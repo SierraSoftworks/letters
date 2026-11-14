@@ -54,6 +54,7 @@ fn export_and_import_are_subcommands() {
     let cases = [
         ("export a.let --to md", export("a.let", Format::Markdown, None, false)),
         ("export --to=html a.let", export("a.let", Format::Html, None, false)),
+        ("export a.let --to docx", export("a.let", Format::Docx, None, false)),
         ("export a.let --to html -o out/a.html --force", export("a.let", Format::Html, to_file("out/a.html"), true)),
         ("export a.let --to md --output=-", export("a.let", Format::Markdown, Some(Output::Stdout), false)),
         ("export --to md -o - -- --odd.let", export("--odd.let", Format::Markdown, Some(Output::Stdout), false)),

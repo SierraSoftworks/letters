@@ -1,7 +1,7 @@
 //! The `export` and `import` subcommands: documents to and from other formats, with no window.
 //!
-//! - [`export`] writes one document as Markdown or as a single HTML file.
-//! - [`import`] makes a document beside each Markdown file and prints a line for each.
+//! - [`export`] writes one document as Markdown, as a single HTML file or as a Word document.
+//! - [`import`] makes a document beside each Markdown or Word file and prints a line for each.
 //!
 //! Neither changes a file that is already there: an export asks for `--force` first, and an import skips.
 
@@ -11,7 +11,7 @@ use std::io::{self, Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
-use letters_convert::{ImportNote, from_markdown, to_html, to_markdown};
+use letters_convert::{ImportNote, from_docx, from_markdown, to_docx, to_html, to_markdown};
 use letters_format::{Archive, Package};
 use letters_model::{Anchor, Block, BlockKind, Body, Document, Mark, Note, NoteKind, Notes, Run, Style};
 use serde_json::json;
@@ -19,8 +19,12 @@ use serde_json::json;
 use crate::cli::{Export, Format, Import, Output};
 use crate::{files, platform};
 
-/// The extensions of the files an import looks for in a folder.
+/// The extensions of the Markdown files an import looks for in a folder.
 const MARKDOWN: [&str; 2] = ["md", "markdown"];
+/// The extension of the Word files it looks for.
+const WORD: &str = "docx";
+/// How a zip starts, and how the older kind of Word file does. Either is read as Word, whatever its name.
+const WORD_STARTS: [&[u8]; 2] = [b"PK\x03\x04", &[0xd0, 0xcf, 0x11, 0xe0]];
 /// The name import notes are written under.
 const IMPORTER: &str = "Letters import";
 
@@ -45,23 +49,26 @@ fn try_export(export: &Export) -> Result<(), String> {
     for line in simplified(&document, export.to) {
         eprintln!("letters: {name}: {line}");
     }
-    let text = match export.to {
-        Format::Markdown => to_markdown(&document),
-        Format::Html => {
-            // A style this build cannot read gives way to the built-in one, as it does on screen.
-            let style = archive.style().unwrap_or_default();
-            let title = export.file.file_stem().unwrap_or_default().to_string_lossy();
-            // An image that cannot be read is treated as missing, and its description stands in for it.
-            to_html(&document, &style, &title, &mut |name| archive.read(name).ok().flatten())
+    // A style this build cannot read gives way to the built-in one, as it does on screen.
+    let style = archive.style().unwrap_or_default();
+    let title = export.file.file_stem().unwrap_or_default().to_string_lossy();
+    let bytes = match export.to {
+        Format::Markdown => to_markdown(&document).into_bytes(),
+        // An image that cannot be read is treated as missing, and its description stands in for it.
+        Format::Html => to_html(&document, &style, &title, &mut |name| archive.read(name).ok().flatten()).into_bytes(),
+        Format::Docx => {
+            // Notes that cannot be read are left behind: the text matters more than its comments.
+            let notes = archive.notes().unwrap_or_default();
+            to_docx(&document, &style, &notes, &title, &mut |name| archive.read(name).ok().flatten())
         }
     };
 
     let output = match &export.output {
-        Some(Output::Stdout) => return io::stdout().write_all(text.as_bytes()).map_err(|error| error.to_string()),
+        Some(Output::Stdout) => return io::stdout().write_all(&bytes).map_err(|error| error.to_string()),
         Some(Output::File(path)) => path.clone(),
         None => export.file.with_extension(export.to.extension()),
     };
-    write(&output, text.as_bytes(), export.force).map_err(|error| match error.kind() {
+    write(&output, &bytes, export.force).map_err(|error| match error.kind() {
         io::ErrorKind::AlreadyExists => {
             format!("{} is already there: pass --force to replace it, or --output to write elsewhere", output.display())
         }
@@ -74,8 +81,8 @@ fn try_export(export: &Export) -> Result<(), String> {
 /// What the format cannot carry over, a line for each kind of loss.
 fn simplified(document: &Document, to: Format) -> Vec<String> {
     let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    // HTML already writes figures, which the model has yet to learn.
-    let known = |name: &str| to == Format::Html && name == "figure";
+    // HTML and Word already write figures, which the model has yet to learn.
+    let known = |name: &str| to != Format::Markdown && name == "figure";
     let lost = |block: &&Block| matches!(&block.kind, BlockKind::Unknown { type_name } if !known(type_name));
     let unknown = document.walk().filter(lost).count();
     let other = |run: &&Run| run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)));
@@ -90,6 +97,16 @@ fn simplified(document: &Document, to: Format) -> Vec<String> {
             "formatting this version does not know is left out of {}",
             count(marks, "passage", "passages")
         ));
+    }
+    if to == Format::Docx {
+        // Word has no block that holds others, so only paragraphs and list items can take a quote's style.
+        let boxes = document.walk().filter(|block| matches!(block.kind, BlockKind::Quote | BlockKind::Callout { .. }));
+        let plain = |block: &&Block| !matches!(block.kind, BlockKind::Paragraph | BlockKind::ListItem { .. });
+        let outside = boxes.flat_map(|outer| outer.body.blocks()).filter(plain).count();
+        if outside > 0 {
+            let blocks = count(outside, "block inside a quote or callout is", "blocks inside quotes or callouts are");
+            lines.push(format!("{blocks} written outside it, since Word cannot nest them"));
+        }
     }
     lines
 }
@@ -136,7 +153,7 @@ pub fn import(import: &Import) -> ExitCode {
     let mut sources = BTreeSet::new();
     found.retain(|(path, error)| error.is_some() || sources.insert(normal(path)));
     if found.is_empty() {
-        eprintln!("letters: no Markdown files to import");
+        eprintln!("letters: no Markdown or Word files to import");
     }
 
     let style = files::new_style(std::env::home_dir().as_deref());
@@ -180,8 +197,8 @@ fn json_line(source: &Path, outcome: &Outcome) -> String {
     line.to_string()
 }
 
-/// Lists what a path names: itself, or for a folder the Markdown files in it, by name, before those of the
-/// folders inside it. Hidden files and folders are passed over, and a linked folder is not followed.
+/// Lists what a path names: itself, or for a folder the Markdown and Word files in it, by name, before those
+/// of the folders inside it. Hidden files and folders are passed over, and a linked folder is not followed.
 fn find(path: &Path, recursive: bool, found: &mut Vec<(PathBuf, Option<String>)>) {
     if !path.is_dir() {
         // A file named outright is imported whatever it is called. If it is missing, reading it says so.
@@ -197,7 +214,8 @@ fn find(path: &Path, recursive: bool, found: &mut Vec<(PathBuf, Option<String>)>
     entries.sort_by_key(|entry| entry.file_name());
     let (folders, files): (Vec<_>, Vec<_>) =
         entries.into_iter().partition(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()));
-    for file in files.iter().map(|entry| entry.path()).filter(|file| is_markdown(file) && file.is_file()) {
+    let wanted = |file: &PathBuf| (is_markdown(file) || is_word(file)) && file.is_file();
+    for file in files.iter().map(|entry| entry.path()).filter(wanted) {
         found.push((file, None));
     }
     for folder in folders.iter().filter(|_| recursive) {
@@ -208,6 +226,10 @@ fn find(path: &Path, recursive: bool, found: &mut Vec<(PathBuf, Option<String>)>
 fn is_markdown(path: &Path) -> bool {
     let extension = path.extension().unwrap_or_default();
     MARKDOWN.iter().any(|known| extension.eq_ignore_ascii_case(known))
+}
+
+fn is_word(path: &Path) -> bool {
+    path.extension().unwrap_or_default().eq_ignore_ascii_case(WORD)
 }
 
 /// A path from the root with its `.` and `..` worked out, so that two spellings of one file compare equal.
@@ -223,29 +245,55 @@ fn normal(path: &Path) -> PathBuf {
     out
 }
 
-/// Makes a document beside one Markdown file. `sources` holds every file of this import, by [`normal`] path.
+/// Makes a document beside one Markdown or Word file. `sources` holds every file of this import, by
+/// [`normal`] path.
 fn import_file(source: &Path, style: &Style, sources: &BTreeSet<PathBuf>) -> Outcome {
     let failed = |error: &dyn std::fmt::Display| Outcome::Failed { error: error.to_string() };
     let output = source.with_extension(files::EXTENSION);
+    // A document is a zip too, so this comes before the file is looked into.
     if output.exists() {
         return Outcome::Skipped { output };
     }
-    let markdown = match fs::read_to_string(source) {
-        Ok(markdown) => markdown,
+    let bytes = match fs::read(source) {
+        Ok(bytes) => bytes,
         Err(error) => return failed(&error),
     };
-    let (mut document, simplified) = from_markdown(&markdown, &mut platform::block_id);
-    if document.blocks.is_empty() {
-        document = files::blank();
-    }
-    relink(&mut document.blocks, source.parent().unwrap_or(Path::new("")), sources);
-
     let created = platform::now_rfc3339();
-    let mut package =
-        Package { id: platform::document_id(), created: created.clone(), document, entries: Default::default() };
-    package.set_style(style);
-    if !simplified.is_empty() {
-        let notes = simplified.iter().map(|note| import_note(note, &created)).collect();
+    let mut package = Package {
+        id: platform::document_id(),
+        created: created.clone(),
+        document: Document::default(),
+        entries: Default::default(),
+    };
+    let mut notes = Vec::new();
+    let simplified = if WORD_STARTS.iter().any(|start| bytes.starts_with(start)) {
+        let word = match from_docx(&bytes, style, &created, &mut platform::block_id) {
+            Ok(word) => word,
+            Err(error) => return failed(&error),
+        };
+        package.document = word.document;
+        // Word's own styles are laid over the user's, so the document looks as it did.
+        package.set_style(&word.style);
+        package.entries.extend(word.assets);
+        // People's comments come along, and are not what the import counts as its notes.
+        notes = word.comments;
+        word.notes
+    } else {
+        let markdown = match String::from_utf8(bytes) {
+            Ok(markdown) => markdown,
+            Err(_) => return failed(&"the file is neither Markdown in UTF-8 nor a Word document"),
+        };
+        let (document, simplified) = from_markdown(&markdown, &mut platform::block_id);
+        package.document = document;
+        relink(&mut package.document.blocks, source.parent().unwrap_or(Path::new("")), sources);
+        package.set_style(style);
+        simplified
+    };
+    if package.document.blocks.is_empty() {
+        package.document = files::blank();
+    }
+    notes.extend(simplified.iter().map(|note| import_note(note, &created)));
+    if !notes.is_empty() {
         package.set_notes(&Notes { notes, ..Notes::default() });
     }
     let mut bytes = Cursor::new(Vec::new());

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use letters_format::{Archive, Package};
-use letters_model::{Block, BlockKind, Document, Mark, NoteKind, Run, Style};
+use letters_model::{Anchor, Block, BlockKind, Document, Mark, Note, NoteKind, Notes, Run, Style};
 
 /// A scratch folder that is removed when the test ends.
 struct Folder(PathBuf);
@@ -266,4 +266,84 @@ fn an_imported_document_exports_back_to_its_markdown() {
     assert_eq!(run.stdout, source);
     // An empty file still makes a document that opens.
     assert_eq!(open(&folder.path("empty.let")).document().unwrap().blocks.len(), 1);
+}
+
+/// Adds a comment by Ada on the first word of the document's second block.
+fn comment(path: &Path) {
+    let mut package = open(path).package().unwrap();
+    let note = Note {
+        id: "n1".into(),
+        kind: NoteKind::Comment,
+        anchor: Anchor::range(package.document.blocks[1].id.clone(), 0..5),
+        author: "Ada".into(),
+        created: "2026-11-14T20:00:00Z".into(),
+        resolved: false,
+        content: vec![Run::plain("Which rates?")],
+        replies: Vec::new(),
+        extra: Default::default(),
+    };
+    package.set_notes(&Notes { notes: vec![note], ..Notes::default() });
+    let mut out = Cursor::new(Vec::new());
+    letters_format::write(&mut out, &package).unwrap();
+    fs::write(path, out.into_inner()).unwrap();
+}
+
+#[test]
+fn a_document_goes_to_word_and_back() {
+    let folder = Folder::new("word");
+    comment(&rates(&folder));
+    folder.write("word/notes.md", "# Notes\n");
+    // A document is made once for a name, whichever file of that name comes first.
+    folder.write("word/Rates.md", "# Rates in Markdown\n");
+
+    let run = folder.letters(&["export", "Rates.let", "--to", "docx", "-o", "word/Rates.docx"]);
+    assert!(run.ok, "{}", run.stderr);
+    assert!(run.stdout.contains("Rates.docx"), "{}", run.stdout);
+    assert!(run.stderr.contains("1 block") && run.stderr.contains("1 passage"), "{}", run.stderr);
+    let again = folder.letters(&["export", "Rates.let", "--to", "docx", "-o", "word/Rates.docx"]);
+    assert!(!again.ok && again.stderr.contains("--force"), "{}", again.stderr);
+
+    let run = folder.letters(&["import", "word"]);
+    assert!(run.ok, "{}", run.stderr);
+    let lines: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "one line per file: {}", run.stdout);
+    // People's comments are not something the import simplified.
+    assert!(
+        lines[0].contains("Rates.docx") && lines[0].contains("Rates.let") && !lines[0].contains("note)"),
+        "{}",
+        lines[0]
+    );
+    assert!(folder.path("word/notes.let").exists());
+
+    let mut back = open(&folder.path("word/Rates.let"));
+    let document = back.document().unwrap();
+    assert_eq!(
+        (&document.blocks[0].kind, document.blocks[0].plain_text().as_str()),
+        (&BlockKind::Heading { level: 1 }, "Rates")
+    );
+    assert_eq!(document.blocks[2].kind, BlockKind::Code { language: None });
+    // The document's style went into Word's styles and came back out of them.
+    assert_eq!(back.style().unwrap().types["heading1"].color, "#aa3300");
+    let notes = back.notes().unwrap().notes;
+    let [note] = notes.as_slice() else { panic!("one comment, got {notes:?}") };
+    assert_eq!((&note.kind, note.author.as_str()), (&NoteKind::Comment, "Ada"));
+    let on = document.block(&note.anchor.block).unwrap().plain_text();
+    assert_eq!(&on[note.anchor.range.clone().unwrap()], "Rates");
+}
+
+#[test]
+fn import_refuses_what_only_looks_like_word() {
+    let folder = Folder::new("not-word");
+    folder.write("old.doc", [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+    folder.write("torn.docx", b"PK\x03\x04 and then nothing");
+    let run = folder.letters(&["import", "--json", "old.doc", "torn.docx"]);
+    assert!(!run.ok);
+    let lines: Vec<serde_json::Value> = run.stdout.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(lines.len(), 2, "{}", run.stdout);
+    for line in &lines {
+        assert_eq!(line["status"], "failed", "{line}");
+    }
+    // An older file says how to get one that can be read.
+    assert!(lines[0]["error"].as_str().unwrap().contains(".docx"), "{}", lines[0]);
+    assert!(!folder.path("old.let").exists() && !folder.path("torn.let").exists());
 }

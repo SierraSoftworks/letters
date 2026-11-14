@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 pub const USAGE: &str = "\
 Usage: letters [OPTIONS] [FILE]
-       letters export --to md|html [OPTIONS] FILE
+       letters export --to md|html|docx [OPTIONS] FILE
        letters import [OPTIONS] PATH...
 
 Opens FILE, or a new document when none is given.
@@ -19,12 +19,13 @@ Options:
   -V, --version
   -h, --help
 
-Export writes FILE as Markdown or as one HTML file, beside it unless told otherwise:
-      --to md|html         The format to write
+Export writes FILE as Markdown, one HTML file or a Word document, beside it unless told otherwise:
+      --to md|html|docx    The format to write
   -o, --output PATH        Where to write, or - for standard output
   -f, --force              Replace the output if it is already there
 
-Import makes a document beside each Markdown file, leaves the original alone and prints one line per file:
+Import makes a document beside each Markdown or Word file, leaves the original alone and prints one line
+per file:
   -r, --recursive          Look through the folders inside each PATH as well
       --json               Print each line as a JSON object
 
@@ -57,6 +58,7 @@ pub struct Export {
 pub enum Format {
     Markdown,
     Html,
+    Docx,
 }
 
 impl Format {
@@ -65,6 +67,7 @@ impl Format {
         match self {
             Self::Markdown => "md",
             Self::Html => "html",
+            Self::Docx => "docx",
         }
     }
 }
@@ -75,10 +78,10 @@ pub enum Output {
     Stdout,
 }
 
-/// `letters import`: a document made from each Markdown file.
+/// `letters import`: a document made from each Markdown or Word file.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Import {
-    /// Files, and folders whose Markdown files are meant.
+    /// Files, and folders whose Markdown and Word files are meant.
     pub paths: Vec<PathBuf>,
     pub recursive: bool,
     /// Whether each line of the report is a JSON object.
@@ -186,7 +189,8 @@ fn parse_export(args: impl Iterator<Item = OsString>) -> Result<Command, String>
                 to = Some(match value(inline, name)?.to_str() {
                     Some("md" | "markdown") => Format::Markdown,
                     Some("html") => Format::Html,
-                    _ => return Err("--to takes md or html".into()),
+                    Some("docx") => Format::Docx,
+                    _ => return Err("--to takes md, html or docx".into()),
                 });
             }
             Arg::Flag(name @ ("-o" | "--output"), inline) => {
@@ -199,7 +203,7 @@ fn parse_export(args: impl Iterator<Item = OsString>) -> Result<Command, String>
         }
     }
     let file = file.ok_or("export needs the file to export")?;
-    let to = to.ok_or("export needs --to md or --to html")?;
+    let to = to.ok_or("export needs --to md, --to html or --to docx")?;
     Ok(Command::Export(Export { file, to, output, force }))
 }
 
