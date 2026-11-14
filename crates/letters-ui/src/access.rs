@@ -125,8 +125,9 @@ fn collect<M>(tree: &Tree<M>, window: &Window<'_>, i: usize, named: bool, siblin
     let mut node = AccessNode::new(role);
     node.set_bounds(bounds(n.rect));
     match (&access.label, &n.el.content) {
+        // A label's text is its value, also when it shows as an icon and its text was given in words.
+        (Some(label), _) if role == Role::Label => node.set_value(label.as_str()),
         (Some(label), _) => node.set_label(label.as_str()),
-        // A label's text is its value.
         (None, Content::Text { text, .. }) => node.set_value(text.as_str()),
         (None, _) if from_content => node.set_label(text_of(tree, i)),
         _ => {}

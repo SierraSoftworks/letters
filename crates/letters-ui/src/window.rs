@@ -10,16 +10,17 @@ use std::rc::Rc;
 use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
 use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Platform};
 use letters_layout::{Callout, DocLayout, Fonts, Palette, Syntax};
-use letters_model::{Align as TextAlign, Block, BlockId, BlockKind, Change, Mark, Pos, Selection, Style};
+use letters_model::{Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Mark, Pos, Selection, Style};
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
 
 use crate::color::{fade, resolve, same};
-use crate::describe::{self, Request};
+use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::highlight;
 use crate::icon::{self, Icon};
 use crate::motion::{self, FRAME_MS};
+use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
 use crate::restyle::{self, Field, StyleEdit, Styles};
 use crate::spelling::{Fix, Spelling};
@@ -56,6 +57,13 @@ fn chapters_width() -> f32 {
     CHAPTERS_INSET.horizontal() + CHAPTER_LINE.width + f32::from(CHAPTER_STEPS) * CHAPTER_INDENT
 }
 
+/// The landing card: how many recent documents it lists, how wide it is, and the height of one of its rows.
+const RECENTS: usize = 6;
+const CARD_WIDTH: f32 = 544.0;
+const RECENT_HEIGHT: f32 = 38.0;
+/// How long the bar says which folder a document was first written to, in milliseconds.
+const SAVED_NOTE_MS: u64 = 4000;
+
 /// The editor's window.
 pub type Window = Ui<EditorApp>;
 
@@ -67,6 +75,10 @@ pub enum SaveState {
     Saving,
     /// Changes are kept on this device until the server is back.
     Offline,
+    /// Nothing has been written yet, as in a new document nobody has typed in. The bar says nothing.
+    Unsaved,
+    /// The last write did not succeed.
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +133,14 @@ pub enum Message {
     },
     /// Puts the menu about a misspelled word away.
     Unfix,
+    /// Asks the shell for a recent document, by its path.
+    Open(String),
+    /// Asks the shell to let the person choose a document.
+    OpenDialog,
+    /// Asks the shell for another new document.
+    NewDocument,
+    /// Puts the landing card away: this window's document is the one to write.
+    Start,
 }
 
 impl Ui<EditorApp> {
@@ -150,8 +170,35 @@ impl Ui<EditorApp> {
         self.app().edits
     }
 
+    /// Names the document. Shorthand for a [`Window::set_location`] that changes nothing else.
     pub fn set_document_name(&mut self, name: &str) {
-        self.app_mut().name = name.into();
+        self.app_mut().location.name = Some(name.to_owned()).filter(|name| !name.is_empty());
+    }
+
+    /// Says what the document is called and where it is kept.
+    pub fn set_location(&mut self, location: Location) {
+        self.app_mut().location = location;
+    }
+
+    /// Shows the landing card over a document nobody has written in, or takes it away. The card goes by
+    /// itself when the person starts to write.
+    pub fn set_landing(&mut self, landing: Option<Landing>) {
+        self.app_mut().landing = landing;
+    }
+
+    /// Whether the landing card is showing.
+    pub fn landing(&self) -> bool {
+        self.app().landing.is_some()
+    }
+
+    /// Has the bar say for a few seconds which folder the document was written to, after its first write.
+    pub fn set_saved_in(&mut self, folder: &str) {
+        self.app_mut().saved_in = Some((folder.to_owned(), None));
+    }
+
+    /// What the window asks of its shell, since this was last called. Call it after every event.
+    pub fn take_requests(&mut self) -> Vec<Request> {
+        std::mem::take(&mut self.app_mut().requests)
     }
 
     pub fn set_save_state(&mut self, state: SaveState) {
@@ -241,6 +288,10 @@ impl Platform for Lent<'_> {
     fn store_asset(&mut self, name: &str, bytes: &[u8]) {
         self.platform.store_asset(name, bytes);
     }
+
+    fn learn_word(&mut self, word: &str) {
+        self.platform.learn_word(word);
+    }
 }
 
 pub struct EditorApp {
@@ -258,7 +309,14 @@ pub struct EditorApp {
     scale: f32,
     /// Whether the layout still holds estimated heights, to be replaced in idle time.
     estimated: bool,
-    name: String,
+    location: Location,
+    /// What the landing card offers, while it shows.
+    landing: Option<Landing>,
+    requests: Vec<Request>,
+    /// The folder the bar says the document was saved in, and since when, once a frame has said so.
+    saved_in: Option<(String, Option<u64>)>,
+    /// Whether the caret is in the heading that will name the document.
+    naming: bool,
     save: SaveState,
     edits: u64,
     panel: Option<Panel>,
@@ -290,7 +348,11 @@ impl EditorApp {
             scroll: 0.0,
             scale: 1.0,
             estimated: true,
-            name: String::new(),
+            location: Location::default(),
+            landing: None,
+            requests: Vec::new(),
+            saved_in: None,
+            naming: false,
             save: SaveState::default(),
             edits: 0,
             panel: None,
@@ -306,6 +368,33 @@ impl EditorApp {
         }
     }
 
+    /// The first Heading 1, which names a document that has no name of its own.
+    fn heading(&self) -> Option<&Block> {
+        self.editor.doc().walk().find(|block| matches!(block.kind, BlockKind::Heading { level: 1 }))
+    }
+
+    /// The name the bar shows, and whether it is the document's own. Without one it is what the first
+    /// Heading 1 says so far.
+    fn name(&self) -> (String, bool) {
+        if let Some(name) = &self.location.name {
+            return (name.clone(), true);
+        }
+        let heading = self.heading().map(|heading| heading.plain_text().trim().to_owned());
+        (heading.filter(|heading| !heading.is_empty()).unwrap_or_else(|| "Untitled".into()), false)
+    }
+
+    /// Puts the landing card away and the caret on the page.
+    fn start(&mut self) {
+        self.landing = None;
+        if self.editor.selection().is_none() {
+            let first = self.editor.doc().walk().find(|block| matches!(block.body, Body::Text(_)));
+            if let Some(first) = first.map(|block| Pos::new(block.id.clone(), 0)) {
+                self.editor.select(Selection::caret(first));
+                self.mark();
+            }
+        }
+    }
+
     /// The element type whose style the caret's block is drawn with.
     fn element(&self) -> Option<&'static str> {
         restyle::element(self.editor.doc(), &self.editor.selection()?.head.block)
@@ -316,7 +405,8 @@ impl EditorApp {
     fn refold(&mut self, width: f32) {
         let style = self.element().and_then(|element| Some((element, &self.style.types.get(element)?.family)));
         let mut hasher = DefaultHasher::new();
-        (width.to_bits(), &self.name, std::mem::discriminant(&self.save), style).hash(&mut hasher);
+        let note = self.saved_in.as_ref().map(|note| &note.0);
+        (width.to_bits(), self.name(), std::mem::discriminant(&self.save), note, style).hash(&mut hasher);
         let key = hasher.finish();
         if key != self.folded.key {
             self.folded = Folded { key, form: None, seen: Fitted::default() };
@@ -376,6 +466,14 @@ impl EditorApp {
         self.layout.set_composition(self.editor.composition());
         let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
         self.spelling.moved(caret, &mut self.layout);
+        // A document without a name takes its first Heading 1, once the caret has left it.
+        let heading = self.heading().filter(|_| self.location.name.is_none());
+        let naming = heading.zip(head.as_ref()).is_some_and(|(heading, head)| heading.id == head.block);
+        let name = heading.map(|heading| heading.plain_text().trim().to_owned()).filter(|name| !name.is_empty());
+        if let (true, false, Some(name)) = (self.naming, naming, name) {
+            self.requests.push(Request::Named(name));
+        }
+        self.naming = naming;
         let composing = self.editor.composition().is_some();
         if changed {
             let at_once = self.reduced_motion || composing;
@@ -520,6 +618,78 @@ impl EditorApp {
         self.spelling.ask(self.editor.doc(), &pos, &self.layout);
     }
 
+    /// The landing card, over the middle of a page nobody has written on: the documents opened lately, and
+    /// the ways to open another or to start this one. A press on the page behind it starts this one.
+    fn card(landing: &Landing, room: Size) -> Popover<Message> {
+        let quiet = |text: &str| Element::text(text, TextStyle::control().size(tokens::TEXT_SM)).fg(tokens::FG_MUTED);
+        let recent = |recent: &Recent| {
+            let when = opening::ago(&landing.now, &recent.opened);
+            Element::row()
+                .key(recent.path.as_str())
+                .align(Align::Center)
+                .gap(tokens::SPACE_SM)
+                .height(RECENT_HEIGHT)
+                .padding(Edges::xy(tokens::SPACE_SM, 0.0))
+                .radius(tokens::RADIUS_CONTROL)
+                .hover(Look::bg(tokens::NEUTRAL_SOFT))
+                .focused(Look::bg(tokens::NEUTRAL_SOFT))
+                .role(Role::ListBoxOption)
+                .label(recent.name.as_str())
+                .description(format!("{}, {when}", recent.folder))
+                .focusable()
+                .on_press(Message::Open(recent.path.clone()))
+                .child(Element::icon(icon::FILE_TEXT, 16.0).fg(tokens::FG_MUTED))
+                .child(Element::text(recent.name.as_str(), TextStyle::control().weight(500)).shrink())
+                .child(quiet(&recent.folder).shrink())
+                .child(Element::row().grow(1.0))
+                .child(quiet(&when))
+        };
+        let recents: Vec<Element<Message>> = landing.recents.iter().take(RECENTS).map(recent).collect();
+        let listed = recents.len() as f32;
+
+        let hint = Element::row()
+            .align(Align::Center)
+            .gap(tokens::SPACE_XS)
+            .grow(1.0)
+            .shrink()
+            .child(Element::icon(icon::MOUSE_POINTER_CLICK, 14.0).fg(tokens::FG_MUTED))
+            .child(quiet("Or click the page to start writing").shrink());
+        let foot = Element::row()
+            .align(Align::Center)
+            .gap(tokens::SPACE_SM)
+            .child(hint)
+            .child(Button::new("Open").icon(icon::FOLDER_OPEN).on_press(Message::OpenDialog))
+            .child(Button::new("New document").icon(icon::PLUS).primary().on_press(Message::Start));
+
+        let mut card = Element::column().gap(tokens::SPACE_SM).width(CARD_WIDTH);
+        if !recents.is_empty() {
+            let title = Element::text("Recent", TextStyle::control().size(tokens::TEXT_SM).weight(600));
+            let list = Element::column()
+                .role(Role::ListBox)
+                .label("Recent documents")
+                .arrows(Dir::Column)
+                .one_stop()
+                .children(recents);
+            let line = Element::row().height(1.0).bg(tokens::LINE).decorative();
+            card = card
+                .child(title.fg(tokens::FG_MUTED).padding(Edges::xy(tokens::SPACE_SM, 0.0)))
+                .child(list)
+                .child(line);
+        }
+        // The card sits a little above the middle of the page area.
+        let height = listed * RECENT_HEIGHT + if listed > 0.0 { 120.0 } else { 64.0 };
+        let spot = Rect::new(room.width / 2.0, ((room.height - height) * 0.4).max(0.0), 0.0, 0.0);
+        Popover::new(card.child(foot))
+            .label("Open a document")
+            .max_width(CARD_WIDTH + 2.0 * tokens::SPACE_MD)
+            .at(spot)
+            .align(Align::Center)
+            .gap(0.0)
+            .shows_focus()
+            .open(true)
+            .on_close(Message::Start)
+    }
+
     /// The menu about a misspelled word: corrections, and the two dictionaries that can take the word.
     fn fixes(fix: &Fix) -> Menu<Message> {
         let mut menu = Menu::new().label("Spelling");
@@ -581,7 +751,9 @@ impl EditorApp {
             .caret(caret)
             .on_text(Message::Text)
             .on_pointer(|event| Some(Message::Pointer(event)));
-        if let Some(fix) = &self.spelling.fix {
+        if let Some(landing) = &self.landing {
+            element = element.popover(Self::card(landing, room));
+        } else if let Some(fix) = &self.spelling.fix {
             // The menu hangs from the start of its word.
             let start = self.layout.caret(&Pos::new(fix.block.clone(), fix.range.start)).unwrap_or_default();
             let spot = Rect { x: origin.x + start.x, y: origin.y + start.y, ..start };
@@ -686,6 +858,9 @@ impl EditorApp {
 
         let more = Menu::new()
             .label("More")
+            .item(MenuItem::new("New document").icon(icon::PLUS).on_select(Message::NewDocument))
+            .item(MenuItem::new("Open").icon(icon::FOLDER_OPEN).on_select(Message::OpenDialog))
+            .separator()
             .item(MenuItem::new("Export").icon(icon::DOWNLOAD).disabled(true))
             .item(MenuItem::new("Print view").icon(icon::PRINTER).disabled(true))
             .item(MenuItem::new("Page setup").icon(icon::SETTINGS).disabled(true));
@@ -719,27 +894,41 @@ impl EditorApp {
     /// What the bar starts with: the document's name, in no more than `room`, and whether it is saved, which
     /// `brief` says with the icon alone.
     fn lead(&self, room: f32, brief: bool) -> Vec<Element<Message>> {
-        let name = if self.name.is_empty() { "Untitled" } else { &self.name };
-        let (state_icon, state) = match self.save {
-            SaveState::Saved => (icon::CLOUD_CHECK, "Saved"),
-            SaveState::Saving => (icon::REFRESH_CW, "Saving"),
-            SaveState::Offline => (icon::CLOUD_OFF, "Offline"),
-        };
-        let mut saved = Element::row()
-            .align(Align::Center)
-            .gap(tokens::SPACE_XS)
-            .fg(tokens::FG_MUTED)
-            .child(Element::icon(state_icon, 14.0));
-        saved = match brief {
-            true => saved.role(Role::Label).label(state).tooltip(state, Side::Bottom),
-            false => saved.child(Element::text(state, TextStyle::control().size(tokens::TEXT_SM))),
-        };
-        if self.save == SaveState::Offline {
-            saved = saved.description("Changes are kept on this device");
-        }
+        // A name that is not the document's own is grey, as a field's placeholder is.
+        let (name, own) = self.name();
+        let style = TextStyle::control().weight(if own { 600 } else { 400 });
         // The name gives way to the controls after it, down to a few letters.
-        let name = Element::text(name, TextStyle::control().weight(600)).min_width(NAME_WIDTH.0).max_width(room);
-        vec![Element::icon(icon::FILE_TEXT, 18.0).fg(tokens::FG_MUTED), name.shrink(), saved]
+        let name = Element::text(name, style).min_width(NAME_WIDTH.0).max_width(room).shrink();
+        let name = if own { name } else { name.fg(tokens::FG_MUTED) };
+        let mut lead = vec![Element::icon(icon::FILE_TEXT, 18.0).fg(tokens::FG_MUTED), name];
+
+        let (state_icon, state, ink) = match self.save {
+            SaveState::Saved => (icon::CLOUD_CHECK, "Saved", tokens::FG_MUTED),
+            SaveState::Saving => (icon::REFRESH_CW, "Saving", tokens::FG_MUTED),
+            SaveState::Offline => (icon::CLOUD_OFF, "Offline", tokens::FG_MUTED),
+            SaveState::Failed => (icon::CLOUD_ALERT, "Not saved", tokens::DANGER),
+            SaveState::Unsaved => return lead,
+        };
+        // A saved document says so with the icon alone, but for the moment after its first write.
+        let note = self
+            .saved_in
+            .as_ref()
+            .filter(|_| self.save == SaveState::Saved)
+            .map(|(folder, _)| format!("Saved in {folder}"));
+        let said = note.clone().unwrap_or_else(|| state.to_owned());
+        let mut saved =
+            Element::row().align(Align::Center).gap(tokens::SPACE_XS).fg(ink).child(Element::icon(state_icon, 14.0));
+        saved = match (brief || self.save == SaveState::Saved) && note.is_none() {
+            true => saved.role(Role::Label).label(said.as_str()).tooltip(said, Side::Bottom),
+            false => saved.child(Element::text(said, TextStyle::control().size(tokens::TEXT_SM))),
+        };
+        saved = match self.save {
+            SaveState::Offline => saved.description("Changes are kept on this device"),
+            SaveState::Failed => saved.description("The last changes could not be written"),
+            _ => saved,
+        };
+        lead.push(saved);
+        lead
     }
 
     /// The bar's format controls: undo and redo, the style of the type under the caret, then the marks and
@@ -961,7 +1150,7 @@ impl App for EditorApp {
     type Msg = Message;
 
     fn title(&self) -> String {
-        if self.name.is_empty() { "Letters".into() } else { self.name.clone() }
+        self.location.name.clone().unwrap_or_else(|| "Letters".into())
     }
 
     fn view(&mut self, window: Size) -> Element<Message> {
@@ -990,6 +1179,10 @@ impl App for EditorApp {
             }
             Message::Learn { mine } => self.spelling.learn(mine, self.editor.doc(), &mut self.layout, platform),
             Message::Unfix => self.spelling.fix = None,
+            Message::Open(path) => self.requests.push(Request::Open(path)),
+            Message::OpenDialog => self.requests.push(Request::OpenDialog),
+            Message::NewDocument => self.requests.push(Request::New),
+            Message::Start => self.start(),
             Message::Jump(block) => {
                 let start = Pos { block, offset: 0 };
                 self.editor.select(Selection::caret(start.clone()));
@@ -1047,15 +1240,24 @@ impl App for EditorApp {
 
     fn access_action(&mut self, request: &ActionRequest, platform: &mut dyn Platform) {
         match describe::request(self.editor.doc(), request) {
-            Some(Request::Select(selection)) => {
+            Some(describe::Request::Select(selection)) => {
                 self.editor.select(selection);
                 self.mark();
                 self.reveal();
             }
-            Some(Request::Replace(text)) => {
+            Some(describe::Request::Replace(text)) => {
                 self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(text), platform));
             }
             None => {}
+        }
+    }
+
+    fn text(&mut self, event: InputEvent, platform: &mut dyn Platform) {
+        // The first character typed over the landing card starts this document with it.
+        let typed = matches!(event, InputEvent::Insert(_) | InputEvent::Commit(_) | InputEvent::SetComposition { .. });
+        if self.landing.is_some() && typed {
+            self.start();
+            self.edit(platform, |editor, platform| editor.input(event, platform));
         }
     }
 
@@ -1080,7 +1282,13 @@ impl App for EditorApp {
     }
 
     fn animate(&mut self, now_ms: u64) -> Option<u64> {
-        let from = *self.fading.as_mut()?.get_or_insert(now_ms);
+        // The note about where the document was saved goes after its few seconds.
+        let until = self.saved_in.as_mut().map(|(_, from)| *from.get_or_insert(now_ms) + SAVED_NOTE_MS);
+        let note = until.filter(|until| now_ms < *until);
+        if note.is_none() {
+            self.saved_in = None;
+        }
+        let Some(from) = self.fading.as_mut().map(|from| *from.get_or_insert(now_ms)) else { return note };
         let progress = now_ms.saturating_sub(from) as f32 / tokens::DURATION_FAST;
         // The last step is the page exactly as it will stay.
         self.layout.set_reveal_progress(if progress < 1.0 { motion::ease(progress) } else { 1.0 });
@@ -1088,7 +1296,7 @@ impl App for EditorApp {
             return Some(now_ms + FRAME_MS);
         }
         self.fading = None;
-        None
+        note
     }
 
     fn idle(&mut self) -> bool {

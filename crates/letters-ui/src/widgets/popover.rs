@@ -43,6 +43,7 @@ pub struct Popover<M> {
     pub(crate) open: Option<bool>,
     pub(crate) on_close: Option<M>,
     pub(crate) modal: bool,
+    pub(crate) shows_focus: bool,
     pub(crate) popup: HasPopup,
 }
 
@@ -65,6 +66,7 @@ impl<M> Popover<M> {
             open: None,
             on_close: None,
             modal: false,
+            shows_focus: false,
             popup: HasPopup::Dialog,
         }
     }
@@ -123,6 +125,13 @@ impl<M> Popover<M> {
     /// Sent when an app-controlled popover asks to close: on Escape, a press outside, or a choice inside.
     pub fn on_close(mut self, message: M) -> Self {
         self.on_close = Some(message);
+        self
+    }
+
+    /// Shows where the keyboard's focus lands when the popover opens, for one that opens without the person
+    /// pressing anything.
+    pub fn shows_focus(mut self) -> Self {
+        self.shows_focus = true;
         self
     }
 

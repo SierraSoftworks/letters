@@ -79,6 +79,9 @@ pub trait App {
     /// follow on their own.
     fn keys(&mut self, _keys: Keys) {}
 
+    /// Text typed while the keyboard is on something that takes none, such as a button.
+    fn text(&mut self, _event: InputEvent, _platform: &mut dyn Platform) {}
+
     /// Told how many device pixels make one logical pixel, which is one until then.
     fn scale(&mut self, _scale: f32) {}
 
@@ -591,7 +594,10 @@ impl<A: App> Ui<A> {
             _ if matches!(&event, InputEvent::Insert(text) | InputEvent::Commit(text) if text == " ") => {
                 self.activate(i)
             }
-            _ => {}
+            _ => {
+                self.app.text(event, platform);
+                self.stale.view = true;
+            }
         }
         self.flush(platform);
     }
@@ -1162,6 +1168,7 @@ impl<A: App> Ui<A> {
                         self.inputs.entry(node.id).or_default().select_all(&input.value);
                     }
                     focus = Some(node.id);
+                    self.focus_visible |= layer.shows_focus;
                 }
             }
         }

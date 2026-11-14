@@ -5,7 +5,7 @@ use letters_editor::InputEvent;
 use letters_model::{Align, Block, BlockKind, Document, Pos, Selection, TextStyle};
 use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
-use letters_ui::SaveState;
+use letters_ui::{Landing, Recent, Request, SaveState};
 
 fn text(id: &str, kind: BlockKind, text: &str) -> Block {
     Block::text(id, kind, text)
@@ -41,6 +41,26 @@ fn report() -> Harness {
         blocks.extend((0..40).map(paragraph));
     }
     Harness::open(Document { blocks, ..Document::default() })
+}
+
+/// A new document: one empty paragraph with the caret in it, and nothing written to disk.
+fn blank() -> Harness {
+    let mut window =
+        Harness::open(Document { blocks: vec![text("p", BlockKind::Paragraph, "")], ..Document::default() });
+    window.ui().set_save_state(SaveState::Unsaved);
+    window
+}
+
+/// What the shell offers on the landing card: seven documents, the newest first, named "Doc 1" to "Doc 7".
+fn landing() -> Landing {
+    let opened = ["2026-11-14T10:28:00+01:00", "2026-11-13T09:00:00+01:00", "2026-11-03T09:00:00+01:00"];
+    let recent = |n: usize| Recent {
+        path: format!("/family/doc-{n}"),
+        name: format!("Doc {n}"),
+        folder: "Family / House".into(),
+        opened: opened[(n - 1).min(2)].into(),
+    };
+    Landing { now: "2026-11-14T10:30:00+01:00".into(), recents: (1..=7).map(recent).collect() }
 }
 
 /// The page area.
@@ -942,4 +962,117 @@ fn a_change_from_outside_shows_on_the_page_without_moving_it() {
     assert!(block_text(&window, "p0").len() > 1000, "the editor holds the change");
     let after = caret(&mut window);
     assert!((after.y - before.y).abs() <= 1.0, "the line the writer is on stays put: {before:?} to {after:?}");
+}
+
+#[test]
+fn the_landing_card_lists_recent_documents_and_asks_the_shell_for_one() {
+    let mut window = blank();
+    assert!(!window.ui().landing(), "no card until the shell offers one");
+    window.ui().set_landing(Some(landing()));
+    window.assert_open(Role::Dialog, "Open a document").assert_open(Role::ListBox, "Recent documents");
+    let listed: Vec<String> = window
+        .controls()
+        .into_iter()
+        .filter(|found| found.role == Role::ListBoxOption)
+        .map(|found| found.name)
+        .collect();
+    assert_eq!(listed, ["Doc 1", "Doc 2", "Doc 3", "Doc 4", "Doc 5", "Doc 6"], "the six opened last");
+
+    let first = window.focused().expect("the card takes the keyboard");
+    assert_eq!((first.name.as_str(), first.description.as_deref()), ("Doc 1", Some("Family / House, 2 minutes ago")));
+    // How a document is asked for, and the request the shell then finds.
+    let asks = [
+        ("Enter on the newest", Request::Open("/family/doc-1".into())),
+        ("Down and Enter", Request::Open("/family/doc-2".into())),
+        ("a click", Request::Open("/family/doc-5".into())),
+        ("the Open button", Request::OpenDialog),
+    ];
+    for (ask, request) in asks {
+        match ask {
+            "Enter on the newest" => window.key("Enter"),
+            "Down and Enter" => window.key("Down").key("Enter"),
+            "a click" => window.click(Role::ListBoxOption, "Doc 5"),
+            _ => window.click(Role::Button, "Open"),
+        };
+        assert_eq!(window.ui().take_requests(), [request], "{ask}");
+        assert!(window.ui().landing(), "{ask}: the card stays until the shell has the document");
+    }
+}
+
+#[test]
+fn writing_starts_on_the_page_behind_the_landing_card() {
+    for (start, recents) in [("a click on the page", 7), ("typing", 7), ("New document", 0), ("Escape", 0)] {
+        let mut window = blank();
+        window.ui().set_landing(Some(Landing { recents: landing().recents[..recents].to_vec(), ..landing() }));
+        assert_eq!(window.find(Role::ListBox, "Recent documents").is_some(), recents > 0, "{start}");
+        match start {
+            "a click on the page" => window.click_at(Point { x: 80.0, y: 700.0 }),
+            "typing" => window.type_text("D"),
+            "New document" => window.click(Role::Button, "New document"),
+            _ => window.key("Escape"),
+        };
+        assert!(!window.ui().landing(), "{start}: the card is gone");
+        window.assert_closed(Role::Dialog, "Open a document");
+        assert_eq!(
+            window.focused().map(|found| found.role),
+            Some(Role::Document),
+            "{start}: the page has the keyboard"
+        );
+        window.type_text("ear Ada");
+        window.assert_markdown(if start == "typing" { "Dear Ada" } else { "ear Ada" });
+        assert_eq!(window.ui().take_requests(), [], "{start}: this window's document is the new one");
+    }
+}
+
+#[test]
+fn a_document_without_a_name_takes_its_first_heading_once_the_caret_leaves_it() {
+    let mut window = blank();
+    window.ui().select(Selection::caret(Pos::new("p", 0)));
+    window.assert_open(Role::Label, "Untitled");
+    window.type_text("# Cottage renov");
+    window.assert_open(Role::Label, "Cottage renov").assert_closed(Role::Label, "Untitled");
+    assert_eq!(window.ui().take_requests(), [], "nothing is asked while the heading is being typed");
+
+    window.type_text("ation").key("Enter");
+    assert_eq!(window.ui().take_requests(), [Request::Named("Cottage renovation".into())]);
+
+    // Once it has its name, the heading can change without the name following.
+    window.ui().set_document_name("Cottage renovation");
+    window.key("Up").type_text("The ").key("Down");
+    window.assert_open(Role::Label, "Cottage renovation");
+    assert_eq!(window.ui().take_requests(), [], "the name is taken once");
+}
+
+#[test]
+fn the_bar_says_how_saving_stands_and_where_the_first_write_went() {
+    let mut window = letter();
+    // What the shell reports, and what the bar then says: nothing, for a document not yet written.
+    let states = [
+        (SaveState::Unsaved, None),
+        (SaveState::Saving, Some("Saving")),
+        (SaveState::Failed, Some("Not saved")),
+        (SaveState::Saved, Some("Saved")),
+    ];
+    for (state, said) in states {
+        window.ui().set_save_state(state);
+        let shown: Vec<&str> = ["Saving", "Not saved", "Saved"]
+            .into_iter()
+            .filter(|label| window.find(Role::Label, label).is_some())
+            .collect();
+        assert_eq!(shown, Vec::from_iter(said), "{state:?}");
+    }
+
+    window.ui().set_saved_in("House");
+    window.assert_open(Role::Label, "Saved in House");
+    window.advance(0).advance(2000).assert_open(Role::Label, "Saved in House");
+    window.advance(3000).assert_closed(Role::Label, "Saved in House").assert_open(Role::Label, "Saved");
+}
+
+#[test]
+fn the_more_menu_asks_the_shell_for_a_new_document_or_another_one() {
+    for (item, request) in [("New document", Request::New), ("Open", Request::OpenDialog)] {
+        let mut window = letter();
+        window.click(Role::Button, "More").click(Role::MenuItem, item);
+        assert_eq!(window.ui().take_requests(), [request], "{item}");
+    }
 }

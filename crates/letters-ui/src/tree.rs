@@ -67,6 +67,8 @@ pub(crate) struct Layer<M> {
     pub anchor: Option<usize>,
     pub placement: Placement,
     pub modal: bool,
+    /// Whether focus shows on what takes it when the layer opens.
+    pub shows_focus: bool,
     pub controlled: bool,
     pub on_close: Option<M>,
 }
@@ -98,6 +100,7 @@ impl<M> Tree<M> {
             let layer = &mut tree.layers[layer];
             layer.placement = popover.placement;
             layer.modal = popover.modal;
+            layer.shows_focus = popover.shows_focus;
             layer.controlled = popover.open.is_some();
             layer.on_close = popover.on_close;
         }
@@ -121,6 +124,7 @@ impl<M> Tree<M> {
             anchor,
             placement: Placement::default(),
             modal: false,
+            shows_focus: false,
             controlled: false,
             on_close: None,
         });
