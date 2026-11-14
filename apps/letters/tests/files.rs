@@ -3,8 +3,8 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use letters::files::{self, Home, Opened};
-use letters_format::{Archive, Package};
-use letters_model::{Block, BlockKind, Document, Style};
+use letters_format::{Archive, Package, Saved, conflict_copy_of};
+use letters_model::{Block, BlockKind, Document, Page, Style};
 
 /// A scratch folder that is removed when the test ends.
 struct Folder(PathBuf);
@@ -43,18 +43,22 @@ fn document(text: &str) -> Document {
 
 /// A file as another writer would leave it, with entries the app itself never touches.
 fn write_full(path: &Path, text: &str) -> Package {
-    let entries =
-        [("style.json", b"{}".to_vec()), ("assets/0a1b.png", vec![0x89, b'P']), ("history/oplog", vec![1, 2])];
-    let package = Package {
+    let entries = [("assets/0a1b.png", vec![0x89, b'P']), ("history/oplog", vec![1, 2])];
+    let mut package = Package {
         id: "8f14e45f-ceea-467f-a0e6-5b1d3c2a9f00".into(),
         created: "2026-11-14T20:00:00Z".into(),
         document: document(text),
         entries: entries.into_iter().map(|(name, bytes)| (name.to_string(), bytes)).collect(),
     };
-    let mut out = Cursor::new(Vec::new());
-    letters_format::write(&mut out, &package).unwrap();
-    fs::write(path, out.into_inner()).unwrap();
+    package.set_style(&Style { page: Page { width: 400.0, ..Page::default() }, ..Style::default() });
+    write(path, &package);
     package
+}
+
+fn write(path: &Path, package: &Package) {
+    let mut out = Cursor::new(Vec::new());
+    letters_format::write(&mut out, package).unwrap();
+    fs::write(path, out.into_inner()).unwrap();
 }
 
 fn read(path: &Path) -> Package {
@@ -68,8 +72,9 @@ fn a_new_document_is_saved_and_opens_again() {
     let home = Home::new(&path);
     assert_eq!(home.title(), "Notes");
 
-    let home = home.save(&document("First")).unwrap();
-    let home = home.save(&document("Second")).unwrap();
+    let (home, first) = home.save(&document("First")).unwrap();
+    let (home, _) = home.save(&document("Second")).unwrap();
+    assert!(matches!(first, Saved::Written), "{first:?}");
 
     assert_eq!(files::open(&path).unwrap().document, document("Second"));
     assert_eq!(home.path(), path);
@@ -85,7 +90,7 @@ fn saving_keeps_the_identity_and_every_other_entry_of_the_file() {
     let Opened { document: opened, home, .. } = files::open(&path).unwrap();
     assert_eq!(opened, original.document);
     // Two saves, so entries must survive being carried from a file the app wrote itself.
-    let home = home.save(&document("Edited")).unwrap();
+    let (home, _) = home.save(&document("Edited")).unwrap();
     home.save(&document("After")).unwrap();
 
     assert_eq!(read(&path), Package { document: document("After"), ..original });
@@ -99,20 +104,20 @@ fn a_file_changed_by_someone_else_is_never_overwritten() {
     let home = files::open(&path).unwrap().home;
 
     let theirs = write_full(&path, "Theirs");
-    let home = home.save(&document("Mine")).unwrap();
+    let (home, saved) = home.save(&document("Mine")).unwrap();
 
+    assert!(matches!(saved, Saved::ConflictCopy { .. }), "{saved:?}");
     assert_eq!(read(&path), theirs, "their version is untouched");
-    assert_ne!(home.path(), path);
     assert_eq!(home.path().parent(), path.parent());
-    assert!(home.title().starts_with("Rates (conflicted copy "), "{}", home.title());
-    assert_eq!(read(home.path()).document, document("Mine"));
-    assert_eq!(read(home.path()).id, theirs.id, "a conflict copy is the same document");
+    let name = home.path().file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(conflict_copy_of(&name).as_deref(), Some("Rates.let"), "{name}");
+    assert_eq!(read(home.path()), Package { document: document("Mine"), ..theirs }, "the copy is a whole document");
 
     // Later saves stay with the copy, and a second conflict gets a name of its own.
-    let again = home.save(&document("Mine, later")).unwrap();
+    let (again, _) = home.save(&document("Mine, later")).unwrap();
     assert_eq!(again.path(), home.path());
     write_full(again.path(), "Theirs again");
-    let third = again.save(&document("Mine, third")).unwrap();
+    let (third, _) = again.save(&document("Mine, third")).unwrap();
     assert_eq!(folder.names().len(), 3);
     assert_eq!(read(third.path()).document, document("Mine, third"));
 }
@@ -125,7 +130,7 @@ fn a_file_deleted_by_someone_else_is_written_back() {
     let home = files::open(&path).unwrap().home;
     fs::remove_file(&path).unwrap();
 
-    let home = home.save(&document("Mine")).unwrap();
+    let (home, _) = home.save(&document("Mine")).unwrap();
     assert_eq!(home.path(), path);
     assert_eq!(read(&path).document, document("Mine"));
 }
@@ -163,15 +168,44 @@ fn the_style_comes_from_the_file_and_falls_back_to_the_built_in_one() {
     let folder = Folder::new("style");
     let path = folder.path("Styled.let");
     let mut package = write_full(&path, "Text");
-    assert_eq!(files::open(&path).unwrap().style, Style::default(), "an unreadable style.json");
+    assert_eq!(files::open(&path).unwrap().style.page.width, 400.0);
 
-    let mut style = Style::default();
-    style.page.width = 400.0;
-    package.entries.insert("style.json".into(), style.to_json().into_bytes());
-    let mut out = Cursor::new(Vec::new());
-    letters_format::write(&mut out, &package).unwrap();
-    fs::write(&path, out.into_inner()).unwrap();
-    assert_eq!(files::open(&path).unwrap().style, style);
+    for (case, unreadable) in [("not a style", Some(&b"{}"[..])), ("no style", None)] {
+        package.entries.remove("style.json");
+        package.entries.extend(unreadable.map(|bytes| ("style.json".to_string(), bytes.to_vec())));
+        write(&path, &package);
+        let opened = files::open(&path).unwrap();
+        assert_eq!(opened.style, Style::default(), "{case}");
+        opened.home.save(&document("Edited")).unwrap();
+        assert_eq!(read(&path).entries.get("style.json").map(Vec::as_slice), unreadable, "{case} is left as it was");
+    }
+}
+
+#[test]
+fn a_new_document_replaces_the_file_its_user_chose_and_carries_a_style() {
+    let folder = Folder::new("replace");
+    let path = folder.path("Old.let");
+    write_full(&path, "Old");
+
+    Home::new(&path).save(&document("New")).unwrap();
+    let written = read(&path);
+    assert_eq!(written.document, document("New"));
+    assert_eq!(written.style().unwrap(), Style::default());
+    assert!(!written.entries.keys().any(|name| name.starts_with("history/")), "nothing of the old file remains");
+    assert_eq!(folder.names(), ["Old.let"]);
+}
+
+#[test]
+fn a_file_that_appears_where_a_new_document_was_going_is_left_alone() {
+    let folder = Folder::new("appears");
+    let path = folder.path("Fresh.let");
+    let opened = files::open(&path).unwrap();
+    let theirs = write_full(&path, "Theirs");
+
+    let (home, _) = opened.home.save(&document("Mine")).unwrap();
+    assert_eq!(read(&path), theirs);
+    assert_ne!(home.path(), path);
+    assert_eq!(read(home.path()).document, document("Mine"));
 }
 
 #[test]

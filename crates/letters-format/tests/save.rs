@@ -151,6 +151,36 @@ fn a_file_that_is_not_ours_to_replace_is_left_alone() {
     }
 }
 
+/// A writer with no way to merge, as one without the file's history is.
+struct Unmergeable(Package);
+
+impl Replica for Unmergeable {
+    fn id(&self) -> &str {
+        &self.0.id
+    }
+
+    fn merge(&mut self, _disk: &mut DiskCopy) -> Result<(), Error> {
+        Err(Error::Unmerged)
+    }
+
+    fn package(&self) -> Package {
+        self.0.clone()
+    }
+}
+
+#[test]
+fn a_file_that_cannot_be_merged_is_left_alone() {
+    let mut folder = Folder::default();
+    let original = bytes(&theirs());
+    folder.put(NAME, original.clone());
+
+    let saved = save(&mut folder, &mut Unmergeable(ours().0), &SAVE).unwrap();
+    let Saved::ConflictCopy { name, cause: Error::Unmerged } = saved else { panic!("{saved:?}") };
+    assert_eq!(folder.files[NAME], original);
+    assert_eq!(block_ids(&on_disk(&folder, &name)), ["p", "ours"]);
+    assert_eq!(folder.waits, 0, "waiting would not make it mergeable");
+}
+
 #[test]
 fn a_damaged_file_is_set_aside_and_restored_from_memory() {
     let good = bytes(&package());

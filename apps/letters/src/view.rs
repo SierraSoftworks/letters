@@ -141,10 +141,8 @@ impl View {
         {
             out.push(Item::Fill { rect: Rect { width: CARET_WIDTH, ..caret }, color: CARET, radius: 0.0 });
         }
-        // The layout speaks in column coordinates, and a display list has no transforms.
-        for item in &mut out.items[first..] {
-            shift(item, column.x, column.y);
-        }
+        // The layout speaks in column coordinates.
+        out.translate(first, Point { x: column.x, y: column.y });
     }
 
     /// The caret in column coordinates, when the selection is one.
@@ -307,24 +305,5 @@ impl View {
             Some(Request::Replace(text)) => self.input(InputEvent::Insert(text), platform),
             None => {}
         }
-    }
-}
-
-/// Moves an item. This belongs in `letters-render`, which knows every item: an unknown one stays put here.
-fn shift(item: &mut Item, x: f32, y: f32) {
-    match item {
-        Item::Fill { rect, .. }
-        | Item::Stroke { rect, .. }
-        | Item::Shadow { rect, .. }
-        | Item::Image { rect, .. }
-        | Item::PushClip { rect, .. } => {
-            rect.x += x;
-            rect.y += y;
-        }
-        Item::Glyphs { origin, .. } | Item::Path { origin, .. } => {
-            origin.x += x;
-            origin.y += y;
-        }
-        _ => {}
     }
 }

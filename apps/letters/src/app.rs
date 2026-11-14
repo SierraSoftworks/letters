@@ -17,7 +17,7 @@ use letters_render::{DisplayList, Point, Size};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy, OwnedDisplayHandle};
 use winit::keyboard::ModifiersState;
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -62,6 +62,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::<Event>::with_user_event().build()?;
     launch.mark("event loop ready");
     let mut app = App {
+        starting: true,
         report_launch: options.mode == Mode::LaunchReport,
         launch: Some(launch),
         reading,
@@ -79,15 +80,18 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
 
 /// Opens the document and paints its first frame into memory, as [`run`] would into a window.
 pub fn run_headless(options: &Options, mut launch: Launch) -> Result<Launch, Box<dyn Error>> {
-    let opened = match &options.file {
-        Some(path) => files::open(path).map_err(|error| format!("{}: {error}", path.display()))?,
-        None => untitled(),
+    let (document, style) = match &options.file {
+        Some(path) => {
+            let opened = files::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+            (opened.document, opened.style)
+        }
+        None => (files::blank(), Style::default()),
     };
     launch.mark("document read");
     // A window of the default size on a display like the reference machine's.
     let scale = 2.0;
     let (width, height) = ((WINDOW_SIZE.width * scale) as u32, (WINDOW_SIZE.height * scale) as u32);
-    let mut view = View::new(Editor::new(opened.document), opened.style);
+    let mut view = View::new(Editor::new(document), style);
     view.resize(Size { width: WINDOW_SIZE.width as f32, height: WINDOW_SIZE.height as f32 }, scale as f32);
     launch.mark("laid out");
     let mut list = DisplayList::default();
@@ -99,12 +103,9 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<Launch, Box
     Ok(launch)
 }
 
-fn untitled() -> Opened {
-    // The home is a placeholder that is never saved to: an untitled document has `home: None` in its window.
-    Opened { document: files::blank(), style: Style::default(), home: Home::new(PathBuf::new()) }
-}
-
 struct App {
+    /// Whether the first window is still to open.
+    starting: bool,
     report_launch: bool,
     /// The stopwatch, until the first frame is on screen.
     launch: Option<Launch>,
@@ -248,7 +249,7 @@ impl DocWindow {
         let document = self.view.editor().doc().clone();
         let (id, proxy) = (self.window.id(), proxy.clone());
         let save = thread::spawn(move || {
-            let result = home.save(&document).map_err(|error| error.to_string());
+            let result = home.save(&document).map(|(home, _)| home).map_err(|error| error.to_string());
             let _ = proxy.send_event(Event::Saved(id));
             result
         });
@@ -276,38 +277,36 @@ impl DocWindow {
         self.retitle();
     }
 
-    /// Saves now, on this thread. Returns whether everything is on disk.
+    /// Saves now, on this thread, if anything is unsaved. Returns whether everything is on disk.
     fn save_now(&mut self) -> bool {
         self.finish_save(Instant::now());
-        if !self.unsaved() {
-            return true;
-        }
+        !self.unsaved() || self.write()
+    }
+
+    /// Writes the document to its home on this thread. Returns whether that worked.
+    fn write(&mut self) -> bool {
         let Some(home) = &self.home else { return false };
-        match home.save(self.view.editor().doc()) {
-            Ok(home) => {
+        let saved = home.save(self.view.editor().doc());
+        self.save_failed = saved.is_err();
+        match saved {
+            Ok((home, _)) => {
                 self.home = Some(home);
                 self.saved_edits = self.view.edits();
                 self.noticed_edits = self.saved_edits;
                 self.save_at = None;
-                self.save_failed = false;
             }
-            Err(error) => {
-                self.save_failed = true;
-                self.alert(&format!("{} could not be saved.\n\n{error}", self.name()));
-            }
+            Err(error) => self.alert(&format!("{} could not be saved.\n\n{error}", self.name())),
         }
         self.retitle();
-        !self.unsaved()
+        !self.save_failed
     }
 
-    /// Asks where an untitled document should live, then saves it there.
+    /// Asks where an untitled document should live, then saves it there, blank or not.
     fn choose_home(&mut self) -> bool {
         let dialog = FileDialog::new().add_filter("Letters document", &[EXTENSION]).set_parent(&*self.window);
         let Some(path) = dialog.set_file_name(format!("{UNTITLED}.{EXTENSION}")).save_file() else { return false };
         self.home = Some(Home::new(path.with_extension(EXTENSION)));
-        // An untitled document is saved even when blank, so that the chosen file exists.
-        self.saved_edits = u64::MAX;
-        self.save_now()
+        self.write()
     }
 
     fn alert(&self, message: &str) {
@@ -349,7 +348,12 @@ fn alert(parent: Option<&Rc<Window>>, message: &str) {
 }
 
 impl App {
-    fn open_window(&mut self, event_loop: &ActiveEventLoop, opened: Opened, home: bool) -> Result<(), Box<dyn Error>> {
+    /// Opens a window on a document. With no `opened`, the document is blank and has no home yet.
+    fn open_window(&mut self, event_loop: &ActiveEventLoop, opened: Option<Opened>) -> Result<(), Box<dyn Error>> {
+        let (document, style, home) = match opened {
+            Some(Opened { document, style, home }) => (document, style, Some(home)),
+            None => (files::blank(), Style::default(), None),
+        };
         let attributes = Window::default_attributes()
             .with_title(UNTITLED)
             .with_inner_size(WINDOW_SIZE)
@@ -363,7 +367,7 @@ impl App {
         self.mark("window created");
 
         let mut window = DocWindow {
-            view: View::new(Editor::new(opened.document), opened.style),
+            view: View::new(Editor::new(document), style),
             window,
             surface,
             access,
@@ -374,7 +378,7 @@ impl App {
             cursor: Cursor::Default,
             access_stale: false,
             wake_ms: None,
-            home: home.then_some(opened.home),
+            home,
             saved_edits: 0,
             noticed_edits: 0,
             save_at: None,
@@ -396,20 +400,21 @@ impl App {
         }
     }
 
-    /// Opens a file in a new window, or reports why it cannot be opened.
-    fn open_path(&mut self, event_loop: &ActiveEventLoop, path: &Path, parent: Option<WindowId>) {
+    /// Opens a file in a new window, or reports why it cannot be opened. Returns whether it opened.
+    fn open_path(&mut self, event_loop: &ActiveEventLoop, path: &Path, parent: Option<WindowId>) -> bool {
         let parent = parent.and_then(|id| self.windows.get(&id)).map(|window| window.window.clone());
         let opened = files::open(path).map_err(|error| error.to_string());
-        let shown = opened.and_then(|opened| self.open_window(event_loop, opened, true).map_err(|e| e.to_string()));
-        if let Err(error) = shown {
+        let shown = opened.and_then(|opened| self.open_window(event_loop, Some(opened)).map_err(|e| e.to_string()));
+        if let Err(error) = &shown {
             alert(parent.as_ref(), &format!("{} could not be opened.\n\n{error}", path.display()));
         }
+        shown.is_ok()
     }
 
     fn act(&mut self, event_loop: &ActiveEventLoop, id: WindowId, action: Action) {
         match action {
             Action::New => {
-                if let Err(error) = self.open_window(event_loop, untitled(), false) {
+                if let Err(error) = self.open_window(event_loop, None) {
                     alert(None, &format!("A new window could not be opened.\n\n{error}"));
                 }
             }
@@ -419,8 +424,7 @@ impl App {
                 let Some(path) = dialog.pick_file() else { return };
                 // A blank, untouched window gives way to the document that was asked for.
                 let pristine = window.home.is_none() && !window.unsaved();
-                self.open_path(event_loop, &path, Some(id));
-                if pristine && self.windows.len() > 1 {
+                if self.open_path(event_loop, &path, Some(id)) && pristine {
                     self.windows.remove(&id);
                 }
             }
@@ -457,22 +461,22 @@ impl App {
 }
 
 impl ApplicationHandler<Event> for App {
-    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-        if cause != StartCause::Init {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // A desktop may resume more than once. Only the first opens the window.
+        if !std::mem::take(&mut self.starting) {
             return;
         }
-        // The first window opens here, not in `resumed`, which a desktop may call again later.
         let opened = match self.reading.take().map(|reading| reading.join().expect("reading does not panic")) {
-            Some(Ok(opened)) => Ok((opened, true)),
+            Some(Ok(opened)) => Ok(Some(opened)),
             Some(Err(error)) => {
                 let path = self.path.as_deref().unwrap_or(Path::new(""));
                 Err(format!("{} could not be opened.\n\n{error}", path.display()))
             }
-            None => Ok((untitled(), false)),
+            None => Ok(None),
         };
         self.mark("document read");
-        let shown = opened.and_then(|(opened, home)| {
-            self.open_window(event_loop, opened, home).map_err(|error| format!("No window could be opened.\n\n{error}"))
+        let shown = opened.and_then(|opened| {
+            self.open_window(event_loop, opened).map_err(|error| format!("No window could be opened.\n\n{error}"))
         });
         if let Err(failure) = shown {
             if !self.report_launch {
@@ -481,8 +485,6 @@ impl ApplicationHandler<Event> for App {
             self.fail(event_loop, failure);
         }
     }
-
-    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Self { windows, platform, mods, .. } = self;

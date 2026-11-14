@@ -45,7 +45,9 @@ pub trait Replica {
     /// Takes in whatever the copy on disk holds that memory lacks. This is also where a writer learns which
     /// of its own journalled changes have reached the shared file.
     ///
-    /// An error means the copy cannot be read as this document, and the save treats it as damaged.
+    /// An error means the copy cannot be read as this document, and the save treats it as damaged. The
+    /// exception is [`Error::Unmerged`]: the copy is sound but cannot be merged, so the save leaves it alone
+    /// and writes a conflict copy.
     fn merge(&mut self, disk: &mut DiskCopy) -> Result<(), Error>;
 
     /// The document as it should be written now.
@@ -113,8 +115,8 @@ pub fn save(files: &mut impl Files, replica: &mut impl Replica, save: &Save) -> 
         if let Some(bytes) = disk {
             match open(bytes, replica) {
                 Ok(copy) => base = Some(copy),
-                // Another document, or a newer build's file, is never ours to replace.
-                Err(error @ (Error::OtherDocument(_) | Error::NewerFormat(_))) => {
+                // Another document, a newer build's file, or changes we cannot merge are never ours to replace.
+                Err(error @ (Error::OtherDocument(_) | Error::NewerFormat(_) | Error::Unmerged)) => {
                     cause = error;
                     break;
                 }

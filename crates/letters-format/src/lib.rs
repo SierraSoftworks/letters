@@ -53,6 +53,8 @@ pub enum Error {
     Notes(JsonError),
     /// The file holds a different document, named here by its id.
     OtherDocument(String),
+    /// The file holds changes that memory could not take in, so replacing it would lose them.
+    Unmerged,
     /// The folder refused a read, a write or a rename.
     Files(String),
 }
@@ -70,6 +72,7 @@ impl fmt::Display for Error {
             Self::Style(error) => write!(f, "{STYLE}: {error}"),
             Self::Notes(error) => write!(f, "{NOTES}: {error}"),
             Self::OtherDocument(id) => write!(f, "the file holds another document ({id})"),
+            Self::Unmerged => f.write_str("the file holds changes that could not be merged"),
             Self::Files(message) => write!(f, "the folder could not be used: {message}"),
         }
     }
