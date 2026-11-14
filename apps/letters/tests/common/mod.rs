@@ -21,14 +21,16 @@ fn replica() -> ReplicaId {
 impl Writer {
     /// The writer of a new document.
     pub fn new(document: &Document, style: Style) -> Self {
-        Self { model: Model::new(document.clone(), replica()), copy: files::new_copy(document.clone(), style) }
+        let model = Model::new(document.clone(), replica()).with_style(style.clone());
+        Self { model, copy: files::new_copy(document.clone(), style) }
     }
 
     /// The writer of a document that was opened, once the rest of its file is read as it is after the first
     /// paint. Returns where its saves go too.
     pub fn of(opened: Opened) -> (Self, Home) {
         let replica = replica();
-        let mut model = Model::new(opened.document, replica);
+        // The editor's history starts from the style on screen, as a window's does.
+        let mut model = Model::new(opened.document, replica).with_style(opened.style);
         let Working { copy, history } = opened.rest.read(replica).unwrap();
         if let Some(history) = history {
             model.attach(history);
