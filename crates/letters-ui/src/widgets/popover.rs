@@ -44,6 +44,7 @@ pub struct Popover<M> {
     pub(crate) on_close: Option<M>,
     pub(crate) modal: bool,
     pub(crate) shows_focus: bool,
+    pub(crate) beside: bool,
     pub(crate) popup: HasPopup,
 }
 
@@ -67,6 +68,7 @@ impl<M> Popover<M> {
             on_close: None,
             modal: false,
             shows_focus: false,
+            beside: false,
             popup: HasPopup::Dialog,
         }
     }
@@ -132,6 +134,14 @@ impl<M> Popover<M> {
     /// pressing anything.
     pub fn shows_focus(mut self) -> Self {
         self.shows_focus = true;
+        self
+    }
+
+    /// Leaves focus where it is when the popover opens, for a flyout under a field that is being typed
+    /// into. Tab then goes round the field and the popover as one, and Escape in either drops what the
+    /// field holds.
+    pub fn beside(mut self) -> Self {
+        self.beside = true;
         self
     }
 

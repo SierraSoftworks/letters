@@ -5,7 +5,7 @@ use letters_editor::InputEvent;
 use letters_model::{Align, Block, BlockKind, Document, Pos, Selection, TextStyle};
 use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
-use letters_ui::{Landing, Recent, Request, SaveState};
+use letters_ui::{Folder, Landing, Location, Recent, Request, SaveState};
 
 fn text(id: &str, kind: BlockKind, text: &str) -> Block {
     Block::text(id, kind, text)
@@ -65,7 +65,7 @@ fn landing() -> Landing {
 
 /// The page area.
 fn page(window: &mut Harness) -> Rect {
-    window.find(Role::Document, "Letters").expect("the page").bounds
+    window.controls().into_iter().find(|found| found.role == Role::Document).expect("the page").bounds
 }
 
 /// The lines the outline draws, top to bottom, each with its colour.
@@ -225,7 +225,7 @@ fn a_click_on_the_page_moves_the_caret_there() {
 fn the_bar_names_the_document_its_save_state_and_the_type_at_the_caret() {
     let mut window = letter();
     window.ui().set_document_name("Quote");
-    window.assert_open(Role::Label, "Quote").assert_open(Role::Label, "Saved").assert_open(Role::Label, "Heading 1");
+    window.assert_open(Role::Button, "Quote").assert_open(Role::Label, "Saved").assert_open(Role::Label, "Heading 1");
 
     window.ui().set_save_state(SaveState::Offline);
     window.ui().select(Selection::caret(Pos::new("p1", 0)));
@@ -585,7 +585,7 @@ fn a_narrowing_window_folds_alignment_then_the_marks_then_the_whole_style() {
         let (first, last) = (&controls[0].1, &controls[controls.len() - 1].1);
         assert!(first.x >= 0.0 && last.x + last.width <= width as f32, "at {width} the bar is in the window");
     }
-    window.assert_open(Role::Label, name);
+    window.assert_open(Role::Button, name);
     assert!(folds.is_sorted(), "the bar only folds further as the window narrows: {folds:?}");
     assert_eq!((folds[0], folds[folds.len() - 1]), (0, 3), "from everything shown to everything folded");
     window.resize(1400.0, 600.0).assert_open(Role::Button, "Align left").assert_open(Role::Button, "Bold");
@@ -1028,9 +1028,9 @@ fn writing_starts_on_the_page_behind_the_landing_card() {
 fn a_document_without_a_name_takes_its_first_heading_once_the_caret_leaves_it() {
     let mut window = blank();
     window.ui().select(Selection::caret(Pos::new("p", 0)));
-    window.assert_open(Role::Label, "Untitled");
+    window.assert_open(Role::Button, "Untitled");
     window.type_text("# Cottage renov");
-    window.assert_open(Role::Label, "Cottage renov").assert_closed(Role::Label, "Untitled");
+    window.assert_open(Role::Button, "Cottage renov").assert_closed(Role::Button, "Untitled");
     assert_eq!(window.ui().take_requests(), [], "nothing is asked while the heading is being typed");
 
     window.type_text("ation").key("Enter");
@@ -1039,7 +1039,7 @@ fn a_document_without_a_name_takes_its_first_heading_once_the_caret_leaves_it() 
     // Once it has its name, the heading can change without the name following.
     window.ui().set_document_name("Cottage renovation");
     window.key("Up").type_text("The ").key("Down");
-    window.assert_open(Role::Label, "Cottage renovation");
+    window.assert_open(Role::Button, "Cottage renovation");
     assert_eq!(window.ui().take_requests(), [], "the name is taken once");
 }
 
@@ -1053,6 +1053,7 @@ fn the_bar_says_how_saving_stands_and_where_the_first_write_went() {
         (SaveState::Failed, Some("Not saved")),
         (SaveState::Saved, Some("Saved")),
     ];
+    let bar = bar_controls(&mut window);
     for (state, said) in states {
         window.ui().set_save_state(state);
         let shown: Vec<&str> = ["Saving", "Not saved", "Saved"]
@@ -1060,12 +1061,15 @@ fn the_bar_says_how_saving_stands_and_where_the_first_write_went() {
             .filter(|label| window.find(Role::Label, label).is_some())
             .collect();
         assert_eq!(shown, Vec::from_iter(said), "{state:?}");
+        assert_eq!(bar_controls(&mut window), bar, "nothing in the bar moves when the document is {state:?}");
     }
 
+    // Where the first write went is told under the icon for a moment, and the bar stays as it is.
     window.ui().set_saved_in("House");
-    window.assert_open(Role::Label, "Saved in House");
-    window.advance(0).advance(2000).assert_open(Role::Label, "Saved in House");
-    window.advance(3000).assert_closed(Role::Label, "Saved in House").assert_open(Role::Label, "Saved");
+    window.assert_open(Role::Label, "Saved in House").assert_open(Role::Tooltip, "Saved in House");
+    assert_eq!(bar_controls(&mut window), bar);
+    window.advance(0).advance(2000).assert_open(Role::Tooltip, "Saved in House");
+    window.advance(3000).assert_closed(Role::Tooltip, "Saved in House").assert_open(Role::Label, "Saved");
 }
 
 #[test]
@@ -1075,4 +1079,187 @@ fn the_more_menu_asks_the_shell_for_a_new_document_or_another_one() {
         window.click(Role::Button, "More").click(Role::MenuItem, item);
         assert_eq!(window.ui().take_requests(), [request], "{item}");
     }
+}
+
+/// Where the cottage's plan is kept: in House, in the space called Family. Holidays holds a folder too.
+fn family() -> Location {
+    let folder = |path: &str| Folder {
+        path: path.into(),
+        name: path.rsplit('/').next().unwrap_or_default().into(),
+        depth: path.matches('/').count() as u8 - 1,
+    };
+    let folders = [
+        "/Family",
+        "/Family/House",
+        "/Family/House/Quotes",
+        "/Family/House/Photos",
+        "/Family/Holidays",
+        "/Family/Holidays/2026",
+        "/Family/School",
+    ];
+    Location {
+        name: Some("Cottage renovation".into()),
+        folder: "/Family/House".into(),
+        folders: folders.map(folder).into(),
+    }
+}
+
+/// The letter, kept where [`family`] says, with its name open to be typed over.
+fn renaming() -> Harness {
+    let mut window = letter();
+    window.ui().set_location(family());
+    window.click(Role::Button, "Cottage renovation");
+    window
+}
+
+/// The folders the flyout shows, from the top.
+fn folders(window: &mut Harness) -> Vec<String> {
+    window.controls().into_iter().filter(|found| found.role == Role::TreeItem).map(|found| found.name).collect()
+}
+
+/// The role, name and value of what the keyboard's focus is on.
+fn focus(window: &mut Harness) -> (Role, String, String) {
+    let focused = window.focused().expect("something has focus");
+    (focused.role, focused.name, focused.value.unwrap_or_default())
+}
+
+fn click_the_page(window: &mut Harness) {
+    let page = page(window);
+    window.click_at(Point { x: page.x + page.width / 2.0, y: page.y + page.height - 40.0 });
+}
+
+#[test]
+fn the_name_in_the_bar_is_typed_over_and_the_shell_is_asked_for_it() {
+    let mut window = renaming();
+    assert_eq!(focus(&mut window), (Role::TextInput, "Document name".into(), "Cottage renovation".into()));
+    window.type_text("Cottage plan").key("Enter");
+    assert_eq!(window.ui().take_requests(), [Request::Rename("Cottage plan".into())], "typing replaces the old name");
+    window.assert_closed(Role::TextInput, "Document name");
+
+    // The bar shows the name the shell answers with, and writing goes on in the document.
+    window.ui().set_location(Location { name: Some("Cottage plan".into()), ..family() });
+    window.assert_open(Role::Button, "Cottage plan");
+    window.type_text("!");
+    assert!(window.markdown().contains('!'), "{}", window.markdown());
+}
+
+#[test]
+fn a_typed_name_is_taken_on_enter_or_a_press_elsewhere_and_dropped_on_escape() {
+    type Leave = fn(&mut Harness);
+    let cases: [(&str, &str, Leave, bool); 5] = [
+        ("Enter", "Roof quotes", |window| _ = window.key("Enter"), true),
+        ("a press on the page", "Roof quotes", click_the_page, true),
+        ("Escape", "Roof quotes", |window| _ = window.key("Escape"), false),
+        ("Escape among the folders", "Roof quotes", |window| _ = window.key("Tab").key("Escape"), false),
+        ("Enter on the name as it was", "Cottage renovation", |window| _ = window.key("Enter"), false),
+    ];
+    for (leave, name, act, taken) in cases {
+        let mut window = renaming();
+        window.type_text(name);
+        act(&mut window);
+        let asked = if taken { vec![Request::Rename(name.into())] } else { Vec::new() };
+        assert_eq!(window.ui().take_requests(), asked, "{leave}");
+        window.assert_closed(Role::TextInput, "Document name").assert_closed(Role::Tree, "Move to");
+    }
+}
+
+#[test]
+fn a_name_the_shell_refuses_comes_back_to_be_changed() {
+    let mut window = renaming();
+    window.type_text("Roof quotes").key("Enter");
+    window.ui().take_requests();
+    let why = "There is already a document called \u{201c}Roof quotes\u{201d} in that folder.";
+    window.ui().set_notice(Some(why));
+    window.assert_open(Role::Alert, why);
+    assert_eq!(focus(&mut window), (Role::TextInput, "Document name".into(), "Roof quotes".into()));
+
+    // Another name takes the notice away, and is asked for in turn.
+    window.type_text(", second round");
+    window.assert_closed(Role::Alert, why);
+    window.key("Enter");
+    let asked = window.ui().take_requests();
+    assert!(matches!(&asked[..], [Request::Rename(name)] if name.ends_with(", second round")), "{asked:?}");
+}
+
+#[test]
+fn the_flyout_lists_the_folders_and_moves_the_document_to_the_one_picked() {
+    let mut window = renaming();
+    assert_eq!(folders(&mut window), ["Family", "House", "Quotes", "Photos", "Holidays", "School"]);
+    let here = window.find(Role::TreeItem, "House").expect("the folder it is in");
+    assert_eq!(here.description.as_deref(), Some("It is here"));
+    let nowhere = |window: &mut Harness| window.find(Role::Button, "Move").is_some_and(|button| button.disabled);
+    assert!(nowhere(&mut window), "there is nowhere to move to until a folder is picked");
+
+    // The folder it is in already is nowhere to move to.
+    window.click(Role::TreeItem, "Quotes").assert_open(Role::Button, "Move to Quotes");
+    window.click(Role::TreeItem, "House");
+    assert!(nowhere(&mut window));
+
+    window.click(Role::TreeItem, "Quotes").click(Role::Button, "Move to Quotes");
+    assert_eq!(window.ui().take_requests(), [Request::Move("/Family/House/Quotes".into())]);
+    window.assert_closed(Role::Tree, "Move to").assert_closed(Role::TextInput, "Document name");
+
+    let mut window = renaming();
+    window.click(Role::Button, "Other location\u{2026}");
+    assert_eq!(window.ui().take_requests(), [Request::MoveElsewhere]);
+    window.assert_closed(Role::Tree, "Move to");
+}
+
+#[test]
+fn the_folders_are_opened_and_picked_from_the_keyboard() {
+    let mut window = renaming();
+    window.key("Tab");
+    assert_eq!(focus(&mut window).1, "Family", "Tab goes from the name to the folders");
+    for _ in 0..4 {
+        window.key("Down");
+    }
+    assert_eq!(focus(&mut window).1, "Holidays");
+    window.key("Right");
+    assert!(folders(&mut window).contains(&"2026".to_owned()), "Right opens a folder");
+    window.key("Left");
+    assert!(!folders(&mut window).contains(&"2026".to_owned()), "and Left closes it");
+
+    // Enter picks a folder. The name and the flyout are one round for Tab, and Enter in the name moves too.
+    window.key("Right").key("Down").key("Enter");
+    window.assert_open(Role::Button, "Move to 2026");
+    window.key("Shift+Tab");
+    assert_eq!(focus(&mut window).1, "Document name");
+    window.key("Enter");
+    assert_eq!(window.ui().take_requests(), [Request::Move("/Family/Holidays/2026".into())]);
+}
+
+#[test]
+fn a_new_folder_is_asked_for_by_name_and_picked_once_the_shell_lists_it() {
+    // The folder picked, if any, and the folder the new one then goes into.
+    for (picked, parent) in [(Some("Photos"), "/Family/House/Photos"), (None, "/Family/House")] {
+        let mut window = renaming();
+        if let Some(picked) = picked {
+            window.click(Role::TreeItem, picked);
+        }
+        window.click(Role::Button, "New folder");
+        assert_eq!(focus(&mut window).1, "Folder name");
+        window.type_text("Before").key("Enter");
+        let asked = Request::NewFolder { parent: parent.into(), name: "Before".into() };
+        assert_eq!(window.ui().take_requests(), [asked], "{picked:?}");
+
+        let mut location = family();
+        let at = location.folders.iter().position(|folder| folder.path == parent).expect("the parent");
+        let depth = location.folders[at].depth + 1;
+        location.folders.insert(at + 1, Folder { path: format!("{parent}/Before"), name: "Before".into(), depth });
+        window.ui().set_location(location);
+        window.assert_open(Role::TreeItem, "Before").assert_open(Role::Button, "Move to Before");
+    }
+}
+
+#[test]
+fn a_document_with_no_folders_to_show_is_renamed_from_the_field_alone() {
+    let mut window = blank();
+    window.click(Role::Button, "Untitled");
+    window.assert_closed(Role::Tree, "Move to");
+    // A name that is not the document's own is not offered to keep.
+    assert_eq!(focus(&mut window), (Role::TextInput, "Document name".into(), String::new()));
+    window.type_text("Shopping");
+    click_the_page(&mut window);
+    assert_eq!(window.ui().take_requests(), [Request::Rename("Shopping".into())]);
+    window.assert_closed(Role::TextInput, "Document name");
 }

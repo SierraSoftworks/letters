@@ -100,7 +100,10 @@ fn role_of<M>(tree: &Tree<M>, i: usize, named: bool) -> Option<Role> {
 /// Whether a role's name is the text inside it, as for a button.
 fn named_by_content(role: Role) -> bool {
     use Role::*;
-    matches!(role, Button | DefaultButton | Link | MenuItem | MenuItemCheckBox | MenuItemRadio | Tab | ListBoxOption)
+    matches!(
+        role,
+        Button | DefaultButton | Link | MenuItem | MenuItemCheckBox | MenuItemRadio | Tab | ListBoxOption | TreeItem
+    )
 }
 
 fn collect<M>(tree: &Tree<M>, window: &Window<'_>, i: usize, named: bool, siblings: &mut Vec<NodeId>, out: &mut Nodes) {
@@ -143,6 +146,9 @@ fn collect<M>(tree: &Tree<M>, window: &Window<'_>, i: usize, named: bool, siblin
     }
     if let Some(selected) = access.selected {
         node.set_selected(selected);
+    }
+    if let Some(expanded) = access.expanded {
+        node.set_expanded(expanded);
     }
     if access.modal {
         node.set_modal();

@@ -17,6 +17,7 @@ mod layout;
 pub mod motion;
 mod opening;
 mod paint;
+mod renaming;
 mod restyle;
 mod spelling;
 mod style;

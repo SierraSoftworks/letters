@@ -22,6 +22,7 @@ use crate::icon::{self, Icon};
 use crate::motion::{self, FRAME_MS};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
+use crate::renaming::{Outcome, Rename, Renaming};
 use crate::restyle::{self, Field, StyleEdit, Styles};
 use crate::spelling::{Fix, Spelling};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
@@ -63,6 +64,8 @@ const CARD_WIDTH: f32 = 544.0;
 const RECENT_HEIGHT: f32 = 38.0;
 /// How long the bar says which folder a document was first written to, in milliseconds.
 const SAVED_NOTE_MS: u64 = 4000;
+/// The size of the icon that says how saving stands.
+const SAVE_ICON: f32 = 14.0;
 
 /// The editor's window.
 pub type Window = Ui<EditorApp>;
@@ -141,6 +144,8 @@ pub enum Message {
     NewDocument,
     /// Puts the landing card away: this window's document is the one to write.
     Start,
+    /// Renames the document where its name stands, or moves it from the flyout under the name.
+    Rename(Rename),
 }
 
 impl Ui<EditorApp> {
@@ -172,12 +177,32 @@ impl Ui<EditorApp> {
 
     /// Names the document. Shorthand for a [`Window::set_location`] that changes nothing else.
     pub fn set_document_name(&mut self, name: &str) {
-        self.app_mut().location.name = Some(name.to_owned()).filter(|name| !name.is_empty());
+        let app = self.app_mut();
+        let name = Some(name.to_owned()).filter(|name| !name.is_empty());
+        app.place(Location { name, ..app.location.clone() });
     }
 
-    /// Says what the document is called and where it is kept.
+    /// Says what the document is called and where it is kept. It is also the answer to a
+    /// [`Request::Rename`], [`Request::Move`] or [`Request::NewFolder`] that was done.
     pub fn set_location(&mut self, location: Location) {
-        self.app_mut().location = location;
+        self.app_mut().place(location);
+    }
+
+    /// Says why a rename, a move or a new folder could not be done, as the person is to read it. The name
+    /// field comes back with what was typed, marked as wrong, and says so until something in it changes.
+    /// `None` takes the notice away.
+    pub fn set_notice(&mut self, notice: Option<&str>) {
+        let app = self.app_mut();
+        match notice {
+            Some(notice) => {
+                let asked = app.renaming.take().or(app.asked.take());
+                let mut renaming = asked.unwrap_or_else(|| Renaming::open(&app.location));
+                renaming.notice = Some(notice.to_owned());
+                app.renaming = Some(renaming);
+            }
+            None => _ = app.renaming.as_mut().map(|renaming| renaming.notice = None),
+        }
+        app.asked = None;
     }
 
     /// Shows the landing card over a document nobody has written in, or takes it away. The card goes by
@@ -317,6 +342,10 @@ pub struct EditorApp {
     saved_in: Option<(String, Option<u64>)>,
     /// Whether the caret is in the heading that will name the document.
     naming: bool,
+    /// The name field in the bar, while the document is being renamed or moved.
+    renaming: Option<Renaming>,
+    /// What the field held when the shell was last asked for it, to bring back if the shell refuses.
+    asked: Option<Renaming>,
     save: SaveState,
     edits: u64,
     panel: Option<Panel>,
@@ -353,6 +382,8 @@ impl EditorApp {
             requests: Vec::new(),
             saved_in: None,
             naming: false,
+            renaming: None,
+            asked: None,
             save: SaveState::default(),
             edits: 0,
             panel: None,
@@ -383,6 +414,28 @@ impl EditorApp {
         (heading.filter(|heading| !heading.is_empty()).unwrap_or_else(|| "Untitled".into()), false)
     }
 
+    /// Takes the shell's word for where the document is, which also answers what the name field asked.
+    fn place(&mut self, location: Location) {
+        self.location = location;
+        self.asked = None;
+        if let Some(renaming) = &mut self.renaming {
+            renaming.placed(&self.location);
+        }
+    }
+
+    /// What the name field and its flyout ask for.
+    fn rename(&mut self, message: Rename) {
+        let Some(mut renaming) = self.renaming.take() else {
+            self.renaming = (message == Rename::Open).then(|| Renaming::open(&self.location));
+            return;
+        };
+        match renaming.update(message, &self.location, &mut self.requests) {
+            Outcome::Open => self.renaming = Some(renaming),
+            Outcome::Asked => self.asked = Some(renaming),
+            Outcome::Closed => {}
+        }
+    }
+
     /// Puts the landing card away and the caret on the page.
     fn start(&mut self) {
         self.landing = None;
@@ -403,10 +456,13 @@ impl EditorApp {
     /// Keeps up which form of the bar fits a window of `width`: forgotten when something that decides it
     /// has changed, and learnt from the layout after that.
     fn refold(&mut self, width: f32) {
+        // The name field keeps its place in the bar for as long as it is open.
+        if self.renaming.is_some() && self.folded.form.is_some() {
+            return;
+        }
         let style = self.element().and_then(|element| Some((element, &self.style.types.get(element)?.family)));
         let mut hasher = DefaultHasher::new();
-        let note = self.saved_in.as_ref().map(|note| &note.0);
-        (width.to_bits(), self.name(), std::mem::discriminant(&self.save), note, style).hash(&mut hasher);
+        (width.to_bits(), self.name(), style).hash(&mut hasher);
         let key = hasher.finish();
         if key != self.folded.key {
             self.folded = Folded { key, form: None, seen: Fitted::default() };
@@ -867,17 +923,17 @@ impl EditorApp {
 
         // The forms of the bar, from the widest. Once the layout has said which fits, only that one is built.
         let forms = [
-            (NAME_WIDTH.2, Fold::None, false),
-            (NAME_WIDTH.1, Fold::None, false),
-            (NAME_WIDTH.1, Fold::Alignment, false),
-            (NAME_WIDTH.1, Fold::Marks, false),
-            (NAME_WIDTH.1, Fold::Style, false),
-            (NAME_WIDTH.1, Fold::Style, true),
+            (NAME_WIDTH.2, Fold::None),
+            (NAME_WIDTH.1, Fold::None),
+            (NAME_WIDTH.1, Fold::Alignment),
+            (NAME_WIDTH.1, Fold::Marks),
+            (NAME_WIDTH.1, Fold::Style),
         ];
         let mut bar = TopBar::new().shown(self.folded.seen.clone());
-        for (n, (name, fold, brief)) in forms.into_iter().enumerate() {
+        for (n, (name, fold)) in forms.into_iter().enumerate() {
             if self.folded.form.is_none_or(|form| form == n) {
-                bar = self.lead(name, brief).into_iter().fold(bar.form(n), TopBar::start);
+                let shown = self.folded.form == Some(n);
+                bar = self.lead(name, shown).into_iter().fold(bar.form(n), TopBar::start);
                 bar = self.tools(fold).into_iter().fold(bar, TopBar::middle);
             }
         }
@@ -891,42 +947,59 @@ impl EditorApp {
         bar.end(panels.child(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End)))).into()
     }
 
-    /// What the bar starts with: the document's name, in no more than `room`, and whether it is saved, which
-    /// `brief` says with the icon alone.
-    fn lead(&self, room: f32, brief: bool) -> Vec<Element<Message>> {
+    /// What the bar starts with: the document's name, in no more than `room`, and whether it is saved. A
+    /// press on the name makes it a field, in the form of the bar that is `shown`.
+    fn lead(&self, room: f32, shown: bool) -> Vec<Element<Message>> {
         // A name that is not the document's own is grey, as a field's placeholder is.
         let (name, own) = self.name();
+        let page = Element::icon(icon::FILE_TEXT, 18.0).fg(tokens::FG_MUTED);
+        if let Some(renaming) = self.renaming.as_ref().filter(|_| shown) {
+            return vec![page, renaming.field(&name, room, &self.location).min_width(NAME_WIDTH.0)];
+        }
         let style = TextStyle::control().weight(if own { 600 } else { 400 });
         // The name gives way to the controls after it, down to a few letters.
-        let name = Element::text(name, style).min_width(NAME_WIDTH.0).max_width(room).shrink();
+        let name = Element::text(name.as_str(), style)
+            .min_width(NAME_WIDTH.0)
+            .max_width(room)
+            .shrink()
+            .role(Role::Button)
+            .label(name)
+            .description("Rename or move")
+            .tooltip("Rename or move", Side::Bottom)
+            .on_press(Message::Rename(Rename::Open))
+            .cursor(Cursor::Text);
         let name = if own { name } else { name.fg(tokens::FG_MUTED) };
-        let mut lead = vec![Element::icon(icon::FILE_TEXT, 18.0).fg(tokens::FG_MUTED), name];
+        let mut lead = vec![page, name];
 
-        let (state_icon, state, ink) = match self.save {
-            SaveState::Saved => (icon::CLOUD_CHECK, "Saved", tokens::FG_MUTED),
-            SaveState::Saving => (icon::REFRESH_CW, "Saving", tokens::FG_MUTED),
-            SaveState::Offline => (icon::CLOUD_OFF, "Offline", tokens::FG_MUTED),
-            SaveState::Failed => (icon::CLOUD_ALERT, "Not saved", tokens::DANGER),
-            SaveState::Unsaved => return lead,
+        // How saving stands is an icon of one size whatever it says, so that nothing after it moves when
+        // saving starts. A document not yet written keeps the room.
+        let (state, said, more, ink) = match self.save {
+            SaveState::Saved => (icon::CLOUD_CHECK, "Saved", None, tokens::FG_MUTED),
+            SaveState::Saving => (icon::REFRESH_CW, "Saving", None, tokens::FG_MUTED),
+            SaveState::Offline => {
+                (icon::CLOUD_OFF, "Offline", Some("Changes are kept on this device"), tokens::FG_MUTED)
+            }
+            SaveState::Failed => {
+                (icon::CLOUD_ALERT, "Not saved", Some("The last changes could not be written"), tokens::DANGER)
+            }
+            SaveState::Unsaved => {
+                lead.push(Element::row().width(SAVE_ICON).decorative());
+                return lead;
+            }
         };
-        // A saved document says so with the icon alone, but for the moment after its first write.
-        let note = self
-            .saved_in
-            .as_ref()
-            .filter(|_| self.save == SaveState::Saved)
-            .map(|(folder, _)| format!("Saved in {folder}"));
-        let said = note.clone().unwrap_or_else(|| state.to_owned());
-        let mut saved =
-            Element::row().align(Align::Center).gap(tokens::SPACE_XS).fg(ink).child(Element::icon(state_icon, 14.0));
-        saved = match (brief || self.save == SaveState::Saved) && note.is_none() {
-            true => saved.role(Role::Label).label(said.as_str()).tooltip(said, Side::Bottom),
-            false => saved.child(Element::text(said, TextStyle::control().size(tokens::TEXT_SM))),
-        };
-        saved = match self.save {
-            SaveState::Offline => saved.description("Changes are kept on this device"),
-            SaveState::Failed => saved.description("The last changes could not be written"),
-            _ => saved,
-        };
+        // For a moment after its first write, the icon tells where the document went.
+        let note = self.saved_in.as_ref().filter(|_| self.save == SaveState::Saved);
+        let said = note.map_or_else(|| said.to_owned(), |(folder, _)| format!("Saved in {folder}"));
+        let tip = more.map_or_else(|| said.clone(), |more| format!("{said}. {more}"));
+        let mut saved = Element::icon(state, SAVE_ICON)
+            .fg(ink)
+            .role(Role::Label)
+            .label(said)
+            .tooltip(tip, Side::Bottom)
+            .telling(note.is_some());
+        if let Some(more) = more {
+            saved = saved.description(more);
+        }
         lead.push(saved);
         lead
     }
@@ -1183,6 +1256,7 @@ impl App for EditorApp {
             Message::OpenDialog => self.requests.push(Request::OpenDialog),
             Message::NewDocument => self.requests.push(Request::New),
             Message::Start => self.start(),
+            Message::Rename(message) => self.rename(message),
             Message::Jump(block) => {
                 let start = Pos { block, offset: 0 };
                 self.editor.select(Selection::caret(start.clone()));

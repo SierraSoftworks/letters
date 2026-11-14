@@ -13,6 +13,16 @@ pub enum Request {
     New,
     /// The caret left the first Heading 1 of a document that has no name of its own: it takes this one.
     Named(String),
+    /// Call the document this. Answer with `Window::set_location`, or with `Window::set_notice` when it
+    /// cannot be done.
+    Rename(String),
+    /// Move the document to the folder with this path. Answered as a rename is.
+    Move(String),
+    /// Let the person choose a folder that is not in the tree, and move the document there.
+    MoveElsewhere,
+    /// Make a folder called `name` in the folder with the path `parent`, and list it with
+    /// `Window::set_location`.
+    NewFolder { parent: String, name: String },
 }
 
 /// A document opened lately, as the landing card lists it.
@@ -50,7 +60,8 @@ pub struct Location {
 pub struct Folder {
     pub path: String,
     pub name: String,
-    /// How far down the tree it is. The first folder, at 0, is the space itself.
+    /// How far down the tree it is. A folder at 0 is the space itself, or one outside it that holds the
+    /// document.
     pub depth: u8,
 }
 

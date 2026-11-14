@@ -148,6 +148,8 @@ pub struct Ui<A: App> {
     layers: Vec<Id>,
     /// For each open popover, where focus was before it opened.
     returns: Vec<(Id, Option<Id>)>,
+    /// The elements that ask for focus when they first show, as of the last build.
+    asking: Vec<Id>,
     /// The popovers that open and close themselves, by anchor.
     open: HashSet<Id>,
     inputs: HashMap<Id, InputState>,
@@ -187,6 +189,7 @@ impl<A: App> Ui<A> {
             focus_visible: false,
             layers: Vec::new(),
             returns: Vec::new(),
+            asking: Vec::new(),
             open: HashSet::new(),
             inputs: HashMap::new(),
             scroll: HashMap::new(),
@@ -608,9 +611,14 @@ impl<A: App> Ui<A> {
         if event.key == Key::Escape {
             // A field drops what was typed into it, and then Escape closes the topmost popover before it
             // means anything else.
-            let dropped = focused.and_then(|i| match &self.tree.nodes[i].el.content {
+            let cancel = |i: usize| match &self.tree.nodes[i].el.content {
                 Content::Input(input) => input.on_cancel.clone(),
                 _ => None,
+            };
+            // In a popover beside a field, Escape means what it means in the field.
+            let dropped = focused.and_then(|i| {
+                let layer = &self.tree.layers[self.tree.nodes[i].layer];
+                cancel(i).or_else(|| layer.anchor.filter(|_| layer.beside).and_then(cancel))
             });
             let cancelled = dropped.is_some();
             self.queue.extend(dropped);
@@ -682,7 +690,14 @@ impl<A: App> Ui<A> {
         let modal = self.tree.modal_layer();
         let held = focused.map(|i| self.tree.nodes[i].layer).filter(|&layer| modal.is_none_or(|modal| layer >= modal));
         let layer = &self.tree.layers[held.or(modal).unwrap_or(0)];
-        let stops = self.tab_stops(layer.root..layer.end, focused);
+        // A popover beside its anchor is one round with it.
+        let beside = self.tree.layers.iter().find(|layer| {
+            layer.beside && focused.is_some_and(|i| layer.anchor == Some(i) || (layer.root..layer.end).contains(&i))
+        });
+        let stops: Vec<usize> = match beside {
+            Some(layer) => layer.anchor.into_iter().chain(self.tab_stops(layer.root..layer.end, focused)).collect(),
+            None => self.tab_stops(layer.root..layer.end, focused),
+        };
         let at = focused.and_then(|i| stops.iter().position(|&stop| stop == i));
         let next = match (at, back) {
             (Some(at), false) => (at + 1) % stops.len(),
@@ -867,12 +882,14 @@ impl<A: App> Ui<A> {
     }
 
     /// Works out which tooltip shows: the one of the element under the pointer, or else of the element the
-    /// keyboard's focus is on.
+    /// keyboard's focus is on, or else of one that has news to tell.
     fn update_tip(&mut self) {
         let has = |&i: &usize| self.tree.nodes[i].el.tooltip.is_some() && !self.tree.disabled(i);
         let hovered = self.hover.iter().filter_map(|id| self.tree.find(*id)).find(has);
         let focused = self.focused().filter(|_| self.focus_visible).filter(has);
-        let Some(node) = hovered.or(focused).map(|i| &self.tree.nodes[i]) else {
+        let telling =
+            || (0..self.tree.nodes.len()).filter(|&i| self.tree.nodes[i].el.telling && !self.tree.gone(i)).find(has);
+        let Some(node) = hovered.or(focused).or_else(telling).map(|i| &self.tree.nodes[i]) else {
             self.tip = None;
             return;
         };
@@ -1157,22 +1174,31 @@ impl<A: App> Ui<A> {
         if let Some(before) = restored {
             focus = before;
         }
-        // One that opened takes it.
+        // One that opened takes it, as does an element that asks for it when it first shows.
+        let mut took = Vec::new();
         for (layer, anchor) in tree.layers.iter().skip(1).zip(&anchors) {
             if !self.layers.contains(anchor) {
-                self.returns.push((*anchor, focus));
-                if let Some(&first) = tree.focusables(layer.root..layer.end).first() {
-                    let node = &tree.nodes[first];
-                    // A field reached this way is ready to be typed over, as one reached by Tab is.
-                    if let Content::Input(input) = &node.el.content {
-                        self.inputs.entry(node.id).or_default().select_all(&input.value);
-                    }
-                    focus = Some(node.id);
+                self.returns.push((*anchor, took.last().map_or(focus, |&i: &usize| Some(tree.nodes[i].id))));
+                // One beside its anchor leaves focus where it is.
+                let first = tree.focusables(layer.root..layer.end).first().copied();
+                if let Some(first) = first.filter(|_| !layer.beside) {
+                    took.push(first);
                     self.focus_visible |= layer.shows_focus;
                 }
             }
         }
         self.layers = anchors;
+        let asking: Vec<Id> = tree.nodes.iter().filter(|node| node.el.takes_focus).map(|node| node.id).collect();
+        took.extend(asking.iter().find(|id| !self.asking.contains(id)).and_then(|id| tree.find(*id)));
+        self.asking = asking;
+        if let Some(&took) = took.last() {
+            let node = &tree.nodes[took];
+            // A field reached this way is ready to be typed over, as one reached by Tab is.
+            if let Content::Input(input) = &node.el.content {
+                self.inputs.entry(node.id).or_default().select_all(&input.value);
+            }
+            focus = Some(node.id);
+        }
 
         if focus.and_then(|id| tree.find(id)).is_none_or(|i| !tree.focusable(i)) {
             focus = self.rest();

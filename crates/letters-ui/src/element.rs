@@ -110,6 +110,7 @@ pub(crate) struct Access {
     pub pressed: Option<bool>,
     pub checked: Option<bool>,
     pub selected: Option<bool>,
+    pub expanded: Option<bool>,
     pub modal: bool,
     /// Decoration: left out of the accessibility tree, with everything in it.
     pub hidden: bool,
@@ -130,12 +131,14 @@ pub struct Element<M> {
     pub(crate) focus: Focus,
     pub(crate) disabled: bool,
     pub(crate) rest: bool,
+    pub(crate) takes_focus: bool,
     pub(crate) closes: bool,
     pub(crate) arrows: Option<Dir>,
     pub(crate) one_stop: bool,
     pub(crate) cursor: Cursor,
     pub(crate) popover: Option<Box<Popover<M>>>,
     pub(crate) tooltip: Option<(String, Side)>,
+    pub(crate) telling: bool,
     pub(crate) fitted: Option<Fitted>,
 }
 
@@ -159,12 +162,14 @@ impl<M> Element<M> {
             focus: Focus::No,
             disabled: false,
             rest: false,
+            takes_focus: false,
             closes: false,
             arrows: None,
             one_stop: false,
             cursor: Cursor::Default,
             popover: None,
             tooltip: None,
+            telling: false,
             fitted: None,
         }
     }
@@ -422,6 +427,14 @@ impl<M> Element<M> {
         self
     }
 
+    /// Sends `message` when the element is clicked, and keeps it out of the keyboard's reach: for a part of a
+    /// focusable element whose job the keys do another way, as the arrow of a tree's row.
+    pub fn on_click(mut self, message: M) -> Self {
+        self.on_press = Some(message);
+        self.cursor = Cursor::Pointer;
+        self
+    }
+
     /// Offers this element the keys nothing inside it used. Returning a message uses the key.
     pub fn on_key(mut self, handler: impl Fn(&KeyEvent) -> Option<M> + 'static) -> Self {
         self.on_key = Some(Rc::new(handler));
@@ -443,6 +456,14 @@ impl<M> Element<M> {
     /// Makes this the element focus rests on whenever nothing else holds it, as the page does.
     pub fn default_focus(mut self) -> Self {
         self.rest = true;
+        self.focus = self.focus.max(Focus::Keys);
+        self
+    }
+
+    /// Gives this element the keyboard's focus when it first shows, as a field that opens in place of what
+    /// it edits.
+    pub fn takes_focus(mut self) -> Self {
+        self.takes_focus = true;
         self.focus = self.focus.max(Focus::Keys);
         self
     }
@@ -469,6 +490,13 @@ impl<M> Element<M> {
     /// Shows `text` beside the element while the pointer is over it or the keyboard's focus is on it.
     pub fn tooltip(mut self, text: impl Into<String>, side: Side) -> Self {
         self.tooltip = Some((text.into(), side));
+        self
+    }
+
+    /// Shows the tooltip without being pointed at, while the element has news to tell. One under the pointer
+    /// or the keyboard's focus still comes first.
+    pub fn telling(mut self, telling: bool) -> Self {
+        self.telling = telling;
         self
     }
 
@@ -538,6 +566,12 @@ impl<M> Element<M> {
 
     pub fn selected(mut self, selected: bool) -> Self {
         self.access.selected = Some(selected);
+        self
+    }
+
+    /// Says whether a row that has others under it shows them, as a folder in a tree.
+    pub fn expanded(mut self, expanded: bool) -> Self {
+        self.access.expanded = Some(expanded);
         self
     }
 
