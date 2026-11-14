@@ -24,6 +24,8 @@ pub const WINDOW: Size = Size { width: 1280.0, height: 800.0 };
 pub struct TestPlatform {
     pub now_ms: u64,
     pub clipboard: Option<Clip>,
+    /// The words the person added to their own dictionary.
+    pub learned: Vec<String>,
     ids: u64,
 }
 
@@ -43,6 +45,10 @@ impl Platform for TestPlatform {
     fn new_id(&mut self) -> String {
         self.ids += 1;
         format!("t{}", self.ids)
+    }
+
+    fn learn_word(&mut self, word: &str) {
+        self.learned.push(word.to_owned());
     }
 }
 
@@ -220,6 +226,19 @@ impl<A: App> Harness<A> {
     pub fn release_at(&mut self, at: Point) -> &mut Self {
         self.ui.pointer_move(at, &mut self.platform);
         self.ui.pointer_up(at, &mut self.platform);
+        self
+    }
+
+    /// Presses the secondary button at a point, as to ask for a menu there.
+    pub fn secondary_click_at(&mut self, at: Point) -> &mut Self {
+        self.ui.pointer_move(at, &mut self.platform);
+        self.ui.secondary_down(at, &mut self.platform);
+        self
+    }
+
+    /// Presses the Menu key.
+    pub fn menu_key(&mut self) -> &mut Self {
+        self.ui.menu_key(&mut self.platform);
         self
     }
 

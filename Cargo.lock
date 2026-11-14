@@ -2448,6 +2448,7 @@ dependencies = [
  "letters-layout",
  "letters-model",
  "letters-render",
+ "letters-spell",
  "yewi-highlight",
  "yewi-tokens",
 ]

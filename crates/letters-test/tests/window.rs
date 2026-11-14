@@ -3,7 +3,7 @@
 use accesskit::{Action, ActionData, ActionRequest, TextPosition, TextSelection, TreeId};
 use letters_editor::InputEvent;
 use letters_model::{Align, Block, BlockKind, Document, Pos, Selection, TextStyle};
-use letters_render::{Color, Item, Point, Rect};
+use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
 use letters_ui::SaveState;
 
@@ -94,6 +94,44 @@ fn marked(reduced_motion: bool) -> Harness {
 }
 
 const INSIDE: usize = 11;
+
+/// Lets the window do the work it keeps for idle time, all of it.
+fn rest(window: &mut Harness) {
+    // A frame that is owed comes first.
+    window.paint();
+    let mut steps = 0;
+    while window.ui().animate(0) == Some(0) {
+        steps += 1;
+        assert!(steps < 10_000, "idle work comes to an end");
+        window.paint();
+    }
+}
+
+/// The wavy lines under misspelled words, left to right down the page: where each starts and ends.
+fn waves(window: &mut Harness) -> Vec<(Point, Point)> {
+    let page = page(window);
+    let wave = |item: &Item| match item {
+        Item::Path { origin, path, stroke: Some(_), .. } if page.contains(*origin) => {
+            let ends = path.iter().filter_map(|el| if let PathEl::QuadTo(_, end) = el { Some(end.x) } else { None });
+            Some((*origin, Point { x: origin.x + ends.fold(0.0, f32::max), y: origin.y }))
+        }
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(wave).collect()
+}
+
+/// A sentence with one misspelled word, checked.
+fn misspelled() -> Harness {
+    let mut window = Harness::doc("The quik brown fox.");
+    rest(&mut window);
+    window
+}
+
+/// Asks for the menu on the first wavy line, as a press of the secondary button on its word does.
+fn ask_about_first_wave(window: &mut Harness) {
+    let (start, end) = waves(window)[0];
+    window.secondary_click_at(Point { x: (start.x + end.x) / 2.0, y: start.y - 6.0 });
+}
 
 fn head(window: &Harness) -> Pos {
     window.editor().selection().expect("a selection").head.clone()
@@ -795,4 +833,113 @@ fn a_screen_reader_reads_the_document_and_edits_it() {
     assert_eq!(selected(&window), "Harland");
     window.ask(ask(Action::ReplaceSelectedText, ActionData::Value("Hartley".into())));
     assert_eq!(block_text(&window, "p1"), "Hartley Roofing sent a quote.");
+}
+
+#[test]
+fn misspelled_words_are_underlined_once_the_window_has_a_moment() {
+    let mut window = Harness::doc("The quik brown fox.\n\nA plain line with nothing wrong.");
+    rest(&mut window);
+    let [(start, end)] = waves(&mut window)[..] else { panic!("one word is wrong, and one is marked") };
+    let (from, to) = (spot(&mut window, "b1", 4), spot(&mut window, "b1", 8));
+    assert!((start.x - from.x).abs() < 1.5 && (end.x - to.x).abs() < 1.5, "the line runs under the word");
+    assert!(start.y > from.y && start.y < from.y + from.height + 4.0, "at the foot of its letters");
+}
+
+#[test]
+fn a_word_is_not_called_wrong_while_it_is_being_typed() {
+    // What the writer does, and how many words are then marked.
+    let steps = [
+        ("helo", 0, "a word still being typed is left alone"),
+        (" ", 1, "it is marked once the caret has left it"),
+        ("Backspace", 0, "going back into it takes the mark off"),
+        ("Backspace", 0, ""),
+        ("lo", 0, "and mending it leaves nothing to mark"),
+        (" wrld", 0, ""),
+        ("Home", 1, "a caret that leaves by a key marks the word as well"),
+    ];
+    let mut window = Harness::doc("Say");
+    window.ui().select(Selection::caret(Pos::new("b1", 3)));
+    window.type_text(" ");
+    for (step, marked, why) in steps {
+        match step {
+            "Backspace" | "Home" => window.key(step),
+            text => window.type_text(text),
+        };
+        assert_eq!(waves(&mut window).len(), marked, "after {step:?} in {:?}: {why}", window.markdown());
+    }
+}
+
+#[test]
+fn the_menu_on_a_misspelled_word_puts_a_correction_in_its_place() {
+    let mut window = misspelled();
+    ask_about_first_wave(&mut window);
+    window.assert_open(Role::Menu, "Spelling").click(Role::MenuItem, "quick");
+    window.assert_markdown("The quick brown fox.").assert_closed(Role::Menu, "Spelling");
+    assert!(waves(&mut window).is_empty(), "nothing is left to mark");
+    assert!(window.focused().is_some_and(|found| found.role == Role::Document), "the keyboard is back on the page");
+
+    window.key("Mod+Z").assert_markdown("The quik brown fox.");
+    assert_eq!(waves(&mut window).len(), 1, "one undo takes the correction back, mark and all");
+}
+
+#[test]
+fn the_menu_opens_for_a_marked_word_alone_by_pointer_or_the_menu_key() {
+    // Where in "The quik brown fox." the menu is asked for, and whether there is one to open.
+    for (offset, opens) in [(6, true), (8, true), (1, false), (12, false)] {
+        for by in ["pointer", "menu key"] {
+            let mut window = misspelled();
+            let at = spot(&mut window, "b1", offset);
+            match by {
+                "pointer" => window.secondary_click_at(Point { x: at.x, y: at.y + at.height / 2.0 }),
+                _ => window.menu_key(),
+            };
+            assert_eq!(window.find(Role::Menu, "Spelling").is_some(), opens, "at {offset} by {by}");
+            window.key("Escape").assert_closed(Role::Menu, "Spelling");
+            assert!(window.focused().is_some_and(|found| found.role == Role::Document), "at {offset} by {by}");
+        }
+    }
+
+    let mut window = Harness::doc("It ends in quik");
+    rest(&mut window);
+    let end = spot(&mut window, "b1", 15);
+    window.secondary_click_at(Point { x: end.x + 200.0, y: end.y + end.height / 2.0 });
+    window.assert_closed(Role::Menu, "Spelling");
+}
+
+#[test]
+fn a_word_is_accepted_from_the_menu_or_from_the_persons_own_list() {
+    // How the word comes to be accepted, and whether the shell is handed it to keep.
+    for (route, kept) in [("Add to my dictionary", true), ("Add to this document", false), ("the shell's list", false)]
+    {
+        let mut window = Harness::doc("Ask Zorvex for a quote.\n\nZorvex replied.");
+        rest(&mut window);
+        assert_eq!(waves(&mut window).len(), 2, "{route}: the name is marked wherever it stands");
+        match route {
+            "the shell's list" => window.ui().set_user_words(["Zorvex"]),
+            item => {
+                ask_about_first_wave(&mut window);
+                window.click(Role::MenuItem, item);
+                assert_eq!(waves(&mut window).len(), 1, "{route}: its own block is cleared at once");
+            }
+        }
+        rest(&mut window);
+        assert!(waves(&mut window).is_empty(), "{route}: and the rest of the document after it");
+        assert_eq!(window.platform.learned, if kept { vec!["Zorvex"] } else { vec![] }, "{route}");
+        window.assert_markdown("Ask Zorvex for a quote.\n\nZorvex replied.");
+    }
+}
+
+#[test]
+fn a_change_from_outside_shows_on_the_page_without_moving_it() {
+    let mut window = long();
+    window.scroll_at(Point { x: 500.0, y: 400.0 }, 3000.0).click_at(Point { x: 500.0, y: 300.0 });
+    let before = caret(&mut window);
+
+    // Another writer makes the first paragraph several lines long, far above what is in view.
+    let mut doc = window.editor().doc().clone();
+    doc.blocks[0] = text("p0", BlockKind::Paragraph, &"One more line of the letter. ".repeat(40));
+    window.ui().change(|editor| editor.rewrite(doc)).expect("the document is taken in");
+    assert!(block_text(&window, "p0").len() > 1000, "the editor holds the change");
+    let after = caret(&mut window);
+    assert!((after.y - before.y).abs() <= 1.0, "the line the writer is on stays put: {before:?} to {after:?}");
 }

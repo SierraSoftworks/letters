@@ -12,6 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+letters-spell.workspace = true
 letters-model.workspace = true
 letters-render.workspace = true
 letters-fonts.workspace = true

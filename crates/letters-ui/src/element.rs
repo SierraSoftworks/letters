@@ -50,6 +50,11 @@ pub enum Pointer {
     Up {
         at: Point,
     },
+    /// A menu about what is at `at` is wanted: the secondary button went down there, or the Menu key was
+    /// pressed with the caret there.
+    Menu {
+        at: Point,
+    },
     /// The wheel turned, or two fingers moved. A positive `y` moves the content up. Returning a message
     /// takes the scroll, so that nothing behind the canvas moves as well.
     Scroll {

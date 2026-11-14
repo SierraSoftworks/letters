@@ -477,6 +477,39 @@ impl<A: App> Ui<A> {
         self.flush(platform);
     }
 
+    /// The secondary button went down, which asks for a menu about what is under the pointer.
+    pub fn secondary_down(&mut self, at: Point, platform: &mut dyn Platform) {
+        self.refresh();
+        self.pointer = Some(at);
+        let blocked = self.dismiss(self.hit(at));
+        self.flush(platform);
+        self.refresh();
+        if blocked {
+            return;
+        }
+        let Some(i) = self.hit(at).and_then(|hit| self.target(hit)).filter(|&i| !self.tree.disabled(i)) else { return };
+        if self.tree.nodes[i].el.focus == Focus::Click {
+            self.set_focus(Some(self.tree.nodes[i].id), false);
+        }
+        self.ask_menu(i, self.within(i, at), platform);
+    }
+
+    /// The Menu key or Shift+F10, which asks for a menu about what is at the caret.
+    pub fn menu_key(&mut self, platform: &mut dyn Platform) {
+        self.refresh();
+        let Some(i) = self.focused() else { return };
+        let Content::Canvas(canvas) = &self.tree.nodes[i].el.content else { return };
+        let Some(caret) = canvas.caret else { return };
+        self.ask_menu(i, Point { x: caret.x, y: caret.y + caret.height / 2.0 }, platform);
+    }
+
+    fn ask_menu(&mut self, i: usize, at: Point, platform: &mut dyn Platform) {
+        if let Content::Canvas(canvas) = &self.tree.nodes[i].el.content {
+            self.queue.extend(canvas.on_pointer.as_ref().and_then(|handler| handler(Pointer::Menu { at })));
+        }
+        self.flush(platform);
+    }
+
     pub fn pointer_up(&mut self, at: Point, platform: &mut dyn Platform) {
         self.refresh();
         self.pointer = Some(at);

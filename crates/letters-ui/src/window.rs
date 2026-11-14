@@ -12,6 +12,7 @@ use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, L
 use letters_layout::{Callout, DocLayout, Fonts, Palette, Syntax};
 use letters_model::{Align as TextAlign, Block, BlockId, BlockKind, Change, Mark, Pos, Selection, Style};
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
+use letters_spell::Dictionary;
 
 use crate::color::{fade, resolve, same};
 use crate::describe::{self, Request};
@@ -21,6 +22,7 @@ use crate::icon::{self, Icon};
 use crate::motion::{self, FRAME_MS};
 use crate::paint::scrollbar;
 use crate::restyle::{self, Field, StyleEdit, Styles};
+use crate::spelling::{Fix, Spelling};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::text::{Family, FontShaper, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
@@ -111,6 +113,14 @@ pub enum Message {
     Apply(Field),
     /// Drops what was typed into a field.
     Forget,
+    /// Puts a correction in place of the misspelled word the menu is about.
+    Correct(String),
+    /// Accepts that word from now on: in the person's own dictionary, or in this document's.
+    Learn {
+        mine: bool,
+    },
+    /// Puts the menu about a misspelled word away.
+    Unfix,
 }
 
 impl Ui<EditorApp> {
@@ -146,6 +156,25 @@ impl Ui<EditorApp> {
 
     pub fn set_save_state(&mut self, state: SaveState) {
         self.app_mut().save = state;
+    }
+
+    /// The person's own words, which are right in every document: the lines of their dictionary file. A
+    /// word they add from the page is handed to `Platform::learn_word` to be kept there.
+    pub fn set_user_words(&mut self, words: impl IntoIterator<Item = impl AsRef<str>>) {
+        self.app_mut().spelling.set_user_words(words);
+    }
+
+    /// Adds the dictionary of a language for its text to be checked against. English is built in, and text
+    /// in a language without a dictionary is left alone.
+    pub fn add_dictionary(&mut self, language: &str, dictionary: Dictionary) {
+        self.app_mut().spelling.add_dictionary(language, dictionary);
+    }
+
+    /// Runs something on the editor from outside, such as taking in another writer's edits, and brings the
+    /// page up to date with what it changed. The page stays where it is scrolled to.
+    pub fn change<E>(&mut self, act: impl FnOnce(&mut Editor) -> Result<Change, E>) -> Result<(), E> {
+        let app = self.app_mut();
+        app.held(|app| act(&mut app.editor).map(|change| app.follow(&change)))
     }
 }
 
@@ -245,6 +274,7 @@ pub struct EditorApp {
     /// said so.
     fading: Option<Option<u64>>,
     reduced_motion: bool,
+    spelling: Spelling,
     dragging: bool,
 }
 
@@ -271,6 +301,7 @@ impl EditorApp {
             lexed: HashMap::new(),
             fading: None,
             reduced_motion: false,
+            spelling: Spelling::default(),
             dragging: false,
         }
     }
@@ -343,6 +374,8 @@ impl EditorApp {
         let markers = self.editor.markers();
         let changed = self.layout.reveal(head.as_ref().map(|head| (head, &markers)));
         self.layout.set_composition(self.editor.composition());
+        let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
+        self.spelling.moved(caret, &mut self.layout);
         let composing = self.editor.composition().is_some();
         if changed {
             let at_once = self.reduced_motion || composing;
@@ -362,14 +395,34 @@ impl EditorApp {
 
     /// Brings the layout and the viewport up to date after the editor did something.
     fn changed(&mut self, change: &Change) {
+        self.follow(change);
+        self.reveal();
+    }
+
+    /// Brings the layout up to date with a change to the document, and what is marked on the page with it.
+    fn follow(&mut self, change: &Change) {
         if !change.blocks.is_empty() || change.structure {
             self.edits += 1;
             self.layout.update(self.editor.doc(), &self.style, self.column.1, Some(change));
             self.estimated = true;
             self.highlight((!change.structure).then_some(&change.blocks));
+            let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
+            self.spelling.edited(change, self.editor.doc(), caret, &mut self.layout);
         }
         self.mark();
-        self.reveal();
+    }
+
+    /// Does something that may change the height of what is above the view, and keeps the view's top line
+    /// where it is.
+    fn held<R>(&mut self, act: impl FnOnce(&mut Self) -> R) -> R {
+        let pin = self.layout.hit(Point { x: 0.0, y: self.viewport().y.max(0.0) });
+        let top = |layout: &DocLayout| pin.as_ref().and_then(|pos| layout.caret(pos)).map(|caret| caret.y);
+        let before = top(&self.layout);
+        let done = act(self);
+        if let (Some(before), Some(after)) = (before, top(&self.layout)) {
+            self.scroll_by(after - before);
+        }
+        done
     }
 
     /// The part of the document in view, in the layout's coordinates.
@@ -436,8 +489,49 @@ impl EditorApp {
             }
             Pointer::Drag { .. } => {}
             Pointer::Up { .. } => self.dragging = false,
+            Pointer::Menu { at } => self.menu(at),
             Pointer::Scroll { delta } => self.scroll_by(delta.y),
         }
+    }
+
+    /// Opens the menu about what is at a point of the page area: for now, a word marked as misspelled.
+    fn menu(&mut self, at: Point) {
+        let Some(pos) = self.hit(at) else { return };
+        let Some(range) = self.layout.spelling_at(&pos) else { return };
+        // The word itself was meant, not the room its line leaves beside it.
+        let word = Selection {
+            anchor: Pos::new(pos.block.clone(), range.start),
+            head: Pos::new(pos.block.clone(), range.end),
+        };
+        let spot = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        let near = |rect: &Rect| {
+            (rect.x - 2.0..=rect.x + rect.width + 2.0).contains(&spot.x)
+                && (rect.y..=rect.y + rect.height).contains(&spot.y)
+        };
+        if !self.layout.selection(&word).iter().any(near) {
+            return;
+        }
+        // A selection is left alone, so that the menu can come to serve it as well.
+        if self.editor.selection().is_none_or(Selection::is_caret) {
+            self.editor.select(Selection::caret(pos.clone()));
+            self.mark();
+        }
+        self.link = None;
+        self.spelling.ask(self.editor.doc(), &pos, &self.layout);
+    }
+
+    /// The menu about a misspelled word: corrections, and the two dictionaries that can take the word.
+    fn fixes(fix: &Fix) -> Menu<Message> {
+        let mut menu = Menu::new().label("Spelling");
+        for suggestion in &fix.suggestions {
+            menu = menu.item(MenuItem::new(suggestion).on_select(Message::Correct(suggestion.clone())));
+        }
+        if fix.suggestions.is_empty() {
+            menu = menu.item(MenuItem::new("No suggestions").disabled(true));
+        }
+        menu.separator()
+            .item(MenuItem::new("Add to this document").on_select(Message::Learn { mine: false }))
+            .item(MenuItem::new("Add to my dictionary").on_select(Message::Learn { mine: true }))
     }
 
     /// Lays the document out for the room it has and paints the part in view.
@@ -487,7 +581,13 @@ impl EditorApp {
             .caret(caret)
             .on_text(Message::Text)
             .on_pointer(|event| Some(Message::Pointer(event)));
-        if let Some(address) = &self.link {
+        if let Some(fix) = &self.spelling.fix {
+            // The menu hangs from the start of its word.
+            let start = self.layout.caret(&Pos::new(fix.block.clone(), fix.range.start)).unwrap_or_default();
+            let spot = Rect { x: origin.x + start.x, y: origin.y + start.y, ..start };
+            let menu = Self::fixes(fix).popover().at(spot).open(true).on_close(Message::Unfix);
+            element = element.popover(menu);
+        } else if let Some(address) = &self.link {
             let field = TextField::new("Link", address)
                 .placeholder("Paste or type a link")
                 .on_input(Message::LinkDraft)
@@ -882,6 +982,14 @@ impl App for EditorApp {
             Message::Panel(panel) => self.panel = (self.panel != Some(panel)).then_some(panel),
             Message::ClosePanel => self.panel = None,
             Message::Share(open) => self.sharing = open,
+            Message::Correct(text) => {
+                let Some(fix) = self.spelling.fix.take() else { return };
+                let (anchor, head) = (Pos::new(fix.block.clone(), fix.range.start), Pos::new(fix.block, fix.range.end));
+                self.editor.select(Selection { anchor, head });
+                self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(text), platform));
+            }
+            Message::Learn { mine } => self.spelling.learn(mine, self.editor.doc(), &mut self.layout, platform),
+            Message::Unfix => self.spelling.fix = None,
             Message::Jump(block) => {
                 let start = Pos { block, offset: 0 };
                 self.editor.select(Selection::caret(start.clone()));
@@ -984,19 +1092,13 @@ impl App for EditorApp {
     }
 
     fn idle(&mut self) -> bool {
-        if !self.estimated {
-            return false;
+        if self.estimated {
+            // Blocks above the part in view change height as they are laid out.
+            self.held(|app| app.estimated = app.layout.settle(app.viewport(), SETTLE_BYTES));
+            return true;
         }
-        // Blocks above the part in view change height as they are laid out, so its top line is held still.
-        let viewport = self.viewport();
-        let pin = self.layout.hit(Point { x: 0.0, y: viewport.y.max(0.0) });
-        let top = |layout: &DocLayout| pin.as_ref().and_then(|pos| layout.caret(pos)).map(|caret| caret.y);
-        let before = top(&self.layout);
-        self.estimated = self.layout.settle(viewport, SETTLE_BYTES);
-        if let (Some(before), Some(after)) = (before, top(&self.layout)) {
-            self.scroll_by(after - before);
-        }
-        true
+        let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
+        self.spelling.idle(self.editor.doc(), caret, &mut self.layout)
     }
 }
 
