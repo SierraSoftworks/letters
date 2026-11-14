@@ -773,6 +773,8 @@ impl App {
                     let make = |library: &Library| library.new_folder(Path::new(&parent), &name).map(drop);
                     refused = !self.replace(id, now, |_, library| make(library));
                 }
+                // A request this shell does not know yet.
+                _ => {}
             }
         }
     }

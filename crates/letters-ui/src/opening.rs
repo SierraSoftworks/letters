@@ -3,7 +3,10 @@
 //! The window knows no file system. A path is a string the shell made, which it gets back unchanged.
 
 /// What the window asks its shell to do. Collect them with `Window::take_requests` after each event.
+///
+/// More will come, so a shell matches the ones it can do and lets the rest go.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Request {
     /// Open the recent document with this path.
     Open(String),
