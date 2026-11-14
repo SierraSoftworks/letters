@@ -136,7 +136,12 @@ impl Layout<'_> {
     }
 
     fn measure_children<M>(&mut self, tree: &mut Tree<M>, i: usize, style: &Style, inner: f32) -> Size {
-        let children: Vec<usize> = tree.children(i).collect();
+        // An overlay is measured for itself and takes no room.
+        let (overlays, children): (Vec<usize>, Vec<usize>) =
+            tree.children(i).partition(|&child| tree.nodes[child].el.style.overlay);
+        for overlay in overlays {
+            self.measure(tree, overlay, inner);
+        }
         let gaps = style.gap * children.len().saturating_sub(1) as f32;
         match style.dir {
             Dir::Column => {
@@ -181,11 +186,17 @@ impl Layout<'_> {
         let rect = snap(rect, self.scale);
         tree.nodes[i].rect = rect;
         let style = tree.nodes[i].el.style;
-        let children: Vec<usize> = tree.children(i).collect();
+        let inner = inner(rect, &style);
+        let (overlays, children): (Vec<usize>, Vec<usize>) =
+            tree.children(i).partition(|&child| tree.nodes[child].el.style.overlay);
+        for overlay in overlays {
+            let size = tree.nodes[overlay].size;
+            let over = Rect::new(inner.x, inner.y, size.width.min(inner.width), size.height.min(inner.height));
+            self.place(tree, overlay, over);
+        }
         if children.is_empty() {
             return;
         }
-        let inner = inner(rect, &style);
 
         let column = style.dir == Dir::Column;
         let (main, cross) = if column { (inner.height, inner.width) } else { (inner.width, inner.height) };
@@ -271,7 +282,7 @@ fn snap(rect: Rect, scale: f32) -> Rect {
 }
 
 /// Puts a popover beside its anchor, on the other side when it does not fit, and always inside the window.
-fn position(placement: Placement, anchor: Rect, size: Size, window: Size) -> Rect {
+pub(crate) fn position(placement: Placement, anchor: Rect, size: Size, window: Size) -> Rect {
     let anchor = match placement.at {
         Some(at) => Rect::new(anchor.x + at.x, anchor.y + at.y, at.width, at.height),
         None => anchor,

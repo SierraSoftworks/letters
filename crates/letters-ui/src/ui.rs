@@ -14,12 +14,13 @@ use letters_render::{DisplayList, Point, Rect, Size};
 use crate::access;
 use crate::element::{Content, Cursor, Element, Focus, Pointer};
 use crate::input::{InputState, Motion};
-use crate::layout::{Layout, TextCache, inner};
-use crate::paint::{self, Scene};
-use crate::style::Dir;
+use crate::layout::{Layout, TextCache, inner, position};
+use crate::paint::{self, Scene, Tip};
+use crate::style::{Align, Dir};
 use crate::text::TextShaper;
 use crate::tokens::Scheme;
 use crate::tree::{Id, Tree};
+use crate::widgets::Placement;
 
 /// Half a caret blink.
 const BLINK_MS: u64 = 500;
@@ -123,6 +124,8 @@ pub struct Ui<A: App> {
     idle: (bool, bool),
     blink_from: Option<u64>,
     caret_on: bool,
+    /// The tooltip that is showing.
+    tip: Option<Tip>,
 }
 
 impl<A: App> Ui<A> {
@@ -154,6 +157,7 @@ impl<A: App> Ui<A> {
             idle: (true, false),
             blink_from: None,
             caret_on: true,
+            tip: None,
         }
     }
 
@@ -199,6 +203,7 @@ impl<A: App> Ui<A> {
 
     pub fn paint(&mut self, out: &mut DisplayList) {
         self.refresh();
+        self.update_tip();
         self.stale.paint = false;
         let scene = Scene {
             scheme: self.scheme,
@@ -209,6 +214,7 @@ impl<A: App> Ui<A> {
             caret: self.caret_on && self.active,
             inputs: &self.inputs,
             scroll: &self.scroll,
+            tip: self.tip.as_ref(),
         };
         paint::paint(&self.tree, &scene, self.window(), out);
     }
@@ -278,6 +284,7 @@ impl<A: App> Ui<A> {
     /// The whole accessibility tree.
     pub fn access(&mut self) -> TreeUpdate {
         self.refresh();
+        self.update_tip();
         let title = self.app.title();
         let window = access::Window {
             title: &title,
@@ -285,6 +292,7 @@ impl<A: App> Ui<A> {
             scale: self.scale,
             focus: self.focus,
             inputs: &self.inputs,
+            tip: self.tip.as_ref().map(|tip| (tip.text.as_str(), tip.rect)),
             describe: &|node, nodes| self.app.describe(node, nodes),
         };
         access::build(&self.tree, &window)
@@ -440,7 +448,19 @@ impl<A: App> Ui<A> {
     pub fn scroll(&mut self, at: Point, delta: Point, platform: &mut dyn Platform) {
         self.refresh();
         let Some(hit) = self.hit(at) else { return };
-        // The innermost element that scrolls and has room to move takes the scroll.
+        if !self.scroll_from(hit, delta) {
+            // An overlay with nothing to scroll lets the wheel through to what it covers.
+            let under = self.tree.layers.iter().rev().find_map(|layer| self.hit_in(layer.root, at, true));
+            if let Some(under) = under.filter(|&under| under != hit) {
+                self.scroll_from(under, delta);
+            }
+        }
+        self.flush(platform);
+    }
+
+    /// Offers a scroll to an element and then to what it sits in. The innermost one that scrolls and has
+    /// room to move takes it.
+    fn scroll_from(&mut self, hit: usize, delta: Point) -> bool {
         for i in self.tree.ancestors(hit).collect::<Vec<_>>() {
             let handler = match &self.tree.nodes[i].el.content {
                 Content::Canvas(canvas) => canvas.on_pointer.as_ref(),
@@ -448,13 +468,13 @@ impl<A: App> Ui<A> {
             };
             if let Some(message) = handler.and_then(|handler| handler(Pointer::Scroll { delta })) {
                 self.queue.push(message);
-                break;
+                return true;
             }
             if self.scroll_by(i, delta.y) {
-                break;
+                return true;
             }
         }
-        self.flush(platform);
+        false
     }
 
     // The keyboard
@@ -549,7 +569,7 @@ impl<A: App> Ui<A> {
         let modal = self.tree.modal_layer();
         let held = focused.map(|i| self.tree.nodes[i].layer).filter(|&layer| modal.is_none_or(|modal| layer >= modal));
         let layer = &self.tree.layers[held.or(modal).unwrap_or(0)];
-        let stops = self.tree.focusables(layer.root..layer.end);
+        let stops = self.tab_stops(layer.root..layer.end, focused);
         let at = focused.and_then(|i| stops.iter().position(|&stop| stop == i));
         let next = match (at, back) {
             (Some(at), false) => (at + 1) % stops.len(),
@@ -561,6 +581,20 @@ impl<A: App> Ui<A> {
             self.set_focus(Some(self.tree.nodes[stop].id), true);
         }
         true
+    }
+
+    /// The elements Tab stops at. A group that is one stop gives the element in it that has focus, or else
+    /// its first.
+    fn tab_stops(&self, range: std::ops::Range<usize>, focused: Option<usize>) -> Vec<usize> {
+        let group = |i: usize| self.tree.ancestors(i).skip(1).find(|&at| self.tree.nodes[at].el.one_stop);
+        let within = focused.and_then(group);
+        let mut entered = HashSet::new();
+        let stop = |i: &usize| match group(*i) {
+            None => true,
+            Some(group) if Some(group) == within => Some(*i) == focused,
+            Some(group) => entered.insert(group),
+        };
+        self.tree.focusables(range).into_iter().filter(stop).collect()
     }
 
     /// Moves focus among the focusable elements inside `container`, wrapping at the ends.
@@ -698,7 +732,7 @@ impl<A: App> Ui<A> {
     /// The topmost element at a point. A modal popover hides everything beneath it.
     fn hit(&self, at: Point) -> Option<usize> {
         for layer in self.tree.layers.iter().rev() {
-            let hit = self.hit_in(layer.root, at);
+            let hit = self.hit_in(layer.root, at, false);
             if hit.is_some() || layer.modal {
                 return hit;
             }
@@ -706,15 +740,36 @@ impl<A: App> Ui<A> {
         None
     }
 
-    fn hit_in(&self, i: usize, at: Point) -> Option<usize> {
+    /// The topmost element at a point within `i`. `under` looks beneath overlays.
+    fn hit_in(&self, i: usize, at: Point, under: bool) -> Option<usize> {
         let node = &self.tree.nodes[i];
         let inside = node.rect.contains(at);
-        if node.el.style.clip && !inside {
+        if (node.el.style.clip && !inside) || (under && node.el.style.overlay) {
             return None;
         }
         // Later children are painted over earlier ones.
-        let child = self.tree.children(i).filter_map(|child| self.hit_in(child, at)).last();
+        let child = self.tree.children(i).filter_map(|child| self.hit_in(child, at, under)).last();
         child.or(inside.then_some(i))
+    }
+
+    /// Works out which tooltip shows: the one of the element under the pointer, or else of the element the
+    /// keyboard's focus is on.
+    fn update_tip(&mut self) {
+        let has = |&i: &usize| self.tree.nodes[i].el.tooltip.is_some() && !self.tree.disabled(i);
+        let hovered = self.hover.iter().filter_map(|id| self.tree.find(*id)).find(has);
+        let focused = self.focused().filter(|_| self.focus_visible).filter(has);
+        let Some(node) = hovered.or(focused).map(|i| &self.tree.nodes[i]) else {
+            self.tip = None;
+            return;
+        };
+        let Some((text, side)) = &node.el.tooltip else { return };
+        let shaped = match self.tip.take() {
+            Some(tip) if tip.text == *text => tip.shaped,
+            _ => Rc::new(self.shaper.shape(text, &Tip::TEXT, Some(Tip::WIDTH))),
+        };
+        let placement = Placement { side: *side, align: Align::Center, gap: Tip::GAP, at: None };
+        let rect = position(placement, node.rect, Tip::size(&shaped), self.size);
+        self.tip = Some(Tip { text: text.clone(), shaped, rect });
     }
 
     /// The element a press at `hit` is meant for: the nearest one that does something with it.

@@ -2,13 +2,16 @@
 
 use std::collections::HashMap;
 
-use letters_render::{DisplayList, Item, Point, Rect};
+use std::rc::Rc;
+
+use letters_render::{DisplayList, Item, Point, Rect, Size};
 
 use crate::color::{fade, resolve};
 use crate::element::Content;
 use crate::input::InputState;
 use crate::layout::inner;
-use crate::style::Ring;
+use crate::style::{Edges, Ring};
+use crate::text::{Shaped, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::tree::{Id, Tree};
 
@@ -16,6 +19,43 @@ use crate::tree::{Id, Tree};
 const RING: f32 = 2.0;
 const CARET: f32 = 1.0;
 const SCROLLBAR: f32 = 6.0;
+
+/// A tooltip that is showing: yewi's bubble, beside the element it names.
+pub(crate) struct Tip {
+    pub text: String,
+    pub shaped: Rc<Shaped>,
+    pub rect: Rect,
+}
+
+impl Tip {
+    pub const TEXT: TextStyle = TextStyle::control().size(tokens::TEXT_SM).leading(1.4);
+    /// The widest a bubble's text runs before it wraps.
+    pub const WIDTH: f32 = 320.0;
+    /// The room between a bubble and its element.
+    pub const GAP: f32 = 6.0;
+    const PADDING: Edges = Edges::xy(tokens::SPACE_SM, tokens::SPACE_XS);
+
+    /// The bubble's size around its text, border included.
+    pub fn size(shaped: &Shaped) -> Size {
+        Size {
+            width: shaped.size.width + Self::PADDING.horizontal() + 2.0,
+            height: shaped.size.height + Self::PADDING.vertical() + 2.0,
+        }
+    }
+
+    fn paint(&self, scheme: Scheme, out: &mut DisplayList) {
+        let (rect, radius) = (self.rect, tokens::RADIUS_CONTROL);
+        let color = |ink: Ink| resolve(ink, scheme, 1.0);
+        for shadow in tokens::SHADOW_CARD {
+            let offset = Point { x: shadow.x, y: shadow.y };
+            out.push(Item::Shadow { rect, color: color(shadow.color), blur: shadow.blur, offset, radius });
+        }
+        out.push(Item::Fill { rect, color: color(tokens::SURFACE_RAISED), radius });
+        out.push(Item::Stroke { rect, color: color(tokens::CARD_LINE), width: 1.0, radius });
+        let at = Point { x: rect.x + Self::PADDING.left + 1.0, y: rect.y + Self::PADDING.top + 1.0 };
+        self.shaped.paint(at, color(tokens::FG), out);
+    }
+}
 
 /// What painting needs to know beyond the tree: the scheme and where the pointer and focus are.
 pub(crate) struct Scene<'a> {
@@ -30,6 +70,7 @@ pub(crate) struct Scene<'a> {
     pub caret: bool,
     pub inputs: &'a HashMap<Id, InputState>,
     pub scroll: &'a HashMap<Id, f32>,
+    pub tip: Option<&'a Tip>,
 }
 
 #[derive(Clone, Copy)]
@@ -49,6 +90,9 @@ pub(crate) fn paint<M>(tree: &Tree<M>, scene: &Scene<'_>, window: Rect, out: &mu
         }
         node(tree, scene, layer.root, inherited, &mut rings, out);
         out.items.append(&mut rings);
+    }
+    if let Some(tip) = scene.tip {
+        tip.paint(scene.scheme, out);
     }
 }
 
@@ -90,7 +134,7 @@ fn node<M>(
             radius: style.radius,
         });
     }
-    if let Some(bg) = look.bg {
+    if let Some(bg) = look.bg.or(style.inked.then_some(fg)) {
         out.push(Item::Fill { rect, color: color(bg), radius: style.radius });
     }
     if let Some(border) = look.border {

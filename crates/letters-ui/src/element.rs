@@ -15,7 +15,7 @@ use crate::icon::Icon;
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring, Style};
 use crate::text::TextStyle;
 use crate::tokens::{Color as Ink, Scheme, Shadow};
-use crate::widgets::Popover;
+use crate::widgets::{Popover, Side};
 
 /// The pointer shape an element asks for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,8 +124,10 @@ pub struct Element<M> {
     pub(crate) rest: bool,
     pub(crate) closes: bool,
     pub(crate) arrows: Option<Dir>,
+    pub(crate) one_stop: bool,
     pub(crate) cursor: Cursor,
     pub(crate) popover: Option<Box<Popover<M>>>,
+    pub(crate) tooltip: Option<(String, Side)>,
 }
 
 impl<M> Element<M> {
@@ -147,8 +149,10 @@ impl<M> Element<M> {
             rest: false,
             closes: false,
             arrows: None,
+            one_stop: false,
             cursor: Cursor::Default,
             popover: None,
+            tooltip: None,
         }
     }
 
@@ -320,6 +324,20 @@ impl<M> Element<M> {
         self
     }
 
+    /// Fills the element with the text colour it inherits, so a mark inside a control follows the control's
+    /// states.
+    pub fn inked(mut self) -> Self {
+        self.style.inked = true;
+        self
+    }
+
+    /// Lays the element over its siblings at the top left of its parent. It takes no room among them, so it
+    /// goes last among the children to be drawn and hit above them.
+    pub fn overlay(mut self) -> Self {
+        self.style.overlay = true;
+        self
+    }
+
     pub fn opacity(mut self, opacity: f32) -> Self {
         self.style.opacity = opacity;
         self
@@ -409,6 +427,19 @@ impl<M> Element<M> {
     /// Moves focus between the focusable elements inside with the arrow keys along `dir`, and Home and End.
     pub fn arrows(mut self, dir: Dir) -> Self {
         self.arrows = Some(dir);
+        self
+    }
+
+    /// Makes everything inside one stop for the Tab key: the element in it that has focus, or else its
+    /// first. With [`Element::arrows`], a long list then costs a keyboard user one press to pass.
+    pub fn one_stop(mut self) -> Self {
+        self.one_stop = true;
+        self
+    }
+
+    /// Shows `text` beside the element while the pointer is over it or the keyboard's focus is on it.
+    pub fn tooltip(mut self, text: impl Into<String>, side: Side) -> Self {
+        self.tooltip = Some((text.into(), side));
         self
     }
 

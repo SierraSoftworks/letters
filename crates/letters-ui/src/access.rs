@@ -27,9 +27,14 @@ pub(crate) struct Window<'a> {
     pub scale: f32,
     pub focus: Option<Id>,
     pub inputs: &'a HashMap<Id, InputState>,
+    /// The tooltip that is showing, and where.
+    pub tip: Option<(&'a str, Rect)>,
     /// Lets the app fill in a canvas's node and add the nodes under it.
     pub describe: &'a dyn Fn(&mut AccessNode, &mut Nodes),
 }
+
+/// The key of the tooltip's node under the window.
+const TIP: u64 = 0x0074_6970;
 
 pub(crate) fn node_id(id: Id) -> NodeId {
     NodeId(id.0)
@@ -45,6 +50,15 @@ pub(crate) fn build<M>(tree: &Tree<M>, window: &Window<'_>) -> TreeUpdate {
     let mut children = Vec::new();
     for layer in &tree.layers {
         collect(tree, window, layer.root, false, &mut children, &mut nodes);
+    }
+
+    if let Some((text, rect)) = window.tip {
+        let mut tip = AccessNode::new(Role::Tooltip);
+        tip.set_label(text);
+        tip.set_bounds(bounds(rect));
+        let id = node_id(Id::WINDOW.child(TIP));
+        nodes.push((id, tip));
+        children.push(id);
     }
 
     let mut root = AccessNode::new(Role::Window);

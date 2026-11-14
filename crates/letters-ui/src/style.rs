@@ -151,6 +151,10 @@ pub struct Style {
     pub clip: bool,
     /// Scrolls vertically when the content is taller than the element.
     pub scroll: bool,
+    /// Sits at the top left of its parent, over its siblings, and takes no room among them.
+    pub overlay: bool,
+    /// Filled with the text colour it inherits, as a rule or a tick inside a control is.
+    pub inked: bool,
 }
 
 impl Default for Style {
@@ -179,6 +183,8 @@ impl Default for Style {
             opacity: 1.0,
             clip: false,
             scroll: false,
+            overlay: false,
+            inked: false,
         }
     }
 }
