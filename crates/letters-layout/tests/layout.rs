@@ -2,7 +2,7 @@
 
 use letters_layout::{Callout, DocLayout, FontSpec, Fonts, Palette, Shaper, Token, TokenKind};
 use letters_model::{
-    Block, BlockKind, Body, Document, ListKind, Mark, Model, Op, Pos, Run, Selection, Style, TextStyle, Tone,
+    Block, BlockKind, Body, Document, ListKind, Mark, Model, Op, Pos, ReplicaId, Run, Selection, Style, TextStyle, Tone,
 };
 use letters_render::{Color, DisplayList, Item, Point, Rect};
 
@@ -331,7 +331,7 @@ fn an_edit_gives_the_same_layout_as_starting_over() {
         ),
     ];
     for (name, ops) in edits {
-        let mut model = Model::new(start());
+        let mut model = Model::new(start(), ReplicaId::from(1));
         let mut layout = laid(model.doc());
         painted(&layout, everything());
         let change = model.apply(ops).unwrap();
@@ -349,7 +349,7 @@ fn an_edit_gives_the_same_layout_as_starting_over() {
 
 #[test]
 fn an_edit_is_exact_at_once() {
-    let mut model = Model::new(prose(200));
+    let mut model = Model::new(prose(200), ReplicaId::from(1));
     let mut layout = laid(model.doc());
     let viewport = Rect::new(0.0, 0.0, WIDTH, 600.0);
     painted(&layout, viewport);
@@ -574,7 +574,7 @@ fn tokens_follow_the_text_through_edits() {
         ("splitting the block after it", vec![Op::Split { at: Pos::new("c", 11), new_id: "n".into() }], 4),
     ];
     for (name, ops, coloured) in cases {
-        let mut model = Model::new(code());
+        let mut model = Model::new(code(), ReplicaId::from(1));
         let mut layout = laid(model.doc());
         layout.set_tokens(&"c".into(), vec![token("main", TokenKind::Keyword)]);
         let before = inked(&painted(&layout, everything()), keyword);

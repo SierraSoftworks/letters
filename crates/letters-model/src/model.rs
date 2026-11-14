@@ -1,18 +1,30 @@
 //! The one way to change a document.
 //!
 //! Every edit is a list of [`Op`]s applied as a unit: all of them land, or none do, and together they are one
-//! undo step. This first backing keeps whole-document snapshots. A CRDT replaces it behind the same interface.
+//! undo step. Behind the document sits its history, a CRDT, so any two copies of one document merge.
+//! [`Model::doc`] is a view of that history, brought up to date by each change and never rebuilt.
 
-use std::collections::BTreeSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
+use std::mem;
 use std::ops::Range;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::{Block, BlockId, BlockKind, Body, Document, Mark, Pos, Run};
+use loro::cursor::{Cursor, Side};
+use loro::{ContainerTrait, ExportMode, LoroDoc, LoroText, LoroValue, Subscription, TextDelta};
+
+use crate::crdt::{self, Event, attrs};
+use crate::flat::{self, BLOCK, DEPTH, Entry, Flat, head, insert, marker, nth, nth_mut};
+use crate::history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
+use crate::undo::{Delta, Script, Step, Steps, is_skip};
+use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, Mark, Pos, Run};
 
 /// One change to a document. Offsets are UTF-8 bytes into a text block and must sit on character boundaries.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
-    /// Inserts text, which takes the marks of the character before it.
+    /// Inserts text, which takes the formatting of the character before it, or at the start of a block
+    /// that of the character after it.
     InsertText {
         at: Pos,
         text: String,
@@ -37,7 +49,7 @@ pub enum Op {
         at: Pos,
         new_id: BlockId,
     },
-    /// Appends a text block's content to the text block before it, then removes it.
+    /// Appends a text block's content to the text block before it in the document, then removes it.
     Join {
         block: BlockId,
     },
@@ -74,6 +86,8 @@ pub enum OpError {
     DuplicateId(BlockId),
     /// There is no text block before this one to join.
     NothingToJoin(BlockId),
+    /// The model shows an older revision, which cannot be edited.
+    ReadOnly,
 }
 
 impl fmt::Display for OpError {
@@ -85,6 +99,7 @@ impl fmt::Display for OpError {
             Self::BadIndex { index } => write!(f, "index {index} is past the end of the list"),
             Self::DuplicateId(id) => write!(f, "the id \"{id}\" is already in use"),
             Self::NothingToJoin(id) => write!(f, "there is no text block before \"{id}\" to join"),
+            Self::ReadOnly => f.write_str("an older revision cannot be edited"),
         }
     }
 }
@@ -100,64 +115,731 @@ pub struct Change {
     pub structure: bool,
 }
 
-/// A document and its undo history.
-#[derive(Clone, Debug, Default)]
+impl Change {
+    fn absorb(&mut self, other: Change) {
+        self.blocks.extend(other.blocks);
+        self.structure |= other.structure;
+    }
+}
+
+/// The entry of a block, and where the block starts in the sequence, in characters.
+type Place = (usize, usize);
+
+/// One replica of a document: the document, its history and this session's undo steps.
+///
+/// A model is not `Clone`, because two writers must never share a [`ReplicaId`]. Clone [`Model::doc`] to
+/// read, and [`Model::fork`] to write.
 pub struct Model {
     doc: Document,
-    undo: Vec<Document>,
-    redo: Vec<Document>,
+    /// One entry per block, in document order.
+    index: Vec<Entry>,
+    loro: LoroDoc,
+    body: LoroText,
+    steps: Steps,
+    events: Arc<Mutex<Vec<Event>>>,
+    _watch: Subscription,
+}
+
+impl fmt::Debug for Model {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut model = f.debug_struct("Model");
+        model.field("replica", &self.replica()).field("revision", &self.revision().to_string());
+        model.field("doc", &self.doc).finish()
+    }
 }
 
 impl Model {
-    pub fn new(doc: Document) -> Self {
-        Self { doc, undo: Vec::new(), redo: Vec::new() }
+    /// Starts the history of a document that has none.
+    ///
+    /// The first change depends on the document alone, so two devices that open the same file without a
+    /// history can still merge their copies. Runs are stored merged, and a repeated block id is renamed.
+    pub fn new(doc: Document, replica: ReplicaId) -> Self {
+        Self::open(crdt::create(&doc), replica)
+    }
+
+    /// Opens a saved history, as [`Model::save`] or [`Model::updates_since`] wrote it.
+    pub fn load(history: &[u8], replica: ReplicaId) -> Result<Self, HistoryError> {
+        let loro = LoroDoc::new();
+        crdt::configure(&loro);
+        loro.import(history).map_err(unreadable)?;
+        Ok(Self::open(loro, replica))
+    }
+
+    /// A second replica at the newest revision, for another writer. It starts with no undo steps.
+    pub fn fork(&self, replica: ReplicaId) -> Self {
+        Self::load(&self.save(), replica).expect("a history that was just saved loads")
+    }
+
+    fn open(loro: LoroDoc, replica: ReplicaId) -> Self {
+        // Loro draws an id of its own for every document. It is replaced before anything is written.
+        loro.set_peer_id(replica.0).expect("a replica id is one Loro accepts");
+        let body = loro.get_text(crdt::BODY);
+        let (doc, index) = crdt::read(&loro, &body);
+        let (events, watch) = crdt::watch(&loro, &body);
+        Self { doc, index, loro, body, steps: Steps::default(), events, _watch: watch }
     }
 
     pub fn doc(&self) -> &Document {
         &self.doc
     }
 
-    /// Applies `ops` in order as one undo step.
+    pub fn replica(&self) -> ReplicaId {
+        ReplicaId(self.loro.peer_id())
+    }
+
+    /// Applies `ops` in order as one undo step. Ops that leave the document as it was are no step at all.
     pub fn apply(&mut self, ops: impl IntoIterator<Item = Op>) -> Result<Change, OpError> {
-        let before = self.doc.clone();
-        let mut change = Change::default();
-        for op in ops {
-            if let Err(error) = apply(&mut self.doc, op, &mut change) {
-                self.doc = before;
-                return Err(error);
+        if self.loro.is_detached() {
+            return Err(OpError::ReadOnly);
+        }
+        let ops: Vec<Op> = ops.into_iter().collect();
+        // One op changes the document whenever it changes the sequence. Several may cancel out, unless
+        // one of them adds or removes a block.
+        fn named(op: &Op) -> Option<&BlockId> {
+            match op {
+                Op::InsertText { at, .. } => Some(&at.block),
+                Op::DeleteText { block, .. } | Op::SetMark { block, .. } | Op::SetLink { block, .. } => Some(block),
+                Op::SetKind { block, .. } => Some(block),
+                Op::Split { .. } | Op::Join { .. } | Op::InsertBlock { .. } | Op::RemoveBlock { .. } => None,
             }
         }
-        if self.doc != before {
-            self.undo.push(before);
-            self.redo.clear();
+        let before: Option<Vec<Block>> = (ops.len() > 1)
+            .then(|| ops.iter().map(named).collect())
+            .flatten()
+            .map(|ids: BTreeSet<&BlockId>| ids.into_iter().filter_map(|id| self.doc.block(id).cloned()).collect());
+
+        let mut change = Change::default();
+        let mut edits = Vec::new();
+        let mut step = Step::new();
+        let mut refused = None;
+        for op in &ops {
+            match self.compile(op) {
+                Ok((delta, _)) if delta.is_empty() => {}
+                Ok((delta, place)) => {
+                    let (changed, undo) = self.shift(&delta, place);
+                    debug_assert!(undo.is_some(), "an edit that was checked did not fit the document");
+                    change.absorb(changed);
+                    step.push(undo.unwrap_or_default());
+                    edits.push(delta);
+                }
+                Err(error) => {
+                    refused = Some(error);
+                    break;
+                }
+            }
+        }
+        step.reverse();
+        let same = |blocks: &Vec<Block>| blocks.iter().all(|block| self.doc.block(&block.id) == Some(block));
+        if refused.is_some() || before.as_ref().is_some_and(same) {
+            // Nothing has reached the history yet, so the document's own undo puts it back.
+            step.iter().for_each(|undo| drop(self.shift(undo, None)));
+            return refused.map_or(Ok(Change::default()), Err);
+        }
+        if self.write(&edits, &mut change) {
+            self.steps.record(step, false);
         }
         Ok(change)
     }
 
-    /// Steps back one edit. `None` when there is nothing to undo.
+    /// Steps back one of this replica's edits, leaving what others wrote since. `None` when there is none.
     pub fn undo(&mut self) -> Option<Change> {
-        let doc = self.undo.pop()?;
-        Some(self.swap(doc, false))
+        self.step(true)
     }
 
     /// Reapplies the edit last undone. `None` when there is nothing to redo.
     pub fn redo(&mut self) -> Option<Change> {
-        let doc = self.redo.pop()?;
-        Some(self.swap(doc, true))
+        self.step(false)
     }
 
-    fn swap(&mut self, doc: Document, redo: bool) -> Change {
-        let old = std::mem::replace(&mut self.doc, doc);
-        let change = diff(&old, &self.doc);
-        if redo {
-            self.undo.push(old)
+    fn step(&mut self, back: bool) -> Option<Change> {
+        let step = self.steps.take(back).filter(|_| !self.loro.is_detached())?;
+        let mut change = Change::default();
+        let mut reverse = Step::new();
+        for delta in &step {
+            let (changed, undo) = self.shift(delta, None);
+            change.absorb(changed);
+            let Some(undo) = undo else {
+                // The document has been read again from the history, which this step never reached.
+                debug_assert!(false, "an undo step no longer fits the document");
+                self.steps.clear();
+                return Some(change);
+            };
+            reverse.push(undo);
+        }
+        reverse.reverse();
+        if self.write(&step, &mut change) {
+            self.steps.stepped(reverse, back);
+        }
+        Some(change)
+    }
+
+    /// Sends changes the document already shows to the history, as one change there.
+    fn write(&mut self, edits: &[Delta], change: &mut Change) -> bool {
+        let written = edits.iter().all(|delta| crdt::write(&self.loro, &self.body, delta).is_some());
+        self.loro.commit();
+        if written {
+            // The history reports the edit back, and the document already shows it.
+            self.queue().clear();
         } else {
-            self.redo.push(old)
+            // The history is what every other replica sees, so it wins over what was meant.
+            change.absorb(self.resync());
+            self.steps.clear();
+        }
+        written
+    }
+
+    /// The whole history, for the file. Any two saves of one document merge.
+    pub fn save(&self) -> Vec<u8> {
+        // Every edit, without Loro's snapshot of where they lead. Loro 1.17 reads the snapshot of a long
+        // text in quadratic time, and replays the edits of the same text in a tenth of that.
+        self.loro.export(ExportMode::all_updates()).expect("a history can always be written out")
+    }
+
+    /// What this replica holds beyond `revision`, for a replica that is already there. Everything, when
+    /// this history does not know the revision.
+    pub fn updates_since(&self, revision: &Revision) -> Vec<u8> {
+        let from = self.loro.frontiers_to_vv(&revision.0).unwrap_or_default();
+        self.loro.export(ExportMode::updates(&from)).expect("a history can always be written out")
+    }
+
+    /// Takes in what another replica wrote. Merging is commutative and idempotent: replicas that have seen
+    /// the same edits show the same document, and a merge that adds nothing changes nothing.
+    pub fn merge(&mut self, history: &[u8]) -> Result<Change, HistoryError> {
+        self.loro.import(history).map_err(unreadable)?;
+        Ok(self.drain())
+    }
+
+    /// How this history stands to a saved one: `Greater` holds everything in it and more, `Less` lacks
+    /// some of it, and `None` means each holds edits the other lacks.
+    pub fn compare(&self, history: &[u8]) -> Result<Option<Ordering>, HistoryError> {
+        let other = LoroDoc::decode_import_blob_meta(history, true).map_err(unreadable)?;
+        Ok(self.loro.oplog_vv().partial_cmp(&other.partial_end_vv))
+    }
+
+    /// The point in history the document shows.
+    pub fn revision(&self) -> Revision {
+        Revision(self.loro.state_frontiers())
+    }
+
+    /// Whether the document shows the newest revision, and so can be edited.
+    pub fn is_latest(&self) -> bool {
+        !self.loro.is_detached()
+    }
+
+    /// Shows the document as it was at `revision`, read-only. Leaving the newest revision forgets the
+    /// undo steps.
+    pub fn checkout(&mut self, revision: &Revision) -> Result<Change, HistoryError> {
+        if revision.0 == self.loro.oplog_frontiers() {
+            return Ok(self.checkout_latest());
+        }
+        self.loro.checkout(&revision.0).map_err(|_| HistoryError::UnknownRevision)?;
+        self.steps.clear();
+        Ok(self.drain())
+    }
+
+    /// Returns to the newest revision, with everything merged in the meantime.
+    pub fn checkout_latest(&mut self) -> Change {
+        self.loro.checkout_to_latest();
+        self.drain()
+    }
+
+    /// A position that follows its text, for anything kept across edits. `None` when `pos` is not a
+    /// position in the document.
+    pub fn stable(&self, pos: &Pos, hold: Hold) -> Option<StablePos> {
+        let (spot, runs) = self.text(&pos.block).ok()?;
+        let at = spot.text() + chars_before(runs, pos.offset)?;
+        let id = |at: usize| self.body.get_cursor(at, Side::Middle)?.id;
+        Some(match hold {
+            Hold::Prev if at > 0 => StablePos { id: Some(id(at - 1)?), after: true },
+            _ if at < self.start(self.index.len()) => StablePos { id: Some(id(at)?), after: false },
+            _ => StablePos { id: None, after: false },
+        })
+    }
+
+    /// Where a stable position is now. `None` when it no longer sits in text.
+    pub fn resolve(&self, stable: &StablePos) -> Option<Pos> {
+        let at = match stable.id {
+            None => self.start(self.index.len()),
+            Some(id) => {
+                let found = self.loro.get_cursor_pos(&Cursor::new(Some(id), self.body.id(), Side::Middle, 0)).ok()?;
+                // A character that is gone leaves the position where it stood.
+                found.current.pos + usize::from(stable.after && found.update.is_none())
+            }
+        };
+        let mut start = 0;
+        let (i, text) = self.index.iter().enumerate().find_map(|(i, entry)| {
+            let text = start + usize::from(entry.marker);
+            start += entry.len();
+            (entry.shape == BodyShape::Text && (text..=text + entry.chars).contains(&at)).then_some((i, text))
+        })?;
+        let block = nth(&self.doc.blocks, &self.index, i)?;
+        let mut chars = block.body.runs().iter().flat_map(|run| run.text.chars());
+        let offset = chars.by_ref().take(at - text).map(char::len_utf8).sum();
+        Some(Pos { block: block.id.clone(), offset })
+    }
+
+    fn queue(&self) -> MutexGuard<'_, Vec<Event>> {
+        self.events.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Brings the document up to date with what the history reported.
+    fn drain(&mut self) -> Change {
+        let (mut bodies, mut keys, mut meta) = (Vec::new(), Vec::new(), false);
+        for event in mem::take(&mut *self.queue()) {
+            match event {
+                Event::Body(delta) => bodies.push(delta),
+                Event::Markers(changed) => keys.extend(changed),
+                Event::Meta => meta = true,
+            }
+        }
+        if meta {
+            crdt::read_meta(&self.loro, &mut self.doc);
+        }
+        let mut change = Change::default();
+        match bodies.as_slice() {
+            [] => {
+                self.follow(&crdt::restyles(&self.loro, &self.body, &keys, &HashSet::new()), &mut change);
+            }
+            [raw] => {
+                let mut new = HashSet::new();
+                let delta = crdt::lift(&self.loro, &self.body, raw, &mut new);
+                let restyles = crdt::restyles(&self.loro, &self.body, &keys, &new);
+                // A change that does not fit has the whole document read again, restyled markers and all.
+                if self.follow(&delta, &mut change) {
+                    self.follow(&restyles, &mut change);
+                }
+            }
+            // Each was told against the sequence as it then stood, which only the last still is.
+            _ => {
+                self.steps.clear();
+                change = self.resync();
+            }
         }
         change
     }
+
+    /// Makes the document and the undo steps follow a change the history reported. False when it did not
+    /// fit, and the whole document was read again.
+    fn follow(&mut self, delta: &[TextDelta], change: &mut Change) -> bool {
+        if delta.is_empty() {
+            return true;
+        }
+        let (changed, undo) = self.shift(delta, None);
+        change.absorb(changed);
+        match undo {
+            // The undo steps were made for the sequence as it was before this.
+            Some(_) => self.steps.rebase(delta),
+            None => self.steps.clear(),
+        }
+        undo.is_some()
+    }
+
+    /// Reads the whole document from the history again.
+    fn resync(&mut self) -> Change {
+        let (doc, index) = crdt::read(&self.loro, &self.body);
+        let old = mem::replace(&mut self.doc, doc);
+        self.index = index;
+        self.queue().clear();
+        diff(&old, &self.doc)
+    }
+
+    /// Makes the document follow a change to the sequence. Says what that touched, and gives the change
+    /// that takes it back: `None` when it did not fit and the document was read again from the history.
+    ///
+    /// `place` is the entry of the block the change is known to be made in, and where that block starts.
+    fn shift(&mut self, delta: &[TextDelta], place: Option<Place>) -> (Change, Option<Delta>) {
+        if let Some(done) = self.shift_text(delta, place) {
+            return done;
+        }
+        let before: Vec<(u64, usize)> = self.index.iter().map(|entry| (entry.hash, entry.level)).collect();
+        let flat = flat::flatten(mem::take(&mut self.doc.blocks), mem::take(&mut self.index));
+        let mut undo = Script::default();
+        let Some(moved) = flat::transform(flat, delta, &mut undo) else {
+            // The tree was taken apart for nothing, so every block is reported.
+            let mut change = self.resync();
+            change.structure = true;
+            return (change, None);
+        };
+        let built = flat::build(moved.blocks);
+        (self.doc.blocks, self.index) = (built.blocks, built.index);
+        // Blocks came, went or moved exactly when the ids or their nesting read differently in order.
+        let structure = !before.iter().copied().eq(self.index.iter().map(|entry| (entry.hash, entry.level)));
+        let blocks = built.dirty.into_iter().chain(moved.gone).collect();
+        (Change { blocks, structure }, Some(undo.finish()))
+    }
+
+    /// The common case of [`Model::shift`]: a change inside one block's text edits that block in place.
+    fn shift_text(&mut self, delta: &[TextDelta], place: Option<Place>) -> Option<(Change, Option<Delta>)> {
+        let (first, last) = span(delta)?;
+        let holds = |entry: &Entry, start: usize| {
+            entry.marker && entry.shape == BodyShape::Text && start < first && last <= start + entry.len()
+        };
+        let (i, start) = place.filter(|(i, start)| holds(&self.index[*i], *start)).or_else(|| {
+            let mut start = 0;
+            let i = self.index.iter().position(|entry| {
+                let hit = holds(entry, start);
+                start += usize::from(!hit) * entry.len();
+                hit
+            })?;
+            Some((i, start))
+        })?;
+        let block = nth_mut(&mut self.doc.blocks, &self.index, i)?;
+        let Body::Text(runs) = &mut block.body else { return None };
+
+        // The block is read alone, as if the sequence began at its marker.
+        let alone = Block {
+            id: block.id.clone(),
+            kind: BlockKind::Paragraph,
+            body: Body::Text(mem::take(runs)),
+            extra: Extra::new(),
+        };
+        let alone = Flat { block: alone, entry: self.index[i].clone(), dirty: false };
+        let mut local = vec![retain(first - start)];
+        local.extend(delta.iter().skip_while(|item| is_skip(item)).cloned());
+        while local.last().is_some_and(is_skip) {
+            local.pop();
+        }
+        let mut undo = Script::default();
+        match flat::transform(vec![alone], &local, &mut undo).map(|moved| moved.blocks).as_deref_mut() {
+            Some([Flat { block: Block { body: Body::Text(edited), .. }, entry, .. }]) => {
+                *runs = mem::take(edited);
+                self.index[i].chars = entry.chars;
+                let mut undo = undo.finish();
+                // Read alone, the block's change starts at the block. In the sequence it starts before.
+                if let Some(TextDelta::Retain { retain, .. }) = undo.first_mut() {
+                    *retain += start;
+                }
+                Some((Change { blocks: BTreeSet::from([block.id.clone()]), structure: false }, Some(undo)))
+            }
+            _ => {
+                let mut change = self.resync();
+                change.structure = true;
+                Some((change, None))
+            }
+        }
+    }
+
+    /// Where entry `i` starts in the sequence, in characters.
+    fn start(&self, i: usize) -> usize {
+        self.index[..i].iter().map(Entry::len).sum()
+    }
+
+    /// The entry after block `i` and everything nested in it.
+    fn after(&self, i: usize) -> usize {
+        let level = self.index[i].level;
+        (i + 1..self.index.len()).find(|&next| self.index[next].level <= level).unwrap_or(self.index.len())
+    }
+
+    /// Finds a block by id in one pass over the entries, which also counts up to where it starts.
+    fn spot(&self, id: &BlockId) -> Result<Spot<'_>, OpError> {
+        let hash = flat::hash(id);
+        let mut start = 0;
+        for (i, entry) in self.index.iter().enumerate() {
+            if entry.hash == hash
+                && let Some(block) = nth(&self.doc.blocks, &self.index, i)
+                && block.id == *id
+            {
+                return Ok(Spot { i, start, block, entry });
+            }
+            start += entry.len();
+        }
+        Err(OpError::NoSuchBlock(id.clone()))
+    }
+
+    fn text(&self, id: &BlockId) -> Result<(Spot<'_>, &[Run]), OpError> {
+        let spot = self.spot(id)?;
+        match &spot.block.body {
+            Body::Text(runs) => Ok((spot, runs)),
+            _ => Err(OpError::WrongBody(id.clone())),
+        }
+    }
+
+    /// Turns an operation into the change it makes to the sequence, or says why it cannot be made.
+    ///
+    /// An operation on one block's text also names that block's place, which saves looking for it again.
+    fn compile(&self, op: &Op) -> Result<(Delta, Option<Place>), OpError> {
+        let mut delta = Vec::new();
+        let mut place = None;
+        match op {
+            Op::InsertText { at, text } => {
+                let (spot, runs) = self.text(&at.block)?;
+                let chars = chars_before(runs, at.offset).ok_or_else(|| bad(&at.block, at.offset))?;
+                place = Some((spot.i, spot.start));
+                if !text.is_empty() {
+                    let mut end = 0;
+                    let format = runs.iter().find(|run| {
+                        end += run.text.len();
+                        at.offset <= end
+                    });
+                    spot.reach(chars, &mut delta);
+                    delta.push(insert(&crdt::clean(text), format.map(attrs).unwrap_or_default()));
+                }
+            }
+            Op::DeleteText { block, range } => {
+                let (spot, runs) = self.text(block)?;
+                let chars = char_range(runs, block, range)?;
+                place = Some((spot.i, spot.start));
+                if !chars.is_empty() {
+                    spot.reach(chars.start, &mut delta);
+                    delta.push(TextDelta::Delete { delete: chars.len() });
+                }
+            }
+            Op::SetMark { block, range, mark, on } => {
+                let value = if *on { true.into() } else { LoroValue::Null };
+                let set = |run: &Run| run.marks.contains(mark) == *on;
+                place = Some(self.restyle(block, range, crdt::mark_attr(mark), value, set, &mut delta)?);
+            }
+            Op::SetLink { block, range, link } => {
+                let value = link.as_deref().map_or(LoroValue::Null, Into::into);
+                let set = |run: &Run| run.link == *link;
+                place = Some(self.restyle(block, range, crdt::LINK.into(), value, set, &mut delta)?);
+            }
+            Op::Split { at, new_id } => {
+                if self.spot(new_id).is_ok() {
+                    return Err(OpError::DuplicateId(new_id.clone()));
+                }
+                let (spot, runs) = self.text(&at.block)?;
+                let chars = chars_before(runs, at.offset).ok_or_else(|| bad(&at.block, at.offset))?;
+                spot.reach(chars, &mut delta);
+                delta.push(marker(&Block::new(new_id.clone(), spot.block.kind.clone()), spot.entry.level));
+            }
+            Op::Join { block } => {
+                let (spot, _) = self.text(block)?;
+                let before = spot.i.checked_sub(1).map(|i| &self.index[i]);
+                if !spot.entry.marker || before.is_none_or(|entry| entry.shape != BodyShape::Text) {
+                    return Err(OpError::NothingToJoin(block.clone()));
+                }
+                // Without its marker, the block's text is the end of the text before it.
+                seek(&mut delta, spot.start);
+                delta.push(TextDelta::Delete { delete: 1 });
+            }
+            Op::SetKind { block, kind } => {
+                let spot = self.spot(block)?;
+                if matches!(kind, BlockKind::Unknown { .. }) || spot.block.kind.shape() != kind.shape() {
+                    return Err(OpError::WrongBody(block.clone()));
+                }
+                if spot.block.kind == *kind {
+                    return Ok((delta, None));
+                }
+                let changed = Block { kind: kind.clone(), body: Body::None, ..spot.block.clone_bare() };
+                seek(&mut delta, spot.start);
+                if spot.entry.marker {
+                    delta.push(style(1, BLOCK.into(), head(&changed).into()));
+                } else {
+                    delta.push(marker(&changed, spot.entry.level));
+                }
+            }
+            Op::InsertBlock { parent, index, block } => {
+                let mut ids = BTreeSet::new();
+                let mut stack = vec![block];
+                while let Some(block) = stack.pop() {
+                    if self.spot(&block.id).is_ok() || !ids.insert(&block.id) {
+                        return Err(OpError::DuplicateId(block.id.clone()));
+                    }
+                    stack.extend(children(block));
+                }
+                let (siblings, depth, end) = match parent {
+                    None => (self.doc.blocks.as_slice(), 0, self.index.len()),
+                    Some(parent) => {
+                        let spot = self.spot(parent)?;
+                        let Body::Blocks(children) = &spot.block.body else {
+                            return Err(OpError::WrongBody(parent.clone()));
+                        };
+                        (children.as_slice(), spot.entry.level + 1, self.after(spot.i))
+                    }
+                };
+                let at = match siblings.get(*index) {
+                    Some(next) => self.spot(&next.id)?.i,
+                    None if *index == siblings.len() => end,
+                    None => return Err(OpError::BadIndex { index: *index }),
+                };
+                seek(&mut delta, self.start(at));
+                spell(block, depth, &mut delta);
+                self.settle(at, &mut delta);
+            }
+            Op::RemoveBlock { block } => {
+                let spot = self.spot(block)?;
+                let end = self.after(spot.i);
+                seek(&mut delta, spot.start);
+                delta.push(TextDelta::Delete { delete: self.index[spot.i..end].iter().map(Entry::len).sum() });
+                self.settle(end, &mut delta);
+            }
+        }
+        Ok((delta, place))
+    }
+
+    /// Sets one attribute over a range of a block's text. Text that `set` says has it already is left
+    /// alone, so formatting that changes nothing is no edit.
+    fn restyle(
+        &self,
+        block: &BlockId,
+        range: &Range<usize>,
+        key: String,
+        value: LoroValue,
+        set: impl Fn(&Run) -> bool,
+        delta: &mut Vec<TextDelta>,
+    ) -> Result<Place, OpError> {
+        let (spot, runs) = self.text(block)?;
+        let chars = char_range(runs, block, range)?;
+        // Where the change has got to in the block's text. `None` until it has somewhere to start.
+        let mut reached = None;
+        let mut start = 0;
+        for run in runs {
+            let end = start + run.text.chars().count();
+            let (from, to) = (chars.start.max(start), chars.end.min(end));
+            if from < to && !set(run) {
+                match reached {
+                    None => spot.reach(from, delta),
+                    Some(at) => seek(delta, from - at),
+                }
+                delta.push(style(to - from, key.clone(), value.clone()));
+                reached = Some(to);
+            }
+            start = end;
+        }
+        Ok((spot.i, spot.start))
+    }
+
+    /// Gives the text at entry `at` a marker if it has none, when the block before it is about to change.
+    /// Otherwise that text would join whatever comes to stand before it.
+    fn settle(&self, at: usize, delta: &mut Vec<TextDelta>) {
+        if let Some(entry) = self.index.get(at).filter(|entry| !entry.marker)
+            && let Some(block) = nth(&self.doc.blocks, &self.index, at)
+        {
+            delta.push(marker(&block.clone_bare(), entry.level));
+        }
+    }
 }
 
+impl Block {
+    /// The block without its text or children.
+    fn clone_bare(&self) -> Block {
+        Block { id: self.id.clone(), kind: self.kind.clone(), body: Body::None, extra: self.extra.clone() }
+    }
+}
+
+/// A block and its place in the sequence.
+struct Spot<'a> {
+    /// Its place in document order.
+    i: usize,
+    /// Where it starts in the sequence, in characters.
+    start: usize,
+    block: &'a Block,
+    entry: &'a Entry,
+}
+
+impl Spot<'_> {
+    /// Where the block's text starts.
+    fn text(&self) -> usize {
+        self.start + usize::from(self.entry.marker)
+    }
+
+    /// Moves to `chars` into the block's text. Text without a marker is given one on the way, so a block
+    /// that an edit names cannot vanish with its last character.
+    fn reach(&self, chars: usize, delta: &mut Vec<TextDelta>) {
+        if self.entry.marker {
+            seek(delta, self.text() + chars);
+        } else {
+            seek(delta, self.start);
+            delta.push(marker(&self.block.clone_bare(), self.entry.level));
+            seek(delta, chars);
+        }
+    }
+}
+
+fn unreadable(error: impl fmt::Display) -> HistoryError {
+    HistoryError::Unreadable(error.to_string())
+}
+
+fn bad(block: &BlockId, offset: usize) -> OpError {
+    OpError::BadOffset { block: block.clone(), offset }
+}
+
+fn retain(retain: usize) -> TextDelta {
+    TextDelta::Retain { retain, attributes: None }
+}
+
+fn seek(delta: &mut Vec<TextDelta>, chars: usize) {
+    if chars > 0 {
+        delta.push(retain(chars));
+    }
+}
+
+fn style(retain: usize, key: String, value: LoroValue) -> TextDelta {
+    TextDelta::Retain { retain, attributes: Some([(key, value)].into_iter().collect()) }
+}
+
+fn children(block: &Block) -> &[Block] {
+    if block.kind.shape() == BodyShape::Blocks { block.body.blocks() } else { &[] }
+}
+
+/// Writes a block and everything in it as the sequence holds them.
+fn spell(block: &Block, depth: usize, delta: &mut Vec<TextDelta>) {
+    delta.push(marker(block, depth));
+    if block.kind.shape() == BodyShape::Text {
+        let runs = block.body.runs().iter().filter(|run| !run.text.is_empty());
+        delta.extend(runs.map(|run| insert(&crdt::clean(&run.text), attrs(run))));
+    }
+    children(block).iter().for_each(|child| spell(child, depth + 1, delta));
+}
+
+/// The stretch of the sequence a change touches, if it changes nothing but text.
+fn span(delta: &[TextDelta]) -> Option<(usize, usize)> {
+    let (mut at, mut first, mut last) = (0, None, 0);
+    for item in delta {
+        match item {
+            _ if is_skip(item) => {}
+            TextDelta::Retain { retain, attributes } => {
+                if attributes.as_ref().is_some_and(|attrs| attrs.contains_key(BLOCK) || attrs.contains_key(DEPTH)) {
+                    return None;
+                }
+                first.get_or_insert(at);
+                last = at + retain;
+            }
+            TextDelta::Insert { attributes, .. } => {
+                if attributes.as_ref().is_some_and(|attrs| attrs.contains_key(BLOCK)) {
+                    return None;
+                }
+                first.get_or_insert(at);
+                last = last.max(at);
+            }
+            TextDelta::Delete { delete } => {
+                first.get_or_insert(at);
+                last = at + delete;
+            }
+        }
+        at += match item {
+            TextDelta::Retain { retain, .. } => *retain,
+            TextDelta::Delete { delete } => *delete,
+            TextDelta::Insert { .. } => 0,
+        };
+    }
+    Some((first?, last))
+}
+
+/// The characters before byte `offset` of a block's text. `None` when that is not a position in it.
+fn chars_before(runs: &[Run], offset: usize) -> Option<usize> {
+    let (mut bytes, mut chars) = (0, 0);
+    for run in runs {
+        if offset <= bytes + run.text.len() {
+            return Some(chars + run.text.get(..offset - bytes)?.chars().count());
+        }
+        bytes += run.text.len();
+        chars += run.text.chars().count();
+    }
+    (offset == bytes).then_some(chars)
+}
+
+fn char_range(runs: &[Run], block: &BlockId, range: &Range<usize>) -> Result<Range<usize>, OpError> {
+    if range.start > range.end {
+        return Err(bad(block, range.start));
+    }
+    let start = chars_before(runs, range.start).ok_or_else(|| bad(block, range.start))?;
+    let end = chars_before(runs, range.end).ok_or_else(|| bad(block, range.end))?;
+    Ok(start..end)
+}
+
+/// What differs between two documents, for the rare case where one was read whole.
 fn diff(old: &Document, new: &Document) -> Change {
     let mut change = Change::default();
     let ids = |doc: &Document| doc.walk().map(|b| b.id.clone()).collect::<Vec<_>>();
@@ -173,206 +855,4 @@ fn diff(old: &Document, new: &Document) -> Change {
         }
     }
     change
-}
-
-fn apply(doc: &mut Document, op: Op, change: &mut Change) -> Result<(), OpError> {
-    match op {
-        Op::InsertText { at, text } => {
-            let runs = text_of(doc, &at.block)?;
-            insert_text(runs, at.offset, &text)
-                .ok_or(OpError::BadOffset { block: at.block.clone(), offset: at.offset })?;
-            change.blocks.insert(at.block);
-        }
-        Op::DeleteText { block, range } => {
-            let runs = text_of(doc, &block)?;
-            let (from, to) = span(runs, &block, &range)?;
-            runs.drain(from..to);
-            normalise(runs);
-            change.blocks.insert(block);
-        }
-        Op::SetMark { block, range, mark, on } => {
-            let runs = text_of(doc, &block)?;
-            let (from, to) = span(runs, &block, &range)?;
-            for run in &mut runs[from..to] {
-                if on {
-                    run.marks.insert(mark.clone());
-                } else {
-                    run.marks.remove(&mark);
-                }
-            }
-            normalise(runs);
-            change.blocks.insert(block);
-        }
-        Op::SetLink { block, range, link } => {
-            let runs = text_of(doc, &block)?;
-            let (from, to) = span(runs, &block, &range)?;
-            for run in &mut runs[from..to] {
-                run.link = link.clone();
-            }
-            normalise(runs);
-            change.blocks.insert(block);
-        }
-        Op::Split { at, new_id } => {
-            if doc.block(&new_id).is_some() {
-                return Err(OpError::DuplicateId(new_id));
-            }
-            let runs = text_of(doc, &at.block)?;
-            let index =
-                cut(runs, at.offset).ok_or(OpError::BadOffset { block: at.block.clone(), offset: at.offset })?;
-            let tail = runs.split_off(index);
-            let (siblings, i) = locate(&mut doc.blocks, &at.block).expect("the block was just found");
-            let mut new = Block::new(new_id.clone(), siblings[i].kind.clone());
-            new.body = Body::Text(tail);
-            siblings.insert(i + 1, new);
-            change.blocks.extend([at.block, new_id]);
-            change.structure = true;
-        }
-        Op::Join { block } => {
-            let (siblings, i) = locate(&mut doc.blocks, &block).ok_or_else(|| OpError::NoSuchBlock(block.clone()))?;
-            if !matches!(siblings[i].body, Body::Text(_)) {
-                return Err(OpError::WrongBody(block));
-            }
-            if i == 0 || !matches!(siblings[i - 1].body, Body::Text(_)) {
-                return Err(OpError::NothingToJoin(block));
-            }
-            let Body::Text(tail) = siblings.remove(i).body else { unreachable!() };
-            let Body::Text(runs) = &mut siblings[i - 1].body else { unreachable!() };
-            runs.extend(tail);
-            normalise(runs);
-            change.blocks.extend([siblings[i - 1].id.clone(), block]);
-            change.structure = true;
-        }
-        Op::SetKind { block, kind } => {
-            let (siblings, i) = locate(&mut doc.blocks, &block).ok_or_else(|| OpError::NoSuchBlock(block.clone()))?;
-            if matches!(kind, BlockKind::Unknown { .. }) || siblings[i].kind.shape() != kind.shape() {
-                return Err(OpError::WrongBody(block));
-            }
-            siblings[i].kind = kind;
-            change.blocks.insert(block);
-        }
-        Op::InsertBlock { parent, index, block } => {
-            let mut new_ids = BTreeSet::new();
-            let mut stack = vec![&block];
-            while let Some(b) = stack.pop() {
-                if doc.block(&b.id).is_some() || !new_ids.insert(b.id.clone()) {
-                    return Err(OpError::DuplicateId(b.id.clone()));
-                }
-                stack.extend(b.body.blocks());
-            }
-            let siblings = match &parent {
-                None => &mut doc.blocks,
-                Some(parent) => {
-                    let (siblings, i) =
-                        locate(&mut doc.blocks, parent).ok_or_else(|| OpError::NoSuchBlock(parent.clone()))?;
-                    match &mut siblings[i].body {
-                        Body::Blocks(children) => children,
-                        _ => return Err(OpError::WrongBody(parent.clone())),
-                    }
-                }
-            };
-            if index > siblings.len() {
-                return Err(OpError::BadIndex { index });
-            }
-            siblings.insert(index, block);
-            change.blocks.extend(new_ids);
-            change.structure = true;
-        }
-        Op::RemoveBlock { block } => {
-            let (siblings, i) = locate(&mut doc.blocks, &block).ok_or_else(|| OpError::NoSuchBlock(block.clone()))?;
-            let removed = siblings.remove(i);
-            let mut stack = vec![&removed];
-            while let Some(b) = stack.pop() {
-                change.blocks.insert(b.id.clone());
-                stack.extend(b.body.blocks());
-            }
-            change.structure = true;
-        }
-    }
-    Ok(())
-}
-
-/// The list holding a block, and the block's index in it.
-fn locate<'a>(blocks: &'a mut Vec<Block>, id: &BlockId) -> Option<(&'a mut Vec<Block>, usize)> {
-    if let Some(i) = blocks.iter().position(|b| &b.id == id) {
-        return Some((blocks, i));
-    }
-    blocks.iter_mut().find_map(|b| match &mut b.body {
-        Body::Blocks(children) => locate(children, id),
-        _ => None,
-    })
-}
-
-fn text_of<'a>(doc: &'a mut Document, id: &BlockId) -> Result<&'a mut Vec<Run>, OpError> {
-    let (siblings, i) = locate(&mut doc.blocks, id).ok_or_else(|| OpError::NoSuchBlock(id.clone()))?;
-    match &mut siblings[i].body {
-        Body::Text(runs) => Ok(runs),
-        _ => Err(OpError::WrongBody(id.clone())),
-    }
-}
-
-/// Makes `offset` a run boundary and returns the index of the run that starts there.
-fn cut(runs: &mut Vec<Run>, offset: usize) -> Option<usize> {
-    let mut start = 0;
-    for i in 0..runs.len() {
-        if offset == start {
-            return Some(i);
-        }
-        let len = runs[i].text.len();
-        if offset < start + len {
-            let at = offset - start;
-            if !runs[i].text.is_char_boundary(at) {
-                return None;
-            }
-            let mut tail = runs[i].clone();
-            tail.text = runs[i].text.split_off(at);
-            runs.insert(i + 1, tail);
-            return Some(i + 1);
-        }
-        start += len;
-    }
-    (offset == start).then_some(runs.len())
-}
-
-/// Cuts at both ends of `range` and returns the indices of the runs it covers.
-fn span(runs: &mut Vec<Run>, block: &BlockId, range: &Range<usize>) -> Result<(usize, usize), OpError> {
-    let bad = |offset| OpError::BadOffset { block: block.clone(), offset };
-    if range.start > range.end {
-        return Err(bad(range.start));
-    }
-    let from = cut(runs, range.start).ok_or_else(|| bad(range.start))?;
-    let to = cut(runs, range.end).ok_or_else(|| bad(range.end))?;
-    Ok((from, to))
-}
-
-fn insert_text(runs: &mut Vec<Run>, offset: usize, text: &str) -> Option<()> {
-    let mut start = 0;
-    for run in runs.iter_mut() {
-        let end = start + run.text.len();
-        if offset <= end {
-            let at = offset - start;
-            if !run.text.is_char_boundary(at) {
-                return None;
-            }
-            run.text.insert_str(at, text);
-            return Some(());
-        }
-        start = end;
-    }
-    if offset != start {
-        return None;
-    }
-    runs.push(Run::plain(text));
-    Some(())
-}
-
-/// Drops empty runs and merges neighbours that share their formatting.
-fn normalise(runs: &mut Vec<Run>) {
-    runs.retain(|run| !run.text.is_empty());
-    runs.dedup_by(|next, prev| {
-        let same = prev.same_format(next);
-        if same {
-            prev.text.push_str(&next.text);
-        }
-        same
-    });
 }

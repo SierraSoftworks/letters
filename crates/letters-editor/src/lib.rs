@@ -19,7 +19,9 @@ mod tree;
 use std::collections::BTreeSet;
 use std::ops::Range;
 
-use letters_model::{Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, Pos, Selection};
+use letters_model::{
+    Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, Pos, ReplicaId, Selection,
+};
 
 pub use keymap::Keymap;
 /// The markers [`Editor::markers`] returns. They live in the model so that layout can draw them.
@@ -196,7 +198,7 @@ struct Composing {
 const PAUSE_MS: u64 = 1000;
 
 /// A document being edited.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Editor {
     model: Model,
     caret: Option<Caret>,
@@ -215,10 +217,16 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(doc: Document) -> Self {
-        let first = tree::texts(&doc).first().map(|block| Pos::new(block.id.clone(), 0));
+    /// Starts editing a document that has no history. `replica` names this session: see [`ReplicaId`].
+    pub fn new(doc: Document, replica: ReplicaId) -> Self {
+        Self::with_model(Model::new(doc, replica))
+    }
+
+    /// Starts editing a document that comes with its history.
+    pub fn with_model(model: Model) -> Self {
+        let first = tree::texts(model.doc()).first().map(|block| Pos::new(block.id.clone(), 0));
         let mut editor = Self {
-            model: Model::new(doc),
+            model,
             caret: None,
             keymap: Keymap::default(),
             undo: Vec::new(),

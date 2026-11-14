@@ -10,7 +10,7 @@ use std::rc::Rc;
 use accesskit::{ActionRequest, Toggled};
 use accesskit_consumer::{NodeRef, Tree};
 use letters_editor::{Clip, Editor, InputEvent, Key, KeyEvent, Modifiers, Platform};
-use letters_model::{Document, Pos, Selection, Style};
+use letters_model::{Document, Pos, ReplicaId, Selection, Style};
 use letters_render::{DisplayList, Point, Rect, Size};
 use letters_ui::{App, EditorApp, FixedShaper, Keys, Ui, Window};
 
@@ -284,7 +284,7 @@ impl<A: App> Harness<A> {
 impl Harness<EditorApp> {
     /// The editor's window on a document, with the bundled fonts and the default style.
     pub fn open(document: Document) -> Self {
-        Self::with(Window::new(Editor::new(document), Style::default()))
+        Self::with(Window::new(Editor::new(document, ReplicaId::from(1)), Style::default()))
     }
 
     /// The editor's window on a document written as Markdown.

@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 
 use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Marker, Modifiers, Platform};
-use letters_model::{Block, BlockKind, Body, Change, Document, ListKind, Mark, Pos, Run, Selection, Tone};
+use letters_model::{Block, BlockKind, Body, Change, Document, ListKind, Mark, Pos, ReplicaId, Run, Selection, Tone};
 
 /// The marks the notation can write, with their switches. Longer switches come first so they are read first.
 const SWITCHES: [(&str, Mark); 6] = [
@@ -119,7 +119,7 @@ impl Harness {
     /// An editor on the document that `state` describes, with the standard keymap on every system.
     pub fn new(state: &str) -> Self {
         let (doc, selection) = parse(state);
-        let mut editor = Editor::new(doc);
+        let mut editor = Editor::new(doc, ReplicaId::from(1));
         editor.set_keymap(Keymap::standard());
         if let Some(selection) = selection {
             editor.select(selection);

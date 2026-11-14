@@ -1,9 +1,9 @@
-use letters_model::{Block, BlockId, BlockKind, Document, Mark, Model, Op, OpError, Pos};
+use letters_model::{Block, BlockId, BlockKind, Document, Mark, Model, Op, OpError, Pos, ReplicaId};
 
 /// One paragraph `p` reading "Hello world", then a divider `d`.
 fn model() -> Model {
     let blocks = vec![Block::text("p", BlockKind::Paragraph, "Hello world"), Block::new("d", BlockKind::Divider)];
-    Model::new(Document { blocks, ..Document::default() })
+    Model::new(Document { blocks, ..Document::default() }, ReplicaId::from(1))
 }
 
 fn id(id: &str) -> BlockId {
@@ -124,8 +124,8 @@ fn a_refused_edit_changes_nothing() {
 
 #[test]
 fn offsets_inside_a_character_are_refused() {
-    let mut m =
-        Model::new(Document { blocks: vec![Block::text("p", BlockKind::Paragraph, "é")], ..Document::default() });
+    let blocks = vec![Block::text("p", BlockKind::Paragraph, "é")];
+    let mut m = Model::new(Document { blocks, ..Document::default() }, ReplicaId::from(1));
     let error = m.apply([Op::InsertText { at: Pos::new("p", 1), text: "x".into() }]);
     assert_eq!(error, Err(OpError::BadOffset { block: id("p"), offset: 1 }));
 }

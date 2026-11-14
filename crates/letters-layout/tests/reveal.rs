@@ -2,7 +2,7 @@
 
 use letters_editor::{Clip, Command, Editor, InputEvent, Motion, Platform};
 use letters_layout::{DocLayout, Palette};
-use letters_model::{Block, BlockKind, Body, Document, Mark, Pos, Run, Selection, Style, Tone};
+use letters_model::{Block, BlockKind, Body, Document, Mark, Pos, ReplicaId, Run, Selection, Style, Tone};
 use letters_render::{Color, Item, Point};
 use proptest::prelude::*;
 
@@ -53,7 +53,7 @@ impl Page {
     fn new(doc: &Document, width: f32) -> Self {
         let mut layout = DocLayout::new(fonts());
         layout.update(doc, &Style::default(), width, None);
-        Self { editor: Editor::new(doc.clone()), layout }
+        Self { editor: Editor::new(doc.clone(), ReplicaId::from(1)), layout }
     }
 
     fn head(&self) -> Pos {

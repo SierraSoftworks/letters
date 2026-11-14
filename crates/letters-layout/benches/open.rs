@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use letters_layout::{DocLayout, Fonts};
 use letters_model::{
-    Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Model, Op, Page, Pos, Run, Style, Tone,
+    Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Model, Op, Page, Pos, ReplicaId, Run, Style, Tone,
 };
 use letters_render::{DisplayList, Rect};
 
@@ -262,7 +262,7 @@ fn main() {
     // Typing into a long paragraph on screen: the layout's part of a key press.
     let target = doc.blocks.iter().find(|block| block.plain_text().len() > 600).expect("a long paragraph");
     let (id, y) = (target.id.clone(), opened(&doc, &style).caret(&Pos::new(target.id.clone(), 0)).expect("a caret").y);
-    let mut model = Model::new(doc.clone());
+    let mut model = Model::new(doc.clone(), ReplicaId::from(1));
     let mut layout = opened(model.doc(), &style);
     frame(&mut layout, y, &mut list);
     let typing = Times::of(300, |at| {
@@ -307,7 +307,7 @@ fn main() {
     // whole document, as the idle slices above would have by the time anyone asks for pages.
     let page = Page::default();
     let column = (page.width - page.margin_left - page.margin_right) * 96.0 / 72.0;
-    let mut model = Model::new(doc.clone());
+    let mut model = Model::new(doc.clone(), ReplicaId::from(1));
     let mut layout = opened_at(model.doc(), &style, column);
     let mut pages = layout.paginate(&page);
     let paginate = Times::of(50, |_| timed(|| pages = layout.paginate(&page)));

@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 use letters_layout::{DocLayout, Palette};
-use letters_model::{Model, Op, Pos, Style};
+use letters_model::{Model, Op, Pos, ReplicaId, Style};
 use letters_render::{Item, PathEl, Point};
 
 mod common;
@@ -86,7 +86,7 @@ fn marks_follow_the_text_through_edits() {
         ("splitting the block before it", vec![Op::Split { at: Pos::new("p0", 10), new_id: "n".into() }], None),
     ];
     for (name, ops, expected) in cases {
-        let mut model = Model::new(prose(2));
+        let mut model = Model::new(prose(2), ReplicaId::from(1));
         let mut layout = marked(vec![word("household")]);
         let change = model.apply(ops).unwrap();
         layout.update(model.doc(), &Style::default(), NARROW, Some(&change));

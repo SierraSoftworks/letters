@@ -256,11 +256,11 @@ const MARKS: [(&str, Mark); 6] = [
     ("code", Mark::Code),
 ];
 
-fn read_mark(name: &str) -> Mark {
+pub(crate) fn read_mark(name: &str) -> Mark {
     MARKS.iter().find(|(n, _)| *n == name).map_or_else(|| Mark::Other(name.into()), |(_, mark)| mark.clone())
 }
 
-fn mark_name(mark: &Mark) -> &str {
+pub(crate) fn mark_name(mark: &Mark) -> &str {
     match mark {
         Mark::Other(name) => name,
         known => MARKS.iter().find(|(_, m)| m == known).map(|(name, _)| *name).expect("every known mark is named"),

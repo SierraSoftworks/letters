@@ -1,6 +1,6 @@
 //! Checking a document a block at a time, through the public interface.
 
-use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Model, Op, Pos, Run};
+use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Model, Op, Pos, ReplicaId, Run};
 use letters_spell::{Checked, Dictionary, Proofing, Speller, language_at};
 
 fn doc(language: &str, blocks: Vec<Block>) -> Document {
@@ -95,7 +95,7 @@ fn nested_blocks_are_checked() {
 
 #[test]
 fn an_edit_rechecks_only_its_block_and_first() {
-    let mut model = Model::new(letter());
+    let mut model = Model::new(letter(), ReplicaId::from(1));
     let (mut proofing, speller) = proofed(model.doc());
 
     let change = model.apply([Op::DeleteText { block: "c".into(), range: 0..6 }]).unwrap();
@@ -117,7 +117,7 @@ fn an_edit_rechecks_only_its_block_and_first() {
 
 #[test]
 fn undo_and_removed_blocks_are_followed() {
-    let mut model = Model::new(letter());
+    let mut model = Model::new(letter(), ReplicaId::from(1));
     let (mut proofing, speller) = proofed(model.doc());
 
     let change = model.apply([Op::RemoveBlock { block: "b".into() }]).unwrap();

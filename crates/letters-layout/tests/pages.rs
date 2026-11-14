@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use letters_layout::{DocLayout, Pages};
-use letters_model::{Block, BlockId, BlockKind, Body, Document, ListKind, Model, Op, Page, Pos, Style, Tone};
+use letters_model::{
+    Block, BlockId, BlockKind, Body, Document, ListKind, Model, Op, Page, Pos, ReplicaId, Style, Tone,
+};
 use letters_render::{DisplayList, Item, Point, Rect};
 use proptest::prelude::*;
 
@@ -317,7 +319,7 @@ fn pages_follow_edits() {
         ),
     ];
     for (name, ops) in edits {
-        let mut model = Model::new(mixed());
+        let mut model = Model::new(mixed(), ReplicaId::from(1));
         let mut layout = laid_at(model.doc(), COLUMN);
         let before = layout.paginate(&paper(240.0));
         let change = model.apply(ops).unwrap();

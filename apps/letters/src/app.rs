@@ -11,7 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Platform as _};
-use letters_model::Style;
+use letters_model::{ReplicaId, Style};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Size};
 // The editor's window is the view here, where `Window` is the system's.
@@ -129,7 +129,8 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
     // A window of the default size on a display like the reference machine's.
     let scale = 2.0;
     let (width, height) = ((WINDOW_SIZE.width * scale) as u32, (WINDOW_SIZE.height * scale) as u32);
-    let mut view = View::new(Editor::new(document), style);
+    let replica = ReplicaId::new(&Desktop::new().new_id());
+    let mut view = View::new(Editor::new(document, replica), style);
     view.resize(Size { width: WINDOW_SIZE.width as f32, height: WINDOW_SIZE.height as f32 }, scale as f32);
     launch.mark("laid out");
     let mut list = DisplayList::default();
@@ -453,8 +454,9 @@ impl App {
         window.set_ime_allowed(true);
         self.mark("window created");
 
+        let replica = ReplicaId::new(&self.platform.new_id());
         let mut window = DocWindow {
-            view: View::new(Editor::new(document), style),
+            view: View::new(Editor::new(document, replica), style),
             window,
             presenter,
             access,
