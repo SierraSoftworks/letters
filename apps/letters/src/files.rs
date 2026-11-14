@@ -276,7 +276,7 @@ impl Rest {
         // The editor takes the history as the copy holds it, so a document changed outside Letters is one
         // change in both and not one in each.
         let model = copy.model();
-        let history = Model::prepare(model.doc().clone(), Some(&model.save()), editor);
+        let history = Model::new(model.doc().clone(), editor).prepare(Some(&model.save()));
         Ok(Working { history: Some(history.map_err(letters_format::Error::History)?), copy })
     }
 }
