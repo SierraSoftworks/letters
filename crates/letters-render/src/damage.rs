@@ -124,6 +124,14 @@ impl Mix {
         self.floats(&[rect.x, rect.y, rect.width, rect.height]);
     }
 
+    fn bytes(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        words.iter().for_each(|word| self.add(u64::from_le_bytes(*word)));
+        let mut last = [0; 8];
+        last[..rest.len()].copy_from_slice(rest);
+        self.add(u64::from_le_bytes(last) ^ (bytes.len() as u64) << 56);
+    }
+
     fn color(&mut self, color: Color) {
         self.add(u64::from(u32::from_be_bytes([color.r, color.g, color.b, color.a])));
     }
@@ -133,13 +141,40 @@ impl Mix {
     }
 }
 
+/// How an item's hash names the fonts and images it draws.
+#[derive(Clone, Copy)]
+enum By {
+    /// By an id that lasts for the life of the process. Cheap, for telling two frames apart.
+    Identity,
+    /// By their bytes, so the hash means the same in every process.
+    #[cfg_attr(not(feature = "snapshot"), expect(dead_code, reason = "only snapshots are keyed by content"))]
+    Content,
+}
+
 /// Surveys `list` into `out`, reusing its storage.
 pub(crate) fn survey(list: &DisplayList, images: &Images, fonts: &mut FontCache, out: &mut Survey) {
     out.clear();
-    out.extend(list.items.iter().map(|item| entry(item, images, fonts)));
+    out.extend(list.items.iter().map(|item| entry(item, images, fonts, By::Identity)));
 }
 
-fn entry(item: &Item, images: &Images, fonts: &mut FontCache) -> Entry {
+/// A hash of everything `list` draws, the same wherever and whenever it is taken.
+#[cfg(feature = "snapshot")]
+pub(crate) fn fingerprint(list: &DisplayList, images: &Images) -> u64 {
+    let mut fonts = FontCache::default();
+    let mut mix = Mix(list.items.len() as u64);
+    list.items.iter().for_each(|item| mix.add(entry(item, images, &mut fonts, By::Content).hash));
+    mix.finish()
+}
+
+/// A hash of some bytes, for [`fingerprint`]'s callers to fold more into a key.
+#[cfg(feature = "snapshot")]
+pub(crate) fn hash(parts: &[&[u8]]) -> u64 {
+    let mut mix = Mix(parts.len() as u64);
+    parts.iter().for_each(|part| mix.bytes(part));
+    mix.finish()
+}
+
+fn entry(item: &Item, images: &Images, fonts: &mut FontCache, by: By) -> Entry {
     // Each kind of item starts from its own seed, so a fill never matches a stroke of the same shape.
     let mut mix;
     let extent = match item {
@@ -169,7 +204,10 @@ fn entry(item: &Item, images: &Images, fonts: &mut FontCache) -> Entry {
         Item::Glyphs { origin, font, size, color, skew, embolden, glyphs } => {
             mix = Mix(4);
             let face = fonts.face(font);
-            mix.add(face.id);
+            match by {
+                By::Identity => mix.add(face.id),
+                By::Content => mix.bytes(&font.data),
+            }
             mix.add(u64::from(font.index));
             for coord in font.coords.iter() {
                 mix.add(*coord as u64);
@@ -234,7 +272,13 @@ fn entry(item: &Item, images: &Images, fonts: &mut FontCache) -> Entry {
             // The picture is part of what the item draws: it changes when the asset is decoded or replaced.
             match images.get(asset) {
                 Some(image) => {
-                    mix.add(image.id);
+                    match by {
+                        By::Identity => mix.add(image.id),
+                        By::Content => {
+                            mix.add(u64::from(image.pixels.width()) << 32 | u64::from(image.pixels.height()));
+                            mix.bytes(image.pixels.data_as_u8_slice());
+                        }
+                    }
                     Extent::of(rect, 0.0)
                 }
                 None => Extent::Nowhere,

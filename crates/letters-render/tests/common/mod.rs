@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use letters_render::cpu::{CpuRenderer, Frame};
 use letters_render::image::{Image, Images};
+use letters_render::snapshot::Shot;
 use letters_render::{Color, DisplayList, Font, Glyph, Item, PathEl, Point, Rect};
 use skrifa::instance::{LocationRef, Size};
 use skrifa::raw::types::F2Dot14;
@@ -93,43 +94,14 @@ pub fn image(width: u32, height: u32, color: impl Fn(u32, u32) -> Color) -> Imag
     Image::from_rgba8(width, height, rgba).expect("a valid image")
 }
 
-/// Compares a frame with `tests/snapshots/<name>.png`, allowing for small differences in antialiasing between
-/// machines. Run with `LETTERS_BLESS=1` to accept the frame as the new snapshot.
-pub fn assert_snapshot(name: &str, frame: &Frame) {
-    /// A pixel differs when a channel is off by more than this.
-    const CHANNEL: u8 = 24;
-    /// The share of pixels that may differ.
-    const SHARE: f64 = 0.002;
+/// Where the snapshot of a name is kept.
+pub fn snapshot_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots").join(format!("{name}.png"))
+}
 
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots").join(format!("{name}.png"));
-    let save = |path: &PathBuf| {
-        image::save_buffer(path, frame.data(), frame.width(), frame.height(), image::ColorType::Rgba8)
-            .expect("the snapshot can be written");
-    };
-    if std::env::var_os("LETTERS_BLESS").is_some() {
-        return save(&path);
-    }
-
-    let actual = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.png"));
-    let hint = format!("see {} or accept it with LETTERS_BLESS=1", actual.display());
-    let Ok(expected) = image::open(&path).map(|image| image.into_rgba8()) else {
-        save(&actual);
-        panic!("snapshot {name} is missing: {hint}");
-    };
-    let same_size = (expected.width(), expected.height()) == (frame.width(), frame.height());
-    let differing = expected
-        .as_raw()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(frame.data().as_chunks::<4>().0)
-        .filter(|(a, b)| a.iter().zip(*b).any(|(a, b)| a.abs_diff(*b) > CHANNEL))
-        .count();
-    let allowed = (f64::from(frame.width() * frame.height()) * SHARE) as usize;
-    if !same_size || differing > allowed {
-        save(&actual);
-        panic!("snapshot {name} changed ({differing} pixels differ, {allowed} allowed): {hint}");
-    }
+/// A list to snapshot, drawn over white.
+pub fn shot<'a>(list: &'a DisplayList, images: &'a Images, width: u32, height: u32, scale: f32) -> Shot<'a> {
+    Shot { list, images, size: (width, height), scale, background: WHITE }
 }
 
 /// A scene 240 by 160 logical pixels, and the display scale to draw it at.

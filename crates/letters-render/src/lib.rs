@@ -11,6 +11,8 @@ mod damage;
 pub mod gpu;
 pub mod image;
 mod paint;
+#[cfg(feature = "snapshot")]
+pub mod snapshot;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Point {

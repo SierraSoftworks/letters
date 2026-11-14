@@ -2041,6 +2041,7 @@ dependencies = [
  "glifo",
  "image",
  "letters-fonts",
+ "letters-render",
  "pollster 1.0.1",
  "skrifa",
  "vello_cpu",

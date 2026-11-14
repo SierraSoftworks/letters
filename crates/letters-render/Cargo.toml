@@ -14,6 +14,8 @@ workspace = true
 [features]
 # The GPU backend. The shell turns it on, so the wasm-clean core never builds it.
 gpu = ["dep:vello_gpu", "dep:wgpu"]
+# Pixel snapshots for tests. They read and write files, which the core must not.
+snapshot = []
 
 [dependencies]
 bytemuck.workspace = true
@@ -26,4 +28,6 @@ wgpu = { workspace = true, optional = true }
 
 [dev-dependencies]
 letters-fonts.workspace = true
+# Turns the snapshot feature on for this crate's own tests.
+letters-render = { workspace = true, features = ["snapshot"] }
 pollster.workspace = true
