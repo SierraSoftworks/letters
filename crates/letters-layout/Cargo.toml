@@ -18,3 +18,7 @@ parley.workspace = true
 
 [dev-dependencies]
 letters-fonts.workspace = true
+
+[[bench]]
+name = "open"
+harness = false
