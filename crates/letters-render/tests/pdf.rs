@@ -18,7 +18,7 @@ use hayro::hayro_syntax::page::Page;
 use hayro::kurbo::{Affine, BezPath};
 use hayro::vello_cpu::color::palette::css;
 use hayro::{PixmapSettings, RenderCache, RenderSettings};
-use letters_render::image::Images;
+use letters_render::image::{Image, Images};
 use letters_render::pdf::{Heading, Info, Link, Pdf, PdfError, Target};
 use letters_render::{Color, DisplayList, Item, Point, Rect, RunText, Size};
 
@@ -224,6 +224,40 @@ fn an_image_is_stored_once_however_often_it_is_drawn() {
 
     assert!(once > stored / 2, "the image is in the file: {once} bytes");
     assert!(often < once + stored / 4, "three draws take {often} bytes and one takes {once}");
+}
+
+#[test]
+fn a_photo_goes_in_as_the_file_it_came_from() {
+    // Soft shapes under grain, as a camera gives: a JPEG is a fraction of its pixels.
+    let grainy = |x: u32, y: u32| {
+        let grain = (x.wrapping_mul(0x9E37_79B9) ^ y.wrapping_mul(0x85EB_CA6B)).wrapping_mul(0xC2B2_AE35) >> 28;
+        Color::rgb((x + grain) as u8, (y + grain) as u8, (255 - x / 2 + grain) as u8)
+    };
+    let jpeg = encoded(160, 120, image::ImageFormat::Jpeg, grainy);
+    let cases = [("a photo", jpeg.clone(), true), ("a photo taken on its side", oriented(&jpeg, 6), false)];
+    for (name, file, kept) in cases {
+        let photo = Image::decode(&file).expect("the photo decodes");
+        let frame = Rect::new(20.0, 20.0, photo.width() as f32, photo.height() as f32);
+        let mut images = Images::default();
+        images.insert("photo", photo);
+        let scene = on_white([Item::Image { rect: frame, asset: "photo".into() }]);
+
+        let bytes = written(&[(scene.clone(), vec![])], &images, &Info::default()).expect("it can be written");
+
+        let pixels = 160 * 120 * 3;
+        assert_eq!(
+            bytes.len() < file.len() + pixels / 20,
+            kept,
+            "{name}: {} bytes from a file of {}",
+            bytes.len(),
+            file.len()
+        );
+        let screen = render_with(&scene, &images, SHEET.width as u32, SHEET.height as u32, 1.0);
+        let page = shown(&read(bytes).pages()[0]);
+        let apart = |(a, b): (&[u8; 4], &[u8; 4])| a.iter().zip(b).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+        let far = screen.data().as_chunks::<4>().0.iter().zip(&page).filter(|pair| apart(*pair) > 48).count();
+        assert!(far < page.len() / 100, "{name} looks as it does on screen: {far} pixels are far off");
+    }
 }
 
 #[test]

@@ -57,6 +57,10 @@ pub struct Image {
     pub(crate) pixels: Arc<Pixmap>,
     /// Unique to these pixels for the life of the process, so a renderer can tell a replaced asset.
     pub(crate) id: u64,
+    /// The file the pixels were decoded from, when it is a JPEG that shows the same picture as it stands.
+    /// A PDF stores that rather than the pixels, which for a photo are many times larger.
+    #[cfg(feature = "pdf")]
+    pub(crate) jpeg: Option<Arc<[u8]>>,
 }
 
 impl Image {
@@ -65,9 +69,7 @@ impl Image {
         let mut reader = ImageReader::new(Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|error| ImageError::Invalid(error.to_string()))?;
-        if reader.format().is_none() {
-            return Err(ImageError::Unsupported);
-        }
+        let Some(format) = reader.format() else { return Err(ImageError::Unsupported) };
         let mut limits = Limits::default();
         limits.max_image_width = Some(MAX_SIDE);
         limits.max_image_height = Some(MAX_SIDE);
@@ -82,7 +84,15 @@ impl Image {
         let mut image = DynamicImage::from_decoder(decoder)?;
         image.apply_orientation(orientation);
         let image = image.into_rgba8();
-        Self::from_rgba8(image.width(), image.height(), image.into_raw())
+        #[cfg_attr(not(feature = "pdf"), expect(unused_mut, reason = "only the PDF backend keeps the file"))]
+        let mut image = Self::from_rgba8(image.width(), image.height(), image.into_raw())?;
+        #[cfg(feature = "pdf")]
+        if format == ::image::ImageFormat::Jpeg && orientation == ::image::metadata::Orientation::NoTransforms {
+            image.jpeg = Some(bytes.into());
+        }
+        #[cfg(not(feature = "pdf"))]
+        let _ = format;
+        Ok(image)
     }
 
     /// Wraps straight (not premultiplied) RGBA8 pixels, row by row from the top left.
@@ -99,7 +109,12 @@ impl Image {
         let metadata = PixelMetadata::new(ImageAlphaType::Alpha, true);
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let pixels = Arc::new(Pixmap::from_parts(rgba, width as u16, height as u16, metadata));
-        Ok(Self { pixels, id: NEXT.fetch_add(1, Ordering::Relaxed) })
+        Ok(Self {
+            pixels,
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            #[cfg(feature = "pdf")]
+            jpeg: None,
+        })
     }
 
     pub fn width(&self) -> u32 {

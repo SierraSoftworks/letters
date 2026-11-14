@@ -370,7 +370,14 @@ impl Painter<'_, '_> {
             Item::Image { rect, asset } => {
                 let (Some(_), Some(image)) = (rounded(rect, 0.0), self.assets.get(asset)) else { return };
                 let stored = self.kept.images.entry(image.id).or_insert_with(|| {
-                    picture(image.pixels.data_as_u8_slice(), (image.width(), image.height()), image.id)
+                    // A photo goes in as the file it came from. A JPEG the writer cannot take goes in as pixels.
+                    let file = image.jpeg.as_ref().and_then(|jpeg| {
+                        let data: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(jpeg.clone());
+                        krilla::image::Image::from_jpeg(data.into(), true).ok()
+                    });
+                    file.unwrap_or_else(|| {
+                        picture(image.pixels.data_as_u8_slice(), (image.width(), image.height()), image.id)
+                    })
                 });
                 let stored = stored.clone();
                 self.place(stored, *rect);

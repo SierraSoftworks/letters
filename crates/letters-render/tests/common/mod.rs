@@ -1,9 +1,11 @@
 //! Fixtures shared by the rendering tests.
 #![allow(dead_code, reason = "each test file uses its own part")]
 
+use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use image::{ImageFormat, Rgb, RgbImage};
 use letters_render::cpu::{CpuRenderer, Frame};
 use letters_render::image::{Image, Images};
 use letters_render::snapshot::Shot;
@@ -161,6 +163,29 @@ pub fn image(width: u32, height: u32, color: impl Fn(u32, u32) -> Color) -> Imag
     let pixels = (0..height).flat_map(|y| (0..width).map(move |x| (x, y)));
     let rgba = pixels.map(|(x, y)| color(x, y)).flat_map(|c| [c.r, c.g, c.b, c.a]).collect();
     Image::from_rgba8(width, height, rgba).expect("a valid image")
+}
+
+/// A `width` by `height` picture whose pixels come from `color(x, y)`, as a file in `format`.
+pub fn encoded(width: u32, height: u32, format: ImageFormat, color: impl Fn(u32, u32) -> Color) -> Vec<u8> {
+    let picture = RgbImage::from_fn(width, height, |x, y| {
+        let color = color(x, y);
+        Rgb([color.r, color.g, color.b])
+    });
+    let mut bytes = Cursor::new(Vec::new());
+    picture.write_to(&mut bytes, format).expect("the format encodes");
+    bytes.into_inner()
+}
+
+/// Adds an EXIF orientation to a JPEG, as a camera does for a photo taken on its side.
+pub fn oriented(jpeg: &[u8], orientation: u8) -> Vec<u8> {
+    let mut exif = b"Exif\0\0MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0".to_vec();
+    exif.extend([orientation, 0, 0, 0, 0, 0, 0]);
+    let mut out = jpeg[..2].to_vec();
+    out.extend([0xff, 0xe1]);
+    out.extend((exif.len() as u16 + 2).to_be_bytes());
+    out.extend(exif);
+    out.extend(&jpeg[2..]);
+    out
 }
 
 /// Where the snapshot of a name is kept.

@@ -11,14 +11,7 @@ use letters_render::{Color, Item, Rect};
 
 /// A picture that is red on the left and blue on the right, encoded in `format`.
 fn encoded(width: u32, height: u32, format: ImageFormat) -> Vec<u8> {
-    let picture = RgbaImage::from_fn(width, height, |x, _| {
-        let color = if x < width / 2 { RED } else { BLUE };
-        Rgba([color.r, color.g, color.b, 255])
-    });
-    let mut bytes = Cursor::new(Vec::new());
-    // JPEG has no alpha channel.
-    image::DynamicImage::from(picture).into_rgb8().write_to(&mut bytes, format).expect("the format encodes");
-    bytes.into_inner()
+    common::encoded(width, height, format, |x, _| if x < width / 2 { RED } else { BLUE })
 }
 
 /// Draws an image across a frame of its own size and returns the colours of its left and right halves.
@@ -30,18 +23,6 @@ fn halves(image: Image) -> (Color, Color) {
     let frame = render_with(&list([item]), &images, width, height, 1.0);
     let probe = |x| frame.pixel(x, height / 2).expect("the probe is inside the frame");
     (probe(width / 4), probe(width * 3 / 4))
-}
-
-/// Adds an EXIF orientation to a JPEG, as a camera does for a photo taken on its side.
-fn oriented(jpeg: &[u8], orientation: u8) -> Vec<u8> {
-    let mut exif = b"Exif\0\0MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0".to_vec();
-    exif.extend([orientation, 0, 0, 0, 0, 0, 0]);
-    let mut out = jpeg[..2].to_vec();
-    out.extend([0xff, 0xe1]);
-    out.extend((exif.len() as u16 + 2).to_be_bytes());
-    out.extend(exif);
-    out.extend(&jpeg[2..]);
-    out
 }
 
 #[test]
