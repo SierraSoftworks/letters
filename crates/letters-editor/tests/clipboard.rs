@@ -1,7 +1,14 @@
 mod common;
 
+use std::collections::BTreeSet;
+
 use common::{Harness, canon, clip};
 use letters_editor::Command;
+
+/// The id of every block, in document order.
+fn ids(editor: &Harness) -> Vec<String> {
+    editor.editor.doc().walk().map(|block| block.id.to_string()).collect()
+}
 
 /// Copies or cuts the selection in `from`, then pastes over the selection in `into`.
 fn carry(from: &str, command: Command, into: &str) -> (Harness, Harness) {
@@ -56,19 +63,19 @@ fn a_cut_takes_the_selection_away_and_pastes_back_in_place() {
 }
 
 #[test]
-fn other_applications_are_given_markdown() {
+fn other_applications_are_given_markdown_and_html() {
     let cases = [
-        ("p on^e **two**\nhr\n> ul th|ree", vec!["e **two**", "---", "> - th"]),
-        ("h2 ^A *title*|", vec!["## A *title*"]),
+        ("p on^e **two**\nhr\n> ul th|ree", vec!["e **two**", "---", "> - th"], "<blockquote>"),
+        ("h2 ^A *title*|", vec!["## A *title*"], "<h2>"),
         // A phrase keeps the spaces around it as they were typed.
-        ("p one^ **two** |three", vec![" **two** "]),
+        ("p one^ **two** |three", vec![" **two** "], "<strong>two</strong>"),
     ];
-    for (from, lines) in cases {
+    for (from, lines, element) in cases {
         let (source, _) = carry(from, Command::Copy, "p |");
         let clip = source.platform.clip.expect("copying writes the clipboard");
         let written: Vec<&str> = clip.text.lines().filter(|line| !line.is_empty()).collect();
         assert_eq!(written, lines, "the text of {from:?}");
-        assert!(clip.html.is_some_and(|html| html.contains("<p>")), "a copy of {from:?} offers HTML");
+        assert!(clip.html.is_some_and(|html| html.contains(element)), "the HTML of {from:?} has {element}");
     }
 }
 
@@ -85,8 +92,8 @@ fn text_from_elsewhere_is_read_as_markdown() {
         ("p **A|B**", "one", None, "p **Aone|B**"),
         // Text that is only space has no Markdown to read.
         ("p A|B", "  ", None, "p A  |B"),
-        // HTML that Letters did not write is not understood yet, so the text beside it is used.
-        ("p A|B", "one", Some("<b>one</b>"), "p Aone|B"),
+        // HTML with nothing to show leaves the text beside it.
+        ("p A|B", "*one*", Some("<div><p></p></div>"), "p A*one*|B"),
         // Code takes text as it is written.
         ("code A|B", "one\n  *two*", None, "code Aone⏎  \\*two\\*|B"),
     ];
@@ -96,6 +103,69 @@ fn text_from_elsewhere_is_read_as_markdown() {
         editor.key("Mod+v");
         assert_eq!(editor.state(), canon(after), "{text:?} into {into:?}");
     }
+}
+
+#[test]
+fn html_from_elsewhere_keeps_its_formatting() {
+    let cases = [
+        // A phrase pours into the line at the caret, as text selected within a line of a web page does.
+        ("p A|B", "<meta charset='utf-8'><b>one</b> two", "p A**one** two|B"),
+        ("p A|B", r#"a <a href="https://a.example">link</a>"#, "p Aa [link](https://a.example)|B"),
+        ("h1 A|B", "<p>one</p>", "h1 Aone|B"),
+        // It keeps its own formatting, and not what is in force at the caret.
+        ("p **A|B**", "<i>one</i>", "p **A***one*|**B**"),
+        // Blocks arrive as blocks.
+        ("p |", "<h1>Title</h1><ul><li>one</li><li>two</li></ul>", "h1 Title\nul one\nul two|"),
+        ("p A|B", "<p>one</p><blockquote><p>two</p></blockquote>", "p Aone\n> p two\np |B"),
+    ];
+    for (into, html, after) in cases {
+        let mut editor = Harness::new(into);
+        // The text beside the HTML is what an application without formatting would take.
+        editor.platform.clip = Some(clip("unformatted", Some(html)));
+        editor.key("Mod+v");
+        assert_eq!(editor.state(), canon(after), "{html:?} into {into:?}");
+
+        let mut plain = Harness::new("p A|B");
+        plain.platform.clip = Some(clip("unformatted", Some(html)));
+        plain.key("Mod+Shift+v");
+        assert_eq!(plain.state(), canon("p Aunformatted|B"), "{html:?} pasted plainly");
+    }
+}
+
+#[test]
+fn a_cut_block_comes_back_as_itself_and_a_copy_as_another() {
+    let before = "p one\np tw^o\nhr\n> p three\np fo|ur\np end";
+    let unique = |ids: &[String]| ids.iter().collect::<BTreeSet<_>>().len() == ids.len();
+
+    // Whatever refers to a block by its id still finds it after the block is moved.
+    let mut editor = Harness::new(before);
+    let original = ids(&editor);
+    editor.key("Mod+x");
+    let left = ids(&editor);
+    let cut: Vec<&String> = original.iter().filter(|id| !left.contains(id)).collect();
+    editor.key("Mod+End");
+    editor.key("Mod+v");
+    let moved = ids(&editor);
+    assert!(!cut.is_empty() && cut.iter().all(|id| moved.contains(id)), "{cut:?} are back in {moved:?}");
+    assert!(unique(&moved), "{moved:?}");
+
+    // The clipboard still holds them, and a second paste makes blocks of its own.
+    editor.key("Mod+v");
+    let twice = ids(&editor);
+    assert!(twice.len() > moved.len() && unique(&twice), "{twice:?}");
+
+    // Undo puts every block back where it was, under the id it had.
+    (0..3).for_each(|_| _ = editor.key("Mod+z"));
+    assert_eq!((editor.text(), ids(&editor)), (canon(before).replace(['^', '|'], ""), original.clone()));
+
+    // A copy leaves the original where it is, so what is pasted is new.
+    let mut editor = Harness::new(before);
+    editor.key("Mod+c");
+    editor.key("Mod+End");
+    editor.key("Mod+v");
+    let copied = ids(&editor);
+    assert!(original.iter().all(|id| copied.contains(id)) && copied.len() > original.len(), "{copied:?}");
+    assert!(unique(&copied), "{copied:?}");
 }
 
 #[test]

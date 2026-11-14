@@ -1,12 +1,12 @@
 //! Copy, cut and paste.
 //!
 //! A copy carries the selected blocks as `document.json` does, inside the clipboard's HTML, so that pasting
-//! into Letters loses nothing. Other applications read the HTML around it, or the plain text, which is
-//! Markdown. Text from other applications is read as Markdown too.
+//! into Letters loses nothing. Other applications read the HTML it wraps, or the plain text, which is
+//! Markdown. What other applications copied is read from its HTML, or from its text as Markdown.
 
 use std::collections::BTreeSet;
 
-use letters_convert::{from_markdown, to_markdown};
+use letters_convert::{from_html, from_markdown, to_html_fragment, to_markdown};
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Op, Pos, Run};
 use serde_json::Value;
 
@@ -35,14 +35,15 @@ fn lines(blocks: &[Block]) -> Vec<String> {
         .collect()
 }
 
+/// The clipboard's HTML for `blocks`: what other applications read, inside an element that carries the
+/// blocks themselves.
 fn to_html(blocks: &[Block]) -> String {
     let json = Value::Array(blocks.iter().map(Block::to_value).collect()).to_string();
-    let body: String = lines(blocks).iter().map(|line| format!("<p>{}</p>", escape(line))).collect();
-    format!("<div {CARRIER}=\"{}\">{body}</div>", escape(&json))
+    format!("<div {CARRIER}=\"{}\">{}</div>", escape(&json), to_html_fragment(blocks))
 }
 
 /// The blocks that HTML copied from Letters carries.
-fn from_html(html: &str) -> Option<Vec<Block>> {
+fn carried(html: &str) -> Option<Vec<Block>> {
     let (_, rest) = html.split_once(&format!("{CARRIER}=\""))?;
     let (json, _) = rest.split_once('"')?;
     let Value::Array(blocks) = serde_json::from_str(&unescape(json)).ok()? else { return None };
@@ -115,10 +116,15 @@ fn keep(block: &Block, leaf: &dyn Fn(&Block) -> Option<Body>) -> Option<Block> {
     Some(Block { id: block.id.clone(), kind: block.kind.clone(), body, extra: block.extra.clone() })
 }
 
-fn renew(block: &mut Block, platform: &mut dyn Platform) {
-    block.id = BlockId::new(platform.new_id());
+/// Gives `block` and the blocks inside it new ids where theirs are `taken`. A block that was cut comes
+/// back under its own id, so whatever refers to it still does, and a copy is a block of its own.
+fn renew(block: &mut Block, taken: &mut BTreeSet<BlockId>, platform: &mut dyn Platform) {
+    if !taken.insert(block.id.clone()) {
+        block.id = BlockId::new(platform.new_id());
+        taken.insert(block.id.clone());
+    }
     if let Body::Blocks(children) = &mut block.body {
-        children.iter_mut().for_each(|child| renew(child, platform));
+        children.iter_mut().for_each(|child| renew(child, taken, platform));
     }
 }
 
@@ -192,28 +198,30 @@ impl Editor {
             return self.set_link(Some(address.to_owned()));
         }
         let marks = self.caret.as_ref().map(|caret| caret.marks.clone()).unwrap_or_default();
-        let carried = clip.html.as_deref().and_then(from_html).filter(|blocks| !blocks.is_empty());
+        let html = clip.html.as_deref();
+        let own = html.and_then(carried).filter(|blocks| !blocks.is_empty());
         let text = clip.text.replace("\r\n", "\n").replace('\r', "\n");
         if plain || code {
             // Only the words are wanted. For a copy made in Letters those are not the Markdown beside it.
-            let text = carried.map_or(text, |blocks| lines(&blocks).join("\n"));
+            let text = own.map_or(text, |blocks| lines(&blocks).join("\n"));
             return self.insert_lines(&text, platform);
         }
-        if let Some(mut blocks) = carried {
-            blocks.iter_mut().for_each(|block| renew(block, platform));
-            return self.insert_blocks(blocks, &BTreeSet::new(), platform);
-        }
-        // HTML that Letters did not write is not read yet, so the text beside it is.
-        match from_text(&text, platform) {
-            blocks if blocks.is_empty() => self.insert_lines(&text, platform),
-            blocks => self.insert_blocks(blocks, &marks, platform),
+        // Formatted text keeps its own formatting. Bare text takes what is in force at the caret.
+        let none = BTreeSet::new();
+        let read = |html: &str, platform: &mut dyn Platform| from_html(html, &mut || platform.new_id()).0.blocks;
+        let formatted = own.or_else(|| html.map(|html| read(html, platform)).filter(|blocks| !blocks.is_empty()));
+        match formatted.map_or_else(|| (from_text(&text, platform), &marks), |blocks| (blocks, &none)) {
+            (blocks, _) if blocks.is_empty() => self.insert_lines(&text, platform),
+            (blocks, marks) => self.insert_blocks(blocks, marks, platform),
         }
     }
 
     /// Replaces the selection with `blocks`. Text poured into the block at the caret also takes `marks`.
-    fn insert_blocks(&mut self, blocks: Vec<Block>, marks: &BTreeSet<Mark>, platform: &mut dyn Platform) {
+    fn insert_blocks(&mut self, mut blocks: Vec<Block>, marks: &BTreeSet<Mark>, platform: &mut dyn Platform) {
         self.delete_selection();
         let Some(at) = self.selection().map(|selection| selection.head.clone()) else { return };
+        let mut taken: BTreeSet<BlockId> = self.doc().walk().map(|block| block.id.clone()).collect();
+        blocks.iter_mut().for_each(|block| renew(block, &mut taken, platform));
         let doc = self.doc();
         let (Some(target), Some(place)) = (doc.block(&at.block), tree::place(doc, &at.block)) else { return };
         let (len, parent, index) = (text::len(target), place.parent_id(), place.index + 1);
