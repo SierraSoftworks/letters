@@ -224,6 +224,11 @@ impl Harness {
     }
 }
 
+/// What another application leaves on the clipboard.
+pub fn clip(text: &str, html: Option<&str>) -> Clip {
+    Clip { text: text.into(), html: html.map(str::to_owned), ..Clip::default() }
+}
+
 /// `Mod+Shift+z`, `Alt+Left`, `Enter`: modifiers, then a named key or a character.
 pub fn key(name: &str) -> KeyEvent {
     let mut parts: Vec<&str> = name.split('+').collect();

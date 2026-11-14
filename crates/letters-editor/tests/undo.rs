@@ -1,8 +1,7 @@
 mod common;
 
 use common::Do::{K, T};
-use common::{Action, Harness, SAMPLE, action, canon, check, perform};
-use letters_editor::Clip;
+use common::{Action, Harness, SAMPLE, action, canon, check, clip, perform};
 use proptest::prelude::*;
 
 /// Presses undo until nothing changes, and returns each state passed through.
@@ -73,7 +72,7 @@ proptest! {
             Some(width) => Harness::wrapped(&SAMPLE.replace("ünïcödé 👩‍👧", "unicode"), width),
             None => Harness::new(SAMPLE),
         };
-        editor.platform.clip = Some(Clip { text: "pasted\ntext".into(), html: None });
+        editor.platform.clip = Some(clip("pasted\ntext", None));
         let original = editor.text();
         for action in &actions {
             // The fake layout counts bytes, so it is only given text of one byte a character.

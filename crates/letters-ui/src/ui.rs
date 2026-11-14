@@ -713,7 +713,7 @@ impl<A: App> Ui<A> {
             (Key::Char('c' | 'x'), _) if mods.primary => {
                 let selected = state.selected(value);
                 if !selected.is_empty() {
-                    platform.clipboard_write(Clip { text: selected.to_owned(), html: None });
+                    platform.clipboard_write(Clip { text: selected.to_owned(), ..Clip::default() });
                 }
                 (event.key == Key::Char('x') && !selected.is_empty()).then(|| state.insert(value, ""))
             }

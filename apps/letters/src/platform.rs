@@ -46,7 +46,7 @@ impl Platform for Desktop {
         if text.is_none() && html.is_none() {
             return None;
         }
-        Some(Clip { text: text.unwrap_or_default(), html })
+        Some(Clip { text: text.unwrap_or_default(), html, ..Clip::default() })
     }
 
     fn clipboard_write(&mut self, clip: Clip) {

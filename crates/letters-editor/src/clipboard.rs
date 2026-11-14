@@ -167,7 +167,8 @@ impl Editor {
     pub(crate) fn copy(&mut self, platform: &mut dyn Platform) {
         let blocks = self.fragment();
         if !blocks.is_empty() {
-            platform.clipboard_write(Clip { text: to_text(&blocks), html: Some(to_html(&blocks)) });
+            let clip = Clip { text: to_text(&blocks), html: Some(to_html(&blocks)), ..Clip::default() };
+            platform.clipboard_write(clip);
         }
     }
 

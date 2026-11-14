@@ -1,8 +1,8 @@
 mod common;
 
 use common::Do::{K, T};
-use common::{Do, Harness, SAMPLE, action, canon, check, perform};
-use letters_editor::{Clip, InputEvent};
+use common::{Do, Harness, SAMPLE, action, canon, check, clip, perform};
+use letters_editor::InputEvent;
 use proptest::prelude::*;
 
 /// Two writers on `state`: this one with its selection, and another who plays `script` from `theirs`.
@@ -93,7 +93,7 @@ proptest! {
         let mut first = Harness::new(SAMPLE);
         let mut second = first.fork(2);
         for writer in [&mut first, &mut second] {
-            writer.platform.clip = Some(Clip { text: "pasted\ntext".into(), html: None });
+            writer.platform.clip = Some(clip("pasted\ntext", None));
         }
         for (mine, action, share) in &turns {
             let (writer, other) = if *mine { (&mut first, &mut second) } else { (&mut second, &mut first) };

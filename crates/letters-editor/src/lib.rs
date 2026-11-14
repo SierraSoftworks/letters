@@ -152,13 +152,28 @@ pub trait Platform {
     fn lines(&self) -> Option<&dyn Lines> {
         None
     }
+    /// Keeps the bytes of an asset that the document now names. The name comes from the bytes, so being
+    /// handed one twice changes nothing.
+    fn store_asset(&mut self, _name: &str, _bytes: &[u8]) {}
 }
 
-/// Clipboard content: plain text (Markdown when Letters wrote it) and, where offered, HTML.
+/// Clipboard content: plain text (Markdown when Letters wrote it) and, where offered, HTML and images.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Clip {
     pub text: String,
     pub html: Option<String>,
+    pub pictures: Vec<Picture>,
+}
+
+/// An image on its way into the document, as the shell hands it over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Picture {
+    pub bytes: Vec<u8>,
+    /// Its media type, such as `image/png`.
+    pub mime: String,
+    /// Its size in pixels.
+    pub width: u32,
+    pub height: u32,
 }
 
 /// A selection and the marks that text typed at it will take.

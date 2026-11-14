@@ -1,7 +1,7 @@
 mod common;
 
-use common::{Harness, canon};
-use letters_editor::{Clip, Command};
+use common::{Harness, canon, clip};
+use letters_editor::Command;
 
 /// Copies or cuts the selection in `from`, then pastes over the selection in `into`.
 fn carry(from: &str, command: Command, into: &str) -> (Harness, Harness) {
@@ -92,7 +92,7 @@ fn text_from_elsewhere_is_read_as_markdown() {
     ];
     for (into, text, html, after) in cases {
         let mut editor = Harness::new(into);
-        editor.platform.clip = Some(Clip { text: text.into(), html: html.map(str::to_owned) });
+        editor.platform.clip = Some(clip(text, html));
         editor.key("Mod+v");
         assert_eq!(editor.state(), canon(after), "{text:?} into {into:?}");
     }
@@ -109,7 +109,7 @@ fn pasting_plainly_keeps_only_the_text() {
 
     // Text from elsewhere is kept as written, Markdown or not.
     let mut written = Harness::new("p A|B");
-    written.platform.clip = Some(Clip { text: "# one\n*two*".into(), html: None });
+    written.platform.clip = Some(clip("# one\n*two*", None));
     written.key("Mod+Shift+v");
     assert_eq!(written.state(), canon("p A# one\np \\*two\\*|B"));
 
@@ -124,7 +124,7 @@ fn pasting_plainly_keeps_only_the_text() {
 fn an_address_pasted_over_a_selection_links_it() {
     let paste = |into: &str, text: &str| {
         let mut editor = Harness::new(into);
-        editor.platform.clip = Some(Clip { text: text.into(), html: None });
+        editor.platform.clip = Some(clip(text, None));
         editor.key("Mod+v");
         editor.state()
     };
