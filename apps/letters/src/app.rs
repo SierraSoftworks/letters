@@ -34,7 +34,7 @@ use crate::cli::{Mode, Options};
 use crate::files::{self, EXTENSION, Home, Opened, Rest, Working};
 use crate::gpu::Gpu;
 use crate::input::{self, Composer, Press};
-use crate::library::{Library, Place, Recent, UNTITLED, has_content};
+use crate::library::{Library, Place, Recent, Refused, UNTITLED, has_content};
 use crate::measure::{FIRST_FRAME, Launch, Typing};
 use crate::platform::{self, Desktop};
 use crate::present::{Painter, Presenter};
@@ -354,6 +354,30 @@ impl DocWindow {
             folders: library.folders(&folder).into_iter().filter_map(shown).collect(),
         });
         self.located = Some((name, folder));
+    }
+
+    /// Renames or moves the document, or makes a folder for it, as the bar asked, and answers the bar:
+    /// where the document now is, or why it is not there. Returns whether it was done.
+    fn replace(
+        &mut self,
+        library: &Library,
+        now: Instant,
+        change: impl FnOnce(&mut Place, &Library) -> Result<(), Refused>,
+    ) -> bool {
+        // The file is at rest while it moves, so a save that is running is waited for.
+        self.finish_save(library, now);
+        let done = change(&mut self.place, library);
+        match &done {
+            Ok(()) => {
+                self.relist(library);
+                // Told even when nothing changed, since the bar waits for its answer.
+                self.located = None;
+                self.relocate(library);
+            }
+            Err(refused) => self.view.set_notice(Some(&refused.to_string())),
+        }
+        self.retitle();
+        done.is_ok()
     }
 
     /// Reads the person's own words again, if their dictionary changed since this window last looked.
@@ -719,6 +743,7 @@ impl App {
     /// Does what a window asked of the app since it was last looked at.
     fn serve(&mut self, event_loop: &ActiveEventLoop, id: WindowId, now: Instant) {
         let Some(window) = self.windows.get_mut(&id) else { return };
+        let mut refused = false;
         for request in window.view.take_requests() {
             match request {
                 Request::Open(path) => self.act(event_loop, id, Action::Open(Some(path.into()))),
@@ -730,8 +755,36 @@ impl App {
                         window.save_at = Some(now);
                     }
                 }
+                // What was asked along with something refused is left for the person to ask again.
+                Request::Rename(_) | Request::Move(_) | Request::MoveElsewhere | Request::NewFolder { .. }
+                    if refused => {}
+                Request::Rename(name) => {
+                    refused = !self.replace(id, now, |place, library| place.rename(&name, library))
+                }
+                Request::Move(folder) => refused = !self.replace(id, now, |place, _| place.move_to(Path::new(&folder))),
+                Request::MoveElsewhere => {
+                    let Some(window) = self.windows.get(&id) else { continue };
+                    let dialog = FileDialog::new().set_directory(window.place.folder(&self.library));
+                    if let Some(folder) = dialog.set_parent(&*window.window).pick_folder() {
+                        refused = !self.replace(id, now, |place, _| place.move_to(&folder));
+                    }
+                }
+                Request::NewFolder { parent, name } => {
+                    let make = |library: &Library| library.new_folder(Path::new(&parent), &name).map(drop);
+                    refused = !self.replace(id, now, |_, library| make(library));
+                }
             }
         }
+    }
+
+    /// Has a window rename or move its document. Returns whether it was done.
+    fn replace(
+        &mut self,
+        id: WindowId,
+        now: Instant,
+        change: impl FnOnce(&mut Place, &Library) -> Result<(), Refused>,
+    ) -> bool {
+        self.windows.get_mut(&id).is_some_and(|window| window.replace(&self.library, now, change))
     }
 
     fn mark(&mut self, stage: &'static str) {

@@ -348,6 +348,22 @@ fn a_folder_is_shown_by_its_place_under_the_root() {
 }
 
 #[test]
+fn a_new_folder_is_made_where_it_was_asked_for_and_replaces_nothing() {
+    let desk = Desk::new("new-folder");
+    let (library, work) = (desk.library(), desk.folder("Work"));
+
+    let made = library.new_folder(&work, " Clients: 2026 ").unwrap();
+    assert!(made.is_dir() && made.parent() == Some(&*work), "{made:?}");
+    assert!(library.folders(&work).iter().any(|folder| folder.path == made), "the tree lists it");
+
+    let taken = made.file_name().unwrap().to_str().unwrap();
+    assert!(matches!(library.new_folder(&work, taken), Err(Refused::FolderTaken(_))));
+    assert!(matches!(library.new_folder(&work, " . "), Err(Refused::NoFolderName)));
+    assert!(matches!(library.new_folder(&work.join("Gone"), "Notes"), Err(Refused::NoFolder(_))));
+    assert_eq!(desk.names("Work"), [taken]);
+}
+
+#[test]
 fn a_free_path_is_the_first_number_nothing_has() {
     let desk = Desk::new("free");
     let root = desk.folder("");
