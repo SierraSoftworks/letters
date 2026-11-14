@@ -5,6 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <title>Letters</title>
+    <!-- Everything the editor needs is asked for at once, not each when the one before has arrived. -->
+    <link rel="modulepreload" href="letters.js" />
+    <link rel="preload" as="fetch" crossorigin href="letters_bg.wasm" />
+    <link rel="preload" as="fetch" crossorigin href="fonts/Inter.ttf" />
+    <link rel="preload" as="fetch" crossorigin href="fonts/Inter-Italic.ttf" />
+    <link rel="preload" as="fetch" crossorigin href="fonts/FiraCode.ttf" />
+    <link rel="preload" as="fetch" crossorigin href="fonts/Montserrat.ttf" />
+    <link rel="preload" as="fetch" crossorigin href="fonts/Montserrat-Italic.ttf" />
     <style>
       html,
       body {
@@ -27,7 +35,7 @@
 
       await init();
       // The console and the tests reach the editor here.
-      window.letters = new Letters(document.getElementById("letters"));
+      window.letters = await Letters.start(document.getElementById("letters"), "fonts/");
     </script>
   </body>
 </html>

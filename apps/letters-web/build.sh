@@ -17,7 +17,9 @@ rm -rf dist
 "$bindgen" "$wasm" --target web --no-typescript --out-name letters --out-dir dist \
   --remove-name-section --remove-producers-section
 cp www/index.html dist/
+mkdir dist/fonts
+cp ../../crates/letters-fonts/fonts/*.ttf dist/fonts/
 
 # The same module with its function names left in, which the report reads to say whose the code is.
 "$bindgen" "$wasm" --target web --no-typescript --out-name letters --out-dir "$target/letters-web-named" --no-demangle
-node size.mjs dist/letters_bg.wasm "$target/letters-web-named/letters_bg.wasm"
+node size.mjs dist "$target/letters-web-named/letters_bg.wasm"

@@ -3,9 +3,10 @@
 //! - [`shell`] owns the canvas, the hidden input beside it and the frame loop.
 //! - [`input`] turns the hidden input's events into the editor's input, and [`browser`] lends the editor
 //!   the browser's clock, identifiers and clipboard.
-//! - [`Letters`] is what a page holds: `new Letters(canvas)` starts the editor.
+//! - [`Letters`] is what a page holds: `await Letters.start(canvas, "fonts/")` starts the editor.
 //!
-//! Frames are rasterised on the CPU, so the page needs no WebGPU.
+//! Frames are rasterised on the CPU, so the page needs no WebGPU. The fonts are fetched beside the wasm and
+//! are no part of it, so a new build of the code leaves them in the browser's cache.
 
 pub mod browser;
 pub mod input;
@@ -28,10 +29,12 @@ pub struct Letters {
 
 #[wasm_bindgen]
 impl Letters {
-    /// Starts the editor in `canvas`. The page's CSS decides the canvas's size.
-    #[wasm_bindgen(constructor)]
-    pub fn new(canvas: HtmlCanvasElement) -> Result<Letters, JsValue> {
+    /// Starts the editor in `canvas`, whose size the page's CSS decides, with the fonts found under
+    /// `fonts`, a URL that ends in a slash.
+    pub async fn start(canvas: HtmlCanvasElement, fonts: String) -> Result<Letters, JsValue> {
         std::panic::set_hook(Box::new(|panic| web_sys::console::error_1(&panic.to_string().into())));
+        let window = web_sys::window().ok_or("there is no window")?;
+        letters_fonts::provide(browser::fonts(&window, &fonts).await?);
         Ok(Self { shell: Shell::start(canvas)? })
     }
 

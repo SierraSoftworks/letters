@@ -2692,10 +2692,12 @@ version = "0.1.0"
 dependencies = [
  "js-sys",
  "letters-editor",
+ "letters-fonts",
  "letters-model",
  "letters-render",
  "letters-ui",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 

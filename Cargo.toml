@@ -83,6 +83,7 @@ getrandom = "0.4"
 
 # The browser shell. The command-line `wasm-bindgen` must be the version the lock file names.
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = "0.3"
 

@@ -1,6 +1,6 @@
 [package]
 name = "letters-fonts"
-description = "The open-licence fonts compiled into every Letters build"
+description = "The open-licence fonts every Letters build shows"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,10 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# Leaves the fonts out of the binary. The shell fetches the files and hands them over with `provide`.
+provided = []
 
 [dependencies]
 letters-render.workspace = true
