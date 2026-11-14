@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use letters_render::{Color, DisplayList, Glyph, Item, PathEl, Point, Rect};
 use parley::{
-    Affinity, Alignment, AlignmentOptions, Cursor, GlyphRun, Language, Layout, Line, PositionedLayoutItem,
+    Affinity, Alignment, AlignmentOptions, BreakReason, Cursor, GlyphRun, Language, Layout, Line, PositionedLayoutItem,
     Selection as Span,
 };
 
@@ -90,6 +90,22 @@ fn marked<'a>(of: &'a Type, code: &'a Type, mono: bool, ink: Ink, bits: u8) -> S
 /// The height a leaf takes, in whole pixels so that the rows below stay on the pixel grid.
 pub(crate) fn height(layout: &Layout<Brush>) -> f32 {
     layout.height().round().max(1.0)
+}
+
+/// How many lines a layout has, and which of them carry on from the line before with no line break between.
+/// Only a line of `code` holds together like that: prose may go to the next page at any line.
+pub(crate) fn lines(layout: &Layout<Brush>, code: bool) -> (u32, Vec<u32>) {
+    let mut joined = Vec::new();
+    if code {
+        let mut wrapped = false;
+        for (index, line) in layout.lines().enumerate() {
+            if wrapped {
+                joined.push(index as u32);
+            }
+            wrapped = line.break_reason() != BreakReason::Explicit;
+        }
+    }
+    (layout.len().max(1) as u32, joined)
 }
 
 /// Lays a leaf out in full, with the sign its marker needs.
@@ -403,7 +419,7 @@ impl Painter<'_> {
     }
 
     /// Emits a whole small layout with its top left at `at`.
-    fn glyphs(&mut self, layout: &Layout<Brush>, at: Point) {
+    pub fn glyphs(&mut self, layout: &Layout<Brush>, at: Point) {
         for line in layout.lines() {
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(run) = item else { continue };

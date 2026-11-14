@@ -24,6 +24,12 @@ pub(crate) enum Role {
     Caption,
 }
 
+impl Role {
+    pub fn is_heading(self) -> bool {
+        matches!(self, Self::Heading1 | Self::Heading2 | Self::Heading3 | Self::Heading4)
+    }
+}
+
 const ROLES: [(Role, &str); 8] = [
     (Role::Body, "body"),
     (Role::Heading1, "heading1"),
@@ -192,10 +198,17 @@ pub(crate) struct Leaf {
     /// The innermost frame around this leaf.
     pub frame: Option<usize>,
 
+    /// Whether a page of print starts with this leaf, come what may.
+    pub breaks: bool,
+
     pub y: f32,
     pub height: f32,
     /// Whether `height` comes from a real layout and not an estimate.
     pub exact: bool,
+    /// How many lines the leaf has, each as tall as the next. Known once `exact`.
+    pub lines: u32,
+    /// The lines that carry on a line of code from the line before, in order. No page starts with one.
+    pub joined: Vec<u32>,
     pub laid: Option<Box<Laid>>,
     /// When the layout was last used, for dropping the stalest.
     pub used: u64,
@@ -294,6 +307,11 @@ impl Frame {
     }
 }
 
+/// Whether a block is marked to start a page of print.
+pub(crate) fn breaks(block: &Block) -> bool {
+    block.extra.get("break").and_then(|value| value.as_str()) == Some("page")
+}
+
 #[derive(Default)]
 pub(crate) struct Flow {
     pub leaves: Vec<Leaf>,
@@ -303,7 +321,7 @@ pub(crate) struct Flow {
 /// Lays the document out as a column `width` wide. `reuse` hands back the old leaf of a block whose content
 /// has not changed, so its text and layout carry over.
 pub(crate) fn flow(doc: &Document, types: &Types, width: f32, reuse: impl FnMut(&Block) -> Option<Leaf>) -> Flow {
-    let mut walk = Walk { types, reuse, out: Flow::default(), pad: 0.0, root: 0 };
+    let mut walk = Walk { types, reuse, out: Flow::default(), pad: 0.0, breaks: false, root: 0 };
     walk.place(&doc.blocks, 0.0, width, None, false);
     walk.out
 }
@@ -314,6 +332,8 @@ struct Walk<'a, F> {
     out: Flow,
     /// Padding of frames opened since the last leaf, which the next leaf carries above it.
     pad: f32,
+    /// Whether a block since the last leaf starts a page, which the next leaf then does.
+    breaks: bool,
     root: usize,
 }
 
@@ -328,6 +348,7 @@ impl<F: FnMut(&Block) -> Option<Leaf>> Walk<'_, F> {
             if frame.is_none() {
                 self.root = index;
             }
+            self.breaks |= breaks(block);
             let role = match &block.kind {
                 BlockKind::Heading { level: 1 } => Role::Heading1,
                 BlockKind::Heading { level: 2 } => Role::Heading2,
@@ -403,11 +424,12 @@ impl<F: FnMut(&Block) -> Option<Leaf>> Walk<'_, F> {
                     (self.out.frames[this].last, self.out.frames[this].reach) = (last, self.out.leaves[last].bottom);
                 }
                 BlockKind::Divider => {
-                    self.push(Leaf { what: What::Rule, ..Leaf::default() }, x, width, gap, frame);
+                    let id = Some(block.id.clone());
+                    self.push(Leaf { id, what: What::Rule, ..Leaf::default() }, x, width, gap, frame);
                 }
                 BlockKind::Unknown { type_name } => {
-                    let text = format!("Unsupported block: {type_name}");
-                    self.push(Leaf { what: What::Label, role, text, ..Leaf::default() }, x, width, gap, frame);
+                    let (id, text) = (Some(block.id.clone()), format!("Unsupported block: {type_name}"));
+                    self.push(Leaf { id, what: What::Label, role, text, ..Leaf::default() }, x, width, gap, frame);
                 }
                 _ => {
                     let mut leaf = match (self.reuse)(block) {
@@ -443,8 +465,9 @@ impl<F: FnMut(&Block) -> Option<Leaf>> Walk<'_, F> {
         leaf.top = gap + pad_y + std::mem::take(&mut self.pad);
         leaf.bottom = pad_y;
         leaf.frame = frame;
+        leaf.breaks = std::mem::take(&mut self.breaks);
         if matches!(leaf.what, What::Rule | What::Blank) {
-            (leaf.height, leaf.exact) = (leaf.estimate(self.types), true);
+            (leaf.height, leaf.exact, leaf.lines) = (leaf.estimate(self.types), true, 1);
         } else if !leaf.exact {
             leaf.height = leaf.estimate(self.types);
         }

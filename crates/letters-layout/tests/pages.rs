@@ -1,0 +1,410 @@
+//! Pagination for Print view and export: where pages break, and what each one paints.
+
+use std::collections::HashMap;
+use std::ops::Range;
+
+use letters_layout::{DocLayout, Pages};
+use letters_model::{Block, BlockId, BlockKind, Body, Document, ListKind, Model, Op, Page, Pos, Style, Tone};
+use letters_render::{DisplayList, Item, Point, Rect};
+use proptest::prelude::*;
+
+mod common;
+use common::*;
+
+/// The text width of [`paper`], in logical pixels.
+const COLUMN: f32 = 320.0;
+
+/// A sheet whose text area is [`COLUMN`] wide and `room` logical pixels tall, with margins all round.
+fn paper(room: f32) -> Page {
+    let (margin, points) = (30.0, 72.0 / 96.0);
+    Page {
+        width: COLUMN * points + 2.0 * margin,
+        height: room * points + 2.0 * margin,
+        margin_top: margin,
+        margin_right: margin,
+        margin_bottom: margin,
+        margin_left: margin,
+        ..Page::default()
+    }
+}
+
+fn paged(doc: &Document, room: f32) -> (DocLayout, Pages) {
+    let layout = laid_at(doc, COLUMN);
+    let pages = layout.paginate(&paper(room));
+    (layout, pages)
+}
+
+/// A block that starts a page of print.
+fn breaking(mut block: Block) -> Block {
+    block.extra.insert("break".into(), "page".into());
+    block
+}
+
+fn code(id: &str, text: &str) -> Block {
+    Block::text(id, BlockKind::Code { language: None }, text)
+}
+
+/// One of every kind of block, long enough to fill several small pages.
+fn mixed() -> Document {
+    let item = |id: &str, list| Block::text(id, BlockKind::ListItem { list, depth: 0 }, PROSE);
+    doc(vec![
+        Block::text("h", BlockKind::Heading { level: 1 }, "Household rates"),
+        paragraph("a", PROSE),
+        paragraph("b", &PROSE.repeat(3)),
+        code("c", "fn main() {\n    let rate = 0.125;\n    println!(\"{rate}\");\n}\n\nfn other() {}\n// the end"),
+        item("i", ListKind::Ordered),
+        item("j", ListKind::Task { checked: true }),
+        container("w", BlockKind::Callout { tone: Tone::Warn }, vec![paragraph("d", PROSE), paragraph("e", PROSE)]),
+        Block::new("r", BlockKind::Divider),
+        container("q", BlockKind::Quote, vec![paragraph("f", &PROSE.repeat(2))]),
+        Block::new("u", BlockKind::Unknown { type_name: "chart".into() }),
+        Block::text("k", BlockKind::Heading { level: 2 }, "What changes"),
+        paragraph("z", PROSE),
+    ])
+}
+
+/// What one page paints: where its text is clipped to, what is drawn inside that, and what beneath it.
+struct Painted {
+    clip: Rect,
+    text: Vec<Item>,
+    beneath: Vec<Item>,
+}
+
+fn page(layout: &DocLayout, pages: &Pages, index: usize) -> Painted {
+    let mut list = DisplayList::default();
+    layout.paint_page(pages, index, &mut list);
+    let Some(Item::PushClip { rect, .. }) = list.items.first() else { panic!("page {index} clips its text") };
+    let close = list.items.iter().rposition(|item| matches!(item, Item::PopClip)).expect("the clip ends");
+    Painted { clip: *rect, text: list.items[1..close].to_vec(), beneath: list.items[close + 1..].to_vec() }
+}
+
+/// The lines of each block on each page it is on, in page order.
+fn parts(pages: &Pages) -> HashMap<BlockId, Vec<(usize, Range<usize>)>> {
+    let mut parts: HashMap<BlockId, Vec<(usize, Range<usize>)>> = HashMap::new();
+    for (index, sheet) in pages.sheets.iter().enumerate() {
+        for (block, lines) in &sheet.blocks {
+            parts.entry(block.clone()).or_default().push((index, lines.clone()));
+        }
+    }
+    parts
+}
+
+/// Where a block's first line starts in the column, how tall a line of it is, and how many it has.
+fn lines_of(layout: &DocLayout, block: &str, len: usize) -> (f32, f32, usize) {
+    let count = parts(&layout.paginate(&paper(1.0e6)))[&BlockId::from(block)][0].1.len();
+    let caret = |offset| layout.caret(&Pos::new(block, offset)).unwrap();
+    let (first, last) = (caret(0), caret(len));
+    let line = (last.y - first.y) / (count - 1) as f32;
+    (first.y - (line - first.height) / 2.0, line, count)
+}
+
+/// The blocks that start a page: those marked to, and the first inside a container that is.
+fn starts(doc: &Document) -> Vec<BlockId> {
+    let marked = doc.blocks.iter().filter(|block| block.extra.contains_key("break"));
+    marked.map(|block| block.body.blocks().first().unwrap_or(block).id.clone()).collect()
+}
+
+/// Checks what holds for any document: every line is on one page, in order, inside the page's text area.
+fn check_pages(doc: &Document, layout: &DocLayout, pages: &Pages) -> Result<(), String> {
+    let glyphs = |items: &[Item]| placed(items).iter().map(|glyph| glyph.0).collect::<Vec<u32>>();
+    let whole = glyphs(&painted(layout, everything()));
+    let mut seen = Vec::new();
+    for index in 0..pages.sheets.len() {
+        let Painted { clip, text, .. } = page(layout, pages, index);
+        let (top, bottom) = (pages.area.y, pages.area.y + pages.area.height);
+        if clip.y < top - 0.01 || clip.y + clip.height > bottom + 0.01 {
+            return Err(format!("page {index} shows {clip:?}, past its text area"));
+        }
+        if placed(&text).iter().any(|glyph| glyph.2 < clip.y || glyph.2 > clip.y + clip.height) {
+            return Err(format!("page {index} sets a line outside {clip:?}"));
+        }
+        if pages.sheets[index].blocks.is_empty() {
+            return Err(format!("page {index} is empty"));
+        }
+        seen.extend(glyphs(&text));
+    }
+    if seen != whole {
+        return Err(format!(
+            "the pages paint {} glyphs and the document {}, or in another order",
+            seen.len(),
+            whole.len()
+        ));
+    }
+
+    // Blocks come in the document's order, and the lines of each run on from page to page.
+    let order: Vec<&BlockId> = pages.sheets.iter().flat_map(|sheet| &sheet.blocks).map(|block| &block.0).collect();
+    let mut expected: Vec<&BlockId> = order.clone();
+    expected.dedup();
+    let known: Vec<&BlockId> = doc.walk().map(|block| &block.id).filter(|id| expected.contains(id)).collect();
+    if expected != known {
+        return Err("blocks are out of order, or one is on two pages that are not neighbours".into());
+    }
+    for (block, parts) in parts(pages) {
+        let runs_on = parts.windows(2).all(|pair| pair[0].1.end == pair[1].1.start && pair[0].0 + 1 == pair[1].0);
+        if parts[0].1.start != 0 || !runs_on {
+            return Err(format!("the lines of {block:?} do not run on: {parts:?}"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_line_is_on_one_page_in_order() {
+    let mixed = mixed();
+    for room in [160.0, 240.0, 500.0, 5000.0] {
+        let (layout, pages) = paged(&mixed, room);
+        assert_eq!(check_pages(&mixed, &layout, &pages), Ok(()), "with {room} px of room");
+        let fewest = (layout.height() / room).ceil() as usize;
+        assert!(pages.sheets.len() >= fewest && pages.sheets.len() <= fewest * 2, "{} pages", pages.sheets.len());
+        assert!((pages.area.width - COLUMN).abs() < 0.01 && (pages.area.height - room).abs() < 0.01);
+    }
+    let (_, pages) = paged(&doc(vec![]), 500.0);
+    assert_eq!(pages.sheets.len(), 1, "an empty document still has a page");
+}
+
+#[test]
+fn a_marked_block_starts_a_page() {
+    let marked = doc(vec![
+        paragraph("a", "One"),
+        breaking(paragraph("b", "Two")),
+        paragraph("c", "Three"),
+        breaking(container("w", BlockKind::Callout { tone: Tone::Tip }, vec![paragraph("d", "Four")])),
+        breaking(Block::new("r", BlockKind::Divider)),
+    ]);
+    let (_, pages) = paged(&marked, 500.0);
+    let firsts: Vec<&str> = pages.sheets.iter().map(|sheet| sheet.blocks[0].0.as_str()).collect();
+    assert_eq!(firsts, ["a", "b", "d", "r"]);
+    assert_eq!(pages.sheets[1].blocks.len(), 2, "what follows stays on the page");
+
+    let (_, pages) = paged(&doc(vec![breaking(paragraph("a", "One")), paragraph("b", "Two")]), 500.0);
+    assert_eq!(pages.sheets.len(), 1, "the first block starts the first page as it is");
+}
+
+#[test]
+fn a_heading_goes_with_the_block_after_it() {
+    let doc = doc(vec![
+        paragraph("a", PROSE),
+        Block::text("h", BlockKind::Heading { level: 2 }, "What changes"),
+        Block::text("s", BlockKind::Heading { level: 3 }, "For households"),
+        paragraph("b", PROSE),
+    ]);
+    // Room for both headings and one line of the paragraph, which may not stand alone.
+    let (top, line, _) = lines_of(&laid_at(&doc, COLUMN), "b", PROSE.len());
+    let (layout, pages) = paged(&doc, top + line + 1.0);
+    let on = |block: &str| layout.page_of(&pages, &Pos::new(block, 0));
+    assert_eq!((on("a"), on("h"), on("s"), on("b")), (Some(0), Some(1), Some(1), Some(1)));
+
+    let (layout, pages) = paged(&doc, top + 2.0 * line + 1.0);
+    assert_eq!(layout.page_of(&pages, &Pos::new("h", 0)), Some(0), "with room for two lines they all stay");
+    assert_eq!(pages.sheets[1].blocks[0].0.as_str(), "b");
+}
+
+#[test]
+fn a_block_splits_with_two_lines_on_each_side() {
+    let doc = doc(vec![paragraph("a", &PROSE.repeat(3)), paragraph("b", &PROSE.repeat(2))]);
+    let (top, line, lines) = lines_of(&laid_at(&doc, COLUMN), "b", PROSE.len() * 2);
+    assert!(lines >= 6, "the paragraph has lines to split");
+    for fit in 0..=lines + 1 {
+        // Room for the first paragraph and `fit` lines of the second.
+        let (_, pages) = paged(&doc, top + fit as f32 * line + 1.0);
+        let parts = &parts(&pages)[&BlockId::from("b")];
+        assert!(parts.iter().all(|part| part.1.len() >= 2), "{fit} lines fit: no line stands alone in {parts:?}");
+        let stayed = if parts[0].0 == 0 { parts[0].1.len() } else { 0 };
+        let most = if fit >= lines { lines } else { fit.min(lines - 2) };
+        assert_eq!(stayed, if most < 2 { 0 } else { most }, "{fit} lines fit: the page takes what the rule allows");
+    }
+}
+
+#[test]
+fn a_line_of_code_never_splits() {
+    let long = "let assessment = council.rates().for_household(scheme).quarterly().before(december_statement);";
+    let text = [long, "run();", long, long, "check();", long, "done();", long, long].join("\n");
+    let doc = doc(vec![paragraph("a", PROSE), code("c", &text)]);
+    for room in [130.0, 150.0, 170.0, 190.0, 210.0] {
+        let (layout, pages) = paged(&doc, room);
+        assert_eq!(check_pages(&doc, &layout, &pages), Ok(()), "with {room} px of room");
+        assert!(parts(&pages)[&BlockId::from("c")].len() >= 2, "the code runs over a page end");
+        let mut start = 0;
+        for line in text.split('\n') {
+            let on = |offset| layout.page_of(&pages, &Pos::new("c", offset));
+            assert_eq!(on(start), on(start + line.len()), "the line at {start} is on one page with {room} px");
+            start += line.len() + 1;
+        }
+    }
+}
+
+#[test]
+fn a_position_maps_to_its_page() {
+    let doc = mixed();
+    let (layout, pages) = paged(&doc, 240.0);
+    let mut last = 0;
+    for block in doc.walk().filter(|block| matches!(block.body, Body::Text(_))) {
+        for offset in [0, block.plain_text().len()] {
+            let on = layout.page_of(&pages, &Pos::new(block.id.clone(), offset)).expect("a page");
+            assert!(on >= last && on < pages.sheets.len(), "pages follow the document");
+            assert!(pages.sheets[on].blocks.iter().any(|(id, _)| *id == block.id), "{:?} is on page {on}", block.id);
+            last = on;
+
+            // The page's origin carries a caret onto the sheet, and a point on the sheet back to the text.
+            let (caret, origin) =
+                (layout.caret(&Pos::new(block.id.clone(), offset)).unwrap(), pages.origin(on).unwrap());
+            let (top, area) = (caret.y + origin.y, pages.area);
+            assert!(top > area.y - 1.0 && top + caret.height < area.y + area.height + 1.0, "its caret is on the page");
+            let point = Point { x: caret.x + origin.x, y: top + caret.height / 2.0 };
+            let hit = layout.hit(Point { x: point.x - origin.x, y: point.y - origin.y }).unwrap();
+            assert_eq!(layout.page_of(&pages, &hit), Some(on), "a click there finds the page's text");
+        }
+    }
+    assert_eq!(last, pages.sheets.len() - 1, "the document ends on the last page");
+    assert_eq!(layout.page_of(&pages, &Pos::new("missing", 0)), None);
+    assert_eq!(pages.origin(pages.sheets.len()), None);
+}
+
+#[test]
+fn a_page_paints_its_text_in_the_text_area_and_its_number_beneath() {
+    let doc = mixed();
+    let (layout, pages) = paged(&doc, 240.0);
+    for index in [0, pages.sheets.len() - 1] {
+        let Painted { clip, text, beneath } = page(&layout, &pages, index);
+        let area = pages.area;
+        assert_eq!(clip.y, area.y, "page {index} starts at the top of its text area");
+        let left = placed(&text).iter().map(|glyph| glyph.1).fold(f32::MAX, f32::min);
+        assert!(left >= area.x - 0.5 && left < area.x + 40.0, "and at its left edge");
+
+        let number = placed(&beneath);
+        assert!(!number.is_empty() && number.len() <= 2, "the page number is beneath");
+        for (_, x, y) in number {
+            assert!(y > area.y + area.height && y < pages.height, "in the bottom margin");
+            assert!((x - (area.x + area.width / 2.0)).abs() < 12.0, "in the middle");
+        }
+    }
+    let mut list = DisplayList::default();
+    layout.paint_page(&pages, pages.sheets.len(), &mut list);
+    assert!(list.items.is_empty(), "there is no page past the last");
+
+    let bare = Page { margin_bottom: 0.0, ..paper(240.0) };
+    let pages = layout.paginate(&bare);
+    assert!(page(&layout, &pages, 0).beneath.is_empty(), "a sheet with no bottom margin has no room for a number");
+}
+
+#[test]
+fn print_shows_the_document_and_nothing_of_the_editor() {
+    let doc = mixed();
+    let (plain, pages) = paged(&doc, 240.0);
+    let (mut layout, _) = paged(&doc, 240.0);
+    layout.set_spelling(&"a".into(), vec![0..5, 10..20]);
+    layout.set_composition(Some((&"a".into(), 30..40)));
+    let revealed = letters_model::Markers { block: Some(("h".into(), "#".into())), ..Default::default() };
+    layout.reveal(Some((&Pos::new("h", 2), &revealed)));
+    for index in 0..pages.sheets.len() {
+        assert!(page(&layout, &pages, index).text == page(&plain, &pages, index).text, "page {index}");
+    }
+}
+
+#[test]
+fn pages_follow_edits() {
+    let edits: Vec<(&str, Vec<Op>)> = vec![
+        ("typing a page's worth", vec![Op::InsertText { at: Pos::new("a", 5), text: PROSE.repeat(4) }]),
+        ("deleting", vec![Op::DeleteText { block: "b".into(), range: 0..PROSE.len() * 2 }]),
+        ("splitting", vec![Op::Split { at: Pos::new("b", 40), new_id: "n".into() }]),
+        ("removing", vec![Op::RemoveBlock { block: "w".into() }]),
+        (
+            "adding a page break",
+            vec![
+                Op::RemoveBlock { block: "i".into() },
+                Op::InsertBlock { parent: None, index: 4, block: breaking(paragraph("i", PROSE)) },
+            ],
+        ),
+    ];
+    for (name, ops) in edits {
+        let mut model = Model::new(mixed());
+        let mut layout = laid_at(model.doc(), COLUMN);
+        let before = layout.paginate(&paper(240.0));
+        let change = model.apply(ops).unwrap();
+        layout.update(model.doc(), &Style::default(), COLUMN, Some(&change));
+        let after = layout.paginate(&paper(240.0));
+        assert!(after != before, "{name} changes the pages");
+        assert!(after == laid_at(model.doc(), COLUMN).paginate(&paper(240.0)), "{name}: as paginating afresh");
+        assert_eq!(check_pages(model.doc(), &layout, &after), Ok(()), "{name}");
+    }
+}
+
+const WORDS: [&str; 8] = ["rates", "change", "on", "the", "first", "of", "January", "household"];
+
+/// Documents of every kind of block, some marked to start a page.
+fn documents() -> impl Strategy<Value = Document> {
+    let words = |most: usize| prop::collection::vec(prop::sample::select(WORDS.to_vec()), 1..most);
+    let lines = prop::collection::vec(words(14).prop_map(|words| words.join(".")), 1..12);
+    let block = (0..9u8, words(90), lines, prop::bool::weighted(0.1));
+    prop::collection::vec(block, 1..14).prop_map(|blocks| {
+        let blocks = blocks.into_iter().enumerate().map(|(index, (kind, words, lines, breaks))| {
+            let (id, text) = (format!("b{index}"), words.join(" "));
+            let inside = |kind| {
+                container(
+                    &format!("c{index}"),
+                    kind,
+                    vec![paragraph(&id, &text), paragraph(&format!("d{index}"), &text)],
+                )
+            };
+            let block = match kind {
+                0 => Block::text(
+                    id.as_str(),
+                    BlockKind::Heading { level: 1 + (index % 3) as u8 },
+                    words[..words.len().min(6)].join(" "),
+                ),
+                1 => code(&id, &lines.join("\n")),
+                2 => Block::text(
+                    id.as_str(),
+                    BlockKind::ListItem { list: ListKind::Ordered, depth: (index % 2) as u8 },
+                    text,
+                ),
+                3 => inside(BlockKind::Callout { tone: Tone::Info }),
+                4 => inside(BlockKind::Quote),
+                5 => Block::new(id.as_str(), BlockKind::Divider),
+                _ => paragraph(&id, &text),
+            };
+            if breaks { breaking(block) } else { block }
+        });
+        doc(blocks.collect())
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// Every line lands on exactly one page, in order, no page overflows its text area, and the rules of
+    /// where a page may break hold.
+    #[test]
+    fn pages_hold_every_line_once(doc in documents(), room in 320.0f32..900.0) {
+        let (layout, pages) = paged(&doc, room);
+        prop_assert_eq!(check_pages(&doc, &layout, &pages), Ok(()));
+
+        let blocks: Vec<&Block> = doc.walk().collect();
+        let block = |id: &BlockId| blocks.iter().position(|block| block.id == *id).unwrap();
+        let heading = |id: &BlockId| matches!(blocks[block(id)].kind, BlockKind::Heading { .. });
+        let starts = starts(&doc);
+        for (index, sheet) in pages.sheets.iter().enumerate() {
+            let (last, _) = sheet.blocks.last().unwrap();
+            let next = pages.sheets.get(index + 1).map(|next| block(&next.blocks[0].0));
+            if let Some(next) = next.filter(|next| *next != block(last)) {
+                let alone = sheet.blocks.iter().all(|(id, _)| heading(id));
+                prop_assert!(!heading(last) || alone || starts.contains(&blocks[next].id), "page {} ends with the heading {:?}", index, last);
+            }
+        }
+        for (id, parts) in parts(&pages) {
+            prop_assert!(parts.len() == 1 || parts.iter().all(|part| part.1.len() >= 2), "{:?} leaves a line alone: {:?}", id, parts);
+            let source = blocks[block(&id)];
+            if starts.contains(&id) {
+                prop_assert!(pages.sheets[parts[0].0].blocks[0].0 == id, "{:?} starts a page", id);
+            }
+            if matches!(source.kind, BlockKind::Code { .. }) {
+                let (text, mut start) = (source.plain_text(), 0);
+                for line in text.split('\n') {
+                    let on = |offset| layout.page_of(&pages, &Pos::new(id.clone(), offset));
+                    prop_assert_eq!(on(start), on(start + line.len()), "a line of {:?} is split", id);
+                    start += line.len() + 1;
+                }
+            }
+        }
+    }
+}

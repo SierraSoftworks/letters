@@ -13,11 +13,15 @@
 //!
 //! The Markdown markers around the caret are drawn over the layout and are no part of it. See
 //! [`DocLayout::reveal`].
+//!
+//! Pages exist only on request: [`DocLayout::paginate`] splits the same column into sheets for Print view
+//! and export, and typing never pays for it.
 
 mod engine;
 mod flow;
 mod ink;
 mod leaf;
+mod paginate;
 mod palette;
 mod reveal;
 mod shape;
@@ -29,16 +33,17 @@ use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 
-use letters_model::{BlockId, Body, Change, Document, Markers, Pos, Selection, Style};
+use letters_model::{BlockId, Body, Change, Document, Markers, Page, Pos, Selection, Style};
 use letters_render::{DisplayList, Font, Item, Point, Rect};
 use parley::{Language, Layout};
 
 use crate::engine::Engine;
 use crate::flow::{Frame, Leaf, Look, Role, Types, What};
-use crate::ink::{Brush, Inks};
+use crate::ink::{Brush, Ink, Inks};
 use crate::leaf::{Over, Painter};
 use crate::reveal::{Reveal, Shapes, Shifts};
 
+pub use crate::paginate::{Pages, Sheet};
 pub use crate::palette::{Callout, Palette, Scheme, Syntax};
 pub use crate::shape::{FontSpec, ShapedRun, ShapedText, Shaper};
 pub use crate::tokens::{Token, TokenKind};
@@ -191,7 +196,33 @@ impl DocLayout {
 
     /// Emits the part of the document that falls inside `viewport`.
     pub fn paint(&self, viewport: Rect, out: &mut DisplayList) {
-        self.state.borrow_mut().paint(viewport, out);
+        self.state.borrow_mut().paint(viewport, false, out);
+    }
+
+    /// Splits the document into pages of `page`'s size, for Print view and export. Lay the document out at
+    /// the page's text width first, which is `(width - margin_left - margin_right) * 96 / 72` logical pixels.
+    ///
+    /// A block with `"break": "page"` among its properties starts a page. A heading stays with the block
+    /// after it. A block splits between pages only where two of its lines stay and two go, and a line of
+    /// code never splits. Only something taller than a page breaks these rules.
+    ///
+    /// This is a pass over the heights of lines and shapes nothing, so it is cheap to run again after an
+    /// edit. It first lays out whatever is still estimated, which on a long document that was never
+    /// settled takes as long as settling it.
+    pub fn paginate(&self, page: &Page) -> Pages {
+        self.state.borrow_mut().paginate(page)
+    }
+
+    /// Emits one sheet of `pages`, with the sheet's top left at the origin: the text in its text area, as
+    /// the document's style has it, and the page number beneath. The paper itself is the caller's to draw.
+    /// Nothing that belongs to editing is drawn: no markers, no spelling marks and no composition.
+    pub fn paint_page(&self, pages: &Pages, index: usize, out: &mut DisplayList) {
+        self.state.borrow_mut().paint_page(pages, index, out);
+    }
+
+    /// The page of `pages` that shows the line `pos` is on.
+    pub fn page_of(&self, pages: &Pages, pos: &Pos) -> Option<usize> {
+        self.state.borrow_mut().page_of(pages, pos)
     }
 
     /// The text position nearest to a point. `None` when the document holds no text.
@@ -312,6 +343,10 @@ impl State {
             let leaf = &mut self.leaves[at];
             let Some(block) = doc.blocks.get(leaf.root).and_then(|root| flow::find(root, id)) else { return false };
             if leaf.kind.as_ref() != Some(&block.kind) || !matches!(block.body, Body::Text(_)) {
+                return false;
+            }
+            // Whether a page starts here is decided where the column is built.
+            if flow::breaks(block) != leaf.breaks {
                 return false;
             }
             let (tokens, spelling) = (self.tokens.get_mut(id), self.spelling.get_mut(id));
@@ -436,7 +471,7 @@ impl State {
             self.evict();
         }
         let laid = leaf::lay(&mut self.engine, &self.types, &self.leaves[at], self.locale);
-        self.set_height(at, leaf::height(&laid.text));
+        self.set_extent(at, leaf::height(&laid.text), leaf::lines(&laid.text, self.leaves[at].role == Role::Code));
         self.leaves[at].laid = Some(Box::new(laid));
         self.held += 1;
     }
@@ -447,11 +482,14 @@ impl State {
             return;
         }
         leaf::shape(&mut self.engine, &self.types, &self.leaves[at], self.locale, &mut self.scratch);
-        self.set_height(at, leaf::height(&self.scratch));
+        let lines = leaf::lines(&self.scratch, self.leaves[at].role == Role::Code);
+        self.set_extent(at, leaf::height(&self.scratch), lines);
     }
 
-    fn set_height(&mut self, at: usize, height: f32) {
+    /// Records what a layout says of a leaf: its height, and the lines pagination may split it at.
+    fn set_extent(&mut self, at: usize, height: f32, (lines, joined): (u32, Vec<u32>)) {
         let leaf = &mut self.leaves[at];
+        (leaf.lines, leaf.joined) = (lines, joined);
         if !std::mem::replace(&mut leaf.exact, true) {
             self.pending -= 1;
         }
@@ -495,7 +533,8 @@ impl State {
         (first, end)
     }
 
-    fn paint(&mut self, viewport: Rect, out: &mut DisplayList) {
+    /// Paints a band of the column. `print` leaves out what belongs to editing and not to the document.
+    fn paint(&mut self, viewport: Rect, print: bool, out: &mut DisplayList) {
         let band = (viewport.y, viewport.y + viewport.height);
         let (first, end) = self.show(band.0, band.1);
         let inks = Inks::new(&self.types, self.palette);
@@ -529,7 +568,7 @@ impl State {
             }
             // A callout's tag sits in the padding above its text, where it moves nothing.
             let mut at = Point { x: frame.x + theme::BOX_PAD_X, y: top + theme::BOX_PAD_Y - 2.0 };
-            let seen = top < band.1 && at.y > band.0;
+            let seen = !print && top < band.1 && at.y > band.0;
             for (tag, level) in reveal.beside(&frame.id).filter(|_| seen) {
                 let (shape, width) = shapes.get(engine, types, Role::Body, true, tag);
                 if let Some(shape) = shapes.layout(shape) {
@@ -541,7 +580,7 @@ impl State {
         for at in first..end {
             // A viewport taller than the cache holds has dropped its first layouts by now.
             self.lay(at);
-            let shifts = self.shifts(at);
+            let shifts = if print { Shifts::default() } else { self.shifts(at) };
             let Self { engine, types, leaves, tokens, spelling, shapes, composition, .. } = self;
             let leaf = &leaves[at];
             if leaf.what == What::Rule {
@@ -549,13 +588,65 @@ impl State {
                 out.push(Item::Fill { rect, color: palette.line, radius: 0.0 });
             } else if let Some(laid) = &leaf.laid {
                 let tokens = leaf.id.as_ref().and_then(|id| tokens.get(id));
-                let composing = composition.as_ref().filter(|(block, _)| leaf.id.as_ref() == Some(block));
-                let composing = composing.map(|(_, range)| range.clone());
-                let spelling = leaf.id.as_ref().and_then(|id| spelling.get(id)).map_or(&[][..], Vec::as_slice);
+                let own = |id: &&BlockId| !print && leaf.id.as_ref() == Some(*id);
+                let composing = composition.as_ref().filter(|(block, _)| own(&block)).map(|(_, range)| range.clone());
+                let spelling = leaf.id.as_ref().filter(own).and_then(|id| spelling.get(id));
+                let spelling = spelling.map_or(&[][..], Vec::as_slice);
                 let over = Over { shifts: &shifts, shapes, composing, spelling };
                 Painter { engine, types, inks: &inks, band, out }.leaf(leaf, laid, tokens.map(Vec::as_slice), &over);
             }
         }
+    }
+
+    fn paginate(&mut self, page: &Page) -> Pages {
+        for at in 0..self.leaves.len() {
+            self.measure(at);
+        }
+        self.place_all();
+        let px = |points: f32| points * theme::PT;
+        let area = Rect::new(
+            px(page.margin_left),
+            px(page.margin_top),
+            px(page.width - page.margin_left - page.margin_right).max(1.0),
+            px(page.height - page.margin_top - page.margin_bottom).max(1.0),
+        );
+        let sheets = paginate::sheets(&self.leaves, &self.frames, area.height);
+        Pages { width: px(page.width), height: px(page.height), area, sheets }
+    }
+
+    fn paint_page(&mut self, pages: &Pages, index: usize, out: &mut DisplayList) {
+        let (Some(sheet), Some(origin)) = (pages.sheets.get(index), pages.origin(index)) else { return };
+        let (area, (top, bottom)) = (pages.area, sheet.band);
+        if bottom > top {
+            // The page shows a band of the column. A box that runs on to the next page is cut at its edge.
+            let from = out.items.len();
+            out.push(Item::PushClip { rect: Rect::new(-area.x, top, pages.width, bottom - top), radius: 0.0 });
+            // A little inside the band, so that a line ending at its edge is not taken for one in it.
+            self.paint(Rect::new(0.0, top + 0.25, self.width, bottom - top - 0.5), true, out);
+            out.push(Item::PopClip);
+            out.translate(from, origin);
+        }
+        // The page number sits in the middle of the margin beneath the text, if the margin has room for it.
+        let Self { engine, types, scratch, palette, .. } = self;
+        let label = (index + 1).to_string();
+        let spec = types.get(Role::Caption).spec(false, Brush { ink: Ink::Style(Role::Caption), back: None });
+        engine.build(&label, &[spec], &[(0, 0..label.len())], None, scratch);
+        scratch.break_all_lines(None);
+        let (below, foot) = (area.y + area.height, pages.height - area.y - area.height);
+        if foot >= scratch.height() {
+            let x = area.x + (area.width - scratch.full_width()) / 2.0;
+            let at = Point { x: x.round(), y: below + ((foot - scratch.height()) / 2.0).round() };
+            let inks = Inks::new(types, *palette);
+            Painter { engine, types, inks: &inks, band: (f32::MIN, f32::MAX), out }.glyphs(scratch, at);
+        }
+    }
+
+    fn page_of(&mut self, pages: &Pages, pos: &Pos) -> Option<usize> {
+        let at = *self.index.get(&pos.block)?;
+        self.clock += 1;
+        self.lay(at);
+        let line = leaf::line_of(self.leaves[at].laid.as_ref()?, pos.offset);
+        pages.sheets.partition_point(|sheet| sheet.first <= (at, line)).checked_sub(1)
     }
 
     fn hit(&mut self, point: Point) -> Option<Pos> {
