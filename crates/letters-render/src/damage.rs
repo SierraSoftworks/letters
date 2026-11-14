@@ -296,15 +296,18 @@ fn pixels(sides: &[f32; 4], scale: f32, width: u32, height: u32) -> Option<Pixel
     (right > left && bottom > top).then_some(rect)
 }
 
-/// Joins rectangles that overlap or nearly do, so no pixel is repainted many times over.
+/// Joins rectangles that share rows or nearly overlap. A repaint draws whole rows, so afterwards no row is
+/// drawn twice.
 fn merge(rects: &mut Vec<PixelRect>) {
     /// Pixels worth repainting needlessly to save a separate pass.
     const SLACK: u64 = 4096;
+    let joins = |a: &PixelRect, b: &PixelRect| {
+        let shares_rows = a.y < b.y + b.height && b.y < a.y + a.height;
+        shares_rows || a.union(b).area() <= a.area() + b.area() + SLACK
+    };
     let mut at = 0;
     while at < rects.len() {
-        let joined = (at + 1..rects.len())
-            .find(|&other| rects[at].union(&rects[other]).area() <= rects[at].area() + rects[other].area() + SLACK);
-        match joined {
+        match (at + 1..rects.len()).find(|&other| joins(&rects[at], &rects[other])) {
             Some(other) => {
                 rects[at] = rects[at].union(&rects[other]);
                 rects.swap_remove(other);
