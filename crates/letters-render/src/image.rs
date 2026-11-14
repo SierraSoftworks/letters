@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ::image::{DynamicImage, ImageDecoder, ImageReader, Limits};
 use vello_cpu::peniko::ImageAlphaType;
@@ -54,6 +55,8 @@ impl From<::image::ImageError> for ImageError {
 #[derive(Clone, Debug)]
 pub struct Image {
     pub(crate) pixels: Arc<Pixmap>,
+    /// Unique to these pixels for the life of the process, so a renderer can tell a replaced asset.
+    pub(crate) id: u64,
 }
 
 impl Image {
@@ -94,7 +97,9 @@ impl Image {
         // Rebuilt so the capacity is a whole number of pixels, which the pixmap requires.
         let rgba = rgba.into_boxed_slice().into_vec();
         let metadata = PixelMetadata::new(ImageAlphaType::Alpha, true);
-        Ok(Self { pixels: Arc::new(Pixmap::from_parts(rgba, width as u16, height as u16, metadata)) })
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let pixels = Arc::new(Pixmap::from_parts(rgba, width as u16, height as u16, metadata));
+        Ok(Self { pixels, id: NEXT.fetch_add(1, Ordering::Relaxed) })
     }
 
     pub fn width(&self) -> u32 {

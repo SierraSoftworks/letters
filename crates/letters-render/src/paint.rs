@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use skrifa::raw::TableProvider;
+
 use vello_cpu::kurbo::{Affine, BezPath, Cap, Diagonal2, Join, Rect as KRect, RoundedRect, Shape, Stroke};
 use vello_cpu::peniko::{Blob, Fill, FontData, ImageSampler};
 use vello_cpu::{Glyph as RunGlyph, ImageSource, PaintType, color};
@@ -108,22 +110,35 @@ pub(crate) struct FontCache {
     faces: HashMap<(usize, u32), Face>,
 }
 
-struct Face {
+pub(crate) struct Face {
     /// Keeps the address the face is keyed by from being reused.
     data: Arc<[u8]>,
     /// `None` if the data is not a font: Vello panics on one.
     handle: Option<FontData>,
+    /// Unique to this face for the life of the process, unlike its address.
+    pub id: u64,
+    /// The box that holds every glyph, in ems with y up: left, bottom, right, top.
+    pub glyph_box: [f32; 4],
 }
 
 impl FontCache {
-    fn get(&mut self, font: &Font) -> Option<&FontData> {
+    pub fn face(&mut self, font: &Font) -> &Face {
         let key = (Arc::as_ptr(&font.data).cast::<u8>() as usize, font.index);
-        let face = self.faces.entry(key).or_insert_with(|| {
-            let valid = skrifa::FontRef::from_index(&font.data, font.index).is_ok();
-            let handle = valid.then(|| FontData::new(Blob::new(Arc::new(font.data.clone())), font.index));
-            Face { data: font.data.clone(), handle }
-        });
-        face.handle.as_ref()
+        self.faces.entry(key).or_insert_with(|| {
+            let blob = Blob::new(Arc::new(font.data.clone()));
+            let id = blob.id();
+            let head = skrifa::FontRef::from_index(&font.data, font.index).map(|face| face.head());
+            let glyph_box = match &head {
+                Ok(Ok(head)) => {
+                    let em = f32::from(head.units_per_em().max(1));
+                    [head.x_min(), head.y_min(), head.x_max(), head.y_max()].map(|unit| f32::from(unit) / em)
+                }
+                // A face with no header still draws, so assume a generous box.
+                _ => [-1.0, -1.0, 2.0, 2.0],
+            };
+            let handle = head.is_ok().then(|| FontData::new(blob, font.index));
+            Face { data: font.data.clone(), handle, id, glyph_box }
+        })
     }
 
     /// Forgets fonts nothing else uses any more. A handle holds a second reference.
@@ -132,17 +147,32 @@ impl FontCache {
     }
 }
 
-/// Draws `list` on `canvas`, with logical pixels scaled by `scale`.
-pub(crate) fn paint(canvas: &mut impl Canvas, fonts: &mut FontCache, list: &DisplayList, scale: f32) {
-    let scale = if scale.is_finite() && scale > 0.0 { f64::from(scale) } else { 1.0 };
-    let tolerance = TOLERANCE / scale;
-    let base = Affine::scale(scale);
+/// Which part of a display list to draw, and how large.
+pub(crate) struct View<'a> {
+    /// Physical pixels per logical pixel.
+    pub scale: f64,
+    /// Whether the item at an index can show at all. Clips are kept whatever this says.
+    pub shows: &'a dyn Fn(usize) -> bool,
+}
+
+/// The display scale to draw at: `scale`, or 1 when it is not usable.
+pub(crate) fn usable_scale(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 { scale } else { 1.0 }
+}
+
+/// Draws the part of `list` that `view` selects on `canvas`.
+pub(crate) fn paint(canvas: &mut impl Canvas, fonts: &mut FontCache, list: &DisplayList, view: &View<'_>) {
+    let tolerance = TOLERANCE / view.scale;
+    let base = Affine::scale(view.scale);
     canvas.set_transform(base);
     canvas.set_paint_transform(Affine::IDENTITY);
     canvas.set_fill_rule(Fill::NonZero);
 
     let mut clips = 0_usize;
-    for item in &list.items {
+    for (index, item) in list.items.iter().enumerate() {
+        if !matches!(item, Item::PushClip { .. } | Item::PopClip) && !(view.shows)(index) {
+            continue;
+        }
         match item {
             Item::Fill { rect, color, radius } => {
                 let Some(shape) = rounded(rect, *radius) else { continue };
@@ -177,7 +207,7 @@ pub(crate) fn paint(canvas: &mut impl Canvas, fonts: &mut FontCache, list: &Disp
                 if !(origin.x.is_finite() && origin.y.is_finite() && size.is_finite() && *size > 0.0) {
                     continue;
                 }
-                let Some(handle) = fonts.get(font) else { continue };
+                let Some(handle) = &fonts.face(font).handle else { continue };
                 canvas.set_paint(solid(*color));
                 let run = Run {
                     font: handle,

@@ -17,7 +17,7 @@ use vello_gpu::{
 pub use wgpu;
 
 use crate::image::{Image, Images};
-use crate::paint::{self, Canvas, FontCache, forward_canvas};
+use crate::paint::{self, Canvas, FontCache, View, forward_canvas};
 use crate::{Color, DisplayList};
 
 /// Draws display lists on the GPU. Keep one for the life of a window: it holds the pipelines, the glyph
@@ -77,7 +77,8 @@ impl GpuRenderer {
             device: &self.device,
             queue: &self.queue,
         };
-        paint::paint(&mut canvas, &mut self.fonts, list, scale);
+        let view = View { scale: paint::usable_scale(scale).into(), shows: &|_| true };
+        paint::paint(&mut canvas, &mut self.fonts, list, &view);
         self.fonts.trim();
 
         let background = AlphaColor::from_rgba8(background.r, background.g, background.b, background.a);

@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 pub mod cpu;
+mod damage;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod image;
