@@ -12,12 +12,19 @@ use crate::Speller;
 /// Tell it about every edit with [`Proofing::invalidate`], and call [`Proofing::step`] while the shell is
 /// idle until it returns `None`. It starts with the whole document to check, and checks it all again by
 /// itself when the document's language or dictionary, the user's words or the dictionaries change.
+///
+/// Blocks are checked in this order: those an edit touched, those named by [`Proofing::check_first`], then
+/// the rest from the top of the document.
 #[derive(Debug, Default)]
 pub struct Proofing {
     marks: HashMap<BlockId, Vec<Range<usize>>>,
-    /// The blocks to check, soonest first. Only those still in `waiting` count.
-    queue: VecDeque<BlockId>,
+    /// The blocks to check. The lists below order them, and only their entries still in here count.
     waiting: HashSet<BlockId>,
+    edited: Vec<BlockId>,
+    /// The blocks the caller asked for first, soonest first.
+    first: VecDeque<BlockId>,
+    /// Every other block, in document order.
+    queue: VecDeque<BlockId>,
     /// What the marks were checked against.
     seen: Option<Seen>,
 }
@@ -54,8 +61,17 @@ impl Proofing {
         for block in &change.blocks {
             self.marks.remove(block);
             self.waiting.insert(block.clone());
-            self.queue.push_front(block.clone());
+            self.edited.push(block.clone());
         }
+    }
+
+    /// Checks these blocks before the rest of the document, in the order given: pass the blocks in view and
+    /// a long document shows its misspellings where the reader is looking. Each call replaces the last, and
+    /// blocks that are up to date cost nothing, so it can be called before every batch of steps.
+    pub fn check_first<'a>(&mut self, blocks: impl IntoIterator<Item = &'a BlockId>) {
+        // Until the first step has listed the document, every block is still to check.
+        let unlisted = self.seen.is_none();
+        self.first = blocks.into_iter().filter(|block| unlisted || self.waiting.contains(*block)).cloned().collect();
     }
 
     /// Checks the next block that needs it. `None` when every block is up to date.
@@ -73,7 +89,7 @@ impl Proofing {
                 }
             }
         }
-        while let Some(id) = self.queue.pop_front() {
+        while let Some(id) = self.next() {
             if !self.waiting.remove(&id) {
                 continue;
             }
@@ -95,6 +111,10 @@ impl Proofing {
     /// none, or that was edited and not yet checked again.
     pub fn marks(&self, block: &BlockId) -> &[Range<usize>] {
         self.marks.get(block).map_or(&[], Vec::as_slice)
+    }
+
+    fn next(&mut self) -> Option<BlockId> {
+        self.edited.pop().or_else(|| self.first.pop_front()).or_else(|| self.queue.pop_front())
     }
 }
 

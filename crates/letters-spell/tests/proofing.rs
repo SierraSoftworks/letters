@@ -205,3 +205,63 @@ fn another_document_starts_afresh() {
     assert_eq!(settle(&mut proofing, &speller, &other), ["b"]);
     assert_eq!(flagged(&proofing, &other, "b"), ["diferent"]);
 }
+
+#[test]
+fn the_blocks_in_view_can_be_checked_first() {
+    let long = || doc("en-GB", (0..40).map(|i| paragraph(&format!("p{i}"), "A paragraf of text.")).collect());
+    let ids = |list: &[&str]| list.iter().map(BlockId::new).collect::<Vec<_>>();
+    // Each case: how many blocks were checked already, what happens then, and the blocks checked next.
+    type Prepare = fn(&mut Proofing, &mut Model, &dyn Fn(&[&str]) -> Vec<BlockId>);
+    let cases: [(&str, usize, Prepare, &[&str]); 5] = [
+        (
+            "then the rest from the top",
+            1,
+            |proofing, _, ids| proofing.check_first(&ids(&["p30", "p31"])),
+            &["p30", "p31", "p1"],
+        ),
+        (
+            "before anything was checked",
+            0,
+            |proofing, _, ids| proofing.check_first(&ids(&["p30"])),
+            &["p30", "p0", "p1"],
+        ),
+        (
+            "the newest view replaces the last",
+            0,
+            |proofing, _, ids| {
+                proofing.check_first(&ids(&["p30", "p31"]));
+                proofing.check_first(&ids(&["p20"]));
+            },
+            &["p20", "p0", "p1"],
+        ),
+        (
+            "a checked or missing block is passed over",
+            2,
+            |proofing, _, ids| proofing.check_first(&ids(&["p0", "nowhere", "p9"])),
+            &["p9", "p2"],
+        ),
+        (
+            "an edit still comes first",
+            1,
+            |proofing, model, ids| {
+                let change = model.apply([Op::DeleteText { block: "p5".into(), range: 0..2 }]).unwrap();
+                proofing.invalidate(&change);
+                proofing.check_first(&ids(&["p30"]));
+            },
+            &["p5", "p30", "p1"],
+        ),
+    ];
+    for (name, steps, prepare, expected) in cases {
+        let (mut model, speller, mut proofing) =
+            (Model::new(long(), ReplicaId::from(1)), Speller::new(), Proofing::new());
+        for _ in 0..steps {
+            proofing.step(&speller, model.doc());
+        }
+        prepare(&mut proofing, &mut model, &ids);
+        let checked = settle(&mut proofing, &speller, model.doc());
+        assert_eq!(checked[..expected.len()], *expected, "{name}");
+        // Every block is still checked, and none twice.
+        assert_eq!(steps + checked.len(), 40, "{name}");
+        assert_eq!(flagged(&proofing, model.doc(), "p30"), ["paragraf"], "{name}");
+    }
+}
