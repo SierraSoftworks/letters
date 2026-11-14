@@ -3,6 +3,8 @@
 use letters_model::Tone;
 use letters_render::Color;
 
+use crate::tokens::TokenKind;
+
 /// Whether the page is light or dark.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Scheme {
@@ -49,7 +51,7 @@ pub struct Palette {
     pub info: Callout,
     pub warn: Callout,
     pub danger: Callout,
-    /// Not painted yet: code is set in the style's colour until its blocks carry tokens.
+    /// The colours of a code block's tokens. See [`crate::DocLayout::set_tokens`].
     pub syntax: Syntax,
 }
 
@@ -72,6 +74,21 @@ pub struct Syntax {
     pub type_name: Color,
     pub function: Color,
     pub property: Color,
+}
+
+impl Syntax {
+    /// The colour of a kind of token. The thirteen kinds share the seven colours as they do in yewi.
+    pub fn color(&self, kind: TokenKind) -> Color {
+        match kind {
+            TokenKind::Comment => self.comment,
+            TokenKind::Keyword => self.keyword,
+            TokenKind::String | TokenKind::Inserted => self.string,
+            TokenKind::Number | TokenKind::Literal | TokenKind::Meta => self.number,
+            TokenKind::Type => self.type_name,
+            TokenKind::Function => self.function,
+            TokenKind::Property | TokenKind::Tag | TokenKind::Variable | TokenKind::Deleted => self.property,
+        }
+    }
 }
 
 const fn callout(r: u8, g: u8, b: u8, fill: u8) -> Callout {

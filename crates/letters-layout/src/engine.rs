@@ -9,7 +9,7 @@ use parley::fontique::{Blob, Collection, CollectionOptions, FamilyId, SourceCach
 use parley::setting::Tag;
 use parley::{
     FontContext, FontFamily, FontFamilyName, FontStyle, FontVariation, FontVariations, FontWeight, GenericFamily,
-    GlyphRun, Language, Layout, LayoutContext, LineHeight, OverflowWrap, TextStyle,
+    GlyphRun, Language, Layout, LayoutContext, LineHeight, OverflowWrap, Run, TextStyle,
 };
 
 use crate::Fonts;
@@ -40,6 +40,9 @@ pub(crate) struct Engine {
 }
 
 const OPSZ: Tag = Tag::new(b"opsz");
+
+/// The slant, in degrees, of text set in italics at paint time, which leaves its layout alone.
+const SLANT: f32 = 14.0;
 
 impl Engine {
     /// Registers exactly `fonts`. System fonts are never consulted, so text looks the same everywhere.
@@ -133,8 +136,6 @@ impl Engine {
 
     /// The glyphs of one run as a display item, with the run's layout placed at `at`.
     pub fn glyphs(&mut self, run: &GlyphRun<'_, Brush>, at: Point, color: Color) -> Option<Item> {
-        let font = self.font(run)?;
-        let synthesis = run.run().synthesis();
         let mut pen = 0.0;
         let glyphs = run
             .glyphs()
@@ -144,20 +145,29 @@ impl Engine {
                 placed
             })
             .collect();
-        Some(Item::Glyphs {
-            origin: Point { x: at.x + run.offset(), y: at.y + run.baseline() },
-            font,
-            size: run.run().font_size(),
-            color,
-            skew: synthesis.skew().unwrap_or(0.0),
-            embolden: synthesis.embolden(),
-            glyphs,
-        })
+        let origin = Point { x: at.x + run.offset(), y: at.y + run.baseline() };
+        self.item(run.run(), origin, color, false, glyphs)
     }
 
-    fn font(&mut self, run: &GlyphRun<'_, Brush>) -> Option<Font> {
-        let face = run.run().font();
-        let (id, coords) = (face.data.id(), run.run().normalized_coords());
+    /// Glyphs of `run` as a display item, with the first on the baseline at `origin`. `slant` sets them in
+    /// italics without another face.
+    pub fn item(
+        &mut self,
+        run: &Run<'_, Brush>,
+        origin: Point,
+        color: Color,
+        slant: bool,
+        glyphs: Vec<Glyph>,
+    ) -> Option<Item> {
+        let font = self.font(run)?;
+        let synthesis = run.synthesis();
+        let skew = synthesis.skew().unwrap_or(if slant { SLANT } else { 0.0 });
+        Some(Item::Glyphs { origin, font, size: run.font_size(), color, skew, embolden: synthesis.embolden(), glyphs })
+    }
+
+    fn font(&mut self, run: &Run<'_, Brush>) -> Option<Font> {
+        let face = run.font();
+        let (id, coords) = (face.data.id(), run.normalized_coords());
         let known = self.instances.iter().find(|(source, font)| {
             *source == id
                 && font.index == face.index

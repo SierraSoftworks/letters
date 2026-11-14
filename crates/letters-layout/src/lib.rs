@@ -18,6 +18,7 @@ mod leaf;
 mod palette;
 mod shape;
 mod theme;
+mod tokens;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -28,11 +29,13 @@ use letters_render::{DisplayList, Font, Item, Point, Rect};
 use parley::{Language, Layout};
 
 use crate::engine::Engine;
-use crate::flow::{Frame, Leaf, Look, Types, What};
+use crate::flow::{Frame, Leaf, Look, Role, Types, What};
 use crate::ink::{Brush, Inks};
+use crate::leaf::Painter;
 
 pub use crate::palette::{Callout, Palette, Scheme, Syntax};
 pub use crate::shape::{FontSpec, ShapedRun, ShapedText, Shaper};
+pub use crate::tokens::{Token, TokenKind};
 
 /// The fonts layout may use. The shell supplies them, since the core never reads files.
 ///
@@ -87,6 +90,7 @@ impl DocLayout {
             leaves: Vec::new(),
             frames: Vec::new(),
             index: HashMap::new(),
+            tokens: HashMap::new(),
             stale: 0,
             height: 0.0,
             pending: 0,
@@ -107,6 +111,15 @@ impl DocLayout {
     /// of theme costs one paint.
     pub fn set_palette(&mut self, palette: Palette) {
         self.state.get_mut().palette = palette;
+    }
+
+    /// Colours the text of a code block: each token in the palette's colour for its kind, and the rest in the
+    /// style's. Tokens are in order and do not overlap. Nothing is laid out again, so this costs one paint.
+    ///
+    /// They follow the text through edits until the block is lexed again and they are set anew. Tokens for
+    /// a block that is not code, or not in the document, are dropped.
+    pub fn set_tokens(&mut self, block: &BlockId, tokens: Vec<Token>) {
+        self.state.get_mut().set_tokens(block, tokens);
     }
 
     /// The height of the whole document. Partly an estimate until [`DocLayout::settle`] returns `false`.
@@ -173,6 +186,8 @@ struct State {
     frames: Vec<Frame>,
     /// Text leaves by block.
     index: HashMap<BlockId, usize>,
+    /// The tokens of code blocks.
+    tokens: HashMap<BlockId, Vec<Token>>,
     /// The first leaf whose `y` is out of date.
     stale: usize,
     height: f32,
@@ -222,7 +237,11 @@ impl State {
             if leaf.kind.as_ref() != Some(&block.kind) || !matches!(block.body, Body::Text(_)) {
                 return false;
             }
+            let before = self.tokens.get_mut(id).map(|tokens| (tokens, leaf.text.clone()));
             leaf.set_content(block);
+            if let Some((tokens, before)) = before {
+                tokens::follow(tokens, &before, &leaf.text);
+            }
             if leaf.laid.take().is_some() {
                 self.held -= 1;
             }
@@ -238,9 +257,15 @@ impl State {
     fn reflow(&mut self, doc: &Document, carry: Option<&Change>) {
         let mut old = std::mem::take(&mut self.leaves);
         let mut index = std::mem::take(&mut self.index);
+        let tokens = &mut self.tokens;
         let flow = flow::flow(doc, &self.types, self.width, |block| {
-            let untouched = !carry?.blocks.contains(&block.id);
-            let at = *index.get(&block.id).filter(|_| untouched)?;
+            let (change, at) = (carry?, *index.get(&block.id)?);
+            if change.blocks.contains(&block.id) {
+                if let Some(tokens) = tokens.get_mut(&block.id) {
+                    tokens::follow(tokens, &old[at].text, &block.plain_text());
+                }
+                return None;
+            }
             Some(std::mem::take(&mut old[at]))
         });
         (self.leaves, self.frames) = (flow.leaves, flow.frames);
@@ -251,9 +276,21 @@ impl State {
             }
         }
         self.index = index;
+        let coded = |id: &BlockId| self.index.get(id).is_some_and(|at| self.leaves[*at].role == Role::Code);
+        self.tokens.retain(|id, tokens| coded(id) && !tokens.is_empty());
         self.pending = self.leaves.iter().filter(|leaf| !leaf.exact).count();
         self.held = self.leaves.iter().filter(|leaf| leaf.laid.is_some()).count();
         self.stale = 0;
+    }
+
+    fn set_tokens(&mut self, block: &BlockId, mut tokens: Vec<Token>) {
+        let coded = self.index.get(block).is_some_and(|at| self.leaves[*at].role == Role::Code);
+        if coded && !tokens.is_empty() {
+            tokens.sort_by_key(|token| token.range.start);
+            self.tokens.insert(block.clone(), tokens);
+        } else {
+            self.tokens.remove(block);
+        }
     }
 
     /// Brings `y` up to date for every leaf up to and including `upto`.
@@ -375,13 +412,14 @@ impl State {
         for at in first..end {
             // A viewport taller than the cache holds has dropped its first layouts by now.
             self.lay(at);
-            let Self { engine, types, leaves, .. } = self;
+            let Self { engine, types, leaves, tokens, .. } = self;
             let leaf = &leaves[at];
             if leaf.what == What::Rule {
                 let rect = Rect::new(leaf.x, leaf.y, leaf.width, leaf.height);
                 out.push(Item::Fill { rect, color: palette.line, radius: 0.0 });
             } else if let Some(laid) = &leaf.laid {
-                leaf::paint(engine, types, leaf, laid, band, &inks, out);
+                let tokens = leaf.id.as_ref().and_then(|id| tokens.get(id));
+                Painter { engine, types, inks: &inks, band, out }.leaf(leaf, laid, tokens.map(Vec::as_slice));
             }
         }
     }

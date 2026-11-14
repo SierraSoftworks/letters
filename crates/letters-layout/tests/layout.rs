@@ -1,6 +1,6 @@
 //! Document layout through its public interface, with the bundled fonts.
 
-use letters_layout::{Callout, DocLayout, FontSpec, Fonts, Palette, Scheme, Shaper};
+use letters_layout::{Callout, DocLayout, FontSpec, Fonts, Palette, Scheme, Shaper, Token, TokenKind};
 use letters_model::{
     Block, BlockKind, Body, Document, ListKind, Mark, Model, Op, Pos, Run, Selection, Style, TextStyle, Tone,
 };
@@ -67,6 +67,24 @@ fn color_of(item: &Item) -> Option<Color> {
 fn dark() -> Palette {
     let (page, text) = (Color::rgb(0x22, 0x22, 0x24), Color::rgb(0xd0, 0xd0, 0xd1));
     Palette { scheme: Scheme::Dark, page, text, ..Palette::LIGHT }
+}
+
+/// Every glyph painted and where it sits on the page, whatever items carry it.
+fn placed(items: &[Item]) -> Vec<(u32, f32, f32)> {
+    let glyphs = glyph_runs(items).flat_map(|item| match item {
+        Item::Glyphs { origin, glyphs, .. } => glyphs.iter().map(|g| (g.id, origin.x + g.x, origin.y + g.y)).collect(),
+        _ => Vec::new(),
+    });
+    glyphs.collect()
+}
+
+/// The glyphs painted in `color`.
+fn inked(items: &[Item], color: Color) -> Vec<u32> {
+    let runs = glyph_runs(items).filter(|item| color_of(item) == Some(color));
+    runs.flat_map(
+        |item| if let Item::Glyphs { glyphs, .. } = item { glyphs.iter().map(|g| g.id).collect() } else { vec![] },
+    )
+    .collect()
 }
 
 fn glyph_runs(items: &[Item]) -> impl Iterator<Item = &Item> {
@@ -562,5 +580,98 @@ fn a_dark_page_recolours_the_style() {
         let items = painted(&layout, everything());
         let colors: Vec<_> = glyph_runs(&items).filter_map(color_of).collect();
         assert_eq!(colors, [palette.text, body], "a colour that cannot be read falls back to the palette's text");
+    }
+}
+
+const CODE: &str =
+    "fn main() {\n    // rates change on the first of January, and every household should check the notice first\n}";
+
+fn code() -> Document {
+    doc(vec![Block::text("c", BlockKind::Code { language: Some("rust".into()) }, CODE), paragraph("p", "Rates")])
+}
+
+fn token(word: &str, kind: TokenKind) -> Token {
+    let start = CODE.find(word).unwrap();
+    Token { range: start..start + word.len(), kind }
+}
+
+#[test]
+fn tokens_colour_code_and_move_nothing() {
+    use TokenKind::*;
+    let syntax = Palette::LIGHT.syntax;
+    let mut layout = laid(&code());
+    let plain = painted(&layout, everything());
+    let height = layout.height();
+    let comment = &CODE[CODE.find("//").unwrap()..CODE.rfind('\n').unwrap()];
+
+    let kinds = [
+        (Comment, syntax.comment),
+        (Keyword, syntax.keyword),
+        (Literal, syntax.number),
+        (Number, syntax.number),
+        (String, syntax.string),
+        (Type, syntax.type_name),
+        (Function, syntax.function),
+        (Property, syntax.property),
+        (Tag, syntax.property),
+        (Variable, syntax.property),
+        (Meta, syntax.number),
+        (Inserted, syntax.string),
+        (Deleted, syntax.property),
+    ];
+    for (kind, color) in kinds {
+        layout.set_tokens(&"c".into(), vec![token("main", kind)]);
+        let items = painted(&layout, everything());
+        assert_eq!(inked(&items, color).len(), 4, "{kind:?} colours the four letters of its token");
+        assert_eq!(placed(&items), placed(&plain), "{kind:?} moves no glyph");
+    }
+
+    // A comment long enough to wrap, between two other tokens.
+    layout.set_tokens(&"c".into(), vec![token(comment, Comment), token("main", Function), token("fn", Keyword)]);
+    let items = painted(&layout, everything());
+    assert_eq!(placed(&items), placed(&plain), "tokens move no glyph, across wrapped lines too");
+    assert_eq!(layout.height(), height);
+    assert_eq!(inked(&items, syntax.keyword).len(), 2, "tokens may be given in any order");
+    assert_eq!(inked(&items, syntax.comment).len(), comment.len(), "every letter of the comment, on both lines");
+    let slanted = |items: &[Item], color| {
+        glyph_runs(items)
+            .filter(|item| color_of(item) == Some(color))
+            .all(|item| matches!(item, Item::Glyphs { skew, .. } if *skew > 0.0))
+    };
+    assert!(slanted(&items, syntax.comment) && !slanted(&items, syntax.keyword), "only comments are set in italics");
+
+    layout.set_tokens(&"c".into(), Vec::new());
+    assert_eq!(painted(&layout, everything()), plain, "no tokens is plain code again");
+    layout.set_tokens(&"p".into(), vec![Token { range: 0..5, kind: Keyword }]);
+    layout.set_tokens(&"missing".into(), vec![Token { range: 0..5, kind: Keyword }]);
+    assert_eq!(painted(&layout, everything()), plain, "only code blocks take tokens");
+}
+
+#[test]
+fn tokens_follow_the_text_through_edits() {
+    let keyword = Palette::LIGHT.syntax.keyword;
+    let cases: Vec<(&str, Vec<Op>, usize)> = vec![
+        ("typing before it", vec![Op::InsertText { at: Pos::new("c", 0), text: "pub ".into() }], 4),
+        ("typing after it", vec![Op::InsertText { at: Pos::new("c", 9), text: "x".into() }], 4),
+        ("typing at its end", vec![Op::InsertText { at: Pos::new("c", 7), text: "ly".into() }], 6),
+        ("typing inside it", vec![Op::InsertText { at: Pos::new("c", 5), text: "x".into() }], 5),
+        ("deleting part of it", vec![Op::DeleteText { block: "c".into(), range: 2..5 }], 2),
+        ("deleting all of it", vec![Op::DeleteText { block: "c".into(), range: 0..9 }], 0),
+        ("splitting the block after it", vec![Op::Split { at: Pos::new("c", 11), new_id: "n".into() }], 4),
+    ];
+    for (name, ops, coloured) in cases {
+        let mut model = Model::new(code());
+        let mut layout = laid(model.doc());
+        layout.set_tokens(&"c".into(), vec![token("main", TokenKind::Keyword)]);
+        let before = inked(&painted(&layout, everything()), keyword);
+        let change = model.apply(ops).unwrap();
+        layout.update(model.doc(), &Style::default(), WIDTH, Some(&change));
+        let after = inked(&painted(&layout, everything()), keyword);
+        assert_eq!(after.len(), coloured, "{name}");
+        if coloured == before.len() {
+            assert_eq!(after, before, "{name} leaves the same letters coloured");
+        }
+        layout.update(model.doc(), &Style::default(), WIDTH / 2.0, None);
+        assert_eq!(inked(&painted(&layout, everything()), keyword), after, "{name}, then a new width");
     }
 }
