@@ -1,0 +1,185 @@
+//! The Parley setup everything is shaped with: the registered faces and the scratch space layouts are built in.
+
+use std::borrow::Cow;
+use std::ops::Range;
+use std::sync::Arc;
+
+use letters_render::{Color, Font, Glyph, Item, Point};
+use parley::fontique::{Blob, Collection, CollectionOptions, FamilyId, SourceCache};
+use parley::setting::Tag;
+use parley::{
+    FontContext, FontFamily, FontFamilyName, FontStyle, FontVariation, FontVariations, FontWeight, GenericFamily,
+    GlyphRun, Language, Layout, LayoutContext, LineHeight, OverflowWrap, TextStyle,
+};
+
+use crate::Fonts;
+
+/// What Parley carries for each styled range: the text colour and any fill behind the text.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Brush {
+    pub color: Color,
+    pub back: Option<Color>,
+}
+
+/// How one stretch of text is set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Spec<'a> {
+    pub family: &'a str,
+    /// Falls back to a monospace face, not a proportional one, when the family is missing.
+    pub mono: bool,
+    pub size: f32,
+    pub weight: f32,
+    pub italic: bool,
+    pub line: LineHeight,
+    pub brush: Brush,
+    pub underline: bool,
+    pub strike: bool,
+}
+
+pub(crate) struct Engine {
+    fcx: FontContext,
+    lcx: LayoutContext<Brush>,
+    /// The bytes behind each registered blob, by blob id.
+    sources: Vec<(u64, Arc<[u8]>)>,
+    /// Font instances already handed out, so that painting clones one and allocates nothing.
+    instances: Vec<(u64, Font)>,
+}
+
+const OPSZ: Tag = Tag::new(b"opsz");
+
+impl Engine {
+    /// Registers exactly `fonts`. System fonts are never consulted, so text looks the same everywhere.
+    pub fn new(fonts: &Fonts) -> Self {
+        let collection = Collection::new(CollectionOptions { shared: false, system_fonts: false });
+        let mut engine = Self {
+            fcx: FontContext { collection, source_cache: SourceCache::default() },
+            lcx: LayoutContext::new(),
+            sources: Vec::new(),
+            instances: Vec::new(),
+        };
+        let mut families: Vec<FamilyId> = Vec::new();
+        for font in &fonts.faces {
+            if engine.sources.iter().any(|(_, data)| Arc::ptr_eq(data, &font.data)) {
+                continue;
+            }
+            let blob = Blob::new(Arc::new(font.data.clone()));
+            engine.sources.push((blob.id(), font.data.clone()));
+            for (family, _) in engine.fcx.collection.register_fonts(blob, None) {
+                if !families.contains(&family) {
+                    families.push(family);
+                }
+            }
+        }
+        // Every family backs up every other, so a glyph one face lacks comes from the next that has it.
+        let (mono, sans): (Vec<_>, Vec<_>) = families.iter().partition(|family| engine.is_monospace(**family));
+        let generic = |first: &[FamilyId], rest: &[FamilyId]| first.iter().chain(rest).copied().collect::<Vec<_>>();
+        engine.fcx.collection.set_generic_families(GenericFamily::SansSerif, generic(&sans, &mono).into_iter());
+        engine.fcx.collection.set_generic_families(GenericFamily::Monospace, generic(&mono, &sans).into_iter());
+        engine
+    }
+
+    fn is_monospace(&mut self, family: FamilyId) -> bool {
+        let Some(name) = self.fcx.collection.family_name(family).map(str::to_owned) else { return false };
+        let mut width = |text: &str| {
+            let spec = Spec {
+                family: &name,
+                mono: false,
+                size: 16.0,
+                weight: 400.0,
+                italic: false,
+                line: LineHeight::NORMAL,
+                brush: Brush::default(),
+                underline: false,
+                strike: false,
+            };
+            let mut layout = Layout::new();
+            self.build(text, &[spec], &[(0, 0..text.len())], None, &mut layout);
+            layout.break_all_lines(None);
+            layout.full_width()
+        };
+        width("i") == width("m")
+    }
+
+    /// Shapes `text` into `layout`. `runs` name a spec for each stretch of the text, in order and without gaps.
+    /// The caller still breaks the lines.
+    pub fn build(
+        &mut self,
+        text: &str,
+        specs: &[Spec],
+        runs: &[(u16, Range<usize>)],
+        locale: Option<Language>,
+        layout: &mut Layout<Brush>,
+    ) {
+        let mut builder = self.lcx.style_run_builder(&mut self.fcx, text, 1.0, true);
+        for spec in specs {
+            let generic = if spec.mono { GenericFamily::Monospace } else { GenericFamily::SansSerif };
+            let stack = [FontFamilyName::named(spec.family), FontFamilyName::Generic(generic)];
+            // Optical size follows the font size, as it does on the web. A face with no such axis ignores it.
+            let optical = [FontVariation::new(OPSZ, spec.size)];
+            builder.push_style(TextStyle {
+                font_family: FontFamily::List(Cow::Borrowed(&stack)),
+                font_size: spec.size,
+                font_weight: FontWeight::new(spec.weight),
+                font_style: if spec.italic { FontStyle::Italic } else { FontStyle::Normal },
+                font_variations: FontVariations::List(Cow::Borrowed(&optical)),
+                locale,
+                brush: spec.brush,
+                has_underline: spec.underline,
+                has_strikethrough: spec.strike,
+                line_height: spec.line,
+                overflow_wrap: OverflowWrap::Anywhere,
+                ..TextStyle::default()
+            });
+        }
+        for (spec, range) in runs {
+            builder.push_style_run(*spec, range.clone());
+        }
+        builder.build_into(layout, text);
+    }
+
+    /// The glyphs of one run as a display item, with the run's layout placed at `at`.
+    pub fn glyphs(&mut self, run: &GlyphRun<'_, Brush>, at: Point, color: Color) -> Option<Item> {
+        let font = self.font(run)?;
+        let synthesis = run.run().synthesis();
+        let mut pen = 0.0;
+        let glyphs = run
+            .glyphs()
+            .map(|glyph| {
+                let placed = Glyph { id: glyph.id, x: pen + glyph.x, y: glyph.y };
+                pen += glyph.advance;
+                placed
+            })
+            .collect();
+        Some(Item::Glyphs {
+            origin: Point { x: at.x + run.offset(), y: at.y + run.baseline() },
+            font,
+            size: run.run().font_size(),
+            color,
+            skew: synthesis.skew().unwrap_or(0.0),
+            embolden: synthesis.embolden(),
+            glyphs,
+        })
+    }
+
+    fn font(&mut self, run: &GlyphRun<'_, Brush>) -> Option<Font> {
+        let face = run.run().font();
+        let (id, coords) = (face.data.id(), run.run().normalized_coords());
+        let known = self.instances.iter().find(|(source, font)| {
+            *source == id
+                && font.index == face.index
+                && font.coords.len() == coords.len()
+                && font.coords.iter().zip(coords).all(|(a, b)| *a == b.to_bits())
+        });
+        if let Some((_, font)) = known {
+            return Some(font.clone());
+        }
+        let data = self.sources.iter().find(|(source, _)| *source == id)?.1.clone();
+        let font = Font::new(data, face.index).with_coords(coords.iter().map(|c| c.to_bits()).collect::<Vec<_>>());
+        // Sizes are few, so this stays small. The cap only guards against a caller that animates them.
+        if self.instances.len() >= 256 {
+            self.instances.clear();
+        }
+        self.instances.push((id, font.clone()));
+        Some(font)
+    }
+}

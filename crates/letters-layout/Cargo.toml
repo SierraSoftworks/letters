@@ -14,3 +14,7 @@ workspace = true
 [dependencies]
 letters-model.workspace = true
 letters-render.workspace = true
+parley.workspace = true
+
+[dev-dependencies]
+letters-fonts.workspace = true
