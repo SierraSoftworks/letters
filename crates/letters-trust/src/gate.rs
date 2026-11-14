@@ -32,7 +32,7 @@ pub enum ImageDecision {
     OnRequest,
     /// Safe mode: keep the frame, and fetch nothing until the document is trusted.
     Held,
-    /// Never fetched.
+    /// Never fetched, unless the user adds a trusted source that covers it.
     Refused(UrlError),
 }
 
@@ -57,7 +57,8 @@ pub enum MergeDecision {
 #[derive(Clone, Copy, Debug)]
 pub struct Gate<'a> {
     trust: &'a Trust,
-    server: &'a [Source],
+    /// The administrator's sources, when the decisions are made on a server.
+    server: Option<&'a [Source]>,
     mode: Mode,
 }
 
@@ -74,14 +75,17 @@ impl Trust {
     }
 
     pub fn gate(&self, id: &str, origin: Origin<'_>) -> Gate<'_> {
-        Gate { trust: self, server: &[], mode: self.mode(id, origin) }
+        Gate { trust: self, server: None, mode: self.mode(id, origin) }
     }
 }
 
 impl<'a> Gate<'a> {
-    /// Adds the sources the server's administrator trusts for everyone.
-    pub fn with_sources(self, server: &'a [Source]) -> Self {
-        Self { server, ..self }
+    /// On a server: adds the sources its administrator trusts for everyone.
+    ///
+    /// The server fetches inside the administrator's network, so there only these sources may be on a
+    /// private address. A user's own source could otherwise point the server at its neighbours.
+    pub fn on_server(self, sources: &'a [Source]) -> Self {
+        Self { server: Some(sources), ..self }
     }
 
     pub fn mode(&self) -> Mode {
@@ -89,12 +93,20 @@ impl<'a> Gate<'a> {
     }
 
     /// Whether an image that is still a remote link may load.
+    ///
+    /// An address on this device or a private network is refused unless a trusted source covers it.
     pub fn image(&self, url: &str) -> ImageDecision {
-        match HttpsUrl::parse(url) {
-            Err(error) => ImageDecision::Refused(error),
-            Ok(_) if self.mode == Mode::Safe => ImageDecision::Held,
-            Ok(url) if self.sources().any(|source| source.allows(&url)) => ImageDecision::Load,
-            Ok(_) => ImageDecision::OnRequest,
+        let url = match HttpsUrl::parse(url) {
+            Ok(url) => url,
+            Err(error) => return ImageDecision::Refused(error),
+        };
+        if !url.is_public() && !self.vouchers().iter().any(|source| source.allows(&url)) {
+            return ImageDecision::Refused(UrlError::Private);
+        }
+        match self.mode {
+            Mode::Safe => ImageDecision::Held,
+            Mode::Trusted if self.sources().any(|source| source.allows(&url)) => ImageDecision::Load,
+            Mode::Trusted => ImageDecision::OnRequest,
         }
     }
 
@@ -142,28 +154,36 @@ impl<'a> Gate<'a> {
     /// Starts the fetch of an image that loads on open. It is refused unless [`image`](Self::image) says
     /// `Load`, and a redirect may not leave the trusted sources.
     pub fn fetch_on_open(&self, url: &str, limits: Limits) -> Result<ImageFetch, FetchError> {
-        match self.image(url) {
-            ImageDecision::OnRequest => Err(FetchError::UntrustedSource),
-            _ => self.fetch(url, limits, Some(self.sources().cloned().collect())),
-        }
+        self.fetch(url, limits, true)
     }
 
     /// Starts a fetch the user asked for: "Load once", "Always load from this host" or "Embed". Safe mode
     /// still refuses it.
     pub fn fetch_on_request(&self, url: &str, limits: Limits) -> Result<ImageFetch, FetchError> {
-        self.fetch(url, limits, None)
+        self.fetch(url, limits, false)
     }
 
-    fn fetch(&self, url: &str, limits: Limits, within: Option<Vec<Source>>) -> Result<ImageFetch, FetchError> {
-        let url = HttpsUrl::parse(url).map_err(FetchError::Url)?;
-        match self.mode {
-            Mode::Trusted => Ok(ImageFetch::new(url, limits, within)),
-            Mode::Safe => Err(FetchError::Held),
+    fn fetch(&self, url: &str, limits: Limits, on_open: bool) -> Result<ImageFetch, FetchError> {
+        match self.image(url) {
+            ImageDecision::Refused(error) => Err(FetchError::Url(error)),
+            ImageDecision::Held => Err(FetchError::Held),
+            ImageDecision::OnRequest if on_open => Err(FetchError::UntrustedSource),
+            ImageDecision::Load | ImageDecision::OnRequest => {
+                let url = HttpsUrl::parse(url).map_err(FetchError::Url)?;
+                let within = on_open.then(|| self.sources().cloned().collect());
+                Ok(ImageFetch::new(url, limits, within, self.vouchers().to_vec()))
+            }
         }
     }
 
+    /// Every source images load from on open.
     fn sources(&self) -> impl Iterator<Item = &'a Source> {
-        self.trust.sources().iter().chain(self.server)
+        self.trust.sources().iter().chain(self.server.unwrap_or_default())
+    }
+
+    /// The sources that may be on a private address: those of whoever owns the network the fetch runs in.
+    fn vouchers(&self) -> &'a [Source] {
+        self.server.unwrap_or(self.trust.sources())
     }
 }
 

@@ -7,7 +7,8 @@
 //!   shell lends it. Trust lives outside the document, so a file cannot declare itself trusted.
 //! - [`Trust::gate`] decides how one open document is treated, and its [`Gate`] answers for each remote
 //!   image, link and merge.
-//! - [`ImageFetch`] guards one download: HTTPS only, no private addresses, and limits on size and type.
+//! - [`ImageFetch`] guards one download: HTTPS only, no private addresses but those of a trusted source, and
+//!   limits on size and type.
 //!
 //! Nothing here opens a file or a socket: the shell does both and asks before each step.
 

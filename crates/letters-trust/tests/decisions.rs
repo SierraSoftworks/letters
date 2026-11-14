@@ -1,6 +1,6 @@
 mod common;
 
-use common::{HOME, SETTINGS, safe, trust, trusted};
+use common::{HOME, PRIVATE_SOURCES, SETTINGS, safe, trust, trusted};
 use letters_trust::{ImageDecision, LinkDecision, MergeDecision, Mode, Origin, Source, Trust, UrlError};
 
 #[test]
@@ -106,13 +106,45 @@ fn an_image_loads_from_a_trusted_source_in_a_trusted_document() {
 }
 
 #[test]
+fn a_private_address_loads_only_from_a_trusted_source() {
+    use ImageDecision::{Held, Load, Refused};
+    let trust = trust(PRIVATE_SOURCES);
+    let cases = [
+        ("https://192.168.1.10/photos/a.png", Load, Held),
+        ("https://localhost:8443/a.png", Load, Held),
+        // Beside the source, and elsewhere on the network.
+        ("https://192.168.1.10/admin/a.png", Refused(UrlError::Private), Refused(UrlError::Private)),
+        ("https://192.168.1.10:8443/photos/a.png", Refused(UrlError::Private), Refused(UrlError::Private)),
+        ("https://192.168.1.11/photos/a.png", Refused(UrlError::Private), Refused(UrlError::Private)),
+        ("https://localhost/a.png", Refused(UrlError::Private), Refused(UrlError::Private)),
+        ("http://192.168.1.10/photos/a.png", Refused(UrlError::NotHttps), Refused(UrlError::NotHttps)),
+    ];
+    for (url, in_trusted, in_safe) in cases {
+        assert_eq!(trusted(&trust).image(url), in_trusted, "{url} in a trusted document");
+        assert_eq!(safe(&trust).image(url), in_safe, "{url} in safe mode");
+    }
+}
+
+#[test]
 fn the_servers_sources_load_for_every_user() {
     let trust = trust(SETTINGS);
     let server = [Source::parse("https://cdn.example.net/").unwrap()];
     let url = "https://cdn.example.net/a.png";
     assert_eq!(trusted(&trust).image(url), ImageDecision::OnRequest);
-    assert_eq!(trusted(&trust).with_sources(&server).image(url), ImageDecision::Load);
-    assert_eq!(safe(&trust).with_sources(&server).image(url), ImageDecision::Held, "safe mode still holds it");
+    assert_eq!(trusted(&trust).on_server(&server).image(url), ImageDecision::Load);
+    assert_eq!(trusted(&trust).on_server(&server).image("https://upload.wikimedia.org/a.png"), ImageDecision::Load);
+    assert_eq!(safe(&trust).on_server(&server).image(url), ImageDecision::Held, "safe mode still holds it");
+}
+
+#[test]
+fn on_a_server_only_its_administrator_vouches_for_a_private_address() {
+    let trust = trust(PRIVATE_SOURCES);
+    let server =
+        [Source::parse("https://assets.internal.example/").unwrap(), Source::parse("https://10.0.0.5/").unwrap()];
+    let gate = trusted(&trust).on_server(&server);
+    // The user's own source would point the server at its neighbours.
+    assert_eq!(gate.image("https://192.168.1.10/photos/a.png"), ImageDecision::Refused(UrlError::Private));
+    assert_eq!(gate.image("https://10.0.0.5/a.png"), ImageDecision::Load);
 }
 
 #[test]

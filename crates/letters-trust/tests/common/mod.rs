@@ -22,6 +22,12 @@ image_sources = ["https://upload.wikimedia.org/", "https://img.example.org/chart
 language = "en-GB"
 "#;
 
+/// A user who trusts a doc and three sources that are, or may resolve to, private addresses.
+pub const PRIVATE_SOURCES: &str = r#"[trust]
+documents = ["doc-trusted"]
+image_sources = ["https://192.168.1.10/photos/", "https://localhost:8443/", "https://nas.tailnet.example/"]
+"#;
+
 /// A settings file in memory. Clones share the one file, so a test can read what the store wrote.
 #[derive(Clone, Default)]
 pub struct Memory {

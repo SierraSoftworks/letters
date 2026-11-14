@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::is_public;
 
-/// An HTTPS address on the public internet, in its plain form. `Display` writes the text to fetch.
+/// An HTTPS address in its plain form. `Display` writes the text to fetch.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HttpsUrl {
     host: Host,
@@ -33,7 +33,7 @@ pub enum UrlError {
     NotHttps,
     /// A user name or password in the address, which also disguises the real host.
     Credentials,
-    /// The host is this machine or a private network.
+    /// The host is this machine or a private network, and no trusted source vouches for it.
     Private,
     /// Not a form that every program reads the same way.
     Malformed,
@@ -55,9 +55,6 @@ impl HttpsUrl {
             return Err(UrlError::Credentials);
         }
         let (host, port) = split_authority(authority)?;
-        if !host.is_public() {
-            return Err(UrlError::Private);
-        }
         // The fragment never reaches the server.
         let tail = tail.split_once('#').map_or(tail, |(tail, _)| tail);
         let (path, query) = match tail.split_once('?') {
@@ -82,6 +79,15 @@ impl HttpsUrl {
 
     pub fn query(&self) -> Option<&str> {
         self.query.as_deref()
+    }
+
+    /// Whether the host is written as one on the public internet. A name can still resolve to a private
+    /// address, which the fetch checks when it connects.
+    pub fn is_public(&self) -> bool {
+        match &self.host {
+            Host::Name(name) => name != "localhost" && !name.ends_with(".localhost"),
+            Host::Address(address) => is_public(*address),
+        }
     }
 
     pub(crate) fn same_origin(&self, other: &Self) -> bool {
@@ -111,15 +117,6 @@ impl HttpsUrl {
             format!("{origin}{folder}{location}")
         };
         Self::parse(&absolute)
-    }
-}
-
-impl Host {
-    fn is_public(&self) -> bool {
-        match self {
-            Self::Name(name) => name != "localhost" && !name.ends_with(".localhost"),
-            Self::Address(address) => is_public(*address),
-        }
     }
 }
 

@@ -39,19 +39,6 @@ fn an_address_that_could_be_misread_or_misused_is_refused() {
         // A user name disguises the host.
         ("https://example.org@evil.example/a.png", UrlError::Credentials),
         ("https://user:pass@example.org/a.png", UrlError::Credentials),
-        // This machine and private networks, however they are spelled.
-        ("https://localhost/a.png", UrlError::Private),
-        ("https://LOCALHOST./a.png", UrlError::Private),
-        ("https://app.localhost:8443/a.png", UrlError::Private),
-        ("https://127.0.0.1/a.png", UrlError::Private),
-        ("https://10.1.2.3/a.png", UrlError::Private),
-        ("https://192.168.0.1/a.png", UrlError::Private),
-        ("https://169.254.169.254/latest/meta-data/", UrlError::Private),
-        ("https://100.100.100.100/a.png", UrlError::Private),
-        ("https://[::1]/a.png", UrlError::Private),
-        ("https://[::ffff:127.0.0.1]/a.png", UrlError::Private),
-        ("https://[fd00::1]/a.png", UrlError::Private),
-        ("https://0.0.0.0/a.png", UrlError::Private),
         // Spellings of an address that only some programs read as one.
         ("https://2130706433/a.png", UrlError::Malformed),
         ("https://127.1/a.png", UrlError::Malformed),
@@ -86,6 +73,33 @@ fn an_address_that_could_be_misread_or_misused_is_refused() {
 }
 
 #[test]
+fn an_address_on_this_device_or_a_private_network_is_told_apart() {
+    let cases = [
+        ("https://example.org/a.png", true),
+        ("https://93.184.216.34/a.png", true),
+        ("https://[2606:4700:4700::1111]/a.png", true),
+        // A name says nothing about where it resolves: the fetch checks that when it connects.
+        ("https://nas.tailnet.example/a.png", true),
+        ("https://localhost/a.png", false),
+        ("https://LOCALHOST./a.png", false),
+        ("https://app.localhost:8443/a.png", false),
+        ("https://127.0.0.1/a.png", false),
+        ("https://10.1.2.3/a.png", false),
+        ("https://192.168.0.1/a.png", false),
+        ("https://169.254.169.254/latest/meta-data/", false),
+        ("https://100.100.100.100/a.png", false),
+        ("https://[::1]/a.png", false),
+        ("https://[::ffff:127.0.0.1]/a.png", false),
+        ("https://[fd00::1]/a.png", false),
+        ("https://0.0.0.0/a.png", false),
+    ];
+    for (text, public) in cases {
+        let url = HttpsUrl::parse(text).unwrap_or_else(|error| panic!("{text}: {error}"));
+        assert_eq!(url.is_public(), public, "{text}");
+    }
+}
+
+#[test]
 fn a_source_allows_its_host_or_prefix_and_nothing_near_it() {
     let cases = [
         // A whole host.
@@ -111,6 +125,10 @@ fn a_source_allows_its_host_or_prefix_and_nothing_near_it() {
         ("https://img.example.org/charts/", "https://img.example.org/charts/..%2Fprivate/q3.png", false),
         ("https://img.example.org/charts/", "https://img.example.org/charts/..%5cprivate/q3.png", false),
         ("https://img.example.org/charts/", "https://img.example.org/charts/a/../q3.png", true),
+        // A source on a private network.
+        ("https://192.168.1.10/photos/", "https://192.168.1.10/photos/a.png", true),
+        ("https://192.168.1.10/photos/", "https://192.168.1.11/photos/a.png", false),
+        ("nas.tailnet.example", "https://nas.tailnet.example/a.png", true),
     ];
     for (source, url, allowed) in cases {
         let parsed = Source::parse(source).unwrap_or_else(|error| panic!("{source}: {error}"));
@@ -120,12 +138,10 @@ fn a_source_allows_its_host_or_prefix_and_nothing_near_it() {
 }
 
 #[test]
-fn a_source_must_be_a_public_https_host_or_prefix() {
+fn a_source_must_be_an_https_host_or_prefix() {
     let cases = [
         ("http://img.example.org/", UrlError::NotHttps),
         ("https://user@img.example.org/", UrlError::Credentials),
-        ("https://192.168.1.10/", UrlError::Private),
-        ("localhost", UrlError::Private),
         ("https://img.example.org/charts?size=large", UrlError::Malformed),
         ("https://img.example.org/charts#top", UrlError::Malformed),
         ("*.example.org", UrlError::Malformed),

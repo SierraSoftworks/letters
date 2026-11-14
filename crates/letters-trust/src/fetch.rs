@@ -3,7 +3,7 @@
 //! The shell owns the socket and asks before each step:
 //!
 //! 1. Resolve the host of [`ImageFetch::url`], pass every address to [`ImageFetch::connect`], and connect
-//!    to an address that passed.
+//!    to an address that passed. A private address passes only for a trusted source.
 //! 2. On a redirect call [`ImageFetch::redirect`] and start again from step 1. Never let the HTTP client
 //!    follow redirects by itself.
 //! 3. Pass the headers of a successful response to [`ImageFetch::response`], and the size of each piece of
@@ -71,7 +71,7 @@ pub enum FetchError {
     Held,
     /// The address, or one it redirected to, is not a trusted source and the user did not ask for it.
     UntrustedSource,
-    /// The host's name led to this machine or a private network.
+    /// The host's name led to this machine or a private network, and no trusted source vouches for it.
     PrivateAddress(IpAddr),
     TooManyRedirects,
     /// The body is, or says it will be, larger than the limit in bytes.
@@ -104,13 +104,15 @@ pub struct ImageFetch {
     limits: Limits,
     /// The sources a redirect must stay inside. `None` when the user asked for the image.
     within: Option<Vec<Source>>,
+    /// The sources that may be on a private address.
+    vouchers: Vec<Source>,
     redirects: u32,
     received: u64,
 }
 
 impl ImageFetch {
-    pub(crate) fn new(url: HttpsUrl, limits: Limits, within: Option<Vec<Source>>) -> Self {
-        Self { url, limits, within, redirects: 0, received: 0 }
+    pub(crate) fn new(url: HttpsUrl, limits: Limits, within: Option<Vec<Source>>, vouchers: Vec<Source>) -> Self {
+        Self { url, limits, within, vouchers, redirects: 0, received: 0 }
     }
 
     /// The address to request now. Request this text and not the document's own spelling of it.
@@ -118,9 +120,10 @@ impl ImageFetch {
         &self.url
     }
 
-    /// Checks an address the host's name resolved to, before connecting to it.
+    /// Checks an address the host's name resolved to, before connecting to it. Only a trusted source may
+    /// be on a private address.
     pub fn connect(&self, address: IpAddr) -> Result<(), FetchError> {
-        if is_public(address) { Ok(()) } else { Err(FetchError::PrivateAddress(address)) }
+        if is_public(address) || self.vouched(&self.url) { Ok(()) } else { Err(FetchError::PrivateAddress(address)) }
     }
 
     /// Follows a redirect to the response's `Location`, which is held to every rule the first address was.
@@ -129,6 +132,9 @@ impl ImageFetch {
             return Err(FetchError::TooManyRedirects);
         }
         let next = self.url.join(location).map_err(FetchError::Url)?;
+        if !next.is_public() && !self.vouched(&next) {
+            return Err(FetchError::Url(UrlError::Private));
+        }
         if self.within.as_ref().is_some_and(|sources| !sources.iter().any(|source| source.allows(&next))) {
             return Err(FetchError::UntrustedSource);
         }
@@ -161,6 +167,10 @@ impl ImageFetch {
     pub fn finish(self, body: &[u8]) -> Result<ImageType, FetchError> {
         self.check_size(body.len() as u64)?;
         ImageType::sniff(body).ok_or(FetchError::NotAnImage)
+    }
+
+    fn vouched(&self, url: &HttpsUrl) -> bool {
+        self.vouchers.iter().any(|source| source.allows(url))
     }
 
     fn check_size(&self, bytes: u64) -> Result<(), FetchError> {

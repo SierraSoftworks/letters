@@ -2,7 +2,7 @@ mod common;
 
 use std::net::IpAddr;
 
-use common::{SETTINGS, safe, trust, trusted};
+use common::{PRIVATE_SOURCES, SETTINGS, safe, trust, trusted};
 use letters_trust::{FetchError, ImageFetch, ImageType, Limits, UrlError};
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
@@ -64,6 +64,31 @@ fn a_host_that_resolves_to_a_private_address_is_not_connected_to() {
         assert_eq!(fetch.connect(address), Err(FetchError::PrivateAddress(address)));
     }
     assert_eq!(fetch.connect("93.184.216.34".parse().unwrap()), Ok(()));
+}
+
+#[test]
+fn a_trusted_source_may_be_on_a_private_address() {
+    let trust = trust(PRIVATE_SOURCES);
+    let tailnet: IpAddr = "100.64.0.7".parse().unwrap();
+
+    // A name that resolves into the tailnet, and an address written out.
+    let named = trusted(&trust).fetch_on_open("https://nas.tailnet.example/a.png", SMALL).unwrap();
+    assert_eq!(named.connect(tailnet), Ok(()));
+    let written = trusted(&trust).fetch_on_open("https://192.168.1.10/photos/a.png", SMALL).unwrap();
+    assert_eq!(written.connect("192.168.1.10".parse().unwrap()), Ok(()));
+
+    // Another host gains nothing from it, unless it redirects into the source itself.
+    let mut other = trusted(&trust).fetch_on_request("https://example.org/a.png", SMALL).unwrap();
+    assert_eq!(other.connect(tailnet), Err(FetchError::PrivateAddress(tailnet)));
+    assert_eq!(other.redirect("https://192.168.1.10/admin/a.png"), Err(FetchError::Url(UrlError::Private)));
+    assert_eq!(other.redirect("https://192.168.1.10/photos/a.png"), Ok(()));
+    assert_eq!(other.connect("192.168.1.10".parse().unwrap()), Ok(()));
+
+    // Safe mode holds it like any other image, and a server does not take a user's word for it.
+    let held = safe(&trust).fetch_on_request("https://nas.tailnet.example/a.png", SMALL);
+    assert_eq!(held.map(drop), Err(FetchError::Held));
+    let on_server = trusted(&trust).on_server(&[]).fetch_on_open("https://nas.tailnet.example/a.png", SMALL).unwrap();
+    assert_eq!(on_server.connect(tailnet), Err(FetchError::PrivateAddress(tailnet)));
 }
 
 #[test]

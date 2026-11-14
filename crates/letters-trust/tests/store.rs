@@ -148,7 +148,7 @@ fn an_entry_that_cannot_be_read_trusts_nothing_and_is_kept() {
 [trust]
 documents = ["doc-trusted", 7, ""]
 folders = ["~/Documents", "relative/folder", "/"]
-image_sources = ["https://upload.wikimedia.org/", "http://plain.example/", "https://192.168.1.1/"]
+image_sources = ["https://upload.wikimedia.org/", "http://plain.example/", "https://ada@img.example.org/"]
 "#;
     let (mut store, memory) = store(settings);
     let trust = store.trust().clone();

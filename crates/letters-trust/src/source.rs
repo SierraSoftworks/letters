@@ -7,6 +7,9 @@ use crate::{HttpsUrl, UrlError};
 /// A place images may load from: an HTTPS host, or the addresses under one of its paths.
 ///
 /// A host is exactly that host and port. Its subdomains are other sources.
+///
+/// A source may be on a private network, such as a home server or a tailnet. Naming it is what lets a fetch
+/// reach it: every other private address is refused.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Source(HttpsUrl);
 
