@@ -1,19 +1,26 @@
 //! The `.let` container: a zip holding one document, its style, notes, assets and history.
 //!
 //! - [`Archive`] opens a file and reads its parts on demand, so first paint touches only what it needs.
-//! - [`Package`] is everything that goes into a file, and [`write`] turns it into bytes.
+//! - [`Package`] is everything that goes into a file. [`write`] turns it into bytes, and [`write_over`] does
+//!   the same over an older copy, copying what did not change without recompressing it.
+//! - [`save`] replaces a file on a shared folder without locks: read, merge, write beside, rename.
+//! - [`schema`] holds the JSON Schemas of the public entries.
 //!
 //! Nothing here touches the filesystem or the clock. The shell supplies readers, writers, ids and dates.
+
+mod save;
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Seek, Write};
 
-use letters_model::{Document, JsonError};
+use letters_model::{Document, JsonError, Notes, Style};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+pub use save::{DiskCopy, Files, Replica, Save, Saved, Stamp, conflict_copy_of, save};
 
 /// The media type of a `.let` file, stored in its first entry.
 pub const MIMETYPE: &str = "application/vnd.letters.document+zip";
@@ -42,6 +49,12 @@ pub enum Error {
     HashMismatch(String),
     Manifest(String),
     Document(JsonError),
+    Style(JsonError),
+    Notes(JsonError),
+    /// The file holds a different document, named here by its id.
+    OtherDocument(String),
+    /// The folder refused a read, a write or a rename.
+    Files(String),
 }
 
 impl fmt::Display for Error {
@@ -54,6 +67,10 @@ impl fmt::Display for Error {
             Self::HashMismatch(name) => write!(f, "{name} does not match its recorded hash"),
             Self::Manifest(message) => write!(f, "{MANIFEST}: {message}"),
             Self::Document(error) => write!(f, "{DOCUMENT}: {error}"),
+            Self::Style(error) => write!(f, "{STYLE}: {error}"),
+            Self::Notes(error) => write!(f, "{NOTES}: {error}"),
+            Self::OtherDocument(id) => write!(f, "the file holds another document ({id})"),
+            Self::Files(message) => write!(f, "the folder could not be used: {message}"),
         }
     }
 }
@@ -162,8 +179,17 @@ impl<R: Read + Seek> Archive<R> {
 
     pub fn document(&mut self) -> Result<Document, Error> {
         let bytes = self.read(DOCUMENT)?.ok_or_else(|| Error::Missing(DOCUMENT.into()))?;
-        let json = String::from_utf8(bytes).map_err(|_| Error::Zip(format!("{DOCUMENT} is not UTF-8")))?;
-        Document::from_json(&json).map_err(Error::Document)
+        Document::from_json(&text(DOCUMENT, bytes)?).map_err(Error::Document)
+    }
+
+    /// The document's style. A file without one takes the built-in style.
+    pub fn style(&mut self) -> Result<Style, Error> {
+        self.read(STYLE)?.map_or_else(|| Ok(Style::default()), |bytes| read_style(&bytes))
+    }
+
+    /// The document's notes. A file without any has none.
+    pub fn notes(&mut self) -> Result<Notes, Error> {
+        self.read(NOTES)?.map_or_else(|| Ok(Notes::default()), |bytes| read_notes(&bytes))
     }
 
     /// Reads the whole file.
@@ -177,6 +203,18 @@ impl<R: Read + Seek> Archive<R> {
         }
         Ok(Package { id: self.manifest.id.clone(), created: self.manifest.created.clone(), document, entries })
     }
+}
+
+fn text(name: &str, bytes: Vec<u8>) -> Result<String, Error> {
+    String::from_utf8(bytes).map_err(|_| Error::Zip(format!("{name} is not UTF-8")))
+}
+
+fn read_style(bytes: &[u8]) -> Result<Style, Error> {
+    Style::from_json(&text(STYLE, bytes.to_vec())?).map_err(Error::Style)
+}
+
+fn read_notes(bytes: &[u8]) -> Result<Notes, Error> {
+    Notes::from_json(&text(NOTES, bytes.to_vec())?).map_err(Error::Notes)
 }
 
 fn raw<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str) -> Result<Option<Vec<u8>>, Error> {
@@ -201,30 +239,95 @@ pub struct Package {
     pub entries: BTreeMap<String, Vec<u8>>,
 }
 
+impl Package {
+    /// The style in [`STYLE`]. A package without one takes the built-in style.
+    pub fn style(&self) -> Result<Style, Error> {
+        self.entries.get(STYLE).map_or_else(|| Ok(Style::default()), |bytes| read_style(bytes))
+    }
+
+    pub fn set_style(&mut self, style: &Style) {
+        self.entries.insert(STYLE.into(), style.to_json().into_bytes());
+    }
+
+    /// The notes in [`NOTES`]. A package without any has none.
+    pub fn notes(&self) -> Result<Notes, Error> {
+        self.entries.get(NOTES).map_or_else(|| Ok(Notes::default()), |bytes| read_notes(bytes))
+    }
+
+    pub fn set_notes(&mut self, notes: &Notes) {
+        self.entries.insert(NOTES.into(), notes.to_json().into_bytes());
+    }
+}
+
 /// Writes a `.let` file. The same package always produces the same bytes.
 pub fn write<W: Write + Seek>(writer: W, package: &Package) -> Result<(), Error> {
-    let document = package.document.to_json().into_bytes();
-    let mut entries: BTreeMap<&str, &[u8]> = package.entries.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
-    entries.insert(DOCUMENT, &document);
-    let hashes = entries.iter().map(|(name, bytes)| (name.to_string(), hash(bytes))).collect();
-    let manifest = Manifest { id: package.id.clone(), created: package.created.clone(), hashes }.to_json();
+    Plan::new(package, None, |_| false).write(writer, None::<&mut Archive<std::io::Empty>>)
+}
 
-    // A fixed timestamp keeps the output reproducible.
-    let stored = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Stored)
-        .last_modified_time(zip::DateTime::default());
-    let deflated = stored.compression_method(CompressionMethod::Deflated);
+/// Writes a `.let` file over an older copy of it, at disk speed where nothing changed.
+///
+/// An entry the older copy already holds under the same name and hash is copied across still compressed. An
+/// entry of the older copy that the package does not hold is carried over the same way when `keep` says so,
+/// which lets a save leave large assets unread.
+pub fn write_over<W: Write + Seek, R: Read + Seek>(
+    writer: W,
+    package: &Package,
+    base: &mut Archive<R>,
+    keep: impl Fn(&str) -> bool,
+) -> Result<(), Error> {
+    Plan::new(package, Some(&base.manifest), keep).write(writer, Some(base))
+}
 
-    let mut zip = ZipWriter::new(writer);
-    // The mimetype comes first and uncompressed, so the file can be recognised from its first bytes.
-    zip.start_file("mimetype", stored)?;
-    zip.write_all(MIMETYPE.as_bytes())?;
-    zip.start_file(MANIFEST, deflated)?;
-    zip.write_all(manifest.as_bytes())?;
-    for (name, bytes) in entries {
-        zip.start_file(name, deflated)?;
-        zip.write_all(bytes)?;
+/// What a write will hold: the manifest, and the content of each entry that is not copied from the older file.
+pub(crate) struct Plan<'a> {
+    pub(crate) manifest: Manifest,
+    document: Vec<u8>,
+    package: &'a Package,
+}
+
+impl<'a> Plan<'a> {
+    pub(crate) fn new(package: &'a Package, base: Option<&Manifest>, keep: impl Fn(&str) -> bool) -> Self {
+        let document = package.document.to_json().into_bytes();
+        let kept = base.into_iter().flat_map(|base| &base.hashes).filter(|(name, _)| keep(name));
+        let mut hashes: BTreeMap<String, String> = kept.map(|(name, hash)| (name.clone(), hash.clone())).collect();
+        hashes.extend(package.entries.iter().map(|(name, bytes)| (name.clone(), hash(bytes))));
+        hashes.insert(DOCUMENT.into(), hash(&document));
+        let manifest = Manifest { id: package.id.clone(), created: package.created.clone(), hashes };
+        Self { manifest, document, package }
     }
-    zip.finish()?;
-    Ok(())
+
+    pub(crate) fn write<W: Write + Seek, R: Read + Seek>(
+        &self,
+        writer: W,
+        mut base: Option<&mut Archive<R>>,
+    ) -> Result<(), Error> {
+        // A fixed timestamp keeps the output reproducible.
+        let stored = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::default());
+        let deflated = stored.compression_method(CompressionMethod::Deflated);
+
+        let mut zip = ZipWriter::new(writer);
+        // The mimetype comes first and uncompressed, so the file can be recognised from its first bytes.
+        zip.start_file("mimetype", stored)?;
+        zip.write_all(MIMETYPE.as_bytes())?;
+        zip.start_file(MANIFEST, deflated)?;
+        zip.write_all(self.manifest.to_json().as_bytes())?;
+        for (name, hash) in &self.manifest.hashes {
+            let unchanged = base.as_deref_mut().filter(|base| base.manifest.hashes.get(name) == Some(hash));
+            let copied = unchanged.and_then(|base| base.zip.index_for_name(name).map(|index| (base, index)));
+            if let Some((base, index)) = copied {
+                zip.raw_copy_file_touch(base.zip.by_index_raw(index)?, zip::DateTime::default(), None)?;
+                continue;
+            }
+            let bytes = match name.as_str() {
+                DOCUMENT => &self.document,
+                name => self.package.entries.get(name).ok_or_else(|| Error::Missing(name.into()))?,
+            };
+            zip.start_file(name, deflated)?;
+            zip.write_all(bytes)?;
+        }
+        zip.finish()?;
+        Ok(())
+    }
 }
