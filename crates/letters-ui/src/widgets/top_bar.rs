@@ -1,9 +1,11 @@
 //! TopBar: the editor window's one bar. The document sits at the start, the format controls take the middle
 //! and give way first when the window narrows, and the window's actions sit at the end.
+//!
+//! A bar can be given narrower forms of its start and middle to fold into before anything is cut short.
 
 use accesskit::Role;
 
-use crate::element::Element;
+use crate::element::{Element, Fitted};
 use crate::style::{Align, Dir, Edges};
 use crate::tokens;
 
@@ -12,14 +14,21 @@ pub const HEIGHT: f32 = 44.0;
 
 pub struct TopBar<M> {
     label: String,
+    forms: Vec<Form<M>>,
+    shown: Option<Fitted>,
+    end: Vec<Element<M>>,
+}
+
+/// The start and the middle of the bar, as they are for one width of window.
+struct Form<M> {
+    key: usize,
     start: Vec<Element<M>>,
     middle: Vec<Element<M>>,
-    end: Vec<Element<M>>,
 }
 
 impl<M> Default for TopBar<M> {
     fn default() -> Self {
-        Self { label: "Document".into(), start: Vec::new(), middle: Vec::new(), end: Vec::new() }
+        Self { label: "Document".into(), forms: Vec::new(), shown: None, end: Vec::new() }
     }
 }
 
@@ -35,12 +44,29 @@ impl<M> TopBar<M> {
     }
 
     pub fn start(mut self, child: impl Into<Element<M>>) -> Self {
-        self.start.push(child.into());
+        self.last().start.push(child.into());
         self
     }
 
     pub fn middle(mut self, child: impl Into<Element<M>>) -> Self {
-        self.middle.push(child.into());
+        self.last().middle.push(child.into());
+        self
+    }
+
+    /// Begins another form of the start and the middle, which the calls after this fill. The bar shows the
+    /// first of its forms that fits, so give them from the widest to the narrowest. When not even the last
+    /// fits, what may shrink at its start gives way, and then its middle is cut short.
+    ///
+    /// `key` is the form's place among all the bar's forms, which keeps its controls who they are when only
+    /// some of the forms are built.
+    pub fn form(mut self, key: usize) -> Self {
+        self.forms.push(Form { key, start: Vec::new(), middle: Vec::new() });
+        self
+    }
+
+    /// Tells `shown` which of the forms given fits, counted from the first.
+    pub fn shown(mut self, shown: Fitted) -> Self {
+        self.shown = Some(shown);
         self
     }
 
@@ -54,11 +80,24 @@ impl<M> TopBar<M> {
         let line = Element::row().width(1.0).height(tokens::SPACE_LG).bg(tokens::LINE);
         Element::row().padding(Edges::xy(tokens::SPACE_XS, 0.0)).child(line).decorative()
     }
+
+    fn last(&mut self) -> &mut Form<M> {
+        if self.forms.is_empty() {
+            self.forms.push(Form { key: 0, start: Vec::new(), middle: Vec::new() });
+        }
+        let last = self.forms.len() - 1;
+        &mut self.forms[last]
+    }
 }
 
 impl<M> From<TopBar<M>> for Element<M> {
     fn from(bar: TopBar<M>) -> Self {
         let group = || Element::row().align(Align::Center).gap(tokens::SPACE_SM);
+        let form = |form: Form<M>| {
+            let start = group().shrink().children(form.start);
+            group().key(form.key).grow(1.0).shrink().child(start).child(group().children(form.middle))
+        };
+        let forms = Element::row().grow(1.0).shrink().clip().children(bar.forms.into_iter().map(form));
         Element::row()
             .align(Align::Center)
             .gap(tokens::SPACE_SM)
@@ -70,8 +109,10 @@ impl<M> From<TopBar<M>> for Element<M> {
             .role(Role::Toolbar)
             .label(bar.label)
             .arrows(Dir::Row)
-            .child(group().children(bar.start))
-            .child(group().grow(1.0).shrink().clip().children(bar.middle))
+            .child(match bar.shown {
+                Some(shown) => forms.fit_into(shown),
+                None => forms.fit(),
+            })
             .child(group().children(bar.end))
     }
 }

@@ -4,6 +4,7 @@
 //! functions that return elements, and an app describes its whole window as one tree of them each time its
 //! state changes. Elements send the app's own messages (`M`) when something happens to them.
 
+use std::cell::Cell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
@@ -128,7 +129,11 @@ pub struct Element<M> {
     pub(crate) cursor: Cursor,
     pub(crate) popover: Option<Box<Popover<M>>>,
     pub(crate) tooltip: Option<(String, Side)>,
+    pub(crate) fitted: Option<Fitted>,
 }
+
+/// Where the layout says which child of an [`Element::fit`] it showed, counted from the first.
+pub type Fitted = Rc<Cell<Option<usize>>>;
 
 impl<M> Element<M> {
     fn new(content: Content<M>) -> Self {
@@ -153,6 +158,7 @@ impl<M> Element<M> {
             cursor: Cursor::Default,
             popover: None,
             tooltip: None,
+            fitted: None,
         }
     }
 
@@ -291,6 +297,8 @@ impl<M> Element<M> {
         self
     }
 
+    /// Lets the element take less than its size when its row has too little room. It gives up what in it
+    /// can shrink in turn, or all of itself when it clips. A line of text that shrinks ends in an ellipsis.
     pub fn shrink(mut self) -> Self {
         self.style.shrink = true;
         self
@@ -329,6 +337,20 @@ impl<M> Element<M> {
     pub fn inked(mut self) -> Self {
         self.style.inked = true;
         self
+    }
+
+    /// Shows only the first of its children that fits the width it has, or the last when none does. The
+    /// others are left out as if they were not there, so a bar can offer its controls in full and folded.
+    pub fn fit(mut self) -> Self {
+        self.style.fit = true;
+        self
+    }
+
+    /// Fits as [`Element::fit`] does and tells `shown` which child it settled on. Whoever builds the children
+    /// can then build only that one, until something that decides the fit changes.
+    pub fn fit_into(mut self, shown: Fitted) -> Self {
+        self.fitted = Some(shown);
+        self.fit()
     }
 
     /// Lays the element over its siblings at the top left of its parent. It takes no room among them, so it

@@ -116,6 +116,7 @@ impl Layout<'_> {
                 (Size { width: INPUT_WIDTH - style.frame_x(), height: shaped.size.height }, Some(shaped))
             }
             Content::Canvas(_) => (Size::default(), None),
+            Content::None if style.fit => (self.measure_fit(tree, i, inner), None),
             Content::None => (self.measure_children(tree, i, &style, inner), None),
         };
         tree.nodes[i].shaped = shaped;
@@ -133,6 +134,26 @@ impl Layout<'_> {
         };
         tree.nodes[i].size = size;
         size
+    }
+
+    /// Picks the first child that fits `inner`, or the last when none does, and leaves the others out.
+    fn measure_fit<M>(&mut self, tree: &mut Tree<M>, i: usize, inner: f32) -> Size {
+        let options: Vec<usize> = tree.all_children(i).collect();
+        let mut shown = None;
+        for (n, &option) in options.iter().enumerate() {
+            tree.nodes[option].gone = true;
+            if shown.is_none() {
+                let size = self.measure(tree, option, inner);
+                if size.width <= inner || n + 1 == options.len() {
+                    tree.nodes[option].gone = false;
+                    shown = Some(size);
+                    if let Some(fitted) = &tree.nodes[i].el.fitted {
+                        fitted.set(Some(n));
+                    }
+                }
+            }
+        }
+        shown.unwrap_or_default()
     }
 
     fn measure_children<M>(&mut self, tree: &mut Tree<M>, i: usize, style: &Style, inner: f32) -> Size {
@@ -182,11 +203,35 @@ impl Layout<'_> {
         }
     }
 
+    /// Ends a line of text that got less room than it needs in an ellipsis.
+    fn cut<M>(&mut self, tree: &mut Tree<M>, i: usize, width: f32) {
+        let node = &tree.nodes[i];
+        let Content::Text { text, style, wrap: false } = &node.el.content else { return };
+        // A pixel of slack, since the box was rounded to the device's pixels.
+        if node.shaped.as_ref().is_none_or(|shaped| shaped.size.width <= width + 1.0) {
+            return;
+        }
+        let ends: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+        let mut shape = |end: usize| {
+            let cut = format!("{}\u{2026}", text[..end].trim_end());
+            self.cache.shape(self.shaper, &cut, style, None)
+        };
+        // The longest start of the text that fits with the ellipsis after it.
+        let (mut fits, mut over) = (0, ends.len());
+        while over - fits > 1 {
+            let middle = (fits + over) / 2;
+            if shape(ends[middle]).size.width <= width { fits = middle } else { over = middle }
+        }
+        let shaped = shape(ends[fits]);
+        tree.nodes[i].shaped = Some(shaped);
+    }
+
     fn place<M>(&mut self, tree: &mut Tree<M>, i: usize, rect: Rect) {
         let rect = snap(rect, self.scale);
         tree.nodes[i].rect = rect;
         let style = tree.nodes[i].el.style;
         let inner = inner(rect, &style);
+        self.cut(tree, i, inner.width);
         let (overlays, children): (Vec<usize>, Vec<usize>) =
             tree.children(i).partition(|&child| tree.nodes[child].el.style.overlay);
         for overlay in overlays {
@@ -215,11 +260,17 @@ impl Layout<'_> {
             scrolled = *offset;
         }
 
-        // Too little room: the children that may shrink give it up in proportion to their size.
-        let shrinkable: f32 =
-            children.iter().filter(|&&c| tree.nodes[c].el.style.shrink).map(|&c| along(tree.nodes[c].size)).sum();
-        let squeeze =
-            if spare < 0.0 && shrinkable > 0.0 && !style.scroll { (-spare / shrinkable).min(1.0) } else { 0.0 };
+        // Too little room: the children that may shrink give it up, each in proportion to what it can spare.
+        let give = |tree: &Tree<M>, child: usize| {
+            let length = along(tree.nodes[child].size);
+            match tree.nodes[child].el.style.shrink {
+                true if column => length,
+                true => (length - least(tree, child)).max(0.0),
+                false => 0.0,
+            }
+        };
+        let spared: f32 = children.iter().map(|&child| give(tree, child)).sum();
+        let squeeze = if spare < 0.0 && spared > 0.0 && !style.scroll { (-spare / spared).min(1.0) } else { 0.0 };
 
         let (mut cursor, mut gap) = (0.0, style.gap);
         if spare > 0.0 && growth == 0.0 {
@@ -238,8 +289,8 @@ impl Layout<'_> {
             let mut length = along(size);
             if spare > 0.0 && child_style.grow > 0.0 {
                 length += spare * child_style.grow / growth;
-            } else if child_style.shrink {
-                length -= length * squeeze;
+            } else if squeeze > 0.0 {
+                length -= give(tree, child) * squeeze;
             }
 
             let align = child_style.align_self.unwrap_or(style.align);
@@ -261,6 +312,26 @@ impl Layout<'_> {
             cursor += length + gap;
         }
     }
+}
+
+/// The least width a node that may shrink can be given: the room for what in it cannot shrink. Whatever
+/// clips or scrolls its content can lose all of it.
+fn least<M>(tree: &Tree<M>, i: usize) -> f32 {
+    let node = &tree.nodes[i];
+    let style = &node.el.style;
+    if !style.shrink {
+        return node.size.width;
+    }
+    let children: Vec<usize> = tree.children(i).filter(|&child| !tree.nodes[child].el.style.overlay).collect();
+    if style.clip || style.scroll || children.is_empty() {
+        return style.min_width;
+    }
+    let kept = children.iter().map(|&child| least(tree, child));
+    let content = match style.dir {
+        Dir::Row => kept.sum::<f32>() + style.gap * (children.len() - 1) as f32,
+        Dir::Column => kept.fold(0.0, f32::max),
+    };
+    (content + style.frame_x()).max(style.min_width)
 }
 
 /// The box inside an element's border and padding.

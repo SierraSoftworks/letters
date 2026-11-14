@@ -48,6 +48,8 @@ pub(crate) struct Node<M> {
     pub shaped: Option<Rc<Shaped>>,
     /// An empty input's placeholder.
     pub hint: Option<Rc<Shaped>>,
+    /// Left out by the layout, as one of several ways to show something that did not fit or was not needed.
+    pub gone: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -167,6 +169,7 @@ impl<M> Tree<M> {
             content_height: 0.0,
             shaped: None,
             hint: None,
+            gone: false,
         });
         let mut seen = Vec::new();
         for child in children {
@@ -179,8 +182,13 @@ impl<M> Tree<M> {
         self.index.get(&id).copied()
     }
 
-    /// The direct children of a node, in order.
+    /// The direct children of a node that are showing, in order.
     pub fn children(&self, i: usize) -> impl Iterator<Item = usize> + '_ {
+        self.all_children(i).filter(|&child| !self.nodes[child].gone)
+    }
+
+    /// The direct children of a node, with those the layout left out.
+    pub fn all_children(&self, i: usize) -> impl Iterator<Item = usize> + '_ {
         let end = self.nodes[i].end;
         let mut next = i + 1;
         std::iter::from_fn(move || {
@@ -224,7 +232,12 @@ impl<M> Tree<M> {
 
     pub fn focusable(&self, i: usize) -> bool {
         let node = &self.nodes[i];
-        node.el.focus != Focus::No && !self.disabled(i)
+        node.el.focus != Focus::No && !self.disabled(i) && !self.gone(i)
+    }
+
+    /// Whether the layout left out the node or anything it sits in.
+    pub fn gone(&self, i: usize) -> bool {
+        self.ancestors(i).any(|at| self.nodes[at].gone)
     }
 
     /// Whether the node or anything it sits in is disabled.

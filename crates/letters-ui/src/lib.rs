@@ -23,7 +23,7 @@ pub mod widgets;
 mod window;
 
 pub use accesskit::Role;
-pub use element::{Cursor, Element, Paint, Pointer};
+pub use element::{Cursor, Element, Fitted, Paint, Pointer};
 pub use icon::Icon;
 pub use style::{Align, Dir, Edges, Justify, Look, Ring, Style};
 pub use text::{Family, FixedShaper, FontShaper, GlyphRun, Shaped, Stop, TextShaper, TextStyle};

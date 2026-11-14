@@ -6,7 +6,7 @@ use crate::color::fade;
 use crate::element::Element;
 use crate::icon::{self, Icon};
 use crate::style::{Align, Dir, Edges, Look};
-use crate::text::TextStyle;
+use crate::text::{Family, TextStyle};
 use crate::tokens;
 use crate::widgets::Popover;
 
@@ -25,6 +25,7 @@ pub struct MenuItem<M> {
     icon: Option<Icon>,
     aside: Option<String>,
     checked: Option<bool>,
+    face: Family,
     tone: Tone,
     disabled: bool,
     on_select: Option<M>,
@@ -37,6 +38,7 @@ impl<M> MenuItem<M> {
             icon: None,
             aside: None,
             checked: None,
+            face: Family::Sans,
             tone: Tone::Default,
             disabled: false,
             on_select: None,
@@ -57,6 +59,12 @@ impl<M> MenuItem<M> {
     /// Makes the item checkable and says whether it is on.
     pub fn checked(mut self, checked: bool) -> Self {
         self.checked = Some(checked);
+        self
+    }
+
+    /// The family the label is set in, for a menu of fonts that shows each in its own face.
+    pub fn face(mut self, face: Family) -> Self {
+        self.face = face;
         self
     }
 
@@ -207,7 +215,7 @@ fn row<M>(item: MenuItem<M>) -> Element<M> {
     if let Some(icon) = item.icon {
         row = row.child(Element::icon(icon, ICON).fg(fade(fg, 0.7)));
     }
-    row = row.child(Element::text(item.label, TextStyle::control()).grow(1.0));
+    row = row.child(Element::text(item.label, TextStyle::control().family(item.face)).grow(1.0));
     let trailing = Edges::left(tokens::SPACE_XS);
     if let Some(aside) = item.aside {
         let aside = Element::text(aside, TextStyle::control().size(tokens::TEXT_SM)).fg(tokens::FG_MUTED);

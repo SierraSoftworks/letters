@@ -155,6 +155,8 @@ pub struct Style {
     pub overlay: bool,
     /// Filled with the text colour it inherits, as a rule or a tick inside a control is.
     pub inked: bool,
+    /// Shows only the first child that fits the width, or the last when none does.
+    pub fit: bool,
 }
 
 impl Default for Style {
@@ -185,6 +187,7 @@ impl Default for Style {
             scroll: false,
             overlay: false,
             inked: false,
+            fit: false,
         }
     }
 }

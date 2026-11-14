@@ -980,8 +980,25 @@ impl<A: App> Ui<A> {
                 self.stale.layout = false;
                 self.layout();
             }
+            if self.fold() {
+                // A popover hung from something that is no longer shown: build the window without it.
+                self.stale.view = true;
+                return self.refresh();
+            }
             self.update_hover();
         }
+    }
+
+    /// Takes focus and popovers away from what the layout left out, as a bar folding for a narrower window.
+    /// Returns whether a popover was closed.
+    fn fold(&mut self) -> bool {
+        if self.focused().is_some_and(|i| self.tree.gone(i)) {
+            self.focus = self.rest();
+        }
+        let tree = &self.tree;
+        let before = self.open.len();
+        self.open.retain(|id| !tree.find(*id).is_some_and(|i| tree.gone(i)));
+        self.open.len() < before
     }
 
     fn layout(&mut self) {
