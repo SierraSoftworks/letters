@@ -155,13 +155,25 @@ impl Reveal {
         self.of(block).filter(|(sign, _)| sign.place == Place::Block).map(|(sign, level)| (sign.text.as_str(), level))
     }
 
-    /// Where the markers of a text block sit over its layout. `shape` gives a marker's shape and full width.
-    pub fn over(&self, block: &BlockId, layout: &Layout<Brush>, mut shape: impl FnMut(&str) -> (usize, f32)) -> Shifts {
+    /// Where the markers of a text block sit over its layout. `shape` gives a marker's shape and full width,
+    /// and `room` is how much of the margin left of the text is free to hang a marker in.
+    pub fn over(
+        &self,
+        block: &BlockId,
+        layout: &Layout<Brush>,
+        room: f32,
+        mut shape: impl FnMut(&str) -> (usize, f32),
+    ) -> Shifts {
         let mut shifts = Shifts::default();
         for (sign, level) in self.of(block) {
             let (shape, width) = shape(&sign.text);
             match sign.place {
-                Place::Block => shifts.hung.push((shape, level)),
+                Place::Block => {
+                    // What does not fit in the margin pushes the first line, as a marker inside it would.
+                    let short = (width + theme::MARKER_GAP - room).max(0.0);
+                    shifts.indent = shifts.indent.max(short * level);
+                    shifts.hung.push((shape, level));
+                }
                 Place::Inline { offset, before, upstream } => {
                     let affinity = if upstream { Affinity::Upstream } else { Affinity::Downstream };
                     let (line, x) = leaf::spot(layout, offset, affinity);
@@ -195,14 +207,17 @@ pub(crate) struct Shifts {
     inline: Vec<Shown>,
     /// The shape of each marker beside the leaf and how much of it shows.
     pub hung: Vec<(usize, f32)>,
+    /// How far the first line is pushed to make room for the markers hung beside it.
+    pub indent: f32,
 }
 
 /// Positions closer than this are one position.
 const NEAR: f32 = 0.05;
 
 impl Shifts {
+    /// Whether nothing is pushed.
     pub fn is_empty(&self) -> bool {
-        self.inline.is_empty()
+        self.inline.is_empty() && self.indent == 0.0
     }
 
     /// The markers on a line, left to right.
@@ -210,9 +225,20 @@ impl Shifts {
         self.inline.iter().filter(move |shown| shown.line == line)
     }
 
+    /// Whether anything on a line is pushed.
+    pub fn touches(&self, line: usize) -> bool {
+        self.lead(line) > 0.0 || self.on(line).next().is_some()
+    }
+
+    /// How far a whole line is pushed.
+    fn lead(&self, line: usize) -> f32 {
+        if line == 0 { self.indent } else { 0.0 }
+    }
+
     /// How far whatever starts at `x` on a line is pushed. A marker at `x` itself goes before it.
     pub fn push(&self, line: usize, x: f32) -> f32 {
-        self.on(line).filter(|shown| shown.x <= x + NEAR).map(|shown| shown.width).sum()
+        let before = self.on(line).filter(|shown| shown.x <= x + NEAR);
+        self.lead(line) + before.map(|shown| shown.width).sum::<f32>()
     }
 
     /// How far a stretch of a line from `from` to `to` is pushed, and how much wider the markers inside it
@@ -226,13 +252,13 @@ impl Shifts {
     /// How far a caret at a byte offset on a line is pushed.
     pub fn caret(&self, line: usize, offset: usize) -> f32 {
         let ahead = |shown: &&Shown| shown.offset < offset || (shown.offset == offset && shown.before);
-        self.on(line).filter(ahead).map(|shown| shown.width).sum()
+        self.lead(line) + self.on(line).filter(ahead).map(|shown| shown.width).sum::<f32>()
     }
 
     /// Where a point on a pushed line falls in the line as laid out. A point on a marker falls where the
     /// marker starts.
     pub fn pull(&self, line: usize, x: f32) -> f32 {
-        let mut pushed = 0.0;
+        let mut pushed = self.lead(line);
         for shown in self.on(line) {
             if x < shown.x + pushed + shown.width {
                 return (x - pushed).min(shown.x);

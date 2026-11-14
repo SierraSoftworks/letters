@@ -136,7 +136,8 @@ impl DocLayout {
     /// while the caret stays put. Returns whether a marker appears or goes.
     ///
     /// Markers never change the layout. One inside a line pushes the rest of that line aside, past the text
-    /// edge when the line is full, and no other line moves. A heading's hangs left of the text edge, and a
+    /// edge when the line is full, and no other line moves. A heading's hangs left of the text edge, or as
+    /// far left as the bar of the quote or callout around it allows, with its first line making room. A
     /// callout's sits in the corner of its box. [`DocLayout::caret`], [`DocLayout::hit`] and the other
     /// queries answer for the page as drawn, so a caret among markers at its offset sits after the first
     /// `before_caret` of them.
@@ -347,14 +348,16 @@ impl State {
 
     /// The markers revealed in a leaf that holds its layout.
     fn shifts(&mut self, at: usize) -> Shifts {
-        let Self { reveal, shapes, engine, types, leaves, .. } = self;
+        let Self { reveal, shapes, engine, types, leaves, frames, .. } = self;
         let leaf = &leaves[at];
         let (Some(id), Some(laid)) = (&leaf.id, &leaf.laid) else { return Shifts::default() };
         // Code shows its text as written.
         if leaf.what != What::Text || leaf.role == Role::Code {
             return Shifts::default();
         }
-        reveal.over(id, &laid.text, |text| shapes.get(engine, types, leaf.role, false, text))
+        // Inside a quote or callout a marker hangs clear of the bar down its side, never across it.
+        let room = leaf.frame.map_or(f32::INFINITY, |frame| leaf.x - frames[frame].x - theme::BAR - 2.0);
+        reveal.over(id, &laid.text, room, |text| shapes.get(engine, types, leaf.role, false, text))
     }
 
     fn set_tokens(&mut self, block: &BlockId, mut tokens: Vec<Token>) {

@@ -167,8 +167,8 @@ impl Painter<'_> {
         {
             let baseline = first.metrics().baseline;
             self.marker(leaf, laid, baseline);
-            // A heading's marker hangs in the margin, where it pushes nothing.
-            let mut right = leaf.x - theme::MARKER_GAP;
+            // A heading's marker hangs in the margin. Where the margin is too narrow, the line makes room.
+            let mut right = leaf.x - theme::MARKER_GAP + over.shifts.indent;
             for (shape, level) in over.shifts.hung.iter().rev() {
                 let Some(shape) = over.shapes.layout(*shape) else { continue };
                 right -= shape.full_width();
@@ -180,7 +180,7 @@ impl Painter<'_> {
             if leaf.y + metrics.block_max_coord <= top || leaf.y + metrics.block_min_coord >= bottom {
                 continue;
             }
-            let pushed = over.shifts.on(index).next().is_some();
+            let pushed = over.shifts.touches(index);
             // Fills go under every glyph of the line, so one run's fill never covers its neighbour's overhang.
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(run) = item else { continue };

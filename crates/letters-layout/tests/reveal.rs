@@ -212,6 +212,31 @@ fn block_markers_sit_beside_the_text_and_move_nothing() {
 }
 
 #[test]
+fn a_heading_in_a_box_keeps_its_marker_inside() {
+    let cases = [("callout", BlockKind::Callout { tone: Tone::Tip }), ("quote", BlockKind::Quote)];
+    for (name, kind) in cases {
+        let heading = Block::text("a", BlockKind::Heading { level: 3 }, "Rates change on the first of January");
+        let doc = doc(vec![paragraph("p", PROSE), container("c", kind, vec![heading, paragraph("b", PROSE)])]);
+        let mut page = Page::new(&doc, NARROW);
+        let hidden = page.painted();
+        let first = page.layout.caret(&Pos::new("a", 0)).unwrap();
+        assert!(page.click("a", 2), "{name}: the heading's marker appears");
+        let shown = page.painted();
+
+        let [(line, left)] = markers(&shown)[..] else { panic!("{name}: one marker shows") };
+        // The box starts at the page's left edge, and the bar down its side is 3 wide.
+        assert!(left > 3.0, "{name}: the marker stays clear of the bar, not at {left}");
+        assert!(page.layout.caret(&Pos::new("a", 0)).unwrap().x > first.x, "{name}: its line makes room");
+        let moved: Vec<(f32, f32)> = pushes(&hidden, &shown).into_iter().filter(|push| push.1 != 0.0).collect();
+        assert!(!moved.is_empty(), "{name}: the heading moves over");
+        assert!(moved.iter().all(|push| push.0 == line && push.1 > 0.0), "{name}: and only its first line does");
+        let glyphs = text(&shown);
+        let heading = glyphs.iter().filter(|glyph| glyph.2 == line).map(|glyph| glyph.1).fold(f32::MAX, f32::min);
+        assert!(left < heading, "{name}: the marker comes before the heading");
+    }
+}
+
+#[test]
 fn progress_fades_markers_and_slides_the_line() {
     let mut page = Page::new(&sentence(&[Mark::Bold]), NARROW);
     let hidden = page.painted();
@@ -292,23 +317,21 @@ fn line_edges_stay_on_their_line() {
 const WORDS: [&str; 8] = ["rates", "change", "on", "the", "first", "of", "January", "household"];
 const MARKS: [Mark; 4] = [Mark::Bold, Mark::Italic, Mark::Strike, Mark::Code];
 
-/// A few blocks of marked text: paragraphs, headings and paragraphs inside callouts.
+/// A few blocks of marked text: paragraphs and headings, some of them inside callouts.
 fn documents() -> impl Strategy<Value = Document> {
     let words = prop::collection::vec(prop::sample::select(WORDS.to_vec()), 1..5);
     let run = (words, prop::sample::subsequence(MARKS.to_vec(), 0..=2))
         .prop_map(|(words, marks)| Run::marked(words.join(" ") + " ", marks));
-    let block = (0..4u8, prop::collection::vec(run, 1..6));
+    let block = (0..5u8, prop::collection::vec(run, 1..6));
     prop::collection::vec(block, 1..4).prop_map(|blocks| {
         let blocks = blocks.into_iter().enumerate().map(|(index, (kind, runs))| {
             let id = format!("b{index}");
             let text = |kind| Block { body: Body::Text(runs.clone()), ..Block::new(id.as_str(), kind) };
+            let boxed = |inside| container(&format!("c{index}"), BlockKind::Callout { tone: Tone::Info }, vec![inside]);
             match kind {
                 0 => text(BlockKind::Heading { level: 2 }),
-                1 => container(
-                    &format!("c{index}"),
-                    BlockKind::Callout { tone: Tone::Info },
-                    vec![text(BlockKind::Paragraph)],
-                ),
+                1 => boxed(text(BlockKind::Paragraph)),
+                2 => boxed(text(BlockKind::Heading { level: 3 })),
                 _ => text(BlockKind::Paragraph),
             }
         });
