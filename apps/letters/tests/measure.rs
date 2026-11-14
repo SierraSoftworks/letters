@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use letters::launch::{BUDGET, Bench, FIRST_FRAME, Launch};
+use letters::measure::{BUDGET, Bench, FIRST_FRAME, KEYSTROKE, KEYSTROKE_P99, Launch, Typing};
 
 #[test]
 fn a_report_lists_each_stage_and_the_verdict() {
@@ -43,10 +43,33 @@ fn a_bench_times_each_launch_and_fails_when_one_paints_nothing() {
     let silent = script("silent", "exit 0");
     let crashes = script("crashes", "echo 'first frame'; exit 3");
 
-    let bench = letters::launch::bench(&paints, None, true, 3).unwrap();
+    let bench = letters::measure::bench(&paints, None, true, 3).unwrap();
     assert_eq!(bench.runs.len(), 3);
     assert!(bench.runs.is_sorted());
-    assert!(letters::launch::bench(&silent, None, false, 1).is_err());
-    assert!(letters::launch::bench(&crashes, None, false, 1).is_err());
+    assert!(letters::measure::bench(&silent, None, false, 1).is_err());
+    assert!(letters::measure::bench(&crashes, None, false, 1).is_err());
     std::fs::remove_dir_all(&folder).unwrap();
+}
+
+#[test]
+fn typing_is_judged_on_its_median_and_its_slowest_keystroke_in_a_hundred() {
+    let ms = Duration::from_millis;
+    let (fast, slow, stalled) = (KEYSTROKE / 2, KEYSTROKE + ms(1), KEYSTROKE_P99 + ms(1));
+    let cases = [
+        ("every keystroke fast", vec![(fast, 200)], true),
+        ("one stall in two hundred", vec![(fast, 199), (stalled, 1)], true),
+        ("stalls in more than one in a hundred", vec![(fast, 195), (stalled, 5)], false),
+        ("mostly slow", vec![(slow, 150), (fast, 50)], false),
+    ];
+    for (case, groups, within) in cases {
+        let mut typing = Typing::default();
+        for (keystroke, count) in groups {
+            (0..count).for_each(|_| typing.record(keystroke));
+        }
+        assert_eq!(typing.len(), 200);
+        assert_eq!(typing.within_budget(), within, "{case}");
+        assert!(typing.percentile(50) <= typing.percentile(99) && typing.percentile(99) <= typing.percentile(100));
+        assert!(typing.report("CPU").contains("CPU"));
+    }
+    assert!(Typing::default().is_empty());
 }

@@ -1,7 +1,8 @@
-//! Measures launch: how long it takes from starting the app to a document painted on screen.
+//! Measures the app against its performance budgets.
 //!
-//! - [`Launch`] times the stages inside one run, for `--launch-report`.
+//! - [`Launch`] times the stages from starting the app to a painted document, for `--launch-report`.
 //! - [`bench`] launches the app repeatedly and checks the result against the budget, for `--bench-launch`.
+//! - [`Typing`] collects how long each keystroke takes to reach a frame, for `--typing-report`.
 
 use std::fmt::Write as _;
 use std::io::{self, BufRead, BufReader, Read};
@@ -11,6 +12,11 @@ use std::time::{Duration, Instant};
 
 /// Cold launch to the first painted document, on the reference machine (a MacBook Pro with the M1 Pro).
 pub const BUDGET: Duration = Duration::from_millis(150);
+
+/// A keystroke to its frame submitted, at the median.
+pub const KEYSTROKE: Duration = Duration::from_millis(8);
+/// The same, for the slowest keystroke in a hundred.
+pub const KEYSTROKE_P99: Duration = Duration::from_millis(16);
 
 /// The line a `--launch-report` run prints the moment its first frame is on screen.
 pub const FIRST_FRAME: &str = "first frame";
@@ -111,4 +117,53 @@ pub fn bench(program: &Path, file: Option<&Path>, headless: bool, runs: u32) -> 
     }
     times.sort();
     Ok(Bench { runs: times })
+}
+
+/// How long keystrokes took to reach a submitted frame.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Typing {
+    samples: Vec<Duration>,
+}
+
+impl Typing {
+    pub fn record(&mut self, keystroke: Duration) {
+        let at = self.samples.partition_point(|sample| *sample <= keystroke);
+        self.samples.insert(at, keystroke);
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    /// The keystroke that `percent` of the others were at least as fast as. Zero with no samples.
+    pub fn percentile(&self, percent: usize) -> Duration {
+        let rank = (self.samples.len() * percent).div_ceil(100).max(1);
+        self.samples.get(rank - 1).copied().unwrap_or_default()
+    }
+
+    pub fn within_budget(&self) -> bool {
+        self.percentile(50) <= KEYSTROKE && self.percentile(99) <= KEYSTROKE_P99
+    }
+
+    /// `renderer` says what painted the frames, such as `CPU`.
+    pub fn report(&self, renderer: &str) -> String {
+        let verdict = |within| if within { "within" } else { "over" };
+        let (median, p99) = (self.percentile(50), self.percentile(99));
+        format!(
+            "{} keystrokes on the {renderer}: median {:.2} ms, p99 {:.2} ms, slowest {:.2} ms\n\
+             median is {} the {:.0} ms budget, p99 is {} the {:.0} ms budget\n",
+            self.len(),
+            ms(median),
+            ms(p99),
+            ms(self.percentile(100)),
+            verdict(median <= KEYSTROKE),
+            ms(KEYSTROKE),
+            verdict(p99 <= KEYSTROKE_P99),
+            ms(KEYSTROKE_P99),
+        )
+    }
 }

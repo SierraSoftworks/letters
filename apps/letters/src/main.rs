@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use letters::cli::{self, Command, Mode};
-use letters::launch::{self, FIRST_FRAME, Launch};
+use letters::measure::{self, Launch};
 
 fn main() -> ExitCode {
     let launch = Launch::start();
@@ -25,16 +25,13 @@ fn main() -> ExitCode {
 
     let result = match options.mode {
         Mode::BenchLaunch { runs } => std::env::current_exe()
-            .and_then(|program| launch::bench(&program, options.file.as_deref(), options.headless, runs))
+            .and_then(|program| measure::bench(&program, options.file.as_deref(), options.headless, runs))
             .map_err(Into::into)
             .map(|bench| {
                 print!("{}", bench.report());
                 bench.within_budget()
             }),
-        _ if options.headless => letters::app::run_headless(&options, launch).map(|launch| {
-            println!("{FIRST_FRAME}\n{}", launch.report());
-            true
-        }),
+        _ if options.headless => letters::app::run_headless(&options, launch),
         _ => letters::app::run(options, launch).map(|()| true),
     };
     match result {

@@ -17,6 +17,8 @@ fn arguments_select_a_file_and_a_mode() {
         ("--launch-report notes.let", run(file("notes.let"), Mode::LaunchReport, false)),
         ("notes.let --bench-launch --headless", run(file("notes.let"), Mode::BenchLaunch { runs: 20 }, true)),
         ("--bench-launch=5 notes.let", run(file("notes.let"), Mode::BenchLaunch { runs: 5 }, false)),
+        ("--typing-report notes.let", run(file("notes.let"), Mode::TypingReport { keys: 200 }, false)),
+        ("--typing-report=50 --headless", run(None, Mode::TypingReport { keys: 50 }, true)),
         ("-- --odd-name.let", run(file("--odd-name.let"), Mode::Edit, false)),
         ("--version", Ok(Command::Version)),
         ("notes.let -h", Ok(Command::Help)),
@@ -28,7 +30,14 @@ fn arguments_select_a_file_and_a_mode() {
 
 #[test]
 fn bad_arguments_are_refused() {
-    for line in ["--frobnicate", "a.let b.let", "--bench-launch=0", "--bench-launch=many", "--headless a.let"] {
+    for line in [
+        "--frobnicate",
+        "a.let b.let",
+        "--bench-launch=0",
+        "--bench-launch=many",
+        "--typing-report=-1",
+        "--headless a.let",
+    ] {
         assert!(parse(args(line)).is_err(), "{line:?}");
     }
 }

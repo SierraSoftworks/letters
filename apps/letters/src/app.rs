@@ -27,7 +27,7 @@ use crate::cli::{Mode, Options};
 use crate::files::{self, EXTENSION, Home, Opened};
 use crate::gpu::Gpu;
 use crate::input::{self, Composer, Press};
-use crate::launch::{FIRST_FRAME, Launch};
+use crate::measure::{self, FIRST_FRAME, Launch, Typing};
 use crate::platform::Desktop;
 use crate::present::{Painter, Presenter};
 use crate::view::{self, Cursor, View};
@@ -38,6 +38,8 @@ const UNTITLED: &str = "Untitled";
 const SAVE_AFTER: Duration = Duration::from_millis(800);
 /// How long to wait before trying a failed save again.
 const RETRY_AFTER: Duration = Duration::from_secs(5);
+/// The gap between the keystrokes of a typing report, long enough that no frame waits on the one before.
+const TYPING_GAP: Duration = Duration::from_millis(20);
 /// The distance one notch of a mouse wheel scrolls, in logical pixels.
 const WHEEL_LINE: f32 = 40.0;
 const WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1100.0, 800.0);
@@ -66,6 +68,10 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
     let mut app = App {
         starting: true,
         report_launch: options.mode == Mode::LaunchReport,
+        typing: match options.mode {
+            Mode::TypingReport { keys } => Some(TypingRun { keys, stats: Typing::default(), typed: None, next: None }),
+            _ => None,
+        },
         launch: Some(launch),
         reading,
         path: options.file,
@@ -84,8 +90,9 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
     app.failure.map_or(Ok(()), |failure| Err(failure.into()))
 }
 
-/// Opens the document and paints its first frame into memory, as [`run`] would into a window.
-pub fn run_headless(options: &Options, mut launch: Launch) -> Result<Launch, Box<dyn Error>> {
+/// Opens the document and paints into memory, as [`run`] would into a window, then prints the report the
+/// mode asks for. Returns whether the budget was met.
+pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<dyn Error>> {
     let (document, style) = match &options.file {
         Some(path) => {
             let opened = files::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -104,15 +111,34 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<Launch, Box
     view.paint(&mut list);
     launch.mark("display list");
     let mut pixels = vec![0; (width * height) as usize];
-    Painter::new().paint(&list, &Images::default(), scale as f32, view::PAGE, width, &mut pixels);
+    let mut painter = Painter::new();
+    painter.paint(&list, &Images::default(), scale as f32, view::PAGE, width, &mut pixels);
     launch.mark(FIRST_FRAME);
-    Ok(launch)
+    let Mode::TypingReport { keys } = options.mode else {
+        println!("{FIRST_FRAME}\n{}", launch.report());
+        return Ok(launch.total() <= measure::BUDGET);
+    };
+
+    let mut platform = Desktop::new();
+    let mut typing = Typing::default();
+    for _ in 0..keys {
+        let typed = Instant::now();
+        view.input(InputEvent::Insert("a".into()), &mut platform);
+        list.items.clear();
+        view.paint(&mut list);
+        painter.paint(&list, &Images::default(), scale as f32, view::PAGE, width, &mut pixels);
+        typing.record(typed.elapsed());
+    }
+    print!("{}", typing.report("CPU"));
+    Ok(typing.within_budget())
 }
 
 struct App {
     /// Whether the first window is still to open.
     starting: bool,
     report_launch: bool,
+    /// The typing report in progress, in that mode.
+    typing: Option<TypingRun>,
     /// The stopwatch, until the first frame is on screen.
     launch: Option<Launch>,
     reading: Option<JoinHandle<Result<Opened, files::Error>>>,
@@ -124,6 +150,16 @@ struct App {
     mods: ModifiersState,
     /// Why the app is exiting, when it is not by choice.
     failure: Option<String>,
+}
+
+/// A typing report: the app types into its own window and times each keystroke to its frame.
+struct TypingRun {
+    keys: u32,
+    stats: Typing,
+    /// When the keystroke now waiting for its frame was typed.
+    typed: Option<Instant>,
+    /// When to type the next one. `None` until the window has its first frame and its final renderer.
+    next: Option<Instant>,
 }
 
 /// Where the GPU stands. Windows paint on the CPU in every state but the last.
@@ -389,7 +425,8 @@ impl App {
             gpu_offered: false,
             access_stale: false,
             wake_ms: None,
-            home,
+            // A typing report must leave the file as it found it.
+            home: home.filter(|_| self.typing.is_none()),
             saved_edits: 0,
             noticed_edits: 0,
             save_at: None,
@@ -513,6 +550,20 @@ impl ApplicationHandler<Event> for App {
                         println!("{FIRST_FRAME}\n{}", launch.report());
                         return event_loop.exit();
                     }
+                }
+                if let Some(run) = &mut self.typing
+                    && let Some(typed) = run.typed.take()
+                {
+                    run.stats.record(typed.elapsed());
+                    if run.stats.len() as u32 == run.keys {
+                        let renderer = if window.presenter.on_gpu() { "GPU" } else { "CPU" };
+                        print!("{}", run.stats.report(renderer));
+                        if !run.stats.within_budget() {
+                            self.failure = Some("typing is over its budget".into());
+                        }
+                        return event_loop.exit();
+                    }
+                    run.next = Some(Instant::now() + TYPING_GAP);
                 }
                 // A frame is on screen, so the GPU can now be brought in without holding anything up.
                 match &mut self.gpu {
@@ -640,10 +691,21 @@ impl ApplicationHandler<Event> for App {
             if window.save_at.is_some_and(|at| at <= now) {
                 window.start_save(&self.proxy);
             }
+            if let Some(run) = &mut self.typing {
+                // Typing starts once the window is on the renderer it will stay on.
+                let settled = self.launch.is_none() && (window.gpu_offered || matches!(self.gpu, GpuState::Off));
+                if settled && run.typed.is_none() && run.next.is_none_or(|next| next <= now) {
+                    run.typed = Some(Instant::now());
+                    run.next = None;
+                    window.view.input(InputEvent::Insert("a".into()), &mut self.platform);
+                    window.sync(now);
+                }
+            }
             let wake = window.wake_ms.map(|ms| self.platform.instant(ms));
             // A save that is due but waiting on another needs no timer: that save's end wakes the loop.
             let save = window.save_at.filter(|_| window.saving.is_none());
-            for due in [wake, save].into_iter().flatten() {
+            let type_next = self.typing.as_ref().and_then(|run| run.next);
+            for due in [wake, save, type_next].into_iter().flatten() {
                 next = Some(next.map_or(due, |next| next.min(due)));
             }
         }
