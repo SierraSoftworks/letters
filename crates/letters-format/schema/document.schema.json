@@ -58,6 +58,7 @@
           "if": { "properties": { "type": { "const": "code" } } },
           "then": {
             "$ref": "#/$defs/text",
+            "description": "The text is the code, its lines joined by a line feed with none after the last.",
             "properties": { "language": { "type": "string", "description": "Kept as written." } }
           }
         },
@@ -76,7 +77,7 @@
       ]
     },
     "text": {
-      "description": "A block that holds text.",
+      "description": "A block that holds text. A line feed in the text of a paragraph, heading or list item is a hard line break.",
       "properties": { "content": { "$ref": "#/$defs/runs" } }
     },
     "container": {

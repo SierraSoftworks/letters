@@ -15,7 +15,6 @@ Rates change on **1 January**. See the [notice](https://example.com/notice) from
 fn rate() -> f32 {
     4.5
 }
-
 ```
 
 > Fair, and early.

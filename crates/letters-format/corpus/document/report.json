@@ -126,7 +126,7 @@
       "language": "rust",
       "content": [
         {
-          "text": "fn rate() -> f32 {\n    4.5\n}\n"
+          "text": "fn rate() -> f32 {\n    4.5\n}"
         }
       ]
     },
