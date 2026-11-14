@@ -21,6 +21,8 @@ pub struct TextField<M> {
     disabled: bool,
     on_input: Option<Rc<dyn Fn(String) -> M>>,
     on_submit: Option<M>,
+    on_leave: Option<M>,
+    on_cancel: Option<M>,
 }
 
 impl<M> TextField<M> {
@@ -36,6 +38,8 @@ impl<M> TextField<M> {
             disabled: false,
             on_input: None,
             on_submit: None,
+            on_leave: None,
+            on_cancel: None,
         }
     }
 
@@ -77,6 +81,20 @@ impl<M> TextField<M> {
         self.on_submit = Some(message);
         self
     }
+
+    /// Sent when focus leaves the field, or the popover it is in closes under it: the moment to take or drop
+    /// what was typed.
+    pub fn on_leave(mut self, message: M) -> Self {
+        self.on_leave = Some(message);
+        self
+    }
+
+    /// Sent when Escape is pressed in the field, before anything else Escape does: the moment to drop what
+    /// was typed. Focus then goes back to where it rests, unless Escape closed a popover.
+    pub fn on_cancel(mut self, message: M) -> Self {
+        self.on_cancel = Some(message);
+        self
+    }
 }
 
 impl<M> From<TextField<M>> for Element<M> {
@@ -105,6 +123,8 @@ impl<M> From<TextField<M>> for Element<M> {
             style,
             on_input: field.on_input,
             on_submit: field.on_submit,
+            on_leave: field.on_leave,
+            on_cancel: field.on_cancel,
         })
         .height(field.size.height())
         .padding(Edges::xy(padding, 0.0))

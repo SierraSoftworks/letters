@@ -45,6 +45,8 @@ pub const HISTORY: Icon = Icon::new("M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.
 pub const INFO: Icon = Icon::new("M2 12a10 10 0 1 0 20 0a10 10 0 1 0 -20 0M12 16v-4M12 8h.01");
 /// `italic`
 pub const ITALIC: Icon = Icon::new("M19 4L10 4M14 20L5 20M15 4L9 20");
+/// `line-height`
+pub const LINE_HEIGHT: Icon = Icon::new("M15 14H9M21 21H3M21 3H3M8 16l3.453-7.648a.6.6 0 011.094.001L16 16");
 /// `link`
 pub const LINK: Icon = Icon::new("M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71");
 /// `list-tree`
@@ -81,6 +83,8 @@ pub const TEXT_ALIGN_JUSTIFY: Icon = Icon::new("M3 5h18M3 12h18M3 19h18");
 pub const TEXT_ALIGN_START: Icon = Icon::new("M21 5H3M15 12H3M17 19H3");
 /// `trash-2`
 pub const TRASH_2: Icon = Icon::new("M10 11v6M14 11v6M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2");
+/// `type`
+pub const TYPE: Icon = Icon::new("M12 4v16M4 7V5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2M9 20h6");
 /// `underline`
 pub const UNDERLINE: Icon = Icon::new("M6 4v6a6 6 0 0 0 12 0V4M4 20L20 20");
 /// `undo-2`

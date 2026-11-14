@@ -532,10 +532,24 @@ impl<A: App> Ui<A> {
     fn route(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
         let focused = self.focused();
         let plain = !event.mods.primary && !event.mods.alt;
-        // Escape closes the topmost popover before it means anything else.
-        if let (Key::Escape, Some(top)) = (&event.key, self.tree.top_layer()) {
-            self.close_layer(top);
-            return true;
+        if event.key == Key::Escape {
+            // A field drops what was typed into it, and then Escape closes the topmost popover before it
+            // means anything else.
+            let dropped = focused.and_then(|i| match &self.tree.nodes[i].el.content {
+                Content::Input(input) => input.on_cancel.clone(),
+                _ => None,
+            });
+            let cancelled = dropped.is_some();
+            self.queue.extend(dropped);
+            if let Some(top) = self.tree.top_layer() {
+                self.close_layer(top);
+                return true;
+            }
+            if cancelled {
+                self.set_focus(self.rest(), false);
+                self.stale.view = true;
+                return true;
+            }
         }
         let on_page = focused.is_none_or(|i| matches!(self.tree.nodes[i].el.content, Content::Canvas(_)));
         if on_page && self.offer(event, platform) {
@@ -850,7 +864,18 @@ impl<A: App> Ui<A> {
         }
     }
 
+    /// Tells a field that focus is leaving it.
+    fn leave(&mut self, i: usize) {
+        if let Content::Input(input) = &self.tree.nodes[i].el.content {
+            self.queue.extend(input.on_leave.clone());
+            self.stale.view |= input.on_leave.is_some();
+        }
+    }
+
     fn close_layer(&mut self, layer: usize) {
+        if let Some(focus) = self.focused().filter(|&i| self.tree.in_layer(i, layer)) {
+            self.leave(focus);
+        }
         let layer = &self.tree.layers[layer];
         if layer.controlled {
             self.queue.extend(layer.on_close.clone());
@@ -894,6 +919,9 @@ impl<A: App> Ui<A> {
         if let Some(state) = self.focus.and_then(|old| self.inputs.get_mut(&old)) {
             state.composing = None;
             self.stale.layout = true;
+        }
+        if let Some(old) = self.focused() {
+            self.leave(old);
         }
         self.focus = id;
         self.restart_blink();
