@@ -1,11 +1,11 @@
 //! What the browser lends the editor: a clock, identifiers, the clipboard for as long as a clipboard event
-//! lasts, and the fonts.
+//! lasts, somewhere to keep the person's own words, and the fonts.
 
 use js_sys::{Promise, Uint8Array};
 use letters_editor::{Clip, Platform, block_id};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Crypto, Performance, Response, Window};
+use web_sys::{Crypto, Performance, Response, Storage, Window};
 
 /// Fetches the font files from under `base`, a URL that ends in a slash, all at once. A page that preloads
 /// them has them here by the time the wasm is running.
@@ -24,9 +24,14 @@ pub async fn fonts(window: &Window, base: &str) -> Result<Vec<Vec<u8>>, JsValue>
     Ok(fonts)
 }
 
+/// Where this browser keeps the person's own words, a line each, as their dictionary file does elsewhere.
+const WORDS: &str = "letters.words";
+
 pub struct Browser {
     performance: Performance,
     crypto: Crypto,
+    /// `None` where the person has turned the page's storage off.
+    storage: Option<Storage>,
     /// What a `paste` event brought, for the editor to read while it handles that event.
     pub pasted: Option<Clip>,
     /// What the editor copied, for the `copy` or `cut` event that asked for it to carry away.
@@ -36,7 +41,14 @@ pub struct Browser {
 impl Browser {
     pub fn new(window: &Window) -> Result<Self, JsValue> {
         let performance = window.performance().ok_or("this browser has no clock")?;
-        Ok(Self { performance, crypto: window.crypto()?, pasted: None, copied: None })
+        let storage = window.local_storage().ok().flatten();
+        Ok(Self { performance, crypto: window.crypto()?, storage, pasted: None, copied: None })
+    }
+
+    /// The words the person has added to their own dictionary in this browser.
+    pub fn user_words(&self) -> Vec<String> {
+        let kept = self.storage.as_ref().and_then(|storage| storage.get_item(WORDS).ok().flatten());
+        kept.unwrap_or_default().lines().map(str::to_owned).collect()
     }
 
     /// Milliseconds since the page started loading, to a fraction.
@@ -63,5 +75,17 @@ impl Platform for Browser {
         let mut bytes = [0; 10];
         self.crypto.get_random_values_with_u8_array(&mut bytes).expect("the browser has a source of randomness");
         block_id(bytes)
+    }
+
+    fn learn_word(&mut self, word: &str) {
+        let mut words = self.user_words();
+        if words.iter().any(|known| known == word) {
+            return;
+        }
+        words.push(word.to_owned());
+        // Storage that is full or turned off keeps nothing, and the word still holds until the page closes.
+        if let Some(storage) = &self.storage {
+            let _ = storage.set_item(WORDS, &words.join("\n"));
+        }
     }
 }

@@ -50,6 +50,16 @@ impl Letters {
         Ok(())
     }
 
+    /// Everything this page knows of the document, for another replica of it to merge.
+    pub fn history(&self) -> Vec<u8> {
+        self.shell.borrow().history()
+    }
+
+    /// Takes in what another replica of the document wrote, as its `history()` gives it.
+    pub fn merge(&self, history: &[u8]) -> Result<(), JsValue> {
+        self.shell.borrow_mut().merge(history).map_err(|error| JsError::new(&error.to_string()).into())
+    }
+
     /// How many frames have been painted.
     #[wasm_bindgen(getter)]
     pub fn frames(&self) -> u32 {

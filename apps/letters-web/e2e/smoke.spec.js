@@ -2,17 +2,7 @@
 
 import { expect, test } from "@playwright/test";
 
-/** The document on screen, one entry per block: its type and its text. */
-const blocks = (page) =>
-  page.evaluate(() =>
-    JSON.parse(window.letters.json()).blocks.map((block) => ({
-      type: block.type,
-      text: (block.content ?? []).map((run) => run.text).join(""),
-    })),
-  );
-
-const texts = async (page) => (await blocks(page)).map((block) => block.text);
-const frames = (page) => page.evaluate(() => window.letters.frames);
+import { blocks, frames, ready, texts } from "./page.js";
 
 /** How many different colours the canvas shows, from a sample of its pixels. */
 const colours = (page) =>
@@ -33,10 +23,7 @@ const compose = (page, type, text) =>
     [type, text],
   );
 
-test.beforeEach(async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(() => window.letters?.frames > 0);
-});
+test.beforeEach(({ page }) => ready(page));
 
 test("boots to a painted document that fills the page", async ({ page }) => {
   const size = await page.evaluate(() => {

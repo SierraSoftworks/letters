@@ -9,11 +9,11 @@ use std::rc::{Rc, Weak};
 
 use js_sys::{Function, Object, Reflect};
 use letters_editor::{Clip, Editor, Platform as _};
-use letters_model::{Block, BlockId, BlockKind, Document, Pos, ReplicaId, Selection, Style};
+use letters_model::{Block, BlockId, BlockKind, Document, HistoryError, Pos, ReplicaId, Selection, Style};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Rect, Size};
-use letters_ui::{Cursor, Keys, Scheme, Window as View, tokens};
+use letters_ui::{Cursor, Keys, Request, Scheme, Window as View, tokens};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use web_sys::{
@@ -26,7 +26,6 @@ use crate::input::{Clipboard, Dom, Held, Reply, TextInput, modifiers};
 
 /// The distance one line of a mouse wheel scrolls, in logical pixels.
 const WHEEL_LINE: f32 = 40.0;
-const UNTITLED: &str = "Untitled";
 /// The hidden input: on the page, so it can take focus and anchor the input method, and invisible. The
 /// font size keeps phones from zooming in on it.
 const HIDDEN: &str = "position:fixed;width:1px;padding:0;border:0;margin:0;outline:0;resize:none;overflow:hidden;\
@@ -61,6 +60,7 @@ pub struct Shell {
     context: CanvasRenderingContext2d,
     input: HtmlTextAreaElement,
     dark_mode: Option<MediaQueryList>,
+    less_motion: Option<MediaQueryList>,
     on_frame: Function,
     on_wake: Function,
 
@@ -113,6 +113,7 @@ impl Shell {
         let mut platform = Browser::new(&window)?;
         let mac = window.navigator().platform().is_ok_and(|name| name.starts_with("Mac") || name.starts_with("iP"));
         let dark_mode = window.match_media("(prefers-color-scheme: dark)")?;
+        let less_motion = window.match_media("(prefers-reduced-motion: reduce)")?;
         let view = view(welcome(&mut platform), &mut platform, mac);
 
         let shell = Rc::new_cyclic(|shell| {
@@ -124,6 +125,7 @@ impl Shell {
                 context,
                 input: input.clone(),
                 dark_mode: dark_mode.clone(),
+                less_motion: less_motion.clone(),
                 view,
                 platform,
                 text: TextInput::new(mac),
@@ -154,6 +156,10 @@ impl Shell {
         hear(&shell, &canvas, "pointercancel", Self::pointer_up)?;
         hear(&shell, &canvas, "pointerleave", |shell, _: Event| shell.view.pointer_leave())?;
         hear(&shell, &canvas, "wheel", Self::wheel)?;
+        // The secondary button, Ctrl with a press on a Mac and a long press on a touch screen all ask for
+        // a menu this way. The Menu key and Shift+F10 ask the element that has the keyboard.
+        hear(&shell, &canvas, "contextmenu", Self::menu)?;
+        hear(&shell, &input, "contextmenu", Self::menu_key)?;
         hear(&shell, &input, "keydown", Self::key_down)?;
         hear(&shell, &input, "beforeinput", Self::before_input)?;
         hear(&shell, &input, "input", Self::input)?;
@@ -165,8 +171,10 @@ impl Shell {
         hear(&shell, &input, "focus", |shell, _: Event| shell.view.focus(true))?;
         hear(&shell, &input, "blur", |shell, _: Event| shell.view.focus(false))?;
         hear(&shell, &window, "resize", |shell, _: Event| shell.fit())?;
-        if let Some(dark_mode) = &dark_mode {
-            hear(&shell, dark_mode, "change", |shell, _: Event| shell.fit())?;
+        // Another tab of the editor may have added to the person's words.
+        hear(&shell, &window, "storage", |shell, _: Event| shell.view.set_user_words(shell.platform.user_words()))?;
+        for setting in [&dark_mode, &less_motion].into_iter().flatten() {
+            hear(&shell, setting, "change", |shell, _: Event| shell.fit())?;
         }
 
         input.focus()?;
@@ -190,6 +198,19 @@ impl Shell {
         self.show();
     }
 
+    /// Everything this replica knows of the document, for another replica to merge.
+    pub fn history(&self) -> Vec<u8> {
+        self.view.editor().model().save()
+    }
+
+    /// Takes in what another replica wrote, as [`Shell::history`] gives it. The page stays where it is
+    /// scrolled to, and the caret stays with its text.
+    pub fn merge(&mut self, history: &[u8]) -> Result<(), HistoryError> {
+        self.view.change(|editor| editor.merge(history))?;
+        self.sync();
+        Ok(())
+    }
+
     /// Brings a new view to the canvas.
     fn show(&mut self) {
         let active = self.window.document().and_then(|page| page.active_element());
@@ -211,6 +232,7 @@ impl Shell {
         }
         self.scale = scale;
         self.view.set_dark(self.dark());
+        self.view.set_reduced_motion(self.less_motion.as_ref().is_some_and(MediaQueryList::matches));
         self.view.resize(size, scale);
     }
 
@@ -220,6 +242,18 @@ impl Shell {
 
     /// Brings everything outside the canvas up to date with the view, after any event.
     fn sync(&mut self) {
+        for request in self.view.take_requests() {
+            match request {
+                Request::Named(name) => {
+                    self.view.set_document_name(&name);
+                    if let Some(page) = self.window.document() {
+                        page.set_title(&name);
+                    }
+                }
+                // There are no files to open or start until the page has a server behind it.
+                Request::Open(_) | Request::OpenDialog | Request::New => {}
+            }
+        }
         if self.view.needs_paint() && !self.frame_due {
             self.frame_due = self.window.request_animation_frame(&self.on_frame).is_ok();
         }
@@ -370,6 +404,18 @@ impl Shell {
         }
     }
 
+    fn menu(&mut self, event: MouseEvent) {
+        // The browser's own menu offers nothing for a canvas but saving it as a picture.
+        event.prevent_default();
+        self.pointer = Point { x: event.offset_x() as f32, y: event.offset_y() as f32 };
+        self.view.secondary_down(self.pointer, &mut self.platform);
+    }
+
+    fn menu_key(&mut self, event: Event) {
+        event.prevent_default();
+        self.view.menu_key(&mut self.platform);
+    }
+
     fn wheel(&mut self, event: WheelEvent) {
         // Ctrl with the wheel zooms the page, and so does a pinch, which arrives the same way.
         if event.ctrl_key() {
@@ -390,7 +436,7 @@ fn view(document: Document, platform: &mut Browser, mac: bool) -> View {
     let end = document.blocks.last().map(|block| Pos::new(block.id.clone(), usize::MAX));
     let mut view = View::new(Editor::new(document, ReplicaId::new(&platform.new_id())), Style::default());
     view.set_keys(if mac { Keys::Mac } else { Keys::Standard });
-    view.set_document_name(UNTITLED);
+    view.set_user_words(platform.user_words());
     if let Some(end) = end {
         view.select(Selection::caret(end));
     }
