@@ -1,5 +1,6 @@
 //! A frame kept between renders is repainted only where its display list changed, and always ends up
-//! showing what a fresh frame would.
+//! showing what a fresh frame would. Pixels that only moved up or down are moved, not repainted: a fresh
+//! render may round those differently, by one step at most.
 
 mod common;
 
@@ -70,8 +71,8 @@ fn caret(x: f32, row: usize) -> Item {
 fn a_change_repaints_only_its_own_part_of_the_frame() {
     let swatch = || image(8, 8, |x, y| Color::rgb(30 * x as u8, 30 * y as u8, 120));
     let picture = || Item::Image { rect: Rect::new(150.0, 100.0, 60.0, 40.0), asset: "swatch".into() };
-    let shadow = |y| Item::Shadow {
-        rect: Rect::new(140.0, y, 80.0, 30.0),
+    let shadow = |x, y| Item::Shadow {
+        rect: Rect::new(x, y, 80.0, 30.0),
         color: Color::rgba(0, 0, 0, 120),
         blur: 10.0,
         offset: Point { x: 0.0, y: 3.0 },
@@ -108,7 +109,7 @@ fn a_change_repaints_only_its_own_part_of_the_frame() {
             ),
         ),
         ("a line removed", (page(&LINES), none()), (page(&LINES[..6]), none())),
-        ("a shadow moving", (with(vec![shadow(60.0)]), none()), (with(vec![shadow(90.0)]), none())),
+        ("a shadow moving", (with(vec![shadow(140.0, 60.0)]), none()), (with(vec![shadow(136.0, 70.0)]), none())),
         ("an image being decoded", (with(vec![picture()]), none()), (with(vec![picture()]), decoded.clone())),
         ("an image being replaced", (with(vec![picture()]), decoded.clone()), (with(vec![picture()]), replaced)),
         (
@@ -166,9 +167,9 @@ fn what_cannot_be_patched_is_repainted_whole() {
     assert!(kept.frame == kept.fresh(&clipped(200.0), &none), "the new clip shows");
 
     kept.render(&scene(), &none);
-    let scrolled = list(page(&LINES).into_iter().map(|item| moved(item, 0.0, -7.0)).collect::<Vec<_>>());
-    assert_eq!(kept.render(&scrolled, &none).rects(), whole(&kept.frame), "everything moved");
-    assert!(kept.frame == kept.fresh(&scrolled, &none), "the moved page shows");
+    let aside = list(page(&LINES).into_iter().map(|item| moved(item, 7.0, 0.0)).collect::<Vec<_>>());
+    assert_eq!(kept.render(&aside, &none).rects(), whole(&kept.frame), "everything moved sideways");
+    assert!(kept.frame == kept.fresh(&aside, &none), "the moved page shows");
 
     let mut other = Frame::new(WIDTH, HEIGHT);
     kept.render(&scene(), &none);
@@ -189,63 +190,148 @@ fn moved(item: Item, x: f32, y: f32) -> Item {
     list.items.remove(0)
 }
 
-#[test]
-fn any_run_of_edits_leaves_the_frame_a_fresh_render_would() {
-    // A fixed sequence of pseudo-random numbers, so a failure can be replayed.
-    let mut state = 0x2545_f491_4f6c_dd1d_u64;
-    let mut random = move |below: usize| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        (state % below as u64) as usize
-    };
-    let mut images = Images::default();
-    images.insert("swatch", image(4, 4, |x, _| Color::rgb(60 * x as u8, 90, 200)));
-    let make = |random: &mut dyn FnMut(usize) -> usize| {
-        let (x, y) = (random(200) as f32, random(130) as f32);
-        let color = Color::rgba(random(256) as u8, random(256) as u8, random(256) as u8, 120 + random(136) as u8);
-        match random(6) {
-            0 => fill(x, y, 10.0 + random(60) as f32, 6.0 + random(40) as f32, color),
-            1 => Item::Stroke { rect: Rect::new(x, y, 50.0, 30.0), color, width: 2.0, radius: random(12) as f32 },
-            2 => Item::Shadow {
-                rect: Rect::new(x, y, 40.0, 20.0),
-                color,
-                blur: random(14) as f32,
-                offset: Point { x: 2.0, y: 4.0 },
-                radius: 4.0,
-            },
-            3 => text(
-                &sans(300.0 + 100.0 * random(5) as f32),
-                10.0 + random(14) as f32,
-                color,
-                Point { x, y: y + 20.0 },
-                "Wavy fjord",
-            ),
-            4 => Item::Image { rect: Rect::new(x, y, 30.0, 24.0), asset: "swatch".into() },
-            _ => Item::Fill { rect: Rect::new(x, y, 36.0, 36.0), color, radius: 18.0 },
-        }
-    };
+/// A window around a scrolling page: a bar above it, the page's lines inside a clip, and a thumb and a
+/// rounded badge over it. `scrolled` is how far up the lines have moved.
+fn window(lines: &[&str], scrolled: f32, clip_radius: f32) -> Vec<Item> {
+    let mut items = vec![
+        fill(0.0, 0.0, WIDTH as f32, HEIGHT as f32, Color::rgb(244, 246, 249)),
+        fill(0.0, 0.0, WIDTH as f32, 20.0, WHITE),
+        text(&sans(600.0), 11.0, BLACK, Point { x: 8.0, y: 14.0 }, "A bar that stays"),
+        Item::PushClip { rect: Rect::new(0.0, 20.0, WIDTH as f32, 140.0), radius: clip_radius },
+        fill(30.0, 20.0, 180.0, 140.0, WHITE),
+    ];
+    for (row, line) in lines.iter().enumerate() {
+        let y = 40.0 + 18.0 * row as f32 - scrolled;
+        items.push(text(&sans(400.0), 13.0, BLACK, Point { x: 36.0, y }, line));
+    }
+    items.push(Item::PopClip);
+    // The thumb follows the scroll by a fraction of a pixel, and the badge stays where it is.
+    items.push(Item::Fill { rect: Rect::new(232.0, 24.0 + scrolled / 3.0, 5.0, 30.0), color: BLUE, radius: 2.5 });
+    items.push(Item::Fill { rect: Rect::new(150.0, 120.0, 50.0, 18.0), color: RED, radius: 9.0 });
+    items
+}
 
-    let mut items: Vec<Item> = (0..30).map(|_| make(&mut random)).collect();
-    let mut kept = Kept::new(1.5);
-    kept.render(&list(items.clone()), &images);
-    for step in 0..60 {
-        for _ in 0..1 + random(3) {
-            match random(3) {
-                0 => items.insert(random(items.len() + 1), make(&mut random)),
-                1 if !items.is_empty() => drop(items.remove(random(items.len()))),
-                _ if !items.is_empty() => {
-                    let at = random(items.len());
-                    items[at] = moved(items[at].clone(), random(9) as f32 - 4.0, random(9) as f32 - 4.0);
-                }
-                _ => {}
+#[test]
+fn a_scroll_or_a_rewrap_keeps_the_frame_within_a_step_of_a_fresh_one() {
+    const BOOK: [&str; 12] = [
+        "Call me Ishmael. Some years",
+        "ago, never mind how long",
+        "precisely, having little or",
+        "no money in my purse, and",
+        "nothing particular to",
+        "interest me on shore, I",
+        "thought I would sail about",
+        "a little and see the watery",
+        "part of the world. It is a",
+        "way I have of driving off",
+        "the spleen and regulating",
+        "the circulation.",
+    ];
+    let rewrapped: Vec<&str> = [&BOOK[..3], &["no money in my", "purse or pocket, and"], &BOOK[4..]].concat();
+    // What happens, as the lines, scroll and clip radius of each frame in turn.
+    type Shown<'a> = (&'a [&'a str], f32, f32);
+    let cases: [(&str, &[Shown<'_>]); 5] = [
+        ("scrolling down and back", &[(&BOOK, 0.0, 0.0), (&BOOK, 18.0, 0.0), (&BOOK, 58.0, 0.0), (&BOOK, 4.0, 0.0)]),
+        ("scrolling by part of a pixel", &[(&BOOK, 0.0, 0.0), (&BOOK, 10.3, 0.0), (&BOOK, 20.6, 0.0)]),
+        ("scrolling in a rounded clip", &[(&BOOK, 0.0, 12.0), (&BOOK, 36.0, 12.0), (&BOOK, 30.0, 12.0)]),
+        ("a line wrapping in two", &[(&BOOK, 18.0, 0.0), (&rewrapped, 18.0, 0.0), (&BOOK, 18.0, 0.0)]),
+        ("wrapping while scrolling", &[(&BOOK, 0.0, 0.0), (&rewrapped, 36.0, 0.0), (&BOOK, 16.0, 0.0)]),
+    ];
+    let none = Images::default();
+    for scale in [1.0, 1.5, 2.0] {
+        for (name, frames) in &cases {
+            let mut kept = Kept::new(scale);
+            let mut window_pixels = vec![0_u32; kept.frame.pixels().len()];
+            for (step, (lines, scrolled, radius)) in frames.iter().enumerate() {
+                let scene = list(window(lines, *scrolled, *radius));
+
+                let damage = kept.render(&scene, &none);
+                damage.rects().iter().for_each(|rect| kept.frame.copy_rect_to(&mut window_pixels, *rect));
+
+                let apart = furthest_apart(&kept.frame, &kept.fresh(&scene, &none));
+                assert!(apart <= 1, "{name} at scale {scale}: frame {step} is {apart} steps from a fresh one");
+                let mut whole_frame = vec![0_u32; window_pixels.len()];
+                kept.frame.copy_to_xrgb(&mut whole_frame);
+                assert!(window_pixels == whole_frame, "{name} at scale {scale}: the damage of frame {step} covers it");
             }
         }
-        let scene = list(items.clone());
+    }
+}
 
-        kept.render(&scene, &images);
+#[test]
+fn any_run_of_changes_leaves_the_frame_a_fresh_render_would() {
+    let mut images = Images::default();
+    images.insert("swatch", image(4, 4, |x, _| Color::rgb(60 * x as u8, 90, 200)));
+    // Edits alone repaint exactly. Whole lists moving up and down move pixels, which may round a step off.
+    for (name, scrolls, allowed) in [("edits", false, 0), ("edits and scrolls", true, 1)] {
+        // A fixed sequence of pseudo-random numbers, so a failure can be replayed.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut random = move |below: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % below as u64) as usize
+        };
+        let make = |random: &mut dyn FnMut(usize) -> usize| {
+            let (x, y) = (random(200) as f32, random(130) as f32);
+            let color = Color::rgba(random(256) as u8, random(256) as u8, random(256) as u8, 120 + random(136) as u8);
+            match random(6) {
+                0 => fill(x, y, 10.0 + random(60) as f32, 6.0 + random(40) as f32, color),
+                1 => Item::Stroke { rect: Rect::new(x, y, 50.0, 30.0), color, width: 2.0, radius: random(12) as f32 },
+                2 => Item::Shadow {
+                    rect: Rect::new(x, y, 40.0, 20.0),
+                    color,
+                    blur: random(14) as f32,
+                    offset: Point { x: 2.0, y: 4.0 },
+                    radius: 4.0,
+                },
+                3 => text(
+                    &sans(300.0 + 100.0 * random(5) as f32),
+                    10.0 + random(14) as f32,
+                    color,
+                    Point { x, y: y + 20.0 },
+                    "Wavy fjord",
+                ),
+                4 => Item::Image { rect: Rect::new(x, y, 30.0, 24.0), asset: "swatch".into() },
+                _ => Item::Fill { rect: Rect::new(x, y, 36.0, 36.0), color, radius: 18.0 },
+            }
+        };
+        // Three layers: under a clipped page, on it, and over it. A scroll moves the page's items together.
+        let mut layers: [Vec<Item>; 3] = std::array::from_fn(|_| (0..10).map(|_| make(&mut random)).collect());
+        let clip = |radius| Item::PushClip { rect: Rect::new(20.0, 10.0, 200.0, 130.0), radius };
+        let scene = |layers: &[Vec<Item>; 3], radius: f32| {
+            let [under, page, over] = layers.clone();
+            list([under, vec![clip(radius)], page, vec![Item::PopClip], over].concat())
+        };
 
-        assert!(kept.frame == kept.fresh(&scene, &images), "after step {step} the frame matches a fresh one");
+        let mut kept = Kept::new(1.5);
+        kept.render(&scene(&layers, 0.0), &images);
+        for step in 0..40 {
+            for _ in 0..1 + random(3) {
+                let layer = &mut layers[random(3)];
+                match random(3) {
+                    0 => layer.insert(random(layer.len() + 1), make(&mut random)),
+                    1 if !layer.is_empty() => drop(layer.remove(random(layer.len()))),
+                    _ if !layer.is_empty() => {
+                        // Never straight up or down, which is the move a scroll makes.
+                        let (at, x) = (random(layer.len()), [-3.0, -1.0, 2.0, 4.0][random(4)]);
+                        layer[at] = moved(layer[at].clone(), x, random(9) as f32 - 4.0);
+                    }
+                    _ => {}
+                }
+            }
+            if scrolls && random(2) == 0 {
+                // Whole pixels at this scale, either way.
+                let rows = [-20.0, -8.0, -2.0, 2.0, 4.0, 14.0][random(6)];
+                layers[1] = layers[1].drain(..).map(|item| moved(item, 0.0, rows)).collect();
+            }
+            let scene = scene(&layers, if step < 20 { 0.0 } else { 8.0 });
+
+            kept.render(&scene, &images);
+
+            let apart = furthest_apart(&kept.frame, &kept.fresh(&scene, &images));
+            assert!(apart <= allowed, "{name}: after step {step} the frame is {apart} steps from a fresh one");
+        }
     }
 }
 

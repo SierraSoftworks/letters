@@ -41,6 +41,12 @@ pub fn close(a: Color, b: Color, tolerance: u8) -> bool {
     [(a.r, b.r), (a.g, b.g), (a.b, b.b), (a.a, b.a)].iter().all(|(a, b)| a.abs_diff(*b) <= tolerance)
 }
 
+/// The largest difference between two frames on any channel of any pixel.
+pub fn furthest_apart(a: &Frame, b: &Frame) -> u8 {
+    assert_eq!((a.width(), a.height(), a.format()), (b.width(), b.height(), b.format()), "the frames match");
+    a.data().iter().zip(b.data()).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0)
+}
+
 /// How much a frame departs from white inside a rectangle of physical pixels: the summed darkness.
 pub fn ink(frame: &Frame, x: u32, y: u32, width: u32, height: u32) -> u64 {
     let pixels = (y..y + height).flat_map(|y| (x..x + width).map(move |x| (x, y)));

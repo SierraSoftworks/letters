@@ -1,7 +1,8 @@
 //! The CPU backend: draws a display list into memory.
 //!
 //! It paints the first frame and every frame on a host with no GPU, and it is what pixel tests run on. A
-//! frame that is kept between renders is repainted only where its display list changed.
+//! frame that is kept between renders is repainted only where its display list changed, and what only
+//! scrolled keeps its pixels.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -126,6 +127,26 @@ impl Frame {
     }
 }
 
+impl Frame {
+    /// Fills each rectangle, listed from the top down, with the pixels `by` rows above it.
+    fn slide(&mut self, rects: &[PixelRect], by: i32) {
+        let stride = usize::from(self.width);
+        let mut slide = |rect: &PixelRect, y: u32| {
+            let to = y as usize * stride + rect.x as usize;
+            let from = to.wrapping_add_signed(-(by as isize) * stride as isize);
+            if from.max(to) + rect.width as usize <= self.pixels.len() {
+                self.pixels.copy_within(from..from + rect.width as usize, to);
+            }
+        };
+        // No row may be written before it has been read, so the rows furthest along the move go first.
+        if by > 0 {
+            rects.iter().rev().for_each(|rect| (rect.y..rect.y + rect.height).rev().for_each(|y| slide(rect, y)));
+        } else {
+            rects.iter().for_each(|rect| (rect.y..rect.y + rect.height).for_each(|y| slide(rect, y)));
+        }
+    }
+}
+
 /// An RGBA8 pixel as `0x00RRGGBB`.
 fn xrgb(rgba: u32) -> u32 {
     u32::from_be_bytes(rgba.to_ne_bytes()) >> 8
@@ -160,10 +181,12 @@ impl CpuRenderer {
     }
 
     /// Makes `frame` show `list` over `background`, with logical pixels scaled by `scale`, and returns what
-    /// it repainted. An image whose asset is not in `images` is left out.
+    /// it changed. An image whose asset is not in `images` is left out.
     ///
-    /// When `frame` is the one this renderer drew last, only what changed since is repainted. Any other
-    /// frame is painted whole.
+    /// When `frame` is the one this renderer drew last, only what changed since is repainted, and it comes
+    /// out exactly as a fresh frame would. Items that moved up or down together by whole pixels, as in a
+    /// scroll, have their pixels moved instead: those can be one step of a channel off a fresh frame's. Any
+    /// other frame is painted whole.
     pub fn render(
         &mut self,
         list: &DisplayList,
@@ -184,13 +207,30 @@ impl CpuRenderer {
             .drawn
             .as_ref()
             .filter(|drawn| drawn.id == frame.drawn && drawn.scale == scale && drawn.background == background);
-        let regions = kept.and_then(|drawn| damage::regions(&drawn.survey, &survey, scale, whole.width, whole.height));
-        let regions = match regions {
-            Some(regions) => {
-                for region in &regions {
-                    self.repaint(list, images, scale, background, &survey, *region, frame);
+        let plan = kept.and_then(|drawn| damage::plan(&drawn.survey, &survey, scale, whole.width, whole.height));
+        let changed = match plan {
+            Some(plan) => {
+                frame.slide(&plan.moved, plan.by);
+                // Rectangles that share rows are painted in one pass over those rows.
+                let mut repaint = plan.repaint.clone();
+                repaint.sort_unstable_by_key(|rect| rect.y);
+                let mut rest = repaint.as_slice();
+                while let Some(first) = rest.first() {
+                    let mut bottom = first.y + first.height;
+                    let shares_rows = |rect: &&PixelRect| {
+                        let shares = rect.y < bottom;
+                        bottom = bottom.max(rect.y + rect.height);
+                        shares
+                    };
+                    let count = rest.iter().take_while(shares_rows).count();
+                    let (band, after) = rest.split_at(count);
+                    self.repaint(list, images, scale, background, &survey, band, frame);
+                    rest = after;
                 }
-                regions
+                let mut changed = plan.moved;
+                changed.extend(plan.repaint);
+                damage::merge(&mut changed);
+                changed
             }
             None => {
                 self.paint(list, images, scale, background, frame);
@@ -203,7 +243,7 @@ impl CpuRenderer {
         frame.drawn = NEXT.fetch_add(1, Ordering::Relaxed);
         let previous = self.drawn.replace(Drawn { id: frame.drawn, survey, scale, background });
         self.survey = previous.map(|drawn| drawn.survey).unwrap_or_default();
-        Damage::new(regions)
+        Damage::new(changed)
     }
 
     fn context(&mut self, width: u16, height: u16) -> &mut RenderContext {
@@ -230,7 +270,8 @@ impl CpuRenderer {
         }
     }
 
-    /// Paints one rectangle of the frame afresh, from the items that can show in it.
+    /// Paints rectangles of the frame afresh, from the items that can show in them. The rectangles are sorted
+    /// by their tops and leave no row between them untouched, so one pass over their rows paints them all.
     #[expect(clippy::too_many_arguments, reason = "one render's inputs, passed straight through")]
     fn repaint(
         &mut self,
@@ -239,32 +280,37 @@ impl CpuRenderer {
         scale: f32,
         background: Color,
         survey: &Survey,
-        region: PixelRect,
+        rects: &[PixelRect],
         frame: &mut Frame,
     ) {
+        let top = rects.first().map_or(0, |rect| rect.y);
+        let bottom = rects.iter().map(|rect| rect.y + rect.height).max().unwrap_or(0);
         // The scene keeps the whole frame's coordinates and the rows are drawn at full width, because
         // hinting and image sampling both depend on where a row starts.
         self.context(frame.width, frame.height);
-        let (width, height) = (usize::from(frame.width), region.height as usize);
+        let (width, height) = (usize::from(frame.width), (bottom - top) as usize);
         self.band.resize(width * height * 4, 0);
-        let target = PixmapMut::new(frame.width, region.height as u16, &mut self.band);
+        let target = PixmapMut::new(frame.width, height as u16, &mut self.band);
         let (Some(context), Some(target)) = (&mut self.context, target) else {
             return;
         };
-        let view = View { scale: scale.into(), shows: &|index| survey[index].extent.touches(&region, scale) };
+        let shows = |index: usize| rects.iter().any(|rect| survey[index].extent.touches(rect, scale));
+        let view = View { scale: scale.into(), shows: &shows };
         paint::paint(&mut CpuCanvas { context, resources: &mut self.resources, images }, &mut self.fonts, list, &view);
         context.flush();
-        let offset = (0, -(region.y as i32));
+        let offset = (0, -(top as i32));
         context.render_with(target, &mut self.resources, RasterizerSettings { offset, ..clear(background) });
 
-        let columns = region.x as usize..(region.x + region.width) as usize;
-        let rows = self.band.as_chunks::<4>().0.chunks_exact(width);
-        for (y, row) in (region.y as usize..).zip(rows) {
-            let start = y * width;
-            let kept = &mut frame.pixels[start + columns.start..start + columns.end];
-            for (to, from) in kept.iter_mut().zip(&row[columns.clone()]) {
-                let rgba = u32::from_ne_bytes(*from);
-                *to = if frame.format == PixelFormat::Xrgb { xrgb(rgba) } else { rgba };
+        for rect in rects {
+            let columns = rect.x as usize..(rect.x + rect.width) as usize;
+            let rows = self.band.as_chunks::<4>().0.chunks_exact(width).skip((rect.y - top) as usize);
+            for (y, row) in (rect.y as usize..(rect.y + rect.height) as usize).zip(rows) {
+                let start = y * width;
+                let kept = &mut frame.pixels[start + columns.start..start + columns.end];
+                for (to, from) in kept.iter_mut().zip(&row[columns.clone()]) {
+                    let rgba = u32::from_ne_bytes(*from);
+                    *to = if frame.format == PixelFormat::Xrgb { xrgb(rgba) } else { rgba };
+                }
             }
         }
     }
