@@ -2434,6 +2434,7 @@ dependencies = [
  "letters-layout",
  "letters-model",
  "letters-render",
+ "yewi-tokens",
 ]
 
 [[package]]
@@ -6086,6 +6087,12 @@ name = "yewi-highlight"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6103e11eaaae27dc57a82d511da313e90d2e2e49eace9d816397298bf965bb67"
+
+[[package]]
+name = "yewi-tokens"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77088f4cd3f498cd5739f229db4eba79a5c54956fd3304c24ac803588a879097"
 
 [[package]]
 name = "yoke"

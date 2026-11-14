@@ -17,7 +17,7 @@ mod paint;
 mod restyle;
 mod style;
 mod text;
-pub mod tokens;
+pub use yewi_tokens as tokens;
 mod tree;
 mod ui;
 pub mod widgets;
