@@ -13,7 +13,18 @@ workspace = true
 
 [dependencies]
 letters-model.workspace = true
+letters-render.workspace = true
+letters-fonts.workspace = true
+letters-layout.workspace = true
 letters-editor.workspace = true
 letters-ui.workspace = true
 letters-format.workspace = true
 letters-convert.workspace = true
+
+winit.workspace = true
+softbuffer.workspace = true
+accesskit.workspace = true
+accesskit_winit.workspace = true
+arboard.workspace = true
+rfd.workspace = true
+getrandom.workspace = true

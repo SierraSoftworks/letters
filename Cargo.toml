@@ -26,6 +26,15 @@ sha2 = "0.11"
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 proptest = "1"
 
+# The desktop shell. None of these may reach the core crates.
+winit = "0.30"
+softbuffer = "0.4"
+accesskit = "0.25"
+accesskit_winit = "0.34"
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+rfd = "0.17"
+getrandom = "0.4"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
