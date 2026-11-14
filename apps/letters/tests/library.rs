@@ -332,6 +332,22 @@ fn the_folders_to_move_to_are_the_tree_under_the_root() {
 }
 
 #[test]
+fn a_folder_is_shown_by_its_place_under_the_root() {
+    let desk = Desk::new("shown");
+    let (library, root) = (desk.library(), desk.library().root().to_owned());
+    let elsewhere = desk.0.join("Desktop");
+    let cases = [
+        (root.clone(), "Letters".to_owned()),
+        (root.join("Work"), "Work".to_owned()),
+        (root.join("Work").join("Clients"), "Work / Clients".to_owned()),
+        (elsewhere.clone(), elsewhere.display().to_string()),
+    ];
+    for (folder, expected) in cases {
+        assert_eq!(library.shown(&folder), expected);
+    }
+}
+
+#[test]
 fn a_free_path_is_the_first_number_nothing_has() {
     let desk = Desk::new("free");
     let root = desk.folder("");

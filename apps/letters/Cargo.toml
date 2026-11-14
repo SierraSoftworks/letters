@@ -28,6 +28,7 @@ accesskit_winit.workspace = true
 arboard.workspace = true
 rfd.workspace = true
 getrandom.workspace = true
+jiff.workspace = true
 pollster.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]

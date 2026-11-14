@@ -133,6 +133,17 @@ impl Library {
         self.remember(Some(&folder_of(&to)), &recents);
     }
 
+    /// A folder as a window names it: its place under the root as `Work / Clients`, or its whole path when
+    /// it is somewhere else.
+    pub fn shown(&self, folder: &Path) -> String {
+        let name = |part: &std::ffi::OsStr| part.to_string_lossy().into_owned();
+        match folder.strip_prefix(&self.root) {
+            Ok(inside) if inside.as_os_str().is_empty() => self.root.file_name().map(name).unwrap_or_default(),
+            Ok(inside) => inside.iter().map(name).collect::<Vec<_>>().join(" / "),
+            Err(_) => folder.display().to_string(),
+        }
+    }
+
     /// The folders a document in `current` can be moved to, as a tree in reading order: the root and
     /// everything under it, after `current` itself when that is somewhere else.
     pub fn folders(&self, current: &Path) -> Vec<Folder> {

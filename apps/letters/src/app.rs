@@ -14,18 +14,18 @@ use std::time::{Duration, Instant};
 
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Platform as _};
 use letters_format::WorkingCopy;
-use letters_model::{BlockId, Model, ReplicaId, Revision, Style};
+use letters_model::{Model, ReplicaId, Revision, Style};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Size};
 // The editor's window is the view here, where `Window` is the system's.
-use letters_ui::{Cursor, SaveState, Scheme, Window as View, tokens};
+use letters_ui::{Cursor, Landing, Location, Request, SaveState, Scheme, Window as View, tokens};
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::error::EventLoopError;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{self, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
@@ -34,10 +34,11 @@ use crate::cli::{Mode, Options};
 use crate::files::{self, EXTENSION, Home, Opened, Rest, Working};
 use crate::gpu::Gpu;
 use crate::input::{self, Composer, Press};
-use crate::library::{Library, Place, UNTITLED, has_content};
+use crate::library::{Library, Place, Recent, UNTITLED, has_content};
 use crate::measure::{FIRST_FRAME, Launch, Typing};
 use crate::platform::{self, Desktop};
 use crate::present::{Painter, Presenter};
+use crate::words::{self, Words};
 
 const MAC: bool = cfg!(target_os = "macos");
 /// How long typing must pause before a save starts.
@@ -46,6 +47,8 @@ const SAVE_AFTER: Duration = Duration::from_millis(800);
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 /// The gap between the keystrokes of a typing report, long enough that no frame waits on the one before.
 const TYPING_GAP: Duration = Duration::from_millis(20);
+/// How many recent documents the landing card is handed. It shows the first few.
+const LISTED: usize = 12;
 /// The distance one notch of a mouse wheel scrolls, in logical pixels.
 const WHEEL_LINE: f32 = 40.0;
 const WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1100.0, 800.0);
@@ -75,6 +78,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
     let reading = options.file.clone().map(|path| thread::spawn(move || files::open(&path, new_style)));
     let report_launch = options.mode == Mode::LaunchReport;
     let event_loop = event_loop(report_launch)?;
+    let home = std::env::home_dir().unwrap_or_default();
     launch.mark("event loop built");
     let mut app = App {
         starting: true,
@@ -87,8 +91,9 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         reading,
         path: options.file,
         proxy: event_loop.create_proxy(),
-        platform: Desktop::new(),
-        library: Library::of(&std::env::home_dir().unwrap_or_default()),
+        platform: Desktop::new().with_words(Words::of(&home)),
+        library: Library::of(&home),
+        words: Words::of(&home),
         reduced_motion: false,
         gpu: match std::env::var("LETTERS_RENDERER").as_deref() {
             Ok("cpu") => GpuState::Off,
@@ -194,6 +199,7 @@ struct App {
     proxy: EventLoopProxy<Event>,
     platform: Desktop,
     library: Library,
+    words: Words,
     /// Whether the desktop asked for less motion. Asked once, after the first frame.
     reduced_motion: bool,
     gpu: GpuState,
@@ -247,8 +253,12 @@ struct DocWindow {
     keeps: bool,
     /// The path the recents list has for this document.
     listed: Option<PathBuf>,
-    /// The block the caret was last seen in, while the document has no name of its own.
-    caret: Option<BlockId>,
+    /// The name and folder the view was last told, so it is told again only when they change.
+    located: Option<(Option<String>, PathBuf)>,
+    /// The person's own dictionary as this window last read it.
+    words_seen: words::Stamp,
+    /// Whether the primary button went down as a secondary one, as it does with Control held on a Mac.
+    menu_press: bool,
     /// The view's edit count that is safely on disk.
     saved_edits: u64,
     /// The edit count a save was last planned for.
@@ -276,10 +286,11 @@ struct Saving {
 }
 
 /// Something a key asks of the app, not of the document.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Action {
     New,
-    Open,
+    /// Opens the document at a path, or one the person picks.
+    Open(Option<PathBuf>),
     Save,
     Close,
     Quit,
@@ -291,7 +302,7 @@ fn shortcut(event: &KeyEvent) -> Option<Action> {
     }
     Some(match event.key {
         Key::Char('n') => Action::New,
-        Key::Char('o') => Action::Open,
+        Key::Char('o') => Action::Open(None),
         Key::Char('s') => Action::Save,
         Key::Char('w') => Action::Close,
         Key::Char('q') => Action::Quit,
@@ -315,12 +326,41 @@ impl DocWindow {
     /// The top bar says whether the document is saved. The title adds what the bar has no word for: a
     /// save that failed.
     fn retitle(&mut self) {
-        let name = self.name();
-        self.view.set_document_name(&name);
-        let unsaved = self.unsaved() || self.save_failed;
-        self.view.set_save_state(if unsaved { SaveState::Saving } else { SaveState::Saved });
+        self.view.set_save_state(match (self.save_failed, self.place.home().is_some(), self.unsaved()) {
+            (true, _, _) => SaveState::Failed,
+            // A document with no file yet has nothing to say about saving.
+            (false, false, _) => SaveState::Unsaved,
+            (false, true, true) => SaveState::Saving,
+            (false, true, false) => SaveState::Saved,
+        });
         let state = if self.save_failed { " · Not saved" } else { "" };
-        self.window.set_title(&format!("{name}{state}"));
+        self.window.set_title(&format!("{}{state}", self.name()));
+    }
+
+    /// Tells the view what the document is called and where it is kept, when either has changed. A
+    /// document with no name of its own is told so, and the view shows its first heading meanwhile.
+    fn relocate(&mut self, library: &Library) {
+        let name = (!self.place.naming()).then(|| self.place.name());
+        let folder = self.place.folder(library);
+        if self.located.as_ref().is_some_and(|(told, at)| (told, at) == (&name, &folder)) {
+            return;
+        }
+        let shown = |folder: crate::library::Folder| {
+            Some(letters_ui::Folder { path: folder.path.to_str()?.to_owned(), name: folder.name, depth: folder.depth })
+        };
+        self.view.set_location(Location {
+            name: name.clone(),
+            folder: folder.to_string_lossy().into_owned(),
+            folders: library.folders(&folder).into_iter().filter_map(shown).collect(),
+        });
+        self.located = Some((name, folder));
+    }
+
+    /// Reads the person's own words again, if their dictionary changed since this window last looked.
+    fn reword(&mut self, words: &Words) {
+        if let Some(words) = words.changed(&mut self.words_seen) {
+            self.view.set_user_words(words);
+        }
     }
 
     /// Tells the recents list where the document is, when that is news to it.
@@ -352,6 +392,7 @@ impl DocWindow {
             }
         }
         self.retitle();
+        self.relocate(library);
         home.ok().flatten()
     }
 
@@ -365,9 +406,12 @@ impl DocWindow {
 
     /// Paints one frame and puts it on screen.
     fn redraw(&mut self, now_ms: u64) -> Result<(), softbuffer::SoftBufferError> {
-        self.wake_ms = self.view.animate(now_ms);
+        self.view.animate(now_ms);
         self.list.items.clear();
         self.view.paint(&mut self.list);
+        // The view puts off its idle work while a frame is owed, and says when to call again only once
+        // none is. So it is asked again as soon as this frame is out.
+        self.wake_ms = Some(now_ms);
         self.presenter.present(&self.list, background(self.dark()))
     }
 
@@ -396,13 +440,6 @@ impl DocWindow {
             self.noticed_edits = self.view.edits();
             self.save_at = Some(now + SAVE_AFTER);
             self.retitle();
-        }
-        // A document with no name of its own takes its first heading's when the caret leaves it, which no
-        // edit need mark. So the caret's block is watched, and a move asks for what a save would settle.
-        let caret = self.view.editor().selection().map(|selection| &selection.head.block);
-        if self.keeps && self.place.naming() && caret != self.caret.as_ref() {
-            self.caret = caret.cloned();
-            self.save_at.get_or_insert(now + SAVE_AFTER);
         }
     }
 
@@ -510,7 +547,13 @@ impl DocWindow {
     /// and `news` is what the file held from other writers.
     fn saved(&mut self, home: Home, news: Option<Vec<u8>>, edits: u64, revision: Revision, library: &Library) {
         self.place.saved(home);
+        // The first write is to a folder nobody chose, so the bar names it for a moment.
+        let first = self.keeps && self.listed.is_none();
         self.relist(library);
+        if first && let Some(path) = &self.listed {
+            self.view.set_saved_in(&library.shown(path.parent().unwrap_or(Path::new(""))));
+        }
+        self.relocate(library);
         self.sent = Some(revision);
         self.save_failed = false;
         let typed_since = self.view.edits() != edits;
@@ -586,8 +629,14 @@ fn alert(parent: Option<&Arc<Window>>, message: &str) {
 }
 
 impl App {
-    /// Opens a window on a document. With no `opened`, the document is blank and has no file yet.
-    fn open_window(&mut self, event_loop: &ActiveEventLoop, opened: Option<Opened>) -> Result<(), Box<dyn Error>> {
+    /// Opens a window on a document. With no `opened`, the document is blank and has no file yet, and
+    /// `landing` puts the card with the recent documents over it.
+    fn open_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        opened: Option<Opened>,
+        landing: bool,
+    ) -> Result<(), Box<dyn Error>> {
         let (document, style, place, rest) = match opened {
             Some(Opened { document, style, home, rest }) => (document, style, Place::at(home), rest),
             None => {
@@ -621,7 +670,9 @@ impl App {
             place,
             keeps: self.typing.is_none() && !self.report_launch,
             listed: None,
-            caret: None,
+            located: None,
+            words_seen: None,
+            menu_press: false,
             saved_edits: 0,
             noticed_edits: 0,
             save_at: None,
@@ -633,6 +684,12 @@ impl App {
             sent: None,
         };
         window.view.set_reduced_motion(self.reduced_motion);
+        if !window.place.naming() {
+            window.view.set_document_name(&window.place.name());
+        }
+        if landing && window.keeps {
+            window.view.set_landing(Some(self.landing()));
+        }
         window.retitle();
         window.fit();
         self.mark("laid out");
@@ -641,6 +698,40 @@ impl App {
         window.window.request_redraw();
         self.windows.insert(window.window.id(), window);
         Ok(())
+    }
+
+    /// What the landing card offers: the documents opened lately, with times on the person's own clock.
+    fn landing(&self) -> Landing {
+        let recent = |recent: Recent| {
+            Some(letters_ui::Recent {
+                name: recent.name(),
+                folder: self.library.shown(recent.path.parent()?),
+                opened: platform::local(&recent.opened),
+                path: recent.path.to_str()?.to_owned(),
+            })
+        };
+        Landing {
+            now: platform::local(&platform::now_rfc3339()),
+            recents: self.library.recents().into_iter().filter_map(recent).take(LISTED).collect(),
+        }
+    }
+
+    /// Does what a window asked of the app since it was last looked at.
+    fn serve(&mut self, event_loop: &ActiveEventLoop, id: WindowId, now: Instant) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        for request in window.view.take_requests() {
+            match request {
+                Request::Open(path) => self.act(event_loop, id, Action::Open(Some(path.into()))),
+                Request::OpenDialog => self.act(event_loop, id, Action::Open(None)),
+                Request::New => self.act(event_loop, id, Action::New),
+                // The name is taken on the way to a save, which reads it from the document.
+                Request::Named(_) => {
+                    if let Some(window) = self.windows.get_mut(&id) {
+                        window.save_at = Some(now);
+                    }
+                }
+            }
+        }
     }
 
     fn mark(&mut self, stage: &'static str) {
@@ -653,7 +744,8 @@ impl App {
     fn open_path(&mut self, event_loop: &ActiveEventLoop, path: &Path, parent: Option<WindowId>) -> bool {
         let parent = parent.and_then(|id| self.windows.get(&id)).map(|window| window.window.clone());
         let opened = files::open(path, new_style).map_err(|error| error.to_string());
-        let shown = opened.and_then(|opened| self.open_window(event_loop, Some(opened)).map_err(|e| e.to_string()));
+        let shown =
+            opened.and_then(|opened| self.open_window(event_loop, Some(opened), false).map_err(|e| e.to_string()));
         if let Err(error) = &shown {
             alert(parent.as_ref(), &format!("{} could not be opened.\n\n{error}", path.display()));
         }
@@ -663,18 +755,29 @@ impl App {
     fn act(&mut self, event_loop: &ActiveEventLoop, id: WindowId, action: Action) {
         match action {
             Action::New => {
-                if let Err(error) = self.open_window(event_loop, None) {
+                if let Err(error) = self.open_window(event_loop, None, false) {
                     alert(None, &format!("A new window could not be opened.\n\n{error}"));
                 }
             }
-            Action::Open => {
+            Action::Open(path) => {
                 let Some(window) = self.windows.get(&id) else { return };
-                let dialog = FileDialog::new().add_filter("Letters document", &[EXTENSION]).set_parent(&*window.window);
-                let Some(path) = dialog.pick_file() else { return };
+                let pick = || {
+                    let dialog = FileDialog::new().add_filter("Letters document", &[EXTENSION]);
+                    dialog.set_directory(self.library.default_folder()).set_parent(&*window.window).pick_file()
+                };
+                let Some(path) = path.or_else(pick) else { return };
                 // A window with no file and nothing to put in one gives way to the document that was asked for.
                 let pristine = window.place.home().is_none() && !has_content(window.view.editor().doc());
-                if self.open_path(event_loop, &path, Some(id)) && pristine {
-                    self.windows.remove(&id);
+                match self.open_path(event_loop, &path, Some(id)) {
+                    true if pristine => drop(self.windows.remove(&id)),
+                    true => {}
+                    // A recent document that has gone is no longer offered.
+                    false => {
+                        let landing = self.landing();
+                        if let Some(window) = self.windows.get_mut(&id).filter(|window| window.view.landing()) {
+                            window.view.set_landing(Some(landing));
+                        }
+                    }
                 }
             }
             Action::Save => {
@@ -724,7 +827,7 @@ impl ApplicationHandler<Event> for App {
         // The document was read long before the desktop finished starting the app.
         self.mark("app launched");
         let shown = opened.and_then(|opened| {
-            self.open_window(event_loop, opened).map_err(|error| format!("No window could be opened.\n\n{error}"))
+            self.open_window(event_loop, opened, true).map_err(|error| format!("No window could be opened.\n\n{error}"))
         });
         if let Err(failure) = shown {
             if !self.report_launch {
@@ -783,9 +886,13 @@ impl ApplicationHandler<Event> for App {
                     }
                     _ => {}
                 }
-                // Off the path to the first frame: the file's history is read, and the recents list learns
-                // of an opened document.
-                window.start_read(&self.proxy);
+                // Off the path to the first frame: the file's history and the person's own words are read,
+                // and the recents list learns of an opened document.
+                if window.rest.is_some() {
+                    window.reword(&self.words);
+                    window.start_read(&self.proxy);
+                    window.relocate(library);
+                }
                 window.relist(library);
                 return;
             }
@@ -794,12 +901,29 @@ impl ApplicationHandler<Event> for App {
             }
             WindowEvent::Focused(focused) => {
                 window.view.focus(focused);
+                // Another window, or another copy of the app, may have taught the dictionary a word.
+                if focused && window.rest.is_none() {
+                    window.reword(&self.words);
+                }
                 window.access_stale = true;
             }
             WindowEvent::ModifiersChanged(modifiers) => *mods = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !window.composer.active() =>
             {
+                // The Menu key and Shift+F10 ask for the menu at the caret.
+                let menu = match event.logical_key {
+                    keyboard::Key::Named(NamedKey::ContextMenu) => true,
+                    keyboard::Key::Named(NamedKey::F10) => mods.shift_key(),
+                    _ => false,
+                };
+                if menu {
+                    window.view.menu_key(platform);
+                    window.access_stale = true;
+                    let now = Instant::now();
+                    window.sync(now);
+                    return self.serve(event_loop, id, now);
+                }
                 let unmodified = event.key_without_modifiers();
                 let press = Press {
                     key: &event.logical_key,
@@ -830,11 +954,21 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::CursorLeft { .. } => window.view.pointer_leave(),
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 match state {
+                    // On a Mac a press with Control held asks for the menu, as the secondary button does.
+                    ElementState::Pressed if MAC && mods.control_key() => {
+                        window.menu_press = true;
+                        window.view.secondary_down(window.pointer, platform);
+                    }
                     ElementState::Pressed => {
                         window.view.pointer_down(window.pointer, input::modifiers(*mods, MAC), platform)
                     }
+                    ElementState::Released if std::mem::take(&mut window.menu_press) => {}
                     ElementState::Released => window.view.pointer_up(window.pointer, platform),
                 }
+                window.access_stale = true;
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                window.view.secondary_down(window.pointer, platform);
                 window.access_stale = true;
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -851,13 +985,15 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::CloseRequested => action = Some(Action::Close),
             _ => {}
         }
-        window.sync(Instant::now());
+        let now = Instant::now();
+        window.sync(now);
+        self.serve(event_loop, id, now);
         if let Some(action) = action {
             self.act(event_loop, id, action);
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Event) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         let now = Instant::now();
         match event {
             Event::Saved(id) => {
@@ -905,6 +1041,7 @@ impl ApplicationHandler<Event> for App {
                     accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
                 }
                 window.sync(now);
+                self.serve(event_loop, window_id, now);
             }
         }
     }

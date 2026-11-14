@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use letters::platform::{Desktop, block_id, document_id, rfc3339};
+use letters::platform::{Desktop, block_id, document_id, local, rfc3339};
 use letters_editor::Platform;
 
 #[test]
@@ -13,6 +13,23 @@ fn dates_are_rfc_3339_in_utc() {
     ];
     for (seconds, expected) in cases {
         assert_eq!(rfc3339(seconds), expected);
+    }
+}
+
+#[test]
+fn a_local_time_is_the_same_moment_with_an_offset() {
+    for utc in ["1970-01-01T00:00:00Z", "2026-03-29T01:30:00Z", "2026-11-14T20:34:31Z"] {
+        let shown = local(utc);
+        let moment = |text: &str| text.parse::<jiff::Timestamp>().unwrap();
+        assert_eq!(moment(&shown), moment(utc), "{shown}");
+        assert!(!shown.ends_with('Z'), "{shown} states no offset");
+    }
+}
+
+#[test]
+fn a_time_that_cannot_be_read_is_passed_on_as_it_is() {
+    for text in ["", "yesterday", "2026-13-45T00:00:00Z"] {
+        assert_eq!(local(text), text);
     }
 }
 
