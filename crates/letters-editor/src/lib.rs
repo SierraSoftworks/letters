@@ -175,6 +175,14 @@ pub trait Platform {
     fn learn_word(&mut self, _word: &str) {}
 }
 
+/// A block id made of 80 random bits: 16 characters, short enough to keep `document.json` readable. The
+/// shell brings the bits, as the core has no randomness of its own, and answers [`Platform::new_id`] with it.
+pub fn block_id(random: [u8; 10]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let bits = random.iter().fold(0u128, |bits, byte| bits << 8 | u128::from(*byte));
+    (0..16).map(|i| ALPHABET[(bits >> (5 * i) & 31) as usize] as char).collect()
+}
+
 /// Clipboard content: plain text (Markdown when Letters wrote it) and, where offered, HTML and images.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Clip {
