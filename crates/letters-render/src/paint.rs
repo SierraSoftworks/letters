@@ -17,7 +17,7 @@ use crate::{Color, DisplayList, Font, Item, PathEl, Point, Rect};
 /// How far a curve may stray from its true shape, in physical pixels.
 const TOLERANCE: f64 = 0.05;
 /// The outline growth per side of synthetic bold, as a share of the font size.
-const EMBOLDEN: f64 = 1.0 / 48.0;
+pub(crate) const EMBOLDEN: f64 = 1.0 / 48.0;
 
 /// One run of glyphs, in the terms the glyph builders take.
 pub(crate) struct Run<'a> {
@@ -213,8 +213,9 @@ pub(crate) fn paint(canvas: &mut impl Canvas, fonts: &mut FontCache, list: &Disp
                     font: handle,
                     coords: &font.coords,
                     size: *size,
+                    // With y down, a lean to the right moves what is above the baseline the positive way.
                     skew: (skew.is_finite() && *skew != 0.0)
-                        .then(|| Affine::skew(f64::from(skew.to_radians().tan()), 0.0)),
+                        .then(|| Affine::skew(-f64::from(skew.to_radians().tan()), 0.0)),
                     embolden: embolden
                         .then(|| Diagonal2::new(f64::from(*size) * EMBOLDEN, f64::from(*size) * EMBOLDEN)),
                 };
@@ -290,7 +291,7 @@ fn fill(canvas: &mut impl Canvas, shape: &RoundedRect, tolerance: f64) {
 }
 
 /// A rectangle with its corner radius clamped to fit, or `None` if it has no area or is not finite.
-fn rounded(rect: &Rect, radius: f32) -> Option<RoundedRect> {
+pub(crate) fn rounded(rect: &Rect, radius: f32) -> Option<RoundedRect> {
     let finite = [rect.x, rect.y, rect.width, rect.height].iter().all(|value| value.is_finite());
     if !finite || rect.width <= 0.0 || rect.height <= 0.0 {
         return None;
@@ -301,7 +302,7 @@ fn rounded(rect: &Rect, radius: f32) -> Option<RoundedRect> {
 }
 
 /// A path in Vello's terms, or `None` if it is empty or any of its points is not finite.
-fn bez_path(path: &[PathEl]) -> Option<BezPath> {
+pub(crate) fn bez_path(path: &[PathEl]) -> Option<BezPath> {
     let mut out = BezPath::with_capacity(path.len());
     // A segment before the first move would have nowhere to start from.
     let mut started = false;

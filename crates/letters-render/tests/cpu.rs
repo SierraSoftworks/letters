@@ -7,7 +7,7 @@ use std::sync::Arc;
 use common::*;
 use letters_render::cpu::{CpuRenderer, Frame};
 use letters_render::image::Images;
-use letters_render::{Color, DisplayList, Font, Glyph, Item, PathEl, Point, Rect};
+use letters_render::{Color, DisplayList, Font, Item, PathEl, Point, Rect};
 
 fn at(frame: &Frame, x: u32, y: u32) -> Color {
     frame.pixel(x, y).expect("the probe is inside the frame")
@@ -203,9 +203,14 @@ fn weight_slant_and_synthetic_bold_change_the_glyphs() {
 
     assert!(all(&draw(&sans(700.0), 0.0, false)) > all(&regular) * 11 / 10, "a bold instance is heavier");
     assert!(all(&draw(&sans(400.0), 0.0, true)) > all(&regular) * 11 / 10, "synthetic bold is heavier");
-    let slanted = draw(&mono(), 14.0, false);
-    assert_ne!(slanted, draw(&mono(), 0.0, false), "a skew slants the glyphs");
-    assert!(all(&slanted) > 0);
+    // The baseline is at y 40: a lean to the right carries the tops of the letters right and their feet not.
+    let (upright, slanted) = (draw(&mono(), 0.0, false), draw(&mono(), 14.0, false));
+    let middle = |frame: &Frame, rows: std::ops::Range<u32>| {
+        let ink = |x| ink(frame, x, rows.start, 1, rows.end - rows.start) as f64;
+        (0..160).map(|x| f64::from(x) * ink(x)).sum::<f64>() / (0..160).map(ink).sum::<f64>()
+    };
+    assert!(middle(&slanted, 15..25) > middle(&upright, 15..25) + 2.0, "a skew leans the tops to the right");
+    assert!((middle(&slanted, 36..40) - middle(&upright, 36..40)).abs() < 1.0, "and leaves the feet in place");
 }
 
 #[test]
@@ -298,69 +303,10 @@ fn curves_are_drawn() {
 
 #[test]
 fn items_that_cannot_be_drawn_are_skipped() {
-    let rect = |x, y, width, height| Rect::new(x, y, width, height);
-    let glyphs = |font: Font, size, glyphs| Item::Glyphs {
-        origin: Point { x: 5.0, y: 20.0 },
-        font,
-        size,
-        color: BLACK,
-        skew: 0.0,
-        embolden: false,
-        glyphs,
-        text: None,
-    };
-    let path = |path: Vec<PathEl>, scale| Item::Path {
-        origin: Point::default(),
-        scale,
-        path: path.into(),
-        color: BLACK,
-        stroke: Some(1.0),
-    };
-    let garbage = Font::new(Arc::from(&b"not a font"[..]), 0);
-    let glyph = |id| vec![Glyph { id, x: 0.0, y: 0.0 }];
-    let cases: Vec<(&str, Item)> = vec![
-        ("an empty fill", fill(5.0, 5.0, 0.0, 10.0, BLACK)),
-        ("a negative fill", fill(5.0, 5.0, -10.0, 10.0, BLACK)),
-        ("a fill that is not a number", fill(f32::NAN, 5.0, 10.0, 10.0, BLACK)),
-        ("an infinite fill", fill(0.0, 0.0, f32::INFINITY, 10.0, BLACK)),
-        (
-            "a radius that is not a number",
-            Item::Fill { rect: rect(40.0, 40.0, 5.0, 5.0), color: WHITE, radius: f32::NAN },
-        ),
-        (
-            "a stroke of no width",
-            Item::Stroke { rect: rect(5.0, 5.0, 20.0, 20.0), color: BLACK, width: 0.0, radius: 0.0 },
-        ),
-        (
-            "a stroke that is not a number",
-            Item::Stroke { rect: rect(5.0, 5.0, 20.0, 20.0), color: BLACK, width: f32::NAN, radius: 0.0 },
-        ),
-        (
-            "a shadow that is not a number",
-            Item::Shadow {
-                rect: rect(5.0, 5.0, 20.0, 20.0),
-                color: BLACK,
-                blur: f32::NAN,
-                offset: Point::default(),
-                radius: 0.0,
-            },
-        ),
-        ("a font that is not a font", glyphs(garbage, 16.0, glyph(1))),
-        ("a glyph the font does not have", glyphs(sans(400.0), 16.0, glyph(u32::MAX))),
-        ("text of no size", glyphs(sans(400.0), 0.0, glyph(40))),
-        ("an empty run", glyphs(sans(400.0), 16.0, Vec::new())),
-        ("an empty path", path(Vec::new(), 1.0)),
-        ("a path with no start", path(vec![PathEl::LineTo(Point { x: 10.0, y: 10.0 })], 1.0)),
-        (
-            "a path of no scale",
-            path(vec![PathEl::MoveTo(Point::default()), PathEl::LineTo(Point { x: 10.0, y: 10.0 })], 0.0),
-        ),
-        ("an empty image", Item::Image { rect: rect(5.0, 5.0, 0.0, 0.0), asset: "pixel".into() }),
-    ];
     let mut images = Images::default();
     images.insert("pixel", image(1, 1, |_, _| BLACK));
 
-    for (name, item) in cases {
+    for (name, item) in undrawable() {
         // The item under test, then one that must still be drawn.
         let frame = render_with(&list([item, fill(50.0, 50.0, 10.0, 10.0, RED)]), &images, 64, 64, 1.0);
 

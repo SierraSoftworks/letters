@@ -93,6 +93,69 @@ pub fn text(font: &Font, size: f32, color: Color, origin: Point, text: &str) -> 
     Item::Glyphs { origin, font: font.clone(), size, color, skew: 0.0, embolden: false, glyphs, text: None }
 }
 
+/// Items that have nothing to draw, each with what is wrong with it. One draws an image named `pixel`.
+pub fn undrawable() -> Vec<(&'static str, Item)> {
+    let rect = |x, y, width, height| Rect::new(x, y, width, height);
+    let glyphs = |font: Font, size, glyphs| Item::Glyphs {
+        origin: Point { x: 5.0, y: 20.0 },
+        font,
+        size,
+        color: BLACK,
+        skew: 0.0,
+        embolden: false,
+        glyphs,
+        text: None,
+    };
+    let path = |path: Vec<PathEl>, scale| Item::Path {
+        origin: Point::default(),
+        scale,
+        path: path.into(),
+        color: BLACK,
+        stroke: Some(1.0),
+    };
+    let garbage = Font::new(Arc::from(&b"not a font"[..]), 0);
+    let glyph = |id| vec![Glyph { id, x: 0.0, y: 0.0 }];
+    vec![
+        ("an empty fill", fill(5.0, 5.0, 0.0, 10.0, BLACK)),
+        ("a negative fill", fill(5.0, 5.0, -10.0, 10.0, BLACK)),
+        ("a fill that is not a number", fill(f32::NAN, 5.0, 10.0, 10.0, BLACK)),
+        ("an infinite fill", fill(0.0, 0.0, f32::INFINITY, 10.0, BLACK)),
+        (
+            "a radius that is not a number",
+            Item::Fill { rect: rect(40.0, 40.0, 5.0, 5.0), color: WHITE, radius: f32::NAN },
+        ),
+        (
+            "a stroke of no width",
+            Item::Stroke { rect: rect(5.0, 5.0, 20.0, 20.0), color: BLACK, width: 0.0, radius: 0.0 },
+        ),
+        (
+            "a stroke that is not a number",
+            Item::Stroke { rect: rect(5.0, 5.0, 20.0, 20.0), color: BLACK, width: f32::NAN, radius: 0.0 },
+        ),
+        (
+            "a shadow that is not a number",
+            Item::Shadow {
+                rect: rect(5.0, 5.0, 20.0, 20.0),
+                color: BLACK,
+                blur: f32::NAN,
+                offset: Point::default(),
+                radius: 0.0,
+            },
+        ),
+        ("a font that is not a font", glyphs(garbage, 16.0, glyph(1))),
+        ("a glyph the font does not have", glyphs(sans(400.0), 16.0, glyph(u32::MAX))),
+        ("text of no size", glyphs(sans(400.0), 0.0, glyph(40))),
+        ("an empty run", glyphs(sans(400.0), 16.0, Vec::new())),
+        ("an empty path", path(Vec::new(), 1.0)),
+        ("a path with no start", path(vec![PathEl::LineTo(Point { x: 10.0, y: 10.0 })], 1.0)),
+        (
+            "a path of no scale",
+            path(vec![PathEl::MoveTo(Point::default()), PathEl::LineTo(Point { x: 10.0, y: 10.0 })], 0.0),
+        ),
+        ("an empty image", Item::Image { rect: rect(5.0, 5.0, 0.0, 0.0), asset: "pixel".into() }),
+    ]
+}
+
 /// A `width` by `height` image whose pixels come from `color(x, y)`.
 pub fn image(width: u32, height: u32, color: impl Fn(u32, u32) -> Color) -> Image {
     let pixels = (0..height).flat_map(|y| (0..width).map(move |x| (x, y)));
