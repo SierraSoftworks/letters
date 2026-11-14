@@ -262,22 +262,10 @@ impl Painter<'_> {
         }
     }
 
-    /// The part of each line that a byte range covers: the line, where the part starts from the leaf's left
-    /// edge, and its width. Markers on the line have pushed and widened it.
-    fn stretches(laid: &Laid, range: &Range<usize>, shifts: &Shifts, mut each: impl FnMut(usize, f32, f32)) {
-        let layout = &laid.text;
-        let start = Cursor::from_byte_index(layout, range.start, Affinity::Downstream);
-        let end = Cursor::from_byte_index(layout, range.end, Affinity::Upstream);
-        Span::new(start, end).geometry_with(layout, |area, line| {
-            let (lead, wider) = shifts.spread(line, area.x0 as f32, area.x1 as f32);
-            each(line, area.x0 as f32 + lead, area.width() as f32 + wider);
-        });
-    }
-
     /// Draws a wavy line under a misspelled word.
     fn misspelled(&mut self, leaf: &Leaf, laid: &Laid, range: &Range<usize>, shifts: &Shifts) {
         let (of, color) = (self.types.get(leaf.role), self.inks.palette.spelling);
-        Self::stretches(laid, range, shifts, |line, x, width| {
+        stretches(laid, range, shifts, |line, x, width| {
             let Some(baseline) = laid.text.get(line).map(|line| line.metrics().baseline) else { return };
             let y = (leaf.y + baseline + of.size * 0.16).round() + 0.5;
             if y + theme::WAVE_SWING <= self.band.0 || y - theme::WAVE_SWING >= self.band.1 || width <= 0.0 {
@@ -337,7 +325,7 @@ impl Painter<'_> {
     fn composing(&mut self, leaf: &Leaf, laid: &Laid, range: &Range<usize>, shifts: &Shifts) {
         let of = self.types.get(leaf.role);
         let (size, color) = ((of.size / 12.0).round().max(1.0), self.inks.ink(Ink::Style(leaf.role)));
-        Self::stretches(laid, range, shifts, |line, x, width| {
+        stretches(laid, range, shifts, |line, x, width| {
             let Some(baseline) = laid.text.get(line).map(|line| line.metrics().baseline) else { return };
             let y = (leaf.y + baseline + of.size * 0.12).round();
             if y + size <= self.band.0 || y >= self.band.1 {
@@ -427,6 +415,18 @@ impl Painter<'_> {
             }
         }
     }
+}
+
+/// The part of each line that a byte range covers: the line, where the part starts from the leaf's left edge,
+/// and its width. Markers on the line have pushed and widened it.
+pub(crate) fn stretches(laid: &Laid, range: &Range<usize>, shifts: &Shifts, mut each: impl FnMut(usize, f32, f32)) {
+    let layout = &laid.text;
+    let start = Cursor::from_byte_index(layout, range.start, Affinity::Downstream);
+    let end = Cursor::from_byte_index(layout, range.end, Affinity::Upstream);
+    Span::new(start, end).geometry_with(layout, |area, line| {
+        let (lead, wider) = shifts.spread(line, area.x0 as f32, area.x1 as f32);
+        each(line, area.x0 as f32 + lead, area.width() as f32 + wider);
+    });
 }
 
 /// The byte offset nearest to a point given from the leaf's top left.

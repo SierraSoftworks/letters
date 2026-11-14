@@ -35,6 +35,28 @@ impl Pages {
     }
 }
 
+/// A link on a sheet, for an export that makes links work. See [`crate::DocLayout::page_links`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageLink {
+    /// One line of the link's text, from the sheet's top left.
+    pub rect: Rect,
+    /// Where the link leads, as the document stores it.
+    pub target: String,
+}
+
+/// A heading and where print shows it, for an export's outline. See [`crate::DocLayout::outline`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Heading {
+    pub block: BlockId,
+    pub title: String,
+    /// From 1 to 4.
+    pub level: u8,
+    /// The sheet the heading starts on.
+    pub page: usize,
+    /// The top left of the heading's text on that sheet.
+    pub at: Point,
+}
+
 /// One page of a paginated document.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sheet {

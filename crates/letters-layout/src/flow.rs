@@ -1,6 +1,8 @@
 //! Turns the block tree into a flat column of leaves: where each block sits across the page, the space around
 //! it and what frames it. No text is shaped here, so this stays cheap for a whole document.
 
+use std::ops::Range;
+
 use letters_model::{Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Style, TextStyle, Tone};
 use letters_render::Color;
 use parley::{Alignment, Layout, LineHeight};
@@ -26,7 +28,18 @@ pub(crate) enum Role {
 
 impl Role {
     pub fn is_heading(self) -> bool {
-        matches!(self, Self::Heading1 | Self::Heading2 | Self::Heading3 | Self::Heading4)
+        self.level().is_some()
+    }
+
+    /// A heading's level, from 1.
+    pub fn level(self) -> Option<u8> {
+        match self {
+            Self::Heading1 => Some(1),
+            Self::Heading2 => Some(2),
+            Self::Heading3 => Some(3),
+            Self::Heading4 => Some(4),
+            _ => None,
+        }
     }
 }
 
@@ -184,6 +197,8 @@ pub(crate) struct Leaf {
     pub text: String,
     /// Empty when the whole text is unmarked.
     pub spans: Vec<Span>,
+    /// The links in the text, in order: the bytes each covers and where it leads.
+    pub links: Vec<(Range<usize>, String)>,
     pub newlines: usize,
 
     /// The left edge and width of the text.
@@ -249,8 +264,17 @@ impl Leaf {
     pub fn set_content(&mut self, block: &Block) {
         self.text.clear();
         self.spans.clear();
+        self.links.clear();
         for run in block.body.runs() {
+            let start = self.text.len();
             self.text.push_str(&run.text);
+            if let Some(link) = run.link.as_ref().filter(|_| !run.text.is_empty()) {
+                match self.links.last_mut() {
+                    // One link whose words differ in marks is still one link.
+                    Some((range, last)) if range.end == start && last == link => range.end = self.text.len(),
+                    _ => self.links.push((start..self.text.len(), link.clone())),
+                }
+            }
             let mut bits = if run.link.is_some() { marks::LINK } else { 0 };
             for mark in &run.marks {
                 bits |= match mark {

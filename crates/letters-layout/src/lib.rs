@@ -43,7 +43,7 @@ use crate::ink::{Brush, Ink, Inks};
 use crate::leaf::{Over, Painter};
 use crate::reveal::{Reveal, Shapes, Shifts};
 
-pub use crate::paginate::{Pages, Sheet};
+pub use crate::paginate::{Heading, PageLink, Pages, Sheet};
 pub use crate::palette::{Callout, Palette, Scheme, Syntax};
 pub use crate::shape::{FontSpec, ShapedRun, ShapedText, Shaper};
 pub use crate::tokens::{Token, TokenKind};
@@ -226,6 +226,18 @@ impl DocLayout {
     /// The page of `pages` that shows the line `pos` is on.
     pub fn page_of(&self, pages: &Pages, pos: &Pos) -> Option<usize> {
         self.state.borrow_mut().page_of(pages, pos)
+    }
+
+    /// The links on one sheet of `pages`, in reading order. A link that runs over several lines has a
+    /// rectangle for each.
+    pub fn page_links(&self, pages: &Pages, index: usize) -> Vec<PageLink> {
+        self.state.borrow_mut().page_links(pages, index)
+    }
+
+    /// The document's headings in order, each with the sheet of `pages` it is on. Headings with no text are
+    /// left out.
+    pub fn outline(&self, pages: &Pages) -> Vec<Heading> {
+        self.state.borrow_mut().outline(pages)
     }
 
     /// The text position nearest to a point. `None` when the document holds no text.
@@ -657,6 +669,44 @@ impl State {
         self.lay(at);
         let line = leaf::line_of(self.leaves[at].laid.as_ref()?, pos.offset);
         pages.sheets.partition_point(|sheet| sheet.first <= (at, line)).checked_sub(1)
+    }
+
+    fn page_links(&mut self, pages: &Pages, index: usize) -> Vec<PageLink> {
+        let mut links = Vec::new();
+        let (Some(sheet), Some(origin)) = (pages.sheets.get(index), pages.origin(index)) else { return links };
+        self.clock += 1;
+        self.place_all();
+        for (block, lines) in &sheet.blocks {
+            let Some(&at) = self.index.get(block).filter(|at| !self.leaves[**at].links.is_empty()) else { continue };
+            self.lay(at);
+            let leaf = &self.leaves[at];
+            let Some(laid) = &leaf.laid else { continue };
+            for (range, target) in &leaf.links {
+                leaf::stretches(laid, range, &Shifts::default(), |line, x, width| {
+                    let Some(shown) = laid.text.get(line).filter(|_| lines.contains(&line)) else { return };
+                    let (top, bottom) = (shown.metrics().block_min_coord, shown.metrics().block_max_coord);
+                    let rect = Rect::new(origin.x + leaf.x + x, origin.y + leaf.y + top, width, bottom - top);
+                    links.push(PageLink { rect, target: target.clone() });
+                });
+            }
+        }
+        links
+    }
+
+    fn outline(&mut self, pages: &Pages) -> Vec<Heading> {
+        self.place_all();
+        let mut headings = Vec::new();
+        for (page, sheet) in pages.sheets.iter().enumerate() {
+            let Some(origin) = pages.origin(page) else { continue };
+            // A heading is listed where it starts.
+            for (block, _) in sheet.blocks.iter().filter(|(_, lines)| lines.start == 0) {
+                let Some(leaf) = self.index.get(block).map(|at| &self.leaves[*at]) else { continue };
+                let Some(level) = leaf.role.level().filter(|_| !leaf.text.trim().is_empty()) else { continue };
+                let at = Point { x: origin.x + leaf.x, y: origin.y + leaf.y };
+                headings.push(Heading { block: block.clone(), title: leaf.text.clone(), level, page, at });
+            }
+        }
+        headings
     }
 
     fn hit(&mut self, point: Point) -> Option<Pos> {

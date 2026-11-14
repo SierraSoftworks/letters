@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use letters_layout::{DocLayout, Pages};
+use letters_layout::{DocLayout, PageLink, Pages};
 use letters_model::{
-    Block, BlockId, BlockKind, Body, Document, ListKind, Model, Op, Page, Pos, ReplicaId, Style, Tone,
+    Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Model, Op, Page, Pos, ReplicaId, Run, Style, Tone,
 };
 use letters_render::{DisplayList, Item, Point, Rect};
 use proptest::prelude::*;
@@ -317,6 +317,61 @@ fn a_sheet_is_white_paper_whatever_the_theme() {
     assert!(sheet.text == light.text && sheet.beneath == light.beneath, "a dark theme changes nothing on paper");
     let colors = |items: &[Item]| items.iter().filter_map(color_of).collect::<Vec<_>>();
     assert!(colors(&painted(&layout, everything())) != colors(&light.text), "while the screen takes its colours");
+}
+
+#[test]
+fn a_sheet_lists_its_links() {
+    // A link long enough to wrap, part of it bold, and a second one further down the document.
+    let (before, first, second) = ("Read ", "the notice that arrives with the December ", "statement before January");
+    let link = |text: &str, url: &str| Run { link: Some(url.into()), ..Run::plain(text) };
+    let (notice, rates) = ("https://example.org/notice", "https://example.org/rates");
+    let bold = Run { marks: [Mark::Bold].into(), ..link(second, notice) };
+    let linked = Block { body: Body::Text(vec![Run::plain(before), link(first, notice), bold]), ..paragraph("a", "") };
+    let later = Block { body: Body::Text(vec![link("Rates", rates), Run::plain(" change.")]), ..paragraph("z", "") };
+    let doc = doc(vec![linked, paragraph("b", &PROSE.repeat(4)), paragraph("c", &PROSE.repeat(4)), later]);
+    let (layout, pages) = paged(&doc, 240.0);
+    let on = |block: &str| layout.page_of(&pages, &Pos::new(block, 0)).unwrap();
+    assert!(on("z") > on("a"), "the links are on different sheets");
+
+    let links = layout.page_links(&pages, on("a"));
+    assert!(links.len() >= 2 && links.iter().all(|link| link.target == notice), "one link, a rectangle a line");
+    // The link's ends, as carets on the sheet, are at the ends of its rectangles.
+    let caret = |block: &str, offset| {
+        let (caret, origin) = (layout.caret(&Pos::new(block, offset)).unwrap(), pages.origin(on(block)).unwrap());
+        Point { x: caret.x + origin.x, y: caret.y + origin.y + caret.height / 2.0 }
+    };
+    let (start, end) = (caret("a", before.len()), caret("a", before.len() + first.len() + second.len()));
+    let (head, tail) = (links[0].rect, links[links.len() - 1].rect);
+    assert!((head.x - start.x).abs() < 1.0 && head.y < start.y && head.y + head.height > start.y, "from its start");
+    assert!((tail.x + tail.width - end.x).abs() < 2.0 && tail.y < end.y && tail.y + tail.height > end.y, "to its end");
+    let area = pages.area;
+    for PageLink { rect, .. } in &links {
+        assert!(rect.x >= area.x - 0.5 && rect.x + rect.width <= area.x + area.width + 0.5, "inside the text area");
+        assert!(rect.y >= area.y - 0.5 && rect.y + rect.height <= area.y + area.height + 0.5);
+    }
+
+    let last = layout.page_links(&pages, on("z"));
+    assert_eq!(last.iter().map(|link| link.target.as_str()).collect::<Vec<_>>(), [rates]);
+    assert!(layout.page_links(&pages, pages.sheets.len()).is_empty(), "a sheet that is not there lists none");
+}
+
+#[test]
+fn the_outline_lists_headings_with_their_sheets() {
+    let mut blocks = mixed().blocks;
+    blocks.push(Block::text("e", BlockKind::Heading { level: 3 }, "  "));
+    let doc = doc(blocks);
+    let (layout, pages) = paged(&doc, 240.0);
+    let outline = layout.outline(&pages);
+    let listed: Vec<(&str, &str, u8)> =
+        outline.iter().map(|heading| (heading.block.as_str(), heading.title.as_str(), heading.level)).collect();
+    assert_eq!(listed, [("h", "Household rates", 1), ("k", "What changes", 2)], "in order, without the empty one");
+    for heading in &outline {
+        let pos = Pos::new(heading.block.clone(), 0);
+        assert_eq!(Some(heading.page), layout.page_of(&pages, &pos), "{:?} is on its sheet", heading.block);
+        let (caret, origin) = (layout.caret(&pos).unwrap(), pages.origin(heading.page).unwrap());
+        assert!((heading.at.x - (caret.x + origin.x)).abs() < 1.0, "at the left of its text");
+        assert!(heading.at.y <= caret.y + origin.y && heading.at.y >= pages.area.y - 0.5, "and at its top");
+    }
 }
 
 #[test]
