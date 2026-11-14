@@ -1,0 +1,53 @@
+[package]
+name = "letters-web"
+description = "The Letters browser shell: the engine on a canvas"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+# The browser loads the `cdylib`. Tests link the `rlib`.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+letters-model.workspace = true
+letters-render.workspace = true
+letters-editor.workspace = true
+letters-ui.workspace = true
+
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = [
+  "CanvasRenderingContext2d",
+  "ClipboardEvent",
+  "CompositionEvent",
+  "Crypto",
+  "CssStyleDeclaration",
+  "DataTransfer",
+  "Document",
+  "DomRect",
+  "Element",
+  "Event",
+  "EventTarget",
+  "HtmlCanvasElement",
+  "HtmlElement",
+  "HtmlTextAreaElement",
+  "ImageData",
+  "InputEvent",
+  "KeyboardEvent",
+  "MediaQueryList",
+  "MouseEvent",
+  "Navigator",
+  "Node",
+  "Performance",
+  "PointerEvent",
+  "WheelEvent",
+  "Window",
+  "console",
+] }

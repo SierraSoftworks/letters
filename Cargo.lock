@@ -2453,6 +2453,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "letters-web"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "letters-editor",
+ "letters-model",
+ "letters-render",
+ "letters-ui",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "lexical"
 version = "7.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

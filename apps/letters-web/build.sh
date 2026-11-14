@@ -1,0 +1,23 @@
+#!/usr/bin/env sh
+# Builds the browser shell into `dist/`, ready to serve, and reports the size of its wasm.
+set -eu
+cd "$(dirname "$0")"
+target=${CARGO_TARGET_DIR:-../../target}
+wasm=$target/wasm32-unknown-unknown/release/letters_web.wasm
+
+# The command-line wasm-bindgen must be the version the crate was built against.
+version=$(sed -n '/^name = "wasm-bindgen"$/{n;s/version = "\(.*\)"/\1/p;}' ../../Cargo.lock)
+bindgen=$target/tools/bin/wasm-bindgen
+if [ "$("$bindgen" --version 2>/dev/null)" != "wasm-bindgen $version" ]; then
+  cargo install wasm-bindgen-cli --version "$version" --locked --root "$target/tools"
+fi
+
+cargo build -p letters-web --lib --release --target wasm32-unknown-unknown
+rm -rf dist
+"$bindgen" "$wasm" --target web --no-typescript --out-name letters --out-dir dist \
+  --remove-name-section --remove-producers-section
+cp www/index.html dist/
+
+# The same module with its function names left in, which the report reads to say whose the code is.
+"$bindgen" "$wasm" --target web --no-typescript --out-name letters --out-dir "$target/letters-web-named" --no-demangle
+node size.mjs dist/letters_bg.wasm "$target/letters-web-named/letters_bg.wasm"

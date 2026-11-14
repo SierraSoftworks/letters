@@ -1,0 +1,3 @@
+# Every browser Letters supports has wasm SIMD, and the CPU renderer paints a frame in half the time with it.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

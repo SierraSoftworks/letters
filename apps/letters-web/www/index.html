@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Letters</title>
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+      }
+      /* The page sizes the canvas. The editor reads the size and paints to fit. */
+      canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="letters"></canvas>
+    <script type="module">
+      import init, { Letters } from "./letters.js";
+
+      await init();
+      // The console and the tests reach the editor here.
+      window.letters = new Letters(document.getElementById("letters"));
+    </script>
+  </body>
+</html>
