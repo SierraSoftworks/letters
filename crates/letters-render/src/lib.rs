@@ -61,17 +61,32 @@ impl Color {
     }
 }
 
-/// One face of a font file. Cheap to clone, and compared by identity of its bytes.
+/// One instance of a face in a font file. Cheap to clone, and compared by identity of its bytes.
 #[derive(Clone, Debug)]
 pub struct Font {
     pub data: Arc<[u8]>,
     /// The face's index in a collection, or 0.
     pub index: u32,
+    /// A variable font's normalised design coordinates (F2Dot14, in axis order), or empty for the default
+    /// instance.
+    pub coords: Arc<[i16]>,
+}
+
+impl Font {
+    /// The default instance of a face.
+    pub fn new(data: Arc<[u8]>, index: u32) -> Self {
+        Self { data, index, coords: Arc::default() }
+    }
+
+    pub fn with_coords(mut self, coords: impl Into<Arc<[i16]>>) -> Self {
+        self.coords = coords.into();
+        self
+    }
 }
 
 impl PartialEq for Font {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.data, &other.data) && self.index == other.index
+        Arc::ptr_eq(&self.data, &other.data) && self.index == other.index && self.coords == other.coords
     }
 }
 
@@ -98,7 +113,7 @@ pub enum Item {
         width: f32,
         radius: f32,
     },
-    /// A soft shadow cast by a rectangle.
+    /// A soft shadow cast by a rectangle. `blur` is a CSS blur radius: twice the standard deviation.
     Shadow {
         rect: Rect,
         color: Color,
@@ -112,6 +127,10 @@ pub enum Item {
         font: Font,
         size: f32,
         color: Color,
+        /// A synthetic slant in degrees, for a face with no italic. 0 for none.
+        skew: f32,
+        /// Thickens the outlines, for a face with no bold.
+        embolden: bool,
         glyphs: Vec<Glyph>,
     },
     /// An asset of the document, by entry name, scaled to fill `rect`.

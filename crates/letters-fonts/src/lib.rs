@@ -23,7 +23,7 @@ pub const DISPLAY: &str = "Montserrat";
 /// Every bundled face. Repeated calls share the same font data.
 pub fn bundled() -> Vec<Font> {
     static FONTS: OnceLock<Vec<Font>> = OnceLock::new();
-    FONTS.get_or_init(|| FILES.iter().map(|bytes| Font { data: (*bytes).into(), index: 0 }).collect()).clone()
+    FONTS.get_or_init(|| FILES.iter().map(|bytes| Font::new((*bytes).into(), 0)).collect()).clone()
 }
 
 #[cfg(test)]
