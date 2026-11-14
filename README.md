@@ -13,6 +13,7 @@ server that adds identity, sharing and sync without owning any content.
 - `crates/letters-editor`: commands, Markdown input rules, keymap, clipboard and composition.
 - `crates/letters-ui`: the native widgets and the editor window's panels.
 - `crates/letters-convert`: import and export.
+- `crates/letters-spell`: spell checking with Hunspell dictionaries, English bundled.
 - `crates/letters-test`: the headless interaction-test harness.
 - `apps/letters`: the desktop app.
 

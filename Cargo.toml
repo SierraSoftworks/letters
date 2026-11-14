@@ -19,6 +19,7 @@ letters-layout = { path = "crates/letters-layout" }
 letters-editor = { path = "crates/letters-editor" }
 letters-ui = { path = "crates/letters-ui" }
 letters-convert = { path = "crates/letters-convert" }
+letters-spell = { path = "crates/letters-spell" }
 letters-test = { path = "crates/letters-test" }
 
 serde = "1"
@@ -42,6 +43,8 @@ bytemuck = "1"
 # Text shaping and line breaking. No system fonts: only the bundled faces are registered.
 parley = { version = "0.13", default-features = false, features = ["std"] }
 pulldown-cmark = { version = "0.13", default-features = false }
+# Reads Hunspell dictionaries. MPL-2.0, used unmodified.
+spellbook = "0.4"
 # The accessibility tree's types: plain data, shared by the widgets, the shell and the test harness.
 accesskit = "0.25"
 accesskit_consumer = "0.39"
