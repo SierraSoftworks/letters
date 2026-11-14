@@ -8,6 +8,7 @@
 //!
 //! Nothing here touches the filesystem or the clock. The shell supplies readers, writers, ids and dates.
 
+mod name;
 mod save;
 
 use std::collections::BTreeMap;
@@ -20,6 +21,7 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+pub use name::suggested_name;
 pub use save::{DiskCopy, Files, Replica, Save, Saved, Stamp, conflict_copy_of, save};
 
 /// The media type of a `.let` file, stored in its first entry.
