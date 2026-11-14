@@ -5,7 +5,7 @@ mod common;
 use std::cmp::Ordering;
 
 use common::{Folder, ID, bytes, open, package, paragraph};
-use letters_format::{Error, NOTES, OPLOG, Package, STYLE, Save, Saved, WorkingCopy, conflict_copy_of, save};
+use letters_format::{Error, NOTES, OPLOG, STYLE, Save, Saved, WorkingCopy, conflict_copy_of, save};
 use letters_model::{Anchor, BlockId, Document, Note, NoteKind, Op, Pos, ReplicaId, Run, Style};
 
 const NAME: &str = "report.let";
