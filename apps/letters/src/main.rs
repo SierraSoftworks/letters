@@ -31,6 +31,7 @@ fn main() -> ExitCode {
                 print!("{}", bench.report());
                 bench.within_budget()
             }),
+        Mode::Baseline => letters::baseline::run(options.headless, launch).map(|()| true),
         _ if options.headless => letters::app::run_headless(&options, launch),
         _ => letters::app::run(options, launch).map(|()| true),
     };

@@ -15,6 +15,8 @@ fn arguments_select_a_file_and_a_mode() {
         ("", run(None, Mode::Edit, false)),
         ("notes.let", run(file("notes.let"), Mode::Edit, false)),
         ("--launch-report notes.let", run(file("notes.let"), Mode::LaunchReport, false)),
+        ("--baseline", run(None, Mode::Baseline, false)),
+        ("--baseline --headless", run(None, Mode::Baseline, true)),
         ("notes.let --bench-launch --headless", run(file("notes.let"), Mode::BenchLaunch { runs: 20 }, true)),
         ("--bench-launch=5 notes.let", run(file("notes.let"), Mode::BenchLaunch { runs: 5 }, false)),
         ("--typing-report notes.let", run(file("notes.let"), Mode::TypingReport { keys: 200 }, false)),

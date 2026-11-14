@@ -2,9 +2,11 @@
 //!
 //! - [`app`] runs the winit event loop and owns the windows.
 //! - [`input`] and [`platform`] adapt the desktop to the engine's interfaces.
-//! - [`files`] opens and saves `.let` files, and [`measure`] checks the performance budgets.
+//! - [`files`] opens and saves `.let` files.
+//! - [`measure`] checks the performance budgets, and [`baseline`] is the empty window it compares with.
 
 pub mod app;
+pub mod baseline;
 pub mod cli;
 pub mod files;
 pub mod gpu;

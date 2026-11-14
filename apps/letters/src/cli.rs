@@ -10,9 +10,10 @@ Opens FILE, or a new document when none is given.
 
 Options:
       --launch-report      Print how long each stage of launch took, then exit after the first frame
-      --bench-launch[=N]   Launch N times (default 20) and check the cold-launch budget
+      --baseline           The same for an empty window, which is what launches are measured against
+      --bench-launch[=N]   Launch N times (default 20) and check what Letters adds to an empty window
       --typing-report[=N]  Type N characters (default 200) and check the keystroke budget, saving nothing
-      --headless           With the three above: paint into memory, without a window
+      --headless           With the four above: paint into memory, without a window
   -V, --version
   -h, --help
 
@@ -41,6 +42,8 @@ pub enum Mode {
     #[default]
     Edit,
     LaunchReport,
+    /// An empty window in place of the app. See [`crate::baseline`].
+    Baseline,
     BenchLaunch {
         runs: u32,
     },
@@ -60,6 +63,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             Some("-V" | "--version") => return Ok(Command::Version),
             Some("-h" | "--help") => return Ok(Command::Help),
             Some("--launch-report") => options.mode = Mode::LaunchReport,
+            Some("--baseline") => options.mode = Mode::Baseline,
             Some("--bench-launch") => options.mode = Mode::BenchLaunch { runs: 20 },
             Some("--typing-report") => options.mode = Mode::TypingReport { keys: 200 },
             Some("--headless") => options.headless = true,
@@ -76,7 +80,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         }
     }
     if options.headless && options.mode == Mode::Edit {
-        return Err("--headless needs --launch-report, --bench-launch or --typing-report".into());
+        return Err("--headless needs --launch-report, --baseline, --bench-launch or --typing-report".into());
     }
     Ok(Command::Run(options))
 }

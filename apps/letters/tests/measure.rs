@@ -3,25 +3,32 @@ use std::time::Duration;
 use letters::measure::{BUDGET, Bench, FIRST_FRAME, KEYSTROKE, KEYSTROKE_P99, Launch, Typing};
 
 #[test]
-fn a_report_lists_each_stage_and_the_verdict() {
+fn a_report_lists_each_stage_and_the_total() {
     let mut launch = Launch::start();
     launch.mark("document read");
     launch.mark(FIRST_FRAME);
     let report = launch.report();
-    let stages: Vec<usize> = ["document read", FIRST_FRAME, "budget"].iter().filter_map(|s| report.find(s)).collect();
+    let stages: Vec<usize> =
+        ["document read", FIRST_FRAME, "in the process"].iter().filter_map(|s| report.find(s)).collect();
     assert_eq!(stages.len(), 3, "{report}");
     assert!(stages.is_sorted(), "stages are listed in the order they finished:\n{report}");
-    assert!(launch.total() <= BUDGET && report.contains("within"), "{report}");
 }
 
 #[test]
-fn a_bench_is_judged_on_its_median() {
+fn a_bench_is_judged_on_what_the_median_launch_adds_to_an_empty_window() {
     let ms = Duration::from_millis;
-    let cases = [(vec![ms(90), ms(100), ms(400)], true), (vec![ms(90), ms(160), ms(170)], false), (vec![BUDGET], true)];
-    for (runs, within) in cases {
-        let bench = Bench { runs };
-        assert_eq!(bench.within_budget(), within, "{bench:?}");
-        assert!(bench.report().contains(if within { "within" } else { "over" }));
+    let slow_desktop = vec![ms(280), ms(300), ms(900)];
+    let cases = [
+        ("a slow desktop is not the app's fault", vec![ms(300), ms(310), ms(320)], slow_desktop.clone(), true),
+        ("one slow launch is not the median", vec![ms(90), ms(100), ms(400)], vec![ms(80), ms(90), ms(95)], true),
+        ("the app adds too much", vec![ms(400), ms(460), ms(470)], slow_desktop, false),
+        ("exactly the budget", vec![ms(50) + BUDGET], vec![ms(50)], true),
+        ("faster than the empty window", vec![ms(40)], vec![ms(50)], true),
+    ];
+    for (case, runs, baseline, within) in cases {
+        let bench = Bench { runs, baseline };
+        assert_eq!(bench.within_budget(), within, "{case}");
+        assert!(bench.report().contains(if within { "within" } else { "over" }), "{case}");
     }
 }
 
@@ -44,8 +51,8 @@ fn a_bench_times_each_launch_and_fails_when_one_paints_nothing() {
     let crashes = script("crashes", "echo 'first frame'; exit 3");
 
     let bench = letters::measure::bench(&paints, None, true, 3).unwrap();
-    assert_eq!(bench.runs.len(), 3);
-    assert!(bench.runs.is_sorted());
+    assert_eq!((bench.runs.len(), bench.baseline.len()), (3, 3));
+    assert!(bench.runs.is_sorted() && bench.baseline.is_sorted());
     assert!(letters::measure::bench(&silent, None, false, 1).is_err());
     assert!(letters::measure::bench(&crashes, None, false, 1).is_err());
     std::fs::remove_dir_all(&folder).unwrap();

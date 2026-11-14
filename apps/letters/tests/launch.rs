@@ -38,10 +38,22 @@ fn a_launch_reports_its_first_frame_and_what_led_to_it() {
     let output = letters(&["--launch-report", "--headless"], Some(&path));
     let report = String::from_utf8_lossy(&output.stdout);
 
-    // Whether a debug build makes the budget is not this test's business, so the exit code is not either.
     assert!(report.starts_with(FIRST_FRAME), "the first frame is announced before anything else:\n{report}");
-    assert!(report.contains("document read") && report.contains("budget"), "{report}");
+    assert!(report.contains("document read") && report.contains("laid out"), "{report}");
     assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn a_bench_sets_the_app_beside_an_empty_window() {
+    let path = document("bench");
+    let original = fs::read(&path).unwrap();
+    let output = letters(&["--bench-launch=2", "--headless"], Some(&path));
+    let report = String::from_utf8_lossy(&output.stdout);
+
+    // Whether a debug build makes the budget is not this test's business, so the exit code is not either.
+    assert!(report.contains("empty window") && report.contains("Letters adds"), "{report}");
+    assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read(&path).unwrap(), original);
 }
 
 #[test]

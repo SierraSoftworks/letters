@@ -1,7 +1,8 @@
 //! Measures the app against its performance budgets.
 //!
 //! - [`Launch`] times the stages from starting the app to a painted document, for `--launch-report`.
-//! - [`bench`] launches the app repeatedly and checks the result against the budget, for `--bench-launch`.
+//! - [`bench`] launches the app and an empty window in turn and checks what the app adds, for
+//!   `--bench-launch`.
 //! - [`Typing`] collects how long each keystroke takes to reach a frame, for `--typing-report`.
 
 use std::fmt::Write as _;
@@ -10,7 +11,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Cold launch to the first painted document, on the reference machine (a MacBook Pro with the M1 Pro).
+/// What opening a document may add to the launch of an empty window, on the reference machine (a MacBook
+/// Pro with the M1 Pro). Starting a process and opening a window cost what the system makes them cost.
 pub const BUDGET: Duration = Duration::from_millis(150);
 
 /// A keystroke to its frame submitted, at the median.
@@ -51,9 +53,7 @@ impl Launch {
             let _ = writeln!(out, "{:>8.2} ms  {:<24} +{:.2} ms", ms(*at), stage, ms(at.saturating_sub(before)));
             before = *at;
         }
-        let verdict = if self.total() <= BUDGET { "within" } else { "over" };
-        let _ =
-            writeln!(out, "{:>8.2} ms  in the process, {verdict} the {:.0} ms budget", ms(self.total()), ms(BUDGET));
+        let _ = writeln!(out, "{:>8.2} ms  in the process", ms(self.total()));
         out
     }
 }
@@ -62,61 +62,84 @@ fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e3
 }
 
-/// What a series of launches measured, from spawning the process to its first frame.
+/// What a series of launches measured, each from spawning the process to its first frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bench {
-    /// Sorted, fastest first.
+    /// The app opening its document. Sorted, fastest first.
     pub runs: Vec<Duration>,
+    /// The empty window. Sorted, fastest first.
+    pub baseline: Vec<Duration>,
 }
 
 impl Bench {
-    pub fn median(&self) -> Duration {
-        self.runs[self.runs.len() / 2]
+    /// What the app adds to an empty window, median to median.
+    pub fn overhead(&self) -> Duration {
+        median(&self.runs).saturating_sub(median(&self.baseline))
     }
 
     pub fn within_budget(&self) -> bool {
-        self.median() <= BUDGET
+        self.overhead() <= BUDGET
     }
 
     pub fn report(&self) -> String {
-        let (fastest, slowest) = (self.runs[0], self.runs[self.runs.len() - 1]);
+        let line = |name: &str, runs: &[Duration]| {
+            let (fastest, slowest) = (runs[0], runs[runs.len() - 1]);
+            format!(
+                "{name:<13} median {:.1} ms, fastest {:.1} ms, slowest {:.1} ms\n",
+                ms(median(runs)),
+                ms(fastest),
+                ms(slowest)
+            )
+        };
         let verdict = if self.within_budget() { "within" } else { "over" };
         format!(
-            "{} launches: median {:.1} ms, fastest {:.1} ms, slowest {:.1} ms\nmedian is {verdict} the {:.0} ms budget\n",
+            "{} launches of each\n{}{}Letters adds {:.1} ms, {verdict} the {:.0} ms budget\n",
             self.runs.len(),
-            ms(self.median()),
-            ms(fastest),
-            ms(slowest),
+            line("Letters", &self.runs),
+            line("empty window", &self.baseline),
+            ms(self.overhead()),
             ms(BUDGET)
         )
     }
 }
 
-/// Launches `program` on `file` `runs` times, timing each from spawn to the first frame it reports.
+fn median(sorted: &[Duration]) -> Duration {
+    sorted[sorted.len() / 2]
+}
+
+/// Launches `program` on `file` `runs` times, and as an empty window as often, in turn so that both meet
+/// the same conditions. Each launch is timed from spawn to the first frame it reports.
 ///
 /// This includes starting the process, which the stopwatch inside a run cannot see. The file cache is warm
 /// after the first run, so the slowest run is the nearest thing here to a cold launch.
 pub fn bench(program: &Path, file: Option<&Path>, headless: bool, runs: u32) -> io::Result<Bench> {
-    let mut times = Vec::new();
+    let (mut times, mut baseline) = (Vec::new(), Vec::new());
     for _ in 0..runs {
-        let mut command = Command::new(program);
-        command.arg("--launch-report").args(headless.then_some("--headless")).arg("--").args(file);
-        let start = Instant::now();
-        let mut child = command.stdout(Stdio::piped()).spawn()?;
-        let mut output = BufReader::new(child.stdout.take().expect("stdout is piped"));
-        let mut line = String::new();
-        output.read_line(&mut line)?;
-        let elapsed = start.elapsed();
-        // The rest is the run's own report. Reading it lets the run finish writing.
-        output.read_to_string(&mut String::new())?;
-        let status = child.wait()?;
-        if line.trim() != FIRST_FRAME || !status.success() {
-            return Err(io::Error::other(format!("a launch ended without painting a frame ({status})")));
-        }
-        times.push(elapsed);
+        baseline.push(launch(program, "--baseline", None, headless)?);
+        times.push(launch(program, "--launch-report", file, headless)?);
     }
     times.sort();
-    Ok(Bench { runs: times })
+    baseline.sort();
+    Ok(Bench { runs: times, baseline })
+}
+
+/// Runs `program` in the measuring `mode` and returns how long its first frame took to be reported.
+fn launch(program: &Path, mode: &str, file: Option<&Path>, headless: bool) -> io::Result<Duration> {
+    let mut command = Command::new(program);
+    command.arg(mode).args(headless.then_some("--headless")).arg("--").args(file);
+    let start = Instant::now();
+    let mut child = command.stdout(Stdio::piped()).spawn()?;
+    let mut output = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    let mut line = String::new();
+    output.read_line(&mut line)?;
+    let elapsed = start.elapsed();
+    // The rest is the run's own report. Reading it lets the run finish writing.
+    output.read_to_string(&mut String::new())?;
+    let status = child.wait()?;
+    if line.trim() != FIRST_FRAME || !status.success() {
+        return Err(io::Error::other(format!("a launch ended without painting a frame ({status})")));
+    }
+    Ok(elapsed)
 }
 
 /// How long keystrokes took to reach a submitted frame.

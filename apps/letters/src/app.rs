@@ -19,17 +19,18 @@ use letters_ui::{Cursor, SaveState, Scheme, Window as View, tokens};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
+use winit::error::EventLoopError;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{CursorIcon, Theme, Window, WindowId};
+use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
 use crate::cli::{Mode, Options};
 use crate::files::{self, EXTENSION, Home, Opened};
 use crate::gpu::Gpu;
 use crate::input::{self, Composer, Press};
-use crate::measure::{self, FIRST_FRAME, Launch, Typing};
+use crate::measure::{FIRST_FRAME, Launch, Typing};
 use crate::platform::Desktop;
 use crate::present::{Painter, Presenter};
 
@@ -64,11 +65,12 @@ impl From<accesskit_winit::Event> for Event {
 pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
     // The file is read while the event loop connects to the display.
     let reading = options.file.clone().map(|path| thread::spawn(move || files::open(&path, new_style)));
-    let event_loop = EventLoop::<Event>::with_user_event().build()?;
-    launch.mark("event loop ready");
+    let report_launch = options.mode == Mode::LaunchReport;
+    let event_loop = event_loop(report_launch)?;
+    launch.mark("event loop built");
     let mut app = App {
         starting: true,
-        report_launch: options.mode == Mode::LaunchReport,
+        report_launch,
         typing: match options.mode {
             Mode::TypingReport { keys } => Some(TypingRun { keys, stats: Typing::default(), typed: None, next: None }),
             _ => None,
@@ -91,8 +93,30 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
     app.failure.map_or(Ok(()), |failure| Err(failure.into()))
 }
 
+/// Builds the event loop. A `background` app does not come to the front, so a run that only measures takes
+/// no keystrokes from whatever the user is typing into.
+pub(crate) fn event_loop<T: 'static>(background: bool) -> Result<EventLoop<T>, EventLoopError> {
+    let mut builder = EventLoop::<T>::with_user_event();
+    #[cfg(target_os = "macos")]
+    if background {
+        use winit::platform::macos::EventLoopBuilderExtMacOS;
+        builder.with_activate_ignoring_other_apps(false);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = background;
+    builder.build()
+}
+
+/// What every window starts as, document or not.
+pub(crate) fn window_attributes() -> WindowAttributes {
+    Window::default_attributes()
+        .with_title(UNTITLED)
+        .with_inner_size(WINDOW_SIZE)
+        .with_min_inner_size(LogicalSize::new(360.0, 240.0))
+}
+
 /// Opens the document and paints into memory, as [`run`] would into a window, then prints the report the
-/// mode asks for. Returns whether the budget was met.
+/// mode asks for. Returns whether the typing budget was met: the launch budget is for `--bench-launch`.
 pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<dyn Error>> {
     let (document, style) = match &options.file {
         Some(path) => {
@@ -117,7 +141,7 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
     launch.mark(FIRST_FRAME);
     let Mode::TypingReport { keys } = options.mode else {
         println!("{FIRST_FRAME}\n{}", launch.report());
-        return Ok(launch.total() <= measure::BUDGET);
+        return Ok(true);
     };
 
     let mut platform = Desktop::new();
@@ -421,13 +445,8 @@ impl App {
             Some(Opened { document, style, home }) => (document, style, Some(home)),
             None => (files::blank(), new_style(), None),
         };
-        let attributes = Window::default_attributes()
-            .with_title(UNTITLED)
-            .with_inner_size(WINDOW_SIZE)
-            .with_min_inner_size(LogicalSize::new(360.0, 240.0))
-            // AccessKit must attach before the window is first shown.
-            .with_visible(false);
-        let window = Arc::new(event_loop.create_window(attributes)?);
+        // AccessKit must attach before the window is first shown.
+        let window = Arc::new(event_loop.create_window(window_attributes().with_visible(false))?);
         let access = accesskit_winit::Adapter::with_event_loop_proxy(event_loop, &window, self.proxy.clone());
         let presenter = Presenter::new(window.clone())?;
         window.set_ime_allowed(true);
@@ -445,8 +464,8 @@ impl App {
             gpu_offered: false,
             access_stale: false,
             wake_ms: None,
-            // A typing report must leave the file as it found it.
-            home: home.filter(|_| self.typing.is_none()),
+            // A run that only measures must leave the file as it found it.
+            home: home.filter(|_| self.typing.is_none() && !self.report_launch),
             saved_edits: 0,
             noticed_edits: 0,
             save_at: None,
@@ -457,6 +476,7 @@ impl App {
         window.fit();
         self.mark("laid out");
         window.window.set_visible(true);
+        self.mark("window shown");
         window.window.request_redraw();
         self.windows.insert(window.window.id(), window);
         Ok(())
@@ -542,7 +562,8 @@ impl ApplicationHandler<Event> for App {
             }
             None => Ok(None),
         };
-        self.mark("document read");
+        // The document was read long before the desktop finished starting the app.
+        self.mark("app launched");
         let shown = opened.and_then(|opened| {
             self.open_window(event_loop, opened).map_err(|error| format!("No window could be opened.\n\n{error}"))
         });
