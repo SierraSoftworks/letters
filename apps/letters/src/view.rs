@@ -75,6 +75,10 @@ impl View {
         &self.editor
     }
 
+    pub fn style(&self) -> &Style {
+        &self.style
+    }
+
     /// Goes up each time the document changes.
     pub fn edits(&self) -> u64 {
         self.edits

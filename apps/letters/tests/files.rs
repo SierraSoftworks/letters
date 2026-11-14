@@ -37,6 +37,15 @@ impl Drop for Folder {
     }
 }
 
+/// A style that is easy to tell from the built-in one.
+fn narrow() -> Style {
+    Style { page: Page { width: 400.0, ..Page::default() }, ..Style::default() }
+}
+
+fn open(path: &Path) -> Result<Opened, files::Error> {
+    files::open(path, Style::default)
+}
+
 fn document(text: &str) -> Document {
     Document { blocks: vec![Block::text("p", BlockKind::Paragraph, text)], ..Document::default() }
 }
@@ -50,7 +59,7 @@ fn write_full(path: &Path, text: &str) -> Package {
         document: document(text),
         entries: entries.into_iter().map(|(name, bytes)| (name.to_string(), bytes)).collect(),
     };
-    package.set_style(&Style { page: Page { width: 400.0, ..Page::default() }, ..Style::default() });
+    package.set_style(&narrow());
     write(path, &package);
     package
 }
@@ -69,14 +78,14 @@ fn read(path: &Path) -> Package {
 fn a_new_document_is_saved_and_opens_again() {
     let folder = Folder::new("new");
     let path = folder.path("Notes.let");
-    let home = Home::new(&path);
+    let home = Home::new(&path, Style::default());
     assert_eq!(home.title(), "Notes");
 
     let (home, first) = home.save(&document("First")).unwrap();
     let (home, _) = home.save(&document("Second")).unwrap();
     assert!(matches!(first, Saved::Written), "{first:?}");
 
-    assert_eq!(files::open(&path).unwrap().document, document("Second"));
+    assert_eq!(open(&path).unwrap().document, document("Second"));
     assert_eq!(home.path(), path);
     assert_eq!(folder.names(), ["Notes.let"], "a save leaves nothing else behind");
 }
@@ -87,7 +96,7 @@ fn saving_keeps_the_identity_and_every_other_entry_of_the_file() {
     let path = folder.path("Rates.let");
     let original = write_full(&path, "Before");
 
-    let Opened { document: opened, home, .. } = files::open(&path).unwrap();
+    let Opened { document: opened, home, .. } = open(&path).unwrap();
     assert_eq!(opened, original.document);
     // Two saves, so entries must survive being carried from a file the app wrote itself.
     let (home, _) = home.save(&document("Edited")).unwrap();
@@ -101,7 +110,7 @@ fn a_file_changed_by_someone_else_is_never_overwritten() {
     let folder = Folder::new("conflict");
     let path = folder.path("Rates.let");
     write_full(&path, "Shared");
-    let home = files::open(&path).unwrap().home;
+    let home = open(&path).unwrap().home;
 
     let theirs = write_full(&path, "Theirs");
     let (home, saved) = home.save(&document("Mine")).unwrap();
@@ -127,7 +136,7 @@ fn a_file_deleted_by_someone_else_is_written_back() {
     let folder = Folder::new("deleted");
     let path = folder.path("Rates.let");
     write_full(&path, "Shared");
-    let home = files::open(&path).unwrap().home;
+    let home = open(&path).unwrap().home;
     fs::remove_file(&path).unwrap();
 
     let (home, _) = home.save(&document("Mine")).unwrap();
@@ -146,7 +155,7 @@ fn files_that_are_not_documents_are_refused_with_a_reason() {
     fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
 
     for path in [folder.path("no such folder/missing.let"), text, truncated] {
-        let error = files::open(&path).expect_err("not a document");
+        let error = open(&path).expect_err("not a document");
         assert!(!error.to_string().is_empty(), "{path:?}");
     }
 }
@@ -155,7 +164,7 @@ fn files_that_are_not_documents_are_refused_with_a_reason() {
 fn a_path_with_no_file_opens_blank_and_is_created_by_the_first_save() {
     let folder = Folder::new("fresh");
     let path = folder.path("Fresh.let");
-    let opened = files::open(&path).unwrap();
+    let opened = open(&path).unwrap();
     assert_eq!(opened.document.blocks.len(), 1);
     assert!(folder.names().is_empty(), "opening writes nothing");
 
@@ -168,13 +177,13 @@ fn the_style_comes_from_the_file_and_falls_back_to_the_built_in_one() {
     let folder = Folder::new("style");
     let path = folder.path("Styled.let");
     let mut package = write_full(&path, "Text");
-    assert_eq!(files::open(&path).unwrap().style.page.width, 400.0);
+    assert_eq!(open(&path).unwrap().style, narrow());
 
     for (case, unreadable) in [("not a style", Some(&b"{}"[..])), ("no style", None)] {
         package.entries.remove("style.json");
         package.entries.extend(unreadable.map(|bytes| ("style.json".to_string(), bytes.to_vec())));
         write(&path, &package);
-        let opened = files::open(&path).unwrap();
+        let opened = open(&path).unwrap();
         assert_eq!(opened.style, Style::default(), "{case}");
         opened.home.save(&document("Edited")).unwrap();
         assert_eq!(read(&path).entries.get("style.json").map(Vec::as_slice), unreadable, "{case} is left as it was");
@@ -187,10 +196,10 @@ fn a_new_document_replaces_the_file_its_user_chose_and_carries_a_style() {
     let path = folder.path("Old.let");
     write_full(&path, "Old");
 
-    Home::new(&path).save(&document("New")).unwrap();
+    Home::new(&path, narrow()).save(&document("New")).unwrap();
     let written = read(&path);
     assert_eq!(written.document, document("New"));
-    assert_eq!(written.style().unwrap(), Style::default());
+    assert_eq!(written.style().unwrap(), narrow());
     assert!(!written.entries.keys().any(|name| name.starts_with("history/")), "nothing of the old file remains");
     assert_eq!(folder.names(), ["Old.let"]);
 }
@@ -199,13 +208,33 @@ fn a_new_document_replaces_the_file_its_user_chose_and_carries_a_style() {
 fn a_file_that_appears_where_a_new_document_was_going_is_left_alone() {
     let folder = Folder::new("appears");
     let path = folder.path("Fresh.let");
-    let opened = files::open(&path).unwrap();
+    let opened = open(&path).unwrap();
     let theirs = write_full(&path, "Theirs");
 
     let (home, _) = opened.home.save(&document("Mine")).unwrap();
     assert_eq!(read(&path), theirs);
     assert_ne!(home.path(), path);
     assert_eq!(read(home.path()).document, document("Mine"));
+}
+
+#[test]
+fn new_documents_take_the_users_default_style() {
+    let folder = Folder::new("default-style");
+    assert_eq!(files::new_style(None), Style::default());
+    assert_eq!(files::new_style(Some(&folder.0)), Style::default(), "no default saved yet");
+
+    fs::create_dir(folder.path(".letters")).unwrap();
+    fs::write(folder.path(".letters/style.json"), "not a style").unwrap();
+    assert_eq!(files::new_style(Some(&folder.0)), Style::default(), "an unreadable default");
+    fs::write(folder.path(".letters/style.json"), narrow().to_json()).unwrap();
+    assert_eq!(files::new_style(Some(&folder.0)), narrow());
+
+    // A path with no file yet is a new document, and its first save carries that style.
+    let path = folder.path("Fresh.let");
+    let opened = files::open(&path, || files::new_style(Some(&folder.0))).unwrap();
+    assert_eq!(opened.style, narrow());
+    opened.home.save(&document("Typed")).unwrap();
+    assert_eq!(read(&path).style().unwrap(), narrow());
 }
 
 #[test]

@@ -55,6 +55,13 @@ pub fn blank() -> Document {
     }
 }
 
+/// The style a new document starts with: the user's own default, kept in `.letters/style.json` in their home
+/// folder as on the server, or the built-in style when they have none that can be read.
+pub fn new_style(home_folder: Option<&Path>) -> Style {
+    let json = home_folder.and_then(|home| fs::read_to_string(home.join(".letters").join("style.json")).ok());
+    json.and_then(|json| Style::from_json(&json).ok()).unwrap_or_default()
+}
+
 /// Where a document lives on disk, and what was there when it was last read or written.
 #[derive(Clone, Debug)]
 pub struct Home {
@@ -65,13 +72,15 @@ pub struct Home {
     seen: Option<String>,
     /// Whether the first save replaces whatever the path holds, because the user chose to.
     replace: bool,
+    /// The style a new document is first written with. `None` once the file has a style of its own.
+    style: Option<Style>,
 }
 
 impl Home {
-    /// A home for a new document. The first save replaces whatever `path` holds now.
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+    /// A home for a new document in `style`. The first save replaces whatever `path` holds now.
+    pub fn new(path: impl Into<PathBuf>, style: Style) -> Self {
         let (id, created) = (platform::document_id(), platform::now_rfc3339());
-        Self { path: path.into(), id, created, seen: None, replace: true }
+        Self { path: path.into(), id, created, seen: None, replace: true, style: Some(style) }
     }
 
     pub fn path(&self) -> &Path {
@@ -103,8 +112,8 @@ impl Home {
             document: document.clone(),
             entries: Default::default(),
         };
-        if self.seen.is_none() {
-            package.set_style(&Style::default());
+        if let Some(style) = &self.style {
+            package.set_style(style);
         }
         let written = letters_format::hash(document.to_json().as_bytes());
         let mut replica = Snapshot { package, seen: self.seen.clone() };
@@ -116,7 +125,7 @@ impl Home {
             Saved::ConflictCopy { name, .. } => self.path.with_file_name(name),
             _ => self.path.clone(),
         };
-        Ok((Home { path, seen: Some(written), replace: false, ..self.clone() }, saved))
+        Ok((Home { path, seen: Some(written), replace: false, style: None, ..self.clone() }, saved))
     }
 }
 
@@ -214,14 +223,15 @@ pub struct Opened {
 
 /// Reads what the first paint needs from a `.let` file: its document and its style.
 ///
-/// A path with no file yet opens as a blank document that will be saved there.
-pub fn open(path: &Path) -> Result<Opened, Error> {
+/// A path with no file yet opens as a blank document in `new_style` that will be saved there.
+pub fn open(path: &Path, new_style: impl FnOnce() -> Style) -> Result<Opened, Error> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         // A file that is missing from a folder that exists is a new document. A missing folder is a mistake.
         Err(error) if error.kind() == io::ErrorKind::NotFound && folder_of(path).is_dir() => {
-            let home = Home { replace: false, ..Home::new(path) };
-            return Ok(Opened { document: blank(), style: Style::default(), home });
+            let style = new_style();
+            let home = Home { replace: false, ..Home::new(path, style.clone()) };
+            return Ok(Opened { document: blank(), style, home });
         }
         Err(error) => return Err(error.into()),
     };
@@ -231,7 +241,13 @@ pub fn open(path: &Path) -> Result<Opened, Error> {
     let style = archive.style().unwrap_or_default();
     let manifest = archive.manifest();
     let seen = manifest.hashes.get(DOCUMENT).cloned();
-    let home =
-        Home { path: path.into(), id: manifest.id.clone(), created: manifest.created.clone(), seen, replace: false };
+    let home = Home {
+        path: path.into(),
+        id: manifest.id.clone(),
+        created: manifest.created.clone(),
+        seen,
+        replace: false,
+        style: None,
+    };
     Ok(Opened { document, style, home })
 }

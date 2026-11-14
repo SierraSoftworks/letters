@@ -62,7 +62,7 @@ impl From<accesskit_winit::Event> for Event {
 /// Runs the app until its last window closes.
 pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
     // The file is read while the event loop connects to the display.
-    let reading = options.file.clone().map(|path| thread::spawn(move || files::open(&path)));
+    let reading = options.file.clone().map(|path| thread::spawn(move || files::open(&path, new_style)));
     let event_loop = EventLoop::<Event>::with_user_event().build()?;
     launch.mark("event loop ready");
     let mut app = App {
@@ -95,10 +95,10 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
 pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<dyn Error>> {
     let (document, style) = match &options.file {
         Some(path) => {
-            let opened = files::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+            let opened = files::open(path, new_style).map_err(|error| format!("{}: {error}", path.display()))?;
             (opened.document, opened.style)
         }
-        None => (files::blank(), Style::default()),
+        None => (files::blank(), new_style()),
     };
     launch.mark("document read");
     // A window of the default size on a display like the reference machine's.
@@ -131,6 +131,11 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
     }
     print!("{}", typing.report("CPU"));
     Ok(typing.within_budget())
+}
+
+/// The style of a new document.
+fn new_style() -> Style {
+    files::new_style(std::env::home_dir().as_deref())
 }
 
 struct App {
@@ -352,7 +357,7 @@ impl DocWindow {
     fn choose_home(&mut self) -> bool {
         let dialog = FileDialog::new().add_filter("Letters document", &[EXTENSION]).set_parent(&*self.window);
         let Some(path) = dialog.set_file_name(format!("{UNTITLED}.{EXTENSION}")).save_file() else { return false };
-        self.home = Some(Home::new(path.with_extension(EXTENSION)));
+        self.home = Some(Home::new(path.with_extension(EXTENSION), self.view.style().clone()));
         self.write()
     }
 
@@ -399,7 +404,7 @@ impl App {
     fn open_window(&mut self, event_loop: &ActiveEventLoop, opened: Option<Opened>) -> Result<(), Box<dyn Error>> {
         let (document, style, home) = match opened {
             Some(Opened { document, style, home }) => (document, style, Some(home)),
-            None => (files::blank(), Style::default(), None),
+            None => (files::blank(), new_style(), None),
         };
         let attributes = Window::default_attributes()
             .with_title(UNTITLED)
@@ -451,7 +456,7 @@ impl App {
     /// Opens a file in a new window, or reports why it cannot be opened. Returns whether it opened.
     fn open_path(&mut self, event_loop: &ActiveEventLoop, path: &Path, parent: Option<WindowId>) -> bool {
         let parent = parent.and_then(|id| self.windows.get(&id)).map(|window| window.window.clone());
-        let opened = files::open(path).map_err(|error| error.to_string());
+        let opened = files::open(path, new_style).map_err(|error| error.to_string());
         let shown = opened.and_then(|opened| self.open_window(event_loop, Some(opened)).map_err(|e| e.to_string()));
         if let Err(error) = &shown {
             alert(parent.as_ref(), &format!("{} could not be opened.\n\n{error}", path.display()));
@@ -674,6 +679,20 @@ impl ApplicationHandler<Event> for App {
                     accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
                 }
                 window.sync(now);
+            }
+        }
+    }
+
+    /// The last chance to save, which is the only one when the system ends the app, as Quit in the macOS
+    /// menu does. Nothing may ask a question here.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        for window in self.windows.values_mut() {
+            window.finish_save(Instant::now());
+            if window.unsaved()
+                && let Some(home) = &window.home
+                && let Err(error) = home.save(window.view.editor().doc())
+            {
+                eprintln!("letters: could not save {}: {error}", window.name());
             }
         }
     }
