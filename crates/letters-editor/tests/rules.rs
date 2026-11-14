@@ -152,6 +152,24 @@ fn a_code_fence_becomes_a_code_block_on_enter() {
 }
 
 #[test]
+fn a_closing_fence_ends_the_code_block() {
+    let cases = [
+        ("code let a;⏎|", "```", "code let a;\np |"),
+        ("code |", "```", "code\np |"),
+        ("> code let a;⏎⏎|", "```", "> code let a;⏎\n> p |"),
+        // Only a fence on a line of its own closes, at the end of the block.
+        ("code let a; |", "```", "code let a; \\`\\`\\`⏎|"),
+        ("code |⏎let a;", "```", "code \\`\\`\\`⏎|⏎let a;"),
+        ("code let a;⏎|", "``", "code let a;⏎\\`\\`⏎|"),
+    ];
+    for (before, typed, after) in cases {
+        assert_eq!(play(before, &[T(typed), K("Enter")]), canon(after), "{typed:?} into {before:?}");
+    }
+    let back = play("code let a;⏎|", &[T("```"), K("Enter"), K("Backspace")]);
+    assert_eq!(back, canon("code let a;⏎\\`\\`\\`|"), "Backspace gives the fence back");
+}
+
+#[test]
 fn shorthand_typed_through_an_input_method_counts_too() {
     let mut editor = Harness::new("p |");
     editor.input(InputEvent::SetComposition { text: "#".into(), selection: None });

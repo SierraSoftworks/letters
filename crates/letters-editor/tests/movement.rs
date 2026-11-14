@@ -81,11 +81,68 @@ fn with_a_layout_movement_follows_its_lines() {
         ("p abcdefg\np abcd|efghi", &["Up", "Up"], "p abcd|efg\np abcdefghi"),
         ("p abcd|efg\np abcdefghi", &["Down", "Down", "Down"], "p abcdefg\np abcdefghi|"),
         ("p abcdefghijklmnopqrstuvw|xyz", &["PageUp"], "p abcdefgh|ijklmnopqrstuvwxyz"),
+        // A wrapped line of code is not its last, and the one after it is.
+        ("code ab|cdefghi", &["Down"], "code abcdefg|hi"),
+        ("code ab|cdefghi", &["Down", "Down"], "code abcdefghi\np |"),
     ];
     for (before, keys, after) in cases {
         let mut editor = Harness::wrapped(before, 5);
         keys.iter().for_each(|key| _ = editor.key(key));
         assert_eq!(editor.state(), canon(after), "{keys:?} from {before:?}");
+    }
+}
+
+#[test]
+fn an_arrow_off_the_end_of_the_document_makes_a_line_to_leave_by() {
+    let cases = [
+        // Code is left by its last line, and an empty last line is not left behind.
+        ("code one⏎tw|o", "Down", "code one⏎two\np |"),
+        ("code one⏎two|", "Right", "code one⏎two\np |"),
+        ("code one⏎|", "Down", "code one\np |"),
+        ("code on|e⏎two", "Up", "p |\ncode one⏎two"),
+        ("code |one", "Left", "p |\ncode one"),
+        // A quote or a callout is left from the last line in it.
+        ("> p one\n> p tw|o", "Down", "> p one\n> p two\np |"),
+        ("tip> ul one|", "Right", "tip> ul one\np |"),
+        ("> p o|ne\n> p two", "Up", "p |\n> p one\n> p two"),
+        // Code in a quote is left first, and then the quote. An empty line moves out itself.
+        ("> code on|e", "Down", "> code one\n> p |"),
+        ("> code one\n> p |", "Down", "> code one\np |"),
+        ("> p |", "Down", "p |"),
+        // What holds no text is no place to stop, so the line is made past it.
+        ("p on|e\nhr", "Down", "p one\nhr\np |"),
+        ("hr\np on|e", "Up", "p |\nhr\np one"),
+        ("p |\nhr", "Down", "hr\np |"),
+    ];
+    for (before, key, after) in cases {
+        let mut editor = Harness::new(before);
+        editor.key(key);
+        assert_eq!(editor.state(), canon(after), "{key} from {before:?}");
+        editor.key("Mod+z");
+        assert_eq!(editor.state(), canon(before), "undoing {key} from {before:?}");
+    }
+}
+
+#[test]
+fn an_arrow_makes_no_line_where_there_is_one_or_nothing_to_leave() {
+    let cases = [
+        // Body text, headings and lists end the document as they are.
+        ("p on|e", "Down", "p one|"),
+        ("h1 one|", "Right", "h1 one|"),
+        ("ul on|e", "Up", "ul |one"),
+        // With text beyond, the caret goes to it.
+        ("code on|e⏎two\np three", "Down", "code one⏎tw|o\np three"),
+        ("code one⏎two|\n> p three", "Right", "code one⏎two\n> p |three"),
+        ("> p one|\np", "Down", "> p one\np |"),
+        // A selection is extended or collapsed, never led out.
+        ("> p o^n|e", "Shift+Down", "> p o^ne|"),
+        ("code o^n|e", "Right", "code on|e"),
+    ];
+    for (before, key, after) in cases {
+        let mut editor = Harness::new(before);
+        editor.key(key);
+        assert_eq!(editor.state(), canon(after), "{key} from {before:?}");
+        assert!(!editor.editor.can_undo(), "{key} from {before:?} edited the document");
     }
 }
 

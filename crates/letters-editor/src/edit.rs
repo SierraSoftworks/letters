@@ -271,6 +271,54 @@ impl Editor {
         self.apply(ops);
     }
 
+    /// Makes a line for the caret outside what holds it in, below or above, when the document has no text
+    /// there to move to. A code block is left on its own. A quote or callout is left from the last line in
+    /// it, and so is anything that only blocks without text follow. Returns whether there was such a place.
+    pub(crate) fn open(&mut self, down: bool, platform: &mut dyn Platform) -> bool {
+        let Some(head) = self.selection().map(|selection| selection.head.clone()) else { return false };
+        let doc = self.doc();
+        let (Some(block), Some(place)) = (doc.block(&head.block), tree::place(doc, &head.block)) else {
+            return false;
+        };
+        let code = text::is_code(block);
+        let outermost = |place: &tree::Place| match down {
+            true => place.index + 1 == place.siblings(doc).len(),
+            false => place.index == 0,
+        };
+        let parent = place.parent.filter(|_| !code && outermost(&place));
+        let around = parent.and_then(|parent| tree::place(doc, &parent.id));
+        let from = around.as_ref().unwrap_or(&place);
+        if !(code || parent.is_some() || !outermost(from)) {
+            return false;
+        }
+        let (into, len) = (from.parent_id(), from.siblings(doc).len());
+        let text = block.plain_text();
+
+        if block.kind == BlockKind::Paragraph && text.is_empty() {
+            // An empty line is already a line to type on, so it moves there itself.
+            let alone = parent.is_some_and(|parent| parent.body.blocks().len() == 1);
+            let mut ops = vec![Op::RemoveBlock { block: block.id.clone() }];
+            ops.extend(parent.filter(|_| alone).map(|parent| Op::RemoveBlock { block: parent.id.clone() }));
+            let gone = usize::from(parent.is_none() || alone);
+            let index = if down { len - gone } else { 0 };
+            ops.push(Op::InsertBlock { parent: into, index, block: block.clone() });
+            self.apply(ops);
+            self.place(head);
+            return true;
+        }
+        let new = BlockId::new(platform.new_id());
+        let mut ops = Vec::new();
+        if code && down && head.offset == text.len() && text.ends_with('\n') {
+            // The empty last line was the way out before there was one, so it is not left behind.
+            ops.push(Op::DeleteText { block: block.id.clone(), range: text.len() - 1..text.len() });
+        }
+        let line = Block::new(new.clone(), BlockKind::Paragraph);
+        ops.push(Op::InsertBlock { parent: into, index: if down { len } else { 0 }, block: line });
+        self.apply(ops);
+        self.place(Pos::new(new, 0));
+        true
+    }
+
     /// Breaks the block at the caret, as Enter does.
     pub(crate) fn split(&mut self, platform: &mut dyn Platform) -> Kind {
         self.delete_selection();
@@ -285,18 +333,20 @@ impl Editor {
         let paragraph = BlockKind::Paragraph;
 
         match &block.kind {
-            BlockKind::Code { .. } if at_end && text.ends_with('\n') => {
-                // Enter on the empty last line leaves the code block.
+            BlockKind::Code { .. } if at_end && rules::closes(&text) => {
+                // A closing fence ends the code block as it does in Markdown. An empty line does not,
+                // because code has empty lines of its own.
                 let new = BlockId::new(platform.new_id());
-                let line = text.len() - 1..text.len();
+                let fence = text.rfind('\n').unwrap_or(0)..text.len();
                 let after = Op::InsertBlock {
                     parent: place.parent_id(),
                     index: place.index + 1,
                     block: Block::new(new.clone(), paragraph),
                 };
-                self.apply(vec![Op::DeleteText { block: id, range: line }, after]);
+                self.apply(vec![Op::DeleteText { block: id, range: fence }, after]);
                 self.place(Pos::new(new, 0));
-                return Kind::Other;
+                self.rule = true;
+                return Kind::Rule;
             }
             BlockKind::Code { .. } => {
                 self.insert("\n");

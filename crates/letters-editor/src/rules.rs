@@ -73,6 +73,11 @@ pub(crate) fn fence(text: &str) -> Option<Option<String>> {
     named.then(|| (!language.is_empty()).then(|| language.to_owned()))
 }
 
+/// Whether the last line of a code block's text is a closing fence.
+pub(crate) fn closes(text: &str) -> bool {
+    text.rsplit('\n').next() == Some("```")
+}
+
 /// A span of text between a pair of typed markers.
 #[derive(Debug, PartialEq)]
 struct Span {

@@ -105,6 +105,10 @@ pub enum Motion {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// Moves the caret, or only the head of the selection when `extend` is set.
+    ///
+    /// An arrow with no text left to go to makes an empty line outside a code block, a quote or a callout,
+    /// or past a block that holds no text, and that is an edit. A click below the last block is
+    /// [`Motion::DocEnd`] and then [`Motion::Down`].
     Move {
         to: Motion,
         extend: bool,

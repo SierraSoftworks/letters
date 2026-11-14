@@ -132,7 +132,15 @@ impl Editor {
         }
     }
 
-    pub(crate) fn move_to(&mut self, to: Motion, extend: bool, goal: Option<f32>, platform: &dyn Platform) {
+    /// Whether the document has no line of text above or below `pos`.
+    fn outermost(&self, pos: &Pos, down: bool, platform: &dyn Platform) -> bool {
+        let fallback = HardLines(self.doc());
+        let lines = platform.lines().unwrap_or(&fallback);
+        let x = lines.caret_x(pos).unwrap_or(0.0);
+        lines.line_step(pos, x, down).and_then(|pos| self.clamp(&pos)).is_none()
+    }
+
+    pub(crate) fn move_to(&mut self, to: Motion, extend: bool, goal: Option<f32>, platform: &mut dyn Platform) {
         let Some(caret) = self.caret.clone() else { return };
         let selection = caret.selection.clone();
         let vertical = matches!(to, Motion::Up | Motion::Down | Motion::PageUp | Motion::PageDown);
@@ -154,15 +162,20 @@ impl Editor {
         } else if matches!(to, Motion::Left | Motion::Right) {
             self.step(caret, to == Motion::Right, platform);
         } else {
-            let pos = self.target(&selection.head, to, &mut goal, platform);
-            self.place(pos);
+            // An arrow that has no line to go to makes one, where there is something to leave.
+            let down = to == Motion::Down;
+            let edge = matches!(to, Motion::Up | Motion::Down) && self.outermost(&selection.head, down, platform);
+            if !(edge && self.open(down, platform)) {
+                let pos = self.target(&selection.head, to, &mut goal, platform);
+                self.place(pos);
+            }
         }
         self.goal = goal;
     }
 
     /// Moves a caret one stop sideways. A revealed marker is a stop of its own, so crossing one changes the
     /// marks typed text will take and leaves the caret where it is.
-    fn step(&mut self, caret: Caret, right: bool, platform: &dyn Platform) {
+    fn step(&mut self, caret: Caret, right: bool, platform: &mut dyn Platform) {
         let pos = caret.selection.head.clone();
         let Some(block) = self.block(&pos.block) else { return };
         let sides = Sides::at(block, pos.offset);
@@ -181,6 +194,8 @@ impl Editor {
         let to = if right { Motion::Right } else { Motion::Left };
         let target = self.target(&pos, to, &mut None, platform);
         if target == pos {
+            // The document ends here, so the caret leaves what holds it in by a line made for it.
+            self.open(right, platform);
             return;
         }
         // The caret lands on the near side of any marker at its new place: it keeps the paired marks of
