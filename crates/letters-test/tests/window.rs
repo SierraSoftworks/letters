@@ -1,6 +1,7 @@
 //! The editor's window, as a shell shows it: the page, the top bar and the side panel.
 
 use accesskit::{Action, ActionData, ActionRequest, TextPosition, TextSelection, TreeId};
+use letters_editor::InputEvent;
 use letters_model::{Align, Block, BlockKind, Document, Pos, Selection, TextStyle};
 use letters_render::{Color, Item, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
@@ -76,6 +77,23 @@ fn selected(window: &Harness) -> String {
 fn block_text(window: &Harness, id: &str) -> String {
     window.editor().doc().block(&id.into()).map(Block::plain_text).unwrap_or_default()
 }
+
+/// Where the caret shows in the next frame.
+fn caret(window: &mut Harness) -> Rect {
+    window.paint();
+    window.ui().caret_rect().expect("the page shows a caret")
+}
+
+/// A sentence with a bold word, whose markers show once the caret is inside it, as at `INSIDE`.
+fn marked(reduced_motion: bool) -> Harness {
+    let mut window = Harness::doc("Send the **quote** today.");
+    window.ui().set_reduced_motion(reduced_motion);
+    window.ui().select(Selection::caret(Pos::new("b1", 0)));
+    window.paint();
+    window
+}
+
+const INSIDE: usize = 11;
 
 fn head(window: &Harness) -> Pos {
     window.editor().selection().expect("a selection").head.clone()
@@ -645,6 +663,72 @@ fn a_dark_window_shows_a_dark_page_with_light_text() {
         })
         .collect();
     assert!(!inks.is_empty() && inks.iter().all(light), "its text is light: {inks:?}");
+}
+
+#[test]
+fn markers_open_beside_the_caret_over_a_moment() {
+    let inside = Selection::caret(Pos::new("b1", INSIDE));
+    let mut settled = marked(true);
+    settled.ui().select(inside.clone());
+    let end = caret(&mut settled).x;
+
+    let mut window = marked(false);
+    window.ui().select(inside);
+    let start = caret(&mut window).x;
+    assert!(start < end, "the text has yet to make room for the markers: {start} of {end}");
+    let now = window.platform.now_ms;
+    let next = window.ui().animate(now).expect("a frame is asked for while they open");
+    assert!(next - now <= 17, "and soon enough to look smooth: {} ms", next - now);
+
+    let mut seen = vec![start];
+    for _ in 0..40 {
+        window.advance(8);
+        seen.push(caret(&mut window).x);
+    }
+    assert!(seen.windows(2).all(|pair| pair[0] <= pair[1]), "the caret only slides towards its place: {seen:?}");
+    assert!(seen.iter().any(|x| *x > start && *x < end), "by way of the places between: {seen:?}");
+    assert_eq!(seen[40], end, "and comes to rest where it shows without motion");
+}
+
+#[test]
+fn markers_show_at_once_under_reduced_motion_and_while_text_is_composed() {
+    // Where the caret shows, some time after it lands inside the bold word.
+    let shown = |reduced_motion: bool, composing: bool, wait: u64| {
+        let mut window = marked(reduced_motion);
+        window.ui().select(Selection::caret(Pos::new("b1", INSIDE)));
+        if composing {
+            window.input(InputEvent::SetComposition { text: "x".into(), selection: None });
+        }
+        // The first frame after a change begins what moves.
+        window.advance(0).advance(wait);
+        caret(&mut window).x
+    };
+    for (name, reduced_motion, composing) in [("reduced motion", true, false), ("composing", false, true)] {
+        let rest = shown(false, composing, 400);
+        for wait in [0, 8, 40] {
+            assert_eq!(shown(reduced_motion, composing, wait), rest, "{name}: nothing is left to slide, {wait} ms on");
+        }
+    }
+}
+
+#[test]
+fn a_narrow_window_keeps_a_headings_markers_in_sight_and_the_outline_off_the_text() {
+    for (width, outlined) in [(1280.0, true), (700.0, true), (620.0, false), (400.0, false)] {
+        let mut window = letter();
+        window.resize(width, 800.0);
+        let (page, edge) = (page(&mut window), spot(&mut window, "p2", 0).x);
+        window.ui().select(Selection::caret(Pos::new("h2", 2)));
+        window.advance(0).advance(400);
+        // What is drawn left of the text edge is the heading's markers.
+        let hung = |item: &Item| match item {
+            Item::Glyphs { origin, .. } if origin.y > page.y && origin.x < edge => Some(origin.x),
+            _ => None,
+        };
+        let hung: Vec<f32> = window.paint().items.iter().filter_map(hung).collect();
+        assert!(!hung.is_empty(), "at {width} px the heading's markers hang left of the text");
+        assert!(hung.iter().all(|x| *x >= page.x), "at {width} px the window's edge cuts none of them: {hung:?}");
+        assert_eq!(window.find(Role::Navigation, "Outline").is_some(), outlined, "the outline at {width} px");
+    }
 }
 
 #[test]

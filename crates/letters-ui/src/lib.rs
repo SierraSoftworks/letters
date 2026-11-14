@@ -14,6 +14,7 @@ mod highlight;
 pub mod icon;
 mod input;
 mod layout;
+pub mod motion;
 mod paint;
 mod restyle;
 mod style;

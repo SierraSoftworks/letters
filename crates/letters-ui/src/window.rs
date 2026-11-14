@@ -18,6 +18,7 @@ use crate::describe::{self, Request};
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::highlight;
 use crate::icon::{self, Icon};
+use crate::motion::{self, FRAME_MS};
 use crate::paint::scrollbar;
 use crate::restyle::{self, Field, StyleEdit, Styles};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
@@ -47,6 +48,11 @@ const CHAPTER_INDENT: f32 = 3.0;
 const CHAPTER_STEPS: u8 = 3;
 /// The room a line takes down the control, and the least it closes up to in a document of many headings.
 const CHAPTER_PITCH: (f32, f32) = (8.0, 4.0);
+
+/// The width of the chapters control with the room either side of it.
+fn chapters_width() -> f32 {
+    CHAPTERS_INSET.horizontal() + CHAPTER_LINE.width + f32::from(CHAPTER_STEPS) * CHAPTER_INDENT
+}
 
 /// The editor's window.
 pub type Window = Ui<EditorApp>;
@@ -120,6 +126,7 @@ impl Ui<EditorApp> {
     pub fn select(&mut self, selection: Selection) {
         let app = self.app_mut();
         app.editor.select(selection);
+        app.mark();
         app.reveal();
     }
 
@@ -165,10 +172,7 @@ impl Lines for DocLines<'_> {
     }
 
     fn line_edge(&self, pos: &Pos, end: bool) -> Option<Pos> {
-        let caret = self.layout.caret(pos)?;
-        // Far enough to either side to be past any line.
-        let x = if end { 1e6 } else { -1e6 };
-        self.layout.hit(Point { x, y: caret.y + caret.height / 2.0 })
+        self.layout.line_edge(pos, end)
     }
 
     fn page_lines(&self) -> usize {
@@ -233,6 +237,10 @@ pub struct EditorApp {
     folded: Folded,
     /// What each code block was last coloured for: its text and language, hashed.
     lexed: HashMap<BlockId, u64>,
+    /// The Markdown markers' last change while it is still fading in, with when it began once a frame has
+    /// said so.
+    fading: Option<Option<u64>>,
+    reduced_motion: bool,
     dragging: bool,
 }
 
@@ -257,6 +265,8 @@ impl EditorApp {
             draft: None,
             folded: Folded::default(),
             lexed: HashMap::new(),
+            fading: None,
+            reduced_motion: false,
             dragging: false,
         }
     }
@@ -321,6 +331,24 @@ impl EditorApp {
         }
     }
 
+    /// Shows the Markdown markers that belong where the caret now is, after anything that may have moved it.
+    /// A change fades in. It shows at once when motion is reduced, and while an input method composes, whose
+    /// text must not slide under its window.
+    fn mark(&mut self) {
+        let head = self.editor.selection().map(|selection| selection.head.clone());
+        let markers = self.editor.markers();
+        let changed = self.layout.reveal(head.as_ref().map(|head| (head, &markers)));
+        self.layout.set_composition(self.editor.composition());
+        let composing = self.editor.composition().is_some();
+        if changed {
+            let at_once = self.reduced_motion || composing;
+            self.fading = (!at_once).then_some(None);
+            self.layout.set_reveal_progress(if at_once { 1.0 } else { 0.0 });
+        } else if composing && self.fading.take().is_some() {
+            self.layout.set_reveal_progress(1.0);
+        }
+    }
+
     /// Runs something on the editor, which may ask the layout about lines while it works.
     fn edit(&mut self, platform: &mut dyn Platform, act: impl FnOnce(&mut Editor, &mut dyn Platform) -> Change) {
         let mut lent = Lent { platform, lines: DocLines::new(&self.layout, self.height) };
@@ -336,6 +364,7 @@ impl EditorApp {
             self.estimated = true;
             self.highlight((!change.structure).then_some(&change.blocks));
         }
+        self.mark();
         self.reveal();
     }
 
@@ -418,6 +447,9 @@ impl EditorApp {
             self.highlight(None);
         }
         (self.column, self.height) = ((left, width), room.height);
+        // A heading's markers hang in the margin, beside the outline when it shows.
+        let taken = if self.outlined() { chapters_width() } else { tokens::SPACE_SM };
+        self.layout.set_margin(left - taken);
         // What is about to show is laid out for real. The rest waits for idle time.
         self.estimated = self.layout.settle(self.viewport(), 0);
         self.scroll = self.scroll.min(self.max_scroll());
@@ -430,14 +462,6 @@ impl EditorApp {
             list.items.extend(self.layout.selection_in(selection, viewport).into_iter().map(|rect| fill(rect, color)));
         }
         self.layout.paint(viewport, &mut list);
-        if let Some((block, range)) = self.editor.composition() {
-            // Text still being composed is underlined, as native fields do.
-            let composing =
-                Selection { anchor: Pos::new(block.clone(), range.start), head: Pos::new(block.clone(), range.end) };
-            let under =
-                |rect: Rect| fill(Rect::new(rect.x, rect.y + rect.height - 1.0, rect.width, 1.0), self.palette.text);
-            list.items.extend(self.layout.selection_in(&composing, viewport).into_iter().map(under));
-        }
 
         let origin = Point { x: left, y: TOP - self.scrolled() };
         let caret = selection.and_then(|selection| self.layout.caret(&selection.head));
@@ -488,9 +512,19 @@ impl EditorApp {
         section
     }
 
+    /// Whether the outline shows: the margin left of the text holds it, so no text runs under it, and the
+    /// document has more than the one heading that is no outline.
+    fn outlined(&self) -> bool {
+        let heading = |block: &&Block| matches!(block.kind, BlockKind::Heading { .. });
+        self.column.0 >= chapters_width() && self.editor.doc().walk().filter(heading).take(2).count() == 2
+    }
+
     /// The document's outline, at the top left of the page: one short line per heading, stepped in by its
     /// level. A line names its heading in a tooltip, and pressing it brings the heading to the top.
     fn chapters(&self) -> Option<Element<Message>> {
+        if !self.outlined() {
+            return None;
+        }
         let level = |block: &Block| match block.kind {
             BlockKind::Heading { level } => Some(level),
             _ => None,
@@ -498,14 +532,10 @@ impl EditorApp {
         let headings: Vec<(&Block, u8)> =
             self.editor.doc().walk().filter_map(|block| Some((block, level(block)?))).collect();
         let shallowest = headings.iter().map(|heading| heading.1).min()?;
-        // One heading is no outline.
-        if headings.len() < 2 {
-            return None;
-        }
         // The lines close up when the page has no room for them all.
         let room = (self.height - CHAPTERS_INSET.vertical()).max(0.0);
         let pitch = (room / headings.len() as f32).floor().clamp(CHAPTER_PITCH.1, CHAPTER_PITCH.0);
-        let width = CHAPTER_LINE.width + f32::from(CHAPTER_STEPS) * CHAPTER_INDENT;
+        let width = chapters_width() - CHAPTERS_INSET.horizontal();
         let section = self.section();
 
         let line = |(block, level): (&Block, u8)| {
@@ -851,6 +881,7 @@ impl App for EditorApp {
             Message::Jump(block) => {
                 let start = Pos { block, offset: 0 };
                 self.editor.select(Selection::caret(start.clone()));
+                self.mark();
                 // Twice, since laying out what comes into view can move the block.
                 for _ in 0..2 {
                     let Some(line) = self.layout.caret(&start) else { break };
@@ -906,6 +937,7 @@ impl App for EditorApp {
         match describe::request(self.editor.doc(), request) {
             Some(Request::Select(selection)) => {
                 self.editor.select(selection);
+                self.mark();
                 self.reveal();
             }
             Some(Request::Replace(text)) => {
@@ -929,6 +961,22 @@ impl App for EditorApp {
     fn scheme(&mut self, scheme: Scheme) {
         self.palette = palette(scheme);
         self.layout.set_palette(self.palette);
+    }
+
+    fn reduced_motion(&mut self, reduced: bool) {
+        self.reduced_motion = reduced;
+    }
+
+    fn animate(&mut self, now_ms: u64) -> Option<u64> {
+        let from = *self.fading.as_mut()?.get_or_insert(now_ms);
+        let progress = now_ms.saturating_sub(from) as f32 / tokens::DURATION_FAST;
+        // The last step is the page exactly as it will stay.
+        self.layout.set_reveal_progress(if progress < 1.0 { motion::ease(progress) } else { 1.0 });
+        if progress < 1.0 {
+            return Some(now_ms + FRAME_MS);
+        }
+        self.fading = None;
+        None
     }
 
     fn idle(&mut self) -> bool {

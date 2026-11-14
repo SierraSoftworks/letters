@@ -79,8 +79,18 @@ pub trait App {
     /// follow on their own.
     fn keys(&mut self, _keys: Keys) {}
 
-    /// Told how many device pixels make one logical pixel, at first and whenever that changes.
+    /// Told how many device pixels make one logical pixel, which is one until then.
     fn scale(&mut self, _scale: f32) {}
+
+    /// Told whether the person asked their system for less motion. What the app animates then changes at
+    /// once.
+    fn reduced_motion(&mut self, _reduced: bool) {}
+
+    /// Moves on what the app animates by itself. Returns when to call again, or `None` once nothing moves.
+    /// A frame is painted after every call that returns a time, and after the one that ends the motion.
+    fn animate(&mut self, _now_ms: u64) -> Option<u64> {
+        None
+    }
 
     /// Does a little of any work that was put off, such as laying out text that is out of sight. Returns
     /// whether there was any. It is called while nothing else is happening.
@@ -144,6 +154,8 @@ pub struct Ui<A: App> {
     /// Whether the app may have work for idle time, and whether it did any since the window was described.
     idle: (bool, bool),
     blink_from: Option<u64>,
+    /// Whether the app was animating when it was last asked.
+    moving: bool,
     caret_on: bool,
     /// The tooltip that is showing.
     tip: Option<Tip>,
@@ -178,6 +190,7 @@ impl<A: App> Ui<A> {
             canvas_caret: None,
             idle: (true, false),
             blink_from: None,
+            moving: false,
             caret_on: true,
             tip: None,
         }
@@ -222,6 +235,11 @@ impl<A: App> Ui<A> {
         self.app.keys(keys);
     }
 
+    /// Tells the window that the person asked their system for less motion.
+    pub fn set_reduced_motion(&mut self, reduced: bool) {
+        self.app.reduced_motion(reduced);
+    }
+
     /// Tells the window whether it has the keyboard. Without it no caret blinks.
     pub fn focus(&mut self, focused: bool) {
         self.active = focused;
@@ -255,6 +273,16 @@ impl<A: App> Ui<A> {
     /// again, or `None` when nothing is left to move.
     pub fn animate(&mut self, now_ms: u64) -> Option<u64> {
         self.refresh();
+        let moving = self.app.animate(now_ms);
+        // The call that ends a motion changed what shows as well.
+        if std::mem::replace(&mut self.moving, moving.is_some()) || moving.is_some() {
+            self.stale.view = true;
+            self.refresh();
+        }
+        let sooner = |next: Option<u64>| match (next, moving) {
+            (Some(next), Some(moving)) => Some(next.min(moving)),
+            (next, moving) => next.or(moving),
+        };
         // A frame that is owed comes before work on what is out of sight.
         if self.idle.0 && !self.needs_paint() {
             if self.app.idle() {
@@ -272,7 +300,7 @@ impl<A: App> Ui<A> {
             _ => false,
         });
         if !self.active || !caret {
-            return None;
+            return sooner(None);
         }
         // A caret that has just moved shows solid from the next frame.
         let from = *self.blink_from.get_or_insert(now_ms);
@@ -280,7 +308,7 @@ impl<A: App> Ui<A> {
         let on = phase.is_multiple_of(2);
         self.stale.paint |= on != self.caret_on;
         self.caret_on = on;
-        Some(from + (phase + 1) * BLINK_MS)
+        sooner(Some(from + (phase + 1) * BLINK_MS))
     }
 
     /// Where the caret is in the window as last laid out, for the input method's candidate window.
