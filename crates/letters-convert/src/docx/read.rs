@@ -1,0 +1,795 @@
+//! Word document to document.
+
+mod comments;
+mod inline;
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use letters_model::{Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Note, Run, Style};
+use roxmltree::Node;
+
+use super::numbering::Numbering;
+use super::package::{Element, Package, Rels, parse};
+use super::styles::{ParaProps, Role, RunProps, Styles, Theme, page};
+use super::{DocxError, TASK_DONE, TASK_OPEN};
+use crate::ImportNote;
+
+/// Text boxes, table cells and content controls nested deeper than this are passed over, which bounds the
+/// reader's recursion.
+const MAX_DEPTH: usize = 32;
+
+const CONTENTS: &str = "Table of contents left out";
+const TITLE: &str = "Title became a level 1 heading";
+const TABLE: &str = "Table flattened into lines of text";
+const PICTURE_MOVED: &str = "Picture moved out of its paragraph";
+const DIRECT: &str = "Fonts, sizes, colours and alignment set on single passages were left out. The document's \
+                      styles set them instead";
+const HEADERS: &str = "Headers and footers were left out";
+const HEADING_NUMBERS: &str = "Heading numbers were left out";
+
+/// A Word document as Letters holds one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocxImport {
+    pub document: Document,
+    /// The style the import was given, with Word's own styles and page laid over it.
+    pub style: Style,
+    /// What the import simplified, each on the block it happened to.
+    pub notes: Vec<ImportNote>,
+    /// Word's comments, with their replies.
+    pub comments: Vec<Note>,
+    /// The pictures the document shows, by the entry name its blocks use.
+    pub assets: BTreeMap<String, Vec<u8>>,
+}
+
+/// Reads a `.docx`.
+///
+/// - `base` is the style to fall back on for whatever Word's styles do not define.
+/// - `now` dates a comment Word left undated, as RFC 3339.
+/// - `new_id` supplies an id for each block and each comment.
+///
+/// Text is never dropped: what the document cannot hold is flattened and named in a note.
+pub fn from_docx(
+    bytes: &[u8],
+    base: &Style,
+    now: &str,
+    new_id: &mut dyn FnMut() -> String,
+) -> Result<DocxImport, DocxError> {
+    let mut package = Package::open(bytes)?;
+    let main = match package.rels("")?.part("officeDocument") {
+        Some(main) => main.to_owned(),
+        None => "word/document.xml".to_owned(),
+    };
+    let text = package.text(&main)?.ok_or(DocxError::NotWord)?;
+    let xml = parse(&main, &text)?;
+    let body = xml.root_element().child("body").ok_or(DocxError::NotWord)?;
+    let rels = package.rels(&main)?;
+
+    // The parts beside the document, each with the relationships of its own.
+    let mut side = |kind: &str| -> Result<Option<(String, String, Rels)>, DocxError> {
+        let Some(name) = rels.part(kind) else { return Ok(None) };
+        let Some(text) = package.text(name)? else { return Ok(None) };
+        Ok(Some((name.to_owned(), text, package.rels(name)?)))
+    };
+    let (theme, styles, numbering) = (side("theme")?, side("styles")?, side("numbering")?);
+    let (footnotes, endnotes) = (side("footnotes")?, side("endnotes")?);
+    let (comments, threads) = (side("comments")?, side("commentsExtended")?);
+    let mut furniture = Vec::new();
+    for name in rels.parts("header").chain(rels.parts("footer")) {
+        furniture.extend(package.text(name)?);
+    }
+    fn read(part: &Option<(String, String, Rels)>) -> Result<Option<roxmltree::Document<'_>>, DocxError> {
+        part.as_ref().map(|(name, text, _)| parse(name, text)).transpose()
+    }
+
+    let theme = read(&theme)?.as_ref().map(Theme::read).unwrap_or_default();
+    // A file with no styles of its own takes the look it is given.
+    let seeded = styles.is_some();
+    let styles = read(&styles)?.as_ref().map(|xml| Styles::read(xml, &theme)).unwrap_or_default();
+    let numbering = read(&numbering)?.as_ref().map(Numbering::read).unwrap_or_default();
+    let mut style = if seeded { styles.seed(base) } else { base.clone() };
+    if let Some(page) = body.child("sectPr").and_then(|section| page(section, &base.page)) {
+        style.page = page;
+    }
+
+    let mut reader = Reader {
+        package,
+        normal: styles.paragraph(None),
+        styles,
+        theme,
+        numbering,
+        new_id,
+        notes: Vec::new(),
+        whole: Vec::new(),
+        fields: Vec::new(),
+        depth: 0,
+        detached: false,
+        plain: false,
+        paras: 0,
+        placed: BTreeMap::new(),
+        spans: BTreeMap::new(),
+        cited: Vec::new(),
+        numbers: BTreeMap::new(),
+        counts: BTreeMap::new(),
+        assets: BTreeMap::new(),
+        pictures: BTreeMap::new(),
+    };
+    let mut blocks = reader.blocks(body, &rels);
+
+    // Notes follow the text, in the order it first cites them.
+    let (footnotes_xml, endnotes_xml) = (read(&footnotes)?, read(&endnotes)?);
+    let mut cited = 0;
+    while let Some((endnote, id)) = reader.cited.get(cited).cloned() {
+        cited += 1;
+        let (story, element) = if endnote { (&endnotes, "endnote") } else { (&footnotes, "footnote") };
+        let xml = if endnote { &endnotes_xml } else { &footnotes_xml };
+        let (Some((.., rels)), Some(xml)) = (story, xml) else { continue };
+        let Some(note) = xml.root_element().all(element).find(|note| note.attr("id") == Some(&id)) else { continue };
+        let first = reader.paras;
+        reader.plain = true;
+        let mut inner = reader.blocks(note, rels);
+        reader.plain = false;
+        let label = format!("[^{cited}]:");
+        match inner.first_mut() {
+            Some(Block { id, kind: BlockKind::Paragraph, body: Body::Text(runs), .. }) => {
+                // Word starts a note's text with a space after its number.
+                let (was, text) = (runs[0].text.len(), runs[0].text.trim_start().to_owned());
+                runs[0].text = text;
+                let cut = was - runs[0].text.len();
+                runs.insert(0, Run::plain(format!("{label} ")));
+                merge(runs);
+                for place in reader.placed.range_mut(first..).map(|(_, place)| place).filter(|place| place.block == *id)
+                {
+                    place.base += label.len() + 1;
+                    place.cut = cut;
+                    place.len = place.len.saturating_sub(cut);
+                }
+            }
+            _ => inner.insert(0, Block::text((reader.new_id)().as_str(), BlockKind::Paragraph, label)),
+        }
+        blocks.append(&mut inner);
+    }
+    settle(&mut blocks);
+
+    if furniture.iter().any(|part| shows_text(part)) {
+        reader.whole.push(HEADERS.into());
+    }
+    let unknown: BTreeSet<&str> = Style::TYPES
+        .iter()
+        .filter_map(|name| style.types.get(*name))
+        .map(|kind| kind.family.as_str())
+        .filter(|family| ![letters_fonts::SANS, letters_fonts::MONO, letters_fonts::DISPLAY].contains(family))
+        .collect();
+    if seeded && !unknown.is_empty() {
+        let names = unknown.into_iter().collect::<Vec<_>>().join(", ");
+        reader.whole.push(format!(
+            "The style names fonts that Letters does not carry ({names}). Their text shows in the nearest face \
+             Letters has, and the names are kept for export"
+        ));
+    }
+    // What concerns the whole document sits on its first block.
+    if let Some(first) = blocks.first() {
+        let whole = std::mem::take(&mut reader.whole);
+        let notes = whole.into_iter().map(|message| ImportNote { block: first.id.to_string(), message });
+        reader.notes.splice(0..0, notes);
+    }
+
+    let mut document = Document { blocks, ..Document::default() };
+    if let Some(language) = reader.styles.language.as_deref().filter(|tag| is_language(tag)) {
+        document.language = language.to_owned();
+    }
+    let notes = match (&comments, read(&comments)?) {
+        (Some((.., rels)), Some(xml)) => {
+            let threads = read(&threads)?;
+            reader.comments(xml.root_element(), threads.as_ref().map(|xml| xml.root_element()), rels, &document, now)
+        }
+        _ => Vec::new(),
+    };
+    Ok(DocxImport { document, style, notes: reader.notes, comments: notes, assets: reader.assets })
+}
+
+/// Whether a tag is shaped as BCP 47 asks.
+fn is_language(tag: &str) -> bool {
+    !tag.is_empty() && tag.split('-').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// Whether a header or footer shows any words or numbers.
+fn shows_text(part: &str) -> bool {
+    let Ok(xml) = roxmltree::Document::parse(part.trim_start_matches('\u{feff}')) else { return false };
+    xml.descendants().filter(|node| node.is("t")).any(|node| text_of(node).chars().any(char::is_alphanumeric))
+}
+
+/// The text an element holds directly.
+fn text_of(node: Node) -> String {
+    node.children().filter_map(|child| child.text()).collect()
+}
+
+/// Joins neighbouring runs that share their formatting.
+fn merge(runs: &mut Vec<Run>) {
+    runs.dedup_by(|next, last| {
+        let same = last.marks == next.marks && last.link == next.link;
+        if same {
+            last.text.push_str(&next.text);
+        }
+        same
+    });
+}
+
+/// Tidies blocks once they are all read: list items nest one level at a time, and code ends on its last line.
+fn settle(blocks: &mut [Block]) {
+    // The levels Word set the items above this one at, outermost first. Items of one level stay siblings.
+    let mut levels: Vec<u8> = Vec::new();
+    for block in blocks {
+        match &mut block.kind {
+            BlockKind::ListItem { depth, .. } => {
+                while levels.last().is_some_and(|level| *level > *depth) {
+                    levels.pop();
+                }
+                if levels.last() != Some(depth) {
+                    levels.push(*depth);
+                }
+                *depth = (levels.len() - 1) as u8;
+            }
+            _ => levels.clear(),
+        }
+        match &mut block.body {
+            Body::Blocks(children) => settle(children),
+            Body::Text(runs) if matches!(block.kind, BlockKind::Code { .. }) => {
+                if let Some(run) = runs.last_mut() {
+                    run.text.truncate(run.text.trim_end_matches('\n').len());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A place in the text as it is read: a paragraph, and bytes into it.
+#[derive(Clone, Copy, Debug)]
+struct Spot {
+    para: usize,
+    at: usize,
+}
+
+/// Where a paragraph's text ended up.
+#[derive(Clone, Debug)]
+struct Place {
+    block: BlockId,
+    /// Bytes into the block's text at which the paragraph starts.
+    base: usize,
+    /// Bytes taken off the start of the paragraph on its way into the block.
+    cut: usize,
+    len: usize,
+}
+
+/// A field: instructions to Word, then what they last produced.
+#[derive(Default)]
+struct Field {
+    code: String,
+    /// Whether the instructions are over and what follows is shown.
+    shown: bool,
+    /// The address, for a field that is a link.
+    link: Option<String>,
+    /// Whether the field is a table of contents.
+    contents: bool,
+}
+
+/// What surrounds the inline content being read.
+struct Inline<'r> {
+    rels: &'r Rels,
+    link: Option<String>,
+    depth: usize,
+}
+
+impl Inline<'_> {
+    fn deeper(&self, link: Option<String>) -> Self {
+        Self { rels: self.rels, link: link.or_else(|| self.link.clone()), depth: self.depth + 1 }
+    }
+}
+
+/// One paragraph as it is read.
+struct Para {
+    index: usize,
+    role: Role,
+    /// What text of this paragraph's style looks like in Word.
+    styled: RunProps,
+    /// What text of the block this becomes will look like, which marks are measured against.
+    baseline: RunProps,
+    runs: Vec<Run>,
+    /// Bytes of text read so far.
+    len: usize,
+    notes: Vec<String>,
+    /// Blocks that follow the paragraph: its pictures and the text of its text boxes.
+    after: Vec<Block>,
+    /// How many of `after` are pictures that sat in this paragraph.
+    pictures: Vec<BlockId>,
+    /// The state of a checkbox the paragraph opens with.
+    task: Option<bool>,
+    /// Whether Word drew a rule across the page here.
+    ruled: bool,
+    /// Whether any of it belongs to a table of contents.
+    contents: bool,
+}
+
+impl Para {
+    fn push(&mut self, text: &str, marks: &BTreeSet<Mark>, link: Option<String>) {
+        if text.is_empty() {
+            return;
+        }
+        self.len += text.len();
+        match self.runs.last_mut() {
+            Some(last) if last.marks == *marks && last.link == link => last.text.push_str(text),
+            _ => self.runs.push(Run { text: text.into(), marks: marks.clone(), link, ..Run::default() }),
+        }
+    }
+
+    /// Notes something about the block this becomes, once however often it happens.
+    fn note(&mut self, message: &str) {
+        if !self.notes.iter().any(|held| held == message) {
+            self.notes.push(message.into());
+        }
+    }
+
+    fn is_blank(&self) -> bool {
+        self.runs.iter().all(|run| run.text.trim().is_empty())
+    }
+}
+
+/// What the last block of a list of blocks is still gathering paragraphs into.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Open {
+    #[default]
+    Nothing,
+    Quote,
+    Callout(letters_model::Tone),
+    Code,
+}
+
+/// The blocks read so far among siblings.
+#[derive(Default)]
+struct Out {
+    blocks: Vec<Block>,
+    open: Open,
+    /// Notes waiting for the next block, the nearest place to what they are about.
+    pending: Vec<&'static str>,
+    /// The numbers the page will give the list being read, level by level.
+    counters: Vec<u32>,
+}
+
+struct Reader<'a, 'f> {
+    package: Package<'a>,
+    styles: Styles,
+    theme: Theme,
+    numbering: Numbering,
+    /// What a paragraph of the default style looks like.
+    normal: (ParaProps, RunProps),
+    new_id: &'f mut dyn FnMut() -> String,
+    notes: Vec<ImportNote>,
+    /// Notes about the document as a whole.
+    whole: Vec<String>,
+    /// The fields open at this point, outermost first. A field can run across paragraphs.
+    fields: Vec<Field>,
+    /// How many text boxes, cells and controls enclose what is being read.
+    depth: usize,
+    /// Set while reading text that joins no block, such as the words of a comment.
+    detached: bool,
+    /// Set while reading text whose look in Word is beside the point, such as a footnote's.
+    plain: bool,
+    /// Paragraphs read so far.
+    paras: usize,
+    placed: BTreeMap<usize, Place>,
+    /// Where each comment starts and ends, by its id.
+    spans: BTreeMap<String, (Option<Spot>, Option<Spot>)>,
+    /// The notes cited so far, in order: whether each is an endnote, and its id.
+    cited: Vec<(bool, String)>,
+    numbers: BTreeMap<(bool, String), usize>,
+    /// The number Word will give the next item at each level of each list.
+    counts: BTreeMap<String, Vec<Option<u32>>>,
+    assets: BTreeMap<String, Vec<u8>>,
+    /// The asset each picture part became, or why it became none, so that a part is read once.
+    pictures: BTreeMap<String, Result<String, String>>,
+}
+
+impl Reader<'_, '_> {
+    fn id(&mut self) -> BlockId {
+        BlockId::new((self.new_id)())
+    }
+
+    fn whole(&mut self, message: &str) {
+        if !self.whole.iter().any(|held| held == message) {
+            self.whole.push(message.into());
+        }
+    }
+
+    fn note(&mut self, block: &BlockId, message: &str) {
+        if !self.detached {
+            self.notes.push(ImportNote { block: block.to_string(), message: message.into() });
+        }
+    }
+
+    /// Adds a block, with the notes that were waiting for one.
+    fn push(&mut self, block: Block, out: &mut Out) {
+        for message in std::mem::take(&mut out.pending) {
+            self.note(&block.id, message);
+        }
+        out.blocks.push(block);
+    }
+
+    /// Reads the blocks inside a body, a text box, a table cell, a note or a comment.
+    fn blocks(&mut self, parent: Node, rels: &Rels) -> Vec<Block> {
+        let mut out = Out::default();
+        self.depth += 1;
+        if self.depth <= MAX_DEPTH {
+            self.children(parent, rels, &mut out);
+        }
+        self.depth -= 1;
+        // A note with no block after it goes on the last one.
+        if let Some(last) = out.blocks.last().map(|block| block.id.clone()) {
+            for message in std::mem::take(&mut out.pending) {
+                self.note(&last, message);
+            }
+        }
+        out.blocks
+    }
+
+    fn children(&mut self, parent: Node, rels: &Rels, out: &mut Out) {
+        for node in parent.children() {
+            match node.word() {
+                Some("p") => self.paragraph(node, rels, out),
+                Some("tbl") => self.table(node, rels, out),
+                Some("sdt") => {
+                    let gallery = node.child("sdtPr").and_then(|props| props.child("docPartObj"));
+                    let contents = gallery.and_then(|part| part.value("docPartGallery")) == Some("Table of Contents");
+                    if contents {
+                        out.pending.push(CONTENTS);
+                    } else if let Some(content) = node.child("sdtContent") {
+                        self.wrapped(content, rels, out);
+                    }
+                }
+                Some("ins" | "moveTo" | "customXml" | "smartTag") => self.wrapped(node, rels, out),
+                // A comment can start and end between paragraphs.
+                Some("commentRangeStart") => self.span(node).0 = Some(Spot { para: self.paras, at: 0 }),
+                Some("commentRangeEnd") => {
+                    self.span(node).1 = Some(Spot { para: self.paras.saturating_sub(1), at: usize::MAX });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Reads blocks that something wraps without being a block itself.
+    fn wrapped(&mut self, wrapper: Node, rels: &Rels, out: &mut Out) {
+        self.depth += 1;
+        if self.depth <= MAX_DEPTH {
+            self.children(wrapper, rels, out);
+        }
+        self.depth -= 1;
+    }
+
+    fn span(&mut self, mark: Node) -> &mut (Option<Spot>, Option<Spot>) {
+        self.spans.entry(mark.attr("id").unwrap_or_default().to_owned()).or_default()
+    }
+
+    fn paragraph(&mut self, node: Node, rels: &Rels, out: &mut Out) {
+        let index = self.paras;
+        self.paras += 1;
+        let direct = node.child("pPr").map(ParaProps::read).unwrap_or_default();
+        let (style, styled) = self.styles.paragraph(direct.style.as_deref());
+        let props = direct.clone().over(&style);
+        let role = match self.styles.role(direct.style.as_deref()) {
+            // A style Word files under a heading level is a heading, whatever it is called.
+            Role::Body => props.outline.filter(|level| *level < 9).map_or(Role::Body, |level| Role::Heading(level + 1)),
+            role => role,
+        };
+        // Body text is measured against the default style, so what another style adds to it shows as marks.
+        let (expected, baseline) = match role {
+            Role::Body => (self.normal.0.align, self.normal.1.clone()),
+            _ => (style.align, styled.clone()),
+        };
+        let mut para = Para {
+            index,
+            role,
+            styled,
+            baseline,
+            runs: Vec::new(),
+            len: 0,
+            notes: Vec::new(),
+            after: Vec::new(),
+            pictures: Vec::new(),
+            task: None,
+            ruled: direct.ruled == Some(true),
+            contents: role == Role::Contents || self.fields.iter().any(|field| field.contents),
+        };
+        self.inline(node, &Inline { rels, link: None, depth: 0 }, &mut para);
+        if !para.is_blank() && props.align.unwrap_or(Align::Start) != expected.unwrap_or(Align::Start) {
+            self.whole(DIRECT);
+        }
+        self.emit(para, &props, out);
+    }
+
+    /// Turns a paragraph into its block, or into more of the block before it.
+    fn emit(&mut self, mut para: Para, props: &ParaProps, out: &mut Out) {
+        if para.contents {
+            if !out.pending.contains(&CONTENTS) {
+                out.pending.push(CONTENTS);
+            }
+            // What floats beside an entry is no part of the table.
+            if !para.after.is_empty() {
+                self.close(out);
+            }
+            for block in std::mem::take(&mut para.after) {
+                self.push(block, out);
+            }
+            return;
+        }
+        let blank = para.is_blank();
+        let level = props.list.as_ref().filter(|(list, _)| list != "0").map(|(list, depth)| {
+            let level = self.numbering.level(list, *depth);
+            // Word counts on through a list wherever its items sit.
+            let counts = self.counts.entry(list.clone()).or_default();
+            let at = usize::from(*depth);
+            let reached = counts.get(at).copied().flatten().unwrap_or(level.start);
+            // An item under this one starts its own count again.
+            counts.resize(at + 1, None);
+            counts[at] = Some(if blank { reached } else { reached.saturating_add(1) });
+            (level, *depth, reached)
+        });
+        let named_depth = self.styles.depth(props.style.as_deref());
+        let level = level.map(|(level, depth, reached)| (level, depth.max(named_depth), reached));
+        let mut after = std::mem::take(&mut para.after);
+        let mut runs = std::mem::take(&mut para.runs);
+        // Tools without a checkbox of their own write a task as a bullet whose text opens with a box.
+        let mut cut = 0;
+        if para.task.is_none() && level.is_some_and(|(level, ..)| level.kind == Some(ListKind::Bullet)) {
+            let boxes = [(TASK_OPEN, false), (TASK_DONE, true), ('\u{2612}', true)];
+            let first = runs.first_mut().and_then(|run| {
+                let (_, checked) = boxes.iter().find(|(glyph, _)| run.text.starts_with(*glyph))?;
+                let rest = run.text[TASK_OPEN.len_utf8()..].strip_prefix([' ', '\u{a0}', '\t'])?.to_owned();
+                cut = run.text.len() - rest.len();
+                run.text = rest;
+                Some(*checked)
+            });
+            para.task = first;
+        }
+        // The space between a checkbox and its text is not part of the text.
+        if para.task.is_some() && cut == 0 {
+            if let Some(run) = runs.first_mut() {
+                let rest = run.text.trim_start_matches([' ', '\u{a0}', '\t']).to_owned();
+                cut = run.text.len() - rest.len();
+                run.text = rest;
+            }
+            runs.retain(|run| !run.text.is_empty());
+        }
+        let place = |reader: &mut Self, block: &BlockId, base: usize| {
+            if !reader.detached {
+                reader.placed.insert(para.index, Place { block: block.clone(), base, cut, len: para.len - cut });
+            }
+        };
+
+        let mut notes = std::mem::take(&mut para.notes);
+        if blank && para.role == Role::Code && out.open == Open::Code {
+            // An empty line of code is still a line.
+            if let Some(Body::Text(code)) = out.blocks.last_mut().map(|block| &mut block.body) {
+                code.push(Run::plain("\n"));
+                merge(code);
+            }
+        } else if blank && (para.ruled || para.role == Role::Divider) {
+            let block = Block::new(self.id(), BlockKind::Divider);
+            place(self, &block.id, 0);
+            self.close(out);
+            self.push(block, out);
+        } else if blank {
+            // Word spaces text with empty paragraphs. Here the style does that.
+        } else if para.role == Role::Code {
+            let text: String = runs.iter().map(|run| run.text.as_str()).collect();
+            let open = out.blocks.last_mut().filter(|_| out.open == Open::Code);
+            if let Some(Block { id, body: Body::Text(code), .. }) = open {
+                let base = code.iter().map(|run| run.text.len()).sum::<usize>() + 1;
+                code.push(Run::plain(format!("\n{text}")));
+                merge(code);
+                let id = id.clone();
+                place(self, &id, base);
+                for message in &notes {
+                    if !self.notes.iter().any(|held| held.block == id.as_str() && held.message == *message) {
+                        self.note(&id, message);
+                    }
+                }
+            } else {
+                self.close(out);
+                let block = Block::text(self.id(), BlockKind::Code { language: None }, text);
+                place(self, &block.id, 0);
+                self.attach(&block.id, &notes);
+                self.push(block, out);
+                out.open = Open::Code;
+            }
+        } else if para.role == Role::Caption && captions(out.blocks.last()) && after.is_empty() {
+            let figure = out.blocks.last_mut().expect("a figure was just found");
+            figure.extra.insert("content".into(), Run::list_to_value(&runs));
+            let id = figure.id.clone();
+            place(self, &id, 0);
+            self.attach(&id, &notes);
+        } else {
+            let list = match (para.task, level) {
+                (Some(checked), level) => Some((ListKind::Task { checked }, level.map_or(0, |(_, depth, _)| depth))),
+                (None, Some((level, depth, _))) => level.kind.map(|kind| (kind, depth)),
+                (None, None) => None,
+            };
+            let item = list.map(|(list, depth)| BlockKind::ListItem { list, depth });
+            let (kind, wrapper) = match para.role {
+                Role::Heading(level) => {
+                    if level > 4 {
+                        notes.push(format!("Heading level {level} became level 4"));
+                    }
+                    (BlockKind::Heading { level: level.min(4) }, Open::Nothing)
+                }
+                Role::Title => {
+                    notes.push(TITLE.into());
+                    (BlockKind::Heading { level: 1 }, Open::Nothing)
+                }
+                Role::Quote => (item.unwrap_or(BlockKind::Paragraph), Open::Quote),
+                Role::Callout(tone) => (item.unwrap_or(BlockKind::Paragraph), Open::Callout(tone)),
+                _ => (item.unwrap_or(BlockKind::Paragraph), Open::Nothing),
+            };
+            let numbered = level.is_some_and(|(level, ..)| level.kind == Some(ListKind::Ordered));
+            if matches!(kind, BlockKind::Heading { .. }) && numbered {
+                self.whole(HEADING_NUMBERS);
+            }
+            if wrapper != out.open {
+                // A list does not run on from the page into a quote, or out of one.
+                out.counters.clear();
+                self.close(out);
+            }
+
+            // The page numbers a list from 1 wherever it starts, and Word may not.
+            match &kind {
+                BlockKind::ListItem { list, depth } => {
+                    let depth = usize::from(*depth);
+                    out.counters.resize(depth + 1, 0);
+                    out.counters[depth] = if *list == ListKind::Ordered { out.counters[depth] + 1 } else { 0 };
+                    let reached = level.map_or(1, |(.., reached)| reached);
+                    if *list == ListKind::Ordered && out.counters[depth] == 1 && reached != 1 {
+                        notes.push(format!("Numbering started at {reached} and now starts at 1"));
+                    }
+                }
+                _ => out.counters.clear(),
+            }
+
+            let mut block = Block::new(self.id(), kind);
+            block.body = Body::Text(runs);
+            place(self, &block.id, 0);
+            self.attach(&block.id, &notes);
+            match wrapper {
+                Open::Nothing => self.push(block, out),
+                _ if out.open == wrapper => {
+                    if let Some(Body::Blocks(inner)) = out.blocks.last_mut().map(|block| &mut block.body) {
+                        inner.push(block);
+                    }
+                }
+                _ => {
+                    let kind = match wrapper {
+                        Open::Callout(tone) => BlockKind::Callout { tone },
+                        _ => BlockKind::Quote,
+                    };
+                    let mut outer = Block::new(self.id(), kind);
+                    outer.body = Body::Blocks(vec![block]);
+                    self.push(outer, out);
+                    out.open = wrapper;
+                }
+            }
+        }
+
+        if !after.is_empty() {
+            self.close(out);
+            for block in after.drain(..) {
+                if !blank && para.pictures.contains(&block.id) {
+                    self.note(&block.id, PICTURE_MOVED);
+                }
+                self.push(block, out);
+            }
+        }
+    }
+
+    /// Ends whatever the last block was gathering.
+    fn close(&mut self, out: &mut Out) {
+        out.open = Open::Nothing;
+    }
+
+    fn attach(&mut self, block: &BlockId, notes: &[String]) {
+        for message in notes {
+            self.note(block, message);
+        }
+    }
+
+    /// Reads a table. The document holds none yet, so each row becomes a line of its cells.
+    fn table(&mut self, table: Node, rels: &Rels, out: &mut Out) {
+        self.close(out);
+        let mut first = true;
+        let mut after = Vec::new();
+        let rows =
+            table.descendants().filter(|node| node.is("tr") && node.ancestors().find(|a| a.is("tbl")) == Some(table));
+        for row in rows {
+            let (from, noted) = (self.paras, self.notes.len());
+            let mut runs: Vec<Run> = Vec::new();
+            let mut moved = BTreeMap::new();
+            let cells =
+                row.descendants().filter(|node| node.is("tc") && node.ancestors().find(|a| a.is("tr")) == Some(row));
+            for (index, cell) in cells.enumerate() {
+                if index > 0 {
+                    runs.push(Run::plain("\t"));
+                }
+                let blocks = self.blocks(cell, rels);
+                flatten(blocks, &mut runs, &mut moved, &mut after);
+            }
+            merge(&mut runs);
+            if runs.iter().all(|run| run.text.trim().is_empty()) {
+                // A row of nothing leaves no block for its places and notes to be on.
+                self.placed.retain(|para, place| *para < from || !moved.contains_key(&place.block));
+                let mut made = self.notes.split_off(noted.min(self.notes.len()));
+                made.retain(|note| !moved.contains_key(&BlockId::new(&note.block)));
+                self.notes.append(&mut made);
+                continue;
+            }
+            let mut block = Block::new(self.id(), BlockKind::Paragraph);
+            block.body = Body::Text(runs);
+            self.replace(from, noted, &moved, &block.id);
+            if std::mem::take(&mut first) {
+                self.note(&block.id, TABLE);
+            }
+            self.push(block, out);
+        }
+        for block in after {
+            self.push(block, out);
+        }
+    }
+
+    /// Moves the places and notes of blocks that were flattened into `into`: those of the paragraphs read
+    /// since `from`, and the notes made since there were `noted` of them.
+    fn replace(&mut self, from: usize, noted: usize, moved: &BTreeMap<BlockId, usize>, into: &BlockId) {
+        for (_, place) in self.placed.range_mut(from..) {
+            if let Some(base) = moved.get(&place.block) {
+                place.base += base;
+                place.block = into.clone();
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let mut recent = self.notes.split_off(noted.min(self.notes.len()));
+        for note in &mut recent {
+            if moved.contains_key(&BlockId::new(&note.block)) {
+                note.block = into.to_string();
+            }
+        }
+        recent.retain(|note| note.block != into.as_str() || seen.insert(note.message.clone()));
+        self.notes.append(&mut recent);
+    }
+}
+
+/// Whether the last block is a picture that has no caption yet.
+fn captions(last: Option<&Block>) -> bool {
+    last.is_some_and(|block| {
+        matches!(&block.kind, BlockKind::Unknown { type_name } if type_name == "figure")
+            && !block.extra.contains_key("content")
+    })
+}
+
+/// Joins the text of blocks into one list of runs, a line for each block. Pictures cannot join text, so they
+/// are set aside. `moved` records where each block's text starts in the result.
+fn flatten(blocks: Vec<Block>, runs: &mut Vec<Run>, moved: &mut BTreeMap<BlockId, usize>, aside: &mut Vec<Block>) {
+    for block in blocks {
+        match block.body {
+            Body::Text(text) => {
+                let len: usize = runs.iter().map(|run| run.text.len()).sum();
+                let fresh = runs.last().is_none_or(|last| last.text.ends_with(['\t', '\n']));
+                if !fresh {
+                    runs.push(Run::plain("\n"));
+                }
+                moved.insert(block.id, len + usize::from(!fresh));
+                runs.extend(text);
+            }
+            Body::Blocks(inner) => {
+                moved.insert(block.id, runs.iter().map(|run| run.text.len()).sum());
+                flatten(inner, runs, moved, aside);
+            }
+            Body::None if matches!(&block.kind, BlockKind::Unknown { .. }) => aside.push(block),
+            Body::None => {}
+        }
+    }
+}

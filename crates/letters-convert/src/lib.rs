@@ -1,11 +1,14 @@
 //! Import and export. Conversion is best effort in both directions.
 //!
 //! Markdown is first: it is the exchange format and what interaction tests assert on. HTML is an export, one
-//! file that stands alone, and what the clipboard carries to and from other applications.
+//! file that stands alone, and what the clipboard carries to and from other applications. Word documents are
+//! read and written whole, styles included.
 
+mod docx;
 mod html;
 mod markdown;
 
+pub use docx::{DocxError, DocxImport, from_docx, to_docx};
 pub use html::{Assets, from_html, to_html, to_html_fragment};
 pub use markdown::{from_markdown, to_markdown};
 

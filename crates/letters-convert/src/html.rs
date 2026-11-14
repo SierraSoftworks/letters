@@ -328,7 +328,7 @@ fn text(text: &str, out: &mut String) {
 }
 
 /// A link's address as a browser will read it, or `None` for one that would run script when followed.
-fn href(url: &str) -> Option<String> {
+pub(crate) fn href(url: &str) -> Option<String> {
     // A browser drops these before it looks for the scheme, so they cannot be left to hide one.
     let url: String = url.chars().filter(|c| !c.is_control()).collect();
     let url = url.trim();

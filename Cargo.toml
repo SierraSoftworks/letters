@@ -53,6 +53,8 @@ parley = { version = "0.13", default-features = false, features = ["std"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 # Tokenizes clipboard HTML. No dependencies of its own.
 html5gum = "0.9"
+# Reads the XML inside a .docx. Read-only, no dependencies of its own.
+roxmltree = "0.21"
 # Reads Hunspell dictionaries. MPL-2.0, used unmodified.
 spellbook = "0.4"
 # yewi's highlighter. Its own lexers need no dependencies; the `syntect` feature adds grammars and weight.
