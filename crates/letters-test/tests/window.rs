@@ -648,6 +648,27 @@ fn a_dark_window_shows_a_dark_page_with_light_text() {
 }
 
 #[test]
+fn a_scroll_by_part_of_a_pixel_moves_the_page_by_whole_device_pixels() {
+    // The device pixels in a logical one, and what a trackpad sends.
+    let cases: [(f32, &[f32]); 4] =
+        [(1.0, &[10.3, 10.3, -4.6]), (2.0, &[10.3, 0.3, 7.25]), (1.5, &[3.1, 3.1, 3.1]), (1.0, &[0.2; 10])];
+    for (scale, deltas) in cases {
+        let mut window = long();
+        window.ui().resize(WINDOW, scale);
+        window.click_at(Point { x: 500.0, y: 300.0 }).paint();
+        let start = window.ui().caret_rect().unwrap().y;
+        let mut asked = 0.0;
+        for delta in deltas {
+            window.scroll_at(Point { x: 500.0, y: 400.0 }, *delta).paint();
+            asked += delta;
+            let moved = (start - window.ui().caret_rect().unwrap().y) * scale;
+            assert!((moved - moved.round()).abs() < 0.01, "at scale {scale} the page sits {moved} device pixels down");
+            assert!((moved - asked * scale).abs() <= 0.51, "at scale {scale} it follows the {asked} px asked: {moved}");
+        }
+    }
+}
+
+#[test]
 fn the_rest_of_a_long_document_is_laid_out_in_idle_time_without_moving_the_page() {
     let mut window = long();
     window.scroll_at(Point { x: 500.0, y: 400.0 }, 3000.0).click_at(Point { x: 500.0, y: 300.0 });

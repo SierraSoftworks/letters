@@ -79,6 +79,9 @@ pub trait App {
     /// follow on their own.
     fn keys(&mut self, _keys: Keys) {}
 
+    /// Told how many device pixels make one logical pixel, at first and whenever that changes.
+    fn scale(&mut self, _scale: f32) {}
+
     /// Does a little of any work that was put off, such as laying out text that is out of sight. Returns
     /// whether there was any. It is called while nothing else is happening.
     fn idle(&mut self) -> bool {
@@ -195,6 +198,9 @@ impl<A: App> Ui<A> {
     /// `size` is in logical pixels. `scale` is the device pixels in one of them, for crisp edges.
     pub fn resize(&mut self, size: Size, scale: f32) {
         if size != self.size || scale != self.scale {
+            if scale != self.scale {
+                self.app.scale(scale);
+            }
             (self.size, self.scale) = (size, scale);
             self.stale.view = true;
         }

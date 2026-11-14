@@ -215,7 +215,10 @@ pub struct EditorApp {
     column: (f32, f32),
     /// The height of the page area.
     height: f32,
+    /// How far down the page was scrolled, which may be part of a pixel. See `scrolled`.
     scroll: f32,
+    /// The device pixels in a logical one.
+    scale: f32,
     /// Whether the layout still holds estimated heights, to be replaced in idle time.
     estimated: bool,
     name: String,
@@ -243,6 +246,7 @@ impl EditorApp {
             column: (0.0, 0.0),
             height: 0.0,
             scroll: 0.0,
+            scale: 1.0,
             estimated: true,
             name: String::new(),
             save: SaveState::default(),
@@ -337,11 +341,18 @@ impl EditorApp {
 
     /// The part of the document in view, in the layout's coordinates.
     fn viewport(&self) -> Rect {
-        Rect::new(0.0, self.scroll - TOP, self.column.1, self.height)
+        Rect::new(0.0, self.scrolled() - TOP, self.column.1, self.height)
     }
 
     fn max_scroll(&self) -> f32 {
         (self.layout.height() + 2.0 * TOP - self.height).max(0.0)
+    }
+
+    /// How far down the page shows: the nearest whole device pixel to where it was scrolled to. A frame that
+    /// differs from the last by whole pixels can move them, and hinted text stays sharp. Parts of a pixel
+    /// still add up in `scroll`.
+    fn scrolled(&self) -> f32 {
+        (self.scroll * self.scale).round() / self.scale
     }
 
     fn scroll_by(&mut self, delta: f32) {
@@ -365,7 +376,7 @@ impl EditorApp {
 
     /// The text position under a point of the page area.
     fn hit(&self, at: Point) -> Option<Pos> {
-        self.layout.hit(Point { x: at.x - self.column.0, y: at.y + self.scroll - TOP })
+        self.layout.hit(Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP })
     }
 
     fn pointer(&mut self, event: Pointer, platform: &mut dyn Platform) {
@@ -428,7 +439,7 @@ impl EditorApp {
             list.items.extend(self.layout.selection_in(&composing, viewport).into_iter().map(under));
         }
 
-        let origin = Point { x: left, y: TOP - self.scroll };
+        let origin = Point { x: left, y: TOP - self.scrolled() };
         let caret = selection.and_then(|selection| self.layout.caret(&selection.head));
         let caret =
             caret.map(|caret| Rect { x: origin.x + caret.x, y: origin.y + caret.y, width: CARET_WIDTH, ..caret });
@@ -437,7 +448,7 @@ impl EditorApp {
             origin,
             page: self.palette.page,
             content: self.layout.height() + 2.0 * TOP,
-            scroll: self.scroll,
+            scroll: self.scrolled(),
         };
         let mut element = Element::canvas(Rc::new(paint))
             .grow(1.0)
@@ -464,7 +475,7 @@ impl EditorApp {
     /// The heading the top of the view is under.
     fn section(&self) -> Option<&BlockId> {
         // A heading brought to the top sits just under the page's top margin.
-        let top = self.layout.hit(Point { x: 0.0, y: self.scroll + CHAPTER_PITCH.0 })?;
+        let top = self.layout.hit(Point { x: 0.0, y: self.scrolled() + CHAPTER_PITCH.0 })?;
         let mut section = None;
         for block in self.editor.doc().walk() {
             if matches!(block.kind, BlockKind::Heading { .. }) {
@@ -909,6 +920,10 @@ impl App for EditorApp {
             Keys::Standard => Keymap::standard(),
             Keys::Mac => Keymap::mac(),
         });
+    }
+
+    fn scale(&mut self, scale: f32) {
+        self.scale = scale;
     }
 
     fn scheme(&mut self, scheme: Scheme) {
