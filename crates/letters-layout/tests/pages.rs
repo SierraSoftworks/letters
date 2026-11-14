@@ -304,6 +304,22 @@ fn print_shows_the_document_and_nothing_of_the_editor() {
 }
 
 #[test]
+fn a_sheet_is_white_paper_whatever_the_theme() {
+    let heading = Block::text("h", BlockKind::Heading { level: 1 }, "Household rates");
+    let (mut layout, pages) = paged(&doc(vec![heading, paragraph("a", PROSE), paragraph("b", PROSE)]), 240.0);
+    let glyphs = |items: &[Item]| !items.is_empty() && items.iter().all(|item| matches!(item, Item::Glyphs { .. }));
+    let light = page(&layout, &pages, 0);
+    assert!(glyphs(&light.text) && glyphs(&light.beneath), "nothing is painted behind the text of a sheet");
+    assert!(glyphs(&painted(&layout, everything())), "nor behind the text on screen");
+
+    layout.set_palette(dark());
+    let sheet = page(&layout, &pages, 0);
+    assert!(sheet.text == light.text && sheet.beneath == light.beneath, "a dark theme changes nothing on paper");
+    let colors = |items: &[Item]| items.iter().filter_map(color_of).collect::<Vec<_>>();
+    assert!(colors(&painted(&layout, everything())) != colors(&light.text), "while the screen takes its colours");
+}
+
+#[test]
 fn pages_follow_edits() {
     let edits: Vec<(&str, Vec<Op>)> = vec![
         ("typing a page's worth", vec![Op::InsertText { at: Pos::new("a", 5), text: PROSE.repeat(4) }]),

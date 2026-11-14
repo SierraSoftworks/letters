@@ -213,9 +213,12 @@ impl DocLayout {
         self.state.borrow_mut().paginate(page)
     }
 
-    /// Emits one sheet of `pages`, with the sheet's top left at the origin: the text in its text area, as
-    /// the document's style has it, and the page number beneath. The paper itself is the caller's to draw.
-    /// Nothing that belongs to editing is drawn: no markers, no spelling marks and no composition.
+    /// Emits one sheet of `pages`, with the sheet's top left at the origin: the text in its text area and
+    /// the page number beneath. Nothing that belongs to editing is drawn: no markers, no spelling marks and
+    /// no composition.
+    ///
+    /// A sheet is white paper. It is painted with [`Palette::LIGHT`] whatever palette is set, and nothing
+    /// is drawn behind the text, so the caller fills the paper with that palette's `page` colour.
     pub fn paint_page(&self, pages: &Pages, index: usize, out: &mut DisplayList) {
         self.state.borrow_mut().paint_page(pages, index, out);
     }
@@ -615,6 +618,13 @@ impl State {
     }
 
     fn paint_page(&mut self, pages: &Pages, index: usize, out: &mut DisplayList) {
+        // Paper is white whatever the screen's theme, so a sheet takes the colours the style was written for.
+        let screen = std::mem::replace(&mut self.palette, Palette::LIGHT);
+        self.sheet(pages, index, out);
+        self.palette = screen;
+    }
+
+    fn sheet(&mut self, pages: &Pages, index: usize, out: &mut DisplayList) {
         let (Some(sheet), Some(origin)) = (pages.sheets.get(index), pages.origin(index)) else { return };
         let (area, (top, bottom)) = (pages.area, sheet.band);
         if bottom > top {
