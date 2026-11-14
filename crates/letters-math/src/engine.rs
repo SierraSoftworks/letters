@@ -2,12 +2,14 @@
 //! so another engine can take its place here.
 
 use std::collections::HashMap;
+use std::mem;
 use std::sync::Arc;
 
 use letters_render::{Color, Glyph, Item, PathEl, Point, Rect, Size};
 use ratex_font::FontId;
 use ratex_layout::{FallbackGlyphMetrics, LayoutOptions};
 use ratex_parser::ParseError;
+use ratex_parser::parse_node::{ArrayTag, ParseNode, ProofBranch};
 use ratex_parser::parser::Parser;
 use ratex_types::display_item::DisplayItem;
 use ratex_types::math_style::MathStyle;
@@ -26,7 +28,10 @@ const HAIRLINE: f32 = 1.0;
 const MAX_DASHES: usize = 1024;
 
 pub(crate) fn typeset(source: &str, style: &Style) -> Result<Formula, Error> {
-    let nodes = Parser::new(source).parse().map_err(|error| parse_error(source, error))?;
+    let mut nodes = Parser::new(source).parse().map_err(|error| parse_error(source, error))?;
+    if !style.links {
+        unlink(&mut nodes);
+    }
 
     let options = LayoutOptions {
         style: if style.display { MathStyle::Display } else { MathStyle::Text },
@@ -102,6 +107,109 @@ fn parse_error(source: &str, error: ParseError) -> Error {
         span.start <= span.end && source.is_char_boundary(span.start) && source.is_char_boundary(span.end)
     });
     Error { message: error.message.replace("'EOF'", "the end of the formula"), span }
+}
+
+/// Sets every link as its plain argument: the text of `\href` and the address of `\url`, drawn as what is
+/// around them is.
+fn unlink(nodes: &mut [ParseNode]) {
+    // A stack, since the source decides how deep the tree goes.
+    let mut pending: Vec<&mut ParseNode> = nodes.iter_mut().collect();
+    while let Some(node) = pending.pop() {
+        if let ParseNode::Href { mode, body, loc, .. } = node {
+            *node = ParseNode::OrdGroup { mode: *mode, body: mem::take(body), semisimple: None, loc: loc.take() };
+        }
+        children(node, &mut pending);
+    }
+}
+
+/// Adds the nodes directly inside `node`. Every kind of node is named, so that a kind new to the engine
+/// cannot hide a link: it does not compile until it has a place here.
+fn children<'a>(node: &'a mut ParseNode, out: &mut Vec<&'a mut ParseNode>) {
+    use ParseNode as N;
+    match node {
+        N::Atom { .. }
+        | N::MathOrd { .. }
+        | N::TextOrd { .. }
+        | N::OpToken { .. }
+        | N::AccentToken { .. }
+        | N::SpacingNode { .. }
+        | N::ColorToken { .. }
+        | N::Size { .. }
+        | N::DelimSizing { .. }
+        | N::LeftRightRight { .. }
+        | N::Middle { .. }
+        | N::Rule { .. }
+        | N::Kern { .. }
+        | N::Cr { .. }
+        | N::Infix { .. }
+        | N::Internal { .. }
+        | N::Verb { .. }
+        | N::Url { .. }
+        | N::Raw { .. }
+        | N::NoNumber { .. }
+        | N::IncludeGraphics { .. } => {}
+        N::OrdGroup { body, .. }
+        | N::OperatorName { body, .. }
+        | N::Text { body, .. }
+        | N::Color { body, .. }
+        | N::Styling { body, .. }
+        | N::Sizing { body, .. }
+        | N::LeftRight { body, .. }
+        | N::Phantom { body, .. }
+        | N::MClass { body, .. }
+        | N::Href { body, .. }
+        | N::HBox { body, .. }
+        | N::Pmb { body, .. }
+        | N::Html { body, .. } => out.extend(body),
+        N::Op { body, .. } => out.extend(body.iter_mut().flatten()),
+        N::Font { body, .. }
+        | N::Overline { body, .. }
+        | N::Underline { body, .. }
+        | N::VPhantom { body, .. }
+        | N::Smash { body, .. }
+        | N::Enclose { body, .. }
+        | N::Lap { body, .. }
+        | N::RaiseBox { body, .. }
+        | N::VCenter { body, .. }
+        | N::Accent { base: body, .. }
+        | N::AccentUnder { base: body, .. }
+        | N::HorizBrace { base: body, .. }
+        | N::Environment { name_group: body, .. }
+        | N::CdLabel { label: body, .. }
+        | N::CdLabelParent { fragment: body, .. } => out.push(body),
+        N::GenFrac { numer, denom, .. } => out.extend([&mut **numer, &mut **denom]),
+        N::Sqrt { body, index: other, .. } | N::XArrow { body, below: other, .. } => {
+            out.push(body);
+            out.extend(other.as_deref_mut());
+        }
+        N::SupSub { base, sup, sub, .. } => out.extend([base, sup, sub].into_iter().filter_map(Option::as_deref_mut)),
+        N::CdArrow { label_above, label_below, .. } => {
+            out.extend([label_above, label_below].into_iter().filter_map(Option::as_deref_mut));
+        }
+        N::MathChoice { display, text, script, scriptscript, .. } => {
+            out.extend([display, text, script, scriptscript].into_iter().flatten());
+        }
+        N::Tag { body: first, tag: second, .. } | N::HtmlMathMl { html: first, mathml: second, .. } => {
+            out.extend([first, second].into_iter().flatten());
+        }
+        N::Array { body, tags, .. } => {
+            out.extend(body.iter_mut().flatten());
+            for tag in tags.iter_mut().flatten() {
+                match tag {
+                    ArrayTag::Explicit(nodes) => out.extend(nodes),
+                    ArrayTag::Auto(_) => {}
+                }
+            }
+        }
+        N::ProofTree { tree, .. } => {
+            let mut branches = vec![tree];
+            while let Some(ProofBranch { conclusion, premises, left_label, right_label, .. }) = branches.pop() {
+                out.extend(conclusion);
+                out.extend([left_label, right_label].into_iter().flatten().flatten());
+                branches.extend(premises);
+            }
+        }
+    }
 }
 
 /// Measurements for the characters of the source that only the body face draws.

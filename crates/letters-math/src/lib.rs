@@ -5,8 +5,9 @@
 //! [`Cache`], since a formula is set far more often than it changes. [`commands`] and [`environments`] list
 //! what the engine understands, for completion while typing.
 //!
-//! A formula holds only glyphs, rules and outlines. Nothing in one can load or link: `\href` sets its text
-//! and drops the address, and there is no command for an image.
+//! A formula holds only glyphs, rules and outlines, so nothing in one can load, and there is no command for
+//! an image. `\href` and `\url` are drawn as links only where [`Style::links`] allows it. The address is not
+//! kept either way, so a formula cannot yet be clicked through.
 //!
 //! The engine is RaTeX and the faces are KaTeX's, compiled in. Neither shows in this interface.
 
@@ -38,6 +39,9 @@ pub struct Style {
     /// Sets the formula as a block of its own: full-size fractions, and limits above and below their
     /// operators. Otherwise it is set tight, to sit in a line of text.
     pub display: bool,
+    /// Lets `\href` and `\url` link. Otherwise each is set as its plain argument: the text of `\href`, the
+    /// address of `\url`. Only a document that is trusted may link.
+    pub links: bool,
 }
 
 /// A typeset formula. All lengths are logical pixels.

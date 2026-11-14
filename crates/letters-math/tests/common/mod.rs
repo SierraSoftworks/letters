@@ -15,9 +15,9 @@ pub const INK: Color = Color::rgb(24, 28, 40);
 /// Room left around a formula when it is drawn, in logical pixels.
 pub const MARGIN: f32 = 16.0;
 
-/// The inline style at a size.
+/// The inline style at a size, as a document that is not trusted sets it.
 pub fn inline(size: f32) -> Style {
-    Style { size, color: INK, display: false }
+    Style { size, color: INK, display: false, links: false }
 }
 
 /// The display style at a size.

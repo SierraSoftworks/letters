@@ -23,10 +23,14 @@ fn the_same_source_and_style_are_typeset_once() {
 #[test]
 fn each_part_of_the_style_is_part_of_the_key() {
     let base = inline(16.0);
-    let others =
-        [Style { size: 17.0, ..base }, Style { color: Color::rgb(200, 0, 0), ..base }, Style { display: true, ..base }];
+    let others = [
+        Style { size: 17.0, ..base },
+        Style { color: Color::rgb(200, 0, 0), ..base },
+        Style { display: true, ..base },
+        Style { links: true, ..base },
+    ];
     let mut cache = Cache::default();
-    let source = r"\sum_{i=0}^{n} i";
+    let source = r"\sum_{i=0}^{n} \href{https://example.com}{i}";
     let plain = cache.typeset(source, &base).expect("a good source");
 
     for style in others {
@@ -35,7 +39,7 @@ fn each_part_of_the_style_is_part_of_the_key() {
         assert_ne!(*styled, *plain, "{style:?} gave the formula of another style");
         assert_eq!(*styled, set(source, &style));
     }
-    assert_eq!(cache.len(), 4);
+    assert_eq!(cache.len(), 5);
 }
 
 #[test]

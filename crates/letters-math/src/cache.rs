@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
+use letters_render::Color;
+
 use crate::{Error, Formula, Style, typeset};
 
 /// Typesets formulas and keeps the results, by source and style. A source that fails keeps its error.
@@ -81,11 +83,18 @@ impl Cache {
 /// slot, and the later one takes it.
 fn key(source: &str, style: &Style) -> u64 {
     let mut hasher = DefaultHasher::new();
-    (source, style.size.to_bits(), style.color, style.display).hash(&mut hasher);
+    (source, parts(style)).hash(&mut hasher);
     hasher.finish()
 }
 
-/// Whether two styles set a formula alike. Sizes compare by their bits, as the key hashes them.
+/// Whether two styles set a formula alike.
 fn same(a: &Style, b: &Style) -> bool {
-    (a.size.to_bits(), a.color, a.display) == (b.size.to_bits(), b.color, b.display)
+    parts(a) == parts(b)
+}
+
+/// Everything in a style, with the size as its bits so that it can be hashed. Each field is named, so that
+/// a new one cannot be left out of the key.
+fn parts(style: &Style) -> (u32, Color, bool, bool) {
+    let Style { size, color, display, links } = *style;
+    (size.to_bits(), color, display, links)
 }
