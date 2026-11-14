@@ -14,4 +14,4 @@ pub use doc::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMA
 pub use json::JsonError;
 pub use model::{Change, Model, Op, OpError};
 pub use pos::{Pos, Selection};
-pub use style::{Align, Page, Style, TextStyle};
+pub use style::{Align, Page, STYLE_FORMAT, Style, TextStyle};
