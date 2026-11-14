@@ -1,7 +1,11 @@
 //! Naming, renaming and moving documents, and remembering the ones opened lately.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use common::Writer;
 
 use letters::files;
 use letters::library::{Library, Place, Refused, free_path, has_content};
@@ -36,7 +40,8 @@ impl Desk {
     fn theirs(&self, inside: &str) -> PathBuf {
         let path = self.folder("").join(inside);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        files::Home::new(&path, Style::default()).save(&document(&[(TEXT, "Theirs")])).unwrap();
+        let document = document(&[(TEXT, "Theirs")]);
+        Writer::new(&document, Style::default()).save(&files::Home::new(&path), &document);
         path
     }
 
@@ -62,13 +67,21 @@ fn document(blocks: &[(BlockKind, &str)]) -> Document {
     Document { blocks: blocks.iter().enumerate().map(block).collect(), ..Document::default() }
 }
 
+/// A new document being written: where it is kept, and what saves it once there is something to save.
+#[derive(Default)]
+struct Draft {
+    place: Place,
+    writer: Option<Writer>,
+}
+
 /// Saves as the app does, with the caret in block `caret`. Returns where the document ended up.
-fn save(place: &mut Place, document: &Document, caret: Option<&str>, library: &Library) -> Option<PathBuf> {
+fn save(draft: &mut Draft, document: &Document, caret: Option<&str>, library: &Library) -> Option<PathBuf> {
     let caret = caret.map(BlockId::from);
-    let home = place.settle(document, caret.as_ref(), &Style::default(), library).unwrap()?.clone();
-    let (home, _) = home.save(document).unwrap();
-    place.saved(home);
-    place.path().map(Path::to_owned)
+    let home = draft.place.settle(document, caret.as_ref(), library).unwrap()?.clone();
+    let writer = draft.writer.get_or_insert_with(|| Writer::new(document, Style::default()));
+    let (home, _) = writer.save(&home, document);
+    draft.place.saved(home);
+    draft.place.path().map(Path::to_owned)
 }
 
 fn read(path: &Path) -> Document {
@@ -79,16 +92,16 @@ fn read(path: &Path) -> Document {
 fn a_new_document_has_no_file_until_it_has_content() {
     let desk = Desk::new("content");
     let library = desk.library();
-    let mut place = Place::new();
+    let mut draft = Draft::default();
 
     for empty in [files::blank(), document(&[(H1, "  ")]), Document::default()] {
         assert!(!has_content(&empty));
-        assert_eq!(save(&mut place, &empty, None, &library), None);
+        assert_eq!(save(&mut draft, &empty, None, &library), None);
     }
     assert!(!library.root().exists(), "nothing is made for a document with nothing in it");
 
     let written = document(&[(TEXT, "Dear all")]);
-    let path = save(&mut place, &written, None, &library).unwrap();
+    let path = save(&mut draft, &written, None, &library).unwrap();
     assert_eq!(path, library.root().join("Untitled.let"));
     assert_eq!(read(&path), written);
 }
@@ -106,17 +119,17 @@ fn a_new_document_is_named_once() {
         ("and the next one the next number", None, "Plan 2027 28 3"),
     ];
     for (case, typed, name) in cases {
-        let mut place = Place::new();
+        let mut draft = Draft::default();
         if let Some(typed) = typed {
-            place.rename(typed, &library).unwrap();
+            draft.place.rename(typed, &library).unwrap();
         }
-        let path = save(&mut place, &plan, None, &library).unwrap();
-        assert_eq!(place.name(), name, "{case}");
+        let path = save(&mut draft, &plan, None, &library).unwrap();
+        assert_eq!(draft.place.name(), name, "{case}");
         assert_eq!(read(&path), plan, "{case}");
 
         // Later changes to the heading leave the name alone.
         let retitled = document(&[(H1, "Something else"), (TEXT, "Dear all")]);
-        assert_eq!(save(&mut place, &retitled, None, &library).unwrap(), path, "{case}");
+        assert_eq!(save(&mut draft, &retitled, None, &library).unwrap(), path, "{case}");
     }
     assert_eq!(desk.names("").len(), 4, "every document kept its own file: {:?}", desk.names(""));
 }
@@ -125,19 +138,19 @@ fn a_new_document_is_named_once() {
 fn a_title_still_being_typed_is_not_a_name_yet() {
     let desk = Desk::new("titling");
     let library = desk.library();
-    let mut place = Place::new();
+    let mut draft = Draft::default();
 
     let typing = document(&[(H1, "Quart")]);
-    assert_eq!(save(&mut place, &typing, Some("b0"), &library), None);
+    assert_eq!(save(&mut draft, &typing, Some("b0"), &library), None);
     assert!(!library.root().exists(), "a title alone waits for its name");
 
     let typed = document(&[(H1, "Quarterly report"), (TEXT, "Sales rose.")]);
-    let path = save(&mut place, &typed, Some("b1"), &library).unwrap();
+    let path = save(&mut draft, &typed, Some("b1"), &library).unwrap();
     assert_eq!(path, library.root().join("Quarterly report.let"));
     assert_eq!(read(&path), typed);
 
     let retitled = document(&[(H1, "Annual report"), (TEXT, "Sales rose.")]);
-    assert_eq!(save(&mut place, &retitled, Some("b0"), &library).unwrap(), path, "the heading names it once");
+    assert_eq!(save(&mut draft, &retitled, Some("b0"), &library).unwrap(), path, "the heading names it once");
     assert_eq!(desk.names(""), ["Quarterly report.let"]);
 }
 
@@ -154,11 +167,11 @@ fn a_document_that_starts_with_text_is_untitled_until_a_heading_names_it() {
         ("the heading, once it is left", document(&[(H1, "Minutes"), (TEXT, "Dear all")]), "b1", "Minutes"),
         ("another heading later", document(&[(H1, "Agenda"), (TEXT, "Dear all")]), "b1", "Minutes"),
     ];
-    let mut place = Place::new();
+    let mut draft = Draft::default();
     for (step, written, caret, name) in steps {
-        let path = save(&mut place, &written, Some(caret), &library).unwrap();
-        assert_eq!(place.name(), name, "{step}");
-        assert_eq!(place.naming(), name == "Untitled", "{step}");
+        let path = save(&mut draft, &written, Some(caret), &library).unwrap();
+        assert_eq!(draft.place.name(), name, "{step}");
+        assert_eq!(draft.place.naming(), name == "Untitled", "{step}");
         assert_eq!(read(&path), written, "{step}");
         assert_eq!(desk.names(""), [format!("{name}.let")], "{step}: the one file was renamed, not copied");
     }
@@ -171,8 +184,8 @@ fn a_rename_never_replaces_another_document() {
     let library = desk.library();
     let theirs = desk.theirs("Budget.let");
     let mine = document(&[(H1, "Plan"), (TEXT, "First, the budget.")]);
-    let mut place = Place::new();
-    let path = save(&mut place, &mine, None, &library).unwrap();
+    let mut draft = Draft::default();
+    let path = save(&mut draft, &mine, None, &library).unwrap();
 
     let refused = [
         ("Budget", "taken"),
@@ -181,25 +194,25 @@ fn a_rename_never_replaces_another_document() {
         ("///", "nothing a file can be called"),
     ];
     for (typed, case) in refused {
-        let answer = place.rename(typed, &library);
+        let answer = draft.place.rename(typed, &library);
         match typed.trim() {
             "Budget" => assert!(matches!(answer, Err(Refused::Taken(_))), "{case}: {answer:?}"),
             _ => assert!(matches!(answer, Err(Refused::NoName)), "{case}: {answer:?}"),
         }
-        assert_eq!(place.path(), Some(path.as_path()), "{case}");
+        assert_eq!(draft.place.path(), Some(path.as_path()), "{case}");
         assert_eq!(read(&path), mine, "{case}");
         assert_eq!(read(&theirs), document(&[(TEXT, "Theirs")]), "{case}");
     }
 
-    place.rename("Plan", &library).expect("its own name is no clash");
-    place.rename(" Plan for 2027 ", &library).unwrap();
-    assert_eq!(place.name(), "Plan for 2027");
+    draft.place.rename("Plan", &library).expect("its own name is no clash");
+    draft.place.rename(" Plan for 2027 ", &library).unwrap();
+    assert_eq!(draft.place.name(), "Plan for 2027");
     assert_eq!(desk.names(""), ["Budget.let", "Plan for 2027.let"]);
-    assert_eq!(read(place.path().unwrap()), mine);
+    assert_eq!(read(draft.place.path().unwrap()), mine);
 
     // The renamed document goes on being saved where it now is.
     let edited = document(&[(H1, "Plan"), (TEXT, "Second thoughts.")]);
-    save(&mut place, &edited, None, &library);
+    save(&mut draft, &edited, None, &library);
     assert_eq!(read(&library.root().join("Plan for 2027.let")), edited);
     assert_eq!(desk.names(""), ["Budget.let", "Plan for 2027.let"]);
 }
@@ -211,17 +224,17 @@ fn a_move_keeps_the_name_and_never_replaces_another_document() {
     let (work, home) = (desk.folder("Work"), desk.folder("Home"));
     let theirs = desk.theirs("Home/Plan.let");
     let mine = document(&[(H1, "Plan"), (TEXT, "First, the budget.")]);
-    let mut place = Place::new();
-    let path = save(&mut place, &mine, None, &library).unwrap();
+    let mut draft = Draft::default();
+    let path = save(&mut draft, &mine, None, &library).unwrap();
 
-    let answer = place.move_to(&home);
+    let answer = draft.place.move_to(&home);
     assert!(matches!(answer, Err(Refused::Taken(_))), "{answer:?}");
-    assert!(place.move_to(&desk.0.join("nowhere")).is_err());
-    assert_eq!(place.path(), Some(path.as_path()));
+    assert!(draft.place.move_to(&desk.0.join("nowhere")).is_err());
+    assert_eq!(draft.place.path(), Some(path.as_path()));
     assert_eq!((read(&path), read(&theirs)), (mine.clone(), document(&[(TEXT, "Theirs")])));
 
-    place.move_to(&work).unwrap();
-    assert_eq!(place.path(), Some(work.join("Plan.let").as_path()));
+    draft.place.move_to(&work).unwrap();
+    assert_eq!(draft.place.path(), Some(work.join("Plan.let").as_path()));
     assert_eq!(read(&work.join("Plan.let")), mine);
     assert!(!path.exists(), "a move leaves nothing behind");
 }
@@ -232,16 +245,16 @@ fn a_document_with_no_file_yet_can_be_named_and_placed() {
     let library = desk.library();
     let work = desk.folder("Work");
     desk.theirs("Work/Budget.let");
-    let mut place = Place::new();
-    assert_eq!((place.name().as_str(), place.folder(&library)), ("Untitled", library.root().to_owned()));
+    let mut draft = Draft::default();
+    assert_eq!((draft.place.name().as_str(), draft.place.folder(&library)), ("Untitled", library.root().to_owned()));
 
-    place.move_to(&work).unwrap();
-    assert!(matches!(place.rename("Budget", &library), Err(Refused::Taken(_))));
-    place.rename("Minutes", &library).unwrap();
-    assert_eq!((place.name().as_str(), place.folder(&library)), ("Minutes", work.clone()));
+    draft.place.move_to(&work).unwrap();
+    assert!(matches!(draft.place.rename("Budget", &library), Err(Refused::Taken(_))));
+    draft.place.rename("Minutes", &library).unwrap();
+    assert_eq!((draft.place.name().as_str(), draft.place.folder(&library)), ("Minutes", work.clone()));
     assert_eq!(desk.names("Work"), ["Budget.let"], "still nothing on disk");
 
-    let path = save(&mut place, &document(&[(H1, "Plan"), (TEXT, "Dear all")]), None, &library).unwrap();
+    let path = save(&mut draft, &document(&[(H1, "Plan"), (TEXT, "Dear all")]), None, &library).unwrap();
     assert_eq!(path, work.join("Minutes.let"));
 }
 
