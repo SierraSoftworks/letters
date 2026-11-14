@@ -127,6 +127,8 @@ fn other(block: &Block) -> Vec<String> {
         BlockKind::Unknown { .. } => lines(&text(&[Run::plain(fallback(block))], Context::Lines)),
         // A list item is written by `item`, which knows the list around it.
         BlockKind::ListItem { .. } => Vec::new(),
+        // STAND-IN: the kinds layout is built against, until the model has them.
+        _ => Vec::new(),
     }
 }
 

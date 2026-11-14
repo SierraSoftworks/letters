@@ -126,6 +126,8 @@ fn blocks(blocks: &[Block], assets: Assets, out: &mut String) {
             }
             // Written by `item`, which knows the list around it.
             BlockKind::ListItem { .. } => {}
+            // STAND-IN: the kinds layout is built against, until the model has them.
+            _ => {}
         }
     }
     close(&mut lists, 0, out);
