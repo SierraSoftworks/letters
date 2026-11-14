@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use letters_format::{file_name, suggested_name};
-use letters_model::{Block, BlockId, BlockKind, BodyShape, Document, Style};
+use letters_model::{Block, BlockId, BlockKind, BodyShape, Document};
 use serde_json::{Value, json};
 
 use crate::files::{EXTENSION, Home};
@@ -294,7 +294,6 @@ impl Place {
         &mut self,
         document: &Document,
         caret: Option<&BlockId>,
-        style: &Style,
         library: &Library,
     ) -> io::Result<Option<&Home>> {
         let heading = document.walk().find(|block| block.kind == BlockKind::Heading { level: 1 });
@@ -312,7 +311,7 @@ impl Place {
                 let name = self.typed.take().or(name);
                 self.naming &= name.is_none();
                 let name = name.unwrap_or_else(|| UNTITLED.into());
-                self.home = Some(Home::new(free_path(&folder, &name), style.clone()));
+                self.home = Some(Home::new(free_path(&folder, &name)));
             }
             Some(home) => {
                 if let Some(name) = name {

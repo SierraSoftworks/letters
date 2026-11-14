@@ -5,6 +5,7 @@
 //! and nobody is asked where: a new document gets a file of its own once it has content.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,7 +13,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Platform as _};
-use letters_model::{BlockId, ReplicaId, Style};
+use letters_format::WorkingCopy;
+use letters_model::{BlockId, ReplicaId, Revision, Style};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Size};
 // The editor's window is the view here, where `Window` is the system's.
@@ -28,7 +30,7 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
 use crate::cli::{Mode, Options};
-use crate::files::{self, EXTENSION, Home, Opened};
+use crate::files::{self, EXTENSION, Home, Opened, Rest, Working};
 use crate::gpu::Gpu;
 use crate::input::{self, Composer, Press};
 use crate::library::{Library, Place, UNTITLED, has_content};
@@ -52,6 +54,8 @@ pub enum Event {
     Access(accesskit_winit::Event),
     /// A window's save has finished, and its result is ready to collect.
     Saved(WindowId),
+    /// What a window's first paint did not need has been read.
+    Read(WindowId),
     /// The search for a GPU has ended, with one or without.
     Gpu(Option<Box<Gpu>>),
 }
@@ -244,8 +248,25 @@ struct DocWindow {
     /// The edit count a save was last planned for.
     noticed_edits: u64,
     save_at: Option<Instant>,
-    saving: Option<(u64, JoinHandle<Result<Home, String>>)>,
+    /// The save that is running, with the edit count and the editor's revision it started from.
+    saving: Option<(u64, Revision, JoinHandle<Saving>)>,
     save_failed: bool,
+
+    /// What the first paint did not need from the file, until reading it starts.
+    rest: Option<Rest>,
+    reading: Option<JoinHandle<Result<Working, String>>>,
+    /// What saves are written from. `None` while it is being read, and while a save has it.
+    copy: Option<WorkingCopy>,
+    /// The editor's revision that the copy has seen all of.
+    sent: Option<Revision>,
+    /// The style the copy was last given, which tells a change made here from one a save merged in.
+    sent_style: Style,
+}
+
+/// A save on its way back from its thread: the copy, and the home with what the file held from others.
+struct Saving {
+    copy: WorkingCopy,
+    result: Result<(Home, Option<Vec<u8>>), String>,
 }
 
 /// Something a key asks of the app, not of the document.
@@ -311,7 +332,7 @@ impl DocWindow {
     fn settle(&mut self, caret: bool, library: &Library, now: Instant) -> Option<Home> {
         let editor = self.view.editor();
         let caret = editor.selection().filter(|_| caret).map(|selection| &selection.head.block);
-        let home = self.place.settle(editor.doc(), caret, self.view.style(), library).map(|home| home.cloned());
+        let home = self.place.settle(editor.doc(), caret, library).map(|home| home.cloned());
         match &home {
             // A document with nothing in it has nothing to lose. A title still being typed is waited for.
             Ok(None) if !has_content(editor.doc()) => {
@@ -379,9 +400,57 @@ impl DocWindow {
         }
     }
 
+    /// Starts reading what the first paint did not need, on another thread.
+    fn start_read(&mut self, proxy: &EventLoopProxy<Event>) {
+        let Some(rest) = self.rest.take() else { return };
+        let (id, proxy, replica) = (self.window.id(), proxy.clone(), self.view.editor().model().replica());
+        self.reading = Some(thread::spawn(move || {
+            let working = rest.read(replica).map_err(|error| error.to_string());
+            let _ = proxy.send_event(Event::Read(id));
+            working
+        }));
+    }
+
+    /// Collects the working copy and gives the editor the file's history, reading here if that had not
+    /// started and waiting if it had not finished. Fails once, when the file could not be read for saving.
+    fn finish_read(&mut self) -> Result<(), String> {
+        let working = match (self.reading.take(), self.rest.take()) {
+            (Some(reading), _) => reading.join().unwrap_or_else(|_| Err("reading it stopped unexpectedly".into())),
+            (None, Some(rest)) => rest.read(self.view.editor().model().replica()).map_err(|error| error.to_string()),
+            (None, None) => return Ok(()),
+        };
+        match working {
+            Ok(Working { copy, history }) => {
+                if let Some(history) = history {
+                    let _ = self.view.change(|editor| Ok::<_, Infallible>(editor.attach(history)));
+                }
+                self.copy = Some(copy);
+                Ok(())
+            }
+            Err(error) => {
+                self.save_failed = self.keeps;
+                self.retitle();
+                Err(format!("{} is open, but changes to it cannot be saved.\n\n{error}", self.name()))
+            }
+        }
+    }
+
+    /// What the copy needs to catch up with the editor: the edits it has not seen, and the revision they
+    /// lead to. The copy takes the style too, when it was changed here.
+    fn edits_for(&mut self, copy: &mut WorkingCopy) -> (Vec<u8>, Revision) {
+        if self.view.style() != &self.sent_style {
+            self.sent_style = self.view.style().clone();
+            copy.style = self.sent_style.clone();
+        }
+        let model = self.view.editor().model();
+        let edits = self.sent.as_ref().map_or_else(|| model.save(), |sent| model.updates_since(sent));
+        (edits, model.revision())
+    }
+
     /// Starts saving on another thread, unless a save is running or there is nothing to save.
     fn start_save(&mut self, proxy: &EventLoopProxy<Event>, library: &Library, now: Instant) {
-        if self.saving.is_some() {
+        // A save waits for the one before it, and for the file's history.
+        if self.saving.is_some() || self.copy.is_none() {
             return;
         }
         self.save_at = None;
@@ -393,25 +462,30 @@ impl DocWindow {
             // Only the name was due.
             return self.relist(library);
         }
-        let document = self.view.editor().doc().clone();
-        let (id, proxy) = (self.window.id(), proxy.clone());
+        let Some(mut copy) = self.copy.take() else { return };
+        let (edits, revision) = self.edits_for(&mut copy);
+        let (id, proxy, since) = (self.window.id(), proxy.clone(), revision.clone());
         let save = thread::spawn(move || {
-            let result = home.save(&document).map(|(home, _)| home).map_err(|error| error.to_string());
+            let result = home.exchange(&mut copy, &edits, &since).map_err(|error| error.to_string());
             let _ = proxy.send_event(Event::Saved(id));
-            result
+            Saving { copy, result }
         });
-        self.saving = Some((self.view.edits(), save));
+        self.saving = Some((self.view.edits(), revision, save));
     }
 
     /// Collects a running save, waiting for it if it has not finished.
     fn finish_save(&mut self, library: &Library, now: Instant) {
-        let Some((edits, save)) = self.saving.take() else { return };
-        match save.join().unwrap_or_else(|_| Err("the save stopped unexpectedly".into())) {
-            Ok(home) => {
-                self.place.saved(home);
-                self.relist(library);
-                self.saved_edits = edits;
-                self.save_failed = false;
+        let Some((edits, revision, save)) = self.saving.take() else { return };
+        let result = match save.join() {
+            Ok(Saving { copy, result }) => {
+                self.copy = Some(copy);
+                result
+            }
+            Err(_) => Err("the save stopped unexpectedly".into()),
+        };
+        match result {
+            Ok((home, news)) => {
+                self.saved(home, news, edits, revision, library);
                 if self.unsaved() && self.save_at.is_none() {
                     self.save_at = Some(now + SAVE_AFTER);
                 }
@@ -425,40 +499,73 @@ impl DocWindow {
         self.retitle();
     }
 
-    /// Saves now, on this thread, if anything is unsaved. Returns whether everything is on disk.
+    /// Notes a save that worked: the document as it was at `edits` and `revision` is in its file at `home`,
+    /// and `news` is what the file held from other writers.
+    fn saved(&mut self, home: Home, news: Option<Vec<u8>>, edits: u64, revision: Revision, library: &Library) {
+        self.place.saved(home);
+        self.relist(library);
+        self.sent = Some(revision);
+        self.save_failed = false;
+        let typed_since = self.view.edits() != edits;
+        if let Some(news) = news
+            && let Err(error) = self.view.change(|editor| editor.merge(&news))
+        {
+            eprintln!("letters: could not take in what {} held: {error}", self.name());
+        }
+        // What came from the file is in the file, so it is no edit to save.
+        self.saved_edits = if typed_since { edits } else { self.view.edits() };
+        if !typed_since {
+            self.noticed_edits = self.saved_edits;
+        }
+    }
+
+    /// Saves now, on this thread, if anything is unsaved. Fails with what to tell the writer.
     ///
     /// With the `caret` counted, a first Heading 1 it is still in does not name the file yet.
-    fn save_now(&mut self, caret: bool, library: &Library) -> bool {
-        let now = Instant::now();
-        self.finish_save(library, now);
-        let Some(home) = self.settle(caret, library, now) else { return !self.save_failed };
-        if !self.unsaved() {
-            self.relist(library);
-            return true;
+    fn save_now(&mut self, caret: bool, library: &Library) -> Result<(), String> {
+        if !self.keeps {
+            return Ok(());
         }
-        let saved = home.save(self.view.editor().doc());
-        self.save_failed = saved.is_err();
+        let now = Instant::now();
+        self.finish_read()?;
+        self.finish_save(library, now);
+        // A copy that could not be read was reported when that failed, and holds nothing back now.
+        let Some(mut copy) = self.copy.take() else { return Ok(()) };
+        let home = self.settle(caret, library, now).filter(|_| self.unsaved());
+        let saved = home.map(|home| {
+            let (edits, revision) = self.edits_for(&mut copy);
+            home.exchange(&mut copy, &edits, &revision).map(|(home, news)| (home, news, revision))
+        });
+        self.copy = Some(copy);
         match saved {
-            Ok((home, _)) => {
-                self.place.saved(home);
-                self.relist(library);
-                self.saved_edits = self.view.edits();
-                self.noticed_edits = self.saved_edits;
+            Some(Ok((home, news, revision))) => {
+                self.saved(home, news, self.view.edits(), revision, library);
                 self.save_at = None;
             }
-            Err(error) => self.alert(&format!("{} could not be saved.\n\n{error}", self.name())),
+            Some(Err(error)) => {
+                self.save_failed = true;
+                self.retitle();
+                return Err(format!("{} could not be saved.\n\n{error}", self.name()));
+            }
+            // Nothing to write, though a name may have been due. A place that could not be made is retried.
+            None if self.save_failed => return Err(format!("{} could not be saved.", self.name())),
+            None => self.relist(library),
         }
         self.retitle();
-        !self.save_failed
+        Ok(())
     }
 
     fn alert(&self, message: &str) {
         alert(Some(&self.window), message);
     }
 
-    /// Makes sure nothing would be lost by closing. Returns `false` if the document could not be saved.
-    fn ready_to_close(&mut self, library: &Library) -> bool {
-        self.save_now(false, library)
+    /// Saves and says so if that fails. Returns whether everything is on disk.
+    fn save_or_say(&mut self, caret: bool, library: &Library) -> bool {
+        let saved = self.save_now(caret, library);
+        if let Err(error) = &saved {
+            self.alert(error);
+        }
+        saved.is_ok()
     }
 }
 
@@ -474,9 +581,13 @@ fn alert(parent: Option<&Arc<Window>>, message: &str) {
 impl App {
     /// Opens a window on a document. With no `opened`, the document is blank and has no file yet.
     fn open_window(&mut self, event_loop: &ActiveEventLoop, opened: Option<Opened>) -> Result<(), Box<dyn Error>> {
-        let (document, style, place) = match opened {
-            Some(Opened { document, style, home }) => (document, style, Place::at(home)),
-            None => (files::blank(), new_style(), Place::new()),
+        let (document, style, place, rest) = match opened {
+            Some(Opened { document, style, home, rest }) => (document, style, Place::at(home), rest),
+            None => {
+                let (document, style) = (files::blank(), new_style());
+                let rest = Rest::new(&document, &style);
+                (document, style, Place::new(), rest)
+            }
         };
         // AccessKit must attach before the window is first shown.
         let window = Arc::new(event_loop.create_window(window_attributes().with_visible(false))?);
@@ -487,6 +598,7 @@ impl App {
 
         let replica = ReplicaId::new(&self.platform.new_id());
         let mut window = DocWindow {
+            sent_style: style.clone(),
             view: View::new(Editor::new(document, replica), style),
             window,
             presenter,
@@ -507,6 +619,10 @@ impl App {
             save_at: None,
             saving: None,
             save_failed: false,
+            rest: Some(rest),
+            reading: None,
+            copy: None,
+            sent: None,
         };
         window.retitle();
         window.fit();
@@ -554,7 +670,7 @@ impl App {
             }
             Action::Save => {
                 if let Some(window) = self.windows.get_mut(&id) {
-                    window.save_now(true, &self.library);
+                    window.save_or_say(true, &self.library);
                 }
             }
             Action::Close => self.close(event_loop, id),
@@ -567,7 +683,8 @@ impl App {
     }
 
     fn close(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
-        if self.windows.get_mut(&id).is_some_and(|window| window.ready_to_close(&self.library)) {
+        // Nothing is asked at closing: the document is saved, and stays open only if that fails.
+        if self.windows.get_mut(&id).is_some_and(|window| window.save_or_say(false, &self.library)) {
             self.windows.remove(&id);
         }
         if self.windows.is_empty() {
@@ -652,7 +769,9 @@ impl ApplicationHandler<Event> for App {
                     }
                     _ => {}
                 }
-                // Off the path to the first frame: the recents list learns of an opened document here.
+                // Off the path to the first frame: the file's history is read, and the recents list learns
+                // of an opened document.
+                window.start_read(&self.proxy);
                 window.relist(library);
                 return;
             }
@@ -730,7 +849,21 @@ impl ApplicationHandler<Event> for App {
             Event::Saved(id) => {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.finish_save(&self.library, now);
+                    // Another writer's edits may have come in with it.
+                    window.access_stale = true;
+                    window.sync(now);
                 }
+            }
+            Event::Read(id) => {
+                let Some(window) = self.windows.get_mut(&id) else { return };
+                if let Err(error) = window.finish_read() {
+                    match window.keeps {
+                        true => window.alert(&error),
+                        false => eprintln!("letters: {error}"),
+                    }
+                }
+                window.access_stale = true;
+                window.sync(now);
             }
             Event::Gpu(None) => self.gpu = GpuState::Off,
             Event::Gpu(Some(mut gpu)) => {
@@ -759,14 +892,9 @@ impl ApplicationHandler<Event> for App {
     /// The last chance to save, which is the only one when the system ends the app, as Quit in the macOS
     /// menu does. Nothing may ask a question here.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        let now = Instant::now();
         for window in self.windows.values_mut() {
-            window.finish_save(&self.library, now);
-            if let Some(home) = window.settle(false, &self.library, now)
-                && window.unsaved()
-                && let Err(error) = home.save(window.view.editor().doc())
-            {
-                eprintln!("letters: could not save {}: {error}", window.name());
+            if let Err(error) = window.save_now(false, &self.library) {
+                eprintln!("letters: {error}");
             }
         }
     }
@@ -786,7 +914,9 @@ impl ApplicationHandler<Event> for App {
             }
             if let Some(run) = &mut self.typing {
                 // Typing starts once the window is on the renderer it will stay on.
-                let settled = self.launch.is_none() && (window.gpu_offered || matches!(self.gpu, GpuState::Off));
+                let read = window.rest.is_none() && window.reading.is_none();
+                let settled =
+                    read && self.launch.is_none() && (window.gpu_offered || matches!(self.gpu, GpuState::Off));
                 if settled && run.typed.is_none() && run.next.is_none_or(|next| next <= now) {
                     run.typed = Some(Instant::now());
                     run.next = None;
@@ -796,7 +926,7 @@ impl ApplicationHandler<Event> for App {
             }
             let wake = window.wake_ms.map(|ms| self.platform.instant(ms));
             // A save that is due but waiting on another needs no timer: that save's end wakes the loop.
-            let save = window.save_at.filter(|_| window.saving.is_none());
+            let save = window.save_at.filter(|_| window.saving.is_none() && window.copy.is_some());
             let type_next = self.typing.as_ref().and_then(|run| run.next);
             for due in [wake, save, type_next].into_iter().flatten() {
                 next = Some(next.map_or(due, |next| next.min(due)));

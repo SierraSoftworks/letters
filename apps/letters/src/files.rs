@@ -1,8 +1,8 @@
 //! Opening and saving `.let` files.
 //!
 //! A file is read and closed at once, and saved the way `letters_format::save` lays down: merged with what is
-//! on disk, written beside it and renamed over it. Saving runs off the UI thread: a [`Home`] and a document
-//! are all it needs.
+//! on disk, written beside it and renamed over it. Saving runs off the UI thread: a [`Home`] and the
+//! document's working copy are all it needs.
 
 use std::fmt;
 use std::fs;
@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
-use letters_format::{Archive, DOCUMENT, DiskCopy, Files, Package, Replica, Save, Saved, Stamp};
-use letters_model::{Block, BlockId, BlockKind, Document, Style};
+use letters_format::{Archive, Files, Save, Saved, Stamp, WorkingCopy};
+use letters_model::{Block, BlockId, BlockKind, Document, Model, Prepared, ReplicaId, Revision, Style};
 
 use crate::platform;
 
@@ -62,24 +62,27 @@ pub fn new_style(home_folder: Option<&Path>) -> Style {
     json.and_then(|json| Style::from_json(&json).ok()).unwrap_or_default()
 }
 
-/// Where a document lives on disk, and what was there when it was last read or written.
+/// The working copy of a new document in `style`, which no file holds yet.
+pub fn new_copy(document: Document, style: Style) -> WorkingCopy {
+    let replica = ReplicaId::new(&platform::block_id());
+    let mut copy = WorkingCopy::new(platform::document_id(), platform::now_rfc3339(), document, replica);
+    copy.style = style;
+    copy
+}
+
+/// Where a document lives on disk.
 #[derive(Clone, Debug)]
 pub struct Home {
     path: PathBuf,
-    id: String,
-    created: String,
-    /// The hash of the `document.json` last read from or written to the file, or `None` if there was no file.
-    seen: Option<String>,
-    /// The style a new document is first written with. `None` once the file has a style of its own.
-    style: Option<Style>,
+    /// Whether the document was ever read from the path or written to it.
+    written: bool,
 }
 
 impl Home {
-    /// A home for a new document in `style`. A file that turns up at `path` before the first save is left
-    /// alone, as one changed by someone else is.
-    pub fn new(path: impl Into<PathBuf>, style: Style) -> Self {
-        let (id, created) = (platform::document_id(), platform::now_rfc3339());
-        Self { path: path.into(), id, created, seen: None, style: Some(style) }
+    /// A home for a document that has no file yet. A file that turns up at `path` before the first save is
+    /// left alone, as one changed by someone else is.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into(), written: false }
     }
 
     pub fn path(&self) -> &Path {
@@ -91,44 +94,46 @@ impl Home {
         self.path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default()
     }
 
-    /// Writes the document and returns its home from now on, with how the save ended.
+    /// Writes `copy` to the file and returns the document's home from now on, with how the save ended.
     ///
-    /// If someone else changed the file since it was last read, their version is left alone and this one goes
-    /// to a conflict copy beside it, which becomes the document's home.
-    pub fn save(&self, document: &Document) -> Result<(Home, Saved), Error> {
+    /// What someone else wrote to the file since it was last read is merged into `copy` first. A file that
+    /// cannot be merged is left alone: the document goes to a conflict copy beside it, which becomes its home.
+    pub fn save(&self, copy: &mut WorkingCopy) -> Result<(Home, Saved), Error> {
         let name = self.path.file_name().unwrap_or_default().to_string_lossy();
         let mut folder = Folder(folder_of(&self.path).to_owned());
-
-        let mut package = Package {
-            id: self.id.clone(),
-            created: self.created.clone(),
-            document: document.clone(),
-            entries: Default::default(),
-        };
-        if let Some(style) = &self.style {
-            package.set_style(style);
-        }
-        let written = letters_format::hash(document.to_json().as_bytes());
-        let mut replica = Snapshot { package, seen: self.seen.clone() };
         let today = &platform::now_rfc3339()[..10];
         let save = Save { name: &name, token: &platform::block_id(), label: today, attempts: 3 };
-        let saved = letters_format::save(&mut folder, &mut replica, &save)?;
-
+        let saved = letters_format::save(&mut folder, copy, &save)?;
         let path = match &saved {
             Saved::ConflictCopy { name, .. } => self.path.with_file_name(name),
             _ => self.path.clone(),
         };
-        Ok((Home { path, seen: Some(written), style: None, ..self.clone() }, saved))
+        Ok((Home { path, written: true }, saved))
+    }
+
+    /// One save from an editor: takes its `edits` into `copy`, writes the file, and returns the home with
+    /// what the file held that the editor, at `revision`, has not seen. The editor merges that.
+    pub fn exchange(
+        &self,
+        copy: &mut WorkingCopy,
+        edits: &[u8],
+        revision: &Revision,
+    ) -> Result<(Home, Option<Vec<u8>>), Error> {
+        copy.edit(edits)?;
+        let ours = copy.model().revision();
+        let (home, _) = self.save(copy)?;
+        let news = (copy.model().revision() != ours).then(|| copy.model().updates_since(revision));
+        Ok((home, news))
     }
 
     /// Moves the document's file to `to` and returns its home there. Whatever `to` holds is never replaced:
     /// the move fails with `AlreadyExists` instead. No save of this home may be running.
     pub fn move_to(&self, to: &Path) -> io::Result<Home> {
-        match self.seen {
-            Some(_) => relocate(&self.path, to)?,
+        match self.written {
+            true => relocate(&self.path, to)?,
             // Nothing is on disk yet, so there is only a path to change.
-            None if to.symlink_metadata().is_ok() => return Err(io::ErrorKind::AlreadyExists.into()),
-            None => {}
+            false if to.symlink_metadata().is_ok() => return Err(io::ErrorKind::AlreadyExists.into()),
+            false => {}
         }
         Ok(Home { path: to.to_owned(), ..self.clone() })
     }
@@ -162,38 +167,6 @@ pub fn relocate(from: &Path, to: &Path) -> io::Result<()> {
         let _ = fs::remove_file(to);
     }
     copied
-}
-
-/// The document in memory at the moment of a save.
-struct Snapshot {
-    package: Package,
-    seen: Option<String>,
-}
-
-impl Replica for Snapshot {
-    fn id(&self) -> &str {
-        &self.package.id
-    }
-
-    /// Until the model can merge, the only file memory may replace is the one it last saw.
-    fn merge(&mut self, disk: &mut DiskCopy) -> Result<(), letters_format::Error> {
-        if disk.manifest().hashes.get(DOCUMENT) == self.seen.as_ref() {
-            return Ok(());
-        }
-        // The conflict copy this leads to should still be a whole document, so it takes the file's other
-        // entries with it.
-        let names: Vec<String> = disk.names().filter(|name| *name != DOCUMENT).map(str::to_owned).collect();
-        for name in names {
-            if let Some(bytes) = disk.read(&name)? {
-                self.package.entries.entry(name).or_insert(bytes);
-            }
-        }
-        Err(letters_format::Error::Unmerged)
-    }
-
-    fn package(&self) -> Package {
-        self.package.clone()
-    }
 }
 
 /// The folder a file is in, which for a bare file name is the current one.
@@ -249,11 +222,63 @@ impl Files for Folder {
 }
 
 /// A document ready to show, and where its saves go.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Opened {
     pub document: Document,
     pub style: Style,
     pub home: Home,
+    pub rest: Rest,
+}
+
+/// What opening leaves for after the first paint: the file's history, and whatever else a save needs.
+pub struct Rest(Source);
+
+enum Source {
+    /// The file as it was read.
+    File(Vec<u8>),
+    /// No file yet.
+    New(Box<WorkingCopy>),
+}
+
+impl fmt::Debug for Rest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.0 {
+            Source::File(_) => "Rest(File)",
+            Source::New(_) => "Rest(New)",
+        })
+    }
+}
+
+/// What saving a document needs: its working copy, and the history for the editor that shows it.
+pub struct Working {
+    pub copy: WorkingCopy,
+    /// For `Editor::attach`. `None` when the editor's own history is already the document's.
+    pub history: Option<Prepared>,
+}
+
+impl Rest {
+    /// The rest of a new `document` in `style`, which is nothing to read.
+    pub fn new(document: &Document, style: &Style) -> Self {
+        Self(Source::New(Box::new(new_copy(document.clone(), style.clone()))))
+    }
+
+    /// Reads it. `editor` is the replica the document's editor was made with.
+    ///
+    /// This is the slow part of opening a long document, so it runs on another thread once the document
+    /// is on screen.
+    pub fn read(self, editor: ReplicaId) -> Result<Working, Error> {
+        let bytes = match self.0 {
+            Source::File(bytes) => bytes,
+            Source::New(copy) => return Ok(Working { copy: *copy, history: None }),
+        };
+        let mut archive = Archive::open(Cursor::new(bytes))?;
+        let copy = WorkingCopy::open(&mut archive, ReplicaId::new(&platform::block_id()))?;
+        // The editor takes the history as the copy holds it, so a document changed outside Letters is one
+        // change in both and not one in each.
+        let model = copy.model();
+        let history = Model::prepare(model.doc().clone(), Some(&model.save()), editor);
+        Ok(Working { history: Some(history.map_err(letters_format::Error::History)?), copy })
+    }
 }
 
 /// Reads what the first paint needs from a `.let` file: its document and its style.
@@ -264,19 +289,15 @@ pub fn open(path: &Path, new_style: impl FnOnce() -> Style) -> Result<Opened, Er
         Ok(bytes) => bytes,
         // A file that is missing from a folder that exists is a new document. A missing folder is a mistake.
         Err(error) if error.kind() == io::ErrorKind::NotFound && folder_of(path).is_dir() => {
-            let style = new_style();
-            let home = Home::new(path, style.clone());
-            return Ok(Opened { document: blank(), style, home });
+            let (document, style) = (blank(), new_style());
+            let rest = Rest::new(&document, &style);
+            return Ok(Opened { document, style, home: Home::new(path), rest });
         }
         Err(error) => return Err(error.into()),
     };
-    let mut archive = Archive::open(Cursor::new(bytes))?;
+    let mut archive = Archive::open(Cursor::new(&bytes))?;
     let document = archive.document()?;
     // A style this build cannot read stays in the file untouched, and the built-in one is shown.
     let style = archive.style().unwrap_or_default();
-    let manifest = archive.manifest();
-    let seen = manifest.hashes.get(DOCUMENT).cloned();
-    let home =
-        Home { path: path.into(), id: manifest.id.clone(), created: manifest.created.clone(), seen, style: None };
-    Ok(Opened { document, style, home })
+    Ok(Opened { document, style, home: Home { path: path.into(), written: true }, rest: Rest(Source::File(bytes)) })
 }
