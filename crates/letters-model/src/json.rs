@@ -26,9 +26,9 @@ impl fmt::Display for JsonError {
 
 impl std::error::Error for JsonError {}
 
-type Result<T> = std::result::Result<T, JsonError>;
+pub(crate) type Result<T> = std::result::Result<T, JsonError>;
 
-fn err<T>(path: &str, message: impl Into<String>) -> Result<T> {
+pub(crate) fn err<T>(path: &str, message: impl Into<String>) -> Result<T> {
     Err(JsonError { path: path.into(), message: message.into() })
 }
 
@@ -81,14 +81,38 @@ impl Document {
     }
 }
 
-fn object(value: Value, path: &str) -> Result<Map<String, Value>> {
+impl Block {
+    /// Reads one block as `document.json` stores it. `path` names the block in errors.
+    pub fn from_value(value: Value, path: &str) -> Result<Self> {
+        block(value, path)
+    }
+
+    /// The block as `document.json` stores it.
+    pub fn to_value(&self) -> Value {
+        write_block(self)
+    }
+}
+
+impl Run {
+    /// Reads a list of runs as a block's `content` stores it. `path` names the list in errors.
+    pub fn list_from_value(value: Value, path: &str) -> Result<Vec<Self>> {
+        runs(value, path)
+    }
+
+    /// A list of runs as a block's `content` stores it.
+    pub fn list_to_value(runs: &[Self]) -> Value {
+        runs.iter().map(write_run).collect()
+    }
+}
+
+pub(crate) fn object(value: Value, path: &str) -> Result<Map<String, Value>> {
     match value {
         Value::Object(map) => Ok(map),
         _ => err(path, "expected an object"),
     }
 }
 
-fn string(map: &mut Map<String, Value>, key: &str, path: &str) -> Result<Option<String>> {
+pub(crate) fn string(map: &mut Map<String, Value>, key: &str, path: &str) -> Result<Option<String>> {
     match map.remove(key) {
         None => Ok(None),
         Some(Value::String(s)) => Ok(Some(s)),
@@ -287,7 +311,7 @@ fn write_run(run: &Run) -> Value {
 }
 
 /// Appends unknown fields in key order, with the keys of any nested object sorted too.
-fn write_extra(map: &mut Map<String, Value>, extra: &Extra) {
+pub(crate) fn write_extra(map: &mut Map<String, Value>, extra: &Extra) {
     fn sorted(value: &Value) -> Value {
         match value {
             Value::Object(map) => {
