@@ -44,6 +44,7 @@ parley = { version = "0.13", default-features = false, features = ["std"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 # The accessibility tree's types: plain data, shared by the widgets, the shell and the test harness.
 accesskit = "0.25"
+accesskit_consumer = "0.39"
 
 # The desktop shell. None of these may reach the core crates.
 winit = "0.30"
