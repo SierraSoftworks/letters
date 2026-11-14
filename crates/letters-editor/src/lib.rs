@@ -155,6 +155,8 @@ pub trait Platform {
     /// Keeps the bytes of an asset that the document now names. The name comes from the bytes, so being
     /// handed one twice changes nothing.
     fn store_asset(&mut self, _name: &str, _bytes: &[u8]) {}
+    /// Keeps a word in the person's own dictionary, which every document is checked against.
+    fn learn_word(&mut self, _word: &str) {}
 }
 
 /// Clipboard content: plain text (Markdown when Letters wrote it) and, where offered, HTML and images.
