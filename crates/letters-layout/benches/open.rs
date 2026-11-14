@@ -318,7 +318,7 @@ fn main() {
     let middle = model.doc().blocks.len() / 2;
     let breaking = Times::of(50, |at| {
         let mut block = model.doc().blocks[middle + at].clone();
-        block.extra.insert("break".into(), "page".into());
+        block.page_break = true;
         let ops =
             [Op::RemoveBlock { block: block.id.clone() }, Op::InsertBlock { parent: None, index: middle + at, block }];
         let change = model.apply(ops).expect("a page break");

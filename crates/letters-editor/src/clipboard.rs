@@ -113,7 +113,8 @@ fn keep(block: &Block, leaf: &dyn Fn(&Block) -> Option<Body>) -> Option<Block> {
         }
         _ => leaf(block)?,
     };
-    Some(Block { id: block.id.clone(), kind: block.kind.clone(), body, extra: block.extra.clone() })
+    let (id, kind, lang) = (block.id.clone(), block.kind.clone(), block.lang.clone());
+    Some(Block { id, kind, body, lang, page_break: block.page_break, extra: block.extra.clone() })
 }
 
 /// Gives `block` and the blocks inside it new ids where theirs are `taken`. A block that was cut comes

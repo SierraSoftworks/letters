@@ -129,8 +129,7 @@ impl Flat {
 
 /// The JSON a marker carries for `block`.
 pub(crate) fn head(block: &Block) -> String {
-    let bare = Block { id: block.id.clone(), kind: block.kind.clone(), body: Body::None, extra: block.extra.clone() };
-    bare.to_value().to_string()
+    block.clone_bare().to_value().to_string()
 }
 
 /// The insert that puts text into the sequence with exactly these attributes.
@@ -297,15 +296,16 @@ fn canonical(block: &Block) -> bool {
     };
     let body = match (&block.body, block.kind.shape()) {
         (Body::Text(runs), BodyShape::Text) => {
-            let plain =
-                |run: &Run| run.extra.is_empty() && !run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)));
+            let known = |run: &Run| !run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)));
+            let plain = |run: &Run| run.extra.is_empty() && run.lang.as_deref() != Some("") && known(run);
             let apart = runs.windows(2).all(|pair| !pair[0].same_format(&pair[1]));
             apart && runs.iter().all(|run| !run.text.is_empty() && !run.text.contains(MARKER) && plain(run))
         }
         (Body::Blocks(_), BodyShape::Blocks) | (Body::None, BodyShape::None) => true,
         _ => false,
     };
-    kind && body && block.extra.is_empty() && !block.id.as_str().is_empty()
+    let lang = block.lang.as_deref() != Some("");
+    kind && body && lang && block.extra.is_empty() && !block.id.as_str().is_empty()
 }
 
 /// Reads a tree as the history would give it back had it been stored there: ids made unique, runs merged,
@@ -679,7 +679,8 @@ fn rising(found: &[Option<usize>]) -> Vec<(usize, usize)> {
 
 /// Changes one block of the sequence into another that keeps its place.
 fn reblock((was, at): (&Block, &Entry), (is, to): (&Block, &Entry), out: &mut Script) {
-    let head = at.stored == is.id && at.depth == to.level && was.kind == is.kind && was.extra == is.extra;
+    let fields = (&was.kind, &was.lang, was.page_break, &was.extra) == (&is.kind, &is.lang, is.page_break, &is.extra);
+    let head = at.stored == is.id && at.depth == to.level && fields;
     if !at.marker {
         out.push(marker(is, to.level));
     } else if head {

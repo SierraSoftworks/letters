@@ -1,14 +1,18 @@
 //! `document.json`: strict to read, canonical to write.
 //!
-//! Key order and layout are fixed, so one document always produces the same bytes. Unknown fields and unknown
-//! block types are kept and written back.
+//! Key order and layout are fixed, so one document always produces the same bytes. A block is written as
+//! its id, its type and that type's fields, then its body, then every other field in key order. Unknown
+//! fields and unknown block types are kept and written back.
 
 use std::collections::BTreeSet;
 use std::fmt;
 
 use serde_json::{Map, Value};
 
-use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Run, Tone};
+use crate::{
+    Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Properties, PropertiesFormat,
+    Run, Tone,
+};
 
 mod stream;
 
@@ -54,11 +58,43 @@ impl Document {
         if !self.dictionary.is_empty() {
             map.insert("dictionary".into(), self.dictionary.iter().cloned().collect());
         }
+        if let Some(properties) = &self.properties {
+            map.insert("properties".into(), properties.to_value());
+        }
         map.insert("blocks".into(), self.blocks.iter().map(write_block).collect());
         write_extra(&mut map, &self.extra);
         let mut out = serde_json::to_string_pretty(&Value::Object(map)).expect("a JSON value always serialises");
         out.push('\n');
         out
+    }
+}
+
+impl Properties {
+    /// Reads a document's properties as `document.json` stores them. `path` names them in errors.
+    pub fn from_value(value: Value, path: &str) -> Result<Self> {
+        let mut map = object(value, path)?;
+        let format = match string(&mut map, "format", path)?.as_deref() {
+            Some("yaml") => PropertiesFormat::Yaml,
+            Some("toml") => PropertiesFormat::Toml,
+            _ => return err(&format!("{path}.format"), "expected yaml or toml"),
+        };
+        let Some(source) = string(&mut map, "source", path)? else {
+            return err(&format!("{path}.source"), "expected the properties as text");
+        };
+        Ok(Self { format, source, extra: map.into_iter().collect() })
+    }
+
+    /// The properties as `document.json` stores them.
+    pub fn to_value(&self) -> Value {
+        let mut map = Map::new();
+        let format = match self.format {
+            PropertiesFormat::Yaml => "yaml",
+            PropertiesFormat::Toml => "toml",
+        };
+        map.insert("format".into(), format.into());
+        map.insert("source".into(), self.source.as_str().into());
+        write_extra(&mut map, &self.extra);
+        Value::Object(map)
     }
 }
 
@@ -103,12 +139,13 @@ fn document(mut map: Map<String, Value>, read: Option<Vec<Block>>) -> Result<Doc
     };
     let dictionary =
         strings(map.remove("dictionary"), "dictionary")?.unwrap_or_default().into_iter().collect::<BTreeSet<_>>();
+    let properties = map.remove("properties").map(|value| Properties::from_value(value, "properties")).transpose()?;
     let blocks = match read {
         Some(blocks) => blocks,
         None => blocks(map.remove("blocks").unwrap_or(Value::Array(Vec::new())), "blocks")?,
     };
 
-    let doc = Document { language, dictionary, blocks, extra: map.into_iter().collect() };
+    let doc = Document { language, dictionary, properties, blocks, extra: map.into_iter().collect() };
     let mut seen = BTreeSet::new();
     for block in doc.walk() {
         if !seen.insert(&block.id) {
@@ -130,6 +167,14 @@ pub(crate) fn string(map: &mut Map<String, Value>, key: &str, path: &str) -> Res
         None => Ok(None),
         Some(Value::String(s)) => Ok(Some(s)),
         Some(_) => err(&format!("{path}.{key}"), "expected a string"),
+    }
+}
+
+/// Takes a `lang` out of a block's or a run's fields.
+pub(crate) fn lang(map: &mut Map<String, Value>, path: &str) -> Result<Option<String>> {
+    match string(map, "lang", path)? {
+        Some(tag) if tag.is_empty() => err(&format!("{path}.lang"), "expected a BCP 47 tag"),
+        tag => Ok(tag),
     }
 }
 
@@ -225,7 +270,13 @@ fn block_from(mut map: Map<String, Value>, read: Option<Body>, path: &str) -> Re
             Body::Text(runs(map.remove("content").unwrap_or(Value::Array(Vec::new())), &format!("{path}.content"))?)
         }
     };
-    Ok(Block { id, kind, body, extra: map.into_iter().collect() })
+    let lang = lang(&mut map, path)?;
+    let page_break = match map.remove("break") {
+        None => false,
+        Some(Value::String(at)) if at == "page" => true,
+        Some(_) => return err(&format!("{path}.break"), "expected page"),
+    };
+    Ok(Block { id, kind, body, lang, page_break, extra: map.into_iter().collect() })
 }
 
 fn runs(value: Value, path: &str) -> Result<Vec<Run>> {
@@ -242,7 +293,8 @@ fn runs(value: Value, path: &str) -> Result<Vec<Run>> {
             let marks = strings(map.remove("marks"), &format!("{path}.marks"))?.unwrap_or_default();
             let marks = marks.into_iter().map(|name| read_mark(&name)).collect();
             let link = string(&mut map, "link", &path)?;
-            Ok(Run { text, marks, link, extra: map.into_iter().collect() })
+            let lang = lang(&mut map, &path)?;
+            Ok(Run { text, marks, link, lang, extra: map.into_iter().collect() })
         })
         .collect()
 }
@@ -323,7 +375,7 @@ fn write_block(block: &Block) -> Value {
         }
         Body::None => {}
     }
-    write_extra(&mut map, &block.extra);
+    write_rest(&mut map, block.lang.as_deref(), block.page_break, &block.extra);
     Value::Object(map)
 }
 
@@ -336,8 +388,21 @@ fn write_run(run: &Run) -> Value {
     if let Some(link) = &run.link {
         map.insert("link".into(), link.as_str().into());
     }
-    write_extra(&mut map, &run.extra);
+    write_rest(&mut map, run.lang.as_deref(), false, &run.extra);
     Value::Object(map)
+}
+
+/// Appends the fields any block or run may carry, among its unknown fields and in key order with them. A
+/// field of that name among the unknown ones gives way.
+fn write_rest(map: &mut Map<String, Value>, lang: Option<&str>, page_break: bool, extra: &Extra) {
+    let lang = lang.filter(|lang| !lang.is_empty());
+    if lang.is_none() && !page_break {
+        return write_extra(map, extra);
+    }
+    let mut all = extra.clone();
+    all.extend(lang.map(|lang| ("lang".to_owned(), lang.into())));
+    all.extend(page_break.then(|| ("break".to_owned(), "page".into())));
+    write_extra(map, &all);
 }
 
 /// Appends unknown fields in key order, with the keys of any nested object sorted too.

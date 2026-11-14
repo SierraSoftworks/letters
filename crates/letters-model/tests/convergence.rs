@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use letters_model::{
     Block, BlockId, BlockKind, Body, BodyShape, Change, Document, ListKind, Mark, Model, Op, OpError, Page, Pos,
-    ReplicaId, Run, Style, Tone,
+    Properties, PropertiesFormat, ReplicaId, Run, Style, Tone,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -21,15 +21,23 @@ enum Edit {
     Delete { block: usize, at: usize, len: usize },
     Mark { block: usize, at: usize, len: usize, mark: Mark, on: bool },
     Link { block: usize, at: usize, len: usize, link: Option<String> },
+    Lang { block: usize, at: usize, len: usize, lang: usize },
     Split { block: usize, at: usize, id: usize },
     Join { block: usize },
     Kind { block: usize, kind: usize },
+    Props { block: usize, page_break: bool, lang: usize },
     Insert { parent: Option<usize>, index: usize, kind: usize, id: usize, text: String },
     Remove { block: usize },
     Style { element: usize, field: usize, value: usize },
     Page { field: usize, value: usize },
     Language { language: usize },
     Word { word: usize, add: bool },
+    Properties { properties: usize },
+}
+
+/// No language, or one of two.
+fn lang(n: usize) -> Option<String> {
+    [None, Some("fr"), Some("de-CH")][n % 3].map(str::to_owned)
 }
 
 /// Everything a replica shows.
@@ -87,6 +95,9 @@ fn edit() -> impl Strategy<Value = Edit> {
         2 => (n(), n(), 0..6usize, mark, any::<bool>())
             .prop_map(|(block, at, len, mark, on)| Edit::Mark { block, at, len, mark, on }),
         1 => (n(), n(), 0..6usize, link).prop_map(|(block, at, len, link)| Edit::Link { block, at, len, link }),
+        1 => (n(), n(), 0..6usize, n()).prop_map(|(block, at, len, lang)| Edit::Lang { block, at, len, lang }),
+        1 => (n(), any::<bool>(), n()).prop_map(|(block, page_break, lang)| Edit::Props { block, page_break, lang }),
+        1 => n().prop_map(|properties| Edit::Properties { properties }),
         3 => (n(), n(), id()).prop_map(|(block, at, id)| Edit::Split { block, at, id }),
         3 => n().prop_map(|block| Edit::Join { block }),
         1 => (n(), n()).prop_map(|(block, kind)| Edit::Kind { block, kind }),
@@ -115,14 +126,18 @@ fn step() -> impl Strategy<Value = Step> {
 /// A document with every shape of block, formatted text and a nested container.
 fn fixture() -> Document {
     let mut marked = Block::new("m", BlockKind::Paragraph);
-    marked.body = Body::Text(vec![Run::plain("plain "), Run::marked("bold", [Mark::Bold]), Run::plain(" tail")]);
+    marked.body = Body::Text(vec![
+        Run::plain("plain "),
+        Run::marked("bold", [Mark::Bold]),
+        Run { lang: lang(1), ..Run::plain(" tail") },
+    ]);
     let mut quote = Block::new("q", BlockKind::Quote);
     quote.body = Body::Blocks(vec![
         Block::text("q1", BlockKind::Paragraph, "Quoted"),
         Block::new("q2", BlockKind::Callout { tone: Tone::Tip }),
     ]);
     let blocks = vec![
-        Block::text("h", BlockKind::Heading { level: 1 }, "Title"),
+        Block { page_break: true, lang: lang(2), ..Block::text("h", BlockKind::Heading { level: 1 }, "Title") },
         marked,
         quote,
         Block::new("d", BlockKind::Divider),
@@ -176,6 +191,13 @@ fn op((doc, style): &Shown, edit: &Edit) -> Option<Op> {
             let block = pick(&texts, *block)?;
             Op::SetLink { range: range(&block, *at, *len), block: block.id, link: link.clone() }
         }
+        Edit::Lang { block, at, len, lang: tag } => {
+            let block = pick(&texts, *block)?;
+            Op::SetLang { range: range(&block, *at, *len), block: block.id, lang: lang(*tag) }
+        }
+        Edit::Props { block, page_break, lang: tag } => {
+            Op::SetBlockProps { block: pick(&all, *block)?.id, page_break: *page_break, lang: lang(*tag) }
+        }
         Edit::Split { block, at, id } => {
             let block = pick(&texts, *block)?;
             Op::Split { at: Pos { offset: range(&block, *at, 0).start, block: block.id }, new_id: new(*id) }
@@ -218,6 +240,11 @@ fn op((doc, style): &Shown, edit: &Edit) -> Option<Op> {
             },
         },
         Edit::Language { language } => Op::SetLanguage { language: ["en", "fr", "de"][language % 3].into() },
+        Edit::Properties { properties: n } => {
+            let source = ["title: a\n", "title: b\n"][n % 2].to_owned();
+            let properties = Properties { format: PropertiesFormat::Toml, source, extra: Default::default() };
+            Op::SetProperties { properties: (n % 3 > 0).then_some(properties) }
+        }
         Edit::Word { word, add } => {
             let word = ["mot", "word", "字\u{1e}x"][word % 3].to_owned();
             if *add { Op::AddWord { word } } else { Op::RemoveWord { word } }
@@ -241,12 +268,12 @@ fn outline(doc: &Document) -> Vec<(BlockId, usize)> {
 /// What layout would get wrong by trusting `change`: the blocks that differ without being named, and
 /// whatever else differs without it saying so.
 fn missed((before, style): &Shown, (after, restyled): &Shown, change: &Change) -> Vec<String> {
-    let own = |block: &Block| (block.kind.clone(), block.body.runs().to_vec(), block.extra.clone());
+    let own = |block: &Block| Block { body: Body::Text(block.body.runs().to_vec()), ..block.clone() };
     let ids: BTreeSet<BlockId> = before.walk().chain(after.walk()).map(|block| block.id.clone()).collect();
     let differs = |id: &&BlockId| before.block(id).map(own) != after.block(id).map(own);
     let mut missed: Vec<String> =
         ids.iter().filter(differs).filter(|id| !change.blocks.contains(id)).map(BlockId::to_string).collect();
-    let fields = |doc: &Document| (doc.language.clone(), doc.dictionary.clone());
+    let fields = |doc: &Document| (doc.language.clone(), doc.dictionary.clone(), doc.properties.clone());
     let unsaid = [
         ("structure", outline(before) != outline(after) && !change.structure),
         ("style", style != restyled && !change.style),

@@ -1,4 +1,4 @@
-use letters_model::{BlockKind, Document};
+use letters_model::{BlockKind, Document, PropertiesFormat};
 use proptest::prelude::*;
 
 const CORPUS: [&str; 2] = [include_str!("corpus/design-sample.json"), include_str!("corpus/every-block.json")];
@@ -27,7 +27,22 @@ fn unknown_content_survives() {
     let hologram = doc.block(&"f".into()).unwrap();
     assert_eq!(hologram.kind, BlockKind::Unknown { type_name: "hologram".into() });
     assert_eq!(hologram.extra["fallback"], "A hologram");
-    assert_eq!(doc.block(&"g".into()).unwrap().extra["break"], "page");
+}
+
+#[test]
+fn what_any_block_or_run_may_carry_is_read() {
+    let doc = Document::from_json(CORPUS[1]).unwrap();
+    let block = doc.block(&"g".into()).unwrap();
+    assert_eq!((block.page_break, block.lang.as_deref()), (true, Some("fr")));
+    let langs: Vec<Option<&str>> = block.body.runs().iter().map(|run| run.lang.as_deref()).collect();
+    assert_eq!(langs, [None, Some("de")]);
+    assert!(!block.extra.contains_key("break") && !block.extra.contains_key("lang"));
+
+    let properties = doc.properties.as_ref().unwrap();
+    assert_eq!(
+        (properties.format, properties.source.as_str()),
+        (PropertiesFormat::Yaml, "title: Every block\ntags: [a, b]\n")
+    );
 }
 
 #[test]
@@ -49,6 +64,14 @@ fn schema_breaks_are_refused_with_their_path() {
             "blocks[0].blocks[0].list",
         ),
         (r#"{"format":1,"blocks":[{"id":"a","type":"divider"},{"id":"a","type":"divider"}]}"#, "blocks"),
+        (r#"{"format":1,"blocks":[{"id":"a","type":"divider","break":"column"}]}"#, "blocks[0].break"),
+        (r#"{"format":1,"blocks":[{"id":"a","type":"divider","lang":""}]}"#, "blocks[0].lang"),
+        (
+            r#"{"format":1,"blocks":[{"id":"a","type":"paragraph","content":[{"text":"x","lang":5}]}]}"#,
+            "blocks[0].content[0].lang",
+        ),
+        (r#"{"format":1,"properties":{"format":"ini","source":""},"blocks":[]}"#, "properties.format"),
+        (r#"{"format":1,"properties":{"format":"toml"},"blocks":[]}"#, "properties.source"),
     ];
     for (json, path) in cases {
         let error = Document::from_json(json).expect_err(json);
@@ -80,14 +103,24 @@ fn reversed(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// The object with one more field, when there is a value for it.
+fn with(mut object: serde_json::Value, key: &str, value: Option<String>) -> serde_json::Value {
+    if let Some(value) = value {
+        object[key] = value.into();
+    }
+    object
+}
+
 fn json_value() -> impl Strategy<Value = serde_json::Value> {
     prop_oneof![any::<bool>().prop_map(Into::into), any::<i32>().prop_map(Into::into), ".{0,6}".prop_map(Into::into)]
 }
 
 /// Documents as loosely typed JSON, so unknown fields and types are exercised alongside the known ones.
 fn document_json() -> impl Strategy<Value = String> {
+    let lang = || prop::option::of("en|fr|de-CH");
     let run = (".{0,12}", prop::collection::vec("bold|italic|code|odd", 0..3), prop::option::of("https://[a-z]{1,8}"))
         .prop_map(|(text, marks, link)| serde_json::json!({ "text": text, "marks": marks, "link": link }));
+    let run = (run, lang()).prop_map(|(run, lang)| with(run, "lang", lang));
     let block = (
         "paragraph|heading|list_item|code|divider|mystery",
         prop::collection::vec(run, 0..4),
@@ -98,6 +131,8 @@ fn document_json() -> impl Strategy<Value = String> {
             block.as_object_mut().unwrap().extend(extra);
             block
         });
+    let block = (block, lang(), prop::option::of(Just("page")))
+        .prop_map(|(block, lang, at)| with(with(block, "lang", lang), "break", at.map(str::to_owned)));
     prop::collection::vec(block, 0..8).prop_map(|mut blocks| {
         for (i, block) in blocks.iter_mut().enumerate() {
             block["id"] = format!("b{i}").into();

@@ -16,7 +16,10 @@ mod pos;
 mod style;
 mod undo;
 
-pub use doc::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Run, Tone};
+pub use doc::{
+    Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Properties, PropertiesFormat,
+    Run, Tone,
+};
 pub use history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
 pub use json::JsonError;
 pub use markers::{Marker, Markers};

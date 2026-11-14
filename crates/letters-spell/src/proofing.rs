@@ -127,24 +127,18 @@ pub fn language_at<'a>(doc: &'a Document, block: &BlockId, offset: usize) -> Opt
         end += run.text.len();
         offset < end
     });
-    Some(run.and_then(|run| lang(&run.extra)).unwrap_or(language))
+    Some(run.and_then(|run| run.lang.as_deref()).unwrap_or(language))
 }
 
 /// A block that holds text, with the language its text is in unless a run says otherwise.
 fn find<'a>(blocks: &'a [Block], id: &BlockId, language: &'a str) -> Option<(&'a Block, &'a str)> {
     blocks.iter().find_map(|block| {
-        let language = lang(&block.extra).unwrap_or(language);
+        let language = block.lang.as_deref().unwrap_or(language);
         if &block.id == id {
             return (!block.body.runs().is_empty()).then_some((block, language));
         }
         find(block.body.blocks(), id, language)
     })
-}
-
-/// The `lang` a block or run carries for a passage in another language.
-// The model has no field for it yet, so it is read from the fields kept as written.
-fn lang(extra: &letters_model::Extra) -> Option<&str> {
-    extra.get("lang")?.as_str()
 }
 
 fn misspellings(speller: &Speller, doc: &Document, block: &Block, language: &str) -> Vec<Range<usize>> {
@@ -154,7 +148,7 @@ fn misspellings(speller: &Speller, doc: &Document, block: &Block, language: &str
     }
     // `None` for code, which also parts the words on either side of it.
     fn spoken<'a>(run: &'a Run, language: &'a str) -> Option<&'a str> {
-        (!run.marks.contains(&Mark::Code)).then_some(lang(&run.extra).unwrap_or(language))
+        (!run.marks.contains(&Mark::Code)).then_some(run.lang.as_deref().unwrap_or(language))
     }
     let mut out = Vec::new();
     let mut start = 0;

@@ -180,22 +180,23 @@ impl<'de> Visitor<'de> for OneRun {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Run, A::Error> {
-        let (mut text, mut marks, mut link) = (None, None, None);
+        let (mut text, mut marks, mut link, mut lang) = (None, None, None, None);
         let mut extra = Extra::new();
-        while let Some(key) = map.next_key_seed(Key(&["text", "marks", "link"]))? {
+        while let Some(key) = map.next_key_seed(Key(&["text", "marks", "link", "lang"]))? {
             let repeated = match key {
                 Ok(0) => text.replace(map.next_value::<String>()?).is_some(),
                 Ok(1) => marks.replace(map.next_value::<Vec<String>>()?).is_some(),
-                Ok(_) => link.replace(map.next_value::<String>()?).is_some(),
+                Ok(2) => link.replace(map.next_value::<String>()?).is_some(),
+                Ok(_) => lang.replace(map.next_value::<String>()?).is_some(),
                 Err(key) => extra.insert(key, map.next_value()?).is_some(),
             };
-            if repeated {
+            if repeated || lang.as_deref() == Some("") {
                 return Err(decline());
             }
         }
         let text = text.ok_or_else(decline)?;
         let marks = marks.unwrap_or_default().iter().map(|name| read_mark(name)).collect();
-        Ok(Run { text, marks, link, extra })
+        Ok(Run { text, marks, link, lang, extra })
     }
 }
 

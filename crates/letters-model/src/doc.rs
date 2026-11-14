@@ -43,14 +43,38 @@ pub struct Document {
     pub language: String,
     /// Words every copy of this document accepts as spelled correctly.
     pub dictionary: BTreeSet<String>,
+    /// The front matter of the file the document came from, if it had any.
+    pub properties: Option<Properties>,
     pub blocks: Vec<Block>,
     pub extra: Extra,
 }
 
 impl Default for Document {
     fn default() -> Self {
-        Self { language: "en".into(), dictionary: BTreeSet::new(), blocks: Vec::new(), extra: Extra::new() }
+        Self {
+            language: "en".into(),
+            dictionary: BTreeSet::new(),
+            properties: None,
+            blocks: Vec::new(),
+            extra: Extra::new(),
+        }
     }
+}
+
+/// A document's properties as their source, so that they go back into a file exactly as they came out
+/// of one. Nothing in the model reads inside them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Properties {
+    pub format: PropertiesFormat,
+    /// The text between the fences, with `\n` line endings.
+    pub source: String,
+    pub extra: Extra,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropertiesFormat {
+    Yaml,
+    Toml,
 }
 
 impl Document {
@@ -81,6 +105,10 @@ pub struct Block {
     pub id: BlockId,
     pub kind: BlockKind,
     pub body: Body,
+    /// A BCP 47 tag, for a block in another language than the document's. Its children take it too.
+    pub lang: Option<String>,
+    /// Whether the block starts a new page.
+    pub page_break: bool,
     pub extra: Extra,
 }
 
@@ -92,7 +120,7 @@ impl Block {
             BodyShape::Blocks => Body::Blocks(Vec::new()),
             BodyShape::None => Body::None,
         };
-        Self { id: id.into(), kind, body, extra: Extra::new() }
+        Self { id: id.into(), kind, body, lang: None, page_break: false, extra: Extra::new() }
     }
 
     /// A text block holding one unmarked run.
@@ -193,6 +221,8 @@ pub struct Run {
     pub text: String,
     pub marks: BTreeSet<Mark>,
     pub link: Option<String>,
+    /// A BCP 47 tag, for text in another language than its block's.
+    pub lang: Option<String>,
     pub extra: Extra,
 }
 
@@ -207,7 +237,7 @@ impl Run {
 
     /// Whether two runs differ only in their text, so they can be stored as one.
     pub(crate) fn same_format(&self, other: &Self) -> bool {
-        self.marks == other.marks && self.link == other.link && self.extra == other.extra
+        self.marks == other.marks && self.link == other.link && self.lang == other.lang && self.extra == other.extra
     }
 }
 

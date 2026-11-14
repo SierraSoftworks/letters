@@ -38,7 +38,7 @@ fn paged(doc: &Document, room: f32) -> (DocLayout, Pages) {
 
 /// A block that starts a page of print.
 fn breaking(mut block: Block) -> Block {
-    block.extra.insert("break".into(), "page".into());
+    block.page_break = true;
     block
 }
 
@@ -102,7 +102,7 @@ fn lines_of(layout: &DocLayout, block: &str, len: usize) -> (f32, f32, usize) {
 
 /// The blocks that start a page: those marked to, and the first inside a container that is.
 fn starts(doc: &Document) -> Vec<BlockId> {
-    let marked = doc.blocks.iter().filter(|block| block.extra.contains_key("break"));
+    let marked = doc.blocks.iter().filter(|block| block.page_break);
     marked.map(|block| block.body.blocks().first().unwrap_or(block).id.clone()).collect()
 }
 

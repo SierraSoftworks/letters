@@ -36,7 +36,7 @@ use crate::flat::{Attrs, BLOCK, DEPTH, Entry, MARKER, build, head, insert, order
 use crate::history::read_id;
 use crate::json::{mark_name, read_mark};
 use crate::undo::Script;
-use crate::{Block, BlockKind, Document, Run, STYLE_FORMAT, Style};
+use crate::{Block, BlockKind, Document, Properties, Run, STYLE_FORMAT, Style};
 
 pub(crate) const BODY: &str = "body";
 const BLOCKS: &str = "blocks";
@@ -46,8 +46,11 @@ const DICTIONARY: &str = "dictionary";
 const EXTRA: &str = "extra";
 const STYLE: &str = "style";
 const LANGUAGE: &str = "language";
+const PROPERTIES: &str = "properties";
 
 pub(crate) const LINK: &str = "link";
+/// The attribute for a run's language. It is the field `lang`, as a build that did not know it kept it.
+pub(crate) const LANG: &str = "x.lang";
 /// Prefix of a mark's attribute, whose value is `true`.
 const MARK: &str = "m.";
 /// Prefix of the attribute for a run field this build does not know, whose value is the field's JSON.
@@ -84,6 +87,11 @@ fn text(value: &LoroValue) -> Option<&str> {
     }
 }
 
+/// What the [`LANG`] attribute holds for a language, or for none.
+pub(crate) fn lang_value(lang: Option<&str>) -> LoroValue {
+    lang.map_or(LoroValue::Null, |lang| Value::from(lang).to_string().into())
+}
+
 /// Changes a run's formatting as text attributes say. A null value clears, and unknown keys are left alone.
 pub(crate) fn format<S: BuildHasher>(run: &mut Run, attrs: &Attrs<S>) {
     for (attr, value) in attrs {
@@ -96,6 +104,9 @@ pub(crate) fn format<S: BuildHasher>(run: &mut Run, attrs: &Attrs<S>) {
             } else {
                 run.marks.remove(&mark);
             }
+        } else if attr == LANG {
+            let lang = text(value).and_then(|json| serde_json::from_str::<String>(json).ok());
+            run.lang = lang.filter(|lang| !lang.is_empty());
         } else if let Some(field) = attr.strip_prefix(FIELD) {
             match text(value).and_then(|json| serde_json::from_str(json).ok()) {
                 Some(value) => run.extra.insert(name(field), value),
@@ -110,7 +121,9 @@ pub(crate) fn attrs(run: &Run) -> Vec<(String, LoroValue)> {
     let marks = run.marks.iter().map(|mark| (key(MARK, mark_name(mark)), true.into()));
     let link = run.link.iter().map(|link| (LINK.to_owned(), link.as_str().into()));
     let extra = run.extra.iter().map(|(field, value)| (key(FIELD, field), value.to_string().into()));
-    marks.chain(link).chain(extra).collect()
+    // Last, so that it stands over a field of the same name among the unknown ones.
+    let lang = run.lang.iter().filter(|lang| !lang.is_empty()).map(|lang| (LANG.to_owned(), lang_value(Some(lang))));
+    marks.chain(link).chain(extra).chain(lang).collect()
 }
 
 /// What the history keeps for each marker, under the id Loro gave the marker character. No other
@@ -449,6 +462,8 @@ fn plan(doc: &Document, index: &[Entry]) -> Vec<Call> {
     });
     let mut calls: Vec<Call> = blocks.rev().flatten().collect();
     calls.push(Call::Set(META, LANGUAGE.into(), doc.language.as_str().into()));
+    let properties = doc.properties.iter().map(|properties| properties.to_value().to_string());
+    calls.extend(properties.map(|json| Call::Set(META, PROPERTIES.into(), json.into())));
     calls.extend(doc.dictionary.iter().map(|word| Call::Set(DICTIONARY, word_key(word, ""), true.into())));
     calls.extend(doc.extra.iter().map(|(key, value)| Call::Set(EXTRA, key.clone(), value.to_string().into())));
     calls
@@ -557,10 +572,14 @@ pub(crate) fn read_meta(loro: &LoroDoc, doc: &mut Document) {
     doc.language = fresh.language;
     doc.dictionary.clear();
     doc.extra.clear();
-    each(loro, META, |key, value| {
-        if let (LANGUAGE, Some(language)) = (key, text(value)) {
-            doc.language = language.to_owned();
+    doc.properties = None;
+    each(loro, META, |key, value| match (key, text(value)) {
+        (LANGUAGE, Some(language)) => language.clone_into(&mut doc.language),
+        (PROPERTIES, Some(json)) => {
+            let read = serde_json::from_str(json).ok().map(|value| Properties::from_value(value, ""));
+            doc.properties = read.and_then(Result::ok);
         }
+        _ => {}
     });
     each(loro, DICTIONARY, |key, value| {
         if matches!(value, LoroValue::Bool(true)) {
@@ -593,6 +612,11 @@ pub(crate) fn normal_meta(doc: &mut Document) {
         if let Ok(read) = serde_json::from_str(&value.to_string()) {
             *value = read;
         }
+    }
+    if let Some(properties) = &mut doc.properties
+        && let Ok(read) = Properties::from_value(properties.to_value(), "")
+    {
+        *properties = read;
     }
 }
 
@@ -629,6 +653,10 @@ pub(crate) fn meta_assigns(loro: &LoroDoc, from: &Document, to: &Document) -> Ve
     let mut assigns = Vec::new();
     if from.language != to.language {
         assigns.push(set(META, LANGUAGE, Some(to.language.as_str().into())));
+    }
+    if from.properties != to.properties {
+        let json = to.properties.as_ref().map(|properties| properties.to_value().to_string().into());
+        assigns.push(set(META, PROPERTIES, json));
     }
     // A word goes with every add of it this replica has seen. The history lists them in no order, and an
     // outside change must be written in one.

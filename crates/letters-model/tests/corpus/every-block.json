@@ -1,6 +1,10 @@
 {
   "format": 1,
   "language": "en",
+  "properties": {
+    "format": "yaml",
+    "source": "title: Every block\ntags: [a, b]\n"
+  },
   "blocks": [
     {
       "id": "a",
@@ -66,9 +70,14 @@
         {
           "text": "Héllo",
           "future": true
+        },
+        {
+          "text": " Welt",
+          "lang": "de"
         }
       ],
-      "break": "page"
+      "break": "page",
+      "lang": "fr"
     }
   ],
   "future": [

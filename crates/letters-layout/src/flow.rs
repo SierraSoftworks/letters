@@ -333,7 +333,7 @@ impl Frame {
 
 /// Whether a block is marked to start a page of print.
 pub(crate) fn breaks(block: &Block) -> bool {
-    block.extra.get("break").and_then(|value| value.as_str()) == Some("page")
+    block.page_break
 }
 
 #[derive(Default)]

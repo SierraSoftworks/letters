@@ -18,7 +18,7 @@ use crate::crdt::{self, Assign, Event, attrs};
 use crate::flat::{self, BLOCK, DEPTH, Entry, Flat, children, head, insert, marker, nth, nth_mut, spell};
 use crate::history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
 use crate::undo::{Delta, Edit, Script, Step, Steps, is_skip};
-use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, Mark, Page, Pos, Run, Style, TextStyle};
+use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Mark, Page, Pos, Properties, Run, Style, TextStyle};
 
 /// One change to a document. Offsets are UTF-8 bytes into a text block and must sit on character boundaries.
 #[derive(Clone, Debug, PartialEq)]
@@ -44,6 +44,12 @@ pub enum Op {
         range: Range<usize>,
         link: Option<String>,
     },
+    /// Sets the language of a stretch of text, or with `None` leaves it to its block's.
+    SetLang {
+        block: BlockId,
+        range: Range<usize>,
+        lang: Option<String>,
+    },
     /// Splits a text block in two. The text after `at` moves to a new block of the same kind, placed after it.
     Split {
         at: Pos,
@@ -57,6 +63,12 @@ pub enum Op {
     SetKind {
         block: BlockId,
         kind: BlockKind,
+    },
+    /// Sets what any block may carry: whether it starts a new page, and its language as a BCP 47 tag.
+    SetBlockProps {
+        block: BlockId,
+        page_break: bool,
+        lang: Option<String>,
     },
     /// Inserts a block at `index` among the children of `parent`, or at the top level.
     InsertBlock {
@@ -91,6 +103,10 @@ pub enum Op {
     },
     RemoveWord {
         word: String,
+    },
+    /// Sets the document's properties, or with `None` takes them away.
+    SetProperties {
+        properties: Option<Properties>,
     },
 }
 
@@ -143,7 +159,7 @@ pub struct Change {
     pub structure: bool,
     /// Whether the style changed, which the layout of every block depends on.
     pub style: bool,
-    /// Whether the document's own fields changed: its language or its dictionary.
+    /// Whether the document's own fields changed: its language, its dictionary or its properties.
     pub document: bool,
 }
 
@@ -434,7 +450,7 @@ impl Model {
             match op {
                 Op::InsertText { at, .. } => Some(&at.block),
                 Op::DeleteText { block, .. } | Op::SetMark { block, .. } | Op::SetLink { block, .. } => Some(block),
-                Op::SetKind { block, .. } => Some(block),
+                Op::SetLang { block, .. } | Op::SetKind { block, .. } | Op::SetBlockProps { block, .. } => Some(block),
                 _ => None,
             }
         }
@@ -555,12 +571,13 @@ impl Model {
 
     /// The document's own fields, without its blocks.
     fn fields(&self) -> Document {
-        let (language, dictionary, extra) = (&self.doc.language, &self.doc.dictionary, &self.doc.extra);
+        let doc = &self.doc;
         Document {
             blocks: Vec::new(),
-            language: language.clone(),
-            dictionary: dictionary.clone(),
-            extra: extra.clone(),
+            language: doc.language.clone(),
+            dictionary: doc.dictionary.clone(),
+            properties: doc.properties.clone(),
+            extra: doc.extra.clone(),
         }
     }
 
@@ -570,9 +587,11 @@ impl Model {
         let mut read = Document::default();
         crdt::read_meta(&history.loro, &mut read);
         let style = crdt::read_style(&history.loro);
-        let document = (&read.language, &read.dictionary) != (&self.doc.language, &self.doc.dictionary);
-        let change = Change { style: style != self.style, document, ..Change::default() };
-        (self.doc.language, self.doc.dictionary, self.doc.extra) = (read.language, read.dictionary, read.extra);
+        let change =
+            Change { style: style != self.style, document: fields(&read) != fields(&self.doc), ..Change::default() };
+        let doc = &mut self.doc;
+        (doc.language, doc.dictionary, doc.properties, doc.extra) =
+            (read.language, read.dictionary, read.properties, read.extra);
         self.style = style;
         change
     }
@@ -756,7 +775,7 @@ impl Model {
         self.index = index;
         self.queue().clear();
         let mut change = diff(&old, &self.doc);
-        change.document = (&old.language, &old.dictionary) != (&self.doc.language, &self.doc.dictionary);
+        change.document = fields(&old) != fields(&self.doc);
         change.style = mem::replace(&mut self.style, style) != self.style;
         change
     }
@@ -805,12 +824,7 @@ impl Model {
         let Body::Text(runs) = &mut block.body else { return None };
 
         // The block is read alone, as if the sequence began at its marker.
-        let alone = Block {
-            id: block.id.clone(),
-            kind: BlockKind::Paragraph,
-            body: Body::Text(mem::take(runs)),
-            extra: Extra::new(),
-        };
+        let alone = Block { body: Body::Text(mem::take(runs)), ..Block::new(block.id.clone(), BlockKind::Paragraph) };
         let alone = Flat { block: alone, entry: self.index[i].clone(), dirty: false };
         let mut local = vec![retain(first - start)];
         local.extend(delta.iter().skip_while(|item| is_skip(item)).cloned());
@@ -912,6 +926,11 @@ impl Model {
                 let set = |run: &Run| run.link == *link;
                 place = Some(self.restyle(block, range, crdt::LINK.into(), value, set, &mut delta)?);
             }
+            Op::SetLang { block, range, lang } => {
+                let lang = lang.as_deref().filter(|lang| !lang.is_empty());
+                let set = |run: &Run| run.lang.as_deref() == lang;
+                place = Some(self.restyle(block, range, crdt::LANG.into(), crdt::lang_value(lang), set, &mut delta)?);
+            }
             Op::Split { at, new_id } => {
                 if self.spot(new_id).is_ok() {
                     return Err(OpError::DuplicateId(new_id.clone()));
@@ -939,13 +958,15 @@ impl Model {
                 if spot.block.kind == *kind {
                     return Ok((delta, None));
                 }
-                let changed = Block { kind: kind.clone(), body: Body::None, ..spot.block.clone_bare() };
-                seek(&mut delta, spot.start);
-                if spot.entry.marker {
-                    delta.push(style(1, BLOCK.into(), head(&changed).into()));
-                } else {
-                    delta.push(marker(&changed, spot.entry.level));
+                self.rehead(&spot, Block { kind: kind.clone(), ..spot.block.clone_bare() }, &mut delta);
+            }
+            Op::SetBlockProps { block, page_break, lang } => {
+                let spot = self.spot(block)?;
+                let lang = lang.clone().filter(|lang| !lang.is_empty());
+                if (spot.block.page_break, &spot.block.lang) == (*page_break, &lang) {
+                    return Ok((delta, None));
                 }
+                self.rehead(&spot, Block { page_break: *page_break, lang, ..spot.block.clone_bare() }, &mut delta);
             }
             Op::InsertBlock { parent, index, block } => {
                 let mut ids = BTreeSet::new();
@@ -984,9 +1005,19 @@ impl Model {
             }
             // These change no block. `apply` makes them itself.
             Op::SetStyle { .. } | Op::SetPage { .. } | Op::ReplaceStyle { .. } => {}
-            Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. } => {}
+            Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. } | Op::SetProperties { .. } => {}
         }
         Ok((delta, place))
+    }
+
+    /// Changes what a block is, leaving what it holds. `changed` is the block without its body.
+    fn rehead(&self, spot: &Spot, changed: Block, delta: &mut Vec<TextDelta>) {
+        seek(delta, spot.start);
+        if spot.entry.marker {
+            delta.push(style(1, BLOCK.into(), head(&changed).into()));
+        } else {
+            delta.push(marker(&changed, spot.entry.level));
+        }
     }
 
     /// Sets one attribute over a range of a block's text. Text that `set` says has it already is left
@@ -1034,8 +1065,15 @@ impl Model {
 
 impl Block {
     /// The block without its text or children.
-    fn clone_bare(&self) -> Block {
-        Block { id: self.id.clone(), kind: self.kind.clone(), body: Body::None, extra: self.extra.clone() }
+    pub(crate) fn clone_bare(&self) -> Block {
+        Block {
+            id: self.id.clone(),
+            kind: self.kind.clone(),
+            body: Body::None,
+            lang: self.lang.clone(),
+            page_break: self.page_break,
+            extra: self.extra.clone(),
+        }
     }
 }
 
@@ -1071,7 +1109,8 @@ impl Spot<'_> {
 /// Whether an operation changes the document's own fields or its style, and no block.
 fn is_setting(op: &Op) -> bool {
     let style = matches!(op, Op::SetStyle { .. } | Op::SetPage { .. } | Op::ReplaceStyle { .. });
-    style || matches!(op, Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. })
+    let fields = matches!(op, Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. });
+    style || fields || matches!(op, Op::SetProperties { .. })
 }
 
 /// Makes such an operation, on copies of the fields and the style.
@@ -1080,6 +1119,7 @@ fn set(op: &Op, fields: &mut Document, style: &mut Style) -> Result<(), OpError>
         Op::SetLanguage { language } => fields.language.clone_from(language),
         Op::AddWord { word } => drop(fields.dictionary.insert(word.clone())),
         Op::RemoveWord { word } => drop(fields.dictionary.remove(word)),
+        Op::SetProperties { properties } => fields.properties.clone_from(properties),
         Op::SetStyle { element, style: text } => drop(style.types.insert(element.clone(), text.clone())),
         Op::SetPage { page } => style.page.clone_from(page),
         Op::ReplaceStyle { style: whole } => style.clone_from(whole),
@@ -1092,6 +1132,11 @@ fn set(op: &Op, fields: &mut Document, style: &mut Style) -> Result<(), OpError>
     }
     crdt::normal_meta(fields);
     Ok(())
+}
+
+/// The document's own fields that a [`Change`] speaks of.
+fn fields(doc: &Document) -> (&String, &BTreeSet<String>, &Option<Properties>) {
+    (&doc.language, &doc.dictionary, &doc.properties)
 }
 
 fn unreadable(error: impl fmt::Display) -> HistoryError {
