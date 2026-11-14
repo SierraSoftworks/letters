@@ -237,6 +237,23 @@ fn a_heading_in_a_box_keeps_its_marker_inside() {
 }
 
 #[test]
+fn a_heading_makes_room_for_a_marker_its_margin_cannot_hold() {
+    let doc = doc(vec![paragraph("p", PROSE), Block::text("a", BlockKind::Heading { level: 3 }, "Rates")]);
+    // The room left of the text edge, and whether the marker fits in it.
+    for (margin, fits) in [(200.0, true), (16.0, false), (0.0, false)] {
+        let mut page = Page::new(&doc, WIDTH);
+        page.layout.set_margin(margin);
+        let first = page.layout.caret(&Pos::new("a", 0)).unwrap();
+        assert!(page.click("a", 2), "the heading's marker appears");
+
+        let [(_, left)] = markers(&page.painted())[..] else { panic!("one marker shows") };
+        assert!(left >= -margin - 0.01, "the marker stays within {margin} px of the text edge, not at {left}");
+        let pushed = page.layout.caret(&Pos::new("a", 0)).unwrap().x - first.x;
+        assert_eq!(pushed > 0.0, !fits, "with {margin} px to hang in, the first line moves over by {pushed}");
+    }
+}
+
+#[test]
 fn progress_fades_markers_and_slides_the_line() {
     let mut page = Page::new(&sentence(&[Mark::Bold]), NARROW);
     let hidden = page.painted();

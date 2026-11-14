@@ -104,6 +104,7 @@ impl DocLayout {
             tokens: HashMap::new(),
             spelling: HashMap::new(),
             reveal: Reveal::default(),
+            margin: f32::INFINITY,
             shapes: Shapes::default(),
             composition: None,
             stale: 0,
@@ -160,6 +161,13 @@ impl DocLayout {
     /// step to 1 over the time the fade takes.
     pub fn set_reveal_progress(&mut self, progress: f32) {
         self.state.get_mut().reveal.set_progress(progress);
+    }
+
+    /// How much room lies left of the text edge for a heading's markers to hang in, which is without limit
+    /// until set. A marker that does not fit has the heading's first line make room, as in a quote. Nothing
+    /// is laid out again.
+    pub fn set_margin(&mut self, margin: f32) {
+        self.state.get_mut().margin = margin.max(0.0);
     }
 
     /// Underlines the text an input method is composing: a block and a byte range in it, as the editor's
@@ -304,6 +312,8 @@ struct State {
     spelling: HashMap<BlockId, Vec<Range<usize>>>,
     /// The markers shown around the caret.
     reveal: Reveal,
+    /// The room left of the text edge that markers may hang in.
+    margin: f32,
     shapes: Shapes,
     /// The text an input method is composing.
     composition: Option<(BlockId, Range<usize>)>,
@@ -439,7 +449,7 @@ impl State {
 
     /// The markers revealed in a leaf that holds its layout.
     fn shifts(&mut self, at: usize) -> Shifts {
-        let Self { reveal, shapes, engine, types, leaves, frames, .. } = self;
+        let Self { reveal, shapes, engine, types, leaves, frames, margin, .. } = self;
         let leaf = &leaves[at];
         let (Some(id), Some(laid)) = (&leaf.id, &leaf.laid) else { return Shifts::default() };
         // Code shows its text as written.
@@ -447,7 +457,7 @@ impl State {
             return Shifts::default();
         }
         // Inside a quote or callout a marker hangs clear of the bar down its side, never across it.
-        let room = leaf.frame.map_or(f32::INFINITY, |frame| leaf.x - frames[frame].x - theme::BAR - 2.0);
+        let room = leaf.frame.map_or(*margin + leaf.x, |frame| leaf.x - frames[frame].x - theme::BAR - 2.0);
         reveal.over(id, &laid.text, room, |text| shapes.get(engine, types, leaf.role, false, text))
     }
 
