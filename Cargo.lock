@@ -2057,7 +2057,9 @@ dependencies = [
 name = "letters-ui"
 version = "0.1.0"
 dependencies = [
+ "accesskit",
  "letters-editor",
+ "letters-fonts",
  "letters-layout",
  "letters-model",
  "letters-render",

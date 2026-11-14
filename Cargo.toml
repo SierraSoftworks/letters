@@ -42,11 +42,12 @@ bytemuck = "1"
 # Text shaping and line breaking. No system fonts: only the bundled faces are registered.
 parley = { version = "0.13", default-features = false, features = ["std"] }
 pulldown-cmark = { version = "0.13", default-features = false }
+# The accessibility tree's types: plain data, shared by the widgets, the shell and the test harness.
+accesskit = "0.25"
 
 # The desktop shell. None of these may reach the core crates.
 winit = "0.30"
 softbuffer = "0.4"
-accesskit = "0.25"
 accesskit_winit = "0.34"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 rfd = "0.17"

@@ -1,0 +1,1003 @@
+//! Hosts an app's elements in a window.
+//!
+//! [`Ui`] rebuilds the element tree when the app's state changes, lays it out, routes pointer, key and text
+//! input to elements, keeps focus and open popovers, and paints. A shell and the test harness drive it
+//! through the same calls, so a test exercises what a person does.
+
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+use accesskit::{Action, ActionData, ActionRequest, Node as AccessNode, NodeId, TreeUpdate};
+use letters_editor::{Clip, InputEvent, Key, KeyEvent, Modifiers, Platform};
+use letters_render::{DisplayList, Point, Rect, Size};
+
+use crate::access;
+use crate::element::{Content, Cursor, Element, Focus, Pointer};
+use crate::input::{InputState, Motion};
+use crate::layout::{Layout, TextCache, inner};
+use crate::paint::{self, Scene};
+use crate::style::Dir;
+use crate::text::TextShaper;
+use crate::tokens::Scheme;
+use crate::tree::{Id, Tree};
+
+/// Half a caret blink.
+const BLINK_MS: u64 = 500;
+/// The longest gap between the presses of a double click.
+const DOUBLE_CLICK_MS: u64 = 400;
+/// How far the pointer may wander between them.
+const DOUBLE_CLICK_SLOP: f32 = 4.0;
+/// Room kept between a canvas's caret and the edge of what scrolls it.
+const CARET_MARGIN: f32 = 24.0;
+/// macOS moves by word with Option and by line with Command. Elsewhere Control moves by word.
+const MAC: bool = cfg!(target_os = "macos");
+
+/// What a window shows and does. The app owns all of its state: elements only send it messages.
+pub trait App {
+    type Msg: Clone + 'static;
+
+    /// The window's name, as assistive technology announces it.
+    fn title(&self) -> String;
+
+    /// Describes the whole window for the current state. The app may bring what it draws itself up to date
+    /// here, such as a document's layout for the window's width.
+    fn view(&mut self, window: Size) -> Element<Self::Msg>;
+
+    fn update(&mut self, message: Self::Msg, platform: &mut dyn Platform);
+
+    /// Offered every key while the page has focus, and otherwise the shortcuts no element used. `true` uses
+    /// the key.
+    fn key(&mut self, _event: &KeyEvent, _platform: &mut dyn Platform) -> bool {
+        false
+    }
+
+    /// Fills in the accessibility node of a canvas and adds the nodes under it: what the app draws there
+    /// itself, such as a document's blocks.
+    fn describe(&self, _canvas: &mut AccessNode, _nodes: &mut Vec<(NodeId, AccessNode)>) {}
+
+    /// A request from assistive technology for a canvas or a node described under one.
+    fn access_action(&mut self, _request: &ActionRequest, _platform: &mut dyn Platform) {}
+
+    /// Told when the window turns light or dark, for what the app draws itself. Elements follow on their own.
+    fn scheme(&mut self, _scheme: Scheme) {}
+
+    /// Does a little of any work that was put off, such as laying out text that is out of sight. Returns
+    /// whether there was any. It is called while nothing else is happening.
+    fn idle(&mut self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Stale {
+    view: bool,
+    layout: bool,
+    paint: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Press {
+    id: Id,
+    at: Point,
+    time_ms: u64,
+    clicks: u8,
+}
+
+enum Step {
+    Previous,
+    Next,
+    First,
+    Last,
+}
+
+pub struct Ui<A: App> {
+    app: A,
+    shaper: Rc<dyn TextShaper>,
+    cache: TextCache,
+    tree: Tree<A::Msg>,
+    queue: Vec<A::Msg>,
+    size: Size,
+    scale: f32,
+    scheme: Scheme,
+    /// Whether the window has the keyboard.
+    active: bool,
+    stale: Stale,
+    pointer: Option<Point>,
+    /// The element under the pointer and its ancestors.
+    hover: Vec<Id>,
+    pressed: Option<Id>,
+    last_press: Option<Press>,
+    focus: Option<Id>,
+    focus_visible: bool,
+    /// The anchors of the open popovers, as of the last build.
+    layers: Vec<Id>,
+    /// For each open popover, where focus was before it opened.
+    returns: Vec<(Id, Option<Id>)>,
+    /// The popovers that open and close themselves, by anchor.
+    open: HashSet<Id>,
+    inputs: HashMap<Id, InputState>,
+    scroll: HashMap<Id, f32>,
+    /// The focused canvas's caret at the last layout, to scroll after it when it moves.
+    canvas_caret: Option<Rect>,
+    /// Whether the app may have work for idle time, and whether it did any since the window was described.
+    idle: (bool, bool),
+    blink_from: Option<u64>,
+    caret_on: bool,
+}
+
+impl<A: App> Ui<A> {
+    /// Hosts `app`, measuring and drawing its text with `shaper`.
+    pub fn host(app: A, shaper: Rc<dyn TextShaper>) -> Self {
+        Self {
+            app,
+            shaper,
+            cache: TextCache::default(),
+            tree: Tree::default(),
+            queue: Vec::new(),
+            size: Size::default(),
+            scale: 1.0,
+            scheme: Scheme::Light,
+            active: true,
+            stale: Stale { view: true, layout: true, paint: true },
+            pointer: None,
+            hover: Vec::new(),
+            pressed: None,
+            last_press: None,
+            focus: None,
+            focus_visible: false,
+            layers: Vec::new(),
+            returns: Vec::new(),
+            open: HashSet::new(),
+            inputs: HashMap::new(),
+            scroll: HashMap::new(),
+            canvas_caret: None,
+            idle: (true, false),
+            blink_from: None,
+            caret_on: true,
+        }
+    }
+
+    pub fn app(&self) -> &A {
+        &self.app
+    }
+
+    /// The app, to change its state from outside. The window is described again afterwards.
+    pub fn app_mut(&mut self) -> &mut A {
+        self.stale.view = true;
+        &mut self.app
+    }
+
+    // The window
+
+    /// `size` is in logical pixels. `scale` is the device pixels in one of them, for crisp edges.
+    pub fn resize(&mut self, size: Size, scale: f32) {
+        if size != self.size || scale != self.scale {
+            (self.size, self.scale) = (size, scale);
+            self.stale.view = true;
+        }
+    }
+
+    pub fn set_dark(&mut self, dark: bool) {
+        let scheme = if dark { Scheme::Dark } else { Scheme::Light };
+        if scheme != self.scheme {
+            self.scheme = scheme;
+            self.app.scheme(scheme);
+            self.stale.view = true;
+        }
+    }
+
+    /// Tells the window whether it has the keyboard. Without it no caret blinks.
+    pub fn focus(&mut self, focused: bool) {
+        self.active = focused;
+        self.pressed = None;
+        self.restart_blink();
+    }
+
+    pub fn needs_paint(&self) -> bool {
+        self.stale.view || self.stale.layout || self.stale.paint
+    }
+
+    pub fn paint(&mut self, out: &mut DisplayList) {
+        self.refresh();
+        self.stale.paint = false;
+        let scene = Scene {
+            scheme: self.scheme,
+            hover: &self.hover,
+            pressed: self.pressed,
+            focus: self.focus,
+            focus_visible: self.focus_visible,
+            caret: self.caret_on && self.active,
+            inputs: &self.inputs,
+            scroll: &self.scroll,
+        };
+        paint::paint(&self.tree, &scene, self.window(), out);
+    }
+
+    /// Advances what moves on its own: the caret's blink, and the app's idle work. Returns when to call
+    /// again, or `None` when nothing is left to move.
+    pub fn animate(&mut self, now_ms: u64) -> Option<u64> {
+        self.refresh();
+        // A frame that is owed comes before work on what is out of sight.
+        if self.idle.0 && !self.needs_paint() {
+            if self.app.idle() {
+                self.idle.1 = true;
+                return Some(now_ms);
+            }
+            // The work may have changed what shows, such as how far a page scrolls.
+            self.stale.view = std::mem::take(&mut self.idle.1);
+            self.idle.0 = false;
+            self.refresh();
+        }
+        let caret = self.focused().is_some_and(|i| match &self.tree.nodes[i].el.content {
+            Content::Input(_) => true,
+            Content::Canvas(canvas) => canvas.caret.is_some(),
+            _ => false,
+        });
+        if !self.active || !caret {
+            return None;
+        }
+        // A caret that has just moved shows solid from the next frame.
+        let from = *self.blink_from.get_or_insert(now_ms);
+        let phase = now_ms.saturating_sub(from) / BLINK_MS;
+        let on = phase.is_multiple_of(2);
+        self.stale.paint |= on != self.caret_on;
+        self.caret_on = on;
+        Some(from + (phase + 1) * BLINK_MS)
+    }
+
+    /// Where the caret is in the window as last laid out, for the input method's candidate window.
+    pub fn caret_rect(&self) -> Option<Rect> {
+        let node = &self.tree.nodes[self.focused()?];
+        let content = inner(node.rect, &node.el.style);
+        match &node.el.content {
+            Content::Input(input) => {
+                let shaped = node.shaped.as_ref()?;
+                let state = self.inputs.get(&node.id).cloned().unwrap_or_default();
+                let x = content.x - state.scroll + shaped.x_at(state.caret(&input.value));
+                let y = content.y + (content.height - shaped.size.height) / 2.0;
+                Some(Rect::new(x, y, 1.0, shaped.size.height))
+            }
+            Content::Canvas(canvas) => {
+                let caret = canvas.caret?;
+                Some(Rect { x: content.x + caret.x, y: content.y + caret.y, ..caret })
+            }
+            _ => None,
+        }
+    }
+
+    /// The pointer shape for what is under the pointer.
+    pub fn cursor(&self) -> Cursor {
+        // A drag keeps the shape of what it started on.
+        let held = self.pressed.iter().chain(&self.hover);
+        let nodes = held.filter_map(|&id| self.tree.find(id)).filter(|&i| !self.tree.disabled(i));
+        nodes.map(|i| self.tree.nodes[i].el.cursor).find(|&cursor| cursor != Cursor::Default).unwrap_or_default()
+    }
+
+    // Accessibility
+
+    /// The whole accessibility tree.
+    pub fn access(&mut self) -> TreeUpdate {
+        self.refresh();
+        let title = self.app.title();
+        let window = access::Window {
+            title: &title,
+            rect: self.window(),
+            scale: self.scale,
+            focus: self.focus,
+            inputs: &self.inputs,
+            describe: &|node, nodes| self.app.describe(node, nodes),
+        };
+        access::build(&self.tree, &window)
+    }
+
+    /// Does what assistive technology asked of a node.
+    pub fn access_action(&mut self, request: ActionRequest, platform: &mut dyn Platform) {
+        self.refresh();
+        let id = Id(request.target_node.0);
+        // What a canvas holds is the app's, and so is anything asked of it beyond a click or focus.
+        let found = self.tree.find(id);
+        let canvas = found.is_some_and(|i| matches!(self.tree.nodes[i].el.content, Content::Canvas(_)));
+        let (Some(i), true) = (found, !canvas || matches!(request.action, Action::Click | Action::Focus)) else {
+            self.app.access_action(&request, platform);
+            self.stale.view = true;
+            return;
+        };
+        match (request.action, request.data) {
+            (Action::Click, _) => {
+                if self.tree.nodes[i].el.focus == Focus::Click {
+                    self.set_focus(Some(id), true);
+                }
+                self.activate(i);
+            }
+            (Action::Focus, _) if self.tree.focusable(i) => self.set_focus(Some(id), true),
+            (Action::SetValue, Some(ActionData::Value(text))) => {
+                if let Content::Input(input) = &self.tree.nodes[i].el.content {
+                    self.inputs.entry(id).or_default().select_all(&input.value);
+                }
+                self.input_text(i, InputEvent::Insert(text.into()));
+            }
+            (Action::ReplaceSelectedText, Some(ActionData::Value(text))) => {
+                self.input_text(i, InputEvent::Insert(text.into()));
+            }
+            (Action::SetTextSelection, Some(ActionData::SetTextSelection(selection))) => {
+                let Some(shaped) = self.tree.nodes[i].shaped.clone() else { return };
+                let offset = |position| access::offset_of(id, &shaped, position);
+                if let (Some(anchor), Some(head)) = (offset(&selection.anchor), offset(&selection.focus)) {
+                    let state = self.inputs.entry(id).or_default();
+                    (state.anchor, state.head) = (anchor, head);
+                    self.restart_blink();
+                }
+            }
+            _ => {}
+        }
+        self.flush(platform);
+    }
+
+    // The pointer
+
+    pub fn pointer_move(&mut self, at: Point, platform: &mut dyn Platform) {
+        self.refresh();
+        self.pointer = Some(at);
+        if let Some(i) = self.pressed.and_then(|id| self.tree.find(id)) {
+            let node = &self.tree.nodes[i];
+            match &node.el.content {
+                Content::Input(input) => {
+                    let offset = self.offset_at(i, at);
+                    self.inputs.entry(node.id).or_default().place(&input.value, offset, true);
+                    self.restart_blink();
+                }
+                Content::Canvas(canvas) => {
+                    let event = Pointer::Drag { at: self.within(i, at) };
+                    self.queue.extend(canvas.on_pointer.as_ref().and_then(|handler| handler(event)));
+                }
+                _ => {}
+            }
+        }
+        self.update_hover();
+        self.flush(platform);
+    }
+
+    pub fn pointer_down(&mut self, at: Point, mods: Modifiers, platform: &mut dyn Platform) {
+        self.refresh();
+        self.pointer = Some(at);
+        let blocked = self.dismiss(self.hit(at));
+        self.flush(platform);
+        self.refresh();
+        if blocked {
+            return;
+        }
+
+        let Some(i) = self.hit(at).and_then(|hit| self.target(hit)).filter(|&i| !self.tree.disabled(i)) else { return };
+        let id = self.tree.nodes[i].id;
+        let now = platform.now_ms();
+        let clicks = match self.last_press {
+            Some(last)
+                if last.id == id
+                    && now.saturating_sub(last.time_ms) <= DOUBLE_CLICK_MS
+                    && (last.at.x - at.x).abs() <= DOUBLE_CLICK_SLOP
+                    && (last.at.y - at.y).abs() <= DOUBLE_CLICK_SLOP =>
+            {
+                last.clicks.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.last_press = Some(Press { id, at, time_ms: now, clicks });
+        self.pressed = Some(id);
+        self.stale.paint = true;
+        if self.tree.nodes[i].el.focus == Focus::Click {
+            self.set_focus(Some(id), false);
+        }
+
+        let node = &self.tree.nodes[i];
+        match &node.el.content {
+            Content::Input(input) => {
+                let offset = self.offset_at(i, at);
+                let state = self.inputs.entry(id).or_default();
+                match clicks {
+                    1 => state.place(&input.value, offset, mods.shift),
+                    2 => state.select_word(&input.value, offset),
+                    _ => state.select_all(&input.value),
+                }
+                self.restart_blink();
+            }
+            Content::Canvas(canvas) => {
+                let event = Pointer::Down { at: self.within(i, at), mods, clicks };
+                self.queue.extend(canvas.on_pointer.as_ref().and_then(|handler| handler(event)));
+            }
+            _ => {}
+        }
+        self.flush(platform);
+    }
+
+    pub fn pointer_up(&mut self, at: Point, platform: &mut dyn Platform) {
+        self.refresh();
+        self.pointer = Some(at);
+        self.update_hover();
+        if let Some(id) = self.pressed.take() {
+            self.stale.paint = true;
+            if let Some(i) = self.tree.find(id) {
+                match &self.tree.nodes[i].el.content {
+                    Content::Canvas(canvas) => {
+                        let event = Pointer::Up { at: self.within(i, at) };
+                        self.queue.extend(canvas.on_pointer.as_ref().and_then(|handler| handler(event)));
+                    }
+                    Content::Input(_) => {}
+                    // A press counts when it is let go over the element it started on.
+                    _ if self.hover.contains(&id) => self.activate(i),
+                    _ => {}
+                }
+            }
+        }
+        self.flush(platform);
+    }
+
+    pub fn pointer_leave(&mut self) {
+        self.pointer = None;
+        self.update_hover();
+    }
+
+    /// `delta` is in logical pixels. A positive `y` moves the content up.
+    pub fn scroll(&mut self, at: Point, delta: Point, platform: &mut dyn Platform) {
+        self.refresh();
+        let Some(hit) = self.hit(at) else { return };
+        // The innermost element that scrolls and has room to move takes the scroll.
+        for i in self.tree.ancestors(hit).collect::<Vec<_>>() {
+            let handler = match &self.tree.nodes[i].el.content {
+                Content::Canvas(canvas) => canvas.on_pointer.as_ref(),
+                _ => None,
+            };
+            if let Some(message) = handler.and_then(|handler| handler(Pointer::Scroll { delta })) {
+                self.queue.push(message);
+                break;
+            }
+            if self.scroll_by(i, delta.y) {
+                break;
+            }
+        }
+        self.flush(platform);
+    }
+
+    // The keyboard
+
+    /// Offers a key to the focused element, then to the window and the app. `false` means nothing used it.
+    pub fn key(&mut self, event: KeyEvent, platform: &mut dyn Platform) -> bool {
+        self.refresh();
+        let used = self.route(&event, platform);
+        self.flush(platform);
+        used
+    }
+
+    /// Text from the keyboard or an input method, for whatever has focus.
+    pub fn input(&mut self, event: InputEvent, platform: &mut dyn Platform) {
+        self.refresh();
+        let Some(i) = self.focused() else { return };
+        match &self.tree.nodes[i].el.content {
+            Content::Input(_) => self.input_text(i, event),
+            Content::Canvas(canvas) => self.queue.extend(canvas.on_text.as_ref().map(|handler| handler(event))),
+            // Space presses a focused button. It arrives as text, like every other character.
+            _ if matches!(&event, InputEvent::Insert(text) | InputEvent::Commit(text) if text == " ") => {
+                self.activate(i)
+            }
+            _ => {}
+        }
+        self.flush(platform);
+    }
+
+    fn route(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        let focused = self.focused();
+        let plain = !event.mods.primary && !event.mods.alt;
+        // Escape closes the topmost popover before it means anything else.
+        if let (Key::Escape, Some(top)) = (&event.key, self.tree.top_layer()) {
+            self.close_layer(top);
+            return true;
+        }
+        let on_page = focused.is_none_or(|i| matches!(self.tree.nodes[i].el.content, Content::Canvas(_)));
+        if on_page && self.offer(event, platform) {
+            return true;
+        }
+        if let Some(i) = focused {
+            if self.input_key(i, event, platform) {
+                return true;
+            }
+            let node = &self.tree.nodes[i];
+            if event.key == Key::Enter && plain && (node.el.on_press.is_some() || node.trigger.is_some()) {
+                self.activate(i);
+                return true;
+            }
+            // What the element did not use is offered to each element it sits in.
+            for at in self.tree.ancestors(i).collect::<Vec<_>>() {
+                let el = &self.tree.nodes[at].el;
+                if let Some(message) = el.on_key.as_ref().and_then(|handler| handler(event)) {
+                    self.queue.push(message);
+                    return true;
+                }
+                if let Some(step) = el.arrows.filter(|_| plain).and_then(|dir| step(dir, &event.key)) {
+                    self.rove(at, i, step);
+                    return true;
+                }
+            }
+        }
+        let used = match event.key {
+            Key::Escape => self.escape(),
+            Key::Tab if plain => self.tab(event.mods.shift),
+            Key::PageUp | Key::PageDown => self.page(event.key == Key::PageDown),
+            _ => false,
+        };
+        // Shortcuts reach the app wherever focus is.
+        used || (!on_page && event.mods.primary && self.offer(event, platform))
+    }
+
+    fn offer(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        let used = self.app.key(event, platform);
+        self.stale.view |= used;
+        used
+    }
+
+    /// Hands focus back to the page.
+    fn escape(&mut self) -> bool {
+        let rest = self.rest();
+        let away = rest.is_some() && rest != self.focus;
+        if away {
+            self.set_focus(rest, false);
+        }
+        away
+    }
+
+    /// Moves focus to the next or previous element in the layer that holds it. A modal layer keeps it in.
+    fn tab(&mut self, back: bool) -> bool {
+        let focused = self.focused();
+        let modal = self.tree.modal_layer();
+        let held = focused.map(|i| self.tree.nodes[i].layer).filter(|&layer| modal.is_none_or(|modal| layer >= modal));
+        let layer = &self.tree.layers[held.or(modal).unwrap_or(0)];
+        let stops = self.tree.focusables(layer.root..layer.end);
+        let at = focused.and_then(|i| stops.iter().position(|&stop| stop == i));
+        let next = match (at, back) {
+            (Some(at), false) => (at + 1) % stops.len(),
+            (Some(at), true) => (at + stops.len() - 1) % stops.len(),
+            (None, false) => 0,
+            (None, true) => stops.len().saturating_sub(1),
+        };
+        if let Some(&stop) = stops.get(next) {
+            self.set_focus(Some(self.tree.nodes[stop].id), true);
+        }
+        true
+    }
+
+    /// Moves focus among the focusable elements inside `container`, wrapping at the ends.
+    fn rove(&mut self, container: usize, from: usize, step: Step) {
+        // After the pointer, the first arrow key only shows where focus is.
+        if !self.focus_visible {
+            self.focus_visible = true;
+            self.stale.paint = true;
+            return;
+        }
+        let stops = self.tree.focusables(container + 1..self.tree.nodes[container].end);
+        let at = stops.iter().position(|&stop| stop == from);
+        let next = match (step, at) {
+            (Step::First, _) | (Step::Next, None) => 0,
+            (Step::Last, _) | (Step::Previous, None) => stops.len().saturating_sub(1),
+            (Step::Next, Some(at)) => (at + 1) % stops.len(),
+            (Step::Previous, Some(at)) => (at + stops.len() - 1) % stops.len(),
+        };
+        if let Some(&stop) = stops.get(next) {
+            self.set_focus(Some(self.tree.nodes[stop].id), true);
+        }
+    }
+
+    /// Scrolls what holds focus by most of its height.
+    fn page(&mut self, down: bool) -> bool {
+        let scrolls = |i: &usize| self.tree.nodes[*i].el.style.scroll;
+        let scroller = match self.focused() {
+            Some(i) => self.tree.ancestors(i).find(scrolls),
+            None => (0..self.tree.nodes.len()).find(scrolls),
+        };
+        let Some(i) = scroller else { return false };
+        let node = &self.tree.nodes[i];
+        let step = inner(node.rect, &node.el.style).height * 0.9;
+        self.scroll_by(i, if down { step } else { -step });
+        true
+    }
+
+    /// The keys of a one-line text input.
+    fn input_key(&mut self, i: usize, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        let node = &self.tree.nodes[i];
+        let (Content::Input(input), Some(shaped)) = (&node.el.content, &node.shaped) else { return false };
+        let state = self.inputs.entry(node.id).or_default();
+        let value = input.value.as_str();
+        let mods = event.mods;
+        let by_line = MAC && mods.primary;
+        let by_word = if MAC { mods.alt } else { mods.primary };
+
+        let motion = match event.key {
+            Key::Home => Some(Motion::Start),
+            Key::End => Some(Motion::End),
+            Key::Left | Key::Backspace if by_line => Some(Motion::Start),
+            Key::Right | Key::Delete if by_line => Some(Motion::End),
+            Key::Left | Key::Backspace if by_word => Some(Motion::WordLeft),
+            Key::Right | Key::Delete if by_word => Some(Motion::WordRight),
+            Key::Left | Key::Backspace => Some(Motion::Left),
+            Key::Right | Key::Delete => Some(Motion::Right),
+            _ => None,
+        };
+        let edited = match (&event.key, motion) {
+            (Key::Backspace | Key::Delete, Some(motion)) => state.delete(value, shaped, motion),
+            (_, Some(motion)) => {
+                state.step(value, shaped, motion, mods.shift);
+                None
+            }
+            (Key::Char('a'), _) if mods.primary => {
+                state.select_all(value);
+                None
+            }
+            (Key::Char('c' | 'x'), _) if mods.primary => {
+                let selected = state.selected(value);
+                if !selected.is_empty() {
+                    platform.clipboard_write(Clip { text: selected.to_owned(), html: None });
+                }
+                (event.key == Key::Char('x') && !selected.is_empty()).then(|| state.insert(value, ""))
+            }
+            (Key::Char('v'), _) if mods.primary => {
+                platform.clipboard_read().map(|clip| state.insert(value, &clip.text))
+            }
+            // A field keeps no history of its own, and the document's must not move under it.
+            (Key::Char('z' | 'y'), _) if mods.primary => None,
+            (Key::Enter, _) if !mods.primary && !mods.alt => {
+                let Some(message) = input.on_submit.clone() else { return false };
+                self.queue.push(message);
+                return true;
+            }
+            _ => return false,
+        };
+        self.queue.extend(edited.and_then(|value| input.on_input.as_ref().map(|handler| handler(value))));
+        self.restart_blink();
+        self.stale.layout = true;
+        true
+    }
+
+    /// Text arriving at a text input.
+    fn input_text(&mut self, i: usize, event: InputEvent) {
+        let node = &self.tree.nodes[i];
+        let Content::Input(input) = &node.el.content else { return };
+        let Some(on_input) = &input.on_input else { return };
+        let state = self.inputs.entry(node.id).or_default();
+        let value = input.value.as_str();
+        let edited = match event {
+            InputEvent::Insert(text) | InputEvent::Commit(text) => {
+                state.composing = None;
+                (!text.is_empty() || !state.selected(value).is_empty()).then(|| state.insert(value, &text))
+            }
+            InputEvent::ReplaceRange { range, text } => Some(state.replace(value, range, &text)),
+            InputEvent::SetComposition { text, .. } => {
+                // Composing over a selection replaces it.
+                let cleared = (!text.is_empty() && !state.selected(value).is_empty()).then(|| state.insert(value, ""));
+                state.composing = (!text.is_empty()).then_some(text);
+                cleared
+            }
+            InputEvent::DeleteSurrounding { before, after } => state.delete_around(value, before, after),
+        };
+        self.queue.extend(edited.map(|value| on_input(value)));
+        self.restart_blink();
+        self.stale.layout = true;
+    }
+
+    // Elements
+
+    fn window(&self) -> Rect {
+        Rect::new(0.0, 0.0, self.size.width, self.size.height)
+    }
+
+    fn focused(&self) -> Option<usize> {
+        self.focus.and_then(|id| self.tree.find(id))
+    }
+
+    /// The element focus rests on when nothing else holds it.
+    fn rest(&self) -> Option<Id> {
+        self.tree.nodes.iter().find(|node| node.el.rest).map(|node| node.id)
+    }
+
+    /// The topmost element at a point. A modal popover hides everything beneath it.
+    fn hit(&self, at: Point) -> Option<usize> {
+        for layer in self.tree.layers.iter().rev() {
+            let hit = self.hit_in(layer.root, at);
+            if hit.is_some() || layer.modal {
+                return hit;
+            }
+        }
+        None
+    }
+
+    fn hit_in(&self, i: usize, at: Point) -> Option<usize> {
+        let node = &self.tree.nodes[i];
+        let inside = node.rect.contains(at);
+        if node.el.style.clip && !inside {
+            return None;
+        }
+        // Later children are painted over earlier ones.
+        let child = self.tree.children(i).filter_map(|child| self.hit_in(child, at)).last();
+        child.or(inside.then_some(i))
+    }
+
+    /// The element a press at `hit` is meant for: the nearest one that does something with it.
+    fn target(&self, hit: usize) -> Option<usize> {
+        self.tree.ancestors(hit).find(|&i| {
+            let node = &self.tree.nodes[i];
+            let takes_input = matches!(node.el.content, Content::Input(_) | Content::Canvas(_));
+            takes_input || node.el.on_press.is_some() || node.trigger.is_some() || node.el.focus != Focus::No
+        })
+    }
+
+    /// A window position relative to an element's content box.
+    fn within(&self, i: usize, at: Point) -> Point {
+        let node = &self.tree.nodes[i];
+        let content = inner(node.rect, &node.el.style);
+        Point { x: at.x - content.x, y: at.y - content.y }
+    }
+
+    /// The offset in a text input's value nearest to a window position.
+    fn offset_at(&self, i: usize, at: Point) -> usize {
+        let node = &self.tree.nodes[i];
+        let scroll = self.inputs.get(&node.id).map_or(0.0, |state| state.scroll);
+        node.shaped.as_ref().map_or(0, |shaped| shaped.offset_at(self.within(i, at).x + scroll))
+    }
+
+    fn update_hover(&mut self) {
+        let hit = self.pointer.and_then(|at| self.hit(at));
+        let hover: Vec<Id> =
+            hit.into_iter().flat_map(|i| self.tree.ancestors(i)).map(|i| self.tree.nodes[i].id).collect();
+        if hover != self.hover {
+            self.hover = hover;
+            self.stale.paint = true;
+        }
+    }
+
+    /// Presses an element: sends its message, toggles its popover, and closes the popover it is in if it
+    /// asks for that.
+    fn activate(&mut self, i: usize) {
+        if self.tree.disabled(i) {
+            return;
+        }
+        let node = &self.tree.nodes[i];
+        self.queue.extend(node.el.on_press.clone());
+        // A popover the app controls opens and closes through the message.
+        if node.trigger.is_some_and(|trigger| !trigger.controlled) && !self.open.remove(&node.id) {
+            self.open.insert(node.id);
+        }
+        self.stale.view = true;
+        if node.el.closes && node.layer > 0 {
+            self.close_layer(node.layer);
+        }
+    }
+
+    fn close_layer(&mut self, layer: usize) {
+        let layer = &self.tree.layers[layer];
+        if layer.controlled {
+            self.queue.extend(layer.on_close.clone());
+        } else if let Some(anchor) = layer.anchor {
+            self.open.remove(&self.tree.nodes[anchor].id);
+        }
+        self.stale.view = true;
+    }
+
+    /// Closes the popovers a press landed outside of. Returns whether the press ends there, as one on a
+    /// modal popover's backdrop does.
+    fn dismiss(&mut self, hit: Option<usize>) -> bool {
+        let Some(top) = self.tree.top_layer() else { return false };
+        let Some(hit) = hit else {
+            if self.tree.modal_layer().is_some() {
+                self.close_layer(top);
+                return true;
+            }
+            (1..=top).rev().for_each(|layer| self.close_layer(layer));
+            return false;
+        };
+        for layer in (1..=top).rev() {
+            let Layer { anchor, placement, .. } = &self.tree.layers[layer];
+            // A press on the anchor is left to toggle its own popover.
+            let on_anchor = placement.at.is_none() && self.tree.ancestors(hit).any(|i| Some(i) == *anchor);
+            if on_anchor || self.tree.in_layer(hit, layer) {
+                break;
+            }
+            self.close_layer(layer);
+        }
+        false
+    }
+
+    fn set_focus(&mut self, id: Option<Id>, keyboard: bool) {
+        self.focus_visible = keyboard;
+        self.stale.paint = true;
+        if id == self.focus {
+            return;
+        }
+        // Text an input method had not finished does not survive leaving the field.
+        if let Some(state) = self.focus.and_then(|old| self.inputs.get_mut(&old)) {
+            state.composing = None;
+            self.stale.layout = true;
+        }
+        self.focus = id;
+        self.restart_blink();
+        let Some(i) = id.and_then(|id| self.tree.find(id)) else { return };
+        let node = &self.tree.nodes[i];
+        if let (Content::Input(input), true) = (&node.el.content, keyboard) {
+            self.inputs.entry(node.id).or_default().select_all(&input.value);
+        }
+        self.reveal(i, node.rect, 0.0);
+    }
+
+    /// Scrolls `rect`, which lies inside element `i`, into view.
+    fn reveal(&mut self, i: usize, rect: Rect, margin: f32) {
+        for at in self.tree.ancestors(i).skip(1) {
+            let node = &self.tree.nodes[at];
+            if !node.el.style.scroll {
+                continue;
+            }
+            let view = inner(node.rect, &node.el.style);
+            let margin = margin.min(view.height / 4.0);
+            let (top, bottom) = (rect.y - margin, rect.y + rect.height + margin);
+            let (view_top, view_bottom) = (view.y, view.y + view.height);
+            let by = if top < view_top {
+                top - view_top
+            } else if bottom > view_bottom {
+                // Something taller than the view shows its top.
+                (bottom - view_bottom).min(top - view_top)
+            } else {
+                0.0
+            };
+            if by != 0.0 {
+                *self.scroll.entry(node.id).or_insert(0.0) += by;
+                self.stale.layout = true;
+            }
+        }
+    }
+
+    /// Scrolls element `i` if it scrolls and has room to. Returns whether it moved.
+    fn scroll_by(&mut self, i: usize, delta: f32) -> bool {
+        let node = &self.tree.nodes[i];
+        if !node.el.style.scroll {
+            return false;
+        }
+        let room = (node.content_height - inner(node.rect, &node.el.style).height).max(0.0);
+        let offset = self.scroll.entry(node.id).or_insert(0.0);
+        let next = (*offset + delta).clamp(0.0, room);
+        let moved = next != *offset;
+        *offset = next;
+        self.stale.layout |= moved;
+        moved
+    }
+
+    fn restart_blink(&mut self) {
+        self.blink_from = None;
+        self.caret_on = true;
+        self.stale.paint = true;
+    }
+
+    // Upkeep
+
+    /// Hands the app the messages its elements sent.
+    fn flush(&mut self, platform: &mut dyn Platform) {
+        for message in std::mem::take(&mut self.queue) {
+            self.app.update(message, platform);
+            self.stale.view = true;
+        }
+    }
+
+    /// Brings the tree and its layout up to date with the app.
+    fn refresh(&mut self) {
+        if self.stale.view {
+            self.stale = Stale { view: false, layout: true, paint: true };
+            self.idle.0 = true;
+            let open = &self.open;
+            self.tree = Tree::build(self.app.view(self.size), |id| open.contains(&id));
+            self.settle();
+        }
+        if self.stale.layout {
+            self.stale.layout = false;
+            self.stale.paint = true;
+            self.layout();
+            // A caret that moved is scrolled into view, once the layout says where it is.
+            if self.follow_caret() {
+                self.stale.layout = false;
+                self.layout();
+            }
+            self.update_hover();
+        }
+    }
+
+    fn layout(&mut self) {
+        let inputs = &self.inputs;
+        let shown = |id: Id, value: &str| inputs.get(&id).map_or_else(|| value.to_owned(), |state| state.shown(value));
+        let mut layout = Layout {
+            shaper: &*self.shaper,
+            cache: &mut self.cache,
+            window: self.size,
+            scale: self.scale,
+            scroll: &mut self.scroll,
+            inputs: &shown,
+        };
+        layout.run(&mut self.tree);
+    }
+
+    /// Keeps the focused element's caret in view. Returns whether anything scrolled.
+    fn follow_caret(&mut self) -> bool {
+        let Some(i) = self.focused() else { return false };
+        let node = &self.tree.nodes[i];
+        let content = inner(node.rect, &node.el.style);
+        match &node.el.content {
+            Content::Input(input) => {
+                let (Some(shaped), Some(state)) = (&node.shaped, self.inputs.get_mut(&node.id)) else { return false };
+                state.reveal(&input.value, shaped, content.width);
+                false
+            }
+            Content::Canvas(canvas) => {
+                let moved = canvas.caret != self.canvas_caret;
+                self.canvas_caret = canvas.caret;
+                let Some(caret) = canvas.caret.filter(|_| moved) else { return false };
+                self.restart_blink();
+                self.reveal(i, Rect { x: content.x + caret.x, y: content.y + caret.y, ..caret }, CARET_MARGIN);
+                self.stale.layout
+            }
+            _ => false,
+        }
+    }
+
+    /// Carries focus, popovers and per-element state over to a newly built tree.
+    fn settle(&mut self) {
+        let tree = &self.tree;
+        let anchors: Vec<Id> = tree.layers.iter().filter_map(|layer| layer.anchor).map(|i| tree.nodes[i].id).collect();
+        let mut focus = self.focus;
+
+        // A popover that closed gives focus back to where it was.
+        let mut restored = None;
+        self.returns.retain(|(anchor, before)| {
+            let open = anchors.contains(anchor);
+            if !open {
+                restored.get_or_insert(*before);
+            }
+            open
+        });
+        if let Some(before) = restored {
+            focus = before;
+        }
+        // One that opened takes it.
+        for (layer, anchor) in tree.layers.iter().skip(1).zip(&anchors) {
+            if !self.layers.contains(anchor) {
+                self.returns.push((*anchor, focus));
+                if let Some(&first) = tree.focusables(layer.root..layer.end).first() {
+                    let node = &tree.nodes[first];
+                    // A field reached this way is ready to be typed over, as one reached by Tab is.
+                    if let Content::Input(input) = &node.el.content {
+                        self.inputs.entry(node.id).or_default().select_all(&input.value);
+                    }
+                    focus = Some(node.id);
+                }
+            }
+        }
+        self.layers = anchors;
+
+        if focus.and_then(|id| tree.find(id)).is_none_or(|i| !tree.focusable(i)) {
+            focus = self.rest();
+        }
+        if focus != self.focus {
+            self.focus = focus;
+            self.restart_blink();
+        }
+
+        // State is kept only for elements that are still there.
+        let tree = &self.tree;
+        self.open.retain(|id| tree.find(*id).is_some_and(|i| tree.nodes[i].trigger.is_some()));
+        self.inputs.retain(|id, _| tree.find(*id).is_some());
+        self.scroll.retain(|id, _| tree.find(*id).is_some());
+        self.pressed = self.pressed.filter(|id| tree.find(*id).is_some());
+    }
+}
+
+use crate::tree::Layer;
+
+fn step(dir: Dir, key: &Key) -> Option<Step> {
+    match (dir, key) {
+        (Dir::Row, Key::Left) | (Dir::Column, Key::Up) => Some(Step::Previous),
+        (Dir::Row, Key::Right) | (Dir::Column, Key::Down) => Some(Step::Next),
+        (_, Key::Home) => Some(Step::First),
+        (_, Key::End) => Some(Step::Last),
+        _ => None,
+    }
+}
