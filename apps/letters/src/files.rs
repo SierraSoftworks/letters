@@ -65,9 +65,7 @@ pub fn new_style(home_folder: Option<&Path>) -> Style {
 /// The working copy of a new document in `style`, which no file holds yet.
 pub fn new_copy(document: Document, style: Style) -> WorkingCopy {
     let replica = ReplicaId::new(&platform::block_id());
-    let mut copy = WorkingCopy::new(platform::document_id(), platform::now_rfc3339(), document, replica);
-    copy.style = style;
-    copy
+    WorkingCopy::new(platform::document_id(), platform::now_rfc3339(), document, style, replica)
 }
 
 /// Where a document lives on disk.
@@ -276,7 +274,8 @@ impl Rest {
         // The editor takes the history as the copy holds it, so a document changed outside Letters is one
         // change in both and not one in each.
         let model = copy.model();
-        let history = Model::new(model.doc().clone(), editor).prepare(Some(&model.save()));
+        let shown = Model::new(model.doc().clone(), editor).with_style(model.style().clone());
+        let history = shown.prepare(Some(&model.save()));
         Ok(Working { history: Some(history.map_err(letters_format::Error::History)?), copy })
     }
 }

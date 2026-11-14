@@ -34,7 +34,7 @@ fn opened(file: Vec<u8>) -> (Folder, WorkingCopy, WorkingCopy) {
 /// A folder that holds a saved document reading "Hello world", and two devices that have it open.
 fn shared() -> (Folder, WorkingCopy, WorkingCopy) {
     let mut folder = Folder::default();
-    let mut first = WorkingCopy::new(ID, "2026-11-14T20:00:00Z", document(), ReplicaId::from(1));
+    let mut first = WorkingCopy::new(ID, "2026-11-14T20:00:00Z", document(), Style::default(), ReplicaId::from(1));
     save_from(&mut folder, &mut first, "first");
     opened(folder.files[NAME].clone())
 }
@@ -65,6 +65,12 @@ fn comment(copy: &mut WorkingCopy, id: &str, range: std::ops::Range<usize>) {
         replies: Vec::new(),
         extra: Default::default(),
     });
+}
+
+fn restyle(copy: &mut WorkingCopy, edit: impl Fn(&mut Style)) {
+    let mut style = copy.style().clone();
+    edit(&mut style);
+    copy.set_style(style).unwrap();
 }
 
 fn text(document: &Document) -> String {
@@ -190,7 +196,7 @@ fn a_conflict_copy_merges_back_with_nothing_lost() {
 /// The file [`shared`] starts from.
 fn opened_bytes() -> Vec<u8> {
     let mut folder = Folder::default();
-    let mut first = WorkingCopy::new(ID, "2026-11-14T20:00:00Z", document(), ReplicaId::from(1));
+    let mut first = WorkingCopy::new(ID, "2026-11-14T20:00:00Z", document(), Style::default(), ReplicaId::from(1));
     save_from(&mut folder, &mut first, "first");
     folder.files.remove(NAME).unwrap()
 }
@@ -231,23 +237,17 @@ fn a_saved_file_opens_with_its_history() {
 }
 
 #[test]
-fn a_file_that_cannot_be_merged_is_left_alone() {
-    let rewritten = |edit: fn(&mut Package)| {
-        let mut package = open(&opened_bytes()).package().unwrap();
-        edit(&mut package);
-        bytes(&package)
-    };
-    let cases = [
-        // Its history no longer leads to its document.
-        ("changed by another tool", rewritten(|package| package.document.blocks.push(paragraph("q", "Added")))),
-        (
-            "another document without a history",
-            rewritten(|package| {
-                package.document.blocks = vec![paragraph("x", "Something else")];
-                package.entries.remove(OPLOG);
-            }),
-        ),
-    ];
+fn a_file_that_shares_no_history_is_left_alone() {
+    let other = Document { blocks: vec![paragraph("x", "Something else")], ..Document::default() };
+    let mut bare = open(&opened_bytes()).package().unwrap();
+    bare.document = other.clone();
+    bare.entries.remove(OPLOG);
+    let mut elsewhere = Folder::default();
+    let mut unrelated = WorkingCopy::new(ID, "2026-11-14T20:00:00Z", other, Style::default(), ReplicaId::from(9));
+    save_from(&mut elsewhere, &mut unrelated, "elsewhere");
+
+    // Merging these would put one document after the other.
+    let cases = [("without a history", bytes(&bare)), ("with a history of its own", elsewhere.files[NAME].clone())];
     for (why, theirs) in cases {
         let (mut folder, mut desk, _) = shared();
         typed(&mut desk, 0, "Oh. ");
@@ -258,6 +258,31 @@ fn a_file_that_cannot_be_merged_is_left_alone() {
         assert_eq!(folder.files[NAME], theirs, "{why}: the file is left alone");
         assert_eq!(text(open_at(&folder, &name, 4).model().doc()), "Oh. Hello world", "{why}");
     }
+}
+
+#[test]
+fn a_change_by_another_tool_is_merged_once_on_every_device() {
+    let (mut folder, mut desk, mut laptop) = shared();
+    // Another tool rewrites the document and the style, and leaves the history as it was.
+    let mut package = open(&folder.files[NAME]).package().unwrap();
+    package.document.blocks[0] = paragraph("p", "Hello there world");
+    package.document.blocks.push(paragraph("q", "Added"));
+    let mut style = Style::default();
+    style.page.margin_left = 99.0;
+    package.set_style(&style);
+    folder.put(NAME, bytes(&package));
+
+    typed(&mut desk, 0, "Oh. ");
+    typed(&mut laptop, 11, "!");
+    let saves = in_turn(&mut folder, &mut desk, &mut laptop, 3);
+    assert!(saves.iter().all(|saved| matches!(saved, Saved::Written | Saved::Unchanged)), "{saves:?}");
+
+    let file = open_at(&folder, NAME, 4);
+    let blocks: Vec<String> = file.model().doc().walk().map(|block| block.plain_text()).collect();
+    assert_eq!(blocks, ["Oh. Hello there world!", "Added"], "both devices took the change in, and it is there once");
+    assert_eq!(file.style(), &style);
+    assert!(level(&desk, &laptop));
+    assert_eq!(folder.names(), [NAME]);
 }
 
 #[test]
@@ -275,16 +300,16 @@ fn a_style_changed_on_one_device_reaches_the_other() {
         [(Some(wide), None, Some(wide)), (None, Some(tall), Some(tall)), (Some(wide), Some(tall), None)];
     for (case, (at_desk, at_laptop, expected)) in cases.into_iter().enumerate() {
         let (mut folder, mut desk, mut laptop) = shared();
-        let mut changed = desk.style.clone();
-        at_desk.inspect(|edit| edit(&mut desk.style));
-        at_laptop.inspect(|edit| edit(&mut laptop.style));
+        let mut changed = desk.style().clone();
+        at_desk.inspect(|edit| restyle(&mut desk, *edit));
+        at_laptop.inspect(|edit| restyle(&mut laptop, *edit));
         in_turn(&mut folder, &mut desk, &mut laptop, 4);
 
-        assert_eq!(desk.style, laptop.style, "case {case}");
-        assert_eq!(open(&folder.files[NAME]).style().unwrap(), desk.style, "case {case}");
+        assert_eq!(desk.style(), laptop.style(), "case {case}");
+        assert_eq!(&open(&folder.files[NAME]).style().unwrap(), desk.style(), "case {case}");
         if let Some(edit) = expected {
             edit(&mut changed);
-            assert_eq!(desk.style, changed, "case {case}");
+            assert_eq!(desk.style(), &changed, "case {case}");
         }
     }
 }
@@ -322,7 +347,7 @@ fn an_entry_this_build_cannot_read_is_carried_over() {
         let unreadable = with_unreadable(entry);
         let (mut folder, mut desk, _) = if opened_before { shared() } else { opened(unreadable.clone()) };
         folder.put(NAME, unreadable);
-        assert_eq!(desk.style, Style::default(), "{why}: the built-in style stands in");
+        assert_eq!(desk.style(), &Style::default(), "{why}: the built-in style stands in");
 
         typed(&mut desk, 0, "Oh. ");
         let saved = save_from(&mut folder, &mut desk, "desk");
@@ -337,10 +362,10 @@ fn an_entry_this_build_cannot_read_is_carried_over() {
 #[test]
 fn a_style_changed_here_replaces_one_that_cannot_be_read() {
     let (mut folder, mut desk, _) = opened(with_unreadable(STYLE));
-    desk.style.page.margin_left = 99.0;
+    restyle(&mut desk, |style| style.page.margin_left = 99.0);
     let saved = save_from(&mut folder, &mut desk, "desk");
     assert!(matches!(saved, Saved::Written), "{saved:?}");
-    assert_eq!(open(&folder.files[NAME]).style().unwrap(), desk.style);
+    assert_eq!(&open(&folder.files[NAME]).style().unwrap(), desk.style());
 }
 
 #[test]

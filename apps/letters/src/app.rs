@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Platform as _};
 use letters_format::WorkingCopy;
-use letters_model::{BlockId, ReplicaId, Revision, Style};
+use letters_model::{BlockId, Model, ReplicaId, Revision, Style};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Size};
 // The editor's window is the view here, where `Window` is the system's.
@@ -446,7 +446,8 @@ impl DocWindow {
     fn edits_for(&mut self, copy: &mut WorkingCopy) -> (Vec<u8>, Revision) {
         if self.view.style() != &self.sent_style {
             self.sent_style = self.view.style().clone();
-            copy.style = self.sent_style.clone();
+            // The window only offers styles the file format takes.
+            let _ = copy.set_style(self.sent_style.clone());
         }
         let model = self.view.editor().model();
         let edits = self.sent.as_ref().map_or_else(|| model.save(), |sent| model.updates_since(sent));
@@ -605,7 +606,8 @@ impl App {
         let replica = ReplicaId::new(&self.platform.new_id());
         let mut window = DocWindow {
             sent_style: style.clone(),
-            view: View::new(Editor::new(document, replica), style),
+            // The editor's history starts from the style on screen, as the working copy's does.
+            view: View::new(Editor::with_model(Model::new(document, replica).with_style(style.clone())), style),
             window,
             presenter,
             access,
