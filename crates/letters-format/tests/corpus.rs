@@ -1,7 +1,10 @@
 //! The conformance corpus under `corpus/`, checked against both the published schemas and this build's readers.
 //!
 //! Each kind has canonical files, which Letters writes byte for byte, an `accepted.json` of looser forms every
-//! reader must take, and a `refused.json` of breaks every reader must refuse.
+//! reader must take, and a `refused.json` of breaks every reader must refuse. `report.let` is a whole file built
+//! from the canonical ones.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 
@@ -44,6 +47,10 @@ fn validator(schema: &str) -> Validator {
 
 fn corpus(kind: &Kind) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus").join(kind.name)
+}
+
+fn report(kind: &Kind) -> String {
+    std::fs::read_to_string(corpus(kind).join("report.json")).unwrap()
 }
 
 /// The cases listed in a kind's `accepted.json` or `refused.json`.
@@ -114,4 +121,23 @@ fn breaks_are_refused_by_schema_and_reader() {
             assert_eq!(validator.is_valid(&case["json"]), schema_accepts, "{why}");
         }
     }
+}
+
+#[test]
+fn the_sample_file_holds_the_canonical_entries() {
+    let file = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/report.let")).unwrap();
+    let mut archive = common::open(&file);
+    for kind in KINDS {
+        let entry = archive.read(&format!("{}.json", kind.name)).unwrap().unwrap();
+        assert_eq!(String::from_utf8(entry).unwrap(), report(&kind), "{}", kind.name);
+    }
+    assert!(archive.names().any(|name| name.starts_with(letters_format::ASSETS)));
+}
+
+#[test]
+fn the_manifest_of_a_written_file_validates() {
+    let file = common::bytes(&common::package());
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(file)).unwrap();
+    let manifest: Value = serde_json::from_reader(zip.by_name(letters_format::MANIFEST).unwrap()).unwrap();
+    assert_eq!(complaints(&validator(schema::MANIFEST), &manifest), Vec::<String>::new());
 }
