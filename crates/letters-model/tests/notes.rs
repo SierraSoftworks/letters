@@ -1,4 +1,5 @@
 use letters_model::{Anchor, Block, BlockKind, Note, NoteKind, Notes, Reply, Run, Version};
+use proptest::prelude::*;
 use serde_json::{Value, json};
 
 fn note(id: &str, kind: NoteKind) -> Note {
@@ -118,5 +119,78 @@ fn schema_breaks_are_refused_with_their_path() {
     for (json, path) in cases {
         let error = Notes::from_json(&json).expect_err(&json);
         assert_eq!(error.path, path, "{json}: {error}");
+    }
+}
+
+#[test]
+fn merging_keeps_every_note_reply_and_resolution() {
+    let reply = |author: &str, minute: u32| Reply {
+        author: author.into(),
+        created: format!("2026-11-14T20:{minute}:00Z"),
+        content: vec![Run::plain("Agreed")],
+        extra: Default::default(),
+    };
+    let shared = note("n1", NoteKind::Comment);
+    let mut ours = Notes {
+        notes: vec![
+            Note { replies: vec![reply("Ana", 20)], ..shared.clone() },
+            Note { created: "2026-11-14T21:00:00Z".into(), ..note("ours", NoteKind::Import) },
+        ],
+        ..Notes::default()
+    };
+    let theirs = Notes {
+        notes: vec![
+            Note { created: "2026-11-14T19:00:00Z".into(), ..note("theirs", NoteKind::Comment) },
+            Note { replies: vec![reply("Ben", 10), reply("Ana", 20)], resolved: true, ..shared },
+        ],
+        ..Notes::default()
+    };
+
+    assert!(ours.merge(&theirs));
+    let ids: Vec<&str> = ours.notes.iter().map(|note| note.id.as_str()).collect();
+    assert_eq!(ids, ["theirs", "n1", "ours"], "notes read in the order they were written");
+    let n1 = &ours.notes[1];
+    assert!(n1.resolved);
+    let authors: Vec<&str> = n1.replies.iter().map(|reply| reply.author.as_str()).collect();
+    assert_eq!(authors, ["Ben", "Ana"]);
+    assert!(!ours.merge(&theirs), "a merge that adds nothing changes nothing");
+}
+
+/// A few notes drawn from a small pool of ids, so that two sets often hold different copies of one note.
+fn some_notes() -> impl Strategy<Value = Notes> {
+    let reply = (0..3u8, 0..3u8).prop_map(|(author, minute)| Reply {
+        author: format!("author{author}"),
+        created: format!("2026-11-14T20:0{minute}:00Z"),
+        content: Vec::new(),
+        extra: Default::default(),
+    });
+    let one = (0..4u8, 0..3u8, any::<bool>(), "[a-c]{0,2}", prop::collection::vec(reply, 0..3)).prop_map(
+        |(id, minute, resolved, text, replies)| Note {
+            created: format!("2026-11-14T19:0{minute}:00Z"),
+            resolved,
+            content: vec![Run::plain(text)],
+            replies,
+            ..note(&format!("n{id}"), NoteKind::Comment)
+        },
+    );
+    prop::collection::btree_map(0..4u8, one, 0..4).prop_map(|notes| {
+        let notes = notes.into_iter().map(|(id, note)| Note { id: format!("n{id}"), ..note }).collect();
+        Notes { notes, ..Notes::default() }
+    })
+}
+
+fn merged(mut a: Notes, b: &Notes) -> Notes {
+    a.merge(b);
+    a
+}
+
+proptest! {
+    #[test]
+    fn every_copy_settles_on_the_same_notes(a in some_notes(), b in some_notes(), c in some_notes()) {
+        let ab = merged(a.clone(), &b);
+        prop_assert_eq!(&ab, &merged(b.clone(), &a), "whichever side merges");
+        prop_assert_eq!(&merged(ab.clone(), &c), &merged(a.clone(), &merged(b.clone(), &c)), "in whatever order");
+        prop_assert!(!ab.clone().merge(&b) && !ab.clone().merge(&a), "and merging again changes nothing");
+        prop_assert_eq!(Notes::from_json(&ab.to_json()).unwrap(), ab, "the result is a valid notes.json");
     }
 }

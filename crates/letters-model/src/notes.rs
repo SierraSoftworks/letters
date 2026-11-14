@@ -3,7 +3,7 @@
 //! All three are one [`Note`] that differs only in its [`NoteKind`]. Reading is strict and writing is canonical,
 //! as for `document.json`, and unknown fields and note types are kept and written back.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use serde_json::{Map, Value};
@@ -120,6 +120,54 @@ impl Notes {
         out.push('\n');
         out
     }
+}
+
+impl Notes {
+    /// Takes in the notes of another copy of the document. Returns whether anything here changed.
+    ///
+    /// The result depends only on the two sets of notes, never on which side merges or in what order, so every
+    /// copy settles on the same `notes.json` and merging again changes nothing. A note is never lost: one held
+    /// by both sides stays resolved if either resolved it and keeps the replies of both.
+    pub fn merge(&mut self, other: &Notes) -> bool {
+        let before = self.clone();
+        let mut notes: BTreeMap<String, Note> = BTreeMap::new();
+        for note in std::mem::take(&mut self.notes).into_iter().chain(other.notes.iter().cloned()) {
+            let joined = match notes.remove(&note.id) {
+                Some(held) => join(held, note),
+                None => note,
+            };
+            notes.insert(joined.id.clone(), joined);
+        }
+        self.notes = notes.into_values().map(settle).collect();
+        self.notes.sort_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)));
+        for (key, value) in &other.extra {
+            // Values have no order of their own, so their JSON text stands in for one.
+            let (held, theirs) = (self.extra.get(key).map(Value::to_string), value.to_string());
+            if held.is_none_or(|held| held < theirs) {
+                self.extra.insert(key.clone(), value.clone());
+            }
+        }
+        *self != before
+    }
+}
+
+/// One note from two copies of it. Where they differ beyond replies and resolution there is no telling which
+/// is newer, so the choice is arbitrary but the same on every device.
+fn join(a: Note, b: Note) -> Note {
+    let body = |note: &Note| write_note(&Note { resolved: false, replies: Vec::new(), ..note.clone() }).to_string();
+    let resolved = a.resolved || b.resolved;
+    let (mut kept, other) = if body(&a) >= body(&b) { (a, b) } else { (b, a) };
+    kept.resolved = resolved;
+    kept.replies.extend(other.replies);
+    kept
+}
+
+/// Puts a note's replies in an order that depends only on what they are, dropping repeats.
+fn settle(mut note: Note) -> Note {
+    let key = |reply: &Reply| (reply.created.clone(), write_reply(reply).to_string());
+    note.replies.sort_by_cached_key(key);
+    note.replies.dedup();
+    note
 }
 
 /// Reads an optional list, giving each item its path.
