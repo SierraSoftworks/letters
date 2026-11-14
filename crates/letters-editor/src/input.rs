@@ -1,0 +1,188 @@
+//! Text input: typing, autocorrect, soft-keyboard deletes and IME composition.
+
+use std::ops::Range;
+
+use letters_model::{Block, BlockId, BlockKind, Op, Pos, Selection};
+
+use crate::{Caret, Composing, Editor, InputEvent, Kind, Platform, text};
+
+impl Editor {
+    pub(crate) fn handle(&mut self, event: InputEvent, platform: &mut dyn Platform) {
+        let now = platform.now_ms();
+        let rule = std::mem::take(&mut self.rule);
+        self.goal = None;
+        match event {
+            InputEvent::SetComposition { text, selection } => self.compose(&text, selection, platform, now),
+            InputEvent::Commit(text) => self.commit_composition(&text, platform, now),
+            InputEvent::Insert(text) => {
+                self.end_composition();
+                self.typed(&text, platform, now);
+            }
+            InputEvent::ReplaceRange { range, text } => {
+                self.end_composition();
+                self.replace_range(range, &text, now);
+            }
+            InputEvent::DeleteSurrounding { before, after } => {
+                self.end_composition();
+                // A soft keyboard's backspace takes back an input rule just as the key does.
+                if !(rule && before > 0 && after == 0 && self.undo_step()) {
+                    self.delete_surrounding(before, after, now);
+                }
+            }
+        }
+    }
+
+    /// Makes sure there is a caret to type at. A document with no text gets a paragraph.
+    pub(crate) fn ensure_caret(&mut self, platform: &mut dyn Platform) -> bool {
+        if self.caret.is_none() {
+            let id = BlockId::new(platform.new_id());
+            let block = Block::new(id.clone(), BlockKind::Paragraph);
+            let index = self.doc().blocks.len();
+            if self.apply(vec![Op::InsertBlock { parent: None, index, block }]) {
+                self.place(Pos::new(id, 0));
+            }
+        }
+        self.caret.is_some()
+    }
+
+    fn typed(&mut self, text: &str, platform: &mut dyn Platform, now: u64) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let before = self.caret.clone();
+        if text.is_empty() || !self.ensure_caret(platform) {
+            return;
+        }
+        if self.type_marker(&text) {
+            return self.commit(before, Kind::Other, now, true);
+        }
+        // A word undoes together with the space before it, so a space after text starts a new step.
+        let fresh = text.starts_with(char::is_whitespace) && !self.after_space();
+        self.insert_lines(&text, platform);
+        self.commit(before, Kind::Typing, now, fresh);
+        self.run_rules(platform, now);
+    }
+
+    /// Whether the character before the selection is white space. The start of a block counts as one.
+    fn after_space(&self) -> bool {
+        let Some(caret) = &self.caret else { return true };
+        let (start, _) = self.ordered(&caret.selection);
+        let text = self.block(&start.block).map(Block::plain_text).unwrap_or_default();
+        text[..text::snap(&text, start.offset)].chars().next_back().is_none_or(char::is_whitespace)
+    }
+
+    /// Inserts text that may hold line breaks. Outside code each one starts a new block, as Enter does.
+    pub(crate) fn insert_lines(&mut self, text: &str, platform: &mut dyn Platform) {
+        let code = self.selection().and_then(|selection| self.block(&selection.head.block)).is_some_and(text::is_code);
+        if code || !text.contains('\n') {
+            return self.insert(text);
+        }
+        for (index, line) in text.split('\n').enumerate() {
+            if index > 0 {
+                self.split(platform);
+            }
+            self.insert(line);
+        }
+    }
+
+    fn run_rules(&mut self, platform: &mut dyn Platform, now: u64) {
+        let before = self.caret.clone();
+        if self.apply_rules(platform) {
+            self.commit(before, Kind::Rule, now, true);
+            self.rule = true;
+        }
+    }
+
+    /// Shows the text being composed in the document, in place of what the composition showed before.
+    fn compose(&mut self, text: &str, selection: Option<Range<usize>>, platform: &mut dyn Platform, now: u64) {
+        if self.composing.is_none() {
+            let before = self.caret.clone();
+            if text.is_empty() || !self.ensure_caret(platform) {
+                return;
+            }
+            self.redo.clear();
+            self.delete_selection();
+            let Some(at) = self.selection().map(|selection| selection.head.offset) else { return };
+            self.composing = Some(Composing { range: at..at, before, at: now });
+        }
+        let (Some(mut composing), Some(caret)) = (self.composing.take(), self.caret.clone()) else { return };
+        if text.is_empty() {
+            // The input method gave the composition up, so the document goes back to how it was.
+            self.rollback();
+            self.caret = composing.before;
+            return;
+        }
+        let block = caret.selection.head.block.clone();
+        let at = |offset: usize| Pos::new(block.clone(), offset);
+        let start = composing.range.start;
+        let composed = Selection { anchor: at(start), head: at(composing.range.end) };
+        self.caret = Some(Caret { selection: composed, marks: caret.marks.clone() });
+        self.insert(text);
+
+        let inside = selection.unwrap_or(text.len()..text.len());
+        let (anchor, head) = (start + text::snap(text, inside.start), start + text::snap(text, inside.end));
+        self.caret = Some(Caret { selection: Selection { anchor: at(anchor), head: at(head) }, marks: caret.marks });
+        (composing.range, composing.at) = (start..start + text.len(), now);
+        self.composing = Some(composing);
+    }
+
+    /// Ends the composition with `text`. With none in progress, the text is simply typed.
+    fn commit_composition(&mut self, text: &str, platform: &mut dyn Platform, now: u64) {
+        let (Some(composing), Some(caret)) = (self.composing.take(), self.caret.clone()) else {
+            return self.typed(text, platform, now);
+        };
+        if text.is_empty() {
+            self.rollback();
+            self.caret = composing.before;
+            return;
+        }
+        let block = caret.selection.head.block.clone();
+        let at = |offset: usize| Pos::new(block.clone(), offset);
+        let composed = Selection { anchor: at(composing.range.start), head: at(composing.range.end) };
+        self.caret = Some(Caret { selection: composed, marks: caret.marks });
+        self.insert(text);
+        self.commit(composing.before, Kind::Other, now, true);
+        self.run_rules(platform, now);
+    }
+
+    /// Replaces a range of the caret's block, keeping the formatting of the text it replaces.
+    fn replace_range(&mut self, range: Range<usize>, replacement: &str, now: u64) {
+        let Some(caret) = self.caret.clone() else { return };
+        let head = caret.selection.head.clone();
+        let Some(block) = self.block(&head.block) else { return };
+        let text = block.plain_text();
+        let range = text::snap(&text, range.start)..text::snap(&text, range.end.max(range.start));
+        if range.is_empty() {
+            // Nothing is replaced, so this is typing at that place.
+            self.place(Pos::new(head.block.clone(), range.start));
+            self.insert(replacement);
+        } else {
+            let Some(first) = text::run_at(block.body.runs(), range.start) else { return };
+            let (marks, link) = (first.marks.clone(), first.link.clone());
+            self.replace(&head.block, range.clone(), replacement, &marks, &link);
+        }
+        // The caret keeps its place in the text around the replacement.
+        let offset = match head.offset {
+            offset if offset >= range.end => offset - range.len() + replacement.len(),
+            offset if offset > range.start => range.start + replacement.len(),
+            offset => offset,
+        };
+        self.place_with(Pos::new(head.block, offset), caret.marks.clone());
+        self.commit(Some(caret), Kind::Other, now, true);
+    }
+
+    fn delete_surrounding(&mut self, before: usize, after: usize, now: u64) {
+        let Some(caret) = self.caret.clone() else { return };
+        let (start, end) = self.ordered(&caret.selection);
+        let Some(block) = self.block(&start.block).filter(|_| start.block == end.block) else { return };
+        let text = block.plain_text();
+        let from = text::snap(&text, start.offset.saturating_sub(before));
+        let to = text::snap_up(&text, end.offset.saturating_add(after));
+        let delete = |range: Range<usize>| Op::DeleteText { block: start.block.clone(), range };
+        // The later range goes first, so the earlier one's offsets still hold.
+        let ops = [end.offset..to, from..start.offset].into_iter().filter(|range| !range.is_empty()).map(delete);
+        self.apply(ops.collect());
+        let moved = |pos: &Pos| Pos::new(pos.block.clone(), pos.offset - (start.offset - from));
+        let selection = Selection { anchor: moved(&caret.selection.anchor), head: moved(&caret.selection.head) };
+        self.caret = Some(Caret { selection, marks: caret.marks.clone() });
+        self.commit(Some(caret), Kind::Deleting, now, false);
+    }
+}

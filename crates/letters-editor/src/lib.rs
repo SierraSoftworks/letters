@@ -1,14 +1,29 @@
 //! The editor: turns input into edits of a [`Model`].
 //!
 //! - [`InputEvent`] is the one stream of text input every platform funnels into.
-//! - [`KeyEvent`] carries key presses, which the keymap resolves to [`Command`]s.
+//! - [`KeyEvent`] carries key presses, which the [`Keymap`] resolves to [`Command`]s.
 //! - [`Editor`] owns the model and the selection, and is driven with nothing else.
 //!
 //! The editor never reads a clock or a clipboard itself. The shell injects a [`Platform`].
 
+mod clipboard;
+mod edit;
+mod input;
+mod keymap;
+mod markers;
+mod motion;
+mod rules;
+mod text;
+mod tree;
+
+use std::collections::BTreeSet;
 use std::ops::Range;
 
-use letters_model::{Change, Document, Mark, Model, Op, Pos, Selection};
+use letters_model::{Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, Pos, Selection};
+
+pub use keymap::Keymap;
+pub use markers::{Marker, Markers};
+pub use motion::Lines;
 
 /// Text input, as every platform delivers it. Offsets are UTF-8 bytes relative to the caret's block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,7 +32,8 @@ pub enum InputEvent {
     Insert(String),
     /// Replaces a range of the caret's block, as autocorrect does.
     ReplaceRange { range: Range<usize>, text: String },
-    /// Shows text an IME is still composing, replacing any earlier composition.
+    /// Shows text an IME is still composing, replacing any earlier composition. `selection` is the caret or
+    /// the selected part inside `text`, in bytes of `text`. Empty text gives the composition up.
     SetComposition { text: String, selection: Option<Range<usize>> },
     /// Ends a composition with its final text.
     Commit(String),
@@ -58,16 +74,65 @@ pub struct KeyEvent {
     pub mods: Modifiers,
 }
 
+/// Where a caret can be sent. Left and Right stop at each character and each revealed Markdown marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Motion {
+    Left,
+    Right,
+    WordLeft,
+    WordRight,
+    /// The edges of the visual line, which needs [`Lines`]. Without one, a line ends at a line break.
+    LineStart,
+    LineEnd,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    /// The start of the block, or of the block before when already there.
+    BlockStart,
+    BlockEnd,
+    DocStart,
+    DocEnd,
+}
+
 /// Everything the editor can be asked to do. Keys, menus and the command palette all go through here.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
+    /// Moves the caret, or only the head of the selection when `extend` is set.
+    Move {
+        to: Motion,
+        extend: bool,
+    },
+    /// Deletes the selection, or from the caret to where the motion leads.
+    Delete(Motion),
+    /// Breaks the block at the caret, as Enter does.
+    Split,
+    /// A line break that stays inside the block.
+    LineBreak,
+    /// Nests list items one level deeper, or steps a line of code in.
+    Indent,
+    Outdent,
+    /// Flips a mark on the selection, or on the text typed next at a caret.
     ToggleMark(Mark),
+    /// Links the selection, or changes the link under the caret. `None` removes the link.
+    SetLink(Option<String>),
+    /// Turns the selected blocks into `kind`, or back into paragraphs when they already are.
+    /// A quote or callout wraps them, and a divider is inserted after them.
+    SetBlock(BlockKind),
+    /// Ticks or unticks the task under the caret.
+    ToggleChecked,
     Undo,
     Redo,
     SelectAll,
+    /// Selects the word under the caret, as a double click does.
+    SelectWord,
+    /// Selects the block under the caret, as a triple click does.
+    SelectBlock,
     Copy,
     Cut,
     Paste,
+    /// Pastes the clipboard's text as it is, with no formatting.
+    PastePlain,
 }
 
 /// What the shell lends the editor.
@@ -78,6 +143,10 @@ pub trait Platform {
     fn clipboard_write(&mut self, clip: Clip);
     /// A new identifier, unique across devices.
     fn new_id(&mut self) -> String;
+    /// The laid-out lines, for movement between them. Without them a line runs to the next line break.
+    fn lines(&self) -> Option<&dyn Lines> {
+        None
+    }
 }
 
 /// Clipboard content: plain text (Markdown when Letters wrote it) and, where offered, HTML.
@@ -87,18 +156,82 @@ pub struct Clip {
     pub html: Option<String>,
 }
 
+/// A selection and the marks that text typed at it will take.
+#[derive(Clone, Debug, PartialEq)]
+struct Caret {
+    selection: Selection,
+    marks: BTreeSet<Mark>,
+}
+
+/// One undo step: a run of model edits that are undone together, and the carets either side of them.
+#[derive(Clone, Debug)]
+struct Step {
+    count: usize,
+    before: Option<Caret>,
+    after: Option<Caret>,
+    kind: Kind,
+    at: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Typing and deleting each grow one step until the writer pauses or moves.
+    Typing,
+    Deleting,
+    /// A Markdown input rule, kept apart so that undoing it leaves the typed characters.
+    Rule,
+    Other,
+}
+
+/// A composition in progress in the caret's block.
+#[derive(Clone, Debug)]
+struct Composing {
+    range: Range<usize>,
+    before: Option<Caret>,
+    at: u64,
+}
+
+/// A pause this long, in milliseconds, starts a new undo step.
+const PAUSE_MS: u64 = 1000;
+
 /// A document being edited.
 #[derive(Clone, Debug)]
 pub struct Editor {
     model: Model,
-    selection: Option<Selection>,
+    caret: Option<Caret>,
+    keymap: Keymap,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
+    /// Model edits made since the last undo step was closed.
+    steps: usize,
+    /// What the call in progress has changed so far.
+    change: Change,
+    /// Whether the newest undo step is an input rule, which Backspace then takes back.
+    rule: bool,
+    composing: Option<Composing>,
+    /// The horizontal position that consecutive vertical moves keep to.
+    goal: Option<f32>,
 }
 
 impl Editor {
     pub fn new(doc: Document) -> Self {
-        let selection = doc.walk().find(|b| matches!(b.body, letters_model::Body::Text(_)));
-        let selection = selection.map(|b| Selection::caret(Pos { block: b.id.clone(), offset: 0 }));
-        Self { model: Model::new(doc), selection }
+        let first = tree::texts(&doc).first().map(|block| Pos::new(block.id.clone(), 0));
+        let mut editor = Self {
+            model: Model::new(doc),
+            caret: None,
+            keymap: Keymap::default(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            steps: 0,
+            change: Change::default(),
+            rule: false,
+            composing: None,
+            goal: None,
+        };
+        if let Some(pos) = first {
+            editor.place(pos);
+        }
+        editor
     }
 
     pub fn doc(&self) -> &Document {
@@ -107,37 +240,338 @@ impl Editor {
 
     /// `None` when the document has nowhere to put a caret.
     pub fn selection(&self) -> Option<&Selection> {
-        self.selection.as_ref()
+        self.caret.as_ref().map(|caret| &caret.selection)
     }
 
+    /// Moves the selection, as a click or a drag does. Positions are brought onto the nearest character, and a
+    /// selection that names no text block is ignored.
     pub fn select(&mut self, selection: Selection) {
-        self.selection = Some(selection);
-    }
-
-    /// Feeds text input. Returns what changed, for layout.
-    pub fn input(&mut self, event: InputEvent, _platform: &mut dyn Platform) -> Change {
-        match (event, self.selection.clone()) {
-            (InputEvent::Insert(text), Some(selection)) if selection.is_caret() => {
-                let at = selection.head;
-                let moved = Pos { block: at.block.clone(), offset: at.offset + text.len() };
-                match self.model.apply([Op::InsertText { at, text }]) {
-                    Ok(change) => {
-                        self.selection = Some(Selection::caret(moved));
-                        change
-                    }
-                    Err(_) => Change::default(),
-                }
-            }
-            _ => todo!("editor"),
+        self.end_composition();
+        (self.rule, self.goal) = (false, None);
+        self.seal();
+        if let (Some(anchor), Some(head)) = (self.clamp(&selection.anchor), self.clamp(&selection.head)) {
+            self.set_selection(Selection { anchor, head });
         }
     }
 
-    /// Feeds a key press. Returns `None` when the key means nothing here, so the shell may use it.
-    pub fn key(&mut self, _event: KeyEvent, _platform: &mut dyn Platform) -> Option<Change> {
-        todo!("editor")
+    pub fn keymap(&self) -> &Keymap {
+        &self.keymap
     }
 
-    pub fn run(&mut self, _command: Command, _platform: &mut dyn Platform) -> Change {
-        todo!("editor")
+    pub fn set_keymap(&mut self, keymap: Keymap) {
+        self.keymap = keymap;
+    }
+
+    /// The marks in force: those typed text will take at a caret, or those every selected character has.
+    pub fn marks(&self) -> BTreeSet<Mark> {
+        let Some(caret) = &self.caret else { return BTreeSet::new() };
+        if caret.selection.is_caret() {
+            return caret.marks.clone();
+        }
+        let doc = self.doc();
+        let pieces = self.pieces(&caret.selection);
+        let mut runs = pieces.iter().flat_map(|(id, range)| {
+            let runs = doc.block(id).map_or(&[][..], |block| block.body.runs());
+            text::runs_in(runs, range.clone())
+        });
+        let first = runs.next().map(|run| run.marks.clone()).unwrap_or_default();
+        runs.fold(first, |marks, run| marks.intersection(&run.marks).cloned().collect())
+    }
+
+    /// The address of the link under the caret, or at the start of the selection.
+    pub fn link(&self) -> Option<&str> {
+        let caret = self.caret.as_ref()?;
+        let (start, _) = self.ordered(&caret.selection);
+        let runs = self.doc().block(&start.block)?.body.runs();
+        let after = text::run_at(runs, start.offset).and_then(|run| run.link.as_deref());
+        let before =
+            start.offset.checked_sub(1).and_then(|at| text::run_at(runs, at)).and_then(|run| run.link.as_deref());
+        if caret.selection.is_caret() { before.or(after) } else { after }
+    }
+
+    /// The text an input method is composing: its block and where in it the text sits.
+    pub fn composition(&self) -> Option<(&BlockId, Range<usize>)> {
+        let composing = self.composing.as_ref()?;
+        Some((&self.selection()?.head.block, composing.range.clone()))
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty() || self.composing.is_some()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// Feeds text input. Returns what changed, for layout.
+    pub fn input(&mut self, event: InputEvent, platform: &mut dyn Platform) -> Change {
+        self.handle(event, platform);
+        std::mem::take(&mut self.change)
+    }
+
+    /// Feeds a key press. Returns `None` when the key means nothing here, so the shell may use it.
+    pub fn key(&mut self, event: KeyEvent, platform: &mut dyn Platform) -> Option<Change> {
+        let command = self.keymap.command(&event)?.clone();
+        self.exec(command, platform).then(|| std::mem::take(&mut self.change))
+    }
+
+    pub fn run(&mut self, command: Command, platform: &mut dyn Platform) -> Change {
+        self.exec(command, platform);
+        std::mem::take(&mut self.change)
+    }
+
+    /// Whether a command has anything to act on, so that a key it is bound to can fall through when not.
+    fn applies(&self, command: &Command) -> bool {
+        let Some(caret) = &self.caret else {
+            return match command {
+                Command::Undo => self.can_undo(),
+                Command::Redo => self.can_redo(),
+                Command::Paste | Command::PastePlain => true,
+                _ => false,
+            };
+        };
+        let ranged = !caret.selection.is_caret();
+        let kind = self.doc().block(&caret.selection.head.block).map(|block| &block.kind);
+        match command {
+            Command::Indent | Command::Outdent => {
+                matches!(kind, Some(BlockKind::ListItem { .. } | BlockKind::Code { .. }))
+            }
+            Command::ToggleChecked => {
+                matches!(kind, Some(BlockKind::ListItem { list: ListKind::Task { .. }, .. }))
+            }
+            Command::ToggleMark(_) => ranged || !matches!(kind, Some(BlockKind::Code { .. })),
+            Command::SetLink(_) => ranged || self.link().is_some(),
+            Command::Copy | Command::Cut => ranged,
+            Command::Undo => self.can_undo(),
+            Command::Redo => self.can_redo(),
+            _ => true,
+        }
+    }
+
+    fn exec(&mut self, command: Command, platform: &mut dyn Platform) -> bool {
+        if !self.applies(&command) {
+            return false;
+        }
+        let now = platform.now_ms();
+        self.end_composition();
+        let rule = std::mem::take(&mut self.rule);
+        let goal = self.goal.take();
+        let before = self.caret.clone();
+        let mut kind = Kind::Other;
+        match command {
+            Command::Move { to, extend } => self.move_to(to, extend, goal, platform),
+            // Straight after an input rule, Backspace gives back the characters that were typed.
+            Command::Delete(Motion::Left) if rule && self.undo_step() => {}
+            Command::Delete(motion) => {
+                self.delete(motion, platform);
+                kind = Kind::Deleting;
+            }
+            Command::Split => kind = self.split(platform),
+            Command::LineBreak => self.insert("\n"),
+            Command::Indent => self.indent(true),
+            Command::Outdent => self.indent(false),
+            Command::ToggleMark(mark) => self.toggle_mark(mark),
+            Command::SetLink(link) => self.set_link(link),
+            Command::SetBlock(block) => self.set_block(block, platform),
+            Command::ToggleChecked => self.toggle_checked(),
+            Command::Undo => _ = self.undo_step(),
+            Command::Redo => self.redo_step(),
+            Command::SelectAll => self.select_all(),
+            Command::SelectWord => self.select_word(),
+            Command::SelectBlock => self.select_block(),
+            Command::Copy => self.copy(platform),
+            Command::Cut => self.cut(platform),
+            Command::Paste => self.paste(false, platform),
+            Command::PastePlain => self.paste(true, platform),
+        }
+        self.commit(before, kind, now, false);
+        true
+    }
+
+    /// Applies `ops` as one model edit. Returns whether the document changed.
+    fn apply(&mut self, ops: Vec<Op>) -> bool {
+        if ops.is_empty() {
+            return false;
+        }
+        // The model records an undo step only for an edit that changed something, so the count kept here
+        // must do the same. An edit that adds or removes blocks always does. Any other is checked against
+        // the blocks it names.
+        let structural = |op: &Op| {
+            matches!(op, Op::Split { .. } | Op::Join { .. } | Op::InsertBlock { .. } | Op::RemoveBlock { .. })
+        };
+        let named = |op: &Op| match op {
+            Op::InsertText { at, .. } => Some(at.block.clone()),
+            Op::DeleteText { block, .. }
+            | Op::SetMark { block, .. }
+            | Op::SetLink { block, .. }
+            | Op::SetKind { block, .. } => Some(block.clone()),
+            _ => None,
+        };
+        let before: Option<Vec<Block>> = (!ops.iter().any(structural)).then(|| {
+            let ids: BTreeSet<BlockId> = ops.iter().filter_map(named).collect();
+            ids.iter().filter_map(|id| self.doc().block(id).cloned()).collect()
+        });
+        let change = match self.model.apply(ops) {
+            Ok(change) => change,
+            Err(error) => {
+                debug_assert!(false, "the editor planned an edit the model refused: {error}");
+                return false;
+            }
+        };
+        let changed = before.is_none_or(|blocks| blocks.iter().any(|block| self.doc().block(&block.id) != Some(block)));
+        if changed {
+            self.steps += 1;
+            self.note(change);
+        }
+        changed
+    }
+
+    fn note(&mut self, change: Change) {
+        self.change.blocks.extend(change.blocks);
+        self.change.structure |= change.structure;
+    }
+
+    /// Closes the edits made since the last call as one undo step, or adds them to the step before when
+    /// they continue it. `fresh` keeps them apart.
+    fn commit(&mut self, before: Option<Caret>, kind: Kind, now: u64, fresh: bool) {
+        let count = std::mem::take(&mut self.steps);
+        if count == 0 {
+            // Moving the caret ends the step, even when it comes back to where it was.
+            if self.caret != before {
+                self.seal();
+            }
+            return;
+        }
+        self.redo.clear();
+        let after = self.caret.clone();
+        let grows = !fresh && matches!(kind, Kind::Typing | Kind::Deleting);
+        if let Some(last) = self.undo.last_mut()
+            && grows
+            && last.kind == kind
+            && last.after == before
+            && now.saturating_sub(last.at) <= PAUSE_MS
+        {
+            (last.count, last.after, last.at) = (last.count + count, after, now);
+            return;
+        }
+        self.undo.push(Step { count, before, after, kind, at: now });
+    }
+
+    /// Stops the newest undo step from growing, so that what is typed next starts another.
+    fn seal(&mut self) {
+        if let Some(last) = self.undo.last_mut() {
+            last.kind = Kind::Other;
+        }
+    }
+
+    /// Takes back the edits made since the last undo step was closed.
+    fn rollback(&mut self) {
+        for _ in 0..std::mem::take(&mut self.steps) {
+            if let Some(change) = self.model.undo() {
+                self.note(change);
+            }
+        }
+    }
+
+    fn undo_step(&mut self) -> bool {
+        let Some(step) = self.undo.pop() else { return false };
+        for _ in 0..step.count {
+            if let Some(change) = self.model.undo() {
+                self.note(change);
+            }
+        }
+        self.caret = step.before.clone();
+        self.redo.push(step);
+        true
+    }
+
+    fn redo_step(&mut self) {
+        let Some(step) = self.redo.pop() else { return };
+        for _ in 0..step.count {
+            if let Some(change) = self.model.redo() {
+                self.note(change);
+            }
+        }
+        self.caret = step.after.clone();
+        self.undo.push(step);
+    }
+
+    /// Ends a composition where it stands, keeping its text.
+    fn end_composition(&mut self) {
+        if let Some(composing) = self.composing.take() {
+            self.commit(composing.before, Kind::Other, composing.at, true);
+        }
+    }
+
+    fn block(&self, id: &BlockId) -> Option<&Block> {
+        self.doc().block(id)
+    }
+
+    /// The position on a character boundary of a text block that is nearest to `pos`.
+    fn clamp(&self, pos: &Pos) -> Option<Pos> {
+        let block = self.block(&pos.block).filter(|block| tree::is_text(block))?;
+        Some(Pos::new(pos.block.clone(), text::snap(&block.plain_text(), pos.offset)))
+    }
+
+    /// The ends of a selection in document order.
+    fn ordered(&self, selection: &Selection) -> (Pos, Pos) {
+        let (anchor, head) = (selection.anchor.clone(), selection.head.clone());
+        let backwards = if anchor.block == head.block {
+            head.offset < anchor.offset
+        } else {
+            let texts = tree::texts(self.doc());
+            let index = |pos: &Pos| texts.iter().position(|block| block.id == pos.block);
+            index(&head) < index(&anchor)
+        };
+        if backwards { (head, anchor) } else { (anchor, head) }
+    }
+
+    /// The selected part of each text block a selection touches, in document order.
+    fn pieces(&self, selection: &Selection) -> Vec<(BlockId, Range<usize>)> {
+        let (start, end) = self.ordered(selection);
+        let texts = tree::texts(self.doc());
+        let index = |pos: &Pos| texts.iter().position(|block| block.id == pos.block);
+        let (Some(from), Some(to)) = (index(&start), index(&end)) else { return Vec::new() };
+        let piece = |i: usize| {
+            let from_offset = if i == from { start.offset } else { 0 };
+            let to_offset = if i == to { end.offset } else { text::len(texts[i]) };
+            (texts[i].id.clone(), from_offset..to_offset)
+        };
+        (from..=to).map(piece).filter(|(_, range)| !range.is_empty()).collect()
+    }
+
+    /// The marks text takes when nothing says otherwise: those of the character before. At the start of a
+    /// block the caret sits before any opening marker, so only marks that show no marker carry over from the
+    /// first character. Code blocks carry none.
+    fn natural(&self, pos: &Pos) -> BTreeSet<Mark> {
+        let Some(block) = self.block(&pos.block).filter(|block| !text::is_code(block)) else {
+            return BTreeSet::new();
+        };
+        let runs = block.body.runs();
+        if pos.offset > 0 {
+            return text::marks_before(runs, pos.offset);
+        }
+        text::marks_after(runs, 0).into_iter().filter(|mark| !markers::PAIRED.contains(mark)).collect()
+    }
+
+    /// Selects with the marks that follow from the text: a range takes those of its first character.
+    fn set_selection(&mut self, selection: Selection) {
+        let marks = if selection.is_caret() {
+            self.natural(&selection.head)
+        } else {
+            let (start, _) = self.ordered(&selection);
+            let block = self.block(&start.block).filter(|block| !text::is_code(block));
+            block.map(|block| text::marks_after(block.body.runs(), start.offset)).unwrap_or_default()
+        };
+        self.caret = Some(Caret { selection, marks });
+    }
+
+    fn place(&mut self, pos: Pos) {
+        self.set_selection(Selection::caret(pos));
+    }
+
+    /// Puts the caret at `pos` with marks chosen by the caller.
+    fn place_with(&mut self, pos: Pos, marks: BTreeSet<Mark>) {
+        self.caret = Some(Caret { selection: Selection::caret(pos), marks });
     }
 }

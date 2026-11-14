@@ -1984,7 +1984,11 @@ dependencies = [
 name = "letters-editor"
 version = "0.1.0"
 dependencies = [
+ "letters-convert",
  "letters-model",
+ "proptest",
+ "serde_json",
+ "unicode-segmentation",
 ]
 
 [[package]]
