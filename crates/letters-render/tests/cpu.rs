@@ -196,7 +196,7 @@ fn weight_slant_and_synthetic_bold_change_the_glyphs() {
         else {
             unreachable!()
         };
-        render(&list([Item::Glyphs { origin, font, size, color, skew, embolden, glyphs }]), 160, 60, 1.0)
+        render(&list([Item::Glyphs { origin, font, size, color, skew, embolden, glyphs, text: None }]), 160, 60, 1.0)
     };
     let all = |frame: &Frame| ink(frame, 0, 0, 160, 60);
     let regular = draw(&sans(400.0), 0.0, false);
@@ -307,6 +307,7 @@ fn items_that_cannot_be_drawn_are_skipped() {
         skew: 0.0,
         embolden: false,
         glyphs,
+        text: None,
     };
     let path = |path: Vec<PathEl>, scale| Item::Path {
         origin: Point::default(),

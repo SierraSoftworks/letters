@@ -203,7 +203,7 @@ pub(crate) fn paint(canvas: &mut impl Canvas, fonts: &mut FontCache, list: &Disp
                 let radius = shape.radii().top_left as f32;
                 canvas.fill_blurred_rounded_rect(&shape.rect(), radius, blur.max(0.0) / 2.0);
             }
-            Item::Glyphs { origin, font, size, color, skew, embolden, glyphs } => {
+            Item::Glyphs { origin, font, size, color, skew, embolden, glyphs, .. } => {
                 if !(origin.x.is_finite() && origin.y.is_finite() && size.is_finite() && *size > 0.0) {
                     continue;
                 }

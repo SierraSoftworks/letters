@@ -107,6 +107,15 @@ pub struct Glyph {
     pub y: f32,
 }
 
+/// The text a run of glyphs was shaped from, for a backend that keeps text as text, such as PDF.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunText {
+    pub text: Box<str>,
+    /// For each glyph of the run in order, the byte offset in `text` where its cluster starts. A cluster
+    /// ends where the next one in the text starts.
+    pub clusters: Box<[u32]>,
+}
+
 /// One segment of a vector path, in the path's own units.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PathEl {
@@ -154,6 +163,8 @@ pub enum Item {
         /// Thickens the outlines, for a face with no bold.
         embolden: bool,
         glyphs: Vec<Glyph>,
+        /// What the glyphs spell. `None` where it is not kept: nothing on screen needs it.
+        text: Option<Arc<RunText>>,
     },
     /// A vector shape such as an icon. Path units are multiplied by `scale` and placed at `origin`.
     Path {

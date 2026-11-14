@@ -162,7 +162,16 @@ impl Engine {
         let font = self.font(run)?;
         let synthesis = run.synthesis();
         let skew = synthesis.skew().unwrap_or(if slant { SLANT } else { 0.0 });
-        Some(Item::Glyphs { origin, font, size: run.font_size(), color, skew, embolden: synthesis.embolden(), glyphs })
+        Some(Item::Glyphs {
+            origin,
+            font,
+            size: run.font_size(),
+            color,
+            skew,
+            embolden: synthesis.embolden(),
+            glyphs,
+            text: None,
+        })
     }
 
     fn font(&mut self, run: &Run<'_, Brush>) -> Option<Font> {

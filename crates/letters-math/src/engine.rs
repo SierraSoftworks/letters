@@ -127,7 +127,7 @@ fn glyph(items: &mut Vec<Item>, font: letters_render::Font, id: u32, size: f32, 
         return;
     }
     let glyphs = vec![Glyph { id, x: 0.0, y: 0.0 }];
-    items.push(Item::Glyphs { origin: at, font, size, color, skew: 0.0, embolden: false, glyphs });
+    items.push(Item::Glyphs { origin: at, font, size, color, skew: 0.0, embolden: false, glyphs, text: None });
 }
 
 /// Adds a filled rectangle. A side thinner than a hairline grows to one about its centre.

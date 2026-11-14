@@ -127,6 +127,7 @@ impl ShapedText {
                 skew: run.skew,
                 embolden: run.embolden,
                 glyphs: run.glyphs.clone(),
+                text: None,
             });
         }
     }

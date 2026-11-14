@@ -90,7 +90,7 @@ pub fn text(font: &Font, size: f32, color: Color, origin: Point, text: &str) -> 
             glyph
         })
         .collect();
-    Item::Glyphs { origin, font: font.clone(), size, color, skew: 0.0, embolden: false, glyphs }
+    Item::Glyphs { origin, font: font.clone(), size, color, skew: 0.0, embolden: false, glyphs, text: None }
 }
 
 /// A `width` by `height` image whose pixels come from `color(x, y)`.
@@ -172,7 +172,7 @@ fn type_specimen() -> Vec<Item> {
         else {
             unreachable!()
         };
-        Item::Glyphs { origin, font, size, color, skew, embolden, glyphs }
+        Item::Glyphs { origin, font, size, color, skew, embolden, glyphs, text: None }
     };
     items.push(synthetic("let slanted = code();", 14.0, false, 132.0));
     items.push(synthetic("let heavier = code();", 0.0, true, 150.0));

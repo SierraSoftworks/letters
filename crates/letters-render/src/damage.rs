@@ -226,7 +226,7 @@ fn entry(item: &Item, images: &Images, fonts: &mut FontCache, by: By) -> Entry {
             // Vello stops a blur at two and a half standard deviations, and the blur is two of them.
             (Point { x: rect.x, y: rect.y }, Extent::of(&moved, 1.25 * blur.max(0.0)))
         }
-        Item::Glyphs { origin, font, size, color, skew, embolden, glyphs } => {
+        Item::Glyphs { origin, font, size, color, skew, embolden, glyphs, .. } => {
             mix = Mix(4);
             let face = fonts.face(font);
             match by {
