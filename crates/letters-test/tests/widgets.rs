@@ -259,6 +259,26 @@ fn a_text_field_cuts_copies_and_pastes() {
 }
 
 #[test]
+fn a_text_field_moves_by_word_and_by_line_with_each_systems_keys() {
+    // (macOS keys, script from the end of "Ana de Li", result)
+    let cases = [
+        (false, "Mod+Left 'x'", "Ana de xLi"),
+        (false, "Mod+Backspace", "Ana de "),
+        (false, "Home 'x'", "xAna de Li"),
+        (true, "Alt+Left 'x'", "Ana de xLi"),
+        (true, "Alt+Backspace", "Ana de "),
+        (true, "Mod+Left 'x'", "xAna de Li"),
+        (true, "Mod+Backspace", ""),
+    ];
+    for (mac, script, result) in cases {
+        let mut desk = if mac { named("Ana de Li").mac() } else { named("Ana de Li") };
+        desk.click(Role::TextInput, "Name");
+        play(&mut desk, &format!("End {script}"));
+        assert_eq!(desk.app().name, result, "{script} with {} keys", if mac { "macOS" } else { "standard" });
+    }
+}
+
+#[test]
 fn a_double_click_selects_a_word_to_replace() {
     let mut desk = named("Ana Li");
     desk.double_click(Role::TextInput, "Name").type_text("Bo");

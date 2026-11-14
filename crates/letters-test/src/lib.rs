@@ -12,7 +12,7 @@ use accesskit_consumer::{NodeRef, Tree};
 use letters_editor::{Clip, Editor, InputEvent, Key, KeyEvent, Modifiers, Platform};
 use letters_model::{Document, Pos, Selection, Style};
 use letters_render::{DisplayList, Point, Rect, Size};
-use letters_ui::{App, EditorApp, FixedShaper, Ui, Window};
+use letters_ui::{App, EditorApp, FixedShaper, Keys, Ui, Window};
 
 pub use letters_ui::Role;
 
@@ -98,9 +98,17 @@ impl<A: App> Harness<A> {
         Self::with(Ui::host(app, Rc::new(FixedShaper)))
     }
 
+    /// Drives `ui` with the key conventions of Linux and Windows, whatever system the tests run on.
     pub fn with(mut ui: Ui<A>) -> Self {
         ui.resize(WINDOW, 1.0);
+        ui.set_keys(Keys::Standard);
         Self { ui, platform: TestPlatform::default() }
+    }
+
+    /// The same window under macOS key conventions.
+    pub fn mac(mut self) -> Self {
+        self.ui.set_keys(Keys::Mac);
+        self
     }
 
     pub fn app(&self) -> &A {

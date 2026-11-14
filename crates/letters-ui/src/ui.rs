@@ -30,8 +30,21 @@ const DOUBLE_CLICK_MS: u64 = 400;
 const DOUBLE_CLICK_SLOP: f32 = 4.0;
 /// Room kept between a canvas's caret and the edge of what scrolls it.
 const CARET_MARGIN: f32 = 24.0;
-/// macOS moves by word with Option and by line with Command. Elsewhere Control moves by word.
-const MAC: bool = cfg!(target_os = "macos");
+/// Which system's key conventions a window follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keys {
+    /// Linux and Windows: Control moves by word, and Home and End by line.
+    Standard,
+    /// macOS: Option moves by word, and Command by line.
+    Mac,
+}
+
+impl Default for Keys {
+    /// The conventions of the system this build is for.
+    fn default() -> Self {
+        if cfg!(target_os = "macos") { Self::Mac } else { Self::Standard }
+    }
+}
 
 /// What a window shows and does. The app owns all of its state: elements only send it messages.
 pub trait App {
@@ -61,6 +74,10 @@ pub trait App {
 
     /// Told when the window turns light or dark, for what the app draws itself. Elements follow on their own.
     fn scheme(&mut self, _scheme: Scheme) {}
+
+    /// Told which system's key conventions to follow, for the keys the app handles itself. Text fields
+    /// follow on their own.
+    fn keys(&mut self, _keys: Keys) {}
 
     /// Does a little of any work that was put off, such as laying out text that is out of sight. Returns
     /// whether there was any. It is called while nothing else is happening.
@@ -100,6 +117,7 @@ pub struct Ui<A: App> {
     size: Size,
     scale: f32,
     scheme: Scheme,
+    keys: Keys,
     /// Whether the window has the keyboard.
     active: bool,
     stale: Stale,
@@ -140,6 +158,7 @@ impl<A: App> Ui<A> {
             size: Size::default(),
             scale: 1.0,
             scheme: Scheme::Light,
+            keys: Keys::default(),
             active: true,
             stale: Stale { view: true, layout: true, paint: true },
             pointer: None,
@@ -188,6 +207,13 @@ impl<A: App> Ui<A> {
             self.app.scheme(scheme);
             self.stale.view = true;
         }
+    }
+
+    /// Follows one system's key conventions, in place of those of the system this build is for. A browser
+    /// shell picks at run time, and tests pin one so they give the same result on every host.
+    pub fn set_keys(&mut self, keys: Keys) {
+        self.keys = keys;
+        self.app.keys(keys);
     }
 
     /// Tells the window whether it has the keyboard. Without it no caret blinks.
@@ -639,8 +665,9 @@ impl<A: App> Ui<A> {
         let state = self.inputs.entry(node.id).or_default();
         let value = input.value.as_str();
         let mods = event.mods;
-        let by_line = MAC && mods.primary;
-        let by_word = if MAC { mods.alt } else { mods.primary };
+        let mac = self.keys == Keys::Mac;
+        let by_line = mac && mods.primary;
+        let by_word = if mac { mods.alt } else { mods.primary };
 
         let motion = match event.key {
             Key::Home => Some(Motion::Start),

@@ -390,6 +390,31 @@ fn arrow_keys_move_between_the_lines_the_layout_made() {
 }
 
 #[test]
+fn the_ends_of_a_line_and_of_the_document_have_each_systems_keys() {
+    let ends = |block: &str| (Pos::new(block, 0), Pos::new(block, block_text(&letter(), block).len()));
+    let (line, first, last) = (ends("p1"), ends("h1").0, ends("p2").1);
+    // (macOS keys, key, where the caret lands from the middle of the second block)
+    let cases = [
+        (false, "Home", &line.0),
+        (false, "End", &line.1),
+        (false, "Mod+Home", &first),
+        (false, "Mod+End", &last),
+        (true, "Mod+Left", &line.0),
+        (true, "Mod+Right", &line.1),
+        (true, "Mod+Up", &first),
+        (true, "Mod+Down", &last),
+        (true, "Home", &first),
+        (true, "End", &last),
+    ];
+    for (mac, key, lands) in cases {
+        let mut window = if mac { letter().mac() } else { letter() };
+        window.ui().select(Selection::caret(Pos::new("p1", 9)));
+        window.key(key);
+        assert_eq!(&head(&window), lands, "{key} with {} keys", if mac { "macOS" } else { "standard" });
+    }
+}
+
+#[test]
 fn a_double_click_selects_a_word_and_a_drag_selects_a_stretch() {
     let mut window = letter();
     let (start, end) = (spot(&mut window, "p1", 2), spot(&mut window, "p1", 16));

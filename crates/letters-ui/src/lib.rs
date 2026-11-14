@@ -28,5 +28,5 @@ pub use icon::Icon;
 pub use style::{Align, Dir, Edges, Justify, Look, Ring, Style};
 pub use text::{Family, FixedShaper, FontShaper, GlyphRun, Shaped, Stop, TextShaper, TextStyle};
 pub use tokens::{Color as Ink, Scheme};
-pub use ui::{App, Ui};
+pub use ui::{App, Keys, Ui};
 pub use window::{DocLines, EditorApp, SaveState, Window};

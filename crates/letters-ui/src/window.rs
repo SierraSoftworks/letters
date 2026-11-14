@@ -6,7 +6,7 @@
 use std::rc::Rc;
 
 use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
-use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Lines, Modifiers, Platform};
+use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Platform};
 use letters_layout::{Callout, DocLayout, Fonts, Palette, Syntax};
 use letters_model::{Block, BlockId, BlockKind, Change, Mark, Pos, Selection, Style};
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
@@ -19,7 +19,7 @@ use crate::paint::scrollbar;
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::text::{FontShaper, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::ui::{App, Ui};
+use crate::ui::{App, Keys, Ui};
 use crate::widgets::{Button, Menu, MenuItem, Popover, Side, SidePanel, TextField, TopBar, side_panel, top_bar};
 
 /// Space kept beside the text column.
@@ -616,6 +616,13 @@ impl App for EditorApp {
             }
             None => {}
         }
+    }
+
+    fn keys(&mut self, keys: Keys) {
+        self.editor.set_keymap(match keys {
+            Keys::Standard => Keymap::standard(),
+            Keys::Mac => Keymap::mac(),
+        });
     }
 
     fn scheme(&mut self, scheme: Scheme) {
