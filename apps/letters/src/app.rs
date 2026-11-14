@@ -137,7 +137,7 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
     launch.mark("display list");
     let mut pixels = vec![0; (width * height) as usize];
     let mut painter = Painter::new();
-    painter.paint(&list, &Images::default(), scale as f32, background(false), width, &mut pixels);
+    painter.paint(&list, &Images::default(), scale as f32, background(false), width, 0, &mut pixels);
     launch.mark(FIRST_FRAME);
     let Mode::TypingReport { keys } = options.mode else {
         println!("{FIRST_FRAME}\n{}", launch.report());
@@ -151,7 +151,8 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
         view.input(InputEvent::Insert("a".into()), &mut platform);
         list.items.clear();
         view.paint(&mut list);
-        painter.paint(&list, &Images::default(), scale as f32, background(false), width, &mut pixels);
+        // The pixels still hold the frame before, as a window's buffer does.
+        painter.paint(&list, &Images::default(), scale as f32, background(false), width, 1, &mut pixels);
         typing.record(typed.elapsed());
     }
     print!("{}", typing.report("CPU"));

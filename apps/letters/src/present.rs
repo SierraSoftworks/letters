@@ -7,18 +7,22 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use letters_render::cpu::{CpuRenderer, Frame};
+use letters_render::cpu::{CpuRenderer, Damage, Frame};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList};
 use winit::window::Window;
 
 use crate::gpu::{Gpu, GpuSurface};
 
-/// Keeps the CPU renderer's glyph caches and its frame between paints.
+/// Keeps the CPU renderer and the frame it draws into between paints, so that a paint redraws only what
+/// changed since the one before.
 #[derive(Default)]
 pub struct Painter {
     renderer: CpuRenderer,
+    /// The latest frame, in the window's own pixel layout.
     frame: Frame,
+    /// What the paint before this one changed, which a buffer two frames old has also missed.
+    before: Damage,
 }
 
 impl Painter {
@@ -26,7 +30,11 @@ impl Painter {
         Self::default()
     }
 
-    /// Paints `list` at `scale` over `background` into `out`: one `0x00RRGGBB` per pixel, `width` to a row.
+    /// Makes `out` show `list` at `scale` over `background`: one `0x00RRGGBB` per pixel, `width` to a row.
+    ///
+    /// `age` says what `out` holds now: the frame of the paint before this one (1), of the one before that
+    /// (2), or nothing that can be relied on (anything else).
+    #[allow(clippy::too_many_arguments)]
     pub fn paint(
         &mut self,
         list: &DisplayList,
@@ -34,14 +42,26 @@ impl Painter {
         scale: f32,
         background: Color,
         width: u32,
+        age: u8,
         out: &mut [u32],
     ) {
         let height = (out.len() as u32).checked_div(width).unwrap_or(0);
-        if (self.frame.width(), self.frame.height()) != (width, height) {
-            self.frame = Frame::new(width, height);
+        let resized = (self.frame.width(), self.frame.height()) != (width, height);
+        if resized {
+            self.frame = Frame::xrgb(width, height);
         }
-        self.renderer.render(list, images, scale, background, &mut self.frame);
-        self.frame.copy_to_xrgb(out);
+        let damage = self.renderer.render(list, images, scale, background, &mut self.frame);
+        let stale = match age {
+            _ if resized => None,
+            1 => Some(damage.clone()),
+            2 => Some(damage.union(&self.before)),
+            _ => None,
+        };
+        match stale {
+            Some(stale) => stale.rects().iter().for_each(|rect| self.frame.copy_rect_to(out, *rect)),
+            None => out.copy_from_slice(self.frame.pixels()),
+        }
+        self.before = damage;
     }
 }
 
@@ -103,8 +123,11 @@ impl Presenter {
         let Surface::Software(surface) = &mut self.surface else { unreachable!("the GPU surface was just replaced") };
         surface.resize(width, height)?;
         let mut buffer = surface.buffer_mut()?;
-        self.painter.paint(list, &self.images, scale, background, size.width, &mut buffer);
+        let age = buffer.age();
+        self.painter.paint(list, &self.images, scale, background, size.width, age, &mut buffer);
         self.window.pre_present_notify();
+        // The whole buffer is presented even when little of it changed: a redraw may be the system's way
+        // of asking for all of the window again.
         buffer.present()
     }
 }
