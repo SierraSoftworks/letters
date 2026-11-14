@@ -8,7 +8,9 @@ use std::fmt;
 
 use serde_json::{Map, Value};
 
-use crate::{Block, BlockId, BlockKind, Body, Document, Extra, FORMAT, ListKind, Mark, Run, Tone};
+use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Run, Tone};
+
+mod stream;
 
 /// Why a `document.json` was refused, and where.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,34 +37,13 @@ pub(crate) fn err<T>(path: &str, message: impl Into<String>) -> Result<T> {
 impl Document {
     /// Reads a `document.json`, refusing anything that breaks the schema.
     pub fn from_json(json: &str) -> Result<Self> {
+        // A sound file is read in one pass. Anything that pass declines is read again the slow way, which
+        // can say what is wrong and where.
+        if let Some(doc) = stream::document(json) {
+            return Ok(doc);
+        }
         let value: Value = serde_json::from_str(json).or_else(|e| err("", format!("not valid JSON: {e}")))?;
-        let mut map = object(value, "")?;
-
-        match map.remove("format").as_ref().and_then(Value::as_u64) {
-            Some(format) if format == u64::from(FORMAT) => {}
-            Some(format) if format > u64::from(FORMAT) => {
-                return err("format", format!("version {format} is newer than this build reads ({FORMAT})"));
-            }
-            _ => return err("format", "expected a format version"),
-        }
-
-        let language = match map.remove("language") {
-            None => Document::default().language,
-            Some(Value::String(tag)) => tag,
-            Some(_) => return err("language", "expected a BCP 47 tag"),
-        };
-        let dictionary =
-            strings(map.remove("dictionary"), "dictionary")?.unwrap_or_default().into_iter().collect::<BTreeSet<_>>();
-        let blocks = blocks(map.remove("blocks").unwrap_or(Value::Array(Vec::new())), "blocks")?;
-
-        let doc = Self { language, dictionary, blocks, extra: map.into_iter().collect() };
-        let mut seen = BTreeSet::new();
-        for block in doc.walk() {
-            if !seen.insert(&block.id) {
-                return err("blocks", format!("the id \"{}\" is used by more than one block", block.id));
-            }
-        }
-        Ok(doc)
+        document(object(value, "")?, None)
     }
 
     /// Writes the canonical `document.json`.
@@ -105,6 +86,38 @@ impl Run {
     }
 }
 
+/// Builds a document from its fields. `read` holds the blocks when they were read on the way in.
+fn document(mut map: Map<String, Value>, read: Option<Vec<Block>>) -> Result<Document> {
+    match map.remove("format").as_ref().and_then(Value::as_u64) {
+        Some(format) if format == u64::from(FORMAT) => {}
+        Some(format) if format > u64::from(FORMAT) => {
+            return err("format", format!("version {format} is newer than this build reads ({FORMAT})"));
+        }
+        _ => return err("format", "expected a format version"),
+    }
+
+    let language = match map.remove("language") {
+        None => Document::default().language,
+        Some(Value::String(tag)) => tag,
+        Some(_) => return err("language", "expected a BCP 47 tag"),
+    };
+    let dictionary =
+        strings(map.remove("dictionary"), "dictionary")?.unwrap_or_default().into_iter().collect::<BTreeSet<_>>();
+    let blocks = match read {
+        Some(blocks) => blocks,
+        None => blocks(map.remove("blocks").unwrap_or(Value::Array(Vec::new())), "blocks")?,
+    };
+
+    let doc = Document { language, dictionary, blocks, extra: map.into_iter().collect() };
+    let mut seen = BTreeSet::new();
+    for block in doc.walk() {
+        if !seen.insert(&block.id) {
+            return err("blocks", format!("the id \"{}\" is used by more than one block", block.id));
+        }
+    }
+    Ok(doc)
+}
+
 pub(crate) fn object(value: Value, path: &str) -> Result<Map<String, Value>> {
     match value {
         Value::Object(map) => Ok(map),
@@ -139,7 +152,20 @@ fn blocks(value: Value, path: &str) -> Result<Vec<Block>> {
 }
 
 fn block(value: Value, path: &str) -> Result<Block> {
-    let mut map = object(value, path)?;
+    block_from(object(value, path)?, None, path)
+}
+
+/// The shape of body a block of this type holds, for the types this build knows.
+fn shape(type_name: &str) -> Option<BodyShape> {
+    match type_name {
+        "paragraph" | "heading" | "list_item" | "code" => Some(BodyShape::Text),
+        "quote" | "callout" => Some(BodyShape::Blocks),
+        _ => None,
+    }
+}
+
+/// Builds a block from its fields. `read` holds its body when that was read on the way in.
+fn block_from(mut map: Map<String, Value>, read: Option<Body>, path: &str) -> Result<Block> {
     let id = match string(&mut map, "id", path)? {
         Some(id) if !id.is_empty() => BlockId::new(id),
         _ => return err(&format!("{path}.id"), "every block needs an id"),
@@ -188,12 +214,16 @@ fn block(value: Value, path: &str) -> Result<Block> {
         _ => BlockKind::Unknown { type_name },
     };
 
-    let body = match kind {
-        BlockKind::Unknown { .. } | BlockKind::Divider => Body::None,
-        BlockKind::Quote | BlockKind::Callout { .. } => {
+    let body = match (kind.shape(), read) {
+        (BodyShape::Text, Some(body @ Body::Text(_))) | (BodyShape::Blocks, Some(body @ Body::Blocks(_))) => body,
+        (_, Some(_)) => return err(path, "the body does not fit the block's type"),
+        (BodyShape::None, None) => Body::None,
+        (BodyShape::Blocks, None) => {
             Body::Blocks(blocks(map.remove("blocks").unwrap_or(Value::Array(Vec::new())), &format!("{path}.blocks"))?)
         }
-        _ => Body::Text(runs(map.remove("content").unwrap_or(Value::Array(Vec::new())), &format!("{path}.content"))?),
+        (BodyShape::Text, None) => {
+            Body::Text(runs(map.remove("content").unwrap_or(Value::Array(Vec::new())), &format!("{path}.content"))?)
+        }
     };
     Ok(Block { id, kind, body, extra: map.into_iter().collect() })
 }

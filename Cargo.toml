@@ -21,6 +21,7 @@ letters-ui = { path = "crates/letters-ui" }
 letters-convert = { path = "crates/letters-convert" }
 letters-test = { path = "crates/letters-test" }
 
+serde = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }

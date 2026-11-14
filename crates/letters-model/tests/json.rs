@@ -56,6 +56,30 @@ fn schema_breaks_are_refused_with_their_path() {
     }
 }
 
+#[test]
+fn a_repeated_key_keeps_its_last_value() {
+    let cases = [
+        r#"{"format":1,"blocks":[{"id":"x","type":"divider"}],"blocks":[{"id":"a","type":"paragraph","content":[{"text":"kept"}]}]}"#,
+        r#"{"format":1,"blocks":[{"id":"a","type":"paragraph","content":[{"text":"lost"}],"content":[{"text":"kept"}]}]}"#,
+        r#"{"format":1,"blocks":[{"id":"a","type":"paragraph","content":[{"text":"lost","text":"kept"}]}]}"#,
+        r#"{"format":1,"blocks":[{"id":"a","type":"heading","type":"paragraph","content":[{"text":"kept"}]}]}"#,
+    ];
+    for json in cases {
+        let doc = Document::from_json(json).expect(json);
+        let block = doc.block(&"a".into()).expect(json);
+        assert_eq!((&block.kind, block.plain_text().as_str()), (&BlockKind::Paragraph, "kept"), "{json}");
+    }
+}
+
+/// The same JSON with the keys of every object in the opposite order.
+fn reversed(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => map.iter().rev().map(|(key, value)| (key.clone(), reversed(value))).collect(),
+        serde_json::Value::Array(items) => items.iter().map(reversed).collect(),
+        other => other.clone(),
+    }
+}
+
 fn json_value() -> impl Strategy<Value = serde_json::Value> {
     prop_oneof![any::<bool>().prop_map(Into::into), any::<i32>().prop_map(Into::into), ".{0,6}".prop_map(Into::into)]
 }
@@ -92,5 +116,13 @@ proptest! {
         let reread = Document::from_json(&written).unwrap();
         prop_assert_eq!(&reread, &doc);
         prop_assert_eq!(reread.to_json(), written);
+    }
+
+    #[test]
+    fn the_order_of_keys_never_changes_what_is_read(json in document_json()) {
+        let json = json.replace(r#","link":null"#, "").replace(r#""link":null,"#, "");
+        let canonical = Document::from_json(&json).unwrap().to_json();
+        let backwards = reversed(&serde_json::from_str(&canonical).unwrap()).to_string();
+        prop_assert_eq!(Document::from_json(&backwards).unwrap(), Document::from_json(&canonical).unwrap());
     }
 }
