@@ -12,12 +12,12 @@ use letters_layout::{Callout, DocLayout, Fonts, Palette, Syntax};
 use letters_model::{Align as TextAlign, Block, BlockId, BlockKind, Change, Mark, Pos, Selection, Style};
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 
-use crate::color::{fade, resolve};
+use crate::color::{fade, resolve, same};
 use crate::describe::{self, Request};
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::icon::{self, Icon};
 use crate::paint::scrollbar;
-use crate::restyle::{self, StyleEdit, Styles};
+use crate::restyle::{self, Field, StyleEdit, Styles};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::text::{Family, FontShaper, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
@@ -97,9 +97,12 @@ pub enum Message {
     LinkClose,
     /// Changes the style of the element type under the caret.
     Restyle(StyleEdit),
-    /// What is typed into the size field, before it is taken.
-    SizeDraft(String),
-    SizeApply,
+    /// What is typed into one of the style's fields, before it is taken.
+    Draft(Field, String),
+    /// Takes what was typed into a field, or drops it if it makes no sense there.
+    Apply(Field),
+    /// Drops what was typed into a field.
+    Forget,
 }
 
 impl Ui<EditorApp> {
@@ -220,8 +223,8 @@ pub struct EditorApp {
     sharing: bool,
     /// The address in the link editor while it is open.
     link: Option<String>,
-    /// What is typed into the size field and the element type it was typed for.
-    size: Option<(&'static str, String)>,
+    /// What is typed into one of the style's fields, and the element type it was typed for.
+    draft: Option<(Field, &'static str, String)>,
     folded: Folded,
     dragging: bool,
 }
@@ -243,7 +246,7 @@ impl EditorApp {
             panel: None,
             sharing: false,
             link: None,
-            size: None,
+            draft: None,
             folded: Folded::default(),
             dragging: false,
         }
@@ -580,7 +583,7 @@ impl EditorApp {
                 menu = menu.item(item.on_select(toggle(mark)));
             }
             let any = MARKS.iter().any(|(_, _, mark)| in_force.contains(mark));
-            marks = marks.child(tool(icon::BASELINE, "Marks").pressed(any).popover(menu.popover()));
+            marks = marks.child(tool(icon::TYPE, "Marks").pressed(any).popover(menu.popover()));
         } else {
             for (icon, label, mark) in MARKS {
                 marks = marks.child(tool(icon, label).pressed(in_force.contains(&mark)).on_press(toggle(mark)));
@@ -642,12 +645,67 @@ impl EditorApp {
             .child(Element::icon(icon::CHEVRON_DOWN, 14.0).fg(tokens::FG_MUTED))
             .popover(fonts.popover());
 
-        let typed = self.size.as_ref().filter(|(of, _)| *of == element).map(|(_, text)| text.clone());
-        let size = TextField::new("Size", typed.unwrap_or_else(|| format!("{}", style.size)))
-            .size(ControlSize::Small)
-            .on_input(Message::SizeDraft)
-            .on_submit(Message::SizeApply);
-        let size = Element::from(size).width(56.0);
+        let size = self.field(Field::Size, element, style).width(56.0);
+
+        // The colour shows as the page draws it, which a dark page does not do as written.
+        let shown = |hex: &str| {
+            let color = self.palette.recolor(hex_color(hex).unwrap_or(self.palette.text));
+            same(color.r, color.g, color.b)
+        };
+        let mut swatches = Element::row().gap(tokens::SPACE_XS);
+        for (name, ink) in INKS {
+            let hex = hex(ink);
+            let chosen = style.color.eq_ignore_ascii_case(&hex);
+            let dot = Element::row().width(18.0).height(18.0).radius(9.0).bg(shown(&hex));
+            let swatch = Element::row()
+                .padding(Edges::all(2.0))
+                .border(Edges::all(2.0), if chosen { tokens::ACCENT } else { fade(tokens::FG, 0.0) })
+                .radius(13.0)
+                .hover(Look::bg(tokens::NEUTRAL_SOFT))
+                .ring(Ring::Outline(2.0))
+                .role(Role::Button)
+                .label(name)
+                .pressed(chosen)
+                .tooltip(name, Side::Top)
+                .closes()
+                .on_press(Message::Restyle(StyleEdit::Color(hex)))
+                .child(dot);
+            swatches = swatches.child(swatch);
+        }
+        let any = Element::row()
+            .align(Align::Center)
+            .gap(tokens::SPACE_SM)
+            .child(Element::text("Hex", TextStyle::control().size(tokens::TEXT_SM)).fg(tokens::FG_MUTED).grow(1.0))
+            .child(self.field(Field::Color, element, style).width(96.0));
+        let named = INKS.iter().find(|(_, ink)| style.color.eq_ignore_ascii_case(&hex(*ink)));
+        let colour = Element::row()
+            .align(Align::Center)
+            .justify(Justify::Center)
+            .width(tokens::CONTROL_HEIGHT_SM)
+            .height(tokens::CONTROL_HEIGHT_SM)
+            .radius(tokens::RADIUS_CONTROL)
+            .fg(shown(&style.color))
+            .hover(Look::bg(tokens::NEUTRAL_SOFT))
+            .ring(Ring::Outline(2.0))
+            .role(Role::Button)
+            .label("Colour")
+            .description(named.map_or(style.color.as_str(), |(name, _)| name))
+            .child(Element::icon(icon::BASELINE, 16.0))
+            .popover(Popover::new(Element::column().gap(tokens::SPACE_MD).child(swatches).child(any)).label("Colour"));
+
+        let spaces = [(Field::LineHeight, ""), (Field::SpaceBefore, "pt"), (Field::SpaceAfter, "pt")];
+        let spaces = spaces.map(|(field, unit)| {
+            let label = Element::text(field.label(), TextStyle::control().size(tokens::TEXT_SM)).grow(1.0);
+            let unit = Element::text(unit, TextStyle::control().size(tokens::TEXT_SM)).fg(tokens::FG_MUTED).width(16.0);
+            Element::row()
+                .align(Align::Center)
+                .gap(tokens::SPACE_SM)
+                .child(label)
+                .child(self.field(field, element, style).width(56.0))
+                .child(unit)
+        });
+        let spacing = Element::column().gap(tokens::SPACE_SM).min_width(200.0).children(spaces);
+        let spacing = tool(icon::LINE_HEIGHT, "Spacing").popover(Popover::new(spacing).label("Spacing"));
 
         let align = |align| Message::Restyle(StyleEdit::Align(align));
         let mut aligns = cluster();
@@ -664,14 +722,15 @@ impl EditorApp {
             }
         }
 
+        let looks = cluster().child(colour).child(aligns).child(spacing);
         if fold < Fold::Style {
-            return vec![label, font, size, aligns, TopBar::rule()];
+            return vec![label, font, size, looks, TopBar::rule()];
         }
         let title = format!("{name} style");
         let rest = Element::column()
             .gap(tokens::SPACE_SM)
             .child(font)
-            .child(Element::row().align(Align::Center).gap(tokens::SPACE_SM).child(size).child(aligns));
+            .child(Element::row().align(Align::Center).gap(tokens::SPACE_SM).child(size).child(looks));
         let open = label
             .child(Element::icon(icon::CHEVRON_DOWN, 14.0))
             .hover(Look::bg(tokens::NEUTRAL_SOFT))
@@ -680,6 +739,23 @@ impl EditorApp {
             .label(title.clone())
             .popover(Popover::new(rest).label(title));
         vec![open, TopBar::rule()]
+    }
+
+    /// A field for one part of the type's style. It shows what is being typed into it, and the style's own
+    /// value otherwise. What was typed is taken on Enter and when focus leaves.
+    fn field(&self, field: Field, element: &'static str, style: &letters_model::TextStyle) -> Element<Message> {
+        let typed = self.draft.as_ref().filter(|draft| draft.0 == field && draft.1 == element).map(|draft| &draft.2);
+        let mut input = TextField::new(field.label(), typed.cloned().unwrap_or_else(|| field.show(style)))
+            .size(ControlSize::Small)
+            .invalid(typed.is_some_and(|text| field.read(text).is_none()))
+            .on_input(move |text| Message::Draft(field, text))
+            .on_submit(Message::Apply(field))
+            .on_leave(Message::Apply(field))
+            .on_cancel(Message::Forget);
+        if field == Field::Color {
+            input = input.mono();
+        }
+        input.into()
     }
 
     fn side(&self, panel: Panel) -> Element<Message> {
@@ -740,12 +816,18 @@ impl App for EditorApp {
             Message::EditLink => self.link = Some(self.editor.link().unwrap_or_default().to_owned()),
             Message::LinkDraft(address) => self.link = self.link.is_some().then_some(address),
             Message::LinkClose => self.link = None,
-            Message::Restyle(edit) => self.restyle(&edit),
-            Message::SizeDraft(text) => self.size = self.element().map(|element| (element, text)),
-            Message::SizeApply => {
-                let typed = self.size.take().filter(|(element, _)| Some(*element) == self.element());
-                if let Some(size) = typed.and_then(|(_, text)| restyle::size(&text)) {
-                    self.restyle(&StyleEdit::Size(size));
+            Message::Restyle(edit) => {
+                // A choice made outright replaces whatever was half typed.
+                self.draft = None;
+                self.restyle(&edit);
+            }
+            Message::Forget => self.draft = None,
+            Message::Draft(field, text) => self.draft = self.element().map(|element| (field, element, text)),
+            Message::Apply(field) => {
+                let typed =
+                    self.draft.take_if(|draft| draft.0 == field).filter(|draft| Some(draft.1) == self.element());
+                if let Some(edit) = typed.and_then(|draft| field.read(&draft.2)) {
+                    self.restyle(&edit);
                 }
             }
             Message::LinkApply => {
@@ -916,6 +998,30 @@ fn tool(icon: Icon, label: &str) -> Button<Message> {
 /// Buttons that belong together, set closer than the bar's other controls.
 fn cluster() -> Element<Message> {
     Element::row().align(Align::Center).gap(tokens::SPACE_2XS)
+}
+
+/// The colours offered for text, as they are on a light page: yewi's ink and its tones that read on white.
+/// Any other colour can be typed.
+const INKS: [(&str, Ink); 8] = [
+    ("Ink", same(0x1f, 0x23, 0x28)),
+    ("Grey", tokens::FG_MUTED),
+    ("Red", tokens::DANGER),
+    ("Amber", tokens::WARN),
+    ("Green", tokens::OK),
+    ("Teal", tokens::SYNTAX_TYPE),
+    ("Blue", tokens::INFO),
+    ("Purple", tokens::SYNTAX_KEYWORD),
+];
+
+/// A colour as a style stores it.
+fn hex(ink: Ink) -> String {
+    format!("#{:02x}{:02x}{:02x}", ink.light.r, ink.light.g, ink.light.b)
+}
+
+/// Reads a style's `#rrggbb`.
+fn hex_color(hex: &str) -> Option<Color> {
+    let rgb = u32::from_str_radix(hex.strip_prefix('#').filter(|digits| digits.len() == 6)?, 16).ok()?;
+    Some(Color::rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
 }
 
 const MARKS: [(Icon, &str, Mark); 5] = [

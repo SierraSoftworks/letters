@@ -86,6 +86,15 @@ fn style_of(window: &mut Harness, element: &str) -> TextStyle {
     window.ui().style().types[element].clone()
 }
 
+/// Narrows the window until the bar has folded far enough to show a button.
+fn narrow_until(window: &mut Harness, button: &str) {
+    let shows = |width: u16| {
+        window.resize(f32::from(width), 600.0);
+        window.find(Role::Button, button).is_some()
+    };
+    assert!((600..=1400).rev().step_by(20).any(shows), "no width of window shows {button}");
+}
+
 /// The bar's buttons and fields, left to right.
 fn bar_controls(window: &mut Harness) -> Vec<(String, Rect)> {
     let bar = window.find(Role::Toolbar, "Document").expect("the bar").bounds;
@@ -404,18 +413,77 @@ fn the_bar_restyles_every_block_of_the_type_at_the_caret() {
 }
 
 #[test]
-fn a_size_is_taken_on_enter_and_one_that_makes_no_sense_is_dropped() {
-    for (typed, expected) in [("18", Some(18.0)), (" 10.5 ", Some(10.5)), ("big", None), ("0", None)] {
+fn what_is_typed_into_a_style_field_is_taken_or_dropped() {
+    // What is typed, how the typing ends, and whether 18 points is then in force.
+    let cases = [
+        ("18", "Enter", true),
+        (" 18 ", "leave", true),
+        ("18", "Escape", false),
+        ("big", "Enter", false),
+        ("0", "leave", false),
+    ];
+    for (typed, end, taken) in cases {
         let mut window = letter();
-        window.ui().select(Selection::caret(Pos::new("p1", 0)));
+        let elsewhere = spot(&mut window, "p1", 5);
         let before = style_of(&mut window, "body").size;
-        window.click(Role::TextInput, "Size").key("Mod+A").type_text(typed).key("Enter");
+        window.click(Role::TextInput, "Size").key("Mod+A").type_text(typed);
+        match end {
+            "leave" => window.click_at(Point { x: elsewhere.x, y: elsewhere.y + elsewhere.height / 2.0 }),
+            key => window.key(key),
+        };
 
         let after = style_of(&mut window, "body").size;
-        assert_eq!(after, expected.unwrap_or(before), "{typed:?}");
+        assert_eq!(after, if taken { 18.0 } else { before }, "{typed:?} then {end}");
         let field = window.find(Role::TextInput, "Size").unwrap();
         assert_eq!(field.value, Some(after.to_string()), "the field shows the size in force after {typed:?}");
+        if end != "Enter" {
+            assert_eq!(window.focused().map(|found| found.role), Some(Role::Document), "focus is on the page");
+        }
     }
+}
+
+#[test]
+fn a_colour_is_picked_from_the_swatches_or_typed() {
+    let mut window = letter();
+    window.click(Role::Button, "Colour").assert_open(Role::Dialog, "Colour");
+    window.click(Role::Button, "Red").assert_closed(Role::Dialog, "Colour");
+    let red = style_of(&mut window, "heading1").color;
+    assert_eq!(window.find(Role::Button, "Colour").unwrap().description.as_deref(), Some("Red"));
+    let page = page(&mut window);
+    let inks: Vec<String> = window
+        .paint()
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Glyphs { origin, color, .. } if page.contains(*origin) => {
+                Some(format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(inks.contains(&red), "the page draws the heading in {red}: {inks:?}");
+    assert!(inks.contains(&style_of(&mut window, "body").color), "and the body as it was");
+
+    window.click(Role::Button, "Colour").click(Role::TextInput, "Hex").key("Mod+A").type_text("0A7").key("Enter");
+    assert_eq!(style_of(&mut window, "heading1").color, "#00aa77");
+}
+
+#[test]
+fn spacing_opens_up_the_lines_of_a_type_and_the_room_around_it() {
+    let mut window = letter();
+    let gap = |window: &mut Harness| {
+        let next = spot(window, "h2", 0).y;
+        next - spot(window, "p1", 0).y
+    };
+    let before = gap(&mut window);
+    window.click(Role::Button, "Spacing").assert_open(Role::Dialog, "Spacing");
+    for (field, typed) in [("Line height", "2"), ("Space after", "24")] {
+        window.click(Role::TextInput, field).key("Mod+A").type_text(typed).key("Enter");
+    }
+    let body = style_of(&mut window, "body");
+    assert_eq!((body.line_height, body.space_after), (2.0, 24.0));
+    window.key("Escape").assert_closed(Role::Dialog, "Spacing");
+    assert!(gap(&mut window) > before, "the paragraph takes more of the page");
 }
 
 #[test]
@@ -450,14 +518,16 @@ fn a_narrowing_window_folds_alignment_then_the_marks_then_the_whole_style() {
 #[test]
 fn folded_controls_do_what_the_buttons_did() {
     let mut ed = Harness::doc("Send the **quote** today.");
-    ed.resize(960.0, 600.0).select("quote");
+    ed.select("quote");
+    narrow_until(&mut ed, "Marks");
     assert_eq!(ed.find(Role::Button, "Marks").unwrap().toggled, Some(true), "a mark is in force");
     ed.click(Role::Button, "Marks").click(Role::MenuItemCheckBox, "Bold");
     ed.assert_markdown("Send the quote today.");
     ed.click(Role::Button, "Alignment").click(Role::MenuItemCheckBox, "Align centre");
     assert_eq!(style_of(&mut ed, "body").align, Align::Center);
 
-    ed.resize(720.0, 600.0).click(Role::Button, "Body style").assert_open(Role::Dialog, "Body style");
+    narrow_until(&mut ed, "Body style");
+    ed.click(Role::Button, "Body style").assert_open(Role::Dialog, "Body style");
     ed.click(Role::Button, "Justify");
     assert_eq!(style_of(&mut ed, "body").align, Align::Justify);
     ed.click(Role::Button, "Font").click(Role::MenuItemCheckBox, "Montserrat");
