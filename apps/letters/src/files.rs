@@ -70,17 +70,16 @@ pub struct Home {
     created: String,
     /// The hash of the `document.json` last read from or written to the file, or `None` if there was no file.
     seen: Option<String>,
-    /// Whether the first save replaces whatever the path holds, because the user chose to.
-    replace: bool,
     /// The style a new document is first written with. `None` once the file has a style of its own.
     style: Option<Style>,
 }
 
 impl Home {
-    /// A home for a new document in `style`. The first save replaces whatever `path` holds now.
+    /// A home for a new document in `style`. A file that turns up at `path` before the first save is left
+    /// alone, as one changed by someone else is.
     pub fn new(path: impl Into<PathBuf>, style: Style) -> Self {
         let (id, created) = (platform::document_id(), platform::now_rfc3339());
-        Self { path: path.into(), id, created, seen: None, replace: true, style: Some(style) }
+        Self { path: path.into(), id, created, seen: None, style: Some(style) }
     }
 
     pub fn path(&self) -> &Path {
@@ -99,12 +98,6 @@ impl Home {
     pub fn save(&self, document: &Document) -> Result<(Home, Saved), Error> {
         let name = self.path.file_name().unwrap_or_default().to_string_lossy();
         let mut folder = Folder(folder_of(&self.path).to_owned());
-        if self.replace {
-            match folder.remove(&name) {
-                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
-                _ => {}
-            }
-        }
 
         let mut package = Package {
             id: self.id.clone(),
@@ -125,8 +118,50 @@ impl Home {
             Saved::ConflictCopy { name, .. } => self.path.with_file_name(name),
             _ => self.path.clone(),
         };
-        Ok((Home { path, seen: Some(written), replace: false, style: None, ..self.clone() }, saved))
+        Ok((Home { path, seen: Some(written), style: None, ..self.clone() }, saved))
     }
+
+    /// Moves the document's file to `to` and returns its home there. Whatever `to` holds is never replaced:
+    /// the move fails with `AlreadyExists` instead. No save of this home may be running.
+    pub fn move_to(&self, to: &Path) -> io::Result<Home> {
+        match self.seen {
+            Some(_) => relocate(&self.path, to)?,
+            // Nothing is on disk yet, so there is only a path to change.
+            None if to.symlink_metadata().is_ok() => return Err(io::ErrorKind::AlreadyExists.into()),
+            None => {}
+        }
+        Ok(Home { path: to.to_owned(), ..self.clone() })
+    }
+}
+
+/// Moves a file to a path that must be free. A file already at `to` is never replaced, as a plain rename
+/// would: the move fails with `AlreadyExists` instead.
+pub fn relocate(from: &Path, to: &Path) -> io::Result<()> {
+    // A change of letter case alone names the same file where the file system ignores case.
+    let same_name = from.file_name().zip(to.file_name()).is_some_and(|(from, to)| from.eq_ignore_ascii_case(to));
+    if same_name && from != to && fs::canonicalize(from).is_ok_and(|file| fs::canonicalize(to).ok() == Some(file)) {
+        return fs::rename(from, to);
+    }
+    // A link fails where a file exists, and appears whole or not at all.
+    match fs::hard_link(from, to) {
+        Ok(()) => return fs::remove_file(from),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Err(error),
+        // Another disk, or a file system without links: copy instead.
+        Err(_) => {}
+    }
+    let mut copy = fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+    let copied = fs::File::open(from)
+        .and_then(|mut file| {
+            io::copy(&mut file, &mut copy)?;
+            copy.set_permissions(file.metadata()?.permissions())?;
+            copy.sync_all()
+        })
+        .and_then(|()| fs::remove_file(from));
+    if copied.is_err() {
+        // The original is still whole, so the half-made copy must not pass for the document.
+        let _ = fs::remove_file(to);
+    }
+    copied
 }
 
 /// The document in memory at the moment of a save.
@@ -230,7 +265,7 @@ pub fn open(path: &Path, new_style: impl FnOnce() -> Style) -> Result<Opened, Er
         // A file that is missing from a folder that exists is a new document. A missing folder is a mistake.
         Err(error) if error.kind() == io::ErrorKind::NotFound && folder_of(path).is_dir() => {
             let style = new_style();
-            let home = Home { replace: false, ..Home::new(path, style.clone()) };
+            let home = Home::new(path, style.clone());
             return Ok(Opened { document: blank(), style, home });
         }
         Err(error) => return Err(error.into()),
@@ -241,13 +276,7 @@ pub fn open(path: &Path, new_style: impl FnOnce() -> Style) -> Result<Opened, Er
     let style = archive.style().unwrap_or_default();
     let manifest = archive.manifest();
     let seen = manifest.hashes.get(DOCUMENT).cloned();
-    let home = Home {
-        path: path.into(),
-        id: manifest.id.clone(),
-        created: manifest.created.clone(),
-        seen,
-        replace: false,
-        style: None,
-    };
+    let home =
+        Home { path: path.into(), id: manifest.id.clone(), created: manifest.created.clone(), seen, style: None };
     Ok(Opened { document, style, home })
 }

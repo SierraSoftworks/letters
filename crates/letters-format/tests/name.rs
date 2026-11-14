@@ -1,4 +1,4 @@
-use letters_format::suggested_name;
+use letters_format::{file_name, suggested_name};
 use letters_model::{Block, BlockKind, Document, Tone};
 
 fn heading(level: u8, text: &str) -> Block {
@@ -51,6 +51,7 @@ fn a_name_is_safe_on_every_file_system() {
     ];
     for (title, name) in cases {
         assert_eq!(named(title).as_deref(), name, "{title:?}");
+        assert_eq!(file_name(title).as_deref(), name, "{title:?}, typed as a name");
     }
 }
 

@@ -191,17 +191,43 @@ fn the_style_comes_from_the_file_and_falls_back_to_the_built_in_one() {
 }
 
 #[test]
-fn a_new_document_replaces_the_file_its_user_chose_and_carries_a_style() {
-    let folder = Folder::new("replace");
+fn a_new_document_carries_a_style_and_replaces_nothing() {
+    let folder = Folder::new("in-the-way");
     let path = folder.path("Old.let");
-    write_full(&path, "Old");
+    let theirs = write_full(&path, "Old");
 
-    Home::new(&path, narrow()).save(&document("New")).unwrap();
-    let written = read(&path);
+    let (home, _) = Home::new(&path, narrow()).save(&document("New")).unwrap();
+    assert_eq!(read(&path), theirs, "the file that was there is left as it was");
+    assert_ne!(home.path(), path);
+    let written = read(home.path());
     assert_eq!(written.document, document("New"));
     assert_eq!(written.style().unwrap(), narrow());
-    assert!(!written.entries.keys().any(|name| name.starts_with("history/")), "nothing of the old file remains");
-    assert_eq!(folder.names(), ["Old.let"]);
+}
+
+#[test]
+fn a_move_takes_the_whole_file_and_replaces_nothing() {
+    let folder = Folder::new("move");
+    let (path, taken) = (folder.path("Rates.let"), folder.path("Taken.let"));
+    let original = write_full(&path, "Rates");
+    let theirs = write_full(&taken, "Theirs");
+    let home = open(&path).unwrap().home;
+
+    let refused = home.move_to(&taken).unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(home.move_to(&folder.path("missing/Rates.let")).is_err());
+    assert_eq!((read(&path), read(&taken)), (original.clone(), theirs), "a refused move changes nothing");
+    assert_eq!(folder.names(), ["Rates.let", "Taken.let"]);
+
+    fs::create_dir(folder.path("Work")).unwrap();
+    let moved = home.move_to(&folder.path("Work/Rates 2027.let")).unwrap();
+    assert_eq!(moved.title(), "Rates 2027");
+    assert_eq!(read(moved.path()), original, "assets and history move with the document");
+    assert!(!path.exists());
+
+    // The moved document is saved in its new place, as itself.
+    moved.save(&document("Edited")).unwrap();
+    assert_eq!(read(moved.path()), Package { document: document("Edited"), ..original });
+    assert_eq!(folder.names(), ["Taken.let", "Work"]);
 }
 
 #[test]

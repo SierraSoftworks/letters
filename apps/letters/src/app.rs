@@ -1,7 +1,8 @@
 //! The winit event loop: windows, their input, painting and saving.
 //!
 //! Each window holds one document. Everything a window shows comes from its view as a display list, which
-//! is rasterised into a software surface. Saving happens on a thread per save, a moment after typing stops.
+//! is rasterised into a software surface. Saving happens on a thread per save, a moment after typing stops,
+//! and nobody is asked where: a new document gets a file of its own once it has content.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -11,12 +12,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Platform as _};
-use letters_model::{ReplicaId, Style};
+use letters_model::{Document, ReplicaId, Style};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Size};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{Cursor, SaveState, Scheme, Window as View, tokens};
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::error::EventLoopError;
@@ -30,12 +31,12 @@ use crate::cli::{Mode, Options};
 use crate::files::{self, EXTENSION, Home, Opened};
 use crate::gpu::Gpu;
 use crate::input::{self, Composer, Press};
+use crate::library::{Library, Place, UNTITLED, has_content};
 use crate::measure::{FIRST_FRAME, Launch, Typing};
-use crate::platform::Desktop;
+use crate::platform::{self, Desktop};
 use crate::present::{Painter, Presenter};
 
 const MAC: bool = cfg!(target_os = "macos");
-const UNTITLED: &str = "Untitled";
 /// How long typing must pause before a save starts.
 const SAVE_AFTER: Duration = Duration::from_millis(800);
 /// How long to wait before trying a failed save again.
@@ -80,6 +81,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         path: options.file,
         proxy: event_loop.create_proxy(),
         platform: Desktop::new(),
+        library: Library::of(&std::env::home_dir().unwrap_or_default()),
         gpu: match std::env::var("LETTERS_RENDERER").as_deref() {
             Ok("cpu") => GpuState::Off,
             Ok("gpu") => GpuState::Wanted { software: true },
@@ -183,6 +185,7 @@ struct App {
     path: Option<PathBuf>,
     proxy: EventLoopProxy<Event>,
     platform: Desktop,
+    library: Library,
     gpu: GpuState,
     windows: HashMap<WindowId, DocWindow>,
     mods: ModifiersState,
@@ -228,8 +231,12 @@ struct DocWindow {
     /// When the view next wants a frame without being asked, on the editor's clock.
     wake_ms: Option<u64>,
 
-    /// Where the document is saved, or `None` until the user has chosen.
-    home: Option<Home>,
+    /// Where the document is saved, once it has somewhere.
+    place: Place,
+    /// Whether the document is saved at all. A run that only measures leaves every file as it found it.
+    keeps: bool,
+    /// The path the recents list has for this document.
+    listed: Option<PathBuf>,
     /// The view's edit count that is safely on disk.
     saved_edits: u64,
     /// The edit count a save was last planned for.
@@ -265,11 +272,11 @@ fn shortcut(event: &KeyEvent) -> Option<Action> {
 
 impl DocWindow {
     fn name(&self) -> String {
-        self.home.as_ref().map_or_else(|| UNTITLED.into(), Home::title)
+        self.place.name()
     }
 
     fn unsaved(&self) -> bool {
-        self.view.edits() != self.saved_edits
+        self.keeps && self.view.edits() != self.saved_edits
     }
 
     fn dark(&self) -> bool {
@@ -277,18 +284,41 @@ impl DocWindow {
     }
 
     /// The top bar says whether the document is saved. The title adds what the bar has no word for: a
-    /// document with nowhere to be saved yet, and a save that failed.
+    /// save that failed.
     fn retitle(&mut self) {
         let name = self.name();
         self.view.set_document_name(&name);
-        let unsaved = self.unsaved();
-        self.view.set_save_state(if unsaved || self.save_failed { SaveState::Saving } else { SaveState::Saved });
-        let state = match (self.save_failed, unsaved && self.home.is_none()) {
-            (true, _) => " · Not saved",
-            (false, true) => " · Edited",
-            (false, false) => "",
-        };
+        let unsaved = self.unsaved() || self.save_failed;
+        self.view.set_save_state(if unsaved { SaveState::Saving } else { SaveState::Saved });
+        let state = if self.save_failed { " · Not saved" } else { "" };
         self.window.set_title(&format!("{name}{state}"));
+    }
+
+    /// Tells the recents list where the document is, when that is news to it.
+    fn relist(&mut self, library: &Library) {
+        let news = |path: &&Path| self.keeps && Some(*path) != self.listed.as_deref() && path.is_file();
+        let Some(path) = self.place.path().filter(news).map(Path::to_owned) else { return };
+        library.moved(self.listed.as_deref().unwrap_or(&path), &path, &platform::now_rfc3339());
+        self.listed = Some(path);
+    }
+
+    /// Finds where a save of `document` goes, giving a new document its file name. `None` when there is
+    /// nothing to save, or nowhere: the first is settled here and the second is tried again.
+    fn settle(&mut self, document: &Document, caret: bool, library: &Library, now: Instant) -> Option<Home> {
+        let caret = self.view.editor().selection().filter(|_| caret).map(|selection| selection.head.block.clone());
+        let home = self.place.settle(document, caret.as_ref(), self.view.style(), library).map(|home| home.cloned());
+        match &home {
+            // A document with nothing in it has nothing to lose.
+            Ok(None) => (self.saved_edits, self.save_failed) = (self.view.edits(), false),
+            Ok(Some(_)) => {}
+            Err(error) => {
+                eprintln!("letters: could not save {}: {error}", self.name());
+                self.save_failed = true;
+                self.save_at = Some(now + RETRY_AFTER);
+            }
+        }
+        self.retitle();
+        home.ok().flatten()
     }
 
     /// Fits the view to the window, which may have changed size, display or theme.
@@ -335,11 +365,17 @@ impl DocWindow {
         }
     }
 
-    /// Starts saving on another thread, if there is somewhere to save and no save is running.
-    fn start_save(&mut self, proxy: &EventLoopProxy<Event>) {
-        let Some(home) = self.home.clone().filter(|_| self.saving.is_none()) else { return };
+    /// Starts saving on another thread, unless a save is running or there is nothing to save.
+    fn start_save(&mut self, proxy: &EventLoopProxy<Event>, library: &Library, now: Instant) {
+        if self.saving.is_some() {
+            return;
+        }
         self.save_at = None;
+        if !self.keeps {
+            return;
+        }
         let document = self.view.editor().doc().clone();
+        let Some(home) = self.settle(&document, true, library, now) else { return };
         let (id, proxy) = (self.window.id(), proxy.clone());
         let save = thread::spawn(move || {
             let result = home.save(&document).map(|(home, _)| home).map_err(|error| error.to_string());
@@ -350,11 +386,12 @@ impl DocWindow {
     }
 
     /// Collects a running save, waiting for it if it has not finished.
-    fn finish_save(&mut self, now: Instant) {
+    fn finish_save(&mut self, library: &Library, now: Instant) {
         let Some((edits, save)) = self.saving.take() else { return };
         match save.join().unwrap_or_else(|_| Err("the save stopped unexpectedly".into())) {
             Ok(home) => {
-                self.home = Some(home);
+                self.place.saved(home);
+                self.relist(library);
                 self.saved_edits = edits;
                 self.save_failed = false;
                 if self.unsaved() && self.save_at.is_none() {
@@ -371,19 +408,22 @@ impl DocWindow {
     }
 
     /// Saves now, on this thread, if anything is unsaved. Returns whether everything is on disk.
-    fn save_now(&mut self) -> bool {
-        self.finish_save(Instant::now());
-        !self.unsaved() || self.write()
-    }
-
-    /// Writes the document to its home on this thread. Returns whether that worked.
-    fn write(&mut self) -> bool {
-        let Some(home) = &self.home else { return false };
-        let saved = home.save(self.view.editor().doc());
+    ///
+    /// With the `caret` counted, a first Heading 1 it is still in does not name the file yet.
+    fn save_now(&mut self, caret: bool, library: &Library) -> bool {
+        let now = Instant::now();
+        self.finish_save(library, now);
+        if !self.unsaved() {
+            return true;
+        }
+        let document = self.view.editor().doc().clone();
+        let Some(home) = self.settle(&document, caret, library, now) else { return !self.save_failed };
+        let saved = home.save(&document);
         self.save_failed = saved.is_err();
         match saved {
             Ok((home, _)) => {
-                self.home = Some(home);
+                self.place.saved(home);
+                self.relist(library);
                 self.saved_edits = self.view.edits();
                 self.noticed_edits = self.saved_edits;
                 self.save_at = None;
@@ -394,40 +434,13 @@ impl DocWindow {
         !self.save_failed
     }
 
-    /// Asks where an untitled document should live, then saves it there, blank or not.
-    fn choose_home(&mut self) -> bool {
-        let dialog = FileDialog::new().add_filter("Letters document", &[EXTENSION]).set_parent(&*self.window);
-        let Some(path) = dialog.set_file_name(format!("{UNTITLED}.{EXTENSION}")).save_file() else { return false };
-        self.home = Some(Home::new(path.with_extension(EXTENSION), self.view.style().clone()));
-        self.write()
-    }
-
     fn alert(&self, message: &str) {
         alert(Some(&self.window), message);
     }
 
-    /// Makes sure nothing would be lost by closing. Returns `false` if the user chose to stay.
-    fn ready_to_close(&mut self) -> bool {
-        if self.home.is_some() {
-            return self.save_now();
-        }
-        if !self.unsaved() {
-            return true;
-        }
-        let answer = MessageDialog::new()
-            .set_level(MessageLevel::Warning)
-            .set_title("Keep this document?")
-            .set_description("It has not been saved anywhere yet.")
-            .set_buttons(MessageButtons::YesNoCancelCustom("Save".into(), "Discard".into(), "Cancel".into()))
-            .set_parent(&*self.window)
-            .show();
-        match answer {
-            MessageDialogResult::Yes => self.choose_home(),
-            MessageDialogResult::Custom(choice) if choice == "Save" => self.choose_home(),
-            MessageDialogResult::No => true,
-            MessageDialogResult::Custom(choice) => choice == "Discard",
-            _ => false,
-        }
+    /// Makes sure nothing would be lost by closing. Returns `false` if the document could not be saved.
+    fn ready_to_close(&mut self, library: &Library) -> bool {
+        self.save_now(false, library)
     }
 }
 
@@ -441,11 +454,11 @@ fn alert(parent: Option<&Arc<Window>>, message: &str) {
 }
 
 impl App {
-    /// Opens a window on a document. With no `opened`, the document is blank and has no home yet.
+    /// Opens a window on a document. With no `opened`, the document is blank and has no file yet.
     fn open_window(&mut self, event_loop: &ActiveEventLoop, opened: Option<Opened>) -> Result<(), Box<dyn Error>> {
-        let (document, style, home) = match opened {
-            Some(Opened { document, style, home }) => (document, style, Some(home)),
-            None => (files::blank(), new_style(), None),
+        let (document, style, place) = match opened {
+            Some(Opened { document, style, home }) => (document, style, Place::at(home)),
+            None => (files::blank(), new_style(), Place::new()),
         };
         // AccessKit must attach before the window is first shown.
         let window = Arc::new(event_loop.create_window(window_attributes().with_visible(false))?);
@@ -467,8 +480,9 @@ impl App {
             gpu_offered: false,
             access_stale: false,
             wake_ms: None,
-            // A run that only measures must leave the file as it found it.
-            home: home.filter(|_| self.typing.is_none() && !self.report_launch),
+            place,
+            keeps: self.typing.is_none() && !self.report_launch,
+            listed: None,
             saved_edits: 0,
             noticed_edits: 0,
             save_at: None,
@@ -513,18 +527,15 @@ impl App {
                 let Some(window) = self.windows.get(&id) else { return };
                 let dialog = FileDialog::new().add_filter("Letters document", &[EXTENSION]).set_parent(&*window.window);
                 let Some(path) = dialog.pick_file() else { return };
-                // A blank, untouched window gives way to the document that was asked for.
-                let pristine = window.home.is_none() && !window.unsaved();
+                // A window with no file and nothing to put in one gives way to the document that was asked for.
+                let pristine = window.place.home().is_none() && !has_content(window.view.editor().doc());
                 if self.open_path(event_loop, &path, Some(id)) && pristine {
                     self.windows.remove(&id);
                 }
             }
             Action::Save => {
-                let Some(window) = self.windows.get_mut(&id) else { return };
-                if window.home.is_some() {
-                    window.save_now();
-                } else {
-                    window.choose_home();
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.save_now(true, &self.library);
                 }
             }
             Action::Close => self.close(event_loop, id),
@@ -537,7 +548,7 @@ impl App {
     }
 
     fn close(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
-        if self.windows.get_mut(&id).is_some_and(DocWindow::ready_to_close) {
+        if self.windows.get_mut(&id).is_some_and(|window| window.ready_to_close(&self.library)) {
             self.windows.remove(&id);
         }
         if self.windows.is_empty() {
@@ -579,7 +590,7 @@ impl ApplicationHandler<Event> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let Self { windows, platform, mods, .. } = self;
+        let Self { windows, platform, mods, library, .. } = self;
         let Some(window) = windows.get_mut(&id) else { return };
         window.access.process_event(&window.window, &event);
         let mut action = None;
@@ -622,6 +633,8 @@ impl ApplicationHandler<Event> for App {
                     }
                     _ => {}
                 }
+                // Off the path to the first frame: the recents list learns of an opened document here.
+                window.relist(library);
                 return;
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } | WindowEvent::ThemeChanged(_) => {
@@ -697,7 +710,7 @@ impl ApplicationHandler<Event> for App {
         match event {
             Event::Saved(id) => {
                 if let Some(window) = self.windows.get_mut(&id) {
-                    window.finish_save(now);
+                    window.finish_save(&self.library, now);
                 }
             }
             Event::Gpu(None) => self.gpu = GpuState::Off,
@@ -727,11 +740,15 @@ impl ApplicationHandler<Event> for App {
     /// The last chance to save, which is the only one when the system ends the app, as Quit in the macOS
     /// menu does. Nothing may ask a question here.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
         for window in self.windows.values_mut() {
-            window.finish_save(Instant::now());
-            if window.unsaved()
-                && let Some(home) = &window.home
-                && let Err(error) = home.save(window.view.editor().doc())
+            window.finish_save(&self.library, now);
+            if !window.unsaved() {
+                continue;
+            }
+            let document = window.view.editor().doc().clone();
+            if let Some(home) = window.settle(&document, false, &self.library, now)
+                && let Err(error) = home.save(&document)
             {
                 eprintln!("letters: could not save {}: {error}", window.name());
             }
@@ -749,7 +766,7 @@ impl ApplicationHandler<Event> for App {
                 window.sync(now);
             }
             if window.save_at.is_some_and(|at| at <= now) {
-                window.start_save(&self.proxy);
+                window.start_save(&self.proxy, &self.library, now);
             }
             if let Some(run) = &mut self.typing {
                 // Typing starts once the window is on the renderer it will stay on.

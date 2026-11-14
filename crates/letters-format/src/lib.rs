@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-pub use name::suggested_name;
+pub use name::{file_name, suggested_name};
 pub use save::{DiskCopy, Files, Replica, Save, Saved, Stamp, conflict_copy_of, save};
 pub use working::{OPLOG, WorkingCopy};
 
