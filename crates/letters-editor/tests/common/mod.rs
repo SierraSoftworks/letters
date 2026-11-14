@@ -558,6 +558,9 @@ pub fn action() -> impl Strategy<Value = Action> {
         Just(Command::SelectWord),
         Just(Command::SelectBlock),
         Just(Command::ToggleMark(Mark::Highlight)),
+        Just(Command::AddWord("mot".into())),
+        Just(Command::RemoveWord("mot".into())),
+        Just(Command::SetLanguage("fr".into())),
     ];
     let composed = prop::sample::select(vec!["", "k", "か", "かな"]);
     let inputs = prop_oneof![

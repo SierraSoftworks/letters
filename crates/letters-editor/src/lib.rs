@@ -21,7 +21,8 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 
 use letters_model::{
-    Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, Pos, ReplicaId, Selection,
+    Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, OpError, Page, Pos, ReplicaId, Selection,
+    Style, TextStyle,
 };
 
 pub use keymap::Keymap;
@@ -138,6 +139,21 @@ pub enum Command {
     Paste,
     /// Pastes the clipboard's text as it is, with no formatting.
     PastePlain,
+    /// Sets the style of one element type, such as `heading1`, which every block of that type takes.
+    /// A style the file format would refuse changes nothing.
+    SetStyle {
+        element: String,
+        style: TextStyle,
+    },
+    /// Sets the paper size and margins.
+    SetPage(Page),
+    /// Replaces the whole style, as applying a stylesheet does.
+    ReplaceStyle(Style),
+    /// Sets the language the document is written in.
+    SetLanguage(String),
+    /// Adds a word to the document's own dictionary. [`Platform::learn_word`] keeps one for the person.
+    AddWord(String),
+    RemoveWord(String),
 }
 
 /// What the shell lends the editor.
@@ -366,6 +382,9 @@ impl Editor {
                 Command::Undo => self.can_undo(),
                 Command::Redo => self.can_redo(),
                 Command::Paste | Command::PastePlain => true,
+                // The style and the document's own fields are there whether or not there is text.
+                Command::SetStyle { .. } | Command::SetPage(_) | Command::ReplaceStyle(_) => true,
+                Command::SetLanguage(_) | Command::AddWord(_) | Command::RemoveWord(_) => true,
                 _ => false,
             };
         };
@@ -422,6 +441,12 @@ impl Editor {
             Command::Cut => self.cut(platform),
             Command::Paste => self.paste(false, platform),
             Command::PastePlain => self.paste(true, platform),
+            Command::SetStyle { element, style } => _ = self.apply(vec![Op::SetStyle { element, style }]),
+            Command::SetPage(page) => _ = self.apply(vec![Op::SetPage { page }]),
+            Command::ReplaceStyle(style) => _ = self.apply(vec![Op::ReplaceStyle { style }]),
+            Command::SetLanguage(language) => _ = self.apply(vec![Op::SetLanguage { language }]),
+            Command::AddWord(word) => _ = self.apply(vec![Op::AddWord { word }]),
+            Command::RemoveWord(word) => _ = self.apply(vec![Op::RemoveWord { word }]),
         }
         self.commit(kind, now, false);
         true
@@ -433,8 +458,8 @@ impl Editor {
             return false;
         }
         // The model records an undo step only for an edit that changed something, so the count kept here
-        // must do the same. An edit that adds or removes blocks always does. Any other is checked against
-        // the blocks it names.
+        // must do the same. An edit that adds or removes blocks always does, and one to the style or the
+        // document's own fields says so in its change. Any other is checked against the blocks it names.
         let structural = |op: &Op| {
             matches!(op, Op::Split { .. } | Op::Join { .. } | Op::InsertBlock { .. } | Op::RemoveBlock { .. })
         };
@@ -457,12 +482,15 @@ impl Editor {
         }
         let change = match self.model.apply(ops) {
             Ok(change) => change,
+            // The style is the caller's, and the model is the judge of what one may hold.
+            Err(OpError::BadStyle(_)) => return false,
             Err(error) => {
                 debug_assert!(false, "the editor planned an edit the model refused: {error}");
                 return false;
             }
         };
-        let changed = before.is_none_or(|blocks| blocks.iter().any(|block| self.doc().block(&block.id) != Some(block)));
+        let differs = |blocks: Vec<Block>| blocks.iter().any(|block| self.doc().block(&block.id) != Some(block));
+        let changed = change.style || change.document || before.is_none_or(differs);
         if changed {
             self.steps += 1;
             self.note(change);
@@ -473,6 +501,8 @@ impl Editor {
     fn note(&mut self, change: Change) {
         self.change.blocks.extend(change.blocks);
         self.change.structure |= change.structure;
+        self.change.style |= change.style;
+        self.change.document |= change.document;
     }
 
     /// Closes the edits made since the last call as one undo step, or adds them to the step before when
