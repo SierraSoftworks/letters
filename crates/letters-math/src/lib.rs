@@ -2,7 +2,8 @@
 //!
 //! The source is the LaTeX that KaTeX accepts. [`typeset`] turns it into a [`Formula`], whose items go into
 //! the same display list as everything else, so one renderer draws maths on every backend. Layout keeps a
-//! [`Cache`], since a formula is set far more often than it changes.
+//! [`Cache`], since a formula is set far more often than it changes. [`commands`] and [`environments`] list
+//! what the engine understands, for completion while typing.
 //!
 //! A formula holds only glyphs, rules and outlines. Nothing in one can load or link: `\href` sets its text
 //! and drops the address, and there is no command for an image.
@@ -10,8 +11,10 @@
 //! The engine is RaTeX and the faces are KaTeX's, compiled in. Neither shows in this interface.
 
 mod cache;
+mod commands;
 mod engine;
 mod fonts;
+mod table;
 
 use std::fmt;
 use std::ops::Range;
@@ -19,6 +22,7 @@ use std::ops::Range;
 use letters_render::{Color, DisplayList, Item, Point, Size};
 
 pub use crate::cache::Cache;
+pub use crate::commands::{Command, commands, environments};
 
 /// How much larger than the text beside it a formula is set. The maths faces are small on the body, so at
 /// the same size a formula looks slight next to prose. This is the ratio KaTeX uses.
