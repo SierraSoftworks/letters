@@ -8,6 +8,7 @@ server that adds identity, sharing and sync without owning any content.
 - `crates/letters-model`: the document, its operations and selections.
 - `crates/letters-format`: the `.let` container.
 - `crates/letters-render`: the display list and its backends.
+- `crates/letters-fonts`: the bundled open-licence fonts.
 - `crates/letters-layout`: paragraph and page layout.
 - `crates/letters-editor`: commands, Markdown input rules, keymap, clipboard and composition.
 - `crates/letters-ui`: the native widgets and the editor window's panels.

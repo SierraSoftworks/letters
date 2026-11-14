@@ -17,6 +17,7 @@ Build what it specifies, and prefer simple and polished over complex.
 - **Document.** `letters_model::Document` is the tree `document.json` stores. All edits go through
   `Model::apply` as `Op`s, and `Change` tells layout what to redo. Offsets are UTF-8 bytes.
 - **Drawing.** Everything visible is emitted as a `letters_render::DisplayList`. Nothing draws directly.
+- **Fonts.** `letters_fonts::bundled()` is the one font set for layout, tests, export and every shell.
 - **Input.** Text arrives as `letters_editor::InputEvent`, keys as `KeyEvent`, and actions as `Command`.
 
 ## Style

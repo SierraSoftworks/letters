@@ -1,0 +1,15 @@
+[package]
+name = "letters-fonts"
+description = "The open-licence fonts compiled into every Letters build"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+letters-render.workspace = true

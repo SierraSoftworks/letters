@@ -14,6 +14,7 @@ publish = false
 letters-model = { path = "crates/letters-model" }
 letters-format = { path = "crates/letters-format" }
 letters-render = { path = "crates/letters-render" }
+letters-fonts = { path = "crates/letters-fonts" }
 letters-layout = { path = "crates/letters-layout" }
 letters-editor = { path = "crates/letters-editor" }
 letters-ui = { path = "crates/letters-ui" }

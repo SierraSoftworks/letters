@@ -284,6 +284,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "letters-fonts"
+version = "0.1.0"
+dependencies = [
+ "letters-render",
+]
+
+[[package]]
 name = "letters-format"
 version = "0.1.0"
 dependencies = [
