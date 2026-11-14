@@ -13,7 +13,10 @@ workspace = true
 
 [dependencies]
 letters-model.workspace = true
+letters-layout.workspace = true
+letters-render.workspace = true
 pulldown-cmark.workspace = true
+yewi-highlight.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
