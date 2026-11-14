@@ -180,7 +180,7 @@ fn one_side_panel_shows_at_a_time() {
 }
 
 #[test]
-fn the_outline_is_a_line_for_each_heading_stepped_in_by_its_level() {
+fn the_outline_is_a_line_for_each_heading_stepped_in_and_shortened_by_its_level() {
     let mut window = report();
     for (_, title) in REPORT {
         window.assert_open(Role::Link, title);
@@ -191,6 +191,8 @@ fn the_outline_is_a_line_for_each_heading_stepped_in_by_its_level() {
     // Survey is level 1, Roof and Gutters level 2, Flashing level 3.
     assert!(lines[0].x < lines[1].x && lines[1].x < lines[2].x, "deeper headings step in: {lines:?}");
     assert_eq!(lines[3].x, lines[1].x, "headings of one level line up");
+    let right = lines[0].x + lines[0].width;
+    assert!(lines.iter().all(|line| line.x + line.width == right), "every line ends at one edge: {lines:?}");
 
     let (outline, page) = (window.find(Role::Navigation, "Outline").unwrap().bounds, page(&mut window));
     assert_eq!((outline.x, outline.y), (page.x, page.y), "at the top left of the page");

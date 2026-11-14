@@ -36,11 +36,11 @@ const CARET_WIDTH: f32 = 1.5;
 /// How much text one idle step lays out, in bytes. Small enough to fit between two frames.
 const SETTLE_BYTES: usize = 4096;
 
-/// The chapters control: where it sits in the page's corner, and the size of its lines.
+/// The chapters control: where it sits in the page's corner, and the size of its shortest line.
 const CHAPTERS_INSET: Edges = Edges::xy(6.0, 16.0);
 const CHAPTER_LINE: Size = Size { width: 12.0, height: 2.0 };
 /// How far a line steps in for each level below the document's shallowest heading, and the most steps it
-/// takes: headings run from level 1 to 4.
+/// takes: headings run from level 1 to 4. Every line ends at the same edge, so a deeper one is shorter.
 const CHAPTER_INDENT: f32 = 3.0;
 const CHAPTER_STEPS: u8 = 3;
 /// The room a line takes down the control, and the least it closes up to in a document of many headings.
@@ -464,7 +464,7 @@ impl EditorApp {
             let title = Some(block.plain_text()).filter(|title| !title.trim().is_empty());
             let title = title.unwrap_or_else(|| "Untitled".into());
             let here = section == Some(&block.id);
-            let mark = Element::row().width(CHAPTER_LINE.width).height(CHAPTER_LINE.height).radius(1.0).inked();
+            let mark = Element::row().grow(1.0).height(CHAPTER_LINE.height).radius(1.0).inked();
             Element::row()
                 .key(block.id.as_str())
                 .align(Align::Center)
