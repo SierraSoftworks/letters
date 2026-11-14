@@ -5256,9 +5256,9 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "yewi-highlight"
-version = "0.1.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f5fc28992e973e6171d221239f2f34b5d1b721feb9c07536076483e657a9fdd"
+checksum = "6103e11eaaae27dc57a82d511da313e90d2e2e49eace9d816397298bf965bb67"
 
 [[package]]
 name = "yoke"

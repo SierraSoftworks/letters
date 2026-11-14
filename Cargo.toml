@@ -47,7 +47,8 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # Reads Hunspell dictionaries. MPL-2.0, used unmodified.
 spellbook = "0.4"
 # yewi's highlighter. Its own lexers need no dependencies; the `syntect` feature adds grammars and weight.
-yewi-highlight = "0.1"
+yewi-highlight = "0.3"
+yewi-tokens = "0.3"
 # The accessibility tree's types: plain data, shared by the widgets, the shell and the test harness.
 accesskit = "0.25"
 accesskit_consumer = "0.39"
