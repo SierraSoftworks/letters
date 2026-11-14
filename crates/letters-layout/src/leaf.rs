@@ -2,13 +2,14 @@
 
 use std::ops::Range;
 
-use letters_render::{Color, DisplayList, Item, Point, Rect};
+use letters_render::{DisplayList, Item, Point, Rect};
 use parley::{
     Affinity, Alignment, AlignmentOptions, Cursor, Language, Layout, PositionedLayoutItem, Selection as Span,
 };
 
-use crate::engine::{Brush, Engine, Spec};
+use crate::engine::{Engine, Spec};
 use crate::flow::{Leaf, Marker, Role, Type, Types, What, marks};
+use crate::ink::{Back, Brush, Ink, Inks};
 use crate::theme;
 
 /// A leaf's layout, kept while the leaf is near the viewport.
@@ -27,8 +28,8 @@ pub(crate) fn shape(
     layout: &mut Layout<Brush>,
 ) {
     let (of, code) = (types.get(leaf.role), types.get(Role::Code));
-    let color = if leaf.what == What::Label { theme::MUTED } else { of.color };
-    let spec = |bits: u8| marked(of, code, leaf.role == Role::Code, color, bits);
+    let ink = if leaf.what == What::Label { Ink::Marker } else { Ink::Style(leaf.role) };
+    let spec = |bits: u8| marked(of, code, leaf.role == Role::Code, ink, bits);
     let mut specs = Vec::with_capacity(leaf.spans.len().max(1));
     let mut runs = Vec::with_capacity(leaf.spans.len().max(1));
     if leaf.spans.is_empty() {
@@ -57,8 +58,8 @@ pub(crate) fn shape(
 }
 
 /// How text of type `of` looks under a set of marks.
-fn marked<'a>(of: &'a Type, code: &'a Type, mono: bool, color: Color, bits: u8) -> Spec<'a> {
-    let mut spec = of.spec(mono, Brush { color, back: None });
+fn marked<'a>(of: &'a Type, code: &'a Type, mono: bool, ink: Ink, bits: u8) -> Spec<'a> {
+    let mut spec = of.spec(mono, Brush { ink, back: None });
     if bits & marks::BOLD != 0 {
         // Bold must still stand out in a type that is already heavy.
         spec.weight = if of.weight >= 600.0 { (of.weight + 200.0).min(900.0) } else { 700.0 };
@@ -70,13 +71,13 @@ fn marked<'a>(of: &'a Type, code: &'a Type, mono: bool, color: Color, bits: u8) 
     if bits & marks::CODE != 0 {
         (spec.family, spec.mono) = (&code.family, true);
         spec.size = of.size * theme::INLINE_CODE_SCALE;
-        spec.brush.back = Some(theme::CODE_INLINE);
+        spec.brush.back = Some(Back::Code);
     }
     if bits & marks::HIGHLIGHT != 0 {
-        spec.brush.back = Some(theme::HIGHLIGHT);
+        spec.brush.back = Some(Back::Highlight);
     }
     if bits & marks::LINK != 0 {
-        spec.brush.color = theme::LINK;
+        spec.brush.ink = Ink::Link;
     }
     spec.underline = bits & (marks::UNDERLINE | marks::LINK) != 0;
     spec.strike = bits & marks::STRIKE != 0;
@@ -94,12 +95,12 @@ pub(crate) fn lay(engine: &mut Engine, types: &Types, leaf: &Leaf, locale: Optio
     shape(engine, types, leaf, locale, &mut text);
     let of = types.get(leaf.role);
     let sign = match leaf.marker {
-        Marker::Number(number) => Some((format!("{number}."), of.color, of.size)),
-        Marker::Task(true) => Some(("\u{2713}".to_string(), theme::ON_ACCENT, theme::CHECKBOX * 0.8)),
+        Marker::Number(number) => Some((format!("{number}."), Ink::Marker, of.size)),
+        Marker::Task(true) => Some(("\u{2713}".to_string(), Ink::OnAccent, theme::CHECKBOX * 0.8)),
         _ => None,
     };
-    let sign = sign.map(|(label, color, size)| {
-        let mut spec = of.spec(false, Brush { color, back: None });
+    let sign = sign.map(|(label, ink, size)| {
+        let mut spec = of.spec(false, Brush { ink, back: None });
         (spec.size, spec.italic) = (size, false);
         let mut layout = Layout::new();
         engine.build(&label, &[spec], &[(0, 0..label.len())], None, &mut layout);
@@ -116,9 +117,11 @@ pub(crate) fn paint(
     leaf: &Leaf,
     laid: &Laid,
     (top, bottom): (f32, f32),
+    inks: &Inks,
     out: &mut DisplayList,
 ) {
     let at = Point { x: leaf.x, y: leaf.y };
+    let palette = &inks.palette;
     if leaf.boxed() {
         let rect = Rect::new(
             leaf.x - leaf.pad,
@@ -127,15 +130,15 @@ pub(crate) fn paint(
             leaf.height + 2.0 * theme::BOX_PAD_Y,
         );
         out.push(match leaf.what {
-            What::Label => Item::Stroke { rect, color: theme::LINE_STRONG, width: 1.0, radius: theme::BOX_RADIUS },
-            _ => Item::Fill { rect, color: theme::CODE_BLOCK, radius: theme::BOX_RADIUS },
+            What::Label => Item::Stroke { rect, color: palette.line_strong, width: 1.0, radius: theme::BOX_RADIUS },
+            _ => Item::Fill { rect, color: palette.code, radius: theme::BOX_RADIUS },
         });
     }
     if let Some(first) = laid.text.get(0)
         && leaf.y + first.metrics().block_min_coord < bottom
         && leaf.y + first.metrics().block_max_coord > top
     {
-        marker(engine, types.get(leaf.role), leaf, laid, first.metrics().baseline, out);
+        marker(engine, types.get(leaf.role), leaf, laid, first.metrics().baseline, inks, out);
     }
     for line in laid.text.lines() {
         let metrics = line.metrics();
@@ -145,7 +148,7 @@ pub(crate) fn paint(
         // Fills go under every glyph of the line, so one run's fill never covers its neighbour's overhang.
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(run) = item else { continue };
-            let Some(color) = run.style().brush.back else { continue };
+            let Some(back) = run.style().brush.back else { continue };
             let font = run.run().font_metrics();
             let rect = Rect::new(
                 at.x + run.offset() - 2.0,
@@ -153,12 +156,12 @@ pub(crate) fn paint(
                 run.advance() + 4.0,
                 font.ascent + font.descent,
             );
-            out.push(Item::Fill { rect, color, radius: theme::INLINE_RADIUS });
+            out.push(Item::Fill { rect, color: inks.back(back), radius: theme::INLINE_RADIUS });
         }
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(run) = item else { continue };
             let style = run.style();
-            out.items.extend(engine.glyphs(&run, at, style.brush.color));
+            out.items.extend(engine.glyphs(&run, at, inks.ink(style.brush.ink)));
             let font = run.run().font_metrics();
             let strokes = [
                 (&style.underline, font.underline_offset, font.underline_size),
@@ -169,14 +172,15 @@ pub(crate) fn paint(
                 let size = stroke.size.unwrap_or(size).max(1.0);
                 let y = at.y + run.baseline() - stroke.offset.unwrap_or(offset);
                 let rect = Rect::new(at.x + run.offset(), y, run.advance(), size);
-                out.push(Item::Fill { rect, color: stroke.brush.color, radius: 0.0 });
+                out.push(Item::Fill { rect, color: inks.ink(stroke.brush.ink), radius: 0.0 });
             }
         }
     }
 }
 
 /// Draws a list item's marker in the indent, level with the first line.
-fn marker(engine: &mut Engine, of: &Type, leaf: &Leaf, laid: &Laid, baseline: f32, out: &mut DisplayList) {
+fn marker(engine: &mut Engine, of: &Type, leaf: &Leaf, laid: &Laid, baseline: f32, inks: &Inks, out: &mut DisplayList) {
+    let palette = &inks.palette;
     let right = leaf.x - theme::MARKER_GAP;
     // The middle of a lower-case letter, which is where a bullet or checkbox looks centred.
     let middle = leaf.y + baseline - of.size * 0.34;
@@ -186,39 +190,39 @@ fn marker(engine: &mut Engine, of: &Type, leaf: &Leaf, laid: &Laid, baseline: f3
             let side = (of.size * 0.36).round().max(3.0);
             let rect = Rect::new(right - side, (middle - side / 2.0).round(), side, side);
             out.push(match depth % 3 {
-                0 => Item::Fill { rect, color: of.color, radius: side / 2.0 },
-                1 => Item::Stroke { rect, color: of.color, width: 1.0, radius: side / 2.0 },
-                _ => Item::Fill { rect, color: of.color, radius: 0.0 },
+                0 => Item::Fill { rect, color: palette.marker, radius: side / 2.0 },
+                1 => Item::Stroke { rect, color: palette.marker, width: 1.0, radius: side / 2.0 },
+                _ => Item::Fill { rect, color: palette.marker, radius: 0.0 },
             });
         }
         Marker::Number(_) => {
             let Some(sign) = &laid.sign else { return };
             let at = Point { x: right - sign.full_width(), y: leaf.y };
-            glyphs(engine, sign, at, out);
+            glyphs(engine, sign, at, inks, out);
         }
         Marker::Task(checked) => {
             let side = theme::CHECKBOX;
             let rect = Rect::new(right - side, (middle - side / 2.0).round(), side, side);
             if !checked {
-                out.push(Item::Stroke { rect, color: theme::LINE_STRONG, width: 1.5, radius: 3.0 });
+                out.push(Item::Stroke { rect, color: palette.line_strong, width: 1.5, radius: 3.0 });
                 return;
             }
-            out.push(Item::Fill { rect, color: theme::ACCENT, radius: 3.0 });
+            out.push(Item::Fill { rect, color: palette.accent, radius: 3.0 });
             let Some(sign) = &laid.sign else { return };
             let at = Point {
                 x: rect.x + (side - sign.full_width()) / 2.0,
                 y: rect.y + ((side - sign.height()) / 2.0).round(),
             };
-            glyphs(engine, sign, at, out);
+            glyphs(engine, sign, at, inks, out);
         }
     }
 }
 
-fn glyphs(engine: &mut Engine, layout: &Layout<Brush>, at: Point, out: &mut DisplayList) {
+fn glyphs(engine: &mut Engine, layout: &Layout<Brush>, at: Point, inks: &Inks, out: &mut DisplayList) {
     for line in layout.lines() {
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(run) = item else { continue };
-            out.items.extend(engine.glyphs(&run, at, run.style().brush.color));
+            out.items.extend(engine.glyphs(&run, at, inks.ink(run.style().brush.ink)));
         }
     }
 }

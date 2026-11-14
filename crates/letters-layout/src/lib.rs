@@ -7,10 +7,15 @@
 //! height estimated from the amount of text it holds, and is laid out with Parley the first time something
 //! asks about it. An edit redoes only the blocks it touched. [`DocLayout::settle`] replaces the remaining
 //! estimates a little at a time while the shell is idle.
+//!
+//! Text takes its colours from the document's style and everything else from a [`Palette`]. Layout has no
+//! theme of its own.
 
 mod engine;
 mod flow;
+mod ink;
 mod leaf;
+mod palette;
 mod shape;
 mod theme;
 
@@ -22,9 +27,11 @@ use letters_model::{BlockId, Body, Change, Document, Pos, Selection, Style};
 use letters_render::{DisplayList, Font, Item, Point, Rect};
 use parley::{Language, Layout};
 
-use crate::engine::{Brush, Engine};
+use crate::engine::Engine;
 use crate::flow::{Frame, Leaf, Look, Types, What};
+use crate::ink::{Brush, Inks};
 
+pub use crate::palette::{Callout, Palette, Scheme, Syntax};
 pub use crate::shape::{FontSpec, ShapedRun, ShapedText, Shaper};
 
 /// The fonts layout may use. The shell supplies them, since the core never reads files.
@@ -73,6 +80,7 @@ impl DocLayout {
         let state = State {
             engine: Engine::new(&fonts),
             types: Types::default(),
+            palette: Palette::default(),
             style: None,
             locale: None,
             width: 0.0,
@@ -93,6 +101,12 @@ impl DocLayout {
     /// style, and otherwise names what an edit touched.
     pub fn update(&mut self, doc: &Document, style: &Style, width: f32, change: Option<&Change>) {
         self.state.get_mut().update(doc, style, width, change);
+    }
+
+    /// Sets the colours to paint with, [`Palette::LIGHT`] until then. Nothing is laid out again, so a change
+    /// of theme costs one paint.
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.state.get_mut().palette = palette;
     }
 
     /// The height of the whole document. Partly an estimate until [`DocLayout::settle`] returns `false`.
@@ -150,6 +164,7 @@ impl DocLayout {
 struct State {
     engine: Engine,
     types: Types,
+    palette: Palette,
     /// The style `types` was resolved from.
     style: Option<Style>,
     locale: Option<Language>,
@@ -328,6 +343,8 @@ impl State {
     fn paint(&mut self, viewport: Rect, out: &mut DisplayList) {
         let band = (viewport.y, viewport.y + viewport.height);
         let (first, end) = self.show(band.0, band.1);
+        let inks = Inks::new(&self.types, self.palette);
+        let palette = &inks.palette;
         // Frames go behind what they hold, outermost first. They are numbered in that order.
         let mut frames: Vec<usize> = Vec::new();
         for leaf in &self.leaves[first..end] {
@@ -344,10 +361,10 @@ impl State {
             let rect = Rect::new(frame.x, top, frame.width, bottom - top);
             let bar = Rect { width: theme::BAR, ..rect };
             match frame.look {
-                Look::Quote => out.push(Item::Fill { rect: bar, color: theme::LINE_STRONG, radius: theme::BAR / 2.0 }),
+                Look::Quote => out.push(Item::Fill { rect: bar, color: palette.line_strong, radius: theme::BAR / 2.0 }),
                 Look::Callout(tone) => {
-                    let (accent, soft) = theme::tone(tone);
-                    out.push(Item::Fill { rect, color: soft, radius: theme::BOX_RADIUS });
+                    let Callout { accent, fill } = palette.callout(tone);
+                    out.push(Item::Fill { rect, color: fill, radius: theme::BOX_RADIUS });
                     // The accent follows the rounded corners.
                     out.push(Item::PushClip { rect, radius: theme::BOX_RADIUS });
                     out.push(Item::Fill { rect: bar, color: accent, radius: 0.0 });
@@ -362,9 +379,9 @@ impl State {
             let leaf = &leaves[at];
             if leaf.what == What::Rule {
                 let rect = Rect::new(leaf.x, leaf.y, leaf.width, leaf.height);
-                out.push(Item::Fill { rect, color: theme::LINE, radius: 0.0 });
+                out.push(Item::Fill { rect, color: palette.line, radius: 0.0 });
             } else if let Some(laid) = &leaf.laid {
-                leaf::paint(engine, types, leaf, laid, band, out);
+                leaf::paint(engine, types, leaf, laid, band, &inks, out);
             }
         }
     }

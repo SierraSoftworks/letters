@@ -1,6 +1,6 @@
 //! Document layout through its public interface, with the bundled fonts.
 
-use letters_layout::{DocLayout, FontSpec, Fonts, Shaper};
+use letters_layout::{Callout, DocLayout, FontSpec, Fonts, Palette, Scheme, Shaper};
 use letters_model::{
     Block, BlockKind, Body, Document, ListKind, Mark, Model, Op, Pos, Run, Selection, Style, TextStyle, Tone,
 };
@@ -54,6 +54,19 @@ fn extent(item: &Item) -> Option<(f32, f32)> {
         Item::Glyphs { origin, size, .. } => Some((origin.y - size, origin.y + size / 4.0)),
         _ => None,
     }
+}
+
+fn color_of(item: &Item) -> Option<Color> {
+    match item {
+        Item::Fill { color, .. } | Item::Stroke { color, .. } | Item::Glyphs { color, .. } => Some(*color),
+        _ => None,
+    }
+}
+
+/// A dark page: the default palette with yewi's dark surface and text.
+fn dark() -> Palette {
+    let (page, text) = (Color::rgb(0x22, 0x22, 0x24), Color::rgb(0xd0, 0xd0, 0xd1));
+    Palette { scheme: Scheme::Dark, page, text, ..Palette::LIGHT }
 }
 
 fn glyph_runs(items: &[Item]) -> impl Iterator<Item = &Item> {
@@ -466,4 +479,88 @@ fn plain_strings_are_shaped_for_widgets() {
     let [Item::Glyphs { origin, glyphs, .. }] = &list.items[..] else { panic!("one run of glyphs") };
     assert_eq!((origin.x, origin.y), (10.0, 20.0 + label.baseline));
     assert_eq!(glyphs.len(), text.len());
+}
+
+#[test]
+fn the_palette_colours_what_the_style_does_not() {
+    const LOUD: Color = Color::rgb(1, 200, 3);
+    let light = Palette::LIGHT;
+    let item = |list| Block::text("a", BlockKind::ListItem { list, depth: 0 }, "Item");
+    let run = |run: Run| Block { body: Body::Text(vec![run]), ..paragraph("a", "") };
+    let warning = || container("c", BlockKind::Callout { tone: Tone::Warn }, vec![paragraph("a", "Rates")]);
+    let cases: Vec<(&str, Palette, Block)> = vec![
+        (
+            "a link",
+            Palette { link: LOUD, ..light },
+            run(Run { link: Some("https://a.example".into()), ..Run::plain("a") }),
+        ),
+        ("a bullet", Palette { marker: LOUD, ..light }, item(ListKind::Bullet)),
+        ("a number", Palette { marker: LOUD, ..light }, item(ListKind::Ordered)),
+        ("a ticked box", Palette { accent: LOUD, ..light }, item(ListKind::Task { checked: true })),
+        ("a tick", Palette { on_accent: LOUD, ..light }, item(ListKind::Task { checked: true })),
+        ("an unticked box", Palette { line_strong: LOUD, ..light }, item(ListKind::Task { checked: false })),
+        ("a divider", Palette { line: LOUD, ..light }, Block::new("d", BlockKind::Divider)),
+        (
+            "a quote",
+            Palette { line_strong: LOUD, ..light },
+            container("q", BlockKind::Quote, vec![paragraph("a", "Rates")]),
+        ),
+        (
+            "a code block",
+            Palette { code: LOUD, ..light },
+            Block::text("a", BlockKind::Code { language: None }, "let x;"),
+        ),
+        ("inline code", Palette { inline_code: LOUD, ..light }, run(Run::marked("x", [Mark::Code]))),
+        ("a highlight", Palette { highlight: LOUD, ..light }, run(Run::marked("x", [Mark::Highlight]))),
+        ("a callout's bar", Palette { warn: Callout { accent: LOUD, ..light.warn }, ..light }, warning()),
+        ("a callout's fill", Palette { warn: Callout { fill: LOUD, ..light.warn }, ..light }, warning()),
+        (
+            "an unsupported block",
+            Palette { marker: LOUD, ..light },
+            Block::new("u", BlockKind::Unknown { type_name: "chart".into() }),
+        ),
+    ];
+    for (name, palette, block) in cases {
+        let mut layout = laid(&doc(vec![block]));
+        let before = painted(&layout, everything());
+        let height = layout.height();
+        assert!(!before.iter().any(|item| color_of(item) == Some(LOUD)), "{name} starts in the light palette");
+        layout.set_palette(palette);
+        let after = painted(&layout, everything());
+        assert!(after.iter().any(|item| color_of(item) == Some(LOUD)), "{name} takes the palette's colour");
+        assert_eq!((after.len(), layout.height()), (before.len(), height), "{name} keeps its layout");
+    }
+}
+
+#[test]
+fn a_dark_page_recolours_the_style() {
+    let (light, dark) = (Palette::LIGHT, dark());
+    let near = |a: Color, b: Color| [(a.r, b.r), (a.g, b.g), (a.b, b.b)].iter().all(|(a, b)| a.abs_diff(*b) <= 2);
+    let brightness = |color: Color| u32::from(color.r) + u32::from(color.g) + u32::from(color.b);
+    let (navy, brick) = (Color::rgb(0x1a, 0x3c, 0x8e), Color::rgb(0xa0, 0x1c, 0x1c));
+
+    let cases = [("the light page's text", light.text, dark.text), ("the light page", light.page, dark.page)];
+    for (name, written, shown) in cases {
+        assert_eq!(light.recolor(written), written, "a light page shows {name} as written");
+        assert!(near(dark.recolor(written), shown), "{name} becomes {:?}", dark.recolor(written));
+    }
+    let greys: Vec<u32> = (0..=255).step_by(15).map(|v| brightness(dark.recolor(Color::rgb(v, v, v)))).collect();
+    assert!(greys.windows(2).all(|pair| pair[0] >= pair[1]), "darker ink is lighter text, in order: {greys:?}");
+    let (blue, red) = (dark.recolor(navy), dark.recolor(brick));
+    assert!(blue.b > blue.r && blue.b > blue.g && brightness(blue) > brightness(navy), "navy stays blue: {blue:?}");
+    assert!(red.r > red.g && red.r > red.b && brightness(red) > brightness(brick), "brick stays red: {red:?}");
+    assert_eq!(dark.recolor(Color::rgba(10, 20, 30, 77)).a, 77, "transparency is kept");
+
+    let mut style = Style::default();
+    style.types.get_mut("body").unwrap().color = "#1a3c8e".into();
+    style.types.get_mut("heading1").unwrap().color = "not a colour".into();
+    let blocks = vec![Block::text("h", BlockKind::Heading { level: 1 }, "Rates"), paragraph("a", "Rates")];
+    let mut layout = DocLayout::new(fonts());
+    layout.update(&doc(blocks), &style, WIDTH, None);
+    for (palette, body) in [(light, navy), (dark, blue)] {
+        layout.set_palette(palette);
+        let items = painted(&layout, everything());
+        let colors: Vec<_> = glyph_runs(&items).filter_map(color_of).collect();
+        assert_eq!(colors, [palette.text, body], "a colour that cannot be read falls back to the palette's text");
+    }
 }

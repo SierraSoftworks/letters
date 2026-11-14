@@ -6,7 +6,8 @@ use letters_render::{Color, DisplayList, Font, Glyph, Item, Point};
 use parley::{Layout, LineHeight, PositionedLayoutItem};
 
 use crate::Fonts;
-use crate::engine::{Brush, Engine, Spec};
+use crate::engine::{Engine, Spec};
+use crate::ink::Brush;
 
 /// The face a plain string is set in.
 #[derive(Clone, Copy, Debug, PartialEq)]

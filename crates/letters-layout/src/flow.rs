@@ -5,7 +5,8 @@ use letters_model::{Align, Block, BlockId, BlockKind, Body, Document, ListKind, 
 use letters_render::Color;
 use parley::{Alignment, Layout, LineHeight};
 
-use crate::engine::{Brush, Engine, Spec};
+use crate::engine::{Engine, Spec};
+use crate::ink::Brush;
 use crate::leaf::Laid;
 use crate::theme;
 
@@ -41,7 +42,8 @@ pub(crate) struct Type {
     pub weight: f32,
     pub italic: bool,
     pub size: f32,
-    pub color: Color,
+    /// `None` when the style's colour cannot be read, which shows as the palette's text colour.
+    pub color: Option<Color>,
     pub align: Alignment,
     /// The height of a line. Whole pixels, so baselines stay crisp.
     pub line: f32,
@@ -94,6 +96,11 @@ impl Types {
 
     pub fn get(&self, role: Role) -> &Type {
         &self.0[role as usize]
+    }
+
+    /// Each role's colour, in the order of [`Role`].
+    pub fn colors(&self) -> impl Iterator<Item = Option<Color>> {
+        self.0.iter().map(|of| of.color)
     }
 }
 

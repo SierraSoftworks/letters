@@ -13,13 +13,7 @@ use parley::{
 };
 
 use crate::Fonts;
-
-/// What Parley carries for each styled range: the text colour and any fill behind the text.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct Brush {
-    pub color: Color,
-    pub back: Option<Color>,
-}
+use crate::ink::Brush;
 
 /// How one stretch of text is set.
 #[derive(Clone, Copy, Debug, PartialEq)]
