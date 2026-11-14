@@ -7,11 +7,13 @@
 mod doc;
 mod json;
 mod model;
+mod notes;
 mod pos;
 mod style;
 
 pub use doc::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Run, Tone};
 pub use json::JsonError;
 pub use model::{Change, Model, Op, OpError};
+pub use notes::{Anchor, NOTES_FORMAT, Note, NoteKind, Notes, Reply, Version};
 pub use pos::{Pos, Selection};
 pub use style::{Align, Page, STYLE_FORMAT, Style, TextStyle};
