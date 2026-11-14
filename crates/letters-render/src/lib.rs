@@ -6,6 +6,8 @@
 use std::sync::Arc;
 
 pub mod cpu;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod image;
 mod paint;
 
@@ -182,5 +184,27 @@ pub struct DisplayList {
 impl DisplayList {
     pub fn push(&mut self, item: Item) {
         self.items.push(item);
+    }
+
+    /// Moves the items from index `from` onward by `by`. A caller that paints something in its own
+    /// coordinates (a page, a widget) uses this to place what was just emitted.
+    pub fn translate(&mut self, from: usize, by: Point) {
+        for item in self.items.iter_mut().skip(from) {
+            match item {
+                Item::Fill { rect, .. }
+                | Item::Stroke { rect, .. }
+                | Item::Shadow { rect, .. }
+                | Item::Image { rect, .. }
+                | Item::PushClip { rect, .. } => {
+                    rect.x += by.x;
+                    rect.y += by.y;
+                }
+                Item::Glyphs { origin, .. } | Item::Path { origin, .. } => {
+                    origin.x += by.x;
+                    origin.y += by.y;
+                }
+                Item::PopClip => {}
+            }
+        }
     }
 }

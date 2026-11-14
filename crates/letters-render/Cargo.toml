@@ -11,12 +11,19 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The GPU backend. The shell turns it on, so the wasm-clean core never builds it.
+gpu = ["dep:vello_gpu", "dep:wgpu"]
+
 [dependencies]
 bytemuck.workspace = true
 glifo.workspace = true
 image.workspace = true
 skrifa.workspace = true
 vello_cpu.workspace = true
+vello_gpu = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
 
 [dev-dependencies]
 letters-fonts.workspace = true
+pollster.workspace = true

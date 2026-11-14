@@ -401,6 +401,26 @@ fn a_renderer_is_reused_across_frames_and_sizes() {
 }
 
 #[test]
+fn a_list_can_be_moved_after_it_is_emitted() {
+    let mut scene = list([fill(0.0, 0.0, 10.0, 10.0, RED)]);
+    let first = scene.items.len();
+    scene.items.extend([
+        Item::PushClip { rect: Rect::new(0.0, 0.0, 10.0, 10.0), radius: 0.0 },
+        fill(0.0, 0.0, 30.0, 30.0, BLUE),
+        Item::PopClip,
+        text(&sans(700.0), 14.0, BLACK, Point { x: 14.0, y: 9.0 }, "I"),
+    ]);
+    scene.translate(first, Point { x: 30.0, y: 20.0 });
+    let frame = render(&scene, 60, 40, 1.0);
+
+    assert_eq!(at(&frame, 5, 5), RED, "items before the index stay put");
+    assert_eq!(at(&frame, 35, 25), BLUE, "the clipped fill moved with its clip");
+    assert_eq!(at(&frame, 45, 35), WHITE, "the clip still limits it");
+    assert!(ink(&frame, 42, 18, 10, 12) > 0, "the text moved");
+    assert_eq!(ink(&frame, 12, 0, 10, 10), 0, "nothing is left where the text was");
+}
+
+#[test]
 fn a_frame_converts_to_window_pixels() {
     let frame = render(&list([fill(1.0, 0.0, 1.0, 1.0, Color::rgb(0x12, 0x34, 0x56))]), 2, 1, 1.0);
     let mut window = [0xdead_beef_u32; 2];
