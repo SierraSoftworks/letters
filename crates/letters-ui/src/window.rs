@@ -208,6 +208,10 @@ impl Platform for Lent<'_> {
     fn lines(&self) -> Option<&dyn Lines> {
         Some(&self.lines)
     }
+
+    fn store_asset(&mut self, name: &str, bytes: &[u8]) {
+        self.platform.store_asset(name, bytes);
+    }
 }
 
 pub struct EditorApp {
