@@ -4,18 +4,20 @@
 //! - [`Package`] is everything that goes into a file. [`write`] turns it into bytes, and [`write_over`] does
 //!   the same over an older copy, copying what did not change without recompressing it.
 //! - [`save`] replaces a file on a shared folder without locks: read, merge, write beside, rename.
+//! - [`WorkingCopy`] is a document in memory between saves, and merges with any other copy of it.
 //! - [`schema`] holds the JSON Schemas of the public entries.
 //!
 //! Nothing here touches the filesystem or the clock. The shell supplies readers, writers, ids and dates.
 
 mod name;
 mod save;
+mod working;
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Seek, Write};
 
-use letters_model::{Document, JsonError, Notes, Style};
+use letters_model::{Document, HistoryError, JsonError, Notes, Style};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
@@ -23,6 +25,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 pub use name::suggested_name;
 pub use save::{DiskCopy, Files, Replica, Save, Saved, Stamp, conflict_copy_of, save};
+pub use working::{OPLOG, WorkingCopy};
 
 /// The media type of a `.let` file, stored in its first entry.
 pub const MIMETYPE: &str = "application/vnd.letters.document+zip";
@@ -53,6 +56,8 @@ pub enum Error {
     Document(JsonError),
     Style(JsonError),
     Notes(JsonError),
+    /// The history could not be read or merged.
+    History(HistoryError),
     /// The file holds a different document, named here by its id.
     OtherDocument(String),
     /// The file holds changes that memory could not take in, so replacing it would lose them.
@@ -73,6 +78,7 @@ impl fmt::Display for Error {
             Self::Document(error) => write!(f, "{DOCUMENT}: {error}"),
             Self::Style(error) => write!(f, "{STYLE}: {error}"),
             Self::Notes(error) => write!(f, "{NOTES}: {error}"),
+            Self::History(error) => write!(f, "{HISTORY}: {error}"),
             Self::OtherDocument(id) => write!(f, "the file holds another document ({id})"),
             Self::Unmerged => f.write_str("the file holds changes that could not be merged"),
             Self::Files(message) => write!(f, "the folder could not be used: {message}"),
