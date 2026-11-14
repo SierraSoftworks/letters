@@ -14,6 +14,7 @@ server that adds identity, sharing and sync without owning any content.
 - `crates/letters-ui`: the native widgets and the editor window's panels.
 - `crates/letters-convert`: import and export.
 - `crates/letters-spell`: spell checking with Hunspell dictionaries, English bundled.
+- `crates/letters-trust`: safe mode, trusted sources and the guards on remote image fetches.
 - `crates/letters-test`: the headless interaction-test harness.
 - `apps/letters`: the desktop app.
 

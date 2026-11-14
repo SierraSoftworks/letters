@@ -21,6 +21,7 @@ letters-ui = { path = "crates/letters-ui" }
 letters-convert = { path = "crates/letters-convert" }
 letters-spell = { path = "crates/letters-spell" }
 letters-math = { path = "crates/letters-math" }
+letters-trust = { path = "crates/letters-trust" }
 letters-test = { path = "crates/letters-test" }
 
 serde = "1"
@@ -59,6 +60,8 @@ ratex-parser = "0.1.15"
 ratex-layout = "0.1.15"
 ratex-types = "0.1.15"
 ratex-font = "0.1.15"
+# Edits the user's settings file and keeps their comments and layout.
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 
 # The desktop shell. None of these may reach the core crates.
 winit = "0.30"
