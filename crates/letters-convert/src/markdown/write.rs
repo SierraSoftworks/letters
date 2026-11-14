@@ -365,6 +365,7 @@ impl<'a> Inline<'a> {
             && segments.get(i + 1).is_none_or(|(_, next)| next.link != format.link);
         alone
             && format.marks & CODE == 0
+            && !url.contains('$')
             && self.chars[range.clone()].iter().copied().eq(url.chars())
             && (2..=32).contains(&scheme.len())
             && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
@@ -458,7 +459,8 @@ fn destination(url: &str) -> String {
     let mut out = String::new();
     for (i, c) in chars.iter().enumerate() {
         let escaped = match c {
-            '\\' | '<' | '>' => true,
+            // A dollar here could pair with one in the text and read as maths.
+            '\\' | '<' | '>' | '$' => true,
             '(' | ')' => !pointed,
             '&' => is_reference(&chars[i + 1..]),
             _ => false,

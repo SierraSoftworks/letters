@@ -339,6 +339,7 @@ fn keeps_marks_where_delimiters_would_not_read_back() {
         vec![Run::marked("\"quoted\"", [Mark::Italic]), Run::plain("s")],
         vec![bold("*"), Run::marked("_", [Mark::Italic]), Run::marked("~", [Mark::Strike])],
         vec![Run { link: Some(String::new()), ..Run::marked("]:", [Mark::Code]) }],
+        vec![Run::plain("$5 at "), linked("the shop", "/pay?in=$")],
     ];
     for runs in cases {
         let before = doc(vec![with_text(BlockKind::Paragraph, runs)]);
@@ -432,7 +433,15 @@ fn any_runs() -> impl Strategy<Value = Vec<Run>> {
         3 => proptest::sample::subsequence(marks.to_vec(), 1..=2),
         1 => proptest::sample::subsequence(marks.to_vec(), 0..=6),
     ];
-    let urls = vec!["https://example.com/a?b=1&c=2", "/relative path", "", "x(y)&amp;z\\", "<q>"];
+    let urls = vec![
+        "https://example.com/a?b=1&c=2",
+        "/relative path",
+        "",
+        "x(y)&amp;z\\",
+        "<q>",
+        "/pay?in=$",
+        "https://a.b/$c",
+    ];
     let link = proptest::option::weighted(0.2, proptest::sample::select(urls));
     let run = (any_text(), marks, link)
         .prop_map(|(text, marks, link)| Run { link: link.map(str::to_owned), ..Run::marked(text, marks) });
