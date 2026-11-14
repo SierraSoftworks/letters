@@ -250,8 +250,8 @@ impl Shell {
                         page.set_title(&name);
                     }
                 }
-                // There are no files to open or start until the page has a server behind it.
-                Request::Open(_) | Request::OpenDialog | Request::New => {}
+                // Opening, starting, renaming and moving need files, which wait for a server behind the page.
+                _ => {}
             }
         }
         if self.view.needs_paint() && !self.frame_due {
