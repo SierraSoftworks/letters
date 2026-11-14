@@ -10,7 +10,9 @@ mod damage;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod image;
+
 mod paint;
+pub mod pdf;
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
 

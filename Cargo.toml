@@ -44,6 +44,10 @@ glifo = { version = "0.5", default-features = false, features = ["std"] }
 # The font reader inside glifo: same version as its.
 skrifa = "0.49"
 bytemuck = "1"
+# Writes PDF: font subsets, text that can be selected, outlines and links. Without its own text shaping.
+krilla = { version = "0.8", default-features = false, features = ["raster-images"] }
+# Reads and draws PDF, by krilla's authors. For tests of what letters-render writes.
+hayro = "0.9"
 # Text shaping and line breaking. No system fonts: only the bundled faces are registered.
 parley = { version = "0.13", default-features = false, features = ["std"] }
 pulldown-cmark = { version = "0.13", default-features = false }

@@ -21,12 +21,14 @@ snapshot = []
 bytemuck.workspace = true
 glifo.workspace = true
 image.workspace = true
+krilla.workspace = true
 skrifa.workspace = true
 vello_cpu.workspace = true
 vello_gpu = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
 
 [dev-dependencies]
+hayro.workspace = true
 letters-fonts.workspace = true
 # Turns the snapshot feature on for this crate's own tests.
 letters-render = { workspace = true, features = ["snapshot"] }
