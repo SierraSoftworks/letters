@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::cmp::Ordering;
+
 use common::{doc, pair, sync, typed};
 use letters_model::{
     Change, Document, Extra, Model, Op, OpError, Page, Properties, PropertiesFormat, ReplicaId, Style, TextStyle,
@@ -166,6 +168,16 @@ fn a_file_opens_with_the_style_it_holds() {
         other.merge(&model.save()).unwrap();
         assert_eq!(other.style(), &style, "{name}");
     }
+}
+
+#[test]
+fn a_model_given_no_style_takes_the_one_its_file_holds() {
+    let history = Model::new(doc(), ReplicaId::from(1)).with_style(narrow()).save();
+    let mut model = Model::new(doc(), ReplicaId::from(2));
+    let change = model.attach(Model::new(doc(), ReplicaId::from(2)).prepare(Some(&history)).unwrap());
+    assert!(change.style && change.blocks.is_empty());
+    assert_eq!(model.style(), &narrow());
+    assert_eq!(model.compare(&history), Ok(Some(Ordering::Equal)), "nothing is written for it");
 }
 
 #[test]

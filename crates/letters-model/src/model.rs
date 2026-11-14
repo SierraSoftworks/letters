@@ -202,6 +202,9 @@ pub struct Model {
     /// One entry per block, in document order.
     index: Vec<Entry>,
     style: Style,
+    /// Whether the style is this model's own: given to it, edited, or read from its history. The built-in
+    /// style a model starts with is not, and gives way to the style of a history it is handed.
+    styled: bool,
     replica: ReplicaId,
     /// Started from the document when something first needs it, unless one is attached before.
     history: OnceLock<History>,
@@ -243,7 +246,7 @@ impl Model {
         doc.blocks = built.blocks;
         crdt::normal_meta(&mut doc);
         let (index, style) = (built.index, Style::default());
-        Self { doc, index, style, replica, history: OnceLock::new(), steps: Steps::default() }
+        Self { doc, index, style, styled: false, replica, history: OnceLock::new(), steps: Steps::default() }
     }
 
     /// The model with the style its file holds, for one that was just made.
@@ -254,6 +257,7 @@ impl Model {
             // Only an older revision refuses a style, and a model that was just made shows none.
             Some(_) => drop(self.rewrite_style(style)),
         }
+        self.styled = true;
         self
     }
 
@@ -265,7 +269,8 @@ impl Model {
         let history = History::open(loro, replica);
         let (doc, index) = crdt::read(&history.loro, &history.body);
         let style = crdt::read_style(&history.loro);
-        Ok(Self { doc, index, style, replica, history: OnceLock::from(history), steps: Steps::default() })
+        let (history, steps) = (OnceLock::from(history), Steps::default());
+        Ok(Self { doc, index, style, styled: true, replica, history, steps })
     }
 
     /// A second replica at the newest revision, for another writer. It starts with no undo steps.
@@ -275,7 +280,8 @@ impl Model {
             // Both then start the same history from the same document.
             None => {
                 let (doc, index, style) = (self.doc.clone(), self.index.clone(), self.style.clone());
-                Self { doc, index, style, replica, history: OnceLock::new(), steps: Steps::default() }
+                let (history, steps) = (OnceLock::new(), Steps::default());
+                Self { doc, index, style, styled: self.styled, replica, history, steps }
             }
         }
     }
@@ -286,6 +292,7 @@ impl Model {
     ///
     /// A document or style that is not the newest in `history` was changed outside Letters. The history
     /// takes that in as one more change, as [`Model::rewrite`] does, so the file is always the document.
+    /// A model that was given no style has none to hold against the history's.
     pub fn prepare(self, history: Option<&[u8]>) -> Result<Prepared, HistoryError> {
         let model = match history {
             None => self,
@@ -293,7 +300,9 @@ impl Model {
                 let mut model = Self::load(history, self.replica)?;
                 // A history that was just loaded shows its newest revision, which can be rewritten.
                 let _ = model.rewrite(self.doc);
-                let _ = model.rewrite_style(self.style);
+                if self.styled {
+                    let _ = model.rewrite_style(self.style);
+                }
                 model
             }
         };
@@ -303,7 +312,7 @@ impl Model {
 
     /// Takes over a history that [`Model::prepare`] made for the document this model shows. The document
     /// and its style stay as they are: what was edited in the meantime goes into that history as one
-    /// change.
+    /// change. Only a model that was given no style takes the history's, and says so in the change.
     ///
     /// Until a file's history is attached, the model keeps one that starts at the document, which is all
     /// a file without a history needs. When the file has one, revisions and stable positions taken before
@@ -330,10 +339,10 @@ impl Model {
             let _ = self.adopt(shown.clone(), false);
             change.absorb(diff(&shown, &self.doc));
         }
-        if style != self.style {
+        if mem::replace(&mut self.styled, true) && style != self.style {
             let _ = self.adopt_style(style.clone(), false);
-            change.style |= style != self.style;
         }
+        change.style |= style != self.style;
         // An undo step counts characters, so it holds for as long as the sequence is laid out as before.
         let alike =
             |a: &Entry, b: &Entry| (a.marker, a.chars, a.depth, &a.stored) == (b.marker, b.chars, b.depth, &b.stored);
@@ -399,6 +408,7 @@ impl Model {
             return Err(OpError::ReadOnly);
         }
         let style = crdt::normal_style(&style);
+        self.styled = true;
         let mut change = Change::default();
         if style != self.style {
             if outside {
@@ -505,6 +515,7 @@ impl Model {
             let mut assigns = crdt::meta_assigns(self.loro(), &self.doc, &fields);
             if style != self.style {
                 assigns.extend(crdt::style_assigns(self.loro(), &style));
+                self.styled = true;
             }
             step.insert(0, Edit::Set(self.set(&assigns, &mut change)));
         }
