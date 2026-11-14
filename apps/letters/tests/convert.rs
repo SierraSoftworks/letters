@@ -5,6 +5,16 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use hayro::hayro_interpret::font::GlyphRun;
+use hayro::hayro_interpret::hayro_cmap::BfString;
+use hayro::hayro_interpret::{
+    BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image as Drawn, ImageDrawProps, InterpreterCache,
+    InterpreterSettings, SoftMask, interpret_page,
+};
+use hayro::hayro_syntax::Pdf;
+use hayro::hayro_syntax::object::{Array, Dict, String as Bytes};
+use hayro::hayro_syntax::page::Page;
+use hayro::kurbo::{Affine, BezPath};
 use letters_format::{Archive, Package};
 use letters_model::{Anchor, Block, BlockKind, Document, Mark, Note, NoteKind, Notes, Run, Style};
 
@@ -346,4 +356,121 @@ fn import_refuses_what_only_looks_like_word() {
     // An older file says how to get one that can be read.
     assert!(lines[0]["error"].as_str().unwrap().contains(".docx"), "{}", lines[0]);
     assert!(!folder.path("old.let").exists() && !folder.path("torn.let").exists());
+}
+
+/// Collects the text of a PDF page in the order it is drawn.
+#[derive(Default)]
+struct Reader(String);
+
+impl<'a> Device<'a> for Reader {
+    fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {
+        for glyph in run.glyphs() {
+            match glyph.as_unicode() {
+                Some(BfString::Char(character)) => self.0.push(character),
+                Some(BfString::String(text)) => self.0.push_str(&text),
+                None => {}
+            }
+        }
+    }
+
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_image(&mut self, _: Drawn<'a, '_>, _: ImageDrawProps<'a>) {}
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// Text without its white space. A PDF holds no line ends, so this is what a page's text is compared as.
+fn squeezed(text: &str) -> String {
+    text.split_whitespace().collect()
+}
+
+/// The text a reader finds on a page when it is searched or copied, [`squeezed`].
+fn text_on(page: &Page<'_>) -> String {
+    let cache = InterpreterCache::default();
+    let bounds = hayro::kurbo::Rect::new(0.0, 0.0, 1e4, 1e4);
+    let mut context = Context::new(Affine::IDENTITY, bounds, &cache, page.xref(), InterpreterSettings::default());
+    let mut reader = Reader::default();
+    interpret_page(page, &mut context, &mut reader);
+    squeezed(&reader.0)
+}
+
+fn pdf_string(dict: &Dict<'_>, key: &str) -> Option<String> {
+    let bytes = dict.get::<Bytes<'_>>(key)?;
+    Some(String::from_utf8_lossy(bytes.as_bytes()).into_owned())
+}
+
+/// The addresses of the links on a page.
+fn links_on(page: &Page<'_>) -> Vec<String> {
+    let links = page.raw().get::<Array<'_>>("Annots").map(|links| links.iter::<Dict<'_>>().collect::<Vec<_>>());
+    links.unwrap_or_default().iter().filter_map(|link| pdf_string(&link.get::<Dict<'_>>("A")?, "URI")).collect()
+}
+
+/// The outline's titles with the page each leads to, indented by a space for each level below the first.
+fn outline_of(pdf: &Pdf) -> Vec<(String, usize)> {
+    fn walk(pdf: &Pdf, parent: &Dict<'_>, depth: usize, out: &mut Vec<(String, usize)>) {
+        let mut next = parent.get::<Dict<'_>>("First");
+        while let Some(entry) = next {
+            let target = entry.get::<Array<'_>>("Dest").and_then(|place| place.flex_iter().next::<Dict<'_>>());
+            let page =
+                target.and_then(|page| pdf.pages().iter().position(|other| other.raw().obj_id() == page.obj_id()));
+            let title = pdf_string(&entry, "Title").unwrap_or_default();
+            out.push((format!("{}{title}", " ".repeat(depth)), page.unwrap_or(usize::MAX)));
+            walk(pdf, &entry, depth + 1, out);
+            next = entry.get::<Dict<'_>>("Next");
+        }
+    }
+    let mut out = Vec::new();
+    let root = pdf.xref().get::<Dict<'_>>(pdf.xref().root_id()).expect("a PDF has a catalogue");
+    if let Some(outline) = root.get::<Dict<'_>>("Outlines") {
+        walk(pdf, &outline, 0, &mut out);
+    }
+    out
+}
+
+#[test]
+fn export_writes_a_pdf_a_reader_can_search_and_find_its_way_in() {
+    let folder = Folder::new("pdf");
+    let filler = "Every household on the scheme should check the notice that arrives in December. ".repeat(6);
+    let markdown = format!(
+        "# Rates\n\nRates change in January, as [the notice](https://example.com/rates?year=2027) and \
+         [a trap](javascript:alert(1)) say.\n\n```rust\nlet rate = 4;\n```\n\n{}## Appeals\n\nAppeals close in March.\n",
+        format!("{filler}\n\n").repeat(12)
+    );
+    folder.write("Rates.md", markdown);
+    assert!(folder.letters(&["import", "Rates.md"]).ok);
+
+    let run = folder.letters(&["export", "Rates.let", "--to", "pdf"]);
+    assert!(run.ok, "{}", run.stderr);
+    let pdf = Pdf::new(fs::read(folder.path("Rates.pdf")).unwrap()).expect("a reader can open the PDF");
+    let pages = pdf.pages();
+    let text: Vec<String> = pages.iter().map(text_on).collect();
+
+    // The document runs over more than one sheet of the style's paper, which is A4.
+    assert!(pages.len() > 1, "{} pages", pages.len());
+    for page in pages.iter() {
+        let (width, height) = page.render_dimensions();
+        assert_eq!((width.round(), height.round()), (595.0, 842.0));
+    }
+
+    // Text is text, in reading order from the first page to the last.
+    assert!(
+        text[0].starts_with(&squeezed("Rates Rates change in January, as the notice and a trap say.")),
+        "{}",
+        text[0]
+    );
+    assert!(text[0].contains(&squeezed("let rate = 4;")), "{}", text[0]);
+    assert!(text.last().unwrap().contains(&squeezed("Appeals close in March.")), "{:?}", text.last());
+    assert_eq!(text.concat().matches(&squeezed("check the notice that arrives in December.")).count(), 72);
+
+    // Links open what they name, unless that would run script.
+    assert_eq!(links_on(&pages[0]), ["https://example.com/rates?year=2027"]);
+
+    // The headings are the outline, each leading to the page it is on.
+    let appeals = text.iter().position(|page| page.contains("Appealsclose")).unwrap();
+    assert!(appeals > 0, "the last heading is on a later page");
+    assert_eq!(outline_of(&pdf), [("Rates".to_owned(), 0), (" Appeals".to_owned(), appeals)]);
+    let title = pdf.metadata().title.as_deref().map(|title| String::from_utf8_lossy(title).into_owned());
+    assert_eq!(title.as_deref(), Some("Rates"));
 }

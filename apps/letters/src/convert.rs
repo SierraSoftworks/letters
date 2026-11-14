@@ -1,6 +1,6 @@
 //! The `export` and `import` subcommands: documents to and from other formats, with no window.
 //!
-//! - [`export`] writes one document as Markdown, as a single HTML file or as a Word document.
+//! - [`export`] writes one document as Markdown, as a single HTML file, as a Word document or as a PDF.
 //! - [`import`] makes a document beside each Markdown or Word file and prints a line for each.
 //!
 //! Neither changes a file that is already there: an export asks for `--force` first, and an import skips.
@@ -11,8 +11,9 @@ use std::io::{self, Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
-use letters_convert::{ImportNote, from_docx, from_markdown, to_docx, to_html, to_markdown};
+use letters_convert::{ImportNote, from_docx, from_markdown, to_docx, to_html, to_markdown, to_pdf};
 use letters_format::{Archive, Package};
+use letters_layout::Fonts;
 use letters_model::{Anchor, Block, BlockKind, Body, Document, Mark, Note, NoteKind, Notes, Run, Style};
 use serde_json::json;
 
@@ -61,6 +62,10 @@ fn try_export(export: &Export) -> Result<(), String> {
             let notes = archive.notes().unwrap_or_default();
             to_docx(&document, &style, &notes, &title, &mut |name| archive.read(name).ok().flatten())
         }
+        Format::Pdf => {
+            let fonts = Fonts { faces: letters_fonts::bundled() };
+            to_pdf(&document, &style, fonts, &title).map_err(|error| failed(&error))?
+        }
     };
 
     let output = match &export.output {
@@ -82,7 +87,7 @@ fn try_export(export: &Export) -> Result<(), String> {
 fn simplified(document: &Document, to: Format) -> Vec<String> {
     let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     // HTML and Word already write figures, which the model has yet to learn.
-    let known = |name: &str| to != Format::Markdown && name == "figure";
+    let known = |name: &str| matches!(to, Format::Html | Format::Docx) && name == "figure";
     let lost = |block: &&Block| matches!(&block.kind, BlockKind::Unknown { type_name } if !known(type_name));
     let unknown = document.walk().filter(lost).count();
     let other = |run: &&Run| run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)));
@@ -90,7 +95,9 @@ fn simplified(document: &Document, to: Format) -> Vec<String> {
     let mut lines = Vec::new();
     if unknown > 0 {
         let blocks = count(unknown, "block is", "blocks are");
-        lines.push(format!("{blocks} of a kind this version does not know, and written as fallback text"));
+        // A page shows what the screen shows, which for these is a placeholder that names the kind.
+        let shown = if to == Format::Pdf { "shown as a placeholder" } else { "written as fallback text" };
+        lines.push(format!("{blocks} of a kind this version does not know, and {shown}"));
     }
     if marks > 0 {
         lines.push(format!(

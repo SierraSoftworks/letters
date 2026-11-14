@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 pub const USAGE: &str = "\
 Usage: letters [OPTIONS] [FILE]
-       letters export --to md|html|docx [OPTIONS] FILE
+       letters export --to md|html|docx|pdf [OPTIONS] FILE
        letters import [OPTIONS] PATH...
 
 Opens FILE, or a new document when none is given.
@@ -19,8 +19,8 @@ Options:
   -V, --version
   -h, --help
 
-Export writes FILE as Markdown, one HTML file or a Word document, beside it unless told otherwise:
-      --to md|html|docx    The format to write
+Export writes FILE as Markdown, one HTML file, a Word document or a PDF, beside it unless told otherwise:
+      --to FORMAT          The format to write: md, html, docx or pdf
   -o, --output PATH        Where to write, or - for standard output
   -f, --force              Replace the output if it is already there
 
@@ -59,6 +59,7 @@ pub enum Format {
     Markdown,
     Html,
     Docx,
+    Pdf,
 }
 
 impl Format {
@@ -68,6 +69,7 @@ impl Format {
             Self::Markdown => "md",
             Self::Html => "html",
             Self::Docx => "docx",
+            Self::Pdf => "pdf",
         }
     }
 }
@@ -190,7 +192,8 @@ fn parse_export(args: impl Iterator<Item = OsString>) -> Result<Command, String>
                     Some("md" | "markdown") => Format::Markdown,
                     Some("html") => Format::Html,
                     Some("docx") => Format::Docx,
-                    _ => return Err("--to takes md, html or docx".into()),
+                    Some("pdf") => Format::Pdf,
+                    _ => return Err("--to takes md, html, docx or pdf".into()),
                 });
             }
             Arg::Flag(name @ ("-o" | "--output"), inline) => {
