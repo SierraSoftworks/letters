@@ -3,6 +3,7 @@
 //! [`Window`] is what a shell shows and the test harness drives. The page is a canvas holding what the
 //! document's layout painted for the part in view. Everything around it is made of the toolkit's widgets.
 
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
@@ -15,6 +16,7 @@ use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 use crate::color::{fade, resolve, same};
 use crate::describe::{self, Request};
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
+use crate::highlight;
 use crate::icon::{self, Icon};
 use crate::paint::scrollbar;
 use crate::restyle::{self, Field, StyleEdit, Styles};
@@ -226,6 +228,8 @@ pub struct EditorApp {
     /// What is typed into one of the style's fields, and the element type it was typed for.
     draft: Option<(Field, &'static str, String)>,
     folded: Folded,
+    /// What each code block was last coloured for: its text and language, hashed.
+    lexed: HashMap<BlockId, u64>,
     dragging: bool,
 }
 
@@ -248,6 +252,7 @@ impl EditorApp {
             link: None,
             draft: None,
             folded: Folded::default(),
+            lexed: HashMap::new(),
             dragging: false,
         }
     }
@@ -284,6 +289,34 @@ impl EditorApp {
         self.reveal();
     }
 
+    /// Colours the code blocks among `changed`, or every one in the document. A block is lexed again only
+    /// when its text or language is not what it was last lexed for, so a keystroke lexes one block at most.
+    fn highlight(&mut self, changed: Option<&BTreeSet<BlockId>>) {
+        let doc = self.editor.doc();
+        let blocks: Vec<&Block> = match changed {
+            Some(changed) => changed.iter().filter_map(|id| doc.block(id)).collect(),
+            None => doc.walk().collect(),
+        };
+        let mut lexed = HashMap::new();
+        for block in blocks {
+            let BlockKind::Code { language } = &block.kind else { continue };
+            let text = block.plain_text();
+            let mut hasher = DefaultHasher::new();
+            (&text, language).hash(&mut hasher);
+            let key = hasher.finish();
+            if self.lexed.get(&block.id) != Some(&key) {
+                let language = language.as_deref().unwrap_or_default();
+                self.layout.set_tokens(&block.id, highlight::tokens(&text, language));
+            }
+            lexed.insert(block.id.clone(), key);
+        }
+        // A walk of the whole document also forgets the blocks that are gone.
+        match changed {
+            Some(_) => self.lexed.extend(lexed),
+            None => self.lexed = lexed,
+        }
+    }
+
     /// Runs something on the editor, which may ask the layout about lines while it works.
     fn edit(&mut self, platform: &mut dyn Platform, act: impl FnOnce(&mut Editor, &mut dyn Platform) -> Change) {
         let mut lent = Lent { platform, lines: DocLines::new(&self.layout, self.height) };
@@ -297,6 +330,7 @@ impl EditorApp {
             self.edits += 1;
             self.layout.update(self.editor.doc(), &self.style, self.column.1, Some(change));
             self.estimated = true;
+            self.highlight((!change.structure).then_some(&change.blocks));
         }
         self.reveal();
     }
@@ -362,7 +396,6 @@ impl EditorApp {
         }
     }
 
-    /// The block the caret is in.
     /// Lays the document out for the room it has and paints the part in view.
     fn page(&mut self, room: Size) -> Element<Message> {
         let page = &self.style.page;
@@ -371,6 +404,7 @@ impl EditorApp {
         let left = ((room.width - width) / 2.0).max(0.0).round();
         if width != self.column.1 {
             self.layout.update(self.editor.doc(), &self.style, width, None);
+            self.highlight(None);
         }
         (self.column, self.height) = ((left, width), room.height);
         // What is about to show is laid out for real. The rest waits for idle time.

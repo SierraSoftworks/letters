@@ -543,6 +543,24 @@ fn folding_puts_an_open_menu_away_and_leaves_focus_on_the_page() {
 }
 
 #[test]
+fn code_is_coloured_for_its_language_and_stays_so_as_it_is_typed() {
+    let mut ed = Harness::doc("```rust\nlet first = 1;\n```\n\n```\nlet second = 2;\n```\n");
+    let keyword = letters_ui::tokens::SYNTAX_KEYWORD.light;
+    let keywords = |ed: &mut Harness| {
+        let inked = |item: &&Item| match item {
+            Item::Glyphs { color, .. } => (color.r, color.g, color.b) == (keyword.r, keyword.g, keyword.b),
+            _ => false,
+        };
+        ed.paint().items.iter().filter(inked).count()
+    };
+    assert_eq!(keywords(&mut ed), 1, "the block that names a language has its keyword coloured, the other none");
+
+    ed.select("first");
+    ed.key("End").key("Enter").type_text("fn main() {}");
+    assert_eq!(keywords(&mut ed), 2, "a keyword typed into the block is coloured too");
+}
+
+#[test]
 fn undo_and_redo_are_offered_when_there_is_something_to_take_back() {
     let mut ed = Harness::doc("Quote.");
     let offered = |ed: &mut Harness| ["Undo", "Redo"].map(|name| !ed.find(Role::Button, name).unwrap().disabled);

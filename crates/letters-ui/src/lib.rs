@@ -10,6 +10,7 @@ mod access;
 pub mod color;
 mod describe;
 mod element;
+mod highlight;
 pub mod icon;
 mod input;
 mod layout;
