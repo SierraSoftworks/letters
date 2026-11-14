@@ -51,9 +51,16 @@
       "properties": {
         "block": { "type": "string", "minLength": 1, "description": "The id of a block in document.json." },
         "start": { "type": "integer", "minimum": 0 },
-        "end": { "type": "integer", "minimum": 0 }
+        "end": { "type": "integer", "minimum": 0 },
+        "stable_start": { "$ref": "#/$defs/stable" },
+        "stable_end": { "$ref": "#/$defs/stable" }
       },
-      "dependentRequired": { "start": ["end"], "end": ["start"] }
+      "dependentRequired": {
+        "start": ["end"],
+        "end": ["start"],
+        "stable_start": ["stable_end", "start"],
+        "stable_end": ["stable_start", "start"]
+      }
     },
     "version": {
       "type": "object",
@@ -73,6 +80,11 @@
         "created": { "$ref": "#/$defs/time" },
         "content": { "$ref": "document.schema.json#/$defs/runs" }
       }
+    },
+    "stable": {
+      "type": "string",
+      "pattern": "^(end|[0-9]+@[0-9]+\\+?)$",
+      "description": "One end of the range as a position in the document's history, which Letters uses to keep the anchor on its text through edits and merges. Other tools keep it as written, and drop both when they change the range."
     },
     "author": { "type": "string", "minLength": 1, "description": "The name shown beside the note." },
     "time": { "type": "string", "minLength": 1, "format": "date-time", "description": "RFC 3339." }

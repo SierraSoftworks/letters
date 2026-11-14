@@ -9,7 +9,7 @@ use std::ops::Range;
 use serde_json::{Map, Value};
 
 use crate::json::{Result, err, object, string, write_extra};
-use crate::{Block, BlockId, Extra, Run};
+use crate::{Block, BlockId, Extra, Hold, Model, Pos, Run, StablePos};
 
 /// The `notes.json` format version this build reads and writes.
 pub const NOTES_FORMAT: u32 = 1;
@@ -67,16 +67,43 @@ pub struct Anchor {
     pub block: BlockId,
     /// UTF-8 bytes into the block's text. `None` anchors the whole block.
     pub range: Option<Range<usize>>,
+    /// The two ends of the range as positions that stay with their text. The block and range above say where
+    /// those are in the `document.json` beside them, for readers that know nothing of the history.
+    pub stable: Option<(StablePos, StablePos)>,
     pub extra: Extra,
 }
 
 impl Anchor {
     pub fn block(block: impl Into<BlockId>) -> Self {
-        Self { block: block.into(), range: None, extra: Extra::new() }
+        Self { block: block.into(), range: None, stable: None, extra: Extra::new() }
     }
 
     pub fn range(block: impl Into<BlockId>, range: Range<usize>) -> Self {
-        Self { block: block.into(), range: Some(range), extra: Extra::new() }
+        Self { block: block.into(), range: Some(range), stable: None, extra: Extra::new() }
+    }
+
+    /// Ties the range to the text it covers in `model`, so that it can [`follow`](Self::follow) that text.
+    /// Leaves alone a whole block, a range that is already tied and one that is not in the document.
+    pub fn pin(&mut self, model: &Model) {
+        if let (None, Some(range)) = (&self.stable, &self.range) {
+            let start = model.stable(&Pos::new(self.block.clone(), range.start), Hold::Next);
+            let end = model.stable(&Pos::new(self.block.clone(), range.end), Hold::Prev);
+            self.stable = start.zip(end);
+        }
+    }
+
+    /// Moves the block and range to where the text is now, after edits or a merge. A passage that a split
+    /// spread over several blocks keeps the part in its first block.
+    pub fn follow(&mut self, model: &Model) {
+        let Some((start, end)) = &self.stable else { return };
+        let (Some(start), Some(end)) = (model.resolve(start), model.resolve(end)) else { return };
+        let end = if end.block == start.block {
+            end.offset.max(start.offset)
+        } else {
+            model.doc().block(&start.block).map_or(start.offset, |block| block.plain_text().len())
+        };
+        self.range = Some(start.offset..end);
+        self.block = start.block;
     }
 }
 
@@ -123,6 +150,16 @@ impl Notes {
 }
 
 impl Notes {
+    /// Ties every anchor to the text it covers in `model`. See [`Anchor::pin`].
+    pub fn pin(&mut self, model: &Model) {
+        self.notes.iter_mut().for_each(|note| note.anchor.pin(model));
+    }
+
+    /// Moves every anchor to where its text is now. See [`Anchor::follow`].
+    pub fn follow(&mut self, model: &Model) {
+        self.notes.iter_mut().for_each(|note| note.anchor.follow(model));
+    }
+
     /// Takes in the notes of another copy of the document. Returns whether anything here changed.
     ///
     /// The result depends only on the two sets of notes, never on which side merges or in what order, so every
@@ -241,7 +278,17 @@ fn read_anchor(value: Value, path: &str) -> Result<Anchor> {
         (Some(_), Some(_)) => return err(&format!("{path}.end"), "the end comes before the start"),
         _ => return err(path, "expected both start and end, or neither"),
     };
-    Ok(Anchor { block, range, extra: map.into_iter().collect() })
+    let mut stable = |key: &str| match string(&mut map, key, path)?.map(|text| text.parse::<StablePos>()) {
+        None => Ok(None),
+        Some(Ok(stable)) => Ok(Some(stable)),
+        Some(Err(_)) => err(&format!("{path}.{key}"), "expected a stable position"),
+    };
+    let stable = match (stable("stable_start")?, stable("stable_end")?) {
+        (Some(start), Some(end)) if range.is_some() => Some((start, end)),
+        (None, None) => None,
+        _ => return err(path, "expected stable_start and stable_end beside a start and end, or neither"),
+    };
+    Ok(Anchor { block, range, stable, extra: map.into_iter().collect() })
 }
 
 fn read_version(value: Value, path: &str) -> Result<Version> {
@@ -279,6 +326,10 @@ fn write_note(note: &Note) -> Value {
     if let Some(range) = &note.anchor.range {
         anchor.insert("start".into(), range.start.into());
         anchor.insert("end".into(), range.end.into());
+    }
+    if let Some((start, end)) = &note.anchor.stable {
+        anchor.insert("stable_start".into(), start.to_string().into());
+        anchor.insert("stable_end".into(), end.to_string().into());
     }
     write_extra(&mut anchor, &note.anchor.extra);
     map.insert("anchor".into(), anchor.into());

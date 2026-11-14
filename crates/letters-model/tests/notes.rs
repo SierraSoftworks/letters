@@ -1,4 +1,6 @@
-use letters_model::{Anchor, Block, BlockKind, Note, NoteKind, Notes, Reply, Run, Version};
+use letters_model::{
+    Anchor, Block, BlockKind, Document, Model, Note, NoteKind, Notes, Op, Pos, ReplicaId, Reply, Run, Version,
+};
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
@@ -106,6 +108,15 @@ fn schema_breaks_are_refused_with_their_path() {
         (with(set("anchor", json!({ "block": "b", "start": 1 }))), "notes[0].anchor"),
         (with(set("anchor", json!({ "block": "b", "start": 5, "end": 2 }))), "notes[0].anchor.end"),
         (with(set("anchor", json!({ "block": "b", "start": -1, "end": 2 }))), "notes[0].anchor.start"),
+        (
+            with(set(
+                "anchor",
+                json!({ "block": "b", "start": 1, "end": 2, "stable_start": "soon", "stable_end": "end" }),
+            )),
+            "notes[0].anchor.stable_start",
+        ),
+        (with(set("anchor", json!({ "block": "b", "start": 1, "end": 2, "stable_end": "end" }))), "notes[0].anchor"),
+        (with(set("anchor", json!({ "block": "b", "stable_start": "end", "stable_end": "end" }))), "notes[0].anchor"),
         (with(set("content", json!([{ "marks": ["bold"] }]))), "notes[0].content[0].text"),
         (with(set("replies", json!([{ "created": "2026" }]))), "notes[0].replies[0].author"),
         (with(set("type", "conflict".into())), "notes[0].versions"),
@@ -154,6 +165,59 @@ fn merging_keeps_every_note_reply_and_resolution() {
     let authors: Vec<&str> = n1.replies.iter().map(|reply| reply.author.as_str()).collect();
     assert_eq!(authors, ["Ben", "Ana"]);
     assert!(!ours.merge(&theirs), "a merge that adds nothing changes nothing");
+}
+
+/// A model of one paragraph `p` reading "Hello world", and a note pinned on "world".
+fn pinned(replica: u64) -> (Model, Notes) {
+    let doc = Document { blocks: vec![Block::text("p", BlockKind::Paragraph, "Hello world")], ..Document::default() };
+    let model = Model::new(doc, ReplicaId::from(replica));
+    let mut notes = Notes {
+        notes: vec![Note { anchor: Anchor::range("p", 6..11), ..note("n", NoteKind::Comment) }],
+        ..Notes::default()
+    };
+    notes.pin(&model);
+    (model, notes)
+}
+
+/// The text an anchor covers now.
+fn covered(model: &Model, anchor: &Anchor) -> String {
+    let text = model.doc().block(&anchor.block).unwrap().plain_text();
+    text[anchor.range.clone().unwrap()].to_owned()
+}
+
+#[test]
+fn an_anchor_follows_its_text_through_edits() {
+    let typed = |offset: usize, text: &str| Op::InsertText { at: Pos::new("p", offset), text: text.into() };
+    let cases = [
+        ("typing before it", vec![typed(0, "Oh. ")], "world"),
+        ("typing inside it", vec![typed(8, "---")], "wo---rld"),
+        ("typing at its ends", vec![typed(11, "!"), typed(6, "big ")], "world"),
+        ("a split before it", vec![Op::Split { at: Pos::new("p", 5), new_id: "q".into() }], "world"),
+        ("a split inside it", vec![Op::Split { at: Pos::new("p", 8), new_id: "q".into() }], "wo"),
+        ("deleting part of it", vec![Op::DeleteText { block: "p".into(), range: 4..8 }], "rld"),
+    ];
+    for (why, ops, expected) in cases {
+        let (mut model, mut notes) = pinned(1);
+        model.apply(ops).unwrap();
+        notes.follow(&model);
+        assert_eq!(covered(&model, &notes.notes[0].anchor), expected, "{why}");
+    }
+}
+
+#[test]
+fn an_anchor_follows_its_text_through_a_merge_and_a_save() {
+    let (mut ours, mut notes) = pinned(1);
+    let (mut theirs, _) = pinned(2);
+    theirs.apply([Op::InsertText { at: Pos::new("p", 0), text: "Well, hello. ".into() }]).unwrap();
+    ours.merge(&theirs.save()).unwrap();
+
+    // The stable ends travel in notes.json, so a copy read back from a file follows the text as well.
+    let mut reread = Notes::from_json(&notes.to_json()).unwrap();
+    assert_eq!(reread, notes);
+    reread.follow(&ours);
+    notes.follow(&ours);
+    assert_eq!(reread, notes);
+    assert_eq!(covered(&ours, &notes.notes[0].anchor), "world");
 }
 
 /// A few notes drawn from a small pool of ids, so that two sets often hold different copies of one note.
