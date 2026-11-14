@@ -11,6 +11,7 @@ mod edit;
 mod input;
 mod keymap;
 mod markers;
+mod merge;
 mod motion;
 mod rules;
 mod text;
@@ -26,6 +27,7 @@ use letters_model::{
 pub use keymap::Keymap;
 /// The markers [`Editor::markers`] returns. They live in the model so that layout can draw them.
 pub use letters_model::{Marker, Markers};
+use merge::Kept;
 pub use motion::Lines;
 
 /// Text input, as every platform delivers it. Offsets are UTF-8 bytes relative to the caret's block.
@@ -170,8 +172,8 @@ struct Caret {
 #[derive(Clone, Debug)]
 struct Step {
     count: usize,
-    before: Option<Caret>,
-    after: Option<Caret>,
+    before: Kept,
+    after: Kept,
     kind: Kind,
     at: u64,
 }
@@ -190,7 +192,7 @@ enum Kind {
 #[derive(Clone, Debug)]
 struct Composing {
     range: Range<usize>,
-    before: Option<Caret>,
+    before: Kept,
     at: u64,
 }
 
@@ -214,6 +216,8 @@ pub struct Editor {
     composing: Option<Composing>,
     /// The horizontal position that consecutive vertical moves keep to.
     goal: Option<f32>,
+    /// How many times other writers' edits have been taken in.
+    merges: u64,
 }
 
 impl Editor {
@@ -236,6 +240,7 @@ impl Editor {
             rule: false,
             composing: None,
             goal: None,
+            merges: 0,
         };
         if let Some(pos) = first {
             editor.place(pos);
@@ -245,6 +250,12 @@ impl Editor {
 
     pub fn doc(&self) -> &Document {
         self.model.doc()
+    }
+
+    /// The model, for saving its history and comparing revisions. Other writers' edits come in through
+    /// [`Editor::merge`].
+    pub fn model(&self) -> &Model {
+        &self.model
     }
 
     /// `None` when the document has nowhere to put a caret.
@@ -365,7 +376,7 @@ impl Editor {
         self.end_composition();
         let rule = std::mem::take(&mut self.rule);
         let goal = self.goal.take();
-        let before = self.caret.clone();
+        let before = self.keep();
         let mut kind = Kind::Other;
         match command {
             Command::Move { to, extend } => self.move_to(to, extend, goal, platform),
@@ -442,22 +453,22 @@ impl Editor {
 
     /// Closes the edits made since the last call as one undo step, or adds them to the step before when
     /// they continue it. `fresh` keeps them apart.
-    fn commit(&mut self, before: Option<Caret>, kind: Kind, now: u64, fresh: bool) {
+    fn commit(&mut self, before: Kept, kind: Kind, now: u64, fresh: bool) {
         let count = std::mem::take(&mut self.steps);
         if count == 0 {
             // Moving the caret ends the step, even when it comes back to where it was.
-            if self.caret != before {
+            if self.caret != before.caret {
                 self.seal();
             }
             return;
         }
         self.redo.clear();
-        let after = self.caret.clone();
+        let after = self.keep();
         let grows = !fresh && matches!(kind, Kind::Typing | Kind::Deleting);
         if let Some(last) = self.undo.last_mut()
             && grows
             && last.kind == kind
-            && last.after == before
+            && last.after.caret == before.caret
             && now.saturating_sub(last.at) <= PAUSE_MS
         {
             (last.count, last.after, last.at) = (last.count + count, after, now);
@@ -489,7 +500,7 @@ impl Editor {
                 self.note(change);
             }
         }
-        self.caret = step.before.clone();
+        self.recall(&step.before);
         self.redo.push(step);
         true
     }
@@ -501,7 +512,7 @@ impl Editor {
                 self.note(change);
             }
         }
-        self.caret = step.after.clone();
+        self.recall(&step.after);
         self.undo.push(step);
     }
 

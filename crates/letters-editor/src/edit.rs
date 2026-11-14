@@ -123,11 +123,11 @@ impl Editor {
             ops.push(Op::DeleteText { block: end.block.clone(), range: 0..end.offset });
         }
         self.apply(ops);
-        self.merge(&start.block, &end.block)
+        self.join(&start.block, &end.block)
     }
 
     /// Joins the text block `second` onto `first`, which comes before it. Returns where the two meet.
-    pub(crate) fn merge(&mut self, first: &BlockId, second: &BlockId) -> Pos {
+    pub(crate) fn join(&mut self, first: &BlockId, second: &BlockId) -> Pos {
         let doc = self.doc();
         let (Some(a), Some(b)) = (doc.block(first), doc.block(second)) else { return Pos::new(first.clone(), 0) };
         let seam = text::len(a);
@@ -233,7 +233,7 @@ impl Editor {
         let before = leaves.iter().position(|leaf| leaf.id == id).and_then(|index| index.checked_sub(1));
         let Some(before) = before.map(|index| leaves[index]) else { return };
         if tree::is_text(before) {
-            let pos = self.merge(&before.id.clone(), &id);
+            let pos = self.join(&before.id.clone(), &id);
             self.place_with(pos, caret.marks);
         } else {
             // A divider, or anything else with no text to join, is removed whole.
@@ -248,7 +248,7 @@ impl Editor {
         let after = leaves.iter().position(|leaf| leaf.id == id).and_then(|index| leaves.get(index + 1));
         let Some(after) = after else { return };
         if tree::is_text(after) {
-            let pos = self.merge(&id, &after.id.clone());
+            let pos = self.join(&id, &after.id.clone());
             self.place_with(pos, caret.marks);
         } else {
             self.apply(vec![Op::RemoveBlock { block: tree::removal(doc, &after.id) }]);

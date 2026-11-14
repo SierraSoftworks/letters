@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 
 use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Marker, Modifiers, Platform};
 use letters_model::{Block, BlockKind, Body, Change, Document, ListKind, Mark, Pos, ReplicaId, Run, Selection, Tone};
+use proptest::prelude::*;
 
 /// The marks the notation can write, with their switches. Longer switches come first so they are read first.
 const SWITCHES: [(&str, Mark); 6] = [
@@ -31,6 +32,8 @@ pub struct Fake {
     pub now: u64,
     pub clip: Option<Clip>,
     pub wrap: Option<Wrapped>,
+    /// What this writer's new ids start with, so that two writers never make the same one.
+    pub writer: String,
     ids: u32,
 }
 
@@ -46,7 +49,7 @@ impl Platform for Fake {
     }
     fn new_id(&mut self) -> String {
         self.ids += 1;
-        format!("n{}", self.ids)
+        format!("{}n{}", self.writer, self.ids)
     }
     fn lines(&self) -> Option<&dyn Lines> {
         self.wrap.as_ref().map(|wrap| wrap as &dyn Lines)
@@ -125,6 +128,18 @@ impl Harness {
             editor.select(selection);
         }
         Self { editor, platform: Fake::default() }
+    }
+
+    /// A second writer on the same document, as it stands now.
+    pub fn fork(&self, replica: u64) -> Self {
+        let mut editor = Editor::with_model(self.editor.model().fork(ReplicaId::from(replica)));
+        editor.set_keymap(Keymap::standard());
+        Self { editor, platform: Fake { writer: format!("w{replica}"), ..Fake::default() } }
+    }
+
+    /// Takes in everything `other` has written. Returns whether its history could be read.
+    pub fn merge(&mut self, other: &Self) -> bool {
+        self.editor.merge(&other.editor.model().save()).is_ok()
     }
 
     /// The same, laid out by a fake layout that wraps after `width` characters.
@@ -429,3 +444,159 @@ fn line(block: &Block, selection: Option<&Selection>) -> String {
     }
     format!("{}{kind}{}{text}", "  ".repeat(indent), if text.is_empty() { "" } else { " " })
 }
+
+/// One thing a writer or a shell can do to the editor.
+#[derive(Clone, Debug)]
+pub enum Action {
+    Type(String),
+    Key(&'static str),
+    Run(Command),
+    /// Selects from one block and offset to another, both wrapped into range.
+    Select(usize, usize, usize, usize),
+    Input(InputEvent),
+    Wait(u64),
+}
+
+pub fn action() -> impl Strategy<Value = Action> {
+    let typed = prop::sample::select(vec![
+        "a",
+        "b",
+        " ",
+        " ",
+        "é",
+        "👩‍👧",
+        "*",
+        "*",
+        "`",
+        "~",
+        "#",
+        "-",
+        ">",
+        "[",
+        "]",
+        "(",
+        ")",
+        "!",
+        "x",
+        "1",
+        ".",
+        "\n",
+    ]);
+    let keys = prop::sample::select(vec![
+        "Left",
+        "Right",
+        "Up",
+        "Down",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "Mod+Left",
+        "Mod+Right",
+        "Mod+Up",
+        "Mod+Down",
+        "Mod+Home",
+        "Mod+End",
+        "Shift+Left",
+        "Shift+Right",
+        "Shift+Up",
+        "Shift+Down",
+        "Shift+Mod+Left",
+        "Shift+Mod+End",
+        "Backspace",
+        "Backspace",
+        "Delete",
+        "Mod+Backspace",
+        "Mod+Delete",
+        "Enter",
+        "Enter",
+        "Shift+Enter",
+        "Mod+Enter",
+        "Tab",
+        "Shift+Tab",
+        "Mod+b",
+        "Mod+i",
+        "Mod+e",
+        "Mod+Shift+x",
+        "Mod+u",
+        "Mod+z",
+        "Mod+z",
+        "Mod+Shift+z",
+        "Mod+a",
+        "Mod+c",
+        "Mod+x",
+        "Mod+v",
+        "Mod+v",
+        "Mod+Shift+v",
+    ]);
+    let kinds = prop::sample::select(vec![
+        BlockKind::Paragraph,
+        BlockKind::Heading { level: 2 },
+        BlockKind::ListItem { list: ListKind::Bullet, depth: 0 },
+        BlockKind::ListItem { list: ListKind::Task { checked: true }, depth: 0 },
+        BlockKind::Code { language: None },
+        BlockKind::Quote,
+        BlockKind::Callout { tone: Tone::Tip },
+        BlockKind::Divider,
+    ]);
+    let commands = prop_oneof![
+        kinds.prop_map(Command::SetBlock),
+        Just(Command::SetLink(Some("https://a.example".into()))),
+        Just(Command::SetLink(None)),
+        Just(Command::SelectWord),
+        Just(Command::SelectBlock),
+        Just(Command::ToggleMark(Mark::Highlight)),
+    ];
+    let composed = prop::sample::select(vec!["", "k", "か", "かな"]);
+    let inputs = prop_oneof![
+        (composed.clone(), 0..8usize)
+            .prop_map(|(text, at)| InputEvent::SetComposition { text: text.into(), selection: Some(at..at) }),
+        composed.prop_map(|text| InputEvent::Commit(text.into())),
+        (0..12usize, 0..6usize)
+            .prop_map(|(start, len)| InputEvent::ReplaceRange { range: start..start + len, text: "fix".into() }),
+        (0..4usize, 0..4usize).prop_map(|(before, after)| InputEvent::DeleteSurrounding { before, after }),
+    ];
+    prop_oneof![
+        4 => typed.prop_map(|text| Action::Type(text.into())),
+        4 => keys.prop_map(Action::Key),
+        1 => commands.prop_map(Action::Run),
+        1 => (0..16usize, 0..24usize, 0..16usize, 0..24usize).prop_map(|(a, b, c, d)| Action::Select(a, b, c, d)),
+        1 => inputs.prop_map(Action::Input),
+        1 => prop::sample::select(vec![10u64, 2_000]).prop_map(Action::Wait),
+    ]
+}
+
+pub fn perform(editor: &mut Harness, action: &Action) {
+    match action {
+        Action::Type(text) => editor.type_text(text),
+        Action::Key(name) => _ = editor.editor.key(key(name), &mut editor.platform),
+        Action::Run(command) => _ = editor.run(command.clone()),
+        Action::Input(event) => _ = editor.input(event.clone()),
+        Action::Wait(ms) => editor.platform.now += ms,
+        Action::Select(a, b, c, d) => {
+            let ids: Vec<_> = editor.editor.doc().walk().map(|block| block.id.clone()).collect();
+            if !ids.is_empty() {
+                let pos = |block: &usize, offset: &usize| Pos::new(ids[block % ids.len()].clone(), *offset);
+                editor.editor.select(Selection { anchor: pos(a, b), head: pos(c, d) });
+            }
+        }
+    }
+}
+
+/// What must hold after anything: every block has its own id, and the selection sits on characters of text.
+pub fn check(editor: &Harness) -> Result<(), TestCaseError> {
+    let doc = editor.editor.doc();
+    let ids: BTreeSet<_> = doc.walk().map(|block| &block.id).collect();
+    prop_assert_eq!(ids.len(), doc.walk().count(), "two blocks share an id");
+    if let Some(selection) = editor.editor.selection() {
+        for pos in [&selection.anchor, &selection.head] {
+            let block = doc.block(&pos.block).filter(|block| matches!(block.body, Body::Text(_)));
+            let text = block.map(|block| block.plain_text());
+            prop_assert!(text.is_some_and(|text| text.is_char_boundary(pos.offset)), "the selection is off the text");
+        }
+    }
+    Ok(())
+}
+
+/// A document with every kind of block and mark, for scripts to run on.
+pub const SAMPLE: &str = "h1 A *title*|\np Some **bold** and [linked](https://a.example) text, ünïcödé 👩‍👧.\nul one\n  todo two\nhr\n> p quoted\n> p lines\ntip> p a tip\ncode:rust fn main() {⏎    body();⏎}\np";

@@ -47,7 +47,7 @@ impl Editor {
 
     fn typed(&mut self, text: &str, platform: &mut dyn Platform, now: u64) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let before = self.caret.clone();
+        let before = self.keep();
         if text.is_empty() || !self.ensure_caret(platform) {
             return;
         }
@@ -84,7 +84,7 @@ impl Editor {
     }
 
     fn run_rules(&mut self, platform: &mut dyn Platform, now: u64) {
-        let before = self.caret.clone();
+        let before = self.keep();
         if self.apply_rules(platform) {
             self.commit(before, Kind::Rule, now, true);
             self.rule = true;
@@ -94,7 +94,7 @@ impl Editor {
     /// Shows the text being composed in the document, in place of what the composition showed before.
     fn compose(&mut self, text: &str, selection: Option<Range<usize>>, platform: &mut dyn Platform, now: u64) {
         if self.composing.is_none() {
-            let before = self.caret.clone();
+            let before = self.keep();
             if text.is_empty() || !self.ensure_caret(platform) {
                 return;
             }
@@ -107,7 +107,7 @@ impl Editor {
         if text.is_empty() {
             // The input method gave the composition up, so the document goes back to how it was.
             self.rollback();
-            self.caret = composing.before;
+            self.recall(&composing.before);
             return;
         }
         let block = caret.selection.head.block.clone();
@@ -131,7 +131,7 @@ impl Editor {
         };
         if text.is_empty() {
             self.rollback();
-            self.caret = composing.before;
+            self.recall(&composing.before);
             return;
         }
         let block = caret.selection.head.block.clone();
@@ -145,6 +145,7 @@ impl Editor {
 
     /// Replaces a range of the caret's block, keeping the formatting of the text it replaces.
     fn replace_range(&mut self, range: Range<usize>, replacement: &str, now: u64) {
+        let before = self.keep();
         let Some(caret) = self.caret.clone() else { return };
         let head = caret.selection.head.clone();
         let Some(block) = self.block(&head.block) else { return };
@@ -165,11 +166,12 @@ impl Editor {
             offset if offset > range.start => range.start + replacement.len(),
             offset => offset,
         };
-        self.place_with(Pos::new(head.block, offset), caret.marks.clone());
-        self.commit(Some(caret), Kind::Other, now, true);
+        self.place_with(Pos::new(head.block, offset), caret.marks);
+        self.commit(before, Kind::Other, now, true);
     }
 
     fn delete_surrounding(&mut self, before: usize, after: usize, now: u64) {
+        let kept = self.keep();
         let Some(caret) = self.caret.clone() else { return };
         let (start, end) = self.ordered(&caret.selection);
         let Some(block) = self.block(&start.block).filter(|_| start.block == end.block) else { return };
@@ -182,7 +184,7 @@ impl Editor {
         self.apply(ops.collect());
         let moved = |pos: &Pos| Pos::new(pos.block.clone(), pos.offset - (start.offset - from));
         let selection = Selection { anchor: moved(&caret.selection.anchor), head: moved(&caret.selection.head) };
-        self.caret = Some(Caret { selection, marks: caret.marks.clone() });
-        self.commit(Some(caret), Kind::Deleting, now, false);
+        self.caret = Some(Caret { selection, marks: caret.marks });
+        self.commit(kept, Kind::Deleting, now, false);
     }
 }
