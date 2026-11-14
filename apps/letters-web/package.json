@@ -1,0 +1,13 @@
+{
+  "name": "letters-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "./build.sh",
+    "start": "node serve.mjs",
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}
