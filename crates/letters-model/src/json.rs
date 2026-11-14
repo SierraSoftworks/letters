@@ -247,7 +247,8 @@ fn runs(value: Value, path: &str) -> Result<Vec<Run>> {
         .collect()
 }
 
-const MARKS: [(&str, Mark); 6] = [
+const MARKS: [(&str, Mark); 7] = [
+    ("math", Mark::Math),
     ("bold", Mark::Bold),
     ("italic", Mark::Italic),
     ("underline", Mark::Underline),
@@ -310,6 +311,13 @@ fn write_block(block: &Block) -> Value {
         }
         BlockKind::Divider => "divider",
         BlockKind::Unknown { type_name } => type_name,
+        BlockKind::Figure { .. } => "figure",
+        BlockKind::Gallery { .. } => "gallery",
+        BlockKind::Caption => "caption",
+        BlockKind::Formula => "formula",
+        BlockKind::Table { .. } => "table",
+        BlockKind::TableRow => "table_row",
+        BlockKind::TableCell => "table_cell",
     };
     // `type` reads best straight after `id`, ahead of the fields that depend on it.
     map.shift_insert(1, "type".into(), type_name.into());

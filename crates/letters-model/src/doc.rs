@@ -135,12 +135,34 @@ pub enum BlockKind {
     Unknown {
         type_name: String,
     },
+    // STAND-IN for the shapes the model thread lands. Layout builds against these until then.
+    Figure {
+        asset: Option<String>,
+        src: Option<String>,
+        alt: String,
+        width: f32,
+        height: f32,
+        numbered: bool,
+    },
+    Gallery {
+        numbered: bool,
+    },
+    Caption,
+    Formula,
+    Table {
+        columns: Vec<crate::Align>,
+        header: bool,
+    },
+    TableRow,
+    TableCell,
 }
 
 impl BlockKind {
     pub fn shape(&self) -> BodyShape {
         match self {
             Self::Paragraph | Self::Heading { .. } | Self::ListItem { .. } | Self::Code { .. } => BodyShape::Text,
+            Self::Figure { .. } | Self::Caption | Self::Formula | Self::TableCell => BodyShape::Text,
+            Self::Gallery { .. } | Self::Table { .. } | Self::TableRow => BodyShape::Blocks,
             Self::Quote | Self::Callout { .. } => BodyShape::Blocks,
             Self::Divider | Self::Unknown { .. } => BodyShape::None,
         }
@@ -220,6 +242,8 @@ pub enum Mark {
     Strike,
     Highlight,
     Code,
+    /// STAND-IN: the run's text is TeX, set as a formula in the line.
+    Math,
     /// A mark this build does not know, kept as written.
     Other(String),
 }
