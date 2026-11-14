@@ -2,7 +2,7 @@
 
 use accesskit::{Action, ActionData, ActionRequest, TextPosition, TextSelection, TreeId};
 use letters_model::{Block, BlockKind, Document, Pos, Selection};
-use letters_render::{Item, Point, Rect};
+use letters_render::{Color, Item, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
 use letters_ui::SaveState;
 
@@ -26,6 +26,37 @@ fn long() -> Harness {
     let blocks =
         (0..200).map(|n| text(&format!("p{n}"), BlockKind::Paragraph, "One more line of the letter.")).collect();
     Harness::open(Document { blocks, ..Document::default() })
+}
+
+/// The headings of [`report`], with their levels.
+const REPORT: [(u8, &str); 4] = [(1, "Survey"), (2, "Roof"), (3, "Flashing"), (2, "Gutters")];
+
+/// A long report: each heading of [`REPORT`] over forty paragraphs. Heading `n` is block `s{n}`.
+fn report() -> Harness {
+    let mut blocks = Vec::new();
+    for (n, (level, title)) in REPORT.into_iter().enumerate() {
+        blocks.push(text(&format!("s{n}"), BlockKind::Heading { level }, title));
+        let paragraph = |p| text(&format!("s{n}p{p}"), BlockKind::Paragraph, "One more line of the report.");
+        blocks.extend((0..40).map(paragraph));
+    }
+    Harness::open(Document { blocks, ..Document::default() })
+}
+
+/// The page area.
+fn page(window: &mut Harness) -> Rect {
+    window.find(Role::Document, "Letters").expect("the page").bounds
+}
+
+/// The lines the outline draws, top to bottom, each with its colour.
+fn outline_lines(window: &mut Harness) -> Vec<(Rect, Color)> {
+    let outline = window.find(Role::Navigation, "Outline").expect("the outline").bounds;
+    let line = |item: &Item| match item {
+        Item::Fill { rect, color, .. } if rect.height == 2.0 && outline.contains(Point { x: rect.x, y: rect.y }) => {
+            Some((*rect, *color))
+        }
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(line).collect()
 }
 
 /// Where a position of the document shows in the window.
@@ -55,19 +86,8 @@ fn the_window_opens_on_the_page_with_every_control_reachable() {
     let mut window = letter();
     assert_eq!(window.focused().map(|found| found.role), Some(Role::Document));
     window.assert_open(Role::Toolbar, "Document");
-    let buttons = [
-        "Bold",
-        "Italic",
-        "Underline",
-        "Strikethrough",
-        "Code",
-        "Share",
-        "Outline",
-        "Styles",
-        "Notes",
-        "History",
-        "More",
-    ];
+    let buttons =
+        ["Bold", "Italic", "Underline", "Strikethrough", "Code", "Share", "Styles", "Notes", "History", "More"];
     for name in buttons {
         let button = window.find(Role::Button, name).unwrap_or_else(|| panic!("no {name} button"));
         assert!(
@@ -126,7 +146,7 @@ fn one_side_panel_shows_at_a_time() {
     let mut window = letter();
     // (button pressed, panel showing afterwards)
     let steps = [
-        ("Outline", Some("Outline")),
+        ("Styles", Some("Styles")),
         ("Notes", Some("Notes")),
         ("Notes", None),
         ("History", Some("History")),
@@ -134,7 +154,7 @@ fn one_side_panel_shows_at_a_time() {
     ];
     for (button, showing) in steps {
         window.click(Role::Button, button);
-        for panel in ["Outline", "Styles", "Notes", "History"] {
+        for panel in ["Styles", "Notes", "History"] {
             let open = window.find(Role::Complementary, panel).is_some();
             assert_eq!(open, showing == Some(panel), "{panel} after pressing {button}");
             assert_eq!(window.find(Role::Button, panel).unwrap().toggled, Some(open), "the {panel} button says so");
@@ -143,18 +163,107 @@ fn one_side_panel_shows_at_a_time() {
 }
 
 #[test]
-fn the_outline_lists_headings_and_jumps_to_them() {
-    let mut window = letter();
-    window.click(Role::Button, "Outline");
-    window.assert_open(Role::Link, "Roof repairs");
-    window.click(Role::Link, "Next steps");
-    assert_eq!(head(&window), Pos::new("h2", 0));
+fn the_outline_is_a_line_for_each_heading_stepped_in_by_its_level() {
+    let mut window = report();
+    for (_, title) in REPORT {
+        window.assert_open(Role::Link, title);
+    }
+    let lines: Vec<Rect> = outline_lines(&mut window).into_iter().map(|line| line.0).collect();
+    assert_eq!(lines.len(), REPORT.len(), "one line for each heading");
+    assert!(lines.windows(2).all(|pair| pair[0].y < pair[1].y), "in the document's order, down the page");
+    // Survey is level 1, Roof and Gutters level 2, Flashing level 3.
+    assert!(lines[0].x < lines[1].x && lines[1].x < lines[2].x, "deeper headings step in: {lines:?}");
+    assert_eq!(lines[3].x, lines[1].x, "headings of one level line up");
+
+    let (outline, page) = (window.find(Role::Navigation, "Outline").unwrap().bounds, page(&mut window));
+    assert_eq!((outline.x, outline.y), (page.x, page.y), "at the top left of the page");
+    assert!(outline.width < 40.0 && outline.height < 80.0, "and very small: {outline:?}");
+}
+
+#[test]
+fn an_outline_needs_two_headings() {
+    // (document, whether it has an outline)
+    let cases = [("Text.", false), ("# Title\n\nText.", false), ("# Title\n\nText.\n\n## Part\n\nMore.", true)];
+    for (document, shown) in cases {
+        let mut window = Harness::doc(document);
+        assert_eq!(window.find(Role::Navigation, "Outline").is_some(), shown, "{document:?}");
+    }
+}
+
+#[test]
+fn a_line_of_the_outline_names_its_heading_under_the_pointer() {
+    let mut window = report();
+    window.assert_closed(Role::Tooltip, "Flashing");
+    window.hover(Role::Link, "Flashing").assert_open(Role::Tooltip, "Flashing");
+    let (tip, line) =
+        (window.find(Role::Tooltip, "Flashing").unwrap().bounds, window.find(Role::Link, "Flashing").unwrap());
+    assert!(tip.x >= line.bounds.x + line.bounds.width, "the name shows beside its line: {tip:?}");
+    assert!(tip.y < line.center().y && line.center().y < tip.y + tip.height, "and level with it: {tip:?}");
+
+    window.hover(Role::Link, "Gutters").assert_open(Role::Tooltip, "Gutters").assert_closed(Role::Tooltip, "Flashing");
+    window.ui().pointer_leave();
+    window.assert_closed(Role::Tooltip, "Gutters");
+}
+
+#[test]
+fn pressing_a_line_of_the_outline_brings_its_heading_to_the_top() {
+    // (heading pressed, its block)
+    for (title, block) in [("Roof", "s1"), ("Gutters", "s3"), ("Survey", "s0")] {
+        let mut window = report();
+        window.click(Role::Link, title).paint();
+        assert_eq!(head(&window), Pos::new(block, 0), "the caret goes to {title}");
+        let (caret, page) = (window.ui().caret_rect().unwrap(), page(&mut window));
+        assert!((0.0..80.0).contains(&(caret.y - page.y)), "{title} is at the top of the page: {caret:?}");
+    }
+}
+
+#[test]
+fn the_outline_marks_the_section_in_view() {
+    let mut window = report();
+    let marked = |window: &mut Harness| {
+        let lines = outline_lines(window);
+        let odd = |n: usize| lines.iter().filter(|line| line.1 == lines[n].1).count() == 1;
+        (0..lines.len()).filter(|&n| odd(n)).collect::<Vec<_>>()
+    };
+    assert_eq!(marked(&mut window), [0], "the first section, at the top of the document");
+
+    window.click(Role::Link, "Flashing");
+    window.ui().pointer_leave();
+    assert_eq!(marked(&mut window), [2], "the section brought to the top");
+
+    let page = page(&mut window);
+    window.scroll_at(Point { x: page.x + page.width / 2.0, y: page.y + page.height / 2.0 }, -1.0e6);
+    assert_eq!(marked(&mut window), [0], "and it follows the wheel back");
+}
+
+#[test]
+fn the_wheel_scrolls_the_page_from_over_the_outline() {
+    let mut window = report();
+    window.paint();
+    let (start, over) = (window.ui().caret_rect().unwrap(), window.find(Role::Link, "Roof").unwrap().center());
+    window.scroll_at(over, 300.0).paint();
+    assert_eq!(window.ui().caret_rect().unwrap().y, start.y - 300.0);
+}
+
+#[test]
+fn the_outline_is_one_stop_for_tab_and_the_arrows_move_along_it() {
+    let mut window = report();
+    let focused = |window: &mut Harness| window.focused().map(|found| (found.role, found.name));
+    window.key("Tab");
+    assert_eq!(focused(&mut window), Some((Role::Link, "Survey".into())));
+    window.key("Down").key("Down");
+    assert_eq!(focused(&mut window), Some((Role::Link, "Flashing".into())));
+    window.assert_open(Role::Tooltip, "Flashing");
+
+    window.key("Enter");
+    assert_eq!(head(&window), Pos::new("s2", 0));
+    window.key("Tab");
+    assert_ne!(window.focused().map(|found| found.role), Some(Role::Link), "one press of Tab leaves the outline");
 }
 
 #[test]
 fn the_page_gives_room_to_the_panel() {
     let mut window = letter();
-    let page = |window: &mut Harness| window.find(Role::Document, "Letters").unwrap().bounds;
     let wide = page(&mut window);
     window.click(Role::Button, "Styles");
     let (narrow, panel) = (page(&mut window), window.find(Role::Complementary, "Styles").unwrap().bounds);

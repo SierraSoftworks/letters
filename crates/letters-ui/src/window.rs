@@ -16,11 +16,11 @@ use crate::describe::{self, Request};
 use crate::element::{Cursor, Element, Paint, Pointer};
 use crate::icon::{self, Icon};
 use crate::paint::scrollbar;
-use crate::style::{Align, Edges, Justify, Look, Ring};
+use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::text::{FontShaper, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::ui::{App, Ui};
-use crate::widgets::{Button, Menu, MenuItem, Popover, SidePanel, TextField, TopBar, side_panel, top_bar};
+use crate::widgets::{Button, Menu, MenuItem, Popover, Side, SidePanel, TextField, TopBar, side_panel, top_bar};
 
 /// Space kept beside the text column.
 const GUTTER: f32 = 24.0;
@@ -31,6 +31,16 @@ const PT: f32 = 96.0 / 72.0;
 const CARET_WIDTH: f32 = 1.5;
 /// How much text one idle step lays out, in bytes. Small enough to fit between two frames.
 const SETTLE_BYTES: usize = 4096;
+
+/// The chapters control: where it sits in the page's corner, and the size of its lines.
+const CHAPTERS_INSET: Edges = Edges::xy(6.0, 16.0);
+const CHAPTER_LINE: Size = Size { width: 12.0, height: 2.0 };
+/// How far a line steps in for each level below the document's shallowest heading, and the most steps it
+/// takes: headings run from level 1 to 4.
+const CHAPTER_INDENT: f32 = 3.0;
+const CHAPTER_STEPS: u8 = 3;
+/// The room a line takes down the control, and the least it closes up to in a document of many headings.
+const CHAPTER_PITCH: (f32, f32) = (8.0, 4.0);
 
 /// The editor's window.
 pub type Window = Ui<EditorApp>;
@@ -47,23 +57,17 @@ pub enum SaveState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Panel {
-    Outline,
     Styles,
     Notes,
     History,
 }
 
 impl Panel {
-    const ALL: [(Panel, Icon); 4] = [
-        (Panel::Outline, icon::LIST_TREE),
-        (Panel::Styles, icon::PALETTE),
-        (Panel::Notes, icon::MESSAGE_SQUARE),
-        (Panel::History, icon::HISTORY),
-    ];
+    const ALL: [(Panel, Icon); 3] =
+        [(Panel::Styles, icon::PALETTE), (Panel::Notes, icon::MESSAGE_SQUARE), (Panel::History, icon::HISTORY)];
 
     fn title(self) -> &'static str {
         match self {
-            Panel::Outline => "Outline",
             Panel::Styles => "Styles",
             Panel::Notes => "Notes",
             Panel::History => "History",
@@ -80,7 +84,7 @@ pub enum Message {
     Panel(Panel),
     ClosePanel,
     Share(bool),
-    /// Puts the caret at the start of a block.
+    /// Puts the caret at the start of a block and brings the block to the top of the page.
     Jump(BlockId),
     /// Opens the link editor at the caret.
     EditLink,
@@ -378,6 +382,76 @@ impl EditorApp {
         element
     }
 
+    /// The heading the top of the view is under.
+    fn section(&self) -> Option<&BlockId> {
+        // A heading brought to the top sits just under the page's top margin.
+        let top = self.layout.hit(Point { x: 0.0, y: self.scroll + CHAPTER_PITCH.0 })?;
+        let mut section = None;
+        for block in self.editor.doc().walk() {
+            if matches!(block.kind, BlockKind::Heading { .. }) {
+                section = Some(&block.id);
+            }
+            if block.id == top.block {
+                break;
+            }
+        }
+        section
+    }
+
+    /// The document's outline, at the top left of the page: one short line per heading, stepped in by its
+    /// level. A line names its heading in a tooltip, and pressing it brings the heading to the top.
+    fn chapters(&self) -> Option<Element<Message>> {
+        let level = |block: &Block| match block.kind {
+            BlockKind::Heading { level } => Some(level),
+            _ => None,
+        };
+        let headings: Vec<(&Block, u8)> =
+            self.editor.doc().walk().filter_map(|block| Some((block, level(block)?))).collect();
+        let shallowest = headings.iter().map(|heading| heading.1).min()?;
+        // One heading is no outline.
+        if headings.len() < 2 {
+            return None;
+        }
+        // The lines close up when the page has no room for them all.
+        let room = (self.height - CHAPTERS_INSET.vertical()).max(0.0);
+        let pitch = (room / headings.len() as f32).floor().clamp(CHAPTER_PITCH.1, CHAPTER_PITCH.0);
+        let width = CHAPTER_LINE.width + f32::from(CHAPTER_STEPS) * CHAPTER_INDENT;
+        let section = self.section();
+
+        let line = |(block, level): (&Block, u8)| {
+            let title = Some(block.plain_text()).filter(|title| !title.trim().is_empty());
+            let title = title.unwrap_or_else(|| "Untitled".into());
+            let here = section == Some(&block.id);
+            let mark = Element::row().width(CHAPTER_LINE.width).height(CHAPTER_LINE.height).radius(1.0).inked();
+            Element::row()
+                .key(block.id.as_str())
+                .align(Align::Center)
+                .width(width)
+                .height(pitch)
+                .padding(Edges::left(CHAPTER_INDENT * f32::from((level - shallowest).min(CHAPTER_STEPS))))
+                .fg(if here { tokens::ACCENT } else { fade(tokens::FG_MUTED, 0.5) })
+                .hover(Look::NONE.with_fg(tokens::FG))
+                .focused(Look::NONE.with_fg(tokens::FG))
+                .ring(Ring::Outline(0.0))
+                .role(Role::Link)
+                .label(title.clone())
+                .tooltip(title, Side::Right)
+                .on_press(Message::Jump(block.id.clone()))
+                .child(mark)
+        };
+        let chapters = Element::column()
+            .overlay()
+            .padding(CHAPTERS_INSET)
+            .max_height(self.height)
+            .clip()
+            .role(Role::Navigation)
+            .label("Outline")
+            .arrows(Dir::Column)
+            .one_stop()
+            .children(headings.into_iter().map(line));
+        Some(chapters)
+    }
+
     fn bar(&self) -> Element<Message> {
         let name = if self.name.is_empty() { "Untitled" } else { &self.name };
         let (state_icon, state) = match self.save {
@@ -449,12 +523,10 @@ impl EditorApp {
 
     fn side(&self, panel: Panel) -> Element<Message> {
         let rows: Vec<Element<Message>> = match panel {
-            Panel::Outline => self.editor.doc().walk().filter_map(outline_row).collect(),
             Panel::Styles => self.style.types.iter().map(|(name, style)| style_row(name, style)).collect(),
             Panel::Notes | Panel::History => Vec::new(),
         };
         let empty = match panel {
-            Panel::Outline => "Headings appear here as the document grows.",
             Panel::Styles => "This document has no styles.",
             Panel::Notes => "No open notes.",
             Panel::History => "No earlier versions yet.",
@@ -480,6 +552,7 @@ impl App for EditorApp {
         let panel = self.panel.map(|panel| self.side(panel));
         let room = window.width - if panel.is_some() { side_panel::WIDTH } else { 0.0 };
         let page = self.page(Size { width: room.max(0.0), height: (window.height - top_bar::HEIGHT).max(0.0) });
+        let page = Element::row().grow(1.0).child(page).children(self.chapters());
         let body = Element::row().grow(1.0).child(page).children(panel);
         Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).child(body)
     }
@@ -493,8 +566,14 @@ impl App for EditorApp {
             Message::ClosePanel => self.panel = None,
             Message::Share(open) => self.sharing = open,
             Message::Jump(block) => {
-                self.editor.select(Selection::caret(Pos { block, offset: 0 }));
-                self.reveal();
+                let start = Pos { block, offset: 0 };
+                self.editor.select(Selection::caret(start.clone()));
+                // Twice, since laying out what comes into view can move the block.
+                for _ in 0..2 {
+                    let Some(line) = self.layout.caret(&start) else { break };
+                    self.scroll = line.y.clamp(0.0, self.max_scroll());
+                    self.layout.settle(self.viewport(), 0);
+                }
             }
             Message::EditLink => self.link = Some(self.editor.link().unwrap_or_default().to_owned()),
             Message::LinkDraft(address) => self.link = self.link.is_some().then_some(address),
@@ -636,25 +715,6 @@ fn type_name(kind: &BlockKind) -> String {
         BlockKind::Divider => "Divider".into(),
         BlockKind::Unknown { .. } => "Block".into(),
     }
-}
-
-/// A heading in the outline. Pressing it puts the caret there.
-fn outline_row(block: &Block) -> Option<Element<Message>> {
-    let BlockKind::Heading { level } = block.kind else { return None };
-    let text = block.plain_text();
-    let indent = tokens::SPACE_SM + tokens::SPACE_MD * f32::from(level.saturating_sub(1));
-    let row = Element::row()
-        .key(block.id.as_str())
-        .align(Align::Center)
-        .min_height(tokens::CONTROL_HEIGHT_SM)
-        .padding(Edges { left: indent, ..Edges::xy(tokens::SPACE_SM, tokens::SPACE_XS) })
-        .radius(tokens::RADIUS_SM)
-        .hover(Look::bg(tokens::NEUTRAL_SOFT))
-        .ring(Ring::Outline(0.0))
-        .role(Role::Link)
-        .child(Element::text(if text.is_empty() { "Untitled".into() } else { text }, TextStyle::control()))
-        .on_press(Message::Jump(block.id.clone()));
-    Some(row)
 }
 
 /// One of the document's element types, with the face it is set in.

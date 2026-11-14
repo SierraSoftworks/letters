@@ -1,4 +1,4 @@
-//! SidePanel: the one panel beside the page, for the outline, styles, notes or history.
+//! SidePanel: the one panel beside the page, for styles, notes or history.
 
 use accesskit::Role;
 
