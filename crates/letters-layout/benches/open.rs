@@ -6,7 +6,9 @@
 use std::time::{Duration, Instant};
 
 use letters_layout::{DocLayout, Fonts};
-use letters_model::{Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Model, Op, Pos, Run, Style, Tone};
+use letters_model::{
+    Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Model, Op, Page, Pos, Run, Style, Tone,
+};
 use letters_render::{DisplayList, Rect};
 
 /// From launch to the first painted document.
@@ -195,8 +197,12 @@ fn frame(layout: &mut DocLayout, y: f32, list: &mut DisplayList) {
 }
 
 fn opened(doc: &Document, style: &Style) -> DocLayout {
+    opened_at(doc, style, WIDTH)
+}
+
+fn opened_at(doc: &Document, style: &Style, width: f32) -> DocLayout {
     let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
-    layout.update(doc, style, WIDTH, None);
+    layout.update(doc, style, width, None);
     layout
 }
 
@@ -296,6 +302,42 @@ fn main() {
     report("settle slice", &settle, settle.worst(), Some(FRAME));
     println!("settle all     {:.0} ms in {} slices of {SLICE} bytes", ms(settle.total()), slices.len());
     println!("height         {:.0} px, first estimated as {estimate:.0} px", layout.height());
+
+    // Print view: the column at the page's text width, split into sheets. The first split settles the
+    // whole document, as the idle slices above would have by the time anyone asks for pages.
+    let page = Page::default();
+    let column = (page.width - page.margin_left - page.margin_right) * 96.0 / 72.0;
+    let mut model = Model::new(doc.clone());
+    let mut layout = opened_at(model.doc(), &style, column);
+    let mut pages = layout.paginate(&page);
+    let paginate = Times::of(50, |_| timed(|| pages = layout.paginate(&page)));
+    report("paginate", &paginate, paginate.worst(), Some(FRAME));
+    println!("sheets         {} of {} by {} pt", pages.sheets.len(), page.width, page.height);
+
+    // A page break put before a block in the middle: the column is rebuilt and split again.
+    let middle = model.doc().blocks.len() / 2;
+    let breaking = Times::of(50, |at| {
+        let mut block = model.doc().blocks[middle + at].clone();
+        block.extra.insert("break".into(), "page".into());
+        let ops =
+            [Op::RemoveBlock { block: block.id.clone() }, Op::InsertBlock { parent: None, index: middle + at, block }];
+        let change = model.apply(ops).expect("a page break");
+        let sheets = pages.sheets.len();
+        timed(|| {
+            layout.update(model.doc(), &style, column, Some(&change));
+            pages = layout.paginate(&page);
+            assert!(pages.sheets.len() >= sheets);
+        })
+    });
+    report("page break", &breaking, breaking.worst(), Some(KEYSTROKE));
+
+    // One sheet a frame, as scrolling Print view or writing a PDF asks for them.
+    let step = (pages.sheets.len() / 200).max(1);
+    let sheet = Times::of(pages.sheets.len() / step, |at| {
+        list.items.clear();
+        timed(|| layout.paint_page(&pages, at * step, &mut list))
+    });
+    report("paint a sheet", &sheet, sheet.worst(), Some(FRAME));
 
     if !broken.is_empty() {
         eprintln!("over budget: {}", broken.join(", "));
