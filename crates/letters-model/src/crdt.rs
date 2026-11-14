@@ -5,6 +5,8 @@
 //! - `blocks` and `depths` are maps from a marker character's own id to what its block is and how deep it
 //!   sits. Kept apart from the text, a block can change kind while someone types beside its marker.
 //! - `meta`, `dictionary` and `extra` are maps holding the document's own fields.
+//! - `style` is a map with one entry per field of the style, so two replicas that change different fields
+//!   of one element type both keep their change.
 //!
 //! The rest of the crate reads and writes the sequence as changes in which a marker carries its block, as
 //! the [`BLOCK`] and [`DEPTH`] attributes. This module turns those to and from what Loro holds, and
@@ -15,26 +17,26 @@
 //! wasm-bindgen: the one thing the core takes from its host without being handed it.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::BuildHasher;
 use std::mem;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use loro::cursor::{Cursor, Side};
+use loro::cursor::{Cursor, PosType, Side};
 use loro::event::Diff;
 use loro::{
     ContainerTrait, ExpandType, ID, LoroDoc, LoroMap, LoroText, LoroValue, StyleConfig, Subscription, TextDelta,
     ValueOrContainer,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::flat::{Attrs, BLOCK, DEPTH, Entry, MARKER, build, head, insert, order, transform};
 use crate::history::read_id;
 use crate::json::{mark_name, read_mark};
 use crate::undo::Script;
-use crate::{Block, BlockKind, Document, Run};
+use crate::{Block, BlockKind, Document, Run, STYLE_FORMAT, Style};
 
 pub(crate) const BODY: &str = "body";
 const BLOCKS: &str = "blocks";
@@ -42,6 +44,7 @@ const DEPTHS: &str = "depths";
 const META: &str = "meta";
 const DICTIONARY: &str = "dictionary";
 const EXTRA: &str = "extra";
+const STYLE: &str = "style";
 const LANGUAGE: &str = "language";
 
 pub(crate) const LINK: &str = "link";
@@ -244,14 +247,39 @@ pub(crate) fn restyles(loro: &LoroDoc, body: &LoroText, keys: &[String], new: &H
     delta
 }
 
+/// Sets attributes over a stretch of the sequence one at a time, in the order of their names. Loro's own
+/// delta sets several in an order that differs from one machine to the next, and a change made outside
+/// Letters has to be written the same way on all of them.
+fn mark<'a>(
+    body: &LoroText,
+    range: Range<usize>,
+    attrs: impl Iterator<Item = (&'a String, &'a LoroValue)>,
+) -> Option<()> {
+    let attrs: BTreeMap<_, _> = attrs.collect();
+    attrs.into_iter().try_for_each(|(key, value)| body.mark(range.clone(), key, value.clone()).ok())
+}
+
+/// Puts text in with exactly the attributes named, whatever the text beside it would lend.
+fn put<S: BuildHasher>(body: &LoroText, at: usize, text: &str, attrs: Option<&Attrs<S>>) -> Option<()> {
+    body.insert(at, text).ok()?;
+    let wanted = |key: &String| attrs.and_then(|attrs| attrs.get(key)).filter(|value| !value.is_null());
+    let mut from = at;
+    for piece in body.slice_delta(at, at + text.chars().count(), PosType::Unicode).ok()? {
+        let TextDelta::Insert { insert, attributes } = piece else { continue };
+        let lent = attributes.unwrap_or_default();
+        let to = from + insert.chars().count();
+        let clear = lent.keys().filter(|key| wanted(key).is_none()).map(|key| (key, &LoroValue::Null));
+        let set = lent.keys().chain(attrs.into_iter().flat_map(|attrs| attrs.keys()));
+        let set = set.filter_map(|key| Some((key, wanted(key).filter(|value| lent.get(key) != Some(value))?)));
+        mark(body, from..to, clear.chain(set))?;
+        from = to;
+    }
+    Some(())
+}
+
 /// Makes in the history a change the document already shows. `None` when Loro refused a part of it.
 pub(crate) fn write(loro: &LoroDoc, body: &LoroText, delta: &[TextDelta]) -> Option<()> {
     let markers = Markers::of(loro);
-    // Loro's own delta sets exactly the attributes named, whatever the text beside would lend.
-    let put = |at: usize, item: TextDelta| {
-        let delta = if at > 0 { vec![retain(at), item] } else { vec![item] };
-        body.apply_delta(&delta).ok()
-    };
     let mut at = 0;
     for item in delta {
         match item {
@@ -264,7 +292,7 @@ pub(crate) fn write(loro: &LoroDoc, body: &LoroText, delta: &[TextDelta]) -> Opt
                             }
                         }
                     }
-                    Some(_) => put(at, item.clone())?,
+                    Some(attrs) => mark(body, at..at + retain, attrs.iter())?,
                     None => {}
                 }
                 at += retain;
@@ -273,13 +301,13 @@ pub(crate) fn write(loro: &LoroDoc, body: &LoroText, delta: &[TextDelta]) -> Opt
                 match attributes.as_ref().filter(|attrs| matches!(attrs.get(BLOCK), Some(LoroValue::String(_)))) {
                     Some(attrs) => {
                         for _ in text.chars() {
-                            put(at, insert(MARKER, Vec::new()))?;
+                            put(body, at, MARKER, None::<&Attrs<std::hash::RandomState>>)?;
                             markers.set(id_at(body, at)?, attrs)?;
                             at += 1;
                         }
                     }
                     None => {
-                        put(at, item.clone())?;
+                        put(body, at, text, attributes.as_ref())?;
                         at += text.chars().count();
                     }
                 }
@@ -306,6 +334,7 @@ pub(crate) enum Event {
     Markers(Vec<String>),
     /// One of the document's own fields changed.
     Meta,
+    Style,
 }
 
 /// Collects what the history reports, for the model to catch up with.
@@ -313,6 +342,7 @@ pub(crate) fn watch(loro: &LoroDoc, body: &LoroText) -> (Arc<Mutex<Vec<Event>>>,
     let events: Arc<Mutex<Vec<Event>>> = Arc::default();
     let (queue, body) = (events.clone(), body.id());
     let markers = [loro.get_map(BLOCKS).id(), loro.get_map(DEPTHS).id()];
+    let style = loro.get_map(STYLE).id();
     let watch = loro.subscribe_root(Arc::new(move |event| {
         let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
         for diff in event.events {
@@ -321,11 +351,58 @@ pub(crate) fn watch(loro: &LoroDoc, body: &LoroText) -> (Arc<Mutex<Vec<Event>>>,
                 Diff::Map(map) if markers.contains(diff.target) => {
                     Event::Markers(map.updated.keys().map(|key| key.to_string()).collect())
                 }
+                _ if *diff.target == style => Event::Style,
                 _ => Event::Meta,
             });
         }
     }));
     (events, watch)
+}
+
+fn feed(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+}
+
+fn feed_value(hash: &mut Sha256, value: &LoroValue) {
+    match value {
+        LoroValue::String(text) => feed(hash, text.as_bytes()),
+        LoroValue::I64(number) => feed(hash, &number.to_le_bytes()),
+        LoroValue::Bool(flag) => feed(hash, &[u8::from(*flag)]),
+        other => feed(hash, format!("{other:?}").as_bytes()),
+    }
+}
+
+/// The replica a change made outside Letters is written as: a hash of the revision it starts from, of
+/// what it does to the sequence, and of the fields or the style it leads to.
+///
+/// Two replicas that take in the same outside change therefore write the very same change, and it merges
+/// as one. The hash covers the change, so a build that tells two documents apart differently can never
+/// claim the same id for different content. Change the tag if the way [`write`] or [`assign`] carries a
+/// change out changes.
+pub(crate) fn outsider(from: &str, delta: &[TextDelta], to: &str) -> u64 {
+    let mut hash = Sha256::new();
+    feed(&mut hash, b"letters outside change 1");
+    feed(&mut hash, from.as_bytes());
+    for item in delta {
+        let (kind, count, text, attributes) = match item {
+            TextDelta::Retain { retain, attributes } => (b"retain", *retain, "", attributes.as_ref()),
+            TextDelta::Insert { insert, attributes } => (b"insert", 0, insert.as_str(), attributes.as_ref()),
+            TextDelta::Delete { delete } => (b"delete", *delete, "", None),
+        };
+        feed(&mut hash, kind);
+        feed(&mut hash, &(count as u64).to_le_bytes());
+        feed(&mut hash, text.as_bytes());
+        let attributes: BTreeMap<_, _> = attributes.into_iter().flatten().collect();
+        feed(&mut hash, &(attributes.len() as u64).to_le_bytes());
+        for (key, value) in attributes {
+            feed(&mut hash, key.as_bytes());
+            feed_value(&mut hash, value);
+        }
+    }
+    feed(&mut hash, b"to");
+    feed(&mut hash, to.as_bytes());
+    peer(hash)
 }
 
 /// One write that puts a document into an empty history.
@@ -388,22 +465,9 @@ pub(crate) fn peer(hash: Sha256) -> u64 {
 /// Two devices that open the same document without a history therefore write the very same change, and their
 /// copies still merge. The hash covers every write, so a build that stores documents differently can never
 /// claim the same id for different content. Change the tag if the way the writes are carried out changes.
-fn author(calls: &[Call]) -> u64 {
-    fn feed(hash: &mut Sha256, bytes: &[u8]) {
-        hash.update((bytes.len() as u64).to_le_bytes());
-        hash.update(bytes);
-    }
-    fn feed_value(hash: &mut Sha256, value: &LoroValue) {
-        match value {
-            LoroValue::String(text) => feed(hash, text.as_bytes()),
-            LoroValue::I64(number) => feed(hash, &number.to_le_bytes()),
-            LoroValue::Bool(flag) => feed(hash, &[u8::from(*flag)]),
-            other => feed(hash, format!("{other:?}").as_bytes()),
-        }
-    }
-
+fn author(tag: &[u8], calls: &[Call]) -> u64 {
     let mut hash = Sha256::new();
-    feed(&mut hash, b"letters first change 1");
+    feed(&mut hash, tag);
     for call in calls {
         match call {
             Call::Text(text) => {
@@ -432,29 +496,40 @@ fn author(calls: &[Call]) -> u64 {
     peer(hash)
 }
 
-/// Starts a history that holds a document as its first change. See [`plan`] for which documents.
-pub(crate) fn create(doc: &Document, index: &[Entry]) -> LoroDoc {
+/// Starts a history that holds a document as its first change and its style as its second. See [`plan`]
+/// for which documents.
+///
+/// The style is a change of its own, written by a replica named after the document's change as well. Two
+/// devices that open the same document under different styles then still share the document.
+pub(crate) fn create(doc: &Document, index: &[Entry], style: &Style) -> LoroDoc {
     let loro = LoroDoc::new();
     configure(&loro);
-    let calls = plan(doc, index);
     let (body, markers) = (loro.get_text(BODY), Markers::of(&loro));
-    // None of these can fail: the peer is in range, the ranges lie inside the block just written, and no
-    // key holds a colon. A failure would leave a shorter document, which the model then shows as it is.
-    let _ = loro.set_peer_id(author(&calls));
-    for call in calls {
-        let _ = match call {
-            Call::Text(text) => body.insert_utf8(0, &text),
-            Call::Block(block, depth) => {
-                let depth = if depth > 0 { (depth as i64).into() } else { LoroValue::Null };
-                let attrs: Attrs<_> = [(BLOCK.to_owned(), block.into()), (DEPTH.to_owned(), depth)].into();
-                id_at(&body, 0).and_then(|id| markers.set(id, &attrs));
-                Ok(())
-            }
-            Call::Mark(range, key, value) => body.mark_utf8(range, &key, value),
-            Call::Set(map, key, value) => loro.get_map(map).insert(&key, value),
-        };
+    let calls = plan(doc, index);
+    let first = author(b"letters first change 1", &calls);
+    let fields = style_fields(style).into_iter().map(|(key, value)| Call::Set(STYLE, key, value.into()));
+    let fields: Vec<Call> = fields.collect();
+    let second = author(&[b"letters first style 1".as_slice(), &first.to_le_bytes()].concat(), &fields);
+    for (peer, calls) in [(first, calls), (second, fields)] {
+        // None of these can fail: the peer is in range, the ranges lie inside the block just written, and
+        // no key holds a colon. A failure would leave a shorter document, which the model then shows as
+        // it is.
+        let _ = loro.set_peer_id(peer);
+        for call in calls {
+            let _ = match call {
+                Call::Text(text) => body.insert_utf8(0, &text),
+                Call::Block(block, depth) => {
+                    let depth = if depth > 0 { (depth as i64).into() } else { LoroValue::Null };
+                    let attrs: Attrs<_> = [(BLOCK.to_owned(), block.into()), (DEPTH.to_owned(), depth)].into();
+                    id_at(&body, 0).and_then(|id| markers.set(id, &attrs));
+                    Ok(())
+                }
+                Call::Mark(range, key, value) => body.mark_utf8(range, &key, value),
+                Call::Set(map, key, value) => loro.get_map(map).insert(&key, value),
+            };
+        }
+        loro.commit();
     }
-    loro.commit();
     loro
 }
 
@@ -521,45 +596,161 @@ pub(crate) fn normal_meta(doc: &mut Document) {
     }
 }
 
-pub(crate) fn set_language(loro: &LoroDoc, language: &str) -> Option<()> {
-    loro.get_map(META).insert(LANGUAGE, language).ok()
+/// One value in one of the history's maps, as an edit sets it. `None` takes the key out.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Assign {
+    map: &'static str,
+    key: String,
+    value: Option<LoroValue>,
 }
 
-pub(crate) fn add_word(loro: &LoroDoc, word: &str) -> Option<()> {
-    let peer = loro.peer_id();
-    // The number of this replica's next edit, which no other add can have.
-    let next = loro.oplog_vv().get(&peer).copied().unwrap_or(0);
-    loro.get_map(DICTIONARY).insert(&word_key(word, &format!("{next}@{peer}")), true).ok()
+/// Makes assignments in the history, and gives the ones that put back what they replaced.
+pub(crate) fn assign(loro: &LoroDoc, assigns: &[Assign]) -> Option<Vec<Assign>> {
+    let mut back = Vec::with_capacity(assigns.len());
+    for Assign { map, key, value } in assigns {
+        let held = loro.get_map(*map);
+        let was = Markers::value(&held, key);
+        if was != *value {
+            match value {
+                Some(value) => held.insert(key, value.clone()).ok()?,
+                None => held.delete(key).ok()?,
+            }
+            back.push(Assign { map, key: key.clone(), value: was });
+        }
+    }
+    back.reverse();
+    Some(back)
 }
 
-pub(crate) fn remove_word(loro: &LoroDoc, word: &str) -> Option<()> {
-    let map = loro.get_map(DICTIONARY);
-    let mut adds = Vec::new();
-    map.for_each(|key, _| {
-        if word_of(key) == word {
-            adds.push(key.to_owned());
+/// The assignments that make the document's own fields in the history those of `to`, where they differ
+/// from `from`.
+pub(crate) fn meta_assigns(loro: &LoroDoc, from: &Document, to: &Document) -> Vec<Assign> {
+    let set = |map, key: &str, value: Option<LoroValue>| Assign { map, key: key.to_owned(), value };
+    let mut assigns = Vec::new();
+    if from.language != to.language {
+        assigns.push(set(META, LANGUAGE, Some(to.language.as_str().into())));
+    }
+    // A word goes with every add of it this replica has seen. The history lists them in no order, and an
+    // outside change must be written in one.
+    let mut gone = BTreeSet::new();
+    loro.get_map(DICTIONARY).for_each(|key, _| {
+        if from.dictionary.contains(word_of(key)) && !to.dictionary.contains(word_of(key)) {
+            gone.insert(key.to_owned());
         }
     });
-    adds.iter().try_for_each(|key| map.delete(key).ok())
-}
-
-/// Sets one of the document's fields that this build does not know, or removes it.
-pub(crate) fn set_extra(loro: &LoroDoc, key: &str, value: Option<&Value>) -> Option<()> {
-    let map = loro.get_map(EXTRA);
-    match value {
-        Some(value) => map.insert(key, value.to_string()).ok(),
-        None => Markers::forget(&map, key),
-    }
-}
-
-/// Makes the document's own fields in the history those of `to`, where they differ from `from`.
-pub(crate) fn write_meta(loro: &LoroDoc, from: &Document, to: &Document) -> Option<()> {
-    if from.language != to.language {
-        set_language(loro, &to.language)?;
-    }
-    from.dictionary.difference(&to.dictionary).try_for_each(|word| remove_word(loro, word))?;
-    to.dictionary.difference(&from.dictionary).try_for_each(|word| add_word(loro, word))?;
-    from.extra.keys().filter(|key| !to.extra.contains_key(*key)).try_for_each(|key| set_extra(loro, key, None))?;
+    assigns.extend(gone.iter().map(|key| set(DICTIONARY, key, None)));
+    // The number of this replica's next edit, which no other add can have.
+    let peer = loro.peer_id();
+    let add = format!("{}@{peer}", loro.oplog_vv().get(&peer).copied().unwrap_or(0));
+    let added = to.dictionary.difference(&from.dictionary);
+    assigns.extend(added.map(|word| set(DICTIONARY, &word_key(word, &add), Some(true.into()))));
+    let gone = from.extra.keys().filter(|key| !to.extra.contains_key(*key));
+    assigns.extend(gone.map(|key| set(EXTRA, key, None)));
     let changed = to.extra.iter().filter(|(key, value)| from.extra.get(*key) != Some(value));
-    changed.into_iter().try_for_each(|(key, value)| set_extra(loro, key, Some(value)))
+    assigns.extend(changed.map(|(key, value)| set(EXTRA, key, Some(value.to_string().into()))));
+    assigns
+}
+
+/// A style as the history holds it: each field under a key of its own, as the JSON `style.json` gives it.
+fn style_fields(style: &Style) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::new();
+    let Ok(Value::Object(root)) = serde_json::from_str(&style.to_json()) else { return fields };
+    let key = |parts: &[&str]| parts.iter().map(|part| clean(part)).collect::<Vec<_>>().join(MARKER);
+    for (name, value) in root {
+        match (name.as_str(), value) {
+            ("format", _) => {}
+            ("types", Value::Object(types)) => {
+                for (element, style) in types {
+                    let Value::Object(style) = style else { continue };
+                    fields.extend(
+                        style.iter().map(|(field, value)| (key(&["types", &element, field]), value.to_string())),
+                    );
+                }
+            }
+            ("page", Value::Object(page)) => {
+                fields.extend(page.iter().map(|(field, value)| (key(&["page", field]), value.to_string())));
+            }
+            (_, value) => drop(fields.insert(key(&["extra", &name]), value.to_string())),
+        }
+    }
+    fields
+}
+
+/// The style that fields give. A value that breaks the schema is left out, as two changes that each made
+/// sense can do once merged, and the built-in value stands in for it.
+fn style_of(fields: impl IntoIterator<Item = (String, String)>) -> Style {
+    fn object<'a>(map: &'a mut Map<String, Value>, key: &str) -> Option<&'a mut Map<String, Value>> {
+        map.entry(key).or_insert_with(|| Value::Object(Map::new())).as_object_mut()
+    }
+    /// Takes out the value an error names. False when there is no telling which it is.
+    fn leave_out(root: &mut Map<String, Value>, path: &str) -> bool {
+        let Some((part, rest)) = path.split_once('.') else { return root.remove(path).is_some() };
+        let Some(Value::Object(inside)) = root.get_mut(part) else { return false };
+        // The name of an element type may hold a dot of its own.
+        let element =
+            inside.keys().find(|name| rest.strip_prefix(name.as_str()).is_some_and(|field| field.starts_with('.')));
+        match element.cloned() {
+            Some(name) => match inside.get_mut(&name) {
+                Some(Value::Object(style)) => {
+                    style.remove(&rest[name.len() + 1..]).is_some() || inside.remove(&name).is_some()
+                }
+                _ => inside.remove(&name).is_some(),
+            },
+            None => inside.remove(rest).is_some() || root.remove(part).is_some(),
+        }
+    }
+
+    let (mut root, mut types, mut page) = (Map::new(), Map::new(), Map::new());
+    for (key, json) in fields {
+        let Ok(value) = serde_json::from_str::<Value>(&json) else { continue };
+        let mut parts = key.split(MARKER);
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some("types"), Some(element), Some(field)) => {
+                object(&mut types, element).map(|style| style.insert(field.to_owned(), value));
+            }
+            (Some("page"), Some(field), None) => drop(page.insert(field.to_owned(), value)),
+            (Some("extra"), Some(name), None) => drop(root.insert(name.to_owned(), value)),
+            _ => {}
+        }
+    }
+    root.insert("format".into(), STYLE_FORMAT.into());
+    root.insert("types".into(), types.into());
+    root.insert("page".into(), page.into());
+    loop {
+        match Style::from_json(&Value::Object(root.clone()).to_string()) {
+            Ok(style) => return style,
+            Err(error) if leave_out(&mut root, &error.path) => {}
+            Err(_) => return Style::default(),
+        }
+    }
+}
+
+/// A style as a history gives it back.
+pub(crate) fn normal_style(style: &Style) -> Style {
+    style_of(style_fields(style))
+}
+
+pub(crate) fn read_style(loro: &LoroDoc) -> Style {
+    let mut fields = Vec::new();
+    loro.get_map(STYLE).for_each(|key, value| {
+        if let ValueOrContainer::Value(LoroValue::String(json)) = value {
+            fields.push((key.to_owned(), json.to_string()));
+        }
+    });
+    style_of(fields)
+}
+
+/// The assignments that make the style in the history `to`, field by field. They are told from what the
+/// history holds, which may be more than the style it reads as: see [`style_of`].
+pub(crate) fn style_assigns(loro: &LoroDoc, to: &Style) -> Vec<Assign> {
+    let (mut old, new) = (BTreeMap::new(), style_fields(to));
+    loro.get_map(STYLE).for_each(|key, value| {
+        if let ValueOrContainer::Value(LoroValue::String(json)) = value {
+            old.insert(key.to_owned(), json.to_string());
+        }
+    });
+    let gone = old.keys().filter(|key| !new.contains_key(*key)).map(|key| (key.clone(), None));
+    let set = new.iter().filter(|(key, json)| old.get(*key) != Some(json));
+    let set = set.map(|(key, json)| (key.clone(), Some(json.as_str().into())));
+    gone.chain(set).map(|(key, value)| Assign { map: STYLE, key, value }).collect()
 }

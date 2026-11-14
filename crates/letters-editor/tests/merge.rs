@@ -99,7 +99,7 @@ fn the_files_history_is_attached_under_the_editing() {
     // The document is on screen and edited before its history has been read.
     let mut mine = Harness::new("p one| two");
     mine.type_text("s");
-    let prepared = Model::prepare(parse(file).0, Some(&saved), ReplicaId::from(1)).expect("the history loads");
+    let prepared = Model::new(parse(file).0, ReplicaId::from(1)).prepare(Some(&saved)).expect("the history loads");
     mine.editor.attach(prepared);
     assert_eq!(mine.state(), canon("p ones| two"));
 

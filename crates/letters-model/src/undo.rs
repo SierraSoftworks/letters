@@ -1,18 +1,37 @@
 //! This session's undo steps.
 //!
-//! A step is kept as the change to the sequence that takes one edit back. When another replica's edit
-//! arrives, every step is rewritten to act on the same text as before. Undoing is then one more edit and
-//! costs what an edit costs: the history is never replayed, however long it is.
+//! A step is kept as the changes that take one edit back. When another replica's edit arrives, every
+//! change to the sequence is rewritten to act on the same text as before. Undoing is then one more edit
+//! and costs what an edit costs: the history is never replayed, however long it is.
 
 use std::collections::VecDeque;
 
 use loro::TextDelta;
 
+use crate::crdt::Assign;
+
 /// A change to the sequence, counted in characters.
 pub(crate) type Delta = Vec<TextDelta>;
 
+/// One of the changes that take an edit back.
+#[derive(Clone, Debug)]
+pub(crate) enum Edit {
+    Text(Delta),
+    /// Values put back into the document's own fields or its style.
+    Set(Vec<Assign>),
+}
+
+impl Edit {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Text(delta) => delta.is_empty(),
+            Self::Set(assigns) => assigns.is_empty(),
+        }
+    }
+}
+
 /// The changes that take one edit back, in the order to make them.
-pub(crate) type Step = Vec<Delta>;
+pub(crate) type Step = Vec<Edit>;
 
 /// Steps kept. The oldest is forgotten first.
 const MAX_STEPS: usize = 1000;
@@ -26,7 +45,7 @@ pub(crate) struct Steps {
 impl Steps {
     /// Notes how to take back an edit just made. With `join`, it is taken back together with the last.
     pub fn record(&mut self, mut step: Step, join: bool) {
-        step.retain(|delta| !delta.is_empty());
+        step.retain(|edit| !edit.is_empty());
         if step.is_empty() {
             return;
         }
@@ -63,7 +82,7 @@ impl Steps {
         self.redo.clear();
     }
 
-    /// Rewrites every step to follow a change that did not come from this session.
+    /// Rewrites every step to follow a change to the sequence that did not come from this session.
     pub fn rebase(&mut self, theirs: &[TextDelta]) {
         fn stack<'a>(steps: impl DoubleEndedIterator<Item = &'a mut Step>, theirs: &[TextDelta]) {
             let mut theirs = theirs.to_vec();
@@ -72,12 +91,13 @@ impl Steps {
                 if theirs.is_empty() {
                     break;
                 }
-                for ours in step.iter_mut() {
+                for edit in step.iter_mut() {
+                    let Edit::Text(ours) = edit else { continue };
                     let moved = rebase(ours, &theirs, true);
                     theirs = rebase(&theirs, ours, false);
                     *ours = moved;
                 }
-                step.retain(|delta| !delta.is_empty());
+                step.retain(|edit| !edit.is_empty());
             }
         }
         stack(self.undo.iter_mut(), theirs);

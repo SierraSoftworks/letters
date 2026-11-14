@@ -14,11 +14,11 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use loro::cursor::{Cursor, Side};
 use loro::{ContainerTrait, ExportMode, LoroDoc, LoroText, LoroValue, Subscription, TextDelta};
 
-use crate::crdt::{self, Event, attrs};
+use crate::crdt::{self, Assign, Event, attrs};
 use crate::flat::{self, BLOCK, DEPTH, Entry, Flat, children, head, insert, marker, nth, nth_mut, spell};
 use crate::history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
-use crate::undo::{Delta, Script, Step, Steps, is_skip};
-use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, Mark, Pos, Run};
+use crate::undo::{Delta, Edit, Script, Step, Steps, is_skip};
+use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, Mark, Page, Pos, Run, Style, TextStyle};
 
 /// One change to a document. Offsets are UTF-8 bytes into a text block and must sit on character boundaries.
 #[derive(Clone, Debug, PartialEq)]
@@ -67,6 +67,31 @@ pub enum Op {
     RemoveBlock {
         block: BlockId,
     },
+    /// Sets the style of one element type, such as `heading1`. Each field that differs is a change of its
+    /// own, so two replicas that change different fields of one type both keep theirs.
+    SetStyle {
+        element: String,
+        style: TextStyle,
+    },
+    /// Sets the paper size and margins.
+    SetPage {
+        page: Page,
+    },
+    /// Replaces the whole style, as applying a stylesheet does.
+    ReplaceStyle {
+        style: Style,
+    },
+    SetLanguage {
+        language: String,
+    },
+    /// Adds a word to the document's dictionary. It stays when another replica removes the word at the
+    /// same time.
+    AddWord {
+        word: String,
+    },
+    RemoveWord {
+        word: String,
+    },
 }
 
 /// Why an [`Op`] was refused. The document is left as it was.
@@ -88,6 +113,8 @@ pub enum OpError {
     NothingToJoin(BlockId),
     /// The model shows an older revision, which cannot be edited.
     ReadOnly,
+    /// The style holds a value `style.json` would refuse, and this says which.
+    BadStyle(String),
 }
 
 impl fmt::Display for OpError {
@@ -100,6 +127,7 @@ impl fmt::Display for OpError {
             Self::DuplicateId(id) => write!(f, "the id \"{id}\" is already in use"),
             Self::NothingToJoin(id) => write!(f, "there is no text block before \"{id}\" to join"),
             Self::ReadOnly => f.write_str("an older revision cannot be edited"),
+            Self::BadStyle(why) => write!(f, "the style cannot be used: {why}"),
         }
     }
 }
@@ -113,12 +141,18 @@ pub struct Change {
     pub blocks: BTreeSet<BlockId>,
     /// Whether blocks were added, removed or moved.
     pub structure: bool,
+    /// Whether the style changed, which the layout of every block depends on.
+    pub style: bool,
+    /// Whether the document's own fields changed: its language or its dictionary.
+    pub document: bool,
 }
 
 impl Change {
     fn absorb(&mut self, other: Change) {
         self.blocks.extend(other.blocks);
         self.structure |= other.structure;
+        self.style |= other.style;
+        self.document |= other.document;
     }
 }
 
@@ -151,6 +185,7 @@ pub struct Model {
     doc: Document,
     /// One entry per block, in document order.
     index: Vec<Entry>,
+    style: Style,
     replica: ReplicaId,
     /// Started from the document when something first needs it, unless one is attached before.
     history: OnceLock<History>,
@@ -159,7 +194,8 @@ pub struct Model {
 
 impl fmt::Debug for Model {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Model").field("replica", &self.replica).field("doc", &self.doc).finish()
+        let mut model = f.debug_struct("Model");
+        model.field("replica", &self.replica).field("doc", &self.doc).field("style", &self.style).finish()
     }
 }
 
@@ -180,17 +216,29 @@ const _: fn() = || {
 };
 
 impl Model {
-    /// Shows a document at once. Its history is not built until an edit, a save or a merge needs it, or
-    /// until [`Model::attach`] hands one over, so opening a document never waits for it.
+    /// Shows a document at once, in the built-in style. Its history is not built until an edit, a save or
+    /// a merge needs it, or until [`Model::attach`] hands one over, so opening a document never waits.
     ///
-    /// A history started here depends on the document alone, so two devices that open the same file
-    /// without a history can still merge their copies. Runs are stored merged, and a repeated block id
-    /// is renamed.
+    /// A history started here depends on the document and its style alone, so two devices that open the
+    /// same file without a history can still merge their copies. Runs are stored merged, and a repeated
+    /// block id is renamed.
     pub fn new(mut doc: Document, replica: ReplicaId) -> Self {
         let built = flat::normal(mem::take(&mut doc.blocks));
         doc.blocks = built.blocks;
         crdt::normal_meta(&mut doc);
-        Self { doc, index: built.index, replica, history: OnceLock::new(), steps: Steps::default() }
+        let (index, style) = (built.index, Style::default());
+        Self { doc, index, style, replica, history: OnceLock::new(), steps: Steps::default() }
+    }
+
+    /// The model with the style its file holds, for one that was just made.
+    pub fn with_style(mut self, style: Style) -> Self {
+        match self.history.get() {
+            // Nothing has been written yet, so the history will start from this style.
+            None => self.style = crdt::normal_style(&style),
+            // Only an older revision refuses a style, and a model that was just made shows none.
+            Some(_) => drop(self.rewrite_style(style)),
+        }
+        self
     }
 
     /// Opens a saved history, as [`Model::save`] or [`Model::updates_since`] wrote it.
@@ -200,7 +248,8 @@ impl Model {
         loro.import(history).map_err(unreadable)?;
         let history = History::open(loro, replica);
         let (doc, index) = crdt::read(&history.loro, &history.body);
-        Ok(Self { doc, index, replica, history: OnceLock::from(history), steps: Steps::default() })
+        let style = crdt::read_style(&history.loro);
+        Ok(Self { doc, index, style, replica, history: OnceLock::from(history), steps: Steps::default() })
     }
 
     /// A second replica at the newest revision, for another writer. It starts with no undo steps.
@@ -209,25 +258,26 @@ impl Model {
             Some(_) => Self::load(&self.save(), replica).expect("a history that was just saved loads"),
             // Both then start the same history from the same document.
             None => {
-                let (doc, index) = (self.doc.clone(), self.index.clone());
-                Self { doc, index, replica, history: OnceLock::new(), steps: Steps::default() }
+                let (doc, index, style) = (self.doc.clone(), self.index.clone(), self.style.clone());
+                Self { doc, index, style, replica, history: OnceLock::new(), steps: Steps::default() }
             }
         }
     }
 
-    /// Does the slow part of opening a document ahead of the model that shows it: reads its `history`, or
-    /// starts one when the file has none. A shell runs this on another thread once a [`Model::new`] of
-    /// the same document is on screen, and hands the result to [`Model::attach`].
+    /// Does the slow part of opening a file ahead of the model that shows it: reads its `history`, or
+    /// starts one when the file has none. A shell makes a second model of the same document and style,
+    /// runs this on another thread once the first is on screen, and hands the result to [`Model::attach`].
     ///
-    /// A document that is not the newest one in `history` was changed outside Letters. The history takes
-    /// that in as one more change, as [`Model::rewrite`] does, so the file is always the document.
-    pub fn prepare(doc: Document, history: Option<&[u8]>, replica: ReplicaId) -> Result<Prepared, HistoryError> {
+    /// A document or style that is not the newest in `history` was changed outside Letters. The history
+    /// takes that in as one more change, as [`Model::rewrite`] does, so the file is always the document.
+    pub fn prepare(self, history: Option<&[u8]>) -> Result<Prepared, HistoryError> {
         let model = match history {
-            None => Self::new(doc, replica),
+            None => self,
             Some(history) => {
-                let mut model = Self::load(history, replica)?;
+                let mut model = Self::load(history, self.replica)?;
                 // A history that was just loaded shows its newest revision, which can be rewritten.
-                let _ = model.rewrite(doc);
+                let _ = model.rewrite(self.doc);
+                let _ = model.rewrite_style(self.style);
                 model
             }
         };
@@ -236,7 +286,8 @@ impl Model {
     }
 
     /// Takes over a history that [`Model::prepare`] made for the document this model shows. The document
-    /// stays as it is: what was edited in the meantime goes into that history as one change.
+    /// and its style stay as they are: what was edited in the meantime goes into that history as one
+    /// change.
     ///
     /// Until a file's history is attached, the model keeps one that starts at the document, which is all
     /// a file without a history needs. When the file has one, revisions and stable positions taken before
@@ -256,10 +307,16 @@ impl Model {
         self.history = OnceLock::from(history);
         let shown = mem::replace(&mut self.doc, theirs.doc);
         let layout = mem::replace(&mut self.index, theirs.index);
+        let style = mem::replace(&mut self.style, theirs.style);
         let steps = mem::take(&mut self.steps);
+        // What this model shows that the history does not is its own writer's work.
         if shown != self.doc {
-            let _ = self.rewrite(shown.clone());
+            let _ = self.adopt(shown.clone(), false);
             change.absorb(diff(&shown, &self.doc));
+        }
+        if style != self.style {
+            let _ = self.adopt_style(style.clone(), false);
+            change.style |= style != self.style;
         }
         // An undo step counts characters, so it holds for as long as the sequence is laid out as before.
         let alike =
@@ -273,33 +330,73 @@ impl Model {
     /// Makes the newest document read as `doc`, which was changed without the model, as a file edited by
     /// another tool is. What differs goes into the history block by block, as one change. It is not an
     /// undo step, and the undo steps already there still hold.
-    pub fn rewrite(&mut self, mut doc: Document) -> Result<Change, OpError> {
-        if self.loro().is_detached() {
+    ///
+    /// The change is named after what it starts from and what it leads to, not after this replica. Two
+    /// replicas that take in the same outside change therefore write the same change, and merge as one.
+    pub fn rewrite(&mut self, doc: Document) -> Result<Change, OpError> {
+        self.adopt(doc, true)
+    }
+
+    /// Makes the newest style read as `style`, which was changed without the model. Like
+    /// [`Model::rewrite`], it is one change in the history and no undo step.
+    pub fn rewrite_style(&mut self, style: Style) -> Result<Change, OpError> {
+        self.adopt_style(style, true)
+    }
+
+    /// Makes the newest document read as `doc`. `outside` says the change is not this replica's own.
+    fn adopt(&mut self, mut doc: Document, outside: bool) -> Result<Change, OpError> {
+        if !self.is_latest() {
             return Err(OpError::ReadOnly);
         }
         let to = flat::normal(mem::take(&mut doc.blocks));
         crdt::normal_meta(&mut doc);
+        doc.blocks = to.blocks;
         let mut change = Change::default();
-        if to.blocks != self.doc.blocks {
+        if doc == self.doc {
+            return Ok(change);
+        }
+        let delta = (doc.blocks != self.doc.blocks).then(|| {
             let old = flat::order(&self.doc.blocks, &self.index);
-            let delta = flat::rewrite(&old, &flat::order(&to.blocks, &to.index));
+            flat::rewrite(&old, &flat::order(&doc.blocks, &to.index))
+        });
+        if outside {
+            let fields = Document { blocks: Vec::new(), ..doc.clone() }.to_json();
+            let from = self.revision().to_string();
+            let _ = self.loro().set_peer_id(crdt::outsider(&from, delta.as_deref().unwrap_or_default(), &fields));
+        }
+        if let Some(delta) = delta {
             let (changed, undo) = self.shift(&delta, None);
             change.absorb(changed);
-            debug_assert!(undo.is_some() && self.doc.blocks == to.blocks, "a rewrite did not give its document");
+            debug_assert!(undo.is_some() && self.doc.blocks == doc.blocks, "a rewrite did not give its document");
             if undo.is_some() && self.write(std::slice::from_ref(&delta), &mut change) {
                 self.steps.rebase(&delta);
             }
         }
-        // Loro refuses none of these: every key and value is a string or a flag.
-        let _ = crdt::write_meta(self.loro(), &self.doc, &doc);
-        self.loro().commit();
-        self.queue().clear();
-        (self.doc.language, self.doc.dictionary, self.doc.extra) = (doc.language, doc.dictionary, doc.extra);
+        let assigns = crdt::meta_assigns(self.loro(), &self.doc, &doc);
+        self.set(&assigns, &mut change);
+        let _ = self.loro().set_peer_id(self.replica.0);
+        Ok(change)
+    }
+
+    fn adopt_style(&mut self, style: Style, outside: bool) -> Result<Change, OpError> {
+        if !self.is_latest() {
+            return Err(OpError::ReadOnly);
+        }
+        let style = crdt::normal_style(&style);
+        let mut change = Change::default();
+        if style != self.style {
+            if outside {
+                let _ = self.loro().set_peer_id(crdt::outsider(&self.revision().to_string(), &[], &style.to_json()));
+            }
+            self.set(&crdt::style_assigns(self.loro(), &style), &mut change);
+            let _ = self.loro().set_peer_id(self.replica.0);
+        }
         Ok(change)
     }
 
     fn history(&self) -> &History {
-        self.history.get_or_init(|| History::open(crdt::create(&self.doc, &self.index), self.replica))
+        let start = || History::open(crdt::create(&self.doc, &self.index, &self.style), self.replica);
+        self.history.get_or_init(start)
     }
 
     fn loro(&self) -> &LoroDoc {
@@ -314,28 +411,36 @@ impl Model {
         &self.doc
     }
 
+    pub fn style(&self) -> &Style {
+        &self.style
+    }
+
     pub fn replica(&self) -> ReplicaId {
         self.replica
     }
 
-    /// Applies `ops` in order as one undo step. Ops that leave the document as it was are no step at all.
+    /// Applies `ops` in order as one undo step. Ops that leave everything as it was are no step at all.
     pub fn apply(&mut self, ops: impl IntoIterator<Item = Op>) -> Result<Change, OpError> {
         if self.loro().is_detached() {
             return Err(OpError::ReadOnly);
         }
         let ops: Vec<Op> = ops.into_iter().collect();
-        // One op changes the document whenever it changes the sequence. Several may cancel out, unless
-        // one of them adds or removes a block.
+        // The document's own fields and the style are changed on copies, made when an op first needs
+        // them, and written once every op has been checked.
+        let mut settings: Option<(Document, Style)> = None;
+        // One op on a block changes the document whenever it changes the sequence. Several may cancel
+        // out, unless one of them adds or removes a block.
         fn named(op: &Op) -> Option<&BlockId> {
             match op {
                 Op::InsertText { at, .. } => Some(&at.block),
                 Op::DeleteText { block, .. } | Op::SetMark { block, .. } | Op::SetLink { block, .. } => Some(block),
                 Op::SetKind { block, .. } => Some(block),
-                Op::Split { .. } | Op::Join { .. } | Op::InsertBlock { .. } | Op::RemoveBlock { .. } => None,
+                _ => None,
             }
         }
-        let before: Option<Vec<Block>> = (ops.len() > 1)
-            .then(|| ops.iter().map(named).collect())
+        let texts = || ops.iter().filter(|op| !is_setting(op));
+        let before: Option<Vec<Block>> = (texts().count() > 1)
+            .then(|| texts().map(named).collect())
             .flatten()
             .map(|ids: BTreeSet<&BlockId>| ids.into_iter().filter_map(|id| self.doc.block(id).cloned()).collect());
 
@@ -344,13 +449,19 @@ impl Model {
         let mut step = Step::new();
         let mut refused = None;
         for op in &ops {
-            match self.compile(op) {
+            let compiled = if is_setting(op) {
+                let (fields, style) = settings.get_or_insert_with(|| (self.fields(), self.style.clone()));
+                set(op, fields, style).map(|()| (Vec::new(), None))
+            } else {
+                self.compile(op)
+            };
+            match compiled {
                 Ok((delta, _)) if delta.is_empty() => {}
                 Ok((delta, place)) => {
                     let (changed, undo) = self.shift(&delta, place);
                     debug_assert!(undo.is_some(), "an edit that was checked did not fit the document");
                     change.absorb(changed);
-                    step.push(undo.unwrap_or_default());
+                    step.push(Edit::Text(undo.unwrap_or_default()));
                     edits.push(delta);
                 }
                 Err(error) => {
@@ -363,10 +474,25 @@ impl Model {
         let same = |blocks: &Vec<Block>| blocks.iter().all(|block| self.doc.block(&block.id) == Some(block));
         if refused.is_some() || before.as_ref().is_some_and(same) {
             // Nothing has reached the history yet, so the document's own undo puts it back.
-            step.iter().for_each(|undo| drop(self.shift(undo, None)));
-            return refused.map_or(Ok(Change::default()), Err);
+            for undo in step.drain(..) {
+                if let Edit::Text(undo) = undo {
+                    self.shift(&undo, None);
+                }
+            }
+            if let Some(error) = refused {
+                return Err(error);
+            }
+            (change, edits) = (Change::default(), Vec::new());
         }
-        if self.write(&edits, &mut change) {
+        let written = edits.is_empty() || self.write(&edits, &mut change);
+        if let Some((fields, style)) = settings {
+            let mut assigns = crdt::meta_assigns(self.loro(), &self.doc, &fields);
+            if style != self.style {
+                assigns.extend(crdt::style_assigns(self.loro(), &style));
+            }
+            step.insert(0, Edit::Set(self.set(&assigns, &mut change)));
+        }
+        if written {
             self.steps.record(step, false);
         }
         Ok(change)
@@ -386,7 +512,9 @@ impl Model {
         let step = self.steps.take(back).filter(|_| !self.loro().is_detached())?;
         let mut change = Change::default();
         let mut reverse = Step::new();
-        for delta in &step {
+        let mut edits = Vec::new();
+        for edit in &step {
+            let Edit::Text(delta) = edit else { continue };
             let (changed, undo) = self.shift(delta, None);
             change.absorb(changed);
             let Some(undo) = undo else {
@@ -395,13 +523,58 @@ impl Model {
                 self.steps.clear();
                 return Some(change);
             };
-            reverse.push(undo);
+            reverse.push(Edit::Text(undo));
+            edits.push(delta.clone());
+        }
+        let written = edits.is_empty() || self.write(&edits, &mut change);
+        for edit in &step {
+            if let Edit::Set(assigns) = edit {
+                reverse.push(Edit::Set(self.set(assigns, &mut change)));
+            }
         }
         reverse.reverse();
-        if self.write(&step, &mut change) {
+        if written {
             self.steps.stepped(reverse, back);
         }
         Some(change)
+    }
+
+    /// Makes assignments in the history's maps, as one change there, and reads what they changed. Gives
+    /// the assignments that take them back.
+    fn set(&mut self, assigns: &[Assign], change: &mut Change) -> Vec<Assign> {
+        if assigns.is_empty() {
+            return Vec::new();
+        }
+        // Loro refuses none of these: every key is a string, and every value a string or a flag.
+        let back = crdt::assign(self.loro(), assigns).unwrap_or_default();
+        self.loro().commit();
+        self.queue().clear();
+        change.absorb(self.reread());
+        back
+    }
+
+    /// The document's own fields, without its blocks.
+    fn fields(&self) -> Document {
+        let (language, dictionary, extra) = (&self.doc.language, &self.doc.dictionary, &self.doc.extra);
+        Document {
+            blocks: Vec::new(),
+            language: language.clone(),
+            dictionary: dictionary.clone(),
+            extra: extra.clone(),
+        }
+    }
+
+    /// Reads the document's own fields and the style from the history again, and says which changed.
+    fn reread(&mut self) -> Change {
+        let Some(history) = self.history.get() else { return Change::default() };
+        let mut read = Document::default();
+        crdt::read_meta(&history.loro, &mut read);
+        let style = crdt::read_style(&history.loro);
+        let document = (&read.language, &read.dictionary) != (&self.doc.language, &self.doc.dictionary);
+        let change = Change { style: style != self.style, document, ..Change::default() };
+        (self.doc.language, self.doc.dictionary, self.doc.extra) = (read.language, read.dictionary, read.extra);
+        self.style = style;
+        change
     }
 
     /// Sends changes the document already shows to the history, as one change there.
@@ -445,6 +618,15 @@ impl Model {
     pub fn compare(&self, history: &[u8]) -> Result<Option<Ordering>, HistoryError> {
         let other = LoroDoc::decode_import_blob_meta(history, true).map_err(unreadable)?;
         Ok(self.loro().oplog_vv().partial_cmp(&other.partial_end_vv))
+    }
+
+    /// Whether a saved history and this one hold an edit in common, as two that began as one file do.
+    /// Histories that hold none still merge, into a document with everything from both.
+    pub fn related(&self, history: &[u8]) -> Result<bool, HistoryError> {
+        let other = LoroDoc::decode_import_blob_meta(history, true).map_err(unreadable)?;
+        let ours = self.loro().oplog_vv();
+        let shared = |(peer, end): (&u64, &i32)| *end > 0 && ours.get(peer).is_some_and(|held| *held > 0);
+        Ok(other.partial_end_vv.iter().any(shared))
     }
 
     /// The point in history the document shows.
@@ -519,18 +701,15 @@ impl Model {
 
     /// Brings the document up to date with what the history reported.
     fn drain(&mut self) -> Change {
-        let (mut bodies, mut keys, mut meta) = (Vec::new(), Vec::new(), false);
+        let (mut bodies, mut keys, mut fields) = (Vec::new(), Vec::new(), false);
         for event in mem::take(&mut *self.queue()) {
             match event {
                 Event::Body(delta) => bodies.push(delta),
                 Event::Markers(changed) => keys.extend(changed),
-                Event::Meta => meta = true,
+                Event::Meta | Event::Style => fields = true,
             }
         }
-        if let (true, Some(history)) = (meta, self.history.get()) {
-            crdt::read_meta(&history.loro, &mut self.doc);
-        }
-        let mut change = Change::default();
+        let mut change = if fields { self.reread() } else { Change::default() };
         match bodies.as_slice() {
             [] => {
                 self.follow(&crdt::restyles(self.loro(), self.body(), &keys, &HashSet::new()), &mut change);
@@ -547,7 +726,7 @@ impl Model {
             // Each was told against the sequence as it then stood, which only the last still is.
             _ => {
                 self.steps.clear();
-                change = self.resync();
+                change.absorb(self.resync());
             }
         }
         change
@@ -572,10 +751,14 @@ impl Model {
     /// Reads the whole document from the history again.
     fn resync(&mut self) -> Change {
         let (doc, index) = crdt::read(self.loro(), self.body());
+        let style = crdt::read_style(self.loro());
         let old = mem::replace(&mut self.doc, doc);
         self.index = index;
         self.queue().clear();
-        diff(&old, &self.doc)
+        let mut change = diff(&old, &self.doc);
+        change.document = (&old.language, &old.dictionary) != (&self.doc.language, &self.doc.dictionary);
+        change.style = mem::replace(&mut self.style, style) != self.style;
+        change
     }
 
     /// Makes the document follow a change to the sequence. Says what that touched, and gives the change
@@ -600,7 +783,7 @@ impl Model {
         // Blocks came, went or moved exactly when the ids or their nesting read differently in order.
         let structure = !before.iter().copied().eq(self.index.iter().map(|entry| (entry.hash, entry.level)));
         let blocks = built.dirty.into_iter().chain(moved.gone).collect();
-        (Change { blocks, structure }, Some(undo.finish()))
+        (Change { blocks, structure, ..Change::default() }, Some(undo.finish()))
     }
 
     /// The common case of [`Model::shift`]: a change inside one block's text edits that block in place.
@@ -644,7 +827,7 @@ impl Model {
                 if let Some(TextDelta::Retain { retain, .. }) = undo.first_mut() {
                     *retain += start;
                 }
-                Some((Change { blocks: BTreeSet::from([block.id.clone()]), structure: false }, Some(undo)))
+                Some((Change { blocks: BTreeSet::from([block.id.clone()]), ..Change::default() }, Some(undo)))
             }
             _ => {
                 let mut change = self.resync();
@@ -799,6 +982,9 @@ impl Model {
                 delta.push(TextDelta::Delete { delete: self.index[spot.i..end].iter().map(Entry::len).sum() });
                 self.settle(end, &mut delta);
             }
+            // These change no block. `apply` makes them itself.
+            Op::SetStyle { .. } | Op::SetPage { .. } | Op::ReplaceStyle { .. } => {}
+            Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. } => {}
         }
         Ok((delta, place))
     }
@@ -880,6 +1066,32 @@ impl Spot<'_> {
             seek(delta, chars);
         }
     }
+}
+
+/// Whether an operation changes the document's own fields or its style, and no block.
+fn is_setting(op: &Op) -> bool {
+    let style = matches!(op, Op::SetStyle { .. } | Op::SetPage { .. } | Op::ReplaceStyle { .. });
+    style || matches!(op, Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. })
+}
+
+/// Makes such an operation, on copies of the fields and the style.
+fn set(op: &Op, fields: &mut Document, style: &mut Style) -> Result<(), OpError> {
+    match op {
+        Op::SetLanguage { language } => fields.language.clone_from(language),
+        Op::AddWord { word } => drop(fields.dictionary.insert(word.clone())),
+        Op::RemoveWord { word } => drop(fields.dictionary.remove(word)),
+        Op::SetStyle { element, style: text } => drop(style.types.insert(element.clone(), text.clone())),
+        Op::SetPage { page } => style.page.clone_from(page),
+        Op::ReplaceStyle { style: whole } => style.clone_from(whole),
+        _ => {}
+    }
+    if matches!(op, Op::SetStyle { .. } | Op::SetPage { .. } | Op::ReplaceStyle { .. }) {
+        // The file format is the judge of what a style may hold.
+        Style::from_json(&style.to_json()).map_err(|error| OpError::BadStyle(error.to_string()))?;
+        *style = crdt::normal_style(style);
+    }
+    crdt::normal_meta(fields);
+    Ok(())
 }
 
 fn unreadable(error: impl fmt::Display) -> HistoryError {

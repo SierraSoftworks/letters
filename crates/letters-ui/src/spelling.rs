@@ -143,7 +143,7 @@ impl Spelling {
             self.own.learn(&fix.word);
         }
         self.reword();
-        self.proofing.invalidate(&Change { blocks: BTreeSet::from([fix.block]), structure: false });
+        self.proofing.invalidate(&Change { blocks: BTreeSet::from([fix.block]), ..Change::default() });
         self.check(1, doc, None, false, layout);
     }
 }

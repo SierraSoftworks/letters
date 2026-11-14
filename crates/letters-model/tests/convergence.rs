@@ -1,12 +1,13 @@
-//! Replicas that have seen the same edits show the same document, whatever the edits and their order.
+//! Replicas that have seen the same edits show the same document and style, whatever the edits and their
+//! order.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::ops::Range;
 
 use letters_model::{
-    Block, BlockId, BlockKind, Body, BodyShape, Change, Document, ListKind, Mark, Model, Op, OpError, Pos, ReplicaId,
-    Run, Tone,
+    Block, BlockId, BlockKind, Body, BodyShape, Change, Document, ListKind, Mark, Model, Op, OpError, Page, Pos,
+    ReplicaId, Run, Style, Tone,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -25,6 +26,17 @@ enum Edit {
     Kind { block: usize, kind: usize },
     Insert { parent: Option<usize>, index: usize, kind: usize, id: usize, text: String },
     Remove { block: usize },
+    Style { element: usize, field: usize, value: usize },
+    Page { field: usize, value: usize },
+    Language { language: usize },
+    Word { word: usize, add: bool },
+}
+
+/// Everything a replica shows.
+type Shown = (Document, Style);
+
+fn shown(model: &Model) -> Shown {
+    (model.doc().clone(), model.style().clone())
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +93,10 @@ fn edit() -> impl Strategy<Value = Edit> {
         2 => (proptest::option::of(n()), 0..4usize, n(), id(), text())
             .prop_map(|(parent, index, kind, id, text)| Edit::Insert { parent, index, kind, id, text }),
         2 => n().prop_map(|block| Edit::Remove { block }),
+        1 => (n(), n(), n()).prop_map(|(element, field, value)| Edit::Style { element, field, value }),
+        1 => (n(), n()).prop_map(|(field, value)| Edit::Page { field, value }),
+        1 => n().prop_map(|language| Edit::Language { language }),
+        1 => (n(), any::<bool>()).prop_map(|(word, add)| Edit::Word { word, add }),
     ]
 }
 
@@ -137,8 +153,8 @@ fn range(block: &Block, at: usize, len: usize) -> Range<usize> {
     starts[start]..starts[(start + len).min(starts.len() - 1)]
 }
 
-/// The operation an edit comes to in `doc`. `None` when the document has nothing for it to act on.
-fn op(doc: &Document, edit: &Edit) -> Option<Op> {
+/// The operation an edit comes to in what a replica shows. `None` when there is nothing for it to act on.
+fn op((doc, style): &Shown, edit: &Edit) -> Option<Op> {
     let all: Vec<&Block> = doc.walk().collect();
     let texts: Vec<&Block> = all.iter().copied().filter(|block| block.kind.shape() == BodyShape::Text).collect();
     let pick = |from: &[&Block], n: usize| (!from.is_empty()).then(|| from[n % from.len()].clone());
@@ -183,6 +199,29 @@ fn op(doc: &Document, edit: &Edit) -> Option<Op> {
             Op::InsertBlock { parent: parent.map(|parent| parent.id), index: index % (siblings + 1), block }
         }
         Edit::Remove { block } => Op::RemoveBlock { block: pick(&all, *block)?.id },
+        Edit::Style { element, field, value } => {
+            let element = ["body", "heading1", "aside"][element % 3];
+            let mut text = style.types.get(element).cloned().unwrap_or_default();
+            match field % 3 {
+                // The last size is one no style may hold.
+                0 => text.size = [9.0, 12.5, 30.0, 0.0][value % 4],
+                1 => text.weight = [400, 700][value % 2],
+                _ => text.color = ["#000000", "#ff0000"][value % 2].into(),
+            }
+            Op::SetStyle { element: element.into(), style: text }
+        }
+        // Either is a page on its own. A narrow page with a wide margin, as a merge can give, is none.
+        Edit::Page { field, value } => Op::SetPage {
+            page: match field % 2 {
+                0 => Page { width: [300.0, 595.0][value % 2], ..style.page.clone() },
+                _ => Page { margin_left: [71.0, 250.0][value % 2], ..style.page.clone() },
+            },
+        },
+        Edit::Language { language } => Op::SetLanguage { language: ["en", "fr", "de"][language % 3].into() },
+        Edit::Word { word, add } => {
+            let word = ["mot", "word", "字\u{1e}x"][word % 3].to_owned();
+            if *add { Op::AddWord { word } } else { Op::RemoveWord { word } }
+        }
     })
 }
 
@@ -200,22 +239,26 @@ fn outline(doc: &Document) -> Vec<(BlockId, usize)> {
 }
 
 /// What layout would get wrong by trusting `change`: the blocks that differ without being named, and
-/// `"structure"` when blocks moved without it saying so.
-fn missed(before: &Document, after: &Document, change: &Change) -> Vec<String> {
+/// whatever else differs without it saying so.
+fn missed((before, style): &Shown, (after, restyled): &Shown, change: &Change) -> Vec<String> {
     let own = |block: &Block| (block.kind.clone(), block.body.runs().to_vec(), block.extra.clone());
     let ids: BTreeSet<BlockId> = before.walk().chain(after.walk()).map(|block| block.id.clone()).collect();
     let differs = |id: &&BlockId| before.block(id).map(own) != after.block(id).map(own);
     let mut missed: Vec<String> =
         ids.iter().filter(differs).filter(|id| !change.blocks.contains(id)).map(BlockId::to_string).collect();
-    if outline(before) != outline(after) && !change.structure {
-        missed.push("structure".into());
-    }
+    let fields = |doc: &Document| (doc.language.clone(), doc.dictionary.clone());
+    let unsaid = [
+        ("structure", outline(before) != outline(after) && !change.structure),
+        ("style", style != restyled && !change.style),
+        ("document", fields(before) != fields(after) && !change.document),
+    ];
+    missed.extend(unsaid.iter().filter(|(_, unsaid)| *unsaid).map(|(what, _)| (*what).to_owned()));
     missed
 }
 
-/// The document as a replica that only ever read this one's history sees it.
-fn reread(model: &Model) -> Document {
-    Model::load(&model.save(), ReplicaId::from(99)).expect("a saved history loads").doc().clone()
+/// What a replica that only ever read this one's history shows.
+fn reread(model: &Model) -> Shown {
+    shown(&Model::load(&model.save(), ReplicaId::from(99)).expect("a saved history loads"))
 }
 
 fn unique_ids(doc: &Document) -> bool {
@@ -234,7 +277,7 @@ proptest! {
         let mut replicas = [first, Model::new(fixture(), ReplicaId::from(2)), third];
         let mut seen = vec![Vec::new(); REPLICAS];
         // Each replica's last edit, as the documents either side of it and whether it has been undone.
-        let mut last: Vec<Option<(Document, Document, bool)>> = vec![None; REPLICAS];
+        let mut last: Vec<Option<(Shown, Shown, bool)>> = vec![None; REPLICAS];
 
         for step in steps {
             let touched = match step {
@@ -242,12 +285,12 @@ proptest! {
                 Step::Visit { replica, .. } | Step::Rewrite { replica, .. } => replica,
                 Step::Sync { to, .. } => to,
             };
-            let before = replicas[touched].doc().clone();
+            let before = shown(&replicas[touched]);
             let change = match step {
                 Step::Edit { replica, edits } => {
                     let ops: Vec<Op> = edits.iter().filter_map(|edit| op(&before, edit)).collect();
                     let applied = replicas[replica].apply(ops);
-                    let after = replicas[replica].doc().clone();
+                    let after = shown(&replicas[replica]);
                     let reported = applied.as_ref().is_ok_and(|change| *change != Change::default());
                     prop_assert_eq!(reported, after != before, "an edit reports a change exactly when it made one");
                     seen[replica].push((replicas[replica].revision(), after.clone()));
@@ -260,7 +303,7 @@ proptest! {
                     let undone = replicas[replica].undo();
                     last[replica] = match last[replica].take() {
                         Some((before, after, false)) => {
-                            prop_assert_eq!(replicas[replica].doc(), &before, "undo did not take the last edit back");
+                            prop_assert_eq!(&shown(&replicas[replica]), &before, "undo did not take the last edit back");
                             Some((before, after, true))
                         }
                         _ => None,
@@ -271,7 +314,7 @@ proptest! {
                     let redone = replicas[replica].redo();
                     last[replica] = match last[replica].take() {
                         Some((before, after, true)) => {
-                            prop_assert_eq!(replicas[replica].doc(), &after, "redo did not make the edit again");
+                            prop_assert_eq!(&shown(&replicas[replica]), &after, "redo did not make the edit again");
                             Some((before, after, false))
                         }
                         Some(edited) => {
@@ -293,31 +336,33 @@ proptest! {
                 Step::Visit { replica, back } => {
                     last[replica] = None;
                     let model = &mut replicas[replica];
-                    if let Some((revision, shown)) = seen[replica].get(back % seen[replica].len().max(1)) {
+                    if let Some((revision, then)) = seen[replica].get(back % seen[replica].len().max(1)) {
                         model.checkout(revision).expect("a replica knows its own revisions");
-                        prop_assert_eq!(model.doc(), shown, "an old revision reads differently than it did");
+                        prop_assert_eq!(&shown(model), then, "an old revision reads differently than it did");
                         prop_assert!(model.is_latest() || model.apply([]) == Err(OpError::ReadOnly));
                     }
                     Some(model.checkout_latest())
                 }
                 Step::Rewrite { replica, edits } => {
                     last[replica] = None;
-                    let mut outside = Model::new(before.clone(), ReplicaId::from(98));
+                    let mut outside = Model::new(before.0.clone(), ReplicaId::from(98)).with_style(before.1.clone());
                     for edit in &edits {
-                        let _ = outside.apply(op(outside.doc(), edit));
+                        let _ = outside.apply(op(&shown(&outside), edit));
                     }
-                    let rewritten = replicas[replica].rewrite(outside.doc().clone());
-                    prop_assert_eq!(replicas[replica].doc(), outside.doc(), "a rewrite did not give its document");
-                    seen[replica].push((replicas[replica].revision(), outside.doc().clone()));
-                    rewritten.ok()
+                    let model = &mut replicas[replica];
+                    let rewritten = model.rewrite(outside.doc().clone());
+                    let restyled = model.rewrite_style(outside.style().clone());
+                    prop_assert_eq!(shown(model), shown(&outside), "a rewrite did not give what it was told");
+                    seen[replica].push((model.revision(), shown(model)));
+                    rewritten.ok().zip(restyled.ok()).map(|(change, restyled)| Change { style: restyled.style, ..change })
                 }
             };
 
             let model = &replicas[touched];
             if let Some(change) = change {
-                prop_assert_eq!(missed(&before, model.doc(), &change), Vec::<String>::new());
+                prop_assert_eq!(missed(&before, &shown(model), &change), Vec::<String>::new());
             }
-            prop_assert_eq!(model.doc(), &reread(model), "the document drifted from its history");
+            prop_assert_eq!(shown(model), reread(model), "the document drifted from its history");
             prop_assert!(unique_ids(model.doc()), "two blocks share an id");
         }
 
@@ -328,10 +373,12 @@ proptest! {
             }
         }
         let [first, second, third] = &replicas;
-        prop_assert_eq!(first.doc(), second.doc());
-        prop_assert_eq!(first.doc(), third.doc());
+        prop_assert_eq!(shown(first), shown(second));
+        prop_assert_eq!(shown(first), shown(third));
         prop_assert_eq!(first.compare(&third.save()), Ok(Some(Ordering::Equal)));
         let stored = Document::from_json(&first.doc().to_json());
         prop_assert_eq!(stored.as_ref(), Ok(first.doc()), "the merged document cannot be stored");
+        let stored = Style::from_json(&first.style().to_json());
+        prop_assert_eq!(stored.as_ref(), Ok(first.style()), "the merged style cannot be stored");
     }
 }

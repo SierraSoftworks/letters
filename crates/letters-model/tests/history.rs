@@ -1,54 +1,14 @@
 //! A document's history: merging replicas, moving between revisions, and positions that follow their text.
 
+mod common;
+
 use std::cmp::Ordering;
 
+use common::{doc, id, pair, saved, split, sync, texts, typed};
 use letters_model::{
-    Block, BlockId, BlockKind, Body, Change, Document, HistoryError, Hold, Mark, Model, Op, OpError, Pos, ReplicaId,
-    Revision, Run, StablePos,
+    Block, BlockKind, Body, Change, Document, HistoryError, Hold, Mark, Model, Op, OpError, Page, Pos, ReplicaId,
+    Revision, Run, StablePos, Style,
 };
-
-/// A paragraph `p` reading "Hello world", then a divider `d`, with every field of its own set.
-fn doc() -> Document {
-    let blocks = vec![Block::text("p", BlockKind::Paragraph, "Hello world"), Block::new("d", BlockKind::Divider)];
-    let mut doc = Document { blocks, language: "en-GB".into(), ..Document::default() };
-    doc.dictionary.insert("Letters".into());
-    doc.extra.insert("future".into(), serde_json::json!({ "kept": true }));
-    doc
-}
-
-/// Two replicas of [`doc`], as two devices that opened the same file.
-fn pair() -> (Model, Model) {
-    (Model::new(doc(), ReplicaId::from(1)), Model::new(doc(), ReplicaId::from(2)))
-}
-
-/// Gives each replica everything the other holds.
-fn sync(a: &mut Model, b: &mut Model) {
-    a.merge(&b.save()).unwrap();
-    b.merge(&a.save()).unwrap();
-}
-
-/// A file as a session left it: its document, and the history that leads there.
-fn saved() -> (Document, Vec<u8>) {
-    let mut writer = Model::new(doc(), ReplicaId::from(1));
-    writer.apply([typed("p", 11, "!")]).unwrap();
-    (writer.doc().clone(), writer.save())
-}
-
-fn id(id: &str) -> BlockId {
-    id.into()
-}
-
-fn typed(block: &str, offset: usize, text: &str) -> Op {
-    Op::InsertText { at: Pos::new(block, offset), text: text.into() }
-}
-
-fn split(block: &str, offset: usize, new_id: &str) -> Op {
-    Op::Split { at: Pos::new(block, offset), new_id: id(new_id) }
-}
-
-fn texts(model: &Model) -> Vec<String> {
-    model.doc().walk().map(Block::plain_text).collect()
-}
 
 /// A name, what each of two replicas does unseen by the other, and the text of every block once merged.
 type Concurrent = (&'static str, Vec<Op>, Vec<Op>, Vec<&'static str>);
@@ -400,7 +360,7 @@ fn a_prepared_history_is_attached_without_a_change() {
     let (file, history) = saved();
     for history in [None, Some(&history[..])] {
         let mut model = Model::new(file.clone(), ReplicaId::from(2));
-        let prepared = Model::prepare(file.clone(), history, ReplicaId::from(2)).unwrap();
+        let prepared = Model::new(file.clone(), ReplicaId::from(2)).prepare(history).unwrap();
         assert_eq!(model.attach(prepared), Change::default());
         assert_eq!(model.doc(), &file);
         if let Some(history) = history {
@@ -410,7 +370,7 @@ fn a_prepared_history_is_attached_without_a_change() {
         assert_eq!(texts(&model), ["Oh. Hello world!", ""]);
     }
     assert!(matches!(
-        Model::prepare(file, Some(b"not a history"), ReplicaId::from(2)),
+        Model::new(file, ReplicaId::from(2)).prepare(Some(b"not a history")),
         Err(HistoryError::Unreadable(_))
     ));
 }
@@ -421,7 +381,7 @@ fn a_file_without_a_history_keeps_the_one_its_model_started() {
     model.apply([typed("p", 0, "Oh. ")]).unwrap();
     let (revision, held) = (model.revision(), model.stable(&Pos::new("p", 4), Hold::Next).unwrap());
 
-    let prepared = Model::prepare(doc(), None, ReplicaId::from(2)).unwrap();
+    let prepared = Model::new(doc(), ReplicaId::from(2)).prepare(None).unwrap();
     assert_eq!(model.attach(prepared), Change::default());
     assert_eq!(model.revision(), revision);
     assert_eq!(model.resolve(&held), Some(Pos::new("p", 4)));
@@ -436,7 +396,7 @@ fn edits_made_before_a_history_is_attached_are_kept() {
     model.apply([typed("p", 0, "Oh. ")]).unwrap();
     let edited = model.doc().clone();
 
-    let prepared = Model::prepare(file, Some(&history), ReplicaId::from(2)).unwrap();
+    let prepared = Model::new(file, ReplicaId::from(2)).prepare(Some(&history)).unwrap();
     assert_eq!(model.attach(prepared), Change::default());
     assert_eq!(model.doc(), &edited);
     assert_eq!(model.compare(&history), Ok(Some(Ordering::Greater)));
@@ -461,7 +421,7 @@ fn a_file_changed_outside_is_one_more_change_in_its_history() {
     outside.dictionary.insert("mot".into());
 
     let mut model = Model::new(outside.clone(), ReplicaId::from(2));
-    let prepared = Model::prepare(outside.clone(), Some(&history), ReplicaId::from(2)).unwrap();
+    let prepared = Model::new(outside.clone(), ReplicaId::from(2)).prepare(Some(&history)).unwrap();
     assert_eq!(model.attach(prepared), Change::default());
     assert_eq!(model.doc(), &outside);
     assert_eq!(model.compare(&history), Ok(Some(Ordering::Greater)));
@@ -502,4 +462,53 @@ fn a_rewrite_changes_only_what_differs() {
         let typed = a.doc().block(&id("p")).is_some_and(|p| p.plain_text().starts_with("Hello,"));
         assert_eq!(typed, kept, "{name}: what another replica typed into a kept block stays");
     }
+}
+
+#[test]
+fn the_same_outside_edit_is_one_change_on_every_device() {
+    let (file, history) = saved();
+    let mut outside = file.clone();
+    outside.blocks[0].body =
+        Body::Text(vec![Run::plain("Hello "), Run::marked("there", [Mark::Bold, Mark::Italic]), Run::plain(" world!")]);
+    outside.blocks.insert(1, Block::text("q", BlockKind::Paragraph, "Aside"));
+    outside.dictionary.insert("mot".into());
+    let style = Style { page: Page { width: 400.0, ..Page::default() }, ..Style::default() };
+
+    // Two devices open the file another tool changed, each knowing only the history it holds.
+    let open = |replica: u64, doc: &Document| {
+        let file = || Model::new(doc.clone(), ReplicaId::from(replica)).with_style(style.clone());
+        let mut model = file();
+        model.attach(file().prepare(Some(&history)).unwrap());
+        model
+    };
+    let (mut a, b) = (open(2, &outside), open(3, &outside));
+    assert_eq!(a.compare(&b.save()), Ok(Some(Ordering::Equal)), "both hold the same history");
+    assert_eq!(a.merge(&b.save()), Ok(Change::default()));
+    assert_eq!((a.doc(), a.style()), (&outside, &style));
+
+    // A different change to the same file is another change, and both are kept.
+    let mut other = file;
+    other.blocks[0] = Block::text("p", BlockKind::Paragraph, "Hello world! Again");
+    let mut c = open(4, &other);
+    assert_eq!(a.compare(&c.save()), Ok(None));
+    sync(&mut a, &mut c);
+    assert_eq!(a.doc(), c.doc());
+    assert_eq!(texts(&a), ["Hello there world! Again", "Aside", ""]);
+}
+
+#[test]
+fn histories_that_share_nothing_are_told_apart() {
+    let (mut a, b) = pair();
+    a.apply([typed("p", 0, "Oh. ")]).unwrap();
+    let stranger =
+        Model::new(Document { blocks: vec![Block::text("p", BlockKind::Paragraph, "Other")], ..doc() }, 3.into());
+    let cases = [
+        ("a copy of the same file", b.save(), true),
+        ("a fork", a.fork(ReplicaId::from(4)).save(), true),
+        ("another document", stranger.save(), false),
+    ];
+    for (name, history, related) in cases {
+        assert_eq!(a.related(&history), Ok(related), "{name}");
+    }
+    assert!(matches!(a.related(b"not a history"), Err(HistoryError::Unreadable(_))));
 }

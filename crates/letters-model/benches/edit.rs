@@ -62,14 +62,15 @@ fn main() {
     // What the window waits for: the document on screen, and later the history handed over.
     let (shown, copy) = (doc.clone(), doc.clone());
     let (mut model, new) = timed(|| Model::new(shown, ReplicaId::from(1)));
-    let (prepared, start) = timed(|| Model::prepare(copy, None, ReplicaId::from(1)).expect("a new history"));
+    let (prepared, start) = timed(|| Model::new(copy, ReplicaId::from(1)).prepare(None).expect("a new history"));
     let (_, attach) = timed(|| model.attach(prepared));
     println!("new {new:.1?}, attach {attach:.1?}, within {OPEN:.0?} each");
     let mut kept = new <= OPEN && attach <= OPEN;
 
     // What runs away from the window.
     let (history, save) = timed(|| model.save());
-    let (_, read) = timed(|| Model::prepare(doc, Some(&history), ReplicaId::from(2)).expect("a saved history loads"));
+    let (_, read) =
+        timed(|| Model::new(doc, ReplicaId::from(2)).prepare(Some(&history)).expect("a saved history loads"));
     let (loaded, load) = timed(|| Model::load(&history, ReplicaId::from(2)).expect("a saved history loads"));
     let size = history.len() as f64 / 1e6;
     println!("prepare {start:.0?}, or {read:.0?} with a history; save {save:.0?} ({size:.1} MB), load {load:.0?}");
