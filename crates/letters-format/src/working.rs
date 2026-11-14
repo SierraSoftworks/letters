@@ -56,15 +56,19 @@ impl WorkingCopy {
 
     /// Reads a file for editing. `replica` is this session's id, fresh from the shell.
     ///
-    /// A file without a history starts one. So does a file whose `document.json` another tool has changed:
-    /// the document is the contract, so it wins over a history that no longer leads to it.
+    /// The document is the contract, so it wins over the history. A `document.json` that another tool has
+    /// changed goes into the history as one more change, and a file without a readable history starts one.
     pub fn open<R: Read + Seek>(file: &mut Archive<R>, replica: ReplicaId) -> Result<Self, Error> {
         let document = file.document()?;
         let history = file.read(OPLOG)?;
         let loaded = history.as_deref().and_then(|bytes| Model::load(bytes, replica).ok());
         let (model, history) = match loaded {
-            Some(model) if model.doc() == &document => (model, history),
-            _ => (Model::new(document, replica), None),
+            Some(mut model) => {
+                // A history that was just loaded shows its newest revision, which can be rewritten.
+                let _ = model.rewrite(document);
+                (model, history)
+            }
+            None => (Model::new(document, replica), None),
         };
         let style = file.style()?;
         let mut notes = file.notes()?;

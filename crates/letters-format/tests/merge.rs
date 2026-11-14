@@ -288,3 +288,21 @@ fn a_style_changed_on_one_device_reaches_the_other() {
         }
     }
 }
+
+#[test]
+fn a_document_changed_by_another_tool_opens_as_written_with_its_history_kept() {
+    let (folder, desk, _) = shared();
+    let mut package = open(&folder.files[NAME]).package().unwrap();
+    package.document.blocks[0] = paragraph("p", "Hello there world");
+    package.document.blocks.push(paragraph("q", "Added"));
+    let mut edited = Folder::default();
+    edited.put(NAME, bytes(&package));
+
+    let mut reopened = open_at(&edited, NAME, 4);
+    assert_eq!(reopened.model().doc(), &package.document, "the document is what the file says");
+    let held = reopened.model().compare(&desk.model().save()).unwrap();
+    assert_eq!(held, Some(Ordering::Greater), "the change is added to the history the file had");
+
+    assert!(matches!(save_from(&mut edited, &mut reopened, "desk"), Saved::Written));
+    assert!(level(&open_at(&edited, NAME, 5), &reopened), "and the next open finds nothing more to take in");
+}
