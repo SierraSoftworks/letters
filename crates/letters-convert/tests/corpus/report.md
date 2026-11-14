@@ -1,0 +1,32 @@
+# Rates for 2027
+
+Rates change on **1 January**. See the [notice](https://example.com/notice) from Zoë Okafor, priced in €.
+
+## What to do
+
+1. Read the notice
+2. Reply to `rates@example.com`
+   - *<u>by post</u>*
+
+- [x] ~~Tell the team~~
+- [ ] <mark>Update the site</mark>
+
+```rust
+fn rate() -> f32 {
+    4.5
+}
+
+```
+
+> Fair, and early.
+
+> [!NOTE]
+> Reply by Friday.
+>
+> > [!CAUTION]
+
+---
+
+A hologram of the rate card
+
+From a newer build

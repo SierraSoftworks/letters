@@ -39,6 +39,7 @@ skrifa = "0.49"
 bytemuck = "1"
 # Text shaping and line breaking. No system fonts: only the bundled faces are registered.
 parley = { version = "0.13", default-features = false, features = ["std"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # The desktop shell. None of these may reach the core crates.
 winit = "0.30"
