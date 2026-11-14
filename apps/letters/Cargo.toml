@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 letters-model.workspace = true
-letters-render.workspace = true
+letters-render = { workspace = true, features = ["gpu"] }
 letters-fonts.workspace = true
 letters-layout.workspace = true
 letters-editor.workspace = true
@@ -26,3 +26,4 @@ accesskit_winit.workspace = true
 arboard.workspace = true
 rfd.workspace = true
 getrandom.workspace = true
+pollster.workspace = true

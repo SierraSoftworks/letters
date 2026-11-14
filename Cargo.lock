@@ -1799,6 +1799,7 @@ dependencies = [
  "letters-layout",
  "letters-model",
  "letters-render",
+ "pollster 1.0.1",
  "rfd",
  "softbuffer",
  "winit",

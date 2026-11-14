@@ -5,30 +5,31 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Platform as _};
 use letters_model::Style;
+use letters_render::image::Images;
 use letters_render::{DisplayList, Point, Size};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy, OwnedDisplayHandle};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::cli::{Mode, Options};
 use crate::files::{self, EXTENSION, Home, Opened};
+use crate::gpu::Gpu;
 use crate::input::{self, Composer, Press};
 use crate::launch::{FIRST_FRAME, Launch};
 use crate::platform::Desktop;
-use crate::raster::Painter;
+use crate::present::{Painter, Presenter};
 use crate::view::{self, Cursor, View};
 
 const MAC: bool = cfg!(target_os = "macos");
@@ -42,11 +43,12 @@ const WHEEL_LINE: f32 = 40.0;
 const WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1100.0, 800.0);
 
 /// What reaches the event loop from outside winit.
-#[derive(Debug)]
 pub enum Event {
     Access(accesskit_winit::Event),
     /// A window's save has finished, and its result is ready to collect.
     Saved(WindowId),
+    /// The search for a GPU has ended, with one or without.
+    Gpu(Option<Box<Gpu>>),
 }
 
 impl From<accesskit_winit::Event> for Event {
@@ -69,7 +71,11 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         path: options.file,
         proxy: event_loop.create_proxy(),
         platform: Desktop::new(),
-        context: softbuffer::Context::new(event_loop.owned_display_handle())?,
+        gpu: match std::env::var("LETTERS_RENDERER").as_deref() {
+            Ok("cpu") => GpuState::Off,
+            Ok("gpu") => GpuState::Wanted { software: true },
+            _ => GpuState::Wanted { software: false },
+        },
         windows: HashMap::new(),
         mods: ModifiersState::empty(),
         failure: None,
@@ -98,7 +104,7 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<Launch, Box
     view.paint(&mut list);
     launch.mark("display list");
     let mut pixels = vec![0; (width * height) as usize];
-    Painter::new().paint(&list, scale as f32, view::PAGE, width, &mut pixels);
+    Painter::new().paint(&list, &Images::default(), scale as f32, view::PAGE, width, &mut pixels);
     launch.mark(FIRST_FRAME);
     Ok(launch)
 }
@@ -113,23 +119,36 @@ struct App {
     path: Option<PathBuf>,
     proxy: EventLoopProxy<Event>,
     platform: Desktop,
-    context: softbuffer::Context<OwnedDisplayHandle>,
+    gpu: GpuState,
     windows: HashMap<WindowId, DocWindow>,
     mods: ModifiersState,
     /// Why the app is exiting, when it is not by choice.
     failure: Option<String>,
 }
 
+/// Where the GPU stands. Windows paint on the CPU in every state but the last.
+enum GpuState {
+    /// Not to be used: `LETTERS_RENDERER=cpu`, or none was found.
+    Off,
+    /// To be looked for once the first frame is on screen. `software` accepts an adapter with no hardware.
+    Wanted {
+        software: bool,
+    },
+    Starting,
+    Ready(Box<Gpu>),
+}
+
 struct DocWindow {
-    window: Rc<Window>,
-    surface: softbuffer::Surface<OwnedDisplayHandle, Rc<Window>>,
+    window: Arc<Window>,
+    presenter: Presenter,
     access: accesskit_winit::Adapter,
     view: View,
-    painter: Painter,
     list: DisplayList,
     composer: Composer,
     pointer: Point,
     cursor: Cursor,
+    /// Whether the window has been offered the GPU. It is offered once, after its first frame.
+    gpu_offered: bool,
     /// Whether the accessibility tree is behind the view.
     access_stale: bool,
     /// When the view next wants a frame without being asked, on the editor's clock.
@@ -200,18 +219,10 @@ impl DocWindow {
 
     /// Paints one frame and puts it on screen.
     fn redraw(&mut self, now_ms: u64) -> Result<(), softbuffer::SoftBufferError> {
-        let size = self.window.inner_size();
-        let (Some(width), Some(height)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
-            return Ok(());
-        };
         self.wake_ms = self.view.animate(now_ms);
         self.list.items.clear();
         self.view.paint(&mut self.list);
-        self.surface.resize(width, height)?;
-        let mut buffer = self.surface.buffer_mut()?;
-        self.painter.paint(&self.list, self.window.scale_factor() as f32, view::PAGE, size.width, &mut buffer);
-        self.window.pre_present_notify();
-        buffer.present()
+        self.presenter.present(&self.list, view::PAGE)
     }
 
     /// Brings everything outside the canvas up to date with the view, after any event.
@@ -338,7 +349,7 @@ impl DocWindow {
     }
 }
 
-fn alert(parent: Option<&Rc<Window>>, message: &str) {
+fn alert(parent: Option<&Arc<Window>>, message: &str) {
     eprintln!("letters: {message}");
     let dialog = MessageDialog::new().set_level(MessageLevel::Error).set_title("Letters").set_description(message);
     match parent {
@@ -360,22 +371,22 @@ impl App {
             .with_min_inner_size(LogicalSize::new(360.0, 240.0))
             // AccessKit must attach before the window is first shown.
             .with_visible(false);
-        let window = Rc::new(event_loop.create_window(attributes)?);
+        let window = Arc::new(event_loop.create_window(attributes)?);
         let access = accesskit_winit::Adapter::with_event_loop_proxy(event_loop, &window, self.proxy.clone());
-        let surface = softbuffer::Surface::new(&self.context, window.clone())?;
+        let presenter = Presenter::new(window.clone())?;
         window.set_ime_allowed(true);
         self.mark("window created");
 
         let mut window = DocWindow {
             view: View::new(Editor::new(document), style),
             window,
-            surface,
+            presenter,
             access,
-            painter: Painter::new(),
             list: DisplayList::default(),
             composer: Composer::default(),
             pointer: Point::default(),
             cursor: Cursor::Default,
+            gpu_offered: false,
             access_stale: false,
             wake_ms: None,
             home,
@@ -500,8 +511,21 @@ impl ApplicationHandler<Event> for App {
                     launch.mark(FIRST_FRAME);
                     if self.report_launch {
                         println!("{FIRST_FRAME}\n{}", launch.report());
-                        event_loop.exit();
+                        return event_loop.exit();
                     }
+                }
+                // A frame is on screen, so the GPU can now be brought in without holding anything up.
+                match &mut self.gpu {
+                    GpuState::Wanted { software } => {
+                        let (software, proxy) = (*software, self.proxy.clone());
+                        thread::spawn(move || proxy.send_event(Event::Gpu(Gpu::start(software).map(Box::new))));
+                        self.gpu = GpuState::Starting;
+                    }
+                    GpuState::Ready(gpu) if !std::mem::replace(&mut window.gpu_offered, true) => {
+                        window.presenter.use_gpu(gpu);
+                        window.window.request_redraw();
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -578,6 +602,15 @@ impl ApplicationHandler<Event> for App {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.finish_save(now);
                 }
+            }
+            Event::Gpu(None) => self.gpu = GpuState::Off,
+            Event::Gpu(Some(mut gpu)) => {
+                for window in self.windows.values_mut() {
+                    window.gpu_offered = true;
+                    window.presenter.use_gpu(&mut gpu);
+                    window.window.request_redraw();
+                }
+                self.gpu = GpuState::Ready(gpu);
             }
             Event::Access(accesskit_winit::Event { window_id, window_event }) => {
                 let Some(window) = self.windows.get_mut(&window_id) else { return };

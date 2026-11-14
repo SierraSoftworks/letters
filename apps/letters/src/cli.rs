@@ -14,6 +14,10 @@ Options:
       --headless           With the two above: paint into memory, without a window
   -V, --version
   -h, --help
+
+Environment:
+  LETTERS_RENDERER=cpu     Never use the GPU
+  LETTERS_RENDERER=gpu     Use the GPU even when it is a software one
 ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
