@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Platform as _};
-use letters_model::{Document, ReplicaId, Style};
+use letters_model::{BlockId, ReplicaId, Style};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Size};
 // The editor's window is the view here, where `Window` is the system's.
@@ -237,6 +237,8 @@ struct DocWindow {
     keeps: bool,
     /// The path the recents list has for this document.
     listed: Option<PathBuf>,
+    /// The block the caret was last seen in, while the document has no name of its own.
+    caret: Option<BlockId>,
     /// The view's edit count that is safely on disk.
     saved_edits: u64,
     /// The edit count a save was last planned for.
@@ -302,15 +304,20 @@ impl DocWindow {
         self.listed = Some(path);
     }
 
-    /// Finds where a save of `document` goes, giving a new document its file name. `None` when there is
-    /// nothing to save, or nowhere: the first is settled here and the second is tried again.
-    fn settle(&mut self, document: &Document, caret: bool, library: &Library, now: Instant) -> Option<Home> {
-        let caret = self.view.editor().selection().filter(|_| caret).map(|selection| selection.head.block.clone());
-        let home = self.place.settle(document, caret.as_ref(), self.view.style(), library).map(|home| home.cloned());
+    /// Finds where a save goes, giving a new document its file and its name when they are due. `None` when
+    /// there is nothing to write yet, or nowhere to write it, which is tried again.
+    ///
+    /// With the `caret` counted, a first Heading 1 it is still in does not name the document yet.
+    fn settle(&mut self, caret: bool, library: &Library, now: Instant) -> Option<Home> {
+        let editor = self.view.editor();
+        let caret = editor.selection().filter(|_| caret).map(|selection| &selection.head.block);
+        let home = self.place.settle(editor.doc(), caret, self.view.style(), library).map(|home| home.cloned());
         match &home {
-            // A document with nothing in it has nothing to lose.
-            Ok(None) => (self.saved_edits, self.save_failed) = (self.view.edits(), false),
-            Ok(Some(_)) => {}
+            // A document with nothing in it has nothing to lose. A title still being typed is waited for.
+            Ok(None) if !has_content(editor.doc()) => {
+                (self.saved_edits, self.save_failed) = (self.view.edits(), false);
+            }
+            Ok(_) => {}
             Err(error) => {
                 eprintln!("letters: could not save {}: {error}", self.name());
                 self.save_failed = true;
@@ -363,6 +370,13 @@ impl DocWindow {
             self.save_at = Some(now + SAVE_AFTER);
             self.retitle();
         }
+        // A document with no name of its own takes its first heading's when the caret leaves it, which no
+        // edit need mark. So the caret's block is watched, and a move asks for what a save would settle.
+        let caret = self.view.editor().selection().map(|selection| &selection.head.block);
+        if self.keeps && self.place.naming() && caret != self.caret.as_ref() {
+            self.caret = caret.cloned();
+            self.save_at.get_or_insert(now + SAVE_AFTER);
+        }
     }
 
     /// Starts saving on another thread, unless a save is running or there is nothing to save.
@@ -374,8 +388,12 @@ impl DocWindow {
         if !self.keeps {
             return;
         }
+        let Some(home) = self.settle(true, library, now) else { return };
+        if !self.unsaved() {
+            // Only the name was due.
+            return self.relist(library);
+        }
         let document = self.view.editor().doc().clone();
-        let Some(home) = self.settle(&document, true, library, now) else { return };
         let (id, proxy) = (self.window.id(), proxy.clone());
         let save = thread::spawn(move || {
             let result = home.save(&document).map(|(home, _)| home).map_err(|error| error.to_string());
@@ -413,12 +431,12 @@ impl DocWindow {
     fn save_now(&mut self, caret: bool, library: &Library) -> bool {
         let now = Instant::now();
         self.finish_save(library, now);
+        let Some(home) = self.settle(caret, library, now) else { return !self.save_failed };
         if !self.unsaved() {
+            self.relist(library);
             return true;
         }
-        let document = self.view.editor().doc().clone();
-        let Some(home) = self.settle(&document, caret, library, now) else { return !self.save_failed };
-        let saved = home.save(&document);
+        let saved = home.save(self.view.editor().doc());
         self.save_failed = saved.is_err();
         match saved {
             Ok((home, _)) => {
@@ -483,6 +501,7 @@ impl App {
             place,
             keeps: self.typing.is_none() && !self.report_launch,
             listed: None,
+            caret: None,
             saved_edits: 0,
             noticed_edits: 0,
             save_at: None,
@@ -743,12 +762,9 @@ impl ApplicationHandler<Event> for App {
         let now = Instant::now();
         for window in self.windows.values_mut() {
             window.finish_save(&self.library, now);
-            if !window.unsaved() {
-                continue;
-            }
-            let document = window.view.editor().doc().clone();
-            if let Some(home) = window.settle(&document, false, &self.library, now)
-                && let Err(error) = home.save(&document)
+            if let Some(home) = window.settle(false, &self.library, now)
+                && window.unsaved()
+                && let Err(error) = home.save(window.view.editor().doc())
             {
                 eprintln!("letters: could not save {}: {error}", window.name());
             }

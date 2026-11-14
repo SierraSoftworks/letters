@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use letters_format::{file_name, suggested_name};
-use letters_model::{BlockId, BlockKind, BodyShape, Document, Style};
+use letters_model::{Block, BlockId, BlockKind, BodyShape, Document, Style};
 use serde_json::{Value, json};
 
 use crate::files::{EXTENSION, Home};
@@ -179,11 +179,16 @@ pub fn free_path(folder: &Path, name: &str) -> PathBuf {
 
 /// Whether a document holds anything worth a file.
 pub fn has_content(document: &Document) -> bool {
-    document.walk().any(|block| match block.kind.shape() {
+    document.walk().any(holds)
+}
+
+/// Whether a block is more than somewhere to type.
+fn holds(block: &Block) -> bool {
+    match block.kind.shape() {
         BodyShape::Text => !block.plain_text().trim().is_empty(),
         BodyShape::Blocks => false,
         BodyShape::None => true,
-    })
+    }
 }
 
 /// Why a document was not renamed or moved. Shown to its writer as it reads.
@@ -274,12 +279,17 @@ impl Place {
         self.home = Some(home);
     }
 
+    /// Whether the document still has no name of its own, so its first Heading 1 may give it one.
+    pub fn naming(&self) -> bool {
+        self.naming
+    }
+
     /// Gets the place ready for a save of `document`, and returns where it goes. `None` while the document
-    /// has no file and nothing worth one.
+    /// has no file and is not to have one yet.
     ///
-    /// A new document is named by what its writer typed in the bar, else by its first Heading 1, else
-    /// Untitled, with a number after a name that is taken. While the `caret` is still in that heading the
-    /// file is Untitled, and takes the heading's name at the first save after the caret has left it.
+    /// A new document takes its name once: what its writer typed in the bar, or its first Heading 1 when
+    /// the `caret` is no longer in it, with a number after a name that is taken. A title still being typed
+    /// is not written. Other text is, as Untitled, and that file is renamed when the name is taken.
     pub fn settle(
         &mut self,
         document: &Document,
@@ -288,27 +298,34 @@ impl Place {
         library: &Library,
     ) -> io::Result<Option<&Home>> {
         let heading = document.walk().find(|block| block.kind == BlockKind::Heading { level: 1 });
-        let titling = self.naming && caret.is_some() && caret == heading.map(|heading| &heading.id);
-        let suggested = || suggested_name(document).filter(|_| !titling);
+        let titling = heading.filter(|heading| self.naming && caret == Some(&heading.id));
+        let name = if titling.is_some() { None } else { suggested_name(document).filter(|_| self.naming) };
         match &self.home {
             None if !has_content(document) => return Ok(None),
+            // Nothing but the title: its file comes when it has its name.
+            None if titling.is_some_and(|title| !document.walk().any(|block| block.id != title.id && holds(block))) => {
+                return Ok(None);
+            }
             None => {
                 let folder = self.folder(library);
                 fs::create_dir_all(&folder)?;
-                let name = self.typed.take().or_else(suggested).unwrap_or_else(|| UNTITLED.into());
+                let name = self.typed.take().or(name);
+                self.naming &= name.is_none();
+                let name = name.unwrap_or_else(|| UNTITLED.into());
                 self.home = Some(Home::new(free_path(&folder, &name), style.clone()));
-                self.naming = titling;
             }
-            Some(home) if self.naming && !titling => {
-                self.naming = false;
-                // A heading that cannot name the file leaves it Untitled, and so does a move that fails.
-                let path = suggested().filter(|name| *name != home.title());
-                let path = path.map(|name| free_path(&folder_of(home.path()), &name));
-                if let Some(home) = path.and_then(|path| home.move_to(&path).ok()) {
-                    self.home = Some(home);
+            Some(home) => {
+                if let Some(name) = name {
+                    self.naming = false;
+                    // A move that fails leaves the document as it is, Untitled and whole.
+                    let path = free_path(&folder_of(home.path()), &name);
+                    if let Some(home) =
+                        Some(home).filter(|home| home.title() != name).and_then(|home| home.move_to(&path).ok())
+                    {
+                        self.home = Some(home);
+                    }
                 }
             }
-            Some(_) => {}
         }
         Ok(self.home.as_ref())
     }

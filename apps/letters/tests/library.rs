@@ -98,48 +98,71 @@ fn a_new_document_is_named_once() {
     let desk = Desk::new("naming");
     let library = desk.library();
     let plan = document(&[(H1, "Plan: 2027/28"), (TEXT, "First, the budget.")]);
-    // What is in the document, what was typed in the bar, and the name the file gets.
+    // What was typed in the bar, and the name the file gets.
     let cases = [
-        ("its first Heading 1", plan.clone(), None, "Plan 2027 28"),
-        ("no heading", document(&[(TEXT, "Dear all")]), None, "Untitled"),
-        ("a heading with nothing to name a file", document(&[(H1, "???"), (TEXT, "Dear all")]), None, "Untitled 2"),
-        ("a typed name wins over the heading", plan.clone(), Some("Budget"), "Budget"),
-        ("a name that is taken gets a number", plan.clone(), None, "Plan 2027 28 2"),
-        ("and the next one the next number", plan, None, "Plan 2027 28 3"),
+        ("its first Heading 1", None, "Plan 2027 28"),
+        ("a typed name wins over the heading", Some("Budget"), "Budget"),
+        ("a name that is taken gets a number", None, "Plan 2027 28 2"),
+        ("and the next one the next number", None, "Plan 2027 28 3"),
     ];
-    for (case, written, typed, name) in cases {
+    for (case, typed, name) in cases {
         let mut place = Place::new();
         if let Some(typed) = typed {
             place.rename(typed, &library).unwrap();
         }
-        let path = save(&mut place, &written, None, &library).unwrap();
+        let path = save(&mut place, &plan, None, &library).unwrap();
         assert_eq!(place.name(), name, "{case}");
-        assert_eq!(read(&path), written, "{case}");
+        assert_eq!(read(&path), plan, "{case}");
 
         // Later changes to the heading leave the name alone.
         let retitled = document(&[(H1, "Something else"), (TEXT, "Dear all")]);
         assert_eq!(save(&mut place, &retitled, None, &library).unwrap(), path, "{case}");
     }
-    assert_eq!(desk.names("").len(), 6, "every document kept its own file: {:?}", desk.names(""));
+    assert_eq!(desk.names("").len(), 4, "every document kept its own file: {:?}", desk.names(""));
 }
 
 #[test]
-fn a_heading_still_being_typed_names_the_file_when_it_is_left() {
+fn a_title_still_being_typed_is_not_a_name_yet() {
     let desk = Desk::new("titling");
     let library = desk.library();
     let mut place = Place::new();
 
     let typing = document(&[(H1, "Quart")]);
-    assert_eq!(save(&mut place, &typing, Some("b0"), &library).unwrap(), library.root().join("Untitled.let"));
+    assert_eq!(save(&mut place, &typing, Some("b0"), &library), None);
+    assert!(!library.root().exists(), "a title alone waits for its name");
 
     let typed = document(&[(H1, "Quarterly report"), (TEXT, "Sales rose.")]);
     let path = save(&mut place, &typed, Some("b1"), &library).unwrap();
     assert_eq!(path, library.root().join("Quarterly report.let"));
-    assert_eq!(desk.names(""), ["Quarterly report.let"], "the file was renamed, not copied");
     assert_eq!(read(&path), typed);
 
     let retitled = document(&[(H1, "Annual report"), (TEXT, "Sales rose.")]);
-    assert_eq!(save(&mut place, &retitled, Some("b1"), &library).unwrap(), path, "the heading names it once");
+    assert_eq!(save(&mut place, &retitled, Some("b0"), &library).unwrap(), path, "the heading names it once");
+    assert_eq!(desk.names(""), ["Quarterly report.let"]);
+}
+
+#[test]
+fn a_document_that_starts_with_text_is_untitled_until_a_heading_names_it() {
+    let desk = Desk::new("later");
+    let library = desk.library();
+    let untitled = library.root().join("Untitled.let");
+    // The document at each save, where the caret is, and the file it is in afterwards.
+    let steps = [
+        ("text alone", document(&[(TEXT, "Dear all")]), "b0", "Untitled"),
+        ("a heading still being typed", document(&[(H1, "Min"), (TEXT, "Dear all")]), "b0", "Untitled"),
+        ("a heading that names nothing", document(&[(H1, "???"), (TEXT, "Dear all")]), "b1", "Untitled"),
+        ("the heading, once it is left", document(&[(H1, "Minutes"), (TEXT, "Dear all")]), "b1", "Minutes"),
+        ("another heading later", document(&[(H1, "Agenda"), (TEXT, "Dear all")]), "b1", "Minutes"),
+    ];
+    let mut place = Place::new();
+    for (step, written, caret, name) in steps {
+        let path = save(&mut place, &written, Some(caret), &library).unwrap();
+        assert_eq!(place.name(), name, "{step}");
+        assert_eq!(place.naming(), name == "Untitled", "{step}");
+        assert_eq!(read(&path), written, "{step}");
+        assert_eq!(desk.names(""), [format!("{name}.let")], "{step}: the one file was renamed, not copied");
+    }
+    assert!(!untitled.exists());
 }
 
 #[test]
