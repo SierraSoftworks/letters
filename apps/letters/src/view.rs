@@ -4,7 +4,7 @@
 //! is a change of type. It drives the editor and the layout directly and has no chrome.
 
 use accesskit::{ActionRequest, TreeUpdate};
-use letters_editor::{Editor, InputEvent, Key, KeyEvent, Modifiers, Platform};
+use letters_editor::{Clip, Command, Editor, InputEvent, KeyEvent, Lines, Modifiers, Platform};
 use letters_layout::{DocLayout, Fonts, Palette};
 use letters_model::{Change, Pos, Selection, Style};
 use letters_render::{DisplayList, Item, Point, Rect, Size};
@@ -18,6 +18,9 @@ const CARET_WIDTH: f32 = 1.5;
 const BLINK_MS: u64 = 530;
 /// How much text one idle step lays out: about 2 ms of work.
 const SETTLE_BYTES: usize = 8192;
+/// Clicks this close together, in time and place, count as one double or triple click.
+const CLICK_MS: u64 = 500;
+const CLICK_SLOP: f32 = 4.0;
 /// Points to logical pixels.
 const PT: f32 = 96.0 / 72.0;
 
@@ -43,8 +46,8 @@ pub struct View {
     scroll: f32,
     focused: bool,
     dragging: bool,
-    /// The horizontal position vertical movement keeps to.
-    goal_x: Option<f32>,
+    /// The last press of the pointer: when, where, and which click of a double or triple it was.
+    clicked: Option<(u64, Point, u8)>,
     /// When the caret last moved. It shows solid from then, and blinks after.
     caret_moved_ms: u64,
     caret_shown: bool,
@@ -66,7 +69,7 @@ impl View {
             scroll: 0.0,
             focused: true,
             dragging: false,
-            goal_x: None,
+            clicked: None,
             caret_moved_ms: 0,
             caret_shown: true,
             edits: 0,
@@ -163,6 +166,15 @@ impl View {
             }
         }
         self.layout.paint(viewport, out);
+        // Text an input method is still composing is underlined.
+        if let Some((block, range)) = self.editor.composition() {
+            let at = |offset| Pos { block: block.clone(), offset };
+            let composing = Selection { anchor: at(range.start), head: at(range.end) };
+            for line in self.layout.selection_in(&composing, viewport) {
+                let rect = Rect { y: line.y + line.height - 1.0, height: 1.0, ..line };
+                out.push(Item::Fill { rect, color: self.palette.text, radius: 0.0 });
+            }
+        }
         if self.focused
             && self.caret_shown
             && let Some(caret) = self.caret()
@@ -233,29 +245,27 @@ impl View {
         Some(self.caret_moved_ms + (phase + 1) * BLINK_MS)
     }
 
-    /// Offers a key to the editor, then to the view. `false` means neither used it.
+    /// What the editor is lent: the shell's platform, and the laid-out lines to move between.
+    fn lend<'a>(layout: &'a DocLayout, size: Size, platform: &'a mut dyn Platform) -> Lent<'a> {
+        Lent { platform, lines: LaidOut { layout, page: (size.height - 2.0 * TOP).max(TOP) } }
+    }
+
+    /// Offers a key to the editor. `false` means it is the shell's to use.
     pub fn key(&mut self, event: KeyEvent, platform: &mut dyn Platform) -> bool {
-        if let Some(change) = self.editor.key(event.clone(), platform) {
-            self.goal_x = None;
-            self.changed(&change);
-            return true;
-        }
-        match event.key {
-            Key::Up | Key::Down if !event.mods.primary && !event.mods.alt => {
-                self.step_line(event.key == Key::Down, event.mods.shift)
-            }
-            Key::PageUp | Key::PageDown => {
-                let page = (self.size.height - 2.0 * TOP).max(TOP);
-                self.scroll_by(if event.key == Key::PageDown { page } else { -page });
-                true
-            }
-            _ => false,
-        }
+        let Some(change) = self.editor.key(event, &mut Self::lend(&self.layout, self.size, platform)) else {
+            return false;
+        };
+        self.changed(&change);
+        true
     }
 
     pub fn input(&mut self, event: InputEvent, platform: &mut dyn Platform) {
-        let change = self.editor.input(event, platform);
-        self.goal_x = None;
+        let change = self.editor.input(event, &mut Self::lend(&self.layout, self.size, platform));
+        self.changed(&change);
+    }
+
+    pub fn run(&mut self, command: Command, platform: &mut dyn Platform) {
+        let change = self.editor.run(command, &mut Self::lend(&self.layout, self.size, platform));
         self.changed(&change);
     }
 
@@ -267,19 +277,6 @@ impl View {
             self.estimated = true;
         }
         self.reveal_caret();
-    }
-
-    /// Moves the head of the selection one visual line, which only the layout can do.
-    fn step_line(&mut self, down: bool, extend: bool) -> bool {
-        let Some(selection) = self.editor.selection().cloned() else { return false };
-        let Some(caret) = self.layout.caret(&selection.head) else { return false };
-        let x = *self.goal_x.get_or_insert(caret.x);
-        if let Some(head) = self.layout.line_step(&selection.head, x, down) {
-            let anchor = if extend { selection.anchor } else { head.clone() };
-            self.editor.select(Selection { anchor, head });
-            self.reveal_caret();
-        }
-        true
     }
 
     /// Scrolls just far enough to show the head of the selection, and restarts the caret's blink.
@@ -317,16 +314,28 @@ impl View {
         self.layout.hit(Point { x: at.x - column.x, y: at.y - column.y })
     }
 
-    pub fn pointer_down(&mut self, at: Point, mods: Modifiers, _platform: &mut dyn Platform) {
+    pub fn pointer_down(&mut self, at: Point, mods: Modifiers, platform: &mut dyn Platform) {
         let Some(head) = self.hit(at) else { return };
+        let now_ms = platform.now_ms();
+        let near = |was: Point| (was.x - at.x).abs() <= CLICK_SLOP && (was.y - at.y).abs() <= CLICK_SLOP;
+        let clicks = match self.clicked {
+            Some((then_ms, was, clicks)) if now_ms.saturating_sub(then_ms) <= CLICK_MS && near(was) => clicks % 3 + 1,
+            _ => 1,
+        };
+        self.clicked = Some((now_ms, at, clicks));
+
         let anchor = match self.editor.selection() {
-            Some(selection) if mods.shift => selection.anchor.clone(),
+            Some(selection) if mods.shift && clicks == 1 => selection.anchor.clone(),
             _ => head.clone(),
         };
         self.editor.select(Selection { anchor, head });
-        self.dragging = true;
-        self.goal_x = None;
-        self.reveal_caret();
+        // A second click takes the word and a third the block. Only a single click starts a drag.
+        self.dragging = clicks == 1;
+        match clicks {
+            2 => self.run(Command::SelectWord, platform),
+            3 => self.run(Command::SelectBlock, platform),
+            _ => self.reveal_caret(),
+        }
     }
 
     pub fn pointer_move(&mut self, at: Point, _platform: &mut dyn Platform) {
@@ -354,11 +363,68 @@ impl View {
         match access::request(self.editor.doc(), &request) {
             Some(Request::Select(selection)) => {
                 self.editor.select(selection);
-                self.goal_x = None;
                 self.reveal_caret();
             }
             Some(Request::Replace(text)) => self.input(InputEvent::Insert(text), platform),
             None => {}
         }
+    }
+}
+
+/// The laid-out document, as the editor asks about its lines.
+struct LaidOut<'a> {
+    layout: &'a DocLayout,
+    /// How far Page Up and Page Down move.
+    page: f32,
+}
+
+impl Lines for LaidOut<'_> {
+    fn caret_x(&self, pos: &Pos) -> Option<f32> {
+        Some(self.layout.caret(pos)?.x)
+    }
+
+    fn line_step(&self, pos: &Pos, x: f32, down: bool) -> Option<Pos> {
+        self.layout.line_step(pos, x, down)
+    }
+
+    fn line_edge(&self, pos: &Pos, end: bool) -> Option<Pos> {
+        let caret = self.layout.caret(pos)?;
+        // Far enough to either side to be past any line.
+        let x = if end { 1.0e6 } else { -1.0e6 };
+        self.layout.hit(Point { x, y: caret.y + caret.height / 2.0 })
+    }
+
+    fn page_lines(&self) -> usize {
+        // Every line is taken to be as tall as the first: near enough for a page's worth of movement.
+        let line = self.layout.hit(Point::default()).and_then(|pos| self.layout.caret(&pos)).map(|caret| caret.height);
+        line.map_or(20, |line| (self.page / line.max(1.0)) as usize).max(1)
+    }
+}
+
+/// The shell's platform with the document's lines added.
+struct Lent<'a> {
+    platform: &'a mut dyn Platform,
+    lines: LaidOut<'a>,
+}
+
+impl Platform for Lent<'_> {
+    fn now_ms(&self) -> u64 {
+        self.platform.now_ms()
+    }
+
+    fn clipboard_read(&mut self) -> Option<Clip> {
+        self.platform.clipboard_read()
+    }
+
+    fn clipboard_write(&mut self, clip: Clip) {
+        self.platform.clipboard_write(clip)
+    }
+
+    fn new_id(&mut self) -> String {
+        self.platform.new_id()
+    }
+
+    fn lines(&self) -> Option<&dyn Lines> {
+        Some(&self.lines)
     }
 }

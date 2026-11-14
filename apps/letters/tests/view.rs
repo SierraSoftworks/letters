@@ -1,6 +1,6 @@
 use letters::platform::Desktop;
 use letters::view::View;
-use letters_editor::{Editor, InputEvent, Modifiers};
+use letters_editor::{Editor, InputEvent, Key, KeyEvent, Modifiers};
 use letters_layout::{Palette, Scheme};
 use letters_model::{Block, BlockKind, Document, Style};
 use letters_render::{Color, DisplayList, Item, Point, Size};
@@ -133,4 +133,73 @@ fn a_new_palette_recolours_the_page_at_the_next_frame() {
     let list = paint(&mut view);
     assert!(matches!(list.items.first(), Some(Item::Fill { color, .. }) if *color == page), "{:?}", list.items.first());
     assert_eq!(view.palette().page, page, "the window is cleared to the same colour");
+}
+
+#[test]
+fn keys_move_the_caret_along_and_between_the_laid_out_lines() {
+    let mut view = view(40);
+    let platform = &mut Desktop::new();
+    let mut press = |view: &mut View, key: Key, primary: bool| {
+        let used = view.key(KeyEvent { key, mods: Modifiers { primary, ..Modifiers::default() } }, platform);
+        (used, view.caret_rect().unwrap())
+    };
+    view.pointer_down(IN_TEXT, Modifiers::default(), &mut Desktop::new());
+    let clicked = view.caret_rect().unwrap();
+
+    let (_, end) = press(&mut view, Key::End, false);
+    assert!(end.x > clicked.x && end.y == clicked.y, "End went from {clicked:?} to {end:?}");
+    let (_, home) = press(&mut view, Key::Home, false);
+    assert!(home.x < clicked.x && home.y == clicked.y, "Home went from {end:?} to {home:?}");
+    let (_, down) = press(&mut view, Key::Down, false);
+    assert!(down.y > home.y, "Down went from {home:?} to {down:?}");
+    let (_, up) = press(&mut view, Key::Up, false);
+    assert_eq!(up.y, home.y);
+
+    let (used, _) = press(&mut view, Key::Char('s'), true);
+    assert!(!used, "a key the editor has no use for is left to the shell");
+    assert_eq!(view.edits(), 0, "moving is not an edit");
+}
+
+#[test]
+fn a_second_click_takes_the_word_and_a_third_the_block() {
+    let mut view = view(40);
+    let platform = &mut Desktop::new();
+    let mut click = |view: &mut View, at: Point| {
+        view.pointer_down(at, Modifiers::default(), platform);
+        view.pointer_up(at, platform);
+        let selection = view.editor().selection().cloned().unwrap();
+        let (from, to) =
+            (selection.anchor.offset.min(selection.head.offset), selection.anchor.offset.max(selection.head.offset));
+        assert_eq!(selection.anchor.block, selection.head.block);
+        (view.editor().doc().block(&selection.head.block).unwrap().plain_text(), from..to)
+    };
+
+    let (_, caret) = click(&mut view, IN_TEXT);
+    assert!(caret.is_empty());
+    let (text, word) = click(&mut view, IN_TEXT);
+    assert!(!word.is_empty() && !text[word.clone()].contains(' '), "selected {:?}", &text[word]);
+    let (text, block) = click(&mut view, IN_TEXT);
+    assert_eq!(block, 0..text.len());
+
+    let (_, elsewhere) = click(&mut view, Point { x: IN_TEXT.x + 60.0, y: IN_TEXT.y });
+    assert!(elsewhere.is_empty(), "a click somewhere else starts again");
+}
+
+#[test]
+fn text_being_composed_is_underlined_until_it_is_committed() {
+    let mut view = view(3);
+    let platform = &mut Desktop::new();
+    let ink = view.palette().text;
+    let underlines = |view: &mut View| {
+        let underline =
+            |item: &Item| matches!(item, Item::Fill { rect, color, .. } if *color == ink && rect.height <= 2.0);
+        paint(view).items.iter().filter(|item| underline(item)).count()
+    };
+    assert_eq!(underlines(&mut view), 0);
+
+    view.input(InputEvent::SetComposition { text: "ni".into(), selection: None }, platform);
+    assert_eq!(underlines(&mut view), 1);
+    view.input(InputEvent::Commit("你".into()), platform);
+    assert_eq!(underlines(&mut view), 0);
+    assert!(view.editor().doc().blocks[0].plain_text().starts_with("你WARM"));
 }
