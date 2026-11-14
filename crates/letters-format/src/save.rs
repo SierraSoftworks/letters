@@ -117,8 +117,10 @@ pub fn save(files: &mut impl Files, replica: &mut impl Replica, save: &Save) -> 
         };
         base = None;
         if let Some(bytes) = disk {
-            match open(bytes, replica) {
-                Ok(copy) => base = Some(copy),
+            let (copy, merged) = open(bytes, replica);
+            base = copy;
+            match merged {
+                Ok(()) => {}
                 // Another document, a newer build's file, or changes we cannot merge are never ours to replace.
                 Err(error @ (Error::OtherDocument(_) | Error::NewerFormat(_) | Error::Unmerged)) => {
                     cause = error;
@@ -187,13 +189,22 @@ fn folder(error: io::Error) -> Error {
 }
 
 /// Opens what was read from disk and merges it into memory.
-fn open(bytes: Vec<u8>, replica: &mut impl Replica) -> Result<DiskCopy, Error> {
-    let mut copy = Archive::open(Cursor::new(bytes))?;
+///
+/// A copy of this document that could not be merged is handed back all the same: the conflict copy carries
+/// over its unloaded entries.
+fn open(bytes: Vec<u8>, replica: &mut impl Replica) -> (Option<DiskCopy>, Result<(), Error>) {
+    let mut copy = match Archive::open(Cursor::new(bytes)) {
+        Ok(copy) => copy,
+        Err(error) => return (None, Err(error)),
+    };
     if copy.manifest().id != replica.id() {
-        return Err(Error::OtherDocument(copy.manifest().id.clone()));
+        return (None, Err(Error::OtherDocument(copy.manifest().id.clone())));
     }
-    replica.merge(&mut copy)?;
-    Ok(copy)
+    match replica.merge(&mut copy) {
+        Ok(()) => (Some(copy), Ok(())),
+        Err(Error::Unmerged) => (Some(copy), Err(Error::Unmerged)),
+        Err(error) => (None, Err(error)),
+    }
 }
 
 /// Splits `report.let` into `report` and `.let`.

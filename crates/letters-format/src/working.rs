@@ -33,6 +33,9 @@ pub struct WorkingCopy {
     seen: BTreeMap<String, String>,
     /// The style the file last held, which tells a change made here from one made by another writer.
     seen_style: Style,
+    /// Whether the file's style or notes are ones this build cannot read, as a newer build's may be. Such an
+    /// entry is carried over as it is.
+    unread: Unread,
     /// The history as the file last held it, read or written. Written back as it is while the model holds
     /// nothing more, so that writers with the same edits write the same bytes.
     history: Option<Vec<u8>>,
@@ -50,6 +53,7 @@ impl WorkingCopy {
             entries: BTreeMap::new(),
             seen: BTreeMap::new(),
             seen_style: Style::default(),
+            unread: Unread::default(),
             history: None,
         }
     }
@@ -70,8 +74,7 @@ impl WorkingCopy {
             }
             None => (Model::new(document, replica), None),
         };
-        let style = file.style()?;
-        let mut notes = file.notes()?;
+        let (style, mut notes, unread) = Unread::read(file)?;
         notes.pin(&model);
         let manifest = file.manifest();
         Ok(Self {
@@ -83,6 +86,7 @@ impl WorkingCopy {
             notes,
             entries: BTreeMap::new(),
             seen: manifest.hashes.clone(),
+            unread,
             history,
         })
     }
@@ -120,7 +124,11 @@ impl WorkingCopy {
     /// read. Fails with [`Error::Unmerged`] when its history does not lead to its document or does not share
     /// a start with this one, which a merge cannot reconcile.
     pub fn merge_from<R: Read + Seek>(&mut self, other: &mut Archive<R>) -> Result<Change, Error> {
-        let change = self.take_in(other)?;
+        let (change, unread) = self.take_in(other)?;
+        if unread != Unread::default() {
+            // Its style or notes would be left behind, and a merged copy is one the user may throw away.
+            return Err(Error::Unmerged);
+        }
         // The save writes over this document's own file, so what only the other file holds comes into memory.
         let core = |name: &str| [DOCUMENT, STYLE, NOTES].contains(&name) || name.starts_with(HISTORY);
         let names: Vec<String> = other.names().filter(|name| !core(name)).map(str::to_owned).collect();
@@ -133,8 +141,8 @@ impl WorkingCopy {
         Ok(change)
     }
 
-    /// Merges the history and notes of another copy, and settles on a style.
-    fn take_in<R: Read + Seek>(&mut self, other: &mut Archive<R>) -> Result<Change, Error> {
+    /// Merges the history and notes of another copy, and settles on a style. Says what of it could not be read.
+    fn take_in<R: Read + Seek>(&mut self, other: &mut Archive<R>) -> Result<(Change, Unread), Error> {
         let document = other.document()?;
         let replica = self.model.replica();
         // Their copy is only read here, so sharing this replica's id with it writes nothing under that id.
@@ -158,9 +166,8 @@ impl WorkingCopy {
                 (theirs, None)
             }
         };
-        let mut notes = other.notes()?;
+        let (style, mut notes, unread) = Unread::read(other)?;
         notes.pin(&theirs);
-        let style = other.style()?;
 
         self.notes.pin(&self.model);
         let change = match &history {
@@ -172,14 +179,16 @@ impl WorkingCopy {
 
         // The style is not in the history yet, so there is no telling which of two changes came last. A
         // change made by the other writer is taken unless this one changed the style too.
-        if style != self.seen_style && self.style == self.seen_style {
-            self.style = style.clone();
+        if !unread.style {
+            if style != self.seen_style && self.style == self.seen_style {
+                self.style = style.clone();
+            }
+            self.seen_style = style;
         }
-        self.seen_style = style;
         if history.is_some() {
             self.history = history;
         }
-        Ok(change)
+        Ok((change, unread))
     }
 }
 
@@ -191,8 +200,12 @@ impl Replica for WorkingCopy {
     fn merge(&mut self, disk: &mut DiskCopy) -> Result<(), Error> {
         let held = &disk.manifest().hashes;
         if held != &self.seen {
-            self.take_in(disk)?;
+            (_, self.unread) = self.take_in(disk)?;
             self.seen = disk.manifest().hashes.clone();
+        }
+        // Notes this build cannot read are other people's words, which a note added here must not replace.
+        if self.unread.notes && !self.notes.notes.is_empty() {
+            return Err(Error::Unmerged);
         }
         // A save that lost a race is replaced by a file without its new assets, so they stay in memory until
         // the file is read back with them in it.
@@ -210,8 +223,14 @@ impl Replica for WorkingCopy {
             document: self.model.doc().clone(),
             entries: self.entries.clone(),
         };
-        package.set_style(&self.style);
-        package.set_notes(&self.notes);
+        // An entry left out is carried over from the file as it is. A style changed here states the whole
+        // style, so it replaces one that could not be read.
+        if !(self.unread.style && self.style == self.seen_style) {
+            package.set_style(&self.style);
+        }
+        if !(self.unread.notes && self.notes.notes.is_empty()) {
+            package.set_notes(&self.notes);
+        }
         package.entries.insert(OPLOG.into(), history);
         package
     }
@@ -219,6 +238,27 @@ impl Replica for WorkingCopy {
     fn saved(&mut self, mut written: Package, manifest: &Manifest) {
         self.seen = manifest.hashes.clone();
         self.seen_style = self.style.clone();
+        self.unread.style &= !written.entries.contains_key(STYLE);
+        self.unread.notes &= !written.entries.contains_key(NOTES);
         self.history = written.entries.remove(OPLOG);
+    }
+}
+
+/// Which entries of a file this build could not read.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Unread {
+    style: bool,
+    notes: bool,
+}
+
+impl Unread {
+    /// The style and notes of `file`. One that cannot be read is given as the default, and marked.
+    fn read<R: Read + Seek>(file: &mut Archive<R>) -> Result<(Style, Notes, Self), Error> {
+        let (style, notes) = (file.style(), file.notes());
+        let unread =
+            Self { style: matches!(style, Err(Error::Style(_))), notes: matches!(notes, Err(Error::Notes(_))) };
+        let style = if unread.style { Style::default() } else { style? };
+        let notes = if unread.notes { Notes::default() } else { notes? };
+        Ok((style, notes, unread))
     }
 }

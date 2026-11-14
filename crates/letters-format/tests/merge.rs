@@ -5,7 +5,7 @@ mod common;
 use std::cmp::Ordering;
 
 use common::{Folder, ID, bytes, open, package, paragraph};
-use letters_format::{Error, OPLOG, Package, Save, Saved, WorkingCopy, conflict_copy_of, save};
+use letters_format::{Error, NOTES, OPLOG, Package, STYLE, Save, Saved, WorkingCopy, conflict_copy_of, save};
 use letters_model::{Anchor, BlockId, Document, Note, NoteKind, Op, Pos, ReplicaId, Run, Style};
 
 const NAME: &str = "report.let";
@@ -305,4 +305,51 @@ fn a_document_changed_by_another_tool_opens_as_written_with_its_history_kept() {
 
     assert!(matches!(save_from(&mut edited, &mut reopened, "desk"), Saved::Written));
     assert!(level(&open_at(&edited, NAME, 5), &reopened), "and the next open finds nothing more to take in");
+}
+
+/// The file [`shared`] starts from, with one entry replaced by something no build reads.
+fn with_unreadable(entry: &str) -> Vec<u8> {
+    let mut package = open(&opened_bytes()).package().unwrap();
+    package.entries.insert(entry.into(), b"from a newer build".to_vec());
+    bytes(&package)
+}
+
+#[test]
+fn an_entry_this_build_cannot_read_is_carried_over() {
+    // The entry, and whether the file was opened before it became unreadable.
+    for (entry, opened_before) in [(STYLE, false), (STYLE, true), (NOTES, false), (NOTES, true)] {
+        let why = format!("{entry}, opened before: {opened_before}");
+        let unreadable = with_unreadable(entry);
+        let (mut folder, mut desk, _) = if opened_before { shared() } else { opened(unreadable.clone()) };
+        folder.put(NAME, unreadable);
+        assert_eq!(desk.style, Style::default(), "{why}: the built-in style stands in");
+
+        typed(&mut desk, 0, "Oh. ");
+        let saved = save_from(&mut folder, &mut desk, "desk");
+        assert!(matches!(saved, Saved::Written), "{why}: {saved:?}");
+        let mut file = open(&folder.files[NAME]);
+        assert_eq!(text(&file.document().unwrap()), "Oh. Hello world", "{why}");
+        assert_eq!(file.read(entry).unwrap().unwrap(), b"from a newer build", "{why}");
+        assert_eq!(folder.names(), [NAME], "{why}");
+    }
+}
+
+#[test]
+fn a_style_changed_here_replaces_one_that_cannot_be_read() {
+    let (mut folder, mut desk, _) = opened(with_unreadable(STYLE));
+    desk.style.page.margin_left = 99.0;
+    let saved = save_from(&mut folder, &mut desk, "desk");
+    assert!(matches!(saved, Saved::Written), "{saved:?}");
+    assert_eq!(open(&folder.files[NAME]).style().unwrap(), desk.style);
+}
+
+#[test]
+fn a_note_added_here_never_replaces_notes_that_cannot_be_read() {
+    let original = with_unreadable(NOTES);
+    let (mut folder, mut desk, _) = opened(original.clone());
+    comment(&mut desk, "desk", 6..11);
+    let saved = save_from(&mut folder, &mut desk, "desk");
+    let Saved::ConflictCopy { name, cause: Error::Unmerged } = saved else { panic!("{saved:?}") };
+    assert_eq!(folder.files[NAME], original, "the file is left alone");
+    assert_eq!(note_ids(&open_at(&folder, &name, 4)), ["desk"]);
 }

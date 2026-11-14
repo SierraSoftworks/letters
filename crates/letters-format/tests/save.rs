@@ -177,7 +177,9 @@ fn a_file_that_cannot_be_merged_is_left_alone() {
     let saved = save(&mut folder, &mut Unmergeable(ours().0), &SAVE).unwrap();
     let Saved::ConflictCopy { name, cause: Error::Unmerged } = saved else { panic!("{saved:?}") };
     assert_eq!(folder.files[NAME], original);
-    assert_eq!(block_ids(&on_disk(&folder, &name)), ["p", "ours"]);
+    let copy = on_disk(&folder, &name);
+    assert_eq!(block_ids(&copy), ["p", "ours"]);
+    assert!(copy.entries.contains_key("assets/theirs.png"), "the copy is whole: it takes the file's assets along");
     assert_eq!(folder.waits, 0, "waiting would not make it mergeable");
 }
 
