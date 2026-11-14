@@ -6,7 +6,7 @@
 
 use std::io::{self, Cursor};
 
-use crate::{Archive, Error, Package, Plan};
+use crate::{Archive, Error, Manifest, Package, Plan};
 
 /// One folder, as the shell lends it. Names are file names inside it.
 ///
@@ -52,6 +52,10 @@ pub trait Replica {
 
     /// The document as it should be written now.
     fn package(&self) -> Package;
+
+    /// Called once the file has been replaced, with what it now holds: the package as written, and the
+    /// manifest, which also lists the entries carried over.
+    fn saved(&mut self, _written: Package, _manifest: &Manifest) {}
 
     /// Whether to carry over an entry of the file on disk that the package does not hold. Keeping is the safe
     /// default: it preserves assets that were never loaded and entries that a newer build added.
@@ -153,7 +157,11 @@ pub fn save(files: &mut impl Files, replica: &mut impl Replica, save: &Save) -> 
             files.rename(&temporary, name)
         });
         match replaced {
-            Ok(()) => return Ok(aside.map_or(Saved::Written, |aside| Saved::Restored { aside })),
+            Ok(()) => {
+                let manifest = plan.manifest;
+                replica.saved(package, &manifest);
+                return Ok(aside.map_or(Saved::Written, |aside| Saved::Restored { aside }));
+            }
             Err(error) => {
                 let _ = files.remove(&temporary);
                 cause = folder(error);
