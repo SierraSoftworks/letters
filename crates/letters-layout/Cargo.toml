@@ -17,7 +17,9 @@ letters-render.workspace = true
 parley.workspace = true
 
 [dev-dependencies]
+letters-editor.workspace = true
 letters-fonts.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "open"

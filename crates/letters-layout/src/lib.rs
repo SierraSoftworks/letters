@@ -10,12 +10,16 @@
 //!
 //! Text takes its colours from the document's style and everything else from a [`Palette`]. Layout has no
 //! theme of its own.
+//!
+//! The Markdown markers around the caret are drawn over the layout and are no part of it. See
+//! [`DocLayout::reveal`].
 
 mod engine;
 mod flow;
 mod ink;
 mod leaf;
 mod palette;
+mod reveal;
 mod shape;
 mod theme;
 mod tokens;
@@ -23,15 +27,17 @@ mod tokens;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Range;
 
-use letters_model::{BlockId, Body, Change, Document, Pos, Selection, Style};
+use letters_model::{BlockId, Body, Change, Document, Markers, Pos, Selection, Style};
 use letters_render::{DisplayList, Font, Item, Point, Rect};
 use parley::{Language, Layout};
 
 use crate::engine::Engine;
 use crate::flow::{Frame, Leaf, Look, Role, Types, What};
 use crate::ink::{Brush, Inks};
-use crate::leaf::Painter;
+use crate::leaf::{Over, Painter};
+use crate::reveal::{Reveal, Shapes, Shifts};
 
 pub use crate::palette::{Callout, Palette, Scheme, Syntax};
 pub use crate::shape::{FontSpec, ShapedRun, ShapedText, Shaper};
@@ -91,6 +97,9 @@ impl DocLayout {
             frames: Vec::new(),
             index: HashMap::new(),
             tokens: HashMap::new(),
+            reveal: Reveal::default(),
+            shapes: Shapes::default(),
+            composition: None,
             stale: 0,
             height: 0.0,
             pending: 0,
@@ -120,6 +129,36 @@ impl DocLayout {
     /// a block that is not code, or not in the document, are dropped.
     pub fn set_tokens(&mut self, block: &BlockId, tokens: Vec<Token>) {
         self.state.get_mut().set_tokens(block, tokens);
+    }
+
+    /// Shows the Markdown markers around the caret: `at` is the caret and what the editor's `markers()`
+    /// gives for it, or `None` to show none. Call it after every call to the editor, since markers change
+    /// while the caret stays put. Returns whether a marker appears or goes.
+    ///
+    /// Markers never change the layout. One inside a line pushes the rest of that line aside, past the text
+    /// edge when the line is full, and no other line moves. A heading's hangs left of the text edge, and a
+    /// callout's sits in the corner of its box. [`DocLayout::caret`], [`DocLayout::hit`] and the other
+    /// queries answer for the page as drawn, so a caret among markers at its offset sits after the first
+    /// `before_caret` of them.
+    ///
+    /// A change is shown at once. To animate it, see [`DocLayout::set_reveal_progress`].
+    pub fn reveal(&mut self, at: Option<(&Pos, &Markers)>) -> bool {
+        self.state.get_mut().reveal(at)
+    }
+
+    /// How far the markers are through their last change, from 0 for the page as it was to 1 for the page as
+    /// it will be. Markers fade and the text beside them slides, with nothing shaped or laid out again.
+    ///
+    /// [`DocLayout::reveal`] leaves this at 1 when it returns `true`. To animate, set 0 straight after and
+    /// step to 1 over the time the fade takes.
+    pub fn set_reveal_progress(&mut self, progress: f32) {
+        self.state.get_mut().reveal.set_progress(progress);
+    }
+
+    /// Underlines the text an input method is composing: a block and a byte range in it, as the editor's
+    /// `composition()` gives them.
+    pub fn set_composition(&mut self, composing: Option<(&BlockId, Range<usize>)>) {
+        self.state.get_mut().composition = composing.map(|(block, range)| (block.clone(), range));
     }
 
     /// The height of the whole document. Partly an estimate until [`DocLayout::settle`] returns `false`.
@@ -163,6 +202,12 @@ impl DocLayout {
         self.state.borrow_mut().line_step(pos, x, down)
     }
 
+    /// The start or the end of the visual line that holds `pos`. The end of a wrapped line is before the space
+    /// it wraps at, which is where a caret still draws on that line.
+    pub fn line_edge(&self, pos: &Pos, end: bool) -> Option<Pos> {
+        self.state.borrow_mut().line_edge(pos, end)
+    }
+
     /// Replaces height estimates with real layouts: first for the blocks `viewport` shows, then outwards from
     /// it for about `budget` bytes of text. Returns whether any estimates remain.
     ///
@@ -188,6 +233,11 @@ struct State {
     index: HashMap<BlockId, usize>,
     /// The tokens of code blocks.
     tokens: HashMap<BlockId, Vec<Token>>,
+    /// The markers shown around the caret.
+    reveal: Reveal,
+    shapes: Shapes,
+    /// The text an input method is composing.
+    composition: Option<(BlockId, Range<usize>)>,
     /// The first leaf whose `y` is out of date.
     stale: usize,
     height: f32,
@@ -208,6 +258,10 @@ impl State {
         if restyled {
             self.types = Types::resolve(style, &mut self.engine);
             self.style = Some(style.clone());
+            self.shapes.clear();
+        }
+        if let Some(change) = change {
+            self.reveal.edit(&change.blocks);
         }
         let same = !restyled && width == self.width && locale == self.locale;
         (self.width, self.locale) = (width, locale);
@@ -281,6 +335,26 @@ impl State {
         self.pending = self.leaves.iter().filter(|leaf| !leaf.exact).count();
         self.held = self.leaves.iter().filter(|leaf| leaf.laid.is_some()).count();
         self.stale = 0;
+    }
+
+    fn reveal(&mut self, at: Option<(&Pos, &Markers)>) -> bool {
+        // Markers are few, so this only guards against a caller that makes up new ones without end.
+        if self.shapes.len() > 64 {
+            self.shapes.clear();
+        }
+        self.reveal.set(at)
+    }
+
+    /// The markers revealed in a leaf that holds its layout.
+    fn shifts(&mut self, at: usize) -> Shifts {
+        let Self { reveal, shapes, engine, types, leaves, .. } = self;
+        let leaf = &leaves[at];
+        let (Some(id), Some(laid)) = (&leaf.id, &leaf.laid) else { return Shifts::default() };
+        // Code shows its text as written.
+        if leaf.what != What::Text || leaf.role == Role::Code {
+            return Shifts::default();
+        }
+        reveal.over(id, &laid.text, |text| shapes.get(engine, types, leaf.role, false, text))
     }
 
     fn set_tokens(&mut self, block: &BlockId, mut tokens: Vec<Token>) {
@@ -393,8 +467,9 @@ impl State {
         }
         frames.sort_unstable();
         for frame in frames {
-            let frame = &self.frames[frame];
-            let (top, bottom) = frame.span(&self.leaves);
+            let Self { engine, types, leaves, frames, reveal, shapes, .. } = self;
+            let frame = &frames[frame];
+            let (top, bottom) = frame.span(leaves);
             let rect = Rect::new(frame.x, top, frame.width, bottom - top);
             let bar = Rect { width: theme::BAR, ..rect };
             match frame.look {
@@ -408,18 +483,31 @@ impl State {
                     out.push(Item::PopClip);
                 }
             }
+            // A callout's tag sits in the padding above its text, where it moves nothing.
+            let mut at = Point { x: frame.x + theme::BOX_PAD_X, y: top + theme::BOX_PAD_Y - 2.0 };
+            let seen = top < band.1 && at.y > band.0;
+            for (tag, level) in reveal.beside(&frame.id).filter(|_| seen) {
+                let (shape, width) = shapes.get(engine, types, Role::Body, true, tag);
+                if let Some(shape) = shapes.layout(shape) {
+                    Painter { engine, types, inks: &inks, band, out }.sign(shape, at, level);
+                }
+                at.x += width;
+            }
         }
         for at in first..end {
             // A viewport taller than the cache holds has dropped its first layouts by now.
             self.lay(at);
-            let Self { engine, types, leaves, tokens, .. } = self;
+            let shifts = self.shifts(at);
+            let Self { engine, types, leaves, tokens, shapes, composition, .. } = self;
             let leaf = &leaves[at];
             if leaf.what == What::Rule {
                 let rect = Rect::new(leaf.x, leaf.y, leaf.width, leaf.height);
                 out.push(Item::Fill { rect, color: palette.line, radius: 0.0 });
             } else if let Some(laid) = &leaf.laid {
                 let tokens = leaf.id.as_ref().and_then(|id| tokens.get(id));
-                Painter { engine, types, inks: &inks, band, out }.leaf(leaf, laid, tokens.map(Vec::as_slice));
+                let composing = composition.as_ref().filter(|(block, _)| leaf.id.as_ref() == Some(block));
+                let over = Over { shifts: &shifts, shapes, composing: composing.map(|(_, range)| range.clone()) };
+                Painter { engine, types, inks: &inks, band, out }.leaf(leaf, laid, tokens.map(Vec::as_slice), &over);
             }
         }
     }
@@ -440,8 +528,9 @@ impl State {
             (above, below) => above.or(below)?,
         };
         self.lay(at);
+        let shifts = self.shifts(at);
         let leaf = &self.leaves[at];
-        let offset = leaf::hit(leaf.laid.as_ref()?, point.x - leaf.x, point.y - leaf.y);
+        let offset = leaf::hit(leaf.laid.as_ref()?, &shifts, point.x - leaf.x, point.y - leaf.y);
         Some(Pos { block: leaf.id.clone()?, offset })
     }
 
@@ -450,8 +539,9 @@ impl State {
         self.clock += 1;
         self.lay(at);
         self.place(at);
+        let shifts = self.shifts(at);
         let leaf = &self.leaves[at];
-        Some(leaf::caret(leaf, leaf.laid.as_ref()?, pos.offset))
+        Some(leaf::caret(leaf, leaf.laid.as_ref()?, &shifts, pos.offset))
     }
 
     fn selection(&mut self, selection: &Selection, viewport: Option<Rect>) -> Vec<Rect> {
@@ -475,12 +565,13 @@ impl State {
                 continue;
             }
             self.lay(at);
+            let shifts = self.shifts(at);
             let leaf = &self.leaves[at];
             let Some(laid) = &leaf.laid else { continue };
             let len = leaf.text.len();
             let start = if at == from.0 { from.1.min(len) } else { 0 };
             let end = if at == to.0 { to.1.min(len) } else { len };
-            leaf::selection(leaf, laid, start..end, at != to.0, &mut rects);
+            leaf::selection(leaf, laid, &shifts, start..end, at != to.0, &mut rects);
         }
         rects
     }
@@ -489,12 +580,13 @@ impl State {
         let at = *self.index.get(&pos.block)?;
         self.clock += 1;
         self.lay(at);
+        let shifts = self.shifts(at);
         let leaf = &self.leaves[at];
         let laid = leaf.laid.as_ref()?;
         let line = leaf::line_of(laid, pos.offset);
         let within = if down { Some(line + 1).filter(|next| *next < laid.text.len()) } else { line.checked_sub(1) };
         if let Some(line) = within {
-            return Some(Pos { block: pos.block.clone(), offset: leaf::on_line(laid, line, x - leaf.x) });
+            return Some(Pos { block: pos.block.clone(), offset: leaf::on_line(laid, &shifts, line, x - leaf.x) });
         }
         // Off this block's edge: the nearest line of the next block that holds text.
         let text = |leaf: &Leaf| leaf.what == What::Text;
@@ -503,10 +595,22 @@ impl State {
             false => self.leaves[..at].iter().rposition(text)?,
         };
         self.lay(at);
+        let shifts = self.shifts(at);
         let leaf = &self.leaves[at];
         let laid = leaf.laid.as_ref()?;
         let line = if down { 0 } else { laid.text.len().saturating_sub(1) };
-        Some(Pos { block: leaf.id.clone()?, offset: leaf::on_line(laid, line, x - leaf.x) })
+        Some(Pos { block: leaf.id.clone()?, offset: leaf::on_line(laid, &shifts, line, x - leaf.x) })
+    }
+
+    fn line_edge(&mut self, pos: &Pos, end: bool) -> Option<Pos> {
+        let at = *self.index.get(&pos.block)?;
+        self.clock += 1;
+        self.lay(at);
+        let laid = self.leaves[at].laid.as_ref()?;
+        // Far off either side, which no marker reaches.
+        let x = if end { f32::MAX } else { f32::MIN };
+        let offset = leaf::on_line(laid, &Shifts::default(), leaf::line_of(laid, pos.offset), x);
+        Some(Pos { block: pos.block.clone(), offset })
     }
 
     fn settle(&mut self, viewport: Rect, budget: usize) -> bool {

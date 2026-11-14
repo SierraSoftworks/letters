@@ -30,6 +30,8 @@ pub(crate) const NEWLINE: f32 = 0.25;
 
 /// Inline code is set a little smaller than the text around it.
 pub(crate) const INLINE_CODE_SCALE: f32 = 0.9;
+/// A callout's revealed tag is set small enough to sit in the padding above its text.
+pub(crate) const TAG_SCALE: f32 = 0.7;
 
 /// Reads `#rrggbb`.
 pub(crate) fn color(hex: &str) -> Option<Color> {

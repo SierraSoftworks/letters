@@ -2011,10 +2011,12 @@ dependencies = [
 name = "letters-layout"
 version = "0.1.0"
 dependencies = [
+ "letters-editor",
  "letters-fonts",
  "letters-model",
  "letters-render",
  "parley",
+ "proptest",
 ]
 
 [[package]]

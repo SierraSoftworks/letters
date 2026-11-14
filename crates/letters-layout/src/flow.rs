@@ -272,6 +272,8 @@ pub(crate) enum Look {
 /// A quote or callout: decoration around a run of leaves.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Frame {
+    /// The quote or callout block.
+    pub id: BlockId,
     pub look: Look,
     pub parent: Option<usize>,
     pub first: usize,
@@ -386,7 +388,9 @@ impl<F: FnMut(&Block) -> Option<Leaf>> Walk<'_, F> {
                     let this = self.out.frames.len();
                     let first = self.out.leaves.len();
                     let lead = self.pad + gap;
-                    self.out.frames.push(Frame { look, parent: frame, first, last: first, x, width, lead, reach: 0.0 });
+                    let id = block.id.clone();
+                    let framed = Frame { id, look, parent: frame, first, last: first, x, width, lead, reach: 0.0 };
+                    self.out.frames.push(framed);
                     self.pad = lead + pad;
                     let quoted = quoted || look == Look::Quote;
                     self.place(block.body.blocks(), x + left, width - shrink, Some(this), quoted);
