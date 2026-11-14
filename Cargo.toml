@@ -26,6 +26,13 @@ sha2 = "0.11"
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 proptest = "1"
 jsonschema = { version = "0.61", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+vello_cpu = "0.4"
+# The glyph renderer inside vello_cpu and vello_gpu: same version as theirs.
+glifo = { version = "0.5", default-features = false, features = ["std"] }
+# The font reader inside glifo: same version as its.
+skrifa = "0.49"
+bytemuck = "1"
 
 # The desktop shell. None of these may reach the core crates.
 winit = "0.30"

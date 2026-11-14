@@ -5,6 +5,10 @@
 
 use std::sync::Arc;
 
+pub mod cpu;
+pub mod image;
+mod paint;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Point {
     pub x: f32,
@@ -98,7 +102,20 @@ pub struct Glyph {
     pub y: f32,
 }
 
+/// One segment of a vector path, in the path's own units.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PathEl {
+    MoveTo(Point),
+    LineTo(Point),
+    /// A quadratic curve: its control point, then its end.
+    QuadTo(Point, Point),
+    /// A cubic curve: its two control points, then its end.
+    CurveTo(Point, Point, Point),
+    Close,
+}
+
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Item {
     /// A filled rectangle, with rounded corners when `radius` is above zero.
     Fill {
@@ -132,6 +149,16 @@ pub enum Item {
         /// Thickens the outlines, for a face with no bold.
         embolden: bool,
         glyphs: Vec<Glyph>,
+    },
+    /// A vector shape such as an icon. Path units are multiplied by `scale` and placed at `origin`.
+    Path {
+        origin: Point,
+        scale: f32,
+        path: Arc<[PathEl]>,
+        color: Color,
+        /// `None` fills the path by the even-odd rule. A width, in path units, strokes it with round caps
+        /// and joins.
+        stroke: Option<f32>,
     },
     /// An asset of the document, by entry name, scaled to fill `rect`.
     Image {

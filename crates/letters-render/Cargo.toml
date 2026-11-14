@@ -12,3 +12,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+bytemuck.workspace = true
+glifo.workspace = true
+image.workspace = true
+skrifa.workspace = true
+vello_cpu.workspace = true
+
+[dev-dependencies]
+letters-fonts.workspace = true
