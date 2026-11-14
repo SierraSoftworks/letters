@@ -1,8 +1,8 @@
-//! What the desktop expects of a window's frame, now that Letters draws it.
+//! What the desktop expects of a window, now that Letters draws all of it.
 //!
 //! On macOS the system keeps its traffic lights, so there is nothing to ask. On Linux the window buttons are
 //! the bar's own, and they follow the desktop's `button-layout` setting: which buttons, in what order, on
-//! which side.
+//! which side. Whether things may move is the desktop's to say too.
 
 /// A button a window's frame carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,15 +72,44 @@ impl Buttons {
     }
 }
 
+/// Whether the desktop asks for less motion. `None` when there is no portal, or it does not say. This
+/// waits for the answer, so call it off the main thread.
+pub fn reduced_motion() -> Option<bool> {
+    // The setting every desktop is meant to share, then the one GNOME has always had.
+    let asked = portal::number("org.freedesktop.appearance", "reduced-motion").map(|reduced| reduced == 1);
+    asked.or_else(|| portal::flag("org.gnome.desktop.interface", "enable-animations").map(|animated| !animated))
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 mod portal {
     use zbus::blocking::{Connection, Proxy};
     use zbus::zvariant::{OwnedValue, Value};
 
-    const NAMESPACE: &str = "org.gnome.desktop.wm.preferences";
-    const KEY: &str = "button-layout";
-
     pub fn button_layout() -> Option<String> {
+        let value = read("org.gnome.desktop.wm.preferences", "button-layout")?;
+        match plain(&value) {
+            Value::Str(text) => Some(text.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn flag(namespace: &str, key: &str) -> Option<bool> {
+        let value = read(namespace, key)?;
+        match plain(&value) {
+            Value::Bool(flag) => Some(*flag),
+            _ => None,
+        }
+    }
+
+    pub fn number(namespace: &str, key: &str) -> Option<u32> {
+        let value = read(namespace, key)?;
+        match plain(&value) {
+            Value::U32(number) => Some(*number),
+            _ => None,
+        }
+    }
+
+    fn read(namespace: &str, key: &str) -> Option<OwnedValue> {
         let connection = Connection::session().ok()?;
         let settings = Proxy::new(
             &connection,
@@ -90,17 +119,14 @@ mod portal {
         )
         .ok()?;
         // `ReadOne` is the current call. Older portals only have `Read`, which wraps its answer once more.
-        let value: OwnedValue =
-            settings.call("ReadOne", &(NAMESPACE, KEY)).or_else(|_| settings.call("Read", &(NAMESPACE, KEY))).ok()?;
-        text(&value)
+        settings.call("ReadOne", &(namespace, key)).or_else(|_| settings.call("Read", &(namespace, key))).ok()
     }
 
-    /// The string inside a value, however many variants deep the portal wrapped it.
-    fn text(value: &Value<'_>) -> Option<String> {
+    /// The value inside, however many variants deep the portal wrapped it.
+    fn plain<'a>(value: &'a Value<'a>) -> &'a Value<'a> {
         match value {
-            Value::Str(text) => Some(text.to_string()),
-            Value::Value(inner) => text(inner),
-            _ => None,
+            Value::Value(inner) => plain(inner),
+            plain => plain,
         }
     }
 }
@@ -108,6 +134,14 @@ mod portal {
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 mod portal {
     pub fn button_layout() -> Option<String> {
+        None
+    }
+
+    pub fn flag(_namespace: &str, _key: &str) -> Option<bool> {
+        None
+    }
+
+    pub fn number(_namespace: &str, _key: &str) -> Option<u32> {
         None
     }
 }

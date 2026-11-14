@@ -29,6 +29,7 @@ use winit::keyboard::ModifiersState;
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
+use crate::chrome;
 use crate::cli::{Mode, Options};
 use crate::files::{self, EXTENSION, Home, Opened, Rest, Working};
 use crate::gpu::Gpu;
@@ -58,6 +59,8 @@ pub enum Event {
     Read(WindowId),
     /// The search for a GPU has ended, with one or without.
     Gpu(Option<Box<Gpu>>),
+    /// The desktop has said whether it wants less motion.
+    Motion(bool),
 }
 
 impl From<accesskit_winit::Event> for Event {
@@ -86,6 +89,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         proxy: event_loop.create_proxy(),
         platform: Desktop::new(),
         library: Library::of(&std::env::home_dir().unwrap_or_default()),
+        reduced_motion: false,
         gpu: match std::env::var("LETTERS_RENDERER").as_deref() {
             Ok("cpu") => GpuState::Off,
             Ok("gpu") => GpuState::Wanted { software: true },
@@ -190,6 +194,8 @@ struct App {
     proxy: EventLoopProxy<Event>,
     platform: Desktop,
     library: Library,
+    /// Whether the desktop asked for less motion. Asked once, after the first frame.
+    reduced_motion: bool,
     gpu: GpuState,
     windows: HashMap<WindowId, DocWindow>,
     mods: ModifiersState,
@@ -624,6 +630,7 @@ impl App {
             copy: None,
             sent: None,
         };
+        window.view.set_reduced_motion(self.reduced_motion);
         window.retitle();
         window.fit();
         self.mark("laid out");
@@ -741,6 +748,11 @@ impl ApplicationHandler<Event> for App {
                         println!("{FIRST_FRAME}\n{}", launch.report());
                         return event_loop.exit();
                     }
+                    // The desktop is asked over D-Bus, which is not worth holding a frame for.
+                    let proxy = self.proxy.clone();
+                    thread::spawn(move || {
+                        chrome::reduced_motion().map(|reduced| proxy.send_event(Event::Motion(reduced)))
+                    });
                 }
                 if let Some(run) = &mut self.typing
                     && let Some(typed) = run.typed.take()
@@ -866,6 +878,12 @@ impl ApplicationHandler<Event> for App {
                 window.sync(now);
             }
             Event::Gpu(None) => self.gpu = GpuState::Off,
+            Event::Motion(reduced) => {
+                self.reduced_motion = reduced;
+                for window in self.windows.values_mut() {
+                    window.view.set_reduced_motion(reduced);
+                }
+            }
             Event::Gpu(Some(mut gpu)) => {
                 for window in self.windows.values_mut() {
                     window.gpu_offered = true;

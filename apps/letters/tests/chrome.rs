@@ -1,4 +1,4 @@
-use letters::chrome::{Button, Buttons};
+use letters::chrome::{self, Button, Buttons};
 
 const ALL: [Button; 3] = [Button::Minimise, Button::Maximise, Button::Close];
 
@@ -56,4 +56,40 @@ fn asking_a_desktop_with_no_settings_portal_gives_up_quietly() {
     let asked = Buttons::ask();
     assert!(asked.is_none_or(|buttons| buttons.order.len() <= 3));
     assert!(started.elapsed() < std::time::Duration::from_secs(30), "asking hung");
+}
+
+/// A stand-in for the desktop's settings portal, answering the way GNOME's does.
+#[cfg(all(unix, not(target_os = "macos")))]
+mod portal {
+    use zbus::fdo;
+    use zbus::zvariant::{OwnedValue, Value};
+
+    pub struct Settings;
+
+    #[zbus::interface(name = "org.freedesktop.portal.Settings")]
+    impl Settings {
+        fn read_one(&self, namespace: &str, key: &str) -> fdo::Result<OwnedValue> {
+            let value = match (namespace, key) {
+                ("org.gnome.desktop.wm.preferences", "button-layout") => Value::from("close,minimize:appmenu"),
+                ("org.gnome.desktop.interface", "enable-animations") => Value::from(false),
+                _ => return Err(fdo::Error::Failed(format!("no setting {namespace} {key}"))),
+            };
+            value.try_into().map_err(|error: zbus::zvariant::Error| fdo::Error::Failed(error.to_string()))
+        }
+    }
+}
+
+#[test]
+#[cfg(all(unix, not(target_os = "macos")))]
+#[ignore = "needs a session bus of its own: dbus-run-session -- cargo test -p letters --test chrome -- --ignored"]
+fn the_portal_is_asked_for_the_layout_and_for_less_motion() {
+    let served = zbus::blocking::connection::Builder::session()
+        .and_then(|bus| bus.name("org.freedesktop.portal.Desktop"))
+        .and_then(|bus| bus.serve_at("/org/freedesktop/portal/desktop", portal::Settings))
+        .and_then(|bus| bus.build());
+    let _portal = served.expect("a session bus to serve the portal on");
+
+    let buttons = Buttons::ask().expect("the portal knows the layout");
+    assert_eq!((buttons.order.as_slice(), buttons.at_start), (&[Button::Close, Button::Minimise][..], true));
+    assert_eq!(chrome::reduced_motion(), Some(true), "no animations is less motion");
 }
