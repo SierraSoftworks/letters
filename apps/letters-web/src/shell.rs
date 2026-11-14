@@ -243,15 +243,12 @@ impl Shell {
     /// Brings everything outside the canvas up to date with the view, after any event.
     fn sync(&mut self) {
         for request in self.view.take_requests() {
-            match request {
-                Request::Named(name) => {
-                    self.view.set_document_name(&name);
-                    if let Some(page) = self.window.document() {
-                        page.set_title(&name);
-                    }
+            // Opening, starting, renaming and moving need files, which wait for a server behind the page.
+            if let Request::Named(name) = request {
+                self.view.set_document_name(&name);
+                if let Some(page) = self.window.document() {
+                    page.set_title(&name);
                 }
-                // Opening, starting, renaming and moving need files, which wait for a server behind the page.
-                _ => {}
             }
         }
         if self.view.needs_paint() && !self.frame_due {
