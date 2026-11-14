@@ -9,6 +9,8 @@ fn main() -> ExitCode {
     let launch = Launch::start();
     let options = match cli::parse(std::env::args_os().skip(1)) {
         Ok(Command::Run(options)) => options,
+        Ok(Command::Export(export)) => return letters::convert::export(&export),
+        Ok(Command::Import(import)) => return letters::convert::import(&import),
         Ok(Command::Version) => {
             println!("letters {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;

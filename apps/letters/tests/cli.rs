@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use letters::cli::{Command, Mode, Options, parse};
+use letters::cli::{Command, Export, Format, Import, Mode, Options, Output, parse};
 
 fn args(line: &str) -> Vec<OsString> {
     line.split_whitespace().map(OsString::from).collect()
@@ -39,6 +39,51 @@ fn bad_arguments_are_refused() {
         "--bench-launch=many",
         "--typing-report=-1",
         "--headless a.let",
+    ] {
+        assert!(parse(args(line)).is_err(), "{line:?}");
+    }
+}
+
+#[test]
+fn export_and_import_are_subcommands() {
+    let export = |file: &str, to, output, force| Ok(Command::Export(Export { file: file.into(), to, output, force }));
+    let import = |paths: &[&str], recursive, json| {
+        Ok(Command::Import(Import { paths: paths.iter().map(PathBuf::from).collect(), recursive, json }))
+    };
+    let to_file = |name: &str| Some(Output::File(name.into()));
+    let cases = [
+        ("export a.let --to md", export("a.let", Format::Markdown, None, false)),
+        ("export --to=html a.let", export("a.let", Format::Html, None, false)),
+        ("export a.let --to html -o out/a.html --force", export("a.let", Format::Html, to_file("out/a.html"), true)),
+        ("export a.let --to md --output=-", export("a.let", Format::Markdown, Some(Output::Stdout), false)),
+        ("export --to md -o - -- --odd.let", export("--odd.let", Format::Markdown, Some(Output::Stdout), false)),
+        ("import notes", import(&["notes"], false, false)),
+        ("import notes a.md --recursive --json", import(&["notes", "a.md"], true, true)),
+        ("import -r -- --odd.md", import(&["--odd.md"], true, false)),
+        ("import notes --help", Ok(Command::Help)),
+        // Only the first argument names a subcommand, so files of those names still open.
+        ("-- export", Ok(Command::Run(Options { file: Some("export".into()), ..Options::default() }))),
+        ("./import", Ok(Command::Run(Options { file: Some("./import".into()), ..Options::default() }))),
+    ];
+    for (line, expected) in cases {
+        assert_eq!(parse(args(line)), expected, "{line:?}");
+    }
+}
+
+#[test]
+fn bad_subcommand_arguments_are_refused() {
+    for line in [
+        "export",
+        "export a.let",
+        "export --to md",
+        "export a.let --to pdf",
+        "export a.let --to",
+        "export a.let b.let --to md",
+        "export a.let --to md --recursive",
+        "import",
+        "import --json",
+        "import notes --to md",
+        "import notes --headless",
     ] {
         assert!(parse(args(line)).is_err(), "{line:?}");
     }
