@@ -105,6 +105,11 @@ impl Ui<EditorApp> {
         app.reveal();
     }
 
+    /// The document's style, which a shell writes when it saves.
+    pub fn style(&self) -> &Style {
+        &self.app().style
+    }
+
     /// Goes up each time the document changes.
     pub fn edits(&self) -> u64 {
         self.app().edits

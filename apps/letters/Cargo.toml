@@ -14,13 +14,11 @@ workspace = true
 [dependencies]
 letters-model.workspace = true
 letters-render = { workspace = true, features = ["gpu"] }
-letters-fonts.workspace = true
-letters-layout.workspace = true
 letters-editor.workspace = true
+letters-ui.workspace = true
 letters-format.workspace = true
 
 winit.workspace = true
-accesskit.workspace = true
 softbuffer.workspace = true
 accesskit_winit.workspace = true
 arboard.workspace = true

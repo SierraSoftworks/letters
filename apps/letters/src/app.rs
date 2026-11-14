@@ -1,6 +1,6 @@
 //! The winit event loop: windows, their input, painting and saving.
 //!
-//! Each window holds one document. Everything a window shows comes from its [`View`] as a display list, which
+//! Each window holds one document. Everything a window shows comes from its view as a display list, which
 //! is rasterised into a software surface. Saving happens on a thread per save, a moment after typing stops.
 
 use std::collections::HashMap;
@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Platform as _};
 use letters_model::Style;
 use letters_render::image::Images;
-use letters_render::{DisplayList, Point, Size};
+use letters_render::{Color, DisplayList, Point, Size};
+// The editor's window is the view here, where `Window` is the system's.
+use letters_ui::{Cursor, SaveState, Scheme, Window as View, tokens};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -21,7 +23,7 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{CursorIcon, Window, WindowId};
+use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 use crate::cli::{Mode, Options};
 use crate::files::{self, EXTENSION, Home, Opened};
@@ -30,7 +32,6 @@ use crate::input::{self, Composer, Press};
 use crate::measure::{self, FIRST_FRAME, Launch, Typing};
 use crate::platform::Desktop;
 use crate::present::{Painter, Presenter};
-use crate::view::{Cursor, View};
 
 const MAC: bool = cfg!(target_os = "macos");
 const UNTITLED: &str = "Untitled";
@@ -112,7 +113,7 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
     launch.mark("display list");
     let mut pixels = vec![0; (width * height) as usize];
     let mut painter = Painter::new();
-    painter.paint(&list, &Images::default(), scale as f32, view.palette().page, width, &mut pixels);
+    painter.paint(&list, &Images::default(), scale as f32, background(false), width, &mut pixels);
     launch.mark(FIRST_FRAME);
     let Mode::TypingReport { keys } = options.mode else {
         println!("{FIRST_FRAME}\n{}", launch.report());
@@ -126,11 +127,17 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
         view.input(InputEvent::Insert("a".into()), &mut platform);
         list.items.clear();
         view.paint(&mut list);
-        painter.paint(&list, &Images::default(), scale as f32, view.palette().page, width, &mut pixels);
+        painter.paint(&list, &Images::default(), scale as f32, background(false), width, &mut pixels);
         typing.record(typed.elapsed());
     }
     print!("{}", typing.report("CPU"));
     Ok(typing.within_budget())
+}
+
+/// What a window is cleared to before the view paints over all of it.
+fn background(dark: bool) -> Color {
+    let ink = tokens::BG.resolve(if dark { Scheme::Dark } else { Scheme::Light });
+    Color::rgba(ink.r, ink.g, ink.b, ink.a)
 }
 
 /// The style of a new document.
@@ -239,11 +246,18 @@ impl DocWindow {
         self.view.edits() != self.saved_edits
     }
 
-    /// The window title carries the save state until the top bar exists to show it.
+    fn dark(&self) -> bool {
+        self.window.theme() == Some(Theme::Dark)
+    }
+
+    /// The top bar says whether the document is saved. The title adds what the bar has no word for: a
+    /// document with nowhere to be saved yet, and a save that failed.
     fn retitle(&mut self) {
         let name = self.name();
         self.view.set_document_name(&name);
-        let state = match (self.save_failed, self.unsaved()) {
+        let unsaved = self.unsaved();
+        self.view.set_save_state(if unsaved || self.save_failed { SaveState::Saving } else { SaveState::Saved });
+        let state = match (self.save_failed, unsaved && self.home.is_none()) {
             (true, _) => " · Not saved",
             (false, true) => " · Edited",
             (false, false) => "",
@@ -251,8 +265,9 @@ impl DocWindow {
         self.window.set_title(&format!("{name}{state}"));
     }
 
-    /// Fits the view to the window, which may have changed size or moved to another display.
+    /// Fits the view to the window, which may have changed size, display or theme.
     fn fit(&mut self) {
+        self.view.set_dark(self.dark());
         let scale = self.window.scale_factor();
         let size = self.window.inner_size().to_logical::<f32>(scale);
         self.view.resize(Size { width: size.width, height: size.height }, scale as f32);
@@ -263,7 +278,7 @@ impl DocWindow {
         self.wake_ms = self.view.animate(now_ms);
         self.list.items.clear();
         self.view.paint(&mut self.list);
-        self.presenter.present(&self.list, self.view.palette().page)
+        self.presenter.present(&self.list, background(self.dark()))
     }
 
     /// Brings everything outside the canvas up to date with the view, after any event.
@@ -585,7 +600,9 @@ impl ApplicationHandler<Event> for App {
                 }
                 return;
             }
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => window.fit(),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } | WindowEvent::ThemeChanged(_) => {
+                window.fit()
+            }
             WindowEvent::Focused(focused) => {
                 window.view.focus(focused);
                 window.access_stale = true;
@@ -640,7 +657,7 @@ impl ApplicationHandler<Event> for App {
                         Point { x: -delta.x, y: -delta.y }
                     }
                 };
-                window.view.scroll(window.pointer, delta);
+                window.view.scroll(window.pointer, delta, platform);
             }
             WindowEvent::CloseRequested => action = Some(Action::Close),
             _ => {}

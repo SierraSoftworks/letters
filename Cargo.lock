@@ -1955,16 +1955,14 @@ dependencies = [
 name = "letters"
 version = "0.1.0"
 dependencies = [
- "accesskit",
  "accesskit_winit",
  "arboard",
  "getrandom 0.4.3",
  "letters-editor",
- "letters-fonts",
  "letters-format",
- "letters-layout",
  "letters-model",
  "letters-render",
+ "letters-ui",
  "pollster 1.0.1",
  "rfd",
  "softbuffer",
