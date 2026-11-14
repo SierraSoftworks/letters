@@ -1,7 +1,7 @@
 //! The editor's window, as a shell shows it: the page, the top bar and the side panel.
 
 use accesskit::{Action, ActionData, ActionRequest, TextPosition, TextSelection, TreeId};
-use letters_model::{Block, BlockKind, Document, Pos, Selection};
+use letters_model::{Align, Block, BlockKind, Document, Pos, Selection, TextStyle};
 use letters_render::{Color, Item, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
 use letters_ui::SaveState;
@@ -79,6 +79,23 @@ fn block_text(window: &Harness, id: &str) -> String {
 
 fn head(window: &Harness) -> Pos {
     window.editor().selection().expect("a selection").head.clone()
+}
+
+/// The style the window draws an element type with.
+fn style_of(window: &mut Harness, element: &str) -> TextStyle {
+    window.ui().style().types[element].clone()
+}
+
+/// The bar's buttons and fields, left to right.
+fn bar_controls(window: &mut Harness) -> Vec<(String, Rect)> {
+    let bar = window.find(Role::Toolbar, "Document").expect("the bar").bounds;
+    let in_bar = |found: &letters_test::Found| {
+        matches!(found.role, Role::Button | Role::TextInput) && bar.contains(found.center())
+    };
+    let mut controls: Vec<(String, Rect)> =
+        window.controls().into_iter().filter(in_bar).map(|found| (found.name, found.bounds)).collect();
+    controls.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+    controls
 }
 
 #[test]
@@ -360,6 +377,97 @@ fn the_bar_shows_and_sets_the_marks_at_the_caret() {
     ed.click(Role::Button, "Italic").click(Role::Button, "Bold");
     ed.assert_markdown("Send the *quote* today.");
     assert_eq!(ed.focused().map(|found| found.role), Some(Role::Document), "the bar leaves focus on the page");
+}
+
+#[test]
+fn the_bar_restyles_every_block_of_the_type_at_the_caret() {
+    let mut window = letter();
+    let (text, edits) = (window.markdown(), window.ui().edits());
+    let body = style_of(&mut window, "body");
+    let left = spot(&mut window, "h1", 0).x;
+
+    window.click(Role::Button, "Font").click(Role::MenuItemCheckBox, "Fira Code");
+    window.click(Role::Button, "Font").click(Role::MenuItemCheckBox, "Light");
+    window.click(Role::Button, "Align centre");
+
+    let heading = style_of(&mut window, "heading1");
+    assert_eq!((heading.family.as_str(), heading.weight, heading.align), ("Fira Code", 300, Align::Center));
+    assert_eq!(style_of(&mut window, "body"), body, "other types keep their style");
+    assert_eq!(window.markdown(), text, "the text is as it was");
+    assert!(window.ui().edits() > edits, "the shell can tell there is something to save");
+    assert!(spot(&mut window, "h1", 0).x > left, "the page shows the heading centred");
+    let pressed = |window: &mut Harness, name| window.find(Role::Button, name).unwrap().toggled;
+    assert_eq!((pressed(&mut window, "Align centre"), pressed(&mut window, "Align left")), (Some(true), Some(false)));
+    assert_eq!(window.find(Role::Button, "Font").unwrap().description.as_deref(), Some("Fira Code"));
+}
+
+#[test]
+fn a_size_is_taken_on_enter_and_one_that_makes_no_sense_is_dropped() {
+    for (typed, expected) in [("18", Some(18.0)), (" 10.5 ", Some(10.5)), ("big", None), ("0", None)] {
+        let mut window = letter();
+        window.ui().select(Selection::caret(Pos::new("p1", 0)));
+        let before = style_of(&mut window, "body").size;
+        window.click(Role::TextInput, "Size").key("Mod+A").type_text(typed).key("Enter");
+
+        let after = style_of(&mut window, "body").size;
+        assert_eq!(after, expected.unwrap_or(before), "{typed:?}");
+        let field = window.find(Role::TextInput, "Size").unwrap();
+        assert_eq!(field.value, Some(after.to_string()), "the field shows the size in force after {typed:?}");
+    }
+}
+
+#[test]
+fn a_narrowing_window_folds_alignment_then_the_marks_then_the_whole_style() {
+    let name = "Roof repairs at the cottage: the quotes, the plan and what was agreed with Harland";
+    let mut window = letter();
+    window.ui().set_document_name(name);
+    let mut folds = Vec::new();
+    for width in (680..=1400).rev().step_by(20) {
+        window.resize(width as f32, 600.0);
+        let controls = bar_controls(&mut window);
+        let has = |name: &str| controls.iter().any(|(found, _)| found == name);
+        folds.push(match (has("Align left"), has("Bold"), has("Font")) {
+            (true, true, true) => 0,
+            (false, true, true) if has("Alignment") => 1,
+            (false, false, true) if has("Alignment") && has("Marks") => 2,
+            (false, false, false) if has("Heading 1 style") && has("Marks") => 3,
+            _ => panic!("at {width} the bar holds {controls:?}"),
+        });
+        for pair in controls.windows(2) {
+            assert!(pair[0].1.x + pair[0].1.width <= pair[1].1.x, "at {width} {pair:?} overlap");
+        }
+        let (first, last) = (&controls[0].1, &controls[controls.len() - 1].1);
+        assert!(first.x >= 0.0 && last.x + last.width <= width as f32, "at {width} the bar is in the window");
+    }
+    window.assert_open(Role::Label, name);
+    assert!(folds.is_sorted(), "the bar only folds further as the window narrows: {folds:?}");
+    assert_eq!((folds[0], folds[folds.len() - 1]), (0, 3), "from everything shown to everything folded");
+    window.resize(1400.0, 600.0).assert_open(Role::Button, "Align left").assert_open(Role::Button, "Bold");
+}
+
+#[test]
+fn folded_controls_do_what_the_buttons_did() {
+    let mut ed = Harness::doc("Send the **quote** today.");
+    ed.resize(960.0, 600.0).select("quote");
+    assert_eq!(ed.find(Role::Button, "Marks").unwrap().toggled, Some(true), "a mark is in force");
+    ed.click(Role::Button, "Marks").click(Role::MenuItemCheckBox, "Bold");
+    ed.assert_markdown("Send the quote today.");
+    ed.click(Role::Button, "Alignment").click(Role::MenuItemCheckBox, "Align centre");
+    assert_eq!(style_of(&mut ed, "body").align, Align::Center);
+
+    ed.resize(720.0, 600.0).click(Role::Button, "Body style").assert_open(Role::Dialog, "Body style");
+    ed.click(Role::Button, "Justify");
+    assert_eq!(style_of(&mut ed, "body").align, Align::Justify);
+    ed.click(Role::Button, "Font").click(Role::MenuItemCheckBox, "Montserrat");
+    assert_eq!(style_of(&mut ed, "body").family, "Montserrat");
+}
+
+#[test]
+fn folding_puts_an_open_menu_away_and_leaves_focus_on_the_page() {
+    let mut window = letter();
+    window.click(Role::Button, "Font").assert_open(Role::Menu, "Font");
+    window.resize(720.0, 600.0).assert_closed(Role::Menu, "Font");
+    assert_eq!(window.focused().map(|found| found.role), Some(Role::Document));
 }
 
 #[test]

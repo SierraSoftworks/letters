@@ -17,7 +17,7 @@ use letters_ui::{App, EditorApp, FixedShaper, Keys, Ui, Window};
 pub use letters_ui::Role;
 
 /// The window every harness starts with, in logical pixels.
-pub const WINDOW: Size = Size { width: 1000.0, height: 700.0 };
+pub const WINDOW: Size = Size { width: 1280.0, height: 800.0 };
 
 /// The clock, clipboard and ids a test controls.
 #[derive(Clone, Debug, Default)]

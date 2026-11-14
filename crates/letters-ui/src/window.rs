@@ -3,24 +3,28 @@
 //! [`Window`] is what a shell shows and the test harness drives. The page is a canvas holding what the
 //! document's layout painted for the part in view. Everything around it is made of the toolkit's widgets.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
 use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Platform};
 use letters_layout::{Callout, DocLayout, Fonts, Palette, Syntax};
-use letters_model::{Block, BlockId, BlockKind, Change, Mark, Pos, Selection, Style};
+use letters_model::{Align as TextAlign, Block, BlockId, BlockKind, Change, Mark, Pos, Selection, Style};
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 
 use crate::color::{fade, resolve};
 use crate::describe::{self, Request};
-use crate::element::{Cursor, Element, Paint, Pointer};
+use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::icon::{self, Icon};
 use crate::paint::scrollbar;
+use crate::restyle::{self, StyleEdit, Styles};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
-use crate::text::{FontShaper, TextStyle};
+use crate::text::{Family, FontShaper, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::ui::{App, Keys, Ui};
-use crate::widgets::{Button, Menu, MenuItem, Popover, Side, SidePanel, TextField, TopBar, side_panel, top_bar};
+use crate::widgets::{
+    Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, TopBar, side_panel, top_bar,
+};
 
 /// Space kept beside the text column.
 const GUTTER: f32 = 24.0;
@@ -91,6 +95,11 @@ pub enum Message {
     LinkDraft(String),
     LinkApply,
     LinkClose,
+    /// Changes the style of the element type under the caret.
+    Restyle(StyleEdit),
+    /// What is typed into the size field, before it is taken.
+    SizeDraft(String),
+    SizeApply,
 }
 
 impl Ui<EditorApp> {
@@ -211,6 +220,9 @@ pub struct EditorApp {
     sharing: bool,
     /// The address in the link editor while it is open.
     link: Option<String>,
+    /// What is typed into the size field and the element type it was typed for.
+    size: Option<(&'static str, String)>,
+    folded: Folded,
     dragging: bool,
 }
 
@@ -231,8 +243,42 @@ impl EditorApp {
             panel: None,
             sharing: false,
             link: None,
+            size: None,
+            folded: Folded::default(),
             dragging: false,
         }
+    }
+
+    /// The element type whose style the caret's block is drawn with.
+    fn element(&self) -> Option<&'static str> {
+        restyle::element(self.editor.doc(), &self.editor.selection()?.head.block)
+    }
+
+    /// Keeps up which form of the bar fits a window of `width`: forgotten when something that decides it
+    /// has changed, and learnt from the layout after that.
+    fn refold(&mut self, width: f32) {
+        let style = self.element().and_then(|element| Some((element, &self.style.types.get(element)?.family)));
+        let mut hasher = DefaultHasher::new();
+        (width.to_bits(), &self.name, std::mem::discriminant(&self.save), style).hash(&mut hasher);
+        let key = hasher.finish();
+        if key != self.folded.key {
+            self.folded = Folded { key, form: None, seen: Fitted::default() };
+        } else if self.folded.form.is_none() {
+            self.folded.form = self.folded.seen.get();
+        }
+    }
+
+    /// Restyles every block of the type under the caret. Line breaks everywhere may change, so the whole
+    /// document is laid out again.
+    fn restyle(&mut self, edit: &StyleEdit) {
+        let Some(element) = self.element() else { return };
+        let Some(mut style) = self.style.style().types.get(element).cloned() else { return };
+        edit.apply(&mut style);
+        self.style.restyle(element, style);
+        self.edits += 1;
+        self.layout.update(self.editor.doc(), &self.style, self.column.1, None);
+        self.estimated = true;
+        self.reveal();
     }
 
     /// Runs something on the editor, which may ask the layout about lines while it works.
@@ -314,10 +360,6 @@ impl EditorApp {
     }
 
     /// The block the caret is in.
-    fn block(&self) -> Option<&Block> {
-        self.editor.doc().block(&self.editor.selection()?.head.block)
-    }
-
     /// Lays the document out for the room it has and paints the part in view.
     fn page(&mut self, room: Size) -> Element<Message> {
         let page = &self.style.page;
@@ -453,34 +495,6 @@ impl EditorApp {
     }
 
     fn bar(&self) -> Element<Message> {
-        let name = if self.name.is_empty() { "Untitled" } else { &self.name };
-        let (state_icon, state) = match self.save {
-            SaveState::Saved => (icon::CLOUD_CHECK, "Saved"),
-            SaveState::Saving => (icon::REFRESH_CW, "Saving"),
-            SaveState::Offline => (icon::CLOUD_OFF, "Offline"),
-        };
-        let small = TextStyle::control().size(tokens::TEXT_SM);
-        let mut state = Element::row()
-            .align(Align::Center)
-            .gap(tokens::SPACE_XS)
-            .fg(tokens::FG_MUTED)
-            .child(Element::icon(state_icon, 14.0))
-            .child(Element::text(state, small));
-        if self.save == SaveState::Offline {
-            state = state.description("Changes are kept on this device");
-        }
-
-        let tool = |icon, label: &str| Button::icon_only(icon, label).subtle().small();
-        let run = |icon, label: &str, command: Command| tool(icon, label).on_press(Message::Run(command));
-        let marks = [
-            (icon::BOLD, "Bold", Mark::Bold),
-            (icon::ITALIC, "Italic", Mark::Italic),
-            (icon::UNDERLINE, "Underline", Mark::Underline),
-            (icon::STRIKETHROUGH, "Strikethrough", Mark::Strike),
-            (icon::CODE, "Code", Mark::Code),
-        ];
-        let in_force = self.editor.marks();
-
         let share = Element::column()
             .gap(tokens::SPACE_LG)
             .min_width(320.0)
@@ -494,31 +508,178 @@ impl EditorApp {
             .item(MenuItem::new("Print view").icon(icon::PRINTER).disabled(true))
             .item(MenuItem::new("Page setup").icon(icon::SETTINGS).disabled(true));
 
-        let mut bar = TopBar::new()
-            .start(Element::icon(icon::FILE_TEXT, 18.0).fg(tokens::FG_MUTED))
-            .start(Element::text(name, TextStyle::control().weight(600)))
-            .start(state)
-            .middle(TopBar::rule())
-            .middle(run(icon::UNDO_2, "Undo", Command::Undo).disabled(!self.editor.can_undo()))
-            .middle(run(icon::REDO_2, "Redo", Command::Redo).disabled(!self.editor.can_redo()))
-            .middle(TopBar::rule());
-        if let Some(block) = self.block() {
-            // The type follows the caret: it is a label here, and changed on the page.
-            bar = bar.middle(Element::text(type_name(&block.kind), small).fg(tokens::FG_MUTED)).middle(TopBar::rule());
+        // The forms of the bar, from the widest. Once the layout has said which fits, only that one is built.
+        let forms = [
+            (NAME_WIDTH.2, Fold::None, false),
+            (NAME_WIDTH.1, Fold::None, false),
+            (NAME_WIDTH.1, Fold::Alignment, false),
+            (NAME_WIDTH.1, Fold::Marks, false),
+            (NAME_WIDTH.1, Fold::Style, false),
+            (NAME_WIDTH.1, Fold::Style, true),
+        ];
+        let mut bar = TopBar::new().shown(self.folded.seen.clone());
+        for (n, (name, fold, brief)) in forms.into_iter().enumerate() {
+            if self.folded.form.is_none_or(|form| form == n) {
+                bar = self.lead(name, brief).into_iter().fold(bar.form(n), TopBar::start);
+                bar = self.tools(fold).into_iter().fold(bar, TopBar::middle);
+            }
         }
-        for (icon, label, mark) in marks {
-            let pressed = in_force.contains(&mark);
-            bar = bar.middle(run(icon, label, Command::ToggleMark(mark)).pressed(pressed));
-        }
-        let link = tool(icon::LINK, "Link").pressed(self.editor.link().is_some()).on_press(Message::EditLink);
-        bar = bar.middle(link);
         bar = bar.end(Button::new("Share").icon(icon::USERS).small().on_press(Message::Share(true)).popover(share));
         bar = bar.end(TopBar::rule());
+        let mut panels = cluster();
         for (panel, icon) in Panel::ALL {
             let button = tool(icon, panel.title()).pressed(self.panel == Some(panel));
-            bar = bar.end(button.on_press(Message::Panel(panel)));
+            panels = panels.child(button.on_press(Message::Panel(panel)));
         }
-        bar.end(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End))).into()
+        bar.end(panels.child(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End)))).into()
+    }
+
+    /// What the bar starts with: the document's name, in no more than `room`, and whether it is saved, which
+    /// `brief` says with the icon alone.
+    fn lead(&self, room: f32, brief: bool) -> Vec<Element<Message>> {
+        let name = if self.name.is_empty() { "Untitled" } else { &self.name };
+        let (state_icon, state) = match self.save {
+            SaveState::Saved => (icon::CLOUD_CHECK, "Saved"),
+            SaveState::Saving => (icon::REFRESH_CW, "Saving"),
+            SaveState::Offline => (icon::CLOUD_OFF, "Offline"),
+        };
+        let mut saved = Element::row()
+            .align(Align::Center)
+            .gap(tokens::SPACE_XS)
+            .fg(tokens::FG_MUTED)
+            .child(Element::icon(state_icon, 14.0));
+        saved = match brief {
+            true => saved.role(Role::Label).label(state).tooltip(state, Side::Bottom),
+            false => saved.child(Element::text(state, TextStyle::control().size(tokens::TEXT_SM))),
+        };
+        if self.save == SaveState::Offline {
+            saved = saved.description("Changes are kept on this device");
+        }
+        // The name gives way to the controls after it, down to a few letters.
+        let name = Element::text(name, TextStyle::control().weight(600)).min_width(NAME_WIDTH.0).max_width(room);
+        vec![Element::icon(icon::FILE_TEXT, 18.0).fg(tokens::FG_MUTED), name.shrink(), saved]
+    }
+
+    /// The bar's format controls: undo and redo, the style of the type under the caret, then the marks and
+    /// the link. `fold` says how much of it goes into menus, for a window too narrow to show it all.
+    fn tools(&self, fold: Fold) -> Vec<Element<Message>> {
+        let run = |icon, label: &str, command: Command| tool(icon, label).on_press(Message::Run(command));
+        let history = cluster()
+            .child(run(icon::UNDO_2, "Undo", Command::Undo).disabled(!self.editor.can_undo()))
+            .child(run(icon::REDO_2, "Redo", Command::Redo).disabled(!self.editor.can_redo()));
+        let mut tools = vec![TopBar::rule(), history, TopBar::rule()];
+        tools.extend(self.style_group(fold));
+
+        let in_force = self.editor.marks();
+        let toggle = |mark| Message::Run(Command::ToggleMark(mark));
+        let mut marks = cluster();
+        if fold >= Fold::Marks {
+            let mut menu = Menu::new().label("Marks");
+            for (icon, label, mark) in MARKS {
+                let item = MenuItem::new(label).icon(icon).checked(in_force.contains(&mark));
+                menu = menu.item(item.on_select(toggle(mark)));
+            }
+            let any = MARKS.iter().any(|(_, _, mark)| in_force.contains(mark));
+            marks = marks.child(tool(icon::BASELINE, "Marks").pressed(any).popover(menu.popover()));
+        } else {
+            for (icon, label, mark) in MARKS {
+                marks = marks.child(tool(icon, label).pressed(in_force.contains(&mark)).on_press(toggle(mark)));
+            }
+        }
+        let link = tool(icon::LINK, "Link").pressed(self.editor.link().is_some()).on_press(Message::EditLink);
+        tools.push(marks.child(link));
+        tools
+    }
+
+    /// The style of the element type under the caret: its name, then its font, size and alignment. Each
+    /// control restyles every block of that type. Folded, the alignments are one button with a menu, and
+    /// folded further the name is a button that opens the rest.
+    fn style_group(&self, fold: Fold) -> Vec<Element<Message>> {
+        let Some(element) = self.element() else { return Vec::new() };
+        let Some(style) = self.style.style().types.get(element) else { return Vec::new() };
+
+        // The type follows the caret: it is a label here, and changed on the page.
+        let name = restyle::name(element);
+        let label = Element::row()
+            .align(Align::Center)
+            .gap(tokens::SPACE_XS)
+            .height(tokens::CONTROL_HEIGHT_SM)
+            .min_width(TYPE_WIDTH)
+            .padding(Edges::xy(tokens::SPACE_SM, 0.0))
+            .radius(tokens::RADIUS_CONTROL)
+            .bg(tokens::TONE_1)
+            .fg(tokens::FG_MUTED)
+            .child(Element::text(name.clone(), TextStyle::control().size(tokens::TEXT_SM).weight(500)));
+
+        let mut fonts = Menu::new().label("Font");
+        for (family, face) in FAMILIES {
+            let pick = Message::Restyle(StyleEdit::Family(family.into()));
+            fonts = fonts.item(MenuItem::new(family).face(face).checked(style.family == family).on_select(pick));
+        }
+        fonts = fonts.heading("Weight");
+        for (weight, name) in WEIGHTS {
+            let pick = Message::Restyle(StyleEdit::Weight(weight));
+            fonts = fonts.item(MenuItem::new(name).checked(style.weight == weight).on_select(pick));
+        }
+        let face = FAMILIES.iter().find(|(family, _)| *family == style.family).map_or(Family::Sans, |found| found.1);
+        let font = Element::row()
+            .align(Align::Center)
+            .gap(tokens::SPACE_SM)
+            .height(tokens::CONTROL_HEIGHT_SM)
+            .min_width(128.0)
+            .padding(Edges::xy(tokens::SPACE_SM, 0.0))
+            .border(Edges::all(1.0), tokens::LINE_STRONG)
+            .radius(tokens::RADIUS_CONTROL)
+            .bg(tokens::SURFACE)
+            .hover(Look::bg(tokens::TONE_1))
+            .ring(Ring::Outline(2.0))
+            .role(Role::Button)
+            .label("Font")
+            .description(style.family.clone())
+            .child(
+                Element::text(style.family.clone(), TextStyle::control().size(tokens::TEXT_SM).family(face)).grow(1.0),
+            )
+            .child(Element::icon(icon::CHEVRON_DOWN, 14.0).fg(tokens::FG_MUTED))
+            .popover(fonts.popover());
+
+        let typed = self.size.as_ref().filter(|(of, _)| *of == element).map(|(_, text)| text.clone());
+        let size = TextField::new("Size", typed.unwrap_or_else(|| format!("{}", style.size)))
+            .size(ControlSize::Small)
+            .on_input(Message::SizeDraft)
+            .on_submit(Message::SizeApply);
+        let size = Element::from(size).width(56.0);
+
+        let align = |align| Message::Restyle(StyleEdit::Align(align));
+        let mut aligns = cluster();
+        if fold == Fold::Alignment || fold == Fold::Marks {
+            let mut menu = Menu::new().label("Alignment");
+            for (icon, label, to) in ALIGNS {
+                menu = menu.item(MenuItem::new(label).icon(icon).checked(style.align == to).on_select(align(to)));
+            }
+            let shown = ALIGNS.iter().find(|(_, _, to)| *to == style.align).map_or(icon::TEXT_ALIGN_START, |at| at.0);
+            aligns = aligns.child(tool(shown, "Alignment").popover(menu.popover()));
+        } else {
+            for (icon, label, to) in ALIGNS {
+                aligns = aligns.child(tool(icon, label).pressed(style.align == to).on_press(align(to)));
+            }
+        }
+
+        if fold < Fold::Style {
+            return vec![label, font, size, aligns, TopBar::rule()];
+        }
+        let title = format!("{name} style");
+        let rest = Element::column()
+            .gap(tokens::SPACE_SM)
+            .child(font)
+            .child(Element::row().align(Align::Center).gap(tokens::SPACE_SM).child(size).child(aligns));
+        let open = label
+            .child(Element::icon(icon::CHEVRON_DOWN, 14.0))
+            .hover(Look::bg(tokens::NEUTRAL_SOFT))
+            .ring(Ring::Outline(2.0))
+            .role(Role::Button)
+            .label(title.clone())
+            .popover(Popover::new(rest).label(title));
+        vec![open, TopBar::rule()]
     }
 
     fn side(&self, panel: Panel) -> Element<Message> {
@@ -549,6 +710,7 @@ impl App for EditorApp {
     }
 
     fn view(&mut self, window: Size) -> Element<Message> {
+        self.refold(window.width);
         let panel = self.panel.map(|panel| self.side(panel));
         let room = window.width - if panel.is_some() { side_panel::WIDTH } else { 0.0 };
         let page = self.page(Size { width: room.max(0.0), height: (window.height - top_bar::HEIGHT).max(0.0) });
@@ -578,6 +740,14 @@ impl App for EditorApp {
             Message::EditLink => self.link = Some(self.editor.link().unwrap_or_default().to_owned()),
             Message::LinkDraft(address) => self.link = self.link.is_some().then_some(address),
             Message::LinkClose => self.link = None,
+            Message::Restyle(edit) => self.restyle(&edit),
+            Message::SizeDraft(text) => self.size = self.element().map(|element| (element, text)),
+            Message::SizeApply => {
+                let typed = self.size.take().filter(|(element, _)| Some(*element) == self.element());
+                if let Some(size) = typed.and_then(|(_, text)| restyle::size(&text)) {
+                    self.restyle(&StyleEdit::Size(size));
+                }
+            }
             Message::LinkApply => {
                 let Some(address) = self.link.take() else { return };
                 let address = Some(address.trim().to_owned()).filter(|address| !address.is_empty());
@@ -711,19 +881,67 @@ fn palette(scheme: Scheme) -> Palette {
     }
 }
 
-/// The element type the top bar names for a block.
-fn type_name(kind: &BlockKind) -> String {
-    match kind {
-        BlockKind::Paragraph => "Body".into(),
-        BlockKind::Heading { level } => format!("Heading {level}"),
-        BlockKind::ListItem { .. } => "List".into(),
-        BlockKind::Code { .. } => "Code".into(),
-        BlockKind::Quote => "Quote".into(),
-        BlockKind::Callout { .. } => "Callout".into(),
-        BlockKind::Divider => "Divider".into(),
-        BlockKind::Unknown { .. } => "Block".into(),
-    }
+/// Which form of the bar fits the window.
+#[derive(Default)]
+struct Folded {
+    /// Everything that decides the fit, hashed.
+    key: u64,
+    /// The form that fits, once the layout has said.
+    form: Option<usize>,
+    seen: Fitted,
 }
+
+/// The room the bar gives the document's name: the least it keeps, what it keeps before any control folds,
+/// and the most a name can take.
+const NAME_WIDTH: (f32, f32, f32) = (48.0, 160.0, 320.0);
+
+/// Room for the longest type name, so the controls after it stay put as the caret goes from type to type.
+const TYPE_WIDTH: f32 = 88.0;
+
+/// How much of the bar's format controls is folded away. A narrowing window loses the alignments to a menu
+/// first, then the marks, and at last the whole style of the type to one button.
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+enum Fold {
+    None,
+    Alignment,
+    Marks,
+    Style,
+}
+
+/// A small button of the bar that shows only an icon.
+fn tool(icon: Icon, label: &str) -> Button<Message> {
+    Button::icon_only(icon, label).subtle().small()
+}
+
+/// Buttons that belong together, set closer than the bar's other controls.
+fn cluster() -> Element<Message> {
+    Element::row().align(Align::Center).gap(tokens::SPACE_2XS)
+}
+
+const MARKS: [(Icon, &str, Mark); 5] = [
+    (icon::BOLD, "Bold", Mark::Bold),
+    (icon::ITALIC, "Italic", Mark::Italic),
+    (icon::UNDERLINE, "Underline", Mark::Underline),
+    (icon::STRIKETHROUGH, "Strikethrough", Mark::Strike),
+    (icon::CODE, "Code", Mark::Code),
+];
+
+const ALIGNS: [(Icon, &str, TextAlign); 4] = [
+    (icon::TEXT_ALIGN_START, "Align left", TextAlign::Start),
+    (icon::TEXT_ALIGN_CENTER, "Align centre", TextAlign::Center),
+    (icon::TEXT_ALIGN_END, "Align right", TextAlign::End),
+    (icon::TEXT_ALIGN_JUSTIFY, "Justify", TextAlign::Justify),
+];
+
+/// The bundled families, each with the face the bar shows its name in.
+const FAMILIES: [(&str, Family); 3] = [
+    (letters_fonts::SANS, Family::Sans),
+    (letters_fonts::DISPLAY, Family::Display),
+    (letters_fonts::MONO, Family::Mono),
+];
+
+/// The weights offered for a type. The bundled faces are variable, so every family has them all.
+const WEIGHTS: [(u16, &str); 5] = [(300, "Light"), (400, "Regular"), (500, "Medium"), (600, "Semibold"), (700, "Bold")];
 
 /// One of the document's element types, with the face it is set in.
 fn style_row(name: &str, style: &letters_model::TextStyle) -> Element<Message> {
