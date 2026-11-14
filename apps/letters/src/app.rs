@@ -30,7 +30,7 @@ use crate::input::{self, Composer, Press};
 use crate::measure::{self, FIRST_FRAME, Launch, Typing};
 use crate::platform::Desktop;
 use crate::present::{Painter, Presenter};
-use crate::view::{self, Cursor, View};
+use crate::view::{Cursor, View};
 
 const MAC: bool = cfg!(target_os = "macos");
 const UNTITLED: &str = "Untitled";
@@ -112,7 +112,7 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
     launch.mark("display list");
     let mut pixels = vec![0; (width * height) as usize];
     let mut painter = Painter::new();
-    painter.paint(&list, &Images::default(), scale as f32, view::PAGE, width, &mut pixels);
+    painter.paint(&list, &Images::default(), scale as f32, view.palette().page, width, &mut pixels);
     launch.mark(FIRST_FRAME);
     let Mode::TypingReport { keys } = options.mode else {
         println!("{FIRST_FRAME}\n{}", launch.report());
@@ -126,7 +126,7 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
         view.input(InputEvent::Insert("a".into()), &mut platform);
         list.items.clear();
         view.paint(&mut list);
-        painter.paint(&list, &Images::default(), scale as f32, view::PAGE, width, &mut pixels);
+        painter.paint(&list, &Images::default(), scale as f32, view.palette().page, width, &mut pixels);
         typing.record(typed.elapsed());
     }
     print!("{}", typing.report("CPU"));
@@ -263,7 +263,7 @@ impl DocWindow {
         self.wake_ms = self.view.animate(now_ms);
         self.list.items.clear();
         self.view.paint(&mut self.list);
-        self.presenter.present(&self.list, view::PAGE)
+        self.presenter.present(&self.list, self.view.palette().page)
     }
 
     /// Brings everything outside the canvas up to date with the view, after any event.

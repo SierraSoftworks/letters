@@ -5,15 +5,11 @@
 
 use accesskit::{ActionRequest, TreeUpdate};
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Modifiers, Platform};
-use letters_layout::{DocLayout, Fonts};
+use letters_layout::{DocLayout, Fonts, Palette};
 use letters_model::{Change, Pos, Selection, Style};
-use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
+use letters_render::{DisplayList, Item, Point, Rect, Size};
 
 use crate::access::{self, Request};
-
-pub const PAGE: Color = Color::rgb(255, 255, 255);
-const CARET: Color = Color::rgb(31, 35, 40);
-const SELECTION: Color = Color::rgba(9, 105, 218, 64);
 
 /// Space kept around the text column.
 const GUTTER: f32 = 24.0;
@@ -37,6 +33,7 @@ pub struct View {
     editor: Editor,
     style: Style,
     layout: DocLayout,
+    palette: Palette,
     name: String,
     size: Size,
     /// The width the layout was last made for, or zero before the first layout.
@@ -61,6 +58,7 @@ impl View {
             editor,
             style,
             layout: DocLayout::new(Fonts { faces: letters_fonts::bundled() }),
+            palette: Palette::default(),
             name: String::new(),
             size: Size::default(),
             laid_width: 0.0,
@@ -82,6 +80,17 @@ impl View {
 
     pub fn style(&self) -> &Style {
         &self.style
+    }
+
+    /// The colours of the page, and of everything on it that the style does not colour.
+    pub fn palette(&self) -> &Palette {
+        &self.palette
+    }
+
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.layout.set_palette(palette);
+        self.palette = palette;
+        self.needs_paint = true;
     }
 
     /// Goes up each time the document changes.
@@ -138,7 +147,8 @@ impl View {
 
     pub fn paint(&mut self, out: &mut DisplayList) {
         self.needs_paint = false;
-        out.push(Item::Fill { rect: Rect::new(0.0, 0.0, self.size.width, self.size.height), color: PAGE, radius: 0.0 });
+        let window = Rect::new(0.0, 0.0, self.size.width, self.size.height);
+        out.push(Item::Fill { rect: window, color: self.palette.page, radius: 0.0 });
         if self.laid_width == 0.0 {
             return;
         }
@@ -149,7 +159,7 @@ impl View {
         let first = out.items.len();
         if let Some(selection) = self.editor.selection().filter(|selection| !selection.is_caret()) {
             for rect in self.layout.selection_in(selection, viewport) {
-                out.push(Item::Fill { rect, color: SELECTION, radius: 0.0 });
+                out.push(Item::Fill { rect, color: self.palette.selection, radius: 0.0 });
             }
         }
         self.layout.paint(viewport, out);
@@ -157,7 +167,7 @@ impl View {
             && self.caret_shown
             && let Some(caret) = self.caret()
         {
-            out.push(Item::Fill { rect: Rect { width: CARET_WIDTH, ..caret }, color: CARET, radius: 0.0 });
+            out.push(Item::Fill { rect: Rect { width: CARET_WIDTH, ..caret }, color: self.palette.caret, radius: 0.0 });
         }
         // The layout speaks in column coordinates.
         out.translate(first, Point { x: column.x, y: column.y });

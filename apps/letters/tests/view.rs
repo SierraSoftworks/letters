@@ -1,8 +1,9 @@
 use letters::platform::Desktop;
 use letters::view::View;
 use letters_editor::{Editor, InputEvent, Modifiers};
+use letters_layout::{Palette, Scheme};
 use letters_model::{Block, BlockKind, Document, Style};
-use letters_render::{DisplayList, Item, Point, Size};
+use letters_render::{Color, DisplayList, Item, Point, Size};
 
 const WINDOW: Size = Size { width: 800.0, height: 600.0 };
 /// A point over the text, a little below the top of the window.
@@ -120,4 +121,16 @@ fn idle_time_lays_out_the_rest_and_holds_the_page_still() {
     for (after, before) in after.iter().zip(&before) {
         assert!((after.y - before.y).abs() < 0.5 && after.x == before.x, "text moved from {before:?} to {after:?}");
     }
+}
+
+#[test]
+fn a_new_palette_recolours_the_page_at_the_next_frame() {
+    let mut view = view(3);
+    let page = Color::rgb(13, 17, 23);
+    view.set_palette(Palette { scheme: Scheme::Dark, page, ..Palette::LIGHT });
+    assert!(view.needs_paint());
+
+    let list = paint(&mut view);
+    assert!(matches!(list.items.first(), Some(Item::Fill { color, .. }) if *color == page), "{:?}", list.items.first());
+    assert_eq!(view.palette().page, page, "the window is cleared to the same colour");
 }
