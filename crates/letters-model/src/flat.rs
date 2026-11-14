@@ -294,6 +294,8 @@ fn canonical(block: &Block) -> bool {
         BlockKind::Heading { level } => (1..=4).contains(level),
         // It may be a type this build knows under its real name.
         BlockKind::Unknown { .. } => false,
+        // STAND-IN.
+        _ => true,
     };
     let body = match (&block.body, block.kind.shape()) {
         (Body::Text(runs), BodyShape::Text) => {

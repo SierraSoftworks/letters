@@ -9,7 +9,7 @@ use parley::fontique::{Blob, Collection, CollectionOptions, FamilyId, SourceCach
 use parley::setting::Tag;
 use parley::{
     FontContext, FontFamily, FontFamilyName, FontStyle, FontVariation, FontVariations, FontWeight, GenericFamily,
-    GlyphRun, Language, Layout, LayoutContext, LineHeight, OverflowWrap, Run, TextStyle,
+    GlyphRun, InlineBox, Language, Layout, LayoutContext, LineHeight, OverflowWrap, Run, TextStyle,
 };
 
 use crate::Fonts;
@@ -107,6 +107,22 @@ impl Engine {
         locale: Option<Language>,
         layout: &mut Layout<Brush>,
     ) {
+        self.build_with(text, specs, runs, &[], false, locale, layout);
+    }
+
+    /// As [`Engine::build`], with `boxes` set in the line, each at a U+FFFC of the text. `by_words` keeps a
+    /// word whole when the layout is asked how narrow it can go, which is what sizes a table's columns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with(
+        &mut self,
+        text: &str,
+        specs: &[Spec],
+        runs: &[(u16, Range<usize>)],
+        boxes: &[InlineBox],
+        by_words: bool,
+        locale: Option<Language>,
+        layout: &mut Layout<Brush>,
+    ) {
         let mut builder = self.lcx.style_run_builder(&mut self.fcx, text, 1.0, true);
         for spec in specs {
             let generic = if spec.mono { GenericFamily::Monospace } else { GenericFamily::SansSerif };
@@ -124,12 +140,15 @@ impl Engine {
                 has_underline: spec.underline,
                 has_strikethrough: spec.strike,
                 line_height: spec.line,
-                overflow_wrap: OverflowWrap::Anywhere,
+                overflow_wrap: if by_words { OverflowWrap::BreakWord } else { OverflowWrap::Anywhere },
                 ..TextStyle::default()
             });
         }
         for (spec, range) in runs {
             builder.push_style_run(*spec, range.clone());
+        }
+        for inline in boxes {
+            builder.push_inline_box(inline.clone());
         }
         builder.build_into(layout, text);
     }
