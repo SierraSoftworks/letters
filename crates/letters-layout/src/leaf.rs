@@ -1,11 +1,13 @@
 //! One leaf's text: shaping it with Parley, painting it and answering where things are inside it.
 
+use std::iter::Peekable;
 use std::ops::Range;
+use std::sync::Arc;
 
-use letters_render::{Color, DisplayList, Glyph, Item, PathEl, Point, Rect};
+use letters_render::{Color, DisplayList, Glyph, Item, PathEl, Point, Rect, RunText};
 use parley::{
-    Affinity, Alignment, AlignmentOptions, BreakReason, Cursor, GlyphRun, Language, Layout, Line, PositionedLayoutItem,
-    Selection as Span,
+    Affinity, Alignment, AlignmentOptions, BreakReason, Cluster, Cursor, GlyphRun, Language, Layout, Line,
+    PositionedLayoutItem, Selection as Span,
 };
 
 use crate::engine::{Engine, Spec};
@@ -108,14 +110,22 @@ pub(crate) fn lines(layout: &Layout<Brush>, code: bool) -> (u32, Vec<u32>) {
     (layout.len().max(1) as u32, joined)
 }
 
+/// The tick in the box of a done task.
+const TICK: &str = "\u{2713}";
+
+/// What stands before an ordered item.
+fn numbered(number: u32) -> String {
+    format!("{number}.")
+}
+
 /// Lays a leaf out in full, with the sign its marker needs.
 pub(crate) fn lay(engine: &mut Engine, types: &Types, leaf: &Leaf, locale: Option<Language>) -> Laid {
     let mut text = Layout::new();
     shape(engine, types, leaf, locale, &mut text);
     let of = types.get(leaf.role);
     let sign = match leaf.marker {
-        Marker::Number(number) => Some((format!("{number}."), Ink::Marker, of.size)),
-        Marker::Task(true) => Some(("\u{2713}".to_string(), Ink::OnAccent, theme::CHECKBOX * 0.8)),
+        Marker::Number(number) => Some((numbered(number), Ink::Marker, of.size)),
+        Marker::Task(true) => Some((TICK.to_string(), Ink::OnAccent, theme::CHECKBOX * 0.8)),
         _ => None,
     };
     let sign = sign.map(|(label, ink, size)| {
@@ -137,6 +147,51 @@ struct Stretch {
     /// Where the first glyph starts, from the line's left edge.
     start: f32,
     glyphs: Vec<Glyph>,
+    spelt: Spelt,
+}
+
+/// What a run of glyphs spells, gathered a cluster at a time in the order the glyphs are drawn.
+#[derive(Default)]
+struct Spelt {
+    /// Where in the text each glyph's cluster starts.
+    starts: Vec<u32>,
+    /// The text of the clusters so far.
+    range: Option<Range<usize>>,
+}
+
+impl Spelt {
+    /// Takes in a cluster that draws `glyphs` glyphs. One that draws none, as the rest of a ligature does,
+    /// belongs to the glyphs before it.
+    fn add(&mut self, cluster: Range<usize>, glyphs: usize) {
+        match &mut self.range {
+            Some(range) => *range = range.start.min(cluster.start)..range.end.max(cluster.end),
+            None if glyphs > 0 => self.range = Some(cluster.clone()),
+            None => return,
+        }
+        self.starts.extend(std::iter::repeat_n(cluster.start as u32, glyphs));
+    }
+
+    /// The text of `source` that `glyphs` glyphs were gathered for.
+    fn text(self, source: &str, glyphs: usize) -> Option<Arc<RunText>> {
+        let range = self.range.filter(|_| self.starts.len() == glyphs)?;
+        let text = source.get(range.clone())?.into();
+        let clusters = self.starts.iter().map(|start| start - range.start as u32).collect();
+        Some(Arc::new(RunText { text, clusters }))
+    }
+}
+
+/// Says what the glyphs of `item` spell. `clusters` are those of its line that no run before it has taken.
+fn spell<'a>(item: &mut Item, clusters: &mut Peekable<impl Iterator<Item = Cluster<'a, Brush>>>, source: &str) {
+    let Item::Glyphs { glyphs, text, .. } = item else { return };
+    let mut spelt = Spelt::default();
+    while spelt.starts.len() < glyphs.len() {
+        let Some(cluster) = clusters.next() else { return };
+        spelt.add(cluster.text_range(), cluster.glyphs().count());
+    }
+    while let Some(rest) = clusters.next_if(Cluster::is_ligature_continuation) {
+        spelt.add(rest.text_range(), 0);
+    }
+    *text = spelt.text(source, glyphs.len());
 }
 
 /// What is drawn over a leaf's text without being part of it.
@@ -157,6 +212,8 @@ pub(crate) struct Painter<'a> {
     pub inks: &'a Inks,
     /// The top and bottom of what is being painted. Lines outside it are skipped.
     pub band: (f32, f32),
+    /// Whether each run of glyphs says what it spells. Only an export needs that, and it costs the screen.
+    pub spelt: bool,
     pub out: &'a mut DisplayList,
 }
 
@@ -214,8 +271,9 @@ impl Painter<'_> {
                 self.out.push(Item::Fill { rect, color: self.inks.back(back), radius: theme::INLINE_RADIUS });
             }
             if let Some(tokens) = tokens {
-                self.tokens(&line, at, tokens);
+                self.tokens(&line, at, tokens, &leaf.text);
             }
+            let mut clusters = line.runs().flat_map(|run| run.visual_clusters()).peekable();
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(run) = item else { continue };
                 let style = run.style();
@@ -223,7 +281,13 @@ impl Painter<'_> {
                 match (tokens, pushed) {
                     (Some(_), _) => {}
                     (None, true) => self.pushed(&run, at, color, index, over.shifts),
-                    (None, false) => self.out.items.extend(self.engine.glyphs(&run, at, color)),
+                    (None, false) => {
+                        let mut glyphs = self.engine.glyphs(&run, at, color);
+                        if let (Some(item), true) = (&mut glyphs, self.spelt) {
+                            spell(item, &mut clusters, &leaf.text);
+                        }
+                        self.out.items.extend(glyphs);
+                    }
                 }
                 let font = run.run().font_metrics();
                 let (lead, wider) = over.shifts.spread(index, run.offset(), run.offset() + run.advance());
@@ -337,30 +401,40 @@ impl Painter<'_> {
 
     /// Emits a line's glyphs with each token in its colour. A token can start anywhere inside one of Parley's
     /// glyph runs, so this walks the clusters and starts an item wherever the style or the token changes.
-    fn tokens(&mut self, line: &Line<'_, Brush>, at: Point, tokens: &[Token]) {
+    fn tokens(&mut self, line: &Line<'_, Brush>, at: Point, tokens: &[Token], source: &str) {
         let metrics = line.metrics();
         let mut pen = metrics.inline_min_coord + metrics.offset;
         for run in line.runs() {
             let mut open: Option<Stretch> = None;
             let mut close = |open: Option<Stretch>| {
-                let Some(Stretch { kind, ink, start, glyphs, .. }) = open else { return };
+                let Some(Stretch { kind, ink, start, glyphs, spelt, .. }) = open else { return };
                 let origin = Point { x: at.x + start, y: at.y + metrics.baseline };
                 let color = kind.map_or(self.inks.ink(ink), |kind| self.inks.palette.syntax.color(kind));
                 let slant = kind == Some(TokenKind::Comment);
-                self.out.items.extend(self.engine.item(&run, origin, color, slant, glyphs));
+                let spelt = if self.spelt { spelt.text(source, glyphs.len()) } else { None };
+                let mut item = self.engine.item(&run, origin, color, slant, glyphs);
+                if let Some(Item::Glyphs { text, .. }) = &mut item {
+                    *text = spelt;
+                }
+                self.out.items.extend(item);
             };
             for cluster in run.visual_clusters() {
                 let (style, kind) = (cluster.style_index(), tokens::at(tokens, cluster.text_range().start));
+                let mut drawn = 0;
                 for glyph in cluster.glyphs() {
                     if open.as_ref().is_none_or(|open| (open.style, open.kind) != (style, kind)) {
                         close(open.take());
-                        let ink = cluster.style().brush.ink;
-                        open = Some(Stretch { style, kind, ink, start: pen, glyphs: Vec::new() });
+                        let (ink, spelt) = (cluster.style().brush.ink, Spelt::default());
+                        open = Some(Stretch { style, kind, ink, start: pen, glyphs: Vec::new(), spelt });
                     }
                     if let Some(open) = &mut open {
                         open.glyphs.push(Glyph { id: glyph.id, x: pen - open.start + glyph.x, y: glyph.y });
                     }
                     pen += glyph.advance;
+                    drawn += 1;
+                }
+                if let Some(open) = &mut open {
+                    open.spelt.add(cluster.text_range(), drawn);
                 }
             }
             close(open.take());
@@ -384,9 +458,9 @@ impl Painter<'_> {
                     _ => Item::Fill { rect, color: palette.marker, radius: 0.0 },
                 });
             }
-            Marker::Number(_) => {
+            Marker::Number(number) => {
                 let Some(sign) = &laid.sign else { return };
-                self.glyphs(sign, Point { x: right - sign.full_width(), y: leaf.y });
+                self.glyphs(sign, &numbered(number), Point { x: right - sign.full_width(), y: leaf.y });
             }
             Marker::Task(checked) => {
                 let side = theme::CHECKBOX;
@@ -401,17 +475,22 @@ impl Painter<'_> {
                     x: rect.x + (side - sign.full_width()) / 2.0,
                     y: rect.y + ((side - sign.height()) / 2.0).round(),
                 };
-                self.glyphs(sign, at);
+                self.glyphs(sign, TICK, at);
             }
         }
     }
 
-    /// Emits a whole small layout with its top left at `at`.
-    pub fn glyphs(&mut self, layout: &Layout<Brush>, at: Point) {
+    /// Emits a whole small layout of `source` with its top left at `at`.
+    pub fn glyphs(&mut self, layout: &Layout<Brush>, source: &str, at: Point) {
         for line in layout.lines() {
+            let mut clusters = line.runs().flat_map(|run| run.visual_clusters()).peekable();
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(run) = item else { continue };
-                self.out.items.extend(self.engine.glyphs(&run, at, self.inks.ink(run.style().brush.ink)));
+                let mut glyphs = self.engine.glyphs(&run, at, self.inks.ink(run.style().brush.ink));
+                if let (Some(item), true) = (&mut glyphs, self.spelt) {
+                    spell(item, &mut clusters, source);
+                }
+                self.out.items.extend(glyphs);
             }
         }
     }

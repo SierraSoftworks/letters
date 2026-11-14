@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use letters_layout::{DocLayout, PageLink, Pages};
+use letters_layout::{DocLayout, PageLink, Pages, Token, TokenKind};
 use letters_model::{
     Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Model, Op, Page, Pos, ReplicaId, Run, Style, Tone,
 };
@@ -317,6 +317,47 @@ fn a_sheet_is_white_paper_whatever_the_theme() {
     assert!(sheet.text == light.text && sheet.beneath == light.beneath, "a dark theme changes nothing on paper");
     let colors = |items: &[Item]| items.iter().filter_map(color_of).collect::<Vec<_>>();
     assert!(colors(&painted(&layout, everything())) != colors(&light.text), "while the screen takes its colours");
+}
+
+#[test]
+fn a_sheet_says_what_its_glyphs_spell() {
+    let marked = Run { marks: [Mark::Bold].into(), ..Run::plain("office finds") };
+    let runs = vec![Run::plain("The "), marked, Run::plain(" it fine.")];
+    let mut blocks = mixed().blocks;
+    blocks.push(Block { body: Body::Text(runs), ..paragraph("m", "") });
+    let doc = doc(blocks);
+    let (mut layout, _) = paged(&doc, 240.0);
+    layout.set_tokens(&"c".into(), vec![Token { range: 0..2, kind: TokenKind::Keyword }]);
+    let pages = layout.paginate(&paper(240.0));
+
+    // What a list of items spells, with each run checked on the way.
+    let read = |items: &[Item]| {
+        let mut spelt = String::new();
+        for item in glyph_runs(items) {
+            let Item::Glyphs { glyphs, text, .. } = item else { continue };
+            let run = text.as_ref().expect("a run on a sheet carries its text");
+            assert_eq!(run.clusters.len(), glyphs.len(), "one cluster for each glyph of {:?}", run.text);
+            assert!(run.clusters.iter().all(|at| run.text.is_char_boundary(*at as usize)), "{:?}", run.text);
+            spelt.push_str(&run.text);
+        }
+        spelt
+    };
+    let (mut spelt, mut numbers) = (String::new(), Vec::new());
+    for index in 0..pages.sheets.len() {
+        let Painted { text, beneath, .. } = page(&layout, &pages, index);
+        spelt.push_str(&read(&text));
+        numbers.push(read(&beneath));
+    }
+    assert_eq!(numbers, (1..=pages.sheets.len()).map(|number| number.to_string()).collect::<Vec<_>>());
+    // A space at a line's end may draw nothing, so only what shows is compared.
+    let shown = |text: &str| text.split_whitespace().collect::<String>();
+    let spelt = shown(&spelt);
+    for block in doc.walk().filter(|block| !block.plain_text().is_empty()) {
+        assert!(spelt.contains(&shown(&block.plain_text())), "block {} can be read from its sheets", block.id);
+    }
+
+    let screen = painted(&layout, everything());
+    assert!(glyph_runs(&screen).all(|item| matches!(item, Item::Glyphs { text: None, .. })), "the screen keeps none");
 }
 
 #[test]

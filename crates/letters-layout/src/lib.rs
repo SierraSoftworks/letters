@@ -597,7 +597,7 @@ impl State {
             for (tag, level) in reveal.beside(&frame.id).filter(|_| seen) {
                 let (shape, width) = shapes.get(engine, types, Role::Body, true, tag);
                 if let Some(shape) = shapes.layout(shape) {
-                    Painter { engine, types, inks: &inks, band, out }.sign(shape, at, level);
+                    Painter { engine, types, inks: &inks, band, spelt: false, out }.sign(shape, at, level);
                 }
                 at.x += width;
             }
@@ -618,7 +618,12 @@ impl State {
                 let spelling = leaf.id.as_ref().filter(own).and_then(|id| spelling.get(id));
                 let spelling = spelling.map_or(&[][..], Vec::as_slice);
                 let over = Over { shifts: &shifts, shapes, composing, spelling };
-                Painter { engine, types, inks: &inks, band, out }.leaf(leaf, laid, tokens.map(Vec::as_slice), &over);
+                Painter { engine, types, inks: &inks, band, spelt: print, out }.leaf(
+                    leaf,
+                    laid,
+                    tokens.map(Vec::as_slice),
+                    &over,
+                );
             }
         }
     }
@@ -669,7 +674,8 @@ impl State {
             let x = area.x + (area.width - scratch.full_width()) / 2.0;
             let at = Point { x: x.round(), y: below + ((foot - scratch.height()) / 2.0).round() };
             let inks = Inks::new(types, *palette);
-            Painter { engine, types, inks: &inks, band: (f32::MIN, f32::MAX), out }.glyphs(scratch, at);
+            Painter { engine, types, inks: &inks, band: (f32::MIN, f32::MAX), spelt: true, out }
+                .glyphs(scratch, &label, at);
         }
     }
 
