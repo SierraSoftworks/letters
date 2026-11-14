@@ -1,0 +1,25 @@
+[package]
+name = "letters-math"
+description = "Maths: KaTeX-compatible TeX typeset into display items"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+letters-fonts.workspace = true
+letters-render.workspace = true
+ratex-font.workspace = true
+ratex-layout.workspace = true
+ratex-parser.workspace = true
+ratex-types.workspace = true
+skrifa.workspace = true
+
+[dev-dependencies]
+# Pixel snapshots, for the tests alone.
+letters-render = { workspace = true, features = ["snapshot"] }

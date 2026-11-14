@@ -20,6 +20,7 @@ letters-editor = { path = "crates/letters-editor" }
 letters-ui = { path = "crates/letters-ui" }
 letters-convert = { path = "crates/letters-convert" }
 letters-spell = { path = "crates/letters-spell" }
+letters-math = { path = "crates/letters-math" }
 letters-test = { path = "crates/letters-test" }
 
 serde = "1"
@@ -50,6 +51,11 @@ yewi-highlight = "0.1"
 # The accessibility tree's types: plain data, shared by the widgets, the shell and the test harness.
 accesskit = "0.25"
 accesskit_consumer = "0.39"
+# The maths engine, KaTeX-compatible and pure Rust. Only letters-math may name it.
+ratex-parser = "0.1.15"
+ratex-layout = "0.1.15"
+ratex-types = "0.1.15"
+ratex-font = "0.1.15"
 
 # The desktop shell. None of these may reach the core crates.
 winit = "0.30"
