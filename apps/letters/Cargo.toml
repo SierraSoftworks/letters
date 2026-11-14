@@ -27,3 +27,6 @@ arboard.workspace = true
 rfd.workspace = true
 getrandom.workspace = true
 pollster.workspace = true
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus.workspace = true

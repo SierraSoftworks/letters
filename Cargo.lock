@@ -1969,6 +1969,7 @@ dependencies = [
  "serde_json",
  "softbuffer",
  "winit",
+ "zbus",
 ]
 
 [[package]]
