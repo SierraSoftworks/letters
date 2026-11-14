@@ -13,6 +13,15 @@
       "items": { "type": "string" },
       "description": "Words every copy of this document accepts as spelled correctly."
     },
+    "properties": {
+      "type": "object",
+      "description": "The document's own metadata, as the front matter of a Markdown file. The source is kept as written.",
+      "required": ["format", "source"],
+      "properties": {
+        "format": { "enum": ["yaml", "toml"] },
+        "source": { "type": "string" }
+      }
+    },
     "blocks": { "$ref": "#/$defs/blocks" }
   },
   "$defs": {
@@ -24,9 +33,11 @@
         "id": { "type": "string", "minLength": 1, "description": "Stable, and unique within the document." },
         "type": {
           "type": "string",
-          "description": "paragraph, heading, list_item, code, quote, callout or divider. A block of any other type is kept as written and drawn from its fallback text."
+          "description": "paragraph, heading, list_item, code, formula, quote, callout or divider. A block of any other type is kept as written and drawn from its fallback text."
         },
-        "fallback": { "type": "string", "description": "Plain text a reader shows for a type it does not know." }
+        "fallback": { "type": "string", "description": "Plain text a reader shows for a type it does not know." },
+        "lang": { "$ref": "#/$defs/lang" },
+        "break": { "const": "page", "description": "Starts the block on a new page." }
       },
       "allOf": [
         {
@@ -63,6 +74,10 @@
           }
         },
         {
+          "if": { "properties": { "type": { "const": "formula" } } },
+          "then": { "$ref": "#/$defs/text", "description": "The text is the TeX source of a formula set on lines of its own." }
+        },
+        {
           "if": { "properties": { "type": { "const": "quote" } } },
           "then": { "$ref": "#/$defs/container" }
         },
@@ -94,10 +109,16 @@
         "marks": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "bold, italic, underline, strike, highlight or code. Any other mark is kept as written."
+          "description": "bold, italic, underline, strike, highlight, code or math. Text marked math is TeX source set in the line. Any other mark is kept as written."
         },
-        "link": { "type": "string", "description": "The address this text links to." }
+        "link": { "type": "string", "description": "The address this text links to." },
+        "lang": { "$ref": "#/$defs/lang" }
       }
+    },
+    "lang": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A BCP 47 tag for text in another language than the document's. On a block it covers the block, and on a run it wins over the block's."
     }
   }
 }

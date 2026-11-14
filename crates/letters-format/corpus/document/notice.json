@@ -1,0 +1,76 @@
+{
+  "format": 1,
+  "language": "en-GB",
+  "properties": {
+    "format": "yaml",
+    "source": "title: Notice of rates\ntags: [rates, 2027]\n"
+  },
+  "blocks": [
+    {
+      "id": "n1",
+      "type": "heading",
+      "level": 1,
+      "content": [
+        {
+          "text": "Notice of rates"
+        }
+      ]
+    },
+    {
+      "id": "n2",
+      "type": "paragraph",
+      "content": [
+        {
+          "text": "Interest compounds as "
+        },
+        {
+          "text": "(1 + r)^n",
+          "marks": [
+            "math"
+          ]
+        },
+        {
+          "text": ", or in full:"
+        }
+      ]
+    },
+    {
+      "id": "n3",
+      "type": "formula",
+      "content": [
+        {
+          "text": "A = P \\left(1 + \\frac{r}{n}\\right)^{nt}"
+        }
+      ]
+    },
+    {
+      "id": "n4",
+      "type": "heading",
+      "level": 1,
+      "content": [
+        {
+          "text": "Avis de taux"
+        }
+      ],
+      "break": "page",
+      "lang": "fr"
+    },
+    {
+      "id": "n5",
+      "type": "paragraph",
+      "content": [
+        {
+          "text": "Voir la "
+        },
+        {
+          "text": "notice",
+          "lang": "en"
+        },
+        {
+          "text": " ci-dessus."
+        }
+      ],
+      "lang": "fr"
+    }
+  ]
+}
