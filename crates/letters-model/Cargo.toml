@@ -1,0 +1,18 @@
+[package]
+name = "letters-model"
+description = "The Letters document, its operations and selections"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

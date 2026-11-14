@@ -1,0 +1,61 @@
+{
+  "format": 1,
+  "language": "en-GB",
+  "dictionary": [
+    "Harland",
+    "Okafor"
+  ],
+  "blocks": [
+    {
+      "id": "b1",
+      "type": "heading",
+      "level": 2,
+      "content": [
+        {
+          "text": "Rates"
+        }
+      ]
+    },
+    {
+      "id": "b2",
+      "type": "paragraph",
+      "content": [
+        {
+          "text": "Rates change on "
+        },
+        {
+          "text": "1 January",
+          "marks": [
+            "bold"
+          ]
+        },
+        {
+          "text": ". See the "
+        },
+        {
+          "text": "notice",
+          "link": "https://example.com/notice"
+        },
+        {
+          "text": "."
+        }
+      ]
+    },
+    {
+      "id": "b3",
+      "type": "callout",
+      "tone": "info",
+      "blocks": [
+        {
+          "id": "b4",
+          "type": "paragraph",
+          "content": [
+            {
+              "text": "Reply by Friday."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

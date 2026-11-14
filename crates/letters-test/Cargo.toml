@@ -1,0 +1,18 @@
+[package]
+name = "letters-test"
+description = "The headless interaction-test harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+letters-model.workspace = true
+letters-editor.workspace = true
+letters-ui.workspace = true
+letters-convert.workspace = true

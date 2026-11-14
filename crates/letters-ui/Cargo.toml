@@ -1,0 +1,18 @@
+[package]
+name = "letters-ui"
+description = "The yewi-styled native widgets and the editor window's panels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+letters-model.workspace = true
+letters-render.workspace = true
+letters-layout.workspace = true
+letters-editor.workspace = true

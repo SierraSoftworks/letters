@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+authors = ["Benjamin Pannell <benjamin@pannell.dev>"]
+repository = "https://github.com/SierraSoftworks/letters"
+publish = false
+
+[workspace.dependencies]
+letters-model = { path = "crates/letters-model" }
+letters-format = { path = "crates/letters-format" }
+letters-render = { path = "crates/letters-render" }
+letters-layout = { path = "crates/letters-layout" }
+letters-editor = { path = "crates/letters-editor" }
+letters-ui = { path = "crates/letters-ui" }
+letters-convert = { path = "crates/letters-convert" }
+letters-test = { path = "crates/letters-test" }
+
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+todo = "allow"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

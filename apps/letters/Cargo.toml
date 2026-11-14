@@ -1,0 +1,19 @@
+[package]
+name = "letters"
+description = "The Letters desktop app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+letters-model.workspace = true
+letters-editor.workspace = true
+letters-ui.workspace = true
+letters-format.workspace = true
+letters-convert.workspace = true

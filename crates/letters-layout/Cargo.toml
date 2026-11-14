@@ -1,0 +1,16 @@
+[package]
+name = "letters-layout"
+description = "Paragraph and page layout"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+letters-model.workspace = true
+letters-render.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "letters-editor"
+description = "Commands, Markdown input rules, keymap, clipboard and composition"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+letters-model.workspace = true
