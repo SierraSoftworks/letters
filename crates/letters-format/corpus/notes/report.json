@@ -1,0 +1,116 @@
+{
+  "format": 1,
+  "notes": [
+    {
+      "id": "n1",
+      "type": "comment",
+      "anchor": {
+        "block": "b2",
+        "start": 16,
+        "end": 25
+      },
+      "author": "Zoë Okafor",
+      "created": "2026-11-14T20:00:00Z",
+      "resolved": true,
+      "content": [
+        {
+          "text": "Is this the "
+        },
+        {
+          "text": "final",
+          "marks": [
+            "italic"
+          ]
+        },
+        {
+          "text": " date? 🎉"
+        }
+      ],
+      "replies": [
+        {
+          "author": "Ben",
+          "created": "2026-11-14T20:10:00Z",
+          "content": [
+            {
+              "text": "Yes, see the "
+            },
+            {
+              "text": "notice",
+              "link": "https://example.com/notice"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "n2",
+      "type": "import",
+      "anchor": {
+        "block": "b1"
+      },
+      "author": "Letters import",
+      "created": "2026-11-14T19:00:00Z",
+      "resolved": false,
+      "content": [
+        {
+          "text": "Text box flattened into this paragraph"
+        }
+      ]
+    },
+    {
+      "id": "n3",
+      "type": "conflict",
+      "anchor": {
+        "block": "b11"
+      },
+      "author": "Letters",
+      "created": "2026-11-14T21:00:00Z",
+      "resolved": false,
+      "content": [],
+      "versions": [
+        {
+          "author": "Zoë Okafor",
+          "edited": "2026-11-14T20:40:00Z",
+          "block": {
+            "id": "b11",
+            "type": "paragraph",
+            "content": [
+              {
+                "text": "Fair, and early."
+              }
+            ]
+          }
+        },
+        {
+          "author": "Ben",
+          "edited": "2026-11-14T20:45:00Z",
+          "block": {
+            "id": "b11",
+            "type": "paragraph",
+            "content": [
+              {
+                "text": "Fair, if a little early."
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "n4",
+      "type": "reaction",
+      "anchor": {
+        "block": "b3",
+        "stable": [
+          4,
+          2
+        ]
+      },
+      "author": "Ben",
+      "created": "2026-11-14T21:30:00Z",
+      "resolved": false,
+      "content": [],
+      "emoji": "tada"
+    }
+  ]
+}

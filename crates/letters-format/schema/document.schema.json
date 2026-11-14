@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SierraSoftworks/letters/main/crates/letters-format/schema/document.schema.json",
+  "title": "Letters document.json, format 1",
+  "description": "The document inside a .let file: a list of typed blocks holding runs of text. A reader keeps the fields and block types it does not know and writes them back. Block ids are unique across the whole tree, which this schema cannot express.",
+  "type": "object",
+  "required": ["format"],
+  "properties": {
+    "format": { "const": 1, "description": "Rises only for a breaking change." },
+    "language": { "type": "string", "description": "A BCP 47 tag such as en-GB. Defaults to en." },
+    "dictionary": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Words every copy of this document accepts as spelled correctly."
+    },
+    "blocks": { "$ref": "#/$defs/blocks" }
+  },
+  "$defs": {
+    "blocks": { "type": "array", "items": { "$ref": "#/$defs/block" } },
+    "block": {
+      "type": "object",
+      "required": ["id", "type"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "description": "Stable, and unique within the document." },
+        "type": {
+          "type": "string",
+          "description": "paragraph, heading, list_item, code, quote, callout or divider. A block of any other type is kept as written and drawn from its fallback text."
+        },
+        "fallback": { "type": "string", "description": "Plain text a reader shows for a type it does not know." }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "paragraph" } } },
+          "then": { "$ref": "#/$defs/text" }
+        },
+        {
+          "if": { "properties": { "type": { "const": "heading" } } },
+          "then": {
+            "$ref": "#/$defs/text",
+            "required": ["level"],
+            "properties": { "level": { "type": "integer", "minimum": 1, "maximum": 4 } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "list_item" } } },
+          "then": {
+            "$ref": "#/$defs/text",
+            "description": "Consecutive items form one list.",
+            "required": ["list"],
+            "properties": {
+              "list": { "enum": ["bullet", "ordered", "task"] },
+              "checked": { "type": "boolean", "description": "For a task item. Defaults to false." },
+              "depth": { "type": "integer", "minimum": 0, "maximum": 255, "description": "Nesting. Defaults to 0." }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "code" } } },
+          "then": {
+            "$ref": "#/$defs/text",
+            "properties": { "language": { "type": "string", "description": "Kept as written." } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "quote" } } },
+          "then": { "$ref": "#/$defs/container" }
+        },
+        {
+          "if": { "properties": { "type": { "const": "callout" } } },
+          "then": {
+            "$ref": "#/$defs/container",
+            "required": ["tone"],
+            "properties": { "tone": { "enum": ["tip", "info", "warn", "danger"] } }
+          }
+        }
+      ]
+    },
+    "text": {
+      "description": "A block that holds text.",
+      "properties": { "content": { "$ref": "#/$defs/runs" } }
+    },
+    "container": {
+      "description": "A block that holds other blocks.",
+      "properties": { "blocks": { "$ref": "#/$defs/blocks" } }
+    },
+    "runs": { "type": "array", "items": { "$ref": "#/$defs/run" } },
+    "run": {
+      "description": "A stretch of text with one set of marks. Offsets into a block count the UTF-8 bytes of its runs' text.",
+      "type": "object",
+      "required": ["text"],
+      "properties": {
+        "text": { "type": "string" },
+        "marks": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "bold, italic, underline, strike, highlight or code. Any other mark is kept as written."
+        },
+        "link": { "type": "string", "description": "The address this text links to." }
+      }
+    }
+  }
+}

@@ -1,0 +1,21 @@
+[
+  { "why": "the style is not an object", "at": "", "json": "body" },
+  { "why": "the format is missing", "at": "format", "json": { "types": {} } },
+  { "why": "the format is newer than 1", "at": "format", "json": { "format": 2 } },
+  { "why": "types is not an object", "at": "types", "json": { "format": 1, "types": [] } },
+  { "why": "a type is not an object", "at": "types.title", "json": { "format": 1, "types": { "title": "big" } } },
+  { "why": "a family is blank", "at": "types.body.family", "json": { "format": 1, "types": { "body": { "family": " " } } } },
+  { "why": "a weight is out of range", "at": "types.body.weight", "json": { "format": 1, "types": { "body": { "weight": 0 } } } },
+  { "why": "italic is not true or false", "at": "types.body.italic", "json": { "format": 1, "types": { "body": { "italic": "yes" } } } },
+  { "why": "a size is not above zero", "at": "types.body.size", "json": { "format": 1, "types": { "body": { "size": 0 } } } },
+  { "why": "a colour is not #rrggbb", "at": "types.body.color", "json": { "format": 1, "types": { "body": { "color": "red" } } } },
+  { "why": "an alignment is unknown", "at": "types.title.align", "json": { "format": 1, "types": { "title": { "align": "left" } } } },
+  { "why": "a line height is not above zero", "at": "types.body.line_height", "json": { "format": 1, "types": { "body": { "line_height": 0 } } } },
+  { "why": "a space is negative", "at": "types.body.space_before", "json": { "format": 1, "types": { "body": { "space_before": -1 } } } },
+  { "why": "an unknown type breaks the rules too", "at": "types.heading5.size", "json": { "format": 1, "types": { "heading5": { "size": "large" } } } },
+  { "why": "the page is not an object", "at": "page", "json": { "format": 1, "page": "A4" } },
+  { "why": "the page has no width", "at": "page.width", "json": { "format": 1, "page": { "width": 0 } } },
+  { "why": "a margin is negative", "at": "page.margin_top", "json": { "format": 1, "page": { "margin_top": -5 } } },
+  { "why": "the margins leave no room for text", "at": "page", "schema_accepts": true,
+    "json": { "format": 1, "page": { "margin_left": 300, "margin_right": 300 } } }
+]

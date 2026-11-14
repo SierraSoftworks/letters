@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SierraSoftworks/letters/main/crates/letters-format/schema/manifest.schema.json",
+  "title": "Letters manifest.json, format 1",
+  "description": "What a .let file is, and the hash of each of its entries. The file is a zip whose first entry, mimetype, is stored uncompressed and reads application/vnd.letters.document+zip.",
+  "type": "object",
+  "required": ["format", "id", "created", "hashes"],
+  "properties": {
+    "format": { "const": 1, "description": "Rises only for a breaking change." },
+    "id": { "type": "string", "minLength": 1, "description": "The document's identity, shared by every copy of it." },
+    "created": { "type": "string", "format": "date-time", "description": "RFC 3339." },
+    "hashes": {
+      "type": "object",
+      "description": "Entry name to the SHA-256 of its content, for every entry but mimetype and manifest.json.",
+      "additionalProperties": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+    }
+  }
+}

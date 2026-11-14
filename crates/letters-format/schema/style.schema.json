@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SierraSoftworks/letters/main/crates/letters-format/schema/style.schema.json",
+  "title": "Letters style.json and .letstyle, format 1",
+  "description": "A document's complete style: one text style per element type, plus page setup. Letters writes every type with every field. A reader fills a missing type or field from its built-in style and keeps the fields and types it does not know. The margins must leave room for text, which this schema cannot express.",
+  "type": "object",
+  "required": ["format"],
+  "properties": {
+    "format": { "const": 1, "description": "Rises only for a breaking change." },
+    "types": {
+      "type": "object",
+      "description": "Keyed by element type: title, heading1 to heading4, body, quote, code and caption.",
+      "additionalProperties": { "$ref": "#/$defs/text_style" }
+    },
+    "page": { "$ref": "#/$defs/page" }
+  },
+  "$defs": {
+    "text_style": {
+      "type": "object",
+      "properties": {
+        "family": { "type": "string", "pattern": "\\S", "description": "A font family name." },
+        "weight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "italic": { "type": "boolean" },
+        "size": { "type": "number", "exclusiveMinimum": 0, "description": "In points." },
+        "color": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$", "description": "As #rrggbb." },
+        "align": { "enum": ["start", "center", "end", "justify"] },
+        "line_height": { "type": "number", "exclusiveMinimum": 0, "description": "A multiple of the font size." },
+        "space_before": { "type": "number", "minimum": 0, "description": "In points." },
+        "space_after": { "type": "number", "minimum": 0, "description": "In points." }
+      }
+    },
+    "page": {
+      "type": "object",
+      "description": "Paper size and margins, in points.",
+      "properties": {
+        "width": { "type": "number", "exclusiveMinimum": 0 },
+        "height": { "type": "number", "exclusiveMinimum": 0 },
+        "margin_top": { "type": "number", "minimum": 0 },
+        "margin_right": { "type": "number", "minimum": 0 },
+        "margin_bottom": { "type": "number", "minimum": 0 },
+        "margin_left": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}

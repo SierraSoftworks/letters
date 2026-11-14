@@ -72,6 +72,14 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// The JSON Schemas of the public entries, as published with this format version.
+pub mod schema {
+    pub const MANIFEST: &str = include_str!("../schema/manifest.schema.json");
+    pub const DOCUMENT: &str = include_str!("../schema/document.schema.json");
+    pub const STYLE: &str = include_str!("../schema/style.schema.json");
+    pub const NOTES: &str = include_str!("../schema/notes.schema.json");
+}
+
 /// `manifest.json`: what the file is, and the hash of each entry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Manifest {

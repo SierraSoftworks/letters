@@ -1,0 +1,123 @@
+{
+  "format": 1,
+  "types": {
+    "title": {
+      "family": "Montserrat",
+      "weight": 800,
+      "italic": false,
+      "size": 32,
+      "color": "#0b3d91",
+      "align": "center",
+      "line_height": 1.2,
+      "space_before": 0,
+      "space_after": 8
+    },
+    "heading1": {
+      "family": "Inter",
+      "weight": 600,
+      "italic": false,
+      "size": 22,
+      "color": "#1f2328",
+      "align": "start",
+      "line_height": 1.25,
+      "space_before": 22,
+      "space_after": 8
+    },
+    "heading2": {
+      "family": "Inter",
+      "weight": 600,
+      "italic": false,
+      "size": 17,
+      "color": "#1f2328",
+      "align": "start",
+      "line_height": 1.25,
+      "space_before": 17,
+      "space_after": 8
+    },
+    "heading3": {
+      "family": "Inter",
+      "weight": 600,
+      "italic": false,
+      "size": 14,
+      "color": "#1f2328",
+      "align": "start",
+      "line_height": 1.25,
+      "space_before": 14,
+      "space_after": 8
+    },
+    "heading4": {
+      "family": "Inter",
+      "weight": 600,
+      "italic": false,
+      "size": 12,
+      "color": "#1f2328",
+      "align": "start",
+      "line_height": 1.25,
+      "space_before": 12,
+      "space_after": 8
+    },
+    "body": {
+      "family": "Inter",
+      "weight": 400,
+      "italic": false,
+      "size": 10.5,
+      "color": "#1f2328",
+      "align": "justify",
+      "line_height": 1.45,
+      "space_before": 0,
+      "space_after": 8
+    },
+    "quote": {
+      "family": "Inter",
+      "weight": 400,
+      "italic": true,
+      "size": 11,
+      "color": "#1f2328",
+      "align": "start",
+      "line_height": 1.5,
+      "space_before": 0,
+      "space_after": 8
+    },
+    "code": {
+      "family": "Fira Code",
+      "weight": 400,
+      "italic": false,
+      "size": 10,
+      "color": "#1f2328",
+      "align": "start",
+      "line_height": 1.5,
+      "space_before": 0,
+      "space_after": 8
+    },
+    "caption": {
+      "family": "Inter",
+      "weight": 400,
+      "italic": false,
+      "size": 9,
+      "color": "#1f2328",
+      "align": "start",
+      "line_height": 1.5,
+      "space_before": 0,
+      "space_after": 8
+    },
+    "margin_note": {
+      "family": "Inter",
+      "weight": 400,
+      "italic": true,
+      "size": 8,
+      "color": "#1f2328",
+      "align": "justify",
+      "line_height": 1.45,
+      "space_before": 0,
+      "space_after": 8
+    }
+  },
+  "page": {
+    "width": 612,
+    "height": 792,
+    "margin_top": 72,
+    "margin_right": 54,
+    "margin_bottom": 72,
+    "margin_left": 54
+  }
+}

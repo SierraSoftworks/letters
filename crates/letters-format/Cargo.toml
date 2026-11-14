@@ -18,4 +18,5 @@ sha2.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+jsonschema.workspace = true
 zip.workspace = true

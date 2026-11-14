@@ -1,0 +1,14 @@
+[
+  { "why": "only the format is required", "json": { "format": 1 } },
+  { "why": "keys may come in any order",
+    "json": { "blocks": [{ "content": [{ "marks": ["bold"], "text": "x" }], "level": 3, "type": "heading", "id": "a" }], "format": 1 } },
+  { "why": "missing content and child blocks mean empty",
+    "json": { "format": 1, "blocks": [{ "id": "a", "type": "paragraph" }, { "id": "b", "type": "quote" }, { "id": "c", "type": "code" }] } },
+  { "why": "a block of an unknown type is kept whatever it holds",
+    "json": { "format": 1, "blocks": [{ "id": "a", "type": "figure", "asset": "assets/0a1b.png", "level": "none", "content": 7 }] } },
+  { "why": "unknown marks and fields are kept",
+    "json": { "format": 1, "theme": { "accent": "blue" }, "blocks": [{ "id": "a", "type": "paragraph", "pinned": true,
+      "content": [{ "text": "x", "marks": ["blink"], "revision": 4 }] }] } },
+  { "why": "text is any Unicode, and may be empty",
+    "json": { "format": 1, "language": "ja", "blocks": [{ "id": "a", "type": "paragraph", "content": [{ "text": "" }, { "text": "手紙 ✉️ é" }] }] } }
+]

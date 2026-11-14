@@ -1,0 +1,207 @@
+{
+  "format": 1,
+  "language": "en-GB",
+  "dictionary": [
+    "Harland",
+    "Okafor"
+  ],
+  "blocks": [
+    {
+      "id": "b1",
+      "type": "heading",
+      "level": 1,
+      "content": [
+        {
+          "text": "Rates for 2027"
+        }
+      ]
+    },
+    {
+      "id": "b2",
+      "type": "paragraph",
+      "content": [
+        {
+          "text": "Rates change on "
+        },
+        {
+          "text": "1 January",
+          "marks": [
+            "bold"
+          ]
+        },
+        {
+          "text": ". See the "
+        },
+        {
+          "text": "notice",
+          "link": "https://example.com/notice"
+        },
+        {
+          "text": " from Zoë Okafor, priced in €."
+        }
+      ]
+    },
+    {
+      "id": "b3",
+      "type": "heading",
+      "level": 2,
+      "content": [
+        {
+          "text": "What to do"
+        }
+      ]
+    },
+    {
+      "id": "b4",
+      "type": "list_item",
+      "list": "ordered",
+      "content": [
+        {
+          "text": "Read the notice"
+        }
+      ]
+    },
+    {
+      "id": "b5",
+      "type": "list_item",
+      "list": "ordered",
+      "content": [
+        {
+          "text": "Reply to "
+        },
+        {
+          "text": "rates@example.com",
+          "marks": [
+            "code"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "b6",
+      "type": "list_item",
+      "list": "bullet",
+      "depth": 1,
+      "content": [
+        {
+          "text": "by post",
+          "marks": [
+            "italic",
+            "underline"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "b7",
+      "type": "list_item",
+      "list": "task",
+      "checked": true,
+      "content": [
+        {
+          "text": "Tell the team",
+          "marks": [
+            "strike"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "b8",
+      "type": "list_item",
+      "list": "task",
+      "checked": false,
+      "content": [
+        {
+          "text": "Update the site",
+          "marks": [
+            "highlight"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "b9",
+      "type": "code",
+      "language": "rust",
+      "content": [
+        {
+          "text": "fn rate() -> f32 {\n    4.5\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "b10",
+      "type": "quote",
+      "blocks": [
+        {
+          "id": "b11",
+          "type": "paragraph",
+          "content": [
+            {
+              "text": "Fair, and early."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "b12",
+      "type": "callout",
+      "tone": "info",
+      "blocks": [
+        {
+          "id": "b13",
+          "type": "paragraph",
+          "content": [
+            {
+              "text": "Reply by Friday."
+            }
+          ]
+        },
+        {
+          "id": "b14",
+          "type": "callout",
+          "tone": "danger",
+          "blocks": []
+        }
+      ]
+    },
+    {
+      "id": "b15",
+      "type": "divider"
+    },
+    {
+      "id": "b16",
+      "type": "hologram",
+      "content": [
+        {
+          "text": "kept as written"
+        }
+      ],
+      "fallback": "A hologram of the rate card",
+      "zoom": {
+        "x": 1.5,
+        "y": 2
+      }
+    },
+    {
+      "id": "b17",
+      "type": "paragraph",
+      "content": [
+        {
+          "text": "From a newer build",
+          "marks": [
+            "sparkle"
+          ],
+          "future": true
+        }
+      ],
+      "break": "page"
+    }
+  ],
+  "future": [
+    1,
+    2
+  ]
+}

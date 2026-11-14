@@ -1,0 +1,8 @@
+[
+  { "why": "only the format is required", "json": { "format": 1 } },
+  { "why": "a type may set only what it changes", "json": { "format": 1, "types": { "quote": { "italic": false } } } },
+  { "why": "colours may be written in upper case", "json": { "format": 1, "types": { "body": { "color": "#AABBCC" } } } },
+  { "why": "unknown types and fields are kept",
+    "json": { "format": 1, "theme": "dusk", "types": { "body": { "tracking": 0.5 }, "heading5": { "size": 11 } }, "page": { "columns": 2 } } },
+  { "why": "margins may be zero", "json": { "format": 1, "page": { "margin_top": 0, "margin_right": 0, "margin_bottom": 0, "margin_left": 0 } } }
+]

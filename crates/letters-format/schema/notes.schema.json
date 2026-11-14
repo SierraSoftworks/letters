@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SierraSoftworks/letters/main/crates/letters-format/schema/notes.schema.json",
+  "title": "Letters notes.json, format 1",
+  "description": "The notes on a document: comments, import notes and conflicts, each anchored to a passage. A reader keeps the fields and note types it does not know and writes them back. Note ids are unique, which this schema cannot express.",
+  "type": "object",
+  "required": ["format"],
+  "properties": {
+    "format": { "const": 1, "description": "Rises only for a breaking change." },
+    "notes": { "type": "array", "items": { "$ref": "#/$defs/note" } }
+  },
+  "$defs": {
+    "note": {
+      "type": "object",
+      "required": ["id", "type", "anchor", "author", "created"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "comment, import or conflict. A note of any other type is kept as written."
+        },
+        "anchor": { "$ref": "#/$defs/anchor" },
+        "author": { "$ref": "#/$defs/author" },
+        "created": { "$ref": "#/$defs/time" },
+        "resolved": { "type": "boolean", "description": "Defaults to false." },
+        "content": {
+          "$ref": "document.schema.json#/$defs/runs",
+          "description": "What the note says, in the same runs as document text."
+        },
+        "replies": { "type": "array", "items": { "$ref": "#/$defs/reply" } }
+      },
+      "if": { "properties": { "type": { "const": "conflict" } } },
+      "then": {
+        "required": ["versions"],
+        "properties": {
+          "versions": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": { "$ref": "#/$defs/version" },
+            "description": "The two versions of the anchored block. Picking one resolves the note."
+          }
+        }
+      }
+    },
+    "anchor": {
+      "type": "object",
+      "description": "The passage a note sits on: a whole block, or a range of its text in UTF-8 bytes with start no greater than end.",
+      "required": ["block"],
+      "properties": {
+        "block": { "type": "string", "minLength": 1, "description": "The id of a block in document.json." },
+        "start": { "type": "integer", "minimum": 0 },
+        "end": { "type": "integer", "minimum": 0 }
+      },
+      "dependentRequired": { "start": ["end"], "end": ["start"] }
+    },
+    "version": {
+      "type": "object",
+      "description": "One side of a conflict.",
+      "required": ["author", "edited", "block"],
+      "properties": {
+        "author": { "$ref": "#/$defs/author" },
+        "edited": { "$ref": "#/$defs/time" },
+        "block": { "$ref": "document.schema.json#/$defs/block" }
+      }
+    },
+    "reply": {
+      "type": "object",
+      "required": ["author", "created"],
+      "properties": {
+        "author": { "$ref": "#/$defs/author" },
+        "created": { "$ref": "#/$defs/time" },
+        "content": { "$ref": "document.schema.json#/$defs/runs" }
+      }
+    },
+    "author": { "type": "string", "minLength": 1, "description": "The name shown beside the note." },
+    "time": { "type": "string", "minLength": 1, "format": "date-time", "description": "RFC 3339." }
+  }
+}
