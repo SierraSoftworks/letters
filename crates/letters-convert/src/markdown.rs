@@ -10,11 +10,13 @@ mod write;
 use letters_model::{Mark, Tone};
 
 pub use read::from_markdown;
+pub(crate) use read::{merge, nest, table};
+pub(crate) use write::cell;
 pub use write::to_markdown;
 
 /// The tags a callout opens with. The first name of each tone is GitHub's and is the one written, so that the
 /// file renders as alerts there.
-const TONES: [(&str, Tone); 8] = [
+pub(crate) const TONES: [(&str, Tone); 8] = [
     ("NOTE", Tone::Info),
     ("TIP", Tone::Tip),
     ("WARNING", Tone::Warn),
@@ -27,7 +29,7 @@ const TONES: [(&str, Tone); 8] = [
 
 /// The HTML tags read as marks. The first name of each mark is the one written when Markdown has no syntax
 /// for it.
-const TAGS: [(&str, Mark); 11] = [
+pub(crate) const TAGS: [(&str, Mark); 11] = [
     ("strong", Mark::Bold),
     ("em", Mark::Italic),
     ("del", Mark::Strike),

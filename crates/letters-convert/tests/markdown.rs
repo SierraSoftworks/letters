@@ -1,8 +1,12 @@
 //! Markdown import and export, through the two public functions.
 
+mod common;
+
 use letters_convert::{ImportNote, from_markdown, to_markdown};
 use letters_model::{Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Run, Tone};
 use proptest::prelude::*;
+
+use common::outline;
 
 fn read(markdown: &str) -> (Document, Vec<ImportNote>) {
     let mut next = 0;
@@ -10,45 +14,6 @@ fn read(markdown: &str) -> (Document, Vec<ImportNote>) {
         next += 1;
         format!("b{next}")
     })
-}
-
-/// A document as indented lines such as `h1 "Title"`, with marked runs as `<bold,italic|text>` and linked ones
-/// as `<@url|text>`, so that a case can state the document it expects.
-fn outline(doc: &Document) -> Vec<String> {
-    fn runs(block: &Block) -> String {
-        let run = |run: &Run| {
-            let mut format: Vec<String> = run.marks.iter().map(|mark| format!("{mark:?}").to_lowercase()).collect();
-            format.extend(run.link.iter().map(|url| format!("@{url}")));
-            if format.is_empty() { run.text.clone() } else { format!("<{}|{}>", format.join(","), run.text) }
-        };
-        format!("{:?}", block.body.runs().iter().map(run).collect::<String>())
-    }
-    fn push(blocks: &[Block], indent: usize, out: &mut Vec<String>) {
-        for block in blocks {
-            let line = match &block.kind {
-                BlockKind::Paragraph => format!("p {}", runs(block)),
-                BlockKind::Heading { level } => format!("h{level} {}", runs(block)),
-                BlockKind::ListItem { list: ListKind::Bullet, depth } => format!("bullet/{depth} {}", runs(block)),
-                BlockKind::ListItem { list: ListKind::Ordered, depth } => format!("ordered/{depth} {}", runs(block)),
-                BlockKind::ListItem { list: ListKind::Task { checked: true }, depth } => {
-                    format!("done/{depth} {}", runs(block))
-                }
-                BlockKind::ListItem { list: ListKind::Task { checked: false }, depth } => {
-                    format!("todo/{depth} {}", runs(block))
-                }
-                BlockKind::Code { language } => format!("code:{} {}", language.as_deref().unwrap_or("-"), runs(block)),
-                BlockKind::Quote => "quote".to_owned(),
-                BlockKind::Callout { tone } => format!("callout:{tone:?}").to_lowercase(),
-                BlockKind::Divider => "divider".to_owned(),
-                BlockKind::Unknown { type_name } => format!("unknown:{type_name}"),
-            };
-            out.push(format!("{:indent$}{line}", ""));
-            push(block.body.blocks(), indent + 2, out);
-        }
-    }
-    let mut out = Vec::new();
-    push(&doc.blocks, 0, &mut out);
-    out
 }
 
 fn doc(blocks: Vec<Block>) -> Document {

@@ -119,17 +119,7 @@ impl<'a> Reader<'a, '_> {
                 _ => {}
             }
         }
-        // A block moved out of a list item splits the list, so the items after it start over.
-        let mut deepest = 0;
-        for block in &mut out {
-            deepest = match &mut block.kind {
-                BlockKind::ListItem { depth, .. } => {
-                    *depth = (*depth).min(deepest);
-                    depth.saturating_add(1)
-                }
-                _ => 0,
-            };
-        }
+        nest(&mut out);
         out
     }
 
@@ -360,8 +350,7 @@ impl<'a> Reader<'a, '_> {
             Alignment::Center => ":-:",
             Alignment::Right => "--:",
         };
-        rows.insert(rows.len().min(1), alignments.iter().map(|alignment| rule(alignment).to_owned()).collect());
-        rows.iter().map(|row| format!("| {} |", row.join(" | "))).collect::<Vec<_>>().join("\n")
+        table(rows, alignments.iter().map(|alignment| rule(alignment).to_owned()).collect())
     }
 
     /// Reads inline content up to the next block boundary, which is left for the caller.
@@ -482,8 +471,29 @@ fn address(url: &str) -> String {
     url.replace(['\n', '\r'], " ")
 }
 
+/// Lets each list item sit at most one level below the item before it. A block that is not an item splits the
+/// list, so the items after it start over.
+pub(crate) fn nest(blocks: &mut [Block]) {
+    let mut deepest = 0;
+    for block in blocks {
+        deepest = match &mut block.kind {
+            BlockKind::ListItem { depth, .. } => {
+                *depth = (*depth).min(deepest);
+                depth.saturating_add(1)
+            }
+            _ => 0,
+        };
+    }
+}
+
+/// Lays rows of cells out as a Markdown table, with `rules` under its first row.
+pub(crate) fn table(mut rows: Vec<Vec<String>>, rules: Vec<String>) -> String {
+    rows.insert(rows.len().min(1), rules);
+    rows.iter().map(|row| format!("| {} |", row.join(" | "))).collect::<Vec<_>>().join("\n")
+}
+
 /// Joins neighbouring runs that share their formatting.
-fn merge(mut runs: Vec<Run>) -> Vec<Run> {
+pub(crate) fn merge(mut runs: Vec<Run>) -> Vec<Run> {
     runs.dedup_by(|next, last| {
         let same = last.marks == next.marks && last.link == next.link;
         if same {

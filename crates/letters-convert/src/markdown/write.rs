@@ -23,7 +23,7 @@ pub fn to_markdown(doc: &Document) -> String {
 }
 
 /// A table cell, for the reader to keep a table as source.
-pub(super) fn cell(runs: &[Run]) -> String {
+pub(crate) fn cell(runs: &[Run]) -> String {
     text(runs, Context::Cell)
 }
 

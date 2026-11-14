@@ -47,6 +47,8 @@ bytemuck = "1"
 # Text shaping and line breaking. No system fonts: only the bundled faces are registered.
 parley = { version = "0.13", default-features = false, features = ["std"] }
 pulldown-cmark = { version = "0.13", default-features = false }
+# Tokenizes clipboard HTML. No dependencies of its own.
+html5gum = "0.9"
 # Reads Hunspell dictionaries. MPL-2.0, used unmodified.
 spellbook = "0.4"
 # yewi's highlighter. Its own lexers need no dependencies; the `syntect` feature adds grammars and weight.

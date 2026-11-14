@@ -12,6 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+html5gum.workspace = true
 letters-model.workspace = true
 letters-layout.workspace = true
 letters-render.workspace = true

@@ -1,10 +1,14 @@
-//! Document to one HTML file.
+//! HTML in both directions: a document to one HTML file, and the clipboard's HTML to and from blocks.
 //!
 //! The file stands alone: the document's style is written as CSS in its head, code is highlighted with spans,
 //! images are written into it, and it holds no script and loads nothing. It reads the same offline, as an
 //! attachment or on a web server.
 
+mod read;
+
 use std::fmt::Write as _;
+
+pub use read::from_html;
 
 use letters_layout::{Palette, TokenKind as Ink};
 use letters_model::{Align, Block, BlockKind, Document, ListKind, Mark, Run, Style, TextStyle, Tone};
@@ -53,6 +57,14 @@ pub fn to_html(doc: &Document, style: &Style, title: &str, assets: Assets) -> St
     out.push_str("</style>\n</head>\n<body>\n<article>\n");
     blocks(&doc.blocks, assets, &mut out);
     out.push_str("</article>\n</body>\n</html>\n");
+    out
+}
+
+/// Writes `blocks` as the elements a page's body would hold, with no page around them: what a copy offers to
+/// other applications. Nothing is styled, and no image is written in.
+pub fn to_html_fragment(blocks: &[Block]) -> String {
+    let mut out = String::new();
+    self::blocks(blocks, &mut |_| None, &mut out);
     out
 }
 
