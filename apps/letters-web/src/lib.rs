@@ -3,6 +3,7 @@
 //! - [`shell`] owns the canvas, the hidden input beside it and the frame loop.
 //! - [`input`] turns the hidden input's events into the editor's input, and [`browser`] lends the editor
 //!   the browser's clock, identifiers and clipboard.
+//! - [`mirror`] keeps the window readable as HTML beside the canvas, for assistive technology.
 //! - [`Letters`] is what a page holds: `await Letters.start(canvas, "fonts/")` starts the editor.
 //!
 //! Frames are rasterised on the CPU, so the page needs no WebGPU. The fonts are fetched beside the wasm and
@@ -10,6 +11,7 @@
 
 pub mod browser;
 pub mod input;
+pub mod mirror;
 pub mod shell;
 
 use std::cell::RefCell;
@@ -76,5 +78,11 @@ impl Letters {
     #[wasm_bindgen(getter, js_name = frameMs)]
     pub fn frame_ms(&self) -> f64 {
         self.shell.borrow().stats().frame_ms
+    }
+
+    /// How long the mirror last took to bring up to date, in milliseconds.
+    #[wasm_bindgen(getter, js_name = mirrorMs)]
+    pub fn mirror_ms(&self) -> f64 {
+        self.shell.borrow().stats().mirror_ms
     }
 }

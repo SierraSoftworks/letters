@@ -1,5 +1,5 @@
-//! The page around the engine: a canvas it paints into, and a hidden input beside the canvas that takes the
-//! keyboard.
+//! The page around the engine: a canvas it paints into, a hidden input beside the canvas that takes the
+//! keyboard, and a mirror of the window as HTML for assistive technology.
 //!
 //! Every event ends the same way, in [`Shell::sync`], which asks for a frame if the view wants one and
 //! moves the hidden input under the caret, where the input method's candidate window should open.
@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
+use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Function, Object, Reflect};
 use letters_editor::{Clip, Editor, Platform as _};
 use letters_model::{Block, BlockId, BlockKind, Document, HistoryError, Pos, ReplicaId, Selection, Style};
@@ -17,12 +18,13 @@ use letters_ui::{Cursor, Keys, Request, Scheme, Window as View, tokens};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use web_sys::{
-    CanvasRenderingContext2d, ClipboardEvent, CompositionEvent, Event, EventTarget, HtmlCanvasElement,
+    CanvasRenderingContext2d, ClipboardEvent, CompositionEvent, Element, Event, EventTarget, HtmlCanvasElement,
     HtmlTextAreaElement, ImageData, KeyboardEvent, MediaQueryList, MouseEvent, PointerEvent, WheelEvent, Window,
 };
 
 use crate::browser::Browser;
 use crate::input::{Clipboard, Dom, Held, Reply, TextInput, modifiers};
+use crate::mirror::{Act, Mirror, Page};
 
 /// The distance one line of a mouse wheel scrolls, in logical pixels.
 const WHEEL_LINE: f32 = 40.0;
@@ -30,6 +32,13 @@ const WHEEL_LINE: f32 = 40.0;
 /// font size keeps phones from zooming in on it.
 const HIDDEN: &str = "position:fixed;width:1px;padding:0;border:0;margin:0;outline:0;resize:none;overflow:hidden;\
                       opacity:0;pointer-events:none;white-space:pre;font-size:16px;";
+
+/// The mirror: over the canvas, so that what it says about where things are is true, and out of sight and
+/// out of the pointer's way. Its text is not for the eye, so the page lays out as little of it as it can.
+const MIRROR: &str = "position:fixed;overflow:hidden;opacity:0;pointer-events:none;user-select:none;contain:strict;";
+/// How long the window must stay as it is before the mirror is brought up to date, in milliseconds. Reading
+/// the whole window costs more than a key press should wait for.
+const MIRROR_MS: i32 = 150;
 
 /// The modifiers held during a keyboard or pointer event, which report them under the same names.
 macro_rules! held {
@@ -52,6 +61,8 @@ pub struct Stats {
     pub first_frame_ms: Option<f64>,
     /// How long the latest frame took, from the display list to the canvas.
     pub frame_ms: f64,
+    /// How long the mirror last took to bring up to date.
+    pub mirror_ms: f64,
 }
 
 pub struct Shell {
@@ -63,6 +74,12 @@ pub struct Shell {
     less_motion: Option<MediaQueryList>,
     on_frame: Function,
     on_wake: Function,
+    on_mirror: Function,
+    mirror: Page,
+    /// The element the mirror is kept in.
+    holder: Element,
+    /// The timer that brings the mirror up to date once the window has settled.
+    mirror_timer: Option<i32>,
 
     view: View,
     platform: Browser,
@@ -109,6 +126,10 @@ impl Shell {
             input.set_attribute(name, value)?;
         }
         canvas.insert_adjacent_element("afterend", &input)?;
+        // The canvas itself says nothing. The mirror follows the input, where a reader comes to it next.
+        canvas.set_attribute("aria-hidden", "true")?;
+        let holder = document.create_element("div")?;
+        input.insert_adjacent_element("afterend", &holder)?;
 
         let mut platform = Browser::new(&window)?;
         let mac = window.navigator().platform().is_ok_and(|name| name.starts_with("Mac") || name.starts_with("iP"));
@@ -120,6 +141,10 @@ impl Shell {
             RefCell::new(Self {
                 on_frame: callback(shell, Self::paint),
                 on_wake: callback(shell, Self::wake),
+                on_mirror: callback(shell, Self::reflect),
+                mirror: Page::new(&document, holder.clone()),
+                holder: holder.clone(),
+                mirror_timer: None,
                 window: window.clone(),
                 canvas: canvas.clone(),
                 context,
@@ -149,6 +174,25 @@ impl Shell {
         let focus = input.clone();
         listen(&canvas, "pointerdown", move |_| report(focus.focus()))?;
         listen(&canvas, "mousedown", |event| event.prevent_default())?;
+
+        // Assistive technology presses what it finds in the mirror. The keyboard goes back to the hidden
+        // input afterwards, as it does after a press on the canvas.
+        let (pressed, focus) = (Rc::downgrade(&shell), input.clone());
+        listen(&holder, "click", move |event| {
+            let mut nodes = Vec::new();
+            let mut at = event.target().and_then(|target| target.dyn_into::<Element>().ok());
+            while let Some(element) = at {
+                nodes.extend(Mirror::node(&element.id()));
+                at = element.parent_element();
+            }
+            if let Some(shell) = pressed.upgrade() {
+                let mut shell = shell.borrow_mut();
+                shell.act(&nodes);
+                shell.changed();
+                shell.sync();
+            }
+            report(focus.focus());
+        })?;
 
         hear(&shell, &canvas, "pointerdown", Self::pointer_down)?;
         hear(&shell, &canvas, "pointermove", Self::pointer_move)?;
@@ -207,6 +251,7 @@ impl Shell {
     /// scrolled to, and the caret stays with its text.
     pub fn merge(&mut self, history: &[u8]) -> Result<(), HistoryError> {
         self.view.change(|editor| editor.merge(history))?;
+        self.changed();
         self.sync();
         Ok(())
     }
@@ -216,6 +261,7 @@ impl Shell {
         let active = self.window.document().and_then(|page| page.active_element());
         self.view.focus(active.is_some_and(|active| active == **self.input));
         self.fit();
+        self.changed();
         self.sync();
     }
 
@@ -230,6 +276,10 @@ impl Shell {
             self.canvas.set_height(height);
             self.frame = Frame::new(width, height);
         }
+        let place = self.canvas.get_bounding_client_rect();
+        let place =
+            format!("left:{}px;top:{}px;width:{}px;height:{}px", place.left(), place.top(), size.width, size.height);
+        report(self.holder.set_attribute("style", &format!("{MIRROR}{place}")));
         self.scale = scale;
         self.view.set_dark(self.dark());
         self.view.set_reduced_motion(self.less_motion.as_ref().is_some_and(MediaQueryList::matches));
@@ -291,6 +341,56 @@ impl Shell {
         self.stats.first_frame_ms.get_or_insert(end);
         self.stats.frame_ms = end - start;
         self.wake_at(wake);
+    }
+
+    // The mirror
+
+    /// Says that the window may read differently, so the mirror is due once it has settled.
+    fn changed(&mut self) {
+        if let Some(timer) = self.mirror_timer.take() {
+            self.window.clear_timeout_with_handle(timer);
+        }
+        let set = self.window.set_timeout_with_callback_and_timeout_and_arguments_0(&self.on_mirror, MIRROR_MS);
+        self.mirror_timer = set.ok();
+    }
+
+    /// Brings the mirror up to date with the window.
+    fn reflect(&mut self) {
+        self.mirror_timer = None;
+        let start = self.platform.now();
+        let mirror = Mirror::of(&self.view.access());
+        // The hidden input keeps the keyboard, and says which control inside the window has it.
+        report(match mirror.focus {
+            Some(focus) => self.input.set_attribute("aria-activedescendant", &Mirror::name(focus)),
+            None => self.input.remove_attribute("aria-activedescendant"),
+        });
+        report(self.mirror.show(mirror));
+        self.stats.mirror_ms = self.platform.now() - start;
+    }
+
+    /// Does what a press in the mirror asks for. `nodes` are the pressed element's node and those around
+    /// it, innermost first: the first that can be pressed takes it.
+    fn act(&mut self, nodes: &[u64]) {
+        let items = &self.mirror.shown().items;
+        let Some((node, act)) = nodes.iter().find_map(|node| Some((*node, items.get(node)?.act?))) else { return };
+        let request = match act {
+            Act::Click => ActionRequest {
+                action: Action::Click,
+                target_tree: TreeId::ROOT,
+                target_node: NodeId(node),
+                data: None,
+            },
+            Act::Caret { page, run } => {
+                let start = TextPosition { node: NodeId(run), character_index: 0 };
+                ActionRequest {
+                    action: Action::SetTextSelection,
+                    target_tree: TreeId::ROOT,
+                    target_node: NodeId(page),
+                    data: Some(ActionData::SetTextSelection(TextSelection { anchor: start, focus: start })),
+                }
+            }
+        };
+        self.view.access_action(request, &mut self.platform);
     }
 
     /// Lets the view move what moves on its own, when the time it asked for has come.
@@ -489,10 +589,15 @@ fn hear<E: JsCast + 'static>(
     handler: fn(&mut Shell, E),
 ) -> Result<(), JsValue> {
     let shell = Rc::downgrade(shell);
+    // The pointer's travels change nothing the mirror says.
+    let quiet = matches!(kind, "pointermove" | "pointerleave" | "wheel");
     listen(target, kind, move |event| {
         let Some(shell) = shell.upgrade() else { return };
         let mut shell = shell.borrow_mut();
         handler(&mut shell, event.unchecked_into());
+        if !quiet {
+            shell.changed();
+        }
         shell.sync();
     })
 }

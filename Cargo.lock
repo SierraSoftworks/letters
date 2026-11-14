@@ -2690,6 +2690,7 @@ dependencies = [
 name = "letters-web"
 version = "0.1.0"
 dependencies = [
+ "accesskit",
  "js-sys",
  "letters-editor",
  "letters-fonts",
