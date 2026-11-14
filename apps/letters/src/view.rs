@@ -20,6 +20,8 @@ const GUTTER: f32 = 24.0;
 const TOP: f32 = 48.0;
 const CARET_WIDTH: f32 = 1.5;
 const BLINK_MS: u64 = 530;
+/// How much text one idle step lays out: about 2 ms of work.
+const SETTLE_BYTES: usize = 8192;
 /// Points to logical pixels.
 const PT: f32 = 96.0 / 72.0;
 
@@ -39,6 +41,8 @@ pub struct View {
     size: Size,
     /// The width the layout was last made for, or zero before the first layout.
     laid_width: f32,
+    /// Whether the layout still holds height estimates for blocks it has not laid out.
+    estimated: bool,
     scroll: f32,
     focused: bool,
     dragging: bool,
@@ -60,6 +64,7 @@ impl View {
             name: String::new(),
             size: Size::default(),
             laid_width: 0.0,
+            estimated: false,
             scroll: 0.0,
             focused: true,
             dragging: false,
@@ -105,6 +110,11 @@ impl View {
         Rect::new(((self.size.width - width) / 2.0).round(), TOP - self.scroll, width, self.layout_height())
     }
 
+    /// The part of the column the window shows, in the column's own coordinates.
+    fn viewport(&self) -> Rect {
+        Rect::new(0.0, self.scroll - TOP, self.laid_width, self.size.height)
+    }
+
     fn layout_height(&self) -> f32 {
         if self.laid_width > 0.0 { self.layout.height() } else { 0.0 }
     }
@@ -120,6 +130,7 @@ impl View {
         if width != self.laid_width {
             self.layout.update(self.editor.doc(), &self.style, width, None);
             self.laid_width = width;
+            self.estimated = true;
         }
         self.scroll = self.scroll.min(self.max_scroll());
         self.needs_paint = true;
@@ -131,14 +142,17 @@ impl View {
         if self.laid_width == 0.0 {
             return;
         }
+        // What is about to be shown must be laid out for real. The rest waits for idle time.
+        let viewport = self.viewport();
+        self.estimated = self.layout.settle(viewport, 0);
         let column = self.column();
         let first = out.items.len();
         if let Some(selection) = self.editor.selection().filter(|selection| !selection.is_caret()) {
-            for rect in self.layout.selection(selection) {
+            for rect in self.layout.selection_in(selection, viewport) {
                 out.push(Item::Fill { rect, color: SELECTION, radius: 0.0 });
             }
         }
-        self.layout.paint(Rect::new(0.0, -column.y, column.width, self.size.height), out);
+        self.layout.paint(viewport, out);
         if self.focused
             && self.caret_shown
             && let Some(caret) = self.caret()
@@ -167,8 +181,34 @@ impl View {
         Cursor::Text
     }
 
-    /// Advances the caret's blink. Returns when the next frame is wanted, or `None` when nothing moves.
+    /// Advances what moves on its own: the caret's blink, and laying out the rest of the document while
+    /// nothing else is happening. Returns when to call again, or `None` when nothing is left to move.
     pub fn animate(&mut self, now_ms: u64) -> Option<u64> {
+        let blink = self.blink(now_ms);
+        if !self.estimated {
+            return blink;
+        }
+        // A frame that is owed comes before any work on what is off screen.
+        if !self.needs_paint {
+            self.settle();
+        }
+        Some(now_ms)
+    }
+
+    /// Lays out a little more of the document, holding still what the window shows.
+    fn settle(&mut self) {
+        let viewport = self.viewport();
+        // Blocks above the viewport change height as they are laid out, so the top line is pinned.
+        let pin = self.layout.hit(Point { x: 0.0, y: viewport.y.max(0.0) });
+        let top = |layout: &DocLayout| pin.as_ref().and_then(|pos| layout.caret(pos)).map(|caret| caret.y);
+        let before = top(&self.layout);
+        self.estimated = self.layout.settle(viewport, SETTLE_BYTES);
+        if let (Some(before), Some(after)) = (before, top(&self.layout)) {
+            self.scroll = (self.scroll + after - before).clamp(0.0, self.max_scroll());
+        }
+    }
+
+    fn blink(&mut self, now_ms: u64) -> Option<u64> {
         if !self.focused || self.editor.selection().is_none_or(|selection| !selection.is_caret()) {
             return None;
         }
@@ -214,6 +254,7 @@ impl View {
         if !change.blocks.is_empty() || change.structure {
             self.edits += 1;
             self.layout.update(self.editor.doc(), &self.style, self.laid_width, Some(change));
+            self.estimated = true;
         }
         self.reveal_caret();
     }
