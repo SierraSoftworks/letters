@@ -1,6 +1,6 @@
 //! What the desktop lends the editor: a clock, the clipboard and identifiers.
 
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use letters_editor::{Clip, Platform};
 
@@ -13,6 +13,11 @@ pub struct Desktop {
 impl Desktop {
     pub fn new() -> Self {
         Self { start: Instant::now(), clipboard: None }
+    }
+
+    /// The moment the editor's clock reads `ms`.
+    pub fn instant(&self, ms: u64) -> Instant {
+        self.start + Duration::from_millis(ms)
     }
 
     fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {

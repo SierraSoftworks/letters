@@ -2,9 +2,9 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use letters::files::{self, Home};
+use letters::files::{self, Home, Opened};
 use letters_format::{Archive, Package};
-use letters_model::{Block, BlockKind, Document};
+use letters_model::{Block, BlockKind, Document, Style};
 
 /// A scratch folder that is removed when the test ends.
 struct Folder(PathBuf);
@@ -71,8 +71,7 @@ fn a_new_document_is_saved_and_opens_again() {
     let home = home.save(&document("First")).unwrap();
     let home = home.save(&document("Second")).unwrap();
 
-    let (reopened, _) = files::open(&path).unwrap();
-    assert_eq!(reopened, document("Second"));
+    assert_eq!(files::open(&path).unwrap().document, document("Second"));
     assert_eq!(home.path(), path);
     assert_eq!(folder.names(), ["Notes.let"], "a save leaves nothing else behind");
 }
@@ -83,7 +82,7 @@ fn saving_keeps_the_identity_and_every_other_entry_of_the_file() {
     let path = folder.path("Rates.let");
     let original = write_full(&path, "Before");
 
-    let (opened, home) = files::open(&path).unwrap();
+    let Opened { document: opened, home, .. } = files::open(&path).unwrap();
     assert_eq!(opened, original.document);
     // Two saves, so entries must survive being carried from a file the app wrote itself.
     let home = home.save(&document("Edited")).unwrap();
@@ -97,7 +96,7 @@ fn a_file_changed_by_someone_else_is_never_overwritten() {
     let folder = Folder::new("conflict");
     let path = folder.path("Rates.let");
     write_full(&path, "Shared");
-    let (_, home) = files::open(&path).unwrap();
+    let home = files::open(&path).unwrap().home;
 
     let theirs = write_full(&path, "Theirs");
     let home = home.save(&document("Mine")).unwrap();
@@ -123,7 +122,7 @@ fn a_file_deleted_by_someone_else_is_written_back() {
     let folder = Folder::new("deleted");
     let path = folder.path("Rates.let");
     write_full(&path, "Shared");
-    let (_, home) = files::open(&path).unwrap();
+    let home = files::open(&path).unwrap().home;
     fs::remove_file(&path).unwrap();
 
     let home = home.save(&document("Mine")).unwrap();
@@ -141,10 +140,38 @@ fn files_that_are_not_documents_are_refused_with_a_reason() {
     let bytes = fs::read(&truncated).unwrap();
     fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
 
-    for path in [folder.path("missing.let"), text, truncated] {
+    for path in [folder.path("no such folder/missing.let"), text, truncated] {
         let error = files::open(&path).expect_err("not a document");
         assert!(!error.to_string().is_empty(), "{path:?}");
     }
+}
+
+#[test]
+fn a_path_with_no_file_opens_blank_and_is_created_by_the_first_save() {
+    let folder = Folder::new("fresh");
+    let path = folder.path("Fresh.let");
+    let opened = files::open(&path).unwrap();
+    assert_eq!(opened.document.blocks.len(), 1);
+    assert!(folder.names().is_empty(), "opening writes nothing");
+
+    opened.home.save(&document("Typed")).unwrap();
+    assert_eq!(read(&path).document, document("Typed"));
+}
+
+#[test]
+fn the_style_comes_from_the_file_and_falls_back_to_the_built_in_one() {
+    let folder = Folder::new("style");
+    let path = folder.path("Styled.let");
+    let mut package = write_full(&path, "Text");
+    assert_eq!(files::open(&path).unwrap().style, Style::default(), "an unreadable style.json");
+
+    let mut style = Style::default();
+    style.page.width = 400.0;
+    package.entries.insert("style.json".into(), style.to_json().into_bytes());
+    let mut out = Cursor::new(Vec::new());
+    letters_format::write(&mut out, &package).unwrap();
+    fs::write(&path, out.into_inner()).unwrap();
+    assert_eq!(files::open(&path).unwrap().style, style);
 }
 
 #[test]

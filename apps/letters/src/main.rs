@@ -1,5 +1,48 @@
 //! The Letters desktop app.
 
-fn main() {
-    println!("letters {}", env!("CARGO_PKG_VERSION"));
+use std::process::ExitCode;
+
+use letters::cli::{self, Command, Mode};
+use letters::launch::{self, FIRST_FRAME, Launch};
+
+fn main() -> ExitCode {
+    let launch = Launch::start();
+    let options = match cli::parse(std::env::args_os().skip(1)) {
+        Ok(Command::Run(options)) => options,
+        Ok(Command::Version) => {
+            println!("letters {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Ok(Command::Help) => {
+            print!("{}", cli::USAGE);
+            return ExitCode::SUCCESS;
+        }
+        Err(message) => {
+            eprint!("letters: {message}\n\n{}", cli::USAGE);
+            return ExitCode::from(2);
+        }
+    };
+
+    let result = match options.mode {
+        Mode::BenchLaunch { runs } => std::env::current_exe()
+            .and_then(|program| launch::bench(&program, options.file.as_deref(), options.headless, runs))
+            .map_err(Into::into)
+            .map(|bench| {
+                print!("{}", bench.report());
+                bench.within_budget()
+            }),
+        _ if options.headless => letters::app::run_headless(&options, launch).map(|launch| {
+            println!("{FIRST_FRAME}\n{}", launch.report());
+            true
+        }),
+        _ => letters::app::run(options, launch).map(|()| true),
+    };
+    match result {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(error) => {
+            eprintln!("letters: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }

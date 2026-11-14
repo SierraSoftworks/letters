@@ -4,7 +4,12 @@
 //! - [`input`], [`platform`] and [`access`] adapt the desktop to the engine's interfaces.
 //! - [`files`] opens and saves `.let` files, and [`launch`] measures how long opening one takes.
 
+pub mod access;
+pub mod app;
 pub mod cli;
 pub mod files;
 pub mod input;
+pub mod launch;
 pub mod platform;
+pub mod raster;
+pub mod view;

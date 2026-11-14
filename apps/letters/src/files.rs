@@ -10,8 +10,8 @@ use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use letters_format::{Archive, DOCUMENT, Package};
-use letters_model::{Block, BlockId, BlockKind, Document};
+use letters_format::{Archive, DOCUMENT, Package, STYLE};
+use letters_model::{Block, BlockId, BlockKind, Document, Style};
 
 use crate::platform;
 
@@ -115,11 +115,32 @@ impl Home {
     }
 }
 
-/// Reads a `.let` file: its document, for the first paint, and the home that later saves go back to.
-pub fn open(path: &Path) -> Result<(Document, Home), Error> {
-    let bytes: Arc<[u8]> = fs::read(path)?.into();
+/// A document ready to show, and where its saves go.
+#[derive(Clone, Debug)]
+pub struct Opened {
+    pub document: Document,
+    pub style: Style,
+    pub home: Home,
+}
+
+/// Reads what the first paint needs from a `.let` file: its document and its style.
+///
+/// A path with no file yet opens as a blank document that will be saved there.
+pub fn open(path: &Path) -> Result<Opened, Error> {
+    let bytes: Arc<[u8]> = match fs::read(path) {
+        Ok(bytes) => bytes.into(),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && path.parent().is_none_or(|p| p.as_os_str().is_empty() || p.is_dir()) =>
+        {
+            return Ok(Opened { document: blank(), style: Style::default(), home: Home::new(path) });
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut archive = Archive::open(Cursor::new(&bytes[..]))?;
     let document = archive.document()?;
+    // A style this build cannot read is carried through each save untouched, and the built-in one is shown.
+    let style = archive.read(STYLE)?.and_then(|json| Style::from_json(&String::from_utf8(json).ok()?).ok());
     let manifest = archive.manifest();
     let seen = Some(bytes.clone());
     let home = Home {
@@ -129,7 +150,7 @@ pub fn open(path: &Path) -> Result<(Document, Home), Error> {
         seen,
         carried: Some(bytes),
     };
-    Ok((document, home))
+    Ok(Opened { document, style: style.unwrap_or_default(), home })
 }
 
 /// The first free name of the form sync tools give a conflict copy, so that it is recognised as one.
