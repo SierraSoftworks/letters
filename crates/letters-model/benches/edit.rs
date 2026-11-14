@@ -12,6 +12,9 @@ const EDIT: Duration = Duration::from_micros(300);
 /// An edit that adds or removes a block, and any undo step.
 const STRUCTURE: Duration = Duration::from_millis(4);
 
+/// Showing a document, and taking over its history once that is ready. Both hold up the window.
+const OPEN: Duration = Duration::from_millis(10);
+
 /// 500 pages of dense prose hold about this many paragraphs.
 const BLOCKS: usize = 10_000;
 
@@ -56,14 +59,23 @@ fn main() {
     let bytes: usize = doc.walk().map(|block| block.plain_text().len()).sum();
     println!("{BLOCKS} blocks, {:.1} MB of text", bytes as f64 / 1e6);
 
-    let (mut model, new) = timed(|| Model::new(doc, ReplicaId::from(1)));
+    // What the window waits for: the document on screen, and later the history handed over.
+    let (shown, copy) = (doc.clone(), doc.clone());
+    let (mut model, new) = timed(|| Model::new(shown, ReplicaId::from(1)));
+    let (prepared, start) = timed(|| Model::prepare(copy, None, ReplicaId::from(1)).expect("a new history"));
+    let (_, attach) = timed(|| model.attach(prepared));
+    println!("new {new:.1?}, attach {attach:.1?}, within {OPEN:.0?} each");
+    let mut kept = new <= OPEN && attach <= OPEN;
+
+    // What runs away from the window.
     let (history, save) = timed(|| model.save());
+    let (_, read) = timed(|| Model::prepare(doc, Some(&history), ReplicaId::from(2)).expect("a saved history loads"));
     let (loaded, load) = timed(|| Model::load(&history, ReplicaId::from(2)).expect("a saved history loads"));
-    println!("new {new:.0?}, save {save:.0?} ({:.1} MB), load {load:.0?}", history.len() as f64 / 1e6);
+    let size = history.len() as f64 / 1e6;
+    println!("prepare {start:.0?}, or {read:.0?} with a history; save {save:.0?} ({size:.1} MB), load {load:.0?}");
     let mut other = loaded.fork(ReplicaId::from(3));
     let first = model.revision();
 
-    let mut kept = true;
     let places = [
         ("type in the first block", 0),
         ("type in a middle block", BLOCKS / 2),

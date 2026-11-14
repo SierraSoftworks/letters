@@ -11,9 +11,9 @@ use std::mem;
 use loro::{LoroValue, TextDelta};
 use serde_json::Value;
 
-use crate::crdt::{attrs, format};
+use crate::crdt::{attrs, clean, format};
 use crate::undo::Script;
-use crate::{Block, BlockId, BlockKind, Body, BodyShape, Run};
+use crate::{Block, BlockId, BlockKind, Body, BodyShape, Mark, Run};
 
 /// The attribute a marker carries its block in, as the block's JSON without its content. The history keeps
 /// it beside the sequence: see [`crate::crdt`].
@@ -263,6 +263,91 @@ pub(crate) fn build(flat: Vec<Flat>) -> Built {
     while let Some((closed, at)) = open.pop() {
         built.index[at].nth = place(&mut open, &mut built.blocks, closed);
     }
+    built
+}
+
+/// The blocks a container holds, for a block whose kind is one.
+pub(crate) fn children(block: &Block) -> &[Block] {
+    if block.kind.shape() == BodyShape::Blocks { block.body.blocks() } else { &[] }
+}
+
+/// Writes a block as the sequence holds it: its marker, then its text.
+fn spell_one(block: &Block, depth: usize, delta: &mut Vec<TextDelta>) {
+    delta.push(marker(block, depth));
+    if block.kind.shape() == BodyShape::Text {
+        let runs = block.body.runs().iter().filter(|run| !run.text.is_empty());
+        delta.extend(runs.map(|run| insert(&clean(&run.text), attrs(run))));
+    }
+}
+
+/// Writes a block and everything in it as the sequence holds them.
+pub(crate) fn spell(block: &Block, depth: usize, delta: &mut Vec<TextDelta>) {
+    spell_one(block, depth, delta);
+    children(block).iter().for_each(|child| spell(child, depth + 1, delta));
+}
+
+/// Whether a block, taken without its children, reads back from the sequence exactly as it stands.
+fn canonical(block: &Block) -> bool {
+    let kind = match &block.kind {
+        BlockKind::Paragraph | BlockKind::ListItem { .. } | BlockKind::Code { .. } => true,
+        BlockKind::Quote | BlockKind::Callout { .. } | BlockKind::Divider => true,
+        BlockKind::Heading { level } => (1..=4).contains(level),
+        // It may be a type this build knows under its real name.
+        BlockKind::Unknown { .. } => false,
+    };
+    let body = match (&block.body, block.kind.shape()) {
+        (Body::Text(runs), BodyShape::Text) => {
+            let plain =
+                |run: &Run| run.extra.is_empty() && !run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)));
+            let apart = runs.windows(2).all(|pair| !pair[0].same_format(&pair[1]));
+            apart && runs.iter().all(|run| !run.text.is_empty() && !run.text.contains(MARKER) && plain(run))
+        }
+        (Body::Blocks(_), BodyShape::Blocks) | (Body::None, BodyShape::None) => true,
+        _ => false,
+    };
+    kind && body && block.extra.is_empty() && !block.id.as_str().is_empty()
+}
+
+/// Reads a tree as the history would give it back had it been stored there: ids made unique, runs merged,
+/// and whatever the sequence cannot hold put right. Every block has a marker that carries the id and the
+/// depth it shows, so a history can be made from the result one block at a time.
+pub(crate) fn normal(blocks: Vec<Block>) -> Built {
+    fn walk(blocks: Vec<Block>, depth: usize, out: &mut Vec<Flat>) {
+        for mut block in blocks {
+            let inside = match &mut block.body {
+                Body::Blocks(inside) if block.kind.shape() == BodyShape::Blocks => mem::take(inside),
+                _ => Vec::new(),
+            };
+            if canonical(&block) {
+                let mut entry = Entry::new(block.id.clone(), depth.min(MAX_DEPTH), true, block.kind.shape());
+                entry.chars = block.body.runs().iter().map(|run| run.text.chars().count()).sum();
+                out.push(Flat { block, entry, dirty: true });
+            } else {
+                // Anything else is spelled out and read, which is what a history does with it.
+                let mut delta = Vec::new();
+                spell_one(&block, depth, &mut delta);
+                out.extend(
+                    transform(Vec::new(), &delta, &mut Script::default()).map_or(Vec::new(), |read| read.blocks),
+                );
+            }
+            walk(inside, depth + 1, out);
+        }
+    }
+    fn settle<'a>(blocks: &[Block], entries: &mut impl Iterator<Item = &'a mut Entry>) {
+        for block in blocks {
+            let Some(entry) = entries.next() else { return };
+            if entry.stored != block.id {
+                entry.stored = block.id.clone();
+            }
+            (entry.depth, entry.marker) = (entry.level, true);
+            settle(block.body.blocks(), entries);
+        }
+    }
+
+    let mut flat = Vec::new();
+    walk(blocks, 0, &mut flat);
+    let mut built = build(flat);
+    settle(&built.blocks, &mut built.index.iter_mut());
     built
 }
 
@@ -527,4 +612,103 @@ pub(crate) fn transform(flat: Vec<Flat>, delta: &[TextDelta], undo: &mut Script)
     }
     gone.extend(reader.rest(&mut out));
     Some(Moved { blocks: out.blocks, gone })
+}
+
+/// The blocks of a tree in document order, each with its entry.
+pub(crate) fn order<'a>(blocks: &'a [Block], index: &'a [Entry]) -> Vec<(&'a Block, &'a Entry)> {
+    fn walk<'a>(blocks: &'a [Block], out: &mut Vec<&'a Block>) {
+        for block in blocks {
+            out.push(block);
+            walk(block.body.blocks(), out);
+        }
+    }
+    let mut out = Vec::with_capacity(index.len());
+    walk(blocks, &mut out);
+    out.into_iter().zip(index).collect()
+}
+
+/// The change that turns the sequence of one tree into that of another, block by block.
+///
+/// A block is kept when both trees hold its id and the kept blocks come in the same order in both. Only
+/// what differs in a kept block is rewritten. `new` must be a tree as [`normal`] gives.
+pub(crate) fn rewrite(old: &[(&Block, &Entry)], new: &[(&Block, &Entry)]) -> Vec<TextDelta> {
+    let places: HashMap<&BlockId, usize> = old.iter().enumerate().map(|(at, (block, _))| (&block.id, at)).collect();
+    let found: Vec<Option<usize>> = new.iter().map(|(block, _)| places.get(&block.id).copied()).collect();
+    let mut out = Script::default();
+    let (mut gone, mut come) = (0, 0);
+    for (keep, kept) in rising(&found).into_iter().chain([(new.len(), old.len())]) {
+        // Between two kept blocks, what the old tree held goes and what the new one holds comes.
+        out.delete(old[gone..kept].iter().map(|(_, entry)| entry.len()).sum());
+        for (block, entry) in &new[come..keep] {
+            let mut spelled = Vec::new();
+            spell_one(block, entry.level, &mut spelled);
+            spelled.into_iter().for_each(|item| out.push(item));
+        }
+        if let (Some(was), Some(is)) = (old.get(kept), new.get(keep)) {
+            reblock(*was, *is, &mut out);
+        }
+        (gone, come) = (kept + 1, keep + 1);
+    }
+    out.finish()
+}
+
+/// The longest run of blocks that stand in the same order in both trees, as pairs of places in the new
+/// tree and the old. `found` gives each new block's place in the old tree.
+fn rising(found: &[Option<usize>]) -> Vec<(usize, usize)> {
+    // For each length of run, the new block that ends the run of that length soonest in the old tree.
+    let mut ends: Vec<usize> = Vec::new();
+    let mut before: Vec<Option<usize>> = vec![None; found.len()];
+    for (new, old) in found.iter().enumerate() {
+        let Some(old) = old else { continue };
+        let longer = ends.partition_point(|end| found[*end].is_some_and(|end| end < *old));
+        before[new] = longer.checked_sub(1).map(|shorter| ends[shorter]);
+        match ends.get_mut(longer) {
+            Some(end) => *end = new,
+            None => ends.push(new),
+        }
+    }
+    let mut run = Vec::with_capacity(ends.len());
+    let mut next = ends.last().copied();
+    while let Some(new) = next {
+        run.extend(found[new].map(|old| (new, old)));
+        next = before[new];
+    }
+    run.reverse();
+    run
+}
+
+/// Changes one block of the sequence into another that keeps its place.
+fn reblock((was, at): (&Block, &Entry), (is, to): (&Block, &Entry), out: &mut Script) {
+    let head = at.stored == is.id && at.depth == to.level && was.kind == is.kind && was.extra == is.extra;
+    if !at.marker {
+        out.push(marker(is, to.level));
+    } else if head {
+        out.retain(1);
+    } else {
+        let mut attrs = marker_attrs(is, to.level);
+        if to.level == 0 {
+            attrs.push((DEPTH.to_owned(), LoroValue::Null));
+        }
+        out.push(TextDelta::Retain { retain: 1, attributes: Some(attrs.into_iter().collect()) });
+    }
+
+    let (old, new) = (was.body.runs(), if is.kind.shape() == BodyShape::Text { is.body.runs() } else { &[] });
+    if old == new {
+        return out.retain(at.chars);
+    }
+    // Each character with the run that formats it. What the two texts share at either end stays.
+    let chars = |runs: &[Run]| -> Vec<(char, usize)> {
+        runs.iter().enumerate().flat_map(|(run, Run { text, .. })| text.chars().map(move |c| (c, run))).collect()
+    };
+    let (a, b) = (chars(old), chars(new));
+    let same = |(a, b): &(&(char, usize), &(char, usize))| a.0 == b.0 && old[a.1].same_format(&new[b.1]);
+    let start = a.iter().zip(&b).take_while(same).count();
+    let end = a[start..].iter().rev().zip(b[start..].iter().rev()).take_while(same).count();
+    out.retain(start);
+    out.delete(a.len() - start - end);
+    for part in b[start..b.len() - end].chunk_by(|a, b| a.1 == b.1) {
+        let text: String = part.iter().map(|(c, _)| c).collect();
+        out.push(insert(&clean(&text), attrs(&new[part[0].1])));
+    }
+    out.retain(end);
 }

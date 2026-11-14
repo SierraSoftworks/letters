@@ -9,10 +9,15 @@
 //! The rest of the crate reads and writes the sequence as changes in which a marker carries its block, as
 //! the [`BLOCK`] and [`DEPTH`] attributes. This module turns those to and from what Loro holds, and
 //! nothing outside this crate sees Loro, so the library can be replaced without touching another crate.
+//!
+//! Loro draws a random id for every document it makes, before the replica's own id replaces it. Nothing is
+//! written under it, but on wasm it is read from the browser's `crypto.getRandomValues` through
+//! wasm-bindgen: the one thing the core takes from its host without being handed it.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::hash::BuildHasher;
+use std::mem;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -22,13 +27,14 @@ use loro::{
     ContainerTrait, ExpandType, ID, LoroDoc, LoroMap, LoroText, LoroValue, StyleConfig, Subscription, TextDelta,
     ValueOrContainer,
 };
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::flat::{Attrs, BLOCK, DEPTH, Entry, MARKER, build, head, insert, transform};
+use crate::flat::{Attrs, BLOCK, DEPTH, Entry, MARKER, build, head, insert, order, transform};
 use crate::history::read_id;
 use crate::json::{mark_name, read_mark};
 use crate::undo::Script;
-use crate::{Block, BlockKind, BodyShape, Document, Run};
+use crate::{Block, BlockKind, Document, Run};
 
 pub(crate) const BODY: &str = "body";
 const BLOCKS: &str = "blocks";
@@ -333,47 +339,40 @@ enum Call {
     Set(&'static str, String, LoroValue),
 }
 
-/// The writes that store `doc`, in an order that depends on nothing but the document.
+/// The writes that store a document, in an order that depends on nothing but the document. It must be one
+/// that [`crate::flat::normal`] gave, with its entries.
 ///
 /// Each block is its own insert, followed by its own attributes. One insert for the whole text would be
 /// cut in two by every attribute after it, and Loro takes quadratic time to replay that when it moves
 /// through history. The last block is written first and every other one in front of it, where no
 /// formatting of a neighbour can spread onto it.
-fn plan(doc: &Document) -> Vec<Call> {
-    fn store(block: &Block, depth: usize, blocks: &mut Vec<Vec<Call>>) {
+fn plan(doc: &Document, index: &[Entry]) -> Vec<Call> {
+    let blocks = order(&doc.blocks, index).into_iter().map(|(block, entry)| {
         let mut text = String::from(MARKER);
-        let mut calls = vec![Call::Block(head(block), depth)];
-        if block.kind.shape() == BodyShape::Text {
-            // One mark covers neighbouring runs that share an attribute.
-            let mut open: BTreeMap<String, (LoroValue, Range<usize>)> = BTreeMap::new();
-            for run in block.body.runs().iter().filter(|run| !run.text.is_empty()) {
-                let range = text.len()..text.len() + run.text.len();
-                text.push_str(&clean(&run.text));
-                for (key, value) in attrs(run) {
-                    match open.get_mut(&key) {
-                        Some((held, span)) if *held == value && span.end == range.start => span.end = range.end,
-                        _ => {
-                            if let Some((held, span)) = open.insert(key.clone(), (value, range.clone())) {
-                                calls.push(Call::Mark(span, key, held));
-                            }
+        let mut calls = vec![Call::Block(head(block), entry.level)];
+        // One mark covers neighbouring runs that share an attribute.
+        let mut open: BTreeMap<String, (LoroValue, Range<usize>)> = BTreeMap::new();
+        for run in block.body.runs() {
+            let range = text.len()..text.len() + run.text.len();
+            text.push_str(&run.text);
+            for (key, value) in attrs(run) {
+                match open.get_mut(&key) {
+                    Some((held, span)) if *held == value && span.end == range.start => span.end = range.end,
+                    _ => {
+                        if let Some((held, span)) = open.insert(key.clone(), (value, range.clone())) {
+                            calls.push(Call::Mark(span, key, held));
                         }
                     }
                 }
             }
-            calls.extend(open.into_iter().map(|(key, (value, span))| Call::Mark(span, key, value)));
         }
+        calls.extend(open.into_iter().map(|(key, (value, span))| Call::Mark(span, key, value)));
         calls.insert(0, Call::Text(text));
-        blocks.push(calls);
-        if block.kind.shape() == BodyShape::Blocks {
-            block.body.blocks().iter().for_each(|child| store(child, depth + 1, blocks));
-        }
-    }
-
-    let mut blocks = Vec::new();
-    doc.blocks.iter().for_each(|block| store(block, 0, &mut blocks));
-    let mut calls: Vec<Call> = blocks.into_iter().rev().flatten().collect();
+        calls
+    });
+    let mut calls: Vec<Call> = blocks.rev().flatten().collect();
     calls.push(Call::Set(META, LANGUAGE.into(), doc.language.as_str().into()));
-    calls.extend(doc.dictionary.iter().map(|word| Call::Set(DICTIONARY, word.clone(), true.into())));
+    calls.extend(doc.dictionary.iter().map(|word| Call::Set(DICTIONARY, word_key(word, ""), true.into())));
     calls.extend(doc.extra.iter().map(|(key, value)| Call::Set(EXTRA, key.clone(), value.to_string().into())));
     calls
 }
@@ -433,11 +432,11 @@ fn author(calls: &[Call]) -> u64 {
     peer(hash)
 }
 
-/// Starts a history that holds `doc` as its first change.
-pub(crate) fn create(doc: &Document) -> LoroDoc {
+/// Starts a history that holds a document as its first change. See [`plan`] for which documents.
+pub(crate) fn create(doc: &Document, index: &[Entry]) -> LoroDoc {
     let loro = LoroDoc::new();
     configure(&loro);
-    let calls = plan(doc);
+    let calls = plan(doc, index);
     let (body, markers) = (loro.get_text(BODY), Markers::of(&loro));
     // None of these can fail: the peer is in range, the ranges lie inside the block just written, and no
     // key holds a colon. A failure would leave a shorter document, which the model then shows as it is.
@@ -488,9 +487,9 @@ pub(crate) fn read_meta(loro: &LoroDoc, doc: &mut Document) {
             doc.language = language.to_owned();
         }
     });
-    each(loro, DICTIONARY, |word, value| {
+    each(loro, DICTIONARY, |key, value| {
         if matches!(value, LoroValue::Bool(true)) {
-            doc.dictionary.insert(word.to_owned());
+            doc.dictionary.insert(word_of(key).to_owned());
         }
     });
     each(loro, EXTRA, |key, value| {
@@ -498,4 +497,69 @@ pub(crate) fn read_meta(loro: &LoroDoc, doc: &mut Document) {
             doc.extra.insert(key.to_owned(), value);
         }
     });
+}
+
+/// The key of one add of a word to the dictionary. Every add has a key of its own, so removing a word takes
+/// out the adds it has seen and no others: a word added elsewhere at the same time stays.
+fn word_key(word: &str, add: &str) -> String {
+    format!("{}{MARKER}{add}", clean(word))
+}
+
+fn word_of(key: &str) -> &str {
+    key.split(MARKER).next().unwrap_or(key)
+}
+
+/// Makes the document's own fields what a history gives back for them.
+pub(crate) fn normal_meta(doc: &mut Document) {
+    if doc.dictionary.iter().any(|word| word.contains(MARKER)) {
+        doc.dictionary = mem::take(&mut doc.dictionary).iter().map(|word| clean(word).into_owned()).collect();
+    }
+    for value in doc.extra.values_mut() {
+        if let Ok(read) = serde_json::from_str(&value.to_string()) {
+            *value = read;
+        }
+    }
+}
+
+pub(crate) fn set_language(loro: &LoroDoc, language: &str) -> Option<()> {
+    loro.get_map(META).insert(LANGUAGE, language).ok()
+}
+
+pub(crate) fn add_word(loro: &LoroDoc, word: &str) -> Option<()> {
+    let peer = loro.peer_id();
+    // The number of this replica's next edit, which no other add can have.
+    let next = loro.oplog_vv().get(&peer).copied().unwrap_or(0);
+    loro.get_map(DICTIONARY).insert(&word_key(word, &format!("{next}@{peer}")), true).ok()
+}
+
+pub(crate) fn remove_word(loro: &LoroDoc, word: &str) -> Option<()> {
+    let map = loro.get_map(DICTIONARY);
+    let mut adds = Vec::new();
+    map.for_each(|key, _| {
+        if word_of(key) == word {
+            adds.push(key.to_owned());
+        }
+    });
+    adds.iter().try_for_each(|key| map.delete(key).ok())
+}
+
+/// Sets one of the document's fields that this build does not know, or removes it.
+pub(crate) fn set_extra(loro: &LoroDoc, key: &str, value: Option<&Value>) -> Option<()> {
+    let map = loro.get_map(EXTRA);
+    match value {
+        Some(value) => map.insert(key, value.to_string()).ok(),
+        None => Markers::forget(&map, key),
+    }
+}
+
+/// Makes the document's own fields in the history those of `to`, where they differ from `from`.
+pub(crate) fn write_meta(loro: &LoroDoc, from: &Document, to: &Document) -> Option<()> {
+    if from.language != to.language {
+        set_language(loro, &to.language)?;
+    }
+    from.dictionary.difference(&to.dictionary).try_for_each(|word| remove_word(loro, word))?;
+    to.dictionary.difference(&from.dictionary).try_for_each(|word| add_word(loro, word))?;
+    from.extra.keys().filter(|key| !to.extra.contains_key(*key)).try_for_each(|key| set_extra(loro, key, None))?;
+    let changed = to.extra.iter().filter(|(key, value)| from.extra.get(*key) != Some(value));
+    changed.into_iter().try_for_each(|(key, value)| set_extra(loro, key, Some(value)))
 }

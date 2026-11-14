@@ -9,13 +9,13 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::mem;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use loro::cursor::{Cursor, Side};
 use loro::{ContainerTrait, ExportMode, LoroDoc, LoroText, LoroValue, Subscription, TextDelta};
 
 use crate::crdt::{self, Event, attrs};
-use crate::flat::{self, BLOCK, DEPTH, Entry, Flat, head, insert, marker, nth, nth_mut};
+use crate::flat::{self, BLOCK, DEPTH, Entry, Flat, children, head, insert, marker, nth, nth_mut, spell};
 use crate::history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
 use crate::undo::{Delta, Script, Step, Steps, is_skip};
 use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, Mark, Pos, Run};
@@ -125,6 +125,24 @@ impl Change {
 /// The entry of a block, and where the block starts in the sequence, in characters.
 type Place = (usize, usize);
 
+/// The history behind a document, and what it has reported since the model last caught up with it.
+struct History {
+    loro: LoroDoc,
+    body: LoroText,
+    events: Arc<Mutex<Vec<Event>>>,
+    _watch: Subscription,
+}
+
+impl History {
+    fn open(loro: LoroDoc, replica: ReplicaId) -> Self {
+        // Loro draws an id of its own for every document. It is replaced before anything is written.
+        loro.set_peer_id(replica.0).expect("a replica id is one Loro accepts");
+        let body = loro.get_text(crdt::BODY);
+        let (events, watch) = crdt::watch(&loro, &body);
+        Self { loro, body, events, _watch: watch }
+    }
+}
+
 /// One replica of a document: the document, its history and this session's undo steps.
 ///
 /// A model is not `Clone`, because two writers must never share a [`ReplicaId`]. Clone [`Model::doc`] to
@@ -133,28 +151,46 @@ pub struct Model {
     doc: Document,
     /// One entry per block, in document order.
     index: Vec<Entry>,
-    loro: LoroDoc,
-    body: LoroText,
+    replica: ReplicaId,
+    /// Started from the document when something first needs it, unless one is attached before.
+    history: OnceLock<History>,
     steps: Steps,
-    events: Arc<Mutex<Vec<Event>>>,
-    _watch: Subscription,
 }
 
 impl fmt::Debug for Model {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut model = f.debug_struct("Model");
-        model.field("replica", &self.replica()).field("revision", &self.revision().to_string());
-        model.field("doc", &self.doc).finish()
+        f.debug_struct("Model").field("replica", &self.replica).field("doc", &self.doc).finish()
     }
 }
 
+/// A history made ready for a model, away from it. See [`Model::prepare`].
+pub struct Prepared(Model);
+
+impl fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Prepared").field(&self.0.replica).finish()
+    }
+}
+
+/// A shell hands these to the thread that owns the window, and may make them on another.
+const _: fn() = || {
+    fn sent<T: Send>() {}
+    sent::<Model>();
+    sent::<Prepared>();
+};
+
 impl Model {
-    /// Starts the history of a document that has none.
+    /// Shows a document at once. Its history is not built until an edit, a save or a merge needs it, or
+    /// until [`Model::attach`] hands one over, so opening a document never waits for it.
     ///
-    /// The first change depends on the document alone, so two devices that open the same file without a
-    /// history can still merge their copies. Runs are stored merged, and a repeated block id is renamed.
-    pub fn new(doc: Document, replica: ReplicaId) -> Self {
-        Self::open(crdt::create(&doc), replica)
+    /// A history started here depends on the document alone, so two devices that open the same file
+    /// without a history can still merge their copies. Runs are stored merged, and a repeated block id
+    /// is renamed.
+    pub fn new(mut doc: Document, replica: ReplicaId) -> Self {
+        let built = flat::normal(mem::take(&mut doc.blocks));
+        doc.blocks = built.blocks;
+        crdt::normal_meta(&mut doc);
+        Self { doc, index: built.index, replica, history: OnceLock::new(), steps: Steps::default() }
     }
 
     /// Opens a saved history, as [`Model::save`] or [`Model::updates_since`] wrote it.
@@ -162,21 +198,110 @@ impl Model {
         let loro = LoroDoc::new();
         crdt::configure(&loro);
         loro.import(history).map_err(unreadable)?;
-        Ok(Self::open(loro, replica))
+        let history = History::open(loro, replica);
+        let (doc, index) = crdt::read(&history.loro, &history.body);
+        Ok(Self { doc, index, replica, history: OnceLock::from(history), steps: Steps::default() })
     }
 
     /// A second replica at the newest revision, for another writer. It starts with no undo steps.
     pub fn fork(&self, replica: ReplicaId) -> Self {
-        Self::load(&self.save(), replica).expect("a history that was just saved loads")
+        match self.history.get() {
+            Some(_) => Self::load(&self.save(), replica).expect("a history that was just saved loads"),
+            // Both then start the same history from the same document.
+            None => {
+                let (doc, index) = (self.doc.clone(), self.index.clone());
+                Self { doc, index, replica, history: OnceLock::new(), steps: Steps::default() }
+            }
+        }
     }
 
-    fn open(loro: LoroDoc, replica: ReplicaId) -> Self {
-        // Loro draws an id of its own for every document. It is replaced before anything is written.
-        loro.set_peer_id(replica.0).expect("a replica id is one Loro accepts");
-        let body = loro.get_text(crdt::BODY);
-        let (doc, index) = crdt::read(&loro, &body);
-        let (events, watch) = crdt::watch(&loro, &body);
-        Self { doc, index, loro, body, steps: Steps::default(), events, _watch: watch }
+    /// Does the slow part of opening a document ahead of the model that shows it: reads its `history`, or
+    /// starts one when the file has none. A shell runs this on another thread once a [`Model::new`] of
+    /// the same document is on screen, and hands the result to [`Model::attach`].
+    ///
+    /// A document that is not the newest one in `history` was changed outside Letters. The history takes
+    /// that in as one more change, as [`Model::rewrite`] does, so the file is always the document.
+    pub fn prepare(doc: Document, history: Option<&[u8]>, replica: ReplicaId) -> Result<Prepared, HistoryError> {
+        let model = match history {
+            None => Self::new(doc, replica),
+            Some(history) => {
+                let mut model = Self::load(history, replica)?;
+                // A history that was just loaded shows its newest revision, which can be rewritten.
+                let _ = model.rewrite(doc);
+                model
+            }
+        };
+        model.history();
+        Ok(Prepared(model))
+    }
+
+    /// Takes over a history that [`Model::prepare`] made for the document this model shows. The document
+    /// stays as it is: what was edited in the meantime goes into that history as one change.
+    ///
+    /// Until a file's history is attached, the model keeps one that starts at the document, which is all
+    /// a file without a history needs. Revisions and stable positions taken from it mean nothing to the
+    /// attached one, and neither does anything saved from it, so a shell saves and merges after attaching.
+    pub fn attach(&mut self, prepared: Prepared) -> Change {
+        let Prepared(theirs) = prepared;
+        let Some(history) = theirs.history.into_inner() else { return Change::default() };
+        let mut change = self.checkout_latest();
+        // Whatever replica the history was prepared for, this model's is the one that writes.
+        let _ = history.loro.set_peer_id(self.replica.0);
+        self.history = OnceLock::from(history);
+        let shown = mem::replace(&mut self.doc, theirs.doc);
+        let layout = mem::replace(&mut self.index, theirs.index);
+        let steps = mem::take(&mut self.steps);
+        if shown != self.doc {
+            let _ = self.rewrite(shown.clone());
+            change.absorb(diff(&shown, &self.doc));
+        }
+        // An undo step counts characters, so it holds for as long as the sequence is laid out as before.
+        let alike =
+            |a: &Entry, b: &Entry| (a.marker, a.chars, a.depth, &a.stored) == (b.marker, b.chars, b.depth, &b.stored);
+        if layout.len() == self.index.len() && layout.iter().zip(&self.index).all(|(a, b)| alike(a, b)) {
+            self.steps = steps;
+        }
+        change
+    }
+
+    /// Makes the newest document read as `doc`, which was changed without the model, as a file edited by
+    /// another tool is. What differs goes into the history block by block, as one change. It is not an
+    /// undo step, and the undo steps already there still hold.
+    pub fn rewrite(&mut self, mut doc: Document) -> Result<Change, OpError> {
+        if self.loro().is_detached() {
+            return Err(OpError::ReadOnly);
+        }
+        let to = flat::normal(mem::take(&mut doc.blocks));
+        crdt::normal_meta(&mut doc);
+        let mut change = Change::default();
+        if to.blocks != self.doc.blocks {
+            let old = flat::order(&self.doc.blocks, &self.index);
+            let delta = flat::rewrite(&old, &flat::order(&to.blocks, &to.index));
+            let (changed, undo) = self.shift(&delta, None);
+            change.absorb(changed);
+            debug_assert!(undo.is_some() && self.doc.blocks == to.blocks, "a rewrite did not give its document");
+            if undo.is_some() && self.write(std::slice::from_ref(&delta), &mut change) {
+                self.steps.rebase(&delta);
+            }
+        }
+        // Loro refuses none of these: every key and value is a string or a flag.
+        let _ = crdt::write_meta(self.loro(), &self.doc, &doc);
+        self.loro().commit();
+        self.queue().clear();
+        (self.doc.language, self.doc.dictionary, self.doc.extra) = (doc.language, doc.dictionary, doc.extra);
+        Ok(change)
+    }
+
+    fn history(&self) -> &History {
+        self.history.get_or_init(|| History::open(crdt::create(&self.doc, &self.index), self.replica))
+    }
+
+    fn loro(&self) -> &LoroDoc {
+        &self.history().loro
+    }
+
+    fn body(&self) -> &LoroText {
+        &self.history().body
     }
 
     pub fn doc(&self) -> &Document {
@@ -184,12 +309,12 @@ impl Model {
     }
 
     pub fn replica(&self) -> ReplicaId {
-        ReplicaId(self.loro.peer_id())
+        self.replica
     }
 
     /// Applies `ops` in order as one undo step. Ops that leave the document as it was are no step at all.
     pub fn apply(&mut self, ops: impl IntoIterator<Item = Op>) -> Result<Change, OpError> {
-        if self.loro.is_detached() {
+        if self.loro().is_detached() {
             return Err(OpError::ReadOnly);
         }
         let ops: Vec<Op> = ops.into_iter().collect();
@@ -252,7 +377,7 @@ impl Model {
     }
 
     fn step(&mut self, back: bool) -> Option<Change> {
-        let step = self.steps.take(back).filter(|_| !self.loro.is_detached())?;
+        let step = self.steps.take(back).filter(|_| !self.loro().is_detached())?;
         let mut change = Change::default();
         let mut reverse = Step::new();
         for delta in &step {
@@ -275,8 +400,8 @@ impl Model {
 
     /// Sends changes the document already shows to the history, as one change there.
     fn write(&mut self, edits: &[Delta], change: &mut Change) -> bool {
-        let written = edits.iter().all(|delta| crdt::write(&self.loro, &self.body, delta).is_some());
-        self.loro.commit();
+        let written = edits.iter().all(|delta| crdt::write(self.loro(), self.body(), delta).is_some());
+        self.loro().commit();
         if written {
             // The history reports the edit back, and the document already shows it.
             self.queue().clear();
@@ -292,20 +417,20 @@ impl Model {
     pub fn save(&self) -> Vec<u8> {
         // Every edit, without Loro's snapshot of where they lead. Loro 1.17 reads the snapshot of a long
         // text in quadratic time, and replays the edits of the same text in a tenth of that.
-        self.loro.export(ExportMode::all_updates()).expect("a history can always be written out")
+        self.loro().export(ExportMode::all_updates()).expect("a history can always be written out")
     }
 
     /// What this replica holds beyond `revision`, for a replica that is already there. Everything, when
     /// this history does not know the revision.
     pub fn updates_since(&self, revision: &Revision) -> Vec<u8> {
-        let from = self.loro.frontiers_to_vv(&revision.0).unwrap_or_default();
-        self.loro.export(ExportMode::updates(&from)).expect("a history can always be written out")
+        let from = self.loro().frontiers_to_vv(&revision.0).unwrap_or_default();
+        self.loro().export(ExportMode::updates(&from)).expect("a history can always be written out")
     }
 
     /// Takes in what another replica wrote. Merging is commutative and idempotent: replicas that have seen
     /// the same edits show the same document, and a merge that adds nothing changes nothing.
     pub fn merge(&mut self, history: &[u8]) -> Result<Change, HistoryError> {
-        self.loro.import(history).map_err(unreadable)?;
+        self.loro().import(history).map_err(unreadable)?;
         Ok(self.drain())
     }
 
@@ -313,33 +438,36 @@ impl Model {
     /// some of it, and `None` means each holds edits the other lacks.
     pub fn compare(&self, history: &[u8]) -> Result<Option<Ordering>, HistoryError> {
         let other = LoroDoc::decode_import_blob_meta(history, true).map_err(unreadable)?;
-        Ok(self.loro.oplog_vv().partial_cmp(&other.partial_end_vv))
+        Ok(self.loro().oplog_vv().partial_cmp(&other.partial_end_vv))
     }
 
     /// The point in history the document shows.
     pub fn revision(&self) -> Revision {
-        Revision(self.loro.state_frontiers())
+        Revision(self.loro().state_frontiers())
     }
 
     /// Whether the document shows the newest revision, and so can be edited.
     pub fn is_latest(&self) -> bool {
-        !self.loro.is_detached()
+        self.history.get().is_none_or(|history| !history.loro.is_detached())
     }
 
     /// Shows the document as it was at `revision`, read-only. Leaving the newest revision forgets the
     /// undo steps.
     pub fn checkout(&mut self, revision: &Revision) -> Result<Change, HistoryError> {
-        if revision.0 == self.loro.oplog_frontiers() {
+        if revision.0 == self.loro().oplog_frontiers() {
             return Ok(self.checkout_latest());
         }
-        self.loro.checkout(&revision.0).map_err(|_| HistoryError::UnknownRevision)?;
+        self.loro().checkout(&revision.0).map_err(|_| HistoryError::UnknownRevision)?;
         self.steps.clear();
         Ok(self.drain())
     }
 
     /// Returns to the newest revision, with everything merged in the meantime.
     pub fn checkout_latest(&mut self) -> Change {
-        self.loro.checkout_to_latest();
+        if self.is_latest() {
+            return Change::default();
+        }
+        self.loro().checkout_to_latest();
         self.drain()
     }
 
@@ -348,7 +476,7 @@ impl Model {
     pub fn stable(&self, pos: &Pos, hold: Hold) -> Option<StablePos> {
         let (spot, runs) = self.text(&pos.block).ok()?;
         let at = spot.text() + chars_before(runs, pos.offset)?;
-        let id = |at: usize| self.body.get_cursor(at, Side::Middle)?.id;
+        let id = |at: usize| self.body().get_cursor(at, Side::Middle)?.id;
         Some(match hold {
             Hold::Prev if at > 0 => StablePos { id: Some(id(at - 1)?), after: true },
             _ if at < self.start(self.index.len()) => StablePos { id: Some(id(at)?), after: false },
@@ -361,7 +489,8 @@ impl Model {
         let at = match stable.id {
             None => self.start(self.index.len()),
             Some(id) => {
-                let found = self.loro.get_cursor_pos(&Cursor::new(Some(id), self.body.id(), Side::Middle, 0)).ok()?;
+                let found =
+                    self.loro().get_cursor_pos(&Cursor::new(Some(id), self.body().id(), Side::Middle, 0)).ok()?;
                 // A character that is gone leaves the position where it stood.
                 found.current.pos + usize::from(stable.after && found.update.is_none())
             }
@@ -379,7 +508,7 @@ impl Model {
     }
 
     fn queue(&self) -> MutexGuard<'_, Vec<Event>> {
-        self.events.lock().unwrap_or_else(PoisonError::into_inner)
+        self.history().events.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Brings the document up to date with what the history reported.
@@ -392,18 +521,18 @@ impl Model {
                 Event::Meta => meta = true,
             }
         }
-        if meta {
-            crdt::read_meta(&self.loro, &mut self.doc);
+        if let (true, Some(history)) = (meta, self.history.get()) {
+            crdt::read_meta(&history.loro, &mut self.doc);
         }
         let mut change = Change::default();
         match bodies.as_slice() {
             [] => {
-                self.follow(&crdt::restyles(&self.loro, &self.body, &keys, &HashSet::new()), &mut change);
+                self.follow(&crdt::restyles(self.loro(), self.body(), &keys, &HashSet::new()), &mut change);
             }
             [raw] => {
                 let mut new = HashSet::new();
-                let delta = crdt::lift(&self.loro, &self.body, raw, &mut new);
-                let restyles = crdt::restyles(&self.loro, &self.body, &keys, &new);
+                let delta = crdt::lift(self.loro(), self.body(), raw, &mut new);
+                let restyles = crdt::restyles(self.loro(), self.body(), &keys, &new);
                 // A change that does not fit has the whole document read again, restyled markers and all.
                 if self.follow(&delta, &mut change) {
                     self.follow(&restyles, &mut change);
@@ -436,7 +565,7 @@ impl Model {
 
     /// Reads the whole document from the history again.
     fn resync(&mut self) -> Change {
-        let (doc, index) = crdt::read(&self.loro, &self.body);
+        let (doc, index) = crdt::read(self.loro(), self.body());
         let old = mem::replace(&mut self.doc, doc);
         self.index = index;
         self.queue().clear();
@@ -767,20 +896,6 @@ fn seek(delta: &mut Vec<TextDelta>, chars: usize) {
 
 fn style(retain: usize, key: String, value: LoroValue) -> TextDelta {
     TextDelta::Retain { retain, attributes: Some([(key, value)].into_iter().collect()) }
-}
-
-fn children(block: &Block) -> &[Block] {
-    if block.kind.shape() == BodyShape::Blocks { block.body.blocks() } else { &[] }
-}
-
-/// Writes a block and everything in it as the sequence holds them.
-fn spell(block: &Block, depth: usize, delta: &mut Vec<TextDelta>) {
-    delta.push(marker(block, depth));
-    if block.kind.shape() == BodyShape::Text {
-        let runs = block.body.runs().iter().filter(|run| !run.text.is_empty());
-        delta.extend(runs.map(|run| insert(&crdt::clean(&run.text), attrs(run))));
-    }
-    children(block).iter().for_each(|child| spell(child, depth + 1, delta));
 }
 
 /// The stretch of the sequence a change touches, if it changes nothing but text.

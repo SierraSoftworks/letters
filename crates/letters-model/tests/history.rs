@@ -3,8 +3,8 @@
 use std::cmp::Ordering;
 
 use letters_model::{
-    Block, BlockId, BlockKind, Document, HistoryError, Hold, Mark, Model, Op, OpError, Pos, ReplicaId, Revision,
-    StablePos,
+    Block, BlockId, BlockKind, Body, Change, Document, HistoryError, Hold, Mark, Model, Op, OpError, Pos, ReplicaId,
+    Revision, Run, StablePos,
 };
 
 /// A paragraph `p` reading "Hello world", then a divider `d`, with every field of its own set.
@@ -25,6 +25,13 @@ fn pair() -> (Model, Model) {
 fn sync(a: &mut Model, b: &mut Model) {
     a.merge(&b.save()).unwrap();
     b.merge(&a.save()).unwrap();
+}
+
+/// A file as a session left it: its document, and the history that leads there.
+fn saved() -> (Document, Vec<u8>) {
+    let mut writer = Model::new(doc(), ReplicaId::from(1));
+    writer.apply([typed("p", 11, "!")]).unwrap();
+    (writer.doc().clone(), writer.save())
 }
 
 fn id(id: &str) -> BlockId {
@@ -352,5 +359,133 @@ fn only_a_position_in_text_can_be_made_stable() {
     let m = Model::new(doc(), ReplicaId::from(1));
     for pos in [Pos::new("d", 0), Pos::new("p", 99), Pos::new("nope", 0)] {
         assert_eq!(m.stable(&pos, Hold::Next), None, "{pos:?}");
+    }
+}
+
+#[test]
+fn a_document_opens_as_its_history_holds_it() {
+    let paragraph = |id: &str, text: &str| Block::text(id, BlockKind::Paragraph, text);
+    let with = |block: Block, body: Body| Block { body, ..block };
+    let runs = vec![
+        Run::plain("a"),
+        Run::plain(""),
+        Run::plain("b\u{1e}c"),
+        Run::marked("d", [Mark::Other("bold".into())]),
+        Run::marked("e", [Mark::Bold]),
+    ];
+    let mut unknown = paragraph("x", "kept");
+    unknown.extra.insert("lang".into(), "fr".into());
+    unknown.extra.insert("type".into(), "heading".into());
+    let figure = Block::new("u", BlockKind::Unknown { type_name: "figure".into() });
+    let twice =
+        with(Block::new("q", BlockKind::Quote), Body::Blocks(vec![paragraph("p", "inside"), paragraph("p", "")]));
+    let cases = vec![
+        ("ids used more than once", vec![paragraph("p", "one"), twice, paragraph("p~2", "two")]),
+        ("runs that could be one", vec![with(paragraph("m", ""), Body::Text(runs))]),
+        ("fields and types this build does not know", vec![unknown, figure]),
+        ("a level no heading has", vec![Block::text("h", BlockKind::Heading { level: 9 }, "Title")]),
+        ("a body of the wrong shape", vec![with(paragraph("w", ""), Body::Blocks(vec![paragraph("in", "lost")]))]),
+    ];
+    for (name, blocks) in cases {
+        let model = Model::new(Document { blocks, ..doc() }, ReplicaId::from(1));
+        let stored = Model::load(&model.save(), ReplicaId::from(2)).unwrap();
+        assert_eq!(model.doc(), stored.doc(), "{name}");
+        assert_eq!(Model::new(model.doc().clone(), ReplicaId::from(3)).doc(), model.doc(), "{name}, opened again");
+        assert_eq!(Document::from_json(&model.doc().to_json()).as_ref(), Ok(model.doc()), "{name}, as a file");
+    }
+}
+
+#[test]
+fn a_prepared_history_is_attached_without_a_change() {
+    let (file, history) = saved();
+    for history in [None, Some(&history[..])] {
+        let mut model = Model::new(file.clone(), ReplicaId::from(2));
+        let prepared = Model::prepare(file.clone(), history, ReplicaId::from(2)).unwrap();
+        assert_eq!(model.attach(prepared), Change::default());
+        assert_eq!(model.doc(), &file);
+        if let Some(history) = history {
+            assert_eq!(model.compare(history), Ok(Some(Ordering::Equal)));
+        }
+        model.apply([typed("p", 0, "Oh. ")]).unwrap();
+        assert_eq!(texts(&model), ["Oh. Hello world!", ""]);
+    }
+    assert!(matches!(
+        Model::prepare(file, Some(b"not a history"), ReplicaId::from(2)),
+        Err(HistoryError::Unreadable(_))
+    ));
+}
+
+#[test]
+fn edits_made_before_a_history_is_attached_are_kept() {
+    let (file, history) = saved();
+    let mut model = Model::new(file.clone(), ReplicaId::from(2));
+    model.apply([typed("p", 0, "Oh. ")]).unwrap();
+    let edited = model.doc().clone();
+
+    let prepared = Model::prepare(file, Some(&history), ReplicaId::from(2)).unwrap();
+    assert_eq!(model.attach(prepared), Change::default());
+    assert_eq!(model.doc(), &edited);
+    assert_eq!(model.compare(&history), Ok(Some(Ordering::Greater)));
+
+    // The edit merges with whatever else the file's history leads to, and is still this session's to undo.
+    let mut other = Model::load(&history, ReplicaId::from(3)).unwrap();
+    other.apply([typed("p", 12, "?")]).unwrap();
+    sync(&mut model, &mut other);
+    assert_eq!(texts(&model), ["Oh. Hello world!?", ""]);
+    model.undo().unwrap();
+    assert_eq!(texts(&model), ["Hello world!?", ""]);
+}
+
+#[test]
+fn a_file_changed_outside_is_one_more_change_in_its_history() {
+    let (file, history) = saved();
+    let mut outside = file.clone();
+    outside.blocks[0] = Block::text("p", BlockKind::Heading { level: 1 }, "Hello, world!");
+    outside.blocks.insert(0, Block::text("new", BlockKind::Paragraph, "Added"));
+    outside.blocks.pop();
+    outside.language = "fr".into();
+    outside.dictionary.insert("mot".into());
+
+    let mut model = Model::new(outside.clone(), ReplicaId::from(2));
+    let prepared = Model::prepare(outside.clone(), Some(&history), ReplicaId::from(2)).unwrap();
+    assert_eq!(model.attach(prepared), Change::default());
+    assert_eq!(model.doc(), &outside);
+    assert_eq!(model.compare(&history), Ok(Some(Ordering::Greater)));
+
+    // A copy that knows only the old history merges with it, and what it typed lands in the changed text.
+    let mut other = Model::load(&history, ReplicaId::from(3)).unwrap();
+    other.apply([typed("p", 12, "?")]).unwrap();
+    sync(&mut model, &mut other);
+    assert_eq!(model.doc(), other.doc());
+    assert_eq!(texts(&model), ["Added", "Hello, world!?"]);
+    assert_eq!((model.doc().language.as_str(), model.doc().dictionary.contains("mot")), ("fr", true));
+}
+
+#[test]
+fn a_rewrite_changes_only_what_differs() {
+    // What the document is rewritten to, and whether `p` is still the block it was.
+    type Rewrite = (&'static str, fn(&mut Document), bool);
+    let cases: Vec<Rewrite> = vec![
+        ("text changed at its end", |doc| doc.blocks[0] = Block::text("p", BlockKind::Paragraph, "Hello world."), true),
+        ("a new kind", |doc| doc.blocks[0].kind = BlockKind::Heading { level: 3 }, true),
+        ("a block added and one removed", |doc| doc.blocks[1] = Block::text("n", BlockKind::Paragraph, "New"), true),
+        ("everything replaced", |doc| doc.blocks = vec![Block::text("z", BlockKind::Paragraph, "Other")], false),
+        ("nothing", |_| {}, true),
+    ];
+    for (name, change, kept) in cases {
+        let (mut a, mut b) = pair();
+        let mut target = doc();
+        change(&mut target);
+        b.apply([typed("p", 5, ",")]).unwrap();
+
+        let changed = a.rewrite(target.clone()).unwrap();
+        assert_eq!(a.doc(), &target, "{name}");
+        assert_eq!(changed == Change::default(), target == doc(), "{name}");
+        assert!(a.undo().is_none(), "{name}: a rewrite is not this session's edit");
+
+        sync(&mut a, &mut b);
+        assert_eq!(a.doc(), b.doc(), "{name}");
+        let typed = a.doc().block(&id("p")).is_some_and(|p| p.plain_text().starts_with("Hello,"));
+        assert_eq!(typed, kept, "{name}: what another replica typed into a kept block stays");
     }
 }

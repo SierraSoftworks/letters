@@ -50,6 +50,11 @@ enum Step {
         replica: usize,
         back: usize,
     },
+    /// Another tool edits a replica's file, knowing nothing of its history.
+    Rewrite {
+        replica: usize,
+        edits: Vec<Edit>,
+    },
 }
 
 /// Short text with characters of every width, and the one the history marks blocks with.
@@ -87,6 +92,7 @@ fn step() -> impl Strategy<Value = Step> {
         1 => replica().prop_map(|replica| Step::Redo { replica }),
         3 => (replica(), replica(), any::<bool>()).prop_map(|(from, to, whole)| Step::Sync { from, to, whole }),
         1 => (replica(), 0..64usize).prop_map(|(replica, back)| Step::Visit { replica, back }),
+        1 => (replica(), vec(edit(), 1..6)).prop_map(|(replica, edits)| Step::Rewrite { replica, edits }),
     ]
 }
 
@@ -233,7 +239,7 @@ proptest! {
         for step in steps {
             let touched = match step {
                 Step::Edit { replica, .. } | Step::Undo { replica } | Step::Redo { replica } => replica,
-                Step::Visit { replica, .. } => replica,
+                Step::Visit { replica, .. } | Step::Rewrite { replica, .. } => replica,
                 Step::Sync { to, .. } => to,
             };
             let before = replicas[touched].doc().clone();
@@ -293,6 +299,17 @@ proptest! {
                         prop_assert!(model.is_latest() || model.apply([]) == Err(OpError::ReadOnly));
                     }
                     Some(model.checkout_latest())
+                }
+                Step::Rewrite { replica, edits } => {
+                    last[replica] = None;
+                    let mut outside = Model::new(before.clone(), ReplicaId::from(98));
+                    for edit in &edits {
+                        let _ = outside.apply(op(outside.doc(), edit));
+                    }
+                    let rewritten = replicas[replica].rewrite(outside.doc().clone());
+                    prop_assert_eq!(replicas[replica].doc(), outside.doc(), "a rewrite did not give its document");
+                    seen[replica].push((replicas[replica].revision(), outside.doc().clone()));
+                    rewritten.ok()
                 }
             };
 
