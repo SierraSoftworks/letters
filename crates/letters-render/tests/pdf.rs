@@ -1,4 +1,5 @@
 //! The PDF backend, read back the way a PDF reader would.
+#![cfg(feature = "pdf")]
 
 mod common;
 
@@ -239,6 +240,7 @@ fn links_and_the_outline_lead_where_they_say() {
         title: "Household rates".into(),
         authors: vec!["Ada Lovelace".into()],
         language: "en-GB".into(),
+        created: None,
         outline: vec![
             heading("Rates", 1, 0),
             heading("Bands and r\u{E9}sum\u{E9}s", 2, 1),
@@ -277,6 +279,29 @@ fn links_and_the_outline_lead_where_they_say() {
     let said = |text: &Option<Box<[u8]>>| text.as_deref().map(|text| String::from_utf8_lossy(text).into_owned());
     assert_eq!(said(&read.metadata().title).as_deref(), Some("Household rates"));
     assert_eq!(said(&read.metadata().author).as_deref(), Some("Ada Lovelace"));
+}
+
+#[test]
+fn the_file_says_when_it_was_written_if_the_shell_says() {
+    let cases = [
+        ("no date", None, None),
+        ("the first second", Some(0), Some((1970, 1, 1, 0, 0, 0))),
+        ("a leap day", Some(951_868_799), Some((2000, 2, 29, 23, 59, 59))),
+        ("the day after a leap day", Some(1_709_251_200), Some((2024, 3, 1, 0, 0, 0))),
+        ("the end of a year", Some(1_798_761_599), Some((2026, 12, 31, 23, 59, 59))),
+        ("an afternoon", Some(1_794_670_245), Some((2026, 11, 14, 15, 30, 45))),
+    ];
+    for (name, created, expected) in cases {
+        let info = Info { created, ..Info::default() };
+
+        let read = read(written(&[(on_white([]), vec![])], &Images::default(), &info).expect("it can be written"));
+
+        let date = read.metadata().creation_date.map(|date| {
+            assert_eq!((date.utc_offset_hour, date.utc_offset_minute), (0, 0), "{name} is in UTC");
+            (date.year, date.month, date.day, date.hour, date.minute, date.second)
+        });
+        assert_eq!(date, expected, "{name}");
+    }
 }
 
 #[test]

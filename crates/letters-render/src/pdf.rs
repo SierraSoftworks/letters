@@ -16,7 +16,7 @@ use krilla::color::rgb;
 use krilla::destination::XyzDestination;
 use krilla::geom::{PathBuilder, Transform};
 use krilla::image::{BitsPerComponent, CustomImage, ImageColorspace};
-use krilla::metadata::Metadata;
+use krilla::metadata::{DateTime, Metadata};
 use krilla::num::NormalizedF32;
 use krilla::outline::{Outline, OutlineNode};
 use krilla::page::PageSettings;
@@ -77,6 +77,8 @@ pub struct Info {
     pub authors: Vec<String>,
     /// The language most of the text is in, as a BCP 47 tag such as `en-GB`.
     pub language: String,
+    /// When the file was written, in seconds since 1970 began in UTC. The shell says: the core has no clock.
+    pub created: Option<u64>,
     /// The headings in reading order.
     pub outline: Vec<Heading>,
 }
@@ -191,6 +193,9 @@ impl Pdf {
         if !info.language.is_empty() {
             metadata = metadata.language(info.language.clone());
         }
+        if let Some(created) = info.created {
+            metadata = metadata.creation_date(date(created));
+        }
         self.document.set_metadata(metadata);
 
         let headings: Vec<&Heading> = info.outline.iter().filter(|heading| heading.page < self.pages).collect();
@@ -207,6 +212,28 @@ impl Pdf {
             other => PdfError::Other(format!("{other:?}")),
         })
     }
+}
+
+/// The date and time in UTC that is `seconds` after 1970 began.
+fn date(seconds: u64) -> DateTime {
+    let (days, seconds) = (seconds / 86_400, seconds % 86_400);
+    // Counted in years that start in March, so that a leap day is the last day of its year.
+    let days = days + 719_468;
+    let (era, day_of_era) = (days / 146_097, days % 146_097);
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month + 2) / 5 + 1;
+    let (month, year) = if month < 10 { (month + 3, 0) } else { (month - 9, 1) };
+    let year = (year + year_of_era + era * 400).min(9999);
+    DateTime::new(year as u16)
+        .month(month as u8)
+        .day(day as u8)
+        .hour((seconds / 3_600) as u8)
+        .minute((seconds / 60 % 60) as u8)
+        .second((seconds % 60) as u8)
+        .utc_offset_hour(0)
+        .utc_offset_minute(0)
 }
 
 fn place(page: usize, at: Point) -> XyzDestination {

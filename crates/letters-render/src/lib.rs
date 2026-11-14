@@ -12,6 +12,7 @@ pub mod gpu;
 pub mod image;
 
 mod paint;
+#[cfg(feature = "pdf")]
 pub mod pdf;
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
