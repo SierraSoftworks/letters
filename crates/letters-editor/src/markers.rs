@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use letters_model::{Block, BlockId, BlockKind, Mark, Tone};
+use letters_model::{Block, BlockId, BlockKind, Mark, Marker, Markers, Tone};
 
 use crate::{Editor, text, tree};
 
@@ -20,24 +20,6 @@ fn delimiter(mark: &Mark) -> &'static str {
         Mark::Code => "`",
         _ => "",
     }
-}
-
-/// The Markdown markers to show for the block and the spans under the caret.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Markers {
-    /// A block's own marker and the block it belongs to: `##` on a heading, `[!INFO]` on a callout.
-    pub block: Option<(BlockId, String)>,
-    /// The markers of the spans the caret is inside or touching, in drawing order.
-    pub inline: Vec<Marker>,
-    /// How many of `inline` are drawn before the caret.
-    pub before_caret: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Marker {
-    /// Where in the caret's block the marker is drawn, in bytes.
-    pub offset: usize,
-    pub text: &'static str,
 }
 
 /// A marker at the caret's own offset: its mark, and whether it opens or closes the span.
@@ -88,6 +70,9 @@ fn tag(tone: Tone) -> &'static str {
 
 impl Editor {
     /// The markers to draw. Inline pairs show only at a caret, so a selection never moves the text under it.
+    ///
+    /// Stepping over a marker changes what this returns and leaves the selection where it was, so read it
+    /// again after every call that may move the caret.
     pub fn markers(&self) -> Markers {
         let Some(caret) = &self.caret else { return Markers::default() };
         let head = &caret.selection.head;

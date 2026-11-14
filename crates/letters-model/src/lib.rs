@@ -6,6 +6,7 @@
 
 mod doc;
 mod json;
+mod markers;
 mod model;
 mod notes;
 mod pos;
@@ -13,6 +14,7 @@ mod style;
 
 pub use doc::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Run, Tone};
 pub use json::JsonError;
+pub use markers::{Marker, Markers};
 pub use model::{Change, Model, Op, OpError};
 pub use notes::{Anchor, NOTES_FORMAT, Note, NoteKind, Notes, Reply, Version};
 pub use pos::{Pos, Selection};

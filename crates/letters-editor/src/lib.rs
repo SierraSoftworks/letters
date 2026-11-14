@@ -22,7 +22,8 @@ use std::ops::Range;
 use letters_model::{Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, Pos, Selection};
 
 pub use keymap::Keymap;
-pub use markers::{Marker, Markers};
+/// The markers [`Editor::markers`] returns. They live in the model so that layout can draw them.
+pub use letters_model::{Marker, Markers};
 pub use motion::Lines;
 
 /// Text input, as every platform delivers it. Offsets are UTF-8 bytes relative to the caret's block.
