@@ -143,12 +143,13 @@ fn find<'a>(blocks: &'a [Block], id: &BlockId, language: &'a str) -> Option<(&'a
 
 fn misspellings(speller: &Speller, doc: &Document, block: &Block, language: &str) -> Vec<Range<usize>> {
     // Code is not prose, and what a type from a newer build holds is unknown.
-    if matches!(block.kind, BlockKind::Code { .. } | BlockKind::Unknown { .. }) {
+    if matches!(block.kind, BlockKind::Code { .. } | BlockKind::Formula | BlockKind::Unknown { .. }) {
         return Vec::new();
     }
     // `None` for code, which also parts the words on either side of it.
     fn spoken<'a>(run: &'a Run, language: &'a str) -> Option<&'a str> {
-        (!run.marks.contains(&Mark::Code)).then_some(run.lang.as_deref().unwrap_or(language))
+        let prose = !run.marks.contains(&Mark::Code) && !run.marks.contains(&Mark::Math);
+        prose.then_some(run.lang.as_deref().unwrap_or(language))
     }
     let mut out = Vec::new();
     let mut start = 0;

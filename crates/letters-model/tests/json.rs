@@ -1,4 +1,4 @@
-use letters_model::{BlockKind, Document, PropertiesFormat};
+use letters_model::{BlockKind, Document, Mark, PropertiesFormat};
 use proptest::prelude::*;
 
 const CORPUS: [&str; 2] = [include_str!("corpus/design-sample.json"), include_str!("corpus/every-block.json")];
@@ -35,7 +35,7 @@ fn what_any_block_or_run_may_carry_is_read() {
     let block = doc.block(&"g".into()).unwrap();
     assert_eq!((block.page_break, block.lang.as_deref()), (true, Some("fr")));
     let langs: Vec<Option<&str>> = block.body.runs().iter().map(|run| run.lang.as_deref()).collect();
-    assert_eq!(langs, [None, Some("de")]);
+    assert_eq!(langs, [None, Some("de"), None]);
     assert!(!block.extra.contains_key("break") && !block.extra.contains_key("lang"));
 
     let properties = doc.properties.as_ref().unwrap();
@@ -43,6 +43,15 @@ fn what_any_block_or_run_may_carry_is_read() {
         (properties.format, properties.source.as_str()),
         (PropertiesFormat::Yaml, "title: Every block\ntags: [a, b]\n")
     );
+}
+
+#[test]
+fn maths_is_read_as_its_source() {
+    let doc = Document::from_json(CORPUS[1]).unwrap();
+    let formula = doc.block(&"m".into()).unwrap();
+    assert_eq!((&formula.kind, formula.plain_text().as_str()), (&BlockKind::Formula, r"e^{i\pi} + 1 = 0"));
+    let inline = doc.block(&"g".into()).unwrap().body.runs().last().unwrap();
+    assert_eq!((inline.text.as_str(), inline.marks.contains(&Mark::Math)), ("x^2", true));
 }
 
 #[test]
@@ -118,11 +127,12 @@ fn json_value() -> impl Strategy<Value = serde_json::Value> {
 /// Documents as loosely typed JSON, so unknown fields and types are exercised alongside the known ones.
 fn document_json() -> impl Strategy<Value = String> {
     let lang = || prop::option::of("en|fr|de-CH");
-    let run = (".{0,12}", prop::collection::vec("bold|italic|code|odd", 0..3), prop::option::of("https://[a-z]{1,8}"))
-        .prop_map(|(text, marks, link)| serde_json::json!({ "text": text, "marks": marks, "link": link }));
+    let run =
+        (".{0,12}", prop::collection::vec("bold|italic|code|math|odd", 0..3), prop::option::of("https://[a-z]{1,8}"))
+            .prop_map(|(text, marks, link)| serde_json::json!({ "text": text, "marks": marks, "link": link }));
     let run = (run, lang()).prop_map(|(run, lang)| with(run, "lang", lang));
     let block = (
-        "paragraph|heading|list_item|code|divider|mystery",
+        "paragraph|heading|list_item|code|formula|divider|mystery",
         prop::collection::vec(run, 0..4),
         prop::collection::btree_map("[a-z]{4,8}_x", json_value(), 0..3),
     )

@@ -283,7 +283,8 @@ impl Leaf {
                     Mark::Underline => marks::UNDERLINE,
                     Mark::Strike => marks::STRIKE,
                     Mark::Highlight => marks::HIGHLIGHT,
-                    Mark::Code => marks::CODE,
+                    // Until maths is typeset in a line, its source shows as code does.
+                    Mark::Code | Mark::Math => marks::CODE,
                     Mark::Other(_) => 0,
                 };
             }

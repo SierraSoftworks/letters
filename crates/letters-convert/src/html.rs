@@ -95,6 +95,8 @@ fn blocks(blocks: &[Block], assets: Assets, out: &mut String) {
             BlockKind::Paragraph => element("p", block.body.runs(), out),
             BlockKind::Heading { level } => element(&format!("h{}", (*level).clamp(1, 4)), block.body.runs(), out),
             BlockKind::Code { language } => code(language.as_deref(), &block.plain_text(), out),
+            // A formula goes out as its source until maths is written.
+            BlockKind::Formula => code(Some("math"), &block.plain_text(), out),
             BlockKind::Quote => container("<blockquote>", "</blockquote>", block.body.blocks(), assets, out),
             BlockKind::Callout { tone } => {
                 let open = format!("<div class=\"callout {}\" role=\"note\">", tone_name(*tone));

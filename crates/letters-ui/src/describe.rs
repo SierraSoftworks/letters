@@ -47,6 +47,7 @@ fn push_block(block: &Block, nodes: &mut Vec<(NodeId, Node)>) {
         BlockKind::Heading { .. } => Role::Heading,
         BlockKind::ListItem { .. } => Role::ListItem,
         BlockKind::Code { .. } => Role::Code,
+        BlockKind::Formula => Role::Math,
         BlockKind::Quote => Role::Blockquote,
         BlockKind::Callout { .. } => Role::Note,
         BlockKind::Divider => Role::Splitter,

@@ -121,6 +121,8 @@ fn other(block: &Block) -> Vec<String> {
             vec![format!("{marker} {}", text(runs, Context::Heading)).trim_end_matches(' ').to_owned()]
         }
         BlockKind::Code { language } => code(language.as_deref().unwrap_or_default(), &block.plain_text()),
+        // A formula goes out as a `math` fence until `$$` is written.
+        BlockKind::Formula => code("math", &block.plain_text()),
         BlockKind::Quote => quote(None, block.body.blocks()),
         BlockKind::Callout { tone } => quote(Some(*tone), block.body.blocks()),
         BlockKind::Divider => vec!["---".to_owned()],

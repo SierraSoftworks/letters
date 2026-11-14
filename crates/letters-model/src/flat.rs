@@ -288,7 +288,7 @@ pub(crate) fn spell(block: &Block, depth: usize, delta: &mut Vec<TextDelta>) {
 /// Whether a block, taken without its children, reads back from the sequence exactly as it stands.
 fn canonical(block: &Block) -> bool {
     let kind = match &block.kind {
-        BlockKind::Paragraph | BlockKind::ListItem { .. } | BlockKind::Code { .. } => true,
+        BlockKind::Paragraph | BlockKind::ListItem { .. } | BlockKind::Code { .. } | BlockKind::Formula => true,
         BlockKind::Quote | BlockKind::Callout { .. } | BlockKind::Divider => true,
         BlockKind::Heading { level } => (1..=4).contains(level),
         // It may be a type this build knows under its real name.

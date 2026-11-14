@@ -87,7 +87,7 @@ fn edit() -> impl Strategy<Value = Edit> {
     let n = || 0..64usize;
     // Few enough ids that two replicas sometimes pick the same one.
     let id = || 0..24usize;
-    let mark = prop_oneof![Just(Mark::Bold), Just(Mark::Italic), Just(Mark::Other("x:y%".into()))];
+    let mark = prop_oneof![Just(Mark::Bold), Just(Mark::Italic), Just(Mark::Math), Just(Mark::Other("x:y%".into()))];
     let link = prop_oneof![Just(None), Just(Some("https://example.com/a".to_owned()))];
     prop_oneof![
         6 => (n(), n(), text()).prop_map(|(block, at, text)| Edit::Type { block, at, text }),
@@ -153,6 +153,7 @@ fn kinds(shape: BodyShape) -> Vec<BlockKind> {
             BlockKind::Heading { level: 2 },
             BlockKind::ListItem { list: ListKind::Task { checked: true }, depth: 1 },
             BlockKind::Code { language: Some("rust".into()) },
+            BlockKind::Formula,
         ],
         BodyShape::Blocks => vec![BlockKind::Quote, BlockKind::Callout { tone: Tone::Warn }],
         BodyShape::None => vec![BlockKind::Divider],

@@ -344,7 +344,8 @@ impl<'d> Writer<'d, '_> {
                     let list = self.list(*list, usize::from(depth));
                     self.paragraph(within.unwrap_or(LIST.0), Some((list, depth)), block.body.runs(), spans);
                 }
-                BlockKind::Code { .. } => self.paragraph("Code", None, block.body.runs(), spans),
+                // A formula goes out as its source until Word maths is written.
+                BlockKind::Code { .. } | BlockKind::Formula => self.paragraph("Code", None, block.body.runs(), spans),
                 BlockKind::Quote => self.container(block, "Quote"),
                 BlockKind::Callout { tone } => {
                     let style = CALLOUTS.iter().find(|(known, ..)| known == tone).map_or("Quote", |(_, id, _)| *id);

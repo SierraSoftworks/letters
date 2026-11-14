@@ -203,7 +203,7 @@ fn block(value: Value, path: &str) -> Result<Block> {
 /// The shape of body a block of this type holds, for the types this build knows.
 fn shape(type_name: &str) -> Option<BodyShape> {
     match type_name {
-        "paragraph" | "heading" | "list_item" | "code" => Some(BodyShape::Text),
+        "paragraph" | "heading" | "list_item" | "code" | "formula" => Some(BodyShape::Text),
         "quote" | "callout" => Some(BodyShape::Blocks),
         _ => None,
     }
@@ -247,6 +247,7 @@ fn block_from(mut map: Map<String, Value>, read: Option<Body>, path: &str) -> Re
             BlockKind::ListItem { list, depth }
         }
         "code" => BlockKind::Code { language: string(&mut map, "language", path)? },
+        "formula" => BlockKind::Formula,
         "quote" => BlockKind::Quote,
         "callout" => match string(&mut map, "tone", path)?.as_deref() {
             Some("tip") => BlockKind::Callout { tone: Tone::Tip },
@@ -299,13 +300,14 @@ fn runs(value: Value, path: &str) -> Result<Vec<Run>> {
         .collect()
 }
 
-const MARKS: [(&str, Mark); 6] = [
+const MARKS: [(&str, Mark); 7] = [
     ("bold", Mark::Bold),
     ("italic", Mark::Italic),
     ("underline", Mark::Underline),
     ("strike", Mark::Strike),
     ("highlight", Mark::Highlight),
     ("code", Mark::Code),
+    ("math", Mark::Math),
 ];
 
 pub(crate) fn read_mark(name: &str) -> Mark {
@@ -349,6 +351,7 @@ fn write_block(block: &Block) -> Value {
             }
             "code"
         }
+        BlockKind::Formula => "formula",
         BlockKind::Quote => "quote",
         BlockKind::Callout { tone } => {
             let tone = match tone {

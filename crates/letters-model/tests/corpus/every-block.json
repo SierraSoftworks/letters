@@ -74,10 +74,25 @@
         {
           "text": " Welt",
           "lang": "de"
+        },
+        {
+          "text": "x^2",
+          "marks": [
+            "math"
+          ]
         }
       ],
       "break": "page",
       "lang": "fr"
+    },
+    {
+      "id": "m",
+      "type": "formula",
+      "content": [
+        {
+          "text": "e^{i\\pi} + 1 = 0"
+        }
+      ]
     }
   ],
   "future": [

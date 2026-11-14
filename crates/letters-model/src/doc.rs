@@ -154,6 +154,8 @@ pub enum BlockKind {
     Code {
         language: Option<String>,
     },
+    /// Display maths. Its text is the TeX source, and marks on it mean nothing.
+    Formula,
     Quote,
     Callout {
         tone: Tone,
@@ -168,7 +170,8 @@ pub enum BlockKind {
 impl BlockKind {
     pub fn shape(&self) -> BodyShape {
         match self {
-            Self::Paragraph | Self::Heading { .. } | Self::ListItem { .. } | Self::Code { .. } => BodyShape::Text,
+            Self::Paragraph | Self::Heading { .. } | Self::ListItem { .. } => BodyShape::Text,
+            Self::Code { .. } | Self::Formula => BodyShape::Text,
             Self::Quote | Self::Callout { .. } => BodyShape::Blocks,
             Self::Divider | Self::Unknown { .. } => BodyShape::None,
         }
@@ -250,6 +253,8 @@ pub enum Mark {
     Strike,
     Highlight,
     Code,
+    /// Inline maths: the run's text is its TeX source.
+    Math,
     /// A mark this build does not know, kept as written.
     Other(String),
 }
