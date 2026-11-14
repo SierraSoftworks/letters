@@ -239,11 +239,17 @@ impl Model {
     /// stays as it is: what was edited in the meantime goes into that history as one change.
     ///
     /// Until a file's history is attached, the model keeps one that starts at the document, which is all
-    /// a file without a history needs. Revisions and stable positions taken from it mean nothing to the
-    /// attached one, and neither does anything saved from it, so a shell saves and merges after attaching.
+    /// a file without a history needs. When the file has one, revisions and stable positions taken before
+    /// it is attached mean nothing after, and neither does anything saved, so a shell saves and merges
+    /// once it has attached.
     pub fn attach(&mut self, prepared: Prepared) -> Change {
         let Prepared(theirs) = prepared;
         let Some(history) = theirs.history.into_inner() else { return Change::default() };
+        let held = |ours: &History| ours.loro.oplog_vv().partial_cmp(&history.loro.oplog_vv());
+        if self.history.get().and_then(held).is_some_and(Ordering::is_ge) {
+            // This model's history holds all of that one already, as two started from one document do.
+            return Change::default();
+        }
         let mut change = self.checkout_latest();
         // Whatever replica the history was prepared for, this model's is the one that writes.
         let _ = history.loro.set_peer_id(self.replica.0);

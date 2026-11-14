@@ -416,6 +416,20 @@ fn a_prepared_history_is_attached_without_a_change() {
 }
 
 #[test]
+fn a_file_without_a_history_keeps_the_one_its_model_started() {
+    let mut model = Model::new(doc(), ReplicaId::from(2));
+    model.apply([typed("p", 0, "Oh. ")]).unwrap();
+    let (revision, held) = (model.revision(), model.stable(&Pos::new("p", 4), Hold::Next).unwrap());
+
+    let prepared = Model::prepare(doc(), None, ReplicaId::from(2)).unwrap();
+    assert_eq!(model.attach(prepared), Change::default());
+    assert_eq!(model.revision(), revision);
+    assert_eq!(model.resolve(&held), Some(Pos::new("p", 4)));
+    model.undo().unwrap();
+    assert_eq!(model.doc(), &doc());
+}
+
+#[test]
 fn edits_made_before_a_history_is_attached_are_kept() {
     let (file, history) = saved();
     let mut model = Model::new(file.clone(), ReplicaId::from(2));
