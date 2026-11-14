@@ -10,7 +10,9 @@
 use std::collections::BTreeSet;
 
 use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Marker, Modifiers, Platform};
-use letters_model::{Block, BlockKind, Body, Change, Document, ListKind, Mark, Pos, ReplicaId, Run, Selection, Tone};
+use letters_model::{
+    Block, BlockKind, Body, Change, Document, ListKind, Mark, Model, Pos, ReplicaId, Run, Selection, Tone,
+};
 use proptest::prelude::*;
 
 /// The marks the notation can write, with their switches. Longer switches come first so they are read first.
@@ -130,11 +132,16 @@ impl Harness {
         Self { editor, platform: Fake::default() }
     }
 
+    /// An editor on a model that comes with its history. `writer` tells its new ids from other writers'.
+    pub fn on(model: Model, writer: u64) -> Self {
+        let mut editor = Editor::with_model(model);
+        editor.set_keymap(Keymap::standard());
+        Self { editor, platform: Fake { writer: format!("w{writer}"), ..Fake::default() } }
+    }
+
     /// A second writer on the same document, as it stands now.
     pub fn fork(&self, replica: u64) -> Self {
-        let mut editor = Editor::with_model(self.editor.model().fork(ReplicaId::from(replica)));
-        editor.set_keymap(Keymap::standard());
-        Self { editor, platform: Fake { writer: format!("w{replica}"), ..Fake::default() } }
+        Self::on(self.editor.model().fork(ReplicaId::from(replica)), replica)
     }
 
     /// Takes in everything `other` has written. Returns whether its history could be read.

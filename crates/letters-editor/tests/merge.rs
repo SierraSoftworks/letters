@@ -1,8 +1,9 @@
 mod common;
 
 use common::Do::{K, T};
-use common::{Do, Harness, SAMPLE, action, canon, check, clip, perform};
+use common::{Do, Harness, SAMPLE, action, canon, check, clip, parse, perform};
 use letters_editor::InputEvent;
+use letters_model::{Model, ReplicaId};
 use proptest::prelude::*;
 
 /// Two writers on `state`: this one with its selection, and another who plays `script` from `theirs`.
@@ -10,7 +11,7 @@ use proptest::prelude::*;
 fn merged(state: &str, theirs: &str, script: &[Do]) -> Harness {
     let mut mine = Harness::new(state);
     let mut other = mine.fork(2);
-    let (_, selection) = common::parse(theirs);
+    let (_, selection) = parse(theirs);
     other.editor.select(selection.expect("the other writer has a caret"));
     other.play(script);
     assert!(mine.merge(&other));
@@ -74,6 +75,46 @@ fn a_composition_goes_on_through_a_merge() {
     assert_eq!(mine.state(), canon("p zero one かな|two"));
     mine.key("Mod+z");
     assert_eq!(mine.state(), canon("p zero one |two"));
+}
+
+#[test]
+fn a_file_changed_outside_is_taken_in_around_the_caret() {
+    let cases = [
+        // (as it is being edited, as another tool left the file, afterwards)
+        ("p one tw|o", "p zero one two", "p zero one tw|o"),
+        ("p one\np ^two|", "h1 one\nul two more\np three", "h1 one\nul ^two| more\np three"),
+        ("p one\np tw|o", "p one", "p one|"),
+    ];
+    for (mine, theirs, after) in cases {
+        let mut editor = Harness::new(mine);
+        assert!(editor.editor.rewrite(parse(theirs).0).is_ok());
+        assert_eq!(editor.state(), canon(after), "{mine:?} rewritten as {theirs:?}");
+    }
+}
+
+#[test]
+fn the_files_history_is_attached_under_the_editing() {
+    let file = "p one two";
+    let saved = Model::new(parse(file).0, ReplicaId::from(7)).save();
+    // The document is on screen and edited before its history has been read.
+    let mut mine = Harness::new("p one| two");
+    mine.type_text("s");
+    let prepared = Model::prepare(parse(file).0, Some(&saved), ReplicaId::from(1)).expect("the history loads");
+    mine.editor.attach(prepared);
+    assert_eq!(mine.state(), canon("p ones| two"));
+
+    // From here on it merges with anyone who has the file.
+    let mut other = Harness::on(Model::load(&saved, ReplicaId::from(2)).expect("the history loads"), 2);
+    other.play(&[K("Mod+Home"), T("zero ")]);
+    assert!(mine.merge(&other));
+    mine.type_text("!");
+    assert_eq!(mine.state(), canon("p zero ones!| two"));
+    assert!(other.merge(&mine));
+    assert_eq!(other.text(), mine.text());
+
+    // What was typed before the history arrived can still be taken back.
+    while mine.key("Mod+z") {}
+    assert_eq!(mine.text(), canon("p zero one two"));
 }
 
 #[test]

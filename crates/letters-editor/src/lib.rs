@@ -207,7 +207,6 @@ enum Kind {
 #[derive(Clone, Debug)]
 struct Composing {
     range: Range<usize>,
-    before: Kept,
     at: u64,
 }
 
@@ -233,6 +232,8 @@ pub struct Editor {
     goal: Option<f32>,
     /// How many times other writers' edits have been taken in.
     merges: u64,
+    /// The caret before the edits that are not yet an undo step.
+    origin: Kept,
 }
 
 impl Editor {
@@ -256,6 +257,7 @@ impl Editor {
             composing: None,
             goal: None,
             merges: 0,
+            origin: Kept::default(),
         };
         if let Some(pos) = first {
             editor.place(pos);
@@ -267,8 +269,8 @@ impl Editor {
         self.model.doc()
     }
 
-    /// The model, for saving its history and comparing revisions. Other writers' edits come in through
-    /// [`Editor::merge`].
+    /// The model, for saving its history and comparing revisions. What changes it from outside comes in
+    /// through [`Editor::merge`], [`Editor::rewrite`] and [`Editor::attach`].
     pub fn model(&self) -> &Model {
         &self.model
     }
@@ -391,7 +393,7 @@ impl Editor {
         self.end_composition();
         let rule = std::mem::take(&mut self.rule);
         let goal = self.goal.take();
-        let before = self.keep();
+        self.mark();
         let mut kind = Kind::Other;
         match command {
             Command::Move { to, extend } => self.move_to(to, extend, goal, platform),
@@ -419,7 +421,7 @@ impl Editor {
             Command::Paste => self.paste(false, platform),
             Command::PastePlain => self.paste(true, platform),
         }
-        self.commit(before, kind, now, false);
+        self.commit(kind, now, false);
         true
     }
 
@@ -446,6 +448,11 @@ impl Editor {
             let ids: BTreeSet<BlockId> = ops.iter().filter_map(named).collect();
             ids.iter().filter_map(|id| self.doc().block(id).cloned()).collect()
         });
+        // The caret that undo comes back to is held while its text is still as it was. The model builds its
+        // history for an edit in any case, so asking for positions here costs nothing more.
+        if self.steps == 0 && self.origin.held.is_none() {
+            self.origin = self.held(self.origin.clone());
+        }
         let change = match self.model.apply(ops) {
             Ok(change) => change,
             Err(error) => {
@@ -468,7 +475,8 @@ impl Editor {
 
     /// Closes the edits made since the last call as one undo step, or adds them to the step before when
     /// they continue it. `fresh` keeps them apart.
-    fn commit(&mut self, before: Kept, kind: Kind, now: u64, fresh: bool) {
+    fn commit(&mut self, kind: Kind, now: u64, fresh: bool) {
+        let before = self.origin.clone();
         let count = std::mem::take(&mut self.steps);
         if count == 0 {
             // Moving the caret ends the step, even when it comes back to where it was.
@@ -499,13 +507,15 @@ impl Editor {
         }
     }
 
-    /// Takes back the edits made since the last undo step was closed.
+    /// Takes back the edits made since the last undo step was closed, and puts the caret back.
     fn rollback(&mut self) {
         for _ in 0..std::mem::take(&mut self.steps) {
             if let Some(change) = self.model.undo() {
                 self.note(change);
             }
         }
+        let origin = self.origin.clone();
+        self.recall(&origin);
     }
 
     fn undo_step(&mut self) -> bool {
@@ -534,7 +544,7 @@ impl Editor {
     /// Ends a composition where it stands, keeping its text.
     fn end_composition(&mut self) {
         if let Some(composing) = self.composing.take() {
-            self.commit(composing.before, Kind::Other, composing.at, true);
+            self.commit(Kind::Other, composing.at, true);
         }
     }
 
