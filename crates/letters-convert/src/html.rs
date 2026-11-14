@@ -198,8 +198,7 @@ fn item(lists: &mut Vec<&'static str>, list: ListKind, depth: u8, runs: &[Run], 
 
 /// Writes a code block, with a span around each token the highlighter colours.
 fn code(language: Option<&str>, source: &str, out: &mut String) {
-    // The first word names the language. A fence may carry more after it.
-    let name = language.and_then(|language| language.split_whitespace().next()).unwrap_or_default();
+    let name = lexer_name(language);
     out.push_str("<pre><code");
     if !name.is_empty() {
         out.push_str(" class=\"language-");
@@ -327,6 +326,11 @@ fn text(text: &str, out: &mut String) {
     }
 }
 
+/// The name to look a code block's lexer up by: the first word of its language. A fence may carry more after it.
+pub(crate) fn lexer_name(language: Option<&str>) -> &str {
+    language.and_then(|language| language.split_whitespace().next()).unwrap_or_default()
+}
+
 /// A link's address as a browser will read it, or `None` for one that would run script when followed.
 pub(crate) fn href(url: &str) -> Option<String> {
     // A browser drops these before it looks for the scheme, so they cannot be left to hide one.
@@ -339,7 +343,7 @@ pub(crate) fn href(url: &str) -> Option<String> {
 }
 
 /// The kind layout colours a token as, so the page and the export agree.
-fn ink(kind: TokenKind) -> Ink {
+pub(crate) fn ink(kind: TokenKind) -> Ink {
     match kind {
         TokenKind::Comment => Ink::Comment,
         TokenKind::Keyword => Ink::Keyword,
