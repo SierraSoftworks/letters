@@ -97,6 +97,7 @@ impl DocLayout {
             frames: Vec::new(),
             index: HashMap::new(),
             tokens: HashMap::new(),
+            spelling: HashMap::new(),
             reveal: Reveal::default(),
             shapes: Shapes::default(),
             composition: None,
@@ -160,6 +161,25 @@ impl DocLayout {
     /// `composition()` gives them.
     pub fn set_composition(&mut self, composing: Option<(&BlockId, Range<usize>)>) {
         self.state.get_mut().composition = composing.map(|(block, range)| (block.clone(), range));
+    }
+
+    /// Marks the misspelled words of a block with a wavy line in the palette's `spelling` colour. `ranges` are
+    /// byte ranges of the block's text. Nothing is laid out again, so this costs one paint.
+    ///
+    /// The marks follow the text through edits until the block is checked again and they are set anew. A
+    /// word the input method is still composing shows none.
+    pub fn set_spelling(&mut self, block: &BlockId, ranges: Vec<Range<usize>>) {
+        self.state.get_mut().set_spelling(block, ranges);
+    }
+
+    /// The misspelled word at a position, as set with [`DocLayout::set_spelling`] and carried through edits
+    /// since. Either end of the word counts, so [`DocLayout::hit`] of a point on its first or last letter
+    /// finds it.
+    pub fn spelling_at(&self, pos: &Pos) -> Option<Range<usize>> {
+        let state = self.state.borrow();
+        let found =
+            state.spelling.get(&pos.block)?.iter().find(|range| (range.start..=range.end).contains(&pos.offset));
+        found.cloned()
     }
 
     /// The height of the whole document. Partly an estimate until [`DocLayout::settle`] returns `false`.
@@ -234,6 +254,8 @@ struct State {
     index: HashMap<BlockId, usize>,
     /// The tokens of code blocks.
     tokens: HashMap<BlockId, Vec<Token>>,
+    /// The misspelled words of text blocks.
+    spelling: HashMap<BlockId, Vec<Range<usize>>>,
     /// The markers shown around the caret.
     reveal: Reveal,
     shapes: Shapes,
@@ -292,10 +314,15 @@ impl State {
             if leaf.kind.as_ref() != Some(&block.kind) || !matches!(block.body, Body::Text(_)) {
                 return false;
             }
-            let before = self.tokens.get_mut(id).map(|tokens| (tokens, leaf.text.clone()));
+            let (tokens, spelling) = (self.tokens.get_mut(id), self.spelling.get_mut(id));
+            // Only what follows the text needs to know what the text was.
+            let before = if tokens.is_some() || spelling.is_some() { leaf.text.clone() } else { String::new() };
             leaf.set_content(block);
-            if let Some((tokens, before)) = before {
+            if let Some(tokens) = tokens {
                 tokens::follow(tokens, &before, &leaf.text);
+            }
+            if let Some(spelling) = spelling {
+                tokens::follow_ranges(spelling, &before, &leaf.text);
             }
             if leaf.laid.take().is_some() {
                 self.held -= 1;
@@ -312,12 +339,15 @@ impl State {
     fn reflow(&mut self, doc: &Document, carry: Option<&Change>) {
         let mut old = std::mem::take(&mut self.leaves);
         let mut index = std::mem::take(&mut self.index);
-        let tokens = &mut self.tokens;
+        let (tokens, spelling) = (&mut self.tokens, &mut self.spelling);
         let flow = flow::flow(doc, &self.types, self.width, |block| {
             let (change, at) = (carry?, *index.get(&block.id)?);
             if change.blocks.contains(&block.id) {
                 if let Some(tokens) = tokens.get_mut(&block.id) {
                     tokens::follow(tokens, &old[at].text, &block.plain_text());
+                }
+                if let Some(spelling) = spelling.get_mut(&block.id) {
+                    tokens::follow_ranges(spelling, &old[at].text, &block.plain_text());
                 }
                 return None;
             }
@@ -333,9 +363,20 @@ impl State {
         self.index = index;
         let coded = |id: &BlockId| self.index.get(id).is_some_and(|at| self.leaves[*at].role == Role::Code);
         self.tokens.retain(|id, tokens| coded(id) && !tokens.is_empty());
+        self.spelling.retain(|id, ranges| self.index.contains_key(id) && !ranges.is_empty());
         self.pending = self.leaves.iter().filter(|leaf| !leaf.exact).count();
         self.held = self.leaves.iter().filter(|leaf| leaf.laid.is_some()).count();
         self.stale = 0;
+    }
+
+    fn set_spelling(&mut self, block: &BlockId, mut ranges: Vec<Range<usize>>) {
+        ranges.retain(|range| !range.is_empty());
+        if self.index.contains_key(block) && !ranges.is_empty() {
+            ranges.sort_by_key(|range| range.start);
+            self.spelling.insert(block.clone(), ranges);
+        } else {
+            self.spelling.remove(block);
+        }
     }
 
     fn reveal(&mut self, at: Option<(&Pos, &Markers)>) -> bool {
@@ -501,7 +542,7 @@ impl State {
             // A viewport taller than the cache holds has dropped its first layouts by now.
             self.lay(at);
             let shifts = self.shifts(at);
-            let Self { engine, types, leaves, tokens, shapes, composition, .. } = self;
+            let Self { engine, types, leaves, tokens, spelling, shapes, composition, .. } = self;
             let leaf = &leaves[at];
             if leaf.what == What::Rule {
                 let rect = Rect::new(leaf.x, leaf.y, leaf.width, leaf.height);
@@ -509,7 +550,9 @@ impl State {
             } else if let Some(laid) = &leaf.laid {
                 let tokens = leaf.id.as_ref().and_then(|id| tokens.get(id));
                 let composing = composition.as_ref().filter(|(block, _)| leaf.id.as_ref() == Some(block));
-                let over = Over { shifts: &shifts, shapes, composing: composing.map(|(_, range)| range.clone()) };
+                let composing = composing.map(|(_, range)| range.clone());
+                let spelling = leaf.id.as_ref().and_then(|id| spelling.get(id)).map_or(&[][..], Vec::as_slice);
+                let over = Over { shifts: &shifts, shapes, composing, spelling };
                 Painter { engine, types, inks: &inks, band, out }.leaf(leaf, laid, tokens.map(Vec::as_slice), &over);
             }
         }

@@ -30,6 +30,10 @@ pub(crate) const NEWLINE: f32 = 0.25;
 
 /// Inline code is set a little smaller than the text around it.
 pub(crate) const INLINE_CODE_SCALE: f32 = 0.9;
+/// Half the length of one wave of the line under a misspelled word, and how far it swings either way.
+pub(crate) const WAVE: f32 = 2.0;
+pub(crate) const WAVE_SWING: f32 = 1.0;
+
 /// A callout's revealed tag is set small enough to sit in the padding above its text.
 pub(crate) const TAG_SCALE: f32 = 0.7;
 

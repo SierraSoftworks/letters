@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use letters_render::{Color, DisplayList, Glyph, Item, Point, Rect};
+use letters_render::{Color, DisplayList, Glyph, Item, PathEl, Point, Rect};
 use parley::{
     Affinity, Alignment, AlignmentOptions, Cursor, GlyphRun, Language, Layout, Line, PositionedLayoutItem,
     Selection as Span,
@@ -130,6 +130,8 @@ pub(crate) struct Over<'a> {
     pub shapes: &'a Shapes,
     /// The text an input method is composing, which is underlined.
     pub composing: Option<Range<usize>>,
+    /// The misspelled words, in order.
+    pub spelling: &'a [Range<usize>],
 }
 
 /// What painting draws with and into.
@@ -230,9 +232,53 @@ impl Painter<'_> {
                 room += shown.width;
             }
         }
+        // A word still being composed is not yet a word to judge.
+        let composed = |range: &&Range<usize>| {
+            over.composing
+                .as_ref()
+                .is_some_and(|composing| range.start <= composing.end && composing.start <= range.end)
+        };
+        for range in over.spelling.iter().filter(|range| !composed(range)) {
+            self.misspelled(leaf, laid, range, over.shifts);
+        }
         if let Some(range) = &over.composing {
             self.composing(leaf, laid, range, over.shifts);
         }
+    }
+
+    /// The part of each line that a byte range covers: the line, where the part starts from the leaf's left
+    /// edge, and its width. Markers on the line have pushed and widened it.
+    fn stretches(laid: &Laid, range: &Range<usize>, shifts: &Shifts, mut each: impl FnMut(usize, f32, f32)) {
+        let layout = &laid.text;
+        let start = Cursor::from_byte_index(layout, range.start, Affinity::Downstream);
+        let end = Cursor::from_byte_index(layout, range.end, Affinity::Upstream);
+        Span::new(start, end).geometry_with(layout, |area, line| {
+            let (lead, wider) = shifts.spread(line, area.x0 as f32, area.x1 as f32);
+            each(line, area.x0 as f32 + lead, area.width() as f32 + wider);
+        });
+    }
+
+    /// Draws a wavy line under a misspelled word.
+    fn misspelled(&mut self, leaf: &Leaf, laid: &Laid, range: &Range<usize>, shifts: &Shifts) {
+        let (of, color) = (self.types.get(leaf.role), self.inks.palette.spelling);
+        Self::stretches(laid, range, shifts, |line, x, width| {
+            let Some(baseline) = laid.text.get(line).map(|line| line.metrics().baseline) else { return };
+            let y = (leaf.y + baseline + of.size * 0.16).round() + 0.5;
+            if y + theme::WAVE_SWING <= self.band.0 || y - theme::WAVE_SWING >= self.band.1 || width <= 0.0 {
+                return;
+            }
+            // Whole waves, stretched a little to end where the word does.
+            let waves = (width / theme::WAVE).round().max(2.0);
+            let step = width / waves;
+            let mut path = vec![PathEl::MoveTo(Point { x: 0.0, y: 0.0 })];
+            for wave in 0..waves as usize {
+                let swing = if wave % 2 == 0 { -2.0 * theme::WAVE_SWING } else { 2.0 * theme::WAVE_SWING };
+                let from = wave as f32 * step;
+                path.push(PathEl::QuadTo(Point { x: from + step / 2.0, y: swing }, Point { x: from + step, y: 0.0 }));
+            }
+            let origin = Point { x: leaf.x + x, y };
+            self.out.push(Item::Path { origin, scale: 1.0, path: path.into(), color, stroke: Some(1.0) });
+        });
     }
 
     /// Emits a run's glyphs on a line that holds markers, each pushed by the markers before it.
@@ -273,19 +319,15 @@ impl Painter<'_> {
 
     /// Underlines the text an input method is composing.
     fn composing(&mut self, leaf: &Leaf, laid: &Laid, range: &Range<usize>, shifts: &Shifts) {
-        let (of, layout) = (self.types.get(leaf.role), &laid.text);
+        let of = self.types.get(leaf.role);
         let (size, color) = ((of.size / 12.0).round().max(1.0), self.inks.ink(Ink::Style(leaf.role)));
-        let start = Cursor::from_byte_index(layout, range.start, Affinity::Downstream);
-        let end = Cursor::from_byte_index(layout, range.end, Affinity::Upstream);
-        Span::new(start, end).geometry_with(layout, |area, line| {
-            let Some(baseline) = layout.get(line).map(|line| line.metrics().baseline) else { return };
-            let (lead, wider) = shifts.spread(line, area.x0 as f32, area.x1 as f32);
+        Self::stretches(laid, range, shifts, |line, x, width| {
+            let Some(baseline) = laid.text.get(line).map(|line| line.metrics().baseline) else { return };
             let y = (leaf.y + baseline + of.size * 0.12).round();
             if y + size <= self.band.0 || y >= self.band.1 {
                 return;
             }
-            let rect = Rect::new(leaf.x + area.x0 as f32 + lead, y, area.width() as f32 + wider, size);
-            self.out.push(Item::Fill { rect, color, radius: 0.0 });
+            self.out.push(Item::Fill { rect: Rect::new(leaf.x + x, y, width, size), color, radius: 0.0 });
         });
     }
 

@@ -694,6 +694,7 @@ fn palette(scheme: Scheme) -> Palette {
         code: ink(fade(tokens::FG, 0.04)),
         inline_code: ink(fade(tokens::FG, 0.06)),
         highlight: Palette::LIGHT.highlight,
+        spelling: ink(tokens::DANGER),
         tip: callout(tokens::OK, tokens::OK_SOFT),
         info: callout(tokens::INFO, tokens::INFO_SOFT),
         warn: callout(tokens::WARN, tokens::WARN_SOFT),

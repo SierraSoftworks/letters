@@ -47,6 +47,8 @@ pub struct Palette {
     pub inline_code: Color,
     /// The fill behind highlighted text.
     pub highlight: Color,
+    /// The wavy line under a misspelled word.
+    pub spelling: Color,
     pub tip: Callout,
     pub info: Callout,
     pub warn: Callout,
@@ -113,6 +115,7 @@ impl Palette {
         code: Color::rgba(0x15, 0x17, 0x1a, 10),
         inline_code: Color::rgba(0x15, 0x17, 0x1a, 16),
         highlight: Color::rgba(0xff, 0xd6, 0x0a, 96),
+        spelling: Color::rgb(0xb8, 0x2c, 0x24),
         tip: callout(0x14, 0x6f, 0x43, 31),
         info: callout(0x2a, 0x63, 0xb5, 31),
         warn: callout(0x85, 0x59, 0x00, 33),
