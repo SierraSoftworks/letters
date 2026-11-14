@@ -1,10 +1,11 @@
 //! Turns the block tree into a flat column of leaves: where each block sits across the page, the space around
 //! it and what frames it. No text is shaped here, so this stays cheap for a whole document.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 
 use letters_model::{Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Style, TextStyle, Tone};
-use letters_render::{Color, Rect};
+use letters_render::{Color, Point, Rect};
 use parley::{Alignment, Layout, LineHeight};
 
 use crate::engine::{Engine, Spec};
@@ -138,8 +139,13 @@ impl Types {
 
     /// The label of the `number`th numbered figure, as it stands before a caption.
     pub fn label(&self, number: u32) -> String {
-        format!("{} {number}:", self.figure)
+        label(&self.figure, number)
     }
+}
+
+/// The label of a numbered figure, from the word it opens with.
+pub(crate) fn label(word: &str, number: u32) -> String {
+    format!("{word} {number}:")
 }
 
 impl Type {
@@ -181,16 +187,17 @@ pub(crate) enum What {
     Row,
 }
 
-impl What {
-    /// Whether a caret can sit in or on a leaf of this kind.
-    pub fn holds(self) -> bool {
-        !matches!(self, Self::Rule | Self::Label | Self::Blank)
-    }
-
-    /// Whether the leaf's own text is set as lines of text.
-    pub fn worded(self) -> bool {
-        matches!(self, Self::Text | Self::Label | Self::Figure | Self::Gallery)
-    }
+/// One of the things in a leaf that a position can be in or on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Part {
+    /// The block the leaf stands for, when positions belong to the blocks inside it.
+    Whole,
+    /// A picture of a gallery.
+    Picture(usize),
+    /// The leaf's own text: a text block's, a formula's source or a caption.
+    Text,
+    /// The text of a cell of a table row.
+    Cell(usize),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -234,6 +241,10 @@ pub(crate) struct Words {
 }
 
 impl Words {
+    pub fn plain(text: String) -> Self {
+        Self { text, ..Self::default() }
+    }
+
     /// Reads a text block's runs.
     pub fn of(block: &Block) -> Self {
         let mut words = Self::default();
@@ -273,7 +284,7 @@ impl Words {
         words
     }
 
-    /// The source of the formula that holds `offset` or ends or starts there, when it is in one.
+    /// The source of the formula that holds `offset`, or starts or ends there.
     pub fn formula(&self, offset: usize) -> Option<Range<usize>> {
         let mut start = 0;
         for span in &self.spans {
@@ -304,6 +315,11 @@ pub(crate) struct Picture {
 }
 
 impl Picture {
+    /// Whether `other` shows the same image at the same shape.
+    fn same(&self, other: &Self) -> bool {
+        (&self.id, &self.asset, &self.host, self.size) == (&other.id, &other.asset, &other.host, other.size)
+    }
+
     fn of(block: &Block) -> Option<Self> {
         let BlockKind::Figure { asset, src, width, height, .. } = &block.kind else { return None };
         // The host is all of a link that the page shows.
@@ -330,6 +346,12 @@ pub(crate) struct Cell {
     pub fit: Option<(f32, f32)>,
 }
 
+impl Cell {
+    fn of(block: &Block) -> Self {
+        Self { id: block.id.clone(), words: Words::of(block), x: 0.0, width: 1.0, fit: None }
+    }
+}
+
 /// One row of the column: a text block, or something that stands where a block is.
 #[derive(Default)]
 pub(crate) struct Leaf {
@@ -342,11 +364,7 @@ pub(crate) struct Leaf {
     pub role: Role,
     pub marker: Marker,
     /// The leaf keeps its own copy of the text, so it can be laid out whenever it scrolls into view.
-    pub text: String,
-    /// Empty when the whole text is unmarked.
-    pub spans: Vec<Span>,
-    /// The links in the text, in order: the bytes each covers and where it leads.
-    pub links: Vec<(Range<usize>, String)>,
+    pub words: Words,
     pub newlines: usize,
     /// The block the text belongs to when that is not the leaf's own: the caption of a gallery.
     pub caption: Option<BlockId>,
@@ -411,7 +429,7 @@ impl Leaf {
             What::Rule => theme::RULE,
             What::Blank => of.line,
             What::Text | What::Label | What::Figure | What::Gallery => {
-                self.tall((self.newlines as f32 + wrapped(self.text.len(), self.width)) * of.line)
+                self.tall((self.newlines as f32 + wrapped(self.words.text.len(), self.width)) * of.line)
             }
             What::Formula => (of.line * 2.5).round(),
             What::Row => {
@@ -423,7 +441,64 @@ impl Leaf {
 
     /// Whether a figure or gallery shows a caption under its pictures.
     pub fn captioned(&self) -> bool {
-        !self.text.is_empty() || self.number.is_some()
+        !self.words.text.is_empty() || self.number.is_some()
+    }
+
+    /// Whether the leaf sets a text of its own, and not only those of its cells.
+    pub fn worded(&self) -> bool {
+        match self.what {
+            What::Text | What::Label | What::Formula => true,
+            What::Figure | What::Gallery => self.captioned(),
+            What::Rule | What::Blank | What::Row => false,
+        }
+    }
+
+    /// Whether a position can be in or on the leaf.
+    pub fn holds(&self) -> bool {
+        self.parts().next().is_some()
+    }
+
+    /// Everything in the leaf that a position can be in or on, in reading order, each with its block.
+    pub fn parts(&self) -> impl Iterator<Item = (Part, &BlockId)> {
+        let own = match self.what {
+            What::Text | What::Formula | What::Figure => self.id.as_ref(),
+            What::Gallery => self.caption.as_ref(),
+            _ => None,
+        };
+        let pictures = self.pictures.iter().enumerate().filter(|_| self.what == What::Gallery);
+        let pictures = pictures.map(|(index, picture)| (Part::Picture(index), &picture.id));
+        let cells = self.cells.iter().enumerate().map(|(index, cell)| (Part::Cell(index), &cell.id));
+        pictures.chain(own.map(|id| (Part::Text, id))).chain(cells)
+    }
+
+    /// The block a part's positions belong to.
+    pub fn owner(&self, part: Part) -> Option<&BlockId> {
+        self.parts().find(|(known, _)| *known == part).map(|(_, id)| id)
+    }
+
+    /// The text of a part that holds one.
+    pub fn text(&self, part: Part) -> Option<&Words> {
+        match part {
+            Part::Text => Some(&self.words),
+            Part::Cell(index) => self.cells.get(index).map(|cell| &cell.words),
+            Part::Whole | Part::Picture(_) => None,
+        }
+    }
+
+    /// How much text the leaf holds, as a measure of what laying it out costs.
+    pub fn bytes(&self) -> usize {
+        self.words.text.len() + self.cells.iter().map(|cell| cell.words.text.len()).sum::<usize>()
+    }
+
+    /// The line of the leaf, as pagination counts them, that holds line `line` of a part's text.
+    pub fn line_of(&self, part: Part, line: usize) -> usize {
+        let last = self.lines.max(1) as usize - 1;
+        match (self.what, part) {
+            (What::Gallery, Part::Picture(index)) => self.pictures.get(index).map_or(0, |picture| picture.row),
+            (What::Gallery, _) => last,
+            (What::Figure, _) => 0,
+            _ => line.min(last),
+        }
     }
 
     /// The leaf's height when its own text is `text` tall.
@@ -459,24 +534,68 @@ impl Leaf {
         }
     }
 
-    /// The leaf of a text block, not yet placed.
-    pub fn of(block: &Block) -> Self {
-        let mut leaf = Self { id: Some(block.id.clone()), kind: Some(block.kind.clone()), ..Self::default() };
-        leaf.set_content(block);
-        leaf
+    /// How many lines end within `room` of the leaf's top.
+    pub fn lines_in(&self, room: f32) -> usize {
+        let count = self.lines.max(1) as usize;
+        match self.ends.is_empty() {
+            true => (((room * count as f32) / self.height.max(1.0)).floor().max(0.0) as usize).min(count),
+            false => self.ends.partition_point(|end| *end <= room).min(count),
+        }
     }
 
-    /// Copies a text block's runs.
-    pub fn set_content(&mut self, block: &Block) {
-        let Words { text, spans, links } = Words::of(block);
-        (self.text, self.spans, self.links) = (text, spans, links);
-        self.newlines = self.text.bytes().filter(|byte| *byte == b'\n').count();
+    /// Copies a text block's runs, and hands back the text there was.
+    pub fn set_content(&mut self, block: &Block) -> String {
+        let before = std::mem::replace(&mut self.words, Words::of(block));
+        self.newlines = self.words.text.bytes().filter(|byte| *byte == b'\n').count();
+        before.text
+    }
+
+    /// Copies a text block's runs into the part that shows them, and hands back the text there was.
+    pub fn reword(&mut self, part: Part, block: &Block) -> String {
+        if let Part::Cell(index) = part
+            && let Some(cell) = self.cells.get_mut(index)
+        {
+            cell.fit = None;
+            return std::mem::replace(&mut cell.words, Words::of(block)).text;
+        }
+        self.set_content(block)
+    }
+
+    /// The cell of a table row under `x` on the page, or the nearest.
+    pub fn cell_at(&self, x: f32) -> Option<usize> {
+        let right = |cell: &Cell| self.x + cell.x + cell.width + theme::CELL_PAD_X;
+        self.cells.iter().position(|cell| x < right(cell)).or(self.cells.len().checked_sub(1))
+    }
+
+    /// The picture of a gallery's row `row` under `x` on the page, or the nearest in that row.
+    pub fn picture_in(&self, row: usize, x: f32) -> Option<usize> {
+        let mut inside = self.pictures.iter().enumerate().filter(|(_, picture)| picture.row == row);
+        let right = |picture: &Picture| self.x + picture.rect.x + picture.rect.width + theme::TILE_GAP / 2.0;
+        let last = inside.clone().next_back();
+        inside.find(|(_, picture)| x < right(picture)).or(last).map(|(index, _)| index)
+    }
+
+    /// The part of the leaf at a point on the page, or the nearest that a position can be in or on.
+    pub fn part_at(&self, point: Point) -> Option<Part> {
+        match self.what {
+            What::Text | What::Formula | What::Figure => Some(Part::Text),
+            What::Row => self.cell_at(point.x).map(Part::Cell),
+            What::Gallery => {
+                let under = point.y >= self.y + self.lead - theme::CAPTION_GAP / 2.0;
+                if self.pictures.is_empty() || (under && self.caption.is_some()) {
+                    return self.caption.as_ref().map(|_| Part::Text);
+                }
+                let bottom = |picture: &Picture| self.y + picture.rect.y + picture.rect.height + theme::TILE_GAP / 2.0;
+                let row = self.pictures.iter().find(|picture| point.y < bottom(picture)).or(self.pictures.last())?.row;
+                self.picture_in(row, point.x).map(Part::Picture)
+            }
+            What::Rule | What::Label | What::Blank => None,
+        }
     }
 
     /// Places a figure's picture, or a gallery's in rows, and makes room for them above the text.
     fn arrange(&mut self, types: &Types) {
         let width = self.width;
-        self.ends.clear();
         match &mut self.pictures[..] {
             [] => self.lead = 0.0,
             [picture] if self.what == What::Figure => {
@@ -497,41 +616,22 @@ impl Leaf {
                     // Up to three to a row, and the last picture is never left alone.
                     let left = pictures.len() - at;
                     let take = if left == 4 { 2 } else { left.min(3) };
-                    let shapes: f32 = pictures[at..at + take].iter().map(|picture| picture.size.0 / picture.size.1).sum();
+                    let tiles = &mut pictures[at..at + take];
+                    let shapes: f32 = tiles.iter().map(|picture| picture.size.0 / picture.size.1).sum();
                     let room = (width - theme::TILE_GAP * (take - 1) as f32).max(take as f32);
                     let tall = (room / shapes).round().max(1.0);
                     let mut x = 0.0;
-                    for (index, picture) in pictures[at..at + take].iter_mut().enumerate() {
+                    for (index, picture) in tiles.iter_mut().enumerate() {
                         // The last one ends at the text edge, whatever the rounding of the others left.
-                        let wide = if index + 1 == take { width - x } else { (picture.size.0 / picture.size.1 * tall).round() };
-                        (picture.rect, picture.row) = (Rect::new(x, top, wide.max(1.0), tall), row);
+                        let scaled = (picture.size.0 / picture.size.1 * tall).round();
+                        let wide = if index + 1 == take { width - x } else { scaled }.max(1.0);
+                        (picture.rect, picture.row) = (Rect::new(x, top, wide, tall), row);
                         x += wide + theme::TILE_GAP;
                     }
                     (at, top, row) = (at + take, top + tall + theme::TILE_GAP, row + 1);
-                    // A line of the leaf is a row with the gap under it.
-                    self.ends.push(top);
                 }
                 self.lead = top - theme::TILE_GAP + theme::CAPTION_GAP;
             }
-        }
-    }
-
-    /// The lines pagination sees in a leaf whose text has `lines` lines and is `text` tall, with where each
-    /// ends. `uneven` gives the ends of the text's lines when they differ in height.
-    pub fn count(&mut self, lines: u32, uneven: Vec<f32>) {
-        let of_text = self.height;
-        match self.what {
-            // A figure is one line: its picture never parts from its caption.
-            What::Figure | What::Formula => (self.lines, self.ends) = (1, Vec::new()),
-            What::Gallery => {
-                let rows = self.pictures.last().map_or(0, |last| last.row + 1);
-                self.ends.truncate(rows);
-                if let Some(last) = self.ends.last_mut() {
-                    *last = of_text;
-                }
-                self.lines = rows.max(1) as u32;
-            }
-            _ => (self.lines, self.ends) = (lines.max(1), uneven),
         }
     }
 }
@@ -579,10 +679,69 @@ pub(crate) struct Table {
     pub rows: Range<usize>,
     /// How each column's text is aligned.
     pub aligns: Vec<Alignment>,
-    /// The width of each column, padding included.
-    pub widths: Vec<f32>,
-    /// Whether the widths come from measured text and not from a guess.
+    /// Whether every cell's text has been measured, so that the columns are as wide as they will stay.
     pub sized: bool,
+}
+
+impl Table {
+    /// Shares the table's width among its columns by what their cells hold, and places the cells. A cell not
+    /// yet measured counts by the amount of its text. A row whose cells move is to be laid out again.
+    ///
+    /// Every column gets at least its longest word while there is room for that, and the rest goes to the
+    /// columns that would otherwise wrap, as a browser shares it.
+    pub fn size(&mut self, leaves: &mut [Leaf], types: &Types) {
+        let rows = &mut leaves[self.rows.clone()];
+        let columns = rows.iter().map(|row| row.cells.len()).max().unwrap_or(0);
+        let Some(width) = rows.first().map(|row| row.width).filter(|_| columns > 0) else { return };
+        let advance = types.get(rows[0].role).advance;
+        let pad = 2.0 * theme::CELL_PAD_X;
+        let (mut least, mut most) = (vec![pad; columns], vec![pad; columns]);
+        self.sized = true;
+        for row in rows.iter() {
+            // A header is set bold, which runs a little wider.
+            let advance = if row.header { advance * 1.08 } else { advance };
+            for (column, cell) in row.cells.iter().enumerate() {
+                self.sized &= cell.fit.is_some();
+                let (narrow, wide) = cell.fit.unwrap_or_else(|| {
+                    let word = cell.words.text.split_whitespace().map(str::len).max().unwrap_or(0);
+                    (word as f32 * advance, cell.words.text.len() as f32 * advance)
+                });
+                least[column] = least[column].max(narrow.ceil() + pad);
+                most[column] = most[column].max(wide.ceil() + pad);
+            }
+        }
+        let (narrowest, widest): (f32, f32) = (least.iter().sum(), most.iter().sum());
+        let share = |column: usize| match () {
+            () if widest <= width => most[column] * width / widest,
+            () if narrowest <= width => {
+                let spare = (width - narrowest) / (widest - narrowest).max(1.0);
+                least[column] + (most[column] - least[column]) * spare
+            }
+            () => least[column] * width / narrowest,
+        };
+        // Whole pixels, with the last column ending at the text edge.
+        let mut edges = vec![0.0; columns + 1];
+        let mut at = 0.0;
+        for column in 0..columns {
+            at += share(column);
+            edges[column + 1] = if column + 1 == columns { width } else { at.round().min(width) };
+        }
+        for row in rows.iter_mut() {
+            let mut moved = false;
+            for (column, cell) in row.cells.iter_mut().enumerate() {
+                let x = edges[column] + theme::CELL_PAD_X;
+                let wide = (edges[column + 1] - edges[column] - pad).max(1.0);
+                moved |= (cell.x, cell.width) != (x, wide);
+                (cell.x, cell.width) = (x, wide);
+            }
+            if moved {
+                (row.exact, row.laid) = (false, None);
+            }
+            if !row.exact {
+                row.height = row.estimate(types);
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -590,6 +749,8 @@ pub(crate) struct Flow {
     pub leaves: Vec<Leaf>,
     pub frames: Vec<Frame>,
     pub tables: Vec<Table>,
+    /// The blocks whose text was read anew into a leaf that was kept, each with the text it had.
+    pub retexted: Vec<(BlockId, String)>,
 }
 
 /// The number of each numbered figure and gallery, in the order of the document. A figure inside a gallery
@@ -607,26 +768,62 @@ pub(crate) fn numbers(blocks: &[Block], next: &mut u32, out: &mut Vec<(BlockId, 
     }
 }
 
-/// Lays the document out as a column `width` wide. `reuse` hands back the old leaf of a block whose content
-/// has not changed, so its text and layout carry over.
-pub(crate) fn flow(doc: &Document, types: &Types, width: f32, reuse: impl FnMut(&Block) -> Option<Leaf>) -> Flow {
-    let mut walk = Walk { types, reuse, out: Flow::default(), pad: 0.0, breaks: false, root: 0 };
+/// Lays the document out as a column `width` wide.
+///
+/// With `carry`, the leaves of the last column are kept: `old` hands over the leaf a block had, and `carry`
+/// names the blocks whose text has changed since, which are read again. A kept leaf brings its height and,
+/// when nothing in it changed, its layout.
+pub(crate) fn flow(
+    doc: &Document,
+    types: &Types,
+    width: f32,
+    carry: Option<&BTreeSet<BlockId>>,
+    old: impl FnMut(&BlockId) -> Option<Leaf>,
+) -> Flow {
+    let mut walk = Walk { types, carry, old, out: Flow::default(), pad: 0.0, breaks: false, root: 0, figures: 0 };
     walk.place(&doc.blocks, 0.0, width, None, false);
     walk.out
 }
 
 struct Walk<'a, F> {
     types: &'a Types,
-    reuse: F,
+    carry: Option<&'a BTreeSet<BlockId>>,
+    old: F,
     out: Flow,
     /// Padding of frames opened since the last leaf, which the next leaf carries above it.
     pad: f32,
     /// Whether a block since the last leaf starts a page, which the next leaf then does.
     breaks: bool,
     root: usize,
+    /// How many numbered figures and galleries there are so far.
+    figures: u32,
 }
 
-impl<F: FnMut(&Block) -> Option<Leaf>> Walk<'_, F> {
+impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
+    /// The leaf `block` had, when it is still the kind of block it was, and otherwise a new one that shows
+    /// `what`. Also says whether the leaf is the old one.
+    fn leaf(&mut self, block: &Block, what: What) -> (Leaf, bool) {
+        let old = self.carry.and_then(|_| (self.old)(&block.id));
+        match old.filter(|old| old.kind.as_ref() == Some(&block.kind) && old.what == what) {
+            Some(old) => (old, true),
+            None => {
+                let (id, kind) = (Some(block.id.clone()), Some(block.kind.clone()));
+                (Leaf { id, kind, what, ..Leaf::default() }, false)
+            }
+        }
+    }
+
+    /// Whether a text read from `block` when the column was last built may no longer be its text.
+    fn changed(&self, block: &BlockId) -> bool {
+        self.carry.is_none_or(|changed| changed.contains(block))
+    }
+
+    /// The next figure number, when the block takes one.
+    fn number(&mut self, numbered: bool) -> Option<u32> {
+        self.figures += u32::from(numbered);
+        numbered.then_some(self.figures)
+    }
+
     fn place(&mut self, blocks: &[Block], x: f32, width: f32, frame: Option<usize>, quoted: bool) {
         let unit = self.types.get(Role::Body).after;
         let prose = if quoted { Role::Quote } else { Role::Body };
@@ -644,12 +841,13 @@ impl<F: FnMut(&Block) -> Option<Leaf>> Walk<'_, F> {
                 BlockKind::Heading { level: 3 } => Role::Heading3,
                 BlockKind::Heading { .. } => Role::Heading4,
                 BlockKind::Code { .. } => Role::Code,
-                BlockKind::Unknown { .. } => Role::Caption,
+                BlockKind::Unknown { .. } | BlockKind::Figure { .. } | BlockKind::Gallery { .. } => Role::Caption,
                 _ => prose,
             };
             let of = self.types.get(role);
             let (before, after) = match &block.kind {
-                BlockKind::Quote => (unit, unit),
+                BlockKind::Quote | BlockKind::Formula | BlockKind::Table { .. } => (unit, unit),
+                BlockKind::Figure { .. } | BlockKind::Gallery { .. } => (unit.max(of.before), unit.max(of.after)),
                 BlockKind::Callout { .. } => ((unit * 1.5).round(), (unit * 1.5).round()),
                 BlockKind::Divider => (unit * 2.0, unit * 2.0),
                 BlockKind::Code { .. } | BlockKind::Unknown { .. } => (of.before.max(of.after), of.after),
@@ -717,21 +915,95 @@ impl<F: FnMut(&Block) -> Option<Leaf>> Walk<'_, F> {
                     self.push(Leaf { id, what: What::Rule, ..Leaf::default() }, x, width, gap, frame);
                 }
                 BlockKind::Unknown { type_name } => {
-                    let (id, text) = (Some(block.id.clone()), format!("Unsupported block: {type_name}"));
-                    self.push(Leaf { id, what: What::Label, role, text, ..Leaf::default() }, x, width, gap, frame);
+                    let words = Words::plain(format!("Unsupported block: {type_name}"));
+                    let leaf = Leaf { id: Some(block.id.clone()), what: What::Label, role, words, ..Leaf::default() };
+                    self.push(leaf, x, width, gap, frame);
                 }
+                BlockKind::Gallery { numbered } => {
+                    let inside = block.body.blocks();
+                    let caption = inside.last().filter(|last| last.kind == BlockKind::Caption);
+                    let (mut leaf, _) = self.leaf(block, What::Gallery);
+                    let pictures: Vec<Picture> = inside.iter().filter_map(Picture::of).collect();
+                    let same = leaf.pictures.len() == pictures.len()
+                        && leaf.pictures.iter().zip(&pictures).all(|(old, new)| old.same(new));
+                    let known = leaf.caption.as_ref() == caption.map(|caption| &caption.id);
+                    let reread = !known || caption.is_some_and(|caption| self.changed(&caption.id));
+                    if reread {
+                        let before = match caption {
+                            Some(caption) => leaf.set_content(caption),
+                            None => std::mem::take(&mut leaf.words).text,
+                        };
+                        if let (true, Some(caption)) = (known, caption) {
+                            self.out.retexted.push((caption.id.clone(), before));
+                        }
+                        leaf.caption = caption.map(|caption| caption.id.clone());
+                    }
+                    let number = self.number(*numbered);
+                    if !same || reread || leaf.number != number || leaf.role != role {
+                        (leaf.exact, leaf.laid) = (false, None);
+                    }
+                    (leaf.pictures, leaf.number, leaf.role) = (pictures, number, role);
+                    self.push(leaf, x, width, gap, frame);
+                }
+                BlockKind::Table { columns, header } => {
+                    let first = self.out.leaves.len();
+                    for (index, row) in block.body.blocks().iter().enumerate() {
+                        let (mut leaf, _) = self.leaf(row, What::Row);
+                        let cells = row.body.blocks();
+                        let mut reread = leaf.cells.len() != cells.len();
+                        if reread {
+                            leaf.cells = cells.iter().map(Cell::of).collect();
+                        } else {
+                            for (cell, block) in leaf.cells.iter_mut().zip(cells) {
+                                let known = cell.id == block.id;
+                                if known && !self.changed(&block.id) {
+                                    continue;
+                                }
+                                let place = Cell { x: cell.x, width: cell.width, ..Cell::of(block) };
+                                let before = std::mem::replace(cell, place);
+                                if known {
+                                    self.out.retexted.push((block.id.clone(), before.words.text));
+                                }
+                                reread = true;
+                            }
+                        }
+                        let header = *header && index == 0;
+                        if reread || leaf.header != header || leaf.role != prose {
+                            (leaf.exact, leaf.laid) = (false, None);
+                        }
+                        (leaf.role, leaf.table, leaf.header) = (prose, self.out.tables.len(), header);
+                        self.push(leaf, x, width, if index == 0 { gap } else { 0.0 }, frame);
+                    }
+                    let aligns = columns.iter().map(|align| alignment(*align)).collect();
+                    let mut table = Table { rows: first..self.out.leaves.len(), aligns, sized: false };
+                    table.size(&mut self.out.leaves, self.types);
+                    self.out.tables.push(table);
+                }
+                // Rows and cells outside a table, and a caption outside a gallery, have nowhere to stand.
+                BlockKind::TableRow | BlockKind::TableCell | BlockKind::Caption => {}
                 _ => {
-                    let mut leaf = match (self.reuse)(block) {
-                        Some(old) if old.kind.as_ref() == Some(&block.kind) => old,
-                        _ => Leaf::of(block),
+                    let what = match &block.kind {
+                        BlockKind::Formula => What::Formula,
+                        BlockKind::Figure { .. } => What::Figure,
+                        _ => What::Text,
                     };
-                    if leaf.role != role {
+                    let (mut leaf, kept) = self.leaf(block, what);
+                    if !kept || self.changed(&block.id) {
+                        let before = leaf.set_content(block);
+                        if kept {
+                            self.out.retexted.push((block.id.clone(), before));
+                        }
+                        (leaf.exact, leaf.laid) = (false, None);
+                    }
+                    let number = self.number(matches!(block.kind, BlockKind::Figure { numbered: true, .. }));
+                    if leaf.role != role || leaf.number != number {
                         leaf.exact = false;
                     }
-                    if leaf.role != role || leaf.marker != marker {
+                    if leaf.role != role || leaf.marker != marker || leaf.number != number {
                         leaf.laid = None;
                     }
-                    (leaf.role, leaf.marker) = (role, marker);
+                    leaf.pictures = Picture::of(block).into_iter().collect();
+                    (leaf.role, leaf.marker, leaf.number) = (role, marker, number);
                     self.push(leaf, x + inset, width - inset, gap, frame);
                 }
             }
@@ -755,6 +1027,7 @@ impl<F: FnMut(&Block) -> Option<Leaf>> Walk<'_, F> {
         leaf.bottom = pad_y;
         leaf.frame = frame;
         leaf.breaks = std::mem::take(&mut self.breaks);
+        leaf.arrange(self.types);
         if matches!(leaf.what, What::Rule | What::Blank) {
             (leaf.height, leaf.exact, leaf.lines) = (leaf.estimate(self.types), true, 1);
         } else if !leaf.exact {

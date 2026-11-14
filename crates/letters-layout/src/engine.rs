@@ -31,6 +31,10 @@ pub(crate) struct Spec<'a> {
 }
 
 pub(crate) struct Engine {
+    /// The formulas typeset so far. They are set far more often than they change.
+    pub maths: letters_math::Cache,
+    /// Whether a formula may link. Only a document that is trusted may.
+    pub links: bool,
     fcx: FontContext,
     lcx: LayoutContext<Brush>,
     /// The bytes behind each registered blob, by blob id.
@@ -49,6 +53,8 @@ impl Engine {
     pub fn new(fonts: &Fonts) -> Self {
         let collection = Collection::new(CollectionOptions { shared: false, system_fonts: false });
         let mut engine = Self {
+            maths: letters_math::Cache::default(),
+            links: false,
             fcx: FontContext { collection, source_cache: SourceCache::default() },
             lcx: LayoutContext::new(),
             sources: Vec::new(),

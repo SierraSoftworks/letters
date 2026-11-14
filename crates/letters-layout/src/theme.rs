@@ -34,6 +34,19 @@ pub(crate) const INLINE_CODE_SCALE: f32 = 0.9;
 pub(crate) const WAVE: f32 = 2.0;
 pub(crate) const WAVE_SWING: f32 = 1.0;
 
+/// The gap between a picture and the caption under it.
+pub(crate) const CAPTION_GAP: f32 = 8.0;
+/// The gap between the pictures of a gallery.
+pub(crate) const TILE_GAP: f32 = 8.0;
+/// The side of the cloud on a picture that is still a link, and how far it sits in from the corner.
+pub(crate) const BADGE: f32 = 16.0;
+pub(crate) const BADGE_INSET: f32 = 8.0;
+/// The padding inside a table cell.
+pub(crate) const CELL_PAD_X: f32 = 10.0;
+pub(crate) const CELL_PAD_Y: f32 = 6.0;
+/// A display formula too wide for the column is set smaller, down to this share of its size.
+pub(crate) const FORMULA_SHRINK: f32 = 0.4;
+
 /// A callout's revealed tag is set small enough to sit in the padding above its text.
 pub(crate) const TAG_SCALE: f32 = 0.7;
 

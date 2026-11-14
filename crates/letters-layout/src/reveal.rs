@@ -8,6 +8,8 @@ use std::collections::BTreeSet;
 use letters_model::{BlockId, Markers, Pos};
 use parley::{Affinity, Layout};
 
+use crate::leaf::Set;
+
 use crate::engine::Engine;
 use crate::flow::{Role, Types};
 use crate::ink::{Brush, Ink};
@@ -157,13 +159,7 @@ impl Reveal {
 
     /// Where the markers of a text block sit over its layout. `shape` gives a marker's shape and full width,
     /// and `room` is how much of the margin left of the text is free to hang a marker in.
-    pub fn over(
-        &self,
-        block: &BlockId,
-        layout: &Layout<Brush>,
-        room: f32,
-        mut shape: impl FnMut(&str) -> (usize, f32),
-    ) -> Shifts {
+    pub fn over(&self, block: &BlockId, set: &Set, room: f32, mut shape: impl FnMut(&str) -> (usize, f32)) -> Shifts {
         let mut shifts = Shifts::default();
         for (sign, level) in self.of(block) {
             let (shape, width) = shape(&sign.text);
@@ -176,7 +172,7 @@ impl Reveal {
                 }
                 Place::Inline { offset, before, upstream } => {
                     let affinity = if upstream { Affinity::Upstream } else { Affinity::Downstream };
-                    let (line, x) = leaf::spot(layout, offset, affinity);
+                    let (line, x) = leaf::spot(set, offset, affinity);
                     shifts.inline.push(Shown { line, x, width: width * level, level, shape, offset, before });
                 }
             }

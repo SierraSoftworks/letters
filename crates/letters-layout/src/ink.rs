@@ -42,10 +42,19 @@ pub(crate) struct Inks {
     roles: Vec<Color>,
 }
 
+/// The colour a palette shows a style's colour as. One the style leaves out is the palette's text colour.
+fn shown(palette: &Palette, color: Option<Color>) -> Color {
+    color.map_or(palette.text, |color| palette.recolor(color))
+}
+
+/// The colour a role's text is painted in.
+pub(crate) fn of(types: &Types, palette: &Palette, role: Role) -> Color {
+    shown(palette, types.get(role).color)
+}
+
 impl Inks {
     pub fn new(types: &Types, palette: Palette) -> Self {
-        let shown = |color: Option<Color>| color.map_or(palette.text, |color| palette.recolor(color));
-        Self { palette, roles: types.colors().map(shown).collect() }
+        Self { palette, roles: types.colors().map(|color| shown(&palette, color)).collect() }
     }
 
     pub fn ink(&self, ink: Ink) -> Color {

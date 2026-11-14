@@ -1,65 +1,276 @@
-//! One leaf's text: shaping it with Parley, painting it and answering where things are inside it.
+//! The texts of a leaf: shaping them with Parley, painting them and answering where things are inside them.
 
 use std::iter::Peekable;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
+use letters_math::{Formula, Style as Maths, TEXT_RATIO};
 use letters_render::{Color, DisplayList, Glyph, Item, PathEl, Point, Rect, RunText};
 use parley::{
-    Affinity, Alignment, AlignmentOptions, BreakReason, Cluster, Cursor, GlyphRun, Language, Layout, Line,
-    PositionedLayoutItem, Selection as Span,
+    Affinity, Alignment, AlignmentOptions, BreakReason, Cluster, Cursor, GlyphRun, InlineBox, InlineBoxKind, Language,
+    Layout, Line, PositionedLayoutItem, Selection as Span, VerticalAlign,
 };
 
 use crate::engine::{Engine, Spec};
-use crate::flow::{Leaf, Marker, Role, Type, Types, What, marks};
+use crate::flow::{self, Cell, Leaf, Marker, Part, Role, Type, Types, What, Words, marks};
 use crate::ink::{Back, Brush, Ink, Inks};
 use crate::reveal::{Shapes, Shifts};
 use crate::theme;
 use crate::tokens::{self, Token, TokenKind};
 
-/// A leaf's layout, kept while the leaf is near the viewport.
-pub(crate) struct Laid {
-    pub text: Layout<Brush>,
-    /// The number of an ordered item or the tick of a done task, set beside the first line.
-    pub sign: Option<Layout<Brush>>,
+/// What stands in a layout's text for a formula. Parley sets a box wherever it meets one.
+const OBJECT: char = '\u{FFFC}';
+
+/// Something a text's layout shows in place of a stretch of its source.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Swap {
+    /// The bytes of the source it stands for. Empty for what only the layout has, as with a figure's label.
+    pub source: Range<usize>,
+    /// The bytes of the layout's text that stand for them.
+    pub shown: Range<usize>,
+    /// The em of the formula set there, and whether it is set as a block. `None` for text.
+    pub maths: Option<(f32, bool)>,
 }
 
-/// Shapes a leaf's text and breaks it to the leaf's width.
-pub(crate) fn shape(
-    engine: &mut Engine,
-    types: &Types,
-    leaf: &Leaf,
-    locale: Option<Language>,
-    layout: &mut Layout<Brush>,
-) {
-    let (of, code) = (types.get(leaf.role), types.get(Role::Code));
-    let ink = if leaf.what == What::Label { Ink::Marker } else { Ink::Style(leaf.role) };
-    let spec = |bits: u8| marked(of, code, leaf.role == Role::Code, ink, bits);
-    let mut specs = Vec::with_capacity(leaf.spans.len().max(1));
-    let mut runs = Vec::with_capacity(leaf.spans.len().max(1));
-    if leaf.spans.is_empty() {
-        specs.push(spec(0));
-        if !leaf.text.is_empty() {
-            runs.push((0, 0..leaf.text.len()));
-        }
-    } else {
-        // One spec per distinct set of marks, however many spans share it.
-        let mut slots = [u16::MAX; 128];
-        let mut start = 0;
-        for span in &leaf.spans {
-            let slot = &mut slots[usize::from(span.marks)];
-            if *slot == u16::MAX {
-                *slot = specs.len() as u16;
-                specs.push(spec(span.marks));
+/// A text as laid out. Its layout may hold other text than its source: a formula is one box in place of its
+/// TeX, and a figure's label comes before the caption. Offsets are of the source unless they say otherwise.
+#[derive(Default)]
+pub(crate) struct Set {
+    pub layout: Layout<Brush>,
+    /// The text the layout holds, where that is not the source as it stands.
+    pub shown: Option<String>,
+    /// Where the layout's text departs from the source, in order.
+    pub swaps: Vec<Swap>,
+}
+
+impl Set {
+    /// The layout's text, given the source it was set from.
+    pub fn shown<'a>(&'a self, source: &'a str) -> &'a str {
+        self.shown.as_deref().unwrap_or(source)
+    }
+
+    /// Where a source offset is in the layout. One inside a swap is at its end.
+    pub fn inward(&self, offset: usize) -> usize {
+        let mut at = offset;
+        for swap in &self.swaps {
+            // An offset where a swap starts is before it. A swap that stands for nothing is the exception:
+            // it is something that comes before the text there.
+            if offset < swap.source.start || (offset == swap.source.start && !swap.source.is_empty()) {
+                break;
             }
-            runs.push((*slot, start..span.end));
-            start = span.end;
+            at = swap.shown.end + offset.saturating_sub(swap.source.end);
+        }
+        at
+    }
+
+    /// The source offset of a place in the layout.
+    pub fn outward(&self, index: usize) -> usize {
+        let mut at = index;
+        for swap in &self.swaps {
+            if index < swap.shown.start {
+                break;
+            }
+            if index < swap.shown.end {
+                return if index == swap.shown.start { swap.source.start } else { swap.source.end };
+            }
+            at = swap.source.end + (index - swap.shown.end);
+        }
+        at
+    }
+
+    fn boxed(&self) -> bool {
+        self.swaps.iter().any(|swap| swap.maths.is_some())
+    }
+}
+
+/// A leaf's layout, kept while the leaf is near the viewport.
+#[derive(Default)]
+pub(crate) struct Laid {
+    /// The leaf's own text.
+    pub text: Set,
+    /// The texts of a table row's cells.
+    pub cells: Vec<Set>,
+    /// The number of an ordered item or the tick of a done task, set beside the first line.
+    pub sign: Option<Layout<Brush>>,
+    /// The host name on each picture that is still a link, with the picture's place among the leaf's.
+    pub names: Vec<(usize, Layout<Brush>)>,
+}
+
+/// What a text is set from, and how.
+pub(crate) struct Source<'a> {
+    pub words: &'a Words,
+    pub role: Role,
+    /// What the text is drawn in where no mark says otherwise.
+    pub ink: Ink,
+    pub align: Alignment,
+    pub width: f32,
+    /// What stands before the text, as a figure's label does.
+    pub label: Option<String>,
+    /// Sets all of it bold, as in the header of a table.
+    pub bold: bool,
+    /// The whole text is the source of one formula, set as a block.
+    pub formula: bool,
+    /// The colour formulas are set in. They hold their colours, so this is the colour of the next paint.
+    pub color: Color,
+}
+
+impl<'a> Source<'a> {
+    /// A leaf's own text.
+    pub fn own(leaf: &'a Leaf, types: &Types, color: Color) -> Self {
+        let align = match leaf.what {
+            _ if leaf.boxed() => Alignment::Start,
+            What::Formula => Alignment::Center,
+            _ => types.get(leaf.role).align,
+        };
+        Self {
+            words: &leaf.words,
+            role: leaf.role,
+            ink: if leaf.what == What::Label { Ink::Marker } else { Ink::Style(leaf.role) },
+            align,
+            width: leaf.width,
+            label: leaf.number.map(|number| types.label(number)),
+            bold: false,
+            formula: leaf.what == What::Formula,
+            color,
         }
     }
-    engine.build(&leaf.text, &specs, &runs, locale, layout);
-    let align = if leaf.boxed() { Alignment::Start } else { of.align };
-    layout.set_alignment(align, AlignmentOptions::default());
-    layout.break_all_lines(Some(leaf.width));
+
+    /// The text of a cell of a table row.
+    pub fn cell(leaf: &'a Leaf, cell: &'a Cell, align: Alignment, color: Color) -> Self {
+        Self {
+            words: &cell.words,
+            role: leaf.role,
+            ink: Ink::Style(leaf.role),
+            align,
+            width: cell.width,
+            label: None,
+            bold: leaf.header,
+            formula: false,
+            color,
+        }
+    }
+}
+
+/// Typesets a formula for a place `room` wide, and says at what em. One too wide is set smaller to fit.
+fn typeset(engine: &mut Engine, source: &str, like: Maths, room: f32) -> Option<(Arc<Formula>, f32)> {
+    let set = engine.maths.typeset(source, &like).ok()?;
+    if set.size.width <= room {
+        return Some((set, like.size));
+    }
+    let size = like.size * (room / set.size.width).max(theme::FORMULA_SHRINK);
+    Some((engine.maths.typeset(source, &Maths { size, ..like }).ok()?, size))
+}
+
+/// Shapes a text. The caller still breaks the lines. `by_words` keeps a word whole where a line would
+/// otherwise break inside it, for measuring how narrow the text can be set.
+fn build(
+    engine: &mut Engine,
+    types: &Types,
+    source: &Source<'_>,
+    by_words: bool,
+    locale: Option<Language>,
+    set: &mut Set,
+) {
+    let (of, code) = (types.get(source.role), types.get(Role::Code));
+    let (text, spans) = (source.words.text.as_str(), &source.words.spans[..]);
+    let always = if source.bold { marks::BOLD } else { 0 };
+    let mut specs: Vec<Spec<'_>> = Vec::with_capacity(spans.len().max(1));
+    let mut runs = Vec::with_capacity(spans.len().max(1));
+    // One spec per distinct set of marks, however many spans share it.
+    let mut slots = [u16::MAX; 128];
+    let mut slot = |bits: u8| {
+        let bits = (bits | always) & !marks::MATH;
+        let slot = &mut slots[usize::from(bits)];
+        if *slot == u16::MAX {
+            *slot = specs.len() as u16;
+            specs.push(marked(of, code, source.role == Role::Code, source.ink, bits));
+        }
+        *slot
+    };
+    set.swaps.clear();
+    let maths = source.formula || spans.iter().any(|span| span.marks & marks::MATH != 0);
+    if !maths && source.label.is_none() {
+        let mut start = 0;
+        for span in spans {
+            runs.push((slot(span.marks), start..span.end));
+            start = span.end;
+        }
+        if spans.is_empty() {
+            let plain = slot(0);
+            runs.extend((!text.is_empty()).then_some((plain, 0..text.len())));
+        }
+        set.shown = None;
+        engine.build_with(text, &specs, &runs, &[], by_words, locale, &mut set.layout);
+        return;
+    }
+
+    let mut shown = set.shown.take().unwrap_or_default();
+    shown.clear();
+    let mut boxes = Vec::new();
+    if let Some(label) = &source.label {
+        shown.push_str(label);
+        shown.push(' ');
+        set.swaps.push(Swap { source: 0..0, shown: 0..shown.len(), maths: None });
+        runs.push((slot(0), 0..shown.len()));
+    }
+    let whole = [flow::Span { end: text.len(), marks: if source.formula { marks::MATH } else { 0 } }];
+    let like = Maths { size: of.size * TEXT_RATIO, color: source.color, display: source.formula, links: engine.links };
+    let mut start = 0;
+    for span in if spans.is_empty() || source.formula { &whole[..] } else { spans } {
+        let (piece, from, mut bits) = (&text[start..span.end], shown.len(), span.marks);
+        let formula = bits & marks::MATH != 0 && !piece.trim().is_empty();
+        match formula.then(|| typeset(engine, piece, like, source.width)) {
+            Some(Some((formula, size))) => {
+                shown.push(OBJECT);
+                boxes.push(InlineBox {
+                    id: set.swaps.len() as u64,
+                    kind: InlineBoxKind::InFlow,
+                    index: from,
+                    width: formula.size.width,
+                    height: formula.size.height,
+                    baseline: Some(formula.baseline),
+                    vertical_align: VerticalAlign::default(),
+                });
+                let maths = Some((size, source.formula));
+                set.swaps.push(Swap { source: start..span.end, shown: from..shown.len(), maths });
+            }
+            // A source that cannot be typeset shows as it is written.
+            Some(None) => {
+                bits |= marks::CODE;
+                shown.push_str(piece);
+            }
+            None => shown.push_str(piece),
+        }
+        if shown.len() > from {
+            runs.push((slot(bits), from..shown.len()));
+        }
+        start = span.end;
+    }
+    if runs.is_empty() {
+        slot(0);
+    }
+    engine.build_with(&shown, &specs, &runs, &boxes, by_words, locale, &mut set.layout);
+    set.shown = Some(shown);
+}
+
+/// Shapes a text and breaks it to its width.
+pub(crate) fn shape(engine: &mut Engine, types: &Types, source: &Source<'_>, locale: Option<Language>, set: &mut Set) {
+    build(engine, types, source, false, locale, set);
+    set.layout.set_alignment(source.align, AlignmentOptions::default());
+    set.layout.break_all_lines(Some(source.width));
+}
+
+/// The narrowest a text can be set without breaking a word, and the widest it runs when nothing breaks.
+pub(crate) fn fit(
+    engine: &mut Engine,
+    types: &Types,
+    source: &Source<'_>,
+    locale: Option<Language>,
+    set: &mut Set,
+) -> (f32, f32) {
+    build(engine, types, source, true, locale, set);
+    let widths = set.layout.calculate_content_widths();
+    (widths.min, widths.max)
 }
 
 /// How text of type `of` looks under a set of marks.
@@ -89,25 +300,65 @@ fn marked<'a>(of: &'a Type, code: &'a Type, mono: bool, ink: Ink, bits: u8) -> S
     spec
 }
 
-/// The height a leaf takes, in whole pixels so that the rows below stay on the pixel grid.
-pub(crate) fn height(layout: &Layout<Brush>) -> f32 {
+/// The height a text takes, in whole pixels so that the rows below stay on the pixel grid.
+fn tall(layout: &Layout<Brush>) -> f32 {
     layout.height().round().max(1.0)
 }
 
-/// How many lines a layout has, and which of them carry on from the line before with no line break between.
-/// Only a line of `code` holds together like that: prose may go to the next page at any line.
-pub(crate) fn lines(layout: &Layout<Brush>, code: bool) -> (u32, Vec<u32>) {
-    let mut joined = Vec::new();
-    if code {
-        let mut wrapped = false;
-        for (index, line) in layout.lines().enumerate() {
-            if wrapped {
-                joined.push(index as u32);
-            }
-            wrapped = line.break_reason() != BreakReason::Explicit;
+/// What a layout says of a leaf: how tall it is, and the lines a page may split it at.
+pub(crate) struct Extent {
+    pub height: f32,
+    pub lines: u32,
+    /// Where each line ends, from the leaf's top, when they are not all as tall as each other.
+    pub ends: Vec<f32>,
+    /// The lines that carry on from the line before with no line break between. Only a line of code holds
+    /// together like that: prose may go to the next page at any line.
+    pub joined: Vec<u32>,
+}
+
+/// Where each line of a text ends, when the text starts `lead` below the leaf's top.
+fn bottoms(set: &Set, lead: f32) -> impl Iterator<Item = f32> + '_ {
+    set.layout.lines().map(move |line| lead + line.metrics().block_max_coord)
+}
+
+pub(crate) fn extent(leaf: &Leaf, laid: &Laid) -> Extent {
+    let text = tall(&laid.text.layout);
+    let (mut ends, mut joined) = (Vec::new(), Vec::new());
+    let (height, lines) = match leaf.what {
+        What::Row => {
+            // The row is as tall as its tallest cell, and splits where that cell's lines do.
+            let tallest = laid.cells.iter().max_by(|a, b| a.layout.height().total_cmp(&b.layout.height()));
+            ends.extend(tallest.into_iter().flat_map(|set| bottoms(set, theme::CELL_PAD_Y)));
+            (tallest.map_or(1.0, |set| tall(&set.layout)) + 2.0 * theme::CELL_PAD_Y, ends.len())
         }
+        What::Gallery => {
+            // A line is a row of pictures with the gap under it. The caption stays with the last.
+            ends.resize(leaf.pictures.last().map_or(0, |last| last.row + 1), 0.0);
+            for picture in &leaf.pictures {
+                ends[picture.row] = picture.rect.y + picture.rect.height + theme::TILE_GAP;
+            }
+            (leaf.tall(text), ends.len())
+        }
+        // A picture never parts from its caption.
+        What::Figure => (leaf.tall(text), 1),
+        _ => {
+            if laid.text.boxed() {
+                ends.extend(bottoms(&laid.text, 0.0));
+            }
+            let mut wrapped = false;
+            for (index, line) in laid.text.layout.lines().enumerate().filter(|_| leaf.role == Role::Code) {
+                if wrapped {
+                    joined.push(index as u32);
+                }
+                wrapped = line.break_reason() != BreakReason::Explicit;
+            }
+            (text, laid.text.layout.len())
+        }
+    };
+    if let Some(last) = ends.last_mut() {
+        *last = height;
     }
-    (layout.len().max(1) as u32, joined)
+    Extent { height, lines: lines.max(1) as u32, ends, joined }
 }
 
 /// The tick in the box of a done task.
@@ -118,26 +369,78 @@ fn numbered(number: u32) -> String {
     format!("{number}.")
 }
 
-/// Lays a leaf out in full, with the sign its marker needs.
-pub(crate) fn lay(engine: &mut Engine, types: &Types, leaf: &Leaf, locale: Option<Language>) -> Laid {
-    let mut text = Layout::new();
-    shape(engine, types, leaf, locale, &mut text);
+/// Lays out the texts of a leaf: its own, and those of its cells, whose columns `aligns` align. Formulas are
+/// set in `color`.
+pub(crate) fn lay(
+    engine: &mut Engine,
+    types: &Types,
+    leaf: &Leaf,
+    aligns: &[Alignment],
+    color: Color,
+    locale: Option<Language>,
+    laid: &mut Laid,
+) {
+    if leaf.what != What::Row {
+        shape(engine, types, &Source::own(leaf, types, color), locale, &mut laid.text);
+    }
+    laid.cells.resize_with(leaf.cells.len(), Set::default);
+    for (index, (cell, set)) in leaf.cells.iter().zip(&mut laid.cells).enumerate() {
+        let align = aligns.get(index).copied().unwrap_or(Alignment::Start);
+        shape(engine, types, &Source::cell(leaf, cell, align, color), locale, set);
+    }
+}
+
+/// Adds to a leaf's layout what is drawn beside its text: the sign its marker needs, and the names on
+/// pictures that are still links.
+pub(crate) fn adorn(engine: &mut Engine, types: &Types, leaf: &Leaf, laid: &mut Laid) {
     let of = types.get(leaf.role);
-    let sign = match leaf.marker {
-        Marker::Number(number) => Some((numbered(number), Ink::Marker, of.size)),
-        Marker::Task(true) => Some((TICK.to_string(), Ink::OnAccent, theme::CHECKBOX * 0.8)),
-        _ => None,
-    };
-    let sign = sign.map(|(label, ink, size)| {
+    let mut small = |text: &str, ink: Ink, size: f32, width: Option<f32>| {
         let mut spec = of.spec(false, Brush { ink, back: None });
         (spec.size, spec.italic) = (size, false);
         let mut layout = Layout::new();
-        engine.build(&label, &[spec], &[(0, 0..label.len())], None, &mut layout);
-        layout.break_all_lines(None);
+        engine.build(text, &[spec], &[(0, 0..text.len())], None, &mut layout);
+        if width.is_some() {
+            layout.set_alignment(Alignment::Center, AlignmentOptions::default());
+        }
+        layout.break_all_lines(width);
         layout
-    });
-    Laid { text, sign }
+    };
+    laid.sign = match leaf.marker {
+        Marker::Number(number) => Some(small(&numbered(number), Ink::Marker, of.size, None)),
+        Marker::Task(true) => Some(small(TICK, Ink::OnAccent, theme::CHECKBOX * 0.8, None)),
+        _ => None,
+    };
+    laid.names.clear();
+    for (index, picture) in leaf.pictures.iter().enumerate() {
+        let room = picture.rect.width - 2.0 * theme::BADGE_INSET;
+        if picture.asset.is_none() && !picture.host.is_empty() && room > 0.0 {
+            laid.names.push((index, small(&picture.host, Ink::Marker, of.size, Some(room))));
+        }
+    }
 }
+
+/// Where the cloud sits on a picture that is still a link, when the picture has room for it.
+pub(crate) fn badge(frame: Rect) -> Option<Rect> {
+    let (side, inset) = (theme::BADGE, theme::BADGE_INSET);
+    let fits = frame.width >= side + 2.0 * inset && frame.height >= side + 2.0 * inset;
+    fits.then(|| Rect::new(frame.x + frame.width - inset - side, frame.y + inset, side, side))
+}
+
+/// The outline of a cloud, in a box of 16 units.
+static CLOUD: LazyLock<Arc<[PathEl]>> = LazyLock::new(|| {
+    let at = |(x, y): (f32, f32)| Point { x, y };
+    let curve = |a, b, end| PathEl::CurveTo(at(a), at(b), at(end));
+    Arc::new([
+        PathEl::MoveTo(at((4.5, 12.5))),
+        curve((2.8, 12.5), (1.5, 11.2), (1.5, 9.6)),
+        curve((1.5, 8.1), (2.6, 6.9), (4.1, 6.8)),
+        curve((4.6, 4.9), (6.3, 3.5), (8.3, 3.5)),
+        curve((10.6, 3.5), (12.4, 5.1), (12.7, 7.3)),
+        curve((13.8, 7.6), (14.5, 8.7), (14.5, 9.9)),
+        curve((14.5, 11.4), (13.4, 12.5), (12.0, 12.5)),
+        PathEl::Close,
+    ])
+});
 
 /// Glyphs of one style and one kind of token, gathered along a line.
 struct Stretch {
@@ -194,15 +497,41 @@ fn spell<'a>(item: &mut Item, clusters: &mut Peekable<impl Iterator<Item = Clust
     *text = spelt.text(source, glyphs.len());
 }
 
-/// What is drawn over a leaf's text without being part of it.
+/// What is drawn over a text without being part of it.
 pub(crate) struct Over<'a> {
-    /// The markers revealed in the leaf.
+    /// The markers revealed in the text.
     pub shifts: &'a Shifts,
     pub shapes: &'a Shapes,
     /// The text an input method is composing, which is underlined.
     pub composing: Option<Range<usize>>,
     /// The misspelled words, in order.
     pub spelling: &'a [Range<usize>],
+}
+
+/// One laid text of a leaf, and where it is.
+#[derive(Clone, Copy)]
+pub(crate) struct Text<'a> {
+    pub set: &'a Set,
+    pub source: &'a Words,
+    /// The text's top left on the page.
+    pub at: Point,
+    pub role: Role,
+}
+
+impl<'a> Text<'a> {
+    /// The text of a part of a leaf, when the part has one and the leaf holds its layout.
+    pub fn of(leaf: &'a Leaf, part: Part) -> Option<Self> {
+        let laid = leaf.laid.as_deref()?;
+        let (set, source, x, y) = match part {
+            Part::Text if leaf.what != What::Row => (&laid.text, &leaf.words, 0.0, leaf.lead),
+            Part::Cell(index) => {
+                let cell = leaf.cells.get(index)?;
+                (laid.cells.get(index)?, &cell.words, cell.x, theme::CELL_PAD_Y)
+            }
+            _ => return None,
+        };
+        Some(Self { set, source, at: Point { x: leaf.x + x, y: leaf.y + y }, role: leaf.role })
+    }
 }
 
 /// What painting draws with and into.
@@ -218,12 +547,14 @@ pub(crate) struct Painter<'a> {
 }
 
 impl Painter<'_> {
-    /// Emits the lines of a leaf that fall inside the band, with its box and marker. `tokens` colour the
-    /// text of a code block.
+    fn outside(&self, top: f32, bottom: f32) -> bool {
+        bottom <= self.band.0 || top >= self.band.1
+    }
+
+    /// Emits what a leaf shows apart from the text of its cells: its box, marker and pictures, and the lines
+    /// of its own text that fall inside the band. `tokens` colour the text of a code block.
     pub fn leaf(&mut self, leaf: &Leaf, laid: &Laid, tokens: Option<&[Token]>, over: &Over<'_>) {
-        let at = Point { x: leaf.x, y: leaf.y };
-        let palette = &self.inks.palette;
-        let (top, bottom) = self.band;
+        let palette = self.inks.palette;
         if leaf.boxed() {
             let rect = Rect::new(
                 leaf.x - leaf.pad,
@@ -236,9 +567,10 @@ impl Painter<'_> {
                 _ => Item::Fill { rect, color: palette.code, radius: theme::BOX_RADIUS },
             });
         }
-        if let Some(first) = laid.text.get(0)
-            && leaf.y + first.metrics().block_min_coord < bottom
-            && leaf.y + first.metrics().block_max_coord > top
+        self.pictures(leaf, laid);
+        let (true, Some(text)) = (leaf.worded(), Text::of(leaf, Part::Text)) else { return };
+        if let Some(first) = laid.text.layout.get(0)
+            && !self.outside(text.at.y + first.metrics().block_min_coord, text.at.y + first.metrics().block_max_coord)
         {
             let baseline = first.metrics().baseline;
             self.marker(leaf, laid, baseline);
@@ -250,9 +582,63 @@ impl Painter<'_> {
                 self.sign(shape, Point { x: right, y: leaf.y + baseline }, *level);
             }
         }
-        for (index, line) in laid.text.lines().enumerate() {
+        self.text(&text, tokens, over);
+    }
+
+    /// Emits the lines of one cell of a table row that fall inside the band.
+    pub fn cell(&mut self, leaf: &Leaf, index: usize, over: &Over<'_>) {
+        if let Some(text) = Text::of(leaf, Part::Cell(index)) {
+            self.text(&text, None, over);
+        }
+    }
+
+    /// Draws the line under a table row, which is heavier under the header.
+    pub fn rule(&mut self, leaf: &Leaf) {
+        let palette = &self.inks.palette;
+        let color = if leaf.header { palette.line_strong } else { palette.line };
+        let rect = Rect::new(leaf.x, leaf.y + leaf.height - theme::RULE, leaf.width, theme::RULE);
+        if !self.outside(rect.y, rect.y + rect.height) {
+            self.out.push(Item::Fill { rect, color, radius: 0.0 });
+        }
+    }
+
+    /// Draws the pictures of a figure or gallery. One that is still a link is a frame with the name of its
+    /// host and a cloud in the corner.
+    fn pictures(&mut self, leaf: &Leaf, laid: &Laid) {
+        let palette = self.inks.palette;
+        for (index, picture) in leaf.pictures.iter().enumerate() {
+            let at = picture.rect;
+            let rect = Rect::new(leaf.x + at.x, leaf.y + at.y, at.width, at.height);
+            if self.outside(rect.y, rect.y + rect.height) {
+                continue;
+            }
+            if let Some(asset) = &picture.asset {
+                self.out.push(Item::Image { rect, asset: asset.clone() });
+                continue;
+            }
+            self.out.push(Item::Fill { rect, color: palette.code, radius: theme::BOX_RADIUS });
+            self.out.push(Item::Stroke { rect, color: palette.line_strong, width: 1.0, radius: theme::BOX_RADIUS });
+            if let Some((_, name)) = laid.names.iter().find(|(at, _)| *at == index) {
+                let top = rect.y + ((rect.height - name.height()) / 2.0).round();
+                self.out.push(Item::PushClip { rect, radius: theme::BOX_RADIUS });
+                self.glyphs(name, &picture.host, Point { x: rect.x + theme::BADGE_INSET, y: top });
+                self.out.push(Item::PopClip);
+            }
+            if let Some(badge) = badge(rect) {
+                let (origin, scale) = (Point { x: badge.x, y: badge.y }, badge.width / 16.0);
+                let (path, color) = (CLOUD.clone(), palette.marker);
+                self.out.push(Item::Path { origin, scale, path, color, stroke: Some(1.25) });
+            }
+        }
+    }
+
+    /// Emits the lines of a text that fall inside the band, and what is drawn over them.
+    fn text(&mut self, text: &Text<'_>, tokens: Option<&[Token]>, over: &Over<'_>) {
+        let Text { set, at, .. } = *text;
+        let shown = set.shown(&text.source.text);
+        for (index, line) in set.layout.lines().enumerate() {
             let metrics = line.metrics();
-            if leaf.y + metrics.block_max_coord <= top || leaf.y + metrics.block_min_coord >= bottom {
+            if self.outside(at.y + metrics.block_min_coord, at.y + metrics.block_max_coord) {
                 continue;
             }
             let pushed = over.shifts.touches(index);
@@ -271,11 +657,19 @@ impl Painter<'_> {
                 self.out.push(Item::Fill { rect, color: self.inks.back(back), radius: theme::INLINE_RADIUS });
             }
             if let Some(tokens) = tokens {
-                self.tokens(&line, at, tokens, &leaf.text);
+                self.tokens(&line, at, tokens, shown);
             }
             let mut clusters = line.runs().flat_map(|run| run.visual_clusters()).peekable();
             for item in line.items() {
-                let PositionedLayoutItem::GlyphRun(run) = item else { continue };
+                let run = match item {
+                    PositionedLayoutItem::GlyphRun(run) => run,
+                    PositionedLayoutItem::InlineBox(inline) => {
+                        let push = over.shifts.push(index, inline.x);
+                        let origin = Point { x: at.x + inline.x + push, y: at.y + inline.y };
+                        self.formula(text, inline.id as usize, origin);
+                        continue;
+                    }
+                };
                 let style = run.style();
                 let color = self.inks.ink(style.brush.ink);
                 match (tokens, pushed) {
@@ -284,7 +678,7 @@ impl Painter<'_> {
                     (None, false) => {
                         let mut glyphs = self.engine.glyphs(&run, at, color);
                         if let (Some(item), true) = (&mut glyphs, self.spelt) {
-                            spell(item, &mut clusters, &leaf.text);
+                            spell(item, &mut clusters, shown);
                         }
                         self.out.items.extend(glyphs);
                     }
@@ -319,32 +713,44 @@ impl Painter<'_> {
                 .is_some_and(|composing| range.start <= composing.end && composing.start <= range.end)
         };
         for range in over.spelling.iter().filter(|range| !composed(range)) {
-            self.misspelled(leaf, laid, range, over.shifts);
+            self.misspelled(text, range, over.shifts);
         }
         if let Some(range) = &over.composing {
-            self.composing(leaf, laid, range, over.shifts);
+            self.composing(text, range, over.shifts);
+        }
+    }
+
+    /// Draws the formula of one of a text's swaps with the top left of its box at `origin`. The cache holds
+    /// it from when the text was shaped, unless the colours have changed since.
+    fn formula(&mut self, text: &Text<'_>, swap: usize, origin: Point) {
+        let Some(Swap { source, maths: Some((size, display)), .. }) = text.set.swaps.get(swap) else { return };
+        let Some(source) = text.source.text.get(source.clone()) else { return };
+        let color = self.inks.ink(Ink::Style(text.role));
+        let style = Maths { size: *size, color, display: *display, links: self.engine.links };
+        if let Ok(formula) = self.engine.maths.typeset(source, &style) {
+            formula.paint(origin, self.out);
         }
     }
 
     /// Draws a wavy line under a misspelled word.
-    fn misspelled(&mut self, leaf: &Leaf, laid: &Laid, range: &Range<usize>, shifts: &Shifts) {
-        let (of, color) = (self.types.get(leaf.role), self.inks.palette.spelling);
-        stretches(laid, range, shifts, |line, x, width| {
-            let Some(baseline) = laid.text.get(line).map(|line| line.metrics().baseline) else { return };
-            let y = (leaf.y + baseline + of.size * 0.16).round() + 0.5;
-            if y + theme::WAVE_SWING <= self.band.0 || y - theme::WAVE_SWING >= self.band.1 || width <= 0.0 {
+    fn misspelled(&mut self, text: &Text<'_>, range: &Range<usize>, shifts: &Shifts) {
+        let (of, color) = (self.types.get(text.role), self.inks.palette.spelling);
+        stretches(text.set, range, shifts, |line, part| {
+            let Some(baseline) = text.set.layout.get(line).map(|line| line.metrics().baseline) else { return };
+            let y = (text.at.y + baseline + of.size * 0.16).round() + 0.5;
+            if self.outside(y - theme::WAVE_SWING, y + theme::WAVE_SWING) || part.width <= 0.0 {
                 return;
             }
             // Whole waves, stretched a little to end where the word does.
-            let waves = (width / theme::WAVE).round().max(2.0);
-            let step = width / waves;
+            let waves = (part.width / theme::WAVE).round().max(2.0);
+            let step = part.width / waves;
             let mut path = vec![PathEl::MoveTo(Point { x: 0.0, y: 0.0 })];
             for wave in 0..waves as usize {
                 let swing = if wave % 2 == 0 { -2.0 * theme::WAVE_SWING } else { 2.0 * theme::WAVE_SWING };
                 let from = wave as f32 * step;
                 path.push(PathEl::QuadTo(Point { x: from + step / 2.0, y: swing }, Point { x: from + step, y: 0.0 }));
             }
-            let origin = Point { x: leaf.x + x, y };
+            let origin = Point { x: text.at.x + part.x, y };
             self.out.push(Item::Path { origin, scale: 1.0, path: path.into(), color, stroke: Some(1.0) });
         });
     }
@@ -386,16 +792,16 @@ impl Painter<'_> {
     }
 
     /// Underlines the text an input method is composing.
-    fn composing(&mut self, leaf: &Leaf, laid: &Laid, range: &Range<usize>, shifts: &Shifts) {
-        let of = self.types.get(leaf.role);
-        let (size, color) = ((of.size / 12.0).round().max(1.0), self.inks.ink(Ink::Style(leaf.role)));
-        stretches(laid, range, shifts, |line, x, width| {
-            let Some(baseline) = laid.text.get(line).map(|line| line.metrics().baseline) else { return };
-            let y = (leaf.y + baseline + of.size * 0.12).round();
-            if y + size <= self.band.0 || y >= self.band.1 {
+    fn composing(&mut self, text: &Text<'_>, range: &Range<usize>, shifts: &Shifts) {
+        let of = self.types.get(text.role);
+        let (size, color) = ((of.size / 12.0).round().max(1.0), self.inks.ink(Ink::Style(text.role)));
+        stretches(text.set, range, shifts, |line, part| {
+            let Some(baseline) = text.set.layout.get(line).map(|line| line.metrics().baseline) else { return };
+            let y = (text.at.y + baseline + of.size * 0.12).round();
+            if self.outside(y, y + size) {
                 return;
             }
-            self.out.push(Item::Fill { rect: Rect::new(leaf.x + x, y, width, size), color, radius: 0.0 });
+            self.out.push(Item::Fill { rect: Rect::new(text.at.x + part.x, y, part.width, size), color, radius: 0.0 });
         });
     }
 
@@ -496,92 +902,88 @@ impl Painter<'_> {
     }
 }
 
-/// The part of each line that a byte range covers: the line, where the part starts from the leaf's left edge,
-/// and its width. Markers on the line have pushed and widened it.
-pub(crate) fn stretches(laid: &Laid, range: &Range<usize>, shifts: &Shifts, mut each: impl FnMut(usize, f32, f32)) {
-    let layout = &laid.text;
-    let start = Cursor::from_byte_index(layout, range.start, Affinity::Downstream);
-    let end = Cursor::from_byte_index(layout, range.end, Affinity::Upstream);
+/// The part of each line that a byte range covers: the line, and the part's box from the text's top left.
+/// Markers on the line have pushed and widened it.
+pub(crate) fn stretches(set: &Set, range: &Range<usize>, shifts: &Shifts, mut each: impl FnMut(usize, Rect)) {
+    let layout = &set.layout;
+    let start = Cursor::from_byte_index(layout, set.inward(range.start), Affinity::Downstream);
+    let end = Cursor::from_byte_index(layout, set.inward(range.end), Affinity::Upstream);
     Span::new(start, end).geometry_with(layout, |area, line| {
         let (lead, wider) = shifts.spread(line, area.x0 as f32, area.x1 as f32);
-        each(line, area.x0 as f32 + lead, area.width() as f32 + wider);
+        let (width, height) = (area.width() as f32 + wider, area.height() as f32);
+        each(line, Rect::new(area.x0 as f32 + lead, area.y0 as f32, width, height));
     });
 }
 
-/// The byte offset nearest to a point given from the leaf's top left.
+/// The byte offset nearest to a point on the page.
 ///
 /// A [`letters_model::Pos`] has no affinity, and an offset at a wrap draws at the start of the next line. So a
 /// point past the end of a wrapped line lands before the space the line wraps at, never after it.
-pub(crate) fn hit(laid: &Laid, shifts: &Shifts, x: f32, y: f32) -> usize {
-    let x = if shifts.is_empty() { x } else { shifts.pull(line_at(laid, y), x) };
-    let cursor = Cursor::from_point(&laid.text, x, y);
+pub(crate) fn hit(text: &Text<'_>, shifts: &Shifts, point: Point) -> usize {
+    let (layout, x, y) = (&text.set.layout, point.x - text.at.x, point.y - text.at.y);
+    let x = if shifts.is_empty() { x } else { shifts.pull(line_at(layout, y), x) };
+    let cursor = Cursor::from_point(layout, x, y);
     if cursor.affinity() == Affinity::Upstream
-        && cursor.index() < laid.text.text_len()
-        && let Some(last) = cursor.upstream_cluster(&laid.text)
+        && cursor.index() < layout.text_len()
+        && let Some(last) = cursor.upstream_cluster(layout)
         && last.is_soft_line_break()
     {
-        return last.text_range().start;
+        return text.set.outward(last.text_range().start);
     }
-    cursor.index()
+    text.set.outward(cursor.index())
 }
 
-/// The line at a height given from the leaf's top, or the nearest one.
-fn line_at(laid: &Laid, y: f32) -> usize {
-    let line = laid.text.lines().position(|line| y < line.metrics().block_max_coord);
-    line.unwrap_or(laid.text.len().saturating_sub(1))
+/// The line at a height given from the text's top, or the nearest one.
+fn line_at(layout: &Layout<Brush>, y: f32) -> usize {
+    let line = layout.lines().position(|line| y < line.metrics().block_max_coord);
+    line.unwrap_or(layout.len().saturating_sub(1))
 }
 
-/// The line a byte offset is on and where along it, from the layout's left edge. The affinity decides which
+/// The line a byte offset is on and where along it, from the text's left edge. The affinity decides which
 /// line an offset at a wrap belongs to.
-pub(crate) fn spot(layout: &Layout<Brush>, offset: usize, affinity: Affinity) -> (usize, f32) {
-    let at = Cursor::from_byte_index(layout, offset, affinity).geometry(layout, 0.0);
+pub(crate) fn spot(set: &Set, offset: usize, affinity: Affinity) -> (usize, f32) {
+    let layout = &set.layout;
+    let at = Cursor::from_byte_index(layout, set.inward(offset), affinity).geometry(layout, 0.0);
     let middle = ((at.y0 + at.y1) / 2.0) as f32;
     let line = layout.lines().position(|line| middle < line.metrics().block_max_coord);
     (line.unwrap_or(layout.len().saturating_sub(1)), at.x0 as f32)
 }
 
 /// The line holding a byte offset.
-pub(crate) fn line_of(laid: &Laid, offset: usize) -> usize {
-    spot(&laid.text, offset, Affinity::Downstream).0
+pub(crate) fn line_of(set: &Set, offset: usize) -> usize {
+    spot(set, offset, Affinity::Downstream).0
 }
 
-/// The byte offset on a line nearest to `x`, given from the leaf's left edge.
-pub(crate) fn on_line(laid: &Laid, shifts: &Shifts, line: usize, x: f32) -> usize {
-    let Some(line) = laid.text.get(line) else { return 0 };
+/// The byte offset on a line nearest to `x` on the page.
+pub(crate) fn on_line(text: &Text<'_>, shifts: &Shifts, line: usize, x: f32) -> usize {
+    let Some(line) = text.set.layout.get(line) else { return 0 };
     let metrics = line.metrics();
-    hit(laid, shifts, x, (metrics.block_min_coord + metrics.block_max_coord) / 2.0)
+    let y = text.at.y + (metrics.block_min_coord + metrics.block_max_coord) / 2.0;
+    hit(text, shifts, Point { x, y })
 }
 
-/// Where a caret at a byte offset is drawn, in page coordinates. It spans the line's text, not its leading.
-pub(crate) fn caret(leaf: &Leaf, laid: &Laid, shifts: &Shifts, offset: usize) -> Rect {
-    let at = Cursor::from_byte_index(&laid.text, offset, Affinity::Downstream).geometry(&laid.text, theme::CARET);
+/// Where a caret at a byte offset is drawn on the page. It spans the line's text, not its leading.
+pub(crate) fn caret(text: &Text<'_>, shifts: &Shifts, offset: usize) -> Rect {
+    let layout = &text.set.layout;
+    let at = Cursor::from_byte_index(layout, text.set.inward(offset), Affinity::Downstream);
+    let at = at.geometry(layout, theme::CARET);
     let (mut top, mut bottom) = (at.y0 as f32, at.y1 as f32);
-    let line = line_of(laid, offset);
-    if let Some(line) = laid.text.get(line) {
+    let line = line_of(text.set, offset);
+    if let Some(line) = layout.get(line) {
         let metrics = line.metrics();
         (top, bottom) = (metrics.content_block_min_coord, metrics.content_block_max_coord);
     }
-    Rect::new(leaf.x + at.x0 as f32 + shifts.caret(line, offset), leaf.y + top, theme::CARET, bottom - top)
+    let x = text.at.x + at.x0 as f32 + shifts.caret(line, offset);
+    Rect::new(x, text.at.y + top, theme::CARET, bottom - top)
 }
 
-/// Adds the rectangles that highlight a byte range, in page coordinates. `newline` also shows the block's end
-/// as selected, for a selection that runs on into the next block.
-pub(crate) fn selection(
-    leaf: &Leaf,
-    laid: &Laid,
-    shifts: &Shifts,
-    range: Range<usize>,
-    newline: bool,
-    out: &mut Vec<Rect>,
-) {
-    let layout = &laid.text;
+/// Adds the rectangles that highlight a byte range, on the page. `newline` also shows the text's end as
+/// selected, for a selection that runs on past it.
+pub(crate) fn selection(text: &Text<'_>, shifts: &Shifts, range: Range<usize>, newline: bool, out: &mut Vec<Rect>) {
+    let (layout, origin) = (&text.set.layout, text.at);
     let first = out.len();
-    let start = Cursor::from_byte_index(layout, range.start, Affinity::Downstream);
-    let end = Cursor::from_byte_index(layout, range.end, Affinity::Upstream);
-    Span::new(start, end).geometry_with(layout, |area, line| {
-        let (lead, wider) = shifts.spread(line, area.x0 as f32, area.x1 as f32);
-        let (x, y) = (leaf.x + area.x0 as f32 + lead, leaf.y + area.y0 as f32);
-        out.push(Rect::new(x, y, area.width() as f32 + wider, area.height() as f32));
+    stretches(text.set, &range, shifts, |_, part| {
+        out.push(Rect { x: origin.x + part.x, y: origin.y + part.y, ..part });
     });
     if !newline {
         return;
@@ -590,10 +992,38 @@ pub(crate) fn selection(
     let metrics = line.metrics();
     let end = Cursor::from_byte_index(layout, layout.text_len(), Affinity::Downstream).geometry(layout, 0.0);
     let push = shifts.push(layout.len().saturating_sub(1), end.x0 as f32);
-    let (x, y) = (leaf.x + end.x0 as f32 + push, leaf.y + metrics.block_min_coord);
+    let (x, y) = (origin.x + end.x0 as f32 + push, origin.y + metrics.block_min_coord);
     let width = (metrics.line_height * theme::NEWLINE).round();
     match out[first..].last_mut() {
         Some(last) if last.y == y && (last.x + last.width - x).abs() < 0.5 => last.width += width,
         _ => out.push(Rect::new(x, y, width, metrics.block_max_coord - metrics.block_min_coord)),
     }
+}
+
+/// Where the formula at a byte offset is drawn on the page: the one the offset is in, or beside. A source
+/// that could not be typeset has the place of its text.
+pub(crate) fn formula_at(text: &Text<'_>, shifts: &Shifts, offset: usize) -> Option<Rect> {
+    let (set, origin) = (text.set, text.at);
+    let holds = |swap: &Swap| swap.maths.is_some() && (swap.source.start..=swap.source.end).contains(&offset);
+    if let Some(swap) = set.swaps.iter().position(holds) {
+        for (index, line) in set.layout.lines().enumerate() {
+            for item in line.items() {
+                let PositionedLayoutItem::InlineBox(inline) = item else { continue };
+                if inline.id as usize == swap {
+                    let x = origin.x + inline.x + shifts.push(index, inline.x);
+                    return Some(Rect::new(x, origin.y + inline.y, inline.width, inline.height));
+                }
+            }
+        }
+    }
+    let source = text.source.formula(offset)?;
+    let mut all: Option<Rect> = None;
+    stretches(set, &source, shifts, |_, part| {
+        let (x, y) = (origin.x + part.x, origin.y + part.y);
+        let (left, top) = all.map_or((x, y), |all| (all.x.min(x), all.y.min(y)));
+        let right = all.map_or(x + part.width, |all| (all.x + all.width).max(x + part.width));
+        let bottom = all.map_or(y + part.height, |all| (all.y + all.height).max(y + part.height));
+        all = Some(Rect::new(left, top, right - left, bottom - top));
+    });
+    all
 }
