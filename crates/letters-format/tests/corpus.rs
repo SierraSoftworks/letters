@@ -2,7 +2,8 @@
 //!
 //! Each kind has canonical files, which Letters writes byte for byte, an `accepted.json` of looser forms every
 //! reader must take, and a `refused.json` of breaks every reader must refuse. `report.let` is a whole file built
-//! from the canonical ones.
+//! from the canonical ones. After changing one of them, rebuild it with
+//! `cargo test -p letters-format --test corpus -- --ignored`.
 
 mod common;
 
@@ -123,9 +124,24 @@ fn breaks_are_refused_by_schema_and_reader() {
     }
 }
 
+fn sample() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/report.let")
+}
+
+#[test]
+#[ignore = "rewrites corpus/report.let from the canonical entries"]
+fn rebuild_the_sample_file() {
+    let mut package = common::open(&std::fs::read(sample()).unwrap()).package().unwrap();
+    for kind in KINDS {
+        package.entries.insert(format!("{}.json", kind.name), report(&kind).into_bytes());
+    }
+    package.document = Document::from_json(&report(&KINDS[0])).unwrap();
+    std::fs::write(sample(), common::bytes(&package)).unwrap();
+}
+
 #[test]
 fn the_sample_file_holds_the_canonical_entries() {
-    let file = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/report.let")).unwrap();
+    let file = std::fs::read(sample()).unwrap();
     let mut archive = common::open(&file);
     for kind in KINDS {
         let entry = archive.read(&format!("{}.json", kind.name)).unwrap().unwrap();
