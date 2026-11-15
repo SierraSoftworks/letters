@@ -1115,6 +1115,16 @@ impl EditorApp {
             self.palette.selection = resolve(fade(self.accent.base, 0.3), self.scheme, 1.0);
         }
         self.layout.set_palette(self.palette);
+        self.light();
+    }
+
+    /// Lights the term the caret is at in the formula it is written in, in the accent as text: what the
+    /// sheet's caret stands at in the source is seen in the formula over it.
+    fn light(&mut self) {
+        let written = self.editor.formula().is_some();
+        let caret = self.editor.selection().filter(|selection| written && selection.is_caret());
+        let lit = resolve(self.accent.text, self.scheme, 1.0);
+        self.layout.tint_term(caret.map(|caret| (&caret.head, lit)));
     }
 
     /// The first Heading 1, which names a document that has no name of its own.
@@ -2377,6 +2387,7 @@ impl EditorApp {
         self.layout.set_composition(self.editor.composition());
         let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
         self.spelling.moved(caret, &mut self.layout);
+        self.light();
         // A document without a name takes its first Heading 1, once the caret has left it.
         let heading = self.heading().filter(|_| self.location.name.is_none());
         let naming = heading.zip(head.as_ref()).is_some_and(|(heading, head)| heading.id == head.block);

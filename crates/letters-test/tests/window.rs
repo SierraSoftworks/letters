@@ -8,7 +8,7 @@ use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
 use letters_ui::{
     Chrome, Cursor, Edge, Folder, Frame, Landing, Location, PictureState, Recent, Request, SafeMode, SaveState,
-    WindowButton,
+    Settings, WindowButton,
 };
 
 fn text(id: &str, kind: BlockKind, text: &str) -> Block {
@@ -2042,6 +2042,52 @@ fn the_sheet_goes_when_the_caret_leaves_its_formula() {
         assert_eq!(window.editor().formula(), None, "{way}");
         assert_eq!(window.markdown(), before, "{way}: the document is as it was");
     }
+}
+
+/// Where each run of glyphs of the page is drawn and in what colour, without what a formula's sheet shows.
+fn runs(window: &mut Harness) -> Vec<(Point, Color)> {
+    let (page, sheet) = (page(window), sheet(window).map(|sheet| sheet.bounds));
+    let on_page = |at: Point| page.contains(at) && !sheet.is_some_and(|sheet| sheet.contains(at));
+    let run = |item: &Item| match item {
+        Item::Glyphs { origin, color, .. } if on_page(*origin) => Some((*origin, *color)),
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(run).collect()
+}
+
+#[test]
+fn the_term_under_the_caret_is_tinted_in_its_formula() {
+    const GREEN: [u8; 3] = [0x1f, 0x8a, 0x5b];
+    let mut window = formulas();
+    let plain: Vec<Color> = runs(&mut window).into_iter().map(|(_, ink)| ink).collect();
+    // The runs drawn in a colour the page does not have while the caret is out of every formula.
+    let tinted =
+        |window: &mut Harness| runs(window).into_iter().filter(|(_, ink)| !plain.contains(ink)).collect::<Vec<_>>();
+    assert_eq!(tinted(&mut window), [], "the caret is past the formula it closed");
+
+    // In `c = a + b`, the caret after the `b` and then after the `a`.
+    window.key("Left");
+    let last = tinted(&mut window);
+    (0..4).for_each(|_| _ = window.key("Left"));
+    let first = tinted(&mut window);
+    assert_eq!((first.len(), last.len()), (1, 1), "one term is tinted: {first:?} and {last:?}");
+    assert_ne!(first[0].0, last[0].0, "the one the caret is at");
+
+    // The tint follows what is written, and is the person's accent.
+    window.type_text("x");
+    let written = tinted(&mut window);
+    assert_eq!(written.len(), 1, "{written:?}");
+    assert_ne!(written[0].0, first[0].0, "the letter just written");
+    window.ui().set_settings(Settings { accent: Some(GREEN), ..Settings::default() });
+    let theirs = tinted(&mut window);
+    assert_eq!(theirs.len(), 1, "{theirs:?}");
+    assert_ne!(theirs[0].1, written[0].1, "in the accent the person set");
+
+    // Nothing is tinted for a passage selected in the formula, nor once the caret has left it.
+    window.key("Shift+Left");
+    assert_eq!(tinted(&mut window), [], "a passage is selected");
+    window.ui().select(Selection::caret(Pos::new("p2", 4)));
+    assert_eq!(tinted(&mut window), [], "the caret is in a paragraph");
 }
 
 #[test]
