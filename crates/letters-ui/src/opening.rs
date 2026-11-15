@@ -200,6 +200,19 @@ pub enum Request {
     /// Answer with `Window::set_access_log` and the server's rows, newest first, or with
     /// `Window::refuse_share`.
     AccessLog,
+    /// Sign in to the server at this address, as the person typed it, through the system's browser. Say
+    /// how far it has come with `Window::set_sign_in`. Once it is done, say who is signed in where with
+    /// `Window::set_servers`, and then that no sign-in is under way with `Window::set_sign_in(None)`.
+    SignIn {
+        server: String,
+    },
+    /// Give up the sign-in that is under way.
+    CancelSignIn,
+    /// Sign out of the server at this [`Server::address`](crate::Server::address), and say who is then
+    /// signed in where with `Window::set_servers`.
+    SignOut {
+        server: String,
+    },
 }
 
 /// A document opened lately, as the landing card lists it.

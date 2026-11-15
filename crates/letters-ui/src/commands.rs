@@ -90,6 +90,8 @@ pub(crate) enum Act {
     /// Opens the card that saves a copy, set to a copy without the history and the notes.
     CleanCopy,
     Share,
+    /// Shows the servers the person is signed in to, and the way to sign in to another.
+    Servers,
     Settings,
     /// Shows where the paper and the margins are set.
     PageSetup,
@@ -164,7 +166,7 @@ const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> E
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 99] = [
+pub(crate) static ENTRIES: [Entry; 100] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -258,6 +260,7 @@ pub(crate) static ENTRIES: [Entry; 99] = [
     entry("Document", "Export clean copy", "history comments notes strip private", Act::CleanCopy),
     entry("Document", "Share", "", Act::Share),
     entry("Document", "Page setup", "paper margins orientation size landscape portrait", Act::PageSetup),
+    entry("Document", "Servers", "sign in out account connect log", Act::Servers),
     entry("Document", "Settings", "preferences appearance accent", Act::Settings),
     entry("Document", "Trust this document", "safe mode", Act::TrustDocument),
     entry("Document", "Trust this folder", "safe mode", Act::TrustFolder),

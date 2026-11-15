@@ -61,6 +61,7 @@ use crate::renaming::{Outcome, Rename, Renaming};
 use crate::restyle::{self, Field, StyleEdit};
 use crate::review::{self, Review, Reviewing, Shown};
 use crate::safe::{self, Safe, SafeMode, Safely};
+use crate::servers::{Server, Servers, SignIn, Signing};
 use crate::settings::{Dialog, Setting, Settings};
 use crate::sharing::{Share, Shared, Sharing};
 use crate::spelling::Spelling;
@@ -197,6 +198,8 @@ pub enum Message {
     ClosePanel,
     /// Something the Share dialog asks.
     Sharing(Sharing),
+    /// Something the Servers dialog asks.
+    Servers(Signing),
     /// Brings the page to where someone else who has the document open is, by their session.
     Visit(u64),
     /// Puts the caret at the start of a block and brings the block to the top of the page.
@@ -574,6 +577,20 @@ impl Ui<EditorApp> {
     /// It answers [`Request::AccessLog`], and the Share dialog's Activity tab lists them by day.
     pub fn set_access_log(&mut self, log: Vec<letters_api::Access>) {
         self.app_mut().share.logged(log);
+    }
+
+    /// Says where the person is signed in: see [`Server`]. A shell that signs in to servers says it once
+    /// at the start, with none if there are none, and whenever it changes. The Servers dialog, which the
+    /// window offers from then on, lists them and asks [`Request::SignIn`] and [`Request::SignOut`].
+    pub fn set_servers(&mut self, servers: Vec<Server>) {
+        self.app_mut().servers.listed(servers);
+    }
+
+    /// Says how far a sign-in has come: see [`SignIn`]. `None` says that none is under way any more: it is
+    /// done, or was given up. One the person did not begin in the Servers dialog, as for a session that
+    /// ended, brings the dialog out while it lasts.
+    pub fn set_sign_in(&mut self, state: Option<SignIn>) {
+        self.app_mut().servers.told(state);
     }
 
     /// Says what the person may take away of the document: see [`Allows`]. A shell says it of a document
@@ -1153,6 +1170,7 @@ pub struct EditorApp {
     edits: u64,
     panel: Option<Panel>,
     share: Share,
+    servers: Servers,
     /// The address in the link editor while it is open.
     link: Option<String>,
     /// What is typed into one of the style's fields, and the element type it was typed for.
@@ -1268,6 +1286,7 @@ impl EditorApp {
             edits: 0,
             panel: None,
             share: Share::default(),
+            servers: Servers::default(),
             link: None,
             draft: None,
             styles: Styles::default(),
@@ -2047,7 +2066,7 @@ impl EditorApp {
         let reads = match act {
             Act::Run(_) | Act::Load | Act::AlwaysLoad | Act::Panel(Panel::Notes) | Act::Review(_) => true,
             Act::NewDocument | Act::Open | Act::SaveCopy | Act::Export | Act::CleanCopy => true,
-            Act::Settings | Act::TrustDocument | Act::TrustFolder | Act::Print => true,
+            Act::Settings | Act::Servers | Act::TrustDocument | Act::TrustFolder | Act::Print => true,
             Act::Find | Act::FindStep { .. } | Act::Palette => true,
             Act::Comment => !self.margin.reads,
             Act::MoveRow { .. } | Act::MoveColumn { .. } | Act::Link | Act::Pictures | Act::Preview => false,
@@ -2121,6 +2140,8 @@ impl EditorApp {
             Act::Export => Message::Copy(Copying::Open(CopyFormat::Pdf)),
             Act::CleanCopy => Message::Copy(Copying::Open(CopyFormat::Clean)),
             Act::Share => Message::Sharing(Sharing::Open),
+            // Only where the shell signs in to servers.
+            Act::Servers => self.servers.offered().then_some(Message::Servers(Signing::Show))?,
             Act::Settings => Message::Settings(Setting::Show),
             Act::PageSetup => Message::Styles(Styling::PageSetup),
             Act::TrustDocument => self.safe.on().then_some(Message::Safe(Safely::TrustDocument))?,
@@ -2263,6 +2284,7 @@ impl EditorApp {
                 // What hangs from the page waits there for the way back. What lies over the window goes.
                 self.commands.close();
                 self.share.close();
+                self.servers.close();
                 if self.grip.release() {
                     self.drop = None;
                 }
@@ -2468,6 +2490,7 @@ impl EditorApp {
                 // What hangs from the page waits there for the way back. What lies over the window goes.
                 self.commands.close();
                 self.share.close();
+                self.servers.close();
                 if self.grip.release() {
                     self.drop = None;
                 }
@@ -2571,6 +2594,14 @@ impl EditorApp {
     /// each with what it asks.
     fn offers(&self) -> Vec<(&'static Entry, Message)> {
         self.commands.matching().filter_map(|entry| Some((entry, self.asked(&entry.act)?))).collect()
+    }
+
+    /// Puts away the dialogs that lie over the middle of the window. A key or a command can ask for one
+    /// while another is out, and the one asked for takes its place.
+    fn undialog(&mut self) {
+        self.dialog.update(Setting::Close, &mut self.settings);
+        self.share.close();
+        self.servers.close();
     }
 
     /// Does what the command palette asked. A command that is taken is done as if its key were pressed.
@@ -4523,9 +4554,11 @@ impl EditorApp {
         // The page is set up by someone who writes on it.
         let setup = MenuItem::new("Page setup").icon(icon::FILE_TEXT).on_select(Message::Styles(Styling::PageSetup));
         let more = if self.writes() { more.item(setup) } else { more };
-        let more = more
-            .separator()
-            .item(MenuItem::new("Settings").icon(icon::SETTINGS).on_select(Message::Settings(Setting::Show)));
+        let more = more.separator();
+        let servers = MenuItem::new("Servers").icon(icon::CLOUD).on_select(Message::Servers(Signing::Show));
+        let more = if self.servers.offered() { more.item(servers) } else { more };
+        let more =
+            more.item(MenuItem::new("Settings").icon(icon::SETTINGS).on_select(Message::Settings(Setting::Show)));
 
         // The forms of the bar, from the widest. Once the layout has said which fits, only that one is built.
         let forms = [
@@ -5244,8 +5277,17 @@ impl EditorApp {
             }
             Message::ClosePanel => self.show(None),
             Message::Sharing(asked) => {
+                if asked == Sharing::Open {
+                    self.undialog();
+                }
                 let served = (self.connection.is_some(), self.zone);
                 self.share.update(asked, served, platform, &mut self.requests);
+            }
+            Message::Servers(asked) => {
+                if asked == Signing::Show {
+                    self.undialog();
+                }
+                self.servers.update(asked, platform, &mut self.requests);
             }
             Message::Visit(session) => self.visit(session),
             Message::Correct(text) => {
@@ -5307,6 +5349,9 @@ impl EditorApp {
                 self.edit(platform, |editor, platform| editor.run(Command::DismissReference, platform));
             }
             Message::Settings(message) => {
+                if matches!(message, Setting::Show) {
+                    self.undialog();
+                }
                 if self.dialog.update(message, &mut self.settings) {
                     self.tint();
                     self.requests.push(Request::Settings(self.settings.clone()));
@@ -5458,6 +5503,7 @@ impl App for EditorApp {
         let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
         let over = over.chain(self.merges.card());
         let over = over.chain(self.share.view(&self.name().0, self.connection.is_some(), window.height));
+        let over = over.chain(self.servers.view());
         let commands = self.commands.open().then(|| {
             let (offers, keymap) = (self.offers(), self.editor.keymap());
             self.commands.view(&offers, keymap, self.mac, bar, window)
