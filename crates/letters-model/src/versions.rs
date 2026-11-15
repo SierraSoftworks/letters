@@ -6,7 +6,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use loro::{ContainerTrait, Frontiers, ID, JsonOpContent, JsonTextOp, LoroDoc, ValueOrContainer, VersionVector};
+use loro::{
+    ChangeMeta, ContainerTrait, Frontiers, ID, JsonOpContent, JsonTextOp, LoroDoc, ValueOrContainer, VersionVector,
+};
 use serde_json::{Map, Value};
 
 use crate::flat::MARKER;
@@ -91,24 +93,13 @@ pub struct Tag {
 /// replica, which every device does alike, and which never lists a step before one it was written on.
 pub(crate) fn timeline(loro: &LoroDoc) -> Vec<Point> {
     let names = crdt::names(loro);
-    let mut changes = Vec::new();
-    for (peer, end) in loro.oplog_vv().iter() {
-        let mut counter = 0;
-        while counter < *end {
-            let Some(change) = loro.get_change(ID::new(*peer, counter)) else { break };
-            counter = change.id.counter + i32::try_from(change.len.max(1)).unwrap_or(i32::MAX);
-            changes.push(change);
-        }
-    }
-    changes.sort_by_key(|change| (change.lamport, change.id.peer));
     let mut heads = Frontiers::default();
     let mut points: Vec<Point> = Vec::new();
     // Where each replica's changes start, with the step that is the first to hold each.
     let mut steps: HashMap<u64, Vec<(i32, usize)>> = HashMap::new();
-    for change in changes {
+    for change in changes(loro) {
         let before = heads.clone();
-        let last = ID::new(change.id.peer, change.id.counter + i32::try_from(change.len.max(1) - 1).unwrap_or(0));
-        heads.update_frontiers_on_new_change(last, &change.deps);
+        heads.update_frontiers_on_new_change(last(&change), &change.deps);
         let marking = change.message.as_deref() == Some(MARKING);
         // A change that only marks a version is no step, and goes with the step before it.
         let step = if marking { points.len().saturating_sub(1) } else { points.len() };
@@ -143,6 +134,40 @@ pub(crate) fn timeline(loro: &LoroDoc) -> Vec<Point> {
         }
     }
     points
+}
+
+/// The revisions either side of each step, as [`timeline`] lists them: all a reader of old revisions
+/// needs of it.
+pub(crate) fn revisions(loro: &LoroDoc) -> Vec<(Frontiers, Frontiers)> {
+    let (mut heads, mut steps) = (Frontiers::default(), Vec::new());
+    for change in changes(loro) {
+        let before = heads.clone();
+        heads.update_frontiers_on_new_change(last(&change), &change.deps);
+        if change.message.as_deref() != Some(MARKING) {
+            steps.push((before, heads.clone()));
+        }
+    }
+    steps
+}
+
+/// The changes of a history in the order every device lists them.
+fn changes(loro: &LoroDoc) -> Vec<ChangeMeta> {
+    let mut changes = Vec::new();
+    for (peer, end) in loro.oplog_vv().iter() {
+        let mut counter = 0;
+        while counter < *end {
+            let Some(change) = loro.get_change(ID::new(*peer, counter)) else { break };
+            counter = change.id.counter + i32::try_from(change.len.max(1)).unwrap_or(i32::MAX);
+            changes.push(change);
+        }
+    }
+    changes.sort_by_key(|change| (change.lamport, change.id.peer));
+    changes
+}
+
+/// The last edit of a change.
+fn last(change: &ChangeMeta) -> ID {
+    ID::new(change.id.peer, change.id.counter + i32::try_from(change.len.max(1) - 1).unwrap_or(0))
 }
 
 /// Counts the characters of text each step put in and took out. `step` tells the step that holds an edit.

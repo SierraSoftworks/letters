@@ -23,6 +23,8 @@ use crate::undo::{Delta, Edit, Script, Step, Steps, is_skip};
 use crate::versions::{self, Point, Tag, TagKind};
 use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Mark, Page, Pos, Properties, Run, Style, TextStyle};
 
+mod reader;
+
 /// One change to a document. Offsets are UTF-8 bytes into a text block and must sit on character boundaries.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
@@ -259,6 +261,11 @@ pub struct Model {
     /// Made when a block is first looked up by id, and again after blocks come, go, move or are renamed.
     lookup: OnceLock<Lookup>,
     pen: Pen,
+    /// Made when an older revision is first read, for the history view to step through them.
+    reader: Option<Box<reader::Reader>>,
+    /// While set, the changes that take back what the document followed, newest last. A reader keeps
+    /// them as the way back over a step. `None` again once a change did not fit.
+    kept: Option<Vec<Delta>>,
 }
 
 impl fmt::Debug for Model {
@@ -297,7 +304,7 @@ impl Model {
         crdt::normal_meta(&mut doc);
         let (index, style, lookup) = (built.index, Style::default(), OnceLock::new());
         let (history, steps, pen) = (OnceLock::new(), Steps::default(), Pen::default());
-        Self { doc, index, style, styled: false, replica, history, steps, lookup, pen }
+        Self { doc, index, style, styled: false, replica, history, steps, lookup, pen, reader: None, kept: None }
     }
 
     /// The model with the style its file holds, for one that was just made.
@@ -317,11 +324,16 @@ impl Model {
         let loro = LoroDoc::new();
         crdt::configure(&loro);
         loro.import(history).map_err(unreadable)?;
-        let history = History::open(loro, replica);
+        Ok(Self::of(History::open(loro, replica), replica))
+    }
+
+    /// The model of a history, showing the revision the history shows.
+    fn of(history: History, replica: ReplicaId) -> Self {
         let (doc, index) = crdt::read(&history.loro, &history.body);
         let style = crdt::read_style(&history.loro);
         let (history, steps, lookup) = (OnceLock::from(history), Steps::default(), OnceLock::new());
-        Ok(Self { doc, index, style, styled: true, replica, history, steps, lookup, pen: Pen::default() })
+        let (pen, styled) = (Pen::default(), true);
+        Self { doc, index, style, styled, replica, history, steps, lookup, pen, reader: None, kept: None }
     }
 
     /// A second replica at the newest revision, for another writer. It starts with no undo steps.
@@ -332,7 +344,8 @@ impl Model {
             None => {
                 let (doc, index, style) = (self.doc.clone(), self.index.clone(), self.style.clone());
                 let (history, steps, lookup) = (OnceLock::new(), Steps::default(), self.lookup.clone());
-                Self { doc, index, style, styled: self.styled, replica, history, steps, lookup, pen: Pen::default() }
+                let (pen, styled) = (Pen::default(), self.styled);
+                Self { doc, index, style, styled, replica, history, steps, lookup, pen, reader: None, kept: None }
             }
         }
     }
@@ -381,6 +394,7 @@ impl Model {
         // Whatever replica the history was prepared for, this model's is the one that writes.
         let _ = history.loro.set_peer_id(self.replica.0);
         self.history = OnceLock::from(history);
+        self.reader = None;
         self.pen.signed = false;
         let shown = mem::replace(&mut self.doc, theirs.doc);
         let layout = mem::replace(&mut self.index, theirs.index);
@@ -552,6 +566,7 @@ impl Model {
         if self.loro().is_detached() {
             return Err(OpError::ReadOnly);
         }
+        self.tire();
         let mut ops: Vec<Op> = ops.into_iter().collect();
         let mut copies = Copies::of(self, &mut ops);
         // The document's own fields and the style are changed on copies, made when an op first needs
@@ -938,11 +953,18 @@ impl Model {
     /// The document and its style as they were at `revision`, read without leaving the revision shown,
     /// and with the undo steps kept. Fails with [`HistoryError::UnknownRevision`] for a revision the
     /// history lacks.
+    ///
+    /// The first read of an older revision walks the whole history once. After that, a revision either
+    /// side of a step of the [timeline](Model::timeline) costs what differs from the last one read, and
+    /// the copy of the document. Any other revision costs a pass over the history each time.
     pub fn document_at(&mut self, revision: &Revision) -> Result<(Document, Style), HistoryError> {
         if *revision == self.revision() {
             return Ok((self.doc.clone(), self.style.clone()));
         }
-        self.read_at(revision).map(|(doc, _, style)| (doc, style))
+        match self.reads(revision) {
+            Some(read) => Ok(read),
+            None => self.read_at(revision).map(|(doc, _, style)| (doc, style)),
+        }
     }
 
     fn read_at(&self, revision: &Revision) -> Result<(Document, Vec<Entry>, Style), HistoryError> {
@@ -1114,6 +1136,7 @@ impl Model {
             // Each was told against the sequence as it then stood, which only the last still is.
             _ => {
                 self.steps.clear();
+                self.kept = None;
                 change.absorb(self.resync());
             }
         }
@@ -1128,12 +1151,17 @@ impl Model {
         }
         let (changed, undo) = self.shift(delta, None);
         change.absorb(changed);
-        match undo {
+        match &undo {
             // The undo steps were made for the sequence as it was before this.
             Some(_) => self.steps.rebase(delta),
             None => self.steps.clear(),
         }
-        undo.is_some()
+        let fits = undo.is_some();
+        self.kept = self.kept.take().zip(undo).map(|(mut kept, undo)| {
+            kept.push(undo);
+            kept
+        });
+        fits
     }
 
     /// Reads the whole document from the history again.

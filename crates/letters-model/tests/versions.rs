@@ -99,6 +99,46 @@ fn a_version_is_read_without_leaving_the_one_shown() {
     assert_eq!((shown(&model), model.revision(), model.is_latest()), (first, start, false));
 }
 
+#[test]
+fn versions_read_as_they_were_written_in_whatever_order() {
+    let (mut ana, mut ben) = writers();
+    ben.apply([typed("p", 0, "Oh. ")]).unwrap();
+    let hours: Vec<Vec<Op>> = vec![
+        vec![typed("p", 11, "!")],
+        vec![split("p", 5, "p2"), typed("p2", 0, "wide")],
+        vec![Op::RemoveBlock { block: id("d") }, Op::DeleteText { block: id("p"), range: 0..2 }],
+        vec![italic_asides(), Op::SetLanguage { language: "fr".into() }],
+    ];
+    let mut written = vec![(ana.revision(), shown(&ana))];
+    for (hour, ops) in (1..).zip(hours) {
+        // Another writer's work comes in between, and so does a mark on a version.
+        match hour {
+            2 => drop(ana.merge(&ben.save()).unwrap()),
+            3 => ana.tag(&written[1].0, TagKind::Named, Some("First draft")).unwrap(),
+            _ => {}
+        }
+        ana.set_time(MORNING + hour * 3600);
+        ana.apply(ops).unwrap();
+        written.push((ana.revision(), shown(&ana)));
+    }
+
+    // Stepping back, stepping forth, and going from one end to the other.
+    let last = written.len() - 1;
+    let orders = [(0..=last).rev().collect(), (0..=last).collect(), vec![0, last, 1, last - 1, 0]];
+    for nth in orders.concat() {
+        let (revision, then) = &written[nth];
+        assert_eq!(ana.document_at(revision).as_ref(), Ok(then), "version {nth}");
+    }
+    // The history is written on, and what was read before reads the same.
+    ana.set_time(MORNING + 24 * 3600);
+    ana.apply([typed("p", 0, "So. ")]).unwrap();
+    written.push((ana.revision(), shown(&ana)));
+    for (nth, (revision, then)) in written.iter().enumerate().rev() {
+        assert_eq!(ana.document_at(revision).as_ref(), Ok(then), "version {nth}, after more was written");
+    }
+    assert_eq!(ana.document_at(&unknown()), Err(HistoryError::UnknownRevision));
+}
+
 /// A name, an edit, and what differs either side of it: the blocks, and whether blocks came or went, the
 /// style changed, or the document's own fields did.
 type Differs = (&'static str, Vec<Op>, Vec<&'static str>, [bool; 3]);
