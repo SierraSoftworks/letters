@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use letters_layout::{FontSpec, Fonts, Shaper, Uncovered};
+use letters_layout::{FontSpec, Fonts, Shaper, Uncovered, WordList};
 use letters_render::{Color, DisplayList, Font, Glyph, Item, Point, Size};
 
 /// Glyphs in one font, positioned from the text's top left.
@@ -168,6 +168,17 @@ impl FontShaper {
     /// The characters of the labels shaped since this was last asked that no face has a glyph for.
     pub fn take_uncovered(&self) -> Vec<Uncovered> {
         self.0.take_uncovered()
+    }
+
+    /// Hands over the word list of a script that is written without spaces. Returns whether a label shaped
+    /// before was of that script, and so may wrap elsewhere now.
+    pub fn add_word_list(&self, list: WordList, data: &[u8]) -> bool {
+        self.0.add_word_list(list, data)
+    }
+
+    /// The scripts of the labels shaped since this was last asked whose word list is not here.
+    pub fn take_unlisted(&self) -> Vec<WordList> {
+        self.0.take_unlisted()
     }
 }
 

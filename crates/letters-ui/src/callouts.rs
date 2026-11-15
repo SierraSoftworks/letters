@@ -185,9 +185,12 @@ impl Callouts {
         }
     }
 
-    /// The card of a callout, which hangs under its icon and title at `spot`.
-    pub fn card(&self, kind: &BlockKind, spot: Rect) -> Option<Popover<Message>> {
+    /// The card of a callout, which hangs under its icon and title at `spot`: from their left end, or from
+    /// their right end where the callout reads from the right and has them there.
+    pub fn card(&self, callout: &Block, spot: Rect) -> Option<Popover<Message>> {
+        let kind = &callout.kind;
         let BlockKind::Callout { title, icon, color, .. } = kind else { return None };
+        let from_right = matches!(&callout.body, Body::Blocks(inside) if letters_layout::leads(inside));
         let look = kind.callout_look()?;
         let edit = |edit: CalloutEdit| Message::Callout(Calling::Edit(edit));
 
@@ -276,6 +279,7 @@ impl Callouts {
             .label("Callout")
             .max_width(WIDTH + 2.0 * tokens::SPACE_MD + 2.0)
             .at(spot)
+            .align(if from_right { Align::End } else { Align::Start })
             .open(true)
             .on_close(Message::Callout(Calling::Close));
         Some(card)

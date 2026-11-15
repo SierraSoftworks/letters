@@ -102,10 +102,12 @@ fn set(window: &mut Harness) -> Vec<(f32, f32, usize)> {
 }
 
 /// Shows `what` somewhere in a letter that does not have it on its page: in a note that is opened, in the
-/// document's name, in the version the history shows, in what the history of a selection says a version
-/// did, or in the version of a conflict that is held back beside the page.
+/// document's name, in a label that wraps (the card that says why a link is not opened), in the version
+/// the history shows, in what the history of a selection says a version did, or in the version of a
+/// conflict that is held back beside the page.
 fn show(window: &mut Harness, place: &str, what: &str) {
     match place {
+        "a label" => window.ui().refuse_link("https://example.org/", what),
         "a note" => {
             window.ui().set_notes(noted(NoteKind::Comment, Anchor::range("a", 0..5), &format!("{what} or F?")));
             window.click(Role::Button, "1 comment");
@@ -225,16 +227,17 @@ fn asked(shows: bool) -> Vec<WordList> {
 #[test]
 fn a_script_without_its_word_list_is_told_once_wherever_it_shows() {
     let thai = thai();
-    for place in ["the page", "a note", "a version", "a passage", "a conflict"] {
+    for place in ["the page", "a note", "the name", "a label", "a version", "a passage", "a conflict"] {
         let on_page = place == "the page";
         let mut window = letter(if on_page { &thai } else { "Rates rise in May." });
         assert_eq!(unlisted(&mut window), asked(on_page), "{place}");
         show(&mut window, place, &thai);
         assert_eq!(unlisted(&mut window), asked(!on_page), "{place}");
 
-        // Asked again there is nothing new, nor when the same script shows somewhere else.
+        // Asked again there is nothing new, nor when the same script shows somewhere else. The history and
+        // a card over the window leave no way to the notes.
         assert_eq!(unlisted(&mut window), [], "{place}: once");
-        if !HISTORY.contains(&place) {
+        if !HISTORY.contains(&place) && place != "a label" {
             show(&mut window, "a note", &thai);
             assert_eq!(unlisted(&mut window), [], "{place}, then a note");
         }
@@ -244,7 +247,7 @@ fn a_script_without_its_word_list_is_told_once_wherever_it_shows() {
 #[test]
 fn a_word_list_ends_lines_between_words_wherever_its_script_shows() {
     let (thai, list) = (thai(), WordList::Thai.data());
-    for place in ["the page", "a note", "a version", "a passage", "a conflict"] {
+    for place in ["the page", "a note", "a label", "a version", "a passage", "a conflict"] {
         // The list comes before the text shows, or once the shell was told that the text needs it.
         let shown = |ahead: bool| {
             let mut window = letter(if place == "the page" { &thai } else { "Rates rise in May." });

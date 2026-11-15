@@ -65,6 +65,31 @@ fn a_press_on_a_callouts_icon_opens_a_card_that_changes_it() {
 }
 
 #[test]
+fn a_callout_that_reads_from_the_right_is_pressed_and_carded_at_its_right_end() {
+    // How far the card's edge may stand from the icon it hangs under.
+    const NEAR: f32 = 48.0;
+    // What the callout says, and whether its icon and title stand at the right.
+    let cases = [
+        ("Reply by Friday.", false),
+        ("\u{645}\u{631}\u{62d}\u{628}\u{627} \u{628}\u{627}\u{644}\u{639}\u{627}\u{644}\u{645}", true),
+    ];
+    for (says, from_right) in cases {
+        let mut window = Harness::doc(&format!("Before\n\n> [!NOTE]\n> {says}\n\nAfter"));
+        window.select("Before");
+        let at = icon(&mut window);
+        let page = window.controls().into_iter().find(|found| found.role == Role::Document).expect("the page").bounds;
+        assert_eq!(at.x > page.x + page.width / 2.0, from_right, "{says}: where the icon stands");
+
+        window.click_at(at).assert_open(Role::Dialog, "Callout");
+        let card = window.find(Role::Dialog, "Callout").expect("the card").bounds;
+        let (left, right) = (at.x - card.x, card.x + card.width - at.x);
+        assert!(left >= 0.0 && right >= 0.0, "{says}: the card hangs under the icon, {card:?} at {at:?}");
+        let near = if from_right { right } else { left };
+        assert!(near < NEAR, "{says}: from the end the icon is at, {card:?} at {at:?}");
+    }
+}
+
+#[test]
 fn a_title_is_typed_on_the_card() {
     let mut window = note();
     let at = icon(&mut window);

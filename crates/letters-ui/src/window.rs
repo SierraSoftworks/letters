@@ -797,8 +797,8 @@ impl Ui<EditorApp> {
     }
 
     /// Hands over the word list of a script that is written without spaces, as [`WordList::data`] gives it.
-    /// Lines of that script then end between words wherever the window sets the document's text: on the
-    /// page, in an earlier version, in a conflict and in a note. Which lists to fetch,
+    /// Lines of that script then end between words wherever the window sets text: on the page, in an earlier
+    /// version, in a conflict, in a note and in a label. Which lists to fetch,
     /// [`Self::take_unlisted`] says. Where they are built in ([`WordList::BUILT_IN`]) none is taken.
     ///
     /// The list is kept for whatever is laid out later. A file that is not the list as this build reads
@@ -810,6 +810,7 @@ impl Ui<EditorApp> {
         if !app.lists.keep(list, &data) {
             return false;
         }
+        let labels = app.shaper.add_word_list(list, &data);
         let mut shown = app.said.add_word_list(list, &data);
         shown |= app.review.add_word_list(list, &data);
         if let Some(history) = &mut app.history {
@@ -819,21 +820,26 @@ impl Ui<EditorApp> {
             // Blocks set again keep their heights as estimates until idle time settles them.
             (app.estimated, shown) = (true, true);
         }
+        if labels {
+            self.reshape();
+        }
         if shown {
             self.app_mut();
         }
-        shown
+        shown || labels
     }
 
     /// The scripts whose lines the window could not end between words since this was last asked, since
-    /// their word list is not here: on the page, in an earlier version, in a conflict or in a note. Each
-    /// is told once for as long as the window lives. Hand what is fetched to [`Self::add_word_list`].
+    /// their word list is not here: on the page, in an earlier version, in a conflict, in a note or in a
+    /// label. Each is told once for as long as the window lives. Hand what is fetched to
+    /// [`Self::add_word_list`].
     ///
     /// Scripts are met as text is laid out, so ask after a frame. It costs nothing when there are none,
     /// asks for no frame, and is always empty where the lists are built in.
     pub fn take_unlisted(&mut self) -> Vec<WordList> {
         let app = self.app_unseen();
-        let mut found = app.layout.take_unlisted();
+        let mut found = app.shaper.take_unlisted();
+        found.extend(app.layout.take_unlisted());
         found.extend(app.said.take_unlisted());
         found.extend(app.review.take_unlisted());
         found.extend(app.history.iter_mut().flat_map(History::take_unlisted));
@@ -4430,14 +4436,14 @@ impl EditorApp {
             element = element.popover(menu);
         } else if let Some(((_, text), (_, line, switch))) = self.captions.alt.as_ref().zip(self.alt_switch()) {
             element = element.popover(captions::sheet(text, self.onto(line), self.onto(switch)));
-        } else if let Some((kind, head)) = self.callouts.open.as_ref().and_then(|open| {
-            let kind = &self.editor.doc().block(open)?.kind;
+        } else if let Some((callout, head)) = self.callouts.open.as_ref().and_then(|open| {
+            let callout = self.editor.doc().block(open)?;
             let heads = self.layout.callouts(viewport);
-            Some((kind, heads.into_iter().find(|(block, _)| block == open).map(|(_, head)| head)))
+            Some((callout, heads.into_iter().find(|(block, _)| block == open).map(|(_, head)| head)))
         }) {
             // The card hangs under the icon and title, or from the caret when the callout shows neither.
             let spot = head.map(|head| self.onto(callouts::target(head))).or(caret).unwrap_or_default();
-            element = element.popover(self.callouts.card(kind, spot).expect("the block is a callout"));
+            element = element.popover(self.callouts.card(callout, spot).expect("the block is a callout"));
         } else if let Some(block) = self.languages.listed() {
             // The list hangs under the block's language, or from the caret when its corner is out of view.
             let boxes = self.layout.code_boxes(viewport);
