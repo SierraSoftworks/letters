@@ -300,6 +300,21 @@ fn using_the_version_held_back_trades_the_two_and_leaves_the_conflict_open() {
 }
 
 #[test]
+fn the_notes_panel_says_which_version_of_each_conflict_the_page_shows() {
+    let mut window = reviewing();
+    window.click(Role::Button, "Notes");
+    // How many of the listed conflicts say that the page shows that version of theirs.
+    let showing = |window: &mut Harness, which: &str| {
+        let says = format!("The page shows the {which} version.");
+        let rows = window.controls().into_iter().filter(|found| found.role == Role::ListBoxOption);
+        rows.filter(|row| row.name.ends_with(&says)).count()
+    };
+    assert_eq!((showing(&mut window, "later"), showing(&mut window, "earlier")), (2, 0));
+    window.click(Role::Button, "Use this version");
+    assert_eq!((showing(&mut window, "later"), showing(&mut window, "earlier")), (1, 1), "the roof's traded");
+}
+
+#[test]
 fn either_version_is_written_on_in_the_page_before_one_is_kept() {
     let mut window = reviewing();
     // Sam mends his own version, then has Alice's on the page and writes on that.

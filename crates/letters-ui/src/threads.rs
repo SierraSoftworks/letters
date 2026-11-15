@@ -20,6 +20,7 @@ use crate::element::{Element, Paint, Pointer};
 use crate::icon::{self, Icon};
 use crate::notes::{Margin, Noting};
 use crate::opening;
+use crate::review;
 use crate::safe::Safely;
 use crate::style::{Align, Dir, Edges, Justify, Look};
 use crate::text::{TextShaper, TextStyle};
@@ -366,16 +367,18 @@ fn cut(text: &str, most: usize) -> String {
 }
 
 /// What a conflict says of itself, where its two versions are not looked at side by side: in the panel,
-/// and once the page no longer has its block, which `there` tells.
-fn conflict(versions: &[Version; 2], there: bool) -> String {
+/// and once the page no longer has its block. `page` is the block as the page has it.
+fn conflict(versions: &[Version; 2], page: Option<&Block>) -> String {
     let changed = match (versions[0].author.trim(), versions[1].author.trim()) {
         ("", _) | (_, "") => "This was changed in two places".to_owned(),
         (one, other) if one == other => format!("{one} changed this in two places"),
         (one, other) => format!("{one} and {other} both changed this"),
     };
-    match there {
-        true => format!("{changed}. The page shows the later version."),
-        false => format!("{changed}. It is no longer on the page."),
+    // Using the version held back trades the two, so the page can come to show the earlier one.
+    match page.map(|page| review::stands_for(versions, page)) {
+        Some(0) => format!("{changed}. The page shows the earlier version."),
+        Some(_) => format!("{changed}. The page shows the later version."),
+        None => format!("{changed}. It is no longer on the page."),
     }
 }
 
@@ -467,7 +470,7 @@ pub(crate) fn thread(
     top = top.child(resolve.disabled(refused.is_some()).on_press(send(Noting::Resolve)));
     if let NoteKind::Conflict { versions } = &note.kind {
         // Only a conflict about a block that is gone is read here: there is no place to show its versions.
-        let says = Element::paragraph(conflict(versions, false), small.leading(1.4)).role(Role::Paragraph);
+        let says = Element::paragraph(conflict(versions, None), small.leading(1.4)).role(Role::Paragraph);
         all = all.child(top).child(says);
         // The version that still has the block can go back where the block stood, to be read on the page
         // beside the one that took it out.
@@ -559,7 +562,7 @@ fn about(doc: &Document, note: &Note) -> Option<String> {
 fn row(note: &Note, kind: Kind, doc: &Document, now: &str, open: bool) -> Element<Message> {
     let small = TextStyle::control().size(tokens::TEXT_SM);
     let (who, says) = match &note.kind {
-        NoteKind::Conflict { versions } => ("Conflict", conflict(versions, doc.block(&note.anchor.block).is_some())),
+        NoteKind::Conflict { versions } => ("Conflict", conflict(versions, doc.block(&note.anchor.block))),
         _ => (named(&note.author), plain(&note.content)),
     };
     let (when, about) = (opening::ago(now, &note.created), about(doc, note));
@@ -741,21 +744,29 @@ mod tests {
 
     #[test]
     fn a_conflict_says_who_changed_what_the_page_shows() {
-        let by = |author: &str| Version {
+        let read = |text: &str| Block::text("b", BlockKind::Paragraph, text);
+        let by = |author: &str, text: &str| Version {
             author: author.into(),
             edited: String::new(),
-            block: None,
+            block: Some(read(text)),
             extra: Default::default(),
         };
-        // Who wrote the two versions, whether the page still has their block, and what is said.
+        // Who wrote the earlier version and the later, what the page reads of their block while it has
+        // it, and what is said.
         let cases = [
-            (("Sam", "Alice"), true, "Sam and Alice both changed this. The page shows the later version."),
-            (("Sam", "Sam"), true, "Sam changed this in two places. The page shows the later version."),
-            (("", "Alice"), true, "This was changed in two places. The page shows the later version."),
-            (("Sam", "Alice"), false, "Sam and Alice both changed this. It is no longer on the page."),
+            (("Sam", "Alice"), Some("later"), "Sam and Alice both changed this. The page shows the later version."),
+            (("Sam", "Sam"), Some("later"), "Sam changed this in two places. The page shows the later version."),
+            (
+                ("", "Alice"),
+                Some("later, and more"),
+                "This was changed in two places. The page shows the later version.",
+            ),
+            (("Sam", "Alice"), Some("earlier"), "Sam and Alice both changed this. The page shows the earlier version."),
+            (("Sam", "Alice"), None, "Sam and Alice both changed this. It is no longer on the page."),
         ];
-        for ((one, other), there, says) in cases {
-            assert_eq!(conflict(&[by(one), by(other)], there), says);
+        for ((one, other), page, says) in cases {
+            let page = page.map(read);
+            assert_eq!(conflict(&[by(one, "earlier"), by(other, "later")], page.as_ref()), says);
         }
     }
 }
