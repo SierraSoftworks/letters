@@ -40,7 +40,9 @@ pub type Assets<'a> = &'a mut dyn FnMut(&str) -> Option<Vec<u8>>;
 /// Writes a whole HTML file with `style` as its stylesheet. `title` names the page, as the file's name does
 /// in the editor, and `assets` supplies the images to write into it.
 ///
-/// - The style is used as written: each element type becomes a rule for its HTML element, in points.
+/// - The style is used as written: each element type becomes a rule for its HTML element. Sizes are in
+///   points. Line heights and gaps are in the whole pixels the editor rounds them to, so that lines fall
+///   where they do there.
 /// - An image held by the file is written in as a `data:` address. One that is still remote becomes a link
 ///   to it, so that opening the page fetches nothing.
 /// - A link that would run script is written as its text alone.
@@ -511,6 +513,13 @@ fn pt(points: f32) -> String {
     if rounded == 0.0 { "0".to_owned() } else { format!("{rounded}pt") }
 }
 
+/// A length in whole logical pixels, which is how layout measures the height of a line and the gaps between
+/// blocks. Written the same, the page puts each line where the editor does.
+fn px(pixels: f32) -> String {
+    let whole = if pixels.is_finite() { pixels.round() } else { 0.0 };
+    if whole == 0.0 { "0".to_owned() } else { format!("{whole}px") }
+}
+
 fn color(color: Color) -> String {
     let Color { r, g, b, a } = color;
     if a == 255 { format!("#{r:02x}{g:02x}{b:02x}") } else { format!("#{r:02x}{g:02x}{b:02x}{a:02x}") }
@@ -546,13 +555,13 @@ fn type_rule(selector: &str, of: &TextStyle, mono: bool, css: &mut String) {
         size = pt(of.size),
         weight = of.weight,
         slant = if of.italic { "italic" } else { "normal" },
-        line = if of.line_height.is_finite() { of.line_height } else { 1.5 },
+        line = px((of.size * PIXELS * of.line_height).max(1.0)),
     );
 }
 
 /// Writes the space above and below an element type.
 fn space_rule(selector: &str, before: f32, after: f32, css: &mut String) {
-    let _ = writeln!(css, "{selector} {{ margin: {} 0 {}; }}", pt(before), pt(after));
+    let _ = writeln!(css, "{selector} {{ margin: {} 0 {}; }}", px(before * PIXELS), px(after * PIXELS));
 }
 
 /// The element types that set text, each with the elements written in it.
@@ -617,7 +626,7 @@ fn css(style: &Style, dark: Option<&Palette>, css: &mut String) {
     let of = |key: &str| style.types.get(key).or_else(|| style.types.get("body")).cloned().unwrap_or_default();
     let (body, quote, code) = (of("body"), of("quote"), of("code"));
     // The space after body text is the unit the gaps around lists, quotes and dividers are measured in.
-    let unit = body.space_after;
+    let unit = (body.space_after * PIXELS).round();
     let page = &style.page;
 
     let _ = write!(
@@ -664,10 +673,10 @@ fn css(style: &Style, dark: Option<&Palette>, css: &mut String) {
          blockquote {{ margin: {after} 0; padding: 0 0 0 16px; border-left: 3px solid; }}\n\
          .callout {{ margin: {callout_gap} 0; padding: 12px 16px; border-left: 3px solid; border-radius: 6px; }}\n",
         mono = quoted(&code.family),
-        before = pt(body.space_before),
-        after = pt(unit),
-        between = pt(unit * 0.25),
-        callout_gap = pt(unit * 1.5),
+        before = px(body.space_before * PIXELS),
+        after = px(unit),
+        between = px(unit * 0.25),
+        callout_gap = px(unit * 1.5),
     );
     let _ = write!(
         css,
@@ -684,9 +693,9 @@ fn css(style: &Style, dark: Option<&Palette>, css: &mut String) {
          hr {{ margin: {rule_gap} 0; border: 0; border-top: 1px solid; }}\n\
          mark {{ color: inherit; }}\n\
          .tok-comment {{ font-style: italic; }}\n",
-        after = pt(unit),
-        between = pt(unit * 0.5),
-        rule_gap = pt(unit * 2.0),
+        after = px(unit),
+        between = px(unit * 0.5),
+        rule_gap = px(unit * 2.0),
     );
     colours(style, &PAGE, css);
     if let Some(dark) = dark {

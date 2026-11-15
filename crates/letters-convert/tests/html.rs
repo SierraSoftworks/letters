@@ -164,13 +164,14 @@ fn the_style_is_written_as_css() {
         "font-size: 30pt;",
         "font-weight: 800;",
         "font-style: italic;",
-        "line-height: 1.1;",
+        // In the whole pixels the editor sets lines by: 30 points are 40 pixels.
+        "line-height: 44px;",
         "text-align: center;",
     ] {
         assert!(heading.contains(declaration), "h1 lacks {declaration:?}: {heading}");
     }
     assert!(css.contains("h1 { color: #aa3300; }"), "{css}");
-    assert!(css.contains("h1 { margin: 24pt 0 6.5pt; }"), "{css}");
+    assert!(css.contains("h1 { margin: 32px 0 9px; }"), "{css}");
     assert!(rule(css, "pre").contains("font-family: \"Fira Code\""), "{css}");
     // The text column is the page less its side margins, and paper takes the page setup.
     assert!(rule(css, "article").contains("max-width: 450pt;"), "{css}");
