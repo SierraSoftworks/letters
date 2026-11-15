@@ -16,6 +16,7 @@ mod notes;
 mod pos;
 mod style;
 mod undo;
+mod versions;
 
 pub use conflict::{Conflict, Side};
 pub use doc::{
@@ -29,3 +30,4 @@ pub use model::{Change, Model, Op, OpError, Place, Prepared};
 pub use notes::{Anchor, NOTES_FORMAT, Note, NoteKind, Notes, Reply, Version};
 pub use pos::{Pos, Selection};
 pub use style::{Align, Page, STYLE_FORMAT, Style, TextStyle};
+pub use versions::{Point, Tag, TagKind};

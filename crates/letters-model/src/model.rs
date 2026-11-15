@@ -13,13 +13,14 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use loro::cursor::{Cursor, Side};
-use loro::{ContainerTrait, ExportMode, LoroDoc, LoroText, LoroValue, Subscription, TextDelta};
+use loro::{ContainerTrait, ExportMode, Frontiers, LoroDoc, LoroText, LoroValue, Subscription, TextDelta};
 
 use crate::conflict::{self, Conflict};
 use crate::crdt::{self, Assign, Event, attrs};
 use crate::flat::{self, BLOCK, DEPTH, Entry, Flat, children, head, insert, marker, nth, nth_mut, spell};
 use crate::history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
 use crate::undo::{Delta, Edit, Script, Step, Steps, is_skip};
+use crate::versions::{self, Point, Tag, TagKind};
 use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Mark, Page, Pos, Properties, Run, Style, TextStyle};
 
 /// One change to a document. Offsets are UTF-8 bytes into a text block and must sit on character boundaries.
@@ -886,6 +887,154 @@ impl Model {
             self.queue().clear();
         }
         Ok((change, conflict::told(found?)))
+    }
+
+    /// Shows the history at `revision`, or at its newest revision for `None`, for `read` to look at, and
+    /// then as it was. The document the model shows stays as it is.
+    fn look<T>(&self, revision: Option<&Revision>, read: impl FnOnce(&History) -> T) -> Result<T, HistoryError> {
+        let history = self.history();
+        let loro = &history.loro;
+        let shown = loro.is_detached().then(|| loro.state_frontiers());
+        let there = match revision {
+            Some(revision) => loro.checkout(&revision.0).map_err(|_| HistoryError::UnknownRevision),
+            None => {
+                loro.checkout_to_latest();
+                Ok(())
+            }
+        };
+        let read = there.map(|()| read(history));
+        self.show(shown);
+        read
+    }
+
+    /// Shows the history as it was before a look elsewhere: at the revision given, or else at its newest.
+    fn show(&self, shown: Option<Frontiers>) {
+        match shown {
+            // The history held this revision a moment ago.
+            Some(shown) => drop(self.loro().checkout(&shown)),
+            None => self.loro().checkout_to_latest(),
+        }
+        self.queue().clear();
+    }
+
+    /// Every step the history was written in, oldest first: the revisions either side of it, who wrote it
+    /// and when, how much it changed, and the versions marked at it. [`Model::changed`] tells which
+    /// blocks a step changed, and [`Model::document_at`] reads the document either side of it.
+    ///
+    /// Every device lists the same history alike. Steps that two devices wrote apart are listed one
+    /// after the other, in an order all devices agree on.
+    pub fn timeline(&mut self) -> Vec<Point> {
+        self.look(None, |history| versions::timeline(&history.loro)).unwrap_or_default()
+    }
+
+    /// The document and its style as they were at `revision`, read without leaving the revision shown,
+    /// and with the undo steps kept. Fails with [`HistoryError::UnknownRevision`] for a revision the
+    /// history lacks.
+    pub fn document_at(&mut self, revision: &Revision) -> Result<(Document, Style), HistoryError> {
+        if *revision == self.revision() {
+            return Ok((self.doc.clone(), self.style.clone()));
+        }
+        self.read_at(revision).map(|(doc, _, style)| (doc, style))
+    }
+
+    fn read_at(&self, revision: &Revision) -> Result<(Document, Vec<Entry>, Style), HistoryError> {
+        self.look(Some(revision), |history| {
+            let (doc, index) = crdt::read(&history.loro, &history.body);
+            (doc, index, crdt::read_style(&history.loro))
+        })
+    }
+
+    /// What differs between two revisions, as a change from `from` to `to` would tell it: the blocks that
+    /// read differently, came or went, and whether the style or the document's own fields differ.
+    pub fn changed(&mut self, from: &Revision, to: &Revision) -> Result<Change, HistoryError> {
+        let ((old, was), (new, is)) = (self.document_at(from)?, self.document_at(to)?);
+        let mut change = diff(&old, &new);
+        change.document = fields(&old) != fields(&new);
+        change.style = was != is;
+        Ok(change)
+    }
+
+    /// Marks `revision` as a version: a point to list in the history, and to keep however the history is
+    /// thinned. It carries this writer's name and the time the shell last told. A revision holds one
+    /// mark, and marking it again replaces the one it has.
+    ///
+    /// A mark is part of the history, so it merges and travels with it. It is no step of the timeline
+    /// and no undo step, and it can be made while an older revision is shown.
+    pub fn tag(&mut self, revision: &Revision, kind: TagKind, name: Option<&str>) -> Result<(), HistoryError> {
+        self.mark(Tag { kind, name: name.map(str::to_owned), ..self.unnamed(revision) })
+    }
+
+    /// A mark of this writer's on `revision`, made now.
+    fn unnamed(&self, revision: &Revision) -> Tag {
+        let (at, author, time) = (revision.clone(), self.pen.author.clone(), self.pen.time);
+        Tag { at, kind: TagKind::Named, name: None, author, time, restored: None }
+    }
+
+    fn mark(&mut self, tag: Tag) -> Result<(), HistoryError> {
+        let loro = self.loro();
+        loro.frontiers_to_vv(&tag.at.0).ok_or(HistoryError::UnknownRevision)?;
+        // The marks are read and written where the history is newest.
+        let shown = loro.is_detached().then(|| loro.state_frontiers());
+        loro.checkout_to_latest();
+        versions::mark(loro, &tag);
+        self.commit();
+        self.show(shown);
+        Ok(())
+    }
+
+    /// Takes the mark off `revision`, which stays in the history like any other. Nothing happens when it
+    /// has no mark.
+    pub fn untag(&mut self, revision: &Revision) {
+        let loro = self.loro();
+        let shown = loro.is_detached().then(|| loro.state_frontiers());
+        loro.checkout_to_latest();
+        if versions::unmark(loro, revision) {
+            self.commit();
+        }
+        self.show(shown);
+    }
+
+    /// The versions marked in the history, oldest first.
+    pub fn tags(&mut self) -> Vec<Tag> {
+        self.look(None, |history| versions::tags(&history.loro)).unwrap_or_default()
+    }
+
+    /// Makes the newest document and style read as they did at `revision`, and shows them. Nothing of
+    /// the history is taken back: the restoring is one more edit of this writer's, and one undo step.
+    /// The revision it leads to is marked as a [`TagKind::Restore`] that names `revision`.
+    ///
+    /// What others wrote since `revision` goes with the rest, and comes back with an undo.
+    pub fn restore(&mut self, revision: &Revision) -> Result<Change, HistoryError> {
+        let (doc, index, style) = self.read_at(revision)?;
+        let mut change = self.checkout_latest();
+        let from = self.revision();
+        let mut step = Step::new();
+        if doc.blocks != self.doc.blocks {
+            let old = flat::order(&self.doc.blocks, &self.index);
+            let delta = flat::rewrite(&old, &flat::order(&doc.blocks, &index));
+            let (changed, undo) = self.shift(&delta, None);
+            change.absorb(changed);
+            debug_assert!(undo.is_some() && self.doc.blocks == doc.blocks, "a restore did not give its document");
+            if let Some(undo) = undo
+                && self.write(std::slice::from_ref(&delta), &mut change)
+            {
+                step.push(Edit::Text(undo));
+            }
+        }
+        let mut assigns = crdt::meta_assigns(self.loro(), &self.doc, &doc);
+        if style != self.style {
+            assigns.extend(crdt::style_assigns(self.loro(), &style));
+            self.styled = true;
+        }
+        step.insert(0, Edit::Set(self.set(&assigns, &mut change)));
+        self.steps.record(step, false);
+        let now = self.revision();
+        if now != from {
+            let tag = Tag { kind: TagKind::Restore, restored: Some(revision.clone()), ..self.unnamed(&now) };
+            // The history holds the revision it has just come to.
+            let _ = self.mark(tag);
+        }
+        Ok(change)
     }
 
     /// A position that follows its text, for anything kept across edits. `None` when `pos` is not a
