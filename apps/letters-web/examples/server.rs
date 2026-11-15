@@ -4,7 +4,8 @@
 //! `LETTERS_WEB_DIST=$PWD/dist cargo run --release -p letters-web --example server -- <folder> [port]`
 //!
 //! The server keeps its state and its spaces under `<folder>`: each person's own space, and "Family",
-//! which the group `family` edits, `reviewers` comment in and `friends` read. Built without
+//! which the group `family` edits, `reviewers` comment in and `friends` read. Its documents can be shared
+//! by link. Built without
 //! `LETTERS_WEB_DIST` it has no editor, and shows its documents to read. It prints a line of JSON: its
 //! address, and the cookie of a browser for each of ada (family), grace (reviewers) and alan (friends).
 //!
@@ -50,6 +51,9 @@ state = '{folder}/state'
 [auth.oidc]
 issuer = "https://id.example.test"
 client_id = "letters"
+
+[links]
+enabled = true
 
 [[space]]
 name = "Home"
