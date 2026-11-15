@@ -760,6 +760,17 @@ impl Reader<'_, '_> {
                 self.push(block, out);
                 out.open = Open::Code;
             }
+        } else if let Role::CalloutTitle(tone) = para.role {
+            // The line that heads a callout starts one. It is the callout's title where it is not its tone's
+            // own, and a comment on it moves to the text under it.
+            let title = runs.iter().map(|run| run.text.as_str()).collect::<String>().replace(['\n', '\t'], " ");
+            let title = (title != tone.title()).then_some(title);
+            let mut callout = Block::new(self.id(), BlockKind::Callout { tone, title, icon: None, color: None });
+            callout.body = Body::Blocks(Vec::new());
+            self.attach(&callout.id, &notes);
+            self.close(out);
+            self.push(callout, out);
+            out.open = Open::Callout(tone);
         } else if captioned {
             merge(&mut runs);
             let caption = Block { body: Body::Text(runs), ..Block::new(self.id(), BlockKind::Caption) };
@@ -853,7 +864,10 @@ impl Reader<'_, '_> {
                 }
                 _ => {
                     let kind = match wrapper {
-                        Open::Callout(tone) => BlockKind::callout(tone),
+                        // No line heads it in Word, so none does on the page.
+                        Open::Callout(tone) => {
+                            BlockKind::Callout { tone, title: Some(String::new()), icon: None, color: None }
+                        }
                         _ => BlockKind::Quote,
                     };
                     let mut outer = Block::new(self.id(), kind);

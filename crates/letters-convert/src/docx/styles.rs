@@ -7,7 +7,7 @@ use letters_model::{Align, Page, Style, TextStyle, Tone};
 use roxmltree::{Document, Node};
 
 use super::package::Element;
-use super::{CALLOUTS, DIVIDER, SINGLE, TWIPS, TYPES, monospace};
+use super::{CALLOUT_TITLE, CALLOUTS, DIVIDER, SINGLE, TWIPS, TYPES, monospace};
 
 /// How deep a chain of styles is followed, which also ends one that loops.
 const MAX_CHAIN: usize = 32;
@@ -213,6 +213,8 @@ pub(super) enum Role {
     Heading(u8),
     Quote,
     Callout(Tone),
+    /// The line that heads a callout.
+    CalloutTitle(Tone),
     Code,
     Caption,
     Divider,
@@ -237,8 +239,13 @@ fn role(name: &str) -> Option<Role> {
     if let Some(level) = name.strip_prefix("heading ").and_then(|level| level.parse::<u8>().ok()) {
         return Some(Role::Heading(level.clamp(1, 9)));
     }
-    if let Some((tone, ..)) = CALLOUTS.iter().find(|(_, _, callout)| callout.eq_ignore_ascii_case(&name)) {
-        return Some(Role::Callout(*tone));
+    let tone =
+        |name: &str| CALLOUTS.iter().find(|(_, _, callout)| callout.eq_ignore_ascii_case(name)).map(|known| known.0);
+    if let Some(tone) = tone(&name) {
+        return Some(Role::Callout(tone));
+    }
+    if let Some(tone) = name.strip_suffix(&CALLOUT_TITLE.1.to_ascii_lowercase()).and_then(tone) {
+        return Some(Role::CalloutTitle(tone));
     }
     Some(match name.as_str() {
         "title" => Role::Title,

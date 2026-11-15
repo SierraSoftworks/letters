@@ -3,7 +3,7 @@
 //! Every paragraph names a style and carries no formatting of its own, so changing a style in Word restyles
 //! the document as it does here. Marks are the one thing written onto runs, as Word's own buttons would.
 //! The exceptions are what Word has no style for: how a column of a table is aligned, which each of its
-//! cells says, and where a picture stands on its line.
+//! cells says, where a picture stands on its line, and how far in an item of a list sits inside a quote.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -20,8 +20,8 @@ use zip::{CompressionMethod, ZipWriter};
 
 use super::math::equation;
 use super::{
-    BOOKMARK, CALLOUTS, CELL, DIVIDER, HEAD_CELL, INLINE_CODE, LINK, LIST, SEQUENCE, SINGLE, TABLE, TABLE_SPACE,
-    TASK_DONE, TASK_OPEN, TWIPS, TYPES,
+    BOOKMARK, CALLOUT_TITLE, CALLOUTS, CELL, DIVIDER, HEAD_CELL, INLINE_CODE, LINK, LIST, SEQUENCE, SINGLE, TABLE,
+    TABLE_SPACE, TASK_DONE, TASK_OPEN, TWIPS, TYPES,
 };
 use crate::html::{Assets, href};
 
@@ -42,6 +42,9 @@ const TASKS_OPEN: usize = 2;
 const TASKS_DONE: usize = 3;
 /// How far each level of a list sits in from the one above it, in twentieths of a point.
 const LIST_INDENT: usize = 360;
+/// How far the text of a quote, a callout or code sits in from the margin, which is where Word draws the
+/// frame's left side.
+const BOX_INSET: usize = 285;
 /// The longest address Word follows. A longer one is written as its text alone.
 const LONGEST_LINK: usize = 2000;
 /// What starts a paragraph on a new page.
@@ -64,6 +67,8 @@ const CELL_PAD: (u32, u32) = (200, 120);
 /// - A numbered figure's caption opens with a label that Word counts, and a reference to the figure is a
 ///   cross-reference to that label. The pictures of a gallery share a paragraph, in the rows the page sets.
 /// - A table is a Word table, its header row repeated on each page it runs to.
+/// - A callout opens with the line that heads it on the page, in a style of its own. Its icon is left out,
+///   and so is a colour of its own.
 /// - A link that would run script is written as its text alone, and an unknown block as its fallback text.
 pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets: Assets) -> Vec<u8> {
     let page = &style.page;
@@ -488,17 +493,15 @@ impl<'d> Writer<'d, '_> {
     /// takes the container's style, and Word draws neighbours of one style as one box.
     fn container(&mut self, block: &'d Block, style: &'static str) {
         let inner = block.body.blocks();
-        // A title of the writer's own heads the box in bold. Word has no place for an icon or a colour
-        // beside the tone's style, and a tone's own title is said by that style's name.
-        let titled = match &block.kind {
-            BlockKind::Callout { title: Some(title), .. } if !title.is_empty() => {
-                let run = Run { marks: [Mark::Bold].into(), ..Run::plain(title.as_str()) };
-                self.paragraph(style, None, &[run], Vec::new());
-                true
-            }
-            _ => false,
-        };
-        if inner.is_empty() && !titled {
+        // The line that heads a callout on the page heads it here, in a style of its own that shares the
+        // box. Word has no place for an icon, or for a colour beside the tone's.
+        let title = block.kind.callout_look().map_or("", |look| look.title);
+        if !title.is_empty() {
+            // A comment on the whole callout sits on its text, where there is any.
+            let waiting = if inner.is_empty() { Vec::new() } else { std::mem::take(&mut self.pending) };
+            self.paragraph(&format!("{style}{}", CALLOUT_TITLE.0), None, &[Run::plain(title)], Vec::new());
+            self.pending = waiting;
+        } else if inner.is_empty() {
             self.paragraph(style, None, &[], Vec::new());
         }
         self.blocks(inner, Some(style));
@@ -549,6 +552,12 @@ impl<'d> Writer<'d, '_> {
             }
             if let Some((list, depth)) = list {
                 let _ = write!(self.out, "<w:numPr><w:ilvl w:val=\"{depth}\"/><w:numId w:val=\"{list}\"/></w:numPr>");
+                if !style.is_empty() && style != LIST.0 {
+                    // An item in a quote or a callout. Word draws a frame where a paragraph's first line
+                    // starts, so every marker stands at the frame's inset, and the text as deep as its level.
+                    let hang = LIST_INDENT * (usize::from(depth) + 1);
+                    let _ = write!(self.out, "<w:ind w:left=\"{}\" w:hanging=\"{hang}\"/>", BOX_INSET + hang);
+                }
             }
             if let Some(align) = align {
                 let _ = write!(self.out, "<w:jc w:val=\"{}\"/>", justification(align));
@@ -1071,8 +1080,10 @@ fn styles(style: &Style, language: &str) -> String {
         });
         format!("<w:pBdr>{}</w:pBdr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{fill}\"/>", sides.concat())
     };
-    let inset = "<w:ind w:left=\"285\" w:right=\"250\"/>";
+    let inset = format!("<w:ind w:left=\"{BOX_INSET}\" w:right=\"250\"/>");
+    let inset = inset.as_str();
 
+    let quoted = format!("<w:ind w:left=\"{BOX_INSET}\"/>");
     for (key, id, name) in TYPES {
         let kind = of(key);
         let keep = "<w:keepNext/><w:keepLines/>";
@@ -1080,7 +1091,7 @@ fn styles(style: &Style, language: &str) -> String {
             "title" => (keep.to_owned(), "", String::new(), ""),
             "quote" => {
                 let bar = format!("<w:pBdr>{}</w:pBdr>", border("left", 18, 12, &hex(PAGE.line_strong)));
-                (bar, "<w:ind w:left=\"285\"/>", String::new(), "")
+                (bar, quoted.as_str(), String::new(), "")
             }
             // Code is not prose: Word should not check its spelling.
             "code" => (boxed(&hex(PAGE.code), &hex(PAGE.code)), inset, String::new(), "<w:noProof/>"),
@@ -1101,6 +1112,12 @@ fn styles(style: &Style, language: &str) -> String {
         };
         let frame = boxed(&hex(look.accent), &hex(look.fill));
         paragraph(id, name, true, &paragraph_look(body, &frame, inset, ""), &run_look(body, ""));
+        // The line that heads the box is in its accent, and stays with the text under it. Its frame is the
+        // box's own, which is what makes Word draw the two as one.
+        let title = TextStyle { weight: 600, color: format!("#{}", hex(look.accent)), ..body.clone() };
+        let (id, name) = (format!("{id}{}", CALLOUT_TITLE.0), format!("{name}{}", CALLOUT_TITLE.1));
+        let kept = format!("<w:keepNext/>{frame}");
+        paragraph(&id, &name, true, &paragraph_look(&title, &kept, inset, ""), &run_look(&title, ""));
     }
     // Items of one list sit closer than paragraphs do.
     paragraph(LIST.0, LIST.1, true, &paragraph_look(body, "", "<w:contextualSpacing/>", ""), &run_look(body, ""));

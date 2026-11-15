@@ -357,6 +357,11 @@ fn shape(doc: &Document) -> Vec<String> {
     outline(&doc)
 }
 
+/// The line that heads each callout of a document, in order.
+fn headed(doc: &Document) -> Vec<String> {
+    doc.walk().filter_map(|block| block.kind.callout_look()).map(|look| look.title.to_owned()).collect()
+}
+
 /// The references of a document: what each reads as, and the caption of the figure it is to.
 fn references(doc: &Document) -> Vec<(String, String)> {
     let caption = |id: &BlockId| {
@@ -1481,6 +1486,34 @@ fn a_formula_is_written_as_an_equation_and_one_with_a_mistake_as_its_source() {
 }
 
 #[test]
+fn a_callout_is_headed_as_on_the_page() {
+    let callout = |id: &str, tone, title: Option<&str>| {
+        let kind = BlockKind::Callout { tone, title: title.map(String::from), icon: Some("star".into()), color: None };
+        holding(id, kind, vec![Block::text(format!("{id}-text").as_str(), BlockKind::Paragraph, "Mind the gap.")])
+    };
+    // A tone, the title a writer gave two callouts of it, and what heads each in Word and on the way back.
+    let cases = [
+        (Tone::Warn, None, vec!["Warning", "Warning"]),
+        (Tone::Tip, Some("Before you start"), vec!["Before you start", "Before you start"]),
+        // With no line between them, Word draws two callouts of one tone as one.
+        (Tone::Info, Some(""), vec![""]),
+    ];
+    for (tone, title, heads) in cases {
+        let blocks = vec![callout("a", tone, title), callout("b", tone, title)];
+        let doc = Document { blocks, ..Document::default() };
+        let body = part(&export(&doc), "word/document.xml");
+        let back = returned(&doc);
+
+        for head in heads.iter().filter(|head| !head.is_empty()) {
+            assert_eq!(body.matches(&format!(">{head}<")).count(), 2, "{head:?} heads each callout in Word");
+        }
+        assert_eq!(headed(&back.document), heads, "{tone:?} {title:?}");
+        assert_eq!(back.document.walk().filter(|block| block.plain_text() == "Mind the gap.").count(), 2);
+        assert_eq!(back.notes, [], "{tone:?} {title:?}");
+    }
+}
+
+#[test]
 fn writes_outside_a_quote_what_word_cannot_keep_inside_one() {
     let back = returned(&document("> Before\n>\n> ## Heading\n>\n> After"));
     let texts: Vec<String> = back.document.walk().map(Block::plain_text).filter(|text| !text.is_empty()).collect();
@@ -1535,9 +1568,12 @@ fn the_style_is_written_as_word_styles_and_paragraphs_only_name_them() {
         assert!(look.contains(held), "the heading's style lacks {held}: {look}");
     }
     let body = part(&file, "word/document.xml");
-    for direct in ["<w:rFonts", "<w:sz ", "<w:color", "<w:jc", "<w:spacing", "<w:ind"] {
+    for direct in ["<w:rFonts", "<w:sz ", "<w:color", "<w:jc", "<w:spacing"] {
         assert!(!body.contains(direct), "a paragraph carries {direct} of its own");
     }
+    // Only an item of a list says how far in it sits, where a quote's frame would otherwise part from it.
+    let set_in: Vec<&str> = body.split("</w:p>").filter(|paragraph| paragraph.contains("<w:ind")).collect();
+    assert!(set_in.iter().all(|paragraph| paragraph.contains("<w:numPr>")), "{set_in:?}");
 }
 
 #[test]
@@ -1919,6 +1955,14 @@ fn any_blocks() -> impl Strategy<Value = Vec<Block>> {
         3 => (list, 0..3u8, any_runs()).prop_map(move |(list, depth, runs)| with(BlockKind::ListItem { list, depth }, runs)),
     ];
     let tone = proptest::sample::select(vec![Tone::Tip, Tone::Info, Tone::Warn, Tone::Danger]);
+    // A callout headed by its tone's title, by one of its own, or by none.
+    let title = proptest::sample::select(vec![None, Some(""), Some("Take care")]);
+    let boxed = move |tone, title: Option<&str>| BlockKind::Callout {
+        tone,
+        title: title.map(String::from),
+        icon: None,
+        color: None,
+    };
     let holding = |kind: BlockKind, blocks: Vec<Block>| holding("", kind, blocks);
     let inside = proptest::collection::vec(text.clone(), 1..4).prop_map(nested);
     // A picture with a caption or none, and pictures side by side over one or none.
@@ -1944,7 +1988,7 @@ fn any_blocks() -> impl Strategy<Value = Vec<Block>> {
         1 => any_text().prop_map(move |code| with(BlockKind::Code { language: None }, vec![Run::plain(code.trim_end_matches('\n'))])),
         1 => Just(Block::new("", BlockKind::Divider)),
         1 => inside.clone().prop_map(move |blocks| holding(BlockKind::Quote, blocks)),
-        1 => (tone, inside).prop_map(move |(tone, blocks)| holding(BlockKind::callout(tone), blocks)),
+        1 => (tone, title, inside).prop_map(move |(tone, title, blocks)| holding(boxed(tone, title), blocks)),
     ];
     proptest::collection::vec(block, 0..8).prop_map(nested)
 }
@@ -1981,10 +2025,18 @@ fn settled(blocks: Vec<Block>) -> Vec<Block> {
                 }
             }
         }
-        // Neighbouring paragraphs of one style are one quote, one callout or one block of code in Word.
+        // Neighbouring paragraphs of one style are one quote, one callout or one block of code in Word. The
+        // line that heads a callout parts it from the one before.
+        let joins = |last: &BlockKind| match (last, &block.kind) {
+            (BlockKind::Quote, BlockKind::Quote) => true,
+            (BlockKind::Callout { tone, .. }, BlockKind::Callout { tone: next, title: Some(title), .. }) => {
+                tone == next && title.is_empty()
+            }
+            _ => false,
+        };
         match (out.last_mut(), &block) {
             (Some(Block { kind, body: Body::Blocks(held), .. }), Block { body: Body::Blocks(more), .. })
-                if *kind == block.kind && matches!(kind, BlockKind::Quote | BlockKind::Callout { .. }) =>
+                if joins(kind) =>
             {
                 held.extend(more.iter().cloned());
             }
@@ -2027,6 +2079,7 @@ proptest! {
         let back = returned(&doc);
         let expected = Document { blocks: settled(doc.blocks.clone()), ..Document::default() };
         prop_assert_eq!(shape(&back.document), shape(&expected));
+        prop_assert_eq!(headed(&back.document), headed(&expected));
         prop_assert_eq!(back.notes, []);
     }
 

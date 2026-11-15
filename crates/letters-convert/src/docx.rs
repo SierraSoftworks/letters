@@ -77,6 +77,9 @@ const CALLOUTS: [(Tone, &str, &str); 4] = [
     (Tone::Danger, "CalloutDanger", "Callout Danger"),
 ];
 
+/// What the style of the line that heads a callout adds to its tone's style, in id and in name.
+const CALLOUT_TITLE: (&str, &str) = ("Title", " Title");
+
 /// The paragraph style of a divider, by id and name.
 const DIVIDER: (&str, &str) = ("Divider", "Divider");
 /// The paragraph style list items take, which sets them closer together than paragraphs.
