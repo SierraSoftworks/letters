@@ -26,6 +26,7 @@ use crate::maths::{self, Maths, Sheet, SheetLines, Source};
 use crate::motion::{self, FRAME_MS};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
+use crate::refer::{Picking, Refer};
 use crate::references::{self, Preview, Reference, References};
 use crate::renaming::{Outcome, Rename, Renaming};
 use crate::restyle::{self, Field, StyleEdit};
@@ -161,6 +162,8 @@ pub enum Message {
     /// What is done on the sheet under a formula.
     Maths(Sheet),
     Insert(Inserting),
+    /// What is asked of the list of figures under a reference being typed.
+    Refer(Picking),
 }
 
 impl Ui<EditorApp> {
@@ -452,6 +455,7 @@ pub struct EditorApp {
     dragging: bool,
     maths: Maths,
     insert: Insert,
+    refer: Refer,
     references: References,
     /// The preview of a figure that shows over the page: its caption, and where it is in the page area.
     previewed: Option<(String, Rect)>,
@@ -500,6 +504,7 @@ impl EditorApp {
             dragging: false,
             maths: Maths::default(),
             insert: Insert::default(),
+            refer: Refer::default(),
             references: References::default(),
             previewed: None,
             told: RefCell::default(),
@@ -764,7 +769,7 @@ impl EditorApp {
     /// The reference to a figure at a point of the page area, while nothing hangs over the page.
     fn reference(&self, at: Point) -> Option<Reference> {
         let hung = self.landing.is_some() || self.spelling.fix.is_some() || self.link.is_some();
-        if hung || self.insert.offers(&self.editor).is_some() {
+        if hung || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some() {
             return None;
         }
         let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
@@ -1113,6 +1118,11 @@ impl EditorApp {
             let slash = self.layout.caret(&Pos::new(line, 0)).unwrap_or_default();
             let spot = Rect { x: origin.x + slash.x, y: origin.y + slash.y, ..slash };
             element = element.popover(self.insert.menu(&offers).at(spot));
+        } else if let Some((typed, figures)) = Refer::offers(&self.editor) {
+            // The list hangs from the start of the words typed for the reference.
+            let start = self.layout.caret(&Pos::new(typed.block.clone(), typed.range.start)).unwrap_or_default();
+            let spot = Rect { x: origin.x + start.x, y: origin.y + start.y, ..start };
+            element = element.popover(self.refer.list(&self.editor, &typed, &figures).at(spot));
         } else if let Some(((source, rect), selection)) = sheet.zip(selection) {
             let spot = Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect };
             element =
@@ -1661,6 +1671,25 @@ impl EditorApp {
         true
     }
 
+    /// Lets the list of figures have the keys that walk it and take from it, while it shows. Until a figure
+    /// is picked, Enter and Tab are the editor's.
+    fn refer_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        let plain = event.mods == Modifiers::default();
+        let Some((typed, figures)) = Refer::offers(&self.editor).filter(|_| plain) else { return false };
+        let picked = self.refer.picked(&typed, figures.len()).and_then(|picked| figures.get(picked));
+        match (&event.key, picked) {
+            (Key::Down | Key::Up, _) => self.refer.pick(&typed, event.key == Key::Down, figures.len()),
+            (Key::Enter | Key::Tab, Some(figure)) => self.refer(figure.id.clone(), platform),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Makes a reference to a figure of the words typed for one.
+    fn refer(&mut self, figure: BlockId, platform: &mut dyn Platform) {
+        self.edit(platform, |editor, platform| editor.run(Command::TakeReference(figure), platform));
+    }
+
     /// Lets the list of symbols have the keys that walk it and take from it, while it shows.
     fn list_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
         let plain = event.mods == Modifiers::default();
@@ -1851,6 +1880,10 @@ impl App for EditorApp {
             Message::Maths(message) => self.sheet(message, platform),
             Message::Insert(Inserting::Take(index)) => self.put(index, platform),
             Message::Insert(Inserting::Close) => self.insert.close(),
+            Message::Refer(Picking::Take(figure)) => self.refer(figure, platform),
+            Message::Refer(Picking::Close) => {
+                self.edit(platform, |editor, platform| editor.run(Command::DismissReference, platform));
+            }
             Message::Jump(block) => {
                 let start = Pos { block, offset: 0 };
                 self.editor.select(Selection::caret(start.clone()));
@@ -1888,7 +1921,7 @@ impl App for EditorApp {
     }
 
     fn key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
-        if self.insert_key(event, platform) || self.list_key(event, platform) {
+        if self.insert_key(event, platform) || self.refer_key(event, platform) || self.list_key(event, platform) {
             return true;
         }
         let (mut used, mut edited) = (false, false);
