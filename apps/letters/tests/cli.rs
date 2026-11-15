@@ -24,6 +24,7 @@ fn arguments_select_a_file_and_a_mode() {
         ("-- --odd-name.let", run(file("--odd-name.let"), Mode::Edit, false)),
         ("--version", Ok(Command::Version)),
         ("notes.let -h", Ok(Command::Help)),
+        ("--check-history", Ok(Command::CheckHistory)),
     ];
     for (line, expected) in cases {
         assert_eq!(parse(args(line)), expected, "{line:?}");

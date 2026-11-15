@@ -768,6 +768,7 @@ const HARMFUL: &[u8] = include_bytes!("../../../fuzz/corpus/history/a-history-lo
 
 #[test]
 fn a_servers_file_is_merged_only_with_a_history_that_does_no_harm() {
+    common::app();
     let blocks = vec![Block::text("p", BlockKind::Paragraph, "Slates first.")];
     let model = Model::new(Document { blocks, ..Document::default() }, ReplicaId::new("a device"));
     let file = |history: Option<Vec<u8>>| {

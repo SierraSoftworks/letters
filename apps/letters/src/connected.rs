@@ -588,12 +588,12 @@ impl Handing {
 /// The history and the notes of a `.let` file that came from a server, for the window that has the
 /// document open to merge. `None` if there is nothing to merge without harm.
 ///
-/// Others wrote the file, so its history is tried with [`Model::check`] where it can hurt nothing, before
-/// any document takes it in. A file with no history, or with none that stands, is not merged: a history
+/// Others wrote the file, so its history is tried in a process of its own, where it can hurt nothing,
+/// before any document takes it in. A file with no history, or with none that stands, is not merged: a history
 /// started here for it would bring every block a second time.
 pub fn mergeable(file: Vec<u8>) -> Option<(Vec<u8>, Notes)> {
     let mut file = Archive::open(io::Cursor::new(file)).ok()?;
-    Model::check(&file.read(OPLOG).ok()??).ok()?;
+    crate::strangers::check(&file.read(OPLOG).ok()??).ok()?;
     // Nothing is written with it, so whose copy it is does not matter.
     let copy = WorkingCopy::open(&mut file, ReplicaId::new(&crate::platform::block_id())).ok()?;
     Some((copy.model().save(), copy.notes))

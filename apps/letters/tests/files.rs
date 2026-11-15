@@ -206,8 +206,12 @@ fn a_file_that_cannot_be_merged_is_never_overwritten() {
     assert_eq!(read(third.path()).document, document("Mine, third"));
 }
 
-/// A history as a stranger writes it: one that Loro panics on.
-const HARMFUL: &[u8] = include_bytes!("../../../fuzz/corpus/history/a-history-loro-panics-on.bin");
+/// Histories as a stranger writes them, which would harm a document that took them in, and how.
+const HARMFUL: [(&str, &[u8]); 3] = [
+    ("Loro panics on it", include_bytes!("../../../fuzz/corpus/history/a-history-loro-panics-on.bin")),
+    ("Loro panics on it too", include_bytes!("../../../fuzz/corpus/history/a-second-history-loro-panics-on.bin")),
+    ("its save cannot be read", include_bytes!("../../../fuzz/corpus/history/a-history-loro-cannot-write-out.bin")),
+];
 
 #[test]
 fn a_document_nobody_vouches_for_is_read_as_a_strangers() {
@@ -228,12 +232,14 @@ fn a_document_nobody_vouches_for_is_read_as_a_strangers() {
     assert_eq!(wary.model().revision(), trusted.model().revision());
 
     // One that would is left out, and the document opens as its file shows it.
-    let mut harmful = sound.clone();
-    harmful.entries.insert(OPLOG.into(), HARMFUL.to_vec());
-    write(&path, &harmful);
-    let opened = read_as(true);
-    assert_eq!(opened.model().doc(), &sound.document);
-    assert!(opened.wary);
+    for (why, history) in HARMFUL {
+        let mut harmful = sound.clone();
+        harmful.entries.insert(OPLOG.into(), history.to_vec());
+        write(&path, &harmful);
+        let opened = read_as(true);
+        assert_eq!(opened.model().doc(), &sound.document, "{why}");
+        assert!(opened.wary && opened.model().save() != history, "{why}");
+    }
 }
 
 #[test]
@@ -243,18 +249,28 @@ fn a_file_whose_history_would_harm_is_not_merged() {
     write_full(&path, "Shared");
     let (mut writer, home) = Writer::of(open(&path).unwrap());
     writer.save(&home, &document("Mine"));
-    let mut harmful = read(&path);
-    harmful.entries.insert(OPLOG.into(), HARMFUL.to_vec());
-    write(&other, &harmful);
 
-    let seen = writer.model.revision();
-    let (edits, others) = (writer.model.updates_since(&seen), std::slice::from_ref(&other));
-    let exchange = home.exchange(&mut writer.copy, &edits, Notes::default(), &seen, others).unwrap();
+    for (why, history) in HARMFUL {
+        let mut harmful = read(&path);
+        harmful.entries.insert(OPLOG.into(), history.to_vec());
+        write(&other, &harmful);
 
-    assert!(matches!(exchange.merged.as_slice(), [merged] if merged.result.is_err()), "{:?}", exchange.merged);
-    assert!(exchange.news.is_none() && !writer.copy.wary, "the document is as it was, and its own as before");
-    assert_eq!(read(&path).document, document("Mine"));
-    assert_eq!(read(&other), harmful, "the other file is only read");
+        let seen = writer.model.revision();
+        let (edits, others) = (writer.model.updates_since(&seen), std::slice::from_ref(&other));
+        let exchange = home.exchange(&mut writer.copy, &edits, Notes::default(), &seen, others).unwrap();
+
+        assert!(
+            matches!(exchange.merged.as_slice(), [merged] if merged.result.is_err()),
+            "{why}: {:?}",
+            exchange.merged
+        );
+        assert!(
+            exchange.news.is_none() && !writer.copy.wary,
+            "{why}: the document is as it was, and its own as before"
+        );
+        assert_eq!(read(&path).document, document("Mine"), "{why}");
+        assert_eq!(read(&other), harmful, "{why}: the other file is only read");
+    }
 }
 
 #[test]

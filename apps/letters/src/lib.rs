@@ -11,6 +11,7 @@
 //! - [`convert`] runs the `export` and `import` subcommands, which need no window, and [`copies`] writes the
 //!   copies and exports a window asks for.
 //! - [`import`] makes a document of a Markdown or Word file, for that subcommand and for a window.
+//! - [`strangers`] tries a history from elsewhere in a process of its own, where a panic ends nothing.
 
 pub mod app;
 pub mod baseline;
@@ -43,6 +44,7 @@ pub mod settings;
 pub mod shadow;
 pub mod signin;
 pub mod socket;
+pub mod strangers;
 pub mod telemetry;
 pub mod trust;
 pub mod versions;
