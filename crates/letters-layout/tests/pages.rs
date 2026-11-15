@@ -5,8 +5,8 @@ use std::ops::Range;
 
 use letters_layout::{DocLayout, PageLink, Pages, Palette, Token, TokenKind};
 use letters_model::{
-    Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Markers, Model, Op, Page, Pos, ReplicaId, Run, Style,
-    Tone,
+    Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Markers, Model, Op, Page, Pos, ReplicaId, Run,
+    Style, Tone,
 };
 use letters_render::{DisplayList, Item, Point, Rect, Role};
 use proptest::prelude::*;
@@ -19,16 +19,7 @@ const COLUMN: f32 = 320.0;
 
 /// A sheet whose text area is [`COLUMN`] wide and `room` logical pixels tall, with margins all round.
 fn paper(room: f32) -> Page {
-    let (margin, points) = (30.0, 72.0 / 96.0);
-    Page {
-        width: COLUMN * points + 2.0 * margin,
-        height: room * points + 2.0 * margin,
-        margin_top: margin,
-        margin_right: margin,
-        margin_bottom: margin,
-        margin_left: margin,
-        ..Page::default()
-    }
+    common::paper(COLUMN, room)
 }
 
 fn paged(doc: &Document, room: f32) -> (DocLayout, Pages) {
@@ -101,10 +92,14 @@ fn lines_of(layout: &DocLayout, block: &str, len: usize) -> (f32, f32, usize) {
     (first.y - (line - first.height) / 2.0, line, count)
 }
 
-/// The blocks that start a page: those marked to, and the first inside a container that is.
+/// The blocks that start a page: those marked to, and the first inside a container that is. A gallery is
+/// one block to a page, whatever it holds.
 fn starts(doc: &Document) -> Vec<BlockId> {
-    let marked = doc.blocks.iter().filter(|block| block.page_break);
-    marked.map(|block| block.body.blocks().first().unwrap_or(block).id.clone()).collect()
+    let first = |block: &Block| match block.kind {
+        BlockKind::Gallery { .. } => block.id.clone(),
+        _ => block.body.blocks().first().unwrap_or(block).id.clone(),
+    };
+    doc.blocks.iter().filter(|block| block.page_break).map(first).collect()
 }
 
 /// Checks what holds for any document: every line is on one page, in order, inside the page's text area.
@@ -149,6 +144,76 @@ fn check_pages(doc: &Document, layout: &DocLayout, pages: &Pages) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// What the rows of [`album`]'s table hold. Two of them wrap.
+const RATES: [[&str; 2]; 6] = [
+    ["Household", "Rate"],
+    [PROSE, "12.5%"],
+    ["Mill cottage", "9%"],
+    ["The old school", "exempt"],
+    [PROSE, "10%"],
+    ["Harbour office", "11%"],
+];
+
+/// A figure `f`, a gallery `g` of seven pictures and a table `t` among prose, each part of them small enough
+/// for a small page.
+fn album() -> Document {
+    let tiles = (0..7).map(|at| figure(&format!("g{at}"), (90.0 + 30.0 * (at % 3) as f32, 90.0), ""));
+    let rows: Vec<&[&str]> = RATES.iter().map(|row| &row[..]).collect();
+    doc(vec![
+        paragraph("a", PROSE),
+        figure("f", (120.0, 80.0), "The harbour office, seen from the quay"),
+        paragraph("b", PROSE),
+        gallery("g", tiles.collect(), Some("Along the harbour")),
+        paragraph("c", PROSE),
+        table("t", &[Align::Start, Align::End], true, &rows),
+        paragraph("z", PROSE),
+    ])
+}
+
+#[test]
+fn a_page_never_cuts_a_picture_or_a_row() {
+    let doc = album();
+    let pictures: Vec<String> = (0..7).map(|at| format!("assets/g{at}.png")).collect();
+    let (mut gallery_split, mut table_split) = (false, false);
+    for room in [200.0, 260.0, 340.0, 480.0] {
+        let (layout, pages) = paged(&doc, room);
+        assert_eq!(check_pages(&doc, &layout, &pages), Ok(()), "at {room} px");
+        // The page each picture is on, in the order they are met.
+        let mut shown: Vec<(String, usize)> = Vec::new();
+        for index in 0..pages.sheets.len() {
+            let Painted { clip, text, .. } = page(&layout, &pages, index);
+            for item in &text {
+                let Item::Image { rect, asset } = item else { continue };
+                let (top, end, last) = (rect.y, rect.y + rect.height, clip.y + clip.height);
+                if end > clip.y && top < last {
+                    assert!(top >= clip.y - 0.01 && end <= last + 0.01, "at {room} px page {index} cuts {asset}");
+                    shown.push((asset.clone(), index));
+                }
+            }
+        }
+        let met: Vec<&str> = shown.iter().map(|(asset, _)| asset.as_str()).collect();
+        let all: Vec<&str> = ["assets/f.png"].into_iter().chain(pictures.iter().map(String::as_str)).collect();
+        assert_eq!(met, all, "at {room} px each picture is on one page");
+
+        let on = |block: &str, offset: usize| layout.page_of(&pages, &Pos::new(block, offset)).unwrap();
+        assert_eq!(
+            (on("f", 0), on("f", 30)),
+            (shown[0].1, shown[0].1),
+            "at {room} px a caption is on its picture's page"
+        );
+        assert_eq!(on("gc", 0), shown[7].1, "at {room} px a gallery's caption is on its last row's page");
+        for (row, [home, rate]) in RATES.iter().enumerate() {
+            let cell = |column: usize, offset: usize| on(&format!("t{row}{column}"), offset);
+            let ends = [cell(0, 0), cell(0, home.len()), cell(1, rate.len())];
+            assert!(ends.iter().all(|page| *page == ends[0]), "at {room} px row {row} is on pages {ends:?}");
+        }
+        assert_eq!(on("t00", 0), on("t10", 0), "at {room} px a header is on its first row's page");
+        gallery_split |= shown[1].1 != shown[7].1;
+        table_split |= on("t00", 0) != on("t50", 0);
+    }
+    assert!(gallery_split && table_split, "a gallery and a table go on to the next page between their rows");
 }
 
 /// Prose with formulas in its lines, some taller than a line of text, and formulas as blocks.
@@ -364,6 +429,8 @@ fn kinds() -> (Document, Vec<Part>) {
     let rule = |id: &str| Block::new(id, BlockKind::Divider);
     let said = |numbered, checked, depth| Role::ListItem { depth, numbered, checked };
     let maths = |tex: &str| Role::Formula { alt: tex.into() };
+    let shown = |id: &str| Role::Figure { alt: format!("Picture {id}").as_str().into() };
+    let picture = |id: &str, wide: f32, caption: &str| figure(id, (wide, 60.0), caption);
     let blocks = vec![
         Block::text("h", BlockKind::Heading { level: 1 }, "Household rates"),
         paragraph("a", &PROSE.repeat(3)),
@@ -377,6 +444,9 @@ fn kinds() -> (Document, Vec<Part>) {
         Block::text("k", BlockKind::Heading { level: 2 }, "What changes"),
         rich("m", &[(PROSE, &[]), ("x^2", &[Mark::Math]), (PROSE, &[]), ("a + b", &[Mark::Math])]),
         formula("g", "E = mc^2"),
+        picture("p", 90.0, "The harbour office"),
+        gallery("v", vec![picture("v0", 90.0, ""), picture("v1", 120.0, "")], Some("Along the harbour")),
+        table("s", &[Align::Start, Align::End], true, &[&["Band", "Rate"], &["B", "12.5%"]]),
     ];
     let parts = vec![
         (Role::Heading(1), None),
@@ -400,6 +470,18 @@ fn kinds() -> (Document, Vec<Part>) {
         (maths("x^2"), Some(Role::Paragraph)),
         (maths("a + b"), Some(Role::Paragraph)),
         (maths("E = mc^2"), None),
+        (shown("p"), None),
+        (Role::Caption, Some(shown("p"))),
+        (shown("v0"), None),
+        (shown("v1"), None),
+        (Role::Caption, None),
+        (Role::Table, None),
+        (Role::Row, Some(Role::Table)),
+        (Role::Cell { header: true }, Some(Role::Row)),
+        (Role::Cell { header: true }, Some(Role::Row)),
+        (Role::Row, Some(Role::Table)),
+        (Role::Cell { header: false }, Some(Role::Row)),
+        (Role::Cell { header: false }, Some(Role::Row)),
     ];
     (doc(blocks), parts)
 }
@@ -408,9 +490,11 @@ fn kinds() -> (Document, Vec<Part>) {
 fn a_sheet_says_what_its_parts_are() {
     let (doc, parts) = kinds();
     let told = |item: &Item| matches!(item, Item::Open { .. } | Item::Close);
-    // The box behind code and a divider's line, which are decoration.
+    // The box behind code and the lines of a divider and under the rows of a table, which are decoration.
     let palette = Palette::LIGHT;
-    let plain = |item: &Item| matches!(item, Item::Fill { color, .. } if [palette.code, palette.line].contains(color));
+    let lines = [palette.code, palette.line, palette.line_strong];
+    let plain = |item: &Item| matches!(item, Item::Fill { color, .. } if lines.contains(color));
+    let pictured = |part: Option<&&Role>| matches!(part, Some(Role::Figure { .. }));
     for room in [160.0, 240.0, 5000.0] {
         let (layout, pages) = paged(&doc, room);
         // Each part where it is first met, by its name.
@@ -431,6 +515,7 @@ fn a_sheet_says_what_its_parts_are() {
                     }
                     Item::Close => drop(open.pop().expect("a part closes only once open")),
                     Item::Glyphs { .. } => assert!(!open.is_empty(), "text on page {index} is part of something"),
+                    Item::Image { .. } => assert!(pictured(open.last()), "a picture on page {index} is a figure"),
                     item if plain(item) => {
                         assert!(open.is_empty(), "decoration on page {index} is part of nothing: {open:?}");
                         decoration += 1;
@@ -598,10 +683,11 @@ const WORDS: [&str; 8] = ["rates", "change", "on", "the", "first", "of", "Januar
 fn documents() -> impl Strategy<Value = Document> {
     let words = |most: usize| prop::collection::vec(prop::sample::select(WORDS.to_vec()), 1..most);
     let lines = prop::collection::vec(words(14).prop_map(|words| words.join(".")), 1..12);
-    let block = (0..11u8, words(90), lines, prop::bool::weighted(0.1));
+    let block = (0..14u8, words(90), lines, prop::bool::weighted(0.1));
     prop::collection::vec(block, 1..14).prop_map(|blocks| {
         let blocks = blocks.into_iter().enumerate().map(|(index, (kind, words, lines, breaks))| {
             let (id, text) = (format!("b{index}"), words.join(" "));
+            let short = words[..words.len().min(6)].join(" ");
             let inside = |kind| {
                 container(
                     &format!("c{index}"),
@@ -626,6 +712,16 @@ fn documents() -> impl Strategy<Value = Document> {
                 5 => Block::new(id.as_str(), BlockKind::Divider),
                 6 => rich(&id, &[(&text, &[]), (r"\frac{a}{\frac{b}{c}}", &[Mark::Math]), (&text, &[])]),
                 7 => formula(&id, r"\sum_{i=0}^{n} i"),
+                8 => figure(&id, (120.0, 80.0), &short),
+                9 => {
+                    // Wide pictures, so that one alone in its row is still shorter than a page.
+                    let tile = |at: usize| figure(&format!("{id}x{at}"), (120.0 + 30.0 * (at % 3) as f32, 60.0), "");
+                    gallery(&format!("c{index}"), (0..1 + index % 5).map(tile).collect(), Some(&short))
+                }
+                10 => {
+                    let rows: [&[&str]; 2] = [&[&short, "Rate"], &[&short, "9%"]];
+                    table(&format!("t{index}x"), &[Align::Start, Align::End], index % 2 == 0, &rows)
+                }
                 _ => paragraph(&id, &text),
             };
             if breaks { breaking(block) } else { block }
@@ -657,8 +753,10 @@ proptest! {
             }
         }
         for (id, parts) in parts(&pages) {
-            prop_assert!(parts.len() == 1 || parts.iter().all(|part| part.1.len() >= 2), "{:?} leaves a line alone: {:?}", id, parts);
             let source = blocks[block(&id)];
+            // A row of pictures may stand alone on a page, as no line of text does.
+            let rows = matches!(source.kind, BlockKind::Gallery { .. });
+            prop_assert!(rows || parts.len() == 1 || parts.iter().all(|part| part.1.len() >= 2), "{:?} leaves a line alone: {:?}", id, parts);
             if starts.contains(&id) {
                 prop_assert!(pages.sheets[parts[0].0].blocks[0].0 == id, "{:?} starts a page", id);
             }

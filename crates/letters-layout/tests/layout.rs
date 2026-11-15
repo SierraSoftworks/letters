@@ -2,7 +2,8 @@
 
 use letters_layout::{Callout, DocLayout, FontSpec, Fonts, Palette, Shaper, Token, TokenKind};
 use letters_model::{
-    Block, BlockKind, Body, Document, ListKind, Mark, Model, Op, Pos, ReplicaId, Run, Selection, Style, TextStyle, Tone,
+    Align, Block, BlockKind, Body, Document, ListKind, Mark, Model, Op, Pos, ReplicaId, Run, Selection, Style,
+    TextStyle, Tone,
 };
 use letters_render::{Color, DisplayList, Item, Point, Rect};
 
@@ -24,6 +25,13 @@ fn every_kind_of_block_paints_inside_the_column() {
         ("divider", Block::new("d", BlockKind::Divider)),
         ("unknown", Block::new("u", BlockKind::Unknown { type_name: "chart".into() })),
         ("empty paragraph", paragraph("a", "")),
+        ("figure", figure("f", (300.0, 200.0), PROSE)),
+        ("linked figure", remote(figure("f", (1200.0, 200.0), ""), "https://example.org/a.png")),
+        (
+            "gallery",
+            gallery("g", (0..4).map(|at| figure(&format!("g{at}"), (300.0, 200.0), "")).collect(), Some(PROSE)),
+        ),
+        ("table", table("t", &[Align::Start, Align::End], true, &[&["Household", "Rate"], &[PROSE, "9%"]])),
     ];
     for (name, block) in cases {
         let layout = laid(&doc(vec![block]));
@@ -34,7 +42,7 @@ fn every_kind_of_block_paints_inside_the_column() {
         for item in &items {
             let Some((top, bottom)) = extent(item) else { continue };
             assert!(top >= -1.0 && bottom <= height + 1.0, "{name} stays inside its height: {item:?}");
-            if let Item::Fill { rect, .. } | Item::Stroke { rect, .. } = item {
+            if let Item::Fill { rect, .. } | Item::Stroke { rect, .. } | Item::Image { rect, .. } = item {
                 assert!(rect.x >= -0.5 && rect.x + rect.width <= WIDTH + 2.5, "{name} stays inside the column");
             }
         }

@@ -69,9 +69,6 @@ pub struct Sheet {
     pub(crate) first: (usize, usize),
 }
 
-/// A page never ends with fewer lines of a block than this, and never starts with fewer.
-const TOGETHER: usize = 2;
-
 /// Room for the rounding of positions that are whole pixels in sum.
 const SLACK: f32 = 0.01;
 
@@ -85,9 +82,11 @@ struct Cut {
 
 /// Splits settled leaves into pages that hold `room` of the column each.
 ///
-/// A leaf marked to break starts a page. A heading stays with the block after it. A block splits only where
-/// two of its lines stay and two go, and never inside a line of code. A leaf that no rule lets onto the page
-/// goes to the next one, unless it is all the page would hold: then the page takes what fits.
+/// A leaf marked to break starts a page. A heading stays with the block after it, and the header of a table
+/// with its first row. A block splits only where two of its lines stay and two go, and never inside a line of
+/// code. A gallery splits between any two rows of pictures. A figure and a row of a table stay whole. A leaf
+/// that no rule lets onto the page goes to the next one, unless it is all the page would hold: then the page
+/// takes what fits.
 pub(crate) fn sheets(leaves: &[Leaf], frames: &[Frame], room: f32) -> Vec<Sheet> {
     if leaves.is_empty() {
         return vec![Sheet { blocks: Vec::new(), band: (0.0, 0.0), first: (0, 0) }];
@@ -116,18 +115,22 @@ pub(crate) fn sheets(leaves: &[Leaf], frames: &[Frame], room: f32) -> Vec<Sheet>
             continue;
         }
 
-        let count = leaf.lines.max(1) as usize;
+        let (count, together) = (leaf.lines.max(1) as usize, leaf.together());
         let fits = leaf.lines_in(limit - leaf.y);
         let free = |before: &usize| leaf.joined.binary_search(&(*before as u32)).is_err();
         let cut = |before: usize| Cut { leaf: at, line: before, y: leaf.y + leaf.line_top(before) };
-        let stay = from + if from == 0 { TOGETHER } else { 1 };
-        if let Some(before) = (stay..=fits.min(count.saturating_sub(TOGETHER))).rev().find(free) {
+        let stay = from + if from == 0 { together } else { 1 };
+        // What must stay whole splits only when a page of its own is still too small for it.
+        let split = (opens || !leaf.whole())
+            .then(|| (stay..=fits.min(count.saturating_sub(together))).rev().find(free))
+            .flatten();
+        if let Some(before) = split {
             cuts.push(cut(before));
             from = before;
         } else if !opens {
             // It goes to the next page whole, and takes along the headings it follows.
             let mut first = at;
-            while first > page.leaf + 1 && leaves[first - 1].role.is_heading() {
+            while first > page.leaf + 1 && leaves[first - 1].leads() {
                 first -= 1;
             }
             cuts.push(Cut { leaf: first, line: 0, y: top(first) });
