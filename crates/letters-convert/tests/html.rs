@@ -1,6 +1,6 @@
 //! HTML export, through its one public function.
 
-use letters_convert::{from_markdown, to_html, to_html_themed};
+use letters_convert::{from_html, from_markdown, to_html, to_html_themed, to_markdown};
 use letters_layout::{Palette, Scheme};
 use letters_model::{Block, BlockKind, Document, ListKind, Mark, Run, Style};
 use letters_render::Color;
@@ -216,6 +216,46 @@ fn a_themed_page_goes_dark_where_its_reader_does() {
     let heading = dark.recolor(Color::rgb(0xaa, 0x33, 0x00));
     assert_eq!(rule(night, "h1"), format!(" color: {}; ", hex(heading)));
     assert_ne!(hex(heading), "#aa3300");
+}
+
+#[test]
+fn maths_is_drawn_and_reads_back() {
+    let doc = document("Mass is $E = mc^2$, where $a < b$.\n\n```math\n\\frac{a}{b}\n```\n\n- So $x^2$ holds.");
+    let html = export(&doc);
+    let body = article(&html);
+    for (element, tex) in [
+        ("span class=\"math inline\"", "E = mc^2"),
+        ("span class=\"math inline\"", "a &lt; b"),
+        ("p class=\"math display\"", "\\frac{a}{b}"),
+        ("span class=\"math inline\"", "x^2"),
+    ] {
+        assert!(body.contains(&format!("<{element} data-tex=\"{tex}\"><svg ")), "{tex} is not drawn: {body}");
+    }
+    // Each is a drawing in outlines, so the page needs no font for it, and the source is not shown beside it.
+    assert!(nests(&html), "{body}");
+    assert_eq!(body.matches("</svg>").count(), 4, "{body}");
+    assert!(tags(&body).iter().any(|name| name == "path"), "{body}");
+    let shown: String = body.split('<').map(|part| part.split_once('>').map_or(part, |(_, text)| text)).collect();
+    assert!(shown.contains("Mass is , where .") && !shown.contains("mc^2"), "{shown}");
+
+    // The page gives the document back, maths and all.
+    let mut next = 0;
+    let (back, _) = from_html(&html, &mut || {
+        next += 1;
+        format!("r{next}")
+    });
+    assert_eq!(to_markdown(&back), to_markdown(&doc));
+}
+
+#[test]
+fn maths_that_cannot_be_set_is_written_as_its_source() {
+    let doc = document("Mass is $\\frac{a$ here.\n\n```math\n\\notacommand{x}\n```");
+    let body = article(&export(&doc));
+    assert_eq!(
+        body,
+        "<p>Mass is <span class=\"math inline\">\\(\\frac{a\\)</span> here.</p> \
+         <p class=\"math display\">\\[\\notacommand{x}\\]</p>"
+    );
 }
 
 #[test]
