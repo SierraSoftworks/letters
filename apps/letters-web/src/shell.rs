@@ -5,6 +5,7 @@
 //! moves the hidden input under the caret, where the input method's candidate window should open.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::ops::Range;
 use std::rc::{Rc, Weak};
@@ -12,17 +13,18 @@ use std::sync::Arc;
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Array, Function, Map, Object, Promise, Reflect, Uint8Array};
-use letters_api::{Opened, paths};
+use letters_api::{Code, Fetch, Opened, Preview, paths};
 use letters_editor::{Clip, Editor, Key, KeyEvent, Modifiers, Picture, Platform as _};
 use letters_model::{
-    BlockKind, Change, Document, HistoryError, Mark, Model, Notes, Pos, ReplicaId, Revision, Selection, Style, TagKind,
+    BlockId, BlockKind, Change, Document, HistoryError, Mark, Model, Notes, Pos, ReplicaId, Revision, Selection, Style,
+    TagKind,
 };
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::{Color, DisplayList, Font, Point, Rect, Size};
 use letters_trust::{LinkDecision, Origin, Trust};
 use letters_ui::{
-    Appearance, CopyFormat, Cursor, Edge, Keys, Request, SaveState, Scheme, Settings, Uncovered, Window as View,
-    WordList, tokens,
+    Appearance, CopyFormat, Cursor, Edge, Keys, LinkPreviewFound, PictureState, Request, SaveState, Scheme, Settings,
+    Uncovered, Window as View, WordList, tokens,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
@@ -179,6 +181,12 @@ pub struct Shell {
     /// What the server behind the page says of the document on it. `None` for a page with no server, and
     /// once the person has opened a file of their own in the server's document's place.
     server: Option<Opened>,
+    /// The pictures the document links to that the server fetched, by the address each link is written
+    /// as, for a PDF to show what the window shows.
+    linked: HashMap<String, Vec<u8>>,
+    /// The hosts whose pictures the person said they trust, for as long as the page is open. The server
+    /// has nowhere to keep them.
+    hosts: Vec<String>,
     /// Whether the document's file is being written.
     saving: bool,
     /// What the window was last told of saving.
@@ -293,6 +301,8 @@ impl Shell {
                 let mut view = set_up(page::served_window(opened, server, replica), &mut platform, mac);
                 // The session's name signs the edits, whatever name this browser kept from another time.
                 view.set_author(&server.author);
+                // The server reads the pages a browser may not.
+                view.set_preview_fetching(true);
                 view
             }
             None => view(opened, &mut platform, mac),
@@ -325,6 +335,8 @@ impl Shell {
                 kept: view.edits(),
                 identity,
                 server,
+                linked: HashMap::new(),
+                hosts: Vec::new(),
                 saving: false,
                 save_state: SaveState::default(),
                 session: None,
@@ -483,6 +495,7 @@ impl Shell {
         self.view = view(document, &mut self.platform, self.mac);
         self.backed();
         (self.kept, self.identity, self.server) = (self.view.edits(), None, None);
+        self.linked.clear();
         (self.session, self.written, self.rested) = (None, self.kept, None);
         self.save_state = SaveState::default();
         self.text = TextInput::new(self.mac);
@@ -678,7 +691,9 @@ impl Shell {
         let authors: Array = editor.model().authors().iter().map(|author| JsValue::from(author.as_str())).collect();
         let created = self.platform.wall_time().map(|seconds| seconds as f64);
         let assets = Map::new();
-        for (name, file) in self.platform.assets.iter().filter(|(name, _)| document.contains(name.as_str())) {
+        // The linked pictures the window shows go along by their addresses, for a PDF to show them too.
+        let held = self.platform.assets.iter().chain(&self.linked);
+        for (name, file) in held.filter(|(name, _)| document.contains(name.as_str())) {
             assets.set(&name.into(), &Uint8Array::from(&file[..]));
         }
         let identity = kept.then(|| match source {
@@ -1049,6 +1064,7 @@ impl Shell {
             self.platform.assets.extend(name.as_string().map(|name| (name, picture)));
         });
         (self.kept, self.identity, self.server) = (view.edits(), Some(identity), None);
+        self.linked.clear();
         (self.session, self.written, self.rested) = (session, self.kept, None);
         self.save_state = SaveState::default();
         self.view = view;
@@ -1201,6 +1217,12 @@ impl Shell {
                 Request::Asset(name) => self.load(name),
                 Request::OpenLink { href, confirmed } => self.open_link(&href, confirmed),
                 Request::TrustDocument => self.trust(),
+                Request::LinkedPicture(src) => self.link(src, Linking::Open),
+                Request::LoadPicture(src) => self.link(src, Linking::Once),
+                Request::EmbedPicture { figure, src } => self.link(src, Linking::Embed(figure)),
+                // The window asks for that host's pictures again by itself.
+                Request::TrustPictures(src) => self.hosts.extend(host(&src)),
+                Request::FetchPreview { url } => self.preview(url),
                 // The window has taken the settings already. The rest is the shell's: keeping them, the
                 // name edits carry, and light or dark.
                 Request::Settings(settings) => {
@@ -1640,6 +1662,101 @@ impl Shell {
         }
     }
 
+    /// Has the server fetch a picture the document links to, which a page may not read from another site
+    /// itself: to show it, or to keep it in the document. The server fetches what its own rules allow, and
+    /// what nobody asked for only from a source it trusts.
+    fn link(&mut self, src: String, link: Linking) {
+        // Without a server the picture keeps its frame and cloud.
+        let Some(server) = &self.server else { return };
+        if server.trust == letters_api::Trust::Safe {
+            // The window asks again by itself once the document is trusted.
+            return self.view.set_picture_state(&src, Some(PictureState::Held));
+        }
+        let trusted = host(&src).is_some_and(|host| self.hosts.contains(&host));
+        self.view.set_picture_trusted(&src, trusted);
+        let asked = trusted || !matches!(link, Linking::Open);
+        // A picture nobody asked for waits as it is: the server may well not fetch it.
+        if !matches!(link, Linking::Open) {
+            self.view.set_picture_state(&src, Some(PictureState::Loading));
+        }
+        let (id, fetch) = (server.id.clone(), Fetch { url: src.clone(), asked });
+        let sent = fetching(&self.window, &paths::fetch_picture(&id), &fetch);
+        let (shell, window) = (self.me.clone(), self.window.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let fetched = sent.await;
+            let (mut picture, mut image) = (None, None);
+            match (&fetched, &link) {
+                (Ok(bytes), Linking::Embed(_)) => picture = browser::picture_of(&window, bytes).await,
+                (Ok(bytes), _) => image = browser::decode(&window, bytes).await,
+                (Err(_), _) => {}
+            }
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            let shell = &mut *shell;
+            // The page may show another document by now.
+            if shell.server.as_ref().is_none_or(|server| server.id != id) {
+                return;
+            }
+            let failed = |why: &str| Some(PictureState::Failed(why.to_owned()));
+            match (fetched, link) {
+                // It waits to be asked for, as any picture from a source nobody said they trust.
+                (Err(refusal), Linking::Open) if refusal.code == Code::Untrusted => {}
+                (Err(refusal), _) => shell.view.set_picture_state(&src, failed(&reason(&refusal))),
+                (Ok(_), Linking::Embed(figure)) => match picture {
+                    Some(picture) => {
+                        shell.view.set_picture_state(&src, None);
+                        shell.view.embed_picture(&figure, picture, &mut shell.platform);
+                    }
+                    None => shell.view.set_picture_state(&src, failed(NO_PICTURE)),
+                },
+                (Ok(bytes), _) => match image {
+                    Some(image) => {
+                        shell.linked.insert(src.clone(), bytes);
+                        shell.view.set_image(&src, Some(image));
+                    }
+                    None => shell.view.set_picture_state(&src, failed(NO_PICTURE)),
+                },
+            }
+            shell.arrived();
+        });
+    }
+
+    /// Has the server read the page at an address for the window's link previews: what the page says of
+    /// itself, and the picture it shows itself by, which the document then keeps.
+    fn preview(&mut self, url: String) {
+        let Some(id) = self.server.as_ref().map(|server| server.id.clone()) else {
+            return self.view.fail_preview(&url, "there is no server to fetch it");
+        };
+        let sent = fetching(&self.window, &paths::fetch_preview(&id), &Fetch { url: url.clone(), asked: true });
+        let (shell, window) = (self.me.clone(), self.window.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let found = match sent.await {
+                Ok(found) => serde_json::from_slice::<Preview>(&found)
+                    .map_err(|_| "the server's answer could not be read".to_owned()),
+                Err(refusal) => Err(reason(&refusal)),
+            };
+            // A page whose picture cannot be had is still what it says of itself.
+            let mut picture = None;
+            if let Ok(Preview { picture: Some(address), .. }) = &found {
+                let fetch = Fetch { url: address.clone(), asked: true };
+                if let Ok(bytes) = fetching(&window, &paths::fetch_picture(&id), &fetch).await {
+                    picture = browser::picture_of(&window, &bytes).await;
+                }
+            }
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            let shell = &mut *shell;
+            match found {
+                Ok(Preview { title, description, .. }) => {
+                    let found = LinkPreviewFound { url, title, description, picture };
+                    shell.view.fill_preview(found, &mut shell.platform);
+                }
+                Err(why) => shell.view.fail_preview(&url, &why),
+            }
+            shell.arrived();
+        });
+    }
+
     /// Fetches the pictures `document` shows that the page never came to show, so that a copy of it
     /// leaves none out. `then` is told why if one cannot be had.
     fn gather(&mut self, document: &Document, then: impl FnOnce(&mut Self, Result<(), String>) + 'static) {
@@ -2002,6 +2119,41 @@ pub fn carried(window: &Window, platform: &mut Browser) -> Document {
             welcome
         }
     }
+}
+
+/// What a linked picture is fetched for.
+enum Linking {
+    /// The document opened, and nobody asked.
+    Open,
+    /// The person asked for it this once.
+    Once,
+    /// The person wants it kept in this figure.
+    Embed(BlockId),
+}
+
+/// What a figure says of a file that was fetched for it and is no picture, as the desktop does.
+const NO_PICTURE: &str = "it is not a picture Letters can show";
+
+/// Asks the server to fetch an address on the document's behalf.
+fn fetching(
+    window: &Window,
+    path: &str,
+    fetch: &Fetch,
+) -> impl Future<Output = Result<Vec<u8>, letters_api::Error>> + 'static + use<> {
+    let fetch = serde_json::to_vec(fetch).expect("an address to fetch is JSON");
+    browser::ask(window, "POST", path, Some((letters_api::JSON, &fetch)))
+}
+
+/// The host of an address, which is what a person trusts pictures from.
+fn host(src: &str) -> Option<String> {
+    Url::new(src).ok().map(|url| url.host()).filter(|host| !host.is_empty())
+}
+
+/// Why the server did not fetch, in words that read on from "Not loaded:": its own sentence, as part of one.
+fn reason(refusal: &letters_api::Error) -> String {
+    let said = refusal.message.trim().trim_end_matches('.');
+    let mut letters = said.chars();
+    letters.next().map(|first| first.to_lowercase().chain(letters).collect()).unwrap_or_default()
 }
 
 /// Where the server keeps a picture of the document `id`, by the name the document has for it.

@@ -48,13 +48,13 @@ export const picture = ([red, green, blue], width = 64, height = 48) => {
   return { bytes, name: `assets/${createHash("sha256").update(bytes).digest("hex")}.png` };
 };
 
-/** A document that shows the pictures called `names`, under a heading. */
-export const album = (names) => ({
+/** A document that shows these figures under a heading: each is its `asset` or its `src`, with a size. */
+export const album = (figures) => ({
   format: 1,
   language: "en",
   blocks: [
     { id: "h", type: "heading", level: 1, content: [{ text: "Album" }] },
-    ...names.map((asset, at) => ({ id: `f${at}`, type: "figure", asset, alt: "", width: 64, height: 48 })),
+    ...figures.map((figure, at) => ({ id: `f${at}`, type: "figure", alt: "", width: 64, height: 48, ...figure })),
     { id: "p", type: "paragraph", content: [] },
   ],
 });
@@ -79,7 +79,7 @@ const composed = (said, document) => {
 
 /**
  * Opens the server's page for the document `said` is about, and waits for the editor as `ready` does.
- * `answer(method, path)` is what the server answers a request with, as `{ status, body, type }`: nothing is
+ * `answer(method, path, body)` is what the server answers a request with, as `{ status, body, type }`: nothing is
  * there otherwise. `document` is its `document.json`, the welcome document if none is given. Resolves to
  * the requests the page made of the server, as they come.
  */
@@ -100,7 +100,7 @@ export const serve = async (page, said, answer = () => undefined, document = und
     const path = new URL(request.url()).pathname;
     asked.push({ method: request.method(), path, body: request.postDataBuffer(), type: await request.headerValue("content-type") });
     const nothing = { status: 404, body: { code: "not_found", message: "Nothing is there." } };
-    const { status = 200, body = "", type = "application/json" } = answer(request.method(), path) ?? nothing;
+    const { status = 200, body = "", type = "application/json" } = answer(request.method(), path, request.postData()) ?? nothing;
     const sent = typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body);
     await route.fulfill({ status, contentType: type, body: sent });
   });

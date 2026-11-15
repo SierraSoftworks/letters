@@ -13,6 +13,35 @@ const DOCUMENT = `/api/v1/documents/${opened().id}`;
 const TRUST = `${DOCUMENT}/trust`;
 const bar = (page) => page.getByText(/^Safe mode:/);
 
+/** Clicks the control with this name where the canvas draws it. */
+const click = async (page, name) => {
+  const box = await page.getByRole("button", { name, exact: true }).boundingBox();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+};
+
+/** Runs an entry of the command palette. */
+const run = async (page, command) => {
+  await page.keyboard.press("ControlOrMeta+Shift+p");
+  await page.keyboard.type(command);
+  await rested(page);
+  await page.keyboard.press("Enter");
+};
+
+/** What the page asked of the server, a line each. A body of JSON is told too. */
+const told = (asked) =>
+  asked.map(({ method, path, body, type }) => [method, path.replace(DOCUMENT, ""), ...(type === "application/json" ? [body.toString()] : [])].join(" "));
+
+/** The server's answers to a fetch: `fetch(url, asked)` for a picture's address, `preview` for a page's. */
+const fetches = ({ fetch = () => undefined, preview } = {}) => (method, path, body) => {
+  if (method === "POST" && path === `${DOCUMENT}/fetch/picture`) {
+    const { url, asked } = JSON.parse(body);
+    const bytes = fetch(url, asked);
+    return bytes ? { body: bytes, type: "image/png" } : { status: 422, body: { code: "untrusted", message: "The server may not fetch this address." } };
+  }
+  if (method === "POST" && path === `${DOCUMENT}/fetch/preview`) return preview;
+  return method === "PUT" ? { status: 204 } : undefined;
+};
+
 test("the server's page opens its document as the server says, under a policy that lets no inline script run", async ({ page }) => {
   const said = opened({ style: { format: 1, page: { margin_top: 99 } } });
   await serve(page, said);
@@ -50,9 +79,7 @@ for (const { name, answer, held, told } of answers) {
     const asked = await serve(page, opened({ trust: "safe" }), (method, path) => (path === TRUST ? answer : undefined));
     await expect(bar(page)).toBeAttached();
 
-    // Where the canvas draws the button.
-    const box = await page.getByRole("button", { name: "Trust this document" }).boundingBox();
-    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await click(page, "Trust this document");
     await expect.poll(() => asked.map(({ method, path }) => `${method} ${path}`)).toEqual([`POST ${TRUST}`]);
     if (told) {
       await expect.poll(() => said).toHaveLength(1);
@@ -69,7 +96,7 @@ test("the pictures of the server's document come from the server, those the page
   const [shown, below] = [picture(INK), picture([0, 128, 255], 64, 4000)];
   const kept = new Map([shown, below].map(({ name, bytes }) => [`${DOCUMENT}/${name}`, bytes]));
   const answer = (method, path) => (method === "GET" && kept.has(path) ? { body: kept.get(path), type: "image/png" } : undefined);
-  const asked = await serve(page, opened(), answer, album([shown.name, below.name]));
+  const asked = await serve(page, opened(), answer, album([{ asset: shown.name }, { asset: below.name }]));
   await expect.poll(() => inked(page)).toBeGreaterThan(1000);
 
   // A copy of the document leaves none of them out.
@@ -88,7 +115,7 @@ test("a copy is not made of a document whose picture the server does not give", 
   page.on("dialog", (dialog) => (said.push(dialog.message()), dialog.accept()));
   let downloads = 0;
   page.on("download", () => downloads++);
-  await serve(page, opened(), undefined, album([picture(INK).name]));
+  await serve(page, opened(), undefined, album([{ asset: picture(INK).name }]));
   await page.keyboard.press("ControlOrMeta+s");
   await expect.poll(() => said).toHaveLength(1);
   expect(said[0]).toMatch(/could not be saved.*picture/);
@@ -118,3 +145,92 @@ for (const { name, answer, told } of keeps) {
     await expect.poll(() => said).toEqual(told ? ["A picture may be 32 MB at most."] : []);
   });
 }
+
+const SRC = "https://pictures.example/boat.png";
+/** A document whose one picture is linked, large enough to press in the middle of the page. */
+const linked = album([{ src: SRC, width: 400, height: 300 }]);
+/** A PDF of the document, as text. */
+const pdf = async (page) => {
+  await page.keyboard.press("ControlOrMeta+Shift+s");
+  await expect(page.getByRole("dialog", { name: "Save a copy" })).toBeAttached();
+  await page.keyboard.type("Album");
+  await click(page, "PDF");
+  await rested(page);
+  const kept = page.waitForEvent("download");
+  await page.keyboard.press("Enter");
+  return (await readFile(await (await kept).path())).toString("latin1");
+};
+const asking = (asked) => `POST /fetch/picture ${JSON.stringify({ url: SRC, asked })}`;
+
+test("a linked picture is fetched by the server when the document opens, if the server trusts its source", async ({ page }) => {
+  const asked = await serve(page, opened(), fetches({ fetch: () => picture(INK).bytes }), linked);
+  await expect.poll(() => inked(page)).toBeGreaterThan(1000);
+  expect(told(asked)).toEqual([asking(false)]);
+});
+
+test("a linked picture the server does not fetch unasked waits for the person, who may load it or keep it", async ({ page }) => {
+  const shot = picture(INK);
+  const asked = await serve(page, opened(), fetches({ fetch: (_, asked) => asked && shot.bytes }), linked);
+  await rested(page);
+  expect(await inked(page)).toBe(0);
+  expect(await pdf(page)).not.toContain("/Subtype/Image");
+
+  await page.mouse.click(600, 300);
+  await run(page, "Load image once");
+  await expect.poll(() => inked(page)).toBeGreaterThan(1000);
+  expect(told(asked)).toEqual([asking(false), asking(true)]);
+  // A PDF shows what the window shows.
+  expect(await pdf(page)).toContain("/Subtype/Image");
+
+  // Kept in the document, it is the document's own picture, and the server's to keep.
+  await run(page, "Embed image in the document");
+  await expect.poll(async () => JSON.parse(await page.evaluate(() => window.letters.json())).blocks[1].asset).toBe(shot.name);
+  await expect.poll(() => told(asked).at(-1)).toBe(`PUT /${shot.name}`);
+});
+
+test("a document in safe mode has no linked picture fetched until the person trusts it", async ({ page }) => {
+  const answer = fetches({ fetch: () => picture(INK).bytes });
+  const asked = await serve(page, opened({ trust: "safe" }), (method, path, body) => (path === TRUST ? { status: 204 } : answer(method, path, body)), linked);
+  await rested(page);
+  expect(told(asked)).toEqual([]);
+
+  await click(page, "Trust this document");
+  await expect.poll(() => inked(page)).toBeGreaterThan(1000);
+  expect(told(asked)).toEqual(["POST /trust", asking(false)]);
+});
+
+const PAGE = "https://example.com/article";
+/** Puts a link preview of `PAGE` into the document. */
+const previewed = async (page) => {
+  await run(page, "Link preview");
+  await expect(page.getByRole("dialog", { name: "Link preview" })).toBeAttached();
+  await page.keyboard.type(PAGE);
+  await page.keyboard.press("Enter");
+};
+const preview = async (page) => JSON.parse(await page.evaluate(() => window.letters.json())).blocks.find((block) => block.type === "link_preview");
+
+test("a link preview is what the server read of the page, and its picture becomes the document's", async ({ page }) => {
+  const shot = picture(INK);
+  const found = { title: "An article", description: "What it is about.", picture: "https://example.com/cover.png" };
+  const asked = await serve(page, opened(), fetches({ fetch: (url) => url === found.picture && shot.bytes, preview: { body: found } }));
+  await previewed(page);
+
+  await expect.poll(() => preview(page)).toMatchObject({ url: PAGE, title: "An article", description: "What it is about.", image: shot.name });
+  await expect.poll(() => told(asked)).toEqual([
+    `POST /fetch/preview ${JSON.stringify({ url: PAGE, asked: true })}`,
+    `POST /fetch/picture ${JSON.stringify({ url: found.picture, asked: true })}`,
+    `PUT /${shot.name}`,
+  ]);
+});
+
+test("a link preview the server could not read says why in the server's words, and offers another try", async ({ page }) => {
+  const refusal = { status: 502, body: { code: "upstream", message: "The page answered 404." } };
+  await serve(page, opened(), fetches({ preview: refusal }));
+  await previewed(page);
+
+  await expect(page.getByRole("button", { name: "Try again" })).toBeAttached();
+  // The preview's card says what the page says under it.
+  await click(page, "Edit link preview");
+  await expect(page.getByText("Not fetched: the page answered 404")).toBeAttached();
+  expect(await preview(page)).toEqual(expect.objectContaining({ url: PAGE }));
+});

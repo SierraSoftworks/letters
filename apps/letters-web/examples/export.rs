@@ -58,7 +58,7 @@ pub fn backup(name: &str, file: Vec<u8>) {
 
 /// Writes a document in another format, from its `document.json`, `style.json` and `notes.json`. `format`
 /// is what such a file's name ends in: `pdf`, `docx`, `html` or `md`. `assets` holds the pictures the
-/// document shows, by their names in it. `created` is in seconds since 1970 began.
+/// document shows, by their names in it, and the linked pictures the window shows, by their addresses. `created` is in seconds since 1970 began.
 ///
 /// The format `let` is the document's own file: it takes its `history`, which is what `Model::save`
 /// writes, and its `identity`, which is its id and when it was created as RFC 3339. A copy is given an
@@ -110,7 +110,11 @@ pub fn exported(
                 }
                 held
             };
-            let sources = PdfSources { backups: Some(&mut backups), words: Some(&mut words), linked: None };
+            // The linked pictures the window shows come among the assets, by their addresses.
+            let mut linked =
+                |src: &str| Some(Uint8Array::new(&assets.get(&src.into())).to_vec()).filter(|file| !file.is_empty());
+            let sources =
+                PdfSources { backups: Some(&mut backups), words: Some(&mut words), linked: Some(&mut linked) };
             let pdf = to_pdf_with(&document, &style, fonts, &mut asset, &info, sources)?;
             (pdf, "pdf", "application/pdf")
         }

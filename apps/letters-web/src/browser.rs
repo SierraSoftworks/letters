@@ -104,6 +104,15 @@ pub async fn picture(window: &Window, file: &Blob) -> Option<Picture> {
     Some(Picture { bytes, mime, width, height })
 }
 
+/// A picture from the bytes of its file, as a server fetched them. `None` for what is no picture Letters
+/// can show.
+pub async fn picture_of(window: &Window, bytes: &[u8]) -> Option<Picture> {
+    let kind = BlobPropertyBag::new();
+    kind.set_type(mime(bytes)?);
+    let file = Blob::new_with_u8_array_sequence_and_options(&Array::of1(&Uint8Array::from(bytes)), &kind).ok()?;
+    picture(window, &file).await
+}
+
 /// The pixels of a picture the document keeps, decoded by the browser, which has the decoders already and
 /// runs them off this thread.
 pub async fn decode(window: &Window, bytes: &[u8]) -> Option<Image> {
