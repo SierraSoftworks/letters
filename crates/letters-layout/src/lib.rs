@@ -55,7 +55,7 @@ use crate::reveal::{Reveal, Shapes, Shifts};
 
 pub use crate::callout::icon_path;
 pub use crate::engine::{Uncovered, reads};
-pub use crate::flow::rtl;
+pub use crate::flow::{leads, rtl};
 pub use crate::paginate::{Heading, PageBlock, PageLink, Pages, Sheet};
 pub use crate::palette::{Callout, Palette, Scheme, Syntax};
 pub use crate::shape::{FontSpec, ShapedRun, ShapedText, Shaper};
