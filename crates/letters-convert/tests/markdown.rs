@@ -724,6 +724,8 @@ fn a_callout_title_follows_its_tag() {
         ("> [!WARNING] 3 * 4 [x]\n> Body", Some("3 * 4 [x]"), "Body"),
         ("> [!NOTE] Info\n> Body", None, "Body"),
         ("> [!NOTE]\n> Body", None, "Body"),
+        // Spaces alone are no title, however they are written.
+        ("> [!NOTE] &#32;\n> Body", None, "Body"),
         // A title that is more than plain text stays a line of the text.
         ("> [!NOTE] Heads **up**\n> Body", None, "Heads up\nBody"),
     ];

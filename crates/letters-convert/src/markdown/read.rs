@@ -351,7 +351,8 @@ impl<'a> Reader<'a, '_> {
                     _ => String::new(),
                 })
                 .collect();
-            title = Some(text.trim().to_owned()).filter(|title| *title != tone.title());
+            // A title of spaces alone, as an escape can write one, is no title.
+            title = Some(text.trim().to_owned()).filter(|title| !title.is_empty() && *title != tone.title());
         }
         if let Some(line_end) = (first..self.events.len()).find(|i| is_line_end(&self.events[*i].0)) {
             match &self.events[line_end].0 {
