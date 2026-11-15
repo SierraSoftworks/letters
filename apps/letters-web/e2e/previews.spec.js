@@ -4,7 +4,7 @@ import { expect, test } from "@playwright/test";
 
 import { blocks, ready, rested } from "./page.js";
 
-test("a link preview that is put in says why it was not fetched, and is asked for no longer", async ({ page }) => {
+test("a link preview that is put in shows its address, and offers no fetch that could not succeed", async ({ page }) => {
   await ready(page);
   await page.keyboard.press("ControlOrMeta+Shift+p");
   await page.keyboard.type("Link preview");
@@ -14,15 +14,9 @@ test("a link preview that is put in says why it was not fetched, and is asked fo
   await page.keyboard.type("https://example.com/article");
   await page.keyboard.press("Enter");
 
-  // The preview is in the document with its address, and its control offers another try with the reason.
   await expect.poll(async () => (await blocks(page)).map((block) => block.type)).toContain("link_preview");
-  const again = page.getByRole("button", { name: "Try again" });
-  await expect(again).toHaveAccessibleDescription(/Not fetched: a preview cannot be fetched in the browser/);
-  await expect(page.getByRole("button", { name: /Fetching/ })).not.toBeAttached();
-
-  // Another try is answered as the first was, and never left waiting.
-  await again.dispatchEvent("click");
+  await expect(page.getByRole("link", { name: "https://example.com/article" })).toBeAttached();
+  // Nothing waits for an answer that never comes, and nothing asks for one.
   await rested(page);
-  await expect(again).toHaveAccessibleDescription(/Not fetched/);
-  await expect(page.getByRole("button", { name: /Fetching/ })).not.toBeAttached();
+  await expect(page.getByRole("button", { name: /Fetch|Try again/ })).not.toBeAttached();
 });
