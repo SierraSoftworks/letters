@@ -41,6 +41,7 @@ mod settings;
 mod spelling;
 mod style;
 mod styles;
+mod tables;
 mod tex;
 mod text;
 mod theme;

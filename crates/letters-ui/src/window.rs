@@ -53,6 +53,7 @@ use crate::settings::{Dialog, Setting, Settings};
 use crate::spelling::{Fix, Spelling};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::styles::{self, Styles, Styling};
+use crate::tables::{self, Tables};
 use crate::text::{Family, FontShaper, TextShaper, TextStyle};
 use crate::theme::{Accent, accent};
 use crate::threads::{self, Said};
@@ -203,6 +204,8 @@ pub enum Message {
     Settings(Setting),
     /// What the menu on a linked picture's cloud asks for.
     Linked(Linking),
+    /// Puts the menu of the caret's column or row away.
+    TableMenu,
     /// What the field of a picture's alt text asks for.
     Alt(Altering),
     /// What the tools over a selection and the field of a comment ask for.
@@ -778,6 +781,7 @@ pub struct EditorApp {
     refer: Refer,
     references: References,
     code_copy: CodeCopy,
+    tables: Tables,
     /// The preview of a figure that shows over the page: its caption, and where it is in the page area.
     previewed: Option<(String, Rect)>,
     /// How the document read when assistive technology was last told of it.
@@ -850,6 +854,7 @@ impl EditorApp {
             refer: Refer::default(),
             references: References::default(),
             code_copy: CodeCopy::default(),
+            tables: Tables::default(),
             previewed: None,
             told: RefCell::default(),
         }
@@ -2080,7 +2085,7 @@ impl EditorApp {
         let asked = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
         let asked = asked || self.captions.alt.is_some() || self.margin.writing().is_some();
         let asked = asked || self.margin.reading().is_some();
-        let asked = asked || self.commands.open();
+        let asked = asked || self.commands.open() || self.tables.open.is_some();
         card || asked || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
     }
 
@@ -2106,6 +2111,79 @@ impl EditorApp {
         let Some(code) = self.editor.doc().block(&block) else { return };
         platform.clipboard_write(Clip { text: code.plain_text(), ..Clip::default() });
         self.code_copy.copied(block, platform.now_ms());
+    }
+
+    /// The cell the caret is in, when it is in one.
+    fn caret_cell(&self) -> Option<&BlockId> {
+        self.editor.cell()?;
+        self.editor.selection().map(|selection| &selection.head.block)
+    }
+
+    /// The table whose handles show: the one a press on them holds, the one the pointer rests over or the
+    /// one the caret is in. None shows while a conflict is open, or something else hangs over the page.
+    fn table(&self) -> Option<tables::Shown> {
+        if let Some(held) = self.tables.held_on() {
+            return Some(held.clone());
+        }
+        let menu = self.tables.open.is_some();
+        let gripped = self.grip.resizing.is_some() || self.grip.moving.is_some();
+        if (self.hung() && !menu) || self.cut().is_some() || gripped {
+            return None;
+        }
+        let pointer = self.references.rest().filter(|_| !menu).map(|at| self.in_layout(at));
+        tables::Shown::find(self.layout.tables(self.viewport()), pointer, self.caret_cell())
+    }
+
+    /// The handle or bar of a table at a point of the page area.
+    fn table_part(&self, at: Point) -> Option<(tables::Shown, tables::Part)> {
+        let shown = self.table().filter(|_| self.tables.open.is_none())?;
+        let part = shown.part_at(self.in_layout(at))?;
+        Some((shown, part))
+    }
+
+    /// Does what a press on a table's handles asked for, at the column or row it was about.
+    fn tabled(&mut self, shown: &tables::Shown, asked: tables::Asked, platform: &mut dyn Platform) {
+        let (axis, index) = match asked {
+            tables::Asked::Menu(axis, index) | tables::Asked::Move { axis, from: index, .. } => (axis, Some(index)),
+            tables::Asked::Add(axis) => (axis, None),
+        };
+        // The commands of a table act where the caret is, so it goes there first.
+        let Some(cell) = shown.cell(axis, index, self.caret_cell()) else { return };
+        if self.caret_cell() != Some(&cell) || !self.editor.selection().is_some_and(Selection::is_caret) {
+            self.editor.select(Selection::caret(Pos::new(cell, 0)));
+            self.mark();
+        }
+        let edit = match (asked, axis) {
+            (tables::Asked::Menu(..), _) => {
+                (self.link, self.spelling.fix, self.captions.alt) = (None, None, None);
+                self.margin.shut();
+                self.tables.open = Some(axis);
+                return self.reveal();
+            }
+            (tables::Asked::Add(_), tables::Axis::Column) => TableEdit::AddColumn { after: true },
+            (tables::Asked::Add(_), tables::Axis::Row) => TableEdit::AddRow { below: true },
+            (tables::Asked::Move { to, .. }, tables::Axis::Column) => TableEdit::MoveColumn { to },
+            (tables::Asked::Move { to, .. }, tables::Axis::Row) => TableEdit::MoveRow { to },
+        };
+        self.edit(platform, |editor, platform| editor.run(Command::Table(edit), platform));
+    }
+
+    /// The menu of the caret's column or row, hung from its handle.
+    fn table_menu(&self) -> Option<Popover<Message>> {
+        let (axis, cell, shown) = (self.tables.open?, self.editor.cell()?, self.table()?);
+        let index = match axis {
+            tables::Axis::Column => cell.column,
+            tables::Axis::Row => cell.row,
+        };
+        let spot = self.onto(shown.rect(tables::Part::Handle(axis, index))?);
+        let aligned = match &self.editor.doc().block(&cell.table)?.kind {
+            BlockKind::Table { columns, .. } => columns.get(cell.column).copied(),
+            _ => None,
+        };
+        // Only the first row can be the header.
+        let header = self.header().filter(|_| cell.row == 0);
+        let menu = tables::menu(axis, |act| self.asked(act), aligned, header);
+        Some(menu.popover().at(spot).open(true).on_close(Message::TableMenu))
     }
 
     /// Whether the first line a code block shows runs as far as the copy button at `button`, in the layout.
@@ -2168,7 +2246,9 @@ impl EditorApp {
         let marker = rest.and_then(|at| self.marker_at(self.in_layout(at)));
         let marked = self.margin.over != marker;
         self.margin.over = marker;
-        self.references.point(found) || copy || clouded || gripped || switched || marked
+        let part = rest.and_then(|at| self.table_part(at)).map(|(_, part)| part);
+        let tabled = self.tables.point(part);
+        self.references.point(found) || copy || clouded || gripped || switched || marked || tabled
     }
 
     /// Forgets where the pointer rests until it next moves, as when the person goes on writing.
@@ -2225,6 +2305,12 @@ impl EditorApp {
                 let button = self.copy_button(at);
                 self.code_copy.press(button);
                 if self.code_copy.held() {
+                    self.dragging = false;
+                    return self.references.press(None);
+                }
+                // A press on a handle or a bar of a table is theirs, and so is where the pointer goes with it.
+                if let Some((shown, part)) = self.table_part(at) {
+                    self.tables.press(shown, part, self.in_layout(at));
                     self.dragging = false;
                     return self.references.press(None);
                 }
@@ -2298,6 +2384,12 @@ impl EditorApp {
                     1 => self.reveal(),
                     2 => self.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform)),
                     _ => self.edit(platform, |editor, platform| editor.run(Command::SelectBlock, platform)),
+                }
+            }
+            Pointer::Drag { at } if self.tables.held() => self.tables.drag(self.in_layout(at), DRAG_SLOP),
+            Pointer::Up { at } if self.tables.held() => {
+                if let Some((shown, asked)) = self.tables.release(self.in_layout(at)) {
+                    self.tabled(&shown, asked, platform);
                 }
             }
             Pointer::Drag { at } if self.grip.resizing.is_some() => {
@@ -2591,6 +2683,11 @@ impl EditorApp {
             self.code_copy.paint(&block, button, behind, self.scheme, &mut list);
         }
 
+        // The table the pointer is over or the caret is in has its handles round it.
+        if let Some(shown) = self.table() {
+            self.tables.paint(&shown, self.accent.base, self.scheme, &mut list);
+        }
+
         // Beside each block with open notes is their marker, in the margin.
         let read = self.margin.reading().map(|(note, _)| note.id.as_str());
         for (marker, at) in self.markers() {
@@ -2708,6 +2805,8 @@ impl EditorApp {
             let menu = pictures::menu(src, loaded, said, self.linked.vouched(src), self.safe.on());
             let menu = menu.popover().at(spot).align(Align::End);
             element = element.popover(menu.open(true).on_close(Message::Linked(Linking::Close)));
+        } else if let Some(menu) = self.table_menu() {
+            element = element.popover(menu);
         } else if let Some(((_, text), (_, line, switch))) = self.captions.alt.as_ref().zip(self.alt_switch()) {
             element = element.popover(captions::sheet(text, self.onto(line), self.onto(switch)));
         } else if let Some(fix) = &self.spelling.fix {
@@ -2771,6 +2870,7 @@ impl EditorApp {
         // which the pointer's shape says.
         let pressable = self.references.pointed().is_some() || self.code_copy.pointed() || self.linked.on_cloud();
         let pressable = pressable || self.captions.over || self.margin.over.is_some() || self.review.pressable();
+        let pressable = pressable || self.tables.pointed();
         match self.grip.corner() {
             Some(corner) => element.cursor(Cursor::Resize(figures::edge(corner))),
             None if pressable => element.cursor(Cursor::Pointer),
@@ -3675,6 +3775,7 @@ impl App for EditorApp {
             Message::Insert(Inserting::Close) => self.insert.close(),
             Message::Refer(Picking::Take(figure)) => self.refer(figure, platform),
             Message::Linked(asked) => self.linking(asked),
+            Message::TableMenu => self.tables.open = None,
             Message::Safe(asked) => self.safely(asked),
             Message::Alt(asked) => self.altering(asked, platform),
             Message::Note(asked) => self.noting(asked, platform),
@@ -3794,6 +3895,17 @@ impl App for EditorApp {
         for (marker, at) in self.markers() {
             describe::marker(&marker.block, &marker.label(), self.onto(at), page, nodes);
         }
+        if let Some(shown) = self.table() {
+            for (part, at) in shown.parts() {
+                let (axis, index, add) = match part {
+                    tables::Part::Handle(axis, index) => (axis, Some(index), false),
+                    tables::Part::Add(axis) => (axis, None, true),
+                };
+                let Some(cell) = shown.cell(axis, index, self.caret_cell()) else { continue };
+                let told = (axis == tables::Axis::Row, add);
+                describe::table_part(&cell, told, &tables::label(part), self.onto(at), page, nodes);
+            }
+        }
         self.review.describe(page, nodes);
     }
 
@@ -3824,6 +3936,16 @@ impl App for EditorApp {
             }
             Some(describe::Request::Copy(block)) => self.copy_code(block, platform),
             Some(describe::Request::Note(block)) => self.noting(Noting::Press(block), platform),
+            Some(describe::Request::Table { cell, row, add }) => {
+                // The caret goes to the cell, and its table then shows the handles of its column and row.
+                self.editor.select(Selection::caret(Pos::new(cell, 0)));
+                self.mark();
+                let axis = if row { tables::Axis::Row } else { tables::Axis::Column };
+                let Some((at, shown)) = self.editor.cell().zip(self.table()) else { return };
+                let index = if row { at.row } else { at.column };
+                let asked = if add { tables::Asked::Add(axis) } else { tables::Asked::Menu(axis, index) };
+                self.tabled(&shown, asked, platform);
+            }
             Some(describe::Request::Alt(figure)) => {
                 self.editor.select_picture(&figure);
                 self.mark();

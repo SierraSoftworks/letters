@@ -89,6 +89,26 @@ pub struct FigureBox {
     pub badge: Option<Rect>,
 }
 
+/// Where a table is drawn. See [`DocLayout::tables`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableBox {
+    /// The whole table.
+    pub rect: Rect,
+    /// The left edge and the width of each column.
+    pub columns: Vec<(f32, f32)>,
+    /// Its rows, from the top.
+    pub rows: Vec<TableRow>,
+}
+
+/// A row of a table, where it is drawn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableRow {
+    pub y: f32,
+    pub height: f32,
+    /// Its cells, in the order of the columns.
+    pub cells: Vec<BlockId>,
+}
+
 /// The number of each numbered figure and gallery of `doc`, in the order of the document. These are the
 /// numbers layout draws, for an export that writes the labels itself.
 pub fn figure_numbers(doc: &Document) -> Vec<(BlockId, u32)> {
@@ -443,6 +463,12 @@ impl DocLayout {
     /// The code blocks that `viewport` shows, in order, each with the box drawn behind its text.
     pub fn code_boxes(&self, viewport: Rect) -> Vec<(BlockId, Rect)> {
         self.state.borrow_mut().code_boxes(viewport)
+    }
+
+    /// The tables that `viewport` shows any row of, in order, each with all its rows. A row out of view
+    /// may still have a height that is an estimate.
+    pub fn tables(&self, viewport: Rect) -> Vec<TableBox> {
+        self.state.borrow_mut().tables(viewport)
     }
 
     /// The rectangles that highlight a selection, one per line it touches.
@@ -1388,6 +1414,26 @@ impl State {
         let (first, end) = self.show(viewport.y, viewport.y + viewport.height);
         let coded = self.leaves[first..end].iter().filter(|leaf| matches!(leaf.kind, Some(BlockKind::Code { .. })));
         coded.filter_map(|leaf| Some((leaf.id.clone()?, leaf::boxed(leaf)))).collect()
+    }
+
+    fn tables(&mut self, viewport: Rect) -> Vec<TableBox> {
+        let (first, end) = self.show(viewport.y, viewport.y + viewport.height);
+        let mut shown: Vec<usize> =
+            self.leaves[first..end].iter().filter(|leaf| leaf.what == What::Row).map(|leaf| leaf.table).collect();
+        shown.dedup();
+        let boxed = |table: usize| {
+            let rows = self.leaves.get(self.tables.get(table)?.rows.clone())?;
+            let (top, last) = (rows.first()?, rows.last()?);
+            let rect = Rect::new(top.x, top.y, top.width, last.y + last.height - top.y);
+            // Every row has its cells at the same places, and the longest has them all.
+            let widest = rows.iter().max_by_key(|row| row.cells.len())?;
+            let pad = theme::CELL_PAD_X;
+            let columns = widest.cells.iter().map(|cell| (top.x + cell.x - pad, cell.width + 2.0 * pad)).collect();
+            let cells = |row: &Leaf| row.cells.iter().map(|cell| cell.id.clone()).collect();
+            let rows = rows.iter().map(|row| TableRow { y: row.y, height: row.height, cells: cells(row) }).collect();
+            Some(TableBox { rect, columns, rows })
+        };
+        shown.into_iter().filter_map(boxed).collect()
     }
 
     fn selection(&mut self, selection: &Selection, viewport: Option<Rect>) -> Vec<Rect> {

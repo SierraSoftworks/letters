@@ -558,6 +558,34 @@ fn a_table_shares_its_width_by_what_its_columns_hold() {
 }
 
 #[test]
+fn a_table_in_view_says_where_its_rows_and_columns_are() {
+    let layout = laid(&doc(vec![paragraph("p", "Above"), rates(true), paragraph("z", "End")]));
+    let caret = |block: &str| layout.caret(&Pos::new(block, 0)).unwrap();
+    let tables = layout.tables(everything());
+    assert_eq!(tables.len(), 1, "one table shows");
+    let table = &tables[0];
+    assert_eq!((table.rows.len(), table.columns.len()), (3, 3));
+    assert!(bottom(caret("p")) <= table.rect.y && bottom(table.rect) <= caret("z").y, "between its neighbours");
+    for (at, row) in table.rows.iter().enumerate() {
+        let ids: Vec<BlockId> = (0..3).map(|column| BlockId::from(format!("t{at}{column}").as_str())).collect();
+        assert_eq!(row.cells, ids, "row {at} names its cells in order");
+        for (cell, (x, width)) in row.cells.iter().zip(&table.columns) {
+            let text = layout.caret(&Pos::new(cell.clone(), 0)).unwrap();
+            assert!(*x <= text.x && text.x <= x + width, "{cell:?} is in its column");
+            assert!(row.y <= text.y && bottom(text) <= row.y + row.height, "{cell:?} is in its row");
+        }
+    }
+    let ends = |spans: Vec<(f32, f32)>| spans.windows(2).all(|pair| pair[0].0 + pair[0].1 == pair[1].0);
+    assert!(ends(table.columns.clone()), "columns meet");
+    assert!(ends(table.rows.iter().map(|row| (row.y, row.height)).collect()), "rows meet");
+    let (left, right_edge) = (table.columns[0].0, table.columns[2].0 + table.columns[2].1);
+    assert_eq!((left, right_edge), (table.rect.x, right(table.rect)), "the columns fill the table");
+
+    let above = Rect::new(0.0, 0.0, WIDTH, caret("p").height / 2.0);
+    assert!(layout.tables(above).is_empty(), "a table out of view is not listed");
+}
+
+#[test]
 fn a_column_is_set_the_way_it_is_aligned() {
     // An alignment, and how far along a cell's text the cells of its column meet.
     let cases = [(Align::Start, 0.0), (Align::Center, 0.5), (Align::End, 1.0)];

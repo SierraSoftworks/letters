@@ -28,6 +28,8 @@ const BREAK: u8 = 7;
 const KEEP: u8 = 8;
 const USE: u8 = 9;
 const HELD: u8 = 10;
+/// The handle of a cell's column and of its row, and the bars that add a column and a row after it.
+const TABLE: [u8; 4] = [11, 12, 13, 14];
 
 /// FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
 fn hashed(bytes: impl Iterator<Item = u8>) -> u64 {
@@ -160,6 +162,26 @@ pub(crate) fn marker(block: &BlockId, label: &str, rect: Rect, page: &mut Node, 
     let id = part_node(block, NOTE);
     page.push_child(id);
     nodes.push((id, marker));
+}
+
+/// Adds a handle or a bar of the table that shows them under the page: a button, which a click presses.
+/// It is told by `cell`, a cell of the column or row it acts on. `row` is whether it acts on a row, and
+/// `add` whether it adds one at the end. `rect` is where it stands in the page area.
+pub(crate) fn table_part(
+    cell: &BlockId,
+    (row, add): (bool, bool),
+    label: &str,
+    rect: Rect,
+    page: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
+    let mut button = Node::new(Role::Button);
+    button.set_label(label);
+    button.add_action(Action::Click);
+    button.set_bounds(placed(page, rect));
+    let id = part_node(cell, TABLE[usize::from(row) + 2 * usize::from(add)]);
+    page.push_child(id);
+    nodes.push((id, button));
 }
 
 /// Adds the button that chooses one version of a block two writers changed apart: the one on the page
@@ -422,6 +444,12 @@ pub(crate) enum Request {
     Alt(BlockId),
     /// Presses the marker of the notes beside a block.
     Note(BlockId),
+    /// Presses the handle of a cell's column or of its row, or the bar that adds one after it.
+    Table {
+        cell: BlockId,
+        row: bool,
+        add: bool,
+    },
     /// Presses what Print view shows of the page break before a block.
     Break(BlockId),
     /// Chooses a version of a block two writers changed apart: the one on the page, or the one held back.
@@ -452,7 +480,15 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
             let broken = || part(BREAK).map(|block| Request::Break(block.id.clone()));
             let chosen = |keep| part(if keep { KEEP } else { USE }).map(|block| (block.id.clone(), keep));
             let chosen = || chosen(true).or_else(|| chosen(false)).map(|(block, keep)| Request::Choose { block, keep });
-            ticked.or_else(copied).or_else(switched).or_else(noted).or_else(broken).or_else(chosen)
+            let tabled = || {
+                let found = |at: usize| Some((part(TABLE[at])?.id.clone(), at));
+                (0..TABLE.len()).find_map(found).map(|(cell, at)| Request::Table {
+                    cell,
+                    row: at % 2 == 1,
+                    add: at >= 2,
+                })
+            };
+            ticked.or_else(copied).or_else(switched).or_else(noted).or_else(broken).or_else(chosen).or_else(tabled)
         }
         _ => None,
     }
