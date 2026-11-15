@@ -203,6 +203,48 @@ fn undo_takes_back_only_its_own_edit_after_a_merge() {
 }
 
 #[test]
+fn an_edit_that_others_left_nothing_of_is_still_a_step_to_undo() {
+    // This replica types twice, and the other deletes what the second edit typed.
+    let (mut a, mut b) = pair();
+    a.apply([typed("p", 0, "Oh. ")]).unwrap();
+    a.apply([typed("p", 15, "!")]).unwrap();
+    sync(&mut a, &mut b);
+    b.apply([Op::DeleteText { block: id("p"), range: 15..16 }]).unwrap();
+    a.merge(&b.save()).unwrap();
+    assert_eq!(texts(&a), ["Oh. Hello world", ""]);
+
+    // Whoever counts its edits steps back as many: over the second, which changes nothing, to the first.
+    assert_eq!(a.undo(), Some(Change::default()));
+    a.undo().unwrap();
+    assert_eq!(texts(&a), ["Hello world", ""]);
+    assert!(a.undo().is_none());
+    a.redo().unwrap();
+    assert_eq!(a.redo(), Some(Change::default()));
+    assert_eq!(texts(&a), ["Oh. Hello world", ""]);
+    assert!(a.redo().is_none());
+}
+
+#[test]
+fn ops_of_one_batch_name_blocks_that_share_an_id_as_they_stood_before_it() {
+    // Each replica adds a block under the same id. Merged, the second goes by a number.
+    let (mut a, mut b) = pair();
+    let added =
+        |text: &str| Op::InsertBlock { parent: None, index: 1, block: Block::text("n", BlockKind::Paragraph, text) };
+    a.apply([added("one")]).unwrap();
+    b.apply([added("two")]).unwrap();
+    sync(&mut a, &mut b);
+    let second = a.block(&id("n~2")).expect("the second of the two").plain_text();
+
+    // Taking the first away renames the second, which the ops after it still call by its number.
+    let ops = [Op::RemoveBlock { block: id("n") }, typed("n~2", 0, "> "), Op::RemoveBlock { block: id("d") }];
+    a.apply(ops).unwrap();
+    assert_eq!(texts(&a), ["Hello world".to_string(), format!("> {second}")]);
+    assert!(a.block(&id("n~2")).is_none());
+    a.undo().unwrap();
+    assert_eq!(a.block(&id("n~2")).map(Block::plain_text), Some(second));
+}
+
+#[test]
 fn an_older_revision_is_shown_read_only() {
     let (mut a, mut b) = pair();
     let first = a.revision();

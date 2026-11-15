@@ -543,11 +543,15 @@ impl Model {
     }
 
     /// Applies `ops` in order as one undo step. Ops that leave everything as it was are no step at all.
+    ///
+    /// Blocks that share an id go by a number each, as in `id~2`. The ops name them as they stood before
+    /// the first of the ops, also once an earlier op has taken one of them away.
     pub fn apply(&mut self, ops: impl IntoIterator<Item = Op>) -> Result<Change, OpError> {
         if self.loro().is_detached() {
             return Err(OpError::ReadOnly);
         }
-        let ops: Vec<Op> = ops.into_iter().collect();
+        let mut ops: Vec<Op> = ops.into_iter().collect();
+        let mut copies = Copies::of(self, &mut ops);
         // The document's own fields and the style are changed on copies, made when an op first needs
         // them, and written once every op has been checked.
         let mut settings: Option<(Document, Style)> = None;
@@ -571,7 +575,11 @@ impl Model {
         let mut edits = Vec::new();
         let mut step = Step::new();
         let mut refused = None;
-        for op in &ops {
+        for (nth, op) in ops.iter_mut().enumerate() {
+            if let Some((named, now)) = target(op).zip(copies.now(nth)) {
+                *named = now;
+            }
+            let op = &*op;
             let compiled = if is_setting(op) {
                 let (fields, style) = settings.get_or_insert_with(|| (self.fields(), self.style.clone()));
                 set(op, fields, style).map(|()| (Vec::new(), None))
@@ -586,6 +594,9 @@ impl Model {
                     change.absorb(changed);
                     step.push(Edit::Text(undo.unwrap_or_default()));
                     edits.push(delta);
+                    if matches!(op, Op::RemoveBlock { .. } | Op::Join { .. }) {
+                        copies.took(nth);
+                    }
                 }
                 Err(error) => {
                     refused = Some(error);
@@ -623,6 +634,7 @@ impl Model {
     }
 
     /// Steps back one of this replica's edits, leaving what others wrote since. `None` when there is none.
+    /// An edit that others have left nothing of is still a step, and stepping back over it changes nothing.
     pub fn undo(&mut self) -> Option<Change> {
         self.step(true)
     }
@@ -1327,6 +1339,64 @@ impl Spot<'_> {
             delta.push(marker(&self.block.clone_bare(), self.entry.level));
             seek(delta, chars);
         }
+    }
+}
+
+/// The block an operation names, for one that names a block already there.
+fn target(op: &mut Op) -> Option<&mut BlockId> {
+    match op {
+        Op::InsertText { at, .. } | Op::Split { at, .. } => Some(&mut at.block),
+        Op::DeleteText { block, .. } | Op::SetMark { block, .. } | Op::SetLink { block, .. } => Some(block),
+        Op::SetLang { block, .. } | Op::SetKind { block, .. } | Op::SetBlockProps { block, .. } => Some(block),
+        Op::Join { block } | Op::RemoveBlock { block } => Some(block),
+        Op::InsertBlock { parent, .. } => parent.as_mut(),
+        _ => None,
+    }
+}
+
+/// Which blocks the ops of one batch mean by the ids of blocks that share one. Such blocks go by a number
+/// each, counted from where they stand, so taking one away renames those after it. A batch names them as
+/// they stood before it.
+#[derive(Default)]
+struct Copies {
+    /// For each op, the id its block is stored under, and which of the blocks with that id it is, from 1.
+    named: Vec<Option<(BlockId, usize)>>,
+    /// Those the batch has taken away so far.
+    gone: Vec<(BlockId, usize)>,
+}
+
+impl Copies {
+    fn of(model: &Model, ops: &mut [Op]) -> Self {
+        // A batch that names no numbered block has nothing to keep track of.
+        let mut numbered = |op: &mut Op| target(op).is_some_and(|id| id.as_str().contains('~'));
+        if ops.len() < 2 || !ops.iter_mut().any(&mut numbered) {
+            return Self::default();
+        }
+        let copy = |id: &mut BlockId| {
+            let stored = &model.index[model.find(id)?].stored;
+            let number = match id.as_str().strip_prefix(stored.as_str())? {
+                "" => 1,
+                rest => rest.strip_prefix('~')?.parse().ok()?,
+            };
+            Some((stored.clone(), number))
+        };
+        Self { named: ops.iter_mut().map(|op| target(op).and_then(copy)).collect(), gone: Vec::new() }
+    }
+
+    /// What the block of the `nth` op goes by now, if no longer by what the op calls it.
+    fn now(&self, nth: usize) -> Option<BlockId> {
+        let (stored, number) = self.named.get(nth)?.as_ref()?;
+        let earlier = self.gone.iter().filter(|(id, gone)| id == stored && gone < number).count();
+        let there = !self.gone.iter().any(|(id, gone)| id == stored && gone == number);
+        (earlier > 0 && there).then(|| match number - earlier {
+            1 => stored.clone(),
+            now => BlockId::new(format!("{stored}~{now}")),
+        })
+    }
+
+    /// Notes that the `nth` op took its block away.
+    fn took(&mut self, nth: usize) {
+        self.gone.extend(self.named.get(nth).cloned().flatten());
     }
 }
 
