@@ -383,7 +383,10 @@ pub fn served_window(document: Document, opened: &Opened, replica: ReplicaId) ->
 /// it has arrived.
 pub fn served_on(model: Model, opened: &Opened) -> Window {
     let mut window = at_end(Window::new(Editor::with_model(model)));
-    window.set_document_name(&opened.name);
+    // A document started without a name takes its first heading's, which the window then asks for.
+    if opened.named {
+        window.set_document_name(&opened.name);
+    }
     window.set_author(&opened.author);
     match opened.notes.as_ref().map(|notes| Notes::from_json(&notes.to_string())) {
         Some(Ok(notes)) => window.set_notes(notes),

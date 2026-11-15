@@ -1793,7 +1793,7 @@ impl Shell {
                 Ok(Ok(entry)) => {
                     shell.called(&entry.name);
                     if let Some(server) = &mut shell.server {
-                        (server.name, server.path) = (entry.name, entry.path);
+                        (server.name, server.path, server.named) = (entry.name, entry.path, true);
                     }
                 }
                 Ok(Err(_)) => shell.view.set_notice(Some("The server's answer could not be read.")),
@@ -1815,7 +1815,7 @@ impl Shell {
             let mut shell = shell.borrow_mut();
             let Some(server) = shell.server.as_mut().filter(|server| server.id == id) else { return };
             let renamed = server.name != now.name;
-            (server.space, server.path) = (now.space, now.path);
+            (server.space, server.path, server.named) = (now.space, now.path, now.named);
             if renamed {
                 server.name.clone_from(&now.name);
                 shell.called(&now.name);

@@ -301,3 +301,13 @@ test("the person's other documents are on the server's page for the folder", asy
   await run(page, "Open");
   await expect(page).toHaveTitle("House");
 });
+
+test("a document started without a name takes its first heading's, on the server too", async ({ page }) => {
+  const named = (method, path) => (path === `${DOCUMENT}/rename` ? { body: listed("Letters in the browser") } : undefined);
+  const asked = await serve(page, opened({ ...HOUSE, name: "Untitled", named: false }), named);
+  // The caret leaves the heading.
+  await page.keyboard.press("ControlOrMeta+Home");
+  await page.keyboard.press("ArrowDown");
+  await expect.poll(() => told(asked)).toEqual(['POST /rename {"name":"Letters in the browser"}']);
+  await expect(page).toHaveTitle("Letters in the browser");
+});
