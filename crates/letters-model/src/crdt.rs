@@ -45,6 +45,8 @@ const META: &str = "meta";
 const DICTIONARY: &str = "dictionary";
 const EXTRA: &str = "extra";
 const STYLE: &str = "style";
+/// The writers' names, each against the replica its writer used.
+const AUTHORS: &str = "authors";
 const LANGUAGE: &str = "language";
 const PROPERTIES: &str = "properties";
 
@@ -58,9 +60,42 @@ const MARK: &str = "m.";
 /// Prefix of the attribute for a run field this build does not know, whose value is the field's JSON.
 const FIELD: &str = "x.";
 
+/// How long one change may run on, in seconds, and so how closely an edit's time is known. A change
+/// costs the history about 5 bytes: a minute adds 7% to an hour of slow typing, ten seconds 50%.
+const CHANGE: i64 = 60;
+
 /// Typed text takes the formatting of the character before it.
 pub(crate) fn configure(loro: &LoroDoc) {
     loro.config_default_text_style(Some(StyleConfig { expand: ExpandType::After }));
+    loro.set_change_merge_interval(CHANGE);
+}
+
+/// Writes the name of the replica's writer into the change that is open.
+pub(crate) fn sign(loro: &LoroDoc, author: &str) {
+    let (authors, replica) = (loro.get_map(AUTHORS), loro.peer_id().to_string());
+    let held = authors.get(&replica).and_then(|held| held.into_value().ok());
+    if held.as_ref().and_then(text) != Some(author) {
+        // Loro refuses no string under a string.
+        let _ = authors.insert(&replica, author);
+    }
+}
+
+/// The name the writer of a replica gave. Empty when it gave none, as an outside change never does.
+pub(crate) fn author_of(loro: &LoroDoc, replica: u64) -> String {
+    let held = loro.get_map(AUTHORS).get(&replica.to_string()).and_then(|held| held.into_value().ok());
+    held.as_ref().and_then(text).unwrap_or_default().to_owned()
+}
+
+pub(crate) fn authors(loro: &LoroDoc) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    loro.get_map(AUTHORS).for_each(|_, held| {
+        if let ValueOrContainer::Value(held) = held
+            && let Some(name) = text(&held).filter(|name| !name.is_empty())
+        {
+            names.insert(name.to_owned());
+        }
+    });
+    names
 }
 
 /// Text as the sequence can hold it. The marker character is the sequence's own, so text gives it up.
@@ -207,7 +242,7 @@ impl Markers {
 }
 
 /// The id of the character at `at`.
-fn id_at(body: &LoroText, at: usize) -> Option<ID> {
+pub(crate) fn id_at(body: &LoroText, at: usize) -> Option<ID> {
     body.get_cursor(at, Side::Middle)?.id
 }
 

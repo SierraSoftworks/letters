@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 
 use letters_model::{
-    Align, Block, BlockId, BlockKind, Body, BodyShape, Change, Document, ListKind, Mark, Model, Op, OpError, Page, Pos,
-    Properties, PropertiesFormat, ReplicaId, Run, Style, Tone,
+    Align, Block, BlockId, BlockKind, Body, BodyShape, Change, Conflict, Document, ListKind, Mark, Model, Op, OpError,
+    Page, Pos, Properties, PropertiesFormat, ReplicaId, Run, Style, Tone,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -360,17 +360,22 @@ proptest! {
         // One copy starts from the same file, the other from the first copy's history.
         let third = first.fork(ReplicaId::from(3));
         let mut replicas = [first, Model::new(fixture(), ReplicaId::from(2)), third];
+        // Two of the writers give their names, and the third writes unnamed.
+        replicas[0].set_author("Ana");
+        replicas[1].set_author("Ben");
         let mut seen = vec![Vec::new(); REPLICAS];
         // Each replica's last edit, as the documents either side of it and whether it has been undone.
         let mut last: Vec<Option<(Shown, Shown, bool)>> = vec![None; REPLICAS];
 
-        for step in steps {
+        for (nth, step) in steps.into_iter().enumerate() {
             let touched = match step {
                 Step::Edit { replica, .. } | Step::Undo { replica } | Step::Redo { replica } => replica,
                 Step::Visit { replica, .. } | Step::Rewrite { replica, .. } => replica,
                 Step::Sync { to, .. } => to,
             };
             let before = shown(&replicas[touched]);
+            // Each writer's clock runs at its own pace, and one has none.
+            replicas[touched].set_time(if touched == 2 { 0 } else { 1_800_000_000 + (nth * (40 + touched)) as u64 });
             let change = match step {
                 Step::Edit { replica, edits } => {
                     let ops: Vec<Op> = edits.iter().filter_map(|edit| op(&before, edit)).collect();
@@ -416,7 +421,22 @@ proptest! {
                         true => replicas[from].save(),
                         false => replicas[from].updates_since(&replicas[to].revision()),
                     };
-                    Some(replicas[to].merge(&history).expect("a replica reads another's history"))
+                    let (ours, theirs) = (replicas[to].revision(), replicas[from].revision());
+                    let held = [before.0.clone(), replicas[from].doc().clone()];
+                    let merged = replicas[to].merge(&history).expect("a replica reads another's history");
+                    let apart = replicas[to].conflicts(&ours, &theirs).expect("a replica holds what it merged");
+                    let mirror = replicas[to].conflicts(&theirs, &ours).expect("a replica holds what it merged");
+                    let turned = |conflict: &Conflict| {
+                        let [first, second] = conflict.sides.clone();
+                        Conflict { sides: [second, first], later: 1 - conflict.later, ..conflict.clone() }
+                    };
+                    prop_assert_eq!(&apart, &mirror.iter().map(turned).collect::<Vec<_>>(), "the sides tell apart");
+                    for conflict in &apart {
+                        let versions = conflict.sides.each_ref().map(|side| side.block.as_ref());
+                        let then = held.each_ref().map(|doc| doc.block(&conflict.block));
+                        prop_assert_eq!(versions, then, "a conflict shows a block as neither side left it");
+                    }
+                    Some(merged)
                 }
                 Step::Visit { replica, back } => {
                     last[replica] = None;
@@ -460,6 +480,7 @@ proptest! {
             }
         }
         let [first, second, third] = &replicas;
+        prop_assert_eq!(first.authors(), third.authors());
         prop_assert_eq!(shown(first), shown(second));
         prop_assert_eq!(shown(first), shown(third));
         prop_assert_eq!(first.compare(&third.save()), Ok(Some(Ordering::Equal)));

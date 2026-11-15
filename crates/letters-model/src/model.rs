@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use loro::cursor::{Cursor, Side};
 use loro::{ContainerTrait, ExportMode, LoroDoc, LoroText, LoroValue, Subscription, TextDelta};
 
+use crate::conflict::{self, Conflict};
 use crate::crdt::{self, Assign, Event, attrs};
 use crate::flat::{self, BLOCK, DEPTH, Entry, Flat, children, head, insert, marker, nth, nth_mut, spell};
 use crate::history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
@@ -227,6 +228,16 @@ impl History {
     }
 }
 
+/// Who writes with a replica, and when: what the shell tells a model that has no clock and knows no one.
+#[derive(Clone, Debug, Default)]
+struct Pen {
+    author: Option<String>,
+    /// Whether the history holds the author's name against this replica.
+    signed: bool,
+    /// Seconds since 1970. 0 until the shell says.
+    time: u64,
+}
+
 /// One replica of a document: the document, its history and this session's undo steps.
 ///
 /// A model is not `Clone`, because two writers must never share a [`ReplicaId`]. Clone [`Model::doc`] to
@@ -245,6 +256,7 @@ pub struct Model {
     steps: Steps,
     /// Made when a block is first looked up by id, and again after blocks come, go, move or are renamed.
     lookup: OnceLock<Lookup>,
+    pen: Pen,
 }
 
 impl fmt::Debug for Model {
@@ -282,7 +294,8 @@ impl Model {
         doc.blocks = built.blocks;
         crdt::normal_meta(&mut doc);
         let (index, style, lookup) = (built.index, Style::default(), OnceLock::new());
-        Self { doc, index, style, styled: false, replica, history: OnceLock::new(), steps: Steps::default(), lookup }
+        let (history, steps, pen) = (OnceLock::new(), Steps::default(), Pen::default());
+        Self { doc, index, style, styled: false, replica, history, steps, lookup, pen }
     }
 
     /// The model with the style its file holds, for one that was just made.
@@ -306,7 +319,7 @@ impl Model {
         let (doc, index) = crdt::read(&history.loro, &history.body);
         let style = crdt::read_style(&history.loro);
         let (history, steps, lookup) = (OnceLock::from(history), Steps::default(), OnceLock::new());
-        Ok(Self { doc, index, style, styled: true, replica, history, steps, lookup })
+        Ok(Self { doc, index, style, styled: true, replica, history, steps, lookup, pen: Pen::default() })
     }
 
     /// A second replica at the newest revision, for another writer. It starts with no undo steps.
@@ -317,7 +330,7 @@ impl Model {
             None => {
                 let (doc, index, style) = (self.doc.clone(), self.index.clone(), self.style.clone());
                 let (history, steps, lookup) = (OnceLock::new(), Steps::default(), self.lookup.clone());
-                Self { doc, index, style, styled: self.styled, replica, history, steps, lookup }
+                Self { doc, index, style, styled: self.styled, replica, history, steps, lookup, pen: Pen::default() }
             }
         }
     }
@@ -366,6 +379,7 @@ impl Model {
         // Whatever replica the history was prepared for, this model's is the one that writes.
         let _ = history.loro.set_peer_id(self.replica.0);
         self.history = OnceLock::from(history);
+        self.pen.signed = false;
         let shown = mem::replace(&mut self.doc, theirs.doc);
         let layout = mem::replace(&mut self.index, theirs.index);
         self.lookup = theirs.lookup;
@@ -476,6 +490,25 @@ impl Model {
 
     pub fn style(&self) -> &Style {
         &self.style
+    }
+
+    /// Names who writes with this replica. The history keeps the name with the replica's next edit, and
+    /// every copy of the document then reads this replica's edits as that writer's.
+    pub fn set_author(&mut self, name: &str) {
+        if self.pen.author.as_deref() != Some(name) {
+            self.pen = Pen { author: Some(name.to_owned()), signed: false, time: self.pen.time };
+        }
+    }
+
+    /// Tells the model the time, in seconds since 1970, as it has no clock to read. Edits made from here
+    /// on are dated with it, to the minute. An edit is never dated before one it builds on.
+    pub fn set_time(&mut self, seconds: u64) {
+        self.pen.time = seconds;
+    }
+
+    /// The names of everyone who has written in the document, as far as the revision shown.
+    pub fn authors(&self) -> BTreeSet<String> {
+        self.history.get().map(|history| crdt::authors(&history.loro)).unwrap_or_default()
     }
 
     /// Finds a block by its id, as [`Document::block`] does, without searching the document for it.
@@ -638,7 +671,7 @@ impl Model {
         }
         // Loro refuses none of these: every key is a string, and every value a string or a flag.
         let back = crdt::assign(self.loro(), assigns).unwrap_or_default();
-        self.loro().commit();
+        self.commit();
         self.queue().clear();
         change.absorb(self.reread());
         back
@@ -671,10 +704,28 @@ impl Model {
         change
     }
 
+    /// Closes a change in the history. This replica's own carries the time and, the first time, its
+    /// writer's name. An outside change carries neither, as every device must write it alike.
+    fn commit(&mut self) {
+        let loro = &self.history().loro;
+        if loro.peer_id() == self.replica.0 {
+            if let Some(author) = self.pen.author.as_deref().filter(|_| !self.pen.signed) {
+                crdt::sign(loro, author);
+            }
+            if self.pen.time > 0 {
+                loro.set_next_commit_timestamp(i64::try_from(self.pen.time).unwrap_or(i64::MAX));
+            }
+            loro.commit();
+            self.pen.signed = true;
+        } else {
+            loro.commit();
+        }
+    }
+
     /// Sends changes the document already shows to the history, as one change there.
     fn write(&mut self, edits: &[Delta], change: &mut Change) -> bool {
         let written = edits.iter().all(|delta| crdt::write(self.loro(), self.body(), delta).is_some());
-        self.loro().commit();
+        self.commit();
         if written {
             // The history reports the edit back, and the document already shows it.
             self.queue().clear();
@@ -751,6 +802,30 @@ impl Model {
         }
         self.loro().checkout_to_latest();
         self.drain()
+    }
+
+    /// The blocks that two revisions both changed, in the same words, since they last agreed. After a
+    /// merge, give the revision each copy stood at before it, in either order.
+    ///
+    /// Each comes with the block as either side left it, and who last changed it there and when. A block
+    /// that one side took away while the other changed its text is among them. Changes to different words
+    /// of a block are not, nor is formatting, nor text that both put in at one place between two words:
+    /// those merge. Fails with [`HistoryError::UnknownRevision`] for a revision the history lacks.
+    ///
+    /// The model reads its history at other revisions meanwhile, and so is taken whole. The document it
+    /// shows stays as it is.
+    pub fn conflicts(&mut self, ours: &Revision, theirs: &Revision) -> Result<Vec<Conflict>, HistoryError> {
+        let history = self.history();
+        let (shown, detached) = (history.loro.state_frontiers(), history.loro.is_detached());
+        let found = conflict::find(&history.loro, &history.body, &history.events, [&ours.0, &theirs.0]);
+        if detached {
+            // The history held this revision a moment ago.
+            let _ = history.loro.checkout(&shown);
+        } else {
+            history.loro.checkout_to_latest();
+        }
+        self.queue().clear();
+        found
     }
 
     /// A position that follows its text, for anything kept across edits. `None` when `pos` is not a

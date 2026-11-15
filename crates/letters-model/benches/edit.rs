@@ -118,6 +118,24 @@ fn main() {
         other.apply([heading(run)]).expect("a new kind");
         model.merge(&other.updates_since(&loaded.revision())).expect("a replica reads another's edits");
     });
+    // Two copies change different blocks apart, as most do, and then one word. The one that takes the
+    // other in asks each time what cannot both stand.
+    let mut part = |model: &mut Model, block: usize| {
+        let at = |block: usize| Pos { block: id(block), offset: 5 };
+        model.apply([Op::InsertText { at: at(11), text: "x".into() }]).expect("typed");
+        other.apply([Op::InsertText { at: at(block), text: "y".into() }]).expect("typed");
+        let stood = (model.revision(), other.revision());
+        model.merge(&other.updates_since(&loaded.revision())).expect("a replica reads another's edits");
+        stood
+    };
+    let (ours, theirs) = part(&mut model, 12);
+    report("ask what two copies changed", 20, None, |_| {
+        assert_eq!(model.conflicts(&ours, &theirs).expect("revisions the history holds"), []);
+    });
+    let (ours, theirs) = part(&mut model, 11);
+    report("the same, when it is one word", 20, None, |_| {
+        assert_eq!(model.conflicts(&ours, &theirs).expect("revisions the history holds").len(), 1);
+    });
     // A character in a block the edits above left alone.
     let text = model.doc().block(&id(BLOCKS / 4)).expect("the block").plain_text();
     let (offset, held) = text.char_indices().nth(30).expect("a long block");

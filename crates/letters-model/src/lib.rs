@@ -4,6 +4,7 @@
 //! - [`Model`] owns a document and its history, and is the only way to change one.
 //! - [`Pos`] and [`Selection`] address text inside it.
 
+mod conflict;
 mod crdt;
 mod doc;
 mod flat;
@@ -16,6 +17,7 @@ mod pos;
 mod style;
 mod undo;
 
+pub use conflict::{Conflict, Side};
 pub use doc::{
     Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Properties, PropertiesFormat,
     Run, Tone,
