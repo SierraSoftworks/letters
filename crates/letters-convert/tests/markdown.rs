@@ -1193,4 +1193,30 @@ proptest! {
         let twice = to_markdown(&read(&once).0);
         prop_assert_eq!(twice, once);
     }
+
+    /// What Markdown has no word for reads back as what it was written as, and stays that: a table of
+    /// contents its list, a link preview its paragraph.
+    #[test]
+    fn what_is_written_as_something_else_settles_at_once(
+        blocks in any_blocks(),
+        levels in 1..=4u8,
+        title in proptest::option::of(any_text()),
+        description in proptest::option::of(any_text()),
+    ) {
+        let title = title.map(|title| title.replace('\n', " ")).filter(|title| !title.is_empty());
+        let card = preview("https://example.com/a (b)?c=1&amp;d", title.as_deref(), description.as_deref().filter(|text| !text.is_empty()));
+        let table = Block::new("", BlockKind::TableOfContents { levels });
+        let once = to_markdown(&doc([vec![table], blocks, vec![card]].concat()));
+        let twice = to_markdown(&read(&once).0);
+        prop_assert_eq!(twice, once);
+    }
+
+    /// A table of contents read from a file lists whatever headings the file has, and its list settles too.
+    #[test]
+    fn the_list_of_an_imported_table_of_contents_settles_at_once(before in any_markdown(), after in any_markdown()) {
+        let (imported, _) = read(&format!("{before}\n\n[TOC]\n\n{after}"));
+        let once = to_markdown(&imported);
+        let twice = to_markdown(&read(&once).0);
+        prop_assert_eq!(twice, once);
+    }
 }

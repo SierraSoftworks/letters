@@ -23,5 +23,7 @@ pub fn seeds() -> Vec<Vec<u8>> {
         include_str!("../../../crates/letters-convert/tests/corpus/report.md"),
         include_str!("../../../crates/letters-convert/tests/corpus/notice.md"),
     ];
-    files.iter().map(|file| file.as_bytes().to_vec()).collect()
+    // A table of contents is written as its list, which no file of the corpus holds one to become.
+    let listed = "# Guide\n\n[TOC]\n\n## Moorings\n\n### Fees & *dues*\n\n## Moorings\n\n[[_TOC_]]\n";
+    files.iter().chain([&listed]).map(|file| file.as_bytes().to_vec()).collect()
 }
