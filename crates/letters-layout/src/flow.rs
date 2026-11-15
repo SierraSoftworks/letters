@@ -11,7 +11,7 @@ use parley::{Alignment, Language, Layout, LineHeight};
 
 use crate::callout::Head;
 use crate::engine::{self, Engine, Spec};
-use crate::ink::Brush;
+use crate::ink::{Brush, Ink};
 use crate::leaf::Laid;
 use crate::theme;
 
@@ -206,6 +206,10 @@ pub(crate) enum What {
     /// A gallery with nothing in it or a table with no rows: an empty box, so that it can be seen and the
     /// caret has somewhere to stand.
     Empty,
+    /// A table of contents: a line for each heading it lists, which leads to that heading.
+    Contents,
+    /// A link shown as a card, with what was fetched of the page it leads to.
+    Preview,
 }
 
 /// One of the things in a leaf that a position can be in or on.
@@ -272,6 +276,55 @@ pub(crate) struct Words {
     pub rtl: bool,
 }
 
+/// One of the texts that a table of contents or a link preview sets one under the other. No position is in
+/// one: the block is a whole, as a divider is.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Entry {
+    pub words: Words,
+    pub role: Role,
+    pub ink: Ink,
+    pub bold: bool,
+    /// How far in from the side it starts at a line of a table of contents is set.
+    pub indent: f32,
+    /// How many of its lines show at most.
+    pub clamp: usize,
+    /// The heading a line of a table of contents leads to.
+    pub target: Option<BlockId>,
+}
+
+/// What a table of contents says while it has no heading to list.
+const UNLISTED: &str = "No headings yet";
+
+/// The host a link names, which is all of it that the page shows.
+fn host(link: &str) -> &str {
+    let rest = link.split_once("://").map_or(link, |(_, rest)| rest);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    host.rsplit_once('@').map_or(host, |(_, host)| host)
+}
+
+/// Whether a link preview has its address alone: nothing was fetched of the page it leads to.
+fn unfetched(kind: &BlockKind) -> bool {
+    matches!(kind, BlockKind::LinkPreview { title: None, description: None, image: None, .. })
+}
+
+/// What a link preview says: the page's title, a few lines of what the page says of itself, and the host
+/// it is on. One that was never fetched has its address alone.
+fn card(kind: &BlockKind, role: Role) -> Vec<Entry> {
+    let BlockKind::LinkPreview { url, title, description, .. } = kind else { return Vec::new() };
+    let said = |text: &str, role, ink, bold, clamp| {
+        let rtl = text.chars().find_map(engine::reads).unwrap_or(false);
+        let words = Words { rtl, ..Words::plain(text.trim().to_owned()) };
+        Entry { words, role, ink, bold, indent: 0.0, clamp, target: None }
+    };
+    if unfetched(kind) {
+        return vec![said(url, role, Ink::Link, false, 2)];
+    }
+    let host = Some(host(url)).filter(|host| !host.is_empty()).unwrap_or(url);
+    let title = title.as_deref().map(|title| said(title, role, Ink::Style(role), true, 2));
+    let description = description.as_deref().map(|text| said(text, Role::Caption, Ink::Style(Role::Caption), false, 3));
+    title.into_iter().chain(description).chain([said(host, Role::Caption, Ink::Marker, false, 1)]).collect()
+}
+
 /// The language a tag names, if it is one.
 pub(crate) fn language(tag: Option<&str>) -> Option<Language> {
     Language::parse(tag?).ok()
@@ -279,7 +332,7 @@ pub(crate) fn language(tag: Option<&str>) -> Option<Language> {
 
 /// Whether a block's text reads from the right: its first letter does. The source of a formula is passed
 /// over, since the formula stands in its place, and code reads from the left whatever is written in it.
-pub(crate) fn rtl(block: &Block) -> bool {
+pub fn rtl(block: &Block) -> bool {
     if matches!(block.kind, BlockKind::Code { .. } | BlockKind::Formula) {
         return false;
     }
@@ -410,12 +463,7 @@ impl Picture {
 
     fn of(block: &Block) -> Option<Self> {
         let BlockKind::Figure { asset, src, alt, width, height, .. } = &block.kind else { return None };
-        // The host is all of a link that the page shows.
-        let host = src.as_deref().map_or("", |src| {
-            let rest = src.split_once("://").map_or(src, |(_, rest)| rest);
-            let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-            host.rsplit_once('@').map_or(host, |(_, host)| host)
-        });
+        let host = src.as_deref().map_or("", host);
         let size = ((width * theme::PT).max(1.0), (height * theme::PT).max(1.0));
         let (id, asset, alt, host) = (block.id.clone(), asset.clone(), alt.as_str().into(), host.to_owned());
         Some(Self { id, asset, alt, src: src.clone(), host, size, rect: Rect::default(), row: 0 })
@@ -473,6 +521,10 @@ pub(crate) struct Leaf {
     /// The table a row is part of, and whether it is its header.
     pub table: usize,
     pub header: bool,
+    /// The lines of a table of contents, or what a link preview says.
+    pub entries: Vec<Entry>,
+    /// The picture of a link preview, by its name among the document's assets.
+    pub image: Option<String>,
 
     /// The left edge and width of the text.
     pub x: f32,
@@ -519,7 +571,41 @@ impl Leaf {
 
     /// Whether the leaf's text has its own box behind it.
     pub fn boxed(&self) -> bool {
-        self.role == Role::Code || matches!(self.what, What::Label | What::Empty)
+        self.role == Role::Code || matches!(self.what, What::Label | What::Empty | What::Preview)
+    }
+
+    /// Whether the leaf sets texts one under the other in place of a text of its own.
+    pub fn stacks(&self) -> bool {
+        matches!(self.what, What::Contents | What::Preview)
+    }
+
+    /// Where a link preview draws its picture, from the leaf's left edge and top: a slot of one size,
+    /// whatever the picture's. A leaf too narrow to set its text beside one has none.
+    pub fn slot(&self) -> Option<Rect> {
+        let (wide, tall) = theme::PREVIEW_PICTURE;
+        let fits = self.width - wide - theme::PREVIEW_GAP >= theme::PREVIEW_TEXT;
+        (self.image.is_some() && fits).then(|| Rect::new(0.0, 0.0, wide, tall))
+    }
+
+    /// The room kept clear at the end of the leaf's lines: for the page numbers of a table of contents,
+    /// which only a sheet sets there, and for what a window stands on a link preview that has only its
+    /// address. So the lines break alike on screen and on paper.
+    pub fn spare(&self, types: &Types) -> f32 {
+        let room = match self.what {
+            What::Contents => (types.get(self.role).size * theme::PAGE_NUMBER).round(),
+            What::Preview if self.kind.as_ref().is_some_and(unfetched) => theme::PREVIEW_CONTROL,
+            _ => 0.0,
+        };
+        room.min((self.width - theme::MIN_WIDTH).max(0.0) / 2.0)
+    }
+
+    /// Where one of the leaf's entries is set: how far in from the leaf's left edge, and how wide.
+    pub fn room(&self, entry: &Entry, types: &Types) -> (f32, f32) {
+        let (beside, spare) = (self.slot().map_or(0.0, |slot| slot.width + theme::PREVIEW_GAP), self.spare(types));
+        let indent = entry.indent.min((self.width - spare - theme::MIN_WIDTH).max(0.0));
+        // A line that reads from the right is set in from the right, and ends at the left.
+        let listed = self.what == What::Contents && entry.words.rtl;
+        (if listed { spare } else { beside + indent }, (self.width - beside - indent - spare).max(1.0))
     }
 
     /// Whether the leaf has no text to lay out, so that its height is known as soon as it is placed.
@@ -531,6 +617,12 @@ impl Leaf {
     pub fn estimate(&self, types: &Types) -> f32 {
         let of = types.get(self.role);
         let wrapped = |bytes: usize, width: f32| (bytes as f32 * of.advance / width.max(1.0)).ceil().max(1.0);
+        // An entry is set in its own type, and shows no more lines than it is let.
+        let entry = |entry: &Entry| {
+            let (of, width) = (types.get(entry.role), self.room(entry, types).1);
+            let lines = (entry.words.text.len() as f32 * of.advance / width).ceil().max(1.0);
+            lines.min(entry.clamp as f32) * of.line
+        };
         match self.what {
             What::Rule => theme::RULE,
             What::Blank | What::Empty => of.line,
@@ -542,6 +634,11 @@ impl Leaf {
             What::Row => {
                 let lines = self.cells.iter().map(|cell| wrapped(cell.words.text.len(), cell.width));
                 lines.fold(1.0, f32::max) * of.line + 2.0 * theme::CELL_PAD_Y
+            }
+            What::Contents | What::Preview => {
+                let gaps = theme::ENTRY_GAP * self.entries.len().saturating_sub(1) as f32;
+                let texts = self.entries.iter().map(entry).sum::<f32>() + gaps;
+                texts.max(self.slot().map_or(0.0, |slot| slot.height))
             }
         }
     }
@@ -572,7 +669,7 @@ impl Leaf {
         match self.what {
             What::Text | What::Label | What::Formula => true,
             What::Figure | What::Gallery => self.captioned(),
-            What::Rule | What::Blank | What::Row | What::Empty => false,
+            What::Rule | What::Blank | What::Row | What::Empty | What::Contents | What::Preview => false,
         }
     }
 
@@ -612,7 +709,8 @@ impl Leaf {
 
     /// How much text the leaf holds, as a measure of what laying it out costs.
     pub fn bytes(&self) -> usize {
-        self.words.text.len() + self.cells.iter().map(|cell| cell.words.text.len()).sum::<usize>()
+        let entries = self.entries.iter().map(|entry| entry.words.text.len());
+        self.words.text.len() + self.cells.iter().map(|cell| cell.words.text.len()).chain(entries).sum::<usize>()
     }
 
     /// The line of the leaf, as pagination counts them, that holds line `line` of a part's text.
@@ -657,7 +755,7 @@ impl Leaf {
 
     /// Whether a page may not split the leaf while it fits a page whole, as with a row of a table.
     pub fn whole(&self) -> bool {
-        self.what == What::Row
+        matches!(self.what, What::Row | What::Preview)
     }
 
     /// How many lines must stay together at a page's end or start. Rows of pictures stand alone.
@@ -730,7 +828,7 @@ impl Leaf {
                 self.picture_in(row, point.x).map(Part::Picture)
             }
             What::Empty => Some(Part::Whole),
-            What::Rule | What::Label | What::Blank => None,
+            What::Rule | What::Label | What::Blank | What::Contents | What::Preview => None,
         }
     }
 
@@ -931,12 +1029,14 @@ pub(crate) fn flow(
     old: impl FnMut(&BlockId) -> Option<Leaf>,
 ) -> Flow {
     let out = Flow::default();
-    let mut walk = Walk { types, numbers, carry, old, out, pad: 0.0, breaks: false, root: 0, depth: 0, lang: None };
+    let mut walk =
+        Walk { doc, types, numbers, carry, old, out, pad: 0.0, breaks: false, root: 0, depth: 0, lang: None };
     walk.place(&doc.blocks, 0.0, width, None, false);
     walk.out
 }
 
 struct Walk<'a, F> {
+    doc: &'a Document,
     types: &'a Types,
     numbers: &'a HashMap<BlockId, u32>,
     carry: Option<&'a BTreeSet<BlockId>>,
@@ -965,6 +1065,47 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                 (Leaf { id, kind, what, ..Leaf::default() }, false)
             }
         }
+    }
+
+    /// The lines of a table of contents: its headings, each set in by how far it is below the shallowest
+    /// of them. One with nothing to list says so.
+    fn listed(&self, table: &Block, role: Role) -> Vec<Entry> {
+        let headings = self.doc.contents(&table.id);
+        let level = |heading: &Block| match heading.kind {
+            BlockKind::Heading { level } => level,
+            _ => 1,
+        };
+        let shallowest = headings.iter().map(|heading| level(heading)).min().unwrap_or(1);
+        let line =
+            |words, ink, indent, target| Entry { words, role, ink, bold: false, indent, clamp: usize::MAX, target };
+        if headings.is_empty() {
+            return vec![line(Words::plain(UNLISTED.to_owned()), Ink::Marker, 0.0, None)];
+        }
+        let lines = headings.into_iter().map(|heading| {
+            let indent = theme::LIST_INDENT * f32::from(level(heading) - shallowest);
+            line(self.title(heading), Ink::Style(role), indent, Some(heading.id.clone()))
+        });
+        lines.collect()
+    }
+
+    /// What a table of contents reads for a heading: the heading's text, with nothing in it that leads
+    /// anywhere of its own, since the whole line leads to the heading. A reference reads as the label of
+    /// its figure.
+    fn title(&self, heading: &Block) -> Words {
+        let mut runs = heading.body.runs().to_vec();
+        for run in &mut runs {
+            run.link = None;
+            let target = run.marks.iter().find_map(|mark| match mark {
+                Mark::Ref(target) if !run.text.is_empty() => Some(self.numbers.get(target).copied()),
+                _ => None,
+            });
+            if let Some(number) = target {
+                run.text = self.types.reference(number);
+                run.marks.retain(|mark| !matches!(mark, Mark::Ref(_) | Mark::Math));
+            }
+        }
+        let line = Block { body: Body::Text(runs), lang: heading.lang.clone(), ..Block::new("", heading.kind.clone()) };
+        Words::of(&line)
     }
 
     /// Whether a text read from `block` when the column was last built may no longer be its text.
@@ -1165,6 +1306,20 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                 BlockKind::Unknown { type_name } => {
                     let words = Words::plain(format!("Unsupported block: {type_name}"));
                     let leaf = Leaf { id: Some(block.id.clone()), what: What::Label, role, words, ..Leaf::default() };
+                    self.push(leaf, x, width, gap, frame);
+                }
+                BlockKind::TableOfContents { .. } | BlockKind::LinkPreview { .. } => {
+                    let (what, entries, image) = match &block.kind {
+                        BlockKind::LinkPreview { image, .. } => (What::Preview, card(&block.kind, role), image.clone()),
+                        _ => (What::Contents, self.listed(block, role), None),
+                    };
+                    let (mut leaf, _) = self.leaf(block, what);
+                    // It is set again only when it says something else, as when a heading it lists is edited.
+                    // Its layout stays, and tells then which of its lines still stand.
+                    if leaf.entries != entries {
+                        leaf.exact = false;
+                    }
+                    (leaf.entries, leaf.image, leaf.role) = (entries, image, role);
                     self.push(leaf, x, width, gap, frame);
                 }
                 BlockKind::Gallery { .. } => {

@@ -96,6 +96,8 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 rfd = "0.17"
 # Lists the system's font files and their families, in Rust alone. For what the bundled fonts cannot draw.
 fontdb = "0.24"
+# Moves a merged conflict copy to the system's trash, where the person can still take it back.
+trash = "5.3"
 # The desktop shell fetches linked pictures with it: no cookies, no proxies, the system's own roots.
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
 # A server for the fetch's tests.

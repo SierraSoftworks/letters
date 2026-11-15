@@ -2,7 +2,7 @@
 //! page split at the one that is open, the two versions trading places, and the choice of the one on the page.
 
 use accesskit::{Action, ActionRequest, TreeId};
-use letters_model::{Block, BlockKind, Document, Note, Notes, Pos, Selection, Version};
+use letters_model::{Block, BlockKind, Document, Note, NoteKind, Notes, Pos, Selection, Stood, Version};
 use letters_render::{Point, Rect};
 use letters_test::{Found, Harness, Role};
 
@@ -300,6 +300,21 @@ fn using_the_version_held_back_trades_the_two_and_leaves_the_conflict_open() {
 }
 
 #[test]
+fn the_notes_panel_says_which_version_of_each_conflict_the_page_shows() {
+    let mut window = reviewing();
+    window.click(Role::Button, "Notes");
+    // How many of the listed conflicts say that the page shows that version of theirs.
+    let showing = |window: &mut Harness, which: &str| {
+        let says = format!("The page shows the {which} version.");
+        let rows = window.controls().into_iter().filter(|found| found.role == Role::ListBoxOption);
+        rows.filter(|row| row.name.ends_with(&says)).count()
+    };
+    assert_eq!((showing(&mut window, "later"), showing(&mut window, "earlier")), (2, 0));
+    window.click(Role::Button, "Use this version");
+    assert_eq!((showing(&mut window, "later"), showing(&mut window, "earlier")), (1, 1), "the roof's traded");
+}
+
+#[test]
 fn either_version_is_written_on_in_the_page_before_one_is_kept() {
     let mut window = reviewing();
     // Sam mends his own version, then has Alice's on the page and writes on that.
@@ -466,19 +481,100 @@ fn a_conflict_about_a_block_the_page_no_longer_has_is_read_and_resolved_as_a_not
     assert_eq!(waiting(&mut window), 0);
 }
 
+/// What Alice made of a paragraph about skips, which Sam then took out.
+const SKIPS: &str = "Two skips are booked for the first week of March.";
+
+/// A conflict about that paragraph, which stood behind the block `after`: the note knows unless `after`
+/// is `None`.
+fn skipped(after: Option<&str>) -> Note {
+    let mut note = conflict("skips", Some(SKIPS), None);
+    note.anchor.stood = after.map(|after| Stood { after: Some(after.into()), ..Stood::default() });
+    // Alice's copy knew the paragraph by another id, as copies do of blocks that share one.
+    if let NoteKind::Conflict { versions } = &mut note.kind {
+        versions[0].block = Some(para("skips~2", SKIPS));
+    }
+    note
+}
+
+/// The letter with that conflict open as a note.
+fn taken_out(after: Option<&str>) -> Harness {
+    let mut window = letter(vec![skipped(after)]);
+    read_conflict(&mut window);
+    window
+}
+
+/// Opens the one note from the Notes panel.
+fn read_conflict(window: &mut Harness) {
+    window.click(Role::Button, "Notes");
+    let row = window.controls().into_iter().find(|found| found.role == Role::ListBoxOption).expect("it is listed");
+    window.click_at(row.center()).assert_open(Role::Dialog, "Conflict");
+}
+
+#[test]
+fn a_block_the_later_writer_took_out_is_put_back_where_it_stood_with_both_versions_to_choose_from() {
+    let mut window = taken_out(Some("plan"));
+    let before = window.markdown();
+    let told =
+        |found: &Found| [Some(&found.name), found.value.as_ref()].into_iter().flatten().any(|said| said == SKIPS);
+    assert!(window.controls().iter().any(told), "the note says how the version reads that still has it");
+
+    window.click(Role::Button, "Use this version").assert_closed(Role::Dialog, "Conflict");
+    let order: Vec<&str> = window.editor().doc().blocks.iter().map(|block| block.id.as_str()).collect();
+    assert_eq!(order, ["title", "plan", "skips", "roof", "dates"], "it is back behind the plan");
+    assert_eq!(reads(&window, "skips").as_deref(), Some(SKIPS));
+    // The conflict is still open, now on the page: the version that took the block out is held back.
+    assert_eq!(waiting(&mut window), 1);
+    assert!(held_back(&mut window).is_some() && choices(&mut window).iter().all(Option::is_some));
+    window.key("Mod+Z");
+    assert_eq!(window.markdown(), before, "one step back");
+}
+
+#[test]
+fn a_block_that_was_put_back_stays_or_goes_by_the_version_that_is_chosen() {
+    // The choice, and what the page reads of the paragraph once it is made.
+    for (choice, left) in [("Keep this version", Some(SKIPS)), ("Use this version", None)] {
+        let mut window = taken_out(Some("plan"));
+        window.click(Role::Button, "Use this version").click(Role::Button, choice);
+        assert_eq!((reads(&window, "skips").as_deref(), waiting(&mut window)), (left, 0), "{choice}");
+    }
+}
+
+#[test]
+fn a_block_is_only_offered_to_be_put_back_where_its_place_is_known_and_a_choice_can_be_kept() {
+    // The block it stood behind, if the note knows, and why this copy's notes cannot be changed, if so.
+    for (after, refused) in [(None, None), (Some("plan"), Some("This copy is read only."))] {
+        let mut window = taken_out(after);
+        window.ui().refuse_comments(refused);
+        assert_eq!(window.find(Role::Button, "Use this version"), None, "{after:?} {refused:?}");
+        assert!(window.find(Role::Dialog, "Conflict").is_some(), "the note is still read");
+    }
+}
+
 #[test]
 fn opening_a_conflict_far_down_the_page_brings_both_versions_into_view() {
-    let mut blocks: Vec<Block> = (0..80).map(|line| para(&format!("l{line}"), "A line.")).collect();
-    blocks.push(para("roof", ROOF[0]));
-    let mut window = Harness::open(Document { blocks, ..Document::default() });
-    window.ui().set_notes(Notes { notes: vec![conflict("roof", Some(ROOF[1]), Some(ROOF[0]))], ..Notes::default() });
-    window.click(Role::Button, "Next conflict");
+    let lines = || (0..80).map(|line| para(&format!("l{line}"), "A line.")).collect::<Vec<Block>>();
+    // The block the conflict is about, with the page and the note as they are before it opens, and how
+    // it is opened: stepped to, and by putting its block back from the note.
+    let stepped: (_, _, _, Open) =
+        ("roof", [lines(), vec![para("roof", ROOF[0])]].concat(), both().remove(0), |window| {
+            window.click(Role::Button, "Next conflict");
+        });
+    let put_back: (_, _, _, Open) = ("skips", lines(), skipped(Some("l79")), |window| {
+        read_conflict(window);
+        window.click(Role::Button, "Use this version");
+    });
+    for (block, blocks, note, open) in [stepped, put_back] {
+        let mut window = Harness::open(Document { blocks, ..Document::default() });
+        window.ui().set_notes(Notes { notes: vec![note], ..Notes::default() });
+        open(&mut window);
 
-    let area = area(&mut window);
-    let within = |rect: Rect| rect.y >= area.y && rect.y + rect.height <= area.y + area.height;
-    let held = held_back(&mut window).expect("the version held back").bounds;
-    let [keep, used] = choices(&mut window).map(|choice| choice.expect("a choice").bounds);
-    assert!(within(held) && within(keep) && within(used), "{held:?}, {keep:?} and {used:?} in {area:?}");
-    let caret = caret_at(&mut window, "roof", ROOF[0].len());
-    assert!(within(caret), "the page's version too: {caret:?}");
+        let area = area(&mut window);
+        let within = |rect: Rect| rect.y >= area.y && rect.y + rect.height <= area.y + area.height;
+        let held = held_back(&mut window).expect("the version held back").bounds;
+        let [keep, used] = choices(&mut window).map(|choice| choice.expect("a choice").bounds);
+        assert!(within(held) && within(keep) && within(used), "{block}: {held:?}, {keep:?} and {used:?} in {area:?}");
+        let end = reads(&window, block).map_or(0, |text| text.len());
+        let caret = caret_at(&mut window, block, end);
+        assert!(within(caret), "the page's version of {block} too: {caret:?}");
+    }
 }

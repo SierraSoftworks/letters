@@ -52,6 +52,20 @@ pub(crate) const CELL_PAD_Y: f32 = 6.0;
 /// A display formula too wide for the column is set smaller, down to this share of its size.
 pub(crate) const FORMULA_SHRINK: f32 = 0.4;
 
+/// The gap between the lines of a table of contents, and between the texts of a link preview.
+pub(crate) const ENTRY_GAP: f32 = 3.0;
+/// The room at the end of the lines of a table of contents that a sheet sets a page number in, in ems of
+/// their type: three digits and a gap.
+pub(crate) const PAGE_NUMBER: f32 = 2.6;
+/// The slot a link preview shows its picture in, whatever the picture's size.
+pub(crate) const PREVIEW_PICTURE: (f32, f32) = (120.0, 80.0);
+/// The gap between that slot and the text beside it.
+pub(crate) const PREVIEW_GAP: f32 = 16.0;
+/// The picture shows only where it leaves the text this much room.
+pub(crate) const PREVIEW_TEXT: f32 = 160.0;
+/// The room at the end of a link preview that has only its address, for what a window stands there.
+pub(crate) const PREVIEW_CONTROL: f32 = 128.0;
+
 /// A callout's revealed tag is set small enough to sit in the padding above its text.
 pub(crate) const TAG_SCALE: f32 = 0.7;
 

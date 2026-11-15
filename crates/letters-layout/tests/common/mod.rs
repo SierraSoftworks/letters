@@ -1,9 +1,9 @@
 //! Shared fixtures: small documents, a layout of them and ways to read what was painted.
 #![allow(dead_code)]
 
-use letters_layout::{DocLayout, Fonts, Palette, Scheme};
+use letters_layout::{DocLayout, Fonts, Pages, Palette, Scheme};
 use letters_model::{Align, Block, BlockKind, Body, Document, Mark, Page, Run, Style};
-use letters_render::{Color, DisplayList, Item, Rect};
+use letters_render::{Color, DisplayList, Item, Rect, Role};
 
 pub const WIDTH: f32 = 600.0;
 pub const PROSE: &str = "Rates change on the first of January, and every household on the scheme should check the \
@@ -78,6 +78,22 @@ pub fn table(id: &str, columns: &[Align], header: bool, rows: &[&[&str]]) -> Blo
     container(id, kind, rows.iter().enumerate().map(row).collect())
 }
 
+pub fn heading(id: &str, level: u8, text: &str) -> Block {
+    Block::text(id, BlockKind::Heading { level }, text)
+}
+
+/// A table of contents that lists headings down to level `levels`.
+pub fn contents(id: &str, levels: u8) -> Block {
+    Block::new(id, BlockKind::TableOfContents { levels })
+}
+
+/// A link preview of `url` with what was fetched of its page: a title, a description and a picture, which
+/// is an asset's name.
+pub fn preview(id: &str, url: &str, fetched: [Option<&str>; 3]) -> Block {
+    let [title, description, image] = fetched.map(|part| part.map(str::to_owned));
+    Block::new(id, BlockKind::LinkPreview { url: url.into(), title, description, image })
+}
+
 /// A sheet of paper whose text area is `column` wide and `room` tall, in logical pixels.
 pub fn paper(column: f32, room: f32) -> Page {
     let (margin, points) = (30.0, 72.0 / 96.0);
@@ -104,6 +120,49 @@ pub fn spelt(layout: &DocLayout) -> String {
         _ => None,
     });
     texts.collect()
+}
+
+/// What one sheet paints.
+pub fn sheet(layout: &DocLayout, pages: &Pages, index: usize) -> Vec<Item> {
+    let mut list = DisplayList::default();
+    layout.paint_page(pages, index, &mut list);
+    list.items
+}
+
+/// The links a sheet says it has, in the order they open: the id of each one's part, and what the part
+/// spells with all that is inside it.
+pub fn links(items: &[Item]) -> Vec<(u64, String)> {
+    let mut told: Vec<(u64, String)> = Vec::new();
+    // For each open part, which of the links it is or is in.
+    let mut open: Vec<Option<usize>> = Vec::new();
+    for item in items {
+        match item {
+            Item::Open { role: Role::Link, id } => {
+                open.push(Some(told.len()));
+                told.push((*id, String::new()));
+            }
+            Item::Open { .. } => open.push(open.last().copied().flatten()),
+            Item::Close => drop(open.pop()),
+            Item::Glyphs { text: Some(run), .. } => {
+                if let Some(Some(link)) = open.last() {
+                    told[*link].1.push_str(&run.text);
+                }
+            }
+            _ => {}
+        }
+    }
+    told
+}
+
+/// Where the glyphs painted inside `rect` start and end across the page, loosely: by where each is set,
+/// not by how wide it is drawn. `None` when no glyph is inside.
+pub fn reach(items: &[Item], rect: Rect) -> Option<(f32, f32)> {
+    let inside = |(_, x, y): &(u32, f32, f32)| {
+        (rect.x..=rect.x + rect.width).contains(x) && (rect.y..=rect.y + rect.height).contains(y)
+    };
+    let across: Vec<f32> = placed(items).into_iter().filter(inside).map(|(_, x, _)| x).collect();
+    let (left, right) = (across.iter().copied().reduce(f32::min)?, across.iter().copied().reduce(f32::max)?);
+    Some((left, right))
 }
 
 /// `count` paragraphs of wrapping prose, named `p0`, `p1` and so on.

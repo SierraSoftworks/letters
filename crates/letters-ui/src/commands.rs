@@ -67,6 +67,8 @@ pub(crate) enum Act {
     AltText,
     /// Opens the card of the callout the caret is in.
     Callout,
+    /// Lists the languages the caret's code block can be in.
+    CodeLanguage,
     /// Shows the selected linked picture this once.
     Load,
     /// Shows the pictures of the selected one's host from now on.
@@ -89,10 +91,18 @@ pub(crate) enum Act {
     PageSetup,
     TrustDocument,
     TrustFolder,
+    /// Merges the conflict copies a sync tool left of the document.
+    MergeConflicts,
+    /// Lets the person choose another file of the document to merge into it.
+    MergeFrom,
+    /// Merges the document, a conflict copy, into the document it is a copy of.
+    MergeInto,
     /// Shows the document on the sheets it prints on.
     Print,
     /// Shows the document's earlier versions.
     History,
+    /// Shows the versions that changed what is selected.
+    SelectionHistory,
     /// Steps through the conflicts that wait for a choice, or settles the one that is open.
     Review(Reviewing),
     /// Goes to the next misspelled word and offers its corrections, or to the one before.
@@ -150,7 +160,7 @@ const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> E
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 91] = [
+pub(crate) static ENTRIES: [Entry; 96] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -179,6 +189,7 @@ pub(crate) static ENTRIES: [Entry; 91] = [
     table("Align column right", "end", TableEdit::Align(ColumnAlign::End)),
     table("Turn header row on", "heading first", TableEdit::Header(true)),
     table("Turn header row off", "heading first", TableEdit::Header(false)),
+    entry("Code", "Change language", "syntax highlight colours colors", Act::CodeLanguage),
     entry("Callout", "Edit callout", "title icon colour color type", Act::Callout),
     callout("Info", "note blue", CalloutEdit::Tone(Tone::Info)),
     callout("Tip", "hint green", CalloutEdit::Tone(Tone::Tip)),
@@ -228,6 +239,7 @@ pub(crate) static ENTRIES: [Entry; 91] = [
     entry("View", "Styles panel", "show hide fonts page", Act::Panel(Panel::Styles)),
     entry("View", "Notes panel", "show hide comments", Act::Panel(Panel::Notes)),
     entry("View", "History", "versions earlier before rewind restore", Act::History),
+    entry("View", "History of selection", "passage versions changed who restore", Act::SelectionHistory),
     entry("View", "Print view", "pages paper sheets preview", Act::Print),
     entry("View", "Next conflict", "changed two places choice", Act::Review(Reviewing::Step { back: false })),
     entry("View", "Previous conflict", "changed two places choice", Act::Review(Reviewing::Step { back: true })),
@@ -242,6 +254,9 @@ pub(crate) static ENTRIES: [Entry; 91] = [
     entry("Document", "Settings", "preferences appearance accent", Act::Settings),
     entry("Document", "Trust this document", "safe mode", Act::TrustDocument),
     entry("Document", "Trust this folder", "safe mode", Act::TrustFolder),
+    entry("Document", "Merge conflicts", "conflict copy copies sync", Act::MergeConflicts),
+    entry("Document", "Merge from file", "duplicate copy combine", Act::MergeFrom),
+    entry("Document", "Merge into the original", "conflict copy sync", Act::MergeInto),
 ];
 
 const PRIMARY: Modifiers = Modifiers { primary: true, shift: false, alt: false };

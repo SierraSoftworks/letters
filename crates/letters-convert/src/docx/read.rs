@@ -412,6 +412,10 @@ struct Para {
     ruled: bool,
     /// Whether any of it belongs to a table of contents.
     contents: bool,
+    /// How deep a table of contents that starts in it lists, where a field says that it is one.
+    listing: Option<u8>,
+    /// Whether it lies in a table of contents that an earlier paragraph started.
+    listed: bool,
     /// The language of the run being read.
     lang: Option<String>,
     /// Whether a page break comes before any of the text.
@@ -571,7 +575,13 @@ impl Reader<'_, '_> {
                     let gallery = node.child("sdtPr").and_then(|props| props.child("docPartObj"));
                     let contents = gallery.and_then(|part| part.value("docPartGallery")) == Some("Table of Contents");
                     if contents {
-                        out.pending.push(CONTENTS);
+                        // Word's own table of contents, which holds the field that makes it.
+                        let code =
+                            node.descendants().filter(|part| part.is("instrText")).filter_map(|part| part.text());
+                        let levels = inline::levels(&code.collect::<String>());
+                        let table = Block::new(self.id(), BlockKind::TableOfContents { levels });
+                        self.close(out);
+                        self.push(table, out);
                     } else if let Some(content) = node.child("sdtContent") {
                         self.wrapped(content, rels, out);
                     }
@@ -637,6 +647,8 @@ impl Reader<'_, '_> {
             task: None,
             ruled: direct.ruled == Some(true),
             contents: role == Role::Contents || self.fields.iter().any(|field| field.contents),
+            listing: None,
+            listed: self.fields.iter().any(|field| field.contents),
             lang: None,
             breaks: false,
             broken: false,
@@ -658,7 +670,14 @@ impl Reader<'_, '_> {
     /// Turns a paragraph into its block, or into more of the block before it.
     fn emit(&mut self, mut para: Para, props: &ParaProps, out: &mut Out) {
         if para.contents {
-            if !out.pending.contains(&CONTENTS) {
+            if let Some(levels) = para.listing {
+                // A field makes the table, so it is one block. Its lines are what Word last made of it,
+                // and the page makes its own.
+                let table = Block::new(self.id(), BlockKind::TableOfContents { levels });
+                self.close(out);
+                self.push(table, out);
+            } else if !para.listed && !out.pending.contains(&CONTENTS) {
+                // Lines set as a table of contents with no field behind them say nothing of what they list.
                 out.pending.push(CONTENTS);
             }
             // What floats beside an entry is no part of the table.
@@ -736,7 +755,17 @@ impl Reader<'_, '_> {
             self.close(out);
             self.push(block, out);
         } else if blank {
-            // Word spaces text with empty paragraphs. Here the style does that.
+            // Word spaces text with empty paragraphs. Here the style does that. One that is not set as the
+            // quote, the callout or the code above it is where that ends.
+            let within = match para.role {
+                Role::Quote => Open::Quote,
+                Role::Callout(tone) | Role::CalloutTitle(tone) => Open::Callout(tone),
+                Role::Code => Open::Code,
+                _ => Open::Nothing,
+            };
+            if within != out.open {
+                self.close(out);
+            }
         } else if para.role == Role::Code {
             let text: String = runs.iter().map(|run| run.text.as_str()).collect();
             // Code that starts a new page is a block of its own.
@@ -760,6 +789,17 @@ impl Reader<'_, '_> {
                 self.push(block, out);
                 out.open = Open::Code;
             }
+        } else if let Role::CalloutTitle(tone) = para.role {
+            // The line that heads a callout starts one. It is the callout's title where it is not its tone's
+            // own, and a comment on it moves to the text under it.
+            let title = runs.iter().map(|run| run.text.as_str()).collect::<String>().replace(['\n', '\t'], " ");
+            let title = (title != tone.title()).then_some(title);
+            let mut callout = Block::new(self.id(), BlockKind::Callout { tone, title, icon: None, color: None });
+            callout.body = Body::Blocks(Vec::new());
+            self.attach(&callout.id, &notes);
+            self.close(out);
+            self.push(callout, out);
+            out.open = Open::Callout(tone);
         } else if captioned {
             merge(&mut runs);
             let caption = Block { body: Body::Text(runs), ..Block::new(self.id(), BlockKind::Caption) };
@@ -853,7 +893,10 @@ impl Reader<'_, '_> {
                 }
                 _ => {
                     let kind = match wrapper {
-                        Open::Callout(tone) => BlockKind::callout(tone),
+                        // No line heads it in Word, so none does on the page.
+                        Open::Callout(tone) => {
+                            BlockKind::Callout { tone, title: Some(String::new()), icon: None, color: None }
+                        }
                         _ => BlockKind::Quote,
                     };
                     let mut outer = Block::new(self.id(), kind);
@@ -1151,7 +1194,8 @@ fn flatten(blocks: Vec<Block>, runs: &mut Vec<Run>, moved: &mut BTreeMap<BlockId
                 moved.insert(block.id, runs.iter().map(|run| run.text.len()).sum());
                 flatten(inner, runs, moved, aside);
             }
-            Body::None => {}
+            // What holds no text leaves none, and what was noted on it is noted where it stood.
+            Body::None => _ = moved.insert(block.id, runs.iter().map(|run| run.text.len()).sum()),
         }
     }
 }

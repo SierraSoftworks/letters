@@ -1,6 +1,6 @@
 //! TeX from anywhere: a formula is typeset or refused, and one that is typeset can be drawn and written.
 
-use letters_math::{Cache, Style, mathml, typeset};
+use letters_math::{Cache, Style, mathml, typeset, typeset_mapped};
 use letters_render::{Color, DisplayList, Point};
 
 use crate::input::text;
@@ -17,6 +17,13 @@ pub fn run(data: &[u8]) {
             formula.svg(Color::rgb(0, 0, 0));
             let cached = cache.typeset(&source, &style).expect("what typesets once typesets again");
             assert!(*cached == formula, "a formula is typeset differently the second time");
+            let traced = typeset_mapped(&source, &style).expect("what typesets can be traced");
+            assert!(traced.size == formula.size, "a traced formula is another size");
+            for part in &traced.parts {
+                assert!(source.get(part.source.clone()).is_some(), "a part is from outside the source: {part:?}");
+                assert!(traced.items.get(part.items.clone()).is_some(), "a part is drawn by nothing: {part:?}");
+            }
+            traced.tinted(&(0..source.len()), Color::rgb(255, 0, 0));
         }
         let _ = mathml(&source, display);
     }

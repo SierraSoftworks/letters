@@ -17,8 +17,8 @@ use letters_layout::{
     CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax, Uncovered, WordList,
 };
 use letters_model::{
-    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, Notes, Pos, Revision,
-    Selection, Style,
+    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, NoteKind, Notes, Pos,
+    Revision, Selection, Style,
 };
 use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
@@ -41,7 +41,9 @@ use crate::history::{self, History, Historying, Naming};
 use crate::icon::{self, Icon};
 use crate::importing::{Import, ImportOffer, Importing};
 use crate::insert::{Insert, Inserting, Put};
+use crate::languages::{self, Fence, Fencing, Languages, Languaging};
 use crate::maths::{self, Maths, Sheet, SheetLines, Source};
+use crate::merging::{Confirmed, MergeAsk, MergeFile, Merges, Merging};
 use crate::motion::{self, FRAME_MS};
 use crate::notes::{self, Margin, Noting};
 use crate::opening::{self, Landing, Location, Recent, Request};
@@ -59,7 +61,7 @@ use crate::spelling::Spelling;
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::styles::{self, Styles, Styling};
 use crate::tables::{self, Tables};
-use crate::text::{Family, FontShaper, TextShaper, TextStyle};
+use crate::text::{Family, FontShaper, Shaped, TextShaper, TextStyle};
 use crate::theme::{Accent, accent};
 use crate::threads::{self, Said};
 use crate::tokens::{self, Color as Ink, Scheme};
@@ -208,6 +210,10 @@ pub enum Message {
     /// What is done on the sheet under a formula.
     Maths(Sheet),
     Insert(Inserting),
+    /// What is asked of the list of languages under a fence being typed.
+    Fence(Fencing),
+    /// What is asked of a code block's language and the list that changes it.
+    Language(Languaging),
     /// What is asked of the list of figures under a reference being typed.
     Refer(Picking),
     /// What the settings dialog asks for.
@@ -224,6 +230,8 @@ pub enum Message {
     Note(Noting),
     /// What the safe mode bar, a link and the card about a link ask for.
     Safe(Safely),
+    /// What the bar about conflict copies and the card about files to merge ask for.
+    Merge(Merging),
     /// What is asked of the command palette.
     Commands(Commanding),
     /// What is asked of the bar that finds and replaces.
@@ -575,6 +583,53 @@ impl Ui<EditorApp> {
         self.app_mut().safe.refuse(href, why);
     }
 
+    /// Says which conflict copies of the document there are: files a sync tool left beside it that hold
+    /// edits it lacks. A bar under the top bar offers to merge them with [`Request::MergeConflicts`], and
+    /// goes when there are none. Each call replaces the list. Until the first call, an empty one included,
+    /// the window offers no merge at all: a shell that cannot merge, or a document that is in no file yet,
+    /// is never asked for one.
+    pub fn set_conflict_copies(&mut self, copies: Vec<MergeFile>) {
+        self.app_mut().merges.set(copies);
+    }
+
+    /// Names the files about to be merged and asks whether to go on, in answer to a
+    /// [`Request::MergeConflicts`] or a [`Request::MergeFrom`] that was not confirmed. A yes asks again
+    /// with `confirmed` set: for the conflict copies when `conflicts` is set, else for the first file.
+    pub fn ask_merge(&mut self, ask: MergeAsk) {
+        self.app_mut().merges.ask(ask);
+    }
+
+    /// Says why files could not be merged, in a sentence that stands by itself. The bar under the top bar
+    /// says it until the person puts it away or asks for another merge.
+    pub fn refuse_merge(&mut self, why: &str) {
+        self.app_mut().merges.refuse(why);
+    }
+
+    /// Says that this document is itself a conflict copy, and of which document, or `None` once it is one
+    /// no longer. The bar under the top bar says so and offers to merge it into that document with
+    /// [`Request::MergeIntoOriginal`]. Its own conflict copies wait until then.
+    pub fn set_conflict_original(&mut self, original: Option<MergeFile>) {
+        self.app_mut().merges.set_original(original);
+    }
+
+    /// Names the document this one is about to be merged into and asks whether to go on, in answer to a
+    /// [`Request::MergeIntoOriginal`] that was not confirmed. A yes asks again with `confirmed` set.
+    pub fn ask_merge_into(&mut self, original: MergeFile) {
+        self.app_mut().merges.ask_into(original);
+    }
+
+    /// Says that files were merged, by their names as the person reads them: the bar says so for a few
+    /// seconds where it says how saving stands. A shell says it once the merge is kept, for conflict
+    /// copies and for a file the person chose alike. No names, nothing said.
+    pub fn set_merged(&mut self, names: Vec<String>) {
+        let said = match names.as_slice() {
+            [] => return,
+            [name] => format!("Merged {name}"),
+            names => format!("Merged {} files", names.len()),
+        };
+        self.app_mut().note = Some((said, None));
+    }
+
     /// The document's notes: the comments on its passages, and what imports and merges left on them. A
     /// shell writes them into the document's file with each save. A comment that is written counts among
     /// [`Window::edits`].
@@ -682,14 +737,14 @@ impl Ui<EditorApp> {
         let app = self.app();
         let editing = self.canvas().filter(|_| !app.away());
         let Some((page, selection)) = editing.zip(app.editor.selection()) else { return [None, None] };
-        let end = |pos: &Pos| {
-            let caret = app.layout.caret(pos)?;
+        let end = |caret: Option<Rect>| {
+            let caret = caret?;
             let at = app.onto(caret);
             let (x, y) = (page.x + at.x, page.y + at.y);
             let shown = y + caret.height > page.y && y < page.y + page.height;
             shown.then_some(Rect { x, y, ..caret })
         };
-        [end(&selection.anchor), end(&selection.head)]
+        [end(app.layout.caret(&selection.anchor)), end(app.head())]
     }
 
     /// Selects the word at a point of the window, as a double click there does: for a long press on a
@@ -698,9 +753,10 @@ impl Ui<EditorApp> {
     pub fn select_word_at(&mut self, at: Point, platform: &mut dyn Platform) -> bool {
         // The version a conflict holds back is read, not selected.
         let on_page = self.on_canvas(at).filter(|at| !self.app().review.covers(*at));
-        let Some(head) = on_page.and_then(|at| self.app().hit(at)) else { return false };
+        let Some((head, before_wrap)) = on_page.and_then(|at| self.app().hit_sided(at)) else { return false };
         let app = self.app_mut();
-        app.editor.select(Selection::caret(head));
+        // Past the end of a line that wraps with no space, the word is one of that line.
+        app.editor.select_at(Selection::caret(head), before_wrap);
         app.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform));
         true
     }
@@ -732,19 +788,22 @@ impl<'a> DocLines<'a> {
     }
 }
 
-// Layout does not yet tell the end of a line that wraps with no space from the start of the next, so
-// every place is taken and answered as its offset alone says.
+/// A place as layout tells it, with the side of a wrap it is on.
+fn sided((pos, before_wrap): (Pos, bool)) -> LinePos {
+    LinePos { pos, before_wrap }
+}
+
 impl Lines for DocLines<'_> {
     fn caret_x(&self, at: &LinePos) -> Option<f32> {
-        self.layout.caret(&at.pos).map(|caret| caret.x)
+        self.layout.caret_sided(&at.pos, at.before_wrap).map(|caret| caret.x)
     }
 
     fn line_step(&self, at: &LinePos, x: f32, down: bool) -> Option<LinePos> {
-        self.layout.line_step(&at.pos, x, down).map(LinePos::from)
+        self.layout.line_step_sided(&at.pos, at.before_wrap, x, down).map(sided)
     }
 
     fn line_edge(&self, at: &LinePos, end: bool) -> Option<LinePos> {
-        self.layout.line_edge(&at.pos, end).map(LinePos::from)
+        self.layout.line_edge_sided(&at.pos, at.before_wrap, end).map(sided)
     }
 
     fn page_lines(&self) -> usize {
@@ -830,6 +889,7 @@ pub struct EditorApp {
     drop: Option<Rect>,
     linked: Linked,
     safe: Safe,
+    merges: Merges,
     grip: Grip,
     captions: Captions,
     margin: Margin,
@@ -889,6 +949,8 @@ pub struct EditorApp {
     refer: Refer,
     references: References,
     code_copy: CodeCopy,
+    fence: Fence,
+    languages: Languages,
     tables: Tables,
     /// The callouts' icons and titles under the pointer, and the card of one.
     callouts: Callouts,
@@ -939,6 +1001,7 @@ impl EditorApp {
             drop: None,
             linked: Linked::default(),
             safe: Safe::default(),
+            merges: Merges::default(),
             grip: Grip::default(),
             captions: Captions::default(),
             margin: Margin::default(),
@@ -977,6 +1040,8 @@ impl EditorApp {
             refer: Refer::default(),
             references: References::default(),
             code_copy: CodeCopy::default(),
+            fence: Fence::default(),
+            languages: Languages::default(),
             tables: Tables::default(),
             callouts: Callouts::default(),
             context: None,
@@ -1407,6 +1472,16 @@ impl EditorApp {
                 self.edits += u64::from(self.margin.answer(created));
             }
             Noting::Resolve => self.edits += u64::from(self.margin.resolve()),
+            Noting::PutBack => {
+                let Some(back) = self.put_back() else { return };
+                // The page keeps its place while the block comes back, and then shows it with the version
+                // that took it out beside it.
+                self.held(|app| {
+                    let change = app.run(platform, |editor, platform| editor.run(back, platform));
+                    app.follow(&change);
+                });
+                return self.show_review();
+            }
             Noting::ResolveImports => self.edits += u64::from(self.margin.resolve_imports()),
         }
         if opens && self.margin.reading().is_some() {
@@ -1424,6 +1499,18 @@ impl EditorApp {
         if opens && self.review.note().is_some_and(|open| Some(open) != reviewed.as_deref()) {
             self.show_review();
         }
+    }
+
+    /// What puts the block of the conflict that is read in a note back on the page: the version that still
+    /// has it, where the block stood. `None` unless the note is such a conflict and the block can go back.
+    fn put_back(&self) -> Option<Command> {
+        let (note, _) = self.margin.reading()?;
+        let NoteKind::Conflict { versions } = &note.kind else { return None };
+        let version = versions.iter().find_map(|version| version.block.clone())?;
+        // The version stands under the id the note is about, whatever it goes by itself.
+        let block = Box::new(Block { id: note.anchor.block.clone(), ..version });
+        let back = Command::PutBack { block, stood: note.anchor.stood.clone()? };
+        (self.margin.refused.is_none() && self.editor.applies(&back)).then_some(back)
     }
 
     /// The first and the last line of the passage a note is about, in the layout's coordinates: of its
@@ -1684,6 +1771,7 @@ impl EditorApp {
             Act::Pictures => Message::Ask(Request::Pictures),
             Act::AltText => self.captioned().map(|_| Message::Alt(Altering::Open))?,
             Act::Callout => editor.callout().map(|_| Message::Callout(Calling::Open))?,
+            Act::CodeLanguage => self.code().map(|_| Message::Language(Languaging::Open))?,
             Act::Load => {
                 let waits = |src: &&str| self.linked.said(src).is_none_or(|state| *state != PictureState::Loading);
                 let src = link.filter(waits).filter(|src| self.images.get(src).is_none());
@@ -1708,9 +1796,16 @@ impl EditorApp {
             Act::PageSetup => Message::Styles(Styling::PageSetup),
             Act::TrustDocument => self.safe.on().then_some(Message::Safe(Safely::TrustDocument))?,
             Act::TrustFolder => self.safe.folder().then_some(Message::Safe(Safely::TrustFolder))?,
+            Act::MergeConflicts => self.merges.waiting().then_some(Message::Merge(Merging::Conflicts))?,
+            Act::MergeFrom => self.merges.can().then_some(Message::Merge(Merging::FromFile))?,
+            Act::MergeInto => self.merges.copied().then_some(Message::Merge(Merging::IntoOriginal))?,
             // A card over the window is answered first: there is no document to act on behind it.
             Act::Print => (!self.carded()).then_some(Message::Print(Printing::Show))?,
             Act::History => (!self.carded()).then_some(Message::History(Historying::Show))?,
+            Act::SelectionHistory => {
+                let touched = editor.selection().and_then(|selection| history::touched(editor.doc(), selection));
+                (touched.is_some() && !self.carded()).then_some(Message::History(Historying::Passage))?
+            }
             Act::Review(asked) => {
                 let (open, can) = (self.margin.reviewing().is_some(), self.margin.refused.is_none());
                 let fits = match asked {
@@ -1777,6 +1872,21 @@ impl EditorApp {
                 self.told.get_mut().forget();
                 self.turn();
             }
+            Historying::Passage => {
+                let selection = self.editor.selection();
+                let touched = selection.and_then(|selection| history::touched(self.editor.doc(), selection));
+                let Some(blocks) = touched else { return };
+                if self.history.is_none() {
+                    self.historying(Historying::Show, platform);
+                }
+                self.take_name();
+                self.narrow(blocks);
+                self.turn();
+            }
+            Historying::Whole => {
+                self.history.iter_mut().for_each(History::whole);
+                self.turn();
+            }
             Historying::Back => {
                 self.take_name();
                 self.leave();
@@ -1821,7 +1931,17 @@ impl EditorApp {
             }
             Historying::Restore => {
                 self.take_name();
-                let Some(revision) = self.history.as_ref().map(|history| history.picked().at.clone()) else { return };
+                let Some(history) = &self.history else { return };
+                // Of a passage's history only the passage is made to read as it did.
+                if let Some(blocks) = history.restored() {
+                    let command = Command::UseVersions(blocks);
+                    if self.editor.applies(&command) {
+                        self.leave();
+                        self.edit(platform, |editor, platform| editor.run(command, platform));
+                    }
+                    return;
+                }
+                let revision = history.picked().at.clone();
                 // The document reads as the version again, and is there to be written on.
                 self.leave();
                 self.edit(platform, |editor, platform| editor.run(Command::Restore(revision), platform));
@@ -1835,10 +1955,30 @@ impl EditorApp {
         let Some((revision, name)) = self.history.as_mut().and_then(History::named) else { return };
         if self.editor.name_version(&revision, name.as_deref()).is_ok() {
             self.edits += 1;
-            let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
-            self.history.iter_mut().for_each(|history| history.follow(&steps, current.clone()));
-            self.turn();
+            self.relist();
         }
+    }
+
+    /// Lists the history's versions again after the document changed under it, and finds a passage's
+    /// versions among them again.
+    fn relist(&mut self) {
+        // The timeline is read only for a history that shows: reading it costs more with every version.
+        if self.history.is_none() {
+            return;
+        }
+        let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
+        let Some(history) = &mut self.history else { return };
+        history.follow(&steps, current);
+        if let Some(blocks) = history.narrowed() {
+            self.narrow(blocks);
+        }
+        self.turn();
+    }
+
+    /// Narrows the history to the versions that changed a passage of the document: `blocks`, at its top.
+    fn narrow(&mut self, blocks: Vec<BlockId>) {
+        let (Some(history), editor) = (&mut self.history, &mut self.editor) else { return };
+        history.narrow(blocks, |revision| editor.document_at(revision).ok().map(|(doc, _)| doc));
     }
 
     /// Reads what the history is to show and has not read: the version it has picked, and the one that
@@ -2061,8 +2201,7 @@ impl EditorApp {
         self.unpoint();
         // Twice, since laying out what comes into view can move the place.
         for _ in 0..2 {
-            let head = self.editor.selection().map(|selection| &selection.head);
-            let Some(line) = head.and_then(|head| self.layout.caret(head)) else { break };
+            let Some(line) = self.head() else { break };
             let top = self.down(line.y) + TOP;
             let margin = GUTTER.min(self.height / 4.0);
             let cover = self.find.cover().min(self.height / 2.0);
@@ -2106,6 +2245,32 @@ impl EditorApp {
                 }
             }
             Safely::Leave => self.safe.leave(),
+        }
+    }
+
+    /// Does what the bar about conflict copies or the card about files to merge asked. The merge itself
+    /// is the shell's to do.
+    fn merging(&mut self, asked: Merging) {
+        match asked {
+            Merging::Conflicts => {
+                self.merges.asked();
+                self.requests.push(Request::MergeConflicts { confirmed: false });
+            }
+            Merging::FromFile => self.requests.push(Request::MergeFrom { path: None, confirmed: false }),
+            Merging::IntoOriginal => {
+                self.merges.asked();
+                self.requests.push(Request::MergeIntoOriginal { confirmed: false });
+            }
+            Merging::Confirm => match self.merges.confirm() {
+                Some(Confirmed::Conflicts) => self.requests.push(Request::MergeConflicts { confirmed: true }),
+                Some(Confirmed::File(path)) => {
+                    self.requests.push(Request::MergeFrom { path: Some(path), confirmed: true });
+                }
+                Some(Confirmed::Original) => self.requests.push(Request::MergeIntoOriginal { confirmed: true }),
+                None => {}
+            },
+            Merging::Leave => self.merges.leave(),
+            Merging::Hide => self.merges.hide(),
         }
     }
 
@@ -2223,11 +2388,7 @@ impl EditorApp {
         if edited || change.style || change.document {
             self.edits += 1;
             // What came in under the history, as another writer's edits do, is its newest version.
-            if self.history.is_some() {
-                let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
-                self.history.iter_mut().for_each(|history| history.follow(&steps, current.clone()));
-                self.turn();
-            }
+            self.relist();
         }
         self.mark();
         self.sync();
@@ -2272,9 +2433,7 @@ impl EditorApp {
 
     /// Scrolls just far enough to show the head of the selection.
     fn reveal(&mut self) {
-        let Some(caret) = self.editor.selection().and_then(|selection| self.layout.caret(&selection.head)) else {
-            return;
-        };
+        let Some(caret) = self.head() else { return };
         let top = self.down(caret.y) + TOP;
         let bottom = top + caret.height;
         let margin = GUTTER.min(self.height / 4.0);
@@ -2294,12 +2453,27 @@ impl EditorApp {
         self.layout.hit(self.in_layout(at))
     }
 
+    /// Where a press at a point of the page area puts the caret, and whether that is the end of a line that
+    /// wraps there with no space: past such a line's end the caret stays on it. See [`LinePos`].
+    fn hit_sided(&self, at: Point) -> Option<(Pos, bool)> {
+        if self.away() {
+            return None;
+        }
+        self.layout.hit_sided(self.in_layout(at))
+    }
+
+    /// Where the caret at the head of the selection is in the layout, on the side of a wrap it stands at.
+    fn head(&self) -> Option<Rect> {
+        let head = &self.editor.selection()?.head;
+        self.layout.caret_sided(head, self.editor.before_wrap())
+    }
+
     /// Whether a card, a menu or a field that the person asked for is out over the page.
     fn covered(&self) -> bool {
         let card = self.landing.is_some() || self.importing.is_some() || self.copying.is_some();
         let asked = self.context.is_some() || self.link.is_some() || self.linked.open.is_some();
         let asked = asked || self.captions.alt.is_some() || self.tables.open.is_some();
-        card || asked || self.commands.open() || self.callouts.open.is_some()
+        card || asked || self.commands.open() || self.callouts.open.is_some() || self.languages.listed().is_some()
     }
 
     /// Whether something hangs over the page and takes what the pointer does there. A note the caret opened
@@ -2307,7 +2481,8 @@ impl EditorApp {
     fn hung(&self) -> bool {
         let read = self.margin.reading().is_some() && !self.margin.follows();
         let asked = self.covered() || self.margin.writing().is_some() || read;
-        asked || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
+        let listed = self.insert.offers(&self.editor).is_some() || self.fence.offers(&self.editor).is_some();
+        asked || listed || Refer::offers(&self.editor).is_some()
     }
 
     /// The open comment whose passage the selection ends in.
@@ -2357,16 +2532,89 @@ impl EditorApp {
         }
     }
 
-    /// The code block whose box is at a point of the page area, and whether the point is on its copy
-    /// button, while nothing hangs over the page.
-    fn code_at(&self, at: Point) -> Option<(BlockId, bool)> {
+    /// The code block whose box is at a point of the page area, with the box and the point as the layout
+    /// has them, while nothing hangs over the page.
+    fn code_box_at(&self, at: Point) -> Option<(BlockId, Rect, Point)> {
         if self.hung() {
             return None;
         }
         let at = self.in_layout(at);
         let boxes = self.layout.code_boxes(Rect::new(at.x, at.y, 0.0, 1.0));
         let (block, code) = boxes.into_iter().find(|(_, code)| code.contains(at))?;
+        Some((block, code, at))
+    }
+
+    /// The code block whose box is at a point of the page area, and whether the point is on its copy
+    /// button.
+    fn code_at(&self, at: Point) -> Option<(BlockId, bool)> {
+        let (block, code, at) = self.code_box_at(at)?;
         Some((block, code_copy::button(code).contains(at)))
+    }
+
+    /// What the corner of a code block's box calls its language, where that stands in the layout, and
+    /// whether the block is in a language at all.
+    fn language_label(&self, block: &BlockId, code: Rect) -> Option<(Shaped, Rect, bool)> {
+        let BlockKind::Code { language } = &self.editor.doc().block(block)?.kind else { return None };
+        let said = self.shaper.shape(&languages::named(language.as_deref()), &languages::style(), None);
+        let at = languages::place(code, said.size.width);
+        Some((said, at, language.is_some()))
+    }
+
+    /// The code block whose language is at a point of the page area.
+    fn language_at(&self, at: Point) -> Option<BlockId> {
+        let (block, code, at) = self.code_box_at(at)?;
+        let (_, named, _) = self.language_label(&block, code)?;
+        named.contains(at).then_some(block)
+    }
+
+    /// The code block the selection is in, and the language it is in.
+    fn code(&self) -> Option<(&BlockId, Option<&str>)> {
+        let selection = self.editor.selection().filter(|selection| selection.anchor.block == selection.head.block)?;
+        let block = self.editor.doc().block(&selection.head.block)?;
+        let BlockKind::Code { language } = &block.kind else { return None };
+        Some((&block.id, language.as_deref()))
+    }
+
+    /// Lists the languages a code block can be in, as a press on its language does. The caret goes into
+    /// the block first, since the list is about the block the caret is in.
+    fn language(&mut self, block: &BlockId, platform: &mut dyn Platform) {
+        if self.code().map(|(caret, _)| caret) != Some(block) {
+            self.editor.select(Selection::caret(Pos::new(block.clone(), 0)));
+            self.mark();
+        }
+        self.languaging(Languaging::Open, platform);
+    }
+
+    /// Does what the language of a code block, or the list that changes it, asked.
+    fn languaging(&mut self, asked: Languaging, platform: &mut dyn Platform) {
+        match asked {
+            Languaging::Open => {
+                let Some((block, language)) =
+                    self.code().map(|(block, language)| (block.clone(), language.map(str::to_owned)))
+                else {
+                    return;
+                };
+                (self.link, self.spelling.fix, self.linked.open, self.captions.alt) = (None, None, None, None);
+                self.languages.open(block, language.as_deref());
+            }
+            Languaging::Type(typed) => self.languages.typed(typed),
+            Languaging::Step { down } => self.languages.step(down),
+            Languaging::Take(index) => self.set_language(Some(index), platform),
+            Languaging::Enter => self.set_language(None, platform),
+            Languaging::Close => self.languages.close(),
+        }
+    }
+
+    /// Puts the caret's code block in the language taken from its list: the one at `index` of those that
+    /// show, or the one picked.
+    fn set_language(&mut self, index: Option<usize>, platform: &mut dyn Platform) {
+        let Some((block, language)) = self.languages.take(index) else { return };
+        // The language it is in already is left be: the same kind again would make body text of the block.
+        let differs = self.code().is_some_and(|(caret, now)| *caret == block && now != language);
+        if differs {
+            let kind = BlockKind::Code { language: language.map(str::to_owned) };
+            self.edit(platform, |editor, platform| editor.run(Command::SetBlock(kind), platform));
+        }
     }
 
     /// The code block whose copy button is at a point of the page area.
@@ -2507,6 +2755,8 @@ impl EditorApp {
         });
         let headed = self.references.rest().and_then(|at| self.callout_at(at));
         let called = std::mem::replace(&mut self.callouts.over, headed.clone()) != headed;
+        let named = self.references.rest().and_then(|at| self.language_at(at));
+        let called = (std::mem::replace(&mut self.languages.over, named.clone()) != named) || called;
         let linked = self.references.rest().and_then(|at| self.linked_at(at));
         // Each is taken, whichever changed.
         let clouded = self.linked.point(linked);
@@ -2584,6 +2834,12 @@ impl EditorApp {
                     self.references.press(None);
                     return self.call(&block, platform);
                 }
+                // A press on a code block's language lists the languages it can be in.
+                if let Some(block) = self.language_at(at) {
+                    self.dragging = false;
+                    self.references.press(None);
+                    return self.language(&block, platform);
+                }
                 // A press on a copy button is the button's, and leaves the caret where it is.
                 let button = self.copy_button(at);
                 self.code_copy.press(button);
@@ -2636,7 +2892,7 @@ impl EditorApp {
                     self.dragging = false;
                     return self.edit(platform, |editor, platform| editor.run(Command::LineBelow, platform));
                 }
-                let Some(head) = self.hit(at) else { return };
+                let Some((head, before_wrap)) = self.hit_sided(at) else { return };
                 // A press on a picture selects its figure. The caption under it is text like any other.
                 let on_page = self.in_layout(at);
                 let figure = self.layout.figure(&head.block).filter(|figure| figure.image.contains(on_page));
@@ -2660,7 +2916,7 @@ impl EditorApp {
                 // The later presses of a double or triple click are about where the first put the caret,
                 // since the text may have moved under the pointer when the caret came to it.
                 if clicks == 1 || mods.shift || self.editor.selection().is_none() {
-                    self.editor.select(Selection { anchor, head });
+                    self.editor.select_at(Selection { anchor, head }, before_wrap);
                 }
                 self.dragging = clicks == 1;
                 match clicks {
@@ -2702,12 +2958,14 @@ impl EditorApp {
                 }
             }
             Pointer::Drag { at } if self.dragging => {
-                let (Some(head), Some(selection)) = (self.hit(at), self.editor.selection()) else { return };
+                let Some(((head, before_wrap), selection)) = self.hit_sided(at).zip(self.editor.selection()) else {
+                    return;
+                };
                 // A drag that selects is no longer pointing at anything.
                 if head != selection.anchor {
                     self.references.point(None);
                 }
-                self.editor.select(Selection { anchor: selection.anchor.clone(), head });
+                self.editor.select_at(Selection { anchor: selection.anchor.clone(), head }, before_wrap);
                 // Dragging past an edge scrolls the page after the selection.
                 self.reveal();
             }
@@ -2743,7 +3001,7 @@ impl EditorApp {
         if self.hung() {
             return;
         }
-        let Some(pos) = self.hit(at) else { return };
+        let Some((pos, before_wrap)) = self.hit_sided(at) else { return };
         let spot = self.in_layout(at);
         (self.link, self.spelling.fix, self.linked.open) = (None, None, None);
         let near = |rect: &Rect| {
@@ -2756,7 +3014,7 @@ impl EditorApp {
             // A selection that was pressed on is left alone, so that the menu serves it.
             let ranged = self.editor.selection().filter(|selection| !selection.is_caret());
             if !ranged.is_some_and(|selection| self.layout.selection(selection).iter().any(near)) {
-                self.editor.select(Selection::caret(pos.clone()));
+                self.editor.select_at(Selection::caret(pos.clone()), before_wrap);
             }
             // A misspelled word is offered its corrections where the word itself was meant, not the room
             // its line leaves beside it.
@@ -2799,9 +3057,7 @@ impl EditorApp {
             self.reveal();
             self.layout.settle(self.viewport(), 0);
         }
-        let Some(caret) = self.editor.selection().and_then(|selection| self.layout.caret(&selection.head)) else {
-            return;
-        };
+        let Some(caret) = self.head() else { return };
         let caret = self.onto(caret);
         self.menu(Point { x: caret.x + 1.0, y: caret.y + caret.height / 2.0 });
     }
@@ -2929,6 +3185,7 @@ impl EditorApp {
             self.linked.open = None;
         }
         self.callouts.follow(&self.editor);
+        self.languages.follow(&self.editor);
         // The alt text of a picture the selection has left is no longer being written.
         if self.captions.alt.as_ref().is_some_and(|(figure, _)| self.captioned() != Some(figure)) {
             self.captions.alt = None;
@@ -2967,6 +3224,7 @@ impl EditorApp {
 
         let viewport = self.viewport();
         self.insert.follow(&self.editor);
+        self.fence.follow(&self.editor);
         let mut list = DisplayList::default();
         let selection = self.editor.selection();
         // A formula with the caret in it has its source out on a sheet, while the place under it is in view
@@ -3033,11 +3291,19 @@ impl EditorApp {
         for (block, head) in self.layout.callouts(viewport) {
             self.callouts.paint(&block, head, self.scheme, &mut list);
         }
-        // Each code block has its copy button in its corner, over its text.
+        // Each code block has its copy button in its corner, over its text, and its language beside that.
         for (block, code) in self.layout.code_boxes(viewport) {
             let button = code_copy::button(code);
-            let behind = self.reaches(&block, button).then_some([self.palette.page, self.palette.code]);
+            // Code in no language says so only while the pointer is over it, or its languages are listed.
+            let near = self.code_copy.over(&block) || self.languages.listed() == Some(&block);
+            let language = self.language_label(&block, code).filter(|(_, _, named)| *named || near);
+            // The first line is kept clear of whichever of the two stands further left.
+            let reach = language.as_ref().map_or(button, |(_, at, _)| *at);
+            let behind = self.reaches(&block, reach).then_some([self.palette.page, self.palette.code]);
             self.code_copy.paint(&block, button, behind, self.scheme, &mut list);
+            if let Some((said, at, _)) = language.filter(|_| behind.is_none() || near) {
+                self.languages.paint(&block, (at, &said), behind, self.scheme, &mut list);
+            }
         }
 
         // The table the pointer is over or the caret is in has its handles round it.
@@ -3121,7 +3387,7 @@ impl EditorApp {
         }
 
         let written = sheet.is_none() && self.editor.picture().is_none();
-        let caret = selection.filter(|_| written).and_then(|selection| self.layout.caret(&selection.head));
+        let caret = self.head().filter(|_| written);
         let caret = caret.map(|caret| Rect { width: CARET_WIDTH, ..self.onto(caret) });
         let paint = PagePaint {
             list,
@@ -3145,7 +3411,10 @@ impl EditorApp {
             .pointed();
         // A note the caret opened waits behind what the caret itself brings out: a menu of what to insert, a
         // list of figures, the sheet of a formula.
-        let brought = || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some();
+        let brought = || {
+            let listed = self.insert.offers(&self.editor).is_some() || self.fence.offers(&self.editor).is_some();
+            listed || Refer::offers(&self.editor).is_some()
+        };
         let waits = self.margin.follows() && (sheet.is_some() || brought());
         if let Some(importing) = &self.importing {
             element = element.popover(importing.card(room));
@@ -3178,6 +3447,13 @@ impl EditorApp {
             // The card hangs under the icon and title, or from the caret when the callout shows neither.
             let spot = head.map(|head| self.onto(callouts::target(head))).or(caret).unwrap_or_default();
             element = element.popover(self.callouts.card(kind, spot).expect("the block is a callout"));
+        } else if let Some(block) = self.languages.listed() {
+            // The list hangs under the block's language, or from the caret when its corner is out of view.
+            let boxes = self.layout.code_boxes(viewport);
+            let code = boxes.into_iter().find(|(id, _)| id == block).map(|(_, code)| code);
+            let named = code.and_then(|code| Some(self.language_label(block, code)?.1));
+            let spot = named.map(|named| self.onto(named)).or(caret).unwrap_or_default();
+            element = element.popover(self.languages.card(spot));
         } else if let Some(context) = &self.context {
             let asked = |act: &Act| self.asked(act);
             let fix = self.spelling.fix.as_ref();
@@ -3206,9 +3482,10 @@ impl EditorApp {
             // The note hangs under the last line of its passage. One whose text is gone hangs from the
             // top of the margin its marker stood in.
             let under = self.note_lines(note).map(|(_, last)| self.onto(last));
+            let ways = (self.margin.follows(), self.put_back().is_some());
             let said = self.said.of(note, threads::SAID, self.palette);
             let (now, refused) = (self.margin.now.as_str(), self.margin.refused.as_deref());
-            let thread = threads::thread(note, reply, said, now, refused, self.margin.follows());
+            let thread = threads::thread(note, reply, said, now, refused, ways);
             element = element.popover(match under {
                 Some(under) => thread.at(under),
                 None => thread.at(Rect::new(room.width - GUTTER, GUTTER, 0.0, 0.0)).align(Align::End),
@@ -3223,6 +3500,11 @@ impl EditorApp {
             let slash = self.layout.caret(&Pos::new(line, 0)).unwrap_or_default();
             let spot = self.onto(slash);
             element = element.popover(self.insert.menu(&offers).at(spot));
+        } else if let Some((line, _, offers)) = self.fence.offers(&self.editor) {
+            // The list hangs from the fence that opened it.
+            let fence = self.layout.caret(&Pos::new(line, 0)).unwrap_or_default();
+            let spot = self.onto(fence);
+            element = element.popover(self.fence.list(&offers).at(spot));
         } else if let Some((typed, figures)) = Refer::offers(&self.editor) {
             // The list hangs from the start of the words typed for the reference.
             let start = self.layout.caret(&Pos::new(typed.block.clone(), typed.range.start)).unwrap_or_default();
@@ -3230,8 +3512,8 @@ impl EditorApp {
             element = element.popover(self.refer.list(&self.editor, &typed, &figures).at(spot));
         } else if let Some(((source, rect), selection)) = sheet.zip(selection) {
             let spot = self.onto(rect);
-            element =
-                element.popover(self.maths.sheet(source, selection, rect.width, self.wide(), self.scheme).at(spot));
+            let caret = (selection, self.editor.before_wrap());
+            element = element.popover(self.maths.sheet(source, caret, rect.width, self.wide(), self.scheme).at(spot));
         } else if let Some(tools) = self.selection_tools(viewport) {
             element = element.popover(tools);
         }
@@ -3240,7 +3522,7 @@ impl EditorApp {
         let pressable = self.references.pointed().is_some() || self.code_copy.pointed() || self.linked.on_cloud();
         let pressable = pressable || self.captions.over || self.margin.over.is_some() || self.review.pressable();
         let pressable = pressable || self.tables.pointed();
-        let pressable = pressable || self.callouts.over.is_some();
+        let pressable = pressable || self.callouts.over.is_some() || self.languages.over.is_some();
         match self.grip.corner() {
             Some(corner) => element.cursor(Cursor::Resize(figures::edge(corner))),
             None if pressable => element.cursor(Cursor::Pointer),
@@ -3800,13 +4082,14 @@ impl EditorApp {
         };
         let at = |offset: usize| Pos::new(block.clone(), offset.clamp(source.start, source.end));
         match message {
-            Sheet::Press { offset, extend, clicks } => {
+            Sheet::Press { offset, before_wrap, extend, clicks } => {
                 let head = at(offset);
                 let anchor = match self.editor.selection() {
                     Some(selection) if extend => selection.anchor.clone(),
                     _ => head.clone(),
                 };
-                self.editor.select(Selection { anchor, head });
+                // A second press picks a word of the row that was pressed, which the side tells the editor.
+                self.editor.select_at(Selection { anchor, head }, before_wrap);
                 match clicks {
                     1 => self.stay(offset == source.start, platform),
                     2 => self.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform)),
@@ -3816,11 +4099,13 @@ impl EditorApp {
                 self.maths.typed(false);
                 self.mark();
             }
-            Sheet::Drag(offset) => {
+            Sheet::Drag(offset, before_wrap) => {
                 // A pointer that has not left its character leaves the caret as the press put it.
-                let held = self.editor.selection().filter(|selection| selection.head != at(offset));
+                let side = self.editor.before_wrap();
+                let stays = |selection: &&Selection| selection.head == at(offset) && side == before_wrap;
+                let held = self.editor.selection().filter(|selection| !stays(selection));
                 if let Some(anchor) = held.filter(|_| self.maths.dragging).map(|selection| selection.anchor.clone()) {
-                    self.editor.select(Selection { anchor, head: at(offset) });
+                    self.editor.select_at(Selection { anchor, head: at(offset) }, before_wrap);
                     self.mark();
                 }
             }
@@ -3862,8 +4147,7 @@ impl EditorApp {
         let Some((line, typed, offers)) = self.insert.offers(&self.editor) else { return };
         let Some(put) = offers.get(index).map(|offer| offer.put.clone()) else { return };
         self.insert.close();
-        self.editor.select(Selection { anchor: Pos::new(line.clone(), 0), head: Pos::new(line, typed) });
-        self.edit(platform, |editor, platform| editor.run(Command::Delete(Motion::Left), platform));
+        self.clear_line(line, typed, platform);
         let command = match put {
             Put::Kind(kind) => Command::SetBlock(kind),
             // A header row over two more, three cells across: enough to start with.
@@ -3872,6 +4156,36 @@ impl EditorApp {
             Put::Pictures => return self.requests.push(Request::Pictures),
         };
         self.edit(platform, |editor, platform| editor.run(command, platform));
+    }
+
+    /// Clears a line of the `typed` bytes that asked for something else to stand there.
+    fn clear_line(&mut self, line: BlockId, typed: usize, platform: &mut dyn Platform) {
+        self.editor.select(Selection { anchor: Pos::new(line.clone(), 0), head: Pos::new(line, typed) });
+        self.edit(platform, |editor, platform| editor.run(Command::Delete(Motion::Left), platform));
+    }
+
+    /// Makes code in a language of the list under a fence, in place of the fence and what was typed after
+    /// it.
+    fn fence(&mut self, index: usize, platform: &mut dyn Platform) {
+        let Some((line, typed, offers)) = self.fence.offers(&self.editor) else { return };
+        let Some(language) = offers.get(index).map(|offer| offer.name().map(str::to_owned)) else { return };
+        self.fence.close();
+        self.clear_line(line, typed, platform);
+        let kind = BlockKind::Code { language };
+        self.edit(platform, |editor, platform| editor.run(Command::SetBlock(kind), platform));
+    }
+
+    /// Lets the list of languages have the keys that walk it and take from it, while it shows. Enter stays
+    /// the editor's, which makes code in the language as it was typed, known or not.
+    fn fence_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        let plain = event.mods == Modifiers::default();
+        let Some((_, _, offers)) = self.fence.offers(&self.editor).filter(|_| plain) else { return false };
+        match event.key {
+            Key::Down | Key::Up => self.fence.pick(event.key == Key::Down, offers.len()),
+            Key::Tab => self.fence(self.fence.picked(offers.len()), platform),
+            _ => return false,
+        }
+        true
     }
 
     /// Lets the insert menu have the keys that walk it and take from it, while it shows.
@@ -4046,6 +4360,7 @@ impl EditorApp {
                 self.edit(platform, |editor, platform| editor.input(event, platform));
                 self.maths.typed(true);
                 self.insert.typed(&self.editor);
+                self.fence.typed(&self.editor);
                 if let Some((start, head)) = before {
                     self.close(&head, start);
                 }
@@ -4107,11 +4422,15 @@ impl EditorApp {
             Message::Maths(message) => self.sheet(message, platform),
             Message::Insert(Inserting::Take(index)) => self.put(index, platform),
             Message::Insert(Inserting::Close) => self.insert.close(),
+            Message::Fence(Fencing::Take(index)) => self.fence(index, platform),
+            Message::Fence(Fencing::Close) => self.fence.close(),
+            Message::Language(asked) => self.languaging(asked, platform),
             Message::Refer(Picking::Take(figure)) => self.refer(figure, platform),
             Message::Linked(asked) => self.linking(asked),
             Message::TableMenu => self.tables.open = None,
             Message::Callout(asked) => self.calling(asked, platform),
             Message::Safe(asked) => self.safely(asked),
+            Message::Merge(asked) => self.merging(asked),
             Message::Alt(asked) => self.altering(asked, platform),
             Message::Note(asked) => self.noting(asked, platform),
             Message::Commands(asked) => self.commanding(asked, platform),
@@ -4183,7 +4502,8 @@ impl EditorApp {
             self.drop = None;
             return true;
         }
-        if self.insert_key(event, platform) || self.refer_key(event, platform) || self.list_key(event, platform) {
+        let listed = self.insert_key(event, platform) || self.fence_key(event, platform);
+        if listed || self.refer_key(event, platform) || self.list_key(event, platform) {
             return true;
         }
         let (mut used, mut edited) = (false, false);
@@ -4237,8 +4557,9 @@ impl App for EditorApp {
         // Print view has the window to itself: the panels and the outline are for editing. The history
         // has its versions listed where a panel would be.
         let (printing, away) = (self.printing.is_some(), self.away());
-        let panel = match &self.history {
-            Some(history) => Some(history.panel()),
+        let (palette, scheme) = (self.palette, self.scheme);
+        let panel = match &mut self.history {
+            Some(history) => Some(history.panel(palette, scheme)),
             None => self.panel.filter(|_| !away).map(|panel| self.side(panel)),
         };
         let room = window.width - if panel.is_some() { side_panel::WIDTH } else { 0.0 };
@@ -4247,8 +4568,10 @@ impl App for EditorApp {
         let open = self.margin.reviewing().and_then(|open| waiting.iter().position(|id| *id == open.id));
         let conflicts = (!waiting.is_empty() && !away).then(|| review::bar(waiting.len(), open));
         let told = if conflicts.is_some() { banner::HEIGHT } else { 0.0 };
-        // The safe mode bar lies under the top bar and takes its height from the page.
+        // The bars of safe mode and of conflict copies lie under the top bar and take their height from
+        // the page.
         let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height() + told;
+        let bar = bar + self.merges.height();
         // The history has a strip of its versions under the page and the panel.
         let strip = self.history.as_ref().map(History::strip);
         let foot = if strip.is_some() { history::STRIP } else { 0.0 };
@@ -4268,6 +4591,7 @@ impl App for EditorApp {
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
         let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
+        let over = over.chain(self.merges.card());
         let commands = self.commands.open().then(|| {
             let (offers, keymap) = (self.offers(), self.editor.keymap());
             self.commands.view(&offers, keymap, self.mac, bar, window)
@@ -4275,7 +4599,7 @@ impl App for EditorApp {
         let over = over.chain(commands);
         // It comes first, so that whatever else opens lies over it and is the first that Escape puts away.
         let all = Element::column().bg(tokens::BG).fg(tokens::FG).children(find);
-        let all = all.child(self.bar()).children(self.safe.bar());
+        let all = all.child(self.bar()).children(self.safe.bar()).children(self.merges.bar());
         let all = all.children(conflicts).child(body).children(strip).children(over);
         if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
     }
@@ -4357,6 +4681,7 @@ impl App for EditorApp {
                 self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(text), platform));
             }
             Some(describe::Request::Copy(block)) => self.copy_code(block, platform),
+            Some(describe::Request::Language(block)) => self.language(&block, platform),
             Some(describe::Request::Note(block)) => self.noting(Noting::Press(block), platform),
             Some(describe::Request::Table { cell, row, does }) => {
                 // The caret goes to the cell, and its table then shows the handles of its column and row.

@@ -12,6 +12,7 @@ use std::fmt;
 
 use serde_json::{Map, Value};
 
+use crate::doc::ASSETS;
 use crate::style::{ALIGNS, write_number};
 use crate::{
     Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Properties, PropertiesFormat,
@@ -312,6 +313,27 @@ fn block_from(mut map: Map<String, Value>, read: Option<Body>, path: &str) -> Re
         }
         "table_row" => BlockKind::TableRow,
         "table_cell" => BlockKind::TableCell,
+        "table_of_contents" => match map.remove("levels").as_ref().and_then(Value::as_u64) {
+            Some(levels @ 1..=4) => BlockKind::TableOfContents { levels: levels as u8 },
+            _ => return err(&format!("{path}.levels"), "expected a number of levels from 1 to 4"),
+        },
+        "link_preview" => {
+            // A field that is empty says what one left out does.
+            let mut given = |name: &str| Ok(string(&mut map, name, path)?.filter(|text| !text.is_empty()));
+            let Some(url) = given("url")? else {
+                return err(&format!("{path}.url"), "a link preview needs an address");
+            };
+            let (title, description, image) = (given("title")?, given("description")?, given("image")?);
+            for (name, text) in [("url", Some(&url)), ("title", title.as_ref()), ("image", image.as_ref())] {
+                if text.is_some_and(|text| text.contains(['\n', '\r'])) {
+                    return err(&format!("{path}.{name}"), "expected one line");
+                }
+            }
+            if image.as_deref().is_some_and(|image| !image.starts_with(ASSETS)) {
+                return err(&format!("{path}.image"), "expected the name of an asset, such as assets/<sha256>.jpg");
+            }
+            BlockKind::LinkPreview { url, title, description, image }
+        }
         _ => BlockKind::Unknown { type_name },
     };
 
@@ -456,6 +478,19 @@ fn write_block(block: &Block) -> Value {
         }
         BlockKind::TableRow => "table_row",
         BlockKind::TableCell => "table_cell",
+        BlockKind::TableOfContents { levels } => {
+            map.insert("levels".into(), (*levels).into());
+            "table_of_contents"
+        }
+        BlockKind::LinkPreview { url, title, description, image } => {
+            map.insert("url".into(), url.as_str().into());
+            for (name, value) in [("title", title), ("description", description), ("image", image)] {
+                if let Some(value) = value {
+                    map.insert(name.into(), value.as_str().into());
+                }
+            }
+            "link_preview"
+        }
         BlockKind::Unknown { type_name } => type_name,
     };
     // `type` reads best straight after `id`, ahead of the fields that depend on it.

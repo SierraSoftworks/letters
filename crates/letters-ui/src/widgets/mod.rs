@@ -4,7 +4,7 @@
 pub(crate) mod banner;
 mod button;
 mod menu;
-mod options;
+pub(crate) mod options;
 mod popover;
 mod segmented;
 pub(crate) mod side_panel;

@@ -60,6 +60,7 @@ fn export_and_import_are_subcommands() {
         ("export a.let --to html -o out/a.html --force", export("a.let", Format::Html, to_file("out/a.html"), true)),
         ("export a.let --to md --output=-", export("a.let", Format::Markdown, Some(Output::Stdout), false)),
         ("export a.let --to pdf", export("a.let", Format::Pdf, None, false)),
+        ("export a.let --to clean", export("a.let", Format::Clean, None, false)),
         ("export --to md -o - -- --odd.let", export("--odd.let", Format::Markdown, Some(Output::Stdout), false)),
         ("import notes", import(&["notes"], false, false)),
         ("import notes a.md --recursive --json", import(&["notes", "a.md"], true, true)),

@@ -54,6 +54,8 @@ pub enum Noting {
     Answer,
     /// Resolves the note that is open.
     Resolve,
+    /// Puts the block of the conflict that is open back on the page, as the version that still has it.
+    PutBack,
     /// Puts the note that is open away.
     Close,
     /// The kind of note the panel lists: all of them when `None`.

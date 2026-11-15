@@ -150,6 +150,18 @@ fn the_strip_marks_text_and_stays_and_its_other_buttons_put_the_menu_away() {
 }
 
 #[test]
+fn what_is_selected_has_its_history_in_the_menu() {
+    let mut window = note();
+    let at = on(&mut window, "brown");
+    // A caret has no passage to show the history of.
+    window.secondary_click_at(at);
+    assert!(!listed(&mut window, "History of selection"));
+    window.key("Escape").select("brown").secondary_click_at(at);
+    choose(&mut window, "History of selection");
+    assert!(window.find(Role::Complementary, "History of selection").is_some());
+}
+
+#[test]
 fn the_strip_offers_only_what_has_something_to_act_on() {
     // Where the menu is asked for, a button of the strip, and whether it can be pressed there.
     let cases = [

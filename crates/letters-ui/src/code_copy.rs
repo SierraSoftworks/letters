@@ -52,6 +52,11 @@ impl CodeCopy {
         news
     }
 
+    /// Whether the pointer rests on a block's box.
+    pub fn over(&self, block: &BlockId) -> bool {
+        self.pointed.as_ref().is_some_and(|(pointed, _)| pointed == block)
+    }
+
     /// Whether the pointer rests on a button.
     pub fn pointed(&self) -> bool {
         matches!(self.pointed, Some((_, true)))

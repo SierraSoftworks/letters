@@ -14,16 +14,19 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with};
-use letters_format::{Archive, OPLOG};
-use letters_layout::Fonts;
-use letters_model::{Block, BlockKind, Body, Document, Mark, Model, ReplicaId, Run, Style};
+use letters_convert::{
+    Linked, Loss, PdfInfo, PdfSources, Target, losses_with, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with,
+};
+use letters_format::{ASSETS, Archive, HISTORY, NOTES, OPLOG, Package};
+use letters_layout::{Fonts, Uncovered};
+use letters_model::{Block, BlockKind, Body, Model, ReplicaId, Style};
 use serde_json::json;
 
 use crate::cli::{Export, Format, Import, Output};
 use crate::fallback;
 use crate::files;
 use crate::import::{Choices, Plan, normal};
+use crate::platform;
 use crate::trust::{self, Trusted};
 
 /// The extensions of the Markdown files an import looks for in a folder.
@@ -54,6 +57,8 @@ fn try_export(export: &Export) -> Result<(), String> {
     let output = match &export.output {
         Some(Output::Stdout) => return io::stdout().write_all(&exported.bytes).map_err(|error| error.to_string()),
         Some(Output::File(path)) => path.clone(),
+        // A clean copy is a document too, so it cannot take the name of the one it is made from.
+        None if export.to == Format::Clean => export.file.with_file_name(format!("{title} clean.{}", files::EXTENSION)),
         None => export.file.with_extension(export.to.extension()),
     };
     exported.write(&output, export.force).map_err(|(path, error)| match error.kind() {
@@ -75,25 +80,50 @@ pub struct Exported {
     pub pictures: Vec<(String, Vec<u8>)>,
     /// What the format could not carry over, a line for each kind of loss.
     pub simplified: Vec<String>,
+    /// The id of the document this is, where it is one: a clean copy has an id of its own.
+    pub id: Option<String>,
 }
 
 /// Writes the document in `file`, the bytes of a `.let` file, in another format. `title` is what the
 /// document is called where the format has a place for a name.
 pub fn exported(file: Vec<u8>, title: &str, to: Format) -> Result<Exported, String> {
+    exported_with(file, title, to, &mut |_| None)
+}
+
+/// As [`exported`], for a window that has loaded pictures its document only links to. `linked` hands over
+/// the file an address led to, as it was fetched, and a PDF then shows that picture as the window does.
+/// An export fetches nothing itself, so any other linked picture is an empty frame there.
+pub fn exported_with(file: Vec<u8>, title: &str, to: Format, linked: Linked) -> Result<Exported, String> {
     let failed = |error: letters_format::Error| error.to_string();
     let mut archive = Archive::open(Cursor::new(file)).map_err(failed)?;
     let document = archive.document().map_err(failed)?;
     // A style this build cannot read gives way to the built-in one, as it does on screen.
     let style = archive.style().unwrap_or_default();
+    // Notes that cannot be read are left behind: the text matters more than its comments.
+    let notes = archive.notes().unwrap_or_default();
+    let target = match to {
+        Format::Markdown => Target::Markdown,
+        Format::Html => Target::Html,
+        Format::Docx => Target::Docx,
+        Format::Pdf => Target::Pdf,
+        Format::Clean => Target::Clean,
+    };
+    // The addresses of the linked pictures a PDF was handed.
+    let mut shown = BTreeSet::new();
+    let mut id = None;
     let bytes = match to {
+        Format::Clean => {
+            let mut package = archive.package().map_err(failed)?;
+            clean(&mut package);
+            id = Some(package.id.clone());
+            let mut bytes = Cursor::new(Vec::new());
+            letters_format::write(&mut bytes, &package).map_err(failed)?;
+            bytes.into_inner()
+        }
         Format::Markdown => to_markdown(&document).into_bytes(),
         // An image that cannot be read is treated as missing, and its description stands in for it.
         Format::Html => to_html(&document, &style, title, &mut |name| archive.read(name).ok().flatten()).into_bytes(),
-        Format::Docx => {
-            // Notes that cannot be read are left behind: the text matters more than its comments.
-            let notes = archive.notes().unwrap_or_default();
-            to_docx(&document, &style, &notes, title, &mut |name| archive.read(name).ok().flatten())
-        }
+        Format::Docx => to_docx(&document, &style, &notes, title, &mut |name| archive.read(name).ok().flatten()),
         Format::Pdf => {
             let fonts = Fonts { faces: letters_fonts::bundled() };
             let created = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|since| since.as_secs());
@@ -106,8 +136,16 @@ pub fn exported(file: Vec<u8>, title: &str, to: Format) -> Result<Exported, Stri
             // What the bundled fonts cannot draw is set in the system's faces, as the window sets it. The
             // system's fonts are read only when a page has such a character.
             let mut assets = |name: &str| archive.read(name).ok().flatten();
-            to_pdf_with(&document, &style, fonts, &mut assets, &info, &mut |lacking| fallback::system_fonts(lacking))
-                .map_err(|error| error.to_string())?
+            let mut backups = |lacking: &[Uncovered]| fallback::system_fonts(lacking);
+            let mut linked = |address: &str| {
+                let picture = linked(address);
+                if picture.is_some() {
+                    shown.insert(address.to_owned());
+                }
+                picture
+            };
+            let sources = PdfSources { backups: Some(&mut backups), words: None, linked: Some(&mut linked) };
+            to_pdf_with(&document, &style, fonts, &mut assets, &info, sources).map_err(|error| error.to_string())?
         }
     };
     // The Markdown names each picture by its entry in the file, as a path from its own folder. A name
@@ -116,7 +154,35 @@ pub fn exported(file: Vec<u8>, title: &str, to: Format) -> Result<Exported, Stri
     let entries = markdown_assets(&document).into_iter().filter(|_| to == Format::Markdown).filter(inside);
     let pictures = entries.filter_map(|entry| Some((archive.read(&entry).ok().flatten()?, entry)));
     let pictures = pictures.map(|(bytes, entry)| (entry, bytes)).collect();
-    Ok(Exported { bytes, pictures, simplified: simplified(&document, to) })
+    let lost = losses_with(&document, &notes, target, &|address| shown.contains(address));
+    Ok(Exported { bytes, pictures, simplified: lost.iter().map(Loss::to_string).collect(), id })
+}
+
+/// Makes a package a document of its own that holds nothing of how it came to be.
+///
+/// - It has an id and a date of its own: with the original's, the two would pass for one document that
+///   was written in two places, and a merge would bring the history back.
+/// - The history goes, and with it every earlier version and who wrote what.
+/// - The notes go: comments, import notes and conflicts. The document stands as the page shows it.
+/// - A picture stays only where a figure shows it. The file may hold others that the history still named.
+/// - The style and the writer's own words for the spelling check stay, since they are the document's.
+fn clean(package: &mut Package) {
+    (package.id, package.created) = (platform::document_id(), platform::now_rfc3339());
+    let shown: BTreeSet<&str> = package
+        .document
+        .walk()
+        .filter_map(|block| match &block.kind {
+            BlockKind::Figure { asset, .. } => asset.as_deref(),
+            _ => None,
+        })
+        .collect();
+    let kept = |name: &str| match name {
+        NOTES => false,
+        name if name.starts_with(HISTORY) => false,
+        name if name.starts_with(ASSETS) => shown.contains(name),
+        _ => true,
+    };
+    package.entries.retain(|name, _| kept(name));
 }
 
 impl Exported {
@@ -137,40 +203,6 @@ impl Exported {
         }
         Ok(())
     }
-}
-
-/// What the format cannot carry over, a line for each kind of loss.
-fn simplified(document: &Document, to: Format) -> Vec<String> {
-    let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    let unknown = document.walk().filter(|block| matches!(block.kind, BlockKind::Unknown { .. })).count();
-    let other = |run: &&Run| run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)));
-    let marks = document.walk().flat_map(|block| block.body.runs()).filter(other).count();
-    let mut lines = Vec::new();
-    if unknown > 0 {
-        let blocks = count(unknown, "block is", "blocks are");
-        // A page shows what the screen shows, which for these is a placeholder that names the kind.
-        let shown = if to == Format::Pdf { "shown as a placeholder" } else { "written as fallback text" };
-        lines.push(format!("{blocks} of a kind this version does not know, and {shown}"));
-    }
-    if marks > 0 {
-        lines.push(format!(
-            "formatting this version does not know is left out of {}",
-            count(marks, "passage", "passages")
-        ));
-    }
-    if to == Format::Docx {
-        // Word has no block that holds others, so only what is one paragraph there can take a quote's style.
-        let boxes = document.walk().filter(|block| matches!(block.kind, BlockKind::Quote | BlockKind::Callout { .. }));
-        let kept =
-            |kind: &BlockKind| matches!(kind, BlockKind::Paragraph | BlockKind::ListItem { .. } | BlockKind::Formula);
-        let plain = |block: &&Block| !kept(&block.kind);
-        let outside = boxes.flat_map(|outer| outer.body.blocks()).filter(plain).count();
-        if outside > 0 {
-            let blocks = count(outside, "block inside a quote or callout is", "blocks inside quotes or callouts are");
-            lines.push(format!("{blocks} written outside it, since Word cannot nest them"));
-        }
-    }
-    lines
 }
 
 /// Writes a file. Unless `replace` is set, one that is already there is left alone and reported.

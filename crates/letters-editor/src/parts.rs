@@ -5,7 +5,7 @@
 //! A figure, a cell and a gallery's caption are parts: nothing splits them or joins them to other text, and
 //! what moves, wraps and is left behind is the unit they belong to.
 
-use letters_model::{Block, BlockId, BlockKind, Op, Pos, Selection};
+use letters_model::{Block, BlockId, BlockKind, Op, Pos, Selection, Stood};
 
 use crate::{Caret, Editor, Platform, text, tree};
 
@@ -152,6 +152,30 @@ impl Editor {
         if self.apply(ops) {
             // The caret may have stood in text that reads otherwise now, or is gone.
             self.restore(self.caret.clone());
+        }
+    }
+
+    /// Where a block that the document no longer holds can be put back: the block that held it, if one
+    /// did, and its number among that one's blocks. `None` while the document holds a block by its id or
+    /// by an id inside it, or no longer holds the block it stood in as one that takes its kind.
+    pub(crate) fn takes_back(&self, block: &Block, stood: &Stood) -> Option<(Option<BlockId>, usize)> {
+        fn free(editor: &Editor, block: &Block) -> bool {
+            editor.block(&block.id).is_none() && block.body.blocks().iter().all(|part| free(editor, part))
+        }
+        let beside = match &stood.parent {
+            Some(parent) => self.block(parent).filter(|parent| parent.kind.admits(&block.kind))?.body.blocks(),
+            None => &self.doc().blocks,
+        };
+        // The block it stood behind may be gone since, or elsewhere: then it goes first, as one that stood
+        // first does.
+        let after = stood.after.as_ref().and_then(|after| beside.iter().position(|block| block.id == *after));
+        free(self, block).then(|| (stood.parent.clone(), after.map_or(0, |after| after + 1)))
+    }
+
+    /// Puts a block back where it stood. The caret stays where it is.
+    pub(crate) fn put_back(&mut self, block: Block, stood: &Stood) {
+        if let Some((parent, index)) = self.takes_back(&block, stood) {
+            _ = self.apply(vec![Op::InsertBlock { parent, index, block }]);
         }
     }
 

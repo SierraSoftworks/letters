@@ -9,6 +9,9 @@ use crate::Align;
 /// The `document.json` format version this build reads and writes.
 pub const FORMAT: u32 = 1;
 
+/// The folder of a file that holds what its document shows by name, such as pictures.
+pub(crate) const ASSETS: &str = "assets/";
+
 /// Fields this build does not know, kept so that a newer client's content survives a save.
 pub type Extra = BTreeMap<String, Value>;
 
@@ -86,6 +89,29 @@ impl Document {
             blocks.iter().find_map(|b| if &b.id == id { Some(b) } else { find(b.body.blocks(), id) })
         }
         find(&self.blocks, id)
+    }
+
+    /// The headings a table of contents lists, in order: those with text, no deeper than its `levels`,
+    /// that come after it. A table that no heading with text follows lists every such heading but the
+    /// title, which is the first Heading 1. Empty for a block that is no table of contents.
+    ///
+    /// Whatever shows or exports a table asks here, so that all of them list the same lines.
+    pub fn contents(&self, table: &BlockId) -> Vec<&Block> {
+        let level = |block: &Block| match block.kind {
+            BlockKind::Heading { level } if !block.plain_text().trim().is_empty() => Some(level),
+            _ => None,
+        };
+        let blocks: Vec<&Block> = self.walk().collect();
+        let Some(at) = blocks.iter().position(|block| block.id == *table) else { return Vec::new() };
+        let BlockKind::TableOfContents { levels } = blocks[at].kind else { return Vec::new() };
+        let after = &blocks[at + 1..];
+        let (from, title) = match after.iter().any(|block| level(block).is_some()) {
+            true => (after, None),
+            false => (&blocks[..], blocks.iter().find(|block| level(block) == Some(1))),
+        };
+        let listed = |block: &&Block| level(block).is_some_and(|level| level <= levels);
+        let title = title.map(|title| &title.id);
+        from.iter().copied().filter(listed).filter(|block| Some(&block.id) != title).collect()
     }
 
     /// Every block in document order, parents before their children.
@@ -202,6 +228,24 @@ pub enum BlockKind {
     TableRow,
     /// One cell of a row, holding text.
     TableCell,
+    /// A list of the document's headings, made where it is shown and never stored. See
+    /// [`Document::contents`].
+    TableOfContents {
+        /// The deepest heading level it lists, from 1 to 4.
+        levels: u8,
+    },
+    /// A link shown as a card. What it shows of the page was fetched once, when a writer asked for it,
+    /// so that it reads without the network. One with a `url` alone has not been fetched.
+    LinkPreview {
+        /// The address the card leads to, on one line.
+        url: String,
+        /// The page's title, on one line.
+        title: Option<String>,
+        description: Option<String>,
+        /// The page's picture, by its name among the file's assets, such as `assets/<sha256>.jpg`.
+        /// It is never an address, so showing a preview loads nothing.
+        image: Option<String>,
+    },
     /// A type this build does not know. Its fields sit in [`Block::extra`] and are written back verbatim.
     Unknown {
         type_name: String,
@@ -221,7 +265,9 @@ impl BlockKind {
             Self::Caption | Self::Figure { .. } | Self::TableCell => BodyShape::Text,
             Self::Quote | Self::Callout { .. } => BodyShape::Blocks,
             Self::Gallery { .. } | Self::Table { .. } | Self::TableRow => BodyShape::Blocks,
-            Self::Divider | Self::Unknown { .. } => BodyShape::None,
+            Self::Divider | Self::TableOfContents { .. } | Self::LinkPreview { .. } => BodyShape::None,
+            // Whatever a type this build does not know holds stays among its other fields.
+            Self::Unknown { .. } => BodyShape::None,
         }
     }
 
@@ -249,6 +295,14 @@ impl BlockKind {
             Self::Callout { title, icon, color, .. } => {
                 let line = |text: &Option<String>| text.as_deref().is_none_or(|text| !text.contains(['\n', '\r']));
                 line(title) && line(icon) && color.as_deref().is_none_or(crate::style::is_color)
+            }
+            Self::TableOfContents { levels } => (1..=4).contains(levels),
+            Self::LinkPreview { url, title, description, image } => {
+                let line = |text: &str| !text.is_empty() && !text.contains(['\n', '\r']);
+                // What a preview lacks is left out, so that it has one spelling.
+                let given = [title, description, image].into_iter().flatten().all(|text| !text.is_empty());
+                let stored = image.as_deref().is_none_or(|image| image.starts_with(ASSETS) && line(image));
+                line(url) && title.as_deref().is_none_or(line) && given && stored
             }
             _ => true,
         }

@@ -1,7 +1,8 @@
 //! The history: the document's versions listed by day beside the one that is picked, which is read where
 //! the page was, shows how it differs from the version before it or from the document, and can be restored
 //! or given a name, and a copy of it saved as a document of its own. A strip under the page has a cell for
-//! each version. A passage of a version is selected with the pointer and copied out of it.
+//! each version. A passage of a version is selected with the pointer and copied out of it. Asked for with
+//! text selected on the page, the history narrows to the versions that changed what is selected.
 
 use letters_editor::Editor;
 use letters_model::{Block, Change, ReplicaId, TagKind};
@@ -64,6 +65,28 @@ fn history() -> Harness {
     let mut window = letter();
     window.click(Role::Button, "History");
     window
+}
+
+/// The letter with the history of what is selected on its page showing: a word of one of its paragraphs.
+fn passage(word: &str) -> Harness {
+    let mut window = letter();
+    window.select(word).key("Mod+Shift+P").type_text("History of selection").key("Enter");
+    window
+}
+
+/// Whether the history shows narrowed to what was selected.
+fn narrowed(window: &mut Harness) -> bool {
+    window.find(Role::Complementary, "History of selection").is_some()
+}
+
+/// What lies over the page area from edge to edge and lets what is under it show through.
+fn veils(window: &mut Harness) -> Vec<Rect> {
+    let area = area(window);
+    let fills = window.paint().items.into_iter().filter_map(|item| match item {
+        Item::Fill { rect, color, .. } if color.a > 64 && color.a < 255 && rect.width >= area.width => Some(rect),
+        _ => None,
+    });
+    fills.collect()
 }
 
 /// A survey long enough to scroll, written on twice. The second time a line was added at its end.
@@ -1185,4 +1208,177 @@ fn a_drag_past_the_edge_of_the_page_area_scrolls_the_version_after_it() {
     }
     window.release_at(under);
     assert!(lines(&mut window, area)[0] < top - 100.0, "the survey moved up under the drag");
+}
+
+#[test]
+fn the_history_of_a_selection_lists_the_versions_that_changed_its_paragraph_with_what_each_did() {
+    // What is selected, then the versions that changed its paragraph, newest first: where each stands among
+    // all the versions, and what it is said to have done.
+    let cases: [(&str, [(usize, &str); 3]); 2] = [
+        ("floor", [(4, "Added 2 words"), (2, "Added 1 word"), (0, "Wrote the passage")]),
+        ("roof", [(3, "Added 1 word"), (1, "Rewrote the passage"), (0, "Wrote the passage")]),
+    ];
+    for (selected, expected) in cases {
+        let mut window = passage(selected);
+        assert!(narrowed(&mut window), "{selected}");
+        let listed = versions(&mut window);
+        assert_eq!(listed.len(), expected.len(), "{selected}: {listed:?}");
+        for (version, (at, did)) in listed.iter().zip(expected) {
+            assert!(version.name.ends_with(VERSIONS[at].0), "{selected}: {}", version.name);
+            assert!(version.description.as_deref().is_some_and(|said| said.ends_with(did)), "{selected}: {version:?}");
+        }
+        assert_eq!(listed[0].selected, Some(true), "{selected}: the newest of them shows");
+        assert!(window.find(Role::Label, "3 of 5 versions").is_some(), "{selected}");
+        assert_eq!(standing_out(&mut window), 3, "{selected}: the strip shows which they are");
+    }
+}
+
+#[test]
+fn the_history_of_a_selection_steps_through_the_versions_that_changed_it() {
+    // The keys pressed from the newest of them, and the version that shows after them.
+    let cases: [(&[&str], usize); 4] =
+        [(&["Left"], 2), (&["Left", "Left"], 0), (&["Left"; 5], 0), (&["Left", "Left", "Right"], 2)];
+    for (keys, at) in cases {
+        let mut window = passage("floor");
+        for key in keys {
+            window.key(key);
+        }
+        assert!(picked(&mut window).is_some_and(|name| name.ends_with(VERSIONS[at].0)), "{keys:?}");
+        assert_eq!(shown(&mut window), VERSIONS[at].1, "{keys:?}: the page reads as that version left it");
+    }
+    // A press on the strip picks the one that left the passage as it read then: the document as it reads
+    // now did not change this one.
+    let mut window = passage("roof");
+    window.key("Left");
+    let now = cell(&mut window, 4.5);
+    window.click_at(now);
+    assert!(picked(&mut window).is_some_and(|name| name.ends_with(VERSIONS[3].0)));
+}
+
+#[test]
+fn all_but_the_passage_lies_under_a_veil() {
+    let mut window = passage("floor");
+    let blocks = window.controls().into_iter().filter(|found| matches!(found.role, Role::Paragraph | Role::Heading));
+    let of: Vec<bool> = blocks.filter(|found| found.name.is_empty()).map(|found| found.description.is_some()).collect();
+    assert_eq!(of, [false, false, true], "the paragraph that was selected is told as the selection");
+
+    // The page's lines: its heading, its first paragraph, then the line that says what the passage is,
+    // and the passage.
+    let area = area(&mut window);
+    let (lines, veils) = (lines(&mut window, area), veils(&mut window));
+    let veiled: Vec<bool> =
+        lines.iter().map(|line| veils.iter().any(|veil| veil.y <= *line && *line < veil.y + veil.height)).collect();
+    assert_eq!(veiled, [true, true, false, false], "{lines:?} under {veils:?}");
+    // Every version shows whole again, the first too, which shows as it read either way.
+    window.key("Left").key("Left").click(Role::Button, "All versions");
+    assert_eq!(self::veils(&mut window), [], "nothing is veiled once every version shows");
+}
+
+#[test]
+fn a_version_that_rewrote_the_passage_shows_it_as_it_read_over_how_it_read_after() {
+    let mut window = passage("roof");
+    let quoted = |window: &mut Harness, side: &str| {
+        let is = |found: &Found| found.role == Role::Paragraph && found.name.starts_with(side);
+        window.controls().into_iter().find(is).unwrap_or_else(|| panic!("the passage as it read {side}"))
+    };
+    let (before, after) = (quoted(&mut window, "Before: "), quoted(&mut window, "After: "));
+    assert!(before.name.ends_with(VERSIONS[0].1[0]) && after.name.ends_with(VERSIONS[1].1[0]));
+    assert!(before.bounds.y + before.bounds.height <= after.bounds.y, "the earlier one is on top");
+    // Each is in a band of the colour the page marks what was taken out and what was put in with.
+    let [red, green] = tinted(&mut window);
+    let within = |bands: &[Rect], quote: &Found| {
+        bands.iter().any(|band| band.width >= quote.bounds.width && band.contains(quote.center()))
+    };
+    assert!(within(&red, &before) && !within(&green, &before), "what it read before is in red");
+    assert!(within(&green, &after) && !within(&red, &after), "what it read after is in green");
+
+    // The page has the passage as that version left it, and only that: the panel has the rest.
+    window.key("Left");
+    assert_eq!(shown(&mut window), VERSIONS[1].1);
+    assert_eq!(bands(&mut window), [vec![], vec![]], "no band of the version before stands in the page");
+}
+
+#[test]
+fn a_passage_far_down_the_page_is_brought_into_view() {
+    let mut window = survey();
+    window.click(Role::Button, "Back to editing");
+    window.select("The last line").key("Mod+Shift+P").type_text("History of selection").key("Enter");
+    assert!(narrowed(&mut window));
+    // The veil over what comes before the passage ends where the passage begins: in the page area, with
+    // some of the page over it and under it.
+    let area = area(&mut window);
+    let begins = |window: &mut Harness| {
+        let veils = veils(window);
+        let over = veils.iter().find(|veil| veil.y <= area.y + 1.0).expect("a veil from the top of the page area");
+        over.y + over.height - area.y
+    };
+    let passage = begins(&mut window);
+    assert!(passage > ROOM && passage < area.height - ROOM, "{passage} down a page area of {}", area.height);
+
+    // It is brought there once: the page then goes where it is scrolled to.
+    let middle = Point { x: area.x + area.width / 2.0, y: area.y + area.height / 2.0 };
+    window.scroll_at(middle, -ROOM);
+    let moved = begins(&mut window);
+    assert!(moved > passage + ROOM / 2.0, "the passage went from {passage} to {moved} down the page area");
+}
+
+#[test]
+fn restoring_a_passage_leaves_the_rest_of_the_document_as_it_reads() {
+    let mut window = passage("floor");
+    let before = window.markdown();
+    // The passage as it reads now is not restored: its button takes no press.
+    window.click(Role::Button, "Restore this passage");
+    assert!(narrowed(&mut window));
+    assert_eq!(window.markdown(), before);
+
+    window.key("Left").click(Role::Button, "Restore this passage");
+    assert!(!narrowed(&mut window) && !showing(&mut window), "the page is back, to be written on");
+    // The other paragraph keeps what was written on it since.
+    assert_eq!(written(&window), [VERSIONS[4].1[0], VERSIONS[2].1[1]]);
+    window.key("Mod+z");
+    assert_eq!(window.markdown(), before, "one step back is the document as it was");
+}
+
+#[test]
+fn every_version_shows_again_with_the_same_one_picked() {
+    let mut window = passage("floor");
+    window.key("Left").click(Role::Button, "All versions");
+    assert!(showing(&mut window) && !narrowed(&mut window));
+    assert_eq!(versions(&mut window).len(), VERSIONS.len());
+    assert_eq!(picked(&mut window).as_deref(), Some(VERSIONS[2].0));
+    assert_eq!(marked(&mut window), [0, 1], "and shows what it changed, as every version does");
+}
+
+#[test]
+fn the_passage_is_every_paragraph_the_selection_reaches_into() {
+    // How far the selection is taken on from the end of the first paragraph, and how many versions
+    // changed what it then touches: the very start of the next paragraph is not a part of that one.
+    let cases: [(&[&str], usize); 3] = [(&[], 3), (&["Shift+Right"], 3), (&["Shift+Right", "Shift+Right"], 5)];
+    for (keys, changed) in cases {
+        let mut window = letter();
+        window.select("rising.");
+        for key in keys {
+            window.key(key);
+        }
+        window.key("Mod+Shift+P").type_text("History of selection").key("Enter");
+        assert_eq!(versions(&mut window).len(), changed, "{keys:?}");
+    }
+    // With nothing selected there is no passage to ask about.
+    let mut window = letter();
+    window.select("rising.").key("Right").key("Mod+Shift+P").type_text("History of selection").key("Enter");
+    assert!(!narrowed(&mut window) && !showing(&mut window));
+}
+
+#[test]
+fn edits_that_come_in_under_the_history_of_a_selection_are_listed_when_they_change_it() {
+    // What another writer writes over, with what, and whether that is in the passage.
+    for (old, new, of) in [("May", "June", true), ("north roof", "slate roof", false)] {
+        let mut window = passage("floor");
+        window.key("Left");
+        merge(&mut window, "Alice Moreau", SUNDAY + 9 * HOUR + 40 * MINUTE, old, new);
+        assert!(narrowed(&mut window), "{old}");
+        assert_eq!(versions(&mut window).len(), 3 + usize::from(of), "{old}");
+        assert!(picked(&mut window).is_some_and(|name| name.ends_with(VERSIONS[2].0)), "{old}");
+        assert_eq!(shown(&mut window), VERSIONS[2].1, "{old}: the version that was being read still shows");
+    }
 }

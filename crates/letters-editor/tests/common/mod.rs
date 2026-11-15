@@ -11,13 +11,16 @@
 //! and a `*` after the kind says its picture is selected.
 //! `g> ` puts a figure or a caption in a gallery, and `g#> ` in a numbered one. A cell is `td`, or `th` in a
 //! row that heads its table, after the row it is in: `r1> `, `r2> ` and so on. Consecutive rows are one table.
+//!
+//! `toc:3` is a table of contents that lists headings down to that level. `card` is a link preview: its
+//! address, then ` ~ ` before each of its title, its description and its picture, with `-` for one it lacks.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use letters_editor::{
     Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, LinePos, Lines, Marker, Modifiers, Picture, Platform,
-    Spot, TableEdit,
+    PreviewEdit, Spot, TableEdit,
 };
 use letters_model::{
     Align, Block, BlockId, BlockKind, Body, Change, Document, ListKind, Mark, Model, Pos, ReplicaId, Run, Selection,
@@ -327,6 +330,14 @@ fn linked(id: &str, numbered: bool) -> BlockKind {
     BlockKind::Figure { asset: None, src, alt: String::new(), width: 240.0, height: 160.0, numbered }
 }
 
+/// A link preview as the notation writes it.
+fn preview(text: &str) -> BlockKind {
+    let mut fields = text.split(" ~ ").map(|field| (field != "-").then(|| field.to_owned()));
+    let mut next = || fields.next().flatten();
+    let url = next().expect("a card has an address");
+    BlockKind::LinkPreview { url, title: next(), description: next(), image: next() }
+}
+
 fn holding(id: String, kind: BlockKind, parts: Vec<Block>) -> Block {
     Block { body: Body::Blocks(parts), ..Block::new(id.as_str(), kind) }
 }
@@ -382,11 +393,13 @@ pub fn read(state: &str) -> (Document, Option<Selection>, Option<BlockId>) {
             "todo" => list(ListKind::Task { checked: false }),
             "done" => list(ListKind::Task { checked: true }),
             "hr" => BlockKind::Divider,
+            "card" => preview(text),
             "formula" => BlockKind::Formula,
             "code" => BlockKind::Code { language: None },
-            other => match other.strip_prefix("code:") {
-                Some(language) => BlockKind::Code { language: Some(language.to_owned()) },
-                None => panic!("unknown block kind {other:?} in {state:?}"),
+            other => match (other.strip_prefix("code:"), other.strip_prefix("toc:")) {
+                (Some(language), _) => BlockKind::Code { language: Some(language.to_owned()) },
+                (_, Some(levels)) => BlockKind::TableOfContents { levels: levels.parse().expect("a heading level") },
+                _ => panic!("unknown block kind {other:?} in {state:?}"),
             },
         };
 
@@ -556,6 +569,8 @@ fn line(block: &Block, selection: Option<&Selection>, picture: Option<&BlockId>)
         BlockKind::Code { language: None } => (0, "code".to_owned()),
         BlockKind::Code { language: Some(language) } => (0, format!("code:{language}")),
         BlockKind::Divider => (0, "hr".to_owned()),
+        BlockKind::TableOfContents { levels } => (0, format!("toc:{levels}")),
+        BlockKind::LinkPreview { .. } => (0, "card".to_owned()),
         BlockKind::Formula => (0, "formula".to_owned()),
         other => (0, format!("{other:?}")),
     };
@@ -608,6 +623,13 @@ fn line(block: &Block, selection: Option<&Selection>, picture: Option<&BlockId>)
         }
         offset += c.map_or(0, char::len_utf8);
     }
+    if let BlockKind::LinkPreview { url, title, description, image } = &block.kind {
+        let mut fields = vec![Some(url), title.as_ref(), description.as_ref(), image.as_ref()];
+        while fields.last() == Some(&None) {
+            fields.pop();
+        }
+        text = fields.iter().map(|field| field.map_or("-", String::as_str)).collect::<Vec<_>>().join(" ~ ");
+    }
     format!("{}{kind}{}{text}", "  ".repeat(indent), if text.is_empty() { "" } else { " " })
 }
 
@@ -629,6 +651,8 @@ pub enum Action {
     Refer(usize),
     /// Keeps a picture in the document for a block, counted the same way.
     Embed(usize),
+    /// Changes a block that holds no text, counted among those, in one of several ways.
+    Whole(usize, usize),
 }
 
 pub fn action() -> impl Strategy<Value = Action> {
@@ -732,6 +756,8 @@ pub fn action() -> impl Strategy<Value = Action> {
         Just(Command::RemoveWord("mot".into())),
         Just(Command::SetLanguage("fr".into())),
         Just(Command::InsertTable { rows: 2, columns: 2 }),
+        Just(Command::InsertContents),
+        Just(Command::InsertPreview("https://a.example".into())),
         Just(Command::ShiftFigure { right: true }),
         Just(Command::ResizeFigure { width: 120.0, height: 90.0 }),
         Just(Command::SetAlt("boats".into())),
@@ -774,6 +800,7 @@ pub fn action() -> impl Strategy<Value = Action> {
         1 => (0..40usize, any::<bool>(), any::<bool>()).prop_map(|(at, beside, after)| Action::MoveFigure(at, beside, after)),
         1 => (0..40usize).prop_map(Action::Refer),
         1 => (0..40usize).prop_map(Action::Embed),
+        1 => (0..8usize, 0..8usize).prop_map(|(at, way)| Action::Whole(at, way)),
     ]
 }
 
@@ -799,6 +826,33 @@ pub fn perform(editor: &mut Harness, action: &Action) {
             let ids: Vec<_> = editor.editor.doc().walk().map(|block| block.id.clone()).collect();
             if let Some(id) = ids.get(at % ids.len().max(1)) {
                 editor.run(Command::EmbedFigure { figure: id.clone(), picture: png(*at as u8, 400, 300) });
+            }
+        }
+        Action::Whole(at, way) => {
+            let whole = |block: &&Block| {
+                matches!(block.kind, BlockKind::TableOfContents { .. } | BlockKind::LinkPreview { .. })
+            };
+            let ids: Vec<_> = editor.editor.doc().walk().filter(whole).map(|block| block.id.clone()).collect();
+            if let Some(id) = ids.get(at % ids.len().max(1)).cloned() {
+                let said = |text: &str| Some(text.to_owned());
+                let edit = match way {
+                    0 => PreviewEdit::Url("https://b.example".into()),
+                    1 => PreviewEdit::Title(said("A page")),
+                    2 => PreviewEdit::Title(said("")),
+                    3 => PreviewEdit::Description(said("About\nit")),
+                    4 => PreviewEdit::Picture(Some(png(*at as u8, 400, 300))),
+                    5 => PreviewEdit::Picture(None),
+                    6 => PreviewEdit::Fetched {
+                        url: "https://a.example".into(),
+                        title: said(" A  page "),
+                        description: None,
+                        picture: None,
+                    },
+                    _ => PreviewEdit::Url(String::new()),
+                };
+                // Each command acts on its own kind of block, and the other has no use for it.
+                editor.run(Command::SetContentsLevels { table: id.clone(), levels: *way as u8 });
+                editor.run(Command::Preview { block: id, edit });
             }
         }
         Action::Refer(at) => {
@@ -904,4 +958,4 @@ fn referred(block: &Block, offset: usize) -> bool {
 }
 
 /// A document with every kind of block and mark, for scripts to run on.
-pub const SAMPLE: &str = "h1 A *title*|\np Some **bold** and [linked](https://a.example) text, ünïcödé 👩‍👧.\nul one\n  todo two\nhr\n> p quoted\n> p lines\ntip> p a tip\ncode:rust fn main() {⏎    body();⏎}\nfig# Boats at sea\ng> fig\ng> fig\ng> cap Two more\nr1> th Boat\nr1> th Length\nr2> td Skiff\nr2> td 4 m\np\np See ⟦Figure 1⟧(b12) for more.\nfig@ A linked one";
+pub const SAMPLE: &str = "h1 A *title*|\np Some **bold** and [linked](https://a.example) text, ünïcödé 👩‍👧.\nul one\n  todo two\nhr\n> p quoted\n> p lines\ntip> p a tip\ncode:rust fn main() {⏎    body();⏎}\nfig# Boats at sea\ng> fig\ng> fig\ng> cap Two more\nr1> th Boat\nr1> th Length\nr2> td Skiff\nr2> td 4 m\np\np See ⟦Figure 1⟧(b12) for more.\nfig@ A linked one\ntoc:2\ncard https://a.example ~ A page";

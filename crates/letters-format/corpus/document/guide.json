@@ -1,0 +1,73 @@
+{
+  "format": 1,
+  "language": "en-GB",
+  "blocks": [
+    {
+      "id": "g1",
+      "type": "heading",
+      "level": 1,
+      "content": [
+        {
+          "text": "Harbour guide"
+        }
+      ]
+    },
+    {
+      "id": "g2",
+      "type": "table_of_contents",
+      "levels": 2
+    },
+    {
+      "id": "g3",
+      "type": "heading",
+      "level": 2,
+      "content": [
+        {
+          "text": "Moorings"
+        }
+      ]
+    },
+    {
+      "id": "g4",
+      "type": "paragraph",
+      "content": [
+        {
+          "text": "Visitors tie up on the east quay."
+        }
+      ]
+    },
+    {
+      "id": "g5",
+      "type": "heading",
+      "level": 3,
+      "content": [
+        {
+          "text": "Fees"
+        }
+      ]
+    },
+    {
+      "id": "g6",
+      "type": "link_preview",
+      "url": "https://example.com/harbour/fees",
+      "title": "Harbour fees",
+      "description": "What a night on the quay costs, by length.",
+      "image": "assets/5e2f.jpg"
+    },
+    {
+      "id": "g7",
+      "type": "heading",
+      "level": 2,
+      "content": [
+        {
+          "text": "Tides"
+        }
+      ]
+    },
+    {
+      "id": "g8",
+      "type": "link_preview",
+      "url": "https://example.com/tides"
+    }
+  ]
+}

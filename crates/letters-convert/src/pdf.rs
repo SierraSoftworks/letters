@@ -34,6 +34,30 @@ pub struct PdfInfo {
 /// [`DocLayout::add_fallback_fonts`] says.
 pub type Backups<'a> = &'a mut dyn FnMut(&[Uncovered]) -> Fonts;
 
+/// Finds the word list of a script that is written without spaces, as [`WordList::data`] gives it, so that
+/// its lines end between words. It is asked once at most for each such script of the document, and only
+/// where the lists are not built in, as [`DocLayout::add_word_list`] says.
+pub type Words<'a> = &'a mut dyn FnMut(WordList) -> Option<Vec<u8>>;
+
+/// Hands over the file a linked picture's address led to, as it was fetched, for a picture the window has
+/// loaded. `None` for one it has not. It is asked once for each address the document's pictures link to.
+pub type Linked<'a> = &'a mut dyn FnMut(&str) -> Option<Vec<u8>>;
+
+/// What a shell hands a PDF beyond the document's own file, so that a page shows what the window shows.
+/// Each is asked only for what the document needs, and one left out changes nothing else.
+#[derive(Default)]
+pub struct PdfSources<'a> {
+    /// Faces for what the fonts lack. Without them such a character is a box. A PDF carries its fonts, so
+    /// these are embedded too.
+    pub backups: Option<Backups<'a>>,
+    /// Word lists, so that a line ends where the window ends it. A browser fetches these, and every other
+    /// build has them.
+    pub words: Option<Words<'a>>,
+    /// Linked pictures. An export fetches nothing, so without them such a picture is the empty frame the
+    /// window shows before it loads.
+    pub linked: Option<Linked<'a>>,
+}
+
 /// Writes a PDF of the document on the paper `style` sets up, in `fonts`. `assets` supplies the images the
 /// pages show, and `info` what the PDF says of itself.
 ///
@@ -42,7 +66,8 @@ pub type Backups<'a> = &'a mut dyn FnMut(&[Uncovered]) -> Fonts;
 /// - A link that would run script is left as its text alone.
 /// - An image that `assets` lacks, or that cannot be decoded, leaves its place empty.
 /// - An unknown block is shown as a placeholder that names its type, as it is on screen.
-/// - A character that none of the fonts has is shown as a box. [`to_pdf_with`] takes faces for those.
+/// - A character that none of the fonts has is shown as a box, and a picture that is still a link as an
+///   empty frame. [`to_pdf_with`] takes what a shell has for those.
 pub fn to_pdf(
     doc: &Document,
     style: &Style,
@@ -50,37 +75,17 @@ pub fn to_pdf(
     assets: Assets,
     info: &PdfInfo,
 ) -> Result<Vec<u8>, PdfError> {
-    to_pdf_with(doc, style, fonts, assets, info, &mut |_| Fonts::default())
+    to_pdf_with(doc, style, fonts, assets, info, PdfSources::default())
 }
 
-/// Finds the word list of a script that is written without spaces, as [`WordList::data`] gives it, so that
-/// its lines end between words. It is asked once at most for each such script of the document, and only
-/// where the lists are not built in, as [`DocLayout::add_word_list`] says.
-pub type Words<'a> = &'a mut dyn FnMut(WordList) -> Option<Vec<u8>>;
-
-/// Writes a PDF as [`to_pdf`] does, with the faces `backups` finds for what the fonts lack, so that a page
-/// shows the emoji and scripts the window shows. A PDF carries its fonts, so these are embedded too.
+/// Writes a PDF as [`to_pdf`] does, with what `sources` hands over.
 pub fn to_pdf_with(
     doc: &Document,
     style: &Style,
     fonts: Fonts,
     assets: Assets,
     info: &PdfInfo,
-    backups: Backups,
-) -> Result<Vec<u8>, PdfError> {
-    to_pdf_with_words(doc, style, fonts, assets, info, backups, &mut |_| None)
-}
-
-/// Writes a PDF as [`to_pdf_with`] does, with the lists `words` finds, so that a line ends where the
-/// window ends it. A browser fetches these, and every other build has them.
-pub fn to_pdf_with_words(
-    doc: &Document,
-    style: &Style,
-    fonts: Fonts,
-    assets: Assets,
-    info: &PdfInfo,
-    backups: Backups,
-    words: Words,
+    mut sources: PdfSources,
 ) -> Result<Vec<u8>, PdfError> {
     let page = &style.page;
     let mut layout = DocLayout::new(fonts);
@@ -90,20 +95,37 @@ pub fn to_pdf_with_words(
             layout.set_tokens(&block.id, tokens(language.as_deref(), &block.plain_text()));
         }
     }
+    // Each image is read and decoded once: a linked one here, so that its place is drawn at its own shape,
+    // and one the file holds when the first page that shows it is painted.
+    let (mut images, mut asked) = (Images::default(), BTreeSet::new());
+    if let Some(linked) = &mut sources.linked {
+        for block in doc.walk() {
+            if let BlockKind::Figure { asset: None, src: Some(src), .. } = &block.kind
+                && asked.insert(src.clone())
+                && let Some(image) = linked(src).and_then(|bytes| Image::decode(&bytes).ok())
+            {
+                layout.set_loaded(src, Some((image.width(), image.height())));
+                images.insert(src.clone(), image);
+            }
+        }
+    }
     let mut pages = layout.paginate(page);
     // Paging lays out every block, so each character that no face has is known by now.
     let lacking = layout.take_uncovered();
-    let mut again = !lacking.is_empty() && layout.add_fallback_fonts(&backups(&lacking));
-    for list in layout.take_unlisted() {
-        again |= words(list).is_some_and(|data| layout.add_word_list(list, &data));
+    let mut again = match &mut sources.backups {
+        Some(backups) if !lacking.is_empty() => layout.add_fallback_fonts(&backups(&lacking)),
+        _ => false,
+    };
+    if let Some(words) = &mut sources.words {
+        for list in layout.take_unlisted() {
+            again |= words(list).is_some_and(|data| layout.add_word_list(list, &data));
+        }
     }
     if again {
         pages = layout.paginate(page);
     }
     let sheet = Size { width: pages.width, height: pages.height };
 
-    // Each image is read and decoded once, when the first page that shows it is painted.
-    let (mut images, mut asked) = (Images::default(), BTreeSet::new());
     let mut pdf = Pdf::new();
     for index in 0..pages.sheets.len() {
         let mut list = DisplayList::default();

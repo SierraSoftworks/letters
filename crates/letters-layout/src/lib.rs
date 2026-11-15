@@ -22,6 +22,9 @@
 //! right edge. While the caret is in a formula, its source shows instead. See [`DocLayout::reveal`]. A
 //! reference to a figure reads as the figure's label, whatever its own text is. A picture of a gallery has
 //! no text on the page, and a position in it is on the picture.
+//!
+//! A table of contents and a link preview are whole blocks, as a divider is: no position is inside one.
+//! [`DocLayout::contents`] and [`DocLayout::previews`] say where they are and where they lead.
 
 mod callout;
 mod engine;
@@ -54,7 +57,8 @@ use crate::leaf::{Extent, Laid, Lay, Open, Over, Painter, Source, Swap, Text};
 use crate::reveal::{Reveal, Shapes, Shifts};
 
 pub use crate::callout::icon_path;
-pub use crate::engine::Uncovered;
+pub use crate::engine::{Uncovered, reads};
+pub use crate::flow::rtl;
 pub use crate::paginate::{Heading, PageBlock, PageLink, Pages, Sheet};
 pub use crate::palette::{Callout, Palette, Scheme, Syntax};
 pub use crate::shape::{FontSpec, ShapedRun, ShapedText, Shaper};
@@ -114,6 +118,29 @@ pub struct TableRow {
     pub height: f32,
     /// Its cells, in the order of the columns.
     pub cells: Vec<BlockId>,
+}
+
+/// A table of contents, where it is drawn. See [`DocLayout::contents`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContentsBox {
+    pub block: BlockId,
+    /// All its lines.
+    pub rect: Rect,
+    /// Its lines from the top: the heading each leads to, and the line across the whole table, with the
+    /// room its page number has on a sheet. Empty for a table with no heading to list, which says so in a
+    /// line of its own.
+    pub lines: Vec<(BlockId, Rect)>,
+}
+
+/// A link preview, where it is drawn. See [`DocLayout::previews`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewBox {
+    pub block: BlockId,
+    /// The card, all of which leads to the preview's address.
+    pub rect: Rect,
+    /// The room a preview that has only its address keeps clear at the end of the card, for a control
+    /// that fetches the rest. `None` once anything was fetched, and where the card is too narrow.
+    pub control: Option<Rect>,
 }
 
 /// The number of each numbered figure and gallery of `doc`, in the order of the document. These are the
@@ -191,6 +218,7 @@ impl DocLayout {
             numbers: HashMap::new(),
             loaded: HashMap::new(),
             caption: None,
+            listing: false,
             scratch: Laid::default(),
         };
         Self { state: RefCell::new(state) }
@@ -312,9 +340,14 @@ impl DocLayout {
     /// does not change the document. So the picture is drawn at its own shape, as large as fits in the
     /// figure's box and in the middle of it. Nothing is laid out again.
     ///
+    /// The picture of a link preview is told the same way, by its name among the document's assets. A
+    /// preview shows its picture in a slot of one size, and the document does not store the picture's.
+    /// Once told, the slot is filled at the picture's own shape, with what does not fit cut off. Until
+    /// then the picture is drawn at the slot's shape.
+    ///
     /// Returns whether the document shows the picture, which is whether to paint again: a name that no
-    /// figure links to changes nothing. [`FigureBox::image`] stays the figure's box and
-    /// [`FigureBox::badge`] answers either way, since a loaded picture is a link until it is embedded.
+    /// figure links to and no preview shows changes nothing. [`FigureBox::image`] stays the figure's box
+    /// and [`FigureBox::badge`] answers either way, since a loaded picture is a link until it is embedded.
     pub fn set_loaded(&mut self, src: &str, size: Option<(u32, u32)>) -> bool {
         self.state.get_mut().set_loaded(src, size)
     }
@@ -410,7 +443,7 @@ impl DocLayout {
 
     /// Emits the part of the document that falls inside `viewport`.
     pub fn paint(&self, viewport: Rect, out: &mut DisplayList) {
-        self.state.borrow_mut().paint(viewport, false, out);
+        self.state.borrow_mut().paint(viewport, None, out);
     }
 
     /// Splits the document into pages of `page`'s size, for Print view and export. Lay the document out at
@@ -445,6 +478,10 @@ impl DocLayout {
     /// around the blocks inside it, and a table around its rows of cells. A block that runs on to the next
     /// sheet opens there under the same id. The page number is part of nothing, and nor are the boxes and
     /// rules of the page.
+    ///
+    /// Each line of a table of contents ends in the number of the sheet its heading starts on, which only
+    /// a sheet shows. The line is a paragraph that holds one link, and so is all that a link preview says.
+    /// A preview's picture is decoration.
     pub fn paint_page(&self, pages: &Pages, index: usize, out: &mut DisplayList) {
         self.state.borrow_mut().printed(|state| state.paint_page(pages, index, out));
     }
@@ -463,7 +500,8 @@ impl DocLayout {
 
     /// The links on one sheet of `pages`, in reading order: those that lead out of the document, and each
     /// reference that names a figure, which leads to where its figure is. A link that runs over several
-    /// lines has a rectangle for each.
+    /// lines has a rectangle for each. A line of a table of contents is one link, which leads to where its
+    /// heading starts, and the card of a link preview is one that leads to the preview's address.
     pub fn page_links(&self, pages: &Pages, index: usize) -> Vec<PageLink> {
         self.state.borrow_mut().printed(|state| state.page_links(pages, index))
     }
@@ -546,6 +584,18 @@ impl DocLayout {
         self.state.borrow_mut().tables(viewport)
     }
 
+    /// The tables of contents that `viewport` shows, in order, each with all its lines and the heading
+    /// each line leads to. The lines are those of [`Document::contents`], set in from the shallowest
+    /// level among them, and follow the headings as they are edited.
+    pub fn contents(&self, viewport: Rect) -> Vec<ContentsBox> {
+        self.state.borrow_mut().contents(viewport)
+    }
+
+    /// The link previews that `viewport` shows, in order, each with its card.
+    pub fn previews(&self, viewport: Rect) -> Vec<PreviewBox> {
+        self.state.borrow_mut().previews(viewport)
+    }
+
     /// The rectangles that highlight a selection, one per line it touches.
     ///
     /// This lays out every block the selection covers. To paint, use [`DocLayout::selection_in`].
@@ -606,6 +656,11 @@ const PARTS: u32 = 32;
 const FRAME: u64 = 1 << 63;
 const TABLE: u64 = 1 << 62;
 
+/// The sheet that shows the start of a leaf, counted from 0.
+fn sheet_of(pages: &Pages, leaf: usize) -> Option<usize> {
+    pages.sheets.partition_point(|sheet| sheet.first <= (leaf, 0)).checked_sub(1)
+}
+
 /// A position and whether it is the end of the line that wraps there, where that place also starts the
 /// next line.
 type Stop = (Pos, bool);
@@ -665,6 +720,8 @@ struct State {
     loaded: HashMap<String, (f32, f32)>,
     /// The figure or gallery that keeps the line of its caption while it has none.
     caption: Option<BlockId>,
+    /// Whether the document has a table of contents, which reads what its headings say.
+    listing: bool,
     /// A layout to measure with, so that measuring allocates nothing.
     scratch: Laid,
 }
@@ -706,6 +763,10 @@ impl State {
         for id in &change.blocks {
             let Some(&Slot { leaf: at, part }) = self.index.get(id) else { return false };
             let leaf = &mut self.leaves[at];
+            // A table of contents says what its headings say, so its lines are read again.
+            if self.listing && leaf.role.is_heading() {
+                return false;
+            }
             let Some(block) = doc.blocks.get(leaf.root).and_then(|root| flow::find(root, id)) else { return false };
             // A block of another kind changes the column's shape, and so does a picture of another size.
             // Whether a page starts at a block is decided where the column is built.
@@ -773,7 +834,7 @@ impl State {
         }
         index.clear();
         for (at, leaf) in self.leaves.iter().enumerate() {
-            if let (What::Gallery | What::Row, Some(id)) = (leaf.what, &leaf.id) {
+            if let (What::Gallery | What::Row | What::Contents | What::Preview, Some(id)) = (leaf.what, &leaf.id) {
                 index.insert(id.clone(), Slot { leaf: at, part: Part::Whole });
             }
             for (part, id) in leaf.parts() {
@@ -798,6 +859,7 @@ impl State {
         self.spelling.retain(|id, ranges| worded(id) && !ranges.is_empty());
         self.recount();
         self.stale = 0;
+        self.listing = self.leaves.iter().any(|leaf| leaf.what == What::Contents);
         // A leaf made anew for the figure whose caption is open, as when its picture is resized, opens too.
         self.open_caption(true);
     }
@@ -860,7 +922,9 @@ impl State {
             None => self.loaded.remove(src).is_some(),
         };
         let shows = |picture: &Picture| picture.asset.is_none() && picture.src.as_deref() == Some(src);
-        changed && self.leaves.iter().any(|leaf| leaf.pictures.iter().any(shows))
+        // A link preview fits its picture to its slot by the picture's size.
+        let slotted = |leaf: &Leaf| leaf.image.as_deref() == Some(src);
+        changed && self.leaves.iter().any(|leaf| slotted(leaf) || leaf.pictures.iter().any(shows))
     }
 
     fn set_maths_links(&mut self, links: bool) {
@@ -1051,13 +1115,17 @@ impl State {
     fn lay(&mut self, at: usize) {
         self.leaves[at].used = self.clock;
         self.size(at);
-        if self.leaves[at].laid.is_some() || self.leaves[at].fixed() {
+        let leaf = &mut self.leaves[at];
+        if leaf.laid.is_some() && leaf.exact || leaf.fixed() {
             return;
         }
+        // A table of contents whose lines have changed keeps its layout, which is brought up to date.
+        let stale = leaf.laid.take();
+        self.held -= usize::from(stale.is_some());
         if self.held >= KEPT {
             self.evict();
         }
-        let mut laid = Box::<Laid>::default();
+        let mut laid = stale.unwrap_or_default();
         self.shape(at, &mut laid);
         leaf::adorn(&mut self.engine, &self.types, &self.leaves[at], &mut laid);
         self.leaves[at].short |= self.engine.short;
@@ -1071,7 +1139,14 @@ impl State {
         if self.leaves[at].exact {
             return;
         }
+        // An edit to a heading changes the table of contents, wherever that is. So it keeps its layout:
+        // bringing that up to date sets one line, and not all of them.
+        if self.leaves[at].laid.is_some() || self.leaves[at].what == What::Contents {
+            return self.lay(at);
+        }
         let mut scratch = std::mem::take(&mut self.scratch);
+        // What it last measured was another leaf's.
+        scratch.set_from.clear();
         self.shape(at, &mut scratch);
         self.scratch = scratch;
     }
@@ -1176,8 +1251,10 @@ impl State {
         (first, end)
     }
 
-    /// Paints a band of the column. `print` leaves out what belongs to editing and not to the document.
-    fn paint(&mut self, viewport: Rect, print: bool, out: &mut DisplayList) {
+    /// Paints a band of the column. With `pages` it is a band of one of their sheets, which leaves out what
+    /// belongs to editing and not to the document.
+    fn paint(&mut self, viewport: Rect, pages: Option<&Pages>, out: &mut DisplayList) {
+        let print = pages.is_some();
         let band = (viewport.y, viewport.y + viewport.height);
         let (first, end) = self.show(band.0, band.1);
         let inks = Inks::new(&self.types, self.palette);
@@ -1305,7 +1382,9 @@ impl State {
             let cells = leaf.cells.len();
             for part in [Part::Text].into_iter().chain((0..cells).map(Part::Cell)) {
                 let shifts = if print { Shifts::default() } else { self.shifts(at, part) };
-                let Self { engine, types, leaves, tokens, spelling, shapes, composition, numbers, loaded, .. } = self;
+                let Self {
+                    engine, types, leaves, index, tokens, spelling, shapes, composition, numbers, loaded, ..
+                } = self;
                 let leaf = &leaves[at];
                 let Some(laid) = &leaf.laid else { continue };
                 // What belongs to editing is found by the block the text is of.
@@ -1313,7 +1392,8 @@ impl State {
                 let own = |id: &BlockId| block == Some(id);
                 let composing = composition.as_ref().filter(|(block, _)| own(block)).map(|(_, range)| range.clone());
                 let spelling = block.and_then(|id| spelling.get(id)).map_or(&[][..], Vec::as_slice);
-                let over = Over { shifts: &shifts, shapes, composing, spelling };
+                let sheet_of = &|block: &BlockId| sheet_of(pages?, index.get(block)?.leaf);
+                let over = Over { shifts: &shifts, shapes, composing, spelling, sheet_of };
                 let mut painter =
                     Painter { engine, types, inks: &inks, band, spelt: print, part: name, numbers, loaded, out };
                 match part {
@@ -1360,7 +1440,7 @@ impl State {
             let from = out.items.len();
             out.push(Item::PushClip { rect: Rect::new(-area.x, top, pages.width, bottom - top), radius: 0.0 });
             // A little inside the band, so that a line ending at its edge is not taken for one in it.
-            self.paint(Rect::new(0.0, top + 0.25, self.width, bottom - top - 0.5), true, out);
+            self.paint(Rect::new(0.0, top + 0.25, self.width, bottom - top - 0.5), Some(pages), out);
             out.push(Item::PopClip);
             out.translate(from, origin);
         }
@@ -1404,6 +1484,11 @@ impl State {
         self.place_all();
         for (block, lines) in &sheet.blocks {
             let Some(at) = self.index.get(block).map(|slot| slot.leaf) else { continue };
+            if self.leaves[at].stacks() {
+                self.lay(at);
+                self.entry_links(pages, at, lines, origin, &mut links);
+                continue;
+            }
             let linked = |words: &Words| !words.links.is_empty() || !words.refs.is_empty();
             if !linked(&self.leaves[at].words) && !self.leaves[at].cells.iter().any(|cell| linked(&cell.words)) {
                 continue;
@@ -1436,12 +1521,43 @@ impl State {
         links
     }
 
+    /// The links of the lines of a table of contents that a sheet holds, or the one link that is the card
+    /// of a link preview. Each is named as painting names its part.
+    fn entry_links(&self, pages: &Pages, at: usize, lines: &Range<usize>, origin: Point, links: &mut Vec<PageLink>) {
+        let leaf = &self.leaves[at];
+        let on_sheet = |rect: Rect| Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect };
+        let named = |part: Part| Some(((at as u64 + 1) << PARTS) | leaf::link(part, 0));
+        if let Some(BlockKind::LinkPreview { url, .. }) = &leaf.kind {
+            let (rect, part) = (on_sheet(leaf::boxed(leaf)), named(Part::Text));
+            links.extend(lines.contains(&0).then(|| PageLink { rect, target: url.clone(), place: None, part }));
+            return;
+        }
+        let Some(laid) = &leaf.laid else { return };
+        for (index, (entry, _, top, height)) in leaf::stack(leaf, laid, &self.types).enumerate() {
+            let place = entry.target.as_ref().and_then(|target| self.shown_at(pages, target));
+            if let (true, Some(place)) = (lines.contains(&index), place) {
+                let rect = on_sheet(Rect::new(leaf.x, leaf.y + top.y, leaf.width, height));
+                links.push(PageLink {
+                    rect,
+                    target: String::new(),
+                    place: Some(place),
+                    part: named(Part::Cell(index)),
+                });
+            }
+        }
+    }
+
     /// Where a sheet shows the figure that a reference to `target` reads as: the sheet, and the top left of
     /// the figure's picture on it. `None` for a block with no number, which no reference names.
     fn leads_to(&self, pages: &Pages, target: &BlockId) -> Option<(usize, Point)> {
-        let at = self.index.get(target).filter(|_| self.numbers.contains_key(target))?.leaf;
+        self.shown_at(pages, target).filter(|_| self.numbers.contains_key(target))
+    }
+
+    /// Where a sheet shows the start of a block: the sheet, and the top left of the block on it.
+    fn shown_at(&self, pages: &Pages, target: &BlockId) -> Option<(usize, Point)> {
+        let at = self.index.get(target)?.leaf;
         let leaf = &self.leaves[at];
-        let page = pages.sheets.partition_point(|sheet| sheet.first <= (at, 0)).checked_sub(1)?;
+        let page = sheet_of(pages, at)?;
         let origin = pages.origin(page)?;
         // A figure's picture stands where its caption's lines do. A gallery starts at the column's edge.
         let across = leaf.pictures.first().filter(|_| leaf.what == What::Figure).map_or(0.0, |picture| picture.rect.x);
@@ -1634,6 +1750,40 @@ impl State {
             Some(TableBox { rect, columns, rows })
         };
         shown.into_iter().filter_map(boxed).collect()
+    }
+
+    fn contents(&mut self, viewport: Rect) -> Vec<ContentsBox> {
+        let (first, end) = self.show(viewport.y, viewport.y + viewport.height);
+        let mut found = Vec::new();
+        for at in first..end {
+            if self.leaves[at].what != What::Contents {
+                continue;
+            }
+            // A viewport taller than the cache holds has dropped its first layouts by now.
+            self.lay(at);
+            let leaf = &self.leaves[at];
+            let (Some(block), Some(laid)) = (leaf.id.clone(), &leaf.laid) else { continue };
+            let across = |top: f32, height: f32| Rect::new(leaf.x, leaf.y + top, leaf.width, height);
+            let lines = leaf::stack(leaf, laid, &self.types)
+                .filter_map(|(entry, _, at, height)| Some((entry.target.clone()?, across(at.y, height))));
+            found.push(ContentsBox { block, rect: across(0.0, leaf.height), lines: lines.collect() });
+        }
+        found
+    }
+
+    fn previews(&mut self, viewport: Rect) -> Vec<PreviewBox> {
+        let (first, end) = self.show(viewport.y, viewport.y + viewport.height);
+        let cards = self.leaves[first..end].iter().filter(|leaf| leaf.what == What::Preview);
+        let boxed = |leaf: &Leaf| {
+            let spare = leaf.spare(&self.types);
+            let control = Rect::new(leaf.x + leaf.width - spare, leaf.y, spare, leaf.height);
+            Some(PreviewBox {
+                block: leaf.id.clone()?,
+                rect: leaf::boxed(leaf),
+                control: (spare > 0.0).then_some(control),
+            })
+        };
+        cards.filter_map(boxed).collect()
     }
 
     fn selection(&mut self, selection: &Selection, viewport: Option<Rect>) -> Vec<Rect> {

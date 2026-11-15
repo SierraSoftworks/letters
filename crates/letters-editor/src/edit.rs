@@ -736,7 +736,7 @@ impl Editor {
         match kind.shape() {
             BodyShape::Text => self.set_kind(kind),
             BodyShape::Blocks => self.wrap(kind, platform),
-            BodyShape::None if kind == BlockKind::Divider => self.insert_divider(platform),
+            BodyShape::None if kind == BlockKind::Divider => self.insert_whole(kind, platform),
             BodyShape::None => {}
         }
     }
@@ -821,33 +821,5 @@ impl Editor {
             block: child.clone(),
         }));
         self.apply(ops);
-    }
-
-    /// Adds a divider after the caret's block and leaves the caret in the text below it. An empty paragraph
-    /// becomes that text, so the divider takes its place.
-    fn insert_divider(&mut self, platform: &mut dyn Platform) {
-        let Some(id) = self.selection().map(|selection| selection.head.block.clone()) else { return };
-        // After a part, the divider follows the gallery or the table it is in.
-        let unit = self.unit(&id);
-        let doc = self.doc();
-        let (Some(block), Some(place)) = (doc.block(&id), self.seat(&unit)) else { return };
-        let divider = Block::new(platform.new_id().as_str(), BlockKind::Divider);
-        let parent = place.parent_id();
-        if block.kind == BlockKind::Paragraph && text::len(block) == 0 {
-            self.apply(vec![Op::InsertBlock { parent, index: place.index, block: divider }]);
-            return;
-        }
-        let mut ops = vec![Op::InsertBlock { parent: parent.clone(), index: place.index + 1, block: divider }];
-        let below = match place.siblings(doc).get(place.index + 1).filter(|below| tree::flows(below)) {
-            Some(below) => below.id.clone(),
-            None => {
-                let new = BlockId::new(platform.new_id());
-                let block = Block::new(new.clone(), BlockKind::Paragraph);
-                ops.push(Op::InsertBlock { parent, index: place.index + 2, block });
-                new
-            }
-        };
-        self.apply(ops);
-        self.place(Pos::new(below, 0));
     }
 }

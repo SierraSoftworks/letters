@@ -144,9 +144,7 @@ impl Open {
         traded: Option<&(usize, Block)>,
     ) -> Self {
         let block = note.anchor.block.clone();
-        // The page stands for the version it reads more like: the later one, until the two trade places.
-        let far = |version: &Version| version.block.as_ref().map_or(usize::MAX, |block| apart(block, page));
-        let on_page = usize::from(far(&versions[0]) >= far(&versions[1]));
+        let on_page = stands_for(versions, page);
         let traded = traded.filter(|(side, _)| *side != on_page);
         let held = traded.map(|(_, block)| block.clone()).or_else(|| versions[1 - on_page].block.clone());
         let mut open = Self {
@@ -791,6 +789,13 @@ pub(crate) fn bar(count: usize, open: Option<usize>) -> Element<Message> {
         Some(_) => bar.on_dismiss("Close conflict", send(Reviewing::Close)).into(),
         None => bar.into(),
     }
+}
+
+/// Which of a conflict's two versions the page stands for, where `page` is the block as the page has it:
+/// the one it reads more like. That is the later one, until the two trade places.
+pub(crate) fn stands_for(versions: &[Version; 2], page: &Block) -> usize {
+    let far = |version: &Version| version.block.as_ref().map_or(usize::MAX, |block| apart(block, page));
+    usize::from(far(&versions[0]) >= far(&versions[1]))
 }
 
 /// How far apart two versions of a block read: how much text only one of them has, in bytes. Nothing

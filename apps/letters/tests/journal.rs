@@ -66,7 +66,7 @@ impl Desk {
         self.journal().saving();
         let (edits, seen) = (self.writer.model.save(), self.writer.model.revision());
         let notes = self.writer.copy.notes.clone();
-        let Exchange { home, held, .. } = home.exchange(&mut self.writer.copy, &edits, notes, &seen).unwrap();
+        let Exchange { home, held, .. } = home.exchange(&mut self.writer.copy, &edits, notes, &seen, &[]).unwrap();
         self.journal().moved(home.path());
         self.journal().saved(held);
         self.home = Some(home);

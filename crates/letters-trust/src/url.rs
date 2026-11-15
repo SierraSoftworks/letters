@@ -99,8 +99,9 @@ impl HttpsUrl {
         Self { host: self.host.clone(), port: self.port, path: "/".into(), query: None }
     }
 
-    /// Reads the `Location` of a redirect, which may be relative to this address.
-    pub(crate) fn join(&self, location: &str) -> Result<Self, UrlError> {
+    /// Reads an address written on this page, or the `Location` of a redirect from it. Either may be
+    /// relative to this address.
+    pub fn join(&self, location: &str) -> Result<Self, UrlError> {
         let location = location.trim();
         let origin = self.root().to_string();
         let origin = origin.trim_end_matches('/');

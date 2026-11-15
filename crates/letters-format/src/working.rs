@@ -7,6 +7,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
+use std::mem;
 
 use letters_model::{Block, BlockId, Change, Document, Model, Note, Notes, Op, OpError, ReplicaId, Stood, Style};
 
@@ -39,6 +40,9 @@ pub struct WorkingCopy {
     /// The history as the file last held it, read or written. Written back as it is while the model holds
     /// nothing more, so that writers with the same edits write the same bytes.
     history: Option<Vec<u8>>,
+    /// The id the file went by when this document became its own, until the file is seen to carry the new
+    /// one. See [`Self::fork`].
+    was: Option<String>,
 }
 
 impl WorkingCopy {
@@ -60,6 +64,7 @@ impl WorkingCopy {
             unread_style: None,
             unread_notes: false,
             history: None,
+            was: None,
         }
     }
 
@@ -82,7 +87,21 @@ impl WorkingCopy {
             entries: BTreeMap::new(),
             seen: manifest.hashes.clone(),
             history,
+            was: None,
         })
+    }
+
+    /// Makes this a document of its own, as a file copied by hand becomes with its first edit. It goes by
+    /// `id` from here on, and keeps its history and the date it was created.
+    ///
+    /// The file it was read from still carries the old id. A save takes that file for this document's own,
+    /// merges what it holds and writes the new id. Once a save has read the new id back from the file, a
+    /// file with the old id there is another document's, and is left alone.
+    pub fn fork(&mut self, id: impl Into<String>) {
+        let was = mem::replace(&mut self.id, id.into());
+        if was != self.id {
+            self.was.get_or_insert(was);
+        }
     }
 
     pub fn model(&self) -> &Model {
@@ -298,6 +317,7 @@ impl WorkingCopy {
             unread_style: None,
             unread_notes: false,
             history: None,
+            was: None,
         };
         copy.replay(unsaved)?;
         Ok(Some(copy))
@@ -309,7 +329,14 @@ impl Replica for WorkingCopy {
         &self.id
     }
 
+    fn was(&self) -> Option<&str> {
+        self.was.as_deref()
+    }
+
     fn merge(&mut self, disk: &mut DiskCopy) -> Result<(), Error> {
+        if disk.manifest().id == self.id {
+            self.was = None;
+        }
         let held = &disk.manifest().hashes;
         if held != &self.seen {
             self.take_in(Theirs::read(disk, self.model.replica(), false)?, true)?;

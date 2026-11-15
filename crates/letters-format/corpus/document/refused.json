@@ -46,5 +46,13 @@
   { "why": "a gallery holds a table", "at": "blocks[0].blocks[1]", "json": { "format": 1, "blocks": [{ "id": "g", "type": "gallery", "blocks": [{ "id": "c", "type": "caption" }, { "id": "t", "type": "table" }] }] } },
   { "why": "a reference names no block", "at": "blocks[0].content[0].ref", "json": { "format": 1, "blocks": [{ "id": "a", "type": "paragraph", "content": [{ "text": "x", "ref": "" }] }] } },
   { "why": "two blocks share an id", "at": "blocks", "schema_accepts": true,
-    "json": { "format": 1, "blocks": [{ "id": "a", "type": "divider" }, { "id": "q", "type": "quote", "blocks": [{ "id": "a", "type": "divider" }] }] } }
+    "json": { "format": 1, "blocks": [{ "id": "a", "type": "divider" }, { "id": "q", "type": "quote", "blocks": [{ "id": "a", "type": "divider" }] }] } },
+  { "why": "a table of contents does not say how deep it lists", "at": "blocks[0].levels", "json": { "format": 1, "blocks": [{ "id": "a", "type": "table_of_contents" }] } },
+  { "why": "a table of contents lists deeper than headings go", "at": "blocks[0].levels", "json": { "format": 1, "blocks": [{ "id": "a", "type": "table_of_contents", "levels": 5 }] } },
+  { "why": "a link preview has no address", "at": "blocks[0].url", "json": { "format": 1, "blocks": [{ "id": "a", "type": "link_preview", "title": "Rates" }] } },
+  { "why": "a link preview's address is empty", "at": "blocks[0].url", "json": { "format": 1, "blocks": [{ "id": "a", "type": "link_preview", "url": "" }] } },
+  { "why": "a link preview's title has two lines", "at": "blocks[0].title", "json": { "format": 1, "blocks": [{ "id": "a", "type": "link_preview", "url": "https://example.com/", "title": "one\ntwo" }] } },
+  { "why": "a link preview's picture is an address", "at": "blocks[0].image",
+    "json": { "format": 1, "blocks": [{ "id": "a", "type": "link_preview", "url": "https://example.com/", "image": "https://example.com/a.png" }] } },
+  { "why": "a gallery holds a table of contents", "at": "blocks[0].blocks[0]", "json": { "format": 1, "blocks": [{ "id": "g", "type": "gallery", "blocks": [{ "id": "a", "type": "table_of_contents", "levels": 2 }] }] } }
 ]

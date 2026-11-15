@@ -21,11 +21,11 @@ use letters_model::{BlockId, Change, Model, Notes, ReplicaId, Revision, Style, T
 use letters_render::image::Image;
 use letters_render::{Color, DisplayList, Font, Point, Size};
 use letters_spell::Dictionary;
-use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, Origin, Trust};
+use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDecision, Origin, Trust};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
     Appearance, Chrome, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer, Landing, Location,
-    PictureState, Request, SafeMode, SaveState, Scheme, Settings, Window as View, tokens,
+    MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState, Scheme, Settings, Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -40,11 +40,12 @@ use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowAttributes
 
 use crate::chrome::{self, Buttons, Host};
 use crate::cli::{Format, Mode, Options};
+use crate::conflicts;
 use crate::convert;
 use crate::copies;
 use crate::dictionaries;
 use crate::fallback::Finder;
-use crate::files::{self, EXTENSION, Exchange, Home, Opened, Rest, STYLESHEET, Working};
+use crate::files::{self, EXTENSION, Exchange, Home, Merged, Opened, Rest, STYLESHEET, Working};
 use crate::gpu::Gpu;
 use crate::import::{self, Choices, Plan};
 use crate::input::{self, Composer, Press};
@@ -96,6 +97,9 @@ pub enum Event {
     Faces(WindowId, Vec<Font>),
     /// What a window's first paint did not need has been read.
     Read(WindowId),
+    /// The folder of a window's document, whose file is at this path, was looked through for conflict
+    /// copies of it.
+    Copies(WindowId, PathBuf, Vec<conflicts::Copy>),
     /// The search for a GPU has ended, with one or without.
     Gpu(Option<Box<Gpu>>),
     /// The desktop has said whether it wants less motion.
@@ -476,14 +480,22 @@ struct DocWindow {
     rests: Rests,
     /// Whether versions were marked that no save has been handed. A mark is no edit, but it is saved.
     marks: bool,
+    /// The conflict copies the view was last told of. `None` until it was told of any, which it is
+    /// once a saved document is read, with or without copies: only then does it offer a merge.
+    copies: Option<Vec<PathBuf>>,
+    /// Files to merge into the document with its next save, and whether each is a conflict copy, which
+    /// goes to the trash once the document's file holds what it held.
+    merging: Vec<(PathBuf, bool)>,
+    /// The files the save that is running merges.
+    carried: Vec<(PathBuf, bool)>,
     /// Pictures the page asked for whose files were not to be had while a read or a save was under way.
     awaited: Vec<String>,
     /// Linked pictures that were asked for before the file said which document this is, which decides
     /// what it may fetch.
     links: Vec<(String, Link)>,
-    /// The files of linked pictures that are held narrower than they are, by their addresses, so that a
-    /// sharper screen does not ask their servers again.
-    linked: BTreeMap<String, Vec<u8>>,
+    /// The files of the linked pictures the page shows, by their addresses, so that a sharper screen, a
+    /// print or a PDF copy does not ask their servers again.
+    linked: copies::Linked,
     /// The pictures the view was handed, and how wide each could be held at most.
     held: BTreeMap<String, u32>,
 }
@@ -508,6 +520,17 @@ pub enum Link {
 /// Whether a change shows in the document, as text or a block that came, went or moved.
 fn moved(change: &Change) -> bool {
     *change != Change::default()
+}
+
+/// A file as the window names it when it offers or asks to merge it.
+fn merge_file(path: &Path, library: &Library) -> MergeFile {
+    let folder = library.shown(path.parent().unwrap_or(Path::new("")));
+    MergeFile { path: path.to_string_lossy().into_owned(), name: named(path), folder }
+}
+
+/// The name of a file, as a sentence about it says it.
+fn named(path: &Path) -> String {
+    path.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
 /// Whether two folders are one, however each is spelled. One that cannot be resolved is taken as written.
@@ -687,11 +710,12 @@ impl DocWindow {
             None if self.busy() => self.awaited.push(name),
             None => self.view.set_image(&name, None),
             Some(image) => {
-                // A linked picture that is held whole has nothing sharper to give, so its file is let go.
-                let whole = image.width() < within && self.linked.remove(&name).is_some();
+                // A picture that is held whole has nothing sharper to give.
+                let whole = image.width() < within && self.linked.contains_key(&name);
                 self.view.set_image(&name, Some(image));
-                if !whole {
-                    self.held.insert(name, within);
+                match whole {
+                    true => drop(self.held.remove(&name)),
+                    false => drop(self.held.insert(name, within)),
                 }
             }
         }
@@ -792,12 +816,7 @@ impl DocWindow {
     /// held in safe mode. One made in this window is trusted. One that was opened is unknown until its id
     /// is read.
     fn retrust(&mut self, trust: &Trust, library: &Library) {
-        let mode = match (&self.id, self.place.path()) {
-            _ if self.made_here => letters_trust::Mode::Trusted,
-            (Some(id), path) => trust::mode(trust, id, path),
-            (None, _) => letters_trust::Mode::Safe,
-        };
-        let links = mode == letters_trust::Mode::Trusted;
+        let links = self.trusted(trust);
         if std::mem::replace(&mut self.maths_links, links) != links {
             self.view.set_maths_links(links);
         }
@@ -807,6 +826,17 @@ impl DocWindow {
             let named = folder.and_then(|folder| Some(folder.file_name()?.to_string_lossy().into_owned()));
             self.view.set_safe_mode((!links).then_some(SafeMode { folder: named }));
         }
+    }
+
+    /// Whether the document is trusted, and not in safe mode. One that has not said which document it is
+    /// is not.
+    fn trusted(&self, trust: &Trust) -> bool {
+        let mode = match (&self.id, self.place.path()) {
+            _ if self.made_here => letters_trust::Mode::Trusted,
+            (Some(id), path) => trust::mode(trust, id, path),
+            (None, _) => letters_trust::Mode::Safe,
+        };
+        mode == letters_trust::Mode::Trusted
     }
 
     /// The folder the document's file is in, as the system spells it, which is how trusted folders are
@@ -1096,7 +1126,7 @@ impl DocWindow {
         // The journal has everything a save is handed, and a new document's before it is given a file.
         self.record();
         let Some(home) = self.settle(true, library, now) else { return };
-        if !self.unsaved() && !self.owes() {
+        if !self.unsaved() && !self.owes() && self.merging.is_empty() {
             // Only the name was due.
             return self.relist(library);
         }
@@ -1107,8 +1137,9 @@ impl DocWindow {
         let (edits, revision) = self.edits_for(&mut copy);
         let (id, proxy, since) = (self.window.id(), proxy.clone(), revision.clone());
         let notes = self.view.notes().clone();
+        let others = self.carry();
         let save = thread::spawn(move || {
-            let result = home.exchange(&mut copy, &edits, notes, &since).map_err(|error| error.to_string());
+            let result = home.exchange(&mut copy, &edits, notes, &since, &others).map_err(|error| error.to_string());
             let _ = proxy.send_event(Event::Saved(id));
             Saving { copy, result }
         });
@@ -1141,11 +1172,132 @@ impl DocWindow {
             Err(error) => {
                 eprintln!("letters: could not save {}: {error}", self.name());
                 self.unheld();
+                match self.copy.take() {
+                    Some(copy) => {
+                        self.catch_up(&copy, &revision);
+                        self.copy = Some(copy);
+                    }
+                    None => drop(self.requeue()),
+                }
                 self.save_failed = true;
                 self.save_at = Some(now + RETRY_AFTER);
             }
         }
         self.retitle();
+    }
+
+    /// The files the save that is starting merges, which are then on their way in.
+    fn carry(&mut self) -> Vec<PathBuf> {
+        self.carried = std::mem::take(&mut self.merging);
+        self.carried.iter().map(|(path, _)| path.clone()).collect()
+    }
+
+    /// After a save that failed with files to merge: the copy may hold them all the same, where no later
+    /// save would find them new. The editor, at `revision`, takes what the copy holds, and the files
+    /// wait for the next save to say how they fared.
+    fn catch_up(&mut self, copy: &WorkingCopy, revision: &Revision) {
+        if !self.requeue() {
+            return;
+        }
+        let news = copy.model().updates_since(revision);
+        let mut met = false;
+        if let Err(error) = self.view.change(|editor| editor.merge(&news).inspect(|change| met = moved(change))) {
+            eprintln!("letters: could not take in what was merged into {}: {error}", self.name());
+        }
+        let mut notes = self.view.notes().clone();
+        if notes.merge(&copy.notes) {
+            self.view.set_notes(notes);
+        }
+        if met {
+            self.rests.merged(Instant::now());
+            let at = self.view.editor().model().revision();
+            self.mark(&at, TagKind::Merge, None);
+        }
+    }
+
+    /// Puts the files a save was to merge back first in line, and says whether there were any.
+    fn requeue(&mut self) -> bool {
+        let carried = std::mem::take(&mut self.carried);
+        let any = !carried.is_empty();
+        self.merging.splice(0..0, carried);
+        any
+    }
+
+    /// Looks beside the document's file for conflict copies of it, on another thread. What is found
+    /// arrives as an event. Nothing is looked for until the file exists and has said which document it is.
+    fn look_for_copies(&self, proxy: &EventLoopProxy<Event>) {
+        let home = self.place.home().filter(|home| self.keeps && home.written());
+        let (Some(id), Some(home)) = (self.id.clone(), home.map(|home| home.path().to_owned())) else { return };
+        let (window, proxy) = (self.window.id(), proxy.clone());
+        thread::spawn(move || {
+            let copies = conflicts::beside(&home, &id);
+            let _ = proxy.send_event(Event::Copies(window, home, copies));
+        });
+    }
+
+    /// Tells the view of the conflict copies found beside the file at `home`: those that hold what the
+    /// document lacks, and are not on their way in already.
+    fn found_copies(&mut self, home: &Path, found: Vec<conflicts::Copy>, library: &Library) {
+        // The document may have been moved since its folder was read.
+        if self.place.path() != Some(home) {
+            return;
+        }
+        let model = self.view.editor().model();
+        let waiting = |path: &Path| self.merging.iter().chain(&self.carried).any(|(other, _)| other == path);
+        let adds = |copy: &conflicts::Copy| copy.adds_to(model) && !waiting(&copy.path);
+        let copies: Vec<PathBuf> = found.into_iter().filter(adds).map(|copy| copy.path).collect();
+        // Told once whatever was found, and then only of a change: a bar the person hid stays hidden.
+        if self.copies.as_ref() != Some(&copies) {
+            self.tell_copies(copies, library);
+        }
+    }
+
+    fn tell_copies(&mut self, copies: Vec<PathBuf>, library: &Library) {
+        self.view.set_conflict_copies(copies.iter().map(|path| merge_file(path, library)).collect());
+        self.copies = Some(copies);
+    }
+
+    /// Whether the person's trust lets a file they picked be merged into the document without a question.
+    /// Only a trusted folder vouches for such a file, and links are followed first, since folders are
+    /// matched by name.
+    fn may_merge(&self, trust: &Trust, file: &Path) -> bool {
+        let real = fs::canonicalize(file).ok();
+        let decision = real.as_deref().and_then(Path::to_str).map(|file| self.gate(trust).merge(file));
+        decision == Some(MergeDecision::Merge)
+    }
+
+    /// Deals with the files a save was to merge: a conflict copy that is in the document goes to the
+    /// trash, and the person reads of each file that is not.
+    fn merged(&mut self, merged: Vec<Merged>, library: &Library) {
+        let carried = std::mem::take(&mut self.carried);
+        let mut refused = Vec::new();
+        for Merged { path, result } in merged {
+            let copy = carried.iter().any(|(carried, copy)| *copy && *carried == path);
+            match result {
+                Ok(()) if copy => {
+                    if let Err(error) = conflicts::discard(&path) {
+                        refused
+                            .push(format!("{} was merged, but could not be moved to the trash: {error}", named(&path)));
+                    }
+                }
+                Ok(()) => {}
+                Err(files::Error::Format(letters_format::Error::Unmerged)) => refused.push(format!(
+                    "{} could not be merged: it is not a copy of this document, or a newer Letters wrote it.",
+                    named(&path)
+                )),
+                Err(error) => refused.push(format!("{} could not be read: {error}", named(&path))),
+            }
+        }
+        if !refused.is_empty() {
+            self.view.refuse_merge(&refused.join("\n"));
+        }
+        // A copy that went is no longer offered, whenever its folder is next looked at.
+        if let Some(copies) = &self.copies {
+            let left: Vec<PathBuf> = copies.iter().filter(|copy| copy.exists()).cloned().collect();
+            if left.len() != copies.len() {
+                self.tell_copies(left, library);
+            }
+        }
     }
 
     /// Says whether comments can be written, now that the copy is back from a read or a save: not on
@@ -1166,7 +1318,9 @@ impl DocWindow {
     /// Notes a save that worked: the document as it was at `edits` and `revision` is in its file, and
     /// `exchange` says where that is and what the file held from other writers.
     fn saved(&mut self, exchange: Exchange, edits: u64, revision: Revision, library: &Library) {
-        let Exchange { home, news, notes, held } = exchange;
+        let Exchange { home, news, notes, held, merged } = exchange;
+        // A merge the person asked for is a version however lately another was marked.
+        let asked = merged.iter().any(|merged| merged.result.is_ok());
         self.place.saved(home);
         self.rehome();
         if let Some(journal) = &mut self.journal {
@@ -1203,10 +1357,11 @@ impl DocWindow {
         }
         // Another writer's words changed the document: where the two met is a version. A mark of theirs
         // alone changes nothing to read, and is not answered with one, or two windows would never rest.
-        if met && self.rests.merged(Instant::now()) {
+        if met && (self.rests.merged(Instant::now()) || asked) {
             let at = self.view.editor().model().revision();
             self.mark(&at, TagKind::Merge, None);
         }
+        self.merged(merged, library);
     }
 
     /// Saves to `home` on this thread, with the copy the window keeps for it.
@@ -1215,10 +1370,12 @@ impl DocWindow {
             journal.saving();
         }
         let (edits, revision) = self.edits_for(copy);
-        match home.exchange(copy, &edits, self.view.notes().clone(), &revision) {
+        let others = self.carry();
+        match home.exchange(copy, &edits, self.view.notes().clone(), &revision, &others) {
             Ok(exchange) => self.saved(exchange, self.view.edits(), revision, library),
             Err(error) => {
                 self.unheld();
+                self.catch_up(copy, &revision);
                 return Err(error.to_string());
             }
         }
@@ -1238,7 +1395,8 @@ impl DocWindow {
         // A copy that could not be read was reported when that failed, and holds nothing back now.
         let Some(mut copy) = self.copy.take() else { return Ok(()) };
         self.record();
-        let home = self.settle(caret, library, now).filter(|_| self.unsaved() || self.owes());
+        let due = |window: &Self| window.unsaved() || window.owes() || !window.merging.is_empty();
+        let home = self.settle(caret, library, now).filter(|_| due(self));
         let saved = home.map(|home| self.exchange(&home, &mut copy, library));
         // A file that was just written is read back, which lets the journal go. A journal that stays is
         // looked at when the app next starts.
@@ -1376,6 +1534,9 @@ impl App {
             imported: None,
             rests: Rests::default(),
             marks: false,
+            copies: None,
+            merging: Vec::new(),
+            carried: Vec::new(),
             awaited: Vec::new(),
             links: Vec::new(),
             linked: BTreeMap::new(),
@@ -1529,6 +1690,8 @@ impl App {
                     }
                 }
                 Request::Print => self.print(id),
+                Request::MergeConflicts { confirmed } => self.merge_conflicts(id, confirmed, now),
+                Request::MergeFrom { path, confirmed } => self.merge_from(id, path.map(PathBuf::from), confirmed, now),
                 // A request this shell does not know yet.
                 _ => {}
             }
@@ -1630,12 +1793,14 @@ impl App {
                 (copies::ending(chosen, format), true)
             }
         };
+        // Only a PDF shows a linked picture, and only one the window has loaded.
+        let linked = if format == CopyFormat::Pdf { window.linked.clone() } else { copies::Linked::new() };
         let proxy = self.proxy.clone();
         self.copies.retain(|copy| !copy.is_finished());
         self.copies.push(thread::spawn(move || {
             let written = match version {
-                Some(version) => copies::write_version(&source, version, &output, format, replace),
-                None => copies::write(&source, &output, format, replace),
+                Some(version) => copies::write_version(&source, version, &output, format, replace, &linked),
+                None => copies::write(&source, &output, format, replace, &linked),
             };
             let _ = proxy.send_event(Event::Copied(id, output, written));
         }));
@@ -1661,11 +1826,14 @@ impl App {
             (Ok(()), Some(file)) => file.to_owned(),
         };
         window.printing = true;
-        let (proxy, title) = (self.proxy.clone(), window.name());
+        // The paper shows the linked pictures the window has loaded, and no other.
+        let (proxy, title, linked) = (self.proxy.clone(), window.name(), window.linked.clone());
         self.copies.retain(|copy| !copy.is_finished());
         self.copies.push(thread::spawn(move || {
             let file = fs::read(&source).map_err(|error| error.to_string());
-            let pdf = file.and_then(|file| convert::exported(file, &title, Format::Pdf)).map(|pdf| pdf.bytes);
+            let mut linked = |address: &str| linked.get(address).cloned();
+            let pdf = file.and_then(|file| convert::exported_with(file, &title, Format::Pdf, &mut linked));
+            let pdf = pdf.map(|pdf| pdf.bytes);
             let _ = proxy.send_event(Event::Pdf(id, pdf));
         }));
     }
@@ -1823,6 +1991,46 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Merges the conflict copies a window was told of with its next save. Every asking is answered: with
+    /// a question, or with the copies still offered.
+    ///
+    /// The press on "Merge conflicts" is enough in a trusted document, as the design has it: the copies
+    /// lie beside the document under a sync tool's name for it and say they are that document, and what
+    /// they bring is held to the document's own trust. Safe mode holds merges back, so there the person
+    /// is asked first.
+    fn merge_conflicts(&mut self, id: WindowId, confirmed: bool, now: Instant) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        let copies = window.copies.clone().unwrap_or_default();
+        if !confirmed && !window.trusted(self.trust.trust()) {
+            let files = copies.iter().map(|copy| merge_file(copy, &self.library)).collect();
+            return window.view.ask_merge(MergeAsk { files, conflicts: true });
+        }
+        window.merging.extend(copies.into_iter().map(|copy| (copy, true)));
+        window.save_at = Some(now);
+        // What is on its way in is not offered again.
+        window.tell_copies(Vec::new(), &self.library);
+    }
+
+    /// Merges a file into a window's document with its next save: the one at `path`, or one the person
+    /// picks. A file no trusted folder vouches for is asked about first, unless that was `confirmed`.
+    fn merge_from(&mut self, id: WindowId, path: Option<PathBuf>, confirmed: bool, now: Instant) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        let path = path.or_else(|| {
+            let dialog = FileDialog::new().add_filter("Letters documents", &[EXTENSION]);
+            dialog.set_directory(window.place.folder(&self.library)).set_parent(&*window.window).pick_file()
+        });
+        let Some(path) = path else { return };
+        if !window.place.home().is_some_and(Home::written) {
+            return window.view.refuse_merge("This document has no file yet, so nothing can be merged into it.");
+        }
+        if !confirmed && !window.may_merge(self.trust.trust(), &path) {
+            let files = vec![merge_file(&path, &self.library)];
+            return window.view.ask_merge(MergeAsk { files, conflicts: false });
+        }
+        window.merging.push((path, false));
+        window.save_at = Some(now);
     }
 
     /// Keeps the host of a linked picture as one whose pictures load from now on.
@@ -2156,6 +2364,8 @@ impl ApplicationHandler<Event> for App {
                 // Another window, or another copy of the app, may have taught the dictionary a word.
                 if focused && window.rest.is_none() {
                     window.reword(&self.words);
+                    // A sync tool may have left a copy of the document while the window was left alone.
+                    window.look_for_copies(&self.proxy);
                 }
                 // The clock may have moved to summer time, or the person to another zone, while the
                 // window was left alone.
@@ -2259,9 +2469,17 @@ impl ApplicationHandler<Event> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         let now = Instant::now();
         match event {
+            Event::Copies(id, home, copies) => {
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.found_copies(&home, copies, &self.library);
+                    window.sync(now);
+                }
+            }
             Event::Saved(id) => {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.finish_save(&self.library, now);
+                    // A sync tool may have left a copy since the folder was last looked at.
+                    window.look_for_copies(&self.proxy);
                     window.ask_again(&mut self.decoder, &self.proxy);
                     // Another writer's edits may have come in with it, in a language of their own.
                     window.ask_dictionaries(&self.proxy, &self.dictionaries);
@@ -2298,6 +2516,7 @@ impl ApplicationHandler<Event> for App {
                 window.ask_again(&mut self.decoder, &self.proxy);
                 // The file has said which document it is, so what the person trusts can be asked about it.
                 window.retrust(self.trust.trust(), &self.library);
+                window.look_for_copies(&self.proxy);
                 let links = std::mem::take(&mut window.links);
                 window.access_stale = true;
                 window.sync(now);

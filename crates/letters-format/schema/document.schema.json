@@ -33,7 +33,7 @@
         "id": { "type": "string", "minLength": 1, "description": "Stable, and unique within the document." },
         "type": {
           "type": "string",
-          "description": "paragraph, heading, list_item, code, formula, quote, callout, divider, caption, figure, gallery, table, table_row or table_cell. A block of any other type is kept as written and drawn from its fallback text."
+          "description": "paragraph, heading, list_item, code, formula, quote, callout, divider, caption, figure, gallery, table, table_row, table_cell, table_of_contents or link_preview. A block of any other type is kept as written and drawn from its fallback text."
         },
         "fallback": { "type": "string", "description": "Plain text a reader shows for a type it does not know." },
         "lang": { "$ref": "#/$defs/lang" },
@@ -167,11 +167,34 @@
         {
           "if": { "properties": { "type": { "const": "table_cell" } } },
           "then": { "$ref": "#/$defs/text", "description": "One cell of a row. A cell outside a row reads as a paragraph." }
+        },
+        {
+          "if": { "properties": { "type": { "const": "table_of_contents" } } },
+          "then": {
+            "description": "A list of the document's headings, made by whatever shows it and never stored. It lists the headings that have text, are no deeper than levels, and come after it. When no heading with text follows it, it lists every such heading but the title, which is the first heading of level 1.",
+            "required": ["levels"],
+            "properties": {
+              "levels": { "type": "integer", "minimum": 1, "maximum": 4, "description": "The deepest heading level it lists." }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "link_preview" } } },
+          "then": {
+            "description": "A link shown as a card. What it shows of the page is kept here, so that showing it loads nothing: one with a url alone has not been fetched. A field that is empty reads as one left out.",
+            "required": ["url"],
+            "properties": {
+              "url": { "type": "string", "pattern": "^[^\\n\\r]+$", "description": "The address the card leads to." },
+              "title": { "type": "string", "pattern": "^[^\\n\\r]*$", "description": "The page's title." },
+              "description": { "type": "string", "description": "A few lines about the page." },
+              "image": { "type": "string", "pattern": "^(assets/[^\\n\\r]*)?$", "description": "The entry of the file that holds the page's picture, such as assets/<sha256>.jpg. Never an address." }
+            }
+          }
         }
       ]
     },
     "known": {
-      "enum": ["paragraph", "heading", "list_item", "code", "formula", "quote", "callout", "divider", "caption", "figure", "gallery", "table", "table_row", "table_cell"],
+      "enum": ["paragraph", "heading", "list_item", "code", "formula", "quote", "callout", "divider", "caption", "figure", "gallery", "table", "table_row", "table_cell", "table_of_contents", "link_preview"],
       "description": "The types this format version defines. A gallery, a table and a row hold only their own parts and types outside this list."
     },
     "text": {

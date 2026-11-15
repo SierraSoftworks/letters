@@ -220,7 +220,16 @@ fn kinds(shape: BodyShape) -> Vec<BlockKind> {
             BlockKind::Table { columns: vec![Align::Center], header: false },
             BlockKind::TableRow,
         ],
-        BodyShape::None => vec![BlockKind::Divider],
+        BodyShape::None => {
+            let (url, title) = ("https://example.com/e".to_owned(), Some("Title é".to_owned()));
+            vec![
+                BlockKind::Divider,
+                BlockKind::TableOfContents { levels: 2 },
+                BlockKind::LinkPreview { url, title, description: None, image: Some("assets/e.jpg".into()) },
+                // No file would hold this one either.
+                BlockKind::TableOfContents { levels: 0 },
+            ]
+        }
     }
 }
 

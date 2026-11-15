@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use letters_math::{Style, typeset};
+use letters_math::{Style, typeset, typeset_mapped};
 use letters_render::{Color, DisplayList, Item, Point};
 
 /// Sources that between them use glyphs, rules, stretched outlines and strokes.
@@ -155,6 +155,7 @@ fn an_error_points_at_the_fault() {
         // Positions count bytes, as the document does.
         (r"é + \foo", r"\foo", r"\foo"),
         (r"\text{наука} \frac{a}", "", "end"),
+        (r"\begin{matrix} a & b \\ c", "", "end"),
     ];
     for (source, fault, word) in cases {
         let Err(error) = typeset(source, &inline(16.0)) else { panic!("{source} was typeset") };
@@ -170,11 +171,23 @@ fn an_error_points_at_the_fault() {
 
 #[test]
 fn an_error_without_a_position_still_says_what_is_wrong() {
-    for source in [r"\begin{nonsense} a \end{nonsense}", r"\begin{matrix} a & b \\ c", "$x$"] {
+    for source in [r"\begin{nonsense} a \end{nonsense}", r"\begin{matrix} a \end{pmatrix}", "$x$"] {
         let Err(error) = typeset(source, &inline(16.0)) else { panic!("{source} was typeset") };
 
         assert!(!error.message.is_empty(), "{source}");
         assert!(error.span.is_none_or(|span| source.get(span).is_some()), "{source}: a position outside the source");
+    }
+}
+
+#[test]
+fn an_error_in_a_macro_of_the_engines_is_not_placed_elsewhere() {
+    // (source, the macro at fault). The engine places each in its macro, at bytes that are also in the source.
+    let cases = [(r"\text{\R}", r"\R"), (r"a + b + c + d + e + f + g + h \text{\iff}", r"\iff")];
+    for (source, fault) in cases {
+        let Err(error) = typeset(source, &inline(16.0)) else { panic!("{source} was typeset") };
+
+        let at = error.span.clone().map(|span| &source[span]);
+        assert!(at.is_none_or(|at| at.contains(fault)), "{source}: {error} at {at:?}");
     }
 }
 
@@ -192,15 +205,14 @@ fn hostile_sources_fail_or_stay_drawable() {
         &nested,
         &roots,
     ];
-    for source in sources {
-        // Either answer is fine. Neither may hang, crash or hand the renderer something it cannot draw.
-        if let Ok(formula) = typeset(source, &display(16.0)) {
-            assert!(formula.size.width.is_finite() && formula.size.height.is_finite() && formula.baseline.is_finite());
-            let mut list = DisplayList::default();
-            formula.paint(Point { x: 4.0, y: 4.0 }, &mut list);
-            let mut frame = letters_render::cpu::Frame::new(64, 64);
-            letters_render::cpu::CpuRenderer::new().render(&list, &Default::default(), 1.0, WHITE, &mut frame);
-        }
+    let set = sources.iter().flat_map(|source| [typeset, typeset_mapped].map(|set| set(source, &display(16.0))));
+    // Either answer is fine. Neither may hang, crash or hand the renderer something it cannot draw.
+    for formula in set.flatten() {
+        assert!(formula.size.width.is_finite() && formula.size.height.is_finite() && formula.baseline.is_finite());
+        let mut list = DisplayList::default();
+        formula.paint(Point { x: 4.0, y: 4.0 }, &mut list);
+        let mut frame = letters_render::cpu::Frame::new(64, 64);
+        letters_render::cpu::CpuRenderer::new().render(&list, &Default::default(), 1.0, WHITE, &mut frame);
     }
 }
 

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 
 use js_sys::{Array, Date, Map, Uint8Array};
-use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with_words};
+use letters_convert::{PdfInfo, PdfSources, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with};
 use letters_format::{ASSETS, Archive, Error, MIMETYPE, OPLOG, Package};
 use letters_layout::{Fonts, Uncovered, WordList};
 use letters_model::{Document, Notes, Style};
@@ -110,7 +110,8 @@ pub fn exported(
                 }
                 held
             };
-            let pdf = to_pdf_with_words(&document, &style, fonts, &mut asset, &info, &mut backups, &mut words)?;
+            let sources = PdfSources { backups: Some(&mut backups), words: Some(&mut words), linked: None };
+            let pdf = to_pdf_with(&document, &style, fonts, &mut asset, &info, sources)?;
             (pdf, "pdf", "application/pdf")
         }
         "docx" => (

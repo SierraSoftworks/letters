@@ -28,7 +28,7 @@ use crate::tex::{self, Part};
 use crate::text::{Family, Shaped, TextShaper, TextStyle};
 use crate::theme::accent;
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::widgets::{Choice, Options, Popover};
+use crate::widgets::{Choice, Options, Popover, options};
 use crate::window::{CARET_WIDTH, Message};
 
 const TEXT: TextStyle = TextStyle::control().family(Family::Mono).size(tokens::TEXT_SM).leading(tokens::LEADING);
@@ -59,14 +59,16 @@ const PICTURE: Size = Size { width: 24.0, height: 22.0 };
 /// What the pointer and the keyboard ask of the sheet.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Sheet {
-    /// A press on the source, at an offset in its block. `extend` keeps the anchor, as Shift does.
+    /// A press on the source, at an offset in its block. `extend` keeps the anchor, as Shift does, and
+    /// `before_wrap` is for a press past the end of a row that goes on with no space: see [`LinePos`].
     Press {
         offset: usize,
+        before_wrap: bool,
         extend: bool,
         clicks: u8,
     },
-    /// The pointer moved over the source with the button held.
-    Drag(usize),
+    /// The pointer moved over the source with the button held, to an offset and its side as for a press.
+    Drag(usize, bool),
     Release,
     /// A symbol of the list was pressed, counted from the first.
     Take(usize),
@@ -81,6 +83,8 @@ struct Row {
     shaped: Shaped,
     /// Whether its line goes on in the next row.
     wrapped: bool,
+    /// Whether it goes on with no space to end at, so that where it ends is where the next row starts.
+    unspaced: bool,
 }
 
 impl Row {
@@ -89,16 +93,18 @@ impl Row {
         self.start + self.shaped.stops.last().map_or(0, |stop| stop.offset)
     }
 
-    /// The last place in the row where the caret is in it. Past the end of a row that goes on, the caret is
-    /// at the start of the next.
-    fn last(&self) -> usize {
+    /// The last place in the row where the caret is in it, and whether that is where the next row starts
+    /// too: see [`LinePos`]. A row that goes on after a space ends before the space.
+    fn last(&self) -> (usize, bool) {
         let end = self.shaped.stops.last().map_or(0, |stop| stop.offset);
-        self.start + if self.wrapped { self.shaped.previous(end) } else { end }
+        let spaced = self.wrapped && !self.unspaced;
+        (self.start + if spaced { self.shaped.previous(end) } else { end }, self.unspaced)
     }
 
-    /// The offset in the block nearest a distance from the row's left edge.
-    fn nearest(&self, x: f32) -> usize {
-        (self.start + self.shaped.offset_at(x)).min(self.last())
+    /// The offset in the block nearest a distance from the row's left edge, with its side of the row's end.
+    fn nearest(&self, x: f32) -> (usize, bool) {
+        let (at, last) = (self.start + self.shaped.offset_at(x), self.last());
+        if at < last.0 { (at, false) } else { last }
     }
 }
 
@@ -153,11 +159,13 @@ impl Source {
             let breaks = breaks(line, &whole, wide);
             let mut from = 0;
             for to in breaks.iter().copied() {
-                rows.push(Row { start: at + from, shaped: shaper.shape(&line[from..to], &TEXT, None), wrapped: true });
+                let (part, start) = (&line[from..to], at + from);
+                let shaped = shaper.shape(part, &TEXT, None);
+                rows.push(Row { start, shaped, wrapped: true, unspaced: !part.ends_with(' ') });
                 from = to;
             }
             let rest = if from == 0 { whole } else { shaper.shape(&line[from..], &TEXT, None) };
-            rows.push(Row { start: at + from, shaped: rest, wrapped: false });
+            rows.push(Row { start: at + from, shaped: rest, wrapped: false, unspaced: false });
             at += line.len() + 1;
         }
         Self { block, range: start..start + text.len(), text: text.to_owned(), display, composing: None, rows }
@@ -214,28 +222,34 @@ impl Source {
         pos.block == self.block && (self.range.start..=self.range.end).contains(&pos.offset)
     }
 
-    /// The row an offset in the block is on.
-    fn row(&self, offset: usize) -> usize {
-        self.rows.iter().rposition(|row| row.start <= offset).unwrap_or(0)
+    /// The row an offset in the block is on. Where a row goes on with no space, its end is the start of
+    /// the next row, unless `before_wrap` says the row that ends there is meant.
+    fn row(&self, offset: usize, before_wrap: bool) -> usize {
+        let at = self.rows.iter().rposition(|row| row.start <= offset).unwrap_or(0);
+        let ends = |before: &usize| before_wrap && self.rows[*before].unspaced && self.rows[at].start == offset;
+        at.checked_sub(1).filter(ends).unwrap_or(at)
     }
 
-    /// Where the caret is drawn for an offset in the block, from the top left of the source.
-    pub fn caret(&self, offset: usize) -> Rect {
-        let at = self.row(offset);
+    /// Where the caret is drawn for an offset in the block, from the top left of the source: with
+    /// `before_wrap`, at the end of a row that goes on there with no space.
+    pub fn caret(&self, offset: usize, before_wrap: bool) -> Rect {
+        let at = self.row(offset, before_wrap);
         let row = &self.rows[at];
         let (x, height) = (row.shaped.x_at(offset.saturating_sub(row.start)), Self::line_height());
         Rect::new(x, at as f32 * height, CARET_WIDTH, height)
     }
 
-    /// The offset in the block nearest a point of the source.
-    pub fn hit(&self, at: Point) -> usize {
+    /// The offset in the block nearest a point of the source, and whether that is the end of a row that goes
+    /// on with no space, as a point past such a row's end is.
+    pub fn hit(&self, at: Point) -> (usize, bool) {
         let row = (at.y / Self::line_height()).floor().max(0.0) as usize;
         self.rows[row.min(self.rows.len() - 1)].nearest(at.x)
     }
 
-    /// The offset one row up or down from `offset`, nearest to `x`. `None` past the first and last row.
-    fn step(&self, offset: usize, x: f32, down: bool) -> Option<usize> {
-        let row = self.row(offset);
+    /// The offset one row up or down from `offset`, nearest to `x`, with its side. `None` past the first and
+    /// last row.
+    fn step(&self, offset: usize, before_wrap: bool, x: f32, down: bool) -> Option<(usize, bool)> {
+        let row = self.row(offset, before_wrap);
         Some(self.rows.get(if down { row + 1 } else { row.checked_sub(1)? })?.nearest(x))
     }
 
@@ -263,7 +277,7 @@ impl Source {
             let x = |offset: usize| row.shaped.x_at(offset.saturating_sub(row.start));
             (from < to).then(|| Rect::new(x(from), at as f32 * height, x(to) - x(from), height))
         };
-        (self.row(range.start)..=self.row(range.end)).filter_map(span).collect()
+        (self.row(range.start, false)..=self.row(range.end, false)).filter_map(span).collect()
     }
 }
 
@@ -307,16 +321,16 @@ impl<L> SheetLines<L> {
 impl<L: Lines> Lines for SheetLines<L> {
     fn caret_x(&self, at: &LinePos) -> Option<f32> {
         match self.on_sheet(&at.pos) {
-            Some(source) => Some(self.left + source.caret(at.pos.offset).x),
+            Some(source) => Some(self.left + source.caret(at.pos.offset, at.before_wrap).x),
             None => self.page.caret_x(at),
         }
     }
 
     fn line_step(&self, at: &LinePos, x: f32, down: bool) -> Option<LinePos> {
         let pos = &at.pos;
-        let within = self.on_sheet(pos).and_then(|source| source.step(pos.offset, x - self.left, down));
-        match within {
-            Some(offset) => Some(Pos::new(pos.block.clone(), offset).into()),
+        let source = self.on_sheet(pos);
+        match source.and_then(|source| source.step(pos.offset, at.before_wrap, x - self.left, down)) {
+            Some((offset, before_wrap)) => Some(LinePos { pos: Pos::new(pos.block.clone(), offset), before_wrap }),
             None => self.page.line_step(at, x, down),
         }
     }
@@ -325,8 +339,9 @@ impl<L: Lines> Lines for SheetLines<L> {
         let pos = &at.pos;
         match self.on_sheet(pos) {
             Some(source) => {
-                let row = &source.rows[source.row(pos.offset)];
-                Some(Pos::new(pos.block.clone(), if end { row.last() } else { row.start }).into())
+                let row = &source.rows[source.row(pos.offset, at.before_wrap)];
+                let (offset, before_wrap) = if end { row.last() } else { (row.start, false) };
+                Some(LinePos { pos: Pos::new(pos.block.clone(), offset), before_wrap })
             }
             None => self.page.line_edge(at, end),
         }
@@ -536,7 +551,7 @@ impl Maths {
     pub fn sheet(
         &self,
         source: Source,
-        selection: &Selection,
+        (selection, before_wrap): (&Selection, bool),
         formula: f32,
         wide: f32,
         scheme: Scheme,
@@ -553,7 +568,7 @@ impl Maths {
             (None, None) => 0.0,
         };
         let (size, width) = (source.size(), Self::width(&source, formula, wide).max(least));
-        let caret = source.caret(selection.head.offset);
+        let caret = source.caret(selection.head.offset, before_wrap);
         // The sheet comes out from under the formula, its last row first.
         let shift = (1.0 - self.slid) * size.height;
         let (start, end) =
@@ -569,12 +584,16 @@ impl Maths {
         let selected = source.spans(&(start..end));
         let paint = SourcePaint { source: source.clone(), selected, inks, lined, composing, shift };
         let pointed = move |event: Pointer| {
-            let offset = |at: Point| source.hit(Point { x: at.x, y: at.y + shift });
+            let hit = |at: Point| source.hit(Point { x: at.x, y: at.y + shift });
             match event {
                 Pointer::Down { at, mods, clicks } => {
-                    Some(Sheet::Press { offset: offset(at), extend: mods.shift, clicks })
+                    let (offset, before_wrap) = hit(at);
+                    Some(Sheet::Press { offset, before_wrap, extend: mods.shift, clicks })
                 }
-                Pointer::Drag { at } => Some(Sheet::Drag(offset(at))),
+                Pointer::Drag { at } => {
+                    let (offset, before_wrap) = hit(at);
+                    Some(Sheet::Drag(offset, before_wrap))
+                }
                 Pointer::Up { .. } => Some(Sheet::Release),
                 // The wheel is the page's, and so is a menu.
                 Pointer::Menu { .. } | Pointer::Scroll { .. } => None,
@@ -599,7 +618,8 @@ impl Maths {
             sheet = sheet.child(said.role(Role::Status));
         }
         if let Some((_, symbols)) = &symbols {
-            sheet = sheet.child(self.list(symbols, scheme)).child(hint());
+            let hint = options::hint("Matches commands and plain names", &["Tab", "Esc"]);
+            sheet = sheet.child(self.list(symbols, scheme)).child(hint);
         }
         Popover::new(sheet)
             .flush()
@@ -647,26 +667,6 @@ impl Maths {
         }
         options.into()
     }
-}
-
-/// The line under the list that says what it matches, and the keys that take a symbol or put the list away.
-fn hint() -> Element<Message> {
-    let quiet = TextStyle::control().size(tokens::TEXT_XS);
-    let key = |name: &str| {
-        Element::row()
-            .padding(Edges::xy(5.0, 1.0))
-            .radius(tokens::RADIUS_SM)
-            .bg(tokens::NEUTRAL_SOFT)
-            .child(Element::text(name, quiet).fg(tokens::FG_MUTED))
-    };
-    Element::row()
-        .align(Align::Center)
-        .gap(tokens::SPACE_XS)
-        .padding(Edges::xy(tokens::SPACE_XS, 0.0))
-        .child(Element::text("Matches commands and plain names", quiet).fg(tokens::FG_MUTED))
-        .child(Element::row().grow(1.0).min_width(tokens::SPACE_SM))
-        .child(key("Tab"))
-        .child(key("Esc"))
 }
 
 /// A symbol as its row of the list shows it, in the middle of the room it has.
@@ -767,11 +767,11 @@ mod tests {
     fn a_point_of_the_source_and_the_caret_there_agree() {
         let source = source();
         for offset in [10, 12, 15, 16, 19, 20, 24] {
-            let caret = source.caret(offset);
+            let caret = source.caret(offset, false);
             let middle = Point { x: caret.x, y: caret.y + caret.height / 2.0 };
-            assert_eq!(source.hit(middle), offset, "{caret:?}");
+            assert_eq!(source.hit(middle), (offset, false), "{caret:?}");
         }
-        assert_eq!(source.hit(Point { x: 500.0, y: 500.0 }), 24, "a point past the source is its end");
+        assert_eq!(source.hit(Point { x: 500.0, y: 500.0 }), (24, false), "a point past the source is its end");
     }
 
     #[test]
@@ -839,9 +839,38 @@ mod tests {
         assert_eq!(lines.line_step(&at(2), x, true), Some(at(10)), "down keeps the column");
         assert_eq!(lines.line_step(&at(10), x, false), Some(at(2)), "and so does up");
         let source = lines.source.as_ref().expect("a source");
-        assert_eq!(source.hit(Point { x: 500.0, y: 1.0 }), 17, "a point past the first row is at its end");
-        let second = source.caret(18);
+        assert_eq!(source.hit(Point { x: 500.0, y: 1.0 }), (17, false), "a point past the first row is at its end");
+        let second = source.caret(18, false);
         assert_eq!((second.x, second.y), (0.0, Source::line_height()), "where it breaks is the start of the next");
+    }
+
+    #[test]
+    fn a_row_that_goes_on_with_no_space_ends_after_its_last_character() {
+        // Twenty characters in rows of eight: one place is the end of a row and the start of the next.
+        let lines = SheetLines { page: Page, source: Some(rows("abcdefghijklmnopqrst", eight())), left: 0.0 };
+        let at = |offset: usize, before_wrap: bool| LinePos { pos: Pos::new("f", 10 + offset), before_wrap };
+        // Where the caret is, and where Home and End take it.
+        let cases = [
+            (at(3, false), at(0, false), at(8, true)),
+            (at(8, true), at(0, false), at(8, true)),
+            (at(8, false), at(8, false), at(16, true)),
+            (at(18, false), at(16, false), at(20, false)),
+        ];
+        for (from, start, end) in cases {
+            assert_eq!(lines.line_edge(&from, false), Some(start), "home from {from:?}");
+            assert_eq!(lines.line_edge(&from, true), Some(end), "end from {from:?}");
+        }
+        let source = lines.source.as_ref().expect("a source");
+        let (first, second) = (source.caret(18, true), source.caret(18, false));
+        assert_eq!((first.y, second.y, second.x), (0.0, Source::line_height(), 0.0), "the two sides of the wrap");
+        assert!(first.x > second.x, "the end of the first row is at its right");
+        assert_eq!(source.hit(Point { x: 500.0, y: 1.0 }), (18, true), "a point past the first row is at its end");
+        // Down from the end of a row is the end of the next, and Up is the way back.
+        let x = lines.caret_x(&at(8, true)).expect("a column");
+        assert_eq!(lines.line_step(&at(8, true), x, true), Some(at(16, true)));
+        assert_eq!(lines.line_step(&at(16, true), x, false), Some(at(8, true)));
+        let x = lines.caret_x(&at(8, false)).expect("a column");
+        assert_eq!(lines.line_step(&at(8, false), x, true), Some(at(16, false)), "from the start of a row");
     }
 
     #[test]

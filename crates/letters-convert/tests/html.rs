@@ -594,3 +594,129 @@ fn a_callout_is_headed_by_its_title_and_keeps_what_was_chosen_for_it() {
         assert_eq!(callout.body.blocks()[0].plain_text(), "Inside", "{kind:?}");
     }
 }
+
+#[test]
+fn a_page_says_the_language_of_a_passage_and_where_a_page_starts() {
+    let mut doc = document(
+        "# Rates\n\nBonjour à tous.\n\n- Guten Tag\n- Second\n\n> Quoted\n\n| A | B |\n| - | - |\n| uno | two |\n\n## Later\n",
+    );
+    let said = |block: &mut Block, lang: &str| block.lang = Some(lang.into());
+    said(&mut doc.blocks[1], "fr");
+    said(&mut doc.blocks[2], "de");
+    said(&mut doc.blocks[4], "la");
+    let Body::Blocks(rows) = &mut doc.blocks[5].body else { panic!("a table holds rows") };
+    let Body::Blocks(cells) = &mut rows[1].body else { panic!("a row holds cells") };
+    said(&mut cells[0], "es");
+    let last = doc.blocks.len() - 1;
+    doc.blocks[last].page_break = true;
+    doc.blocks[last].body =
+        Body::Text(vec![Run::plain("Later, "), Run { lang: Some("it".into()), ..Run::plain("ciao") }]);
+
+    let html = export(&doc);
+    let article = article(&html);
+    for element in [
+        "<p lang=\"fr\">Bonjour",
+        "<li lang=\"de\">Guten Tag",
+        "<li>Second",
+        "<blockquote lang=\"la\">",
+        "<td lang=\"es\">uno",
+        "<td>two",
+        "<span lang=\"it\">ciao</span>",
+        "<h2 data-page-break>Later",
+    ] {
+        assert!(article.contains(element), "{element} in {article}");
+    }
+    assert!(article.starts_with("<h1>Rates</h1>"), "a block that says neither is written as ever: {article}");
+    assert!(rule(stylesheet(&html), "[data-page-break]").contains("break-before: page"), "a printed page breaks there");
+    assert!(nests(&article), "{article}");
+}
+
+#[test]
+fn a_table_of_contents_leads_to_the_headings_it_lists() {
+    let heading = |id: &str, level: u8, text: &str| Block::text(id, BlockKind::Heading { level }, text);
+    let blocks = vec![
+        heading("title", 1, "Rates"),
+        Block::new("toc", BlockKind::TableOfContents { levels: 2 }),
+        heading("a b", 2, "Rates & charges"),
+        heading("deep", 3, "Too deep to list"),
+        heading("c", 2, "Appeals"),
+    ];
+    let html = export(&Document { blocks, ..Document::default() });
+    let article = article(&html);
+    let (_, rest) = article.split_once("<nav").expect("the table is written");
+    let (table, after) = rest.split_once("</nav>").expect("the table ends");
+    assert_eq!(table.matches("<a href=").count(), 2, "a line for each heading it lists: {table}");
+    assert!(table.contains("href=\"#a%20b\">Rates &amp; charges</a>") && table.contains("href=\"#c\">Appeals</a>"));
+    // Each line leads to a heading that is there, and only those carry an id.
+    assert!(after.contains("<h2 id=\"a b\">") && after.contains("<h2 id=\"c\">Appeals"), "{after}");
+    assert!(after.contains("<h3>Too deep to list") && article.starts_with("<h1>Rates"), "{article}");
+    assert!(nests(&article), "{article}");
+
+    // With no heading to list it is left out, and a copy has no page to lead into.
+    let alone = vec![heading("title", 1, "Rates"), Block::new("toc", BlockKind::TableOfContents { levels: 2 })];
+    assert!(!export(&Document { blocks: alone.clone(), ..Document::default() }).contains("<nav"));
+    assert!(!to_html_fragment(&alone).contains("nav"));
+}
+
+#[test]
+fn a_link_preview_is_a_card_that_leads_to_its_page() {
+    let card = |url: &str, title: Option<&str>, description: Option<&str>, image: Option<&str>| {
+        let (url, own) = (url.to_owned(), |text: Option<&str>| text.map(String::from));
+        let kind = BlockKind::LinkPreview { url, title: own(title), description: own(description), image: own(image) };
+        Document { blocks: vec![Block::new("card", kind)], ..Document::default() }
+    };
+    let page = |doc: &Document| {
+        let html = to_html(doc, &Style::default(), "Report", &mut |name| {
+            (name == "assets/a.png").then(|| vec![0x89, b'P', b'N', b'G'])
+        });
+        article(&html)
+    };
+
+    let whole = page(&card(
+        "https://example.com/rates?a=1&b=2",
+        Some("Rates <2027>"),
+        Some("What changes."),
+        Some("assets/a.png"),
+    ));
+    for part in [
+        "<a class=\"preview\" href=\"https://example.com/rates?a=1&amp;b=2\">",
+        "<img src=\"data:image/png;base64,",
+        "Rates &lt;2027&gt;",
+        "What changes.",
+        "example.com",
+    ] {
+        assert!(whole.contains(part), "{part} in {whole}");
+    }
+    assert!(nests(&whole), "{whole}");
+
+    // One that was never fetched shows where it leads, and a picture the file lacks leaves no hole.
+    let bare = page(&card("https://example.com/rates", None, None, Some("assets/gone.png")));
+    assert!(
+        bare.contains("href=\"https://example.com/rates\"") && bare.contains(">https://example.com/rates<"),
+        "{bare}"
+    );
+    assert!(!bare.contains("<img"), "{bare}");
+
+    // An address that would run script leads nowhere.
+    let trap = page(&card("javascript:alert(1)", Some("Rates"), None, None));
+    assert!(!trap.contains("href") && trap.contains("Rates"), "{trap}");
+
+    // A copy offers the link under its title.
+    let copied = to_html_fragment(&card("https://example.com/rates", Some("Rates"), None, None).blocks);
+    assert_eq!(copied.trim(), "<p><a href=\"https://example.com/rates\">Rates</a></p>");
+}
+
+#[test]
+fn text_that_reads_from_the_right_is_set_from_the_right() {
+    let html = export(&document("שלום עולם\n"));
+    let css = stylesheet(&html);
+    let text =
+        css.split('}').find(|rule| rule.contains("unicode-bidi")).expect("the page says how text takes its side");
+    for element in ["p", "td", "h1", "figcaption"] {
+        assert!(
+            text.split('{').next().unwrap().split(',').any(|selector| selector.trim() == element),
+            "{element}: {text}"
+        );
+    }
+    assert!(text.contains("plaintext"), "by its own first letter: {text}");
+}

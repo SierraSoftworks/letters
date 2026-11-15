@@ -182,6 +182,7 @@ fn curves() -> Formula {
         size: Size { width: 50.0, height: 20.0 },
         baseline: 10.0,
         items: vec![shape(10.0, &circle), shape(38.0, &lens)],
+        parts: Vec::new(),
     }
 }
 

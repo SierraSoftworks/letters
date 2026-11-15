@@ -77,6 +77,9 @@ const CALLOUTS: [(Tone, &str, &str); 4] = [
     (Tone::Danger, "CalloutDanger", "Callout Danger"),
 ];
 
+/// What the style of the line that heads a callout adds to its tone's style, in id and in name.
+const CALLOUT_TITLE: (&str, &str) = ("Title", " Title");
+
 /// The paragraph style of a divider, by id and name.
 const DIVIDER: (&str, &str) = ("Divider", "Divider");
 /// The paragraph style list items take, which sets them closer together than paragraphs.
@@ -90,9 +93,19 @@ const HEAD_CELL: (&str, &str) = ("TableHeading", "Table Heading");
 /// The paragraph style of the empty paragraph after a table. Word joins two tables that touch, and sets a
 /// table against the text under it.
 const TABLE_SPACE: (&str, &str) = ("TableSpace", "Table Space");
+/// The paragraph style of the empty paragraph between two boxes of one kind, as two quotes are. Word draws
+/// neighbours that are framed alike as one.
+const BOX_SPACE: (&str, &str) = ("BoxSpace", "Box Space");
 /// What Word counts figures under, and what opens the name of the bookmark around a figure's label.
 const SEQUENCE: &str = "Figure";
 const BOOKMARK: &str = "_RefFigure";
+/// The paragraph styles of the lines of a table of contents, one for each level it lists. They are Word's
+/// own, which it sets the lines it makes in.
+const CONTENTS: [(&str, &str); 4] = [("TOC1", "toc 1"), ("TOC2", "toc 2"), ("TOC3", "toc 3"), ("TOC4", "toc 4")];
+/// What opens the name of the bookmark at a heading that a table of contents lists.
+const HEADING_MARK: &str = "_Toc";
+/// The paragraph style of what a link's preview shows.
+const PREVIEW: (&str, &str) = ("LinkPreview", "Link Preview");
 /// The character style of code inside a line.
 const INLINE_CODE: (&str, &str) = ("InlineCode", "Inline Code");
 /// The character style of a link.

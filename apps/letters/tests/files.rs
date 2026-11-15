@@ -137,7 +137,7 @@ fn two_writers_of_one_file_both_keep_their_edits() {
     ben.write(&paragraphs(&["One", "Two, says Ben"]));
     let seen = ben.model.revision();
     let Exchange { home, news, held, .. } =
-        bens.exchange(&mut ben.copy, &ben.model.save(), Notes::default(), &seen).unwrap();
+        bens.exchange(&mut ben.copy, &ben.model.save(), Notes::default(), &seen, &[]).unwrap();
     ben.model.merge(&news.expect("the file held her edit")).unwrap();
     assert!(!held, "the file had to be written");
 
@@ -148,7 +148,8 @@ fn two_writers_of_one_file_both_keep_their_edits() {
 
     // A save with nothing new on either side has nothing to hand back, and finds it all in the file.
     let seen = ben.model.revision();
-    let again = home.exchange(&mut ben.copy, &ben.model.updates_since(&seen), Notes::default(), &seen).unwrap();
+    let edits = ben.model.updates_since(&seen);
+    let again = home.exchange(&mut ben.copy, &edits, Notes::default(), &seen, &[]).unwrap();
     assert!(again.news.is_none() && again.held);
 }
 
@@ -167,11 +168,11 @@ fn comments_are_saved_as_the_editor_holds_them_and_meet_those_of_other_writers()
 
     // A save hands over the editor's notes, and hears nothing back when the file had no others.
     let (edits, notes) = hand(&ada, "ada");
-    let saved = adas.exchange(&mut ada.copy, &edits, notes, &ada.model.revision()).unwrap();
+    let saved = adas.exchange(&mut ada.copy, &edits, notes, &ada.model.revision(), &[]).unwrap();
     assert_eq!(saved.notes, None);
     // One that meets another writer's comment in the file is handed it, and the file keeps both.
     let (edits, notes) = hand(&ben, "ben");
-    let saved = bens.exchange(&mut ben.copy, &edits, notes, &ben.model.revision()).unwrap();
+    let saved = bens.exchange(&mut ben.copy, &edits, notes, &ben.model.revision(), &[]).unwrap();
     assert_eq!(saved.notes.as_ref().map(comments), Some(vec!["ada", "ben"]));
     assert_eq!(comments(&Writer::of(open(&path).unwrap()).0.copy.notes), ["ada", "ben"]);
 }

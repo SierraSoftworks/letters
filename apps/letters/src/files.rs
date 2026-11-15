@@ -141,21 +141,27 @@ impl Home {
 
     /// One save from an editor: takes its `edits` and its `notes` as they stand into `copy`, writes the
     /// file, and says what the file held that the editor, at `revision`, has not seen.
+    ///
+    /// The files at `others` are merged into the document on the way: conflict copies, or a file the
+    /// person picked. They are only read, and one that cannot be merged does not hold the save back.
     pub fn exchange(
         &self,
         copy: &mut WorkingCopy,
         edits: &[u8],
         notes: Notes,
         revision: &Revision,
+        others: &[PathBuf],
     ) -> Result<Exchange, Error> {
         copy.edit(edits)?;
         // The editor's notes have followed its text and say what was resolved, so they stand for the copy's.
         let ours = (copy.model().revision(), notes.clone());
         copy.notes = notes;
+        // Merged after the editor's own words are in, so that what clashes with them is found and noted.
+        let merged = others.iter().map(|path| Merged { path: path.clone(), result: merge(copy, path) }).collect();
         let (home, saved) = self.save(copy)?;
         let news = (copy.model().revision() != ours.0).then(|| copy.model().updates_since(revision));
         let notes = (copy.notes != ours.1).then(|| copy.notes.clone());
-        Ok(Exchange { home, news, notes, held: matches!(saved, Saved::Unchanged) })
+        Ok(Exchange { home, news, notes, held: matches!(saved, Saved::Unchanged), merged })
     }
 
     /// Moves the document's file to `to` and returns its home there. Whatever `to` holds is never replaced:
@@ -183,6 +189,21 @@ pub struct Exchange {
     /// Whether the file was read and found to hold everything, so that nothing was written. Only this
     /// tells a journal that its records are in the file.
     pub held: bool,
+    /// How each file that was to be merged fared, in the order asked.
+    pub merged: Vec<Merged>,
+}
+
+/// A file that was to be merged into a document, and whether it was. The file is as it was either way.
+#[derive(Debug)]
+pub struct Merged {
+    pub path: PathBuf,
+    pub result: Result<(), Error>,
+}
+
+/// Merges the document in the file at `path` into `copy`.
+fn merge(copy: &mut WorkingCopy, path: &Path) -> Result<(), Error> {
+    let mut archive = Archive::open(BufReader::new(fs::File::open(path)?))?;
+    copy.merge_from(&mut archive).map(drop).map_err(Error::from)
 }
 
 /// Moves a file to a path that must be free. A file already at `to` is never replaced, as a plain rename

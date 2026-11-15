@@ -30,5 +30,11 @@
     "json": { "format": 1, "blocks": [{ "id": "a", "type": "paragraph", "content": [{ "text": "Figure 2", "ref": "gone" }] }] } },
   { "why": "a row may stand outside a table, a cell outside a row, and a caption or figure anywhere",
     "json": { "format": 1, "blocks": [{ "id": "r", "type": "table_row", "blocks": [{ "id": "a", "type": "table_cell" }] }, { "id": "b", "type": "table_cell" },
-      { "id": "q", "type": "quote", "blocks": [{ "id": "c", "type": "caption" }, { "id": "d", "type": "table_row" }, { "id": "e", "type": "figure", "src": "https://example.com/a.png", "width": 2, "height": 2 }] }] } }
+      { "id": "q", "type": "quote", "blocks": [{ "id": "c", "type": "caption" }, { "id": "d", "type": "table_row" }, { "id": "e", "type": "figure", "src": "https://example.com/a.png", "width": 2, "height": 2 }] }] } },
+  { "why": "a link preview may hold its address alone, and a field that is empty reads as one left out",
+    "json": { "format": 1, "blocks": [{ "id": "a", "type": "link_preview", "url": "https://example.com/" },
+      { "id": "b", "type": "link_preview", "title": "", "image": "", "description": "Two\nlines", "url": "mailto:ask@example.com" }] } },
+  { "why": "a table of contents may stand anywhere a block may, and many may stand in one document",
+    "json": { "format": 1, "blocks": [{ "id": "a", "type": "table_of_contents", "levels": 1 },
+      { "id": "q", "type": "quote", "blocks": [{ "id": "b", "type": "table_of_contents", "levels": 4 }] }] } }
 ]

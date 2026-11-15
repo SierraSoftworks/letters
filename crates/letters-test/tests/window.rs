@@ -230,6 +230,84 @@ fn a_click_on_the_page_moves_the_caret_there() {
     assert_eq!(block_text(&window, "h1").len(), "Roof repairs!".len());
 }
 
+/// What a paragraph is made of whose lines wrap with no space to wrap at: inside a long word, and after a
+/// hyphen. There one place in the text is the end of a line and the start of the next.
+const UNSPACED: [(&str, &str); 2] = [("a long word", "abcdefghij"), ("hyphens", "well-known-")];
+
+/// A paragraph `p1` of one of [`UNSPACED`], with the caret at its start. Returns where the caret shows
+/// there, where it shows at the end of the first line, and the place in the text that end is.
+fn unspaced(part: &str) -> (Harness, Rect, Rect, Pos) {
+    let blocks = vec![text("p1", BlockKind::Paragraph, &part.repeat(40))];
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    let start = spot(&mut window, "p1", 0);
+    window.key("End");
+    let (end, wrap) = (caret(&mut window), head(&window));
+    window.key("Home");
+    (window, start, end, wrap)
+}
+
+#[test]
+fn the_caret_stands_at_the_end_of_a_line_that_wraps_with_no_space() {
+    for (name, part) in UNSPACED {
+        let (mut window, start, end, wrap) = unspaced(part);
+        assert_eq!(caret(&mut window), start, "{name}: Home is back at the start of the line");
+        assert!(end.y == start.y && end.x > start.x + 200.0, "{name}: End is on the same line: {start:?} {end:?}");
+        // That place is after the line's last character: the one before it is on the line, and by its
+        // offset alone the place is the start of the next line.
+        let last = spot(&mut window, "p1", wrap.offset - 1);
+        let next = spot(&mut window, "p1", wrap.offset);
+        assert!(last.y == start.y && last.x < end.x, "{name}: {last:?} is before the end, {end:?}");
+        assert!(next.y > start.y && next.x < end.x, "{name}: {next:?} starts the next line");
+
+        spot(&mut window, "p1", 0);
+        window.key("End").key("End");
+        assert_eq!((caret(&mut window), head(&window)), (end, wrap.clone()), "{name}: End twice stays put");
+        assert_eq!(window.ui().selection_ends()[1], Some(end), "{name}: a handle is drawn where the caret is");
+        // The line under it is reached at its own end, and the way back is the same.
+        window.key("Down");
+        let under = caret(&mut window);
+        assert!(under.y > end.y && (under.x - end.x).abs() < 16.0, "{name}: {under:?} is under {end:?}");
+        window.key("Up");
+        assert_eq!(caret(&mut window), end, "{name}: Up comes back to the end of the line");
+        // The menu that the keyboard asks for opens at the caret and leaves it there.
+        window.menu_key().key("Escape");
+        assert_eq!((caret(&mut window), head(&window)), (end, wrap.clone()), "{name}: the menu left the caret");
+        // What is typed there goes after the line's last character.
+        window.type_text("X");
+        assert_eq!(&block_text(&window, "p1")[wrap.offset..=wrap.offset], "X", "{name}");
+    }
+}
+
+#[test]
+fn a_press_past_the_end_of_a_line_that_wraps_with_no_space_puts_the_caret_at_its_end() {
+    for (name, part) in UNSPACED {
+        let (mut window, start, end, wrap) = unspaced(part);
+        let past = Point { x: end.x + 40.0, y: end.y + end.height / 2.0 };
+        // The press alone puts it there, and letting go leaves it.
+        window.press_at(past);
+        assert_eq!((caret(&mut window), head(&window)), (end, wrap.clone()), "{name}: a press past the end");
+        window.release_at(past);
+        assert_eq!((caret(&mut window), head(&window)), (end, wrap.clone()), "{name}: let go past the end");
+        // A press at the start of the line under it is at the same place in the text, and shows there.
+        let next = spot(&mut window, "p1", wrap.offset);
+        // Each press comes too late to count with the one before it.
+        window.advance(1000).click_at(past).click_at(Point { x: next.x - 2.0, y: next.y + next.height / 2.0 });
+        assert_eq!((caret(&mut window), head(&window)), (next, wrap.clone()), "{name}: a press on the next line");
+        // A second press there selects a word of that line, not the word the next line starts with.
+        window.advance(1000).click_at(past).click_at(past);
+        let [from, to] = window.ui().selection_ends();
+        assert!(!selected(&window).is_empty() && from.map(|from| from.y) == Some(end.y), "{name}: {from:?} {to:?}");
+        // So does a finger held there.
+        let picked = selected(&window);
+        window.advance(1000).click_at(Point { x: next.x - 2.0, y: next.y + next.height / 2.0 });
+        assert!(window.long_press_at(past) && selected(&window) == picked, "{name}: held, {:?}", selected(&window));
+        // A drag along the line to past its end selects the line, and ends where the line does.
+        window.advance(1000).press_at(Point { x: start.x, y: start.y + start.height / 2.0 }).release_at(past);
+        assert_eq!(selected(&window), part.repeat(40)[..wrap.offset], "{name}: the line is selected");
+        assert_eq!(window.ui().selection_ends()[1], Some(end), "{name}: the selection ends at the line's end");
+    }
+}
+
 #[test]
 fn the_bar_names_the_document_its_save_state_and_the_type_at_the_caret() {
     let mut window = letter();
@@ -2007,6 +2085,48 @@ fn a_press_on_the_sheet_puts_the_caret_there_in_the_source() {
     window.type_text("y");
     assert_eq!(source(&mut window).as_deref(), Some("y"));
     assert_eq!(block_text(&window, "p1"), "A rafter has length y");
+}
+
+#[test]
+fn the_caret_stands_at_the_end_of_a_row_of_source_that_goes_on_with_no_space() {
+    // A source with no space in it, too long for one row of its sheet. A word ends wherever a row does.
+    let long = "x+".repeat(150);
+    let blocks = vec![text("f1", BlockKind::Formula, &long), text("p2", BlockKind::Paragraph, "After.")];
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.ui().set_reduced_motion(true);
+    let start = spot(&mut window, "f1", 0);
+    window.key("End");
+    let (end, wrap) = (caret(&mut window), head(&window));
+    assert!(wrap.offset > 0 && wrap.offset < long.len(), "the source is in rows: {wrap:?}");
+    assert!(end.y == start.y && end.x > start.x + 100.0, "End is on the same row: {start:?} {end:?}");
+    window.key("End");
+    assert_eq!((caret(&mut window), head(&window)), (end, wrap.clone()), "End twice stays put");
+    window.key("Home");
+    assert_eq!(caret(&mut window), start, "Home is back at the start of the row");
+    // By its offset alone the place is the start of the next row.
+    let next = spot(&mut window, "f1", wrap.offset);
+    assert!(next.y > start.y && next.x == start.x, "{next:?} starts the next row");
+
+    // A press past the end of the row puts the caret at that end, and letting go leaves it there.
+    let source = sheet(&mut window).expect("a sheet").bounds;
+    let past = Point { x: source.x + source.width - 1.0, y: end.y + end.height / 2.0 };
+    window.press_at(past);
+    assert_eq!((caret(&mut window), head(&window)), (end, wrap.clone()), "a press past the end");
+    window.release_at(past);
+    assert_eq!((caret(&mut window), head(&window)), (end, wrap.clone()), "let go past the end");
+    // A second press selects in that row, not what the next row starts with.
+    window.click_at(past);
+    let selection = window.editor().selection().expect("a selection").clone();
+    assert!(!selection.is_caret() && selection.anchor.offset.min(selection.head.offset) < wrap.offset, "{selection:?}");
+    // A drag along the row to past its end selects the row, and the caret is where the row ends.
+    window.advance(1000).press_at(Point { x: start.x, y: start.y + start.height / 2.0 }).release_at(past);
+    assert_eq!((selected(&window), caret(&mut window)), (long[..wrap.offset].to_owned(), end));
+    // A drag from there to the start of the next row is at the same place in the source, and shows there.
+    window.advance(1000).press_at(past).release_at(Point { x: next.x, y: next.y + next.height / 2.0 });
+    assert_eq!((caret(&mut window), head(&window)), (next, wrap.clone()));
+    // What is typed at the end of the row goes after its last character.
+    window.advance(1000).click_at(past).type_text("X");
+    assert_eq!(&block_text(&window, "f1")[wrap.offset..=wrap.offset], "X");
 }
 
 /// Whether the next frame draws the caret where it can be seen: whole, inside whatever clips it.

@@ -557,3 +557,38 @@ fn a_note_added_here_never_replaces_notes_that_cannot_be_read() {
     assert_eq!(folder.files[NAME], original, "the file is left alone");
     assert_eq!(note_ids(&open_at(&folder, &name, 4)), ["desk"]);
 }
+
+#[test]
+fn a_file_copied_by_hand_becomes_its_own_document_with_its_first_edit() {
+    const COPY: &str = "report copy.let";
+    let copied = Save { name: COPY, token: "desk", label: "desk", attempts: 3 };
+    let (mut folder, mut original, _) = shared();
+    let before = folder.files[NAME].clone();
+    folder.put(COPY, before.clone());
+
+    let mut copy = open_at(&folder, COPY, 5);
+    copy.fork("a-new-id");
+    typed(&mut copy, 11, "!");
+    let saved = save(&mut folder, &mut copy, &copied).unwrap();
+    assert!(matches!(saved, Saved::Written), "{saved:?}");
+    assert_eq!(folder.files[NAME], before, "the original is left alone");
+    assert_eq!(folder.names(), [COPY, NAME], "and no conflict copy is written");
+
+    let reopened = open_at(&folder, COPY, 6);
+    assert_eq!((reopened.id.as_str(), reopened.created.as_str()), ("a-new-id", original.created.as_str()));
+    assert_eq!(text(reopened.model().doc()), "Hello world!");
+    assert!(matches!(save(&mut folder, &mut copy, &copied).unwrap(), Saved::Unchanged));
+
+    // The history is kept up to the fork, so the two still merge when asked to.
+    typed(&mut original, 0, "Oh. ");
+    original.merge_from(&mut open(&folder.files[COPY])).unwrap();
+    assert_eq!(text(original.model().doc()), "Oh. Hello world!");
+    assert_eq!(original.id, ID);
+
+    // From here on a file with the old id in the copy's place is another document's.
+    folder.put(COPY, before.clone());
+    typed(&mut copy, 0, "So. ");
+    let saved = save(&mut folder, &mut copy, &copied).unwrap();
+    let Saved::ConflictCopy { cause: Error::OtherDocument(id), .. } = saved else { panic!("{saved:?}") };
+    assert_eq!((id.as_str(), &folder.files[COPY]), (ID, &before));
+}

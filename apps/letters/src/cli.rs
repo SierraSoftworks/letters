@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 pub const USAGE: &str = "\
 Usage: letters [OPTIONS] [FILE]
-       letters export --to md|html|docx|pdf [OPTIONS] FILE
+       letters export --to md|html|docx|pdf|clean [OPTIONS] FILE
        letters import [OPTIONS] PATH...
 
 Opens FILE, or a new document when none is given.
@@ -20,7 +20,8 @@ Options:
   -h, --help
 
 Export writes FILE as Markdown, one HTML file, a Word document or a PDF, beside it unless told otherwise:
-      --to FORMAT          The format to write: md, html, docx or pdf
+      --to FORMAT          The format to write: md, html, docx or pdf, or clean for a
+                           document of its own without history or comments
   -o, --output PATH        Where to write, or - for standard output
   -f, --force              Replace the output if it is already there
 
@@ -62,6 +63,8 @@ pub enum Format {
     Html,
     Docx,
     Pdf,
+    /// A document of its own with nothing of how it came to be: no history and no notes.
+    Clean,
 }
 
 impl Format {
@@ -72,6 +75,7 @@ impl Format {
             Self::Html => "html",
             Self::Docx => "docx",
             Self::Pdf => "pdf",
+            Self::Clean => "let",
         }
     }
 }
@@ -197,7 +201,8 @@ fn parse_export(args: impl Iterator<Item = OsString>) -> Result<Command, String>
                     Some("html") => Format::Html,
                     Some("docx") => Format::Docx,
                     Some("pdf") => Format::Pdf,
-                    _ => return Err("--to takes md, html, docx or pdf".into()),
+                    Some("clean") => Format::Clean,
+                    _ => return Err("--to takes md, html, docx, pdf or clean".into()),
                 });
             }
             Arg::Flag(name @ ("-o" | "--output"), inline) => {
@@ -210,7 +215,7 @@ fn parse_export(args: impl Iterator<Item = OsString>) -> Result<Command, String>
         }
     }
     let file = file.ok_or("export needs the file to export")?;
-    let to = to.ok_or("export needs --to md, --to html or --to docx")?;
+    let to = to.ok_or("export needs --to md, html, docx, pdf or clean")?;
     Ok(Command::Export(Export { file, to, output, force }))
 }
 

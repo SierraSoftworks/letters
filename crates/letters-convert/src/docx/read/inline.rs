@@ -70,7 +70,10 @@ impl Reader<'_, '_> {
                 }
                 Some("fldSimple") => {
                     let code = node.attr("instr").unwrap_or_default();
-                    para.contents |= is_contents(code);
+                    if is_contents(code) {
+                        para.contents = true;
+                        para.listing.get_or_insert(levels(code));
+                    }
                     let from = para.len;
                     self.inline(node, &around.deeper(hyperlink(code)), para);
                     self.shown(code, from, para);
@@ -121,7 +124,7 @@ impl Reader<'_, '_> {
         let look = own.clone().over(&para.styled);
         let linked = around.link.is_some() || self.fields.iter().any(|field| field.link.is_some());
         // The words of a comment are in no language of the document's.
-        para.lang = look.lang.clone().filter(|_| !self.detached);
+        para.lang = look.language().map(str::to_owned).filter(|_| !self.detached);
 
         let on = |value: Option<bool>| value.unwrap_or(false);
         let base = &para.baseline;
@@ -231,12 +234,20 @@ impl Reader<'_, '_> {
                     field.shown = true;
                     field.link = hyperlink(&field.code);
                     field.contents = is_contents(&field.code);
-                    para.contents |= field.contents;
+                    if field.contents {
+                        para.contents = true;
+                        para.listing.get_or_insert(levels(&field.code));
+                    }
                     field.from = Some(Spot { para: para.index, at: para.len });
                 }
             }
             Some("end") => {
                 let Some(field) = self.fields.pop() else { return };
+                // A table of contents that Word has yet to make shows nothing, and is one all the same.
+                if !field.shown && is_contents(&field.code) {
+                    para.contents = true;
+                    para.listing.get_or_insert(levels(&field.code));
+                }
                 // What a field shows is known only when it ends, and only where it stayed in one paragraph.
                 if let Some(from) = field.from.filter(|from| from.para == para.index) {
                     self.shown(&field.code, from.at, para);
@@ -412,6 +423,17 @@ fn styled_size(style: &str) -> Option<(f32, f32)> {
 /// Whether a field's instructions ask for a table of contents.
 fn is_contents(code: &str) -> bool {
     code.trim_start().get(..3).is_some_and(|name| name.eq_ignore_ascii_case("TOC"))
+}
+
+/// How deep the table of contents a field asks for lists: the end of the range its `\o` names, as in
+/// `TOC \o "1-3"`, and every level where it names none.
+pub(super) fn levels(code: &str) -> u8 {
+    let range = code.split_once("\\o").map(|(_, rest)| rest.trim_start().trim_start_matches('"'));
+    let deepest = range.and_then(|range| {
+        let (_, to) = range.split_once('-')?;
+        to.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u8>().ok()
+    });
+    deepest.unwrap_or(4).clamp(1, 4)
 }
 
 /// The address a field leads to, when its instructions make it a link out of the document.

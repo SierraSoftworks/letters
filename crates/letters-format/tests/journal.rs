@@ -247,3 +247,28 @@ fn journal_names_are_safe_whatever_the_id() {
         assert!(!is_journal(name), "{name}");
     }
 }
+
+#[test]
+fn a_copy_that_became_its_own_document_comes_back_under_its_new_id() {
+    let (folder, mut state) = (shared(), Folder::default());
+    // The file is a copy made by hand. Its first edit makes it a document of its own, before the journal
+    // hears of the edit: the original's journal goes by the id the two share.
+    let opened = WorkingCopy::open(&mut open(&folder.files[NAME]), ReplicaId::from(2)).unwrap();
+    let mut editor = Model::load(&opened.model().save(), ReplicaId::from(102)).unwrap();
+    let stood = editor.revision();
+    let (mut journal, _) = Journal::open(&mut state, "a-new-id", CREATED, Some(NAME)).unwrap();
+    editor.apply([Op::InsertText { at: Pos::new("p", 0), text: "Mine. ".into() }]).unwrap();
+    journal.edits(&mut state, &editor.updates_since(&stood)).unwrap();
+
+    // The session ends before a save. The file still carries the old id.
+    let unsaved = Unsaved::read(&mut state, &journal_name("a-new-id")).unwrap().unwrap();
+    let mut copy = WorkingCopy::open(&mut open(&folder.files[NAME]), ReplicaId::from(3)).unwrap();
+    assert!(matches!(copy.replay(&unsaved), Err(Error::OtherDocument(_))), "not while it goes by the old id");
+    copy.fork(unsaved.id.clone());
+    assert!(copy.replay(&unsaved).unwrap());
+    assert_eq!(text(copy.model().doc()), "Mine. Hello world");
+
+    let mut folder = folder;
+    assert!(matches!(save(&mut folder, &mut copy, &SAVE).unwrap(), Saved::Written));
+    assert_eq!(open(&folder.files[NAME]).manifest().id, "a-new-id");
+}

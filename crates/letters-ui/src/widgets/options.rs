@@ -12,7 +12,7 @@ use crate::theme::accent;
 use crate::tokens;
 
 /// The least height of a choice's row.
-const ROW: f32 = 28.0;
+pub(crate) const ROW: f32 = 28.0;
 
 pub struct Choice<M> {
     label: String,
@@ -50,6 +50,26 @@ impl<M> Choice<M> {
         self.on_take = Some(message);
         self
     }
+}
+
+/// The line under a list that hangs where the person is typing: what the list matches, and the keys that
+/// take from it and put it away.
+pub(crate) fn hint<M>(says: &str, keys: &[&str]) -> Element<M> {
+    let quiet = TextStyle::control().size(tokens::TEXT_XS);
+    let key = |name: &&str| {
+        Element::row()
+            .padding(Edges::xy(5.0, 1.0))
+            .radius(tokens::RADIUS_SM)
+            .bg(tokens::NEUTRAL_SOFT)
+            .child(Element::text(*name, quiet).fg(tokens::FG_MUTED))
+    };
+    Element::row()
+        .align(Align::Center)
+        .gap(tokens::SPACE_XS)
+        .padding(Edges::xy(tokens::SPACE_XS, 0.0))
+        .child(Element::text(says, quiet).fg(tokens::FG_MUTED))
+        .child(Element::row().grow(1.0).min_width(tokens::SPACE_SM))
+        .children(keys.iter().map(key))
 }
 
 enum Entry<M> {

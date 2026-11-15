@@ -72,6 +72,9 @@ pub fn import_markdown(markdown: &str, new_id: &mut dyn FnMut() -> String, files
     MarkdownImport { document, notes: reader.notes, assets: reader.assets }
 }
 
+/// The levels of heading a table of contents read from Markdown lists: all of them, as its renderers do.
+const EVERY: u8 = 4;
+
 /// The fence that opens and closes front matter in each format.
 pub(super) const FENCES: [(&str, PropertiesFormat); 2] =
     [("---", PropertiesFormat::Yaml), ("+++", PropertiesFormat::Toml)];
@@ -178,6 +181,9 @@ impl<'a> Reader<'a, '_> {
     /// Reads the block that `tag` opens. A list read here starts at `list_depth`.
     fn read(&mut self, tag: Tag<'a>, range: Range<usize>, list_depth: u8, out: &mut Vec<Block>) {
         match tag {
+            Tag::Paragraph if self.contents(&range) => {
+                out.push(self.block(BlockKind::TableOfContents { levels: EVERY }))
+            }
             Tag::Paragraph if self.pictures(out) => {}
             Tag::Paragraph => {
                 let mut block = self.block(BlockKind::Paragraph);
@@ -284,6 +290,20 @@ impl<'a> Reader<'a, '_> {
             }
         }
         text
+    }
+
+    /// Reads a paragraph that is the line a renderer swaps for a table of contents: `[TOC]`, as
+    /// Python-Markdown and GitLab have it, or `[[_TOC_]]`, as GitLab and Azure DevOps do. Says whether it was one.
+    fn contents(&mut self, range: &Range<usize>) -> bool {
+        let line = self.source[range.clone()].trim();
+        // The source is checked, not the events, so that an escaped `\[TOC\]` stays text. With a link
+        // defined under that name, it is a link.
+        let linked = matches!(self.peek(0), Some(Event::Start(Tag::Link { .. })));
+        if line != "[[_TOC_]]" && (linked || !line.eq_ignore_ascii_case("[toc]")) {
+            return false;
+        }
+        while self.next().is_some_and(|(event, _)| event != Event::End(TagEnd::Paragraph)) {}
+        true
     }
 
     /// Reads a callout tag such as `[!NOTE]` off the start of a quote and takes it out of the quote's text.
