@@ -22,6 +22,8 @@ use letters_api::{
     Access, Action, Allows, Code, CreatedLink, Exchange, Grant, Grantee, Link, NewLink, Opened, Person, Renewal, Role,
     Shares, Space, SpaceKind, Token, Trust, Who, paths,
 };
+use letters_format::{OPLOG, Package};
+use letters_model::{Block, BlockKind, Document, Model, ReplicaId};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -732,6 +734,37 @@ fn nobody_is_sent_to_sign_in_at_what_is_no_letters_server() {
         connected::enter(&stranger, "d1", None, None, &home.0, &no_browser, &|_, _| (), &AtomicBool::new(false));
 
     assert!(matches!(entered, Err(Unreached::Refused(Refused::Unreachable(_)))));
+}
+
+/// A history as a stranger writes it: one that Loro panics on.
+const HARMFUL: &[u8] = include_bytes!("../../../fuzz/corpus/history/a-history-loro-panics-on.bin");
+
+#[test]
+fn a_servers_file_is_merged_only_with_a_history_that_does_no_harm() {
+    let blocks = vec![Block::text("p", BlockKind::Paragraph, "Slates first.")];
+    let model = Model::new(Document { blocks, ..Document::default() }, ReplicaId::new("a device"));
+    let file = |history: Option<Vec<u8>>| {
+        let mut package = Package {
+            id: "8f14e45f-ceea-467f-a0e6-5b1d3c2a9f01".into(),
+            created: "2026-11-15T20:00:00Z".into(),
+            document: model.doc().clone(),
+            entries: Default::default(),
+        };
+        package.entries.extend(history.map(|history| (OPLOG.to_owned(), history)));
+        let mut out = std::io::Cursor::new(Vec::new());
+        letters_format::write(&mut out, &package).unwrap();
+        out.into_inner()
+    };
+
+    let (history, _) = connected::mergeable(file(Some(model.save()))).expect("a sound history is merged");
+    let merged = Model::load(&history, ReplicaId::new("another device")).unwrap();
+    assert_eq!(merged.doc().blocks, model.doc().blocks);
+
+    // One that would harm is not, and neither is a file with none: its blocks would come a second time.
+    for (unsound, why) in [(Some(HARMFUL.to_vec()), "harmful"), (None, "no history"), (Some(vec![1, 2, 3]), "unread")] {
+        assert!(connected::mergeable(file(unsound)).is_none(), "{why}");
+    }
+    assert!(connected::mergeable(b"no file".to_vec()).is_none());
 }
 
 #[test]

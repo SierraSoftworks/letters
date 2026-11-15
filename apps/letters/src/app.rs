@@ -1524,12 +1524,16 @@ impl DocWindow {
     }
 
     /// Starts reading what the first paint did not need, on another thread.
-    fn start_read(&mut self, proxy: &EventLoopProxy<Event>, journals: &Journals) {
+    ///
+    /// A document that would open in safe mode is read as a stranger's: see [`Rest::read`].
+    fn start_read(&mut self, proxy: &EventLoopProxy<Event>, journals: &Journals, trust: &Trust) {
         let Some(rest) = self.rest.take() else { return };
         let (id, proxy, replica) = (self.window.id(), proxy.clone(), self.view.editor().model().replica());
         let journals = self.keeps.then(|| journals.folder().to_owned());
+        let (vouched, trust, path) = (self.vouched(), trust.clone(), self.place.path().map(Path::to_owned));
+        let wary = move |id: &str| !vouched && trust::mode(&trust, id, path.as_deref()) != letters_trust::Mode::Trusted;
         self.reading = Some(thread::spawn(move || {
-            let working = rest.read(replica, journals.as_deref()).map_err(|error| error.to_string());
+            let working = rest.read(replica, journals.as_deref(), wary).map_err(|error| error.to_string());
             let _ = proxy.send_event(Event::Read(id));
             working
         }));
@@ -1542,7 +1546,9 @@ impl DocWindow {
             (Some(reading), _) => reading.join().unwrap_or_else(|_| Err("reading it stopped unexpectedly".into())),
             (None, Some(rest)) => {
                 let replica = self.view.editor().model().replica();
-                rest.read(replica, self.keeps.then(|| journals.folder())).map_err(|error| error.to_string())
+                // With nothing at hand that says who is trusted, only what is vouched for here is.
+                let (journals, vouched) = (self.keeps.then(|| journals.folder()), self.vouched());
+                rest.read(replica, journals, |_| !vouched).map_err(|error| error.to_string())
             }
             (None, None) => return Ok(()),
         };
@@ -3364,7 +3370,7 @@ impl ApplicationHandler<Event> for App {
                 if window.rest.is_some() {
                     window.reword(&self.words);
                     window.view.set_default_style(Some(new_style()));
-                    window.start_read(&self.proxy, &self.journals);
+                    window.start_read(&self.proxy, &self.journals, self.trust.trust());
                     window.ask_dictionaries(&self.proxy, &self.dictionaries);
                     window.relocate(library);
                 }

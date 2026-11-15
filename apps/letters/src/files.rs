@@ -209,7 +209,12 @@ pub struct Merged {
 /// Merges the document in the file at `path` into `copy`.
 fn merge(copy: &mut WorkingCopy, path: &Path) -> Result<(), Error> {
     let mut archive = Archive::open(BufReader::new(fs::File::open(path)?))?;
-    copy.merge_from(&mut archive).map(drop).map_err(Error::from)
+    // Another file's history is a stranger's, whoever's this document is: it is tried where it can hurt
+    // nothing before the document takes it in.
+    let was = std::mem::replace(&mut copy.wary, true);
+    let merged = copy.merge_from(&mut archive).map(drop).map_err(Error::from);
+    copy.wary = was;
+    merged
 }
 
 /// Moves a file to a path that must be free. A file already at `to` is never replaced, as a plain rename
@@ -359,16 +364,28 @@ impl Rest {
     }
 
     /// Reads it. `editor` is the replica the document's editor was made with, and `journals` the folder
-    /// unsaved work is journalled in, if it is.
+    /// unsaved work is journalled in, if it is. `wary` says of the file's document, by its id, whether
+    /// nobody vouches for it: its history is then a stranger's, which is checked before a model loads it
+    /// and left out if it would do harm, and the copy stays wary of what reaches it later.
     ///
     /// This is the slow part of opening a long document, so it runs on another thread once the document
     /// is on screen.
-    pub fn read(self, editor: ReplicaId, journals: Option<&Path>) -> Result<Working, Error> {
+    pub fn read(
+        self,
+        editor: ReplicaId,
+        journals: Option<&Path>,
+        wary: impl FnOnce(&str) -> bool,
+    ) -> Result<Working, Error> {
         let claim = |copy: &WorkingCopy| journals.and_then(|folder| journal::claim(folder, &copy.id));
         let (mut copy, kept) = match self.0 {
             Source::File(bytes) => {
                 let mut archive = Archive::open(Cursor::new(bytes))?;
-                (WorkingCopy::open(&mut archive, ReplicaId::new(&platform::block_id()))?, None)
+                let replica = ReplicaId::new(&platform::block_id());
+                let copy = match wary(&archive.manifest().id) {
+                    true => WorkingCopy::open_wary(&mut archive, replica)?,
+                    false => WorkingCopy::open(&mut archive, replica)?,
+                };
+                (copy, None)
             }
             Source::New(copy) => {
                 let claim = claim(&copy);

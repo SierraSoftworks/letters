@@ -31,7 +31,7 @@ impl Writer {
         let replica = replica();
         // The editor's history starts from the style on screen, as a window's does.
         let mut model = Model::new(opened.document, replica).with_style(opened.style);
-        let Working { copy, history, .. } = opened.rest.read(replica, None).unwrap();
+        let Working { copy, history, .. } = opened.rest.read(replica, None, |_| false).unwrap();
         if let Some(history) = history {
             model.attach(history);
         }

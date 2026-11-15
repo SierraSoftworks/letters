@@ -69,7 +69,9 @@ impl Desk {
     fn at(journals: &mut Journals, app: usize, opened: Opened) -> Self {
         let replica = ReplicaId::new(&platform::block_id());
         let mut model = Model::new(opened.document, replica).with_style(opened.style);
-        let rest = opened.rest.read(replica, Some(journals.folder())).expect("the rest of an opened document reads");
+        // The documents are the apps' own, which open trusted.
+        let rest = opened.rest.read(replica, Some(journals.folder()), |_| false);
+        let rest = rest.expect("the rest of an opened document reads");
         let Working { copy, history, news, claim, journalled, .. } = rest;
         if let Some(history) = history {
             model.attach(history);

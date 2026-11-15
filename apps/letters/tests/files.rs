@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use common::{Writer, comment, comments};
 use letters::files::{self, Exchange, Home, Opened};
-use letters_format::{Archive, Package, Saved, conflict_copy_of};
-use letters_model::{Block, BlockKind, Document, Notes, Page, Style};
+use letters_format::{Archive, OPLOG, Package, Saved, conflict_copy_of};
+use letters_model::{Block, BlockKind, Document, Notes, Page, ReplicaId, Style};
 
 /// A scratch folder that is removed when the test ends.
 struct Folder(PathBuf);
@@ -204,6 +204,57 @@ fn a_file_that_cannot_be_merged_is_never_overwritten() {
     let (third, _) = writer.save(&again, &document("Mine, third"));
     assert_eq!(folder.names().len(), 3);
     assert_eq!(read(third.path()).document, document("Mine, third"));
+}
+
+/// A history as a stranger writes it: one that Loro panics on.
+const HARMFUL: &[u8] = include_bytes!("../../../fuzz/corpus/history/a-history-loro-panics-on.bin");
+
+#[test]
+fn a_document_nobody_vouches_for_is_read_as_a_strangers() {
+    let folder = Folder::new("wary");
+    let path = folder.path("Rates.let");
+    write_full(&path, "Shared");
+    let (mut writer, home) = Writer::of(open(&path).unwrap());
+    writer.save(&home, &document("Shared, and written on"));
+    let sound = read(&path);
+    let read_as = |wary: bool| {
+        let asked = |id: &str| (id == sound.id && wary) || (id != sound.id && panic!("asked of {id}"));
+        open(&path).unwrap().rest.read(ReplicaId::new("a window"), None, asked).unwrap().copy
+    };
+
+    // A history that does no harm is the document's either way. Only the wary copy checks what comes later.
+    let (trusted, wary) = (read_as(false), read_as(true));
+    assert_eq!((trusted.wary, wary.wary), (false, true));
+    assert_eq!(wary.model().revision(), trusted.model().revision());
+
+    // One that would is left out, and the document opens as its file shows it.
+    let mut harmful = sound.clone();
+    harmful.entries.insert(OPLOG.into(), HARMFUL.to_vec());
+    write(&path, &harmful);
+    let opened = read_as(true);
+    assert_eq!(opened.model().doc(), &sound.document);
+    assert!(opened.wary);
+}
+
+#[test]
+fn a_file_whose_history_would_harm_is_not_merged() {
+    let folder = Folder::new("harmful-merge");
+    let (path, other) = (folder.path("Rates.let"), folder.path("Rates from Ben.let"));
+    write_full(&path, "Shared");
+    let (mut writer, home) = Writer::of(open(&path).unwrap());
+    writer.save(&home, &document("Mine"));
+    let mut harmful = read(&path);
+    harmful.entries.insert(OPLOG.into(), HARMFUL.to_vec());
+    write(&other, &harmful);
+
+    let seen = writer.model.revision();
+    let (edits, others) = (writer.model.updates_since(&seen), std::slice::from_ref(&other));
+    let exchange = home.exchange(&mut writer.copy, &edits, Notes::default(), &seen, others).unwrap();
+
+    assert!(matches!(exchange.merged.as_slice(), [merged] if merged.result.is_err()), "{:?}", exchange.merged);
+    assert!(exchange.news.is_none() && !writer.copy.wary, "the document is as it was, and its own as before");
+    assert_eq!(read(&path).document, document("Mine"));
+    assert_eq!(read(&other), harmful, "the other file is only read");
 }
 
 #[test]

@@ -16,7 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 use letters_api::{Access, Code, CreatedLink, EntryKind, Grant, NewLink, Opened, Shares, paths};
-use letters_format::{Archive, WorkingCopy};
+use letters_format::{Archive, OPLOG, WorkingCopy};
 use letters_model::{Model, Notes, ReplicaId, Selection};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
 use sha2::{Digest, Sha256};
@@ -562,11 +562,7 @@ impl Handing {
     /// The history and the notes of the document as the server's file holds it, to merge here. This
     /// waits on the network.
     fn bring(&self) -> Option<(Vec<u8>, Notes)> {
-        let file = self.session.file(&self.id, self.session.limits().ok()?.document).ok()?;
-        let mut file = Archive::open(io::Cursor::new(file)).ok()?;
-        // Nothing is written with it, so whose copy it is does not matter.
-        let copy = WorkingCopy::open(&mut file, ReplicaId::new(&crate::platform::block_id())).ok()?;
-        Some((copy.model().save(), copy.notes))
+        mergeable(self.session.file(&self.id, self.session.limits().ok()?.document).ok()?)
     }
 
     /// Owes the server the pictures in the copy's file that it does not list.
@@ -581,6 +577,20 @@ impl Handing {
             }
         }
     }
+}
+
+/// The history and the notes of a `.let` file that came from a server, for the window that has the
+/// document open to merge. `None` if there is nothing to merge without harm.
+///
+/// Others wrote the file, so its history is tried with [`Model::check`] where it can hurt nothing, before
+/// any document takes it in. A file with no history, or with none that stands, is not merged: a history
+/// started here for it would bring every block a second time.
+pub fn mergeable(file: Vec<u8>) -> Option<(Vec<u8>, Notes)> {
+    let mut file = Archive::open(io::Cursor::new(file)).ok()?;
+    Model::check(&file.read(OPLOG).ok()??).ok()?;
+    // Nothing is written with it, so whose copy it is does not matter.
+    let copy = WorkingCopy::open(&mut file, ReplicaId::new(&crate::platform::block_id())).ok()?;
+    Some((copy.model().save(), copy.notes))
 }
 
 /// Where a document keeps its pictures, as its blocks name them.
