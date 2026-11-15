@@ -170,7 +170,7 @@ impl Editor {
         let at = |caret: &Caret| caret.selection.is_caret() && !caret.picture;
         let Some(caret) = self.caret.clone().filter(at) else { return false };
         let pos = caret.selection.head;
-        if self.label_rule(&pos) {
+        if self.label_rule(&pos) || self.reference_rule(&pos, &caret.marks) {
             return true;
         }
         let doc = self.doc();

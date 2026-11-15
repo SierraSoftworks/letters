@@ -4,13 +4,13 @@
 //! into Letters loses nothing. Other applications read the HTML it wraps, or the plain text, which is
 //! Markdown. What other applications copied is read from its HTML, or from its text as Markdown.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use letters_convert::{from_html, from_markdown, to_html_fragment, to_markdown};
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Op, Pos, PropertiesFormat, Run};
 use serde_json::Value;
 
-use crate::{Clip, Editor, Platform, parts, text, tree};
+use crate::{Clip, Editor, Platform, parts, refs, text, tree};
 
 /// The HTML attribute that holds the copied blocks.
 const CARRIER: &str = "data-letters-blocks";
@@ -153,15 +153,19 @@ fn flat(blocks: &[Block]) -> Vec<Run> {
 
 /// Gives `block` and the blocks inside it new ids where theirs are `taken`. A block that was cut comes
 /// back under its own id, so whatever refers to it still does, and a copy is a block of its own.
-fn renew(block: &mut Block, taken: &mut BTreeSet<BlockId>, platform: &mut dyn Platform) {
+fn renew(block: &mut Block, taken: &mut BTreeSet<BlockId>, renewed: &mut Renewed, platform: &mut dyn Platform) {
     if !taken.insert(block.id.clone()) {
-        block.id = BlockId::new(platform.new_id());
+        let old = std::mem::replace(&mut block.id, BlockId::new(platform.new_id()));
         taken.insert(block.id.clone());
+        renewed.insert(old, block.id.clone());
     }
     if let Body::Blocks(children) = &mut block.body {
-        children.iter_mut().for_each(|child| renew(child, taken, platform));
+        children.iter_mut().for_each(|child| renew(child, taken, renewed, platform));
     }
 }
+
+/// The new id of each pasted block that was given one.
+type Renewed = BTreeMap<BlockId, BlockId>;
 
 impl Editor {
     /// The selection as blocks that stand on their own.
@@ -290,7 +294,9 @@ impl Editor {
         let Some(at) = self.selection().map(|selection| selection.head.clone()) else { return };
         let mut blocks = parts::settled(blocks);
         let mut taken: BTreeSet<BlockId> = self.doc().walk().map(|block| block.id.clone()).collect();
-        blocks.iter_mut().for_each(|block| renew(block, &mut taken, platform));
+        let mut renewed = Renewed::new();
+        blocks.iter_mut().for_each(|block| renew(block, &mut taken, &mut renewed, platform));
+        refs::relink(&mut blocks, &renewed, &taken);
         let doc = self.doc();
         let (Some(target), Some(place)) = (doc.block(&at.block), self.seat(&at.block)) else { return };
         let (len, parent, index) = (text::len(target), place.parent_id(), place.index + 1);

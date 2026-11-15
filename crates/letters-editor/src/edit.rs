@@ -272,6 +272,11 @@ impl Editor {
             if let Some((mark, _)) = if right { stops.first() } else { stops.last() } {
                 return self.delete_marker(caret, mark, !right);
             }
+            // A reference goes back to the words it shows before any of them is deleted.
+            if self.unrefer(&pos, right) {
+                return;
+            }
+            let Some(block) = self.block(&pos.block) else { return };
             if !right && pos.offset == 0 {
                 return self.delete_at_start(caret);
             }
@@ -517,6 +522,9 @@ impl Editor {
         if caret.picture {
             // Enter on a picture starts its caption.
             self.edit_caption(platform);
+            return Kind::Other;
+        }
+        if self.enter_reference() {
             return Kind::Other;
         }
         if caret.marks.contains(&Mark::Math) && self.formula().is_some() {

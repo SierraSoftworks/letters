@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use letters_model::{Block, BlockId, Document, Mark, Pos, Selection};
 
 use crate::markers::{PAIRED, Sides};
-use crate::{Caret, Editor, Motion, Platform, parts, text, tree};
+use crate::{Caret, Editor, Motion, Platform, parts, refs, text, tree};
 
 /// What movement between lines asks of layout. `letters_layout::DocLayout` can answer all of it.
 pub trait Lines {
@@ -88,7 +88,7 @@ impl Editor {
             laid.or_else(|| fallback.line_edge(pos, end)).unwrap_or_else(|| pos.clone())
         };
 
-        match motion {
+        let to = match motion {
             Motion::Left | Motion::WordLeft if offset == 0 => {
                 if index > first {
                     end_of(index - 1)
@@ -130,6 +130,14 @@ impl Editor {
                 }
                 pos
             }
+        };
+        // A reference is passed in one step, whatever the step was to.
+        let back = matches!(motion, Motion::Left | Motion::WordLeft);
+        let forth = matches!(motion, Motion::Right | Motion::WordRight);
+        let inside = self.block(&to.block).and_then(|block| refs::around(block, to.offset));
+        match inside.filter(|_| back || forth) {
+            Some(range) => Pos::new(to.block, if back { range.start } else { range.end }),
+            None => to,
         }
     }
 

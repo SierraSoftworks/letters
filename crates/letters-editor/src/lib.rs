@@ -15,6 +15,7 @@ mod markers;
 mod merge;
 mod motion;
 mod parts;
+mod refs;
 mod rules;
 mod table;
 mod text;
@@ -34,6 +35,7 @@ pub use keymap::Keymap;
 pub use letters_model::{Marker, Markers};
 use merge::Kept;
 pub use motion::Lines;
+pub use refs::{Numbered, Referring};
 pub use table::{Cell, TableEdit};
 
 /// Text input, as every platform delivers it. Offsets are UTF-8 bytes relative to the caret's block.
@@ -179,6 +181,13 @@ pub enum Command {
     EditCaption,
     /// Steps out of a caption, as Esc does: back to the picture it stands under.
     LeaveCaption,
+    /// Puts a reference to a numbered figure or gallery at the caret, in place of the words typed for
+    /// it, which [`Editor::referring`] tells of, or of the selection. It reads as the figure's label and
+    /// follows the figure's number.
+    TakeReference(BlockId),
+    /// Leaves the words typed for a reference as words, as Esc does while a list of figures is open:
+    /// [`Editor::referring`] is `None` until other words are typed for one.
+    DismissReference,
     Undo,
     Redo,
     SelectAll,
@@ -318,6 +327,8 @@ pub struct Editor {
     merges: u64,
     /// The caret before the edits that are not yet an undo step.
     origin: Kept,
+    /// Where the words typed for a reference start that Esc has said are only words.
+    dismissed: Option<(BlockId, usize)>,
 }
 
 impl Editor {
@@ -342,6 +353,7 @@ impl Editor {
             goal: None,
             merges: 0,
             origin: Kept::default(),
+            dismissed: None,
         };
         if let Some(pos) = first {
             editor.place(pos);
@@ -380,6 +392,7 @@ impl Editor {
         if let (Some(anchor), Some(head)) = (self.nearest(&selection.anchor), self.nearest(&selection.head)) {
             self.set_selection(Selection { anchor, head });
         }
+        self.forget();
     }
 
     pub fn keymap(&self) -> &Keymap {
@@ -458,6 +471,7 @@ impl Editor {
     pub fn input(&mut self, event: InputEvent, platform: &mut dyn Platform) -> Change {
         self.date(platform);
         self.handle(event, platform);
+        self.forget();
         std::mem::take(&mut self.change)
     }
 
@@ -486,8 +500,9 @@ impl Editor {
         }
     }
 
-    /// Whether a command has anything to act on, so that a key it is bound to can fall through when not.
-    fn applies(&self, command: &Command) -> bool {
+    /// Whether a command has anything to act on, so that a key it is bound to can fall through when not, and
+    /// a menu can show what is of no use here.
+    pub fn applies(&self, command: &Command) -> bool {
         let Some(caret) = &self.caret else {
             return match command {
                 Command::Undo => self.can_undo(),
@@ -522,6 +537,8 @@ impl Editor {
             Command::SetNumbered(_) => self.numbered_by(&caret.selection.head.block).is_some(),
             Command::EditCaption => caret.picture,
             Command::LeaveCaption => self.captioned().is_some(),
+            Command::TakeReference(_) => self.referable(),
+            Command::DismissReference => self.referring().is_some(),
             Command::Undo => self.can_undo(),
             Command::Redo => self.can_redo(),
             _ => true,
@@ -571,6 +588,8 @@ impl Editor {
             }
             Command::EditCaption => self.edit_caption(platform),
             Command::LeaveCaption => self.leave_caption(),
+            Command::TakeReference(to) => self.take_reference(&to),
+            Command::DismissReference => self.dismiss_reference(),
             Command::Undo => _ = self.undo_step(),
             Command::Redo => self.redo_step(),
             Command::SelectAll => self.select_all(),
@@ -588,6 +607,7 @@ impl Editor {
             Command::RemoveWord(word) => _ = self.apply(vec![Op::RemoveWord { word }]),
         }
         self.commit(kind, now, false);
+        self.forget();
         true
     }
 
@@ -730,8 +750,35 @@ impl Editor {
     /// The position on a character boundary of a text block that is nearest to `pos`.
     fn clamp(&self, pos: &Pos) -> Option<Pos> {
         let block = self.block(&pos.block).filter(|block| tree::is_text(block))?;
-        let offset = pos.offset.min(self.span(block));
-        Some(Pos::new(pos.block.clone(), text::snap(&block.plain_text(), offset)))
+        let offset = text::snap(&block.plain_text(), pos.offset.min(self.span(block)));
+        // A reference is come to at one of its ends, whichever is nearer.
+        let offset = match refs::around(block, offset) {
+            Some(range) if offset - range.start < range.end - offset => range.start,
+            Some(range) => range.end,
+            None => offset,
+        };
+        Some(Pos::new(pos.block.clone(), offset))
+    }
+
+    /// A selection with neither end inside a reference: a caret stands at the nearer end of one, and a
+    /// range takes it whole.
+    fn whole(&self, selection: Selection) -> Selection {
+        let inside = |pos: &Pos| self.block(&pos.block).and_then(|block| refs::around(block, pos.offset));
+        if inside(&selection.anchor).is_none() && inside(&selection.head).is_none() {
+            return selection;
+        }
+        if selection.is_caret() {
+            return self.clamp(&selection.head).map_or(selection, Selection::caret);
+        }
+        let (start, end) = self.ordered(&selection);
+        let from = inside(&start).map_or(start.offset, |range| range.start);
+        let to = inside(&end).map_or(end.offset, |range| range.end);
+        let (from, to) = (Pos::new(start.block.clone(), from), Pos::new(end.block, to));
+        if selection.anchor == start {
+            Selection { anchor: from, head: to }
+        } else {
+            Selection { anchor: to, head: from }
+        }
     }
 
     /// The ends of a selection in document order.
@@ -777,6 +824,7 @@ impl Editor {
 
     /// Selects with the marks that follow from the text: a range takes those of its first character.
     fn set_selection(&mut self, selection: Selection) {
+        let selection = self.whole(selection);
         let marks = if selection.is_caret() {
             self.natural(&selection.head)
         } else {
@@ -785,7 +833,8 @@ impl Editor {
             block.map(|block| text::marks_after(block.body.runs(), start.offset)).unwrap_or_default()
         };
         let picture = selection.is_caret() && self.member(&selection.head.block);
-        self.caret = Some(Caret { selection, marks, picture });
+        // Text typed beside a reference is no part of it.
+        self.caret = Some(Caret { selection, marks: refs::plain(marks), picture });
     }
 
     fn place(&mut self, pos: Pos) {
@@ -794,7 +843,8 @@ impl Editor {
 
     /// Puts the caret at `pos` with marks chosen by the caller.
     fn place_with(&mut self, pos: Pos, marks: BTreeSet<Mark>) {
+        let pos = self.clamp(&pos).unwrap_or(pos);
         let picture = self.member(&pos.block);
-        self.caret = Some(Caret { selection: Selection::caret(pos), marks, picture });
+        self.caret = Some(Caret { selection: Selection::caret(pos), marks: refs::plain(marks), picture });
     }
 }

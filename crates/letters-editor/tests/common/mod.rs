@@ -4,8 +4,8 @@
 //! `hr`, `cap`, `fig`) and its text. Two spaces before the kind nest a list item one level. `> ` puts the block
 //! in a quote, and `tip> `, `info> `, `warn> ` or `danger> ` in a callout. In the text, `**`, `*`, `~~`, `` ` ``,
 //! `__`, `==` and `$` switch bold, italic, strike, code, underline, highlight and maths, `[text](address)` is a
-//! link, `⏎` is a line break, `|` is the caret and `^` the other end of a selection. A backslash makes the next
-//! character text.
+//! link, `⟦text⟧(id)` is a reference to the block with that id, `⏎` is a line break, `|` is the caret and `^`
+//! the other end of a selection. A backslash makes the next character text.
 //!
 //! A figure's text is its caption. `fig#` is numbered, and a `*` after the kind says its picture is selected.
 //! `g> ` puts a figure or a caption in a gallery, and `g#> ` in a numbered one. A cell is `td`, or `th` in a
@@ -34,7 +34,7 @@ const SWITCHES: [(&str, Mark); 7] = [
     ("`", Mark::Code),
     ("$", Mark::Math),
 ];
-const SPECIAL: &str = "\\*~`_=$[]|^⏎";
+const SPECIAL: &str = "\\*~`_=$[]|^⏎⟦⟧";
 const TONES: [(&str, Tone); 4] =
     [("tip", Tone::Tip), ("info", Tone::Info), ("warn", Tone::Warn), ("danger", Tone::Danger)];
 
@@ -421,7 +421,7 @@ pub fn read(state: &str) -> (Document, Option<Selection>, Option<BlockId>) {
 fn inline(text: &str) -> (Vec<Run>, Option<usize>, Option<usize>) {
     let mut runs: Vec<Run> = Vec::new();
     let mut marks: BTreeSet<Mark> = BTreeSet::new();
-    let (mut anchor, mut head, mut linked) = (None, None, None);
+    let (mut anchor, mut head, mut linked, mut referring) = (None, None, None, None);
     let len = |runs: &[Run]| runs.iter().map(|run| run.text.len()).sum::<usize>();
     // A character joins the run before it unless the marks changed or that run is a finished link.
     let push = |runs: &mut Vec<Run>, c: char, marks: &BTreeSet<Mark>| match runs
@@ -459,6 +459,16 @@ fn inline(text: &str) -> (Vec<Run>, Option<usize>, Option<usize>) {
                 let (address, after) = rest[1..].split_once(')').expect("a link has an address");
                 let from = linked.take().expect("a link opens before it closes");
                 runs[from..].iter_mut().for_each(|run| run.link = Some(address.to_owned()));
+                rest = after;
+            }
+            '⟦' => {
+                runs.push(Run::marked("", marks.clone()));
+                referring = Some(runs.len() - 1);
+            }
+            '⟧' => {
+                let (id, after) = rest[1..].split_once(')').expect("a reference names a block");
+                let from = referring.take().expect("a reference opens before it closes");
+                runs[from..].iter_mut().for_each(|run| _ = run.marks.insert(Mark::Ref(BlockId::new(id))));
                 rest = after;
             }
             c => push(&mut runs, c, &marks),
@@ -537,6 +547,9 @@ fn line(block: &Block, selection: Option<&Selection>, picture: Option<&BlockId>)
     let (plain, unlinked) = (BTreeSet::new(), None);
     let mut text = String::new();
     let (mut marks, mut link) = (&plain, &unlinked);
+    let target = |marks: &BTreeSet<Mark>| {
+        marks.iter().find_map(|mark| if let Mark::Ref(id) = mark { Some(id.clone()) } else { None })
+    };
     let mut offset = 0;
     for (c, next_marks, next_link) in chars.chain([(None, &plain, &unlinked)]) {
         // The ends of the selection are written before anything else at their offset.
@@ -545,6 +558,10 @@ fn line(block: &Block, selection: Option<&Selection>, picture: Option<&BlockId>)
         }
         if head == Some(offset) {
             text.push('|');
+        }
+        let (referred, next_referred) = (target(marks), target(next_marks));
+        if let Some(id) = referred.as_ref().filter(|_| referred != next_referred) {
+            text.push_str(&format!("⟧({})", id.as_str()));
         }
         if let Some(address) = link.as_ref().filter(|_| link != next_link) {
             text.push_str(&format!("]({address})"));
@@ -556,6 +573,9 @@ fn line(block: &Block, selection: Option<&Selection>, picture: Option<&BlockId>)
         }
         if next_link.is_some() && link != next_link {
             text.push('[');
+        }
+        if next_referred.is_some() && referred != next_referred {
+            text.push('⟦');
         }
         (marks, link) = (next_marks, next_link);
         match c {
@@ -583,6 +603,8 @@ pub enum Action {
     Figures(usize, Option<(usize, bool, bool)>),
     /// Moves the caret's figure to a spot by a block.
     MoveFigure(usize, bool, bool),
+    /// Refers to a block, counted in document order and wrapped into range.
+    Refer(usize),
 }
 
 pub fn action() -> impl Strategy<Value = Action> {
@@ -613,6 +635,7 @@ pub fn action() -> impl Strategy<Value = Action> {
         "|",
         "|",
         "\n",
+        "Figure 1",
     ]);
     let keys = prop::sample::select(vec![
         "Left",
@@ -725,6 +748,7 @@ pub fn action() -> impl Strategy<Value = Action> {
         1 => (1..4usize, prop::option::of((0..40usize, any::<bool>(), any::<bool>())))
             .prop_map(|(count, spot)| Action::Figures(count, spot)),
         1 => (0..40usize, any::<bool>(), any::<bool>()).prop_map(|(at, beside, after)| Action::MoveFigure(at, beside, after)),
+        1 => (0..40usize).prop_map(Action::Refer),
     ]
 }
 
@@ -744,6 +768,12 @@ pub fn perform(editor: &mut Harness, action: &Action) {
         Action::MoveFigure(at, beside, after) => {
             if let Some(spot) = spot_by(editor, *at, *beside, *after) {
                 editor.run(Command::MoveFigure(spot));
+            }
+        }
+        Action::Refer(at) => {
+            let ids: Vec<_> = editor.editor.doc().walk().map(|block| block.id.clone()).collect();
+            if let Some(id) = ids.get(at % ids.len().max(1)) {
+                editor.run(Command::TakeReference(id.clone()));
             }
         }
         Action::Select(a, b, c, d) => {
@@ -790,7 +820,8 @@ pub fn check(editor: &Harness) -> Result<(), TestCaseError> {
 }
 
 /// What must hold after anything at all: every block has its own id, the document can be stored, the
-/// selection sits on characters of text, and a picture is selected only where there is one.
+/// selection sits on characters of text and at no place inside a reference, and a picture is selected only
+/// where there is one.
 pub fn sound(editor: &Harness) -> Result<(), TestCaseError> {
     let doc = editor.editor.doc();
     let ids: BTreeSet<_> = doc.walk().map(|block| &block.id).collect();
@@ -800,6 +831,10 @@ pub fn sound(editor: &Harness) -> Result<(), TestCaseError> {
             let block = doc.block(&pos.block).filter(|block| matches!(block.body, Body::Text(_)));
             let text = block.map(|block| block.plain_text());
             prop_assert!(text.is_some_and(|text| text.is_char_boundary(pos.offset)), "the selection is off the text");
+            prop_assert!(
+                !block.is_some_and(|block| referred(block, pos.offset)),
+                "the selection is inside a reference"
+            );
         }
     }
     let stored = Document::from_json(&doc.to_json());
@@ -820,5 +855,22 @@ pub fn sound(editor: &Harness) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// Whether `offset` is between two characters of one reference.
+fn referred(block: &Block, offset: usize) -> bool {
+    let (mut end, mut before, mut after) = (0, None, None);
+    for run in block.body.runs() {
+        let start = end;
+        end += run.text.len();
+        let to = run.marks.iter().find(|mark| matches!(mark, Mark::Ref(_)));
+        if start < offset && offset <= end {
+            before = to;
+        }
+        if start <= offset && offset < end {
+            after = to;
+        }
+    }
+    before.is_some() && before == after
+}
+
 /// A document with every kind of block and mark, for scripts to run on.
-pub const SAMPLE: &str = "h1 A *title*|\np Some **bold** and [linked](https://a.example) text, ünïcödé 👩‍👧.\nul one\n  todo two\nhr\n> p quoted\n> p lines\ntip> p a tip\ncode:rust fn main() {⏎    body();⏎}\nfig Boats at sea\ng> fig\ng> fig\ng> cap Two more\nr1> th Boat\nr1> th Length\nr2> td Skiff\nr2> td 4 m\np";
+pub const SAMPLE: &str = "h1 A *title*|\np Some **bold** and [linked](https://a.example) text, ünïcödé 👩‍👧.\nul one\n  todo two\nhr\n> p quoted\n> p lines\ntip> p a tip\ncode:rust fn main() {⏎    body();⏎}\nfig# Boats at sea\ng> fig\ng> fig\ng> cap Two more\nr1> th Boat\nr1> th Length\nr2> td Skiff\nr2> td 4 m\np\np See ⟦Figure 1⟧(b12) for more.";

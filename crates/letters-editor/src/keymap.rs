@@ -122,9 +122,11 @@ impl Keymap {
         keymap
     }
 
-    /// The keys that mean something else on a picture or in a caption than they do in other text.
+    /// The keys that mean something else on a picture, in a caption or after the words for a reference than
+    /// they do in other text.
     fn figures(&mut self) {
         self.also(Key::Escape, NONE, Command::LeaveCaption);
+        self.also(Key::Escape, NONE, Command::DismissReference);
         self.also(Key::Left, ALT, Command::ShiftFigure { right: false });
         self.also(Key::Right, ALT, Command::ShiftFigure { right: true });
     }
