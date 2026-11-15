@@ -175,7 +175,10 @@ export const serve = async (page, said, answer = () => undefined, document = und
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
-    asked.push({ method: request.method(), path, body: request.postDataBuffer(), type: await request.headerValue("content-type") });
+    // Every page asks what the person set for themselves, which is no news of the document.
+    if (request.method() !== "GET" || path !== "/api/v1/settings") {
+      asked.push({ method: request.method(), path, body: request.postDataBuffer(), type: await request.headerValue("content-type") });
+    }
     const nothing = { status: 404, body: { code: "not_found", message: "Nothing is there." } };
     const { status = 200, body = "", type = "application/json" } = (await answer(request.method(), path, request.postData())) ?? nothing;
     const sent = typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body);

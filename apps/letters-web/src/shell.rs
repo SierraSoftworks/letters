@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::mem;
 use std::ops::Range;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -192,6 +193,9 @@ pub struct Shell {
     /// The hosts whose pictures the person said they trust, for as long as the page is open. The server
     /// has nowhere to keep them.
     hosts: Vec<String>,
+    /// What the person set for themselves as their server keeps it, once it has said. What this browser
+    /// keeps of it is a copy, which the page starts with.
+    account: Option<letters_api::Settings>,
     /// The document's line to its server: it says what to send over the socket, and what to merge.
     client: Option<Client>,
     /// The socket the client last asked for.
@@ -372,6 +376,7 @@ impl Shell {
                 server,
                 linked: HashMap::new(),
                 hosts: Vec::new(),
+                account: None,
                 client: None,
                 socket: None,
                 hung: None,
@@ -529,6 +534,7 @@ impl Shell {
         shell.borrow_mut().show();
         shell.borrow_mut().fetch_fonts();
         shell.borrow_mut().go_online();
+        shell.borrow_mut().ask_settings();
         Ok(shell)
     }
 
@@ -1254,6 +1260,7 @@ impl Shell {
                     if !self.platform.keep_default_style(&json) {
                         self.view.set_default_style(self.platform.default_style());
                     }
+                    self.keep_settings();
                 }
                 // The browser asks the person for the file, and the chooser's `change` hands it over.
                 Request::ImportStyle => self.chooser.click(),
@@ -1282,6 +1289,7 @@ impl Shell {
                     self.platform.keep_settings(&settings);
                     follow(&mut self.view, settings);
                     self.view.set_dark(self.dark());
+                    self.keep_settings();
                 }
                 // A page has no folders to write in: a copy is a file the browser keeps for the person.
                 Request::SaveCopy { name, format, .. } => self.copy(name, format, None),
@@ -1313,6 +1321,9 @@ impl Shell {
             self.changed();
         }
         self.keep_pictures();
+        if mem::take(&mut self.platform.learned) {
+            self.keep_settings();
+        }
         self.keep_up();
         self.cover();
         if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
@@ -1732,6 +1743,91 @@ impl Shell {
                 shell.sync();
             });
         }
+    }
+
+    // The person's settings
+
+    /// Asks the server what the person set for themselves, on whatever device. The page starts with
+    /// what this browser kept, so that it does not change its look once it shows.
+    fn ask_settings(&mut self) {
+        if self.server.is_none() {
+            return;
+        }
+        let asked = browser::ask(&self.window, "GET", paths::SETTINGS, None);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            // A server that does not say leaves the person with what this browser kept.
+            let Ok(settings) = asked.await.map(|answer| serde_json::from_slice(&answer)) else { return };
+            let (Ok(settings), Some(shell)) = (settings, shell.upgrade()) else { return };
+            let mut shell = shell.borrow_mut();
+            shell.take_settings(settings);
+            shell.arrived();
+        });
+    }
+
+    /// Takes what the server keeps for the person, in place of what this browser kept. The words and the
+    /// default style this browser has and the server lacks are theirs too, and the server is told.
+    fn take_settings(&mut self, theirs: letters_api::Settings) {
+        let settings = Settings {
+            appearance: match theirs.appearance {
+                Some(letters_api::Appearance::Light) => Appearance::Light,
+                Some(letters_api::Appearance::Dark) => Appearance::Dark,
+                None => Appearance::System,
+            },
+            accent: theirs.accent,
+            name: theirs.name.clone(),
+            language: theirs.language.clone(),
+        };
+        self.platform.keep_settings(&settings);
+        let mut words = theirs.dictionary.clone();
+        let ours = self.platform.user_words();
+        words.extend(ours.into_iter().filter(|word| !theirs.dictionary.contains(word)));
+        self.platform.keep_user_words(&words);
+        if let Some(style) = &theirs.default_style {
+            self.platform.keep_default_style(&style.to_string());
+        }
+        self.view.set_user_words(words);
+        self.view.set_default_style(self.platform.default_style());
+        // Without a name of their own choosing, the person is who the server says they are.
+        if let (None, Some(server)) = (&settings.name, &self.server) {
+            self.view.set_author(&server.author);
+        }
+        follow(&mut self.view, settings);
+        self.fit();
+        self.account = Some(theirs);
+        self.keep_settings();
+    }
+
+    /// Has the server keep what the person set, where it differs from what the server has. The server
+    /// keeps the whole as it is sent.
+    fn keep_settings(&mut self) {
+        let Some(kept) = &self.account else { return };
+        let set = self.view.settings();
+        let ours = letters_api::Settings {
+            name: set.name.clone(),
+            language: set.language.clone(),
+            appearance: match set.appearance {
+                Appearance::Light => Some(letters_api::Appearance::Light),
+                Appearance::Dark => Some(letters_api::Appearance::Dark),
+                Appearance::System => None,
+            },
+            accent: set.accent,
+            dictionary: self.platform.user_words(),
+            default_style: self.platform.kept_default_style().or_else(|| kept.default_style.clone()),
+        };
+        if ours == *kept {
+            return;
+        }
+        let Ok(body) = serde_json::to_vec(&ours) else { return };
+        let sent = browser::ask(&self.window, "PUT", paths::SETTINGS, Some((letters_api::JSON, &body)));
+        self.account = Some(ours);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Err(refusal) = sent.await else { return };
+            let Some(shell) = shell.upgrade() else { return };
+            // The settings hold in this browser, and the person knows that they are nowhere else.
+            shell.borrow().say(refusal.message);
+        });
     }
 
     // The line to the server

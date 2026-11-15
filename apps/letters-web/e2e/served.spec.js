@@ -234,3 +234,27 @@ test("a link preview the server could not read says why in the server's words, a
   await expect(page.getByText("Not fetched: the page answered 404")).toBeAttached();
   expect(await preview(page)).toEqual(expect.objectContaining({ url: PAGE }));
 });
+
+test("what the person set elsewhere is how the page is, and what they set here is kept by the server whole", async ({ page }) => {
+  const theirs = {
+    name: "Countess of Lovelace",
+    appearance: "dark",
+    accent: [31, 138, 91],
+    dictionary: ["quik"],
+    default_style: { format: 1, page: { margin_top: 99 } },
+  };
+  const settings = (method, path) => (path !== "/api/v1/settings" ? undefined : method === "GET" ? { body: theirs } : { status: 204 });
+  const asked = await serve(page, opened(), settings);
+  await page.keyboard.press("ControlOrMeta+,");
+  for (const name of ["Dark", "Green"]) {
+    await expect(page.getByRole("button", { name, exact: true, pressed: true })).toBeAttached();
+  }
+  // This browser keeps a copy, which the next page starts with.
+  const kept = () => page.evaluate(() => ["theme", "name", "words"].map((key) => localStorage.getItem(`letters.${key}`)));
+  expect(await kept()).toEqual(["dark", "Countess of Lovelace", "quik"]);
+  expect(asked).toEqual([]);
+
+  await click(page, "Light");
+  await expect.poll(() => asked.map(({ method, path }) => `${method} ${path}`)).toEqual(["PUT /api/v1/settings"]);
+  expect(JSON.parse(asked[0].body)).toEqual({ ...theirs, appearance: "light" });
+});
