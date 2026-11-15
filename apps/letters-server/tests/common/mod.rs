@@ -127,6 +127,11 @@ impl Server {
         Self::over(Scratch::new(name), &trusting, |app| app.with_roots(roots))
     }
 
+    /// A server whose rooms hold `most` bytes of pictures that no edit names yet.
+    pub fn holding(name: &str, most: usize) -> Self {
+        Self::over(Scratch::new(name), &sound, |app| app.with_waiting(most))
+    }
+
     /// A server whose owner lets links be made.
     pub fn linking(name: &str) -> Self {
         Self::behind(name, None)

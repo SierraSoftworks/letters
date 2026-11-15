@@ -105,6 +105,9 @@ pub struct Rooms {
     closed: AtomicBool,
     /// The time when the clock was first read, and that moment on the runtime's clock.
     started: OnceLock<(u64, Instant)>,
+    /// How many bytes of pictures one room holds for edits still to come: a whole document's worth, since
+    /// a document that named more could not be kept.
+    waiting: usize,
 }
 
 struct Open {
@@ -147,6 +150,8 @@ struct Hosted {
     wrote: bool,
     /// The file is gone from its place. The room is dropped at its keeper's next turn.
     lost: bool,
+    /// The pictures handed over that no edit had named when last looked, and how large each is.
+    waiting: HashMap<String, usize>,
 }
 
 struct Seated {
@@ -181,7 +186,14 @@ impl Rooms {
             left: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             started: OnceLock::new(),
+            waiting: letters_api::Limits::default().document as usize,
         }
+    }
+
+    /// The same rooms holding fewer bytes of pictures that wait for their edit, for tests of too many.
+    pub fn holding(mut self, most: usize) -> Self {
+        self.waiting = most;
+        self
     }
 
     /// The time in milliseconds since 1970, as the rooms are told it. It never runs backwards.
@@ -287,8 +299,24 @@ impl Rooms {
 
     /// Hands the room of a file a picture, for the edit that is about to name it. `name` is the entry's,
     /// and says the hash of the bytes.
+    ///
+    /// A picture no edit ever names stays with the room, so a room holds only so many bytes of them: a
+    /// device could otherwise fill the server's memory with pictures of no document.
     pub fn add_asset(&self, app: &Shared, root: &Root, place: &Place, name: &str, bytes: Vec<u8>) -> Answer<()> {
+        let most = self.waiting;
         let handed = |hosted: &mut Hosted, now: u64| {
+            // What an edit has named since is the document's own, and waits no more.
+            let Hosted { room, waiting, .. } = &mut *hosted;
+            waiting.retain(|held, _| !room.copy().entries.contains_key(held));
+            let others: usize = waiting.iter().filter(|(held, _)| held.as_str() != name).map(|(_, size)| size).sum();
+            if others + bytes.len() > most {
+                return Err(Refusal::new(
+                    Code::TooLarge,
+                    "The server is holding as many pictures for this document as it can before the document \
+                     shows them. Send the edits that add them first.",
+                ));
+            }
+            let size = bytes.len();
             let taken = hosted.room.add_asset(name, bytes, &mut hosted.state, now);
             taken.map_err(|error| match error {
                 Error::HashMismatch(_) => {
@@ -296,6 +324,7 @@ impl Rooms {
                 }
                 error => failed(error),
             })?;
+            hosted.waiting.insert(name.to_owned(), size);
             hosted.linger = now + LINGER;
             Ok(())
         };
@@ -652,6 +681,7 @@ impl Hosted {
             missing: false,
             wrote: false,
             lost: false,
+            waiting: HashMap::new(),
         })
     }
 

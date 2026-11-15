@@ -276,6 +276,43 @@ async fn a_picture_is_handed_over_ahead_of_the_edit_that_names_it() {
 }
 
 #[tokio::test]
+async fn a_room_holds_only_so_many_pictures_that_no_edit_names() {
+    // Room for two of the three pictures at once.
+    let pictures = [b"one", b"two", b"six"].map(|more| [PNG, more.as_slice()].concat());
+    let server = Server::holding("pictures-waiting", 2 * pictures[0].len());
+    let ada = server.person("ada", &["family"]);
+    let id = ada.start("family", "", "Plan").await.id.expect("a document has an id");
+    let put = async |bytes: &[u8]| {
+        ada.send(Method::PUT, &paths::asset(&id, &named(bytes)), "image/png", bytes.to_vec()).await.status
+    };
+    let steps = [
+        (0, StatusCode::NO_CONTENT, "the first"),
+        (1, StatusCode::NO_CONTENT, "the second"),
+        (2, StatusCode::PAYLOAD_TOO_LARGE, "one more than the room holds"),
+        (1, StatusCode::NO_CONTENT, "one it holds already, which is counted once"),
+    ];
+    for (nth, expected, what) in steps {
+        assert_eq!(put(&pictures[nth]).await, expected, "{what}");
+    }
+
+    // An edit names the first: it is the document's from then on, and makes room for the third.
+    let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
+    settle([&mut desk]).await;
+    let figure = BlockKind::Figure {
+        asset: Some(format!("assets/{}", named(&pictures[0]))),
+        src: None,
+        alt: "A chart".into(),
+        width: 320.0,
+        height: 200.0,
+        numbered: false,
+    };
+    desk.edit([Op::InsertBlock { parent: None, index: 1, block: Block::new("f", figure) }]);
+    settle([&mut desk]).await;
+    assert_eq!(put(&pictures[2]).await, StatusCode::NO_CONTENT, "a picture the document shows waits no more");
+    desk.leave().await;
+}
+
+#[tokio::test]
 async fn a_device_hands_its_whole_file_over_and_nothing_is_replaced() {
     let (server, ada, id) = shared("handed-over").await;
     let mut desk = Desk::open(&server, &ada, &id).await.unwrap();

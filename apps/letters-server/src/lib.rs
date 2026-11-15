@@ -94,6 +94,12 @@ impl App {
         Self { fetches: Fetches::new(roots), ..self }
     }
 
+    /// The same server whose rooms hold fewer bytes of pictures that wait for their edit, for tests of
+    /// too many.
+    pub fn with_waiting(self, most: usize) -> Self {
+        Self { rooms: self.rooms.holding(most), ..self }
+    }
+
     /// The same server with another editor for its browsers, or with none.
     pub fn with_editor(self, editor: Option<Editor>) -> Self {
         Self { editor, ..self }
