@@ -1167,6 +1167,16 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                     let leaf = Leaf { id: Some(block.id.clone()), what: What::Label, role, words, ..Leaf::default() };
                     self.push(leaf, x, width, gap, frame);
                 }
+                // Until each is drawn as what it is, a line says what stands there.
+                BlockKind::TableOfContents { .. } | BlockKind::LinkPreview { .. } => {
+                    let said = match &block.kind {
+                        BlockKind::LinkPreview { url, title, .. } => title.as_deref().unwrap_or(url),
+                        _ => "Table of contents",
+                    };
+                    let words = Words::plain(said.to_owned());
+                    let leaf = Leaf { id: Some(block.id.clone()), what: What::Label, role, words, ..Leaf::default() };
+                    self.push(leaf, x, width, gap, frame);
+                }
                 BlockKind::Gallery { .. } => {
                     let inside = block.body.blocks();
                     // A gallery has one caption, which is its last. A merge can leave more.

@@ -20,7 +20,7 @@ enum Home {
     /// Among the pictures of a gallery.
     Gallery { gallery: BlockId, index: usize },
     /// With a figure that stands alone, in a gallery made of them.
-    Pair { figure: Block, parent: Option<BlockId>, index: usize, after: bool },
+    Pair { figure: Box<Block>, parent: Option<BlockId>, index: usize, after: bool },
     /// Among the blocks of `parent`, as a block of its own.
     Line { parent: Option<BlockId>, index: usize },
 }
@@ -213,7 +213,7 @@ impl Editor {
                         Some(Home::Gallery { gallery: gallery.id.clone(), index: place.index + usize::from(*after) })
                     }
                     None => {
-                        let (figure, parent) = (block.clone(), place.parent_id());
+                        let (figure, parent) = (Box::new(block.clone()), place.parent_id());
                         Some(Home::Pair { figure, parent, index: place.index, after: *after })
                     }
                 }
@@ -270,7 +270,7 @@ impl Editor {
             Home::Pair { figure, parent, index, after } => {
                 let numbered = matches!(figure.kind, BlockKind::Figure { numbered: true, .. });
                 // The caption the pictures share is the figure's, or else the first that came with the others.
-                let captions = [&figure].into_iter().chain(&figures).map(|block| block.body.runs());
+                let captions = [&*figure].into_iter().chain(&figures).map(|block| block.body.runs());
                 let caption = captions.filter(|runs| !runs.is_empty()).map(<[_]>::to_vec).next().map(|runs| {
                     let mut caption = Block::new(platform.new_id().as_str(), BlockKind::Caption);
                     caption.body = Body::Text(runs);
@@ -278,7 +278,7 @@ impl Editor {
                 });
                 ops.push(leave(&figure.id));
                 let mut parts: Vec<Block> = figures.into_iter().map(member).collect();
-                parts.insert(if after { 0 } else { parts.len() }, member(figure));
+                parts.insert(if after { 0 } else { parts.len() }, member(*figure));
                 parts.extend(caption);
                 let block = gallery(parts, numbered, platform);
                 ops.push(Op::InsertBlock { index: shifted(&parent, index), parent, block });

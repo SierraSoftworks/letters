@@ -355,6 +355,8 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
         BlockKind::Table { .. } => Role::Table,
         BlockKind::TableRow => Role::Row,
         BlockKind::TableCell => Role::Cell,
+        BlockKind::TableOfContents { .. } => Role::DocToc,
+        BlockKind::LinkPreview { .. } => Role::Link,
         BlockKind::Unknown { .. } => Role::Unknown,
     });
     if let Some(said) = said {

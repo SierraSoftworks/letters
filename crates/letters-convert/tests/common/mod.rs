@@ -48,6 +48,10 @@ pub fn outline(doc: &Document) -> Vec<String> {
                 }
                 BlockKind::TableRow => "row".to_owned(),
                 BlockKind::TableCell => format!("cell {}", runs(block)),
+                BlockKind::TableOfContents { levels } => format!("contents:{levels}"),
+                BlockKind::LinkPreview { url, title, .. } => {
+                    format!("preview {url} [{}]", title.as_deref().unwrap_or("-"))
+                }
                 BlockKind::Unknown { type_name } => format!("unknown:{type_name}"),
             };
             out.push(format!("{:indent$}{line}", ""));

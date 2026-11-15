@@ -149,6 +149,8 @@ fn is_written(block: &Block) -> bool {
         }
         BlockKind::TableRow => true,
         BlockKind::Unknown { .. } => !fallback(block).is_empty(),
+        // Not written yet: its lines are for the page to make.
+        BlockKind::TableOfContents { .. } => false,
         _ => true,
     }
 }
@@ -234,8 +236,14 @@ fn other(block: &Block) -> Vec<String> {
             out
         }
         BlockKind::Unknown { .. } => lines(&text(&[Run::plain(fallback(block))], Context::Lines)),
-        // A list item is written by `item`, which knows the list around it.
-        BlockKind::ListItem { .. } => Vec::new(),
+        // Until it has a mapping of its own, a preview is the link it holds, under its title.
+        BlockKind::LinkPreview { url, title, .. } => {
+            let link = Run { link: Some(url.clone()), ..Run::plain(title.as_deref().unwrap_or(url)) };
+            lines(&text(&[link], Context::Lines))
+        }
+        // A list item is written by `item`, which knows the list around it, and a table of contents
+        // is not written yet.
+        BlockKind::ListItem { .. } | BlockKind::TableOfContents { .. } => Vec::new(),
     }
 }
 

@@ -452,6 +452,13 @@ impl<'d> Writer<'d, '_> {
                         self.paragraph("Caption", None, &[Run::plain(fallback)], Vec::new());
                     }
                 }
+                // Until it has a mapping of its own, a preview is the link it holds, under its title.
+                BlockKind::LinkPreview { url, title, .. } => {
+                    let link = Run { link: Some(url.clone()), ..Run::plain(title.as_deref().unwrap_or(url)) };
+                    self.paragraph(within.unwrap_or(""), None, &[link], spans);
+                }
+                // Not written yet: its lines are for Word to make from a field.
+                BlockKind::TableOfContents { .. } => {}
             }
         }
         self.lang = around;

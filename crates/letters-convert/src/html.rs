@@ -306,8 +306,14 @@ fn written(block: &Block, page: &mut Writing, out: &mut String) {
                 out.push_str("</p>\n");
             }
         }
-        // Written by `item`, which knows the list around it.
-        BlockKind::ListItem { .. } => {}
+        // Until it has a mapping of its own, a preview is the link it holds, under its title.
+        BlockKind::LinkPreview { url, title, .. } => {
+            let link = Run { link: Some(url.clone()), ..Run::plain(title.as_deref().unwrap_or(url)) };
+            element("p", &[link], page.text(0), out);
+        }
+        // A list item is written by `item`, which knows the list around it, and a table of contents
+        // is not written yet.
+        BlockKind::ListItem { .. } | BlockKind::TableOfContents { .. } => {}
     }
 }
 
