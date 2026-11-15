@@ -65,6 +65,57 @@ test("a flick carries the document on after the finger has gone", async ({ page 
   expect((await under(page, 400, "?")) - before).toBeGreaterThan(15);
 });
 
+/** The handles on show, as the middles of their dots from left to right. */
+const handles = (page) =>
+  page.evaluate(() =>
+    [...document.querySelectorAll("[data-letters=handle]:not([hidden])")]
+      .map((handle) => handle.getBoundingClientRect())
+      .map((box) => ({ x: box.x + box.width / 2, y: box.y + 8 }))
+      .sort((a, b) => a.x - b.x),
+  );
+
+/** What is selected in the caret's paragraph, as the hidden input holds it. */
+const selected = (page) =>
+  page.locator("textarea").evaluate((input) => input.value.slice(input.selectionStart, input.selectionEnd));
+
+/** One finger down at `from`, slid `dx` pixels along the line, and lifted. */
+const slide = async (page, from, dx) => {
+  const touch = await page.context().newCDPSession(page);
+  const point = (at) => [{ x: from.x + (dx * at) / 4, y: from.y, id: 1 }];
+  await touch.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: point(0) });
+  for (let at = 1; at <= 4; at++) {
+    await touch.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: point(at) });
+  }
+  await touch.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+};
+
+test("a selection a finger made has a handle at each end, and a finger on one moves that end", async ({ page }) => {
+  // Two taps on a word select it.
+  await page.touchscreen.tap(360, 300);
+  await page.touchscreen.tap(360, 300);
+  await expect.poll(() => selected(page)).toBe("Paragraph");
+  const [start, end] = await handles(page);
+  expect(end.x - start.x).toBeGreaterThan(40);
+  expect(end.y).toBeCloseTo(start.y, 0);
+
+  await slide(page, end, 30);
+  await expect.poll(() => selected(page)).toMatch(/^Paragraph \d/);
+  const longer = await selected(page);
+  await slide(page, (await handles(page))[0], 25);
+  await expect.poll(async () => longer.endsWith(await selected(page)) && (await selected(page)).length < longer.length).toBe(true);
+  // The handles went with their ends.
+  const [from, to] = await handles(page);
+  expect(from.x).toBeGreaterThan(start.x);
+  expect(to.x).toBeGreaterThan(end.x);
+
+  // A caret has none, and neither has a selection a mouse makes.
+  await page.touchscreen.tap(550, 300);
+  await expect.poll(() => handles(page)).toHaveLength(0);
+  await page.mouse.dblclick(360, 300);
+  await expect.poll(() => selected(page)).toBe("Paragraph");
+  expect(await handles(page)).toHaveLength(0);
+});
+
 test("a soft keyboard's backspace and Enter arrive although no key says so", async ({ page }) => {
   await page.keyboard.press("ControlOrMeta+End");
   const input = page.locator("textarea");

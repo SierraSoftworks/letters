@@ -20,8 +20,9 @@ use wasm_bindgen::{Clamped, JsCast};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Blob, BlobPropertyBag, CanvasRenderingContext2d, ClipboardEvent, CompositionEvent, DragEvent, Element, Event,
-    EventTarget, File, FileList, HtmlAnchorElement, HtmlCanvasElement, HtmlIFrameElement, HtmlInputElement,
-    HtmlTextAreaElement, ImageData, KeyboardEvent, MediaQueryList, MouseEvent, PointerEvent, Url, WheelEvent, Window,
+    EventTarget, File, FileList, HtmlAnchorElement, HtmlCanvasElement, HtmlElement, HtmlIFrameElement,
+    HtmlInputElement, HtmlTextAreaElement, ImageData, KeyboardEvent, MediaQueryList, MouseEvent, PointerEvent, Url,
+    WheelEvent, Window,
 };
 
 use crate::browser::{self, Browser};
@@ -38,6 +39,12 @@ const HIDDEN: &str = "position:fixed;width:1px;padding:0;border:0;margin:0;outli
 
 /// The hidden input when a keyboard is to leave what is typed as it is.
 const HELP: [(&str, &str); 2] = [("autocapitalize", "off"), ("autocorrect", "off")];
+
+/// A handle at one end of a selection a finger made: a dot under the line, in a square large enough for a
+/// finger to take hold of. It scrolls nothing, so that a finger on it moves the selection's end.
+const HANDLE: &str = "position:fixed;width:40px;height:40px;margin-left:-20px;touch-action:none;";
+/// The dot's radius, in pixels.
+const DOT: f32 = 7.0;
 
 /// The kinds of picture a document keeps, which is what the person is offered to choose from.
 const PICTURES: &str = "image/png,image/jpeg,image/gif,image/webp";
@@ -111,6 +118,12 @@ pub struct Shell {
     chooser: HtmlInputElement,
     /// The file input the person chooses pictures with.
     picker: HtmlInputElement,
+    /// The handles at the ends of the selection, the anchor's first, and how each was last styled.
+    handles: [(HtmlElement, String); 2],
+    /// Whether the page was last pressed by a finger, which is who the handles are for.
+    fingers: bool,
+    /// The handle a finger holds, and where the finger is from the middle of the line its end is on.
+    grab: Option<(usize, Point)>,
 
     view: View,
     platform: Browser,
@@ -179,6 +192,15 @@ impl Shell {
             picker.set_attribute(name, value)?;
         }
         chooser.insert_adjacent_element("afterend", &picker)?;
+        let handle = || -> Result<(HtmlElement, String), JsValue> {
+            let handle: HtmlElement = document.create_element("div")?.dyn_into()?;
+            for (name, value) in [("data-letters", "handle"), ("aria-hidden", "true"), ("hidden", "")] {
+                handle.set_attribute(name, value)?;
+            }
+            picker.insert_adjacent_element("afterend", &handle)?;
+            Ok((handle, String::new()))
+        };
+        let handles = [handle()?, handle()?];
 
         let mac = window.navigator().platform().is_ok_and(|name| name.starts_with("Mac") || name.starts_with("iP"));
         let dark_mode = window.match_media("(prefers-color-scheme: dark)")?;
@@ -197,6 +219,9 @@ impl Shell {
                 mirror_timer: None,
                 chooser: chooser.clone(),
                 picker: picker.clone(),
+                handles: handles.clone(),
+                fingers: false,
+                grab: None,
                 window: window.clone(),
                 canvas: canvas.clone(),
                 context,
@@ -284,6 +309,13 @@ impl Shell {
         hear(&shell, &canvas, "pointerup", Self::pointer_up)?;
         hear(&shell, &canvas, "pointercancel", Self::pointer_cancel)?;
         hear(&shell, &canvas, "pointerleave", |shell, _: Event| shell.view.pointer_leave())?;
+        for (which, (handle, _)) in handles.iter().enumerate() {
+            // A finger that rests on a handle is holding it, not asking the browser for a menu.
+            listen(handle, "contextmenu", |event| event.prevent_default())?;
+            for kind in ["pointerdown", "pointermove", "pointerup", "pointercancel"] {
+                hear(&shell, handle, kind, move |shell, event: PointerEvent| shell.handle(which, event))?;
+            }
+        }
         hear(&shell, &canvas, "wheel", Self::wheel)?;
         // The secondary button, Ctrl with a press on a Mac and a long press on a touch screen all ask for
         // a menu this way. The Menu key and Shift+F10 ask the element that has the keyboard.
@@ -509,6 +541,7 @@ impl Shell {
             self.input.style().set_css_text(&format!("{HIDDEN}left:{left}px;top:{top}px;height:{}px", at.height));
         }
         self.caret = caret;
+        self.place_handles();
         let cursor = self.view.cursor();
         if cursor != self.cursor {
             self.cursor = cursor;
@@ -856,6 +889,7 @@ impl Shell {
         }
         // A drag keeps reporting to the canvas after it leaves it.
         report(self.canvas.set_pointer_capture(event.pointer_id()));
+        self.fingers = touch(&event).is_some();
         if let Some(touch) = touch(&event) {
             return self.finger(Finger::Down { id: touch, at: place(&event), ms: event.time_stamp() });
         }
@@ -907,6 +941,83 @@ impl Shell {
                 self.view.pointer_up(at, &mut self.platform);
                 self.hand_over();
             }
+        }
+    }
+
+    // Selection handles
+
+    /// Puts the handles under the two ends of a selection a finger made, and away otherwise.
+    fn place_handles(&mut self) {
+        let ranged = self.view.editor().selection().is_some_and(|selection| !selection.is_caret());
+        let mut ends = match self.fingers && ranged && self.view.types_in_canvas() {
+            true => self.view.selection_ends(),
+            false => [None, None],
+        };
+        // The end a held handle moves is the head for as long as it is held.
+        if matches!(self.grab, Some((0, _))) {
+            ends.swap(0, 1);
+        }
+        let canvas = ends.iter().flatten().next().map(|_| self.canvas.get_bounding_client_rect());
+        let ink = match self.view.settings().accent {
+            Some([r, g, b]) => (r, g, b),
+            None => {
+                let ink = tokens::ACCENT.resolve(if self.dark() { Scheme::Dark } else { Scheme::Light });
+                (ink.r, ink.g, ink.b)
+            }
+        };
+        for ((handle, styled), end) in self.handles.iter_mut().zip(ends) {
+            let style = match canvas.as_ref().zip(end) {
+                Some((canvas, end)) => {
+                    let (left, top) = (canvas.left() + f64::from(end.x), canvas.top() + f64::from(end.y + end.height));
+                    let (r, g, b) = ink;
+                    let dot = format!(
+                        "radial-gradient(circle {DOT}px at 50% {}px,rgb({r} {g} {b}) 95%,transparent)",
+                        DOT + 1.0
+                    );
+                    format!("{HANDLE}left:{left}px;top:{top}px;background:{dot}")
+                }
+                None => String::new(),
+            };
+            if style != *styled {
+                handle.set_hidden(style.is_empty());
+                report(handle.set_attribute("style", &style));
+                *styled = style;
+            }
+        }
+    }
+
+    /// A finger on a handle moves the end of the selection it is at, as a drag with Shift held does.
+    fn handle(&mut self, which: usize, event: PointerEvent) {
+        let canvas = self.canvas.get_bounding_client_rect();
+        let finger = Point {
+            x: (f64::from(event.client_x()) - canvas.left()) as f32,
+            y: (f64::from(event.client_y()) - canvas.top()) as f32,
+        };
+        if event.type_() == "pointerdown" {
+            let (Some(end), Some(selection)) = (self.view.selection_ends()[which], self.view.editor().selection())
+            else {
+                return;
+            };
+            event.prevent_default();
+            report(self.handles[which].0.set_pointer_capture(event.pointer_id()));
+            // A drag moves the head, so the anchor's handle makes its end the head first.
+            if which == 0 {
+                let turned = Selection { anchor: selection.head.clone(), head: selection.anchor.clone() };
+                self.view.select(turned);
+            }
+            let line = Point { x: end.x, y: end.y + end.height / 2.0 };
+            self.grab = Some((which, Point { x: finger.x - line.x, y: finger.y - line.y }));
+            self.pointer = line;
+            let shift = Modifiers { shift: true, ..Modifiers::default() };
+            return self.view.pointer_down(line, shift, &mut self.platform);
+        }
+        let Some((_, from)) = self.grab.filter(|(held, _)| *held == which) else { return };
+        self.pointer = Point { x: finger.x - from.x, y: finger.y - from.y };
+        if event.type_() == "pointermove" {
+            self.view.pointer_move(self.pointer, &mut self.platform);
+        } else {
+            self.view.pointer_up(self.pointer, &mut self.platform);
+            self.grab = None;
         }
     }
 
@@ -1040,7 +1151,7 @@ fn hear<E: JsCast + 'static>(
     shell: &Rc<RefCell<Shell>>,
     target: &EventTarget,
     kind: &str,
-    handler: fn(&mut Shell, E),
+    handler: impl Fn(&mut Shell, E) + 'static,
 ) -> Result<(), JsValue> {
     let shell = Rc::downgrade(shell);
     // The pointer's travels change nothing the mirror says.
