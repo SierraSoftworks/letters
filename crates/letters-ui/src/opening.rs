@@ -179,6 +179,20 @@ pub enum Request {
     /// The person wants the server asked again, after it ended the session: see
     /// [`Connection::Refused`](crate::Connection). Answer with `Window::set_connection`.
     Connect,
+    /// The Share dialog opened on a document a server keeps: who is it shared with? Answer with
+    /// `Window::set_shares`, or with `Window::refuse_share` and the server's sentence. Asked again after a
+    /// refusal, since the dialog then shows what may not be so.
+    Shares,
+    /// The document's owner changed who it is shared with: these are all its people from here on, as the
+    /// server's `PUT` of a document's shares takes them. The dialog shows them already. Answer as for
+    /// [`Request::Shares`].
+    SharePeople(Vec<letters_api::Grant>),
+    /// The owner asked for a link. Answer with `Window::link_made` and what the server made, which is the
+    /// one time its address is told, or with `Window::refuse_share`.
+    MakeLink(letters_api::NewLink),
+    /// The owner revoked the link with this id. The dialog has dropped it already. Answer only when it could
+    /// not be done, with `Window::refuse_share`.
+    RevokeLink(String),
 }
 
 /// A document opened lately, as the landing card lists it.

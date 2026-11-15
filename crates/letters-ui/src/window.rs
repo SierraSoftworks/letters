@@ -62,6 +62,7 @@ use crate::restyle::{self, Field, StyleEdit};
 use crate::review::{self, Review, Reviewing, Shown};
 use crate::safe::{self, Safe, SafeMode, Safely};
 use crate::settings::{Dialog, Setting, Settings};
+use crate::sharing::{Share, Shared, Sharing};
 use crate::spelling::Spelling;
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::styles::{self, Styles, Styling};
@@ -194,7 +195,8 @@ pub enum Message {
     /// Shows a panel, or hides it when it is the one showing.
     Panel(Panel),
     ClosePanel,
-    Share(bool),
+    /// Something the Share dialog asks.
+    Sharing(Sharing),
     /// Brings the page to where someone else who has the document open is, by their session.
     Visit(u64),
     /// Puts the caret at the start of a block and brings the block to the top of the page.
@@ -312,7 +314,7 @@ impl Message {
             Message::Maths(_) | Message::Insert(_) | Message::Fence(_) | Message::Refer(_) => true,
             Message::Language(_) | Message::Callout(_) | Message::Contents(_) | Message::Preview(_) => true,
             Message::Alt(_) | Message::Styles(_) | Message::Restyle(_) | Message::Draft(..) => true,
-            Message::Apply(_) | Message::Merge(_) | Message::History(_) => true,
+            Message::Apply(_) | Message::Merge(_) | Message::History(_) | Message::Sharing(_) => true,
             Message::Panel(panel) => *panel == Panel::Styles,
             Message::Linked(asked) => matches!(asked, Linking::Embed | Linking::EmbedAll),
             _ => false,
@@ -536,6 +538,26 @@ impl Ui<EditorApp> {
         if self.app().access != access {
             self.app_mut().grant(access);
         }
+    }
+
+    /// Says who the document is shared with, as the server answers: see [`Shared`]. It answers
+    /// [`Request::Shares`] and [`Request::SharePeople`], and may be said whenever the shares change. The
+    /// Share dialog lists them, and lets the document's owner change them.
+    pub fn set_shares(&mut self, shared: Shared) {
+        self.app_mut().share.told(shared);
+    }
+
+    /// Says that something the Share dialog asked could not be done, in a sentence that stands by itself:
+    /// the server's own, where it gave one. The dialog shows it and asks for the shares again.
+    pub fn refuse_share(&mut self, why: &str) {
+        let app = self.app_mut();
+        app.share.refused(why, &mut app.requests);
+    }
+
+    /// Hands over the link a [`Request::MakeLink`] made. Its address is told this once, so the dialog
+    /// offers to copy it until the window closes.
+    pub fn link_made(&mut self, created: letters_api::CreatedLink) {
+        self.app_mut().share.made(created);
     }
 
     /// Says what the person may take away of the document: see [`Allows`]. A shell says it of a document
@@ -1114,7 +1136,7 @@ pub struct EditorApp {
     presence: Presence,
     edits: u64,
     panel: Option<Panel>,
-    sharing: bool,
+    share: Share,
     /// The address in the link editor while it is open.
     link: Option<String>,
     /// What is typed into one of the style's fields, and the element type it was typed for.
@@ -1229,7 +1251,7 @@ impl EditorApp {
             presence: Presence::default(),
             edits: 0,
             panel: None,
-            sharing: false,
+            share: Share::default(),
             link: None,
             draft: None,
             styles: Styles::default(),
@@ -2008,14 +2030,14 @@ impl EditorApp {
         // write one. Of the editor's own commands the editor says which apply.
         let reads = match act {
             Act::Run(_) | Act::Load | Act::AlwaysLoad | Act::Panel(Panel::Notes) | Act::Review(_) => true,
-            Act::NewDocument | Act::Open | Act::SaveCopy | Act::Export | Act::CleanCopy | Act::Share => true,
+            Act::NewDocument | Act::Open | Act::SaveCopy | Act::Export | Act::CleanCopy => true,
             Act::Settings | Act::TrustDocument | Act::TrustFolder | Act::Print => true,
             Act::Find | Act::FindStep { .. } | Act::Palette => true,
             Act::Comment => !self.margin.reads,
             Act::MoveRow { .. } | Act::MoveColumn { .. } | Act::Link | Act::Pictures | Act::Preview => false,
             Act::AltText | Act::Callout | Act::CodeLanguage | Act::Embed | Act::EmbedAll => false,
             Act::Panel(Panel::Styles) | Act::Rename | Act::Save | Act::PageSetup => false,
-            Act::MergeConflicts | Act::MergeFrom | Act::MergeInto => false,
+            Act::MergeConflicts | Act::MergeFrom | Act::MergeInto | Act::Share => false,
             Act::History | Act::SelectionHistory | Act::Misspelling { .. } | Act::Replace => false,
         };
         if !(reads || self.writes()) {
@@ -2082,7 +2104,7 @@ impl EditorApp {
             Act::SaveCopy => Message::Copy(Copying::Open(CopyFormat::Letters)),
             Act::Export => Message::Copy(Copying::Open(CopyFormat::Pdf)),
             Act::CleanCopy => Message::Copy(Copying::Open(CopyFormat::Clean)),
-            Act::Share => Message::Share(true),
+            Act::Share => Message::Sharing(Sharing::Open),
             Act::Settings => Message::Settings(Setting::Show),
             Act::PageSetup => Message::Styles(Styling::PageSetup),
             Act::TrustDocument => self.safe.on().then_some(Message::Safe(Safely::TrustDocument))?,
@@ -2169,6 +2191,7 @@ impl EditorApp {
         self.insert.close();
         self.fence.close();
         self.commands.close();
+        self.share.close();
         if self.grip.release() {
             self.drop = None;
         }
@@ -2223,7 +2246,7 @@ impl EditorApp {
             Historying::Show => {
                 // What hangs from the page waits there for the way back. What lies over the window goes.
                 self.commands.close();
-                self.sharing = false;
+                self.share.close();
                 if self.grip.release() {
                     self.drop = None;
                 }
@@ -2428,7 +2451,7 @@ impl EditorApp {
             Printing::Show => {
                 // What hangs from the page waits there for the way back. What lies over the window goes.
                 self.commands.close();
-                self.sharing = false;
+                self.share.close();
                 if self.grip.release() {
                     self.drop = None;
                 }
@@ -4454,13 +4477,6 @@ impl EditorApp {
 
     /// Fills the bar for editing: the document's name, the format controls, and what the window offers.
     fn editing(&self, mut bar: TopBar<Message>) -> TopBar<Message> {
-        let share = Element::column()
-            .gap(tokens::SPACE_LG)
-            .min_width(320.0)
-            .child(Element::text("Share", TextStyle::title()))
-            .child(Element::from(Button::new("Done").on_press(Message::Share(false))).align_self(Align::End));
-        let share = Popover::new(share).label("Share").modal().open(self.sharing).on_close(Message::Share(false));
-
         let keys = |act: Act| commands::shortcut(&act, self.editor.keymap(), self.mac).unwrap_or_default();
         let more = Menu::new()
             .label("More")
@@ -4517,7 +4533,10 @@ impl EditorApp {
         if let Some(faces) = self.presence.faces() {
             bar = bar.end(faces);
         }
-        bar = bar.end(Button::new("Share").icon(icon::USERS).small().on_press(Message::Share(true)).popover(share));
+        // Who else reaches the document is for someone who writes it to see, and for its owner to say.
+        if self.writes() {
+            bar = bar.end(Button::new("Share").icon(icon::USERS).small().on_press(Message::Sharing(Sharing::Open)));
+        }
         bar = bar.end(TopBar::rule());
         let mut panels = cluster();
         // The styles are changed in their panel, and the history has what was written before to be had
@@ -5208,7 +5227,10 @@ impl EditorApp {
                 self.show((self.panel != Some(panel)).then_some(panel));
             }
             Message::ClosePanel => self.show(None),
-            Message::Share(open) => self.sharing = open,
+            Message::Sharing(asked) => {
+                let served = (self.connection.is_some(), self.zone);
+                self.share.update(asked, served, platform, &mut self.requests);
+            }
             Message::Visit(session) => self.visit(session),
             Message::Correct(text) => {
                 self.context = None;
@@ -5419,6 +5441,7 @@ impl App for EditorApp {
         // The settings and the card about a link come last, so that they lie over whatever else is out.
         let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
         let over = over.chain(self.merges.card());
+        let over = over.chain(self.share.view(&self.name().0, self.connection.is_some(), window.height));
         let commands = self.commands.open().then(|| {
             let (offers, keymap) = (self.offers(), self.editor.keymap());
             self.commands.view(&offers, keymap, self.mac, bar, window)

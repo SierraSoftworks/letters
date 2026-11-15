@@ -3881,6 +3881,7 @@ version = "0.1.0"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
+ "letters-api",
  "letters-convert",
  "letters-editor",
  "letters-model",
@@ -3901,6 +3902,7 @@ version = "0.1.0"
 dependencies = [
  "accesskit",
  "image",
+ "letters-api",
  "letters-convert",
  "letters-editor",
  "letters-fonts",

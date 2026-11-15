@@ -336,8 +336,8 @@ fn the_bar_says_what_the_person_may_do_where_its_tools_stood() {
         (Access::Reads, Some(("Reading", "You can read this document, but not change it."))),
     ];
     // What changes the document from the bar, and what does not.
-    let tools = ["Undo", "Redo", "Bold", "Italic", "Link", "Styles", "History"];
-    let stays = ["Notes", "More", "Share"];
+    let tools = ["Undo", "Redo", "Bold", "Italic", "Link", "Styles", "History", "Share"];
+    let stays = ["Notes", "More"];
     let others: Vec<&str> = cases.iter().filter_map(|(_, says)| Some(says.as_ref()?.0)).collect();
     let mut window = plan();
     // The role can change while the document is open, and back.
