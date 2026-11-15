@@ -1231,6 +1231,55 @@ fn the_bar_says_how_saving_stands_and_where_the_first_write_went() {
 }
 
 #[test]
+fn a_document_that_is_kept_only_when_asked_is_saved_from_the_mark_the_palette_and_the_key() {
+    fn commands(window: &mut Harness) -> Vec<String> {
+        window.key("Mod+Shift+P");
+        let listed = window.controls().into_iter().filter(|found| found.role == Role::ListBoxOption);
+        let names = listed.map(|found| found.name).collect();
+        window.key("Escape");
+        names
+    }
+    // A way to ask, in a window whose shell says there is something to keep.
+    type Ask = fn(&mut Harness);
+    let ways: [(&str, Ask); 4] = [
+        ("the mark", |window| _ = window.click(Role::Button, "Save")),
+        ("the palette", |window| _ = window.key("Mod+Shift+P").type_text("save").key("Enter")),
+        ("the key", |window| _ = window.key("Mod+S")),
+        ("the key while an earlier version shows", |window| _ = window.click(Role::Button, "History").key("Mod+S")),
+    ];
+    for (way, ask) in ways {
+        let mut window = letter();
+        window.ui().set_save_state(SaveState::Edited);
+        window.ui().take_requests();
+        ask(&mut window);
+        assert_eq!(window.ui().take_requests(), [Request::Save], "{way}");
+    }
+
+    // The mark that asks stands where the mark that tells stood, and nothing beside it moves.
+    let mut window = letter();
+    let bar = bar_controls(&mut window);
+    window.ui().set_save_state(SaveState::Edited);
+    let mut asking = bar_controls(&mut window);
+    let mark = asking.iter().position(|(name, _)| name == "Save").expect("the mark is a button");
+    let (told, asks) = (window.find(Role::Label, "Saved"), asking.remove(mark).1);
+    assert_eq!((told, asking), (None, bar));
+    window.ui().set_save_state(SaveState::Saved);
+    assert_eq!(window.find(Role::Label, "Saved").map(|told| told.bounds), Some(asks));
+
+    // A document that is saved as it is written has nothing to ask for.
+    for state in [SaveState::Saved, SaveState::Saving, SaveState::Offline, SaveState::Failed, SaveState::Unsaved] {
+        let mut window = letter();
+        window.ui().set_save_state(state);
+        window.ui().take_requests();
+        assert_eq!(window.find(Role::Button, "Save"), None, "{state:?}");
+        assert!(!commands(&mut window).contains(&"Save".to_owned()), "{state:?}");
+        window.key("Mod+S");
+        assert_eq!(window.ui().take_requests(), [], "{state:?}");
+        window.assert_markdown("# Roof repairs\n\nHarland Roofing sent a quote.\n\n## Next steps\n\nReply by Friday.");
+    }
+}
+
+#[test]
 fn the_more_menu_asks_the_shell_for_a_new_document_or_another_one() {
     for (item, request) in [("New document", Request::New), ("Open", Request::OpenDialog)] {
         let mut window = letter();

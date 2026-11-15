@@ -77,6 +77,8 @@ pub(crate) enum Act {
     NewDocument,
     Open,
     Rename,
+    /// Asks the shell to save the document, where it does so only when asked.
+    Save,
     SaveCopy,
     Export,
     Share,
@@ -130,7 +132,7 @@ const fn table(name: &'static str, also: &'static str, edit: TableEdit) -> Entry
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 77] = [
+pub(crate) static ENTRIES: [Entry; 78] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier settle resolve", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -201,6 +203,7 @@ pub(crate) static ENTRIES: [Entry; 77] = [
     entry("Document", "New document", "create", Act::NewDocument),
     entry("Document", "Open", "file", Act::Open),
     entry("Document", "Rename or move", "name folder", Act::Rename),
+    entry("Document", "Save", "keep write file download", Act::Save),
     entry("Document", "Save a copy", "duplicate", Act::SaveCopy),
     entry("Document", "Export", "pdf word markdown html web", Act::Export),
     entry("Document", "Share", "", Act::Share),
@@ -214,11 +217,12 @@ const PRIMARY: Modifiers = Modifiers { primary: true, shift: false, alt: false }
 const PRIMARY_SHIFT: Modifiers = Modifiers { primary: true, shift: true, alt: false };
 
 /// The keys the window binds itself, for what is no command of the editor's.
-static KEYS: [(KeyEvent, Act); 5] = [
+static KEYS: [(KeyEvent, Act); 6] = [
     (KeyEvent { key: Key::Char('p'), mods: PRIMARY_SHIFT }, Act::Palette),
     (KeyEvent { key: Key::Char('p'), mods: PRIMARY }, Act::Print),
     (KeyEvent { key: Key::Char('k'), mods: PRIMARY }, Act::Link),
     (KeyEvent { key: Key::Char(','), mods: PRIMARY }, Act::Settings),
+    (KeyEvent { key: Key::Char('s'), mods: PRIMARY }, Act::Save),
     (KeyEvent { key: Key::Char('s'), mods: PRIMARY_SHIFT }, Act::SaveCopy),
 ];
 
@@ -467,6 +471,7 @@ mod tests {
         let cases = [
             (Act::Run(Command::ToggleMark(Mark::Bold)), Some("Ctrl+B")),
             (Act::Link, Some("Ctrl+K")),
+            (Act::Save, Some("Ctrl+S")),
             (Act::SaveCopy, Some("Ctrl+Shift+S")),
             (Act::Palette, Some("Ctrl+Shift+P")),
             (Act::Share, None),

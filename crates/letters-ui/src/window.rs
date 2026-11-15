@@ -107,7 +107,9 @@ const SAVE_ICON: f32 = 14.0;
 /// The editor's window.
 pub type Window = Ui<EditorApp>;
 
-/// What the top bar says about saving. There is no save command: the title is the file's name.
+/// What the top bar says about saving. A document is saved as it is written, so there is no save command:
+/// the title is the file's name. Only a shell that keeps the document when asked reports
+/// [`SaveState::Edited`], which is when the window asks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SaveState {
     #[default]
@@ -119,6 +121,10 @@ pub enum SaveState {
     Unsaved,
     /// The last write did not succeed.
     Failed,
+    /// The document was written on since it was last kept, by a shell that keeps it only when asked, as a
+    /// browser does without a server. The bar's mark is then a button that asks with [`Request::Save`],
+    /// and so do the palette and Ctrl or Cmd with S.
+    Edited,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1537,6 +1543,8 @@ impl EditorApp {
             Act::NewDocument => Message::NewDocument,
             Act::Open => Message::OpenDialog,
             Act::Rename => Message::Rename(Rename::Open),
+            // Only where the shell keeps the document when asked, and has something to keep.
+            Act::Save => (self.save == SaveState::Edited).then_some(Message::Ask(Request::Save))?,
             Act::SaveCopy => Message::Copy(Copying::Open(CopyFormat::Letters)),
             Act::Export => Message::Copy(Copying::Open(CopyFormat::Pdf)),
             Act::Share => Message::Share(true),
@@ -1662,6 +1670,12 @@ impl EditorApp {
     /// What a key does while the history shows: it steps through the versions, moves through the one
     /// that shows, or goes back to editing. Nothing is written there.
     fn history_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        // Saving where it is asked for writes nothing on the document, and is asked from here as well.
+        let save = commands::bound(event).filter(|act| **act == Act::Save).and_then(|act| self.asked(act));
+        if let Some(save) = save {
+            self.update(save, platform);
+            return true;
+        }
         let plain = !event.mods.primary && !event.mods.alt;
         let asked = match event.key {
             Key::Escape => Historying::Back,
@@ -1761,7 +1775,7 @@ impl EditorApp {
         }
         let asked = match commands::bound(event) {
             Some(Act::Print) => Some(Message::Print(Printing::Print)),
-            Some(act @ (Act::Settings | Act::SaveCopy)) => self.asked(act),
+            Some(act @ (Act::Settings | Act::Save | Act::SaveCopy)) => self.asked(act),
             _ => None,
         };
         let bound = asked.is_some();
@@ -3000,6 +3014,17 @@ impl EditorApp {
                 lead.push(Element::row().width(SAVE_ICON).decorative());
                 return lead;
             }
+            // What is not kept yet is kept by a press on the mark, which takes no more room for it.
+            SaveState::Edited => {
+                let save = Element::icon(icon::SAVE, SAVE_ICON)
+                    .role(Role::Button)
+                    .label("Save")
+                    .description("Changes are not saved yet")
+                    .tooltip("Save. Changes are not saved yet", Side::Bottom)
+                    .on_press(Message::Ask(Request::Save));
+                lead.push(save);
+                return lead;
+            }
         };
         // For a moment after its first write, the icon tells where the document went.
         let note = self.note.as_ref().filter(|_| self.save == SaveState::Saved);
@@ -3691,7 +3716,7 @@ impl App for EditorApp {
             return true;
         }
         // The editor leaves some keys to the window: the palette, the link that is edited in place, the
-        // settings and the card that saves a copy.
+        // settings, saving where it is asked for, and the card that saves a copy.
         let asked = commands::bound(event).and_then(|act| self.asked(act));
         let bound = asked.is_some();
         if let Some(message) = asked {
