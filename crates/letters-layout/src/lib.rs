@@ -51,7 +51,7 @@ use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Role as Tag};
 use parley::{Alignment, Language, PositionedLayoutItem};
 
 use crate::engine::Engine;
-use crate::flow::{Frame, Leaf, Look, Part, Picture, Role, Table, Types, What, Words};
+use crate::flow::{Cards, Frame, Leaf, Look, Part, Picture, Role, Table, Types, What, Words};
 use crate::ink::{Brush, Ink, Inks};
 use crate::leaf::{Extent, Laid, Lay, Lit, Open, Over, Painter, Source, Swap, Text};
 use crate::reveal::{Reveal, Shapes, Shifts};
@@ -220,7 +220,7 @@ impl DocLayout {
             loaded: HashMap::new(),
             caption: None,
             listing: false,
-            notes: HashMap::new(),
+            cards: Cards::default(),
             scratch: Laid::default(),
         };
         Self { state: RefCell::new(state) }
@@ -624,6 +624,16 @@ impl DocLayout {
         self.state.get_mut().set_preview_note(block, note)
     }
 
+    /// Sets whether a link preview that has only its address keeps room at its end for a control that
+    /// fetches the rest, which it does until set. A window that stands no control there, as in a shell that
+    /// cannot fetch, turns this off: the address and its note then have the card's whole width, and
+    /// [`PreviewBox::control`] is `None`.
+    ///
+    /// Returns whether a card is laid out anew for it, which can move what is below.
+    pub fn set_preview_control(&mut self, kept: bool) -> bool {
+        self.state.get_mut().set_preview_control(kept)
+    }
+
     /// The rectangles that highlight a selection, one per line it touches.
     ///
     /// This lays out every block the selection covers. To paint, use [`DocLayout::selection_in`].
@@ -752,8 +762,8 @@ struct State {
     caption: Option<BlockId>,
     /// Whether the document has a table of contents, which reads what its headings say.
     listing: bool,
-    /// What a window has to say on a link preview that has only its address, by the preview's block.
-    notes: HashMap<BlockId, String>,
+    /// What a window has told of the document's link previews.
+    cards: Cards,
     /// A layout to measure with, so that measuring allocates nothing.
     scratch: Laid,
 }
@@ -849,7 +859,7 @@ impl State {
         let renumbered = numbers != self.numbers;
         self.numbers = numbers;
         let changed = carry.map(|change| &change.blocks);
-        let flow = flow::flow(doc, &self.types, &self.numbers, &self.notes, self.width, changed, |block| {
+        let flow = flow::flow(doc, &self.types, &self.numbers, &self.cards, self.width, changed, |block| {
             // A block inside a leaf, such as a cell, has no leaf to hand over.
             let at = index.get(block)?.leaf;
             (old[at].id.as_ref() == Some(block)).then(|| std::mem::take(&mut old[at]))
@@ -962,8 +972,8 @@ impl State {
     fn set_preview_note(&mut self, block: &BlockId, note: Option<&str>) -> bool {
         let note = note.map(str::trim).filter(|note| !note.is_empty());
         match note {
-            Some(note) => self.notes.insert(block.clone(), note.to_owned()),
-            None => self.notes.remove(block),
+            Some(note) => self.cards.notes.insert(block.clone(), note.to_owned()),
+            None => self.cards.notes.remove(block),
         };
         let Some(&Slot { leaf: at, .. }) = self.index.get(block) else { return false };
         let leaf = &mut self.leaves[at];
@@ -980,6 +990,20 @@ impl State {
         }
         self.lay(at);
         true
+    }
+
+    fn set_preview_control(&mut self, kept: bool) -> bool {
+        if std::mem::replace(&mut self.cards.bare, !kept) != kept {
+            return false;
+        }
+        // Its lines are another width now, so the layout it held tells nothing of them.
+        let unfetched = |leaf: &Leaf| leaf.what == What::Preview && leaf.kind.as_ref().is_some_and(flow::unfetched);
+        let cards: Vec<usize> = (0..self.leaves.len()).filter(|at| unfetched(&self.leaves[*at])).collect();
+        for at in &cards {
+            self.leaves[*at].bare = !kept;
+            self.unlay(*at);
+        }
+        !cards.is_empty()
     }
 
     fn set_maths_links(&mut self, links: bool) {

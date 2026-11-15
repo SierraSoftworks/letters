@@ -305,8 +305,17 @@ fn host(link: &str) -> &str {
 }
 
 /// Whether a link preview has its address alone: nothing was fetched of the page it leads to.
-fn unfetched(kind: &BlockKind) -> bool {
+pub(crate) fn unfetched(kind: &BlockKind) -> bool {
     matches!(kind, BlockKind::LinkPreview { title: None, description: None, image: None, .. })
+}
+
+/// What a window has told of the document's link previews.
+#[derive(Default)]
+pub(crate) struct Cards {
+    /// What it has to say on a preview that has only its address, by the preview's block.
+    pub notes: HashMap<BlockId, String>,
+    /// Whether no card keeps room for a control, since the window stands none there.
+    pub bare: bool,
 }
 
 /// What a link preview says: the page's title, a few lines of what the page says of itself, and the host
@@ -529,6 +538,8 @@ pub(crate) struct Leaf {
     pub entries: Vec<Entry>,
     /// The picture of a link preview, by its name among the document's assets.
     pub image: Option<String>,
+    /// Whether a link preview keeps no room for a control at the end of its address.
+    pub bare: bool,
 
     /// The left edge and width of the text.
     pub x: f32,
@@ -597,7 +608,7 @@ impl Leaf {
     pub fn spare(&self, types: &Types) -> f32 {
         let room = match self.what {
             What::Contents => (types.get(self.role).size * theme::PAGE_NUMBER).round(),
-            What::Preview if self.kind.as_ref().is_some_and(unfetched) => theme::PREVIEW_CONTROL,
+            What::Preview if !self.bare && self.kind.as_ref().is_some_and(unfetched) => theme::PREVIEW_CONTROL,
             _ => 0.0,
         };
         room.min((self.width - theme::MIN_WIDTH).max(0.0) / 2.0)
@@ -1019,8 +1030,8 @@ pub(crate) fn numbers(blocks: &[Block], next: &mut u32, out: &mut Vec<(BlockId, 
     }
 }
 
-/// Lays the document out as a column `width` wide. `numbers` are those of its numbered figures, and `notes`
-/// what a window has to say on a link preview that has only its address.
+/// Lays the document out as a column `width` wide. `numbers` are those of its numbered figures, and `cards`
+/// what a window has told of its link previews.
 ///
 /// With `carry`, the leaves of the last column are kept: `old` hands over the leaf a block had, and `carry`
 /// names the blocks whose text has changed since, which are read again. A kept leaf brings its height and,
@@ -1029,14 +1040,14 @@ pub(crate) fn flow(
     doc: &Document,
     types: &Types,
     numbers: &HashMap<BlockId, u32>,
-    notes: &HashMap<BlockId, String>,
+    cards: &Cards,
     width: f32,
     carry: Option<&BTreeSet<BlockId>>,
     old: impl FnMut(&BlockId) -> Option<Leaf>,
 ) -> Flow {
     let (out, lang) = (Flow::default(), None);
     let mut walk =
-        Walk { doc, types, numbers, notes, carry, old, out, pad: 0.0, breaks: false, root: 0, depth: 0, lang };
+        Walk { doc, types, numbers, cards, carry, old, out, pad: 0.0, breaks: false, root: 0, depth: 0, lang };
     walk.place(&doc.blocks, 0.0, width, None, false);
     walk.out
 }
@@ -1045,7 +1056,7 @@ struct Walk<'a, F> {
     doc: &'a Document,
     types: &'a Types,
     numbers: &'a HashMap<BlockId, u32>,
-    notes: &'a HashMap<BlockId, String>,
+    cards: &'a Cards,
     carry: Option<&'a BTreeSet<BlockId>>,
     old: F,
     out: Flow,
@@ -1320,7 +1331,7 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                 BlockKind::TableOfContents { .. } | BlockKind::LinkPreview { .. } => {
                     let (what, entries, image) = match &block.kind {
                         BlockKind::LinkPreview { image, .. } => {
-                            let note = self.notes.get(&block.id).map(String::as_str);
+                            let note = self.cards.notes.get(&block.id).map(String::as_str);
                             (What::Preview, card(&block.kind, role, note), image.clone())
                         }
                         _ => (What::Contents, self.listed(block, role), None),
@@ -1331,7 +1342,7 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                     if leaf.entries != entries {
                         leaf.exact = false;
                     }
-                    (leaf.entries, leaf.image, leaf.role) = (entries, image, role);
+                    (leaf.entries, leaf.image, leaf.role, leaf.bare) = (entries, image, role, self.cards.bare);
                     self.push(leaf, x, width, gap, frame);
                 }
                 BlockKind::Gallery { .. } => {

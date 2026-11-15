@@ -133,6 +133,34 @@ fn a_preview_with_only_its_address_keeps_room_for_a_control() {
 }
 
 #[test]
+fn a_card_keeps_no_room_where_no_control_stands() {
+    // An address long enough to run on to the card's end.
+    let long = format!("https://example.org/{}", "a-long-path/".repeat(12));
+    let unfetched = doc(vec![paragraph("a", PROSE), preview("v", &long, [None, None, None]), paragraph("z", PROSE)]);
+    let mut layout = laid(&unfetched);
+    let (kept, page) = (card(&layout), painted(&layout, everything()));
+    let room = kept.control.expect("room is kept until told otherwise");
+
+    assert!(!layout.set_preview_control(true), "nothing changes while the room is kept");
+    assert!(layout.set_preview_control(false), "the card is laid out anew without it");
+    let (bare, items) = (card(&layout), painted(&layout, everything()));
+    assert_eq!(bare.control, None, "no room is named");
+    let text = reach(&items, bare.rect).expect("the address shows");
+    assert!(text.1 > room.x, "the address runs on where the room was: {text:?} against {room:?}");
+    assert!(text.1 <= bare.rect.x + bare.rect.width, "and stays on the card");
+
+    // A layout that starts over, as at another width, keeps none either.
+    layout.update(&unfetched, &Style::default(), WIDTH - 120.0, None);
+    assert_eq!(card(&layout).control, None, "a new layout keeps none either");
+    layout.update(&unfetched, &Style::default(), WIDTH, None);
+    assert!(layout.set_preview_control(true), "the card is laid out anew when the room is kept again");
+    assert!(card(&layout) == kept && painted(&layout, everything()) == page, "and the page is as it was");
+
+    let mut filled = laid(&carded([Some(TITLE), Some(SAID), None]));
+    assert!(!filled.set_preview_control(false), "a card that shows its page kept none to begin with");
+}
+
+#[test]
 fn a_note_is_written_under_an_address_alone() {
     const NOTE: &str = "Not fetched: the server answered 404";
     let (id, muted, unfetched) = ("v".into(), Palette::LIGHT.marker, carded([None, None, None]));
