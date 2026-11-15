@@ -38,7 +38,7 @@ use std::fmt;
 use std::ops::Range;
 
 use letters_model::{BlockId, Body, Change, Document, Markers, Page, Pos, Selection, Style};
-use letters_render::{DisplayList, Font, Item, Point, Rect};
+use letters_render::{DisplayList, Font, Item, Point, Rect, Role as Tag};
 use parley::Language;
 
 use crate::engine::Engine;
@@ -255,6 +255,12 @@ impl DocLayout {
     ///
     /// A sheet is white paper. It is painted with [`Palette::LIGHT`] whatever palette is set, and nothing
     /// is drawn behind the text, so the caller fills the paper with that palette's `page` colour.
+    ///
+    /// A sheet also says what its parts are, for a reader that cannot see it: [`Item::Open`] and
+    /// [`Item::Close`] go around what each block draws, with a list item's marker as its label, a formula
+    /// with its source, and a quote or callout around the blocks inside it. A block that runs on to the
+    /// next sheet opens there under the same id. The page number is part of nothing, and nor are the boxes
+    /// and rules of the page.
     pub fn paint_page(&self, pages: &Pages, index: usize, out: &mut DisplayList) {
         self.state.borrow_mut().printed(|state| state.paint_page(pages, index, out));
     }
@@ -328,6 +334,11 @@ impl DocLayout {
         self.state.get_mut().settle(viewport, budget)
     }
 }
+
+/// How a sheet names its parts. A leaf's parts are numbered from its place in the column, with room under it
+/// for the parts inside it, and a quote or callout from its own place among them.
+const PARTS: u32 = 32;
+const FRAME: u64 = 1 << 63;
 
 struct State {
     engine: Engine,
@@ -704,19 +715,40 @@ impl State {
             for (tag, level) in reveal.beside(&frame.id).filter(|_| seen) {
                 let (shape, width) = shapes.get(engine, types, Role::Body, true, tag);
                 if let Some(shape) = shapes.layout(shape) {
-                    Painter { engine, types, inks: &inks, band, spelt: false, out }.sign(shape, at, level);
+                    Painter { engine, types, inks: &inks, band, spelt: false, part: None, out }.sign(shape, at, level);
                 }
                 at.x += width;
             }
         }
+        // A sheet says what its parts are. `around` is the quotes and callouts open around the leaf being
+        // painted, outermost first.
+        let mut around: Vec<usize> = Vec::new();
         for at in first..end {
             // A viewport taller than the cache holds has dropped its first layouts by now.
             self.lay(at);
             let leaf = &self.leaves[at];
-            if leaf.what == What::Rule {
-                let rect = Rect::new(leaf.x, leaf.y, leaf.width, leaf.height);
-                out.push(Item::Fill { rect, color: palette.line, radius: 0.0 });
-                continue;
+            let mut inside = Vec::new();
+            let mut next = leaf.frame.filter(|_| print);
+            while let Some(frame) = next {
+                inside.insert(0, frame);
+                next = self.frames[frame].parent;
+            }
+            // A box or a rule is decoration and part of nothing, so the parts around it close while it is
+            // drawn and go on after it.
+            let backing = leaf::backing(leaf, palette);
+            let shared = match backing {
+                Some(_) => 0,
+                None => around.iter().zip(&inside).take_while(|(open, frame)| open == frame).count(),
+            };
+            out.items.extend(around.drain(shared..).map(|_| Item::Close));
+            out.items.extend(backing);
+            for &frame in &inside[shared..] {
+                let role = match self.frames[frame].look {
+                    Look::Quote => Tag::Quote,
+                    Look::Callout(_) => Tag::Note,
+                };
+                out.push(Item::Open { role, id: FRAME | frame as u64 });
+                around.push(frame);
             }
             let shifts = if print { Shifts::default() } else { self.shifts(at) };
             let Self { engine, types, leaves, tokens, spelling, shapes, composition, .. } = self;
@@ -729,13 +761,15 @@ impl State {
             let spelling = block.and_then(|id| spelling.get(id)).map_or(&[][..], Vec::as_slice);
             let over = Over { shifts: &shifts, shapes, composing, spelling };
             let tokens = leaf.id.as_ref().and_then(|id| tokens.get(id));
-            Painter { engine, types, inks: &inks, band, spelt: print, out }.leaf(
+            let part = print.then_some((at as u64 + 1) << PARTS);
+            Painter { engine, types, inks: &inks, band, spelt: print, part, out }.leaf(
                 leaf,
                 laid,
                 tokens.map(Vec::as_slice),
                 &over,
             );
         }
+        out.items.extend(around.drain(..).map(|_| Item::Close));
     }
 
     fn paginate(&mut self, page: &Page) -> Pages {
@@ -784,7 +818,8 @@ impl State {
             let x = area.x + (area.width - number.full_width()) / 2.0;
             let at = Point { x: x.round(), y: below + ((foot - number.height()) / 2.0).round() };
             let inks = Inks::new(types, *palette);
-            Painter { engine, types, inks: &inks, band: (f32::MIN, f32::MAX), spelt: true, out }
+            // The number is of the sheet and not of the document, so it is part of nothing.
+            Painter { engine, types, inks: &inks, band: (f32::MIN, f32::MAX), spelt: true, part: None, out }
                 .glyphs(number, &label, at);
         }
     }

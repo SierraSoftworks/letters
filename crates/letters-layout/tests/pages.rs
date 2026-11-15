@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use letters_layout::{DocLayout, PageLink, Pages, Token, TokenKind};
+use letters_layout::{DocLayout, PageLink, Pages, Palette, Token, TokenKind};
 use letters_model::{
     Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Markers, Model, Op, Page, Pos, ReplicaId, Run, Style,
     Tone,
 };
-use letters_render::{DisplayList, Item, Point, Rect};
+use letters_render::{DisplayList, Item, Point, Rect, Role};
 use proptest::prelude::*;
 
 mod common;
@@ -354,11 +354,109 @@ fn a_sheet_typesets_the_formula_the_caret_is_in() {
     }
 }
 
+/// A part a sheet tells of: what it is, and what the part it lies in is.
+type Part = (Role, Option<Role>);
+
+/// One block of each kind a reader is told of, long enough to fill several small pages, with its parts in
+/// reading order.
+fn kinds() -> (Document, Vec<Part>) {
+    let item = |id: &str, list, depth| Block::text(id, BlockKind::ListItem { list, depth }, PROSE);
+    let rule = |id: &str| Block::new(id, BlockKind::Divider);
+    let said = |numbered, checked, depth| Role::ListItem { depth, numbered, checked };
+    let maths = |tex: &str| Role::Formula { alt: tex.into() };
+    let blocks = vec![
+        Block::text("h", BlockKind::Heading { level: 1 }, "Household rates"),
+        paragraph("a", &PROSE.repeat(3)),
+        code("c", "fn main() {\n    let rate = 0.125;\n}"),
+        item("i", ListKind::Ordered, 0),
+        item("j", ListKind::Bullet, 1),
+        item("t", ListKind::Task { checked: false }, 0),
+        item("u", ListKind::Task { checked: true }, 0),
+        container("w", BlockKind::Callout { tone: Tone::Warn }, vec![paragraph("d", PROSE)]),
+        container("q", BlockKind::Quote, vec![paragraph("e", PROSE), rule("r"), code("x", "let x = 1;")]),
+        Block::text("k", BlockKind::Heading { level: 2 }, "What changes"),
+        rich("m", &[(PROSE, &[]), ("x^2", &[Mark::Math]), (PROSE, &[]), ("a + b", &[Mark::Math])]),
+        formula("g", "E = mc^2"),
+    ];
+    let parts = vec![
+        (Role::Heading(1), None),
+        (Role::Paragraph, None),
+        (Role::Code, None),
+        (said(true, None, 0), None),
+        (Role::Label, Some(said(true, None, 0))),
+        (said(false, None, 1), None),
+        (Role::Label, Some(said(false, None, 1))),
+        (said(false, Some(false), 0), None),
+        (Role::Label, Some(said(false, Some(false), 0))),
+        (said(false, Some(true), 0), None),
+        (Role::Label, Some(said(false, Some(true), 0))),
+        (Role::Note, None),
+        (Role::Paragraph, Some(Role::Note)),
+        (Role::Quote, None),
+        (Role::Paragraph, Some(Role::Quote)),
+        (Role::Code, Some(Role::Quote)),
+        (Role::Heading(2), None),
+        (Role::Paragraph, None),
+        (maths("x^2"), Some(Role::Paragraph)),
+        (maths("a + b"), Some(Role::Paragraph)),
+        (maths("E = mc^2"), None),
+    ];
+    (doc(blocks), parts)
+}
+
+#[test]
+fn a_sheet_says_what_its_parts_are() {
+    let (doc, parts) = kinds();
+    let told = |item: &Item| matches!(item, Item::Open { .. } | Item::Close);
+    // The box behind code and a divider's line, which are decoration.
+    let palette = Palette::LIGHT;
+    let plain = |item: &Item| matches!(item, Item::Fill { color, .. } if [palette.code, palette.line].contains(color));
+    for room in [160.0, 240.0, 5000.0] {
+        let (layout, pages) = paged(&doc, room);
+        // Each part where it is first met, by its name.
+        let mut met: Vec<(u64, Part)> = Vec::new();
+        let mut decoration = 0;
+        for index in 0..pages.sheets.len() {
+            let Painted { text, beneath, .. } = page(&layout, &pages, index);
+            let mut open: Vec<&Role> = Vec::new();
+            for item in &text {
+                match item {
+                    Item::Open { role, id } => {
+                        let part = (role.clone(), open.last().copied().cloned());
+                        match met.iter().find(|known| known.0 == *id) {
+                            Some((_, known)) => assert_eq!(known, &part, "a part runs on as what it was"),
+                            None => met.push((*id, part)),
+                        }
+                        open.push(role);
+                    }
+                    Item::Close => drop(open.pop().expect("a part closes only once open")),
+                    Item::Glyphs { .. } => assert!(!open.is_empty(), "text on page {index} is part of something"),
+                    item if plain(item) => {
+                        assert!(open.is_empty(), "decoration on page {index} is part of nothing: {open:?}");
+                        decoration += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(open.is_empty(), "every part of page {index} closes on it at {room} px");
+            assert!(!beneath.iter().any(told), "the page number is part of nothing");
+        }
+        assert!(decoration >= 3, "the boxes and the rule are drawn at {room} px");
+        let met: Vec<Part> = met.into_iter().map(|(_, part)| part).collect();
+        assert!(met == parts, "at {room} px the parts are {met:#?}");
+        assert!(!painted(&layout, everything()).iter().any(told), "the screen is told of none");
+    }
+}
+
 #[test]
 fn a_sheet_is_white_paper_whatever_the_theme() {
     let heading = Block::text("h", BlockKind::Heading { level: 1 }, "Household rates");
     let (mut layout, pages) = paged(&doc(vec![heading, paragraph("a", PROSE), paragraph("b", PROSE)]), 240.0);
-    let glyphs = |items: &[Item]| !items.is_empty() && items.iter().all(|item| matches!(item, Item::Glyphs { .. }));
+    // What a sheet says of its parts paints nothing.
+    let glyphs = |items: &[Item]| {
+        let text = |item: &Item| matches!(item, Item::Glyphs { .. } | Item::Open { .. } | Item::Close);
+        glyph_runs(items).next().is_some() && items.iter().all(text)
+    };
     let light = page(&layout, &pages, 0);
     assert!(glyphs(&light.text) && glyphs(&light.beneath), "nothing is painted behind the text of a sheet");
     assert!(glyphs(&painted(&layout, everything())), "nor behind the text on screen");

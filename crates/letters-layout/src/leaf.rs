@@ -5,7 +5,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use letters_math::{Formula, Style as Maths, TEXT_RATIO};
-use letters_render::{Color, DisplayList, Glyph, Item, PathEl, Point, Rect, RunText};
+use letters_model::{BlockKind, ListKind};
+use letters_render::{Color, DisplayList, Glyph, Item, PathEl, Point, Rect, Role as Tag, RunText};
 use parley::{
     Affinity, Alignment, AlignmentOptions, BreakReason, Cluster, Cursor, GlyphRun, InlineBox, InlineBoxKind, Language,
     Layout, Line, PositionedLayoutItem, Selection as Span, VerticalAlign,
@@ -14,6 +15,7 @@ use parley::{
 use crate::engine::{Engine, Spec};
 use crate::flow::{self, Leaf, Marker, Role, Type, Types, What, Words, marks};
 use crate::ink::{Back, Brush, Ink, Inks};
+use crate::palette::Palette;
 use crate::reveal::{Shapes, Shifts};
 use crate::theme;
 use crate::tokens::{self, Token, TokenKind};
@@ -397,7 +399,49 @@ pub(crate) struct Painter<'a> {
     pub band: (f32, f32),
     /// Whether each run of glyphs says what it spells. Only an export needs that, and it costs the screen.
     pub spelt: bool,
+    /// What names the leaf being painted where a sheet says what its parts are. `None` on screen.
+    pub part: Option<u64>,
     pub out: &'a mut DisplayList,
+}
+
+/// Which part of a leaf an [`Item::Open`] names: the leaf itself is 0, then its marker, then its formulas.
+const LABEL: u64 = 1;
+const FORMULAS: u64 = 2;
+
+/// What is drawn behind a leaf's text, or in the place of it: the box of code or of a note, or a divider.
+pub(crate) fn backing(leaf: &Leaf, palette: &Palette) -> Option<Item> {
+    let rect = Rect::new(
+        leaf.x - leaf.pad,
+        leaf.y - theme::BOX_PAD_Y,
+        leaf.width + 2.0 * leaf.pad,
+        leaf.height + 2.0 * theme::BOX_PAD_Y,
+    );
+    match leaf.what {
+        What::Rule => {
+            let rect = Rect::new(leaf.x, leaf.y, leaf.width, leaf.height);
+            Some(Item::Fill { rect, color: palette.line, radius: 0.0 })
+        }
+        What::Label => Some(Item::Stroke { rect, color: palette.line_strong, width: 1.0, radius: theme::BOX_RADIUS }),
+        _ if leaf.boxed() => Some(Item::Fill { rect, color: palette.code, radius: theme::BOX_RADIUS }),
+        _ => None,
+    }
+}
+
+/// What a leaf is to a reader that cannot see the page.
+fn tag(leaf: &Leaf) -> Tag {
+    match (&leaf.kind, leaf.what, leaf.role) {
+        (_, What::Formula, _) => Tag::Formula { alt: leaf.words.text.as_str().into() },
+        (Some(BlockKind::ListItem { list, depth }), ..) => Tag::ListItem {
+            depth: *depth,
+            numbered: *list == ListKind::Ordered,
+            checked: match list {
+                ListKind::Task { checked } => Some(*checked),
+                _ => None,
+            },
+        },
+        (.., Role::Code) => Tag::Code,
+        (.., role) => role.level().map_or(Tag::Paragraph, Tag::Heading),
+    }
 }
 
 impl Painter<'_> {
@@ -405,23 +449,24 @@ impl Painter<'_> {
         bottom <= self.band.0 || top >= self.band.1
     }
 
-    /// Emits the lines of a leaf that fall inside the band, with its box and marker. `tokens` colour the text
-    /// of a code block.
-    pub fn leaf(&mut self, leaf: &Leaf, laid: &Laid, tokens: Option<&[Token]>, over: &Over<'_>) {
-        let palette = self.inks.palette;
-        if leaf.boxed() {
-            let rect = Rect::new(
-                leaf.x - leaf.pad,
-                leaf.y - theme::BOX_PAD_Y,
-                leaf.width + 2.0 * leaf.pad,
-                leaf.height + 2.0 * theme::BOX_PAD_Y,
-            );
-            self.out.push(match leaf.what {
-                What::Label => Item::Stroke { rect, color: palette.line_strong, width: 1.0, radius: theme::BOX_RADIUS },
-                _ => Item::Fill { rect, color: palette.code, radius: theme::BOX_RADIUS },
-            });
+    /// Starts a part of the leaf, where parts are told: what is drawn up to [`Painter::close`] is of it.
+    fn open(&mut self, which: u64, role: impl FnOnce() -> Tag) {
+        if let Some(id) = self.part {
+            self.out.push(Item::Open { role: role(), id: id | which });
         }
+    }
+
+    fn close(&mut self) {
+        if self.part.is_some() {
+            self.out.push(Item::Close);
+        }
+    }
+
+    /// Emits the lines of a leaf that fall inside the band, with its marker. `tokens` colour the text of a
+    /// code block.
+    pub fn leaf(&mut self, leaf: &Leaf, laid: &Laid, tokens: Option<&[Token]>, over: &Over<'_>) {
         let Some(text) = Text::of(leaf) else { return };
+        self.open(0, || tag(leaf));
         if let Some(first) = laid.text.layout.get(0)
             && !self.outside(text.at.y + first.metrics().block_min_coord, text.at.y + first.metrics().block_max_coord)
         {
@@ -436,6 +481,7 @@ impl Painter<'_> {
             }
         }
         self.text(&text, tokens, over);
+        self.close();
     }
 
     /// Emits the lines of a text that fall inside the band, and what is drawn over them.
@@ -534,7 +580,16 @@ impl Painter<'_> {
         let color = self.inks.ink(Ink::Style(text.role));
         let style = Maths { size: *size, color, display: *display, links: self.engine.links };
         if let Ok(formula) = self.engine.maths.typeset(source, &style) {
+            // A formula block is a part already. One in a line is a part of its own inside the text's, and
+            // says how it was written, since its glyphs spell nothing.
+            let inline = !*display;
+            if inline {
+                self.open(FORMULAS + swap as u64, || Tag::Formula { alt: source.into() });
+            }
             formula.paint(origin, self.out);
+            if inline {
+                self.close();
+            }
         }
     }
 
@@ -653,8 +708,17 @@ impl Painter<'_> {
         }
     }
 
-    /// Draws a list item's marker in the indent, level with the first line.
+    /// Draws a list item's marker in the indent, level with the first line. A task's box is the item's label
+    /// whether it is ticked or not.
     fn marker(&mut self, leaf: &Leaf, laid: &Laid, baseline: f32) {
+        if leaf.marker != Marker::None {
+            self.open(LABEL, || Tag::Label);
+            self.mark(leaf, laid, baseline);
+            self.close();
+        }
+    }
+
+    fn mark(&mut self, leaf: &Leaf, laid: &Laid, baseline: f32) {
         let (of, palette) = (self.types.get(leaf.role), &self.inks.palette);
         let right = leaf.x - theme::MARKER_GAP;
         // The middle of a lower-case letter, which is where a bullet or checkbox looks centred.
