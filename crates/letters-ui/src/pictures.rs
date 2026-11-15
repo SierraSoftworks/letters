@@ -2,7 +2,7 @@
 //! a link is the shell's to decide, so it is told of each, and a cloud in the corner of a linked picture
 //! opens the menu that loads it, trusts its host or embeds it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use letters_model::{Block, BlockId, BlockKind};
 use letters_render::image::Images;
@@ -10,6 +10,7 @@ use letters_render::{DisplayList, Item, Point, Rect};
 
 use crate::color::{blend, resolve};
 use crate::icon;
+use crate::safe::Safely;
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::widgets::{Menu, MenuItem, Tone};
 use crate::window::Message;
@@ -63,6 +64,9 @@ pub(crate) struct Linked {
     pointed: Option<(BlockId, bool)>,
     /// What the shell says of the links that do not show, by address.
     states: HashMap<String, PictureState>,
+    /// The addresses whose source the shell says the person trusts already, and the hosts the person
+    /// said so of in this window.
+    vouched: (HashSet<String>, HashSet<String>),
 }
 
 impl Linked {
@@ -91,6 +95,25 @@ impl Linked {
         self.states.get(src)
     }
 
+    /// Whether the source of the picture linked from `src` is one the person trusts already, so that
+    /// there is nothing left to offer.
+    pub fn vouched(&self, src: &str) -> bool {
+        self.vouched.0.contains(src) || self.vouched.1.contains(host(src))
+    }
+
+    /// Takes the shell's word on whether the person trusts the source of the picture linked from `src`.
+    pub fn vouch(&mut self, src: &str, trusted: bool) {
+        match trusted {
+            true => _ = self.vouched.0.insert(src.to_owned()),
+            false => _ = self.vouched.0.remove(src),
+        }
+    }
+
+    /// The person has said to always load from the host of `src`.
+    pub fn trust(&mut self, src: &str) {
+        self.vouched.1.insert(host(src).to_owned());
+    }
+
     /// Takes what the shell says of the picture linked from `src`: `None` when it has no more to say.
     pub fn say(&mut self, src: &str, state: Option<PictureState>) {
         match state {
@@ -116,8 +139,10 @@ fn host(src: &str) -> &str {
 }
 
 /// The menu on the cloud of the picture linked from `src`. One that shows already needs no loading, and
-/// what the shell says of one that does not show stands over what the menu offers.
-pub(crate) fn menu(src: &str, loaded: bool, state: Option<&PictureState>) -> Menu<Message> {
+/// what the shell says of one that does not show stands over what the menu offers. A source that is
+/// `vouched` for is not offered to be trusted again, and in a document that is known to be `safe` a
+/// picture that is held back offers to trust the document.
+pub(crate) fn menu(src: &str, loaded: bool, state: Option<&PictureState>, vouched: bool, safe: bool) -> Menu<Message> {
     let host = match host(src) {
         "" => "this host",
         host => host,
@@ -137,12 +162,21 @@ pub(crate) fn menu(src: &str, loaded: bool, state: Option<&PictureState>) -> Men
     // Safe mode fetches for nobody, so what would fetch is not there to choose.
     let held = state == Some(&PictureState::Held);
     let item = |label: String, asked| MenuItem::new(label).disabled(held).on_select(Message::Linked(asked));
+    if held && safe {
+        let trust = MenuItem::new("Trust this document").on_select(Message::Safe(Safely::TrustDocument));
+        menu = menu.item(trust).separator();
+    }
     if let Some(load) = load {
         menu = menu.item(item(load.to_owned(), Linking::Load));
     }
-    menu.item(item(format!("Always load from {host}"), Linking::Trust))
-        .separator()
-        .item(item("Embed in the document".to_owned(), Linking::Embed))
+    if !vouched {
+        menu = menu.item(item(format!("Always load from {host}"), Linking::Trust));
+    }
+    // A rule sets apart what changes the document, when anything stands over it.
+    if load.is_some() || !vouched {
+        menu = menu.separator();
+    }
+    menu.item(item("Embed in the document".to_owned(), Linking::Embed))
 }
 
 fn grown(rect: Rect, by: f32) -> Rect {

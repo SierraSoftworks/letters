@@ -7,7 +7,8 @@ use letters_render::image::Image;
 use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
 use letters_ui::{
-    Chrome, Cursor, Edge, Folder, Frame, Landing, Location, PictureState, Recent, Request, SaveState, WindowButton,
+    Chrome, Cursor, Edge, Folder, Frame, Landing, Location, PictureState, Recent, Request, SafeMode, SaveState,
+    WindowButton,
 };
 
 fn text(id: &str, kind: BlockKind, text: &str) -> Block {
@@ -2750,6 +2751,44 @@ fn a_linked_picture_has_its_plain_cloud_again_once_the_shell_says_no_more_of_it(
         // A picture that is taken away again is a link like any other.
         window.ui().set_image(LINK, None);
         assert!(!chip(&mut window, cloud), "handed: {handed}");
+    }
+}
+
+#[test]
+fn a_held_picture_offers_to_trust_its_document_and_is_asked_for_again_once_it_is_trusted() {
+    let (mut window, _, cloud) = linked(false);
+    window.ui().set_safe_mode(Some(SafeMode::default()));
+    window.ui().set_picture_state(LINK, Some(PictureState::Held));
+    // With the bar put away the page is where it was, and the menu is the nearest way to trust.
+    window.click(Role::Button, "Hide");
+    window.click_at(cloud).click(Role::MenuItem, "Trust this document");
+    assert_eq!(window.ui().take_requests(), [Request::TrustDocument]);
+    // With the caret and the pointer elsewhere, only what the shell says of the picture keeps its cloud
+    // on a chip.
+    let far = spot(&mut window, "p1", 2);
+    window.hover_at(Point { x: far.x, y: far.y + 2.0 });
+    assert!(chip(&mut window, cloud), "it is held until the shell says the document is trusted");
+
+    window.ui().set_safe_mode(None);
+    assert_eq!(window.ui().take_requests(), [Request::LinkedPicture(LINK.into())]);
+    assert!(!chip(&mut window, cloud), "nothing holds it back now");
+}
+
+#[test]
+fn a_source_the_person_trusts_already_is_not_offered_to_be_trusted_again() {
+    const ALWAYS: &str = "Always load from example.com";
+    // How the window comes to know: the shell says so, or the person chose it from the menu here.
+    for told in [true, false] {
+        let (mut window, _, cloud) = linked(true);
+        window.click_at(cloud);
+        assert!(window.find(Role::MenuItem, ALWAYS).is_some(), "told: {told}");
+        match told {
+            true => window.key("Escape").ui().set_picture_trusted(LINK, true),
+            false => _ = window.click(Role::MenuItem, ALWAYS),
+        }
+        window.click_at(cloud).assert_open(Role::Menu, "Linked picture");
+        assert!(window.find(Role::MenuItem, ALWAYS).is_none(), "told: {told}");
+        assert!(window.find(Role::MenuItem, "Embed in the document").is_some(), "told: {told}");
     }
 }
 

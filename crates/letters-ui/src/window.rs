@@ -42,6 +42,7 @@ use crate::refer::{Picking, Refer};
 use crate::references::{self, Preview, Reference, References};
 use crate::renaming::{Outcome, Rename, Renaming};
 use crate::restyle::{self, Field, StyleEdit};
+use crate::safe::{self, Safe, SafeMode, Safely};
 use crate::settings::{Dialog, Setting, Settings};
 use crate::spelling::{Fix, Spelling};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
@@ -56,6 +57,8 @@ use crate::widgets::{
 
 /// Space kept beside the text column.
 const GUTTER: f32 = 24.0;
+/// How wide the link editor is: its field and the button that opens the address in it.
+const LINK_WIDTH: f32 = 336.0;
 /// Space kept above and below the text.
 const TOP: f32 = 48.0;
 /// Points to logical pixels.
@@ -193,6 +196,8 @@ pub enum Message {
     Alt(Altering),
     /// What the tools over a selection and the field of a comment ask for.
     Note(Noting),
+    /// What the safe mode bar, a link and the card about a link ask for.
+    Safe(Safely),
 }
 
 impl Ui<EditorApp> {
@@ -405,6 +410,28 @@ impl Ui<EditorApp> {
         app.estimated = true;
     }
 
+    /// Says that the document is held in safe mode, and how it can be trusted, or `None` once it is. A bar
+    /// under the top bar tells the person and asks with [`Request::TrustDocument`] and
+    /// [`Request::TrustFolder`]. What safe mode holds back stays the shell's to hold back. When a document
+    /// becomes trusted the window asks for every linked picture not yet showing with
+    /// [`Request::LinkedPicture`] again.
+    pub fn set_safe_mode(&mut self, safe: Option<SafeMode>) {
+        if self.app_mut().safe.set(safe) {
+            self.app_mut().ask_again(true);
+        }
+    }
+
+    /// Shows the whole address of a link and asks whether to open it, in answer to a
+    /// [`Request::OpenLink`] that was not confirmed. A yes asks again with `confirmed` set.
+    pub fn ask_link(&mut self, href: &str) {
+        self.app_mut().safe.ask(href);
+    }
+
+    /// Says that a link is not opened and why, in a few words, in answer to a [`Request::OpenLink`].
+    pub fn refuse_link(&mut self, href: &str, why: &str) {
+        self.app_mut().safe.refuse(href, why);
+    }
+
     /// The document's notes: the comments on its passages, and what imports and merges left on them. A
     /// shell writes them into the document's file with each save. A comment that is written counts among
     /// [`Window::edits`].
@@ -449,6 +476,15 @@ impl Ui<EditorApp> {
     pub fn set_picture_state(&mut self, src: &str, state: Option<PictureState>) {
         if self.app().linked.said(src) != state.as_ref() {
             self.app_mut().linked.say(src, state);
+        }
+    }
+
+    /// Says whether a linked picture comes from a source the person trusts already, by the address its
+    /// link is written as: the menu on its cloud then does not offer "Always load from" its host again.
+    /// The window takes it as said of every picture of a host once the person has chosen that from a menu.
+    pub fn set_picture_trusted(&mut self, src: &str, trusted: bool) {
+        if self.app().linked.vouched(src) != trusted {
+            self.app_mut().linked.vouch(src, trusted);
         }
     }
 
@@ -625,6 +661,7 @@ pub struct EditorApp {
     /// The bar that says where pictures held over the page would land, in the layout's coordinates.
     drop: Option<Rect>,
     linked: Linked,
+    safe: Safe,
     grip: Grip,
     captions: Captions,
     margin: Margin,
@@ -705,6 +742,7 @@ impl EditorApp {
             wanted: HashSet::new(),
             drop: None,
             linked: Linked::default(),
+            safe: Safe::default(),
             grip: Grip::default(),
             captions: Captions::default(),
             margin: Margin::default(),
@@ -1118,15 +1156,63 @@ impl EditorApp {
         match asked {
             Linking::Load => self.requests.push(Request::LoadPicture(src)),
             Linking::Trust => {
+                self.linked.trust(&src);
                 self.requests.push(Request::TrustPictures(src));
-                // What the shell held back may load now, so it hears of each link not showing again.
-                let links = self.editor.doc().walk().filter_map(pictures::link);
-                let held: BTreeSet<&str> = links.filter(|src| self.images.get(src).is_none()).collect();
-                self.requests.extend(held.into_iter().map(|src| Request::LinkedPicture(src.to_owned())));
+                self.ask_again(false);
             }
             Linking::Embed => self.requests.push(Request::EmbedPicture { figure, src }),
             Linking::Close => {}
         }
+    }
+
+    /// Tells the shell again of each linked picture that does not show, since what it held back may load
+    /// now. With `freed` the document has left safe mode, which no longer holds any of them.
+    fn ask_again(&mut self, freed: bool) {
+        let links = self.editor.doc().walk().filter_map(pictures::link);
+        let held: BTreeSet<String> = links.filter(|src| self.images.get(src).is_none()).map(str::to_owned).collect();
+        for src in held {
+            if freed && self.linked.said(&src) == Some(&PictureState::Held) {
+                self.linked.say(&src, None);
+            }
+            self.requests.push(Request::LinkedPicture(src));
+        }
+    }
+
+    /// Does what the safe mode bar, a link or the card about a link asked, most of which is the shell's
+    /// to do.
+    fn safely(&mut self, asked: Safely) {
+        match asked {
+            Safely::TrustDocument => self.requests.push(Request::TrustDocument),
+            Safely::TrustFolder => self.requests.push(Request::TrustFolder),
+            Safely::Hide => self.safe.hide(true),
+            Safely::Show => self.safe.hide(false),
+            Safely::Follow(href) => {
+                self.link = None;
+                self.open_link(&href, false);
+            }
+            Safely::Confirm => {
+                if let Some(href) = self.safe.confirm() {
+                    self.open_link(&href, true);
+                }
+            }
+            Safely::Leave => self.safe.leave(),
+        }
+    }
+
+    /// Asks the shell to open a link. A place in this document is not the shell's to open.
+    fn open_link(&mut self, href: &str, confirmed: bool) {
+        let href = href.trim();
+        if !href.is_empty() && !href.starts_with('#') {
+            self.requests.push(Request::OpenLink { href: href.to_owned(), confirmed });
+        }
+    }
+
+    /// The address of the link at a point of the page area, while nothing hangs over the page.
+    fn link_at(&self, at: Point) -> Option<String> {
+        if self.hung() {
+            return None;
+        }
+        safe::link_at(self.editor.doc(), &self.layout, self.in_layout(at))
     }
 
     /// Shows the Markdown markers that belong where the caret now is, after anything that may have moved it.
@@ -1424,6 +1510,12 @@ impl EditorApp {
                     self.dragging = false;
                     self.references.press(None);
                     return self.edit(platform, |editor, platform| editor.run(Command::EditCaption, platform));
+                }
+                // A press on a link with Ctrl or Cmd held asks for it to be opened, and leaves the caret be.
+                if let Some(href) = self.link_at(at).filter(|_| mods.primary && !mods.shift && clicks == 1) {
+                    self.dragging = false;
+                    self.references.press(None);
+                    return self.open_link(&href, false);
                 }
                 // A press that stays on a reference follows it. Any other press is the caret's alone.
                 let pressed = self.reference(at).filter(|_| clicks == 1 && !mods.shift);
@@ -1831,7 +1923,8 @@ impl EditorApp {
                 place.badge.map_or(corner, pictures::chip)
             });
             let spot = Rect { x: origin.x + from.x, y: origin.y + from.y, ..from };
-            let menu = pictures::menu(src, self.images.get(src).is_some(), self.linked.said(src));
+            let (loaded, said) = (self.images.get(src).is_some(), self.linked.said(src));
+            let menu = pictures::menu(src, loaded, said, self.linked.vouched(src), self.safe.on());
             let menu = menu.popover().at(spot).align(Align::End);
             element = element.popover(menu.open(true).on_close(Message::Linked(Linking::Close)));
         } else if let Some(((_, text), (_, line, switch))) = self.captions.alt.as_ref().zip(self.alt_switch()) {
@@ -1848,8 +1941,18 @@ impl EditorApp {
                 .placeholder("Paste or type a link")
                 .on_input(Message::LinkDraft)
                 .on_submit(Message::LinkApply);
-            let editor =
-                Popover::new(Element::from(field).width(300.0)).label("Link").open(true).on_close(Message::LinkClose);
+            // The address in the field can be tried from here, written down or not.
+            let open = Button::icon_only(icon::EXTERNAL_LINK, "Open link")
+                .subtle()
+                .disabled(address.trim().is_empty())
+                .on_press(Message::Safe(Safely::Follow(address.clone())));
+            let row = Element::row().align(Align::Center).gap(tokens::SPACE_XS).width(LINK_WIDTH);
+            let row = row.child(Element::from(field).grow(1.0)).child(open);
+            let editor = Popover::new(row)
+                .label("Link")
+                .max_width(LINK_WIDTH + 2.0 * tokens::SPACE_MD + 2.0)
+                .open(true)
+                .on_close(Message::LinkClose);
             // The editor hangs from the caret, in place.
             element = element.popover(editor.at(caret.unwrap_or_default())).cursor(Cursor::Text);
         } else if let Some((field, passage)) = self.margin.field().zip(self.margin.writing()) {
@@ -2077,6 +2180,9 @@ impl EditorApp {
                 bar = self.lead(name, shown).into_iter().fold(bar.form(n), TopBar::start);
                 bar = self.tools(fold).into_iter().fold(bar, TopBar::middle);
             }
+        }
+        if let Some(badge) = self.safe.badge() {
+            bar = bar.end(badge);
         }
         bar = bar.end(Button::new("Share").icon(icon::USERS).small().on_press(Message::Share(true)).popover(share));
         bar = bar.end(TopBar::rule());
@@ -2624,13 +2730,15 @@ impl App for EditorApp {
         self.refold(window.width);
         let panel = self.panel.map(|panel| self.side(panel));
         let room = window.width - if panel.is_some() { side_panel::WIDTH } else { 0.0 };
-        let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT);
+        // The safe mode bar lies under the top bar and takes its height from the page.
+        let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height();
         let page = self.page(Size { width: room.max(0.0), height: (window.height - bar).max(0.0) });
         let page = Element::row().grow(1.0).child(page).children(self.chapters());
         let body = Element::row().grow(1.0).child(page).children(panel);
-        // The settings come last, so that they lie over whatever else is out.
-        let settings = self.dialog.view(&self.settings);
-        let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).child(body).children(settings);
+        // The settings and the card about a link come last, so that they lie over whatever else is out.
+        let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
+        let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).children(self.safe.bar());
+        let all = all.child(body).children(over);
         if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
     }
 
@@ -2694,6 +2802,7 @@ impl App for EditorApp {
             Message::Insert(Inserting::Close) => self.insert.close(),
             Message::Refer(Picking::Take(figure)) => self.refer(figure, platform),
             Message::Linked(asked) => self.linking(asked),
+            Message::Safe(asked) => self.safely(asked),
             Message::Alt(asked) => self.altering(asked, platform),
             Message::Note(asked) => self.noting(asked, platform),
             Message::Refer(Picking::Close) => {

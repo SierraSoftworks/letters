@@ -103,6 +103,22 @@ pub enum Request {
         figure: BlockId,
         src: String,
     },
+    /// The person trusts this document: keep that, treat the document as trusted from now on, and say so
+    /// with `Window::set_safe_mode(None)`. Asked from the bar that `Window::set_safe_mode` shows.
+    TrustDocument,
+    /// The person trusts the folder this document is in, and every document in it. Answered as
+    /// [`Request::TrustDocument`] is. Asked only when the shell named a folder.
+    TrustFolder,
+    /// The person asked to open the link with this address, as the document writes it. The shell judges
+    /// it by what the person trusts: it opens the link, or has the window show the whole address and ask
+    /// with `Window::ask_link`, or says why not with `Window::refuse_link`. `confirmed` is set once the
+    /// person has read the address on that card and said yes, which is enough for a link that asks, and
+    /// changes nothing for one that is refused. An address that starts with `#` is a place in the
+    /// document and is never asked about.
+    OpenLink {
+        href: String,
+        confirmed: bool,
+    },
 }
 
 /// A document opened lately, as the landing card lists it.
