@@ -4140,26 +4140,42 @@ impl EditorApp {
 
     /// The symbols the sheet offers for the command being typed at the caret, and the stretch of the
     /// formula's block that one of them would replace.
-    fn symbols(&self) -> Option<(Pos, usize, Vec<&'static letters_math::Command>)> {
+    fn symbols(&self) -> Option<(Pos, maths::Offered)> {
         let source = Source::of(&self.editor, self.shaper.as_ref(), self.wide())?;
-        let (typed, symbols) = self.maths.symbols(&source, self.editor.selection()?)?;
-        Some((Pos::new(source.block, typed.start), typed.end, symbols))
+        let offered = self.maths.symbols(&source, self.editor.selection()?)?;
+        Some((Pos::new(source.block, offered.range.start), offered))
     }
 
     /// Writes a symbol of the list in place of the command being typed. One that takes arguments gets its
-    /// braces, and the caret waits in the first pair.
+    /// braces, and the caret waits in the first pair. An environment gets the `\end` that matches, and the
+    /// caret waits between the two.
     fn take(&mut self, index: usize, platform: &mut dyn Platform) {
-        let Some((start, end, symbols)) = self.symbols() else { return };
-        let Some(symbol) = symbols.get(index) else { return };
-        self.editor.select(Selection { anchor: start.clone(), head: Pos::new(start.block.clone(), end) });
-        let written = InputEvent::Insert(maths::written(symbol));
-        self.edit(platform, |editor, platform| editor.input(written, platform));
-        if symbol.arguments > 0 {
-            let first = Pos::new(start.block, start.offset + symbol.command.len() + 1);
-            self.editor.select(Selection::caret(first));
+        let Some((start, offered)) = self.symbols() else { return };
+        let Some(symbol) = offered.symbols.get(index).copied() else { return };
+        self.editor.select(Selection { anchor: start.clone(), head: Pos::new(start.block.clone(), offered.range.end) });
+        let (written, caret) = match offered.environments {
+            true => maths::begun(symbol, offered.ended),
+            false => maths::written(symbol),
+        };
+        let whole = written.len();
+        self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(written), platform));
+        if caret < whole {
+            self.editor.select(Selection::caret(Pos::new(start.block, start.offset + caret)));
             self.mark();
         }
+        self.maths.took(symbol);
+    }
+
+    /// Tab in a formula with no list out: the caret leaves the braces it is in, for the next argument
+    /// where one follows and for after them where none does. Outside braces the key is the editor's.
+    fn onward(&mut self) -> bool {
+        let Some(source) = Source::of(&self.editor, self.shaper.as_ref(), self.wide()) else { return false };
+        let caret = self.editor.selection().filter(|selection| selection.is_caret());
+        let Some(next) = caret.and_then(|caret| source.onward(caret.head.offset)) else { return false };
+        self.editor.select(Selection::caret(Pos::new(source.block, next)));
         self.maths.typed(false);
+        self.mark();
+        true
     }
 
     /// Puts what an offer of the insert menu stands for on its line, in place of the slash and what was
@@ -4243,10 +4259,13 @@ impl EditorApp {
     /// Lets the list of symbols have the keys that walk it and take from it, while it shows.
     fn list_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
         let plain = event.mods == Modifiers::default();
-        let Some((_, _, symbols)) = self.symbols().filter(|_| plain) else { return false };
+        let Some((_, offered)) = self.symbols().filter(|_| plain) else {
+            return plain && event.key == Key::Tab && self.onward();
+        };
+        let listed = offered.symbols.len();
         match event.key {
-            Key::Down | Key::Up => self.maths.pick(event.key == Key::Down, symbols.len()),
-            Key::Tab => self.take(self.maths.picked(symbols.len()), platform),
+            Key::Down | Key::Up => self.maths.pick(event.key == Key::Down, listed),
+            Key::Tab => self.take(self.maths.picked(listed), platform),
             _ => return false,
         }
         true
