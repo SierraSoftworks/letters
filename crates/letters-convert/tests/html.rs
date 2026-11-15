@@ -1,6 +1,8 @@
 //! HTML export, through its one public function.
 
-use letters_convert::{from_html, from_markdown, to_html, to_html_themed, to_markdown};
+use letters_convert::{
+    Column, HtmlPage, WebFont, from_html, from_markdown, to_html, to_html_themed, to_html_with, to_markdown,
+};
 use letters_layout::{Palette, Scheme};
 use letters_model::{Block, BlockKind, Document, ListKind, Mark, Run, Style};
 use letters_render::Color;
@@ -179,7 +181,9 @@ fn the_style_is_written_as_css() {
 
     // Every type of the built-in style has a rule, so the look can be reused on the web.
     let css = export(&Document::default());
-    for selector in ["p, li", "h1", "h2", "h3", "h4", "blockquote p, blockquote li", "pre", "figcaption, .fallback"] {
+    for selector in
+        ["p, li", "h1", "h2", "h3", "h4", "blockquote p, blockquote li", "pre", "figcaption, .fallback, .unknown"]
+    {
         assert!(rule(stylesheet(&css), selector).contains("font-size:"), "{selector}");
     }
 }
@@ -277,8 +281,60 @@ fn the_file_stands_alone() {
     for banned in ["script", "link", "img", "iframe", "object", "embed", "base", "form"] {
         assert!(!names.iter().any(|name| name == banned), "the page holds a <{banned}>");
     }
-    assert!(!stylesheet(&html).contains("url(") && !stylesheet(&html).contains("@import"));
-    assert!(html.contains("Content-Security-Policy"));
+    let css = stylesheet(&html);
+    assert!(!css.contains("@import") && !css.contains("@font-face"), "{css}");
+    assert_eq!(css.matches("url(").count(), css.matches("url(\"data:").count(), "the stylesheet fetches something");
+    assert!(html.contains("Content-Security-Policy") && !html.contains("font-src"));
+}
+
+#[test]
+fn a_page_loads_the_fonts_it_is_given_and_takes_the_callers_rules() {
+    let fonts = [
+        WebFont { family: "Inter", url: "/fonts/Inter.ttf", italic: false },
+        WebFont { family: "Inter", url: "/fonts/Inter-Italic.ttf?v=\"2\"</style>", italic: true },
+    ];
+    let page =
+        HtmlPage { fonts: &fonts, css: "html { cursor: progress; }\n/* </style><script> */", ..HtmlPage::default() };
+    let html = to_html_with(&document("# Title"), &Style::default(), "Report", &mut |_| None, &page);
+    let css = stylesheet(&html);
+
+    // The page may fetch fonts from where it came from, and still nothing else.
+    assert!(html.contains("default-src 'none'; font-src 'self';"), "{}", &html[..400]);
+    assert!(
+        css.contains(
+            "font-family: \"Inter\"; src: url(\"/fonts/Inter.ttf\"); font-weight: 1 1000; font-style: normal;"
+        )
+    );
+    assert_eq!(css.matches("@font-face").count(), 2);
+    assert!(css.contains("font-style: italic; font-display: swap;"), "{css}");
+
+    // The caller's rules come last, where they win, and neither they nor an address can end the stylesheet.
+    assert!(css.trim_end().ends_with("html { cursor: progress; }\n/* <\\/style><script> */"), "{css}");
+    assert_eq!(html.matches("</style>").count(), 1);
+}
+
+#[test]
+fn a_page_for_a_window_is_set_as_the_window_sets_it() {
+    let mut poll = Block::new("poll", BlockKind::Unknown { type_name: "poll<b>".into() });
+    poll.extra.insert("fallback".into(), "Which day suits?".into());
+    let doc = Document { blocks: vec![poll], ..Document::default() };
+    let style = Style::default();
+    let window = HtmlPage { window: Some(Column { gutter: 24.0, top: 48.0 }), ..HtmlPage::default() };
+
+    let own = to_html(&doc, &style, "Report", &mut |_| None);
+    let shown = to_html_with(&doc, &style, "Report", &mut |_| None, &window);
+
+    // A page of its own is as wide as the style's paper and gives its margins up on a narrow screen. A
+    // window's column is the text's measure, or the window less its gutters, and keeps its room above.
+    assert!(rule(stylesheet(&own), "article").contains("max-width: 453pt;"));
+    assert!(stylesheet(&own).contains("@media (max-width: 40em)"));
+    let column = rule(stylesheet(&shown), "article");
+    assert!(column.contains("min(604px, 100% - 48px)") && column.contains("padding: 48px 0;"), "{column}");
+    assert!(!stylesheet(&shown).contains("@media (max-width: 40em)"));
+
+    // A reader elsewhere gets what the block says. The window's stand-in shows what the window will.
+    assert_eq!(article(&own), "<p class=\"fallback\">Which day suits?</p>");
+    assert_eq!(article(&shown), "<p class=\"unknown\">Unsupported block: poll&lt;b&gt;</p>");
 }
 
 #[test]

@@ -11,7 +11,7 @@ mod markdown;
 mod pdf;
 
 pub use docx::{DocxError, DocxImport, from_docx, to_docx};
-pub use html::{Assets, from_html, to_html, to_html_fragment, to_html_themed};
+pub use html::{Assets, Column, HtmlPage, WebFont, from_html, to_html, to_html_fragment, to_html_themed, to_html_with};
 pub use markdown::{MarkdownImport, from_markdown, import_markdown, markdown_assets, to_markdown};
 pub use pdf::{PdfInfo, to_pdf};
 

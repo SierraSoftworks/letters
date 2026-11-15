@@ -51,7 +51,7 @@ pub type Assets<'a> = &'a mut dyn FnMut(&str) -> Option<Vec<u8>>;
 ///   written as its source.
 /// - An unknown block is written as its fallback text. Unknown marks and fields are left out.
 pub fn to_html(doc: &Document, style: &Style, title: &str, assets: Assets) -> String {
-    page(doc, style, title, assets, None)
+    to_html_with(doc, style, title, assets, &HtmlPage::default())
 }
 
 /// As [`to_html`], for a page that follows its reader's theme: light as `to_html` writes it, and in `dark`
@@ -59,33 +59,78 @@ pub fn to_html(doc: &Document, style: &Style, title: &str, assets: Assets) -> St
 ///
 /// The style's colours are shown on the dark page as layout shows them, through [`Palette::recolor`].
 pub fn to_html_themed(doc: &Document, style: &Style, title: &str, assets: Assets, dark: &Palette) -> String {
-    page(doc, style, title, assets, Some(dark))
+    to_html_with(doc, style, title, assets, &HtmlPage { dark: Some(dark), ..HtmlPage::default() })
 }
 
-fn page(doc: &Document, style: &Style, title: &str, assets: Assets, dark: Option<&Palette>) -> String {
+/// How a page differs from the file [`to_html`] writes. The default changes nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HtmlPage<'a> {
+    /// The colours of the page where its reader asks for a dark one. See [`to_html_themed`].
+    pub dark: Option<&'a Palette>,
+    /// The font files the page loads, for a server that holds the document's fonts. With none, the page
+    /// loads nothing and is set in the reader's own copies of the fonts, or in what stands in for them.
+    pub fonts: &'a [WebFont<'a>],
+    /// Sets the document as the editor's window does, and not as a page of its own.
+    pub window: Option<Column>,
+    /// Rules written last in the stylesheet, where they win. For what only the caller knows of its page,
+    /// such as a cursor. The caller vouches for them: they are written as they are.
+    pub css: &'a str,
+}
+
+/// A font file for a page to load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WebFont<'a> {
+    /// The family, as the style names it.
+    pub family: &'a str,
+    /// Where the file is. The page may load fonts from its own origin alone.
+    pub url: &'a str,
+    /// The file holds the family's italic. Each file is taken to hold every weight.
+    pub italic: bool,
+}
+
+/// How the editor's window sets a document, for a page that stands in for the window until it has painted:
+/// what the page shows is where the window will draw it.
+///
+/// The text column is as wide as the style's page less its margins, or as the page less its gutters when
+/// that is narrower, and starts on a whole pixel. A block the editor cannot show is drawn as the window
+/// draws it, in a box that names its type.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Column {
+    /// The least room on each side of the column, in logical pixels.
+    pub gutter: f32,
+    /// The room above the document's first line and below its last.
+    pub top: f32,
+}
+
+/// As [`to_html`], with the changes `page` asks for.
+pub fn to_html_with(doc: &Document, style: &Style, title: &str, assets: Assets, page: &HtmlPage) -> String {
     let mut out = String::from("<!doctype html>\n<html lang=\"");
     escape(&doc.language, &mut out);
     out.push_str(concat!(
         "\">\n<head>\n<meta charset=\"utf-8\">\n",
         // Nothing in the file may run or load, whatever a document manages to carry into it.
-        "<meta http-equiv=\"Content-Security-Policy\" ",
-        "content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:\">\n",
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; ",
+    ));
+    // But the fonts its own server holds, where the caller names some.
+    out.push_str(if page.fonts.is_empty() { "" } else { "font-src 'self'; " });
+    out.push_str(concat!(
+        "style-src 'unsafe-inline'; img-src data:\">\n",
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
         // Says which themes the page has, so the browser's own parts follow: the canvas, scroll bars, tick boxes.
         "<meta name=\"color-scheme\" content=\"",
     ));
-    out.push_str(if dark.is_some() { "light dark" } else { "light" });
+    out.push_str(if page.dark.is_some() { "light dark" } else { "light" });
     out.push_str("\">\n<meta name=\"generator\" content=\"Letters\">\n<title>");
     escape(title, &mut out);
     out.push_str("</title>\n<style>\n");
-    css(style, dark, &mut out);
+    css(style, page, &mut out);
     out.push_str("</style>\n</head>\n<body>\n<article>\n");
     let size = |key: &str| {
         let points = style.types.get(key).or_else(|| style.types.get("body")).map_or(0.0, |of| of.size);
         if points.is_finite() && points > 0.0 { points * PIXELS } else { TextStyle::default().size * PIXELS }
     };
     let sizes = [size("body"), size("heading1"), size("heading2"), size("heading3"), size("heading4")];
-    blocks(&doc.blocks, &mut Page { assets, maths: Some(sizes) }, &mut out);
+    blocks(&doc.blocks, &mut Writing { assets, maths: Some(sizes), window: page.window.is_some() }, &mut out);
     out.push_str("</article>\n</body>\n</html>\n");
     out
 }
@@ -95,20 +140,22 @@ fn page(doc: &Document, style: &Style, title: &str, assets: Assets, dark: Option
 /// between `\(` and `\)`, or `\[` and `\]` for a formula, for whatever takes the paste to set.
 pub fn to_html_fragment(blocks: &[Block]) -> String {
     let mut out = String::new();
-    self::blocks(blocks, &mut Page { assets: &mut |_| None, maths: None }, &mut out);
+    self::blocks(blocks, &mut Writing { assets: &mut |_| None, maths: None, window: false }, &mut out);
     out
 }
 
 /// What blocks are written for.
-struct Page<'a> {
+struct Writing<'a> {
     assets: Assets<'a>,
     /// On a page that draws its maths, the size of its text in logical pixels: the body's, then each level
     /// of heading's. Maths is typeset at the size it is shown, so that its hairlines come out as thin as
     /// they should. `None` writes maths as its source.
     maths: Option<[f32; 5]>,
+    /// Blocks are drawn as the editor's window draws them, where that is not how a page of its own reads best.
+    window: bool,
 }
 
-impl Page<'_> {
+impl Writing<'_> {
     /// The size maths is typeset at in a heading of `level`, or in other text for level 0.
     fn text(&self, level: u8) -> Option<f32> {
         self.maths.map(|sizes| sizes[usize::from(level.min(4))])
@@ -129,7 +176,7 @@ fn escape(text: &str, out: &mut String) {
 }
 
 /// Writes sibling blocks, one to a line. Consecutive list items become nested lists.
-fn blocks(blocks: &[Block], page: &mut Page, out: &mut String) {
+fn blocks(blocks: &[Block], page: &mut Writing, out: &mut String) {
     // The lists that are open, outermost first, each with its latest item still open.
     let mut lists: Vec<&str> = Vec::new();
     for block in blocks {
@@ -181,6 +228,11 @@ fn blocks(blocks: &[Block], page: &mut Page, out: &mut String) {
                 };
                 figure(&image, &caption.unwrap_or_default(), page, out);
             }
+            BlockKind::Unknown { type_name } if page.window => {
+                out.push_str("<p class=\"unknown\">Unsupported block: ");
+                escape(type_name, out);
+                out.push_str("</p>\n");
+            }
             BlockKind::Unknown { .. } => {
                 let fallback = block.extra.get("fallback").and_then(|fallback| fallback.as_str()).unwrap_or_default();
                 if !fallback.is_empty() {
@@ -216,7 +268,7 @@ fn element(tag: &str, runs: &[Run], maths: Option<f32>, out: &mut String) {
     let _ = writeln!(out, "</{tag}>");
 }
 
-fn container(open: &str, end: &str, children: &[Block], page: &mut Page, out: &mut String) {
+fn container(open: &str, end: &str, children: &[Block], page: &mut Writing, out: &mut String) {
     let _ = writeln!(out, "{open}");
     let start = out.len();
     blocks(children, page, out);
@@ -228,7 +280,7 @@ fn container(open: &str, end: &str, children: &[Block], page: &mut Page, out: &m
 
 /// Writes a table, its first row in a head where that row heads it. A cell says how its column is aligned
 /// where that is not to the start. What the table holds that is not a row is written after it.
-fn table(columns: &[Align], header: bool, children: &[Block], page: &mut Page, out: &mut String) {
+fn table(columns: &[Align], header: bool, children: &[Block], page: &mut Writing, out: &mut String) {
     let is_row = |child: &&Block| child.kind == BlockKind::TableRow;
     let rows: Vec<&Block> = children.iter().filter(is_row).collect();
     if !rows.is_empty() {
@@ -336,7 +388,7 @@ struct Figure<'a> {
 ///
 /// An image the file holds is written into the page. One that is still remote is not: the page must fetch
 /// nothing, so it becomes a link. One that cannot be found leaves its description in its place.
-fn figure(image: &Figure, caption: &[Run], page: &mut Page, out: &mut String) {
+fn figure(image: &Figure, caption: &[Run], page: &mut Writing, out: &mut String) {
     out.push_str("<figure>\n");
     let held = image.asset.and_then(|name| {
         let bytes = (page.assets)(name)?;
@@ -513,6 +565,11 @@ fn pt(points: f32) -> String {
     if rounded == 0.0 { "0".to_owned() } else { format!("{rounded}pt") }
 }
 
+/// A number as CSS takes it, to two places.
+fn number(value: f32) -> f32 {
+    if value.is_finite() { (value * 100.0).round() / 100.0 } else { 0.0 }
+}
+
 /// A length in whole logical pixels, which is how layout measures the height of a line and the gaps between
 /// blocks. Written the same, the page puts each line where the editor does.
 fn px(pixels: f32) -> String {
@@ -574,7 +631,7 @@ const TYPES: [(&str, &str); 10] = [
     ("heading4", "h4"),
     ("quote", "blockquote p, blockquote li"),
     ("code", "pre"),
-    ("caption", "figcaption, .fallback"),
+    ("caption", "figcaption, .fallback, .unknown"),
     ("title", ".title"),
 ];
 
@@ -596,9 +653,10 @@ fn colours(style: &Style, on: &Palette, css: &mut String) {
         css,
         ":not(pre) > code {{ background: {inline_code}; }}\n\
          pre {{ background: {code_fill}; }}\n\
-         li::marker {{ color: {marker}; }}\n\
-         li.task > input {{ accent-color: {accent}; }}\n\
-         blockquote {{ border-color: {line_strong}; }}\n\
+         li::before, .unknown {{ color: {marker}; }}\n\
+         li.task > input {{ border-color: {line_strong}; }}\n\
+         li.task > input:checked {{ border-color: {accent}; background: {accent} {tick}; }}\n\
+         blockquote, .unknown {{ border-color: {line_strong}; }}\n\
          hr, th, td {{ border-color: {line}; }}\n\
          a {{ color: {link}; }}\n\
          mark {{ background: {highlight}; }}\n",
@@ -606,6 +664,13 @@ fn colours(style: &Style, on: &Palette, css: &mut String) {
         code_fill = color(on.code),
         marker = color(on.marker),
         accent = color(on.accent),
+        // A tick, drawn in the page itself. The `#` of its colour is written so that it does not end the address.
+        tick = format_args!(
+            "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath \
+             d='M3.4 7.4l2.4 2.4 4.8-5.4' fill='none' stroke='%23{}' stroke-width='1.6' stroke-linecap='round' \
+             stroke-linejoin='round'/%3E%3C/svg%3E\")",
+            &color(on.on_accent)[1..],
+        ),
         line_strong = color(on.line_strong),
         line = color(on.line),
         link = color(on.link),
@@ -620,26 +685,87 @@ fn colours(style: &Style, on: &Palette, css: &mut String) {
     }
 }
 
+/// Writes what stands before each list item, where layout draws it: ending 8 pixels before the text, a
+/// bullet or a box level with the middle of a lower-case letter. A browser's own markers sit a few pixels
+/// off, and it greys a box that cannot be ticked.
+fn markers(text: f32, css: &mut String) {
+    let dot = (text * 0.36).round().max(3.0);
+    // An empty marker, where `none` would have some screen readers stop calling the list a list.
+    let _ = write!(
+        css,
+        "li {{ list-style-type: \"\"; }}\n\
+         li::before {{ display: inline-block; box-sizing: border-box; margin-right: 8px; }}\n\
+         ul > li::before {{ content: \"\"; width: {dot}px; height: {dot}px; margin-left: -{reach}px; \
+         vertical-align: calc(0.34em - {half}px); border-radius: 50%; background: currentColor; }}\n",
+        reach = dot + 8.0,
+        half = dot / 2.0,
+    );
+    // A list inside a list changes its bullet: a ring, a square, then round again.
+    for depth in 1..=8 {
+        let shape = match depth % 3 {
+            0 => "border: 0; border-radius: 50%; background: currentColor;",
+            1 => "border: 1px solid; border-radius: 50%; background: none;",
+            _ => "border: 0; border-radius: 0; background: currentColor;",
+        };
+        let _ = writeln!(css, "{}ul > li::before {{ {shape} }}", "li ".repeat(depth));
+    }
+    css.push_str(concat!(
+        "ol { counter-reset: item; }\n",
+        "ol > li { counter-increment: item; }\n",
+        "ol > li::before { content: counter(item) \".\"; width: 4em; margin-left: calc(-4em - 8px); ",
+        "text-align: right; }\n",
+        "li.task::before { content: none; }\n",
+        "li.task > input { appearance: none; -webkit-appearance: none; box-sizing: border-box; width: 14px; ",
+        "height: 14px; margin: 0 8px 0 -22px; vertical-align: calc(0.34em - 7px); border: 1.5px solid; ",
+        "border-radius: 3px; }\n",
+    ));
+}
+
 /// Writes the stylesheet: the page, each element type of the style, the furniture layout draws around them,
 /// then the colours of it all. A page that has a dark theme repeats the colours in `dark`.
-fn css(style: &Style, dark: Option<&Palette>, css: &mut String) {
+fn css(style: &Style, with: &HtmlPage, css: &mut String) {
     let of = |key: &str| style.types.get(key).or_else(|| style.types.get("body")).cloned().unwrap_or_default();
     let (body, quote, code) = (of("body"), of("quote"), of("code"));
     // The space after body text is the unit the gaps around lists, quotes and dividers are measured in.
     let unit = (body.space_after * PIXELS).round();
     let page = &style.page;
 
-    let _ = write!(
-        css,
-        "body {{ margin: 0; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }}\n\
-         article {{ max-width: {measure}; margin: 0 auto; padding: {top} {right} {bottom} {left}; \
-         overflow-wrap: break-word; }}\n",
-        measure = pt(page.width - page.margin_left - page.margin_right),
-        top = pt(page.margin_top),
-        right = pt(page.margin_right),
-        bottom = pt(page.margin_bottom),
-        left = pt(page.margin_left),
-    );
+    for font in with.fonts {
+        let _ = writeln!(
+            css,
+            "@font-face {{ font-family: {}; src: url({}); font-weight: 1 1000; font-style: {}; font-display: swap; }}",
+            quoted(font.family),
+            quoted(font.url),
+            if font.italic { "italic" } else { "normal" },
+        );
+    }
+    // Paper keeps the fills behind code and callouts, which a browser would otherwise leave off it.
+    css.push_str(concat!(
+        "body { margin: 0; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; ",
+        "-webkit-print-color-adjust: exact; print-color-adjust: exact; }\n",
+    ));
+    let measure = page.width - page.margin_left - page.margin_right;
+    let _ = match with.window {
+        // The window centres its column and starts it on a whole pixel, which `margin: auto` would not.
+        Some(Column { gutter, top }) => writeln!(
+            css,
+            "article {{ --column: min({column}px, 100% - {gutters}px); width: var(--column); padding: {top} 0; \
+             margin-left: round(calc((100% - var(--column)) / 2), 1px); overflow-wrap: break-word; }}",
+            column = number(measure * PIXELS),
+            gutters = number(2.0 * gutter),
+            top = px(top),
+        ),
+        None => writeln!(
+            css,
+            "article {{ max-width: {measure}; margin: 0 auto; padding: {top} {right} {bottom} {left}; \
+             overflow-wrap: break-word; }}",
+            measure = pt(measure),
+            top = pt(page.margin_top),
+            right = pt(page.margin_right),
+            bottom = pt(page.margin_bottom),
+            left = pt(page.margin_left),
+        ),
+    };
 
     type_rule("p, li", &body, false, css);
     type_rule("th, td", &body, false, css);
@@ -653,31 +779,40 @@ fn css(style: &Style, dark: Option<&Palette>, css: &mut String) {
     space_rule("blockquote p", quote.space_before, quote.space_after, css);
     type_rule("pre", &code, true, css);
     space_rule("pre", code.space_before.max(code.space_after), code.space_after, css);
-    for (key, selector) in [("caption", "figcaption, .fallback"), ("title", ".title")] {
+    for (key, selector) in [("caption", "figcaption, .fallback, .unknown"), ("title", ".title")] {
         type_rule(selector, &of(key), false, css);
         space_rule(selector, of(key).space_before, of(key).space_after, css);
     }
+    // A block the window cannot show stands in a box, with the room around it that a code block has.
+    let label = of("caption");
+    space_rule(".unknown", label.space_before.max(label.space_after), label.space_after, css);
 
     // The measures in pixels are layout's own, so the file looks as the page does.
     let _ = write!(
         css,
         "code {{ font-family: {mono}, ui-monospace, monospace; }}\n\
-         :not(pre) > code {{ font-size: 0.9em; padding: 0.1em 0.25em; border-radius: 3px; }}\n\
+         :not(pre) > code {{ font-size: 0.9em; }}\n\
+         :not(pre) > code, mark {{ padding: 0 2px; margin: 0 -2px; border-radius: 3px; }}\n\
+         .unknown {{ padding: 11px 15px; border: 1px solid; border-radius: 6px; }}\n\
          pre {{ padding: 12px 16px; border-radius: 6px; white-space: pre-wrap; \
          overflow-wrap: anywhere; tab-size: 4; }}\n\
          ul, ol {{ margin: {before} 0 {after}; padding-left: 24px; }}\n\
          li + li, li > ul, li > ol {{ margin-top: {between}; }}\n\
          li > ul, li > ol {{ margin-bottom: 0; }}\n\
-         li.task {{ list-style: none; }}\n\
-         li.task > input {{ width: 14px; height: 14px; margin: 0 8px 0 -22px; vertical-align: -2px; }}\n\
+         :is(ul, ol) + :is(ul, ol) {{ margin-top: {beside}; }}\n\
          blockquote {{ margin: {after} 0; padding: 0 0 0 16px; border-left: 3px solid; }}\n\
-         .callout {{ margin: {callout_gap} 0; padding: 12px 16px; border-left: 3px solid; border-radius: 6px; }}\n",
+         .callout {{ margin: {callout_gap} 0; padding: 12px 16px 12px 13px; border-left: 3px solid; \
+         border-radius: 6px; }}\n",
         mono = quoted(&code.family),
         before = px(body.space_before * PIXELS),
         after = px(unit),
         between = px(unit * 0.25),
+        // Bullets after numbers are two lists here and one run of items to layout, which sets them as close
+        // as the items of one list. The margin is taken off the gap that the list above leaves.
+        beside = px((unit * 0.25).round() - unit.max((body.space_before * PIXELS).round())),
         callout_gap = px(unit * 1.5),
     );
+    markers(body.size * PIXELS, css);
     let _ = write!(
         css,
         "table {{ margin: {after} 0; border-collapse: collapse; }}\n\
@@ -698,18 +833,21 @@ fn css(style: &Style, dark: Option<&Palette>, css: &mut String) {
         rule_gap = px(unit * 2.0),
     );
     colours(style, &PAGE, css);
-    if let Some(dark) = dark {
+    if let Some(dark) = with.dark {
         // Only a screen goes dark: paper is white whatever the reader's theme.
         css.push_str("@media screen and (prefers-color-scheme: dark) {\n");
         colours(style, dark, css);
         css.push_str("}\n");
     }
-    // A narrow screen gives the margins back to the text, and paper takes them from the page setup.
+    // A narrow screen gives the margins back to the text. A window has gutters for that.
+    if with.window.is_none() {
+        css.push_str("@media (max-width: 40em) { article { padding: 24px 16px; } }\n");
+    }
+    // Paper takes its margins from the page setup.
     let _ = write!(
         css,
-        "@media (max-width: 40em) {{ article {{ padding: 24px 16px; }} }}\n\
-         @page {{ size: {width} {height}; margin: {top} {right} {bottom} {left}; }}\n\
-         @media print {{ article {{ max-width: none; padding: 0; }} }}\n",
+        "@page {{ size: {width} {height}; margin: {top} {right} {bottom} {left}; }}\n\
+         @media print {{ article {{ width: auto; max-width: none; margin: 0; padding: 0; }} }}\n",
         width = pt(page.width),
         height = pt(page.height),
         top = pt(page.margin_top),
@@ -717,4 +855,9 @@ fn css(style: &Style, dark: Option<&Palette>, css: &mut String) {
         bottom = pt(page.margin_bottom),
         left = pt(page.margin_left),
     );
+    // Nothing in the caller's rules can end the stylesheet: CSS reads the escape as the same character.
+    css.push_str(&with.css.replace("</", "<\\/"));
+    if !with.css.is_empty() && !with.css.ends_with('\n') {
+        css.push('\n');
+    }
 }
