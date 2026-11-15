@@ -258,6 +258,29 @@ fn what_is_found_goes_to_every_preview_that_waits_for_the_address_and_to_no_othe
 }
 
 #[test]
+fn a_shell_that_cannot_fetch_is_asked_for_nothing_and_offers_no_fetch() {
+    let blocks = vec![Block::text("p", BlockKind::Paragraph, "")];
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.ui().set_save_state(SaveState::Unsaved);
+    window.ui().set_preview_fetching(false);
+    window.type_text("/link").key("Enter").type_text(QUOTE).key("Enter");
+    assert_eq!(shown(&window), (QUOTE.to_owned(), None, None, None), "a preview is put in all the same");
+    assert_eq!(fetches(&mut window), [""; 0]);
+
+    // Nothing on the preview or in its card offers a fetch, and the rest of the card is there.
+    let offers = |window: &mut Harness| {
+        let fetch =
+            |found: &Found| found.role == Role::Button && (found.name.contains("etch") || found.name == "Try again");
+        window.controls().into_iter().filter(fetch).map(|found| found.name).collect::<Vec<_>>()
+    };
+    assert_eq!(offers(&mut window), [""; 0]);
+    window.click(Role::Button, EDIT).assert_open(Role::Dialog, CARD);
+    assert_eq!(offers(&mut window), [""; 0]);
+    window.click(Role::TextInput, "Title").type_text("Spring quotes");
+    assert_eq!(shown(&window).1.as_deref(), Some("Spring quotes"));
+}
+
+#[test]
 fn a_press_on_a_preview_opens_a_card_that_changes_it() {
     let mut window = note(preview(GUIDE, Some("Welsh slate"), Some("assets/slate.png")));
     window.click(Role::Button, EDIT).assert_open(Role::Dialog, CARD);

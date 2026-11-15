@@ -729,6 +729,14 @@ impl Ui<EditorApp> {
         }
     }
 
+    /// Says whether this shell can fetch what a page says of itself, which it can until told otherwise.
+    /// Where it cannot, no [`Request::FetchPreview`] is raised and nothing offers one: a link preview that
+    /// shows its address alone has no "Fetch preview", and its card no button for it. What the document
+    /// keeps of a page shows as it does anywhere.
+    pub fn set_preview_fetching(&mut self, offered: bool) {
+        self.app_mut().previews.offer(offered);
+    }
+
     /// Says that the page at an address was not fetched and why, in a few words that read on from
     /// "Not fetched:", such as "the server answered 404", in answer to a [`Request::FetchPreview`]. What
     /// waits for the address keeps what it shows and offers another try.
@@ -2634,7 +2642,8 @@ impl EditorApp {
         let at = self.in_layout(at);
         let cards = self.layout.previews(Rect::new(at.x, at.y, 0.0, 1.0));
         let card = cards.into_iter().find(|card| card.rect.contains(at))?;
-        let on_control = card.control.is_some_and(|room| previews::control(room).contains(at));
+        let room = card.control.filter(|_| self.previews.offered());
+        let on_control = room.is_some_and(|room| previews::control(room).contains(at));
         Some((card.block, on_control))
     }
 
@@ -3555,7 +3564,7 @@ impl EditorApp {
             }
         }
         for card in self.layout.previews(viewport) {
-            if let Some(room) = card.control {
+            if let Some(room) = card.control.filter(|_| self.previews.offered()) {
                 let at = previews::control(room);
                 self.previews.paint(&card.block, at, self.shaper.as_ref(), self.scheme, &mut list);
             }
@@ -4980,7 +4989,7 @@ impl App for EditorApp {
         for card in self.layout.previews(view) {
             let at = self.onto(card.rect);
             describe::whole(&card.block, Whole::Preview, (previews::LABEL, None), at, page, nodes);
-            if let Some(room) = card.control {
+            if let Some(room) = card.control.filter(|_| self.previews.offered()) {
                 let failed = self.previews.failed(&card.block).map(|why| format!("Not fetched: {why}"));
                 let told = (self.previews.says(&card.block), failed.as_deref());
                 describe::whole(&card.block, Whole::Fetch, told, self.onto(previews::control(room)), page, nodes);

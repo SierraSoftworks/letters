@@ -91,6 +91,8 @@ pub(crate) struct Previews {
     /// The previews whose page was asked for: the address that was asked for, and why its fetch found
     /// nothing, in the shell's words, which is `None` while the shell fetches.
     fetches: BTreeMap<BlockId, (String, Option<String>)>,
+    /// Whether the shell cannot fetch what a page says of itself, so that nothing offers a fetch.
+    unfetched: bool,
 }
 
 /// The address of a link preview.
@@ -154,9 +156,26 @@ impl Previews {
         typed.map(|typed| (block, typed))
     }
 
+    /// Takes whether the shell can fetch what a page says of itself. Where it cannot, nothing waits for
+    /// a page.
+    pub fn offer(&mut self, offered: bool) {
+        self.unfetched = !offered;
+        if self.unfetched {
+            self.fetches.clear();
+        }
+    }
+
+    /// Whether a fetch is offered: the shell can fetch what a page says of itself.
+    pub fn offered(&self) -> bool {
+        !self.unfetched
+    }
+
     /// Notes that a preview waits for the page at its address. Returns whether the shell has to be asked:
-    /// no fetch of that address runs already, for this preview or for another.
+    /// it can fetch, and no fetch of that address runs already, for this preview or for another.
     pub fn fetch(&mut self, block: &BlockId, url: &str) -> bool {
+        if self.unfetched {
+            return false;
+        }
         let asked = self.fetches.values().any(|(at, failed)| at == url && failed.is_none());
         self.fetches.insert(block.clone(), (url.to_owned(), None));
         !asked
@@ -285,7 +304,8 @@ impl Previews {
             says => says,
         };
         let fetch = Button::new(fetch).small().disabled(self.waits(block)).on_press(send(Previewing::Fetch));
-        let mut buttons = Element::row().align(Align::Center).justify(Justify::Between).child(fetch);
+        let mut buttons = Element::row().align(Align::Center).justify(Justify::Between);
+        buttons = buttons.children(self.offered().then_some(fetch));
         if image.is_some() {
             let remove = Button::new("Remove picture").subtle().small();
             buttons = buttons.child(remove.on_press(edit(PreviewEdit::Picture(None))));
@@ -297,7 +317,8 @@ impl Previews {
             let said = Element::paragraph(format!("Not fetched: {why}"), quiet).fg(tokens::DANGER).max_width(WIDTH);
             card = card.child(said.role(Role::Status));
         }
-        let card = Popover::new(card.child(buttons))
+        let card = card.children((self.offered() || image.is_some()).then_some(buttons));
+        let card = Popover::new(card)
             .label("Link preview")
             .max_width(WIDTH + 2.0 * tokens::SPACE_MD + 2.0)
             .at(spot)
