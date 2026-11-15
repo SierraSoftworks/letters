@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 
 import { expect, test } from "@playwright/test";
 
-import { blocks, ready, rested } from "./page.js";
+import { blocks, entry, ready, rested } from "./page.js";
 
 const card = (page) => page.getByRole("dialog", { name: "Save a copy" });
 
@@ -67,6 +67,24 @@ for (const [format, ending, starts, ...holds] of [
     await expect(card(page)).not.toBeAttached();
   });
 }
+
+test("a clean copy is a document of its own, without what this one once read", async ({ page }) => {
+  // A passage written and taken back is in the history alone.
+  await page.keyboard.insertText("Thought better of. ".repeat(12));
+  await page.keyboard.press("ControlOrMeta+z");
+  await page.keyboard.type("Kept words");
+  const files = [];
+  for (const [name, format] of [["Whole", "Letters"], ["Clean", "Clean copy"]]) {
+    await ask(page, name, format);
+    const [called, file] = await saved(page);
+    expect(called).toBe(`${name}.let`);
+    files.push(Buffer.from(file, "latin1"));
+  }
+  const [whole, clean] = files;
+  for (const file of files) expect(entry(file, "document.json")).toContain("Kept words");
+  expect(entry(clean, "history/oplog").length).toBeLessThan(entry(whole, "history/oplog").length);
+  expect(JSON.parse(entry(clean, "manifest.json")).id).not.toBe(JSON.parse(entry(whole, "manifest.json")).id);
+});
 
 test("a Markdown copy brings its pictures with it", async ({ page }) => {
   await picture(page);
