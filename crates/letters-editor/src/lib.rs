@@ -30,7 +30,7 @@ use std::ops::Range;
 
 use letters_model::{
     Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, OpError, Page, Pos, ReplicaId, Revision,
-    Run, Selection, Style, TextStyle,
+    Run, Selection, Stood, Style, TextStyle,
 };
 
 pub use callout::CalloutEdit;
@@ -248,6 +248,13 @@ pub enum Command {
     /// Makes each of some blocks read as another version of it, as [`Command::UseVersion`] does one: a
     /// passage that is restored from the history. One undo step for all of them.
     UseVersions(Vec<(BlockId, Option<Box<Block>>)>),
+    /// Puts a block back that the document no longer holds, where it stood: the version of a conflict
+    /// whose other side took the block away. Behind the block it stood behind if that is still beside
+    /// where it stood, else first there. One undo step.
+    PutBack {
+        block: Box<Block>,
+        stood: Stood,
+    },
     /// Makes the document and its style read as they did at a revision of the history. Nothing of the
     /// history is taken back, and it is one undo step. See [`letters_model::Model::restore`].
     Restore(Revision),
@@ -586,6 +593,9 @@ impl Editor {
         if let Command::UseVersions(blocks) = command {
             return blocks.iter().any(|(block, version)| self.takes_version(block, version.as_deref()));
         }
+        if let Command::PutBack { block, stood } = command {
+            return self.takes_back(block, stood).is_some();
+        }
         if let Command::Replace { query, only, .. } = command {
             // What is found is replaced wherever the caret is.
             return self.replaceable(query, only.as_ref());
@@ -711,6 +721,7 @@ impl Editor {
                     }
                 }
             }
+            Command::PutBack { block, stood } => self.put_back(*block, &stood),
             Command::Restore(revision) => self.restore_version(&revision),
             Command::ReplaceStyle(style) => _ = self.apply(vec![Op::ReplaceStyle { style }]),
             Command::SetLanguage(language) => _ = self.apply(vec![Op::SetLanguage { language }]),

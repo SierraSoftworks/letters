@@ -3,7 +3,7 @@ mod common;
 use common::Do::{K, T};
 use common::{Action, Do, Harness, SAMPLE, action, canon, check, clip, parse, perform, sound};
 use letters_editor::{Command, InputEvent, Spot, TableEdit};
-use letters_model::{BlockId, BlockKind, Model, ReplicaId};
+use letters_model::{Block, BlockId, BlockKind, Model, ReplicaId, Stood};
 use proptest::prelude::*;
 
 /// Two writers on `state`: this one with its selection, and another who plays `script` from `theirs`.
@@ -310,6 +310,52 @@ fn several_blocks_are_made_to_read_as_other_versions_in_one_undo_step() {
     let editor = Harness::new("p one|\np two");
     let same = Command::UseVersions(vec![(id("b2"), version("p two")), (id("nowhere"), None)]);
     assert!(!editor.editor.applies(&same), "nothing of it changes a block");
+}
+
+/// Puts back a paragraph `gone` that stood behind `after`, in `parent` if it was held by a block.
+fn put_back(id: &str, after: Option<&str>, parent: Option<&str>) -> Command {
+    let block = Box::new(Block { id: BlockId::new(id), ..parse("p gone").0.blocks.remove(0) });
+    let stood = Stood { after: after.map(BlockId::new), parent: parent.map(BlockId::new), ..Stood::default() };
+    Command::PutBack { block, stood }
+}
+
+#[test]
+fn a_block_that_is_gone_is_put_back_where_it_stood_in_one_undo_step() {
+    let (flat, quoted) = ("p one|\np two", "> p one|\n> p two");
+    // The document, the block it stood behind and the one that held it, and the document with it back.
+    // With none to stand behind, or one that is gone too, it stands first.
+    let cases = [
+        (flat, Some("b1"), None, "p one|\np gone\np two"),
+        (flat, Some("b2"), None, "p one|\np two\np gone"),
+        (flat, None, None, "p gone\np one|\np two"),
+        (flat, Some("nowhere"), None, "p gone\np one|\np two"),
+        (quoted, Some("b1"), Some("b2"), "> p one|\n> p gone\n> p two"),
+        (quoted, None, Some("b2"), "> p gone\n> p one|\n> p two"),
+    ];
+    for (before, after, parent, with) in cases {
+        let mut editor = Harness::new(before);
+        let back = put_back("gone", after, parent);
+        assert!(editor.editor.applies(&back), "{after:?} in {parent:?}");
+        editor.run(back);
+        assert_eq!(editor.state(), canon(with), "behind {after:?} in {parent:?}");
+        assert!(editor.key("Mod+z"));
+        assert_eq!(editor.state(), canon(before), "undone, behind {after:?} in {parent:?}");
+        assert!(!editor.editor.can_undo(), "one step, behind {after:?} in {parent:?}");
+    }
+}
+
+#[test]
+fn a_block_is_only_put_back_where_it_is_missing_and_its_place_is_there() {
+    let mut editor = Harness::new("p one|\np two");
+    // A block by its id is there already, or the block that held it is gone or holds no blocks now.
+    let nots =
+        [put_back("b2", Some("b1"), None), put_back("gone", None, Some("nowhere")), put_back("gone", None, Some("b1"))];
+    for not in nots {
+        assert!(!editor.editor.applies(&not), "{not:?}");
+        assert_eq!(editor.run(not), Default::default());
+    }
+    assert_eq!(editor.state(), canon("p one|\np two"));
+    assert!(!editor.editor.can_undo());
 }
 
 #[test]
