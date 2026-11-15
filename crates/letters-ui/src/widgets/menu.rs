@@ -103,11 +103,12 @@ enum Entry<M> {
 pub struct Menu<M> {
     label: Option<String>,
     entries: Vec<Entry<M>>,
+    leads: bool,
 }
 
 impl<M> Default for Menu<M> {
     fn default() -> Self {
-        Self { label: None, entries: Vec::new() }
+        Self { label: None, entries: Vec::new(), leads: false }
     }
 }
 
@@ -139,6 +140,13 @@ impl<M> Menu<M> {
         self
     }
 
+    /// Has the first item that can be chosen take the keyboard when the menu shows, for a menu that is
+    /// not the first thing in its popover.
+    pub fn leads(mut self) -> Self {
+        self.leads = true;
+        self
+    }
+
     pub fn separator(mut self) -> Self {
         self.entries.push(Entry::Separator);
         self
@@ -164,13 +172,15 @@ impl<M> From<Menu<M>> for Element<M> {
 
         let mut danger_before = None;
         let mut ruled = true;
+        let mut leads = menu.leads;
         for entry in menu.entries {
             // yewi draws a rule wherever two kinds of thing meet, without being asked.
             let needs_rule = match &entry {
                 Entry::Heading(_) => !ruled,
                 Entry::Note(..) => false,
                 Entry::Item(item) => !ruled && item.tone == Tone::Danger && danger_before == Some(false),
-                Entry::Separator => true,
+                // A separator with nothing above it, or right under another, has nothing to part.
+                Entry::Separator => !ruled,
             };
             if needs_rule {
                 element = element.child(rule());
@@ -198,7 +208,9 @@ impl<M> From<Menu<M>> for Element<M> {
                 }
                 Entry::Item(item) => {
                     danger_before = Some(item.tone == Tone::Danger);
-                    element = element.child(row(item));
+                    let first = leads && !item.disabled;
+                    leads &= !first;
+                    element = element.child(row(item, first));
                 }
             }
         }
@@ -211,7 +223,7 @@ fn rule<M>() -> Element<M> {
     Element::column().padding(Edges::xy(0.0, tokens::SPACE_XS)).child(line).decorative()
 }
 
-fn row<M>(item: MenuItem<M>) -> Element<M> {
+fn row<M>(item: MenuItem<M>, leads: bool) -> Element<M> {
     let (fg, active) = match item.tone {
         Tone::Default => (tokens::FG, tokens::NEUTRAL_SOFT),
         Tone::Warn => (tokens::WARN, tokens::NEUTRAL_SOFT),
@@ -250,6 +262,9 @@ fn row<M>(item: MenuItem<M>) -> Element<M> {
     }
     if let Some(message) = item.on_select {
         row = row.on_press(message);
+    }
+    if leads {
+        row = row.takes_focus();
     }
     // The gutter around a row is the menu's padding, which rules run through.
     Element::row().padding(Edges::xy(tokens::SPACE_XS, 0.0)).child(row)
