@@ -103,6 +103,12 @@ zip.workspace = true
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 letters-convert.workspace = true
 
+# The `server` example runs the server itself behind the page. Nothing of it is built for the browser.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+letters-server = { path = "../letters-server" }
+axum.workspace = true
+tokio.workspace = true
+
 # The browser fetches the fonts, the maths faces and the dictionaries beside the wasm, so they are cached
 # apart from it and only the fonts hold up the first frame. Only the wasm build leaves them out: a feature
 # named here for every target would take them from the native tests too.
