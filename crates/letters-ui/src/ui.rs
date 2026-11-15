@@ -291,7 +291,7 @@ impl<A: App> Ui<A> {
             pressed: self.pressed,
             focus: self.focus,
             focus_visible: self.focus_visible,
-            caret: self.caret_on && self.active,
+            caret: self.caret_holder().filter(|_| self.caret_on && self.active).map(|i| self.tree.nodes[i].id),
             inputs: &self.inputs,
             scroll: &self.scroll,
             tip: self.tip.as_ref(),
@@ -330,7 +330,7 @@ impl<A: App> Ui<A> {
             self.idle.0 = false;
             self.refresh();
         }
-        let caret = self.focused().is_some_and(|i| match &self.tree.nodes[i].el.content {
+        let caret = self.caret_holder().is_some_and(|i| match &self.tree.nodes[i].el.content {
             Content::Input(_) => true,
             Content::Canvas(canvas) => canvas.caret.is_some(),
             _ => false,
@@ -349,7 +349,7 @@ impl<A: App> Ui<A> {
 
     /// Where the caret is in the window as last laid out, for the input method's candidate window.
     pub fn caret_rect(&self) -> Option<Rect> {
-        let node = &self.tree.nodes[self.focused()?];
+        let node = &self.tree.nodes[self.caret_holder()?];
         let content = inner(node.rect, &node.el.style);
         match &node.el.content {
             Content::Input(input) => {
@@ -748,9 +748,11 @@ impl<A: App> Ui<A> {
         let beside = self.tree.layers.iter().find(|layer| {
             layer.beside && focused.is_some_and(|i| layer.anchor == Some(i) || (layer.root..layer.end).contains(&i))
         });
-        let stops: Vec<usize> = match beside {
-            Some(layer) => layer.anchor.into_iter().chain(self.tab_stops(layer.root..layer.end, focused)).collect(),
-            None => self.tab_stops(layer.root..layer.end, focused),
+        let inside = beside.map(|layer| (layer.anchor, self.tab_stops(layer.root..layer.end, focused)));
+        let stops: Vec<usize> = match inside {
+            // One with nothing to stop at leaves Tab to the window.
+            Some((anchor, inside)) if !inside.is_empty() => anchor.into_iter().chain(inside).collect(),
+            _ => self.tab_stops(layer.root..layer.end, focused),
         };
         let at = focused.and_then(|i| stops.iter().position(|&stop| stop == i));
         let next = match (at, back) {
@@ -961,7 +963,12 @@ impl<A: App> Ui<A> {
     fn target(&self, hit: usize) -> Option<usize> {
         self.tree.ancestors(hit).find(|&i| {
             let node = &self.tree.nodes[i];
-            let takes_input = matches!(node.el.content, Content::Input(_) | Content::Canvas(_));
+            // A canvas that is only a picture leaves the pointer to what it is drawn in.
+            let takes_input = match &node.el.content {
+                Content::Input(_) => true,
+                Content::Canvas(canvas) => canvas.on_pointer.is_some(),
+                _ => false,
+            };
             let el = &node.el;
             let pointed = el.on_drag.is_some() || el.on_double.is_some() || el.on_menu.is_some();
             takes_input || pointed || el.on_press.is_some() || node.trigger.is_some() || el.focus != Focus::No
@@ -1031,6 +1038,13 @@ impl<A: App> Ui<A> {
         self.stale.view = true;
     }
 
+    /// Closes a popover a press landed outside of, unless it is one that stays.
+    fn press_outside(&mut self, layer: usize) {
+        if !self.tree.layers[layer].stays {
+            self.close_layer(layer);
+        }
+    }
+
     /// Closes the popovers a press landed outside of. Returns whether the press ends there, as one on a
     /// modal popover's backdrop does.
     fn dismiss(&mut self, hit: Option<usize>) -> bool {
@@ -1040,7 +1054,7 @@ impl<A: App> Ui<A> {
                 self.close_layer(top);
                 return true;
             }
-            (1..=top).rev().for_each(|layer| self.close_layer(layer));
+            (1..=top).rev().for_each(|layer| self.press_outside(layer));
             return false;
         };
         for layer in (1..=top).rev() {
@@ -1050,7 +1064,7 @@ impl<A: App> Ui<A> {
             if on_anchor || self.tree.in_layer(hit, layer) {
                 break;
             }
-            self.close_layer(layer);
+            self.press_outside(layer);
         }
         false
     }
@@ -1189,9 +1203,19 @@ impl<A: App> Ui<A> {
         layout.run(&mut self.tree);
     }
 
+    /// The element whose caret shows: the one with focus, or a canvas that holds a caret for it in a popover
+    /// beside it.
+    fn caret_holder(&self) -> Option<usize> {
+        let focused = self.focused()?;
+        let holds =
+            |i: &usize| matches!(&self.tree.nodes[*i].el.content, Content::Canvas(canvas) if canvas.caret.is_some());
+        let beside = self.tree.layers.iter().filter(|layer| layer.beside && layer.anchor == Some(focused));
+        beside.flat_map(|layer| layer.root..layer.end).find(holds).or(Some(focused))
+    }
+
     /// Keeps the focused element's caret in view. Returns whether anything scrolled.
     fn follow_caret(&mut self) -> bool {
-        let Some(i) = self.focused() else { return false };
+        let Some(i) = self.caret_holder() else { return false };
         let node = &self.tree.nodes[i];
         let content = inner(node.rect, &node.el.style);
         match &node.el.content {

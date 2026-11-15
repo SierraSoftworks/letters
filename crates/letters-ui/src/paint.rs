@@ -66,8 +66,8 @@ pub(crate) struct Scene<'a> {
     pub focus: Option<Id>,
     /// Whether focus came from the keyboard, which is when a ring is drawn.
     pub focus_visible: bool,
-    /// Whether the blinking caret is in its visible half.
-    pub caret: bool,
+    /// The element whose caret shows, while the blink is in its visible half.
+    pub caret: Option<Id>,
     pub inputs: &'a HashMap<Id, InputState>,
     pub scroll: &'a HashMap<Id, f32>,
     pub tip: Option<&'a Tip>,
@@ -207,7 +207,7 @@ fn node<M>(
                     let rect = span(range, top + shaped.baseline + 2.0, 1.0);
                     out.push(Item::Fill { rect, color: color(fg), radius: 0.0 });
                 }
-                if focused && scene.caret {
+                if scene.caret == Some(n.id) {
                     let x = left + shaped.x_at(state.caret(&input.value));
                     let rect = Rect::new(x, top, CARET, shaped.size.height);
                     out.push(Item::Fill { rect, color: color(fg), radius: 0.0 });
@@ -217,7 +217,7 @@ fn node<M>(
         }
         Content::Canvas(canvas) => {
             canvas.paint.paint(content, intersect(visible, content), scene.scheme, out);
-            if let Some(caret) = canvas.caret.filter(|_| focused && scene.caret) {
+            if let Some(caret) = canvas.caret.filter(|_| scene.caret == Some(n.id)) {
                 let rect =
                     Rect { x: content.x + caret.x, y: content.y + caret.y, width: caret.width.max(CARET), ..caret };
                 out.push(Item::Fill { rect, color: color(fg), radius: 0.0 });

@@ -195,7 +195,8 @@ fn collect<M>(tree: &Tree<M>, window: &Window<'_>, i: usize, named: bool, siblin
         children.extend(runs);
     }
     node.set_children(children);
-    if let Content::Canvas(_) = &n.el.content {
+    // The app describes the canvas that takes its input. A passive one has only its own name.
+    if matches!(n.el.content, Content::Canvas(_)) && n.el.focus != Focus::No {
         (window.describe)(&mut node, out);
     }
 

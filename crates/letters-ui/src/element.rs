@@ -556,6 +556,14 @@ impl<M> Element<M> {
         self
     }
 
+    /// Keeps a canvas from taking focus, for one that is only a picture. In a popover beside another element
+    /// it may still show that element's caret: the caret set here blinks while that element has focus, and
+    /// a press here leaves focus with it.
+    pub fn passive(mut self) -> Self {
+        self.focus = Focus::No;
+        self
+    }
+
     /// Where the canvas draws its caret, relative to its top left.
     pub fn caret(mut self, caret: Option<Rect>) -> Self {
         if let Content::Canvas(canvas) = &mut self.content {

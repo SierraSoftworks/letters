@@ -45,6 +45,7 @@ pub struct Popover<M> {
     pub(crate) modal: bool,
     pub(crate) shows_focus: bool,
     pub(crate) beside: bool,
+    pub(crate) stays: bool,
     pub(crate) popup: HasPopup,
 }
 
@@ -69,6 +70,7 @@ impl<M> Popover<M> {
             modal: false,
             shows_focus: false,
             beside: false,
+            stays: false,
             popup: HasPopup::Dialog,
         }
     }
@@ -142,6 +144,19 @@ impl<M> Popover<M> {
     /// field holds.
     pub fn beside(mut self) -> Self {
         self.beside = true;
+        self
+    }
+
+    /// Keeps the popover out when something outside it is pressed, for one the app shows for as long as a
+    /// reason of its own holds. Escape still asks it to close.
+    pub fn stays(mut self) -> Self {
+        self.stays = true;
+        self
+    }
+
+    /// Makes the surface a flat sheet: no border and barely a corner, with only its shadow to lift it.
+    pub fn flat(mut self) -> Self {
+        self.content = self.content.border(Edges::ZERO, tokens::CARD_LINE).radius(2.0);
         self
     }
 
