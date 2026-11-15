@@ -66,6 +66,8 @@ struct Telling<'a> {
     before: Option<&'a HashMap<NodeId, u64>>,
     now: HashMap<NodeId, u64>,
     nodes: &'a mut Vec<(NodeId, Node)>,
+    /// Whether the document is written on. One that is only read has nothing to press.
+    written: bool,
 }
 
 impl Telling<'_> {
@@ -99,8 +101,26 @@ pub(crate) fn page(
     {
         page.set_text_selection(TextSelection { anchor, focus });
     }
+    tell(doc, told, whole, true, page, nodes);
+}
+
+/// Adds the blocks of a version of the document under the canvas that shows it, as [`page`] does for
+/// the document itself. A version is read and not written on: nothing in it takes a selection or a press.
+pub(crate) fn version(
+    doc: &Document,
+    told: &mut Told,
+    whole: bool,
+    canvas: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
+    canvas.set_language(doc.language.as_str());
+    tell(doc, told, whole, false, canvas, nodes);
+}
+
+fn tell(doc: &Document, told: &mut Told, whole: bool, written: bool, page: &mut Node, nodes: &mut Vec<(NodeId, Node)>) {
     let before = mem::take(&mut told.0);
-    let mut telling = Telling { before: (!whole).then_some(&before), now: HashMap::with_capacity(before.len()), nodes };
+    let now = HashMap::with_capacity(before.len());
+    let mut telling = Telling { before: (!whole).then_some(&before), now, nodes, written };
     page.set_children(push_blocks(&doc.blocks, &mut telling));
     told.0 = telling.now;
 }
@@ -297,6 +317,7 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
         BlockKind::Unknown { .. } => Role::Unknown,
     });
     let mut children = Vec::new();
+    let written = telling.written;
     let mut part = |part: u8, node: Node, children: &mut Vec<NodeId>| {
         telling.nodes.push((part_node(&block.id, part), node));
         children.push(part_node(&block.id, part));
@@ -309,11 +330,13 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
                 // The tick is a checkbox of its own, which a click ticks.
                 let mut tick = Node::new(Role::CheckBox);
                 tick.set_toggled(if *checked { Toggled::True } else { Toggled::False });
-                tick.add_action(Action::Click);
+                if written {
+                    tick.add_action(Action::Click);
+                }
                 part(TICK, tick, &mut children);
             }
         }
-        BlockKind::Code { .. } => {
+        BlockKind::Code { .. } if written => {
             // The button in the corner of the box, which a click presses.
             let mut copy = Node::new(Role::Button);
             copy.set_label(crate::code_copy::LABEL);
@@ -325,11 +348,13 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
             let mut picture = Node::new(Role::Image);
             picture.set_label(alt.as_str());
             part(PICTURE, picture, &mut children);
-            // The switch under it, which a click turns to the alt text.
-            let mut switch = Node::new(Role::Button);
-            switch.set_label(crate::captions::LABEL);
-            switch.add_action(Action::Click);
-            part(ALT, switch, &mut children);
+            if written {
+                // The switch under it, which a click turns to the alt text.
+                let mut switch = Node::new(Role::Button);
+                switch.set_label(crate::captions::LABEL);
+                switch.add_action(Action::Click);
+                part(ALT, switch, &mut children);
+            }
         }
         _ => {}
     }

@@ -18,6 +18,7 @@ mod element;
 mod figures;
 mod folders;
 mod highlight;
+mod history;
 pub mod icon;
 mod importing;
 mod input;

@@ -32,6 +32,7 @@ use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::figures::{self, Grip, Moving, Resizing};
 use crate::highlight;
+use crate::history::{History, Historying};
 use crate::icon::{self, Icon};
 use crate::importing::{Import, ImportOffer, Importing};
 use crate::insert::{Insert, Inserting, Put};
@@ -63,11 +64,11 @@ use crate::widgets::{
 };
 
 /// Space kept beside the text column.
-const GUTTER: f32 = 24.0;
+pub(crate) const GUTTER: f32 = 24.0;
 /// How wide the link editor is: its field and the button that opens the address in it.
 const LINK_WIDTH: f32 = 336.0;
 /// Space kept above and below the text.
-const TOP: f32 = 48.0;
+pub(crate) const TOP: f32 = 48.0;
 /// Points to logical pixels.
 pub(crate) const PT: f32 = 96.0 / 72.0;
 pub(crate) const CARET_WIDTH: f32 = 1.5;
@@ -124,18 +125,15 @@ pub enum SaveState {
 pub enum Panel {
     Styles,
     Notes,
-    History,
 }
 
 impl Panel {
-    const ALL: [(Panel, Icon); 3] =
-        [(Panel::Styles, icon::PALETTE), (Panel::Notes, icon::MESSAGE_SQUARE), (Panel::History, icon::HISTORY)];
+    const ALL: [(Panel, Icon); 2] = [(Panel::Styles, icon::PALETTE), (Panel::Notes, icon::MESSAGE_SQUARE)];
 
     fn title(self) -> &'static str {
         match self {
             Panel::Styles => "Styles",
             Panel::Notes => "Notes",
-            Panel::History => "History",
         }
     }
 }
@@ -209,6 +207,8 @@ pub enum Message {
     Commands(Commanding),
     /// What is asked of Print view.
     Print(Printing),
+    /// What is asked of the history.
+    History(Historying),
     /// What is asked about the conflicts that wait, and about the one that is open.
     Review(Reviewing),
 }
@@ -222,6 +222,13 @@ impl Ui<EditorApp> {
 
     pub fn editor(&self) -> &Editor {
         &self.app().editor
+    }
+
+    /// Says how far the person's clock is ahead of UTC, in minutes: the history tells its days and times
+    /// by it, and by UTC until a shell says. One figure serves every date, so a time from the other side
+    /// of a change to summer time reads an hour off.
+    pub fn set_utc_offset(&mut self, minutes: i32) {
+        self.app_mut().zone = minutes;
     }
 
     /// Names who writes in this window. Edits made from here on carry the name.
@@ -411,6 +418,9 @@ impl Ui<EditorApp> {
         let labels = app.shaper.add_fonts(&fonts);
         app.said.again();
         app.review.add_fonts(&fonts);
+        if let Some(history) = &mut app.history {
+            history.add_fonts(&fonts);
+        }
         if app.held(|app| app.layout.add_fonts(&fonts)) {
             // Blocks set again keep their heights as estimates until idle time settles them.
             app.estimated = true;
@@ -541,8 +551,8 @@ impl Ui<EditorApp> {
     /// page, they land where the selection is, as pictures chosen in a dialog do (see
     /// [`Request::Pictures`]). What is no picture Letters can show is left out.
     pub fn insert_pictures(&mut self, pictures: Vec<Picture>, at: Option<Point>, platform: &mut dyn Platform) {
-        // Nothing is written in Print view.
-        if self.app().printing.is_some() {
+        // Nothing is written in Print view, nor on an earlier version.
+        if self.app().away() {
             return;
         }
         let at = at.and_then(|at| self.on_canvas(at)).and_then(|at| self.app().spot(at)).map(|(spot, _)| spot);
@@ -556,7 +566,7 @@ impl Ui<EditorApp> {
     /// screen. `None` for an end the page does not show, and for both without a selection.
     pub fn selection_ends(&self) -> [Option<Rect>; 2] {
         let app = self.app();
-        let editing = self.canvas().filter(|_| app.printing.is_none());
+        let editing = self.canvas().filter(|_| !app.away());
         let Some((page, selection)) = editing.zip(app.editor.selection()) else { return [None, None] };
         let end = |pos: &Pos| {
             let caret = app.layout.caret(pos)?;
@@ -749,6 +759,10 @@ pub struct EditorApp {
     commands: Commands,
     /// Print view, while it shows in place of the page.
     printing: Option<Print>,
+    /// The history, while one of the document's versions shows in place of the page.
+    history: Option<History>,
+    /// How far the person's clock is ahead of UTC, in minutes.
+    zone: i32,
     refer: Refer,
     references: References,
     code_copy: CodeCopy,
@@ -819,6 +833,8 @@ impl EditorApp {
             insert: Insert::default(),
             commands: Commands::default(),
             printing: None,
+            history: None,
+            zone: 0,
             refer: Refer::default(),
             references: References::default(),
             code_copy: CodeCopy::default(),
@@ -1530,6 +1546,7 @@ impl EditorApp {
             Act::TrustFolder => self.safe.folder().then_some(Message::Safe(Safely::TrustFolder))?,
             // A card over the window is answered first: there is no document to act on behind it.
             Act::Print => (!self.carded()).then_some(Message::Print(Printing::Show))?,
+            Act::History => (!self.carded()).then_some(Message::History(Historying::Show))?,
             Act::Review(asked) => {
                 let (open, can) = (self.margin.reviewing().is_some(), self.margin.refused.is_none());
                 let fits = match asked {
@@ -1554,13 +1571,100 @@ impl EditorApp {
     fn uncover(&mut self) {
         if self.carded() {
             self.printing = None;
+            self.leave();
         }
+    }
+
+    /// Whether a view has the page's place: Print view, or the history.
+    fn away(&self) -> bool {
+        self.printing.is_some() || self.history.is_some()
+    }
+
+    /// Does what is asked of the history.
+    fn historying(&mut self, asked: Historying, platform: &mut dyn Platform) {
+        match asked {
+            Historying::Show if self.away() || self.carded() => {}
+            Historying::Show => {
+                // What hangs from the page waits there for the way back. What lies over the window goes.
+                self.commands.close();
+                self.sharing = false;
+                if self.grip.release() {
+                    self.drop = None;
+                }
+                self.dragging = false;
+                self.unpoint();
+                let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
+                self.history = Some(History::new(&steps, current, platform.wall_time(), self.zone));
+                // The nodes that stand for the blocks go with the page, and are told whole when it is back.
+                self.told.get_mut().forget();
+                self.turn();
+            }
+            Historying::Back => self.leave(),
+            Historying::Pick(at) => {
+                self.history.iter_mut().for_each(|history| history.pick(at));
+                self.turn();
+            }
+            Historying::Step { back } => {
+                self.history.iter_mut().for_each(|history| history.step(back));
+                self.turn();
+            }
+            Historying::Scroll(delta) => self.history.iter_mut().for_each(|history| history.scroll(delta)),
+            Historying::Restore => {
+                let Some(revision) = self.history.as_ref().map(|history| history.picked().at.clone()) else { return };
+                // The document reads as the version again, and is there to be written on.
+                self.leave();
+                self.edit(platform, |editor, platform| editor.run(Command::Restore(revision), platform));
+            }
+        }
+    }
+
+    /// Reads the version the history has picked, when it is not the one that shows.
+    fn turn(&mut self) {
+        let Some(revision) = self.history.as_ref().and_then(|history| history.wanted().cloned()) else { return };
+        let read = self.editor.document_at(&revision).ok();
+        if let Some(history) = &mut self.history {
+            history.show(read);
+        }
+    }
+
+    /// Gives the page its place back from the history.
+    fn leave(&mut self) {
+        if self.history.take().is_some() {
+            // The nodes that stood for a version's blocks are not the page's.
+            self.told.get_mut().forget();
+        }
+    }
+
+    /// The version the history has picked, for the area the page has while it is edited.
+    fn version(&mut self, room: Size) -> Element<Message> {
+        let Some(history) = self.history.as_mut() else { return Element::row() };
+        let (version, awaited) = history.view(room, &self.images, self.palette, self.scheme, self.scale);
+        for asset in awaited {
+            if self.wanted.insert(asset.clone()) {
+                self.requests.push(Request::Asset(asset));
+            }
+        }
+        version
+    }
+
+    /// What a key does while the history shows: it steps through the versions, moves through the one
+    /// that shows, or goes back to editing. Nothing is written there.
+    fn history_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        let plain = !event.mods.primary && !event.mods.alt;
+        let asked = match event.key {
+            Key::Escape => Historying::Back,
+            Key::Left if plain => Historying::Step { back: true },
+            Key::Right if plain => Historying::Step { back: false },
+            _ => return self.history.as_mut().is_some_and(|history| history.key(event)),
+        };
+        self.historying(asked, platform);
+        true
     }
 
     /// Does what is asked of Print view.
     fn print(&mut self, asked: Printing, platform: &mut dyn Platform) {
         match asked {
-            Printing::Show if self.printing.is_some() || self.carded() => {}
+            Printing::Show if self.away() || self.carded() => {}
             Printing::Show => {
                 // What hangs from the page waits there for the way back. What lies over the window goes.
                 self.commands.close();
@@ -1825,6 +1929,12 @@ impl EditorApp {
         }
         if edited || change.style || change.document {
             self.edits += 1;
+            // What came in under the history, as another writer's edits do, is its newest version.
+            if self.history.is_some() {
+                let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
+                self.history.iter_mut().for_each(|history| history.follow(&steps, current.clone()));
+                self.turn();
+            }
         }
         self.mark();
         self.sync();
@@ -1885,7 +1995,7 @@ impl EditorApp {
 
     /// The text position under a point of the page area, while the page shows there.
     fn hit(&self, at: Point) -> Option<Pos> {
-        if self.printing.is_some() {
+        if self.away() {
             return None;
         }
         self.layout.hit(self.in_layout(at))
@@ -2631,8 +2741,8 @@ impl EditorApp {
     /// layout's coordinates: beside a picture from its left or right quarter, and otherwise on a line of
     /// their own, above or below the block there.
     fn spot(&self, at: Point) -> Option<(Spot, Option<Rect>)> {
-        // Sheets take no pictures: the page does, where it is edited.
-        if self.printing.is_some() {
+        // Sheets take no pictures, nor does an earlier version: the page does, where it is edited.
+        if self.away() {
             return None;
         }
         let at = self.in_layout(at);
@@ -2752,13 +2862,14 @@ impl EditorApp {
             bar = bar.before(buttons).before(TopBar::rule());
         }
         // A view that takes the page's place keeps the window's controls and has the rest of the bar.
-        bar = match &self.printing {
-            Some(print) => {
+        bar = match (&self.printing, &self.history) {
+            (Some(print), _) => {
                 let page = &self.editor.model().style().page;
                 let told = self.note.as_ref().map(|(note, _)| note.as_str());
                 print.bar(bar, &self.name().0, told, &styles::paper_name(page), || self.styles.setup(page))
             }
-            None => self.editing(bar),
+            (None, Some(history)) => history.bar(bar, &self.name().0),
+            (None, None) => self.editing(bar),
         };
         if let Some(buttons) = chrome.buttons().filter(|_| !chrome.buttons_at_start) {
             bar = bar.end(TopBar::rule()).end(buttons);
@@ -2831,6 +2942,8 @@ impl EditorApp {
             let button = tool(icon, panel.title()).pressed(self.panel == Some(panel));
             panels = panels.child(button.on_press(Message::Panel(panel)));
         }
+        // The history is no panel: it takes the page's place, and lists the versions beside it.
+        panels = panels.child(tool(icon::HISTORY, "History").on_press(Message::History(Historying::Show)));
         bar.end(panels.child(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End))))
     }
 
@@ -3109,7 +3222,6 @@ impl EditorApp {
         let body = match panel {
             Panel::Styles => self.styles.view(self.editor.model().style(), self.element(), &self.palette),
             Panel::Notes => threads::listed(&self.margin, self.editor.doc()).unwrap_or_else(|| empty("No open notes.")),
-            Panel::History => empty("No earlier versions yet."),
         };
         SidePanel::new(panel.title()).on_close(Message::ClosePanel).child(body).into()
     }
@@ -3369,20 +3481,28 @@ impl App for EditorApp {
         let border = self.chrome.border();
         let window = Size { width: window.width - 2.0 * border, height: window.height - 2.0 * border };
         self.refold(window.width);
-        // Print view has the window to itself: the panels and the outline are for editing.
-        let printing = self.printing.is_some();
-        let panel = self.panel.filter(|_| !printing).map(|panel| self.side(panel));
+        // Print view has the window to itself: the panels and the outline are for editing. The history
+        // has its versions listed where a panel would be.
+        let (printing, away) = (self.printing.is_some(), self.away());
+        let panel = match &self.history {
+            Some(history) => Some(history.panel()),
+            None => self.panel.filter(|_| !away).map(|panel| self.side(panel)),
+        };
         let room = window.width - if panel.is_some() { side_panel::WIDTH } else { 0.0 };
         // While conflicts wait, a bar over the page counts them and steps through them.
         let waiting = self.margin.conflicts();
         let open = self.margin.reviewing().and_then(|open| waiting.iter().position(|id| *id == open.id));
-        let conflicts = (!waiting.is_empty() && !printing).then(|| review::bar(waiting.len(), open));
+        let conflicts = (!waiting.is_empty() && !away).then(|| review::bar(waiting.len(), open));
         let told = if conflicts.is_some() { banner::HEIGHT } else { 0.0 };
         // The safe mode bar lies under the top bar and takes its height from the page.
         let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height() + told;
         let room = Size { width: room.max(0.0), height: (window.height - bar).max(0.0) };
-        let page = if printing { self.sheets(room) } else { self.page(room) };
-        let chapters = if printing { None } else { self.chapters() };
+        let page = match (printing, away) {
+            (true, _) => self.sheets(room),
+            (false, true) => self.version(room),
+            (false, false) => self.page(room),
+        };
+        let chapters = if away { None } else { self.chapters() };
         let page = Element::row().grow(1.0).child(page).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
@@ -3469,6 +3589,7 @@ impl App for EditorApp {
             Message::Note(asked) => self.noting(asked, platform),
             Message::Commands(asked) => self.commanding(asked, platform),
             Message::Print(asked) => self.print(asked, platform),
+            Message::History(asked) => self.historying(asked, platform),
             Message::Review(asked) => self.reviewing(asked, platform),
             Message::Refer(Picking::Close) => {
                 self.edit(platform, |editor, platform| editor.run(Command::DismissReference, platform));
@@ -3518,6 +3639,9 @@ impl App for EditorApp {
     fn key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
         if self.printing.is_some() {
             return self.print_key(event, platform);
+        }
+        if self.history.is_some() {
+            return self.history_key(event, platform);
         }
         // Print view opens at what is being read. A key the editor is offered brings the caret into view,
         // so this one is not offered: it is none of the editor's.
@@ -3569,6 +3693,9 @@ impl App for EditorApp {
             return print.describe(page, nodes);
         }
         let told = &mut self.told.borrow_mut();
+        if let Some(history) = &self.history {
+            return history.describe(told, whole, page, nodes);
+        }
         describe::page(self.editor.doc(), self.editor.selection(), told, whole, page, nodes);
         if let Some((caption, rect)) = &self.previewed {
             describe::preview(caption, *rect, page, nodes);
@@ -3589,6 +3716,10 @@ impl App for EditorApp {
             if let Some(asked) = pressed {
                 self.break_pages(asked, platform);
             }
+            return;
+        }
+        // An earlier version is read, and nothing in it takes a press.
+        if self.history.is_some() {
             return;
         }
         match describe::request(self.editor.doc(), request) {
@@ -3667,6 +3798,9 @@ impl App for EditorApp {
         if let Some(print) = self.printing.as_mut() {
             return print.point(at);
         }
+        if self.history.is_some() {
+            return false;
+        }
         // The page has nothing of its own under the version held back, nor under the buttons.
         let moved = self.review.point(at);
         self.references.set_rest(at.filter(|at| !self.review.covers(*at)));
@@ -3706,6 +3840,10 @@ impl App for EditorApp {
     }
 
     fn idle(&mut self) -> Idle {
+        // The version that shows is laid out before the page behind it.
+        if self.history.as_mut().is_some_and(History::settle) {
+            return Idle::Unseen;
+        }
         if self.estimated {
             // Blocks above the part in view change height as they are laid out.
             self.held(|app| app.estimated = app.layout.settle(app.viewport(), SETTLE_BYTES));

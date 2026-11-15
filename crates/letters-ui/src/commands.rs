@@ -87,6 +87,8 @@ pub(crate) enum Act {
     TrustFolder,
     /// Shows the document on the sheets it prints on.
     Print,
+    /// Shows the document's earlier versions.
+    History,
     /// Steps through the conflicts that wait for a choice, or settles the one that is open.
     Review(Reviewing),
     /// Shows the palette itself. It is not one of its own commands.
@@ -192,7 +194,7 @@ pub(crate) static ENTRIES: [Entry; 77] = [
     run("Edit", "Select all", "", Command::SelectAll),
     entry("View", "Styles panel", "show hide fonts page", Act::Panel(Panel::Styles)),
     entry("View", "Notes panel", "show hide comments", Act::Panel(Panel::Notes)),
-    entry("View", "History panel", "show hide versions", Act::Panel(Panel::History)),
+    entry("View", "History", "versions earlier before rewind restore", Act::History),
     entry("View", "Print view", "pages paper sheets preview", Act::Print),
     entry("View", "Next conflict", "changed two places choice", Act::Review(Reviewing::Step { back: false })),
     entry("View", "Previous conflict", "changed two places choice", Act::Review(Reviewing::Step { back: true })),

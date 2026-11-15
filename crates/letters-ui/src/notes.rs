@@ -417,6 +417,12 @@ pub(crate) fn stamp(seconds: u64) -> String {
     // The last second of the year 9999, past which the form has no room.
     let seconds = seconds.min(253_402_300_799);
     let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    let (year, month, day) = date(days);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rest / 3_600, rest / 60 % 60, rest % 60)
+}
+
+/// The year, month and day of the month that a day counted from 1970 is.
+pub(crate) fn date(days: u64) -> (u64, u64, u64) {
     // Days are counted in eras of 400 years that start on 1 March, so that a leap day ends its year.
     let days = days + 719_468;
     let (era, day) = (days / 146_097, days % 146_097);
@@ -425,8 +431,7 @@ pub(crate) fn stamp(seconds: u64) -> String {
     let month = (5 * day + 2) / 153;
     let day = day - (153 * month + 2) / 5 + 1;
     let month = if month < 10 { month + 3 } else { month - 9 };
-    let year = year + era * 400 + u64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rest / 3_600, rest / 60 % 60, rest % 60)
+    (year + era * 400 + u64::from(month <= 2), month, day)
 }
 
 /// An anchor's passage as a selection, when it is a stretch of text and not a whole block.

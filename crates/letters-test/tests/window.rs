@@ -260,12 +260,12 @@ fn one_side_panel_shows_at_a_time() {
         ("Styles", Some("Styles")),
         ("Notes", Some("Notes")),
         ("Notes", None),
-        ("History", Some("History")),
+        ("Styles", Some("Styles")),
         ("Close", None),
     ];
     for (button, showing) in steps {
         window.click(Role::Button, button);
-        for panel in ["Styles", "Notes", "History"] {
+        for panel in ["Styles", "Notes"] {
             let open = window.find(Role::Complementary, panel).is_some();
             assert_eq!(open, showing == Some(panel), "{panel} after pressing {button}");
             assert_eq!(window.find(Role::Button, panel).unwrap().toggled, Some(open), "the {panel} button says so");

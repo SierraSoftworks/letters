@@ -113,6 +113,8 @@ pub const PRINTER: Icon = Icon::new("M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2
 pub const REDO_2: Icon = Icon::new("M15 14l5-5-5-5M20 9H9.5A5.5 5.5 0 0 0 4 14.5A5.5 5.5 0 0 0 9.5 20H13");
 /// `refresh-cw`
 pub const REFRESH_CW: Icon = Icon::new("M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8M21 3v5h-5M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16M8 16H3v5");
+/// `rotate-ccw`
+pub const ROTATE_CCW: Icon = Icon::new("M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8M3 3v5h5");
 /// `search`
 pub const SEARCH: Icon = Icon::new("M21 21l-4.34-4.34M3 11a8 8 0 1 0 16 0a8 8 0 1 0 -16 0");
 /// `send`
@@ -139,6 +141,10 @@ pub const TEXT_ALIGN_END: Icon = Icon::new("M21 5H3M21 12H9M21 19H7");
 pub const TEXT_ALIGN_JUSTIFY: Icon = Icon::new("M3 5h18M3 12h18M3 19h18");
 /// `text-align-start`
 pub const TEXT_ALIGN_START: Icon = Icon::new("M21 5H3M15 12H3M17 19H3");
+/// `tag`
+pub const TAG: Icon = Icon::new(
+    "M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42zM7 7.5a0.5 0.5 0 1 0 1 0a0.5 0.5 0 1 0 -1 0",
+);
 /// `text-quote`
 pub const TEXT_QUOTE: Icon = Icon::new("M17 5H3M21 12H8M21 19H8M3 12v7");
 /// `trash-2`

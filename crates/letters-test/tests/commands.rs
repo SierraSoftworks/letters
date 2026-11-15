@@ -306,6 +306,7 @@ fn the_commands_of_the_window_open_what_its_buttons_open() {
         ("link", Role::TextInput, "Link", true),
         ("comment", Role::TextInput, "Comment", true),
         ("rename", Role::TextInput, "Document name", true),
+        ("history", Role::Complementary, "History", false),
     ];
     for (typed, role, name, focused) in cases {
         let mut window = line();

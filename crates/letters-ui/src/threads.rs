@@ -343,7 +343,7 @@ fn send(asked: Noting) -> Message {
 }
 
 /// The face of who speaks: the first letters of their name, or the sign of an import for what it noted.
-fn face(name: &str, import: bool) -> Element<Message> {
+pub(crate) fn face(name: &str, import: bool) -> Element<Message> {
     let round = Element::row()
         .width(FACE)
         .height(FACE)

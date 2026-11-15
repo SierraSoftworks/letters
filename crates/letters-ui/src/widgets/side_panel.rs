@@ -13,13 +13,20 @@ pub const WIDTH: f32 = 344.0;
 
 pub struct SidePanel<M> {
     title: String,
+    aside: Option<String>,
     on_close: Option<M>,
     children: Vec<Element<M>>,
 }
 
 impl<M> SidePanel<M> {
     pub fn new(title: impl Into<String>) -> Self {
-        Self { title: title.into(), on_close: None, children: Vec::new() }
+        Self { title: title.into(), aside: None, on_close: None, children: Vec::new() }
+    }
+
+    /// A few quiet words at the end of the head, such as how much the panel lists.
+    pub fn aside(mut self, aside: impl Into<String>) -> Self {
+        self.aside = Some(aside.into());
+        self
     }
 
     /// Adds a close button to the head that sends `message`.
@@ -50,6 +57,9 @@ impl<M> From<SidePanel<M>> for Element<M> {
             .padding(Edges::xy(tokens::SPACE_LG, 0.0))
             .border(Edges::bottom(1.0), tokens::LINE)
             .child(Element::text(panel.title.clone(), TextStyle::title()));
+        if let Some(aside) = panel.aside {
+            head = head.child(Element::text(aside, TextStyle::control().size(tokens::TEXT_SM)).fg(tokens::FG_MUTED));
+        }
         if let Some(message) = panel.on_close {
             head = head.child(Button::icon_only(icon::X, "Close").subtle().small().on_press(message));
         }
