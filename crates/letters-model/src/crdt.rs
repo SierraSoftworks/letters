@@ -383,9 +383,35 @@ fn mark<'a>(
     attrs.into_iter().try_for_each(|(key, value)| body.mark(range.clone(), key, value.clone()).ok())
 }
 
+/// The longest text that goes into the history as one insert, in bytes.
+///
+/// Loro takes an insert in at a cost that grows with the square of its length, 25 ms at 64 KB and 1.7 s at
+/// 512 KB: on every replica that merges it, and on every load once the history holds a concurrent edit.
+/// Longer text is put in as pieces, the last piece first. Loro joins what is inserted front to back into
+/// one insert again, and leaves apart what is inserted back to front.
+const PIECE: usize = 1024;
+
+/// The pieces of a text, the last first. They are cut between characters and not between what a reader
+/// takes for one, which a later Unicode may tell differently: replicas that write the same change must cut
+/// it alike.
+fn pieces(text: &str) -> impl Iterator<Item = &str> {
+    let mut end = text.len();
+    std::iter::from_fn(move || {
+        let mut start = end.checked_sub(1)?.saturating_sub(PIECE - 1);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        let piece = &text[start..end];
+        end = start;
+        Some(piece)
+    })
+}
+
 /// Puts text in with exactly the attributes named, whatever the text beside it would lend.
 fn put<S: BuildHasher>(body: &LoroText, at: usize, text: &str, attrs: Option<&Attrs<S>>) -> Option<()> {
-    body.insert(at, text).ok()?;
+    for piece in pieces(text) {
+        body.insert(at, piece).ok()?;
+    }
     let wanted = |key: &String| attrs.and_then(|attrs| attrs.get(key)).filter(|value| !value.is_null());
     let mut from = at;
     for piece in body.slice_delta(at, at + text.chars().count(), PosType::Unicode).ok()? {
@@ -541,7 +567,7 @@ fn feed_value(hash: &mut Sha256, value: &LoroValue) {
 /// change out changes.
 pub(crate) fn outsider(from: &str, delta: &[TextDelta], to: &str) -> u64 {
     let mut hash = Sha256::new();
-    feed(&mut hash, b"letters outside change 1");
+    feed(&mut hash, b"letters outside change 2");
     feed(&mut hash, from.as_bytes());
     for item in delta {
         let (kind, count, text, attributes) = match item {
@@ -581,7 +607,7 @@ enum Call {
 /// Each block is its own insert, followed by its own attributes. One insert for the whole text would be
 /// cut in two by every attribute after it, and Loro takes quadratic time to replay that when it moves
 /// through history. The last block is written first and every other one in front of it, where no
-/// formatting of a neighbour can spread onto it.
+/// formatting of a neighbour can spread onto it. A long block is written the same way, in [`pieces`].
 fn plan(doc: &Document, index: &[Entry]) -> Vec<Call> {
     let blocks = order(&doc.blocks, index).into_iter().map(|(block, entry)| {
         let mut text = String::from(MARKER);
@@ -603,7 +629,7 @@ fn plan(doc: &Document, index: &[Entry]) -> Vec<Call> {
             }
         }
         calls.extend(open.into_iter().map(|(key, (value, span))| Call::Mark(span, key, value)));
-        calls.insert(0, Call::Text(text));
+        calls.splice(0..0, pieces(&text).map(|piece| Call::Text(piece.to_owned())));
         calls
     });
     let mut calls: Vec<Call> = blocks.rev().flatten().collect();

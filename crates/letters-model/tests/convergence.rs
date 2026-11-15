@@ -253,7 +253,9 @@ fn op((doc, style): &Shown, edit: &Edit) -> Option<Op> {
     Some(match edit {
         Edit::Type { block, at, text } => {
             let block = pick(&texts, *block)?;
-            Op::InsertText { at: Pos { offset: range(&block, *at, 0).start, block: block.id }, text: text.clone() }
+            // Now and then a paste, mostly longer than the history keeps as one insert.
+            let text = text.repeat(if at % 8 == 7 { 600 } else { 1 });
+            Op::InsertText { at: Pos { offset: range(&block, *at, 0).start, block: block.id }, text }
         }
         Edit::Delete { block, at, len } => {
             let block = pick(&texts, *block)?;
