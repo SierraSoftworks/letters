@@ -272,4 +272,41 @@ impl DisplayList {
             }
         }
     }
+
+    /// Makes the items from index `from` onward `by` times their size, about the origin. A caller that
+    /// shows something small, as a preview of a picture, paints it whole and uses this to fit it.
+    pub fn scale(&mut self, from: usize, by: f32) {
+        let fit = |rect: &mut Rect| *rect = Rect::new(rect.x * by, rect.y * by, rect.width * by, rect.height * by);
+        for item in self.items.iter_mut().skip(from) {
+            match item {
+                Item::Fill { rect, radius, .. } | Item::PushClip { rect, radius } => {
+                    fit(rect);
+                    *radius *= by;
+                }
+                Item::Stroke { rect, width, radius, .. } => {
+                    fit(rect);
+                    (*width, *radius) = (*width * by, *radius * by);
+                }
+                Item::Shadow { rect, blur, offset, radius, .. } => {
+                    fit(rect);
+                    (*blur, *radius) = (*blur * by, *radius * by);
+                    *offset = Point { x: offset.x * by, y: offset.y * by };
+                }
+                Item::Image { rect, .. } => fit(rect),
+                Item::Glyphs { origin, size, glyphs, .. } => {
+                    *origin = Point { x: origin.x * by, y: origin.y * by };
+                    *size *= by;
+                    for glyph in glyphs {
+                        (glyph.x, glyph.y) = (glyph.x * by, glyph.y * by);
+                    }
+                }
+                // A stroke's width is in the path's own units, so it follows the scale.
+                Item::Path { origin, scale, .. } => {
+                    *origin = Point { x: origin.x * by, y: origin.y * by };
+                    *scale *= by;
+                }
+                Item::PopClip | Item::Open { .. } | Item::Close => {}
+            }
+        }
+    }
 }

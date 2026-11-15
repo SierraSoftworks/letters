@@ -368,6 +368,29 @@ fn a_list_can_be_moved_after_it_is_emitted() {
 }
 
 #[test]
+fn a_list_can_be_made_smaller_after_it_is_emitted() {
+    let mut scene = list([fill(0.0, 0.0, 10.0, 10.0, RED)]);
+    let first = scene.items.len();
+    scene.items.extend([
+        Item::PushClip { rect: Rect::new(20.0, 20.0, 40.0, 40.0), radius: 0.0 },
+        fill(20.0, 20.0, 80.0, 80.0, BLUE),
+        Item::PopClip,
+        Item::Stroke { rect: Rect::new(80.0, 0.0, 40.0, 40.0), color: BLACK, width: 8.0, radius: 0.0 },
+        text(&sans(700.0), 40.0, BLACK, Point { x: 80.0, y: 100.0 }, "I"),
+    ]);
+    scene.scale(first, 0.5);
+    let frame = render(&scene, 70, 60, 1.0);
+
+    assert_eq!(at(&frame, 8, 8), RED, "items before the index keep their size");
+    assert_eq!(at(&frame, 12, 12), BLUE, "the fill is half as far out");
+    assert_eq!(at(&frame, 28, 28), BLUE, "and half as large, inside its clip");
+    assert_eq!(at(&frame, 32, 32), WHITE, "which shrank with it");
+    assert_eq!((at(&frame, 42, 10), at(&frame, 46, 10)), (BLACK, WHITE), "a stroke is half as wide");
+    assert!(ink(&frame, 38, 30, 14, 22) > 0, "the text is where half the way leads");
+    assert_eq!(ink(&frame, 38, 52, 30, 8), 0, "and half as tall");
+}
+
+#[test]
 fn a_frame_converts_to_window_pixels() {
     let frame = render(&list([fill(1.0, 0.0, 1.0, 1.0, Color::rgb(0x12, 0x34, 0x56))]), 2, 1, 1.0);
     let mut window = [0xdead_beef_u32; 2];
