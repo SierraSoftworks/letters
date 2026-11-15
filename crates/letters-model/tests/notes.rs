@@ -22,7 +22,7 @@ fn version(author: &str, text: &str) -> Version {
     Version {
         author: author.into(),
         edited: "2026-11-14T20:05:00Z".into(),
-        block: Block::text("b2", BlockKind::Paragraph, text),
+        block: Some(Block::text("b2", BlockKind::Paragraph, text)),
         extra: Default::default(),
     }
 }

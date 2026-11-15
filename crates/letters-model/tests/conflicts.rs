@@ -162,7 +162,7 @@ fn a_conflict_holds_both_versions_and_who_wrote_each_when() {
     // A note keeps the same, with its times written out.
     let note = conflict.versions().unwrap();
     assert_eq!((note[1].author.as_str(), note[1].edited.as_str()), ("Ben", "2027-01-15T09:00:00Z"));
-    assert_eq!(Some(&note[0].block), versions[0].as_ref());
+    assert_eq!(note[0].block.as_ref(), versions[0].as_ref());
 
     // Ben's device finds the same conflict, and the same side to show until one is picked.
     let mirrored = ben.conflicts(&him, &her).unwrap();

@@ -171,7 +171,8 @@ pub struct Change {
 }
 
 impl Change {
-    fn absorb(&mut self, other: Change) {
+    /// Takes in what another change touched, for two that are told as one.
+    pub fn absorb(&mut self, other: Change) {
         self.blocks.extend(other.blocks);
         self.structure |= other.structure;
         self.style |= other.style;

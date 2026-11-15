@@ -61,11 +61,20 @@ pub struct Side {
 impl Conflict {
     /// The two versions as a conflict note keeps them. `None` when a side took the block away.
     pub fn versions(&self) -> Option<[Version; 2]> {
-        let version = |side: &Side| {
-            let (author, block) = (side.author.clone(), side.block.clone()?);
-            Some(Version { author, edited: rfc3339(side.edited), block, extra: Extra::new() })
-        };
-        Some([version(&self.sides[0])?, version(&self.sides[1])?])
+        let whole = self.sides.iter().all(|side| side.block.is_some());
+        whole.then(|| [self.sides[0].version(), self.sides[1].version()])
+    }
+}
+
+impl Side {
+    /// This side as a conflict note keeps it, with no block when this side took it away.
+    pub fn version(&self) -> Version {
+        Version {
+            author: self.author.clone(),
+            edited: rfc3339(self.edited),
+            block: self.block.clone(),
+            extra: Extra::new(),
+        }
     }
 }
 

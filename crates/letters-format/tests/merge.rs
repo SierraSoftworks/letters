@@ -5,7 +5,7 @@ mod common;
 use std::cmp::Ordering;
 
 use common::{Folder, ID, bytes, open, package, paragraph};
-use letters_format::{Error, NOTES, OPLOG, STYLE, Save, Saved, WorkingCopy, conflict_copy_of, save};
+use letters_format::{Error, NOTES, OPLOG, Package, STYLE, Save, Saved, WorkingCopy, conflict_copy_of, save};
 use letters_model::{Anchor, BlockId, Document, Note, NoteKind, Op, Pos, ReplicaId, Run, Style, Version};
 
 const NAME: &str = "report.let";
@@ -87,22 +87,32 @@ fn covered(copy: &WorkingCopy, note: &str) -> String {
     text(copy.model().doc())[anchor.range.clone().unwrap()].to_owned()
 }
 
-/// The two versions each conflict note of `copy` holds, as who wrote what.
-fn clashes(copy: &WorkingCopy) -> Vec<[(String, String); 2]> {
-    let side = |version: &Version| (version.author.clone(), version.block.plain_text());
+/// The two versions each open conflict note of `copy` holds, as who wrote what. A side that took the block
+/// away wrote nothing.
+fn clashes(copy: &WorkingCopy) -> Vec<[(String, Option<String>); 2]> {
+    let side = |version: &Version| (version.author.clone(), version.block.as_ref().map(|block| block.plain_text()));
     let versions = |note: &Note| match &note.kind {
-        NoteKind::Conflict { versions } => Some([side(&versions[0]), side(&versions[1])]),
+        NoteKind::Conflict { versions } if !note.resolved => Some([side(&versions[0]), side(&versions[1])]),
         _ => None,
     };
     copy.notes.notes.iter().filter_map(versions).collect()
 }
 
+fn wrote(author: &str, text: &str) -> (String, Option<String>) {
+    (author.to_owned(), Some(text.to_owned()))
+}
+
+/// The time on a writer's clock, so many minutes into the evening.
+fn at(minutes: u64) -> u64 {
+    1_794_000_000 + minutes * 60
+}
+
 /// The desk and the laptop of [`shared`], after Ana and then Ben each changed "world" on their own.
 fn clashing() -> (Folder, WorkingCopy, WorkingCopy) {
     let (folder, mut desk, mut laptop) = shared();
-    desk.sign("Ana", 1_794_000_000);
+    desk.sign("Ana", at(0));
     typed(&mut desk, 11, "s");
-    laptop.sign("Ben", 1_794_000_600);
+    laptop.sign("Ben", at(10));
     typed(&mut laptop, 6, "under");
     (folder, desk, laptop)
 }
@@ -146,7 +156,7 @@ fn two_writers_on_one_file_keep_everything_and_then_settle() {
 }
 
 #[test]
-fn one_word_changed_by_two_writers_raises_one_conflict_note_for_both() {
+fn one_word_changed_by_two_writers_reads_as_the_later_edit_with_a_note_of_both() {
     let (mut folder, mut desk, mut laptop) = clashing();
     typed(&mut laptop, 0, "Oh. ");
     let saves = in_turn(&mut folder, &mut desk, &mut laptop, 3);
@@ -154,11 +164,10 @@ fn one_word_changed_by_two_writers_raises_one_conflict_note_for_both() {
 
     let file = open_at(&folder, NAME, 4);
     for (who, copy) in [("the file", &file), ("the desk", &desk), ("the laptop", &laptop)] {
-        let [[earlier, later]] = &clashes(copy)[..] else { panic!("{who}: {:?}", copy.notes.notes) };
-        assert_eq!(earlier, &("Ana".to_owned(), "Hello worlds".to_owned()), "{who}");
-        assert_eq!(later, &("Ben".to_owned(), "Oh. Hello underworld".to_owned()), "{who}: the later edit is last");
+        assert_eq!(text(copy.model().doc()), "Oh. Hello underworld", "{who}: the later edit stands whole");
+        let found = clashes(copy);
+        assert_eq!(found, [[wrote("Ana", "Hello worlds"), wrote("Ben", "Oh. Hello underworld")]], "{who}");
         assert_eq!(copy.notes.notes[0].anchor.block.as_str(), "p", "{who}");
-        assert!(!copy.notes.notes[0].resolved, "{who}");
     }
 
     // A note that is picked on one device stays picked, and nothing raises it again.
@@ -166,13 +175,13 @@ fn one_word_changed_by_two_writers_raises_one_conflict_note_for_both() {
     let saves = in_turn(&mut folder, &mut desk, &mut laptop, 6);
     assert!(matches!(saves[..], [.., Saved::Unchanged, Saved::Unchanged]), "{saves:?}");
     for (who, copy) in [("the desk", &desk), ("the laptop", &laptop)] {
-        assert_eq!(clashes(copy).len(), 1, "{who}");
-        assert!(copy.notes.notes[0].resolved, "{who}");
+        assert!(clashes(copy).is_empty(), "{who}: {:?}", copy.notes.notes);
+        assert_eq!(copy.notes.notes.len(), 1, "{who}");
     }
 }
 
 #[test]
-fn devices_that_find_the_same_clash_apart_raise_the_same_note() {
+fn devices_that_find_the_same_clash_apart_settle_it_alike() {
     let (_, mut desk, mut laptop) = clashing();
     let (mut hers, mut his) = (Folder::default(), Folder::default());
     save_from(&mut hers, &mut desk, "desk");
@@ -182,12 +191,56 @@ fn devices_that_find_the_same_clash_apart_raise_the_same_note() {
 
     assert_eq!(clashes(&desk).len(), 1, "{:?}", desk.notes.notes);
     assert_eq!(desk.notes, laptop.notes);
+    assert!(level(&desk, &laptop), "each wrote the same change to settle it");
     // Each then meets the other's note, which must not become a second one.
     let (mut folder, _, _) = shared();
     let saves = in_turn(&mut folder, &mut desk, &mut laptop, 4);
     assert!(matches!(saves[..], [.., Saved::Unchanged, Saved::Unchanged]), "{saves:?}");
     assert_eq!(clashes(&laptop).len(), 1);
     assert_eq!(desk.notes, laptop.notes);
+}
+
+#[test]
+fn a_block_that_clashes_again_keeps_only_the_newer_note_open() {
+    let (mut folder, mut desk, mut laptop) = clashing();
+    in_turn(&mut folder, &mut desk, &mut laptop, 3);
+    // Both go on in the same word without picking.
+    desk.sign("Ana", at(20));
+    typed(&mut desk, 16, "s");
+    laptop.sign("Ben", at(30));
+    typed(&mut laptop, 6, "the ");
+    typed(&mut laptop, 15, "-");
+    let saves = in_turn(&mut folder, &mut desk, &mut laptop, 5);
+    assert!(matches!(saves[..], [.., Saved::Unchanged, Saved::Unchanged]), "{saves:?}");
+
+    for (who, copy) in [("the desk", &desk), ("the laptop", &laptop)] {
+        assert_eq!(text(copy.model().doc()), "Hello the under-world", "{who}");
+        let found = clashes(copy);
+        assert_eq!(found, [[wrote("Ana", "Hello underworlds"), wrote("Ben", "Hello the under-world")]], "{who}");
+        assert_eq!(copy.notes.notes.len(), 2, "{who}: the older note is kept, resolved");
+    }
+}
+
+#[test]
+fn a_block_one_writer_removed_and_the_other_changed_goes_the_later_way_with_a_note() {
+    // When Ana removes the paragraph, against Ben changing its text ten minutes in.
+    for (removed, stands) in [(0, true), (20, false)] {
+        let (mut folder, mut desk, mut laptop) = shared();
+        desk.sign("Ana", at(removed));
+        desk.apply([Op::RemoveBlock { block: "p".into() }]).unwrap();
+        laptop.sign("Ben", at(10));
+        typed(&mut laptop, 6, "under");
+        let saves = in_turn(&mut folder, &mut desk, &mut laptop, 5);
+        assert!(matches!(saves[..], [.., Saved::Unchanged, Saved::Unchanged]), "{saves:?}");
+
+        let (gone, kept) = (("Ana".to_owned(), None), wrote("Ben", "Hello underworld"));
+        let expected = if stands { [gone, kept] } else { [kept, gone] };
+        for (who, copy) in [("the desk", &desk), ("the laptop", &laptop)] {
+            let block = copy.model().doc().block(&BlockId::from("p"));
+            assert_eq!(block.is_some(), stands, "{who}, removed at {removed}");
+            assert_eq!(clashes(copy), std::slice::from_ref(&expected), "{who}, removed at {removed}");
+        }
+    }
 }
 
 #[test]
@@ -269,16 +322,17 @@ fn opened_bytes() -> Vec<u8> {
 #[test]
 fn a_file_without_a_usable_history_still_merges() {
     // `package` holds a history no build can read.
-    let mut bare = package();
+    let unreadable = Package { document: document(), ..package() };
+    let mut bare = unreadable.clone();
     bare.entries.remove(OPLOG);
-    let cases = [("no history", bytes(&bare)), ("an unreadable history", bytes(&package()))];
+    let cases = [("no history", bytes(&bare)), ("an unreadable history", bytes(&unreadable))];
     for (why, file) in cases {
         let (mut folder, mut desk, mut laptop) = opened(file);
         typed(&mut desk, 0, "Oh. ");
-        typed(&mut laptop, 5, "!");
+        typed(&mut laptop, 11, "!");
         let saves = in_turn(&mut folder, &mut desk, &mut laptop, 3);
         assert!(saves.iter().all(|saved| matches!(saved, Saved::Written | Saved::Unchanged)), "{why}: {saves:?}");
-        assert_eq!(text(open_at(&folder, NAME, 4).model().doc()), "Oh. Hello!", "{why}");
+        assert_eq!(text(open_at(&folder, NAME, 4).model().doc()), "Oh. Hello world!", "{why}");
         assert!(level(&desk, &laptop), "{why}");
         assert_eq!(folder.names(), [NAME], "{why}");
     }
@@ -337,14 +391,16 @@ fn a_change_by_another_tool_is_merged_once_on_every_device() {
     package.set_style(&style);
     folder.put(NAME, bytes(&package));
 
+    // The desk writes in another word than the tool did, and the laptop writes no text at all.
     typed(&mut desk, 0, "Oh. ");
-    typed(&mut laptop, 11, "!");
+    comment(&mut laptop, "laptop", 0..5);
     let saves = in_turn(&mut folder, &mut desk, &mut laptop, 3);
     assert!(saves.iter().all(|saved| matches!(saved, Saved::Written | Saved::Unchanged)), "{saves:?}");
 
     let file = open_at(&folder, NAME, 4);
     let blocks: Vec<String> = file.model().doc().walk().map(|block| block.plain_text()).collect();
-    assert_eq!(blocks, ["Oh. Hello there world!", "Added"], "both devices took the change in, and it is there once");
+    assert_eq!(blocks, ["Oh. Hello there world", "Added"], "both devices took the change in, and it is there once");
+    assert_eq!(note_ids(&file), ["laptop"], "nothing clashed");
     assert_eq!(file.style(), &style);
     assert!(level(&desk, &laptop));
     assert_eq!(folder.names(), [NAME]);

@@ -39,7 +39,7 @@
             "minItems": 2,
             "maxItems": 2,
             "items": { "$ref": "#/$defs/version" },
-            "description": "The two versions of the anchored block, the later edit last. Picking one resolves the note."
+            "description": "The two versions of the anchored block, the later edit last: the one document.json shows until one is picked. Picking one resolves the note."
           }
         }
       }
@@ -64,8 +64,8 @@
     },
     "version": {
       "type": "object",
-      "description": "One side of a conflict.",
-      "required": ["author", "edited", "block"],
+      "description": "One side of a conflict. A side with no block took the block away, and its author and time say who did and when.",
+      "required": ["author", "edited"],
       "properties": {
         "author": { "type": "string", "description": "Who last changed this side. Empty when that writer gave no name." },
         "edited": { "$ref": "#/$defs/time" },

@@ -46,7 +46,8 @@ pub enum NoteKind {
     Comment,
     /// What an import simplified at this passage.
     Import,
-    /// Two versions of one block that were changed apart, the later edit last. Picking one resolves the note.
+    /// Two versions of one block that were changed apart, the later edit last: the one the document shows
+    /// until a person picks. Picking one resolves the note.
     Conflict { versions: Box<[Version; 2]> },
     /// A type this build does not know. Its fields sit in [`Note::extra`] and are written back verbatim.
     Unknown { type_name: String },
@@ -59,7 +60,8 @@ pub struct Version {
     pub author: String,
     /// When this side was last edited, as RFC 3339.
     pub edited: String,
-    pub block: Block,
+    /// The block as this side left it. `None` when this side took it away.
+    pub block: Option<Block>,
     pub extra: Extra,
 }
 
@@ -189,6 +191,17 @@ impl Notes {
     /// Moves every anchor to where its text is now. See [`Anchor::follow`].
     pub fn follow(&mut self, model: &Model) {
         self.notes.iter_mut().for_each(|note| note.anchor.follow(model));
+    }
+
+    /// Adds a conflict that a merge found. Older conflicts on its block are resolved by it: its versions
+    /// are the ones left to choose from. Raising a note that is held already changes nothing.
+    pub fn raise(&mut self, conflict: Note) {
+        let on_block =
+            |note: &Note| matches!(note.kind, NoteKind::Conflict { .. }) && note.anchor.block == conflict.anchor.block;
+        // Times that tie leave both open: there is no telling which of the two came after the other.
+        let older = |note: &&mut Note| on_block(note) && note.created < conflict.created;
+        self.notes.iter_mut().filter(older).for_each(|note| note.resolved = true);
+        self.merge(&Notes { notes: vec![conflict], extra: Extra::new() });
     }
 
     /// Takes in the notes of another copy of the document. Returns whether anything here changed.
@@ -329,10 +342,7 @@ fn read_version(value: Value, path: &str) -> Result<Version> {
         return err(&format!("{path}.author"), "expected an author");
     };
     let edited = required(&mut map, "edited", path, "an edit time")?;
-    let block = match map.remove("block") {
-        Some(block) => Block::from_value(block, &format!("{path}.block"))?,
-        None => return err(&format!("{path}.block"), "every version needs its block"),
-    };
+    let block = map.remove("block").map(|block| Block::from_value(block, &format!("{path}.block"))).transpose()?;
     Ok(Version { author, edited, block, extra: map.into_iter().collect() })
 }
 
@@ -385,7 +395,9 @@ fn write_version(version: &Version) -> Value {
     let mut map = Map::new();
     map.insert("author".into(), version.author.as_str().into());
     map.insert("edited".into(), version.edited.as_str().into());
-    map.insert("block".into(), version.block.to_value());
+    if let Some(block) = &version.block {
+        map.insert("block".into(), block.to_value());
+    }
     write_extra(&mut map, &version.extra);
     Value::Object(map)
 }

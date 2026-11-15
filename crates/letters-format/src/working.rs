@@ -172,18 +172,17 @@ impl WorkingCopy {
         let apart = apart.then(|| (self.model.revision(), model.revision()));
 
         self.notes.pin(&self.model);
-        let change = self.model.merge(&merged).map_err(Error::History)?;
+        let mut change = self.model.merge(&merged).map_err(Error::History)?;
+        self.notes.merge(&notes);
         if let Some((ours, theirs)) = apart {
-            for conflict in self.model.conflicts(&ours, &theirs).map_err(Error::History)? {
-                // A block one side took away has no second version to offer.
-                let Some(mut versions) = conflict.versions() else { continue };
-                if conflict.later == 0 {
-                    versions.swap(0, 1);
-                }
-                notes.notes.push(Note::conflict(conflict.block, versions));
+            // Each block the two changed in the same words reads as the later side left it from here on.
+            let (settled, conflicts) = self.model.settle(&ours, &theirs).map_err(Error::History)?;
+            change.absorb(settled);
+            for conflict in conflicts {
+                let [earlier, later] = [1 - conflict.later, conflict.later].map(|side| conflict.sides[side].version());
+                self.notes.raise(Note::conflict(conflict.block, [earlier, later]));
             }
         }
-        self.notes.merge(&notes);
         self.notes.follow(&self.model);
         if home {
             // What the merge made of the style came from other writers, and is no change made here.
