@@ -32,7 +32,7 @@ use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::figures::{self, Grip, Moving, Resizing};
 use crate::highlight;
-use crate::history::{History, Historying};
+use crate::history::{self, History, Historying, Naming};
 use crate::icon::{self, Icon};
 use crate::importing::{Import, ImportOffer, Importing};
 use crate::insert::{Insert, Inserting, Put};
@@ -1609,8 +1609,12 @@ impl EditorApp {
                 self.told.get_mut().forget();
                 self.turn();
             }
-            Historying::Back => self.leave(),
+            Historying::Back => {
+                self.take_name();
+                self.leave();
+            }
             Historying::Pick(at) => {
+                self.take_name();
                 self.history.iter_mut().for_each(|history| history.pick(at));
                 self.turn();
             }
@@ -1618,19 +1622,45 @@ impl EditorApp {
                 self.history.iter_mut().for_each(|history| history.step(back));
                 self.turn();
             }
+            Historying::Scrub(across) => {
+                self.take_name();
+                let Some(history) = &mut self.history else { return };
+                // A drag sends many points for each version it passes.
+                let at = history.across(across);
+                if at != history.at() {
+                    history.pick(at);
+                    self.turn();
+                }
+            }
+            Historying::Name(Naming::Apply) => self.take_name(),
+            Historying::Name(asked) => self.history.iter_mut().for_each(|history| history.name(asked.clone())),
             Historying::Scroll(delta) => self.history.iter_mut().for_each(|history| history.scroll(delta)),
             Historying::Down(at) => self.history.iter_mut().for_each(|history| history.press(at)),
             Historying::Up(at) => self.history.iter_mut().for_each(|history| history.release(at)),
             Historying::Compare(with) => {
+                self.take_name();
                 self.history.iter_mut().for_each(|history| history.compare(with));
                 self.turn();
             }
             Historying::Restore => {
+                self.take_name();
                 let Some(revision) = self.history.as_ref().map(|history| history.picked().at.clone()) else { return };
                 // The document reads as the version again, and is there to be written on.
                 self.leave();
                 self.edit(platform, |editor, platform| editor.run(Command::Restore(revision), platform));
             }
+        }
+    }
+
+    /// Gives the picked version the name that was typed for it, when one was. A name is a mark in the
+    /// history: something to save, though no edit and nothing that undo takes back.
+    fn take_name(&mut self) {
+        let Some((revision, name)) = self.history.as_mut().and_then(History::named) else { return };
+        if self.editor.name_version(&revision, name.as_deref()).is_ok() {
+            self.edits += 1;
+            let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
+            self.history.iter_mut().for_each(|history| history.follow(&steps, current.clone()));
+            self.turn();
         }
     }
 
@@ -3533,7 +3563,10 @@ impl App for EditorApp {
         let told = if conflicts.is_some() { banner::HEIGHT } else { 0.0 };
         // The safe mode bar lies under the top bar and takes its height from the page.
         let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height() + told;
-        let room = Size { width: room.max(0.0), height: (window.height - bar).max(0.0) };
+        // The history has a strip of its versions under the page and the panel.
+        let strip = self.history.as_ref().map(History::strip);
+        let foot = if strip.is_some() { history::STRIP } else { 0.0 };
+        let room = Size { width: room.max(0.0), height: (window.height - bar - foot).max(0.0) };
         let page = match (printing, away) {
             (true, _) => self.sheets(room),
             (false, true) => self.version(room),
@@ -3550,7 +3583,7 @@ impl App for EditorApp {
         });
         let over = over.chain(commands);
         let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).children(self.safe.bar());
-        let all = all.children(conflicts).child(body).children(over);
+        let all = all.children(conflicts).child(body).children(strip).children(over);
         if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
     }
 

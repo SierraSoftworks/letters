@@ -94,6 +94,8 @@ pub(crate) struct Canvas<M> {
     pub caret: Option<Rect>,
     /// Whether the app hears where the pointer rests on it.
     pub pointed: bool,
+    /// Whether positions on it are told as parts of its width and height.
+    pub spread: bool,
 }
 
 /// Whether and how an element takes keyboard focus.
@@ -225,8 +227,14 @@ impl<M> Element<M> {
     /// An area the app draws itself. It takes focus on a click, and text and pointer input once the handlers
     /// are set.
     pub fn canvas(paint: Rc<dyn Paint>) -> Self {
-        let mut element =
-            Self::new(Content::Canvas(Canvas { paint, on_text: None, on_pointer: None, caret: None, pointed: false }));
+        let mut element = Self::new(Content::Canvas(Canvas {
+            paint,
+            on_text: None,
+            on_pointer: None,
+            caret: None,
+            pointed: false,
+            spread: false,
+        }));
         element.focus = Focus::Click;
         element.style.clip = true;
         element
@@ -574,6 +582,16 @@ impl<M> Element<M> {
     pub fn pointed(mut self) -> Self {
         if let Content::Canvas(canvas) = &mut self.content {
             canvas.pointed = true;
+        }
+        self
+    }
+
+    /// Has positions on the canvas told as parts of its width and height, from 0 to 1 across it: for a
+    /// canvas that spreads what it draws over whatever room it is given, so that what handles a press need
+    /// not know how much room that was.
+    pub fn spread(mut self) -> Self {
+        if let Content::Canvas(canvas) = &mut self.content {
+            canvas.spread = true;
         }
         self
     }

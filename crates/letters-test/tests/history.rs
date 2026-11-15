@@ -1,8 +1,9 @@
 //! The history: the document's versions listed by day beside the one that is picked, which is read where
-//! the page was, shows how it differs from the version before it or from the document, and can be restored.
+//! the page was, shows how it differs from the version before it or from the document, and can be restored
+//! or given a name. A strip under the page has a cell for each version.
 
 use letters_editor::Editor;
-use letters_model::{Block, ReplicaId};
+use letters_model::{Block, Change, ReplicaId, TagKind};
 use letters_render::{Color, Item, Point, Rect};
 use letters_test::{Found, Harness, Role};
 use letters_ui::{Window, tokens};
@@ -176,6 +177,31 @@ fn picked(window: &mut Harness) -> Option<String> {
     versions(window).into_iter().find(|version| version.selected == Some(true)).map(|version| version.name)
 }
 
+/// The strip of versions under the page.
+fn strip(window: &mut Harness) -> Found {
+    window.find(Role::Image, "Versions, oldest first").expect("the strip of versions")
+}
+
+/// The point of the strip that is so many versions across it, counted from the oldest: 2.5 is the middle
+/// of the third.
+fn cell(window: &mut Harness, versions: f32) -> Point {
+    let strip = strip(window);
+    let wide = strip.bounds.width / VERSIONS.len() as f32;
+    Point { x: strip.bounds.x + versions * wide, y: strip.center().y }
+}
+
+/// How many versions the strip draws as standing out from the rest.
+fn standing_out(window: &mut Harness) -> usize {
+    let (strip, ink) = (strip(window).bounds, tokens::INFO.light);
+    let tone = Color::rgba(ink.r, ink.g, ink.b, ink.a);
+    let on_strip = |rect: Rect| strip.contains(Point { x: rect.x + rect.width / 2.0, y: rect.y + rect.height / 2.0 });
+    let fills = window.paint().items.into_iter().filter_map(|item| match item {
+        Item::Fill { rect, color, .. } => Some((rect, color)),
+        _ => None,
+    });
+    fills.filter(|(rect, color)| *color == tone && on_strip(*rect)).count()
+}
+
 /// The paragraphs of the version that shows where the page was.
 fn shown(window: &mut Harness) -> Vec<String> {
     let runs = window.controls().into_iter().filter(|found| found.role == Role::TextRun);
@@ -226,7 +252,11 @@ type Pick = fn(&mut Harness, usize);
 /// How far into the page area a press is, given how much of the earlier version shows at its left.
 type Reach = fn(f32) -> f32;
 
-const PICKS: [(&str, Pick); 2] = [
+const PICKS: [(&str, Pick); 3] = [
+    ("a press on the strip", |window, back| {
+        let at = cell(window, (VERSIONS.len() - 1 - back) as f32 + 0.5);
+        window.click_at(at);
+    }),
     ("a press", |window, back| {
         window.click(Role::ListBoxOption, VERSIONS[VERSIONS.len() - 1 - back].0);
     }),
@@ -550,4 +580,142 @@ fn a_version_is_listed_with_how_much_it_put_in_and_took_out() {
     assert!(told("11:30").ends_with("15 characters added, 10 removed"), "{}", told("11:30"));
     assert!(told("16:42").contains(" added, ") && told("16:42").ends_with(" removed"), "{}", told("16:42"));
     assert!(!told("First version").contains("removed"), "{}", told("First version"));
+}
+
+#[test]
+fn the_strip_under_the_page_says_which_version_is_picked_and_follows_a_drag() {
+    let mut window = history();
+    // It lies under the page and the panel, and takes its room from them.
+    let (page, cells) = (area(&mut window), strip(&mut window));
+    assert!(cells.bounds.y >= page.y + page.height, "{:?} under {page:?}", cells.bounds);
+    assert_eq!(cells.description.as_deref(), Some("5 of 5"));
+    // It runs from the day of the oldest version that has one to now.
+    let ends = ["6 Nov", "Now"].map(|end| window.find(Role::Label, end).map(|label| label.center().x));
+    let middle = cells.center();
+    assert!(ends[0].is_some_and(|x| x < middle.x) && ends[1].is_some_and(|x| x > middle.x), "{ends:?}");
+    window.key("Left");
+    assert_eq!(strip(&mut window).description.as_deref(), Some("4 of 5"));
+
+    // A drag goes through the versions, and past an end of the strip stays at the version there.
+    let start = cell(&mut window, 4.5);
+    window.press_at(start);
+    let stops =
+        [(2.5, "11:30"), (0.5, "First version"), (-3.0, "First version"), (3.5, "16:42"), (9.0, "Current version")];
+    for (to, version) in stops {
+        let at = cell(&mut window, to);
+        window.hover_at(at);
+        assert_eq!(picked(&mut window).as_deref(), Some(version), "dragged to {to}");
+    }
+    let end = cell(&mut window, 1.5);
+    window.release_at(end);
+    assert_eq!(picked(&mut window).as_deref(), Some("18:20"));
+    assert_eq!(shown(&mut window), VERSIONS[1].1);
+    // The pointer let go: where it moves next picks nothing.
+    window.hover_at(start);
+    assert_eq!(picked(&mut window).as_deref(), Some("18:20"));
+}
+
+#[test]
+fn a_version_is_named_where_the_bar_asks_for_it_and_the_name_is_kept_with_the_history() {
+    let mut window = history();
+    window.click(Role::ListBoxOption, "16:42");
+    let (edits, text) = (window.ui().edits(), written(&window));
+    assert_eq!(standing_out(&mut window), 0);
+    window.click(Role::Button, "Name");
+    let field = window.focused().expect("the keyboard is in the field");
+    assert_eq!((field.role, field.name.as_str()), (Role::TextInput, "Version name"));
+    window.type_text("Sent to the roofer").key("Enter");
+
+    // The version is listed by its name and stays picked. It still says who wrote it and when.
+    assert_eq!(picked(&mut window).as_deref(), Some("Sent to the roofer"));
+    assert_eq!(shown(&mut window), VERSIONS[3].1);
+    let named = versions(&mut window).into_iter().find(|version| version.name == "Sent to the roofer");
+    let told = named.and_then(|version| version.description).unwrap_or_default();
+    assert!(told.starts_with("Alice Moreau, 16:42"), "{told}");
+    assert_eq!(window.find(Role::TextInput, "Version name"), None, "the field is put away");
+    assert_eq!(standing_out(&mut window), 1, "the strip shows which version has a name");
+
+    // A name is something to save, and no edit: the document reads as it did, and undo leaves the name.
+    assert!(window.ui().edits() > edits);
+    assert_eq!(written(&window), text);
+    window.key("Escape").key("Mod+Z").click(Role::Button, "History");
+    let names: Vec<String> = versions(&mut window).into_iter().map(|version| version.name).collect();
+    assert!(names.contains(&"Sent to the roofer".to_owned()), "{names:?}");
+}
+
+#[test]
+fn a_name_that_was_typed_is_taken_however_the_field_is_left_unless_it_is_dropped() {
+    // A way of leaving the field, whether the name is taken, and whether the history still shows.
+    let ways: [(&str, Act, bool, bool); 8] = [
+        ("Enter", |window| _ = window.key("Enter"), true, true),
+        ("Escape", |window| _ = window.key("Escape"), false, true),
+        ("a press on another version", |window| _ = window.click(Role::ListBoxOption, "11:30"), true, true),
+        (
+            "a press on the strip",
+            |window| {
+                let oldest = cell(window, 0.5);
+                window.click_at(oldest);
+            },
+            true,
+            true,
+        ),
+        ("another comparison", |window| _ = window.click(Role::RadioButton, "Off"), true, true),
+        (
+            "a press on the page",
+            |window| {
+                let page = area(window);
+                window.click_at(Point { x: page.x + page.width / 2.0, y: page.y + page.height / 2.0 });
+            },
+            true,
+            true,
+        ),
+        ("the way back", |window| _ = window.click(Role::Button, "Back to editing"), true, false),
+        ("a restore", |window| _ = window.click(Role::Button, "Restore this version"), true, false),
+    ];
+    for (way, leave, taken, stays) in ways {
+        let mut window = history();
+        window.click(Role::ListBoxOption, "16:42").click(Role::Button, "Name").type_text("Sent to the roofer");
+        leave(&mut window);
+        assert_eq!(showing(&mut window), stays, "{way}");
+        if !stays {
+            window.click(Role::Button, "History");
+        }
+        assert_eq!(window.find(Role::TextInput, "Version name"), None, "{way}: the field is put away");
+        let named: Vec<Found> =
+            versions(&mut window).into_iter().filter(|version| version.name == "Sent to the roofer").collect();
+        assert_eq!(named.len(), usize::from(taken), "{way}");
+        // The name goes to the version that was picked when it was typed, wherever the pick went then.
+        let told = named.first().and_then(|version| version.description.clone()).unwrap_or_default();
+        assert!(!taken || told.starts_with("Alice Moreau"), "{way}: {told}");
+    }
+}
+
+#[test]
+fn a_cleared_name_is_taken_off_and_a_version_the_shell_marked_keeps_its_mark_until_it_is_named() {
+    let mut window = letter();
+    // The shell marks what the letter began with as an import.
+    let marked = window.ui().change(|editor| {
+        let began = editor.timeline().into_iter().rfind(|step| step.time == 0).expect("a first step").after;
+        editor.mark_version(&began, TagKind::Import, Some("Renovation.docx")).map(|()| Change::default())
+    });
+    assert!(marked.is_ok());
+    window.click(Role::Button, "History").click(Role::ListBoxOption, "Imported from Renovation.docx");
+    assert_eq!(standing_out(&mut window), 1, "the strip shows what came from elsewhere");
+
+    // What is done at the field, and what the version is then listed as.
+    let steps: [(&str, Act, &str); 4] = [
+        ("nothing typed", |window| _ = window.key("Enter"), "Imported from Renovation.docx"),
+        ("a name typed", |window| _ = window.type_text("Architect's draft").key("Enter"), "Architect's draft"),
+        ("the name left as it is", |window| _ = window.key("Enter"), "Architect's draft"),
+        ("the name cleared", |window| _ = window.key("Mod+A").key("Backspace").key("Enter"), "First version"),
+    ];
+    for (what, act, listed) in steps {
+        let was = picked(&mut window).filter(|name| name == "Architect's draft").unwrap_or_default();
+        window.click(Role::Button, "Name");
+        // The field opens with the name the version has.
+        assert_eq!(window.focused().and_then(|field| field.value).unwrap_or_default(), was, "{what}");
+        act(&mut window);
+        assert_eq!(picked(&mut window).as_deref(), Some(listed), "{what}");
+        assert_eq!(shown(&mut window), VERSIONS[0].1, "{what}");
+    }
 }

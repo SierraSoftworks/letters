@@ -12,6 +12,9 @@
 //! it or with the document as it reads now. A block that was rewritten shows as it read before and after,
 //! the page split there as it is at a conflict. A block that only gained words, or only lost some, shows
 //! once with those words marked, and a line over blocks that only one version has says so.
+//!
+//! Under the page a strip has a cell for each version, to press on or drag along, and the bar names the
+//! version that is picked: a name is a mark in the history, which is saved and is no edit.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -41,7 +44,7 @@ use crate::text::{Family, TextShaper, TextStyle};
 use crate::theme::accent;
 use crate::threads;
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::widgets::{Button, Menu, MenuItem, Segmented, SidePanel, TopBar};
+use crate::widgets::{Button, ControlSize, Menu, MenuItem, Segmented, SidePanel, TextField, TopBar};
 use crate::window::{GUTTER, Message, PT, TOP};
 
 /// How long writing rests before what comes after it is another version, in seconds.
@@ -74,6 +77,16 @@ const SETTLES: usize = 3;
 const KEPT: usize = 3;
 /// The most characters of the words a block gained or lost that assistive technology is told.
 const TOLD: usize = 160;
+/// The most room the field takes that a version's name is typed in.
+const NAME_WIDTH: f32 = 200.0;
+/// The strip of versions under the page: how tall its bar is and how tall its cells are, the narrowest a
+/// cell is set apart from the next, the narrowest a version that stands out is drawn, and how wide the
+/// head at the picked version is and how far it reaches past the cells.
+pub(crate) const STRIP: f32 = 44.0;
+const CELL: f32 = 6.0;
+const CELL_APART: f32 = 4.0;
+const CELL_SEEN: f32 = 2.0;
+const SCRUB: (f32, f32) = (3.0, 6.0);
 
 /// What is asked of the history.
 #[derive(Clone, Debug, PartialEq)]
@@ -95,8 +108,26 @@ pub enum Historying {
     Up(Point),
     /// Shows the picked version against another, or as it read.
     Compare(Compare),
+    /// The pointer went down on the strip of versions, or moved along it while held: this far across it,
+    /// from 0 at the oldest version to 1.
+    Scrub(f32),
+    /// What is done about the picked version's name.
+    Name(Naming),
     /// Makes the document read as the picked version again.
     Restore,
+}
+
+/// What the field sends that a version's name is typed in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Naming {
+    /// Opens the name to be typed, as the version has it.
+    Open,
+    /// What the field holds.
+    Typed(String),
+    /// Puts the field away with the name taken. No name takes off the one the version had.
+    Apply,
+    /// Puts the field away and drops what was typed.
+    Cancel,
 }
 
 /// What the picked version is compared with.
@@ -143,6 +174,11 @@ impl Version {
         tag.name.as_deref().map(str::trim).filter(|name| !name.is_empty())
     }
 
+    /// Whether it came from elsewhere: an import, a merge, or an earlier version restored.
+    fn apart(&self) -> bool {
+        matches!(self.kind(), Some(TagKind::Import | TagKind::Merge | TagKind::Restore))
+    }
+
     /// The time of day it was last written at, on the person's clock.
     fn clock(&self, zone: i32) -> Option<String> {
         let of_day = local(self.time, zone).rem_euclid(86_400);
@@ -187,15 +223,22 @@ impl Version {
             return "Undated".to_owned();
         }
         let day = day(self.time, zone);
-        let ago = today.map(|today| today - day);
-        let (year, month, date) = notes::date(u64::try_from(day).unwrap_or_default());
-        let month = MONTHS[(month.clamp(1, 12) - 1) as usize];
-        match ago {
+        match today.map(|today| today - day) {
             Some(0) => "Today".to_owned(),
             Some(1) => "Yesterday".to_owned(),
             Some(2..7) => WEEKDAYS[(day + 4).rem_euclid(7) as usize].to_owned(),
+            _ => self.date(today, zone),
+        }
+    }
+
+    /// The date it was written on: "6 Nov", with its year where that is not plain.
+    fn date(&self, today: Option<i64>, zone: i32) -> String {
+        let day = day(self.time, zone);
+        let (year, month, date) = notes::date(u64::try_from(day).unwrap_or_default());
+        let month = MONTHS[(month.clamp(1, 12) - 1) as usize];
+        match today.map(|today| today - day) {
             // A date without its year is plain for most of a year back.
-            Some(7..300) => format!("{date} {month}"),
+            Some(0..300) => format!("{date} {month}"),
             _ => format!("{date} {month} {year}"),
         }
     }
@@ -281,6 +324,24 @@ fn versions(steps: &[Step], zone: i32) -> Vec<Version> {
         version.authors.sort_by_key(|(_, edits)| std::cmp::Reverse(*edits));
     }
     versions
+}
+
+/// The version that holds what was written up to `revision`: the first that ends there or later. `None`
+/// for a revision that no step of the history ends at.
+fn holding(steps: &[Step], versions: &[Version], revision: &Revision) -> Option<usize> {
+    let ends = |step: &Step, at: &Revision| step.after == *at || step.tags.iter().any(|tag| tag.at == *at);
+    let (mut next, mut passed) = (0, false);
+    for step in steps {
+        passed |= ends(step, revision);
+        // The versions are listed in the order of the steps they end at.
+        while versions.get(next).is_some_and(|version| ends(step, &version.at)) {
+            if passed {
+                return Some(next);
+            }
+            next += 1;
+        }
+    }
+    None
 }
 
 /// A stretch of blocks that only one of two versions has.
@@ -559,6 +620,8 @@ pub(crate) struct History {
     at: usize,
     /// What it is compared with.
     compare: Compare,
+    /// What the field holds that its name is typed in, while that is open.
+    naming: Option<String>,
     /// The versions the window read last.
     read: Vec<(Revision, Rc<(Document, Style)>)>,
     /// What the page area shows of it, once the window has read it.
@@ -598,6 +661,7 @@ impl History {
             versions: Vec::new(),
             at: 0,
             compare: Compare::default(),
+            naming: None,
             read: Vec::new(),
             leaf: None,
             scroll: 0.0,
@@ -632,7 +696,12 @@ impl History {
             let (authors, tag) = (Vec::new(), None);
             self.versions.push(Version { at: newest.clone(), time, authors, added: 0, removed: 0, tag });
         }
-        let kept = picked.and_then(|picked| self.versions.iter().position(|version| version.at == picked));
+        // A version that is listed no longer, as one whose name was taken off, is part of the one that
+        // holds what it wrote.
+        let kept = picked.and_then(|picked| {
+            let listed = self.versions.iter().position(|version| version.at == picked);
+            listed.or_else(|| holding(steps, &self.versions, &picked))
+        });
         self.at = kept.unwrap_or(self.versions.len() - 1);
     }
 
@@ -726,6 +795,35 @@ impl History {
     pub fn compare(&mut self, with: Compare) {
         self.compare = with;
         (self.active, self.slide, self.since) = (Side::Second, 1.0, None);
+    }
+
+    /// The version that stands so far across the strip, from 0 at the oldest to 1.
+    pub fn across(&self, part: f32) -> usize {
+        let count = self.versions.len();
+        ((part.clamp(0.0, 1.0) * count as f32) as usize).min(count - 1)
+    }
+
+    pub fn at(&self) -> usize {
+        self.at
+    }
+
+    /// Opens the picked version's name to be typed, takes what the field holds, or drops it.
+    pub fn name(&mut self, asked: Naming) {
+        match asked {
+            Naming::Open => self.naming = Some(self.picked().name().unwrap_or_default().to_owned()),
+            Naming::Typed(typed) => self.naming = self.naming.as_ref().map(|_| typed),
+            Naming::Apply | Naming::Cancel => self.naming = None,
+        }
+    }
+
+    /// Puts the name field away. Returns the picked version's revision and what to call it, or `None` to
+    /// take its name off, when what was typed is not what it is called already. With nothing typed, a
+    /// version that has no name of its own stays marked as it was.
+    pub fn named(&mut self) -> Option<(Revision, Option<String>)> {
+        let typed = self.naming.take()?;
+        let (version, name) = (self.picked(), typed.trim());
+        let changed = version.name().unwrap_or_default() != name;
+        changed.then(|| (version.at.clone(), Some(name.to_owned()).filter(|name| !name.is_empty())))
     }
 
     /// Picks the version before the one picked, or the one after it, when there is one.
@@ -1026,6 +1124,20 @@ impl History {
         let with = Compare::ALL.iter().find(|(with, _)| *with == self.compare).map_or("Off", |(_, label)| label);
         let name = || Element::text(name, TextStyle::control().weight(600)).min_width(tokens::SPACE_3XL).shrink();
         let when = Element::text(self.said(), TextStyle::control().size(tokens::TEXT_SM));
+        // The picked version's name is typed where the button stood that asks for it.
+        let naming = |button: Button<Message>| -> Element<Message> {
+            let send = |asked: Naming| Message::History(Historying::Name(asked));
+            let Some(typed) = &self.naming else { return button.small().on_press(send(Naming::Open)).into() };
+            let field = TextField::new("Version name", typed)
+                .placeholder("Name this version")
+                .size(ControlSize::Small)
+                .on_input(|typed| Message::History(Historying::Name(Naming::Typed(typed))))
+                .on_submit(send(Naming::Apply))
+                .on_cancel(send(Naming::Cancel))
+                // Leaving the field takes the name, as leaving the field of the document's own name does.
+                .on_leave(send(Naming::Apply));
+            Element::from(field).key("naming").width(NAME_WIDTH).shrink().takes_focus()
+        };
         // The document as it reads now is what a restore would leave: there is nothing to do.
         let restore = |button: Button<Message>| {
             let button = button.primary().small().disabled(self.newest());
@@ -1040,13 +1152,59 @@ impl History {
             .start(when.fg(tokens::FG_MUTED).shrink())
             .middle(compare)
             .middle(TopBar::rule())
+            .middle(naming(Button::new("Name").icon(icon::TAG)))
             .middle(restore(Button::new("Restore this version").icon(icon::ROTATE_CCW)));
         bar.form(FORMS.1)
             .start(Button::icon_only(icon::ARROW_LEFT, "Back to editing").small().on_press(back))
             .start(name())
             .middle(Element::from(Button::new(with).small().menu(compares)).description("Compare with"))
             .middle(TopBar::rule())
+            .middle(naming(Button::icon_only(icon::TAG, "Name")))
             .middle(restore(Button::icon_only(icon::ROTATE_CCW, "Restore this version")))
+    }
+
+    /// The strip under the page and the panel: a cell for each version, the oldest first, with a head at
+    /// the one that is picked. A press on it picks the version there, and a drag goes through them.
+    pub fn strip(&self) -> Element<Message> {
+        let quiet = TextStyle::control().size(tokens::TEXT_SM);
+        let label = |text: String| Element::text(text, quiet).fg(tokens::FG_MUTED);
+        // The strip runs from the day of the oldest version that has one to now.
+        let first = self.versions.iter().find(|version| version.time > 0);
+        let first = first.map(|version| label(version.date(self.today(), self.zone)));
+        let out = self.versions.iter().map(|version| version.name().is_some() || version.apart()).collect();
+        let track = Element::canvas(Rc::new(Strip { out, at: self.at }))
+            .grow(1.0)
+            .height(STRIP - 1.0)
+            .passive()
+            .role(Role::Image)
+            .label("Versions, oldest first")
+            .description(format!("{} of {}", self.at + 1, self.versions.len()))
+            .cursor(Cursor::Pointer)
+            .spread()
+            .on_pointer(|event| match event {
+                Pointer::Down { at, .. } | Pointer::Drag { at } => Some(Message::History(Historying::Scrub(at.x))),
+                _ => None,
+            });
+        // The keys that step through the versions, as a reminder beside them.
+        let key = |name: &str| {
+            let name = Element::text(name, TextStyle::control().size(tokens::TEXT_XS)).fg(tokens::FG_MUTED);
+            Element::row()
+                .padding(Edges::xy(tokens::SPACE_XS, 1.0))
+                .radius(tokens::RADIUS_SM)
+                .bg(tokens::NEUTRAL_SOFT)
+                .child(name)
+        };
+        Element::row()
+            .height(STRIP)
+            .align(Align::Center)
+            .gap(tokens::SPACE_MD)
+            .padding(Edges::xy(tokens::SPACE_LG, 0.0))
+            .bg(tokens::SURFACE)
+            .border(Edges::top(1.0), tokens::LINE)
+            .children(first)
+            .child(track)
+            .child(label("Now".to_owned()))
+            .child(Element::row().gap(tokens::SPACE_XS).child(key("Left")).child(key("Right")).decorative())
     }
 
     /// When the picked version was written and by whom, as the bar says it: "Tuesday 16:42, by Alice
@@ -1150,7 +1308,7 @@ impl History {
 
         // What made it a version of its own shows in its marker: the one that is the document now, and
         // one that came from elsewhere.
-        let apart = matches!(version.kind(), Some(TagKind::Import | TagKind::Merge | TagKind::Restore));
+        let apart = version.apart();
         let ink = match (newest, apart) {
             (true, _) => accent().base,
             (false, true) => tokens::INFO,
@@ -1329,6 +1487,43 @@ impl Paint for Page {
     }
 }
 
+/// The strip of versions as it is drawn: a cell for each, the oldest first.
+struct Strip {
+    /// Whether each version stands out: one that has a name, or that came from elsewhere.
+    out: Vec<bool>,
+    /// The version that is picked.
+    at: usize,
+}
+
+impl Paint for Strip {
+    fn paint(&self, rect: Rect, _visible: Rect, scheme: Scheme, out: &mut DisplayList) {
+        let ink = |ink: Ink| resolve(ink, scheme, 1.0);
+        let cell = rect.width / self.out.len().max(1) as f32;
+        let cells = Rect::new(rect.x, rect.y + ((rect.height - CELL) / 2.0).round(), rect.width, CELL);
+        // With room for them the cells stand apart. Without, they run into one bar that the versions
+        // which stand out are marked on.
+        let apart = cell >= CELL_APART;
+        out.push(Item::PushClip { rect: cells, radius: tokens::RADIUS_SM });
+        if !apart {
+            out.push(Item::Fill { rect: cells, color: ink(tokens::NEUTRAL_SOFT), radius: 0.0 });
+        }
+        for (at, stands_out) in self.out.iter().enumerate().filter(|(_, stands_out)| apart || **stands_out) {
+            let left = (cells.x + at as f32 * cell).round();
+            let right = (cells.x + (at + 1) as f32 * cell).round() - if apart { 1.0 } else { 0.0 };
+            let wide = (right - left).max(if apart { 1.0 } else { CELL_SEEN });
+            let color = ink(if *stands_out { tokens::INFO } else { tokens::NEUTRAL_SOFT });
+            out.push(Item::Fill { rect: Rect::new(left, cells.y, wide, CELL), color, radius: 0.0 });
+        }
+        out.push(Item::PopClip);
+        let middle = cells.x + (self.at as f32 + 0.5) * cell;
+        let head = Rect::new((middle - SCRUB.0 / 2.0).round(), cells.y - SCRUB.1, SCRUB.0, CELL + 2.0 * SCRUB.1);
+        // A rim of the bar's own colour keeps the head apart from a cell of its colour.
+        let rim = Rect::new(head.x - 1.0, head.y - 1.0, head.width + 2.0, head.height + 2.0);
+        out.push(Item::Fill { rect: rim, color: ink(tokens::SURFACE), radius: rim.width / 2.0 });
+        out.push(Item::Fill { rect: head, color: ink(accent().text), radius: SCRUB.0 / 2.0 });
+    }
+}
+
 /// A version's piece of its day's rail, with its marker.
 struct Rail {
     /// A version that came from elsewhere is a diamond, and any other a ring.
@@ -1455,26 +1650,29 @@ mod tests {
     #[test]
     fn a_version_is_listed_under_its_day_on_the_persons_clock() {
         let today = Some(day(NOON, 0));
-        // When it was written, how far the clock is ahead of UTC, and the day and time it is listed at.
+        // When it was written, how far the clock is ahead of UTC, the day and time it is listed at, and
+        // the date the strip begins at when it is the oldest.
         let cases = [
-            (NOON, 0, "Today", Some("12:00")),
-            (NOON - DAY, 0, "Yesterday", Some("12:00")),
-            (NOON - 2 * DAY, 0, "Sunday", Some("12:00")),
-            (NOON - 6 * DAY, 0, "Wednesday", Some("12:00")),
-            (NOON - 7 * DAY, 0, "3 Nov", Some("12:00")),
-            (NOON - 400 * DAY, 0, "6 Oct 2025", Some("12:00")),
+            (NOON, 0, "Today", Some("12:00"), "10 Nov"),
+            (NOON - DAY, 0, "Yesterday", Some("12:00"), "9 Nov"),
+            (NOON - 2 * DAY, 0, "Sunday", Some("12:00"), "8 Nov"),
+            (NOON - 6 * DAY, 0, "Wednesday", Some("12:00"), "4 Nov"),
+            (NOON - 7 * DAY, 0, "3 Nov", Some("12:00"), "3 Nov"),
+            (NOON - 400 * DAY, 0, "6 Oct 2025", Some("12:00"), "6 Oct 2025"),
             // Half past eleven at night in UTC is the next morning two hours east of it.
-            (NOON - 12 * HOUR - 1_800, 120, "Today", Some("01:30")),
-            (NOON - 12 * HOUR - 1_800, 0, "Yesterday", Some("23:30")),
-            (NOON - 12 * HOUR + 1_800, -300, "Yesterday", Some("19:30")),
-            (0, 0, "Undated", None),
+            (NOON - 12 * HOUR - 1_800, 120, "Today", Some("01:30"), "10 Nov"),
+            (NOON - 12 * HOUR - 1_800, 0, "Yesterday", Some("23:30"), "9 Nov"),
+            (NOON - 12 * HOUR + 1_800, -300, "Yesterday", Some("19:30"), "9 Nov"),
         ];
-        for (time, zone, name, clock) in cases {
+        for (time, zone, name, clock, date) in cases {
             let version = Version { time, ..versions(&[step(0, time, "Sam")], zone).remove(0) };
             let today = today.map(|_| day(NOON, zone));
             assert_eq!(version.day(today, zone), name, "{time} at {zone}");
             assert_eq!(version.clock(zone).as_deref(), clock, "{time} at {zone}");
+            assert_eq!(version.date(today, zone), date, "{time} at {zone}");
         }
+        let undated = versions(&[step(0, 0, "Sam")], 0).remove(0);
+        assert_eq!((undated.day(today, 0).as_str(), undated.clock(0)), ("Undated", None));
     }
 
     #[test]
@@ -1491,6 +1689,64 @@ mod tests {
             vec![Tag { author: Some("Sam".to_owned()), time: NOON, ..tag(2, TagKind::Named, Some("Draft")) }];
         let listed = versions(&steps, 0);
         assert_eq!((listed[1].clock(0).as_deref(), listed[1].who().as_deref()), (Some("13:00"), Some("Alice")));
+    }
+
+    #[test]
+    fn a_version_that_is_listed_no_longer_leaves_the_one_that_holds_it_picked() {
+        // A step the day before, three at one sitting with the second of them named, and one an hour later.
+        let mut steps = vec![step(0, NOON - DAY, "Sam")];
+        steps.extend((1..4).map(|place| step(place, NOON + 60 * place as u64, "Sam")));
+        steps.push(step(4, NOON + HOUR, "Sam"));
+        steps[2].tags = vec![tag(3, TagKind::Named, Some("Sent"))];
+        let newest = steps[4].after.clone();
+        let mut history = History::new(&steps, newest.clone(), None, 0);
+        history.pick(1);
+        assert_eq!(history.picked().name(), Some("Sent"));
+
+        // With its name taken off, what it wrote is part of the sitting.
+        steps[2].tags.clear();
+        history.follow(&steps, newest);
+        assert_eq!(history.picked().at, steps[3].after);
+        assert_eq!(history.versions.len(), 3);
+    }
+
+    #[test]
+    fn the_strip_gives_each_version_an_equal_part_of_its_width() {
+        let steps: Vec<Step> = (0..4).map(|place| step(place, NOON + DAY * place as u64, "Sam")).collect();
+        let history = History::new(&steps, steps[3].after.clone(), None, 0);
+        // How far across the strip, and the version there. Past either end is the version at that end.
+        let cases = [(0.0, 0), (0.24, 0), (0.26, 1), (0.6, 2), (0.99, 3), (1.0, 3), (-0.5, 0), (7.0, 3)];
+        for (across, version) in cases {
+            assert_eq!(history.across(across), version, "{across}");
+        }
+    }
+
+    #[test]
+    fn a_name_is_taken_only_when_it_is_not_what_the_version_is_called() {
+        // A version as it is marked, what is typed for it, and the name it is then given: `None` for
+        // nothing to do, `Some(None)` to take its name off.
+        type Case<'a> = (Option<(TagKind, &'a str)>, &'a str, Option<Option<&'a str>>);
+        let cases: [Case; 7] = [
+            (None, "Sent", Some(Some("Sent"))),
+            (None, "  Sent ", Some(Some("Sent"))),
+            (None, "  ", None),
+            (Some((TagKind::Named, "Sent")), "Sent", None),
+            (Some((TagKind::Named, "Sent")), "Sent again", Some(Some("Sent again"))),
+            (Some((TagKind::Named, "Sent")), "", Some(None)),
+            (Some((TagKind::Import, "plan.docx")), "", None),
+        ];
+        for (marked, typed, expected) in cases {
+            let mut steps = vec![step(0, NOON, "Sam"), step(1, NOON + DAY, "Sam")];
+            steps[0].tags = marked.iter().map(|(kind, name)| tag(1, *kind, Some(name))).collect();
+            let mut history = History::new(&steps, steps[1].after.clone(), None, 0);
+            history.pick(0);
+            history.name(Naming::Open);
+            history.name(Naming::Typed(typed.to_owned()));
+            let named = history.named();
+            let expected = expected.map(|name| (steps[0].after.clone(), name.map(str::to_owned)));
+            assert_eq!(named, expected, "{marked:?} with {typed:?} typed");
+            assert_eq!(history.named(), None, "the field is put away");
+        }
     }
 
     #[test]

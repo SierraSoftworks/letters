@@ -1058,7 +1058,14 @@ impl<A: App> Ui<A> {
     fn within(&self, i: usize, at: Point) -> Point {
         let node = &self.tree.nodes[i];
         let content = inner(node.rect, &node.el.style);
-        Point { x: at.x - content.x, y: at.y - content.y }
+        let at = Point { x: at.x - content.x, y: at.y - content.y };
+        match &node.el.content {
+            // A canvas that spreads over its room is told how far across and down it the point is.
+            Content::Canvas(canvas) if canvas.spread => {
+                Point { x: at.x / content.width.max(1.0), y: at.y / content.height.max(1.0) }
+            }
+            _ => at,
+        }
     }
 
     /// The offset in a text input's value nearest to a window position.
