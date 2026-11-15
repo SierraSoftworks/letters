@@ -15,6 +15,7 @@ use letters::connected::{self, Reached, Shared, Sharing, Unreached};
 use letters::keychain::Keychain;
 use letters::remote::Roots;
 use letters::server::{Client, Refused};
+use letters::servers;
 use letters::session::Session;
 use letters::signin::{SignIn, Unsigned};
 use letters_api::{
@@ -642,14 +643,15 @@ fn a_document_is_entered_with_the_session_at_hand_or_a_new_sign_in() {
 
     // Nobody is signed in: the browser is, and the session is kept.
     let (first, reached) =
-        connected::enter(&client, "d1", None, Some(*KEYCHAIN), &home.0, &sign_in_at(&server), &waiting).unwrap();
+        connected::enter(&client, "d1", None, Some(*KEYCHAIN), &home.0, &sign_in_at(&server), &|_, _| (), &waiting)
+            .unwrap();
     assert_eq!((first.person(), reached.opened, reached.online), (ada(), opened(), true));
     assert_eq!(exchanges(&server), 1);
 
     // The session the app holds opens the next document, and the one that was kept opens it after a restart.
     for held in [Some(first.clone()), None] {
         let (session, _) =
-            connected::enter(&client, "d1", held, Some(*KEYCHAIN), &home.0, &no_browser, &waiting).unwrap();
+            connected::enter(&client, "d1", held, Some(*KEYCHAIN), &home.0, &no_browser, &|_, _| (), &waiting).unwrap();
         assert_eq!(session.person(), ada());
     }
     assert_eq!(exchanges(&server), 0);
@@ -661,9 +663,60 @@ fn a_document_is_entered_with_the_session_at_hand_or_a_new_sign_in() {
         sign_in_at(&server)(page)
     };
     let (session, reached) =
-        connected::enter(&client, "d1", Some(first), Some(*KEYCHAIN), &home.0, &again, &waiting).unwrap();
+        connected::enter(&client, "d1", Some(first), Some(*KEYCHAIN), &home.0, &again, &|_, _| (), &waiting).unwrap();
     assert!(reached.online && !session.ended());
     assert_eq!(exchanges(&server), 1);
+}
+
+#[test]
+fn a_server_signed_in_to_is_listed_until_the_person_signs_out() {
+    let (home, server) = (Scratch::new("connected-servers"), Server::start());
+    let (client, roots) = (server.client(), Roots::These(vec![server.certificate.clone()]));
+    let kept = || servers::kept(&home.0, || Some(*KEYCHAIN), &roots);
+    let waited = Mutex::new(Vec::new());
+    let waiting = |name: &str, page: &str| waited.lock().unwrap().push((name.to_owned(), page.to_owned()));
+    let no_keychain = || -> Option<Keychain> { panic!("the keychain is asked only for a listed server") };
+    assert!(servers::kept(&home.0, no_keychain, &roots).is_empty());
+
+    // A browser that does not open is no end: the person has the page, and can give the sign-in up.
+    let (no_browser, given_up) = (|_: &str| Err(std::io::ErrorKind::NotFound.into()), AtomicBool::new(true));
+    let unsigned = connected::sign_in(&client, Some(*KEYCHAIN), &home.0, &no_browser, &waiting, &given_up);
+    assert!(matches!(&unsigned, Err(Unreached::Unsigned(Unsigned::GivenUp))));
+    assert_eq!(unsigned.unwrap_err().sign_in(), None);
+    assert!(servers::listed(&home.0).is_empty());
+
+    let signed =
+        connected::sign_in(&client, Some(*KEYCHAIN), &home.0, &sign_in_at(&server), &waiting, &AtomicBool::new(false));
+    let session = signed.unwrap();
+    assert_eq!(session.person(), ada());
+    let waited = waited.into_inner().unwrap();
+    assert!(waited.len() == 2 && waited.iter().all(|(name, page)| name == "Home" && page.starts_with(client.origin())));
+    // The next run finds the session by the list, and asks nothing of the server for it.
+    assert_eq!(servers::listed(&home.0), [client.origin()]);
+    server.asked();
+    let people: Vec<_> =
+        kept().iter().map(|session| (session.server().origin().to_owned(), session.person())).collect();
+    assert_eq!(people, [(client.origin().to_owned(), ada())]);
+    assert!(server.asked().is_empty());
+
+    // A sign-in that is gone from the keychain is no session, though its server is listed.
+    session.sign_out().unwrap();
+    assert!(kept().is_empty());
+    servers::forget(&home.0, client.origin()).unwrap();
+    assert!(servers::listed(&home.0).is_empty());
+}
+
+#[test]
+fn a_sign_in_that_did_not_work_says_why_in_a_sentence() {
+    let (home, server) = (Scratch::new("connected-unsigned"), Server::start());
+    let stranger = Client::new(server.client().origin(), &Roots::These(Vec::new())).unwrap();
+    let no_browser = |_: &str| -> std::io::Result<()> { panic!("nobody is sent to sign in") };
+
+    let unsigned = connected::sign_in(&stranger, None, &home.0, &no_browser, &|_, _| (), &AtomicBool::new(false));
+
+    let sentence = unsigned.unwrap_err().sign_in().expect("the person did not give it up");
+    assert!(sentence.starts_with("Signing in did not work") && sentence.ends_with('.'), "{sentence}");
+    assert!(servers::listed(&home.0).is_empty());
 }
 
 #[test]
@@ -673,7 +726,8 @@ fn nobody_is_sent_to_sign_in_at_what_is_no_letters_server() {
     let stranger = Client::new(server.client().origin(), &Roots::These(Vec::new())).unwrap();
     let no_browser = |_: &str| -> std::io::Result<()> { panic!("nobody is sent to sign in") };
 
-    let entered = connected::enter(&stranger, "d1", None, None, &home.0, &no_browser, &AtomicBool::new(false));
+    let entered =
+        connected::enter(&stranger, "d1", None, None, &home.0, &no_browser, &|_, _| (), &AtomicBool::new(false));
 
     assert!(matches!(entered, Err(Unreached::Refused(Refused::Unreachable(_)))));
 }

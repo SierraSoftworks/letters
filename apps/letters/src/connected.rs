@@ -25,6 +25,7 @@ use ureq::http::Uri;
 use crate::keychain::Keychain;
 use crate::remote::Roots;
 use crate::server::{Client, Refused};
+use crate::servers;
 use crate::session::Session;
 use crate::signin::{SignIn, Unsigned};
 use crate::socket::{Closed, Heard, Socket};
@@ -88,8 +89,19 @@ pub enum Unreached {
     Unkept(io::Error),
     /// Nobody signed in to the server.
     Unsigned(Unsigned),
-    /// The system opened no browser to sign in at.
-    NoBrowser(io::Error),
+}
+
+impl Unreached {
+    /// Why a sign-in did not work, as the person is to read it. `None` if they gave it up themselves.
+    pub fn sign_in(&self) -> Option<String> {
+        match self {
+            Self::Unsigned(Unsigned::GivenUp) => None,
+            Self::Refused(Refused::Said(said)) | Self::Unsigned(Unsigned::Refused(Refused::Said(said))) => {
+                Some(said.message.clone())
+            }
+            other => Some(format!("Signing in did not work: {other}.")),
+        }
+    }
 }
 
 impl fmt::Display for Unreached {
@@ -98,7 +110,6 @@ impl fmt::Display for Unreached {
             Self::Refused(refused) => refused.fmt(f),
             Self::Unkept(error) => write!(f, "its copy could not be kept on this device ({error})"),
             Self::Unsigned(unsigned) => unsigned.fmt(f),
-            Self::NoBrowser(_) => write!(f, "no browser could be opened to sign in at"),
         }
     }
 }
@@ -344,8 +355,8 @@ const SIGN_IN_WITHIN: Duration = Duration::from_secs(300);
 /// Opens the way to a server's document: a session at its server, and the document's copy on this device.
 ///
 /// The session is `held` if the app has one there, else the one the keychain kept from an earlier run,
-/// else a new one from a sign-in at the system's browser, which `browse` is handed the page of. The wait
-/// for the browser ends when `given_up` is set. All of this waits on the network, and on the person.
+/// else a new one from a [`sign_in`]. All of this waits on the network, and on the person.
+#[allow(clippy::too_many_arguments)]
 pub fn enter(
     server: &Client,
     id: &str,
@@ -353,6 +364,7 @@ pub fn enter(
     keychain: Option<Keychain>,
     home: &Path,
     browse: &dyn Fn(&str) -> io::Result<()>,
+    waiting: &dyn Fn(&str, &str),
     given_up: &AtomicBool,
 ) -> Result<(Arc<Session>, Reached), Unreached> {
     let kept = || Session::kept(server.clone(), keychain?).ok().flatten().map(Arc::new);
@@ -360,16 +372,51 @@ pub fn enter(
         match reach(&session, id, home) {
             // A session the server has ended is followed by a new sign-in.
             Err(Unreached::Refused(refused)) if refused.code() == Some(Code::SignedOut) => {}
-            reached => return reached.map(|reached| (session, reached)),
+            reached => {
+                // One the keychain kept since before servers were listed is listed from here on.
+                if reached.is_ok() {
+                    list(&session, home);
+                }
+                return reached.map(|reached| (session, reached));
+            }
         }
     }
+    let session = sign_in(server, keychain, home, browse, waiting, given_up)?;
+    reach(&session, id, home).map(|reached| (session, reached))
+}
+
+/// Signs the person in to `server` at the system's browser, which `browse` is handed the sign-in page of.
+///
+/// `waiting` hears the server's name and the page's address as the browser is sent there. A
+/// browser that did not open is no end: the person can open the page themselves. The wait ends when
+/// `given_up` is set. The server is listed in `home` if the keychain keeps the sign-in. This waits on the
+/// network, and on the person.
+pub fn sign_in(
+    server: &Client,
+    keychain: Option<Keychain>,
+    home: &Path,
+    browse: &dyn Fn(&str) -> io::Result<()>,
+    waiting: &dyn Fn(&str, &str),
+    given_up: &AtomicBool,
+) -> Result<Arc<Session>, Unreached> {
     // Nobody is sent to sign in at what is no Letters server.
-    server.discover().map_err(Unreached::Refused)?;
+    let said = server.discover().map_err(Unreached::Refused)?;
     let sign_in = SignIn::begin().map_err(Unreached::Unsigned)?;
-    browse(&sign_in.page(server).map_err(Unreached::Unsigned)?).map_err(Unreached::NoBrowser)?;
+    let page = sign_in.page(server).map_err(Unreached::Unsigned)?;
+    waiting(&said.name, &page);
+    let _ = browse(&page);
     let token = sign_in.finish(server, SIGN_IN_WITHIN, given_up).map_err(Unreached::Unsigned)?;
     let session = Arc::new(Session::begin(server.clone(), keychain, token));
-    reach(&session, id, home).map(|reached| (session, reached))
+    list(&session, home);
+    Ok(session)
+}
+
+/// Lists the session's server among those the person is signed in to, if the sign-in outlasts the app.
+fn list(session: &Session, home: &Path) {
+    if session.unkept().is_none() {
+        // A list that cannot be written costs a row in a dialog, and no sign-in.
+        let _ = servers::remember(home, session.server().origin());
+    }
 }
 
 /// What is known of a document whose server never said anything this device kept: no more than its id.

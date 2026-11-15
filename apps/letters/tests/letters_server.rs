@@ -533,8 +533,17 @@ fn the_app_signs_in_through_the_browser_and_opens_a_document_of_the_server() {
 
     // The sign-in was kept, so the app opens signed in, and the next document needs no browser.
     let no_browser = |_: &str| -> std::io::Result<()> { panic!("nobody is sent to sign in") };
-    let (kept, again) =
-        connected::enter(&client, &id, None, Some(*KEYCHAIN), &home.0, &no_browser, &AtomicBool::new(false)).unwrap();
+    let (kept, again) = connected::enter(
+        &client,
+        &id,
+        None,
+        Some(*KEYCHAIN),
+        &home.0,
+        &no_browser,
+        &|_, _| (),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!((kept.person(), again.path), (ada(), reached.path));
 
     // Signed out, nothing more is had with what was kept.
