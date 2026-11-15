@@ -54,6 +54,8 @@ struct Session {
     /// Where the device's copy stood at its hello, while that copy and the room each hold edits the
     /// other lacks: the device wrote while it was away. Its first edits settle against it.
     apart: Option<Revision>,
+    /// How many of its messages were refused as unreadable.
+    unreadable: u32,
 }
 
 /// One open document on the server.
@@ -136,7 +138,8 @@ impl Room {
         let taken = |colour: &u8| self.sessions.values().any(|session| session.colour == *colour);
         // The first colour nobody here has, so that few people look as different as the window can make them.
         let colour = (0..=u8::MAX).find(|colour| !taken(colour)).unwrap_or(self.last as u8);
-        let session = Session { access, colour, greeted: false, heard: now, selection: None, apart: None };
+        let session =
+            Session { access, colour, greeted: false, heard: now, selection: None, apart: None, unreadable: 0 };
         self.sessions.insert(SessionId(self.last), session);
         SessionId(self.last)
     }
@@ -174,11 +177,9 @@ impl Room {
                 Ok(self.pass_on(Some(session), &ServerMessage::Selection { session, selection }))
             }
             ClientMessage::Edits { seq, .. } | ClientMessage::Style { seq, .. } if !role.edits() => {
-                Ok(self.to(session, &ServerMessage::Refused { seq, why: Refusal::ReadOnly }))
+                Ok(self.refuse(session, seq, Refusal::ReadOnly))
             }
-            ClientMessage::Notes { seq, .. } if !role.comments() => {
-                Ok(self.to(session, &ServerMessage::Refused { seq, why: Refusal::NoComments }))
-            }
+            ClientMessage::Notes { seq, .. } if !role.comments() => Ok(self.refuse(session, seq, Refusal::NoComments)),
             ClientMessage::Edits { seq, updates } => self.edits(session, seq, &updates, state, now),
             ClientMessage::Style { seq, style } => self.style(session, seq, style, state, now),
             ClientMessage::Notes { seq, notes } => self.notes(session, role, seq, notes, state, now),
@@ -372,6 +373,12 @@ impl Room {
         self.sessions.values().filter(|session| session.greeted).map(|session| session.access.name.as_str())
     }
 
+    /// How many of a session's messages the room refused as [`Refusal::Unreadable`] and went on. A sound
+    /// device hangs up at the first, so a host may end a session that keeps sending them.
+    pub fn unreadable(&self, session: SessionId) -> u32 {
+        self.sessions.get(&session).map_or(0, |session| session.unreadable)
+    }
+
     /// Whether the room has no sessions and nothing that is due to the file, so that the host may drop
     /// it. What the journal still holds is taken in by the room that is opened next.
     pub fn is_idle(&self) -> bool {
@@ -384,6 +391,14 @@ impl Room {
     fn to(&mut self, session: SessionId, message: &ServerMessage) -> bool {
         self.out.push_back(Outbound::Send(session, message.encode()));
         false
+    }
+
+    /// Tells a session that its message numbered `seq` was not taken. Always `false`.
+    fn refuse(&mut self, session: SessionId, seq: u64, why: Refusal) -> bool {
+        if let Some(from) = self.sessions.get_mut(&session).filter(|_| why == Refusal::Unreadable) {
+            from.unreadable = from.unreadable.saturating_add(1);
+        }
+        self.to(session, &ServerMessage::Refused { seq, why })
     }
 
     /// Sends a message to every session that said hello, but for one.
@@ -471,7 +486,7 @@ impl Room {
         // A device's bytes are read apart from the document first: a panic of the history library as it
         // reads them would leave the document unusable for everyone.
         if Model::check(updates).is_err() {
-            return Ok(self.to(session, &ServerMessage::Refused { seq, why: Refusal::Unreadable }));
+            return Ok(self.refuse(session, seq, Refusal::Unreadable));
         }
         let before = (self.copy.model().extent(), self.copy.model().revision());
         let read = self.copy.edit(updates).is_ok();
@@ -501,7 +516,7 @@ impl Room {
         } else if whole {
             self.owed.push((session, seq));
         } else {
-            self.to(session, &ServerMessage::Refused { seq, why: Refusal::Unreadable });
+            self.refuse(session, seq, Refusal::Unreadable);
         }
         kept
     }
@@ -516,7 +531,7 @@ impl Room {
     ) -> Result<bool, Error> {
         let before = self.copy.model().extent();
         if self.copy.set_style(style).is_err() {
-            return Ok(self.to(session, &ServerMessage::Refused { seq, why: Refusal::Unreadable }));
+            return Ok(self.refuse(session, seq, Refusal::Unreadable));
         }
         // The room wrote the change, so the session that asked for it lacks it too.
         let kept = self.keep_edits(None, &before, state, now);
@@ -559,7 +574,7 @@ impl Room {
             true => sent.clone(),
             false => match comments(&self.copy.notes, &sent) {
                 Ok(allowed) => allowed,
-                Err(why) => return Ok(self.to(session, &ServerMessage::Refused { seq, why })),
+                Err(why) => return Ok(self.refuse(session, seq, why)),
             },
         };
         let before = self.copy.notes.clone();

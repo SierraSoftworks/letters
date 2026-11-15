@@ -632,6 +632,25 @@ fn an_update_the_history_library_trips_on_is_refused_and_the_room_goes_on() {
 }
 
 #[test]
+fn the_host_can_tell_a_session_that_keeps_sending_what_cannot_be_read() {
+    let (mut world, ada, ben) = editors();
+    world.edit(ada, [typed("p", 0, "Sound. ")]);
+    let (sound, odd) = (world.devices[ada].session.unwrap(), world.devices[ben].session.unwrap());
+    // A sound device hangs up at the first refusal. This one goes on.
+    for seq in 1..=3 {
+        world.forge(ben, &ClientMessage::Edits { seq, updates: TRIPS.to_vec() }.encode());
+    }
+    let room = world.room.as_mut().unwrap();
+    assert_eq!((room.unreadable(sound), room.unreadable(odd)), (0, 3));
+
+    // What the host does about it is its own rule. The room ends the session when told to.
+    room.dismiss(odd, Refusal::Unreadable);
+    assert_eq!((room.sessions(), room.unreadable(odd)), (1, 0));
+    world.settle();
+    assert_eq!(texts(world.devices[ada].document())[0], "Sound. Hello world");
+}
+
+#[test]
 fn edits_that_build_on_some_the_room_never_saw_are_not_held() {
     let (mut world, ada, ben) = editors();
     // Two edits, and only the second is sent.
