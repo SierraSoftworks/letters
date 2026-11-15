@@ -212,8 +212,15 @@ impl Session {
     }
 
     /// Who reached a document through a share, newest first.
-    pub fn access_log(&self, id: &str) -> Result<Vec<Access>, Refused> {
-        self.ask(|server, token| server.get(token, &paths::access(id)))
+    /// A page of them: the newest, or with `before` those from before that row's time.
+    pub fn access_log(&self, id: &str, before: Option<u64>) -> Result<Vec<Access>, Refused> {
+        let page = before.map_or_else(|| paths::access(id), |time| format!("{}?before={time}", paths::access(id)));
+        self.ask(|server, token| server.get(token, &page))
+    }
+
+    /// How many days the server keeps a row of that log. 0 from one that does not say.
+    pub fn log_days(&self) -> Result<u32, Refused> {
+        Ok(self.said()?.log_days)
     }
 
     /// Makes a link to a document. Its address is told this once.

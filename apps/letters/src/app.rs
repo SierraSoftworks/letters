@@ -2357,7 +2357,8 @@ impl App {
                 | Request::SharePeople(_)
                 | Request::MakeLink(_)
                 | Request::RevokeLink(_)
-                | Request::AccessLog => {
+                | Request::AccessLog
+                | Request::AccessLogBefore(_) => {
                     let window = self.windows.get_mut(&id);
                     let Some(remote) = window.and_then(|window| window.remote.as_mut()) else { continue };
                     remote.shares.push(match request {
@@ -2365,6 +2366,7 @@ impl App {
                         Request::MakeLink(new) => Sharing::Link(new),
                         Request::RevokeLink(link) => Sharing::Revoke(link),
                         Request::AccessLog => Sharing::Log,
+                        Request::AccessLogBefore(time) => Sharing::Earlier(time),
                         _ => Sharing::Look,
                     });
                 }
@@ -2810,7 +2812,11 @@ impl App {
                 connected::Shared::Made(link) => window.view.link_made(link),
                 // The dialog dropped the link when it asked.
                 connected::Shared::Revoked => {}
-                connected::Shared::Log(log) => window.view.set_access_log(log),
+                connected::Shared::Log(log, days) => {
+                    window.view.set_log_days(days);
+                    window.view.set_access_log(log);
+                }
+                connected::Shared::Earlier(rows) => window.view.add_access_log(rows),
                 connected::Shared::Refused(why) => window.view.refuse_share(&why),
             }
         }

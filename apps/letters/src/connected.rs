@@ -267,6 +267,8 @@ pub enum Sharing {
     Revoke(String),
     /// Who reached the document through a share.
     Log,
+    /// Who did before this time, which is that of the oldest row the dialog holds.
+    Earlier(u64),
 }
 
 /// What a document's server answered the Share dialog.
@@ -277,8 +279,11 @@ pub enum Shared {
     /// The link that was asked for, with its address.
     Made(CreatedLink),
     Revoked,
-    /// Who reached the document through a share, newest first.
-    Log(Vec<Access>),
+    /// Who reached the document through a share, newest first, and how many days the server keeps such
+    /// a row: 0 if it does not say.
+    Log(Vec<Access>, u32),
+    /// The page of that log that [`Sharing::Earlier`] asked for.
+    Earlier(Vec<Access>),
     /// Why it was not done, as the person is to read it.
     Refused(String),
 }
@@ -291,7 +296,8 @@ pub fn share(session: &Session, id: &str, ask: &Sharing) -> Shared {
         Sharing::People(people) => session.share(id, people).map(told),
         Sharing::Link(new) => session.make_link(id, new).map(Shared::Made),
         Sharing::Revoke(link) => session.revoke_link(id, link).map(|()| Shared::Revoked),
-        Sharing::Log => session.access_log(id).map(Shared::Log),
+        Sharing::Log => session.access_log(id, None).map(|log| Shared::Log(log, session.log_days().unwrap_or(0))),
+        Sharing::Earlier(time) => session.access_log(id, Some(*time)).map(Shared::Earlier),
     };
     answered.unwrap_or_else(|refused| {
         Shared::Refused(match refused {

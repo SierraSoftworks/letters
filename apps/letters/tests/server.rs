@@ -143,7 +143,7 @@ impl Letters {
         };
         match asked.line.as_str() {
             "GET /api/v1/server" => json(&serde_json::json!({
-                "product": "letters-server", "name": "Home", "version": "0.1.0", "protocols": [1],
+                "product": "letters-server", "name": "Home", "version": "0.1.0", "protocols": [1], "log_days": 90,
             })),
             "POST /api/v1/session/exchange" => {
                 let Exchange { code, verifier } = serde_json::from_slice(&asked.body).unwrap();
@@ -209,6 +209,7 @@ impl Letters {
                 address: "192.0.2.7".into(),
                 browser: "Firefox".into(),
             }]),
+            "GET /api/v1/documents/d1/access?before=3" => json(&Vec::<Access>::new()),
             "GET /api/v1/forbidden" => said(Code::Forbidden, "That is not yours to read."),
             "GET /api/v1/elsewhere" => Answer("302 Found", "location: https://elsewhere.example/\r\n", Vec::new()),
             "GET /api/v1/page" => {
@@ -809,8 +810,11 @@ fn the_share_dialog_is_answered_by_the_documents_server() {
     assert!(now.links.iter().any(|link| link.id == made.link.id && link.revoked.is_some()), "{now:?}");
 
     // Who came through a share is listed as the server logged it.
-    let Shared::Log(log) = share(Sharing::Log) else { panic!("the log is told") };
+    let Shared::Log(log, days) = share(Sharing::Log) else { panic!("the log is told") };
     assert!(matches!(&log[..], [Access { who: Who::Link { label, .. }, .. }] if label == "Accountant"), "{log:?}");
+    assert_eq!(days, 90, "and how long the server keeps it");
+    // The page before its oldest row is asked for by that row's time.
+    assert_eq!(share(Sharing::Earlier(log[0].time)), Shared::Earlier(Vec::new()));
 
     // A refusal is the server's own sentence, and a server that shares nothing yet is named as one.
     assert_eq!(
