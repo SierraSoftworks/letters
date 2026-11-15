@@ -29,6 +29,8 @@ letters-trust.workspace = true
 # What the server behind a page says, and where it is asked.
 letters-api.workspace = true
 serde_json.workspace = true
+# The document's line to its server: what to send over the page's socket, and what to merge.
+letters-sync.workspace = true
 
 accesskit.workspace = true
 wasm-bindgen.workspace = true
@@ -36,6 +38,7 @@ wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 web-sys = { workspace = true, features = [
   "Blob",
+  "BinaryType",
   "BlobPropertyBag",
   "CanvasRenderingContext2d",
   "ClipboardEvent",
@@ -65,6 +68,7 @@ web-sys = { workspace = true, features = [
   "KeyboardEvent",
   "Location",
   "MediaQueryList",
+  "MessageEvent",
   "MouseEvent",
   "Navigator",
   "Node",
@@ -74,6 +78,7 @@ web-sys = { workspace = true, features = [
   "Response",
   "Storage",
   "Url",
+  "WebSocket",
   "WheelEvent",
   "Window",
   "console",

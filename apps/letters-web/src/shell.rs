@@ -21,19 +21,20 @@ use letters_model::{
 };
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::{Color, DisplayList, Font, Point, Rect, Size};
+use letters_sync::{Client, Link, Local, Progress};
 use letters_trust::{LinkDecision, Origin, Trust};
 use letters_ui::{
-    Appearance, CopyFormat, Cursor, Edge, Keys, LinkPreviewFound, PictureState, Request, SaveState, Scheme, Settings,
-    Uncovered, Window as View, WordList, tokens,
+    Appearance, Connection, CopyFormat, Cursor, Edge, Keys, LinkPreviewFound, Peer, PictureState, Request, SaveState,
+    Scheme, Settings, Uncovered, Window as View, WordList, tokens,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 use web_sys::{
-    Blob, BlobPropertyBag, CanvasRenderingContext2d, ClipboardEvent, CompositionEvent, DragEvent, Element, Event,
-    EventTarget, File, FileList, HtmlAnchorElement, HtmlCanvasElement, HtmlElement, HtmlIFrameElement,
+    BinaryType, Blob, BlobPropertyBag, CanvasRenderingContext2d, ClipboardEvent, CompositionEvent, DragEvent, Element,
+    Event, EventTarget, File, FileList, HtmlAnchorElement, HtmlCanvasElement, HtmlElement, HtmlIFrameElement,
     HtmlInputElement, HtmlTextAreaElement, ImageData, KeyboardEvent, MediaQueryList, MouseEvent, PointerEvent, Url,
-    WheelEvent, Window,
+    WebSocket, WheelEvent, Window,
 };
 
 use crate::browser::{self, Browser};
@@ -87,6 +88,8 @@ const MIRROR: &str = "position:fixed;overflow:hidden;opacity:0;pointer-events:no
 /// How long the window must stay as it is before the mirror is brought up to date, in milliseconds. Reading
 /// the whole window costs more than a key press should wait for.
 const MIRROR_MS: i32 = 150;
+/// How long a page waits for its first session before the bar says that it is connecting.
+const QUIET_MS: u64 = 1000;
 
 /// The modifiers held during a keyboard or pointer event, which report them under the same names.
 macro_rules! held {
@@ -115,6 +118,8 @@ pub struct Stats {
     pub spelling: bool,
     /// Whether every font has arrived, so that no text stands in another's face.
     pub fonts: bool,
+    /// Whether the page is in session with its server, and its document's history is the server's.
+    pub live: bool,
 }
 
 /// What the first frame does without. The fonts are fetched at once, and the rest once the frame is on the
@@ -187,6 +192,36 @@ pub struct Shell {
     /// The hosts whose pictures the person said they trust, for as long as the page is open. The server
     /// has nowhere to keep them.
     hosts: Vec<String>,
+    /// The document's line to its server: it says what to send over the socket, and what to merge.
+    client: Option<Client>,
+    /// The socket the client last asked for.
+    socket: Option<Line>,
+    /// The socket before it, whose listeners are let go with the next: one of them may be running.
+    hung: Option<Line>,
+    /// How many sockets were asked for.
+    sockets: u32,
+    /// Whether the document's history is the server's, which comes with the first session. Until then
+    /// the page shows the document it was sent, and the client is told nothing of it.
+    attached: bool,
+    /// How many pictures are on their way to the server. The edits that name them wait for them.
+    uploading: u32,
+    /// Whether the server lets this person write in the document. It says so with the page, and again
+    /// with each session.
+    edits: bool,
+    /// Whether the editor was last told that the person may write.
+    writing: bool,
+    /// The selection as the client was last told it.
+    told: Option<Selection>,
+    /// How the window was last told it stands to the server.
+    connection: Option<Connection>,
+    /// Until when a wait for the first session shows nothing: a page that loads says nothing of a
+    /// wait the person does not notice.
+    quiet_until: Option<u64>,
+    /// The count of edits at which the others' carets were last placed. `None` once they moved.
+    peers_at: Option<u64>,
+    on_beat: Function,
+    /// The timer for the client's next move of its own, such as asking for a socket again.
+    beat_timer: Option<i32>,
     /// Whether the document's file is being written.
     saving: bool,
     /// What the window was last told of saving.
@@ -337,6 +372,20 @@ impl Shell {
                 server,
                 linked: HashMap::new(),
                 hosts: Vec::new(),
+                client: None,
+                socket: None,
+                hung: None,
+                sockets: 0,
+                attached: false,
+                uploading: 0,
+                edits: true,
+                writing: true,
+                told: None,
+                connection: None,
+                quiet_until: None,
+                peers_at: None,
+                on_beat: callback(shell, Self::beat),
+                beat_timer: None,
                 saving: false,
                 save_state: SaveState::default(),
                 session: None,
@@ -479,6 +528,7 @@ impl Shell {
         shell.borrow_mut().rest();
         shell.borrow_mut().show();
         shell.borrow_mut().fetch_fonts();
+        shell.borrow_mut().go_online();
         Ok(shell)
     }
 
@@ -494,6 +544,7 @@ impl Shell {
     pub fn open(&mut self, document: Document) {
         self.view = view(document, &mut self.platform, self.mac);
         self.backed();
+        self.go_offline();
         (self.kept, self.identity, self.server) = (self.view.edits(), None, None);
         self.linked.clear();
         (self.session, self.written, self.rested) = (None, self.kept, None);
@@ -1063,6 +1114,7 @@ impl Shell {
             let picture = Uint8Array::new(&picture).to_vec();
             self.platform.assets.extend(name.as_string().map(|name| (name, picture)));
         });
+        self.go_offline();
         (self.kept, self.identity, self.server) = (view.edits(), Some(identity), None);
         self.linked.clear();
         (self.session, self.written, self.rested) = (session, self.kept, None);
@@ -1223,6 +1275,7 @@ impl Shell {
                 // The window asks for that host's pictures again by itself.
                 Request::TrustPictures(src) => self.hosts.extend(host(&src)),
                 Request::FetchPreview { url } => self.preview(url),
+                Request::Connect => self.tell(|client, _, now| client.start(now)),
                 // The window has taken the settings already. The rest is the shell's: keeping them, the
                 // name edits carry, and light or dark.
                 Request::Settings(settings) => {
@@ -1239,16 +1292,28 @@ impl Shell {
             }
         }
         // The window offers to save what is nowhere but on the page.
-        let state = match self.view.edits() == self.kept {
-            _ if self.saving => SaveState::Saving,
-            true => SaveState::Saved,
-            false => SaveState::Edited,
+        let state = match self.client.as_ref().filter(|_| self.attached).map(Client::progress) {
+            // What is written on a served page is kept when the server holds it.
+            Some(Progress::Saved) => SaveState::Saved,
+            Some(Progress::Saving) => SaveState::Saving,
+            Some(Progress::Edited) => SaveState::Edited,
+            None if self.saving => SaveState::Saving,
+            None if self.view.edits() == self.kept => SaveState::Saved,
+            None => SaveState::Edited,
         };
-        if state != self.save_state {
+        self.allow();
+        let connection = self.connection();
+        self.stats.live = self.attached && connection == Some(Connection::Live);
+        if state != self.save_state || connection != self.connection {
             self.save_state = state;
             self.view.set_save_state(state);
+            self.connection.clone_from(&connection);
+            self.view.set_connection(connection);
+            // The server says so in its own time, after no key of the person's.
+            self.changed();
         }
         self.keep_pictures();
+        self.keep_up();
         self.cover();
         if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
             self.frame_due = self.window.request_animation_frame(&self.on_frame).is_ok();
@@ -1652,14 +1717,260 @@ impl Shell {
             let Some(bytes) = self.platform.assets.get(&name) else { continue };
             let kind = browser::mime(bytes).unwrap_or("application/octet-stream");
             let sent = browser::ask(&self.window, "PUT", &asset(&id, &name), Some((kind, bytes)));
+            self.uploading += 1;
             let shell = self.me.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let Err(refusal) = sent.await else { return };
+                let kept = sent.await;
                 let Some(shell) = shell.upgrade() else { return };
-                // The picture stays on the page, and the person knows that it is nowhere else.
-                shell.borrow().say(refusal.message);
+                let mut shell = shell.borrow_mut();
+                shell.uploading -= 1;
+                if let Err(refusal) = kept {
+                    // The picture stays on the page, and the person knows that it is nowhere else.
+                    shell.say(refusal.message);
+                }
+                // The edit that names it may go now.
+                shell.sync();
             });
         }
+    }
+
+    // The line to the server
+
+    /// Starts the served document's line to its server. The socket is asked for at once, beside the
+    /// fonts, and the document's history comes with its first session.
+    fn go_online(&mut self) {
+        let Some(server) = &self.server else { return };
+        let mut client = Client::new(server.id.clone());
+        let now = self.platform.now_ms();
+        client.start(now);
+        self.client = Some(client);
+        self.quiet_until = Some(now + QUIET_MS);
+        self.edits = server.role >= letters_api::Role::Editor;
+        self.allow();
+        self.pump();
+    }
+
+    /// Ends the line, as when the page comes to show a document that is not the server's.
+    fn go_offline(&mut self) {
+        if let Some(mut client) = self.client.take() {
+            client.stop();
+        }
+        self.hang_up();
+        // The window that shows the other document is a new one.
+        (self.attached, self.told, self.quiet_until, self.peers_at, self.writing) = (false, None, None, None, true);
+        self.beat_at();
+    }
+
+    /// Tells the client what happened, and does what it then asks.
+    fn tell(&mut self, tell: impl FnOnce(&mut Client, Local, u64)) {
+        let now = self.platform.now_ms();
+        if let Some(client) = &mut self.client {
+            tell(client, local(&self.view, self.attached), now);
+        }
+        self.pump();
+    }
+
+    /// Does what the client asks, in the order it asks.
+    fn pump(&mut self) {
+        while let Some(asked) = self.client.as_mut().and_then(Client::poll) {
+            match asked {
+                letters_sync::Event::Open => self.connect(),
+                letters_sync::Event::Send(frame) => {
+                    if let Some(line) = &self.socket {
+                        report(line.socket.send_with_u8_array(&frame));
+                    }
+                }
+                letters_sync::Event::Close => self.hang_up(),
+                letters_sync::Event::Merge(history) => self.take_edits(&history),
+                letters_sync::Event::Notes(theirs) => self.take_notes(&theirs),
+                // The page keeps no journal that could let go of what the server holds.
+                letters_sync::Event::Held(_) => {}
+                // The session goes on without what was refused, and the person knows what is not kept.
+                letters_sync::Event::Refused(why) => self.say(why.to_string()),
+                letters_sync::Event::Peers => self.peers_at = None,
+                // The bar is told how the link and saving stand with every look, in `sync`.
+                letters_sync::Event::Link => {
+                    if let Some(Link::Live(role)) = self.client.as_ref().map(Client::link) {
+                        (self.edits, self.quiet_until) = (role.edits(), None);
+                    }
+                }
+                letters_sync::Event::Progress => {}
+            }
+        }
+        self.beat_at();
+    }
+
+    /// Opens the socket the client asked for.
+    fn connect(&mut self) {
+        self.hang_up();
+        self.sockets += 1;
+        let line = self.server.as_ref().and_then(|server| line(&self.window, &server.socket, &self.me, self.sockets));
+        match line {
+            Some(line) => self.socket = Some(line),
+            None => {
+                let now = self.platform.now_ms();
+                self.client.iter_mut().for_each(|client| client.closed(now));
+            }
+        }
+    }
+
+    /// Closes the socket. The client is told nothing more of it.
+    fn hang_up(&mut self) {
+        if let Some(line) = self.socket.take() {
+            report(line.socket.close());
+            self.hung = Some(line);
+        }
+    }
+
+    /// Takes in what was written elsewhere. The first of it is the document's whole history.
+    fn take_edits(&mut self, history: &[u8]) {
+        let taken = match self.attached {
+            true => self.view.change(|editor| editor.merge(history)).map_err(|error| error.to_string()),
+            false => self.take_history(history),
+        };
+        match taken {
+            Ok(()) => self.changed(),
+            Err(error) => web_sys::console::error_1(&format!("what the server sent cannot be merged: {error}").into()),
+        }
+        // The text may have moved under the others' carets.
+        self.peers_at = None;
+        let now = self.platform.now_ms();
+        if let Some(client) = &mut self.client {
+            client.changed(local(&self.view, self.attached), now);
+        }
+    }
+
+    /// Makes the server's history the document's. A page is sent the document without it, so that it
+    /// reads at once.
+    fn take_history(&mut self, history: &[u8]) -> Result<(), String> {
+        let replica = ReplicaId::new(&self.platform.new_id());
+        let held = Model::load(history, replica).map_err(|error| error.to_string())?;
+        if held.doc() == self.view.editor().doc() && held.style() == self.view.style() {
+            // The page shows what the server holds, so the window stays as the person has it.
+            let held = held.prepare(None).map_err(|error| error.to_string())?;
+            _ = self.view.change(|editor| Ok::<_, Infallible>(editor.attach(held)));
+        } else {
+            // The document was changed after the page was written, and the server's is the document.
+            self.show_held(held);
+        }
+        self.attached = true;
+        Ok(())
+    }
+
+    /// Lets the person write in the document, or only read it. What is written before the server's
+    /// history is the document's would have no place in it, and a role may read and not write.
+    fn allow(&mut self) {
+        let may = self.client.is_none() || (self.attached && self.edits);
+        if may != self.writing {
+            self.writing = may;
+            _ = self.view.change(|editor| {
+                editor.set_read_only(!may);
+                Ok::<_, Infallible>(Change::default())
+            });
+        }
+    }
+
+    /// Shows the served document as the server's history holds it, in place of what the page was sent.
+    fn show_held(&mut self, held: Model) {
+        let Some(server) = &self.server else { return };
+        let mut view = set_up(page::served_on(held, server), &mut self.platform, self.mac);
+        view.set_author(&server.author);
+        view.set_preview_fetching(true);
+        // The notes and the caret stay where the person has them, as far as the document still has the place.
+        view.set_notes(self.view.notes().clone());
+        if let Some(selection) = self.view.editor().selection() {
+            view.select(selection.clone());
+        }
+        self.view = view;
+        self.backed();
+        // The new window is told of the link and the others anew, and lets the person write until told.
+        (self.connection, self.peers_at, self.writing) = (None, None, true);
+        (self.kept, self.written, self.rested, self.session) = (self.view.edits(), self.view.edits(), None, None);
+        self.text = TextInput::new(self.mac);
+        self.touch = Touch::default();
+        self.rest();
+        self.show();
+    }
+
+    /// Joins in the notes that were added or changed elsewhere.
+    fn take_notes(&mut self, theirs: &Notes) {
+        let mut notes = self.view.notes().clone();
+        if notes.merge(theirs) {
+            notes.follow(self.view.editor().model());
+            self.view.set_notes(notes);
+            self.changed();
+        }
+        let now = self.platform.now_ms();
+        if let Some(client) = &mut self.client {
+            client.changed(local(&self.view, self.attached), now);
+        }
+    }
+
+    /// Tells the client what the person did since the last look: what they wrote, and where their caret is.
+    fn keep_up(&mut self) {
+        let Some(client) = self.client.as_mut().filter(|_| self.attached) else { return };
+        let now = self.platform.now_ms();
+        // A picture is the server's before the edit that names it is.
+        if self.uploading == 0 {
+            client.changed(local(&self.view, true), now);
+        }
+        let selection = self.view.selection();
+        if selection != self.told.as_ref() {
+            client.selected(self.view.editor().model(), selection, now);
+            self.told = selection.cloned();
+        }
+        self.pump();
+        if self.peers_at != Some(self.view.edits()) {
+            self.peers_at = Some(self.view.edits());
+            self.show_peers();
+        }
+    }
+
+    /// Shows the others' carets where the document has them now.
+    fn show_peers(&mut self) {
+        let Some(client) = &self.client else { return };
+        let model = self.view.editor().model();
+        let peer = |peer: &letters_sync::Peer| Peer {
+            session: peer.session.0.into(),
+            name: peer.name.clone(),
+            colour: peer.colour,
+            selection: peer.selection.as_ref().and_then(|passage| passage.selection(model)),
+        };
+        let peers = client.peers().iter().map(peer).collect();
+        self.view.set_peers(peers);
+        self.changed();
+    }
+
+    /// How the page stands to its server, as the window is to say it. `None` for a document that is not
+    /// the server's, and for the first moments of a page: a wait that short shows nothing.
+    fn connection(&self) -> Option<Connection> {
+        match self.client.as_ref()?.link() {
+            Link::Live(_) => Some(Connection::Live),
+            Link::Refused(why) => Some(Connection::Refused(why.to_string())),
+            _ if self.quiet_until.is_some() => None,
+            Link::Connecting => Some(Connection::Connecting),
+            Link::Offline => Some(Connection::Offline),
+        }
+    }
+
+    /// The time the client asked to be woken at has come.
+    fn beat(&mut self) {
+        self.beat_timer = None;
+        let now = self.platform.now_ms();
+        self.quiet_until = self.quiet_until.filter(|&until| until > now);
+        self.tell(|client, _, now| client.tick(now));
+        self.sync();
+    }
+
+    /// Sets the timer for the client's next move of its own.
+    fn beat_at(&mut self) {
+        if let Some(timer) = self.beat_timer.take() {
+            self.window.clear_timeout_with_handle(timer);
+        }
+        let wake = self.client.as_ref().and_then(Client::wake_at);
+        let Some(at) = [wake, self.quiet_until].into_iter().flatten().min() else { return };
+        let delay = at.saturating_sub(self.platform.now_ms()).min(i32::MAX as u64) as i32;
+        self.beat_timer = self.window.set_timeout_with_callback_and_timeout_and_arguments_0(&self.on_beat, delay).ok();
     }
 
     /// Has the server fetch a picture the document links to, which a page may not read from another site
@@ -2119,6 +2430,56 @@ pub fn carried(window: &Window, platform: &mut Browser) -> Document {
             welcome
         }
     }
+}
+
+/// A socket to the document's server, and what listens to it.
+struct Line {
+    socket: WebSocket,
+    /// Which of the sockets asked for it is.
+    number: u32,
+    _heard: [Closure<dyn FnMut(JsValue)>; 3],
+}
+
+/// Opens a socket to `path` on the page's own server, and has the shell told what comes of it. `None`
+/// when the browser will not open one.
+fn line(window: &Window, path: &str, shell: &Weak<RefCell<Shell>>, number: u32) -> Option<Line> {
+    let address = Url::new_with_base(path, &window.location().href().ok()?).ok()?;
+    address.set_protocol(if address.protocol() == "https:" { "wss:" } else { "ws:" });
+    let socket = WebSocket::new(&address.href()).ok()?;
+    socket.set_binary_type(BinaryType::Arraybuffer);
+    let hear = |kind: &str, heard: fn(&mut Shell, JsValue)| {
+        let shell = shell.clone();
+        let heard = Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            // What an earlier socket still reports is no news of this one.
+            if shell.socket.as_ref().is_some_and(|line| line.number == number) {
+                heard(&mut shell, event);
+                shell.sync();
+            }
+        });
+        socket.add_event_listener_with_callback(kind, heard.as_ref().unchecked_ref()).ok()?;
+        Some(heard)
+    };
+    let heard = [
+        hear("open", |shell, _| shell.tell(|client, local, now| client.opened(local, now)))?,
+        hear("message", |shell, event| {
+            let frame = Reflect::get(&event, &"data".into()).map(|data| Uint8Array::new(&data).to_vec());
+            shell.tell(|client, local, now| client.received(&frame.unwrap_or_default(), local, now));
+        })?,
+        // A socket that could not be opened closes too.
+        hear("close", |shell, _| {
+            shell.hung = shell.socket.take();
+            shell.tell(|client, _, now| client.closed(now));
+        })?,
+    ];
+    Some(Line { socket, number, _heard: heard })
+}
+
+/// The document as the client is lent it. Until the server's history is the document's, the page holds
+/// no copy the client could read.
+fn local(view: &View, attached: bool) -> Local<'_> {
+    Local { model: attached.then(|| view.editor().model()), notes: view.notes() }
 }
 
 /// What a linked picture is fetched for.

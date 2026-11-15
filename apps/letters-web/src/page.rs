@@ -376,7 +376,12 @@ pub fn window(document: Document, replica: ReplicaId) -> Window {
 pub fn served_window(document: Document, opened: &Opened, replica: ReplicaId) -> Window {
     // The built-in style stands in for one this build cannot read, as it does on the desktop.
     let style = opened.style.as_ref().and_then(|style| Style::from_json(&style.to_string()).ok());
-    let model = Model::new(document, replica).with_style(style.unwrap_or_default());
+    served_on(Model::new(document, replica).with_style(style.unwrap_or_default()), opened)
+}
+
+/// The window on a served document as `model` holds it: the page's own, or the server's history once
+/// it has arrived.
+pub fn served_on(model: Model, opened: &Opened) -> Window {
     let mut window = at_end(Window::new(Editor::with_model(model)));
     window.set_document_name(&opened.name);
     window.set_author(&opened.author);

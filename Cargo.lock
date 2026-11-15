@@ -3924,6 +3924,7 @@ dependencies = [
  "letters-model",
  "letters-render",
  "letters-spell",
+ "letters-sync",
  "letters-test",
  "letters-trust",
  "letters-ui",

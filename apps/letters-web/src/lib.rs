@@ -119,6 +119,12 @@ impl Letters {
         self.shell.borrow().stats().fonts
     }
 
+    /// Whether the page is in session with its server, and its document's history is the server's.
+    #[wasm_bindgen(getter)]
+    pub fn live(&self) -> bool {
+        self.shell.borrow().stats().live
+    }
+
     /// How long the mirror last took to bring up to date, in milliseconds.
     #[wasm_bindgen(getter, js_name = mirrorMs)]
     pub fn mirror_ms(&self) -> f64 {
