@@ -606,6 +606,7 @@ impl Shell {
             }
         };
         self.view.access_action(request, &mut self.platform);
+        self.hand_over();
     }
 
     /// Lets the view move what moves on its own, when the time it asked for has come.
@@ -782,6 +783,15 @@ impl Shell {
             self.finger(Finger::Up { id: touch, ms: event.time_stamp() });
         } else if event.button() == 0 {
             self.view.pointer_up(self.pointer, &mut self.platform);
+            self.hand_over();
+        }
+    }
+
+    /// Puts on the clipboard what the view copied with no clipboard event to carry it, as a press on a
+    /// code block's copy button does.
+    fn hand_over(&mut self) {
+        if let Some(clip) = self.platform.copied.take() {
+            report(browser::copy(&self.window, &clip.text));
         }
     }
 
@@ -802,6 +812,7 @@ impl Shell {
                 self.view.pointer_move(at, &mut self.platform);
                 self.view.pointer_down(at, Modifiers::default(), &mut self.platform);
                 self.view.pointer_up(at, &mut self.platform);
+                self.hand_over();
             }
         }
     }

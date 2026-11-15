@@ -398,6 +398,11 @@ impl DocLayout {
         self.state.borrow_mut().figure(block)
     }
 
+    /// The code blocks that `viewport` shows, in order, each with the box drawn behind its text.
+    pub fn code_boxes(&self, viewport: Rect) -> Vec<(BlockId, Rect)> {
+        self.state.borrow_mut().code_boxes(viewport)
+    }
+
     /// The rectangles that highlight a selection, one per line it touches.
     ///
     /// This lays out every block the selection covers. To paint, use [`DocLayout::selection_in`].
@@ -1272,6 +1277,12 @@ impl State {
         let text = leaf.laid.as_ref().map_or(0.0, |laid| laid.text.layout.height());
         let caption = on_page(Rect::new(0.0, leaf.lead, leaf.width, text));
         Some(FigureBox { image, caption, badge: leaf::badge(image).filter(|_| remote) })
+    }
+
+    fn code_boxes(&mut self, viewport: Rect) -> Vec<(BlockId, Rect)> {
+        let (first, end) = self.show(viewport.y, viewport.y + viewport.height);
+        let coded = self.leaves[first..end].iter().filter(|leaf| matches!(leaf.kind, Some(BlockKind::Code { .. })));
+        coded.filter_map(|leaf| Some((leaf.id.clone()?, leaf::boxed(leaf)))).collect()
     }
 
     fn selection(&mut self, selection: &Selection, viewport: Option<Rect>) -> Vec<Rect> {

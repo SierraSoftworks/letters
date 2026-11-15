@@ -49,6 +49,24 @@ pub struct Browser {
     pub copied: Option<Clip>,
 }
 
+/// Puts text on the clipboard outside a clipboard event, as a press on a copy button asks. The browser
+/// allows it only in the wake of a press or a key, and not at all on a page served over plain HTTP.
+pub fn copy(window: &Window, text: &str) -> Result<(), JsValue> {
+    // Read by name: the binding to the async clipboard is not in every release of `web-sys`.
+    let clipboard = Reflect::get(&window.navigator(), &"clipboard".into())?;
+    if clipboard.is_undefined() {
+        return Err("this page may not write to the clipboard".into());
+    }
+    let write: js_sys::Function = Reflect::get(&clipboard, &"writeText".into())?.dyn_into()?;
+    let written: Promise = write.call1(&clipboard, &text.into())?.dyn_into()?;
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(refused) = JsFuture::from(written).await {
+            web_sys::console::error_1(&refused);
+        }
+    });
+    Ok(())
+}
+
 impl Browser {
     pub fn new(window: &Window) -> Result<Self, JsValue> {
         let performance = window.performance().ok_or("this browser has no clock")?;

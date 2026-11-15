@@ -21,6 +21,7 @@ use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
 
 use crate::chrome::Chrome;
+use crate::code_copy::{self, CodeCopy};
 use crate::color::{blend, fade, resolve, same};
 use crate::copying::{self, Copy, CopyFormat, Copying};
 use crate::describe;
@@ -619,6 +620,7 @@ pub struct EditorApp {
     insert: Insert,
     refer: Refer,
     references: References,
+    code_copy: CodeCopy,
     /// The preview of a figure that shows over the page: its caption, and where it is in the page area.
     previewed: Option<(String, Rect)>,
     /// How the document read when assistive technology was last told of it.
@@ -678,6 +680,7 @@ impl EditorApp {
             insert: Insert::default(),
             refer: Refer::default(),
             references: References::default(),
+            code_copy: CodeCopy::default(),
             previewed: None,
             told: RefCell::default(),
         }
@@ -972,14 +975,50 @@ impl EditorApp {
         self.layout.hit(Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP })
     }
 
-    /// The reference to a figure at a point of the page area, while nothing hangs over the page.
-    fn reference(&self, at: Point) -> Option<Reference> {
+    /// Whether something hangs over the page and takes what the pointer does there.
+    fn hung(&self) -> bool {
         let hung = self.landing.is_some()
             || self.importing.is_some()
             || self.copying.is_some()
             || self.spelling.fix.is_some()
             || self.link.is_some();
-        if hung || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some() {
+        hung || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
+    }
+
+    /// The code block whose box is at a point of the page area, and whether the point is on its copy
+    /// button, while nothing hangs over the page.
+    fn code_at(&self, at: Point) -> Option<(BlockId, bool)> {
+        if self.hung() {
+            return None;
+        }
+        let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        let boxes = self.layout.code_boxes(Rect::new(at.x, at.y, 0.0, 1.0));
+        let (block, code) = boxes.into_iter().find(|(_, code)| code.contains(at))?;
+        Some((block, code_copy::button(code).contains(at)))
+    }
+
+    /// The code block whose copy button is at a point of the page area.
+    fn copy_button(&self, at: Point) -> Option<BlockId> {
+        self.code_at(at).filter(|(_, on)| *on).map(|(block, _)| block)
+    }
+
+    /// Puts a code block's text on the clipboard as it is written, and has its button say so.
+    fn copy_code(&mut self, block: BlockId, platform: &mut dyn Platform) {
+        let Some(code) = self.editor.doc().block(&block) else { return };
+        platform.clipboard_write(Clip { text: code.plain_text(), ..Clip::default() });
+        self.code_copy.copied(block, platform.now_ms());
+    }
+
+    /// Whether the first line a code block shows runs as far as the copy button at `button`, in the layout.
+    fn reaches(&self, block: &BlockId, button: Rect) -> bool {
+        let end = self.layout.line_edge(&Pos::new(block.clone(), 0), true);
+        let end = end.and_then(|end| self.layout.caret(&end));
+        end.is_some_and(|end| end.x + code_copy::CLEAR > button.x)
+    }
+
+    /// The reference to a figure at a point of the page area, while nothing hangs over the page.
+    fn reference(&self, at: Point) -> Option<Reference> {
+        if self.hung() {
             return None;
         }
         let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
@@ -1006,12 +1045,15 @@ impl EditorApp {
     /// Works out again which reference the pointer rests on, after it or the page under it has moved.
     /// Returns whether what shows changed with it.
     fn repoint(&mut self) -> bool {
-        let found = self.references.rest().and_then(|at| self.reference(at));
+        let code = self.references.rest().and_then(|at| self.code_at(at));
+        let copy = self.code_copy.point(code);
+        // The button covers what is under it, a reference too.
+        let found = self.references.rest().filter(|_| !self.code_copy.pointed()).and_then(|at| self.reference(at));
         let found = found.map(|reference| {
             let in_view = self.in_view(&reference.target);
             (reference, in_view)
         });
-        self.references.point(found)
+        self.references.point(found) || copy
     }
 
     /// Forgets where the pointer rests until it next moves, as when the person goes on writing.
@@ -1044,6 +1086,13 @@ impl EditorApp {
             Pointer::Down { at, mods, clicks } => {
                 self.picked = None;
                 self.maths.typed(false);
+                // A press on a copy button is the button's, and leaves the caret where it is.
+                let button = self.copy_button(at);
+                self.code_copy.press(button);
+                if self.code_copy.held() {
+                    self.dragging = false;
+                    return self.references.press(None);
+                }
                 // A press that stays on a reference follows it. Any other press is the caret's alone.
                 let pressed = self.reference(at).filter(|_| clicks == 1 && !mods.shift);
                 self.references.press(pressed.map(|reference| (reference, at)));
@@ -1085,6 +1134,12 @@ impl EditorApp {
                 self.reveal();
             }
             Pointer::Drag { .. } => {}
+            Pointer::Up { at } if self.code_copy.held() => {
+                let on = self.copy_button(at);
+                if let Some(block) = self.code_copy.release(on.as_ref()) {
+                    self.copy_code(block, platform);
+                }
+            }
             Pointer::Up { at } => {
                 self.dragging = false;
                 // The markers at the caret show once the button is up: text that made room for them
@@ -1277,6 +1332,13 @@ impl EditorApp {
         if let Some(bar) = self.drop {
             list.items.push(Item::Fill { rect: bar, color: resolve(self.accent.base, self.scheme, 1.0), radius: 2.0 });
         }
+        // Each code block has its copy button in its corner, over its text.
+        for (block, code) in self.layout.code_boxes(viewport) {
+            let button = code_copy::button(code);
+            let behind = self.reaches(&block, button).then_some([self.palette.page, self.palette.code]);
+            self.code_copy.paint(&block, button, behind, self.scheme, &mut list);
+        }
+
         // A figure that is selected has a ring round its picture, and a selected picture is where the caret is.
         let ring = resolve(accent().base, self.scheme, 1.0);
         let pictures = self.editor.figures().into_iter().filter_map(|figure| self.layout.figure(&figure));
@@ -1355,8 +1417,9 @@ impl EditorApp {
             element =
                 element.popover(self.maths.sheet(source, selection, rect.width, self.wide(), self.scheme).at(spot));
         }
-        // A press on a reference follows it, which the pointer's shape says.
-        if self.references.pointed().is_some() { element.cursor(Cursor::Pointer) } else { element }
+        // A press on a reference follows it and one on a copy button copies, which the pointer's shape says.
+        let pressable = self.references.pointed().is_some() || self.code_copy.pointed();
+        if pressable { element.cursor(Cursor::Pointer) } else { element }
     }
 
     /// Draws the figure of the reference under the pointer small beside it, when it is out of view. `origin`
@@ -2266,6 +2329,7 @@ impl App for EditorApp {
             Some(describe::Request::Replace(text)) => {
                 self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(text), platform));
             }
+            Some(describe::Request::Copy(block)) => self.copy_code(block, platform),
             Some(describe::Request::Tick(block)) => {
                 // The editor ticks the task the caret is in, and the caret is not the reader's to lose.
                 let held = self.editor.selection().cloned();
@@ -2347,7 +2411,8 @@ impl App for EditorApp {
             (progress < 1.0).then_some(now_ms + FRAME_MS)
         });
         let light = self.references.animate(now_ms);
-        [note, slide, fade, light].into_iter().flatten().min()
+        let copied = self.code_copy.animate(now_ms);
+        [note, slide, fade, light, copied].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {

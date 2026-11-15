@@ -688,15 +688,20 @@ const PICTURES: u64 = 1 << 31;
 /// The cells of a row are named from the row, each with room for what is in its text.
 const CELLS: u32 = 16;
 
-/// What is drawn behind a leaf, or in the place of its text: the box of code or of a note, a divider, or
-/// the line under a row of a table, which is heavier under the header.
-pub(crate) fn backing(leaf: &Leaf, palette: &Palette) -> Option<Item> {
-    let boxed = Rect::new(
+/// The box around a leaf's text, for a leaf that has one.
+pub(crate) fn boxed(leaf: &Leaf) -> Rect {
+    Rect::new(
         leaf.x - leaf.pad,
         leaf.y - theme::BOX_PAD_Y,
         leaf.width + 2.0 * leaf.pad,
         leaf.height + 2.0 * theme::BOX_PAD_Y,
-    );
+    )
+}
+
+/// What is drawn behind a leaf, or in the place of its text: the box of code or of a note, a divider, or
+/// the line under a row of a table, which is heavier under the header.
+pub(crate) fn backing(leaf: &Leaf, palette: &Palette) -> Option<Item> {
+    let boxed = boxed(leaf);
     let line = |y: f32, color| Item::Fill { rect: Rect::new(leaf.x, y, leaf.width, theme::RULE), color, radius: 0.0 };
     match leaf.what {
         What::Rule => Some(line(leaf.y, palette.line)),

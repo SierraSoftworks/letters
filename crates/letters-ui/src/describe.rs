@@ -1,8 +1,8 @@
 //! The document as accessibility nodes under the page, and assistive technology's requests as edits.
 //!
 //! Each block is a node of its role, and a text block holds one text run whose characters are Unicode scalar
-//! values. List items that follow one another stand under a list, a task's tick is a checkbox and a figure's
-//! picture an image named by its alt text. The page's own node carries the selection.
+//! values. List items that follow one another stand under a list, a task's tick is a checkbox, a figure's
+//! picture an image named by its alt text and a code block's copy button a button. The page's own node carries the selection.
 //!
 //! A long document is not told again for every key: [`Told`] remembers how each block read, and a block that
 //! still reads the same is left out when only the changes are asked for.
@@ -19,6 +19,7 @@ use letters_render::Rect;
 const LIST: u8 = 1;
 const TICK: u8 = 2;
 const PICTURE: u8 = 3;
+const COPY: u8 = 4;
 
 /// FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
 fn hashed(bytes: impl Iterator<Item = u8>) -> u64 {
@@ -34,7 +35,7 @@ fn run_node(id: &BlockId) -> NodeId {
     NodeId(block_node(id).0 | 1)
 }
 
-/// The node of a part of a block: the list it begins, its tick or its picture.
+/// The node of a part of a block: the list it begins, its tick, its picture or its copy button.
 fn part_node(id: &BlockId, part: u8) -> NodeId {
     // No id holds a byte of 0xff, so no block's own node is this one.
     NodeId(hashed(id.as_str().bytes().chain([0xff, part])) & !1)
@@ -207,6 +208,13 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
                 part(TICK, tick, &mut children);
             }
         }
+        BlockKind::Code { .. } => {
+            // The button in the corner of the box, which a click presses.
+            let mut copy = Node::new(Role::Button);
+            copy.set_label(crate::code_copy::LABEL);
+            copy.add_action(Action::Click);
+            part(COPY, copy, &mut children);
+        }
         BlockKind::Figure { alt, .. } => {
             // The picture comes before its caption, named by what it shows.
             let mut picture = Node::new(Role::Image);
@@ -255,6 +263,8 @@ pub(crate) enum Request {
     Replace(String),
     /// Ticks or unticks a task.
     Tick(BlockId),
+    /// Copies a code block.
+    Copy(BlockId),
 }
 
 pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request> {
@@ -270,8 +280,9 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
         }
         (Action::ReplaceSelectedText, Some(ActionData::Value(text))) => Some(Request::Replace(text.to_string())),
         (Action::Click, _) => {
-            let ticked = doc.walk().find(|block| part_node(&block.id, TICK) == request.target_node)?;
-            Some(Request::Tick(ticked.id.clone()))
+            let part = |part| doc.walk().find(|block| part_node(&block.id, part) == request.target_node);
+            let ticked = part(TICK).map(|block| Request::Tick(block.id.clone()));
+            ticked.or_else(|| part(COPY).map(|block| Request::Copy(block.id.clone())))
         }
         _ => None,
     }

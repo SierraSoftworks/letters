@@ -81,6 +81,35 @@ test("copy and paste go through the browser's clipboard events", async ({ page }
   await expect.poll(() => texts(page)).toContain("twice twice ");
 });
 
+test("the copy button of a code block puts its code on the clipboard", async ({ page, context, browserName }) => {
+  // A headless Chromium refuses the write that a press allows in a window. Firefox knows no such permission.
+  if (browserName === "chromium") await context.grantPermissions(["clipboard-write"]);
+  await page.keyboard.type("```");
+  await page.keyboard.press("Enter");
+  await page.keyboard.type("let x = 1;");
+  // The button is in the corner of the block, beside its first line, where the pointer says it can be
+  // pressed. The hidden input is where the caret is.
+  const canvas = page.locator("canvas");
+  const { width } = page.viewportSize();
+  const line = await page.locator("textarea").boundingBox();
+  const y = line.y + line.height / 2;
+  const found = async () => {
+    for (let x = width - 8; x > width / 2; x -= 10) {
+      await page.mouse.move(x, y);
+      await page.evaluate(() => new Promise(requestAnimationFrame));
+      if ((await canvas.evaluate((canvas) => canvas.style.cursor)) === "pointer") return [x, y];
+    }
+  };
+  const at = await found();
+  expect(at, "a copy button under the pointer").toBeTruthy();
+  await page.mouse.click(...at);
+  // What was copied is pasted under the block.
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("ControlOrMeta+V");
+  await expect.poll(async () => (await texts(page)).slice(-2)).toEqual(["let x = 1;", "let x = 1;"]);
+});
+
 test("a composition shows as it is composed and commits its text", async ({ page }) => {
   await compose(page, "compositionstart", "");
   await compose(page, "input", "に");

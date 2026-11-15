@@ -8,6 +8,7 @@
 
 mod access;
 mod chrome;
+mod code_copy;
 pub mod color;
 mod copying;
 mod describe;

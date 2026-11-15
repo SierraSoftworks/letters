@@ -597,3 +597,33 @@ fn tokens_follow_the_text_through_edits() {
         assert_eq!(inked(&painted(&layout, everything()), keyword), after, "{name}, then a new width");
     }
 }
+
+#[test]
+fn the_code_blocks_in_view_are_told_with_the_boxes_drawn_behind_them() {
+    let filler = (0..80).map(|n| paragraph(&format!("p{n}"), PROSE));
+    let mut blocks = vec![paragraph("a", "Rates"), Block::text("first", BlockKind::Code { language: None }, "let x;")];
+    blocks.extend(filler);
+    blocks.push(Block::text("last", BlockKind::Code { language: Some("rust".into()) }, CODE));
+    blocks.push(Block::new("f", BlockKind::Formula));
+    let layout = laid(&doc(blocks));
+
+    let all = layout.code_boxes(everything());
+    let ids: Vec<&str> = all.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["first", "last"], "code alone, in order");
+    let fills: Vec<Rect> = painted(&layout, everything())
+        .iter()
+        .filter_map(|item| match item {
+            Item::Fill { rect, color, .. } if *color == Palette::LIGHT.code => Some(*rect),
+            _ => None,
+        })
+        .collect();
+    for (id, rect) in &all {
+        assert!(fills.contains(rect), "{id}: {rect:?} is a box that is painted: {fills:?}");
+        let text = layout.caret(&Pos::new(id.as_str(), 0)).expect("a caret");
+        assert!(rect.contains(Point { x: text.x, y: text.y + 1.0 }), "{id}: the box holds its text");
+    }
+
+    let top = Rect::new(0.0, 0.0, WIDTH, 200.0);
+    let shown: Vec<_> = layout.code_boxes(top).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(shown.iter().map(|id| id.as_str()).collect::<Vec<_>>(), ["first"], "only what the view shows");
+}
