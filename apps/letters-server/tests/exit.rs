@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::Scratch;
-use letters_api::{Entry, Listing, NewDocument, Person, paths};
+use letters_api::{Entry, Listing, NewDocument, Person, Tag, paths};
 use letters_format::{Archive, Files, Save, Saved, Stamp, WorkingCopy};
 use letters_model::{Block, BlockKind, Document, Model, NoteKind, Notes, Op, Pos, ReplicaId};
 use letters_server::config::Config;
@@ -573,6 +573,62 @@ fn two_desktops_and_a_writer_on_the_share_lose_nothing() {
     }
     assert!(ada.held >= last.0 && ben.held >= last.1, "the server said it holds all that was written");
     assert_eq!(scratch.names("family"), [FILE], "nothing was set aside or copied");
+}
+
+/// The design's row "A sync tool creates a conflict copy": it is known by its name and the document it
+/// holds, merged when an editor asks and not before, and then waits in the trash.
+#[test]
+fn a_sync_tools_conflict_copy_is_merged_when_an_editor_asks() {
+    let (scratch, served, id) = planned("conflict-copy");
+    let (family, file) = (scratch.0.join("family"), scratch.0.join("family").join(FILE));
+    let (mut ada, mut ben) = desktops(&served, &id);
+    ada.begin("First. ");
+    until("the file holds what both machines start from", &mut [&mut ada, &mut ben], |_| {
+        file_says(&file).contains("First.")
+    });
+
+    // A sync tool carries the folder to another machine. Someone writes there with no network while Ben
+    // writes here, so the tool keeps both files, the other machine's under a name of its own.
+    let away = scratch.0.join("away");
+    std::fs::create_dir_all(&away).unwrap();
+    std::fs::copy(&file, away.join(FILE)).unwrap();
+    let mut cy = Outsider::open(&away);
+    let first = cy.copy.model().doc().blocks[0].id.clone();
+    cy.write(first.as_str(), "Written away. ");
+    assert!(matches!(cy.save(), Saved::Written));
+    ben.begin("Written here. ");
+    let copy = "Plan.sync-conflict-20261115-101500-ABCDEFG.let";
+    std::fs::rename(away.join(FILE), family.join(copy)).unwrap();
+
+    // The copy is shown as one. A save goes by, and nothing of it is merged.
+    let (status, listed) = served.ask(&served.tokens["ada"], &paths::entries("family", ""), None);
+    assert_eq!(status, 200, "{listed}");
+    let listed: Listing = serde_json::from_str(&listed).expect("a listing");
+    let copies = |entry: &&Entry| entry.tags.iter().any(|tag| matches!(tag, Tag::ConflictCopy { .. }));
+    let shown: Vec<&str> = listed.entries.iter().filter(copies).map(|entry| entry.name.as_str()).collect();
+    assert!(matches!(shown[..], [name] if name != "Plan"), "one copy is marked, and not the document: {shown:?}");
+    ada.begin("And more. ");
+    until("the file holds what was written since", &mut [&mut ada, &mut ben], |_| {
+        file_says(&file).contains("And more.") && file_says(&file).contains("Written here.")
+    });
+    assert!(!file_says(&file).contains("Written away.") && !ada.said().contains("Written away."));
+
+    // An editor asks: everyone with the document open has both, and so has the file.
+    let merge = || {
+        let (status, took) = served.ask(&served.tokens["ada"], &paths::merge_conflicts(&id), Some("null".into()));
+        assert_eq!(status, 200, "{took}");
+        serde_json::from_str::<Vec<String>>(&took).expect("the names of the copies it took")
+    };
+    assert_eq!(merge().len(), 1);
+    until("everyone holds what was written on both machines", &mut [&mut ada, &mut ben], |desks| {
+        agree(desks) && desks[0].said().contains("Written away.") && file_says(&file) == desks[0].said()
+    });
+    for word in ["First.", "Written away.", "Written here.", "And more."] {
+        assert!(ben.said().contains(word), "{word} is lost: {}", ben.said());
+    }
+    assert_eq!(scratch.names("family"), [".letters-trash", FILE], "the copy is out of the folder");
+    assert_eq!(scratch.names("family/.letters-trash"), [copy], "and can be put back");
+    assert!(merge().is_empty(), "with no copy left there is nothing to merge");
 }
 
 /// The design's row "Crash or power loss mid-save": the journal replays what was not saved.
