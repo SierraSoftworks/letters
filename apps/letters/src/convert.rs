@@ -17,15 +17,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use letters_convert::{
     Linked, Loss, PdfInfo, PdfSources, Target, losses_with, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with,
 };
-use letters_format::{Archive, OPLOG};
+use letters_format::{ASSETS, Archive, HISTORY, NOTES, OPLOG, Package};
 use letters_layout::{Fonts, Uncovered};
-use letters_model::{Block, Body, Model, ReplicaId, Style};
+use letters_model::{Block, BlockKind, Body, Model, ReplicaId, Style};
 use serde_json::json;
 
 use crate::cli::{Export, Format, Import, Output};
 use crate::fallback;
 use crate::files;
 use crate::import::{Choices, Plan, normal};
+use crate::platform;
 use crate::trust::{self, Trusted};
 
 /// The extensions of the Markdown files an import looks for in a folder.
@@ -56,6 +57,8 @@ fn try_export(export: &Export) -> Result<(), String> {
     let output = match &export.output {
         Some(Output::Stdout) => return io::stdout().write_all(&exported.bytes).map_err(|error| error.to_string()),
         Some(Output::File(path)) => path.clone(),
+        // A clean copy is a document too, so it cannot take the name of the one it is made from.
+        None if export.to == Format::Clean => export.file.with_file_name(format!("{title} clean.{}", files::EXTENSION)),
         None => export.file.with_extension(export.to.extension()),
     };
     exported.write(&output, export.force).map_err(|(path, error)| match error.kind() {
@@ -77,6 +80,8 @@ pub struct Exported {
     pub pictures: Vec<(String, Vec<u8>)>,
     /// What the format could not carry over, a line for each kind of loss.
     pub simplified: Vec<String>,
+    /// The id of the document this is, where it is one: a clean copy has an id of its own.
+    pub id: Option<String>,
 }
 
 /// Writes the document in `file`, the bytes of a `.let` file, in another format. `title` is what the
@@ -101,10 +106,20 @@ pub fn exported_with(file: Vec<u8>, title: &str, to: Format, linked: Linked) -> 
         Format::Html => Target::Html,
         Format::Docx => Target::Docx,
         Format::Pdf => Target::Pdf,
+        Format::Clean => Target::Clean,
     };
     // The addresses of the linked pictures a PDF was handed.
     let mut shown = BTreeSet::new();
+    let mut id = None;
     let bytes = match to {
+        Format::Clean => {
+            let mut package = archive.package().map_err(failed)?;
+            clean(&mut package);
+            id = Some(package.id.clone());
+            let mut bytes = Cursor::new(Vec::new());
+            letters_format::write(&mut bytes, &package).map_err(failed)?;
+            bytes.into_inner()
+        }
         Format::Markdown => to_markdown(&document).into_bytes(),
         // An image that cannot be read is treated as missing, and its description stands in for it.
         Format::Html => to_html(&document, &style, title, &mut |name| archive.read(name).ok().flatten()).into_bytes(),
@@ -140,7 +155,34 @@ pub fn exported_with(file: Vec<u8>, title: &str, to: Format, linked: Linked) -> 
     let pictures = entries.filter_map(|entry| Some((archive.read(&entry).ok().flatten()?, entry)));
     let pictures = pictures.map(|(bytes, entry)| (entry, bytes)).collect();
     let lost = losses_with(&document, &notes, target, &|address| shown.contains(address));
-    Ok(Exported { bytes, pictures, simplified: lost.iter().map(Loss::to_string).collect() })
+    Ok(Exported { bytes, pictures, simplified: lost.iter().map(Loss::to_string).collect(), id })
+}
+
+/// Makes a package a document of its own that holds nothing of how it came to be.
+///
+/// - It has an id and a date of its own: with the original's, the two would pass for one document that
+///   was written in two places, and a merge would bring the history back.
+/// - The history goes, and with it every earlier version and who wrote what.
+/// - The notes go: comments, import notes and conflicts. The document stands as the page shows it.
+/// - A picture stays only where a figure shows it. The file may hold others that the history still named.
+/// - The style and the writer's own words for the spelling check stay, since they are the document's.
+fn clean(package: &mut Package) {
+    (package.id, package.created) = (platform::document_id(), platform::now_rfc3339());
+    let shown: BTreeSet<&str> = package
+        .document
+        .walk()
+        .filter_map(|block| match &block.kind {
+            BlockKind::Figure { asset, .. } => asset.as_deref(),
+            _ => None,
+        })
+        .collect();
+    let kept = |name: &str| match name {
+        NOTES => false,
+        name if name.starts_with(HISTORY) => false,
+        name if name.starts_with(ASSETS) => shown.contains(name),
+        _ => true,
+    };
+    package.entries.retain(|name, _| kept(name));
 }
 
 impl Exported {

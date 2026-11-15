@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use letters_model::{Block, BlockKind, Document, Mark, NoteKind, Notes};
+use letters_model::{Block, BlockKind, Document, Mark, Note, NoteKind, Notes};
 
 /// A format a document is exported to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11,6 +11,8 @@ pub enum Target {
     Html,
     Docx,
     Pdf,
+    /// A document of its own with nothing of how it came to be: no history and no notes.
+    Clean,
 }
 
 /// One way an export gives a document less than it holds.
@@ -39,6 +41,11 @@ pub enum LossKind {
     Languages,
     /// Code blocks whose language the format does not keep.
     CodeLanguages,
+    /// The history: every earlier version, and who wrote what. A clean copy is the document as it stands.
+    /// Counted once.
+    History,
+    /// Conflicts nobody has settled, which go with the notes. The version the page shows is the one kept.
+    Conflicts,
 }
 
 /// One kind of loss, and how many places in the document it happens at.
@@ -52,7 +59,7 @@ pub struct Loss {
 }
 
 /// What an export of `doc` to a format will simplify, a [`Loss`] for each kind there is, without writing
-/// anything. `notes` are the document's, for the comments a format leaves behind.
+/// anything. `notes` are the document's, for the comments and conflicts a format leaves behind.
 ///
 /// The list holds what a reader of the export would miss. It leaves out what only shows when the export
 /// is read back, which each writer documents: the sizes of pictures in Markdown, a justified column, and
@@ -88,11 +95,18 @@ pub fn losses_with(doc: &Document, notes: &Notes, to: Target, loaded: &dyn Fn(&s
     let coded =
         |block: &Block| matches!(&block.kind, BlockKind::Code { language: Some(language) } if !language.is_empty());
 
+    let open_conflict = |note: &Note| matches!(note.kind, NoteKind::Conflict { .. }) && !note.resolved;
+
     let counted = [
-        (UnknownBlocks, true, blocks(&|block| matches!(block.kind, BlockKind::Unknown { .. }))),
-        (UnknownMarks, true, runs().filter(|run| run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)))).count()),
+        // A clean copy holds the document as it is, so it loses only what is kept beside the document.
+        (UnknownBlocks, to != Clean, blocks(&|block| matches!(block.kind, BlockKind::Unknown { .. }))),
+        (
+            UnknownMarks,
+            to != Clean,
+            runs().filter(|run| run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)))).count(),
+        ),
         (Comments, to != Docx, notes.notes.iter().filter(|note| note.kind == NoteKind::Comment).count()),
-        (LinkedPictures, to != Markdown, blocks(&linked)),
+        (LinkedPictures, matches!(to, Html | Docx | Pdf), blocks(&linked)),
         (NestedBlocks, to == Docx, nested()),
         (CalloutLooks, matches!(to, Markdown | Docx), blocks(&looks)),
         (Galleries, to == Markdown, blocks(&|block| matches!(block.kind, BlockKind::Gallery { .. }))),
@@ -103,12 +117,15 @@ pub fn losses_with(doc: &Document, notes: &Notes, to: Target, loaded: &dyn Fn(&s
             blocks(&|block| block.lang.is_some()) + runs().filter(|run| run.lang.is_some()).count(),
         ),
         (CodeLanguages, to == Docx, blocks(&coded)),
+        (History, to == Clean, 1),
+        (Conflicts, to == Clean, notes.notes.iter().filter(|note| open_conflict(note)).count()),
     ];
     let lost = counted.into_iter().filter(|(_, applies, count)| *applies && *count > 0);
     lost.map(|(kind, _, count)| Loss { kind, count, to }).collect()
 }
 
-/// The loss as a line for a person, such as "3 galleries become pictures one after another".
+/// The loss as a line for a person, such as "3 galleries become pictures one after another". It says how
+/// many, but for the history, of which a document has one.
 impl fmt::Display for Loss {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let n = self.count;
@@ -152,6 +169,8 @@ impl fmt::Display for Loss {
             LossKind::CodeLanguages => {
                 write!(f, "{} language", count("code block loses its", "code blocks lose their"))
             }
+            LossKind::History => write!(f, "the history is left out"),
+            LossKind::Conflicts => write!(f, "{} dropped", count("open conflict is", "open conflicts are")),
         }
     }
 }

@@ -581,6 +581,67 @@ fn a_pdf_names_those_who_wrote_the_document() {
     assert_eq!(author, "Ada Lovelace");
 }
 
+#[test]
+fn a_clean_copy_is_the_document_without_its_history_and_notes() {
+    let folder = Folder::new("clean");
+    let shown = BlockKind::Figure {
+        asset: Some("assets/shown.png".into()),
+        src: None,
+        alt: "A chart".into(),
+        width: 40.0,
+        height: 20.0,
+        numbered: false,
+    };
+    let blocks = vec![Block::text("p", BlockKind::Paragraph, "Rates"), Block::new("f", shown)];
+    let mut model = Model::new(Document { blocks, ..Document::default() }, ReplicaId::new("a device"));
+    model.set_author("Ada Lovelace");
+    model.apply([Op::InsertText { at: Pos::new("p", 5), text: " change in January.".into() }]).unwrap();
+    let mut package = Package {
+        id: "8f14e45f-ceea-467f-a0e6-5b1d3c2a9f02".into(),
+        created: "2026-11-14T20:00:00Z".into(),
+        document: model.doc().clone(),
+        entries: Default::default(),
+    };
+    package.entries.insert(OPLOG.into(), model.save());
+    // A picture the page shows, and one only an earlier version did.
+    package.entries.insert("assets/shown.png".into(), PICTURE.to_vec());
+    package.entries.insert("assets/removed.png".into(), PICTURE.to_vec());
+    package.set_style(&Style::default());
+    let mut out = Cursor::new(Vec::new());
+    letters_format::write(&mut out, &package).unwrap();
+    let original = folder.write("Rates.let", out.into_inner());
+    comment(&original);
+    let before = fs::read(&original).unwrap();
+
+    let run = folder.letters(&["export", "Rates.let", "--to", "clean"]);
+    assert!(run.ok, "{}", run.stderr);
+    assert!(
+        run.stderr.contains("history") && run.stderr.contains("1 comment"),
+        "it says what it drops: {}",
+        run.stderr
+    );
+    assert_eq!(fs::read(&original).unwrap(), before, "the original is left as it was");
+
+    let mut copy = open(&folder.path("Rates clean.let"));
+    let clean = copy.package().unwrap();
+    assert_eq!(clean.document, package.document, "the document is the same");
+    assert_ne!(clean.id, package.id, "under an id of its own");
+    let names: Vec<&str> = clean.entries.keys().map(String::as_str).collect();
+    assert!(!names.iter().any(|name| name.starts_with(letters_format::HISTORY)), "no history: {names:?}");
+    assert!(clean.notes().unwrap().notes.is_empty(), "no notes");
+    assert_eq!(pictures_held(&names), ["assets/shown.png"], "only the pictures the page shows");
+    assert!(names.contains(&letters_format::STYLE), "and its style");
+
+    // The copy opens and exports like any document.
+    let again = folder.letters(&["export", "Rates clean.let", "--to", "md", "--output", "-"]);
+    assert!(again.ok && again.stdout.contains("Rates change in January."), "{}{}", again.stdout, again.stderr);
+}
+
+/// The entries that are pictures.
+fn pictures_held<'a>(names: &[&'a str]) -> Vec<&'a str> {
+    names.iter().copied().filter(|name| name.starts_with(letters_format::ASSETS)).collect()
+}
+
 /// A picture of 40 by 20 pixels.
 const PICTURE: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x28\x00\x00\x00\x14\x01\x00\x00\x00\x00\xd7\x3d\x42\x16\x00\x00\x00\x0c\x49\x44\x41\x54\x78\xda\x63\x60\x18\x18\x00\x00\x00\x78\x00\x01\x35\x33\x6e\xa4\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
 

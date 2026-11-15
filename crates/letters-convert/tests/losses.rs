@@ -1,8 +1,9 @@
 //! What an export says it will simplify, before it writes.
 
 use letters_convert::{Loss, LossKind, Target, losses, losses_with};
-use letters_model::{Anchor, Block, BlockKind, Body, Document, Mark, Note, NoteKind, Notes, Run, Tone};
+use letters_model::{Anchor, Block, BlockKind, Body, Document, Mark, Note, NoteKind, Notes, Run, Tone, Version};
 
+/// The formats a document is written in for another program to read.
 const TARGETS: [Target; 4] = [Target::Markdown, Target::Html, Target::Docx, Target::Pdf];
 
 fn figure(id: &str, asset: Option<&str>, src: Option<&str>) -> Block {
@@ -28,7 +29,8 @@ fn note(id: &str, kind: NoteKind) -> Note {
     }
 }
 
-/// A document with everything some format cannot carry, and its notes: two comments and an import note.
+/// A document with everything some format cannot carry, and its notes: two comments, an import note, and
+/// two conflicts of which one is settled.
 fn everything() -> (Document, Notes) {
     let mut odd = Block::text("odd", BlockKind::Paragraph, "");
     odd.body = Body::Text(vec![Run::marked("Sparkling", [Mark::Other("sparkle".into())])]);
@@ -63,7 +65,21 @@ fn everything() -> (Document, Notes) {
         holding("quote", BlockKind::Quote, nested),
         Block::text("bare", BlockKind::Code { language: None }, "plain text"),
     ];
-    let notes = vec![note("n1", NoteKind::Comment), note("n2", NoteKind::Comment), note("n3", NoteKind::Import)];
+    let version = || Version {
+        author: "Ada".into(),
+        edited: "2026-11-14T20:00:00Z".into(),
+        block: None,
+        extra: Default::default(),
+    };
+    let conflict = |id: &str| note(id, NoteKind::Conflict { versions: Box::new([version(), version()]) });
+    let settled = Note { resolved: true, ..conflict("n5") };
+    let notes = vec![
+        note("n1", NoteKind::Comment),
+        note("n2", NoteKind::Comment),
+        note("n3", NoteKind::Import),
+        conflict("n4"),
+        settled,
+    ];
     (Document { blocks, ..Document::default() }, Notes { notes, ..Notes::default() })
 }
 
@@ -97,6 +113,8 @@ fn each_format_lists_what_it_cannot_carry() {
             ],
         ),
         (Target::Pdf, vec![(UnknownBlocks, 1), (UnknownMarks, 1), (Comments, 2), (LinkedPictures, 1)]),
+        // A clean copy is the document itself, without what is kept beside it.
+        (Target::Clean, vec![(Comments, 2), (History, 1), (Conflicts, 1)]),
     ];
     for (to, expected) in cases {
         let mut found: Vec<(LossKind, usize)> =
@@ -124,10 +142,11 @@ fn a_document_every_format_carries_loses_nothing() {
 #[test]
 fn a_loss_reads_as_a_line_that_says_how_many() {
     let (doc, notes) = everything();
-    for to in TARGETS {
+    for to in TARGETS.into_iter().chain([Target::Clean]) {
         for loss in losses(&doc, &notes, to) {
             let line = loss.to_string();
-            assert!(line.contains(&loss.count.to_string()), "{to:?} {:?}: {line}", loss.kind);
+            let counted = loss.kind != LossKind::History;
+            assert!(!counted || line.contains(&loss.count.to_string()), "{to:?} {:?}: {line}", loss.kind);
             assert!(!line.ends_with('.') && !line.contains('\n'), "one line, for a list: {line}");
         }
     }
