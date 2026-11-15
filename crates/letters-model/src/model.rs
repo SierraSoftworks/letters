@@ -822,8 +822,9 @@ impl Model {
     ///
     /// Each comes with the block as either side left it, and who last changed it there and when. A block
     /// that one side took away while the other changed its text is among them. Changes to different words
-    /// of a block are not, nor is formatting, nor text that both put in at one place between two words:
-    /// those merge. Nor is a block that both sides left reading alike, where there is nothing to choose.
+    /// of a block are not, nor is formatting: those merge. So does text put in beside a word, which
+    /// changes the word only when it reads on from it or into it, with no space or mark between. Nor is a
+    /// block that both sides left reading alike, where there is nothing to choose.
     /// Fails with [`HistoryError::UnknownRevision`] for a revision the history lacks.
     ///
     /// The model reads its history at other revisions meanwhile, and so is taken whole. The document it
@@ -853,8 +854,9 @@ impl Model {
     ///
     /// Every device that merges the same two revisions writes the same change, so two that settle them
     /// apart settle them once. A device that merged another revision, having written on, writes a change
-    /// of its own: when the two meet, settling again leaves the later of them standing. Settling is no
-    /// undo step, and the undo steps already there still hold.
+    /// of its own: when the two meet, settling again leaves the later of them standing, and returns no
+    /// conflict for it, as each device returned its own. Settling is no undo step, and the undo steps
+    /// already there still hold.
     pub fn settle(&mut self, ours: &Revision, theirs: &Revision) -> Result<(Change, Vec<Conflict>), HistoryError> {
         let history = self.history();
         let loro = &history.loro;

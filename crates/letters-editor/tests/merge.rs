@@ -71,13 +71,13 @@ fn edits_carry_their_writer_and_the_time_the_platform_tells() {
         writer.editor.set_author(name);
         writer.platform.clock = clock;
     }
-    ana.type_text(" two");
-    ben.play(&[K("Mod+Home"), T("zero ")]);
+    ana.type_text("s");
+    ben.play(&[K("Mod+Home"), T("so")]);
     ben.platform.clock = Some(MORNING + 3600);
-    ben.type_text("and ");
+    ben.type_text("me");
     assert_eq!(ben.editor.model().authors(), ["Ben".to_owned()].into(), "a writer is named from the first edit");
 
-    // Both changed the one paragraph, which a reader of the two histories is told with who and when.
+    // Both changed the one word, which a reader of the two histories is told with who and when.
     let (hers, his) = (ana.editor.model().revision(), ben.editor.model().revision());
     let mut reader = Model::load(&ana.editor.model().save(), ReplicaId::from(3)).unwrap();
     reader.merge(&ben.editor.model().save()).unwrap();

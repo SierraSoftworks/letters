@@ -38,6 +38,9 @@ fn writers() -> (Model, Model) {
 enum Edit {
     /// Puts the second text where the first stands.
     Swap(&'static str, &'static str),
+    /// Puts the second text right before the first, or right after it.
+    Before(&'static str, &'static str),
+    After(&'static str, &'static str),
     Add(&'static str),
     Bold(&'static str),
     Kind(BlockKind),
@@ -52,6 +55,8 @@ fn ops(model: &Model, block: &str, edit: Edit) -> Vec<Op> {
         Edit::Swap(old, new) => {
             vec![Op::DeleteText { block: id(block), range: range(old) }, typed(block, range(old).start, new)]
         }
+        Edit::Before(part, new) => vec![typed(block, range(part).start, new)],
+        Edit::After(part, new) => vec![typed(block, range(part).end, new)],
         Edit::Add(new) => vec![typed(block, text.len(), new)],
         Edit::Bold(part) => vec![Op::SetMark { block: id(block), range: range(part), mark: Mark::Bold, on: true }],
         Edit::Kind(kind) => vec![Op::SetKind { block: id(block), kind }],
@@ -131,6 +136,18 @@ fn only_changes_to_the_same_words_conflict() {
         ("a new kind and a word", ("p1", Kind(heading)), ("p1", Swap("quick", "slow")), &[]),
         ("formatting and a word", ("p1", Bold("quick")), ("p1", Swap("quick", "fast")), &[]),
         ("a sentence each at the end", ("p1", Add(" It ran.")), ("p1", Add(" It hid.")), &[]),
+        ("letters before a word one changes", ("p1", Before("quick", "un")), ("p1", Swap("quick", "fast")), &["p1"]),
+        ("letters after a word one changes", ("p1", After("quick", "er")), ("p1", Swap("quick", "fast")), &["p1"]),
+        ("text inside a word one changes", ("p1", After("qui", " ")), ("p1", Swap("quick", "fast")), &["p1"]),
+        ("an ending for a word one changes", ("h", Add("wain")), ("h", Swap("Boats", "Ships")), &["h"]),
+        ("words before a word one changes", ("p1", Before("quick", "very ")), ("p1", Swap("quick", "fast")), &[]),
+        ("words after a word one changes", ("p1", After("quick", ", sly")), ("p1", Swap("quick", "fast")), &[]),
+        ("words before a word and after it", ("p1", Before("quick", "very ")), ("p1", After("quick", ", sly")), &[]),
+        ("text inside a word and after it", ("p1", After("qui", "-")), ("p1", After("quick", ", sly")), &[]),
+        ("a start and a new first word", ("p2", Before("It", "So. ")), ("p2", Swap("It", "This")), &[]),
+        ("a start each", ("p2", Before("It", "So. ")), ("p2", Before("It", "Well. ")), &[]),
+        ("a start and an end for one word", ("h", Before("Boats", "Oh. ")), ("h", Add("!")), &[]),
+        ("an end and a new last word", ("h", Add("!")), ("h", Swap("Boats", "Ships")), &[]),
         ("a split and the word before it", ("p1", Split("fox")), ("p1", Swap("fox", "foxes")), &[]),
     ];
     for (name, hers, his, expected) in cases {
@@ -346,6 +363,31 @@ fn a_settled_block_reads_as_the_writer_who_edited_last_left_it() {
     }
 }
 
+/// A name, what each writer does to one block unseen by the other, and what each typed.
+type Beside = (&'static str, (&'static str, Edit), (&'static str, Edit), [&'static str; 2]);
+
+#[test]
+fn text_beside_a_word_another_writer_changed_stays_on_the_page() {
+    use Edit::*;
+    let cases: Vec<Beside> = vec![
+        ("before the word", ("p1", Before("quick", "very ")), ("p1", Swap("quick", "fast")), ["very ", "fast"]),
+        ("after the word", ("p1", Swap("quick", "fast")), ("p1", After("quick", ", sly")), ["fast", ", sly"]),
+        ("either side of one word", ("h", Before("Boats", "Oh. ")), ("h", Add("!")), ["Oh. ", "!"]),
+        ("at the start of a block", ("p2", Before("It", "So. ")), ("p2", Swap("It", "This")), ["So. ", "This"]),
+        ("at the end of a block", ("h", Swap("Boats", "Ships")), ("h", Add("!")), ["Ships", "!"]),
+        ("at one place", ("p1", Add(" It ran.")), ("p1", Add(" It hid.")), [" It ran.", " It hid."]),
+    ];
+    for (name, hers, his, typed) in cases {
+        let block = hers.0;
+        let (mut ana, mut ben) = writers();
+        let found = settle(&mut ana, &mut ben, vec![hers], vec![his]);
+        assert_eq!(found, [vec![], vec![]], "{name}: neither changed the other's words");
+        let text = text(&ana, block).unwrap_or_default();
+        assert!(typed.iter().all(|typed| text.contains(typed)), "{name}: {text:?} lacks what one of them typed");
+        assert_eq!(ana.doc(), ben.doc(), "{name}");
+    }
+}
+
 #[test]
 fn a_device_that_went_on_writing_elsewhere_settles_to_the_same_text() {
     let (mut ana, mut ben) = writers();
@@ -388,11 +430,12 @@ fn a_block_two_devices_settled_apart_is_settled_again() {
     assert_eq!(meet(&mut ben, &hers, &later, &her).len(), 1);
     assert_eq!(text(&ben, "p1").as_deref(), Some("The quick red fox jumps over the idle dog."));
 
-    // Each put the cut words back by a change of its own. The later of the two settlings stands.
+    // Each put the cut words back by a change of its own. The later of the two settlings stands, and
+    // there is no conflict to tell of beyond the one each of them found.
     let (theirs, his) = (eve.revision(), ben.revision());
     let (held, kept) = (eve.save(), ben.save());
     let found = [meet(&mut eve, &kept, &theirs, &his), meet(&mut ben, &held, &his, &theirs)];
-    assert_eq!((blocks(&found[0]), blocks(&found[1])), (vec!["p1"], vec!["p1"]));
+    assert_eq!(found, [vec![], vec![]]);
     assert_eq!(texts(&eve), ["Boats", "The quick red fox jumps over the idle dog.", P2, ""]);
     assert_eq!(eve.doc(), ben.doc());
     assert_eq!(eve.compare(&ben.save()), Ok(Some(Ordering::Equal)));

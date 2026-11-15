@@ -275,6 +275,17 @@ pub(crate) fn settled(loro: &LoroDoc, block: &BlockId) {
     let _ = loro.get_map(SETTLED).insert(block.as_str(), loro.peer_id().cast_signed());
 }
 
+/// The replicas that settlings were written as, as the revision shown holds them. No person writes as one.
+pub(crate) fn settlers(loro: &LoroDoc) -> HashSet<u64> {
+    let mut settlers = HashSet::new();
+    loro.get_map(SETTLED).for_each(|_, held| {
+        if let ValueOrContainer::Value(LoroValue::I64(replica)) = held {
+            settlers.insert(replica.cast_unsigned());
+        }
+    });
+    settlers
+}
+
 fn retain(retain: usize) -> TextDelta {
     TextDelta::Retain { retain, attributes: None }
 }

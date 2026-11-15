@@ -351,6 +351,119 @@ fn unique_ids(doc: &Document) -> bool {
     doc.walk().all(|block| ids.insert(&block.id))
 }
 
+/// A sentence whose words are parted by spaces, with marks of every kind standing against them.
+const SENTENCE: &str = "One two, three (four) five. Six!";
+const WORDS: usize = 6;
+
+/// What a writer does to one word of [`SENTENCE`], by place in the word: its ends are places too.
+#[derive(Clone, Debug)]
+enum Touch {
+    Type {
+        at: usize,
+        text: String,
+    },
+    Cut {
+        at: usize,
+        len: usize,
+    },
+    /// Cuts, and types where the cut began.
+    Swap {
+        at: usize,
+        len: usize,
+        text: String,
+    },
+    /// Types at the start of the word or at its end, with a space or a mark between that and the word.
+    Beside {
+        end: bool,
+        text: String,
+    },
+}
+
+fn touch() -> impl Strategy<Value = Touch> {
+    prop_oneof![
+        (0..8usize, text()).prop_map(|(at, text)| Touch::Type { at, text }),
+        (0..8usize, 1..4usize).prop_map(|(at, len)| Touch::Cut { at, len }),
+        (0..8usize, 1..4usize, text()).prop_map(|(at, len, text)| Touch::Swap { at, len, text }),
+    ]
+}
+
+fn beside() -> impl Strategy<Value = Touch> {
+    let parting = || prop_oneof![Just(' '), Just('.'), Just(','), Just('!')];
+    (any::<bool>(), parting(), text(), parting())
+        .prop_map(|(end, before, text, after)| Touch::Beside { end, text: format!("{before}{text}{after}") })
+}
+
+/// The edit to the sentence in the paragraph `s` that a touch of its `word` is. With it, where the edit
+/// starts in the sentence, and where it types.
+fn touched(word: usize, touch: &Touch) -> (Vec<Op>, usize, Option<usize>) {
+    let start: usize = SENTENCE.split(' ').take(word).map(|word| word.len() + 1).sum();
+    let word = SENTENCE.split(' ').nth(word).unwrap_or_default();
+    let offset =
+        |at: usize| start + word.char_indices().map(|(at, _)| at).chain([word.len()]).nth(at).unwrap_or(word.len());
+    let typed = |at: usize, text: &str| Op::InsertText { at: Pos::new("s", at), text: text.to_owned() };
+    let cut = |at: usize, len: usize| {
+        let from = at.min(word.chars().count() - 1);
+        (Op::DeleteText { block: BlockId::new("s"), range: offset(from)..offset(from + len) }, offset(from))
+    };
+    match touch {
+        Touch::Type { at, text } => (vec![typed(offset(*at), text)], offset(*at), Some(offset(*at))),
+        Touch::Cut { at, len } => (vec![cut(*at, *len).0], cut(*at, *len).1, None),
+        Touch::Swap { at, len, text } => {
+            let (cut, from) = cut(*at, *len);
+            (vec![cut, typed(from, text)], from, Some(from))
+        }
+        Touch::Beside { end, text } => {
+            let at = if *end { start + word.len() } else { start };
+            (vec![typed(at, text)], at, Some(at))
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+    /// Settling only ever replaces text where two writers changed the same word. Text typed beside a word
+    /// is no change to the word, and neither is anything done to another word: all of it stays.
+    #[test]
+    fn what_one_writer_alone_touched_survives_a_settling(
+        (word, hers) in (0..WORDS, touch()),
+        (away, his) in prop_oneof![(0..WORDS, beside()), (1..WORDS, touch())],
+        her_clock_is_ahead in any::<bool>(),
+    ) {
+        let doc = Document { blocks: vec![Block::text("s", BlockKind::Paragraph, SENTENCE)], ..Document::default() };
+        let made = [touched(word, &hers), touched((word + away) % WORDS, &his)];
+        // One writer makes both edits, the one further on first, so that neither moves the other's place.
+        let mut alone = Model::new(doc.clone(), ReplicaId::from(9));
+        for nth in if made[0].1 >= made[1].1 { [0, 1] } else { [1, 0] } {
+            alone.apply(made[nth].0.clone()).expect("an edit to the sentence fits it");
+        }
+        // Text that both typed at one place stands there in either order.
+        let one_place = made[0].2.is_some() && made[0].2 == made[1].2;
+        let read = |model: &Model| {
+            let mut text: Vec<char> = model.doc().blocks[0].plain_text().chars().collect();
+            if one_place {
+                text.sort_unstable();
+            }
+            text
+        };
+
+        let mut writers = [Model::new(doc.clone(), ReplicaId::from(1)), Model::new(doc, ReplicaId::from(2))];
+        for (nth, writer) in writers.iter_mut().enumerate() {
+            writer.set_time(1_800_000_000 + if (nth == 0) == her_clock_is_ahead { 3_600 } else { 0 });
+            writer.apply(made[nth].0.clone()).expect("an edit to the sentence fits it");
+        }
+        let stood = writers.each_ref().map(Model::revision);
+        let held = writers.each_ref().map(Model::save);
+        for (nth, writer) in writers.iter_mut().enumerate() {
+            writer.merge(&held[1 - nth]).expect("a replica reads another's history");
+            let (_, found) = writer.settle(&stood[nth], &stood[1 - nth]).expect("a replica holds what it merged");
+            prop_assert_eq!(found, Vec::new(), "edits that share no word conflict");
+            prop_assert_eq!(read(writer), read(&alone), "what one writer alone touched was lost or misplaced");
+        }
+        prop_assert_eq!(writers[0].doc(), writers[1].doc());
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
 
