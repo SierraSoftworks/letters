@@ -117,6 +117,7 @@ impl DocLayout {
             held: 0,
             clock: 0,
             open: None,
+            in_place: true,
             scratch: Set::default(),
         };
         Self { state: RefCell::new(state) }
@@ -156,7 +157,8 @@ impl DocLayout {
     ///
     /// A formula is the one thing that is laid out again. While the caret is in it or at either end of it,
     /// its TeX shows in its place, written as code, with the editor's markers around it like any others.
-    /// It is typeset again when the caret leaves, or with `None`.
+    /// It is typeset again when the caret leaves, or with `None`. A window that shows the source somewhere
+    /// else turns this off with [`DocLayout::set_formula_source`].
     ///
     /// A change is shown at once. To animate it, see [`DocLayout::set_reveal_progress`].
     pub fn reveal(&mut self, at: Option<(&Pos, &Markers)>) -> bool {
@@ -183,6 +185,14 @@ impl DocLayout {
     /// Formulas are set again, since one that links may be drawn another way.
     pub fn set_maths_links(&mut self, links: bool) {
         self.state.get_mut().set_maths_links(links);
+    }
+
+    /// Sets whether a formula shows its source in its place while the caret is in it, which it does until
+    /// set. A window that shows the source on a sheet of its own turns this off: every formula then stays
+    /// typeset, and [`DocLayout::formula_rect`] is where the sheet hangs. Turning it on shows the source
+    /// from the next [`DocLayout::reveal`].
+    pub fn set_formula_source(&mut self, in_place: bool) {
+        self.state.get_mut().set_formula_source(in_place);
     }
 
     /// Underlines the text an input method is composing: a block and a byte range in it, as the editor's
@@ -229,14 +239,14 @@ impl DocLayout {
     /// after it. A block splits between pages only where two of its lines stay and two go, and a line of
     /// code never splits. Only something taller than a page breaks these rules.
     ///
-    /// A formula that shows its source for the caret is paged, and painted, as that source. For an export,
-    /// show no caret first: [`DocLayout::reveal`] with `None`.
+    /// Pages hold the document and nothing of the editor, so a formula that shows its source for the caret
+    /// is paged, and painted, typeset.
     ///
     /// This is a pass over the heights of lines and shapes nothing, so it is cheap to run again after an
     /// edit. It first lays out whatever is still estimated, which on a long document that was never
     /// settled takes as long as settling it.
     pub fn paginate(&self, page: &Page) -> Pages {
-        self.state.borrow_mut().paginate(page)
+        self.state.borrow_mut().printed(|state| state.paginate(page))
     }
 
     /// Emits one sheet of `pages`, with the sheet's top left at the origin: the text in its text area and
@@ -246,24 +256,24 @@ impl DocLayout {
     /// A sheet is white paper. It is painted with [`Palette::LIGHT`] whatever palette is set, and nothing
     /// is drawn behind the text, so the caller fills the paper with that palette's `page` colour.
     pub fn paint_page(&self, pages: &Pages, index: usize, out: &mut DisplayList) {
-        self.state.borrow_mut().paint_page(pages, index, out);
+        self.state.borrow_mut().printed(|state| state.paint_page(pages, index, out));
     }
 
     /// The page of `pages` that shows the line `pos` is on.
     pub fn page_of(&self, pages: &Pages, pos: &Pos) -> Option<usize> {
-        self.state.borrow_mut().page_of(pages, pos)
+        self.state.borrow_mut().printed(|state| state.page_of(pages, pos))
     }
 
     /// The links on one sheet of `pages`, in reading order. A link that runs over several lines has a
     /// rectangle for each.
     pub fn page_links(&self, pages: &Pages, index: usize) -> Vec<PageLink> {
-        self.state.borrow_mut().page_links(pages, index)
+        self.state.borrow_mut().printed(|state| state.page_links(pages, index))
     }
 
     /// The document's headings in order, each with the sheet of `pages` it is on. Headings with no text are
     /// left out.
     pub fn outline(&self, pages: &Pages) -> Vec<Heading> {
-        self.state.borrow_mut().outline(pages)
+        self.state.borrow_mut().printed(|state| state.outline(pages))
     }
 
     /// The text position nearest to a point. `None` when the document holds no text.
@@ -353,6 +363,8 @@ struct State {
     clock: u64,
     /// The formula whose source shows in its place: its block, and which of the block's formulas it is.
     open: Option<(BlockId, usize)>,
+    /// Whether the formula the caret is in shows its source in its place.
+    in_place: bool,
     /// A layout to measure with, so that measuring allocates nothing.
     scratch: Set,
 }
@@ -485,17 +497,41 @@ impl State {
         let formula = |caret: &Pos| {
             Some((caret.block.clone(), self.leaves[*self.index.get(&caret.block)?].formula(caret.offset)?.0))
         };
-        let open = at.and_then(|(caret, _)| formula(caret));
+        let open = at.filter(|_| self.in_place).and_then(|(caret, _)| formula(caret));
         let reset = open != self.open;
         if reset {
-            for (block, _) in [self.open.take(), open.clone()].into_iter().flatten() {
-                if let Some(&at) = self.index.get(&block) {
-                    self.unlay(at);
-                }
-            }
+            self.unlay_open();
             self.open = open;
+            self.unlay_open();
         }
         self.reveal.set(at) | reset
+    }
+
+    fn set_formula_source(&mut self, in_place: bool) {
+        self.in_place = in_place;
+        if !in_place {
+            self.unlay_open();
+            self.open = None;
+        }
+    }
+
+    /// Drops the layout of the leaf whose formula shows its source, which is laid out again when the
+    /// formula opens or closes.
+    fn unlay_open(&mut self) {
+        if let Some(&at) = self.open.as_ref().and_then(|(block, _)| self.index.get(block)) {
+            self.unlay(at);
+        }
+    }
+
+    /// Runs `work` on the document as it prints, where no formula shows its source. The pages of one
+    /// pagination are then the same wherever the caret goes meanwhile.
+    fn printed<T>(&mut self, work: impl FnOnce(&mut Self) -> T) -> T {
+        self.unlay_open();
+        let open = self.open.take();
+        let done = work(self);
+        self.open = open;
+        self.unlay_open();
+        done
     }
 
     /// Drops a leaf's layout, so that it is laid out again when next needed. Its height stays as the

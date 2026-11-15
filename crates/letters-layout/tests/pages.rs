@@ -5,7 +5,8 @@ use std::ops::Range;
 
 use letters_layout::{DocLayout, PageLink, Pages, Token, TokenKind};
 use letters_model::{
-    Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Model, Op, Page, Pos, ReplicaId, Run, Style, Tone,
+    Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Markers, Model, Op, Page, Pos, ReplicaId, Run, Style,
+    Tone,
 };
 use letters_render::{DisplayList, Item, Point, Rect};
 use proptest::prelude::*;
@@ -332,6 +333,24 @@ fn print_shows_the_document_and_nothing_of_the_editor() {
     layout.reveal(Some((&Pos::new("h", 2), &revealed)));
     for index in 0..pages.sheets.len() {
         assert!(page(&layout, &pages, index).text == page(&plain, &pages, index).text, "page {index}");
+    }
+}
+
+#[test]
+fn a_sheet_typesets_the_formula_the_caret_is_in() {
+    let (sums, none) = (sums(), Markers::default());
+    let (plain, pages) = paged(&sums, 240.0);
+    let (mut layout, _) = paged(&sums, 240.0);
+    for (block, offset) in [("m", PROSE.len() + 2), ("f", 1)] {
+        let caret = Pos::new(block, offset);
+        assert!(layout.reveal(Some((&caret, &none))), "the formula in {block} opens");
+        let screen = painted(&layout, everything());
+        assert!(layout.paginate(&paper(240.0)) == pages, "the pages are the same with the caret in {block}");
+        for index in 0..pages.sheets.len() {
+            assert!(page(&layout, &pages, index).text == page(&plain, &pages, index).text, "page {index}, {block}");
+        }
+        assert_eq!(layout.page_of(&pages, &caret), plain.page_of(&pages, &caret), "{block} is on the same page");
+        assert!(painted(&layout, everything()) == screen, "and the screen still shows the source in {block}");
     }
 }
 

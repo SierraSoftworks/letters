@@ -180,6 +180,31 @@ fn a_formula_shows_its_source_while_the_caret_is_in_it() {
     }
 }
 
+#[test]
+fn a_formula_stays_typeset_where_its_source_shows_elsewhere() {
+    let none = Markers::default();
+    for Case { name, doc, block: id, ends: (start, end), .. } in both(TEX) {
+        let mut layout = laid(&doc);
+        let typeset = painted(&layout, everything());
+        let place = layout.formula_rect(&Pos::new(id, start));
+        assert!(place.is_some(), "{name}: the formula has a place");
+
+        layout.set_formula_source(false);
+        for offset in [start, start + 3, end] {
+            let caret = Pos::new(id, offset);
+            assert!(!layout.reveal(Some((&caret, &none))), "{name}: nothing opens at {offset}");
+            assert_eq!(painted(&layout, everything()), typeset, "{name}: it stays typeset at {offset}");
+            assert_eq!(layout.formula_rect(&caret), place, "{name}: in its place at {offset}");
+        }
+
+        layout.set_formula_source(true);
+        assert!(layout.reveal(Some((&Pos::new(id, start + 1), &none))), "{name}: it opens again when allowed");
+        assert_ne!(painted(&layout, everything()), typeset, "{name}: as its source");
+        layout.set_formula_source(false);
+        assert_eq!(painted(&layout, everything()), typeset, "{name}: and closes when that ends");
+    }
+}
+
 /// What an edit is called, what it does, and where the caret is before and after it when the page shows one.
 type Edit = (&'static str, Vec<Op>, Option<(Pos, Pos)>);
 
