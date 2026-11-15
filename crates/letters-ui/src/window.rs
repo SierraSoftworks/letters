@@ -44,6 +44,7 @@ use crate::history::{self, History, Historying, Naming};
 use crate::icon::{self, Icon};
 use crate::importing::{self, Import, ImportOffer, Imported, Importing};
 use crate::insert::{Insert, Inserting, Put};
+use crate::kept::{TrustedFolder, TrustedSource};
 use crate::languages::{self, Fence, Fencing, Languages, Languaging};
 use crate::maths::{self, Maths, Sheet, SheetLines, Source};
 use crate::merging::{Confirmed, MergeAsk, MergeFile, Merges, Merging};
@@ -716,7 +717,8 @@ impl Ui<EditorApp> {
     }
 
     /// The person's own words, which are right in every document: the lines of their dictionary file. A
-    /// word they add from the page is handed to `Platform::learn_word` to be kept there.
+    /// word they add from the page is handed to `Platform::learn_word` to be kept there. Once a shell has
+    /// said them the Settings dialog lists them, and asks [`Request::ForgetWord`] for one to go.
     pub fn set_user_words(&mut self, words: impl IntoIterator<Item = impl AsRef<str>>) {
         self.app_mut().spelling.set_user_words(words);
     }
@@ -878,6 +880,34 @@ impl Ui<EditorApp> {
         if self.app_mut().safe.set(safe) {
             self.app_mut().ask_again(true);
         }
+    }
+
+    /// Says which folders the person trusts, at the start and whenever that changes. The Settings dialog
+    /// then lists them, asks [`Request::ForgetFolder`] for one to go and [`Request::TrustFolderDialog`] for
+    /// another. A shell that keeps no trust never says, and its dialog has no such list.
+    pub fn set_trusted_folders(&mut self, folders: Vec<TrustedFolder>) {
+        self.app_mut().dialog.kept.folders = Some(folders);
+    }
+
+    /// Says which sources linked pictures load from when a trusted document opens, the person's and an
+    /// administrator's, at the start and whenever that changes. The Settings dialog then lists them, asks
+    /// [`Request::ForgetSource`] for one of the person's to go and [`Request::TrustSource`] for another,
+    /// which this call also answers.
+    pub fn set_trusted_sources(&mut self, sources: Vec<TrustedSource>) {
+        self.app_mut().dialog.kept.set_sources(sources);
+    }
+
+    /// Says why the source a [`Request::TrustSource`] asked for is not trusted, in a sentence. The dialog
+    /// shows it under the field, which keeps what was typed.
+    pub fn refuse_source(&mut self, why: &str) {
+        self.app_mut().dialog.kept.refuse(why);
+    }
+
+    /// Says whether the person trusts the document that is open, by itself and not through its folder: at
+    /// the start, and whenever that changes. While they do, the Settings dialog offers to stop, with
+    /// [`Request::ForgetDocument`].
+    pub fn set_document_trusted(&mut self, trusted: bool) {
+        self.app_mut().dialog.kept.document = Some(trusted);
     }
 
     /// Shows the whole address of a link and asks whether to open it, in answer to a
@@ -5572,6 +5602,12 @@ impl EditorApp {
                 {
                     self.requests.push(Request::UsageReports(on));
                 }
+                // A word goes at once, as one that is learned comes at once, and the shell keeps that.
+                if let Setting::ForgetWord(word) = &message {
+                    self.spelling.forget(word);
+                    self.spelling.reworded(None, self.editor.doc(), &mut self.layout);
+                }
+                self.requests.extend(self.dialog.kept.asks(&message));
                 if self.dialog.update(message, &mut self.settings) {
                     self.tint();
                     self.requests.push(Request::Settings(self.settings.clone()));
@@ -5725,7 +5761,8 @@ impl App for EditorApp {
         let page = Element::row().grow(1.0).child(page).children(toast).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
-        let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
+        let over = self.dialog.view(&self.settings, self.spelling.mine(), window.height);
+        let over = over.into_iter().chain(self.safe.card());
         let over = over.chain(self.merges.card());
         let over = over.chain(self.share.view(&self.name().0, self.connection.is_some(), window.height));
         let over = over.chain(self.servers.view());

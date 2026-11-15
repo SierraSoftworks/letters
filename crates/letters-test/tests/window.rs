@@ -1155,6 +1155,18 @@ fn the_menu_offers_corrections_for_a_marked_word_alone_by_pointer_or_the_menu_ke
 }
 
 #[test]
+fn a_word_taken_out_of_the_persons_own_is_marked_again() {
+    let mut window = Harness::doc("Ask Zorvex for a quote.\n\nZorvex replied.");
+    window.ui().set_user_words(["Zorvex"]);
+    rest(&mut window);
+    assert!(waves(&mut window).is_empty(), "the person's own word is right");
+
+    window.key("Mod+,").click(Role::Button, "Remove Zorvex").key("Escape");
+    rest(&mut window);
+    assert_eq!(waves(&mut window).len(), 2, "the name is marked wherever it stands");
+}
+
+#[test]
 fn a_word_is_accepted_from_the_menu_or_from_the_persons_own_list() {
     // How the word comes to be accepted, and whether the shell is handed it to keep.
     for (route, kept) in [("Add to my dictionary", true), ("Add to this document", false), ("the shell's list", false)]

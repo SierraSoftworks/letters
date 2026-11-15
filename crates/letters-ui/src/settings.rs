@@ -3,11 +3,14 @@
 //! The dialog shows and asks. The shell keeps what is set, and follows the parts only it can. How a document
 //! looks is not in here: that is the document's own, in the Styles panel.
 
+use std::collections::BTreeSet;
+
 use accesskit::{HasPopup, Role};
 
 use crate::color::{fade, same};
 use crate::element::Element;
 use crate::icon;
+use crate::kept::{self, Kept};
 use crate::style::{Align, Edges, Justify, Look, Ring};
 use crate::text::TextStyle;
 use crate::theme::accent;
@@ -18,6 +21,10 @@ use crate::window::Message;
 /// The width of the dialog, and of the names down its left side.
 const WIDTH: f32 = 560.0;
 const NAMES: f32 = 116.0;
+/// What the dialog takes of the window's height besides what it sets, with the room it keeps clear of the
+/// window's edges, and the least the settings are given before they scroll.
+const AROUND: f32 = 160.0;
+const SHORTEST: f32 = 200.0;
 /// The size of an accent's dot.
 const DOT: f32 = 20.0;
 /// The tallest the list of languages grows before it scrolls.
@@ -72,6 +79,17 @@ pub enum Setting {
     Language(String),
     /// Turns the shell's usage reports on or off.
     Usage(bool),
+    /// Lets the person choose a folder to trust.
+    TrustFolder,
+    /// Stops trusting the folder with this path, the source written so, and the document that is open.
+    ForgetFolder(String),
+    ForgetSource(String),
+    ForgetDocument,
+    /// What is typed into the field for a source, before the shell is asked to trust it.
+    Source(String),
+    TrustSource,
+    /// Takes this word out of the person's dictionary.
+    ForgetWord(String),
 }
 
 /// The accents offered. Any other colour can be typed.
@@ -102,6 +120,8 @@ pub(crate) struct Dialog {
     pub account: Option<String>,
     /// Whether the shell's usage reports are on. `None` where a shell sends none, and there is no switch.
     pub usage: Option<bool>,
+    /// Whom the person trusts, as far as the shell said.
+    pub kept: Kept,
 }
 
 impl Dialog {
@@ -130,13 +150,17 @@ impl Dialog {
             Setting::Language(language) => settings.language = Some(language),
             // Shown at once. The shell keeps it: it is no setting of the documents.
             Setting::Usage(on) => self.usage = self.usage.map(|_| on),
+            // What the shell keeps is asked of it: see `Kept::asks`.
+            Setting::TrustFolder | Setting::ForgetFolder(_) | Setting::ForgetSource(_) | Setting::ForgetDocument => {}
+            Setting::Source(_) | Setting::TrustSource | Setting::ForgetWord(_) => {}
         }
         *settings != before
     }
 
     /// The dialog over the middle of the window, while it is open. It hangs from an element of no size,
-    /// which the window puts after everything else so that the dialog lies over it all.
-    pub fn view(&self, settings: &Settings) -> Option<Element<Message>> {
+    /// which the window puts after everything else so that the dialog lies over it all. `words` are the
+    /// person's own, once the shell has said them, and `room` is the window's height.
+    pub fn view(&self, settings: &Settings, words: Option<&BTreeSet<String>>, room: f32) -> Option<Element<Message>> {
         if !self.open {
             return None;
         }
@@ -150,17 +174,26 @@ impl Dialog {
         let note = "These settings influence every document you open. Document-level styles can be modified in \
                     the document itself.";
         let note = Element::paragraph(note, quiet()).fg(tokens::FG_MUTED).padding(Edges::top(tokens::SPACE_XS));
-        let content = Element::column()
-            .width(WIDTH)
-            .padding(Edges { top: tokens::SPACE_LG, ..Edges::all(tokens::SPACE_XL) })
-            .child(head)
-            .child(note)
+        // What is set scrolls under the title once the lists make it taller than the window, and runs to
+        // the dialog's edges so that its thumb stands clear of it.
+        let side = Edges::xy(tokens::SPACE_XL, 0.0);
+        let set = Element::column()
+            .padding(Edges { bottom: tokens::SPACE_XL, ..side })
             .child(SidePanel::section("Appearance"))
             .child(Element::column().gap(tokens::SPACE_MD).child(appearance(settings)).child(self.accent(settings)))
             .child(SidePanel::section("Writing"))
             .child(Element::column().gap(tokens::SPACE_MD).child(self.name(settings)).child(self.language(settings)))
             .children(self.usage.map(|_| SidePanel::section("Privacy")))
-            .children(self.usage.map(usage));
+            .children(self.usage.map(usage))
+            .children(self.kept.trust())
+            .children(words.map(kept::dictionary))
+            .max_height((room - AROUND).max(SHORTEST))
+            .scroll();
+        let content = Element::column()
+            .width(WIDTH)
+            .padding(Edges::top(tokens::SPACE_LG))
+            .child(Element::column().padding(side).child(head).child(note))
+            .child(set);
         let dialog = Popover::new(content)
             .flush()
             .label("Settings")
@@ -273,7 +306,6 @@ fn appearance(settings: &Settings) -> Element<Message> {
     row("Theme", Element::row().gap(tokens::SPACE_XS).children(buttons), None)
 }
 
-/// One setting: its name, the control that sets it, and perhaps a word about what it does.
 /// The switch for the shell's usage reports, with what they hold under it.
 fn usage(on: bool) -> Element<Message> {
     let tick = Element::row().width(TICK).height(TICK).radius(4.0).align(Align::Center).justify(Justify::Center);
@@ -298,7 +330,8 @@ fn usage(on: bool) -> Element<Message> {
     row("Usage", Element::row().child(choice), Some(USAGE_HOLDS))
 }
 
-fn row(name: &str, control: Element<Message>, about: Option<&str>) -> Element<Message> {
+/// One setting: its name, the control that sets it, and perhaps a word about what it does.
+pub(crate) fn row(name: &str, control: Element<Message>, about: Option<&str>) -> Element<Message> {
     // The control names itself to assistive technology, so the name beside it is for the eye.
     let name = Element::row()
         .align(Align::Center)
@@ -306,12 +339,14 @@ fn row(name: &str, control: Element<Message>, about: Option<&str>) -> Element<Me
         .height(tokens::CONTROL_HEIGHT)
         .child(Element::text(name, TextStyle::control().weight(500)))
         .decorative();
-    let about = about.map(|about| Element::paragraph(about, quiet()).fg(tokens::FG_MUTED));
-    let set = Element::column().gap(tokens::SPACE_XS).grow(1.0).child(control).children(about);
+    // A line that ends in a space measures a little past the room it was wrapped to.
+    let about = about.map(|about| Element::paragraph(about, quiet()).fg(tokens::FG_MUTED).shrink());
+    // What is too wide for the dialog is cut short, and does not widen it.
+    let set = Element::column().gap(tokens::SPACE_XS).grow(1.0).shrink().child(control).children(about);
     Element::row().align(Align::Start).gap(tokens::SPACE_LG).child(name).child(set)
 }
 
-fn quiet() -> TextStyle {
+pub(crate) fn quiet() -> TextStyle {
     TextStyle::body().size(tokens::TEXT_SM)
 }
 

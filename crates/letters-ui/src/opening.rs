@@ -140,6 +140,24 @@ pub enum Request {
     /// The person trusts the folder this document is in, and every document in it. Answered as
     /// [`Request::TrustDocument`] is. Asked only when the shell named a folder.
     TrustFolder,
+    /// Let the person choose a folder, and trust every document in it. Asked from the Settings dialog, which
+    /// lists the folders once the shell said `Window::set_trusted_folders`. Answer with the new list.
+    TrustFolderDialog,
+    /// Stop trusting the folder with this path, as `Window::set_trusted_folders` gave it. Answer with the
+    /// new list.
+    ForgetFolder(String),
+    /// Trust this source of linked pictures, as the person typed it: a host, or an address whose paths are
+    /// meant. Answer with `Window::set_trusted_sources`, or with `Window::refuse_source` when it is none.
+    TrustSource(String),
+    /// Stop trusting this source, as `Window::set_trusted_sources` gave it. Answer with the new list.
+    ForgetSource(String),
+    /// Stop trusting the document that is open, and hold it in safe mode again. Asked from the Settings
+    /// dialog after `Window::set_document_trusted(true)`. Answer with `Window::set_document_trusted(false)`
+    /// and `Window::set_safe_mode`.
+    ForgetDocument,
+    /// Take this word out of the person's dictionary, and tell every other window with
+    /// `Window::set_user_words`. The window that asks has dropped it already.
+    ForgetWord(String),
     /// The person asked to open the link with this address, as the document writes it. The shell judges
     /// it by what the person trusts: it opens the link, or has the window show the whole address and ask
     /// with `Window::ask_link`, or says why not with `Window::refuse_link`. `confirmed` is set once the

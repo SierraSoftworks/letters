@@ -33,6 +33,8 @@ pub(crate) struct Spelling {
     /// The person's own words, as the shell gave them and as they were added here. The document's own are
     /// in the document.
     mine: BTreeSet<String>,
+    /// Whether the shell has said them, and so keeps them.
+    said: bool,
     /// Whether every block has been checked since anything changed.
     done: bool,
     /// A misspelled word that is not marked, because the caret has not left it since it was typed.
@@ -45,8 +47,16 @@ pub(crate) struct Spelling {
 impl Spelling {
     /// Replaces the person's own words.
     pub fn set_user_words(&mut self, words: impl IntoIterator<Item = impl AsRef<str>>) {
-        self.mine = words.into_iter().map(|word| word.as_ref().trim().to_owned()).collect();
+        let words = words.into_iter().map(|word| word.as_ref().trim().to_owned());
+        // A dictionary file may hold empty lines, which are no words.
+        self.mine = words.filter(|word| !word.is_empty()).collect();
+        self.said = true;
         self.reword();
+    }
+
+    /// The person's own words, once the shell has said them: until then nothing keeps a list to show.
+    pub fn mine(&self) -> Option<&BTreeSet<String>> {
+        self.said.then_some(&self.mine)
     }
 
     /// Stops marking misspelled words, or marks them again. Words are marked for someone who can mend
@@ -187,6 +197,12 @@ impl Spelling {
     /// Accepts a word from now on as one of the person's own.
     pub fn learn(&mut self, word: &str) {
         self.mine.insert(word.to_owned());
+        self.reword();
+    }
+
+    /// Takes a word back out of the person's own.
+    pub fn forget(&mut self, word: &str) {
+        self.mine.remove(word);
         self.reword();
     }
 
