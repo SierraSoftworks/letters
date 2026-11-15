@@ -1,9 +1,10 @@
-//! What the formats share about pictures: how a picture's bytes become an asset, and the numbers that figures
-//! are given, which a document never stores.
+//! What the formats share about pictures: how a picture's bytes become an asset, and how the numbers of
+//! figures, which a document never stores, are written as text and read back from it.
 
 use std::collections::BTreeMap;
 use std::mem;
 
+use letters_layout::figure_numbers;
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Run};
 use letters_render::image::Image;
 use sha2::{Digest, Sha256};
@@ -47,35 +48,14 @@ pub(crate) fn fitted(width: f32, height: f32) -> (f32, f32) {
     (width.max(1.0), height.max(1.0))
 }
 
-/// Whether a block takes a number: a numbered figure or gallery. A figure in a gallery takes none, since the
-/// gallery is the figure, so what a gallery holds is not looked into.
-fn is_numbered(kind: &BlockKind) -> bool {
-    matches!(kind, BlockKind::Figure { numbered: true, .. } | BlockKind::Gallery { numbered: true })
-}
-
-/// The number of each numbered figure and gallery, counted through the document.
-fn numbers(blocks: &[Block], next: &mut usize, out: &mut BTreeMap<BlockId, usize>) {
-    for block in blocks {
-        if is_numbered(&block.kind) {
-            *next += 1;
-            out.insert(block.id.clone(), *next);
-        } else if !matches!(block.kind, BlockKind::Gallery { .. }) {
-            numbers(block.body.blocks(), next, out);
-        }
-    }
-}
-
 /// A copy of `doc` in which the numbers of its figures are text, for a format that cannot generate them: each
-/// numbered caption opens with its label, and each reference reads as the label of its figure.
+/// numbered caption opens with its label, and each reference reads as the label of its figure. The numbers
+/// are the ones layout draws.
 pub(crate) fn labelled(doc: &Document) -> Document {
-    /// Counts the figures as [`numbers`] does, so that each caption takes the number its references use.
-    fn label(blocks: &mut [Block], next: &mut usize, numbers: &BTreeMap<BlockId, usize>) {
+    fn label(blocks: &mut [Block], numbers: &BTreeMap<BlockId, u32>) {
         for block in blocks {
-            let opening = is_numbered(&block.kind).then(|| {
-                *next += 1;
-                format!("{LABEL} {next}")
-            });
-            let gallery = matches!(block.kind, BlockKind::Gallery { .. });
+            let pictured = matches!(block.kind, BlockKind::Figure { .. } | BlockKind::Gallery { .. });
+            let opening = numbers.get(&block.id).filter(|_| pictured).map(|number| format!("{LABEL} {number}"));
             match &mut block.body {
                 Body::Text(runs) => {
                     for run in runs.iter_mut() {
@@ -91,8 +71,8 @@ pub(crate) fn labelled(doc: &Document) -> Document {
                         caption(runs, opening);
                     }
                 }
-                Body::Blocks(children) if !gallery => label(children, next, numbers),
                 Body::Blocks(children) => {
+                    label(children, numbers);
                     let Some(opening) = opening else { continue };
                     // A gallery's caption is the last it holds.
                     let last = children.iter().rposition(|child| child.kind == BlockKind::Caption);
@@ -113,10 +93,9 @@ pub(crate) fn labelled(doc: &Document) -> Document {
         runs.insert(0, Run::plain(if captioned { format!("{label}: ") } else { label }));
     }
     let mut doc = doc.clone();
-    let mut numbers_of = BTreeMap::new();
-    numbers(&doc.blocks, &mut 0, &mut numbers_of);
-    if !numbers_of.is_empty() {
-        label(&mut doc.blocks, &mut 0, &numbers_of);
+    let numbers: BTreeMap<BlockId, u32> = figure_numbers(&doc).into_iter().collect();
+    if !numbers.is_empty() {
+        label(&mut doc.blocks, &numbers);
     }
     doc
 }

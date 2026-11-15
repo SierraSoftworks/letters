@@ -18,7 +18,20 @@ fn read(markdown: &str) -> (Document, Vec<ImportNote>) {
     })
 }
 
-fn doc(blocks: Vec<Block>) -> Document {
+/// A document of `blocks`, each given an id where it has none, as every block of a document has one.
+fn doc(mut blocks: Vec<Block>) -> Document {
+    fn name(blocks: &mut [Block], next: &mut usize) {
+        for block in blocks {
+            *next += 1;
+            if block.id.as_str().is_empty() {
+                block.id = format!("n{next}").as_str().into();
+            }
+            if let Body::Blocks(children) = &mut block.body {
+                name(children, next);
+            }
+        }
+    }
+    name(&mut blocks, &mut 0);
     Document { blocks, ..Document::default() }
 }
 
