@@ -25,6 +25,7 @@ mod restyle;
 mod spelling;
 mod style;
 mod styles;
+mod tex;
 mod text;
 pub use yewi_tokens as tokens;
 mod tree;

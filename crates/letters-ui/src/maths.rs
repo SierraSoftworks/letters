@@ -4,6 +4,10 @@
 //! when the caret reaches it, and the caret shows there, at the place in the source the editor holds it.
 //! A backslash typed there lists the symbols that match what follows it, each one typeset. The `$` that
 //! closes a formula blends the source it was typed as into its glyphs.
+//!
+//! The source is coloured as it is read: commands, words, comments, and each pair of brackets by how deep
+//! it is nested. What is wrong is in red, and what the maths engine says of it is under the source. Neither
+//! is said of what is still being written where the caret is.
 
 use std::ops::Range;
 use std::rc::Rc;
@@ -11,7 +15,7 @@ use std::rc::Rc;
 use accesskit::Role;
 use letters_editor::{Editor, Lines};
 use letters_math::{Command as Symbol, Formula, TEXT_RATIO, commands, typeset};
-use letters_model::{BlockId, Pos, Selection};
+use letters_model::{BlockId, BlockKind, Pos, Selection};
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 
 use crate::color::{fade, resolve};
@@ -19,8 +23,9 @@ use crate::element::{Cursor, Element, Paint, Pointer};
 use crate::layout::MARGIN;
 use crate::motion::{self, FRAME_MS};
 use crate::style::{Align, Edges};
+use crate::tex::{self, Part};
 use crate::text::{Family, Shaped, TextShaper, TextStyle};
-use crate::tokens::{self, Scheme};
+use crate::tokens::{self, Color as Ink, Scheme};
 use crate::widgets::{Choice, Options, Popover};
 use crate::window::{CARET_WIDTH, Message};
 
@@ -42,6 +47,10 @@ const SQUEEZE: f32 = 0.5;
 /// How many symbols the list shows, and the least room it takes across.
 const LISTED: usize = 6;
 const LIST_WIDTH: f32 = 300.0;
+/// The least room across for what the maths engine says is wrong.
+const FAULT_WIDTH: f32 = 240.0;
+/// The colours of bracket pairs, by how deep a pair is nested. None is near the red of a mistake.
+const PAIRS: [Ink; 3] = [tokens::SYNTAX_NUMBER, tokens::SYNTAX_KEYWORD, tokens::SYNTAX_TYPE];
 /// The room a symbol's picture has in its row: at least this wide, and this high.
 const PICTURE: Size = Size { width: 24.0, height: 22.0 };
 
@@ -69,6 +78,8 @@ pub(crate) struct Source {
     /// Where the source sits in its block's text.
     pub range: Range<usize>,
     pub text: String,
+    /// Whether the formula is a block of its own.
+    display: bool,
     /// The part an input method is still composing, as offsets in the block.
     composing: Option<Range<usize>>,
     /// Each line: where it starts in the block, and its text shaped.
@@ -79,7 +90,8 @@ impl Source {
     /// The source of the formula the editor's caret is in.
     pub fn of(editor: &Editor, shaper: &dyn TextShaper) -> Option<Self> {
         let (block, range) = editor.formula()?;
-        let text = editor.doc().block(block)?.plain_text().get(range.clone())?.to_owned();
+        let held = editor.doc().block(block)?;
+        let (text, display) = (held.plain_text().get(range.clone())?.to_owned(), held.kind == BlockKind::Formula);
         let mut start = range.start;
         let mut lines = Vec::new();
         for line in text.split('\n') {
@@ -87,7 +99,44 @@ impl Source {
             start += line.len() + 1;
         }
         let composing = editor.composition().filter(|composing| composing.0 == block).map(|composing| composing.1);
-        Some(Self { block: block.clone(), range, text, composing, lines })
+        Some(Self { block: block.clone(), range, text, display, composing, lines })
+    }
+
+    /// The stretches of the source that are not in plain ink with the colour of each, and those a line is
+    /// drawn under because they are wrong. `refused` is what the maths engine will not have, and `writing`
+    /// says that a bracket left open may yet be closed.
+    fn marks(&self, refused: Option<&Range<usize>>, writing: bool) -> (Vec<Stretch>, Vec<Stretch>) {
+        let within = |range: &Range<usize>| self.range.start + range.start..self.range.start + range.end;
+        let (mut inks, mut lined) = (Vec::new(), Vec::new());
+        for token in tex::parts(&self.text) {
+            let (ink, wrong) = match token.part {
+                Part::Command => (tokens::SYNTAX_FUNCTION, false),
+                Part::Text => (tokens::SYNTAX_STRING, false),
+                Part::Comment => (tokens::SYNTAX_COMMENT, false),
+                Part::Paired(depth) => (PAIRS[depth % PAIRS.len()], false),
+                Part::Open(depth) if writing => (PAIRS[depth % PAIRS.len()], false),
+                Part::Open(_) | Part::Stray => (tokens::DANGER, true),
+            };
+            let spans = self.spans(&within(&token.range));
+            lined.extend(spans.iter().filter(|_| wrong).map(|span| (*span, ink)));
+            inks.extend(spans.into_iter().map(|span| (span, ink)));
+        }
+        // Where something is missing the line is under what stands before it.
+        let missing = |range: &Range<usize>| {
+            let before = self.text[..range.start].chars().next_back().filter(|_| range.is_empty());
+            range.start - before.map_or(0, char::len_utf8)..range.end
+        };
+        let refused = refused.map(missing);
+        lined.extend(refused.iter().flat_map(|range| self.spans(&within(range))).map(|span| (span, tokens::DANGER)));
+        (inks, lined)
+    }
+
+    /// What the maths engine will not typeset in the source, if anything.
+    fn fault(&self) -> Option<Fault> {
+        let style =
+            letters_math::Style { size: TEXT.size, color: Color::rgb(0, 0, 0), display: self.display, links: false };
+        let error = typeset(&self.text, &style).err()?;
+        Some(Fault { range: error.span, message: error.message })
     }
 
     fn line_height() -> f32 {
@@ -163,6 +212,27 @@ impl Source {
             (from < to).then(|| Rect::new(left, line as f32 * height, right - left, height))
         };
         (self.line(range.start)..=self.line(range.end)).filter_map(span).collect()
+    }
+}
+
+/// A stretch of the source, from its top left, and the colour it or the line under it is drawn in.
+type Stretch = (Rect, Ink);
+
+/// What the maths engine will not typeset in a source.
+struct Fault {
+    /// Where it is in the source, when the engine can say. Empty where something is missing.
+    range: Option<Range<usize>>,
+    message: String,
+}
+
+impl Fault {
+    /// Whether the caret, at `offset` in the source, is where the fault is: just after it or inside it,
+    /// which is where it is still being written.
+    fn written_at(&self, offset: usize) -> bool {
+        self.range.as_ref().is_some_and(|range| match range.is_empty() {
+            true => offset == range.start,
+            false => range.start < offset && offset <= range.end,
+        })
     }
 }
 
@@ -412,7 +482,16 @@ impl Maths {
         scheme: Scheme,
     ) -> Popover<Message> {
         let symbols = self.symbols(&source, selection);
-        let least = if symbols.is_some() { LIST_WIDTH } else { 0.0 };
+        // What is still being written is not called wrong: a fault the caret is at, and a bracket left open
+        // while the caret is at the end of the source.
+        let at = selection.head.offset.saturating_sub(source.range.start);
+        let fault = source.fault().filter(|fault| !fault.written_at(at));
+        let writing = source.text.get(at..).is_none_or(|rest| rest.trim().is_empty());
+        let least = match (&symbols, &fault) {
+            (Some(_), _) => LIST_WIDTH,
+            (None, Some(_)) => FAULT_WIDTH,
+            (None, None) => 0.0,
+        };
         let (size, width) = (source.size(), Self::width(&source, formula, room).max(least));
         let caret = source.caret(selection.head.offset);
         // A source too long for the window shows the part around the caret.
@@ -423,10 +502,14 @@ impl Maths {
             (selection.anchor.offset.min(selection.head.offset), selection.anchor.offset.max(selection.head.offset));
         let label = source.text.clone();
         let source = Rc::new(source);
-        let typed = symbols.iter().flat_map(|(range, _)| source.spans(range)).collect();
+        let (mut inks, mut lined) = source.marks(fault.as_ref().and_then(|fault| fault.range.as_ref()), writing);
+        // The command being typed is in the accent and underlined, whatever it would be otherwise.
+        let typed = symbols.iter().flat_map(|(range, _)| source.spans(range)).map(|span| (span, tokens::ACCENT_TEXT));
+        inks.extend(typed.clone());
+        lined.extend(typed);
         let composing = source.composing.iter().flat_map(|range| source.spans(range)).collect();
         let selected = source.spans(&(start..end));
-        let paint = SourcePaint { source: source.clone(), selected, typed, composing, shift };
+        let paint = SourcePaint { source: source.clone(), selected, inks, lined, composing, shift };
         let pointed = move |event: Pointer| {
             let offset = |at: Point| source.hit(Point { x: at.x + shift.x, y: at.y + shift.y });
             match event {
@@ -452,6 +535,11 @@ impl Maths {
             .on_pointer(move |event| pointed(event).map(Message::Maths));
         let padding = Edges { top: PADDING.top * self.slid, bottom: PADDING.bottom * self.slid, ..PADDING };
         let mut sheet = Element::column().gap(tokens::SPACE_SM).padding(padding).child(text);
+        if let Some(fault) = fault.filter(|_| self.slid >= 1.0) {
+            let quiet = TextStyle::body().size(tokens::TEXT_XS);
+            let said = Element::paragraph(fault.message, quiet).fg(tokens::DANGER).max_width(width);
+            sheet = sheet.child(said.role(Role::Status));
+        }
         if let Some((_, symbols)) = &symbols {
             sheet = sheet.child(self.list(symbols, scheme)).child(hint());
         }
@@ -539,8 +627,10 @@ struct SourcePaint {
     source: Rc<Source>,
     /// What is selected, from the top left of the source.
     selected: Vec<Rect>,
-    /// The command the list of symbols is for.
-    typed: Vec<Rect>,
+    /// The stretches that are not in plain ink, and the colour of each. A later one counts over an earlier.
+    inks: Vec<Stretch>,
+    /// The stretches a line is drawn under: the command being typed, and what is wrong.
+    lined: Vec<Stretch>,
     /// What an input method is still composing.
     composing: Vec<Rect>,
     /// How far the source is moved left and up under the canvas.
@@ -557,26 +647,23 @@ impl Paint for SourcePaint {
             color: selection,
             radius: 0.0,
         }));
-        let lines = |ink, out: &mut DisplayList| {
-            for (line, (_, shaped)) in self.source.lines.iter().enumerate() {
-                shaped.paint(Point { x: origin.x, y: origin.y + line as f32 * Source::line_height() }, ink, out);
-            }
-        };
-        let ink = resolve(tokens::FG, scheme, 1.0);
-        lines(ink, out);
+        let plain = resolve(tokens::FG, scheme, 1.0);
+        let inks: Vec<(Rect, Color)> =
+            self.inks.iter().map(|(span, ink)| (*span, resolve(*ink, scheme, 1.0))).collect();
+        for (line, (_, shaped)) in self.source.lines.iter().enumerate() {
+            let top = line as f32 * Source::line_height();
+            // A glyph is in the colour of the stretch it starts in.
+            let ink = |x: f32| {
+                let holds = |span: &Rect| span.y == top && span.x <= x + 0.5 && x + 0.5 < span.x + span.width;
+                inks.iter().rev().find(|(span, _)| holds(span)).map_or(plain, |(_, ink)| *ink)
+            };
+            shaped.paint_inked(Point { x: origin.x, y: origin.y + top }, ink, out);
+        }
         let under = |span: Rect| Rect::new(span.x, span.y + span.height - 2.0, span.width, 1.0);
         // Text still being composed is underlined, as on the page.
-        let composing = self.composing.iter().map(|span| under(placed(span)));
-        out.items.extend(composing.map(|rect| Item::Fill { rect, color: ink, radius: 0.0 }));
-        // The command being typed is drawn again in the accent, over itself, and underlined.
-        let accent = resolve(tokens::ACCENT_TEXT, scheme, 1.0);
-        for span in self.typed.iter().map(placed) {
-            out.push(Item::PushClip { rect: span, radius: 0.0 });
-            out.push(Item::Fill { rect: span, color: resolve(tokens::SURFACE_RAISED, scheme, 1.0), radius: 0.0 });
-            lines(accent, out);
-            out.push(Item::PopClip);
-            out.push(Item::Fill { rect: under(span), color: accent, radius: 0.0 });
-        }
+        let composing = self.composing.iter().map(|span| (under(placed(span)), plain));
+        let lined = self.lined.iter().map(|(span, ink)| (under(placed(span)), resolve(*ink, scheme, 1.0)));
+        out.items.extend(composing.chain(lined).map(|(rect, color)| Item::Fill { rect, color, radius: 0.0 }));
     }
 }
 
@@ -600,7 +687,14 @@ mod tests {
             lines.push((start, FixedShaper.shape(line, &TEXT, None)));
             start += line.len() + 1;
         }
-        Source { block: "f".into(), range: 10..10 + text.len(), text: text.into(), composing: None, lines }
+        Source {
+            block: "f".into(),
+            range: 10..10 + text.len(),
+            text: text.into(),
+            display: true,
+            composing: None,
+            lines,
+        }
     }
 
     /// The page's lines, which answer with a place of their own.
@@ -674,7 +768,7 @@ mod tests {
         for (text, caret, expected) in cases {
             let lines = vec![(10, FixedShaper.shape(text, &TEXT, None))];
             let range = 10..10 + text.len();
-            let source = Source { block: "f".into(), range, text: text.into(), composing: None, lines };
+            let source = Source { block: "f".into(), range, text: text.into(), display: false, composing: None, lines };
             let expected =
                 expected.map(|(range, typed): (Range<usize>, &str)| (range.start + 10..range.end + 10, typed));
             assert_eq!(source.typed(10 + caret), expected, "{text:?} at {caret}");

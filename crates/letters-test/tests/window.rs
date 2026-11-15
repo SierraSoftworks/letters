@@ -2010,6 +2010,96 @@ fn what_is_typed_shows_the_caret_where_a_long_source_scrolls_under_it() {
     }
 }
 
+/// A formula block `f1` that holds `source`, with the caret in it at `caret` and its sheet out.
+fn written(source: &str, caret: usize) -> Harness {
+    let mut window =
+        Harness::open(Document { blocks: vec![text("f1", BlockKind::Formula, source)], ..Document::default() });
+    window.ui().set_reduced_motion(true);
+    window.ui().select(Selection::caret(Pos::new("f1", caret)));
+    window
+}
+
+/// The colour each character of a one-line source is drawn in on its sheet, by its place in the source.
+fn source_inks(window: &mut Harness) -> Vec<Option<Color>> {
+    let found = sheet(window).expect("a sheet");
+    let (sheet, count) = (found.bounds, found.description.map_or(0, |source| source.chars().count()));
+    let mut drawn = Vec::new();
+    for item in window.paint().items {
+        let Item::Glyphs { origin, color, glyphs, .. } = item else { continue };
+        let on_sheet = |x: &f32| sheet.contains(Point { x: x + 1.0, y: origin.y });
+        drawn.extend(glyphs.iter().map(|glyph| origin.x + glyph.x).filter(on_sheet).map(|x| (x - sheet.x, color)));
+    }
+    // The source is in one width of character, so a glyph's place across says which character it is.
+    drawn.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let steps = drawn.windows(2).map(|pair| pair[1].0 - pair[0].0).filter(|step| *step > 0.5);
+    let advance = steps.fold(f32::MAX, f32::min);
+    let mut inks = vec![None; count];
+    for (x, color) in drawn {
+        if let Some(ink) = inks.get_mut((x / advance).round() as usize) {
+            *ink = Some(color);
+        }
+    }
+    inks
+}
+
+/// What the sheet says is wrong with its source, if it says anything.
+fn fault(window: &mut Harness) -> Option<String> {
+    window.controls().into_iter().find(|control| control.role == Role::Status).and_then(|said| said.value)
+}
+
+#[test]
+fn the_source_on_a_sheet_is_coloured_by_what_its_parts_are() {
+    // A source, places in it drawn alike, and places drawn apart.
+    type Places<'a> = &'a [(usize, usize)];
+    let cases: [(&str, Places, Places); 5] = [
+        // A command, and the braces of its arguments.
+        (r"\frac{a}{b}", &[(0, 4), (5, 7), (5, 10)], &[(0, 6), (0, 5), (5, 6)]),
+        // A pair inside a pair.
+        ("{a{b}}", &[(0, 5), (2, 4)], &[(0, 2), (0, 1), (2, 3)]),
+        // Words are not maths.
+        (r"\text{if} x", &[(6, 7)], &[(6, 10), (6, 0)]),
+        // A half-open interval pairs nothing.
+        ("(0, 1]", &[(0, 1), (5, 1)], &[]),
+        // A comment runs to the end of its line.
+        ("x % so", &[(2, 5)], &[(0, 2)]),
+    ];
+    for (source, alike, apart) in cases {
+        let inks = source_inks(&mut written(source, 0));
+        for (one, other) in alike {
+            assert_eq!(inks[*one], inks[*other], "{source}: {one} and {other} are drawn alike");
+        }
+        for (one, other) in apart {
+            assert_ne!(inks[*one], inks[*other], "{source}: {one} and {other} are drawn apart");
+        }
+    }
+}
+
+#[test]
+fn what_is_wrong_in_a_source_is_marked_unless_it_is_still_being_written() {
+    // A brace that closes nothing is wrong wherever the caret is.
+    let stray = source_inks(&mut written("a}", 2))[1];
+    assert_ne!(stray, source_inks(&mut written("{a}", 0))[2], "a stray brace is not drawn as one of a pair");
+
+    // A source, where the caret is, the place of what is wrong, and whether it is marked there.
+    let cases = [
+        // A brace is not unclosed while the caret is at the end, where it would be closed.
+        (r"\frac{a}{b", 10, 8, false),
+        (r"\frac{a}{b", 0, 8, true),
+    ];
+    for (source, caret, at, marked) in cases {
+        let mut window = written(source, caret);
+        assert_eq!(source_inks(&mut window)[at] == stray, marked, "{source} with the caret at {caret}");
+        assert_eq!(fault(&mut window).is_some(), marked, "{source} with the caret at {caret}: what is wrong is said");
+    }
+
+    // What the maths engine refuses is said under the source, once the caret has left it.
+    let unknown = r"x + \nosuchthing + y";
+    assert_eq!(fault(&mut written(unknown, 16)), None, "the caret is at the end of the command");
+    let said = fault(&mut written(unknown, 0)).expect("the sheet says what is wrong");
+    assert!(!said.is_empty());
+    assert_eq!(fault(&mut written("x + y", 0)), None, "nothing is wrong");
+}
+
 #[test]
 fn a_sheet_slides_out_from_under_its_formula() {
     let mut window = formulas();
