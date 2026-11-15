@@ -52,6 +52,7 @@ use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
 use crate::peek::{self, Peek, Peeks};
 use crate::pictures::{self, Linked, Linking, PictureState};
+use crate::presence::{Peer, Presence};
 use crate::previews::{self, LinkPreviewFound, Previewing, Previews};
 use crate::print::{Breaking, Paged, Print, Printing};
 use crate::refer::{Picking, Refer};
@@ -166,6 +167,8 @@ pub enum Message {
     Panel(Panel),
     ClosePanel,
     Share(bool),
+    /// Brings the page to where someone else who has the document open is, by their session.
+    Visit(u64),
     /// Puts the caret at the start of a block and brings the block to the top of the page.
     Jump(BlockId),
     /// Opens the link editor at the caret.
@@ -434,6 +437,22 @@ impl Ui<EditorApp> {
 
     pub fn set_save_state(&mut self, state: SaveState) {
         self.app_mut().save = state;
+    }
+
+    /// Says who else has the document open: see [`Peer`]. Their faces stand on the bar, and the page shows
+    /// their carets and what they have selected, each in their colour. Each call replaces the list, so say
+    /// it again when someone comes, goes or moves, and once a merge has moved the text under them.
+    pub fn set_peers(&mut self, peers: Vec<Peer>) {
+        if !self.app().presence.is(&peers) {
+            self.app_mut().presence.set(peers);
+        }
+    }
+
+    /// The person's caret or selection, for a shell that tells it to the others who have the document
+    /// open. `None` while the page is not what shows, as in Print view and in the history.
+    pub fn selection(&self) -> Option<&Selection> {
+        let app = self.app();
+        app.editor.selection().filter(|_| !app.away())
     }
 
     /// The person's own words, which are right in every document: the lines of their dictionary file. A
@@ -972,6 +991,8 @@ pub struct EditorApp {
     /// Whether keys follow macOS conventions, which is how the menus then write them.
     mac: bool,
     save: SaveState,
+    /// Who else has the document open.
+    presence: Presence,
     edits: u64,
     panel: Option<Panel>,
     sharing: bool,
@@ -1081,6 +1102,7 @@ impl EditorApp {
             copy_asked: None,
             mac: cfg!(target_os = "macos"),
             save: SaveState::default(),
+            presence: Presence::default(),
             edits: 0,
             panel: None,
             sharing: false,
@@ -1261,7 +1283,7 @@ impl EditorApp {
         let mut hasher = DefaultHasher::new();
         let differs = self.styles.differs(self.editor.model().style());
         let chrome = (self.chrome.buttons.len(), self.chrome.inset_start.to_bits());
-        (width.to_bits(), self.name(), style, differs, chrome).hash(&mut hasher);
+        (width.to_bits(), self.name(), style, differs, chrome, self.presence.shown()).hash(&mut hasher);
         let key = hasher.finish();
         if key != self.folded.key {
             self.folded = Folded { key, form: None, seen: Fitted::default() };
@@ -2808,6 +2830,19 @@ impl EditorApp {
         self.previews.close();
     }
 
+    /// Brings the page to where someone else is, with their caret in the middle of it. The person's own
+    /// caret stays where it stands.
+    fn visit(&mut self, session: u64) {
+        let Some(head) = self.presence.visit(session) else { return };
+        // Twice, since laying out what comes into view can move the line.
+        for _ in 0..2 {
+            let Some(line) = self.layout.caret(&head) else { break };
+            let middle = self.down(line.y) + TOP + (line.height - self.height) / 2.0;
+            self.scroll = middle.clamp(0.0, self.max_scroll());
+            self.layout.settle(self.viewport(), 0);
+        }
+    }
+
     /// Puts the caret at the start of a block and brings the block to the top of the page.
     fn jump(&mut self, block: BlockId) {
         let start = Pos { block, offset: 0 };
@@ -3071,6 +3106,8 @@ impl EditorApp {
         self.margin.over = marker;
         let part = rest.and_then(|at| self.table_part(at)).map(|(_, part)| part);
         let tabled = self.tables.point(part);
+        let peer = rest.and_then(|at| self.presence.at(&self.layout, self.in_layout(at), self.viewport()));
+        let called = self.presence.point(peer) || called;
         self.references.point(found) || copy || clouded || gripped || switched || marked || tabled || called
     }
 
@@ -3616,6 +3653,7 @@ impl EditorApp {
                 list.items.extend(spans.into_iter().map(|rect| fill(rect, color)));
             }
         }
+        self.presence.wash(&self.layout, viewport, self.scheme, &mut list);
         self.layout.paint(viewport, &mut list);
         // A picture the shell has not handed over is asked for once, and its place is kept until it comes.
         for asset in pictures::awaited(&self.images, self.scheme, &mut list) {
@@ -3735,6 +3773,9 @@ impl EditorApp {
             Some(((figure, _), None)) => references::mark(figure, self.scheme, &mut list),
             None => {}
         }
+        // The others' carets lie over all that is the page's own. A name keeps inside the page area.
+        let reach = (viewport, room.width - left - tokens::SPACE_XS);
+        self.presence.carets(&self.layout, reach, self.shaper.as_ref(), self.scheme, &mut list);
         // What stands round the two versions of the conflict that is open, and the one held back.
         let (mut under, mut over) = (DisplayList::default(), DisplayList::default());
         let (cut, shift) = (self.cut(), self.shift());
@@ -4201,6 +4242,9 @@ impl EditorApp {
         }
         if let Some(badge) = self.safe.badge() {
             bar = bar.end(badge);
+        }
+        if let Some(faces) = self.presence.faces() {
+            bar = bar.end(faces);
         }
         bar = bar.end(Button::new("Share").icon(icon::USERS).small().on_press(Message::Share(true)).popover(share));
         bar = bar.end(TopBar::rule());
@@ -4846,6 +4890,7 @@ impl EditorApp {
             }
             Message::ClosePanel => self.show(None),
             Message::Share(open) => self.sharing = open,
+            Message::Visit(session) => self.visit(session),
             Message::Correct(text) => {
                 self.context = None;
                 let Some(fix) = self.spelling.fix.take() else { return };
@@ -5005,6 +5050,7 @@ impl App for EditorApp {
         // A floating window that Letters frames has a border, which everything else stands inside.
         let border = self.chrome.border();
         let window = Size { width: window.width - 2.0 * border, height: window.height - 2.0 * border };
+        self.presence.fit(window.width);
         self.refold(window.width);
         // Print view has the window to itself: the panels and the outline are for editing. The history
         // has its versions listed where a panel would be.
@@ -5295,7 +5341,8 @@ impl App for EditorApp {
         let copied = self.code_copy.animate(now_ms);
         let slid = self.review.animate(now_ms);
         let rested = self.peeks.animate(now_ms);
-        [note, slide, fade, light, copied, slid, rested].into_iter().flatten().min()
+        let named = self.presence.animate(now_ms);
+        [note, slide, fade, light, copied, slid, rested, named].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {
