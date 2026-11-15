@@ -51,6 +51,7 @@ use crate::ink::{Brush, Ink, Inks};
 use crate::leaf::{Extent, Laid, Lay, Open, Over, Painter, Source, Swap, Text};
 use crate::reveal::{Reveal, Shapes, Shifts};
 
+pub use crate::engine::Uncovered;
 pub use crate::paginate::{Heading, PageBlock, PageLink, Pages, Sheet};
 pub use crate::palette::{Callout, Palette, Scheme, Syntax};
 pub use crate::shape::{FontSpec, ShapedRun, ShapedText, Shaper};
@@ -60,8 +61,10 @@ pub use crate::tokens::{Token, TokenKind};
 
 /// The fonts layout may use. The shell supplies them, since the core never reads files.
 ///
-/// Only these faces are used, never the system's. A family the style names but these lack falls back to the
-/// first proportional face here, or the first monospace one for code.
+/// Text is set in these faces wherever they have its characters, never in the system's. A family the style
+/// names but these lack falls back to the first proportional face here, or the first monospace one for code.
+/// Faces of the system only back them up, for the characters they lack: see
+/// [`DocLayout::add_fallback_fonts`].
 #[derive(Clone, Debug, Default)]
 pub struct Fonts {
     pub faces: Vec<Font>,
@@ -254,7 +257,28 @@ impl DocLayout {
     /// Only the blocks with such text are laid out again, as after an edit: each keeps its height as an
     /// estimate until it is. Returns whether there are any, which is whether the page may now look different.
     pub fn add_fonts(&mut self, fonts: &Fonts) -> bool {
-        self.state.get_mut().add_fonts(fonts)
+        self.state.get_mut().add_fonts(fonts, false)
+    }
+
+    /// Adds faces that only back up the fonts: the system's, for emoji and for scripts the fonts lack. Text
+    /// is set in one only where none of the fonts has its characters, so what they cover measures as it
+    /// did, and a style never gets one by naming its family. A face is taken by its place in its file: of
+    /// a file of several families, only the family of the face given is used. A file that holds a family
+    /// of the fonts' own is left out.
+    ///
+    /// The blocks that were short of a character or of a face are laid out again, as [`Self::add_fonts`]
+    /// does. Returns whether a character that was shown without a glyph has one now.
+    pub fn add_fallback_fonts(&mut self, fonts: &Fonts) -> bool {
+        self.state.get_mut().add_fonts(fonts, true)
+    }
+
+    /// The characters shown without a glyph since this was last asked, since no face has one: each once,
+    /// in the order they were met. Whatever needs no glyph is left out. Text is looked at as it is laid
+    /// out, so a long document tells of its characters as they come into view, and asking costs nothing
+    /// when there are none. Ask once every font of [`Self::add_fonts`] has come, since a late one may
+    /// have them.
+    pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
+        self.state.get_mut().engine.take_uncovered()
     }
 
     /// Says that the picture a link leads to is there to draw, with its size in pixels, or with `None` that
@@ -717,8 +741,8 @@ impl State {
         }
     }
 
-    fn add_fonts(&mut self, fonts: &Fonts) -> bool {
-        if !self.engine.add(fonts) {
+    fn add_fonts(&mut self, fonts: &Fonts, backup: bool) -> bool {
+        if !(if backup { self.engine.back(fonts) } else { self.engine.add(fonts) }) {
             return false;
         }
         // How wide text of each type runs is an estimate taken from its face, and markers are shaped once.
@@ -739,7 +763,8 @@ impl State {
             again = true;
         }
         self.recount();
-        again
+        // A character that has its glyph now was met somewhere, if only in a marker.
+        again || backup
     }
 
     fn set_loaded(&mut self, src: &str, size: Option<(u32, u32)>) -> bool {

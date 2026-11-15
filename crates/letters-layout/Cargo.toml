@@ -16,6 +16,7 @@ letters-math.workspace = true
 letters-model.workspace = true
 letters-render.workspace = true
 parley.workspace = true
+parley_data.workspace = true
 
 [dev-dependencies]
 letters-editor.workspace = true

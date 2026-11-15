@@ -56,6 +56,8 @@ font-test-data = "0.10"
 hayro = "0.9"
 # Text shaping and line breaking. No system fonts: only the bundled faces are registered.
 parley = { version = "0.13", default-features = false, features = ["std"] }
+# The Unicode properties parley itself reads, for telling which characters no font covers: same version as its.
+parley_data = "0.13"
 pulldown-cmark = { version = "0.13", default-features = false }
 # Tokenizes clipboard HTML. No dependencies of its own.
 html5gum = "0.9"
