@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use letters_editor::{Editor, InputEvent, Key, KeyEvent, Platform as _};
+use letters_editor::{Editor, InputEvent, Key, KeyEvent, Picture, Platform as _};
 use letters_format::WorkingCopy;
 use letters_model::{Model, ReplicaId, Revision, Style};
 use letters_render::image::Image;
@@ -23,8 +23,8 @@ use letters_spell::Dictionary;
 use letters_trust::Trust;
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
-    Appearance, Chrome, CopyFormat, Cursor, Edge, Frame, Landing, Location, Request, SaveState, Scheme, Settings,
-    Window as View, tokens,
+    Appearance, Chrome, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer, Landing, Location,
+    Request, SaveState, Scheme, Settings, Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -43,6 +43,7 @@ use crate::copies;
 use crate::dictionaries;
 use crate::files::{self, EXTENSION, Exchange, Home, Opened, Rest, STYLESHEET, Working};
 use crate::gpu::Gpu;
+use crate::import::{self, Choices, PictureFolder, Plan};
 use crate::input::{self, Composer, Press};
 use crate::journal::{Journal, Journals};
 use crate::library::{Library, Place, Recent, Refused, UNTITLED, has_content};
@@ -94,6 +95,11 @@ pub enum Event {
     /// A picture a window's page asked for was decoded, to be held no wider than the last, or could not
     /// be had.
     Picture(WindowId, String, Option<Image>, u32),
+    /// The file at a path, which a window was asked to bring in, has been read: what it would bring is
+    /// known, or why it cannot be brought in.
+    Planned(WindowId, PathBuf, Result<Box<Plan>, String>),
+    /// A file was brought in for a window and kept as a new document at this path, or could not be.
+    Imported(WindowId, Result<PathBuf, String>),
     /// A system dictionary a window's document asked for has been read, under the name it has on disk.
     Dictionary(WindowId, String, Box<Dictionary>),
 }
@@ -107,7 +113,9 @@ impl From<accesskit_winit::Event> for Event {
 /// Runs the app until its last window closes.
 pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
     // The file is read while the event loop connects to the display.
-    let reading = options.file.clone().map(|path| thread::spawn(move || files::open(&path, new_style)));
+    // A file to bring in is no document to read: a window offers it once there is one.
+    let document = options.file.clone().filter(|path| !import::offered(path));
+    let reading = document.map(|path| thread::spawn(move || files::open(&path, new_style)));
     let report_launch = options.mode == Mode::LaunchReport;
     let event_loop = event_loop(report_launch)?;
     let home = std::env::home_dir().unwrap_or_default();
@@ -397,6 +405,10 @@ struct DocWindow {
     journal_at: Option<Instant>,
     /// Assets the document names that no save has been handed yet.
     assets: BTreeMap<String, Vec<u8>>,
+    /// The file this window offers to bring in, as it was read for the card that asks about it.
+    plan: Option<Box<Plan>>,
+    /// Files let go over the window since it was last looked at. They come one at a time.
+    dropped: Vec<PathBuf>,
     /// Pictures the page asked for whose files were not to be had while a read or a save was under way.
     awaited: Vec<String>,
     /// The pictures the view was handed, and how wide each could be held at most.
@@ -507,6 +519,18 @@ impl DocWindow {
             }
             self.assets.insert(name, bytes);
         }
+    }
+
+    /// Puts pictures into the document where the selection is, and keeps their files.
+    fn insert(&mut self, pictures: Vec<Picture>, platform: &mut Desktop) {
+        self.view.insert_pictures(pictures, None, platform);
+        self.keep(platform.take_assets());
+    }
+
+    /// Whether the window has no file and nothing to put in one. Such a window gives way to a document
+    /// that is opened from it.
+    fn pristine(&self) -> bool {
+        self.place.home().is_none() && !has_content(self.view.editor().doc())
     }
 
     /// Whether the document's file or the copy kept for it is away on another thread.
@@ -1068,7 +1092,7 @@ impl App {
         event_loop: &ActiveEventLoop,
         opened: Option<Opened>,
         landing: bool,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<WindowId, Box<dyn Error>> {
         // A document with no file was made in this app, though perhaps in a session that ended early.
         let made_here = opened.as_ref().is_none_or(|opened| opened.home.is_none());
         let (document, style, place, rest) = match opened {
@@ -1139,6 +1163,8 @@ impl App {
             journalled_edits: 0,
             journal_at: None,
             assets: BTreeMap::new(),
+            plan: None,
+            dropped: Vec::new(),
             awaited: Vec::new(),
             held: BTreeMap::new(),
         };
@@ -1159,8 +1185,9 @@ impl App {
         window.window.set_visible(true);
         self.mark("window shown");
         window.window.request_redraw();
-        self.windows.insert(window.window.id(), window);
-        Ok(())
+        let id = window.window.id();
+        self.windows.insert(id, window);
+        Ok(id)
     }
 
     /// What the landing card offers: the documents opened lately, with times on the person's own clock.
@@ -1261,6 +1288,20 @@ impl App {
                 Request::Asset(name) => {
                     if let Some(window) = self.windows.get_mut(&id) {
                         window.want(name, &mut self.decoder, &self.proxy);
+                    }
+                }
+                Request::Pictures => {
+                    let Some(window) = self.windows.get_mut(&id) else { continue };
+                    let dialog = FileDialog::new().add_filter("Pictures", &pictures::ENDINGS);
+                    let chosen = dialog.set_parent(&*window.window).pick_files().unwrap_or_default();
+                    // What is no picture after all is left out, and the rest go in.
+                    let read = chosen.iter().filter_map(|file| pictures::read(fs::read(file).ok()?));
+                    window.insert(read.collect(), &mut self.platform);
+                }
+                Request::Import { folders, comments } => self.bring_in(id, &folders, comments),
+                Request::CancelImport => {
+                    if let Some(window) = self.windows.get_mut(&id) {
+                        window.plan = None;
                     }
                 }
                 // A request this shell does not know yet.
@@ -1382,12 +1423,115 @@ impl App {
     fn open_path(&mut self, event_loop: &ActiveEventLoop, path: &Path, parent: Option<WindowId>) -> bool {
         let parent = parent.and_then(|id| self.windows.get(&id)).map(|window| window.window.clone());
         let opened = files::open(path, new_style).map_err(|error| error.to_string());
-        let shown =
-            opened.and_then(|opened| self.open_window(event_loop, Some(opened), false).map_err(|e| e.to_string()));
+        let shown = opened
+            .and_then(|opened| self.open_window(event_loop, Some(opened), false).map_err(|e| e.to_string()))
+            .map(drop);
         if let Err(error) = &shown {
             alert(parent.as_ref(), &format!("{} could not be opened.\n\n{error}", path.display()));
         }
         shown.is_ok()
+    }
+
+    /// Starts bringing in a Markdown or Word file. It is read off this thread, and offered on a card once
+    /// what it holds is known: in the window that asked if that has nothing of its own, else in a new one.
+    fn import(&mut self, event_loop: &ActiveEventLoop, asked: Option<WindowId>, path: PathBuf) {
+        let empty =
+            asked.filter(|id| self.windows.get(id).is_some_and(|window| window.pristine() && window.plan.is_none()));
+        let id = match empty.map(Ok).unwrap_or_else(|| self.open_window(event_loop, None, true)) {
+            Ok(id) => id,
+            Err(error) => return alert(None, &format!("A new window could not be opened.\n\n{error}")),
+        };
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            let plan = Plan::of(&path, &new_style()).map(Box::new);
+            let _ = proxy.send_event(Event::Planned(id, path, plan));
+        });
+    }
+
+    /// Shows the card that asks what to bring in with a file, now that the file has been read.
+    fn offer(&mut self, id: WindowId, path: &Path, plan: Result<Box<Plan>, String>) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => return window.alert(&format!("{name} could not be brought in.\n\n{error}")),
+        };
+        // A folder with the file is named from the file's own folder on, and any other in full.
+        let outer = plan.folder().parent().map(Path::to_owned).unwrap_or_default();
+        let shown = |folder: &PictureFolder| match folder.path.strip_prefix(&outer) {
+            Ok(inside) if folder.beside => {
+                inside.iter().map(|part| part.to_string_lossy()).collect::<Vec<_>>().join(" / ")
+            }
+            _ => folder.path.display().to_string(),
+        };
+        let folders = plan.folders.iter().map(|folder| ImportFolder {
+            path: folder.path.to_string_lossy().into_owned(),
+            shown: shown(folder),
+            pictures: folder.pictures as u32,
+            chosen: folder.beside,
+        });
+        window.view.offer_import(Some(ImportOffer {
+            name,
+            kind: match plan.kind {
+                import::Kind::Markdown => ImportKind::Markdown,
+                import::Kind::Word => ImportKind::Word,
+            },
+            folders: folders.collect(),
+            missing: plan.missing as u32,
+            comments: plan.comments as u32,
+            destination: self.library.shown(&self.library.default_folder()),
+        }));
+        window.plan = Some(plan);
+        window.sync(Instant::now());
+    }
+
+    /// Brings in the file a window offered, with what the person chose on its card, off this thread. The
+    /// document is kept as a new one in the default folder, and the file it came from is left as it is.
+    fn bring_in(&mut self, id: WindowId, folders: &[String], comments: bool) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        let Some(plan) = window.plan.take() else { return window.view.offer_import(None) };
+        // The card names the folders as it was given them.
+        let chosen =
+            plan.folders.iter().filter(|folder| folders.iter().any(|path| *path == folder.path.to_string_lossy()));
+        let choices = Choices { pictures: chosen.map(|folder| folder.path.clone()).collect(), comments };
+        let (proxy, folder) = (self.proxy.clone(), self.library.default_folder());
+        thread::spawn(move || {
+            let name = plan.name.clone();
+            let kept = plan.import(&choices).keep(&folder, &name);
+            let _ = proxy.send_event(Event::Imported(id, kept));
+        });
+    }
+
+    /// Opens the document a file was brought in as, in place of the window that offered it.
+    fn imported(&mut self, event_loop: &ActiveEventLoop, id: WindowId, kept: Result<PathBuf, String>) {
+        if let Some(window) = self.windows.get_mut(&id) {
+            window.view.offer_import(None);
+            window.sync(Instant::now());
+        }
+        match (kept, self.windows.contains_key(&id)) {
+            (Ok(path), true) => self.act(event_loop, id, Action::Open(Some(path))),
+            // The window was closed meanwhile, and the document is there all the same.
+            (Ok(path), false) => _ = self.open_path(event_loop, &path, None),
+            (Err(error), _) => {
+                let parent = self.windows.get(&id).map(|window| &window.window);
+                alert(parent, &format!("The file could not be brought in.\n\n{error}"));
+            }
+        }
+    }
+
+    /// Takes the files that were let go over a window: pictures go into its document, and a single file
+    /// of another kind is opened.
+    fn take_dropped(&mut self, event_loop: &ActiveEventLoop, id: WindowId, files: Vec<PathBuf>) {
+        let pictures = pictures::from_files(&files);
+        match (self.windows.get_mut(&id), files.as_slice()) {
+            (Some(window), _) if !pictures.is_empty() => {
+                // Where they were let go is not known: the desktop does not say.
+                window.insert(pictures, &mut self.platform);
+                window.sync(Instant::now());
+            }
+            (Some(_), [file]) => self.act(event_loop, id, Action::Open(Some(file.clone()))),
+            _ => {}
+        }
     }
 
     fn act(&mut self, event_loop: &ActiveEventLoop, id: WindowId, action: Action) {
@@ -1400,12 +1544,20 @@ impl App {
             Action::Open(path) => {
                 let Some(window) = self.windows.get(&id) else { return };
                 let pick = || {
-                    let dialog = FileDialog::new().add_filter("Letters document", &[EXTENSION]);
+                    let mut known = vec![EXTENSION];
+                    known.extend(import::ENDINGS);
+                    let dialog = FileDialog::new()
+                        .add_filter("Documents", &known)
+                        .add_filter("Letters document", &[EXTENSION])
+                        .add_filter("Markdown and Word", &import::ENDINGS);
                     dialog.set_directory(self.library.default_folder()).set_parent(&*window.window).pick_file()
                 };
                 let Some(path) = path.or_else(pick) else { return };
+                if import::offered(&path) {
+                    return self.import(event_loop, Some(id), path);
+                }
                 // A window with no file and nothing to put in one gives way to the document that was asked for.
-                let pristine = window.place.home().is_none() && !has_content(window.view.editor().doc());
+                let pristine = window.pristine();
                 match self.open_path(event_loop, &path, Some(id)) {
                     true if pristine => {
                         if let Some(mut window) = self.windows.remove(&id) {
@@ -1492,9 +1644,15 @@ impl ApplicationHandler<Event> for App {
             documents.into_iter().try_for_each(|opened| {
                 let landing = opened.is_none();
                 self.open_window(event_loop, opened, landing)
+                    .map(drop)
                     .map_err(|error| format!("No window could be opened.\n\n{error}"))
             })
         });
+        // A Markdown or Word file that was asked for is offered in a window that has nothing of its own.
+        if let Some(path) = self.path.clone().filter(|path| shown.is_ok() && import::offered(path)) {
+            let empty = self.windows.iter().find(|(_, window)| window.pristine()).map(|(id, _)| *id);
+            self.import(event_loop, empty, path);
+        }
         if let Err(failure) = shown {
             if !self.report_launch {
                 alert(None, &failure);
@@ -1672,6 +1830,8 @@ impl ApplicationHandler<Event> for App {
                 window.view.scroll(window.pointer, delta, platform);
             }
             WindowEvent::CloseRequested => action = Some(Action::Close),
+            // Several files come one after another, and are taken together once all of them are here.
+            WindowEvent::DroppedFile(file) => window.dropped.push(file),
             _ => {}
         }
         // A paste or a drop may have put pictures in.
@@ -1747,6 +1907,8 @@ impl ApplicationHandler<Event> for App {
                 let Some(window) = self.windows.get_mut(&id) else { return };
                 window.picture(asset, image, within);
             }
+            Event::Planned(id, path, plan) => self.offer(id, &path, plan),
+            Event::Imported(id, kept) => self.imported(event_loop, id, kept),
             Event::Account(name) => {
                 self.account = Some(name);
                 let writer = self.settings.name.as_deref().or(self.account.as_deref());
@@ -1820,6 +1982,12 @@ impl ApplicationHandler<Event> for App {
         let now = Instant::now();
         let now_ms = self.platform.now_ms();
         self.vouch();
+        let dropped = |(id, window): (&WindowId, &mut DocWindow)| {
+            Some((*id, std::mem::take(&mut window.dropped))).filter(|(_, files)| !files.is_empty())
+        };
+        for (id, files) in self.windows.iter_mut().filter_map(dropped).collect::<Vec<_>>() {
+            self.take_dropped(event_loop, id, files);
+        }
         let mut next: Option<Instant> = None;
         for window in self.windows.values_mut() {
             if window.wake_ms.is_some_and(|wake| wake <= now_ms) {

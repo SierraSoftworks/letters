@@ -27,6 +27,9 @@ pub fn widest(style: &Style, scale: f64) -> u32 {
     (text * scale).ceil().max(1.0) as u32
 }
 
+/// How the files of the pictures a document keeps are named.
+pub const ENDINGS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
 /// The media type of a picture in one of the formats a document keeps, told by its first bytes.
 pub fn mime(bytes: &[u8]) -> Option<&'static str> {
     match bytes {

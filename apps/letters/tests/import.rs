@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use letters::import::{Choices, Kind, Plan};
+use letters::import::{self, Choices, Kind, Plan};
 use letters_convert::to_docx;
 use letters_model::{Anchor, Block, BlockKind, Document, Note, NoteKind, Notes, Run, Style};
 
@@ -143,4 +143,41 @@ fn a_plan_and_what_it_makes_can_cross_threads() {
     fn sendable<T: Send>() {}
     sendable::<Plan>();
     sendable::<letters::import::Imported>();
+}
+
+#[test]
+fn a_file_is_offered_for_import_by_its_ending() {
+    let cases = [
+        ("Notes.md", true),
+        ("notes/Trip.MARKDOWN", true),
+        ("Report.docx", true),
+        ("Report.let", false),
+        ("Report.doc", false),
+        ("md", false),
+        ("Picture.png", false),
+    ];
+    for (path, offered) in cases {
+        assert_eq!(import::offered(Path::new(path)), offered, "{path}");
+    }
+}
+
+#[test]
+fn an_imported_document_is_kept_under_a_free_name_and_replaces_nothing() {
+    let folder = Folder::new("keep");
+    let library = folder.0.join("Letters");
+    let import = || Plan::of(&notes(&folder), &Style::default()).map(|plan| plan.import(&plan_choices(&folder)));
+    fn plan_choices(folder: &Folder) -> Choices {
+        Choices { pictures: vec![folder.0.join("notes")], comments: true }
+    }
+
+    let first = import().unwrap().keep(&library, "Animals").expect("the folder is made for it");
+    let second = import().unwrap().keep(&library, "Animals").expect("another name is free");
+
+    assert_eq!(first, library.join("Animals.let"));
+    assert_ne!(second, first, "the first is not replaced");
+    for kept in [&first, &second] {
+        let opened = letters::files::open(kept, Style::default).expect("what was kept opens as a document");
+        assert_eq!(pictures(&opened.document, 0).1, 2, "{}", kept.display());
+    }
+    assert!(folder.0.join("notes/Animals.md").exists(), "the file it came from is left alone");
 }

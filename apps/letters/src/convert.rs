@@ -25,9 +25,9 @@ use crate::files;
 use crate::import::{Choices, Plan, normal};
 
 /// The extensions of the Markdown files an import looks for in a folder.
-const MARKDOWN: [&str; 2] = ["md", "markdown"];
+pub(crate) const MARKDOWN: [&str; 2] = ["md", "markdown"];
 /// The extension of the Word files it looks for.
-const WORD: &str = "docx";
+pub(crate) const WORD: &str = "docx";
 /// Runs `letters export`.
 pub fn export(export: &Export) -> ExitCode {
     match try_export(export) {
@@ -285,12 +285,12 @@ fn find(path: &Path, recursive: bool, found: &mut Vec<(PathBuf, Option<String>)>
     }
 }
 
-fn is_markdown(path: &Path) -> bool {
+pub(crate) fn is_markdown(path: &Path) -> bool {
     let extension = path.extension().unwrap_or_default();
     MARKDOWN.iter().any(|known| extension.eq_ignore_ascii_case(known))
 }
 
-fn is_word(path: &Path) -> bool {
+pub(crate) fn is_word(path: &Path) -> bool {
     path.extension().unwrap_or_default().eq_ignore_ascii_case(WORD)
 }
 

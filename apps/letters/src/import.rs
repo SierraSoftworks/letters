@@ -17,7 +17,8 @@ use letters_convert::{DocxImport, ImportNote, from_docx, import_markdown};
 use letters_format::Package;
 use letters_model::{Anchor, Document, Note, NoteKind, Notes, Run, Style};
 
-use crate::{files, platform};
+use crate::library::free_path;
+use crate::{convert, files, platform};
 
 /// How a zip starts, and how the older kind of Word file does. Either is read as Word, whatever its name.
 const WORD_STARTS: [&[u8]; 2] = [b"PK\x03\x04", &[0xd0, 0xcf, 0x11, 0xe0]];
@@ -25,6 +26,15 @@ const WORD_STARTS: [&[u8]; 2] = [b"PK\x03\x04", &[0xd0, 0xcf, 0x11, 0xe0]];
 const LARGEST_PICTURE: u64 = 64 << 20;
 /// The name import notes are written under.
 const IMPORTER: &str = "Letters import";
+
+/// The endings of the files a window brings in when it is asked to open them.
+pub const ENDINGS: [&str; 3] = [convert::MARKDOWN[0], convert::MARKDOWN[1], convert::WORD];
+
+/// Whether `path` is named as a file to bring in and not as a document: a window opens the one and offers
+/// to import the other.
+pub fn offered(path: &Path) -> bool {
+    convert::is_markdown(path) || convert::is_word(path)
+}
 
 /// What kind of file is being brought in. It is told from what the file holds, not from its name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +70,26 @@ pub struct Imported {
     pub package: Package,
     /// How many passages the import simplified. Each carries a note that says how.
     pub notes: usize,
+}
+
+impl Imported {
+    /// Keeps the document as a new file in `folder`, called `name` or by the next name after it that is
+    /// free, and returns where. No file is replaced.
+    pub fn keep(&self, folder: &Path, name: &str) -> Result<PathBuf, String> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        letters_format::write(&mut bytes, &self.package).map_err(|error| error.to_string())?;
+        fs::create_dir_all(folder).map_err(|error| error.to_string())?;
+        // A name that was free may be taken by the time it is written: the next one is tried then.
+        for _ in 0..8 {
+            let path = free_path(folder, name);
+            match convert::write(&path, bytes.get_ref(), false) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err(format!("no name like {name} is free in {}", folder.display()))
+    }
 }
 
 /// A file that can be brought in, and what there is to choose about it.
