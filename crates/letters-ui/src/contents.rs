@@ -109,8 +109,9 @@ impl Contents {
 
     /// Shows what a press on a table would do: the line under the pointer is filled, and the table under
     /// the pointer, or the one that is selected, has its chip. `accent` is the person's accent as it is
-    /// written on a surface.
-    pub fn paint(&self, table: &ContentsBox, accent: Ink, scheme: Scheme, out: &mut DisplayList) {
+    /// written on a surface, and `chip` whether the table has a chip at all: it opens what changes the
+    /// table, which is for someone who writes.
+    pub fn paint(&self, table: &ContentsBox, (accent, chip): (Ink, bool), scheme: Scheme, out: &mut DisplayList) {
         let over = self.over.as_ref().filter(|(block, _)| *block == table.block).map(|(_, part)| part);
         let open = self.open.as_ref() == Some(&table.block);
         if let Some(Part::Line(heading)) = over
@@ -120,7 +121,7 @@ impl Contents {
             let color = resolve(tokens::NEUTRAL_SOFT, scheme, 1.0);
             out.push(Item::Fill { rect, color, radius: tokens::RADIUS_CONTROL });
         }
-        if over.is_some() || open {
+        if chip && (over.is_some() || open) {
             let lit = open || over == Some(&Part::Chip);
             pictures::sign(badge(table), icon::LIST_TREE, lit, (tokens::FG_MUTED, accent), scheme, out);
         }

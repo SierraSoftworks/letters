@@ -156,6 +156,19 @@ pub enum Connection {
     Refused(String),
 }
 
+/// What the person may do with the document, as its server granted it. A document is theirs to change
+/// until a shell says otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Access {
+    /// They change it, comment on it and read it.
+    #[default]
+    Edits,
+    /// They comment on it and read it: a comment is added, answered or resolved, and nothing else changes.
+    Comments,
+    /// They read it.
+    Reads,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Panel {
     Styles,
@@ -268,6 +281,24 @@ pub enum Message {
     History(Historying),
     /// What is asked about the conflicts that wait, and about the one that is open.
     Review(Reviewing),
+}
+
+impl Message {
+    /// Whether this asks for something that is for writing the document: what changes it, and what opens
+    /// a card, a list or a view that does. Of the editor's commands the editor says which apply.
+    fn writes(&self) -> bool {
+        match self {
+            Message::Text(_) | Message::Correct(_) | Message::Learn { .. } | Message::Misspelling { .. } => true,
+            Message::Rename(_) | Message::EditLink | Message::LinkDraft(_) | Message::LinkApply => true,
+            Message::Maths(_) | Message::Insert(_) | Message::Fence(_) | Message::Refer(_) => true,
+            Message::Language(_) | Message::Callout(_) | Message::Contents(_) | Message::Preview(_) => true,
+            Message::Alt(_) | Message::Styles(_) | Message::Restyle(_) | Message::Draft(..) => true,
+            Message::Apply(_) | Message::Merge(_) | Message::History(_) => true,
+            Message::Panel(panel) => *panel == Panel::Styles,
+            Message::Linked(asked) => matches!(asked, Linking::Embed | Linking::EmbedAll),
+            _ => false,
+        }
+    }
 }
 
 impl Ui<EditorApp> {
@@ -459,6 +490,18 @@ impl Ui<EditorApp> {
     pub fn set_connection(&mut self, connection: Option<Connection>) {
         if self.app().connection != connection {
             self.app_mut().connection = connection;
+        }
+    }
+
+    /// Says what the person may do with the document: see [`Access`]. A shell says it of a document a
+    /// server keeps, from the role its session was given, and again whenever the role changes. With less
+    /// than [`Access::Edits`] nothing the person does changes the text, the bar says so where its tools
+    /// stood, and the page offers only what reads: selecting, copying, finding, following a link. With
+    /// [`Access::Reads`] no comment is written either. What others write still comes in through
+    /// [`Window::change`].
+    pub fn set_access(&mut self, access: Access) {
+        if self.app().access != access {
+            self.app_mut().grant(access);
         }
     }
 
@@ -780,10 +823,9 @@ impl Ui<EditorApp> {
     /// page shows as it does anywhere.
     pub fn set_preview_fetching(&mut self, offered: bool) {
         let app = self.app_mut();
-        app.previews.offer(offered);
+        app.fetching = offered;
         app.editor.set_preview_fetching(offered);
-        // A card that gives up the room of its control, or takes it again, leaves what is read where it is.
-        app.held(|app| app.layout.set_preview_control(offered));
+        app.offer_fetches();
     }
 
     /// Says that the page at an address was not fetched and why, in a few words that read on from
@@ -797,6 +839,7 @@ impl Ui<EditorApp> {
     /// files dragged over the window are: a bar beside a picture, or between two blocks. `None` puts the
     /// bar away. Returns whether the point is on the page.
     pub fn drag_pictures(&mut self, at: Option<Point>) -> bool {
+        let at = at.filter(|_| self.app().writes());
         let spot = at.and_then(|at| self.on_canvas(at)).and_then(|at| self.app().spot(at));
         let bar = spot.as_ref().and_then(|(_, bar)| *bar);
         if self.app().drop != bar {
@@ -1016,6 +1059,10 @@ pub struct EditorApp {
     save: SaveState,
     /// How the window stands to the server that keeps the document, when one does.
     connection: Option<Connection>,
+    /// What the person may do with the document.
+    access: Access,
+    /// Whether the shell fetches what a page says of itself. Only someone who writes is offered a fetch.
+    fetching: bool,
     /// Who else has the document open.
     presence: Presence,
     edits: u64,
@@ -1128,6 +1175,8 @@ impl EditorApp {
             mac: cfg!(target_os = "macos"),
             save: SaveState::default(),
             connection: None,
+            access: Access::default(),
+            fetching: true,
             presence: Presence::default(),
             edits: 0,
             panel: None,
@@ -1309,7 +1358,8 @@ impl EditorApp {
         let mut hasher = DefaultHasher::new();
         let differs = self.styles.differs(self.editor.model().style());
         let chrome = (self.chrome.buttons.len(), self.chrome.inset_start.to_bits());
-        (width.to_bits(), self.name(), style, differs, chrome, self.presence.shown()).hash(&mut hasher);
+        let people = (self.presence.shown(), self.access as u8);
+        (width.to_bits(), self.name(), style, differs, chrome, people).hash(&mut hasher);
         let key = hasher.finish();
         if key != self.folded.key {
             self.folded = Folded { key, form: None, seen: Fitted::default() };
@@ -1448,6 +1498,9 @@ impl EditorApp {
     /// versions trade places, or settles it with the one on the page. The page keeps its place while the
     /// block's other version comes or goes.
     fn reviewing(&mut self, asked: Reviewing, platform: &mut dyn Platform) {
+        if matches!(asked, Reviewing::Keep | Reviewing::Use) && !self.settles() {
+            return;
+        }
         match asked {
             Reviewing::Step { back } => {
                 let Some(next) = self.margin.step(back) else { return };
@@ -1463,8 +1516,7 @@ impl EditorApp {
                 app.sync();
             }),
             Reviewing::Use => {
-                let held = self.review.held_back().filter(|_| self.margin.refused.is_none());
-                let Some((block, version)) = held else { return };
+                let Some((block, version)) = self.review.held_back() else { return };
                 // A version that took the block out leaves nothing to write on: using it settles.
                 let settles = version.is_none();
                 let command = Command::UseVersion { block, version };
@@ -1514,7 +1566,8 @@ impl EditorApp {
     /// The selected picture and its place, when it stands alone. One of a gallery takes its size from its
     /// row, so it has no corners to be resized by.
     fn lone_picture(&self) -> Option<(BlockId, Rect)> {
-        let figure = self.editor.picture().filter(|figure| self.gallery_of(figure).is_none())?;
+        let alone = |figure: &&BlockId| self.writes() && self.gallery_of(figure).is_none();
+        let figure = self.editor.picture().filter(alone)?;
         Some((figure.clone(), self.layout.figure(figure)?.image))
     }
 
@@ -1547,7 +1600,7 @@ impl EditorApp {
     /// The line under the selected picture while nothing is written or numbered there, and where on it
     /// the hint to write a caption stands.
     fn hint(&self) -> Option<(Rect, Rect)> {
-        let figure = self.editor.picture()?;
+        let figure = self.editor.picture().filter(|_| self.writes())?;
         let (line, holder) = self.caption_of(figure)?;
         let numbers = self.gallery_of(figure).or_else(|| self.editor.doc().block(figure));
         let numbered = numbers.is_some_and(|block| {
@@ -1565,7 +1618,7 @@ impl EditorApp {
     /// The figure whose alt text the switch under it turns to, the line under its picture and where the
     /// switch stands at the end of that line.
     fn alt_switch(&self) -> Option<(&BlockId, Rect, Rect)> {
-        let figure = self.captioned()?;
+        let figure = self.captioned().filter(|_| self.writes())?;
         let (line, holder) = self.caption_of(figure)?;
         let first = holder.and_then(|block| self.layout.caret(&Pos::new(block.id.clone(), 0)));
         let first = first.map_or((line.y, line.height), |caret| (caret.y, caret.height));
@@ -1661,7 +1714,7 @@ impl EditorApp {
         // The version stands under the id the note is about, whatever it goes by itself.
         let block = Box::new(Block { id: note.anchor.block.clone(), ..version });
         let back = Command::PutBack { block, stood: note.anchor.stood.clone()? };
-        (self.margin.refused.is_none() && self.editor.applies(&back)).then_some(back)
+        (self.settles() && self.editor.applies(&back)).then_some(back)
     }
 
     /// The first and the last line of the passage a note is about, in the layout's coordinates: of its
@@ -1745,7 +1798,8 @@ impl EditorApp {
     /// last when there is no room above.
     fn selection_tools(&self, viewport: Rect) -> Option<Popover<Message>> {
         let selection = self.editor.selection().filter(|selection| !selection.is_caret())?;
-        if self.dragging || !self.margin.offers() || self.commands.open() {
+        // Someone who only reads has nothing to make of what they select.
+        if self.dragging || !self.margin.offers() || self.commands.open() || self.margin.reads {
             return None;
         }
         // A place that was found is selected to be looked at, not to have something made of it.
@@ -1757,7 +1811,8 @@ impl EditorApp {
         let (first, last) = (lines.first()?, lines.last()?);
         let above = self.onto(*first).y >= notes::TOOLS_ROOM;
         let from = if above { first } else { last };
-        Some(Margin::tools(self.editor.link().is_some(), above).at(self.onto(*from)))
+        let linked = self.writes().then(|| self.editor.link().is_some());
+        Some(Margin::tools(linked, above).at(self.onto(*from)))
     }
 
     /// Does what the field of a picture's alt text asked.
@@ -1892,6 +1947,23 @@ impl EditorApp {
         let beside = |at: usize, count: usize, on: bool| {
             if on { Some(at + 1).filter(|to| *to < count) } else { at.checked_sub(1) }
         };
+        // Someone who does not write is offered what reads the document, and a comment where they may
+        // write one. Of the editor's own commands the editor says which apply.
+        let reads = match act {
+            Act::Run(_) | Act::Load | Act::AlwaysLoad | Act::Panel(Panel::Notes) | Act::Review(_) => true,
+            Act::NewDocument | Act::Open | Act::SaveCopy | Act::Export | Act::CleanCopy | Act::Share => true,
+            Act::Settings | Act::TrustDocument | Act::TrustFolder | Act::Print => true,
+            Act::Find | Act::FindStep { .. } | Act::Palette => true,
+            Act::Comment => !self.margin.reads,
+            Act::MoveRow { .. } | Act::MoveColumn { .. } | Act::Link | Act::Pictures | Act::Preview => false,
+            Act::AltText | Act::Callout | Act::CodeLanguage | Act::Embed | Act::EmbedAll => false,
+            Act::Panel(Panel::Styles) | Act::Rename | Act::Save | Act::PageSetup => false,
+            Act::MergeConflicts | Act::MergeFrom | Act::MergeInto => false,
+            Act::History | Act::SelectionHistory | Act::Misspelling { .. } | Act::Replace => false,
+        };
+        if !(reads || self.writes()) {
+            return None;
+        }
         let message = match act {
             Act::Run(command) => {
                 // The editor says where a command applies. One that turns something on or off is listed
@@ -1960,7 +2032,7 @@ impl EditorApp {
                 (touched.is_some() && !self.carded()).then_some(Message::History(Historying::Passage))?
             }
             Act::Review(asked) => {
-                let (open, can) = (self.margin.reviewing().is_some(), self.margin.refused.is_none());
+                let (open, can) = (self.margin.reviewing().is_some(), self.settles());
                 let fits = match asked {
                     // With one conflict that is open already there is nowhere to step to.
                     Reviewing::Step { .. } => self.margin.conflicts().len() > usize::from(open),
@@ -1994,6 +2066,62 @@ impl EditorApp {
             self.printing = None;
             self.leave();
         }
+    }
+
+    /// Whether the document is the person's to change.
+    fn writes(&self) -> bool {
+        self.access == Access::Edits
+    }
+
+    /// Whether the person may choose between the versions of a conflict: the choice changes the text, and
+    /// is kept in the notes.
+    fn settles(&self) -> bool {
+        self.writes() && self.margin.refusal().is_none()
+    }
+
+    /// Takes what the person may do with the document from here on. What was out to change it goes.
+    fn grant(&mut self, access: Access) {
+        self.access = access;
+        let writes = self.writes();
+        self.editor.set_read_only(!writes);
+        self.margin.reads = access == Access::Reads;
+        if self.margin.reads {
+            self.margin.drop_draft();
+        }
+        self.find.only_finds(!writes);
+        self.offer_fetches();
+        self.spelling.hush(!writes, self.editor.doc(), &mut self.layout);
+        self.printing.iter_mut().for_each(|print| print.fix(!writes));
+        self.mark();
+        if writes {
+            return;
+        }
+        self.put_away();
+        (self.context, self.callouts.open, self.tables.open, self.renaming) = (None, None, None, None);
+        (self.picked, self.draft) = (None, None);
+        self.languages.close();
+        self.insert.close();
+        self.fence.close();
+        self.commands.close();
+        if self.grip.release() {
+            self.drop = None;
+        }
+        if self.panel == Some(Panel::Styles) {
+            self.show(None);
+        }
+        // The history offers what was written before to be had back, which is for someone who writes.
+        if self.history.is_some() {
+            self.leave();
+        }
+    }
+
+    /// Offers the fetch of what a page says of itself where the shell fetches and the person writes: what
+    /// is fetched is kept in the document.
+    fn offer_fetches(&mut self) {
+        let offered = self.fetching && self.writes();
+        self.previews.offer(offered);
+        // A card that gives up the room of its control, or takes it again, leaves what is read where it is.
+        self.held(|app| app.layout.set_preview_control(offered));
     }
 
     /// Whether a view has the page's place: Print view, or the history.
@@ -2219,7 +2347,9 @@ impl EditorApp {
                 self.dragging = false;
                 self.unpoint();
                 let reading = self.layout.hit(Point { x: 0.0, y: self.viewport().y.max(0.0) });
-                self.printing = Some(Print::new(reading));
+                let mut print = Print::new(reading);
+                print.fix(!self.writes());
+                self.printing = Some(print);
                 // The nodes that stand for the blocks go with the page, and are told whole when it is back.
                 self.told.get_mut().forget();
             }
@@ -2464,7 +2594,7 @@ impl EditorApp {
         self.spelling.moved(caret, &mut self.layout);
         self.light();
         // A document without a name takes its first Heading 1, once the caret has left it.
-        let heading = self.heading().filter(|_| self.location.name.is_none());
+        let heading = self.heading().filter(|_| self.location.name.is_none() && self.writes());
         let naming = heading.zip(head.as_ref()).is_some_and(|(heading, head)| heading.id == head.block);
         let name = heading.map(|heading| heading.plain_text().trim().to_owned()).filter(|name| !name.is_empty());
         if let (true, false, Some(name)) = (self.naming, naming, name) {
@@ -2671,7 +2801,7 @@ impl EditorApp {
 
     /// The callout whose icon and title are at a point of the page area, while nothing hangs over the page.
     fn callout_at(&self, at: Point) -> Option<BlockId> {
-        if self.hung() || self.away() {
+        if self.hung() || self.away() || !self.writes() {
             return None;
         }
         let at = self.in_layout(at);
@@ -2706,7 +2836,9 @@ impl EditorApp {
         }
         let at = self.in_layout(at);
         let tables = self.layout.contents(Rect::new(at.x, at.y, 0.0, 1.0));
-        tables.iter().find_map(|table| Some((table.block.clone(), contents::part_at(table, at)?)))
+        // The chip opens what changes the table, for someone who writes. A line leads to its heading.
+        let offered = |part: &contents::Part| self.writes() || *part != contents::Part::Chip;
+        tables.iter().find_map(|table| Some((table.block.clone(), contents::part_at(table, at).filter(offered)?)))
     }
 
     /// Does what is asked of a table of contents and of its bar.
@@ -2919,7 +3051,7 @@ impl EditorApp {
 
     /// The code block whose language is at a point of the page area.
     fn language_at(&self, at: Point) -> Option<BlockId> {
-        let (block, code, at) = self.code_box_at(at)?;
+        let (block, code, at) = self.code_box_at(at).filter(|_| self.writes())?;
         let (_, named, _) = self.language_label(&block, code)?;
         named.contains(at).then_some(block)
     }
@@ -3000,7 +3132,7 @@ impl EditorApp {
         }
         let menu = self.tables.open.is_some();
         let gripped = self.grip.resizing.is_some() || self.grip.moving.is_some();
-        if (self.hung() && !menu) || self.cut().is_some() || gripped {
+        if (self.hung() && !menu) || self.cut().is_some() || gripped || !self.writes() {
             return None;
         }
         let pointer = self.references.rest().filter(|_| !menu).map(|at| self.in_layout(at));
@@ -3116,7 +3248,7 @@ impl EditorApp {
         let called = (std::mem::replace(&mut self.languages.over, named.clone()) != named) || called;
         let listed = self.references.rest().and_then(|at| self.contents_at(at));
         let called = self.contents.point(listed) || called;
-        let carded = self.references.rest().and_then(|at| self.preview_at(at));
+        let carded = self.references.rest().filter(|_| self.writes()).and_then(|at| self.preview_at(at));
         let called = (std::mem::replace(&mut self.previews.over, carded.clone()) != carded) || called;
         let peeked = self.references.rest().and_then(|at| self.peek_at(at));
         let called = self.peeks.point(peeked) || called;
@@ -3231,10 +3363,11 @@ impl EditorApp {
                 }
                 // A press on a link preview opens its card, and one on its control fetches its page. With
                 // Ctrl or Cmd held the preview is a link like any other.
-                if let Some((preview, on_control)) = self.preview_at(at) {
+                let follows = mods.primary && !mods.shift && clicks == 1;
+                // To someone who only reads, a preview is a link and nothing else.
+                if let Some((preview, on_control)) = self.preview_at(at).filter(|_| follows || self.writes()) {
                     self.dragging = false;
                     self.references.press(None);
-                    let follows = mods.primary && !mods.shift && clicks == 1;
                     return match self.address_of(&preview).filter(|_| follows).map(str::to_owned) {
                         Some(href) => self.open_link(&href, false),
                         None if on_control => self.fetch_preview(&preview),
@@ -3305,7 +3438,7 @@ impl EditorApp {
                     let cloud = figure.badge.is_some_and(|badge| pictures::pressed(badge, on_page));
                     if cloud && self.link_of(&head.block).is_some() {
                         self.link_menu(head.block);
-                    } else {
+                    } else if self.writes() {
                         self.grip.moving = Some(Moving::start(head.block, at));
                     }
                     return self.reveal();
@@ -3608,7 +3741,8 @@ impl EditorApp {
         // next move.
         if !self.dragging {
             let within = self.editor.selection().filter(|selection| selection.anchor.block == selection.head.block);
-            let named = within.map(|selection| selection.head.block.clone());
+            // Only someone who writes has a caption to write there.
+            let named = within.filter(|_| self.writes()).map(|selection| selection.head.block.clone());
             if named == self.captions.named {
                 self.layout.set_caption_open(named.as_ref());
             } else {
@@ -3645,7 +3779,8 @@ impl EditorApp {
         let selection = self.editor.selection();
         // A formula with the caret in it has its source out on a sheet, while the place under it is in view
         // and nothing else hangs from the page.
-        let alone = self.landing.is_none()
+        let alone = self.writes()
+            && self.landing.is_none()
             && self.importing.is_none()
             && self.copying.is_none()
             && self.context.is_none()
@@ -3717,7 +3852,7 @@ impl EditorApp {
             Item::Stroke { rect, color, width: 2.0, radius: tokens::RADIUS_CARD }
         };
         for table in self.layout.contents(viewport) {
-            self.contents.paint(&table, self.accent.text, self.scheme, &mut list);
+            self.contents.paint(&table, (self.accent.text, self.writes()), self.scheme, &mut list);
             if self.contents.open.as_ref() == Some(&table.block) {
                 // A table has no frame of its own, so its ring stands off its lines.
                 list.items.push(ring(table.rect, (tokens::SPACE_SM, tokens::SPACE_XS)));
@@ -3811,13 +3946,13 @@ impl EditorApp {
         self.presence.carets(&self.layout, reach, self.shaper.as_ref(), self.scheme, &mut list);
         // What stands round the two versions of the conflict that is open, and the one held back.
         let (mut under, mut over) = (DisplayList::default(), DisplayList::default());
-        let (cut, shift) = (self.cut(), self.shift());
+        let (cut, shift, choosing) = (self.cut(), self.shift(), self.settles());
         let cuts = cut.as_ref().map_or_else(Vec::new, |cut| {
             let shown = Shown {
                 shift,
                 room,
                 now: &self.margin.now,
-                choosing: self.margin.refused.is_none(),
+                choosing,
                 page: self.palette.page,
                 scheme: self.scheme,
                 shaper: self.shaper.as_ref(),
@@ -3887,7 +4022,8 @@ impl EditorApp {
             });
             let spot = self.onto(from);
             let (loaded, said) = (self.images.get(src).is_some(), self.linked.said(src));
-            let menu = pictures::menu(src, loaded, said, self.linked.vouched(src), self.safe.on());
+            let trust = (self.linked.vouched(src), self.safe.on());
+            let menu = pictures::menu(src, loaded, said, trust, self.writes());
             let menu = menu.popover().at(spot).align(Align::End);
             element = element.popover(menu.open(true).on_close(Message::Linked(Linking::Close)));
         } else if let Some(menu) = self.table_menu() {
@@ -3935,7 +4071,8 @@ impl EditorApp {
         } else if let Some(context) = &self.context {
             let asked = |act: &Act| self.asked(act);
             let fix = self.spelling.fix.as_ref();
-            let about = About { editor: &self.editor, asked: &asked, mac: self.mac, fix, room: room.height };
+            let (mac, writes) = (self.mac, self.writes());
+            let about = About { editor: &self.editor, asked: &asked, mac, writes, fix, room: room.height };
             element = element.popover(context.menu(&about));
         } else if let Some(address) = &self.link {
             let field = TextField::new("Link", address)
@@ -3990,7 +4127,7 @@ impl EditorApp {
             let look = (self.palette.selection, self.shaper.as_ref() as &dyn TextShaper);
             let field = reply.field(desk, look, ("Reply", "Reply"), Noting::Answer);
             let said = self.said.of(note, threads::SAID, self.palette);
-            let (now, refused) = (self.margin.now.as_str(), self.margin.refused.as_deref());
+            let (now, refused) = (self.margin.now.as_str(), self.margin.refusal());
             let thread = threads::thread(note, (field, reply.is_blank()), said, now, refused, ways);
             element = element.popover(match under {
                 Some(under) => thread.at(under),
@@ -4252,8 +4389,11 @@ impl EditorApp {
                     .icon(icon::PRINTER)
                     .aside(keys(Act::Print))
                     .on_select(Message::Print(Printing::Show)),
-            )
-            .item(MenuItem::new("Page setup").icon(icon::FILE_TEXT).on_select(Message::Styles(Styling::PageSetup)))
+            );
+        // The page is set up by someone who writes on it.
+        let setup = MenuItem::new("Page setup").icon(icon::FILE_TEXT).on_select(Message::Styles(Styling::PageSetup));
+        let more = if self.writes() { more.item(setup) } else { more };
+        let more = more
             .separator()
             .item(MenuItem::new("Settings").icon(icon::SETTINGS).on_select(Message::Settings(Setting::Show)));
 
@@ -4282,12 +4422,16 @@ impl EditorApp {
         bar = bar.end(Button::new("Share").icon(icon::USERS).small().on_press(Message::Share(true)).popover(share));
         bar = bar.end(TopBar::rule());
         let mut panels = cluster();
-        for (panel, icon) in Panel::ALL {
+        // The styles are changed in their panel, and the history has what was written before to be had
+        // back: both are for someone who writes.
+        let writes = self.writes();
+        for (panel, icon) in Panel::ALL.into_iter().filter(|(panel, _)| writes || *panel != Panel::Styles) {
             let button = tool(icon, panel.title()).pressed(self.panel == Some(panel));
             panels = panels.child(button.on_press(Message::Panel(panel)));
         }
         // The history is no panel: it takes the page's place, and lists the versions beside it.
-        panels = panels.child(tool(icon::HISTORY, "History").on_press(Message::History(Historying::Show)));
+        let history = tool(icon::HISTORY, "History").on_press(Message::History(Historying::Show));
+        panels = panels.children(writes.then_some(history));
         bar.end(panels.child(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End))))
     }
 
@@ -4302,16 +4446,18 @@ impl EditorApp {
         }
         let style = TextStyle::control().weight(if own { 600 } else { 400 });
         // The name gives way to the controls after it, down to a few letters.
-        let name = Element::text(name.as_str(), style)
-            .min_width(NAME_WIDTH.0)
-            .max_width(room)
-            .shrink()
-            .role(Role::Button)
-            .label(name)
-            .description("Rename or move")
-            .tooltip("Rename or move", Side::Bottom)
-            .on_press(Message::Rename(Rename::Open))
-            .cursor(Cursor::Text);
+        let said = Element::text(name.as_str(), style).min_width(NAME_WIDTH.0).max_width(room).shrink();
+        // A document is named and moved by someone who writes it.
+        let name = match self.writes() {
+            true => said
+                .role(Role::Button)
+                .label(name)
+                .description("Rename or move")
+                .tooltip("Rename or move", Side::Bottom)
+                .on_press(Message::Rename(Rename::Open))
+                .cursor(Cursor::Text),
+            false => said,
+        };
         // On a title bar a drag that starts on the name moves the window, and only a click renames.
         let name = if self.chrome.titled() { name.on_drag(Message::Ask(Request::DragWindow)) } else { name };
         let name = if own { name } else { name.fg(tokens::FG_MUTED) };
@@ -4374,6 +4520,9 @@ impl EditorApp {
     /// The bar's format controls: undo and redo, the style of the type under the caret, then the marks and
     /// the link. `fold` says how much of it goes into menus, for a window too narrow to show it all.
     fn tools(&self, fold: Fold) -> Vec<Element<Message>> {
+        if !self.writes() {
+            return vec![TopBar::rule(), self.granted()];
+        }
         let run = |icon, label: &str, command: Command| tool(icon, label).on_press(Message::Run(command));
         let history = cluster()
             .child(run(icon::UNDO_2, "Undo", Command::Undo).disabled(!self.editor.can_undo()))
@@ -4400,6 +4549,29 @@ impl EditorApp {
         let link = tool(icon::LINK, "Link").pressed(self.editor.link().is_some()).on_press(Message::EditLink);
         tools.push(marks.child(link));
         tools
+    }
+
+    /// What the bar has where its tools would stand, for someone who may not change the document: what
+    /// they may do with it, under the icon their role has wherever it shows.
+    fn granted(&self) -> Element<Message> {
+        let (icon, says, more) = match self.access {
+            Access::Reads => (icon::EYE, "Reading", "You can read this document, but not change it."),
+            _ => (icon::MESSAGE_SQUARE, "Commenting", "You can comment on this document, but not change it."),
+        };
+        Element::row()
+            .align(Align::Center)
+            .gap(tokens::SPACE_XS)
+            .height(tokens::CONTROL_HEIGHT_SM)
+            .padding(Edges::xy(tokens::SPACE_SM, 0.0))
+            .radius(tokens::RADIUS_CONTROL)
+            .bg(tokens::NEUTRAL_SOFT)
+            .fg(tokens::FG_MUTED)
+            .child(Element::icon(icon, 14.0))
+            .child(Element::text(says, TextStyle::control().size(tokens::TEXT_SM)).decorative())
+            .role(Role::Label)
+            .label(says)
+            .description(more)
+            .tooltip(more, Side::Bottom)
     }
 
     /// The style of the element type under the caret: its name, then its font, size and alignment. Each
@@ -4895,6 +5067,11 @@ impl EditorApp {
         if !matches!(message, Message::Note(Noting::Close) | Message::Pointer(Pointer::Down { .. })) {
             self.margin.forget();
         }
+        // Nothing that is for writing is done for someone who only reads, whatever was still on its way
+        // when they were told so.
+        if !self.writes() && message.writes() {
+            return;
+        }
         match message {
             Message::Text(event) => {
                 let dollar =
@@ -5181,7 +5358,8 @@ impl App for EditorApp {
             };
             said.extend(self.editor.doc().walk().filter_map(state));
         }
-        describe::page(self.editor.doc(), self.editor.selection(), &said, told, whole, page, nodes);
+        let writes = self.writes();
+        describe::page(self.editor.doc(), self.editor.selection(), (&said, writes), told, whole, page, nodes);
         if let Some((caption, rect)) = &self.previewed {
             describe::preview(caption, *rect, page, nodes);
         }
@@ -5195,10 +5373,13 @@ impl App for EditorApp {
                 let listed = self.editor.doc().block(heading).map(Block::plain_text).unwrap_or_default();
                 describe::contents_line(&table.block, heading, listed.trim(), self.onto(*line), page, nodes);
             }
-            let chip = self.onto(pictures::chip(contents::badge(&table)));
-            describe::whole(&table.block, Whole::Contents, (contents::LABEL, None), chip, page, nodes);
+            // The chip of a table and the card of a preview change them, for someone who writes.
+            if writes {
+                let chip = self.onto(pictures::chip(contents::badge(&table)));
+                describe::whole(&table.block, Whole::Contents, (contents::LABEL, None), chip, page, nodes);
+            }
         }
-        for card in self.layout.previews(view) {
+        for card in self.layout.previews(view).into_iter().filter(|_| writes) {
             let at = self.onto(card.rect);
             describe::whole(&card.block, Whole::Preview, (previews::LABEL, None), at, page, nodes);
             if let Some((room, url)) = card.control.zip(self.address_of(&card.block)) {
@@ -5249,7 +5430,19 @@ impl App for EditorApp {
         if self.history.is_some() {
             return;
         }
-        match describe::request(self.editor.doc(), request) {
+        let request = describe::request(self.editor.doc(), request);
+        // Someone who only reads is told of nothing that changes the document, and nothing is done for a
+        // press that comes all the same.
+        let reads = matches!(
+            request,
+            Some(describe::Request::Select(_) | describe::Request::Copy(_) | describe::Request::Note(_))
+                | Some(describe::Request::Line(_) | describe::Request::Choose { .. })
+                | None
+        );
+        if !(reads || self.writes()) {
+            return;
+        }
+        match request {
             Some(describe::Request::Select(selection)) => {
                 let was = self.noted();
                 self.editor.select(selection);

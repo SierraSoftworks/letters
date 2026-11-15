@@ -82,8 +82,10 @@ struct Telling<'a> {
     before: Option<&'a HashMap<NodeId, u64>>,
     now: HashMap<NodeId, u64>,
     nodes: &'a mut Vec<(NodeId, Node)>,
-    /// Whether the document is written on. One that is only read has nothing to press.
+    /// Whether this is the document on its page. A version of it that is only read has nothing to press.
     written: bool,
+    /// Whether the person may change the document, and so has what changes it to press.
+    edits: bool,
     /// What is said of a block beside what it reads: that a version of the document added it, or why the
     /// page does not show what it links to.
     said: &'a HashMap<BlockId, String>,
@@ -99,11 +101,12 @@ impl Telling<'_> {
 
 /// Fills in the page's node and adds the blocks under it: all of them when `whole` is set, and otherwise
 /// those that read differently than `told` has them. `said` holds what the page shows of a block beside
-/// what it reads, such as why what it links to was not fetched.
+/// what it reads, such as why what it links to was not fetched, and `edits` is whether the person may
+/// change the document: someone who only reads it is told of nothing that changes it.
 pub(crate) fn page(
     doc: &Document,
     selection: Option<&Selection>,
-    said: &HashMap<BlockId, String>,
+    (said, edits): (&HashMap<BlockId, String>, bool),
     told: &mut Told,
     whole: bool,
     page: &mut Node,
@@ -122,7 +125,7 @@ pub(crate) fn page(
     {
         page.set_text_selection(TextSelection { anchor, focus });
     }
-    tell(doc, (said, true), told, whole, page, nodes);
+    tell(doc, (said, true, edits), told, whole, page, nodes);
 }
 
 /// Adds the blocks of a version of the document under the canvas that shows it, as [`page`] does for
@@ -137,14 +140,14 @@ pub(crate) fn version(
     nodes: &mut Vec<(NodeId, Node)>,
 ) {
     canvas.set_language(doc.language.as_str());
-    tell(doc, (said, false), told, whole, canvas, nodes);
+    tell(doc, (said, false, false), told, whole, canvas, nodes);
 }
 
-/// Adds the blocks of `doc` under `page`, with what is `said` of them, for the document that is `written`
-/// on or for a version that is only read.
+/// Adds the blocks of `doc` under `page`, with what is `said` of them, for the document on its page
+/// (`written`), which the person may change or not (`edits`), or for a version that is only read.
 fn tell(
     doc: &Document,
-    (said, written): (&HashMap<BlockId, String>, bool),
+    (said, written, edits): (&HashMap<BlockId, String>, bool, bool),
     told: &mut Told,
     whole: bool,
     page: &mut Node,
@@ -152,7 +155,7 @@ fn tell(
 ) {
     let before = mem::take(&mut told.0);
     let now = HashMap::with_capacity(before.len());
-    let mut telling = Telling { before: (!whole).then_some(&before), now, nodes, written, said };
+    let mut telling = Telling { before: (!whole).then_some(&before), now, nodes, written, edits, said };
     page.set_children(push_blocks(&doc.blocks, &mut telling));
     told.0 = telling.now;
 }
@@ -415,7 +418,7 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
     block.body.runs().iter().for_each(|run| run.text.hash(&mut reads));
     (&under, &inner).hash(&mut reads);
     let said = telling.said.get(&block.id);
-    said.hash(&mut reads);
+    (said, telling.edits).hash(&mut reads);
     if !telling.differs(id, reads.finish()) {
         return id;
     }
@@ -443,7 +446,7 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
         node.set_description(said.as_str());
     }
     let mut children = Vec::new();
-    let written = telling.written;
+    let (written, edits) = (telling.written, telling.edits);
     let mut part = |part: u8, node: Node, children: &mut Vec<NodeId>| {
         telling.nodes.push((part_node(&block.id, part), node));
         children.push(part_node(&block.id, part));
@@ -456,7 +459,7 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
                 // The tick is a checkbox of its own, which a click ticks.
                 let mut tick = Node::new(Role::CheckBox);
                 tick.set_toggled(if *checked { Toggled::True } else { Toggled::False });
-                if written {
+                if edits {
                     tick.add_action(Action::Click);
                 }
                 part(TICK, tick, &mut children);
@@ -468,7 +471,7 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
             if !title.is_empty() {
                 node.set_label(title);
             }
-            if written {
+            if edits {
                 let mut edit = Node::new(Role::Button);
                 edit.set_label(crate::callouts::LABEL);
                 edit.add_action(Action::Click);
@@ -478,10 +481,12 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
         BlockKind::Code { language } if written => {
             // The language named in the corner of the box, which a click lists the others for, and the
             // button beside it, which a click presses.
-            let mut named = Node::new(Role::Button);
-            named.set_label(crate::languages::label(language.as_deref()));
-            named.add_action(Action::Click);
-            part(LANGUAGE, named, &mut children);
+            if edits {
+                let mut named = Node::new(Role::Button);
+                named.set_label(crate::languages::label(language.as_deref()));
+                named.add_action(Action::Click);
+                part(LANGUAGE, named, &mut children);
+            }
             let mut copy = Node::new(Role::Button);
             copy.set_label(crate::code_copy::LABEL);
             copy.add_action(Action::Click);
@@ -498,7 +503,7 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
             let mut picture = Node::new(Role::Image);
             picture.set_label(alt.as_str());
             part(PICTURE, picture, &mut children);
-            if written {
+            if edits {
                 // The switch under it, which a click turns to the alt text.
                 let mut switch = Node::new(Role::Button);
                 switch.set_label(crate::captions::LABEL);

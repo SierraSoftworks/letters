@@ -200,6 +200,9 @@ pub(crate) struct Print {
     hot: Vec<Hot>,
     /// What a press began on.
     pressed: Option<Breaking>,
+    /// Whether the sheets are only looked at: where pages start and how the page is set up are for
+    /// someone who writes the document.
+    fixed: bool,
 }
 
 impl Print {
@@ -218,7 +221,13 @@ impl Print {
             gaps: Vec::new(),
             hot: Vec::new(),
             pressed: None,
+            fixed: false,
         }
+    }
+
+    /// Says whether the sheets are only looked at, as by someone who does not write the document.
+    pub fn fix(&mut self, fixed: bool) {
+        (self.fixed, self.pressed) = (fixed, None);
     }
 
     /// Notes where the pointer rests, and says whether the sheets show something else for it.
@@ -381,7 +390,9 @@ impl Print {
             let down = |y: f32| at.y + y * spread.scale;
             let span = ((at.x + pages.area.x * spread.scale).round(), (pages.area.width * spread.scale).round());
             for stands in stand.iter().skip(1) {
-                let Some(block) = doc.blocks.get(stands.index).filter(|_| stands.starts) else { continue };
+                let Some(block) = doc.blocks.get(stands.index).filter(|_| stands.starts && !self.fixed) else {
+                    continue;
+                };
                 let y = down((stands.above + stands.top) / 2.0).round();
                 self.gaps.push(Gap { sheet: index, on: at, y, span, block: block.id.clone() });
             }
@@ -389,10 +400,13 @@ impl Print {
             if let (Some(last), false) = (stand.last(), made.is_empty()) {
                 let end = down(pages.area.y + pages.area.height);
                 let y = (down(last.bottom) + UNDER + LABEL / 2.0).min(at.y + at.height - LABEL / 2.0 - 2.0).round();
-                let over = self.pointer;
+                // The marker says why the sheet ends here. A press on it takes the break away.
+                let over = self.pointer.filter(|_| !self.fixed);
                 let remove = labels.marker(Point { x: span.0, y }, span.1, over, &mut list);
                 hatch(Rect::new(span.0, y + LABEL / 2.0 + UNDER, span.1, end - y - LABEL / 2.0 - UNDER), &mut list);
-                self.hot.push(Hot { rect: remove, sheet: index, asks: Breaking { blocks: made, on: false } });
+                if !self.fixed {
+                    self.hot.push(Hot { rect: remove, sheet: index, asks: Breaking { blocks: made, on: false } });
+                }
             }
         }
         // The offer lies over its sheet, where the pointer is.
@@ -432,6 +446,7 @@ impl Print {
         setup: impl Fn() -> Popover<Message>,
     ) -> TopBar<Message> {
         let back = Message::Print(Printing::Back);
+        let leave = if self.fixed { "Back to the document" } else { "Back to editing" };
         let name = || Element::text(name, TextStyle::control().weight(600)).min_width(tokens::SPACE_3XL).shrink();
         let pages = if self.count == 1 { "1 page".to_owned() } else { format!("{} pages", self.count) };
         let count = Element::text(format!("Print view, {pages}"), TextStyle::control().size(tokens::TEXT_SM));
@@ -459,25 +474,32 @@ impl Print {
             .apart()
             .label("Print view")
             .form(FORMS.0)
-            .start(Button::new("Back to editing").icon(icon::ARROW_LEFT).small().on_press(back.clone()))
+            .start(Button::new(leave).icon(icon::ARROW_LEFT).small().on_press(back.clone()))
             .start(name())
-            .start(count.fg(tokens::FG_MUTED))
-            .middle(
+            .start(count.fg(tokens::FG_MUTED));
+        // The page is set up by someone who writes on it.
+        let bar = match self.fixed {
+            true => bar,
+            false => bar.middle(
                 Element::from(Button::new(paper).icon(icon::FILE_TEXT).small().popover(setup()))
                     .description("Page setup"),
-            )
+            ),
+        };
+        let bar = bar
             .middle(zoom)
             .middle(TopBar::rule())
             .middle(export(Button::new("Export PDF").icon(icon::FILE_DOWN)))
             .middle(print());
-        bar.form(FORMS.1)
-            .start(Button::icon_only(icon::ARROW_LEFT, "Back to editing").small().on_press(back))
-            .start(name())
-            .middle(
+        let bar =
+            bar.form(FORMS.1).start(Button::icon_only(icon::ARROW_LEFT, leave).small().on_press(back)).start(name());
+        let bar = match self.fixed {
+            true => bar,
+            false => bar.middle(
                 Element::from(Button::icon_only(icon::FILE_TEXT, "Page setup").small().popover(setup()))
                     .description(paper),
-            )
-            .middle(Element::from(Button::new(shown).small().menu(zooms)).description("Zoom"))
+            ),
+        };
+        bar.middle(Element::from(Button::new(shown).small().menu(zooms)).description("Zoom"))
             .middle(TopBar::rule())
             .middle(export(Button::icon_only(icon::FILE_DOWN, "Export PDF")))
             .middle(print())

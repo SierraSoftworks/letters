@@ -644,7 +644,7 @@ pub(crate) fn listed(margin: &Margin, doc: &Document) -> Option<Element<Message>
         .child(Element::text(count, small).fg(tokens::FG_MUTED));
     if alike && first.1 == Kind::Import {
         let resolve = Button::new("Resolve all").icon(icon::CHECK).subtle().small();
-        count = count.child(resolve.disabled(margin.refused.is_some()).on_press(send(Noting::ResolveImports)));
+        count = count.child(resolve.disabled(margin.refusal().is_some()).on_press(send(Noting::ResolveImports)));
     }
     // The row of the note that is open is the one picked, wherever that note shows.
     let read = margin.reading().map(|(note, _)| note).or_else(|| margin.reviewing()).map(|note| note.id.as_str());

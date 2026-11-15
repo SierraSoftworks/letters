@@ -30,6 +30,9 @@ pub(crate) const TOOLS_GAP: f32 = 8.0;
 pub(crate) const TOOLS_ROOM: f32 = tokens::CONTROL_HEIGHT_SM + 2.0 * tokens::SPACE_XS + 2.0 + TOOLS_GAP;
 /// How strong the tint of a passage is while its comment is being written or read.
 const OPEN: f32 = 0.26;
+/// What someone who only reads the document is told where a comment would be written, in the words the
+/// server refuses one with.
+const READS: &str = "You can read this document, but not comment on it.";
 
 /// What the pointer and the keyboard ask about notes.
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +78,8 @@ pub(crate) struct Margin {
     draft: Option<(Anchor, Written)>,
     /// Why no comment can be written on this document, as the shell says.
     pub refused: Option<String>,
+    /// Whether the person only reads the document, and so writes no comment on it either.
+    pub reads: bool,
     /// The note that is open under its passage, and the reply written to it so far.
     thread: Option<(String, Written)>,
     /// Whether the caret opened the note that is open, by coming into its passage. Such a note leaves the
@@ -101,6 +106,12 @@ impl Margin {
     }
 
     /// Whether the tools may show over the selection: not once they were put away over it.
+    /// Why nothing can be added to the notes of this document, when nothing can: the shell said so, or
+    /// the person only reads the document.
+    pub fn refusal(&self) -> Option<&str> {
+        self.refused.as_deref().or(self.reads.then_some(READS))
+    }
+
     pub fn offers(&self) -> bool {
         self.away.is_none() && self.draft.is_none() && self.reading().is_none()
     }
@@ -163,7 +174,7 @@ impl Margin {
     pub fn send(&mut self, model: &Model, id: String, created: String) -> bool {
         let Some((mut anchor, written)) = self.draft.take() else { return false };
         let content = written.content();
-        if content.is_empty() || self.refused.is_some() {
+        if content.is_empty() || self.refusal().is_some() {
             return false;
         }
         anchor.pin(model);
@@ -269,7 +280,7 @@ impl Margin {
     /// Settles the conflict that is open, once one of its versions was chosen, and puts it away. Returns
     /// whether it did.
     pub fn settle(&mut self) -> bool {
-        let open = self.reviewing().filter(|_| self.refused.is_none()).map(|note| note.id.clone());
+        let open = self.reviewing().filter(|_| self.refusal().is_none()).map(|note| note.id.clone());
         let Some(id) = open else { return false };
         self.thread = None;
         self.notes.notes.iter_mut().filter(|note| note.id == id).for_each(|note| note.resolved = true);
@@ -355,10 +366,11 @@ impl Margin {
     /// Keeps the reply typed into the open note, signed and dated. Returns whether there was anything to
     /// keep.
     pub fn answer(&mut self, created: String) -> bool {
+        let free = self.refusal().is_none();
         let Some((id, reply)) = &mut self.thread else { return false };
         let content = reply.content();
         let note = self.notes.notes.iter_mut().find(|note| &note.id == id);
-        let Some(note) = note.filter(|_| !content.is_empty() && self.refused.is_none()) else { return false };
+        let Some(note) = note.filter(|_| !content.is_empty() && free) else { return false };
         note.replies.push(Reply { author: self.author.clone(), created, content, extra: Default::default() });
         *reply = Written::default();
         true
@@ -367,7 +379,7 @@ impl Margin {
     /// Resolves the note that is read and puts it away. Returns whether it did. A conflict whose versions
     /// show in the page is not read: choosing one of them settles it, see [`Margin::settle`].
     pub fn resolve(&mut self) -> bool {
-        let read = self.reading().filter(|_| self.refused.is_none()).map(|(note, _)| note.id.clone());
+        let read = self.reading().filter(|_| self.refusal().is_none()).map(|(note, _)| note.id.clone());
         let Some(id) = read else { return false };
         self.thread = None;
         self.notes.notes.iter_mut().filter(|note| note.id == id).for_each(|note| note.resolved = true);
@@ -376,18 +388,20 @@ impl Margin {
 
     /// Resolves every open import note. Returns whether there were any.
     pub fn resolve_imports(&mut self) -> bool {
+        let free = self.refusal().is_none();
         let open = self.notes.notes.iter_mut().filter(|note| note.kind == NoteKind::Import && !note.resolved);
-        let open: Vec<&mut Note> = open.filter(|_| self.refused.is_none()).collect();
+        let open: Vec<&mut Note> = open.filter(|_| free).collect();
         let any = !open.is_empty();
         open.into_iter().for_each(|note| note.resolved = true);
         any
     }
 
     /// The tools over a selection: a link and a comment, and nothing else. They hang over the first line of
-    /// the selection, or under `under` when there is no room above it.
-    pub fn tools(linked: bool, above: bool) -> Popover<Message> {
+    /// the selection, or under `under` when there is no room above it. `linked` is whether the selection
+    /// is a link, for someone who can make it one: anyone else has the comment alone.
+    pub fn tools(linked: Option<bool>, above: bool) -> Popover<Message> {
         let tool = |icon, label: &str| Button::icon_only(icon, label).subtle().small();
-        let link = tool(icon::LINK, "Link").pressed(linked).on_press(Message::EditLink);
+        let link = linked.map(|linked| tool(icon::LINK, "Link").pressed(linked).on_press(Message::EditLink));
         let comment = tool(icon::MESSAGE_SQUARE_PLUS, "Comment").on_press(Message::Note(Noting::Write));
         let tools = Element::row()
             .align(Align::Center)
@@ -395,7 +409,7 @@ impl Margin {
             .padding(Edges::all(tokens::SPACE_XS))
             .role(Role::Toolbar)
             .label("Selection")
-            .child(link)
+            .children(link)
             .child(comment);
         Popover::new(tools)
             .flush()
@@ -411,9 +425,9 @@ impl Margin {
     /// Where no comment can be written, the reason hangs there in place of `field`.
     pub fn field(&self, field: Element<Message>) -> Option<Popover<Message>> {
         let blank = self.drafted()?.is_blank();
-        if let Some(why) = &self.refused {
+        if let Some(why) = self.refusal() {
             let quiet = TextStyle::control().size(tokens::TEXT_SM);
-            let said = Element::paragraph(why.as_str(), quiet).fg(tokens::FG_MUTED).width(WIDTH).role(Role::Status);
+            let said = Element::paragraph(why, quiet).fg(tokens::FG_MUTED).width(WIDTH).role(Role::Status);
             let said = Popover::new(said).label("New comment").max_width(WIDTH + 2.0 * tokens::SPACE_MD + 2.0);
             return Some(said.open(true).on_close(Message::Note(Noting::Drop)));
         }

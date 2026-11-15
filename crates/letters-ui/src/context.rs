@@ -73,6 +73,9 @@ pub(crate) struct About<'a> {
     /// to act on.
     pub asked: &'a dyn Fn(&Act) -> Option<Message>,
     pub mac: bool,
+    /// Whether the document is the person's to change. Someone who only reads it has what copies and
+    /// what leads somewhere, and a comment where they may write one.
+    pub writes: bool,
     /// The misspelled word there, with its corrections.
     pub fix: Option<&'a Fix>,
     /// How high the page area is.
@@ -252,11 +255,19 @@ impl Context {
             .child(divider())
             .child(about.tool(icon::LINK, Act::Link, editor.link().is_some(), true))
             .child(about.tool(icon::MESSAGE_SQUARE_PLUS, Act::Comment, false, true));
+        let first = match about.writes {
+            true => first,
+            false => {
+                let comment = (about.asked)(&Act::Comment).is_some();
+                let comment = comment.then(|| about.tool(icon::MESSAGE_SQUARE_PLUS, Act::Comment, false, true));
+                bar("Clipboard").child(about.tool(icon::COPY, run(Command::Copy), false, true)).children(comment)
+            }
+        };
         let mut strip = Element::column().gap(tokens::SPACE_2XS).padding(Edges::all(tokens::SPACE_XS)).child(first);
 
         let cell = editor.cell();
         let fixed = matches!(kind, Some(BlockKind::Figure { .. } | BlockKind::Caption | BlockKind::Gallery { .. }));
-        if let Some(cell) = &cell {
+        if let Some(cell) = cell.as_ref().filter(|_| about.writes) {
             // What is done with the caret's row, and then with its column: each icon shows the row or the
             // column and where the new one goes, which way it moves, or that it is taken away.
             let table = |edit: TableEdit| run(Command::Table(edit));
@@ -351,7 +362,10 @@ impl Context {
             }
             let copy = MenuItem::new("Copy link address").icon(icon::COPY);
             items.push(copy.on_select(send(Contexting::CopyLink(address.to_owned()))));
-            items.push(MenuItem::new("Remove link").icon(icon::X).on_select(Message::Run(Command::SetLink(None))));
+            if about.writes {
+                let remove = MenuItem::new("Remove link").icon(icon::X);
+                items.push(remove.on_select(Message::Run(Command::SetLink(None))));
+            }
             menu = section(menu, "Link", items);
         }
         if let Some(figure) = &self.reference {
@@ -388,7 +402,7 @@ impl Context {
             }
             _ => {}
         }
-        if around.iter().any(|block| matches!(block.kind, BlockKind::Callout { .. })) {
+        if about.writes && around.iter().any(|block| matches!(block.kind, BlockKind::Callout { .. })) {
             // The types are a choice of one, in a menu of their own. The one the callout has does nothing.
             let mut types = Menu::new().label("Callout type");
             let mut items = Vec::new();
@@ -405,7 +419,7 @@ impl Context {
         }
         if picture || matches!(kind, Some(BlockKind::Figure { .. })) {
             let mut items: Vec<_> = commands::group("Image").filter_map(|entry| about.item(entry)).collect();
-            if picture {
+            if picture && about.writes {
                 let delete = MenuItem::new("Delete image").icon(icon::TRASH_2).danger();
                 items.push(delete.on_select(Message::Run(Command::Delete(Motion::Right))));
             }

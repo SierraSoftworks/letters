@@ -247,6 +247,22 @@ fn a_fetch_that_finds_nothing_says_why_and_offers_another_try() {
 }
 
 #[test]
+fn someone_listening_is_told_again_of_a_preview_whose_fetch_failed() {
+    // What each update says with the preview, where it tells the preview at all.
+    let said = |update: &accesskit::TreeUpdate| -> Vec<Option<String>> {
+        let preview = |node: &accesskit::Node| node.role() == Role::Link && node.label() == Some(QUOTE);
+        let told = update.nodes.iter().filter(|(_, node)| preview(node));
+        told.map(|(_, node)| node.description().map(str::to_owned)).collect()
+    };
+    let mut window = bare();
+    window.click(Role::Button, FETCH);
+    assert_eq!(said(&window.ui().access()), [None], "nothing is said of a try that is on its way");
+    window.ui().fail_preview(QUOTE, "the server answered 404");
+    let why = "Not fetched: the server answered 404".to_owned();
+    assert_eq!(said(&window.ui().access_changes()), [Some(why)], "the preview reads as it did, and says more");
+}
+
+#[test]
 fn print_view_shows_a_preview_as_it_prints_whatever_is_said_of_its_fetch() {
     // A note in Print view after its preview was asked for, and what the shell answered if it did.
     let printing = |failed: Option<&str>| {

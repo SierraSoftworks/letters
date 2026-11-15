@@ -148,17 +148,18 @@ pub(crate) fn host(src: &str) -> &str {
 /// The menu on the cloud of the picture linked from `src`. One that shows already needs no loading, and
 /// what the shell says of one that does not show stands over what the menu offers. A source that is
 /// `vouched` for is not offered to be trusted again, and in a document that is known to be `safe` a
-/// picture that is held back offers to trust the document.
-pub(crate) fn menu(src: &str, loaded: bool, state: Option<&PictureState>, vouched: bool, safe: bool) -> Menu<Message> {
+/// picture that is held back offers to trust the document. Only someone who `writes` is offered to keep
+/// the picture in the document.
+pub(crate) fn menu(
+    src: &str,
+    loaded: bool,
+    state: Option<&PictureState>,
+    (vouched, safe): (bool, bool),
+    writes: bool,
+) -> Menu<Message> {
     let host = match host(src) {
         "" => "this host",
         host => host,
-    };
-    let mut menu = Menu::new().label("Linked picture");
-    menu = match state {
-        Some(PictureState::Failed(_)) => menu.note(says(src, state), Tone::Danger).separator(),
-        Some(_) => menu.note(says(src, state), Tone::Default).separator(),
-        None => menu,
     };
     let load = match state {
         Some(PictureState::Loading) => None,
@@ -167,6 +168,18 @@ pub(crate) fn menu(src: &str, loaded: bool, state: Option<&PictureState>, vouche
     };
     // Safe mode fetches for nobody, so what would fetch is not there to choose.
     let held = state == Some(&PictureState::Held);
+    let offers = writes || load.is_some() || !vouched || (held && safe);
+    let mut menu = Menu::new().label("Linked picture");
+    menu = match state {
+        Some(PictureState::Failed(_)) => menu.note(says(src, state), Tone::Danger),
+        Some(_) => menu.note(says(src, state), Tone::Default),
+        // With nothing to say and nothing to offer, the menu says what the cloud is for.
+        None if !offers => menu.note(format!("Linked from {host}"), Tone::Default),
+        None => menu,
+    };
+    if state.is_some() && offers {
+        menu = menu.separator();
+    }
     let item = |label: String, asked| MenuItem::new(label).disabled(held).on_select(Message::Linked(asked));
     if held && safe {
         let trust = MenuItem::new("Trust this document").on_select(Message::Safe(Safely::TrustDocument));
@@ -177,6 +190,9 @@ pub(crate) fn menu(src: &str, loaded: bool, state: Option<&PictureState>, vouche
     }
     if !vouched {
         menu = menu.item(item(format!("Always load from {host}"), Linking::Trust));
+    }
+    if !writes {
+        return menu;
     }
     // A rule sets apart what changes the document, when anything stands over it.
     if load.is_some() || !vouched {

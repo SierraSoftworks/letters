@@ -88,6 +88,8 @@ pub(crate) enum Does {
 pub(crate) struct Find {
     open: bool,
     replacing: bool,
+    /// Whether the bar only finds, as for someone who cannot change the document.
+    only: bool,
     query: Query,
     with: String,
     /// The places the query is found at, in the order of the document.
@@ -104,6 +106,12 @@ pub(crate) struct Find {
 impl Find {
     pub fn open(&self) -> bool {
         self.open
+    }
+
+    /// Says whether the bar only finds. One that does has nothing about replacing.
+    pub fn only_finds(&mut self, only: bool) {
+        self.only = only;
+        self.replacing &= !only;
     }
 
     /// Whether there is a place to go to.
@@ -275,6 +283,8 @@ impl Find {
         };
         let expand = Button::icon_only(expand, told).subtle().small().on_press(send(Finding::Expand));
         let expand = Element::from(expand).expanded(self.replacing).tooltip(told, Side::Bottom);
+        // A bar that only finds has nothing to open.
+        let expand = (!self.only).then_some(expand);
         let ways = Element::row()
             .gap(1.0)
             .child(way(icon::CASE_SENSITIVE, "Match case", Way::Case, self.query.case))
@@ -291,14 +301,14 @@ impl Find {
         let indent = || Element::row().width(tokens::CONTROL_HEIGHT_SM).decorative();
         let mut lines = Element::column().gap(tokens::SPACE_XS).width(width);
         lines = match narrow {
-            false => lines.child(line().child(expand).child(field).child(count).child(ways).child(steps)),
+            false => lines.child(line().children(expand).child(field).child(count).child(ways).child(steps)),
             true => lines
-                .child(line().child(expand).child(field).child(steps))
-                .child(line().child(indent()).child(ways).child(Element::spacer()).child(count)),
+                .child(line().children(expand).child(field).child(steps))
+                .child(line().children((!self.only).then(indent)).child(ways).child(Element::spacer()).child(count)),
         };
         if let Some(bad) = &self.bad {
             let why = Element::paragraph(format!("Not a pattern: {bad}"), quiet).fg(tokens::DANGER).role(Role::Status);
-            lines = lines.child(line().child(indent()).child(why.grow(1.0)));
+            lines = lines.child(line().children((!self.only).then(indent)).child(why.grow(1.0)));
         }
         if self.replacing {
             let with = TextField::new("Replace with", self.with.as_str())
@@ -317,7 +327,7 @@ impl Find {
             };
         }
         let bar = Popover::new(Element::column().padding(Edges::all(tokens::SPACE_SM)).child(lines))
-            .label(LABEL)
+            .label(if self.only { "Find" } else { LABEL })
             .flush()
             .max_width(width + AROUND)
             .at(Rect::new(end - MARGIN, top + MARGIN / 2.0, 0.0, 0.0))
