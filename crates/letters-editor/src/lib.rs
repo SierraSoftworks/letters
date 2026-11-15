@@ -21,13 +21,14 @@ mod shared;
 mod table;
 mod text;
 mod tree;
+mod versions;
 
 use std::collections::BTreeSet;
 use std::ops::Range;
 
 use letters_model::{
-    Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, OpError, Page, Pos, ReplicaId, Run,
-    Selection, Style, TextStyle,
+    Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, OpError, Page, Pos, ReplicaId, Revision,
+    Run, Selection, Style, TextStyle,
 };
 
 pub use figures::Spot;
@@ -229,6 +230,9 @@ pub enum Command {
         block: BlockId,
         version: Option<Box<Block>>,
     },
+    /// Makes the document and its style read as they did at a revision of the history. Nothing of the
+    /// history is taken back, and it is one undo step. See [`letters_model::Model::restore`].
+    Restore(Revision),
     /// Replaces the whole style, as applying a stylesheet does.
     ReplaceStyle(Style),
     /// Sets the language the document is written in.
@@ -537,6 +541,10 @@ impl Editor {
         if let Command::UseVersion { block, version } = command {
             return self.takes_version(block, version.as_deref());
         }
+        if let Command::Restore(revision) = command {
+            // The document has no caret to ask, and a restore of what is there has nothing to do.
+            return *revision != self.model.revision();
+        }
         let Some(caret) = &self.caret else {
             return match command {
                 Command::Undo => self.can_undo(),
@@ -643,6 +651,7 @@ impl Editor {
                 _ = self.apply(vec![Op::SetBlockProps { block, page_break: on, lang }]);
             }
             Command::UseVersion { block, version } => self.use_version(block, version),
+            Command::Restore(revision) => self.restore_version(&revision),
             Command::ReplaceStyle(style) => _ = self.apply(vec![Op::ReplaceStyle { style }]),
             Command::SetLanguage(language) => _ = self.apply(vec![Op::SetLanguage { language }]),
             Command::AddWord(word) => _ = self.apply(vec![Op::AddWord { word }]),
