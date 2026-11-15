@@ -223,6 +223,12 @@ pub enum Command {
         block: BlockId,
         on: bool,
     },
+    /// Makes a block read as another version of it, or with `None` takes it away: the choice of the
+    /// version that a conflict held back. One undo step, wherever the caret is.
+    UseVersion {
+        block: BlockId,
+        version: Option<Box<Block>>,
+    },
     /// Replaces the whole style, as applying a stylesheet does.
     ReplaceStyle(Style),
     /// Sets the language the document is written in.
@@ -528,6 +534,9 @@ impl Editor {
         if let Command::SetPageBreak { block, on } = command {
             return self.doc().block(block).is_some_and(|block| block.page_break != *on);
         }
+        if let Command::UseVersion { block, version } = command {
+            return self.takes_version(block, version.as_deref());
+        }
         let Some(caret) = &self.caret else {
             return match command {
                 Command::Undo => self.can_undo(),
@@ -633,6 +642,7 @@ impl Editor {
                 let lang = self.doc().block(&block).and_then(|block| block.lang.clone());
                 _ = self.apply(vec![Op::SetBlockProps { block, page_break: on, lang }]);
             }
+            Command::UseVersion { block, version } => self.use_version(block, version),
             Command::ReplaceStyle(style) => _ = self.apply(vec![Op::ReplaceStyle { style }]),
             Command::SetLanguage(language) => _ = self.apply(vec![Op::SetLanguage { language }]),
             Command::AddWord(word) => _ = self.apply(vec![Op::AddWord { word }]),

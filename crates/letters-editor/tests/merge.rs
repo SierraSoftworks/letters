@@ -250,3 +250,47 @@ proptest! {
         prop_assert_eq!(first.text(), second.text());
     }
 }
+
+/// The command that makes the second block of the document read as `version`: the one block that
+/// `version` describes, or nothing.
+fn use_version(version: Option<&str>) -> Command {
+    let version = version.map(|state| Box::new(parse(state).0.blocks.remove(0)));
+    Command::UseVersion { block: BlockId::new("b2"), version }
+}
+
+#[test]
+fn a_block_is_made_to_read_as_another_version_of_it_in_one_undo_step() {
+    let cases = [
+        // (before, the version to use, after)
+        ("p one|\np two\np three", Some("p deux"), "p one|\np deux\np three"),
+        // A caret in the block stays in it, as far along as the version reaches.
+        ("p one\np two and more|\np three", Some("p deux"), "p one\np deux|\np three"),
+        ("p one\np tw|o\np three", Some("h2 Two"), "p one\nh2 Tw|o\np three"),
+        // A version that took the block away takes it away.
+        ("p one|\np two\np three", None, "p one|\np three"),
+    ];
+    for (before, version, after) in cases {
+        let mut editor = Harness::new(before);
+        let change = editor.run(use_version(version));
+        assert_eq!(editor.state(), canon(after), "{version:?} in {before:?}");
+        assert!(change.blocks.contains(&BlockId::new("b2")), "the layout hears of it, in {before:?}");
+        if version.is_some() {
+            let ids: Vec<&str> = editor.editor.doc().blocks.iter().map(|block| block.id.as_str()).collect();
+            assert_eq!(ids, ["b1", "b2", "b3"], "the block keeps its name and its place, in {before:?}");
+        }
+        assert!(editor.key("Mod+z"));
+        assert_eq!(editor.text(), canon(before).replace(['|', '^'], ""), "undone in {before:?}");
+        assert!(!editor.editor.can_undo(), "one step, in {before:?}");
+    }
+}
+
+#[test]
+fn a_version_is_only_used_where_it_changes_a_block_that_is_there() {
+    let mut editor = Harness::new("p one|\np two");
+    for same in [use_version(Some("p two")), Command::UseVersion { block: BlockId::new("nowhere"), version: None }] {
+        assert!(!editor.editor.applies(&same), "{same:?}");
+        assert_eq!(editor.run(same), Default::default());
+    }
+    assert_eq!(editor.state(), canon("p one|\np two"));
+    assert!(!editor.editor.can_undo());
+}

@@ -126,6 +126,35 @@ impl Editor {
         self.model.place(id).map(Into::into)
     }
 
+    /// Whether a block can be made to read as `version`: it is there and reads otherwise, and no block
+    /// outside it goes by an id that the version holds.
+    pub(crate) fn takes_version(&self, id: &BlockId, version: Option<&Block>) -> bool {
+        fn ids<'a>(block: &'a Block, out: &mut Vec<&'a BlockId>) {
+            out.push(&block.id);
+            block.body.blocks().iter().for_each(|part| ids(part, out));
+        }
+        // The version comes to stand under the block's id, whatever it goes by itself.
+        let reads = |block: &'_ Block| (block.kind.clone(), block.body.clone(), block.lang.clone(), block.page_break);
+        let same = |held: &Block| version.is_some_and(|version| reads(version) == reads(held));
+        let Some(held) = self.block(id).filter(|held| !same(held)) else { return false };
+        let (mut mine, mut theirs) = (Vec::new(), Vec::new());
+        ids(held, &mut mine);
+        version.into_iter().for_each(|version| ids(version, &mut theirs));
+        theirs.iter().skip(1).all(|id| mine.contains(id) || self.block(id).is_none())
+    }
+
+    /// Puts another version of a block in its place, under the block's own id, or takes the block away.
+    pub(crate) fn use_version(&mut self, id: BlockId, version: Option<Box<Block>>) {
+        let Some(place) = self.seat(&id) else { return };
+        let (parent, index) = (place.parent_id(), place.index);
+        let mut ops = vec![Op::RemoveBlock { block: id.clone() }];
+        ops.extend(version.map(|version| Op::InsertBlock { parent, index, block: Block { id, ..*version } }));
+        if self.apply(ops) {
+            // The caret may have stood in text that reads otherwise now, or is gone.
+            self.restore(self.caret.clone());
+        }
+    }
+
     /// See [`tree::is_part`].
     pub(crate) fn part(&self, id: &BlockId) -> bool {
         let parent = self.seat(id).and_then(|place| place.parent);
