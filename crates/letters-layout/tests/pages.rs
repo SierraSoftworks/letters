@@ -676,6 +676,82 @@ fn a_reference_links_to_where_its_figure_is() {
 }
 
 #[test]
+fn a_link_is_a_part_of_its_text() {
+    let link = |text: &str, url: &str| Run { link: Some(url.into()), ..Run::plain(text) };
+    let (notice, rates) = ("https://example.org/notice", "https://example.org/rates");
+    // A link long enough to wrap with part of it bold, another straight after it, a reference set as the text
+    // around it is, and one to nothing.
+    let (first, second, third) = ("the notice that arrives with the December ", "statement", "the rates");
+    let runs = vec![
+        Run::plain("Read "),
+        link(first, notice),
+        Run { marks: [Mark::Bold].into(), ..link(second, notice) },
+        link(third, rates),
+        Run::plain(" and see "),
+        Run::marked("Figure 9", [Mark::Ref("f".into())]),
+        Run::plain(" or "),
+        Run::marked("Figure 9", [Mark::Ref("nowhere".into())]),
+        Run::plain(", then read on."),
+    ];
+    let cell = Block { body: Body::Text(vec![link("Rates", rates)]), ..Block::new("c", BlockKind::TableCell) };
+    let grid = BlockKind::Table { columns: vec![Align::Start], header: false };
+    let doc = doc(vec![
+        Block { body: Body::Text(runs), ..paragraph("a", "") },
+        paragraph("b", &PROSE.repeat(3)),
+        container("t", grid, vec![container("r", BlockKind::TableRow, vec![cell])]),
+        numbered(figure("f", (120.0, 80.0), "The harbour office")),
+    ]);
+    let (layout, pages) = paged(&doc, 240.0);
+    // What each link's part spells and lies in, and where the sheets' links with that part lead.
+    let mut told: Vec<(u64, String, Role)> = Vec::new();
+    let mut listed: Vec<(u64, String, bool)> = Vec::new();
+    for index in 0..pages.sheets.len() {
+        let mut open: Vec<(&Role, u64)> = Vec::new();
+        let Painted { text, .. } = page(&layout, &pages, index);
+        for item in &text {
+            match item {
+                Item::Open { role, id } => {
+                    if let (Role::Link, None) = (role, told.iter().find(|known| known.0 == *id)) {
+                        told.push((*id, String::new(), open.last().expect("a link lies in its text").0.clone()));
+                    }
+                    open.push((role, *id));
+                }
+                Item::Close => drop(open.pop()),
+                Item::Glyphs { text: Some(run), .. } => {
+                    if let Some((Role::Link, id)) = open.last() {
+                        told.iter_mut().find(|known| known.0 == *id).unwrap().1.push_str(&run.text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for link in layout.page_links(&pages, index) {
+            let part = link.part.expect("a link names the part its text is");
+            listed.push((part, link.target, link.place.is_some()));
+        }
+    }
+    listed.dedup();
+    let spelt: Vec<(&str, &Role)> = told.iter().map(|(_, text, inside)| (text.as_str(), inside)).collect();
+    let whole = format!("{first}{second}");
+    let cell = Role::Cell { header: false };
+    let expected =
+        [(whole.trim(), &Role::Paragraph), (third, &Role::Paragraph), ("Figure 1", &Role::Paragraph), ("Rates", &cell)];
+    let trimmed: Vec<(&str, &Role)> = spelt.iter().map(|(text, inside)| (text.trim(), *inside)).collect();
+    assert_eq!(
+        trimmed,
+        expected.map(|(text, inside)| (text.trim(), inside)),
+        "each link is one part, whatever its lines and marks"
+    );
+    let ids: Vec<u64> = told.iter().map(|(id, ..)| *id).collect();
+    let leads = [(ids[0], notice, false), (ids[1], rates, false), (ids[2], "", true), (ids[3], rates, false)];
+    assert_eq!(
+        listed,
+        leads.map(|(id, target, place)| (id, target.to_string(), place)),
+        "and the sheet's links name them"
+    );
+}
+
+#[test]
 fn the_outline_lists_headings_with_their_sheets() {
     let mut blocks = mixed().blocks;
     blocks.push(Block::text("e", BlockKind::Heading { level: 3 }, "  "));

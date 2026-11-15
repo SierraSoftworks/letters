@@ -518,18 +518,66 @@ impl Spelt {
     }
 }
 
-/// Says what the glyphs of `item` spell. `clusters` are those of its line that no run before it has taken.
-fn spell<'a>(item: &mut Item, clusters: &mut Peekable<impl Iterator<Item = Cluster<'a, Brush>>>, source: &str) {
-    let Item::Glyphs { glyphs, text, .. } = item else { return };
+/// Says what the glyphs of `item` spell, and where in `source` that starts. `clusters` are those of its line
+/// that no run before it has taken.
+fn spell<'a>(
+    item: &mut Item,
+    clusters: &mut Peekable<impl Iterator<Item = Cluster<'a, Brush>>>,
+    source: &str,
+) -> Option<usize> {
+    let Item::Glyphs { glyphs, text, .. } = item else { return None };
     let mut spelt = Spelt::default();
     while spelt.starts.len() < glyphs.len() {
-        let Some(cluster) = clusters.next() else { return };
+        let cluster = clusters.next()?;
         spelt.add(cluster.text_range(), cluster.glyphs().count());
     }
     while let Some(rest) = clusters.next_if(Cluster::is_ligature_continuation) {
         spelt.add(rest.text_range(), 0);
     }
+    let start = spelt.range.as_ref().map(|range| range.start);
     *text = spelt.text(source, glyphs.len());
+    start.filter(|_| text.is_some())
+}
+
+/// The stretches of a text that lead somewhere, as its layout has them and in order: its links, and its
+/// references that name a figure. Each comes with its number among the text's links and references, which
+/// names its part on a sheet. Code has none.
+fn leads(text: &Text<'_>, numbers: &HashMap<BlockId, u32>) -> Vec<(Range<usize>, u64)> {
+    let Words { links, refs, .. } = text.source;
+    let links = links.iter().map(|(range, _)| range);
+    let refs = refs.iter().map(|(range, target)| numbers.contains_key(target).then_some(range));
+    let all = links.map(Some).chain(refs).enumerate().filter(|_| text.role != Role::Code);
+    let inward = |range: &Range<usize>| text.set.inward(range.start)..text.set.inward(range.end);
+    let mut leads: Vec<_> = all.filter_map(|(which, range)| Some((inward(range?), which as u64))).collect();
+    leads.sort_by_key(|(range, _)| range.start);
+    leads
+}
+
+/// The part of a text that is `which` of its links and references, to add to the text's own name.
+pub(crate) fn link(part: Part, which: usize) -> u64 {
+    let cell = if let Part::Cell(index) = part { (index as u64 + 1) << CELLS } else { 0 };
+    cell | LINKS | which as u64
+}
+
+/// Some of the glyphs of a run that says what it spells, as a run of their own that says what they spell.
+fn piece(run: &Item, glyphs: Range<usize>) -> Item {
+    let mut piece = run.clone();
+    if let Item::Glyphs { glyphs: all, text: Some(spelt), .. } = &mut piece {
+        // Their text runs from the first of their clusters to the next cluster that is not theirs.
+        let own = &spelt.clusters[glyphs.clone()];
+        let (first, last) = (own.iter().min().copied().unwrap_or(0), own.iter().max().copied().unwrap_or(0));
+        let after = spelt
+            .clusters
+            .iter()
+            .filter(|start| **start > last)
+            .min()
+            .map_or(spelt.text.len(), |start| *start as usize);
+        let text = spelt.text[first as usize..after].into();
+        let clusters = own.iter().map(|start| start - first).collect();
+        *spelt = Arc::new(RunText { text, clusters });
+        *all = all[glyphs].to_vec();
+    }
+    piece
 }
 
 /// What is drawn over a text without being part of it.
@@ -580,6 +628,8 @@ pub(crate) struct Painter<'a> {
     pub spelt: bool,
     /// What names the text being painted where a sheet says what its parts are. `None` on screen.
     pub part: Option<u64>,
+    /// The number of each numbered figure, which says whether a reference leads anywhere.
+    pub numbers: &'a HashMap<BlockId, u32>,
     pub out: &'a mut DisplayList,
 }
 
@@ -587,6 +637,8 @@ pub(crate) struct Painter<'a> {
 /// its marker, then its formulas.
 const LABEL: u64 = 1;
 const FORMULAS: u64 = 2;
+/// The links of a text come after its formulas.
+const LINKS: u64 = 1 << 15;
 /// The pictures of a leaf are named after its own text and what is in that.
 const PICTURES: u64 = 1 << 31;
 /// The cells of a row are named from the row, each with room for what is in its text.
@@ -756,6 +808,8 @@ impl Painter<'_> {
     fn text(&mut self, text: &Text<'_>, tokens: Option<&[Token]>, over: &Over<'_>) {
         let Text { set, at, .. } = *text;
         let shown = set.shown(&text.source.text);
+        // A sheet says which of its text leads somewhere.
+        let leads = if self.part.is_some() { leads(text, self.numbers) } else { Vec::new() };
         for (index, line) in set.layout.lines().enumerate() {
             let metrics = line.metrics();
             if self.outside(at.y + metrics.block_min_coord, at.y + metrics.block_max_coord) {
@@ -797,10 +851,12 @@ impl Painter<'_> {
                     (None, true) => self.pushed(&run, at, color, index, over.shifts),
                     (None, false) => {
                         let mut glyphs = self.engine.glyphs(&run, at, color);
-                        if let (Some(item), true) = (&mut glyphs, self.spelt) {
-                            spell(item, &mut clusters, shown);
+                        let from =
+                            glyphs.as_mut().filter(|_| self.spelt).and_then(|item| spell(item, &mut clusters, shown));
+                        match (glyphs, from) {
+                            (Some(item), Some(from)) if !leads.is_empty() => self.leading(item, from, &leads),
+                            (glyphs, _) => self.out.items.extend(glyphs),
                         }
-                        self.out.items.extend(glyphs);
                     }
                 }
                 let font = run.run().font_metrics();
@@ -837,6 +893,30 @@ impl Painter<'_> {
         }
         if let Some(range) = &over.composing {
             self.composing(text, range, over.shifts);
+        }
+    }
+
+    /// Emits a run of glyphs whose text starts at byte `from` of its layout's, with each stretch of it that
+    /// leads somewhere as a part of its own. A run can hold more than one, and text that leads nowhere.
+    fn leading(&mut self, item: Item, from: usize, leads: &[(Range<usize>, u64)]) {
+        let Item::Glyphs { glyphs, text: Some(spelt), .. } = &item else { return self.out.push(item) };
+        let lead = |glyph: usize| {
+            let at = from + spelt.clusters[glyph] as usize;
+            leads.iter().find(|(range, _)| range.contains(&at)).map(|(_, which)| *which)
+        };
+        let mut start = 0;
+        while start < glyphs.len() {
+            let which = lead(start);
+            let end = (start + 1..glyphs.len()).find(|glyph| lead(*glyph) != which).unwrap_or(glyphs.len());
+            let piece = if (start, end) == (0, glyphs.len()) { item.clone() } else { piece(&item, start..end) };
+            if let Some(which) = which {
+                self.open(LINKS | which, || Tag::Link);
+            }
+            self.out.push(piece);
+            if which.is_some() {
+                self.close();
+            }
+            start = end;
         }
     }
 

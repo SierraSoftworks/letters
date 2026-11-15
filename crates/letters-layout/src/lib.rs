@@ -807,7 +807,7 @@ impl State {
         }
         frames.sort_unstable();
         for frame in frames {
-            let Self { engine, types, leaves, frames, reveal, shapes, .. } = self;
+            let Self { engine, types, leaves, frames, reveal, shapes, numbers, .. } = self;
             let frame = &frames[frame];
             let (top, bottom) = frame.span(leaves);
             let rect = Rect::new(frame.x, top, frame.width, bottom - top);
@@ -829,7 +829,8 @@ impl State {
             for (tag, level) in reveal.beside(&frame.id).filter(|_| seen) {
                 let (shape, width) = shapes.get(engine, types, Role::Body, true, tag);
                 if let Some(shape) = shapes.layout(shape) {
-                    Painter { engine, types, inks: &inks, band, spelt: false, part: None, out }.sign(shape, at, level);
+                    Painter { engine, types, inks: &inks, band, spelt: false, part: None, numbers, out }
+                        .sign(shape, at, level);
                 }
                 at.x += width;
             }
@@ -873,7 +874,7 @@ impl State {
             let cells = leaf.cells.len();
             for part in [Part::Text].into_iter().chain((0..cells).map(Part::Cell)) {
                 let shifts = if print { Shifts::default() } else { self.shifts(at, part) };
-                let Self { engine, types, leaves, tokens, spelling, shapes, composition, .. } = self;
+                let Self { engine, types, leaves, tokens, spelling, shapes, composition, numbers, .. } = self;
                 let leaf = &leaves[at];
                 let Some(laid) = &leaf.laid else { continue };
                 // What belongs to editing is found by the block the text is of.
@@ -882,7 +883,7 @@ impl State {
                 let composing = composition.as_ref().filter(|(block, _)| own(block)).map(|(_, range)| range.clone());
                 let spelling = block.and_then(|id| spelling.get(id)).map_or(&[][..], Vec::as_slice);
                 let over = Over { shifts: &shifts, shapes, composing, spelling };
-                let mut painter = Painter { engine, types, inks: &inks, band, spelt: print, part: name, out };
+                let mut painter = Painter { engine, types, inks: &inks, band, spelt: print, part: name, numbers, out };
                 match part {
                     Part::Cell(index) => painter.cell(leaf, index, &over),
                     _ => {
@@ -932,7 +933,7 @@ impl State {
             out.translate(from, origin);
         }
         // The page number sits in the middle of the margin beneath the text, if the margin has room for it.
-        let Self { engine, types, scratch, palette, .. } = self;
+        let Self { engine, types, scratch, palette, numbers, .. } = self;
         let (label, number) = ((index + 1).to_string(), &mut scratch.text.layout);
         let spec = types.get(Role::Caption).spec(false, Brush { ink: Ink::Style(Role::Caption), back: None });
         engine.build(&label, &[spec], &[(0, 0..label.len())], None, number);
@@ -943,7 +944,8 @@ impl State {
             let at = Point { x: x.round(), y: below + ((foot - number.height()) / 2.0).round() };
             let inks = Inks::new(types, *palette);
             // The number is of the sheet and not of the document, so it is part of nothing.
-            Painter { engine, types, inks: &inks, band: (f32::MIN, f32::MAX), spelt: true, part: None, out }
+            let band = (f32::MIN, f32::MAX);
+            Painter { engine, types, inks: &inks, band, spelt: true, part: None, numbers, out }
                 .glyphs(number, &label, at);
         }
     }
@@ -974,18 +976,21 @@ impl State {
             for part in [Part::Text].into_iter().chain((0..leaf.cells.len()).map(Part::Cell)) {
                 let Some(text) = Text::of(leaf, part) else { continue };
                 let out = text.source.links.iter().map(|(range, target)| (range, target.clone(), None));
-                // A reference leads to its figure when it names one.
+                // A reference leads to its figure when it names one. Each link and reference is numbered as
+                // painting numbers them, which names its text on the sheet.
                 let places =
-                    text.source.refs.iter().filter_map(|(range, target)| {
-                        Some((range, String::new(), Some(self.leads_to(pages, target)?)))
-                    });
-                let mut found: Vec<_> = out.chain(places).collect();
-                found.sort_by_key(|(range, ..)| range.start);
-                for (range, target, place) in found {
+                    text.source.refs.iter().map(|(range, target)| (range, String::new(), self.leads_to(pages, target)));
+                let led = |(_, target, place): &(_, String, Option<_>)| !target.is_empty() || place.is_some();
+                let mut found: Vec<_> = out.chain(places).enumerate().filter(|(_, link)| led(link)).collect();
+                found.sort_by_key(|(_, (range, ..))| range.start);
+                for (which, (range, target, place)) in found {
+                    let name = ((at as u64 + 1) << PARTS) | leaf::link(part, which);
+                    let named = (leaf.role != Role::Code).then_some(name);
                     leaf::stretches(text.set, range, &Shifts::default(), |line, part_of| {
                         if lines.contains(&leaf.line_of(part, line)) {
                             let (x, y) = (origin.x + text.at.x + part_of.x, origin.y + text.at.y + part_of.y);
-                            links.push(PageLink { rect: Rect { x, y, ..part_of }, target: target.clone(), place });
+                            let (rect, target) = (Rect { x, y, ..part_of }, target.clone());
+                            links.push(PageLink { rect, target, place, part: named });
                         }
                     });
                 }

@@ -45,6 +45,9 @@ pub struct PageLink {
     /// Where a reference to a figure leads: the sheet its figure is on, counted from 0, and the top left of
     /// its picture on that sheet. `None` for a link that leads out of the document.
     pub place: Option<(usize, Point)>,
+    /// The id of the [`letters_render::Role::Link`] part that holds the link's text on the sheet. Every
+    /// rectangle of one link has the same one. `None` in a code block, where no text is told as a link.
+    pub part: Option<u64>,
 }
 
 /// A heading and where print shows it, for an export's outline. See [`crate::DocLayout::outline`].
