@@ -325,6 +325,42 @@ fn new_documents_take_the_users_default_style() {
 }
 
 #[test]
+fn a_style_kept_as_the_default_is_what_new_documents_start_with() {
+    let folder = Folder::new("keep-style");
+    // The first one makes the folder it is kept in, and a later one takes its place.
+    for style in [narrow(), Style::default()] {
+        files::keep_style(&folder.0, &style.to_json()).unwrap();
+        assert_eq!(files::new_style(Some(&folder.0)), style);
+    }
+    assert_eq!(fs::read_dir(folder.path(".letters")).unwrap().count(), 1, "nothing is left beside it");
+}
+
+#[test]
+fn a_stylesheet_is_written_as_a_letstyle_file() {
+    let folder = Folder::new("stylesheet");
+    let sheet = narrow().to_json();
+    let cases = [
+        ("Look.letstyle", "Look.letstyle"),
+        ("Look.LETSTYLE", "Look.LETSTYLE"),
+        ("Plain", "Plain.letstyle"),
+        ("My.look", "My.look.letstyle"),
+    ];
+    for (chosen, written) in cases {
+        let path = files::write_stylesheet(&folder.path(chosen), &sheet).unwrap();
+        assert_eq!(path, folder.path(written), "{chosen}");
+        assert_eq!(Style::from_json(&fs::read_to_string(path).unwrap()).unwrap(), narrow(), "{chosen}");
+    }
+
+    // The person was asked about replacing the name they chose, and not about one that was made from it.
+    let other = Style::default().to_json();
+    files::write_stylesheet(&folder.path("Look.letstyle"), &other).unwrap();
+    assert_eq!(fs::read_to_string(folder.path("Look.letstyle")).unwrap(), other);
+    let refused = files::write_stylesheet(&folder.path("Plain"), &other).unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read_to_string(folder.path("Plain.letstyle")).unwrap(), sheet);
+}
+
+#[test]
 fn a_blank_document_has_somewhere_to_type() {
     let blank = files::blank();
     assert_eq!(blank.blocks.len(), 1);

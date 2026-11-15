@@ -18,6 +18,8 @@ use crate::journal::{self, Claim};
 use crate::platform;
 
 pub const EXTENSION: &str = "let";
+/// What a stylesheet's file name ends in.
+pub const STYLESHEET: &str = "letstyle";
 
 #[derive(Debug)]
 pub enum Error {
@@ -61,6 +63,28 @@ pub fn blank() -> Document {
 pub fn new_style(home_folder: Option<&Path>) -> Style {
     let json = home_folder.and_then(|home| fs::read_to_string(home.join(".letters").join("style.json")).ok());
     json.and_then(|json| Style::from_json(&json).ok()).unwrap_or_default()
+}
+
+/// Keeps `json`, the text of a `style.json`, as the style the person's new documents start with.
+pub fn keep_style(home_folder: &Path, json: &str) -> io::Result<()> {
+    let folder = home_folder.join(".letters");
+    fs::create_dir_all(&folder)?;
+    // Written beside and renamed, so that a crash leaves the old default or the new one.
+    let beside = folder.join("style.json.new");
+    fs::write(&beside, json)?;
+    fs::rename(beside, folder.join("style.json"))
+}
+
+/// Writes a stylesheet where the person chose, and returns where that is: a name typed without the ending
+/// gets it, and then replaces nothing, since nobody was asked about the file of that name.
+pub fn write_stylesheet(chosen: &Path, json: &str) -> io::Result<PathBuf> {
+    if chosen.extension().is_some_and(|ending| ending.eq_ignore_ascii_case(STYLESHEET)) {
+        return fs::write(chosen, json).map(|()| chosen.to_owned());
+    }
+    let mut path = chosen.as_os_str().to_owned();
+    path.push(format!(".{STYLESHEET}"));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+    file.write_all(json.as_bytes()).map(|()| path.into())
 }
 
 /// The working copy of a new document in `style`, which no file holds yet.

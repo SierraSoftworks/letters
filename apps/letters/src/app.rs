@@ -36,7 +36,7 @@ use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 use crate::chrome;
 use crate::cli::{Mode, Options};
 use crate::dictionaries;
-use crate::files::{self, EXTENSION, Exchange, Home, Opened, Rest, Working};
+use crate::files::{self, EXTENSION, Exchange, Home, Opened, Rest, STYLESHEET, Working};
 use crate::gpu::Gpu;
 use crate::input::{self, Composer, Press};
 use crate::journal::{Journal, Journals};
@@ -61,6 +61,8 @@ const LISTED: usize = 12;
 /// The distance one notch of a mouse wheel scrolls, in logical pixels.
 const WHEEL_LINE: f32 = 40.0;
 const WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1100.0, 800.0);
+/// What a file dialog calls the files it lists for the Styles panel.
+const STYLESHEETS: &str = "Letters stylesheet";
 
 /// What reaches the event loop from outside winit.
 pub enum Event {
@@ -548,12 +550,10 @@ impl DocWindow {
 
     /// Paints one frame and puts it on screen.
     fn redraw(&mut self, now_ms: u64) -> Result<(), softbuffer::SoftBufferError> {
-        self.view.animate(now_ms);
+        // Idle work waits behind this frame, and the view asks to be called again for it.
+        self.wake_ms = self.view.animate(now_ms);
         self.list.items.clear();
         self.view.paint(&mut self.list);
-        // The view puts off its idle work while a frame is owed, and says when to call again only once
-        // none is. So it is asked again as soon as this frame is out.
-        self.wake_ms = Some(now_ms);
         self.presenter.present(&self.list, background(self.dark()))
     }
 
@@ -950,7 +950,9 @@ impl App {
     fn serve(&mut self, event_loop: &ActiveEventLoop, id: WindowId, now: Instant) {
         let Some(window) = self.windows.get_mut(&id) else { return };
         let mut refused = false;
-        for request in window.view.take_requests() {
+        let requests = window.view.take_requests();
+        let served = !requests.is_empty();
+        for request in requests {
             match request {
                 Request::Open(path) => self.act(event_loop, id, Action::Open(Some(path.into()))),
                 Request::OpenDialog => self.act(event_loop, id, Action::Open(None)),
@@ -979,9 +981,53 @@ impl App {
                     let make = |library: &Library| library.new_folder(Path::new(&parent), &name).map(drop);
                     refused = !self.replace(id, now, |_, library| make(library));
                 }
+                Request::SaveDefaultStyle(json) => self.keep_style(id, &json),
+                Request::ImportStyle => {
+                    let Some(window) = self.windows.get_mut(&id) else { continue };
+                    let dialog = FileDialog::new().add_filter(STYLESHEETS, &[STYLESHEET]);
+                    let Some(path) = dialog.set_parent(&*window.window).pick_file() else { continue };
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    // The window says so itself when the text is no stylesheet.
+                    match fs::read(&path) {
+                        Ok(text) => window.view.offer_stylesheet(&name, &String::from_utf8_lossy(&text)),
+                        Err(error) => window.alert(&format!("{name} could not be read.\n\n{error}")),
+                    }
+                }
+                Request::ExportStyle(json) => {
+                    let Some(window) = self.windows.get(&id) else { continue };
+                    let dialog = FileDialog::new()
+                        .add_filter(STYLESHEETS, &[STYLESHEET])
+                        .set_directory(window.place.folder(&self.library))
+                        .set_file_name(format!("{}.{STYLESHEET}", window.name()));
+                    if let Some(path) = dialog.set_parent(&*window.window).save_file()
+                        && let Err(error) = files::write_stylesheet(&path, &json)
+                    {
+                        window.alert(&format!("The stylesheet could not be written.\n\n{error}"));
+                    }
+                }
                 // A request this shell does not know yet.
                 _ => {}
             }
+        }
+        // An answer may have changed what the window shows.
+        if served && let Some(window) = self.windows.get_mut(&id) {
+            window.access_stale = true;
+            window.sync(now);
+        }
+    }
+
+    /// Keeps a style as the person's default, for every window to offer from now on. The window that
+    /// asked is told the old one again if the new one could not be kept.
+    fn keep_style(&mut self, id: WindowId, json: &str) {
+        let kept = files::keep_style(&std::env::home_dir().unwrap_or_default(), json);
+        let default = new_style();
+        for (other, window) in &mut self.windows {
+            if kept.is_err() || *other != id {
+                window.view.set_default_style(Some(default.clone()));
+            }
+        }
+        if let (Err(error), Some(window)) = (kept, self.windows.get(&id)) {
+            window.alert(&format!("Your default style could not be kept.\n\n{error}"));
         }
     }
 
@@ -1196,6 +1242,7 @@ impl ApplicationHandler<Event> for App {
                 // and the recents list learns of an opened document.
                 if window.rest.is_some() {
                     window.reword(&self.words);
+                    window.view.set_default_style(Some(new_style()));
                     window.start_read(&self.proxy, &self.journals);
                     window.ask_dictionaries(&self.proxy, &self.dictionaries);
                     window.relocate(library);
