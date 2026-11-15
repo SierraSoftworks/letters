@@ -437,6 +437,10 @@ impl Editor {
     /// or callout is left from the last line in it, and so is anything that only blocks without text
     /// follow. Returns whether there was such a place.
     pub(crate) fn open(&mut self, down: bool, platform: &mut dyn Platform) -> bool {
+        if self.read_only {
+            // A caret that only reads stays where the text ends.
+            return false;
+        }
         let Some(head) = self.selection().map(|selection| selection.head.clone()) else { return false };
         let doc = self.doc();
         let (Some(block), Some(place)) = (doc.block(&head.block), self.seat(&head.block)) else {

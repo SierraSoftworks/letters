@@ -123,7 +123,9 @@ impl Editor {
     /// number after it. While there is one, a list of [`Editor::numbered_figures`] belongs by the caret.
     /// `None` when the document has no numbered figure, and once Esc has dismissed it.
     pub fn referring(&self) -> Option<Referring> {
-        let caret = self.caret.as_ref().filter(|caret| caret.selection.is_caret() && !caret.picture)?;
+        // Where nothing may be written, the words at the caret are words someone else wrote.
+        let caret = self.caret.as_ref().filter(|_| !self.read_only);
+        let caret = caret.filter(|caret| caret.selection.is_caret() && !caret.picture)?;
         self.referring_at(&caret.selection.head, &caret.marks)
     }
 

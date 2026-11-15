@@ -314,6 +314,15 @@ pub enum Command {
     RemoveWord(String),
 }
 
+impl Command {
+    /// Whether the command only moves the caret, selects or copies, which is all that is left to do
+    /// where nothing may be written.
+    fn reads(&self) -> bool {
+        let selects = matches!(self, Command::SelectAll | Command::SelectWord | Command::SelectBlock);
+        selects || matches!(self, Command::Move { .. } | Command::LineBelow | Command::Copy)
+    }
+}
+
 /// What the shell lends the editor.
 pub trait Platform {
     /// Milliseconds since an arbitrary start. Only differences are meaningful.
@@ -444,6 +453,8 @@ pub struct Editor {
     fetching: bool,
     /// Whether typing leaves blocks as they are, see [`Editor::set_inline_only`].
     inline_only: bool,
+    /// Whether nothing may be written here, see [`Editor::set_read_only`].
+    read_only: bool,
 }
 
 impl Editor {
@@ -473,6 +484,7 @@ impl Editor {
             unfetched: Vec::new(),
             fetching: true,
             inline_only: false,
+            read_only: false,
         };
         if let Some(pos) = first {
             editor.place(pos);
@@ -626,16 +638,43 @@ impl Editor {
         }
     }
 
+    /// Says that whoever sits here may read the document and not write it, as a session that was let
+    /// in to read or to comment. It may write until told otherwise, and this can change while the
+    /// document is open.
+    ///
+    /// While it is on, nothing that comes in through [`Editor::input`], [`Editor::key`] or
+    /// [`Editor::run`] changes the document, its style or its history: each returns as a call that had
+    /// nothing to do. The caret still moves and selects, and the selection is still copied, so of the
+    /// commands only [`Command::Move`], [`Command::LineBelow`], the three that select and
+    /// [`Command::Copy`] apply, and none of them makes a line for the caret. There is nothing to undo
+    /// or redo, no reference is in the making, [`Editor::take_unfetched`] names nothing, and no
+    /// version is marked or named. What other writers wrote still comes in through
+    /// [`Editor::merge`], [`Editor::rewrite`] and [`Editor::attach`], since the page follows them.
+    /// What was there to undo is there again once writing is allowed.
+    pub fn set_read_only(&mut self, on: bool) {
+        if on {
+            // What is being composed stays as it stands, and nothing waits to be taken back or fetched.
+            self.end_composition();
+            self.seal();
+            self.rule = false;
+            self.unfetched.clear();
+        }
+        self.read_only = on;
+    }
+
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty() || self.composing.is_some()
+        !self.read_only && (!self.undo.is_empty() || self.composing.is_some())
     }
 
     pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
+        !self.read_only && !self.redo.is_empty()
     }
 
     /// Feeds text input. Returns what changed, for layout.
     pub fn input(&mut self, event: InputEvent, platform: &mut dyn Platform) -> Change {
+        if self.read_only {
+            return Change::default();
+        }
         self.date(platform);
         self.handle(event, platform);
         self.forget();
@@ -670,6 +709,9 @@ impl Editor {
     /// Whether a command has anything to act on, so that a key it is bound to can fall through when not, and
     /// a menu can show what is of no use here.
     pub fn applies(&self, command: &Command) -> bool {
+        if self.read_only && !command.reads() {
+            return false;
+        }
         if let Command::EmbedFigure { figure, picture } = command {
             // The figure is named, so the caret has no say.
             return self.embeddable(figure, picture);
@@ -849,7 +891,8 @@ impl Editor {
 
     /// Applies `ops` as one model edit. Returns whether the document changed.
     fn apply(&mut self, ops: Vec<Op>) -> bool {
-        if ops.is_empty() {
+        // Where nothing may be written this is the floor under every command, whatever let it through.
+        if ops.is_empty() || self.read_only {
             return false;
         }
         let (ops, renames) = shared::unshared(self.doc(), ops);
