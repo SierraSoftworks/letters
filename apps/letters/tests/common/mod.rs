@@ -6,7 +6,7 @@
 use letters::files::{self, Home, Opened, Working};
 use letters::platform;
 use letters_format::{Saved, WorkingCopy};
-use letters_model::{Document, Model, ReplicaId, Style};
+use letters_model::{Anchor, Document, Model, Note, NoteKind, Notes, ReplicaId, Run, Style};
 
 /// The two halves of a document being written: the editor's model, and the copy saves are made from.
 pub struct Writer {
@@ -52,6 +52,26 @@ impl Writer {
         self.model.merge(&self.copy.model().save()).unwrap();
         saved
     }
+}
+
+/// A comment on the start of a block.
+pub fn comment(id: &str, block: &str, words: &str) -> Note {
+    Note {
+        id: id.into(),
+        kind: NoteKind::Comment,
+        anchor: Anchor::range(block, 0..3),
+        author: "Ada".into(),
+        created: "2026-11-15T04:00:00Z".into(),
+        resolved: false,
+        content: vec![Run::plain(words)],
+        replies: Vec::new(),
+        extra: Default::default(),
+    }
+}
+
+/// The comments among some notes, by their ids.
+pub fn comments(notes: &Notes) -> Vec<&str> {
+    notes.notes.iter().map(|note| note.id.as_str()).collect()
 }
 
 /// A scratch folder that is removed when the test ends.

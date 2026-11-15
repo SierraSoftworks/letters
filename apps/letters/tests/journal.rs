@@ -3,11 +3,11 @@ mod common;
 use std::fs;
 use std::path::Path;
 
-use common::{Scratch, Writer};
+use common::{Scratch, Writer, comment, comments};
 use letters::files::{self, Exchange, Home, Opened, Rest, Working};
 use letters::journal::{Journal, Journals};
 use letters::platform;
-use letters_model::{Block, BlockKind, Document, Model, ReplicaId, Revision, Style};
+use letters_model::{Block, BlockKind, Document, Model, Notes, ReplicaId, Revision, Style};
 
 fn document(text: &str) -> Document {
     Document { blocks: vec![Block::text("p0", BlockKind::Paragraph, text)], ..Document::default() }
@@ -65,7 +65,8 @@ impl Desk {
         let home = self.home.clone().expect("the document has somewhere to go");
         self.journal().saving();
         let (edits, seen) = (self.writer.model.save(), self.writer.model.revision());
-        let Exchange { home, held, .. } = home.exchange(&mut self.writer.copy, &edits, &seen).unwrap();
+        let notes = self.writer.copy.notes.clone();
+        let Exchange { home, held, .. } = home.exchange(&mut self.writer.copy, &edits, notes, &seen).unwrap();
         self.journal().moved(home.path());
         self.journal().saved(held);
         self.home = Some(home);
@@ -217,4 +218,29 @@ fn a_picture_put_in_before_a_crash_comes_back_and_reaches_the_file() {
     // The save it is owed puts the picture in the file, where the next opening finds it.
     desk.save();
     assert_eq!(files::entry(&path, name), Some(picture.bytes), "the file holds the picture");
+}
+
+#[test]
+fn a_comment_written_before_a_crash_comes_back_and_reaches_the_file() {
+    let scratch = Scratch::new("journal-comment");
+    let path = scratch.0.join("Rates.let");
+    let mut journals = Journals::at(scratch.0.join("unsaved"));
+    let mut desk = Desk::at(&mut journals, new(Some(&path)));
+    desk.write(&document("Rates change in January."));
+    desk.save();
+
+    let notes = Notes { notes: vec![comment("n1", "p0", "Which rates?")], ..Notes::default() };
+    desk.journal().notes(&notes);
+
+    let mut journals = crash(desk, journals);
+    let mut back = brought_back(&journals);
+    assert_eq!(back.len(), 1);
+    let mut desk = Desk::at(&mut journals, back.remove(0));
+    assert_eq!(comments(&desk.writer.copy.notes), ["n1"], "the window has the comment again");
+    assert!(desk.journal().owes());
+
+    // The save it is owed puts the comment in the file, where the next opening finds it.
+    desk.save();
+    let (reader, _) = Writer::of(files::open(&path, Style::default).unwrap());
+    assert_eq!(comments(&reader.copy.notes), ["n1"], "the file holds the comment");
 }

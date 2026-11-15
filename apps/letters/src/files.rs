@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
 use letters_format::{Archive, Files, Save, Saved, Stamp, WorkingCopy};
-use letters_model::{Block, BlockId, BlockKind, Document, Model, Prepared, ReplicaId, Revision, Style};
+use letters_model::{Block, BlockId, BlockKind, Document, Model, Notes, Prepared, ReplicaId, Revision, Style};
 
 use crate::journal::{self, Claim};
 use crate::platform;
@@ -139,14 +139,23 @@ impl Home {
         Ok((Home { path, written: true }, saved))
     }
 
-    /// One save from an editor: takes its `edits` into `copy`, writes the file, and says what the file held
-    /// that the editor, at `revision`, has not seen.
-    pub fn exchange(&self, copy: &mut WorkingCopy, edits: &[u8], revision: &Revision) -> Result<Exchange, Error> {
+    /// One save from an editor: takes its `edits` and its `notes` as they stand into `copy`, writes the
+    /// file, and says what the file held that the editor, at `revision`, has not seen.
+    pub fn exchange(
+        &self,
+        copy: &mut WorkingCopy,
+        edits: &[u8],
+        notes: Notes,
+        revision: &Revision,
+    ) -> Result<Exchange, Error> {
         copy.edit(edits)?;
-        let ours = copy.model().revision();
+        // The editor's notes have followed its text and say what was resolved, so they stand for the copy's.
+        let ours = (copy.model().revision(), notes.clone());
+        copy.notes = notes;
         let (home, saved) = self.save(copy)?;
-        let news = (copy.model().revision() != ours).then(|| copy.model().updates_since(revision));
-        Ok(Exchange { home, news, held: matches!(saved, Saved::Unchanged) })
+        let news = (copy.model().revision() != ours.0).then(|| copy.model().updates_since(revision));
+        let notes = (copy.notes != ours.1).then(|| copy.notes.clone());
+        Ok(Exchange { home, news, notes, held: matches!(saved, Saved::Unchanged) })
     }
 
     /// Moves the document's file to `to` and returns its home there. Whatever `to` holds is never replaced:
@@ -169,6 +178,8 @@ pub struct Exchange {
     pub home: Home,
     /// What the file held that the editor has not seen. The editor merges it.
     pub news: Option<Vec<u8>>,
+    /// The notes as the file's own changed them. The editor merges them.
+    pub notes: Option<Notes>,
     /// Whether the file was read and found to hold everything, so that nothing was written. Only this
     /// tells a journal that its records are in the file.
     pub held: bool,

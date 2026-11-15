@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Picture, Platform as _};
 use letters_format::WorkingCopy;
-use letters_model::{BlockId, Model, ReplicaId, Revision, Style};
+use letters_model::{BlockId, Model, Notes, ReplicaId, Revision, Style};
 use letters_render::image::Image;
 use letters_render::{Color, DisplayList, Point, Size};
 use letters_spell::Dictionary;
@@ -410,6 +410,8 @@ struct DocWindow {
     journalled: Option<Revision>,
     /// The view's edit count the journal was last given.
     journalled_edits: u64,
+    /// The notes as the journal, or the file before it, last held them.
+    journalled_notes: Notes,
     journal_at: Option<Instant>,
     /// Assets the document names that no save has been handed yet.
     assets: BTreeMap<String, Vec<u8>>,
@@ -533,6 +535,11 @@ impl DocWindow {
         let model = self.view.editor().model();
         journal.edits(self.journalled.as_ref().map_or_else(|| model.save(), |seen| model.updates_since(seen)));
         (self.journalled, self.journalled_edits) = (Some(model.revision()), self.view.edits());
+        // A comment counts among the edits, and the notes move with the text they are about.
+        if self.view.notes() != &self.journalled_notes {
+            journal.notes(self.view.notes());
+            self.journalled_notes = self.view.notes().clone();
+        }
     }
 
     /// How wide a picture is held for this window, in pixels.
@@ -914,6 +921,13 @@ impl DocWindow {
                     eprintln!("letters: could not bring back unsaved work in {}: {error}", self.name());
                 }
                 self.id = Some(copy.id.clone());
+                // The window keeps the notes from here on. A comment written before they arrived stays.
+                let mut notes = copy.notes.clone();
+                let early = notes.merge(self.view.notes());
+                self.view.set_notes(notes);
+                if !early {
+                    self.journalled_notes = self.view.notes().clone();
+                }
                 if let Some(claim) = claim {
                     let journal = journals.open(claim, &copy.id, &copy.created, self.file());
                     // What an earlier session left unsaved is saved now.
@@ -976,8 +990,9 @@ impl DocWindow {
         }
         let (edits, revision) = self.edits_for(&mut copy);
         let (id, proxy, since) = (self.window.id(), proxy.clone(), revision.clone());
+        let notes = self.view.notes().clone();
         let save = thread::spawn(move || {
-            let result = home.exchange(&mut copy, &edits, &since).map_err(|error| error.to_string());
+            let result = home.exchange(&mut copy, &edits, notes, &since).map_err(|error| error.to_string());
             let _ = proxy.send_event(Event::Saved(id));
             Saving { copy, result }
         });
@@ -1026,7 +1041,7 @@ impl DocWindow {
     /// Notes a save that worked: the document as it was at `edits` and `revision` is in its file, and
     /// `exchange` says where that is and what the file held from other writers.
     fn saved(&mut self, exchange: Exchange, edits: u64, revision: Revision, library: &Library) {
-        let Exchange { home, news, held } = exchange;
+        let Exchange { home, news, notes, held } = exchange;
         self.place.saved(home);
         self.rehome();
         if let Some(journal) = &mut self.journal {
@@ -1048,6 +1063,13 @@ impl DocWindow {
         {
             eprintln!("letters: could not take in what {} held: {error}", self.name());
         }
+        // What others wrote in the margin joins what was written here, since the save started too.
+        if let Some(theirs) = notes {
+            let mut merged = self.view.notes().clone();
+            if merged.merge(&theirs) {
+                self.view.set_notes(merged);
+            }
+        }
         // What came from the file is in the file, so it is no edit to save.
         self.saved_edits = if typed_since { edits } else { self.view.edits() };
         if !typed_since {
@@ -1061,7 +1083,7 @@ impl DocWindow {
             journal.saving();
         }
         let (edits, revision) = self.edits_for(copy);
-        match home.exchange(copy, &edits, &revision) {
+        match home.exchange(copy, &edits, self.view.notes().clone(), &revision) {
             Ok(exchange) => self.saved(exchange, self.view.edits(), revision, library),
             Err(error) => {
                 self.unheld();
@@ -1210,6 +1232,7 @@ impl App {
             journal: None,
             journalled: None,
             journalled_edits: 0,
+            journalled_notes: Notes::default(),
             journal_at: None,
             assets: BTreeMap::new(),
             plan: None,

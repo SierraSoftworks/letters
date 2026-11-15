@@ -4,10 +4,10 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use common::Writer;
+use common::{Writer, comment, comments};
 use letters::files::{self, Exchange, Home, Opened};
 use letters_format::{Archive, Package, Saved, conflict_copy_of};
-use letters_model::{Block, BlockKind, Document, Page, Style};
+use letters_model::{Block, BlockKind, Document, Notes, Page, Style};
 
 /// A scratch folder that is removed when the test ends.
 struct Folder(PathBuf);
@@ -136,7 +136,8 @@ fn two_writers_of_one_file_both_keep_their_edits() {
     // Ben's save meets hers in the file, and hands him what he has not seen.
     ben.write(&paragraphs(&["One", "Two, says Ben"]));
     let seen = ben.model.revision();
-    let Exchange { home, news, held } = bens.exchange(&mut ben.copy, &ben.model.save(), &seen).unwrap();
+    let Exchange { home, news, held, .. } =
+        bens.exchange(&mut ben.copy, &ben.model.save(), Notes::default(), &seen).unwrap();
     ben.model.merge(&news.expect("the file held her edit")).unwrap();
     assert!(!held, "the file had to be written");
 
@@ -147,8 +148,32 @@ fn two_writers_of_one_file_both_keep_their_edits() {
 
     // A save with nothing new on either side has nothing to hand back, and finds it all in the file.
     let seen = ben.model.revision();
-    let again = home.exchange(&mut ben.copy, &ben.model.updates_since(&seen), &seen).unwrap();
+    let again = home.exchange(&mut ben.copy, &ben.model.updates_since(&seen), Notes::default(), &seen).unwrap();
     assert!(again.news.is_none() && again.held);
+}
+
+#[test]
+fn comments_are_saved_as_the_editor_holds_them_and_meet_those_of_other_writers() {
+    let folder = Folder::new("comments");
+    let path = folder.path("Shared.let");
+    let text = paragraphs(&["One", "Two"]);
+    Writer::new(&text, Style::default()).save(&Home::new(&path), &text);
+    let (mut ada, adas) = Writer::of(open(&path).unwrap());
+    let (mut ben, bens) = Writer::of(open(&path).unwrap());
+    let holding =
+        |ids: &[&str]| Notes { notes: ids.iter().map(|id| comment(id, "p0", "Why?")).collect(), ..Notes::default() };
+    // What a writer's editor hands a save: nothing typed, and the notes it holds.
+    let hand = |writer: &Writer, id| (writer.model.updates_since(&writer.model.revision()), holding(&[id]));
+
+    // A save hands over the editor's notes, and hears nothing back when the file had no others.
+    let (edits, notes) = hand(&ada, "ada");
+    let saved = adas.exchange(&mut ada.copy, &edits, notes, &ada.model.revision()).unwrap();
+    assert_eq!(saved.notes, None);
+    // One that meets another writer's comment in the file is handed it, and the file keeps both.
+    let (edits, notes) = hand(&ben, "ben");
+    let saved = bens.exchange(&mut ben.copy, &edits, notes, &ben.model.revision()).unwrap();
+    assert_eq!(saved.notes.as_ref().map(comments), Some(vec!["ada", "ben"]));
+    assert_eq!(comments(&Writer::of(open(&path).unwrap()).0.copy.notes), ["ada", "ben"]);
 }
 
 #[test]

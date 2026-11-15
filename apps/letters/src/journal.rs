@@ -14,6 +14,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use letters_format::{Journal as Records, Mark, Saved, Unsaved, is_journal, journal_name};
+use letters_model::Notes;
 
 use crate::files::Folder;
 
@@ -112,6 +113,10 @@ enum Message {
         key: u64,
         name: String,
         bytes: Vec<u8>,
+    },
+    Notes {
+        key: u64,
+        notes: Notes,
     },
     /// A save has been handed everything journalled so far.
     Saving {
@@ -238,6 +243,12 @@ impl Journal {
         self.send(Message::Asset { key: self.key, name: name.into(), bytes: bytes.into() });
     }
 
+    /// Records the document's notes as they stand, after a comment was written or changed.
+    pub fn notes(&mut self, notes: &Notes) {
+        self.owed = true;
+        self.send(Message::Notes { key: self.key, notes: notes.clone() });
+    }
+
     /// Notes that a save is being handed everything recorded so far.
     pub fn saving(&mut self) {
         self.covered |= std::mem::take(&mut self.owed);
@@ -303,6 +314,9 @@ fn write(mut folder: Folder, messages: Receiver<Message>) {
             }
             Message::Asset { key, name, bytes } => {
                 open.get_mut(&key).map_or(Ok(()), |journal| journal.records.asset(&mut folder, &name, &bytes))
+            }
+            Message::Notes { key, notes } => {
+                open.get_mut(&key).map_or(Ok(()), |journal| journal.records.notes(&mut folder, &notes))
             }
             Message::Saving { key } => {
                 if let Some(journal) = open.get_mut(&key) {
