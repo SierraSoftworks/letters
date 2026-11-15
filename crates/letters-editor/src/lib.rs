@@ -6,6 +6,7 @@
 //!
 //! The editor never reads a clock or a clipboard itself. The shell injects a [`Platform`].
 
+mod callout;
 mod clipboard;
 mod edit;
 mod figures;
@@ -31,6 +32,7 @@ use letters_model::{
     Run, Selection, Style, TextStyle,
 };
 
+pub use callout::CalloutEdit;
 pub use figures::Spot;
 pub use keymap::Keymap;
 /// The markers [`Editor::markers`] returns. They live in the model so that layout can draw them.
@@ -153,6 +155,8 @@ pub enum Command {
     },
     /// Changes the table the caret is in. [`Editor::cell`] says where in it the caret is.
     Table(TableEdit),
+    /// Changes the callout the caret is in, which [`Editor::callout`] tells of.
+    Callout(CalloutEdit),
     /// Puts pictures in: one as a figure, several as a gallery, and the last is left selected. With no
     /// spot they go below the block the selection ends in, in place of an empty line, or beside the
     /// selected picture of a gallery. The bytes go to [`Platform::store_asset`], and what is no picture
@@ -574,6 +578,7 @@ impl Editor {
             Command::Copy | Command::Cut => ranged || caret.picture,
             Command::LeaveFormula => self.formula().is_some(),
             Command::Table(_) => self.cell().is_some(),
+            Command::Callout(_) => self.callout().is_some(),
             Command::MoveFigure(_) | Command::ResizeFigure { .. } | Command::SetAlt(_) => self.subject().is_some(),
             Command::ShiftFigure { .. } => caret.picture && self.member(&caret.selection.head.block),
             Command::SetNumbered(_) => self.numbered_by(&caret.selection.head.block).is_some(),
@@ -618,6 +623,7 @@ impl Editor {
             Command::ToggleChecked => self.toggle_checked(),
             Command::InsertTable { rows, columns } => self.insert_table(rows, columns, platform),
             Command::Table(edit) => self.table_edit(edit, platform),
+            Command::Callout(edit) => self.callout_edit(edit),
             Command::InsertFigures { pictures, at } => self.insert_figures(&pictures, at.as_ref(), platform),
             Command::MoveFigure(spot) => self.move_figure(&spot, platform),
             Command::ShiftFigure { right } => self.shift_figure(right, platform),

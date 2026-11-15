@@ -5,7 +5,7 @@
 //! list is the table below. The window says which of it has something to act on now, and what each asks.
 
 use accesskit::Role;
-use letters_editor::{Command, Key, KeyEvent, Keymap, Modifiers, TableEdit};
+use letters_editor::{CalloutEdit, Command, Key, KeyEvent, Keymap, Modifiers, TableEdit};
 use letters_model::{Align as ColumnAlign, BlockKind, ListKind, Mark, Tone};
 use letters_render::{Rect, Size};
 
@@ -65,6 +65,8 @@ pub(crate) enum Act {
     Pictures,
     /// Turns the line under a picture to its alt text.
     AltText,
+    /// Opens the card of the callout the caret is in.
+    Callout,
     /// Shows the selected linked picture this once.
     Load,
     /// Shows the pictures of the selected one's host from now on.
@@ -130,9 +132,13 @@ const fn table(name: &'static str, also: &'static str, edit: TableEdit) -> Entry
     run("Table", name, also, Command::Table(edit))
 }
 
+const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> Entry {
+    run("Callout", name, also, Command::Callout(edit))
+}
+
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 78] = [
+pub(crate) static ENTRIES: [Entry; 85] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -161,6 +167,13 @@ pub(crate) static ENTRIES: [Entry; 78] = [
     table("Align column right", "end", TableEdit::Align(ColumnAlign::End)),
     table("Turn header row on", "heading first", TableEdit::Header(true)),
     table("Turn header row off", "heading first", TableEdit::Header(false)),
+    entry("Callout", "Edit callout", "title icon colour color type", Act::Callout),
+    callout("Info", "note blue", CalloutEdit::Tone(Tone::Info)),
+    callout("Tip", "hint green", CalloutEdit::Tone(Tone::Tip)),
+    callout("Warning", "caution amber", CalloutEdit::Tone(Tone::Warn)),
+    callout("Danger", "error red", CalloutEdit::Tone(Tone::Danger)),
+    callout("Use the type's defaults", "reset title icon colour color", CalloutEdit::Reset),
+    callout("Turn into body text", "remove unwrap plain", CalloutEdit::Remove),
     kind("Body text", "paragraph normal plain", BlockKind::Paragraph),
     kind("Heading 1", "h1 title", BlockKind::Heading { level: 1 }),
     kind("Heading 2", "h2", BlockKind::Heading { level: 2 }),
@@ -184,7 +197,7 @@ pub(crate) static ENTRIES: [Entry; 78] = [
     entry("Format", "Comment", "note", Act::Comment),
     run("Insert", "Table", "grid", Command::InsertTable { rows: 3, columns: 3 }),
     entry("Insert", "Image", "picture photo figure", Act::Pictures),
-    run("Insert", "Callout", "box note", Command::SetBlock(BlockKind::Callout { tone: Tone::Info })),
+    run("Insert", "Callout", "box note", Command::SetBlock(BlockKind::callout(Tone::Info))),
     run("Insert", "Formula", "maths equation tex", Command::SetBlock(BlockKind::Formula)),
     run("Insert", "Divider", "rule line separator", Command::SetBlock(BlockKind::Divider)),
     run("Edit", "Undo", "", Command::Undo),

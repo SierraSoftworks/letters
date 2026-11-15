@@ -779,19 +779,23 @@ impl Editor {
         let doc = self.doc();
         let Some(place) = self.seat(&head) else { return };
         if let Some(parent) = place.parent {
-            let Some(outer) = self.seat(&parent.id).filter(|_| parent.kind.admits(&kind)) else { return };
+            if !parent.kind.admits(&kind) {
+                return;
+            }
+            // A callout asked to be one of another tone keeps what was chosen for it.
+            let kind = match (&parent.kind, kind) {
+                (BlockKind::Callout { tone: old, .. }, BlockKind::Callout { tone, .. }) if *old != tone => {
+                    crate::callout::toned(&parent.kind, tone)
+                }
+                (BlockKind::Callout { .. }, BlockKind::Callout { .. }) => parent.kind.clone(),
+                (_, kind) => kind,
+            };
             if parent.kind != kind {
                 self.apply(vec![Op::SetKind { block: parent.id.clone(), kind }]);
                 return;
             }
-            let mut ops = vec![Op::RemoveBlock { block: parent.id.clone() }];
-            let children = parent.body.blocks().iter().enumerate();
-            ops.extend(children.map(|(i, child)| Op::InsertBlock {
-                parent: outer.parent_id(),
-                index: outer.index + i,
-                block: child.clone(),
-            }));
-            self.apply(ops);
+            let parent = parent.id.clone();
+            self.unwrap(&parent);
             return;
         }
         // The blocks wrapped are the top-level ones from the anchor's to the head's.
@@ -803,6 +807,19 @@ impl Editor {
         let mut container = Block::new(platform.new_id().as_str(), kind);
         container.body = Body::Blocks(children);
         ops.push(Op::InsertBlock { parent: None, index: from, block: container });
+        self.apply(ops);
+    }
+
+    /// Takes a quote or callout away and leaves what it held in its place.
+    pub(crate) fn unwrap(&mut self, holder: &BlockId) {
+        let (Some(block), Some(outer)) = (self.doc().block(holder), self.seat(holder)) else { return };
+        let mut ops = vec![Op::RemoveBlock { block: holder.clone() }];
+        let children = block.body.blocks().iter().enumerate();
+        ops.extend(children.map(|(i, child)| Op::InsertBlock {
+            parent: outer.parent_id(),
+            index: outer.index + i,
+            block: child.clone(),
+        }));
         self.apply(ops);
     }
 

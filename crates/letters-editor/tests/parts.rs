@@ -183,7 +183,7 @@ fn deleting_a_range_takes_whole_figures_and_keeps_a_cut_table_in_shape() {
 fn commands_for_blocks_leave_parts_as_they_are() {
     let heading = Command::SetBlock(BlockKind::Heading { level: 2 });
     let quote = Command::SetBlock(BlockKind::Quote);
-    let tip = Command::SetBlock(BlockKind::Callout { tone: Tone::Tip });
+    let tip = Command::SetBlock(BlockKind::callout(Tone::Tip));
     let divider = Command::SetBlock(BlockKind::Divider);
     let all = "Paragraph Figure Paragraph";
     let cases = [

@@ -22,6 +22,7 @@ use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
 
+use crate::callouts::{self, Calling, Callouts};
 use crate::captions::{self, Altering, Captions};
 use crate::chrome::Chrome;
 use crate::code_copy::{self, CodeCopy};
@@ -206,6 +207,8 @@ pub enum Message {
     Linked(Linking),
     /// Puts the menu of the caret's column or row away.
     TableMenu,
+    /// What is done on the card of a callout.
+    Callout(Calling),
     /// What the field of a picture's alt text asks for.
     Alt(Altering),
     /// What the tools over a selection and the field of a comment ask for.
@@ -782,6 +785,8 @@ pub struct EditorApp {
     references: References,
     code_copy: CodeCopy,
     tables: Tables,
+    /// The callouts' icons and titles under the pointer, and the card of one.
+    callouts: Callouts,
     /// The preview of a figure that shows over the page: its caption, and where it is in the page area.
     previewed: Option<(String, Rect)>,
     /// How the document read when assistive technology was last told of it.
@@ -855,6 +860,7 @@ impl EditorApp {
             references: References::default(),
             code_copy: CodeCopy::default(),
             tables: Tables::default(),
+            callouts: Callouts::default(),
             previewed: None,
             told: RefCell::default(),
         }
@@ -1525,6 +1531,7 @@ impl EditorApp {
                     Command::Table(TableEdit::Header(on)) => self.header() == Some(!on),
                     Command::SetNumbered(on) => self.numbered() == Some(!on),
                     Command::SetBlock(_) => in_text,
+                    Command::Callout(edit) => callouts::changes(editor, edit),
                     _ => true,
                 };
                 (fits && editor.applies(command)).then(|| Message::Run(command.clone()))?
@@ -1544,6 +1551,7 @@ impl EditorApp {
             }
             Act::Pictures => Message::Ask(Request::Pictures),
             Act::AltText => self.captioned().map(|_| Message::Alt(Altering::Open))?,
+            Act::Callout => editor.callout().map(|_| Message::Callout(Calling::Open))?,
             Act::Load => {
                 let waits = |src: &&str| self.linked.said(src).is_none_or(|state| *state != PictureState::Loading);
                 let src = link.filter(waits).filter(|src| self.images.get(src).is_none());
@@ -2084,7 +2092,7 @@ impl EditorApp {
         let card = self.landing.is_some() || self.importing.is_some() || self.copying.is_some();
         let asked = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
         let asked = asked || self.captions.alt.is_some() || self.tables.open.is_some();
-        card || asked || self.commands.open()
+        card || asked || self.commands.open() || self.callouts.open.is_some()
     }
 
     /// Whether something hangs over the page and takes what the pointer does there. A note the caret opened
@@ -2110,6 +2118,35 @@ impl EditorApp {
         let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
         if self.margin.attend(was, caret, free) {
             self.margin.now = platform.wall_time().map(notes::stamp).unwrap_or_default();
+        }
+    }
+
+    /// The callout whose icon and title are at a point of the page area, while nothing hangs over the page.
+    fn callout_at(&self, at: Point) -> Option<BlockId> {
+        if self.hung() || self.away() {
+            return None;
+        }
+        let at = self.in_layout(at);
+        let heads = self.layout.callouts(Rect::new(at.x, at.y - 64.0, 0.0, 128.0));
+        heads.into_iter().find(|(_, head)| callouts::target(*head).contains(at)).map(|(block, _)| block)
+    }
+
+    /// Opens the card of a callout, as a press on its icon or title does. The caret goes inside it first,
+    /// since the card is about the callout the caret is in.
+    fn call(&mut self, callout: &BlockId, platform: &mut dyn Platform) {
+        let Some(inside) = self.editor.doc().block(callout).and_then(callouts::inside) else { return };
+        self.editor.select(Selection::caret(inside));
+        self.mark();
+        self.calling(Calling::Open, platform);
+    }
+
+    /// Does what the card of a callout asked.
+    fn calling(&mut self, asked: Calling, platform: &mut dyn Platform) {
+        if asked == Calling::Open {
+            (self.link, self.spelling.fix, self.linked.open, self.captions.alt) = (None, None, None, None);
+        }
+        if let Some(edit) = self.callouts.update(asked, &self.editor) {
+            self.edit(platform, |editor, platform| editor.run(Command::Callout(edit), platform));
         }
     }
 
@@ -2254,6 +2291,8 @@ impl EditorApp {
             let in_view = self.in_view(&reference.target);
             (reference, in_view)
         });
+        let headed = self.references.rest().and_then(|at| self.callout_at(at));
+        let called = std::mem::replace(&mut self.callouts.over, headed.clone()) != headed;
         let linked = self.references.rest().and_then(|at| self.linked_at(at));
         // Each is taken, whichever changed.
         let clouded = self.linked.point(linked);
@@ -2272,7 +2311,7 @@ impl EditorApp {
         self.margin.over = marker;
         let part = rest.and_then(|at| self.table_part(at)).map(|(_, part)| part);
         let tabled = self.tables.point(part);
-        self.references.point(found) || copy || clouded || gripped || switched || marked || tabled
+        self.references.point(found) || copy || clouded || gripped || switched || marked || tabled || called
     }
 
     /// Forgets where the pointer rests until it next moves, as when the person goes on writing.
@@ -2325,6 +2364,12 @@ impl EditorApp {
                     return self.noting(Noting::Press(block), platform);
                 }
                 self.margin.forget();
+                // A press on a callout's icon or title opens its card, with the caret inside the callout.
+                if let Some(block) = self.callout_at(at) {
+                    self.dragging = false;
+                    self.references.press(None);
+                    return self.call(&block, platform);
+                }
                 // A press on a copy button is the button's, and leaves the caret where it is.
                 let button = self.copy_button(at);
                 self.code_copy.press(button);
@@ -2611,6 +2656,7 @@ impl EditorApp {
         if self.linked.open.as_ref().is_some_and(|figure| self.link_of(figure).is_none()) {
             self.linked.open = None;
         }
+        self.callouts.follow(&self.editor);
         // The alt text of a picture the selection has left is no longer being written.
         if self.captions.alt.as_ref().is_some_and(|(figure, _)| self.captioned() != Some(figure)) {
             self.captions.alt = None;
@@ -2699,6 +2745,10 @@ impl EditorApp {
 
         if let Some(bar) = self.drop {
             list.items.push(Item::Fill { rect: bar, color: resolve(self.accent.base, self.scheme, 1.0), radius: 2.0 });
+        }
+        // A callout's icon and title say that a press on them does something.
+        for (block, head) in self.layout.callouts(viewport) {
+            self.callouts.paint(&block, head, self.scheme, &mut list);
         }
         // Each code block has its copy button in its corner, over its text.
         for (block, code) in self.layout.code_boxes(viewport) {
@@ -2837,6 +2887,14 @@ impl EditorApp {
             element = element.popover(menu);
         } else if let Some(((_, text), (_, line, switch))) = self.captions.alt.as_ref().zip(self.alt_switch()) {
             element = element.popover(captions::sheet(text, self.onto(line), self.onto(switch)));
+        } else if let Some((kind, head)) = self.callouts.open.as_ref().and_then(|open| {
+            let kind = &self.editor.doc().block(open)?.kind;
+            let heads = self.layout.callouts(viewport);
+            Some((kind, heads.into_iter().find(|(block, _)| block == open).map(|(_, head)| head)))
+        }) {
+            // The card hangs under the icon and title, or from the caret when the callout shows neither.
+            let spot = head.map(|head| self.onto(callouts::target(head))).or(caret).unwrap_or_default();
+            element = element.popover(self.callouts.card(kind, spot).expect("the block is a callout"));
         } else if let Some(fix) = &self.spelling.fix {
             // The menu hangs from the start of its word.
             let start = self.layout.caret(&Pos::new(fix.block.clone(), fix.range.start)).unwrap_or_default();
@@ -2900,6 +2958,7 @@ impl EditorApp {
         let pressable = self.references.pointed().is_some() || self.code_copy.pointed() || self.linked.on_cloud();
         let pressable = pressable || self.captions.over || self.margin.over.is_some() || self.review.pressable();
         let pressable = pressable || self.tables.pointed();
+        let pressable = pressable || self.callouts.over.is_some();
         match self.grip.corner() {
             Some(corner) => element.cursor(Cursor::Resize(figures::edge(corner))),
             None if pressable => element.cursor(Cursor::Pointer),
@@ -3756,6 +3815,7 @@ impl EditorApp {
             Message::Refer(Picking::Take(figure)) => self.refer(figure, platform),
             Message::Linked(asked) => self.linking(asked),
             Message::TableMenu => self.tables.open = None,
+            Message::Callout(asked) => self.calling(asked, platform),
             Message::Safe(asked) => self.safely(asked),
             Message::Alt(asked) => self.altering(asked, platform),
             Message::Note(asked) => self.noting(asked, platform),
@@ -3996,6 +4056,7 @@ impl App for EditorApp {
                 let asked = if add { tables::Asked::Add(axis) } else { tables::Asked::Menu(axis, index) };
                 self.tabled(&shown, asked, platform);
             }
+            Some(describe::Request::Callout(block)) => self.call(&block, platform),
             Some(describe::Request::Alt(figure)) => {
                 self.editor.select_picture(&figure);
                 self.mark();

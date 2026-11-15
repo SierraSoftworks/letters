@@ -22,7 +22,7 @@ fn rate() -> f32 {
 > [!NOTE]
 > Reply by Friday.
 >
-> > [!CAUTION]
+> > [!CAUTION] Before you start
 
 ---
 

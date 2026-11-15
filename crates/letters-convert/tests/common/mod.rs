@@ -34,7 +34,7 @@ pub fn outline(doc: &Document) -> Vec<String> {
                 BlockKind::Code { language } => format!("code:{} {}", language.as_deref().unwrap_or("-"), runs(block)),
                 BlockKind::Formula => format!("formula {}", runs(block)),
                 BlockKind::Quote => "quote".to_owned(),
-                BlockKind::Callout { tone } => format!("callout:{tone:?}").to_lowercase(),
+                BlockKind::Callout { tone, .. } => format!("callout:{tone:?}").to_lowercase(),
                 BlockKind::Divider => "divider".to_owned(),
                 BlockKind::Caption => format!("caption {}", runs(block)),
                 BlockKind::Figure { asset, src, alt, numbered, .. } => {

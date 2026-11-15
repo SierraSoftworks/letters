@@ -20,8 +20,8 @@ fn every_kind_of_block_paints_inside_the_column() {
         ("task", Block::text("a", BlockKind::ListItem { list: ListKind::Task { checked: true }, depth: 0 }, PROSE)),
         ("code", Block::text("a", BlockKind::Code { language: Some("rust".into()) }, "fn main() {\n    run();\n}")),
         ("quote", container("q", BlockKind::Quote, vec![paragraph("a", PROSE)])),
-        ("callout", container("c", BlockKind::Callout { tone: Tone::Warn }, vec![paragraph("a", PROSE)])),
-        ("empty callout", container("c", BlockKind::Callout { tone: Tone::Info }, vec![])),
+        ("callout", container("c", BlockKind::callout(Tone::Warn), vec![paragraph("a", PROSE)])),
+        ("empty callout", container("c", BlockKind::callout(Tone::Info), vec![])),
         ("divider", Block::new("d", BlockKind::Divider)),
         ("unknown", Block::new("u", BlockKind::Unknown { type_name: "chart".into() })),
         ("empty paragraph", paragraph("a", "")),
@@ -312,7 +312,7 @@ fn an_edit_gives_the_same_layout_as_starting_over() {
             paragraph("a", PROSE),
             Block::text("i", BlockKind::ListItem { list: ListKind::Ordered, depth: 0 }, "One"),
             Block::text("j", BlockKind::ListItem { list: ListKind::Ordered, depth: 0 }, "Two"),
-            container("c", BlockKind::Callout { tone: Tone::Tip }, vec![paragraph("b", PROSE)]),
+            container("c", BlockKind::callout(Tone::Tip), vec![paragraph("b", PROSE)]),
             paragraph("z", "End"),
         ])
     };
@@ -427,7 +427,7 @@ fn the_palette_colours_what_the_style_does_not() {
     let light = Palette::LIGHT;
     let item = |list| Block::text("a", BlockKind::ListItem { list, depth: 0 }, "Item");
     let run = |run: Run| Block { body: Body::Text(vec![run]), ..paragraph("a", "") };
-    let warning = || container("c", BlockKind::Callout { tone: Tone::Warn }, vec![paragraph("a", "Rates")]);
+    let warning = || container("c", BlockKind::callout(Tone::Warn), vec![paragraph("a", "Rates")]);
     let cases: Vec<(&str, Palette, Block)> = vec![
         (
             "a link",
@@ -679,4 +679,54 @@ fn text_is_read_in_the_language_named_nearest_to_it() {
         assert!(glyphs(&layout) == wanted.0, "{name}: the text is set again for the language");
         assert!(read(model.doc()) == wanted, "{name}: as on a page that starts with it, Han told with it");
     }
+}
+
+#[test]
+fn a_callout_is_headed_by_its_icon_and_title_in_its_colour() {
+    const OWN: Color = Color::rgb(0xaa, 0x33, 0x66);
+    let chosen = |title: Option<&str>, icon: Option<&str>, color: Option<&str>| {
+        let own = |text: Option<&str>| text.map(str::to_owned);
+        let kind = BlockKind::Callout { tone: Tone::Warn, title: own(title), icon: own(icon), color: own(color) };
+        laid(&doc(vec![container("c", kind, vec![paragraph("a", "Rates")])]))
+    };
+    let icons = |layout: &DocLayout| {
+        let items = painted(layout, everything());
+        items.iter().filter(|item| matches!(item, Item::Path { .. })).count()
+    };
+    let caret = |layout: &DocLayout| layout.caret(&Pos::new("a", 0)).expect("the text has a caret");
+
+    let plain = chosen(None, None, None);
+    let (titled, untitled) = (chosen(Some("Before the roofers arrive"), None, None), chosen(Some(""), None, None));
+    let bare = chosen(Some(""), Some("none"), None);
+    // The tone gives a title and an icon. A title has a line of its own, and an icon alone stands beside the text.
+    assert_eq!(spelt(&plain).matches("Warning").count(), 1, "the tone's title shows: {}", spelt(&plain));
+    assert!(spelt(&titled).contains("Before the roofers arrive") && !spelt(&titled).contains("Warning"));
+    assert_eq!((icons(&plain), icons(&untitled), icons(&bare)), (1, 1, 0));
+    assert_eq!(titled.height(), plain.height(), "a title takes one line, whatever it says");
+    assert!(untitled.height() < plain.height() && bare.height() == untitled.height());
+    assert!(caret(&untitled).x > caret(&bare).x, "the text makes room for an icon beside it");
+    assert!((caret(&plain).x - caret(&bare).x).abs() < 0.01, "and for none above it");
+
+    // What a press on the callout's head is on: its icon and title, inside its box and above its text.
+    for (name, layout) in [("the tone's", &plain), ("a title", &titled), ("an icon alone", &untitled)] {
+        let heads = layout.callouts(everything());
+        let [(block, head)] = heads.as_slice() else { panic!("{name}: one callout has one head, not {heads:?}") };
+        assert_eq!(block.as_str(), "c");
+        assert!(head.width > 0.0 && head.x >= 0.0 && head.x + head.width <= WIDTH, "{name}: {head:?}");
+        assert!(head.y < caret(layout).y + caret(layout).height, "{name}: {head:?}");
+    }
+    assert!(bare.callouts(everything()).is_empty(), "nothing to press where nothing shows");
+
+    // A colour of its own colours the bar and the title, and a dark page turns it over to be read.
+    let mut own = chosen(None, None, Some("#aa3366"));
+    let light = painted(&own, everything());
+    let in_own = light.iter().filter(|item| color_of(item) == Some(OWN)).count();
+    assert!(in_own >= 2, "the bar and the title take the colour: {in_own}");
+    assert!(!light.iter().any(|item| color_of(item) == Some(Palette::LIGHT.warn.accent)));
+    own.set_palette(dark());
+    let dim = painted(&own, everything());
+    assert!(
+        !dim.iter().any(|item| color_of(item) == Some(OWN)),
+        "a colour for paper is not drawn as it is on a dark page"
+    );
 }

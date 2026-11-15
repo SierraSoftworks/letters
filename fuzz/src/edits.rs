@@ -66,7 +66,7 @@ fn kinds(shape: BodyShape) -> Vec<BlockKind> {
         ],
         BodyShape::Blocks => vec![
             BlockKind::Quote,
-            BlockKind::Callout { tone: Tone::Warn },
+            BlockKind::callout(Tone::Warn),
             BlockKind::Gallery { numbered: true },
             BlockKind::Table { columns: vec![Align::Center], header: false },
             BlockKind::TableRow,

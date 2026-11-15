@@ -178,7 +178,7 @@ fn stepping_over_a_marker_moves_the_caret_and_not_the_position() {
 
 #[test]
 fn block_markers_sit_beside_the_text_and_move_nothing() {
-    let callout = container("c", BlockKind::Callout { tone: Tone::Warn }, vec![paragraph("a", PROSE)]);
+    let callout = container("c", BlockKind::callout(Tone::Warn), vec![paragraph("a", PROSE)]);
     let cases = [
         ("heading", doc(vec![paragraph("p", PROSE), Block::text("a", BlockKind::Heading { level: 2 }, "Rates")])),
         ("callout", doc(vec![paragraph("p", PROSE), callout])),
@@ -207,7 +207,7 @@ fn block_markers_sit_beside_the_text_and_move_nothing() {
 
 #[test]
 fn a_heading_in_a_box_keeps_its_marker_inside() {
-    let cases = [("callout", BlockKind::Callout { tone: Tone::Tip }), ("quote", BlockKind::Quote)];
+    let cases = [("callout", BlockKind::callout(Tone::Tip)), ("quote", BlockKind::Quote)];
     for (name, kind) in cases {
         let heading = Block::text("a", BlockKind::Heading { level: 3 }, "Rates change on the first of January");
         let doc = doc(vec![paragraph("p", PROSE), container("c", kind, vec![heading, paragraph("b", PROSE)])]);
@@ -338,7 +338,7 @@ fn documents() -> impl Strategy<Value = Document> {
         let blocks = blocks.into_iter().enumerate().map(|(index, (kind, runs))| {
             let id = format!("b{index}");
             let text = |kind| Block { body: Body::Text(runs.clone()), ..Block::new(id.as_str(), kind) };
-            let boxed = |inside| container(&format!("c{index}"), BlockKind::Callout { tone: Tone::Info }, vec![inside]);
+            let boxed = |inside| container(&format!("c{index}"), BlockKind::callout(Tone::Info), vec![inside]);
             match kind {
                 0 => text(BlockKind::Heading { level: 2 }),
                 1 => boxed(text(BlockKind::Paragraph)),

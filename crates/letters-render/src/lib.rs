@@ -16,6 +16,8 @@ mod paint;
 pub mod pdf;
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
+mod svg;
+pub use svg::svg_path;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Point {

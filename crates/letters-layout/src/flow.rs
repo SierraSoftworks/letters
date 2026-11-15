@@ -9,6 +9,7 @@ use letters_model::{Align, Block, BlockId, BlockKind, Body, Document, ListKind, 
 use letters_render::{Color, Point, Rect};
 use parley::{Alignment, Language, Layout, LineHeight};
 
+use crate::callout::Head;
 use crate::engine::{Engine, Spec};
 use crate::ink::Brush;
 use crate::leaf::Laid;
@@ -769,6 +770,8 @@ pub(crate) struct Frame {
     /// The quote or callout block.
     pub id: BlockId,
     pub look: Look,
+    /// A callout's icon, title and colour.
+    pub head: Head,
     pub parent: Option<usize>,
     pub first: usize,
     pub last: usize,
@@ -1091,9 +1094,16 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
 
             match &block.kind {
                 BlockKind::Quote | BlockKind::Callout { .. } => {
+                    let mut head = Head::default();
                     let (look, left, right, pad) = match &block.kind {
-                        BlockKind::Callout { tone } => {
-                            (Look::Callout(*tone), theme::BOX_PAD_X, theme::BOX_PAD_X, theme::BOX_PAD_Y)
+                        BlockKind::Callout { tone, .. } => {
+                            if let Some(look) = block.kind.callout_look() {
+                                let line = if look.title.is_empty() { 0.0 } else { self.types.get(Role::Body).line };
+                                let color = look.color.and_then(theme::color);
+                                head = Head { icon: look.icon, title: look.title.to_owned(), color, line };
+                            }
+                            let beside = head.room().1;
+                            (Look::Callout(*tone), theme::BOX_PAD_X + beside, theme::BOX_PAD_X, theme::BOX_PAD_Y)
                         }
                         _ => (Look::Quote, theme::QUOTE_INSET, 0.0, 0.0),
                     };
@@ -1103,9 +1113,11 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                     let first = self.out.leaves.len();
                     let lead = self.pad + gap;
                     let id = block.id.clone();
-                    let framed = Frame { id, look, parent: frame, first, last: first, x, width, lead, reach: 0.0 };
+                    let above = head.room().0;
+                    let framed =
+                        Frame { id, look, head, parent: frame, first, last: first, x, width, lead, reach: 0.0 };
                     self.out.frames.push(framed);
-                    self.pad = lead + pad;
+                    self.pad = lead + pad + above;
                     let quoted = quoted || look == Look::Quote;
                     self.inside(block.body.blocks(), x + left, width - shrink, Some(this), quoted);
                     if self.out.leaves.len() == first {

@@ -511,7 +511,7 @@ fn maths_survives_a_round_trip() {
             formula.clone(),
             item(ListKind::Ordered, 0, "item"),
             formula.clone(),
-            holding(BlockKind::Callout { tone: Tone::Tip }, vec![formula]),
+            holding(BlockKind::callout(Tone::Tip), vec![formula]),
         ]
     };
     let cases = inline.iter().map(|tex| around(tex)).chain(display.iter().map(|tex| formula(tex)));
@@ -553,7 +553,7 @@ fn reads_callout_tags_and_their_aliases() {
         for markdown in [format!("> [!{tag}]\n> Body"), format!("> [!{tag}]\n>\n> Body")] {
             let (doc, notes) = read(&markdown);
             assert_eq!(doc.blocks.len(), 1, "reading {markdown:?}");
-            assert_eq!(doc.blocks[0].kind, BlockKind::Callout { tone }, "reading {markdown:?}");
+            assert_eq!(doc.blocks[0].kind, BlockKind::callout(tone), "reading {markdown:?}");
             assert_eq!(outline(&doc)[1..], [r#"  p "Body""#], "reading {markdown:?}");
             assert_eq!(notes, [], "reading {markdown:?}");
         }
@@ -573,9 +573,25 @@ fn leaves_other_quotes_as_quotes() {
 }
 
 #[test]
-fn reads_a_callout_title_as_its_first_line() {
-    let (doc, _) = read("> [!info] Heads up\n> Body");
-    assert_eq!(outline(&doc), ["callout:info", r#"  p "Heads up\nBody""#]);
+fn a_callout_title_follows_its_tag() {
+    // Each case: the Markdown, the title read from it (`None` is the tone's own), and the first block's text.
+    let cases = [
+        ("> [!info] Heads up\n> Body", Some("Heads up"), "Body"),
+        ("> [!WARNING] 3 * 4 [x]\n> Body", Some("3 * 4 [x]"), "Body"),
+        ("> [!NOTE] Info\n> Body", None, "Body"),
+        ("> [!NOTE]\n> Body", None, "Body"),
+        // A title that is more than plain text stays a line of the text.
+        ("> [!NOTE] Heads **up**\n> Body", None, "Heads up\nBody"),
+    ];
+    for (markdown, title, text) in cases {
+        let (doc, _) = read(markdown);
+        let BlockKind::Callout { title: found, .. } = &doc.blocks[0].kind else { panic!("{markdown:?} is a callout") };
+        assert_eq!(found.as_deref(), title, "reading {markdown:?}");
+        assert_eq!(doc.blocks[0].body.blocks()[0].plain_text(), text, "reading {markdown:?}");
+        // What was written reads back as the same callout.
+        let (again, _) = read(&to_markdown(&doc));
+        assert_eq!(again.blocks[0].kind, doc.blocks[0].kind, "writing {markdown:?}");
+    }
 }
 
 #[test]
@@ -692,7 +708,7 @@ fn writes_callouts_under_the_names_github_renders() {
     let cases = [(Tone::Info, "NOTE"), (Tone::Tip, "TIP"), (Tone::Warn, "WARNING"), (Tone::Danger, "CAUTION")];
     for (tone, name) in cases {
         let body = with_text(BlockKind::Paragraph, vec![Run::plain("Body")]);
-        let markdown = to_markdown(&doc(vec![holding(BlockKind::Callout { tone }, vec![body])]));
+        let markdown = to_markdown(&doc(vec![holding(BlockKind::callout(tone), vec![body])]));
         assert_eq!(markdown, format!("> [!{name}]\n> Body\n"));
     }
 }
@@ -964,7 +980,7 @@ fn any_blocks() -> impl Strategy<Value = Vec<Block>> {
         let children = proptest::collection::vec(inner, 0..4);
         prop_oneof![
             children.clone().prop_map(|blocks| holding(BlockKind::Quote, blocks)),
-            (tone.clone(), children).prop_map(|(tone, blocks)| holding(BlockKind::Callout { tone }, blocks)),
+            (tone.clone(), children).prop_map(|(tone, blocks)| holding(BlockKind::callout(tone), blocks)),
         ]
     });
     proptest::collection::vec(block, 0..6).prop_map(nest_items)

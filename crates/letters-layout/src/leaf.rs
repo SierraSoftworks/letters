@@ -586,7 +586,7 @@ impl Spelt {
 
 /// Says what the glyphs of `item` spell, and where in `source` that starts. `clusters` are those of its line
 /// that no run before it has taken.
-fn spell<'a>(
+pub(crate) fn spell<'a>(
     item: &mut Item,
     clusters: &mut Peekable<impl Iterator<Item = Cluster<'a, Brush>>>,
     source: &str,

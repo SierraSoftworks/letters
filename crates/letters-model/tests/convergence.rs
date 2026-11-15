@@ -161,7 +161,7 @@ fn fixture() -> Document {
     let mut quote = Block::new("q", BlockKind::Quote);
     quote.body = Body::Blocks(vec![
         Block::text("q1", BlockKind::Paragraph, "Quoted"),
-        Block::new("q2", BlockKind::Callout { tone: Tone::Tip }),
+        Block::new("q2", BlockKind::callout(Tone::Tip)),
     ]);
     let blocks = vec![
         Block { page_break: true, lang: lang(2), ..Block::text("h", BlockKind::Heading { level: 1 }, "Title") },
@@ -215,7 +215,7 @@ fn kinds(shape: BodyShape) -> Vec<BlockKind> {
         ],
         BodyShape::Blocks => vec![
             BlockKind::Quote,
-            BlockKind::Callout { tone: Tone::Warn },
+            BlockKind::callout(Tone::Warn),
             BlockKind::Gallery { numbered: true },
             BlockKind::Table { columns: vec![Align::Center], header: false },
             BlockKind::TableRow,

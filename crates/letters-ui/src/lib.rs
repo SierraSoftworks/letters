@@ -7,6 +7,7 @@
 //! - [`Window`] is the editor's window, which the shells and the test harness drive through the same calls.
 
 mod access;
+mod callouts;
 mod captions;
 mod chrome;
 mod code_copy;
@@ -53,6 +54,7 @@ pub mod widgets;
 mod window;
 
 pub use accesskit::Role;
+pub use callouts::Calling;
 pub use chrome::{Chrome, Edge, Frame, WindowButton};
 pub use copying::CopyFormat;
 pub use element::{Cursor, Element, Fitted, Paint, Pointer};

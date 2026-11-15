@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 use std::ops::Range;
 
-use letters_model::{Align, Block, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone};
+use letters_model::{Align, Block, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use super::{TAGS, TONES};
@@ -214,7 +214,7 @@ impl<'a> Reader<'a, '_> {
                 self.placeholder("markdown", source[range].trim_end(), "Deep nesting kept as Markdown", out);
             }
             Tag::BlockQuote(_) => {
-                let kind = self.callout().map_or(BlockKind::Quote, |tone| BlockKind::Callout { tone });
+                let kind = self.callout().unwrap_or(BlockKind::Quote);
                 let mut block = self.block(kind);
                 self.depth += 1;
                 block.body = Body::Blocks(self.blocks());
@@ -287,7 +287,7 @@ impl<'a> Reader<'a, '_> {
     }
 
     /// Reads a callout tag such as `[!NOTE]` off the start of a quote and takes it out of the quote's text.
-    fn callout(&mut self) -> Option<Tone> {
+    fn callout(&mut self) -> Option<BlockKind> {
         let Some((Event::Start(Tag::Paragraph), range)) = self.events.get(self.at) else { return None };
         // The source is checked, not the events, so that an escaped `\[!NOTE\]` stays text.
         let (name, rest) = self.source[range.clone()].strip_prefix("[!")?.split_once(']')?;
@@ -309,16 +309,32 @@ impl<'a> Reader<'a, '_> {
         }
         let is_line_end =
             |event: &Event| matches!(event, Event::SoftBreak | Event::HardBreak | Event::End(TagEnd::Paragraph));
+        // Plain text after the tag on its line is the callout's title.
+        let mut title = None;
+        let texts =
+            self.events[first.min(self.events.len())..].iter().take_while(|(event, _)| matches!(event, Event::Text(_)));
+        let end = first + texts.count();
+        if end > first && self.events.get(end).is_some_and(|(after, _)| is_line_end(after)) {
+            let text: String = self
+                .events
+                .drain(first..end)
+                .map(|(event, _)| match event {
+                    Event::Text(text) => text.into_string(),
+                    _ => String::new(),
+                })
+                .collect();
+            title = Some(text.trim().to_owned()).filter(|title| *title != tone.title());
+        }
         if let Some(line_end) = (first..self.events.len()).find(|i| is_line_end(&self.events[*i].0)) {
             match &self.events[line_end].0 {
-                // Text after the tag on its line is a title, which keeps its own line.
+                // Text after the tag that is more than plain keeps its own line.
                 Event::SoftBreak if line_end > first => self.events[line_end].0 = Event::HardBreak,
                 Event::End(_) if line_end == first => drop(self.events.drain(first - 1..=first)),
                 Event::SoftBreak | Event::HardBreak if line_end == first => drop(self.events.remove(first)),
                 _ => {}
             }
         }
-        Some(*tone)
+        Some(BlockKind::Callout { tone: *tone, title, icon: None, color: None })
     }
 
     /// Reads a paragraph that holds only pictures: one is a figure, several are a gallery. An emphasised line

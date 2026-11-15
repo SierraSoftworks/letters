@@ -203,7 +203,11 @@ fn other(block: &Block) -> Vec<String> {
         BlockKind::Code { language } => code(language.as_deref().unwrap_or_default(), &block.plain_text()),
         BlockKind::Formula => formula(&block.plain_text()),
         BlockKind::Quote => quote(None, block.body.blocks()),
-        BlockKind::Callout { tone } => quote(Some(*tone), block.body.blocks()),
+        BlockKind::Callout { tone, title, .. } => {
+            // Markdown has a place for a title, after the tag, and none for an icon or a colour.
+            let title = title.as_deref().filter(|title| !title.is_empty());
+            quote(Some((*tone, title)), block.body.blocks())
+        }
         BlockKind::Divider => vec!["---".to_owned()],
         BlockKind::Table { columns, header } => table(columns, *header, block.body.blocks()),
         // A merge can leave a row outside a table and a cell outside a row.
@@ -280,12 +284,15 @@ fn formula(tex: &str) -> Vec<String> {
     if reads_back && !tex.contains('\t') { lines(&dollars) } else { code("math", tex) }
 }
 
-fn quote(tone: Option<Tone>, children: &[Block]) -> Vec<String> {
+fn quote(tone: Option<(Tone, Option<&str>)>, children: &[Block]) -> Vec<String> {
     let inner = blocks(children);
     let mut out = Vec::new();
-    if let Some(tone) = tone {
+    if let Some((tone, title)) = tone {
         let (name, _) = TONES.iter().find(|(_, named)| *named == tone).expect("every tone is named");
-        out.push(format!("[!{name}]"));
+        match title {
+            Some(title) => out.push(format!("[!{name}] {}", text(&[Run::plain(title)], Context::Heading))),
+            None => out.push(format!("[!{name}]")),
+        }
         // A paragraph runs on from the tag, as GitHub expects. Any other block needs a gap to be read as itself.
         let first = children.iter().find(|child| is_written(child));
         if first.is_some_and(|first| first.kind != BlockKind::Paragraph) {

@@ -271,13 +271,24 @@ fn block_from(mut map: Map<String, Value>, read: Option<Body>, path: &str) -> Re
         "code" => BlockKind::Code { language: string(&mut map, "language", path)? },
         "formula" => BlockKind::Formula,
         "quote" => BlockKind::Quote,
-        "callout" => match string(&mut map, "tone", path)?.as_deref() {
-            Some("tip") => BlockKind::Callout { tone: Tone::Tip },
-            Some("info") => BlockKind::Callout { tone: Tone::Info },
-            Some("warn") => BlockKind::Callout { tone: Tone::Warn },
-            Some("danger") => BlockKind::Callout { tone: Tone::Danger },
-            _ => return err(&format!("{path}.tone"), "expected tip, info, warn or danger"),
-        },
+        "callout" => {
+            let name = string(&mut map, "tone", path)?;
+            let Some(tone) = Tone::ALL.into_iter().find(|tone| name.as_deref() == Some(tone.name())) else {
+                return err(&format!("{path}.tone"), "expected tip, info, warn or danger");
+            };
+            let mut line = |name: &str| match string(&mut map, name, path)? {
+                Some(text) if text.contains(['\n', '\r']) => err(&format!("{path}.{name}"), "expected one line"),
+                text => Ok(text),
+            };
+            let (title, icon) = (line("title")?, line("icon")?);
+            let color = match string(&mut map, "color", path)? {
+                Some(color) if !crate::style::is_color(&color) => {
+                    return err(&format!("{path}.color"), "expected a colour as #rrggbb");
+                }
+                color => color.map(|color| color.to_ascii_lowercase()),
+            };
+            BlockKind::Callout { tone, title, icon, color }
+        }
         "divider" => BlockKind::Divider,
         "caption" => BlockKind::Caption,
         "figure" => {
@@ -410,14 +421,13 @@ fn write_block(block: &Block) -> Value {
         }
         BlockKind::Formula => "formula",
         BlockKind::Quote => "quote",
-        BlockKind::Callout { tone } => {
-            let tone = match tone {
-                Tone::Tip => "tip",
-                Tone::Info => "info",
-                Tone::Warn => "warn",
-                Tone::Danger => "danger",
-            };
-            map.insert("tone".into(), tone.into());
+        BlockKind::Callout { tone, title, icon, color } => {
+            map.insert("tone".into(), tone.name().into());
+            for (name, value) in [("title", title), ("icon", icon), ("color", color)] {
+                if let Some(value) = value {
+                    map.insert(name.into(), value.as_str().into());
+                }
+            }
             "callout"
         }
         BlockKind::Divider => "divider",

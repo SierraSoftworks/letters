@@ -150,7 +150,7 @@ fn blocks_change_kind_on_command() {
         ("p let a;|", BlockKind::Code { language: Some("rust".into()) }, "code:rust let a;|"),
         // Quotes and callouts wrap, change and unwrap.
         ("p o^ne\np tw|o\np three", BlockKind::Quote, "> p o^ne\n> p tw|o\np three"),
-        ("> p one|\n> p two", BlockKind::Callout { tone: Tone::Warn }, "warn> p one|\nwarn> p two"),
+        ("> p one|\n> p two", BlockKind::callout(Tone::Warn), "warn> p one|\nwarn> p two"),
         ("p zero\n> p one|\n> p two", BlockKind::Quote, "p zero\np one|\np two"),
         // A divider goes below the block, or takes the place of an empty paragraph.
         ("p one|\np two", BlockKind::Divider, "p one\nhr\np |two"),

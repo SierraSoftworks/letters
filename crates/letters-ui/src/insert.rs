@@ -70,7 +70,7 @@ pub(crate) static OFFERS: [Offer; 13] = [
     offer("Text", "Code block", icon::CODE_XML, "```", kind(BlockKind::Code { language: None })),
     offer("Elements", "Table", icon::TABLE, "| a | b |", Put::Table),
     offer("Elements", "Image", icon::IMAGE, "![]()", Put::Pictures),
-    offer("Elements", "Callout", icon::INFO, "> [!INFO]", kind(BlockKind::Callout { tone: Tone::Info })),
+    offer("Elements", "Callout", icon::INFO, "> [!INFO]", kind(BlockKind::callout(Tone::Info))),
     offer("Elements", "Formula", icon::SIGMA, "$$", kind(BlockKind::Formula)),
     offer("Elements", "Divider", icon::SEPARATOR_HORIZONTAL, "---", kind(BlockKind::Divider)),
 ];

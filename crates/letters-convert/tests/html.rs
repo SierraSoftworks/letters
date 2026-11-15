@@ -5,7 +5,7 @@ use letters_convert::{
     to_markdown,
 };
 use letters_layout::{Palette, Scheme};
-use letters_model::{Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Run, Style};
+use letters_model::{Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Run, Style, Tone};
 use letters_render::Color;
 
 fn document(markdown: &str) -> Document {
@@ -92,8 +92,6 @@ fn blocks_and_marks_become_their_elements() {
              <li class=\"task\"><input type=\"checkbox\" disabled>open</li> </ul>",
         ),
         ("> quoted\n>\n> - item", "<blockquote> <p>quoted</p> <ul> <li>item</li> </ul> </blockquote>"),
-        ("> [!TIP]\n> Try it", "<div class=\"callout tip\" role=\"note\"> <p>Try it</p> </div>"),
-        ("> [!CAUTION]\n> Hot", "<div class=\"callout danger\" role=\"note\"> <p>Hot</p> </div>"),
         ("a\n\n---\n\nb", "<p>a</p> <hr> <p>b</p>"),
         ("```\nx < 1 && y\n```", "<pre><code>x &lt; 1 &amp;&amp; y</code></pre>"),
         (
@@ -561,4 +559,38 @@ fn what_has_no_text_keeps_its_place() {
         article(&html),
         "<p>above</p> <p><br></p> <p>below</p> <blockquote> <p><br></p> </blockquote> <pre><code> </code></pre>"
     );
+}
+
+#[test]
+fn a_callout_is_headed_by_its_title_and_keeps_what_was_chosen_for_it() {
+    let cases = [
+        ("> [!TIP]\n> Try it", "callout tip", "Tip</p> <p>Try it</p>"),
+        ("> [!CAUTION]\n> Hot", "callout danger", "Danger</p> <p>Hot</p>"),
+        ("> [!WARNING] Mind the gap\n> Hot", "callout warn", "Mind the gap</p> <p>Hot</p>"),
+    ];
+    for (markdown, class, text) in cases {
+        let html = export(&document(markdown));
+        let article = article(&html);
+        assert!(article.contains(class) && article.contains(text), "{markdown:?} gave {article}");
+        assert!(nests(&html), "{markdown:?} gave elements that do not nest:\n{html}");
+    }
+
+    // A title, an icon and a colour of the writer's own are read back from the page, and no title is added
+    // to the text for being shown.
+    let chosen = [
+        BlockKind::Callout { tone: Tone::Info, title: Some("A <b> & c".into()), icon: None, color: None },
+        BlockKind::Callout { tone: Tone::Warn, title: Some(String::new()), icon: Some("none".into()), color: None },
+        BlockKind::Callout { tone: Tone::Tip, title: None, icon: Some("flame".into()), color: Some("#aa3366".into()) },
+    ];
+    for kind in chosen {
+        let mut doc = document("> [!NOTE]\n> Inside");
+        doc.blocks[0].kind = kind.clone();
+        let html = export(&doc);
+        assert!(nests(&html), "{kind:?} gave elements that do not nest:\n{html}");
+        let (read, _) = from_html(&html, &mut || "r".to_owned());
+        let callout = read.blocks.iter().find(|block| matches!(block.kind, BlockKind::Callout { .. }));
+        let callout = callout.unwrap_or_else(|| panic!("{kind:?} reads back as a callout"));
+        assert_eq!(callout.kind, kind);
+        assert_eq!(callout.body.blocks()[0].plain_text(), "Inside", "{kind:?}");
+    }
 }
