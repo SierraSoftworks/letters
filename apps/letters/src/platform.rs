@@ -82,6 +82,12 @@ impl Platform for Desktop {
 
     fn clipboard_write(&mut self, clip: Clip) {
         let Some(clipboard) = self.clipboard() else { return };
+        // A picture alone, as a code block copied as one is, goes as a picture.
+        let picture = clip.pictures.first().filter(|_| clip.text.is_empty() && clip.html.is_none());
+        if let Some(image) = picture.and_then(pictures::to_rgba) {
+            let _ = clipboard.set_image(image);
+            return;
+        }
         // A failed copy has nowhere useful to be reported: the clipboard simply keeps what it had.
         let _ = match clip.html {
             Some(html) => clipboard.set_html(html, Some(clip.text)),
