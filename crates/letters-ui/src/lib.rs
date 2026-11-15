@@ -62,6 +62,7 @@ pub use copying::CopyFormat;
 pub use element::{Cursor, Element, Fitted, Paint, Pointer};
 pub use icon::Icon;
 pub use importing::{ImportFolder, ImportKind, ImportOffer};
+pub use letters_layout::Uncovered;
 pub use opening::{Folder, Landing, Location, Recent, Request};
 pub use pictures::PictureState;
 pub use restyle::StyleEdit;

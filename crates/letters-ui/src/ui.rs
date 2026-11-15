@@ -269,6 +269,11 @@ impl<A: App> Ui<A> {
         &mut self.app
     }
 
+    /// The app, for what changes nothing the window shows: no frame is asked for.
+    pub(crate) fn app_unseen(&mut self) -> &mut A {
+        &mut self.app
+    }
+
     // The window
 
     /// `size` is in logical pixels. `scale` is the device pixels in one of them, for crisp edges.

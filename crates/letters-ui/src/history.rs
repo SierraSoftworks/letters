@@ -22,7 +22,7 @@ use std::rc::Rc;
 
 use accesskit::{Node, NodeId, Role};
 use letters_editor::{Key, KeyEvent};
-use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split};
+use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split, Uncovered};
 use letters_model::{
     Block, BlockId, BlockKind, Body, Change, Document, Point as Step, Pos, Revision, Selection, Style, Tag, TagKind,
 };
@@ -674,6 +674,8 @@ pub(crate) struct History {
     arrangement: Option<Arrangement>,
     frames: Vec<(BlockId, Side, Rect)>,
     hot: Vec<(Rect, Side)>,
+    /// The faces of the system that back the fonts up, for the layout of a version shown after they came.
+    backup: Fonts,
 }
 
 impl History {
@@ -701,6 +703,7 @@ impl History {
             arrangement: None,
             frames: Vec::new(),
             hot: Vec::new(),
+            backup: Fonts::default(),
         };
         history.follow(steps, current);
         history
@@ -792,7 +795,8 @@ impl History {
             (_, None) => ["Removed", "Added"].map(str::to_owned),
         };
         let last = self.leaf.take();
-        self.leaf = later.map(|later| Leaf::new(between, earlier.as_deref(), &later, heads, captions, last));
+        let backup = &self.backup;
+        self.leaf = later.map(|later| Leaf::new(between, earlier.as_deref(), &later, heads, captions, last, backup));
         // The versions just shown are the ones a step is most likely to want again.
         let spare = self.read.len().saturating_sub(KEPT);
         self.read.drain(..spare);
@@ -853,6 +857,28 @@ impl History {
     /// Picks the version before the one picked, or the one after it, when there is one.
     pub fn step(&mut self, back: bool) {
         self.pick(if back { self.at.saturating_sub(1) } else { self.at + 1 });
+    }
+
+    /// Takes faces of the system that back the fonts up, for the versions shown from now on. Returns
+    /// whether a character that was shown without a glyph has one now.
+    pub fn add_fallback_fonts(&mut self, fonts: &Fonts) -> bool {
+        self.backup.faces.extend(fonts.faces.iter().cloned());
+        let Some(leaf) = &mut self.leaf else { return false };
+        let earlier = leaf.earlier.as_mut().is_some_and(|(_, layout)| layout.add_fallback_fonts(fonts));
+        let shown = leaf.layout.add_fallback_fonts(fonts) || earlier;
+        leaf.estimated |= shown;
+        if let Some((_, spare, _)) = &mut leaf.spare {
+            spare.add_fallback_fonts(fonts);
+        }
+        shown
+    }
+
+    /// The characters the versions showed without a glyph since this was last asked.
+    pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
+        let Some(leaf) = &mut self.leaf else { return Vec::new() };
+        let mut found = leaf.layout.take_uncovered();
+        found.extend(leaf.earlier.iter_mut().flat_map(|(_, layout)| layout.take_uncovered()));
+        found
     }
 
     /// Takes faces that arrived late.
@@ -1417,7 +1443,8 @@ impl History {
 impl Leaf {
     /// A version to show: `later`, as it read or as it differs from `earlier`. `heads` say who wrote the
     /// two and when, and `captions` what stands over a stretch that was taken out and over one that was
-    /// added. `last` is the version that showed until now.
+    /// added. `last` is the version that showed until now, and `backup` the faces of the system for a
+    /// layout that is made new.
     fn new(
         between: (Option<Revision>, Revision),
         earlier: Option<&(Document, Style)>,
@@ -1425,6 +1452,7 @@ impl Leaf {
         heads: [Head; 2],
         captions: [String; 2],
         last: Option<Self>,
+        backup: &Fonts,
     ) -> Self {
         let (doc, found) = match earlier {
             Some((earlier, _)) => compare(earlier, &later.0),
@@ -1445,6 +1473,7 @@ impl Leaf {
             }
             None => {
                 let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
+                layout.add_fallback_fonts(backup);
                 // Nothing has a caret here, so a formula is typeset and never shows its source.
                 layout.set_formula_source(false);
                 (layout, None)

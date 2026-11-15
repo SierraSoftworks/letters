@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use accesskit::{Node, NodeId};
-use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split, Window};
+use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split, Uncovered, Window};
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Note, NoteKind, Pos, Selection, Style, Version};
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 
@@ -113,6 +113,8 @@ struct Open {
 #[derive(Default)]
 pub(crate) struct Review {
     open: Option<Open>,
+    /// The faces of the system that back the fonts up, for a conflict opened after they came.
+    backup: Fonts,
     /// What can be pressed, where it shows in the page area.
     hot: Vec<(Rect, Press)>,
     /// Where the held-back version shows in the page area, which the page has nothing under.
@@ -223,6 +225,7 @@ impl Review {
         let same = |open: &Open| open.note == note.id && open.block == note.anchor.block && open.versions == *versions;
         if !self.open.as_ref().is_some_and(same) {
             let mut open = Open::new(note, versions, doc, page, self.traded.get(&note.id));
+            open.first.add_fallback_fonts(&self.backup);
             open.seen = selection.cloned();
             self.open = Some(open);
         }
@@ -260,6 +263,18 @@ impl Review {
         if let Some(open) = &mut self.open {
             open.first.add_fonts(fonts);
         }
+    }
+
+    /// Takes faces of the system that back the fonts up, for the version that is held back. Returns
+    /// whether a character that was shown without a glyph has one now.
+    pub fn add_fallback_fonts(&mut self, fonts: &Fonts) -> bool {
+        self.backup.faces.extend(fonts.faces.iter().cloned());
+        self.open.as_mut().is_some_and(|open| open.first.add_fallback_fonts(fonts))
+    }
+
+    /// The characters the version held back showed without a glyph since this was last asked.
+    pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
+        self.open.as_mut().map(|open| open.first.take_uncovered()).unwrap_or_default()
     }
 
     /// The page as the open conflict splits it, in a page area `room` wide: counted from the top of what

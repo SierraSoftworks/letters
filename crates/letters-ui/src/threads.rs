@@ -9,7 +9,7 @@ use std::iter;
 use std::rc::Rc;
 
 use accesskit::Role;
-use letters_layout::{DocLayout, Fonts, Palette};
+use letters_layout::{DocLayout, Fonts, Palette, Uncovered};
 use letters_model::{
     Block, BlockId, BlockKind, Body, Document, Note, NoteKind, Pos, Run, Selection, Style, TextStyle as Type, Version,
 };
@@ -242,6 +242,8 @@ impl Paint for Spoken {
 pub(crate) struct Said {
     /// Made when the first note is opened.
     layout: Option<DocLayout>,
+    /// The faces of the system that back the fonts up, for a layout made after they came.
+    backup: Fonts,
     /// What was last set: the note, how many replies it had, how wide and in which colours.
     of: Option<(String, usize, f32, Palette)>,
     spoken: Vec<Rc<Spoken>>,
@@ -253,12 +255,29 @@ impl Said {
         self.of = None;
     }
 
+    /// Takes faces of the system that back the fonts up. Returns whether a character that was shown
+    /// without a glyph has one now.
+    pub fn add_fallback_fonts(&mut self, fonts: &Fonts) -> bool {
+        self.backup.faces.extend(fonts.faces.iter().cloned());
+        self.again();
+        self.layout.as_mut().is_some_and(|layout| layout.add_fallback_fonts(fonts))
+    }
+
+    /// The characters that notes showed without a glyph since this was last asked.
+    pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
+        self.layout.as_mut().map(DocLayout::take_uncovered).unwrap_or_default()
+    }
+
     /// What a note says and each reply to it, set `width` wide. They are set again only when they change.
     pub fn of(&mut self, note: &Note, width: f32, palette: Palette) -> &[Rc<Spoken>] {
         let of = (note.id.clone(), note.replies.len(), width, palette);
         if self.of.as_ref() != Some(&of) {
             let fonts = Fonts { faces: letters_fonts::bundled() };
-            let layout = self.layout.get_or_insert_with(|| DocLayout::new(fonts.clone()));
+            let layout = self.layout.get_or_insert_with(|| {
+                let mut layout = DocLayout::new(fonts.clone());
+                layout.add_fallback_fonts(&self.backup);
+                layout
+            });
             // A shell whose fonts come one after another may hold more by now.
             layout.add_fonts(&fonts);
             layout.set_palette(palette);

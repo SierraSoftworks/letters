@@ -13,7 +13,7 @@ use letters_editor::{
     Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Picture, Platform, Spot,
     TableEdit,
 };
-use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax};
+use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax, Uncovered};
 use letters_model::{
     Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, Notes, Pos, Revision,
     Selection, Style,
@@ -443,6 +443,52 @@ impl Ui<EditorApp> {
         }
     }
 
+    /// Adds faces of the system that only back the bundled fonts up, for the characters those lack: emoji,
+    /// and the scripts no bundled face writes. Text is set in one only where no bundled face has its
+    /// characters, so nothing else moves, and no style gets one by naming its family. Which faces to look
+    /// for, [`Self::take_uncovered`] says. They never go through [`Self::add_fonts`].
+    ///
+    /// The faces are kept for whatever is laid out later. Returns whether text that was shown without a
+    /// glyph has one now, which the next frame shows.
+    pub fn add_fallback_fonts(&mut self, faces: Vec<Font>) -> bool {
+        let fonts = Fonts { faces };
+        let app = self.app_mut();
+        app.backup.faces.extend(fonts.faces.iter().cloned());
+        let labels = app.shaper.add_fallback_fonts(&fonts);
+        let mut shown = app.said.add_fallback_fonts(&fonts);
+        shown |= app.review.add_fallback_fonts(&fonts);
+        if let Some(history) = &mut app.history {
+            shown |= history.add_fallback_fonts(&fonts);
+        }
+        if app.held(|app| app.layout.add_fallback_fonts(&fonts)) {
+            // Blocks set again keep their heights as estimates until idle time settles them.
+            (app.estimated, shown) = (true, true);
+        }
+        if labels {
+            self.reshape();
+        }
+        shown || labels
+    }
+
+    /// The characters the window showed without a glyph since this was last asked, since no face it has
+    /// writes them: on the page, in an earlier version, in a note or in a label. Each is told once for as
+    /// long as the window lives, as it was first met: with whether it is written as an emoji and the
+    /// language of its text, which say what face to look for. Hand what is found to
+    /// [`Self::add_fallback_fonts`].
+    ///
+    /// Characters are met as text is laid out, so ask after a frame, and once every face of
+    /// [`Self::add_fonts`] has come. It costs nothing when there are none, and asks for no frame.
+    pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
+        let app = self.app_unseen();
+        let mut found = app.shaper.take_uncovered();
+        found.extend(app.layout.take_uncovered());
+        found.extend(app.said.take_uncovered());
+        found.extend(app.review.take_uncovered());
+        found.extend(app.history.iter_mut().flat_map(History::take_uncovered));
+        found.retain(|found| app.uncovered.insert(found.ch));
+        found
+    }
+
     /// Lets formulas link, as `\\href` asks. The shell turns it on for a document the person trusts, and it
     /// is off until then.
     pub fn set_maths_links(&mut self, links: bool) {
@@ -794,6 +840,10 @@ pub struct EditorApp {
     previewed: Option<(String, Rect)>,
     /// How the document read when assistive technology was last told of it.
     told: RefCell<describe::Told>,
+    /// The faces of the system that back the bundled fonts up, for what is laid out after they came.
+    backup: Fonts,
+    /// The characters without a glyph that the shell was told of. None is told twice.
+    uncovered: HashSet<char>,
 }
 
 impl EditorApp {
@@ -867,6 +917,8 @@ impl EditorApp {
             context: None,
             previewed: None,
             told: RefCell::default(),
+            backup: Fonts::default(),
+            uncovered: HashSet::new(),
         }
     }
 
@@ -1634,6 +1686,7 @@ impl EditorApp {
                 self.unpoint();
                 let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
                 let mut history = History::new(&steps, current, platform.wall_time(), self.zone);
+                history.add_fallback_fonts(&self.backup);
                 history.still = self.reduced_motion;
                 self.history = Some(history);
                 // The nodes that stand for the blocks go with the page, and are told whole when it is back.
