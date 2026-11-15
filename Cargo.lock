@@ -3415,6 +3415,7 @@ dependencies = [
  "letters-model",
  "letters-render",
  "letters-spell",
+ "letters-sync",
  "letters-trust",
  "serde_json",
  "sha2",
