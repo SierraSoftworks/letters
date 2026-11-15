@@ -3,7 +3,8 @@
 //! The source is the LaTeX that KaTeX accepts. [`typeset`] turns it into a [`Formula`], whose items go into
 //! the same display list as everything else, so one renderer draws maths on every backend. Layout keeps a
 //! [`Cache`], since a formula is set far more often than it changes. [`commands`] and [`environments`] list
-//! what the engine understands, for completion while typing.
+//! what the engine understands, for completion while typing. [`Formula::svg`] draws one where there is no
+//! renderer, as on an exported page.
 //!
 //! A formula holds only glyphs, rules and outlines, so nothing in one can load, and there is no command for
 //! an image. `\href` and `\url` are drawn as links only where [`Style::links`] allows it. The address is not
@@ -15,6 +16,7 @@ mod cache;
 mod commands;
 mod engine;
 mod fonts;
+mod svg;
 mod table;
 
 use std::fmt;
