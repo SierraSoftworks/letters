@@ -41,9 +41,11 @@ impl Letters {
     /// under `base`, a URL that is empty or ends in a slash: `fonts/`, `maths/` and `dictionaries/`.
     ///
     /// The first frame waits for the first font, which sets most text, and for the maths faces only when
-    /// the page's document holds maths. The other fonts are set in as they arrive, and the rest is fetched
-    /// once that frame is on the canvas. A browser that kept the fonts from an earlier visit has them all
-    /// at once, and its first frame is drawn with all of them.
+    /// the page's document holds maths. A document the first font's stand-in writes waits for that
+    /// instead, a third of the download, and the whole face takes its place with the others. The other
+    /// fonts are set in as they arrive, and the rest is fetched once that frame is on the canvas. A browser
+    /// that kept the fonts from an earlier visit has them all at once, and its first frame is drawn with
+    /// all of them.
     pub async fn start(canvas: HtmlCanvasElement, base: String) -> Result<Letters, JsValue> {
         std::panic::set_hook(Box::new(|panic| web_sys::console::error_1(&panic.to_string().into())));
         let window = web_sys::window().ok_or("there is no window")?;
@@ -52,16 +54,24 @@ impl Letters {
         let server = shell::served(&window);
         let maths = page::has_maths(&opened);
         let fonts = shell::urls(&base, "fonts", &letters_fonts::FILES);
-        let first = if platform.kept(&window, &fonts[0]) { fonts.len() } else { 1 };
-        let mut urls = fonts[..first].to_vec();
+        // The page asked for this one as it loaded: see `page::preloads`.
+        let asked = shell::urls(&base, "fonts", &[page::first_font(&opened)]).remove(0);
+        let kept = platform.kept(&window, &asked);
+        let stands_in = asked != fonts[0] && !kept;
+        let first = if kept { fonts.len() } else { usize::from(!stands_in) };
+        let mut urls = if stands_in { vec![asked] } else { fonts[..first].to_vec() };
+        let faces = urls.len();
         if maths {
             urls.extend(shell::urls(&base, "maths", &letters_math::FONT_FILES));
         }
         let mut files = browser::files(&window, &urls).await?;
-        let faces = files.split_off(first);
-        letters_fonts::provide(files);
+        let maths_faces = files.split_off(faces);
+        match stands_in {
+            true => files.into_iter().for_each(letters_fonts::provide_first),
+            false => letters_fonts::provide(files),
+        }
         if maths {
-            letters_math::provide_fonts(faces);
+            letters_math::provide_fonts(maths_faces);
         }
         let later = Later { base, fonts: fonts[first..].to_vec(), maths: !maths };
         Ok(Self { shell: Shell::start(canvas, platform, opened, server, later)? })

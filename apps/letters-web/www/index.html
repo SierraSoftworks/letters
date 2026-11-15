@@ -12,10 +12,9 @@
     <link rel="modulepreload" href="start.js" />
     <link rel="modulepreload" href="letters.js" />
     <link rel="preload" as="fetch" crossorigin href="letters_bg.wasm" />
-    <!-- The text of the first paint and the editor's first frame are waiting for this one. The other fonts
-         are asked for when the editor starts, so that they do not hold up what it waits for. -->
-    <link rel="preload" as="fetch" crossorigin fetchpriority="high" href="fonts/Inter.ttf" />
-    <!-- The build writes in here what this document's first frame waits for besides: the maths faces, if it has maths. -->
+    <!-- The build writes in here what this document's first frame waits for besides: its first font, which the
+         text of the first paint waits for too, and the maths faces if it has maths. The other fonts are asked
+         for when the editor starts, so that they do not hold up what it waits for. -->
     <!--letters:preload-->
     <style>
       html,

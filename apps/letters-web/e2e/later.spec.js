@@ -31,7 +31,8 @@ const carrying = (page, document) =>
 test("the first frame waits for the first font alone, and text is set again in its own face when that arrives", async ({ page }) => {
   const runs = [{ text: "Upright, " }, { text: "slanted", marks: ["italic"] }, { text: " and " }, { text: "typed", marks: ["code"] }];
   await carrying(page, { format: 1, language: "en", blocks: [{ id: "p1", type: "paragraph", content: runs }] });
-  const arrive = await held(page, /\/fonts\/(?!Inter\.ttf)/);
+  // Text in Latin script waits for the stand-in for the first font, a third of the whole face.
+  const arrive = await held(page, /\/fonts\/(?!Inter-Latin\.ttf)/);
   await page.goto("/");
   await painted(page);
   expect(await page.evaluate(() => window.letters.fonts)).toBe(false);
@@ -46,6 +47,27 @@ test("the first frame waits for the first font alone, and text is set again in i
   await rested(page);
   expect(await canvas()).not.toBe(before);
   expect((await texts(page))[0]).toBe("Upright, slanted and typed");
+});
+
+test("a document the stand-in for the first font cannot write waits for the whole face, and has its text from the first frame", async ({ page }) => {
+  await carrying(page, { format: 1, language: "el", blocks: [{ id: "p1", type: "paragraph", content: [{ text: "Πρακτικά" }] }] });
+  const asked = [];
+  page.on("request", (request) => asked.push(new URL(request.url()).pathname));
+  const arrive = await held(page, /\/fonts\/(?!Inter\.ttf)/);
+  await page.goto("/");
+  await painted(page);
+  expect(await page.evaluate(() => window.letters.fonts)).toBe(false);
+  await page.locator("textarea").blur();
+  await rested(page);
+  const canvas = () => page.evaluate(() => document.querySelector("canvas").toDataURL());
+  const before = await canvas();
+
+  arrive();
+  await page.waitForFunction(() => window.letters.fonts);
+  await rested(page);
+  // Upright Greek was in its own face from the start, so the faces that came later changed nothing.
+  expect(await canvas()).toBe(before);
+  expect(asked.filter((path) => path.endsWith("/fonts/Inter.ttf")).length).toBe(1);
 });
 
 test("the first frame does not wait for dictionaries, and misspellings are marked when they arrive", async ({ page }) => {
