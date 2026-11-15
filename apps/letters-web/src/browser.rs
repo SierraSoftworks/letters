@@ -77,6 +77,11 @@ impl Platform for Browser {
         self.now() as u64
     }
 
+    // Edits are dated by the browser's clock.
+    fn wall_time(&self) -> Option<u64> {
+        Some((js_sys::Date::now() / 1000.0) as u64)
+    }
+
     // A page may read the clipboard only inside a paste event, so outside one there is nothing to give.
     fn clipboard_read(&mut self) -> Option<Clip> {
         self.pasted.clone()
