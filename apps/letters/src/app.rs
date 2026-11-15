@@ -43,7 +43,7 @@ use crate::copies;
 use crate::dictionaries;
 use crate::files::{self, EXTENSION, Exchange, Home, Opened, Rest, STYLESHEET, Working};
 use crate::gpu::Gpu;
-use crate::import::{self, Choices, PictureFolder, Plan};
+use crate::import::{self, Choices, Plan};
 use crate::input::{self, Composer, Press};
 use crate::journal::{Journal, Journals};
 use crate::library::{Library, Place, Recent, Refused, UNTITLED, has_content};
@@ -1534,17 +1534,10 @@ impl App {
             Ok(plan) => plan,
             Err(error) => return window.alert(&format!("{name} could not be brought in.\n\n{error}")),
         };
-        // A folder with the file is named from the file's own folder on, and any other in full.
-        let outer = plan.folder().parent().map(Path::to_owned).unwrap_or_default();
-        let shown = |folder: &PictureFolder| match folder.path.strip_prefix(&outer) {
-            Ok(inside) if folder.beside => {
-                inside.iter().map(|part| part.to_string_lossy()).collect::<Vec<_>>().join(" / ")
-            }
-            _ => folder.path.display().to_string(),
-        };
+        let home = std::env::home_dir();
         let folders = plan.folders.iter().map(|folder| ImportFolder {
             path: folder.path.to_string_lossy().into_owned(),
-            shown: shown(folder),
+            shown: import::shown(&folder.path, plan.folder(), home.as_deref()),
             pictures: folder.pictures as u32,
             chosen: folder.beside,
         });

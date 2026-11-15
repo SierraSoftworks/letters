@@ -181,3 +181,22 @@ fn an_imported_document_is_kept_under_a_free_name_and_replaces_nothing() {
     }
     assert!(folder.0.join("notes/Animals.md").exists(), "the file it came from is left alone");
 }
+
+#[test]
+fn a_picture_folder_is_named_so_that_its_own_name_shows() {
+    let (beside, home) = (Path::new("/home/ada/notes/trip"), Path::new("/home/ada"));
+    let cases = [
+        ("/home/ada/notes/trip", "trip"),
+        ("/home/ada/notes/trip/img/day one", "trip / img / day one"),
+        ("/home/ada/notes/shared", "../shared"),
+        ("/home/ada/pictures/2026", "../../pictures/2026"),
+        ("/home/ada/notes", "~/notes"),
+        ("/home/ada", "~"),
+        ("/home/grace/pictures", "/home/grace/pictures"),
+        ("/srv/pictures", "/srv/pictures"),
+    ];
+    for (folder, shown) in cases {
+        assert_eq!(import::shown(Path::new(folder), beside, Some(home)), shown, "{folder}");
+    }
+    assert_eq!(import::shown(Path::new("/srv/pictures"), beside, None), "/srv/pictures", "with no home folder");
+}

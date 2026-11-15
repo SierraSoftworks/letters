@@ -72,6 +72,30 @@ pub struct Imported {
     pub notes: usize,
 }
 
+/// How the card that offers a file names a folder its pictures are in, so that the folder's own name is
+/// there to read: from the file's folder on when it is that folder or inside it (`notes / img`), by the
+/// short climb from it when it is near (`../shared`), and from the home folder or the root otherwise.
+pub fn shown(folder: &Path, beside: &Path, home: Option<&Path>) -> String {
+    let parts =
+        |path: &Path, between: &str| path.iter().map(|part| part.to_string_lossy()).collect::<Vec<_>>().join(between);
+    let outer = beside.parent().unwrap_or(Path::new(""));
+    if folder.starts_with(beside) {
+        return parts(folder.strip_prefix(outer).unwrap_or(folder), " / ");
+    }
+    // One or two folders up, and down again from there. A folder the file's own lies in is not near in
+    // that sense: a climb alone would not name it.
+    let near = beside.ancestors().enumerate().skip(1).take(2).filter(|_| !beside.starts_with(folder));
+    let climbed = near.filter(|(_, above)| above.parent().is_some()).find_map(|(up, above)| {
+        let down = folder.strip_prefix(above).ok().filter(|down| !down.as_os_str().is_empty())?;
+        Some(format!("{}{}", "../".repeat(up), parts(down, "/")))
+    });
+    let from_home = || {
+        let inside = folder.strip_prefix(home?).ok()?;
+        Some(if inside.as_os_str().is_empty() { "~".to_owned() } else { format!("~/{}", parts(inside, "/")) })
+    };
+    climbed.or_else(from_home).unwrap_or_else(|| folder.display().to_string())
+}
+
 impl Imported {
     /// Keeps the document as a new file in `folder`, called `name` or by the next name after it that is
     /// free, and returns where. No file is replaced.
