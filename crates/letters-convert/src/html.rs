@@ -254,21 +254,6 @@ fn blocks(blocks: &[Block], page: &mut Writing, out: &mut String) {
             // A merge can leave a caption outside a gallery too.
             BlockKind::Caption | BlockKind::TableCell => element("p", block.body.runs(), page.text(0), out),
             BlockKind::Gallery { .. } => gallery(block, page, out),
-            // A reader that does not build figures yet hands one over as an unknown block, its fields beside it.
-            BlockKind::Unknown { type_name } if type_name == "figure" => {
-                let field = |name: &str| block.extra.get(name);
-                let text = |name: &str| field(name).and_then(|value| value.as_str());
-                let size = |name: &str| field(name).and_then(|value| value.as_f64()).unwrap_or_default() as f32;
-                let caption = field("content").and_then(|runs| Run::list_from_value(runs.clone(), "content").ok());
-                let image = Figure {
-                    asset: text("asset"),
-                    src: text("src"),
-                    alt: text("alt").unwrap_or_default(),
-                    width: size("width"),
-                    height: size("height"),
-                };
-                figure(&image, &caption.unwrap_or_default(), None, page, out);
-            }
             BlockKind::Unknown { type_name } if page.window => {
                 out.push_str("<p class=\"unknown\">Unsupported block: ");
                 escape(type_name, out);

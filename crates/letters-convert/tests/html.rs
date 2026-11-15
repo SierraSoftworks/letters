@@ -371,13 +371,11 @@ fn text_cannot_break_out_of_the_page() {
 
 /// A figure as a file stores one, with `fields` beside its caption.
 fn figure(fields: &[(&str, &str)], caption: &[Run]) -> Document {
-    let mut block = Block::new("f", BlockKind::Unknown { type_name: "figure".into() });
-    for (name, value) in fields {
-        block.extra.insert((*name).into(), (*value).into());
-    }
-    block.extra.insert("width".into(), 150.0.into());
-    block.extra.insert("height".into(), 75.0.into());
-    block.extra.insert("content".into(), Run::list_to_value(caption));
+    let field = |name: &str| fields.iter().find(|(field, _)| *field == name).map(|(_, value)| (*value).to_owned());
+    let (asset, src, alt) = (field("asset"), field("src"), field("alt").unwrap_or_default());
+    let kind = BlockKind::Figure { asset, src, alt, width: 150.0, height: 75.0, numbered: false };
+    let mut block = Block::new("f", kind);
+    block.body = Body::Text(caption.to_vec());
     Document { blocks: vec![block], ..Document::default() }
 }
 

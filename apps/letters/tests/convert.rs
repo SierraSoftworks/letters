@@ -502,3 +502,63 @@ fn a_pdf_names_those_who_wrote_the_document() {
     let author = pdf.metadata().author.as_deref().map(String::from_utf8_lossy).unwrap_or_default().into_owned();
     assert_eq!(author, "Ada Lovelace");
 }
+
+/// A picture of 40 by 20 pixels.
+const PICTURE: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x28\x00\x00\x00\x14\x01\x00\x00\x00\x00\xd7\x3d\x42\x16\x00\x00\x00\x0c\x49\x44\x41\x54\x78\xda\x63\x60\x18\x18\x00\x00\x00\x78\x00\x01\x35\x33\x6e\xa4\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
+/// The entries of the pictures a document shows, in order.
+fn pictures(path: &Path) -> Vec<String> {
+    let asset = |block: &Block| match &block.kind {
+        BlockKind::Figure { asset, .. } => asset.clone(),
+        _ => None,
+    };
+    open(path).document().unwrap().walk().filter_map(asset).collect()
+}
+
+#[test]
+fn pictures_follow_markdown_in_and_out() {
+    let folder = Folder::new("pictures");
+    folder.write("notes/img/cat.png", PICTURE);
+    // A picture outside what the import was asked for, which a file from elsewhere might name to carry it off.
+    folder.write("private.png", PICTURE);
+    folder.write("notes/Cat.md", "![A cat](img/cat.png)\n\n![Not ours](../private.png)\n\n![Gone](gone.png)\n");
+
+    assert!(folder.letters(&["import", "notes"]).ok);
+    let document = folder.path("notes/Cat.let");
+    let held = pictures(&document);
+    assert_eq!(held.len(), 1, "only the picture in the folder comes along: {held:?}");
+    assert_eq!(open(&document).read(&held[0]).unwrap().as_deref(), Some(PICTURE));
+
+    // On the way out the picture is written where the Markdown names it.
+    folder.write("out/keep", "");
+    let run = folder.letters(&["export", "notes/Cat.let", "--to", "md", "--output", "out/Cat.md"]);
+    assert!(run.ok, "{}", run.stderr);
+    let markdown = fs::read_to_string(folder.path("out/Cat.md")).unwrap();
+    assert!(markdown.contains(&format!("![A cat]({})", held[0])), "{markdown}");
+    assert_eq!(fs::read(folder.path("out").join(&held[0])).unwrap(), PICTURE);
+    // A second export finds the picture there and leaves it.
+    let again = folder.letters(&["export", "notes/Cat.let", "--to", "md", "--output", "out/Again.md"]);
+    assert!(again.ok, "{}", again.stderr);
+}
+
+#[test]
+fn an_export_writes_no_picture_outside_its_folder() {
+    let folder = Folder::new("climb");
+    let asset = Some("../stolen.png".to_owned());
+    let kind = BlockKind::Figure { asset, src: None, alt: "A cat".into(), width: 30.0, height: 15.0, numbered: false };
+    let mut package = Package {
+        id: "8f14e45f-ceea-467f-a0e6-5b1d3c2a9f02".into(),
+        created: "2026-11-14T20:00:00Z".into(),
+        document: Document { blocks: vec![Block::text("f", kind, "")], ..Document::default() },
+        entries: Default::default(),
+    };
+    package.entries.insert("../stolen.png".into(), PICTURE.to_vec());
+    let mut out = Cursor::new(Vec::new());
+    // A file that cannot even be written with such an entry cannot ask for it either.
+    if letters_format::write(&mut out, &package).is_ok() {
+        folder.write("docs/Cat.let", out.into_inner());
+        let run = folder.letters(&["export", "docs/Cat.let", "--to", "md"]);
+        assert!(run.ok, "{}", run.stderr);
+    }
+    assert!(!folder.path("stolen.png").exists());
+}

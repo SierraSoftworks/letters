@@ -1,7 +1,9 @@
 //! The `export` and `import` subcommands: documents to and from other formats, with no window.
 //!
 //! - [`export`] writes one document as Markdown, as a single HTML file, as a Word document or as a PDF.
-//! - [`import`] makes a document beside each Markdown or Word file and prints a line for each.
+//!   Markdown cannot hold a picture, so the document's pictures are written beside it.
+//! - [`import`] makes a document beside each Markdown or Word file and prints a line for each. The pictures
+//!   a Markdown file shows come along.
 //!
 //! Neither changes a file that is already there: an export asks for `--force` first, and an import skips.
 
@@ -12,7 +14,9 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use letters_convert::{ImportNote, PdfInfo, from_docx, from_markdown, to_docx, to_html, to_markdown, to_pdf};
+use letters_convert::{
+    ImportNote, PdfInfo, from_docx, import_markdown, markdown_assets, to_docx, to_html, to_markdown, to_pdf,
+};
 use letters_format::{Archive, OPLOG, Package};
 use letters_layout::Fonts;
 use letters_model::{
@@ -29,6 +33,8 @@ const MARKDOWN: [&str; 2] = ["md", "markdown"];
 const WORD: &str = "docx";
 /// How a zip starts, and how the older kind of Word file does. Either is read as Word, whatever its name.
 const WORD_STARTS: [&[u8]; 2] = [b"PK\x03\x04", &[0xd0, 0xcf, 0x11, 0xe0]];
+/// The largest picture an import reads, in bytes. The reader keeps none larger.
+const LARGEST_PICTURE: u64 = 64 << 20;
 /// The name import notes are written under.
 const IMPORTER: &str = "Letters import";
 
@@ -90,6 +96,24 @@ fn try_export(export: &Export) -> Result<(), String> {
         }
         _ => format!("{}: {error}", output.display()),
     })?;
+    if export.to == Format::Markdown {
+        // The Markdown names each picture by its entry in the file, as a path from its own folder.
+        let folder = output.parent().unwrap_or(Path::new(""));
+        for entry in markdown_assets(&document) {
+            // A name that climbs out of that folder is not written, whatever the file says it holds.
+            let inside = Path::new(&entry).components().all(|part| matches!(part, Component::Normal(_)));
+            let Some(bytes) = archive.read(&entry).ok().flatten().filter(|_| inside) else { continue };
+            let picture = folder.join(&entry);
+            let made = fs::create_dir_all(picture.parent().unwrap_or(folder));
+            match made.and_then(|()| write(&picture, &bytes, export.force)) {
+                // A picture is named after what it holds, so one that is there already is this one.
+                Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
+                    return Err(format!("{}: {error}", picture.display()));
+                }
+                _ => {}
+            }
+        }
+    }
     println!("{name} -> {}", output.display());
     Ok(())
 }
@@ -97,14 +121,7 @@ fn try_export(export: &Export) -> Result<(), String> {
 /// What the format cannot carry over, a line for each kind of loss.
 fn simplified(document: &Document, to: Format) -> Vec<String> {
     let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    // Only HTML and Word write figures yet. HTML also takes one that a reader handed over as an unknown block.
-    let pictured = matches!(to, Format::Html | Format::Docx);
-    let lost = |block: &&Block| match &block.kind {
-        BlockKind::Unknown { type_name } => !(to == Format::Html && type_name == "figure"),
-        BlockKind::Figure { .. } => !pictured,
-        _ => false,
-    };
-    let unknown = document.walk().filter(lost).count();
+    let unknown = document.walk().filter(|block| matches!(block.kind, BlockKind::Unknown { .. })).count();
     let other = |run: &&Run| run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)));
     let marks = document.walk().flat_map(|block| block.body.runs()).filter(other).count();
     let mut lines = Vec::new();
@@ -174,6 +191,9 @@ pub fn import(import: &Import) -> ExitCode {
     for path in &import.paths {
         find(path, import.recursive, &mut found);
     }
+    // What was asked for: each folder named, and the folder of each file named.
+    let folder = |path: &PathBuf| if path.is_dir() { normal(path) } else { normal(path.parent().unwrap_or(path)) };
+    let roots: Vec<PathBuf> = import.paths.iter().map(folder).collect();
     let mut sources = BTreeSet::new();
     found.retain(|(path, error)| error.is_some() || sources.insert(normal(path)));
     if found.is_empty() {
@@ -186,7 +206,7 @@ pub fn import(import: &Import) -> ExitCode {
     for (source, error) in found {
         let outcome = match error {
             Some(error) => Outcome::Failed { error },
-            None => import_file(&source, &style, &sources),
+            None => import_file(&source, &style, &sources, &roots),
         };
         failures |= matches!(outcome, Outcome::Failed { .. });
         let line = if import.json { json_line(&source, &outcome) } else { text_line(&source, &outcome) };
@@ -270,8 +290,8 @@ fn normal(path: &Path) -> PathBuf {
 }
 
 /// Makes a document beside one Markdown or Word file. `sources` holds every file of this import, by
-/// [`normal`] path.
-fn import_file(source: &Path, style: &Style, sources: &BTreeSet<PathBuf>) -> Outcome {
+/// [`normal`] path, and `roots` the folders it was asked to bring in.
+fn import_file(source: &Path, style: &Style, sources: &BTreeSet<PathBuf>, roots: &[PathBuf]) -> Outcome {
     let failed = |error: &dyn std::fmt::Display| Outcome::Failed { error: error.to_string() };
     let output = source.with_extension(files::EXTENSION);
     // A document is a zip too, so this comes before the file is looked into.
@@ -307,11 +327,13 @@ fn import_file(source: &Path, style: &Style, sources: &BTreeSet<PathBuf>) -> Out
             Ok(markdown) => markdown,
             Err(_) => return failed(&"the file is neither Markdown in UTF-8 nor a Word document"),
         };
-        let (document, simplified) = from_markdown(&markdown, &mut platform::block_id);
-        package.document = document;
-        relink(&mut package.document.blocks, source.parent().unwrap_or(Path::new("")), sources);
+        let folder = source.parent().unwrap_or(Path::new(""));
+        let read = import_markdown(&markdown, &mut platform::block_id, &mut |path| picture(folder, path, roots));
+        package.document = read.document;
+        package.entries.extend(read.assets);
+        relink(&mut package.document.blocks, folder, sources);
         package.set_style(style);
-        simplified
+        read.notes
     };
     if package.document.blocks.is_empty() {
         package.document = files::blank();
@@ -329,6 +351,17 @@ fn import_file(source: &Path, style: &Style, sources: &BTreeSet<PathBuf>) -> Out
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Outcome::Skipped { output },
         Err(error) => failed(&error),
     }
+}
+
+/// Reads a picture that a Markdown file in `folder` names by `path`.
+///
+/// A file an import was not asked for is not read: one that the path reaches by climbing out of every
+/// folder of `roots`. A Markdown file from elsewhere could otherwise carry a picture off this machine in
+/// the document made from it.
+fn picture(folder: &Path, path: &str, roots: &[PathBuf]) -> Option<Vec<u8>> {
+    let file = normal(&folder.join(path));
+    let size = fs::metadata(&file).ok().filter(|about| about.is_file())?.len();
+    (size <= LARGEST_PICTURE && roots.iter().any(|root| file.starts_with(root))).then(|| fs::read(&file).ok())?
 }
 
 /// The note that marks, on its block, something the import simplified.
