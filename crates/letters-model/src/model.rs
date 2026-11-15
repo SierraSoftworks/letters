@@ -10,10 +10,13 @@ use std::fmt;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::mem;
 use std::ops::Range;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use loro::cursor::{Cursor, Side};
-use loro::{ContainerTrait, ExportMode, Frontiers, LoroDoc, LoroText, LoroValue, Subscription, TextDelta};
+use loro::{
+    ContainerTrait, ExportMode, Frontiers, LoroDoc, LoroText, LoroValue, Subscription, TextDelta, VersionRange,
+};
 
 use crate::conflict::{self, Conflict};
 use crate::crdt::{self, Assign, Event, attrs};
@@ -280,6 +283,8 @@ pub struct Model {
     /// While set, the changes that take back what the document followed, newest last. A reader keeps
     /// them as the way back over a step. `None` again once a change did not fit.
     kept: Option<Vec<Delta>>,
+    /// A copy of the history that takes an update from a stranger first. Made by [`Model::admit`].
+    guard: Mutex<Option<LoroDoc>>,
 }
 
 impl fmt::Debug for Model {
@@ -318,7 +323,8 @@ impl Model {
         crdt::normal_meta(&mut doc);
         let (index, style, lookup) = (built.index, Style::default(), OnceLock::new());
         let (history, steps, pen) = (OnceLock::new(), Steps::default(), Pen::default());
-        Self { doc, index, style, styled: false, replica, history, steps, lookup, pen, reader: None, kept: None }
+        let guard = Mutex::default();
+        Self { doc, index, style, styled: false, replica, history, steps, lookup, pen, reader: None, kept: None, guard }
     }
 
     /// The model with the style its file holds, for one that was just made.
@@ -341,30 +347,85 @@ impl Model {
         Ok(Self::of(History::open(loro, replica), replica))
     }
 
-    /// Reads a history from a stranger in a document of its own, before a document in use sees it.
+    /// Reads a whole history from a stranger in documents of its own, before a document in use sees it.
+    /// It refuses one that cannot be read, and one that is read and then cannot be saved and read again as
+    /// the same document: Loro takes in some histories that it cannot write out.
+    ///
     /// [`Model::load`] and [`Model::merge`] refuse bytes that are no history, but a panic inside Loro as it
     /// reads them cannot be caught there: it leaves the document's locks poisoned, and the document panics
-    /// again as it is dropped.
+    /// again as it is dropped. Here such a panic is answered as an error, in a build whose panics unwind,
+    /// as a server's must. Where a panic ends the process there is nothing to contain.
     ///
-    /// This guards a build whose panics unwind, as a server's must. Where a panic ends the process, as in
-    /// the apps and in a browser, there is nothing to contain, and it answers `Ok` at no cost.
+    /// It costs about two loads and a save. An update that builds on a history is for [`Model::admit`].
     pub fn check(history: &[u8]) -> Result<(), HistoryError> {
-        #[cfg(panic = "unwind")]
-        {
-            use std::panic::{AssertUnwindSafe, catch_unwind};
-            // Never dropped once a panic has poisoned it, since dropping it would panic again.
-            let scratch = mem::ManuallyDrop::new(LoroDoc::new());
-            crdt::configure(&scratch);
-            let read = catch_unwind(AssertUnwindSafe(|| scratch.import(history).map(drop)));
-            let read = read.map_err(|_| unreadable("reading it panicked"))?;
-            drop(mem::ManuallyDrop::into_inner(scratch));
-            read.map_err(unreadable)
+        /// What a history shows, read as [`Model::load`] reads it.
+        fn shown(loro: &LoroDoc) -> (Document, Style) {
+            (crdt::read(loro, &loro.get_text(crdt::BODY)).0, crdt::read_style(loro))
         }
-        #[cfg(not(panic = "unwind"))]
-        {
-            let _ = history;
-            Ok(())
+
+        // Never dropped once a panic has poisoned them, since dropping them would panic again.
+        let scratch = [(); 2].map(|()| mem::ManuallyDrop::new(LoroDoc::new()));
+        let read = panic::catch_unwind(AssertUnwindSafe(|| {
+            let [first, second] = &scratch;
+            crdt::configure(first);
+            crdt::configure(second);
+            first.import(history).map_err(unreadable)?;
+            let saved = first.export(ExportMode::all_updates()).map_err(unreadable)?;
+            second.import(&saved).map_err(unreadable)?;
+            if shown(first) == shown(second) { Ok(()) } else { Err(unreadable("it is saved as another history")) }
+        }));
+        let read = read.map_err(|_| unreadable("reading it panicked"))?;
+        drop(scratch.map(mem::ManuallyDrop::into_inner));
+        read
+    }
+
+    /// Tries an update from a stranger on a copy of this history, before [`Model::merge`] takes it. The
+    /// update is admitted when it lands on the copy whole and without a panic, and the copy then writes
+    /// it out as the same edits. Loro takes in updates that panic as they land, that it cannot write out
+    /// again, or that a replica reads differently once it is saved, and merging one costs a room its
+    /// document.
+    ///
+    /// An update that builds on edits this history lacks is refused, so none waits unseen in the
+    /// document. The copy is made by the first call, keeps up with the document, and is a second history
+    /// in memory. Like [`Model::check`], this contains a panic only where panics unwind.
+    pub fn admit(&self, update: &[u8]) -> Result<(), HistoryError> {
+        /// The edits an import names, by the replica that wrote them.
+        fn spans<'a>(ranges: impl IntoIterator<Item = &'a VersionRange>) -> BTreeMap<u64, (i32, i32)> {
+            ranges.into_iter().flat_map(VersionRange::iter).map(|(replica, span)| (*replica, *span)).collect()
         }
+
+        let mut guard = self.guard.lock().unwrap_or_else(PoisonError::into_inner);
+        let copy = guard.take().unwrap_or_else(|| {
+            let copy = LoroDoc::new();
+            crdt::configure(&copy);
+            copy
+        });
+        // Neither is dropped once a panic has poisoned it, since dropping it would panic again.
+        let (copy, scratch) = (mem::ManuallyDrop::new(copy), mem::ManuallyDrop::new(LoroDoc::new()));
+        let tried = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (ours, held) = (self.loro(), copy.oplog_vv());
+            if ours.oplog_vv() != held {
+                let lacks = ours.export(ExportMode::updates(&held)).map_err(unreadable)?;
+                copy.import(&lacks).map_err(unreadable)?;
+            }
+            let before = copy.oplog_vv();
+            let took = copy.import(update).map_err(unreadable)?;
+            if took.pending.is_some() {
+                return Err(unreadable("it builds on edits this history lacks"));
+            }
+            let wrote = copy.export(ExportMode::updates(&before)).map_err(unreadable)?;
+            let wrote = scratch.import(&wrote).map_err(unreadable)?;
+            let same = spans([&took.success]) == spans([&wrote.success].into_iter().chain(&wrote.pending));
+            if same { Ok(()) } else { Err(unreadable("it is written out as other edits")) }
+        }));
+        let tried = tried.map_err(|_| unreadable("merging it panicked"))?;
+        drop(mem::ManuallyDrop::into_inner(scratch));
+        let copy = mem::ManuallyDrop::into_inner(copy);
+        // A copy that took the update in goes on with the document. One that refused it is made again.
+        if tried.is_ok() {
+            *guard = Some(copy);
+        }
+        tried
     }
 
     /// The model of a history, showing the revision the history shows.
@@ -373,7 +434,8 @@ impl Model {
         let style = crdt::read_style(&history.loro);
         let (history, steps, lookup) = (OnceLock::from(history), Steps::default(), OnceLock::new());
         let (pen, styled) = (Pen::default(), true);
-        Self { doc, index, style, styled, replica, history, steps, lookup, pen, reader: None, kept: None }
+        let guard = Mutex::default();
+        Self { doc, index, style, styled, replica, history, steps, lookup, pen, reader: None, kept: None, guard }
     }
 
     /// A second replica at the newest revision, for another writer. It starts with no undo steps.
@@ -385,7 +447,8 @@ impl Model {
                 let (doc, index, style) = (self.doc.clone(), self.index.clone(), self.style.clone());
                 let (history, steps, lookup) = (OnceLock::new(), Steps::default(), self.lookup.clone());
                 let (pen, styled) = (Pen::default(), self.styled);
-                Self { doc, index, style, styled, replica, history, steps, lookup, pen, reader: None, kept: None }
+                let (reader, kept, guard) = (None, None, Mutex::default());
+                Self { doc, index, style, styled, replica, history, steps, lookup, pen, reader, kept, guard }
             }
         }
     }

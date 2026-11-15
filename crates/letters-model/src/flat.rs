@@ -203,6 +203,7 @@ pub(crate) struct Built {
 /// - An id that an earlier block uses gets a suffix, so ids stay unique whatever was merged.
 /// - Text without a marker becomes a paragraph named after the block before it, or a cell in a row and a
 ///   caption in a gallery.
+/// - A marker whose JSON tells no id is named the same way, so every block has an id a file can hold.
 pub(crate) fn build(flat: Vec<Flat>) -> Built {
     /// Puts a finished block into the container it belongs to, and says where among its siblings.
     fn place(open: &mut [(Block, usize)], roots: &mut Vec<Block>, block: Block) -> usize {
@@ -222,11 +223,16 @@ pub(crate) fn build(flat: Vec<Flat>) -> Built {
     let mut open: Vec<(Block, usize)> = Vec::new();
 
     for Flat { mut block, mut entry, dirty } in flat {
-        if !entry.marker {
-            (entry.stored, entry.depth) = match &before {
+        let nameless = entry.stored.as_str().is_empty();
+        if !entry.marker || nameless {
+            let (id, depth) = match &before {
                 Some((id, depth)) => (BlockId::new(format!("{id}~")), *depth),
                 None => (BlockId::new("~"), 0),
             };
+            entry.stored = id;
+            if !entry.marker {
+                entry.depth = depth;
+            }
         }
         before = Some((entry.stored.clone(), entry.depth + usize::from(entry.shape == BodyShape::Blocks)));
 

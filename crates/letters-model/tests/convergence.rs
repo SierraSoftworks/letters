@@ -571,6 +571,7 @@ proptest! {
                     let (ours, theirs) = (replicas[to].revision(), replicas[from].revision());
                     let held = [before.0.clone(), replicas[from].doc().clone()];
                     let mine = replicas[to].save();
+                    prop_assert_eq!(replicas[to].admit(&history), Ok(()), "a replica's history is not admitted");
                     let mut merged = replicas[to].merge(&history).expect("a replica reads another's history");
                     let apart = replicas[to].conflicts(&ours, &theirs).expect("a replica holds what it merged");
                     let mirror = replicas[to].conflicts(&theirs, &ours).expect("a replica holds what it merged");
