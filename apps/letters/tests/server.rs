@@ -100,6 +100,7 @@ fn opened() -> Opened {
         id: "d1".into(),
         created: "2026-11-15T04:00:00Z".into(),
         name: "Roof repairs".into(),
+        named: true,
         space: Some("ada".into()),
         path: "House".into(),
         role: Role::Editor,

@@ -32,6 +32,7 @@ fn opened(name: &str, author: &str, trust: Trust) -> Opened {
         id: "0190f3a2-7c1e-7b4a-9c55-3f2a1b0c9d8e".into(),
         created: "2026-11-15T10:00:00Z".into(),
         name: name.into(),
+        named: true,
         space: None,
         path: String::new(),
         role: Role::Editor,

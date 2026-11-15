@@ -21,6 +21,18 @@ use crate::store::{Batch, Store, StoreError, Table};
 
 /// What a new document is called until its first heading names it.
 pub const UNTITLED: &str = "Untitled";
+
+/// Whether `name` is what a document with no name of its own is called: "Untitled", or "Untitled 2" and
+/// so on. The name alone says so, since other writers of a folder start documents the same way.
+pub fn untitled(name: &str) -> bool {
+    match name.strip_prefix(UNTITLED) {
+        Some("") => true,
+        Some(rest) => {
+            rest.strip_prefix(' ').is_some_and(|count| !count.is_empty() && count.bytes().all(|c| c.is_ascii_digit()))
+        }
+        None => false,
+    }
+}
 /// How long a root is taken as scanned. A lost document is looked for again only after that, so asking
 /// for ids that do not exist cannot keep the server walking its folders.
 const SCAN_REST: u64 = 30;

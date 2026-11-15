@@ -86,10 +86,18 @@ async fn a_document_is_made_listed_and_opened() {
 async fn a_document_without_a_name_takes_the_first_free_one() {
     let server = Server::new("untitled");
     let ben = server.person("ben", &[]);
+    let mut last = String::new();
     for expected in ["Untitled", "Untitled 2", "Untitled 3"] {
         let made: Entry = ben.post(&paths::documents("home"), &NewDocument::default()).await.unwrap();
         assert_eq!(made.name, expected);
+        last = made.id.expect("a document has an id");
+        let opened: Opened = ben.get(&paths::document(&last)).await.unwrap();
+        assert!(!opened.named, "{expected} is not a name of the document's own");
     }
+    // Its first heading names it, which the editor asks for as a rename.
+    let _: Entry = ben.post(&paths::rename(&last), &Rename { name: "Roof repairs".into() }).await.unwrap();
+    let opened: Opened = ben.get(&paths::document(&last)).await.unwrap();
+    assert!(opened.named && opened.name == "Roof repairs", "{opened:?}");
     let taken = NewDocument { folder: String::new(), name: Some("Untitled 2".into()) };
     let refused = ben.post::<Entry>(&paths::documents("home"), &taken).await.expect_err("the name is taken");
     assert_eq!(refused.code, Code::NameTaken);

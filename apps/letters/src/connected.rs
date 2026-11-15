@@ -205,6 +205,7 @@ fn unsaid(id: &str) -> Opened {
         id: id.to_owned(),
         created: String::new(),
         name: id.to_owned(),
+        named: true,
         space: None,
         path: String::new(),
         role: letters_api::Role::Reader,

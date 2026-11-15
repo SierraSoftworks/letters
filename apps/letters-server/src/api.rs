@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::{Answer, Refusal};
-use crate::library::Row;
+use crate::library::{Row, untitled};
 use crate::session::{Carrier, Signed};
 use crate::spaces::{EXTENSION, Place, Root, seconds, shown};
 use crate::store::Table;
@@ -484,6 +484,7 @@ impl App {
             id: manifest.id.clone(),
             created: manifest.created,
             name: shown(found.place.name()).to_owned(),
+            named: !untitled(shown(found.place.name())),
             space: Some(found.space.id.clone()),
             path: found.place.as_str().to_owned(),
             role: found.space.role,
