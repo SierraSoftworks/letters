@@ -3,6 +3,8 @@
 
 use super::Icon;
 
+/// `arrow-left`
+pub const ARROW_LEFT: Icon = Icon::new("M12 19l-7-7 7-7M19 12H5");
 /// `baseline`
 pub const BASELINE: Icon = Icon::new("M4 20h16M6 16l6-12 6 12M8 12h8");
 /// `bold`

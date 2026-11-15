@@ -41,6 +41,7 @@ use crate::notes::{self, Margin, Noting};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
 use crate::pictures::{self, Linked, Linking, PictureState};
+use crate::print::{Print, Printing};
 use crate::refer::{Picking, Refer};
 use crate::references::{self, Preview, Reference, References};
 use crate::renaming::{Outcome, Rename, Renaming};
@@ -204,6 +205,8 @@ pub enum Message {
     Safe(Safely),
     /// What is asked of the command palette.
     Commands(Commanding),
+    /// What is asked of Print view.
+    Print(Printing),
 }
 
 impl Ui<EditorApp> {
@@ -294,7 +297,9 @@ impl Ui<EditorApp> {
     /// Shows the landing card over a document nobody has written in, or takes it away. The card goes by
     /// itself when the person starts to write.
     pub fn set_landing(&mut self, landing: Option<Landing>) {
-        self.app_mut().landing = landing;
+        let app = self.app_mut();
+        app.landing = landing;
+        app.uncover();
     }
 
     /// Whether the landing card is showing.
@@ -305,7 +310,9 @@ impl Ui<EditorApp> {
     /// Shows the import card for a file that has to be imported, in place of the landing card, or takes it
     /// away. The card asks with [`Request::Import`] and [`Request::CancelImport`].
     pub fn offer_import(&mut self, offer: Option<ImportOffer>) {
-        self.app_mut().importing = offer.map(Importing::new);
+        let app = self.app_mut();
+        app.importing = offer.map(Importing::new);
+        app.uncover();
     }
 
     /// Whether the import card is showing.
@@ -529,6 +536,10 @@ impl Ui<EditorApp> {
     /// page, they land where the selection is, as pictures chosen in a dialog do (see
     /// [`Request::Pictures`]). What is no picture Letters can show is left out.
     pub fn insert_pictures(&mut self, pictures: Vec<Picture>, at: Option<Point>, platform: &mut dyn Platform) {
+        // Nothing is written in Print view.
+        if self.app().printing.is_some() {
+            return;
+        }
         let at = at.and_then(|at| self.on_canvas(at)).and_then(|at| self.app().spot(at)).map(|(spot, _)| spot);
         let app = self.app_mut();
         app.drop = None;
@@ -540,7 +551,8 @@ impl Ui<EditorApp> {
     /// screen. `None` for an end the page does not show, and for both without a selection.
     pub fn selection_ends(&self) -> [Option<Rect>; 2] {
         let app = self.app();
-        let Some((page, selection)) = self.canvas().zip(app.editor.selection()) else { return [None, None] };
+        let editing = self.canvas().filter(|_| app.printing.is_none());
+        let Some((page, selection)) = editing.zip(app.editor.selection()) else { return [None, None] };
         let end = |pos: &Pos| {
             let caret = app.layout.caret(pos)?;
             let (x, y) = (page.x + app.column.0 + caret.x, page.y + TOP - app.scrolled() + caret.y);
@@ -724,6 +736,8 @@ pub struct EditorApp {
     maths: Maths,
     insert: Insert,
     commands: Commands,
+    /// Print view, while it shows in place of the page.
+    printing: Option<Print>,
     refer: Refer,
     references: References,
     code_copy: CodeCopy,
@@ -791,6 +805,7 @@ impl EditorApp {
             maths: Maths::default(),
             insert: Insert::default(),
             commands: Commands::default(),
+            printing: None,
             refer: Refer::default(),
             references: References::default(),
             code_copy: CodeCopy::default(),
@@ -1382,12 +1397,104 @@ impl EditorApp {
             Act::TrustDocument => self.safe.on().then_some(Message::Safe(Safely::TrustDocument))?,
             Act::TrustFolder => self.safe.folder().then_some(Message::Safe(Safely::TrustFolder))?,
             // A card over the window is answered first: there is no document to act on behind it.
-            Act::Palette => {
-                let card = self.landing.is_some() || self.importing.is_some();
-                (!card).then_some(Message::Commands(Commanding::Toggle))?
-            }
+            Act::Print => (!self.carded()).then_some(Message::Print(Printing::Show))?,
+            Act::Palette => (!self.carded()).then_some(Message::Commands(Commanding::Toggle))?,
         };
         Some(message)
+    }
+
+    /// Whether a card lies over the window that has to be answered before there is a document to act on.
+    fn carded(&self) -> bool {
+        self.landing.is_some() || self.importing.is_some()
+    }
+
+    /// Gives the window back to the page when a card has come to lie over it.
+    fn uncover(&mut self) {
+        if self.carded() {
+            self.printing = None;
+        }
+    }
+
+    /// Does what is asked of Print view.
+    fn print(&mut self, asked: Printing) {
+        match asked {
+            Printing::Show if self.printing.is_some() || self.carded() => {}
+            Printing::Show => {
+                // What hangs from the page waits there for the way back. What lies over the window goes.
+                self.commands.close();
+                self.sharing = false;
+                if self.grip.release() {
+                    self.drop = None;
+                }
+                self.dragging = false;
+                self.unpoint();
+                let reading = self.layout.hit(Point { x: 0.0, y: self.viewport().y.max(0.0) });
+                self.printing = Some(Print::new(reading));
+                // The nodes that stand for the blocks go with the page, and are told whole when it is back.
+                self.told.get_mut().forget();
+            }
+            Printing::Back => self.printing = None,
+            Printing::Zoom(zoom) => self.printing.iter_mut().for_each(|print| print.zoom(zoom)),
+            Printing::Scroll(delta) => self.printing.iter_mut().for_each(|print| print.scroll(delta)),
+            Printing::Print => self.requests.push(Request::Print),
+        }
+    }
+
+    /// The sheets of Print view, for the area the page has while it is edited.
+    fn sheets(&mut self, room: Size) -> Element<Message> {
+        // A sheet's text is as wide as its paper leaves between the margins, whatever the window has.
+        let page = &self.editor.model().style().page;
+        let text = ((page.width - page.margin_left - page.margin_right) * PT).max(1.0);
+        if text != self.column.1 {
+            self.layout.update(self.editor.doc(), self.editor.model().style(), text, None);
+            self.column.1 = text;
+            self.highlight(None);
+            self.tell_links(None);
+        }
+        // Paging lays out whatever was still estimated.
+        let pages = self.layout.paginate(&self.editor.model().style().page);
+        self.estimated = false;
+        let Some(print) = self.printing.as_mut() else { return Element::row() };
+        let (mut sheets, awaited) =
+            print.view(&self.layout, &pages, room, &self.images, self.shaper.as_ref(), self.scheme);
+        for asset in awaited {
+            if self.wanted.insert(asset.clone()) {
+                self.requests.push(Request::Asset(asset));
+            }
+        }
+        if let Some(copy) = &self.copying {
+            sheets = sheets.popover(copy.card(&self.location, room));
+        }
+        sheets
+    }
+
+    /// What a key does while Print view shows: it moves through the sheets, prints, takes a change back
+    /// or goes back to editing. Nothing is written there.
+    fn print_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        if event.key == Key::Escape {
+            self.print(Printing::Back);
+            return true;
+        }
+        if self.printing.as_mut().is_some_and(|print| print.key(event)) {
+            return true;
+        }
+        // A change to the page is an edit, which undo takes back from here too.
+        let command =
+            self.editor.keymap().command(event).filter(|command| matches!(command, Command::Undo | Command::Redo));
+        if let Some(command) = command.cloned() {
+            self.edit(platform, |editor, platform| editor.run(command, platform));
+            return true;
+        }
+        let asked = match commands::bound(event) {
+            Some(Act::Print) => Some(Message::Print(Printing::Print)),
+            Some(act @ (Act::Settings | Act::SaveCopy)) => self.asked(act),
+            _ => None,
+        };
+        let bound = asked.is_some();
+        if let Some(message) = asked {
+            self.update(message, platform);
+        }
+        bound
     }
 
     /// The commands the palette lists: those that what is typed finds and that have something to act on,
@@ -1603,8 +1710,11 @@ impl EditorApp {
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
     }
 
-    /// The text position under a point of the page area.
+    /// The text position under a point of the page area, while the page shows there.
     fn hit(&self, at: Point) -> Option<Pos> {
+        if self.printing.is_some() {
+            return None;
+        }
         self.layout.hit(Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP })
     }
 
@@ -2312,6 +2422,10 @@ impl EditorApp {
     /// layout's coordinates: beside a picture from its left or right quarter, and otherwise on a line of
     /// their own, above or below the block there.
     fn spot(&self, at: Point) -> Option<(Spot, Option<Rect>)> {
+        // Sheets take no pictures: the page does, where it is edited.
+        if self.printing.is_some() {
+            return None;
+        }
         let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
         let block = self.layout.hit(at)?.block;
         let (thick, gap) = BAR;
@@ -2410,6 +2524,41 @@ impl EditorApp {
     }
 
     fn bar(&self) -> Element<Message> {
+        let chrome = &self.chrome;
+        let mut bar = TopBar::new().inset(chrome.inset_start);
+        if let Some(height) = chrome.bar_height {
+            bar = bar.height(height);
+        }
+        // A bar that is the title bar moves its window, and dims while the window is behind another.
+        if chrome.titled() {
+            let title = Title {
+                drag: Message::Ask(Request::DragWindow),
+                double_click: Message::Ask(Request::ToggleMaximise),
+                menu: Box::new(|at| Message::Ask(Request::WindowMenu(at))),
+            };
+            bar = bar.title(title).dim(!self.active);
+        }
+        // The window's buttons stand where the desktop keeps them, a rule apart from the bar's own.
+        if let Some(buttons) = chrome.buttons().filter(|_| chrome.buttons_at_start) {
+            bar = bar.before(buttons).before(TopBar::rule());
+        }
+        // A view that takes the page's place keeps the window's controls and has the rest of the bar.
+        bar = match &self.printing {
+            Some(print) => {
+                let page = &self.editor.model().style().page;
+                let told = self.note.as_ref().map(|(note, _)| note.as_str());
+                print.bar(bar, &self.name().0, told, &styles::paper_name(page), || styles::papers(page))
+            }
+            None => self.editing(bar),
+        };
+        if let Some(buttons) = chrome.buttons().filter(|_| !chrome.buttons_at_start) {
+            bar = bar.end(TopBar::rule()).end(buttons);
+        }
+        bar.into()
+    }
+
+    /// Fills the bar for editing: the document's name, the format controls, and what the window offers.
+    fn editing(&self, mut bar: TopBar<Message>) -> TopBar<Message> {
         let share = Element::column()
             .gap(tokens::SPACE_LG)
             .min_width(320.0)
@@ -2437,7 +2586,12 @@ impl EditorApp {
                     .on_select(Message::Copy(Copying::Open(CopyFormat::Letters))),
             )
             .item(MenuItem::new("Export").icon(icon::DOWNLOAD).on_select(Message::Copy(Copying::Open(CopyFormat::Pdf))))
-            .item(MenuItem::new("Print view").icon(icon::PRINTER).disabled(true))
+            .item(
+                MenuItem::new("Print view")
+                    .icon(icon::PRINTER)
+                    .aside(keys(Act::Print))
+                    .on_select(Message::Print(Printing::Show)),
+            )
             .item(MenuItem::new("Page setup").icon(icon::FILE_TEXT).disabled(true))
             .separator()
             .item(MenuItem::new("Settings").icon(icon::SETTINGS).on_select(Message::Settings(Setting::Show)));
@@ -2450,25 +2604,7 @@ impl EditorApp {
             (NAME_WIDTH.1, Fold::Marks),
             (NAME_WIDTH.1, Fold::Style),
         ];
-        let chrome = &self.chrome;
-        let mut bar = TopBar::new().shown(self.folded.seen.clone()).inset(chrome.inset_start);
-        if let Some(height) = chrome.bar_height {
-            bar = bar.height(height);
-        }
-        // A bar that is the title bar moves its window, and dims while the window is behind another.
-        if chrome.titled() {
-            let title = Title {
-                drag: Message::Ask(Request::DragWindow),
-                double_click: Message::Ask(Request::ToggleMaximise),
-                menu: Box::new(|at| Message::Ask(Request::WindowMenu(at))),
-            };
-            bar = bar.title(title).dim(!self.active);
-        }
-        // The window's buttons stand where the desktop keeps them, a rule apart from the bar's own.
-        let buttons = chrome.buttons();
-        if let Some(buttons) = buttons.filter(|_| chrome.buttons_at_start) {
-            bar = bar.before(buttons).before(TopBar::rule());
-        }
+        bar = bar.shown(self.folded.seen.clone());
         for (n, (name, fold)) in forms.into_iter().enumerate() {
             if self.folded.form.is_none_or(|form| form == n) {
                 let shown = self.folded.form == Some(n);
@@ -2486,11 +2622,7 @@ impl EditorApp {
             let button = tool(icon, panel.title()).pressed(self.panel == Some(panel));
             panels = panels.child(button.on_press(Message::Panel(panel)));
         }
-        bar = bar.end(panels.child(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End))));
-        if let Some(buttons) = chrome.buttons().filter(|_| !chrome.buttons_at_start) {
-            bar = bar.end(TopBar::rule()).end(buttons);
-        }
-        bar.into()
+        bar.end(panels.child(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End))))
     }
 
     /// What the bar starts with: the document's name, in no more than `room`, and whether it is saved. A
@@ -3023,12 +3155,16 @@ impl App for EditorApp {
         let border = self.chrome.border();
         let window = Size { width: window.width - 2.0 * border, height: window.height - 2.0 * border };
         self.refold(window.width);
-        let panel = self.panel.map(|panel| self.side(panel));
+        // Print view has the window to itself: the panels and the outline are for editing.
+        let printing = self.printing.is_some();
+        let panel = self.panel.filter(|_| !printing).map(|panel| self.side(panel));
         let room = window.width - if panel.is_some() { side_panel::WIDTH } else { 0.0 };
         // The safe mode bar lies under the top bar and takes its height from the page.
         let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height();
-        let page = self.page(Size { width: room.max(0.0), height: (window.height - bar).max(0.0) });
-        let page = Element::row().grow(1.0).child(page).children(self.chapters());
+        let room = Size { width: room.max(0.0), height: (window.height - bar).max(0.0) };
+        let page = if printing { self.sheets(room) } else { self.page(room) };
+        let chapters = if printing { None } else { self.chapters() };
+        let page = Element::row().grow(1.0).child(page).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
         let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
@@ -3113,6 +3249,7 @@ impl App for EditorApp {
             Message::Alt(asked) => self.altering(asked, platform),
             Message::Note(asked) => self.noting(asked, platform),
             Message::Commands(asked) => self.commanding(asked, platform),
+            Message::Print(asked) => self.print(asked),
             Message::Refer(Picking::Close) => {
                 self.edit(platform, |editor, platform| editor.run(Command::DismissReference, platform));
             }
@@ -3159,6 +3296,15 @@ impl App for EditorApp {
     }
 
     fn key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        if self.printing.is_some() {
+            return self.print_key(event, platform);
+        }
+        // Print view opens at what is being read. A key the editor is offered brings the caret into view,
+        // so this one is not offered: it is none of the editor's.
+        if commands::bound(event) == Some(&Act::Print) {
+            let asked = self.asked(&Act::Print);
+            return asked.map(|message| self.update(message, platform)).is_some();
+        }
         // Escape lets go of a picture held by a corner or carried, which stays as it was.
         if event.key == Key::Escape && self.grip.release() {
             self.drop = None;
@@ -3194,6 +3340,9 @@ impl App for EditorApp {
     }
 
     fn describe(&self, page: &mut AccessNode, nodes: &mut Vec<(NodeId, AccessNode)>, whole: bool) {
+        if let Some(print) = &self.printing {
+            return print.describe(page, nodes);
+        }
         let told = &mut self.told.borrow_mut();
         describe::page(self.editor.doc(), self.editor.selection(), told, whole, page, nodes);
         if let Some((caption, rect)) = &self.previewed {
@@ -3206,6 +3355,10 @@ impl App for EditorApp {
     }
 
     fn access_action(&mut self, request: &ActionRequest, platform: &mut dyn Platform) {
+        // The sheets of Print view are read, and the document is changed where it is edited.
+        if self.printing.is_some() {
+            return;
+        }
         match describe::request(self.editor.doc(), request) {
             Some(describe::Request::Select(selection)) => {
                 self.editor.select(selection);

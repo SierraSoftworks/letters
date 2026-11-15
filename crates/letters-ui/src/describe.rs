@@ -49,6 +49,13 @@ fn part_node(id: &BlockId, part: u8) -> NodeId {
 #[derive(Default)]
 pub(crate) struct Told(HashMap<NodeId, u64>);
 
+impl Told {
+    /// Has every block told again the next time: the nodes that stood for them are gone.
+    pub fn forget(&mut self) {
+        self.0.clear();
+    }
+}
+
 /// One telling of the document: what is told, and what it is told against.
 struct Telling<'a> {
     /// How the blocks read before, when only those that read differently are wanted.
@@ -116,6 +123,18 @@ pub(crate) fn marker(block: &BlockId, label: &str, rect: Rect, page: &mut Node, 
     let id = part_node(block, NOTE);
     page.push_child(id);
     nodes.push((id, marker));
+}
+
+/// Adds a sheet of Print view under its canvas: a picture of the page, named by its number. `rect` is where
+/// it shows in the canvas.
+pub(crate) fn sheet(index: usize, label: &str, rect: Rect, canvas: &mut Node, nodes: &mut Vec<(NodeId, Node)>) {
+    let mut sheet = Node::new(Role::Image);
+    sheet.set_label(label);
+    sheet.set_bounds(placed(canvas, rect));
+    // No block's id holds a byte of 0xff, so no node of the document is this one.
+    let id = NodeId(hashed([0xff, 0xfe].into_iter().chain(index.to_le_bytes())) & !1);
+    canvas.push_child(id);
+    nodes.push((id, sheet));
 }
 
 /// Where something at `rect` in the page area is in the window.

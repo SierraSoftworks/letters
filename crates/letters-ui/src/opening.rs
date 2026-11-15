@@ -82,6 +82,9 @@ pub enum Request {
     ToggleMaximise,
     /// Close the window.
     Close,
+    /// The person asked to print the document, from Print view: hand what the PDF export writes to the
+    /// system's print dialog, or to the browser's.
+    Print,
     /// Let the person choose pictures, and hand them to `Window::insert_pictures` with no point.
     Pictures,
     /// Read this asset of the document, by its entry name, and hand it decoded to `Window::set_image`.

@@ -82,6 +82,8 @@ pub(crate) enum Act {
     Settings,
     TrustDocument,
     TrustFolder,
+    /// Shows the document on the sheets it prints on.
+    Print,
     /// Shows the palette itself. It is not one of its own commands.
     Palette,
 }
@@ -121,7 +123,7 @@ const fn table(name: &'static str, also: &'static str, edit: TableEdit) -> Entry
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 70] = [
+pub(crate) static ENTRIES: [Entry; 71] = [
     run("Image", "Edit caption", "picture", Command::EditCaption),
     entry("Image", "Edit alt text", "picture describe description", Act::AltText),
     run("Image", "Number this figure", "picture label caption", Command::SetNumbered(true)),
@@ -183,6 +185,7 @@ pub(crate) static ENTRIES: [Entry; 70] = [
     entry("View", "Styles panel", "show hide fonts page", Act::Panel(Panel::Styles)),
     entry("View", "Notes panel", "show hide comments", Act::Panel(Panel::Notes)),
     entry("View", "History panel", "show hide versions", Act::Panel(Panel::History)),
+    entry("View", "Print view", "pages paper sheets preview", Act::Print),
     entry("Document", "New document", "create", Act::NewDocument),
     entry("Document", "Open", "file", Act::Open),
     entry("Document", "Rename or move", "name folder", Act::Rename),
@@ -198,8 +201,9 @@ const PRIMARY: Modifiers = Modifiers { primary: true, shift: false, alt: false }
 const PRIMARY_SHIFT: Modifiers = Modifiers { primary: true, shift: true, alt: false };
 
 /// The keys the window binds itself, for what is no command of the editor's.
-static KEYS: [(KeyEvent, Act); 4] = [
+static KEYS: [(KeyEvent, Act); 5] = [
     (KeyEvent { key: Key::Char('p'), mods: PRIMARY_SHIFT }, Act::Palette),
+    (KeyEvent { key: Key::Char('p'), mods: PRIMARY }, Act::Print),
     (KeyEvent { key: Key::Char('k'), mods: PRIMARY }, Act::Link),
     (KeyEvent { key: Key::Char(','), mods: PRIMARY }, Act::Settings),
     (KeyEvent { key: Key::Char('s'), mods: PRIMARY_SHIFT }, Act::SaveCopy),

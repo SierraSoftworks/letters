@@ -29,6 +29,7 @@ mod notes;
 mod opening;
 mod paint;
 mod pictures;
+mod print;
 mod refer;
 mod references;
 mod renaming;

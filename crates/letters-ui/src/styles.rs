@@ -112,16 +112,6 @@ impl Styles {
 
     /// The paper, which way up it is, and its margins, each changed where it stands.
     fn page(&self, page: &Page) -> Element<Message> {
-        let mut papers = Menu::new().label("Paper");
-        for (index, (name, ..)) in PAPERS.iter().enumerate() {
-            let pick = Message::Styles(Styling::Paper(index));
-            papers = papers.item(MenuItem::new(*name).checked(paper(page) == Some(index)).on_select(pick));
-        }
-        papers = papers.heading("Orientation");
-        for (name, to) in [("Portrait", false), ("Landscape", true)] {
-            let pick = Message::Styles(Styling::Landscape(to));
-            papers = papers.item(MenuItem::new(name).checked(landscape(page) == to).on_select(pick));
-        }
         let name = paper_name(page);
         let paper = Element::row()
             .align(Align::Center)
@@ -137,7 +127,7 @@ impl Styles {
             .description(name.clone())
             .child(Element::text(name, quiet()))
             .child(Element::icon(icon::CHEVRON_DOWN, 14.0).fg(tokens::FG_MUTED))
-            .popover(papers.popover());
+            .popover(papers(page).popover());
 
         let typed = self.margins.as_ref();
         let shown = margins(page).map(|margins| margins.to_string()).unwrap_or_default();
@@ -226,8 +216,23 @@ fn paper(page: &Page) -> Option<usize> {
     PAPERS.iter().position(|(_, width, height)| (width - short).abs() < 1.0 && (height - long).abs() < 1.0)
 }
 
+/// The papers offered and the two ways up, with the page's own ticked. A choice changes the page.
+pub(crate) fn papers(page: &Page) -> Menu<Message> {
+    let mut papers = Menu::new().label("Paper");
+    for (index, (name, ..)) in PAPERS.iter().enumerate() {
+        let pick = Message::Styles(Styling::Paper(index));
+        papers = papers.item(MenuItem::new(*name).checked(paper(page) == Some(index)).on_select(pick));
+    }
+    papers = papers.heading("Orientation");
+    for (name, to) in [("Portrait", false), ("Landscape", true)] {
+        let pick = Message::Styles(Styling::Landscape(to));
+        papers = papers.item(MenuItem::new(name).checked(landscape(page) == to).on_select(pick));
+    }
+    papers
+}
+
 /// A page's paper and which way up it is, as the panel says it: `A4, portrait`.
-fn paper_name(page: &Page) -> String {
+pub(crate) fn paper_name(page: &Page) -> String {
     let way = if landscape(page) { "landscape" } else { "portrait" };
     match paper(page) {
         Some(paper) => format!("{}, {way}", PAPERS[paper].0),

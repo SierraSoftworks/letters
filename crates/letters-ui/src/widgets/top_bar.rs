@@ -7,7 +7,7 @@ use accesskit::Role;
 use letters_render::Point;
 
 use crate::element::{Element, Fitted};
-use crate::style::{Align, Dir, Edges};
+use crate::style::{Align, Dir, Edges, Justify};
 use crate::tokens;
 
 /// The bar's height: yewi's control height with room to breathe.
@@ -21,6 +21,7 @@ pub struct TopBar<M> {
     height: f32,
     inset: f32,
     dim: bool,
+    apart: bool,
     before: Vec<Element<M>>,
     forms: Vec<Form<M>>,
     shown: Option<Fitted>,
@@ -50,6 +51,7 @@ impl<M> Default for TopBar<M> {
             height: HEIGHT,
             inset: 0.0,
             dim: false,
+            apart: false,
             before: Vec::new(),
             forms: Vec::new(),
             shown: None,
@@ -85,6 +87,12 @@ impl<M> TopBar<M> {
     /// Dims what the bar holds, as a title bar does while its window is behind another.
     pub fn dim(mut self, dim: bool) -> Self {
         self.dim = dim;
+        self
+    }
+
+    /// Sets the middle at the end of the room the start leaves, for a bar whose middle is its actions.
+    pub fn apart(mut self) -> Self {
+        self.apart = true;
         self
     }
 
@@ -152,9 +160,11 @@ impl<M: 'static> From<TopBar<M>> for Element<M> {
     fn from(bar: TopBar<M>) -> Self {
         let opacity = if bar.dim { DIMMED } else { 1.0 };
         let group = || Element::row().align(Align::Center).gap(tokens::SPACE_SM);
+        let justify = if bar.apart { Justify::Between } else { Justify::Start };
         let form = |form: Form<M>| {
             let start = group().shrink().children(form.start);
-            group().key(form.key).grow(1.0).shrink().child(start).child(group().children(form.middle))
+            let row = group().key(form.key).grow(1.0).shrink().justify(justify);
+            row.child(start).child(group().children(form.middle))
         };
         let forms = Element::row().grow(1.0).shrink().clip().children(bar.forms.into_iter().map(form));
         let forms = match bar.shown {
@@ -175,7 +185,7 @@ impl<M: 'static> From<TopBar<M>> for Element<M> {
             .arrows(Dir::Row)
             .children((!bar.before.is_empty()).then(|| group().opacity(opacity).children(bar.before)))
             .child(forms.opacity(opacity))
-            .child(group().opacity(opacity).children(bar.end));
+            .children((!bar.end.is_empty()).then(|| group().opacity(opacity).children(bar.end)));
         match bar.title {
             Some(title) => row.on_drag(title.drag).on_double_click(title.double_click).on_menu(title.menu),
             None => row,
