@@ -2,6 +2,7 @@
 //!
 //! The window knows no file system. A path is a string the shell made, which it gets back unchanged.
 
+use letters_model::BlockId;
 use letters_render::Point;
 
 use crate::chrome::Edge;
@@ -86,6 +87,22 @@ pub enum Request {
     /// Read this asset of the document, by its entry name, and hand it decoded to `Window::set_image`.
     /// Asked once for each picture the page comes to show, which keeps its place until then.
     Asset(String),
+    /// The document links to this picture, by the address its figure has for a `src`. Fetch it if the
+    /// person's trust lets it load when a document opens, and hand it to `Window::set_image` under the
+    /// address as it is written here. Otherwise do nothing: the picture keeps its frame and cloud. Asked
+    /// once for each address, and again for those not showing after a [`Request::TrustPictures`].
+    LinkedPicture(String),
+    /// The person asked for this linked picture this once. Fetch it and hand it to `Window::set_image`.
+    LoadPicture(String),
+    /// The person trusts the host of this linked picture from now on: keep that. The window then asks for
+    /// every linked picture not yet showing with [`Request::LinkedPicture`] again.
+    TrustPictures(String),
+    /// The person wants this linked picture kept in the document. Fetch it and hand its bytes to
+    /// `Window::embed_picture` with the figure.
+    EmbedPicture {
+        figure: BlockId,
+        src: String,
+    },
 }
 
 /// A document opened lately, as the landing card lists it.

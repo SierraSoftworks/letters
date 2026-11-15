@@ -24,6 +24,7 @@ mod maths;
 pub mod motion;
 mod opening;
 mod paint;
+mod pictures;
 mod refer;
 mod references;
 mod renaming;

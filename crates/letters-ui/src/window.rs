@@ -22,7 +22,7 @@ use letters_spell::Dictionary;
 
 use crate::chrome::Chrome;
 use crate::code_copy::{self, CodeCopy};
-use crate::color::{blend, fade, resolve, same};
+use crate::color::{fade, resolve, same};
 use crate::copying::{self, Copy, CopyFormat, Copying};
 use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
@@ -34,6 +34,7 @@ use crate::maths::{self, Maths, Sheet, SheetLines, Source};
 use crate::motion::{self, FRAME_MS};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
+use crate::pictures::{self, Linked, Linking};
 use crate::refer::{Picking, Refer};
 use crate::references::{self, Preview, Reference, References};
 use crate::renaming::{Outcome, Rename, Renaming};
@@ -62,9 +63,6 @@ const RING: f32 = 3.0;
 /// The bar that says where pictures held over the page would land: how thick it is, and how far it stands
 /// from what they would land beside.
 const BAR: (f32, f32) = (3.0, 3.0);
-/// The least a picture's place measures for the sign of a picture to show in it while it is awaited, and the
-/// size of that sign.
-const AWAITED: (f32, f32) = (48.0, 24.0);
 /// How much text one idle step lays out, in bytes. Small enough to fit between two frames.
 const SETTLE_BYTES: usize = 4096;
 
@@ -186,6 +184,8 @@ pub enum Message {
     Refer(Picking),
     /// What the settings dialog asks for.
     Settings(Setting),
+    /// What the menu on a linked picture's cloud asks for.
+    Linked(Linking),
 }
 
 impl Ui<EditorApp> {
@@ -403,15 +403,27 @@ impl Ui<EditorApp> {
         &self.app().images
     }
 
-    /// Hands over a picture the window asked for with [`Request::Asset`], decoded. `None` says it cannot
-    /// be had: its place stays empty and it is not asked for again.
+    /// Hands over a picture decoded: one the window asked for with [`Request::Asset`], or one the document
+    /// links to, under the address the link is written as. `None` says it cannot be had: its place stays
+    /// empty and it is not asked for again, and a linked picture goes back to its frame and cloud.
     pub fn set_image(&mut self, asset: &str, image: Option<Image>) {
         let app = self.app_mut();
         app.wanted.insert(asset.to_owned());
+        // A linked picture is drawn once it is here, at its own shape. For any other name this says nothing.
+        app.layout.set_loaded(asset, image.as_ref().map(|image| (image.width(), image.height())));
         match image {
             Some(image) => app.images.insert(asset, image),
             None => _ = app.images.remove(asset),
         }
+    }
+
+    /// Keeps a linked picture in the document, in answer to a [`Request::EmbedPicture`]: the figure holds
+    /// the picture from now on and no longer links to it. Nothing happens when the figure is gone or holds
+    /// a picture already, or when the bytes are no picture Letters can show.
+    pub fn embed_picture(&mut self, figure: &BlockId, picture: Picture, platform: &mut dyn Platform) {
+        let figure = figure.clone();
+        self.app_mut()
+            .edit(platform, |editor, platform| editor.run(Command::EmbedFigure { figure, picture }, platform));
     }
 
     /// Shows where pictures held over a point of the window would land if they were let go there, as
@@ -577,6 +589,7 @@ pub struct EditorApp {
     wanted: HashSet<String>,
     /// The bar that says where pictures held over the page would land, in the layout's coordinates.
     drop: Option<Rect>,
+    linked: Linked,
     /// What the bar says of a write that was just done, as where the document was first saved, and since
     /// when, once a frame has said so.
     note: Option<(String, Option<u64>)>,
@@ -653,6 +666,7 @@ impl EditorApp {
             images: Images::default(),
             wanted: HashSet::new(),
             drop: None,
+            linked: Linked::default(),
             note: None,
             naming: false,
             renaming: None,
@@ -837,6 +851,59 @@ impl EditorApp {
         }
     }
 
+    /// Tells the shell of the pictures the document links to, each address once: all of them, or those of
+    /// the blocks that changed.
+    fn tell_links(&mut self, changed: Option<&BTreeSet<BlockId>>) {
+        let doc = self.editor.doc();
+        let blocks: Vec<&Block> = match changed {
+            Some(changed) => changed.iter().filter_map(|id| doc.block(id)).collect(),
+            None => doc.walk().collect(),
+        };
+        for src in blocks.into_iter().filter_map(pictures::link) {
+            if self.wanted.insert(src.to_owned()) {
+                self.requests.push(Request::LinkedPicture(src.to_owned()));
+            }
+        }
+    }
+
+    /// The address a figure links to, while it does not hold its picture.
+    fn link_of(&self, figure: &BlockId) -> Option<&str> {
+        self.editor.doc().block(figure).and_then(pictures::link)
+    }
+
+    /// The linked picture at a point of the page area, and whether the point is on its cloud.
+    fn linked_at(&self, at: Point) -> Option<(BlockId, bool)> {
+        let figure = self.hit(at).filter(|_| !self.hung())?.block;
+        self.link_of(&figure)?;
+        let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        let place = self.layout.figure(&figure).filter(|place| place.image.contains(at))?;
+        Some((figure, place.badge.is_some_and(|badge| pictures::pressed(badge, at))))
+    }
+
+    /// Opens the menu on a linked picture's cloud, and puts away what else hangs from the page.
+    fn link_menu(&mut self, figure: BlockId) {
+        (self.link, self.spelling.fix) = (None, None);
+        self.linked.open = Some(figure);
+    }
+
+    /// Does what the menu on a linked picture's cloud asked, which is the shell's to do.
+    fn linking(&mut self, asked: Linking) {
+        let Some(figure) = self.linked.open.take() else { return };
+        let Some(src) = self.link_of(&figure).map(str::to_owned) else { return };
+        match asked {
+            Linking::Load => self.requests.push(Request::LoadPicture(src)),
+            Linking::Trust => {
+                self.requests.push(Request::TrustPictures(src));
+                // What the shell held back may load now, so it hears of each link not showing again.
+                let links = self.editor.doc().walk().filter_map(pictures::link);
+                let held: BTreeSet<&str> = links.filter(|src| self.images.get(src).is_none()).collect();
+                self.requests.extend(held.into_iter().map(|src| Request::LinkedPicture(src.to_owned())));
+            }
+            Linking::Embed => self.requests.push(Request::EmbedPicture { figure, src }),
+            Linking::Close => {}
+        }
+    }
+
     /// Shows the Markdown markers that belong where the caret now is, after anything that may have moved it.
     /// A change fades in. It shows at once when motion is reduced, and while an input method composes, whose
     /// text must not slide under its window.
@@ -910,6 +977,7 @@ impl EditorApp {
             // What the pointer rested on may be gone, or somewhere else.
             self.unpoint();
             self.highlight((!change.structure).then_some(&change.blocks));
+            self.tell_links((!change.structure).then_some(&change.blocks));
             let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
             self.spelling.edited(change, self.editor.doc(), caret, &mut self.layout);
         }
@@ -977,12 +1045,9 @@ impl EditorApp {
 
     /// Whether something hangs over the page and takes what the pointer does there.
     fn hung(&self) -> bool {
-        let hung = self.landing.is_some()
-            || self.importing.is_some()
-            || self.copying.is_some()
-            || self.spelling.fix.is_some()
-            || self.link.is_some();
-        hung || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
+        let card = self.landing.is_some() || self.importing.is_some() || self.copying.is_some();
+        let asked = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
+        card || asked || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
     }
 
     /// The code block whose box is at a point of the page area, and whether the point is on its copy
@@ -1042,8 +1107,8 @@ impl EditorApp {
         Some((whole, if each.is_empty() { vec![whole] } else { each }))
     }
 
-    /// Works out again which reference the pointer rests on, after it or the page under it has moved.
-    /// Returns whether what shows changed with it.
+    /// Works out again which reference or linked picture the pointer rests on, after it or the page under
+    /// it has moved. Returns whether what shows changed with it.
     fn repoint(&mut self) -> bool {
         let code = self.references.rest().and_then(|at| self.code_at(at));
         let copy = self.code_copy.point(code);
@@ -1053,7 +1118,10 @@ impl EditorApp {
             let in_view = self.in_view(&reference.target);
             (reference, in_view)
         });
-        self.references.point(found) || copy
+        let linked = self.references.rest().and_then(|at| self.linked_at(at));
+        // Each is taken, whichever changed.
+        let clouded = self.linked.point(linked);
+        self.references.point(found) || copy || clouded
     }
 
     /// Forgets where the pointer rests until it next moves, as when the person goes on writing.
@@ -1105,10 +1173,15 @@ impl EditorApp {
                 let Some(head) = self.hit(at) else { return };
                 // A press on a picture selects its figure. The caption under it is text like any other.
                 let on_page = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
-                let pictured = self.layout.figure(&head.block).is_some_and(|figure| figure.image.contains(on_page));
-                if pictured && !mods.shift {
+                let figure = self.layout.figure(&head.block).filter(|figure| figure.image.contains(on_page));
+                if let Some(figure) = figure.filter(|_| !mods.shift) {
                     self.editor.select_picture(&head.block);
                     self.dragging = false;
+                    // The cloud on a picture that is still a link opens its menu.
+                    let cloud = figure.badge.is_some_and(|badge| pictures::pressed(badge, on_page));
+                    if cloud && self.link_of(&head.block).is_some() {
+                        self.link_menu(head.block);
+                    }
                     return self.reveal();
                 }
                 let anchor = match self.editor.selection() {
@@ -1159,9 +1232,15 @@ impl EditorApp {
         }
     }
 
-    /// Opens the menu about what is at a point of the page area: for now, a word marked as misspelled.
+    /// Opens the menu about what is at a point of the page area: a picture that is still a link, or a word
+    /// marked as misspelled.
     fn menu(&mut self, at: Point) {
         let Some(pos) = self.hit(at) else { return };
+        if self.linked_at(at).is_some() {
+            self.editor.select_picture(&pos.block);
+            self.mark();
+            return self.link_menu(pos.block);
+        }
         let Some(range) = self.layout.spelling_at(&pos) else { return };
         // The word itself was meant, not the room its line leaves beside it.
         let word = Selection {
@@ -1280,6 +1359,11 @@ impl EditorApp {
         if width != self.column.1 {
             self.layout.update(self.editor.doc(), self.editor.model().style(), width, None);
             self.highlight(None);
+            self.tell_links(None);
+        }
+        // A menu whose picture is gone, or is a link no longer, goes with it.
+        if self.linked.open.as_ref().is_some_and(|figure| self.link_of(figure).is_none()) {
+            self.linked.open = None;
         }
         (self.column, self.height) = ((left, width), room.height);
         // A heading's markers hang in the margin, beside the outline when it shows.
@@ -1317,7 +1401,7 @@ impl EditorApp {
         }
         self.layout.paint(viewport, &mut list);
         // A picture the shell has not handed over is asked for once, and its place is kept until it comes.
-        for asset in awaited(&self.images, self.scheme, &mut list) {
+        for asset in pictures::awaited(&self.images, self.scheme, &mut list) {
             if self.wanted.insert(asset.clone()) {
                 self.requests.push(Request::Asset(asset));
             }
@@ -1347,6 +1431,13 @@ impl EditorApp {
             let rect = Rect::new(image.x - RING, image.y - RING, image.width + 2.0 * RING, image.height + 2.0 * RING);
             Item::Stroke { rect, color: ring, width: 2.0, radius: 2.0 }
         }));
+        // A picture that is still a link has its cloud on a chip while it is selected or under the pointer.
+        for (figure, lit) in self.linked.clouds(self.editor.picture()) {
+            let badge = self.layout.figure(figure).and_then(|place| place.badge);
+            if let Some(badge) = badge.filter(|_| self.link_of(figure).is_some()) {
+                pictures::cloud(badge, lit, self.accent.text, self.scheme, &mut list);
+            }
+        }
         // The figure a reference under the pointer means, or the one the page was just brought to.
         let lit = self.references.light().and_then(|(figure, way)| Some((self.pictures(figure)?, way)));
         match lit {
@@ -1387,6 +1478,17 @@ impl EditorApp {
             element = element.popover(Self::card(landing, room));
         } else if let Some(copy) = &self.copying {
             element = element.popover(copy.card(&self.location, room));
+        } else if let Some((figure, src)) =
+            self.linked.open.as_ref().and_then(|figure| Some((figure, self.link_of(figure)?)))
+        {
+            // The menu hangs from the cloud, or from the corner of a picture too small to have one.
+            let from = self.layout.figure(figure).map_or(Rect::default(), |place| {
+                let corner = Rect::new(place.image.x + place.image.width, place.image.y, 0.0, 0.0);
+                place.badge.map_or(corner, pictures::chip)
+            });
+            let spot = Rect { x: origin.x + from.x, y: origin.y + from.y, ..from };
+            let menu = pictures::menu(src, self.images.get(src).is_some()).popover().at(spot).align(Align::End);
+            element = element.popover(menu.open(true).on_close(Message::Linked(Linking::Close)));
         } else if let Some(fix) = &self.spelling.fix {
             // The menu hangs from the start of its word.
             let start = self.layout.caret(&Pos::new(fix.block.clone(), fix.range.start)).unwrap_or_default();
@@ -1417,8 +1519,9 @@ impl EditorApp {
             element =
                 element.popover(self.maths.sheet(source, selection, rect.width, self.wide(), self.scheme).at(spot));
         }
-        // A press on a reference follows it and one on a copy button copies, which the pointer's shape says.
-        let pressable = self.references.pointed().is_some() || self.code_copy.pointed();
+        // A press on a reference follows it, one on a copy button copies and one on a cloud opens its menu,
+        // which the pointer's shape says.
+        let pressable = self.references.pointed().is_some() || self.code_copy.pointed() || self.linked.on_cloud();
         if pressable { element.cursor(Cursor::Pointer) } else { element }
     }
 
@@ -2230,6 +2333,7 @@ impl App for EditorApp {
             Message::Insert(Inserting::Take(index)) => self.put(index, platform),
             Message::Insert(Inserting::Close) => self.insert.close(),
             Message::Refer(Picking::Take(figure)) => self.refer(figure, platform),
+            Message::Linked(asked) => self.linking(asked),
             Message::Refer(Picking::Close) => {
                 self.edit(platform, |editor, platform| editor.run(Command::DismissReference, platform));
             }
@@ -2489,41 +2593,6 @@ fn whole<'a>(doc: &'a Document, id: &BlockId) -> Option<&'a Block> {
         &block.id == id || block.body.blocks().iter().any(|part| holds(part, id))
     }
     doc.blocks.iter().find(|block| holds(block, id))
-}
-
-/// Keeps the place of each picture in `list` that is not among `images`: a quiet box with the sign of a
-/// picture in it, under where the picture will be drawn. Returns the assets that are awaited.
-fn awaited(images: &Images, scheme: Scheme, list: &mut DisplayList) -> Vec<String> {
-    let missing = |item: &Item| matches!(item, Item::Image { asset, .. } if images.get(asset).is_none());
-    if !list.items.iter().any(missing) {
-        return Vec::new();
-    }
-    // The box is of one piece: a picture that comes with clear parts has the page behind them, not the box.
-    let ground = resolve(blend(tokens::SURFACE, tokens::FG, 0.06), scheme, 1.0);
-    let sign = resolve(tokens::FG_SUBTLE, scheme, 1.0);
-    let mut assets = Vec::new();
-    let mut items = Vec::with_capacity(list.items.len() + 2);
-    for item in std::mem::take(&mut list.items) {
-        if let Item::Image { rect, asset } = &item
-            && images.get(asset).is_none()
-        {
-            items.push(Item::Fill { rect: *rect, color: ground, radius: 2.0 });
-            if rect.width.min(rect.height) >= AWAITED.0 {
-                let (x, y) = (rect.x + (rect.width - AWAITED.1) / 2.0, rect.y + (rect.height - AWAITED.1) / 2.0);
-                items.push(Item::Path {
-                    origin: Point { x, y },
-                    scale: AWAITED.1 / icon::GRID,
-                    path: icon::IMAGE.outline(),
-                    color: sign,
-                    stroke: Some(tokens::ICON_STROKE),
-                });
-            }
-            assets.push(asset.clone());
-        }
-        items.push(item);
-    }
-    list.items = items;
-    assets
 }
 
 /// The colours the page is painted in. The light page is the one documents are styled for and exports use.

@@ -373,6 +373,13 @@ impl Harness<EditorApp> {
         self
     }
 
+    /// Hands over the bytes of a linked picture to keep in the document, as a shell that was asked to
+    /// embed it does.
+    pub fn embed_picture(&mut self, figure: &str, picture: Picture) -> &mut Self {
+        self.ui.embed_picture(&figure.into(), picture, &mut self.platform);
+        self
+    }
+
     /// Holds a finger on a point, as a touch screen's shell passes it on. Returns whether a word was
     /// selected.
     pub fn long_press_at(&mut self, at: Point) -> bool {

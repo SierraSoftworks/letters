@@ -2562,3 +2562,145 @@ fn the_insert_menu_asks_the_shell_for_pictures_which_take_the_place_of_the_line(
     window.paint();
     assert!(matches!(window.ui().take_requests()[..], [Request::Asset(_), ..]), "and are asked for to be shown");
 }
+
+/// The address the picture of [`pictured`] is linked from.
+const LINK: &str = "https://example.com/roof.png";
+
+/// The window of [`pictured`] with its linked picture handed over or not, the middle of that picture and
+/// the middle of the cloud in its corner. What the window asked on the way is taken.
+fn linked(loaded: bool) -> (Harness, Point, Point) {
+    let mut window = pictured();
+    let image = Image::from_rgba8(2, 1, vec![255; 8]).expect("two pixels");
+    window.ui().set_image(LINK, Some(image));
+    let place = picture(&mut window).0;
+    if !loaded {
+        window.ui().set_image(LINK, None);
+        window.paint();
+    }
+    window.ui().take_requests();
+    let middle = Point { x: place.x + place.width / 2.0, y: place.y + place.height / 2.0 };
+    (window, middle, Point { x: place.x + place.width - 16.0, y: place.y + 16.0 })
+}
+
+/// The assets a frame draws pictures of.
+fn drawn(window: &mut Harness) -> Vec<String> {
+    let asset = |item: &Item| match item {
+        Item::Image { asset, .. } => Some(asset.clone()),
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(asset).collect()
+}
+
+/// How many shapes a frame fills in over a point of a picture, after the picture.
+fn over(window: &mut Harness, at: Point) -> usize {
+    let frame = window.paint();
+    let picture = frame.items.iter().position(|item| matches!(item, Item::Image { .. })).expect("a picture");
+    let covers = |item: &&Item| matches!(item, Item::Fill { rect, .. } if rect.contains(at));
+    frame.items[picture..].iter().filter(covers).count()
+}
+
+#[test]
+fn a_linked_picture_is_told_to_the_shell_once_and_drawn_when_the_shell_hands_it_over() {
+    let mut window = pictured();
+    assert_eq!(drawn(&mut window), [""; 0], "a link is not a picture until the shell says so");
+    assert_eq!(window.ui().take_requests(), [Request::LinkedPicture(LINK.into())]);
+    window.type_text("x");
+    window.paint();
+    assert_eq!(window.ui().take_requests(), [], "it is told once");
+
+    let image = Image::from_rgba8(2, 1, vec![255; 8]).expect("two pixels");
+    window.ui().set_image(LINK, Some(image));
+    assert_eq!(drawn(&mut window), [LINK], "the picture is drawn under the address it is linked from");
+    window.ui().set_image(LINK, None);
+    assert_eq!(drawn(&mut window), [""; 0], "and is a link again when it is taken away");
+    assert_eq!(window.ui().take_requests(), []);
+}
+
+#[test]
+fn the_cloud_on_a_linked_picture_asks_the_shell_to_load_trust_or_embed_it() {
+    let (load, trust) = (Request::LoadPicture(LINK.into()), Request::TrustPictures(LINK.into()));
+    let embed = Request::EmbedPicture { figure: "g".into(), src: LINK.into() };
+    // Whether the picture shows, what is picked from the menu, and what the shell is asked.
+    let cases = [
+        (false, "Load once", vec![load]),
+        // What was held back is told again, since it may load now.
+        (false, "Always load from example.com", vec![trust.clone(), Request::LinkedPicture(LINK.into())]),
+        (true, "Always load from example.com", vec![trust]),
+        (false, "Embed in the document", vec![embed.clone()]),
+        (true, "Embed in the document", vec![embed]),
+    ];
+    for (loaded, picked, asked) in cases {
+        let (mut window, _, cloud) = linked(loaded);
+        window.click_at(cloud).assert_open(Role::Menu, "Linked picture");
+        assert_eq!(window.find(Role::MenuItem, "Load once").is_some(), !loaded, "nothing to load when it shows");
+        window.click(Role::MenuItem, picked).assert_closed(Role::Menu, "Linked picture");
+        assert_eq!(window.ui().take_requests(), asked, "{picked}, loaded: {loaded}");
+        assert_eq!(window.editor().picture().map(|figure| figure.as_str()), Some("g"), "{picked}");
+    }
+}
+
+#[test]
+fn the_menu_of_a_linked_picture_opens_from_its_cloud_or_a_secondary_press_alone() {
+    let (mut window, middle, _) = linked(false);
+    window.click_at(middle).assert_closed(Role::Menu, "Linked picture");
+    window.secondary_click_at(middle).assert_open(Role::Menu, "Linked picture");
+    window.key("Escape").assert_closed(Role::Menu, "Linked picture");
+    assert_eq!(window.ui().take_requests(), [], "a menu put away asks nothing");
+
+    // A picture the document holds has no cloud and no such menu.
+    let mut window = illustrated();
+    let place = picture(&mut window).0;
+    let (middle, corner) =
+        (Point { x: place.x + 150.0, y: place.y + 75.0 }, Point { x: place.x + 284.0, y: place.y + 16.0 });
+    window.click_at(corner).assert_closed(Role::Menu, "Linked picture");
+    window.secondary_click_at(middle).assert_closed(Role::Menu, "Linked picture");
+}
+
+#[test]
+fn a_linked_picture_that_shows_has_its_cloud_while_it_is_selected_or_under_the_pointer() {
+    let (mut window, middle, cloud) = linked(true);
+    let far = spot(&mut window, "p1", 2);
+    assert_eq!(over(&mut window, cloud), 0, "a picture that is read is left alone");
+
+    window.hover_at(middle);
+    assert_eq!(over(&mut window, cloud), 1, "under the pointer it says it is a link");
+    assert_ne!(window.ui().cursor(), Cursor::Pointer);
+    window.hover_at(cloud);
+    assert_eq!(over(&mut window, cloud), 1);
+    assert_eq!(window.ui().cursor(), Cursor::Pointer, "the cloud is there to press");
+
+    window.click_at(middle).hover_at(Point { x: far.x, y: far.y + 2.0 });
+    assert_eq!(over(&mut window, cloud), 1, "selected, it keeps its cloud for a finger or the keyboard");
+    window.click_at(Point { x: far.x, y: far.y + 2.0 });
+    assert_eq!(over(&mut window, cloud), 0);
+}
+
+#[test]
+fn an_embedded_picture_is_the_documents_own_and_one_that_cannot_be_kept_stays_a_link() {
+    let held = |window: &Harness| {
+        let figure = window.editor().doc().block(&"g".into()).expect("the figure");
+        match &figure.kind {
+            BlockKind::Figure { asset, src, .. } => (asset.clone(), src.clone()),
+            kind => panic!("no figure: {kind:?}"),
+        }
+    };
+    let (mut window, _, _) = linked(true);
+    let edits = window.ui().edits();
+    // Bytes that are no picture, and a figure that is not there.
+    window.embed_picture("g", Picture { bytes: b"not a picture".to_vec(), ..png() });
+    window.embed_picture("gone", png());
+    assert_eq!(held(&window), (None, Some(LINK.into())));
+    assert_eq!(window.ui().edits(), edits, "nothing changed, so there is nothing to save");
+
+    window.embed_picture("g", png());
+    let (asset, src) = held(&window);
+    let asset = asset.expect("the figure holds its picture");
+    assert_eq!(src, None, "and links to it no longer");
+    assert!(window.ui().edits() > edits, "which the shell is to save");
+    assert_eq!(drawn(&mut window), std::slice::from_ref(&asset));
+    assert_eq!(
+        window.ui().take_requests(),
+        [Request::Asset(asset)],
+        "the picture is asked for as any of the document's"
+    );
+}

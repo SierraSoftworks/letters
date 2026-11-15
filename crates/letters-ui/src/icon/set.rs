@@ -17,6 +17,8 @@ pub const CHEVRON_LEFT: Icon = Icon::new("M15 18l-6-6 6-6");
 pub const CHEVRON_RIGHT: Icon = Icon::new("M9 18l6-6-6-6");
 /// `chevron-up`
 pub const CHEVRON_UP: Icon = Icon::new("M18 15l-6-6-6 6");
+/// `cloud`
+pub const CLOUD: Icon = Icon::new("M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z");
 /// `cloud-alert`
 pub const CLOUD_ALERT: Icon = Icon::new("M12 12v4M12 20h.01M8.128 16.949A7 7 0 1 1 15.71 8h1.79a1 1 0 0 1 0 9h-1.642");
 /// `cloud-check`
