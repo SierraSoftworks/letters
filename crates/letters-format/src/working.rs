@@ -10,6 +10,7 @@ use std::io::{Read, Seek};
 
 use letters_model::{Change, Document, Model, Note, Notes, Op, OpError, ReplicaId, Style};
 
+use crate::journal::Unsaved;
 use crate::save::{DiskCopy, Replica};
 use crate::{Archive, DOCUMENT, Error, HISTORY, Manifest, NOTES, Package, STYLE};
 
@@ -173,6 +174,66 @@ impl WorkingCopy {
             self.history = history;
         }
         Ok(change)
+    }
+}
+
+impl WorkingCopy {
+    /// Takes in what a journal kept from a session that ended before its edits were known to be in the
+    /// file. Returns whether it held anything this copy lacked, which is then owed a save.
+    ///
+    /// Fails with [`Error::Unmerged`] when the journal's edits build on a history this copy does not hold.
+    pub fn replay(&mut self, unsaved: &Unsaved) -> Result<bool, Error> {
+        if unsaved.id != self.id {
+            return Err(Error::OtherDocument(unsaved.id.clone()));
+        }
+        let held = |model: &Model, edits: &[u8]| {
+            let held = model.compare(edits).map_err(Error::History)?;
+            Ok::<_, Error>(matches!(held, Some(Ordering::Greater | Ordering::Equal)))
+        };
+        let mut added = false;
+        self.notes.pin(&self.model);
+        for edits in &unsaved.edits {
+            if !held(&self.model, edits)? {
+                self.model.merge(edits).map_err(Error::History)?;
+                added = true;
+            }
+        }
+        // Edits that wait for others the copy never saw are not in the document.
+        for edits in &unsaved.edits {
+            if !held(&self.model, edits)? {
+                return Err(Error::Unmerged);
+            }
+        }
+        if let Some(notes) = &unsaved.notes {
+            added |= self.notes.merge(notes);
+        }
+        self.notes.follow(&self.model);
+        for (name, bytes) in &unsaved.assets {
+            if !self.entries.contains_key(name) && !self.seen.contains_key(name) {
+                self.entries.insert(name.clone(), bytes.clone());
+                added = true;
+            }
+        }
+        Ok(added)
+    }
+
+    /// The document a journal holds on its own, for one that never reached a file or whose file is gone.
+    /// `None` when the journal only adds to a file.
+    pub fn recover(unsaved: &Unsaved, replica: ReplicaId) -> Result<Option<Self>, Error> {
+        let Some(first) = unsaved.edits.first().filter(|_| unsaved.whole) else { return Ok(None) };
+        let mut copy = Self {
+            id: unsaved.id.clone(),
+            created: unsaved.created.clone(),
+            model: Model::load(first, replica).map_err(Error::History)?,
+            notes: Notes::default(),
+            entries: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            unread_style: None,
+            unread_notes: false,
+            history: None,
+        };
+        copy.replay(unsaved)?;
+        Ok(Some(copy))
     }
 }
 

@@ -5,10 +5,12 @@
 //!   the same over an older copy, copying what did not change without recompressing it.
 //! - [`save`] replaces a file on a shared folder without locks: read, merge, write beside, rename.
 //! - [`WorkingCopy`] is a document in memory between saves, and merges with any other copy of it.
+//! - [`Journal`] keeps what a writer has not yet read back from the file, for the session after a crash.
 //! - [`schema`] holds the JSON Schemas of the public entries.
 //!
 //! Nothing here touches the filesystem or the clock. The shell supplies readers, writers, ids and dates.
 
+mod journal;
 mod name;
 mod save;
 mod working;
@@ -23,6 +25,7 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+pub use journal::{Journal, Mark, Unsaved, is_journal, journal_name};
 pub use name::{file_name, suggested_name};
 pub use save::{DiskCopy, Files, Replica, Save, Saved, Stamp, conflict_copy_of, save};
 pub use working::{OPLOG, WorkingCopy};
