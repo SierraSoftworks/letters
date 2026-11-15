@@ -1286,3 +1286,21 @@ fn a_document_with_no_folders_to_show_is_renamed_from_the_field_alone() {
     assert_eq!(window.ui().take_requests(), [Request::Rename("Shopping".into())]);
     window.assert_closed(Role::TextInput, "Document name");
 }
+
+#[test]
+fn a_press_under_the_last_block_gives_a_line_to_write_on() {
+    // What the document ends in, and the last block once "After" is typed where the press put the caret.
+    let cases = [
+        ("a code block", "Intro.\n\n```\nlet a = 1;\n```\n", "After"),
+        ("a quote", "Intro.\n\n> Quoted.\n", "After"),
+        ("body text", "Intro.\n\nLast words.", "Last words.After"),
+    ];
+    for (ends_in, markdown, last) in cases {
+        let mut window = Harness::doc(markdown);
+        click_the_page(&mut window);
+        window.type_text("After");
+        let block = window.editor().doc().blocks.last().expect("the document has blocks");
+        assert!(matches!(block.kind, BlockKind::Paragraph), "after {ends_in} comes body text: {:?}", block.kind);
+        assert_eq!(block.plain_text(), last, "after {ends_in}");
+    }
+}

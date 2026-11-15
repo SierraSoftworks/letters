@@ -622,6 +622,12 @@ impl EditorApp {
     fn pointer(&mut self, event: Pointer, platform: &mut dyn Platform) {
         match event {
             Pointer::Down { at, mods, clicks } => {
+                // Under the last block there is always a line to write on, also when the document ends in
+                // something that holds the caret in, as a code block does.
+                if at.y + self.scrolled() - TOP > self.layout.height() && !mods.shift {
+                    self.dragging = false;
+                    return self.edit(platform, |editor, platform| editor.run(Command::LineBelow, platform));
+                }
                 let Some(head) = self.hit(at) else { return };
                 let anchor = match self.editor.selection() {
                     Some(selection) if mods.shift => selection.anchor.clone(),
