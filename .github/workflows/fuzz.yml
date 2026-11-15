@@ -1,0 +1,191 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to fuzz each target for
+        default: "120"
+      targets:
+        description: Targets to run, separated by spaces. Empty runs them all.
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: fuzz
+
+jobs:
+  # One job for every target: the instrumented build is most of the cost of a short run, so it is made once
+  # and the targets share the machine's cores.
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      FUZZ_SECONDS: ${{ inputs.seconds || '120' }}
+      FUZZ_TARGETS: ${{ inputs.targets }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target/afl
+          key: fuzz
+
+      # Built from source: a prebuilt cargo-afl comes without the AFL++ tree that `cargo afl config --build`
+      # needs, and `--force` unpacks it even when the cache restored the binary.
+      - name: Install cargo-afl
+        run: cargo install cargo-afl --locked --force
+
+      # `--force` because the install has already built the runtime once, which a plain build refuses to
+      # replace.
+      - name: Build AFL toolchain
+        run: cargo afl config --build --force
+
+      # cargo-afl calls sudo itself. Under sudo it would not be found.
+      - name: Configure system for AFL++
+        run: cargo afl system-config
+
+      - name: Build fuzz targets
+        run: cargo afl build --profile fuzz -p letters-fuzz --target-dir target/afl
+
+      - name: Run fuzz targets
+        id: fuzz
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -f
+          mkdir -p fuzz-out
+          targets="${FUZZ_TARGETS:-$(target/afl/fuzz/letters-fuzz --list | cut -f1)}"
+          # One target to a core, each with its own log.
+          printf '%s\n' $targets | xargs -P "$(nproc)" -I{} bash -c '
+            ./scripts/fuzz "$1" "$2" >"fuzz-out/$1.log" 2>&1
+            echo "$1 $?" >>fuzz-out/results
+          ' fuzz {} "$FUZZ_SECONDS"
+          sort -o fuzz-out/results fuzz-out/results
+
+          {
+            echo "| Target | Result |"
+            echo "| --- | --- |"
+            while read -r target status; do
+              case "$status" in
+                0) result="no failure in ${FUZZ_SECONDS} s" ;;
+                1) result="failed" ;;
+                *) result="did not run (status ${status})" ;;
+              esac
+              echo "| \`${target}\` | ${result} |"
+            done <fuzz-out/results
+          } >>"$GITHUB_STEP_SUMMARY"
+          ! grep -qv ' 0$' fuzz-out/results
+
+      # AFL++ names what it keeps like `id:000000,sig:06,...`, and upload-artifact rejects paths with a `:`,
+      # so the inputs are archived first.
+      - name: Package failing inputs
+        if: always() && steps.fuzz.outcome == 'failure'
+        shell: bash
+        run: |
+          grep -v ' 0$' fuzz-out/results | while read -r target status; do
+            findings="target/afl/findings/${target}"
+            if [[ -f "${findings}/report.txt" ]]; then
+              cp "${findings}/report.txt" "fuzz-out/${target}.report.txt"
+            fi
+            if [[ -d "${findings}/default" ]]; then
+              tar -czf "fuzz-out/${target}.inputs.tar.gz" -C "${findings}/default" crashes hangs
+            fi
+          done
+
+      - name: Upload failure details
+        if: always() && steps.fuzz.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-failures-${{ github.run_id }}
+          path: fuzz-out/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # One issue for each target that fails, which later runs add to while it stays open.
+      - name: Report fuzz failures
+        if: always() && steps.fuzz.outcome == 'failure'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const results = fs.readFileSync('fuzz-out/results', 'utf8').trim().split('\n').map(line => line.split(' '));
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+
+            for (const [target, status] of results) {
+              if (status === '0') continue;
+              const marker = `<!-- letters-fuzz:${target} -->`;
+              // The report tells where the target fails. Without one the fuzzer itself did not run, and
+              // its last words say why.
+              const report = `fuzz-out/${target}.report.txt`;
+              const reported = fs.existsSync(report);
+              let output = fs.readFileSync(reported ? report : `fuzz-out/${target}.log`, 'utf8');
+              output = output.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+              if (output.length > 50000) {
+                output = reported
+                  ? `${output.slice(0, 50000)}\n[cut after 50000 characters]`
+                  : `[cut to the last 50000 characters]\n${output.slice(-50000)}`;
+              }
+              output = output.replaceAll('```', '` ` `');
+
+              const occurrence = [
+                `Fuzz target: \`${target}\``,
+                `Commit: \`${context.sha}\``,
+                `Workflow run: ${runUrl}`,
+                `Failing inputs: ${runUrl}#artifacts`,
+                '',
+                `<details><summary>${reported ? 'Where it fails' : 'Fuzzer output'}</summary>`,
+                '',
+                '```text',
+                output,
+                '```',
+                '</details>',
+              ].join('\n');
+
+              const existing = issues.find(issue => !issue.pull_request && issue.body?.includes(marker));
+              if (existing) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: existing.number,
+                  body: occurrence,
+                });
+              } else {
+                const found = reported
+                  ? 'A scheduled fuzzing run found inputs that break Letters.'
+                  : 'A scheduled fuzzing run could not run this target.';
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `Fuzz failure: ${target}`,
+                  body: `${marker}\n${found}\n\n${occurrence}`,
+                });
+              }
+            }
+
+      - name: Fail job after reporting
+        if: always() && steps.fuzz.outcome == 'failure'
+        run: exit 1
