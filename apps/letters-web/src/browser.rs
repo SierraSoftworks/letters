@@ -1,9 +1,10 @@
 //! What the browser lends the editor: a clock, identifiers, the clipboard for as long as a clipboard event
-//! lasts, somewhere to keep the person's own words and default style, and the files beside the wasm.
+//! lasts, somewhere to keep the person's own words, default style and settings, and the files beside the wasm.
 
 use js_sys::{Promise, Reflect, Uint8Array};
 use letters_editor::{Clip, Platform, block_id};
 use letters_model::Style;
+use letters_ui::{Appearance, Settings};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Crypto, Performance, Response, Storage, Url, Window};
@@ -29,6 +30,13 @@ const WORDS: &str = "letters.words";
 
 /// Where this browser keeps the person's default style, as a `style.json`, until an account keeps it.
 const STYLE: &str = "letters.style";
+
+/// Where this browser keeps what the person set for themselves, a key to each setting, until an account
+/// keeps them. A setting that is not set has no key.
+const THEME: &str = "letters.theme";
+const ACCENT: &str = "letters.accent";
+const NAME: &str = "letters.name";
+const LANGUAGE: &str = "letters.language";
 
 pub struct Browser {
     performance: Performance,
@@ -77,10 +85,60 @@ impl Browser {
         self.storage.as_ref().is_some_and(|storage| storage.set_item(STYLE, json).is_ok())
     }
 
+    /// What the person set for themselves in this browser. A key that holds what makes no sense for it is
+    /// as if it had never been set.
+    pub fn settings(&self) -> Settings {
+        let kept = |key| {
+            let kept = self.storage.as_ref()?.get_item(key).ok().flatten()?;
+            Some(kept.trim().to_owned()).filter(|kept| !kept.is_empty())
+        };
+        Settings {
+            appearance: match kept(THEME).as_deref() {
+                Some("light") => Appearance::Light,
+                Some("dark") => Appearance::Dark,
+                _ => Appearance::System,
+            },
+            accent: kept(ACCENT).and_then(|accent| colour(&accent)),
+            name: kept(NAME),
+            language: kept(LANGUAGE),
+        }
+    }
+
+    /// Keeps `settings` for the next page this browser loads, and for its other tabs. Storage that is full
+    /// or turned off keeps nothing, and the settings still hold until the page closes.
+    pub fn keep_settings(&self, settings: &Settings) {
+        let Some(storage) = &self.storage else { return };
+        let theme = match settings.appearance {
+            Appearance::System => None,
+            Appearance::Light => Some("light".to_owned()),
+            Appearance::Dark => Some("dark".to_owned()),
+        };
+        let accent = settings.accent.map(|[r, g, b]| format!("#{r:02x}{g:02x}{b:02x}"));
+        let keys =
+            [(THEME, theme), (ACCENT, accent), (NAME, settings.name.clone()), (LANGUAGE, settings.language.clone())];
+        for (key, set) in keys {
+            let _ = match set {
+                Some(set) => storage.set_item(key, &set),
+                None => storage.remove_item(key),
+            };
+        }
+    }
+
     /// Milliseconds since the page started loading, to a fraction.
     pub fn now(&self) -> f64 {
         self.performance.now()
     }
+}
+
+/// Reads `#rrggbb`.
+fn colour(hex: &str) -> Option<[u8; 3]> {
+    let digits = hex.strip_prefix('#')?;
+    // A sign would parse as a number, and is no part of a colour.
+    if digits.len() != 6 || !digits.bytes().all(|digit| digit.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rgb = u32::from_str_radix(digits, 16).ok()?;
+    Some([(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8])
 }
 
 impl Platform for Browser {

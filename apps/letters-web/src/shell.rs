@@ -15,7 +15,7 @@ use letters_model::{BlockKind, Document, HistoryError, Mark, ReplicaId};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Rect, Size};
-use letters_ui::{Cursor, Edge, Keys, Request, Scheme, Window as View, tokens};
+use letters_ui::{Appearance, Cursor, Edge, Keys, Request, Scheme, Settings, Window as View, tokens};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use wasm_bindgen_futures::JsFuture;
@@ -284,10 +284,16 @@ impl Shell {
         hear(&shell, &input, "focus", |shell, _: Event| shell.view.focus(true))?;
         hear(&shell, &input, "blur", |shell, _: Event| shell.view.focus(false))?;
         hear(&shell, &window, "resize", |shell, _: Event| shell.fit())?;
-        // Another tab of the editor may have added to the person's words, or kept another default style.
+        // Another tab of the editor may have added to the person's words, kept another default style, or
+        // changed their settings.
         hear(&shell, &window, "storage", |shell, _: Event| {
             shell.view.set_user_words(shell.platform.user_words());
             shell.view.set_default_style(shell.platform.default_style());
+            let settings = shell.platform.settings();
+            if *shell.view.settings() != settings {
+                follow(&mut shell.view, settings);
+                shell.fit();
+            }
         })?;
         for setting in [&dark_mode, &less_motion].into_iter().flatten() {
             hear(&shell, setting, "change", |shell, _: Event| shell.fit())?;
@@ -429,8 +435,13 @@ impl Shell {
         self.view.resize(size, scale);
     }
 
+    /// Whether the window is dark: as the person set it, else as their system is.
     fn dark(&self) -> bool {
-        self.dark_mode.as_ref().is_some_and(MediaQueryList::matches)
+        match self.view.settings().appearance {
+            Appearance::System => self.dark_mode.as_ref().is_some_and(MediaQueryList::matches),
+            Appearance::Light => false,
+            Appearance::Dark => true,
+        }
     }
 
     /// Brings everything outside the canvas up to date with the view, after any event.
@@ -452,6 +463,13 @@ impl Shell {
                 // The browser asks the person for the file, and the chooser's `change` hands it over.
                 Request::ImportStyle => self.chooser.click(),
                 Request::ExportStyle(json) => report(self.download(&json, "letstyle")),
+                // The window has taken the settings already. The rest is the shell's: keeping them, the
+                // name edits carry, and light or dark.
+                Request::Settings(settings) => {
+                    self.platform.keep_settings(&settings);
+                    follow(&mut self.view, settings);
+                    self.view.set_dark(self.dark());
+                }
                 // Opening, starting and moving need files, which wait for a server behind the page.
                 _ => {}
             }
@@ -822,7 +840,14 @@ pub fn carried(window: &Window, platform: &mut Browser) -> Document {
             web_sys::console::error_1(&format!("the page's document cannot be read: {error}").into());
             page::welcome(&mut || platform.new_id())
         }
-        None => page::welcome(&mut || platform.new_id()),
+        None => {
+            let mut welcome = page::welcome(&mut || platform.new_id());
+            // A new document is written in the person's language.
+            if let Some(language) = platform.settings().language {
+                welcome.language = language;
+            }
+            welcome
+        }
     }
 }
 
@@ -837,7 +862,19 @@ fn view(document: Document, platform: &mut Browser, mac: bool) -> View {
     view.set_keys(if mac { Keys::Mac } else { Keys::Standard });
     view.set_user_words(platform.user_words());
     view.set_default_style(platform.default_style());
+    follow(&mut view, platform.settings());
     view
+}
+
+/// Has `view` take `settings`, and sign the person's edits with the name they set. There is no account to
+/// name them otherwise.
+fn follow(view: &mut View, settings: Settings) {
+    if let Some(name) = &settings.name {
+        view.set_author(name);
+    }
+    if *view.settings() != settings {
+        view.set_settings(settings);
+    }
 }
 
 /// Copies one rectangle of the frame to the same place on the canvas.
