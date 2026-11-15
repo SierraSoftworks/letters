@@ -9,7 +9,8 @@ use std::io::{BufReader, Cursor, Read, Seek};
 use std::sync::Mutex;
 
 use letters_format::{
-    Archive, Files, OPLOG, Reading, Replica, Save, Saved, WorkingCopy, conflict_copy_of, file_name, hash,
+    ASSETS, Archive, Files, HISTORY, NOTES, OPLOG, Reading, Replica, Save, Saved, WorkingCopy, conflict_copy_of,
+    file_name, hash,
 };
 use letters_model::{Block, BlockId, BlockKind, Document, Model, NoteKind, Op, ReplicaId, Style};
 use serde::{Deserialize, Serialize};
@@ -308,6 +309,31 @@ impl Library {
         let (folder, name) = place.split();
         let bytes = Files::read(&mut root.folder(&folder)?, name)?;
         bytes.ok_or_else(Refusal::not_found)
+    }
+
+    /// The file at `place` as a document of its own, with nothing of how it came to be. It is what a link
+    /// hands whoever it let in, and what the desktop app's clean copy holds:
+    ///
+    /// - An id and a date of its own. With the original's, a merge of the two would bring the history back.
+    /// - No history, and so no earlier text and no names of who wrote what.
+    /// - No notes: comments, import notes and conflicts.
+    /// - A picture only where the document shows it. The file may hold others that its history names.
+    pub fn clean(&self, root: &Root, place: &Place, now: u64) -> Answer<Vec<u8>> {
+        let mut package = self.open(root, place)?.package()?;
+        (package.id, package.created) = (ids::document_id(), ids::rfc3339(now));
+        // A preview no link names is kept for the history's sake, which goes.
+        package.document.prune_previews();
+        let shown = package.document.assets();
+        let kept = |name: &str| match name {
+            NOTES => false,
+            name if name.starts_with(HISTORY) => false,
+            name if name.starts_with(ASSETS) => shown.contains(name),
+            _ => true,
+        };
+        package.entries.retain(|name, _| kept(name));
+        let mut bytes = Cursor::new(Vec::new());
+        letters_format::write(&mut bytes, &package)?;
+        Ok(bytes.into_inner())
     }
 
     /// Merges `theirs`, another copy of the document `id`, into its file at `place`. Nothing in the file is

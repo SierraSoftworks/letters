@@ -264,7 +264,13 @@ async fn file(State(app): State<Shared>, Reader(who): Reader, Path(id): Path<Str
         }
         // What the document's room holds goes to the file first, so that the file sent is whole.
         app.rooms.save(&found.root, &found.place);
-        Ok((found.place.name().to_owned(), app.library.bytes(&found.root, &found.place)?))
+        // The history can show text that was since taken out. Whoever has no more than a link gets the
+        // document as it stands.
+        let bytes = match found.by_link() {
+            true => app.library.clean(&found.root, &found.place, app.now())?,
+            false => app.library.bytes(&found.root, &found.place)?,
+        };
+        Ok((found.place.name().to_owned(), bytes))
     })
     .await?;
     // The name is the file's own, less what a header cannot carry.
@@ -473,6 +479,12 @@ impl Found {
             true => Ok(()),
             false => Err(Refusal::forbidden("You can read this document, but not change it.")),
         }
+    }
+
+    /// Whether a link is all that leads the session to the document: its space does not, and no share
+    /// with them does.
+    pub fn by_link(&self) -> bool {
+        self.until.is_some()
     }
 
     /// The space the session reaches the document in, for what is done to its place and not to it. A

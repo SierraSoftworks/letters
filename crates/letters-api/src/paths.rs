@@ -113,7 +113,9 @@ pub fn document(id: &str) -> String {
     format!("{API}/documents/{}", segment(id))
 }
 
-/// `GET`: the whole `.let` file, pictures and history included, as the server would save it now. `PUT`: a
+/// `GET`: the whole `.let` file, pictures and history included, as the server would save it now. Whoever
+/// has no more than a link gets a document of its own in its place, with an id of its own and without the
+/// history or the notes, since a history can show what was since taken out. `PUT`: a
 /// device's own copy of the document, for work that is too much for the socket. It is merged into the
 /// document and replaces nothing, and may be as large as [`Limits::document`](crate::Limits::document).
 /// A copy is read before it is merged, and [`Code::Stale`](crate::Code::Stale) says the document was

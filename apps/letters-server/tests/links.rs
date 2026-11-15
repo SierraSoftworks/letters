@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::io::Cursor;
 use std::net::SocketAddr;
 
 use axum::http::{Method, StatusCode};
@@ -11,6 +12,8 @@ use common::{Browser, Client, Raw, START, Server, URL, follow, let_in, link, pla
 use letters_api::{
     Allows, Code, CreatedLink, Entry, Error, Fetch, Listing, NewLink, Opened, Rename, Role, Shares, Tag, Trust, paths,
 };
+use letters_format::{Archive, HISTORY};
+use letters_model::Op;
 use letters_sync::Link::Live;
 
 /// How many links the row of Ada's document says lead to it.
@@ -268,6 +271,59 @@ async fn a_link_withholds_what_it_does_not_let_its_reader_take_away() {
         assert_eq!(opened.allows, allows);
         assert_eq!(guest.get(&paths::file(&id)).await.status, file, "the file, with {allows:?}");
         assert_eq!(guest.get(&paths::read_page(&id)).await.status, page, "the page to read, with {allows:?}");
+    }
+}
+
+/// What a file tells of how its document came to be: whether it holds a history, how many notes, and the
+/// id it goes by.
+fn past(file: Vec<u8>) -> (bool, usize, String) {
+    let package = Archive::open(Cursor::new(file)).expect("a document").package().expect("it reads");
+    let history = package.entries.keys().any(|name| name.starts_with(HISTORY));
+    (history, package.notes().expect("its notes read").notes.len(), package.id)
+}
+
+#[tokio::test]
+async fn a_link_hands_over_the_document_as_it_stands_and_nothing_of_its_past() {
+    let (server, ada, _, id) = planned("links-clean").await;
+    // Ada writes a line, takes it out again, writes another and leaves a comment.
+    let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
+    settle([&mut desk]).await;
+    let (draft, line) = ("Offer no more than 400,000. ", desk.model.as_ref().unwrap().doc().blocks[0].id.clone());
+    desk.write(draft);
+    desk.edit([Op::DeleteText { block: line, range: 0..draft.len() }]);
+    desk.write("We would like to make an offer. ");
+    desk.comment("Is 400,000 still the ceiling?");
+    settle([&mut desk]).await;
+    desk.leave().await;
+
+    let taking = |role| NewLink { allows: Allows { download: true, ..Allows::default() }, ..link("Seller", role) };
+    let made: CreatedLink = ada.post(&paths::links(&id), &taking(Role::Reader)).await.unwrap();
+    // Who asks for the file, a link they followed first, and whether they get its past with it. Ben has
+    // a share of his own, and a link takes nothing from that.
+    let cases = [
+        (Some("ada"), None, true),
+        (Some("ben"), None, true),
+        (Some("ben"), Some(Role::Reader), true),
+        (Some("carol"), Some(Role::Reader), false),
+        (None, Some(Role::Reader), false),
+        (None, Some(Role::Editor), false),
+    ];
+    for (username, by, whole) in cases {
+        let mut browser = username.map_or_else(|| server.visitor(), |username| server.reader(username, &[]));
+        match by {
+            Some(Role::Reader) => drop(follow(&mut browser, &made).await),
+            Some(role) => {
+                let made: CreatedLink = ada.post(&paths::links(&id), &taking(role)).await.unwrap();
+                follow(&mut browser, &made).await;
+            }
+            None => {}
+        }
+        let file = browser.get(&paths::file(&id)).await;
+        assert_eq!(file.status, StatusCode::OK, "{username:?} by {by:?}");
+        let text = texts(file.body.clone()).join("\n");
+        assert!(text.contains("We would like to make an offer."), "{username:?} by {by:?}: {text}");
+        let (history, notes, named) = past(file.body);
+        assert_eq!((history, notes > 0, named == id), (whole, whole, whole), "{username:?} by {by:?}");
     }
 }
 
