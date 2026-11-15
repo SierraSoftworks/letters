@@ -459,6 +459,49 @@ fn an_edit_nothing_announced_is_read_from_how_the_text_around_the_caret_changed(
     assert_eq!(input.event(Dom::Input { value: "Hello", selection: 0..0 }), pressed(Key::Backspace));
 }
 
+#[test]
+fn a_caret_the_keyboard_moves_is_the_editors_to_follow() {
+    let cases = [
+        // (what is held, where the keyboard puts the selection, the selection the editor is asked for)
+        ("Hello wor|ld", "Hel|lo world", Some(3..3)),
+        ("né|e", "née|", Some(4..4)),
+        ("one two|", "one |two|", Some(4..7)),
+        ("a 😀 b|", "a |😀 b", Some(2..2)),
+        // Where the editor's selection already is, as after the shell's own writing, there is nothing to ask.
+        ("Hello|", "Hello|", None),
+    ];
+    for (held, now, expected) in cases {
+        let mut input = holding(held);
+        let (value, selection) = now_holds(now);
+        let reply = input.event(Dom::Select { value: &value, selection: selection.clone() });
+        assert_eq!(reply, expected.map_or(Reply::Pass, Reply::Select), "{held:?} to {now:?}");
+        // Told once, it is not told again.
+        assert_eq!(input.event(Dom::Select { value: &value, selection }), Reply::Pass, "{now:?} again");
+    }
+    // Before the space the input rests on is the start of the block.
+    let mut input = holding("He|llo");
+    assert_eq!(input.event(Dom::Select { value: " Hello", selection: 0..0 }), Reply::Select(0..0));
+
+    // In a long block the selection is counted from the block's start, not from what is held.
+    let (text, caret) = marked(&format!("{}word|", "é ".repeat(3000)));
+    let mut input = TextInput::new(false);
+    let (value, held) = input.hold(&Around::of(&text, caret.clone())).map(|(v, s)| (v.to_owned(), s)).expect("held");
+    let reply = input.event(Dom::Select { value: &value, selection: held.start - 4..held.start - 4 });
+    assert_eq!(reply, Reply::Select(caret.start - 4..caret.start - 4));
+}
+
+#[test]
+fn a_selection_that_moves_with_an_edit_or_a_composition_is_not_a_move_of_the_caret() {
+    // The text changed too: the `input` event says what happened.
+    let mut input = holding("Hello|");
+    assert_eq!(input.event(Dom::Select { value: " Hello!", selection: 7..7 }), Reply::Pass);
+    assert_eq!(input.event(Dom::Input { value: " Hello!", selection: 7..7 }), insert("!"));
+
+    let mut input = holding("Hello| there");
+    input.event(Dom::CompositionStart);
+    assert_eq!(input.event(Dom::Select { value: " Hello there", selection: 2..2 }), Reply::Pass);
+}
+
 /// A step of a composition in an input that holds text: what it holds after an `input` event, or the
 /// `data` it ends with and what it holds then. Text is marked as [`marked`] reads it.
 enum Step {

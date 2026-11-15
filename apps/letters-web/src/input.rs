@@ -64,6 +64,12 @@ pub enum Dom<'a> {
         data: &'a str,
         value: &'a str,
     },
+    /// `selectionchange`: what the hidden input holds, and the selection in it in UTF-16 units. A soft
+    /// keyboard moves the caret this way, as a swipe along its space bar does.
+    Select {
+        value: &'a str,
+        selection: Range<u32>,
+    },
 }
 
 /// What an event means for the editor and for the browser.
@@ -79,6 +85,8 @@ pub enum Reply {
     Key { event: KeyEvent, claim: bool },
     /// Text for the editor. The browser's own edit is stopped where it can be.
     Text(InputEvent),
+    /// The selection the keyboard asks for, in bytes of the caret's block.
+    Select(Range<usize>),
 }
 
 /// A clipboard event on the hidden input.
@@ -226,6 +234,17 @@ impl TextInput {
             Dom::CompositionStart => {
                 (self.composing, self.shown, self.following) = (true, false, false);
                 Reply::Pass
+            }
+            // A selection that moved with the text is part of an edit, which its own events report.
+            Dom::Select { value, .. } if self.composing || value != self.value => Reply::Pass,
+            Dom::Select { value, selection } => {
+                let moved = byte_offset(value, selection.start)..byte_offset(value, selection.end);
+                let (asked, held) = (self.in_block(&moved), self.in_block(&self.held));
+                if asked == held {
+                    return Reply::Pass;
+                }
+                self.held = moved;
+                Reply::Select(asked)
             }
             Dom::CompositionEnd { data, value } => {
                 self.ended = true;

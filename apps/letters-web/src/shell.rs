@@ -11,7 +11,7 @@ use std::rc::{Rc, Weak};
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Function, Object, Reflect};
 use letters_editor::{Clip, Modifiers, Platform as _};
-use letters_model::{BlockKind, Document, HistoryError, Mark, ReplicaId};
+use letters_model::{BlockKind, Document, HistoryError, Mark, Pos, ReplicaId, Selection};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Rect, Size};
@@ -278,6 +278,8 @@ impl Shell {
         hear(&shell, &input, "input", Self::input)?;
         hear(&shell, &input, "compositionstart", |shell, event: Event| shell.text(Dom::CompositionStart, &event))?;
         hear(&shell, &input, "compositionend", Self::composition_end)?;
+        // Every browser reports a selection that moved to the document, and only some to the input too.
+        hear(&shell, &document, "selectionchange", Self::selection_change)?;
         hear(&shell, &input, "copy", |shell, event| shell.clipboard(event, Clipboard::Copy))?;
         hear(&shell, &input, "cut", |shell, event| shell.clipboard(event, Clipboard::Cut))?;
         hear(&shell, &input, "paste", |shell, event| shell.clipboard(event, Clipboard::Paste))?;
@@ -634,6 +636,13 @@ impl Shell {
                 self.view.input(text, &mut self.platform);
                 event.prevent_default();
             }
+            Reply::Select(range) => {
+                let Some(block) = self.view.editor().selection().map(|selection| selection.head.block.clone()) else {
+                    return;
+                };
+                let (anchor, head) = (Pos::new(block.clone(), range.start), Pos::new(block, range.end));
+                self.view.select(Selection { anchor, head });
+            }
         }
     }
 
@@ -694,6 +703,14 @@ impl Shell {
 
     fn input(&mut self, event: Event) {
         self.text(Dom::Input { value: &self.input.value(), selection: self.selected() }, &event);
+    }
+
+    /// The selection moved somewhere on the page. In the hidden input, only a keyboard moves it.
+    fn selection_change(&mut self, event: Event) {
+        let active = self.window.document().and_then(|page| page.active_element());
+        if active.is_some_and(|active| active == **self.input) {
+            self.text(Dom::Select { value: &self.input.value(), selection: self.selected() }, &event);
+        }
     }
 
     fn composition_end(&mut self, event: CompositionEvent) {

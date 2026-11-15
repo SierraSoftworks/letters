@@ -63,6 +63,18 @@ test("a word the keyboard mends where it stands is mended in the document", asyn
   expect(await last(page)).toBe("I saw the cat!");
 });
 
+test("a caret the keyboard moves in the hidden input moves in the document", async ({ page }) => {
+  await page.keyboard.type("One two");
+  // A swipe along a soft keyboard's space bar moves the caret, and says only that the selection changed.
+  await input(page).evaluate((input) => input.setSelectionRange(5, 5));
+  await page.keyboard.type("and ");
+  expect(await last(page)).toBe("One and two");
+  await expect.poll(() => selection(page)).toEqual([9, 9]);
+  await input(page).evaluate((input) => input.setSelectionRange(1, 4));
+  await page.keyboard.type("1");
+  expect(await last(page)).toBe("1 and two");
+});
+
 test("a correction nothing announced is read from what the hidden input then holds", async ({ page }) => {
   await page.keyboard.type("I saw teh");
   // A soft keyboard mends the word as the space after it is typed, and says only that the input changed.
