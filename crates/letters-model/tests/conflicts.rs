@@ -363,6 +363,37 @@ fn a_settled_block_reads_as_the_writer_who_edited_last_left_it() {
     }
 }
 
+#[test]
+fn writers_who_wrote_more_apart_than_they_share_settle_as_any_others() {
+    use Edit::*;
+    // Longer than all the document held when the two parted.
+    let paste: &'static str = "A long story of the sea. ".repeat(60).leak();
+    let cases: Vec<(&str, Edits, Edits, &[&str])> = vec![
+        (
+            "a word both change, and a paste elsewhere",
+            vec![("p1", Swap("quick", "slow"))],
+            vec![("e", Add(paste)), ("p1", Swap("quick", "fast"))],
+            &["p1"],
+        ),
+        (
+            "a paste into a word the other changes",
+            vec![("p1", After("qui", paste))],
+            vec![("p1", Swap("quick", "fast"))],
+            &["p1"],
+        ),
+        ("a paste after a word the other changes", vec![("p1", Swap("dog", "cat"))], vec![("p1", Add(paste))], &[]),
+        ("a paste each, in two paragraphs", vec![("p2", Add(paste))], vec![("e", Add(paste))], &[]),
+    ];
+    for (name, hers, his, expected) in cases {
+        let (mut ana, mut ben) = writers();
+        let found = settle(&mut ana, &mut ben, hers, his);
+        assert_eq!((blocks(&found[0]), blocks(&found[1])), (expected.to_vec(), expected.to_vec()), "{name}");
+        assert_eq!(ana.doc(), ben.doc(), "{name}: each device settled it alone, and alike");
+        assert_eq!(ana.compare(&ben.save()), Ok(Some(Ordering::Equal)), "{name}: by the very same change");
+        assert!(ana.is_latest(), "{name}: the search left the document where it was shown");
+    }
+}
+
 /// A name, what each writer does to one block unseen by the other, and what the block then reads in part.
 type Beside = (&'static str, (&'static str, Edit), (&'static str, Edit), &'static [&'static str]);
 

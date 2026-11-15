@@ -28,11 +28,12 @@ use std::mem;
 use std::ops::Range;
 use std::sync::{Mutex, PoisonError};
 
-use loro::{Frontiers, ID, JsonOpContent, JsonTextOp, LoroDoc, LoroText, TextDelta, VersionVector};
+use loro::{ExportMode, Frontiers, ID, JsonOpContent, JsonTextOp, LoroDoc, LoroText, TextDelta, VersionVector};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::crdt::{self, Event};
 use crate::flat::{self, Entry, MARKER};
+use crate::model::unreadable;
 use crate::notes::Version;
 use crate::{Block, BlockId, BodyShape, Document, Extra, HistoryError, Revision};
 
@@ -494,7 +495,6 @@ fn strikes(
     to: &VersionVector,
     wanted: &HashSet<ID>,
 ) -> Result<HashMap<ID, ID>, HistoryError> {
-    let unreadable = |error: loro::LoroError| HistoryError::Unreadable(error.to_string());
     let edits = loro.export_json_updates_without_peer_compression(from, to).map_err(unreadable)?;
     let sequence = loro::ContainerTrait::id(body);
     let mut struck: HashMap<ID, (u32, ID)> = HashMap::new();
@@ -547,22 +547,57 @@ pub(crate) struct Clash {
     near: Vec<ID>,
 }
 
-/// Finds the conflicts between two revisions. It reads the history at other revisions, and leaves it
+/// Finds the conflicts between two revisions. It reads the history at other revisions, and can leave it
 /// showing one of them: the caller brings back the one its document shows.
 pub(crate) fn find(
-    loro: &LoroDoc,
+    history: &LoroDoc,
     body: &LoroText,
     events: &Mutex<Vec<Event>>,
     sides: [&Frontiers; 2],
 ) -> Result<Vec<Clash>, HistoryError> {
-    let held = |at: &Frontiers| loro.frontiers_to_vv(at).ok_or(HistoryError::UnknownRevision);
+    let held = |at: &Frontiers| history.frontiers_to_vv(at).ok_or(HistoryError::UnknownRevision);
     let reach = [held(sides[0])?, held(sides[1])?];
     // A side that holds all of the other changed nothing apart from it.
     if reach[0].partial_cmp(&reach[1]).is_some() {
         return Ok(Vec::new());
     }
     let shared = reach[0].intersection(&reach[1]);
-    let base = loro.vv_to_frontiers(&shared);
+    // A step through the history costs Loro a pass over all the text that comes or goes with it. The
+    // history behind a document shows what both sides wrote: it steps back from there, and returns.
+    // Sides that wrote more apart than they share, as after a long paste, are read in a copy that shows
+    // nothing at first. It reads what the side that wrote more did once, where the history itself
+    // would pass over it up to four times.
+    if size(&reach[0]) + size(&reach[1]) <= 3 * size(&shared) {
+        return read(history, body, events, sides, reach, &shared, false);
+    }
+    let copy = LoroDoc::new();
+    crdt::configure(&copy);
+    // Detached, it takes the edits in and shows none of them.
+    copy.detach();
+    copy.import(&history.export(ExportMode::all_updates()).map_err(unreadable)?).map_err(unreadable)?;
+    let body = copy.get_text(crdt::BODY);
+    let (events, _watch) = crdt::watch(&copy, &body);
+    read(&copy, &body, &events, sides, reach, &shared, true)
+}
+
+/// How much a revision holds, as Loro counts: an edit of a text counts once for each of its characters.
+fn size(held: &VersionVector) -> i64 {
+    held.values().map(|counter| i64::from(*counter)).sum()
+}
+
+/// Reads the conflicts between two revisions out of `loro`, which it shows at one revision after another.
+/// `reach` is what each side holds and `shared` what both do. `light` says that this is little beside
+/// what the sides wrote since: its document is then read at once, which costs less than a way back to it.
+fn read(
+    loro: &LoroDoc,
+    body: &LoroText,
+    events: &Mutex<Vec<Event>>,
+    sides: [&Frontiers; 2],
+    reach: [VersionVector; 2],
+    shared: &VersionVector,
+    light: bool,
+) -> Result<Vec<Clash>, HistoryError> {
+    let base = loro.vv_to_frontiers(shared);
     // Shows a revision, and gives the change to the sequence that led there with the blocks whose
     // conflicts were settled on the way.
     let show = |at: &Frontiers| {
@@ -584,21 +619,32 @@ pub(crate) fn find(
     };
     show(&base)?;
     let sequence = body.to_string();
-    let (first, ours) = show(sides[0])?;
+    let old = light.then(|| crdt::read(loro, body));
+    // The step back between the sides is from the one read first: the one that wrote less.
+    let lighter = usize::from(size(&reach[1]) < size(&reach[0]));
+    let (one, settled) = show(sides[lighter])?;
     show(&base)?;
-    let (second, theirs) = show(sides[1])?;
-    let again: BTreeSet<String> = ours.intersection(&theirs).cloned().collect();
+    let (other, also) = show(sides[1 - lighter])?;
+    let (first, second) = if lighter == 0 { (one, other) } else { (other, one) };
+    let again: BTreeSet<String> = settled.intersection(&also).cloned().collect();
     // Most copies that part change different blocks, and are done here.
     if again.is_empty() && !meet(&sequence, [&first, &second]) {
         return Ok(Vec::new());
     }
-    show(&base)?;
-    let (old, index) = crdt::read(loro, body);
+    let (old, index) = match old {
+        Some(old) => old,
+        None => {
+            show(&base)?;
+            crdt::read(loro, body)
+        }
+    };
     let mut near = Vec::new();
     let blocks = clashes(&old, &index, [&first, &second], &again, &mut near);
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
+    // The ids of the old characters are read where the sides last agreed.
+    show(&base)?;
     let ids = |places: &mut dyn Iterator<Item = usize>| -> Vec<ID> {
         places.filter_map(|at| crdt::id_at(body, at)).collect()
     };
@@ -616,10 +662,10 @@ pub(crate) fn find(
     let is_old = |id: &ID| shared.includes_id(*id);
     let held = ours.iter().chain(&theirs).flat_map(|held| &held.ids);
     let wanted: HashSet<ID> = olds.iter().flatten().chain(held).copied().filter(is_old).collect();
-    let struck = [strikes(loro, body, &shared, &reach[0], &wanted)?, strikes(loro, body, &shared, &reach[1], &wanted)?];
+    let struck = [strikes(loro, body, shared, &reach[0], &wanted)?, strikes(loro, body, shared, &reach[1], &wanted)?];
     // The newest edit of each side at all, for a side whose edits to a block cannot be told.
     let last = |span: loro::IdSpan| Stamp::of(loro, ID::new(span.peer, span.counter.end - 1));
-    let newest = [0, 1].map(|side| reach[side].sub_iter(&shared).filter_map(last).max().unwrap_or_default());
+    let newest = [0, 1].map(|side| reach[side].sub_iter(shared).filter_map(last).max().unwrap_or_default());
 
     let mut found = Vec::new();
     let views = ours.into_iter().zip(theirs);

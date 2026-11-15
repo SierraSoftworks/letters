@@ -1782,7 +1782,7 @@ fn replacement(cut: &[TextDelta], put: &[TextDelta]) -> Option<Delta> {
     text.iter().all(plain).then(|| cut.iter().chain(text).cloned().collect())
 }
 
-fn unreadable(error: impl fmt::Display) -> HistoryError {
+pub(crate) fn unreadable(error: impl fmt::Display) -> HistoryError {
     HistoryError::Unreadable(error.to_string())
 }
 
