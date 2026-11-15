@@ -15,7 +15,7 @@ use letters_model::{Align, Block, BlockKind, Document, ListKind, Mark, Run, Styl
 use letters_render::Color;
 use yewi_highlight::{TokenKind, tokenize};
 
-/// Exports are drawn on the light page, whatever theme the editor is in.
+/// Exports are drawn on the light page, whatever theme the editor is in. One page can add a dark theme to it.
 const PAGE: Palette = Palette::LIGHT;
 
 /// The element each mark is written as, outermost first.
@@ -42,6 +42,18 @@ pub type Assets<'a> = &'a mut dyn FnMut(&str) -> Option<Vec<u8>>;
 ///   of the class `math`. Nothing in the file sets it, since nothing in the file runs.
 /// - An unknown block is written as its fallback text. Unknown marks and fields are left out.
 pub fn to_html(doc: &Document, style: &Style, title: &str, assets: Assets) -> String {
+    page(doc, style, title, assets, None)
+}
+
+/// As [`to_html`], for a page that follows its reader's theme: light as `to_html` writes it, and in `dark`
+/// where the reader asks for a dark page. Paper stays light.
+///
+/// The style's colours are shown on the dark page as layout shows them, through [`Palette::recolor`].
+pub fn to_html_themed(doc: &Document, style: &Style, title: &str, assets: Assets, dark: &Palette) -> String {
+    page(doc, style, title, assets, Some(dark))
+}
+
+fn page(doc: &Document, style: &Style, title: &str, assets: Assets, dark: Option<&Palette>) -> String {
     let mut out = String::from("<!doctype html>\n<html lang=\"");
     escape(&doc.language, &mut out);
     out.push_str(concat!(
@@ -50,12 +62,14 @@ pub fn to_html(doc: &Document, style: &Style, title: &str, assets: Assets) -> St
         "<meta http-equiv=\"Content-Security-Policy\" ",
         "content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:\">\n",
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
-        "<meta name=\"color-scheme\" content=\"light\">\n",
-        "<meta name=\"generator\" content=\"Letters\">\n<title>",
+        // Says which themes the page has, so the browser's own parts follow: the canvas, scroll bars, tick boxes.
+        "<meta name=\"color-scheme\" content=\"",
     ));
+    out.push_str(if dark.is_some() { "light dark" } else { "light" });
+    out.push_str("\">\n<meta name=\"generator\" content=\"Letters\">\n<title>");
     escape(title, &mut out);
     out.push_str("</title>\n<style>\n");
-    css(style, &mut out);
+    css(style, dark, &mut out);
     out.push_str("</style>\n</head>\n<body>\n<article>\n");
     blocks(&doc.blocks, assets, &mut out);
     out.push_str("</article>\n</body>\n</html>\n");
@@ -410,7 +424,7 @@ fn quoted(text: &str) -> String {
     out
 }
 
-/// Writes how an element type's text is set.
+/// Writes how an element type's text is set, but for its colour, which [`colours`] writes.
 fn type_rule(selector: &str, of: &TextStyle, mono: bool, css: &mut String) {
     let generic = if mono { "ui-monospace, monospace" } else { "system-ui, sans-serif" };
     let align = match of.align {
@@ -419,23 +433,15 @@ fn type_rule(selector: &str, of: &TextStyle, mono: bool, css: &mut String) {
         Align::End => "end",
         Align::Justify => "justify",
     };
-    // A colour that cannot be read falls back to the page's text colour, as it does on the page.
-    let digits =
-        of.color.strip_prefix('#').filter(|digits| digits.len() == 6).map(|digits| u32::from_str_radix(digits, 16));
-    let ink = match digits {
-        Some(Ok(rgb)) => Color::rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8),
-        _ => PAGE.text,
-    };
     let _ = writeln!(
         css,
         "{selector} {{\n  font-family: {family}, {generic};\n  font-size: {size};\n  font-weight: {weight};\n  \
-         font-style: {slant};\n  line-height: {line};\n  color: {ink};\n  text-align: {align};\n}}",
+         font-style: {slant};\n  line-height: {line};\n  text-align: {align};\n}}",
         family = quoted(&of.family),
         size = pt(of.size),
         weight = of.weight,
         slant = if of.italic { "italic" } else { "normal" },
         line = if of.line_height.is_finite() { of.line_height } else { 1.5 },
-        ink = color(ink),
     );
 }
 
@@ -444,8 +450,64 @@ fn space_rule(selector: &str, before: f32, after: f32, css: &mut String) {
     let _ = writeln!(css, "{selector} {{ margin: {} 0 {}; }}", pt(before), pt(after));
 }
 
-/// Writes the stylesheet: the page, each element type of the style, then the furniture layout draws around them.
-fn css(style: &Style, css: &mut String) {
+/// The element types that set text, each with the elements written in it.
+const TYPES: [(&str, &str); 9] = [
+    ("body", "p, li"),
+    ("heading1", "h1"),
+    ("heading2", "h2"),
+    ("heading3", "h3"),
+    ("heading4", "h4"),
+    ("quote", "blockquote p, blockquote li"),
+    ("code", "pre"),
+    ("caption", "figcaption, .fallback"),
+    ("title", ".title"),
+];
+
+/// Writes every colour of the page as `on` has it, and nothing else, so that a second palette can follow the
+/// first and change the colours alone.
+fn colours(style: &Style, on: &Palette, css: &mut String) {
+    let _ = writeln!(css, "html {{ background: {}; }}", color(on.page));
+    for (key, selector) in TYPES {
+        let of = style.types.get(key).or_else(|| style.types.get("body"));
+        let digits = of.and_then(|of| of.color.strip_prefix('#')).filter(|digits| digits.len() == 6);
+        // A colour that cannot be read falls back to the page's text colour, as it does on the page.
+        let ink = match digits.map(|digits| u32::from_str_radix(digits, 16)) {
+            Some(Ok(rgb)) => on.recolor(Color::rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)),
+            _ => on.text,
+        };
+        let _ = writeln!(css, "{selector} {{ color: {}; }}", color(ink));
+    }
+    let _ = write!(
+        css,
+        ":not(pre) > code {{ background: {inline_code}; }}\n\
+         pre {{ background: {code_fill}; }}\n\
+         li::marker {{ color: {marker}; }}\n\
+         li.task > input {{ accent-color: {accent}; }}\n\
+         blockquote {{ border-color: {line_strong}; }}\n\
+         hr {{ border-color: {line}; }}\n\
+         a {{ color: {link}; }}\n\
+         mark {{ background: {highlight}; }}\n",
+        inline_code = color(on.inline_code),
+        code_fill = color(on.code),
+        marker = color(on.marker),
+        accent = color(on.accent),
+        line_strong = color(on.line_strong),
+        line = color(on.line),
+        link = color(on.link),
+        highlight = color(on.highlight),
+    );
+    for (tone, look) in [(Tone::Tip, on.tip), (Tone::Info, on.info), (Tone::Warn, on.warn), (Tone::Danger, on.danger)] {
+        let (name, accent, fill) = (tone_name(tone), color(look.accent), color(look.fill));
+        let _ = writeln!(css, ".callout.{name} {{ border-color: {accent}; background: {fill}; }}");
+    }
+    for kind in TokenKind::ALL {
+        let _ = writeln!(css, ".tok-{} {{ color: {}; }}", kind.as_str(), color(on.syntax.color(ink(kind))));
+    }
+}
+
+/// Writes the stylesheet: the page, each element type of the style, the furniture layout draws around them,
+/// then the colours of it all. A page that has a dark theme repeats the colours in `dark`.
+fn css(style: &Style, dark: Option<&Palette>, css: &mut String) {
     let of = |key: &str| style.types.get(key).or_else(|| style.types.get("body")).cloned().unwrap_or_default();
     let (body, quote, code) = (of("body"), of("quote"), of("code"));
     // The space after body text is the unit the gaps around lists, quotes and dividers are measured in.
@@ -454,11 +516,9 @@ fn css(style: &Style, css: &mut String) {
 
     let _ = write!(
         css,
-        "html {{ background: {paper}; }}\n\
-         body {{ margin: 0; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }}\n\
+        "body {{ margin: 0; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }}\n\
          article {{ max-width: {measure}; margin: 0 auto; padding: {top} {right} {bottom} {left}; \
          overflow-wrap: break-word; }}\n",
-        paper = color(PAGE.page),
         measure = pt(page.width - page.margin_left - page.margin_right),
         top = pt(page.margin_top),
         right = pt(page.margin_right),
@@ -486,35 +546,22 @@ fn css(style: &Style, css: &mut String) {
     let _ = write!(
         css,
         "code {{ font-family: {mono}, ui-monospace, monospace; }}\n\
-         :not(pre) > code {{ font-size: 0.9em; padding: 0.1em 0.25em; border-radius: 3px; background: {inline_code}; }}\n\
-         pre {{ padding: 12px 16px; border-radius: 6px; background: {code_fill}; white-space: pre-wrap; \
+         :not(pre) > code {{ font-size: 0.9em; padding: 0.1em 0.25em; border-radius: 3px; }}\n\
+         pre {{ padding: 12px 16px; border-radius: 6px; white-space: pre-wrap; \
          overflow-wrap: anywhere; tab-size: 4; }}\n\
          ul, ol {{ margin: {before} 0 {after}; padding-left: 24px; }}\n\
          li + li, li > ul, li > ol {{ margin-top: {between}; }}\n\
          li > ul, li > ol {{ margin-bottom: 0; }}\n\
-         li::marker {{ color: {marker}; }}\n\
          li.task {{ list-style: none; }}\n\
-         li.task > input {{ width: 14px; height: 14px; margin: 0 8px 0 -22px; vertical-align: -2px; \
-         accent-color: {accent}; }}\n\
-         blockquote {{ margin: {after} 0; padding: 0 0 0 16px; border-left: 3px solid {line_strong}; }}\n\
+         li.task > input {{ width: 14px; height: 14px; margin: 0 8px 0 -22px; vertical-align: -2px; }}\n\
+         blockquote {{ margin: {after} 0; padding: 0 0 0 16px; border-left: 3px solid; }}\n\
          .callout {{ margin: {callout_gap} 0; padding: 12px 16px; border-left: 3px solid; border-radius: 6px; }}\n",
         mono = quoted(&code.family),
-        inline_code = color(PAGE.inline_code),
-        code_fill = color(PAGE.code),
         before = pt(body.space_before),
         after = pt(unit),
         between = pt(unit * 0.25),
-        marker = color(PAGE.marker),
-        accent = color(PAGE.accent),
-        line_strong = color(PAGE.line_strong),
         callout_gap = pt(unit * 1.5),
     );
-    for (tone, look) in
-        [(Tone::Tip, PAGE.tip), (Tone::Info, PAGE.info), (Tone::Warn, PAGE.warn), (Tone::Danger, PAGE.danger)]
-    {
-        let (name, accent, fill) = (tone_name(tone), color(look.accent), color(look.fill));
-        let _ = writeln!(css, ".callout.{name} {{ border-color: {accent}; background: {fill}; }}");
-    }
     let _ = write!(
         css,
         "figure {{ margin: {after} 0; }}\n\
@@ -523,19 +570,19 @@ fn css(style: &Style, css: &mut String) {
          img {{ display: block; max-width: 100%; height: auto; }}\n\
          article > :first-child, blockquote > :first-child, .callout > :first-child {{ margin-top: 0; }}\n\
          article > :last-child, blockquote > :last-child, .callout > :last-child {{ margin-bottom: 0; }}\n\
-         hr {{ margin: {rule_gap} 0; border: 0; border-top: 1px solid {line}; }}\n\
-         a {{ color: {link}; }}\n\
-         mark {{ background: {highlight}; color: inherit; }}\n",
+         hr {{ margin: {rule_gap} 0; border: 0; border-top: 1px solid; }}\n\
+         mark {{ color: inherit; }}\n\
+         .tok-comment {{ font-style: italic; }}\n",
         after = pt(unit),
         between = pt(unit * 0.5),
         rule_gap = pt(unit * 2.0),
-        line = color(PAGE.line),
-        link = color(PAGE.link),
-        highlight = color(PAGE.highlight),
     );
-    for kind in TokenKind::ALL {
-        let slant = if kind == TokenKind::Comment { " font-style: italic;" } else { "" };
-        let _ = writeln!(css, ".tok-{} {{ color: {};{slant} }}", kind.as_str(), color(PAGE.syntax.color(ink(kind))));
+    colours(style, &PAGE, css);
+    if let Some(dark) = dark {
+        // Only a screen goes dark: paper is white whatever the reader's theme.
+        css.push_str("@media screen and (prefers-color-scheme: dark) {\n");
+        colours(style, dark, css);
+        css.push_str("}\n");
     }
     // A narrow screen gives the margins back to the text, and paper takes them from the page setup.
     let _ = write!(

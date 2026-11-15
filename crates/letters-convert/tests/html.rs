@@ -1,7 +1,9 @@
 //! HTML export, through its one public function.
 
-use letters_convert::{from_markdown, to_html};
+use letters_convert::{from_markdown, to_html, to_html_themed};
+use letters_layout::{Palette, Scheme};
 use letters_model::{Block, BlockKind, Document, ListKind, Mark, Run, Style};
+use letters_render::Color;
 
 fn document(markdown: &str) -> Document {
     let mut next = 0;
@@ -157,11 +159,11 @@ fn the_style_is_written_as_css() {
         "font-weight: 800;",
         "font-style: italic;",
         "line-height: 1.1;",
-        "color: #aa3300;",
         "text-align: center;",
     ] {
         assert!(heading.contains(declaration), "h1 lacks {declaration:?}: {heading}");
     }
+    assert!(css.contains("h1 { color: #aa3300; }"), "{css}");
     assert!(css.contains("h1 { margin: 24pt 0 6.5pt; }"), "{css}");
     assert!(rule(css, "pre").contains("font-family: \"Fira Code\""), "{css}");
     // The text column is the page less its side margins, and paper takes the page setup.
@@ -173,6 +175,47 @@ fn the_style_is_written_as_css() {
     for selector in ["p, li", "h1", "h2", "h3", "h4", "blockquote p, blockquote li", "pre", "figcaption, .fallback"] {
         assert!(rule(stylesheet(&css), selector).contains("font-size:"), "{selector}");
     }
+}
+
+#[test]
+fn a_themed_page_goes_dark_where_its_reader_does() {
+    let hex = |color: Color| format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b);
+    let dark = Palette {
+        scheme: Scheme::Dark,
+        page: Color::rgb(0x15, 0x17, 0x1a),
+        text: Color::rgb(0xe6, 0xe8, 0xeb),
+        link: Color::rgb(0x6c, 0xb0, 0xff),
+        ..Palette::LIGHT
+    };
+    let mut style = Style::default();
+    style.types.get_mut("heading1").expect("the style has headings").color = "#aa3300".into();
+    let doc = document(include_str!("corpus/report.md"));
+
+    let light = to_html(&doc, &style, "Report", &mut |_| None);
+    let themed = to_html_themed(&doc, &style, "Report", &mut |_| None, &dark);
+    assert!(light.contains("<meta name=\"color-scheme\" content=\"light\">"), "the plain page is light alone");
+    assert!(!light.contains("prefers-color-scheme"), "the plain page is light alone");
+    assert!(themed.contains("<meta name=\"color-scheme\" content=\"light dark\">"));
+    assert_eq!(article(&themed), article(&light), "a theme changes no content");
+
+    let (day, rest) = stylesheet(&themed).split_once("@media screen and (prefers-color-scheme: dark) {\n").unwrap();
+    let night = rest.split_once("\n}\n").expect("the dark rules end").0;
+    assert!(day.contains("h1 { color: #aa3300; }"), "the light page keeps the style's colours: {day}");
+
+    // Nothing stays as it was on white: each rule that colours the light page has one for the dark.
+    let coloured: Vec<&str> = day.lines().filter(|rule| rule.contains(": #")).collect();
+    assert!(coloured.len() > 20, "{coloured:?}");
+    for light in coloured {
+        let selector = light.split_once(" {").expect("a rule has a selector").0;
+        assert!(night.lines().any(|dark| dark.split_once(" {").is_some_and(|rule| rule.0 == selector)), "{selector}");
+    }
+    assert_eq!(rule(night, "html"), " background: #15171a; ");
+    assert_eq!(rule(night, "a"), " color: #6cb0ff; ");
+    // The style's colours turn over as they do on the editor's dark page: ink to the theme's text, hues kept.
+    assert_eq!(rule(night, "p, li"), " color: #e6e8eb; ");
+    let heading = dark.recolor(Color::rgb(0xaa, 0x33, 0x00));
+    assert_eq!(rule(night, "h1"), format!(" color: {}; ", hex(heading)));
+    assert_ne!(hex(heading), "#aa3300");
 }
 
 #[test]
