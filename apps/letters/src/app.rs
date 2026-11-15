@@ -19,7 +19,7 @@ use letters_format::WorkingCopy;
 use letters_frame::Lights;
 use letters_model::{BlockId, Change, Model, Notes, ReplicaId, Revision, Style, TagKind};
 use letters_render::image::Image;
-use letters_render::{Color, DisplayList, Point, Size};
+use letters_render::{Color, DisplayList, Font, Point, Size};
 use letters_spell::Dictionary;
 use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, Origin, Trust};
 // The editor's window is the view here, where `Window` is the system's.
@@ -43,6 +43,7 @@ use crate::cli::{Format, Mode, Options};
 use crate::convert;
 use crate::copies;
 use crate::dictionaries;
+use crate::fallback::Finder;
 use crate::files::{self, EXTENSION, Exchange, Home, Opened, Rest, STYLESHEET, Working};
 use crate::gpu::Gpu;
 use crate::import::{self, Choices, Plan};
@@ -91,6 +92,8 @@ pub enum Event {
     Printed(WindowId, Result<(), String>),
     /// The copy a window asked for was written at this path, or was not.
     Copied(WindowId, PathBuf, Result<Option<String>, copies::Refused>),
+    /// Faces of the system were found for characters a window showed without a glyph.
+    Faces(WindowId, Vec<Font>),
     /// What a window's first paint did not need has been read.
     Read(WindowId),
     /// The search for a GPU has ended, with one or without.
@@ -173,6 +176,10 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         },
         windows: HashMap::new(),
         copies: Vec::new(),
+        fonts: Finder::system({
+            let proxy = event_loop.create_proxy();
+            move |id, faces| drop(proxy.send_event(Event::Faces(id, faces)))
+        }),
         mods: ModifiersState::empty(),
         failure: None,
     };
@@ -326,6 +333,8 @@ struct App {
     windows: HashMap<WindowId, DocWindow>,
     /// The copies being written, which the app waits for before it ends.
     copies: Vec<JoinHandle<()>>,
+    /// Looks among the system's fonts for what the bundled ones cannot draw, once a window shows any.
+    fonts: Finder<WindowId>,
     mods: ModifiersState,
     /// Why the app is exiting, when it is not by choice.
     failure: Option<String>,
@@ -2029,7 +2038,7 @@ impl ApplicationHandler<Event> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let Self { windows, platform, mods, library, .. } = self;
+        let Self { windows, platform, mods, library, fonts, .. } = self;
         let Some(window) = windows.get_mut(&id) else { return };
         window.access.process_event(&window.window, &event);
         let mut action = None;
@@ -2037,6 +2046,12 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::RedrawRequested => {
                 if let Err(error) = window.redraw(platform.now_ms()) {
                     return self.fail(event_loop, format!("the window could not be painted: {error}"));
+                }
+                // What the frame showed as an empty box, the system may have a face for. It is looked
+                // for off this thread, and comes back as an event.
+                let uncovered = window.view.take_uncovered();
+                if !uncovered.is_empty() {
+                    fonts.ask(id, uncovered);
                 }
                 if let Some(mut launch) = self.launch.take() {
                     launch.mark(FIRST_FRAME);
@@ -2290,6 +2305,12 @@ impl ApplicationHandler<Event> for App {
             Event::Linked(id, src, link, fetched) => {
                 self.linked(id, src, link, fetched);
                 if let Some(window) = self.windows.get_mut(&id) {
+                    window.sync(now);
+                }
+            }
+            Event::Faces(id, faces) => {
+                let Some(window) = self.windows.get_mut(&id) else { return };
+                if window.view.add_fallback_fonts(faces) {
                     window.sync(now);
                 }
             }
