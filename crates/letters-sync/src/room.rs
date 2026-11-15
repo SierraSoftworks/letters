@@ -3,12 +3,13 @@
 //! The host owns the sockets, the folders and the clock, and lends them call by call. The times it tells
 //! are milliseconds since 1970. For each open document the host:
 //!
-//! - reads the file into a [`WorkingCopy`] and opens a room over it with [`Room::open`];
+//! - takes the file's stamp, reads the file into a [`WorkingCopy`], opens a room over it with
+//!   [`Room::open`] and hands it the stamp with [`Room::read_as`];
 //! - admits each socket it has checked with [`Room::join`], feeds its frames to [`Room::received`], and
 //!   says when it closed with [`Room::leave`];
 //! - drains [`Room::poll`] after every call, for the frames to send and the sockets to close;
 //! - at [`Room::wake_at`], calls [`Room::tick`] and then [`Room::exchange`];
-//! - drops the room once [`Room::is_idle`].
+//! - drops the room once [`Room::is_idle`], and calls [`Room::stop`] on each room before it stops itself.
 //!
 //! Every change is in the room's journal before it is acknowledged, so a server that stops loses nothing
 //! it said it held. The file is rewritten when the edits pause, the way every writer of a shared folder
@@ -115,6 +116,13 @@ impl Room {
             offered: BTreeMap::new(),
             owed: Vec::new(),
         })
+    }
+
+    /// How the document's file looked just before the host read the copy this room was opened over. The
+    /// room then leaves the file alone until a writer changes it. A host that does not say costs the
+    /// first look a read of the whole file, and nothing else.
+    pub fn read_as(&mut self, stamp: Stamp) {
+        self.stamp = Some(stamp);
     }
 
     /// The document as the room holds it, for the host to render or export.
@@ -271,8 +279,8 @@ impl Room {
         self.flush(folder, state, save, now).map(Some)
     }
 
-    /// Saves now, whatever is due: before the host renders the file, moves it to the trash, or stops.
-    /// Like [`Room::exchange`] in everything else.
+    /// Saves now, whatever is due: before the host renders the file or moves it to the trash. Like
+    /// [`Room::exchange`] in everything else. A host that stops calls [`Room::stop`].
     pub fn flush(
         &mut self,
         folder: &mut impl Files,
@@ -315,6 +323,33 @@ impl Room {
         self.tell_news(&before, state, now)?;
         held?;
         Ok(saved)
+    }
+
+    /// The host is stopping, or drops the room with people in it. Writes to the file whatever it lacks,
+    /// and closes every session once it was sent what the save let the room say. Drain [`Room::poll`]
+    /// afterwards.
+    ///
+    /// `None` when the file lacked nothing, and for a room that waits for [`Room::moved`], whose file
+    /// would only be given another copy. What the file does not hold then stays in the journal, as it
+    /// does when the save fails, and the room that is opened over the file next takes it in.
+    ///
+    /// The devices are told no reason, so each asks again and is back once the server is.
+    pub fn stop(
+        &mut self,
+        folder: &mut impl Files,
+        state: &mut impl Files,
+        save: &Save,
+        now: u64,
+    ) -> Result<Option<Saved>, Error> {
+        let saved = match self.parked || self.unsaved.is_none() {
+            true => Ok(None),
+            false => self.flush(folder, state, save, now).map(Some),
+        };
+        for session in mem::take(&mut self.sessions).into_keys() {
+            self.out.push_back(Outbound::Close(session));
+        }
+        self.owed.clear();
+        saved
     }
 
     /// The document is saved at `home` from now on, in the host's own words: after a move or a rename,

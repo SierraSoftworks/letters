@@ -74,6 +74,19 @@ fn an_edit_the_journal_could_not_take_is_held_once_the_file_has_it() {
 }
 
 #[test]
+fn a_change_reaches_the_others_at_once_and_the_file_in_its_own_time() {
+    let (mut world, ada, ben) = editors();
+    world.edit(ada, [typed("p", 0, "Now. ")]);
+    world.annotate(ben, |notes| notes.notes.push(note("n1", "q", 0..6, "Ben", "Now too?")));
+    // No time passes: nothing here waits for a save.
+    world.settle();
+    assert_eq!(texts(world.devices[ben].document())[0], "Now. Hello world");
+    assert!(find(&world.devices[ada].notes, "n1").is_some());
+    assert_eq!(on_disk(&world), texts(&doc()), "the file waits for the edits to pause");
+    assert!(world.saves.is_empty());
+}
+
+#[test]
 fn the_file_is_written_once_the_edits_pause() {
     let (mut world, ada, _) = editors();
     world.edit(ada, [typed("p", 0, "One. ")]);
@@ -123,6 +136,15 @@ fn what_another_writer_puts_in_the_file_reaches_every_session() {
     }
     assert!(copies(&world).is_empty());
     assert_eq!(written(&world), 0, "the room had nothing of its own to write");
+}
+
+#[test]
+fn a_file_nobody_changed_is_left_unread_while_the_document_is_open() {
+    let (mut world, ..) = editors();
+    let before = world.folder.reads;
+    world.advance(10 * LOOK_EVERY);
+    assert_eq!(world.folder.reads, before, "the room read a file that was as it had been opened");
+    assert!(world.saves.is_empty());
 }
 
 #[test]
@@ -248,6 +270,54 @@ fn edits_made_after_a_conflict_copy_survive_a_stop() {
 
     world.stop_server();
     world.cut(ada);
+    world.folder.locked = None;
+    world.open_room().unwrap();
+    world.advance(SAVE_WITHIN);
+    assert_eq!(on_disk(&world)[0], "Two. One. Hello world");
+}
+
+#[test]
+fn a_server_that_stops_writes_the_file_and_its_devices_find_it_again() {
+    let (mut world, ada, ben) = editors();
+    let number = world.edit(ada, [typed("p", 0, "Kept. ")]);
+    world.settle();
+
+    assert!(matches!(world.shut_down(), Ok(Some(Saved::Written))));
+    assert_eq!(on_disk(&world)[0], "Kept. Hello world");
+    assert!(world.devices[ada].holds(number));
+    for device in [ada, ben] {
+        assert_eq!(world.devices[device].client.link(), Link::Offline, "{}", world.devices[device].name);
+    }
+
+    // What is written while the server is away comes along once it is back.
+    world.edit(ben, [typed("q", 0, "Later. ")]);
+    world.open_room().unwrap();
+    world.advance(SAVE_WITHIN);
+    assert_eq!(texts(world.held()), ["Kept. Hello world", "Later. Second"]);
+    assert_eq!(on_disk(&world), texts(world.held()));
+    for device in [ada, ben] {
+        assert_eq!(world.devices[device].client.link(), Link::Live(Role::Editor));
+        assert_eq!(texts(world.devices[device].document()), texts(world.held()));
+    }
+}
+
+#[test]
+fn a_stop_leaves_alone_a_file_that_lacks_nothing_and_one_that_refuses() {
+    // Nothing was written here, so the file is not so much as read.
+    let (mut world, ..) = editors();
+    let reads = world.folder.reads;
+    assert!(matches!(world.shut_down(), Ok(None)));
+    assert_eq!(world.folder.reads, reads);
+
+    // A file that got a conflict copy gets no second one. The journal keeps what the file lacks.
+    let (mut world, ada, _) = editors();
+    world.folder.locked = Some(NAME.into());
+    world.edit(ada, [typed("p", 0, "One. ")]);
+    world.advance(SAVE_AFTER);
+    world.edit(ada, [typed("p", 0, "Two. ")]);
+    world.settle();
+    assert!(matches!(world.shut_down(), Ok(None)));
+    assert_eq!(copies(&world).len(), 1);
     world.folder.locked = None;
     world.open_room().unwrap();
     world.advance(SAVE_WITHIN);
