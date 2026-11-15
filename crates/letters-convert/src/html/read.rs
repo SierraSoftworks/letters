@@ -180,8 +180,8 @@ impl Element {
 
     /// The TeX source of the maths this element stands for, and whether it is set on a line of its own. The
     /// source is found where pages carry it: annotated on MathML, as KaTeX and Wikipedia write it, in the
-    /// script MathJax leaves, or between delimiters in an element of the class `math`, as Pandoc and
-    /// `to_html` write it.
+    /// script MathJax leaves, or on an element of the class `math`: between delimiters as Pandoc writes it, or
+    /// in `data-tex` as `to_html` does.
     fn maths(&self) -> Option<(String, bool)> {
         let text = |element: &Element| {
             let mut text = String::new();
@@ -204,6 +204,10 @@ impl Element {
             // Wikipedia shows a picture of the maths, described by its source.
             "img" if class.starts_with("mwe-math-fallback-image") => {
                 Some((self.attribute("alt").to_owned(), class.ends_with("display")))
+            }
+            // A page of `to_html` shows a drawing of the maths, and keeps the source beside it.
+            _ if self.classes().any(|class| class == "math") && !self.attribute("data-tex").is_empty() => {
+                Some((self.attribute("data-tex").to_owned(), self.classes().any(|class| class == "display")))
             }
             _ if self.classes().any(|class| class == "math") => {
                 let source = text(self);

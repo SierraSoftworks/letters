@@ -12,7 +12,7 @@ pub use read::from_html;
 
 use letters_layout::{Palette, TokenKind as Ink};
 use letters_model::{Align, Block, BlockKind, Document, ListKind, Mark, Run, Style, TextStyle, Tone};
-use letters_render::Color;
+use letters_render::{Color, Size};
 use yewi_highlight::{TokenKind, tokenize};
 
 /// Exports are drawn on the light page, whatever theme the editor is in. One page can add a dark theme to it.
@@ -28,6 +28,12 @@ const MARKS: [(Mark, &str); 6] = [
     (Mark::Code, "code"),
 ];
 
+/// The colour maths is typeset in. The drawing leaves it to the text around it, so that a theme reaches it.
+const INK: Color = PAGE.text;
+
+/// Logical pixels in a point: 96 to the inch against 72.
+const PIXELS: f32 = 96.0 / 72.0;
+
 /// Reads an entry of the document's file by name, such as `assets/<hash>.png`. `None` when the file lacks it.
 pub type Assets<'a> = &'a mut dyn FnMut(&str) -> Option<Vec<u8>>;
 
@@ -38,8 +44,9 @@ pub type Assets<'a> = &'a mut dyn FnMut(&str) -> Option<Vec<u8>>;
 /// - An image held by the file is written in as a `data:` address. One that is still remote becomes a link
 ///   to it, so that opening the page fetches nothing.
 /// - A link that would run script is written as its text alone.
-/// - Maths is written as its TeX source between `\(` and `\)`, or `\[` and `\]` for a formula, in an element
-///   of the class `math`. Nothing in the file sets it, since nothing in the file runs.
+/// - Maths is set and written in as a drawing, in the colour of the text around it. Its TeX source is kept on
+///   the element, of the class `math`, where [`from_html`] reads it back. Maths that cannot be set is
+///   written as its source.
 /// - An unknown block is written as its fallback text. Unknown marks and fields are left out.
 pub fn to_html(doc: &Document, style: &Style, title: &str, assets: Assets) -> String {
     page(doc, style, title, assets, None)
@@ -71,17 +78,39 @@ fn page(doc: &Document, style: &Style, title: &str, assets: Assets, dark: Option
     out.push_str("</title>\n<style>\n");
     css(style, dark, &mut out);
     out.push_str("</style>\n</head>\n<body>\n<article>\n");
-    blocks(&doc.blocks, assets, &mut out);
+    let size = |key: &str| {
+        let points = style.types.get(key).or_else(|| style.types.get("body")).map_or(0.0, |of| of.size);
+        if points.is_finite() && points > 0.0 { points * PIXELS } else { TextStyle::default().size * PIXELS }
+    };
+    let sizes = [size("body"), size("heading1"), size("heading2"), size("heading3"), size("heading4")];
+    blocks(&doc.blocks, &mut Page { assets, maths: Some(sizes) }, &mut out);
     out.push_str("</article>\n</body>\n</html>\n");
     out
 }
 
 /// Writes `blocks` as the elements a page's body would hold, with no page around them: what a copy offers to
-/// other applications. Nothing is styled, and no image is written in.
+/// other applications. Nothing is styled, and no image is written in. Maths is written as its TeX source
+/// between `\(` and `\)`, or `\[` and `\]` for a formula, for whatever takes the paste to set.
 pub fn to_html_fragment(blocks: &[Block]) -> String {
     let mut out = String::new();
-    self::blocks(blocks, &mut |_| None, &mut out);
+    self::blocks(blocks, &mut Page { assets: &mut |_| None, maths: None }, &mut out);
     out
+}
+
+/// What blocks are written for.
+struct Page<'a> {
+    assets: Assets<'a>,
+    /// On a page that draws its maths, the size of its text in logical pixels: the body's, then each level
+    /// of heading's. Maths is typeset at the size it is shown, so that its hairlines come out as thin as
+    /// they should. `None` writes maths as its source.
+    maths: Option<[f32; 5]>,
+}
+
+impl Page<'_> {
+    /// The size maths is typeset at in a heading of `level`, or in other text for level 0.
+    fn text(&self, level: u8) -> Option<f32> {
+        self.maths.map(|sizes| sizes[usize::from(level.min(4))])
+    }
 }
 
 /// Writes text so that HTML reads it as text, between tags or inside a quoted attribute.
@@ -98,43 +127,43 @@ fn escape(text: &str, out: &mut String) {
 }
 
 /// Writes sibling blocks, one to a line. Consecutive list items become nested lists.
-fn blocks(blocks: &[Block], assets: Assets, out: &mut String) {
+fn blocks(blocks: &[Block], page: &mut Page, out: &mut String) {
     // The lists that are open, outermost first, each with its latest item still open.
     let mut lists: Vec<&str> = Vec::new();
     for block in blocks {
         if let BlockKind::ListItem { list, depth } = block.kind {
-            item(&mut lists, list, depth, block.body.runs(), out);
+            item(&mut lists, list, depth, block.body.runs(), page.text(0), out);
             continue;
         }
         close(&mut lists, 0, out);
         match &block.kind {
-            BlockKind::Paragraph => element("p", block.body.runs(), out),
-            BlockKind::Heading { level } => element(&format!("h{}", (*level).clamp(1, 4)), block.body.runs(), out),
-            BlockKind::Code { language } => code(language.as_deref(), &block.plain_text(), out),
-            // Maths goes out as its source between the delimiters MathJax and Pandoc use, for a page or a paste
-            // that can set it.
-            BlockKind::Formula => {
-                out.push_str("<p class=\"math display\">\\[");
-                escape(&block.plain_text(), out);
-                out.push_str("\\]</p>\n");
+            BlockKind::Paragraph => element("p", block.body.runs(), page.text(0), out),
+            BlockKind::Heading { level } => {
+                let level = (*level).clamp(1, 4);
+                element(&format!("h{level}"), block.body.runs(), page.text(level), out);
             }
-            BlockKind::Quote => container("<blockquote>", "</blockquote>", block.body.blocks(), assets, out),
+            BlockKind::Code { language } => code(language.as_deref(), &block.plain_text(), out),
+            BlockKind::Formula => {
+                maths(&block.plain_text(), true, page.text(0), out);
+                out.push('\n');
+            }
+            BlockKind::Quote => container("<blockquote>", "</blockquote>", block.body.blocks(), page, out),
             BlockKind::Callout { tone } => {
                 let open = format!("<div class=\"callout {}\" role=\"note\">", tone_name(*tone));
-                container(&open, "</div>", block.body.blocks(), assets, out);
+                container(&open, "</div>", block.body.blocks(), page, out);
             }
             BlockKind::Divider => out.push_str("<hr>\n"),
             BlockKind::Figure { asset, src, alt, width, height, .. } => {
                 let image =
                     Figure { asset: asset.as_deref(), src: src.as_deref(), alt, width: *width, height: *height };
-                figure(&image, block.body.runs(), assets, out);
+                figure(&image, block.body.runs(), page, out);
             }
-            BlockKind::Table { columns, header } => table(columns, *header, block.body.blocks(), assets, out),
+            BlockKind::Table { columns, header } => table(columns, *header, block.body.blocks(), page, out),
             // A merge can leave a row outside a table and a cell outside a row.
-            BlockKind::TableRow => table(&[], false, std::slice::from_ref(block), assets, out),
+            BlockKind::TableRow => table(&[], false, std::slice::from_ref(block), page, out),
             // Until galleries are written as such, what they hold is written in order.
-            BlockKind::Caption | BlockKind::TableCell => element("p", block.body.runs(), out),
-            BlockKind::Gallery { .. } => self::blocks(block.body.blocks(), assets, out),
+            BlockKind::Caption | BlockKind::TableCell => element("p", block.body.runs(), page.text(0), out),
+            BlockKind::Gallery { .. } => self::blocks(block.body.blocks(), page, out),
             // A reader that does not build figures yet hands one over as an unknown block, its fields beside it.
             BlockKind::Unknown { type_name } if type_name == "figure" => {
                 let field = |name: &str| block.extra.get(name);
@@ -148,7 +177,7 @@ fn blocks(blocks: &[Block], assets: Assets, out: &mut String) {
                     width: size("width"),
                     height: size("height"),
                 };
-                figure(&image, &caption.unwrap_or_default(), assets, out);
+                figure(&image, &caption.unwrap_or_default(), page, out);
             }
             BlockKind::Unknown { .. } => {
                 let fallback = block.extra.get("fallback").and_then(|fallback| fallback.as_str()).unwrap_or_default();
@@ -175,20 +204,20 @@ fn tone_name(tone: Tone) -> &'static str {
 }
 
 /// Writes a text block. One with no text keeps its line, as it does on the page.
-fn element(tag: &str, runs: &[Run], out: &mut String) {
+fn element(tag: &str, runs: &[Run], maths: Option<f32>, out: &mut String) {
     let _ = write!(out, "<{tag}>");
     if runs.iter().all(|run| run.text.is_empty()) {
         out.push_str("<br>");
     } else {
-        inline(runs, out);
+        inline(runs, maths, out);
     }
     let _ = writeln!(out, "</{tag}>");
 }
 
-fn container(open: &str, end: &str, children: &[Block], assets: Assets, out: &mut String) {
+fn container(open: &str, end: &str, children: &[Block], page: &mut Page, out: &mut String) {
     let _ = writeln!(out, "{open}");
     let start = out.len();
-    blocks(children, assets, out);
+    blocks(children, page, out);
     if out.len() == start {
         out.push_str("<p><br></p>\n");
     }
@@ -197,7 +226,7 @@ fn container(open: &str, end: &str, children: &[Block], assets: Assets, out: &mu
 
 /// Writes a table, its first row in a head where that row heads it. A cell says how its column is aligned
 /// where that is not to the start. What the table holds that is not a row is written after it.
-fn table(columns: &[Align], header: bool, children: &[Block], assets: Assets, out: &mut String) {
+fn table(columns: &[Align], header: bool, children: &[Block], page: &mut Page, out: &mut String) {
     let is_row = |child: &&Block| child.kind == BlockKind::TableRow;
     let rows: Vec<&Block> = children.iter().filter(is_row).collect();
     if !rows.is_empty() {
@@ -218,7 +247,7 @@ fn table(columns: &[Align], header: bool, children: &[Block], assets: Assets, ou
                         Some(Align::Start) | None => "",
                     };
                     let _ = write!(out, "<{cell}{align}>");
-                    inline(block.body.runs(), out);
+                    inline(block.body.runs(), page.text(0), out);
                     let _ = write!(out, "</{cell}>");
                 }
                 out.push_str("</tr>\n");
@@ -228,7 +257,7 @@ fn table(columns: &[Align], header: bool, children: &[Block], assets: Assets, ou
         out.push_str("</table>\n");
     }
     for other in children.iter().filter(|child| !is_row(child)) {
-        blocks(std::slice::from_ref(other), assets, out);
+        blocks(std::slice::from_ref(other), page, out);
     }
 }
 
@@ -241,7 +270,7 @@ fn close(lists: &mut Vec<&str>, keep: usize, out: &mut String) {
 }
 
 /// Writes a list item, opening and closing lists around it to reach its depth.
-fn item(lists: &mut Vec<&'static str>, list: ListKind, depth: u8, runs: &[Run], out: &mut String) {
+fn item(lists: &mut Vec<&'static str>, list: ListKind, depth: u8, runs: &[Run], maths: Option<f32>, out: &mut String) {
     let tag = if list == ListKind::Ordered { "ol" } else { "ul" };
     // An item nests inside the one before it, so it can sit at most one level deeper.
     let depth = usize::from(depth).min(lists.len());
@@ -264,7 +293,7 @@ fn item(lists: &mut Vec<&'static str>, list: ListKind, depth: u8, runs: &[Run], 
         ListKind::Task { checked: false } => "<li class=\"task\"><input type=\"checkbox\" disabled>",
         ListKind::Bullet | ListKind::Ordered => "<li>",
     });
-    inline(runs, out);
+    inline(runs, maths, out);
 }
 
 /// Writes a code block, with a span around each token the highlighter colours.
@@ -305,10 +334,10 @@ struct Figure<'a> {
 ///
 /// An image the file holds is written into the page. One that is still remote is not: the page must fetch
 /// nothing, so it becomes a link. One that cannot be found leaves its description in its place.
-fn figure(image: &Figure, caption: &[Run], assets: Assets, out: &mut String) {
+fn figure(image: &Figure, caption: &[Run], page: &mut Page, out: &mut String) {
     out.push_str("<figure>\n");
     let held = image.asset.and_then(|name| {
-        let bytes = assets(name)?;
+        let bytes = (page.assets)(name)?;
         Some((media_type(name, &bytes)?, bytes))
     });
     let remote = image.src.and_then(href);
@@ -316,7 +345,7 @@ fn figure(image: &Figure, caption: &[Run], assets: Assets, out: &mut String) {
         let _ = write!(out, "<img src=\"data:{media};base64,{}\" alt=\"", base64(&bytes));
         escape(image.alt, out);
         // In CSS pixels, so the page keeps the image's place while it decodes.
-        let pixels = |points: f32| (points * 96.0 / 72.0).round().max(1.0);
+        let pixels = |points: f32| (points * PIXELS).round().max(1.0);
         let _ = writeln!(out, "\" width=\"{}\" height=\"{}\">", pixels(image.width), pixels(image.height));
     } else if let Some(address) = remote {
         out.push_str("<p><a href=\"");
@@ -331,7 +360,7 @@ fn figure(image: &Figure, caption: &[Run], assets: Assets, out: &mut String) {
     }
     if caption.iter().any(|run| !run.text.is_empty()) {
         out.push_str("<figcaption>");
-        inline(caption, out);
+        inline(caption, page.text(0), out);
         out.push_str("</figcaption>\n");
     }
     out.push_str("</figure>\n");
@@ -363,8 +392,48 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// Writes maths: a drawing of it on a page that sets maths at `text`, and elsewhere its source between the
+/// delimiters MathJax and Pandoc use.
+///
+/// The drawing is sized in em, so it follows the text it sits in, and stands on that text's baseline. The
+/// source is kept beside it twice over: for `from_html`, and as what a screen reader says.
+fn maths(tex: &str, display: bool, text: Option<f32>, out: &mut String) {
+    let (tag, class, open, close) =
+        if display { ("p", "display", r"\[", r"\]") } else { ("span", "inline", r"\(", r"\)") };
+    let set = text.and_then(|text| {
+        let style = letters_math::Style { size: text * letters_math::TEXT_RATIO, color: INK, display, links: false };
+        let formula = letters_math::typeset(tex, &style).ok()?;
+        (formula.size.width > 0.0 && formula.size.height > 0.0).then_some((formula, text))
+    });
+    let _ = write!(out, "<{tag} class=\"math {class}\"");
+    if let Some((formula, text)) = set {
+        let Size { width, height } = formula.size;
+        let em = |pixels: f32| (pixels / text * 1000.0).round() / 1000.0;
+        out.push_str(" data-tex=\"");
+        escape(tex, out);
+        let _ = write!(
+            out,
+            "\"><svg viewBox=\"0 0 {width} {height}\" width=\"{}em\" height=\"{}em\" overflow=\"visible\" \
+             style=\"vertical-align: {}em\" role=\"img\" aria-label=\"",
+            em(width),
+            em(height),
+            em(formula.baseline - height),
+        );
+        escape(tex, out);
+        out.push_str("\">");
+        out.push_str(&formula.svg(INK));
+        out.push_str("</svg>");
+    } else {
+        out.push('>');
+        out.push_str(open);
+        escape(tex, out);
+        out.push_str(close);
+    }
+    let _ = write!(out, "</{tag}>");
+}
+
 /// Writes a block's runs. Neighbouring runs of one link share its anchor.
-fn inline(runs: &[Run], out: &mut String) {
+fn inline(runs: &[Run], maths: Option<f32>, out: &mut String) {
     let mut rest = runs;
     while let Some(first) = rest.first() {
         let (linked, after) = rest.split_at(rest.iter().take_while(|run| run.link == first.link).count());
@@ -378,9 +447,7 @@ fn inline(runs: &[Run], out: &mut String) {
             let tags = || MARKS.iter().filter(|(mark, _)| run.marks.contains(mark)).map(|(_, tag)| *tag);
             tags().for_each(|tag| _ = write!(out, "<{tag}>"));
             if run.marks.contains(&Mark::Math) {
-                out.push_str("<span class=\"math inline\">\\(");
-                escape(&run.text, out);
-                out.push_str("\\)</span>");
+                self::maths(&run.text, false, maths, out);
             } else {
                 text(&run.text, out);
             }
@@ -611,6 +678,7 @@ fn css(style: &Style, dark: Option<&Palette>, css: &mut String) {
          figure > * {{ margin: 0; }}\n\
          figure > figcaption {{ margin-top: {between}; }}\n\
          img {{ display: block; max-width: 100%; height: auto; }}\n\
+         .math.display > svg {{ display: block; margin: 0 auto; max-width: 100%; height: auto; }}\n\
          article > :first-child, blockquote > :first-child, .callout > :first-child {{ margin-top: 0; }}\n\
          article > :last-child, blockquote > :last-child, .callout > :last-child {{ margin-bottom: 0; }}\n\
          hr {{ margin: {rule_gap} 0; border: 0; border-top: 1px solid; }}\n\
