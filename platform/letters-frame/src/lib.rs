@@ -7,11 +7,21 @@
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod print;
 #[cfg_attr(not(all(unix, not(target_os = "macos"))), path = "no_wayland.rs")]
 pub mod wayland;
 
 #[cfg(target_os = "macos")]
 pub use macos::unify_title_bar;
+#[cfg(target_os = "macos")]
+pub use print::print_pdf;
+
+/// Only macOS has the print sheet this asks for. Nothing is shown, and `false` says so.
+#[cfg(not(target_os = "macos"))]
+pub fn print_pdf(_window: &impl raw_window_handle::HasWindowHandle, _pdf: &[u8], _title: &str) -> bool {
+    false
+}
 
 /// Only macOS has the title bar this asks for. Nothing changes, and `None` says so.
 #[cfg(not(target_os = "macos"))]

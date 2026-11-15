@@ -38,7 +38,8 @@ use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowAttributes, WindowId};
 
 use crate::chrome::{self, Buttons, Host};
-use crate::cli::{Mode, Options};
+use crate::cli::{Format, Mode, Options};
+use crate::convert;
 use crate::copies;
 use crate::dictionaries;
 use crate::files::{self, EXTENSION, Exchange, Home, Opened, Rest, STYLESHEET, Working};
@@ -52,6 +53,7 @@ use crate::measure::{FIRST_FRAME, Launch, Typing};
 use crate::pictures::{self, Decoder, Source};
 use crate::platform::{self, Desktop};
 use crate::present::{Painter, Presenter};
+use crate::printing;
 use crate::remote::{self, Roots};
 use crate::settings;
 use crate::trust::{self, Trusted};
@@ -81,6 +83,10 @@ pub enum Event {
     Access(accesskit_winit::Event),
     /// A window's save has finished, and its result is ready to collect.
     Saved(WindowId),
+    /// A window's document was written as a PDF to print, or could not be.
+    Pdf(WindowId, Result<Vec<u8>, String>),
+    /// The print dialog a window asked for was shown and is done with, or could not be shown.
+    Printed(WindowId, Result<(), String>),
     /// The copy a window asked for was written at this path, or was not.
     Copied(WindowId, PathBuf, Result<Option<String>, copies::Refused>),
     /// What a window's first paint did not need has been read.
@@ -420,6 +426,8 @@ struct DocWindow {
     plan: Option<Box<Plan>>,
     /// Files let go over the window since it was last looked at. They come one at a time.
     dropped: Vec<PathBuf>,
+    /// Whether the document is on its way to the print dialog, or the dialog is up.
+    printing: bool,
     /// Pictures the page asked for whose files were not to be had while a read or a save was under way.
     awaited: Vec<String>,
     /// Linked pictures that were asked for before the file said which document this is, which decides
@@ -1270,6 +1278,7 @@ impl App {
             assets: BTreeMap::new(),
             plan: None,
             dropped: Vec::new(),
+            printing: false,
             awaited: Vec::new(),
             links: Vec::new(),
             linked: BTreeMap::new(),
@@ -1419,6 +1428,7 @@ impl App {
                         window.plan = None;
                     }
                 }
+                Request::Print => self.print(id),
                 // A request this shell does not know yet.
                 _ => {}
             }
@@ -1503,6 +1513,34 @@ impl App {
             let _ = proxy.send_event(Event::Copied(id, output, written));
         }));
         Ok(())
+    }
+
+    /// Starts printing a window's document: its file is written as a PDF on another thread, as an export
+    /// is, and the PDF goes to the system's print dialog when it arrives.
+    fn print(&mut self, id: WindowId) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        // One dialog at a time: a second Print while the first is on its way is the same wish.
+        if window.printing {
+            return;
+        }
+        // The file is brought up to date first, as for a copy.
+        let saved = [true, false].into_iter().try_for_each(|caret| match window.file().is_none() || window.unsaved() {
+            true => window.save_now(caret, &self.library, &mut self.journals),
+            false => Ok(()),
+        });
+        let source = match (saved, window.file()) {
+            (Err(error), _) => return window.alert(&error),
+            (Ok(()), None) => return window.alert("There is nothing to print yet."),
+            (Ok(()), Some(file)) => file.to_owned(),
+        };
+        window.printing = true;
+        let (proxy, title) = (self.proxy.clone(), window.name());
+        self.copies.retain(|copy| !copy.is_finished());
+        self.copies.push(thread::spawn(move || {
+            let file = fs::read(&source).map_err(|error| error.to_string());
+            let pdf = file.and_then(|file| convert::exported(file, &title, Format::Pdf)).map(|pdf| pdf.bytes);
+            let _ = proxy.send_event(Event::Pdf(id, pdf));
+        }));
     }
 
     /// Has a window rename or move its document. Returns whether it was done.
@@ -2124,6 +2162,22 @@ impl ApplicationHandler<Event> for App {
                 }
             }
             Event::Planned(id, path, plan) => self.offer(id, &path, plan),
+            Event::Pdf(id, pdf) => {
+                let Some(window) = self.windows.get(&id) else { return };
+                let proxy = self.proxy.clone();
+                let done = move |shown| drop(proxy.send_event(Event::Printed(id, shown)));
+                match pdf {
+                    Ok(pdf) => printing::print(pdf, window.name(), &window.window, done),
+                    Err(error) => done(Err(error)),
+                }
+            }
+            Event::Printed(id, shown) => {
+                let Some(window) = self.windows.get_mut(&id) else { return };
+                window.printing = false;
+                if let Err(error) = shown {
+                    window.alert(&format!("{} could not be printed.\n\n{error}", window.name()));
+                }
+            }
             Event::Imported(id, kept) => self.imported(event_loop, id, kept),
             Event::Account(name) => {
                 self.account = Some(name);

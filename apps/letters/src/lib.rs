@@ -29,6 +29,7 @@ pub mod measure;
 pub mod pictures;
 pub mod platform;
 pub mod present;
+pub mod printing;
 pub mod remote;
 pub mod settings;
 pub mod shadow;
