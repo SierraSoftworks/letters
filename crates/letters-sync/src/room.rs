@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::mem;
 
 use letters_format::{ASSETS, Error, Files, Journal, Save, Saved, Stamp, WorkingCopy, hash};
-use letters_model::{Extent, Notes, Revision, Style};
+use letters_model::{Extent, Model, Notes, Revision, Style};
 
 use crate::access::{Access, Refusal, Role, comments};
 use crate::presence::{Passage, Peer};
@@ -468,6 +468,11 @@ impl Room {
         state: &mut impl Files,
         now: u64,
     ) -> Result<bool, Error> {
+        // A device's bytes are read apart from the document first: a panic of the history library as it
+        // reads them would leave the document unusable for everyone.
+        if Model::check(updates).is_err() {
+            return Ok(self.to(session, &ServerMessage::Refused { seq, why: Refusal::Unreadable }));
+        }
         let before = (self.copy.model().extent(), self.copy.model().revision());
         let read = self.copy.edit(updates).is_ok();
         // Edits that build on others the room never saw wait outside the document, and are not held.

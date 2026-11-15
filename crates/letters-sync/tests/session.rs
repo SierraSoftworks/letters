@@ -608,6 +608,29 @@ fn a_frame_a_device_cannot_read_costs_it_the_socket_and_nothing_else() {
     assert_eq!(texts(world.devices[ada].document())[0], "Mine. Hello world");
 }
 
+/// The update of issue 2: its checksum is sound, and the history library's debug assertions panic on it.
+const TRIPS: &[u8] = include_bytes!("../../../fuzz/corpus/history/bytes-after-a-block-header.bin");
+
+#[test]
+fn an_update_the_history_library_trips_on_is_refused_and_the_room_goes_on() {
+    let (mut world, ada, ben) = editors();
+    let before = world.state.files.clone();
+    world.forge(ben, &ClientMessage::Edits { seq: 5, updates: TRIPS.to_vec() }.encode());
+    world.settle();
+
+    let refused = ServerMessage::Refused { seq: 5, why: Refusal::Unreadable };
+    assert!(world.told.iter().any(|(_, message)| *message == refused), "{:?}", world.told.last());
+    assert_eq!(world.state.files, before, "nothing of it is kept");
+    assert_eq!(texts(world.held()), texts(&doc()));
+
+    // The document goes on, for the device that sent it too once it is back.
+    world.advance(5_000);
+    let number = world.edit(ada, [typed("p", 0, "After. ")]);
+    world.settle();
+    assert!(world.devices[ada].holds(number));
+    assert_eq!(texts(world.devices[ben].document())[0], "After. Hello world");
+}
+
 #[test]
 fn edits_that_build_on_some_the_room_never_saw_are_not_held() {
     let (mut world, ada, ben) = editors();
