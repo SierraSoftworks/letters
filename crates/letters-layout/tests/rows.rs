@@ -124,6 +124,27 @@ fn a_picture_still_a_link_shows_where_it_comes_from() {
 }
 
 #[test]
+fn the_linked_pictures_in_view_are_listed_with_their_clouds() {
+    let link = |id: &str| remote(figure(id, (300.0, 200.0), ""), &format!("https://example.org/{id}.png"));
+    let lines = (0..40).map(|line| paragraph(&format!("p{line}"), PROSE));
+    let top = [
+        figure("held", (300.0, 200.0), ""),
+        link("f"),
+        gallery("g", vec![figure("g0", (300.0, 200.0), ""), link("g1")], None),
+    ];
+    let small = remote(figure("small", (12.0, 12.0), ""), "https://example.org/small.png");
+    let layout = laid(&doc(top.into_iter().chain([small]).chain(lines).chain([link("far")]).collect()));
+    let ids = |viewport: Rect| layout.linked(viewport).into_iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>();
+    assert_eq!(ids(everything()), ["f", "g1", "far"], "links alone, and those with room for a cloud");
+    for (id, cloud) in layout.linked(everything()) {
+        assert_eq!(Some(cloud), layout.figure(&id).unwrap().badge, "{id}: where its figure has its cloud");
+    }
+    let far = layout.figure(&"far".into()).unwrap().image;
+    assert_eq!(ids(Rect::new(0.0, 0.0, WIDTH, far.y - 100.0)), ["f", "g1"], "what is out of view is left out");
+    assert_eq!(ids(Rect::new(0.0, far.y, WIDTH, 100.0)), ["far"]);
+}
+
+#[test]
 fn a_linked_picture_is_drawn_once_it_is_loaded() {
     let src = "https://images.example.org/harbour/office.png";
     let linked = || remote(figure("f", (300.0, 200.0), "The harbour"), src);

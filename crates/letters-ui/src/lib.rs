@@ -51,6 +51,7 @@ pub use element::{Cursor, Element, Fitted, Paint, Pointer};
 pub use icon::Icon;
 pub use importing::{ImportFolder, ImportKind, ImportOffer};
 pub use opening::{Folder, Landing, Location, Recent, Request};
+pub use pictures::PictureState;
 pub use restyle::StyleEdit;
 pub use settings::{Appearance, Settings};
 pub use style::{Align, Dir, Edges, Justify, Look, Ring, Style};

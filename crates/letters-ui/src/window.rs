@@ -36,7 +36,7 @@ use crate::maths::{self, Maths, Sheet, SheetLines, Source};
 use crate::motion::{self, FRAME_MS};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
-use crate::pictures::{self, Linked, Linking};
+use crate::pictures::{self, Linked, Linking, PictureState};
 use crate::refer::{Picking, Refer};
 use crate::references::{self, Preview, Reference, References};
 use crate::renaming::{Outcome, Rename, Renaming};
@@ -416,8 +416,22 @@ impl Ui<EditorApp> {
         // A linked picture is drawn once it is here, at its own shape. For any other name this says nothing.
         app.layout.set_loaded(asset, image.as_ref().map(|image| (image.width(), image.height())));
         match image {
-            Some(image) => app.images.insert(asset, image),
+            Some(image) => {
+                app.images.insert(asset, image);
+                // A picture that shows has nothing more said of it.
+                app.linked.say(asset, None);
+            }
             None => _ = app.images.remove(asset),
+        }
+    }
+
+    /// Says how a linked picture that does not show is doing, by the address its link is written as: it is
+    /// being fetched, the fetch failed for a short reason, or safe mode holds it back. Its cloud tells the
+    /// person, and offers another try at one that failed with a [`Request::LoadPicture`]. Say it again as
+    /// it changes. `None` says no more of it, as handing the picture to [`Window::set_image`] does.
+    pub fn set_picture_state(&mut self, src: &str, state: Option<PictureState>) {
+        if self.app().linked.said(src) != state.as_ref() {
+            self.app_mut().linked.say(src, state);
         }
     }
 
@@ -1692,11 +1706,13 @@ impl EditorApp {
         if let Some((_, image)) = carried {
             list.items.push(fill(image, Color { a: 178, ..self.palette.page }));
         }
-        // A picture that is still a link has its cloud on a chip while it is selected or under the pointer.
-        for (figure, lit) in self.linked.clouds(self.editor.picture()) {
-            let badge = self.layout.figure(figure).and_then(|place| place.badge);
-            if let Some(badge) = badge.filter(|_| self.link_of(figure).is_some()) {
-                pictures::cloud(badge, lit, self.accent.text, self.scheme, &mut list);
+        // A picture that is still a link has its cloud on a chip while it is selected or under the pointer,
+        // and while the shell has something to say of it.
+        for (figure, badge) in self.layout.linked(viewport) {
+            let Some(src) = self.link_of(&figure) else { continue };
+            let (shows, state) = (self.linked.shows(&figure, self.editor.picture()), self.linked.said(src));
+            if shows.is_some() || state.is_some() {
+                pictures::cloud(badge, shows == Some(true), state, self.accent.text, self.scheme, &mut list);
             }
         }
         // The figure a reference under the pointer means, or the one the page was just brought to.
@@ -1751,7 +1767,8 @@ impl EditorApp {
                 place.badge.map_or(corner, pictures::chip)
             });
             let spot = Rect { x: origin.x + from.x, y: origin.y + from.y, ..from };
-            let menu = pictures::menu(src, self.images.get(src).is_some()).popover().at(spot).align(Align::End);
+            let menu = pictures::menu(src, self.images.get(src).is_some(), self.linked.said(src));
+            let menu = menu.popover().at(spot).align(Align::End);
             element = element.popover(menu.open(true).on_close(Message::Linked(Linking::Close)));
         } else if let Some(((_, text), (_, line, switch))) = self.captions.alt.as_ref().zip(self.alt_switch()) {
             let onto = |rect: Rect| Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect };

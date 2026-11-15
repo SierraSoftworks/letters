@@ -23,6 +23,8 @@ pub const CLOUD: Icon = Icon::new("M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 
 pub const CLOUD_ALERT: Icon = Icon::new("M12 12v4M12 20h.01M8.128 16.949A7 7 0 1 1 15.71 8h1.79a1 1 0 0 1 0 9h-1.642");
 /// `cloud-check`
 pub const CLOUD_CHECK: Icon = Icon::new("M17 15l-5.5 5.5L9 18M5.516 16.07A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 3.501 7.327");
+/// `cloud-download`
+pub const CLOUD_DOWNLOAD: Icon = Icon::new("M12 13v8l-4-4M12 21l4-4M4.393 15.269A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.436 8.284");
 /// `cloud-off`
 pub const CLOUD_OFF: Icon = Icon::new("M10.94 5.274A7 7 0 0 1 15.71 10h1.79a4.5 4.5 0 0 1 4.222 6.057M18.796 18.81A4.5 4.5 0 0 1 17.5 19H9A7 7 0 0 1 5.79 5.78M2 2l20 20");
 /// `code`

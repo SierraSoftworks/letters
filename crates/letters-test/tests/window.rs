@@ -6,7 +6,9 @@ use letters_model::{Align, Block, BlockKind, Document, ListKind, Pos, Selection,
 use letters_render::image::Image;
 use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
-use letters_ui::{Chrome, Cursor, Edge, Folder, Frame, Landing, Location, Recent, Request, SaveState, WindowButton};
+use letters_ui::{
+    Chrome, Cursor, Edge, Folder, Frame, Landing, Location, PictureState, Recent, Request, SaveState, WindowButton,
+};
 
 fn text(id: &str, kind: BlockKind, text: &str) -> Block {
     Block::text(id, kind, text)
@@ -2681,6 +2683,72 @@ fn a_linked_picture_that_shows_has_its_cloud_while_it_is_selected_or_under_the_p
     assert_eq!(over(&mut window, cloud), 1, "selected, it keeps its cloud for a finger or the keyboard");
     window.click_at(Point { x: far.x, y: far.y + 2.0 });
     assert_eq!(over(&mut window, cloud), 0);
+}
+
+/// Whether a frame has a chip under the cloud at `at`: a small filled shape, as the frame of a picture that
+/// does not show is not.
+fn chip(window: &mut Harness, at: Point) -> bool {
+    let small = |item: &Item| matches!(item, Item::Fill { rect, .. } if rect.contains(at) && rect.width <= 40.0);
+    window.paint().items.iter().any(small)
+}
+
+#[test]
+fn what_the_shell_says_of_a_linked_picture_is_on_its_cloud_and_in_its_menu() {
+    let failed = PictureState::Failed("the server answered 404".into());
+    // What the shell says, what the menu says of it, the item that loads the picture and whether what
+    // fetches is there to choose.
+    let cases = [
+        (None, None, Some("Load once"), true),
+        (Some(PictureState::Loading), Some("Loading from example.com"), None, true),
+        (Some(failed), Some("the server answered 404"), Some("Try again"), true),
+        (Some(PictureState::Held), Some("Safe mode"), Some("Load once"), false),
+    ];
+    for (state, said, load, offered) in cases {
+        let (mut window, _, cloud) = linked(false);
+        window.ui().set_picture_state(LINK, state.clone());
+        assert_eq!(chip(&mut window, cloud), state.is_some(), "{state:?}: the cloud says it with nothing selected");
+
+        window.click_at(cloud).assert_open(Role::Menu, "Linked picture");
+        let note =
+            window.controls().into_iter().find(|control| control.role == Role::Status).and_then(|note| note.value);
+        assert_eq!(note.is_some(), said.is_some(), "{state:?}: {note:?}");
+        assert!(note.zip(said).is_none_or(|(note, said)| note.contains(said)), "{state:?}");
+        let loads = ["Load once", "Try again"].into_iter().find(|item| window.find(Role::MenuItem, item).is_some());
+        assert_eq!(loads, load, "{state:?}");
+        for item in load.into_iter().chain(["Always load from example.com", "Embed in the document"]) {
+            let found = window.find(Role::MenuItem, item).expect(item);
+            assert_eq!(!found.disabled, offered, "{state:?}: {item}");
+        }
+        match (load, offered) {
+            (Some(load), true) => {
+                window.click(Role::MenuItem, load);
+                assert_eq!(window.ui().take_requests(), [Request::LoadPicture(LINK.into())], "{state:?}: {load}");
+            }
+            (_, false) => {
+                window.click(Role::MenuItem, "Embed in the document");
+                assert_eq!(window.ui().take_requests(), [], "{state:?}: nothing is asked that would be refused");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn a_linked_picture_has_its_plain_cloud_again_once_the_shell_says_no_more_of_it() {
+    // How the shell ends what it said: with the picture, or with nothing.
+    for handed in [true, false] {
+        let (mut window, _, cloud) = linked(false);
+        window.ui().set_picture_state(LINK, Some(PictureState::Loading));
+        assert!(chip(&mut window, cloud), "handed: {handed}");
+        match handed {
+            true => window.ui().set_image(LINK, Image::from_rgba8(2, 1, vec![255; 8]).ok()),
+            false => window.ui().set_picture_state(LINK, None),
+        }
+        assert!(!chip(&mut window, cloud), "handed: {handed}");
+        // A picture that is taken away again is a link like any other.
+        window.ui().set_image(LINK, None);
+        assert!(!chip(&mut window, cloud), "handed: {handed}");
+    }
 }
 
 #[test]

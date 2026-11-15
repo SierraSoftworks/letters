@@ -427,6 +427,12 @@ impl DocLayout {
         self.state.borrow_mut().figure(block)
     }
 
+    /// The pictures `viewport` shows that are still links, in order, each with where its cloud sits. One
+    /// with no room for a cloud is left out.
+    pub fn linked(&self, viewport: Rect) -> Vec<(BlockId, Rect)> {
+        self.state.borrow_mut().linked(viewport)
+    }
+
     /// The code blocks that `viewport` shows, in order, each with the box drawn behind its text.
     pub fn code_boxes(&self, viewport: Rect) -> Vec<(BlockId, Rect)> {
         self.state.borrow_mut().code_boxes(viewport)
@@ -1346,6 +1352,19 @@ impl State {
         let text = leaf.laid.as_ref().map_or(0.0, |laid| laid.text.layout.height());
         let caption = on_page(Rect::new(0.0, leaf.lead, leaf.width, text));
         Some(FigureBox { image, caption, badge: leaf::badge(image).filter(|_| remote) })
+    }
+
+    fn linked(&mut self, viewport: Rect) -> Vec<(BlockId, Rect)> {
+        let (first, end) = self.show(viewport.y, viewport.y + viewport.height);
+        let mut found = Vec::new();
+        for leaf in &self.leaves[first..end] {
+            let links = leaf.pictures.iter().filter(|picture| picture.asset.is_none());
+            found.extend(links.filter_map(|picture| {
+                let image = Rect { x: leaf.x + picture.rect.x, y: leaf.y + picture.rect.y, ..picture.rect };
+                Some((picture.id.clone(), leaf::badge(image)?))
+            }));
+        }
+        found
     }
 
     fn code_boxes(&mut self, viewport: Rect) -> Vec<(BlockId, Rect)> {

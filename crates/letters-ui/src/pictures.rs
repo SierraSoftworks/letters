@@ -2,6 +2,8 @@
 //! a link is the shell's to decide, so it is told of each, and a cloud in the corner of a linked picture
 //! opens the menu that loads it, trusts its host or embeds it.
 
+use std::collections::HashMap;
+
 use letters_model::{Block, BlockId, BlockKind};
 use letters_render::image::Images;
 use letters_render::{DisplayList, Item, Point, Rect};
@@ -9,8 +11,11 @@ use letters_render::{DisplayList, Item, Point, Rect};
 use crate::color::{blend, resolve};
 use crate::icon;
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::widgets::{Menu, MenuItem};
+use crate::widgets::{Menu, MenuItem, Tone};
 use crate::window::Message;
+
+/// What the menu says of a picture that safe mode holds back.
+const HELD: &str = "Safe mode holds linked pictures back until this document is trusted";
 
 /// The least a picture's place measures for the sign of a picture to show in it while it is awaited, and the
 /// size of that sign.
@@ -36,6 +41,19 @@ pub enum Linking {
     Close,
 }
 
+/// How a linked picture that does not show is doing, as the shell that fetches it says. Its cloud tells the
+/// person.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PictureState {
+    /// It is being fetched.
+    Loading,
+    /// It could not be fetched, for a short reason that reads on from "Not loaded:", such as "the server
+    /// answered 404". The person is offered another try.
+    Failed(String),
+    /// Safe mode holds it back. Nothing fetches it until the document is trusted.
+    Held,
+}
+
 /// The linked pictures that something shows on.
 #[derive(Default)]
 pub(crate) struct Linked {
@@ -43,6 +61,8 @@ pub(crate) struct Linked {
     pub open: Option<BlockId>,
     /// The figure under the pointer, and whether the pointer is on its cloud.
     pointed: Option<(BlockId, bool)>,
+    /// What the shell says of the links that do not show, by address.
+    states: HashMap<String, PictureState>,
 }
 
 impl Linked {
@@ -58,17 +78,25 @@ impl Linked {
         self.pointed.as_ref().is_some_and(|(_, on_cloud)| *on_cloud)
     }
 
-    /// The figures to draw a cloud on: the selected one, the one under the pointer and the one whose menu is
-    /// out. Each comes with whether its cloud is lit, as under the pointer or over its menu.
-    pub fn clouds<'a>(&'a self, selected: Option<&'a BlockId>) -> Vec<(&'a BlockId, bool)> {
-        let lit = |figure: &BlockId| {
-            self.open.as_ref() == Some(figure) || self.pointed.as_ref().is_some_and(|(at, on)| at == figure && *on)
-        };
-        let pointed = self.pointed.as_ref().map(|(figure, _)| figure);
-        let mut figures: Vec<&BlockId> = self.open.iter().chain(pointed).chain(selected).collect();
-        figures.sort();
-        figures.dedup();
-        figures.into_iter().map(|figure| (figure, lit(figure))).collect()
+    /// Whether what the person is doing puts a figure's cloud on a chip: it is selected, under the pointer
+    /// or has its menu out. Comes with whether the cloud is lit, as under the pointer or over its menu.
+    pub fn shows(&self, figure: &BlockId, selected: Option<&BlockId>) -> Option<bool> {
+        let open = self.open.as_ref() == Some(figure);
+        let pointed = self.pointed.as_ref().filter(|(at, _)| at == figure).map(|(_, on_cloud)| *on_cloud);
+        (open || pointed.is_some() || selected == Some(figure)).then_some(open || pointed == Some(true))
+    }
+
+    /// What the shell says of the picture linked from `src`.
+    pub fn said(&self, src: &str) -> Option<&PictureState> {
+        self.states.get(src)
+    }
+
+    /// Takes what the shell says of the picture linked from `src`: `None` when it has no more to say.
+    pub fn say(&mut self, src: &str, state: Option<PictureState>) {
+        match state {
+            Some(state) => _ = self.states.insert(src.to_owned(), state),
+            None => _ = self.states.remove(src),
+        }
     }
 }
 
@@ -87,19 +115,34 @@ fn host(src: &str) -> &str {
     host.rsplit_once('@').map_or(host, |(_, host)| host)
 }
 
-/// The menu on the cloud of the picture linked from `src`. One that shows already needs no loading.
-pub(crate) fn menu(src: &str, loaded: bool) -> Menu<Message> {
-    let mut menu = Menu::new().label("Linked picture");
-    if !loaded {
-        menu = menu.item(MenuItem::new("Load once").on_select(Message::Linked(Linking::Load)));
-    }
-    let always = match host(src) {
-        "" => "Always load from this host".to_owned(),
-        host => format!("Always load from {host}"),
+/// The menu on the cloud of the picture linked from `src`. One that shows already needs no loading, and
+/// what the shell says of one that does not show stands over what the menu offers.
+pub(crate) fn menu(src: &str, loaded: bool, state: Option<&PictureState>) -> Menu<Message> {
+    let host = match host(src) {
+        "" => "this host",
+        host => host,
     };
-    menu.item(MenuItem::new(always).on_select(Message::Linked(Linking::Trust)))
+    let mut menu = Menu::new().label("Linked picture");
+    menu = match state {
+        Some(PictureState::Loading) => menu.note(format!("Loading from {host}"), Tone::Default).separator(),
+        Some(PictureState::Failed(reason)) => menu.note(format!("Not loaded: {reason}"), Tone::Danger).separator(),
+        Some(PictureState::Held) => menu.note(HELD, Tone::Default).separator(),
+        None => menu,
+    };
+    let load = match state {
+        Some(PictureState::Loading) => None,
+        Some(PictureState::Failed(_)) => Some("Try again"),
+        Some(PictureState::Held) | None => (!loaded).then_some("Load once"),
+    };
+    // Safe mode fetches for nobody, so what would fetch is not there to choose.
+    let held = state == Some(&PictureState::Held);
+    let item = |label: String, asked| MenuItem::new(label).disabled(held).on_select(Message::Linked(asked));
+    if let Some(load) = load {
+        menu = menu.item(item(load.to_owned(), Linking::Load));
+    }
+    menu.item(item(format!("Always load from {host}"), Linking::Trust))
         .separator()
-        .item(MenuItem::new("Embed in the document").on_select(Message::Linked(Linking::Embed)))
+        .item(item("Embed in the document".to_owned(), Linking::Embed))
 }
 
 fn grown(rect: Rect, by: f32) -> Rect {
@@ -117,11 +160,25 @@ pub(crate) fn pressed(badge: Rect, at: Point) -> bool {
 }
 
 /// Draws the cloud that marks a linked picture, on a chip that sets it off from the picture. A lit one is
-/// in `accent`, the person's accent as it is written on a surface.
-pub(crate) fn cloud(badge: Rect, lit: bool, accent: Ink, scheme: Scheme, out: &mut DisplayList) {
+/// in `accent`, the person's accent as it is written on a surface. The cloud is the sign of what the shell
+/// says of the picture, and one that failed is in the colour of what went wrong.
+pub(crate) fn cloud(
+    badge: Rect,
+    lit: bool,
+    state: Option<&PictureState>,
+    accent: Ink,
+    scheme: Scheme,
+    out: &mut DisplayList,
+) {
     let rect = chip(badge);
     let radius = rect.height / 2.0;
-    let (ground, ink) = if lit { (accent, tokens::SURFACE) } else { (tokens::SURFACE, tokens::FG_MUTED) };
+    let (sign, quiet, loud) = match state {
+        Some(PictureState::Loading) => (icon::CLOUD_DOWNLOAD, tokens::FG_MUTED, accent),
+        Some(PictureState::Failed(_)) => (icon::CLOUD_ALERT, tokens::DANGER, tokens::DANGER),
+        Some(PictureState::Held) => (icon::CLOUD_OFF, tokens::FG_MUTED, accent),
+        None => (icon::CLOUD, tokens::FG_MUTED, accent),
+    };
+    let (ground, ink) = if lit { (loud, tokens::SURFACE) } else { (tokens::SURFACE, quiet) };
     out.push(Item::Fill { rect, color: resolve(ground, scheme, 1.0), radius });
     if !lit {
         out.push(Item::Stroke { rect, color: resolve(tokens::CARD_LINE, scheme, 1.0), width: 1.0, radius });
@@ -130,7 +187,7 @@ pub(crate) fn cloud(badge: Rect, lit: bool, accent: Ink, scheme: Scheme, out: &m
     out.push(Item::Path {
         origin: Point { x: badge.x + inset, y: badge.y + inset },
         scale: CLOUD / icon::GRID,
-        path: icon::CLOUD.outline(),
+        path: sign.outline(),
         color: resolve(ink, scheme, 1.0),
         stroke: Some(tokens::ICON_STROKE),
     });
