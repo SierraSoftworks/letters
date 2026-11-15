@@ -608,7 +608,7 @@ pub(crate) fn backing(leaf: &Leaf, palette: &Palette) -> Option<Item> {
             let color = if leaf.header { palette.line_strong } else { palette.line };
             Some(line(leaf.y + leaf.height - theme::RULE, color))
         }
-        What::Label => {
+        What::Label | What::Empty => {
             Some(Item::Stroke { rect: boxed, color: palette.line_strong, width: 1.0, radius: theme::BOX_RADIUS })
         }
         _ if leaf.boxed() => Some(Item::Fill { rect: boxed, color: palette.code, radius: theme::BOX_RADIUS }),

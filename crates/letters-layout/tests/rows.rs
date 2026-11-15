@@ -3,7 +3,7 @@
 
 use letters_layout::{DocLayout, FigureBox, Palette, figure_label, figure_numbers};
 use letters_model::{Align, Block, BlockId, BlockKind, Document, Mark, Model, Op, Pos, ReplicaId, Selection, Style};
-use letters_render::{Font, Item, Point, Rect};
+use letters_render::{DisplayList, Font, Item, Point, Rect};
 
 mod common;
 use common::*;
@@ -121,6 +121,69 @@ fn a_picture_still_a_link_shows_where_it_comes_from() {
     }
     let tiny = remote(figure("f", (12.0, 12.0), ""), "https://example.org/a.png");
     assert_eq!(laid(&doc(vec![tiny])).figure(&"f".into()).unwrap().badge, None, "a cloud needs room");
+}
+
+#[test]
+fn a_picture_is_no_taller_than_a_page_holds() {
+    // A style whose page has a text area as wide as the column and `room` tall.
+    let room = 400.0;
+    let style = Style { page: paper(WIDTH, room), ..Style::default() };
+    let tall = (300.0, 1800.0);
+    let pair = vec![figure("g0", tall, ""), figure("g1", tall, "")];
+    // What holds tall pictures, the block its caption is, and the pictures.
+    let cases: Vec<(&str, Block, &str, Vec<&str>)> = vec![
+        ("a figure", figure("f", tall, PROSE), "f", vec!["f"]),
+        ("a gallery of one", gallery("g", vec![figure("g0", tall, "")], Some(PROSE)), "gc", vec!["g0"]),
+        ("a gallery of two", gallery("g", pair, Some(PROSE)), "gc", vec!["g0", "g1"]),
+    ];
+    for (name, block, caption, pictures) in cases {
+        let mut layout = DocLayout::new(fonts());
+        layout.update(&doc(vec![paragraph("p", PROSE), block, paragraph("z", PROSE)]), &style, WIDTH, None);
+        let places: Vec<FigureBox> = pictures.iter().map(|id| layout.figure(&(*id).into()).unwrap()).collect();
+        for (id, place) in pictures.iter().zip(&places) {
+            let image = place.image;
+            assert!(stretch(image, tall) < 0.03, "{name}: {id} keeps its shape: {image:?}");
+            assert!(image.x >= 0.0 && right(image) <= WIDTH + 0.5, "{name}: {id} is inside the column: {image:?}");
+        }
+        // A row held to the page's height no longer fills the column, and stands in its middle.
+        let (first, last) = (places[0].image, places[places.len() - 1].image);
+        let centre = (first.x + right(last)) / 2.0;
+        assert!(caption == "f" || (centre - WIDTH / 2.0).abs() <= 1.0, "{name}: its row is centred: {first:?}");
+
+        // A sheet of that page holds the pictures and the caption under them, whole.
+        let pages = layout.paginate(&style.page);
+        let page = layout.page_of(&pages, &Pos::new(caption, 0)).unwrap();
+        let (down, area) = (pages.origin(page).unwrap().y, pages.area);
+        let (top, end) = (first.y + down, bottom(places[0].caption) + down);
+        assert!(top >= area.y - 0.5 && end <= bottom(area) + 0.5, "{name}: from {top} to {end} on a sheet of {area:?}");
+    }
+}
+
+#[test]
+fn an_empty_gallery_or_table_keeps_a_place_for_the_caret() {
+    let cases = [
+        ("a gallery of nothing", BlockKind::Gallery { numbered: false }),
+        ("a table with no rows", BlockKind::Table { columns: vec![Align::Start; 2], header: true }),
+    ];
+    for (name, kind) in cases {
+        let layout = laid(&doc(vec![paragraph("p", "Above"), container("x", kind, vec![]), paragraph("z", "Zulu")]));
+        let caret = |block: &str| layout.caret(&Pos::new(block, 0));
+        let place = caret("x").unwrap_or_else(|| panic!("{name} has a place"));
+        let (above, below) = (caret("p").unwrap(), caret("z").unwrap());
+        assert!(bottom(above) <= place.y && bottom(place) <= below.y, "{name}: between the blocks around it");
+        assert!(place.height >= above.height, "{name}: as tall as a line of text");
+        assert_eq!(layout.hit(middle(place)), Some(Pos::new("x", 0)), "{name}: a point on it is at it");
+        let boxed = |item: &Item| matches!(item, Item::Stroke { rect, .. } if rect.y <= place.y && bottom(*rect) >= bottom(place));
+        assert!(painted(&layout, everything()).iter().any(boxed), "{name}: a box shows where it is");
+
+        let step = |from: &str, down: bool| layout.line_step(&Pos::new(from, 0), 10.0, down).map(|pos| pos.block);
+        let through = [step("p", true), step("x", true), step("z", false), step("x", false)];
+        assert_eq!(through, ["x", "z", "x", "p"].map(|id| Some(BlockId::from(id))), "{name}: lines pass through it");
+
+        let mut sheet = DisplayList::default();
+        layout.paint_page(&layout.paginate(&paper(WIDTH, 1.0e6)), 0, &mut sheet);
+        assert!(!sheet.items.iter().any(|item| matches!(item, Item::Stroke { .. })), "{name}: print shows no box");
+    }
 }
 
 #[test]
@@ -415,7 +478,7 @@ fn what_a_merge_leaves_out_of_place_still_shows() {
             vec!["a"],
             vec!["Alpha"],
         ),
-        ("a table with no rows", holding(two.clone(), vec![]), vec![], vec![]),
+        ("a table with no rows", holding(two.clone(), vec![]), vec!["x"], vec![]),
         (
             "a row outside a table",
             row("r", vec![cell("a", "Alpha"), cell("b", "Bravo")]),
@@ -452,7 +515,7 @@ fn what_a_merge_leaves_out_of_place_still_shows() {
             vec!["Alpha", "chart"],
         ),
         ("a gallery of a caption alone", holding(album.clone(), vec![caption("c", "Alpha")]), vec!["c"], vec!["Alpha"]),
-        ("a gallery of nothing", holding(album, vec![]), vec![], vec![]),
+        ("a gallery of nothing", holding(album, vec![]), vec!["x"], vec![]),
     ];
     for (name, block, holds, says) in cases {
         let layout = laid(&doc(vec![paragraph("p", "Above"), block, paragraph("z", "Zulu")]));
@@ -574,6 +637,8 @@ fn an_edit_to_a_figure_or_a_table_gives_the_same_layout_as_starting_over() {
         ("removing a row", vec![removing("t1")]),
         ("adding a row", vec![adding(Some("t"), 1, row)]),
         ("removing a cell", vec![removing("t11")]),
+        ("removing every row", ["t0", "t1", "t2"].map(removing).to_vec()),
+        ("taking everything out of a gallery", ["g0", "g1", "g2", "g3", "gc"].map(removing).to_vec()),
         ("turning a header into a row", vec![retyping(grid([Align::Start; 3], false))]),
         ("setting columns another way", vec![retyping(grid([Align::End, Align::Center, Align::Start], true))]),
         ("typing before a reference", vec![typing("a", 0, "Now ")]),

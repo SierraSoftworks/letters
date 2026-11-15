@@ -303,8 +303,9 @@ impl DocLayout {
         self.state.borrow_mut().printed(|state| state.page_of(pages, pos))
     }
 
-    /// The links on one sheet of `pages`, in reading order. A link that runs over several lines has a
-    /// rectangle for each.
+    /// The links on one sheet of `pages`, in reading order: those that lead out of the document, and each
+    /// reference that names a figure, which leads to where its figure is. A link that runs over several
+    /// lines has a rectangle for each.
     pub fn page_links(&self, pages: &Pages, index: usize) -> Vec<PageLink> {
         self.state.borrow_mut().printed(|state| state.page_links(pages, index))
     }
@@ -687,7 +688,7 @@ impl State {
     fn lay(&mut self, at: usize) {
         self.leaves[at].used = self.clock;
         self.size(at);
-        if self.leaves[at].laid.is_some() || matches!(self.leaves[at].what, What::Rule | What::Blank) {
+        if self.leaves[at].laid.is_some() || self.leaves[at].fixed() {
             return;
         }
         if self.held >= KEPT {
@@ -834,7 +835,9 @@ impl State {
             }
         }
         // The boxes and rules of the leaves are decoration too, and go behind all their text.
-        out.items.extend(self.leaves[first..end].iter().filter_map(|leaf| leaf::backing(leaf, palette)));
+        // An empty gallery or table is boxed only for whoever edits it.
+        let backed = self.leaves[first..end].iter().filter(|leaf| !(print && leaf.what == What::Empty));
+        out.items.extend(backed.filter_map(|leaf| leaf::backing(leaf, palette)));
         // A sheet says what its parts are. `around` is what is open around the leaf being painted, outermost
         // first: its quotes and callouts, and its table.
         let mut around: Vec<u64> = Vec::new();
@@ -962,7 +965,7 @@ impl State {
         self.place_all();
         for (block, lines) in &sheet.blocks {
             let Some(at) = self.index.get(block).map(|slot| slot.leaf) else { continue };
-            let linked = |words: &Words| !words.links.is_empty();
+            let linked = |words: &Words| !words.links.is_empty() || !words.refs.is_empty();
             if !linked(&self.leaves[at].words) && !self.leaves[at].cells.iter().any(|cell| linked(&cell.words)) {
                 continue;
             }
@@ -970,17 +973,37 @@ impl State {
             let leaf = &self.leaves[at];
             for part in [Part::Text].into_iter().chain((0..leaf.cells.len()).map(Part::Cell)) {
                 let Some(text) = Text::of(leaf, part) else { continue };
-                for (range, target) in &text.source.links {
+                let out = text.source.links.iter().map(|(range, target)| (range, target.clone(), None));
+                // A reference leads to its figure when it names one.
+                let places =
+                    text.source.refs.iter().filter_map(|(range, target)| {
+                        Some((range, String::new(), Some(self.leads_to(pages, target)?)))
+                    });
+                let mut found: Vec<_> = out.chain(places).collect();
+                found.sort_by_key(|(range, ..)| range.start);
+                for (range, target, place) in found {
                     leaf::stretches(text.set, range, &Shifts::default(), |line, part_of| {
                         if lines.contains(&leaf.line_of(part, line)) {
                             let (x, y) = (origin.x + text.at.x + part_of.x, origin.y + text.at.y + part_of.y);
-                            links.push(PageLink { rect: Rect { x, y, ..part_of }, target: target.clone() });
+                            links.push(PageLink { rect: Rect { x, y, ..part_of }, target: target.clone(), place });
                         }
                     });
                 }
             }
         }
         links
+    }
+
+    /// Where a sheet shows the figure that a reference to `target` reads as: the sheet, and the top left of
+    /// the figure's picture on it. `None` for a block with no number, which no reference names.
+    fn leads_to(&self, pages: &Pages, target: &BlockId) -> Option<(usize, Point)> {
+        let at = self.index.get(target).filter(|_| self.numbers.contains_key(target))?.leaf;
+        let leaf = &self.leaves[at];
+        let page = pages.sheets.partition_point(|sheet| sheet.first <= (at, 0)).checked_sub(1)?;
+        let origin = pages.origin(page)?;
+        // A figure's picture stands where its caption's lines do. A gallery starts at the column's edge.
+        let across = leaf.pictures.first().filter(|_| leaf.what == What::Figure).map_or(0.0, |picture| picture.rect.x);
+        Some((page, Point { x: origin.x + leaf.x + across, y: origin.y + leaf.y }))
     }
 
     fn outline(&mut self, pages: &Pages) -> Vec<Heading> {
@@ -1040,6 +1063,9 @@ impl State {
             let picture = leaf.pictures.get(index)?.rect;
             let x = if pos.offset == 0 { picture.x } else { picture.x + picture.width - theme::CARET };
             return Some(Rect::new(leaf.x + x, leaf.y + picture.y, theme::CARET, picture.height));
+        }
+        if leaf.what == What::Empty {
+            return Some(Rect::new(leaf.x, leaf.y, theme::CARET, leaf.height));
         }
         Some(leaf::caret(&Text::of(leaf, part)?, &shifts, pos.offset))
     }
@@ -1147,6 +1173,7 @@ impl State {
         let leaf = &self.leaves[at];
         let rows = leaf.pictures.last().map_or(0, |last| last.row + 1);
         let part = match leaf.what {
+            What::Empty => Part::Whole,
             What::Row => leaf.cell_at(x).map(Part::Cell)?,
             // From above a gallery is entered by its first row, and from below by its caption.
             What::Gallery if rows > 0 && (down || leaf.caption.is_none()) => {

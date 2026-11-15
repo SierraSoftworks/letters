@@ -40,8 +40,11 @@ impl Pages {
 pub struct PageLink {
     /// One line of the link's text, from the sheet's top left.
     pub rect: Rect,
-    /// Where the link leads, as the document stores it.
+    /// Where the link leads, as the document stores it. Empty for a reference to a figure.
     pub target: String,
+    /// Where a reference to a figure leads: the sheet its figure is on, counted from 0, and the top left of
+    /// its picture on that sheet. `None` for a link that leads out of the document.
+    pub place: Option<(usize, Point)>,
 }
 
 /// A heading and where print shows it, for an export's outline. See [`crate::DocLayout::outline`].

@@ -631,6 +631,51 @@ fn a_sheet_lists_its_links() {
 }
 
 #[test]
+fn a_reference_links_to_where_its_figure_is() {
+    let to = |id: &str| [Mark::Ref(id.into())];
+    let (one, two, gone, bare) = (to("f"), to("g"), to("nowhere"), to("u"));
+    let said = "Figure 9";
+    let runs: Vec<(&str, &[Mark])> = vec![
+        ("See ", &[]),
+        (said, &one),
+        (", ", &[]),
+        (said, &two),
+        (", ", &[]),
+        (said, &gone),
+        (", ", &[]),
+        (said, &bare),
+    ];
+    let tiles = (0..2).map(|at| figure(&format!("g{at}"), (120.0, 60.0), "")).collect();
+    let doc = doc(vec![
+        rich("a", &runs),
+        paragraph("b", &PROSE.repeat(4)),
+        numbered(figure("f", (120.0, 80.0), "The harbour office")),
+        paragraph("c", &PROSE.repeat(4)),
+        numbered(gallery("g", tiles, Some("Along the harbour"))),
+        figure("u", (120.0, 80.0), "A figure with no number"),
+    ]);
+    let (layout, pages) = paged(&doc, 240.0);
+    let links = layout.page_links(&pages, 0);
+    assert!(links.iter().all(|link| link.target.is_empty()), "a reference leads nowhere out of the document");
+
+    // Where a sheet shows a picture: the sheet, and the picture's top left on it.
+    let shown = |picture: &str| {
+        let page = layout.page_of(&pages, &Pos::new(picture, 0)).unwrap();
+        let (image, origin) = (layout.figure(&picture.into()).unwrap().image, pages.origin(page).unwrap());
+        (page, Point { x: image.x + origin.x, y: image.y + origin.y })
+    };
+    let places: Vec<(usize, Point)> = links.iter().filter_map(|link| link.place).collect();
+    assert_eq!(places, [shown("f"), shown("g0")], "one that names a figure leads to it, and no other leads anywhere");
+    assert!(places[0].0 > 0 && places[1].0 > places[0].0, "on the sheets the figures are on");
+
+    let origin = pages.origin(0).unwrap();
+    let caret = |offset: usize| layout.caret(&Pos::new("a", offset)).unwrap().x + origin.x;
+    let rect = links[0].rect;
+    let ends = (rect.x - caret(4)).abs() < 1.0 && (rect.x + rect.width - caret(4 + said.len())).abs() < 2.0;
+    assert!(ends, "the link is the reference's text: {rect:?}");
+}
+
+#[test]
 fn the_outline_lists_headings_with_their_sheets() {
     let mut blocks = mixed().blocks;
     blocks.push(Block::text("e", BlockKind::Heading { level: 3 }, "  "));

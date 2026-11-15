@@ -79,6 +79,9 @@ pub(crate) struct Types {
     types: Vec<Type>,
     /// The word a numbered figure's label opens with.
     pub figure: String,
+    /// How tall a picture may be drawn, so that print shows it whole with a few lines of caption: what is
+    /// left of the height of a page's text area.
+    pub tallest: f32,
 }
 
 /// The word a style gives its figure labels: the caption type's `label`, or the English one.
@@ -126,7 +129,11 @@ impl Types {
             }
             resolved
         });
-        Self { types: types.collect(), figure: figure_word(style).to_owned() }
+        let types: Vec<Type> = types.collect();
+        let caption = types[Role::Caption as usize].line;
+        let room = (style.page.height - style.page.margin_top - style.page.margin_bottom) * theme::PT;
+        let tallest = (room - theme::CAPTION_GAP - theme::CAPTION_LINES * caption).max(caption);
+        Self { types, figure: figure_word(style).to_owned(), tallest }
     }
 
     pub fn get(&self, role: Role) -> &Type {
@@ -194,6 +201,9 @@ pub(crate) enum What {
     Gallery,
     /// A row of a table. Its cells hold the text.
     Row,
+    /// A gallery with nothing in it or a table with no rows: an empty box, so that it can be seen and the
+    /// caret has somewhere to stand.
+    Empty,
 }
 
 /// One of the things in a leaf that a position can be in or on.
@@ -450,7 +460,12 @@ impl Leaf {
 
     /// Whether the leaf's text has its own box behind it.
     pub fn boxed(&self) -> bool {
-        self.role == Role::Code || self.what == What::Label
+        self.role == Role::Code || matches!(self.what, What::Label | What::Empty)
+    }
+
+    /// Whether the leaf has no text to lay out, so that its height is known as soon as it is placed.
+    pub fn fixed(&self) -> bool {
+        matches!(self.what, What::Rule | What::Blank | What::Empty)
     }
 
     /// A guess at the height from the amount of text, used until the leaf is laid out.
@@ -459,7 +474,7 @@ impl Leaf {
         let wrapped = |bytes: usize, width: f32| (bytes as f32 * of.advance / width.max(1.0)).ceil().max(1.0);
         match self.what {
             What::Rule => theme::RULE,
-            What::Blank => of.line,
+            What::Blank | What::Empty => of.line,
             What::Text | What::Label | What::Figure | What::Gallery => {
                 self.tall((self.newlines as f32 + wrapped(self.words.text.len(), self.width)) * of.line)
             }
@@ -481,7 +496,7 @@ impl Leaf {
         match self.what {
             What::Text | What::Label | What::Formula => true,
             What::Figure | What::Gallery => self.captioned(),
-            What::Rule | What::Blank | What::Row => false,
+            What::Rule | What::Blank | What::Row | What::Empty => false,
         }
     }
 
@@ -500,7 +515,9 @@ impl Leaf {
         let pictures = self.pictures.iter().enumerate().filter(|_| self.what == What::Gallery);
         let pictures = pictures.map(|(index, picture)| (Part::Picture(index), &picture.id));
         let cells = self.cells.iter().enumerate().map(|(index, cell)| (Part::Cell(index), &cell.id));
-        pictures.chain(own.map(|id| (Part::Text, id))).chain(cells)
+        // An empty box is one place, which is its block's.
+        let empty = self.id.as_ref().filter(|_| self.what == What::Empty).map(|id| (Part::Whole, id));
+        empty.into_iter().chain(pictures).chain(own.map(|id| (Part::Text, id))).chain(cells)
     }
 
     /// The block a part's positions belong to.
@@ -636,18 +653,21 @@ impl Leaf {
                 let row = self.pictures.iter().find(|picture| point.y < bottom(picture)).or(self.pictures.last())?.row;
                 self.picture_in(row, point.x).map(Part::Picture)
             }
+            What::Empty => Some(Part::Whole),
             What::Rule | What::Label | What::Blank => None,
         }
     }
 
     /// Places a figure's picture, or a gallery's in rows, and makes room for them above the text.
     fn arrange(&mut self, types: &Types) {
-        let width = self.width;
+        let (width, tallest) = (self.width, types.tallest);
         match &mut self.pictures[..] {
             [] => self.lead = 0.0,
             [picture] if self.what == What::Figure => {
-                let wide = picture.size.0.min(width).round().max(1.0);
-                let tall = (picture.size.1 * wide / picture.size.0).round().max(1.0);
+                // At its own size and shape, but no wider than the column and no taller than a page holds.
+                let scale = (width / picture.size.0).min(tallest / picture.size.1).min(1.0);
+                let wide = (picture.size.0 * scale).round().max(1.0);
+                let tall = (picture.size.1 * scale).round().max(1.0);
                 // The picture stands where the caption's style puts its lines.
                 let x = match types.get(Role::Caption).align {
                     Alignment::Center => ((width - wide) / 2.0).round(),
@@ -666,12 +686,16 @@ impl Leaf {
                     let tiles = &mut pictures[at..at + take];
                     let shapes: f32 = tiles.iter().map(|picture| picture.size.0 / picture.size.1).sum();
                     let room = (width - theme::TILE_GAP * (take - 1) as f32).max(take as f32);
-                    let tall = (room / shapes).round().max(1.0);
-                    let mut x = 0.0;
+                    let full = (room / shapes).round().max(1.0);
+                    let tall = full.min(tallest);
+                    let scaled = |picture: &Picture| (picture.size.0 / picture.size.1 * tall).round().max(1.0);
+                    // A row that a page holds no taller is narrower than the column, and stands in its middle.
+                    let spare = if tall < full { room - tiles.iter().map(scaled).sum::<f32>() } else { 0.0 };
+                    let mut x = (spare / 2.0).round().max(0.0);
                     for (index, picture) in tiles.iter_mut().enumerate() {
                         // The last one ends at the text edge, whatever the rounding of the others left.
-                        let scaled = (picture.size.0 / picture.size.1 * tall).round();
-                        let wide = if index + 1 == take { width - x } else { scaled }.max(1.0);
+                        let fills = index + 1 == take && tall == full;
+                        let wide = if fills { width - x } else { scaled(picture) }.max(1.0);
                         (picture.rect, picture.row) = (Rect::new(x, top, wide, tall), row);
                         x += wide + theme::TILE_GAP;
                     }
@@ -882,6 +906,14 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
         }
     }
 
+    /// Places the empty box that stands for a gallery or a table with nothing in it.
+    fn empty(&mut self, block: &Block, role: Role, at: (f32, f32, f32, Option<usize>)) {
+        let (x, width, gap, frame) = at;
+        let (mut leaf, _) = self.leaf(block, What::Empty);
+        leaf.role = role;
+        self.push(leaf, x, width, gap, frame);
+    }
+
     /// Places the rows of a table, the first `gap` below the row above.
     fn table(
         &mut self,
@@ -1038,8 +1070,13 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                     let inside = block.body.blocks();
                     // A gallery has one caption, which is its last. A merge can leave more.
                     let caption = inside.iter().rfind(|part| part.kind == BlockKind::Caption);
-                    let (mut leaf, _) = self.leaf(block, What::Gallery);
                     let pictures: Vec<Picture> = inside.iter().filter_map(Picture::of).collect();
+                    if pictures.is_empty() && caption.is_none() {
+                        self.empty(block, prose, (x, width, gap, frame));
+                        self.strays(inside.iter(), x, width, frame);
+                        continue;
+                    }
+                    let (mut leaf, _) = self.leaf(block, What::Gallery);
                     let same = leaf.pictures.len() == pictures.len()
                         && leaf.pictures.iter().zip(&pictures).all(|(old, new)| old.same(new));
                     let known = leaf.caption.as_ref() == caption.map(|caption| &caption.id);
@@ -1068,7 +1105,10 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                 BlockKind::Table { columns, header } => {
                     let (rows, rest): (Vec<&Block>, Vec<&Block>) =
                         block.body.blocks().iter().partition(|row| row.kind == BlockKind::TableRow);
-                    self.table(&rows, columns, *header, prose, (x, width, gap, frame));
+                    match rows.is_empty() {
+                        true => self.empty(block, prose, (x, width, gap, frame)),
+                        false => self.table(&rows, columns, *header, prose, (x, width, gap, frame)),
+                    }
                     self.strays(rest.into_iter(), x, width, frame);
                 }
                 // A row that a merge left outside its table is a table of one row.
@@ -1121,7 +1161,7 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
         leaf.frame = frame;
         leaf.breaks = std::mem::take(&mut self.breaks);
         leaf.arrange(self.types);
-        if matches!(leaf.what, What::Rule | What::Blank) {
+        if leaf.fixed() {
             (leaf.height, leaf.exact, leaf.lines) = (leaf.estimate(self.types), true, 1);
         } else if !leaf.exact {
             leaf.height = leaf.estimate(self.types);

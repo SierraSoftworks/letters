@@ -36,6 +36,8 @@ pub(crate) const WAVE_SWING: f32 = 1.0;
 
 /// The gap between a picture and the caption under it.
 pub(crate) const CAPTION_GAP: f32 = 8.0;
+/// How many lines of caption still fit a page under a picture that is as tall as layout lets it be.
+pub(crate) const CAPTION_LINES: f32 = 3.0;
 /// The gap between the pictures of a gallery.
 pub(crate) const TILE_GAP: f32 = 8.0;
 /// The side of the cloud on a picture that is still a link, and how far it sits in from the corner.
