@@ -56,7 +56,9 @@ impl From<io::Error> for Refusal {
     fn from(error: io::Error) -> Self {
         match error.kind() {
             io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => Self::not_found(),
-            io::ErrorKind::AlreadyExists => Self::new(Code::NameTaken, "Something of that name is already there."),
+            io::ErrorKind::AlreadyExists => {
+                Self::new(Code::NameTaken, "A document or folder with that name already exists.")
+            }
             _ => {
                 crate::log(&format!("a folder refused: {error}"));
                 Self::new(Code::Unavailable, "The folder behind this space cannot be used just now.")
