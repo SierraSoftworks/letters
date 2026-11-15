@@ -147,3 +147,27 @@ test("a comment written by one is read by the other", async ({ page, context }) 
   await marker.dispatchEvent("click");
   await expect(other.getByLabel("Is this the line?")).toBeAttached();
 });
+
+const returns = [
+  { name: "the window has the person's attention again", back: (page) => page.evaluate(() => window.dispatchEvent(new Event("focus"))) },
+  {
+    name: "the server is reached again",
+    back: async (page, host) => {
+      host.cut();
+      await expect(mark(page, /^(Offline|Connecting)$/)).toBeAttached();
+      host.mend();
+    },
+  },
+];
+for (const { name, back } of returns) {
+  test(`a document someone else renamed has its new name once ${name}`, async ({ page }) => {
+    const host = hosted();
+    let called = "Minutes";
+    const document = (method, path) => (method === "GET" && path === `/api/v1/documents/${opened().id}` ? { body: opened({ name: called }) } : undefined);
+    await serve(page, opened(), document, undefined, host);
+    called = "Agenda";
+    await back(page, host);
+    await expect(page).toHaveTitle("Agenda", { timeout: 15_000 });
+    await expect(page.getByRole("button", { name: "Agenda", exact: true })).toBeAttached();
+  });
+}

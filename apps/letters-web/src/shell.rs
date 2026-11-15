@@ -517,6 +517,8 @@ impl Shell {
         hear(&shell, &input, "focus", |shell, _: Event| shell.view.focus(true))?;
         hear(&shell, &input, "blur", |shell, _: Event| shell.view.focus(false))?;
         hear(&shell, &window, "resize", |shell, _: Event| shell.fit())?;
+        // Someone else may have renamed or moved the document while the person was away.
+        hear(&shell, &window, "focus", |shell, _: Event| shell.look())?;
         // The browser asks before it leaves a page whose work the server lacks.
         hear(&shell, &window, "beforeunload", |shell, event: Event| {
             if shell.unsent() {
@@ -1797,6 +1799,27 @@ impl Shell {
         });
     }
 
+    /// Asks the server what the document is called and where it is now: nothing tells an open page that
+    /// someone else renamed or moved it.
+    fn look(&mut self) {
+        let Some(id) = self.server.as_ref().map(|server| server.id.clone()) else { return };
+        let asked = browser::ask(&self.window, "GET", &paths::document(&id), None);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Ok(Ok(now)) = asked.await.map(|answer| serde_json::from_slice::<Opened>(&answer)) else { return };
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            let Some(server) = shell.server.as_mut().filter(|server| server.id == id) else { return };
+            let renamed = server.name != now.name;
+            (server.space, server.path) = (now.space, now.path);
+            if renamed {
+                server.name.clone_from(&now.name);
+                shell.called(&now.name);
+                shell.arrived();
+            }
+        });
+    }
+
     /// Shows the document under `name`, in the window and on the browser's tab.
     fn called(&mut self, name: &str) {
         self.view.set_document_name(name);
@@ -2003,6 +2026,10 @@ impl Shell {
                 letters_sync::Event::Link => {
                     if let Some(Link::Live(role)) = self.client.as_ref().map(Client::link) {
                         (self.edits, self.quiet_until) = (role.edits(), None);
+                        // Back after a while without the server, the document may be called otherwise.
+                        if self.sockets > 1 {
+                            self.look();
+                        }
                     }
                 }
                 letters_sync::Event::Progress => {}
