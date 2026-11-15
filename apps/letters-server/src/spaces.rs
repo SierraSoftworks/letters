@@ -21,6 +21,8 @@ use crate::error::{Answer, Refusal};
 pub const EXTENSION: &str = ".let";
 /// Where a space keeps what was thrown away. Hidden, as every name with a leading dot is.
 pub const TRASH: &str = ".letters-trash";
+/// Where a person's own space keeps what they set for themselves, as the desktop app does in a home folder.
+pub const KEPT: &str = ".letters";
 
 /// Whether `name` can name a file or a folder in a space: one visible name that every file system takes.
 /// A leading dot is how sync tools, the trash and half-written files hide, so none is reachable by name.
@@ -145,6 +147,18 @@ impl Root {
     pub fn thrown(&self) -> io::Result<Option<Folder>> {
         Ok(found(self.dir.open_dir(TRASH))?.map(|dir| Folder { dir }))
     }
+
+    /// The folder of what the space's person set for themselves. It is made first if `make` says so, and
+    /// is `None` when it is not there.
+    pub fn kept(&self, make: bool) -> io::Result<Option<Folder>> {
+        if make
+            && let Err(error) = self.dir.create_dir(KEPT)
+            && error.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(error);
+        }
+        Ok(found(self.dir.open_dir(KEPT))?.map(|dir| Folder { dir }))
+    }
 }
 
 /// What a folder holds under one name.
@@ -188,6 +202,15 @@ impl Folder {
 
     pub fn make_folder(&self, name: &str) -> io::Result<()> {
         self.dir.create_dir(name)
+    }
+
+    /// The start of the file `name`, `most` bytes of it at most: for a small file that a person may have
+    /// written by hand, at any length.
+    pub fn start(&self, name: &str, most: u64) -> io::Result<Option<Vec<u8>>> {
+        let Some(file) = found(self.dir.open(name))? else { return Ok(None) };
+        let mut bytes = Vec::new();
+        file.take(most).read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
     }
 
     /// The file to read from, with nothing read yet: a manifest is found without the pictures beside it.

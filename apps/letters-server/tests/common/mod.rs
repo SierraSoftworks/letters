@@ -132,6 +132,16 @@ impl Server {
         Self::over(Scratch::new(name), &sound, |app| app.with_waiting(most))
     }
 
+    /// A server that gives nobody a space of their own: the family's is all there is.
+    pub fn shared(name: &str) -> Self {
+        let shared = |at: &Path| {
+            let all = sound(at);
+            let (own, family) = (all.find("[[space]]").unwrap(), all.rfind("[[space]]").unwrap());
+            format!("{}{}", &all[..own], &all[family..])
+        };
+        Self::over(Scratch::new(name), &shared, |app| app)
+    }
+
     /// A server whose owner lets links be made.
     pub fn linking(name: &str) -> Self {
         Self::behind(name, None)

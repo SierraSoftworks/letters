@@ -7,6 +7,7 @@
 //! - [`spaces`] is the only way to a file, and cannot leave a space's folder.
 //! - [`library`] lists a space and finds a document by its id, wherever its file was moved to.
 //! - [`api`] answers the interface `letters_api` lays down.
+//! - [`home`] is what a person set for themselves, kept as files in their own space.
 //! - [`shares`] is who reaches a document besides those its space lets in, and [`links`] are the
 //!   addresses that let in whoever holds one.
 //! - [`fetch`] is what the server fetches for a document from elsewhere: a linked picture, a link's page.
@@ -23,6 +24,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod fetch;
+pub mod home;
 pub mod ids;
 pub mod library;
 pub mod links;
@@ -46,6 +48,7 @@ use crate::access::Log;
 use crate::config::Config;
 use crate::error::{Answer, Refusal};
 use crate::fetch::{Fetches, Roots};
+use crate::home::Homes;
 use crate::library::Library;
 use crate::links::Doors;
 use crate::oidc::Provider;
@@ -74,6 +77,7 @@ pub struct App {
     /// What the access logs noted of late.
     pub log: Log,
     pub telemetry: Telemetry,
+    homes: Homes,
     clock: Clock,
 }
 
@@ -85,8 +89,8 @@ impl App {
         let (provider, rooms) = (Provider::new(&config), Rooms::new(&config.server.state, store.clone()));
         let (editor, fetches) = (Editor::compiled(), Fetches::new(Roots::System));
         let (library, doors, log) = (Library::new(), Doors::default(), Log::default());
-        let telemetry = Telemetry::default();
-        Self { config, store, library, provider, rooms, editor, fetches, doors, log, telemetry, clock: Box::new(clock) }
+        let (telemetry, homes, clock) = (Telemetry::default(), Homes::default(), Box::new(clock));
+        Self { config, store, library, provider, rooms, editor, fetches, doors, log, telemetry, homes, clock }
     }
 
     /// The same server taking another word on who a site is, for tests against a site of their own.

@@ -19,7 +19,7 @@ use letters_api::{
     Preview, Rename, Renewal, Role, Server, Settings, Space, Tag, Token, Trust, paths,
 };
 use letters_format::{ASSETS, Archive, MIMETYPE, NOTES, Reading, STYLE, file_name};
-use letters_model::{Document, ReplicaId, Style};
+use letters_model::{Document, ReplicaId};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -35,16 +35,10 @@ use crate::{App, Shared};
 /// A document's file, open to be read.
 type File = letters_format::Archive<std::io::BufReader<std::fs::File>>;
 
-/// By [`Person::id`].
-const SETTINGS: Table<Settings> = Table::new("settings");
 /// By [`Person::id`]: the documents they opened, newest first.
 const RECENT: Table<Vec<String>> = Table::new("recent");
 /// How many documents a person's recents hold.
 const RECENTS: usize = 30;
-/// How long a word of a person's dictionary may be, in characters.
-const WORD: usize = 64;
-/// How many words a person's dictionary holds.
-const WORDS: usize = 10_000;
 
 pub fn routes() -> Router<Shared> {
     let limits = letters_api::Limits::default();
@@ -123,33 +117,19 @@ async fn sign_out(State(app): State<Shared>, who: Signed) -> Answer<Response> {
 }
 
 async fn settings(State(app): State<Shared>, who: Signed) -> Answer<Json<Settings>> {
-    blocking(move || Ok(Json(app.store.get(&SETTINGS, &who.person.id)?.unwrap_or_default()))).await
+    blocking(move || app.settings(&who).map(Json)).await
 }
 
 async fn set_settings(
     State(app): State<Shared>,
     who: Signed,
-    Json(mut settings): Json<Settings>,
+    Json(settings): Json<Settings>,
 ) -> Answer<Json<Settings>> {
-    if let Some(style) = &settings.default_style
-        && let Err(error) = Style::from_json(&style.to_string())
-    {
-        return Err(Refusal::invalid(format!("The default style cannot be read: {error}.")));
-    }
-    blocking(move || {
-        // The words change one at a time (`App::word`). What a whole list sent here would do is bring
-        // back a word that another device took out, so the words kept stay as they are.
-        Ok(Json(app.store.write(|batch| {
-            settings.dictionary = batch.get(&SETTINGS, &who.person.id)?.unwrap_or_default().dictionary;
-            batch.put(&SETTINGS, &who.person.id, &settings)?;
-            Ok(settings)
-        })?))
-    })
-    .await
+    blocking(move || app.set_settings(&who, settings).map(Json)).await
 }
 
 async fn words(State(app): State<Shared>, who: Signed) -> Answer<Json<Vec<String>>> {
-    blocking(move || Ok(Json(app.store.get(&SETTINGS, &who.person.id)?.unwrap_or_default().dictionary))).await
+    blocking(move || Ok(Json(app.settings(&who)?.dictionary))).await
 }
 
 async fn add_word(State(app): State<Shared>, who: Signed, Path(word): Path<String>) -> Answer<Json<Vec<String>>> {
@@ -573,49 +553,14 @@ impl App {
         entry
     }
 
-    /// The name `who` signs what they write with: the one they chose, or the one they sign in under.
-    pub fn signs_as(&self, who: &Signed) -> Answer<String> {
-        let settings = self.store.get(&SETTINGS, &who.person.id)?.unwrap_or_default();
-        Ok(settings.name.unwrap_or_else(|| who.person.name.clone()))
-    }
-
-    /// Adds a word to the person's own, or takes it out, and answers the words as they are then. One
-    /// read and write of the store, so two devices that change words at once both have their way.
-    pub fn word(&self, who: &Signed, word: &str, add: bool) -> Answer<Vec<String>> {
-        // Only a word going in is held to the rule: whatever is there can be taken out.
-        let fits = !word.is_empty() && word.chars().count() <= WORD;
-        if add && !(fits && word.chars().all(|letter| !letter.is_whitespace() && !letter.is_control())) {
-            return Err(Refusal::invalid(format!(
-                "A word in your dictionary is a single word of up to {WORD} characters, with no spaces."
-            )));
-        }
-        let words = self.store.write(|batch| {
-            let mut settings = batch.get(&SETTINGS, &who.person.id)?.unwrap_or_default();
-            let at = settings.dictionary.iter().position(|known| known == word);
-            match (add, at) {
-                (true, None) if settings.dictionary.len() >= WORDS => return Ok(None),
-                (true, None) => settings.dictionary.push(word.to_owned()),
-                (false, Some(at)) => drop(settings.dictionary.remove(at)),
-                _ => return Ok(Some(settings.dictionary)),
-            }
-            batch.put(&SETTINGS, &who.person.id, &settings)?;
-            Ok(Some(settings.dictionary))
-        })?;
-        let full = || format!("Your dictionary already holds {WORDS} words. Remove some before adding more.");
-        words.ok_or_else(|| Refusal::invalid(full()))
-    }
-
     pub fn new_document(&self, who: &Signed, space: &str, new: &NewDocument) -> Answer<Entry> {
         let (space, role) = self.space(who, space)?;
         if !role.edits() {
             return Err(Refusal::forbidden("You can read this space, but not add to it."));
         }
         let (root, folder) = (self.root(who, space)?, Place::parse(&new.folder)?);
-        let settings = self.store.get(&SETTINGS, &who.person.id)?.unwrap_or_default();
-        let style = settings.default_style.and_then(|style| Style::from_json(&style.to_string()).ok());
-        let author = settings.name.as_deref().unwrap_or(&who.person.name);
-        let name = new.name.as_deref();
-        let place = self.library.create(&root, &folder, name, style.unwrap_or_default(), author, self.now())?;
+        let (style, author) = (self.new_style(who)?, self.signs_as(who)?);
+        let place = self.library.create(&root, &folder, new.name.as_deref(), style, &author, self.now())?;
         self.entry(who, &space.told(role), &root, &place)
     }
 

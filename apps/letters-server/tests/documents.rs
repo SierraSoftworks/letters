@@ -13,6 +13,7 @@ use letters_api::{
 };
 use letters_format::{Archive, MIMETYPE, WorkingCopy};
 use letters_model::{Document, ReplicaId, Style};
+use letters_server::store::Table;
 
 /// What the folder at `path` of a space lists for `who`.
 async fn listed(who: &common::Client, space: &str, path: &str) -> Vec<Entry> {
@@ -22,6 +23,11 @@ async fn listed(who: &common::Client, space: &str, path: &str) -> Vec<Entry> {
 /// The words as a dictionary answers them.
 fn owned(words: &[&str]) -> Vec<String> {
     words.iter().map(|word| (*word).to_owned()).collect()
+}
+
+/// Adds a word to a person's dictionary or takes it out, and answers the words it holds then.
+async fn word(who: &common::Client, method: Method, word: &str) -> Vec<String> {
+    who.send(method, &paths::word(word), "", Vec::new()).await.json()
 }
 
 /// A smallest PNG, by its first bytes.
@@ -359,9 +365,21 @@ async fn what_a_person_opened_lately_is_listed_newest_first() {
     assert!(server.person("alice", &["family"]).get::<Vec<Entry>>(paths::RECENT).await.unwrap().is_empty());
 }
 
+/// A server where everyone has a space of their own, and one where nobody has: what a person keeps for
+/// themselves is in files of their space on the first and in the server's store on the second, and is
+/// asked for and changed alike. Each with a space its people write in.
+fn homes(name: &str) -> [(Server, &'static str); 2] {
+    [(Server::new(name), "home"), (Server::shared(&format!("{name}-shared")), "family")]
+}
+
 #[tokio::test]
 async fn a_dictionary_changes_a_word_at_a_time_and_only_so() {
-    let server = Server::new("words");
+    for (server, _) in homes("words") {
+        a_dictionary_changes(&server).await;
+    }
+}
+
+async fn a_dictionary_changes(server: &Server) {
     let ben = server.person("ben", &[]);
     assert!(ben.get::<Vec<String>>(paths::DICTIONARY).await.unwrap().is_empty());
 
@@ -398,25 +416,108 @@ async fn a_dictionary_changes_a_word_at_a_time_and_only_so() {
     assert!(server.person("alice", &[]).get::<Vec<String>>(paths::DICTIONARY).await.unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn what_a_person_set_is_kept_and_shapes_their_new_documents() {
-    let server = Server::new("settings");
-    let ben = server.person("ben", &[]);
-    assert_eq!(ben.get::<Settings>(paths::SETTINGS).await.unwrap(), Settings::default());
-
+/// A style that is not the built-in one, and as a person's settings carry it.
+fn styled() -> (Style, serde_json::Value) {
     let mut style = Style::default();
     style.types.get_mut("body").expect("the built-in style sets body text").size = 15.0;
+    let json = serde_json::from_str(&style.to_json()).unwrap();
+    (style, json)
+}
+
+#[tokio::test]
+async fn what_a_person_keeps_for_themselves_is_in_files_of_their_own_space() {
+    let server = Server::new("kept");
+    let ben = server.person("ben", &[]);
+    let kept = server.scratch.0.join("home/ben/.letters");
+    let read = |name: &str| std::fs::read_to_string(kept.join(name));
+
+    // The files are the ones the desktop app keeps in a home folder: a word a line, and a style.
+    let (style, json) = styled();
+    for new in ["yewi", "Pannell"] {
+        word(&ben, Method::PUT, new).await;
+    }
+    ben.put::<Settings>(paths::SETTINGS, &Settings { default_style: Some(json), ..Settings::default() }).await.unwrap();
+    assert_eq!(read("dictionary.txt").unwrap().lines().collect::<Vec<_>>(), ["yewi", "Pannell"]);
+    assert_eq!(Style::from_json(&read("style.json").unwrap()).unwrap(), style);
+
+    // What another writer of the folder left there is the person's as well, and stays as it was written
+    // when the server changes a word.
+    std::fs::write(kept.join("dictionary.txt"), "yewi\nPannell\n  tsidp  \nsierra").unwrap();
+    assert_eq!(ben.get::<Vec<String>>(paths::DICTIONARY).await.unwrap(), ["yewi", "Pannell", "tsidp", "sierra"]);
+    word(&ben, Method::PUT, "letters").await;
+    assert_eq!(word(&ben, Method::DELETE, "Pannell").await, ["yewi", "tsidp", "sierra", "letters"]);
+    assert_eq!(read("dictionary.txt").unwrap(), "yewi\n  tsidp  \nsierra\nletters\n");
+
+    // A person with no style of their own any more has no file of one.
+    let told = ben.put::<Settings>(paths::SETTINGS, &Settings::default()).await.unwrap();
+    assert_eq!((told.default_style, read("style.json").is_ok()), (None, false));
+
+    // The folder is no part of the space: not listed, not to be asked for, and a document's file in it,
+    // such as the desktop app's own copies, is no document here.
+    let id = ben.start("home", "", "Plan").await.id.unwrap();
+    std::fs::create_dir_all(kept.join("servers")).unwrap();
+    for copy in ["Plan.let", "servers/Plan.let"] {
+        std::fs::copy(server.scratch.0.join("home/ben/Plan.let"), kept.join(copy)).unwrap();
+    }
+    server.wait(60);
+    let rows = listed(&ben, "home", "").await;
+    assert_eq!((names(&rows), &rows[0].tags), (vec!["Plan"], &Vec::new()));
+    assert_ne!(ben.get::<Listing>(&paths::entries("home", ".letters")).await.map(|_| ()), Ok(()));
+    assert_eq!(ben.get::<Opened>(&paths::document(&id)).await.unwrap().path, "Plan.let");
+}
+
+#[tokio::test]
+async fn what_an_earlier_build_kept_in_its_store_is_written_to_the_files_once() {
+    let server = Server::new("kept-moved");
+    let ben = server.person("ben", &[]);
+    let rows: Table<Settings> = Table::new("settings");
+    let (_, style) = styled();
+    let before = Settings {
+        name: Some("Benjamin".into()),
+        dictionary: owned(&["yewi", "tsidp"]),
+        default_style: Some(style.clone()),
+        ..Settings::default()
+    };
+    server.app.store.put(&rows, "sub-ben", &before).unwrap();
+    // The folder has words of its own already, from a device that has it as its home folder.
+    let kept = server.scratch.0.join("home/ben/.letters");
+    std::fs::create_dir_all(&kept).unwrap();
+    std::fs::write(kept.join("dictionary.txt"), "tsidp\nsierra").unwrap();
+
+    let told = ben.get::<Settings>(paths::SETTINGS).await.unwrap();
+    let all = owned(&["tsidp", "sierra", "yewi"]);
+    assert_eq!((told.name.as_deref(), told.dictionary, told.default_style), (Some("Benjamin"), all, Some(style)));
+
+    // The store keeps neither afterwards, so a word that is taken out stays out.
+    let row = server.app.store.get(&rows, "sub-ben").unwrap().unwrap();
+    assert_eq!((row.name.as_deref(), row.dictionary.len(), row.default_style), (Some("Benjamin"), 0, None));
+    assert_eq!(word(&ben, Method::DELETE, "yewi").await, ["tsidp", "sierra"]);
+    assert_eq!(ben.get::<Vec<String>>(paths::DICTIONARY).await.unwrap(), ["tsidp", "sierra"]);
+}
+
+#[tokio::test]
+async fn what_a_person_set_is_kept_and_shapes_their_new_documents() {
+    for (server, space) in homes("settings") {
+        what_a_person_set_is_kept(&server, space).await;
+    }
+}
+
+async fn what_a_person_set_is_kept(server: &Server, space: &str) {
+    let ben = server.person("ben", &["family"]);
+    assert_eq!(ben.get::<Settings>(paths::SETTINGS).await.unwrap(), Settings::default());
+
+    let (style, json) = styled();
     let settings = Settings {
         name: Some("Benjamin".into()),
         accent: Some([10, 120, 60]),
-        default_style: Some(serde_json::from_str(&style.to_json()).unwrap()),
+        default_style: Some(json),
         ..Settings::default()
     };
     assert_eq!(ben.put::<Settings>(paths::SETTINGS, &settings).await.unwrap(), settings);
     assert_eq!(ben.get::<Settings>(paths::SETTINGS).await.unwrap(), settings);
     assert_eq!(server.person("alice", &[]).get::<Settings>(paths::SETTINGS).await.unwrap(), Settings::default());
 
-    let made = ben.start("home", "", "Styled").await;
+    let made = ben.start(space, "", "Styled").await;
     assert_eq!(made.contributors, ["Benjamin"], "edits are signed with the name the person set");
     let file = ben.send(Method::GET, &paths::file(&made.id.unwrap()), "", Vec::new()).await;
     assert_eq!(Archive::open(Cursor::new(file.body)).unwrap().style().unwrap(), style);
