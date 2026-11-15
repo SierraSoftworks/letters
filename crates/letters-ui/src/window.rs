@@ -72,8 +72,8 @@ use crate::threads::{self, Said};
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::ui::{App, DRAG_SLOP, Idle, Keys, Ui};
 use crate::widgets::{
-    Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, Title, TopBar, banner, side_panel,
-    top_bar,
+    Banner, Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, Title, Tone, TopBar, banner,
+    side_panel, top_bar,
 };
 use crate::words::WordLists;
 
@@ -139,6 +139,21 @@ pub enum SaveState {
     /// browser does without a server. The bar's mark is then a button that asks with [`Request::Save`],
     /// and so do the palette and Ctrl or Cmd with S.
     Edited,
+}
+
+/// How the window stands to the server that keeps its document, for a shell that syncs with one. The bar
+/// says the document is offline for all but [`Connection::Live`], whatever was last told of saving.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Connection {
+    /// The server is not reached. Changes are kept on this device.
+    Offline,
+    /// The server was asked and has not answered.
+    Connecting,
+    /// In session: [`SaveState`] says where the person's work is.
+    Live,
+    /// The server ended the session for a reason that waiting does not mend, told in a sentence that stands
+    /// by itself. A bar under the top bar says it, and offers another try with [`Request::Connect`].
+    Refused(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,6 +452,14 @@ impl Ui<EditorApp> {
 
     pub fn set_save_state(&mut self, state: SaveState) {
         self.app_mut().save = state;
+    }
+
+    /// Says how the window stands to the server that keeps the document: see [`Connection`]. `None` is
+    /// for a document that no server keeps, which is what a window takes its document for until told.
+    pub fn set_connection(&mut self, connection: Option<Connection>) {
+        if self.app().connection != connection {
+            self.app_mut().connection = connection;
+        }
     }
 
     /// Says who else has the document open: see [`Peer`]. Their faces stand on the bar, and the page shows
@@ -991,6 +1014,8 @@ pub struct EditorApp {
     /// Whether keys follow macOS conventions, which is how the menus then write them.
     mac: bool,
     save: SaveState,
+    /// How the window stands to the server that keeps the document, when one does.
+    connection: Option<Connection>,
     /// Who else has the document open.
     presence: Presence,
     edits: u64,
@@ -1102,6 +1127,7 @@ impl EditorApp {
             copy_asked: None,
             mac: cfg!(target_os = "macos"),
             save: SaveState::default(),
+            connection: None,
             presence: Presence::default(),
             edits: 0,
             panel: None,
@@ -2843,6 +2869,13 @@ impl EditorApp {
         }
     }
 
+    /// The bar that says why a server ended the session, with the button that asks it again.
+    fn refused(&self) -> Option<Element<Message>> {
+        let Some(Connection::Refused(why)) = &self.connection else { return None };
+        let again = Button::new("Try again").small().on_press(Message::Ask(Request::Connect));
+        Some(Banner::new(why.as_str()).tone(Tone::Warn).icon(icon::CLOUD_OFF).action(again).into())
+    }
+
     /// Puts the caret at the start of a block and brings the block to the top of the page.
     fn jump(&mut self, block: BlockId) {
         let start = Pos { block, offset: 0 };
@@ -4284,13 +4317,23 @@ impl EditorApp {
         let name = if own { name } else { name.fg(tokens::FG_MUTED) };
         let mut lead = vec![page, name];
 
+        // Nothing reaches a server the window is not in session with, whatever was last said of saving.
+        let apart = self.connection.as_ref().filter(|connection| **connection != Connection::Live);
+        let save = match self.save {
+            SaveState::Saved | SaveState::Saving if apart.is_some() => SaveState::Offline,
+            save => save,
+        };
         // How saving stands is an icon of one size whatever it says, so that nothing after it moves when
         // saving starts. A document not yet written keeps the room.
-        let (state, said, more, ink) = match self.save {
+        let (state, said, more, ink) = match save {
             SaveState::Saved => (icon::CLOUD_CHECK, "Saved", None, tokens::FG_MUTED),
             SaveState::Saving => (icon::REFRESH_CW, "Saving", None, tokens::FG_MUTED),
             SaveState::Offline => {
-                (icon::CLOUD_OFF, "Offline", Some("Changes are kept on this device"), tokens::FG_MUTED)
+                let kept = Some("Changes are kept on this device");
+                match apart {
+                    Some(Connection::Connecting) => (icon::CLOUD, "Connecting", kept, tokens::FG_MUTED),
+                    _ => (icon::CLOUD_OFF, "Offline", kept, tokens::FG_MUTED),
+                }
             }
             SaveState::Failed => {
                 (icon::CLOUD_ALERT, "Not saved", Some("The last changes could not be written"), tokens::DANGER)
@@ -4312,7 +4355,7 @@ impl EditorApp {
             }
         };
         // For a moment after its first write, the icon tells where the document went.
-        let note = self.note.as_ref().filter(|_| self.save == SaveState::Saved);
+        let note = self.note.as_ref().filter(|_| save == SaveState::Saved);
         let said = note.map_or_else(|| said.to_owned(), |(note, _)| note.clone());
         let tip = more.map_or_else(|| said.clone(), |more| format!("{said}. {more}"));
         let mut saved = Element::icon(state, SAVE_ICON)
@@ -5070,6 +5113,9 @@ impl App for EditorApp {
         // the page.
         let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height() + told;
         let bar = bar + self.merges.height();
+        // So does what a server said when it ended the session.
+        let refused = self.refused();
+        let bar = bar + if refused.is_some() { banner::HEIGHT } else { 0.0 };
         // The history has a strip of its versions under the page and the panel.
         let strip = self.history.as_ref().map(History::strip);
         let foot = if strip.is_some() { history::STRIP } else { 0.0 };
@@ -5097,7 +5143,7 @@ impl App for EditorApp {
         let over = over.chain(commands);
         // It comes first, so that whatever else opens lies over it and is the first that Escape puts away.
         let all = Element::column().bg(tokens::BG).fg(tokens::FG).children(find);
-        let all = all.child(self.bar()).children(self.safe.bar()).children(self.merges.bar());
+        let all = all.child(self.bar()).children(refused).children(self.safe.bar()).children(self.merges.bar());
         let all = all.children(conflicts).child(body).children(strip).children(over);
         if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
     }

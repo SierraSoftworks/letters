@@ -1,9 +1,10 @@
-//! The others who have the document open: their faces on the bar, and their carets and selections on the page.
+//! The others who have the document open: their faces on the bar, their carets and selections on the page,
+//! and what the bar says of the server that tells of them.
 
 use letters_model::{Block, BlockKind, Document, Pos, Selection};
 use letters_render::{Color, Item, Point, Rect};
 use letters_test::{Found, Harness, Role};
-use letters_ui::Peer;
+use letters_ui::{Connection, Peer, Request, SaveState};
 
 /// A title and three paragraphs `a`, `b` and `c`, then `more` paragraphs `p0`, `p1` and so on.
 fn letter(more: usize) -> Harness {
@@ -101,6 +102,14 @@ fn washed(window: &mut Harness, (start, end): (Rect, Rect)) -> Option<Color> {
         _ => None,
     };
     window.paint().items.iter().find_map(under)
+}
+
+/// What the bar says of saving: the name of its mark, between the document's name and the tools.
+fn mark(window: &mut Harness) -> String {
+    let says = ["Saved", "Saving", "Offline", "Connecting", "Not saved"];
+    let found =
+        window.controls().into_iter().find(|found| found.role == Role::Label && says.contains(&found.name.as_str()));
+    found.map(|found| found.name).unwrap_or_default()
 }
 
 #[test]
@@ -305,9 +314,11 @@ fn a_list_that_says_nothing_new_asks_for_no_frame() {
     let mut window = letter(0);
     let here = vec![peer(1, "Alice Martin", 0, Some(("c", 46, 46)))];
     window.ui().set_peers(here.clone());
+    window.ui().set_connection(Some(Connection::Live));
     window.advance(0).advance(5000);
     window.paint();
     window.ui().set_peers(here);
+    window.ui().set_connection(Some(Connection::Live));
     assert!(!window.ui().needs_paint());
 }
 
@@ -321,4 +332,62 @@ fn the_window_tells_of_the_persons_selection_while_the_page_shows() {
     window.click(Role::Button, "History");
     assert_eq!(window.ui().selection(), None, "an earlier version is not where the person writes");
     assert_eq!(faces(&mut window), [""; 0]);
+}
+
+#[test]
+fn the_bar_says_how_the_document_stands_to_its_server() {
+    let refused = || Connection::Refused("You do not have access to this document.".to_owned());
+    // What the shell says of the server and of saving, and what the bar's mark says.
+    let cases = [
+        (None, SaveState::Saved, "Saved"),
+        (None, SaveState::Saving, "Saving"),
+        (Some(Connection::Live), SaveState::Saved, "Saved"),
+        (Some(Connection::Live), SaveState::Saving, "Saving"),
+        (Some(Connection::Live), SaveState::Offline, "Offline"),
+        (Some(Connection::Offline), SaveState::Saved, "Offline"),
+        (Some(Connection::Offline), SaveState::Saving, "Offline"),
+        (Some(Connection::Connecting), SaveState::Saved, "Connecting"),
+        (Some(refused()), SaveState::Saved, "Offline"),
+        // A write to this device that failed is told whatever the server does.
+        (Some(Connection::Offline), SaveState::Failed, "Not saved"),
+    ];
+    for (connection, save, says) in cases {
+        let mut window = letter(0);
+        window.ui().set_save_state(save);
+        window.ui().set_connection(connection.clone());
+        assert_eq!(mark(&mut window), says, "{connection:?}, {save:?}");
+    }
+}
+
+#[test]
+fn a_session_the_server_ended_says_why_and_offers_another_try() {
+    let why = "You do not have access to this document.";
+    let mut window = letter(0);
+    let before = page(&mut window);
+    assert!(window.find(Role::Alert, why).is_none());
+    window.ui().set_connection(Some(Connection::Refused(why.to_owned())));
+    let bar = window.find(Role::Alert, why).expect("a bar says why").bounds;
+    let after = page(&mut window);
+    assert!(after.y >= bar.y + bar.height && after.height < before.height, "the bar takes its room from the page");
+    window.click(Role::Button, "Try again");
+    assert_eq!(window.ui().take_requests(), [Request::Connect]);
+    // The end of a long document still comes into what the window shows.
+    let mut long = letter(60);
+    long.resize(900.0, 500.0);
+    long.ui().set_connection(Some(Connection::Refused(why.to_owned())));
+    long.click_at(Point { x: 450.0, y: 300.0 }).key("Mod+End");
+    long.paint();
+    let caret = long.ui().caret_rect().expect("a caret at the end");
+    assert!(caret.y + caret.height <= 500.0, "{caret:?}");
+    // The page under it is still the person's to write.
+    window.type_text("So. ");
+    assert!(window.markdown().starts_with("# So. Cottage renovation"));
+    // The bar stays until the shell says how the next try went.
+    assert!(window.find(Role::Alert, why).is_some());
+    for next in [Some(Connection::Connecting), Some(Connection::Live), None] {
+        window.ui().set_connection(Some(Connection::Refused(why.to_owned())));
+        window.ui().set_connection(next.clone());
+        assert!(window.find(Role::Alert, why).is_none(), "{next:?}");
+        assert!(window.find(Role::Button, "Try again").is_none(), "{next:?}");
+    }
 }

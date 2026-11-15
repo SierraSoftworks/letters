@@ -87,4 +87,4 @@ pub use text::{Family, FixedShaper, FontShaper, GlyphRun, Shaped, Stop, TextShap
 pub use theme::Accent;
 pub use tokens::{Color as Ink, Scheme};
 pub use ui::{App, Idle, Keys, Ui};
-pub use window::{DocLines, EditorApp, SaveState, Window, palette};
+pub use window::{Connection, DocLines, EditorApp, SaveState, Window, palette};

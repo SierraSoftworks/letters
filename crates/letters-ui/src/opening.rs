@@ -176,6 +176,9 @@ pub enum Request {
     FetchPreview {
         url: String,
     },
+    /// The person wants the server asked again, after it ended the session: see
+    /// [`Connection::Refused`](crate::Connection). Answer with `Window::set_connection`.
+    Connect,
 }
 
 /// A document opened lately, as the landing card lists it.
