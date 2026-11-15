@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use letters_api::{Code, CreatedLink, EntryKind, Grant, NewLink, Opened, Shares, paths};
+use letters_api::{Access, Code, CreatedLink, EntryKind, Grant, NewLink, Opened, Shares, paths};
 use letters_format::{Archive, WorkingCopy};
 use letters_model::{Model, Notes, ReplicaId, Selection};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
@@ -254,6 +254,8 @@ pub enum Sharing {
     Link(NewLink),
     /// A link to revoke, by its id.
     Revoke(String),
+    /// Who reached the document through a share.
+    Log,
 }
 
 /// What a document's server answered the Share dialog.
@@ -264,6 +266,8 @@ pub enum Shared {
     /// The link that was asked for, with its address.
     Made(CreatedLink),
     Revoked,
+    /// Who reached the document through a share, newest first.
+    Log(Vec<Access>),
     /// Why it was not done, as the person is to read it.
     Refused(String),
 }
@@ -276,6 +280,7 @@ pub fn share(session: &Session, id: &str, ask: &Sharing) -> Shared {
         Sharing::People(people) => session.share(id, people).map(told),
         Sharing::Link(new) => session.make_link(id, new).map(Shared::Made),
         Sharing::Revoke(link) => session.revoke_link(id, link).map(|()| Shared::Revoked),
+        Sharing::Log => session.access_log(id).map(Shared::Log),
     };
     answered.unwrap_or_else(|refused| {
         Shared::Refused(match refused {

@@ -2297,13 +2297,18 @@ impl App {
                 Request::MergeIntoOriginal { confirmed } => self.merge_into_original(id, confirmed, now),
                 Request::Connect => self.reconnect(id, now),
                 // The Share dialog asks of a document's server. With no server it asks nothing.
-                Request::Shares | Request::SharePeople(_) | Request::MakeLink(_) | Request::RevokeLink(_) => {
+                Request::Shares
+                | Request::SharePeople(_)
+                | Request::MakeLink(_)
+                | Request::RevokeLink(_)
+                | Request::AccessLog => {
                     let window = self.windows.get_mut(&id);
                     let Some(remote) = window.and_then(|window| window.remote.as_mut()) else { continue };
                     remote.shares.push(match request {
                         Request::SharePeople(people) => Sharing::People(people),
                         Request::MakeLink(new) => Sharing::Link(new),
                         Request::RevokeLink(link) => Sharing::Revoke(link),
+                        Request::AccessLog => Sharing::Log,
                         _ => Sharing::Look,
                     });
                 }
@@ -2568,6 +2573,7 @@ impl App {
                 connected::Shared::Made(link) => window.view.link_made(link),
                 // The dialog dropped the link when it asked.
                 connected::Shared::Revoked => {}
+                connected::Shared::Log(log) => window.view.set_access_log(log),
                 connected::Shared::Refused(why) => window.view.refuse_share(&why),
             }
         }

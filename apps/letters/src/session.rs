@@ -9,8 +9,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use letters_api::{
-    Code, CreatedLink, Entry, Grant, Limits, Listing, Move, NewFolder, NewLink, Opened, Person, Rename, Shares, Space,
-    Token, paths,
+    Access, Code, CreatedLink, Entry, Grant, Limits, Listing, Move, NewFolder, NewLink, Opened, Person, Rename, Shares,
+    Space, Token, paths,
 };
 
 use crate::keychain::{Keychain, Unkept};
@@ -203,6 +203,11 @@ impl Session {
     pub fn share(&self, id: &str, people: &[Grant]) -> Result<Shares, Refused> {
         let shares = Shares { people: people.to_vec(), links: Vec::new() };
         self.ask(|server, token| server.put(token, &paths::shares(id), &shares))
+    }
+
+    /// Who reached a document through a share, newest first.
+    pub fn access_log(&self, id: &str) -> Result<Vec<Access>, Refused> {
+        self.ask(|server, token| server.get(token, &paths::access(id)))
     }
 
     /// Makes a link to a document. Its address is told this once.

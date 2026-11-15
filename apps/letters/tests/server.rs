@@ -18,8 +18,8 @@ use letters::server::{Client, Refused};
 use letters::session::Session;
 use letters::signin::{SignIn, Unsigned};
 use letters_api::{
-    Allows, Code, CreatedLink, Exchange, Grant, Grantee, Link, NewLink, Opened, Person, Renewal, Role, Shares, Space,
-    SpaceKind, Token, Trust, paths,
+    Access, Action, Allows, Code, CreatedLink, Exchange, Grant, Grantee, Link, NewLink, Opened, Person, Renewal, Role,
+    Shares, Space, SpaceKind, Token, Trust, Who, paths,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -195,6 +195,15 @@ impl Letters {
                 }
                 Answer("204 No Content", "", Vec::new())
             }
+            "GET /api/v1/documents/d1/access" => json(&[Access {
+                time: 3,
+                who: Who::Link { id: "link-1".into(), label: "Accountant".into() },
+                action: Action::Open,
+                role: Role::Reader,
+                refused: false,
+                address: "192.0.2.7".into(),
+                browser: "Firefox".into(),
+            }]),
             "GET /api/v1/forbidden" => said(Code::Forbidden, "That is not yours to read."),
             "GET /api/v1/elsewhere" => Answer("302 Found", "location: https://elsewhere.example/\r\n", Vec::new()),
             "GET /api/v1/page" => {
@@ -709,6 +718,10 @@ fn the_share_dialog_is_answered_by_the_documents_server() {
     assert_eq!(share(Sharing::Revoke(made.link.id.clone())), Shared::Revoked);
     let Shared::Shares(now, _) = share(Sharing::Look) else { panic!("the shares are told") };
     assert!(now.links.iter().any(|link| link.id == made.link.id && link.revoked.is_some()), "{now:?}");
+
+    // Who came through a share is listed as the server logged it.
+    let Shared::Log(log) = share(Sharing::Log) else { panic!("the log is told") };
+    assert!(matches!(&log[..], [Access { who: Who::Link { label, .. }, .. }] if label == "Accountant"), "{log:?}");
 
     // A refusal is the server's own sentence, and a server that shares nothing yet is named as one.
     assert_eq!(
