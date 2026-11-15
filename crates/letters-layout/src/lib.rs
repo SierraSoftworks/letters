@@ -80,7 +80,7 @@ pub struct FigureBox {
     /// is fitted in.
     pub image: Rect,
     /// The caption under it. While there is none this is where its first line would be, which reaches into
-    /// the space below the figure.
+    /// the space below the figure unless [`DocLayout::set_caption_open`] keeps that line open.
     pub caption: Rect,
     /// The cloud on a picture that is still a link, when the picture has room for one. It keeps its place
     /// when the picture is loaded and drawn, where nothing marks it.
@@ -161,6 +161,7 @@ impl DocLayout {
             stands: false,
             numbers: HashMap::new(),
             loaded: HashMap::new(),
+            caption: None,
             scratch: Laid::default(),
         };
         Self { state: RefCell::new(state) }
@@ -250,6 +251,21 @@ impl DocLayout {
     /// [`FigureBox::badge`] answers either way, since a loaded picture is a link until it is embedded.
     pub fn set_loaded(&mut self, src: &str, size: Option<(u32, u32)>) -> bool {
         self.state.get_mut().set_loaded(src, size)
+    }
+
+    /// Keeps the line of a caption open under one figure or gallery while it has no caption: the one the
+    /// selection is at, where a caption is about to be written. `block` is the figure or the gallery, a
+    /// picture of the gallery or the gallery's caption, and `None` or any other block closes the line.
+    ///
+    /// A figure with no caption and no number is only as tall as its picture, so that
+    /// [`FigureBox::caption`] and the caret of an empty caption lie over the block below. With its line
+    /// open they have a line of their own, and nothing moves when the first letter is typed. A figure
+    /// that has a caption or a number has the line already.
+    ///
+    /// Returns whether a line opened or closed, which moves what is below it. Only the screen has the
+    /// line: a sheet shows the document.
+    pub fn set_caption_open(&mut self, block: Option<&BlockId>) -> bool {
+        self.state.get_mut().set_caption_open(block)
     }
 
     /// Lets formulas link, as `\\href` asks. Off until set, and only a document that is trusted may have it on.
@@ -504,6 +520,8 @@ struct State {
     /// The links whose pictures the shell has, which are drawn in place of their frames, each with the
     /// size of its picture.
     loaded: HashMap<String, (f32, f32)>,
+    /// The figure or gallery that keeps the line of its caption while it has none.
+    caption: Option<BlockId>,
     /// A layout to measure with, so that measuring allocates nothing.
     scratch: Laid,
 }
@@ -632,6 +650,8 @@ impl State {
         self.spelling.retain(|id, ranges| worded(id) && !ranges.is_empty());
         self.recount();
         self.stale = 0;
+        // A leaf made anew for the figure whose caption is open, as when its picture is resized, opens too.
+        self.open_caption(true);
     }
 
     /// Counts the leaves whose height is a guess and those that hold a layout.
@@ -752,20 +772,57 @@ impl State {
         self.unlay(leaf);
     }
 
-    /// Runs `work` on the document as it prints, where no formula shows for the caret. The pages of one
-    /// pagination are then the same wherever the caret goes meanwhile.
+    /// Runs `work` on the document as it prints, where no formula shows for the caret and no caption has
+    /// a line that it does not fill. The pages of one pagination are then the same wherever the caret goes
+    /// meanwhile.
     fn printed<T>(&mut self, work: impl FnOnce(&mut Self) -> T) -> T {
         let shows = self.shows_open();
         if shows {
             self.unlay_open();
         }
-        let open = self.open.take();
+        let (open, captioned) = (self.open.take(), self.open_caption(false));
         let done = work(self);
         self.open = open;
         if shows {
             self.unlay_open();
         }
+        if captioned {
+            self.open_caption(true);
+        }
         done
+    }
+
+    fn set_caption_open(&mut self, block: Option<&BlockId>) -> bool {
+        // A picture of a gallery and the gallery's caption both name the gallery.
+        let leaf = block.and_then(|block| self.index.get(block)).map(|slot| &self.leaves[slot.leaf]);
+        let named =
+            leaf.filter(|leaf| matches!(leaf.what, What::Figure | What::Gallery)).and_then(|leaf| leaf.id.clone());
+        if named == self.caption {
+            return false;
+        }
+        let closed = self.open_caption(false);
+        self.caption = named;
+        self.open_caption(true) | closed
+    }
+
+    /// Opens or closes the line of the caption that is kept open, in the leaf that shows it. Returns
+    /// whether the leaf is another height for it, which one with a caption or a number is not.
+    fn open_caption(&mut self, open: bool) -> bool {
+        let Some(&Slot { leaf: at, .. }) = self.caption.as_ref().and_then(|block| self.index.get(block)) else {
+            return false;
+        };
+        let leaf = &mut self.leaves[at];
+        let shown = leaf.captioned();
+        if !matches!(leaf.what, What::Figure | What::Gallery) || std::mem::replace(&mut leaf.open, open) == open {
+            return false;
+        }
+        if leaf.captioned() == shown {
+            return false;
+        }
+        // It is what the selection is at, so it is given its height at once.
+        self.unlay(at);
+        self.lay(at);
+        true
     }
 
     /// Drops a leaf's layout, so that it is laid out again when next needed. Its height stays as the

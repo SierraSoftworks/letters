@@ -194,6 +194,81 @@ fn a_loaded_picture_keeps_its_shape_in_the_box_its_figure_stores() {
 }
 
 #[test]
+fn an_empty_caption_has_a_line_of_its_own_where_one_is_about_to_be_written() {
+    let sheet = |layout: &DocLayout| {
+        let mut sheet = DisplayList::default();
+        layout.paint_page(&layout.paginate(&paper(WIDTH, 1.0e6)), 0, &mut sheet);
+        sheet.items
+    };
+    let below = |layout: &DocLayout| layout.caret(&Pos::new("z", 0)).unwrap().y;
+    // What holds pictures and no caption, the block that is named to open its caption's line, and the block
+    // its caption is written in.
+    let cases = [
+        ("a figure", picture("f", ""), "f", "f"),
+        ("a gallery, by a picture of it", tiles(3, Some("")), "g1", "gc"),
+        ("a gallery, by its caption", tiles(3, Some("")), "gc", "gc"),
+    ];
+    for (name, block, at, caption) in cases {
+        let figure = block.id.clone();
+        let mut model = Model::new(doc(vec![block, paragraph("z", PROSE)]), ReplicaId::from(1));
+        let mut layout = laid(model.doc());
+        let line = |layout: &DocLayout| layout.figure(&figure).unwrap().caption;
+        let (closed, printed) = (below(&layout), sheet(&layout));
+        assert!(bottom(line(&layout)) > closed, "{name}: with no caption, its line lies over the block below");
+
+        assert!(layout.set_caption_open(Some(&at.into())), "{name}: its line opens");
+        let (open, own) = (below(&layout), line(&layout));
+        assert!(own.height > 0.0 && bottom(own) <= open, "{name}: clear of the block below: {own:?}");
+        let caret = layout.caret(&Pos::new(caption, 0)).unwrap();
+        assert!(caret.y >= own.y && bottom(caret) <= bottom(own), "{name}: with the caption's caret on it: {caret:?}");
+        assert!(!layout.set_caption_open(Some(&at.into())), "{name}: named again, nothing changes");
+        assert!(sheet(&layout) == printed, "{name}: a sheet shows the document, which has no such line");
+        assert_eq!(below(&layout), open, "{name}: and the screen keeps it");
+
+        let mut edit = |layout: &mut DocLayout, op: Op| {
+            let change = model.apply(vec![op]).unwrap();
+            layout.update(model.doc(), &Style::default(), WIDTH, Some(&change));
+        };
+        edit(&mut layout, Op::InsertText { at: Pos::new(caption, 0), text: "A".into() });
+        assert!((below(&layout) - open).abs() < 0.5, "{name}: nothing moves when the first letter is typed");
+        edit(&mut layout, Op::DeleteText { block: caption.into(), range: 0..1 });
+        assert!((below(&layout) - open).abs() < 0.5, "{name}: nor when it is taken away again");
+
+        assert!(layout.set_caption_open(Some(&"z".into())), "{name}: a block that is no figure closes it");
+        assert_eq!(below(&layout), closed, "{name}: and the figure is as tall as its pictures again");
+    }
+}
+
+#[test]
+fn a_caption_line_is_open_only_where_it_is_missing() {
+    let below = |layout: &DocLayout| layout.caret(&Pos::new("z", 0)).unwrap().y;
+    // Figures that have their caption's line already, and one whose gallery has no caption to write in.
+    let cases = [
+        ("a figure with a caption", picture("f", "The harbour"), false),
+        ("a numbered figure", numbered(picture("f", "")), false),
+        ("a gallery with no caption block", gallery("f", vec![picture("f0", ""), picture("f1", "")], None), true),
+    ];
+    for (name, block, opens) in cases {
+        let mut layout = laid(&doc(vec![block, paragraph("z", PROSE)]));
+        let closed = below(&layout);
+        assert_eq!(layout.set_caption_open(Some(&"f".into())), opens, "{name}");
+        assert_eq!(below(&layout) > closed, opens, "{name}: the block below moves only for a line that opens");
+        assert_eq!(layout.set_caption_open(None), opens, "{name}: and back");
+        assert_eq!(below(&layout), closed, "{name}");
+    }
+
+    // A picture that is resized is a new figure to layout, and keeps its line.
+    let mut model = Model::new(doc(vec![picture("f", ""), paragraph("z", PROSE)]), ReplicaId::from(1));
+    let mut layout = laid(model.doc());
+    layout.set_caption_open(Some(&"f".into()));
+    let resized = figure("f", (300.0, 100.0), "");
+    let change = model.apply(vec![Op::SetKind { block: resized.id.clone(), kind: resized.kind }]).unwrap();
+    layout.update(model.doc(), &Style::default(), WIDTH, Some(&change));
+    let line = layout.figure(&"f".into()).unwrap().caption;
+    assert!(bottom(line) <= below(&layout), "the line stays open under a picture of another size: {line:?}");
+}
+
+#[test]
 fn a_picture_is_no_taller_than_a_page_holds() {
     // A style whose page has a text area as wide as the column and `room` tall.
     let room = 400.0;

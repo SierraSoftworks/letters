@@ -416,6 +416,9 @@ pub(crate) struct Leaf {
     pub pictures: Vec<Picture>,
     /// The number a numbered figure or gallery is given, which its caption opens with.
     pub number: Option<u32>,
+    /// Whether a figure or gallery keeps the line of its caption while it has none, for whoever is about
+    /// to write one.
+    pub open: bool,
     /// The cells of a table row.
     pub cells: Vec<Cell>,
     /// The table a row is part of, and whether it is its header.
@@ -490,9 +493,9 @@ impl Leaf {
         }
     }
 
-    /// Whether a figure or gallery shows a caption under its pictures.
+    /// Whether a figure or gallery has a line for a caption under its pictures.
     pub fn captioned(&self) -> bool {
-        !self.words.text.is_empty() || self.number.is_some()
+        !self.words.text.is_empty() || self.number.is_some() || self.open
     }
 
     /// Whether the leaf sets a text of its own, and not only those of its cells.
