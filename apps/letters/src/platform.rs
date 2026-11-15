@@ -48,6 +48,10 @@ impl Platform for Desktop {
         self.start.elapsed().as_millis() as u64
     }
 
+    fn wall_time(&self) -> Option<u64> {
+        SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|since| since.as_secs())
+    }
+
     fn clipboard_read(&mut self) -> Option<Clip> {
         let clipboard = self.clipboard()?;
         let html = clipboard.get().html().ok().filter(|html| !html.is_empty());

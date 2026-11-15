@@ -47,6 +47,7 @@ use crate::platform::{self, Desktop};
 use crate::present::{Painter, Presenter};
 use crate::trust::{self, Trusted};
 use crate::words::{self, Words};
+use crate::writer;
 
 const MAC: bool = cfg!(target_os = "macos");
 /// How long typing must pause before a save starts.
@@ -78,6 +79,8 @@ pub enum Event {
     Motion(bool),
     /// The desktop has said which buttons its windows carry.
     Buttons(Buttons),
+    /// The name of the person writing has been found.
+    Writer(String),
     /// A system dictionary a window's document asked for has been read, under the name it has on disk.
     Dictionary(WindowId, String, Box<Dictionary>),
 }
@@ -115,6 +118,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         dictionaries: dictionaries::system_folders(&home).into(),
         reduced_motion: false,
         buttons: Buttons::guess(),
+        writer: None,
         gpu: match std::env::var("LETTERS_RENDERER").as_deref() {
             Ok("cpu") => GpuState::Off,
             Ok("gpu") => GpuState::Wanted { software: true },
@@ -246,6 +250,8 @@ struct App {
     reduced_motion: bool,
     /// The buttons the desktop's windows carry: a guess until it has been asked, after the first frame.
     buttons: Buttons,
+    /// The name edits are signed with, once it has been found, after the first frame.
+    writer: Option<String>,
     gpu: GpuState,
     windows: HashMap<WindowId, DocWindow>,
     mods: ModifiersState,
@@ -286,8 +292,9 @@ struct DocWindow {
     cursor: Cursor,
     /// Whether the window has been offered the GPU. It is offered once, after its first frame.
     gpu_offered: bool,
-    /// Whether the accessibility tree is behind the view.
+    /// Whether the accessibility tree is behind the view, and whether it must be told again in full.
     access_stale: bool,
+    access_whole: bool,
     /// The frame the view was last told to draw.
     chrome: Chrome,
     /// The height of the unified title bar the system gave the window, which the bar then fills.
@@ -647,7 +654,9 @@ impl DocWindow {
             });
         }
         if std::mem::take(&mut self.access_stale) {
-            self.access.update_if_active(|| self.view.access());
+            // Assistive technology that has just started is told everything, and after that what changed.
+            let (view, whole) = (&mut self.view, &mut self.access_whole);
+            self.access.update_if_active(|| if std::mem::take(whole) { view.access() } else { view.access_changes() });
         }
         if self.view.edits() != self.noticed_edits {
             self.noticed_edits = self.view.edits();
@@ -950,6 +959,7 @@ impl App {
             cursor: Cursor::Default,
             gpu_offered: false,
             access_stale: false,
+            access_whole: true,
             chrome: Chrome::default(),
             bar,
             wake_ms: None,
@@ -979,6 +989,9 @@ impl App {
             journal_at: None,
         };
         window.view.set_reduced_motion(self.reduced_motion);
+        if let Some(writer) = &self.writer {
+            window.view.set_author(writer);
+        }
         if !window.place.naming() {
             window.view.set_document_name(&window.place.name());
         }
@@ -1286,6 +1299,10 @@ impl ApplicationHandler<Event> for App {
                     // The desktop is asked over D-Bus, which is not worth holding a frame for.
                     let proxy = self.proxy.clone();
                     thread::spawn(move || {
+                        // First, since it is wanted before the first edit.
+                        if let Some(writer) = std::env::home_dir().and_then(|home| writer::find(&home)) {
+                            let _ = proxy.send_event(Event::Writer(writer));
+                        }
                         if let Some(reduced) = chrome::reduced_motion() {
                             let _ = proxy.send_event(Event::Motion(reduced));
                         }
@@ -1472,6 +1489,10 @@ impl ApplicationHandler<Event> for App {
                     window.view.set_reduced_motion(reduced);
                 }
             }
+            Event::Writer(name) => {
+                self.windows.values_mut().for_each(|window| window.view.set_author(&name));
+                self.writer = Some(name);
+            }
             Event::Buttons(buttons) => {
                 self.buttons = buttons;
                 for window in self.windows.values_mut() {
@@ -1491,7 +1512,9 @@ impl ApplicationHandler<Event> for App {
             Event::Access(accesskit_winit::Event { window_id, window_event }) => {
                 let Some(window) = self.windows.get_mut(&window_id) else { return };
                 match window_event {
-                    accesskit_winit::WindowEvent::InitialTreeRequested => window.access_stale = true,
+                    accesskit_winit::WindowEvent::InitialTreeRequested => {
+                        (window.access_stale, window.access_whole) = (true, true);
+                    }
                     accesskit_winit::WindowEvent::ActionRequested(request) => {
                         window.view.access_action(request, &mut self.platform);
                         window.access_stale = true;

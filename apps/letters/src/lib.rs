@@ -26,3 +26,4 @@ pub mod present;
 pub mod shadow;
 pub mod trust;
 pub mod words;
+pub mod writer;

@@ -169,6 +169,11 @@ impl Ui<EditorApp> {
         &self.app().editor
     }
 
+    /// Names who writes in this window. Edits made from here on carry the name.
+    pub fn set_author(&mut self, name: &str) {
+        self.app_mut().editor.set_author(name);
+    }
+
     /// Moves the selection and brings it into view, as a click on the page does.
     pub fn select(&mut self, selection: Selection) {
         let app = self.app_mut();

@@ -2592,6 +2592,7 @@ dependencies = [
  "rfd",
  "serde_json",
  "softbuffer",
+ "toml_edit",
  "winit",
  "zbus",
 ]

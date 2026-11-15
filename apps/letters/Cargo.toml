@@ -33,6 +33,7 @@ rfd.workspace = true
 getrandom.workspace = true
 jiff.workspace = true
 encoding_rs.workspace = true
+toml_edit.workspace = true
 pollster.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
