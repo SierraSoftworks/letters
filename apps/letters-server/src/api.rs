@@ -386,7 +386,7 @@ impl App {
         if let Some((at, place)) = self.library.find(&self.store, &roots, id, self.now())? {
             let (space, root) = reach.into_iter().nth(at).expect("the library answers with a root it was given");
             // A share may let someone do more with one document than its space lets them do with all.
-            let (role, _) = self.in_space(who, id, &root, space.role);
+            let role = self.in_space(who, id, &root, space.role).role;
             return Ok(Found { space: Some(space), role, root, place });
         }
         let (role, root, place) = self.lent(who, id)?.ok_or_else(Refusal::not_found)?;
@@ -438,10 +438,13 @@ impl App {
         }
         // A conflict copy has its original's id, and is shared with nobody.
         if let (Some(id), Some(_), None) = (&entry.id, &entry.space, &row.copy_of) {
-            let (role, with) = self.in_space(who, id, root, entry.role);
-            entry.role = role;
-            if with > 0 {
-                entry.tags.push(Tag::Shared { with });
+            let shared = self.in_space(who, id, root, entry.role);
+            entry.role = shared.role;
+            if shared.with > 0 {
+                entry.tags.push(Tag::Shared { with: shared.with });
+            }
+            if shared.links > 0 {
+                entry.tags.push(Tag::Links { count: shared.links });
             }
         }
         entry
@@ -670,6 +673,6 @@ fn entry(row: &Row, role: Role) -> Entry {
 
 /// The routes with their state, for the server and for tests.
 pub fn router(app: Arc<App>) -> Router {
-    let routes = routes().merge(crate::shares::routes()).merge(crate::socket::routes());
+    let routes = routes().merge(crate::shares::routes()).merge(crate::links::routes()).merge(crate::socket::routes());
     routes.merge(crate::auth::routes()).merge(crate::pages::routes()).with_state(app)
 }

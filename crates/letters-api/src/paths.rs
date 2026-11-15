@@ -175,6 +175,11 @@ pub fn editor_page(id: &str) -> String {
     format!("/d/{}", segment(id))
 }
 
+/// A page: where a share link leads. `token` is the link's secret, which only its address holds.
+pub fn link_page(token: &str) -> String {
+    format!("/l/{}", segment(token))
+}
+
 /// A page: the document as plain HTML, to read with no editor.
 pub fn read_page(id: &str) -> String {
     format!("/d/{}/read", segment(id))

@@ -117,6 +117,8 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 # Already in the tree through accesskit. Linux only: it asks the desktop for its settings.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 getrandom = "0.4"
+# What the server keeps of a share link's passphrase, so that whoever reads its store guesses slowly.
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 # The person's time zone, for the dates the landing card shows. No time zone reaches the core.
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 # Older system dictionaries are not in UTF-8. The app reads them: nothing in the core needs this.
@@ -183,6 +185,14 @@ debug-assertions = false
 # The server's build compresses the browser's editor once, as small as it goes. Unoptimised, that takes
 # minutes, and a build script is not optimised unless it is said here.
 [profile.dev.package.brotli]
+opt-level = 3
+
+# Slow by design, and unoptimised a hundred times slower still: a test that opens a link with a passphrase
+# would wait seconds on each try.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
 opt-level = 3
 
 # Loro's debug assertions hold for histories Loro wrote. One from anywhere else can fail them, and a panic

@@ -36,9 +36,9 @@ struct Kept {
 
 /// By the document's id, [`BETWEEN`], and the key of the root its file is in.
 const SHARES: Table<Kept> = Table::new("shares");
-/// What stands between the two parts of a key. No root's key holds it, and an id that does names no row
-/// of another document.
-const BETWEEN: char = '\0';
+/// What stands between the parts of a key. No root's key holds it, and an id that does names no row of
+/// another document.
+pub(crate) const BETWEEN: char = '\0';
 /// How long a group's name may be.
 const LONGEST_GROUP: usize = 200;
 
@@ -60,6 +60,16 @@ pub(crate) fn same(one: &Grantee, other: &Grantee) -> bool {
 /// and nowhere else.
 pub(crate) fn may_share(role: Role) -> bool {
     role.edits()
+}
+
+/// What the shares of a document say to someone its space lets in.
+pub(crate) struct InSpace {
+    /// What they may do with it: what the space lets them, or a share when that is more.
+    pub role: Role,
+    /// With how many people and groups it is shared, and how many links lead to it now. Both are told to
+    /// whoever says who it is shared with, and are nothing to anyone else.
+    pub with: u32,
+    pub links: u32,
 }
 
 impl Kept {
@@ -104,7 +114,7 @@ async fn share(
 impl App {
     /// The document `id` for the one who says who else reaches it: someone its space lets in, and not
     /// someone a share led to it.
-    fn sharing(&self, who: &Signed, id: &str) -> Answer<Found> {
+    pub(crate) fn sharing(&self, who: &Signed, id: &str) -> Answer<Found> {
         let found = self.locate(who, id)?;
         match found.space.as_ref().is_some_and(|space| may_share(space.role)) {
             true => Ok(found),
@@ -113,12 +123,17 @@ impl App {
     }
 
     /// What the shares of the file of the document `id` in `root` say to `who`, whom its space lets do
-    /// what `role` does: what they may do with the document, and with how many it is shared when that is
-    /// theirs to say. Shares that cannot be read give nobody more than the space does.
-    pub(crate) fn in_space(&self, who: &Signed, id: &str, root: &Root, role: Role) -> (Role, u32) {
-        let Some(kept) = self.store.get(&SHARES, &key(id, root)).ok().flatten() else { return (role, 0) };
-        let with = if may_share(role) { kept.people.len() as u32 } else { 0 };
-        (kept.gives(who).map_or(role, |given| given.max(role)), with)
+    /// what `role` does. Shares that cannot be read give nobody more than the space does.
+    pub(crate) fn in_space(&self, who: &Signed, id: &str, root: &Root, role: Role) -> InSpace {
+        let kept = self.store.get(&SHARES, &key(id, root)).ok().flatten().unwrap_or_default();
+        let (mut with, mut links) = (0, 0);
+        if may_share(role) {
+            let now = self.now();
+            with = kept.people.len() as u32;
+            links =
+                self.links_of(id, root).map_or(0, |links| links.iter().filter(|link| link.live(now)).count() as u32);
+        }
+        InSpace { role: kept.gives(who).map_or(role, |given| given.max(role)), with, links }
     }
 
     /// Where a share leads `who` to the document `id`, and what it lets them do there.
@@ -198,7 +213,7 @@ impl App {
     pub fn shares(&self, who: &Signed, id: &str) -> Answer<Shares> {
         let found = self.sharing(who, id)?;
         let kept = self.store.get(&SHARES, &key(id, &found.root))?.unwrap_or_default();
-        self.told_shares(who, &found, kept)
+        self.told_shares(who, id, &found, kept)
     }
 
     /// Shares the document `id` with `people` and nobody else. Whoever is named twice has what was said
@@ -235,13 +250,13 @@ impl App {
             Ok(kept)
         })?;
         self.rooms.reseat(&found.root, &found.place);
-        self.told_shares(who, &found, kept)
+        self.told_shares(who, id, &found, kept)
     }
 
     /// The shares as whoever may change them is told them, each person by the name they go by now. In a
     /// person's own space the document is theirs, and they come first as its owner. Nobody owns what a
     /// space of several keeps.
-    fn told_shares(&self, who: &Signed, found: &Found, kept: Kept) -> Answer<Shares> {
+    fn told_shares(&self, who: &Signed, id: &str, found: &Found, kept: Kept) -> Answer<Shares> {
         let mut people = Vec::new();
         if found.space.as_ref().is_some_and(|space| space.role == Role::Owner) {
             let owner = Grantee::Person { id: who.person.id.clone(), name: who.person.name.clone() };
@@ -255,6 +270,7 @@ impl App {
             }
             people.push(grant);
         }
-        Ok(Shares { people, links: Vec::new() })
+        let links = self.links_of(id, &found.root)?.into_iter().map(|kept| kept.link).collect();
+        Ok(Shares { people, links })
     }
 }

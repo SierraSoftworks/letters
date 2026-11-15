@@ -125,6 +125,12 @@ impl Server {
         Self::over(Scratch::new(name), &trusting, |app| app.with_roots(roots))
     }
 
+    /// A server whose owner lets links be made.
+    pub fn linking(name: &str) -> Self {
+        let linking = |at: &Path| format!("{}\n[links]\nenabled = true\n", sound(at));
+        Self::over(Scratch::new(name), &linking, |app| app)
+    }
+
     /// The server after it stopped and started again: the same folders, and nothing that was in memory.
     pub fn restarted(self) -> Self {
         Self::over(self.scratch, &sound, |app| app)

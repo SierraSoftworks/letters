@@ -7,7 +7,8 @@
 //! - [`spaces`] is the only way to a file, and cannot leave a space's folder.
 //! - [`library`] lists a space and finds a document by its id, wherever its file was moved to.
 //! - [`api`] answers the interface `letters_api` lays down.
-//! - [`shares`] is who reaches a document besides those its space lets in.
+//! - [`shares`] is who reaches a document besides those its space lets in, and [`links`] are the
+//!   addresses that let in whoever holds one.
 //! - [`fetch`] is what the server fetches for a document from elsewhere: a linked picture, a link's page.
 //! - [`rooms`] are the documents that are open now, and [`socket`] is each device's line to one.
 //! - [`pages`] are the server's own pages for a browser: the documents a person reaches, one to read, and
@@ -23,6 +24,7 @@ pub mod error;
 pub mod fetch;
 pub mod ids;
 pub mod library;
+pub mod links;
 pub mod oidc;
 pub mod pages;
 pub mod rooms;
