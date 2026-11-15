@@ -643,7 +643,14 @@ impl Shell {
         title: String,
         then: impl FnOnce(&mut Self, Result<Exported, String>) + 'static,
     ) {
-        self.export_with(format, source, title, 2, Box::new(then));
+        let document = match &source {
+            Source::Version(version) => version.0.clone(),
+            Source::Own | Source::Copy => self.view.editor().doc().clone(),
+        };
+        self.gather(&document, move |shell, gathered| match gathered {
+            Ok(()) => shell.export_with(format, source, title, 2, Box::new(then)),
+            Err(why) => then(shell, Err(why)),
+        });
     }
 
     /// Writes the file [`Self::export`] asks for. A PDF that shows characters as boxes for want of a face
@@ -1219,6 +1226,7 @@ impl Shell {
             self.save_state = state;
             self.view.set_save_state(state);
         }
+        self.keep_pictures();
         self.cover();
         if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
             self.frame_due = self.window.request_animation_frame(&self.on_frame).is_ok();
@@ -1580,14 +1588,91 @@ impl Shell {
 
     /// Decodes a picture the page has come to show, which takes a moment, and hands it to the window.
     fn load(&mut self, name: String) {
-        // Only what was put in here can be had, until there is a server to ask.
-        let Some(bytes) = self.platform.assets.get(&name).cloned() else { return self.view.set_image(&name, None) };
+        // What was put in here is here. The rest is the server's to give, where there is one.
+        let held = self.platform.assets.get(&name).cloned();
+        let asked = self
+            .server
+            .as_ref()
+            .filter(|_| held.is_none())
+            .map(|server| (server.id.clone(), browser::ask(&self.window, "GET", &asset(&server.id, &name), None)));
+        if held.is_none() && asked.is_none() {
+            return self.view.set_image(&name, None);
+        }
         let (shell, window) = (self.me.clone(), self.window.clone());
         wasm_bindgen_futures::spawn_local(async move {
-            let image = browser::decode(&window, &bytes).await;
+            let (bytes, from) = match (held, asked) {
+                (None, Some((id, asked))) => (asked.await.ok(), Some(id)),
+                (held, _) => (held, None),
+            };
+            let image = match &bytes {
+                Some(bytes) => browser::decode(&window, bytes).await,
+                None => None,
+            };
             let Some(shell) = shell.upgrade() else { return };
             let mut shell = shell.borrow_mut();
+            // A copy of the document takes its pictures along. The page may show another document by now.
+            if let (Some(bytes), Some(id)) = (bytes, from)
+                && shell.server.as_ref().is_some_and(|server| server.id == id)
+            {
+                shell.platform.assets.entry(name.clone()).or_insert(bytes);
+            }
             shell.view.set_image(&name, image);
+            shell.arrived();
+        });
+    }
+
+    /// Hands the server the pictures the editor put into its document since the last look, so that
+    /// they are there before the edits that name them.
+    fn keep_pictures(&mut self) {
+        let stored = std::mem::take(&mut self.platform.stored);
+        let Some(id) = self.server.as_ref().map(|server| server.id.clone()) else { return };
+        for name in stored {
+            let Some(bytes) = self.platform.assets.get(&name) else { continue };
+            let kind = browser::mime(bytes).unwrap_or("application/octet-stream");
+            let sent = browser::ask(&self.window, "PUT", &asset(&id, &name), Some((kind, bytes)));
+            let shell = self.me.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let Err(refusal) = sent.await else { return };
+                let Some(shell) = shell.upgrade() else { return };
+                // The picture stays on the page, and the person knows that it is nowhere else.
+                shell.borrow().say(refusal.message);
+            });
+        }
+    }
+
+    /// Fetches the pictures `document` shows that the page never came to show, so that a copy of it
+    /// leaves none out. `then` is told why if one cannot be had.
+    fn gather(&mut self, document: &Document, then: impl FnOnce(&mut Self, Result<(), String>) + 'static) {
+        let lacking = |name: &&str| !self.platform.assets.contains_key(*name);
+        let (Some(id), names) = (self.server.as_ref().map(|server| server.id.clone()), document.assets()) else {
+            return then(self, Ok(()));
+        };
+        let asked: Vec<_> = names
+            .into_iter()
+            .filter(lacking)
+            .map(|name| (name.to_owned(), browser::ask(&self.window, "GET", &asset(&id, name), None)))
+            .collect();
+        if asked.is_empty() {
+            return then(self, Ok(()));
+        }
+        self.exporting += 1;
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut fetched = Vec::new();
+            for (name, asked) in asked {
+                fetched.push((name, asked.await));
+            }
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            shell.exporting -= 1;
+            let mut all = Ok(());
+            for (name, bytes) in fetched {
+                match bytes {
+                    Ok(bytes) => _ = shell.platform.assets.entry(name).or_insert(bytes),
+                    Err(_) => all = Err("one of its pictures could not be fetched from the server".to_owned()),
+                }
+            }
+            then(&mut shell, all);
             shell.arrived();
         });
     }
@@ -1917,6 +2002,11 @@ pub fn carried(window: &Window, platform: &mut Browser) -> Document {
             welcome
         }
     }
+}
+
+/// Where the server keeps a picture of the document `id`, by the name the document has for it.
+fn asset(id: &str, name: &str) -> String {
+    paths::asset(id, name.strip_prefix("assets/").unwrap_or(name))
 }
 
 /// What the server behind the page says of the document it carries. `None` for a page with no server.

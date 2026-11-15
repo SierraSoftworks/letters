@@ -33,36 +33,42 @@ pub async fn files(window: &Window, urls: &[String]) -> Result<Vec<Vec<u8>>, JsV
 }
 
 /// Asks the server behind the page for what is at `path`, an address of `letters_api::paths`, with a
-/// `body` of JSON if it takes one. The browser sends the session along by itself. `Err` is the server's
-/// refusal, or one made up here for an answer that never came, with a sentence the person can be shown.
-pub async fn ask(
+/// `body` if it takes one: its media type and its bytes. The browser sends the session along by itself.
+/// The request is on its way when this returns, so several asked one after another travel together.
+///
+/// `Err` is the server's refusal, or one made up here for an answer that never came, with a sentence the
+/// person can be shown.
+pub fn ask(
     window: &Window,
     method: &str,
     path: &str,
-    body: Option<String>,
-) -> Result<Vec<u8>, letters_api::Error> {
-    let lost = |_| letters_api::Error::new(letters_api::Code::Unavailable, "The server could not be reached.");
+    body: Option<(&str, &[u8])>,
+) -> impl Future<Output = Result<Vec<u8>, letters_api::Error>> + 'static + use<> {
     let request = RequestInit::new();
     request.set_method(method);
-    if let Some(body) = &body {
+    if let Some((kind, bytes)) = body {
         let headers = Object::new();
-        Reflect::set(&headers, &"content-type".into(), &letters_api::JSON.into()).map_err(lost)?;
+        // A plain object always takes a key.
+        let _ = Reflect::set(&headers, &"content-type".into(), &kind.into());
         request.set_headers(&headers);
-        request.set_body(&body.into());
+        request.set_body(&Uint8Array::from(bytes));
     }
-    let response = JsFuture::from(window.fetch_with_str_and_init(path, &request)).await.map_err(lost)?;
-    let response: Response = response.dyn_into().map_err(lost)?;
-    let bytes = JsFuture::from(response.array_buffer().map_err(lost)?).await.map_err(lost)?;
-    let bytes = Uint8Array::new(&bytes).to_vec();
-    if response.ok() {
-        return Ok(bytes);
+    let sent = window.fetch_with_str_and_init(path, &request);
+    async move {
+        let lost = |_| letters_api::Error::new(letters_api::Code::Unavailable, "The server could not be reached.");
+        let response: Response = JsFuture::from(sent).await.map_err(lost)?.dyn_into().map_err(lost)?;
+        let bytes = JsFuture::from(response.array_buffer().map_err(lost)?).await.map_err(lost)?;
+        let bytes = Uint8Array::new(&bytes).to_vec();
+        if response.ok() {
+            return Ok(bytes);
+        }
+        // What stands between the page and the server may refuse in words of its own.
+        let unread = || {
+            let message = format!("The server answered {} and did not say why.", response.status());
+            letters_api::Error::new(letters_api::Code::Unknown, message)
+        };
+        Err(serde_json::from_slice(&bytes).unwrap_or_else(|_| unread()))
     }
-    // What stands between the page and the server may refuse in words of its own.
-    let unread = || {
-        let message = format!("The server answered {} and did not say why.", response.status());
-        letters_api::Error::new(letters_api::Code::Unknown, message)
-    };
-    Err(serde_json::from_slice(&bytes).unwrap_or_else(|_| unread()))
 }
 
 /// The longest side a picture is drawn from, in pixels. A photo straight from a camera is several times
@@ -70,7 +76,7 @@ pub async fn ask(
 const LONGEST: f64 = 4096.0;
 
 /// The media type of a picture in one of the formats a document keeps, told by its first bytes.
-fn mime(bytes: &[u8]) -> Option<&'static str> {
+pub fn mime(bytes: &[u8]) -> Option<&'static str> {
     match bytes {
         [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
         [0xff, 0xd8, 0xff, ..] => Some("image/jpeg"),
@@ -144,6 +150,8 @@ pub struct Browser {
     /// The pictures put into the document here, by the names it has for them. They are kept until there
     /// is a server to keep them.
     pub assets: HashMap<String, Vec<u8>>,
+    /// The names of those the editor put in since the shell last looked, for a server to be handed.
+    pub stored: Vec<String>,
 }
 
 /// The page's async clipboard. Read by name: the binding to it is not in every release of `web-sys`.
@@ -251,7 +259,15 @@ impl Browser {
     pub fn new(window: &Window) -> Result<Self, JsValue> {
         let performance = window.performance().ok_or("this browser has no clock")?;
         let storage = window.local_storage().ok().flatten();
-        Ok(Self { performance, crypto: window.crypto()?, storage, pasted: None, copied: None, assets: HashMap::new() })
+        Ok(Self {
+            performance,
+            crypto: window.crypto()?,
+            storage,
+            pasted: None,
+            copied: None,
+            assets: HashMap::new(),
+            stored: Vec::new(),
+        })
     }
 
     /// Whether the browser had `url` from an earlier visit when the page asked for it, as its preload did.
@@ -365,7 +381,10 @@ impl Platform for Browser {
     }
 
     fn store_asset(&mut self, name: &str, bytes: &[u8]) {
-        self.assets.entry(name.to_owned()).or_insert_with(|| bytes.to_vec());
+        if !self.assets.contains_key(name) {
+            self.assets.insert(name.to_owned(), bytes.to_vec());
+            self.stored.push(name.to_owned());
+        }
     }
 
     fn learn_word(&mut self, word: &str) {

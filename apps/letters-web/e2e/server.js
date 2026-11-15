@@ -1,10 +1,12 @@
 // A server behind the page, for the tests: the page it sends for a document it keeps, and its answers.
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { crc32, deflateSync } from "node:zlib";
 
 const ID = "0190f3a2-7c1e-7b4a-9c55-3f2a1b0c9d8e";
 
@@ -26,15 +28,49 @@ export const opened = (over = {}) => ({
   ...over,
 });
 
+/** A PNG of one colour, and the name a document has for it: `assets/` and the hash of its bytes. */
+export const picture = ([red, green, blue], width = 64, height = 48) => {
+  const chunk = (kind, data) => {
+    const body = Buffer.concat([Buffer.from(kind), data]);
+    const [length, sum] = [Buffer.alloc(4), Buffer.alloc(4)];
+    length.writeUInt32BE(data.length);
+    sum.writeUInt32BE(crc32(body));
+    return Buffer.concat([length, body, sum]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header.set([8, 2, 0, 0, 0], 8);
+  const line = Buffer.from([0, ...Array(width).fill([red, green, blue]).flat()]);
+  const lines = deflateSync(Buffer.concat(Array(height).fill(line)));
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const bytes = Buffer.concat([signature, chunk("IHDR", header), chunk("IDAT", lines), chunk("IEND", Buffer.alloc(0))]);
+  return { bytes, name: `assets/${createHash("sha256").update(bytes).digest("hex")}.png` };
+};
+
+/** A document that shows the pictures called `names`, under a heading. */
+export const album = (names) => ({
+  format: 1,
+  language: "en",
+  blocks: [
+    { id: "h", type: "heading", level: 1, content: [{ text: "Album" }] },
+    ...names.map((asset, at) => ({ id: `f${at}`, type: "figure", asset, alt: "", width: 64, height: 48 })),
+    { id: "p", type: "paragraph", content: [] },
+  ],
+});
+
 const pages = new Map();
 
 /** The page the server sends, written by the call a server makes: `letters_web::page::served`. */
-const composed = (said) => {
-  const key = JSON.stringify(said);
+const composed = (said, document) => {
+  const key = JSON.stringify([said, document]);
   if (!pages.has(key)) {
-    const file = join(mkdtempSync(join(tmpdir(), "letters-served-")), "opened.json");
-    writeFileSync(file, key);
-    const run = ["run", "--quiet", "-p", "letters-web", "--example", "page", "--", "--served", "/", file];
+    const folder = mkdtempSync(join(tmpdir(), "letters-served-"));
+    const files = [said, document].filter(Boolean).map((json, at) => {
+      writeFileSync(join(folder, `${at}.json`), JSON.stringify(json));
+      return join(folder, `${at}.json`);
+    });
+    const run = ["run", "--quiet", "-p", "letters-web", "--example", "page", "--", "--served", "/", ...files];
     const cwd = fileURLToPath(new URL("..", import.meta.url));
     pages.set(key, execFileSync("cargo", run, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
   }
@@ -44,9 +80,10 @@ const composed = (said) => {
 /**
  * Opens the server's page for the document `said` is about, and waits for the editor as `ready` does.
  * `answer(method, path)` is what the server answers a request with, as `{ status, body, type }`: nothing is
- * there otherwise. Resolves to the requests the page made of the server, as they come.
+ * there otherwise. `document` is its `document.json`, the welcome document if none is given. Resolves to
+ * the requests the page made of the server, as they come.
  */
-export const serve = async (page, said, answer = () => undefined) => {
+export const serve = async (page, said, answer = () => undefined, document = undefined) => {
   const asked = [];
   // What the policy stopped, for a test to find nothing in.
   await page.addInitScript(() => {
@@ -56,12 +93,12 @@ export const serve = async (page, said, answer = () => undefined) => {
     );
   });
   await page.route(`**/d/${said.id}`, (route) =>
-    route.fulfill({ contentType: "text/html; charset=utf-8", headers: { "content-security-policy": POLICY }, body: composed(said) }),
+    route.fulfill({ contentType: "text/html; charset=utf-8", headers: { "content-security-policy": POLICY }, body: composed(said, document) }),
   );
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
-    asked.push({ method: request.method(), path, body: request.postData() });
+    asked.push({ method: request.method(), path, body: request.postDataBuffer(), type: await request.headerValue("content-type") });
     const nothing = { status: 404, body: { code: "not_found", message: "Nothing is there." } };
     const { status = 200, body = "", type = "application/json" } = answer(request.method(), path) ?? nothing;
     const sent = typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body);

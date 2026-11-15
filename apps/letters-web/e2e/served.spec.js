@@ -4,10 +4,13 @@ import { readFile } from "node:fs/promises";
 
 import { expect, test } from "@playwright/test";
 
-import { entry, rested, texts } from "./page.js";
-import { opened, serve } from "./server.js";
+import { createHash } from "node:crypto";
 
-const TRUST = `/api/v1/documents/${opened().id}/trust`;
+import { INK, blocks, carry, entry, file, inked, png, rested, texts } from "./page.js";
+import { album, opened, picture, serve } from "./server.js";
+
+const DOCUMENT = `/api/v1/documents/${opened().id}`;
+const TRUST = `${DOCUMENT}/trust`;
 const bar = (page) => page.getByText(/^Safe mode:/);
 
 test("the server's page opens its document as the server says, under a policy that lets no inline script run", async ({ page }) => {
@@ -58,5 +61,60 @@ for (const { name, answer, held, told } of answers) {
     await rested(page);
     await expect(bar(page)).toBeAttached({ attached: held });
     expect(said).toHaveLength(told ? 1 : 0);
+  });
+}
+
+test("the pictures of the server's document come from the server, those the page never showed too", async ({ page }) => {
+  // The second lies far below what the window shows.
+  const [shown, below] = [picture(INK), picture([0, 128, 255], 64, 4000)];
+  const kept = new Map([shown, below].map(({ name, bytes }) => [`${DOCUMENT}/${name}`, bytes]));
+  const answer = (method, path) => (method === "GET" && kept.has(path) ? { body: kept.get(path), type: "image/png" } : undefined);
+  const asked = await serve(page, opened(), answer, album([shown.name, below.name]));
+  await expect.poll(() => inked(page)).toBeGreaterThan(1000);
+
+  // A copy of the document leaves none of them out.
+  const download = page.waitForEvent("download");
+  await page.keyboard.press("ControlOrMeta+s");
+  const zip = await readFile(await (await download).path());
+  for (const { name, bytes } of [shown, below]) {
+    expect(file(zip, name)?.equals(bytes), name).toBe(true);
+  }
+  // Each was asked for once, whoever wanted it.
+  expect(asked.map(({ method, path }) => `${method} ${path}`).sort()).toEqual([...kept.keys()].map((path) => `GET ${path}`).sort());
+});
+
+test("a copy is not made of a document whose picture the server does not give", async ({ page }) => {
+  const said = [];
+  page.on("dialog", (dialog) => (said.push(dialog.message()), dialog.accept()));
+  let downloads = 0;
+  page.on("download", () => downloads++);
+  await serve(page, opened(), undefined, album([picture(INK).name]));
+  await page.keyboard.press("ControlOrMeta+s");
+  await expect.poll(() => said).toHaveLength(1);
+  expect(said[0]).toMatch(/could not be saved.*picture/);
+  expect(downloads).toBe(0);
+});
+
+const keeps = [
+  { name: "keeps", answer: { status: 204 }, told: 0 },
+  { name: "refuses", answer: { status: 413, body: { code: "too_large", message: "A picture may be 32 MB at most." } }, told: 1 },
+];
+for (const { name, answer, told } of keeps) {
+  test(`a picture put into the server's document is handed to the server, which ${name} it`, async ({ page }) => {
+    const said = [];
+    page.on("dialog", (dialog) => (said.push(dialog.message()), dialog.accept()));
+    const asked = await serve(page, opened(), (method) => (method === "PUT" ? answer : undefined));
+    const bytes = Buffer.from(await png(page));
+    await carry(page, "textarea", "paste", [["shot.png", "image/png", [...bytes]]]);
+    await expect.poll(async () => (await blocks(page)).some((block) => block.type === "figure")).toBe(true);
+
+    // Under the name the document has for it, which is the hash of its bytes.
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    await expect.poll(() => asked.map(({ method, path }) => `${method} ${path}`)).toEqual([`PUT ${DOCUMENT}/assets/${hash}.png`]);
+    expect(asked[0].body.equals(bytes)).toBe(true);
+    expect(asked[0].type).toBe("image/png");
+    // The picture is on the page either way, and the person is told when it is nowhere else.
+    await expect.poll(() => inked(page)).toBeGreaterThan(1000);
+    await expect.poll(() => said).toEqual(told ? ["A picture may be 32 MB at most."] : []);
   });
 }
