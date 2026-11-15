@@ -21,6 +21,7 @@ letters-convert.workspace = true
 letters-fonts.workspace = true
 letters-layout.workspace = true
 letters-trust.workspace = true
+letters-spell.workspace = true
 serde_json.workspace = true
 
 winit.workspace = true
@@ -30,6 +31,7 @@ arboard.workspace = true
 rfd.workspace = true
 getrandom.workspace = true
 jiff.workspace = true
+encoding_rs.workspace = true
 pollster.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]

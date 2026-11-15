@@ -4,7 +4,7 @@
 //! is rasterised into a software surface. Saving happens on a thread per save, a moment after typing stops,
 //! and nobody is asked where: a new document gets a file of its own once it has content.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ use letters_format::WorkingCopy;
 use letters_model::{Model, ReplicaId, Revision, Style};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Size};
+use letters_spell::Dictionary;
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{Cursor, Landing, Location, Request, SaveState, Scheme, Window as View, tokens};
 use rfd::{FileDialog, MessageDialog, MessageLevel};
@@ -31,6 +32,7 @@ use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
 use crate::chrome;
 use crate::cli::{Mode, Options};
+use crate::dictionaries;
 use crate::files::{self, EXTENSION, Home, Opened, Rest, Working};
 use crate::gpu::Gpu;
 use crate::input::{self, Composer, Press};
@@ -65,6 +67,8 @@ pub enum Event {
     Gpu(Option<Box<Gpu>>),
     /// The desktop has said whether it wants less motion.
     Motion(bool),
+    /// A system dictionary a window's document asked for has been read, under the name it has on disk.
+    Dictionary(WindowId, String, Box<Dictionary>),
 }
 
 impl From<accesskit_winit::Event> for Event {
@@ -96,6 +100,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         library: Library::of(&home),
         words: Words::of(&home),
         trust: trust::store(&home),
+        dictionaries: dictionaries::system_folders(&home).into(),
         reduced_motion: false,
         gpu: match std::env::var("LETTERS_RENDERER").as_deref() {
             Ok("cpu") => GpuState::Off,
@@ -203,6 +208,8 @@ struct App {
     library: Library,
     words: Words,
     trust: Trusted,
+    /// Where the system keeps dictionaries for languages other than English.
+    dictionaries: Arc<[PathBuf]>,
     /// Whether the desktop asked for less motion. Asked once, after the first frame.
     reduced_motion: bool,
     gpu: GpuState,
@@ -267,6 +274,8 @@ struct DocWindow {
     /// The id of a document made here that has just been written for the first time, for the app to
     /// record as trusted wherever its file goes.
     vouch: Option<String>,
+    /// The languages a system dictionary has been looked for, each once whether or not there was one.
+    asked: BTreeSet<String>,
     /// The view's edit count that is safely on disk.
     saved_edits: u64,
     /// The edit count a save was last planned for.
@@ -386,6 +395,22 @@ impl DocWindow {
         }
         self.retitle();
         done.is_ok()
+    }
+
+    /// Looks for the system's dictionaries for the languages the document names and has not asked about
+    /// yet, on another thread. One that is found arrives as an event. One that is not is no one's concern.
+    fn ask_dictionaries(&mut self, proxy: &EventLoopProxy<Event>, folders: &Arc<[PathBuf]>) {
+        let mut wanted = dictionaries::languages(self.view.editor().doc());
+        wanted.retain(|language| self.asked.insert(language.clone()));
+        if wanted.is_empty() {
+            return;
+        }
+        let (id, proxy, folders) = (self.window.id(), proxy.clone(), folders.clone());
+        thread::spawn(move || {
+            for (name, dictionary) in wanted.iter().filter_map(|language| dictionaries::load(&folders, language)) {
+                let _ = proxy.send_event(Event::Dictionary(id, name, Box::new(dictionary)));
+            }
+        });
     }
 
     /// Reads the person's own words again, if their dictionary changed since this window last looked.
@@ -709,6 +734,7 @@ impl App {
             menu_press: false,
             made_here,
             vouch: None,
+            asked: BTreeSet::new(),
             saved_edits: 0,
             noticed_edits: 0,
             save_at: None,
@@ -974,6 +1000,7 @@ impl ApplicationHandler<Event> for App {
                 if window.rest.is_some() {
                     window.reword(&self.words);
                     window.start_read(&self.proxy);
+                    window.ask_dictionaries(&self.proxy, &self.dictionaries);
                     window.relocate(library);
                 }
                 window.relist(library);
@@ -1082,6 +1109,8 @@ impl ApplicationHandler<Event> for App {
             Event::Saved(id) => {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.finish_save(&self.library, now);
+                    // Another writer's edits may have come in with it, in a language of their own.
+                    window.ask_dictionaries(&self.proxy, &self.dictionaries);
                     // Another writer's edits may have come in with it.
                     window.access_stale = true;
                     window.sync(now);
@@ -1099,6 +1128,13 @@ impl ApplicationHandler<Event> for App {
                 window.sync(now);
             }
             Event::Gpu(None) => self.gpu = GpuState::Off,
+            Event::Dictionary(id, name, dictionary) => {
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.view.add_dictionary(&name, *dictionary);
+                    window.access_stale = true;
+                    window.sync(now);
+                }
+            }
             Event::Motion(reduced) => {
                 self.reduced_motion = reduced;
                 for window in self.windows.values_mut() {
@@ -1152,6 +1188,8 @@ impl ApplicationHandler<Event> for App {
                 window.sync(now);
             }
             if window.save_at.is_some_and(|at| at <= now) {
+                // What was written since the last save may be in a language not seen before.
+                window.ask_dictionaries(&self.proxy, &self.dictionaries);
                 window.start_save(&self.proxy, &self.library, now);
             }
             if let Some(run) = &mut self.typing {

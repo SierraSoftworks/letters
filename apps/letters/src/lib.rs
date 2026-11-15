@@ -4,6 +4,7 @@
 //! - [`input`] and [`platform`] adapt the desktop to the engine's interfaces.
 //! - [`files`] opens and saves `.let` files, and [`library`] decides where they live.
 //! - [`words`] keeps the person's own dictionary, and [`trust`] what they trust.
+//! - [`dictionaries`] finds the system's dictionaries for languages other than English.
 //! - [`measure`] checks the performance budgets, and [`baseline`] is the empty window it compares with.
 //! - [`convert`] runs the `export` and `import` subcommands, which need no window.
 
@@ -12,6 +13,7 @@ pub mod baseline;
 pub mod chrome;
 pub mod cli;
 pub mod convert;
+pub mod dictionaries;
 pub mod files;
 pub mod gpu;
 pub mod input;
