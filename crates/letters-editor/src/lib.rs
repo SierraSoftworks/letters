@@ -24,6 +24,7 @@ mod table;
 mod text;
 mod tree;
 mod versions;
+mod whole;
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -43,6 +44,7 @@ use merge::Kept;
 pub use motion::{LinePos, Lines};
 pub use refs::{Numbered, Referring};
 pub use table::{Cell, TableEdit};
+pub use whole::PreviewEdit;
 
 /// Text input, as every platform delivers it. Offsets are UTF-8 bytes relative to the caret's block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,6 +163,26 @@ pub enum Command {
     Table(TableEdit),
     /// Changes the callout the caret is in, which [`Editor::callout`] tells of.
     Callout(CalloutEdit),
+    /// Puts in a table of contents: a list of the document's headings down to Heading 3, made where it is
+    /// shown by [`letters_model::Document::contents`]. It is a block that holds no text, placed as a
+    /// divider is: below the caret's block, or in place of an empty line, with the caret in the text
+    /// below it.
+    InsertContents,
+    /// Puts in a link preview: a card that leads to an address, placed as a divider is. It shows the
+    /// address alone until [`PreviewEdit::Fetched`] says what the page holds. An address with nothing in
+    /// it is not taken.
+    InsertPreview(String),
+    /// Sets how deep the headings go that a table of contents lists, from 1 to 4. The table is named,
+    /// since no caret stands in it.
+    SetContentsLevels {
+        table: BlockId,
+        levels: u8,
+    },
+    /// Changes a link preview, which is named since no caret stands in it. One undo step.
+    Preview {
+        block: BlockId,
+        edit: PreviewEdit,
+    },
     /// Puts pictures in: one as a figure, several as a gallery, and the last is left selected. With no
     /// spot they go below the block the selection ends in, in place of an empty line, or beside the
     /// selected picture of a gallery. The bytes go to [`Platform::store_asset`], and what is no picture
@@ -587,6 +609,14 @@ impl Editor {
         if let Command::SetPageBreak { block, on } = command {
             return self.doc().block(block).is_some_and(|block| block.page_break != *on);
         }
+        // A block that holds no text is named, and one goes in whether or not there is a caret.
+        match command {
+            Command::InsertContents => return true,
+            Command::InsertPreview(url) => return whole::address(url).is_some(),
+            Command::SetContentsLevels { table, levels } => return self.takes_levels(table, *levels),
+            Command::Preview { block, edit } => return self.takes_preview(block, edit),
+            _ => {}
+        }
         if let Command::UseVersion { block, version } = command {
             return self.takes_version(block, version.as_deref());
         }
@@ -679,6 +709,10 @@ impl Editor {
             Command::InsertTable { rows, columns } => self.insert_table(rows, columns, platform),
             Command::Table(edit) => self.table_edit(edit, platform),
             Command::Callout(edit) => self.callout_edit(edit),
+            Command::InsertContents => self.insert_contents(platform),
+            Command::InsertPreview(url) => self.insert_preview(&url, platform),
+            Command::SetContentsLevels { table, levels } => self.set_levels(&table, levels),
+            Command::Preview { block, edit } => self.preview_edit(&block, &edit, platform),
             Command::InsertFigures { pictures, at } => self.insert_figures(&pictures, at.as_ref(), platform),
             Command::MoveFigure(spot) => self.move_figure(&spot, platform),
             Command::ShiftFigure { right } => self.shift_figure(right, platform),

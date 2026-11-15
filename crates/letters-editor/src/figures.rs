@@ -38,7 +38,7 @@ fn extension(bytes: &[u8]) -> Option<&'static str> {
 
 /// The name a picture's bytes are kept under among the file's assets, which is the same for the same
 /// bytes. `None` for bytes that are no picture Letters can show.
-fn asset_name(bytes: &[u8]) -> Option<String> {
+pub(crate) fn asset_name(bytes: &[u8]) -> Option<String> {
     let extension = extension(bytes)?;
     let hash: String = Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect();
     Some(format!("assets/{hash}.{extension}"))
