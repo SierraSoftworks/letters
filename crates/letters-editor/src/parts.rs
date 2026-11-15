@@ -213,7 +213,7 @@ impl Editor {
 
     pub(crate) fn place_picture(&mut self, figure: &BlockId) {
         let selection = Selection::caret(Pos::new(figure.clone(), 0));
-        self.caret = Some(Caret { selection, marks: Default::default(), picture: true });
+        self.caret = Some(Caret { selection, marks: Default::default(), picture: true, before_wrap: false });
     }
 
     /// Where a caret that comes to `pos` from another block stands. The start of a figure is its picture,
@@ -238,7 +238,8 @@ impl Editor {
         let figure = self.block(&selection.head.block).is_some_and(tree::is_figure);
         let picture = selection.is_caret() && (self.member(&selection.head.block) || caret.picture && figure);
         let selection = if picture { Selection::caret(Pos::new(selection.head.block, 0)) } else { selection };
-        Some(Caret { selection, marks: caret.marks.clone(), picture })
+        let before_wrap = caret.before_wrap && !picture && selection == caret.selection;
+        Some(Caret { selection, marks: caret.marks.clone(), picture, before_wrap })
     }
 
     /// Brings every gallery that an edit left with fewer than two pictures down to what [`lone`] makes of

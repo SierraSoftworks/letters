@@ -16,8 +16,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use letters_editor::{
-    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Marker, Modifiers, Picture, Platform, Spot,
-    TableEdit,
+    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, LinePos, Lines, Marker, Modifiers, Picture, Platform,
+    Spot, TableEdit,
 };
 use letters_model::{
     Align, Block, BlockId, BlockKind, Body, Change, Document, ListKind, Mark, Model, Pos, ReplicaId, Run, Selection,
@@ -84,34 +84,46 @@ pub fn png(seed: u8, width: u32, height: u32) -> Picture {
     Picture { bytes: vec![0x89, b'P', b'N', b'G', seed], mime: "image/png".into(), width, height }
 }
 
-/// A layout that wraps every block after `width` bytes, for text of one byte per character.
+/// A layout that wraps every block after `width` bytes with no space to wrap at, for text of one byte per
+/// character. So the end of each line is the start of the next, and a caret there says which it is at.
 pub struct Wrapped {
     pub width: usize,
     pub doc: Document,
 }
 
 impl Wrapped {
-    fn len(&self, pos: &Pos) -> usize {
-        self.doc.block(&pos.block).map_or(0, |block| block.plain_text().len())
+    fn len(&self, block: &BlockId) -> usize {
+        self.doc.block(block).map_or(0, |block| block.plain_text().len())
     }
 
-    /// The line an offset is on. The end of a full last line belongs to that line, not to one after it.
-    fn line(&self, pos: &Pos) -> usize {
-        let at_full_end = pos.offset > 0 && pos.offset == self.len(pos) && pos.offset.is_multiple_of(self.width);
-        pos.offset / self.width - usize::from(at_full_end)
+    /// Whether a line ends and another starts at an offset.
+    fn wraps(&self, pos: &Pos) -> bool {
+        pos.offset > 0 && pos.offset < self.len(&pos.block) && pos.offset.is_multiple_of(self.width)
+    }
+
+    /// A place on a line, which is before a wrap only where the line ends at one.
+    fn on(&self, block: &BlockId, line: usize, offset: usize) -> LinePos {
+        let pos = Pos::new(block.clone(), offset);
+        LinePos { before_wrap: offset == (line + 1) * self.width && self.wraps(&pos), pos }
+    }
+
+    /// The line a caret is on. The end of a full last line belongs to that line, not to one after it.
+    fn line(&self, LinePos { pos, before_wrap }: &LinePos) -> usize {
+        let at_full_end = pos.offset > 0 && pos.offset == self.len(&pos.block) && pos.offset.is_multiple_of(self.width);
+        pos.offset / self.width - usize::from(at_full_end || *before_wrap && self.wraps(pos))
     }
 }
 
 impl Lines for Wrapped {
-    fn caret_x(&self, pos: &Pos) -> Option<f32> {
-        Some((pos.offset - self.line(pos) * self.width) as f32)
+    fn caret_x(&self, at: &LinePos) -> Option<f32> {
+        Some((at.pos.offset - self.line(at) * self.width) as f32)
     }
 
-    fn line_step(&self, pos: &Pos, x: f32, down: bool) -> Option<Pos> {
+    fn line_step(&self, at: &LinePos, x: f32, down: bool) -> Option<LinePos> {
         let texts: Vec<&Block> = self.doc.walk().filter(|block| matches!(block.body, Body::Text(_))).collect();
-        let index = texts.iter().position(|block| block.id == pos.block)?;
+        let index = texts.iter().position(|block| block.id == at.pos.block)?;
         let last_line = |block: &Block| block.plain_text().len().saturating_sub(1) / self.width;
-        let (index, line) = match (down, self.line(pos)) {
+        let (index, line) = match (down, self.line(at)) {
             (true, line) if line < last_line(texts[index]) => (index, line + 1),
             (true, _) => (index + 1, 0),
             (false, 0) => (index.checked_sub(1)?, last_line(texts[index.checked_sub(1)?])),
@@ -119,13 +131,13 @@ impl Lines for Wrapped {
         };
         let block = texts.get(index)?;
         let offset = (line * self.width + x as usize).min((line + 1) * self.width).min(block.plain_text().len());
-        Some(Pos::new(block.id.clone(), offset))
+        Some(self.on(&block.id, line, offset))
     }
 
-    fn line_edge(&self, pos: &Pos, end: bool) -> Option<Pos> {
-        let start = self.line(pos) * self.width;
-        let offset = if end { (start + self.width).min(self.len(pos)) } else { start };
-        Some(Pos::new(pos.block.clone(), offset))
+    fn line_edge(&self, at: &LinePos, end: bool) -> Option<LinePos> {
+        let (block, line) = (&at.pos.block, self.line(at));
+        let start = line * self.width;
+        Some(self.on(block, line, if end { (start + self.width).min(self.len(block)) } else { start }))
     }
 
     fn page_lines(&self) -> usize {

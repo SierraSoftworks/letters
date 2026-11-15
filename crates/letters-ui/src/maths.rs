@@ -14,7 +14,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use accesskit::Role;
-use letters_editor::{Editor, Lines};
+use letters_editor::{Editor, LinePos, Lines};
 use letters_math::{Command as Symbol, Formula, TEXT_RATIO, commands, typeset};
 use letters_model::{BlockId, BlockKind, Pos, Selection};
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
@@ -305,28 +305,30 @@ impl<L> SheetLines<L> {
 }
 
 impl<L: Lines> Lines for SheetLines<L> {
-    fn caret_x(&self, pos: &Pos) -> Option<f32> {
-        match self.on_sheet(pos) {
-            Some(source) => Some(self.left + source.caret(pos.offset).x),
-            None => self.page.caret_x(pos),
+    fn caret_x(&self, at: &LinePos) -> Option<f32> {
+        match self.on_sheet(&at.pos) {
+            Some(source) => Some(self.left + source.caret(at.pos.offset).x),
+            None => self.page.caret_x(at),
         }
     }
 
-    fn line_step(&self, pos: &Pos, x: f32, down: bool) -> Option<Pos> {
+    fn line_step(&self, at: &LinePos, x: f32, down: bool) -> Option<LinePos> {
+        let pos = &at.pos;
         let within = self.on_sheet(pos).and_then(|source| source.step(pos.offset, x - self.left, down));
         match within {
-            Some(offset) => Some(Pos::new(pos.block.clone(), offset)),
-            None => self.page.line_step(pos, x, down),
+            Some(offset) => Some(Pos::new(pos.block.clone(), offset).into()),
+            None => self.page.line_step(at, x, down),
         }
     }
 
-    fn line_edge(&self, pos: &Pos, end: bool) -> Option<Pos> {
+    fn line_edge(&self, at: &LinePos, end: bool) -> Option<LinePos> {
+        let pos = &at.pos;
         match self.on_sheet(pos) {
             Some(source) => {
                 let row = &source.rows[source.row(pos.offset)];
-                Some(Pos::new(pos.block.clone(), if end { row.last() } else { row.start }))
+                Some(Pos::new(pos.block.clone(), if end { row.last() } else { row.start }).into())
             }
-            None => self.page.line_edge(pos, end),
+            None => self.page.line_edge(at, end),
         }
     }
 
@@ -748,16 +750,16 @@ mod tests {
     struct Page;
 
     impl Lines for Page {
-        fn caret_x(&self, _: &Pos) -> Option<f32> {
+        fn caret_x(&self, _: &LinePos) -> Option<f32> {
             Some(0.0)
         }
 
-        fn line_step(&self, _: &Pos, _: f32, down: bool) -> Option<Pos> {
-            Some(Pos::new(if down { "below" } else { "above" }, 0))
+        fn line_step(&self, _: &LinePos, _: f32, down: bool) -> Option<LinePos> {
+            Some(Pos::new(if down { "below" } else { "above" }, 0).into())
         }
 
-        fn line_edge(&self, _: &Pos, end: bool) -> Option<Pos> {
-            Some(Pos::new("page", usize::from(end)))
+        fn line_edge(&self, _: &LinePos, end: bool) -> Option<LinePos> {
+            Some(Pos::new("page", usize::from(end)).into())
         }
     }
 
@@ -775,14 +777,14 @@ mod tests {
     #[test]
     fn up_and_down_move_through_the_source_before_they_leave_for_the_page() {
         let lines = SheetLines { page: Page, source: Some(source()), left: 100.0 };
-        let at = |offset: usize| Pos::new("f", offset);
+        let at = |offset: usize| LinePos::from(Pos::new("f", offset));
         let x = lines.caret_x(&at(12)).expect("a column");
         let cases = [
             (12, true, at(18)),
             (18, true, at(22)),
-            (22, true, Pos::new("below", 0)),
+            (22, true, Pos::new("below", 0).into()),
             (18, false, at(12)),
-            (12, false, Pos::new("above", 0)),
+            (12, false, Pos::new("above", 0).into()),
         ];
         for (from, down, to) in cases {
             assert_eq!(lines.line_step(&at(from), x, down), Some(to), "from {from}, down: {down}");
@@ -792,12 +794,13 @@ mod tests {
     #[test]
     fn home_and_end_stay_on_the_line_of_the_source() {
         let lines = SheetLines { page: Page, source: Some(source()), left: 0.0 };
-        let at = |offset: usize| Pos::new("f", offset);
+        let at = |offset: usize| LinePos::from(Pos::new("f", offset));
         for (from, start, end) in [(12, 10, 15), (17, 16, 19), (24, 20, 24)] {
             assert_eq!(lines.line_edge(&at(from), false), Some(at(start)), "home from {from}");
             assert_eq!(lines.line_edge(&at(from), true), Some(at(end)), "end from {from}");
         }
-        assert_eq!(lines.line_edge(&Pos::new("p", 3), true), Some(Pos::new("page", 1)), "the page's own lines");
+        let page = lines.line_edge(&Pos::new("p", 3).into(), true);
+        assert_eq!(page, Some(Pos::new("page", 1).into()), "the page's own lines");
     }
 
     /// Rows of eight characters at the most.
@@ -826,7 +829,7 @@ mod tests {
     #[test]
     fn the_caret_keeps_to_its_row_where_a_line_goes_on() {
         let lines = SheetLines { page: Page, source: Some(rows("aaa bbb ccc ddd", eight())), left: 0.0 };
-        let at = |offset: usize| Pos::new("f", 10 + offset);
+        let at = |offset: usize| LinePos::from(Pos::new("f", 10 + offset));
         // Where the caret is, and where Home and End take it: End stops before the space the row breaks at.
         for (from, start, end) in [(2, 0, 7), (7, 0, 7), (8, 8, 15), (12, 8, 15)] {
             assert_eq!(lines.line_edge(&at(from), false), Some(at(start)), "home from {from}");

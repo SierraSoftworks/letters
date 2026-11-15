@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use letters_model::{Block, BlockId, BlockKind, Op, Pos, Selection};
 
-use crate::{Caret, Composing, Editor, InputEvent, Kind, Platform, text};
+use crate::{Composing, Editor, InputEvent, Kind, Platform, text};
 
 impl Editor {
     pub(crate) fn handle(&mut self, event: InputEvent, platform: &mut dyn Platform) {
@@ -128,12 +128,12 @@ impl Editor {
         let at = |offset: usize| Pos::new(block.clone(), offset);
         let start = composing.range.start;
         let composed = Selection { anchor: at(start), head: at(composing.range.end) };
-        self.caret = Some(Caret { selection: composed, ..caret.clone() });
+        self.caret = Some(caret.clone().at(composed));
         self.insert(text);
 
         let inside = selection.unwrap_or(text.len()..text.len());
         let (anchor, head) = (start + text::snap(text, inside.start), start + text::snap(text, inside.end));
-        self.caret = Some(Caret { selection: Selection { anchor: at(anchor), head: at(head) }, ..caret });
+        self.caret = Some(caret.at(Selection { anchor: at(anchor), head: at(head) }));
         (composing.range, composing.at) = (start..start + text.len(), now);
         self.composing = Some(composing);
     }
@@ -149,7 +149,7 @@ impl Editor {
         let block = caret.selection.head.block.clone();
         let at = |offset: usize| Pos::new(block.clone(), offset);
         let composed = Selection { anchor: at(composing.range.start), head: at(composing.range.end) };
-        self.caret = Some(Caret { selection: composed, ..caret });
+        self.caret = Some(caret.at(composed));
         self.insert(text);
         self.commit(Kind::Other, now, true);
         self.run_rules(platform, now);
@@ -204,7 +204,7 @@ impl Editor {
         self.apply(ops.collect());
         let moved = |pos: &Pos| Pos::new(pos.block.clone(), pos.offset - (start.offset - from));
         let selection = Selection { anchor: moved(&caret.selection.anchor), head: moved(&caret.selection.head) };
-        self.caret = Some(Caret { selection, ..caret });
+        self.caret = Some(caret.at(selection));
         self.commit(Kind::Deleting, now, false);
     }
 }

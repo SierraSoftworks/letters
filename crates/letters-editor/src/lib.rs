@@ -40,7 +40,7 @@ pub use keymap::Keymap;
 /// The markers [`Editor::markers`] returns. They live in the model so that layout can draw them.
 pub use letters_model::{Marker, Markers};
 use merge::Kept;
-pub use motion::Lines;
+pub use motion::{LinePos, Lines};
 pub use refs::{Numbered, Referring};
 pub use table::{Cell, TableEdit};
 
@@ -314,6 +314,16 @@ struct Caret {
     marks: BTreeSet<Mark>,
     /// Whether the caret is on a figure's picture, and not in the caption its position names.
     picture: bool,
+    /// Whether the head, where a line wraps there, is at the end of that line: see [`LinePos`]. It holds
+    /// for as long as the selection is the same, and layout makes nothing of it where no line wraps.
+    before_wrap: bool,
+}
+
+impl Caret {
+    /// The caret with another selection.
+    fn at(self, selection: Selection) -> Self {
+        Self { before_wrap: self.before_wrap && self.selection == selection, selection, ..self }
+    }
 }
 
 /// One undo step: a run of model edits that are undone together, and the carets either side of them.
@@ -429,13 +439,27 @@ impl Editor {
     /// selection that names no block is ignored. In a figure the positions are in its caption:
     /// [`Editor::select_picture`] selects the picture, and a picture in a gallery is only ever that.
     pub fn select(&mut self, selection: Selection) {
+        self.select_at(selection, false);
+    }
+
+    /// As [`Editor::select`], with what layout says of the head: whether it is at the end of a line that
+    /// wraps with no space to stand before, as a press past the end of such a line is. See [`LinePos`].
+    pub fn select_at(&mut self, selection: Selection, before_wrap: bool) {
         self.end_composition();
         (self.rule, self.goal) = (false, None);
         self.seal();
         if let (Some(anchor), Some(head)) = (self.nearest(&selection.anchor), self.nearest(&selection.head)) {
             self.set_selection(Selection { anchor, head });
+            self.side(&LinePos { pos: selection.head, before_wrap });
         }
         self.forget();
+    }
+
+    /// Whether the caret is at the end of a line that wraps with no space to stand before. Its position is
+    /// then also the start of the next line, which is where it is drawn unless layout is told. See
+    /// [`LinePos`].
+    pub fn before_wrap(&self) -> bool {
+        self.caret.as_ref().is_some_and(|caret| caret.before_wrap)
     }
 
     pub fn keymap(&self) -> &Keymap {
@@ -919,8 +943,14 @@ impl Editor {
             block.map(|block| text::marks_after(block.body.runs(), start.offset)).unwrap_or_default()
         };
         let picture = selection.is_caret() && self.member(&selection.head.block);
+        let before_wrap = self.stays(&selection);
         // Text typed beside a reference is no part of it.
-        self.caret = Some(Caret { selection, marks: refs::plain(marks), picture });
+        self.caret = Some(Caret { selection, marks: refs::plain(marks), picture, before_wrap });
+    }
+
+    /// Whether a caret set to `selection` is on the line it was on: one that has not moved is.
+    fn stays(&self, selection: &Selection) -> bool {
+        self.caret.as_ref().is_some_and(|caret| caret.before_wrap && caret.selection == *selection)
     }
 
     fn place(&mut self, pos: Pos) {
@@ -931,6 +961,8 @@ impl Editor {
     fn place_with(&mut self, pos: Pos, marks: BTreeSet<Mark>) {
         let pos = self.clamp(&pos).unwrap_or(pos);
         let picture = self.member(&pos.block);
-        self.caret = Some(Caret { selection: Selection::caret(pos), marks: refs::plain(marks), picture });
+        let selection = Selection::caret(pos);
+        let before_wrap = self.stays(&selection);
+        self.caret = Some(Caret { selection, marks: refs::plain(marks), picture, before_wrap });
     }
 }

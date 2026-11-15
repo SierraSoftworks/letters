@@ -10,8 +10,8 @@ use std::rc::Rc;
 
 use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
 use letters_editor::{
-    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Picture, Platform, Seek, Spot,
-    TableEdit,
+    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, LinePos, Lines, Modifiers, Motion, Picture, Platform,
+    Seek, Spot, TableEdit,
 };
 use letters_layout::{
     CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax, Uncovered, WordList,
@@ -732,17 +732,19 @@ impl<'a> DocLines<'a> {
     }
 }
 
+// Layout does not yet tell the end of a line that wraps with no space from the start of the next, so
+// every place is taken and answered as its offset alone says.
 impl Lines for DocLines<'_> {
-    fn caret_x(&self, pos: &Pos) -> Option<f32> {
-        self.layout.caret(pos).map(|caret| caret.x)
+    fn caret_x(&self, at: &LinePos) -> Option<f32> {
+        self.layout.caret(&at.pos).map(|caret| caret.x)
     }
 
-    fn line_step(&self, pos: &Pos, x: f32, down: bool) -> Option<Pos> {
-        self.layout.line_step(pos, x, down)
+    fn line_step(&self, at: &LinePos, x: f32, down: bool) -> Option<LinePos> {
+        self.layout.line_step(&at.pos, x, down).map(LinePos::from)
     }
 
-    fn line_edge(&self, pos: &Pos, end: bool) -> Option<Pos> {
-        self.layout.line_edge(pos, end)
+    fn line_edge(&self, at: &LinePos, end: bool) -> Option<LinePos> {
+        self.layout.line_edge(&at.pos, end).map(LinePos::from)
     }
 
     fn page_lines(&self) -> usize {
