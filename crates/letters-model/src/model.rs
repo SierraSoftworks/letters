@@ -341,6 +341,32 @@ impl Model {
         Ok(Self::of(History::open(loro, replica), replica))
     }
 
+    /// Reads a history from a stranger in a document of its own, before a document in use sees it.
+    /// [`Model::load`] and [`Model::merge`] refuse bytes that are no history, but a panic inside Loro as it
+    /// reads them cannot be caught there: it leaves the document's locks poisoned, and the document panics
+    /// again as it is dropped.
+    ///
+    /// This guards a build whose panics unwind, as a server's must. Where a panic ends the process, as in
+    /// the apps and in a browser, there is nothing to contain, and it answers `Ok` at no cost.
+    pub fn check(history: &[u8]) -> Result<(), HistoryError> {
+        #[cfg(panic = "unwind")]
+        {
+            use std::panic::{AssertUnwindSafe, catch_unwind};
+            // Never dropped once a panic has poisoned it, since dropping it would panic again.
+            let scratch = mem::ManuallyDrop::new(LoroDoc::new());
+            crdt::configure(&scratch);
+            let read = catch_unwind(AssertUnwindSafe(|| scratch.import(history).map(drop)));
+            let read = read.map_err(|_| unreadable("reading it panicked"))?;
+            drop(mem::ManuallyDrop::into_inner(scratch));
+            read.map_err(unreadable)
+        }
+        #[cfg(not(panic = "unwind"))]
+        {
+            let _ = history;
+            Ok(())
+        }
+    }
+
     /// The model of a history, showing the revision the history shows.
     fn of(history: History, replica: ReplicaId) -> Self {
         let (doc, index) = crdt::read(&history.loro, &history.body);

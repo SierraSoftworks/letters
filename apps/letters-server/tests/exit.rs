@@ -740,11 +740,7 @@ const UNREADABLE: &str = "020200000000000000620000006c6f726f00000000000000000000
     020800000000000000b5d4f4e5281c21950101010101010201000000050100000100060104010200000504626f6479000f01040201\
     00030186010201050201010002010a";
 
-/// Fails until the history library's debug assertions are off for it (issue 2): with them, one such frame
-/// from anyone who may edit leaves its document's room unable to take an edit or a device until the server
-/// starts again. Take `should_panic` away with the fix.
 #[test]
-#[should_panic(expected = "what is written after the frame is held")]
 fn a_frame_the_history_library_trips_on_does_not_stop_its_document() {
     let (_scratch, mut served, id) = planned("unreadable");
     let mut ada = Desktop::open(&served, "ada", &id);

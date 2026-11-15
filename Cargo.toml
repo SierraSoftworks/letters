@@ -185,6 +185,13 @@ debug-assertions = false
 [profile.dev.package.brotli]
 opt-level = 3
 
+# Loro's debug assertions hold for histories Loro wrote. One from anywhere else can fail them, and a panic
+# inside an import leaves the document's locks poisoned, so the process aborts. A release build has no such
+# assertions and reads the same bytes as an update, and so a debug build does too.
+[profile.dev.package.loro-internal]
+debug = false
+debug-assertions = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

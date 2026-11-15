@@ -197,12 +197,30 @@ fn an_extent_tells_copies_of_other_documents_apart() {
 fn a_history_that_cannot_be_read_is_refused() {
     let mut m = Model::new(doc(), ReplicaId::from(1));
     let before = (m.doc().clone(), m.revision());
+    assert_eq!(Model::check(&m.save()), Ok(()));
     for bytes in [&b""[..], b"not a history", &m.save()[..40]] {
+        assert!(matches!(Model::check(bytes), Err(HistoryError::Unreadable(_))));
         assert!(matches!(Model::load(bytes, ReplicaId::from(2)), Err(HistoryError::Unreadable(_))));
         assert!(matches!(m.merge(bytes), Err(HistoryError::Unreadable(_))));
         assert!(matches!(m.compare(bytes), Err(HistoryError::Unreadable(_))));
         assert_eq!((m.doc().clone(), m.revision()), before);
     }
+}
+
+/// Found by fuzzing: a history with a sound checksum that no writer makes. Loro panics on it where its debug
+/// assertions are on, which the check contains, and reads it as an update that waits where they are off.
+#[test]
+fn a_history_no_writer_makes_is_stopped_by_the_check_or_changes_nothing() {
+    let odd = include_bytes!("../../../fuzz/corpus/history/bytes-after-a-block-header.bin");
+    let mut m = Model::new(doc(), ReplicaId::from(1));
+    let before = m.doc().clone();
+    if Model::check(odd).is_ok() {
+        let _ = Model::load(odd, ReplicaId::from(2));
+        let _ = (m.compare(odd), m.related(odd), m.merge(odd));
+    }
+    assert_eq!(m.doc(), &before);
+    m.apply([typed("p", 11, "!")]).unwrap();
+    assert_eq!(Model::load(&m.save(), ReplicaId::from(2)).unwrap().doc(), m.doc());
 }
 
 #[test]
