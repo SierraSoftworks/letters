@@ -810,7 +810,8 @@ impl Model {
     /// Each comes with the block as either side left it, and who last changed it there and when. A block
     /// that one side took away while the other changed its text is among them. Changes to different words
     /// of a block are not, nor is formatting, nor text that both put in at one place between two words:
-    /// those merge. Fails with [`HistoryError::UnknownRevision`] for a revision the history lacks.
+    /// those merge. Nor is a block that both sides left reading alike, where there is nothing to choose.
+    /// Fails with [`HistoryError::UnknownRevision`] for a revision the history lacks.
     ///
     /// The model reads its history at other revisions meanwhile, and so is taken whole. The document it
     /// shows stays as it is.
@@ -825,7 +826,51 @@ impl Model {
             history.loro.checkout_to_latest();
         }
         self.queue().clear();
-        found
+        Ok(conflict::told(found?))
+    }
+
+    /// Finds the conflicts as [`Model::conflicts`] does, and settles each: its block comes to read as the
+    /// side that was edited last left it, until a person picks a version. Call it after a merge, with the
+    /// revision each copy stood at before. Returns the conflicts, for the notes to be raised.
+    ///
+    /// The text of the block is the later side's: what the other side cut from it is put back, and what the
+    /// other side put into its own block is taken out. A block the later side took away goes, and one the
+    /// earlier side took away comes back. Formatting and the kind of block merge as they do anywhere, and
+    /// a block that one side joined to its neighbour stays joined.
+    ///
+    /// Every device that merges the same two revisions writes the same change, so two that settle them
+    /// apart settle them once. A device that merged another revision, having written on, writes a change
+    /// of its own: when the two meet, settling again leaves the later of them standing. Settling is no
+    /// undo step, and the undo steps already there still hold.
+    pub fn settle(&mut self, ours: &Revision, theirs: &Revision) -> Result<(Change, Vec<Conflict>), HistoryError> {
+        let history = self.history();
+        let loro = &history.loro;
+        let (shown, detached) = (loro.state_frontiers(), loro.is_detached());
+        let found = conflict::find(loro, &history.body, &history.events, [&ours.0, &theirs.0]);
+        let mut written = false;
+        if let Ok(clashes) = &found {
+            // The change is written at an earlier revision, which Loro allows on request. It then draws a
+            // random replica for each revision it shows, under which nothing is written.
+            loro.set_detached_editing(true);
+            written = conflict::settle(loro, &history.body, [&ours.0, &theirs.0], clashes);
+            loro.set_detached_editing(false);
+            let _ = loro.set_peer_id(self.replica.0);
+        }
+        if detached || written {
+            // The history held this revision a moment ago.
+            let _ = loro.checkout(&shown);
+            self.queue().clear();
+        }
+        let mut change = Change::default();
+        if !detached {
+            self.loro().checkout_to_latest();
+            // Coming back from the revision shown before tells what the settling did to the document.
+            if written {
+                change = self.drain();
+            }
+            self.queue().clear();
+        }
+        Ok((change, conflict::told(found?)))
     }
 
     /// A position that follows its text, for anything kept across edits. `None` when `pos` is not a
@@ -876,6 +921,8 @@ impl Model {
                 Event::Body(delta) => bodies.push(delta),
                 Event::Markers(changed) => keys.extend(changed),
                 Event::Meta | Event::Style => fields = true,
+                // Nothing of it shows.
+                Event::Settled(_) => {}
             }
         }
         let mut change = if fields { self.reread() } else { Change::default() };
@@ -1171,14 +1218,14 @@ impl Model {
                 };
                 seek(&mut delta, self.start(at));
                 spell(block, depth, &mut delta);
-                self.settle(at, &mut delta);
+                self.seat(at, &mut delta);
             }
             Op::RemoveBlock { block } => {
                 let spot = self.spot(block)?;
                 let end = self.after(spot.i);
                 seek(&mut delta, spot.start);
                 delta.push(TextDelta::Delete { delete: self.index[spot.i..end].iter().map(Entry::len).sum() });
-                self.settle(end, &mut delta);
+                self.seat(end, &mut delta);
             }
             // These change no block. `apply` makes them itself.
             Op::SetStyle { .. } | Op::SetPage { .. } | Op::ReplaceStyle { .. } => {}
@@ -1231,7 +1278,7 @@ impl Model {
 
     /// Gives the text at entry `at` a marker if it has none, when the block before it is about to change.
     /// Otherwise that text would join whatever comes to stand before it.
-    fn settle(&self, at: usize, delta: &mut Vec<TextDelta>) {
+    fn seat(&self, at: usize, delta: &mut Vec<TextDelta>) {
         if let Some(entry) = self.index.get(at).filter(|entry| !entry.marker)
             && let Some(block) = nth(&self.doc.blocks, &self.index, at)
         {

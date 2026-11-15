@@ -3,20 +3,38 @@
 //! Changes that do not touch merge by themselves, even inside one paragraph. Where both sides changed one
 //! word, the merge keeps what each of them typed, and the block reads as neither meant it. The same holds
 //! for text typed into a block that the other side took away. [`Model::conflicts`](crate::Model::conflicts)
-//! finds those blocks, with both versions for a person to choose from.
+//! finds those blocks, with both versions for a person to choose from, and
+//! [`Model::settle`](crate::Model::settle) makes each read as the side that was edited last left it.
+//!
+//! # Settling
+//!
+//! Every device that merges the same two revisions settles them with the very same change, or the copies
+//! of what it puts back would add up once the devices meet. So the change is not written where the device
+//! stands, which can be further on. It is written at the point in history where the two revisions have
+//! just met, and named after what it does as an outside change is. The same change written twice merges
+//! as one.
+//!
+//! What it does is told by character. The later side's block stays: its characters that the earlier side
+//! cut are put in again where they stood, and the characters the earlier side put into its own block are
+//! taken out. Formatting and the kind of the block merge as they do anywhere, and a block that one side
+//! joined to its neighbour stays joined.
+//!
+//! Two devices that merge different revisions, as when one of them wrote on before it merged, settle a
+//! block by different changes. Each settling is noted against its block, so the next search finds a block
+//! that both sides settled, and the later one stands.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::mem;
 use std::ops::Range;
 use std::sync::{Mutex, PoisonError};
 
-use loro::{Frontiers, ID, LoroDoc, LoroText, TextDelta, VersionVector};
+use loro::{Frontiers, ID, JsonOpContent, JsonTextOp, LoroDoc, LoroText, TextDelta, VersionVector};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::crdt::{self, Event};
 use crate::flat::{self, Entry, MARKER};
 use crate::notes::Version;
-use crate::{Block, BlockId, BodyShape, Document, Extra, HistoryError};
+use crate::{Block, BlockId, BodyShape, Document, Extra, HistoryError, Revision};
 
 /// A block that two revisions both changed, in the same words, since they last agreed.
 #[derive(Clone, Debug, PartialEq)]
@@ -68,32 +86,84 @@ fn rfc3339(seconds: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rest / 3_600, rest / 60 % 60, rest % 60)
 }
 
+/// Text that one side put into the sequence.
+struct Put {
+    /// The first and the last of the old places it can have stood at. Loro tells of what was cut at a
+    /// place before what was put in there, whichever came first in the sequence, so text put in beside
+    /// characters that were cut is known to no closer than their whole stretch.
+    place: (usize, usize),
+    /// Where it is in the side's own sequence, and how many characters.
+    at: usize,
+    chars: usize,
+    /// Whether it runs on from the text before it, and is not all in a block of its own.
+    runs: bool,
+    /// Whether it holds a marker: a block of the side's own, or a block cut in two.
+    row: bool,
+}
+
 /// What one side did to the sequence since the two last agreed, in the places of that time.
 #[derive(Default)]
 struct Edits {
     /// The characters it took out, in order.
     cut: Vec<Range<usize>>,
-    /// The places where it put text in that runs on from the text before, in order.
-    put: Vec<usize>,
+    /// All it put in, in order.
+    put: Vec<Put>,
 }
 
 impl Edits {
     /// Reads them from the change as Loro tells it. A change of formatting alone is none: it merges.
     fn of(raw: &[TextDelta]) -> Self {
-        let (mut edits, mut at) = (Self::default(), 0);
+        // Where the change has come to, in the sequence it starts from and in the one it leads to.
+        let (mut edits, mut at, mut to) = (Self::default(), 0, 0);
+        // Since the last character that stayed: where the cuts began, what was put in, and whether a
+        // marker was among it.
+        let (mut from, mut first, mut own) = (None, 0, false);
         for item in raw {
             match item {
-                TextDelta::Retain { retain, .. } => at += retain,
+                TextDelta::Retain { retain, .. } => {
+                    (at, to) = (at + retain, to + retain);
+                    (from, first, own) = (None, edits.put.len(), false);
+                }
                 TextDelta::Delete { delete } => {
+                    from.get_or_insert(at);
                     edits.cut.push(at..at + delete);
                     at += delete;
+                    edits.put[first..].iter_mut().for_each(|put| put.place.1 = at);
                 }
-                // Text that opens with a marker went into a block of its own, and none of it in here.
-                TextDelta::Insert { insert, .. } if insert.is_empty() || insert.starts_with(MARKER) => {}
-                TextDelta::Insert { .. } => edits.put.push(at),
+                TextDelta::Insert { insert, .. } => {
+                    let (chars, row) = (insert.chars().count(), insert.contains(MARKER));
+                    // Text behind a marker went into a block of its own, and none of it in here.
+                    let runs = chars > 0 && !own && !insert.starts_with(MARKER);
+                    edits.put.push(Put { place: (*from.get_or_insert(at), at), at: to, chars, runs, row });
+                    (to, own) = (to + chars, own || row);
+                }
             }
         }
         edits
+    }
+
+    /// The last of the characters in `range` that this side left in.
+    fn last_kept(&self, range: Range<usize>) -> Option<usize> {
+        let mut end = range.end;
+        for cut in self.cut.iter().rev().skip_while(|cut| cut.start >= range.end) {
+            if cut.end < end {
+                break;
+            }
+            end = end.min(cut.start);
+        }
+        (end > range.start).then(|| end - 1)
+    }
+
+    /// Whether this side took out the character at `at`.
+    fn cuts(&self, at: usize) -> bool {
+        let next = self.cut.partition_point(|cut| cut.end <= at);
+        self.cut.get(next).is_some_and(|cut| cut.contains(&at))
+    }
+
+    /// What this side put in that can have stood anywhere from `from` to `to`.
+    fn puts(&self, from: usize, to: usize) -> impl Iterator<Item = &Put> {
+        let first = self.put.partition_point(|put| put.place.1 < from);
+        self.put[first..].iter().take_while(move |put| put.place.0 <= to)
     }
 }
 
@@ -103,7 +173,8 @@ type Touch = (BTreeSet<usize>, bool);
 /// What one side did to the text of one block.
 #[derive(Default)]
 struct Done {
-    /// The block left its place: its marker and all of its text were taken out.
+    /// The block left its place: its marker and all of its text were taken out. Whatever the side put
+    /// there instead is in another block.
     gone: bool,
     changed: bool,
     /// By the word's place among the words of the block.
@@ -132,17 +203,18 @@ impl Done {
             }
         }
         done.gone = loose && cut_chars == entry.chars;
-        let first = edits.put.partition_point(|put| *put < text);
-        for put in edits.put[first..].iter().take_while(|put| **put <= end) {
+        for put in edits.puts(text, end).filter(|put| put.runs) {
             done.changed = true;
-            let at = put - text;
-            let next = words.partition_point(|(word, _)| word.end <= at);
-            let inside = words.get(next).is_some_and(|(word, _)| word.start < at);
-            // Text put between two words runs into each one that is more than space or punctuation.
-            let before = next.checked_sub(1).filter(|_| !inside);
-            for nth in [before, Some(next)].into_iter().flatten() {
-                if words.get(nth).is_some_and(|(_, wordlike)| inside || *wordlike) {
-                    done.words.entry(nth).or_default().1 = true;
+            // Beside characters that were cut, it counts at either end of them.
+            for at in [put.place.0.max(text) - text, put.place.1.min(end) - text] {
+                let next = words.partition_point(|(word, _)| word.end <= at);
+                let inside = words.get(next).is_some_and(|(word, _)| word.start < at);
+                // Text put between two words runs into each one that is more than space or punctuation.
+                let before = next.checked_sub(1).filter(|_| !inside);
+                for nth in [before, Some(next)].into_iter().flatten() {
+                    if words.get(nth).is_some_and(|(_, wordlike)| inside || *wordlike) {
+                        done.words.entry(nth).or_default().1 = true;
+                    }
                 }
             }
         }
@@ -175,9 +247,29 @@ fn words(text: &str) -> Vec<(Range<usize>, bool)> {
     text.split_word_bounds().map(word).collect()
 }
 
-/// The blocks of `old` in which the two sides' edits cannot both stand, each with whether it left its
-/// place on either side.
-fn clashes(old: &Document, index: &[Entry], edits: [&Edits; 2]) -> Vec<(BlockId, [bool; 2])> {
+/// A block of a clash, as the two sides last agreed on it.
+struct Old {
+    block: BlockId,
+    /// Whether it left its place on either side.
+    gone: [bool; 2],
+    /// Where it stood in the sequence: its marker, if it had one, and its text. Empty for a block that was
+    /// not there, which both sides have since put in.
+    place: Range<usize>,
+    marker: bool,
+}
+
+/// How many of the blocks after a clash are tried as the place to put its block back in.
+const NEAR: usize = 8;
+
+/// The blocks of `old` in which the two sides' edits cannot both stand, and those among `again`, which
+/// both sides settled apart. `near` takes the places of the markers that follow each.
+fn clashes(
+    old: &Document,
+    index: &[Entry],
+    edits: [&Edits; 2],
+    again: &BTreeSet<String>,
+    near: &mut Vec<Vec<usize>>,
+) -> Vec<Old> {
     // Where each block starts in the sequence, and where its text does.
     let (mut starts, mut texts) = (Vec::with_capacity(index.len()), Vec::with_capacity(index.len()));
     let mut at = 0;
@@ -193,19 +285,39 @@ fn clashes(old: &Document, index: &[Entry], edits: [&Edits; 2]) -> Vec<(BlockId,
             blocks.extend(holds(cut.start)..=holds(cut.end - 1));
         }
         // Text put right before a marker ends the block before it.
-        blocks.extend(edits.put.iter().filter_map(|put| texts.partition_point(|text| text <= put).checked_sub(1)));
+        let ends = |at: usize| texts.partition_point(|text| *text <= at).checked_sub(1);
+        let put = edits.put.iter().filter(|put| put.runs);
+        blocks.extend(put.flat_map(|put| [put.place.0, put.place.1]).filter_map(ends));
         blocks
     };
     let (ours, theirs) = (touched(edits[0]), touched(edits[1]));
     let order = flat::order(&old.blocks, index);
+    // Those among `again` that were there, and the rest.
+    let mut absent: BTreeSet<&str> = again.iter().map(String::as_str).collect();
+    let there = |(nth, (block, _)): (usize, &(&Block, &Entry))| absent.remove(block.id.as_str()).then_some(nth);
+    let again: BTreeSet<usize> = order.iter().enumerate().filter_map(there).collect();
+    let both: BTreeSet<usize> = ours.intersection(&theirs).chain(&again).copied().collect();
     let mut found = Vec::new();
-    for nth in ours.intersection(&theirs).copied().filter(|nth| index[*nth].shape == BodyShape::Text) {
+    for nth in both.into_iter().filter(|nth| index[*nth].shape == BodyShape::Text) {
         let Some((block, entry)) = order.get(nth) else { continue };
         let words = words(&block.plain_text());
         let done = edits.map(|edits| Done::of(edits, texts[nth], entry, &words));
-        if done[0].clashes(&done[1]) {
-            found.push((block.id.clone(), [done[0].gone, done[1].gone]));
+        if again.contains(&nth) || done[0].clashes(&done[1]) {
+            let place = starts[nth]..starts[nth] + entry.len();
+            found.push(Old {
+                block: block.id.clone(),
+                gone: [done[0].gone, done[1].gone],
+                place,
+                marker: entry.marker,
+            });
+            let after = index.iter().zip(&starts).skip(nth + 1).filter(|(entry, _)| entry.marker);
+            near.push(after.take(NEAR).map(|(_, start)| *start).collect());
         }
+    }
+    // A block that was not there has no place, and is gone from a side that does not hold it.
+    for block in absent {
+        found.push(Old { block: BlockId::new(block), gone: [true, true], place: 0..0, marker: false });
+        near.push(Vec::new());
     }
     found
 }
@@ -222,7 +334,8 @@ fn meet(sequence: &str, edits: [&Edits; 2]) -> bool {
             stretches.extend(holds(cut.start)..=holds(cut.end - 1));
         }
         // Text put in belongs with the character before it.
-        stretches.extend(edits.put.iter().map(|put| holds(put.saturating_sub(1))));
+        let put = edits.put.iter().filter(|put| put.runs);
+        stretches.extend(put.flat_map(|put| [put.place.0, put.place.1]).map(|at| holds(at.saturating_sub(1))));
         stretches
     };
     !touched(edits[0]).is_disjoint(&touched(edits[1]))
@@ -245,32 +358,133 @@ impl Stamp {
     }
 }
 
-/// What the history holds of each block at the revision it shows, with the newest edit made to the block
-/// since `shared` and who made it. A block whose edit left no text to ask is given the newest edit of
-/// that side at all.
-fn views(
-    loro: &LoroDoc,
-    body: &LoroText,
-    blocks: &[(BlockId, [bool; 2])],
-    shared: &VersionVector,
-) -> Vec<(Side, Stamp)> {
+/// What one side holds of a block of a clash.
+#[derive(Default)]
+struct Held {
+    /// `None` when it is not there.
+    block: Option<Block>,
+    /// The block as a change that puts it into the sequence, and with it the blocks the side cut from it:
+    /// all it made of the block's old text.
+    pieces: Vec<TextDelta>,
+    /// The id of each character of that, in order.
+    ids: Vec<ID>,
+    /// The ids of whatever else the side put in between the block's old text.
+    beside: Vec<ID>,
+    /// The ids of the text it put in right before the block, which ends the block before.
+    ahead: Vec<ID>,
+}
+
+/// What the history holds of each block at the revision it shows, which is that of the side whose `edits`
+/// these are. `other` are those of the other side, and `olds` the ids each block had when the two last
+/// agreed.
+fn views(loro: &LoroDoc, body: &LoroText, blocks: &[Old], olds: &[Vec<ID>], edits: &Edits, other: &Edits) -> Vec<Held> {
     let (doc, index) = crdt::read(loro, body);
     let order = flat::order(&doc.blocks, &index);
-    let last = |span: loro::IdSpan| Stamp::of(loro, ID::new(span.peer, span.counter.end - 1));
-    let side = loro.state_vv().sub_iter(shared).filter_map(last).max().unwrap_or_default();
-    let view = |id: &BlockId| {
-        let Some(nth) = order.iter().position(|(block, _)| block.id == *id) else { return (None, side) };
-        let start: usize = index[..nth].iter().map(Entry::len).sum();
-        let new = |at: usize| crdt::id_at(body, at).filter(|id| !shared.includes_id(*id));
-        let newest = (start..start + index[nth].len()).filter_map(new).filter_map(|id| Stamp::of(loro, id)).max();
-        (Some(order[nth].0.clone()), newest.unwrap_or(side))
+    let view = |(old, ids): (&Old, &Vec<ID>)| {
+        let text = old.place.start + usize::from(old.marker)..old.place.end;
+        let mut held = Held::default();
+        let mut own = 0..0;
+        let found = order.iter().position(|(block, _)| block.id == old.block).map(|nth| {
+            let start: usize = index[..nth].iter().map(Entry::len).sum();
+            (nth, start, old.marker && crdt::id_at(body, start) == ids.first().copied())
+        });
+        // Another block can have taken the id on this side, while the block itself stands under another.
+        // Which of the two the id then means is not to be told, and the block is left to merge.
+        let stands = || ids.first().is_some_and(|marker| crdt::place(loro, body, *marker).is_some());
+        if let Some((nth, start, same)) = found.filter(|(.., same)| *same || !old.marker || !stands()) {
+            let mut end = start + index[nth].len();
+            // A side that cut the block in two holds its old text in more blocks than one. They are its
+            // version of the block together, up to the end of the one that holds the last of that text.
+            let split = edits.puts(text.start, text.end).any(|put| put.row && put.place.0 < text.end);
+            if split && same {
+                let last = edits.last_kept(text.clone()).and_then(|last| ids.get(last - old.place.start));
+                let last = last.and_then(|last| crdt::place(loro, body, *last));
+                for entry in &index[nth + 1..] {
+                    if last.is_none_or(|last| last < end) {
+                        break;
+                    }
+                    end += entry.len();
+                }
+            }
+            if let Some((pieces, ids)) = crdt::stretch(loro, body, start..end) {
+                (held, own) = (Held { block: Some(order[nth].0.clone()), pieces, ids, ..Held::default() }, start..end);
+            }
+        }
+        // What else it put in where the old text stood can come to stand in the block's way, so the
+        // settling has to know of it. That goes for what it put before a marker it cut, and for what it
+        // put after the text when the other side put something there too. Anything else it wrote before
+        // or after the block is no edit of the block, and says nothing of when the block was last edited.
+        if !old.place.is_empty() {
+            let headless = !old.marker || edits.cuts(old.place.start);
+            let from = if headless { old.place.start } else { text.start };
+            let after = other.puts(text.end, text.end).next().is_some();
+            let between = edits.puts(from, text.end).filter(|put| after || put.place.0 < text.end);
+            let places = between.flat_map(|put| put.at..put.at + put.chars).filter(|at| !own.contains(at));
+            held.beside = places.filter_map(|at| crdt::id_at(body, at)).collect();
+            // Text it put in right before the block is no edit of the block. A merge can still leave it
+            // standing behind what the other side made of the block.
+            let ahead = edits.puts(old.place.start, old.place.start).filter(|put| !headless && put.runs);
+            let places = ahead.flat_map(|put| put.at..put.at + put.chars);
+            held.ahead = places.filter_map(|at| crdt::id_at(body, at)).collect();
+        }
+        held
     };
-    let told = |(id, _): &(BlockId, [bool; 2])| {
-        let (block, stamp) = view(id);
-        let (author, edited) = (crdt::author_of(loro, stamp.replica), u64::try_from(stamp.time).unwrap_or(0));
-        (Side { block, author, edited }, stamp)
-    };
-    blocks.iter().map(told).collect()
+    blocks.iter().zip(olds).map(view).collect()
+}
+
+/// The characters among `wanted` that one side took out, between the revision `from` that both sides
+/// share and its own, each against the earliest of the edits that cut it.
+fn strikes(
+    loro: &LoroDoc,
+    body: &LoroText,
+    from: &VersionVector,
+    to: &VersionVector,
+    wanted: &HashSet<ID>,
+) -> Result<HashMap<ID, ID>, HistoryError> {
+    let unreadable = |error: loro::LoroError| HistoryError::Unreadable(error.to_string());
+    let edits = loro.export_json_updates_without_peer_compression(from, to).map_err(unreadable)?;
+    let sequence = loro::ContainerTrait::id(body);
+    let mut struck: HashMap<ID, (u32, ID)> = HashMap::new();
+    for change in &edits.changes {
+        for op in change.ops.iter().filter(|op| op.container == sequence) {
+            let JsonOpContent::Text(JsonTextOp::Delete { len, start_id, .. }) = &op.content else { continue };
+            // A cut made backwards, as the backspace key makes it, takes its last character first.
+            let count = len.abs();
+            for nth in 0..count {
+                let aim = if *len > 0 { nth } else { count - 1 - nth };
+                let gone = ID::new(start_id.peer, start_id.counter + aim);
+                if wanted.contains(&gone) {
+                    let by = ID::new(change.id.peer, op.counter + nth);
+                    let when = change.lamport + u32::try_from(by.counter - change.id.counter).unwrap_or_default();
+                    let first = struck.entry(gone).or_insert((when, by));
+                    if (when, by.peer) < (first.0, first.1.peer) {
+                        *first = (when, by);
+                    }
+                }
+            }
+        }
+    }
+    Ok(struck.into_iter().map(|(gone, (_, by))| (gone, by)).collect())
+}
+
+/// A conflict, and what it takes to settle it.
+pub(crate) struct Clash {
+    conflict: Conflict,
+    /// Whether the block stood there when the sides last agreed. Those that did are in the order they
+    /// stood in.
+    old: bool,
+    /// What the later side holds of the block, as a change that puts it into the sequence, and the id of
+    /// each of its characters.
+    keep: (Vec<TextDelta>, Vec<ID>),
+    /// Those of them that the earlier side cut.
+    lost: HashSet<ID>,
+    /// The characters the earlier side put into what it holds of the block.
+    drop: Vec<ID>,
+    /// What else the earlier side put in where the block stood or right before it: text that runs on from
+    /// the block before, then blocks of its own. This block goes between the two.
+    beside: Vec<ID>,
+    /// The markers of the blocks that followed the block when the sides last agreed, nearest first.
+    near: Vec<ID>,
 }
 
 /// Finds the conflicts between two revisions. It reads the history at other revisions, and leaves it
@@ -280,54 +494,285 @@ pub(crate) fn find(
     body: &LoroText,
     events: &Mutex<Vec<Event>>,
     sides: [&Frontiers; 2],
-) -> Result<Vec<Conflict>, HistoryError> {
+) -> Result<Vec<Clash>, HistoryError> {
     let held = |at: &Frontiers| loro.frontiers_to_vv(at).ok_or(HistoryError::UnknownRevision);
-    let (ours, theirs) = (held(sides[0])?, held(sides[1])?);
+    let reach = [held(sides[0])?, held(sides[1])?];
     // A side that holds all of the other changed nothing apart from it.
-    if ours.partial_cmp(&theirs).is_some() {
+    if reach[0].partial_cmp(&reach[1]).is_some() {
         return Ok(Vec::new());
     }
-    let shared = ours.intersection(&theirs);
+    let shared = reach[0].intersection(&reach[1]);
     let base = loro.vv_to_frontiers(&shared);
-    // Shows a revision, and gives the change to the sequence that led there.
+    // Shows a revision, and gives the change to the sequence that led there with the blocks whose
+    // conflicts were settled on the way.
     let show = |at: &Frontiers| {
         let queue = || events.lock().unwrap_or_else(PoisonError::into_inner);
         queue().clear();
         loro.checkout(at).map_err(|_| HistoryError::UnknownRevision)?;
-        let changes = mem::take(&mut *queue()).into_iter();
-        let mut bodies = changes.filter_map(|event| if let Event::Body(delta) = event { Some(delta) } else { None });
-        let delta = bodies.next().unwrap_or_default();
-        debug_assert!(bodies.next().is_none(), "one step through the history told of the sequence twice");
-        Ok::<_, HistoryError>(delta)
+        let (mut delta, mut settled) = (None, BTreeSet::new());
+        for event in mem::take(&mut *queue()) {
+            match event {
+                Event::Body(body) => {
+                    debug_assert!(delta.is_none(), "one step through the history told of the sequence twice");
+                    delta = Some(body);
+                }
+                Event::Settled(blocks) => settled.extend(blocks),
+                _ => {}
+            }
+        }
+        Ok::<_, HistoryError>((Edits::of(&delta.unwrap_or_default()), settled))
     };
     show(&base)?;
     let sequence = body.to_string();
-    let first = Edits::of(&show(sides[0])?);
+    let (first, ours) = show(sides[0])?;
     show(&base)?;
-    let second = Edits::of(&show(sides[1])?);
+    let (second, theirs) = show(sides[1])?;
+    let again: BTreeSet<String> = ours.intersection(&theirs).cloned().collect();
     // Most copies that part change different blocks, and are done here.
-    if !meet(&sequence, [&first, &second]) {
+    if again.is_empty() && !meet(&sequence, [&first, &second]) {
         return Ok(Vec::new());
     }
     show(&base)?;
     let (old, index) = crdt::read(loro, body);
-    let blocks = clashes(&old, &index, [&first, &second]);
+    let mut near = Vec::new();
+    let blocks = clashes(&old, &index, [&first, &second], &again, &mut near);
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
+    let ids = |places: &mut dyn Iterator<Item = usize>| -> Vec<ID> {
+        places.filter_map(|at| crdt::id_at(body, at)).collect()
+    };
+    let olds: Vec<Vec<ID>> = blocks.iter().map(|old| ids(&mut old.place.clone())).collect();
+    let near: Vec<Vec<ID>> = near.into_iter().map(|near| ids(&mut near.into_iter())).collect();
     show(sides[1])?;
-    let theirs = views(loro, body, &blocks, &shared);
+    let (theirs, their_names) = (views(loro, body, &blocks, &olds, &second, &first), crdt::names(loro));
     show(sides[0])?;
-    let ours = views(loro, body, &blocks, &shared);
+    let (ours, our_names) = (views(loro, body, &blocks, &olds, &first, &second), crdt::names(loro));
+    let names = [our_names, their_names];
+
+    // The characters either side may have cut: the old ones of the blocks and of what stands with them.
+    let is_old = |id: &ID| shared.includes_id(*id);
+    let held = ours.iter().chain(&theirs).flat_map(|held| &held.ids);
+    let wanted: HashSet<ID> = olds.iter().flatten().chain(held).copied().filter(is_old).collect();
+    let struck = [strikes(loro, body, &shared, &reach[0], &wanted)?, strikes(loro, body, &shared, &reach[1], &wanted)?];
+    // The newest edit of each side at all, for a side whose edits to a block cannot be told.
+    let last = |span: loro::IdSpan| Stamp::of(loro, ID::new(span.peer, span.counter.end - 1));
+    let newest = [0, 1].map(|side| reach[side].sub_iter(&shared).filter_map(last).max().unwrap_or_default());
+
     let mut found = Vec::new();
-    for (((block, gone), (ours, first)), (theirs, second)) in blocks.into_iter().zip(ours).zip(theirs) {
+    let views = ours.into_iter().zip(theirs);
+    for (((old, chars), near), (ours, theirs)) in blocks.into_iter().zip(olds).zip(near).zip(views) {
         // A side that holds no such block and did not take it away joined it to the block before, where
         // its words now are. That block is another, and this one has no version on that side to show.
-        if (ours.block.is_some() || gone[0]) && (theirs.block.is_some() || gone[1]) {
-            found.push(Conflict { block, later: usize::from(second > first), sides: [ours, theirs] });
+        let there = [ours.block.is_some(), theirs.block.is_some()];
+        if !(there[0] || old.gone[0]) || !(there[1] || old.gone[1]) || there == [false, false] {
+            continue;
         }
+        let held = [ours, theirs];
+        // What each side did to the block: the characters it put into it or between its old ones, and its
+        // cuts of the old ones.
+        let all = chars.iter().chain(held.iter().flat_map(|held| &held.ids));
+        let touched: HashSet<&ID> = all.filter(|id| is_old(id)).collect();
+        let made = [0, 1].map(|side| {
+            let put = held[side].ids.iter().filter(|id| !is_old(id)).chain(&held[side].beside);
+            let cut = touched.iter().filter_map(|id| struck[side].get(*id));
+            // Each replica's newest edit holds its earlier ones.
+            let mut tips: BTreeMap<u64, i32> = BTreeMap::new();
+            for id in put.chain(cut) {
+                let tip = tips.entry(id.peer).or_insert(id.counter);
+                *tip = (*tip).max(id.counter);
+            }
+            tips.into_iter().map(|(peer, counter)| ID::new(peer, counter)).collect::<Vec<ID>>()
+        });
+        let stamps =
+            [0, 1].map(|side| made[side].iter().filter_map(|id| Stamp::of(loro, *id)).max().unwrap_or(newest[side]));
+        let later = usize::from(stamps[1] > stamps[0]);
+        let [ours, theirs] = held;
+        let side = |nth: usize, held: &Held| Side {
+            block: held.block.clone(),
+            author: names[nth].get(&stamps[nth].replica).cloned().unwrap_or_default(),
+            edited: u64::try_from(stamps[nth].time).unwrap_or(0),
+        };
+        let conflict = Conflict { block: old.block, sides: [side(0, &ours), side(1, &theirs)], later };
+        let old = !old.place.is_empty();
+        let (keep, drop) = if later == 0 { (ours, theirs) } else { (theirs, ours) };
+        let lost = keep.ids.iter().filter(|id| struck[1 - later].contains_key(*id)).copied().collect();
+        let beside = drop.ahead.into_iter().chain(drop.beside).collect();
+        let drop = drop.ids.into_iter().filter(|id| !is_old(id)).collect();
+        found.push(Clash { conflict, old, keep: (keep.pieces, keep.ids), lost, drop, beside, near });
     }
     Ok(found)
+}
+
+/// Where each of `ids` stands in the sequence as it is shown. They are given in the order of the sequence,
+/// so most are found by reading on from the one before. Finding one from nothing reads the whole of it.
+fn places(loro: &LoroDoc, body: &LoroText, ids: &[ID]) -> HashMap<ID, usize> {
+    /// How far to read on past the last one found.
+    const FAR: usize = 64;
+    let wanted: HashSet<ID> = ids.iter().copied().collect();
+    let (mut found, len) = (HashMap::new(), body.len_unicode());
+    for id in ids {
+        if found.contains_key(id) {
+            continue;
+        }
+        let Some(mut at) = crdt::place(loro, body, *id) else { continue };
+        found.insert(*id, at);
+        let mut misses = 0;
+        while misses < FAR && found.len() < wanted.len() && at + 1 < len {
+            at += 1;
+            match crdt::id_at(body, at).filter(|id| wanted.contains(id)) {
+                Some(id) => {
+                    found.insert(id, at);
+                    misses = 0;
+                }
+                None => misses += 1,
+            }
+        }
+    }
+    found
+}
+
+/// The conflicts worth telling of. Where the two sides read alike there is nothing to choose.
+pub(crate) fn told(clashes: Vec<Clash>) -> Vec<Conflict> {
+    let differs = |conflict: &Conflict| conflict.sides[0].block != conflict.sides[1].block;
+    clashes.into_iter().map(|clash| clash.conflict).filter(differs).collect()
+}
+
+/// What a settling does to the sequence, by place: the characters to take out, and the text to put in
+/// before a place, for which conflict. Text for an earlier conflict goes in first.
+#[derive(Default)]
+struct Fixes {
+    cut: BTreeSet<usize>,
+    put: BTreeMap<(usize, usize), Vec<TextDelta>>,
+    /// The lost characters that are put back in. Two conflicts can hold one character, when a side cut
+    /// one of their blocks from the other.
+    back: HashSet<ID>,
+}
+
+impl Clash {
+    /// Adds what makes the block read as the side that was edited last left it, in the sequence as the
+    /// history shows it. It is the `nth` of the conflicts, and `next` is where the block of the one after
+    /// it starts. Gives where its own block starts.
+    fn mend(
+        &self,
+        loro: &LoroDoc,
+        body: &LoroText,
+        nth: usize,
+        next: Option<usize>,
+        fixes: &mut Fixes,
+    ) -> Option<usize> {
+        let (pieces, ids) = &self.keep;
+        let kept: Vec<ID> = ids.iter().copied().filter(|id| !self.lost.contains(id)).collect();
+        let mut stand = places(loro, body, &kept);
+        fixes.cut.extend(places(loro, body, &self.drop).into_values());
+        // The merge can leave some of the block on the wrong side of what the earlier side put in beside
+        // it: behind a marker, in a block of that side's own, or ahead of text that ends the block before.
+        // Those characters are moved: taken out there, and put back in with what was lost.
+        let beside = places(loro, body, &self.beside);
+        let marks = |at: &&usize| body.char_at(**at).is_ok_and(|c| MARKER.starts_with(c));
+        // A block the later side joined to this one can hold a marker of the earlier side's as well.
+        let reach = stand.values().min().copied().zip(stand.values().max().copied());
+        let within = reach.and_then(|(first, last)| {
+            let (stretch, held) = (body.slice(first, last + 1).ok()?, stand.values().collect::<HashSet<_>>());
+            let markers =
+                stretch.chars().enumerate().filter(|(_, c)| MARKER.starts_with(*c)).map(|(nth, _)| first + nth);
+            markers.filter(|at| !held.contains(at) && !fixes.cut.contains(at)).min()
+        });
+        let gate = beside.values().filter(marks).copied().chain(within).min();
+        let lead = beside.values().filter(|at| gate.is_none_or(|gate| **at < gate)).max().map(|at| at + 1);
+        let astray = |at: usize| lead.is_some_and(|lead| at < lead) || gate.is_some_and(|gate| at > gate);
+        fixes.cut.extend(stand.values().copied().filter(|at| astray(*at)));
+        stand.retain(|_, at| !astray(*at));
+        // The characters of the block one by one, each with the piece that carries its attributes.
+        let spelled = pieces.iter().enumerate().flat_map(|(piece, item)| match item {
+            TextDelta::Insert { insert, .. } => insert.chars().map(|c| (piece, c)).collect(),
+            _ => Vec::new(),
+        });
+        let mut put = |at: usize, run: &mut Vec<(usize, char)>| {
+            let text = fixes.put.entry((at, nth)).or_default();
+            for chars in mem::take(run).chunk_by(|(a, _), (b, _)| a == b) {
+                let attributes = match &pieces[chars[0].0] {
+                    TextDelta::Insert { attributes, .. } => attributes.clone(),
+                    _ => None,
+                };
+                text.push(TextDelta::Insert { insert: chars.iter().map(|(_, c)| *c).collect(), attributes });
+            }
+        };
+        // A run of lost characters goes back in after the last one before it that is still there.
+        let (mut run, mut after, mut start) = (Vec::new(), None, None);
+        for (id, spelled) in ids.iter().zip(spelled) {
+            match stand.get(id) {
+                Some(at) => {
+                    if !run.is_empty() {
+                        put(after.unwrap_or(*at), &mut run);
+                    }
+                    start.get_or_insert(after.unwrap_or(*at));
+                    after = Some(at + 1);
+                }
+                None if fixes.back.insert(*id) => run.push(spelled),
+                None => {}
+            }
+        }
+        if !run.is_empty() {
+            // With nothing of the block left to go by, it goes between what the earlier side put in beside
+            // it, or else before the nearest block after it: one that still stands, or one put back.
+            let near = || self.near.iter().find_map(|id| crdt::place(loro, body, *id));
+            let after = after.or(lead).or(gate).or_else(|| [near(), next].into_iter().flatten().min());
+            let at = after.unwrap_or_else(|| body.len_unicode());
+            put(at, &mut run);
+            start.get_or_insert(at);
+        }
+        start
+    }
+}
+
+/// Makes the block of each conflict between two revisions read as the side that was edited last left it,
+/// by one change that every device writes alike. False when the history already holds the change, or
+/// there is nothing to do.
+///
+/// It shows the history where the two revisions have just met, and leaves it there.
+pub(crate) fn settle(loro: &LoroDoc, body: &LoroText, sides: [&Frontiers; 2], clashes: &[Clash]) -> bool {
+    let met = Frontiers::from(sides[0].iter().chain(sides[1].iter()).collect::<Vec<ID>>());
+    let met = loro.minimize_frontiers(&met).unwrap_or(met);
+    if clashes.is_empty() || loro.checkout(&met).is_err() {
+        return false;
+    }
+    // One change for all of them, read off one sequence: blocks that stood side by side are put back
+    // side by side.
+    let (mut fixes, mut next) = (Fixes::default(), None);
+    for (nth, clash) in clashes.iter().enumerate().rev() {
+        let start = clash.mend(loro, body, nth, next, &mut fixes);
+        next = start.filter(|_| clash.old).or(next);
+    }
+    let mut put: BTreeMap<usize, Vec<TextDelta>> = BTreeMap::new();
+    for ((at, _), text) in fixes.put {
+        put.entry(at).or_default().extend(text);
+    }
+    let places: BTreeSet<usize> = fixes.cut.iter().chain(put.keys()).copied().collect();
+    let (mut delta, mut at) = (Vec::new(), 0);
+    for place in places {
+        if place > at {
+            delta.push(TextDelta::Retain { retain: place - at, attributes: None });
+            at = place;
+        }
+        delta.extend(put.remove(&place).unwrap_or_default());
+        if fixes.cut.contains(&place) {
+            delta.push(TextDelta::Delete { delete: 1 });
+            at += 1;
+        }
+    }
+    if delta.is_empty() {
+        return false;
+    }
+    let replica = crdt::outsider(&Revision(met).to_string(), &delta, "settled");
+    if loro.oplog_vv().get(&replica).is_some_and(|held| *held > 0) || loro.set_peer_id(replica).is_err() {
+        return false;
+    }
+    // A part Loro refused leaves the rest written, here as on every device.
+    let _ = crdt::write(loro, body, &delta);
+    clashes.iter().for_each(|clash| crdt::settled(loro, &clash.conflict.block));
+    loro.commit();
+    true
 }
 
 #[cfg(test)]

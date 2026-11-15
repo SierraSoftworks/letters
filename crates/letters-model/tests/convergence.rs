@@ -379,10 +379,13 @@ proptest! {
             let change = match step {
                 Step::Edit { replica, edits } => {
                     let ops: Vec<Op> = edits.iter().filter_map(|edit| op(&before, edit)).collect();
+                    // Edits made together can take each other back, as a join and a split in the same place.
+                    let alone = ops.len() < 2;
                     let applied = replicas[replica].apply(ops);
                     let after = shown(&replicas[replica]);
                     let reported = applied.as_ref().is_ok_and(|change| *change != Change::default());
-                    prop_assert_eq!(reported, after != before, "an edit reports a change exactly when it made one");
+                    prop_assert!(reported || after == before, "an edit that changed the document did not report it");
+                    prop_assert!(!alone || reported == (after != before), "an edit that changed nothing reported a change");
                     seen[replica].push((replicas[replica].revision(), after.clone()));
                     if after != before {
                         last[replica] = Some((before.clone(), after, false));
@@ -423,7 +426,8 @@ proptest! {
                     };
                     let (ours, theirs) = (replicas[to].revision(), replicas[from].revision());
                     let held = [before.0.clone(), replicas[from].doc().clone()];
-                    let merged = replicas[to].merge(&history).expect("a replica reads another's history");
+                    let mine = replicas[to].save();
+                    let mut merged = replicas[to].merge(&history).expect("a replica reads another's history");
                     let apart = replicas[to].conflicts(&ours, &theirs).expect("a replica holds what it merged");
                     let mirror = replicas[to].conflicts(&theirs, &ours).expect("a replica holds what it merged");
                     let turned = |conflict: &Conflict| {
@@ -436,6 +440,41 @@ proptest! {
                         let then = held.each_ref().map(|doc| doc.block(&conflict.block));
                         prop_assert_eq!(versions, then, "a conflict shows a block as neither side left it");
                     }
+                    let (settled, found) = replicas[to].settle(&ours, &theirs).expect("a replica holds what it merged");
+                    prop_assert_eq!(&found, &apart, "settling found other conflicts than the search");
+                    for conflict in &apart {
+                        let now = replicas[to].block(&conflict.block).map(Block::plain_text);
+                        let later = conflict.sides[conflict.later].block.as_ref().map(Block::plain_text);
+                        // A block that one side joined to it stays joined. Joined by the earlier side, its
+                        // text follows. Joined by the later side, what the earlier made of it is in between.
+                        let (first, last) = (conflict.later, 1 - conflict.later);
+                        let mut joined = [first, last].map(|side| {
+                            let mut after = held[side].walk().skip_while(|block| block.id != conflict.block);
+                            after.nth(1).is_some_and(|next| held[1 - side].block(&next.id).is_none())
+                        });
+                        // The earlier side may not hold the block to tell by. Then any block of its own
+                        // that the later side has made away with may be the one.
+                        let away = |block: &Block| held[first].block(&block.id).is_none() && replicas[to].block(&block.id).is_none();
+                        joined[1] |= held[last].block(&conflict.block).is_none() && held[last].walk().any(away);
+                        let whole = match (&now, &later) {
+                            (Some(now), Some(later)) if joined[0] => now.starts_with(later.as_str()),
+                            (Some(now), Some(later)) if joined[1] => {
+                                let mut rest = now.chars();
+                                later.chars().all(|c| rest.any(|next| next == c))
+                            }
+                            _ => now == later,
+                        };
+                        prop_assert!(whole, "a settled block reads {:?}, and the later side left it {:?}", now, later);
+                    }
+                    // The other device meets the same two revisions, and settles them with no word from this one.
+                    let mut other = Model::load(&replicas[from].save(), ReplicaId::from(97)).expect("a saved history loads");
+                    other.merge(&mine).expect("a replica reads another's history");
+                    other.settle(&theirs, &ours).expect("a replica holds what it merged");
+                    prop_assert_eq!(shown(&other), shown(&replicas[to]), "two devices settled a conflict differently");
+                    let same = other.compare(&replicas[to].save());
+                    prop_assert_eq!(same, Ok(Some(Ordering::Equal)), "two devices settled a conflict by different changes");
+                    merged.blocks.extend(settled.blocks);
+                    merged.structure |= settled.structure;
                     Some(merged)
                 }
                 Step::Visit { replica, back } => {

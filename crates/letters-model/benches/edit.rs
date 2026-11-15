@@ -136,6 +136,10 @@ fn main() {
     report("the same, when it is one word", 20, None, |_| {
         assert_eq!(model.conflicts(&ours, &theirs).expect("revisions the history holds").len(), 1);
     });
+    // The first of these writes the change. The rest find it written.
+    report("settle that word", 20, None, |_| {
+        assert_eq!(model.settle(&ours, &theirs).expect("revisions the history holds").1.len(), 1);
+    });
     // A character in a block the edits above left alone.
     let text = model.doc().block(&id(BLOCKS / 4)).expect("the block").plain_text();
     let (offset, held) = text.char_indices().nth(30).expect("a long block");

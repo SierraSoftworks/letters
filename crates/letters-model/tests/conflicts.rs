@@ -1,10 +1,11 @@
-//! Who wrote an edit and when, and the blocks two writers changed in the same words while apart.
+//! Who wrote an edit and when, the blocks two writers changed in the same words while apart, and how such
+//! a block reads once the two meet.
 
 mod common;
 
 use std::cmp::Ordering;
 
-use common::{id, saved, sync, typed};
+use common::{id, saved, sync, texts, typed};
 use letters_model::{Block, BlockKind, Conflict, Document, HistoryError, Mark, Model, Op, ReplicaId, Revision};
 
 /// A morning in January 2027, in seconds since 1970.
@@ -15,8 +16,8 @@ const HOUR: u64 = 3_600;
 fn doc() -> Document {
     let blocks = vec![
         Block::text("h", BlockKind::Heading { level: 1 }, "Boats"),
-        Block::text("p1", BlockKind::Paragraph, "The quick brown fox jumps over the lazy dog."),
-        Block::text("p2", BlockKind::Paragraph, "It was a calm day."),
+        Block::text("p1", BlockKind::Paragraph, P1),
+        Block::text("p2", BlockKind::Paragraph, P2),
         Block::text("e", BlockKind::Paragraph, ""),
     ];
     Document { blocks, ..Document::default() }
@@ -59,15 +60,52 @@ fn ops(model: &Model, block: &str, edit: Edit) -> Vec<Op> {
     }
 }
 
+/// Edits to blocks, in the order a writer makes them.
+type Edits = Vec<(&'static str, Edit)>;
+
+fn write(model: &mut Model, edits: Edits) {
+    for (block, edit) in edits {
+        model.apply(ops(model, block, edit)).unwrap();
+    }
+}
+
 /// Lets each writer make an edit unseen by the other, then gives each all the other holds. Returns the
 /// revisions the two stood at before.
-fn part(ana: &mut Model, ben: &mut Model, hers: (&str, Edit), his: (&str, Edit)) -> (Revision, Revision) {
-    ana.apply(ops(ana, hers.0, hers.1)).unwrap();
-    ben.apply(ops(ben, his.0, his.1)).unwrap();
+fn part(
+    ana: &mut Model,
+    ben: &mut Model,
+    hers: (&'static str, Edit),
+    his: (&'static str, Edit),
+) -> (Revision, Revision) {
+    write(ana, vec![hers]);
+    write(ben, vec![his]);
     let stood = (ana.revision(), ben.revision());
     sync(ana, ben);
     stood
 }
+
+/// Gives a device what another one held, and settles what the two changed alike. Returns the conflicts.
+fn meet(model: &mut Model, held: &[u8], ours: &Revision, theirs: &Revision) -> Vec<Conflict> {
+    model.merge(held).unwrap();
+    model.settle(ours, theirs).unwrap().1
+}
+
+/// Lets each writer make edits unseen by the other. Then each device takes in what the other held and
+/// settles the conflicts by itself, with no word from the other about how.
+fn settle(ana: &mut Model, ben: &mut Model, hers: Edits, his: Edits) -> [Vec<Conflict>; 2] {
+    write(ana, hers);
+    write(ben, his);
+    let (her, him) = (ana.revision(), ben.revision());
+    let (hers, his) = (ana.save(), ben.save());
+    [meet(ana, &his, &her, &him), meet(ben, &hers, &him, &her)]
+}
+
+fn text(model: &Model, block: &str) -> Option<String> {
+    model.block(&id(block)).map(Block::plain_text)
+}
+
+const P1: &str = "The quick brown fox jumps over the lazy dog.";
+const P2: &str = "It was a calm day.";
 
 /// A name, what each writer does to a block unseen by the other, and the blocks that then conflict.
 type Apart = (&'static str, (&'static str, Edit), (&'static str, Edit), &'static [&'static str]);
@@ -225,4 +263,170 @@ fn an_outside_edit_is_the_same_change_whoever_finds_it_and_when() {
     assert_eq!(ana.compare(&ben.save()), Ok(Some(Ordering::Equal)));
     assert_eq!(ana.save(), ben.save(), "the change differs in nothing, its time included");
     assert!(ana.authors().is_empty(), "neither of them wrote it");
+}
+
+/// A name, what the writer who edits first and the one who edits last each do unseen by the other, and how
+/// the blocks then read.
+type Settled = (&'static str, Edits, Edits, &'static [&'static str]);
+
+#[test]
+fn a_settled_block_reads_as_the_writer_who_edited_last_left_it() {
+    use Edit::*;
+    let cases: Vec<Settled> = vec![
+        (
+            "the same word",
+            vec![("p1", Swap("quick", "slow"))],
+            vec![("p1", Swap("quick", "fast"))],
+            &["Boats", "The fast brown fox jumps over the lazy dog.", P2, ""],
+        ),
+        (
+            "words the first one cut",
+            vec![("p1", Swap("quick brown ", ""))],
+            vec![("p1", Swap("brown", "red"))],
+            &["Boats", "The quick red fox jumps over the lazy dog.", P2, ""],
+        ),
+        (
+            "a word the last one cut",
+            vec![("p1", Swap("fox", "foxes"))],
+            vec![("p1", Swap("fox ", ""))],
+            &["Boats", "The quick brown jumps over the lazy dog.", P2, ""],
+        ),
+        ("two ends for one word", vec![("h", Add("man"))], vec![("h", Add("wain"))], &["Boatswain", P1, P2, ""]),
+        (
+            "a paragraph the first one removed",
+            vec![("p2", Remove)],
+            vec![("p2", Swap("calm", "windy"))],
+            &["Boats", P1, "It was a windy day.", ""],
+        ),
+        (
+            "a paragraph the first one removed, and the last cut short",
+            vec![("p2", Remove)],
+            vec![("p2", Swap(" calm", ""))],
+            &["Boats", P1, "It was a day.", ""],
+        ),
+        (
+            "a paragraph the first one removed, having written on in the one before",
+            vec![("p1", Add(" The end.")), ("p2", Remove)],
+            vec![("p2", Swap("calm", "windy"))],
+            &["Boats", "The quick brown fox jumps over the lazy dog. The end.", "It was a windy day.", ""],
+        ),
+        (
+            "two paragraphs the first one removed",
+            vec![("p1", Remove), ("p2", Remove)],
+            vec![("p1", Swap("quick", "fast")), ("p2", Swap("calm", "windy"))],
+            &["Boats", "The fast brown fox jumps over the lazy dog.", "It was a windy day.", ""],
+        ),
+        (
+            "a paragraph the last one removed",
+            vec![("p2", Swap("calm", "windy"))],
+            vec![("p2", Remove)],
+            &["Boats", P1, ""],
+        ),
+        ("an empty paragraph the last one removed", vec![("e", Add("Notes"))], vec![("e", Remove)], &["Boats", P1, P2]),
+        (
+            "a paragraph the last one cut in two",
+            vec![("p1", Swap("lazy", "sleepy"))],
+            vec![("p1", Split("fox")), ("new", Swap("lazy", "idle"))],
+            &["Boats", "The quick brown fox", " jumps over the idle dog.", P2, ""],
+        ),
+        (
+            "a paragraph the first one cut in two",
+            vec![("p1", Split("fox")), ("new", Swap("lazy", "idle"))],
+            vec![("p1", Swap("lazy", "sleepy"))],
+            &["Boats", "The quick brown fox jumps over the sleepy dog.", P2, ""],
+        ),
+    ];
+    for (name, first, last, expected) in cases {
+        let (mut ana, mut ben) = writers();
+        let found = settle(&mut ana, &mut ben, first, last);
+        assert!(!found[0].is_empty() && found[0].len() == found[1].len(), "{name}: each device finds the conflicts");
+        assert_eq!(texts(&ana), expected, "{name}");
+        assert_eq!(ana.doc(), ben.doc(), "{name}: each device settled it alone, and alike");
+        assert_eq!(ana.compare(&ben.save()), Ok(Some(Ordering::Equal)), "{name}: by the very same change");
+    }
+}
+
+#[test]
+fn a_device_that_went_on_writing_elsewhere_settles_to_the_same_text() {
+    let (mut ana, mut ben) = writers();
+    write(&mut ana, vec![("p1", Edit::Swap("quick brown ", ""))]);
+    write(&mut ben, vec![("p1", Edit::Swap("brown", "red"))]);
+    let (her, him) = (ana.revision(), ben.revision());
+    let (hers, his) = (ana.save(), ben.save());
+    // Ana writes on in another paragraph before she sees what Ben did. Ben sees only what she did before.
+    write(&mut ana, vec![("p2", Edit::Add(" We sailed."))]);
+    let later = ana.revision();
+    assert_eq!(meet(&mut ana, &his, &later, &him).len(), 1);
+    assert_eq!(meet(&mut ben, &hers, &him, &her).len(), 1);
+    let settled = "The quick red fox jumps over the lazy dog.";
+    assert_eq!((text(&ana, "p1").as_deref(), text(&ben, "p1").as_deref()), (Some(settled), Some(settled)));
+
+    // They merged different revisions, so each put the cut words back by a change of its own. Settled
+    // again when they meet, the words stand once, and there is nothing left to choose.
+    let (her, him) = (ana.revision(), ben.revision());
+    let (hers, his) = (ana.save(), ben.save());
+    let found = [meet(&mut ana, &his, &her, &him), meet(&mut ben, &hers, &him, &her)];
+    assert_eq!(found, [vec![], vec![]]);
+    assert_eq!(texts(&ana), ["Boats", settled, "It was a calm day. We sailed.", ""]);
+    assert_eq!(ana.doc(), ben.doc());
+    assert_eq!(ana.compare(&ben.save()), Ok(Some(Ordering::Equal)));
+}
+
+#[test]
+fn a_block_two_devices_settled_apart_is_settled_again() {
+    let (mut ana, mut ben) = writers();
+    write(&mut ana, vec![("p1", Edit::Swap("quick brown ", ""))]);
+    write(&mut ben, vec![("p1", Edit::Swap("brown", "red"))]);
+    let (her, him) = (ana.revision(), ben.revision());
+    let (hers, his) = (ana.save(), ben.save());
+    // A third device meets both and settles the paragraph. Ben writes on in it, and then meets Ana.
+    let mut eve = ana.fork(ReplicaId::from(3));
+    assert_eq!(meet(&mut eve, &his, &her, &him).len(), 1);
+    ben.set_time(MORNING + 2 * HOUR);
+    write(&mut ben, vec![("p1", Edit::Swap("lazy", "idle"))]);
+    let later = ben.revision();
+    assert_eq!(meet(&mut ben, &hers, &later, &her).len(), 1);
+    assert_eq!(text(&ben, "p1").as_deref(), Some("The quick red fox jumps over the idle dog."));
+
+    // Each put the cut words back by a change of its own. The later of the two settlings stands.
+    let (theirs, his) = (eve.revision(), ben.revision());
+    let (held, kept) = (eve.save(), ben.save());
+    let found = [meet(&mut eve, &kept, &theirs, &his), meet(&mut ben, &held, &his, &theirs)];
+    assert_eq!((blocks(&found[0]), blocks(&found[1])), (vec!["p1"], vec!["p1"]));
+    assert_eq!(texts(&eve), ["Boats", "The quick red fox jumps over the idle dog.", P2, ""]);
+    assert_eq!(eve.doc(), ben.doc());
+    assert_eq!(eve.compare(&ben.save()), Ok(Some(Ordering::Equal)));
+}
+
+#[test]
+fn settling_twice_changes_nothing_and_no_undo_step_is_lost_to_it() {
+    let (mut ana, mut ben) = writers();
+    write(&mut ana, vec![("p2", Edit::Add(" We sailed.")), ("p1", Edit::Swap("quick", "slow"))]);
+    write(&mut ben, vec![("p1", Edit::Swap("quick", "fast"))]);
+    let (her, him) = (ana.revision(), ben.revision());
+    ana.merge(&ben.save()).unwrap();
+
+    let (change, found) = ana.settle(&her, &him).unwrap();
+    assert!(change.blocks.contains(&id("p1")), "the change names the block that now reads otherwise");
+    let settled = (ana.doc().clone(), ana.revision());
+    let (change, again) = ana.settle(&her, &him).unwrap();
+    assert_eq!((again, change.blocks.len()), (found, 0), "the conflict is found again, and nothing done");
+    assert_eq!((ana.doc(), ana.revision(), ana.is_latest()), (&settled.0, settled.1, true));
+
+    // Ana can still take back her own two edits, the earlier of which the settling did not touch.
+    assert!(ana.undo().is_some() && ana.undo().is_some());
+    assert_eq!(text(&ana, "p2").as_deref(), Some(P2));
+}
+
+#[test]
+fn a_model_that_shows_an_older_revision_settles_without_leaving_it() {
+    let (mut ana, mut ben) = writers();
+    let first = (ana.doc().clone(), ana.revision());
+    let stood = part(&mut ana, &mut ben, ("p1", Edit::Swap("quick", "slow")), ("p1", Edit::Swap("quick", "fast")));
+    ana.checkout(&first.1).unwrap();
+    let (change, found) = ana.settle(&stood.0, &stood.1).unwrap();
+    assert_eq!((blocks(&found), change.blocks.len()), (vec!["p1"], 0));
+    assert_eq!((ana.doc(), ana.revision(), ana.is_latest()), (&first.0, first.1, false));
+    ana.checkout_latest();
+    assert_eq!(text(&ana, "p1").as_deref(), Some("The fast brown fox jumps over the lazy dog."));
 }

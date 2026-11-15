@@ -17,7 +17,7 @@
 //! wasm-bindgen: the one thing the core takes from its host without being handed it.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::mem;
 use std::ops::Range;
@@ -47,6 +47,8 @@ const EXTRA: &str = "extra";
 const STYLE: &str = "style";
 /// The writers' names, each against the replica its writer used.
 const AUTHORS: &str = "authors";
+/// The blocks whose conflict was settled, each against the replica the settling change is written as.
+const SETTLED: &str = "settled";
 const LANGUAGE: &str = "language";
 const PROPERTIES: &str = "properties";
 
@@ -80,22 +82,23 @@ pub(crate) fn sign(loro: &LoroDoc, author: &str) {
     }
 }
 
-/// The name the writer of a replica gave. Empty when it gave none, as an outside change never does.
-pub(crate) fn author_of(loro: &LoroDoc, replica: u64) -> String {
-    let held = loro.get_map(AUTHORS).get(&replica.to_string()).and_then(|held| held.into_value().ok());
-    held.as_ref().and_then(text).unwrap_or_default().to_owned()
-}
-
-pub(crate) fn authors(loro: &LoroDoc) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    loro.get_map(AUTHORS).for_each(|_, held| {
+/// The name each replica's writer gave, as the revision shown holds them. A replica that gave none is not
+/// among them, as one that made an outside change never is.
+pub(crate) fn names(loro: &LoroDoc) -> HashMap<u64, String> {
+    let mut names = HashMap::new();
+    loro.get_map(AUTHORS).for_each(|replica, held| {
         if let ValueOrContainer::Value(held) = held
             && let Some(name) = text(&held).filter(|name| !name.is_empty())
+            && let Ok(replica) = replica.parse()
         {
-            names.insert(name.to_owned());
+            names.insert(replica, name.to_owned());
         }
     });
     names
+}
+
+pub(crate) fn authors(loro: &LoroDoc) -> BTreeSet<String> {
+    names(loro).into_values().collect()
 }
 
 /// Text as the sequence can hold it. The marker character is the sequence's own, so text gives it up.
@@ -246,6 +249,32 @@ pub(crate) fn id_at(body: &LoroText, at: usize) -> Option<ID> {
     body.get_cursor(at, Side::Middle)?.id
 }
 
+/// Where the character `id` stands in the sequence as it is shown. `None` when it is not in it. Loro
+/// reads the sequence from its start to tell.
+pub(crate) fn place(loro: &LoroDoc, body: &LoroText, id: ID) -> Option<usize> {
+    let found = loro.get_cursor_pos(&Cursor::new(Some(id), body.id(), Side::Middle, 0)).ok()?;
+    let there = found.update.is_none() && id_at(body, found.current.pos) == Some(id);
+    there.then_some(found.current.pos)
+}
+
+/// A stretch of the sequence as a change that puts it in, its markers carrying their blocks, and the id
+/// of each of its characters.
+pub(crate) fn stretch(loro: &LoroDoc, body: &LoroText, range: Range<usize>) -> Option<(Vec<TextDelta>, Vec<ID>)> {
+    let mut raw = vec![retain(range.start)];
+    raw.extend(body.slice_delta(range.start, range.end, PosType::Unicode).ok()?);
+    let mut pieces = lift(loro, body, &raw, &mut HashSet::new());
+    pieces.remove(0);
+    let ids = range.map(|at| id_at(body, at)).collect::<Option<Vec<ID>>>()?;
+    Some((pieces, ids))
+}
+
+/// Notes in the change that is open that it settles the conflict over `block`, for a later search to
+/// tell two settlings of one block apart.
+pub(crate) fn settled(loro: &LoroDoc, block: &BlockId) {
+    // Loro refuses no number under a string. The replica is the settling's own, and names it.
+    let _ = loro.get_map(SETTLED).insert(block.as_str(), loro.peer_id().cast_signed());
+}
+
 fn retain(retain: usize) -> TextDelta {
     TextDelta::Retain { retain, attributes: None }
 }
@@ -301,9 +330,7 @@ pub(crate) fn restyles(loro: &LoroDoc, body: &LoroText, keys: &[String], new: &H
             // A marker that is gone, or not yet there at the revision shown, has nothing to change. Its
             // block is gone from the map with it, which saves Loro a search of the history for it.
             markers.blocks.get(key)?;
-            let found = loro.get_cursor_pos(&Cursor::new(Some(id), body.id(), Side::Middle, 0)).ok()?;
-            let there = found.update.is_none() && id_at(body, found.current.pos) == Some(id);
-            there.then_some((found.current.pos, id))
+            Some((place(loro, body, id)?, id))
         })
         .collect();
     places.sort_unstable_by_key(|(at, _)| *at);
@@ -408,6 +435,8 @@ pub(crate) enum Event {
     /// One of the document's own fields changed.
     Meta,
     Style,
+    /// The conflicts over these blocks were settled, by id.
+    Settled(Vec<String>),
 }
 
 /// Collects what the history reports, for the model to catch up with.
@@ -415,15 +444,15 @@ pub(crate) fn watch(loro: &LoroDoc, body: &LoroText) -> (Arc<Mutex<Vec<Event>>>,
     let events: Arc<Mutex<Vec<Event>>> = Arc::default();
     let (queue, body) = (events.clone(), body.id());
     let markers = [loro.get_map(BLOCKS).id(), loro.get_map(DEPTHS).id()];
-    let style = loro.get_map(STYLE).id();
+    let (style, settled) = (loro.get_map(STYLE).id(), loro.get_map(SETTLED).id());
     let watch = loro.subscribe_root(Arc::new(move |event| {
         let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
         for diff in event.events {
+            let keys = |map: loro::event::MapDelta| map.updated.keys().map(|key| key.to_string()).collect();
             queue.push(match diff.diff {
                 Diff::Text(delta) if *diff.target == body => Event::Body(delta),
-                Diff::Map(map) if markers.contains(diff.target) => {
-                    Event::Markers(map.updated.keys().map(|key| key.to_string()).collect())
-                }
+                Diff::Map(map) if markers.contains(diff.target) => Event::Markers(keys(map)),
+                Diff::Map(map) if *diff.target == settled => Event::Settled(keys(map)),
                 _ if *diff.target == style => Event::Style,
                 _ => Event::Meta,
             });
