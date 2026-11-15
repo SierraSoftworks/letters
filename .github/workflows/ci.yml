@@ -111,6 +111,30 @@ jobs:
           xvfb-run -a -s "-screen 0 1400x1000x24" ./scripts/budgets.sh --window ubuntu-latest | tee budgets.txt
           { echo '```text'; cat budgets.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
 
+  # The tests that are too slow for every push, each night and when asked for.
+  slow:
+    name: Slow tests
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: slow
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install a session bus
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends dbus-daemon
+
+      - name: Test
+        run: ./scripts/check.sh slow
+
   # What layout costs a frame. The bench holds its own budgets and fails when a measurement is over one.
   bench:
     name: Layout bench
