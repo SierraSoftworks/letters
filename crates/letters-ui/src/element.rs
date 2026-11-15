@@ -152,7 +152,11 @@ pub struct Element<M> {
     pub(crate) telling: bool,
     pub(crate) in_view: bool,
     pub(crate) fitted: Option<Fitted>,
+    pub(crate) later: Option<Later<M>>,
 }
+
+/// What builds the content of an [`Element::later`].
+pub(crate) type Later<M> = Rc<dyn Fn() -> Element<M>>;
 
 /// Where the layout says which child of an [`Element::fit`] it showed, counted from the first.
 pub type Fitted = Rc<Cell<Option<usize>>>;
@@ -187,12 +191,23 @@ impl<M> Element<M> {
             telling: false,
             in_view: false,
             fitted: None,
+            later: None,
         }
     }
 
     /// A box whose children sit side by side.
     pub fn row() -> Self {
         Self::new(Content::None)
+    }
+
+    /// A place `height` tall for what `build` makes, which is made only while the place is near what shows:
+    /// a row of a long list, which costs next to nothing while it is scrolled away. The place is as tall
+    /// from the start as the row will be, so what scrolls keeps its height. Give it a key, and say on it
+    /// whether the row asks to be in view.
+    pub fn later(height: f32, build: impl Fn() -> Element<M> + 'static) -> Self {
+        let mut element = Self::column().height(height);
+        element.later = Some(Rc::new(build));
+        element
     }
 
     /// A box whose children are stacked top to bottom.

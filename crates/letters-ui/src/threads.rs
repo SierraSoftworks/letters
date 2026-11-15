@@ -41,7 +41,7 @@ const REACH: f32 = 3.0;
 
 /// How wide a note that is open is, and the round face of who speaks in it.
 const WIDTH: f32 = 344.0;
-const FACE: f32 = 24.0;
+pub(crate) const FACE: f32 = 24.0;
 /// How wide what is said runs, beside the face of who says it.
 pub(crate) const SAID: f32 = WIDTH - FACE - tokens::SPACE_SM;
 /// How tall what is said in a note gets before it scrolls.

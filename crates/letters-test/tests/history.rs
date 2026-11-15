@@ -79,6 +79,19 @@ fn survey() -> Harness {
     window
 }
 
+/// A count that was raised once an hour for so many hours until that Sunday began, with its history
+/// showing twenty minutes later.
+fn counted(sittings: u64) -> Harness {
+    let mut window = Harness::doc("# Count\n\nThe count is 0.");
+    window.ui().set_author("Sam Okafor");
+    for n in 1..=sittings {
+        write(&mut window, SUNDAY - (sittings - n) * HOUR, &format!("is {}", n - 1), &format!("is {n}"));
+    }
+    window.platform.wall = Some(SUNDAY + 20 * MINUTE);
+    window.click(Role::Button, "History");
+    window
+}
+
 /// What the plan read when it was begun, block by block.
 const PLAN: [&str; 6] = [
     "# Cottage renovation",
@@ -209,6 +222,17 @@ fn shown(window: &mut Harness) -> Vec<String> {
     runs.filter_map(|run| run.value).map(|text| text.trim_end().to_owned()).skip(1).collect()
 }
 
+/// What is drawn where the version shows: its letters, and what marks them.
+fn drawn(window: &mut Harness) -> Vec<Item> {
+    let area = area(window);
+    let items = window.paint().items.into_iter().filter(|item| match item {
+        Item::Glyphs { origin, .. } => area.contains(*origin),
+        Item::Fill { rect, .. } => area.contains(Point { x: rect.x + rect.width / 2.0, y: rect.y + rect.height / 2.0 }),
+        _ => false,
+    });
+    items.collect()
+}
+
 /// The paragraphs of the document itself.
 fn written(window: &Harness) -> Vec<String> {
     window.editor().doc().blocks.iter().skip(1).map(Block::plain_text).collect()
@@ -247,6 +271,8 @@ fn kept(window: &mut Harness) -> Kept {
 
 /// A way of doing something to a window.
 type Act = fn(&mut Harness);
+/// A document with its history showing.
+type Open = fn() -> Harness;
 /// A way of picking the version that is so many back from the newest.
 type Pick = fn(&mut Harness, usize);
 /// How far into the page area a press is, given how much of the earlier version shows at its left.
@@ -455,6 +481,62 @@ fn a_version_is_set_again_for_a_window_of_another_width() {
 }
 
 #[test]
+fn a_version_that_is_stepped_to_shows_as_it_does_laid_out_whole() {
+    // A step lays out only what differs from the version that showed. Another width lays all of it out.
+    let cases: [(&str, Open); 2] = [("the letter", history), ("the plan", plan)];
+    for (name, open) in cases {
+        for compared in ["Previous", "Current", "Off"] {
+            let mut window = open();
+            window.click(Role::ListBoxOption, "Current version").click(Role::RadioButton, compared);
+            let count = versions(&mut window).len();
+            // Back to the oldest and on to the newest again, so each is come to from both sides.
+            let steps = std::iter::repeat_n("Left", count - 1).chain(std::iter::repeat_n("Right", count - 1));
+            for (step, key) in steps.enumerate() {
+                window.key(key);
+                let stepped = drawn(&mut window);
+                window.resize(560.0, 800.0);
+                window.paint();
+                window.resize(1280.0, 800.0);
+                let whole = drawn(&mut window);
+                assert!(!whole.is_empty(), "{name}, {compared}, step {step}: the version shows");
+                assert!(
+                    stepped == whole,
+                    "{name}, {compared}, step {step}: the version shows as it does laid out whole"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn code_is_coloured_as_the_version_that_shows_reads() {
+    // The second block was taken out after a line was added to the first.
+    let mut window = Harness::doc("```rust\nlet first = 1;\n```\n\n```rust\nlet second = 2;\n```\n");
+    window.platform.wall = Some(SUNDAY + HOUR);
+    window.select("first").key("End").key("Enter").type_text("fn main() {}");
+    window.platform.wall = Some(SUNDAY + 3 * HOUR);
+    window.select("let second = 2;");
+    while window.editor().doc().blocks.len() > 1 {
+        window.key("Backspace");
+    }
+    window.platform.wall = Some(SUNDAY + 4 * HOUR);
+    window.click(Role::Button, "History").click(Role::RadioButton, "Off");
+    let keyword = tokens::SYNTAX_KEYWORD.light;
+    let keywords = |window: &mut Harness| {
+        let inked = |item: &Item| match item {
+            Item::Glyphs { color, .. } => (color.r, color.g, color.b) == (keyword.r, keyword.g, keyword.b),
+            _ => false,
+        };
+        drawn(window).iter().filter(|item| inked(item)).count()
+    };
+    assert_eq!(keywords(&mut window), 2, "both keywords of the document as it is");
+    for (key, expected) in [("Left", 3), ("Left", 2), ("Right", 3), ("Right", 2)] {
+        window.key(key);
+        assert_eq!(keywords(&mut window), expected, "{key}: the keywords that version has");
+    }
+}
+
+#[test]
 fn a_version_shows_what_it_changed_from_the_version_before_it() {
     let mut window = plan();
     let document = window.markdown();
@@ -565,6 +647,56 @@ fn a_version_the_window_cuts_off_comes_across_when_it_is_pressed() {
         // Another version starts with its later side whole again.
         window.key("Right").key("Left");
         assert!(!whole(&mut window), "{way}");
+    }
+}
+
+#[test]
+fn a_long_history_lists_the_versions_near_what_shows_and_brings_the_one_picked_into_view() {
+    let mut window = counted(60);
+    let panel = window.find(Role::Complementary, "History").expect("the panel").bounds;
+    let in_view = |row: &Found| row.bounds.y >= panel.y && row.bounds.y + row.bounds.height <= panel.y + panel.height;
+    let row = |window: &mut Harness, name: &str| versions(window).into_iter().find(|version| version.name == name);
+    assert_eq!(strip(&mut window).description.as_deref(), Some("61 of 61"));
+    // The panel builds the rows near what shows of it, which is its top.
+    let listed = versions(&mut window);
+    assert!(listed.len() < 61 && listed[0].name == "Current version", "{} rows are built", listed.len());
+
+    // The oldest version is picked on the strip: its row is built, and is in view.
+    let oldest = Point { x: strip(&mut window).bounds.x + 1.0, y: strip(&mut window).center().y };
+    window.click_at(oldest);
+    let first = row(&mut window, "First version").expect("the row of the oldest version");
+    assert!(first.selected == Some(true) && in_view(&first), "it is picked and in view: {:?}", first.bounds);
+    assert_eq!(shown(&mut window), ["The count is 0."]);
+
+    // The panel scrolls back to the newest under the wheel, and a press there picks.
+    window.scroll_at(Point { x: panel.x + panel.width / 2.0, y: panel.y + panel.height / 2.0 }, -1e6);
+    let newest = row(&mut window, "Current version").expect("the row of the newest version");
+    assert!(in_view(&newest), "the newest version is in view again: {:?}", newest.bounds);
+    window.click(Role::ListBoxOption, "23:00");
+    assert_eq!(shown(&mut window), ["The count is 59."]);
+}
+
+#[test]
+fn the_place_the_panel_keeps_for_a_row_is_as_tall_as_the_row() {
+    // A version nobody put their name to, with a name of its own: its row says when it was written under
+    // the name, and shows no face.
+    let mut unsigned = Harness::doc("The roof comes first.");
+    write(&mut unsigned, SUNDAY + HOUR, "roof", "north roof");
+    let named = unsigned.ui().change(|editor| {
+        let at = editor.model().revision();
+        editor.name_version(&at, Some("Draft")).map(|()| Change::default())
+    });
+    assert!(named.is_ok());
+    write(&mut unsigned, SUNDAY + 3 * HOUR, "first", "first of all");
+    unsigned.platform.wall = Some(SUNDAY + 4 * HOUR);
+    unsigned.click(Role::Button, "History");
+    for (name, mut window) in [("the letter", history()), ("an unsigned document", unsigned)] {
+        let controls = window.controls();
+        for day in controls.iter().filter(|found| found.role == Role::ListBox) {
+            let within = |row: &&Found| row.role == Role::ListBoxOption && day.bounds.contains(row.center());
+            let rows: f32 = controls.iter().filter(within).map(|row| row.bounds.height).sum();
+            assert_eq!(rows, day.bounds.height, "{name}, {}: its rows are as tall as their places", day.name);
+        }
     }
 }
 

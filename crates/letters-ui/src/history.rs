@@ -23,7 +23,7 @@ use accesskit::{Node, NodeId, Role};
 use letters_editor::{Key, KeyEvent};
 use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split};
 use letters_model::{
-    Block, BlockId, BlockKind, Body, Document, Point as Step, Pos, Revision, Selection, Style, Tag, TagKind,
+    Block, BlockId, BlockKind, Body, Change, Document, Point as Step, Pos, Revision, Selection, Style, Tag, TagKind,
 };
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Item, PathEl, Point, Rect, Size};
@@ -75,6 +75,8 @@ const DASH: f32 = 4.0;
 const SETTLES: usize = 3;
 /// How many versions that were read are kept, so that a step to the next version reads one and not two.
 const KEPT: usize = 3;
+/// The most blocks a version differs in from the last one shown for its layout to go on from that one's.
+const NEAR: usize = 8;
 /// The most characters of the words a block gained or lost that assistive technology is told.
 const TOLD: usize = 160;
 /// The most room the field takes that a version's name is typed in.
@@ -203,6 +205,14 @@ impl Version {
             _ if first => "First version".to_owned(),
             _ => "Undated edits".to_owned(),
         }
+    }
+
+    /// What it is listed as, and the time it was written at where that is not what it is listed as: the
+    /// time is said once. `ends` is as for [`Version::title`].
+    fn aside(&self, ends: (bool, bool), zone: i32) -> (String, Option<String>) {
+        let title = self.title(ends, zone);
+        let when = self.clock(zone).filter(|clock| *clock != title);
+        (title, when)
     }
 
     /// Who wrote it, in a few words. `None` when nobody put a name to it.
@@ -608,14 +618,24 @@ struct Leaf {
     said: HashMap<BlockId, String>,
     /// The width it is laid out at, once it is.
     laid: Option<f32>,
+    /// What the page's layout and the earlier side's have still to take in: `None` for one that was never
+    /// laid out, and otherwise what differs from the version it was last laid out for.
+    behind: [Option<Change>; 2],
+    /// The layout of an earlier side that the last version had and this one has no use for, kept for
+    /// the next that has.
+    spare: Option<Sheet>,
     /// Whether some of its heights are still estimates.
     estimated: bool,
 }
 
+/// A document, its layout, and what the layout has still to take in of it.
+type Sheet = (Document, DocLayout, Option<Change>);
+
 /// What the history keeps while it shows.
 pub(crate) struct History {
-    /// Oldest first, and never empty.
-    versions: Vec<Version>,
+    /// Oldest first, and never empty. Shared with the rows of the panel, which are built as they come
+    /// near what shows.
+    versions: Rc<Vec<Version>>,
     /// The version picked.
     at: usize,
     /// What it is compared with.
@@ -658,7 +678,7 @@ impl History {
     /// The history of a document that reads as `current`, with its newest version picked.
     pub fn new(steps: &[Step], current: Revision, now: Option<u64>, zone: i32) -> Self {
         let mut history = Self {
-            versions: Vec::new(),
+            versions: Rc::default(),
             at: 0,
             compare: Compare::default(),
             naming: None,
@@ -688,14 +708,15 @@ impl History {
     /// edits came in. The version that was picked stays picked while it is still listed.
     pub fn follow(&mut self, steps: &[Step], current: Revision) {
         let picked = self.versions.get(self.at).map(|version| version.at.clone());
-        self.versions = versions(steps, self.zone);
+        let mut listed = versions(steps, self.zone);
         // The document as it reads now is always the last version, marked or not.
         let newest = steps.last().map_or(&current, |step| &step.after);
-        if self.versions.last().is_none_or(|last| last.at != *newest) {
+        if listed.last().is_none_or(|last| last.at != *newest) {
             let time = steps.last().map_or(0, |step| step.time);
             let (authors, tag) = (Vec::new(), None);
-            self.versions.push(Version { at: newest.clone(), time, authors, added: 0, removed: 0, tag });
+            listed.push(Version { at: newest.clone(), time, authors, added: 0, removed: 0, tag });
         }
+        self.versions = Rc::new(listed);
         // A version that is listed no longer, as one whose name was taken off, is part of the one that
         // holds what it wrote.
         let kept = picked.and_then(|picked| {
@@ -768,7 +789,8 @@ impl History {
             (_, Some(by)) => [format!("Removed by {by}"), format!("Added by {by}")],
             (_, None) => ["Removed", "Added"].map(str::to_owned),
         };
-        self.leaf = later.map(|later| Leaf::new(between, earlier.as_deref(), &later, heads, captions));
+        let last = self.leaf.take();
+        self.leaf = later.map(|later| Leaf::new(between, earlier.as_deref(), &later, heads, captions, last));
         // The versions just shown are the ones a step is most likely to want again.
         let spare = self.read.len().saturating_sub(KEPT);
         self.read.drain(..spare);
@@ -837,6 +859,9 @@ impl History {
             let earlier = leaf.earlier.as_mut().is_some_and(|(_, layout)| layout.add_fonts(fonts));
             if leaf.layout.add_fonts(fonts) || earlier {
                 leaf.estimated = true;
+            }
+            if let Some((_, spare, _)) = &mut leaf.spare {
+                spare.add_fonts(fonts);
             }
         }
     }
@@ -1250,10 +1275,16 @@ impl History {
             count => format!("{count} versions"),
         };
         let mut panel = SidePanel::new("History").aside(count);
+        let (count, zone) = (self.versions.len(), self.zone);
         for (name, listed) in self.days() {
-            let rows = listed.iter().enumerate().map(|(place, at)| {
-                let ends = (place == 0, place + 1 == listed.len());
-                self.row(*at, ends)
+            let rows = listed.iter().enumerate().map(|(place, &at)| {
+                let (ends, picked) = ((place == 0, place + 1 == listed.len()), at == self.at);
+                let (version, versions) = (&self.versions[at], self.versions.clone());
+                // A long history has more rows than a frame has time for, so a row is built when it
+                // comes near what shows. Until then its place is kept.
+                let two = !version.authors.is_empty() || version.aside((at == 0, at + 1 == count), zone).1.is_some();
+                let tall = 2.0 * tokens::SPACE_SM + HEAD + if two { tokens::SPACE_2XS + threads::FACE } else { 0.0 };
+                Element::later(tall, move || Self::row(&versions, at, picked, ends, zone)).key(at).in_view(picked)
             });
             let list = Element::column().key(listed[0]).role(Role::ListBox).label(name.as_str()).children(rows);
             panel = panel.child(SidePanel::<Message>::section(&name)).child(list);
@@ -1263,15 +1294,13 @@ impl History {
 
     /// One version in the panel: its marker on the day's rail, what it is listed as, who wrote it and how
     /// much it changed. `ends` says whether it is the first and the last of its day.
-    fn row(&self, at: usize, (first, last): (bool, bool)) -> Element<Message> {
-        let version = &self.versions[at];
-        let (newest, picked) = (at + 1 == self.versions.len(), at == self.at);
+    fn row(versions: &[Version], at: usize, picked: bool, (first, last): (bool, bool), zone: i32) -> Element<Message> {
+        let version = &versions[at];
+        let newest = at + 1 == versions.len();
         let small = TextStyle::control().size(tokens::TEXT_SM);
         let quiet = TextStyle::control().size(tokens::TEXT_XS);
-        let title = version.title((at == 0, newest), self.zone);
+        let (title, when) = version.aside((at == 0, newest), zone);
         let who = version.who();
-        // The time is said once: by the title, or else after who wrote the version.
-        let when = version.clock(self.zone).filter(|clock| *clock != title);
         let size = changed(version.added, version.removed);
 
         let mut head = Element::row()
@@ -1303,7 +1332,9 @@ impl History {
         if !by.is_empty() {
             let face = version.authors.first().map(|(name, _)| threads::face(name, false));
             let by = Element::text(by.join(" \u{b7} "), small).fg(tokens::FG_MUTED).shrink();
-            body = body.child(Element::row().align(Align::Center).gap(tokens::SPACE_SM).children(face).child(by));
+            let by = Element::row().align(Align::Center).gap(tokens::SPACE_SM).children(face).child(by);
+            // As tall with a face as without, so that the row's height is known before it is built.
+            body = body.child(by.height(threads::FACE));
         }
 
         // What made it a version of its own shows in its marker: the one that is the document now, and
@@ -1318,7 +1349,6 @@ impl History {
             Rail { diamond: apart && !newest, ink, at: tokens::SPACE_SM + HEAD / 2.0, above: !first, below: !last };
         let told: Vec<String> = [who, when, size].into_iter().flatten().collect();
         let row = Element::row()
-            .key(version.at.to_string())
             .gap(tokens::SPACE_SM)
             .padding(Edges::xy(tokens::SPACE_XS, 0.0))
             .radius(tokens::RADIUS_CONTROL)
@@ -1327,7 +1357,6 @@ impl History {
             .label(title)
             .description(told.join(", "))
             .selected(picked)
-            .in_view(picked)
             // A press picks the version. The keyboard stays with the page, where the arrows step on.
             .on_click(Message::History(Historying::Pick(at)))
             .child(Element::canvas(Rc::new(rail)).width(TRACK).passive().decorative())
@@ -1354,31 +1383,49 @@ impl History {
 impl Leaf {
     /// A version to show: `later`, as it read or as it differs from `earlier`. `heads` say who wrote the
     /// two and when, and `captions` what stands over a stretch that was taken out and over one that was
-    /// added.
+    /// added. `last` is the version that showed until now.
     fn new(
         between: (Option<Revision>, Revision),
         earlier: Option<&(Document, Style)>,
         later: &(Document, Style),
         heads: [Head; 2],
         captions: [String; 2],
+        last: Option<Self>,
     ) -> Self {
         let (doc, found) = match earlier {
             Some((earlier, _)) => compare(earlier, &later.0),
             None => (later.0.clone(), Differences::default()),
         };
-        let fresh = || {
-            let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
-            // Nothing has a caret here, so a formula is typeset and never shows its source.
-            layout.set_formula_source(false);
-            layout
+        // A step shows nearly the same document, so the layouts go on from the last version's and lay
+        // out only what differs. A layout of its own for every version made a step cost a whole page.
+        let (laid, [page, other]) = last.map_or((None, [None, None]), |last| (last.laid, last.sheets()));
+        let go_on = |sheet: Option<Sheet>, doc: &Document| match sheet {
+            Some((was, layout, behind)) => {
+                let behind = behind.and_then(|mut behind| {
+                    behind.absorb(differing(&was, doc));
+                    // A layout sets every block a change names at once, in view or not. A version far
+                    // from the last differs in many, so it is laid out as new and only what shows is set.
+                    (behind.blocks.len() <= NEAR).then_some(behind)
+                });
+                (layout, behind)
+            }
+            None => {
+                let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
+                // Nothing has a caret here, so a formula is typeset and never shows its source.
+                layout.set_formula_source(false);
+                (layout, None)
+            }
         };
-        let earlier = (!found.pairs.is_empty()).then(|| {
+        let (layout, behind) = go_on(page, &doc);
+        let (mut earlier, mut spare, mut second) = (None, other, None);
+        if !found.pairs.is_empty() {
             let mut first = doc.clone();
             for before in &found.pairs {
                 review::put(&mut first.blocks, before.clone());
             }
-            (first, fresh())
-        });
+            let (layout, behind) = go_on(spare.take(), &first);
+            (earlier, second) = (Some((first, layout)), behind);
+        }
         let said = found.sorts.iter().map(|(block, sort)| {
             let said = match sort {
                 Sort::Added => captions[1].clone(),
@@ -1395,32 +1442,43 @@ impl Leaf {
             pairs: found.pairs.iter().map(|before| before.id.clone()).collect(),
             doc,
             style: later.1.clone(),
-            layout: fresh(),
+            layout,
             earlier,
             found,
             heads,
             captions,
-            laid: None,
+            laid,
+            behind: [behind, second],
+            spare,
             estimated: true,
         }
     }
 
+    /// The page and its layout, and those of an earlier side if it has one to hand on, for the version
+    /// that shows next.
+    fn sheets(self) -> [Option<Sheet>; 2] {
+        let [page, earlier] = self.behind;
+        let earlier = self.earlier.map(|(doc, layout)| (doc, layout, earlier));
+        [Some((self.doc, self.layout, page)), earlier.or(self.spare)]
+    }
+
     /// Sets the version for a column `width` wide, when it is not.
     fn lay(&mut self, width: f32, images: &Images, palette: Palette) {
+        let wide = self.laid == Some(width);
         let mut layouts =
             [Some((&self.doc, &mut self.layout)), self.earlier.as_mut().map(|(doc, layout)| (&*doc, layout))];
-        for (doc, layout) in layouts.iter_mut().flatten() {
-            if self.laid != Some(width) {
-                layout.update(doc, &self.style, width, None);
-            }
-            if self.laid.is_none() {
-                dress(doc, layout, images);
+        for (layout, behind) in layouts.iter_mut().zip(&mut self.behind) {
+            let Some((doc, layout)) = layout else { continue };
+            let change = behind.replace(Change::default());
+            if !wide || change.as_ref() != Some(&Change::default()) {
+                // A layout that finds its width or its style changed lays everything out again.
+                layout.update(doc, &self.style, width, change.as_ref());
+                dress(doc, layout, images, change.as_ref());
+                self.estimated = true;
             }
             layout.set_palette(palette);
         }
-        if self.laid != Some(width) {
-            (self.laid, self.estimated) = (Some(width), true);
-        }
+        self.laid = Some(width);
     }
 
     /// The page as what differs splits it, in a page area `room` wide: at each block that has two
@@ -1454,11 +1512,36 @@ impl Leaf {
     }
 }
 
+/// What a layout of `old` is to take in to be one of `new`.
+fn differing(old: &Document, new: &Document) -> Change {
+    let was: HashMap<&BlockId, &Block> = old.walk().map(|block| (&block.id, block)).collect();
+    let mut change = Change::default();
+    let mut kept = 0;
+    for block in new.walk() {
+        match was.get(&block.id) {
+            Some(was) if *was == block => kept += 1,
+            Some(_) => {
+                kept += 1;
+                change.blocks.insert(block.id.clone());
+            }
+            None => _ = change.blocks.insert(block.id.clone()),
+        }
+    }
+    if kept < was.len() {
+        let is: HashSet<&BlockId> = new.walk().map(|block| &block.id).collect();
+        change.blocks.extend(was.keys().filter(|id| !is.contains(*id)).map(|id| (*id).clone()));
+    }
+    change.structure = !old.walk().map(|block| &block.id).eq(new.walk().map(|block| &block.id));
+    change
+}
+
 /// Gives a layout what the page's has beside the document: the colours of its code, and the pictures it
-/// links to that are there to draw.
-fn dress(doc: &Document, layout: &mut DocLayout, images: &Images) {
+/// links to that are there to draw. `only` names the blocks that changed since it last had them.
+fn dress(doc: &Document, layout: &mut DocLayout, images: &Images, only: Option<&Change>) {
     for block in doc.walk() {
-        if let BlockKind::Code { language } = &block.kind {
+        if let BlockKind::Code { language } = &block.kind
+            && only.is_none_or(|change| change.blocks.contains(&block.id))
+        {
             let tokens = highlight::tokens(&block.plain_text(), language.as_deref().unwrap_or_default());
             layout.set_tokens(&block.id, tokens);
         }
