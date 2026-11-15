@@ -1,37 +1,32 @@
 //! The desktop's side of connected mode against the server itself: `letters-server`, running on this
 //! machine over scratch folders, behind a certificate nobody but a test trusts.
-//!
-//! The server does not serve a document's socket yet, so what stands in front of it here does: it asks
-//! the server who is there and what they may do, and hosts the room of `letters-sync` itself.
 
 mod common;
 
-use std::collections::{HashMap, VecDeque};
-use std::io::{self, Cursor, Read, Write};
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use common::{Scratch, Writer};
 use letters::connected::{self, Line, Said, Told};
 use letters::files::{self, Home};
 use letters::keychain::Keychain;
 use letters::pictures;
-use letters::platform;
 use letters::remote::Roots;
 use letters::server::Client;
 use letters::session::Session;
 use letters::signin::SignIn;
 use letters_api::{Entry, EntryKind, NewDocument, Opened, Person, Role, SpaceKind, Trust, paths};
-use letters_format::{Archive, Files, Stamp, WorkingCopy};
-use letters_model::{Block, BlockKind, Notes, ReplicaId, Style};
+use letters_model::{Block, BlockKind, Notes, Style};
 use letters_server::config::Config;
 use letters_server::session::{COOKIE_NAME, Carrier};
 use letters_server::store::Store;
 use letters_server::{App, api};
-use letters_sync::{Access, ClientMessage, Link, Local, Outbound, Progress, Refusal, Room, SessionId};
+use letters_sync::{ClientMessage, Link, Local, Progress, Refusal};
 use sha2::{Digest, Sha256};
 
 /// Sign-ins are kept in memory here, never in the keychain of whoever runs the tests.
@@ -90,8 +85,12 @@ path = '{at}/home/{{username}}'
             tokio::spawn(async move { axum::serve(listener, router).await });
             behind
         });
-        let front =
-            Arc::new(Front { behind, rooms: Mutex::default(), down: AtomicBool::new(false), log: Mutex::default() });
+        let front = Arc::new(Front {
+            behind,
+            down: AtomicBool::new(false),
+            sockets: AtomicUsize::new(0),
+            log: Mutex::default(),
+        });
         let serving = front.clone();
         // The server speaks plain HTTP and expects TLS in front of it, as it has wherever it runs.
         thread::spawn(move || {
@@ -143,7 +142,7 @@ path = '{at}/home/{{username}}'
     fn cut(&self) {
         self.front.down.store(true, Ordering::Relaxed);
         let ended = Instant::now() + Duration::from_secs(10);
-        while self.front.rooms.lock().unwrap().values().any(|hosted| !hosted.to.is_empty()) {
+        while self.front.sockets.load(Ordering::Relaxed) > 0 {
             assert!(Instant::now() < ended, "the sockets end");
             thread::sleep(Duration::from_millis(5));
         }
@@ -205,101 +204,20 @@ path = '{at}/home/{{username}}'
 
 type Tls = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
 
-/// What stands in front of the server: it passes on what the server answers itself, and does what the
-/// server does not do yet for a document's socket and for the pictures that come in beside it.
+/// What stands in front of the server, as TLS does wherever it runs. It passes everything on, and notes
+/// what a test asks the order of.
 struct Front {
     behind: SocketAddr,
-    /// The rooms of the documents that have a socket.
-    rooms: Mutex<HashMap<String, Hosted>>,
-    /// Whether the network to the server is down.
+    /// Whether the network to the server is down, and how many sockets are open through here.
     down: AtomicBool,
-    /// What came in that a test asks the order of: `picture NAME` and `edits`.
+    sockets: AtomicUsize,
+    /// What came in for the server: `picture NAME` and `edits`.
     log: Mutex<Vec<String>>,
 }
 
-/// One document's room, its journal, and the way to each socket in it.
-struct Hosted {
-    room: Room,
-    state: Memory,
-    to: HashMap<SessionId, mpsc::Sender<Outbound>>,
-    /// The pictures the room was handed, by their names without `assets/`.
-    handed: Vec<String>,
-}
-
-impl Hosted {
-    /// Hands what the room wants said to the sockets it is for.
-    fn tell(&mut self) {
-        while let Some(out) = self.room.poll() {
-            let (Outbound::Send(session, _) | Outbound::Close(session)) = &out;
-            if let Some(to) = self.to.get(session) {
-                let _ = to.send(out);
-            }
-        }
-    }
-}
-
-/// A folder in memory, for a room's journal.
-#[derive(Default)]
-struct Memory(HashMap<String, Vec<u8>>);
-
-impl Files for Memory {
-    fn stamp(&mut self, name: &str) -> io::Result<Option<Stamp>> {
-        Ok(self.0.get(name).map(|bytes| Stamp { len: bytes.len() as u64, modified: 0 }))
-    }
-
-    fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
-        Ok(self.0.get(name).cloned())
-    }
-
-    fn write(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
-        self.0.insert(name.into(), bytes.to_vec());
-        Ok(())
-    }
-
-    fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
-        let bytes = self.0.remove(from).ok_or(io::ErrorKind::NotFound)?;
-        self.0.insert(to.into(), bytes);
-        Ok(())
-    }
-
-    fn remove(&mut self, name: &str) -> io::Result<()> {
-        self.0.remove(name).map(drop).ok_or(io::ErrorKind::NotFound.into())
-    }
-}
-
-/// What was read of a request already, and then the rest of its connection.
-struct Replayed<'a> {
-    head: Cursor<&'a [u8]>,
-    stream: &'a mut Tls,
-}
-
-impl Read for Replayed<'_> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        match self.head.read(into)? {
-            0 => self.stream.read(into),
-            read => Ok(read),
-        }
-    }
-}
-
-impl Write for Replayed<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.stream.write(bytes)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
-    }
-}
-
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-}
-
-/// An answer with a body, or with none.
-fn answer(stream: &mut Tls, status: u16, body: &[u8]) -> io::Result<()> {
-    write!(stream, "HTTP/1.1 {status} Said\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len())?;
-    stream.write_all(body)
+/// Whether a read only ran out of time.
+fn waits(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
 }
 
 impl Front {
@@ -313,14 +231,17 @@ impl Front {
         let said = String::from_utf8_lossy(&head).into_owned();
         let mut line = said.split(' ');
         let (verb, path) = (line.next().unwrap_or_default(), line.next().unwrap_or_default());
-        let named = |line: &str| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("authorization").then(|| value.trim().to_owned())
-        };
-        let bearer = said.lines().find_map(named).unwrap_or_default();
         let of_document = path.strip_prefix("/api/v1/documents/").and_then(|rest| rest.split_once('/'));
-        if let Some((id, "sync")) = of_document {
-            return self.sync(stream, &head, id, &bearer);
+        if let Some((_, "sync")) = of_document {
+            self.sockets.fetch_add(1, Ordering::Relaxed);
+            let carried = self.carry(stream, &head);
+            self.sockets.fetch_sub(1, Ordering::Relaxed);
+            return carried;
+        }
+        if let ("PUT", Some((_, rest))) = (verb, of_document)
+            && let Some(name) = rest.strip_prefix("assets/")
+        {
+            self.log.lock().unwrap().push(format!("picture {name}"));
         }
         let length = said
             .to_ascii_lowercase()
@@ -328,158 +249,66 @@ impl Front {
             .find_map(|line| line.strip_prefix("content-length:")?.trim().parse().ok());
         let mut body = vec![0; length.unwrap_or(0)];
         stream.read_exact(&mut body)?;
-        match (verb, of_document.and_then(|(id, rest)| Some((id, rest.strip_prefix("assets")?)))) {
-            // The server lists what the file holds, and the room what it was handed since.
-            ("GET", Some((id, ""))) => {
-                let (status, listed) = self.get(&paths::assets(id), &bearer)?;
-                let mut names: Vec<String> = serde_json::from_slice(&listed).unwrap_or_default();
-                names.extend(self.rooms.lock().unwrap().get(id).into_iter().flat_map(|hosted| hosted.handed.clone()));
-                answer(stream, status, &if status == 200 { serde_json::to_vec(&names).unwrap() } else { listed })
-            }
-            ("GET", Some((id, name))) if self.picture(id, name).is_some() => {
-                answer(stream, 200, &self.picture(id, name).unwrap())
-            }
-            ("PUT", Some((id, name))) => {
-                let status = self.keep(id, name.trim_start_matches('/'), body, &bearer)?;
-                answer(stream, status, &[])
-            }
-            _ => stream.write_all(&self.ask(&head, &body)?),
-        }
-    }
-
-    /// Asks the server behind one thing, and gives its whole answer.
-    fn ask(&self, head: &[u8], body: &[u8]) -> io::Result<Vec<u8>> {
         // One request to a connection, so that the answer ends where the server hangs up.
         let line = head.iter().position(|byte| *byte == b'\n').unwrap_or(0) + 1;
         let mut server = TcpStream::connect(self.behind)?;
-        server.write_all(&[&head[..line], b"connection: close\r\n", &head[line..], body].concat())?;
+        server.write_all(&[&head[..line], b"connection: close\r\n", &head[line..], &body].concat())?;
         let mut answer = Vec::new();
         server.read_to_end(&mut answer)?;
-        Ok(answer)
+        stream.write_all(&answer)
     }
 
-    /// Asks the server for `path` as whoever holds `bearer`: how it answered, and with what.
-    fn get(&self, path: &str, bearer: &str) -> io::Result<(u16, Vec<u8>)> {
-        let head = format!("GET {path} HTTP/1.1\r\nhost: localhost\r\nauthorization: {bearer}\r\n\r\n");
-        let answer = self.ask(head.as_bytes(), &[])?;
-        let body = answer.windows(4).position(|window| window == b"\r\n\r\n").map_or(answer.len(), |at| at + 4);
-        let status = String::from_utf8_lossy(&answer[..body]).split(' ').nth(1).and_then(|status| status.parse().ok());
-        Ok((status.unwrap_or(502), answer[body..].to_vec()))
-    }
-
-    /// What the server says of a document to whoever holds `bearer`, or how it refused.
-    fn opened(&self, id: &str, bearer: &str) -> io::Result<Result<Opened, u16>> {
-        let (status, opened) = self.get(&paths::document(id), bearer)?;
-        Ok(match status {
-            200 => Ok(serde_json::from_slice(&opened).expect("the server says how the document is opened")),
-            status => Err(status),
-        })
-    }
-
-    /// Does `with` to a document's room, which opens over the file as the server holds it.
-    fn room<T>(&self, id: &str, bearer: &str, with: impl FnOnce(&mut Hosted) -> T) -> io::Result<T> {
-        let mut rooms = self.rooms.lock().unwrap();
-        if !rooms.contains_key(id) {
-            let file = self.get(&paths::file(id), bearer)?.1;
-            let mut file = Archive::open(Cursor::new(file)).expect("the server holds a document");
-            let copy = WorkingCopy::open(&mut file, ReplicaId::new(&platform::block_id())).unwrap();
-            let mut state = Memory::default();
-            let room = Room::open(copy, id, &mut state, now()).expect("a room opens over the file");
-            rooms.insert(id.to_owned(), Hosted { room, state, to: HashMap::new(), handed: Vec::new() });
-        }
-        Ok(with(rooms.get_mut(id).unwrap()))
-    }
-
-    /// A picture a document's room was handed, which the server's file does not hold.
-    fn picture(&self, id: &str, name: &str) -> Option<Vec<u8>> {
-        let name = format!("assets{name}");
-        self.rooms.lock().unwrap().get(id)?.room.asset(&name).map(<[u8]>::to_vec)
-    }
-
-    /// Takes a picture for a document from someone who may edit it. How that is answered.
-    fn keep(&self, id: &str, name: &str, bytes: Vec<u8>, bearer: &str) -> io::Result<u16> {
-        match self.opened(id, bearer)? {
-            Ok(opened) if opened.role >= Role::Editor => {}
-            Ok(_) => return Ok(403),
-            Err(status) => return Ok(status),
-        }
-        let kept = self.room(id, bearer, |Hosted { room, state, handed, .. }| {
-            let kept = room.add_asset(&format!("assets/{name}"), bytes, state, now()).is_ok();
-            if kept {
-                handed.push(name.to_owned());
-            }
-            kept
-        })?;
-        if kept {
-            self.log.lock().unwrap().push(format!("picture {name}"));
-        }
-        Ok(if kept { 200 } else { 400 })
-    }
-
-    /// A document's socket: the server says whether this session may have it, and the room does the rest.
-    fn sync(&self, stream: &mut Tls, head: &[u8], id: &str, bearer: &str) -> io::Result<()> {
-        let opened = match self.opened(id, bearer)? {
-            Ok(opened) => opened,
-            Err(status) => return answer(stream, status, &[]),
-        };
-        let role = match opened.role {
-            Role::Reader => letters_sync::Role::Reader,
-            Role::Commenter => letters_sync::Role::Commenter,
-            Role::Editor | Role::Owner => letters_sync::Role::Editor,
-        };
-        let (tell, told) = mpsc::channel();
-        let session = self.room(id, bearer, |hosted| {
-            let session = hosted.room.join(Access { role, name: opened.author }, now());
-            hosted.to.insert(session, tell);
-            session
-        })?;
-        let leave = || {
-            let _ = self.room(id, bearer, |hosted| {
-                hosted.to.remove(&session);
-                hosted.room.leave(session);
-                hosted.tell();
-            });
-        };
-        let Ok(mut socket) = tungstenite::accept(Replayed { head: Cursor::new(head), stream }) else {
-            leave();
-            return Ok(());
-        };
-        // The socket is looked at often, so that what the room has for it is not kept waiting.
-        socket.get_ref().stream.sock.set_read_timeout(Some(Duration::from_millis(5)))?;
-        'open: while !self.down.load(Ordering::Relaxed) {
-            let frame = match socket.read() {
-                Ok(tungstenite::Message::Binary(frame)) => Some(frame),
-                Ok(_) => None,
-                Err(tungstenite::Error::Io(error))
-                    if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
-                {
-                    None
+    /// Carries a document's socket both ways until either side ends it, or the network goes.
+    fn carry(&self, stream: &mut Tls, head: &[u8]) -> io::Result<()> {
+        let mut server = TcpStream::connect(self.behind)?;
+        server.write_all(head)?;
+        // Each side is looked at often, so that neither is kept waiting for the other.
+        stream.sock.set_read_timeout(Some(Duration::from_millis(2)))?;
+        server.set_read_timeout(Some(Duration::from_millis(2)))?;
+        let (mut some, mut sent) = ([0; 64 * 1024], Vec::new());
+        while !self.down.load(Ordering::Relaxed) {
+            match stream.read(&mut some) {
+                Ok(0) => break,
+                Ok(read) => {
+                    server.write_all(&some[..read])?;
+                    sent.extend_from_slice(&some[..read]);
+                    self.note(&mut sent);
                 }
-                Err(_) => break,
+                Err(error) if waits(&error) => {}
+                Err(error) => return Err(error),
+            }
+            match server.read(&mut some) {
+                Ok(0) => break,
+                Ok(read) => stream.write_all(&some[..read])?,
+                Err(error) if waits(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Notes the edits among the whole frames a device has sent so far, and takes those frames off.
+    fn note(&self, sent: &mut Vec<u8>) {
+        loop {
+            let Some(&[_, second]) = sent.get(..2) else { return };
+            // A device masks what it sends, and says how long it is in one of three ways.
+            let (at, length) = match second & 0x7f {
+                126 if sent.len() >= 4 => (4, u16::from_be_bytes([sent[2], sent[3]]) as usize),
+                127 if sent.len() >= 10 => (10, u64::from_be_bytes(sent[2..10].try_into().unwrap()) as usize),
+                126 | 127 => return,
+                short => (2, short as usize),
             };
-            if matches!(frame.as_deref().map(ClientMessage::decode), Some(Ok(Some(ClientMessage::Edits { .. })))) {
+            if sent.len() < at + 4 + length {
+                return;
+            }
+            let frame: Vec<u8> = sent.drain(..at + 4 + length).collect();
+            let mask = &frame[at..at + 4];
+            let said: Vec<u8> =
+                frame[at + 4..].iter().zip(mask.iter().cycle()).map(|(byte, mask)| byte ^ mask).collect();
+            if matches!(ClientMessage::decode(&said), Ok(Some(ClientMessage::Edits { .. }))) {
                 self.log.lock().unwrap().push("edits".to_owned());
             }
-            self.room(id, bearer, |hosted| {
-                if let Some(frame) = frame {
-                    let _ = hosted.room.received(session, &frame, &mut hosted.state, now());
-                }
-                hosted.room.tick(now());
-                hosted.tell();
-            })?;
-            for out in told.try_iter() {
-                let sent = match out {
-                    Outbound::Send(_, frame) => socket.send(tungstenite::Message::Binary(frame.into())),
-                    // Reading on is what ends it, once the other side has said so too.
-                    Outbound::Close(_) => socket.close(None),
-                };
-                if sent.is_err() {
-                    break 'open;
-                }
-            }
         }
-        leave();
-        Ok(())
     }
 }
 
@@ -782,10 +611,8 @@ fn a_line_outlives_its_token_and_ends_with_the_sign_in() {
     assert!(settle(&mut [&mut desk], |desks| live(desks[0])), "{:?}", desk.line.link());
     assert_ne!(session.token().unwrap(), first);
 
-    // Signed out, the line asks no more.
+    // Signed out, the server ends the socket, and the line asks for no other.
     assert_eq!(session.sign_out(), Ok(()));
-    server.cut();
-    server.mend();
     let over = |desks: &[&mut Desk]| desks[0].line.link() == Link::Refused(Refusal::SignedOut);
     assert!(settle(&mut [&mut desk], over), "{:?}", desk.line.link());
     assert_eq!(desk.line.wake_at(), None);
