@@ -4,6 +4,7 @@
 //! A bar can be given narrower forms of its start and middle to fold into before anything is cut short.
 
 use accesskit::Role;
+use letters_render::Point;
 
 use crate::element::{Element, Fitted};
 use crate::style::{Align, Dir, Edges};
@@ -12,11 +13,27 @@ use crate::tokens;
 /// The bar's height: yewi's control height with room to breathe.
 pub const HEIGHT: f32 = 44.0;
 
+/// How much of itself a bar's content keeps while its window is behind another.
+const DIMMED: f32 = 0.5;
+
 pub struct TopBar<M> {
     label: String,
+    height: f32,
+    inset: f32,
+    dim: bool,
+    before: Vec<Element<M>>,
     forms: Vec<Form<M>>,
     shown: Option<Fitted>,
     end: Vec<Element<M>>,
+    title: Option<Title<M>>,
+}
+
+/// What a bar that is its window's title bar sends: for a drag and for a double click on the room between
+/// its controls, and for a secondary press there, with the point of the window it was at.
+pub struct Title<M> {
+    pub drag: M,
+    pub double_click: M,
+    pub menu: Box<dyn Fn(Point) -> M>,
 }
 
 /// The start and the middle of the bar, as they are for one width of window.
@@ -28,7 +45,17 @@ struct Form<M> {
 
 impl<M> Default for TopBar<M> {
     fn default() -> Self {
-        Self { label: "Document".into(), forms: Vec::new(), shown: None, end: Vec::new() }
+        Self {
+            label: "Document".into(),
+            height: HEIGHT,
+            inset: 0.0,
+            dim: false,
+            before: Vec::new(),
+            forms: Vec::new(),
+            shown: None,
+            end: Vec::new(),
+            title: None,
+        }
     }
 }
 
@@ -40,6 +67,37 @@ impl<M> TopBar<M> {
     /// The bar's accessible name.
     pub fn label(mut self, label: impl Into<String>) -> Self {
         self.label = label.into();
+        self
+    }
+
+    /// The bar's height, where the system sets one for a title bar.
+    pub fn height(mut self, height: f32) -> Self {
+        self.height = height;
+        self
+    }
+
+    /// Room kept at the very start of the bar, from the window's edge, for what the system draws there.
+    pub fn inset(mut self, inset: f32) -> Self {
+        self.inset = inset;
+        self
+    }
+
+    /// Dims what the bar holds, as a title bar does while its window is behind another.
+    pub fn dim(mut self, dim: bool) -> Self {
+        self.dim = dim;
+        self
+    }
+
+    /// Makes the bar its window's title bar.
+    pub fn title(mut self, title: Title<M>) -> Self {
+        self.title = Some(title);
+        self
+    }
+
+    /// Something ahead of the document, in every form of the bar: where a desktop that keeps its window
+    /// buttons at the start has them.
+    pub fn before(mut self, child: impl Into<Element<M>>) -> Self {
+        self.before.push(child.into());
         self
     }
 
@@ -90,29 +148,37 @@ impl<M> TopBar<M> {
     }
 }
 
-impl<M> From<TopBar<M>> for Element<M> {
+impl<M: 'static> From<TopBar<M>> for Element<M> {
     fn from(bar: TopBar<M>) -> Self {
+        let opacity = if bar.dim { DIMMED } else { 1.0 };
         let group = || Element::row().align(Align::Center).gap(tokens::SPACE_SM);
         let form = |form: Form<M>| {
             let start = group().shrink().children(form.start);
             group().key(form.key).grow(1.0).shrink().child(start).child(group().children(form.middle))
         };
         let forms = Element::row().grow(1.0).shrink().clip().children(bar.forms.into_iter().map(form));
-        Element::row()
+        let forms = match bar.shown {
+            Some(shown) => forms.fit_into(shown),
+            None => forms.fit(),
+        };
+        let padding = Edges::xy(tokens::SPACE_MD, 0.0);
+        let row = Element::row()
             .align(Align::Center)
             .gap(tokens::SPACE_SM)
-            .height(HEIGHT)
-            .padding(Edges::xy(tokens::SPACE_MD, 0.0))
+            .height(bar.height)
+            .padding(Edges { left: padding.left.max(bar.inset), ..padding })
             .bg(tokens::SURFACE)
             .fg(tokens::FG)
             .border(Edges::bottom(1.0), tokens::LINE)
             .role(Role::Toolbar)
             .label(bar.label)
             .arrows(Dir::Row)
-            .child(match bar.shown {
-                Some(shown) => forms.fit_into(shown),
-                None => forms.fit(),
-            })
-            .child(group().children(bar.end))
+            .children((!bar.before.is_empty()).then(|| group().opacity(opacity).children(bar.before)))
+            .child(forms.opacity(opacity))
+            .child(group().opacity(opacity).children(bar.end));
+        match bar.title {
+            Some(title) => row.on_drag(title.drag).on_double_click(title.double_click).on_menu(title.menu),
+            None => row,
+        }
     }
 }

@@ -14,6 +14,7 @@ use letters_model::{Align as TextAlign, Block, BlockId, BlockKind, Body, Change,
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
 
+use crate::chrome::Chrome;
 use crate::color::{fade, resolve, same};
 use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
@@ -31,7 +32,7 @@ use crate::text::{Family, FontShaper, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::ui::{App, Idle, Keys, Ui};
 use crate::widgets::{
-    Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, TopBar, side_panel, top_bar,
+    Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, Title, TopBar, side_panel, top_bar,
 };
 
 /// Space kept beside the text column.
@@ -149,6 +150,8 @@ pub enum Message {
     Rename(Rename),
     /// What the Styles panel asks for: the person's default, page setup and stylesheets.
     Styles(Styling),
+    /// Asks the shell for something only it can do, such as moving the window.
+    Ask(Request),
 }
 
 impl Ui<EditorApp> {
@@ -239,6 +242,13 @@ impl Ui<EditorApp> {
         let app = self.app_mut();
         app.show(Some(Panel::Styles));
         app.styles.offer(name, json);
+    }
+
+    /// Says what the desktop expects of the window's frame and bar: see [`Chrome`]. Call it at the start
+    /// and whenever the window's state changes. A bar that is the title bar asks for the window to be
+    /// moved, resized, minimised, maximised and closed through [`Request`].
+    pub fn set_chrome(&mut self, chrome: Chrome) {
+        self.app_mut().chrome = chrome;
     }
 
     /// What the window asks of its shell, since this was last called. Call it after every event.
@@ -383,6 +393,9 @@ pub struct EditorApp {
     /// What is typed into one of the style's fields, and the element type it was typed for.
     draft: Option<(Field, &'static str, String)>,
     styles: Styles,
+    chrome: Chrome,
+    /// Whether the window is the one in front. Behind another, a bar that is the title bar dims.
+    active: bool,
     /// The type a row of the Styles panel has the bar show, and where the selection was then: the bar goes
     /// back to the type at the caret once the caret moves.
     picked: Option<(&'static str, Option<Selection>)>,
@@ -422,6 +435,8 @@ impl EditorApp {
             link: None,
             draft: None,
             styles: Styles::default(),
+            chrome: Chrome::default(),
+            active: true,
             picked: None,
             folded: Folded::default(),
             lexed: HashMap::new(),
@@ -502,7 +517,8 @@ impl EditorApp {
         let style = self.element().and_then(|element| Some((element, &types.get(element)?.family)));
         let mut hasher = DefaultHasher::new();
         let differs = self.styles.differs(self.editor.model().style());
-        (width.to_bits(), self.name(), style, differs).hash(&mut hasher);
+        let chrome = (self.chrome.buttons.len(), self.chrome.inset_start.to_bits());
+        (width.to_bits(), self.name(), style, differs, chrome).hash(&mut hasher);
         let key = hasher.finish();
         if key != self.folded.key {
             self.folded = Folded { key, form: None, seen: Fitted::default() };
@@ -982,7 +998,25 @@ impl EditorApp {
             (NAME_WIDTH.1, Fold::Marks),
             (NAME_WIDTH.1, Fold::Style),
         ];
-        let mut bar = TopBar::new().shown(self.folded.seen.clone());
+        let chrome = &self.chrome;
+        let mut bar = TopBar::new().shown(self.folded.seen.clone()).inset(chrome.inset_start);
+        if let Some(height) = chrome.bar_height {
+            bar = bar.height(height);
+        }
+        // A bar that is the title bar moves its window, and dims while the window is behind another.
+        if chrome.titled() {
+            let title = Title {
+                drag: Message::Ask(Request::DragWindow),
+                double_click: Message::Ask(Request::ToggleMaximise),
+                menu: Box::new(|at| Message::Ask(Request::WindowMenu(at))),
+            };
+            bar = bar.title(title).dim(!self.active);
+        }
+        // The window's buttons stand where the desktop keeps them, a rule apart from the bar's own.
+        let buttons = chrome.buttons();
+        if let Some(buttons) = buttons.filter(|_| chrome.buttons_at_start) {
+            bar = bar.before(buttons).before(TopBar::rule());
+        }
         for (n, (name, fold)) in forms.into_iter().enumerate() {
             if self.folded.form.is_none_or(|form| form == n) {
                 let shown = self.folded.form == Some(n);
@@ -997,7 +1031,11 @@ impl EditorApp {
             let button = tool(icon, panel.title()).pressed(self.panel == Some(panel));
             panels = panels.child(button.on_press(Message::Panel(panel)));
         }
-        bar.end(panels.child(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End)))).into()
+        bar = bar.end(panels.child(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End))));
+        if let Some(buttons) = chrome.buttons().filter(|_| !chrome.buttons_at_start) {
+            bar = bar.end(TopBar::rule()).end(buttons);
+        }
+        bar.into()
     }
 
     /// What the bar starts with: the document's name, in no more than `room`, and whether it is saved. A
@@ -1021,6 +1059,8 @@ impl EditorApp {
             .tooltip("Rename or move", Side::Bottom)
             .on_press(Message::Rename(Rename::Open))
             .cursor(Cursor::Text);
+        // On a title bar a drag that starts on the name moves the window, and only a click renames.
+        let name = if self.chrome.titled() { name.on_drag(Message::Ask(Request::DragWindow)) } else { name };
         let name = if own { name } else { name.fg(tokens::FG_MUTED) };
         let mut lead = vec![page, name];
 
@@ -1350,13 +1390,18 @@ impl App for EditorApp {
     }
 
     fn view(&mut self, window: Size) -> Element<Message> {
+        // A floating window that Letters frames has a border, which everything else stands inside.
+        let border = self.chrome.border();
+        let window = Size { width: window.width - 2.0 * border, height: window.height - 2.0 * border };
         self.refold(window.width);
         let panel = self.panel.map(|panel| self.side(panel));
         let room = window.width - if panel.is_some() { side_panel::WIDTH } else { 0.0 };
-        let page = self.page(Size { width: room.max(0.0), height: (window.height - top_bar::HEIGHT).max(0.0) });
+        let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT);
+        let page = self.page(Size { width: room.max(0.0), height: (window.height - bar).max(0.0) });
         let page = Element::row().grow(1.0).child(page).children(self.chapters());
         let body = Element::row().grow(1.0).child(page).children(panel);
-        Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).child(body)
+        let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).child(body);
+        if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
     }
 
     fn update(&mut self, message: Message, platform: &mut dyn Platform) {
@@ -1392,6 +1437,7 @@ impl App for EditorApp {
             Message::Start => self.start(),
             Message::Rename(message) => self.rename(message),
             Message::Styles(message) => self.styling(message, platform),
+            Message::Ask(request) => self.requests.push(request),
             Message::Jump(block) => {
                 let start = Pos { block, offset: 0 };
                 self.editor.select(Selection::caret(start.clone()));
@@ -1488,6 +1534,15 @@ impl App for EditorApp {
 
     fn reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
+    }
+
+    fn active(&mut self, active: bool) {
+        self.active = active;
+    }
+
+    fn edge(&self, at: Point, window: Size) -> Option<(Cursor, Message)> {
+        let edge = self.chrome.edge(at, window)?;
+        Some((Cursor::Resize(edge), Message::Ask(Request::ResizeWindow(edge))))
     }
 
     fn animate(&mut self, now_ms: u64) -> Option<u64> {

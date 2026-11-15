@@ -13,4 +13,4 @@ pub use menu::{Menu, MenuItem, Tone};
 pub use popover::{Placement, Popover, Side};
 pub use side_panel::SidePanel;
 pub use text_field::TextField;
-pub use top_bar::TopBar;
+pub use top_bar::{Title, TopBar};

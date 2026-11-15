@@ -28,6 +28,8 @@ const BLINK_MS: u64 = 500;
 const DOUBLE_CLICK_MS: u64 = 400;
 /// How far the pointer may wander between them.
 const DOUBLE_CLICK_SLOP: f32 = 4.0;
+/// How far a press moves before it is a drag.
+const DRAG_SLOP: f32 = 4.0;
 /// Room kept between a canvas's caret and the edge of what scrolls it.
 const CARET_MARGIN: f32 = 24.0;
 /// Which system's key conventions a window follows.
@@ -92,6 +94,15 @@ pub trait App {
     /// Moves on what the app animates by itself. Returns when to call again, or `None` once nothing moves.
     /// A frame is painted after every call that returns a time, and after the one that ends the motion.
     fn animate(&mut self, _now_ms: u64) -> Option<u64> {
+        None
+    }
+
+    /// Told whether the window is the one in front, which has the keyboard.
+    fn active(&mut self, _active: bool) {}
+
+    /// What the window's own frame does at a point: the pointer's shape there, and what a press sends. For
+    /// a window that draws its frame, whose edge comes before whatever lies under it.
+    fn edge(&self, _at: Point, _window: Size) -> Option<(Cursor, Self::Msg)> {
         None
     }
 
@@ -261,6 +272,8 @@ impl<A: App> Ui<A> {
     pub fn focus(&mut self, focused: bool) {
         self.active = focused;
         self.pressed = None;
+        self.app.active(focused);
+        self.stale.view = true;
         self.restart_blink();
     }
 
@@ -356,6 +369,10 @@ impl<A: App> Ui<A> {
 
     /// The pointer shape for what is under the pointer.
     pub fn cursor(&self) -> Cursor {
+        let edge = self.pointer.filter(|_| self.pressed.is_none()).and_then(|at| self.app.edge(at, self.size));
+        if let Some((cursor, _)) = edge {
+            return cursor;
+        }
         // A drag keeps the shape of what it started on.
         let held = self.pressed.iter().chain(&self.hover);
         let nodes = held.filter_map(|&id| self.tree.find(id)).filter(|&i| !self.tree.disabled(i));
@@ -441,7 +458,16 @@ impl<A: App> Ui<A> {
                     let event = Pointer::Drag { at: self.within(i, at) };
                     self.queue.extend(canvas.on_pointer.as_ref().and_then(|handler| handler(event)));
                 }
-                _ => {}
+                // A press that moves is a drag for what can be dragged, and a click no more.
+                _ => {
+                    let from = self.last_press.map_or(at, |press| press.at);
+                    let moved = (at.x - from.x).abs() > DRAG_SLOP || (at.y - from.y).abs() > DRAG_SLOP;
+                    if let Some(message) = node.el.on_drag.clone().filter(|_| moved) {
+                        self.queue.push(message);
+                        self.pressed = None;
+                        self.stale.paint = true;
+                    }
+                }
             }
         }
         self.update_hover();
@@ -451,6 +477,10 @@ impl<A: App> Ui<A> {
     pub fn pointer_down(&mut self, at: Point, mods: Modifiers, platform: &mut dyn Platform) {
         self.refresh();
         self.pointer = Some(at);
+        if let Some((_, message)) = self.app.edge(at, self.size) {
+            self.queue.push(message);
+            return self.flush(platform);
+        }
         let blocked = self.dismiss(self.hit(at));
         self.flush(platform);
         self.refresh();
@@ -480,6 +510,9 @@ impl<A: App> Ui<A> {
         }
 
         let node = &self.tree.nodes[i];
+        if clicks == 2 {
+            self.queue.extend(node.el.on_double.clone());
+        }
         match &node.el.content {
             Content::Input(input) => {
                 let offset = self.offset_at(i, at);
@@ -513,6 +546,10 @@ impl<A: App> Ui<A> {
         let Some(i) = self.hit(at).and_then(|hit| self.target(hit)).filter(|&i| !self.tree.disabled(i)) else { return };
         if self.tree.nodes[i].el.focus == Focus::Click {
             self.set_focus(Some(self.tree.nodes[i].id), false);
+        }
+        if let Some(handler) = &self.tree.nodes[i].el.on_menu {
+            self.queue.push(handler(at));
+            return self.flush(platform);
         }
         self.ask_menu(i, self.within(i, at), platform);
     }
@@ -925,7 +962,9 @@ impl<A: App> Ui<A> {
         self.tree.ancestors(hit).find(|&i| {
             let node = &self.tree.nodes[i];
             let takes_input = matches!(node.el.content, Content::Input(_) | Content::Canvas(_));
-            takes_input || node.el.on_press.is_some() || node.trigger.is_some() || node.el.focus != Focus::No
+            let el = &node.el;
+            let pointed = el.on_drag.is_some() || el.on_double.is_some() || el.on_menu.is_some();
+            takes_input || pointed || el.on_press.is_some() || node.trigger.is_some() || el.focus != Focus::No
         })
     }
 

@@ -2,10 +2,14 @@
 //!
 //! The window knows no file system. A path is a string the shell made, which it gets back unchanged.
 
+use letters_render::Point;
+
+use crate::chrome::Edge;
+
 /// What the window asks its shell to do. Collect them with `Window::take_requests` after each event.
 ///
 /// More will come, so a shell matches the ones it can do and lets the rest go.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Request {
     /// Open the recent document with this path.
@@ -25,7 +29,10 @@ pub enum Request {
     MoveElsewhere,
     /// Make a folder called `name` in the folder with the path `parent`, and list it with
     /// `Window::set_location`.
-    NewFolder { parent: String, name: String },
+    NewFolder {
+        parent: String,
+        name: String,
+    },
     /// Keep this as the person's default style, which their new documents start with: the text of a
     /// `style.json`. Answer with `Window::set_default_style` if it could not be kept.
     SaveDefaultStyle(String),
@@ -34,6 +41,20 @@ pub enum Request {
     ImportStyle,
     /// Let the person choose where to write this stylesheet: the text of a `.letstyle` file.
     ExportStyle(String),
+    /// Move the window with the pointer, which is held down on the bar: a bar that is the title bar asks
+    /// (see `Window::set_chrome`).
+    DragWindow,
+    /// Resize the window from this edge with the pointer, which is held down on the grip of a floating
+    /// window.
+    ResizeWindow(Edge),
+    /// Open the desktop's menu for the window at this point of it.
+    WindowMenu(Point),
+    Minimise,
+    /// Maximise the window, or restore it. Also asked by a double click on the bar, which on macOS does
+    /// what the person set their system to do.
+    ToggleMaximise,
+    /// Close the window.
+    Close,
 }
 
 /// A document opened lately, as the landing card lists it.

@@ -69,6 +69,8 @@ pub const LIST_TREE: Icon = Icon::new("M8 5h13M13 12h8M13 19h8M3 10a2 2 0 0 0 2 
 pub const MESSAGE_SQUARE: Icon = Icon::new("M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z");
 /// `message-square-plus`
 pub const MESSAGE_SQUARE_PLUS: Icon = Icon::new("M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2zM12 8v6M9 11h6");
+/// `minus`
+pub const MINUS: Icon = Icon::new("M5 12h14");
 /// `mouse-pointer-click`
 pub const MOUSE_POINTER_CLICK: Icon = Icon::new("M14 4.1 12 6M5.1 8l-2.9-.8M6 12l-1.9 2M7.2 2.2 8 5.1M9.037 9.69a.498.498 0 0 1 .653-.653l11 4.5a.5.5 0 0 1-.074.949l-4.349 1.041a1 1 0 0 0-.74.739l-1.04 4.35a.5.5 0 0 1-.95.074z");
 /// `palette`
@@ -87,6 +89,8 @@ pub const REFRESH_CW: Icon = Icon::new("M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74
 pub const SEARCH: Icon = Icon::new("M21 21l-4.34-4.34M3 11a8 8 0 1 0 16 0a8 8 0 1 0 -16 0");
 /// `settings`
 pub const SETTINGS: Icon = Icon::new("M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915M9 12a3 3 0 1 0 6 0a3 3 0 1 0 -6 0");
+/// `square`
+pub const SQUARE: Icon = Icon::new("M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z");
 /// `strikethrough`
 pub const STRIKETHROUGH: Icon = Icon::new("M16 4H9a3 3 0 0 0-2.83 4M14 12a4 4 0 0 1 0 8H6M4 12L20 12");
 /// `text-align-center`

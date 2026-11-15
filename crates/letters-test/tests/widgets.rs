@@ -461,5 +461,6 @@ fn the_caret_blinks_while_a_field_has_focus() {
     desk.ui().animate(next);
     assert!(desk.ui().needs_paint(), "the caret went out");
     desk.ui().focus(false);
+    desk.paint();
     assert_eq!(desk.ui().animate(next + 1), None, "a window without the keyboard shows no caret");
 }

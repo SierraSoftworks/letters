@@ -5,7 +5,7 @@ use letters_editor::InputEvent;
 use letters_model::{Align, Block, BlockKind, Document, Pos, Selection, Style, TextStyle};
 use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
-use letters_ui::{Folder, Landing, Location, Recent, Request, SaveState};
+use letters_ui::{Chrome, Cursor, Edge, Folder, Frame, Landing, Location, Recent, Request, SaveState, WindowButton};
 
 fn text(id: &str, kind: BlockKind, text: &str) -> Block {
     Block::text(id, kind, text)
@@ -1548,4 +1548,179 @@ fn the_paper_and_its_margins_are_set_in_the_panel() {
 
     window.click(Role::Button, "Undo");
     assert_eq!(window.ui().style().page.margin_top, turned.margin_top, "page setup is undone like any edit");
+}
+
+/// The letter in a window that Letters frames itself, as on Linux: it floats, with all three buttons at the
+/// end of the bar.
+fn framed() -> Harness {
+    let mut window = letter();
+    let buttons = vec![WindowButton::Minimise, WindowButton::Maximise, WindowButton::Close];
+    window.ui().set_chrome(Chrome { buttons, frame: Frame::Floating, ..Chrome::default() });
+    window
+}
+
+/// A point of the bar with no control under it.
+fn free_part_of_the_bar(window: &mut Harness) -> Point {
+    let bar = window.find(Role::Toolbar, "Document").expect("the bar").bounds;
+    let share = window.find(Role::Button, "Share").expect("the Share button").bounds;
+    let at = Point { x: share.x - 24.0, y: bar.y + bar.height / 2.0 };
+    let controls = bar_controls(window);
+    assert!(controls.iter().all(|control| !control.1.contains(at)), "{at:?} is on a control: {controls:?}");
+    at
+}
+
+/// A point a little way from another, further than a click may wander.
+fn dragged(from: Point) -> Point {
+    Point { x: from.x + 12.0, y: from.y + 3.0 }
+}
+
+#[test]
+fn the_bar_shows_the_windows_buttons_where_the_desktop_keeps_them() {
+    use WindowButton::{Close, Maximise, Minimise};
+    // The desktop's buttons, whether it keeps them at the start, whether the window is maximised, and the
+    // names the bar then shows in order.
+    let cases: [(&[WindowButton], bool, bool, &[&str]); 5] = [
+        (&[Minimise, Maximise, Close], false, false, &["Minimise", "Maximise", "Close window"]),
+        (&[Close], false, false, &["Close window"]),
+        (&[Close, Minimise, Maximise], true, false, &["Close window", "Minimise", "Maximise"]),
+        (&[Minimise, Maximise, Close], false, true, &["Minimise", "Restore", "Close window"]),
+        (&[], false, false, &[]),
+    ];
+    for (buttons, at_start, maximized, expected) in cases {
+        let mut window = letter();
+        let frame = if maximized { Frame::Filled } else { Frame::Floating };
+        let chrome =
+            Chrome { buttons: buttons.to_vec(), buttons_at_start: at_start, maximized, frame, ..Chrome::default() };
+        window.ui().set_chrome(chrome);
+        let names: Vec<String> = bar_controls(&mut window).into_iter().map(|control| control.0).collect();
+        let shown = if at_start { &names[..expected.len()] } else { &names[names.len() - expected.len()..] };
+        assert_eq!(shown, expected, "at the start: {at_start}, of {names:?}");
+        let window_buttons = ["Minimise", "Maximise", "Restore", "Close window"];
+        let count = names.iter().filter(|name| window_buttons.contains(&name.as_str())).count();
+        assert_eq!(count, expected.len(), "{names:?}");
+    }
+}
+
+#[test]
+fn the_windows_buttons_ask_the_shell() {
+    let cases =
+        [("Minimise", Request::Minimise), ("Maximise", Request::ToggleMaximise), ("Close window", Request::Close)];
+    for (button, expected) in cases {
+        let mut window = framed();
+        window.click(Role::Button, button);
+        assert_eq!(window.ui().take_requests(), [expected], "{button}");
+    }
+}
+
+#[test]
+fn a_drag_on_a_title_bar_moves_the_window_from_its_free_parts_and_its_name_alone() {
+    let mut window = framed();
+    window.ui().set_document_name("Quote");
+    let free = free_part_of_the_bar(&mut window);
+    let name = window.find(Role::Button, "Quote").expect("the name").center();
+    let bold = window.find(Role::Button, "Bold").expect("the Bold button").center();
+    // Where the press starts, whether it moves before it is let go, and what the shell is asked.
+    let cases = [
+        (free, true, vec![Request::DragWindow]),
+        (free, false, vec![]),
+        (name, true, vec![Request::DragWindow]),
+        (name, false, vec![]),
+        (bold, true, vec![]),
+    ];
+    for (from, moves, expected) in cases {
+        window.advance(1000).press_at(from).release_at(if moves { dragged(from) } else { from });
+        assert_eq!(window.ui().take_requests(), expected, "from {from:?}, moving: {moves}");
+        // Only a click on the name opens it to be typed over.
+        let renaming = window.find(Role::TextInput, "Document name").is_some();
+        assert_eq!(renaming, from == name && !moves, "from {from:?}, moving: {moves}");
+        window.key("Escape");
+    }
+}
+
+#[test]
+fn a_bar_under_the_systems_title_bar_moves_nothing() {
+    let mut window = letter();
+    let free = free_part_of_the_bar(&mut window);
+    window.press_at(free).release_at(dragged(free)).click_at(free).click_at(free).secondary_click_at(free);
+    assert_eq!(window.ui().take_requests(), []);
+}
+
+#[test]
+fn a_double_click_on_a_title_bar_maximises_and_a_secondary_press_asks_for_the_window_menu() {
+    let mut window = framed();
+    let free = free_part_of_the_bar(&mut window);
+    window.click_at(free).click_at(free);
+    assert_eq!(window.ui().take_requests(), [Request::ToggleMaximise]);
+    window.advance(1000).secondary_click_at(free);
+    assert_eq!(window.ui().take_requests(), [Request::WindowMenu(free)]);
+
+    // A control keeps its presses to itself.
+    window.advance(1000).double_click(Role::Button, "Bold");
+    let bold = window.find(Role::Button, "Bold").unwrap().center();
+    window.secondary_click_at(bold);
+    assert_eq!(window.ui().take_requests(), []);
+}
+
+#[test]
+fn a_floating_window_is_resized_from_the_grip_inside_its_edge() {
+    let mut window = framed();
+    let before = head(&window);
+    let cases = [
+        (Point { x: 2.0, y: 300.0 }, Edge::West),
+        (Point { x: WINDOW.width - 2.0, y: 300.0 }, Edge::East),
+        (Point { x: 400.0, y: WINDOW.height - 2.0 }, Edge::South),
+        (Point { x: WINDOW.width - 3.0, y: WINDOW.height - 3.0 }, Edge::SouthEast),
+        (Point { x: 3.0, y: 3.0 }, Edge::NorthWest),
+    ];
+    for (at, edge) in cases {
+        window.press_at(at);
+        assert_eq!(window.ui().take_requests(), [Request::ResizeWindow(edge)], "{at:?}");
+        window.release_at(at);
+        assert_eq!(window.ui().cursor(), Cursor::Resize(edge), "the pointer shows it at {at:?}");
+    }
+    assert_eq!(head(&window), before, "a press on the grip is not a press on the page under it");
+
+    // A window that fills its place has no edge to take hold of.
+    let buttons = vec![WindowButton::Close];
+    window.ui().set_chrome(Chrome { buttons, frame: Frame::Filled, maximized: true, ..Chrome::default() });
+    window.click_at(Point { x: 2.0, y: 300.0 });
+    assert_eq!(window.ui().take_requests(), []);
+    assert_ne!(window.ui().cursor(), Cursor::Resize(Edge::West));
+}
+
+/// The faintest ink of the text and icons drawn in the bar.
+fn faintest_in_the_bar(window: &mut Harness) -> u8 {
+    let bar = window.find(Role::Toolbar, "Document").expect("the bar").bounds;
+    let ink = |item: &Item| match item {
+        Item::Glyphs { origin, color, .. } if bar.contains(*origin) => Some(color.a),
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(ink).min().expect("the bar holds text")
+}
+
+#[test]
+fn a_title_bar_dims_while_its_window_is_behind_another() {
+    // A bar under the system's own title bar is no title bar, and stays as it is.
+    for (frame, dims) in [(Frame::Floating, true), (Frame::Unified, true), (Frame::System, false)] {
+        let mut window = letter();
+        window.ui().set_chrome(Chrome { frame, ..Chrome::default() });
+        let front = faintest_in_the_bar(&mut window);
+        window.ui().focus(false);
+        let behind = faintest_in_the_bar(&mut window);
+        assert_eq!(behind < front, dims, "{frame:?}: {front} in front, {behind} behind");
+        window.ui().focus(true);
+        assert_eq!(faintest_in_the_bar(&mut window), front, "{frame:?}: in front again");
+    }
+}
+
+#[test]
+fn a_bar_under_the_systems_buttons_takes_their_height_and_leaves_them_room() {
+    let mut window = letter();
+    let chrome = Chrome { frame: Frame::Unified, bar_height: Some(52.0), inset_start: 78.0, ..Chrome::default() };
+    window.ui().set_chrome(chrome);
+    let bar = window.find(Role::Toolbar, "Document").expect("the bar").bounds;
+    assert_eq!(bar.height, 52.0);
+    assert_eq!(page(&mut window).y, 52.0, "the page starts under it");
+    let first = bar_controls(&mut window).into_iter().next().expect("the bar holds controls");
+    assert!(first.1.x >= 78.0, "{} starts at {}", first.0, first.1.x);
 }

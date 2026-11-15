@@ -7,6 +7,7 @@
 //! - [`Window`] is the editor's window, which the shells and the test harness drive through the same calls.
 
 mod access;
+mod chrome;
 pub mod color;
 mod describe;
 mod element;
@@ -30,6 +31,7 @@ pub mod widgets;
 mod window;
 
 pub use accesskit::Role;
+pub use chrome::{Chrome, Edge, Frame, WindowButton};
 pub use element::{Cursor, Element, Fitted, Paint, Pointer};
 pub use icon::Icon;
 pub use opening::{Folder, Landing, Location, Recent, Request};

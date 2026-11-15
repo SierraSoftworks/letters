@@ -14,7 +14,7 @@ use letters_model::{Document, HistoryError, Pos, ReplicaId, Selection};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Rect, Size};
-use letters_ui::{Cursor, Keys, Request, Scheme, Window as View, tokens};
+use letters_ui::{Cursor, Edge, Keys, Request, Scheme, Window as View, tokens};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use web_sys::{
@@ -345,6 +345,16 @@ impl Shell {
                 Cursor::Default => "default",
                 Cursor::Pointer => "pointer",
                 Cursor::Text => "text",
+                Cursor::Resize(edge) => match edge {
+                    Edge::North => "n-resize",
+                    Edge::NorthEast => "ne-resize",
+                    Edge::East => "e-resize",
+                    Edge::SouthEast => "se-resize",
+                    Edge::South => "s-resize",
+                    Edge::SouthWest => "sw-resize",
+                    Edge::West => "w-resize",
+                    Edge::NorthWest => "nw-resize",
+                },
             };
             report(self.canvas.style().set_property("cursor", name));
         }

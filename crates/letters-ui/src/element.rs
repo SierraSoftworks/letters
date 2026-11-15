@@ -12,6 +12,7 @@ use accesskit::Role;
 use letters_editor::{InputEvent, KeyEvent, Modifiers};
 use letters_render::{DisplayList, Point, Rect};
 
+use crate::chrome::Edge;
 use crate::icon::Icon;
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring, Style};
 use crate::text::TextStyle;
@@ -25,6 +26,8 @@ pub enum Cursor {
     Default,
     Pointer,
     Text,
+    /// Over the grip at an edge of a window that draws its own frame.
+    Resize(Edge),
 }
 
 /// Draws an element's own content, such as the page.
@@ -63,6 +66,7 @@ pub enum Pointer {
 }
 
 pub(crate) type KeyHandler<M> = Rc<dyn Fn(&KeyEvent) -> Option<M>>;
+pub(crate) type MenuHandler<M> = Rc<dyn Fn(Point) -> M>;
 
 pub(crate) enum Content<M> {
     None,
@@ -127,6 +131,9 @@ pub struct Element<M> {
     pub(crate) children: Vec<Element<M>>,
     pub(crate) access: Access,
     pub(crate) on_press: Option<M>,
+    pub(crate) on_drag: Option<M>,
+    pub(crate) on_double: Option<M>,
+    pub(crate) on_menu: Option<MenuHandler<M>>,
     pub(crate) on_key: Option<KeyHandler<M>>,
     pub(crate) focus: Focus,
     pub(crate) disabled: bool,
@@ -158,6 +165,9 @@ impl<M> Element<M> {
             children: Vec::new(),
             access: Access::default(),
             on_press: None,
+            on_drag: None,
+            on_double: None,
+            on_menu: None,
             on_key: None,
             focus: Focus::No,
             disabled: false,
@@ -432,6 +442,27 @@ impl<M> Element<M> {
     pub fn on_click(mut self, message: M) -> Self {
         self.on_press = Some(message);
         self.cursor = Cursor::Pointer;
+        self
+    }
+
+    /// Sends `message` when a press on the element moves a little before it is let go, which is then no
+    /// click: for what is dragged as a whole, as a window is by its title bar. It answers for the room
+    /// between the controls inside it, and never for a control.
+    pub fn on_drag(mut self, message: M) -> Self {
+        self.on_drag = Some(message);
+        self
+    }
+
+    /// Sends `message` at the second of two quick presses on the element, outside the controls inside it.
+    pub fn on_double_click(mut self, message: M) -> Self {
+        self.on_double = Some(message);
+        self
+    }
+
+    /// Sends what `handler` makes of a point of the window when the secondary button goes down there on the
+    /// element, outside the controls inside it.
+    pub fn on_menu(mut self, handler: impl Fn(Point) -> M + 'static) -> Self {
+        self.on_menu = Some(Rc::new(handler));
         self
     }
 

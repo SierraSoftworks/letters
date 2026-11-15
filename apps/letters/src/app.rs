@@ -22,7 +22,7 @@ use letters_render::{Color, DisplayList, Point, Size};
 use letters_spell::Dictionary;
 use letters_trust::Trust;
 // The editor's window is the view here, where `Window` is the system's.
-use letters_ui::{Cursor, Landing, Location, Request, SaveState, Scheme, Window as View, tokens};
+use letters_ui::{Cursor, Edge, Landing, Location, Request, SaveState, Scheme, Window as View, tokens};
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -573,6 +573,16 @@ impl DocWindow {
                 Cursor::Default => CursorIcon::Default,
                 Cursor::Pointer => CursorIcon::Pointer,
                 Cursor::Text => CursorIcon::Text,
+                Cursor::Resize(edge) => match edge {
+                    Edge::North => CursorIcon::NResize,
+                    Edge::NorthEast => CursorIcon::NeResize,
+                    Edge::East => CursorIcon::EResize,
+                    Edge::SouthEast => CursorIcon::SeResize,
+                    Edge::South => CursorIcon::SResize,
+                    Edge::SouthWest => CursorIcon::SwResize,
+                    Edge::West => CursorIcon::WResize,
+                    Edge::NorthWest => CursorIcon::NwResize,
+                },
             });
         }
         if std::mem::take(&mut self.access_stale) {
