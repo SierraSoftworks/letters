@@ -145,6 +145,72 @@ async fn a_linked_picture_is_fetched_only_as_the_owners_rules_allow() {
     }
 }
 
+/// A change to someone's own sources, and the sources as they are then or why it was refused.
+type Step<'a> = (Method, &'a str, Result<&'a [&'a str], Code>);
+
+/// Changes the sources of `who`'s own, and answers them as they are then.
+async fn sources(who: &Client, method: Method, source: &str) -> Result<Vec<String>, Code> {
+    let raw = who.send(method, &paths::own_source(source), "", Vec::new()).await;
+    match raw.status {
+        StatusCode::OK => Ok(raw.json()),
+        _ => Err(raw.json::<Error>().code),
+    }
+}
+
+#[tokio::test]
+async fn a_persons_own_sources_change_one_at_a_time() {
+    let server = Server::new("own-sources");
+    let ada = server.person("ada", &["family"]);
+    assert!(ada.get::<Vec<String>>(paths::OWN_SOURCES).await.unwrap().is_empty());
+
+    // A host and its whole address are one source, and one already there or already gone is no trouble.
+    let (host, charts) = ("https://img.example.org/", "https://img.example.org/charts/");
+    let steps: [Step; 7] = [
+        (Method::PUT, "img.example.org", Ok(&[host])),
+        (Method::PUT, host, Ok(&[host])),
+        (Method::PUT, charts, Ok(&[host, charts])),
+        (Method::PUT, "http://img.example.org/", Err(Code::Invalid)),
+        (Method::PUT, "not a source", Err(Code::Invalid)),
+        (Method::DELETE, "img.example.org", Ok(&[charts])),
+        (Method::DELETE, host, Ok(&[charts])),
+    ];
+    for (method, source, then) in steps {
+        let told = sources(&ada, method.clone(), source).await;
+        let then = then.map(|sources| sources.iter().map(|source| (*source).to_owned()).collect::<Vec<_>>());
+        assert_eq!(told, then, "{method} {source}");
+    }
+    assert_eq!(ada.get::<Vec<String>>(paths::OWN_SOURCES).await.unwrap(), [charts]);
+    assert!(server.person("guest", &["friends"]).get::<Vec<String>>(paths::OWN_SOURCES).await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_picture_under_a_persons_own_source_is_fetched_unasked_but_never_from_inside() {
+    let site = Site::start();
+    let (server, ada, id) = trusting("fetch-own", &site).await;
+    let reader = server.browser("guest", &["friends"]);
+    let path = paths::fetch_picture(&id);
+    // No such site exists, so a fetch that is let through comes back with nothing, and one that is not
+    // let through never leaves.
+    let elsewhere = "https://pictures.invalid/sky.png";
+    let inside = format!("https://127.0.0.1:{}/sky.png", site.port);
+    assert_eq!(fetched(&ada, &path, elsewhere, false).await, Err(Code::Untrusted), "nobody trusts it yet");
+
+    sources(&ada, Method::PUT, "pictures.invalid").await.expect("a source of her own");
+    sources(&ada, Method::PUT, &format!("127.0.0.1:{}", site.port)).await.expect("kept, though never reached");
+    let cases = [
+        (&ada, elsewhere, Code::Upstream, "her own source is tried without her asking"),
+        (&reader, elsewhere, Code::Untrusted, "her sources are hers alone"),
+        (&ada, inside.as_str(), Code::Untrusted, "a source of her own reaches nothing inside the network"),
+    ];
+    for (who, url, code, why) in cases {
+        assert_eq!(fetched(who, &path, url, false).await, Err(code), "{why}");
+    }
+    assert!(site.asked.lock().unwrap().is_empty(), "the site inside the network was never asked");
+
+    sources(&ada, Method::DELETE, "pictures.invalid").await.expect("taken out");
+    assert_eq!(fetched(&ada, &path, elsewhere, false).await, Err(Code::Untrusted), "no longer hers");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_preview_is_what_the_page_behind_a_link_says_of_itself() {
     let site = Site::start();

@@ -142,6 +142,7 @@ async fn a_link_lets_whoever_follows_it_in_to_its_document_and_to_nothing_else()
         paths::SESSION.to_owned(),
         paths::SETTINGS.to_owned(),
         paths::DICTIONARY.to_owned(),
+        paths::OWN_SOURCES.to_owned(),
         paths::SPACES.to_owned(),
         paths::RECENT.to_owned(),
         paths::SHARED.to_owned(),

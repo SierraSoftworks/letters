@@ -56,6 +56,8 @@ pub fn routes() -> Router<Shared> {
         .route(paths::SETTINGS, get(settings).put(set_settings))
         .route(paths::DICTIONARY, get(words))
         .route("/api/v1/settings/dictionary/{word}", put(add_word).delete(forget_word))
+        .route(paths::OWN_SOURCES, get(own_sources))
+        .route("/api/v1/settings/sources/{source}", put(add_source).delete(forget_source))
         .route(paths::SPACES, get(spaces))
         .route(paths::RECENT, get(recent))
         .route(paths::SOURCES, get(sources))
@@ -156,6 +158,22 @@ async fn add_word(State(app): State<Shared>, who: Signed, Path(word): Path<Strin
 
 async fn forget_word(State(app): State<Shared>, who: Signed, Path(word): Path<String>) -> Answer<Json<Vec<String>>> {
     blocking(move || app.word(&who, &word, false).map(Json)).await
+}
+
+async fn own_sources(State(app): State<Shared>, who: Signed) -> Answer<Json<Vec<String>>> {
+    blocking(move || app.own_sources(&who).map(Json)).await
+}
+
+async fn add_source(State(app): State<Shared>, who: Signed, Path(source): Path<String>) -> Answer<Json<Vec<String>>> {
+    blocking(move || app.own_source(&who, &source, true).map(Json)).await
+}
+
+async fn forget_source(
+    State(app): State<Shared>,
+    who: Signed,
+    Path(source): Path<String>,
+) -> Answer<Json<Vec<String>>> {
+    blocking(move || app.own_source(&who, &source, false).map(Json)).await
 }
 
 async fn spaces(State(app): State<Shared>, who: Signed) -> Json<Vec<Space>> {

@@ -190,7 +190,8 @@ fn yes() -> bool {
 pub struct Fetch {
     pub url: String,
     /// The person asked for this one themselves. Otherwise only a trusted source is fetched, as when a
-    /// document opens.
+    /// document opens: one of the server's, or one of the person's own
+    /// ([`paths::OWN_SOURCES`](crate::paths::OWN_SOURCES)).
     #[serde(default)]
     pub asked: bool,
 }

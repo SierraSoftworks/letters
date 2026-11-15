@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use letters_api::{Code, Preview};
 use letters_convert::{PageSummary, page_summary};
-use letters_trust::{Fetch, FetchError, Gate, HttpsUrl, ImageType, Kind, Limits, Origin, Trust};
+use letters_trust::{Fetch, FetchError, Gate, HttpsUrl, ImageType, Kind, Limits, Origin, Source, Trust};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ureq::config::{AutoHeaderValue, Config};
@@ -130,9 +130,14 @@ struct Trusted {
     /// The documents they took out of safe mode, by id.
     #[serde(default)]
     documents: Vec<String>,
+    /// The sources they always load pictures from, each as a [`Source`] writes itself.
+    #[serde(default)]
+    sources: Vec<String>,
 }
 
 const TRUSTED: Table<Trusted> = Table::new("trusted");
+/// How many sources of their own a person keeps.
+const SOURCES: usize = 200;
 
 impl App {
     /// The person trusts the document `id` from now on. Whoever only a link let in trusts it for their
@@ -165,20 +170,48 @@ impl App {
         Ok(trusted.documents.iter().any(|document| document == id))
     }
 
+    /// The sources the person always loads pictures from, on whatever device.
+    pub fn own_sources(&self, who: &Signed) -> Answer<Vec<String>> {
+        Ok(self.store.get(&TRUSTED, &who.person.id)?.unwrap_or_default().sources)
+    }
+
+    /// Adds a source to the person's own, or takes it out, and answers them as they are then. One read
+    /// and write of the store, so two devices that change them at once both have their way.
+    pub fn own_source(&self, who: &Signed, source: &str, add: bool) -> Answer<Vec<String>> {
+        let unread = "A source is a host such as img.example.org, or an https address that the pictures are under.";
+        // Kept as the source writes itself, so that a host and its whole address are one source.
+        let source = Source::parse(source).map_err(|_| Refusal::invalid(unread))?.to_string();
+        let sources = self.store.write(|batch| {
+            let mut trusted = batch.get(&TRUSTED, &who.person.id)?.unwrap_or_default();
+            let at = trusted.sources.iter().position(|known| *known == source);
+            match (add, at) {
+                (true, None) if trusted.sources.len() >= SOURCES => return Ok(None),
+                (true, None) => trusted.sources.push(source),
+                (false, Some(at)) => drop(trusted.sources.remove(at)),
+                _ => return Ok(Some(trusted.sources)),
+            }
+            batch.put(&TRUSTED, &who.person.id, &trusted)?;
+            Ok(Some(trusted.sources))
+        })?;
+        let full = || format!("You already have {SOURCES} sources of your own. Remove some before adding more.");
+        sources.ok_or_else(|| Refusal::invalid(full()))
+    }
+
     /// Starts a fetch for the document `id` as `who` may: `start` asks the document's gate for it.
     fn guarded<T>(&self, who: &Signed, id: &str, start: impl FnOnce(&Gate) -> Result<T, FetchError>) -> Answer<T> {
         let found = self.locate(who, id)?;
         let sources = self.config.sources().unwrap_or_default();
-        // What a person trusts by themselves adds no source: only the owner's sources reach into the
-        // owner's network.
         let origin = if self.trusts(who, &found, id)? { Origin::Created } else { Origin::Outside };
-        let trust = Trust::default();
+        // A person's own sources are fetched from unasked, as the owner's are, but only the owner's
+        // reach into the owner's network. Whoever only a link let in has none.
+        let own = if who.alone() { Vec::new() } else { self.own_sources(who)? };
+        let trust = Trust::of_sources(own.iter().filter_map(|source| Source::parse(source).ok()).collect());
         let gate = trust.gate(id, origin).on_server(&sources);
         Ok(start(&gate).map_err(Failed::Refused)?)
     }
 
     /// Fetches the picture a document links to. One nobody asked for is fetched from a trusted source
-    /// alone, as when a document opens.
+    /// alone, the owner's or the person's own, as when a document opens.
     pub fn fetch_picture(&self, who: &Signed, id: &str, fetch: &letters_api::Fetch) -> Answer<Fetched> {
         let guard = self.guarded(who, id, |gate| match fetch.asked {
             true => gate.fetch_on_request(&fetch.url, Limits::default()),

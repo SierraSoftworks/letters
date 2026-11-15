@@ -64,6 +64,12 @@ impl Trust {
         Ok(trust)
     }
 
+    /// Trusts these sources and nothing else: what a server keeps of one person's trust, where no file
+    /// of theirs is read.
+    pub fn of_sources(sources: Vec<Source>) -> Self {
+        Self { sources, ..Self::default() }
+    }
+
     /// Trusts nothing, and knows where `~` is.
     pub(crate) fn empty(home: Option<&str>) -> Self {
         Self { home: home.map(String::from), ..Self::default() }

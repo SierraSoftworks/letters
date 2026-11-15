@@ -37,6 +37,11 @@ pub const SHARED: &str = "/api/v1/shared";
 pub const PEOPLE: &str = "/api/v1/people";
 /// `GET`: the sources the server itself fetches pictures and previews from, as a list of addresses.
 pub const SOURCES: &str = "/api/v1/trust/sources";
+/// `GET`: the sources the person always loads pictures from, as a list of addresses: what "Always load
+/// from this host" adds, on whatever device. The server fetches a picture under one of them without being
+/// asked ([`Fetch::asked`](crate::Fetch::asked)), as it does under its own. They change one at a time, at
+/// [`own_source`].
+pub const OWN_SOURCES: &str = "/api/v1/settings/sources";
 
 /// A page: where a browser starts signing in. `?then=` names the page to come back to.
 pub const SIGN_IN_PAGE: &str = "/auth/sign-in";
@@ -54,6 +59,13 @@ pub const HOME_PAGE: &str = "/";
 /// once both have their way, which two `PUT`s of a whole list would not give them.
 pub fn word(word: &str) -> String {
     format!("{DICTIONARY}/{}", segment(word))
+}
+
+/// `PUT` adds the source to the person's own and `DELETE` takes it out: a host such as `img.example.org`,
+/// or an `https` address that the pictures are under. Each answers the sources as they are then, written as
+/// whole addresses, and minds neither one already there nor one already gone.
+pub fn own_source(source: &str) -> String {
+    format!("{OWN_SOURCES}/{}", segment(source))
 }
 
 /// `GET`: the [`Listing`](crate::Listing) of the folder `?path=` names, or of the space itself.
