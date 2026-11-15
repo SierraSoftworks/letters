@@ -15,8 +15,8 @@ import { expect, test } from "@playwright/test";
 import { learn, rested, texts } from "./page.js";
 
 test.skip(!process.env.LETTERS_WEB_DIST, "letters-server is built with the editor when LETTERS_WEB_DIST names dist/");
-// The first run builds the server.
-test.setTimeout(20 * 60_000);
+// The server is built before the tests run (`built.js`), and cargo still looks whether it is.
+test.setTimeout(2 * 60_000);
 
 /** Starts the server over a folder of its own, with its people signed in: see `examples/server.rs`. */
 const served = async () => {
