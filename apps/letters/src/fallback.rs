@@ -14,7 +14,7 @@ use std::thread;
 use fontdb::{Database, ID, Source, Stretch, Style};
 use letters_fonts::{DISPLAY, MONO, SANS};
 use letters_layout::{Fonts, Uncovered};
-use letters_render::Font;
+use letters_render::{Font, FontBytes};
 use skrifa::{FontRef, MetadataProvider};
 
 /// The families every window has already, whatever the system holds of them.
@@ -184,9 +184,9 @@ struct Family {
 pub struct Shelf {
     fonts: Database,
     families: Vec<Family>,
-    /// The files read so far. A collection is read once for all its faces, and a face handed out twice is
-    /// the same bytes, which is how the layout knows it has it.
-    files: HashMap<PathBuf, Arc<[u8]>>,
+    /// The files mapped so far. A collection is mapped once for all its faces, and a face handed out twice
+    /// is the same bytes, which is how the layout knows it has it and the renderer when it is let go.
+    files: HashMap<PathBuf, FontBytes>,
     /// The characters no face here has, so that they are looked for once.
     lacking: HashSet<char>,
 }
@@ -301,7 +301,7 @@ impl Shelf {
         order.into_iter().map(|family| family.face).collect()
     }
 
-    /// A face with its file's bytes, read once however many of the file's faces are taken.
+    /// A face with its file's bytes, mapped once however many of the file's faces are taken.
     fn read(&mut self, face: ID) -> Option<Font> {
         let (source, index) = self.fonts.face(face).map(|face| (face.source.clone(), face.index))?;
         let path = match source {
@@ -309,10 +309,12 @@ impl Shelf {
             Source::Binary(_) => return None,
         };
         if !self.files.contains_key(&path) {
-            let data: Arc<[u8]> = self.fonts.with_face_data(face, |data, _| Arc::from(data))?;
-            self.files.insert(path.clone(), data);
+            // Mapped and not read: a face then costs the memory of the glyphs that are drawn, where the
+            // whole file of an emoji face may be hundreds of megabytes.
+            let mapped = letters_frame::map_font(&path).ok()?;
+            self.files.insert(path.clone(), FontBytes::lent(Arc::new(mapped)));
         }
-        self.files.get(&path).map(|data| Font::new(data.clone(), index))
+        self.files.get(&path).map(|data| Font::of(data.clone(), index))
     }
 }
 

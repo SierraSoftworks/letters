@@ -17,11 +17,11 @@ undocumented_unsafe_blocks = "deny"
 
 [dependencies]
 raw-window-handle.workspace = true
+memmap2.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 wayland-client.workspace = true
 wayland-backend.workspace = true
-memmap2.workspace = true
 rustix.workspace = true
 bytemuck.workspace = true
 
