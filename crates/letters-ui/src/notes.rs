@@ -76,6 +76,9 @@ pub(crate) struct Margin {
     pub refused: Option<String>,
     /// The note that is open under its passage, and the reply typed into it so far.
     thread: Option<(String, String)>,
+    /// Whether the caret opened the note that is open, by coming into its passage. Such a note leaves the
+    /// keyboard with the page, and goes when the caret does.
+    followed: bool,
     /// The note a press outside it just put away. A press on its own marker goes on from it.
     left: Option<String>,
     /// The markers beside the blocks that have open notes, in the order of the document.
@@ -269,6 +272,45 @@ impl Margin {
     /// Opens a note under its passage. What was being written elsewhere is dropped.
     pub fn read(&mut self, id: &str) {
         (self.thread, self.draft, self.left) = (Some((id.to_owned(), String::new())), None, None);
+        self.followed = false;
+    }
+
+    /// The open comment whose passage a place in the text is in, either end of it included: the passages
+    /// that are marked on the page. Where one lies in another, the shorter is the one meant.
+    pub fn about(&self, at: &Pos) -> Option<&str> {
+        let comments = self.open().filter(|(note, kind)| *kind == Kind::Comment && note.anchor.block == at.block);
+        let around = comments.filter_map(|(note, _)| {
+            let passage = note.anchor.range.as_ref().filter(|range| !range.is_empty())?;
+            (passage.start..=passage.end).contains(&at.offset).then_some((passage.len(), note.id.as_str()))
+        });
+        around.min_by_key(|(long, _)| *long).map(|(_, id)| id)
+    }
+
+    /// Whether the note that is open is one the caret opened.
+    pub fn follows(&self) -> bool {
+        self.followed && self.reading().is_some()
+    }
+
+    /// Has the notes follow the caret, after the person did something. `was` is the comment whose passage
+    /// the selection ended in before that, and `caret` is where the caret is now, when the selection is one.
+    ///
+    /// A comment whose passage the caret came into is opened, when the window is `free` to show it and no
+    /// note is open or being written: nothing the person opened gives way to the caret. A note the caret
+    /// opened goes once the caret has left its passage, unless a reply is typed there. Returns whether a
+    /// note was opened.
+    pub fn attend(&mut self, was: Option<&str>, caret: Option<&Pos>, free: bool) -> bool {
+        let at = caret.and_then(|caret| self.about(caret)).map(str::to_owned);
+        let left = |(open, reply): &(String, String)| reply.trim().is_empty() && Some(open) != at.as_ref();
+        if self.followed && self.thread.as_ref().is_some_and(left) {
+            self.thread = None;
+        }
+        let Some(at) = at.filter(|at| was != Some(at.as_str())) else { return false };
+        let held = self.draft.is_some() || self.reading().is_some() || self.reviewing().is_some();
+        if !free || held {
+            return false;
+        }
+        (self.thread, self.followed, self.left) = (Some((at, String::new())), true, None);
+        true
     }
 
     /// Puts the open note away, as a press outside it or Escape does, and remembers which it was.

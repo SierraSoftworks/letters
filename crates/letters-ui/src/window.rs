@@ -2079,14 +2079,38 @@ impl EditorApp {
         self.layout.hit(self.in_layout(at))
     }
 
-    /// Whether something hangs over the page and takes what the pointer does there.
-    fn hung(&self) -> bool {
+    /// Whether a card, a menu or a field that the person asked for is out over the page.
+    fn covered(&self) -> bool {
         let card = self.landing.is_some() || self.importing.is_some() || self.copying.is_some();
         let asked = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
-        let asked = asked || self.captions.alt.is_some() || self.margin.writing().is_some();
-        let asked = asked || self.margin.reading().is_some();
-        let asked = asked || self.commands.open() || self.tables.open.is_some();
-        card || asked || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
+        let asked = asked || self.captions.alt.is_some() || self.tables.open.is_some();
+        card || asked || self.commands.open()
+    }
+
+    /// Whether something hangs over the page and takes what the pointer does there. A note the caret opened
+    /// does not: the page under it is still being written on.
+    fn hung(&self) -> bool {
+        let read = self.margin.reading().is_some() && !self.margin.follows();
+        let asked = self.covered() || self.margin.writing().is_some() || read;
+        asked || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
+    }
+
+    /// The open comment whose passage the selection ends in.
+    fn noted(&self) -> Option<String> {
+        let head = &self.editor.selection()?.head;
+        self.margin.about(head).map(str::to_owned)
+    }
+
+    /// Has the notes follow the caret, after the person did something: a comment opens under its passage
+    /// when the caret is put there, and goes when the caret leaves. `was` is what [`Self::noted`] gave
+    /// before.
+    fn attend(&mut self, was: Option<&str>, platform: &mut dyn Platform) {
+        // A press opens nothing while the button is down: it may be the start of a selection.
+        let free = !(self.dragging || self.away() || self.covered());
+        let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
+        if self.margin.attend(was, caret, free) {
+            self.margin.now = platform.wall_time().map(notes::stamp).unwrap_or_default();
+        }
     }
 
     /// The code block whose box is at a point of the page area, and whether the point is on its copy
@@ -2786,6 +2810,10 @@ impl EditorApp {
             .on_text(Message::Text)
             .on_pointer(|event| Some(Message::Pointer(event)))
             .pointed();
+        // A note the caret opened waits behind what the caret itself brings out: a menu of what to insert, a
+        // list of figures, the sheet of a formula.
+        let brought = || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some();
+        let waits = self.margin.follows() && (sheet.is_some() || brought());
         if let Some(importing) = &self.importing {
             element = element.popover(importing.card(room));
         } else if let Some(landing) = &self.landing {
@@ -2834,12 +2862,13 @@ impl EditorApp {
                 .on_close(Message::LinkClose);
             // The editor hangs from the caret, in place.
             element = element.popover(editor.at(caret.unwrap_or_default())).cursor(Cursor::Text);
-        } else if let Some((note, reply)) = self.margin.reading() {
+        } else if let Some((note, reply)) = self.margin.reading().filter(|_| !waits) {
             // The note hangs under the last line of its passage. One whose text is gone hangs from the
             // top of the margin its marker stood in.
             let under = self.note_lines(note).map(|(_, last)| self.onto(last));
             let said = self.said.of(note, threads::SAID, self.palette);
-            let thread = threads::thread(note, reply, said, &self.margin.now, self.margin.refused.as_deref());
+            let (now, refused) = (self.margin.now.as_str(), self.margin.refused.as_deref());
+            let thread = threads::thread(note, reply, said, now, refused, self.margin.follows());
             element = element.popover(match under {
                 Some(under) => thread.at(under),
                 None => thread.at(Rect::new(room.width - GUTTER, GUTTER, 0.0, 0.0)).align(Align::End),
@@ -3657,58 +3686,9 @@ impl EditorApp {
     }
 }
 
-impl App for EditorApp {
-    type Msg = Message;
-
-    fn title(&self) -> String {
-        self.location.name.clone().unwrap_or_else(|| "Letters".into())
-    }
-
-    fn view(&mut self, window: Size) -> Element<Message> {
-        // A floating window that Letters frames has a border, which everything else stands inside.
-        let border = self.chrome.border();
-        let window = Size { width: window.width - 2.0 * border, height: window.height - 2.0 * border };
-        self.refold(window.width);
-        // Print view has the window to itself: the panels and the outline are for editing. The history
-        // has its versions listed where a panel would be.
-        let (printing, away) = (self.printing.is_some(), self.away());
-        let panel = match &self.history {
-            Some(history) => Some(history.panel()),
-            None => self.panel.filter(|_| !away).map(|panel| self.side(panel)),
-        };
-        let room = window.width - if panel.is_some() { side_panel::WIDTH } else { 0.0 };
-        // While conflicts wait, a bar over the page counts them and steps through them.
-        let waiting = self.margin.conflicts();
-        let open = self.margin.reviewing().and_then(|open| waiting.iter().position(|id| *id == open.id));
-        let conflicts = (!waiting.is_empty() && !away).then(|| review::bar(waiting.len(), open));
-        let told = if conflicts.is_some() { banner::HEIGHT } else { 0.0 };
-        // The safe mode bar lies under the top bar and takes its height from the page.
-        let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height() + told;
-        // The history has a strip of its versions under the page and the panel.
-        let strip = self.history.as_ref().map(History::strip);
-        let foot = if strip.is_some() { history::STRIP } else { 0.0 };
-        let room = Size { width: room.max(0.0), height: (window.height - bar - foot).max(0.0) };
-        let page = match (printing, away) {
-            (true, _) => self.sheets(room),
-            (false, true) => self.version(room),
-            (false, false) => self.page(room),
-        };
-        let chapters = if away { None } else { self.chapters() };
-        let page = Element::row().grow(1.0).child(page).children(chapters);
-        let body = Element::row().grow(1.0).child(page).children(panel);
-        // The settings and the card about a link come last, so that they lie over whatever else is out.
-        let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
-        let commands = self.commands.open().then(|| {
-            let (offers, keymap) = (self.offers(), self.editor.keymap());
-            self.commands.view(&offers, keymap, self.mac, bar, window)
-        });
-        let over = over.chain(commands);
-        let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).children(self.safe.bar());
-        let all = all.children(conflicts).child(body).children(strip).children(over);
-        if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
-    }
-
-    fn update(&mut self, message: Message, platform: &mut dyn Platform) {
+impl EditorApp {
+    /// Does what a message asks.
+    fn does(&mut self, message: Message, platform: &mut dyn Platform) {
         // A note that a press outside it put away is remembered for that press alone.
         if !matches!(message, Message::Note(Noting::Close) | Message::Pointer(Pointer::Down { .. })) {
             self.margin.forget();
@@ -3828,7 +3808,8 @@ impl App for EditorApp {
         }
     }
 
-    fn key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+    /// Does what a key the page was offered asks. Returns whether the key was used.
+    fn keyed(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
         if self.printing.is_some() {
             return self.print_key(event, platform);
         }
@@ -3879,6 +3860,73 @@ impl App for EditorApp {
         }
         bound
     }
+}
+
+impl App for EditorApp {
+    type Msg = Message;
+
+    fn title(&self) -> String {
+        self.location.name.clone().unwrap_or_else(|| "Letters".into())
+    }
+
+    fn view(&mut self, window: Size) -> Element<Message> {
+        // A floating window that Letters frames has a border, which everything else stands inside.
+        let border = self.chrome.border();
+        let window = Size { width: window.width - 2.0 * border, height: window.height - 2.0 * border };
+        self.refold(window.width);
+        // Print view has the window to itself: the panels and the outline are for editing. The history
+        // has its versions listed where a panel would be.
+        let (printing, away) = (self.printing.is_some(), self.away());
+        let panel = match &self.history {
+            Some(history) => Some(history.panel()),
+            None => self.panel.filter(|_| !away).map(|panel| self.side(panel)),
+        };
+        let room = window.width - if panel.is_some() { side_panel::WIDTH } else { 0.0 };
+        // While conflicts wait, a bar over the page counts them and steps through them.
+        let waiting = self.margin.conflicts();
+        let open = self.margin.reviewing().and_then(|open| waiting.iter().position(|id| *id == open.id));
+        let conflicts = (!waiting.is_empty() && !away).then(|| review::bar(waiting.len(), open));
+        let told = if conflicts.is_some() { banner::HEIGHT } else { 0.0 };
+        // The safe mode bar lies under the top bar and takes its height from the page.
+        let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height() + told;
+        // The history has a strip of its versions under the page and the panel.
+        let strip = self.history.as_ref().map(History::strip);
+        let foot = if strip.is_some() { history::STRIP } else { 0.0 };
+        let room = Size { width: room.max(0.0), height: (window.height - bar - foot).max(0.0) };
+        let page = match (printing, away) {
+            (true, _) => self.sheets(room),
+            (false, true) => self.version(room),
+            (false, false) => self.page(room),
+        };
+        let chapters = if away { None } else { self.chapters() };
+        let page = Element::row().grow(1.0).child(page).children(chapters);
+        let body = Element::row().grow(1.0).child(page).children(panel);
+        // The settings and the card about a link come last, so that they lie over whatever else is out.
+        let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
+        let commands = self.commands.open().then(|| {
+            let (offers, keymap) = (self.offers(), self.editor.keymap());
+            self.commands.view(&offers, keymap, self.mac, bar, window)
+        });
+        let over = over.chain(commands);
+        let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).children(self.safe.bar());
+        let all = all.children(conflicts).child(body).children(strip).children(over);
+        if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
+    }
+
+    fn update(&mut self, message: Message, platform: &mut dyn Platform) {
+        // A press that leaves the caret in a passage asks for its note, wherever the caret was before.
+        let pressed = self.dragging && matches!(message, Message::Pointer(Pointer::Up { .. }));
+        let was = self.noted().filter(|_| !pressed);
+        self.does(message, platform);
+        self.attend(was.as_deref(), platform);
+    }
+
+    fn key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        let was = self.noted();
+        let used = self.keyed(event, platform);
+        self.attend(was.as_deref(), platform);
+        used
+    }
 
     fn describe(&self, page: &mut AccessNode, nodes: &mut Vec<(NodeId, AccessNode)>, whole: bool) {
         if let Some(print) = &self.printing {
@@ -3927,9 +3975,11 @@ impl App for EditorApp {
         }
         match describe::request(self.editor.doc(), request) {
             Some(describe::Request::Select(selection)) => {
+                let was = self.noted();
                 self.editor.select(selection);
                 self.mark();
                 self.reveal();
+                self.attend(was.as_deref(), platform);
             }
             Some(describe::Request::Replace(text)) => {
                 self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(text), platform));

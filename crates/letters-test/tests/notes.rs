@@ -99,6 +99,24 @@ fn caret_at(window: &mut Harness, block: &str, offset: usize) -> Rect {
     window.ui().caret_rect().expect("the page shows a caret")
 }
 
+/// A point on the text of a block, just after a place in it. The caret is left at the start of paragraph
+/// `b`, away from every note.
+fn spot(window: &mut Harness, block: &str, offset: usize) -> Point {
+    let after = caret_at(window, block, offset);
+    caret_at(window, "b", 0);
+    Point { x: after.x + 1.0, y: after.y + after.height / 2.0 }
+}
+
+/// Alice's comment on the slates, at the end of paragraph `a`.
+fn slates() -> Note {
+    note("slates", NoteKind::Comment, Anchor::range("a", 31..37), "Welsh ones?")
+}
+
+/// What the note that is open starts with, when one of any kind is open.
+fn reading(window: &mut Harness) -> Option<String> {
+    said(window).into_iter().next().map(|(_, words)| words)
+}
+
 /// The tools over the selection, and the names of the buttons on them.
 fn tools(window: &mut Harness) -> Option<(Found, Vec<Found>)> {
     let bar = window.find(Role::Toolbar, "Selection")?;
@@ -400,6 +418,205 @@ fn each_kind_of_note_opens_with_what_can_be_done_about_it() {
         assert!(window.find(Role::Button, "Resolve").is_some(), "{title} can be resolved");
         assert!(window.find(Role::TextInput, "Reply").is_some(), "{title} can be replied to");
     }
+}
+
+#[test]
+fn a_comment_opens_when_the_caret_is_put_in_its_passage() {
+    // How the caret comes into the written quote: by a press on it, or by keys from the word before it.
+    for by in ["a press", "keys"] {
+        let mut window = noted(vec![chased()]);
+        let passage = (caret_at(&mut window, "a", QUOTE.start), caret_at(&mut window, "a", QUOTE.end));
+        if by == "keys" {
+            caret_at(&mut window, "a", QUOTE.start - 2);
+            window.key("Right").assert_closed(Role::Dialog, "Comments").key("Right");
+        } else {
+            let on = spot(&mut window, "a", QUOTE.start + 4);
+            window.click_at(on);
+        }
+        let open = window.find(Role::Dialog, "Comments").unwrap_or_else(|| panic!("{by}: the comment opens"));
+        assert!(open.bounds.y >= passage.1.y + passage.1.height, "{by}: under its passage, {:?}", open.bounds);
+        let both = [("Alice Moreau", "Has anyone chased it?"), ("Sam Okafor", "Called on Tuesday.")];
+        assert_eq!(said(&mut window), both.map(|(who, words)| (who.to_owned(), words.to_owned())), "{by}");
+        let when = window.find(Role::Comment, "Alice Moreau").and_then(|voice| voice.description);
+        assert_eq!(when.as_deref(), Some("Tuesday"), "{by}: it says when it was written");
+
+        // The page keeps the keyboard: what is typed is written in the passage, and the note stays by it.
+        assert!(window.focused().is_some_and(|found| found.role == Role::Document), "{by}");
+        window.type_text("x");
+        let text = window.editor().doc().block(&"a".into()).map(Block::plain_text).unwrap_or_default();
+        assert_eq!(text.len(), "Their written quote covers the slates.".len() + 1, "{by}: {text}");
+        assert_eq!(reading(&mut window).as_deref(), Some("Has anyone chased it?"), "{by}");
+    }
+}
+
+#[test]
+fn a_note_the_caret_opened_goes_when_the_caret_leaves_its_passage() {
+    // What is done from the last letter of the written quote, and whether its note is still open after.
+    let cases: [(&[&str], bool); 4] =
+        [(&["Right"], true), (&["Right", "Right"], false), (&["Shift+Left"], false), (&["a press elsewhere"], false)];
+    for (done, stays) in cases {
+        let mut window = noted(vec![chased()]);
+        let elsewhere = spot(&mut window, "b", 5);
+        let on = spot(&mut window, "a", QUOTE.end - 1);
+        window.click_at(on).assert_open(Role::Dialog, "Comments");
+        for step in done {
+            match *step {
+                "a press elsewhere" => window.click_at(elsewhere),
+                key => window.key(key),
+            };
+        }
+        assert_eq!(reading(&mut window).is_some(), stays, "{done:?}");
+        // A stretch selected in the passage has the tools over it, to link it or comment on it again.
+        assert_eq!(tools(&mut window).is_some(), done == ["Shift+Left"], "{done:?}");
+    }
+}
+
+#[test]
+fn a_note_the_caret_opened_stays_away_once_it_is_put_away() {
+    let mut window = noted(vec![chased()]);
+    let on = spot(&mut window, "a", QUOTE.start + 4);
+    window.click_at(on).key("Escape").assert_closed(Role::Dialog, "Comments");
+    assert!(window.focused().is_some_and(|found| found.role == Role::Document), "the page keeps the keyboard");
+    window.key("Right").key("Left").key("Left").assert_closed(Role::Dialog, "Comments");
+
+    // It opens again once the caret has left its passage and come back, or the passage is pressed.
+    window.key("Home").key("Right").assert_closed(Role::Dialog, "Comments");
+    for _ in 0..QUOTE.start {
+        window.key("Right");
+    }
+    window.assert_open(Role::Dialog, "Comments").key("Escape").assert_closed(Role::Dialog, "Comments");
+    // Long enough after the first press that this is not the second of a double click.
+    window.advance(2_000).click_at(on).assert_open(Role::Dialog, "Comments");
+}
+
+#[test]
+fn a_reply_is_written_in_a_note_the_caret_opened() {
+    let mut window = noted(vec![chased()]);
+    let elsewhere = spot(&mut window, "b", 5);
+    let on = spot(&mut window, "a", QUOTE.start + 4);
+    window.click_at(on).click(Role::TextInput, "Reply").type_text("On it");
+    assert_eq!(window.markdown().matches("On it").count(), 0, "the reply is not written on the page");
+
+    // What is typed keeps the note, wherever the caret is put, until it is sent.
+    window.click_at(elsewhere);
+    let field = window.find(Role::TextInput, "Reply").expect("the note stays open");
+    assert_eq!(field.value.as_deref(), Some("On it"));
+    window.click(Role::Button, "Send");
+    let replies = &window.ui().notes().notes[0].replies;
+    assert_eq!(replies.len(), 2, "the reply is kept: {replies:?}");
+    window.assert_closed(Role::Dialog, "Comments");
+}
+
+#[test]
+fn the_caret_opens_the_comments_that_are_marked_on_the_page_and_the_nearest_of_them() {
+    // The notes on the written quote, where in paragraph `a` the caret is put, and what opens there.
+    let on_quote = |id: &str, kind, says: &str| note(id, kind, Anchor::range("a", QUOTE), says);
+    let word = note("word", NoteKind::Comment, Anchor::range("a", 14..19), "Which quote?");
+    let cases = [
+        (vec![chased()], QUOTE.start, Some("Has anyone chased it?")),
+        (vec![chased()], QUOTE.end, Some("Has anyone chased it?")),
+        (vec![chased()], QUOTE.end + 1, None),
+        (vec![chased(), word.clone()], 16, Some("Which quote?")),
+        (vec![chased(), word], 8, Some("Has anyone chased it?")),
+        (vec![on_quote("split", NoteKind::Import, "Merged cells split")], 10, None),
+        (vec![Note { resolved: true, ..chased() }], 10, None),
+        (vec![note("whole", NoteKind::Comment, Anchor::block("a"), "Too long")], 10, None),
+    ];
+    for (notes, offset, opens) in cases {
+        let mut window = noted(notes);
+        let on = spot(&mut window, "a", offset);
+        window.click_at(on);
+        assert_eq!(reading(&mut window).as_deref(), opens, "at {offset}");
+    }
+}
+
+#[test]
+fn nothing_that_is_open_or_being_written_gives_way_to_the_caret() {
+    // A comment that is being written on the slates stays when the written quote is pressed.
+    let mut window = noted(vec![chased()]);
+    let on = spot(&mut window, "a", QUOTE.start + 4);
+    window.select("slates").click(Role::Button, "Comment").type_text("Welsh ones?").click_at(on);
+    let field = window.find(Role::TextInput, "Comment").expect("the comment is still being written");
+    assert_eq!(field.value.as_deref(), Some("Welsh ones?"));
+    window.assert_closed(Role::Dialog, "Comments");
+
+    // So does a note opened from its marker, once a reply is typed in it.
+    let mut window = noted(vec![chased(), slates()]);
+    let on = spot(&mut window, "a", 33);
+    window.click(Role::Button, "3 comments").type_text("Thanks").click_at(on);
+    assert_eq!(reading(&mut window).as_deref(), Some("Has anyone chased it?"));
+
+    // A comment that was just written stays away while the caret only lets go of what it was written on,
+    // and opens when its passage is pressed.
+    let mut window = noted(Vec::new());
+    let on = spot(&mut window, "a", 33);
+    comment(&mut window, "slates", "Welsh ones?");
+    window.key("Right").assert_closed(Role::Dialog, "Comments");
+    window.click_at(on);
+    assert_eq!(said(&mut window), [("Sam Okafor".to_owned(), "Welsh ones?".to_owned())]);
+}
+
+#[test]
+fn the_page_and_the_margin_work_as_before_under_a_note_the_caret_opened() {
+    // A link on the page is still followed with Ctrl or Cmd held, and the note stays by its passage.
+    let href = "https://harland.example/quotes/north-slope";
+    let mut window = Harness::doc(&format!("See [their email]({href}) for the written quote."));
+    let line = window.editor().doc().blocks[0].id.clone();
+    let text = window.editor().doc().blocks[0].plain_text();
+    let (link, quote) = (text.find("email").expect("a link"), text.find("written").expect("a passage"));
+    let asked = note("chased", NoteKind::Comment, Anchor::range(line.as_str(), quote..quote + 13), "Chased?");
+    window.ui().set_notes(Notes { notes: vec![asked], ..Notes::default() });
+    let (on, link) = (caret_at(&mut window, line.as_str(), quote + 4), caret_at(&mut window, line.as_str(), link));
+    window.ui().select(Selection::caret(Pos::new(line.as_str(), 0)));
+    window.click_at(Point { x: on.x + 1.0, y: on.y + on.height / 2.0 }).assert_open(Role::Dialog, "Comments");
+    window.ui().take_requests();
+    window.mod_click_at(Point { x: link.x + 1.0, y: link.y + link.height / 2.0 });
+    assert_eq!(window.ui().take_requests(), [Request::OpenLink { href: href.into(), confirmed: false }]);
+    window.assert_open(Role::Dialog, "Comments");
+
+    // A press on the marker of its block goes on to the next note, which takes the keyboard as any note
+    // opened from a marker does.
+    let mut window = noted(vec![chased(), slates()]);
+    let on = spot(&mut window, "a", QUOTE.start + 4);
+    window.click_at(on).click(Role::Button, "3 comments");
+    assert_eq!(reading(&mut window).as_deref(), Some("Welsh ones?"));
+    assert!(window.find(Role::TextInput, "Reply").is_some_and(|field| field.focused), "ready for a reply");
+}
+
+#[test]
+fn the_sheet_of_a_formula_shows_in_place_of_a_note_the_caret_opened() {
+    // A comment on words that end in a formula: `rafter has length c = a + b`.
+    let blocks = vec![Block::text("p", BlockKind::Paragraph, "A rafter has length ")];
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.ui().set_reduced_motion(true);
+    window.ui().select(Selection::caret(Pos::new("p", 20)));
+    window.type_text("$c = a + b$");
+    let long = window.editor().doc().blocks[0].plain_text().len();
+    let asked = note("which", NoteKind::Comment, Anchor::range("p", 2..long), "Of which rafter?");
+    window.ui().set_notes(Notes { notes: vec![asked], ..Notes::default() });
+    window.ui().select(Selection::caret(Pos::new("p", 0)));
+    window.key("Right").key("Right").assert_open(Role::Dialog, "Comments");
+
+    // At the end of the line the caret is in the formula, and its source is what shows under it. The note
+    // is back once the caret has stepped out of the formula.
+    window.key("End").assert_closed(Role::Dialog, "Comments");
+    assert!(window.find(Role::Code, "Formula source").is_some(), "the sheet is out");
+    window.key("Right").assert_open(Role::Dialog, "Comments");
+}
+
+#[test]
+fn a_press_opens_a_comment_when_the_button_comes_up_and_a_drag_selects_instead() {
+    let mut window = noted(vec![chased()]);
+    let (from, to) = (spot(&mut window, "a", QUOTE.start + 2), spot(&mut window, "a", QUOTE.start + 8));
+    window.press_at(from).assert_closed(Role::Dialog, "Comments");
+    window.release_at(from).assert_open(Role::Dialog, "Comments");
+
+    // The note stays while its passage is pressed again. A stretch dragged out inside the passage is
+    // selected, with the tools over it and no note under it.
+    window.advance(2_000).press_at(from).assert_open(Role::Dialog, "Comments");
+    window.release_at(to).assert_closed(Role::Dialog, "Comments");
+    assert!(window.editor().selection().is_some_and(|selection| !selection.is_caret()), "a stretch is selected");
+    assert!(tools(&mut window).is_some(), "the tools show over it");
 }
 
 #[test]

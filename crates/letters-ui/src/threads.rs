@@ -399,13 +399,15 @@ fn voice(index: usize, (who, when): (&str, &str), said: &Rc<Spoken>, import: boo
 
 /// A note that is open, to hang under its passage: what was said, by whom and when, with Resolve at its
 /// top right and a reply under it. `said` is what the note and each reply say, as [`Said::of`] set them,
-/// and `refused` why nothing can be added to the notes of this document.
+/// and `refused` why nothing can be added to the notes of this document. `follows` is for a note the caret
+/// opened by coming into its passage.
 pub(crate) fn thread(
     note: &Note,
     reply: &str,
     said: &[Rc<Spoken>],
     now: &str,
     refused: Option<&str>,
+    follows: bool,
 ) -> Popover<Message> {
     let small = TextStyle::control().size(tokens::TEXT_SM);
     let kind = Kind::of(note).unwrap_or(Kind::Comment);
@@ -456,7 +458,9 @@ pub(crate) fn thread(
                     .small()
                     .disabled(reply.trim().is_empty())
                     .on_press(send(Noting::Answer));
-                under.child(Element::from(field).key("reply").grow(1.0).takes_focus()).child(post)
+                // A note the caret opened leaves the keyboard with the page, until its reply is pressed.
+                let field = Element::from(field).key("reply").grow(1.0);
+                under.child(if follows { field } else { field.takes_focus() }).child(post)
             }
         };
         all = all.child(top).child(voices).child(under);
@@ -466,6 +470,10 @@ pub(crate) fn thread(
         .max_width(WIDTH + 2.0 * tokens::SPACE_MD + 2.0)
         .open(true)
         .on_close(send(Noting::Close));
+    // A note the caret opened is beside the page, and stays for as long as the caret is in its passage.
+    if follows {
+        return thread.beside().stays();
+    }
     // A stray press on the page does not cost what was typed: Escape drops it.
     if reply.trim().is_empty() { thread } else { thread.stays() }
 }
