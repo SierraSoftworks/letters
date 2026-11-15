@@ -13,18 +13,23 @@ workspace = true
 
 [features]
 # Word lists for Thai, Lao, Khmer, Burmese, Chinese and Japanese, built into the binary: 3.7 MiB. With them a
-# line of Thai ends between words. Without, it ends at a space or wherever it fills. The desktop app has them.
+# line of Thai ends between words. Without, it does once the shell hands layout the list (`add_word_list`),
+# and until then ends at a space or wherever it fills. The desktop app has them built in.
 dictionaries = ["parley/complex-scripts"]
 
 [dependencies]
 icu_properties.workspace = true
+icu_provider.workspace = true
+icu_segmenter.workspace = true
 letters-math.workspace = true
 letters-model.workspace = true
 letters-render.workspace = true
 parley.workspace = true
 parley_data.workspace = true
+zerovec.workspace = true
 
 [dev-dependencies]
+font-test-data.workspace = true
 letters-editor.workspace = true
 letters-fonts.workspace = true
 proptest.workspace = true

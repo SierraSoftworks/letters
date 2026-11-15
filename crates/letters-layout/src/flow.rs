@@ -504,7 +504,8 @@ pub(crate) struct Leaf {
     pub laid: Option<Box<Laid>>,
     /// When the layout was last used, for dropping the stalest.
     pub used: u64,
-    /// Whether its text was last set short of a face it asked for. It is set again when more fonts arrive.
+    /// Whether its text was last set short of a face it asked for, or of a word list. It is set again when
+    /// more fonts or a word list arrive.
     pub short: bool,
     /// The language its texts take from the blocks around them, where one names any.
     pub lang: Option<Language>,

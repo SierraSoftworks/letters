@@ -9,13 +9,15 @@ use letters_render::{Color, Font, FontBytes, Glyph, Item, Point};
 use parley::fontique::{Blob, CharmapIndex, Collection, CollectionOptions, FamilyId, SourceCache};
 use parley::setting::Tag;
 use parley::{
-    BaseDirection, FontContext, FontFamily, FontFamilyName, FontStyle, FontVariation, FontVariations, FontWeight,
-    GenericFamily, GlyphRun, InlineBox, Language, Layout, LayoutContext, LineHeight, OverflowWrap, Run, TextStyle,
+    BaseDirection, DictionaryProvider, FontContext, FontFamily, FontFamilyName, FontStyle, FontVariation,
+    FontVariations, FontWeight, GenericFamily, GlyphRun, InlineBox, Language, Layout, LayoutContext, LineHeight,
+    OverflowWrap, Run, TextStyle,
 };
 use parley_data::Properties;
 
 use crate::Fonts;
 use crate::ink::Brush;
+use crate::words::Lists;
 
 /// A character that is shown without a glyph, since no face has one. See [`crate::DocLayout::take_uncovered`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,8 +72,11 @@ pub(crate) struct Engine {
     /// The characters met without a glyph since they were last taken: whether each is an emoji, and the
     /// language of its text.
     missed: Vec<(char, bool, Option<Language>)>,
+    /// The word lists handed over, and the scripts met without theirs.
+    pub lists: Lists,
     /// Whether text shaped since this was last cleared asked for a face that is not registered, and so was
-    /// set in another, or held a character no face has. Such text is set again when more fonts arrive.
+    /// set in another, or held a character no face has, or was in a script whose word list is not here.
+    /// Such text is set again when more fonts or a word list arrive.
     pub short: bool,
 }
 
@@ -98,6 +103,7 @@ impl Engine {
             maps: Vec::new(),
             covered: HashMap::new(),
             missed: Vec::new(),
+            lists: Lists::default(),
             short: false,
         };
         engine.add(fonts);
@@ -219,7 +225,8 @@ impl Engine {
         !found.is_empty()
     }
 
-    /// Notes which characters of `text` no face has a glyph for.
+    /// Notes which characters of `text` no face has a glyph for, and which are in a script whose word list
+    /// is not here.
     fn note(&mut self, text: &str, locale: Option<Language>) {
         if text.is_ascii() {
             return;
@@ -235,7 +242,7 @@ impl Engine {
                 self.missed.extend((!has).then(|| (ch, emoji(ch, chars.peek().copied()), locale)));
                 has
             });
-            self.short |= !has;
+            self.short |= !has | self.lists.note(ch);
         }
     }
 
@@ -301,6 +308,9 @@ impl Engine {
         }
         let mut builder = self.lcx.style_run_builder(&mut self.fcx, text, 1.0, true);
         builder.set_base_direction(reads);
+        // Parley looks for word lists here only once there is one: without, it keeps to its own rules.
+        let lists: Option<&dyn DictionaryProvider> = self.lists.any().then_some(&self.lists);
+        builder.set_dictionary_provider(lists);
         for spec in specs {
             let generic = if spec.mono { GenericFamily::Monospace } else { GenericFamily::SansSerif };
             let stack = [FontFamilyName::named(spec.family), FontFamilyName::Generic(generic)];

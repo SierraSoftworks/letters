@@ -1,11 +1,13 @@
 //! Document layout through its public interface, with the bundled fonts.
 
-use letters_layout::{Callout, DocLayout, FontSpec, Fonts, Palette, Shaper, Token, TokenKind};
+use std::sync::Arc;
+
+use letters_layout::{Callout, DocLayout, FontSpec, Fonts, Palette, Shaper, Token, TokenKind, WordList};
 use letters_model::{
     Align, Block, BlockKind, Body, Document, ListKind, Mark, Markers, Model, Op, Pos, ReplicaId, Run, Selection, Style,
     TextStyle, Tone,
 };
-use letters_render::{Color, DisplayList, Item, Point, Rect};
+use letters_render::{Color, DisplayList, Font, Item, Point, Rect};
 
 mod common;
 use common::*;
@@ -437,24 +439,86 @@ fn a_text_reads_from_the_side_its_first_letter_does() {
     }
 }
 
-#[test]
-#[cfg(feature = "dictionaries")]
-fn a_line_of_thai_ends_between_words() {
-    // Thai is written without spaces. These are words a dictionary keeps whole.
-    const WORDS: [&str; 9] = ["ภาษา", "ไทย", "เป็น", "ภาษา", "ราชการ", "ของ", "ประเทศ", "ไทย", "และ"];
-    let text = WORDS.concat().repeat(4);
-    let layout = laid_at(&doc(vec![paragraph("a", &text)]), 300.0);
+/// Thai as it is written, without spaces: words a word list keeps whole.
+const THAI: [&str; 9] = ["ภาษา", "ไทย", "เป็น", "ภาษา", "ราชการ", "ของ", "ประเทศ", "ไทย", "และ"];
+
+/// How many lines of a paragraph of [`THAI`] start inside a word, and how many lines it has.
+fn broken_words(layout: &DocLayout, text: &str) -> (usize, usize) {
     let line = |offset: usize| layout.caret(&Pos::new("a", offset)).unwrap().y;
     let offsets: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
-    let starts: Vec<usize> =
-        offsets.windows(2).filter(|pair| line(pair[1]) > line(pair[0])).map(|pair| pair[1]).collect();
+    let starts = offsets.windows(2).filter(|pair| line(pair[1]) > line(pair[0])).map(|pair| pair[1]);
+    let starts: Vec<usize> = starts.collect();
     let mut between = vec![0];
-    for word in WORDS.iter().cycle().take(WORDS.len() * 4) {
-        between.push(between[between.len() - 1] + word.len());
+    while between[between.len() - 1] < text.len() {
+        between.push(between[between.len() - 1] + THAI[(between.len() - 1) % THAI.len()].len());
     }
-    assert!(starts.len() > 2, "the text runs over several lines");
-    let inside: Vec<&usize> = starts.iter().filter(|start| !between.contains(start)).collect();
-    assert!(inside.is_empty(), "no line starts inside a word, as those at {inside:?} do");
+    (starts.iter().filter(|start| !between.contains(start)).count(), starts.len() + 1)
+}
+
+#[test]
+fn a_line_of_thai_ends_between_words_once_its_word_list_is_here() {
+    let text = THAI.concat().repeat(4);
+    let page = doc(vec![paragraph("a", &text)]);
+    let mut layout = laid_at(&page, 300.0);
+    painted(&layout, everything());
+    // A face for Thai comes first, as it does where the lists are fetched: the text then lacks only its list.
+    let thai = Font::new(Arc::from(font_test_data::LAST_RESORT_HE), 0);
+    assert!(layout.add_fallback_fonts(&Fonts { faces: vec![thai.clone()] }), "the text has its glyphs");
+    painted(&layout, everything());
+    let list = WordList::Thai.data();
+    assert!(broken_words(&layout, &text).1 > 3, "the text runs over several lines");
+
+    // A build either has the lists in it, or is handed each when a document turns out to need it.
+    if !WordList::BUILT_IN {
+        assert!(broken_words(&layout, &text).0 > 0, "without the list a line ends wherever it fills");
+        assert_eq!(layout.take_unlisted(), [WordList::Thai], "the script is told of");
+        assert_eq!(layout.take_unlisted(), [], "and only once");
+        // A file that is not the list would be read as words it does not hold.
+        let damaged: [(&str, Vec<u8>); 4] = [
+            ("nothing", vec![]),
+            ("a file cut short", list[..list.len() / 2].to_vec()),
+            ("a changed file", list.iter().map(|byte| byte.wrapping_add(1)).collect()),
+            ("another script's list", WordList::Lao.data()),
+        ];
+        for (name, data) in damaged {
+            assert!(!layout.add_word_list(WordList::Thai, &data), "{name} is refused");
+        }
+        assert!(layout.add_word_list(WordList::Thai, &list), "the page may look different with the list");
+    }
+    assert_eq!(layout.take_unlisted(), [], "a script is not told of where its list is");
+    assert!(!layout.add_word_list(WordList::Thai, &list), "a list that is here already changes nothing");
+    assert_eq!(broken_words(&layout, &text).0, 0, "no line starts inside a word");
+
+    let mut fresh = DocLayout::new(fonts());
+    fresh.add_fallback_fonts(&Fonts { faces: vec![thai] });
+    fresh.add_word_list(WordList::Thai, &list);
+    fresh.update(&page, &Style::default(), 300.0, None);
+    assert_eq!(painted(&layout, everything()), painted(&fresh, everything()), "as if the list had always been here");
+    assert_eq!(layout.height(), fresh.height());
+}
+
+#[test]
+fn each_script_written_without_spaces_asks_for_its_own_word_list() {
+    let cases = [
+        (WordList::Thai, "ภาษาไทย"),
+        (WordList::Lao, "ພາສາລາວ"),
+        (WordList::Khmer, "ភាសាខ្មែរ"),
+        (WordList::Burmese, "မြန်မာဘာသာ"),
+    ];
+    for (list, text) in cases {
+        let page = doc(vec![paragraph("a", "日本語 and English"), paragraph("b", text)]);
+        let mut layout = laid(&page);
+        painted(&layout, everything());
+        let asked = layout.take_unlisted();
+        assert_eq!(asked, if WordList::BUILT_IN { vec![] } else { vec![list] }, "{list:?}");
+        assert!(list.data().len() > 100_000, "{list:?} has a list to hand over");
+        assert_eq!(layout.add_word_list(list, &list.data()), !WordList::BUILT_IN, "{list:?} is taken");
+
+        let mut ahead = laid(&page);
+        painted(&ahead, everything());
+        ahead.add_word_list(list, &list.data());
+        assert_eq!(ahead.take_unlisted(), [], "{list:?} is not asked for once it is here");
+    }
 }
 
 #[test]
