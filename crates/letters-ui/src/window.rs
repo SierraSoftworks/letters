@@ -605,6 +605,31 @@ impl Ui<EditorApp> {
         self.app_mut().merges.refuse(why);
     }
 
+    /// Says that this document is itself a conflict copy, and of which document, or `None` once it is one
+    /// no longer. The bar under the top bar says so and offers to merge it into that document with
+    /// [`Request::MergeIntoOriginal`]. Its own conflict copies wait until then.
+    pub fn set_conflict_original(&mut self, original: Option<MergeFile>) {
+        self.app_mut().merges.set_original(original);
+    }
+
+    /// Names the document this one is about to be merged into and asks whether to go on, in answer to a
+    /// [`Request::MergeIntoOriginal`] that was not confirmed. A yes asks again with `confirmed` set.
+    pub fn ask_merge_into(&mut self, original: MergeFile) {
+        self.app_mut().merges.ask_into(original);
+    }
+
+    /// Says that files were merged, by their names as the person reads them: the bar says so for a few
+    /// seconds where it says how saving stands. A shell says it once the merge is kept, for conflict
+    /// copies and for a file the person chose alike. No names, nothing said.
+    pub fn set_merged(&mut self, names: Vec<String>) {
+        let said = match names.as_slice() {
+            [] => return,
+            [name] => format!("Merged {name}"),
+            names => format!("Merged {} files", names.len()),
+        };
+        self.app_mut().note = Some((said, None));
+    }
+
     /// The document's notes: the comments on its passages, and what imports and merges left on them. A
     /// shell writes them into the document's file with each save. A comment that is written counts among
     /// [`Window::edits`].
@@ -1773,6 +1798,7 @@ impl EditorApp {
             Act::TrustFolder => self.safe.folder().then_some(Message::Safe(Safely::TrustFolder))?,
             Act::MergeConflicts => self.merges.waiting().then_some(Message::Merge(Merging::Conflicts))?,
             Act::MergeFrom => self.merges.can().then_some(Message::Merge(Merging::FromFile))?,
+            Act::MergeInto => self.merges.copied().then_some(Message::Merge(Merging::IntoOriginal))?,
             // A card over the window is answered first: there is no document to act on behind it.
             Act::Print => (!self.carded()).then_some(Message::Print(Printing::Show))?,
             Act::History => (!self.carded()).then_some(Message::History(Historying::Show))?,
@@ -2231,11 +2257,16 @@ impl EditorApp {
                 self.requests.push(Request::MergeConflicts { confirmed: false });
             }
             Merging::FromFile => self.requests.push(Request::MergeFrom { path: None, confirmed: false }),
+            Merging::IntoOriginal => {
+                self.merges.asked();
+                self.requests.push(Request::MergeIntoOriginal { confirmed: false });
+            }
             Merging::Confirm => match self.merges.confirm() {
                 Some(Confirmed::Conflicts) => self.requests.push(Request::MergeConflicts { confirmed: true }),
                 Some(Confirmed::File(path)) => {
                     self.requests.push(Request::MergeFrom { path: Some(path), confirmed: true });
                 }
+                Some(Confirmed::Original) => self.requests.push(Request::MergeIntoOriginal { confirmed: true }),
                 None => {}
             },
             Merging::Leave => self.merges.leave(),

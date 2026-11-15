@@ -110,6 +110,10 @@ fn the_shell_has_the_files_named_before_it_merges_them_and_a_yes_asks_again() {
         }
         let focused = window.focused().expect("something focused");
         assert_eq!((focused.role, focused.name.as_str()), (Role::Button, "Merge"), "Enter says yes");
+        // The card is answered before another merge is asked for.
+        for command in ["Merge conflicts", "Merge from file"] {
+            assert!(!offered(&mut window, command), "{conflicts}: {command} while the card shows");
+        }
 
         window.click(Role::Button, answer);
         assert_eq!(window.ui().take_requests(), asked, "{conflicts}, {answer}");
@@ -189,4 +193,76 @@ fn the_end_of_a_long_document_shows_whole_under_the_bar() {
     window.key("Mod+End").paint();
     let (caret, page) = (window.ui().caret_rect().expect("the page shows a caret"), page(&mut window).bounds);
     assert!(caret.y + caret.height <= page.y + page.height, "the last line is in view: {caret:?} in {page:?}");
+}
+
+const INTO: Request = Request::MergeIntoOriginal { confirmed: false };
+
+#[test]
+fn a_document_that_is_a_conflict_copy_offers_to_merge_into_its_original() {
+    let mut window = letter();
+    assert!(!offered(&mut window, "Merge into the original"), "this document is no copy");
+
+    window.ui().set_conflict_original(Some(file("Roof quote")));
+    let told = bar(&mut window).expect("a bar");
+    assert!(told.name.contains("Roof quote"), "it names the original: {}", told.name);
+    window.click(Role::Button, "Merge into the original");
+    assert_eq!(window.ui().take_requests(), [INTO]);
+    // Nothing is merged twice while the shell is at it.
+    window.click(Role::Button, "Merge into the original");
+    assert_eq!(window.ui().take_requests(), [], "the button waits for the shell's answer");
+    assert!(!offered(&mut window, "Merge into the original"), "and so does the palette");
+
+    // The shell has the original named first, and a yes asks again.
+    window.ui().ask_merge_into(file("Roof quote"));
+    let named = window.controls().into_iter().find(|found| found.role == Role::ListItem);
+    let named = named.expect("the card names the original").name;
+    assert!(named.contains("Roof quote") && named.contains("Family / House"), "{named}");
+    run(&mut window, "Merge into the original");
+    assert_eq!(window.ui().take_requests(), [], "the card is answered first");
+    window.click(Role::Button, "Merge");
+    assert_eq!(window.ui().take_requests(), [Request::MergeIntoOriginal { confirmed: true }]);
+    let waits = window.find(Role::Button, "Merge into the original").map(|button| button.disabled);
+    assert_eq!(waits, Some(true), "the button waits again while the shell merges");
+
+    // Put away, the bar is back when the shell says which document this is a copy of.
+    window.click(Role::Button, "Hide");
+    window.ui().set_conflict_original(Some(file("Roof quote")));
+    assert!(bar(&mut window).is_none(), "the same original is no news");
+    window.ui().set_conflict_original(Some(file("Roof quote, first draft")));
+    assert!(bar(&mut window).is_some(), "another is");
+
+    window.ui().set_conflict_original(None);
+    assert!(bar(&mut window).is_none(), "the window holds the original now");
+}
+
+#[test]
+fn a_conflict_copy_with_copies_of_its_own_is_merged_into_its_original_first() {
+    let mut window = letter();
+    window.ui().set_conflict_copies(copies(1));
+    window.ui().set_conflict_original(Some(file("Roof quote")));
+    assert!(window.find(Role::Button, "Merge conflicts").is_none());
+    window.click(Role::Button, "Merge into the original");
+    assert_eq!(window.ui().take_requests(), [INTO]);
+
+    window.ui().set_conflict_original(None);
+    window.click(Role::Button, "Merge conflicts");
+    assert_eq!(window.ui().take_requests(), [CONFLICTS], "its copies come after");
+}
+
+#[test]
+fn the_bar_says_what_was_merged_for_a_few_seconds() {
+    // The names the shell says, and what the bar says of them.
+    let cases: [(&[&str], Option<&str>); 3] = [
+        (&["Roof quote (conflict 1)"], Some("Merged Roof quote (conflict 1)")),
+        (&["a", "b", "c"], Some("Merged 3 files")),
+        (&[], None),
+    ];
+    for (names, said) in cases {
+        let mut window = letter();
+        window.ui().set_merged(names.iter().map(|name| (*name).to_owned()).collect());
+        let merged = window.controls().into_iter().find(|found| found.name.starts_with("Merged"));
+        assert_eq!(merged.map(|found| found.name).as_deref(), said, "{names:?}");
+        window.advance(0).advance(10_000);
+        assert!(window.controls().iter().all(|found| !found.name.starts_with("Merged")), "{names:?}: it goes");
+    }
 }

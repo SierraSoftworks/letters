@@ -158,6 +158,14 @@ pub enum Request {
         path: Option<String>,
         confirmed: bool,
     },
+    /// Merge this document, a conflict copy, into the document it is a copy of, which was told with
+    /// `Window::set_conflict_original`, and go on with that document in this window. The shell merges, or
+    /// has the window name the original and ask with `Window::ask_merge_into`, or says why not with
+    /// `Window::refuse_merge`. `confirmed` is set once the person has read that card and said yes. The
+    /// button waits for one of the three: `Window::set_conflict_original` says what the window holds then.
+    MergeIntoOriginal {
+        confirmed: bool,
+    },
 }
 
 /// A document opened lately, as the landing card lists it.

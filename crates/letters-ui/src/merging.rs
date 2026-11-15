@@ -1,5 +1,5 @@
 //! Merging another file of this document into it: the bar over a document a sync tool left conflict copies
-//! of, and the card that names the files before they are merged.
+//! of, or that is such a copy itself, and the card that names the files before they are merged.
 //!
 //! The window only shows and asks. The shell finds the copies, judges each file and does the merge, whose
 //! edits arrive as another writer's do.
@@ -44,6 +44,8 @@ pub enum Merging {
     Conflicts,
     /// Lets the person choose a file to merge.
     FromFile,
+    /// Merges this document, a conflict copy, into the document it is a copy of.
+    IntoOriginal,
     /// The person has read the files on the card and wants them merged.
     Confirm,
     /// Puts the card away.
@@ -57,6 +59,15 @@ pub enum Merging {
 pub(crate) enum Confirmed {
     Conflicts,
     File(String),
+    Original,
+}
+
+/// What the card asks about.
+enum Card {
+    /// Files to merge into this document.
+    Files(MergeAsk),
+    /// The document to merge this one into.
+    Original(MergeFile),
 }
 
 #[derive(Default)]
@@ -64,10 +75,12 @@ pub(crate) struct Merges {
     /// The conflict copies the shell last told of. `None` until it has: a shell that never does cannot
     /// merge, and is not asked to.
     copies: Option<Vec<MergeFile>>,
+    /// The document this one is a conflict copy of, when it is one.
+    original: Option<MergeFile>,
     hidden: bool,
-    /// Whether the shell was asked to merge the copies and has not answered.
+    /// Whether the shell was asked for the merge the bar offers and has not answered.
     asked: bool,
-    card: Option<MergeAsk>,
+    card: Option<Card>,
     /// Why the last merge could not be done.
     refused: Option<String>,
 }
@@ -81,24 +94,47 @@ impl Merges {
         (self.copies, self.asked) = (Some(copies), false);
     }
 
-    /// Whether the shell merges files at all.
+    /// Takes the document this one is a conflict copy of, or that it is one no longer.
+    pub fn set_original(&mut self, original: Option<MergeFile>) {
+        if self.original != original {
+            self.hidden = false;
+        }
+        (self.original, self.asked) = (original, false);
+    }
+
+    /// Whether nothing is asked of the shell or of the person: a card is answered before another merge.
+    fn idle(&self) -> bool {
+        !self.asked && self.card.is_none()
+    }
+
+    /// Whether this document is a conflict copy, and no merge into its original is under way.
+    pub fn copied(&self) -> bool {
+        self.idle() && self.original.is_some()
+    }
+
+    /// Whether the shell merges files at all, and a file can be chosen now.
     pub fn can(&self) -> bool {
-        self.copies.is_some()
+        self.copies.is_some() && self.card.is_none()
     }
 
     /// Whether there are conflict copies to merge, and no merge of them under way.
     pub fn waiting(&self) -> bool {
-        !self.asked && self.copies.as_ref().is_some_and(|copies| !copies.is_empty())
+        self.idle() && self.copies.as_ref().is_some_and(|copies| !copies.is_empty())
     }
 
-    /// Notes that the shell was asked to merge the copies. What was said of the last merge is past.
+    /// Notes that the shell was asked for the merge the bar offers. What was said of the last merge is past.
     pub fn asked(&mut self) {
         (self.asked, self.refused) = (true, None);
     }
 
     /// The shell wants the person to see what is merged first.
     pub fn ask(&mut self, ask: MergeAsk) {
-        (self.card, self.asked) = ((!ask.files.is_empty()).then_some(ask), false);
+        (self.card, self.asked) = ((!ask.files.is_empty()).then_some(Card::Files(ask)), false);
+    }
+
+    /// The shell wants the person to see what this document is merged into first.
+    pub fn ask_into(&mut self, original: MergeFile) {
+        (self.card, self.asked) = (Some(Card::Original(original)), false);
     }
 
     /// The shell could not merge, and says why. The bar says it, put away or not.
@@ -117,7 +153,13 @@ impl Merges {
 
     /// Puts the card away. Returns what it asked about.
     pub fn confirm(&mut self) -> Option<Confirmed> {
-        let ask = self.card.take()?;
+        let ask = match self.card.take()? {
+            Card::Files(ask) => ask,
+            Card::Original(_) => {
+                self.asked = true;
+                return Some(Confirmed::Original);
+            }
+        };
         if ask.conflicts {
             self.asked = true;
             return Some(Confirmed::Conflicts);
@@ -127,7 +169,7 @@ impl Merges {
 
     fn shows(&self) -> bool {
         let copies = self.copies.as_ref().is_some_and(|copies| !copies.is_empty());
-        self.refused.is_some() || (copies && !self.hidden)
+        self.refused.is_some() || ((copies || self.original.is_some()) && !self.hidden)
     }
 
     /// The room the bar takes above the page.
@@ -135,18 +177,29 @@ impl Merges {
         if self.shows() { banner::HEIGHT } else { 0.0 }
     }
 
-    /// The bar under the top bar, while there are conflict copies or a merge that could not be done.
+    /// The bar under the top bar, while there is something to merge or a merge that could not be done. A
+    /// document that is a conflict copy says that first: its own copies wait for it to be the original.
     pub fn bar(&self) -> Option<Element<Message>> {
         if !self.shows() {
             return None;
         }
         let copies = self.copies.as_deref().unwrap_or_default();
-        let mut bar = match (&self.refused, copies) {
-            (Some(why), _) => Banner::new(why.as_str()).tone(Tone::Warn),
-            (None, [copy]) => Banner::new(format!("A conflict copy has edits this document lacks: {}", copy.name)),
-            (None, copies) => Banner::new(format!("{} conflict copies have edits this document lacks.", copies.len())),
+        let mut bar = match (&self.refused, &self.original, copies) {
+            (Some(why), ..) => Banner::new(why.as_str()).tone(Tone::Warn),
+            (None, Some(original), _) => Banner::new(format!("This is a conflict copy of {}.", original.name)),
+            (None, None, [copy]) => {
+                Banner::new(format!("A conflict copy has edits this document lacks: {}", copy.name))
+            }
+            (None, None, copies) => {
+                Banner::new(format!("{} conflict copies have edits this document lacks.", copies.len()))
+            }
         };
-        if !copies.is_empty() {
+        if let Some(original) = &self.original {
+            let does = format!("Brings this copy's edits into {} and moves this copy to the trash", original.name);
+            let merge = Button::new("Merge into the original").small().disabled(self.asked);
+            let merge = merge.on_press(Message::Merge(Merging::IntoOriginal));
+            bar = bar.action(Element::from(merge).tooltip(does, Side::Bottom));
+        } else if !copies.is_empty() {
             let does = match copies.len() {
                 1 => "Brings its edits into this document and moves the copy to the trash",
                 _ => "Brings their edits into this document and moves the copies to the trash",
@@ -161,17 +214,29 @@ impl Merges {
     /// The card over the middle of the window, while the shell asks about files to merge. It hangs from
     /// an element of no size, which the window puts after everything else.
     pub fn card(&self) -> Option<Element<Message>> {
-        let ask = self.card.as_ref()?;
         let send = |asked: Merging| Message::Merge(asked);
-        let (title, does) = match (ask.conflicts, ask.files.len()) {
-            (true, 1) => {
-                ("Merge this conflict copy?", "Its edits come into this document, and the copy moves to the trash.")
-            }
-            (true, _) => (
-                "Merge these conflict copies?",
-                "Their edits come into this document, and the copies move to the trash.",
+        let (files, title, does) = match self.card.as_ref()? {
+            Card::Original(original) => (
+                std::slice::from_ref(original),
+                "Merge into the original?",
+                "This copy's edits go into it, and this copy moves to the trash. The window goes on with the original.",
             ),
-            (false, _) => ("Merge this file?", "Its edits come into this document. The file stays where it is."),
+            Card::Files(ask) => {
+                let (title, does) = match (ask.conflicts, ask.files.len()) {
+                    (true, 1) => (
+                        "Merge this conflict copy?",
+                        "Its edits come into this document, and the copy moves to the trash.",
+                    ),
+                    (true, _) => (
+                        "Merge these conflict copies?",
+                        "Their edits come into this document, and the copies move to the trash.",
+                    ),
+                    (false, _) => {
+                        ("Merge this file?", "Its edits come into this document. The file stays where it is.")
+                    }
+                };
+                (&ask.files[..], title, does)
+            }
         };
         let head = Element::row()
             .align(Align::Center)
@@ -180,7 +245,7 @@ impl Merges {
             .child(Element::text(title, TextStyle::control().weight(600)));
         // Each file by its name, with where it lies under it.
         let quiet = TextStyle::control().size(tokens::TEXT_SM);
-        let files = ask.files.iter().map(|file| {
+        let files = files.iter().map(|file| {
             Element::column()
                 .role(Role::ListItem)
                 .label(format!("{}, in {}", file.name, file.folder))
@@ -254,5 +319,8 @@ mod tests {
             assert_eq!(merges.confirm(), confirmed, "{ask:?}");
             assert_eq!(merges.confirm(), None, "the card is gone");
         }
+        let mut merges = Merges::default();
+        merges.ask_into(copy("original"));
+        assert_eq!(merges.confirm(), Some(Confirmed::Original));
     }
 }
