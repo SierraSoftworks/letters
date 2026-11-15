@@ -788,6 +788,44 @@ fn plain_strings_are_shaped_for_widgets() {
 }
 
 #[test]
+fn a_label_of_thai_wraps_between_words_once_its_word_list_is_here() {
+    let font = FontSpec::new(letters_fonts::SANS, 13.0);
+    let (text, list) = (THAI.concat(), WordList::Thai.data());
+    let between: Vec<usize> =
+        THAI.iter().scan(0, |end, word| Some(std::mem::replace(end, *end + word.len()))).collect();
+    // Where the label's first line ends, at each of several widths.
+    let ends = |shaper: &Shaper| -> Vec<usize> {
+        let whole = shaper.shape(&text, &font, None).width;
+        let at =
+            |tenths: u8| shaper.shape(&text, &font, Some(whole * f32::from(tenths) / 10.0)).stops.last().unwrap().0;
+        (3..9).map(at).collect()
+    };
+    let whole = |ends: &[usize]| ends.iter().all(|end| between.contains(end));
+
+    let shaper = Shaper::new(fonts());
+    let first = ends(&shaper);
+    assert!(first.iter().all(|end| *end < text.len()), "a width wraps the label: {first:?}");
+    // A build either has the lists in it, or is handed each when a label turns out to need it.
+    if !WordList::BUILT_IN {
+        assert!(!whole(&first), "without the list a line ends wherever it fills: {first:?}");
+        assert_eq!(shaper.take_unlisted(), [WordList::Thai], "the script is told of");
+        assert_eq!(shaper.take_unlisted(), [], "and only once");
+        assert!(!shaper.add_word_list(WordList::Thai, &WordList::Lao.data()), "another script's list is refused");
+        assert!(shaper.add_word_list(WordList::Thai, &list), "labels of the script are to be shaped again");
+    }
+    assert_eq!(shaper.take_unlisted(), [], "a script is not told of where its list is");
+    assert!(!shaper.add_word_list(WordList::Thai, &list), "a list that is here already changes nothing");
+    let kept = ends(&shaper);
+    assert!(whole(&kept), "no line ends inside a word: {kept:?} of {between:?}");
+
+    // A list that comes before any label of its script leaves nothing to shape again.
+    let ahead = Shaper::new(fonts());
+    ahead.shape("Save changes", &font, Some(40.0));
+    assert!(!ahead.add_word_list(WordList::Thai, &list), "no label was of the script");
+    assert_eq!((ends(&ahead), ahead.take_unlisted()), (kept, vec![]), "as if the list had come late");
+}
+
+#[test]
 fn the_palette_colours_what_the_style_does_not() {
     const LOUD: Color = Color::rgb(1, 200, 3);
     let light = Palette::LIGHT;
