@@ -117,7 +117,10 @@ impl Editor {
     pub(crate) fn recall(&mut self, kept: &Kept) {
         let moved = (kept.merges != self.merges).then(|| self.found(kept.held.clone())).flatten();
         let caret = kept.caret.clone();
-        self.restore(caret.map(|caret| Caret { selection: moved.unwrap_or(caret.selection.clone()), ..caret }));
+        self.restore(caret.map(|caret| {
+            let selection = moved.unwrap_or(caret.selection.clone());
+            caret.at(selection)
+        }));
     }
 
     /// A range holds on to the text inside it and a caret to the character before it, so what another

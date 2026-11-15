@@ -1226,22 +1226,43 @@ pub(crate) fn stretches(set: &Set, range: &Range<usize>, shifts: &Shifts, mut ea
     });
 }
 
-/// The byte offset nearest to a point on the page.
+/// The byte offset nearest to a point on the page, and whether it is the end of the line that wraps there.
 ///
 /// A [`letters_model::Pos`] has no affinity, and an offset at a wrap draws at the start of the next line. So a
-/// point past the end of a wrapped line lands before the space the line wraps at, never after it.
-pub(crate) fn hit(text: &Text<'_>, shifts: &Shifts, point: Point) -> usize {
+/// point past the end of a line that wraps at a space lands before the space, never after it. A line that
+/// wraps with no space ends at the offset the next one starts at, and the flag says that it is that end.
+pub(crate) fn hit(text: &Text<'_>, shifts: &Shifts, point: Point) -> (usize, bool) {
     let (layout, x, y) = (&text.set.layout, point.x - text.at.x, point.y - text.at.y);
     let x = if shifts.is_empty() { x } else { shifts.pull(line_at(layout, y), x) };
     let cursor = Cursor::from_point(layout, x, y);
-    if cursor.affinity() == Affinity::Upstream
-        && cursor.index() < layout.text_len()
-        && let Some(last) = cursor.upstream_cluster(layout)
-        && last.is_soft_line_break()
-    {
-        return text.set.outward(last.text_range().start);
+    let last = wrapped(layout, cursor.index()).filter(|_| cursor.affinity() == Affinity::Upstream);
+    match last {
+        Some(space) if space.is_space_or_nbsp() => (text.set.outward(space.text_range().start), false),
+        last => (text.set.outward(cursor.index()), last.is_some()),
     }
-    text.set.outward(cursor.index())
+}
+
+/// The last cluster of the line that ends at an offset of the layout's text only because it was full, when
+/// the next line starts at that offset.
+fn wrapped(layout: &Layout<Brush>, index: usize) -> Option<Cluster<'_, Brush>> {
+    let last = Cluster::from_byte_index(layout, index.checked_sub(1)?)?;
+    let next = Cluster::from_byte_index(layout, index)?;
+    let apart = last.path().line_index() != next.path().line_index();
+    (apart && !last.is_hard_line_break()).then_some(last)
+}
+
+/// The side of a byte offset that a caret there is drawn at: the end of the line before it for one that is
+/// `before_wrap`, where a line does wrap there with no space.
+fn lean(set: &Set, offset: usize, before_wrap: bool) -> Affinity {
+    let wraps = |index: usize| wrapped(&set.layout, index).is_some_and(|last| !last.is_space_or_nbsp());
+    let at = Cursor::from_byte_index(&set.layout, set.inward(offset), Affinity::Downstream);
+    if before_wrap && wraps(at.index()) { Affinity::Upstream } else { Affinity::Downstream }
+}
+
+/// The byte offset before the character that ends at one.
+pub(crate) fn back(set: &Set, offset: usize) -> usize {
+    let last = set.inward(offset).checked_sub(1).and_then(|index| Cluster::from_byte_index(&set.layout, index));
+    last.map_or(offset, |last| set.outward(last.text_range().start))
 }
 
 /// The line at a height given from the text's top, or the nearest one.
@@ -1260,26 +1281,28 @@ pub(crate) fn spot(set: &Set, offset: usize, affinity: Affinity) -> (usize, f32)
     (line.unwrap_or(layout.len().saturating_sub(1)), at.x0 as f32)
 }
 
-/// The line holding a byte offset.
-pub(crate) fn line_of(set: &Set, offset: usize) -> usize {
-    spot(set, offset, Affinity::Downstream).0
+/// The line holding a byte offset: of the two that an offset where a line wraps is on, the first if
+/// `before_wrap`.
+pub(crate) fn line_of(set: &Set, offset: usize, before_wrap: bool) -> usize {
+    spot(set, offset, lean(set, offset, before_wrap)).0
 }
 
-/// The byte offset on a line nearest to `x` on the page.
-pub(crate) fn on_line(text: &Text<'_>, shifts: &Shifts, line: usize, x: f32) -> usize {
-    let Some(line) = text.set.layout.get(line) else { return 0 };
+/// The byte offset on a line nearest to `x` on the page, with its side as [`hit`] gives it.
+pub(crate) fn on_line(text: &Text<'_>, shifts: &Shifts, line: usize, x: f32) -> (usize, bool) {
+    let Some(line) = text.set.layout.get(line) else { return (0, false) };
     let metrics = line.metrics();
     let y = text.at.y + (metrics.block_min_coord + metrics.block_max_coord) / 2.0;
     hit(text, shifts, Point { x, y })
 }
 
-/// Where a caret at a byte offset is drawn on the page. It spans the line's text, not its leading.
-pub(crate) fn caret(text: &Text<'_>, shifts: &Shifts, offset: usize) -> Rect {
+/// Where a caret at a byte offset is drawn on the page: at the end of the line that wraps there for one that
+/// is `before_wrap`. It spans the line's text, not its leading.
+pub(crate) fn caret(text: &Text<'_>, shifts: &Shifts, offset: usize, before_wrap: bool) -> Rect {
     let layout = &text.set.layout;
-    let at = Cursor::from_byte_index(layout, text.set.inward(offset), Affinity::Downstream);
+    let at = Cursor::from_byte_index(layout, text.set.inward(offset), lean(text.set, offset, before_wrap));
     let at = at.geometry(layout, theme::CARET);
     let (mut top, mut bottom) = (at.y0 as f32, at.y1 as f32);
-    let line = line_of(text.set, offset);
+    let line = line_of(text.set, offset, before_wrap);
     if let Some(line) = layout.get(line) {
         let metrics = line.metrics();
         (top, bottom) = (metrics.content_block_min_coord, metrics.content_block_max_coord);

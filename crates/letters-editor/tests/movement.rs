@@ -1,7 +1,8 @@
 mod common;
 
-use common::{Harness, canon};
-use letters_editor::Command;
+use common::Do::{K, T};
+use common::{Do, Harness, canon};
+use letters_editor::{Command, Motion};
 use letters_model::{Pos, Selection};
 
 /// Presses `keys` from `before` and returns each state passed through.
@@ -218,4 +219,94 @@ fn a_selection_from_outside_is_brought_onto_text() {
     assert_eq!(select(&mut editor, "b1", 99), canon("p héllo|\nhr"));
     assert_eq!(select(&mut editor, "b2", 0), canon("p héllo|\nhr"));
     assert_eq!(select(&mut editor, "nope", 0), canon("p héllo|\nhr"));
+}
+
+/// Plays `script` on a page whose lines are five characters wide and wrap with no space.
+fn narrow(before: &str, script: &[Do]) -> Harness {
+    let mut editor = Harness::wrapped(before, 5);
+    editor.play(script);
+    editor
+}
+
+#[test]
+fn the_end_of_a_line_that_wraps_with_no_space_is_a_place_of_its_own() {
+    // One offset ends a line and starts the next. The flag says the caret is at the end of the first.
+    let cases = [
+        ("p ab|cdefghijklmn", &[K("End")][..], "p abcde|fghijklmn", true),
+        // End stays where it is, and Home is the start of the line the caret is shown on.
+        ("p ab|cdefghijklmn", &[K("End"), K("End")], "p abcde|fghijklmn", true),
+        ("p ab|cdefghijklmn", &[K("End"), K("Home")], "p |abcdefghijklmn", false),
+        ("p ab|cdefghijklmn", &[K("Shift+End")], "p ab^cde|fghijklmn", true),
+        ("p ab|cdefghijklmn", &[K("Shift+End"), K("Shift+End")], "p ab^cde|fghijklmn", true),
+        ("p ab|cdefghijklmn", &[K("Shift+End"), K("Shift+Home")], "p |ab^cdefghijklmn", false),
+        // The same offset come to from the next line is that line's start.
+        ("p abcdef|ghijklmn", &[K("Left")], "p abcde|fghijklmn", false),
+        ("p abcdefg|hijklmn", &[K("Home"), K("Home")], "p abcde|fghijklmn", false),
+        ("p abcdefg|hijklmn", &[K("Home"), K("End")], "p abcdefghij|klmn", true),
+        // Up and down keep to the ends of lines, and the last line ends where its text does.
+        ("p ab|cdefghijklmn", &[K("End"), K("Down")], "p abcdefghij|klmn", true),
+        ("p abcdefg|hijklmn", &[K("End"), K("Up")], "p abcde|fghijklmn", true),
+        ("p ab|cdefghijklmn", &[K("End"), K("Down"), K("Down")], "p abcdefghijklmn|", false),
+        // A page is three lines.
+        ("p ab|cdefghijklmnopqrstuvwxy", &[K("End"), K("PageDown")], "p abcdefghijklmnopqrst|uvwxy", true),
+        ("p ab|cdefghijklmnopqrstuvwxy", &[K("End"), K("Shift+PageDown")], "p abcde^fghijklmnopqrst|uvwxy", true),
+        // A step sideways leaves the end of a line as it leaves any place.
+        ("p ab|cdefghijklmn", &[K("End"), K("Left")], "p abcd|efghijklmn", false),
+        ("p ab|cdefghijklmn", &[K("End"), K("Right")], "p abcdef|ghijklmn", false),
+        // A selection that ends there collapses to where its end is shown.
+        ("p ab|cdefghijklmn", &[K("Shift+End"), K("Right")], "p abcde|fghijklmn", true),
+        ("p ab|cdefghijklmn", &[K("Shift+End"), K("Left")], "p ab|cdefghijklmn", false),
+        // What is typed or deleted there is at the end of the line, and undoing it leads back there.
+        ("p ab|cdefghijklmn", &[K("End"), T("x")], "p abcdex|fghijklmn", false),
+        ("p ab|cdefghijklmn", &[K("End"), K("Backspace")], "p abcd|fghijklmn", false),
+        ("p ab|cdefghijklmn", &[K("End"), T("x"), K("Mod+z")], "p abcde|fghijklmn", true),
+        // The caret stays on its line for what moves it nowhere.
+        ("p ab|cdefghijklmn", &[K("End"), K("Mod+b")], "p abcde|fghijklmn", true),
+        ("p ab|cdefghijklmn", &[K("End"), K("Delete")], "p abcde|ghijklmn", true),
+    ];
+    for (before, script, after, before_wrap) in cases {
+        let editor = narrow(before, script);
+        assert_eq!(editor.state(), canon(after), "{script:?} from {before:?}");
+        assert_eq!(editor.editor.before_wrap(), before_wrap, "the line after {script:?} from {before:?}");
+    }
+}
+
+#[test]
+fn a_line_is_deleted_up_to_the_edge_the_caret_is_shown_at() {
+    let cases = [
+        ("p ab|cdefghijklmn", &[][..], Motion::LineEnd, "p ab|fghijklmn"),
+        ("p ab|cdefghijklmn", &[K("End")], Motion::LineStart, "p |fghijklmn"),
+        ("p ab|cdefghijklmn", &[K("End")], Motion::LineEnd, "p abcde|fghijklmn"),
+        ("p abcdefg|hijklmn", &[K("Home")], Motion::LineStart, "p abcde|fghijklmn"),
+    ];
+    for (before, script, motion, after) in cases {
+        let mut editor = narrow(before, script);
+        editor.run(Command::Delete(motion));
+        assert_eq!(editor.state(), canon(after), "deleting to {motion:?} after {script:?} from {before:?}");
+    }
+}
+
+#[test]
+fn a_press_at_a_wrap_is_on_the_line_that_layout_says() {
+    // The same offset, as a press past the end of the first line gives it and as one before the second.
+    let cases = [(true, "p |abcdefghijklmn", "p abcde|fghijklmn"), (false, "p abcde|fghijklmn", "p abcdefghij|klmn")];
+    for (before_wrap, home, end) in cases {
+        let pressed = |key: &str| {
+            let mut editor = narrow("p |abcdefghijklmn", &[]);
+            editor.editor.select_at(Selection::caret(Pos::new("b1", 5)), before_wrap);
+            assert_eq!(editor.editor.before_wrap(), before_wrap);
+            editor.key(key);
+            editor.state()
+        };
+        assert_eq!(pressed("Home"), canon(home), "Home, before the wrap: {before_wrap}");
+        assert_eq!(pressed("End"), canon(end), "End, before the wrap: {before_wrap}");
+    }
+    // A drag that ends past the line's end is on that line too, and a plain press takes the caret off it.
+    let mut editor = narrow("p |abcdefghijklmn", &[]);
+    editor.editor.select_at(Selection { anchor: Pos::new("b1", 2), head: Pos::new("b1", 5) }, true);
+    editor.key("Shift+Home");
+    assert_eq!(editor.state(), canon("p |ab^cdefghijklmn"));
+    editor.editor.select_at(Selection::caret(Pos::new("b1", 5)), true);
+    editor.editor.select(Selection::caret(Pos::new("b1", 5)));
+    assert!(!editor.editor.before_wrap(), "a press at the start of the next line");
 }

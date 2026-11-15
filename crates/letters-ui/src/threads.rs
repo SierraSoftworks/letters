@@ -9,7 +9,7 @@ use std::iter;
 use std::rc::Rc;
 
 use accesskit::Role;
-use letters_layout::{DocLayout, Fonts, Palette, Uncovered};
+use letters_layout::{DocLayout, Fonts, Palette, Uncovered, WordList};
 use letters_model::{
     Block, BlockId, BlockKind, Body, Document, Note, NoteKind, Pos, Run, Selection, Style, TextStyle as Type, Version,
 };
@@ -26,6 +26,7 @@ use crate::text::{TextShaper, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::widgets::{Button, ControlSize, Popover, TextField};
 use crate::window::{Message, PT};
+use crate::words::WordLists;
 
 /// How far a marker stands from the text, how tall it is, and the room it keeps from the edge of the page
 /// area.
@@ -244,6 +245,8 @@ pub(crate) struct Said {
     layout: Option<DocLayout>,
     /// The faces of the system that back the fonts up, for a layout made after they came.
     backup: Fonts,
+    /// The word lists, for a layout made after they came.
+    lists: WordLists,
     /// What was last set: the note, how many replies it had, how wide and in which colours.
     of: Option<(String, usize, f32, Palette)>,
     spoken: Vec<Rc<Spoken>>,
@@ -268,6 +271,22 @@ impl Said {
         self.layout.as_mut().map(DocLayout::take_uncovered).unwrap_or_default()
     }
 
+    /// Takes the word list of a script. Returns whether what a note says may now be set otherwise: the
+    /// layout holds only what it set last, so whatever was set counts.
+    pub fn add_word_list(&mut self, list: WordList, data: &Rc<[u8]>) -> bool {
+        if !self.lists.keep(list, data) {
+            return false;
+        }
+        let Some(layout) = &mut self.layout else { return false };
+        layout.add_word_list(list, data);
+        self.of.take().is_some()
+    }
+
+    /// The scripts that notes set without their word list since this was last asked.
+    pub fn take_unlisted(&mut self) -> Vec<WordList> {
+        self.layout.as_mut().map(DocLayout::take_unlisted).unwrap_or_default()
+    }
+
     /// What a note says and each reply to it, set `width` wide. They are set again only when they change.
     pub fn of(&mut self, note: &Note, width: f32, palette: Palette) -> &[Rc<Spoken>] {
         let of = (note.id.clone(), note.replies.len(), width, palette);
@@ -276,6 +295,7 @@ impl Said {
             let layout = self.layout.get_or_insert_with(|| {
                 let mut layout = DocLayout::new(fonts.clone());
                 layout.add_fallback_fonts(&self.backup);
+                self.lists.hand(&mut layout);
                 layout
             });
             // A shell whose fonts come one after another may hold more by now.

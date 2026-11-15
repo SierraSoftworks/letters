@@ -157,6 +157,7 @@ console.log(`${"What the browser downloads".padEnd(24)}${["as served", "gzip", "
 downloads.forEach(([label, files]) => row(label, ...download(files)));
 row("for the first frame", ...download(downloads.flatMap(([, files]) => files)));
 later.forEach(([label, files]) => row(label, ...download(files)));
+readdirSync(join(dist, "words")).forEach((file) => row(`words/${file}`.slice(0, 22), ...download([read("words", file)])));
 fallback.forEach((file) => row(`fallback/${file}`.slice(0, 22), ...download([read("fallback", file)])));
 console.log("What the wasm holds");
 row("code", size(10));

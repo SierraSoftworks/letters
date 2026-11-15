@@ -204,11 +204,6 @@ fn area(window: &mut Harness) -> Rect {
     window.controls().into_iter().find(|found| found.role == Role::Document).expect("a page").bounds
 }
 
-/// Whether `inner` shows whole between the left and right edges of `outer`.
-fn across(inner: Rect, outer: Rect) -> bool {
-    inner.x >= outer.x && inner.x + inner.width <= outer.x + outer.width
-}
-
 /// The versions the panel lists, newest first.
 fn versions(window: &mut Harness) -> Vec<Found> {
     window.controls().into_iter().filter(|found| found.role == Role::ListBoxOption).collect()
@@ -346,8 +341,6 @@ fn tool(window: &mut Harness) -> Option<bool> {
 type Open = fn() -> Harness;
 /// A way of picking the version that is so many back from the newest.
 type Pick = fn(&mut Harness, usize);
-/// How far into the page area a press is, given how much of the earlier version shows at its left.
-type Reach = fn(f32) -> f32;
 
 const PICKS: [(&str, Pick); 3] = [
     ("a press on the strip", |window, back| {
@@ -613,7 +606,7 @@ fn a_version_shows_what_it_changed_from_the_version_before_it() {
     let document = window.markdown();
     // What is said of each block that differs, and some of what the block reads.
     let expected = [
-        ("After, by Alice Moreau, Tuesday 16:42", "This plan keeps them in order."),
+        ("Changed by Alice Moreau", "This plan keeps them in order."),
         ("Added: and the lead flashing", "battens and the lead flashing."),
         ("Removed by Alice Moreau", PLAN[4]),
         ("Removed: joists are sound, so the", "The joists are sound, so the new floor"),
@@ -625,9 +618,9 @@ fn a_version_shows_what_it_changed_from_the_version_before_it() {
     for ((said, reads), (says, holds)) in found.iter().zip(expected) {
         assert!(said == says && reads.contains(holds), "{said:?} of {reads:?}, for {says:?} of {holds:?}");
     }
-    // The paragraph that was rewritten shows as it read before as well, under the name of who wrote that.
+    // The paragraph that was rewritten shows as it read before as well.
     let before = before(&mut window).expect("the paragraph as it read before");
-    assert_eq!(before.name, "Before, by Sam Okafor, Tuesday 11:30");
+    assert_eq!(before.name, "Before");
     assert_eq!(before.value.as_deref(), Some(PLAN[1]));
     let [gone, came] = marked(&mut window);
     assert!(gone >= 2 && came >= 2, "words of both versions are marked: {gone} and {came}");
@@ -638,23 +631,44 @@ fn a_version_shows_what_it_changed_from_the_version_before_it() {
 }
 
 #[test]
-fn what_only_one_version_has_lies_in_a_band_across_the_page() {
+fn what_a_version_took_out_and_what_it_put_in_lie_in_bands_across_the_page() {
     let mut window = plan();
+    window.resize(1280.0, 1400.0);
     let area = area(&mut window);
     let [gone, came] = bands(&mut window);
-    // The band of each version's colour, and the last paragraph of what only that version has.
-    for (name, bands, holds) in [("taken out", gone, PLAN[4]), ("added", came, HERS[5])] {
-        let [band] = bands[..] else { panic!("{name}: one stretch lies in one band, not {bands:?}") };
-        assert!(band.x <= area.x && band.x + band.width >= area.x + area.width, "{name}: from edge to edge");
-        // What the band holds is the stretch: its last line is the paragraph's.
-        let line = lines(&mut window, band).pop().expect("text in the band");
-        let at = ends(area, line)[0];
-        window.advance(2_000).click_at(at).click_at(at).click_at(at).key("Mod+C");
-        assert_eq!(copied(&window), Some(holds), "{name}");
+    // The bands of each colour down the page, and the last paragraph each holds: the rewritten paragraph
+    // as its version has it, then the stretch that only that version has.
+    for (name, bands, holds) in [("taken out", gone, [PLAN[1], PLAN[4]]), ("added", came, [HERS[0], HERS[5]])] {
+        assert_eq!(bands.len(), holds.len(), "{name}: a band for the paragraph and one for the stretch: {bands:?}");
+        for (band, holds) in bands.into_iter().zip(holds) {
+            assert!(band.x <= area.x && band.x + band.width >= area.x + area.width, "{name}: from edge to edge");
+            // What the band holds is its last line's paragraph.
+            let line = lines(&mut window, band).pop().expect("text in the band");
+            let at = ends(area, line)[0];
+            window.advance(2_000).click_at(at).click_at(at).click_at(at).key("Mod+C");
+            assert_eq!(copied(&window), Some(holds), "{name}");
+        }
     }
     let [gone, came] = bands(&mut window);
-    let (gone, came) = (gone[0], came[0]);
-    assert!(gone.y + gone.height <= came.y, "down the page as the stretches are: {gone:?} and {came:?}");
+    for (gone, came) in gone.into_iter().zip(came) {
+        assert!(gone.y + gone.height <= came.y, "what was taken out first: {gone:?} and {came:?}");
+    }
+}
+
+#[test]
+fn a_rewritten_block_reads_as_it_did_right_over_how_it_reads_now_whatever_the_room() {
+    for width in [1720.0, 1440.0, 900.0] {
+        let mut window = plan();
+        window.resize(width, 800.0);
+        let (area, before) = (area(&mut window), before(&mut window).expect("the earlier version").bounds);
+        let [gone, came] = bands(&mut window);
+        let (gone, came) = (gone[0], came[0]);
+        assert!(gone.y > area.y, "{width}: under the heading, which both versions have");
+        assert_eq!(gone.y + gone.height, came.y, "{width}: the two stand together, the earlier one on top");
+        assert!(gone.width >= area.width && came.width >= area.width, "{width}: neither stands beside the other");
+        // The band of what was taken out is where the paragraph is told as it read before.
+        assert!((before.y - gone.y).abs() < 1.0 && (before.height - gone.height).abs() < 1.0, "{width}: {before:?}");
+    }
 }
 
 #[test]
@@ -683,12 +697,12 @@ fn a_version_compared_with_the_document_shows_what_has_changed_since() {
     window.click(Role::ListBoxOption, "11:30").click(Role::RadioButton, "Current");
     let found = differing(&mut window);
     let says = |said: &str, holds: &str| found.iter().any(|(told, reads)| told == said && reads.contains(holds));
-    assert!(says("After, by Sam Okafor, Today 09:12", "This plan keeps them in order."), "{found:?}");
+    assert!(says("Changed later", "This plan keeps them in order."), "{found:?}");
     assert!(says("Removed later", PLAN[4]), "{found:?}");
     assert!(says("Added later", "Budget"), "{found:?}");
     // The version that is picked is the earlier of the two.
     let before = before(&mut window).expect("the paragraph as the picked version has it");
-    assert_eq!(before.name, "Before, by Sam Okafor, Tuesday 11:30");
+    assert_eq!(before.value.as_deref(), Some(PLAN[1]));
 
     // What comes in while it shows is part of the document it is compared with.
     merge(&mut window, "Alice Moreau", SUNDAY + 9 * HOUR + 40 * MINUTE, "8,400", "9,100");
@@ -722,46 +736,6 @@ fn a_version_with_nothing_to_compare_it_with_shows_as_it_read() {
         if !expected.is_empty() {
             assert_eq!(shown(&mut window), expected, "{name}: only what the version itself has shows");
         }
-    }
-}
-
-#[test]
-fn both_versions_of_a_rewritten_block_stand_side_by_side_while_the_window_has_room_for_them() {
-    // How wide the window is, whether the earlier version shows whole, and whether it takes the page's
-    // whole width, as the upper one of a stack does.
-    let cases = [(1720.0, true, false), (1440.0, false, false), (900.0, true, true)];
-    for (width, whole, stacked) in cases {
-        let mut window = plan();
-        window.resize(width, 800.0);
-        let (area, before) = (area(&mut window), before(&mut window).expect("the earlier version").bounds);
-        assert_eq!(across(before, area), whole, "{width}: {before:?} in {area:?}");
-        assert_eq!(before.width > 0.9 * area.width, stacked, "{width}: {before:?} in {area:?}");
-        assert!(before.y > area.y, "{width}: under the heading, which both versions have");
-    }
-}
-
-#[test]
-fn a_version_the_window_cuts_off_comes_across_when_it_is_pressed() {
-    // Where the press is: how far into the page area from its left edge, given how much of the earlier
-    // version shows there.
-    let ways: [(&str, Reach); 2] = [
-        ("what shows of the version", |showing| showing / 2.0),
-        ("the round button at the window's edge", |_| tokens::SPACE_LG + 16.0),
-    ];
-    for (way, across_to) in ways {
-        let mut window = plan();
-        window.resize(1440.0, 800.0);
-        let whole = |window: &mut Harness| across(before(window).expect("the earlier version").bounds, area(window));
-        assert!(!whole(&mut window), "{way}: the later version is the one that shows whole at first");
-
-        let (area, before) = (area(&mut window), before(&mut window).expect("the earlier version").bounds);
-        let x = area.x + across_to(before.x + before.width - area.x);
-        window.click_at(Point { x, y: before.y + before.height / 2.0 });
-        window.advance(16).advance(400);
-        assert!(whole(&mut window), "{way}: the pair slid across");
-        // Another version starts with its later side whole again.
-        window.key("Right").key("Left");
-        assert!(!whole(&mut window), "{way}");
     }
 }
 
@@ -1120,24 +1094,28 @@ fn each_version_of_a_rewritten_block_is_copied_as_that_version_reads() {
     // Whether the drag ends in the block it began in, or far down the page.
     for beyond in [false, true] {
         let mut window = plan();
-        window.resize(1720.0, 800.0);
-        let (area, before) = (area(&mut window), before(&mut window).expect("the earlier version").bounds);
-        // The line at the head of the earlier version says whose it is, over its text.
+        window.resize(1280.0, 1400.0);
+        let area = area(&mut window);
+        let [gone, came] = bands(&mut window);
+        let (before, after) = (gone[0], came[0]);
+        // The line in the band of the earlier version says what it is, over its text.
         let down = lines(&mut window, before);
         let (first, last) = (down[1], if beyond { area.y + area.height - 2.0 } else { down[down.len() - 1] });
         window.press_at(ends(before, first)[0]).release_at(ends(before, last)[1]);
         let tool = window.find(Role::Button, "Copy").expect("the tool that copies").bounds;
-        assert!(tool.y > first, "the line that says whose version it is stays to be read: {tool:?}");
+        assert!(tool.y > first, "the line that says which version it is stays to be read: {tool:?}");
         window.key("Mod+C");
         assert_eq!(copied(&window), Some(PLAN[1]), "the earlier version, and no more than its block shows of it");
 
-        // The later version stands beside it, where the page goes on above and below.
-        let beside = Rect { x: before.x + before.width + 24.0, ..before };
-        window.press_at(ends(beside, first)[0]).release_at(ends(beside, down[down.len() - 1])[1]).key("Mod+C");
+        // The later version stands under it, where the page goes on.
+        let down = lines(&mut window, after);
+        let (first, last) = (down[1], down[down.len() - 1]);
+        window.advance(2_000);
+        window.press_at(ends(after, first)[0]).release_at(ends(after, last)[1]).key("Mod+C");
         assert_eq!(copied(&window), Some(HERS[0]), "the later version");
         // A while later, so that the press is not the second of two.
         window.advance(2_000);
-        window.press_at(ends(beside, first)[0]).release_at(ends(area, area.y + area.height - 2.0)[1]).key("Mod+C");
+        window.press_at(ends(after, first)[0]).release_at(ends(area, area.y + area.height - 2.0)[1]).key("Mod+C");
         let all = copied(&window).expect("a passage down to the end of the page");
         assert!(all.starts_with(HERS[0]) && all.ends_with(HERS[5]), "the page, from the later version on: {all}");
     }
@@ -1147,30 +1125,11 @@ fn each_version_of_a_rewritten_block_is_copied_as_that_version_reads() {
     write(&mut window, SUNDAY + HOUR, "roof comes", "slates come");
     write(&mut window, SUNDAY + HOUR, "floor follows", "kitchen is last");
     window.platform.wall = Some(SUNDAY + 2 * HOUR);
-    window.resize(1720.0, 800.0);
     window.click(Role::Button, "History");
     let (area, before) = (area(&mut window), before(&mut window).expect("the earlier version").bounds);
     let first = lines(&mut window, before)[1];
     window.press_at(ends(before, first)[0]).release_at(ends(area, area.y + area.height - 2.0)[1]).key("Mod+C");
     assert_eq!(copied(&window), Some("The roof comes first."));
-}
-
-#[test]
-fn a_press_that_brings_a_version_across_selects_nothing() {
-    let mut window = plan();
-    window.resize(1440.0, 800.0);
-    let (area, before) = (area(&mut window), before(&mut window).expect("the earlier version").bounds);
-    let showing = Rect { x: area.x, width: before.x + before.width - area.x, ..before };
-    let line = lines(&mut window, before)[1];
-    window.press_at(ends(showing, line)[0]).release_at(ends(showing, line)[1]);
-    window.advance(16).advance(400);
-    assert_eq!(tool(&mut window), None, "the press brought the earlier version across");
-
-    // Once it shows whole, a drag over it selects in it.
-    let before = self::before(&mut window).expect("the earlier version").bounds;
-    let down = lines(&mut window, before);
-    window.press_at(ends(before, down[1])[0]).release_at(ends(before, down[down.len() - 1])[1]).key("Mod+C");
-    assert_eq!(copied(&window), Some(PLAN[1]));
 }
 
 #[test]

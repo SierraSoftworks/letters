@@ -54,6 +54,7 @@ mod tree;
 mod ui;
 pub mod widgets;
 mod window;
+mod words;
 
 pub use accesskit::Role;
 pub use callouts::Calling;
@@ -64,7 +65,7 @@ pub use element::{Cursor, Element, Fitted, Paint, Pointer};
 pub use finding::{Finding, Way};
 pub use icon::Icon;
 pub use importing::{ImportFolder, ImportKind, ImportOffer};
-pub use letters_layout::Uncovered;
+pub use letters_layout::{Uncovered, WordList};
 pub use opening::{Folder, Landing, Location, Recent, Request};
 pub use pictures::PictureState;
 pub use restyle::StyleEdit;

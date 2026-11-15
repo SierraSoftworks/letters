@@ -10,9 +10,9 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 
 use js_sys::{Array, Date, Map, Uint8Array};
-use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with};
+use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with_words};
 use letters_format::{ASSETS, Archive, Error, MIMETYPE, OPLOG, Package};
-use letters_layout::{Fonts, Uncovered};
+use letters_layout::{Fonts, Uncovered, WordList};
 use letters_model::{Document, Notes, Style};
 use letters_render::Font;
 
@@ -41,13 +41,19 @@ use faces::{Face, chosen, has, lacking as wanted};
 thread_local! {
     /// The faces that back up the fonts, as far as the page has fetched them.
     static BACKUPS: RefCell<Vec<(Face, Font)>> = const { RefCell::new(Vec::new()) };
+    /// The word lists of the scripts written without spaces, as far as the page has fetched them.
+    static WORDS: RefCell<Vec<(WordList, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Takes a face that backs up the fonts, which the page fetched, by the name of its file.
+/// Takes a file the page fetched because a document needed it, by its name: a face that backs up the
+/// fonts, or the word list of a script.
 #[wasm_bindgen]
 pub fn backup(name: &str, file: Vec<u8>) {
     let face = Face::ALL.into_iter().find(|face| face.file() == name);
-    BACKUPS.with_borrow_mut(|backups| backups.extend(face.map(|face| (face, Font::new(file.into(), 0)))));
+    match WordList::ALL.into_iter().find(|list| list.file() == name) {
+        Some(list) => WORDS.with_borrow_mut(|words| words.push((list, file))),
+        None => BACKUPS.with_borrow_mut(|backups| backups.extend(face.map(|face| (face, Font::new(file.into(), 0))))),
+    }
 }
 
 /// Writes a document in another format, from its `document.json`, `style.json` and `notes.json`. `format`
@@ -60,7 +66,8 @@ pub fn backup(name: &str, file: Vec<u8>) {
 ///
 /// Returns the file's name, its media type and its bytes. The name is `title` as a file can be called,
 /// and `undefined` when nothing of the title can name a file. A PDF also tells the files of the faces it
-/// would have set characters in that are shown as boxes, had [`backup`] handed them over.
+/// would have set characters in that are shown as boxes, and of the word lists its lines would have ended
+/// by, had [`backup`] handed them over.
 #[wasm_bindgen]
 #[allow(clippy::too_many_arguments, reason = "the arguments cross from the page one by one")]
 pub fn exported(
@@ -95,7 +102,16 @@ pub fn exported(
                 wanted(&chosen(told, &had, lacks), &had).iter().for_each(|face| _ = lacking.push(&face.file().into()));
                 Fonts { faces }
             };
-            (to_pdf_with(&document, &style, fonts, &mut asset, &info, &mut backups)?, "pdf", "application/pdf")
+            let mut words = |list: WordList| {
+                let held =
+                    WORDS.with_borrow(|words| words.iter().find(|(held, _)| *held == list).map(|held| held.1.clone()));
+                if held.is_none() {
+                    lacking.push(&list.file().into());
+                }
+                held
+            };
+            let pdf = to_pdf_with_words(&document, &style, fonts, &mut asset, &info, &mut backups, &mut words)?;
+            (pdf, "pdf", "application/pdf")
         }
         "docx" => (
             to_docx(&document, &style, &Notes::from_json(notes)?, title, &mut asset),

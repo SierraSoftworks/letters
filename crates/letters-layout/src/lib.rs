@@ -404,7 +404,8 @@ impl DocLayout {
 
     /// The position at a point, or the nearest to it, among what a stretch of the column holds.
     pub(crate) fn hit_in(&self, point: Point, band: (f32, f32)) -> Option<Pos> {
-        self.state.borrow_mut().hit(point, Some(band))
+        let mut state = self.state.borrow_mut();
+        state.hit(point, Some(band)).map(|stop| state.unsided(stop))
     }
 
     /// Emits the part of the document that falls inside `viewport`.
@@ -475,13 +476,37 @@ impl DocLayout {
 
     /// The position nearest to a point: in the nearest text, or on a picture of a gallery. `None` when the
     /// document holds neither.
+    ///
+    /// Past the end of a line that wraps, this is the last place that is on that line alone: before the space
+    /// it wraps at, or before its last character when it wraps with no space. To put a caret, use
+    /// [`DocLayout::hit_sided`].
     pub fn hit(&self, point: Point) -> Option<Pos> {
+        let mut state = self.state.borrow_mut();
+        state.hit(point, None).map(|stop| state.unsided(stop))
+    }
+
+    /// [`DocLayout::hit`] for a caret, which can be at the end of any line.
+    ///
+    /// Where a line wraps with no space to wrap at, as in a long word, after a hyphen and in the scripts
+    /// written without spaces, one place is the end of that line and the start of the next. The flag tells
+    /// the two apart: it is set for a position that is the end of the line before the wrap, which is what a
+    /// point past that line's end gives. A line that wraps at a space ends before the space, and no flag is
+    /// set for it. [`DocLayout::caret_sided`], [`DocLayout::line_step_sided`] and
+    /// [`DocLayout::line_edge_sided`] take the flag with the position.
+    pub fn hit_sided(&self, point: Point) -> Option<(Pos, bool)> {
         self.state.borrow_mut().hit(point, None)
     }
 
     /// Where a caret at `pos` is drawn. An offset where a line wraps belongs to the start of the next line.
     pub fn caret(&self, pos: &Pos) -> Option<Rect> {
-        self.state.borrow_mut().caret(pos)
+        self.state.borrow_mut().caret(pos, false)
+    }
+
+    /// Where a caret at `pos` is drawn that has the side [`DocLayout::hit_sided`] tells of: with
+    /// `before_wrap`, at the end of the line that wraps at `pos`. The flag changes nothing at a place where
+    /// no line wraps, or where one wraps at a space, so one left over from before an edit does no harm.
+    pub fn caret_sided(&self, pos: &Pos, before_wrap: bool) -> Option<Rect> {
+        self.state.borrow_mut().caret(pos, before_wrap)
     }
 
     /// Where the formula at `pos` is drawn: the one `pos` is in or beside, in a line of text or as a block of
@@ -535,15 +560,33 @@ impl DocLayout {
     }
 
     /// The position one visual line above or below `pos`, keeping to the horizontal position `x`. `None` on
-    /// the document's first or last line.
+    /// the document's first or last line. For a caret, see [`DocLayout::line_step_sided`].
     pub fn line_step(&self, pos: &Pos, x: f32, down: bool) -> Option<Pos> {
-        self.state.borrow_mut().line_step(pos, x, down)
+        let mut state = self.state.borrow_mut();
+        state.line_step(pos, false, x, down).map(|stop| state.unsided(stop))
     }
 
-    /// The start or the end of the visual line that holds `pos`. The end of a wrapped line is before the space
-    /// it wraps at, which is where a caret still draws on that line.
+    /// [`DocLayout::line_step`] for a caret with the side [`DocLayout::hit_sided`] tells of. The line stepped
+    /// from is the one that wraps at `pos` if `before_wrap`, and the answer has its side: an `x` past the end
+    /// of a line that wraps with no space leads to that line's end.
+    pub fn line_step_sided(&self, pos: &Pos, before_wrap: bool, x: f32, down: bool) -> Option<(Pos, bool)> {
+        self.state.borrow_mut().line_step(pos, before_wrap, x, down)
+    }
+
+    /// The start or the end of the visual line that holds `pos`, which for a line read from the right are at
+    /// its right and its left. The end of a wrapped line is the last place on that line alone, as for
+    /// [`DocLayout::hit`]. For a caret, see [`DocLayout::line_edge_sided`].
     pub fn line_edge(&self, pos: &Pos, end: bool) -> Option<Pos> {
-        self.state.borrow_mut().line_edge(pos, end)
+        let mut state = self.state.borrow_mut();
+        state.line_edge(pos, false, end).map(|stop| state.unsided(stop))
+    }
+
+    /// [`DocLayout::line_edge`] for a caret with the side [`DocLayout::hit_sided`] tells of. The line is the
+    /// one that wraps at `pos` if `before_wrap`, and the answer has its side: the end of a line that wraps
+    /// with no space is after its last character, with the flag set. So End pressed twice stays put, and Home
+    /// from there goes back to the start of that line.
+    pub fn line_edge_sided(&self, pos: &Pos, before_wrap: bool, end: bool) -> Option<(Pos, bool)> {
+        self.state.borrow_mut().line_edge(pos, before_wrap, end)
     }
 
     /// Replaces height estimates with real layouts: first for the blocks `viewport` shows, then outwards from
@@ -562,6 +605,10 @@ impl DocLayout {
 const PARTS: u32 = 32;
 const FRAME: u64 = 1 << 63;
 const TABLE: u64 = 1 << 62;
+
+/// A position and whether it is the end of the line that wraps there, where that place also starts the
+/// next line.
+type Stop = (Pos, bool);
 
 /// Where a block's positions are: a leaf, and the part of it that shows the block.
 #[derive(Clone, Copy)]
@@ -1340,7 +1387,7 @@ impl State {
         self.clock += 1;
         self.lay(at);
         let leaf = &self.leaves[at];
-        let line = Text::of(leaf, part).map_or(0, |text| leaf::line_of(text.set, pos.offset));
+        let line = Text::of(leaf, part).map_or(0, |text| leaf::line_of(text.set, pos.offset, false));
         let line = leaf.line_of(part, line);
         pages.sheets.partition_point(|sheet| sheet.first <= (at, line)).checked_sub(1)
     }
@@ -1418,8 +1465,9 @@ impl State {
         headings
     }
 
-    /// The position at a point, among the leaves of a stretch of the column if `band` gives one.
-    fn hit(&mut self, point: Point, band: Option<(f32, f32)>) -> Option<Pos> {
+    /// The position at a point and whether it is the end of the line that wraps there, among the leaves of a
+    /// stretch of the column if `band` gives one.
+    fn hit(&mut self, point: Point, band: Option<(f32, f32)>) -> Option<Stop> {
         self.clock += 1;
         self.place_all();
         let (first, end) = match band {
@@ -1445,16 +1493,26 @@ impl State {
         self.find(at, part, |text, shifts| leaf::hit(text, shifts, point))
     }
 
-    /// A position in a part of a laid leaf: where `offset` says in its text, or on it when it is a picture.
-    fn find(&mut self, at: usize, part: Part, offset: impl FnOnce(&Text<'_>, &Shifts) -> usize) -> Option<Pos> {
+    /// A position in a part of a laid leaf: where `stop` says in its text, with the side it says, or on it
+    /// when it is a picture.
+    fn find(&mut self, at: usize, part: Part, stop: impl FnOnce(&Text<'_>, &Shifts) -> (usize, bool)) -> Option<Stop> {
         let shifts = self.shifts(at, part);
         let leaf = &self.leaves[at];
         let block = leaf.owner(part)?.clone();
-        let offset = Text::of(leaf, part).map_or(0, |text| offset(&text, &shifts));
-        Some(Pos { block, offset })
+        let (offset, before_wrap) = Text::of(leaf, part).map_or((0, false), |text| stop(&text, &shifts));
+        Some((Pos { block, offset }, before_wrap))
     }
 
-    fn caret(&mut self, pos: &Pos) -> Option<Rect> {
+    /// A stop for a caller that takes a position alone. One that ends a line where the next begins goes back
+    /// before that line's last character, which is the last place on the line that needs no side.
+    fn unsided(&self, (pos, before_wrap): Stop) -> Pos {
+        let text = self.index.get(&pos.block).filter(|_| before_wrap);
+        let text = text.and_then(|slot| Text::of(&self.leaves[slot.leaf], slot.part));
+        let offset = text.map_or(pos.offset, |text| leaf::back(text.set, pos.offset));
+        Pos { offset, ..pos }
+    }
+
+    fn caret(&mut self, pos: &Pos, before_wrap: bool) -> Option<Rect> {
         let Slot { leaf: at, part } = *self.index.get(&pos.block)?;
         self.clock += 1;
         self.lay(at);
@@ -1470,7 +1528,7 @@ impl State {
         if leaf.what == What::Empty {
             return Some(Rect::new(leaf.x, leaf.y, theme::CARET, leaf.height));
         }
-        Some(leaf::caret(&Text::of(leaf, part)?, &shifts, pos.offset))
+        Some(leaf::caret(&Text::of(leaf, part)?, &shifts, pos.offset, before_wrap))
     }
 
     fn formula_rect(&mut self, pos: &Pos) -> Option<Rect> {
@@ -1628,11 +1686,11 @@ impl State {
         rects
     }
 
-    fn line_step(&mut self, pos: &Pos, x: f32, down: bool) -> Option<Pos> {
+    fn line_step(&mut self, pos: &Pos, before_wrap: bool, x: f32, down: bool) -> Option<Stop> {
         let Slot { leaf: at, part } = *self.index.get(&pos.block)?;
         self.clock += 1;
         self.lay(at);
-        if let Some(inside) = self.step_inside(at, part, pos.offset, x, down) {
+        if let Some(inside) = self.step_inside(at, part, (pos.offset, before_wrap), x, down) {
             return Some(inside);
         }
         // Off this leaf's edge: the nearest line of the next leaf that a position can be in.
@@ -1659,9 +1717,9 @@ impl State {
     }
 
     /// The position a line above or below one in a part of a leaf, when that is still in the leaf.
-    fn step_inside(&mut self, at: usize, part: Part, offset: usize, x: f32, down: bool) -> Option<Pos> {
+    fn step_inside(&mut self, at: usize, part: Part, from: (usize, bool), x: f32, down: bool) -> Option<Stop> {
         let leaf = &self.leaves[at];
-        let on = |picture: usize| Some(Pos { block: leaf.pictures.get(picture)?.id.clone(), offset: 0 });
+        let on = |picture: usize| Some((Pos { block: leaf.pictures.get(picture)?.id.clone(), offset: 0 }, false));
         let rows = leaf.pictures.last().map_or(0, |last| last.row + 1);
         if let Part::Picture(index) = part {
             let row = leaf.pictures.get(index)?.row;
@@ -1676,7 +1734,7 @@ impl State {
             };
         }
         let text = Text::of(leaf, part)?;
-        let line = leaf::line_of(text.set, offset);
+        let line = leaf::line_of(text.set, from.0, from.1);
         let lines = text.set.layout.len();
         match if down { Some(line + 1).filter(|next| *next < lines) } else { line.checked_sub(1) } {
             Some(line) => self.find(at, part, |text, shifts| leaf::on_line(text, shifts, line, x)),
@@ -1686,16 +1744,17 @@ impl State {
         }
     }
 
-    fn line_edge(&mut self, pos: &Pos, end: bool) -> Option<Pos> {
+    fn line_edge(&mut self, pos: &Pos, before_wrap: bool, end: bool) -> Option<Stop> {
         let Slot { leaf: at, part } = *self.index.get(&pos.block)?;
         self.clock += 1;
         self.lay(at);
         // A picture is a line of its own.
-        let Some(text) = Text::of(&self.leaves[at], part) else { return Some(pos.clone()) };
-        // Far off either side, which no marker reaches.
-        let x = if end { f32::MAX } else { f32::MIN };
-        let offset = leaf::on_line(&text, &Shifts::default(), leaf::line_of(text.set, pos.offset), x);
-        Some(Pos { block: pos.block.clone(), offset })
+        let Some(text) = Text::of(&self.leaves[at], part) else { return Some((pos.clone(), false)) };
+        // Far off either side, which no marker reaches. A line read from the right ends at its left.
+        let x = if end != text.source.rtl { f32::MAX } else { f32::MIN };
+        let line = leaf::line_of(text.set, pos.offset, before_wrap);
+        let (offset, before_wrap) = leaf::on_line(&text, &Shifts::default(), line, x);
+        Some((Pos { block: pos.block.clone(), offset }, before_wrap))
     }
 
     fn settle(&mut self, viewport: Rect, budget: usize) -> bool {
