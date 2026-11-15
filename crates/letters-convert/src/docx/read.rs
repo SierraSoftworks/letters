@@ -1005,7 +1005,7 @@ impl Reader<'_, '_> {
             let Some((place, start)) = self.locate(from) else { continue };
             let Some((_, end)) = self.locate(Spot { para: from.para, at: to }) else { continue };
             if let Some(Block { body: Body::Text(runs), .. }) = find(blocks, &place.block.clone()) {
-                mark(runs, start..end, Mark::Ref(target));
+                point(runs, start..end, &target);
             }
         }
     }
@@ -1076,8 +1076,12 @@ fn skip(runs: &mut Vec<Run>, mut bytes: usize) {
     runs.retain(|run| !run.text.is_empty());
 }
 
-/// Adds a mark to a passage of runs, cutting the runs it starts and ends in.
-fn mark(runs: &mut Vec<Run>, passage: Range<usize>, mark: Mark) {
+/// Makes a passage of runs a reference to a figure, cutting the runs it starts and ends in. A run refers to
+/// one figure, so a reference inside another gives way to it.
+fn point(runs: &mut Vec<Run>, passage: Range<usize>, figure: &BlockId) {
+    if passage.is_empty() {
+        return;
+    }
     let mut at = 0;
     let mut cut = Vec::with_capacity(runs.len() + 2);
     for run in runs.drain(..) {
@@ -1093,7 +1097,8 @@ fn mark(runs: &mut Vec<Run>, passage: Range<usize>, mark: Mark) {
         for pair in edges.windows(2).filter(|pair| pair[0] < pair[1]) {
             let mut piece = Run { text: run.text[pair[0]..pair[1]].to_owned(), ..run.clone() };
             if start + pair[0] >= passage.start && start + pair[1] <= passage.end {
-                piece.marks.insert(mark.clone());
+                piece.marks.retain(|held| !matches!(held, Mark::Ref(_)));
+                piece.marks.insert(Mark::Ref(figure.clone()));
             }
             cut.push(piece);
         }
