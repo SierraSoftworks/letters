@@ -1213,7 +1213,7 @@ impl EditorApp {
         }
 
         if let Some(bar) = self.drop {
-            list.items.push(Item::Fill { rect: bar, color: resolve(tokens::ACCENT, self.scheme, 1.0), radius: 2.0 });
+            list.items.push(Item::Fill { rect: bar, color: resolve(self.accent.base, self.scheme, 1.0), radius: 2.0 });
         }
         // A figure that is selected has a ring round its picture, and a selected picture is where the caret is.
         let ring = resolve(accent().base, self.scheme, 1.0);
