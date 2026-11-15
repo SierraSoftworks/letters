@@ -439,6 +439,14 @@ impl Ui<EditorApp> {
         &self.app().margin.notes
     }
 
+    /// Says that no comment can be written on this document and why, in a sentence that stands by
+    /// itself, or `None` once one can. A shell says it of a document whose notes it could not read, since
+    /// a comment added to those could not be saved. The Comment tool then shows the sentence in place of
+    /// its field.
+    pub fn refuse_comments(&mut self, why: Option<&str>) {
+        self.app_mut().margin.refused = why.map(str::to_owned);
+    }
+
     /// Hands over the notes of the document that was opened, or what a merge made of them.
     pub fn set_notes(&mut self, notes: Notes) {
         let app = self.app_mut();

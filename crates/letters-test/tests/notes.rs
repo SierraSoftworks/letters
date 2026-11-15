@@ -153,6 +153,25 @@ fn a_comment_is_written_under_its_passage_and_kept_as_a_note() {
 }
 
 #[test]
+fn a_document_that_takes_no_comments_says_why_in_place_of_the_field() {
+    let mut window = letter();
+    let why = "Comments cannot be added: this document's notes were written by a newer version of Letters.";
+    window.ui().refuse_comments(Some(why));
+    window.select("written quote").click(Role::Button, "Comment");
+    assert!(window.find(Role::TextInput, "Comment").is_none(), "nothing is typed that could not be kept");
+    let said = |found: &Found| {
+        found.role == Role::Status && [Some(found.name.as_str()), found.value.as_deref()].contains(&Some(why))
+    };
+    assert!(window.controls().iter().any(said), "the reason is there to read");
+    window.key("Escape").assert_closed(Role::Dialog, "New comment");
+    assert_eq!(kept(&mut window), []);
+
+    window.ui().refuse_comments(None);
+    comment(&mut window, "Reply", "Chased?");
+    assert_eq!(kept(&mut window).len(), 1, "once the shell says they can be, comments are written again");
+}
+
+#[test]
 fn a_comment_is_signed_and_reads_the_marks_markdown_writes() {
     let mut window = letter();
     comment(&mut window, "written quote", "due **Friday**, see [their email](https://a.example/m)");

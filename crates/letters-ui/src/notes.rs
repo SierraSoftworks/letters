@@ -14,6 +14,7 @@ use crate::color::{fade, resolve};
 use crate::element::Element;
 use crate::icon;
 use crate::style::{Align, Edges};
+use crate::text::TextStyle;
 use crate::tokens::{self, Scheme};
 use crate::widgets::{Button, ControlSize, Popover, Side, TextField};
 use crate::window::Message;
@@ -52,6 +53,8 @@ pub(crate) struct Margin {
     away: Option<Selection>,
     /// The comment being written: the passage it is about, and what is typed so far.
     draft: Option<(Anchor, String)>,
+    /// Why no comment can be written on this document, as the shell says.
+    pub refused: Option<String>,
 }
 
 impl Margin {
@@ -116,7 +119,7 @@ impl Margin {
     pub fn send(&mut self, model: &Model, id: String, created: String) -> bool {
         let Some((mut anchor, text)) = self.draft.take() else { return false };
         let content = inline(text.trim());
-        if content.is_empty() {
+        if content.is_empty() || self.refused.is_some() {
             return false;
         }
         anchor.pin(model);
@@ -166,9 +169,16 @@ impl Margin {
             .on_close(Message::Note(Noting::Away))
     }
 
-    /// The field the comment is written in, to hang under its passage.
+    /// The field the comment is written in, to hang under its passage. Where no comment can be written,
+    /// the reason hangs there in its place.
     pub fn field(&self) -> Option<Popover<Message>> {
         let (_, text) = self.draft.as_ref()?;
+        if let Some(why) = &self.refused {
+            let quiet = TextStyle::control().size(tokens::TEXT_SM);
+            let said = Element::paragraph(why.as_str(), quiet).fg(tokens::FG_MUTED).width(WIDTH).role(Role::Status);
+            let said = Popover::new(said).label("New comment").max_width(WIDTH + 2.0 * tokens::SPACE_MD + 2.0);
+            return Some(said.open(true).on_close(Message::Note(Noting::Drop)));
+        }
         let field = TextField::new("Comment", text)
             .placeholder("Comment on this")
             .size(ControlSize::Small)
