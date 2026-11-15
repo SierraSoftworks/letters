@@ -67,6 +67,8 @@ pub(crate) enum Act {
     AltText,
     /// Opens the card of the callout the caret is in.
     Callout,
+    /// Lists the languages the caret's code block can be in.
+    CodeLanguage,
     /// Shows the selected linked picture this once.
     Load,
     /// Shows the pictures of the selected one's host from now on.
@@ -156,7 +158,7 @@ const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> E
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 94] = [
+pub(crate) static ENTRIES: [Entry; 95] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -185,6 +187,7 @@ pub(crate) static ENTRIES: [Entry; 94] = [
     table("Align column right", "end", TableEdit::Align(ColumnAlign::End)),
     table("Turn header row on", "heading first", TableEdit::Header(true)),
     table("Turn header row off", "heading first", TableEdit::Header(false)),
+    entry("Code", "Change language", "syntax highlight colours colors", Act::CodeLanguage),
     entry("Callout", "Edit callout", "title icon colour color type", Act::Callout),
     callout("Info", "note blue", CalloutEdit::Tone(Tone::Info)),
     callout("Tip", "hint green", CalloutEdit::Tone(Tone::Tip)),

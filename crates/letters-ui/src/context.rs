@@ -180,6 +180,7 @@ fn icon_of(act: &Act) -> Option<Icon> {
             _ => return None,
         },
         Act::Link | Act::Callout => icon::PENCIL,
+        Act::CodeLanguage => icon::CODE_XML,
         Act::AltText => icon::EYE,
         Act::Pictures => icon::IMAGE,
         Act::Load => icon::CLOUD_DOWNLOAD,
@@ -373,7 +374,7 @@ impl Context {
                     MenuItem::new("Copy code").icon(icon::COPY).on_select(send(Contexting::CopyText(block.clone()))),
                     MenuItem::new("Copy as picture").icon(icon::IMAGE).on_select(send(Contexting::CopyPicture(block))),
                 ];
-                items.extend(about.items(&[run(Command::Indent), run(Command::Outdent)]));
+                items.extend(about.items(&[Act::CodeLanguage, run(Command::Indent), run(Command::Outdent)]));
                 menu = section(menu, "Code", items);
             }
             (Some(BlockKind::Formula), Some(block)) => {

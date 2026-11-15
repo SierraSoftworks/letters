@@ -26,6 +26,7 @@ pub mod icon;
 mod importing;
 mod input;
 mod insert;
+mod languages;
 mod layout;
 mod maths;
 mod merging;

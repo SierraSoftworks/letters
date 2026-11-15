@@ -28,7 +28,7 @@ use crate::tex::{self, Part};
 use crate::text::{Family, Shaped, TextShaper, TextStyle};
 use crate::theme::accent;
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::widgets::{Choice, Options, Popover};
+use crate::widgets::{Choice, Options, Popover, options};
 use crate::window::{CARET_WIDTH, Message};
 
 const TEXT: TextStyle = TextStyle::control().family(Family::Mono).size(tokens::TEXT_SM).leading(tokens::LEADING);
@@ -618,7 +618,8 @@ impl Maths {
             sheet = sheet.child(said.role(Role::Status));
         }
         if let Some((_, symbols)) = &symbols {
-            sheet = sheet.child(self.list(symbols, scheme)).child(hint());
+            let hint = options::hint("Matches commands and plain names", &["Tab", "Esc"]);
+            sheet = sheet.child(self.list(symbols, scheme)).child(hint);
         }
         Popover::new(sheet)
             .flush()
@@ -666,26 +667,6 @@ impl Maths {
         }
         options.into()
     }
-}
-
-/// The line under the list that says what it matches, and the keys that take a symbol or put the list away.
-fn hint() -> Element<Message> {
-    let quiet = TextStyle::control().size(tokens::TEXT_XS);
-    let key = |name: &str| {
-        Element::row()
-            .padding(Edges::xy(5.0, 1.0))
-            .radius(tokens::RADIUS_SM)
-            .bg(tokens::NEUTRAL_SOFT)
-            .child(Element::text(name, quiet).fg(tokens::FG_MUTED))
-    };
-    Element::row()
-        .align(Align::Center)
-        .gap(tokens::SPACE_XS)
-        .padding(Edges::xy(tokens::SPACE_XS, 0.0))
-        .child(Element::text("Matches commands and plain names", quiet).fg(tokens::FG_MUTED))
-        .child(Element::row().grow(1.0).min_width(tokens::SPACE_SM))
-        .child(key("Tab"))
-        .child(key("Esc"))
 }
 
 /// A symbol as its row of the list shows it, in the middle of the room it has.

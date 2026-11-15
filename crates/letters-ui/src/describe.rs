@@ -32,6 +32,7 @@ const HELD: u8 = 10;
 /// before it.
 const TABLE: [u8; 6] = [11, 12, 13, 14, 16, 17];
 const CALLOUT: u8 = 15;
+const LANGUAGE: u8 = 18;
 
 /// FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
 fn hashed(bytes: impl Iterator<Item = u8>) -> u64 {
@@ -330,6 +331,7 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
         }
         BlockKind::Figure { alt, .. } => alt.hash(&mut reads),
         BlockKind::Callout { .. } => block.kind.callout_look().map(|look| look.title.to_owned()).hash(&mut reads),
+        BlockKind::Code { language } => language.hash(&mut reads),
         _ => {}
     }
     block.body.runs().iter().for_each(|run| run.text.hash(&mut reads));
@@ -395,8 +397,13 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
                 part(CALLOUT, edit, &mut children);
             }
         }
-        BlockKind::Code { .. } if written => {
-            // The button in the corner of the box, which a click presses.
+        BlockKind::Code { language } if written => {
+            // The language named in the corner of the box, which a click lists the others for, and the
+            // button beside it, which a click presses.
+            let mut named = Node::new(Role::Button);
+            named.set_label(crate::languages::label(language.as_deref()));
+            named.add_action(Action::Click);
+            part(LANGUAGE, named, &mut children);
             let mut copy = Node::new(Role::Button);
             copy.set_label(crate::code_copy::LABEL);
             copy.add_action(Action::Click);
@@ -459,6 +466,8 @@ pub(crate) enum Request {
     Tick(BlockId),
     /// Copies a code block.
     Copy(BlockId),
+    /// Presses the language of a code block, which lists the languages it can be in.
+    Language(BlockId),
     /// Presses a callout's icon and title, which opens its card.
     Callout(BlockId),
     /// Turns the line under a figure's picture to its alt text.
@@ -497,6 +506,7 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
             let part = |part| doc.walk().find(|block| part_node(&block.id, part) == request.target_node);
             let ticked = part(TICK).map(|block| Request::Tick(block.id.clone()));
             let copied = || part(COPY).map(|block| Request::Copy(block.id.clone()));
+            let languaged = || part(LANGUAGE).map(|block| Request::Language(block.id.clone()));
             let switched = || part(ALT).map(|block| Request::Alt(block.id.clone()));
             let called = || part(CALLOUT).map(|block| Request::Callout(block.id.clone()));
             let noted = || part(NOTE).map(|block| Request::Note(block.id.clone()));
@@ -512,7 +522,7 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
                 })
             };
             let found = ticked.or_else(copied).or_else(switched).or_else(called).or_else(noted).or_else(broken);
-            found.or_else(chosen).or_else(tabled)
+            found.or_else(chosen).or_else(tabled).or_else(languaged)
         }
         _ => None,
     }
