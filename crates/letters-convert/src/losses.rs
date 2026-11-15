@@ -42,9 +42,6 @@ pub enum LossKind {
     Languages,
     /// Code blocks in a language, which Word neither names nor colours. A reader misses the colours.
     CodeLanguages,
-    /// Tables of contents, where a format writes none. Every format writes one now: Markdown as the list
-    /// it shows, a Word file as the field Word makes one from.
-    Contents,
     /// Link previews, where the format has no card: the link is written under its title, without the
     /// picture. A Word file frames what the card shows.
     LinkPreviews,
@@ -85,9 +82,11 @@ pub fn losses_with(doc: &Document, notes: &Notes, to: Target, loaded: &dyn Fn(&s
     let runs = || doc.walk().flat_map(|block| block.body.runs());
 
     let nested = || {
-        // Only what is one paragraph in Word can take a quote's style.
-        let kept =
-            |kind: &BlockKind| matches!(kind, BlockKind::Paragraph | BlockKind::ListItem { .. } | BlockKind::Formula);
+        // Only what is paragraphs in Word can take a quote's style, as the lines of a link preview do.
+        let kept = |kind: &BlockKind| {
+            use BlockKind::*;
+            matches!(kind, Paragraph | ListItem { .. } | Formula | LinkPreview { .. })
+        };
         let boxes = doc.walk().filter(|block| matches!(block.kind, BlockKind::Quote | BlockKind::Callout { .. }));
         boxes.flat_map(|outer| outer.body.blocks()).filter(|inner| !kept(&inner.kind)).count()
     };
@@ -183,7 +182,6 @@ impl fmt::Display for Loss {
             LossKind::CodeLanguages => {
                 write!(f, "{} colours", count("code block loses its", "code blocks lose their"))
             }
-            LossKind::Contents => write!(f, "{} left out", count("table of contents is", "tables of contents are")),
             LossKind::LinkPreviews => {
                 write!(f, "{}", count("link preview becomes a plain link", "link previews become plain links"))
             }
