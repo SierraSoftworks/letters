@@ -6,7 +6,7 @@ use std::ops::Range;
 use letters_model::{Block, BlockId, BlockKind, Body, BodyShape, ListKind, Mark, Op, Pos, Run, Selection};
 
 use crate::markers::Sides;
-use crate::{Caret, Editor, Kind, Motion, Platform, rules, text, tree};
+use crate::{Caret, Editor, Kind, Motion, Platform, rules, table, text, tree};
 
 /// Lists nest no deeper than this.
 const MAX_DEPTH: u8 = 8;
@@ -548,6 +548,12 @@ impl Editor {
             BlockKind::Code { .. } | BlockKind::Formula => {
                 self.insert("\n");
                 return Kind::Other;
+            }
+            // A line of cells between bars starts a table.
+            BlockKind::Paragraph if at_end && table::row(block).is_some() => {
+                self.table_rule(&id, platform);
+                self.rule = true;
+                return Kind::Rule;
             }
             BlockKind::Paragraph if at_end => {
                 // A fence opens code, and `$$` a formula.

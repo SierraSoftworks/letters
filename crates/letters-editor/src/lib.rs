@@ -15,6 +15,7 @@ mod merge;
 mod motion;
 mod parts;
 mod rules;
+mod table;
 mod text;
 mod tree;
 
@@ -31,6 +32,7 @@ pub use keymap::Keymap;
 pub use letters_model::{Marker, Markers};
 use merge::Kept;
 pub use motion::Lines;
+pub use table::{Cell, TableEdit};
 
 /// Text input, as every platform delivers it. Offsets are UTF-8 bytes relative to the caret's block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +139,14 @@ pub enum Command {
     SetBlock(BlockKind),
     /// Ticks or unticks the task under the caret.
     ToggleChecked,
+    /// Puts in a table of empty cells, its first row the header, and the caret in its first cell. It
+    /// follows the block the selection ends in, or takes the place of an empty line.
+    InsertTable {
+        rows: usize,
+        columns: usize,
+    },
+    /// Changes the table the caret is in. [`Editor::cell`] says where in it the caret is.
+    Table(TableEdit),
     Undo,
     Redo,
     SelectAll,
@@ -444,7 +454,7 @@ impl Editor {
             return match command {
                 Command::Undo => self.can_undo(),
                 Command::Redo => self.can_redo(),
-                Command::Paste | Command::PastePlain | Command::LineBelow => true,
+                Command::Paste | Command::PastePlain | Command::LineBelow | Command::InsertTable { .. } => true,
                 // The style and the document's own fields are there whether or not there is text.
                 Command::SetStyle { .. } | Command::SetPage(_) | Command::ReplaceStyle(_) => true,
                 Command::SetLanguage(_) | Command::AddWord(_) | Command::RemoveWord(_) => true,
@@ -467,6 +477,7 @@ impl Editor {
             Command::SetLink(_) => ranged || self.link().is_some(),
             Command::Copy | Command::Cut => ranged || caret.picture,
             Command::LeaveFormula => self.formula().is_some(),
+            Command::Table(_) => self.cell().is_some(),
             Command::Undo => self.can_undo(),
             Command::Redo => self.can_redo(),
             _ => true,
@@ -501,6 +512,8 @@ impl Editor {
             Command::SetLink(link) => self.set_link(link),
             Command::SetBlock(block) => self.set_block(block, platform),
             Command::ToggleChecked => self.toggle_checked(),
+            Command::InsertTable { rows, columns } => self.insert_table(rows, columns, platform),
+            Command::Table(edit) => self.table_edit(edit, platform),
             Command::Undo => _ = self.undo_step(),
             Command::Redo => self.redo_step(),
             Command::SelectAll => self.select_all(),

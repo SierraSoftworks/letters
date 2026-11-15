@@ -14,7 +14,9 @@
 
 use std::collections::BTreeSet;
 
-use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Marker, Modifiers, Platform};
+use letters_editor::{
+    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Marker, Modifiers, Platform, TableEdit,
+};
 use letters_model::{
     Align, Block, BlockId, BlockKind, Body, Change, Document, ListKind, Mark, Model, Pos, ReplicaId, Run, Selection,
     Tone,
@@ -593,6 +595,8 @@ pub fn action() -> impl Strategy<Value = Action> {
         "x",
         "1",
         ".",
+        "|",
+        "|",
         "\n",
     ]);
     let keys = prop::sample::select(vec![
@@ -663,6 +667,22 @@ pub fn action() -> impl Strategy<Value = Action> {
         Just(Command::AddWord("mot".into())),
         Just(Command::RemoveWord("mot".into())),
         Just(Command::SetLanguage("fr".into())),
+        Just(Command::InsertTable { rows: 2, columns: 2 }),
+        prop::sample::select(vec![
+            TableEdit::AddRow { below: true },
+            TableEdit::AddRow { below: false },
+            TableEdit::AddColumn { after: true },
+            TableEdit::AddColumn { after: false },
+            TableEdit::RemoveRow,
+            TableEdit::RemoveColumn,
+            TableEdit::MoveRow { to: 0 },
+            TableEdit::MoveRow { to: 2 },
+            TableEdit::MoveColumn { to: 0 },
+            TableEdit::MoveColumn { to: 2 },
+            TableEdit::Align(Align::Center),
+            TableEdit::Header(false),
+        ])
+        .prop_map(Command::Table),
     ];
     let composed = prop::sample::select(vec!["", "k", "か", "かな"]);
     let inputs = prop_oneof![
