@@ -220,6 +220,7 @@ impl DocLayout {
             loaded: HashMap::new(),
             caption: None,
             listing: false,
+            notes: HashMap::new(),
             scratch: Laid::default(),
         };
         Self { state: RefCell::new(state) }
@@ -609,6 +610,20 @@ impl DocLayout {
         self.state.borrow_mut().previews(viewport)
     }
 
+    /// Writes a line under the address of a link preview that has only its address: what a window has to
+    /// say of it, such as why it could not be fetched. It is set small and muted, on two lines at most, and
+    /// the card grows by it. `None` takes it away. The room [`PreviewBox::control`] names stays clear beside
+    /// both lines.
+    ///
+    /// A preview that shows what was fetched ignores its note, and shows it if it loses that again, so a
+    /// window takes the note away once it no longer holds. Only the screen shows it: a sheet leaves the
+    /// words out, though the card keeps their height there for as long as the note stands.
+    ///
+    /// Returns whether a card is laid out anew for it, which can move what is below.
+    pub fn set_preview_note(&mut self, block: &BlockId, note: Option<&str>) -> bool {
+        self.state.get_mut().set_preview_note(block, note)
+    }
+
     /// The rectangles that highlight a selection, one per line it touches.
     ///
     /// This lays out every block the selection covers. To paint, use [`DocLayout::selection_in`].
@@ -737,6 +752,8 @@ struct State {
     caption: Option<BlockId>,
     /// Whether the document has a table of contents, which reads what its headings say.
     listing: bool,
+    /// What a window has to say on a link preview that has only its address, by the preview's block.
+    notes: HashMap<BlockId, String>,
     /// A layout to measure with, so that measuring allocates nothing.
     scratch: Laid,
 }
@@ -832,7 +849,7 @@ impl State {
         let renumbered = numbers != self.numbers;
         self.numbers = numbers;
         let changed = carry.map(|change| &change.blocks);
-        let flow = flow::flow(doc, &self.types, &self.numbers, self.width, changed, |block| {
+        let flow = flow::flow(doc, &self.types, &self.numbers, &self.notes, self.width, changed, |block| {
             // A block inside a leaf, such as a cell, has no leaf to hand over.
             let at = index.get(block)?.leaf;
             (old[at].id.as_ref() == Some(block)).then(|| std::mem::take(&mut old[at]))
@@ -940,6 +957,29 @@ impl State {
         // A link preview fits its picture to its slot by the picture's size.
         let slotted = |leaf: &Leaf| leaf.image.as_deref() == Some(src);
         changed && self.leaves.iter().any(|leaf| slotted(leaf) || leaf.pictures.iter().any(shows))
+    }
+
+    fn set_preview_note(&mut self, block: &BlockId, note: Option<&str>) -> bool {
+        let note = note.map(str::trim).filter(|note| !note.is_empty());
+        match note {
+            Some(note) => self.notes.insert(block.clone(), note.to_owned()),
+            None => self.notes.remove(block),
+        };
+        let Some(&Slot { leaf: at, .. }) = self.index.get(block) else { return false };
+        let leaf = &mut self.leaves[at];
+        let card = leaf.kind.as_ref().filter(|_| leaf.what == What::Preview);
+        let Some(entries) = card.map(|kind| flow::card(kind, leaf.role, note)).filter(|said| *said != leaf.entries)
+        else {
+            return false;
+        };
+        // Its layout stays, and tells which of its lines still stand. It is given its height at once, since
+        // the window draws on it.
+        leaf.entries = entries;
+        if std::mem::take(&mut leaf.exact) {
+            self.pending += 1;
+        }
+        self.lay(at);
+        true
     }
 
     fn set_maths_links(&mut self, links: bool) {

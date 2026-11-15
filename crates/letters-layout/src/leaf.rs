@@ -985,8 +985,8 @@ impl Painter<'_> {
         let (mut number, mut opened) = (Layout::new(), false);
         for (index, (entry, set, at, height)) in stack(leaf, laid, self.types).enumerate() {
             let at = Point { x: leaf.x + at.x, y: leaf.y + at.y };
-            // A table with nothing to list says so only to whoever edits it.
-            let unsaid = name.is_some() && !card && entry.target.is_none();
+            // What is said only to whoever edits the document is not on a sheet.
+            let unsaid = name.is_some() && entry.aside;
             if unsaid || self.outside(at.y, at.y + height) {
                 continue;
             }

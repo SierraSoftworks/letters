@@ -1,7 +1,7 @@
 //! Link previews: the card, what it shows of the page it leads to, and the one link it is on a sheet.
 
-use letters_layout::{DocLayout, PreviewBox};
-use letters_model::Document;
+use letters_layout::{DocLayout, Palette, PreviewBox};
+use letters_model::{Document, Style};
 use letters_render::{Item, Rect};
 
 mod common;
@@ -130,6 +130,41 @@ fn a_preview_with_only_its_address_keeps_room_for_a_control() {
     let run_on = laid(&doc(vec![preview("v", &long, [None, None, None])]));
     let grown = self::card(&run_on).rect.height;
     assert!(grown < card.rect.height * 2.5, "an address that runs on is cut to a line or two: {grown}");
+}
+
+#[test]
+fn a_note_is_written_under_an_address_alone() {
+    const NOTE: &str = "Not fetched: the server answered 404";
+    let (id, muted, unfetched) = ("v".into(), Palette::LIGHT.marker, carded([None, None, None]));
+    let below = |layout: &DocLayout| layout.band(&"z".into()).expect("the paragraph under the card").0;
+    let mut layout = laid(&unfetched);
+    let (bare, page, under) = (card(&layout), painted(&layout, everything()), below(&layout));
+    assert!(inked(&page, muted).is_empty(), "nothing on the page is muted before");
+
+    assert!(layout.set_preview_note(&id, Some(NOTE)), "the card is laid out anew for a note");
+    assert!(!layout.set_preview_note(&id, Some(NOTE)), "and not for the same note again");
+    let (noted, items) = (card(&layout), painted(&layout, everything()));
+    let grown = noted.rect.height - bare.rect.height;
+    assert!(grown > 8.0, "the card grows by the note's line: {grown}");
+    assert!((below(&layout) - under - grown).abs() < 0.5, "and what is under it moves down as far");
+    assert!(!inked(&items, muted).is_empty(), "the note is written, muted");
+    let (was, control) = (bare.control.unwrap(), noted.control.expect("the control keeps its room"));
+    assert_eq!((control.x, control.width), (was.x, was.width), "where it was");
+    let text = reach(&items, noted.rect).expect("the card's text");
+    assert!(control.height > was.height && text.1 < control.x, "beside the note too: {text:?}, {control:?}");
+    assert!(!spelt(&layout).contains("Not fetched"), "a sheet shows the document");
+
+    // A layout that starts over, as at another width, still has it.
+    layout.update(&unfetched, &Style::default(), WIDTH - 120.0, None);
+    assert!(!inked(&painted(&layout, everything()), muted).is_empty(), "the note outlives a new layout");
+    layout.update(&unfetched, &Style::default(), WIDTH, None);
+    assert!(layout.set_preview_note(&id, None), "the card is laid out anew when the note goes");
+    assert!(painted(&layout, everything()) == page, "and the page is as it was");
+
+    let mut filled = laid(&carded([Some(TITLE), Some(SAID), None]));
+    let page = painted(&filled, everything());
+    assert!(!filled.set_preview_note(&id, Some(NOTE)), "a card that shows its page takes no note");
+    assert!(painted(&filled, everything()) == page, "and shows none");
 }
 
 #[test]

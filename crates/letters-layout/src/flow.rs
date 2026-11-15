@@ -290,6 +290,8 @@ pub(crate) struct Entry {
     pub clamp: usize,
     /// The heading a line of a table of contents leads to.
     pub target: Option<BlockId>,
+    /// Whether it speaks only to whoever edits the document. A sheet leaves it out.
+    pub aside: bool,
 }
 
 /// What a table of contents says while it has no heading to list.
@@ -308,16 +310,18 @@ fn unfetched(kind: &BlockKind) -> bool {
 }
 
 /// What a link preview says: the page's title, a few lines of what the page says of itself, and the host
-/// it is on. One that was never fetched has its address alone.
-fn card(kind: &BlockKind, role: Role) -> Vec<Entry> {
+/// it is on. One that was never fetched has its address alone, and under it the `note` a window has for
+/// it, such as why a fetch failed.
+pub(crate) fn card(kind: &BlockKind, role: Role, note: Option<&str>) -> Vec<Entry> {
     let BlockKind::LinkPreview { url, title, description, .. } = kind else { return Vec::new() };
     let said = |text: &str, role, ink, bold, clamp| {
         let rtl = text.chars().find_map(engine::reads).unwrap_or(false);
         let words = Words { rtl, ..Words::plain(text.trim().to_owned()) };
-        Entry { words, role, ink, bold, indent: 0.0, clamp, target: None }
+        Entry { words, role, ink, bold, indent: 0.0, clamp, target: None, aside: false }
     };
     if unfetched(kind) {
-        return vec![said(url, role, Ink::Link, false, 2)];
+        let note = note.map(|note| Entry { aside: true, ..said(note, Role::Caption, Ink::Marker, false, 2) });
+        return [said(url, role, Ink::Link, false, 2)].into_iter().chain(note).collect();
     }
     let host = Some(host(url)).filter(|host| !host.is_empty()).unwrap_or(url);
     let title = title.as_deref().map(|title| said(title, role, Ink::Style(role), true, 2));
@@ -1015,7 +1019,8 @@ pub(crate) fn numbers(blocks: &[Block], next: &mut u32, out: &mut Vec<(BlockId, 
     }
 }
 
-/// Lays the document out as a column `width` wide. `numbers` are those of its numbered figures.
+/// Lays the document out as a column `width` wide. `numbers` are those of its numbered figures, and `notes`
+/// what a window has to say on a link preview that has only its address.
 ///
 /// With `carry`, the leaves of the last column are kept: `old` hands over the leaf a block had, and `carry`
 /// names the blocks whose text has changed since, which are read again. A kept leaf brings its height and,
@@ -1024,13 +1029,14 @@ pub(crate) fn flow(
     doc: &Document,
     types: &Types,
     numbers: &HashMap<BlockId, u32>,
+    notes: &HashMap<BlockId, String>,
     width: f32,
     carry: Option<&BTreeSet<BlockId>>,
     old: impl FnMut(&BlockId) -> Option<Leaf>,
 ) -> Flow {
-    let out = Flow::default();
+    let (out, lang) = (Flow::default(), None);
     let mut walk =
-        Walk { doc, types, numbers, carry, old, out, pad: 0.0, breaks: false, root: 0, depth: 0, lang: None };
+        Walk { doc, types, numbers, notes, carry, old, out, pad: 0.0, breaks: false, root: 0, depth: 0, lang };
     walk.place(&doc.blocks, 0.0, width, None, false);
     walk.out
 }
@@ -1039,6 +1045,7 @@ struct Walk<'a, F> {
     doc: &'a Document,
     types: &'a Types,
     numbers: &'a HashMap<BlockId, u32>,
+    notes: &'a HashMap<BlockId, String>,
     carry: Option<&'a BTreeSet<BlockId>>,
     old: F,
     out: Flow,
@@ -1076,8 +1083,10 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
             _ => 1,
         };
         let shallowest = headings.iter().map(|heading| level(heading)).min().unwrap_or(1);
-        let line =
-            |words, ink, indent, target| Entry { words, role, ink, bold: false, indent, clamp: usize::MAX, target };
+        let line = |words, ink, indent, target: Option<BlockId>| {
+            let aside = target.is_none();
+            Entry { words, role, ink, bold: false, indent, clamp: usize::MAX, target, aside }
+        };
         if headings.is_empty() {
             return vec![line(Words::plain(UNLISTED.to_owned()), Ink::Marker, 0.0, None)];
         }
@@ -1310,7 +1319,10 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                 }
                 BlockKind::TableOfContents { .. } | BlockKind::LinkPreview { .. } => {
                     let (what, entries, image) = match &block.kind {
-                        BlockKind::LinkPreview { image, .. } => (What::Preview, card(&block.kind, role), image.clone()),
+                        BlockKind::LinkPreview { image, .. } => {
+                            let note = self.notes.get(&block.id).map(String::as_str);
+                            (What::Preview, card(&block.kind, role, note), image.clone())
+                        }
                         _ => (What::Contents, self.listed(block, role), None),
                     };
                     let (mut leaf, _) = self.leaf(block, what);
