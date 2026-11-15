@@ -4,7 +4,7 @@ mod common;
 
 use common::{Do, Do::K, Do::T, Harness, canon, clip};
 use letters_editor::Command;
-use letters_model::{BlockKind, Body, Document, Tone};
+use letters_model::{Block, BlockKind, Body, Document, Model, Pos, ReplicaId, Selection, Tone};
 
 const FIGURE: &str = "p one\nfig Boats\np two";
 const GALLERY: &str = "p one\ng> fig\ng> fig\ng> cap At sea\np two";
@@ -27,9 +27,9 @@ fn play(cases: &[(String, &[Do], &str)]) {
 
 /// The kinds of a document's blocks, with what each holds in brackets after it.
 fn outline(doc: &Document) -> String {
-    fn walk(blocks: &[letters_model::Block]) -> String {
+    fn walk(blocks: &[Block]) -> String {
         let name = |kind: &BlockKind| format!("{kind:?}").split([' ', '{']).next().unwrap_or_default().to_owned();
-        let one = |block: &letters_model::Block| match &block.body {
+        let one = |block: &Block| match &block.body {
             Body::Blocks(parts) => format!("{}({})", name(&block.kind), walk(parts)),
             _ => name(&block.kind),
         };
@@ -322,5 +322,89 @@ fn the_selected_figures_are_the_one_under_the_caret_or_those_a_range_takes() {
         let editor = Harness::new(&state);
         assert_eq!(editor.editor.figures().len(), count, "{state:?}");
         assert_eq!(editor.editor.picture().is_some(), state.contains("fig*"), "{state:?}");
+    }
+}
+
+/// Picks the blocks to take out of a document.
+type Gone = fn(&Block) -> bool;
+
+/// An editor on `state` with every block that `gone` picks taken out. Only a merge leaves a gallery, a
+/// table or a row with nothing in it, so the notation has no way to write one.
+fn left_without(state: &str, gone: Gone) -> Harness {
+    fn strip(blocks: &mut Vec<Block>, gone: Gone) {
+        blocks.retain(|block| !gone(block));
+        for block in blocks {
+            if let Body::Blocks(parts) = &mut block.body {
+                strip(parts, gone);
+            }
+        }
+    }
+    let (mut doc, selection) = common::parse(state);
+    strip(&mut doc.blocks, gone);
+    let mut editor = Harness::on(Model::new(doc, ReplicaId::from(1)), 1);
+    if let Some(selection) = selection {
+        editor.editor.select(selection);
+    }
+    editor
+}
+
+#[test]
+fn an_empty_gallery_or_table_holds_no_caret_and_goes_as_a_divider_does() {
+    let rows: Gone = |block| block.kind == BlockKind::TableRow;
+    let pictures: Gone = |block| matches!(block.kind, BlockKind::Figure { .. });
+    let emptied = [("p one\nr1> td x\np two", rows), ("p one\ng> fig\ng> fig\np two", pictures)];
+    let cases = [
+        // (the caret, the key, the text afterwards, whether the empty block is still there)
+        (("one", "one|"), "Right", "p one\np |two", true),
+        (("two", "|two"), "Left", "p one|\np two", true),
+        (("two", "|two"), "Backspace", "p one\np |two", false),
+        (("one", "one|"), "Delete", "p one|\np two", false),
+        (("two", "t|wo"), "Shift+Mod+Home", "p |one\np t^wo", true),
+    ];
+    for (doc, gone) in emptied {
+        for ((from, to), key, after, kept) in cases {
+            let mut editor = left_without(&at(doc, from, to), gone);
+            assert_eq!(editor.editor.doc().blocks.len(), 3, "{doc:?} has an empty block in the middle");
+            editor.key(key);
+            assert_eq!(editor.state(), canon(after), "{key} at {to:?} in {doc:?}");
+            assert_eq!(editor.editor.doc().blocks.len() == 3, kept, "{key} at {to:?} in {doc:?}");
+        }
+        // A range over it takes it away, and a click on it lands in the text after it.
+        let mut editor = left_without(&at(&at(doc, "one", "o^ne"), "two", "tw|o"), gone);
+        editor.key("Backspace");
+        assert_eq!(editor.state(), canon("p o|o"), "{doc:?}");
+        let mut editor = left_without(&at(doc, "one", "o|ne"), gone);
+        let empty = editor.editor.doc().blocks[1].id.clone();
+        editor.editor.select(Selection::caret(Pos::new(empty, 0)));
+        assert_eq!(editor.state(), canon("p one\np |two"), "a click on the empty block of {doc:?}");
+    }
+}
+
+#[test]
+fn a_row_with_no_cells_is_passed_over() {
+    let table = "r1> td A\nr1> td B\nr2> td x\nr3> td C\nr3> td D";
+    let cases = [
+        // The third row keeps its number, since the second is still there with nothing in it.
+        (("A", "A|"), "Down", "r1> td A\nr1> td B\nr3> td C|\nr3> td D"),
+        (("D", "D|"), "Up", "r1> td A\nr1> td B|\nr3> td C\nr3> td D"),
+        (("A", "A|"), "Enter", "r1> td A\nr1> td B\nr3> td C|\nr3> td D"),
+        (("B", "B|"), "Tab", "r1> td A\nr1> td B\nr3> td C|\nr3> td D"),
+        (("C", "C|"), "Shift+Tab", "r1> td A\nr1> td B|\nr3> td C\nr3> td D"),
+    ];
+    for ((from, to), key, after) in cases {
+        let mut editor = left_without(&at(table, from, to), |block| block.plain_text() == "x");
+        editor.key(key);
+        assert_eq!(editor.state(), after, "{key} at {to:?}");
+    }
+}
+
+#[test]
+fn either_side_of_a_picture_in_a_gallery_is_the_picture() {
+    for side in [0, 1, 7] {
+        let mut editor = Harness::new(&at(GALLERY, "one", "one|"));
+        let second = editor.editor.doc().blocks[1].body.blocks()[1].id.clone();
+        editor.editor.select(Selection::caret(Pos::new(second.clone(), side)));
+        assert_eq!(editor.editor.picture(), Some(&second), "offset {side}");
+        assert_eq!(editor.state(), canon("p one\ng> fig\ng> fig*\ng> cap At sea\np two"), "offset {side}");
     }
 }

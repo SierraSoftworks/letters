@@ -18,6 +18,17 @@ pub(crate) fn cells(row: &Block) -> Vec<&Block> {
     row.body.blocks().iter().filter(|cell| cell.kind == BlockKind::TableCell).collect()
 }
 
+/// The nearest row below the `row`th of a table, or above it, that has cells. A merge can leave a row with
+/// none, and such a row holds no caret.
+pub(crate) fn row_beside(table: &Block, row: usize, down: bool) -> Option<&Block> {
+    let rows = rows(table);
+    let held = |row: &&Block| !cells(row).is_empty();
+    match down {
+        true => rows.into_iter().skip(row + 1).find(held),
+        false => rows.into_iter().take(row).rev().find(held),
+    }
+}
+
 /// The caption of a gallery: the last one, should a merge have left it several.
 pub(crate) fn caption(gallery: &Block) -> Option<&Block> {
     gallery.body.blocks().iter().rev().find(|part| part.kind == BlockKind::Caption)
@@ -134,6 +145,20 @@ impl Editor {
     /// How much text of a block a caret can be in. A picture in a gallery shows none.
     pub(crate) fn span(&self, block: &Block) -> usize {
         if self.member(&block.id) { 0 } else { text::len(block) }
+    }
+
+    /// The place in text nearest to a position that may name a block with none, as a click on an empty
+    /// gallery or table does: the first text in the block, or else the text after it, or before it.
+    pub(crate) fn nearest(&self, pos: &Pos) -> Option<Pos> {
+        if let Some(pos) = self.clamp(pos) {
+            return Some(pos);
+        }
+        let all: Vec<&Block> = self.doc().walk().collect();
+        let at = all.iter().position(|block| block.id == pos.block)?;
+        let text = |block: &&&Block| tree::is_text(block);
+        let after = all[at + 1..].iter().find(text).map(|block| Pos::new(block.id.clone(), 0));
+        let before = || all[..at].iter().rev().find(text).map(|block| Pos::new(block.id.clone(), self.span(block)));
+        after.or_else(before).and_then(|pos| self.clamp(&pos))
     }
 
     /// The block that a part moves with: the gallery of a picture or a caption, and the table of a cell.
@@ -282,7 +307,7 @@ impl Editor {
             return false;
         }
         let below = self.grid(&at.block).and_then(|(table, row, column)| {
-            let cells = cells(rows(table).get(row + 1)?);
+            let cells = cells(row_beside(table, row, true)?);
             let cell = cells.get(column).or(cells.last())?;
             Some(Pos::new(cell.id.clone(), text::len(cell)))
         });

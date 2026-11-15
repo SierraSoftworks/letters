@@ -337,14 +337,15 @@ impl Editor {
         self.caret.as_ref().map(|caret| &caret.selection)
     }
 
-    /// Moves the selection, as a click or a drag does. Positions are brought onto the nearest character, and a
-    /// selection that names no text block is ignored. In a figure the positions are in its caption:
-    /// [`Editor::select_picture`] selects the picture.
+    /// Moves the selection, as a click or a drag does. Positions are brought onto the nearest character, and
+    /// one that names a block with no text, such as an empty table, onto the text nearest to it. A
+    /// selection that names no block is ignored. In a figure the positions are in its caption:
+    /// [`Editor::select_picture`] selects the picture, and a picture in a gallery is only ever that.
     pub fn select(&mut self, selection: Selection) {
         self.end_composition();
         (self.rule, self.goal) = (false, None);
         self.seal();
-        if let (Some(anchor), Some(head)) = (self.clamp(&selection.anchor), self.clamp(&selection.head)) {
+        if let (Some(anchor), Some(head)) = (self.nearest(&selection.anchor), self.nearest(&selection.head)) {
             self.set_selection(Selection { anchor, head });
         }
     }

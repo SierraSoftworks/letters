@@ -168,11 +168,7 @@ impl Editor {
         } else if figure && !*picture && !down && leaves() {
             return on(block);
         } else if let Some((table, row, column)) = self.grid(&pos.block).filter(|_| leaves()) {
-            let rows = parts::rows(table);
-            let Some(next) = (if down { rows.get(row + 1) } else { row.checked_sub(1).and_then(|row| rows.get(row)) })
-            else {
-                return beyond(table);
-            };
+            let Some(next) = parts::row_beside(table, row, down) else { return beyond(table) };
             let cells = parts::cells(next);
             let cell = cells.get(column).or(cells.last())?;
             return Some((Pos::new(cell.id.clone(), text::snap(&cell.plain_text(), pos.offset)), false));
