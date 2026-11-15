@@ -41,6 +41,7 @@ impl Keymap {
         keymap.bind(Key::Backspace, PRIMARY, Command::Delete(Motion::WordLeft));
         keymap.bind(Key::Delete, PRIMARY, Command::Delete(Motion::WordRight));
         keymap.bind(Key::Char('y'), PRIMARY, Command::Redo);
+        keymap.figures();
         keymap
     }
 
@@ -63,6 +64,7 @@ impl Keymap {
         keymap.bind(Key::Delete, ALT, Command::Delete(Motion::WordRight));
         keymap.bind(Key::Backspace, PRIMARY, Command::Delete(Motion::LineStart));
         keymap.bind(Key::Delete, PRIMARY, Command::Delete(Motion::LineEnd));
+        keymap.figures();
         keymap
     }
 
@@ -86,6 +88,7 @@ impl Keymap {
             (Key::Enter, NONE, Command::Split),
             (Key::Enter, SHIFT, Command::LineBreak),
             (Key::Enter, PRIMARY, Command::ToggleChecked),
+            (Key::Escape, NONE, Command::LeaveFormula),
             (Key::Tab, NONE, Command::Indent),
             (Key::Tab, SHIFT, Command::Outdent),
             (Key::Char('b'), PRIMARY, Command::ToggleMark(Mark::Bold)),
@@ -119,6 +122,15 @@ impl Keymap {
         keymap
     }
 
+    /// The keys that mean something else on a picture, in a caption or after the words for a reference than
+    /// they do in other text.
+    fn figures(&mut self) {
+        self.also(Key::Escape, NONE, Command::LeaveCaption);
+        self.also(Key::Escape, NONE, Command::DismissReference);
+        self.also(Key::Left, ALT, Command::ShiftFigure { right: false });
+        self.also(Key::Right, ALT, Command::ShiftFigure { right: true });
+    }
+
     /// Binds each motion to its key, and to the same key with Shift to extend the selection.
     fn motions(&mut self, motions: &[(Key, Modifiers, Motion)]) {
         for (key, mods, to) in motions {
@@ -136,13 +148,26 @@ impl Keymap {
         self.bindings.push((event, command));
     }
 
+    /// Binds a key to one command more, which is tried before what the key runs already. This is for a
+    /// command that has something to act on only in some places, such as on a picture: everywhere else
+    /// the key runs what it ran before.
+    pub fn also(&mut self, key: Key, mods: Modifiers, command: Command) {
+        self.bindings.insert(0, (KeyEvent { key, mods }, command));
+    }
+
     pub fn unbind(&mut self, event: &KeyEvent) {
         self.bindings.retain(|(bound, _)| bound != event);
     }
 
-    /// The command a key runs.
+    /// The command a key runs wherever nothing bound with [`Keymap::also`] has something to act on.
     pub fn command(&self, event: &KeyEvent) -> Option<&Command> {
-        self.bindings.iter().find(|(bound, _)| bound == event).map(|(_, command)| command)
+        self.commands(event).last()
+    }
+
+    /// Every command a key is bound to, in the order to try them. The editor runs the first that has
+    /// something to act on.
+    pub fn commands(&self, event: &KeyEvent) -> impl Iterator<Item = &Command> {
+        self.bindings.iter().filter(move |(bound, _)| bound == event).map(|(_, command)| command)
     }
 
     /// The key that runs a command, to show beside it in a menu.

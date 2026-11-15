@@ -1,14 +1,22 @@
 //! `document.json`: strict to read, canonical to write.
 //!
-//! Key order and layout are fixed, so one document always produces the same bytes. Unknown fields and unknown
-//! block types are kept and written back.
+//! Key order and layout are fixed, so one document always produces the same bytes. A block is written as
+//! its id, its type and that type's fields, then its body, then every other field in key order. Unknown
+//! fields and unknown block types are kept and written back.
+//!
+//! A gallery, a table and a row hold only their own parts, and a file that nests them otherwise is
+//! refused. A row may hold any number of cells, since two people changing one table can leave it so.
 
 use std::collections::BTreeSet;
 use std::fmt;
 
 use serde_json::{Map, Value};
 
-use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Run, Tone};
+use crate::style::{ALIGNS, write_number};
+use crate::{
+    Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Properties, PropertiesFormat,
+    Run, Tone,
+};
 
 mod stream;
 
@@ -54,11 +62,43 @@ impl Document {
         if !self.dictionary.is_empty() {
             map.insert("dictionary".into(), self.dictionary.iter().cloned().collect());
         }
+        if let Some(properties) = &self.properties {
+            map.insert("properties".into(), properties.to_value());
+        }
         map.insert("blocks".into(), self.blocks.iter().map(write_block).collect());
         write_extra(&mut map, &self.extra);
         let mut out = serde_json::to_string_pretty(&Value::Object(map)).expect("a JSON value always serialises");
         out.push('\n');
         out
+    }
+}
+
+impl Properties {
+    /// Reads a document's properties as `document.json` stores them. `path` names them in errors.
+    pub fn from_value(value: Value, path: &str) -> Result<Self> {
+        let mut map = object(value, path)?;
+        let format = match string(&mut map, "format", path)?.as_deref() {
+            Some("yaml") => PropertiesFormat::Yaml,
+            Some("toml") => PropertiesFormat::Toml,
+            _ => return err(&format!("{path}.format"), "expected yaml or toml"),
+        };
+        let Some(source) = string(&mut map, "source", path)? else {
+            return err(&format!("{path}.source"), "expected the properties as text");
+        };
+        Ok(Self { format, source, extra: map.into_iter().collect() })
+    }
+
+    /// The properties as `document.json` stores them.
+    pub fn to_value(&self) -> Value {
+        let mut map = Map::new();
+        let format = match self.format {
+            PropertiesFormat::Yaml => "yaml",
+            PropertiesFormat::Toml => "toml",
+        };
+        map.insert("format".into(), format.into());
+        map.insert("source".into(), self.source.as_str().into());
+        write_extra(&mut map, &self.extra);
+        Value::Object(map)
     }
 }
 
@@ -103,12 +143,13 @@ fn document(mut map: Map<String, Value>, read: Option<Vec<Block>>) -> Result<Doc
     };
     let dictionary =
         strings(map.remove("dictionary"), "dictionary")?.unwrap_or_default().into_iter().collect::<BTreeSet<_>>();
+    let properties = map.remove("properties").map(|value| Properties::from_value(value, "properties")).transpose()?;
     let blocks = match read {
         Some(blocks) => blocks,
         None => blocks(map.remove("blocks").unwrap_or(Value::Array(Vec::new())), "blocks")?,
     };
 
-    let doc = Document { language, dictionary, blocks, extra: map.into_iter().collect() };
+    let doc = Document { language, dictionary, properties, blocks, extra: map.into_iter().collect() };
     let mut seen = BTreeSet::new();
     for block in doc.walk() {
         if !seen.insert(&block.id) {
@@ -130,6 +171,31 @@ pub(crate) fn string(map: &mut Map<String, Value>, key: &str, path: &str) -> Res
         None => Ok(None),
         Some(Value::String(s)) => Ok(Some(s)),
         Some(_) => err(&format!("{path}.{key}"), "expected a string"),
+    }
+}
+
+/// Takes a `lang` out of a block's or a run's fields.
+pub(crate) fn lang(map: &mut Map<String, Value>, path: &str) -> Result<Option<String>> {
+    match string(map, "lang", path)? {
+        Some(tag) if tag.is_empty() => err(&format!("{path}.lang"), "expected a BCP 47 tag"),
+        tag => Ok(tag),
+    }
+}
+
+/// Takes a flag that is left out when it is off.
+fn flag(map: &mut Map<String, Value>, key: &str, path: &str) -> Result<bool> {
+    match map.remove(key) {
+        None => Ok(false),
+        Some(Value::Bool(on)) => Ok(on),
+        Some(_) => err(&format!("{path}.{key}"), "expected true or false"),
+    }
+}
+
+/// Takes one side of a figure's size.
+fn size(map: &mut Map<String, Value>, key: &str, path: &str) -> Result<f32> {
+    match map.remove(key).as_ref().and_then(Value::as_f64).map(|size| size as f32) {
+        Some(size) if size.is_finite() && size > 0.0 => Ok(size),
+        _ => err(&format!("{path}.{key}"), "expected a size above 0, in points"),
     }
 }
 
@@ -156,10 +222,11 @@ fn block(value: Value, path: &str) -> Result<Block> {
 }
 
 /// The shape of body a block of this type holds, for the types this build knows.
-fn shape(type_name: &str) -> Option<BodyShape> {
+pub(crate) fn shape(type_name: &str) -> Option<BodyShape> {
     match type_name {
-        "paragraph" | "heading" | "list_item" | "code" => Some(BodyShape::Text),
-        "quote" | "callout" => Some(BodyShape::Blocks),
+        "paragraph" | "heading" | "list_item" | "code" | "formula" => Some(BodyShape::Text),
+        "caption" | "figure" | "table_cell" => Some(BodyShape::Text),
+        "quote" | "callout" | "gallery" | "table" | "table_row" => Some(BodyShape::Blocks),
         _ => None,
     }
 }
@@ -202,6 +269,7 @@ fn block_from(mut map: Map<String, Value>, read: Option<Body>, path: &str) -> Re
             BlockKind::ListItem { list, depth }
         }
         "code" => BlockKind::Code { language: string(&mut map, "language", path)? },
+        "formula" => BlockKind::Formula,
         "quote" => BlockKind::Quote,
         "callout" => match string(&mut map, "tone", path)?.as_deref() {
             Some("tip") => BlockKind::Callout { tone: Tone::Tip },
@@ -211,6 +279,28 @@ fn block_from(mut map: Map<String, Value>, read: Option<Body>, path: &str) -> Re
             _ => return err(&format!("{path}.tone"), "expected tip, info, warn or danger"),
         },
         "divider" => BlockKind::Divider,
+        "caption" => BlockKind::Caption,
+        "figure" => {
+            let (asset, src) = (string(&mut map, "asset", path)?, string(&mut map, "src", path)?);
+            if asset.is_some() == src.is_some() {
+                return err(path, "a figure names its picture as an asset or as a src, and not both");
+            }
+            let alt = string(&mut map, "alt", path)?.unwrap_or_default();
+            let (width, height) = (size(&mut map, "width", path)?, size(&mut map, "height", path)?);
+            BlockKind::Figure { asset, src, alt, width, height, numbered: flag(&mut map, "numbered", path)? }
+        }
+        "gallery" => BlockKind::Gallery { numbered: flag(&mut map, "numbered", path)? },
+        "table" => {
+            let at = format!("{path}.columns");
+            let names = strings(map.remove("columns"), &at)?.unwrap_or_default();
+            let align = |name: &String| ALIGNS.iter().find(|(known, _)| known == name).map(|(_, align)| *align);
+            match names.iter().map(align).collect() {
+                Some(columns) => BlockKind::Table { columns, header: flag(&mut map, "header", path)? },
+                None => return err(&at, "expected start, center, end or justify for each column"),
+            }
+        }
+        "table_row" => BlockKind::TableRow,
+        "table_cell" => BlockKind::TableCell,
         _ => BlockKind::Unknown { type_name },
     };
 
@@ -225,7 +315,21 @@ fn block_from(mut map: Map<String, Value>, read: Option<Body>, path: &str) -> Re
             Body::Text(runs(map.remove("content").unwrap_or(Value::Array(Vec::new())), &format!("{path}.content"))?)
         }
     };
-    Ok(Block { id, kind, body, extra: map.into_iter().collect() })
+    if let Some(stray) = body.blocks().iter().position(|child| !kind.admits(&child.kind)) {
+        let holds = match kind {
+            BlockKind::Gallery { .. } => "a gallery holds figures and captions",
+            BlockKind::Table { .. } => "a table holds rows",
+            _ => "a row holds cells",
+        };
+        return err(&format!("{path}.blocks[{stray}]"), holds);
+    }
+    let lang = lang(&mut map, path)?;
+    let page_break = match map.remove("break") {
+        None => false,
+        Some(Value::String(at)) if at == "page" => true,
+        Some(_) => return err(&format!("{path}.break"), "expected page"),
+    };
+    Ok(Block { id, kind, body, lang, page_break, extra: map.into_iter().collect() })
 }
 
 fn runs(value: Value, path: &str) -> Result<Vec<Run>> {
@@ -240,31 +344,37 @@ fn runs(value: Value, path: &str) -> Result<Vec<Run>> {
                 return err(&format!("{path}.text"), "every run needs text");
             };
             let marks = strings(map.remove("marks"), &format!("{path}.marks"))?.unwrap_or_default();
-            let marks = marks.into_iter().map(|name| read_mark(&name)).collect();
+            let mut marks: BTreeSet<Mark> = marks.into_iter().map(|name| read_mark(&name)).collect();
             let link = string(&mut map, "link", &path)?;
-            Ok(Run { text, marks, link, extra: map.into_iter().collect() })
+            let lang = lang(&mut map, &path)?;
+            match string(&mut map, "ref", &path)? {
+                Some(target) if target.is_empty() => return err(&format!("{path}.ref"), "expected a block id"),
+                target => marks.extend(target.map(|target| Mark::Ref(BlockId::new(target)))),
+            }
+            Ok(Run { text, marks, link, lang, extra: map.into_iter().collect() })
         })
         .collect()
 }
 
 const MARKS: [(&str, Mark); 7] = [
-    ("math", Mark::Math),
     ("bold", Mark::Bold),
     ("italic", Mark::Italic),
     ("underline", Mark::Underline),
     ("strike", Mark::Strike),
     ("highlight", Mark::Highlight),
     ("code", Mark::Code),
+    ("math", Mark::Math),
 ];
 
 pub(crate) fn read_mark(name: &str) -> Mark {
     MARKS.iter().find(|(n, _)| *n == name).map_or_else(|| Mark::Other(name.into()), |(_, mark)| mark.clone())
 }
 
-pub(crate) fn mark_name(mark: &Mark) -> &str {
+/// The name a mark goes by in a run's `marks`. `None` for a reference, which is a field of its own.
+pub(crate) fn mark_name(mark: &Mark) -> Option<&str> {
     match mark {
-        Mark::Other(name) => name,
-        known => MARKS.iter().find(|(_, m)| m == known).map(|(name, _)| *name).expect("every known mark is named"),
+        Mark::Other(name) => Some(name),
+        known => MARKS.iter().find(|(_, m)| m == known).map(|(name, _)| *name),
     }
 }
 
@@ -298,6 +408,7 @@ fn write_block(block: &Block) -> Value {
             }
             "code"
         }
+        BlockKind::Formula => "formula",
         BlockKind::Quote => "quote",
         BlockKind::Callout { tone } => {
             let tone = match tone {
@@ -310,14 +421,32 @@ fn write_block(block: &Block) -> Value {
             "callout"
         }
         BlockKind::Divider => "divider",
-        BlockKind::Unknown { type_name } => type_name,
-        BlockKind::Figure { .. } => "figure",
-        BlockKind::Gallery { .. } => "gallery",
         BlockKind::Caption => "caption",
-        BlockKind::Formula => "formula",
-        BlockKind::Table { .. } => "table",
+        BlockKind::Figure { asset, src, alt, width, height, numbered } => {
+            for (key, name) in [("asset", asset), ("src", src)] {
+                if let Some(name) = name {
+                    map.insert(key.into(), name.as_str().into());
+                }
+            }
+            map.insert("alt".into(), alt.as_str().into());
+            map.insert("width".into(), write_number(*width));
+            map.insert("height".into(), write_number(*height));
+            write_flag(&mut map, "numbered", *numbered);
+            "figure"
+        }
+        BlockKind::Gallery { numbered } => {
+            write_flag(&mut map, "numbered", *numbered);
+            "gallery"
+        }
+        BlockKind::Table { columns, header } => {
+            let name = |align| ALIGNS.iter().find(|(_, known)| known == align).map(|(name, _)| *name);
+            map.insert("columns".into(), columns.iter().map(name).collect());
+            write_flag(&mut map, "header", *header);
+            "table"
+        }
         BlockKind::TableRow => "table_row",
         BlockKind::TableCell => "table_cell",
+        BlockKind::Unknown { type_name } => type_name,
     };
     // `type` reads best straight after `id`, ahead of the fields that depend on it.
     map.shift_insert(1, "type".into(), type_name.into());
@@ -331,21 +460,46 @@ fn write_block(block: &Block) -> Value {
         }
         Body::None => {}
     }
-    write_extra(&mut map, &block.extra);
+    let page_break = block.page_break.then_some(("break", "page"));
+    write_rest(&mut map, [block.lang.as_deref().map(|lang| ("lang", lang)), page_break], &block.extra);
     Value::Object(map)
+}
+
+/// Writes a flag that is left out when it is off.
+fn write_flag(map: &mut Map<String, Value>, key: &str, on: bool) {
+    if on {
+        map.insert(key.into(), true.into());
+    }
 }
 
 fn write_run(run: &Run) -> Value {
     let mut map = Map::new();
     map.insert("text".into(), run.text.as_str().into());
-    if !run.marks.is_empty() {
-        map.insert("marks".into(), run.marks.iter().map(mark_name).collect());
+    let marks: Vec<&str> = run.marks.iter().filter_map(mark_name).collect();
+    if !marks.is_empty() {
+        map.insert("marks".into(), marks.into());
     }
     if let Some(link) = &run.link {
         map.insert("link".into(), link.as_str().into());
     }
-    write_extra(&mut map, &run.extra);
+    let target = run.marks.iter().find_map(|mark| match mark {
+        Mark::Ref(target) => Some(("ref", target.as_str())),
+        _ => None,
+    });
+    write_rest(&mut map, [run.lang.as_deref().map(|lang| ("lang", lang)), target], &run.extra);
     Value::Object(map)
+}
+
+/// Appends the fields any block or run may carry, among its unknown fields and in key order with them. A
+/// field of that name among the unknown ones gives way, and an empty one is left out.
+fn write_rest(map: &mut Map<String, Value>, fields: [Option<(&str, &str)>; 2], extra: &Extra) {
+    let fields = fields.into_iter().flatten().filter(|(_, value)| !value.is_empty());
+    if fields.clone().next().is_none() {
+        return write_extra(map, extra);
+    }
+    let mut all = extra.clone();
+    all.extend(fields.map(|(key, value)| (key.to_owned(), value.into())));
+    write_extra(map, &all);
 }
 
 /// Appends unknown fields in key order, with the keys of any nested object sorted too.

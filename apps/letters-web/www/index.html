@@ -5,6 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <title>Letters</title>
+    <!-- What the editor's first frame needs is asked for at once, not each when the one before has arrived. -->
+    <link rel="modulepreload" href="letters.js" />
+    <link rel="preload" as="fetch" crossorigin href="letters_bg.wasm" />
+    <!-- The text of the first paint and the editor's first frame are waiting for this one. The other fonts
+         are asked for when the editor starts, so that they do not hold up what it waits for. -->
+    <link rel="preload" as="fetch" crossorigin fetchpriority="high" href="fonts/Inter.ttf" />
+    <!-- The build writes in here what this document's first frame waits for besides: the maths faces, if it has maths. -->
+    <!--letters:preload-->
     <style>
       html,
       body {
@@ -22,12 +30,16 @@
   </head>
   <body>
     <canvas id="letters"></canvas>
+    <!-- The build writes the document in here twice, as a server would: to read at once under the shapes of
+         the window's controls, and to open. -->
+    <!--letters:first-paint-->
+    <!--letters:document-->
     <script type="module">
       import init, { Letters } from "./letters.js";
 
       await init();
       // The console and the tests reach the editor here.
-      window.letters = new Letters(document.getElementById("letters"));
+      window.letters = await Letters.start(document.getElementById("letters"), "");
     </script>
   </body>
 </html>

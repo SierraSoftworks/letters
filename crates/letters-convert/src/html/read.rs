@@ -4,11 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 
 use html5gum::{DefaultEmitter, HtmlString, Token, Tokenizer};
-use letters_model::{Block, BlockKind, Body, Document, ListKind, Mark, Run, Tone};
+use letters_model::{Align, Block, BlockKind, Body, Document, ListKind, Mark, Run, Tone};
 
 use super::href;
-use crate::ImportNote;
-use crate::markdown::{TAGS, TONES, cell, merge, nest, table};
+use crate::markdown::{TAGS, TONES, merge, nest, trim};
+use crate::{ImportNote, figures};
 
 /// Elements nested deeper than this are read as their text, which bounds the reader's recursion.
 const MAX_DEPTH: usize = 128;
@@ -78,8 +78,20 @@ const SIBLINGS: [(&[&str], &[&str]); 3] =
     [(&["li"], &["ul", "ol"]), (&["td", "th"], &["tr", "table"]), (&["tr"], &["table"])];
 
 /// The style properties the reader acts on.
-const PROPERTIES: [&str; 7] =
-    ["display", "font-style", "font-weight", "mso-list", "text-decoration", "text-decoration-line", "white-space"];
+const PROPERTIES: [&str; 8] = [
+    "display",
+    "font-style",
+    "font-weight",
+    "mso-list",
+    "text-align",
+    "text-decoration",
+    "text-decoration-line",
+    "white-space",
+];
+
+/// The empty cells one read adds where cells span rows or columns. Past it, spans are not filled in, so that
+/// a page cannot make a small paste a huge table.
+const MAX_SPANNED: usize = 10_000;
 
 /// Reads the HTML another application put on the clipboard: a fragment or a whole page, with or without the
 /// comments that mark what was copied. `new_id` supplies an id for each block.
@@ -88,10 +100,20 @@ const PROPERTIES: [&str; 7] =
 ///   dropped, and an unknown element is read through to its text.
 /// - White space collapses as a browser shows it. A fragment with no block in it is one paragraph that keeps
 ///   the spaces at its edges, so that a phrase can be poured into a line.
-/// - Blocks with no text, scripts, style sheets and images are left out.
-/// - A table is kept as Markdown in a code block, as a Markdown import keeps one.
+/// - Maths is read where a page carries its TeX source, and left out where it carries only a drawing of it.
+/// - A picture that stands alone in its block is a figure whose picture is still at its `https` address, and
+///   several in one `figure` element are a gallery, with the element's caption as theirs. A picture amid text
+///   is left out, as is one at any other address.
+/// - Blocks with no text, scripts and style sheets are left out.
+/// - A table keeps its rows and the text of its cells. A cell that spans several leaves empty cells where it
+///   reaches. A table that only lays a page out, with one column or in that role, is read as what its cells
+///   hold.
 pub fn from_html(html: &str, new_id: &mut dyn FnMut() -> String) -> (Document, Vec<ImportNote>) {
-    let nodes = parse(copied(html));
+    let mut nodes = parse(copied(html));
+    // Excel marks the rows it copied, which leaves out the table around them.
+    if nodes.iter().any(|node| matches!(node, Node::Element(element) if element.name == "tr")) {
+        nodes = vec![Node::Element(Element { name: "table".into(), children: nodes, ..Element::default() })];
+    }
     let mut reader = Reader {
         new_id,
         notes: Vec::new(),
@@ -102,6 +124,8 @@ pub fn from_html(html: &str, new_id: &mut dyn FnMut() -> String) -> (Document, V
         task: None,
         marker: None,
         cell: false,
+        captioned: false,
+        spare: MAX_SPANNED,
     };
     let mut blocks = Vec::new();
     reader.nodes(&nodes, &Style::default(), &mut blocks);
@@ -156,6 +180,73 @@ impl Element {
             let name = class.strip_prefix("markdown-alert-").unwrap_or(class);
             TONES.iter().find(|(tag, _)| tag.eq_ignore_ascii_case(name)).map(|(_, tone)| *tone)
         })
+    }
+
+    /// The TeX source of the maths this element stands for, and whether it is set on a line of its own. The
+    /// source is found where pages carry it: annotated on MathML, as KaTeX and Wikipedia write it, in the
+    /// script MathJax leaves, or on an element of the class `math`: between delimiters as Pandoc writes it, or
+    /// in `data-tex` as `to_html` does.
+    fn maths(&self) -> Option<(String, bool)> {
+        let text = |element: &Element| {
+            let mut text = String::new();
+            raw(&element.children, &mut text);
+            text
+        };
+        let class = self.attribute("class");
+        match self.name.as_str() {
+            "math" => {
+                let is_source = |element: &Element| {
+                    element.name == "annotation" && element.attribute("encoding").to_ascii_lowercase().contains("tex")
+                };
+                let source = self.find(&is_source).map_or_else(|| self.attribute("alttext").to_owned(), text);
+                Some((source, self.attribute("display") == "block"))
+            }
+            "script" => {
+                let kind = self.attribute("type").strip_prefix("math/tex")?;
+                Some((text(self), kind.contains("display")))
+            }
+            // Wikipedia shows a picture of the maths, described by its source.
+            "img" if class.starts_with("mwe-math-fallback-image") => {
+                Some((self.attribute("alt").to_owned(), class.ends_with("display")))
+            }
+            // A page of `to_html` shows a drawing of the maths, and keeps the source beside it.
+            _ if self.classes().any(|class| class == "math") && !self.attribute("data-tex").is_empty() => {
+                Some((self.attribute("data-tex").to_owned(), self.classes().any(|class| class == "display")))
+            }
+            _ if self.classes().any(|class| class == "math") => {
+                let source = text(self);
+                [(r"\(", r"\)", false), (r"\[", r"\]", true)].into_iter().find_map(|(open, close, display)| {
+                    Some((source.trim().strip_prefix(open)?.strip_suffix(close)?.to_owned(), display))
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The first element inside this one that `is` what is looked for.
+    fn find(&self, is: &dyn Fn(&Element) -> bool) -> Option<&Element> {
+        self.children.iter().find_map(|node| match node {
+            Node::Element(child) if is(child) => Some(child),
+            Node::Element(child) => child.find(is),
+            Node::Text(_) => None,
+        })
+    }
+
+    /// How the element says its text is aligned, as a table's cell does.
+    fn align(&self) -> Option<Align> {
+        let stated = self.css("text-align").map_or_else(|| self.attribute("align").to_ascii_lowercase(), str::to_owned);
+        match stated.as_str() {
+            "left" | "start" => Some(Align::Start),
+            "center" => Some(Align::Center),
+            "right" | "end" => Some(Align::End),
+            "justify" => Some(Align::Justify),
+            _ => None,
+        }
+    }
+
+    /// How many rows or columns a cell reaches over, as the attribute `name` says.
+    fn span(&self, name: &str) -> usize {
+        self.attribute(name).trim().parse().unwrap_or(1).clamp(1, 1000)
     }
 
     /// How deep in its list a paragraph of Word's sits. Word writes list items as paragraphs.
@@ -252,33 +343,19 @@ fn raw(nodes: &[Node], out: &mut String) {
     }
 }
 
-/// The text of `blocks` as the runs of one line.
+/// The text of `blocks` as the runs of one block, a line to each.
 fn flatten(blocks: Vec<Block>, runs: &mut Vec<Run>) {
     for block in blocks {
         match block.body {
             Body::Text(text) if !text.is_empty() => {
                 if !runs.is_empty() {
-                    runs.push(Run::plain(" "));
+                    runs.push(Run::plain("\n"));
                 }
                 runs.extend(text);
             }
             Body::Blocks(children) => flatten(children, runs),
             _ => {}
         }
-    }
-}
-
-/// Drops the spaces and line breaks at the edges of a block's text, which a browser does not show.
-fn trim(runs: &mut Vec<Run>) {
-    const EDGE: [char; 3] = [' ', '\t', '\n'];
-    let blank = |run: &Run| run.text.trim_matches(EDGE).is_empty();
-    runs.truncate(runs.len() - runs.iter().rev().take_while(|run| blank(run)).count());
-    runs.drain(..runs.iter().take_while(|run| blank(run)).count());
-    if let Some(last) = runs.last_mut() {
-        last.text.truncate(last.text.trim_end_matches(EDGE).len());
-    }
-    if let Some(first) = runs.first_mut() {
-        first.text.drain(..first.text.len() - first.text.trim_start_matches(EDGE).len());
     }
 }
 
@@ -303,7 +380,11 @@ impl Style {
         style.heavy |= matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th");
         match name {
             "kbd" | "samp" | "tt" => _ = style.marks.insert(Mark::Code),
-            "a" => style.link = href(element.attribute("href")).filter(|address| address.len() <= MAX_ADDRESS),
+            "a" => {
+                // A link to a place on its own page, as a reference to a figure is, leads nowhere from a document.
+                let leads = |address: &String| !address.starts_with('#') && address.len() <= MAX_ADDRESS;
+                style.link = href(element.attribute("href")).filter(leads);
+            }
             _ => style.marks.extend(TAGS.iter().filter(|(tag, _)| *tag == name).map(|(_, mark)| mark.clone())),
         }
 
@@ -359,15 +440,15 @@ struct Reader<'f> {
     marker: Option<String>,
     /// Whether a table's cell is being read, where a table reads as its text.
     cell: bool,
+    /// Whether a figure is being read, whose caption is the caption of the pictures in it.
+    captioned: bool,
+    /// How many more empty cells may be added where cells span.
+    spare: usize,
 }
 
 impl Reader<'_> {
     fn block(&mut self, kind: BlockKind) -> Block {
         Block::new((self.new_id)().as_str(), kind)
-    }
-
-    fn note(&mut self, block: &Block, message: impl Into<String>) {
-        self.notes.push(ImportNote { block: block.id.to_string(), message: message.into() });
     }
 
     fn push(&mut self, text: &str, style: &Style) {
@@ -409,6 +490,27 @@ impl Reader<'_> {
         self.gap = true;
     }
 
+    /// Reads maths from its source: a formula between the blocks around it, or a run in the text.
+    fn maths(&mut self, tex: &str, display: bool, style: &Style, out: &mut Vec<Block>) {
+        let tex = tex.replace('\r', "");
+        let tex = tex.trim();
+        if tex.is_empty() {
+            return;
+        }
+        if display {
+            self.blocks = true;
+            self.flush(out);
+            let mut block = self.block(BlockKind::Formula);
+            block.body = Body::Text(vec![Run::plain(tex)]);
+            out.push(block);
+        } else {
+            let mut style = style.clone();
+            style.marks.insert(Mark::Math);
+            self.push(&tex.replace('\n', " "), &style);
+            self.gap = false;
+        }
+    }
+
     /// Ends the block being read. One with nothing to show is left out.
     fn flush(&mut self, out: &mut Vec<Block>) {
         let mut runs = mem::take(&mut self.runs);
@@ -443,16 +545,22 @@ impl Reader<'_> {
 
     fn element(&mut self, element: &Element, outer: &Style, out: &mut Vec<Block>) {
         let name = element.name.as_str();
-        if UNREAD.contains(&name)
-            || element.is_hidden()
-            || element.classes().any(|class| class == "markdown-alert-title")
+        // KaTeX writes maths twice: as MathML, which carries its source, and as the boxes it draws.
+        if element.is_hidden() || element.classes().any(|class| matches!(class, "markdown-alert-title" | "katex-html"))
         {
+            return;
+        }
+        if let Some((tex, display)) = element.maths() {
+            return self.maths(&tex, display, outer, out);
+        }
+        if UNREAD.contains(&name) {
             return;
         }
         let mut style = outer.inside(element);
         if !BLOCKS.contains(&name) {
             match name {
                 "br" => self.line_break(&style),
+                "img" => self.picture(element, out),
                 "input" if element.attribute("type").eq_ignore_ascii_case("checkbox") => {
                     self.task = Some(element.attributes.contains_key("checked"));
                 }
@@ -475,7 +583,9 @@ impl Reader<'_> {
                 let level = name[1..].parse::<u8>().unwrap_or(1);
                 let from = out.len();
                 self.within(BlockKind::Heading { level: level.min(4) }, element, &style, out);
-                if let Some(heading) = out.get(from).filter(|_| level > 4) {
+                // What the heading holds can come out as other blocks, which the note is not about.
+                let lowered = |block: &&Block| level > 4 && matches!(block.kind, BlockKind::Heading { .. });
+                if let Some(heading) = out[from..].iter().find(lowered) {
                     let message = format!("Heading level {level} became level 4");
                     self.notes.push(ImportNote { block: heading.id.to_string(), message });
                 }
@@ -487,6 +597,8 @@ impl Reader<'_> {
             }
             "li" => self.item(element, &style, out),
             "blockquote" => self.container(BlockKind::Quote, element, &style, out),
+            "figure" => self.figure(element, &style, out),
+            "figcaption" if self.captioned => self.within(BlockKind::Caption, element, &style, out),
             "table" => self.table(element, &style, out),
             "p" if element.word_depth().is_some() => {
                 self.marker = None;
@@ -524,6 +636,74 @@ impl Reader<'_> {
             block.body = Body::Text(vec![Run::plain(text)]);
         }
         out.push(block);
+    }
+
+    /// Reads a picture that stands alone in its block as a figure. One amid text has no place in a line, and
+    /// one the clipboard only names by a file or by its bytes cannot be found again: both are left out, as
+    /// is the speck a page uses to count its readers.
+    fn picture(&mut self, element: &Element, out: &mut Vec<Block>) {
+        let src = element.attribute("src").trim();
+        let side = |name: &str| element.attribute(name).trim().trim_end_matches("px").parse::<f32>().ok();
+        let size = (side("width"), side("height"));
+        let speck = [size.0, size.1].into_iter().flatten().any(|side| side.is_nan() || side <= 2.0);
+        let amid = self.cell || self.runs.iter().any(|run| !run.text.trim().is_empty());
+        if amid || speck || !src.starts_with("https://") || src.len() > MAX_ADDRESS {
+            return;
+        }
+        self.blocks = true;
+        self.flush(out);
+        let (width, height) = match size {
+            (Some(width), Some(height)) => figures::fitted(width, height),
+            _ => figures::UNSIZED,
+        };
+        let alt = element.attribute("alt").to_owned();
+        out.push(self.block(BlockKind::Figure {
+            asset: None,
+            src: Some(src.to_owned()),
+            alt,
+            width,
+            height,
+            numbered: false,
+        }));
+    }
+
+    /// Reads a `figure` element: one picture in it is a figure and several are a gallery, with the element's
+    /// caption as theirs. With no picture in it, it is read as what it holds.
+    fn figure(&mut self, element: &Element, style: &Style, out: &mut Vec<Block>) {
+        let mut parts = Vec::new();
+        let captioned = mem::replace(&mut self.captioned, true);
+        self.within(BlockKind::Paragraph, element, style, &mut parts);
+        self.captioned = captioned;
+
+        let is_picture = |part: &Block| matches!(part.kind, BlockKind::Figure { .. });
+        let pictured = parts.iter().any(is_picture);
+        let (mut pictures, mut caption, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+        for mut part in parts {
+            match (&part.kind, &mut part.body) {
+                (BlockKind::Figure { .. }, _) => pictures.push(part),
+                (BlockKind::Caption, Body::Text(runs)) if pictured => {
+                    caption.extend((!caption.is_empty()).then(|| Run::plain("\n")));
+                    caption.append(runs);
+                }
+                (BlockKind::Caption, _) => rest.push(Block { kind: BlockKind::Paragraph, ..part }),
+                _ => rest.push(part),
+            }
+        }
+        let caption = merge(caption);
+        if pictures.len() > 1 {
+            let mut gallery = self.block(BlockKind::Gallery { numbered: false });
+            if !caption.is_empty() {
+                let mut line = self.block(BlockKind::Caption);
+                line.body = Body::Text(caption);
+                pictures.push(line);
+            }
+            gallery.body = Body::Blocks(pictures);
+            out.push(gallery);
+        } else if let Some(mut picture) = pictures.pop() {
+            picture.body = Body::Text(caption);
+            out.push(picture);
+        }
+        out.extend(rest);
     }
 
     /// Reads a list item. The text it opens with is the item, and anything else follows it.
@@ -565,7 +745,9 @@ impl Reader<'_> {
     /// Reads a quote or a callout, whose content is blocks of its own.
     fn container(&mut self, kind: BlockKind, element: &Element, style: &Style, out: &mut Vec<Block>) {
         let mut children = Vec::new();
+        let captioned = mem::take(&mut self.captioned);
         self.within(BlockKind::Paragraph, element, &Style { list: None, ..style.clone() }, &mut children);
+        self.captioned = captioned;
         nest(&mut children);
         if !children.is_empty() {
             let mut block = self.block(kind);
@@ -574,56 +756,96 @@ impl Reader<'_> {
         }
     }
 
-    /// Reads a table back into Markdown, since the document has no tables yet. A table that only lays a page
-    /// out, with one column or in that role, is read as the blocks in its cells, and so is one inside a cell.
+    /// Reads a table. One that only lays a page out, with one column or in that role, is read as the blocks in
+    /// its cells, and so is one inside a cell, which holds text alone.
     fn table(&mut self, element: &Element, style: &Style, out: &mut Vec<Block>) {
-        fn collect<'a>(element: &'a Element, rows: &mut Vec<Vec<&'a Element>>, rest: &mut Vec<&'a Element>) {
+        /// A row's cells, and whether it sits in the table's head.
+        type Row<'a> = (bool, Vec<&'a Element>);
+        fn collect<'a>(element: &'a Element, head: bool, rows: &mut Vec<Row<'a>>, rest: &mut Vec<&'a Node>) {
             for node in &element.children {
-                let Node::Element(child) = node else { continue };
-                match child.name.as_str() {
-                    "td" | "th" => match rows.last_mut() {
-                        Some(row) => row.push(child),
-                        None => rows.push(vec![child]),
+                match node {
+                    Node::Element(child) => match child.name.as_str() {
+                        "td" | "th" => match rows.last_mut() {
+                            Some((_, row)) => row.push(child),
+                            None => rows.push((head, vec![child])),
+                        },
+                        "tr" => {
+                            rows.push((head, Vec::new()));
+                            collect(child, head, rows, rest);
+                        }
+                        "thead" | "tbody" | "tfoot" => collect(child, child.name == "thead", rows, rest),
+                        _ => rest.push(node),
                     },
-                    "tr" => {
-                        rows.push(Vec::new());
-                        collect(child, rows, rest);
-                    }
-                    "thead" | "tbody" | "tfoot" => collect(child, rows, rest),
-                    _ => rest.push(child),
+                    Node::Text(_) => rest.push(node),
                 }
             }
         }
-        let (mut cells, mut rest) = (Vec::new(), Vec::new());
-        collect(element, &mut cells, &mut rest);
-        if self.cell || element.attribute("role") == "presentation" || cells.iter().all(|row| row.len() < 2) {
+        let (mut rows, mut rest) = (Vec::new(), Vec::new());
+        collect(element, false, &mut rows, &mut rest);
+        if self.cell || element.attribute("role") == "presentation" || rows.iter().all(|(_, row)| row.len() < 2) {
             return self.nodes(&element.children, style, out);
         }
         // A caption reads as the paragraph above its table.
-        rest.into_iter().for_each(|other| self.element(other, style, out));
+        for node in rest {
+            match node {
+                Node::Text(text) => self.text(text, style),
+                Node::Element(other) => self.element(other, style, out),
+            }
+        }
+        self.flush(out);
 
-        let rules = vec!["---".to_owned(); cells.first().map_or(0, Vec::len)];
+        let header = rows
+            .first()
+            .is_some_and(|(head, row)| *head || !row.is_empty() && row.iter().all(|cell| cell.name == "th"));
         let (notes, kind) = (self.notes.len(), mem::replace(&mut self.kind, BlockKind::Paragraph));
         self.cell = true;
+        let mut columns: Vec<Option<Align>> = Vec::new();
+        // How many more rows each column is covered for by a cell above.
+        let mut covered: Vec<usize> = Vec::new();
         let mut lines = Vec::new();
-        for row in cells {
-            let mut line = Vec::new();
-            for element in row {
+        for (_, row) in rows {
+            let mut cells = Vec::new();
+            let mut row = row.into_iter();
+            loop {
+                let column = cells.len();
+                if covered.get(column).is_some_and(|rows| *rows > 0) && self.spare > 0 {
+                    (covered[column], self.spare) = (covered[column] - 1, self.spare - 1);
+                    cells.push(self.block(BlockKind::TableCell));
+                    continue;
+                }
+                let Some(element) = row.next() else { break };
                 let (mut blocks, mut runs) = (Vec::new(), Vec::new());
                 let inside = Style { list: None, ..style.inside(element) };
                 self.within(BlockKind::Paragraph, element, &inside, &mut blocks);
                 flatten(blocks, &mut runs);
-                line.push(cell(&merge(runs)));
+                let mut cell = self.block(BlockKind::TableCell);
+                cell.body = Body::Text(merge(runs));
+                cells.push(cell);
+
+                let across = element.span("colspan").min(self.spare + 1);
+                self.spare -= across - 1;
+                covered.resize(covered.len().max(column + across), 0);
+                columns.resize(columns.len().max(column + across), None);
+                // Word says how a cell is aligned on the paragraph in it.
+                let align = || element.align().or_else(|| element.find(&|inner| inner.name == "p")?.align());
+                columns[column] = columns[column].or_else(align);
+                covered[column..column + across].fill(element.span("rowspan") - 1);
+                cells.extend((1..across).map(|_| self.block(BlockKind::TableCell)));
             }
+            covered.iter_mut().skip(cells.len()).for_each(|rows| *rows = rows.saturating_sub(1));
+            let mut line = self.block(BlockKind::TableRow);
+            line.body = Body::Blocks(cells);
             lines.push(line);
         }
         // The blocks read inside the cells are gone, and so is what was noted on them.
         self.notes.truncate(notes);
         (self.kind, self.cell) = (kind, false);
-        let mut block = self.block(BlockKind::Code { language: Some("markdown".into()) });
-        block.body = Body::Text(vec![Run::plain(table(lines, rules))]);
-        self.note(&block, "Table kept as Markdown in a code block");
-        out.push(block);
+        if lines.iter().any(|line| line.body.blocks().iter().any(|cell| !cell.plain_text().trim().is_empty())) {
+            let columns = columns.into_iter().map(|align| align.unwrap_or(Align::Start)).collect();
+            let mut block = self.block(BlockKind::Table { columns, header });
+            block.body = Body::Blocks(lines);
+            out.push(block);
+        }
     }
 }
 

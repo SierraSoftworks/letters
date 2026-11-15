@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Runs one fuzz target under AFL++, and fails when it finds an input that breaks Letters.
+#
+#   ./scripts/fuzz                                      names the targets
+#   ./scripts/fuzz <target> [seconds] [afl-fuzz options]
+#
+# Needs cargo-afl: `cargo install cargo-afl`. Seeds come from the target itself and from
+# fuzz/corpus/<target>/, and what AFL++ finds is kept in target/afl/findings/<target>/, where the next
+# run of the target carries on. What it finds is run again at the end and told by where it fails.
+
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+target="${1:-}"
+seconds="${2:-60}"
+if [[ ! "$seconds" =~ ^[0-9]+$ ]]; then
+    echo "usage: ./scripts/fuzz [target] [seconds] [afl-fuzz options...]" >&2
+    exit 2
+fi
+shift $(( $# < 2 ? $# : 2 ))
+
+if ! command -v cargo-afl >/dev/null 2>&1; then
+    echo "cargo-afl is required: cargo install cargo-afl" >&2
+    exit 1
+fi
+
+# Built apart from everything else, since the fuzzer's compiler flags would rebuild the whole tree.
+cargo afl build --profile fuzz -p letters-fuzz --target-dir target/afl
+binary="target/afl/fuzz/letters-fuzz"
+
+if [[ -z "$target" ]]; then
+    "$binary" --list
+    exit 0
+fi
+if ! "$binary" --list | cut -f1 | grep -qx -- "$target"; then
+    echo "there is no fuzz target \"$target\". The targets are:" >&2
+    "$binary" --list >&2
+    exit 2
+fi
+
+findings="target/afl/findings/${target}"
+if [[ -d "${findings}/default/queue" ]]; then
+    input=(-i -)
+else
+    seeds="$(mktemp -d)"
+    trap 'rm -rf "$seeds"' EXIT
+    "$binary" --seeds "$target" "$seeds"
+    if compgen -G "fuzz/corpus/${target}/*" >/dev/null; then
+        cp fuzz/corpus/"${target}"/* "$seeds"/
+    fi
+    rm -rf "$findings"
+    mkdir -p "$findings"
+    input=(-i "$seeds")
+fi
+
+# Runs unattended, on machines whose core pattern and CPU governor cannot be changed.
+export AFL_SKIP_CPUFREQ="${AFL_SKIP_CPUFREQ:-1}"
+export AFL_NO_AFFINITY="${AFL_NO_AFFINITY:-1}"
+export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES="${AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES:-1}"
+
+# The run goes on past its first finding, so that one fault does not hide the others. An input is a few
+# kilobytes at most, so one that takes five seconds has found a hang.
+status=0
+cargo afl fuzz "${input[@]}" -o "$findings" -V "$seconds" -t 5000 "$@" -- "$binary" "$target" || status=$?
+
+# Every input that was kept is run again, and the report tells the places they fail at.
+report="${findings}/report.txt"
+rm -f "$report"
+if ! "$binary" --report "$target" "${findings}/default/crashes" "${findings}/default/hangs" >"$report"; then
+    echo >&2
+    cat "$report" >&2
+    echo "The inputs are kept in ${findings}/default/, and this report in ${report}." >&2
+    exit 1
+fi
+rm -f "$report"
+exit "$status"

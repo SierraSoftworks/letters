@@ -129,3 +129,60 @@ fn offsets_inside_a_character_are_refused() {
     let error = m.apply([Op::InsertText { at: Pos::new("p", 1), text: "x".into() }]);
     assert_eq!(error, Err(OpError::BadOffset { block: id("p"), offset: 1 }));
 }
+
+#[test]
+fn a_block_carries_a_page_break_and_a_language() {
+    // What the block is given, and what it then carries.
+    let cases = [
+        (true, Some("fr"), (true, Some("fr"))),
+        (true, None, (true, None)),
+        (false, Some("de-CH"), (false, Some("de-CH"))),
+        (false, Some(""), (false, None)),
+    ];
+    for (page_break, lang, carried) in cases {
+        let mut m = model();
+        let before = m.doc().clone();
+        let op = Op::SetBlockProps { block: id("d"), page_break, lang: lang.map(str::to_owned) };
+
+        let change = m.apply([op.clone()]).unwrap();
+        let block = m.doc().block(&id("d")).unwrap();
+        assert_eq!((block.page_break, block.lang.as_deref()), carried, "{op:?}");
+        assert_eq!(change.blocks.contains(&id("d")), m.doc() != &before, "{op:?}: layout hears of it");
+        assert!(!change.structure, "{op:?}");
+        assert_eq!(m.apply([op.clone()]), Ok(Default::default()), "{op:?}: set again, it changes nothing");
+
+        // A new kind leaves both as they are.
+        m.apply([Op::SetKind { block: id("p"), kind: BlockKind::Heading { level: 1 } }]).unwrap();
+        m.undo();
+        m.undo();
+        assert_eq!(m.doc(), &before, "{op:?}");
+    }
+}
+
+#[test]
+fn text_carries_a_language_that_typing_continues() {
+    let mut m = model();
+    let lang = |lang: Option<&str>| Op::SetLang { block: id("p"), range: 6..11, lang: lang.map(str::to_owned) };
+    m.apply([lang(Some("fr"))]).unwrap();
+    m.apply([Op::InsertText { at: Pos::new("p", 11), text: "!".into() }]).unwrap();
+    let runs: Vec<(&str, Option<&str>)> =
+        m.doc().blocks[0].body.runs().iter().map(|run| (run.text.as_str(), run.lang.as_deref())).collect();
+    assert_eq!(runs, [("Hello ", None), ("world!", Some("fr"))]);
+
+    assert_eq!(m.apply([lang(Some("fr"))]), Ok(Default::default()), "set again, it changes nothing");
+    m.apply([lang(None)]).unwrap();
+    let runs: Vec<(&str, Option<&str>)> =
+        m.doc().blocks[0].body.runs().iter().map(|run| (run.text.as_str(), run.lang.as_deref())).collect();
+    assert_eq!(runs, [("Hello world", None), ("!", Some("fr"))]);
+}
+
+#[test]
+fn fields_once_kept_as_unknown_are_read_as_their_own() {
+    // A build that did not know these fields kept them among the unknown ones.
+    let mut block = Block::text("p", BlockKind::Paragraph, "Bonjour");
+    block.extra.insert("break".into(), "page".into());
+    block.extra.insert("lang".into(), "fr".into());
+    let m = Model::new(Document { blocks: vec![block], ..Document::default() }, ReplicaId::from(1));
+    let block = &m.doc().blocks[0];
+    assert_eq!((block.page_break, block.lang.as_deref(), block.extra.is_empty()), (true, Some("fr"), true));
+}

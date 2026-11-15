@@ -82,7 +82,9 @@ impl Steps {
         self.redo.clear();
     }
 
-    /// Rewrites every step to follow a change to the sequence that did not come from this session.
+    /// Rewrites every step to follow a change to the sequence that did not come from this session. A step
+    /// that the change leaves nothing of keeps its place, so whoever counts its edits can still step
+    /// back as many.
     pub fn rebase(&mut self, theirs: &[TextDelta]) {
         fn stack<'a>(steps: impl DoubleEndedIterator<Item = &'a mut Step>, theirs: &[TextDelta]) {
             let mut theirs = theirs.to_vec();
@@ -102,8 +104,6 @@ impl Steps {
         }
         stack(self.undo.iter_mut(), theirs);
         stack(self.redo.iter_mut(), theirs);
-        self.undo.retain(|step| !step.is_empty());
-        self.redo.retain(|step| !step.is_empty());
     }
 }
 

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use common::*;
 use letters_render::cpu::{CpuRenderer, Frame};
 use letters_render::image::Images;
-use letters_render::{Color, DisplayList, Font, Item, PathEl, Point, Rect};
+use letters_render::{Color, DisplayList, Font, Item, PathEl, Point, Rect, Role};
 
 fn at(frame: &Frame, x: u32, y: u32) -> Color {
     frame.pixel(x, y).expect("the probe is inside the frame")
@@ -368,10 +368,45 @@ fn a_list_can_be_moved_after_it_is_emitted() {
 }
 
 #[test]
+fn a_list_can_be_made_smaller_after_it_is_emitted() {
+    let mut scene = list([fill(0.0, 0.0, 10.0, 10.0, RED)]);
+    let first = scene.items.len();
+    scene.items.extend([
+        Item::PushClip { rect: Rect::new(20.0, 20.0, 40.0, 40.0), radius: 0.0 },
+        fill(20.0, 20.0, 80.0, 80.0, BLUE),
+        Item::PopClip,
+        Item::Stroke { rect: Rect::new(80.0, 0.0, 40.0, 40.0), color: BLACK, width: 8.0, radius: 0.0 },
+        text(&sans(700.0), 40.0, BLACK, Point { x: 80.0, y: 100.0 }, "I"),
+    ]);
+    scene.scale(first, 0.5);
+    let frame = render(&scene, 70, 60, 1.0);
+
+    assert_eq!(at(&frame, 8, 8), RED, "items before the index keep their size");
+    assert_eq!(at(&frame, 12, 12), BLUE, "the fill is half as far out");
+    assert_eq!(at(&frame, 28, 28), BLUE, "and half as large, inside its clip");
+    assert_eq!(at(&frame, 32, 32), WHITE, "which shrank with it");
+    assert_eq!((at(&frame, 42, 10), at(&frame, 46, 10)), (BLACK, WHITE), "a stroke is half as wide");
+    assert!(ink(&frame, 38, 30, 14, 22) > 0, "the text is where half the way leads");
+    assert_eq!(ink(&frame, 38, 52, 30, 8), 0, "and half as tall");
+}
+
+#[test]
 fn a_frame_converts_to_window_pixels() {
     let frame = render(&list([fill(1.0, 0.0, 1.0, 1.0, Color::rgb(0x12, 0x34, 0x56))]), 2, 1, 1.0);
     let mut window = [0xdead_beef_u32; 2];
     frame.copy_to_xrgb(&mut window);
 
     assert_eq!(window, [0x00ff_ffff, 0x0012_3456]);
+}
+
+#[test]
+fn the_parts_of_a_document_change_nothing_on_screen() {
+    let words = text(&sans(400.0), 16.0, BLACK, Point { x: 10.0, y: 30.0 }, "Parts");
+    let plain = list([fill(0.0, 0.0, 30.0, 30.0, RED), words.clone()]);
+    let mut marked = part(Role::Paragraph, 1, [fill(0.0, 0.0, 30.0, 30.0, RED), words]);
+    marked.extend([Item::Close, Item::Open { role: Role::Heading(1), id: 2 }]);
+
+    let (plain, marked) = (render(&plain, 80, 40, 1.0), render(&list(marked), 80, 40, 1.0));
+
+    assert_eq!(furthest_apart(&plain, &marked), 0);
 }

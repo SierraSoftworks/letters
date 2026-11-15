@@ -112,17 +112,27 @@ impl Shaped {
     }
 
     pub(crate) fn paint(&self, at: Point, color: Color, out: &mut DisplayList) {
+        self.paint_inked(at, |_| color, out);
+    }
+
+    /// Paints the text with each glyph in the colour `ink` gives for its distance from the left edge, so
+    /// that stretches of a line can differ.
+    pub(crate) fn paint_inked(&self, at: Point, ink: impl Fn(f32) -> Color, out: &mut DisplayList) {
         for run in &self.runs {
-            out.push(Item::Glyphs {
-                origin: Point { x: at.x + run.origin.x, y: at.y + run.origin.y },
-                font: run.font.clone(),
-                size: run.size,
-                color,
-                skew: run.skew,
-                embolden: run.embolden,
-                glyphs: run.glyphs.clone(),
-                text: None,
-            });
+            let ink = |glyph: &Glyph| ink(run.origin.x + glyph.x);
+            // Neighbours of one colour go out together.
+            for glyphs in run.glyphs.chunk_by(|a, b| ink(a) == ink(b)) {
+                out.push(Item::Glyphs {
+                    origin: Point { x: at.x + run.origin.x, y: at.y + run.origin.y },
+                    font: run.font.clone(),
+                    size: run.size,
+                    color: ink(&glyphs[0]),
+                    skew: run.skew,
+                    embolden: run.embolden,
+                    glyphs: glyphs.to_vec(),
+                    text: None,
+                });
+            }
         }
     }
 }
@@ -139,6 +149,14 @@ pub struct FontShaper(Shaper);
 impl Default for FontShaper {
     fn default() -> Self {
         Self(Shaper::new(Fonts { faces: letters_fonts::bundled() }))
+    }
+}
+
+impl FontShaper {
+    /// Adds faces that arrived after the shaper was made. Returns whether any was new, when a label shaped
+    /// before may have been set without it.
+    pub fn add_fonts(&self, fonts: &Fonts) -> bool {
+        self.0.add_fonts(fonts)
     }
 }
 

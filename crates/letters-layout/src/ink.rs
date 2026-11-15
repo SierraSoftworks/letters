@@ -14,6 +14,8 @@ pub(crate) enum Ink {
     Marker,
     Link,
     OnAccent,
+    /// What is wrong as it stands, such as the source of a formula that cannot be typeset.
+    Warning,
 }
 
 impl Default for Ink {
@@ -63,6 +65,7 @@ impl Inks {
             Ink::Marker => self.palette.marker,
             Ink::Link => self.palette.link,
             Ink::OnAccent => self.palette.on_accent,
+            Ink::Warning => self.palette.warn.accent,
         }
     }
 

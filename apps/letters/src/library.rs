@@ -133,6 +133,28 @@ impl Library {
         self.remember(Some(&folder_of(&to)), &recents);
     }
 
+    /// A folder as a window names it: its place under the root as `Work / Clients`, or its whole path when
+    /// it is somewhere else.
+    pub fn shown(&self, folder: &Path) -> String {
+        let name = |part: &std::ffi::OsStr| part.to_string_lossy().into_owned();
+        match folder.strip_prefix(&self.root) {
+            Ok(inside) if inside.as_os_str().is_empty() => self.root.file_name().map(name).unwrap_or_default(),
+            Ok(inside) => inside.iter().map(name).collect::<Vec<_>>().join(" / "),
+            Err(_) => folder.display().to_string(),
+        }
+    }
+
+    /// Makes a folder called `name` in `parent`, for a document to move to.
+    pub fn new_folder(&self, parent: &Path, name: &str) -> Result<PathBuf, Refused> {
+        let name = file_name(name).ok_or(Refused::NoFolderName)?;
+        let path = parent.join(&name);
+        match fs::create_dir(&path) {
+            Ok(()) => Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(Refused::FolderTaken(name)),
+            Err(error) => Err(Refused::NoFolder(error)),
+        }
+    }
+
     /// The folders a document in `current` can be moved to, as a tree in reading order: the root and
     /// everything under it, after `current` itself when that is somewhere else.
     pub fn folders(&self, current: &Path) -> Vec<Folder> {
@@ -199,6 +221,11 @@ pub enum Refused {
     /// Another document has that name in that folder, and it is never replaced.
     Taken(String),
     Io(io::Error),
+    /// Nothing of what was typed can be a folder's name.
+    NoFolderName,
+    /// There is a folder of that name there already.
+    FolderTaken(String),
+    NoFolder(io::Error),
 }
 
 impl fmt::Display for Refused {
@@ -207,6 +234,9 @@ impl fmt::Display for Refused {
             Self::NoName => f.write_str("A document needs a name."),
             Self::Taken(name) => write!(f, "There is already a document called \u{201c}{name}\u{201d} in that folder."),
             Self::Io(error) => write!(f, "The document could not be moved: {error}."),
+            Self::NoFolderName => f.write_str("A folder needs a name."),
+            Self::FolderTaken(name) => write!(f, "There is already a folder called \u{201c}{name}\u{201d} there."),
+            Self::NoFolder(error) => write!(f, "The folder could not be made: {error}."),
         }
     }
 }

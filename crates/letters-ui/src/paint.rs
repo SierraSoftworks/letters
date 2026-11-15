@@ -12,6 +12,7 @@ use crate::input::InputState;
 use crate::layout::inner;
 use crate::style::{Edges, Ring};
 use crate::text::{Shaped, TextStyle};
+use crate::theme::accent;
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::tree::{Id, Tree};
 
@@ -66,8 +67,8 @@ pub(crate) struct Scene<'a> {
     pub focus: Option<Id>,
     /// Whether focus came from the keyboard, which is when a ring is drawn.
     pub focus_visible: bool,
-    /// Whether the blinking caret is in its visible half.
-    pub caret: bool,
+    /// The element whose caret shows, while the blink is in its visible half.
+    pub caret: Option<Id>,
     pub inputs: &'a HashMap<Id, InputState>,
     pub scroll: &'a HashMap<Id, f32>,
     pub tip: Option<&'a Tip>,
@@ -196,7 +197,7 @@ fn node<M>(
                 let (start, end) = state.ordered(&input.value);
                 if focused && composing.is_none() && start != end {
                     let rect = span(start..end, top, shaped.size.height);
-                    out.push(Item::Fill { rect, color: color(fade(tokens::ACCENT, 0.3)), radius: 0.0 });
+                    out.push(Item::Fill { rect, color: color(fade(accent().base, 0.3)), radius: 0.0 });
                 }
                 match &n.hint {
                     Some(hint) => hint.paint(Point { x: content.x, y: top }, color(tokens::FG_SUBTLE), out),
@@ -207,7 +208,7 @@ fn node<M>(
                     let rect = span(range, top + shaped.baseline + 2.0, 1.0);
                     out.push(Item::Fill { rect, color: color(fg), radius: 0.0 });
                 }
-                if focused && scene.caret {
+                if scene.caret == Some(n.id) {
                     let x = left + shaped.x_at(state.caret(&input.value));
                     let rect = Rect::new(x, top, CARET, shaped.size.height);
                     out.push(Item::Fill { rect, color: color(fg), radius: 0.0 });
@@ -217,7 +218,7 @@ fn node<M>(
         }
         Content::Canvas(canvas) => {
             canvas.paint.paint(content, intersect(visible, content), scene.scheme, out);
-            if let Some(caret) = canvas.caret.filter(|_| focused && scene.caret) {
+            if let Some(caret) = canvas.caret.filter(|_| scene.caret == Some(n.id)) {
                 let rect =
                     Rect { x: content.x + caret.x, y: content.y + caret.y, width: caret.width.max(CARET), ..caret };
                 out.push(Item::Fill { rect, color: color(fg), radius: 0.0 });
@@ -250,7 +251,7 @@ fn node<M>(
         if let Some(grow) = offset {
             let ring = Rect::new(rect.x - grow, rect.y - grow, rect.width + 2.0 * grow, rect.height + 2.0 * grow);
             let radius = if style.radius > 0.0 { (style.radius + grow).max(0.0) } else { 0.0 };
-            let ink = el.focused.border.unwrap_or(tokens::FOCUS);
+            let ink = el.focused.border.unwrap_or(accent().focus());
             rings.push(Item::Stroke { rect: ring, color: color(ink), width: RING, radius });
         }
     }

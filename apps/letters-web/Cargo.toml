@@ -20,10 +20,18 @@ letters-model.workspace = true
 letters-render.workspace = true
 letters-editor.workspace = true
 letters-ui.workspace = true
+letters-fonts.workspace = true
+letters-math.workspace = true
+letters-spell.workspace = true
+letters-trust.workspace = true
 
+accesskit.workspace = true
 wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 web-sys = { workspace = true, features = [
+  "Blob",
+  "BlobPropertyBag",
   "CanvasRenderingContext2d",
   "ClipboardEvent",
   "CompositionEvent",
@@ -31,23 +39,58 @@ web-sys = { workspace = true, features = [
   "CssStyleDeclaration",
   "DataTransfer",
   "Document",
+  "DragEvent",
   "DomRect",
   "Element",
   "Event",
   "EventTarget",
+  "File",
+  "FileList",
+  "HtmlAnchorElement",
   "HtmlCanvasElement",
   "HtmlElement",
+  "HtmlIFrameElement",
+  "HtmlInputElement",
   "HtmlTextAreaElement",
+  "ImageBitmap",
   "ImageData",
   "InputEvent",
   "KeyboardEvent",
+  "Location",
   "MediaQueryList",
   "MouseEvent",
   "Navigator",
   "Node",
   "Performance",
   "PointerEvent",
+  "Response",
+  "Storage",
+  "Url",
   "WheelEvent",
   "Window",
   "console",
 ] }
+
+# A page's first paint is the document's HTML export, which a server writes when it builds the page. The
+# browser's own build does not carry the export.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+letters-convert.workspace = true
+
+# The PDF export is a module of its own, which the page fetches when the person first prints.
+[[example]]
+name = "print"
+crate-type = ["cdylib"]
+
+[dev-dependencies]
+letters-layout.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+letters-convert.workspace = true
+
+# The browser fetches the fonts, the maths faces and the dictionaries beside the wasm, so they are cached
+# apart from it and only the fonts hold up the first frame. Only the wasm build leaves them out: a feature
+# named here for every target would take them from the native tests too.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+letters-fonts = { workspace = true, features = ["provided"] }
+letters-math = { workspace = true, features = ["provided"] }
+letters-spell = { workspace = true, features = ["provided"] }

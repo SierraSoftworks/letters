@@ -2,8 +2,12 @@
 
 mod common;
 
+use std::cmp::Ordering;
+
 use common::{doc, pair, sync, typed};
-use letters_model::{Change, Document, Model, Op, OpError, Page, ReplicaId, Style, TextStyle};
+use letters_model::{
+    Change, Document, Extra, Model, Op, OpError, Page, Properties, PropertiesFormat, ReplicaId, Style, TextStyle,
+};
 
 /// Sets the style of first headings to the built-in one with a change.
 fn heading(change: impl FnOnce(&mut TextStyle)) -> Op {
@@ -25,6 +29,11 @@ fn narrow() -> Style {
     style
 }
 
+/// The front matter of a Markdown file.
+fn front_matter() -> Properties {
+    Properties { format: PropertiesFormat::Yaml, source: "title: Hello\n".into(), extra: Extra::new() }
+}
+
 /// Everything a model shows.
 fn shown(model: &Model) -> (Document, Style) {
     (model.doc().clone(), model.style().clone())
@@ -44,6 +53,12 @@ fn a_setting_is_an_edit_that_can_be_taken_back() {
         ("the language", Op::SetLanguage { language: "fr".into() }, |m| m.doc().language == "fr", false),
         ("a word", Op::AddWord { word: "mot".into() }, |m| m.doc().dictionary.contains("mot"), false),
         ("no word", Op::RemoveWord { word: "Letters".into() }, |m| !m.doc().dictionary.contains("Letters"), false),
+        (
+            "properties",
+            Op::SetProperties { properties: Some(front_matter()) },
+            |m| m.doc().properties == Some(front_matter()),
+            false,
+        ),
     ];
     for (name, op, holds, style) in cases {
         let mut model = Model::new(doc(), ReplicaId::from(1));
@@ -153,6 +168,16 @@ fn a_file_opens_with_the_style_it_holds() {
         other.merge(&model.save()).unwrap();
         assert_eq!(other.style(), &style, "{name}");
     }
+}
+
+#[test]
+fn a_model_given_no_style_takes_the_one_its_file_holds() {
+    let history = Model::new(doc(), ReplicaId::from(1)).with_style(narrow()).save();
+    let mut model = Model::new(doc(), ReplicaId::from(2));
+    let change = model.attach(Model::new(doc(), ReplicaId::from(2)).prepare(Some(&history)).unwrap());
+    assert!(change.style && change.blocks.is_empty());
+    assert_eq!(model.style(), &narrow());
+    assert_eq!(model.compare(&history), Ok(Some(Ordering::Equal)), "nothing is written for it");
 }
 
 #[test]

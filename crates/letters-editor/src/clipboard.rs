@@ -4,13 +4,13 @@
 //! into Letters loses nothing. Other applications read the HTML it wraps, or the plain text, which is
 //! Markdown. What other applications copied is read from its HTML, or from its text as Markdown.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use letters_convert::{from_html, from_markdown, to_html_fragment, to_markdown};
-use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Op, Pos, Run};
+use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Op, Pos, PropertiesFormat, Run};
 use serde_json::Value;
 
-use crate::{Clip, Editor, Platform, text, tree};
+use crate::{Clip, Editor, Platform, parts, refs, text, tree};
 
 /// The HTML attribute that holds the copied blocks.
 const CARRIER: &str = "data-letters-blocks";
@@ -72,7 +72,17 @@ fn to_text(blocks: &[Block]) -> String {
 
 /// The blocks that text from another application stands for, read as Markdown.
 fn from_text(text: &str, platform: &mut dyn Platform) -> Vec<Block> {
-    let mut read = |markdown: &str| from_markdown(markdown, &mut || platform.new_id()).0.blocks;
+    let mut read = |markdown: &str| {
+        let mut doc = from_markdown(markdown, &mut || platform.new_id()).0;
+        // Front matter is read as the properties of a document, and a paste is not one. Its lines stay.
+        if let Some(properties) = doc.properties {
+            let language = if properties.format == PropertiesFormat::Toml { "toml" } else { "yaml" };
+            let kind = BlockKind::Code { language: Some(language.into()) };
+            let source = properties.source.strip_suffix('\n').unwrap_or(&properties.source);
+            doc.blocks.insert(0, Block::text(platform.new_id().as_str(), kind, source));
+        }
+        doc.blocks
+    };
     let line = text.trim_matches('\n');
     if line.contains('\n') {
         return read(text);
@@ -103,30 +113,59 @@ fn last_text(blocks: &[Block]) -> Option<&Block> {
     })
 }
 
-/// A copy of `block` with the body `leaf` gives each text block or divider. A leaf it gives nothing is left
-/// out, and so is a container left with nothing in it.
-fn keep(block: &Block, leaf: &dyn Fn(&Block) -> Option<Body>) -> Option<Block> {
-    let body = match &block.body {
-        Body::Blocks(children) => {
-            let kept: Vec<Block> = children.iter().filter_map(|child| keep(child, leaf)).collect();
-            (!kept.is_empty()).then_some(Body::Blocks(kept))?
+/// A copy of `block` with what `leaf` makes of each text block or divider. A leaf it makes nothing of is
+/// left out, and so is a container left with nothing in it. A row comes whole when `leaf` keeps any of its
+/// cells, so that a table keeps its shape.
+fn keep(block: &Block, leaf: &dyn Fn(&Block) -> Option<Block>) -> Option<Block> {
+    let Body::Blocks(children) = &block.body else { return leaf(block) };
+    if block.kind == BlockKind::TableRow {
+        return children.iter().any(|cell| leaf(cell).is_some()).then(|| block.clone());
+    }
+    let kept: Vec<Block> = children.iter().filter_map(|child| keep(child, leaf)).collect();
+    let (first, lang) = (kept.first()?.id.clone(), block.lang.clone());
+    let mut kind = block.kind.clone();
+    if let BlockKind::Table { header, .. } = &mut kind {
+        // Only its first row can head a table.
+        *header &= children.first().is_some_and(|row| row.id == first);
+    }
+    let (id, body, extra) = (block.id.clone(), Body::Blocks(kept), block.extra.clone());
+    Some(Block { id, kind, body, lang, page_break: block.page_break, extra })
+}
+
+/// The text of every block as one stretch of runs, with a space where one block ends and the next begins.
+fn flat(blocks: &[Block]) -> Vec<Run> {
+    let mut runs: Vec<Run> = Vec::new();
+    for block in blocks {
+        let inner = match &block.body {
+            Body::Text(runs) => {
+                runs.iter().map(|run| Run { text: run.text.replace('\n', " "), ..run.clone() }).collect()
+            }
+            Body::Blocks(children) => flat(children),
+            Body::None => Vec::new(),
+        };
+        if !runs.is_empty() && inner.iter().any(|run| !run.text.is_empty()) {
+            runs.push(Run::plain(" "));
         }
-        _ => leaf(block)?,
-    };
-    Some(Block { id: block.id.clone(), kind: block.kind.clone(), body, extra: block.extra.clone() })
+        runs.extend(inner.into_iter().filter(|run| !run.text.is_empty()));
+    }
+    runs
 }
 
 /// Gives `block` and the blocks inside it new ids where theirs are `taken`. A block that was cut comes
 /// back under its own id, so whatever refers to it still does, and a copy is a block of its own.
-fn renew(block: &mut Block, taken: &mut BTreeSet<BlockId>, platform: &mut dyn Platform) {
+fn renew(block: &mut Block, taken: &mut BTreeSet<BlockId>, renewed: &mut Renewed, platform: &mut dyn Platform) {
     if !taken.insert(block.id.clone()) {
-        block.id = BlockId::new(platform.new_id());
+        let old = std::mem::replace(&mut block.id, BlockId::new(platform.new_id()));
         taken.insert(block.id.clone());
+        renewed.insert(old, block.id.clone());
     }
     if let Body::Blocks(children) = &mut block.body {
-        children.iter_mut().for_each(|child| renew(child, taken, platform));
+        children.iter_mut().for_each(|child| renew(child, taken, renewed, platform));
     }
 }
+
+/// The new id of each pasted block that was given one.
+type Renewed = BTreeMap<BlockId, BlockId>;
 
 impl Editor {
     /// The selection as blocks that stand on their own.
@@ -134,12 +173,16 @@ impl Editor {
         let Some(selection) = self.selection() else { return Vec::new() };
         let (start, end) = self.ordered(selection);
         let doc = self.doc();
+        if let Some(figure) = self.picture() {
+            return doc.block(figure).cloned().into_iter().collect();
+        }
         if start.block == end.block {
             let Some(block) = doc.block(&start.block) else { return Vec::new() };
-            // Part of a block is only text. A whole block keeps its kind.
+            // Part of a block is only text, and so is the text of a caption or a cell. Any other whole
+            // block keeps its kind.
             let whole = start.offset == 0 && end.offset == text::len(block);
             let mut piece = block.clone();
-            if !whole {
+            if !whole || self.part(&block.id) {
                 piece.kind = BlockKind::Paragraph;
             }
             piece.body = Body::Text(text::slice(block.body.runs(), start.offset..end.offset));
@@ -151,23 +194,36 @@ impl Editor {
         // The fragment starts at the deepest quote or callout that holds both ends, so text copied inside
         // one does not bring it along.
         let mut scope = &doc.blocks;
-        let holds = |block: &&Block| tree::contains(block, &start.block) && tree::contains(block, &end.block);
+        let holds = |block: &&Block| {
+            let quote = matches!(block.kind, BlockKind::Quote | BlockKind::Callout { .. });
+            quote && tree::contains(block, &start.block) && tree::contains(block, &end.block)
+        };
         while let Some(Body::Blocks(children)) = scope.iter().find(holds).map(|block| &block.body) {
             scope = children;
         }
+        let taken = self.taken(&start, &end);
         let leaf = |block: &Block| {
             let at = index(&block.id);
-            match &block.body {
+            let body = match &block.body {
+                _ if taken.contains(&block.id) => return Some(block.clone()),
                 Body::Text(runs) if (from..=to).contains(&at) => {
                     let from_offset = if at == from { start.offset } else { 0 };
                     let to_offset = if at == to { end.offset } else { text::len(block) };
-                    Some(Body::Text(text::slice(runs, from_offset..to_offset)))
+                    Body::Text(text::slice(runs, from_offset..to_offset))
                 }
-                Body::None if from < at && at < to => Some(Body::None),
-                _ => None,
+                Body::None if from < at && at < to => Body::None,
+                _ => return None,
+            };
+            let mut piece = Block { body, ..block.clone() };
+            if tree::is_figure(block) {
+                // A figure that is not taken whole gives the text of its caption that is.
+                piece.kind = BlockKind::Paragraph;
+                return Some(piece).filter(|piece| text::len(piece) > 0);
             }
+            Some(piece)
         };
-        scope.iter().filter_map(|block| keep(block, &leaf)).collect()
+        // A gallery copied with one of its pictures is that picture.
+        parts::settled(scope.iter().filter_map(|block| keep(block, &leaf)).collect())
     }
 
     pub(crate) fn copy(&mut self, platform: &mut dyn Platform) {
@@ -180,7 +236,10 @@ impl Editor {
 
     pub(crate) fn cut(&mut self, platform: &mut dyn Platform) {
         self.copy(platform);
-        self.delete_selection();
+        match self.picture().cloned() {
+            Some(figure) => self.remove_picture(&figure),
+            None => _ = self.delete_selection(),
+        }
     }
 
     /// Pastes the clipboard over the selection. `plain` takes only its text.
@@ -189,8 +248,21 @@ impl Editor {
         if !self.ensure_caret(platform) {
             return;
         }
+        if !plain && clip.text.is_empty() && clip.html.is_none() && !clip.pictures.is_empty() {
+            // Pictures alone come in as figures. Beside words they are a rendering of the words.
+            self.delete_selection();
+            return self.insert_figures(&clip.pictures, None, platform);
+        }
+        if self.picture().is_some() {
+            // A picture is not typed over. What is pasted with one selected goes on a line after it.
+            if clip.text.is_empty() && clip.html.is_none() {
+                return;
+            }
+            self.line_after(platform);
+        }
         let Some(selection) = self.selection() else { return };
-        let code = self.block(&selection.head.block).is_some_and(text::is_code);
+        // Source takes text as it is written: code, and a formula's TeX.
+        let code = self.block(&selection.head.block).is_some_and(text::is_source) || self.formula().is_some();
         let ranged = !selection.is_caret();
         let address = clip.text.trim();
         if !plain && !code && ranged && is_address(address) {
@@ -217,17 +289,25 @@ impl Editor {
     }
 
     /// Replaces the selection with `blocks`. Text poured into the block at the caret also takes `marks`.
-    fn insert_blocks(&mut self, mut blocks: Vec<Block>, marks: &BTreeSet<Mark>, platform: &mut dyn Platform) {
+    fn insert_blocks(&mut self, blocks: Vec<Block>, marks: &BTreeSet<Mark>, platform: &mut dyn Platform) {
         self.delete_selection();
         let Some(at) = self.selection().map(|selection| selection.head.clone()) else { return };
+        let mut blocks = parts::settled(blocks);
         let mut taken: BTreeSet<BlockId> = self.doc().walk().map(|block| block.id.clone()).collect();
-        blocks.iter_mut().for_each(|block| renew(block, &mut taken, platform));
+        let mut renewed = Renewed::new();
+        blocks.iter_mut().for_each(|block| renew(block, &mut taken, &mut renewed, platform));
+        refs::relink(&mut blocks, &renewed, &taken);
         let doc = self.doc();
-        let (Some(target), Some(place)) = (doc.block(&at.block), tree::place(doc, &at.block)) else { return };
+        let (Some(target), Some(place)) = (doc.block(&at.block), self.seat(&at.block)) else { return };
         let (len, parent, index) = (text::len(target), place.parent_id(), place.index + 1);
 
+        if tree::is_part(target, place.parent) {
+            // A caption and a cell hold one stretch of text, so what is pasted goes in as that.
+            let line = Block { body: Body::Text(flat(&blocks)), ..Block::new("", BlockKind::Paragraph) };
+            return self.insert_runs(&at, &line, marks);
+        }
         if let [only] = blocks.as_slice()
-            && tree::is_text(only)
+            && tree::flows(only)
         {
             // A single block of text is poured into the block at the caret, which takes its kind if it was
             // an empty paragraph.
@@ -251,13 +331,13 @@ impl Editor {
         });
         self.apply(inserts.collect());
         let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else { return };
-        if at.offset > 0 && tree::is_text(first) {
+        if at.offset > 0 && tree::flows(first) {
             self.apply(vec![Op::Join { block: first.id.clone() }]);
         } else if at.offset == 0 && last_text(&blocks).is_some() {
             // The block at the caret had nothing before the caret, so the pasted blocks take its place.
             self.apply(vec![Op::RemoveBlock { block: at.block.clone() }]);
         }
-        let end = if tree::is_text(last) {
+        let end = if tree::flows(last) {
             let end = Pos::new(last.id.clone(), text::len(last));
             if let Some(tail) = tail {
                 self.apply(vec![Op::Join { block: tail }]);
@@ -272,7 +352,7 @@ impl Editor {
         let end = end.and_then(|pos| self.clamp(&pos));
         let end = end.or_else(|| self.clamp(&Pos::new(at.block.clone(), usize::MAX)));
         if let Some(end) = end {
-            self.place(end);
+            self.land(self.arrive(end));
         }
     }
 

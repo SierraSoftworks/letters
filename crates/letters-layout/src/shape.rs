@@ -39,6 +39,12 @@ impl Shaper {
         Self { state: RefCell::new((Engine::new(&fonts), Layout::new())) }
     }
 
+    /// Adds faces to the fonts given at the start, as [`crate::DocLayout::add_fonts`] does. Strings shaped
+    /// before are not changed: shape again whatever named a family or an italic that was not there.
+    pub fn add_fonts(&self, fonts: &Fonts) -> bool {
+        self.state.borrow_mut().0.add(fonts)
+    }
+
     /// Shapes `text`. With `max_width` it wraps to that width, and without one only line breaks in the text
     /// start a new line.
     pub fn shape(&self, text: &str, font: &FontSpec, max_width: Option<f32>) -> ShapedText {

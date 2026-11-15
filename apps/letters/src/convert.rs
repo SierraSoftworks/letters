@@ -1,7 +1,9 @@
 //! The `export` and `import` subcommands: documents to and from other formats, with no window.
 //!
-//! - [`export`] writes one document as Markdown or as a single HTML file.
-//! - [`import`] makes a document beside each Markdown file and prints a line for each.
+//! - [`export`] writes one document as Markdown, as a single HTML file, as a Word document or as a PDF.
+//!   Markdown cannot hold a picture, so the document's pictures are written beside it.
+//! - [`import`] makes a document beside each Markdown or Word file and prints a line for each. The pictures
+//!   a Markdown file shows come along.
 //!
 //! Neither changes a file that is already there: an export asks for `--force` first, and an import skips.
 
@@ -10,20 +12,22 @@ use std::fs;
 use std::io::{self, Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use letters_convert::{ImportNote, from_markdown, to_html, to_markdown};
-use letters_format::{Archive, Package};
-use letters_model::{Anchor, Block, BlockKind, Body, Document, Mark, Note, NoteKind, Notes, Run, Style};
+use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf};
+use letters_format::{Archive, OPLOG};
+use letters_layout::Fonts;
+use letters_model::{Block, BlockKind, Body, Document, Mark, Model, ReplicaId, Run, Style};
 use serde_json::json;
 
 use crate::cli::{Export, Format, Import, Output};
-use crate::{files, platform};
+use crate::files;
+use crate::import::{Choices, Plan, normal};
 
-/// The extensions of the files an import looks for in a folder.
-const MARKDOWN: [&str; 2] = ["md", "markdown"];
-/// The name import notes are written under.
-const IMPORTER: &str = "Letters import";
-
+/// The extensions of the Markdown files an import looks for in a folder.
+pub(crate) const MARKDOWN: [&str; 2] = ["md", "markdown"];
+/// The extension of the Word files it looks for.
+pub(crate) const WORD: &str = "docx";
 /// Runs `letters export`.
 pub fn export(export: &Export) -> ExitCode {
     match try_export(export) {
@@ -39,51 +43,109 @@ fn try_export(export: &Export) -> Result<(), String> {
     let name = export.file.display();
     let failed = |error: &dyn std::fmt::Display| format!("{name}: {error}");
     let bytes = fs::read(&export.file).map_err(|error| failed(&error))?;
-    let mut archive = Archive::open(Cursor::new(bytes)).map_err(|error| failed(&error))?;
-    let document = archive.document().map_err(|error| failed(&error))?;
-    // An export says what it will simplify before it writes.
-    for line in simplified(&document, export.to) {
+    let title = export.file.file_stem().unwrap_or_default().to_string_lossy();
+    let exported = exported(bytes, &title, export.to).map_err(|error| failed(&error))?;
+    // An export says what it simplified before it writes.
+    for line in &exported.simplified {
         eprintln!("letters: {name}: {line}");
     }
-    let text = match export.to {
-        Format::Markdown => to_markdown(&document),
-        Format::Html => {
-            // A style this build cannot read gives way to the built-in one, as it does on screen.
-            let style = archive.style().unwrap_or_default();
-            let title = export.file.file_stem().unwrap_or_default().to_string_lossy();
-            // An image that cannot be read is treated as missing, and its description stands in for it.
-            to_html(&document, &style, &title, &mut |name| archive.read(name).ok().flatten())
-        }
-    };
-
     let output = match &export.output {
-        Some(Output::Stdout) => return io::stdout().write_all(text.as_bytes()).map_err(|error| error.to_string()),
+        Some(Output::Stdout) => return io::stdout().write_all(&exported.bytes).map_err(|error| error.to_string()),
         Some(Output::File(path)) => path.clone(),
         None => export.file.with_extension(export.to.extension()),
     };
-    write(&output, text.as_bytes(), export.force).map_err(|error| match error.kind() {
+    exported.write(&output, export.force).map_err(|(path, error)| match error.kind() {
         io::ErrorKind::AlreadyExists => {
-            format!("{} is already there: pass --force to replace it, or --output to write elsewhere", output.display())
+            format!("{} is already there: pass --force to replace it, or --output to write elsewhere", path.display())
         }
-        _ => format!("{}: {error}", output.display()),
+        _ => format!("{}: {error}", path.display()),
     })?;
     println!("{name} -> {}", output.display());
     Ok(())
 }
 
+/// A document as another format holds it.
+pub struct Exported {
+    /// The one file the format writes.
+    pub bytes: Vec<u8>,
+    /// What goes beside that file: the pictures a Markdown file shows, each by its path from the file's
+    /// folder. The other formats hold their own.
+    pub pictures: Vec<(String, Vec<u8>)>,
+    /// What the format could not carry over, a line for each kind of loss.
+    pub simplified: Vec<String>,
+}
+
+/// Writes the document in `file`, the bytes of a `.let` file, in another format. `title` is what the
+/// document is called where the format has a place for a name.
+pub fn exported(file: Vec<u8>, title: &str, to: Format) -> Result<Exported, String> {
+    let failed = |error: letters_format::Error| error.to_string();
+    let mut archive = Archive::open(Cursor::new(file)).map_err(failed)?;
+    let document = archive.document().map_err(failed)?;
+    // A style this build cannot read gives way to the built-in one, as it does on screen.
+    let style = archive.style().unwrap_or_default();
+    let bytes = match to {
+        Format::Markdown => to_markdown(&document).into_bytes(),
+        // An image that cannot be read is treated as missing, and its description stands in for it.
+        Format::Html => to_html(&document, &style, title, &mut |name| archive.read(name).ok().flatten()).into_bytes(),
+        Format::Docx => {
+            // Notes that cannot be read are left behind: the text matters more than its comments.
+            let notes = archive.notes().unwrap_or_default();
+            to_docx(&document, &style, &notes, title, &mut |name| archive.read(name).ok().flatten())
+        }
+        Format::Pdf => {
+            let fonts = Fonts { faces: letters_fonts::bundled() };
+            let created = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|since| since.as_secs());
+            // Who wrote a document is in its history. A file with none, or with one this build cannot read,
+            // names nobody.
+            let history = archive.read(OPLOG).ok().flatten();
+            let model = history.and_then(|history| Model::load(&history, ReplicaId::new("export")).ok());
+            let authors = model.map(|model| model.authors().into_iter().collect()).unwrap_or_default();
+            let info = PdfInfo { title: title.to_owned(), authors, created };
+            to_pdf(&document, &style, fonts, &mut |name| archive.read(name).ok().flatten(), &info)
+                .map_err(|error| error.to_string())?
+        }
+    };
+    // The Markdown names each picture by its entry in the file, as a path from its own folder. A name
+    // that climbs out of that folder is not written, whatever the file says it holds.
+    let inside = |entry: &String| Path::new(entry).components().all(|part| matches!(part, Component::Normal(_)));
+    let entries = markdown_assets(&document).into_iter().filter(|_| to == Format::Markdown).filter(inside);
+    let pictures = entries.filter_map(|entry| Some((archive.read(&entry).ok().flatten()?, entry)));
+    let pictures = pictures.map(|(bytes, entry)| (entry, bytes)).collect();
+    Ok(Exported { bytes, pictures, simplified: simplified(&document, to) })
+}
+
+impl Exported {
+    /// Writes the file at `output`, and what goes with it beside it. Unless `replace` is set, a file
+    /// already at `output` is left alone and reported as `AlreadyExists`. A failure names the path it
+    /// was at.
+    pub fn write(&self, output: &Path, replace: bool) -> Result<(), (PathBuf, io::Error)> {
+        write(output, &self.bytes, replace).map_err(|error| (output.to_owned(), error))?;
+        let folder = output.parent().unwrap_or(Path::new(""));
+        for (entry, bytes) in &self.pictures {
+            let picture = folder.join(entry);
+            let made = fs::create_dir_all(picture.parent().unwrap_or(folder));
+            match made.and_then(|()| write(&picture, bytes, replace)) {
+                // A picture is named after what it holds, so one that is there already is this one.
+                Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err((picture, error)),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 /// What the format cannot carry over, a line for each kind of loss.
 fn simplified(document: &Document, to: Format) -> Vec<String> {
     let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    // HTML already writes figures, which the model has yet to learn.
-    let known = |name: &str| to == Format::Html && name == "figure";
-    let lost = |block: &&Block| matches!(&block.kind, BlockKind::Unknown { type_name } if !known(type_name));
-    let unknown = document.walk().filter(lost).count();
+    let unknown = document.walk().filter(|block| matches!(block.kind, BlockKind::Unknown { .. })).count();
     let other = |run: &&Run| run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)));
     let marks = document.walk().flat_map(|block| block.body.runs()).filter(other).count();
     let mut lines = Vec::new();
     if unknown > 0 {
         let blocks = count(unknown, "block is", "blocks are");
-        lines.push(format!("{blocks} of a kind this version does not know, and written as fallback text"));
+        // A page shows what the screen shows, which for these is a placeholder that names the kind.
+        let shown = if to == Format::Pdf { "shown as a placeholder" } else { "written as fallback text" };
+        lines.push(format!("{blocks} of a kind this version does not know, and {shown}"));
     }
     if marks > 0 {
         lines.push(format!(
@@ -91,11 +153,23 @@ fn simplified(document: &Document, to: Format) -> Vec<String> {
             count(marks, "passage", "passages")
         ));
     }
+    if to == Format::Docx {
+        // Word has no block that holds others, so only what is one paragraph there can take a quote's style.
+        let boxes = document.walk().filter(|block| matches!(block.kind, BlockKind::Quote | BlockKind::Callout { .. }));
+        let kept =
+            |kind: &BlockKind| matches!(kind, BlockKind::Paragraph | BlockKind::ListItem { .. } | BlockKind::Formula);
+        let plain = |block: &&Block| !kept(&block.kind);
+        let outside = boxes.flat_map(|outer| outer.body.blocks()).filter(plain).count();
+        if outside > 0 {
+            let blocks = count(outside, "block inside a quote or callout is", "blocks inside quotes or callouts are");
+            lines.push(format!("{blocks} written outside it, since Word cannot nest them"));
+        }
+    }
     lines
 }
 
 /// Writes a file. Unless `replace` is set, one that is already there is left alone and reported.
-fn write(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
+pub(crate) fn write(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
     let mut options = fs::OpenOptions::new();
     options.write(true);
     if replace {
@@ -133,10 +207,15 @@ pub fn import(import: &Import) -> ExitCode {
     for path in &import.paths {
         find(path, import.recursive, &mut found);
     }
+    // Pictures come from what was asked for: each folder named, the folder of each file named, and any
+    // folder added for them.
+    let folder = |path: &PathBuf| if path.is_dir() { normal(path) } else { normal(path.parent().unwrap_or(path)) };
+    let roots: Vec<PathBuf> =
+        import.paths.iter().map(folder).chain(import.pictures.iter().map(|path| normal(path))).collect();
     let mut sources = BTreeSet::new();
     found.retain(|(path, error)| error.is_some() || sources.insert(normal(path)));
     if found.is_empty() {
-        eprintln!("letters: no Markdown files to import");
+        eprintln!("letters: no Markdown or Word files to import");
     }
 
     let style = files::new_style(std::env::home_dir().as_deref());
@@ -145,7 +224,7 @@ pub fn import(import: &Import) -> ExitCode {
     for (source, error) in found {
         let outcome = match error {
             Some(error) => Outcome::Failed { error },
-            None => import_file(&source, &style, &sources),
+            None => import_file(&source, &style, &sources, &roots),
         };
         failures |= matches!(outcome, Outcome::Failed { .. });
         let line = if import.json { json_line(&source, &outcome) } else { text_line(&source, &outcome) };
@@ -180,8 +259,8 @@ fn json_line(source: &Path, outcome: &Outcome) -> String {
     line.to_string()
 }
 
-/// Lists what a path names: itself, or for a folder the Markdown files in it, by name, before those of the
-/// folders inside it. Hidden files and folders are passed over, and a linked folder is not followed.
+/// Lists what a path names: itself, or for a folder the Markdown and Word files in it, by name, before those
+/// of the folders inside it. Hidden files and folders are passed over, and a linked folder is not followed.
 fn find(path: &Path, recursive: bool, found: &mut Vec<(PathBuf, Option<String>)>) {
     if !path.is_dir() {
         // A file named outright is imported whatever it is called. If it is missing, reading it says so.
@@ -197,7 +276,8 @@ fn find(path: &Path, recursive: bool, found: &mut Vec<(PathBuf, Option<String>)>
     entries.sort_by_key(|entry| entry.file_name());
     let (folders, files): (Vec<_>, Vec<_>) =
         entries.into_iter().partition(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()));
-    for file in files.iter().map(|entry| entry.path()).filter(|file| is_markdown(file) && file.is_file()) {
+    let wanted = |file: &PathBuf| (is_markdown(file) || is_word(file)) && file.is_file();
+    for file in files.iter().map(|entry| entry.path()).filter(wanted) {
         found.push((file, None));
     }
     for folder in folders.iter().filter(|_| recursive) {
@@ -205,72 +285,38 @@ fn find(path: &Path, recursive: bool, found: &mut Vec<(PathBuf, Option<String>)>
     }
 }
 
-fn is_markdown(path: &Path) -> bool {
+pub(crate) fn is_markdown(path: &Path) -> bool {
     let extension = path.extension().unwrap_or_default();
     MARKDOWN.iter().any(|known| extension.eq_ignore_ascii_case(known))
 }
 
-/// A path from the root with its `.` and `..` worked out, so that two spellings of one file compare equal.
-fn normal(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for part in std::path::absolute(path).unwrap_or_else(|_| path.into()).components() {
-        match part {
-            Component::CurDir => {}
-            Component::ParentDir => _ = out.pop(),
-            part => out.push(part),
-        }
-    }
-    out
+pub(crate) fn is_word(path: &Path) -> bool {
+    path.extension().unwrap_or_default().eq_ignore_ascii_case(WORD)
 }
 
-/// Makes a document beside one Markdown file. `sources` holds every file of this import, by [`normal`] path.
-fn import_file(source: &Path, style: &Style, sources: &BTreeSet<PathBuf>) -> Outcome {
+/// Makes a document beside one Markdown or Word file. `sources` holds every file of this import, by
+/// [`normal`] path, and `roots` the folders its pictures may be read from.
+fn import_file(source: &Path, style: &Style, sources: &BTreeSet<PathBuf>, roots: &[PathBuf]) -> Outcome {
     let failed = |error: &dyn std::fmt::Display| Outcome::Failed { error: error.to_string() };
     let output = source.with_extension(files::EXTENSION);
+    // A document is a zip too, so this comes before the file is looked into.
     if output.exists() {
         return Outcome::Skipped { output };
     }
-    let markdown = match fs::read_to_string(source) {
-        Ok(markdown) => markdown,
+    let choices = Choices { pictures: roots.to_vec(), comments: true };
+    let mut imported = match Plan::of(source, style) {
+        Ok(plan) => plan.import(&choices),
         Err(error) => return failed(&error),
     };
-    let (mut document, simplified) = from_markdown(&markdown, &mut platform::block_id);
-    if document.blocks.is_empty() {
-        document = files::blank();
-    }
-    relink(&mut document.blocks, source.parent().unwrap_or(Path::new("")), sources);
-
-    let created = platform::now_rfc3339();
-    let mut package =
-        Package { id: platform::document_id(), created: created.clone(), document, entries: Default::default() };
-    package.set_style(style);
-    if !simplified.is_empty() {
-        let notes = simplified.iter().map(|note| import_note(note, &created)).collect();
-        package.set_notes(&Notes { notes, ..Notes::default() });
-    }
+    relink(&mut imported.package.document.blocks, source.parent().unwrap_or(Path::new("")), sources);
     let mut bytes = Cursor::new(Vec::new());
-    if let Err(error) = letters_format::write(&mut bytes, &package) {
+    if let Err(error) = letters_format::write(&mut bytes, &imported.package) {
         return failed(&error);
     }
     match write(&output, bytes.get_ref(), false) {
-        Ok(()) => Outcome::Imported { output, notes: simplified.len() },
+        Ok(()) => Outcome::Imported { output, notes: imported.notes },
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Outcome::Skipped { output },
         Err(error) => failed(&error),
-    }
-}
-
-/// The note that marks, on its block, something the import simplified.
-fn import_note(note: &ImportNote, created: &str) -> Note {
-    Note {
-        id: platform::block_id(),
-        kind: NoteKind::Import,
-        anchor: Anchor::block(note.block.as_str()),
-        author: IMPORTER.into(),
-        created: created.into(),
-        resolved: false,
-        content: vec![Run::plain(note.message.as_str())],
-        replies: Vec::new(),
-        extra: Default::default(),
     }
 }
 

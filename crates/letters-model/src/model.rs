@@ -5,26 +5,29 @@
 //! [`Model::doc`] is a view of that history, brought up to date by each change and never rebuilt.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use loro::cursor::{Cursor, Side};
-use loro::{ContainerTrait, ExportMode, LoroDoc, LoroText, LoroValue, Subscription, TextDelta};
+use loro::{ContainerTrait, ExportMode, Frontiers, LoroDoc, LoroText, LoroValue, Subscription, TextDelta};
 
+use crate::conflict::{self, Conflict};
 use crate::crdt::{self, Assign, Event, attrs};
 use crate::flat::{self, BLOCK, DEPTH, Entry, Flat, children, head, insert, marker, nth, nth_mut, spell};
 use crate::history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
 use crate::undo::{Delta, Edit, Script, Step, Steps, is_skip};
-use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, Mark, Page, Pos, Run, Style, TextStyle};
+use crate::versions::{self, Point, Tag, TagKind};
+use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Mark, Page, Pos, Properties, Run, Style, TextStyle};
 
 /// One change to a document. Offsets are UTF-8 bytes into a text block and must sit on character boundaries.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     /// Inserts text, which takes the formatting of the character before it, or at the start of a block
-    /// that of the character after it.
+    /// that of the character after it. Text put at the end of a reference is no part of it.
     InsertText {
         at: Pos,
         text: String,
@@ -44,6 +47,12 @@ pub enum Op {
         range: Range<usize>,
         link: Option<String>,
     },
+    /// Sets the language of a stretch of text, or with `None` leaves it to its block's.
+    SetLang {
+        block: BlockId,
+        range: Range<usize>,
+        lang: Option<String>,
+    },
     /// Splits a text block in two. The text after `at` moves to a new block of the same kind, placed after it.
     Split {
         at: Pos,
@@ -53,12 +62,20 @@ pub enum Op {
     Join {
         block: BlockId,
     },
-    /// Changes a block's kind to another kind that holds the same shape of body.
+    /// Changes a block's kind to another kind that holds the same shape of body, or changes the fields of
+    /// its kind, as resizing a figure does.
     SetKind {
         block: BlockId,
         kind: BlockKind,
     },
-    /// Inserts a block at `index` among the children of `parent`, or at the top level.
+    /// Sets what any block may carry: whether it starts a new page, and its language as a BCP 47 tag.
+    SetBlockProps {
+        block: BlockId,
+        page_break: bool,
+        lang: Option<String>,
+    },
+    /// Inserts a block at `index` among the children of `parent`, or at the top level. Removing a block
+    /// and inserting it elsewhere under its own id, in one edit, moves it.
     InsertBlock {
         parent: Option<BlockId>,
         index: usize,
@@ -92,14 +109,20 @@ pub enum Op {
     RemoveWord {
         word: String,
     },
+    /// Sets the document's properties, or with `None` takes them away.
+    SetProperties {
+        properties: Option<Properties>,
+    },
 }
 
 /// Why an [`Op`] was refused. The document is left as it was.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpError {
     NoSuchBlock(BlockId),
-    /// The block does not hold what the operation needs (text, or child blocks).
+    /// The block does not hold what the operation needs: text, child blocks, or children of that kind.
     WrongBody(BlockId),
+    /// The kind the block was to have breaks the rules of its type, as a figure without a picture does.
+    BadKind(BlockId),
     /// An offset is past the end of the text or inside a character.
     BadOffset {
         block: BlockId,
@@ -122,6 +145,7 @@ impl fmt::Display for OpError {
         match self {
             Self::NoSuchBlock(id) => write!(f, "there is no block \"{id}\""),
             Self::WrongBody(id) => write!(f, "block \"{id}\" does not hold what this operation changes"),
+            Self::BadKind(id) => write!(f, "block \"{id}\" was given a kind that breaks the rules of its type"),
             Self::BadOffset { block, offset } => write!(f, "offset {offset} is not a position in block \"{block}\""),
             Self::BadIndex { index } => write!(f, "index {index} is past the end of the list"),
             Self::DuplicateId(id) => write!(f, "the id \"{id}\" is already in use"),
@@ -143,12 +167,13 @@ pub struct Change {
     pub structure: bool,
     /// Whether the style changed, which the layout of every block depends on.
     pub style: bool,
-    /// Whether the document's own fields changed: its language or its dictionary.
+    /// Whether the document's own fields changed: its language, its dictionary or its properties.
     pub document: bool,
 }
 
 impl Change {
-    fn absorb(&mut self, other: Change) {
+    /// Takes in what another change touched, for two that are told as one.
+    pub fn absorb(&mut self, other: Change) {
         self.blocks.extend(other.blocks);
         self.structure |= other.structure;
         self.style |= other.style;
@@ -157,7 +182,35 @@ impl Change {
 }
 
 /// The entry of a block, and where the block starts in the sequence, in characters.
-type Place = (usize, usize);
+type Seat = (usize, usize);
+
+/// Where a block sits: the block that holds it, and its place among that block's children or, at the top
+/// level, among the document's blocks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Place<'a> {
+    pub parent: Option<&'a Block>,
+    pub index: usize,
+}
+
+/// Each block's entry by the hash of its id, which is spread well enough to be the map's own hash.
+type Lookup = HashMap<u64, u32, BuildHasherDefault<Ready>>;
+
+#[derive(Default)]
+struct Ready(u64);
+
+impl Hasher for Ready {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = bytes.iter().fold(self.0, |hash, byte| hash.rotate_left(8) ^ u64::from(*byte));
+    }
+
+    fn write_u64(&mut self, hash: u64) {
+        self.0 = hash;
+    }
+}
 
 /// The history behind a document, and what it has reported since the model last caught up with it.
 struct History {
@@ -177,6 +230,16 @@ impl History {
     }
 }
 
+/// Who writes with a replica, and when: what the shell tells a model that has no clock and knows no one.
+#[derive(Clone, Debug, Default)]
+struct Pen {
+    author: Option<String>,
+    /// Whether the history holds the author's name against this replica.
+    signed: bool,
+    /// Seconds since 1970. 0 until the shell says.
+    time: u64,
+}
+
 /// One replica of a document: the document, its history and this session's undo steps.
 ///
 /// A model is not `Clone`, because two writers must never share a [`ReplicaId`]. Clone [`Model::doc`] to
@@ -186,10 +249,16 @@ pub struct Model {
     /// One entry per block, in document order.
     index: Vec<Entry>,
     style: Style,
+    /// Whether the style is this model's own: given to it, edited, or read from its history. The built-in
+    /// style a model starts with is not, and gives way to the style of a history it is handed.
+    styled: bool,
     replica: ReplicaId,
     /// Started from the document when something first needs it, unless one is attached before.
     history: OnceLock<History>,
     steps: Steps,
+    /// Made when a block is first looked up by id, and again after blocks come, go, move or are renamed.
+    lookup: OnceLock<Lookup>,
+    pen: Pen,
 }
 
 impl fmt::Debug for Model {
@@ -226,8 +295,9 @@ impl Model {
         let built = flat::normal(mem::take(&mut doc.blocks));
         doc.blocks = built.blocks;
         crdt::normal_meta(&mut doc);
-        let (index, style) = (built.index, Style::default());
-        Self { doc, index, style, replica, history: OnceLock::new(), steps: Steps::default() }
+        let (index, style, lookup) = (built.index, Style::default(), OnceLock::new());
+        let (history, steps, pen) = (OnceLock::new(), Steps::default(), Pen::default());
+        Self { doc, index, style, styled: false, replica, history, steps, lookup, pen }
     }
 
     /// The model with the style its file holds, for one that was just made.
@@ -238,6 +308,7 @@ impl Model {
             // Only an older revision refuses a style, and a model that was just made shows none.
             Some(_) => drop(self.rewrite_style(style)),
         }
+        self.styled = true;
         self
     }
 
@@ -249,7 +320,8 @@ impl Model {
         let history = History::open(loro, replica);
         let (doc, index) = crdt::read(&history.loro, &history.body);
         let style = crdt::read_style(&history.loro);
-        Ok(Self { doc, index, style, replica, history: OnceLock::from(history), steps: Steps::default() })
+        let (history, steps, lookup) = (OnceLock::from(history), Steps::default(), OnceLock::new());
+        Ok(Self { doc, index, style, styled: true, replica, history, steps, lookup, pen: Pen::default() })
     }
 
     /// A second replica at the newest revision, for another writer. It starts with no undo steps.
@@ -259,7 +331,8 @@ impl Model {
             // Both then start the same history from the same document.
             None => {
                 let (doc, index, style) = (self.doc.clone(), self.index.clone(), self.style.clone());
-                Self { doc, index, style, replica, history: OnceLock::new(), steps: Steps::default() }
+                let (history, steps, lookup) = (OnceLock::new(), Steps::default(), self.lookup.clone());
+                Self { doc, index, style, styled: self.styled, replica, history, steps, lookup, pen: Pen::default() }
             }
         }
     }
@@ -270,6 +343,7 @@ impl Model {
     ///
     /// A document or style that is not the newest in `history` was changed outside Letters. The history
     /// takes that in as one more change, as [`Model::rewrite`] does, so the file is always the document.
+    /// A model that was given no style has none to hold against the history's.
     pub fn prepare(self, history: Option<&[u8]>) -> Result<Prepared, HistoryError> {
         let model = match history {
             None => self,
@@ -277,7 +351,9 @@ impl Model {
                 let mut model = Self::load(history, self.replica)?;
                 // A history that was just loaded shows its newest revision, which can be rewritten.
                 let _ = model.rewrite(self.doc);
-                let _ = model.rewrite_style(self.style);
+                if self.styled {
+                    let _ = model.rewrite_style(self.style);
+                }
                 model
             }
         };
@@ -287,7 +363,7 @@ impl Model {
 
     /// Takes over a history that [`Model::prepare`] made for the document this model shows. The document
     /// and its style stay as they are: what was edited in the meantime goes into that history as one
-    /// change.
+    /// change. Only a model that was given no style takes the history's, and says so in the change.
     ///
     /// Until a file's history is attached, the model keeps one that starts at the document, which is all
     /// a file without a history needs. When the file has one, revisions and stable positions taken before
@@ -305,8 +381,10 @@ impl Model {
         // Whatever replica the history was prepared for, this model's is the one that writes.
         let _ = history.loro.set_peer_id(self.replica.0);
         self.history = OnceLock::from(history);
+        self.pen.signed = false;
         let shown = mem::replace(&mut self.doc, theirs.doc);
         let layout = mem::replace(&mut self.index, theirs.index);
+        self.lookup = theirs.lookup;
         let style = mem::replace(&mut self.style, theirs.style);
         let steps = mem::take(&mut self.steps);
         // What this model shows that the history does not is its own writer's work.
@@ -314,10 +392,10 @@ impl Model {
             let _ = self.adopt(shown.clone(), false);
             change.absorb(diff(&shown, &self.doc));
         }
-        if style != self.style {
+        if mem::replace(&mut self.styled, true) && style != self.style {
             let _ = self.adopt_style(style.clone(), false);
-            change.style |= style != self.style;
         }
+        change.style |= style != self.style;
         // An undo step counts characters, so it holds for as long as the sequence is laid out as before.
         let alike =
             |a: &Entry, b: &Entry| (a.marker, a.chars, a.depth, &a.stored) == (b.marker, b.chars, b.depth, &b.stored);
@@ -383,6 +461,7 @@ impl Model {
             return Err(OpError::ReadOnly);
         }
         let style = crdt::normal_style(&style);
+        self.styled = true;
         let mut change = Change::default();
         if style != self.style {
             if outside {
@@ -415,16 +494,66 @@ impl Model {
         &self.style
     }
 
+    /// Names who writes with this replica. The history keeps the name with the replica's next edit, and
+    /// every copy of the document then reads this replica's edits as that writer's.
+    pub fn set_author(&mut self, name: &str) {
+        if self.pen.author.as_deref() != Some(name) {
+            self.pen = Pen { author: Some(name.to_owned()), signed: false, time: self.pen.time };
+        }
+    }
+
+    /// Tells the model the time, in seconds since 1970, as it has no clock to read. Edits made from here
+    /// on are dated with it, to the minute. An edit is never dated before one it builds on.
+    pub fn set_time(&mut self, seconds: u64) {
+        self.pen.time = seconds;
+    }
+
+    /// The names of everyone who has written in the document, as far as the revision shown.
+    pub fn authors(&self) -> BTreeSet<String> {
+        self.history.get().map(|history| crdt::authors(&history.loro)).unwrap_or_default()
+    }
+
+    /// Finds a block by its id, as [`Document::block`] does, without searching the document for it.
+    pub fn block(&self, id: &BlockId) -> Option<&Block> {
+        nth(&self.doc.blocks, &self.index, self.find(id)?)
+    }
+
+    /// Where a block sits. `None` when the document has no such block.
+    pub fn place(&self, id: &BlockId) -> Option<Place<'_>> {
+        let entry = &self.index[self.find(id)?];
+        let parent = (entry.level > 0).then(|| nth(&self.doc.blocks, &self.index, entry.parent)).flatten();
+        Some(Place { parent, index: entry.nth })
+    }
+
+    /// The entry of the block with this id.
+    fn find(&self, id: &BlockId) -> Option<usize> {
+        let lookup = self.lookup.get_or_init(|| {
+            let mut lookup = Lookup::with_capacity_and_hasher(self.index.len(), BuildHasherDefault::default());
+            for (i, entry) in self.index.iter().enumerate() {
+                lookup.entry(entry.hash).or_insert(i as u32);
+            }
+            lookup
+        });
+        let i = *lookup.get(&flat::hash(id))? as usize;
+        let found = nth(&self.doc.blocks, &self.index, i).is_some_and(|block| block.id == *id);
+        // Two ids that share a hash are told apart the slow way.
+        if found { Some(i) } else { self.spot(id).ok().map(|spot| spot.i) }
+    }
+
     pub fn replica(&self) -> ReplicaId {
         self.replica
     }
 
     /// Applies `ops` in order as one undo step. Ops that leave everything as it was are no step at all.
+    ///
+    /// Blocks that share an id go by a number each, as in `id~2`. The ops name them as they stood before
+    /// the first of the ops, also once an earlier op has taken one of them away.
     pub fn apply(&mut self, ops: impl IntoIterator<Item = Op>) -> Result<Change, OpError> {
         if self.loro().is_detached() {
             return Err(OpError::ReadOnly);
         }
-        let ops: Vec<Op> = ops.into_iter().collect();
+        let mut ops: Vec<Op> = ops.into_iter().collect();
+        let mut copies = Copies::of(self, &mut ops);
         // The document's own fields and the style are changed on copies, made when an op first needs
         // them, and written once every op has been checked.
         let mut settings: Option<(Document, Style)> = None;
@@ -434,7 +563,7 @@ impl Model {
             match op {
                 Op::InsertText { at, .. } => Some(&at.block),
                 Op::DeleteText { block, .. } | Op::SetMark { block, .. } | Op::SetLink { block, .. } => Some(block),
-                Op::SetKind { block, .. } => Some(block),
+                Op::SetLang { block, .. } | Op::SetKind { block, .. } | Op::SetBlockProps { block, .. } => Some(block),
                 _ => None,
             }
         }
@@ -448,7 +577,11 @@ impl Model {
         let mut edits = Vec::new();
         let mut step = Step::new();
         let mut refused = None;
-        for op in &ops {
+        for (nth, op) in ops.iter_mut().enumerate() {
+            if let Some((named, now)) = target(op).zip(copies.now(self, nth)) {
+                *named = now;
+            }
+            let op = &*op;
             let compiled = if is_setting(op) {
                 let (fields, style) = settings.get_or_insert_with(|| (self.fields(), self.style.clone()));
                 set(op, fields, style).map(|()| (Vec::new(), None))
@@ -463,6 +596,9 @@ impl Model {
                     change.absorb(changed);
                     step.push(Edit::Text(undo.unwrap_or_default()));
                     edits.push(delta);
+                    if matches!(op, Op::RemoveBlock { .. } | Op::Join { .. }) {
+                        copies.took(nth);
+                    }
                 }
                 Err(error) => {
                     refused = Some(error);
@@ -489,6 +625,7 @@ impl Model {
             let mut assigns = crdt::meta_assigns(self.loro(), &self.doc, &fields);
             if style != self.style {
                 assigns.extend(crdt::style_assigns(self.loro(), &style));
+                self.styled = true;
             }
             step.insert(0, Edit::Set(self.set(&assigns, &mut change)));
         }
@@ -499,6 +636,7 @@ impl Model {
     }
 
     /// Steps back one of this replica's edits, leaving what others wrote since. `None` when there is none.
+    /// An edit that others have left nothing of is still a step, and stepping back over it changes nothing.
     pub fn undo(&mut self) -> Option<Change> {
         self.step(true)
     }
@@ -547,7 +685,7 @@ impl Model {
         }
         // Loro refuses none of these: every key is a string, and every value a string or a flag.
         let back = crdt::assign(self.loro(), assigns).unwrap_or_default();
-        self.loro().commit();
+        self.commit();
         self.queue().clear();
         change.absorb(self.reread());
         back
@@ -555,12 +693,13 @@ impl Model {
 
     /// The document's own fields, without its blocks.
     fn fields(&self) -> Document {
-        let (language, dictionary, extra) = (&self.doc.language, &self.doc.dictionary, &self.doc.extra);
+        let doc = &self.doc;
         Document {
             blocks: Vec::new(),
-            language: language.clone(),
-            dictionary: dictionary.clone(),
-            extra: extra.clone(),
+            language: doc.language.clone(),
+            dictionary: doc.dictionary.clone(),
+            properties: doc.properties.clone(),
+            extra: doc.extra.clone(),
         }
     }
 
@@ -570,17 +709,45 @@ impl Model {
         let mut read = Document::default();
         crdt::read_meta(&history.loro, &mut read);
         let style = crdt::read_style(&history.loro);
-        let document = (&read.language, &read.dictionary) != (&self.doc.language, &self.doc.dictionary);
-        let change = Change { style: style != self.style, document, ..Change::default() };
-        (self.doc.language, self.doc.dictionary, self.doc.extra) = (read.language, read.dictionary, read.extra);
+        let change =
+            Change { style: style != self.style, document: fields(&read) != fields(&self.doc), ..Change::default() };
+        let doc = &mut self.doc;
+        (doc.language, doc.dictionary, doc.properties, doc.extra) =
+            (read.language, read.dictionary, read.properties, read.extra);
         self.style = style;
         change
     }
 
+    /// Closes a change in the history. This replica's own carries the time and, the first time, its
+    /// writer's name. An outside change carries neither, as every device must write it alike.
+    fn commit(&mut self) {
+        let loro = &self.history().loro;
+        if loro.peer_id() == self.replica.0 {
+            if let Some(author) = self.pen.author.as_deref().filter(|_| !self.pen.signed) {
+                crdt::sign(loro, author);
+            }
+            if self.pen.time > 0 {
+                loro.set_next_commit_timestamp(i64::try_from(self.pen.time).unwrap_or(i64::MAX));
+            }
+            loro.commit();
+            self.pen.signed = true;
+        } else {
+            loro.commit();
+        }
+    }
+
     /// Sends changes the document already shows to the history, as one change there.
     fn write(&mut self, edits: &[Delta], change: &mut Change) -> bool {
-        let written = edits.iter().all(|delta| crdt::write(self.loro(), self.body(), delta).is_some());
-        self.loro().commit();
+        let (mut written, mut edits) = (true, edits.iter().peekable());
+        while let Some(delta) = edits.next().filter(|_| written) {
+            // Text put in where text was just taken out replaces it, and is written as that.
+            let both = edits.peek().and_then(|put| replacement(delta, put));
+            if both.is_some() {
+                edits.next();
+            }
+            written = crdt::write(self.loro(), self.body(), both.as_ref().unwrap_or(delta)).is_some();
+        }
+        self.commit();
         if written {
             // The history reports the edit back, and the document already shows it.
             self.queue().clear();
@@ -659,6 +826,225 @@ impl Model {
         self.drain()
     }
 
+    /// The blocks that two revisions both changed, in the same words, since they last agreed. After a
+    /// merge, give the revision each copy stood at before it, in either order.
+    ///
+    /// Each comes with the block as either side left it, and who last changed it there and when. A block
+    /// that one side took away while the other changed its text is among them. Changes to different words
+    /// of a block are not, nor is formatting: those merge. So does text put in beside a word, which
+    /// changes the word only when it reads on from it or into it, with no space or mark between. Nor is a
+    /// block that both sides left reading alike, where there is nothing to choose.
+    /// Fails with [`HistoryError::UnknownRevision`] for a revision the history lacks.
+    ///
+    /// The model reads its history at other revisions meanwhile, and so is taken whole. The document it
+    /// shows stays as it is.
+    pub fn conflicts(&mut self, ours: &Revision, theirs: &Revision) -> Result<Vec<Conflict>, HistoryError> {
+        let history = self.history();
+        let (shown, detached) = (history.loro.state_frontiers(), history.loro.is_detached());
+        let found = conflict::find(&history.loro, &history.body, &history.events, [&ours.0, &theirs.0]);
+        if detached {
+            // The history held this revision a moment ago.
+            let _ = history.loro.checkout(&shown);
+        } else {
+            history.loro.checkout_to_latest();
+        }
+        self.queue().clear();
+        Ok(conflict::told(found?))
+    }
+
+    /// Finds the conflicts as [`Model::conflicts`] does, and settles each: its block comes to read as the
+    /// side that was edited last left it, until a person picks a version. Call it after a merge, with the
+    /// revision each copy stood at before. Returns the conflicts, for the notes to be raised.
+    ///
+    /// The text of the block is the later side's: what the other side cut from it is put back, and what the
+    /// other side put into its own block is taken out. A block the later side took away goes, and one the
+    /// earlier side took away comes back. Formatting and the kind of block merge as they do anywhere, and
+    /// a block that one side joined to its neighbour stays joined.
+    ///
+    /// Every device that merges the same two revisions writes the same change, so two that settle them
+    /// apart settle them once. A device that merged another revision, having written on, writes a change
+    /// of its own: when the two meet, settling again leaves the later of them standing, and returns no
+    /// conflict for it, as each device returned its own. Settling is no undo step, and the undo steps
+    /// already there still hold.
+    pub fn settle(&mut self, ours: &Revision, theirs: &Revision) -> Result<(Change, Vec<Conflict>), HistoryError> {
+        let history = self.history();
+        let loro = &history.loro;
+        let (shown, detached) = (loro.state_frontiers(), loro.is_detached());
+        let found = conflict::find(loro, &history.body, &history.events, [&ours.0, &theirs.0]);
+        let mut written = false;
+        if let Ok(clashes) = &found {
+            // The change is written at an earlier revision, which Loro allows on request. It then draws a
+            // random replica for each revision it shows, under which nothing is written.
+            loro.set_detached_editing(true);
+            written = conflict::settle(loro, &history.body, [&ours.0, &theirs.0], clashes);
+            loro.set_detached_editing(false);
+            let _ = loro.set_peer_id(self.replica.0);
+        }
+        if detached || written {
+            // The history held this revision a moment ago.
+            let _ = loro.checkout(&shown);
+            self.queue().clear();
+        }
+        let mut change = Change::default();
+        if !detached {
+            self.loro().checkout_to_latest();
+            // Coming back from the revision shown before tells what the settling did to the document.
+            if written {
+                change = self.drain();
+            }
+            self.queue().clear();
+        }
+        Ok((change, conflict::told(found?)))
+    }
+
+    /// Shows the history at `revision`, or at its newest revision for `None`, for `read` to look at, and
+    /// then as it was. The document the model shows stays as it is.
+    fn look<T>(&self, revision: Option<&Revision>, read: impl FnOnce(&History) -> T) -> Result<T, HistoryError> {
+        let history = self.history();
+        let loro = &history.loro;
+        let shown = loro.is_detached().then(|| loro.state_frontiers());
+        let there = match revision {
+            Some(revision) => loro.checkout(&revision.0).map_err(|_| HistoryError::UnknownRevision),
+            None => {
+                loro.checkout_to_latest();
+                Ok(())
+            }
+        };
+        let read = there.map(|()| read(history));
+        self.show(shown);
+        read
+    }
+
+    /// Shows the history as it was before a look elsewhere: at the revision given, or else at its newest.
+    fn show(&self, shown: Option<Frontiers>) {
+        match shown {
+            // The history held this revision a moment ago.
+            Some(shown) => drop(self.loro().checkout(&shown)),
+            None => self.loro().checkout_to_latest(),
+        }
+        self.queue().clear();
+    }
+
+    /// Every step the history was written in, oldest first: the revisions either side of it, who wrote it
+    /// and when, how much it changed, and the versions marked at it. [`Model::changed`] tells which
+    /// blocks a step changed, and [`Model::document_at`] reads the document either side of it.
+    ///
+    /// Every device lists the same history alike. Steps that two devices wrote apart are listed one
+    /// after the other, in an order all devices agree on.
+    pub fn timeline(&mut self) -> Vec<Point> {
+        self.look(None, |history| versions::timeline(&history.loro)).unwrap_or_default()
+    }
+
+    /// The document and its style as they were at `revision`, read without leaving the revision shown,
+    /// and with the undo steps kept. Fails with [`HistoryError::UnknownRevision`] for a revision the
+    /// history lacks.
+    pub fn document_at(&mut self, revision: &Revision) -> Result<(Document, Style), HistoryError> {
+        if *revision == self.revision() {
+            return Ok((self.doc.clone(), self.style.clone()));
+        }
+        self.read_at(revision).map(|(doc, _, style)| (doc, style))
+    }
+
+    fn read_at(&self, revision: &Revision) -> Result<(Document, Vec<Entry>, Style), HistoryError> {
+        self.look(Some(revision), |history| {
+            let (doc, index) = crdt::read(&history.loro, &history.body);
+            (doc, index, crdt::read_style(&history.loro))
+        })
+    }
+
+    /// What differs between two revisions, as a change from `from` to `to` would tell it: the blocks that
+    /// read differently, came or went, and whether the style or the document's own fields differ.
+    pub fn changed(&mut self, from: &Revision, to: &Revision) -> Result<Change, HistoryError> {
+        let ((old, was), (new, is)) = (self.document_at(from)?, self.document_at(to)?);
+        let mut change = diff(&old, &new);
+        change.document = fields(&old) != fields(&new);
+        change.style = was != is;
+        Ok(change)
+    }
+
+    /// Marks `revision` as a version: a point to list in the history, and to keep however the history is
+    /// thinned. It carries this writer's name and the time the shell last told. A revision holds one
+    /// mark, and marking it again replaces the one it has.
+    ///
+    /// A mark is part of the history, so it merges and travels with it. It is no step of the timeline
+    /// and no undo step, and it can be made while an older revision is shown.
+    pub fn tag(&mut self, revision: &Revision, kind: TagKind, name: Option<&str>) -> Result<(), HistoryError> {
+        self.mark(Tag { kind, name: name.map(str::to_owned), ..self.unnamed(revision) })
+    }
+
+    /// A mark of this writer's on `revision`, made now.
+    fn unnamed(&self, revision: &Revision) -> Tag {
+        let (at, author, time) = (revision.clone(), self.pen.author.clone(), self.pen.time);
+        Tag { at, kind: TagKind::Named, name: None, author, time, restored: None }
+    }
+
+    fn mark(&mut self, tag: Tag) -> Result<(), HistoryError> {
+        let loro = self.loro();
+        loro.frontiers_to_vv(&tag.at.0).ok_or(HistoryError::UnknownRevision)?;
+        // The marks are read and written where the history is newest.
+        let shown = loro.is_detached().then(|| loro.state_frontiers());
+        loro.checkout_to_latest();
+        versions::mark(loro, &tag);
+        self.commit();
+        self.show(shown);
+        Ok(())
+    }
+
+    /// Takes the mark off `revision`, which stays in the history like any other. Nothing happens when it
+    /// has no mark.
+    pub fn untag(&mut self, revision: &Revision) {
+        let loro = self.loro();
+        let shown = loro.is_detached().then(|| loro.state_frontiers());
+        loro.checkout_to_latest();
+        if versions::unmark(loro, revision) {
+            self.commit();
+        }
+        self.show(shown);
+    }
+
+    /// The versions marked in the history, oldest first.
+    pub fn tags(&mut self) -> Vec<Tag> {
+        self.look(None, |history| versions::tags(&history.loro)).unwrap_or_default()
+    }
+
+    /// Makes the newest document and style read as they did at `revision`, and shows them. Nothing of
+    /// the history is taken back: the restoring is one more edit of this writer's, and one undo step.
+    /// The revision it leads to is marked as a [`TagKind::Restore`] that names `revision`.
+    ///
+    /// What others wrote since `revision` goes with the rest, and comes back with an undo.
+    pub fn restore(&mut self, revision: &Revision) -> Result<Change, HistoryError> {
+        let (doc, index, style) = self.read_at(revision)?;
+        let mut change = self.checkout_latest();
+        let from = self.revision();
+        let mut step = Step::new();
+        if doc.blocks != self.doc.blocks {
+            let old = flat::order(&self.doc.blocks, &self.index);
+            let delta = flat::rewrite(&old, &flat::order(&doc.blocks, &index));
+            let (changed, undo) = self.shift(&delta, None);
+            change.absorb(changed);
+            debug_assert!(undo.is_some() && self.doc.blocks == doc.blocks, "a restore did not give its document");
+            if let Some(undo) = undo
+                && self.write(std::slice::from_ref(&delta), &mut change)
+            {
+                step.push(Edit::Text(undo));
+            }
+        }
+        let mut assigns = crdt::meta_assigns(self.loro(), &self.doc, &doc);
+        if style != self.style {
+            assigns.extend(crdt::style_assigns(self.loro(), &style));
+            self.styled = true;
+        }
+        step.insert(0, Edit::Set(self.set(&assigns, &mut change)));
+        self.steps.record(step, false);
+        let now = self.revision();
+        if now != from {
+            let tag = Tag { kind: TagKind::Restore, restored: Some(revision.clone()), ..self.unnamed(&now) };
+            // The history holds the revision it has just come to.
+            let _ = self.mark(tag);
+        }
+        Ok(change)
+    }
+
     /// A position that follows its text, for anything kept across edits. `None` when `pos` is not a
     /// position in the document.
     pub fn stable(&self, pos: &Pos, hold: Hold) -> Option<StablePos> {
@@ -707,6 +1093,8 @@ impl Model {
                 Event::Body(delta) => bodies.push(delta),
                 Event::Markers(changed) => keys.extend(changed),
                 Event::Meta | Event::Style => fields = true,
+                // Nothing of it shows.
+                Event::Settled(_) => {}
             }
         }
         let mut change = if fields { self.reread() } else { Change::default() };
@@ -753,10 +1141,10 @@ impl Model {
         let (doc, index) = crdt::read(self.loro(), self.body());
         let style = crdt::read_style(self.loro());
         let old = mem::replace(&mut self.doc, doc);
-        self.index = index;
+        (self.index, self.lookup) = (index, OnceLock::new());
         self.queue().clear();
         let mut change = diff(&old, &self.doc);
-        change.document = (&old.language, &old.dictionary) != (&self.doc.language, &self.doc.dictionary);
+        change.document = fields(&old) != fields(&self.doc);
         change.style = mem::replace(&mut self.style, style) != self.style;
         change
     }
@@ -765,7 +1153,7 @@ impl Model {
     /// that takes it back: `None` when it did not fit and the document was read again from the history.
     ///
     /// `place` is the entry of the block the change is known to be made in, and where that block starts.
-    fn shift(&mut self, delta: &[TextDelta], place: Option<Place>) -> (Change, Option<Delta>) {
+    fn shift(&mut self, delta: &[TextDelta], place: Option<Seat>) -> (Change, Option<Delta>) {
         if let Some(done) = self.shift_text(delta, place) {
             return done;
         }
@@ -779,7 +1167,7 @@ impl Model {
             return (change, None);
         };
         let built = flat::build(moved.blocks);
-        (self.doc.blocks, self.index) = (built.blocks, built.index);
+        (self.doc.blocks, self.index, self.lookup) = (built.blocks, built.index, OnceLock::new());
         // Blocks came, went or moved exactly when the ids or their nesting read differently in order.
         let structure = !before.iter().copied().eq(self.index.iter().map(|entry| (entry.hash, entry.level)));
         let blocks = built.dirty.into_iter().chain(moved.gone).collect();
@@ -787,7 +1175,7 @@ impl Model {
     }
 
     /// The common case of [`Model::shift`]: a change inside one block's text edits that block in place.
-    fn shift_text(&mut self, delta: &[TextDelta], place: Option<Place>) -> Option<(Change, Option<Delta>)> {
+    fn shift_text(&mut self, delta: &[TextDelta], place: Option<Seat>) -> Option<(Change, Option<Delta>)> {
         let (first, last) = span(delta)?;
         let holds = |entry: &Entry, start: usize| {
             entry.marker && entry.shape == BodyShape::Text && start < first && last <= start + entry.len()
@@ -805,12 +1193,7 @@ impl Model {
         let Body::Text(runs) = &mut block.body else { return None };
 
         // The block is read alone, as if the sequence began at its marker.
-        let alone = Block {
-            id: block.id.clone(),
-            kind: BlockKind::Paragraph,
-            body: Body::Text(mem::take(runs)),
-            extra: Extra::new(),
-        };
+        let alone = Block { body: Body::Text(mem::take(runs)), ..Block::new(block.id.clone(), BlockKind::Paragraph) };
         let alone = Flat { block: alone, entry: self.index[i].clone(), dirty: false };
         let mut local = vec![retain(first - start)];
         local.extend(delta.iter().skip_while(|item| is_skip(item)).cloned());
@@ -875,7 +1258,7 @@ impl Model {
     /// Turns an operation into the change it makes to the sequence, or says why it cannot be made.
     ///
     /// An operation on one block's text also names that block's place, which saves looking for it again.
-    fn compile(&self, op: &Op) -> Result<(Delta, Option<Place>), OpError> {
+    fn compile(&self, op: &Op) -> Result<(Delta, Option<Seat>), OpError> {
         let mut delta = Vec::new();
         let mut place = None;
         match op {
@@ -885,12 +1268,20 @@ impl Model {
                 place = Some((spot.i, spot.start));
                 if !text.is_empty() {
                     let mut end = 0;
-                    let format = runs.iter().find(|run| {
+                    let run = runs.iter().position(|run| {
                         end += run.text.len();
                         at.offset <= end
                     });
+                    let mut format = run.map(|run| attrs(&runs[run])).unwrap_or_default();
+                    // Text is part of a reference only when it is typed between two characters of it.
+                    let target = |run: &Run| run.marks.iter().find(|mark| matches!(mark, Mark::Ref(_))).cloned();
+                    let after = run.filter(|_| at.offset == end).and_then(|run| runs.get(run + 1));
+                    let goes_on = run.zip(after).is_some_and(|(run, after)| target(&runs[run]) == target(after));
+                    if at.offset == 0 || (at.offset == end && !goes_on) {
+                        format.retain(|(key, _)| key != crdt::REF);
+                    }
                     spot.reach(chars, &mut delta);
-                    delta.push(insert(&crdt::clean(text), format.map(attrs).unwrap_or_default()));
+                    delta.push(insert(&crdt::clean(text), format));
                 }
             }
             Op::DeleteText { block, range } => {
@@ -903,14 +1294,20 @@ impl Model {
                 }
             }
             Op::SetMark { block, range, mark, on } => {
-                let value = if *on { true.into() } else { LoroValue::Null };
+                let (key, value) = crdt::mark_attr(mark);
+                let value = if *on { value } else { LoroValue::Null };
                 let set = |run: &Run| run.marks.contains(mark) == *on;
-                place = Some(self.restyle(block, range, crdt::mark_attr(mark), value, set, &mut delta)?);
+                place = Some(self.restyle(block, range, key, value, set, &mut delta)?);
             }
             Op::SetLink { block, range, link } => {
                 let value = link.as_deref().map_or(LoroValue::Null, Into::into);
                 let set = |run: &Run| run.link == *link;
                 place = Some(self.restyle(block, range, crdt::LINK.into(), value, set, &mut delta)?);
+            }
+            Op::SetLang { block, range, lang } => {
+                let lang = lang.as_deref().filter(|lang| !lang.is_empty());
+                let set = |run: &Run| run.lang.as_deref() == lang;
+                place = Some(self.restyle(block, range, crdt::LANG.into(), crdt::lang_value(lang), set, &mut delta)?);
             }
             Op::Split { at, new_id } => {
                 if self.spot(new_id).is_ok() {
@@ -939,13 +1336,24 @@ impl Model {
                 if spot.block.kind == *kind {
                     return Ok((delta, None));
                 }
-                let changed = Block { kind: kind.clone(), body: Body::None, ..spot.block.clone_bare() };
-                seek(&mut delta, spot.start);
-                if spot.entry.marker {
-                    delta.push(style(1, BLOCK.into(), head(&changed).into()));
-                } else {
-                    delta.push(marker(&changed, spot.entry.level));
+                if !kind.sound() {
+                    return Err(OpError::BadKind(block.clone()));
                 }
+                // The block must still fit where it sits, and what it holds must fit it.
+                let parent = (spot.entry.level > 0).then(|| nth(&self.doc.blocks, &self.index, spot.entry.parent));
+                let fits = parent.flatten().is_none_or(|parent| parent.kind.admits(kind));
+                if !fits || !children(spot.block).iter().all(|child| kind.admits(&child.kind)) {
+                    return Err(OpError::WrongBody(block.clone()));
+                }
+                self.rehead(&spot, Block { kind: kind.clone(), ..spot.block.clone_bare() }, &mut delta);
+            }
+            Op::SetBlockProps { block, page_break, lang } => {
+                let spot = self.spot(block)?;
+                let lang = lang.clone().filter(|lang| !lang.is_empty());
+                if (spot.block.page_break, &spot.block.lang) == (*page_break, &lang) {
+                    return Ok((delta, None));
+                }
+                self.rehead(&spot, Block { page_break: *page_break, lang, ..spot.block.clone_bare() }, &mut delta);
             }
             Op::InsertBlock { parent, index, block } => {
                 let mut ids = BTreeSet::new();
@@ -953,6 +1361,12 @@ impl Model {
                 while let Some(block) = stack.pop() {
                     if self.spot(&block.id).is_ok() || !ids.insert(&block.id) {
                         return Err(OpError::DuplicateId(block.id.clone()));
+                    }
+                    if !block.kind.sound() {
+                        return Err(OpError::BadKind(block.id.clone()));
+                    }
+                    if !children(block).iter().all(|child| block.kind.admits(&child.kind)) {
+                        return Err(OpError::WrongBody(block.id.clone()));
                     }
                     stack.extend(children(block));
                 }
@@ -963,6 +1377,9 @@ impl Model {
                         let Body::Blocks(children) = &spot.block.body else {
                             return Err(OpError::WrongBody(parent.clone()));
                         };
+                        if !spot.block.kind.admits(&block.kind) {
+                            return Err(OpError::WrongBody(parent.clone()));
+                        }
                         (children.as_slice(), spot.entry.level + 1, self.after(spot.i))
                     }
                 };
@@ -973,20 +1390,30 @@ impl Model {
                 };
                 seek(&mut delta, self.start(at));
                 spell(block, depth, &mut delta);
-                self.settle(at, &mut delta);
+                self.seat(at, &mut delta);
             }
             Op::RemoveBlock { block } => {
                 let spot = self.spot(block)?;
                 let end = self.after(spot.i);
                 seek(&mut delta, spot.start);
                 delta.push(TextDelta::Delete { delete: self.index[spot.i..end].iter().map(Entry::len).sum() });
-                self.settle(end, &mut delta);
+                self.seat(end, &mut delta);
             }
             // These change no block. `apply` makes them itself.
             Op::SetStyle { .. } | Op::SetPage { .. } | Op::ReplaceStyle { .. } => {}
-            Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. } => {}
+            Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. } | Op::SetProperties { .. } => {}
         }
         Ok((delta, place))
+    }
+
+    /// Changes what a block is, leaving what it holds. `changed` is the block without its body.
+    fn rehead(&self, spot: &Spot, changed: Block, delta: &mut Vec<TextDelta>) {
+        seek(delta, spot.start);
+        if spot.entry.marker {
+            delta.push(style(1, BLOCK.into(), head(&changed).into()));
+        } else {
+            delta.push(marker(&changed, spot.entry.level));
+        }
     }
 
     /// Sets one attribute over a range of a block's text. Text that `set` says has it already is left
@@ -999,7 +1426,7 @@ impl Model {
         value: LoroValue,
         set: impl Fn(&Run) -> bool,
         delta: &mut Vec<TextDelta>,
-    ) -> Result<Place, OpError> {
+    ) -> Result<Seat, OpError> {
         let (spot, runs) = self.text(block)?;
         let chars = char_range(runs, block, range)?;
         // Where the change has got to in the block's text. `None` until it has somewhere to start.
@@ -1023,7 +1450,7 @@ impl Model {
 
     /// Gives the text at entry `at` a marker if it has none, when the block before it is about to change.
     /// Otherwise that text would join whatever comes to stand before it.
-    fn settle(&self, at: usize, delta: &mut Vec<TextDelta>) {
+    fn seat(&self, at: usize, delta: &mut Vec<TextDelta>) {
         if let Some(entry) = self.index.get(at).filter(|entry| !entry.marker)
             && let Some(block) = nth(&self.doc.blocks, &self.index, at)
         {
@@ -1034,8 +1461,15 @@ impl Model {
 
 impl Block {
     /// The block without its text or children.
-    fn clone_bare(&self) -> Block {
-        Block { id: self.id.clone(), kind: self.kind.clone(), body: Body::None, extra: self.extra.clone() }
+    pub(crate) fn clone_bare(&self) -> Block {
+        Block {
+            id: self.id.clone(),
+            kind: self.kind.clone(),
+            body: Body::None,
+            lang: self.lang.clone(),
+            page_break: self.page_break,
+            extra: self.extra.clone(),
+        }
     }
 }
 
@@ -1068,10 +1502,69 @@ impl Spot<'_> {
     }
 }
 
+/// The block an operation names, for one that names a block already there.
+fn target(op: &mut Op) -> Option<&mut BlockId> {
+    match op {
+        Op::InsertText { at, .. } | Op::Split { at, .. } => Some(&mut at.block),
+        Op::DeleteText { block, .. } | Op::SetMark { block, .. } | Op::SetLink { block, .. } => Some(block),
+        Op::SetLang { block, .. } | Op::SetKind { block, .. } | Op::SetBlockProps { block, .. } => Some(block),
+        Op::Join { block } | Op::RemoveBlock { block } => Some(block),
+        Op::InsertBlock { parent, .. } => parent.as_mut(),
+        _ => None,
+    }
+}
+
+/// Which blocks the ops of one batch mean by the ids of blocks that share one. Such blocks go by a number
+/// each, counted from where they stand, so taking one away renames those after it. A batch names them as
+/// they stood before it.
+#[derive(Default)]
+struct Copies {
+    /// For each op, the id its block is stored under, and which of the blocks with that id it is, from 1.
+    named: Vec<Option<(BlockId, usize)>>,
+    /// Those the batch has taken away so far.
+    gone: Vec<(BlockId, usize)>,
+}
+
+impl Copies {
+    fn of(model: &Model, ops: &mut [Op]) -> Self {
+        // A batch that names no numbered block has nothing to keep track of.
+        let mut numbered = |op: &mut Op| target(op).is_some_and(|id| id.as_str().contains('~'));
+        if ops.len() < 2 || !ops.iter_mut().any(&mut numbered) {
+            return Self::default();
+        }
+        let copy = |id: &mut BlockId| {
+            let at = model.find(id)?;
+            let stored = &model.index[at].stored;
+            // Counted by where it stands. The number in its name can be higher, where a block of another
+            // id is stored under a name of the same form.
+            let number = model.index[..=at].iter().filter(|entry| entry.stored == *stored).count();
+            Some((stored.clone(), number))
+        };
+        Self { named: ops.iter_mut().map(|op| target(op).and_then(copy)).collect(), gone: Vec::new() }
+    }
+
+    /// What the block of the `op`th op goes by now, once the batch has taken a block away. Any block gone
+    /// can have freed the name of another, so it is looked up by where it stands.
+    fn now(&self, model: &Model, op: usize) -> Option<BlockId> {
+        let (stored, number) = self.named.get(op)?.as_ref().filter(|_| !self.gone.is_empty())?;
+        let earlier = self.gone.iter().filter(|(id, gone)| id == stored && gone < number).count();
+        let there = !self.gone.iter().any(|(id, gone)| id == stored && gone == number);
+        let mut stored = model.index.iter().enumerate().filter(|(_, entry)| entry.stored == *stored);
+        let (at, _) = stored.nth(number - earlier - 1).filter(|_| there)?;
+        nth(&model.doc.blocks, &model.index, at).map(|block| block.id.clone())
+    }
+
+    /// Notes that the `nth` op took its block away.
+    fn took(&mut self, nth: usize) {
+        self.gone.extend(self.named.get(nth).cloned().flatten());
+    }
+}
+
 /// Whether an operation changes the document's own fields or its style, and no block.
 fn is_setting(op: &Op) -> bool {
     let style = matches!(op, Op::SetStyle { .. } | Op::SetPage { .. } | Op::ReplaceStyle { .. });
-    style || matches!(op, Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. })
+    let fields = matches!(op, Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. });
+    style || fields || matches!(op, Op::SetProperties { .. })
 }
 
 /// Makes such an operation, on copies of the fields and the style.
@@ -1080,6 +1573,7 @@ fn set(op: &Op, fields: &mut Document, style: &mut Style) -> Result<(), OpError>
         Op::SetLanguage { language } => fields.language.clone_from(language),
         Op::AddWord { word } => drop(fields.dictionary.insert(word.clone())),
         Op::RemoveWord { word } => drop(fields.dictionary.remove(word)),
+        Op::SetProperties { properties } => fields.properties.clone_from(properties),
         Op::SetStyle { element, style: text } => drop(style.types.insert(element.clone(), text.clone())),
         Op::SetPage { page } => style.page.clone_from(page),
         Op::ReplaceStyle { style: whole } => style.clone_from(whole),
@@ -1092,6 +1586,23 @@ fn set(op: &Op, fields: &mut Document, style: &mut Style) -> Result<(), OpError>
     }
     crdt::normal_meta(fields);
     Ok(())
+}
+
+/// The document's own fields that a [`Change`] speaks of.
+fn fields(doc: &Document) -> (&String, &BTreeSet<String>, &Option<Properties>) {
+    (&doc.language, &doc.dictionary, &doc.properties)
+}
+
+/// The one change that two make together, when the first takes text out and the second puts text in at
+/// the same place.
+fn replacement(cut: &[TextDelta], put: &[TextDelta]) -> Option<Delta> {
+    let (TextDelta::Delete { .. }, lead) = cut.split_last()? else { return None };
+    let text = put.strip_prefix(lead).filter(|text| !text.is_empty() && lead.iter().all(is_skip))?;
+    let plain = |item: &TextDelta| match item {
+        TextDelta::Insert { attributes, .. } => attributes.as_ref().is_none_or(|attrs| !attrs.contains_key(BLOCK)),
+        _ => false,
+    };
+    text.iter().all(plain).then(|| cut.iter().chain(text).cloned().collect())
 }
 
 fn unreadable(error: impl fmt::Display) -> HistoryError {

@@ -2,7 +2,8 @@
 
 use letters_layout::{Callout, DocLayout, FontSpec, Fonts, Palette, Shaper, Token, TokenKind};
 use letters_model::{
-    Block, BlockKind, Body, Document, ListKind, Mark, Model, Op, Pos, ReplicaId, Run, Selection, Style, TextStyle, Tone,
+    Align, Block, BlockKind, Body, Document, ListKind, Mark, Model, Op, Pos, ReplicaId, Run, Selection, Style,
+    TextStyle, Tone,
 };
 use letters_render::{Color, DisplayList, Item, Point, Rect};
 
@@ -24,6 +25,13 @@ fn every_kind_of_block_paints_inside_the_column() {
         ("divider", Block::new("d", BlockKind::Divider)),
         ("unknown", Block::new("u", BlockKind::Unknown { type_name: "chart".into() })),
         ("empty paragraph", paragraph("a", "")),
+        ("figure", figure("f", (300.0, 200.0), PROSE)),
+        ("linked figure", remote(figure("f", (1200.0, 200.0), ""), "https://example.org/a.png")),
+        (
+            "gallery",
+            gallery("g", (0..4).map(|at| figure(&format!("g{at}"), (300.0, 200.0), "")).collect(), Some(PROSE)),
+        ),
+        ("table", table("t", &[Align::Start, Align::End], true, &[&["Household", "Rate"], &[PROSE, "9%"]])),
     ];
     for (name, block) in cases {
         let layout = laid(&doc(vec![block]));
@@ -34,7 +42,7 @@ fn every_kind_of_block_paints_inside_the_column() {
         for item in &items {
             let Some((top, bottom)) = extent(item) else { continue };
             assert!(top >= -1.0 && bottom <= height + 1.0, "{name} stays inside its height: {item:?}");
-            if let Item::Fill { rect, .. } | Item::Stroke { rect, .. } = item {
+            if let Item::Fill { rect, .. } | Item::Stroke { rect, .. } | Item::Image { rect, .. } = item {
                 assert!(rect.x >= -0.5 && rect.x + rect.width <= WIDTH + 2.5, "{name} stays inside the column");
             }
         }
@@ -588,4 +596,34 @@ fn tokens_follow_the_text_through_edits() {
         layout.update(model.doc(), &Style::default(), WIDTH / 2.0, None);
         assert_eq!(inked(&painted(&layout, everything()), keyword), after, "{name}, then a new width");
     }
+}
+
+#[test]
+fn the_code_blocks_in_view_are_told_with_the_boxes_drawn_behind_them() {
+    let filler = (0..80).map(|n| paragraph(&format!("p{n}"), PROSE));
+    let mut blocks = vec![paragraph("a", "Rates"), Block::text("first", BlockKind::Code { language: None }, "let x;")];
+    blocks.extend(filler);
+    blocks.push(Block::text("last", BlockKind::Code { language: Some("rust".into()) }, CODE));
+    blocks.push(Block::new("f", BlockKind::Formula));
+    let layout = laid(&doc(blocks));
+
+    let all = layout.code_boxes(everything());
+    let ids: Vec<&str> = all.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["first", "last"], "code alone, in order");
+    let fills: Vec<Rect> = painted(&layout, everything())
+        .iter()
+        .filter_map(|item| match item {
+            Item::Fill { rect, color, .. } if *color == Palette::LIGHT.code => Some(*rect),
+            _ => None,
+        })
+        .collect();
+    for (id, rect) in &all {
+        assert!(fills.contains(rect), "{id}: {rect:?} is a box that is painted: {fills:?}");
+        let text = layout.caret(&Pos::new(id.as_str(), 0)).expect("a caret");
+        assert!(rect.contains(Point { x: text.x, y: text.y + 1.0 }), "{id}: the box holds its text");
+    }
+
+    let top = Rect::new(0.0, 0.0, WIDTH, 200.0);
+    let shown: Vec<_> = layout.code_boxes(top).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(shown.iter().map(|id| id.as_str()).collect::<Vec<_>>(), ["first"], "only what the view shows");
 }

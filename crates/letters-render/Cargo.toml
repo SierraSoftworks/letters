@@ -12,6 +12,9 @@ publish.workspace = true
 workspace = true
 
 [features]
+default = ["pdf"]
+# The PDF backend. A shell that never exports can leave it and its PDF writer out.
+pdf = ["dep:krilla"]
 # The GPU backend. The shell turns it on, so the wasm-clean core never builds it.
 gpu = ["dep:vello_gpu", "dep:wgpu"]
 # Pixel snapshots for tests. They read and write files, which the core must not.
@@ -21,7 +24,7 @@ snapshot = []
 bytemuck.workspace = true
 glifo.workspace = true
 image.workspace = true
-krilla.workspace = true
+krilla = { workspace = true, optional = true }
 skrifa.workspace = true
 vello_cpu.workspace = true
 vello_gpu = { workspace = true, optional = true }
@@ -31,5 +34,5 @@ wgpu = { workspace = true, optional = true }
 hayro.workspace = true
 letters-fonts.workspace = true
 # Turns the snapshot feature on for this crate's own tests.
-letters-render = { workspace = true, features = ["snapshot"] }
+letters-render = { workspace = true, features = ["pdf", "snapshot"] }
 pollster.workspace = true

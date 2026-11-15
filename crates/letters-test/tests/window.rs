@@ -1,11 +1,15 @@
 //! The editor's window, as a shell shows it: the page, the top bar and the side panel.
 
-use accesskit::{Action, ActionData, ActionRequest, TextPosition, TextSelection, TreeId};
-use letters_editor::InputEvent;
-use letters_model::{Align, Block, BlockKind, Document, Pos, Selection, TextStyle};
+use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, Toggled, TreeId, TreeUpdate};
+use letters_editor::{InputEvent, Picture};
+use letters_model::{Align, Block, BlockKind, Document, ListKind, Pos, Selection, Style, TextStyle};
+use letters_render::image::Image;
 use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
-use letters_ui::{Landing, Recent, Request, SaveState};
+use letters_ui::{
+    Chrome, Cursor, Edge, Folder, Frame, Landing, Location, PictureState, Recent, Request, SafeMode, SaveState,
+    WindowButton,
+};
 
 fn text(id: &str, kind: BlockKind, text: &str) -> Block {
     Block::text(id, kind, text)
@@ -65,7 +69,7 @@ fn landing() -> Landing {
 
 /// The page area.
 fn page(window: &mut Harness) -> Rect {
-    window.find(Role::Document, "Letters").expect("the page").bounds
+    window.controls().into_iter().find(|found| found.role == Role::Document).expect("the page").bounds
 }
 
 /// The lines the outline draws, top to bottom, each with its colour.
@@ -115,15 +119,18 @@ fn marked(reduced_motion: bool) -> Harness {
 
 const INSIDE: usize = 11;
 
-/// Lets the window do the work it keeps for idle time, all of it.
+/// Lets the window do the work it keeps for idle time, all of it, as a shell does: it asks what moves, paints
+/// the frame, and comes back for as long as it is told to at once.
 fn rest(window: &mut Harness) {
-    // A frame that is owed comes first.
-    window.paint();
     let mut steps = 0;
-    while window.ui().animate(0) == Some(0) {
+    loop {
+        let again = window.ui().animate(0);
+        window.paint();
+        if again != Some(0) {
+            break;
+        }
         steps += 1;
         assert!(steps < 10_000, "idle work comes to an end");
-        window.paint();
     }
 }
 
@@ -133,7 +140,9 @@ fn waves(window: &mut Harness) -> Vec<(Point, Point)> {
     let wave = |item: &Item| match item {
         Item::Path { origin, path, stroke: Some(_), .. } if page.contains(*origin) => {
             let ends = path.iter().filter_map(|el| if let PathEl::QuadTo(_, end) = el { Some(end.x) } else { None });
-            Some((*origin, Point { x: origin.x + ends.fold(0.0, f32::max), y: origin.y }))
+            // An icon over the page is a stroked path too, but not one of waves alone.
+            let end = ends.reduce(f32::max)?;
+            Some((*origin, Point { x: origin.x + end, y: origin.y }))
         }
         _ => None,
     };
@@ -225,11 +234,11 @@ fn a_click_on_the_page_moves_the_caret_there() {
 fn the_bar_names_the_document_its_save_state_and_the_type_at_the_caret() {
     let mut window = letter();
     window.ui().set_document_name("Quote");
-    window.assert_open(Role::Label, "Quote").assert_open(Role::Label, "Saved").assert_open(Role::Label, "Heading 1");
+    window.assert_open(Role::Button, "Quote").assert_open(Role::Label, "Saved").assert_open(Role::Button, "Heading 1");
 
     window.ui().set_save_state(SaveState::Offline);
     window.ui().select(Selection::caret(Pos::new("p1", 0)));
-    window.assert_open(Role::Label, "Offline").assert_open(Role::Label, "Body");
+    window.assert_open(Role::Label, "Offline").assert_open(Role::Button, "Body");
     window.assert_closed(Role::Label, "Saved");
 }
 
@@ -486,6 +495,23 @@ fn the_bar_restyles_every_block_of_the_type_at_the_caret() {
     let pressed = |window: &mut Harness, name| window.find(Role::Button, name).unwrap().toggled;
     assert_eq!((pressed(&mut window, "Align centre"), pressed(&mut window, "Align left")), (Some(true), Some(false)));
     assert_eq!(window.find(Role::Button, "Font").unwrap().description.as_deref(), Some("Fira Code"));
+
+    // Each change to the style is a step that undo takes back.
+    window.click(Role::Button, "Undo");
+    assert_eq!(style_of(&mut window, "heading1").align, body.align);
+    assert_eq!(spot(&mut window, "h1", 0).x, left, "and the page shows it");
+    assert_eq!(style_of(&mut window, "heading1").weight, 300, "one step at a time");
+}
+
+#[test]
+fn a_style_changed_by_another_writer_shows_on_the_page() {
+    let mut window = letter();
+    let left = spot(&mut window, "h1", 0).x;
+    let mut style = window.ui().style().clone();
+    style.types.get_mut("heading1").expect("a style for headings").align = Align::Center;
+    window.ui().change(|editor| editor.rewrite_style(style)).expect("the style is taken in");
+    assert!(spot(&mut window, "h1", 0).x > left, "the heading is centred");
+    assert_eq!(window.find(Role::Button, "Align centre").unwrap().toggled, Some(true), "and the bar says so");
 }
 
 #[test]
@@ -585,7 +611,7 @@ fn a_narrowing_window_folds_alignment_then_the_marks_then_the_whole_style() {
         let (first, last) = (&controls[0].1, &controls[controls.len() - 1].1);
         assert!(first.x >= 0.0 && last.x + last.width <= width as f32, "at {width} the bar is in the window");
     }
-    window.assert_open(Role::Label, name);
+    window.assert_open(Role::Button, name);
     assert!(folds.is_sorted(), "the bar only folds further as the window narrows: {folds:?}");
     assert_eq!((folds[0], folds[folds.len() - 1]), (0, 3), "from everything shown to everything folded");
     window.resize(1400.0, 600.0).assert_open(Role::Button, "Align left").assert_open(Role::Button, "Bold");
@@ -855,6 +881,109 @@ fn a_screen_reader_reads_the_document_and_edits_it() {
     assert_eq!(block_text(&window, "p1"), "Hartley Roofing sent a quote.");
 }
 
+/// The document as a screen reader walks it under the page: each node's role and what it says, set in by
+/// how deep it is.
+fn read(update: &TreeUpdate) -> Vec<String> {
+    fn walk(update: &TreeUpdate, id: NodeId, depth: usize, out: &mut Vec<String>) {
+        let node = &update.nodes.iter().find(|(node, _)| *node == id).expect("a node the tree lists").1;
+        let ticked = node.toggled().map(|toggled| if toggled == Toggled::True { "ticked" } else { "unticked" });
+        let says = [node.label(), node.value().map(str::trim_end), ticked].into_iter().flatten();
+        let line = [format!("{:?}", node.role())].into_iter().chain(says.map(str::to_owned)).collect::<Vec<_>>();
+        out.push(format!("{}{}", "  ".repeat(depth), line.join(" ")));
+        node.children().iter().for_each(|child| walk(update, *child, depth + 1, out));
+    }
+    let page = update.nodes.iter().find(|(_, node)| node.role() == Role::Document).expect("the page");
+    let mut out = Vec::new();
+    page.1.children().iter().for_each(|child| walk(update, *child, 0, &mut out));
+    out
+}
+
+/// Two bullets with one more inside the first, a numbered step, two tasks and a figure.
+fn shopping() -> Harness {
+    let item = |id: &str, list, depth, words: &str| text(id, BlockKind::ListItem { list, depth }, words);
+    let figure = BlockKind::Figure {
+        asset: None,
+        src: Some("https://example.com/roof.png".into()),
+        alt: "A slate roof".into(),
+        width: 300.0,
+        height: 200.0,
+        numbered: false,
+    };
+    let blocks = vec![
+        item("a", ListKind::Bullet, 0, "Slates"),
+        item("b", ListKind::Bullet, 1, "Welsh"),
+        item("c", ListKind::Bullet, 0, "Nails"),
+        item("d", ListKind::Ordered, 0, "Strip"),
+        item("e", ListKind::Task { checked: false }, 0, "Order"),
+        item("f", ListKind::Task { checked: true }, 0, "Measure"),
+        text("g", figure, "The roof today"),
+    ];
+    Harness::open(Document { blocks, ..Document::default() })
+}
+
+#[test]
+fn a_screen_reader_finds_lists_ticks_and_pictures_as_what_they_are() {
+    let mut window = shopping();
+    window.ui().select(Selection::caret(Pos::new("a", 2)));
+    let tree = window.ui().access();
+    let expected = [
+        "List",
+        "  ListItem",
+        "    TextRun Slates",
+        "    List",
+        "      ListItem",
+        "        TextRun Welsh",
+        "  ListItem",
+        "    TextRun Nails",
+        "List",
+        "  ListItem",
+        "    TextRun Strip",
+        "List",
+        "  ListItem",
+        "    CheckBox unticked",
+        "    TextRun Order",
+        "  ListItem",
+        "    CheckBox ticked",
+        "    TextRun Measure",
+        "Figure",
+        "  Image A slate roof",
+        "  Button Alt text",
+        "  TextRun The roof today",
+    ];
+    assert_eq!(read(&tree), expected);
+
+    // A click on a tick ticks its task, and leaves the caret where the writer has it.
+    let tick = tree.nodes.iter().find(|(_, node)| node.role() == Role::CheckBox).expect("a tick").0;
+    window.ask(ActionRequest { action: Action::Click, target_tree: TreeId::ROOT, target_node: tick, data: None });
+    let ticked = |window: &Harness, id: &str| window.editor().doc().block(&id.into()).map(|block| block.kind.clone());
+    assert!(matches!(ticked(&window, "e"), Some(BlockKind::ListItem { list: ListKind::Task { checked: true }, .. })));
+    assert_eq!(head(&window), Pos::new("a", 2));
+
+    // A click on the button under a picture selects the picture and turns its line to the alt text.
+    let alt = tree.nodes.iter().find(|(_, node)| node.label() == Some("Alt text")).expect("a button").0;
+    window.ask(ActionRequest { action: Action::Click, target_tree: TreeId::ROOT, target_node: alt, data: None });
+    assert_eq!(window.editor().picture().map(|figure| figure.as_str()), Some("g"));
+    let field = window.find(Role::TextInput, "Alt text").expect("the field of the alt text");
+    assert_eq!((field.value.as_deref(), field.focused), (Some("A slate roof"), true));
+}
+
+#[test]
+fn a_key_typed_in_a_long_document_tells_a_screen_reader_of_its_block_alone() {
+    // What the tree says of the letter's lines.
+    let lines = |update: &TreeUpdate| {
+        let said = update.nodes.iter().filter_map(|(_, node)| node.value().map(str::to_owned));
+        said.filter(|said| said.contains("line of the letter")).collect::<Vec<_>>()
+    };
+    let mut window = long();
+    window.ui().select(Selection::caret(Pos::new("p3", 0)));
+    assert_eq!(lines(&window.ui().access()).len(), 200, "one that starts to listen is told all of it");
+    window.type_text("x");
+    assert_eq!(lines(&window.ui().access_changes()), ["xOne more line of the letter.\n"]);
+    window.key("Right");
+    assert_eq!(lines(&window.ui().access_changes()), [""; 0], "the caret moves with nothing told again");
+    assert_eq!(lines(&window.ui().access()).len(), 200, "and one that starts later is told all of it too");
+}
+
 #[test]
 fn misspelled_words_are_underlined_once_the_window_has_a_moment() {
     let mut window = Harness::doc("The quik brown fox.\n\nA plain line with nothing wrong.");
@@ -863,6 +992,26 @@ fn misspelled_words_are_underlined_once_the_window_has_a_moment() {
     let (from, to) = (spot(&mut window, "b1", 4), spot(&mut window, "b1", 8));
     assert!((start.x - from.x).abs() < 1.5 && (end.x - to.x).abs() < 1.5, "the line runs under the word");
     assert!(start.y > from.y && start.y < from.y + from.height + 4.0, "at the foot of its letters");
+}
+
+#[test]
+fn a_long_document_is_checked_where_the_reader_is_first() {
+    let lines = (0..400).map(|n| text(&format!("p{n}"), BlockKind::Paragraph, "One more lnie of the letter."));
+    let mut window = Harness::open(Document { blocks: lines.collect(), ..Document::default() });
+    let middle = page(&mut window);
+    let middle = Point { x: middle.x + middle.width / 2.0, y: middle.y + middle.height / 2.0 };
+    window.scroll_at(middle, 1e6);
+
+    let mut steps = 0;
+    while waves(&mut window).is_empty() {
+        assert_eq!(window.ui().animate(0), Some(0), "there is still work to do");
+        steps += 1;
+        assert!(steps < 10_000, "the words in view are marked");
+    }
+    window.scroll_at(middle, -1e6);
+    assert_eq!(waves(&mut window), [], "the top of the document waits its turn");
+    rest(&mut window);
+    assert!(!waves(&mut window).is_empty(), "which comes");
 }
 
 #[test]
@@ -946,6 +1095,15 @@ fn a_word_is_accepted_from_the_menu_or_from_the_persons_own_list() {
         assert!(waves(&mut window).is_empty(), "{route}: and the rest of the document after it");
         assert_eq!(window.platform.learned, if kept { vec!["Zorvex"] } else { vec![] }, "{route}");
         window.assert_markdown("Ask Zorvex for a quote.\n\nZorvex replied.");
+
+        // A word added to the document is part of it: saved with it, and taken back by undo.
+        let in_document = route == "Add to this document";
+        assert_eq!(window.editor().doc().dictionary.contains("Zorvex"), in_document, "{route}");
+        if in_document {
+            window.key("Mod+z");
+            rest(&mut window);
+            assert_eq!(waves(&mut window).len(), 2, "undo has the name marked again");
+        }
     }
 }
 
@@ -1028,9 +1186,9 @@ fn writing_starts_on_the_page_behind_the_landing_card() {
 fn a_document_without_a_name_takes_its_first_heading_once_the_caret_leaves_it() {
     let mut window = blank();
     window.ui().select(Selection::caret(Pos::new("p", 0)));
-    window.assert_open(Role::Label, "Untitled");
+    window.assert_open(Role::Button, "Untitled");
     window.type_text("# Cottage renov");
-    window.assert_open(Role::Label, "Cottage renov").assert_closed(Role::Label, "Untitled");
+    window.assert_open(Role::Button, "Cottage renov").assert_closed(Role::Button, "Untitled");
     assert_eq!(window.ui().take_requests(), [], "nothing is asked while the heading is being typed");
 
     window.type_text("ation").key("Enter");
@@ -1039,7 +1197,7 @@ fn a_document_without_a_name_takes_its_first_heading_once_the_caret_leaves_it() 
     // Once it has its name, the heading can change without the name following.
     window.ui().set_document_name("Cottage renovation");
     window.key("Up").type_text("The ").key("Down");
-    window.assert_open(Role::Label, "Cottage renovation");
+    window.assert_open(Role::Button, "Cottage renovation");
     assert_eq!(window.ui().take_requests(), [], "the name is taken once");
 }
 
@@ -1053,6 +1211,7 @@ fn the_bar_says_how_saving_stands_and_where_the_first_write_went() {
         (SaveState::Failed, Some("Not saved")),
         (SaveState::Saved, Some("Saved")),
     ];
+    let bar = bar_controls(&mut window);
     for (state, said) in states {
         window.ui().set_save_state(state);
         let shown: Vec<&str> = ["Saving", "Not saved", "Saved"]
@@ -1060,12 +1219,15 @@ fn the_bar_says_how_saving_stands_and_where_the_first_write_went() {
             .filter(|label| window.find(Role::Label, label).is_some())
             .collect();
         assert_eq!(shown, Vec::from_iter(said), "{state:?}");
+        assert_eq!(bar_controls(&mut window), bar, "nothing in the bar moves when the document is {state:?}");
     }
 
+    // Where the first write went is told under the icon for a moment, and the bar stays as it is.
     window.ui().set_saved_in("House");
-    window.assert_open(Role::Label, "Saved in House");
-    window.advance(0).advance(2000).assert_open(Role::Label, "Saved in House");
-    window.advance(3000).assert_closed(Role::Label, "Saved in House").assert_open(Role::Label, "Saved");
+    window.assert_open(Role::Label, "Saved in House").assert_open(Role::Tooltip, "Saved in House");
+    assert_eq!(bar_controls(&mut window), bar);
+    window.advance(0).advance(2000).assert_open(Role::Tooltip, "Saved in House");
+    window.advance(3000).assert_closed(Role::Tooltip, "Saved in House").assert_open(Role::Label, "Saved");
 }
 
 #[test]
@@ -1075,4 +1237,1901 @@ fn the_more_menu_asks_the_shell_for_a_new_document_or_another_one() {
         window.click(Role::Button, "More").click(Role::MenuItem, item);
         assert_eq!(window.ui().take_requests(), [request], "{item}");
     }
+}
+
+/// Where the cottage's plan is kept: in House, in the space called Family. Holidays holds a folder too.
+fn family() -> Location {
+    let folder = |path: &str| Folder {
+        path: path.into(),
+        name: path.rsplit('/').next().unwrap_or_default().into(),
+        depth: path.matches('/').count() as u8 - 1,
+    };
+    let folders = [
+        "/Family",
+        "/Family/House",
+        "/Family/House/Quotes",
+        "/Family/House/Photos",
+        "/Family/Holidays",
+        "/Family/Holidays/2026",
+        "/Family/School",
+    ];
+    Location {
+        name: Some("Cottage renovation".into()),
+        folder: "/Family/House".into(),
+        folders: folders.map(folder).into(),
+    }
+}
+
+/// The letter, kept where [`family`] says, with its name open to be typed over.
+fn renaming() -> Harness {
+    let mut window = letter();
+    window.ui().set_location(family());
+    window.click(Role::Button, "Cottage renovation");
+    window
+}
+
+/// The folders the flyout shows, from the top.
+fn folders(window: &mut Harness) -> Vec<String> {
+    window.controls().into_iter().filter(|found| found.role == Role::TreeItem).map(|found| found.name).collect()
+}
+
+/// The role, name and value of what the keyboard's focus is on.
+fn focus(window: &mut Harness) -> (Role, String, String) {
+    let focused = window.focused().expect("something has focus");
+    (focused.role, focused.name, focused.value.unwrap_or_default())
+}
+
+fn click_the_page(window: &mut Harness) {
+    let page = page(window);
+    window.click_at(Point { x: page.x + page.width / 2.0, y: page.y + page.height - 40.0 });
+}
+
+#[test]
+fn the_name_in_the_bar_is_typed_over_and_the_shell_is_asked_for_it() {
+    let mut window = renaming();
+    assert_eq!(focus(&mut window), (Role::TextInput, "Document name".into(), "Cottage renovation".into()));
+    window.type_text("Cottage plan").key("Enter");
+    assert_eq!(window.ui().take_requests(), [Request::Rename("Cottage plan".into())], "typing replaces the old name");
+    window.assert_closed(Role::TextInput, "Document name");
+
+    // The bar shows the name the shell answers with, and writing goes on in the document.
+    window.ui().set_location(Location { name: Some("Cottage plan".into()), ..family() });
+    window.assert_open(Role::Button, "Cottage plan");
+    window.type_text("!");
+    assert!(window.markdown().contains('!'), "{}", window.markdown());
+}
+
+#[test]
+fn a_typed_name_is_taken_on_enter_or_a_press_elsewhere_and_dropped_on_escape() {
+    type Leave = fn(&mut Harness);
+    let cases: [(&str, &str, Leave, bool); 5] = [
+        ("Enter", "Roof quotes", |window| _ = window.key("Enter"), true),
+        ("a press on the page", "Roof quotes", click_the_page, true),
+        ("Escape", "Roof quotes", |window| _ = window.key("Escape"), false),
+        ("Escape among the folders", "Roof quotes", |window| _ = window.key("Tab").key("Escape"), false),
+        ("Enter on the name as it was", "Cottage renovation", |window| _ = window.key("Enter"), false),
+    ];
+    for (leave, name, act, taken) in cases {
+        let mut window = renaming();
+        window.type_text(name);
+        act(&mut window);
+        let asked = if taken { vec![Request::Rename(name.into())] } else { Vec::new() };
+        assert_eq!(window.ui().take_requests(), asked, "{leave}");
+        window.assert_closed(Role::TextInput, "Document name").assert_closed(Role::Tree, "Move to");
+    }
+}
+
+#[test]
+fn a_name_the_shell_refuses_comes_back_to_be_changed() {
+    let mut window = renaming();
+    window.type_text("Roof quotes").key("Enter");
+    window.ui().take_requests();
+    let why = "There is already a document called \u{201c}Roof quotes\u{201d} in that folder.";
+    window.ui().set_notice(Some(why));
+    window.assert_open(Role::Alert, why);
+    assert_eq!(focus(&mut window), (Role::TextInput, "Document name".into(), "Roof quotes".into()));
+
+    // Another name takes the notice away, and is asked for in turn.
+    window.type_text(", second round");
+    window.assert_closed(Role::Alert, why);
+    window.key("Enter");
+    let asked = window.ui().take_requests();
+    assert!(matches!(&asked[..], [Request::Rename(name)] if name.ends_with(", second round")), "{asked:?}");
+}
+
+#[test]
+fn the_flyout_lists_the_folders_and_moves_the_document_to_the_one_picked() {
+    let mut window = renaming();
+    assert_eq!(folders(&mut window), ["Family", "House", "Quotes", "Photos", "Holidays", "School"]);
+    let here = window.find(Role::TreeItem, "House").expect("the folder it is in");
+    assert_eq!(here.description.as_deref(), Some("It is here"));
+    let nowhere = |window: &mut Harness| window.find(Role::Button, "Move").is_some_and(|button| button.disabled);
+    assert!(nowhere(&mut window), "there is nowhere to move to until a folder is picked");
+
+    // The folder it is in already is nowhere to move to.
+    window.click(Role::TreeItem, "Quotes").assert_open(Role::Button, "Move to Quotes");
+    window.click(Role::TreeItem, "House");
+    assert!(nowhere(&mut window));
+
+    window.click(Role::TreeItem, "Quotes").click(Role::Button, "Move to Quotes");
+    assert_eq!(window.ui().take_requests(), [Request::Move("/Family/House/Quotes".into())]);
+    window.assert_closed(Role::Tree, "Move to").assert_closed(Role::TextInput, "Document name");
+
+    let mut window = renaming();
+    window.click(Role::Button, "Other location\u{2026}");
+    assert_eq!(window.ui().take_requests(), [Request::MoveElsewhere]);
+    window.assert_closed(Role::Tree, "Move to");
+}
+
+#[test]
+fn the_folders_are_opened_and_picked_from_the_keyboard() {
+    let mut window = renaming();
+    window.key("Tab");
+    assert_eq!(focus(&mut window).1, "Family", "Tab goes from the name to the folders");
+    for _ in 0..4 {
+        window.key("Down");
+    }
+    assert_eq!(focus(&mut window).1, "Holidays");
+    window.key("Right");
+    assert!(folders(&mut window).contains(&"2026".to_owned()), "Right opens a folder");
+    window.key("Left");
+    assert!(!folders(&mut window).contains(&"2026".to_owned()), "and Left closes it");
+
+    // Enter picks a folder. The name and the flyout are one round for Tab, and Enter in the name moves too.
+    window.key("Right").key("Down").key("Enter");
+    window.assert_open(Role::Button, "Move to 2026");
+    window.key("Shift+Tab");
+    assert_eq!(focus(&mut window).1, "Document name");
+    window.key("Enter");
+    assert_eq!(window.ui().take_requests(), [Request::Move("/Family/Holidays/2026".into())]);
+}
+
+#[test]
+fn a_new_folder_is_asked_for_by_name_and_picked_once_the_shell_lists_it() {
+    // The folder picked, if any, and the folder the new one then goes into.
+    for (picked, parent) in [(Some("Photos"), "/Family/House/Photos"), (None, "/Family/House")] {
+        let mut window = renaming();
+        if let Some(picked) = picked {
+            window.click(Role::TreeItem, picked);
+        }
+        window.click(Role::Button, "New folder");
+        assert_eq!(focus(&mut window).1, "Folder name");
+        window.type_text("Before").key("Enter");
+        let asked = Request::NewFolder { parent: parent.into(), name: "Before".into() };
+        assert_eq!(window.ui().take_requests(), [asked], "{picked:?}");
+
+        let mut location = family();
+        let at = location.folders.iter().position(|folder| folder.path == parent).expect("the parent");
+        let depth = location.folders[at].depth + 1;
+        location.folders.insert(at + 1, Folder { path: format!("{parent}/Before"), name: "Before".into(), depth });
+        window.ui().set_location(location);
+        window.assert_open(Role::TreeItem, "Before").assert_open(Role::Button, "Move to Before");
+    }
+}
+
+#[test]
+fn a_document_with_no_folders_to_show_is_renamed_from_the_field_alone() {
+    let mut window = blank();
+    window.click(Role::Button, "Untitled");
+    window.assert_closed(Role::Tree, "Move to");
+    // A name that is not the document's own is not offered to keep.
+    assert_eq!(focus(&mut window), (Role::TextInput, "Document name".into(), String::new()));
+    window.type_text("Shopping");
+    click_the_page(&mut window);
+    assert_eq!(window.ui().take_requests(), [Request::Rename("Shopping".into())]);
+    window.assert_closed(Role::TextInput, "Document name");
+}
+
+#[test]
+fn a_press_under_the_last_block_gives_a_line_to_write_on() {
+    // What the document ends in, and the last block once "After" is typed where the press put the caret.
+    let cases = [
+        ("a code block", "Intro.\n\n```\nlet a = 1;\n```\n", "After"),
+        ("a quote", "Intro.\n\n> Quoted.\n", "After"),
+        ("body text", "Intro.\n\nLast words.", "Last words.After"),
+    ];
+    for (ends_in, markdown, last) in cases {
+        let mut window = Harness::doc(markdown);
+        click_the_page(&mut window);
+        window.type_text("After");
+        let block = window.editor().doc().blocks.last().expect("the document has blocks");
+        assert!(matches!(block.kind, BlockKind::Paragraph), "after {ends_in} comes body text: {:?}", block.kind);
+        assert_eq!(block.plain_text(), last, "after {ends_in}");
+    }
+}
+
+/// The Styles panel's rows, top to bottom: each type's name, its font in words, and whether it is the
+/// one the bar shows.
+fn style_rows(window: &mut Harness) -> Vec<(String, String, bool)> {
+    let panel = window.find(Role::Complementary, "Styles").expect("the Styles panel").bounds;
+    let row = |found: letters_test::Found| {
+        let open = found.toggled.filter(|_| found.role == Role::Button && panel.contains(found.center()))?;
+        Some((found.name, found.description.unwrap_or_default(), open))
+    };
+    window.controls().into_iter().filter_map(row).collect()
+}
+
+/// The types whose rows are marked as the one the bar shows.
+fn open_rows(window: &mut Harness) -> Vec<String> {
+    style_rows(window).into_iter().filter(|row| row.2).map(|row| row.0).collect()
+}
+
+/// The bar's button for the type whose style it shows.
+fn type_label(window: &mut Harness, name: &str) -> letters_test::Found {
+    let bar = window.find(Role::Toolbar, "Document").expect("the bar").bounds;
+    let named =
+        |found: &letters_test::Found| found.role == Role::Button && found.name == name && bar.contains(found.center());
+    window.controls().into_iter().find(named).unwrap_or_else(|| panic!("the bar does not name {name}"))
+}
+
+/// What the window asked of its shell about stylesheets, the latest last.
+fn asked(window: &mut Harness) -> Vec<Request> {
+    window.ui().take_requests()
+}
+
+/// A stylesheet that is not the letter's own style: body text in Fira Code.
+fn other_sheet(window: &mut Harness) -> Style {
+    let mut sheet = window.ui().style().clone();
+    sheet.types.get_mut("body").expect("a style for body text").family = "Fira Code".into();
+    sheet
+}
+
+#[test]
+fn the_styles_panel_lists_each_named_style_with_its_font_and_marks_the_one_at_the_caret() {
+    let mut window = letter();
+    window.click(Role::Button, "Styles");
+    let rows = style_rows(&mut window);
+    let names: Vec<&str> = rows.iter().map(|row| row.0.as_str()).collect();
+    let expected = ["Title", "Heading 1", "Heading 2", "Heading 3", "Heading 4", "Body", "Quote", "Code", "Caption"];
+    assert_eq!(names, expected);
+    let font = |rows: &[(String, String, bool)], name: &str| {
+        rows.iter().find(|row| row.0 == name).map(|row| row.1.clone()).unwrap_or_default()
+    };
+    assert!(font(&rows, "Quote").contains("Italic"), "{rows:?}");
+    assert!(font(&rows, "Code").contains("Fira Code"), "{rows:?}");
+    assert_eq!(open_rows(&mut window), ["Heading 1"], "the caret is in a heading");
+
+    // A change made in the bar shows in the row, and the mark follows the caret.
+    window.click(Role::Button, "Font").click(Role::MenuItemCheckBox, "Fira Code");
+    assert!(font(&style_rows(&mut window), "Heading 1").contains("Fira Code"));
+    window.ui().select(Selection::caret(Pos::new("p1", 0)));
+    assert_eq!(open_rows(&mut window), ["Body"]);
+}
+
+#[test]
+fn a_row_of_the_panel_has_the_bar_restyle_a_type_the_caret_is_not_in() {
+    let mut window = letter();
+    window.click(Role::Button, "Styles").click(Role::Button, "Caption");
+    type_label(&mut window, "Caption");
+    assert_eq!(open_rows(&mut window), ["Caption"]);
+
+    window.click(Role::Button, "Align centre");
+    assert_eq!(style_of(&mut window, "caption").align, Align::Center);
+    assert_eq!(style_of(&mut window, "heading1").align, Align::Start, "the type at the caret keeps its style");
+    type_label(&mut window, "Caption");
+
+    // The bar goes back to the caret once it moves.
+    window.ui().select(Selection::caret(Pos::new("p1", 0)));
+    type_label(&mut window, "Body");
+    assert_eq!(open_rows(&mut window), ["Body"]);
+}
+
+#[test]
+fn a_style_that_is_not_the_persons_default_can_be_reset_to_it_or_saved_as_it() {
+    let mut window = letter();
+    let default = window.ui().style().clone();
+    window.ui().set_default_style(Some(default.clone()));
+    window.click(Role::Button, "Styles");
+    window.assert_closed(Role::Label, "Differs from your default");
+    assert!(!type_label(&mut window, "Heading 1").description.unwrap_or_default().contains("default"));
+
+    window.click(Role::Button, "Align centre");
+    window.assert_open(Role::Label, "Differs from your default");
+    let label = type_label(&mut window, "Heading 1");
+    assert!(label.description.unwrap_or_default().contains("Differs from your default"), "the bar says so too");
+
+    window.click(Role::Button, "Reset to my default");
+    assert_eq!(window.ui().style(), &default);
+    window.assert_closed(Role::Label, "Differs from your default");
+    window.click(Role::Button, "Undo");
+    assert_ne!(window.ui().style(), &default, "undo takes the reset back");
+
+    window.click(Role::Button, "Save as my default");
+    let saved = asked(&mut window).into_iter().find_map(|request| match request {
+        Request::SaveDefaultStyle(json) => Some(json),
+        _ => None,
+    });
+    let saved = Style::from_json(&saved.expect("the shell is asked to keep it")).expect("a style.json");
+    assert_eq!(&saved, window.ui().style());
+    window.assert_closed(Role::Label, "Differs from your default");
+}
+
+#[test]
+fn the_bars_type_opens_the_styles_panel() {
+    let mut window = letter();
+    let label = type_label(&mut window, "Heading 1");
+    window.click_at(label.center());
+    window.assert_open(Role::Complementary, "Styles");
+    window.click_at(label.center());
+    window.assert_open(Role::Complementary, "Styles");
+}
+
+#[test]
+fn a_stylesheet_is_shown_as_it_will_look_before_it_is_applied_in_one_step() {
+    let mut window = letter();
+    let (before, sheet) = (window.ui().style().clone(), other_sheet(&mut window));
+    window.click(Role::Button, "Styles").click(Role::Button, "Import");
+    assert!(asked(&mut window).contains(&Request::ImportStyle), "the shell is asked for a file");
+
+    window.ui().offer_stylesheet("travel.letstyle", &sheet.to_json());
+    window.assert_open(Role::Label, "travel.letstyle");
+    let shows = |window: &mut Harness, font: &str| {
+        window.controls().iter().any(|found| found.role == Role::Label && found.name.starts_with(font))
+    };
+    assert!(shows(&mut window, "Fira Code, 11"), "body text is listed as the stylesheet has it");
+    assert_eq!(window.ui().style(), &before, "nothing has changed yet");
+
+    window.click(Role::Button, "Apply");
+    assert_eq!(window.ui().style(), &sheet);
+    window.assert_closed(Role::Label, "travel.letstyle");
+    window.click(Role::Button, "Undo");
+    assert_eq!(window.ui().style(), &before, "the whole stylesheet is one step");
+}
+
+#[test]
+fn a_stylesheet_on_offer_leaves_the_document_alone_unless_it_is_applied() {
+    // The button pressed, and whether the shell is then asked to keep the stylesheet as the default.
+    for (button, kept) in [("Cancel", false), ("Save as my default", true)] {
+        let mut window = letter();
+        let (before, sheet) = (window.ui().style().clone(), other_sheet(&mut window));
+        window.ui().offer_stylesheet("travel.letstyle", &sheet.to_json());
+        window.assert_open(Role::Complementary, "Styles");
+        window.click(Role::Button, button);
+
+        assert_eq!(window.ui().style(), &before, "{button}");
+        window.assert_closed(Role::Label, "travel.letstyle");
+        let saved = asked(&mut window).into_iter().find_map(|request| match request {
+            Request::SaveDefaultStyle(json) => Style::from_json(&json).ok(),
+            _ => None,
+        });
+        assert_eq!(saved, kept.then_some(sheet), "{button}");
+    }
+}
+
+#[test]
+fn a_file_that_is_no_stylesheet_is_refused_and_the_panel_says_why() {
+    let mut window = letter();
+    let before = window.ui().style().clone();
+    window.ui().offer_stylesheet("notes.txt", "Dear Harland,");
+    let alert = window.controls().into_iter().find(|found| found.role == Role::Alert).expect("the panel says why");
+    assert!(alert.name.contains("notes.txt"), "{}", alert.name);
+    assert!(window.find(Role::Button, "Apply").is_none(), "there is nothing to apply");
+    assert_eq!(window.ui().style(), &before);
+
+    // The next file is judged on its own.
+    let sheet = other_sheet(&mut window);
+    window.ui().offer_stylesheet("travel.letstyle", &sheet.to_json());
+    assert!(window.controls().iter().all(|found| found.role != Role::Alert));
+}
+
+#[test]
+fn export_hands_the_shell_the_documents_style_as_a_stylesheet() {
+    let mut window = letter();
+    window.click(Role::Button, "Align centre").click(Role::Button, "Styles").click(Role::Button, "Export");
+    let sheet = asked(&mut window).into_iter().find_map(|request| match request {
+        Request::ExportStyle(json) => Some(json),
+        _ => None,
+    });
+    let sheet = Style::from_json(&sheet.expect("the shell is asked to write it")).expect("a stylesheet");
+    assert_eq!(&sheet, window.ui().style());
+}
+
+#[test]
+fn the_paper_and_its_margins_are_set_in_the_panel() {
+    let mut window = letter();
+    window.click(Role::Button, "Styles");
+    let a4 = window.ui().style().page.clone();
+    assert_eq!(window.find(Role::Button, "Paper").unwrap().description.as_deref(), Some("A4, portrait"));
+
+    window.click(Role::Button, "Paper").click(Role::MenuItemCheckBox, "Letter");
+    let letter = window.ui().style().page.clone();
+    assert!(letter.width > a4.width && letter.height < a4.height, "US Letter is wider and shorter than A4");
+    window.click(Role::Button, "Paper").click(Role::MenuItemCheckBox, "Landscape");
+    let turned = window.ui().style().page.clone();
+    assert_eq!((turned.width, turned.height), (letter.height, letter.width));
+    assert_eq!(window.find(Role::Button, "Paper").unwrap().description.as_deref(), Some("Letter, landscape"));
+
+    // Margins are typed in millimetres, and the paper has to have room for them.
+    for (typed, taken) in [("10", true), ("500", false), ("wide", false)] {
+        let before = window.ui().style().page.clone();
+        window.click(Role::TextInput, "Margins").key("Mod+A").type_text(typed).key("Enter");
+        let page = window.ui().style().page.clone();
+        assert_eq!(page != before, taken, "{typed:?}");
+        assert_eq!((page.width, page.height), (before.width, before.height), "the paper is as it was");
+        if taken {
+            let sides = [page.margin_top, page.margin_right, page.margin_bottom, page.margin_left];
+            assert!(sides.iter().all(|side| (side - 28.35).abs() < 0.1), "10 mm on every side: {sides:?}");
+        }
+        window.key("Escape");
+    }
+
+    window.click(Role::Button, "Undo");
+    assert_eq!(window.ui().style().page.margin_top, turned.margin_top, "page setup is undone like any edit");
+}
+
+/// The letter in a window that Letters frames itself, as on Linux: it floats, with all three buttons at the
+/// end of the bar.
+fn framed() -> Harness {
+    let mut window = letter();
+    let buttons = vec![WindowButton::Minimise, WindowButton::Maximise, WindowButton::Close];
+    window.ui().set_chrome(Chrome { buttons, frame: Frame::Floating, ..Chrome::default() });
+    window
+}
+
+/// A point of the bar with no control under it.
+fn free_part_of_the_bar(window: &mut Harness) -> Point {
+    let bar = window.find(Role::Toolbar, "Document").expect("the bar").bounds;
+    let share = window.find(Role::Button, "Share").expect("the Share button").bounds;
+    let at = Point { x: share.x - 24.0, y: bar.y + bar.height / 2.0 };
+    let controls = bar_controls(window);
+    assert!(controls.iter().all(|control| !control.1.contains(at)), "{at:?} is on a control: {controls:?}");
+    at
+}
+
+/// A point a little way from another, further than a click may wander.
+fn dragged(from: Point) -> Point {
+    Point { x: from.x + 12.0, y: from.y + 3.0 }
+}
+
+#[test]
+fn the_bar_shows_the_windows_buttons_where_the_desktop_keeps_them() {
+    use WindowButton::{Close, Maximise, Minimise};
+    // The desktop's buttons, whether it keeps them at the start, whether the window is maximised, and the
+    // names the bar then shows in order.
+    let cases: [(&[WindowButton], bool, bool, &[&str]); 5] = [
+        (&[Minimise, Maximise, Close], false, false, &["Minimise", "Maximise", "Close window"]),
+        (&[Close], false, false, &["Close window"]),
+        (&[Close, Minimise, Maximise], true, false, &["Close window", "Minimise", "Maximise"]),
+        (&[Minimise, Maximise, Close], false, true, &["Minimise", "Restore", "Close window"]),
+        (&[], false, false, &[]),
+    ];
+    for (buttons, at_start, maximized, expected) in cases {
+        let mut window = letter();
+        let frame = if maximized { Frame::Filled } else { Frame::Floating };
+        let chrome =
+            Chrome { buttons: buttons.to_vec(), buttons_at_start: at_start, maximized, frame, ..Chrome::default() };
+        window.ui().set_chrome(chrome);
+        let names: Vec<String> = bar_controls(&mut window).into_iter().map(|control| control.0).collect();
+        let shown = if at_start { &names[..expected.len()] } else { &names[names.len() - expected.len()..] };
+        assert_eq!(shown, expected, "at the start: {at_start}, of {names:?}");
+        let window_buttons = ["Minimise", "Maximise", "Restore", "Close window"];
+        let count = names.iter().filter(|name| window_buttons.contains(&name.as_str())).count();
+        assert_eq!(count, expected.len(), "{names:?}");
+    }
+}
+
+#[test]
+fn the_windows_buttons_ask_the_shell() {
+    let cases =
+        [("Minimise", Request::Minimise), ("Maximise", Request::ToggleMaximise), ("Close window", Request::Close)];
+    for (button, expected) in cases {
+        let mut window = framed();
+        window.click(Role::Button, button);
+        assert_eq!(window.ui().take_requests(), [expected], "{button}");
+    }
+}
+
+#[test]
+fn a_drag_on_a_title_bar_moves_the_window_from_its_free_parts_and_its_name_alone() {
+    let mut window = framed();
+    window.ui().set_document_name("Quote");
+    let free = free_part_of_the_bar(&mut window);
+    let name = window.find(Role::Button, "Quote").expect("the name").center();
+    let bold = window.find(Role::Button, "Bold").expect("the Bold button").center();
+    // Where the press starts, whether it moves before it is let go, and what the shell is asked.
+    let cases = [
+        (free, true, vec![Request::DragWindow]),
+        (free, false, vec![]),
+        (name, true, vec![Request::DragWindow]),
+        (name, false, vec![]),
+        (bold, true, vec![]),
+    ];
+    for (from, moves, expected) in cases {
+        window.advance(1000).press_at(from).release_at(if moves { dragged(from) } else { from });
+        assert_eq!(window.ui().take_requests(), expected, "from {from:?}, moving: {moves}");
+        // Only a click on the name opens it to be typed over.
+        let renaming = window.find(Role::TextInput, "Document name").is_some();
+        assert_eq!(renaming, from == name && !moves, "from {from:?}, moving: {moves}");
+        window.key("Escape");
+    }
+}
+
+#[test]
+fn a_bar_under_the_systems_title_bar_moves_nothing() {
+    let mut window = letter();
+    let free = free_part_of_the_bar(&mut window);
+    window.press_at(free).release_at(dragged(free)).click_at(free).click_at(free).secondary_click_at(free);
+    assert_eq!(window.ui().take_requests(), []);
+}
+
+#[test]
+fn a_double_click_on_a_title_bar_maximises_and_a_secondary_press_asks_for_the_window_menu() {
+    let mut window = framed();
+    let free = free_part_of_the_bar(&mut window);
+    window.click_at(free).click_at(free);
+    assert_eq!(window.ui().take_requests(), [Request::ToggleMaximise]);
+    window.advance(1000).secondary_click_at(free);
+    assert_eq!(window.ui().take_requests(), [Request::WindowMenu(free)]);
+
+    // A control keeps its presses to itself.
+    window.advance(1000).double_click(Role::Button, "Bold");
+    let bold = window.find(Role::Button, "Bold").unwrap().center();
+    window.secondary_click_at(bold);
+    assert_eq!(window.ui().take_requests(), []);
+}
+
+#[test]
+fn a_floating_window_is_resized_from_the_grip_inside_its_edge() {
+    let mut window = framed();
+    let before = head(&window);
+    let cases = [
+        (Point { x: 2.0, y: 300.0 }, Edge::West),
+        (Point { x: WINDOW.width - 2.0, y: 300.0 }, Edge::East),
+        (Point { x: 400.0, y: WINDOW.height - 2.0 }, Edge::South),
+        (Point { x: WINDOW.width - 3.0, y: WINDOW.height - 3.0 }, Edge::SouthEast),
+        (Point { x: 3.0, y: 3.0 }, Edge::NorthWest),
+    ];
+    for (at, edge) in cases {
+        window.press_at(at);
+        assert_eq!(window.ui().take_requests(), [Request::ResizeWindow(edge)], "{at:?}");
+        window.release_at(at);
+        assert_eq!(window.ui().cursor(), Cursor::Resize(edge), "the pointer shows it at {at:?}");
+    }
+    assert_eq!(head(&window), before, "a press on the grip is not a press on the page under it");
+
+    // A window that fills its place has no edge to take hold of.
+    let buttons = vec![WindowButton::Close];
+    window.ui().set_chrome(Chrome { buttons, frame: Frame::Filled, maximized: true, ..Chrome::default() });
+    window.click_at(Point { x: 2.0, y: 300.0 });
+    assert_eq!(window.ui().take_requests(), []);
+    assert_ne!(window.ui().cursor(), Cursor::Resize(Edge::West));
+}
+
+/// The faintest ink of the text and icons drawn in the bar.
+fn faintest_in_the_bar(window: &mut Harness) -> u8 {
+    let bar = window.find(Role::Toolbar, "Document").expect("the bar").bounds;
+    let ink = |item: &Item| match item {
+        Item::Glyphs { origin, color, .. } if bar.contains(*origin) => Some(color.a),
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(ink).min().expect("the bar holds text")
+}
+
+#[test]
+fn a_title_bar_dims_while_its_window_is_behind_another() {
+    // A bar under the system's own title bar is no title bar, and stays as it is.
+    for (frame, dims) in [(Frame::Floating, true), (Frame::Unified, true), (Frame::System, false)] {
+        let mut window = letter();
+        window.ui().set_chrome(Chrome { frame, ..Chrome::default() });
+        let front = faintest_in_the_bar(&mut window);
+        window.ui().focus(false);
+        let behind = faintest_in_the_bar(&mut window);
+        assert_eq!(behind < front, dims, "{frame:?}: {front} in front, {behind} behind");
+        window.ui().focus(true);
+        assert_eq!(faintest_in_the_bar(&mut window), front, "{frame:?}: in front again");
+    }
+}
+
+#[test]
+fn a_bar_under_the_systems_buttons_takes_their_height_and_leaves_them_room() {
+    let mut window = letter();
+    let chrome = Chrome { frame: Frame::Unified, bar_height: Some(52.0), inset_start: 78.0, ..Chrome::default() };
+    window.ui().set_chrome(chrome);
+    let bar = window.find(Role::Toolbar, "Document").expect("the bar").bounds;
+    assert_eq!(bar.height, 52.0);
+    assert_eq!(page(&mut window).y, 52.0, "the page starts under it");
+    let first = bar_controls(&mut window).into_iter().next().expect("the bar holds controls");
+    assert!(first.1.x >= 78.0, "{} starts at {}", first.0, first.1.x);
+}
+
+#[test]
+fn a_click_on_the_page_shows_the_markers_where_it_lands() {
+    let inside = spot(&mut marked(true), "b1", INSIDE);
+    let mut window = marked(true);
+    // The word has yet to make room for its markers, so it is still a little to the left.
+    window.click_at(Point { x: inside.x - 12.0, y: inside.y + inside.height / 2.0 });
+    let landed = head(&window);
+    assert!((9..=14).contains(&landed.offset), "in the bold word: {landed:?}");
+    let shown = spot(&mut marked(true), "b1", landed.offset);
+    assert_eq!(caret(&mut window).x, shown.x, "the markers show as they do when the caret is put there");
+}
+
+/// The source of the inline formula [`formulas`] writes, and of its formula block.
+const INLINE: &str = "c = a + b";
+const DISPLAY: &str = "x = a\n+ b";
+
+/// A paragraph `p1` that ends in inline maths with the caret just after it, over a formula block `f1` of
+/// two lines. Nothing moves, so a sheet is out as soon as the caret is in a formula.
+fn formulas() -> Harness {
+    let blocks = vec![
+        text("p1", BlockKind::Paragraph, "A rafter has length "),
+        text("f1", BlockKind::Formula, DISPLAY),
+        text("p2", BlockKind::Paragraph, "Reply by Friday."),
+    ];
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.ui().set_reduced_motion(true);
+    window.ui().select(Selection::caret(Pos::new("p1", 20)));
+    window.type_text(&format!("${INLINE}$"));
+    window
+}
+
+/// The sheet under a formula, if one is out: its description is the source it shows.
+fn sheet(window: &mut Harness) -> Option<letters_test::Found> {
+    window.find(Role::Code, "Formula source")
+}
+
+/// The source the sheet shows.
+fn source(window: &mut Harness) -> Option<String> {
+    sheet(window).and_then(|sheet| sheet.description)
+}
+
+#[test]
+fn the_source_of_a_formula_is_on_a_sheet_under_it_while_the_caret_is_in_it() {
+    let mut window = formulas();
+    assert_eq!(source(&mut window), None, "the caret is past the formula it closed");
+    let line = caret(&mut window);
+
+    window.key("Left");
+    assert_eq!(source(&mut window).as_deref(), Some(INLINE));
+    let (sheet, caret) = (sheet(&mut window).expect("a sheet").bounds, caret(&mut window));
+    assert!(sheet.y >= line.y + line.height - 4.0, "the sheet hangs under the line: {sheet:?} under {line:?}");
+    let middle = Point { x: caret.x, y: caret.y + caret.height / 2.0 };
+    assert!(sheet.contains(middle), "the caret is on the sheet: {caret:?} in {sheet:?}");
+
+    // What is typed goes into the formula, and the sheet shows it.
+    window.type_text("x");
+    assert_eq!(block_text(&window, "p1"), format!("A rafter has length {INLINE}x"));
+    assert_eq!(source(&mut window), Some(format!("{INLINE}x")));
+
+    // The sheet is for the formula the caret is in, whichever kind.
+    window.ui().select(Selection::caret(Pos::new("f1", 2)));
+    assert_eq!(source(&mut window).as_deref(), Some(DISPLAY));
+}
+
+#[test]
+fn the_sheet_goes_when_the_caret_leaves_its_formula() {
+    let far = spot(&mut formulas(), "p2", 4);
+    // How the caret leaves from the end of the inline formula. None of it adds to the document.
+    for way in ["Escape", "Right", "a press elsewhere on the page"] {
+        let mut window = formulas();
+        window.key("Left");
+        let before = window.markdown();
+        match way {
+            "Escape" | "Right" => window.key(way),
+            _ => window.click_at(Point { x: far.x, y: far.y + far.height / 2.0 }),
+        };
+        assert_eq!(source(&mut window), None, "{way}");
+        assert_eq!(window.editor().formula(), None, "{way}");
+        assert_eq!(window.markdown(), before, "{way}: the document is as it was");
+    }
+}
+
+#[test]
+fn up_and_down_move_through_the_lines_of_the_source_before_they_leave_the_formula() {
+    let mut window = formulas();
+    window.ui().select(Selection::caret(Pos::new("f1", 2)));
+    window.key("Down");
+    assert_eq!(head(&window), Pos::new("f1", 8), "the same column of the second line");
+    window.key("End");
+    assert_eq!(head(&window), Pos::new("f1", 9));
+    window.key("Home");
+    assert_eq!(head(&window), Pos::new("f1", 6), "the start of the line of source, not of the formula");
+    window.key("Down");
+    assert_eq!(head(&window).block.as_str(), "p2", "past the last line the caret is on the page again");
+    window.key("Up");
+    assert_eq!(head(&window).block.as_str(), "f1");
+    assert_eq!(source(&mut window).as_deref(), Some(DISPLAY));
+}
+
+#[test]
+fn a_press_on_the_sheet_puts_the_caret_there_in_the_source() {
+    let mut window = formulas();
+    window.key("Left");
+    let sheet = sheet(&mut window).expect("a sheet").bounds;
+    let at = |part: f32| Point { x: sheet.x + sheet.width * part, y: sheet.y + sheet.height / 2.0 };
+
+    window.click_at(at(0.5));
+    let middle = head(&window).offset;
+    assert!(middle > 20 && middle < 29, "somewhere inside the source: {middle}");
+    assert_eq!(source(&mut window).as_deref(), Some(INLINE), "the sheet stays out");
+
+    // The start of the source is still in the formula: what is typed there is part of it.
+    window.click_at(at(0.0));
+    assert_eq!(head(&window), Pos::new("p1", 20));
+    window.type_text("2");
+    assert_eq!(source(&mut window), Some(format!("2{INLINE}")));
+
+    // A drag selects source, which typing replaces. It comes too late to be a double click.
+    window.advance(1000).press_at(at(0.0)).release_at(at(1.0));
+    assert_eq!(selected(&window), format!("2{INLINE}"));
+    window.type_text("y");
+    assert_eq!(source(&mut window).as_deref(), Some("y"));
+    assert_eq!(block_text(&window, "p1"), "A rafter has length y");
+}
+
+/// Whether the next frame draws the caret where it can be seen: whole, inside whatever clips it.
+fn caret_shows(window: &mut Harness) -> bool {
+    let caret = caret(window);
+    let holds = |clip: &Rect| clip.x <= caret.x && caret.x + caret.width <= clip.x + clip.width;
+    let mut clips = Vec::new();
+    window.paint().items.iter().any(|item| match item {
+        Item::PushClip { rect, .. } => {
+            clips.push(*rect);
+            false
+        }
+        Item::PopClip => {
+            clips.pop();
+            false
+        }
+        Item::Fill { rect, .. } => {
+            (rect.x, rect.y) == (caret.x, caret.y) && rect.width < 3.0 && clips.iter().all(holds)
+        }
+        _ => false,
+    })
+}
+
+#[test]
+fn the_caret_shows_and_blinks_at_the_end_of_a_source_as_wide_as_its_sheet() {
+    // Written far wider than it typesets, so the sheet is no wider than the source.
+    const LONG: &str = "c = \\sqrt{a^2 + b^2}";
+    let blocks = vec![text("p1", BlockKind::Paragraph, "A rafter has length "), text("f1", BlockKind::Formula, LONG)];
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.ui().set_reduced_motion(true);
+    window.ui().select(Selection::caret(Pos::new("p1", 20)));
+    window.type_text(&format!("${LONG}$"));
+    // How the caret comes to the end of a source: in a paragraph, in a block, and after a space typed there.
+    for way in ["in a paragraph", "in a block", "after a space"] {
+        match way {
+            "in a paragraph" => _ = window.key("Left"),
+            "in a block" => window.ui().select(Selection::caret(Pos::new("f1", LONG.len()))),
+            _ => _ = window.type_text(" "),
+        }
+        assert_eq!(source(&mut window).map(|source| source.trim_end().to_owned()).as_deref(), Some(LONG), "{way}");
+        let seen: Vec<bool> = (0..20).map(|_| caret_shows(window.advance(100))).collect();
+        assert!(seen.contains(&true), "{way}: the caret shows past the last character");
+        assert!(seen.contains(&false), "{way}: and it blinks");
+    }
+}
+
+/// A formula block `f1` that holds `source`, with the caret in it at `caret` and its sheet out.
+fn written(source: &str, caret: usize) -> Harness {
+    let mut window =
+        Harness::open(Document { blocks: vec![text("f1", BlockKind::Formula, source)], ..Document::default() });
+    window.ui().set_reduced_motion(true);
+    window.ui().select(Selection::caret(Pos::new("f1", caret)));
+    window
+}
+
+#[test]
+fn a_key_shows_the_caret_at_once_though_it_moves_nowhere() {
+    let mut window = written("a + b", 5);
+    let at = caret(&mut window);
+    let out = (0..20).any(|_| !caret_shows(window.advance(100)));
+    assert!(out, "the caret blinks");
+    window.key("End");
+    assert_eq!(caret(&mut window), at, "End at the end of the source moves nothing");
+    assert!(caret_shows(&mut window), "and the caret shows at once");
+}
+
+#[test]
+fn a_block_of_maths_is_written_on_as_many_rows_as_it_needs() {
+    let row = sheet(&mut written("a + b", 0)).expect("a sheet").bounds.height;
+
+    // Enter starts a new line of the source, and the sheet grows by a row.
+    let mut window = written("a + b", 5);
+    window.key("Enter").type_text("+ c");
+    assert_eq!(source(&mut window).as_deref(), Some("a + b\n+ c"));
+    let two = sheet(&mut window).expect("a sheet").bounds.height;
+    assert!((two - 2.0 * row).abs() <= 1.0, "two rows: {two} for {row} each");
+
+    // A line too long for the sheet goes on in a new row, and the sheet stays inside the page.
+    let long = "a + ".repeat(60);
+    let long = long.trim_end();
+    let mut window = written(long, 0);
+    let (rows, page) = (sheet(&mut window).expect("a sheet").bounds, page(&mut window));
+    assert!(rows.height >= 2.0 * row, "more rows than one: {rows:?}");
+    assert!(page.x <= rows.x && rows.x + rows.width <= page.x + page.width, "{rows:?} in {page:?}");
+
+    // End keeps to the row the caret is on, and the end of the source is on the last.
+    let first = caret(&mut window);
+    window.key("End");
+    let end = caret(&mut window);
+    assert!(end.y == first.y && end.x > first.x && end.x < rows.x + rows.width, "{end:?} on the row of {first:?}");
+    window.ui().select(Selection::caret(Pos::new("f1", long.len())));
+    let last = caret(&mut window);
+    assert!(last.y > end.y && last.y + last.height <= rows.y + rows.height + 1.0, "{last:?} in {rows:?}");
+    assert!(caret_shows(&mut window), "the caret shows at the end of the last row");
+}
+
+/// The colour each character of a one-line source is drawn in on its sheet, by its place in the source.
+fn source_inks(window: &mut Harness) -> Vec<Option<Color>> {
+    let found = sheet(window).expect("a sheet");
+    let (sheet, count) = (found.bounds, found.description.map_or(0, |source| source.chars().count()));
+    let mut drawn = Vec::new();
+    for item in window.paint().items {
+        let Item::Glyphs { origin, color, glyphs, .. } = item else { continue };
+        let on_sheet = |x: &f32| sheet.contains(Point { x: x + 1.0, y: origin.y });
+        drawn.extend(glyphs.iter().map(|glyph| origin.x + glyph.x).filter(on_sheet).map(|x| (x - sheet.x, color)));
+    }
+    // The source is in one width of character, so a glyph's place across says which character it is.
+    drawn.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let steps = drawn.windows(2).map(|pair| pair[1].0 - pair[0].0).filter(|step| *step > 0.5);
+    let advance = steps.fold(f32::MAX, f32::min);
+    let mut inks = vec![None; count];
+    for (x, color) in drawn {
+        if let Some(ink) = inks.get_mut((x / advance).round() as usize) {
+            *ink = Some(color);
+        }
+    }
+    inks
+}
+
+/// What the sheet says is wrong with its source, if it says anything.
+fn fault(window: &mut Harness) -> Option<String> {
+    window.controls().into_iter().find(|control| control.role == Role::Status).and_then(|said| said.value)
+}
+
+#[test]
+fn the_source_on_a_sheet_is_coloured_by_what_its_parts_are() {
+    // A source, places in it drawn alike, and places drawn apart.
+    type Places<'a> = &'a [(usize, usize)];
+    let cases: [(&str, Places, Places); 5] = [
+        // A command, and the braces of its arguments.
+        (r"\frac{a}{b}", &[(0, 4), (5, 7), (5, 10)], &[(0, 6), (0, 5), (5, 6)]),
+        // A pair inside a pair.
+        ("{a{b}}", &[(0, 5), (2, 4)], &[(0, 2), (0, 1), (2, 3)]),
+        // Words are not maths.
+        (r"\text{if} x", &[(6, 7)], &[(6, 10), (6, 0)]),
+        // A half-open interval pairs nothing.
+        ("(0, 1]", &[(0, 1), (5, 1)], &[]),
+        // A comment runs to the end of its line.
+        ("x % so", &[(2, 5)], &[(0, 2)]),
+    ];
+    for (source, alike, apart) in cases {
+        let inks = source_inks(&mut written(source, 0));
+        for (one, other) in alike {
+            assert_eq!(inks[*one], inks[*other], "{source}: {one} and {other} are drawn alike");
+        }
+        for (one, other) in apart {
+            assert_ne!(inks[*one], inks[*other], "{source}: {one} and {other} are drawn apart");
+        }
+    }
+}
+
+#[test]
+fn what_is_wrong_in_a_source_is_marked_unless_it_is_still_being_written() {
+    // A brace that closes nothing is wrong wherever the caret is.
+    let stray = source_inks(&mut written("a}", 2))[1];
+    assert_ne!(stray, source_inks(&mut written("{a}", 0))[2], "a stray brace is not drawn as one of a pair");
+
+    // A source, where the caret is, the place of what is wrong, and whether it is marked there.
+    let cases = [
+        // A brace is not unclosed while the caret is at the end, where it would be closed.
+        (r"\frac{a}{b", 10, 8, false),
+        (r"\frac{a}{b", 0, 8, true),
+    ];
+    for (source, caret, at, marked) in cases {
+        let mut window = written(source, caret);
+        assert_eq!(source_inks(&mut window)[at] == stray, marked, "{source} with the caret at {caret}");
+        assert_eq!(fault(&mut window).is_some(), marked, "{source} with the caret at {caret}: what is wrong is said");
+    }
+
+    // What the maths engine refuses is said under the source, once the caret has left it.
+    let unknown = r"x + \nosuchthing + y";
+    assert_eq!(fault(&mut written(unknown, 16)), None, "the caret is at the end of the command");
+    let said = fault(&mut written(unknown, 0)).expect("the sheet says what is wrong");
+    assert!(!said.is_empty());
+    assert_eq!(fault(&mut written("x + y", 0)), None, "nothing is wrong");
+}
+
+#[test]
+fn a_sheet_slides_out_from_under_its_formula() {
+    let mut window = formulas();
+    window.ui().set_reduced_motion(false);
+    window.key("Left");
+    let mut heights = Vec::new();
+    for _ in 0..30 {
+        heights.push(sheet(&mut window).expect("a sheet").bounds.height);
+        window.advance(8);
+    }
+    assert!(heights[0] < heights[29], "it starts short of its height: {heights:?}");
+    assert!(heights.windows(2).all(|pair| pair[0] <= pair[1]), "and only grows: {heights:?}");
+    assert_eq!(heights[28], heights[29], "to rest within a quarter of a second: {heights:?}");
+}
+
+/// The options a list beside the caret shows, top to bottom: each one's name, what is said beside it, and
+/// whether it is the one picked. The sheet's symbols are such a list, and so are the insert menu's offers.
+fn options(window: &mut Harness) -> Vec<(String, String, bool)> {
+    let option = |found: letters_test::Found| {
+        let picked = found.selected.filter(|_| found.role == Role::ListBoxOption)?;
+        Some((found.name, found.description.unwrap_or_default(), picked))
+    };
+    window.controls().into_iter().filter_map(option).collect()
+}
+
+/// [`formulas`] with the caret at the end of the inline formula, and `typed` typed there.
+fn typing(typed: &str) -> Harness {
+    let mut window = formulas();
+    window.key("Left").type_text(typed);
+    window
+}
+
+#[test]
+fn a_backslash_lists_the_symbols_that_match_what_follows_it() {
+    let mut window = typing(r" \ap");
+    window.assert_open(Role::ListBox, "Symbols");
+    let listed = options(&mut window);
+    assert_eq!(listed[0], (r"\approx".to_owned(), "approximately equal to".to_owned(), true), "{listed:?}");
+    assert!(listed.len() > 1 && listed[1..].iter().all(|symbol| !symbol.2), "one is picked: {listed:?}");
+
+    // The list follows what is typed, and a plain name finds a symbol as well as its command does.
+    window.key("Backspace").key("Backspace").type_text("fraction");
+    assert_eq!(options(&mut window)[0].0, r"\frac");
+    window.type_text("zz");
+    window.assert_closed(Role::ListBox, "Symbols");
+}
+
+#[test]
+fn tab_writes_the_picked_symbol_and_a_press_writes_the_one_pressed() {
+    let mut window = typing(r" \ap");
+    let second = options(&mut window)[1].0.clone();
+    window.key("Down");
+    assert!(options(&mut window)[1].2, "Down picks the next one");
+    window.key("Tab");
+    assert_eq!(source(&mut window), Some(format!("{INLINE} {second}")));
+    window.assert_closed(Role::ListBox, "Symbols");
+
+    // One that takes arguments gets its braces, and the caret waits in the first pair.
+    window.type_text(r" \fra").click(Role::ListBoxOption, r"\frac");
+    assert_eq!(source(&mut window), Some(format!(r"{INLINE} {second} \frac{{}}{{}}")));
+    window.type_text("a");
+    assert_eq!(source(&mut window), Some(format!(r"{INLINE} {second} \frac{{a}}{{}}")));
+
+    window.key("Mod+Z").key("Mod+Z");
+    assert_eq!(source(&mut window), Some(format!(r"{INLINE} {second} \fra")), "taking a symbol is one step");
+}
+
+#[test]
+fn the_list_of_symbols_is_put_away_without_leaving_the_formula() {
+    // What is done while the list shows, and the source afterwards.
+    let ways: [(&str, &str, &str); 3] = [
+        ("Escape", "Escape", r"c = a + b \ap"),
+        ("an arrow", "Left", r"c = a + b \ap"),
+        ("a space", "Space", r"c = a + b \ap "),
+    ];
+    for (way, key, after) in ways {
+        let mut window = typing(r" \ap");
+        match key {
+            "Space" => window.type_text(" "),
+            key => window.key(key),
+        };
+        window.assert_closed(Role::ListBox, "Symbols");
+        assert_eq!(source(&mut window).as_deref(), Some(after), "{way}: the sheet is still out");
+    }
+    // Escape once more steps out of the formula.
+    let mut window = typing(r" \ap");
+    window.key("Escape").key("Escape");
+    assert_eq!(source(&mut window), None);
+}
+
+/// How strongly each run of glyphs on the page is drawn, back to front: the alpha of its ink.
+fn inks(window: &mut Harness) -> Vec<u8> {
+    let page = page(window);
+    let ink = |item: &Item| match item {
+        Item::Glyphs { origin, color, .. } if page.contains(*origin) => Some(color.a),
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(ink).collect()
+}
+
+#[test]
+fn the_dollar_that_closes_a_formula_blends_its_source_into_its_glyphs() {
+    // A formula closed in a line of text, and one closed alone in its paragraph.
+    for (start, typed) in [("A rafter has length ", "$c = a + b$"), ("", "$$x = a + b$$")] {
+        let closed = |reduced_motion: bool| {
+            let blocks = vec![text("p1", BlockKind::Paragraph, start)];
+            let mut window = Harness::open(Document { blocks, ..Document::default() });
+            window.ui().set_reduced_motion(reduced_motion);
+            window.ui().select(Selection::caret(Pos::new("p1", start.len())));
+            window.type_text(typed);
+            window
+        };
+        let rest = inks(&mut closed(true));
+        assert_eq!(inks(closed(true).advance(400)), rest, "{typed}: nothing blends under reduced motion");
+
+        let mut window = closed(false);
+        let mut frames = Vec::new();
+        for _ in 0..30 {
+            frames.push(inks(&mut window));
+            window.advance(8);
+        }
+        assert!(frames[0].len() > rest.len(), "{typed}: the source is still on the page: {:?}", frames[0]);
+        assert!(frames[0].contains(&0), "{typed}: and the formula has yet to show: {:?}", frames[0]);
+        let between = |inks: &Vec<u8>| inks.iter().filter(|ink| (1..255).contains(*ink)).count() >= 2;
+        assert!(frames.iter().any(between), "{typed}: each shows through the other on the way: {frames:?}");
+        assert_eq!(frames[29], rest, "{typed}: within a quarter of a second the formula is all that shows");
+    }
+}
+
+/// The names of the options a list beside the caret shows.
+fn offered(window: &mut Harness) -> Vec<String> {
+    options(window).into_iter().map(|option| option.0).collect()
+}
+
+#[test]
+fn a_slash_on_an_empty_line_offers_what_to_put_there() {
+    let mut window = blank();
+    window.type_text("/");
+    window.assert_open(Role::ListBox, "Insert");
+    let all = options(&mut window);
+    assert_eq!(all[0], ("Heading 1".to_owned(), "#".to_owned(), true), "each offer shows its shorthand: {all:?}");
+    assert!(all.len() > 8 && all[1..].iter().all(|offer| !offer.2), "one is picked: {all:?}");
+
+    // What is typed after the slash narrows the menu, and what matches nothing puts it away for the moment.
+    window.type_text("li");
+    assert_eq!(offered(&mut window), ["Bulleted list", "Numbered list", "Task list"]);
+    window.type_text("zz");
+    window.assert_closed(Role::ListBox, "Insert");
+    window.key("Backspace").key("Backspace");
+    assert_eq!(offered(&mut window).len(), 3);
+    assert_eq!(block_text(&window, "p"), "/li", "the line is written as any other until an offer is taken");
+}
+
+#[test]
+fn the_insert_menu_puts_what_is_taken_on_its_line() {
+    // What is typed, how an offer is taken, and the document once "Roof" is written there.
+    let cases = [
+        ("/", "Enter", "# Roof"),
+        ("/", "Down Down Tab", "### Roof"),
+        ("/", "Up Enter", "---\n\nRoof"),
+        ("/task", "Enter", "- [ ] Roof"),
+        ("/quote", "a press", "> Roof"),
+        ("/code", "Enter", "```\nRoof\n```"),
+    ];
+    for (typed, take, expected) in cases {
+        let mut window = blank();
+        window.type_text(typed);
+        match take {
+            "a press" => window.click(Role::ListBoxOption, "Quote"),
+            keys => keys.split(' ').fold(&mut window, |window, key| window.key(key)),
+        };
+        window.assert_closed(Role::ListBox, "Insert");
+        window.type_text("Roof");
+        assert_eq!(window.markdown().trim_end(), expected, "{typed} then {take}");
+    }
+}
+
+#[test]
+fn the_insert_menu_puts_a_table_where_the_slash_was() {
+    let mut window = blank();
+    window.type_text("/tab").key("Enter");
+    window.assert_closed(Role::ListBox, "Insert");
+    let cell = window.editor().cell().expect("the caret is in a table");
+    assert_eq!((cell.row, cell.column), (0, 0), "in its first cell");
+    assert!(cell.rows >= 2 && cell.columns >= 2, "a table has more cells than one: {cell:?}");
+    window.type_text("Roof");
+    let written = window.markdown();
+    assert!(written.contains("Roof") && !written.contains('/'), "the slash is gone: {written}");
+}
+
+#[test]
+fn the_insert_menu_stays_away_where_a_slash_is_only_a_slash() {
+    // A slash inside a line opens nothing.
+    let mut window = blank();
+    window.type_text("and/or");
+    window.assert_closed(Role::ListBox, "Insert");
+
+    // Escape puts the menu away and leaves the slash, which is then text like any other.
+    let mut window = blank();
+    window.type_text("/").key("Escape");
+    window.assert_closed(Role::ListBox, "Insert");
+    window.type_text("li");
+    window.assert_closed(Role::ListBox, "Insert");
+    assert_eq!(block_text(&window, "p"), "/li");
+
+    // So does a caret that leaves the end of the line.
+    let mut window = blank();
+    window.type_text("/").key("Left").key("Right");
+    window.assert_closed(Role::ListBox, "Insert");
+}
+
+/// A paragraph `p1`, a figure `g` with a caption, and a paragraph `p2`.
+fn pictured() -> Harness {
+    let figure = BlockKind::Figure {
+        asset: None,
+        src: Some("https://example.com/roof.png".into()),
+        alt: "A slate roof".into(),
+        width: 300.0,
+        height: 150.0,
+        numbered: false,
+    };
+    let blocks = vec![
+        text("p1", BlockKind::Paragraph, "The roof today:"),
+        text("g", figure, "Seen from the garden"),
+        text("p2", BlockKind::Paragraph, "Reply by Friday."),
+    ];
+    Harness::open(Document { blocks, ..Document::default() })
+}
+
+/// The outlines the page draws round a point.
+fn rings(window: &mut Harness, at: Point) -> usize {
+    let round = |item: &Item| matches!(item, Item::Stroke { rect, .. } if rect.contains(at));
+    window.paint().items.iter().filter(|item| round(item)).count()
+}
+
+#[test]
+fn a_press_on_a_picture_selects_its_figure_and_one_on_its_caption_writes_there() {
+    let mut window = pictured();
+    let caption = spot(&mut window, "g", 4);
+    // The picture is above its caption, across the middle of the page.
+    let page = page(&mut window);
+    let picture = Point { x: page.x + page.width / 2.0, y: caption.y - 40.0 };
+    let before = rings(&mut window, picture);
+
+    window.click_at(picture);
+    assert_eq!(window.editor().picture().map(|figure| figure.as_str()), Some("g"));
+    assert_eq!(rings(&mut window, picture), before + 1, "the picture has a ring round it");
+    assert_eq!(window.ui().caret_rect(), None, "and no caret blinks in the text");
+    window.type_text("x");
+    assert_eq!(block_text(&window, "g"), "Seen from the garden", "what is typed on a picture goes nowhere");
+
+    window.click_at(Point { x: caption.x, y: caption.y + caption.height / 2.0 });
+    assert_eq!(window.editor().picture(), None);
+    assert_eq!(head(&window), Pos::new("g", 4));
+    assert_eq!(rings(&mut window, picture), before, "the ring goes with the selection");
+}
+
+/// A paragraph `p1`, a figure `g` whose picture is the asset `assets/roof.png`, and a paragraph `p2`.
+fn illustrated() -> Harness {
+    let figure = BlockKind::Figure {
+        asset: Some("assets/roof.png".into()),
+        src: None,
+        alt: "A slate roof".into(),
+        width: 300.0,
+        height: 150.0,
+        numbered: false,
+    };
+    let blocks = vec![
+        text("p1", BlockKind::Paragraph, "The roof today:"),
+        text("g", figure, "Seen from the garden"),
+        text("p2", BlockKind::Paragraph, "Reply by Friday."),
+    ];
+    Harness::open(Document { blocks, ..Document::default() })
+}
+
+/// Where a frame draws a picture, and how many boxes it fills in that very place before it, to keep it.
+fn picture(window: &mut Harness) -> (Rect, usize) {
+    let frame = window.paint();
+    let drawn = |item: &Item| match item {
+        Item::Image { rect, .. } => Some(*rect),
+        _ => None,
+    };
+    let (at, picture) =
+        frame.items.iter().enumerate().find_map(|(at, item)| Some((at, drawn(item)?))).expect("a picture");
+    let under = frame.items[..at].iter().filter(|item| matches!(item, Item::Fill { rect, .. } if *rect == picture));
+    (picture, under.count())
+}
+
+#[test]
+fn a_picture_is_asked_of_the_shell_once_and_its_place_kept_until_it_comes() {
+    let mut window = illustrated();
+    let (place, kept) = picture(&mut window);
+    assert_eq!(kept, 1, "the place of a picture that has not come is filled in under it");
+    assert_eq!(window.ui().take_requests(), [Request::Asset("assets/roof.png".into())]);
+    window.type_text("x");
+    window.paint();
+    assert_eq!(window.ui().take_requests(), [], "it is asked for once");
+
+    let image = Image::from_rgba8(2, 1, vec![255; 8]).expect("two pixels");
+    window.ui().set_image("assets/roof.png", Some(image));
+    assert_eq!(picture(&mut window), (place, 0), "the picture is drawn where its place was kept");
+    assert!(window.ui().images().get("assets/roof.png").is_some(), "from what the shell's renderer is handed");
+}
+
+#[test]
+fn a_picture_that_cannot_be_had_keeps_its_place_and_is_not_asked_for_again() {
+    let mut window = illustrated();
+    // The shell may know before it is asked.
+    window.ui().set_image("assets/roof.png", None);
+    assert_eq!(picture(&mut window).1, 1);
+    assert_eq!(window.ui().take_requests(), []);
+}
+
+#[test]
+fn the_ends_of_the_selection_are_told_where_the_page_shows_them() {
+    let mut window = long();
+    let (start, end) = (spot(&mut window, "p1", 4), spot(&mut window, "p1", 8));
+    window.ui().select(Selection { anchor: Pos::new("p1", 4), head: Pos::new("p1", 8) });
+    window.paint();
+    let near = |end: Option<Rect>, caret: Rect| {
+        end.is_some_and(|end| (end.x - caret.x).abs() < 1.0 && end.y == caret.y && end.height == caret.height)
+    };
+    let [anchor, head] = window.ui().selection_ends();
+    assert!(near(anchor, start) && near(head, end), "{anchor:?} and {head:?} at {start:?} and {end:?}");
+
+    // An end the page has scrolled away from is not told.
+    window.ui().select(Selection { anchor: Pos::new("p1", 4), head: Pos::new("p150", 8) });
+    window.paint();
+    let [anchor, head] = window.ui().selection_ends();
+    assert!(anchor.is_none() && head.is_some(), "{anchor:?} and {head:?}");
+
+    let mut window = Harness::open(Document::default());
+    window.paint();
+    assert_eq!(window.ui().selection_ends(), [None, None], "a page with nowhere to write has no ends");
+}
+
+#[test]
+fn a_long_press_selects_the_word_under_it_on_the_page_alone() {
+    let mut window = letter();
+    let word = spot(&mut window, "p1", 10);
+    assert!(window.long_press_at(Point { x: word.x + 2.0, y: word.y + word.height / 2.0 }));
+    assert_eq!(selected(&window).trim(), "Roofing");
+
+    let share = window.find(Role::Button, "Share").expect("a Share button").center();
+    assert!(!window.long_press_at(share), "the bar is not the page");
+    assert_eq!(selected(&window).trim(), "Roofing");
+}
+
+/// A picture as a shell hands one over: bytes that begin as a PNG's do.
+fn png() -> Picture {
+    let bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    Picture { bytes, mime: "image/png".into(), width: 400, height: 200 }
+}
+
+/// What the document's own blocks are, in order: text by its words, a figure by its caption or as "new"
+/// without one, and a gallery by how many pictures it holds.
+fn blocks(window: &Harness) -> Vec<String> {
+    let figure = |block: &&Block| matches!(block.kind, BlockKind::Figure { .. });
+    let named = |block: &Block| match &block.kind {
+        BlockKind::Gallery { .. } => format!("gallery of {}", block.body.blocks().iter().filter(figure).count()),
+        BlockKind::Figure { .. } if block.plain_text().is_empty() => "new".into(),
+        _ => block.plain_text(),
+    };
+    window.editor().doc().blocks.iter().map(named).collect()
+}
+
+/// The bars a frame draws to say where held pictures would land, each as whether it stands upright.
+fn bars(window: &mut Harness) -> Vec<bool> {
+    let bar = |item: &Item| match item {
+        Item::Fill { rect, radius, .. } if *radius == 2.0 && rect.width.min(rect.height) == 3.0 => {
+            Some(rect.height > rect.width)
+        }
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(bar).collect()
+}
+
+#[test]
+fn pictures_held_over_the_page_show_where_they_would_land_and_land_there() {
+    let (roof, today, reply) = ("Seen from the garden", "The roof today:", "Reply by Friday.");
+    // Where on the page they are held, whether the bar there stands upright, and the document after.
+    let cases = [
+        ("low on the last line", false, vec![today, roof, reply, "new"]),
+        ("high on the last line", false, vec![today, roof, "new", reply]),
+        ("the right of the picture", true, vec![today, "gallery of 2", reply]),
+        ("the left of the picture", true, vec![today, "gallery of 2", reply]),
+        ("the top of the picture", false, vec![today, "new", roof, reply]),
+    ];
+    for (held, upright, after) in cases {
+        let mut window = illustrated();
+        let (picture, line) = (picture(&mut window).0, spot(&mut window, "p2", 3));
+        let middle = Point { x: picture.x + picture.width / 2.0, y: picture.y + picture.height / 2.0 };
+        let at = match held {
+            "low on the last line" => Point { x: line.x, y: line.y + line.height - 2.0 },
+            "high on the last line" => Point { x: line.x, y: line.y + 2.0 },
+            "the right of the picture" => Point { x: picture.x + picture.width - 10.0, ..middle },
+            "the left of the picture" => Point { x: picture.x + 10.0, ..middle },
+            _ => Point { y: picture.y + 10.0, ..middle },
+        };
+        assert_eq!(bars(&mut window), [false; 0], "{held}: nothing is held yet");
+        assert!(window.hold_pictures(Some(at)), "{held}");
+        assert_eq!(bars(&mut window), [upright], "{held}");
+
+        window.drop_pictures(Some(at), vec![png()]);
+        assert_eq!(blocks(&window), after, "{held}");
+        assert_eq!(bars(&mut window), [false; 0], "{held}: the bar goes with the drop");
+        assert!(window.editor().picture().is_some(), "{held}: what was dropped is selected");
+    }
+}
+
+#[test]
+fn pictures_held_over_anything_but_the_page_have_nowhere_to_land() {
+    let mut window = illustrated();
+    let line = spot(&mut window, "p2", 3);
+    let share = window.find(Role::Button, "Share").expect("a Share button").center();
+    assert!(!window.hold_pictures(Some(share)));
+    assert_eq!(bars(&mut window), [false; 0]);
+
+    // Taken away again, they leave no bar behind.
+    assert!(window.hold_pictures(Some(Point { x: line.x, y: line.y + 2.0 })));
+    assert!(!window.hold_pictures(None));
+    assert_eq!(bars(&mut window), [false; 0]);
+
+    // Let go off the page, they go where the caret is.
+    window.drop_pictures(Some(share), vec![png()]);
+    assert_eq!(blocks(&window).last().map(String::as_str), Some("new"), "under the line of the caret");
+}
+
+#[test]
+fn the_insert_menu_asks_the_shell_for_pictures_which_take_the_place_of_the_line() {
+    let mut window = blank();
+    window.type_text("/ima").key("Enter");
+    window.assert_closed(Role::ListBox, "Insert");
+    assert_eq!(window.ui().take_requests(), [Request::Pictures]);
+    assert_eq!(block_text(&window, "p"), "", "the slash is gone");
+
+    window.drop_pictures(None, vec![png(), png()]);
+    assert_eq!(blocks(&window), ["gallery of 2"], "several pictures are a gallery, where the line was");
+    window.paint();
+    assert!(matches!(window.ui().take_requests()[..], [Request::Asset(_), ..]), "and are asked for to be shown");
+}
+
+/// The address the picture of [`pictured`] is linked from.
+const LINK: &str = "https://example.com/roof.png";
+
+/// The window of [`pictured`] with its linked picture handed over or not, the middle of that picture and
+/// the middle of the cloud in its corner. What the window asked on the way is taken.
+fn linked(loaded: bool) -> (Harness, Point, Point) {
+    let mut window = pictured();
+    let image = Image::from_rgba8(2, 1, vec![255; 8]).expect("two pixels");
+    window.ui().set_image(LINK, Some(image));
+    let place = picture(&mut window).0;
+    if !loaded {
+        window.ui().set_image(LINK, None);
+        window.paint();
+    }
+    window.ui().take_requests();
+    let middle = Point { x: place.x + place.width / 2.0, y: place.y + place.height / 2.0 };
+    (window, middle, Point { x: place.x + place.width - 16.0, y: place.y + 16.0 })
+}
+
+/// The assets a frame draws pictures of.
+fn drawn(window: &mut Harness) -> Vec<String> {
+    let asset = |item: &Item| match item {
+        Item::Image { asset, .. } => Some(asset.clone()),
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(asset).collect()
+}
+
+/// How many shapes a frame fills in over a point of a picture, after the picture.
+fn over(window: &mut Harness, at: Point) -> usize {
+    let frame = window.paint();
+    let picture = frame.items.iter().position(|item| matches!(item, Item::Image { .. })).expect("a picture");
+    let covers = |item: &&Item| matches!(item, Item::Fill { rect, .. } if rect.contains(at));
+    frame.items[picture..].iter().filter(covers).count()
+}
+
+#[test]
+fn a_linked_picture_is_told_to_the_shell_once_and_drawn_when_the_shell_hands_it_over() {
+    let mut window = pictured();
+    assert_eq!(drawn(&mut window), [""; 0], "a link is not a picture until the shell says so");
+    assert_eq!(window.ui().take_requests(), [Request::LinkedPicture(LINK.into())]);
+    window.type_text("x");
+    window.paint();
+    assert_eq!(window.ui().take_requests(), [], "it is told once");
+
+    let image = Image::from_rgba8(2, 1, vec![255; 8]).expect("two pixels");
+    window.ui().set_image(LINK, Some(image));
+    assert_eq!(drawn(&mut window), [LINK], "the picture is drawn under the address it is linked from");
+    window.ui().set_image(LINK, None);
+    assert_eq!(drawn(&mut window), [""; 0], "and is a link again when it is taken away");
+    assert_eq!(window.ui().take_requests(), []);
+}
+
+#[test]
+fn the_cloud_on_a_linked_picture_asks_the_shell_to_load_trust_or_embed_it() {
+    let (load, trust) = (Request::LoadPicture(LINK.into()), Request::TrustPictures(LINK.into()));
+    let embed = Request::EmbedPicture { figure: "g".into(), src: LINK.into() };
+    // Whether the picture shows, what is picked from the menu, and what the shell is asked.
+    let cases = [
+        (false, "Load once", vec![load]),
+        // What was held back is told again, since it may load now.
+        (false, "Always load from example.com", vec![trust.clone(), Request::LinkedPicture(LINK.into())]),
+        (true, "Always load from example.com", vec![trust]),
+        (false, "Embed in the document", vec![embed.clone()]),
+        (true, "Embed in the document", vec![embed]),
+    ];
+    for (loaded, picked, asked) in cases {
+        let (mut window, _, cloud) = linked(loaded);
+        window.click_at(cloud).assert_open(Role::Menu, "Linked picture");
+        assert_eq!(window.find(Role::MenuItem, "Load once").is_some(), !loaded, "nothing to load when it shows");
+        window.click(Role::MenuItem, picked).assert_closed(Role::Menu, "Linked picture");
+        assert_eq!(window.ui().take_requests(), asked, "{picked}, loaded: {loaded}");
+        assert_eq!(window.editor().picture().map(|figure| figure.as_str()), Some("g"), "{picked}");
+    }
+}
+
+#[test]
+fn the_menu_of_a_linked_picture_opens_from_its_cloud_or_a_secondary_press_alone() {
+    let (mut window, middle, _) = linked(false);
+    window.click_at(middle).assert_closed(Role::Menu, "Linked picture");
+    window.secondary_click_at(middle).assert_open(Role::Menu, "Linked picture");
+    window.key("Escape").assert_closed(Role::Menu, "Linked picture");
+    assert_eq!(window.ui().take_requests(), [], "a menu put away asks nothing");
+
+    // A picture the document holds has no cloud and no such menu.
+    let mut window = illustrated();
+    let place = picture(&mut window).0;
+    let (middle, corner) =
+        (Point { x: place.x + 150.0, y: place.y + 75.0 }, Point { x: place.x + 284.0, y: place.y + 16.0 });
+    window.click_at(corner).assert_closed(Role::Menu, "Linked picture");
+    window.secondary_click_at(middle).assert_closed(Role::Menu, "Linked picture");
+}
+
+#[test]
+fn a_linked_picture_that_shows_has_its_cloud_while_it_is_selected_or_under_the_pointer() {
+    let (mut window, middle, cloud) = linked(true);
+    let far = spot(&mut window, "p1", 2);
+    assert_eq!(over(&mut window, cloud), 0, "a picture that is read is left alone");
+
+    window.hover_at(middle);
+    assert_eq!(over(&mut window, cloud), 1, "under the pointer it says it is a link");
+    assert_ne!(window.ui().cursor(), Cursor::Pointer);
+    window.hover_at(cloud);
+    assert_eq!(over(&mut window, cloud), 1);
+    assert_eq!(window.ui().cursor(), Cursor::Pointer, "the cloud is there to press");
+
+    window.click_at(middle).hover_at(Point { x: far.x, y: far.y + 2.0 });
+    assert_eq!(over(&mut window, cloud), 1, "selected, it keeps its cloud for a finger or the keyboard");
+    window.click_at(Point { x: far.x, y: far.y + 2.0 });
+    assert_eq!(over(&mut window, cloud), 0);
+}
+
+/// Whether a frame has a chip under the cloud at `at`: a small filled shape, as the frame of a picture that
+/// does not show is not.
+fn chip(window: &mut Harness, at: Point) -> bool {
+    let small = |item: &Item| matches!(item, Item::Fill { rect, .. } if rect.contains(at) && rect.width <= 40.0);
+    window.paint().items.iter().any(small)
+}
+
+#[test]
+fn what_the_shell_says_of_a_linked_picture_is_on_its_cloud_and_in_its_menu() {
+    let failed = PictureState::Failed("the server answered 404".into());
+    // What the shell says, what the menu says of it, the item that loads the picture and whether what
+    // fetches is there to choose.
+    let cases = [
+        (None, None, Some("Load once"), true),
+        (Some(PictureState::Loading), Some("Loading from example.com"), None, true),
+        (Some(failed), Some("the server answered 404"), Some("Try again"), true),
+        (Some(PictureState::Held), Some("Safe mode"), Some("Load once"), false),
+    ];
+    for (state, said, load, offered) in cases {
+        let (mut window, _, cloud) = linked(false);
+        window.ui().set_picture_state(LINK, state.clone());
+        assert_eq!(chip(&mut window, cloud), state.is_some(), "{state:?}: the cloud says it with nothing selected");
+
+        window.click_at(cloud).assert_open(Role::Menu, "Linked picture");
+        let note =
+            window.controls().into_iter().find(|control| control.role == Role::Status).and_then(|note| note.value);
+        assert_eq!(note.is_some(), said.is_some(), "{state:?}: {note:?}");
+        assert!(note.zip(said).is_none_or(|(note, said)| note.contains(said)), "{state:?}");
+        let loads = ["Load once", "Try again"].into_iter().find(|item| window.find(Role::MenuItem, item).is_some());
+        assert_eq!(loads, load, "{state:?}");
+        for item in load.into_iter().chain(["Always load from example.com", "Embed in the document"]) {
+            let found = window.find(Role::MenuItem, item).expect(item);
+            assert_eq!(!found.disabled, offered, "{state:?}: {item}");
+        }
+        match (load, offered) {
+            (Some(load), true) => {
+                window.click(Role::MenuItem, load);
+                assert_eq!(window.ui().take_requests(), [Request::LoadPicture(LINK.into())], "{state:?}: {load}");
+            }
+            (_, false) => {
+                window.click(Role::MenuItem, "Embed in the document");
+                assert_eq!(window.ui().take_requests(), [], "{state:?}: nothing is asked that would be refused");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn a_linked_picture_has_its_plain_cloud_again_once_the_shell_says_no_more_of_it() {
+    // How the shell ends what it said: with the picture, or with nothing.
+    for handed in [true, false] {
+        let (mut window, _, cloud) = linked(false);
+        window.ui().set_picture_state(LINK, Some(PictureState::Loading));
+        assert!(chip(&mut window, cloud), "handed: {handed}");
+        match handed {
+            true => window.ui().set_image(LINK, Image::from_rgba8(2, 1, vec![255; 8]).ok()),
+            false => window.ui().set_picture_state(LINK, None),
+        }
+        assert!(!chip(&mut window, cloud), "handed: {handed}");
+        // A picture that is taken away again is a link like any other.
+        window.ui().set_image(LINK, None);
+        assert!(!chip(&mut window, cloud), "handed: {handed}");
+    }
+}
+
+#[test]
+fn a_held_picture_offers_to_trust_its_document_and_is_asked_for_again_once_it_is_trusted() {
+    let (mut window, _, cloud) = linked(false);
+    window.ui().set_safe_mode(Some(SafeMode::default()));
+    window.ui().set_picture_state(LINK, Some(PictureState::Held));
+    // With the bar put away the page is where it was, and the menu is the nearest way to trust.
+    window.click(Role::Button, "Hide");
+    window.click_at(cloud).click(Role::MenuItem, "Trust this document");
+    assert_eq!(window.ui().take_requests(), [Request::TrustDocument]);
+    // With the caret and the pointer elsewhere, only what the shell says of the picture keeps its cloud
+    // on a chip.
+    let far = spot(&mut window, "p1", 2);
+    window.hover_at(Point { x: far.x, y: far.y + 2.0 });
+    assert!(chip(&mut window, cloud), "it is held until the shell says the document is trusted");
+
+    window.ui().set_safe_mode(None);
+    assert_eq!(window.ui().take_requests(), [Request::LinkedPicture(LINK.into())]);
+    assert!(!chip(&mut window, cloud), "nothing holds it back now");
+}
+
+#[test]
+fn a_source_the_person_trusts_already_is_not_offered_to_be_trusted_again() {
+    const ALWAYS: &str = "Always load from example.com";
+    // How the window comes to know: the shell says so, or the person chose it from the menu here.
+    for told in [true, false] {
+        let (mut window, _, cloud) = linked(true);
+        window.click_at(cloud);
+        assert!(window.find(Role::MenuItem, ALWAYS).is_some(), "told: {told}");
+        match told {
+            true => window.key("Escape").ui().set_picture_trusted(LINK, true),
+            false => _ = window.click(Role::MenuItem, ALWAYS),
+        }
+        window.click_at(cloud).assert_open(Role::Menu, "Linked picture");
+        assert!(window.find(Role::MenuItem, ALWAYS).is_none(), "told: {told}");
+        assert!(window.find(Role::MenuItem, "Embed in the document").is_some(), "told: {told}");
+    }
+}
+
+#[test]
+fn an_embedded_picture_is_the_documents_own_and_one_that_cannot_be_kept_stays_a_link() {
+    let held = |window: &Harness| {
+        let figure = window.editor().doc().block(&"g".into()).expect("the figure");
+        match &figure.kind {
+            BlockKind::Figure { asset, src, .. } => (asset.clone(), src.clone()),
+            kind => panic!("no figure: {kind:?}"),
+        }
+    };
+    let (mut window, _, _) = linked(true);
+    let edits = window.ui().edits();
+    // Bytes that are no picture, and a figure that is not there.
+    window.embed_picture("g", Picture { bytes: b"not a picture".to_vec(), ..png() });
+    window.embed_picture("gone", png());
+    assert_eq!(held(&window), (None, Some(LINK.into())));
+    assert_eq!(window.ui().edits(), edits, "nothing changed, so there is nothing to save");
+
+    window.embed_picture("g", png());
+    let (asset, src) = held(&window);
+    let asset = asset.expect("the figure holds its picture");
+    assert_eq!(src, None, "and links to it no longer");
+    assert!(window.ui().edits() > edits, "which the shell is to save");
+    assert_eq!(drawn(&mut window), std::slice::from_ref(&asset));
+    assert_eq!(
+        window.ui().take_requests(),
+        [Request::Asset(asset)],
+        "the picture is asked for as any of the document's"
+    );
+}
+
+/// The size a figure is kept at, in points.
+fn size(window: &Harness, id: &str) -> (f32, f32) {
+    match window.editor().doc().block(&id.into()).map(|block| &block.kind) {
+        Some(BlockKind::Figure { width, height, .. }) => (*width, *height),
+        kind => panic!("no figure: {kind:?}"),
+    }
+}
+
+/// The middle of a place on the page.
+fn middle(place: Rect) -> Point {
+    Point { x: place.x + place.width / 2.0, y: place.y + place.height / 2.0 }
+}
+
+/// A point just outside a corner of a picture, where its handle is.
+fn corner(place: Rect, right: bool, bottom: bool) -> Point {
+    let x = if right { place.x + place.width + 2.0 } else { place.x - 2.0 };
+    Point { x, y: if bottom { place.y + place.height + 2.0 } else { place.y - 2.0 } }
+}
+
+#[test]
+fn a_selected_picture_is_resized_by_a_corner_and_keeps_its_shape() {
+    // The corner taken hold of, as whether it is on the right and at the bottom, how far it is dragged, and
+    // the width in points the picture has then. It starts 300 points wide and half as tall.
+    let cases = [
+        ((true, true), (-100.0, -50.0), 225.0),
+        ((false, false), (-40.0, -20.0), 330.0),
+        ((true, false), (-200.0, 0.0), 150.0),
+        ((true, true), (0.0, 0.0), 300.0),
+        // No wider than the text.
+        ((true, true), (2000.0, 0.0), f32::INFINITY),
+    ];
+    for ((right, bottom), (across, down), width) in cases {
+        let mut window = illustrated();
+        let place = picture(&mut window).0;
+        let from = corner(place, right, bottom);
+        let to = Point { x: from.x + across, y: from.y + down };
+        let page = window.ui().style().page.clone();
+        let width = width.min(page.width - page.margin_left - page.margin_right);
+
+        window.press_at(from).release_at(to).advance(1000);
+        assert_eq!(size(&window, "g"), (300.0, 150.0), "a picture that is not selected has no corners");
+        window.click_at(middle(place)).advance(1000).press_at(from).release_at(to);
+        let (wide, high) = size(&window, "g");
+        assert!((wide - width).abs() < 1.5 && (high - wide / 2.0).abs() < 1.0, "{wide} by {high}, for {width}");
+        assert_eq!(window.editor().picture().map(|figure| figure.as_str()), Some("g"), "it stays selected");
+    }
+}
+
+#[test]
+fn a_picture_of_a_gallery_keeps_the_size_its_row_gives_it() {
+    let mut window = illustrated();
+    let place = picture(&mut window).0;
+    window.drop_pictures(Some(Point { x: place.x + place.width - 10.0, y: place.y + 20.0 }), vec![png()]);
+    assert_eq!(blocks(&window), ["The roof today:", "gallery of 2", "Reply by Friday."]);
+    let (place, before) = (picture(&mut window).0, size(&window, "g"));
+    let from = corner(place, true, true);
+    window
+        .click_at(middle(place))
+        .advance(1000)
+        .press_at(from)
+        .release_at(Point { x: from.x - 40.0, y: from.y - 40.0 });
+    assert_eq!(size(&window, "g"), before);
+}
+
+/// Two figures with the captions "a" and "b", and a paragraph before, between and after them.
+fn album() -> Harness {
+    let figure = |id: &str| {
+        let asset = Some(format!("assets/{id}.png"));
+        let kind =
+            BlockKind::Figure { asset, src: None, alt: String::new(), width: 300.0, height: 150.0, numbered: false };
+        text(id, kind, id)
+    };
+    let blocks = vec![
+        text("p1", BlockKind::Paragraph, "One."),
+        figure("a"),
+        text("p2", BlockKind::Paragraph, "Two."),
+        figure("b"),
+        text("p3", BlockKind::Paragraph, "Three."),
+    ];
+    Harness::open(Document { blocks, ..Document::default() })
+}
+
+/// Where a frame draws each picture, in order.
+fn pictures(window: &mut Harness) -> Vec<Rect> {
+    let drawn = |item: &Item| match item {
+        Item::Image { rect, .. } => Some(*rect),
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(drawn).collect()
+}
+
+#[test]
+fn a_picture_is_carried_to_where_the_bar_shows_and_put_down_there() {
+    // Where the first picture is carried to, and the document once it is let go.
+    let cases = [
+        ("low on the last line", vec!["One.", "Two.", "b", "Three.", "a"]),
+        ("the right of the other picture", vec!["One.", "Two.", "gallery of 2", "Three."]),
+        ("a step from where it was", vec!["One.", "a", "Two.", "b", "Three."]),
+    ];
+    for (to, after) in cases {
+        let mut window = album();
+        let (places, line) = (pictures(&mut window), spot(&mut window, "p3", 3));
+        let from = middle(places[0]);
+        let carried = to != "a step from where it was";
+        let to = match to {
+            "low on the last line" => Point { x: line.x, y: line.y + line.height - 2.0 },
+            "the right of the other picture" => Point { x: places[1].x + places[1].width - 10.0, ..middle(places[1]) },
+            _ => Point { x: from.x + 2.0, y: from.y + 2.0 },
+        };
+        window.press_at(from).hover_at(to);
+        assert_eq!(bars(&mut window).len(), usize::from(carried), "a bar says where it would land");
+        assert_eq!(pictures(&mut window).len(), 2 + usize::from(carried), "and it shows small under the pointer");
+
+        window.release_at(to);
+        assert_eq!(blocks(&window), after);
+        assert_eq!((bars(&mut window).len(), pictures(&mut window).len()), (0, 2), "nothing is carried any more");
+    }
+}
+
+#[test]
+fn escape_lets_go_of_a_picture_that_is_carried_or_held_by_a_corner() {
+    let mut window = album();
+    let (places, line) = (pictures(&mut window), spot(&mut window, "p3", 3));
+    let low = Point { x: line.x, y: line.y + line.height - 2.0 };
+    window.press_at(middle(places[0])).hover_at(low).key("Escape");
+    assert_eq!((bars(&mut window).len(), pictures(&mut window).len()), (0, 2));
+    window.release_at(low).advance(1000);
+    assert_eq!(blocks(&window), ["One.", "a", "Two.", "b", "Three."], "it stays where it was");
+
+    let from = corner(places[0], true, true);
+    let to = Point { x: from.x - 100.0, y: from.y - 50.0 };
+    window.click_at(middle(places[0])).advance(1000).press_at(from).hover_at(to).key("Escape").release_at(to);
+    assert_eq!(size(&window, "a"), (300.0, 150.0), "and the size it had");
+}
+
+/// The alt text a figure keeps.
+fn alt(window: &Harness, id: &str) -> String {
+    match window.editor().doc().block(&id.into()).map(|block| &block.kind) {
+        Some(BlockKind::Figure { alt, .. }) => alt.clone(),
+        kind => panic!("no figure: {kind:?}"),
+    }
+}
+
+/// A point on the first line under `pictures`, `along` of the way across the text column, which stands in
+/// the middle of the page area wherever the pictures stand in it. The switch to the alt text stands at the
+/// end of that line.
+fn under(window: &mut Harness, pictures: &[Rect], along: f32) -> Point {
+    let page = window.ui().style().page.clone();
+    let wide = (page.width - page.margin_left - page.margin_right) * 96.0 / 72.0;
+    let area = window.controls().into_iter().find(|found| found.role == Role::Document).expect("a page").bounds;
+    let left = (area.x + (area.width - wide) / 2.0).round();
+    let bottom = pictures.iter().map(|place| place.y + place.height).fold(0.0, f32::max);
+    Point { x: left + (wide - 24.0) * along + 12.0, y: bottom + 17.0 }
+}
+
+/// A figure with the caption `caption`, between two paragraphs.
+fn captioned(caption: &str) -> Harness {
+    let asset = Some("assets/roof.png".into());
+    let kind = BlockKind::Figure { asset, src: None, alt: String::new(), width: 300.0, height: 150.0, numbered: false };
+    let blocks = vec![
+        text("p1", BlockKind::Paragraph, "The roof today:"),
+        text("g", kind, caption),
+        text("p2", BlockKind::Paragraph, "Reply by Friday."),
+    ];
+    Harness::open(Document { blocks, ..Document::default() })
+}
+
+#[test]
+fn a_selected_picture_without_a_caption_has_a_line_under_it_to_write_one_on() {
+    for gallery in [false, true] {
+        let mut window = captioned("");
+        if gallery {
+            let place = picture(&mut window).0;
+            window.drop_pictures(Some(Point { x: place.x + place.width - 10.0, y: place.y + 20.0 }), vec![png()]);
+        }
+        let below = spot(&mut window, "p2", 0).y;
+        let places = pictures(&mut window);
+        let line = under(&mut window, &places, 0.3);
+        window.click_at(line);
+        assert_eq!(head(&window).block.as_str(), "p2", "nothing is kept for a caption nobody is writing");
+
+        window.advance(1000).click_at(middle(places[0])).advance(1000).click_at(line);
+        let caption = head(&window);
+        assert_ne!(caption.block.as_str(), "p2", "gallery: {gallery}");
+        assert_eq!(window.editor().picture(), None, "the caret is in the caption");
+        // Left empty, the line goes again with the selection.
+        assert_eq!(spot(&mut window, "p2", 0).y, below, "gallery: {gallery}");
+
+        window.advance(1000).click_at(middle(places[0])).advance(1000).click_at(line).type_text("Two views");
+        let caption = head(&window).block;
+        assert_eq!(block_text(&window, caption.as_str()), "Two views", "gallery: {gallery}");
+    }
+}
+
+#[test]
+fn the_switch_under_a_picture_is_there_for_the_picture_the_selection_is_at() {
+    // Where the selection is, and whether the switch is there to press.
+    let cases = [("in a paragraph", false), ("on the picture", true), ("in its caption", true)];
+    for (selection, shows) in cases {
+        let mut window = illustrated();
+        let place = picture(&mut window).0;
+        let switch = under(&mut window, &[place], 1.0);
+        match selection {
+            "in a paragraph" => window.ui().select(Selection::caret(Pos::new("p1", 2))),
+            "on the picture" => drop(window.click_at(middle(place)).advance(1000)),
+            _ => window.ui().select(Selection::caret(Pos::new("g", 3))),
+        }
+        window.paint();
+        window.hover_at(switch);
+        assert_eq!(window.ui().cursor() == Cursor::Pointer, shows, "{selection}");
+        window.click_at(switch);
+        assert_eq!(window.find(Role::Dialog, "Alt text").is_some(), shows, "{selection}");
+    }
+}
+
+#[test]
+fn the_line_under_a_picture_turns_to_its_alt_text_and_back() {
+    // What is typed, how the line is given back to the caption, the alt text then and whether that is an
+    // edit to save.
+    let cases = [
+        (Some("Snow on the gable"), "Enter", "Snow on the gable", true),
+        (Some("  Snow on the gable "), "the switch", "Snow on the gable", true),
+        (Some("Snow"), "a press elsewhere", "Snow", true),
+        (Some("Snow"), "Escape", "A slate roof", false),
+        (None, "Enter", "A slate roof", false),
+        (None, "a press elsewhere", "A slate roof", false),
+    ];
+    for (typed, back, after, edited) in cases {
+        let mut window = illustrated();
+        let (place, elsewhere) = (picture(&mut window).0, spot(&mut window, "p1", 2));
+        let switch = under(&mut window, &[place], 1.0);
+        window.click_at(middle(place)).advance(1000).click_at(switch);
+        let field = window.find(Role::TextInput, "Alt text").expect("the field of the alt text");
+        assert_eq!(
+            (field.value.as_deref(), field.focused),
+            (Some("A slate roof"), true),
+            "it shows what the picture has"
+        );
+        let edits = window.ui().edits();
+        // What is typed takes the place of what was there.
+        if let Some(typed) = typed {
+            window.type_text(typed);
+        }
+        match back {
+            "the switch" => window.click(Role::Button, "Alt"),
+            "a press elsewhere" => window.click_at(Point { x: elsewhere.x, y: elsewhere.y + 2.0 }),
+            key => window.key(key),
+        };
+        window.assert_closed(Role::Dialog, "Alt text");
+        assert_eq!(alt(&window, "g"), after, "{typed:?}, {back}");
+        assert_eq!(window.ui().edits() > edits, edited, "{typed:?}, {back}");
+        assert_eq!(block_text(&window, "g"), "Seen from the garden", "the caption is as it was");
+    }
+}
+
+#[test]
+fn alt_text_in_a_gallery_belongs_to_the_selected_picture() {
+    let mut window = illustrated();
+    let place = picture(&mut window).0;
+    window.drop_pictures(Some(Point { x: place.x + place.width - 10.0, y: place.y + 20.0 }), vec![png()]);
+    let places = pictures(&mut window);
+    window.click_at(middle(places[1])).advance(1000);
+    let picked = window.editor().picture().expect("a picture is selected").clone();
+    assert_ne!(picked.as_str(), "g");
+
+    let switch = under(&mut window, &places, 1.0);
+    window.click_at(switch).assert_open(Role::Dialog, "Alt text");
+    window.type_text("The chimney from the scaffold").key("Enter");
+    assert_eq!(alt(&window, picked.as_str()), "The chimney from the scaffold");
+    assert_eq!(alt(&window, "g"), "A slate roof", "the other picture keeps its own");
+}
+
+#[test]
+fn a_double_click_in_a_caption_selects_the_word_first_pressed() {
+    let long = "Seen from the garden on the first dry morning after the storm, with the scaffold still up along \
+                the north gable and the new slates stacked by the door";
+    let mut window = captioned(long);
+    let place = picture(&mut window).0;
+    // In the second line of the caption.
+    let at = Point { y: place.y + place.height + 35.0, ..under(&mut window, &[place], 0.4) };
+    window.click_at(at);
+    let first = head(&window);
+    assert_eq!(first.block.as_str(), "g", "the press is in the caption");
+    // The caption makes room for its switch once the caret is in it, so the word is under the pointer no more.
+    let now = caret(&mut window);
+    assert!((now.x - at.x).abs() > 8.0 || (now.y - at.y).abs() > 16.0, "{now:?} for {at:?}");
+
+    window.click_at(at);
+    let selection = window.editor().selection().expect("a selection");
+    let (start, end) =
+        (selection.anchor.offset.min(selection.head.offset), selection.anchor.offset.max(selection.head.offset));
+    assert!(start < end && (start..=end).contains(&first.offset), "the word at {}: {start} to {end}", first.offset);
+}
+
+#[test]
+fn a_caption_line_that_closes_above_the_view_leaves_the_text_where_it_is_read() {
+    // Where the caret is after a press on the text, far below a picture that was selected.
+    let read = |caption: &str| {
+        let asset = Some("assets/roof.png".into());
+        let kind =
+            BlockKind::Figure { asset, src: None, alt: String::new(), width: 300.0, height: 150.0, numbered: false };
+        let lines = (0..60).map(|line| text(&format!("p{line}"), BlockKind::Paragraph, "Reply by Friday."));
+        let blocks = [text("g", kind, caption)].into_iter().chain(lines).collect();
+        let mut window = Harness::open(Document { blocks, ..Document::default() });
+        let place = picture(&mut window).0;
+        window.click_at(middle(place)).advance(1000);
+        window.paint();
+        window.scroll_at(middle(place), 600.0).click_at(Point { x: place.x + 40.0, y: place.y + 200.0 });
+        (head(&window), caret(&mut window))
+    };
+    // A picture with a caption has its line whatever is selected, so nothing moves there.
+    assert_eq!(read(""), read("Seen from the garden"));
 }

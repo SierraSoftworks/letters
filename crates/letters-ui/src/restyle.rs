@@ -2,28 +2,7 @@
 //!
 //! The bar edits an element type, never a selection, so two headings of one level cannot drift apart.
 
-use letters_model::{Align, Block, BlockId, BlockKind, Document, Style, TextStyle};
-
-/// Where the bar's style changes go.
-///
-/// The document model does not take a style change as an operation yet. Until it does, the window applies
-/// them to its own copy of the style: they show at once, but undo does not take them back.
-pub trait Styles {
-    fn style(&self) -> &Style;
-
-    /// Restyles every block of one element type.
-    fn restyle(&mut self, element: &str, style: TextStyle);
-}
-
-impl Styles for Style {
-    fn style(&self) -> &Style {
-        self
-    }
-
-    fn restyle(&mut self, element: &str, style: TextStyle) {
-        self.types.insert(element.to_owned(), style);
-    }
-}
+use letters_model::{Align, Block, BlockId, BlockKind, Document, TextStyle};
 
 /// One change to an element type's style.
 #[derive(Clone, Debug, PartialEq)]
@@ -132,7 +111,7 @@ pub(crate) fn element(doc: &Document, block: &BlockId) -> Option<&'static str> {
                 BlockKind::Heading { level: 3 } => "heading3",
                 BlockKind::Heading { .. } => "heading4",
                 BlockKind::Code { .. } => "code",
-                BlockKind::Unknown { .. } => "caption",
+                BlockKind::Unknown { .. } | BlockKind::Caption | BlockKind::Figure { .. } => "caption",
                 _ if quoted => "quote",
                 _ => "body",
             })
@@ -154,7 +133,7 @@ pub(crate) fn name(element: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use letters_model::{Body, ListKind, Tone};
+    use letters_model::{Body, ListKind, Style, Tone};
 
     use super::*;
 
@@ -204,18 +183,13 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_changes_one_field_of_one_type() {
-        let mut style = Style::default();
-        let before = style.clone();
-        let mut heading = style.types["heading1"].clone();
-        StyleEdit::Size(30.0).apply(&mut heading);
-        StyleEdit::Align(Align::Center).apply(&mut heading);
-        style.restyle("heading1", heading);
-
-        let after = &style.types["heading1"];
+    fn an_edit_changes_one_field_of_a_style() {
+        let before = Style::default().types["heading1"].clone();
+        let mut after = before.clone();
+        StyleEdit::Size(30.0).apply(&mut after);
+        StyleEdit::Align(Align::Center).apply(&mut after);
         assert_eq!((after.size, after.align), (30.0, Align::Center));
-        assert_eq!(after.family, before.types["heading1"].family);
-        assert_eq!(style.types["body"], before.types["body"]);
+        assert_eq!(TextStyle { size: before.size, align: before.align, ..after }, before, "the rest is as it was");
     }
 
     #[test]

@@ -14,6 +14,9 @@ use winit::window::Window;
 /// Formats whose colours blend as they do on the CPU, most common first.
 const FORMATS: [wgpu::TextureFormat; 2] = [wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm];
 
+/// How a surface takes frames that are clear in places, as the renderer makes them.
+const CLEAR: wgpu::CompositeAlphaMode = wgpu::CompositeAlphaMode::PreMultiplied;
+
 pub struct Gpu {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
@@ -38,14 +41,18 @@ impl Gpu {
         Some(Self { instance, adapter, device, queue, ready })
     }
 
-    /// A surface for presenting to `window`, or `None` if the window cannot take one.
-    pub fn surface(&mut self, window: Arc<Window>) -> Option<GpuSurface> {
+    /// A surface for presenting to `window`, or `None` if the window cannot take one. With `clear`, what
+    /// a frame leaves clear shows what is behind the window, where the surface can do that.
+    pub fn surface(&mut self, window: Arc<Window>, clear: bool) -> Option<GpuSurface> {
         let size = window.inner_size();
         let surface = self.instance.create_surface(window).ok()?;
-        let formats = surface.get_capabilities(&self.adapter).formats;
-        let format = FORMATS.into_iter().find(|format| formats.contains(format))?;
+        let capabilities = surface.get_capabilities(&self.adapter);
+        let format = FORMATS.into_iter().find(|format| capabilities.formats.contains(format))?;
         let mut config = surface.get_default_config(&self.adapter, size.width.max(1), size.height.max(1))?;
         config.format = format;
+        if clear && capabilities.alpha_modes.contains(&CLEAR) {
+            config.alpha_mode = CLEAR;
+        }
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&self.device, &config);
         let renderer = match self.ready.take() {
@@ -65,6 +72,11 @@ pub struct GpuSurface {
 }
 
 impl GpuSurface {
+    /// Whether what a frame leaves clear shows what is behind the window.
+    pub fn clear(&self) -> bool {
+        self.config.alpha_mode == CLEAR
+    }
+
     /// Paints one frame of `width` by `height` physical pixels and presents it.
     ///
     /// An error means the surface is of no more use, and the caller should paint on the CPU.

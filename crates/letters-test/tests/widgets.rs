@@ -199,6 +199,15 @@ fn arrow_keys_walk_a_menu_past_disabled_items_and_wrap() {
 }
 
 #[test]
+fn the_first_key_in_a_menu_opened_by_the_pointer_goes_where_it_says() {
+    for (key, lands) in [("Down", "New"), ("Home", "New"), ("Up", "Delete"), ("End", "Delete")] {
+        let mut desk = desk();
+        desk.click(Role::Button, "File").key(key);
+        assert_eq!(focus_name(&mut desk), lands, "{key}");
+    }
+}
+
+#[test]
 fn a_menu_closes_without_choosing() {
     for way in ["Escape", "outside", "button"] {
         let mut desk = desk();
@@ -452,13 +461,15 @@ fn the_window_repaints_only_when_something_changed() {
 #[test]
 fn the_caret_blinks_while_a_field_has_focus() {
     let mut desk = named("Ana");
+    desk.paint();
     assert_eq!(desk.ui().animate(0), None, "nothing blinks without a caret");
-    desk.click(Role::TextInput, "Name");
+    desk.click(Role::TextInput, "Name").paint();
     let next = desk.ui().animate(1000).expect("a field's caret blinks");
     assert!(next > 1000);
     desk.paint();
     desk.ui().animate(next);
     assert!(desk.ui().needs_paint(), "the caret went out");
     desk.ui().focus(false);
+    desk.paint();
     assert_eq!(desk.ui().animate(next + 1), None, "a window without the keyboard shows no caret");
 }

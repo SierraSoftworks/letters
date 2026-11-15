@@ -1,5 +1,8 @@
 //! The KaTeX faces, compiled in so a formula looks the same everywhere. All are under the SIL Open Font
 //! Licence (see `fonts/OFL-KaTeX.txt`).
+//!
+//! A build with the `provided` feature leaves them out for the shell to hand over, as the browser shell
+//! does: a page with no maths shows its first frame without them.
 
 use std::sync::OnceLock;
 
@@ -10,12 +13,16 @@ use skrifa::{FontRef, GlyphId, MetadataProvider};
 
 macro_rules! faces {
     ($($name:literal),* $(,)?) => {
-        [$(($name, include_bytes!(concat!("../fonts/KaTeX_", $name, ".ttf")).as_slice())),*]
+        /// Each face's name, as the engine asks for it. The main face is first.
+        const NAMES: [&str; 19] = [$($name),*];
+        /// The font files in `fonts/`, in the order [`provide`] takes them.
+        pub const FILES: [&str; 19] = [$(concat!("KaTeX_", $name, ".ttf")),*];
+        #[cfg(not(feature = "provided"))]
+        const BYTES: [&[u8]; 19] = [$(include_bytes!(concat!("../fonts/KaTeX_", $name, ".ttf"))),*];
     };
 }
 
-/// Each face under the name the engine asks for it by, which is also its file's. The main face is first.
-const FILES: [(&str, &[u8]); 19] = faces![
+faces![
     "Main-Regular",
     "Main-Bold",
     "Main-Italic",
@@ -43,15 +50,36 @@ struct Face {
     chars: Charmap<'static>,
 }
 
+static FACES: OnceLock<Vec<Face>> = OnceLock::new();
+
+/// Reads the faces from the contents of [`FILES`].
+fn load(files: &[&'static [u8]]) -> Vec<Face> {
+    let face = |(name, bytes): (&'static str, &&'static [u8])| {
+        let chars = FontRef::new(bytes).ok()?.charmap();
+        Some(Face { name, font: Font::new((*bytes).into(), 0), chars })
+    };
+    NAMES.into_iter().zip(files).filter_map(face).collect()
+}
+
+#[cfg(not(feature = "provided"))]
 fn faces() -> &'static [Face] {
-    static FACES: OnceLock<Vec<Face>> = OnceLock::new();
-    FACES.get_or_init(|| {
-        let face = |&(name, bytes): &(&'static str, &'static [u8])| {
-            let chars = FontRef::new(bytes).ok()?.charmap();
-            Some(Face { name, font: Font::new(bytes.into(), 0), chars })
-        };
-        FILES.iter().filter_map(face).collect()
-    })
+    FACES.get_or_init(|| load(&BYTES))
+}
+
+/// The faces the shell handed over. Until it has, the body face draws what it can.
+#[cfg(feature = "provided")]
+fn faces() -> &'static [Face] {
+    FACES.get().map_or(&[], Vec::as_slice)
+}
+
+/// Hands over the contents of [`FILES`], in that order, for a build with the `provided` feature. They are
+/// taken once and kept for as long as the program runs. A formula set before then is drawn without them,
+/// so hand them over before the first is set. A build that carries its faces has no use for them.
+pub fn provide(files: Vec<Vec<u8>>) {
+    if cfg!(feature = "provided") {
+        let files: Vec<&'static [u8]> = files.into_iter().map(|file| &*file.leak()).collect();
+        let _ = FACES.set(load(&files));
+    }
 }
 
 /// The face and glyph that draw `character`: the named face, else the main one, else the body face. `None`

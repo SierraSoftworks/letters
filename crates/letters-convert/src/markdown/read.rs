@@ -1,45 +1,85 @@
 //! Markdown to document.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::mem;
 use std::ops::Range;
 
-use letters_model::{Block, BlockKind, Body, Document, ListKind, Mark, Run, Tone};
+use letters_model::{Align, Block, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
-use super::{TAGS, TONES, write};
-use crate::ImportNote;
+use super::{TAGS, TONES};
+use crate::html::Assets;
+use crate::{ImportNote, figures};
 
 /// Quotes and lists nested deeper than this are kept as source, which bounds the reader's recursion.
 const MAX_DEPTH: usize = 32;
 
-const MATHS: &str = "Maths kept as TeX source";
+const MOVED: &str = "Moved out of a list item";
 const FOOTNOTE: &str = "Footnote kept as text";
+const LINKED: &str = "Image kept as a link";
 
-/// Reads CommonMark and GFM. `new_id` supplies an id for each block.
+/// What [`import_markdown`] read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkdownImport {
+    pub document: Document,
+    /// What the import simplified, each on the block it happened to.
+    pub notes: Vec<ImportNote>,
+    /// The pictures the document shows, by the entry name its blocks use.
+    pub assets: BTreeMap<String, Vec<u8>>,
+}
+
+/// Reads CommonMark and GFM as text alone, as a paste holds it. `new_id` supplies an id for each block.
 ///
 /// Nothing is dropped: what the document cannot hold is kept as text or as a code block and named in a note.
+/// A picture at an `https` address becomes a figure that is still remote. One named by a path has no file to
+/// come from, and is kept as a link.
 pub fn from_markdown(markdown: &str, new_id: &mut dyn FnMut() -> String) -> (Document, Vec<ImportNote>) {
+    let import = import_markdown(markdown, new_id, &mut |_| None);
+    (import.document, import.notes)
+}
+
+/// Reads a Markdown file. `files` reads a file by the path the Markdown names it by, which is relative to the
+/// Markdown file's folder, and so brings in its pictures.
+///
+/// - A paragraph that holds only a picture is a figure, and one that holds several is a gallery. Its caption
+///   is the emphasised line or paragraph under it, or else a lone picture's title.
+/// - A caption that opens with "Figure 2:" makes its figure numbered, and "Figure 2" in the text becomes a
+///   reference to it.
+/// - A picture that `files` lacks or that Letters cannot show is kept as a link, as is one amid text.
+pub fn import_markdown(markdown: &str, new_id: &mut dyn FnMut() -> String, files: Assets) -> MarkdownImport {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_MATH
         | Options::ENABLE_WIKILINKS;
-    let (front, source) = front_matter(markdown);
+    let (properties, source) = front_matter(markdown);
     let events = Parser::new_ext(source, options).into_offset_iter().collect();
-    let mut reader = Reader { source, events, at: 0, depth: 0, new_id, notes: Vec::new(), task: None };
-    let mut blocks = Vec::new();
-    if let Some((language, text)) = front {
-        reader.placeholder(language, &unix_lines(text), "Front matter kept as a code block", &mut blocks);
-    }
-    blocks.extend(reader.blocks());
-    (Document { blocks, ..Document::default() }, reader.notes)
+    let mut reader = Reader {
+        source,
+        events,
+        at: 0,
+        depth: 0,
+        new_id,
+        notes: Vec::new(),
+        task: None,
+        files,
+        assets: BTreeMap::new(),
+    };
+    let blocks = reader.blocks();
+    let mut document = Document { properties, blocks, ..Document::default() };
+    figures::relabel(&mut document);
+    MarkdownImport { document, notes: reader.notes, assets: reader.assets }
 }
 
-/// Splits front matter off the start of a file: the lines between a first line of `---` or `+++` and the next
-/// such line. Returns its language and text, then the rest of the file.
-fn front_matter(markdown: &str) -> (Option<(&str, &str)>, &str) {
-    for (fence, language) in [("---", "yaml"), ("+++", "toml")] {
+/// The fence that opens and closes front matter in each format.
+pub(super) const FENCES: [(&str, PropertiesFormat); 2] =
+    [("---", PropertiesFormat::Yaml), ("+++", PropertiesFormat::Toml)];
+
+/// Splits front matter off the start of a file: the lines between a first line that is a fence and the next
+/// such line. Returns it as the document's properties, then the rest of the file.
+pub(super) fn front_matter(markdown: &str) -> (Option<Properties>, &str) {
+    for (fence, format) in FENCES {
         let Some(rest) = markdown.strip_prefix(fence) else { continue };
         let Some(body) = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix('\n')) else { continue };
         // A blank line straight after the fence makes it a divider.
@@ -49,7 +89,8 @@ fn front_matter(markdown: &str) -> (Option<(&str, &str)>, &str) {
         let mut end = 0;
         for line in body.split_inclusive('\n') {
             if line.trim_end() == fence {
-                return (Some((language, body[..end].trim())), &body[end + line.len()..]);
+                let properties = Properties { format, source: unix_lines(&body[..end]), extra: Default::default() };
+                return (Some(properties), &body[end + line.len()..]);
             }
             end += line.len();
         }
@@ -68,6 +109,9 @@ struct Reader<'a, 'f> {
     notes: Vec<ImportNote>,
     /// The checkbox of the list item being read, once its marker has been seen.
     task: Option<bool>,
+    files: Assets<'f>,
+    /// The pictures read through `files`, by the names their figures use.
+    assets: BTreeMap<String, Vec<u8>>,
 }
 
 impl<'a> Reader<'a, '_> {
@@ -89,6 +133,14 @@ impl<'a> Reader<'a, '_> {
         let mut block = self.block(BlockKind::Code { language: language.map(str::to_owned) });
         if !text.is_empty() {
             block.body = Body::Text(vec![Run::plain(text)]);
+        }
+        block
+    }
+
+    fn formula(&mut self, tex: &str) -> Block {
+        let mut block = self.block(BlockKind::Formula);
+        if !tex.is_empty() {
+            block.body = Body::Text(vec![Run::plain(tex)]);
         }
         block
     }
@@ -126,19 +178,16 @@ impl<'a> Reader<'a, '_> {
     /// Reads the block that `tag` opens. A list read here starts at `list_depth`.
     fn read(&mut self, tag: Tag<'a>, range: Range<usize>, list_depth: u8, out: &mut Vec<Block>) {
         match tag {
+            Tag::Paragraph if self.pictures(out) => {}
             Tag::Paragraph => {
-                if let (Some(Event::DisplayMath(tex)), Some(Event::End(_))) = (self.peek(0), self.peek(1)) {
-                    let tex = unix_lines(tex.trim());
-                    self.at += 2;
-                    return self.placeholder("math", &tex, MATHS, out);
-                }
                 let mut block = self.block(BlockKind::Paragraph);
-                let runs = self.inline(&block);
+                let (runs, formulas) = self.flow(&block);
                 self.at += 1;
                 if !runs.is_empty() {
                     block.body = Body::Text(runs);
                     out.push(block);
                 }
+                out.extend(formulas);
             }
             Tag::Heading { level, .. } => {
                 let level = level as u8;
@@ -146,7 +195,7 @@ impl<'a> Reader<'a, '_> {
                 if level > 4 {
                     self.note(&block, format!("Heading level {level} became level 4"));
                 }
-                block.body = Body::Text(self.inline(&block));
+                block.body = Body::Text(self.line(&block));
                 self.at += 1;
                 out.push(block);
             }
@@ -184,8 +233,12 @@ impl<'a> Reader<'a, '_> {
                 };
                 let (language, options) = info.trim().split_once(char::is_whitespace).unwrap_or((info.trim(), ""));
                 let text = self.raw();
-                let block =
-                    self.code(Some(language).filter(|name| !name.is_empty()), text.strip_suffix('\n').unwrap_or(&text));
+                let text = text.strip_suffix('\n').unwrap_or(&text);
+                // GitHub shows a code block in this language as maths.
+                if language == "math" && options.is_empty() {
+                    return out.push(self.formula(text));
+                }
+                let block = self.code(Some(language).filter(|name| !name.is_empty()), text);
                 if !options.is_empty() {
                     self.note(&block, format!("Code block options dropped: {}", options.trim()));
                 }
@@ -195,12 +248,7 @@ impl<'a> Reader<'a, '_> {
                 let html = self.raw();
                 self.placeholder("html", html.trim_end_matches('\n'), "HTML kept as a code block", out);
             }
-            Tag::Table(alignments) => {
-                let mut block = self.block(BlockKind::Code { language: Some("markdown".into()) });
-                block.body = Body::Text(vec![Run::plain(self.table(&block, &alignments))]);
-                self.note(&block, "Table kept as Markdown in a code block");
-                out.push(block);
-            }
+            Tag::Table(alignments) => out.push(self.table(&alignments)),
             Tag::FootnoteDefinition(label) => {
                 self.depth += 1;
                 let mut inner = self.blocks();
@@ -273,6 +321,146 @@ impl<'a> Reader<'a, '_> {
         Some(*tone)
     }
 
+    /// Reads a paragraph that holds only pictures: one is a figure, several are a gallery. An emphasised line
+    /// under them, or the paragraph after them where it is all emphasised, is their caption. Returns false,
+    /// with nothing read, for any other paragraph and where no picture can be shown.
+    fn pictures(&mut self, out: &mut Vec<Block>) -> bool {
+        let (start, noted) = (self.at, self.notes.len());
+        let mut shown = Vec::new();
+        loop {
+            match self.peek(0).cloned() {
+                Some(Event::Start(Tag::Image { dest_url, title, .. })) => {
+                    self.at += 1;
+                    shown.push((dest_url.to_string(), title.to_string(), self.alt()));
+                }
+                Some(Event::SoftBreak | Event::HardBreak) => self.at += 1,
+                Some(Event::Text(text)) if text.trim().is_empty() => self.at += 1,
+                _ => break,
+            }
+        }
+        // Notes on a caption wait under no name for the block that takes it.
+        let holder = Block::new("", BlockKind::Caption);
+        let mut caption = self.caption(&holder);
+        let ends = matches!(self.peek(0), Some(Event::End(TagEnd::Paragraph)));
+        if shown.is_empty() || !ends || caption.as_ref().is_some_and(Option::is_none) {
+            (self.at, _) = (start, self.notes.truncate(noted));
+            return false;
+        }
+        self.at += 1;
+        if caption.is_none() && matches!(self.peek(0), Some(Event::Start(Tag::Paragraph))) {
+            let (from, noted) = (self.at, self.notes.len());
+            self.at += 1;
+            caption = self.caption(&holder).filter(|_| matches!(self.peek(0), Some(Event::End(TagEnd::Paragraph))));
+            match caption {
+                Some(Some(_)) => self.at += 1,
+                _ => (self.at, caption, _) = (from, None, self.notes.truncate(noted)),
+            }
+        }
+        let mut caption = caption.flatten().unwrap_or_default();
+
+        let (mut figures, mut links, mut titles) = (Vec::new(), Vec::new(), Vec::new());
+        for (address, title, alt) in shown {
+            match self.figure(&address, &alt) {
+                Some(figure) => figures.push(figure),
+                None => links.push(Run {
+                    link: Some(address.clone()),
+                    ..Run::plain(if alt.is_empty() { address } else { alt })
+                }),
+            }
+            titles.extend(Some(title).filter(|title| !title.is_empty()));
+        }
+        if figures.is_empty() {
+            (self.at, _) = (start, self.notes.truncate(noted));
+            return false;
+        }
+        // A lone picture's title is its caption where it has no other.
+        if let ([figure], [title], true) = (figures.as_mut_slice(), titles.as_slice(), caption.is_empty()) {
+            figure.body = Body::Text(vec![Run::plain(title)]);
+            titles.clear();
+        }
+        let mut block = match figures.len() {
+            1 => figures.remove(0),
+            _ => self.block(BlockKind::Gallery { numbered: false }),
+        };
+        match &mut block.body {
+            Body::Blocks(children) => {
+                children.extend(figures);
+                if !caption.is_empty() {
+                    let mut line = self.block(BlockKind::Caption);
+                    line.body = Body::Text(mem::take(&mut caption));
+                    children.push(line);
+                }
+            }
+            body if !caption.is_empty() => *body = Body::Text(mem::take(&mut caption)),
+            _ => {}
+        }
+        for note in &mut self.notes[noted..] {
+            note.block = block.id.to_string();
+        }
+        for title in titles {
+            self.note(&block, format!("Image title dropped: {title}"));
+        }
+        out.push(block);
+        if !links.is_empty() {
+            let mut kept = self.block(BlockKind::Paragraph);
+            kept.body = Body::Text(links.into_iter().flat_map(|link| [Run::plain(" "), link]).skip(1).collect());
+            self.note(&kept, LINKED);
+            out.push(kept);
+        }
+        true
+    }
+
+    /// The description of the picture that has just opened, as plain text, read up to its end.
+    fn alt(&mut self) -> String {
+        let (mut alt, mut open) = (String::new(), 1);
+        while open > 0
+            && let Some((event, _)) = self.next()
+        {
+            match event {
+                Event::Start(_) => open += 1,
+                Event::End(_) => open -= 1,
+                Event::Text(text) | Event::Code(text) | Event::InlineMath(text) | Event::DisplayMath(text) => {
+                    alt.push_str(&text);
+                }
+                Event::SoftBreak | Event::HardBreak => alt.push(' '),
+                _ => {}
+            }
+        }
+        alt
+    }
+
+    /// Reads the text up to the next block boundary as a caption. `None` where there is no text, and
+    /// `Some(None)` where there is text that is not a caption: one is emphasised from end to end, and not by
+    /// the tag for text that is only set in italics, which is how a paragraph that is no caption is told apart.
+    fn caption(&mut self, block: &Block) -> Option<Option<Vec<Run>>> {
+        let mut text = Text::default();
+        self.inline(block, &mut text, false);
+        let mut runs = text.runs;
+        if runs.is_empty() {
+            return None;
+        }
+        let mut shown = runs.iter().filter(|run| !run.text.trim().is_empty()).peekable();
+        if text.set_italic || shown.peek().is_none() || !shown.all(|run| run.marks.contains(&Mark::Italic)) {
+            return Some(None);
+        }
+        runs.iter_mut().for_each(|run| _ = run.marks.remove(&Mark::Italic));
+        Some(Some(merge(runs)))
+    }
+
+    /// Makes the figure for a picture at `address`: one that is still remote, or one whose file `files` has.
+    fn figure(&mut self, address: &str, alt: &str) -> Option<Block> {
+        let (asset, src, (width, height)) = if address.starts_with("https://") {
+            (None, Some(address.to_owned()), figures::UNSIZED)
+        } else if address.contains(':') || address.starts_with(['/', '#']) {
+            return None;
+        } else {
+            let path = address.split(['?', '#']).next().unwrap_or_default();
+            let (name, width, height) = figures::asset((self.files)(&unescaped(path))?, &mut self.assets)?;
+            (Some(name), None, (width, height))
+        };
+        Some(self.block(BlockKind::Figure { asset, src, alt: alt.to_owned(), width, height, numbered: false }))
+    }
+
     /// Reads a list as flat items. `depth` is how far the list is nested in other lists.
     fn list(&mut self, start: Option<u64>, depth: u8, out: &mut Vec<Block>) {
         let mut renumbered = start.filter(|first| *first != 1);
@@ -283,15 +471,15 @@ impl<'a> Reader<'a, '_> {
             }
 
             self.task = None;
-            let mut runs = self.inline(&block);
+            let (mut runs, mut after) = self.flow(&block);
             let mut task = self.task.take();
-            let mut after = Vec::new();
+            after.iter().for_each(|moved| self.note(moved, MOVED));
             while let Some((event, range)) = self.next() {
                 match event {
                     Event::End(_) => break,
                     // The paragraphs an item opens with are its text. Anything else follows the item.
                     Event::Start(Tag::Paragraph) if after.is_empty() => {
-                        let more = self.inline(&block);
+                        let (more, formulas) = self.flow(&block);
                         self.at += 1;
                         task = task.or(self.task.take());
                         if !runs.is_empty() && !more.is_empty() {
@@ -299,18 +487,20 @@ impl<'a> Reader<'a, '_> {
                             self.note(&block, "Paragraphs of this list item were joined");
                         }
                         runs.extend(more);
+                        formulas.iter().for_each(|moved| self.note(moved, MOVED));
+                        after.extend(formulas);
                     }
                     Event::Start(tag) => {
                         let nested = matches!(tag, Tag::List(_));
                         let from = after.len();
                         self.read(tag, range, depth.saturating_add(1), &mut after);
                         for moved in after[from..].iter().filter(|_| !nested) {
-                            self.note(moved, "Moved out of a list item");
+                            self.note(moved, MOVED);
                         }
                     }
                     Event::Rule => {
                         let rule = self.block(BlockKind::Divider);
-                        self.note(&rule, "Moved out of a list item");
+                        self.note(&rule, MOVED);
                         after.push(rule);
                     }
                     _ => {}
@@ -329,14 +519,21 @@ impl<'a> Reader<'a, '_> {
         }
     }
 
-    /// Reads a table back into Markdown, since the document has no tables yet.
-    fn table(&mut self, block: &Block, alignments: &[Alignment]) -> String {
-        let mut rows: Vec<Vec<String>> = Vec::new();
+    /// Reads a table. Markdown always gives one a first row that heads it, so a first row with no text in it,
+    /// above other rows, is how a table with no header is written.
+    fn table(&mut self, alignments: &[Alignment]) -> Block {
+        let align = |alignment: &Alignment| match alignment {
+            Alignment::None | Alignment::Left => Align::Start,
+            Alignment::Center => Align::Center,
+            Alignment::Right => Align::End,
+        };
+        let mut rows: Vec<Vec<Block>> = Vec::new();
         while let Some((event, _)) = self.next() {
             match event {
                 Event::Start(Tag::TableHead | Tag::TableRow) => rows.push(Vec::new()),
                 Event::Start(Tag::TableCell) => {
-                    let cell = write::cell(&self.inline(block));
+                    let mut cell = self.block(BlockKind::TableCell);
+                    cell.body = Body::Text(self.line(&cell));
                     self.at += 1;
                     rows.last_mut().expect("a cell sits in a row").push(cell);
                 }
@@ -344,18 +541,57 @@ impl<'a> Reader<'a, '_> {
                 _ => {}
             }
         }
-        let rule = |alignment: &Alignment| match alignment {
-            Alignment::None => "---",
-            Alignment::Left => ":--",
-            Alignment::Center => ":-:",
-            Alignment::Right => "--:",
-        };
-        table(rows, alignments.iter().map(|alignment| rule(alignment).to_owned()).collect())
+        let header = rows.len() < 2 || rows[0].iter().any(|cell| !cell.plain_text().is_empty());
+        if !header {
+            let unheaded = rows.remove(0);
+            self.notes.retain(|note| unheaded.iter().all(|cell| cell.id.as_str() != note.block));
+        }
+        let mut table = self.block(BlockKind::Table { columns: alignments.iter().map(align).collect(), header });
+        let rows = rows.into_iter().map(|cells| {
+            let mut row = self.block(BlockKind::TableRow);
+            row.body = Body::Blocks(cells);
+            row
+        });
+        table.body = Body::Blocks(rows.collect());
+        table
     }
 
-    /// Reads inline content up to the next block boundary, which is left for the caller.
-    fn inline(&mut self, block: &Block) -> Vec<Run> {
+    /// Reads text up to the next block boundary, which is left for the caller. Display maths in it is a formula
+    /// of its own: the text before the first is returned for `block`, then each formula and the text after it
+    /// as the blocks that follow.
+    fn flow(&mut self, block: &Block) -> (Vec<Run>, Vec<Block>) {
         let mut text = Text::default();
+        self.inline(block, &mut text, true);
+        let mut first = mem::take(&mut text.runs);
+        let mut rest = Vec::new();
+        while let Some(Event::DisplayMath(tex)) = self.peek(0).cloned() {
+            self.at += 1;
+            rest.push(self.formula(&unix_lines(tex.trim())));
+            let mut after = self.block(BlockKind::Paragraph);
+            self.inline(&after, &mut text, true);
+            let mut runs = mem::take(&mut text.runs);
+            trim(&mut runs);
+            if !runs.is_empty() {
+                after.body = Body::Text(runs);
+                rest.push(after);
+            }
+        }
+        if !rest.is_empty() {
+            trim(&mut first);
+        }
+        (first, rest)
+    }
+
+    /// Reads the text of a block that is one line, where display maths can only sit in the line.
+    fn line(&mut self, block: &Block) -> Vec<Run> {
+        let mut text = Text::default();
+        self.inline(block, &mut text, false);
+        text.runs
+    }
+
+    /// Reads inline content into `text`, up to the next block boundary, which is left for the caller. With
+    /// `formulas`, display maths is such a boundary.
+    fn inline(&mut self, block: &Block, text: &mut Text, formulas: bool) {
         while let Some(event) = self.peek(0).cloned() {
             match event {
                 Event::Text(part) => text.push(&part, None),
@@ -369,12 +605,24 @@ impl<'a> Reader<'a, '_> {
                     }
                 }
                 Event::InlineMath(tex) => {
-                    text.push(&format!("${}$", unix_lines(&tex)), Some(Mark::Code));
-                    self.note(block, MATHS);
+                    // A price is not maths. As Pandoc reads them, the dollar that ends maths has no digit after it.
+                    let end = self.events[self.at].1.end;
+                    if self.source.as_bytes().get(end).is_some_and(u8::is_ascii_digit) {
+                        text.push(&format!("${}$", one_line(&tex)), None);
+                    } else {
+                        text.push(&one_line(&tex), Some(Mark::Math));
+                    }
                 }
+                Event::DisplayMath(_) if formulas => break,
                 Event::DisplayMath(tex) => {
-                    text.push(&format!("$${}$$", unix_lines(tex.trim())), Some(Mark::Code));
-                    self.note(block, MATHS);
+                    // Not all that two dollar signs hold can sit between single ones, and so be written back.
+                    let tex = one_line(tex.trim());
+                    let inline = format!("${tex}$");
+                    let mut events = Parser::new_ext(&inline, Options::ENABLE_MATH).skip(1);
+                    let fits = matches!(events.next(), Some(Event::InlineMath(read)) if *read == *tex)
+                        && matches!(events.next(), Some(Event::End(_)));
+                    text.push(&tex, Some(if fits { Mark::Math } else { Mark::Code }));
+                    self.note(block, "Display maths set in its line");
                 }
                 Event::FootnoteReference(label) => {
                     text.push(&format!("[^{label}]"), None);
@@ -392,7 +640,7 @@ impl<'a> Reader<'a, '_> {
                     text.links.push((address(&dest_url), text.len));
                 }
                 Event::Start(Tag::Image { dest_url, .. }) => {
-                    self.note(block, "Image kept as a link");
+                    self.note(block, LINKED);
                     text.links.push((address(&dest_url), text.len));
                 }
                 Event::End(TagEnd::Link) => drop(text.links.pop()),
@@ -409,7 +657,6 @@ impl<'a> Reader<'a, '_> {
             }
             self.at += 1;
         }
-        text.runs
     }
 }
 
@@ -425,6 +672,8 @@ struct Text {
     tags: Vec<Mark>,
     /// Open links, each with the `len` at which it opened.
     links: Vec<(String, usize)>,
+    /// Whether any of the text was set in italics by the tag that does not emphasise it.
+    set_italic: bool,
 }
 
 impl Text {
@@ -451,6 +700,7 @@ impl Text {
         let (name, closes) = inner.strip_prefix('/').map_or((inner, false), |name| (name, true));
         let Some((_, mark)) = TAGS.iter().find(|(tag, _)| tag.eq_ignore_ascii_case(name)) else { return false };
         if !closes {
+            self.set_italic |= name.eq_ignore_ascii_case("i");
             self.tags.push(mark.clone());
         } else if let Some(open) = self.tags.iter().rposition(|open| open == mark) {
             self.tags.remove(open);
@@ -464,6 +714,24 @@ impl Text {
 /// Maths is the one text the parser hands over with the file's own line endings.
 fn unix_lines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Maths that sits in a line of text, where a line break in its source is only a space.
+fn one_line(tex: &str) -> String {
+    unix_lines(tex).replace('\n', " ")
+}
+
+/// A path as an address writes it, with each `%20` and its like as the character it stands for.
+fn unescaped(path: &str) -> String {
+    let (mut out, mut rest) = (Vec::new(), path.as_bytes());
+    while let [byte, after @ ..] = rest {
+        let hex = after.get(..2).filter(|_| *byte == b'%').and_then(|hex| str::from_utf8(hex).ok());
+        match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+            Some(decoded) => (out.push(decoded), rest = &after[2..]).1,
+            None => (out.push(*byte), rest = after).1,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A link's address. A wiki link can wrap, and an address cannot hold the line break.
@@ -486,10 +754,18 @@ pub(crate) fn nest(blocks: &mut [Block]) {
     }
 }
 
-/// Lays rows of cells out as a Markdown table, with `rules` under its first row.
-pub(crate) fn table(mut rows: Vec<Vec<String>>, rules: Vec<String>) -> String {
-    rows.insert(rows.len().min(1), rules);
-    rows.iter().map(|row| format!("| {} |", row.join(" | "))).collect::<Vec<_>>().join("\n")
+/// Drops the spaces and line breaks at the edges of a block's text.
+pub(crate) fn trim(runs: &mut Vec<Run>) {
+    const EDGE: [char; 3] = [' ', '\t', '\n'];
+    let blank = |run: &Run| run.text.trim_matches(EDGE).is_empty();
+    runs.truncate(runs.len() - runs.iter().rev().take_while(|run| blank(run)).count());
+    runs.drain(..runs.iter().take_while(|run| blank(run)).count());
+    if let Some(last) = runs.last_mut() {
+        last.text.truncate(last.text.trim_end_matches(EDGE).len());
+    }
+    if let Some(first) = runs.first_mut() {
+        first.text.drain(..first.text.len() - first.text.trim_start_matches(EDGE).len());
+    }
 }
 
 /// Joins neighbouring runs that share their formatting.

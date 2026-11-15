@@ -3,42 +3,77 @@
 //! [`Window`] is what a shell shows and the test harness drives. The page is a canvas holding what the
 //! document's layout painted for the part in view. Everything around it is made of the toolkit's widgets.
 
-use std::collections::{BTreeSet, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
-use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Platform};
-use letters_layout::{Callout, DocLayout, Fonts, Palette, Syntax};
-use letters_model::{Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Mark, Pos, Selection, Style};
-use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
+use letters_editor::{
+    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Picture, Platform, Spot,
+    TableEdit,
+};
+use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Syntax};
+use letters_model::{
+    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, Notes, Pos, Selection,
+    Style,
+};
+use letters_render::image::{Image, Images};
+use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
 
+use crate::captions::{self, Altering, Captions};
+use crate::chrome::Chrome;
+use crate::code_copy::{self, CodeCopy};
 use crate::color::{fade, resolve, same};
+use crate::commands::{self, Act, Commanding, Commands, Entry};
+use crate::copying::{self, Copy, CopyFormat, Copying};
 use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
+use crate::figures::{self, Grip, Moving, Resizing};
 use crate::highlight;
 use crate::icon::{self, Icon};
+use crate::importing::{Import, ImportOffer, Importing};
+use crate::insert::{Insert, Inserting, Put};
+use crate::maths::{self, Maths, Sheet, SheetLines, Source};
 use crate::motion::{self, FRAME_MS};
+use crate::notes::{self, Margin, Noting};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
-use crate::restyle::{self, Field, StyleEdit, Styles};
+use crate::pictures::{self, Linked, Linking, PictureState};
+use crate::print::{Breaking, Paged, Print, Printing};
+use crate::refer::{Picking, Refer};
+use crate::references::{self, Preview, Reference, References};
+use crate::renaming::{Outcome, Rename, Renaming};
+use crate::restyle::{self, Field, StyleEdit};
+use crate::safe::{self, Safe, SafeMode, Safely};
+use crate::settings::{Dialog, Setting, Settings};
 use crate::spelling::{Fix, Spelling};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
-use crate::text::{Family, FontShaper, TextStyle};
+use crate::styles::{self, Styles, Styling};
+use crate::text::{Family, FontShaper, TextShaper, TextStyle};
+use crate::theme::{Accent, accent};
+use crate::threads::{self, Said};
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::ui::{App, Keys, Ui};
+use crate::ui::{App, DRAG_SLOP, Idle, Keys, Ui};
 use crate::widgets::{
-    Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, TopBar, side_panel, top_bar,
+    Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, Title, TopBar, side_panel, top_bar,
 };
 
 /// Space kept beside the text column.
 const GUTTER: f32 = 24.0;
+/// How wide the link editor is: its field and the button that opens the address in it.
+const LINK_WIDTH: f32 = 336.0;
 /// Space kept above and below the text.
 const TOP: f32 = 48.0;
 /// Points to logical pixels.
-const PT: f32 = 96.0 / 72.0;
-const CARET_WIDTH: f32 = 1.5;
+pub(crate) const PT: f32 = 96.0 / 72.0;
+pub(crate) const CARET_WIDTH: f32 = 1.5;
+/// How far outside a selected picture its ring is drawn.
+const RING: f32 = 3.0;
+/// The bar that says where pictures held over the page would land: how thick it is, and how far it stands
+/// from what they would land beside.
+const BAR: (f32, f32) = (3.0, 3.0);
 /// How much text one idle step lays out, in bytes. Small enough to fit between two frames.
 const SETTLE_BYTES: usize = 4096;
 
@@ -63,6 +98,8 @@ const CARD_WIDTH: f32 = 544.0;
 const RECENT_HEIGHT: f32 = 38.0;
 /// How long the bar says which folder a document was first written to, in milliseconds.
 const SAVED_NOTE_MS: u64 = 4000;
+/// The size of the icon that says how saving stands.
+const SAVE_ICON: f32 = 14.0;
 
 /// The editor's window.
 pub type Window = Ui<EditorApp>;
@@ -141,15 +178,52 @@ pub enum Message {
     NewDocument,
     /// Puts the landing card away: this window's document is the one to write.
     Start,
+    /// Renames the document where its name stands, or moves it from the flyout under the name.
+    Rename(Rename),
+    /// Chooses what an imported file brings, on the import card.
+    Import(Import),
+    /// What is done on the card that saves a copy of the document, or writes it in another format.
+    Copy(Copying),
+    /// What the Styles panel asks for: the person's default, page setup and stylesheets.
+    Styles(Styling),
+    /// Asks the shell for something only it can do, such as moving the window.
+    Ask(Request),
+    /// What is done on the sheet under a formula.
+    Maths(Sheet),
+    Insert(Inserting),
+    /// What is asked of the list of figures under a reference being typed.
+    Refer(Picking),
+    /// What the settings dialog asks for.
+    Settings(Setting),
+    /// What the menu on a linked picture's cloud asks for.
+    Linked(Linking),
+    /// What the field of a picture's alt text asks for.
+    Alt(Altering),
+    /// What the tools over a selection and the field of a comment ask for.
+    Note(Noting),
+    /// What the safe mode bar, a link and the card about a link ask for.
+    Safe(Safely),
+    /// What is asked of the command palette.
+    Commands(Commanding),
+    /// What is asked of Print view.
+    Print(Printing),
 }
 
 impl Ui<EditorApp> {
-    pub fn new(editor: Editor, style: Style) -> Self {
-        Ui::host(EditorApp::new(editor, style), Rc::new(FontShaper::default()))
+    /// The window on a document. It is drawn with the style its model holds: see `Model::with_style`.
+    pub fn new(editor: Editor) -> Self {
+        let shaper = Rc::new(FontShaper::default());
+        Ui::host(EditorApp::new(editor, shaper.clone()), shaper)
     }
 
     pub fn editor(&self) -> &Editor {
         &self.app().editor
+    }
+
+    /// Names who writes in this window. Edits made from here on carry the name.
+    pub fn set_author(&mut self, name: &str) {
+        self.app_mut().margin.author = name.to_owned();
+        self.app_mut().editor.set_author(name);
     }
 
     /// Moves the selection and brings it into view, as a click on the page does.
@@ -162,7 +236,7 @@ impl Ui<EditorApp> {
 
     /// The document's style, which a shell writes when it saves.
     pub fn style(&self) -> &Style {
-        &self.app().style
+        self.app().editor.model().style()
     }
 
     /// Goes up each time the document changes.
@@ -172,18 +246,60 @@ impl Ui<EditorApp> {
 
     /// Names the document. Shorthand for a [`Window::set_location`] that changes nothing else.
     pub fn set_document_name(&mut self, name: &str) {
-        self.app_mut().location.name = Some(name.to_owned()).filter(|name| !name.is_empty());
+        let app = self.app_mut();
+        let name = Some(name.to_owned()).filter(|name| !name.is_empty());
+        app.place(Location { name, ..app.location.clone() });
     }
 
-    /// Says what the document is called and where it is kept.
+    /// Says what the document is called and where it is kept. It is also the answer to a
+    /// [`Request::Rename`], [`Request::Move`] or [`Request::NewFolder`] that was done.
     pub fn set_location(&mut self, location: Location) {
-        self.app_mut().location = location;
+        self.app_mut().place(location);
+    }
+
+    /// Says why a rename, a move or a new folder could not be done, as the person is to read it. The name
+    /// field comes back with what was typed, marked as wrong, and says so until something in it changes.
+    /// `None` takes the notice away.
+    pub fn set_notice(&mut self, notice: Option<&str>) {
+        let app = self.app_mut();
+        match notice {
+            Some(notice) => {
+                let asked = app.renaming.take().or(app.asked.take());
+                let mut renaming = asked.unwrap_or_else(|| Renaming::open(&app.location));
+                renaming.notice = Some(notice.to_owned());
+                app.renaming = Some(renaming);
+            }
+            None => _ = app.renaming.as_mut().map(|renaming| renaming.notice = None),
+        }
+        app.asked = None;
+    }
+
+    /// Says that the copy a [`Request::SaveCopy`] asked for is written, and names its folder as the bar is
+    /// to say it for a few seconds.
+    pub fn set_copied(&mut self, folder: &str) {
+        let app = self.app_mut();
+        let Some(asked) = app.copy_asked.take() else { return };
+        let said = if asked.format() == CopyFormat::Letters { "Copy saved in" } else { "Exported to" };
+        app.note = Some((format!("{said} {folder}"), None));
+    }
+
+    /// Says why a copy could not be written, as the person is to read it. The card comes back as it was
+    /// and says so until something on it changes. `replaceable` is for a file of the copy's name that is in
+    /// the way: the card then offers to replace it, and asks again with `replace` set.
+    pub fn refuse_copy(&mut self, notice: &str, replaceable: bool) {
+        let app = self.app_mut();
+        if let Some(mut copy) = app.copy_asked.take() {
+            copy.refused(notice, replaceable);
+            app.copying = Some(copy);
+        }
     }
 
     /// Shows the landing card over a document nobody has written in, or takes it away. The card goes by
     /// itself when the person starts to write.
     pub fn set_landing(&mut self, landing: Option<Landing>) {
-        self.app_mut().landing = landing;
+        let app = self.app_mut();
+        app.landing = landing;
+        app.uncover();
     }
 
     /// Whether the landing card is showing.
@@ -191,13 +307,78 @@ impl Ui<EditorApp> {
         self.app().landing.is_some()
     }
 
+    /// Shows the import card for a file that has to be imported, in place of the landing card, or takes it
+    /// away. The card asks with [`Request::Import`] and [`Request::CancelImport`].
+    pub fn offer_import(&mut self, offer: Option<ImportOffer>) {
+        let app = self.app_mut();
+        app.importing = offer.map(Importing::new);
+        app.uncover();
+    }
+
+    /// Whether the import card is showing.
+    pub fn importing(&self) -> bool {
+        self.app().importing.is_some()
+    }
+
     /// Has the bar say for a few seconds which folder the document was written to, after its first write.
     pub fn set_saved_in(&mut self, folder: &str) {
-        self.app_mut().saved_in = Some((folder.to_owned(), None));
+        self.app_mut().note = Some((format!("Saved in {folder}"), None));
+    }
+
+    /// Says what the person's default style is, which their new documents start with. The Styles panel
+    /// then offers to save or reset to it whenever the document's style differs. `None` is for a shell that
+    /// keeps no default. It is also the answer to a [`Request::SaveDefaultStyle`].
+    pub fn set_default_style(&mut self, style: Option<Style>) {
+        self.app_mut().styles.default = style;
+    }
+
+    /// Shows a stylesheet the person chose, by its file's name and text, in the Styles panel as it will
+    /// look. Nothing changes until they apply it there. Text that is no stylesheet is refused there too, with
+    /// the reason. It is the answer to a [`Request::ImportStyle`].
+    pub fn offer_stylesheet(&mut self, name: &str, json: &str) {
+        let app = self.app_mut();
+        app.show(Some(Panel::Styles));
+        app.styles.offer(name, json);
+    }
+
+    /// Says what the person has set for themselves, at the start and whenever another window changed it. The
+    /// window takes the accent from it. Light or dark stays with [`Window::set_dark`], and the name edits
+    /// carry with [`Window::set_author`], since only the shell knows what the system and the account say.
+    pub fn set_settings(&mut self, settings: Settings) {
+        let app = self.app_mut();
+        app.settings = settings;
+        app.tint();
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.app().settings
+    }
+
+    /// Names the languages the shell has dictionaries for, as BCP 47 tags, for the settings to offer beside
+    /// the kinds of English that are built in.
+    pub fn set_languages(&mut self, languages: impl IntoIterator<Item = impl Into<String>>) {
+        self.app_mut().dialog.languages = languages.into_iter().map(Into::into).collect();
+    }
+
+    /// Says what the person's account calls them: the name their edits carry while they have set none,
+    /// which the settings show in the empty name field.
+    pub fn set_account_name(&mut self, name: Option<&str>) {
+        self.app_mut().dialog.account = name.map(str::to_owned);
+    }
+
+    /// Says what the desktop expects of the window's frame and bar: see [`Chrome`]. Call it at the start
+    /// and whenever the window's state changes. A bar that is the title bar asks for the window to be
+    /// moved, resized, minimised, maximised and closed through [`Request`].
+    pub fn set_chrome(&mut self, chrome: Chrome) {
+        self.app_mut().chrome = chrome;
     }
 
     /// What the window asks of its shell, since this was last called. Call it after every event.
     pub fn take_requests(&mut self) -> Vec<Request> {
+        // Reaching for the app's state asks for a frame, which a call after every event must not do.
+        if self.app().requests.is_empty() {
+            return Vec::new();
+        }
         std::mem::take(&mut self.app_mut().requests)
     }
 
@@ -215,6 +396,181 @@ impl Ui<EditorApp> {
     /// in a language without a dictionary is left alone.
     pub fn add_dictionary(&mut self, language: &str, dictionary: Dictionary) {
         self.app_mut().spelling.add_dictionary(language, dictionary);
+    }
+
+    /// Adds faces that arrived after the window opened, for a shell whose fonts come one after another: pass
+    /// `letters_fonts::bundled()` again once it holds more. Text that was set without a face is set again
+    /// with it, and the next frame shows it. Faces the window already has change nothing.
+    pub fn add_fonts(&mut self, faces: Vec<Font>) {
+        let fonts = Fonts { faces };
+        let app = self.app_mut();
+        let labels = app.shaper.add_fonts(&fonts);
+        app.said.again();
+        if app.held(|app| app.layout.add_fonts(&fonts)) {
+            // Blocks set again keep their heights as estimates until idle time settles them.
+            app.estimated = true;
+        }
+        if labels {
+            self.reshape();
+        }
+    }
+
+    /// Lets formulas link, as `\\href` asks. The shell turns it on for a document the person trusts, and it
+    /// is off until then.
+    pub fn set_maths_links(&mut self, links: bool) {
+        let app = self.app_mut();
+        app.held(|app| app.layout.set_maths_links(links));
+        // Formulas are set again, at heights that are estimates until idle time settles them.
+        app.estimated = true;
+    }
+
+    /// Says that the document is held in safe mode, and how it can be trusted, or `None` once it is. A bar
+    /// under the top bar tells the person and asks with [`Request::TrustDocument`] and
+    /// [`Request::TrustFolder`]. What safe mode holds back stays the shell's to hold back. When a document
+    /// becomes trusted the window asks for every linked picture not yet showing with
+    /// [`Request::LinkedPicture`] again.
+    pub fn set_safe_mode(&mut self, safe: Option<SafeMode>) {
+        if self.app_mut().safe.set(safe) {
+            self.app_mut().ask_again(true);
+        }
+    }
+
+    /// Shows the whole address of a link and asks whether to open it, in answer to a
+    /// [`Request::OpenLink`] that was not confirmed. A yes asks again with `confirmed` set.
+    pub fn ask_link(&mut self, href: &str) {
+        self.app_mut().safe.ask(href);
+    }
+
+    /// Says that a link is not opened and why, in a few words, in answer to a [`Request::OpenLink`].
+    pub fn refuse_link(&mut self, href: &str, why: &str) {
+        self.app_mut().safe.refuse(href, why);
+    }
+
+    /// The document's notes: the comments on its passages, and what imports and merges left on them. A
+    /// shell writes them into the document's file with each save. A comment that is written counts among
+    /// [`Window::edits`].
+    pub fn notes(&self) -> &Notes {
+        &self.app().margin.notes
+    }
+
+    /// Says that no comment can be written on this document and why, in a sentence that stands by
+    /// itself, or `None` once one can. A shell says it of a document whose notes it could not read, since
+    /// a comment added to those could not be saved. The Comment tool then shows the sentence in place of
+    /// its field.
+    pub fn refuse_comments(&mut self, why: Option<&str>) {
+        self.app_mut().margin.refused = why.map(str::to_owned);
+    }
+
+    /// Hands over the notes of the document that was opened, or what a merge made of them.
+    pub fn set_notes(&mut self, notes: Notes) {
+        let app = self.app_mut();
+        app.margin.take(notes, app.editor.model());
+    }
+
+    /// The decoded pictures the window's display list draws, by asset name: what a shell hands its
+    /// renderer with each frame.
+    pub fn images(&self) -> &Images {
+        &self.app().images
+    }
+
+    /// Hands over a picture decoded: one the window asked for with [`Request::Asset`], or one the document
+    /// links to, under the address the link is written as. `None` says it cannot be had: its place stays
+    /// empty and it is not asked for again, and a linked picture goes back to its frame and cloud.
+    pub fn set_image(&mut self, asset: &str, image: Option<Image>) {
+        let app = self.app_mut();
+        app.wanted.insert(asset.to_owned());
+        // A linked picture is drawn once it is here, at its own shape. For any other name this says nothing.
+        app.layout.set_loaded(asset, image.as_ref().map(|image| (image.width(), image.height())));
+        match image {
+            Some(image) => {
+                app.images.insert(asset, image);
+                // A picture that shows has nothing more said of it.
+                app.linked.say(asset, None);
+            }
+            None => _ = app.images.remove(asset),
+        }
+    }
+
+    /// Says how a linked picture that does not show is doing, by the address its link is written as: it is
+    /// being fetched, the fetch failed for a short reason, or safe mode holds it back. Its cloud tells the
+    /// person, and offers another try at one that failed with a [`Request::LoadPicture`]. Say it again as
+    /// it changes. `None` says no more of it, as handing the picture to [`Window::set_image`] does.
+    pub fn set_picture_state(&mut self, src: &str, state: Option<PictureState>) {
+        if self.app().linked.said(src) != state.as_ref() {
+            self.app_mut().linked.say(src, state);
+        }
+    }
+
+    /// Says whether a linked picture comes from a source the person trusts already, by the address its
+    /// link is written as: the menu on its cloud then does not offer "Always load from" its host again.
+    /// The window takes it as said of every picture of a host once the person has chosen that from a menu.
+    pub fn set_picture_trusted(&mut self, src: &str, trusted: bool) {
+        if self.app().linked.vouched(src) != trusted {
+            self.app_mut().linked.vouch(src, trusted);
+        }
+    }
+
+    /// Keeps a linked picture in the document, in answer to a [`Request::EmbedPicture`]: the figure holds
+    /// the picture from now on and no longer links to it. Nothing happens when the figure is gone or holds
+    /// a picture already, or when the bytes are no picture Letters can show.
+    pub fn embed_picture(&mut self, figure: &BlockId, picture: Picture, platform: &mut dyn Platform) {
+        let figure = figure.clone();
+        self.app_mut()
+            .edit(platform, |editor, platform| editor.run(Command::EmbedFigure { figure, picture }, platform));
+    }
+
+    /// Shows where pictures held over a point of the window would land if they were let go there, as
+    /// files dragged over the window are: a bar beside a picture, or between two blocks. `None` puts the
+    /// bar away. Returns whether the point is on the page.
+    pub fn drag_pictures(&mut self, at: Option<Point>) -> bool {
+        let spot = at.and_then(|at| self.on_canvas(at)).and_then(|at| self.app().spot(at));
+        let bar = spot.as_ref().and_then(|(_, bar)| *bar);
+        if self.app().drop != bar {
+            self.app_mut().drop = bar;
+        }
+        spot.is_some()
+    }
+
+    /// Puts pictures into the document: one as a figure, several as a gallery. Let go at a point of the
+    /// page they land where [`Window::drag_pictures`] showed. With no point, or one that is not on the
+    /// page, they land where the selection is, as pictures chosen in a dialog do (see
+    /// [`Request::Pictures`]). What is no picture Letters can show is left out.
+    pub fn insert_pictures(&mut self, pictures: Vec<Picture>, at: Option<Point>, platform: &mut dyn Platform) {
+        // Nothing is written in Print view.
+        if self.app().printing.is_some() {
+            return;
+        }
+        let at = at.and_then(|at| self.on_canvas(at)).and_then(|at| self.app().spot(at)).map(|(spot, _)| spot);
+        let app = self.app_mut();
+        app.drop = None;
+        app.edit(platform, |editor, platform| editor.run(Command::InsertFigures { pictures, at }, platform));
+    }
+
+    /// Where the two ends of the selection are in the window as last laid out, the anchor first and then
+    /// the end that moves: each as tall as its line, for a shell that draws handles there on a touch
+    /// screen. `None` for an end the page does not show, and for both without a selection.
+    pub fn selection_ends(&self) -> [Option<Rect>; 2] {
+        let app = self.app();
+        let editing = self.canvas().filter(|_| app.printing.is_none());
+        let Some((page, selection)) = editing.zip(app.editor.selection()) else { return [None, None] };
+        let end = |pos: &Pos| {
+            let caret = app.layout.caret(pos)?;
+            let (x, y) = (page.x + app.column.0 + caret.x, page.y + TOP - app.scrolled() + caret.y);
+            let shown = y + caret.height > page.y && y < page.y + page.height;
+            shown.then_some(Rect { x, y, ..caret })
+        };
+        [end(&selection.anchor), end(&selection.head)]
+    }
+
+    /// Selects the word at a point of the window, as a double click there does: for a long press on a
+    /// touch screen. Returns whether the page had text to select there. A point on anything that lies over
+    /// the page selects nothing.
+    pub fn select_word_at(&mut self, at: Point, platform: &mut dyn Platform) -> bool {
+        let Some(head) = self.on_canvas(at).and_then(|at| self.app().hit(at)) else { return false };
+        let app = self.app_mut();
+        app.editor.select(Selection::caret(head));
+        app.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform));
+        true
     }
 
     /// Runs something on the editor from outside, such as taking in another writer's edits, and brings the
@@ -261,12 +617,16 @@ impl Lines for DocLines<'_> {
 /// Lends the editor the shell's platform together with the laid-out lines.
 struct Lent<'a> {
     platform: &'a mut dyn Platform,
-    lines: DocLines<'a>,
+    lines: SheetLines<DocLines<'a>>,
 }
 
 impl Platform for Lent<'_> {
     fn now_ms(&self) -> u64 {
         self.platform.now_ms()
+    }
+
+    fn wall_time(&self) -> Option<u64> {
+        self.platform.wall_time()
     }
 
     fn clipboard_read(&mut self) -> Option<Clip> {
@@ -296,9 +656,15 @@ impl Platform for Lent<'_> {
 
 pub struct EditorApp {
     editor: Editor,
-    style: Style,
     layout: DocLayout,
+    /// Shapes what the window draws on a canvas of its own, as the interface's text is shaped.
+    shaper: Rc<FontShaper>,
     palette: Palette,
+    scheme: Scheme,
+    /// The person's accent, worked out from their settings.
+    accent: Accent,
+    settings: Settings,
+    dialog: Dialog,
     /// The text column's left edge inside the page area, and its width.
     column: (f32, f32),
     /// The height of the page area.
@@ -312,11 +678,37 @@ pub struct EditorApp {
     location: Location,
     /// What the landing card offers, while it shows.
     landing: Option<Landing>,
+    /// The file the import card offers, while it shows.
+    importing: Option<Importing>,
     requests: Vec<Request>,
-    /// The folder the bar says the document was saved in, and since when, once a frame has said so.
-    saved_in: Option<(String, Option<u64>)>,
+    /// The pictures the shell has handed over, by asset name.
+    images: Images,
+    /// The assets the shell was asked for, or told of by itself.
+    wanted: HashSet<String>,
+    /// The bar that says where pictures held over the page would land, in the layout's coordinates.
+    drop: Option<Rect>,
+    linked: Linked,
+    safe: Safe,
+    grip: Grip,
+    captions: Captions,
+    margin: Margin,
+    /// What the note that is open says, set to be drawn.
+    said: Said,
+    /// What the bar says of a write that was just done, as where the document was first saved, and since
+    /// when, once a frame has said so.
+    note: Option<(String, Option<u64>)>,
     /// Whether the caret is in the heading that will name the document.
     naming: bool,
+    /// The name field in the bar, while the document is being renamed or moved.
+    renaming: Option<Renaming>,
+    /// What the field held when the shell was last asked for it, to bring back if the shell refuses.
+    asked: Option<Renaming>,
+    /// The card that saves a copy, while it shows.
+    copying: Option<Copy>,
+    /// The card as it was when the shell was asked for the copy, to bring back if the shell refuses.
+    copy_asked: Option<Copy>,
+    /// Whether keys follow macOS conventions, which is how the menus then write them.
+    mac: bool,
     save: SaveState,
     edits: u64,
     panel: Option<Panel>,
@@ -325,6 +717,13 @@ pub struct EditorApp {
     link: Option<String>,
     /// What is typed into one of the style's fields, and the element type it was typed for.
     draft: Option<(Field, &'static str, String)>,
+    styles: Styles,
+    chrome: Chrome,
+    /// Whether the window is the one in front. Behind another, a bar that is the title bar dims.
+    active: bool,
+    /// The type a row of the Styles panel has the bar show, and where the selection was then: the bar goes
+    /// back to the type at the caret once the caret moves.
+    picked: Option<(&'static str, Option<Selection>)>,
     folded: Folded,
     /// What each code block was last coloured for: its text and language, hashed.
     lexed: HashMap<BlockId, u64>,
@@ -334,15 +733,34 @@ pub struct EditorApp {
     reduced_motion: bool,
     spelling: Spelling,
     dragging: bool,
+    maths: Maths,
+    insert: Insert,
+    commands: Commands,
+    /// Print view, while it shows in place of the page.
+    printing: Option<Print>,
+    refer: Refer,
+    references: References,
+    code_copy: CodeCopy,
+    /// The preview of a figure that shows over the page: its caption, and where it is in the page area.
+    previewed: Option<(String, Rect)>,
+    /// How the document read when assistive technology was last told of it.
+    told: RefCell<describe::Told>,
 }
 
 impl EditorApp {
-    fn new(editor: Editor, style: Style) -> Self {
+    fn new(editor: Editor, shaper: Rc<FontShaper>) -> Self {
+        let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
+        // A formula stays typeset under the caret: its source is written on a sheet under it.
+        layout.set_formula_source(false);
         Self {
             editor,
-            style,
-            layout: DocLayout::new(Fonts { faces: letters_fonts::bundled() }),
+            layout,
+            shaper,
             palette: Palette::LIGHT,
+            scheme: Scheme::Light,
+            accent: Accent::YEWI,
+            settings: Settings::default(),
+            dialog: Dialog::default(),
             column: (0.0, 0.0),
             height: 0.0,
             scroll: 0.0,
@@ -350,22 +768,61 @@ impl EditorApp {
             estimated: true,
             location: Location::default(),
             landing: None,
+            importing: None,
             requests: Vec::new(),
-            saved_in: None,
+            images: Images::default(),
+            wanted: HashSet::new(),
+            drop: None,
+            linked: Linked::default(),
+            safe: Safe::default(),
+            grip: Grip::default(),
+            captions: Captions::default(),
+            margin: Margin::default(),
+            said: Said::default(),
+            note: None,
             naming: false,
+            renaming: None,
+            asked: None,
+            copying: None,
+            copy_asked: None,
+            mac: cfg!(target_os = "macos"),
             save: SaveState::default(),
             edits: 0,
             panel: None,
             sharing: false,
             link: None,
             draft: None,
+            styles: Styles::default(),
+            chrome: Chrome::default(),
+            active: true,
+            picked: None,
             folded: Folded::default(),
             lexed: HashMap::new(),
             fading: None,
             reduced_motion: false,
             spelling: Spelling::default(),
             dragging: false,
+            maths: Maths::default(),
+            insert: Insert::default(),
+            commands: Commands::default(),
+            printing: None,
+            refer: Refer::default(),
+            references: References::default(),
+            code_copy: CodeCopy::default(),
+            previewed: None,
+            told: RefCell::default(),
         }
+    }
+
+    /// Takes the page's colours for the scheme and the accent the person set. Of the page, only what is
+    /// selected shows in the accent: the rest is the document's to colour, and looks the same to everyone.
+    fn tint(&mut self) {
+        self.accent = self.settings.accent.map_or(Accent::YEWI, Accent::of);
+        self.palette = palette(self.scheme);
+        if self.accent != Accent::YEWI {
+            self.palette.selection = resolve(fade(self.accent.base, 0.3), self.scheme, 1.0);
+        }
+        self.layout.set_palette(self.palette);
     }
 
     /// The first Heading 1, which names a document that has no name of its own.
@@ -383,6 +840,51 @@ impl EditorApp {
         (heading.filter(|heading| !heading.is_empty()).unwrap_or_else(|| "Untitled".into()), false)
     }
 
+    /// Takes the shell's word for where the document is, which also answers what the name field asked.
+    fn place(&mut self, location: Location) {
+        self.location = location;
+        self.asked = None;
+        if let Some(renaming) = &mut self.renaming {
+            renaming.placed(&self.location);
+        }
+        if let Some(copy) = &mut self.copying {
+            copy.placed(&self.location);
+        }
+    }
+
+    /// What the card that saves a copy asks for.
+    fn copy(&mut self, message: Copying) {
+        let title = self.name().0;
+        let Some(mut copy) = self.copying.take() else {
+            // The landing card stands over a document there is nothing of yet, and so does the import card.
+            if let Copying::Open(format) = message
+                && self.landing.is_none()
+                && self.importing.is_none()
+            {
+                self.copying = Some(Copy::open(format, &self.location, &title));
+            }
+            return;
+        };
+        match copy.update(message, &self.location, &title, &mut self.requests) {
+            copying::Outcome::Open => self.copying = Some(copy),
+            copying::Outcome::Asked => self.copy_asked = Some(copy),
+            copying::Outcome::Closed => {}
+        }
+    }
+
+    /// What the name field and its flyout ask for.
+    fn rename(&mut self, message: Rename) {
+        let Some(mut renaming) = self.renaming.take() else {
+            self.renaming = (message == Rename::Open).then(|| Renaming::open(&self.location));
+            return;
+        };
+        match renaming.update(message, &self.location, &mut self.requests) {
+            Outcome::Open => self.renaming = Some(renaming),
+            Outcome::Asked => self.asked = Some(renaming),
+            Outcome::Closed => {}
+        }
+    }
+
     /// Puts the landing card away and the caret on the page.
     fn start(&mut self) {
         self.landing = None;
@@ -395,18 +897,29 @@ impl EditorApp {
         }
     }
 
-    /// The element type whose style the caret's block is drawn with.
+    /// The element type whose style the bar shows: the one the caret's block is drawn with, unless a row of
+    /// the Styles panel picked another since the caret last moved.
     fn element(&self) -> Option<&'static str> {
-        restyle::element(self.editor.doc(), &self.editor.selection()?.head.block)
+        let selection = self.editor.selection();
+        match &self.picked {
+            Some((element, at)) if at.as_ref() == selection => Some(element),
+            _ => restyle::element(self.editor.doc(), &selection?.head.block),
+        }
     }
 
     /// Keeps up which form of the bar fits a window of `width`: forgotten when something that decides it
     /// has changed, and learnt from the layout after that.
     fn refold(&mut self, width: f32) {
-        let style = self.element().and_then(|element| Some((element, &self.style.types.get(element)?.family)));
+        // The name field keeps its place in the bar for as long as it is open.
+        if self.renaming.is_some() && self.folded.form.is_some() {
+            return;
+        }
+        let types = &self.editor.model().style().types;
+        let style = self.element().and_then(|element| Some((element, &types.get(element)?.family)));
         let mut hasher = DefaultHasher::new();
-        let note = self.saved_in.as_ref().map(|note| &note.0);
-        (width.to_bits(), self.name(), std::mem::discriminant(&self.save), note, style).hash(&mut hasher);
+        let differs = self.styles.differs(self.editor.model().style());
+        let chrome = (self.chrome.buttons.len(), self.chrome.inset_start.to_bits());
+        (width.to_bits(), self.name(), style, differs, chrome).hash(&mut hasher);
         let key = hasher.finish();
         if key != self.folded.key {
             self.folded = Folded { key, form: None, seen: Fitted::default() };
@@ -415,17 +928,13 @@ impl EditorApp {
         }
     }
 
-    /// Restyles every block of the type under the caret. Line breaks everywhere may change, so the whole
-    /// document is laid out again.
-    fn restyle(&mut self, edit: &StyleEdit) {
+    /// Restyles every block of the type under the caret, as one step that undo takes back.
+    fn restyle(&mut self, edit: &StyleEdit, platform: &mut dyn Platform) {
         let Some(element) = self.element() else { return };
-        let Some(mut style) = self.style.style().types.get(element).cloned() else { return };
+        let Some(mut style) = self.editor.model().style().types.get(element).cloned() else { return };
         edit.apply(&mut style);
-        self.style.restyle(element, style);
-        self.edits += 1;
-        self.layout.update(self.editor.doc(), &self.style, self.column.1, None);
-        self.estimated = true;
-        self.reveal();
+        let command = Command::SetStyle { element: element.to_owned(), style };
+        self.edit(platform, |editor, platform| editor.run(command, platform));
     }
 
     /// Colours the code blocks among `changed`, or every one in the document. A block is lexed again only
@@ -456,12 +965,639 @@ impl EditorApp {
         }
     }
 
+    /// Tells the shell of the pictures the document links to, each address once: all of them, or those of
+    /// the blocks that changed.
+    fn tell_links(&mut self, changed: Option<&BTreeSet<BlockId>>) {
+        let doc = self.editor.doc();
+        let blocks: Vec<&Block> = match changed {
+            Some(changed) => changed.iter().filter_map(|id| doc.block(id)).collect(),
+            None => doc.walk().collect(),
+        };
+        for src in blocks.into_iter().filter_map(pictures::link) {
+            if self.wanted.insert(src.to_owned()) {
+                self.requests.push(Request::LinkedPicture(src.to_owned()));
+            }
+        }
+    }
+
+    /// The address a figure links to, while it does not hold its picture.
+    fn link_of(&self, figure: &BlockId) -> Option<&str> {
+        self.editor.doc().block(figure).and_then(pictures::link)
+    }
+
+    /// The linked picture at a point of the page area, and whether the point is on its cloud.
+    fn linked_at(&self, at: Point) -> Option<(BlockId, bool)> {
+        let figure = self.hit(at).filter(|_| !self.hung())?.block;
+        self.link_of(&figure)?;
+        let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        let place = self.layout.figure(&figure).filter(|place| place.image.contains(at))?;
+        Some((figure, place.badge.is_some_and(|badge| pictures::pressed(badge, at))))
+    }
+
+    /// A point of the page area as the layout counts it.
+    fn in_layout(&self, at: Point) -> Point {
+        Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP }
+    }
+
+    /// The gallery a picture is one of.
+    fn gallery_of(&self, figure: &BlockId) -> Option<&Block> {
+        let holds = |block: &&Block| {
+            let gallery = matches!(block.kind, BlockKind::Gallery { .. });
+            gallery && block.body.blocks().iter().any(|part| part.id == *figure)
+        };
+        self.editor.doc().walk().find(holds)
+    }
+
+    /// The selected picture and its place, when it stands alone. One of a gallery takes its size from its
+    /// row, so it has no corners to be resized by.
+    fn lone_picture(&self) -> Option<(BlockId, Rect)> {
+        let figure = self.editor.picture().filter(|figure| self.gallery_of(figure).is_none())?;
+        Some((figure.clone(), self.layout.figure(figure)?.image))
+    }
+
+    /// The figure the line under a picture is about: the one whose picture is selected, or one with the
+    /// selection in its caption.
+    fn captioned(&self) -> Option<&BlockId> {
+        let selection = self.editor.selection()?;
+        let within = selection.anchor.block == selection.head.block;
+        let figure = self.editor.doc().block(&selection.head.block).filter(|block| within && is_figure(block))?;
+        Some(&figure.id)
+    }
+
+    /// The line under a figure's picture, and the block that holds what is written there: the figure
+    /// itself, or the caption of its gallery once it has one.
+    fn caption_of(&self, figure: &BlockId) -> Option<(Rect, Option<&Block>)> {
+        let line = self.layout.figure(figure)?.caption;
+        let holder = match self.gallery_of(figure) {
+            Some(gallery) => gallery.body.blocks().iter().find(|part| part.kind == BlockKind::Caption),
+            None => self.editor.doc().block(figure),
+        };
+        Some((line, holder))
+    }
+
+    /// The size captions are written at and how they are aligned, as the document's style has them.
+    fn caption_text(&self) -> (f32, TextAlign) {
+        let style = self.editor.model().style().types.get("caption");
+        style.map_or((tokens::TEXT_SM, TextAlign::Start), |style| (style.size * PT, style.align))
+    }
+
+    /// The line under the selected picture while nothing is written or numbered there, and where on it
+    /// the hint to write a caption stands.
+    fn hint(&self) -> Option<(Rect, Rect)> {
+        let figure = self.editor.picture()?;
+        let (line, holder) = self.caption_of(figure)?;
+        let numbers = self.gallery_of(figure).or_else(|| self.editor.doc().block(figure));
+        let numbered = numbers.is_some_and(|block| {
+            matches!(block.kind, BlockKind::Figure { numbered: true, .. } | BlockKind::Gallery { numbered: true })
+        });
+        if numbered || holder.is_some_and(|block| !block.plain_text().is_empty()) {
+            return None;
+        }
+        // The caret of an empty caption is where its first letter goes.
+        let first = holder.and_then(|block| self.layout.caret(&Pos::new(block.id.clone(), 0)));
+        let (size, align) = self.caption_text();
+        Some((line, captions::hint_at(line, first, CAPTION_INSET, size, align, self.shaper.as_ref())))
+    }
+
+    /// The figure whose alt text the switch under it turns to, the line under its picture and where the
+    /// switch stands at the end of that line.
+    fn alt_switch(&self) -> Option<(&BlockId, Rect, Rect)> {
+        let figure = self.captioned()?;
+        let (line, holder) = self.caption_of(figure)?;
+        let first = holder.and_then(|block| self.layout.caret(&Pos::new(block.id.clone(), 0)));
+        let first = first.map_or((line.y, line.height), |caret| (caret.y, caret.height));
+        Some((figure, line, captions::switch_at(line, first, self.shaper.as_ref())))
+    }
+
+    /// Turns the line under a picture to its alt text, and puts away what else hangs from the page.
+    fn alter(&mut self, figure: BlockId) {
+        let Some(BlockKind::Figure { alt, .. }) = self.editor.doc().block(&figure).map(|block| &block.kind) else {
+            return;
+        };
+        self.captions.alt = Some((figure, alt.clone()));
+        (self.link, self.spelling.fix, self.linked.open) = (None, None, None);
+    }
+
+    /// Does what the tools over a selection, the field of a comment, a marker in the margin, a note that
+    /// is open or the panel of them all asked.
+    fn noting(&mut self, asked: Noting, platform: &mut dyn Platform) {
+        // Notes say when they were written against the time one of them was last asked about.
+        self.margin.now = platform.wall_time().map(notes::stamp).unwrap_or_default();
+        let opens = matches!(asked, Noting::Open(_) | Noting::Press(_));
+        match asked {
+            // What is typed changes nothing but itself.
+            Noting::Draft(text) => return self.margin.typed(text),
+            Noting::Reply(text) => return self.margin.reply(text),
+            Noting::Away => self.margin.put_away(self.editor.selection()),
+            Noting::Write => {
+                self.margin.write(self.editor.model(), self.editor.selection());
+                (self.link, self.spelling.fix, self.linked.open, self.captions.alt) = (None, None, None, None);
+            }
+            Noting::Drop => self.margin.drop_draft(),
+            Noting::Send => {
+                let created = notes::stamp(platform.wall_time().unwrap_or(0));
+                if self.margin.send(self.editor.model(), platform.new_id(), created) {
+                    // A comment is kept with the document, so it is something to save.
+                    self.edits += 1;
+                }
+            }
+            Noting::Open(id) => {
+                self.margin.read(&id);
+                self.show_note();
+            }
+            Noting::Press(block) => self.margin.press(&block),
+            Noting::Close => self.margin.close(),
+            Noting::Show(kind) => self.margin.filter = kind,
+            // A reply, and a note that is resolved, are kept with the document as a comment is.
+            Noting::Answer => {
+                let created = notes::stamp(platform.wall_time().unwrap_or(0));
+                self.edits += u64::from(self.margin.answer(created));
+            }
+            Noting::Resolve => self.edits += u64::from(self.margin.resolve()),
+            Noting::ResolveImports => self.edits += u64::from(self.margin.resolve_imports()),
+        }
+        if opens && self.margin.reading().is_some() {
+            (self.link, self.spelling.fix, self.linked.open, self.captions.alt) = (None, None, None, None);
+        }
+        // Once a comment is kept or dropped, the tools wait for another selection.
+        if self.margin.writing().is_none() {
+            self.margin.put_away(self.editor.selection());
+        }
+        self.margin.remark(self.editor.doc());
+    }
+
+    /// The first and the last line of the passage a note is about, in the layout's coordinates: of its
+    /// stretch of text, or the first line of the block it is on as a whole. `None` once its block is gone.
+    fn note_lines(&self, note: &Note) -> Option<(Rect, Rect)> {
+        if let Some(passage) = notes::stretch(&note.anchor) {
+            let lines = self.layout.selection(&passage);
+            return Some((*lines.first()?, *lines.last()?));
+        }
+        let block = self.editor.doc().block(&note.anchor.block)?;
+        if let Some(figure) = self.layout.figure(&block.id) {
+            return Some((figure.image, figure.image));
+        }
+        let mut texts = Vec::new();
+        written(block, &mut texts);
+        let start = Pos::new(texts.first()?.id.clone(), 0);
+        let from = self.layout.caret(&start)?;
+        let to = self.layout.line_edge(&start, true).and_then(|end| self.layout.caret(&end));
+        let line = Rect { width: to.map_or(0.0, |to| (to.x - from.x).max(0.0)), ..from };
+        Some((line, line))
+    }
+
+    /// Brings the passage of the note that is open into view, as opening it from the panel asks. One that
+    /// shows whole stays where it is.
+    fn show_note(&mut self) {
+        // Twice, since laying out what comes into view can move the passage.
+        for _ in 0..2 {
+            let lines = self.margin.reading().and_then(|(note, _)| self.note_lines(note));
+            let Some((first, last)) = lines else { return };
+            let (top, bottom, view) = (first.y, last.y + last.height, self.viewport());
+            if top >= view.y && bottom <= view.y + view.height {
+                break;
+            }
+            // A quarter of the way down, the note has the rest of the page to hang in.
+            self.scroll = (top + TOP - self.height / 4.0).clamp(0.0, self.max_scroll());
+            self.layout.settle(self.viewport(), 0);
+        }
+    }
+
+    /// The first line of a block that has a marker, in the layout's coordinates, while the block's start
+    /// is in view.
+    fn marked_line(&self, marker: &threads::Marker, view: Rect) -> Option<Rect> {
+        let line = match (self.layout.figure(&marker.block), &marker.first) {
+            (Some(figure), _) => Rect { height: 0.0, ..figure.image },
+            (None, Some((text, long))) => {
+                // Only text that shows is asked where it is: asking lays it out, and text laid out above
+                // the view moves the page.
+                let (start, end) = (Pos::new(text.clone(), 0), Pos::new(text.clone(), *long));
+                let all = Selection { anchor: start.clone(), head: end };
+                if *long > 0 && self.layout.selection_in(&all, view).is_empty() {
+                    return None;
+                }
+                self.layout.caret(&start)?
+            }
+            (None, None) => return None,
+        };
+        (line.y + line.height >= view.y && line.y <= view.y + view.height).then_some(line)
+    }
+
+    /// The markers in view, each with where it stands in the layout's coordinates.
+    fn markers(&self) -> Vec<(&threads::Marker, Rect)> {
+        let view = self.viewport();
+        let (column, room) = (self.column.1, self.column.0);
+        let placed = |marker| {
+            let line = self.marked_line(marker, view)?;
+            Some((marker, threads::place(marker, line, column, room, self.shaper.as_ref())))
+        };
+        self.margin.marks().iter().filter_map(placed).collect()
+    }
+
+    /// The block whose marker is at a point of the layout.
+    fn marker_at(&self, spot: Point) -> Option<BlockId> {
+        let on = self.markers().into_iter().find(|(_, at)| threads::pressed(*at, spot));
+        on.map(|(marker, _)| marker.block.clone())
+    }
+
+    /// The tools over a selected stretch of text, once it is selected: over its first line, or under its
+    /// last when there is no room above. `origin` is where the layout's origin is in the page area.
+    fn selection_tools(&self, origin: Point, viewport: Rect) -> Option<Popover<Message>> {
+        let selection = self.editor.selection().filter(|selection| !selection.is_caret())?;
+        if self.dragging || !self.margin.offers() || self.commands.open() {
+            return None;
+        }
+        notes::passage(self.editor.doc(), selection)?;
+        let lines = self.layout.selection_in(selection, viewport);
+        let (first, last) = (lines.first()?, lines.last()?);
+        let above = origin.y + first.y >= notes::TOOLS_ROOM;
+        let from = if above { first } else { last };
+        let spot = Rect { x: origin.x + from.x, y: origin.y + from.y, ..*from };
+        Some(Margin::tools(self.editor.link().is_some(), above).at(spot))
+    }
+
+    /// Does what the field of a picture's alt text asked.
+    fn altering(&mut self, asked: Altering, platform: &mut dyn Platform) {
+        match asked {
+            Altering::Open => {
+                if let Some(figure) = self.captioned().cloned() {
+                    self.reveal();
+                    self.alter(figure);
+                }
+            }
+            Altering::Draft(text) => {
+                if let Some((_, typed)) = &mut self.captions.alt {
+                    *typed = text;
+                }
+            }
+            Altering::Drop => self.captions.alt = None,
+            Altering::Apply => {
+                let Some((figure, typed)) = self.captions.alt.take() else { return };
+                let typed = typed.trim().to_owned();
+                let before = match self.editor.doc().block(&figure).map(|block| &block.kind) {
+                    Some(BlockKind::Figure { alt, .. }) => alt,
+                    _ => return,
+                };
+                // Only for the picture the line is still about, and only what says something else.
+                if self.captioned() == Some(&figure) && *before != typed {
+                    self.edit(platform, |editor, platform| editor.run(Command::SetAlt(typed), platform));
+                }
+            }
+        }
+    }
+
+    /// Where the picture that is carried would land if it were let go at a point of the page area, and the
+    /// bar that says so. Nowhere when that is where it is.
+    fn carried_to(&self, at: Point) -> Option<(Spot, Option<Rect>)> {
+        let moved = &self.grip.moving.as_ref().filter(|moving| moving.carried().is_some())?.figure;
+        let alone = self.gallery_of(moved).is_none();
+        self.spot(at).filter(|(spot, _)| match spot {
+            Spot::Beside { figure, .. } => figure != moved,
+            // A picture of a gallery leaves it for a line of its own.
+            Spot::Line { block, .. } => !alone || block != moved,
+        })
+    }
+
+    /// Draws a picture small where the pointer carries it, in the page area.
+    fn carry(&self, image: Rect, at: Point, out: &mut DisplayList) {
+        let (rect, by) = figures::carried(image, at);
+        let color = |ink| resolve(ink, self.scheme, 1.0);
+        let radius = tokens::RADIUS_SM;
+        for shadow in tokens::SHADOW_OVERLAY {
+            let offset = Point { x: shadow.x, y: shadow.y };
+            out.push(Item::Shadow { rect, color: color(shadow.color), blur: shadow.blur, offset, radius });
+        }
+        // The picture is what the layout paints where the figure is, made small.
+        let mut picture = DisplayList::default();
+        self.layout.paint(image, &mut picture);
+        pictures::awaited(&self.images, self.scheme, &mut picture);
+        out.push(Item::PushClip { rect, radius });
+        out.push(Item::Fill { rect, color: self.palette.page, radius: 0.0 });
+        let first = out.items.len();
+        out.items.extend(picture.items);
+        out.translate(first, Point { x: -image.x, y: -image.y });
+        out.scale(first, by);
+        out.translate(first, Point { x: rect.x, y: rect.y });
+        out.push(Item::PopClip);
+        out.push(Item::Stroke { rect, color: color(tokens::SURFACE), width: 2.0, radius });
+    }
+
+    /// Opens the menu on a linked picture's cloud, and puts away what else hangs from the page.
+    fn link_menu(&mut self, figure: BlockId) {
+        (self.link, self.spelling.fix, self.captions.alt) = (None, None, None);
+        self.linked.open = Some(figure);
+    }
+
+    /// Does what the menu on a linked picture's cloud asked, which is the shell's to do.
+    fn linking(&mut self, asked: Linking) {
+        if asked == Linking::EmbedAll {
+            return self.embed_all();
+        }
+        // The picture whose menu is out, or the selected one when a command asks.
+        let Some(figure) = self.linked.open.take().or_else(|| self.editor.picture().cloned()) else { return };
+        let Some(src) = self.link_of(&figure).map(str::to_owned) else { return };
+        match asked {
+            Linking::Load => self.requests.push(Request::LoadPicture(src)),
+            Linking::Trust => {
+                self.linked.trust(&src);
+                self.requests.push(Request::TrustPictures(src));
+                self.ask_again(false);
+            }
+            Linking::Embed => self.requests.push(Request::EmbedPicture { figure, src }),
+            Linking::Close | Linking::EmbedAll => {}
+        }
+    }
+
+    /// Asks the shell to keep every linked picture in the document. Those that safe mode holds back stay
+    /// links, since nothing is fetched for a document that is not trusted.
+    fn embed_all(&mut self) {
+        let free = |src: &&str| self.linked.said(src) != Some(&PictureState::Held);
+        let link = |block: &Block| Some((block.id.clone(), pictures::link(block).filter(free)?.to_owned()));
+        let links: Vec<(BlockId, String)> = self.editor.doc().walk().filter_map(link).collect();
+        for (figure, src) in links {
+            self.requests.push(Request::EmbedPicture { figure, src });
+        }
+    }
+
+    /// Whether the figure the caret is on or in carries a number, or the gallery it is one of does.
+    fn numbered(&self) -> Option<bool> {
+        let figure = self.captioned()?;
+        match self.gallery_of(figure).or_else(|| self.editor.doc().block(figure))?.kind {
+            BlockKind::Figure { numbered, .. } | BlockKind::Gallery { numbered } => Some(numbered),
+            _ => None,
+        }
+    }
+
+    /// Whether the first row of the caret's table is its header.
+    fn header(&self) -> Option<bool> {
+        match self.editor.doc().block(&self.editor.cell()?.table)?.kind {
+            BlockKind::Table { header, .. } => Some(header),
+            _ => None,
+        }
+    }
+
+    /// What a command asks for where the caret is now, or `None` while it has nothing to act on.
+    fn asked(&self, act: &Act) -> Option<Message> {
+        let editor = &self.editor;
+        let picture = editor.picture();
+        let in_text = editor.selection().is_some() && picture.is_none();
+        // The selected picture's address while it is a link that safe mode does not hold back.
+        let held = |src: &str| self.linked.said(src) == Some(&PictureState::Held);
+        let link = picture.and_then(|figure| self.link_of(figure)).filter(|src| !held(src));
+        // One place along a row or column of `count`, if there is one that way.
+        let beside = |at: usize, count: usize, on: bool| {
+            if on { Some(at + 1).filter(|to| *to < count) } else { at.checked_sub(1) }
+        };
+        let message = match act {
+            Act::Run(command) => {
+                // The editor says where a command applies. One that turns something on or off is listed
+                // for the way it would turn it, and a picture is no text to make a heading of.
+                let fits = match command {
+                    Command::Table(TableEdit::Header(on)) => self.header() == Some(!on),
+                    Command::SetNumbered(on) => self.numbered() == Some(!on),
+                    Command::SetBlock(_) => in_text,
+                    _ => true,
+                };
+                (fits && editor.applies(command)).then(|| Message::Run(command.clone()))?
+            }
+            Act::MoveRow { down } => {
+                let cell = editor.cell()?;
+                Message::Run(Command::Table(TableEdit::MoveRow { to: beside(cell.row, cell.rows, *down)? }))
+            }
+            Act::MoveColumn { right } => {
+                let cell = editor.cell()?;
+                Message::Run(Command::Table(TableEdit::MoveColumn { to: beside(cell.column, cell.columns, *right)? }))
+            }
+            Act::Link => in_text.then_some(Message::EditLink)?,
+            Act::Comment => {
+                let selection = editor.selection().filter(|selection| !selection.is_caret())?;
+                notes::passage(editor.doc(), selection).map(|_| Message::Note(Noting::Write))?
+            }
+            Act::Pictures => Message::Ask(Request::Pictures),
+            Act::AltText => self.captioned().map(|_| Message::Alt(Altering::Open))?,
+            Act::Load => {
+                let waits = |src: &&str| self.linked.said(src).is_none_or(|state| *state != PictureState::Loading);
+                let src = link.filter(waits).filter(|src| self.images.get(src).is_none());
+                src.map(|_| Message::Linked(Linking::Load))?
+            }
+            Act::AlwaysLoad => link.filter(|src| !self.linked.vouched(src)).map(|_| Message::Linked(Linking::Trust))?,
+            Act::Embed => link.map(|_| Message::Linked(Linking::Embed))?,
+            Act::EmbedAll => {
+                let any = editor.doc().walk().filter_map(pictures::link).any(|src| !held(src));
+                any.then_some(Message::Linked(Linking::EmbedAll))?
+            }
+            Act::Panel(panel) => Message::Panel(*panel),
+            Act::NewDocument => Message::NewDocument,
+            Act::Open => Message::OpenDialog,
+            Act::Rename => Message::Rename(Rename::Open),
+            Act::SaveCopy => Message::Copy(Copying::Open(CopyFormat::Letters)),
+            Act::Export => Message::Copy(Copying::Open(CopyFormat::Pdf)),
+            Act::Share => Message::Share(true),
+            Act::Settings => Message::Settings(Setting::Show),
+            Act::PageSetup => Message::Styles(Styling::PageSetup),
+            Act::TrustDocument => self.safe.on().then_some(Message::Safe(Safely::TrustDocument))?,
+            Act::TrustFolder => self.safe.folder().then_some(Message::Safe(Safely::TrustFolder))?,
+            // A card over the window is answered first: there is no document to act on behind it.
+            Act::Print => (!self.carded()).then_some(Message::Print(Printing::Show))?,
+            Act::Palette => (!self.carded()).then_some(Message::Commands(Commanding::Toggle))?,
+        };
+        Some(message)
+    }
+
+    /// Whether a card lies over the window that has to be answered before there is a document to act on.
+    fn carded(&self) -> bool {
+        self.landing.is_some() || self.importing.is_some()
+    }
+
+    /// Gives the window back to the page when a card has come to lie over it.
+    fn uncover(&mut self) {
+        if self.carded() {
+            self.printing = None;
+        }
+    }
+
+    /// Does what is asked of Print view.
+    fn print(&mut self, asked: Printing, platform: &mut dyn Platform) {
+        match asked {
+            Printing::Show if self.printing.is_some() || self.carded() => {}
+            Printing::Show => {
+                // What hangs from the page waits there for the way back. What lies over the window goes.
+                self.commands.close();
+                self.sharing = false;
+                if self.grip.release() {
+                    self.drop = None;
+                }
+                self.dragging = false;
+                self.unpoint();
+                let reading = self.layout.hit(Point { x: 0.0, y: self.viewport().y.max(0.0) });
+                self.printing = Some(Print::new(reading));
+                // The nodes that stand for the blocks go with the page, and are told whole when it is back.
+                self.told.get_mut().forget();
+            }
+            Printing::Back => self.printing = None,
+            Printing::Zoom(zoom) => self.printing.iter_mut().for_each(|print| print.zoom(zoom)),
+            Printing::Scroll(delta) => self.printing.iter_mut().for_each(|print| print.scroll(delta)),
+            Printing::Print => self.requests.push(Request::Print),
+            Printing::Down(at) => self.printing.iter_mut().for_each(|print| print.press(at)),
+            Printing::Up(at) => {
+                if let Some(asked) = self.printing.as_mut().and_then(|print| print.release(at)) {
+                    self.break_pages(asked, platform);
+                }
+            }
+        }
+    }
+
+    /// Makes pages start with blocks, or no longer start there, as Print view asked. Each is an edit that
+    /// undo takes back. The page is not brought to its caret for it: nothing of a break shows there.
+    fn break_pages(&mut self, asked: Breaking, platform: &mut dyn Platform) {
+        for block in asked.blocks {
+            let command = Command::SetPageBreak { block, on: asked.on };
+            let change = self.run(platform, |editor, platform| editor.run(command, platform));
+            self.follow(&change);
+        }
+    }
+
+    /// The sheets of Print view, for the area the page has while it is edited.
+    fn sheets(&mut self, room: Size) -> Element<Message> {
+        // A sheet's text is as wide as its paper leaves between the margins, whatever the window has.
+        let page = &self.editor.model().style().page;
+        let text = ((page.width - page.margin_left - page.margin_right) * PT).max(1.0);
+        if text != self.column.1 {
+            self.layout.update(self.editor.doc(), self.editor.model().style(), text, None);
+            self.column.1 = text;
+            self.highlight(None);
+            self.tell_links(None);
+        }
+        // Paging lays out whatever was still estimated.
+        let pages = self.layout.paginate(&self.editor.model().style().page);
+        self.estimated = false;
+        let Some(print) = self.printing.as_mut() else { return Element::row() };
+        let paged = Paged { doc: self.editor.doc(), layout: &self.layout, pages: &pages };
+        let (mut sheets, awaited) = print.view(paged, room, &self.images, self.shaper.as_ref(), self.scheme);
+        for asset in awaited {
+            if self.wanted.insert(asset.clone()) {
+                self.requests.push(Request::Asset(asset));
+            }
+        }
+        if let Some(copy) = &self.copying {
+            sheets = sheets.popover(copy.card(&self.location, room));
+        }
+        sheets
+    }
+
+    /// What a key does while Print view shows: it moves through the sheets, prints, takes a change back
+    /// or goes back to editing. Nothing is written there.
+    fn print_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        if event.key == Key::Escape {
+            self.print(Printing::Back, platform);
+            return true;
+        }
+        if self.printing.as_mut().is_some_and(|print| print.key(event)) {
+            return true;
+        }
+        // A change to the page is an edit, which undo takes back from here too.
+        let command =
+            self.editor.keymap().command(event).filter(|command| matches!(command, Command::Undo | Command::Redo));
+        if let Some(command) = command.cloned() {
+            self.edit(platform, |editor, platform| editor.run(command, platform));
+            return true;
+        }
+        let asked = match commands::bound(event) {
+            Some(Act::Print) => Some(Message::Print(Printing::Print)),
+            Some(act @ (Act::Settings | Act::SaveCopy)) => self.asked(act),
+            _ => None,
+        };
+        let bound = asked.is_some();
+        if let Some(message) = asked {
+            self.update(message, platform);
+        }
+        bound
+    }
+
+    /// The commands the palette lists: those that what is typed finds and that have something to act on,
+    /// each with what it asks.
+    fn offers(&self) -> Vec<(&'static Entry, Message)> {
+        self.commands.matching().filter_map(|entry| Some((entry, self.asked(&entry.act)?))).collect()
+    }
+
+    /// Does what the command palette asked. A command that is taken is done as if its key were pressed.
+    fn commanding(&mut self, asked: Commanding, platform: &mut dyn Platform) {
+        let taken = match asked {
+            Commanding::Toggle => return self.commands.toggle(),
+            Commanding::Close => return self.commands.close(),
+            Commanding::Type(typed) => return self.commands.typed(typed),
+            Commanding::Step { down } => return self.commands.step(down, self.offers().len()),
+            Commanding::Take(index) => Some(index),
+            Commanding::Enter => None,
+        };
+        let mut offers = self.offers();
+        let taken = taken.unwrap_or_else(|| self.commands.picked(offers.len()));
+        self.commands.close();
+        if taken < offers.len() {
+            self.update(offers.swap_remove(taken).1, platform);
+        }
+    }
+
+    /// Tells the shell again of each linked picture that does not show, since what it held back may load
+    /// now. With `freed` the document has left safe mode, which no longer holds any of them.
+    fn ask_again(&mut self, freed: bool) {
+        let links = self.editor.doc().walk().filter_map(pictures::link);
+        let held: BTreeSet<String> = links.filter(|src| self.images.get(src).is_none()).map(str::to_owned).collect();
+        for src in held {
+            if freed && self.linked.said(&src) == Some(&PictureState::Held) {
+                self.linked.say(&src, None);
+            }
+            self.requests.push(Request::LinkedPicture(src));
+        }
+    }
+
+    /// Does what the safe mode bar, a link or the card about a link asked, most of which is the shell's
+    /// to do.
+    fn safely(&mut self, asked: Safely) {
+        match asked {
+            Safely::TrustDocument => self.requests.push(Request::TrustDocument),
+            Safely::TrustFolder => self.requests.push(Request::TrustFolder),
+            Safely::Hide => self.safe.hide(true),
+            Safely::Show => self.safe.hide(false),
+            Safely::Follow(href) => {
+                self.link = None;
+                self.open_link(&href, false);
+            }
+            Safely::Confirm => {
+                if let Some(href) = self.safe.confirm() {
+                    self.open_link(&href, true);
+                }
+            }
+            Safely::Leave => self.safe.leave(),
+        }
+    }
+
+    /// Asks the shell to open a link. A place in this document is not the shell's to open.
+    fn open_link(&mut self, href: &str, confirmed: bool) {
+        let href = href.trim();
+        if !href.is_empty() && !href.starts_with('#') {
+            self.requests.push(Request::OpenLink { href: href.to_owned(), confirmed });
+        }
+    }
+
+    /// The address of the link at a point of the page area, while nothing hangs over the page.
+    fn link_at(&self, at: Point) -> Option<String> {
+        if self.hung() {
+            return None;
+        }
+        safe::link_at(self.editor.doc(), &self.layout, self.in_layout(at))
+    }
+
     /// Shows the Markdown markers that belong where the caret now is, after anything that may have moved it.
     /// A change fades in. It shows at once when motion is reduced, and while an input method composes, whose
     /// text must not slide under its window.
     fn mark(&mut self) {
         let head = self.editor.selection().map(|selection| selection.head.clone());
-        let markers = self.editor.markers();
+        let mut markers = self.editor.markers();
+        // A formula's source is on its sheet, so nothing on the page has to say where it begins and ends.
+        let dollar = |marker: &Marker| marker.text == "$";
+        markers.before_caret -= markers.inline[..markers.before_caret].iter().filter(|marker| dollar(marker)).count();
+        markers.inline.retain(|marker| !dollar(marker));
         let changed = self.layout.reveal(head.as_ref().map(|head| (head, &markers)));
         self.layout.set_composition(self.editor.composition());
         let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
@@ -484,11 +1620,35 @@ impl EditorApp {
         }
     }
 
+    /// The most a row of a formula's source may take across on its sheet, which is no wider than the text.
+    fn wide(&self) -> f32 {
+        Maths::wide(self.column.1, 2.0 * self.column.0 + self.column.1)
+    }
+
     /// Runs something on the editor, which may ask the layout about lines while it works.
     fn edit(&mut self, platform: &mut dyn Platform, act: impl FnOnce(&mut Editor, &mut dyn Platform) -> Change) {
-        let mut lent = Lent { platform, lines: DocLines::new(&self.layout, self.height) };
-        let change = act(&mut self.editor, &mut lent);
+        let change = self.run(platform, act);
         self.changed(&change);
+    }
+
+    /// Lets the editor do something with what the window lends it, and returns what that changed.
+    fn run(
+        &mut self,
+        platform: &mut dyn Platform,
+        act: impl FnOnce(&mut Editor, &mut dyn Platform) -> Change,
+    ) -> Change {
+        // On a sheet the caret moves by the lines of the source, which the page does not show.
+        let wide = self.wide();
+        let source = Source::of(&self.editor, self.shaper.as_ref(), wide);
+        let formula = self.editor.selection().and_then(|selection| self.layout.formula_rect(&selection.head));
+        let left = source.as_ref().zip(formula).map(|(source, rect)| Maths::left(source, rect.x, rect.width, wide));
+        let lines = SheetLines {
+            page: DocLines::new(&self.layout, self.height),
+            source: source.filter(|_| left.is_some()),
+            left: left.unwrap_or_default(),
+        };
+        let mut lent = Lent { platform, lines };
+        act(&mut self.editor, &mut lent)
     }
 
     /// Brings the layout and the viewport up to date after the editor did something.
@@ -499,13 +1659,31 @@ impl EditorApp {
 
     /// Brings the layout up to date with a change to the document, and what is marked on the page with it.
     fn follow(&mut self, change: &Change) {
-        if !change.blocks.is_empty() || change.structure {
-            self.edits += 1;
-            self.layout.update(self.editor.doc(), &self.style, self.column.1, Some(change));
+        let edited = !change.blocks.is_empty() || change.structure;
+        if edited || change.style {
+            // Every block is drawn from the style, so a change to it lays all of them out again.
+            let touched = (!change.style).then_some(change);
+            self.layout.update(self.editor.doc(), self.editor.model().style(), self.column.1, touched);
             self.estimated = true;
+        }
+        if edited {
+            // What the pointer rested on may be gone, or somewhere else.
+            self.unpoint();
             self.highlight((!change.structure).then_some(&change.blocks));
+            self.tell_links((!change.structure).then_some(&change.blocks));
+            // A picture that was held may be gone, or another size.
+            if self.grip.release() {
+                self.drop = None;
+            }
             let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
             self.spelling.edited(change, self.editor.doc(), caret, &mut self.layout);
+            self.margin.edited(self.editor.model());
+        }
+        if change.document {
+            self.spelling.reworded(None, self.editor.doc(), &mut self.layout);
+        }
+        if edited || change.style || change.document {
+            self.edits += 1;
         }
         self.mark();
     }
@@ -558,20 +1736,221 @@ impl EditorApp {
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
     }
 
-    /// The text position under a point of the page area.
+    /// The text position under a point of the page area, while the page shows there.
     fn hit(&self, at: Point) -> Option<Pos> {
+        if self.printing.is_some() {
+            return None;
+        }
         self.layout.hit(Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP })
+    }
+
+    /// Whether something hangs over the page and takes what the pointer does there.
+    fn hung(&self) -> bool {
+        let card = self.landing.is_some() || self.importing.is_some() || self.copying.is_some();
+        let asked = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
+        let asked = asked || self.captions.alt.is_some() || self.margin.writing().is_some();
+        let asked = asked || self.margin.reading().is_some();
+        let asked = asked || self.commands.open();
+        card || asked || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
+    }
+
+    /// The code block whose box is at a point of the page area, and whether the point is on its copy
+    /// button, while nothing hangs over the page.
+    fn code_at(&self, at: Point) -> Option<(BlockId, bool)> {
+        if self.hung() {
+            return None;
+        }
+        let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        let boxes = self.layout.code_boxes(Rect::new(at.x, at.y, 0.0, 1.0));
+        let (block, code) = boxes.into_iter().find(|(_, code)| code.contains(at))?;
+        Some((block, code_copy::button(code).contains(at)))
+    }
+
+    /// The code block whose copy button is at a point of the page area.
+    fn copy_button(&self, at: Point) -> Option<BlockId> {
+        self.code_at(at).filter(|(_, on)| *on).map(|(block, _)| block)
+    }
+
+    /// Puts a code block's text on the clipboard as it is written, and has its button say so.
+    fn copy_code(&mut self, block: BlockId, platform: &mut dyn Platform) {
+        let Some(code) = self.editor.doc().block(&block) else { return };
+        platform.clipboard_write(Clip { text: code.plain_text(), ..Clip::default() });
+        self.code_copy.copied(block, platform.now_ms());
+    }
+
+    /// Whether the first line a code block shows runs as far as the copy button at `button`, in the layout.
+    fn reaches(&self, block: &BlockId, button: Rect) -> bool {
+        let end = self.layout.line_edge(&Pos::new(block.clone(), 0), true);
+        let end = end.and_then(|end| self.layout.caret(&end));
+        end.is_some_and(|end| end.x + code_copy::CLEAR > button.x)
+    }
+
+    /// The reference to a figure at a point of the page area, while nothing hangs over the page.
+    fn reference(&self, at: Point) -> Option<Reference> {
+        if self.hung() {
+            return None;
+        }
+        let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        Reference::at(self.editor.doc(), &self.layout, at)
+    }
+
+    /// Whether enough of a figure's picture is in view to tell it by: half of it, or of the page area.
+    fn in_view(&self, figure: &BlockId) -> bool {
+        let Some(picture) = self.layout.figure(figure).map(|figure| figure.image) else { return false };
+        let view = self.viewport();
+        let shown = (picture.y + picture.height).min(view.y + view.height) - picture.y.max(view.y);
+        shown >= picture.height.min(view.height) / 2.0
+    }
+
+    /// Where a figure's picture is in the layout, and each picture of a gallery by itself.
+    fn pictures(&self, figure: &BlockId) -> Option<(Rect, Vec<Rect>)> {
+        let whole = self.layout.figure(figure)?.image;
+        let parts = self.editor.doc().block(figure).map_or(&[][..], |block| block.body.blocks());
+        let parts = parts.iter().filter(|part| matches!(part.kind, BlockKind::Figure { .. }));
+        let each: Vec<Rect> = parts.filter_map(|part| Some(self.layout.figure(&part.id)?.image)).collect();
+        Some((whole, if each.is_empty() { vec![whole] } else { each }))
+    }
+
+    /// Works out again which reference or linked picture the pointer rests on, after it or the page under
+    /// it has moved. Returns whether what shows changed with it.
+    fn repoint(&mut self) -> bool {
+        let code = self.references.rest().and_then(|at| self.code_at(at));
+        let copy = self.code_copy.point(code);
+        // The button covers what is under it, a reference too.
+        let found = self.references.rest().filter(|_| !self.code_copy.pointed()).and_then(|at| self.reference(at));
+        let found = found.map(|reference| {
+            let in_view = self.in_view(&reference.target);
+            (reference, in_view)
+        });
+        let linked = self.references.rest().and_then(|at| self.linked_at(at));
+        // Each is taken, whichever changed.
+        let clouded = self.linked.point(linked);
+        let corner = self.references.rest().filter(|_| !self.hung()).and_then(|at| {
+            let (_, image) = self.lone_picture()?;
+            figures::corner_at(image, self.in_layout(at))
+        });
+        let gripped = std::mem::replace(&mut self.grip.over, corner) != corner;
+        let over = self.references.rest().filter(|_| !self.hung()).is_some_and(|at| {
+            self.alt_switch().is_some_and(|(_, _, switch)| captions::pressed(switch, self.in_layout(at)))
+        });
+        let switched = std::mem::replace(&mut self.captions.over, over) != over;
+        let rest = self.references.rest().filter(|_| !self.hung());
+        let marker = rest.and_then(|at| self.marker_at(self.in_layout(at)));
+        let marked = self.margin.over != marker;
+        self.margin.over = marker;
+        self.references.point(found) || copy || clouded || gripped || switched || marked
+    }
+
+    /// Forgets where the pointer rests until it next moves, as when the person goes on writing.
+    fn unpoint(&mut self) {
+        self.references.set_rest(None);
+        self.repoint();
+    }
+
+    /// Brings a figure into view, as a press on a reference to it asks: to the middle of the page area
+    /// with its caption, or under the top when it is too tall for that. One that shows whole stays where it
+    /// is. The caret stays at the reference, so the next key goes on from there.
+    fn show_figure(&mut self, figure: &BlockId) {
+        // Twice, since laying out what comes into view can move the figure.
+        for _ in 0..2 {
+            let Some(at) = self.layout.figure(figure) else { return };
+            let (top, bottom) = (at.image.y, at.caption.y + at.caption.height);
+            let view = self.viewport();
+            if top >= view.y && bottom <= view.y + view.height {
+                break;
+            }
+            let above = ((self.height - (bottom - top)) / 2.0).max(GUTTER.min(self.height / 4.0));
+            self.scroll = (top + TOP - above).clamp(0.0, self.max_scroll());
+            self.layout.settle(self.viewport(), 0);
+        }
+        self.references.flash(figure);
     }
 
     fn pointer(&mut self, event: Pointer, platform: &mut dyn Platform) {
         match event {
             Pointer::Down { at, mods, clicks } => {
+                self.picked = None;
+                self.maths.typed(false);
+                // A press on a marker in the margin is about the notes of its block, and leaves the caret
+                // where it is.
+                if let Some(block) = self.marker_at(self.in_layout(at)) {
+                    self.dragging = false;
+                    self.references.press(None);
+                    return self.noting(Noting::Press(block), platform);
+                }
+                self.margin.forget();
+                // A press on a copy button is the button's, and leaves the caret where it is.
+                let button = self.copy_button(at);
+                self.code_copy.press(button);
+                if self.code_copy.held() {
+                    self.dragging = false;
+                    return self.references.press(None);
+                }
+                // A press on a corner of the selected picture takes hold of it.
+                let spot = self.in_layout(at);
+                if let Some((figure, image)) = self.lone_picture()
+                    && let Some(corner) = figures::corner_at(image, spot)
+                {
+                    self.grip.resizing = Some(Resizing::start(figure, image, corner, spot));
+                    self.dragging = false;
+                    return self.references.press(None);
+                }
+                // A press on the switch at the end of the line under a picture turns that line to the alt
+                // text, and one on a line that offers a caption starts it.
+                if let Some((figure, _, switch)) = self.alt_switch()
+                    && captions::pressed(switch, spot)
+                {
+                    let figure = figure.clone();
+                    self.dragging = false;
+                    self.references.press(None);
+                    return self.alter(figure);
+                }
+                if self.hint().is_some_and(|(line, _)| line.contains(spot)) {
+                    self.dragging = false;
+                    self.references.press(None);
+                    return self.edit(platform, |editor, platform| editor.run(Command::EditCaption, platform));
+                }
+                // A press on a link with Ctrl or Cmd held asks for it to be opened, and leaves the caret be.
+                if let Some(href) = self.link_at(at).filter(|_| mods.primary && !mods.shift && clicks == 1) {
+                    self.dragging = false;
+                    self.references.press(None);
+                    return self.open_link(&href, false);
+                }
+                // A press that stays on a reference follows it. Any other press is the caret's alone.
+                let pressed = self.reference(at).filter(|_| clicks == 1 && !mods.shift);
+                self.references.press(pressed.map(|reference| (reference, at)));
+                // Under the last block there is always a line to write on, also when the document ends in
+                // something that holds the caret in, as a code block does.
+                if at.y + self.scrolled() - TOP > self.layout.height() && !mods.shift {
+                    self.dragging = false;
+                    return self.edit(platform, |editor, platform| editor.run(Command::LineBelow, platform));
+                }
                 let Some(head) = self.hit(at) else { return };
+                // A press on a picture selects its figure. The caption under it is text like any other.
+                let on_page = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+                let figure = self.layout.figure(&head.block).filter(|figure| figure.image.contains(on_page));
+                if let Some(figure) = figure.filter(|_| !mods.shift) {
+                    self.editor.select_picture(&head.block);
+                    self.dragging = false;
+                    // The cloud on a picture that is still a link opens its menu. From anywhere else on it
+                    // the picture can be carried off.
+                    let cloud = figure.badge.is_some_and(|badge| pictures::pressed(badge, on_page));
+                    if cloud && self.link_of(&head.block).is_some() {
+                        self.link_menu(head.block);
+                    } else {
+                        self.grip.moving = Some(Moving::start(head.block, at));
+                    }
+                    return self.reveal();
+                }
                 let anchor = match self.editor.selection() {
                     Some(selection) if mods.shift => selection.anchor.clone(),
                     _ => head.clone(),
                 };
-                self.editor.select(Selection { anchor, head });
+                // The later presses of a double or triple click are about where the first put the caret,
+                // since the text may have moved under the pointer when the caret came to it.
+                if clicks == 1 || mods.shift || self.editor.selection().is_none() {
+                    self.editor.select(Selection { anchor, head });
+                }
                 self.dragging = clicks == 1;
                 match clicks {
                     1 => self.reveal(),
@@ -579,22 +1958,77 @@ impl EditorApp {
                     _ => self.edit(platform, |editor, platform| editor.run(Command::SelectBlock, platform)),
                 }
             }
+            Pointer::Drag { at } if self.grip.resizing.is_some() => {
+                let (spot, widest) = (self.in_layout(at), self.column.1);
+                if let Some(resizing) = &mut self.grip.resizing {
+                    resizing.drag(spot, widest);
+                }
+            }
+            Pointer::Drag { at } if self.grip.moving.is_some() => {
+                if self.grip.moving.as_mut().is_some_and(|moving| moving.drag(at, DRAG_SLOP)) {
+                    self.drop = self.carried_to(at).and_then(|(_, bar)| bar);
+                }
+            }
+            Pointer::Up { .. } if self.grip.resizing.is_some() => {
+                let resized =
+                    self.grip.resizing.take().filter(|resizing| self.editor.picture() == Some(&resizing.figure));
+                if let Some((width, height)) = resized.and_then(|resizing| resizing.size()) {
+                    let size = Command::ResizeFigure { width: width / PT, height: height / PT };
+                    self.edit(platform, |editor, platform| editor.run(size, platform));
+                }
+            }
+            Pointer::Up { at } if self.grip.moving.is_some() => {
+                let spot = self.carried_to(at).map(|(spot, _)| spot);
+                (self.grip.moving, self.drop) = (None, None);
+                if let Some(spot) = spot {
+                    self.edit(platform, |editor, platform| editor.run(Command::MoveFigure(spot), platform));
+                }
+            }
             Pointer::Drag { at } if self.dragging => {
                 let (Some(head), Some(selection)) = (self.hit(at), self.editor.selection()) else { return };
+                // A drag that selects is no longer pointing at anything.
+                if head != selection.anchor {
+                    self.references.point(None);
+                }
                 self.editor.select(Selection { anchor: selection.anchor.clone(), head });
                 // Dragging past an edge scrolls the page after the selection.
                 self.reveal();
             }
             Pointer::Drag { .. } => {}
-            Pointer::Up { .. } => self.dragging = false,
+            Pointer::Up { at } if self.code_copy.held() => {
+                let on = self.copy_button(at);
+                if let Some(block) = self.code_copy.release(on.as_ref()) {
+                    self.copy_code(block, platform);
+                }
+            }
+            Pointer::Up { at } => {
+                self.dragging = false;
+                // The markers at the caret show once the button is up: text that made room for them
+                // under a pointer still held would be selected by its next move.
+                self.mark();
+                let reference = self.reference(at);
+                if let Some(figure) = self.references.followed(at, DRAG_SLOP, reference.as_ref()) {
+                    self.show_figure(&figure);
+                }
+            }
             Pointer::Menu { at } => self.menu(at),
-            Pointer::Scroll { delta } => self.scroll_by(delta.y),
+            Pointer::Scroll { delta } => {
+                self.scroll_by(delta.y);
+                // Another part of the page is under the pointer now.
+                self.repoint();
+            }
         }
     }
 
-    /// Opens the menu about what is at a point of the page area: for now, a word marked as misspelled.
+    /// Opens the menu about what is at a point of the page area: a picture that is still a link, or a word
+    /// marked as misspelled.
     fn menu(&mut self, at: Point) {
         let Some(pos) = self.hit(at) else { return };
+        if self.linked_at(at).is_some() {
+            self.editor.select_picture(&pos.block);
+            self.mark();
+            return self.link_menu(pos.block);
+        }
         let Some(range) = self.layout.spelling_at(&pos) else { return };
         // The word itself was meant, not the room its line leaves beside it.
         let word = Selection {
@@ -706,15 +2140,43 @@ impl EditorApp {
 
     /// Lays the document out for the room it has and paints the part in view.
     fn page(&mut self, room: Size) -> Element<Message> {
-        let page = &self.style.page;
+        let page = &self.editor.model().style().page;
         let text = (page.width - page.margin_left - page.margin_right) * PT;
         let width = text.min(room.width - 2.0 * GUTTER).max(1.0);
         let left = ((room.width - width) / 2.0).max(0.0).round();
         if width != self.column.1 {
-            self.layout.update(self.editor.doc(), &self.style, width, None);
+            self.layout.update(self.editor.doc(), self.editor.model().style(), width, None);
             self.highlight(None);
+            self.tell_links(None);
+        }
+        // A menu whose picture is gone, or is a link no longer, goes with it.
+        if self.linked.open.as_ref().is_some_and(|figure| self.link_of(figure).is_none()) {
+            self.linked.open = None;
+        }
+        // The alt text of a picture the selection has left is no longer being written.
+        if self.captions.alt.as_ref().is_some_and(|(figure, _)| self.captioned() != Some(figure)) {
+            self.captions.alt = None;
+        }
+        // A note that was open goes when something else comes to hang from the page.
+        let other = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
+        if other || self.captions.alt.is_some() {
+            self.margin.shut();
         }
         (self.column, self.height) = ((left, width), room.height);
+        // The line under the picture the selection is at is made ready for its caption, once the button is
+        // up: a caption that made room for its switch under a pointer still held would be selected by its
+        // next move.
+        if !self.dragging {
+            let within = self.editor.selection().filter(|selection| selection.anchor.block == selection.head.block);
+            let named = within.map(|selection| selection.head.block.clone());
+            if named == self.captions.named {
+                self.layout.set_caption_open(named.as_ref());
+            } else {
+                // A line that opens or closes above the view leaves what is read where it is.
+                self.held(|page| page.layout.set_caption_open(named.as_ref()));
+                self.captions.named = named;
+            }
+        }
         // A heading's markers hang in the margin, beside the outline when it shows.
         let taken = if self.outlined() { chapters_width() } else { tokens::SPACE_SM };
         self.layout.set_margin(left - taken);
@@ -723,20 +2185,126 @@ impl EditorApp {
         self.scroll = self.scroll.min(self.max_scroll());
 
         let viewport = self.viewport();
+        let origin = Point { x: left, y: TOP - self.scrolled() };
+        self.insert.follow(&self.editor);
         let mut list = DisplayList::default();
         let selection = self.editor.selection();
-        if let Some(selection) = selection.filter(|selection| !selection.is_caret()) {
-            let color = self.palette.selection;
-            list.items.extend(self.layout.selection_in(selection, viewport).into_iter().map(|rect| fill(rect, color)));
+        // A formula with the caret in it has its source out on a sheet, while the place under it is in view
+        // and nothing else hangs from the page.
+        let alone = self.landing.is_none()
+            && self.importing.is_none()
+            && self.copying.is_none()
+            && self.spelling.fix.is_none()
+            && self.link.is_none();
+        let formula = selection.filter(|_| alone).and_then(|selection| self.layout.formula_rect(&selection.head));
+        let formula = formula.filter(|rect| (0.0..=room.height).contains(&(origin.y + rect.y + rect.height)));
+        let sheet = formula.and_then(|rect| Some((Source::of(&self.editor, self.shaper.as_ref(), self.wide())?, rect)));
+        self.maths.follow(sheet.as_ref().map(|(source, _)| source), self.reduced_motion);
+        self.margin.follow(selection);
+        for (passage, open) in self.margin.commented() {
+            notes::mark(&self.layout.selection_in(&passage, viewport), open, self.scheme, &mut list);
+        }
+        match &sheet {
+            Some((_, rect)) => list.items.push(maths::tint(*rect, self.scheme)),
+            // On a sheet, the sheet shows what is selected.
+            None => {
+                let color = self.palette.selection;
+                let ranged = selection.filter(|selection| !selection.is_caret());
+                let spans = ranged.map(|selection| self.layout.selection_in(selection, viewport)).unwrap_or_default();
+                list.items.extend(spans.into_iter().map(|rect| fill(rect, color)));
+            }
         }
         self.layout.paint(viewport, &mut list);
+        // A picture the shell has not handed over is asked for once, and its place is kept until it comes.
+        for asset in pictures::awaited(&self.images, self.scheme, &mut list) {
+            if self.wanted.insert(asset.clone()) {
+                self.requests.push(Request::Asset(asset));
+            }
+        }
+        // A formula that was just closed still has its source over it, on the way out.
+        match self.maths.closing().map(|at| self.layout.formula_rect(at)) {
+            Some(Some(rect)) => self.maths.blend(rect, self.palette.text, &mut list),
+            Some(None) => self.maths.settle(),
+            None => {}
+        }
 
-        let origin = Point { x: left, y: TOP - self.scrolled() };
-        let caret = selection.and_then(|selection| self.layout.caret(&selection.head));
+        if let Some(bar) = self.drop {
+            list.items.push(Item::Fill { rect: bar, color: resolve(self.accent.base, self.scheme, 1.0), radius: 2.0 });
+        }
+        // Each code block has its copy button in its corner, over its text.
+        for (block, code) in self.layout.code_boxes(viewport) {
+            let button = code_copy::button(code);
+            let behind = self.reaches(&block, button).then_some([self.palette.page, self.palette.code]);
+            self.code_copy.paint(&block, button, behind, self.scheme, &mut list);
+        }
+
+        // Beside each block with open notes is their marker, in the margin.
+        let read = self.margin.reading().map(|(note, _)| note.id.as_str());
+        for (marker, at) in self.markers() {
+            let open = read.is_some_and(|read| marker.notes.iter().any(|note| note == read));
+            let over = self.margin.over.as_ref() == Some(&marker.block);
+            threads::mark(marker, at, (open, over), self.shaper.as_ref(), self.scheme, &mut list);
+        }
+
+        // A figure that is selected has a ring round its picture, and a selected picture is where the caret is.
+        let ring = resolve(accent().base, self.scheme, 1.0);
+        let pictures = self.editor.figures().into_iter().filter_map(|figure| self.layout.figure(&figure));
+        list.items.extend(pictures.map(|figure| {
+            let image = figure.image;
+            let rect = Rect::new(image.x - RING, image.y - RING, image.width + 2.0 * RING, image.height + 2.0 * RING);
+            Item::Stroke { rect, color: ring, width: 2.0, radius: 2.0 }
+        }));
+        // A selected picture that stands alone is resized by its corners, which are drawn as its ring is.
+        let accent = self.accent.base;
+        match (&self.grip.resizing, self.lone_picture()) {
+            (Some(resizing), _) => resizing.paint(accent, self.scheme, &mut list),
+            (None, Some((_, image))) => figures::handles(image, accent, self.scheme, &mut list),
+            (None, None) => {}
+        }
+        // The line under it offers a caption while it has none, and has the switch to its alt text.
+        if let Some((_, hint)) = self.hint() {
+            captions::hint(hint, self.caption_text().0, self.shaper.as_ref(), self.scheme, &mut list);
+        }
+        if let Some((_, _, switch)) = self.alt_switch().filter(|_| self.captions.alt.is_none()) {
+            captions::switch(switch, self.captions.over, self.shaper.as_ref(), self.scheme, &mut list);
+        }
+        // A picture that is carried is faint where it was.
+        let carried = self.grip.moving.as_ref().and_then(|moving| Some((moving.carried()?, &moving.figure)));
+        let carried = carried.and_then(|(at, figure)| Some((at, self.layout.figure(figure)?.image)));
+        if let Some((_, image)) = carried {
+            list.items.push(fill(image, Color { a: 178, ..self.palette.page }));
+        }
+        // A picture that is still a link has its cloud on a chip while it is selected or under the pointer,
+        // and while the shell has something to say of it.
+        for (figure, badge) in self.layout.linked(viewport) {
+            let Some(src) = self.link_of(&figure) else { continue };
+            let (shows, state) = (self.linked.shows(&figure, self.editor.picture()), self.linked.said(src));
+            if shows.is_some() || state.is_some() {
+                pictures::cloud(badge, shows == Some(true), state, self.accent.text, self.scheme, &mut list);
+            }
+        }
+        // The figure a reference under the pointer means, or the one the page was just brought to.
+        let lit = self.references.light().and_then(|(figure, way)| Some((self.pictures(figure)?, way)));
+        match lit {
+            Some(((figure, pictures), Some(way))) => {
+                references::light(figure, &pictures, way, self.scheme, self.scale, &mut list);
+            }
+            Some(((figure, _), None)) => references::mark(figure, self.scheme, &mut list),
+            None => {}
+        }
+        let mut over = DisplayList::default();
+        self.previewed = self.preview(origin, room, &mut over);
+        if let Some((at, image)) = carried {
+            self.carry(image, at, &mut over);
+        }
+
+        let written = sheet.is_none() && self.editor.picture().is_none();
+        let caret = selection.filter(|_| written).and_then(|selection| self.layout.caret(&selection.head));
         let caret =
             caret.map(|caret| Rect { x: origin.x + caret.x, y: origin.y + caret.y, width: CARET_WIDTH, ..caret });
         let paint = PagePaint {
             list,
+            over,
             origin,
             page: self.palette.page,
             content: self.layout.height() + 2.0 * TOP,
@@ -750,9 +2318,30 @@ impl EditorApp {
             .default_focus()
             .caret(caret)
             .on_text(Message::Text)
-            .on_pointer(|event| Some(Message::Pointer(event)));
-        if let Some(landing) = &self.landing {
+            .on_pointer(|event| Some(Message::Pointer(event)))
+            .pointed();
+        if let Some(importing) = &self.importing {
+            element = element.popover(importing.card(room));
+        } else if let Some(landing) = &self.landing {
             element = element.popover(Self::card(landing, room));
+        } else if let Some(copy) = &self.copying {
+            element = element.popover(copy.card(&self.location, room));
+        } else if let Some((figure, src)) =
+            self.linked.open.as_ref().and_then(|figure| Some((figure, self.link_of(figure)?)))
+        {
+            // The menu hangs from the cloud, or from the corner of a picture too small to have one.
+            let from = self.layout.figure(figure).map_or(Rect::default(), |place| {
+                let corner = Rect::new(place.image.x + place.image.width, place.image.y, 0.0, 0.0);
+                place.badge.map_or(corner, pictures::chip)
+            });
+            let spot = Rect { x: origin.x + from.x, y: origin.y + from.y, ..from };
+            let (loaded, said) = (self.images.get(src).is_some(), self.linked.said(src));
+            let menu = pictures::menu(src, loaded, said, self.linked.vouched(src), self.safe.on());
+            let menu = menu.popover().at(spot).align(Align::End);
+            element = element.popover(menu.open(true).on_close(Message::Linked(Linking::Close)));
+        } else if let Some(((_, text), (_, line, switch))) = self.captions.alt.as_ref().zip(self.alt_switch()) {
+            let onto = |rect: Rect| Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect };
+            element = element.popover(captions::sheet(text, onto(line), onto(switch)));
         } else if let Some(fix) = &self.spelling.fix {
             // The menu hangs from the start of its word.
             let start = self.layout.caret(&Pos::new(fix.block.clone(), fix.range.start)).unwrap_or_default();
@@ -764,12 +2353,124 @@ impl EditorApp {
                 .placeholder("Paste or type a link")
                 .on_input(Message::LinkDraft)
                 .on_submit(Message::LinkApply);
-            let editor =
-                Popover::new(Element::from(field).width(300.0)).label("Link").open(true).on_close(Message::LinkClose);
+            // The address in the field can be tried from here, written down or not.
+            let open = Button::icon_only(icon::EXTERNAL_LINK, "Open link")
+                .subtle()
+                .disabled(address.trim().is_empty())
+                .on_press(Message::Safe(Safely::Follow(address.clone())));
+            let row = Element::row().align(Align::Center).gap(tokens::SPACE_XS).width(LINK_WIDTH);
+            let row = row.child(Element::from(field).grow(1.0)).child(open);
+            let editor = Popover::new(row)
+                .label("Link")
+                .max_width(LINK_WIDTH + 2.0 * tokens::SPACE_MD + 2.0)
+                .open(true)
+                .on_close(Message::LinkClose);
             // The editor hangs from the caret, in place.
             element = element.popover(editor.at(caret.unwrap_or_default())).cursor(Cursor::Text);
+        } else if let Some((note, reply)) = self.margin.reading() {
+            // The note hangs under the last line of its passage. One whose text is gone hangs from the
+            // top of the margin its marker stood in.
+            let under =
+                self.note_lines(note).map(|(_, last)| Rect { x: origin.x + last.x, y: origin.y + last.y, ..last });
+            let said = self.said.of(note, threads::SAID, self.palette);
+            let thread = threads::thread(note, reply, said, &self.margin.now, self.margin.refused.as_deref());
+            element = element.popover(match under {
+                Some(under) => thread.at(under),
+                None => thread.at(Rect::new(room.width - GUTTER, GUTTER, 0.0, 0.0)).align(Align::End),
+            });
+        } else if let Some((field, passage)) = self.margin.field().zip(self.margin.writing()) {
+            // The field hangs under the last line of the passage the comment is about.
+            let lines = notes::stretch(passage).map(|passage| self.layout.selection(&passage)).unwrap_or_default();
+            let under = lines.last().copied().unwrap_or_default();
+            element = element.popover(field.at(Rect { x: origin.x + under.x, y: origin.y + under.y, ..under }));
+        } else if let Some((line, _, offers)) = self.insert.offers(&self.editor) {
+            // The menu hangs from the slash that opened it.
+            let slash = self.layout.caret(&Pos::new(line, 0)).unwrap_or_default();
+            let spot = Rect { x: origin.x + slash.x, y: origin.y + slash.y, ..slash };
+            element = element.popover(self.insert.menu(&offers).at(spot));
+        } else if let Some((typed, figures)) = Refer::offers(&self.editor) {
+            // The list hangs from the start of the words typed for the reference.
+            let start = self.layout.caret(&Pos::new(typed.block.clone(), typed.range.start)).unwrap_or_default();
+            let spot = Rect { x: origin.x + start.x, y: origin.y + start.y, ..start };
+            element = element.popover(self.refer.list(&self.editor, &typed, &figures).at(spot));
+        } else if let Some(((source, rect), selection)) = sheet.zip(selection) {
+            let spot = Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect };
+            element =
+                element.popover(self.maths.sheet(source, selection, rect.width, self.wide(), self.scheme).at(spot));
+        } else if let Some(tools) = self.selection_tools(origin, viewport) {
+            element = element.popover(tools);
         }
-        element
+        // A press on a reference follows it, one on a copy button copies and one on a cloud opens its menu,
+        // which the pointer's shape says.
+        let pressable = self.references.pointed().is_some() || self.code_copy.pointed() || self.linked.on_cloud();
+        let pressable = pressable || self.captions.over || self.margin.over.is_some();
+        match self.grip.corner() {
+            Some(corner) => element.cursor(Cursor::Resize(figures::edge(corner))),
+            None if pressable => element.cursor(Cursor::Pointer),
+            None => element,
+        }
+    }
+
+    /// Draws the figure of the reference under the pointer small beside it, when it is out of view. `origin`
+    /// is where the layout's origin is in the page area, and `room` the size of that area. Returns what the
+    /// preview says and where it is.
+    fn preview(&self, origin: Point, room: Size, out: &mut DisplayList) -> Option<(String, Rect)> {
+        let reference = self.references.previewed()?;
+        let rest = self.references.rest()?;
+        let picture = self.layout.figure(&reference.target)?.image;
+        let caption = references::caption(self.editor.doc(), self.editor.model().style(), &reference.target)?;
+        // The preview hangs from the line of the label that the pointer is on.
+        let lines = reference.lines(&self.layout);
+        let on_page = |line: &Rect| Rect { x: line.x + origin.x, y: line.y + origin.y, ..*line };
+        let anchor = lines.iter().map(on_page).find(|line| line.contains(rest)).or(lines.first().map(on_page))?;
+        let page = self.palette.page;
+        let preview = Preview { layout: &self.layout, picture, page, caption: &caption, anchor, room };
+        let rect = preview.paint(self.shaper.as_ref(), self.scheme, out);
+        Some((caption, rect))
+    }
+
+    /// How far down the page a block reaches, from its top to its bottom, in the layout's coordinates.
+    fn extent(&self, block: &Block) -> Option<(f32, f32)> {
+        if let Some(figure) = self.layout.figure(&block.id) {
+            let captioned = !block.plain_text().is_empty() || block.body.blocks().iter().any(|part| !is_figure(part));
+            let under = if captioned { figure.caption } else { figure.image };
+            return Some((figure.image.y, under.y + under.height));
+        }
+        let mut texts = Vec::new();
+        written(block, &mut texts);
+        let (first, last) = (texts.first()?, texts.last()?);
+        let top = self.layout.caret(&Pos::new(first.id.clone(), 0))?;
+        let bottom = self.layout.caret(&Pos::new(last.id.clone(), last.plain_text().len()))?;
+        Some((top.y, bottom.y + bottom.height))
+    }
+
+    /// Where pictures let go at a point of the page area would land, and the bar that says so, in the
+    /// layout's coordinates: beside a picture from its left or right quarter, and otherwise on a line of
+    /// their own, above or below the block there.
+    fn spot(&self, at: Point) -> Option<(Spot, Option<Rect>)> {
+        // Sheets take no pictures: the page does, where it is edited.
+        if self.printing.is_some() {
+            return None;
+        }
+        let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        let block = self.layout.hit(at)?.block;
+        let (thick, gap) = BAR;
+        let picture = self.layout.figure(&block).map(|figure| figure.image).filter(|image| image.contains(at));
+        let across = picture.map(|image| (image, (at.x - image.x) / image.width.max(1.0)));
+        if let Some((image, across)) = across.filter(|(_, across)| !(0.25..=0.75).contains(across)) {
+            let after = across > 0.5;
+            let x = if after { image.x + image.width + gap } else { image.x - gap - thick };
+            let bar = Rect::new(x, image.y, thick, image.height);
+            return Some((Spot::Beside { figure: block, after }, Some(bar)));
+        }
+        // A block inside a table or a gallery stands for the whole of it.
+        let extent = whole(self.editor.doc(), &block).and_then(|whole| self.extent(whole));
+        let below = extent.is_some_and(|(top, bottom)| at.y > (top + bottom) / 2.0);
+        let bar = extent.map(|(top, bottom)| {
+            let y = if below { bottom + gap } else { top - gap - thick };
+            Rect::new(0.0, y, self.column.1, thick)
+        });
+        Some((Spot::Line { block, below }, bar))
     }
 
     /// The heading the top of the view is under.
@@ -825,7 +2526,7 @@ impl EditorApp {
                 .width(width)
                 .height(pitch)
                 .padding(Edges::left(CHAPTER_INDENT * f32::from((level - shallowest).min(CHAPTER_STEPS))))
-                .fg(if here { tokens::ACCENT } else { fade(tokens::FG_MUTED, 0.5) })
+                .fg(if here { accent().base } else { fade(tokens::FG_MUTED, 0.5) })
                 .hover(Look::NONE.with_fg(tokens::FG))
                 .focused(Look::NONE.with_fg(tokens::FG))
                 .ring(Ring::Outline(0.0))
@@ -849,6 +2550,41 @@ impl EditorApp {
     }
 
     fn bar(&self) -> Element<Message> {
+        let chrome = &self.chrome;
+        let mut bar = TopBar::new().inset(chrome.inset_start);
+        if let Some(height) = chrome.bar_height {
+            bar = bar.height(height);
+        }
+        // A bar that is the title bar moves its window, and dims while the window is behind another.
+        if chrome.titled() {
+            let title = Title {
+                drag: Message::Ask(Request::DragWindow),
+                double_click: Message::Ask(Request::ToggleMaximise),
+                menu: Box::new(|at| Message::Ask(Request::WindowMenu(at))),
+            };
+            bar = bar.title(title).dim(!self.active);
+        }
+        // The window's buttons stand where the desktop keeps them, a rule apart from the bar's own.
+        if let Some(buttons) = chrome.buttons().filter(|_| chrome.buttons_at_start) {
+            bar = bar.before(buttons).before(TopBar::rule());
+        }
+        // A view that takes the page's place keeps the window's controls and has the rest of the bar.
+        bar = match &self.printing {
+            Some(print) => {
+                let page = &self.editor.model().style().page;
+                let told = self.note.as_ref().map(|(note, _)| note.as_str());
+                print.bar(bar, &self.name().0, told, &styles::paper_name(page), || self.styles.setup(page))
+            }
+            None => self.editing(bar),
+        };
+        if let Some(buttons) = chrome.buttons().filter(|_| !chrome.buttons_at_start) {
+            bar = bar.end(TopBar::rule()).end(buttons);
+        }
+        bar.into()
+    }
+
+    /// Fills the bar for editing: the document's name, the format controls, and what the window offers.
+    fn editing(&self, mut bar: TopBar<Message>) -> TopBar<Message> {
         let share = Element::column()
             .gap(tokens::SPACE_LG)
             .min_width(320.0)
@@ -856,30 +2592,54 @@ impl EditorApp {
             .child(Element::from(Button::new("Done").on_press(Message::Share(false))).align_self(Align::End));
         let share = Popover::new(share).label("Share").modal().open(self.sharing).on_close(Message::Share(false));
 
+        let keys = |act: Act| commands::shortcut(&act, self.editor.keymap(), self.mac).unwrap_or_default();
         let more = Menu::new()
             .label("More")
+            .item(
+                MenuItem::new("Commands")
+                    .icon(icon::SEARCH)
+                    .aside(keys(Act::Palette))
+                    .on_select(Message::Commands(Commanding::Toggle)),
+            )
+            .separator()
             .item(MenuItem::new("New document").icon(icon::PLUS).on_select(Message::NewDocument))
             .item(MenuItem::new("Open").icon(icon::FOLDER_OPEN).on_select(Message::OpenDialog))
             .separator()
-            .item(MenuItem::new("Export").icon(icon::DOWNLOAD).disabled(true))
-            .item(MenuItem::new("Print view").icon(icon::PRINTER).disabled(true))
-            .item(MenuItem::new("Page setup").icon(icon::SETTINGS).disabled(true));
+            .item(
+                MenuItem::new("Save a copy")
+                    .icon(icon::COPY)
+                    .aside(keys(Act::SaveCopy))
+                    .on_select(Message::Copy(Copying::Open(CopyFormat::Letters))),
+            )
+            .item(MenuItem::new("Export").icon(icon::DOWNLOAD).on_select(Message::Copy(Copying::Open(CopyFormat::Pdf))))
+            .item(
+                MenuItem::new("Print view")
+                    .icon(icon::PRINTER)
+                    .aside(keys(Act::Print))
+                    .on_select(Message::Print(Printing::Show)),
+            )
+            .item(MenuItem::new("Page setup").icon(icon::FILE_TEXT).on_select(Message::Styles(Styling::PageSetup)))
+            .separator()
+            .item(MenuItem::new("Settings").icon(icon::SETTINGS).on_select(Message::Settings(Setting::Show)));
 
         // The forms of the bar, from the widest. Once the layout has said which fits, only that one is built.
         let forms = [
-            (NAME_WIDTH.2, Fold::None, false),
-            (NAME_WIDTH.1, Fold::None, false),
-            (NAME_WIDTH.1, Fold::Alignment, false),
-            (NAME_WIDTH.1, Fold::Marks, false),
-            (NAME_WIDTH.1, Fold::Style, false),
-            (NAME_WIDTH.1, Fold::Style, true),
+            (NAME_WIDTH.2, Fold::None),
+            (NAME_WIDTH.1, Fold::None),
+            (NAME_WIDTH.1, Fold::Alignment),
+            (NAME_WIDTH.1, Fold::Marks),
+            (NAME_WIDTH.1, Fold::Style),
         ];
-        let mut bar = TopBar::new().shown(self.folded.seen.clone());
-        for (n, (name, fold, brief)) in forms.into_iter().enumerate() {
+        bar = bar.shown(self.folded.seen.clone());
+        for (n, (name, fold)) in forms.into_iter().enumerate() {
             if self.folded.form.is_none_or(|form| form == n) {
-                bar = self.lead(name, brief).into_iter().fold(bar.form(n), TopBar::start);
+                let shown = self.folded.form == Some(n);
+                bar = self.lead(name, shown).into_iter().fold(bar.form(n), TopBar::start);
                 bar = self.tools(fold).into_iter().fold(bar, TopBar::middle);
             }
+        }
+        if let Some(badge) = self.safe.badge() {
+            bar = bar.end(badge);
         }
         bar = bar.end(Button::new("Share").icon(icon::USERS).small().on_press(Message::Share(true)).popover(share));
         bar = bar.end(TopBar::rule());
@@ -888,45 +2648,64 @@ impl EditorApp {
             let button = tool(icon, panel.title()).pressed(self.panel == Some(panel));
             panels = panels.child(button.on_press(Message::Panel(panel)));
         }
-        bar.end(panels.child(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End)))).into()
+        bar.end(panels.child(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End))))
     }
 
-    /// What the bar starts with: the document's name, in no more than `room`, and whether it is saved, which
-    /// `brief` says with the icon alone.
-    fn lead(&self, room: f32, brief: bool) -> Vec<Element<Message>> {
+    /// What the bar starts with: the document's name, in no more than `room`, and whether it is saved. A
+    /// press on the name makes it a field, in the form of the bar that is `shown`.
+    fn lead(&self, room: f32, shown: bool) -> Vec<Element<Message>> {
         // A name that is not the document's own is grey, as a field's placeholder is.
         let (name, own) = self.name();
+        let page = Element::icon(icon::FILE_TEXT, 18.0).fg(tokens::FG_MUTED);
+        if let Some(renaming) = self.renaming.as_ref().filter(|_| shown) {
+            return vec![page, renaming.field(&name, room, &self.location).min_width(NAME_WIDTH.0)];
+        }
         let style = TextStyle::control().weight(if own { 600 } else { 400 });
         // The name gives way to the controls after it, down to a few letters.
-        let name = Element::text(name, style).min_width(NAME_WIDTH.0).max_width(room).shrink();
+        let name = Element::text(name.as_str(), style)
+            .min_width(NAME_WIDTH.0)
+            .max_width(room)
+            .shrink()
+            .role(Role::Button)
+            .label(name)
+            .description("Rename or move")
+            .tooltip("Rename or move", Side::Bottom)
+            .on_press(Message::Rename(Rename::Open))
+            .cursor(Cursor::Text);
+        // On a title bar a drag that starts on the name moves the window, and only a click renames.
+        let name = if self.chrome.titled() { name.on_drag(Message::Ask(Request::DragWindow)) } else { name };
         let name = if own { name } else { name.fg(tokens::FG_MUTED) };
-        let mut lead = vec![Element::icon(icon::FILE_TEXT, 18.0).fg(tokens::FG_MUTED), name];
+        let mut lead = vec![page, name];
 
-        let (state_icon, state, ink) = match self.save {
-            SaveState::Saved => (icon::CLOUD_CHECK, "Saved", tokens::FG_MUTED),
-            SaveState::Saving => (icon::REFRESH_CW, "Saving", tokens::FG_MUTED),
-            SaveState::Offline => (icon::CLOUD_OFF, "Offline", tokens::FG_MUTED),
-            SaveState::Failed => (icon::CLOUD_ALERT, "Not saved", tokens::DANGER),
-            SaveState::Unsaved => return lead,
+        // How saving stands is an icon of one size whatever it says, so that nothing after it moves when
+        // saving starts. A document not yet written keeps the room.
+        let (state, said, more, ink) = match self.save {
+            SaveState::Saved => (icon::CLOUD_CHECK, "Saved", None, tokens::FG_MUTED),
+            SaveState::Saving => (icon::REFRESH_CW, "Saving", None, tokens::FG_MUTED),
+            SaveState::Offline => {
+                (icon::CLOUD_OFF, "Offline", Some("Changes are kept on this device"), tokens::FG_MUTED)
+            }
+            SaveState::Failed => {
+                (icon::CLOUD_ALERT, "Not saved", Some("The last changes could not be written"), tokens::DANGER)
+            }
+            SaveState::Unsaved => {
+                lead.push(Element::row().width(SAVE_ICON).decorative());
+                return lead;
+            }
         };
-        // A saved document says so with the icon alone, but for the moment after its first write.
-        let note = self
-            .saved_in
-            .as_ref()
-            .filter(|_| self.save == SaveState::Saved)
-            .map(|(folder, _)| format!("Saved in {folder}"));
-        let said = note.clone().unwrap_or_else(|| state.to_owned());
-        let mut saved =
-            Element::row().align(Align::Center).gap(tokens::SPACE_XS).fg(ink).child(Element::icon(state_icon, 14.0));
-        saved = match (brief || self.save == SaveState::Saved) && note.is_none() {
-            true => saved.role(Role::Label).label(said.as_str()).tooltip(said, Side::Bottom),
-            false => saved.child(Element::text(said, TextStyle::control().size(tokens::TEXT_SM))),
-        };
-        saved = match self.save {
-            SaveState::Offline => saved.description("Changes are kept on this device"),
-            SaveState::Failed => saved.description("The last changes could not be written"),
-            _ => saved,
-        };
+        // For a moment after its first write, the icon tells where the document went.
+        let note = self.note.as_ref().filter(|_| self.save == SaveState::Saved);
+        let said = note.map_or_else(|| said.to_owned(), |(note, _)| note.clone());
+        let tip = more.map_or_else(|| said.clone(), |more| format!("{said}. {more}"));
+        let mut saved = Element::icon(state, SAVE_ICON)
+            .fg(ink)
+            .role(Role::Label)
+            .label(said)
+            .tooltip(tip, Side::Bottom)
+            .telling(note.is_some());
+        if let Some(more) = more {
+            saved = saved.description(more);
+        }
         lead.push(saved);
         lead
     }
@@ -967,10 +2746,12 @@ impl EditorApp {
     /// folded further the name is a button that opens the rest.
     fn style_group(&self, fold: Fold) -> Vec<Element<Message>> {
         let Some(element) = self.element() else { return Vec::new() };
-        let Some(style) = self.style.style().types.get(element) else { return Vec::new() };
+        let Some(style) = self.editor.model().style().types.get(element) else { return Vec::new() };
 
-        // The type follows the caret: it is a label here, and changed on the page.
+        // The type follows the caret: it is named here and changed on the page. A dot says that the
+        // document's style is no longer the person's default, which the Styles panel can mend.
         let name = restyle::name(element);
+        let differs = self.styles.differs(self.editor.model().style());
         let label = Element::row()
             .align(Align::Center)
             .gap(tokens::SPACE_XS)
@@ -980,7 +2761,8 @@ impl EditorApp {
             .radius(tokens::RADIUS_CONTROL)
             .bg(tokens::TONE_1)
             .fg(tokens::FG_MUTED)
-            .child(Element::text(name.clone(), TextStyle::control().size(tokens::TEXT_SM).weight(500)));
+            .child(Element::text(name.clone(), TextStyle::control().size(tokens::TEXT_SM).weight(500)))
+            .children(differs.then(styles::dot));
 
         let mut fonts = Menu::new().label("Font");
         for (family, face) in FAMILIES {
@@ -1027,7 +2809,7 @@ impl EditorApp {
             let dot = Element::row().width(18.0).height(18.0).radius(9.0).bg(shown(&hex));
             let swatch = Element::row()
                 .padding(Edges::all(2.0))
-                .border(Edges::all(2.0), if chosen { tokens::ACCENT } else { fade(tokens::FG, 0.0) })
+                .border(Edges::all(2.0), if chosen { accent().base } else { fade(tokens::FG, 0.0) })
                 .radius(13.0)
                 .hover(Look::bg(tokens::NEUTRAL_SOFT))
                 .ring(Ring::Outline(2.0))
@@ -1092,6 +2874,16 @@ impl EditorApp {
 
         let looks = cluster().child(colour).child(aligns).child(spacing);
         if fold < Fold::Style {
+            let opens = "Opens the Styles panel";
+            let about = if differs { format!("Differs from your default. {opens}") } else { opens.to_owned() };
+            let label = label
+                .hover(Look::bg(tokens::NEUTRAL_SOFT))
+                .ring(Ring::Outline(2.0))
+                .role(Role::Button)
+                .label(name)
+                .description(about.clone())
+                .tooltip(about, Side::Bottom)
+                .on_press(Message::Styles(Styling::Show));
             return vec![label, font, size, looks, TopBar::rule()];
         }
         let title = format!("{name} style");
@@ -1127,22 +2919,258 @@ impl EditorApp {
     }
 
     fn side(&self, panel: Panel) -> Element<Message> {
-        let rows: Vec<Element<Message>> = match panel {
-            Panel::Styles => self.style.types.iter().map(|(name, style)| style_row(name, style)).collect(),
-            Panel::Notes | Panel::History => Vec::new(),
+        let empty = |said: &str| {
+            let said = Element::paragraph(said, TextStyle::body()).fg(tokens::FG_MUTED);
+            Element::column().padding(Edges::top(tokens::SPACE_MD)).child(said)
         };
-        let empty = match panel {
-            Panel::Styles => "This document has no styles.",
-            Panel::Notes => "No open notes.",
-            Panel::History => "No earlier versions yet.",
-        };
-        let body = Element::column().padding(Edges::top(tokens::SPACE_MD)).gap(tokens::SPACE_2XS);
-        let body = if rows.is_empty() {
-            body.child(Element::paragraph(empty, TextStyle::body()).fg(tokens::FG_MUTED))
-        } else {
-            body.children(rows)
+        let body = match panel {
+            Panel::Styles => self.styles.view(self.editor.model().style(), self.element(), &self.palette),
+            Panel::Notes => threads::listed(&self.margin, self.editor.doc()).unwrap_or_else(|| empty("No open notes.")),
+            Panel::History => empty("No earlier versions yet."),
         };
         SidePanel::new(panel.title()).on_close(Message::ClosePanel).child(body).into()
+    }
+
+    /// Shows a panel, or none. What the Styles panel was in the middle of goes with it.
+    fn show(&mut self, panel: Option<Panel>) {
+        if self.panel == Some(Panel::Styles) && panel != self.panel {
+            self.picked = None;
+            self.styles.leave();
+        }
+        self.panel = panel;
+    }
+
+    /// Does what was asked on the sheet under the formula the caret is in.
+    fn sheet(&mut self, message: Sheet, platform: &mut dyn Platform) {
+        let Some((block, source)) = self.editor.formula().map(|(block, source)| (block.clone(), source)) else {
+            return;
+        };
+        let at = |offset: usize| Pos::new(block.clone(), offset.clamp(source.start, source.end));
+        match message {
+            Sheet::Press { offset, extend, clicks } => {
+                let head = at(offset);
+                let anchor = match self.editor.selection() {
+                    Some(selection) if extend => selection.anchor.clone(),
+                    _ => head.clone(),
+                };
+                self.editor.select(Selection { anchor, head });
+                match clicks {
+                    1 => self.stay(offset == source.start, platform),
+                    2 => self.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform)),
+                    _ => self.editor.select(Selection { anchor: at(source.start), head: at(source.end) }),
+                }
+                self.maths.dragging = clicks == 1;
+                self.maths.typed(false);
+                self.mark();
+            }
+            Sheet::Drag(offset) => {
+                // A pointer that has not left its character leaves the caret as the press put it.
+                let held = self.editor.selection().filter(|selection| selection.head != at(offset));
+                if let Some(anchor) = held.filter(|_| self.maths.dragging).map(|selection| selection.anchor.clone()) {
+                    self.editor.select(Selection { anchor, head: at(offset) });
+                    self.mark();
+                }
+            }
+            Sheet::Release => self.maths.dragging = false,
+            Sheet::Take(index) => self.take(index, platform),
+            // Escape puts the list of symbols away first.
+            Sheet::Leave if self.symbols().is_some() => self.maths.typed(false),
+            Sheet::Leave => self.edit(platform, |editor, platform| editor.run(Command::LeaveFormula, platform)),
+        }
+    }
+
+    /// The symbols the sheet offers for the command being typed at the caret, and the stretch of the
+    /// formula's block that one of them would replace.
+    fn symbols(&self) -> Option<(Pos, usize, Vec<&'static letters_math::Command>)> {
+        let source = Source::of(&self.editor, self.shaper.as_ref(), self.wide())?;
+        let (typed, symbols) = self.maths.symbols(&source, self.editor.selection()?)?;
+        Some((Pos::new(source.block, typed.start), typed.end, symbols))
+    }
+
+    /// Writes a symbol of the list in place of the command being typed. One that takes arguments gets its
+    /// braces, and the caret waits in the first pair.
+    fn take(&mut self, index: usize, platform: &mut dyn Platform) {
+        let Some((start, end, symbols)) = self.symbols() else { return };
+        let Some(symbol) = symbols.get(index) else { return };
+        self.editor.select(Selection { anchor: start.clone(), head: Pos::new(start.block.clone(), end) });
+        let written = InputEvent::Insert(maths::written(symbol));
+        self.edit(platform, |editor, platform| editor.input(written, platform));
+        if symbol.arguments > 0 {
+            let first = Pos::new(start.block, start.offset + symbol.command.len() + 1);
+            self.editor.select(Selection::caret(first));
+            self.mark();
+        }
+        self.maths.typed(false);
+    }
+
+    /// Puts what an offer of the insert menu stands for on its line, in place of the slash and what was
+    /// typed after it.
+    fn put(&mut self, index: usize, platform: &mut dyn Platform) {
+        let Some((line, typed, offers)) = self.insert.offers(&self.editor) else { return };
+        let Some(put) = offers.get(index).map(|offer| offer.put.clone()) else { return };
+        self.insert.close();
+        self.editor.select(Selection { anchor: Pos::new(line.clone(), 0), head: Pos::new(line, typed) });
+        self.edit(platform, |editor, platform| editor.run(Command::Delete(Motion::Left), platform));
+        let command = match put {
+            Put::Kind(kind) => Command::SetBlock(kind),
+            // A header row over two more, three cells across: enough to start with.
+            Put::Table => Command::InsertTable { rows: 3, columns: 3 },
+            // The shell lets the person choose them, and they take the place of the line that is now empty.
+            Put::Pictures => return self.requests.push(Request::Pictures),
+        };
+        self.edit(platform, |editor, platform| editor.run(command, platform));
+    }
+
+    /// Lets the insert menu have the keys that walk it and take from it, while it shows.
+    fn insert_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        let plain = event.mods == Modifiers::default();
+        let Some((_, _, offers)) = self.insert.offers(&self.editor).filter(|_| plain) else { return false };
+        match event.key {
+            Key::Down | Key::Up => self.insert.pick(event.key == Key::Down, offers.len()),
+            Key::Enter | Key::Tab => self.put(self.insert.picked(offers.len()), platform),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Lets the list of figures have the keys that walk it and take from it, while it shows. Until a figure
+    /// is picked, Enter and Tab are the editor's.
+    fn refer_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        let plain = event.mods == Modifiers::default();
+        let Some((typed, figures)) = Refer::offers(&self.editor).filter(|_| plain) else { return false };
+        let picked = self.refer.picked(&typed, figures.len()).and_then(|picked| figures.get(picked));
+        match (&event.key, picked) {
+            (Key::Down | Key::Up, _) => self.refer.pick(&typed, event.key == Key::Down, figures.len()),
+            (Key::Enter | Key::Tab, Some(figure)) => self.refer(figure.id.clone(), platform),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Makes a reference to a figure of the words typed for one.
+    fn refer(&mut self, figure: BlockId, platform: &mut dyn Platform) {
+        self.edit(platform, |editor, platform| editor.run(Command::TakeReference(figure), platform));
+    }
+
+    /// Lets the list of symbols have the keys that walk it and take from it, while it shows.
+    fn list_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        let plain = event.mods == Modifiers::default();
+        let Some((_, _, symbols)) = self.symbols().filter(|_| plain) else { return false };
+        match event.key {
+            Key::Down | Key::Up => self.maths.pick(event.key == Key::Down, symbols.len()),
+            Key::Tab => self.take(self.maths.picked(symbols.len()), platform),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Blends the source of a formula into its glyphs, when a `$` typed at `before` has just closed one.
+    /// `start` is where the block of `before` began on the page then.
+    fn close(&mut self, before: &Pos, start: Option<Rect>) {
+        let Some(block) = self.editor.doc().block(&before.block) else { return };
+        let Some(head) = self.editor.selection().map(|selection| &selection.head) else { return };
+        let closed = if block.kind == BlockKind::Formula {
+            // `$$x$$` alone in its paragraph made a formula of it, and the caret went on below. The source
+            // began where the paragraph did, and the formula may stand anywhere on its line.
+            let from = start.map(|start| Point { x: start.x, y: start.y + start.height / 2.0 });
+            (head.block != block.id).then(|| (0, format!("$${}$$", block.plain_text()), from))
+        } else if head.block == block.id && self.editor.formula().is_none() {
+            // Inline maths that ends at the caret, which is outside it, was closed there.
+            let (mut at, mut from) = (0, None);
+            for run in block.body.runs() {
+                if at >= head.offset {
+                    break;
+                }
+                from = if run.marks.contains(&Mark::Math) { from.or(Some(at)) } else { None };
+                at += run.text.len();
+            }
+            let text = block.plain_text();
+            let source = from.filter(|_| at == head.offset).and_then(|from| Some((from, text.get(from..at)?)));
+            source.map(|(from, source)| (from, format!("${source}$"), None))
+        } else {
+            None
+        };
+        let Some((offset, typed, from)) = closed else { return };
+        // The source goes as it was written: in the face of its block, as near as the interface has it.
+        let types = &self.editor.model().style().types;
+        let written = restyle::element(self.editor.doc(), &block.id).and_then(|element| types.get(element));
+        let face = written.map_or(TextStyle::body(), |style| TextStyle {
+            family: FAMILIES.iter().find(|(family, _)| *family == style.family).map_or(Family::Sans, |found| found.1),
+            size: style.size * PT,
+            weight: style.weight,
+            italic: style.italic,
+            leading: style.line_height,
+        });
+        let typed = self.shaper.shape(&typed.replace('\n', " "), &face, None);
+        self.maths.close(Pos::new(block.id.clone(), offset), typed, from);
+    }
+
+    /// Keeps a caret set at an end of inline maths inside it. Left there, text typed next would be written
+    /// beside the formula, and the sheet that was pressed would go.
+    fn stay(&mut self, at_start: bool, platform: &mut dyn Platform) {
+        if self.editor.formula().is_none() {
+            let to = if at_start { Motion::Right } else { Motion::Left };
+            self.edit(platform, |editor, platform| editor.run(Command::Move { to, extend: false }, platform));
+        }
+    }
+
+    /// What the Styles panel asks for. A change to the style is one step for undo, and files are asked of
+    /// the shell.
+    fn styling(&mut self, message: Styling, platform: &mut dyn Platform) {
+        let style = self.editor.model().style();
+        let command = match message {
+            Styling::Show => {
+                self.show(Some(Panel::Styles));
+                None
+            }
+            Styling::PageSetup => {
+                self.show(Some(Panel::Styles));
+                self.styles.setup = true;
+                None
+            }
+            Styling::Pick(element) => {
+                self.picked = Some((element, self.editor.selection().cloned()));
+                None
+            }
+            Styling::SaveDefault => {
+                let kept = self.styles.offered.take().map_or_else(|| style.clone(), |(_, offered)| offered);
+                self.requests.push(Request::SaveDefaultStyle(kept.to_json()));
+                self.styles.default = Some(kept);
+                None
+            }
+            Styling::Import => {
+                self.styles.refused = None;
+                self.requests.push(Request::ImportStyle);
+                None
+            }
+            Styling::Export => {
+                self.requests.push(Request::ExportStyle(style.to_json()));
+                None
+            }
+            Styling::Decline => {
+                self.styles.offered = None;
+                None
+            }
+            Styling::Margins(typed) => {
+                self.styles.margins = Some(typed);
+                None
+            }
+            Styling::ForgetMargins => {
+                self.styles.margins = None;
+                None
+            }
+            Styling::Reset => self.styles.default.clone().map(Command::ReplaceStyle),
+            Styling::Apply => self.styles.offered.take().map(|(_, offered)| Command::ReplaceStyle(offered)),
+            Styling::Paper(paper) => styles::with_paper(&style.page, paper).map(Command::SetPage),
+            Styling::Landscape(landscape) => Some(Command::SetPage(styles::turned(&style.page, landscape))),
+            Styling::TakeMargins => {
+                let typed = self.styles.margins.take();
+                typed.and_then(|typed| styles::with_margins(&style.page, &typed)).map(Command::SetPage)
+            }
+        };
+        if let Some(command) = command {
+            self.edit(platform, |editor, platform| editor.run(command, platform));
+        }
     }
 }
 
@@ -1154,22 +3182,63 @@ impl App for EditorApp {
     }
 
     fn view(&mut self, window: Size) -> Element<Message> {
+        // A floating window that Letters frames has a border, which everything else stands inside.
+        let border = self.chrome.border();
+        let window = Size { width: window.width - 2.0 * border, height: window.height - 2.0 * border };
         self.refold(window.width);
-        let panel = self.panel.map(|panel| self.side(panel));
+        // Print view has the window to itself: the panels and the outline are for editing.
+        let printing = self.printing.is_some();
+        let panel = self.panel.filter(|_| !printing).map(|panel| self.side(panel));
         let room = window.width - if panel.is_some() { side_panel::WIDTH } else { 0.0 };
-        let page = self.page(Size { width: room.max(0.0), height: (window.height - top_bar::HEIGHT).max(0.0) });
-        let page = Element::row().grow(1.0).child(page).children(self.chapters());
+        // The safe mode bar lies under the top bar and takes its height from the page.
+        let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height();
+        let room = Size { width: room.max(0.0), height: (window.height - bar).max(0.0) };
+        let page = if printing { self.sheets(room) } else { self.page(room) };
+        let chapters = if printing { None } else { self.chapters() };
+        let page = Element::row().grow(1.0).child(page).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
-        Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).child(body)
+        // The settings and the card about a link come last, so that they lie over whatever else is out.
+        let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
+        let commands = self.commands.open().then(|| {
+            let (offers, keymap) = (self.offers(), self.editor.keymap());
+            self.commands.view(&offers, keymap, self.mac, bar, window)
+        });
+        let over = over.chain(commands);
+        let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).children(self.safe.bar());
+        let all = all.child(body).children(over);
+        if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
     }
 
     fn update(&mut self, message: Message, platform: &mut dyn Platform) {
+        // A note that a press outside it put away is remembered for that press alone.
+        if !matches!(message, Message::Note(Noting::Close) | Message::Pointer(Pointer::Down { .. })) {
+            self.margin.forget();
+        }
         match message {
-            Message::Text(event) => self.edit(platform, |editor, platform| editor.input(event, platform)),
+            Message::Text(event) => {
+                let dollar =
+                    matches!(&event, InputEvent::Insert(text) | InputEvent::Commit(text) if text.ends_with('$'));
+                // Where the caret is and where its block starts, should this close a formula.
+                let before = self.editor.selection().filter(|_| dollar && !self.reduced_motion);
+                let before = before.map(|selection| selection.head.clone());
+                let before = before.map(|head| (self.layout.caret(&Pos::new(head.block.clone(), 0)), head));
+                self.unpoint();
+                self.edit(platform, |editor, platform| editor.input(event, platform));
+                self.maths.typed(true);
+                self.insert.typed(&self.editor);
+                if let Some((start, head)) = before {
+                    self.close(&head, start);
+                }
+            }
+            // The page behind the import card is not written on.
+            Message::Pointer(_) if self.importing.is_some() => {}
             Message::Pointer(event) => self.pointer(event, platform),
             Message::Run(command) => self.edit(platform, |editor, platform| editor.run(command, platform)),
-            Message::Panel(panel) => self.panel = (self.panel != Some(panel)).then_some(panel),
-            Message::ClosePanel => self.panel = None,
+            Message::Panel(panel) => {
+                self.margin.now = platform.wall_time().map(notes::stamp).unwrap_or_default();
+                self.show((self.panel != Some(panel)).then_some(panel));
+            }
+            Message::ClosePanel => self.show(None),
             Message::Share(open) => self.sharing = open,
             Message::Correct(text) => {
                 let Some(fix) = self.spelling.fix.take() else { return };
@@ -1177,12 +3246,50 @@ impl App for EditorApp {
                 self.editor.select(Selection { anchor, head });
                 self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(text), platform));
             }
-            Message::Learn { mine } => self.spelling.learn(mine, self.editor.doc(), &mut self.layout, platform),
+            Message::Learn { mine } => {
+                let Some(fix) = self.spelling.fix.take() else { return };
+                if mine {
+                    platform.learn_word(&fix.word);
+                    self.spelling.learn(&fix.word);
+                } else {
+                    // The document's own words are part of it, so undo takes one back and saving keeps it.
+                    let word = Command::AddWord(fix.word);
+                    self.edit(platform, |editor, platform| editor.run(word, platform));
+                }
+                self.spelling.reworded(Some(fix.block), self.editor.doc(), &mut self.layout);
+            }
             Message::Unfix => self.spelling.fix = None,
             Message::Open(path) => self.requests.push(Request::Open(path)),
             Message::OpenDialog => self.requests.push(Request::OpenDialog),
             Message::NewDocument => self.requests.push(Request::New),
             Message::Start => self.start(),
+            Message::Rename(message) => self.rename(message),
+            Message::Import(message) => {
+                let stays = self.importing.as_mut().is_some_and(|card| card.update(message, &mut self.requests));
+                self.importing = self.importing.take().filter(|_| stays);
+            }
+            Message::Copy(message) => self.copy(message),
+            Message::Styles(message) => self.styling(message, platform),
+            Message::Ask(request) => self.requests.push(request),
+            Message::Maths(message) => self.sheet(message, platform),
+            Message::Insert(Inserting::Take(index)) => self.put(index, platform),
+            Message::Insert(Inserting::Close) => self.insert.close(),
+            Message::Refer(Picking::Take(figure)) => self.refer(figure, platform),
+            Message::Linked(asked) => self.linking(asked),
+            Message::Safe(asked) => self.safely(asked),
+            Message::Alt(asked) => self.altering(asked, platform),
+            Message::Note(asked) => self.noting(asked, platform),
+            Message::Commands(asked) => self.commanding(asked, platform),
+            Message::Print(asked) => self.print(asked, platform),
+            Message::Refer(Picking::Close) => {
+                self.edit(platform, |editor, platform| editor.run(Command::DismissReference, platform));
+            }
+            Message::Settings(message) => {
+                if self.dialog.update(message, &mut self.settings) {
+                    self.tint();
+                    self.requests.push(Request::Settings(self.settings.clone()));
+                }
+            }
             Message::Jump(block) => {
                 let start = Pos { block, offset: 0 };
                 self.editor.select(Selection::caret(start.clone()));
@@ -1200,7 +3307,7 @@ impl App for EditorApp {
             Message::Restyle(edit) => {
                 // A choice made outright replaces whatever was half typed.
                 self.draft = None;
-                self.restyle(&edit);
+                self.restyle(&edit, platform);
             }
             Message::Forget => self.draft = None,
             Message::Draft(field, text) => self.draft = self.element().map(|element| (field, element, text)),
@@ -1208,7 +3315,7 @@ impl App for EditorApp {
                 let typed =
                     self.draft.take_if(|draft| draft.0 == field).filter(|draft| Some(draft.1) == self.element());
                 if let Some(edit) = typed.and_then(|draft| field.read(&draft.2)) {
-                    self.restyle(&edit);
+                    self.restyle(&edit, platform);
                 }
             }
             Message::LinkApply => {
@@ -1220,25 +3327,76 @@ impl App for EditorApp {
     }
 
     fn key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
-        let mut used = false;
+        if self.printing.is_some() {
+            return self.print_key(event, platform);
+        }
+        // Print view opens at what is being read. A key the editor is offered brings the caret into view,
+        // so this one is not offered: it is none of the editor's.
+        if commands::bound(event) == Some(&Act::Print) {
+            let asked = self.asked(&Act::Print);
+            return asked.map(|message| self.update(message, platform)).is_some();
+        }
+        // Escape lets go of a picture held by a corner or carried, which stays as it was.
+        if event.key == Key::Escape && self.grip.release() {
+            self.drop = None;
+            return true;
+        }
+        if self.insert_key(event, platform) || self.refer_key(event, platform) || self.list_key(event, platform) {
+            return true;
+        }
+        let (mut used, mut edited) = (false, false);
         self.edit(platform, |editor, platform| {
             let change = editor.key(event.clone(), platform);
             used = change.is_some();
+            edited = change.as_ref().is_some_and(|change| !change.blocks.is_empty());
             change.unwrap_or_default()
         });
-        // The editor leaves this one to the window, which edits the link in place.
-        let link = event.key == Key::Char('k') && event.mods == Modifiers { primary: true, ..Modifiers::default() };
-        if !used && link {
-            self.link = Some(self.editor.link().unwrap_or_default().to_owned());
+        // A key that deletes is typing too. One that moves the caret is not, and puts the symbols away.
+        if used {
+            self.maths.typed(edited);
+            // The page may have moved under a pointer that rests where it was.
+            self.unpoint();
         }
-        used || link
+        if used {
+            return true;
+        }
+        // The editor leaves some keys to the window: the palette, the link that is edited in place, the
+        // settings and the card that saves a copy.
+        let asked = commands::bound(event).and_then(|act| self.asked(act));
+        let bound = asked.is_some();
+        if let Some(message) = asked {
+            self.update(message, platform);
+        }
+        bound
     }
 
-    fn describe(&self, page: &mut AccessNode, nodes: &mut Vec<(NodeId, AccessNode)>) {
-        describe::page(self.editor.doc(), self.editor.selection(), page, nodes);
+    fn describe(&self, page: &mut AccessNode, nodes: &mut Vec<(NodeId, AccessNode)>, whole: bool) {
+        if let Some(print) = &self.printing {
+            return print.describe(page, nodes);
+        }
+        let told = &mut self.told.borrow_mut();
+        describe::page(self.editor.doc(), self.editor.selection(), told, whole, page, nodes);
+        if let Some((caption, rect)) = &self.previewed {
+            describe::preview(caption, *rect, page, nodes);
+        }
+        for (marker, at) in self.markers() {
+            let at = Rect { x: at.x + self.column.0, y: at.y + TOP - self.scrolled(), ..at };
+            describe::marker(&marker.block, &marker.label(), at, page, nodes);
+        }
     }
 
     fn access_action(&mut self, request: &ActionRequest, platform: &mut dyn Platform) {
+        // The sheets of Print view are read, and all that is changed on them is where pages start.
+        if let Some(print) = &self.printing {
+            let pressed = match describe::request(self.editor.doc(), request) {
+                Some(describe::Request::Break(block)) => print.asked(&block),
+                _ => None,
+            };
+            if let Some(asked) = pressed {
+                self.break_pages(asked, platform);
+            }
+            return;
+        }
         match describe::request(self.editor.doc(), request) {
             Some(describe::Request::Select(selection)) => {
                 self.editor.select(selection);
@@ -1248,20 +3406,39 @@ impl App for EditorApp {
             Some(describe::Request::Replace(text)) => {
                 self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(text), platform));
             }
-            None => {}
+            Some(describe::Request::Copy(block)) => self.copy_code(block, platform),
+            Some(describe::Request::Note(block)) => self.noting(Noting::Press(block), platform),
+            Some(describe::Request::Alt(figure)) => {
+                self.editor.select_picture(&figure);
+                self.mark();
+                self.reveal();
+                self.alter(figure);
+            }
+            Some(describe::Request::Tick(block)) => {
+                // The editor ticks the task the caret is in, and the caret is not the reader's to lose.
+                let held = self.editor.selection().cloned();
+                self.editor.select(Selection::caret(Pos::new(block, 0)));
+                self.edit(platform, |editor, platform| editor.run(Command::ToggleChecked, platform));
+                if let Some(held) = held {
+                    self.editor.select(held);
+                    self.mark();
+                }
+            }
+            Some(describe::Request::Break(_)) | None => {}
         }
     }
 
     fn text(&mut self, event: InputEvent, platform: &mut dyn Platform) {
         // The first character typed over the landing card starts this document with it.
         let typed = matches!(event, InputEvent::Insert(_) | InputEvent::Commit(_) | InputEvent::SetComposition { .. });
-        if self.landing.is_some() && typed {
+        if self.landing.is_some() && self.importing.is_none() && typed {
             self.start();
             self.edit(platform, |editor, platform| editor.input(event, platform));
         }
     }
 
     fn keys(&mut self, keys: Keys) {
+        self.mac = keys == Keys::Mac;
         self.editor.set_keymap(match keys {
             Keys::Standard => Keymap::standard(),
             Keys::Mac => Keymap::mac(),
@@ -1273,46 +3450,89 @@ impl App for EditorApp {
     }
 
     fn scheme(&mut self, scheme: Scheme) {
-        self.palette = palette(scheme);
-        self.layout.set_palette(self.palette);
+        self.scheme = scheme;
+        self.tint();
+    }
+
+    fn accent(&self) -> Accent {
+        self.accent
     }
 
     fn reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
+        self.references.set_reduced_motion(reduced);
+    }
+
+    fn point(&mut self, at: Option<Point>) -> bool {
+        if let Some(print) = self.printing.as_mut() {
+            return print.point(at);
+        }
+        self.references.set_rest(at);
+        self.repoint()
+    }
+
+    fn active(&mut self, active: bool) {
+        self.active = active;
+    }
+
+    fn edge(&self, at: Point, window: Size) -> Option<(Cursor, Message)> {
+        let edge = self.chrome.edge(at, window)?;
+        Some((Cursor::Resize(edge), Message::Ask(Request::ResizeWindow(edge))))
     }
 
     fn animate(&mut self, now_ms: u64) -> Option<u64> {
         // The note about where the document was saved goes after its few seconds.
-        let until = self.saved_in.as_mut().map(|(_, from)| *from.get_or_insert(now_ms) + SAVED_NOTE_MS);
+        let until = self.note.as_mut().map(|(_, from)| *from.get_or_insert(now_ms) + SAVED_NOTE_MS);
         let note = until.filter(|until| now_ms < *until);
         if note.is_none() {
-            self.saved_in = None;
+            self.note = None;
         }
-        let Some(from) = self.fading.as_mut().map(|from| *from.get_or_insert(now_ms)) else { return note };
-        let progress = now_ms.saturating_sub(from) as f32 / tokens::DURATION_FAST;
-        // The last step is the page exactly as it will stay.
-        self.layout.set_reveal_progress(if progress < 1.0 { motion::ease(progress) } else { 1.0 });
-        if progress < 1.0 {
-            return Some(now_ms + FRAME_MS);
-        }
-        self.fading = None;
-        note
+        let slide = self.maths.animate(now_ms);
+        let fade = self.fading.as_mut().map(|from| *from.get_or_insert(now_ms)).and_then(|from| {
+            let progress = now_ms.saturating_sub(from) as f32 / tokens::DURATION_FAST;
+            // The last step is the page exactly as it will stay.
+            self.layout.set_reveal_progress(if progress < 1.0 { motion::ease(progress) } else { 1.0 });
+            if progress >= 1.0 {
+                self.fading = None;
+            }
+            (progress < 1.0).then_some(now_ms + FRAME_MS)
+        });
+        let light = self.references.animate(now_ms);
+        let copied = self.code_copy.animate(now_ms);
+        [note, slide, fade, light, copied].into_iter().flatten().min()
     }
 
-    fn idle(&mut self) -> bool {
+    fn idle(&mut self) -> Idle {
         if self.estimated {
             // Blocks above the part in view change height as they are laid out.
             self.held(|app| app.estimated = app.layout.settle(app.viewport(), SETTLE_BYTES));
-            return true;
+            return Idle::Unseen;
+        }
+        if self.spelling.done() {
+            return Idle::Done;
+        }
+        // What the reader is looking at is checked first.
+        let (doc, view) = (self.editor.doc(), self.viewport());
+        let at = |y: f32| self.layout.hit(Point { x: 0.0, y }).map(|pos| pos.block);
+        let mut in_view = Vec::new();
+        if let (Some(first), Some(last)) = (at(view.y.max(0.0)), at(view.y + view.height)) {
+            in_view.extend(doc.walk().map(|block| block.id.clone()).skip_while(|id| *id != first));
+            let shown = in_view.iter().position(|id| *id == last).map_or(in_view.len(), |at| at + 1);
+            in_view.truncate(shown);
         }
         let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
-        self.spelling.idle(self.editor.doc(), caret, &mut self.layout)
+        match self.spelling.idle(doc, caret, &in_view, &mut self.layout) {
+            true => Idle::Seen,
+            false => Idle::Unseen,
+        }
     }
 }
 
 /// What the layout painted for the part of the page in view, placed where the page area is.
 struct PagePaint {
     list: DisplayList,
+    /// What hangs over the page, placed in the page area: the preview of a figure.
+    over: DisplayList,
     /// Where the layout's origin is inside the page area.
     origin: Point,
     page: Color,
@@ -1328,6 +3548,9 @@ impl Paint for PagePaint {
         out.items.extend(self.list.items.iter().cloned());
         out.translate(first, Point { x: rect.x + self.origin.x, y: rect.y + self.origin.y });
         out.items.extend(scrollbar(rect, self.content, self.scroll, scheme, 1.0));
+        let first = out.items.len();
+        out.items.extend(self.over.items.iter().cloned());
+        out.translate(first, Point { x: rect.x, y: rect.y });
     }
 }
 
@@ -1335,8 +3558,28 @@ fn fill(rect: Rect, color: Color) -> Item {
     Item::Fill { rect, color, radius: 0.0 }
 }
 
+fn is_figure(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Figure { .. })
+}
+
+/// The blocks of text in `block`, itself among them, in the order of the document.
+fn written<'a>(block: &'a Block, out: &mut Vec<&'a Block>) {
+    if matches!(block.body, Body::Text(_)) {
+        out.push(block);
+    }
+    block.body.blocks().iter().for_each(|part| written(part, out));
+}
+
+/// The block of the document's own that `id` is in, or is.
+fn whole<'a>(doc: &'a Document, id: &BlockId) -> Option<&'a Block> {
+    fn holds(block: &Block, id: &BlockId) -> bool {
+        &block.id == id || block.body.blocks().iter().any(|part| holds(part, id))
+    }
+    doc.blocks.iter().find(|block| holds(block, id))
+}
+
 /// The colours the page is painted in. The light page is the one documents are styled for and exports use.
-fn palette(scheme: Scheme) -> Palette {
+pub fn palette(scheme: Scheme) -> Palette {
     if scheme == Scheme::Light {
         return Palette::LIGHT;
     }
@@ -1430,7 +3673,7 @@ fn hex(ink: Ink) -> String {
 }
 
 /// Reads a style's `#rrggbb`.
-fn hex_color(hex: &str) -> Option<Color> {
+pub(crate) fn hex_color(hex: &str) -> Option<Color> {
     let rgb = u32::from_str_radix(hex.strip_prefix('#').filter(|digits| digits.len() == 6)?, 16).ok()?;
     Some(Color::rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
 }
@@ -1451,22 +3694,12 @@ const ALIGNS: [(Icon, &str, TextAlign); 4] = [
 ];
 
 /// The bundled families, each with the face the bar shows its name in.
-const FAMILIES: [(&str, Family); 3] = [
+pub(crate) const FAMILIES: [(&str, Family); 3] = [
     (letters_fonts::SANS, Family::Sans),
     (letters_fonts::DISPLAY, Family::Display),
     (letters_fonts::MONO, Family::Mono),
 ];
 
 /// The weights offered for a type. The bundled faces are variable, so every family has them all.
-const WEIGHTS: [(u16, &str); 5] = [(300, "Light"), (400, "Regular"), (500, "Medium"), (600, "Semibold"), (700, "Bold")];
-
-/// One of the document's element types, with the face it is set in.
-fn style_row(name: &str, style: &letters_model::TextStyle) -> Element<Message> {
-    let face = format!("{} {} pt", style.family, style.size);
-    Element::row()
-        .align(Align::Center)
-        .justify(Justify::Between)
-        .min_height(tokens::CONTROL_HEIGHT_SM)
-        .child(Element::text(name, TextStyle::control()))
-        .child(Element::text(face, TextStyle::control().size(tokens::TEXT_SM)).fg(tokens::FG_MUTED))
-}
+pub(crate) const WEIGHTS: [(u16, &str); 5] =
+    [(300, "Light"), (400, "Regular"), (500, "Medium"), (600, "Semibold"), (700, "Bold")];

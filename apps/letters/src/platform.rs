@@ -4,20 +4,38 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use letters_editor::{Clip, Platform};
 
+use crate::pictures;
+use crate::words::Words;
+
 pub struct Desktop {
     start: Instant,
     /// Connected on first use, since reaching the display server would slow every launch.
     clipboard: Option<arboard::Clipboard>,
+    /// Where a word the person teaches the app is kept.
+    words: Option<Words>,
+    /// The assets the editor handed over since they were last taken.
+    stored: Vec<(String, Vec<u8>)>,
 }
 
 impl Desktop {
     pub fn new() -> Self {
-        Self { start: Instant::now(), clipboard: None }
+        Self { start: Instant::now(), clipboard: None, words: None, stored: Vec::new() }
+    }
+
+    /// Keeps the words the person adds in `words`. Without this they last as long as their window.
+    pub fn with_words(self, words: Words) -> Self {
+        Self { words: Some(words), ..self }
     }
 
     /// The moment the editor's clock reads `ms`.
     pub fn instant(&self, ms: u64) -> Instant {
         self.start + Duration::from_millis(ms)
+    }
+
+    /// The assets the editor has stored since this was last asked, for the window whose document names
+    /// them: its file, its journal and its screen all need them.
+    pub fn take_assets(&mut self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut self.stored)
     }
 
     fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
@@ -39,12 +57,25 @@ impl Platform for Desktop {
         self.start.elapsed().as_millis() as u64
     }
 
+    fn wall_time(&self) -> Option<u64> {
+        SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|since| since.as_secs())
+    }
+
     fn clipboard_read(&mut self) -> Option<Clip> {
         let clipboard = self.clipboard()?;
+        // Copied picture files are pasted as their pictures, not as the paths that come with them.
+        let files = clipboard.get().file_list().unwrap_or_default();
+        let pictures = pictures::from_files(&files);
+        if !pictures.is_empty() {
+            return Some(Clip { pictures, ..Clip::default() });
+        }
         let html = clipboard.get().html().ok().filter(|html| !html.is_empty());
         let text = clipboard.get_text().ok().filter(|text| !text.is_empty());
         if text.is_none() && html.is_none() {
-            return None;
+            // Only a picture, as a screenshot is.
+            let image = clipboard.get_image().ok()?;
+            let picture = pictures::from_rgba(image.width as u32, image.height as u32, &image.bytes)?;
+            return Some(Clip { pictures: vec![picture], ..Clip::default() });
         }
         Some(Clip { text: text.unwrap_or_default(), html, ..Clip::default() })
     }
@@ -61,6 +92,18 @@ impl Platform for Desktop {
     fn new_id(&mut self) -> String {
         block_id()
     }
+
+    fn store_asset(&mut self, name: &str, bytes: &[u8]) {
+        self.stored.push((name.to_owned(), bytes.to_vec()));
+    }
+
+    fn learn_word(&mut self, word: &str) {
+        if let Some(words) = &self.words
+            && let Err(error) = words.learn(word)
+        {
+            eprintln!("letters: could not keep the word {word:?}: {error}");
+        }
+    }
 }
 
 fn random<const N: usize>() -> [u8; N] {
@@ -71,9 +114,7 @@ fn random<const N: usize>() -> [u8; N] {
 
 /// A block id: 80 random bits as 16 characters, short enough to keep `document.json` readable.
 pub fn block_id() -> String {
-    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let bits = random::<10>().iter().fold(0u128, |bits, byte| bits << 8 | u128::from(*byte));
-    (0..16).map(|i| ALPHABET[(bits >> (5 * i) & 31) as usize] as char).collect()
+    letters_editor::block_id(random())
 }
 
 /// A document id: a random (version 4) UUID.
@@ -88,6 +129,13 @@ pub fn document_id() -> String {
 /// The current time as RFC 3339, in UTC.
 pub fn now_rfc3339() -> String {
     rfc3339(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs()))
+}
+
+/// A time written in UTC, as RFC 3339 with the offset of the person's own time zone. What is kept on disk
+/// stays in UTC: this is for what a window shows, which has no clock or time zone of its own.
+pub fn local(utc: &str) -> String {
+    let Ok(time) = utc.parse::<jiff::Timestamp>() else { return utc.to_owned() };
+    time.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%dT%H:%M:%S%:z").to_string()
 }
 
 /// Seconds since the Unix epoch as RFC 3339, in UTC.

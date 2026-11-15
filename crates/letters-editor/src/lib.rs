@@ -8,12 +8,17 @@
 
 mod clipboard;
 mod edit;
+mod figures;
 mod input;
 mod keymap;
 mod markers;
 mod merge;
 mod motion;
+mod parts;
+mod refs;
 mod rules;
+mod shared;
+mod table;
 mod text;
 mod tree;
 
@@ -21,14 +26,18 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 
 use letters_model::{
-    Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, Pos, ReplicaId, Selection,
+    Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, OpError, Page, Pos, ReplicaId, Run,
+    Selection, Style, TextStyle,
 };
 
+pub use figures::Spot;
 pub use keymap::Keymap;
 /// The markers [`Editor::markers`] returns. They live in the model so that layout can draw them.
 pub use letters_model::{Marker, Markers};
 use merge::Kept;
 pub use motion::Lines;
+pub use refs::{Numbered, Referring};
+pub use table::{Cell, TableEdit};
 
 /// Text input, as every platform delivers it. Offsets are UTF-8 bytes relative to the caret's block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,14 +113,23 @@ pub enum Motion {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// Moves the caret, or only the head of the selection when `extend` is set.
+    ///
+    /// An arrow with no text left to go to makes an empty line outside a code block, a quote or a callout,
+    /// or past a block that holds no text, and that is an edit.
     Move {
         to: Motion,
         extend: bool,
     },
     /// Deletes the selection, or from the caret to where the motion leads.
     Delete(Motion),
-    /// Breaks the block at the caret, as Enter does.
+    /// Puts the caret below everything, as a click under the last block asks. It goes to the end of the
+    /// body text, heading or list item the document ends in. After anything else an empty line is made for it.
+    LineBelow,
+    /// Breaks the block at the caret, as Enter does. Inside inline maths it leaves the formula instead.
     Split,
+    /// Steps out of the formula the caret is in, as Esc does: to just after inline maths, or to the line
+    /// below a formula block, which is made when there is none.
+    LeaveFormula,
     /// A line break that stays inside the block.
     LineBreak,
     /// Nests list items one level deeper, or steps a line of code in.
@@ -126,6 +144,59 @@ pub enum Command {
     SetBlock(BlockKind),
     /// Ticks or unticks the task under the caret.
     ToggleChecked,
+    /// Puts in a table of empty cells, its first row the header, and the caret in its first cell. It
+    /// follows the block the selection ends in, or takes the place of an empty line.
+    InsertTable {
+        rows: usize,
+        columns: usize,
+    },
+    /// Changes the table the caret is in. [`Editor::cell`] says where in it the caret is.
+    Table(TableEdit),
+    /// Puts pictures in: one as a figure, several as a gallery, and the last is left selected. With no
+    /// spot they go below the block the selection ends in, in place of an empty line, or beside the
+    /// selected picture of a gallery. The bytes go to [`Platform::store_asset`], and what is no picture
+    /// Letters can show is left out.
+    InsertFigures {
+        pictures: Vec<Picture>,
+        at: Option<Spot>,
+    },
+    /// Moves the caret's figure, as dragging it does: the one whose picture is selected, or in whose
+    /// caption the caret is. A gallery it leaves with one picture becomes a figure.
+    MoveFigure(Spot),
+    /// Moves the selected picture one place along its gallery.
+    ShiftFigure {
+        right: bool,
+    },
+    /// Sets the size the caret's figure is shown at, in points.
+    ResizeFigure {
+        width: f32,
+        height: f32,
+    },
+    /// Says what the caret's figure shows, for a reader who cannot see it.
+    SetAlt(String),
+    /// Turns the generated label before a caption, such as "Figure 2:", on or off: for the caret's
+    /// figure, or for the gallery it is in.
+    SetNumbered(bool),
+    /// Puts the caret in the caption of the selected picture, as Enter does there. A gallery has one
+    /// caption for all its pictures, which is made when there is none.
+    EditCaption,
+    /// Steps out of a caption, as Esc does: back to the picture it stands under.
+    LeaveCaption,
+    /// Keeps a linked picture in the document: the figure shows `picture` from the file's assets in place
+    /// of the address it was loaded from, as wide as it was and as high as the picture's own shape makes
+    /// that. The figure is named, since the bytes may arrive when the caret is elsewhere. Nothing happens
+    /// when the figure is gone or already kept, or the bytes are no picture Letters shows.
+    EmbedFigure {
+        figure: BlockId,
+        picture: Picture,
+    },
+    /// Puts a reference to a numbered figure or gallery at the caret, in place of the words typed for
+    /// it, which [`Editor::referring`] tells of, or of the selection. It reads as the figure's label and
+    /// follows the figure's number.
+    TakeReference(BlockId),
+    /// Leaves the words typed for a reference as words, as Esc does while a list of figures is open:
+    /// [`Editor::referring`] is `None` until other words are typed for one.
+    DismissReference,
     Undo,
     Redo,
     SelectAll,
@@ -138,12 +209,37 @@ pub enum Command {
     Paste,
     /// Pastes the clipboard's text as it is, with no formatting.
     PastePlain,
+    /// Sets the style of one element type, such as `heading1`, which every block of that type takes.
+    /// A style the file format would refuse changes nothing.
+    SetStyle {
+        element: String,
+        style: TextStyle,
+    },
+    /// Sets the paper size and margins.
+    SetPage(Page),
+    /// Makes a page of print start with a block, or no longer start there. Nothing of it shows while
+    /// writing: Print view places these breaks and takes them away.
+    SetPageBreak {
+        block: BlockId,
+        on: bool,
+    },
+    /// Replaces the whole style, as applying a stylesheet does.
+    ReplaceStyle(Style),
+    /// Sets the language the document is written in.
+    SetLanguage(String),
+    /// Adds a word to the document's own dictionary. [`Platform::learn_word`] keeps one for the person.
+    AddWord(String),
+    RemoveWord(String),
 }
 
 /// What the shell lends the editor.
 pub trait Platform {
     /// Milliseconds since an arbitrary start. Only differences are meaningful.
     fn now_ms(&self) -> u64;
+    /// The time of day, in seconds since 1970, which edits are dated with. `None` leaves them undated.
+    fn wall_time(&self) -> Option<u64> {
+        None
+    }
     fn clipboard_read(&mut self) -> Option<Clip>;
     fn clipboard_write(&mut self, clip: Clip);
     /// A new identifier, unique across devices.
@@ -157,6 +253,14 @@ pub trait Platform {
     fn store_asset(&mut self, _name: &str, _bytes: &[u8]) {}
     /// Keeps a word in the person's own dictionary, which every document is checked against.
     fn learn_word(&mut self, _word: &str) {}
+}
+
+/// A block id made of 80 random bits: 16 characters, short enough to keep `document.json` readable. The
+/// shell brings the bits, as the core has no randomness of its own, and answers [`Platform::new_id`] with it.
+pub fn block_id(random: [u8; 10]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let bits = random.iter().fold(0u128, |bits, byte| bits << 8 | u128::from(*byte));
+    (0..16).map(|i| ALPHABET[(bits >> (5 * i) & 31) as usize] as char).collect()
 }
 
 /// Clipboard content: plain text (Markdown when Letters wrote it) and, where offered, HTML and images.
@@ -183,6 +287,8 @@ pub struct Picture {
 struct Caret {
     selection: Selection,
     marks: BTreeSet<Mark>,
+    /// Whether the caret is on a figure's picture, and not in the caption its position names.
+    picture: bool,
 }
 
 /// One undo step: a run of model edits that are undone together, and the carets either side of them.
@@ -236,6 +342,10 @@ pub struct Editor {
     merges: u64,
     /// The caret before the edits that are not yet an undo step.
     origin: Kept,
+    /// Where the words typed for a reference start that Esc has said are only words.
+    dismissed: Option<(BlockId, usize)>,
+    /// The blocks that the command at hand put back under another id, see [`shared`].
+    renames: shared::Renames,
 }
 
 impl Editor {
@@ -260,6 +370,8 @@ impl Editor {
             goal: None,
             merges: 0,
             origin: Kept::default(),
+            dismissed: None,
+            renames: Vec::new(),
         };
         if let Some(pos) = first {
             editor.place(pos);
@@ -277,20 +389,28 @@ impl Editor {
         &self.model
     }
 
+    /// Names who writes here. Edits made from here on carry the name, for every copy of the document.
+    pub fn set_author(&mut self, name: &str) {
+        self.model.set_author(name);
+    }
+
     /// `None` when the document has nowhere to put a caret.
     pub fn selection(&self) -> Option<&Selection> {
         self.caret.as_ref().map(|caret| &caret.selection)
     }
 
-    /// Moves the selection, as a click or a drag does. Positions are brought onto the nearest character, and a
-    /// selection that names no text block is ignored.
+    /// Moves the selection, as a click or a drag does. Positions are brought onto the nearest character, and
+    /// one that names a block with no text, such as an empty table, onto the text nearest to it. A
+    /// selection that names no block is ignored. In a figure the positions are in its caption:
+    /// [`Editor::select_picture`] selects the picture, and a picture in a gallery is only ever that.
     pub fn select(&mut self, selection: Selection) {
         self.end_composition();
         (self.rule, self.goal) = (false, None);
         self.seal();
-        if let (Some(anchor), Some(head)) = (self.clamp(&selection.anchor), self.clamp(&selection.head)) {
+        if let (Some(anchor), Some(head)) = (self.nearest(&selection.anchor), self.nearest(&selection.head)) {
             self.set_selection(Selection { anchor, head });
         }
+        self.forget();
     }
 
     pub fn keymap(&self) -> &Keymap {
@@ -328,6 +448,29 @@ impl Editor {
         if caret.selection.is_caret() { before.or(after) } else { after }
     }
 
+    /// The formula the caret or the selection is in: its block and where in it the TeX source sits. A formula
+    /// block is all source. A caret at either end of inline maths is in it only when text typed there
+    /// would be, which [`Editor::marks`] also says.
+    pub fn formula(&self) -> Option<(&BlockId, Range<usize>)> {
+        let caret = self.caret.as_ref()?;
+        let (start, end) = self.ordered(&caret.selection);
+        let block = self.doc().block(&start.block).filter(|_| start.block == end.block)?;
+        if block.kind == BlockKind::Formula {
+            return Some((&block.id, 0..text::len(block)));
+        }
+        let runs = block.body.runs();
+        let maths = |run: &Run| run.marks.contains(&Mark::Math);
+        let inside = match caret.selection.is_caret() {
+            true => caret.marks.contains(&Mark::Math),
+            false => text::runs_in(runs, start.offset..end.offset).all(maths),
+        };
+        let before = text::marks_before(runs, start.offset).contains(&Mark::Math);
+        let after = text::marks_after(runs, end.offset).contains(&Mark::Math);
+        let from = if before { text::stretch_start(runs, start.offset, maths) } else { start.offset };
+        let to = if after { text::stretch_end(runs, end.offset, maths) } else { end.offset };
+        inside.then_some((&block.id, from..to))
+    }
+
     /// The text an input method is composing: its block and where in it the text sits.
     pub fn composition(&self) -> Option<(&BlockId, Range<usize>)> {
         let composing = self.composing.as_ref()?;
@@ -344,28 +487,56 @@ impl Editor {
 
     /// Feeds text input. Returns what changed, for layout.
     pub fn input(&mut self, event: InputEvent, platform: &mut dyn Platform) -> Change {
+        self.date(platform);
         self.handle(event, platform);
+        self.forget();
         std::mem::take(&mut self.change)
     }
 
-    /// Feeds a key press. Returns `None` when the key means nothing here, so the shell may use it.
+    /// Feeds a key press. Returns `None` when the key means nothing here, so the shell may use it. Of the
+    /// commands a key is bound to, the first that has something to act on runs.
     pub fn key(&mut self, event: KeyEvent, platform: &mut dyn Platform) -> Option<Change> {
-        let command = self.keymap.command(&event)?.clone();
-        self.exec(command, platform).then(|| std::mem::take(&mut self.change))
+        let commands: Vec<Command> = self.keymap.commands(&event).cloned().collect();
+        if commands.is_empty() {
+            return None;
+        }
+        self.date(platform);
+        let ran = commands.into_iter().any(|command| self.exec(command, platform));
+        ran.then(|| std::mem::take(&mut self.change))
     }
 
     pub fn run(&mut self, command: Command, platform: &mut dyn Platform) -> Change {
+        self.date(platform);
         self.exec(command, platform);
         std::mem::take(&mut self.change)
     }
 
-    /// Whether a command has anything to act on, so that a key it is bound to can fall through when not.
-    fn applies(&self, command: &Command) -> bool {
+    /// Tells the model the time before it is edited, as it has no clock of its own.
+    fn date(&mut self, platform: &dyn Platform) {
+        if let Some(seconds) = platform.wall_time() {
+            self.model.set_time(seconds);
+        }
+    }
+
+    /// Whether a command has anything to act on, so that a key it is bound to can fall through when not, and
+    /// a menu can show what is of no use here.
+    pub fn applies(&self, command: &Command) -> bool {
+        if let Command::EmbedFigure { figure, picture } = command {
+            // The figure is named, so the caret has no say.
+            return self.embeddable(figure, picture);
+        }
+        if let Command::SetPageBreak { block, on } = command {
+            return self.doc().block(block).is_some_and(|block| block.page_break != *on);
+        }
         let Some(caret) = &self.caret else {
             return match command {
                 Command::Undo => self.can_undo(),
                 Command::Redo => self.can_redo(),
-                Command::Paste | Command::PastePlain => true,
+                Command::Paste | Command::PastePlain | Command::LineBelow => true,
+                Command::InsertTable { .. } | Command::InsertFigures { .. } => true,
+                // The style and the document's own fields are there whether or not there is text.
+                Command::SetStyle { .. } | Command::SetPage(_) | Command::ReplaceStyle(_) => true,
+                Command::SetLanguage(_) | Command::AddWord(_) | Command::RemoveWord(_) => true,
                 _ => false,
             };
         };
@@ -374,13 +545,25 @@ impl Editor {
         match command {
             Command::Indent | Command::Outdent => {
                 matches!(kind, Some(BlockKind::ListItem { .. } | BlockKind::Code { .. }))
+                    || self.grid(&caret.selection.head.block).is_some()
             }
             Command::ToggleChecked => {
                 matches!(kind, Some(BlockKind::ListItem { list: ListKind::Task { .. }, .. }))
             }
-            Command::ToggleMark(_) => ranged || !matches!(kind, Some(BlockKind::Code { .. })),
+            Command::ToggleMark(_) => {
+                ranged || !(caret.picture || matches!(kind, Some(BlockKind::Code { .. } | BlockKind::Formula)))
+            }
             Command::SetLink(_) => ranged || self.link().is_some(),
-            Command::Copy | Command::Cut => ranged,
+            Command::Copy | Command::Cut => ranged || caret.picture,
+            Command::LeaveFormula => self.formula().is_some(),
+            Command::Table(_) => self.cell().is_some(),
+            Command::MoveFigure(_) | Command::ResizeFigure { .. } | Command::SetAlt(_) => self.subject().is_some(),
+            Command::ShiftFigure { .. } => caret.picture && self.member(&caret.selection.head.block),
+            Command::SetNumbered(_) => self.numbered_by(&caret.selection.head.block).is_some(),
+            Command::EditCaption => caret.picture,
+            Command::LeaveCaption => self.captioned().is_some(),
+            Command::TakeReference(_) => self.referable(),
+            Command::DismissReference => self.referring().is_some(),
             Command::Undo => self.can_undo(),
             Command::Redo => self.can_redo(),
             _ => true,
@@ -393,6 +576,7 @@ impl Editor {
         }
         let now = platform.now_ms();
         self.end_composition();
+        self.renames.clear();
         let rule = std::mem::take(&mut self.rule);
         let goal = self.goal.take();
         self.mark();
@@ -405,14 +589,34 @@ impl Editor {
                 self.delete(motion, platform);
                 kind = Kind::Deleting;
             }
+            Command::LineBelow => self.line_below(platform),
             Command::Split => kind = self.split(platform),
+            Command::LeaveFormula => self.leave_formula(platform),
             Command::LineBreak => self.insert("\n"),
-            Command::Indent => self.indent(true),
-            Command::Outdent => self.indent(false),
+            Command::Indent => self.indent(true, platform),
+            Command::Outdent => self.indent(false, platform),
             Command::ToggleMark(mark) => self.toggle_mark(mark),
             Command::SetLink(link) => self.set_link(link),
             Command::SetBlock(block) => self.set_block(block, platform),
             Command::ToggleChecked => self.toggle_checked(),
+            Command::InsertTable { rows, columns } => self.insert_table(rows, columns, platform),
+            Command::Table(edit) => self.table_edit(edit, platform),
+            Command::InsertFigures { pictures, at } => self.insert_figures(&pictures, at.as_ref(), platform),
+            Command::MoveFigure(spot) => self.move_figure(&spot, platform),
+            Command::ShiftFigure { right } => self.shift_figure(right, platform),
+            Command::ResizeFigure { width, height } => self.resize_figure(width, height),
+            Command::SetAlt(alt) => self.set_alt(alt),
+            Command::SetNumbered(on) => {
+                let holder = self.selection().and_then(|selection| self.numbered_by(&selection.head.block));
+                if let Some(holder) = holder.map(|holder| holder.id.clone()) {
+                    self.set_numbered(&holder, on);
+                }
+            }
+            Command::EditCaption => self.edit_caption(platform),
+            Command::LeaveCaption => self.leave_caption(),
+            Command::EmbedFigure { figure, picture } => self.embed_figure(&figure, &picture, platform),
+            Command::TakeReference(to) => self.take_reference(&to),
+            Command::DismissReference => self.dismiss_reference(),
             Command::Undo => _ = self.undo_step(),
             Command::Redo => self.redo_step(),
             Command::SelectAll => self.select_all(),
@@ -422,8 +626,20 @@ impl Editor {
             Command::Cut => self.cut(platform),
             Command::Paste => self.paste(false, platform),
             Command::PastePlain => self.paste(true, platform),
+            Command::SetStyle { element, style } => _ = self.apply(vec![Op::SetStyle { element, style }]),
+            Command::SetPage(page) => _ = self.apply(vec![Op::SetPage { page }]),
+            Command::SetPageBreak { block, on } => {
+                // The op sets all a block may carry, so the language goes back as it is.
+                let lang = self.doc().block(&block).and_then(|block| block.lang.clone());
+                _ = self.apply(vec![Op::SetBlockProps { block, page_break: on, lang }]);
+            }
+            Command::ReplaceStyle(style) => _ = self.apply(vec![Op::ReplaceStyle { style }]),
+            Command::SetLanguage(language) => _ = self.apply(vec![Op::SetLanguage { language }]),
+            Command::AddWord(word) => _ = self.apply(vec![Op::AddWord { word }]),
+            Command::RemoveWord(word) => _ = self.apply(vec![Op::RemoveWord { word }]),
         }
         self.commit(kind, now, false);
+        self.forget();
         true
     }
 
@@ -432,9 +648,10 @@ impl Editor {
         if ops.is_empty() {
             return false;
         }
+        let (ops, renames) = shared::unshared(self.doc(), ops);
         // The model records an undo step only for an edit that changed something, so the count kept here
-        // must do the same. An edit that adds or removes blocks always does. Any other is checked against
-        // the blocks it names.
+        // must do the same. An edit that adds or removes blocks always does, and one to the style or the
+        // document's own fields says so in its change. Any other is checked against the blocks it names.
         let structural = |op: &Op| {
             matches!(op, Op::Split { .. } | Op::Join { .. } | Op::InsertBlock { .. } | Op::RemoveBlock { .. })
         };
@@ -443,7 +660,8 @@ impl Editor {
             Op::DeleteText { block, .. }
             | Op::SetMark { block, .. }
             | Op::SetLink { block, .. }
-            | Op::SetKind { block, .. } => Some(block.clone()),
+            | Op::SetKind { block, .. }
+            | Op::SetBlockProps { block, .. } => Some(block.clone()),
             _ => None,
         };
         let before: Option<Vec<Block>> = (!ops.iter().any(structural)).then(|| {
@@ -457,12 +675,20 @@ impl Editor {
         }
         let change = match self.model.apply(ops) {
             Ok(change) => change,
+            // The style is the caller's, and the model is the judge of what one may hold.
+            Err(OpError::BadStyle(_)) => return false,
             Err(error) => {
                 debug_assert!(false, "the editor planned an edit the model refused: {error}");
                 return false;
             }
         };
-        let changed = before.is_none_or(|blocks| blocks.iter().any(|block| self.doc().block(&block.id) != Some(block)));
+        // The selection stays with a block that came back under another id.
+        for pos in self.caret.iter_mut().flat_map(|caret| [&mut caret.selection.anchor, &mut caret.selection.head]) {
+            pos.block = shared::renamed(&renames, &pos.block);
+        }
+        self.renames.extend(renames);
+        let differs = |blocks: Vec<Block>| blocks.iter().any(|block| self.doc().block(&block.id) != Some(block));
+        let changed = change.style || change.document || before.is_none_or(differs);
         if changed {
             self.steps += 1;
             self.note(change);
@@ -473,11 +699,17 @@ impl Editor {
     fn note(&mut self, change: Change) {
         self.change.blocks.extend(change.blocks);
         self.change.structure |= change.structure;
+        self.change.style |= change.style;
+        self.change.document |= change.document;
     }
 
     /// Closes the edits made since the last call as one undo step, or adds them to the step before when
     /// they continue it. `fresh` keeps them apart.
     fn commit(&mut self, kind: Kind, now: u64, fresh: bool) {
+        // An edit may have taken away the block its caret was left in.
+        if self.caret.as_ref().is_some_and(|caret| self.fit(caret).as_ref() != Some(caret)) {
+            self.restore(self.caret.clone());
+        }
         let before = self.origin.clone();
         let count = std::mem::take(&mut self.steps);
         if count == 0 {
@@ -551,13 +783,47 @@ impl Editor {
     }
 
     fn block(&self, id: &BlockId) -> Option<&Block> {
-        self.doc().block(id)
+        self.model.block(id)
+    }
+
+    /// The id that a block goes by now which the command at hand took out and put back. Any id held from
+    /// before such an edit is asked for here, since a block that shares it may have taken it.
+    fn renamed(&self, id: &BlockId) -> BlockId {
+        shared::renamed(&self.renames, id)
     }
 
     /// The position on a character boundary of a text block that is nearest to `pos`.
     fn clamp(&self, pos: &Pos) -> Option<Pos> {
         let block = self.block(&pos.block).filter(|block| tree::is_text(block))?;
-        Some(Pos::new(pos.block.clone(), text::snap(&block.plain_text(), pos.offset)))
+        let offset = text::snap(&block.plain_text(), pos.offset.min(self.span(block)));
+        // A reference is come to at one of its ends, whichever is nearer.
+        let offset = match refs::around(block, offset) {
+            Some(range) if offset - range.start < range.end - offset => range.start,
+            Some(range) => range.end,
+            None => offset,
+        };
+        Some(Pos::new(pos.block.clone(), offset))
+    }
+
+    /// A selection with neither end inside a reference: a caret stands at the nearer end of one, and a
+    /// range takes it whole.
+    fn whole(&self, selection: Selection) -> Selection {
+        let inside = |pos: &Pos| self.block(&pos.block).and_then(|block| refs::around(block, pos.offset));
+        if inside(&selection.anchor).is_none() && inside(&selection.head).is_none() {
+            return selection;
+        }
+        if selection.is_caret() {
+            return self.clamp(&selection.head).map_or(selection, Selection::caret);
+        }
+        let (start, end) = self.ordered(&selection);
+        let from = inside(&start).map_or(start.offset, |range| range.start);
+        let to = inside(&end).map_or(end.offset, |range| range.end);
+        let (from, to) = (Pos::new(start.block.clone(), from), Pos::new(end.block, to));
+        if selection.anchor == start {
+            Selection { anchor: from, head: to }
+        } else {
+            Selection { anchor: to, head: from }
+        }
     }
 
     /// The ends of a selection in document order.
@@ -591,7 +857,7 @@ impl Editor {
     /// block the caret sits before any opening marker, so only marks that show no marker carry over from the
     /// first character. Code blocks carry none.
     fn natural(&self, pos: &Pos) -> BTreeSet<Mark> {
-        let Some(block) = self.block(&pos.block).filter(|block| !text::is_code(block)) else {
+        let Some(block) = self.block(&pos.block).filter(|block| !text::is_source(block)) else {
             return BTreeSet::new();
         };
         let runs = block.body.runs();
@@ -603,14 +869,17 @@ impl Editor {
 
     /// Selects with the marks that follow from the text: a range takes those of its first character.
     fn set_selection(&mut self, selection: Selection) {
+        let selection = self.whole(selection);
         let marks = if selection.is_caret() {
             self.natural(&selection.head)
         } else {
             let (start, _) = self.ordered(&selection);
-            let block = self.block(&start.block).filter(|block| !text::is_code(block));
+            let block = self.block(&start.block).filter(|block| !text::is_source(block));
             block.map(|block| text::marks_after(block.body.runs(), start.offset)).unwrap_or_default()
         };
-        self.caret = Some(Caret { selection, marks });
+        let picture = selection.is_caret() && self.member(&selection.head.block);
+        // Text typed beside a reference is no part of it.
+        self.caret = Some(Caret { selection, marks: refs::plain(marks), picture });
     }
 
     fn place(&mut self, pos: Pos) {
@@ -619,6 +888,8 @@ impl Editor {
 
     /// Puts the caret at `pos` with marks chosen by the caller.
     fn place_with(&mut self, pos: Pos, marks: BTreeSet<Mark>) {
-        self.caret = Some(Caret { selection: Selection::caret(pos), marks });
+        let pos = self.clamp(&pos).unwrap_or(pos);
+        let picture = self.member(&pos.block);
+        self.caret = Some(Caret { selection: Selection::caret(pos), marks: refs::plain(marks), picture });
     }
 }

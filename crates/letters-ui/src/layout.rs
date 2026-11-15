@@ -17,7 +17,7 @@ use crate::tree::{Id, Tree};
 use crate::widgets::{Placement, Side};
 
 /// The room kept between a popover and the window's edge.
-const MARGIN: f32 = 8.0;
+pub(crate) const MARGIN: f32 = 8.0;
 /// A text field's width when nothing else decides it.
 const INPUT_WIDTH: f32 = 180.0;
 

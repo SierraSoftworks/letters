@@ -2,7 +2,7 @@
 
 use letters_editor::{Clip, Command, Editor, InputEvent, Motion, Platform};
 use letters_layout::{DocLayout, Palette};
-use letters_model::{Block, BlockKind, Body, Document, Mark, Pos, ReplicaId, Run, Selection, Style, Tone};
+use letters_model::{Block, BlockKind, Body, Change, Document, Mark, Pos, ReplicaId, Run, Selection, Style, Tone};
 use letters_render::{Color, Item, Point};
 use proptest::prelude::*;
 
@@ -26,12 +26,6 @@ impl Platform for Desk {
     fn new_id(&mut self) -> String {
         "new".into()
     }
-}
-
-/// A paragraph of runs, each plain or marked.
-fn rich(id: &str, runs: &[(&str, &[Mark])]) -> Block {
-    let runs = runs.iter().map(|(text, marks)| Run::marked(*text, marks.iter().cloned())).collect();
-    Block { body: Body::Text(runs), ..paragraph(id, "") }
 }
 
 /// A sentence that wraps, with `word` marked on its second line.
@@ -395,7 +389,12 @@ proptest! {
             if std::mem::replace(&mut stop, here.clone()) == here {
                 break;
             }
-            page.editor.run(Command::Move { to: Motion::Right, extend: false }, &mut Desk);
+            let moved = page.editor.run(Command::Move { to: Motion::Right, extend: false }, &mut Desk);
+            if moved != Change::default() {
+                // Past the last text the arrow makes a line to leave a callout by, and the walk ends before it.
+                page.editor.run(Command::Undo, &mut Desk);
+                break;
+            }
         }
         prop_assert_eq!(stop.map(|stop| stop.0), page.layout.hit(Point { x: 1.0e6, y: 1.0e6 }), "the walk reached the end");
         page.layout.reveal(None);

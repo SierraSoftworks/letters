@@ -2,17 +2,7 @@
 
 import { expect, test } from "@playwright/test";
 
-/** The document on screen, one entry per block: its type and its text. */
-const blocks = (page) =>
-  page.evaluate(() =>
-    JSON.parse(window.letters.json()).blocks.map((block) => ({
-      type: block.type,
-      text: (block.content ?? []).map((run) => run.text).join(""),
-    })),
-  );
-
-const texts = async (page) => (await blocks(page)).map((block) => block.text);
-const frames = (page) => page.evaluate(() => window.letters.frames);
+import { blocks, frames, ready, texts } from "./page.js";
 
 /** How many different colours the canvas shows, from a sample of its pixels. */
 const colours = (page) =>
@@ -26,17 +16,14 @@ const colours = (page) =>
 const compose = (page, type, text) =>
   page.locator("textarea").evaluate(
     (input, [type, text]) => {
-      if (type === "input") input.value = text;
+      if (type === "input") input.value = ` ${text}`;
       const event = type === "input" ? new InputEvent(type, { data: text, isComposing: true }) : new CompositionEvent(type, { data: text });
       input.dispatchEvent(event);
     },
     [type, text],
   );
 
-test.beforeEach(async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(() => window.letters?.frames > 0);
-});
+test.beforeEach(({ page }) => ready(page));
 
 test("boots to a painted document that fills the page", async ({ page }) => {
   const size = await page.evaluate(() => {
@@ -49,13 +36,21 @@ test("boots to a painted document that fills the page", async ({ page }) => {
   expect(await colours(page)).toBeGreaterThan(16);
 });
 
+test("a page where nothing changes paints only its caret's blink", async ({ page }) => {
+  // Long enough for the first frame's fade and the spelling check to be over.
+  await page.waitForTimeout(500);
+  const before = await frames(page);
+  await page.waitForTimeout(1000);
+  expect((await frames(page)) - before).toBeLessThan(10);
+});
+
 test("typing reaches the document and the canvas", async ({ page }) => {
   const [before, painted] = [await texts(page), await frames(page)];
   await page.keyboard.type("Typed in a browser");
   await expect.poll(() => texts(page)).toEqual([...before.slice(0, -1), "Typed in a browser"]);
   await expect.poll(() => frames(page)).toBeGreaterThan(painted);
-  // The hidden input passes text on and keeps none of it.
-  await expect(page.locator("textarea")).toHaveValue("");
+  // The hidden input passes text on, and then holds what the document does around the caret.
+  await expect(page.locator("textarea")).toHaveValue(" Typed in a browser");
 });
 
 test("editing keys and Markdown shorthand work as they do on the desktop", async ({ page }) => {
@@ -86,6 +81,35 @@ test("copy and paste go through the browser's clipboard events", async ({ page }
   await expect.poll(() => texts(page)).toContain("twice twice ");
 });
 
+test("the copy button of a code block puts its code on the clipboard", async ({ page, context, browserName }) => {
+  // A headless Chromium refuses the write that a press allows in a window. Firefox knows no such permission.
+  if (browserName === "chromium") await context.grantPermissions(["clipboard-write"]);
+  await page.keyboard.type("```");
+  await page.keyboard.press("Enter");
+  await page.keyboard.type("let x = 1;");
+  // The button is in the corner of the block, beside its first line, where the pointer says it can be
+  // pressed. The hidden input is where the caret is.
+  const canvas = page.locator("canvas");
+  const { width } = page.viewportSize();
+  const line = await page.locator("textarea").boundingBox();
+  const y = line.y + line.height / 2;
+  const found = async () => {
+    for (let x = width - 8; x > width / 2; x -= 10) {
+      await page.mouse.move(x, y);
+      await page.evaluate(() => new Promise(requestAnimationFrame));
+      if ((await canvas.evaluate((canvas) => canvas.style.cursor)) === "pointer") return [x, y];
+    }
+  };
+  const at = await found();
+  expect(at, "a copy button under the pointer").toBeTruthy();
+  await page.mouse.click(...at);
+  // What was copied is pasted under the block.
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("ControlOrMeta+V");
+  await expect.poll(async () => (await texts(page)).slice(-2)).toEqual(["let x = 1;", "let x = 1;"]);
+});
+
 test("a composition shows as it is composed and commits its text", async ({ page }) => {
   await compose(page, "compositionstart", "");
   await compose(page, "input", "に");
@@ -93,7 +117,7 @@ test("a composition shows as it is composed and commits its text", async ({ page
   await compose(page, "input", "にほん");
   await compose(page, "compositionend", "日本");
   await expect.poll(() => texts(page)).toContain("日本");
-  await expect(page.locator("textarea")).toHaveValue("");
+  await expect(page.locator("textarea")).toHaveValue(" 日本");
 });
 
 test("a press on the canvas gives the keyboard back to the document", async ({ page }) => {

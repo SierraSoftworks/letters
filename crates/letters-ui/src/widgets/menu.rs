@@ -12,6 +12,9 @@ use crate::widgets::Popover;
 
 const ICON: f32 = 16.0;
 
+/// How wide a note is set before it wraps.
+const NOTE: f32 = 224.0;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tone {
     #[default]
@@ -93,6 +96,7 @@ impl<M> MenuItem<M> {
 enum Entry<M> {
     Item(MenuItem<M>),
     Heading(String),
+    Note(String, Tone),
     Separator,
 }
 
@@ -129,6 +133,12 @@ impl<M> Menu<M> {
         self
     }
 
+    /// A few quiet words on how things stand. They wrap, and are not there to choose.
+    pub fn note(mut self, note: impl Into<String>, tone: Tone) -> Self {
+        self.entries.push(Entry::Note(note.into(), tone));
+        self
+    }
+
     pub fn separator(mut self) -> Self {
         self.entries.push(Entry::Separator);
         self
@@ -158,6 +168,7 @@ impl<M> From<Menu<M>> for Element<M> {
             // yewi draws a rule wherever two kinds of thing meet, without being asked.
             let needs_rule = match &entry {
                 Entry::Heading(_) => !ruled,
+                Entry::Note(..) => false,
                 Entry::Item(item) => !ruled && item.tone == Tone::Danger && danger_before == Some(false),
                 Entry::Separator => true,
             };
@@ -173,6 +184,17 @@ impl<M> From<Menu<M>> for Element<M> {
                     let padding =
                         Edges { top: tokens::SPACE_XS, bottom: tokens::SPACE_2XS, ..Edges::xy(tokens::SPACE_MD, 0.0) };
                     element = element.child(Element::row().padding(padding).child(label));
+                }
+                Entry::Note(note, tone) => {
+                    let fg = match tone {
+                        Tone::Default => tokens::FG_MUTED,
+                        Tone::Warn => tokens::WARN,
+                        Tone::Danger => tokens::DANGER,
+                    };
+                    let style = TextStyle::body().size(tokens::TEXT_XS);
+                    let said = Element::paragraph(note, style).fg(fg).max_width(NOTE).role(Role::Status);
+                    let padding = Edges::xy(tokens::SPACE_MD, tokens::SPACE_XS);
+                    element = element.child(Element::column().padding(padding).child(said));
                 }
                 Entry::Item(item) => {
                     danger_before = Some(item.tone == Tone::Danger);

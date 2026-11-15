@@ -9,7 +9,8 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ::image::{DynamicImage, ImageDecoder, ImageReader, Limits};
+use ::image::imageops::{self, FilterType};
+use ::image::{DynamicImage, ImageDecoder, ImageReader, Limits, Rgba, RgbaImage};
 use vello_cpu::peniko::ImageAlphaType;
 use vello_cpu::{PixelMetadata, Pixmap};
 
@@ -51,23 +52,54 @@ impl From<::image::ImageError> for ImageError {
     }
 }
 
+/// `image` resampled to `width` pixels across, keeping its shape.
+fn narrowed(image: DynamicImage, width: u32) -> RgbaImage {
+    let height = (u64::from(image.height()) * u64::from(width)).div_ceil(u64::from(image.width())).max(1) as u32;
+    // A photo has no alpha, and is narrowed as it was decoded: its pixels with alpha are a third larger.
+    if !image.color().has_alpha() {
+        return image.resize_exact(width, height, FilterType::CatmullRom).into_rgba8();
+    }
+    // Colours are weighed by their alpha while pixels are mixed, or a clear pixel's colour would bleed
+    // into the edge of what is beside it.
+    let mut image = image.into_rgba8();
+    for Rgba([red, green, blue, alpha]) in image.pixels_mut() {
+        let weigh = |colour: &mut u8| *colour = ((u16::from(*colour) * u16::from(*alpha) + 127) / 255) as u8;
+        [red, green, blue].into_iter().for_each(weigh);
+    }
+    let mut image = imageops::resize(&image, width, height, FilterType::CatmullRom);
+    for Rgba([red, green, blue, alpha]) in image.pixels_mut() {
+        let alpha = u16::from(*alpha).max(1);
+        let bare = |colour: &mut u8| *colour = ((u16::from(*colour) * 255 + alpha / 2) / alpha).min(255) as u8;
+        [red, green, blue].into_iter().for_each(bare);
+    }
+    image
+}
+
 /// Decoded pixels, ready to draw. Cheap to clone.
 #[derive(Clone, Debug)]
 pub struct Image {
     pub(crate) pixels: Arc<Pixmap>,
     /// Unique to these pixels for the life of the process, so a renderer can tell a replaced asset.
     pub(crate) id: u64,
+    /// The file the pixels were decoded from, when it is a JPEG that shows the same picture as it stands.
+    /// A PDF stores that rather than the pixels, which for a photo are many times larger.
+    #[cfg(feature = "pdf")]
+    pub(crate) jpeg: Option<Arc<[u8]>>,
 }
 
 impl Image {
     /// Decodes a PNG, JPEG, GIF (first frame) or WebP, upright according to its EXIF orientation.
     pub fn decode(bytes: &[u8]) -> Result<Self, ImageError> {
+        Self::decode_within(bytes, u32::MAX)
+    }
+
+    /// Decodes as [`decode`](Self::decode), and holds the picture no wider than `within` pixels. A screen
+    /// that never draws it wider needs no more, and a photo at its full size is tens of megabytes.
+    pub fn decode_within(bytes: &[u8], within: u32) -> Result<Self, ImageError> {
         let mut reader = ImageReader::new(Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|error| ImageError::Invalid(error.to_string()))?;
-        if reader.format().is_none() {
-            return Err(ImageError::Unsupported);
-        }
+        let Some(format) = reader.format() else { return Err(ImageError::Unsupported) };
         let mut limits = Limits::default();
         limits.max_image_width = Some(MAX_SIDE);
         limits.max_image_height = Some(MAX_SIDE);
@@ -81,8 +113,18 @@ impl Image {
         let orientation = decoder.orientation()?;
         let mut image = DynamicImage::from_decoder(decoder)?;
         image.apply_orientation(orientation);
-        let image = image.into_rgba8();
-        Self::from_rgba8(image.width(), image.height(), image.into_raw())
+        let whole = image.width() <= within.max(1);
+        let image = if whole { image.into_rgba8() } else { narrowed(image, within.max(1)) };
+        #[cfg_attr(not(feature = "pdf"), expect(unused_mut, reason = "only the PDF backend keeps the file"))]
+        let mut image = Self::from_rgba8(image.width(), image.height(), image.into_raw())?;
+        #[cfg(feature = "pdf")]
+        if whole && format == ::image::ImageFormat::Jpeg && orientation == ::image::metadata::Orientation::NoTransforms
+        {
+            image.jpeg = Some(bytes.into());
+        }
+        #[cfg(not(feature = "pdf"))]
+        let _ = format;
+        Ok(image)
     }
 
     /// Wraps straight (not premultiplied) RGBA8 pixels, row by row from the top left.
@@ -99,7 +141,12 @@ impl Image {
         let metadata = PixelMetadata::new(ImageAlphaType::Alpha, true);
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let pixels = Arc::new(Pixmap::from_parts(rgba, width as u16, height as u16, metadata));
-        Ok(Self { pixels, id: NEXT.fetch_add(1, Ordering::Relaxed) })
+        Ok(Self {
+            pixels,
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            #[cfg(feature = "pdf")]
+            jpeg: None,
+        })
     }
 
     pub fn width(&self) -> u32 {

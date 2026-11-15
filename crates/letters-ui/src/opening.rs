@@ -2,8 +2,18 @@
 //!
 //! The window knows no file system. A path is a string the shell made, which it gets back unchanged.
 
+use letters_model::BlockId;
+use letters_render::Point;
+
+use crate::chrome::Edge;
+use crate::copying::CopyFormat;
+use crate::settings::Settings;
+
 /// What the window asks its shell to do. Collect them with `Window::take_requests` after each event.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// More will come, so a shell matches the ones it can do and lets the rest go.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Request {
     /// Open the recent document with this path.
     Open(String),
@@ -13,6 +23,105 @@ pub enum Request {
     New,
     /// The caret left the first Heading 1 of a document that has no name of its own: it takes this one.
     Named(String),
+    /// Call the document this. Answer with `Window::set_location`, or with `Window::set_notice` when it
+    /// cannot be done.
+    Rename(String),
+    /// Move the document to the folder with this path. Answered as a rename is.
+    Move(String),
+    /// Let the person choose a folder that is not in the tree, and move the document there.
+    MoveElsewhere,
+    /// Make a folder called `name` in the folder with the path `parent`, and list it with
+    /// `Window::set_location`.
+    NewFolder {
+        parent: String,
+        name: String,
+    },
+    /// Write a copy of the document called `name` in `format`, and leave this window on the document it
+    /// has. `folder` is the path of the folder to write it to, or `None` to let the person choose where.
+    /// A file of that name is in the way unless `replace` is set, which it is once the person has said so.
+    /// Answer with `Window::set_copied`, or with `Window::refuse_copy` when it cannot be done.
+    SaveCopy {
+        name: String,
+        format: CopyFormat,
+        folder: Option<String>,
+        replace: bool,
+    },
+    /// Keep this as the person's default style, which their new documents start with: the text of a
+    /// `style.json`. Answer with `Window::set_default_style` if it could not be kept.
+    SaveDefaultStyle(String),
+    /// Let the person choose a stylesheet, a `.letstyle` file, and hand its text to
+    /// `Window::offer_stylesheet`.
+    ImportStyle,
+    /// Let the person choose where to write this stylesheet: the text of a `.letstyle` file.
+    ExportStyle(String),
+    /// Import the file the shell offered with `Window::offer_import`, reading pictures and linked files
+    /// only from these folders, by the paths the offer gave them. Take the card away with
+    /// `Window::offer_import(None)` once the document is open, or offer again when it could not be done.
+    Import {
+        folders: Vec<String>,
+        /// Whether the file's comments come too.
+        comments: bool,
+    },
+    /// The file that was offered is not wanted. The card is already gone.
+    CancelImport,
+    /// Keep these as the person's settings, and tell every other window of them with
+    /// `Window::set_settings`. The window that asks already follows the accent. The rest is the shell's to
+    /// follow: light or dark, the name edits are signed with, and the language of new documents.
+    Settings(Settings),
+    /// Move the window with the pointer, which is held down on the bar: a bar that is the title bar asks
+    /// (see `Window::set_chrome`).
+    DragWindow,
+    /// Resize the window from this edge with the pointer, which is held down on the grip of a floating
+    /// window.
+    ResizeWindow(Edge),
+    /// Open the desktop's menu for the window at this point of it.
+    WindowMenu(Point),
+    Minimise,
+    /// Maximise the window, or restore it. Also asked by a double click on the bar, which on macOS does
+    /// what the person set their system to do.
+    ToggleMaximise,
+    /// Close the window.
+    Close,
+    /// The person asked to print the document, from Print view: hand what the PDF export writes to the
+    /// system's print dialog, or to the browser's.
+    Print,
+    /// Let the person choose pictures, and hand them to `Window::insert_pictures` with no point.
+    Pictures,
+    /// Read this asset of the document, by its entry name, and hand it decoded to `Window::set_image`.
+    /// Asked once for each picture the page comes to show, which keeps its place until then.
+    Asset(String),
+    /// The document links to this picture, by the address its figure has for a `src`. Fetch it if the
+    /// person's trust lets it load when a document opens, and hand it to `Window::set_image` under the
+    /// address as it is written here. Otherwise do nothing: the picture keeps its frame and cloud. Asked
+    /// once for each address, and again for those not showing after a [`Request::TrustPictures`].
+    LinkedPicture(String),
+    /// The person asked for this linked picture this once. Fetch it and hand it to `Window::set_image`.
+    LoadPicture(String),
+    /// The person trusts the host of this linked picture from now on: keep that. The window then asks for
+    /// every linked picture not yet showing with [`Request::LinkedPicture`] again.
+    TrustPictures(String),
+    /// The person wants this linked picture kept in the document. Fetch it and hand its bytes to
+    /// `Window::embed_picture` with the figure.
+    EmbedPicture {
+        figure: BlockId,
+        src: String,
+    },
+    /// The person trusts this document: keep that, treat the document as trusted from now on, and say so
+    /// with `Window::set_safe_mode(None)`. Asked from the bar that `Window::set_safe_mode` shows.
+    TrustDocument,
+    /// The person trusts the folder this document is in, and every document in it. Answered as
+    /// [`Request::TrustDocument`] is. Asked only when the shell named a folder.
+    TrustFolder,
+    /// The person asked to open the link with this address, as the document writes it. The shell judges
+    /// it by what the person trusts: it opens the link, or has the window show the whole address and ask
+    /// with `Window::ask_link`, or says why not with `Window::refuse_link`. `confirmed` is set once the
+    /// person has read the address on that card and said yes, which is enough for a link that asks, and
+    /// changes nothing for one that is refused. An address that starts with `#` is a place in the
+    /// document and is never asked about.
+    OpenLink {
+        href: String,
+        confirmed: bool,
+    },
 }
 
 /// A document opened lately, as the landing card lists it.
@@ -50,7 +159,8 @@ pub struct Location {
 pub struct Folder {
     pub path: String,
     pub name: String,
-    /// How far down the tree it is. The first folder, at 0, is the space itself.
+    /// How far down the tree it is. A folder at 0 is the space itself, or one outside it that holds the
+    /// document.
     pub depth: u8,
 }
 

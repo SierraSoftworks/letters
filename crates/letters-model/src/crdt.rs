@@ -17,7 +17,7 @@
 //! wasm-bindgen: the one thing the core takes from its host without being handed it.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::mem;
 use std::ops::Range;
@@ -36,7 +36,7 @@ use crate::flat::{Attrs, BLOCK, DEPTH, Entry, MARKER, build, head, insert, order
 use crate::history::read_id;
 use crate::json::{mark_name, read_mark};
 use crate::undo::Script;
-use crate::{Block, BlockKind, Document, Run, STYLE_FORMAT, Style};
+use crate::{Block, BlockId, BlockKind, Document, Mark, Properties, Run, STYLE_FORMAT, Style};
 
 pub(crate) const BODY: &str = "body";
 const BLOCKS: &str = "blocks";
@@ -45,17 +45,60 @@ const META: &str = "meta";
 const DICTIONARY: &str = "dictionary";
 const EXTRA: &str = "extra";
 const STYLE: &str = "style";
+/// The writers' names, each against the replica its writer used.
+const AUTHORS: &str = "authors";
+/// The blocks whose conflict was settled, each against its [`Settling`].
+const SETTLED: &str = "settled";
 const LANGUAGE: &str = "language";
+const PROPERTIES: &str = "properties";
 
 pub(crate) const LINK: &str = "link";
+/// The attribute for a run's language. It is the field `lang`, as a build that did not know it kept it.
+pub(crate) const LANG: &str = "x.lang";
+/// The attribute for the block a run refers to. Like [`LANG`], it is the field `ref` as an older build kept it.
+pub(crate) const REF: &str = "x.ref";
 /// Prefix of a mark's attribute, whose value is `true`.
 const MARK: &str = "m.";
 /// Prefix of the attribute for a run field this build does not know, whose value is the field's JSON.
 const FIELD: &str = "x.";
 
+/// How long one change may run on, in seconds, and so how closely an edit's time is known. A change
+/// costs the history about 5 bytes: a minute adds 7% to an hour of slow typing, ten seconds 50%.
+const CHANGE: i64 = 60;
+
 /// Typed text takes the formatting of the character before it.
 pub(crate) fn configure(loro: &LoroDoc) {
     loro.config_default_text_style(Some(StyleConfig { expand: ExpandType::After }));
+    loro.set_change_merge_interval(CHANGE);
+}
+
+/// Writes the name of the replica's writer into the change that is open.
+pub(crate) fn sign(loro: &LoroDoc, author: &str) {
+    let (authors, replica) = (loro.get_map(AUTHORS), loro.peer_id().to_string());
+    let held = authors.get(&replica).and_then(|held| held.into_value().ok());
+    if held.as_ref().and_then(text) != Some(author) {
+        // Loro refuses no string under a string.
+        let _ = authors.insert(&replica, author);
+    }
+}
+
+/// The name each replica's writer gave, as the revision shown holds them. A replica that gave none is not
+/// among them, as one that made an outside change never is.
+pub(crate) fn names(loro: &LoroDoc) -> HashMap<u64, String> {
+    let mut names = HashMap::new();
+    loro.get_map(AUTHORS).for_each(|replica, held| {
+        if let ValueOrContainer::Value(held) = held
+            && let Some(name) = text(&held).filter(|name| !name.is_empty())
+            && let Ok(replica) = replica.parse()
+        {
+            names.insert(replica, name.to_owned());
+        }
+    });
+    names
+}
+
+pub(crate) fn authors(loro: &LoroDoc) -> BTreeSet<String> {
+    names(loro).into_values().collect()
 }
 
 /// Text as the sequence can hold it. The marker character is the sequence's own, so text gives it up.
@@ -68,9 +111,25 @@ fn key(prefix: &str, name: &str) -> String {
     format!("{prefix}{}", name.replace('%', "%25").replace(':', "%3A"))
 }
 
-/// The attribute that carries `mark`.
-pub(crate) fn mark_attr(mark: &crate::Mark) -> String {
-    key(MARK, mark_name(mark))
+/// The attribute that carries `mark`, and the value that sets it.
+pub(crate) fn mark_attr(mark: &Mark) -> (String, LoroValue) {
+    match mark_name(mark) {
+        Some(name) => (key(MARK, name), true.into()),
+        None => (REF.to_owned(), field(mark_target(mark).unwrap_or_default())),
+    }
+}
+
+/// The id of the block a reference names.
+fn mark_target(mark: &Mark) -> Option<&str> {
+    match mark {
+        Mark::Ref(target) => Some(target.as_str()),
+        _ => None,
+    }
+}
+
+/// A text field as the attribute for an unknown field holds it: its JSON.
+fn field(text: &str) -> LoroValue {
+    Value::from(text).to_string().into()
 }
 
 fn name(key: &str) -> String {
@@ -82,6 +141,11 @@ fn text(value: &LoroValue) -> Option<&str> {
         LoroValue::String(text) => Some(text.as_str()),
         _ => None,
     }
+}
+
+/// What the [`LANG`] attribute holds for a language, or for none.
+pub(crate) fn lang_value(lang: Option<&str>) -> LoroValue {
+    lang.map_or(LoroValue::Null, field)
 }
 
 /// Changes a run's formatting as text attributes say. A null value clears, and unknown keys are left alone.
@@ -96,6 +160,15 @@ pub(crate) fn format<S: BuildHasher>(run: &mut Run, attrs: &Attrs<S>) {
             } else {
                 run.marks.remove(&mark);
             }
+        } else if attr == LANG || attr == REF {
+            let field = text(value).and_then(|json| serde_json::from_str::<String>(json).ok());
+            let field = field.filter(|field| !field.is_empty());
+            if attr == LANG {
+                run.lang = field;
+            } else {
+                run.marks.retain(|mark| mark_target(mark).is_none());
+                run.marks.extend(field.map(|target| Mark::Ref(BlockId::new(target))));
+            }
         } else if let Some(field) = attr.strip_prefix(FIELD) {
             match text(value).and_then(|json| serde_json::from_str(json).ok()) {
                 Some(value) => run.extra.insert(name(field), value),
@@ -107,10 +180,13 @@ pub(crate) fn format<S: BuildHasher>(run: &mut Run, attrs: &Attrs<S>) {
 
 /// The attributes that give text the formatting of `run`, in a fixed order.
 pub(crate) fn attrs(run: &Run) -> Vec<(String, LoroValue)> {
-    let marks = run.marks.iter().map(|mark| (key(MARK, mark_name(mark)), true.into()));
+    let marks = run.marks.iter().filter(|mark| mark_target(mark).is_none()).map(mark_attr);
     let link = run.link.iter().map(|link| (LINK.to_owned(), link.as_str().into()));
     let extra = run.extra.iter().map(|(field, value)| (key(FIELD, field), value.to_string().into()));
-    marks.chain(link).chain(extra).collect()
+    // Last, so that each stands over a field of the same name among the unknown ones.
+    let lang = run.lang.iter().filter(|lang| !lang.is_empty()).map(|lang| (LANG.to_owned(), field(lang)));
+    let target = run.marks.iter().filter(|mark| mark_target(mark).is_some_and(|id| !id.is_empty())).map(mark_attr);
+    marks.chain(link).chain(extra).chain(lang).chain(target).collect()
 }
 
 /// What the history keeps for each marker, under the id Loro gave the marker character. No other
@@ -169,8 +245,54 @@ impl Markers {
 }
 
 /// The id of the character at `at`.
-fn id_at(body: &LoroText, at: usize) -> Option<ID> {
+pub(crate) fn id_at(body: &LoroText, at: usize) -> Option<ID> {
     body.get_cursor(at, Side::Middle)?.id
+}
+
+/// Where the character `id` stands in the sequence as it is shown. `None` when it is not in it. Loro
+/// reads the sequence from its start to tell.
+pub(crate) fn place(loro: &LoroDoc, body: &LoroText, id: ID) -> Option<usize> {
+    let found = loro.get_cursor_pos(&Cursor::new(Some(id), body.id(), Side::Middle, 0)).ok()?;
+    let there = found.update.is_none() && id_at(body, found.current.pos) == Some(id);
+    there.then_some(found.current.pos)
+}
+
+/// A stretch of the sequence as a change that puts it in, its markers carrying their blocks, and the id
+/// of each of its characters.
+pub(crate) fn stretch(loro: &LoroDoc, body: &LoroText, range: Range<usize>) -> Option<(Vec<TextDelta>, Vec<ID>)> {
+    let mut raw = vec![retain(range.start)];
+    raw.extend(body.slice_delta(range.start, range.end, PosType::Unicode).ok()?);
+    let mut pieces = lift(loro, body, &raw, &mut HashSet::new());
+    pieces.remove(0);
+    let ids = range.map(|at| id_at(body, at)).collect::<Option<Vec<ID>>>()?;
+    Some((pieces, ids))
+}
+
+/// The settling of a block's conflict: the replica its change is written as, then who wrote the version it
+/// made stand, and when.
+pub(crate) type Settling = (u64, String, u64);
+
+/// Notes in the change that is open that it settles the conflict over `block`, for a later search to
+/// tell two settlings of one block apart, and to tell whose version the block then reads as.
+pub(crate) fn settled(loro: &LoroDoc, block: &BlockId, author: &str, edited: u64) {
+    // The replica is the settling's own, and names it.
+    let held: Vec<LoroValue> = vec![loro.peer_id().cast_signed().into(), author.into(), edited.cast_signed().into()];
+    // Loro refuses no list of plain values under a string.
+    let _ = loro.get_map(SETTLED).insert(block.as_str(), held);
+}
+
+/// The last settling of each block, as the revision shown holds them. No person writes as its replica.
+pub(crate) fn settlings(loro: &LoroDoc) -> HashMap<String, Settling> {
+    let mut settlings = HashMap::new();
+    loro.get_map(SETTLED).for_each(|block, held| {
+        if let ValueOrContainer::Value(LoroValue::List(held)) = held
+            && let [LoroValue::I64(replica), author, LoroValue::I64(edited)] = held.as_slice()
+        {
+            let author = text(author).unwrap_or_default().to_owned();
+            settlings.insert(block.to_owned(), (replica.cast_unsigned(), author, edited.cast_unsigned()));
+        }
+    });
+    settlings
 }
 
 fn retain(retain: usize) -> TextDelta {
@@ -228,9 +350,7 @@ pub(crate) fn restyles(loro: &LoroDoc, body: &LoroText, keys: &[String], new: &H
             // A marker that is gone, or not yet there at the revision shown, has nothing to change. Its
             // block is gone from the map with it, which saves Loro a search of the history for it.
             markers.blocks.get(key)?;
-            let found = loro.get_cursor_pos(&Cursor::new(Some(id), body.id(), Side::Middle, 0)).ok()?;
-            let there = found.update.is_none() && id_at(body, found.current.pos) == Some(id);
-            there.then_some((found.current.pos, id))
+            Some((place(loro, body, id)?, id))
         })
         .collect();
     places.sort_unstable_by_key(|(at, _)| *at);
@@ -278,10 +398,26 @@ fn put<S: BuildHasher>(body: &LoroText, at: usize, text: &str, attrs: Option<&At
 }
 
 /// Makes in the history a change the document already shows. `None` when Loro refused a part of it.
+///
+/// Text that takes the place of text is put in behind the first character it replaces, which then goes
+/// with the rest. Put in before that character, it would share its place with whatever another writer
+/// typed there meanwhile, and the two would merge in an order that only their replica ids decide: a word
+/// typed before a word that was replaced could come to stand behind the new one, or inside it.
 pub(crate) fn write(loro: &LoroDoc, body: &LoroText, delta: &[TextDelta]) -> Option<()> {
+    apply(loro, body, delta, true)
+}
+
+/// As [`write`], with all text put in exactly where the change says, for a change whose places were
+/// worked out one by one.
+pub(crate) fn write_as_told(loro: &LoroDoc, body: &LoroText, delta: &[TextDelta]) -> Option<()> {
+    apply(loro, body, delta, false)
+}
+
+fn apply(loro: &LoroDoc, body: &LoroText, delta: &[TextDelta], replacing: bool) -> Option<()> {
     let markers = Markers::of(loro);
     let mut at = 0;
-    for item in delta {
+    let mut delta = delta.iter().peekable();
+    while let Some(item) = delta.next() {
         match item {
             TextDelta::Retain { retain, attributes } => {
                 match attributes.as_ref().filter(|attrs| !attrs.is_empty()) {
@@ -319,7 +455,24 @@ pub(crate) fn write(loro: &LoroDoc, body: &LoroText, delta: &[TextDelta]) -> Opt
                     Markers::forget(&markers.blocks, &key)?;
                     Markers::forget(&markers.depths, &key)?;
                 }
-                body.delete(at, *delete).ok()?;
+                let mut put_in = 0;
+                while replacing
+                    && let Some(TextDelta::Insert { insert: text, attributes }) = delta.peek()
+                    && !attributes.as_ref().is_some_and(|attrs| attrs.contains_key(BLOCK))
+                {
+                    put(body, at + 1 + put_in, text, attributes.as_ref())?;
+                    put_in += text.chars().count();
+                    delta.next();
+                }
+                if put_in == 0 {
+                    body.delete(at, *delete).ok()?;
+                } else {
+                    body.delete(at, 1).ok()?;
+                    at += put_in;
+                    if *delete > 1 {
+                        body.delete(at, delete - 1).ok()?;
+                    }
+                }
             }
         }
     }
@@ -335,6 +488,8 @@ pub(crate) enum Event {
     /// One of the document's own fields changed.
     Meta,
     Style,
+    /// The conflicts over these blocks were settled, by id.
+    Settled(Vec<String>),
 }
 
 /// Collects what the history reports, for the model to catch up with.
@@ -342,15 +497,15 @@ pub(crate) fn watch(loro: &LoroDoc, body: &LoroText) -> (Arc<Mutex<Vec<Event>>>,
     let events: Arc<Mutex<Vec<Event>>> = Arc::default();
     let (queue, body) = (events.clone(), body.id());
     let markers = [loro.get_map(BLOCKS).id(), loro.get_map(DEPTHS).id()];
-    let style = loro.get_map(STYLE).id();
+    let (style, settled) = (loro.get_map(STYLE).id(), loro.get_map(SETTLED).id());
     let watch = loro.subscribe_root(Arc::new(move |event| {
         let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
         for diff in event.events {
+            let keys = |map: loro::event::MapDelta| map.updated.keys().map(|key| key.to_string()).collect();
             queue.push(match diff.diff {
                 Diff::Text(delta) if *diff.target == body => Event::Body(delta),
-                Diff::Map(map) if markers.contains(diff.target) => {
-                    Event::Markers(map.updated.keys().map(|key| key.to_string()).collect())
-                }
+                Diff::Map(map) if markers.contains(diff.target) => Event::Markers(keys(map)),
+                Diff::Map(map) if *diff.target == settled => Event::Settled(keys(map)),
                 _ if *diff.target == style => Event::Style,
                 _ => Event::Meta,
             });
@@ -449,6 +604,8 @@ fn plan(doc: &Document, index: &[Entry]) -> Vec<Call> {
     });
     let mut calls: Vec<Call> = blocks.rev().flatten().collect();
     calls.push(Call::Set(META, LANGUAGE.into(), doc.language.as_str().into()));
+    let properties = doc.properties.iter().map(|properties| properties.to_value().to_string());
+    calls.extend(properties.map(|json| Call::Set(META, PROPERTIES.into(), json.into())));
     calls.extend(doc.dictionary.iter().map(|word| Call::Set(DICTIONARY, word_key(word, ""), true.into())));
     calls.extend(doc.extra.iter().map(|(key, value)| Call::Set(EXTRA, key.clone(), value.to_string().into())));
     calls
@@ -557,10 +714,14 @@ pub(crate) fn read_meta(loro: &LoroDoc, doc: &mut Document) {
     doc.language = fresh.language;
     doc.dictionary.clear();
     doc.extra.clear();
-    each(loro, META, |key, value| {
-        if let (LANGUAGE, Some(language)) = (key, text(value)) {
-            doc.language = language.to_owned();
+    doc.properties = None;
+    each(loro, META, |key, value| match (key, text(value)) {
+        (LANGUAGE, Some(language)) => language.clone_into(&mut doc.language),
+        (PROPERTIES, Some(json)) => {
+            let read = serde_json::from_str(json).ok().map(|value| Properties::from_value(value, ""));
+            doc.properties = read.and_then(Result::ok);
         }
+        _ => {}
     });
     each(loro, DICTIONARY, |key, value| {
         if matches!(value, LoroValue::Bool(true)) {
@@ -593,6 +754,11 @@ pub(crate) fn normal_meta(doc: &mut Document) {
         if let Ok(read) = serde_json::from_str(&value.to_string()) {
             *value = read;
         }
+    }
+    if let Some(properties) = &mut doc.properties
+        && let Ok(read) = Properties::from_value(properties.to_value(), "")
+    {
+        *properties = read;
     }
 }
 
@@ -629,6 +795,10 @@ pub(crate) fn meta_assigns(loro: &LoroDoc, from: &Document, to: &Document) -> Ve
     let mut assigns = Vec::new();
     if from.language != to.language {
         assigns.push(set(META, LANGUAGE, Some(to.language.as_str().into())));
+    }
+    if from.properties != to.properties {
+        let json = to.properties.as_ref().map(|properties| properties.to_value().to_string().into());
+        assigns.push(set(META, PROPERTIES, json));
     }
     // A word goes with every add of it this replica has seen. The history lists them in no order, and an
     // outside change must be written in one.

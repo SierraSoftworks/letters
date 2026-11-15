@@ -18,6 +18,13 @@ pub trait Files {
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>>;
     /// Creates or replaces a file, and returns once its bytes are flushed to disk.
     fn write(&mut self, name: &str, bytes: &[u8]) -> io::Result<()>;
+    /// Adds to the end of a file, creating it, and returns once the bytes are flushed to disk. A shell with
+    /// real files appends in place: the journal calls this for every edit.
+    fn append(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let mut whole = self.read(name)?.unwrap_or_default();
+        whole.extend_from_slice(bytes);
+        self.write(name, &whole)
+    }
     /// Renames a file in one step, replacing whatever `to` held.
     fn rename(&mut self, from: &str, to: &str) -> io::Result<()>;
     fn remove(&mut self, name: &str) -> io::Result<()>;

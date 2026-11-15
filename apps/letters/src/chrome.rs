@@ -4,12 +4,76 @@
 //! the bar's own, and they follow the desktop's `button-layout` setting: which buttons, in what order, on
 //! which side. Whether things may move is the desktop's to say too.
 
+use letters_ui::{Chrome, Frame, WindowButton};
+
+/// Room the bar leaves for the three lights macOS draws over its start.
+const LIGHTS: f32 = 78.0;
+/// The same in a unified title bar, whose lights stand 13 pt further from the window's edge.
+const LIGHTS_UNIFIED: f32 = 91.0;
+
+/// Whose rules a window's frame follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Host {
+    /// The system keeps its lights and its frame, and the bar is the title bar under them.
+    Mac,
+    /// Wayland and X11, where Letters draws the frame and the window's buttons.
+    Linux,
+    /// Anywhere else the system frames and titles the window as it does any other.
+    Other,
+}
+
+impl Host {
+    /// The desktop this build runs on.
+    pub const HERE: Self = if cfg!(target_os = "macos") {
+        Self::Mac
+    } else if cfg!(all(unix, not(target_os = "android"), not(target_os = "ios"))) {
+        Self::Linux
+    } else {
+        Self::Other
+    };
+
+    /// What the desktop expects of a window's frame and bar. A window that is maximised or full screen
+    /// has no edge of its own to show or to be resized by. `bar` is the height of the title bar where the
+    /// system made it a unified one, which the bar then fills so that its contents line up with the lights.
+    pub fn chrome(self, buttons: &Buttons, maximized: bool, full_screen: bool, bar: Option<f32>) -> Chrome {
+        match self {
+            Self::Other => Chrome::default(),
+            Self::Mac => {
+                let inset_start = match bar {
+                    // A full screen window has no lights to leave room for.
+                    _ if full_screen => 0.0,
+                    Some(_) => LIGHTS_UNIFIED,
+                    None => LIGHTS,
+                };
+                Chrome { frame: Frame::Unified, inset_start, bar_height: bar, maximized, ..Chrome::default() }
+            }
+            Self::Linux => Chrome {
+                buttons: buttons.order.iter().map(|button| button.shown()).collect(),
+                buttons_at_start: buttons.at_start,
+                frame: if maximized || full_screen { Frame::Filled } else { Frame::Floating },
+                maximized,
+                ..Chrome::default()
+            },
+        }
+    }
+}
+
 /// A button a window's frame carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
     Minimise,
     Maximise,
     Close,
+}
+
+impl Button {
+    fn shown(self) -> WindowButton {
+        match self {
+            Self::Minimise => WindowButton::Minimise,
+            Self::Maximise => WindowButton::Maximise,
+            Self::Close => WindowButton::Close,
+        }
+    }
 }
 
 /// The window buttons a desktop shows, in its order.

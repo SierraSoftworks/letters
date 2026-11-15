@@ -11,14 +11,7 @@ use letters_render::{Color, Item, Rect};
 
 /// A picture that is red on the left and blue on the right, encoded in `format`.
 fn encoded(width: u32, height: u32, format: ImageFormat) -> Vec<u8> {
-    let picture = RgbaImage::from_fn(width, height, |x, _| {
-        let color = if x < width / 2 { RED } else { BLUE };
-        Rgba([color.r, color.g, color.b, 255])
-    });
-    let mut bytes = Cursor::new(Vec::new());
-    // JPEG has no alpha channel.
-    image::DynamicImage::from(picture).into_rgb8().write_to(&mut bytes, format).expect("the format encodes");
-    bytes.into_inner()
+    common::encoded(width, height, format, |x, _| if x < width / 2 { RED } else { BLUE })
 }
 
 /// Draws an image across a frame of its own size and returns the colours of its left and right halves.
@@ -30,18 +23,6 @@ fn halves(image: Image) -> (Color, Color) {
     let frame = render_with(&list([item]), &images, width, height, 1.0);
     let probe = |x| frame.pixel(x, height / 2).expect("the probe is inside the frame");
     (probe(width / 4), probe(width * 3 / 4))
-}
-
-/// Adds an EXIF orientation to a JPEG, as a camera does for a photo taken on its side.
-fn oriented(jpeg: &[u8], orientation: u8) -> Vec<u8> {
-    let mut exif = b"Exif\0\0MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0".to_vec();
-    exif.extend([orientation, 0, 0, 0, 0, 0, 0]);
-    let mut out = jpeg[..2].to_vec();
-    out.extend([0xff, 0xe1]);
-    out.extend((exif.len() as u16 + 2).to_be_bytes());
-    out.extend(exif);
-    out.extend(&jpeg[2..]);
-    out
 }
 
 #[test]
@@ -75,6 +56,40 @@ fn transparency_survives_decoding() {
     let (left, _) = halves(Image::decode(&bytes.into_inner()).expect("the PNG decodes"));
 
     assert!(close(left, Color::rgb(255, 127, 127), 2), "half red over white, got {left:?}");
+}
+
+#[test]
+fn a_picture_decoded_within_a_width_is_held_no_wider_and_keeps_its_shape() {
+    // (the width asked for, the size held)
+    let cases = [(16, (16, 8)), (32, (32, 16)), (400, (32, 16))];
+    for (within, held) in cases {
+        let image = Image::decode_within(&encoded(32, 16, ImageFormat::Png), within).expect("the PNG decodes");
+
+        assert_eq!((image.width(), image.height()), held, "within {within}");
+        let (left, right) = halves(image);
+        assert!(close(left, RED, 40) && close(right, BLUE, 40), "within {within}: {left:?} and {right:?}");
+    }
+
+    let least = Image::decode_within(&encoded(32, 16, ImageFormat::Png), 0).expect("no width is still a picture");
+    assert_eq!((least.width(), least.height()), (1, 1));
+}
+
+#[test]
+fn a_clear_edge_stays_clean_when_a_picture_is_narrowed() {
+    // Opaque red beside clear pixels whose hidden colour is blue.
+    let picture = RgbaImage::from_fn(64, 8, |x, _| if x < 32 { Rgba([255, 0, 0, 255]) } else { Rgba([0, 0, 255, 0]) });
+    let mut bytes = Cursor::new(Vec::new());
+    picture.write_to(&mut bytes, ImageFormat::Png).expect("PNG encodes");
+    let image = Image::decode_within(&bytes.into_inner(), 16).expect("the PNG decodes");
+
+    let mut images = Images::default();
+    images.insert("picture", image);
+    let item = Item::Image { rect: Rect::new(0.0, 0.0, 16.0, 2.0), asset: "picture".into() };
+    let frame = render_with(&list([item]), &images, 16, 2, 1.0);
+    for x in 0..16 {
+        let Color { r, g, b, .. } = frame.pixel(x, 1).expect("inside the frame");
+        assert!(b <= g.saturating_add(2) || (r, g) == (255, 255), "pixel {x} took the hidden blue: {r} {g} {b}");
+    }
 }
 
 #[test]

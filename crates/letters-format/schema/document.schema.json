@@ -13,6 +13,15 @@
       "items": { "type": "string" },
       "description": "Words every copy of this document accepts as spelled correctly."
     },
+    "properties": {
+      "type": "object",
+      "description": "The document's own metadata, as the front matter of a Markdown file. The source is kept as written.",
+      "required": ["format", "source"],
+      "properties": {
+        "format": { "enum": ["yaml", "toml"] },
+        "source": { "type": "string" }
+      }
+    },
     "blocks": { "$ref": "#/$defs/blocks" }
   },
   "$defs": {
@@ -24,9 +33,11 @@
         "id": { "type": "string", "minLength": 1, "description": "Stable, and unique within the document." },
         "type": {
           "type": "string",
-          "description": "paragraph, heading, list_item, code, quote, callout or divider. A block of any other type is kept as written and drawn from its fallback text."
+          "description": "paragraph, heading, list_item, code, formula, quote, callout, divider, caption, figure, gallery, table, table_row or table_cell. A block of any other type is kept as written and drawn from its fallback text."
         },
-        "fallback": { "type": "string", "description": "Plain text a reader shows for a type it does not know." }
+        "fallback": { "type": "string", "description": "Plain text a reader shows for a type it does not know." },
+        "lang": { "$ref": "#/$defs/lang" },
+        "break": { "const": "page", "description": "Starts the block on a new page." }
       },
       "allOf": [
         {
@@ -63,6 +74,10 @@
           }
         },
         {
+          "if": { "properties": { "type": { "const": "formula" } } },
+          "then": { "$ref": "#/$defs/text", "description": "The text is the TeX source of a formula set on lines of its own." }
+        },
+        {
           "if": { "properties": { "type": { "const": "quote" } } },
           "then": { "$ref": "#/$defs/container" }
         },
@@ -73,8 +88,85 @@
             "required": ["tone"],
             "properties": { "tone": { "enum": ["tip", "info", "warn", "danger"] } }
           }
+        },
+        {
+          "if": { "properties": { "type": { "const": "caption" } } },
+          "then": { "$ref": "#/$defs/text", "description": "A line in the caption style, as under a gallery." }
+        },
+        {
+          "if": { "properties": { "type": { "const": "figure" } } },
+          "then": {
+            "$ref": "#/$defs/text",
+            "description": "A picture. The text is its caption, and it names its picture as an asset or as a src, never both.",
+            "required": ["width", "height"],
+            "oneOf": [{ "required": ["asset"] }, { "required": ["src"] }],
+            "properties": {
+              "asset": { "type": "string", "description": "The entry of the file that holds the picture, such as assets/<sha256>.png." },
+              "src": { "type": "string", "description": "The https address of a picture that is still remote." },
+              "alt": { "type": "string", "description": "What the picture shows, for a reader who cannot see it. Defaults to empty." },
+              "width": { "type": "number", "exclusiveMinimum": 0, "description": "The width it is shown at, in points." },
+              "height": { "type": "number", "exclusiveMinimum": 0, "description": "The height it is shown at, in points." },
+              "numbered": { "type": "boolean", "description": "Whether the caption opens with a generated number. Defaults to false." }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "gallery" } } },
+          "then": {
+            "description": "Pictures shown together. Holds figures and captions, and types a reader does not know: one caption, last, unless two people's changes left more.",
+            "properties": {
+              "numbered": { "type": "boolean", "description": "Whether the caption opens with a generated number. Defaults to false." },
+              "blocks": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/block",
+                  "properties": { "type": { "anyOf": [{ "enum": ["figure", "caption"] }, { "not": { "$ref": "#/$defs/known" } }] } }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "table" } } },
+          "then": {
+            "description": "Holds rows. A row may hold fewer or more cells than there are columns, as two people's changes can leave it: a missing cell reads as empty, and a column past the last one named aligns to the start.",
+            "properties": {
+              "columns": { "type": "array", "items": { "enum": ["start", "center", "end", "justify"] }, "description": "How each column aligns. Defaults to none named." },
+              "header": { "type": "boolean", "description": "Whether the first row heads the columns. Defaults to false." },
+              "blocks": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/block",
+                  "properties": { "type": { "anyOf": [{ "enum": ["table_row"] }, { "not": { "$ref": "#/$defs/known" } }] } }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "table_row" } } },
+          "then": {
+            "description": "Holds cells. A row outside a table reads as a table of that one row.",
+            "properties": {
+              "blocks": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/block",
+                  "properties": { "type": { "anyOf": [{ "enum": ["table_cell"] }, { "not": { "$ref": "#/$defs/known" } }] } }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "table_cell" } } },
+          "then": { "$ref": "#/$defs/text", "description": "One cell of a row. A cell outside a row reads as a paragraph." }
         }
       ]
+    },
+    "known": {
+      "enum": ["paragraph", "heading", "list_item", "code", "formula", "quote", "callout", "divider", "caption", "figure", "gallery", "table", "table_row", "table_cell"],
+      "description": "The types this format version defines. A gallery, a table and a row hold only their own parts and types outside this list."
     },
     "text": {
       "description": "A block that holds text. A line feed in the text of a paragraph, heading or list item is a hard line break.",
@@ -94,10 +186,17 @@
         "marks": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "bold, italic, underline, strike, highlight or code. Any other mark is kept as written."
+          "description": "bold, italic, underline, strike, highlight, code or math. Text marked math is TeX source set in the line. Any other mark is kept as written."
         },
-        "link": { "type": "string", "description": "The address this text links to." }
+        "link": { "type": "string", "description": "The address this text links to." },
+        "ref": { "type": "string", "minLength": 1, "description": "The id of a block this text refers to, such as a figure. The text is what a reader that cannot follow it shows, and the block may be gone." },
+        "lang": { "$ref": "#/$defs/lang" }
       }
+    },
+    "lang": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A BCP 47 tag for text in another language than the document's. On a block it covers the block, and on a run it wins over the block's."
     }
   }
 }

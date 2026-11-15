@@ -1,15 +1,18 @@
 // Reports what the browser downloads and which crates the code in it comes from.
 //
-//   node size.mjs <served.wasm> <named.wasm>
+//   node size.mjs <dist> <named.wasm>
 //
-// The served file is measured as it is and compressed. The named file is the same module with its function
+// The files in `dist` are measured as they are and compressed. The named file is the wasm with its function
 // names left in, which is what says whose each function is.
 
 import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { brotliCompressSync, gzipSync, constants } from "node:zlib";
 
-const [served, named] = process.argv.slice(2).map((path) => readFileSync(path));
-const FONTS = new URL("../../crates/letters-fonts/fonts/", import.meta.url);
+const [dist, namedPath] = process.argv.slice(2);
+const read = (...path) => readFileSync(join(dist, ...path));
+const served = read("letters_bg.wasm");
+const named = readFileSync(namedPath);
 
 /** The sections of a module, each as `{ id, name, bytes }`. */
 function sections(wasm) {
@@ -121,21 +124,42 @@ function codeByCrate(wasm) {
   return [...sizes].sort((a, b) => b[1] - a[1]);
 }
 
-const kib = (bytes) => `${(bytes / 1024).toFixed(0).padStart(6)} KiB`;
-const row = (label, bytes, note = "") => console.log(`  ${label.padEnd(24)}${kib(bytes)}${note && `  ${note}`}`);
+const kib = (bytes) => `${(bytes / 1024).toFixed(0).padStart(7)} KiB`;
+const row = (label, ...sizes) => console.log(`  ${label.padEnd(22)}${sizes.map(kib).join("")}`);
 const size = (id) => sections(served).find((section) => section.id === id)?.bytes.length ?? 0;
-const fonts = readdirSync(FONTS).filter((file) => file.endsWith(".ttf"));
-const fontBytes = fonts.reduce((sum, file) => sum + readFileSync(new URL(file, FONTS)).length, 0);
+const brotli = (bytes) => brotliCompressSync(bytes, { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
+/** A download as it is, gzipped and brotlied. Files that travel apart are compressed apart. */
+const download = (files) => [(bytes) => bytes.length, (bytes) => gzipSync(bytes, { level: 9 }).length, brotli].map(
+  (measure) => files.reduce((sum, bytes) => sum + measure(bytes), 0),
+);
 
-console.log("The wasm the browser downloads");
-row("as served", served.length);
-row("gzip", gzipSync(served, { level: 9 }).length);
-row("brotli", brotliCompressSync(served, { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length);
-console.log("What it holds");
+/** The files of a folder that the editor fetches. Their licences travel with them and are never asked for. */
+const folder = (name) => readdirSync(join(dist, name)).filter((file) => !file.endsWith(".txt")).map((file) => read(name, file));
+const [fonts, maths, dictionaries] = ["fonts", "maths", "dictionaries"].map(folder);
+/** The scripts `letters.js` imports, which `wasm-bindgen` writes beside it. */
+const snippets = readdirSync(join(dist, "snippets"), { recursive: true })
+  .filter((file) => file.endsWith(".js"))
+  .map((file) => read("snippets", file));
+const downloads = [
+  ["letters_bg.wasm", [served]],
+  ["letters.js", [read("letters.js"), ...snippets]],
+  [`fonts (${fonts.length} files)`, fonts],
+];
+// A document with maths has the maths faces before its first frame, too.
+const later = [
+  [`maths (${maths.length} files)`, maths],
+  [`dictionaries (${dictionaries.length})`, dictionaries],
+  ["print, when printing", [read("print_bg.wasm"), read("print.js")]],
+];
+console.log(`${"What the browser downloads".padEnd(24)}${["as served", "gzip", "brotli"].map((head) => head.padStart(11)).join("")}`);
+downloads.forEach(([label, files]) => row(label, ...download(files)));
+row("for the first frame", ...download(downloads.flatMap(([, files]) => files)));
+later.forEach(([label, files]) => row(label, ...download(files)));
+console.log("What the wasm holds");
 row("code", size(10));
-row("data", size(11), `of which ${fonts.length} bundled fonts ${kib(fontBytes).trim()}`);
+row("data", size(11));
 row("the rest", served.length - size(10) - size(11));
-console.log("Code by crate");
+console.log("Its code by crate");
 const crates = codeByCrate(named);
 const shown = crates.filter(([, bytes]) => bytes >= 16 * 1024);
 shown.forEach(([name, bytes]) => row(name, bytes));

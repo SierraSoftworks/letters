@@ -6,17 +6,20 @@
 
 use std::fmt;
 use std::fs;
-use std::io::{self, Cursor, Write};
+use std::io::{self, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
 use letters_format::{Archive, Files, Save, Saved, Stamp, WorkingCopy};
-use letters_model::{Block, BlockId, BlockKind, Document, Model, Prepared, ReplicaId, Revision, Style};
+use letters_model::{Block, BlockId, BlockKind, Document, Model, Notes, Prepared, ReplicaId, Revision, Style};
 
+use crate::journal::{self, Claim};
 use crate::platform;
 
 pub const EXTENSION: &str = "let";
+/// What a stylesheet's file name ends in.
+pub const STYLESHEET: &str = "letstyle";
 
 #[derive(Debug)]
 pub enum Error {
@@ -62,12 +65,32 @@ pub fn new_style(home_folder: Option<&Path>) -> Style {
     json.and_then(|json| Style::from_json(&json).ok()).unwrap_or_default()
 }
 
+/// Keeps `json`, the text of a `style.json`, as the style the person's new documents start with.
+pub fn keep_style(home_folder: &Path, json: &str) -> io::Result<()> {
+    let folder = home_folder.join(".letters");
+    fs::create_dir_all(&folder)?;
+    // Written beside and renamed, so that a crash leaves the old default or the new one.
+    let beside = folder.join("style.json.new");
+    fs::write(&beside, json)?;
+    fs::rename(beside, folder.join("style.json"))
+}
+
+/// Writes a stylesheet where the person chose, and returns where that is: a name typed without the ending
+/// gets it, and then replaces nothing, since nobody was asked about the file of that name.
+pub fn write_stylesheet(chosen: &Path, json: &str) -> io::Result<PathBuf> {
+    if chosen.extension().is_some_and(|ending| ending.eq_ignore_ascii_case(STYLESHEET)) {
+        return fs::write(chosen, json).map(|()| chosen.to_owned());
+    }
+    let mut path = chosen.as_os_str().to_owned();
+    path.push(format!(".{STYLESHEET}"));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+    file.write_all(json.as_bytes()).map(|()| path.into())
+}
+
 /// The working copy of a new document in `style`, which no file holds yet.
 pub fn new_copy(document: Document, style: Style) -> WorkingCopy {
     let replica = ReplicaId::new(&platform::block_id());
-    let mut copy = WorkingCopy::new(platform::document_id(), platform::now_rfc3339(), document, replica);
-    copy.style = style;
-    copy
+    WorkingCopy::new(platform::document_id(), platform::now_rfc3339(), document, style, replica)
 }
 
 /// Where a document lives on disk.
@@ -87,6 +110,11 @@ impl Home {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether the document is in the file, which a home that was only chosen has yet to be written.
+    pub fn written(&self) -> bool {
+        self.written
     }
 
     /// The file name without its extension, which is the document's title.
@@ -111,19 +139,23 @@ impl Home {
         Ok((Home { path, written: true }, saved))
     }
 
-    /// One save from an editor: takes its `edits` into `copy`, writes the file, and returns the home with
-    /// what the file held that the editor, at `revision`, has not seen. The editor merges that.
+    /// One save from an editor: takes its `edits` and its `notes` as they stand into `copy`, writes the
+    /// file, and says what the file held that the editor, at `revision`, has not seen.
     pub fn exchange(
         &self,
         copy: &mut WorkingCopy,
         edits: &[u8],
+        notes: Notes,
         revision: &Revision,
-    ) -> Result<(Home, Option<Vec<u8>>), Error> {
+    ) -> Result<Exchange, Error> {
         copy.edit(edits)?;
-        let ours = copy.model().revision();
-        let (home, _) = self.save(copy)?;
-        let news = (copy.model().revision() != ours).then(|| copy.model().updates_since(revision));
-        Ok((home, news))
+        // The editor's notes have followed its text and say what was resolved, so they stand for the copy's.
+        let ours = (copy.model().revision(), notes.clone());
+        copy.notes = notes;
+        let (home, saved) = self.save(copy)?;
+        let news = (copy.model().revision() != ours.0).then(|| copy.model().updates_since(revision));
+        let notes = (copy.notes != ours.1).then(|| copy.notes.clone());
+        Ok(Exchange { home, news, notes, held: matches!(saved, Saved::Unchanged) })
     }
 
     /// Moves the document's file to `to` and returns its home there. Whatever `to` holds is never replaced:
@@ -137,6 +169,20 @@ impl Home {
         }
         Ok(Home { path: to.to_owned(), ..self.clone() })
     }
+}
+
+/// How one save from an editor ended.
+#[derive(Debug)]
+pub struct Exchange {
+    /// The document's home from now on.
+    pub home: Home,
+    /// What the file held that the editor has not seen. The editor merges it.
+    pub news: Option<Vec<u8>>,
+    /// The notes as the file's own changed them. The editor merges them.
+    pub notes: Option<Notes>,
+    /// Whether the file was read and found to hold everything, so that nothing was written. Only this
+    /// tells a journal that its records are in the file.
+    pub held: bool,
 }
 
 /// Moves a file to a path that must be free. A file already at `to` is never replaced, as a plain rename
@@ -174,8 +220,14 @@ fn folder_of(path: &Path) -> &Path {
     path.parent().filter(|folder| !folder.as_os_str().is_empty()).unwrap_or(Path::new("."))
 }
 
-/// A real folder, for `letters_format::save`.
-struct Folder(PathBuf);
+/// A real folder, for `letters_format::save` and for journals.
+pub(crate) struct Folder(PathBuf);
+
+impl Folder {
+    pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+}
 
 /// `None` for a file that is not there.
 fn found<T>(result: io::Result<T>) -> io::Result<Option<T>> {
@@ -203,6 +255,12 @@ impl Files for Folder {
         file.sync_all()
     }
 
+    fn append(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let mut file = fs::OpenOptions::new().append(true).create(true).open(self.0.join(name))?;
+        file.write_all(bytes)?;
+        file.sync_data()
+    }
+
     fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
         let (from, to) = (self.0.join(from), self.0.join(to));
         // The new file takes over the permissions of the one it replaces.
@@ -226,7 +284,8 @@ impl Files for Folder {
 pub struct Opened {
     pub document: Document,
     pub style: Style,
-    pub home: Home,
+    /// `None` for a document that never reached a file, as one found in a journal may not have.
+    pub home: Option<Home>,
     pub rest: Rest,
 }
 
@@ -238,6 +297,8 @@ enum Source {
     File(Vec<u8>),
     /// No file yet.
     New(Box<WorkingCopy>),
+    /// A document that already took in what its journal held.
+    Kept(Box<WorkingCopy>, Claim),
 }
 
 impl fmt::Debug for Rest {
@@ -245,6 +306,7 @@ impl fmt::Debug for Rest {
         f.write_str(match self.0 {
             Source::File(_) => "Rest(File)",
             Source::New(_) => "Rest(New)",
+            Source::Kept(..) => "Rest(Kept)",
         })
     }
 }
@@ -254,6 +316,13 @@ pub struct Working {
     pub copy: WorkingCopy,
     /// For `Editor::attach`. `None` when the editor's own history is already the document's.
     pub history: Option<Prepared>,
+    /// What a journal held that the file did not, for the editor to merge once the history is attached.
+    pub news: Option<Vec<u8>>,
+    /// The document's journal, when one is kept and no other window has it.
+    pub claim: Option<Claim>,
+    /// The revision the journal's next edits build on. `None` for a new document, whose journal starts
+    /// with its whole history.
+    pub journalled: Option<Revision>,
 }
 
 impl Rest {
@@ -262,22 +331,46 @@ impl Rest {
         Self(Source::New(Box::new(new_copy(document.clone(), style.clone()))))
     }
 
-    /// Reads it. `editor` is the replica the document's editor was made with.
+    /// Reads it. `editor` is the replica the document's editor was made with, and `journals` the folder
+    /// unsaved work is journalled in, if it is.
     ///
     /// This is the slow part of opening a long document, so it runs on another thread once the document
     /// is on screen.
-    pub fn read(self, editor: ReplicaId) -> Result<Working, Error> {
-        let bytes = match self.0 {
-            Source::File(bytes) => bytes,
-            Source::New(copy) => return Ok(Working { copy: *copy, history: None }),
+    pub fn read(self, editor: ReplicaId, journals: Option<&Path>) -> Result<Working, Error> {
+        let claim = |copy: &WorkingCopy| journals.and_then(|folder| journal::claim(folder, &copy.id));
+        let (mut copy, kept) = match self.0 {
+            Source::File(bytes) => {
+                let mut archive = Archive::open(Cursor::new(bytes))?;
+                (WorkingCopy::open(&mut archive, ReplicaId::new(&platform::block_id()))?, None)
+            }
+            Source::New(copy) => {
+                let claim = claim(&copy);
+                return Ok(Working { copy: *copy, history: None, news: None, claim, journalled: None });
+            }
+            Source::Kept(copy, claim) => (*copy, Some(claim)),
         };
-        let mut archive = Archive::open(Cursor::new(bytes))?;
-        let copy = WorkingCopy::open(&mut archive, ReplicaId::new(&platform::block_id()))?;
         // The editor takes the history as the copy holds it, so a document changed outside Letters is one
         // change in both and not one in each.
         let model = copy.model();
-        let history = Model::new(model.doc().clone(), editor).prepare(Some(&model.save()));
-        Ok(Working { history: Some(history.map_err(letters_format::Error::History)?), copy })
+        let shown = Model::new(model.doc().clone(), editor).with_style(model.style().clone());
+        let history = shown.prepare(Some(&model.save())).map_err(letters_format::Error::History)?;
+        let mut news = None;
+        let claim = kept.or_else(|| {
+            // A journal may wait for this file though no window opened for it: its file was gone when the
+            // app started, and has turned up since. The editor shows the file, so it merges what that adds.
+            claim(&copy).filter(|claim| {
+                let Some(unsaved) = claim.unsaved() else { return true };
+                let file = copy.model().revision();
+                let replayed = copy.replay(unsaved);
+                news = (copy.model().revision() != file).then(|| copy.model().updates_since(&file));
+                // A journal that builds on another file stays as it is, and this window keeps none.
+                replayed
+                    .inspect_err(|error| eprintln!("letters: unsaved work could not be brought back: {error}"))
+                    .is_ok()
+            })
+        });
+        let journalled = Some(copy.model().revision());
+        Ok(Working { history: Some(history), news, claim, journalled, copy })
     }
 }
 
@@ -291,7 +384,7 @@ pub fn open(path: &Path, new_style: impl FnOnce() -> Style) -> Result<Opened, Er
         Err(error) if error.kind() == io::ErrorKind::NotFound && folder_of(path).is_dir() => {
             let (document, style) = (blank(), new_style());
             let rest = Rest::new(&document, &style);
-            return Ok(Opened { document, style, home: Home::new(path), rest });
+            return Ok(Opened { document, style, home: Some(Home::new(path)), rest });
         }
         Err(error) => return Err(error.into()),
     };
@@ -299,5 +392,39 @@ pub fn open(path: &Path, new_style: impl FnOnce() -> Style) -> Result<Opened, Er
     let document = archive.document()?;
     // A style this build cannot read stays in the file untouched, and the built-in one is shown.
     let style = archive.style().unwrap_or_default();
-    Ok(Opened { document, style, home: Home { path: path.into(), written: true }, rest: Rest(Source::File(bytes)) })
+    let home = Some(Home { path: path.into(), written: true });
+    Ok(Opened { document, style, home, rest: Rest(Source::File(bytes)) })
+}
+
+/// Reads one entry of the document at `path`, such as a picture it holds. `None` when the file has no
+/// such entry, or cannot be read: only the entry asked for is taken from the disk.
+pub fn entry(path: &Path, name: &str) -> Option<Vec<u8>> {
+    let mut archive = Archive::open(BufReader::new(fs::File::open(path).ok()?)).ok()?;
+    archive.read(name).ok()?
+}
+
+/// Opens the document of a journal that a session left behind when it ended early.
+///
+/// `None` when the document's file turns out to hold everything, and the journal goes. `None` too when the
+/// journal builds on a file that is not where it was: it then waits for that file to be opened.
+pub fn reopen(claim: Claim) -> Option<Opened> {
+    let unsaved = claim.unsaved()?;
+    let replica = || ReplicaId::new(&platform::block_id());
+    let on_file = unsaved.home.as_deref().map(Path::new).and_then(|path| {
+        let mut archive = Archive::open(Cursor::new(fs::read(path).ok()?)).ok()?;
+        let mut copy = WorkingCopy::open(&mut archive, replica()).ok()?;
+        let added = copy.replay(unsaved).ok()?;
+        Some((Home { path: path.into(), written: true }, copy, added))
+    });
+    let (home, copy) = match on_file {
+        Some((_, _, false)) => {
+            claim.discard();
+            return None;
+        }
+        Some((home, copy, true)) => (Some(home), copy),
+        // With no file to add to, the journal has to hold the whole document.
+        None => (None, WorkingCopy::recover(unsaved, replica()).ok()??),
+    };
+    let (document, style) = (copy.model().doc().clone(), copy.model().style().clone());
+    Some(Opened { document, style, home, rest: Rest(Source::Kept(Box::new(copy), claim)) })
 }

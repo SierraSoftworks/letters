@@ -1,6 +1,10 @@
 {
   "format": 1,
   "language": "en",
+  "properties": {
+    "format": "yaml",
+    "source": "title: Every block\ntags: [a, b]\n"
+  },
   "blocks": [
     {
       "id": "a",
@@ -66,9 +70,155 @@
         {
           "text": "Héllo",
           "future": true
+        },
+        {
+          "text": " Welt",
+          "lang": "de"
+        },
+        {
+          "text": "x^2",
+          "marks": [
+            "math"
+          ]
         }
       ],
-      "break": "page"
+      "break": "page",
+      "lang": "fr"
+    },
+    {
+      "id": "m",
+      "type": "formula",
+      "content": [
+        {
+          "text": "e^{i\\pi} + 1 = 0"
+        }
+      ]
+    },
+    {
+      "id": "h",
+      "type": "paragraph",
+      "content": [
+        {
+          "text": "See "
+        },
+        {
+          "text": "Figure 1",
+          "ref": "i"
+        },
+        {
+          "text": "."
+        }
+      ]
+    },
+    {
+      "id": "i",
+      "type": "figure",
+      "asset": "assets/5e884898da28.png",
+      "alt": "A harbour at dusk",
+      "width": 320,
+      "height": 213.5,
+      "numbered": true,
+      "content": [
+        {
+          "text": "The harbour"
+        }
+      ]
+    },
+    {
+      "id": "j",
+      "type": "gallery",
+      "numbered": true,
+      "blocks": [
+        {
+          "id": "k",
+          "type": "figure",
+          "src": "https://example.com/boats.jpg",
+          "alt": "",
+          "width": 240,
+          "height": 160,
+          "content": []
+        },
+        {
+          "id": "l",
+          "type": "figure",
+          "asset": "assets/2c26b46b68ff.jpg",
+          "alt": "Nets drying",
+          "width": 240,
+          "height": 180,
+          "content": []
+        },
+        {
+          "id": "n",
+          "type": "caption",
+          "content": [
+            {
+              "text": "Boats and nets"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "t",
+      "type": "table",
+      "columns": [
+        "start",
+        "end"
+      ],
+      "header": true,
+      "blocks": [
+        {
+          "id": "r1",
+          "type": "table_row",
+          "blocks": [
+            {
+              "id": "c1",
+              "type": "table_cell",
+              "content": [
+                {
+                  "text": "Boat"
+                }
+              ]
+            },
+            {
+              "id": "c2",
+              "type": "table_cell",
+              "content": [
+                {
+                  "text": "Length"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "r2",
+          "type": "table_row",
+          "blocks": [
+            {
+              "id": "c3",
+              "type": "table_cell",
+              "content": [
+                {
+                  "text": "Skiff"
+                }
+              ]
+            },
+            {
+              "id": "c4",
+              "type": "table_cell",
+              "content": [
+                {
+                  "text": "4 m",
+                  "marks": [
+                    "bold"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
     }
   ],
   "future": [

@@ -10,8 +10,9 @@ pub(crate) fn len(block: &Block) -> usize {
     block.body.runs().iter().map(|run| run.text.len()).sum()
 }
 
-pub(crate) fn is_code(block: &Block) -> bool {
-    matches!(block.kind, BlockKind::Code { .. })
+/// Whether a block holds source, which is kept as written: code, or the TeX of a formula.
+pub(crate) fn is_source(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Code { .. } | BlockKind::Formula)
 }
 
 /// The nearest character boundary at or before `offset`.

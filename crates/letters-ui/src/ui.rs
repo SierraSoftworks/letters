@@ -18,6 +18,7 @@ use crate::layout::{Layout, TextCache, inner, position};
 use crate::paint::{self, Scene, Tip};
 use crate::style::{Align, Dir};
 use crate::text::TextShaper;
+use crate::theme::{self, Accent};
 use crate::tokens::Scheme;
 use crate::tree::{Id, Tree};
 use crate::widgets::Placement;
@@ -28,6 +29,8 @@ const BLINK_MS: u64 = 500;
 const DOUBLE_CLICK_MS: u64 = 400;
 /// How far the pointer may wander between them.
 const DOUBLE_CLICK_SLOP: f32 = 4.0;
+/// How far a press moves before it is a drag.
+pub(crate) const DRAG_SLOP: f32 = 4.0;
 /// Room kept between a canvas's caret and the edge of what scrolls it.
 const CARET_MARGIN: f32 = 24.0;
 /// Which system's key conventions a window follows.
@@ -67,13 +70,22 @@ pub trait App {
 
     /// Fills in the accessibility node of a canvas and adds the nodes under it: what the app draws there
     /// itself, such as a document's blocks.
-    fn describe(&self, _canvas: &mut AccessNode, _nodes: &mut Vec<(NodeId, AccessNode)>) {}
+    ///
+    /// With `whole` unset, only what differs from the last time it was described has to be added: the nodes
+    /// left out stay as assistive technology knows them.
+    fn describe(&self, _canvas: &mut AccessNode, _nodes: &mut Vec<(NodeId, AccessNode)>, _whole: bool) {}
 
     /// A request from assistive technology for a canvas or a node described under one.
     fn access_action(&mut self, _request: &ActionRequest, _platform: &mut dyn Platform) {}
 
     /// Told when the window turns light or dark, for what the app draws itself. Elements follow on their own.
     fn scheme(&mut self, _scheme: Scheme) {}
+
+    /// The accent the window shows: yewi's own, unless the app keeps another for the person. Asked before
+    /// the window is described, and every element then follows it.
+    fn accent(&self) -> Accent {
+        Accent::YEWI
+    }
 
     /// Told which system's key conventions to follow, for the keys the app handles itself. Text fields
     /// follow on their own.
@@ -95,11 +107,38 @@ pub trait App {
         None
     }
 
-    /// Does a little of any work that was put off, such as laying out text that is out of sight. Returns
-    /// whether there was any. It is called while nothing else is happening.
-    fn idle(&mut self) -> bool {
+    /// Told whether the window is the one in front, which has the keyboard.
+    fn active(&mut self, _active: bool) {}
+
+    /// Told where the pointer rests on the canvas that asked to hear of it ([`Element::pointed`]), relative
+    /// to its top left, and `None` when it rests there no longer. It is told on every move with no button
+    /// held, so this has to be cheap. `true` says that what the app shows changed with it.
+    fn point(&mut self, _at: Option<Point>) -> bool {
         false
     }
+
+    /// What the window's own frame does at a point: the pointer's shape there, and what a press sends. For
+    /// a window that draws its frame, whose edge comes before whatever lies under it.
+    fn edge(&self, _at: Point, _window: Size) -> Option<(Cursor, Self::Msg)> {
+        None
+    }
+
+    /// Does a little of any work that was put off, such as laying out text that is out of sight. It is
+    /// called while nothing else is happening, until it says there was none.
+    fn idle(&mut self) -> Idle {
+        Idle::Done
+    }
+}
+
+/// What a step of an app's idle work came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Idle {
+    /// There was nothing to do.
+    Done,
+    /// Something was done that changed nothing in sight.
+    Unseen,
+    /// Something was done that shows, so the window is described and painted again before the next step.
+    Seen,
 }
 
 #[derive(Clone, Copy)]
@@ -133,6 +172,8 @@ pub struct Ui<A: App> {
     size: Size,
     scale: f32,
     scheme: Scheme,
+    /// The app's accent as of the last build, which the frame is painted in.
+    accent: Accent,
     keys: Keys,
     /// Whether the window has the keyboard.
     active: bool,
@@ -144,16 +185,21 @@ pub struct Ui<A: App> {
     last_press: Option<Press>,
     focus: Option<Id>,
     focus_visible: bool,
-    /// The anchors of the open popovers, as of the last build.
-    layers: Vec<Id>,
+    /// The open popovers, as of the last build: the anchor of each, and whether it is beside it. One that
+    /// takes the place of another on the same anchor is another popover when only one of them is beside.
+    layers: Vec<(Id, bool)>,
     /// For each open popover, where focus was before it opened.
-    returns: Vec<(Id, Option<Id>)>,
+    returns: Vec<((Id, bool), Option<Id>)>,
+    /// The elements that ask for focus when they first show, as of the last build.
+    asking: Vec<Id>,
     /// The popovers that open and close themselves, by anchor.
     open: HashSet<Id>,
     inputs: HashMap<Id, InputState>,
     scroll: HashMap<Id, f32>,
     /// The focused canvas's caret at the last layout, to scroll after it when it moves.
     canvas_caret: Option<Rect>,
+    /// The element that was last brought into view because it asked: see `Element::in_view`.
+    shown: Option<Id>,
     /// Whether the app may have work for idle time, and whether it did any since the window was described.
     idle: (bool, bool),
     blink_from: Option<u64>,
@@ -162,6 +208,8 @@ pub struct Ui<A: App> {
     caret_on: bool,
     /// The tooltip that is showing.
     tip: Option<Tip>,
+    /// Whether the app was last told that the pointer rests on its canvas.
+    pointed: bool,
 }
 
 impl<A: App> Ui<A> {
@@ -176,6 +224,7 @@ impl<A: App> Ui<A> {
             size: Size::default(),
             scale: 1.0,
             scheme: Scheme::Light,
+            accent: Accent::YEWI,
             keys: Keys::default(),
             active: true,
             stale: Stale { view: true, layout: true, paint: true },
@@ -187,16 +236,25 @@ impl<A: App> Ui<A> {
             focus_visible: false,
             layers: Vec::new(),
             returns: Vec::new(),
+            asking: Vec::new(),
             open: HashSet::new(),
             inputs: HashMap::new(),
             scroll: HashMap::new(),
             canvas_caret: None,
+            shown: None,
             idle: (true, false),
             blink_from: None,
             moving: false,
             caret_on: true,
             tip: None,
+            pointed: false,
         }
+    }
+
+    /// Shapes every label again before the next frame, for a shaper whose fonts changed.
+    pub fn reshape(&mut self) {
+        self.cache = TextCache::default();
+        self.stale.view = true;
     }
 
     pub fn app(&self) -> &A {
@@ -247,6 +305,8 @@ impl<A: App> Ui<A> {
     pub fn focus(&mut self, focused: bool) {
         self.active = focused;
         self.pressed = None;
+        self.app.active(focused);
+        self.stale.view = true;
         self.restart_blink();
     }
 
@@ -264,16 +324,17 @@ impl<A: App> Ui<A> {
             pressed: self.pressed,
             focus: self.focus,
             focus_visible: self.focus_visible,
-            caret: self.caret_on && self.active,
+            caret: self.caret_holder().filter(|_| self.caret_on && self.active).map(|i| self.tree.nodes[i].id),
             inputs: &self.inputs,
             scroll: &self.scroll,
             tip: self.tip.as_ref(),
         };
-        paint::paint(&self.tree, &scene, self.window(), out);
+        theme::with(self.accent, || paint::paint(&self.tree, &scene, self.window(), out));
     }
 
     /// Advances what moves on its own: the caret's blink, and the app's idle work. Returns when to call
-    /// again, or `None` when nothing is left to move.
+    /// again, or `None` when nothing is left to move. Idle work waits for a frame that is owed, so paint
+    /// between calls: the answer is `now_ms` until that work is done.
     pub fn animate(&mut self, now_ms: u64) -> Option<u64> {
         self.refresh();
         let moving = self.app.animate(now_ms);
@@ -286,10 +347,15 @@ impl<A: App> Ui<A> {
             (Some(next), Some(moving)) => Some(next.min(moving)),
             (next, moving) => next.or(moving),
         };
-        // A frame that is owed comes before work on what is out of sight.
-        if self.idle.0 && !self.needs_paint() {
-            if self.app.idle() {
-                self.idle.1 = true;
+        // A frame that is owed comes before work on what is out of sight, which the call after it does.
+        if self.idle.0 && self.needs_paint() {
+            return Some(now_ms);
+        }
+        if self.idle.0 {
+            let step = self.app.idle();
+            if step != Idle::Done {
+                self.stale.view |= step == Idle::Seen;
+                self.idle.1 |= step == Idle::Unseen;
                 return Some(now_ms);
             }
             // The work may have changed what shows, such as how far a page scrolls.
@@ -297,7 +363,7 @@ impl<A: App> Ui<A> {
             self.idle.0 = false;
             self.refresh();
         }
-        let caret = self.focused().is_some_and(|i| match &self.tree.nodes[i].el.content {
+        let caret = self.caret_holder().is_some_and(|i| match &self.tree.nodes[i].el.content {
             Content::Input(_) => true,
             Content::Canvas(canvas) => canvas.caret.is_some(),
             _ => false,
@@ -314,9 +380,30 @@ impl<A: App> Ui<A> {
         sooner(Some(from + (phase + 1) * BLINK_MS))
     }
 
+    /// Whether what is typed goes to the app's own canvas, such as the page, and not to a field of the
+    /// window, as last laid out. A shell that shows a keyboard the text around the caret asks this first.
+    pub fn types_in_canvas(&self) -> bool {
+        self.caret_holder().is_some_and(|i| matches!(self.tree.nodes[i].el.content, Content::Canvas(_)))
+    }
+
+    /// Where the app's own canvas is in the window as last laid out: the one focus rests on, such as the
+    /// page.
+    pub(crate) fn canvas(&self) -> Option<Rect> {
+        let own = self.tree.nodes.iter().find(|node| node.el.rest && matches!(node.el.content, Content::Canvas(_)));
+        own.map(|node| inner(node.rect, &node.el.style))
+    }
+
+    /// A point of the window as the app's own canvas counts it, when a press there would be the canvas's:
+    /// nothing lies over it at that point.
+    pub(crate) fn on_canvas(&self, at: Point) -> Option<Point> {
+        let i = self.hit(at).and_then(|hit| self.target(hit))?;
+        let node = &self.tree.nodes[i];
+        (node.el.rest && matches!(node.el.content, Content::Canvas(_))).then(|| self.within(i, at))
+    }
+
     /// Where the caret is in the window as last laid out, for the input method's candidate window.
     pub fn caret_rect(&self) -> Option<Rect> {
-        let node = &self.tree.nodes[self.focused()?];
+        let node = &self.tree.nodes[self.caret_holder()?];
         let content = inner(node.rect, &node.el.style);
         match &node.el.content {
             Content::Input(input) => {
@@ -336,6 +423,10 @@ impl<A: App> Ui<A> {
 
     /// The pointer shape for what is under the pointer.
     pub fn cursor(&self) -> Cursor {
+        let edge = self.pointer.filter(|_| self.pressed.is_none()).and_then(|at| self.app.edge(at, self.size));
+        if let Some((cursor, _)) = edge {
+            return cursor;
+        }
         // A drag keeps the shape of what it started on.
         let held = self.pressed.iter().chain(&self.hover);
         let nodes = held.filter_map(|&id| self.tree.find(id)).filter(|&i| !self.tree.disabled(i));
@@ -346,6 +437,17 @@ impl<A: App> Ui<A> {
 
     /// The whole accessibility tree.
     pub fn access(&mut self) -> TreeUpdate {
+        self.described(true)
+    }
+
+    /// The accessibility tree as an update for whoever was last given it, whole or as changes: of what the
+    /// app describes under a canvas, such as a document's blocks, only what differs since then. On a long
+    /// document this is far less to make, and to read, than the whole tree.
+    pub fn access_changes(&mut self) -> TreeUpdate {
+        self.described(false)
+    }
+
+    fn described(&mut self, whole: bool) -> TreeUpdate {
         self.refresh();
         self.update_tip();
         let title = self.app.title();
@@ -356,7 +458,7 @@ impl<A: App> Ui<A> {
             focus: self.focus,
             inputs: &self.inputs,
             tip: self.tip.as_ref().map(|tip| (tip.text.as_str(), tip.rect)),
-            describe: &|node, nodes| self.app.describe(node, nodes),
+            describe: &|node, nodes| self.app.describe(node, nodes, whole),
         };
         access::build(&self.tree, &window)
     }
@@ -421,16 +523,30 @@ impl<A: App> Ui<A> {
                     let event = Pointer::Drag { at: self.within(i, at) };
                     self.queue.extend(canvas.on_pointer.as_ref().and_then(|handler| handler(event)));
                 }
-                _ => {}
+                // A press that moves is a drag for what can be dragged, and a click no more.
+                _ => {
+                    let from = self.last_press.map_or(at, |press| press.at);
+                    let moved = (at.x - from.x).abs() > DRAG_SLOP || (at.y - from.y).abs() > DRAG_SLOP;
+                    if let Some(message) = node.el.on_drag.clone().filter(|_| moved) {
+                        self.queue.push(message);
+                        self.pressed = None;
+                        self.stale.paint = true;
+                    }
+                }
             }
         }
         self.update_hover();
         self.flush(platform);
+        self.update_pointed();
     }
 
     pub fn pointer_down(&mut self, at: Point, mods: Modifiers, platform: &mut dyn Platform) {
         self.refresh();
         self.pointer = Some(at);
+        if let Some((_, message)) = self.app.edge(at, self.size) {
+            self.queue.push(message);
+            return self.flush(platform);
+        }
         let blocked = self.dismiss(self.hit(at));
         self.flush(platform);
         self.refresh();
@@ -460,6 +576,9 @@ impl<A: App> Ui<A> {
         }
 
         let node = &self.tree.nodes[i];
+        if clicks == 2 {
+            self.queue.extend(node.el.on_double.clone());
+        }
         match &node.el.content {
             Content::Input(input) => {
                 let offset = self.offset_at(i, at);
@@ -493,6 +612,10 @@ impl<A: App> Ui<A> {
         let Some(i) = self.hit(at).and_then(|hit| self.target(hit)).filter(|&i| !self.tree.disabled(i)) else { return };
         if self.tree.nodes[i].el.focus == Focus::Click {
             self.set_focus(Some(self.tree.nodes[i].id), false);
+        }
+        if let Some(handler) = &self.tree.nodes[i].el.on_menu {
+            self.queue.push(handler(at));
+            return self.flush(platform);
         }
         self.ask_menu(i, self.within(i, at), platform);
     }
@@ -533,11 +656,13 @@ impl<A: App> Ui<A> {
             }
         }
         self.flush(platform);
+        self.update_pointed();
     }
 
     pub fn pointer_leave(&mut self) {
         self.pointer = None;
         self.update_hover();
+        self.update_pointed();
     }
 
     /// `delta` is in logical pixels. A positive `y` moves the content up.
@@ -589,7 +714,11 @@ impl<A: App> Ui<A> {
         let Some(i) = self.focused() else { return };
         match &self.tree.nodes[i].el.content {
             Content::Input(_) => self.input_text(i, event),
-            Content::Canvas(canvas) => self.queue.extend(canvas.on_text.as_ref().map(|handler| handler(event))),
+            Content::Canvas(canvas) => {
+                self.queue.extend(canvas.on_text.as_ref().map(|handler| handler(event)));
+                // What is typed shows the caret, even where the text scrolls under it and it keeps its place.
+                self.restart_blink();
+            }
             // Space presses a focused button. It arrives as text, like every other character.
             _ if matches!(&event, InputEvent::Insert(text) | InputEvent::Commit(text) if text == " ") => {
                 self.activate(i)
@@ -608,9 +737,14 @@ impl<A: App> Ui<A> {
         if event.key == Key::Escape {
             // A field drops what was typed into it, and then Escape closes the topmost popover before it
             // means anything else.
-            let dropped = focused.and_then(|i| match &self.tree.nodes[i].el.content {
+            let cancel = |i: usize| match &self.tree.nodes[i].el.content {
                 Content::Input(input) => input.on_cancel.clone(),
                 _ => None,
+            };
+            // In a popover beside a field, Escape means what it means in the field.
+            let dropped = focused.and_then(|i| {
+                let layer = &self.tree.layers[self.tree.nodes[i].layer];
+                cancel(i).or_else(|| layer.anchor.filter(|_| layer.beside).and_then(cancel))
             });
             let cancelled = dropped.is_some();
             self.queue.extend(dropped);
@@ -626,6 +760,7 @@ impl<A: App> Ui<A> {
         }
         let on_page = focused.is_none_or(|i| matches!(self.tree.nodes[i].el.content, Content::Canvas(_)));
         if on_page && self.offer(event, platform) {
+            self.restart_blink();
             return true;
         }
         if let Some(i) = focused {
@@ -682,7 +817,16 @@ impl<A: App> Ui<A> {
         let modal = self.tree.modal_layer();
         let held = focused.map(|i| self.tree.nodes[i].layer).filter(|&layer| modal.is_none_or(|modal| layer >= modal));
         let layer = &self.tree.layers[held.or(modal).unwrap_or(0)];
-        let stops = self.tab_stops(layer.root..layer.end, focused);
+        // A popover beside its anchor is one round with it.
+        let beside = self.tree.layers.iter().find(|layer| {
+            layer.beside && focused.is_some_and(|i| layer.anchor == Some(i) || (layer.root..layer.end).contains(&i))
+        });
+        let inside = beside.map(|layer| (layer.anchor, self.tab_stops(layer.root..layer.end, focused)));
+        let stops: Vec<usize> = match inside {
+            // One with nothing to stop at leaves Tab to the window.
+            Some((anchor, inside)) if !inside.is_empty() => anchor.into_iter().chain(inside).collect(),
+            _ => self.tab_stops(layer.root..layer.end, focused),
+        };
         let at = focused.and_then(|i| stops.iter().position(|&stop| stop == i));
         let next = match (at, back) {
             (Some(at), false) => (at + 1) % stops.len(),
@@ -712,14 +856,20 @@ impl<A: App> Ui<A> {
 
     /// Moves focus among the focusable elements inside `container`, wrapping at the ends.
     fn rove(&mut self, container: usize, from: usize, step: Step) {
-        // After the pointer, the first arrow key only shows where focus is.
+        let stops = self.tree.focusables(container + 1..self.tree.nodes[container].end);
+        let mut at = stops.iter().position(|&stop| stop == from);
         if !self.focus_visible {
             self.focus_visible = true;
             self.stale.paint = true;
-            return;
+            if self.tree.nodes[container].layer > 0 {
+                // In a popover, focus that does not show was put there as it opened. To the person nothing
+                // is focused yet, so the key goes to the end it names or points away from.
+                at = None;
+            } else if matches!(step, Step::Next | Step::Previous) {
+                // After the pointer, the first arrow key only shows where focus is.
+                return;
+            }
         }
-        let stops = self.tree.focusables(container + 1..self.tree.nodes[container].end);
-        let at = stops.iter().position(|&stop| stop == from);
         let next = match (step, at) {
             (Step::First, _) | (Step::Next, None) => 0,
             (Step::Last, _) | (Step::Previous, None) => stops.len().saturating_sub(1),
@@ -867,12 +1017,14 @@ impl<A: App> Ui<A> {
     }
 
     /// Works out which tooltip shows: the one of the element under the pointer, or else of the element the
-    /// keyboard's focus is on.
+    /// keyboard's focus is on, or else of one that has news to tell.
     fn update_tip(&mut self) {
         let has = |&i: &usize| self.tree.nodes[i].el.tooltip.is_some() && !self.tree.disabled(i);
         let hovered = self.hover.iter().filter_map(|id| self.tree.find(*id)).find(has);
         let focused = self.focused().filter(|_| self.focus_visible).filter(has);
-        let Some(node) = hovered.or(focused).map(|i| &self.tree.nodes[i]) else {
+        let telling =
+            || (0..self.tree.nodes.len()).filter(|&i| self.tree.nodes[i].el.telling && !self.tree.gone(i)).find(has);
+        let Some(node) = hovered.or(focused).or_else(telling).map(|i| &self.tree.nodes[i]) else {
             self.tip = None;
             return;
         };
@@ -890,8 +1042,15 @@ impl<A: App> Ui<A> {
     fn target(&self, hit: usize) -> Option<usize> {
         self.tree.ancestors(hit).find(|&i| {
             let node = &self.tree.nodes[i];
-            let takes_input = matches!(node.el.content, Content::Input(_) | Content::Canvas(_));
-            takes_input || node.el.on_press.is_some() || node.trigger.is_some() || node.el.focus != Focus::No
+            // A canvas that is only a picture leaves the pointer to what it is drawn in.
+            let takes_input = match &node.el.content {
+                Content::Input(_) => true,
+                Content::Canvas(canvas) => canvas.on_pointer.is_some(),
+                _ => false,
+            };
+            let el = &node.el;
+            let pointed = el.on_drag.is_some() || el.on_double.is_some() || el.on_menu.is_some();
+            takes_input || pointed || el.on_press.is_some() || node.trigger.is_some() || el.focus != Focus::No
         })
     }
 
@@ -917,6 +1076,25 @@ impl<A: App> Ui<A> {
             self.hover = hover;
             self.stale.paint = true;
         }
+    }
+
+    /// Tells the app where the pointer rests on the canvas that asked to hear of it, or that it has left.
+    /// A held button keeps the app's last word: a drag is the canvas's own to follow.
+    fn update_pointed(&mut self) {
+        if self.pressed.is_some() {
+            return;
+        }
+        // What the app does with a message may have moved what is under the pointer.
+        self.refresh();
+        let rests = |i: &usize| matches!(&self.tree.nodes[*i].el.content, Content::Canvas(canvas) if canvas.pointed);
+        let over = self.pointer.and_then(|at| Some((self.hit(at).filter(rests)?, at)));
+        let at = over.map(|(i, at)| self.within(i, at));
+        if (at.is_some() || self.pointed) && self.app.point(at) {
+            // The pointer's shape is read before the next frame, and may be part of what changed.
+            self.stale.view = true;
+            self.refresh();
+        }
+        self.pointed = at.is_some();
     }
 
     /// Presses an element: sends its message, toggles its popover, and closes the popover it is in if it
@@ -958,6 +1136,13 @@ impl<A: App> Ui<A> {
         self.stale.view = true;
     }
 
+    /// Closes a popover a press landed outside of, unless it is one that stays.
+    fn press_outside(&mut self, layer: usize) {
+        if !self.tree.layers[layer].stays {
+            self.close_layer(layer);
+        }
+    }
+
     /// Closes the popovers a press landed outside of. Returns whether the press ends there, as one on a
     /// modal popover's backdrop does.
     fn dismiss(&mut self, hit: Option<usize>) -> bool {
@@ -967,7 +1152,7 @@ impl<A: App> Ui<A> {
                 self.close_layer(top);
                 return true;
             }
-            (1..=top).rev().for_each(|layer| self.close_layer(layer));
+            (1..=top).rev().for_each(|layer| self.press_outside(layer));
             return false;
         };
         for layer in (1..=top).rev() {
@@ -977,7 +1162,7 @@ impl<A: App> Ui<A> {
             if on_anchor || self.tree.in_layer(hit, layer) {
                 break;
             }
-            self.close_layer(layer);
+            self.press_outside(layer);
         }
         false
     }
@@ -1068,8 +1253,10 @@ impl<A: App> Ui<A> {
         if self.stale.view {
             self.stale = Stale { view: false, layout: true, paint: true };
             self.idle.0 = true;
-            let open = &self.open;
-            self.tree = Tree::build(self.app.view(self.size), |id| open.contains(&id));
+            let (open, app, size) = (&self.open, &mut self.app, self.size);
+            // The widgets take the accent as they are built.
+            self.accent = app.accent();
+            self.tree = theme::with(self.accent, || Tree::build(app.view(size), |id| open.contains(&id)));
             self.settle();
         }
         if self.stale.layout {
@@ -1077,7 +1264,8 @@ impl<A: App> Ui<A> {
             self.stale.paint = true;
             self.layout();
             // A caret that moved is scrolled into view, once the layout says where it is.
-            if self.follow_caret() {
+            // The two are asked in turn, since each scrolls: a caret that moved and a pick that did.
+            if self.follow_caret() | self.follow_pick() {
                 self.stale.layout = false;
                 self.layout();
             }
@@ -1116,9 +1304,19 @@ impl<A: App> Ui<A> {
         layout.run(&mut self.tree);
     }
 
+    /// The element whose caret shows: the one with focus, or a canvas that holds a caret for it in a popover
+    /// beside it.
+    fn caret_holder(&self) -> Option<usize> {
+        let focused = self.focused()?;
+        let holds =
+            |i: &usize| matches!(&self.tree.nodes[*i].el.content, Content::Canvas(canvas) if canvas.caret.is_some());
+        let beside = self.tree.layers.iter().filter(|layer| layer.beside && layer.anchor == Some(focused));
+        beside.flat_map(|layer| layer.root..layer.end).find(holds).or(Some(focused))
+    }
+
     /// Keeps the focused element's caret in view. Returns whether anything scrolled.
     fn follow_caret(&mut self) -> bool {
-        let Some(i) = self.focused() else { return false };
+        let Some(i) = self.caret_holder() else { return false };
         let node = &self.tree.nodes[i];
         let content = inner(node.rect, &node.el.style);
         match &node.el.content {
@@ -1139,10 +1337,27 @@ impl<A: App> Ui<A> {
         }
     }
 
+    /// Brings the element that asks to be in view there, once for each element that asks. Returns whether
+    /// anything scrolled.
+    fn follow_pick(&mut self) -> bool {
+        let picked = self.tree.nodes.iter().position(|node| node.el.in_view);
+        let id = picked.map(|i| self.tree.nodes[i].id);
+        let (Some(i), true) = (picked, id != self.shown) else {
+            self.shown = id;
+            return false;
+        };
+        self.shown = id;
+        // A row is shown with room for the one beside it, or the heading over it.
+        let rect = self.tree.nodes[i].rect;
+        self.reveal(i, rect, rect.height);
+        self.stale.layout
+    }
+
     /// Carries focus, popovers and per-element state over to a newly built tree.
     fn settle(&mut self) {
         let tree = &self.tree;
-        let anchors: Vec<Id> = tree.layers.iter().filter_map(|layer| layer.anchor).map(|i| tree.nodes[i].id).collect();
+        let open = tree.layers.iter().filter_map(|layer| Some((tree.nodes[layer.anchor?].id, layer.beside)));
+        let anchors: Vec<(Id, bool)> = open.collect();
         let mut focus = self.focus;
 
         // A popover that closed gives focus back to where it was.
@@ -1157,22 +1372,31 @@ impl<A: App> Ui<A> {
         if let Some(before) = restored {
             focus = before;
         }
-        // One that opened takes it.
+        // One that opened takes it, as does an element that asks for it when it first shows.
+        let mut took = Vec::new();
         for (layer, anchor) in tree.layers.iter().skip(1).zip(&anchors) {
             if !self.layers.contains(anchor) {
-                self.returns.push((*anchor, focus));
-                if let Some(&first) = tree.focusables(layer.root..layer.end).first() {
-                    let node = &tree.nodes[first];
-                    // A field reached this way is ready to be typed over, as one reached by Tab is.
-                    if let Content::Input(input) = &node.el.content {
-                        self.inputs.entry(node.id).or_default().select_all(&input.value);
-                    }
-                    focus = Some(node.id);
+                self.returns.push((*anchor, took.last().map_or(focus, |&i: &usize| Some(tree.nodes[i].id))));
+                // One beside its anchor leaves focus where it is.
+                let first = tree.focusables(layer.root..layer.end).first().copied();
+                if let Some(first) = first.filter(|_| !layer.beside) {
+                    took.push(first);
                     self.focus_visible |= layer.shows_focus;
                 }
             }
         }
         self.layers = anchors;
+        let asking: Vec<Id> = tree.nodes.iter().filter(|node| node.el.takes_focus).map(|node| node.id).collect();
+        took.extend(asking.iter().find(|id| !self.asking.contains(id)).and_then(|id| tree.find(*id)));
+        self.asking = asking;
+        if let Some(&took) = took.last() {
+            let node = &tree.nodes[took];
+            // A field reached this way is ready to be typed over, as one reached by Tab is.
+            if let Content::Input(input) = &node.el.content {
+                self.inputs.entry(node.id).or_default().select_all(&input.value);
+            }
+            focus = Some(node.id);
+        }
 
         if focus.and_then(|id| tree.find(id)).is_none_or(|i| !tree.focusable(i)) {
             focus = self.rest();

@@ -7,7 +7,7 @@
 //! Asking the model for such positions makes it build its history, which opening a document does not wait
 //! for. So they are only taken when an edit or a merge is at hand, which needs the history anyway.
 
-use letters_model::{Change, Document, HistoryError, Hold, Model, OpError, Pos, Prepared, Selection, StablePos};
+use letters_model::{Change, Document, HistoryError, Hold, Model, OpError, Pos, Prepared, Selection, StablePos, Style};
 
 use crate::{Caret, Editor, tree};
 
@@ -23,6 +23,12 @@ pub(crate) struct Kept {
     merges: u64,
 }
 
+/// Whether a change touched a block. One to the style or to the document's own fields moves no text, so
+/// every caret still counts the text it counted.
+fn moves(change: &Change) -> bool {
+    change.structure || !change.blocks.is_empty()
+}
+
 impl Editor {
     /// Takes in what another writer wrote, as [`Model::merge`] does. The selection and a composition in
     /// progress stay with their text.
@@ -36,6 +42,12 @@ impl Editor {
         self.take_in(|model| model.rewrite(doc))
     }
 
+    /// Makes the style read as `style`, which was changed outside the editor. See [`Model::rewrite_style`].
+    /// It is no undo step, and no text moves for it.
+    pub fn rewrite_style(&mut self, style: Style) -> Result<Change, OpError> {
+        self.model.rewrite_style(style)
+    }
+
     /// Takes over the history that [`Model::prepare`] made for this document, as [`Model::attach`] does.
     pub fn attach(&mut self, prepared: Prepared) -> Change {
         let change = self.model.attach(prepared);
@@ -43,7 +55,7 @@ impl Editor {
         let steps = self.undo.iter_mut().chain(&mut self.redo);
         let kept = steps.flat_map(|step| [&mut step.before, &mut step.after]).chain([&mut self.origin]);
         kept.for_each(|kept| kept.held = None);
-        if change != Change::default() {
+        if moves(&change) {
             self.merges += 1;
             self.restore(self.caret.clone());
         }
@@ -59,7 +71,7 @@ impl Editor {
         });
 
         let change = edit(&mut self.model)?;
-        if change == Change::default() {
+        if !moves(&change) {
             return Ok(change);
         }
         self.merges += 1;
@@ -105,7 +117,7 @@ impl Editor {
     pub(crate) fn recall(&mut self, kept: &Kept) {
         let moved = (kept.merges != self.merges).then(|| self.found(kept.held.clone())).flatten();
         let caret = kept.caret.clone();
-        self.restore(caret.map(|caret| Caret { selection: moved.unwrap_or(caret.selection), marks: caret.marks }));
+        self.restore(caret.map(|caret| Caret { selection: moved.unwrap_or(caret.selection.clone()), ..caret }));
     }
 
     /// A range holds on to the text inside it and a caret to the character before it, so what another
@@ -126,12 +138,8 @@ impl Editor {
     }
 
     /// Sets a caret that may no longer fit the document, on the text there is now.
-    fn restore(&mut self, caret: Option<Caret>) {
-        let fit = |caret: &Caret| {
-            let (anchor, head) = (self.clamp(&caret.selection.anchor)?, self.clamp(&caret.selection.head)?);
-            Some(Caret { selection: Selection { anchor, head }, marks: caret.marks.clone() })
-        };
-        self.caret = caret.as_ref().and_then(fit);
+    pub(crate) fn restore(&mut self, caret: Option<Caret>) {
+        self.caret = caret.as_ref().and_then(|caret| self.fit(caret));
         // Its block is gone, so the caret goes to the first text there is.
         let first = tree::texts(self.doc()).first().map(|block| Pos::new(block.id.clone(), 0));
         if let (None, Some(first)) = (&self.caret, first) {

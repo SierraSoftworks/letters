@@ -7,6 +7,7 @@ use crate::element::Element;
 use crate::icon::Icon;
 use crate::style::{Align, Edges, Justify, Look, Ring};
 use crate::text::TextStyle;
+use crate::theme::accent;
 use crate::tokens;
 use crate::widgets::{Menu, Popover};
 
@@ -139,15 +140,16 @@ impl<M> Button<M> {
 impl<M> From<Button<M>> for Element<M> {
     fn from(button: Button<M>) -> Self {
         // The component tokens of yewi's button.scss, per variant.
+        let accent = accent();
         let (bg, bg_hover, fg, border) = match (button.pressed, button.variant) {
             (Some(true), variant) if variant != Variant::Primary => (
-                Some(tokens::ACCENT_SOFT),
-                fade(tokens::ACCENT, 0.18),
-                tokens::ACCENT_TEXT,
-                Some(blend(tokens::SURFACE, tokens::ACCENT, 0.45)),
+                Some(accent.soft),
+                fade(accent.base, 0.18),
+                accent.text,
+                Some(blend(tokens::SURFACE, accent.base, 0.45)),
             ),
             (_, Variant::Default) => (Some(tokens::SURFACE), tokens::TONE_1, tokens::FG, Some(tokens::LINE_STRONG)),
-            (_, Variant::Primary) => (Some(tokens::ACCENT_SOLID), tokens::ACCENT_SOLID_HOVER, tokens::ON_SOLID, None),
+            (_, Variant::Primary) => (Some(accent.solid), accent.solid_hover, tokens::ON_SOLID, None),
             (_, Variant::Subtle) => (None, tokens::NEUTRAL_SOFT, tokens::FG_MUTED, None),
             (_, Variant::Danger) => {
                 (Some(tokens::SURFACE), tokens::DANGER_SOFT, tokens::DANGER, Some(fade(tokens::DANGER, 0.45)))

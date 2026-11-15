@@ -35,9 +35,9 @@ fn enter_breaks_the_block_at_the_caret() {
         ("> p one\n> p |", "> p one\np |"),
         ("> p |", "p |"),
         ("> p |\n> p two", "> p\n> p |\n> p two"),
-        // Code keeps its lines, and Enter on its empty last line leaves it.
+        // Code keeps its lines, the empty ones too.
         ("code let a;|", "code let a;⏎|"),
-        ("code let a;⏎|", "code let a;\np |"),
+        ("code let a;⏎|", "code let a;⏎⏎|"),
         ("code let a;⏎|⏎let b;", "code let a;⏎⏎|⏎let b;"),
     ];
     for (before, after) in cases {

@@ -12,6 +12,7 @@ use accesskit::Role;
 use letters_editor::{InputEvent, KeyEvent, Modifiers};
 use letters_render::{DisplayList, Point, Rect};
 
+use crate::chrome::Edge;
 use crate::icon::Icon;
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring, Style};
 use crate::text::TextStyle;
@@ -25,6 +26,8 @@ pub enum Cursor {
     Default,
     Pointer,
     Text,
+    /// Over the grip at an edge of a window that draws its own frame.
+    Resize(Edge),
 }
 
 /// Draws an element's own content, such as the page.
@@ -63,6 +66,7 @@ pub enum Pointer {
 }
 
 pub(crate) type KeyHandler<M> = Rc<dyn Fn(&KeyEvent) -> Option<M>>;
+pub(crate) type MenuHandler<M> = Rc<dyn Fn(Point) -> M>;
 
 pub(crate) enum Content<M> {
     None,
@@ -88,6 +92,8 @@ pub(crate) struct Canvas<M> {
     pub on_pointer: Option<Rc<dyn Fn(Pointer) -> Option<M>>>,
     /// Where the canvas's own caret is, relative to its top left, for the input method's window.
     pub caret: Option<Rect>,
+    /// Whether the app hears where the pointer rests on it.
+    pub pointed: bool,
 }
 
 /// Whether and how an element takes keyboard focus.
@@ -110,6 +116,7 @@ pub(crate) struct Access {
     pub pressed: Option<bool>,
     pub checked: Option<bool>,
     pub selected: Option<bool>,
+    pub expanded: Option<bool>,
     pub modal: bool,
     /// Decoration: left out of the accessibility tree, with everything in it.
     pub hidden: bool,
@@ -126,16 +133,22 @@ pub struct Element<M> {
     pub(crate) children: Vec<Element<M>>,
     pub(crate) access: Access,
     pub(crate) on_press: Option<M>,
+    pub(crate) on_drag: Option<M>,
+    pub(crate) on_double: Option<M>,
+    pub(crate) on_menu: Option<MenuHandler<M>>,
     pub(crate) on_key: Option<KeyHandler<M>>,
     pub(crate) focus: Focus,
     pub(crate) disabled: bool,
     pub(crate) rest: bool,
+    pub(crate) takes_focus: bool,
     pub(crate) closes: bool,
     pub(crate) arrows: Option<Dir>,
     pub(crate) one_stop: bool,
     pub(crate) cursor: Cursor,
     pub(crate) popover: Option<Box<Popover<M>>>,
     pub(crate) tooltip: Option<(String, Side)>,
+    pub(crate) telling: bool,
+    pub(crate) in_view: bool,
     pub(crate) fitted: Option<Fitted>,
 }
 
@@ -155,16 +168,22 @@ impl<M> Element<M> {
             children: Vec::new(),
             access: Access::default(),
             on_press: None,
+            on_drag: None,
+            on_double: None,
+            on_menu: None,
             on_key: None,
             focus: Focus::No,
             disabled: false,
             rest: false,
+            takes_focus: false,
             closes: false,
             arrows: None,
             one_stop: false,
             cursor: Cursor::Default,
             popover: None,
             tooltip: None,
+            telling: false,
+            in_view: false,
             fitted: None,
         }
     }
@@ -206,7 +225,8 @@ impl<M> Element<M> {
     /// An area the app draws itself. It takes focus on a click, and text and pointer input once the handlers
     /// are set.
     pub fn canvas(paint: Rc<dyn Paint>) -> Self {
-        let mut element = Self::new(Content::Canvas(Canvas { paint, on_text: None, on_pointer: None, caret: None }));
+        let mut element =
+            Self::new(Content::Canvas(Canvas { paint, on_text: None, on_pointer: None, caret: None, pointed: false }));
         element.focus = Focus::Click;
         element.style.clip = true;
         element
@@ -422,6 +442,35 @@ impl<M> Element<M> {
         self
     }
 
+    /// Sends `message` when the element is clicked, and keeps it out of the keyboard's reach: for a part of a
+    /// focusable element whose job the keys do another way, as the arrow of a tree's row.
+    pub fn on_click(mut self, message: M) -> Self {
+        self.on_press = Some(message);
+        self.cursor = Cursor::Pointer;
+        self
+    }
+
+    /// Sends `message` when a press on the element moves a little before it is let go, which is then no
+    /// click: for what is dragged as a whole, as a window is by its title bar. It answers for the room
+    /// between the controls inside it, and never for a control.
+    pub fn on_drag(mut self, message: M) -> Self {
+        self.on_drag = Some(message);
+        self
+    }
+
+    /// Sends `message` at the second of two quick presses on the element, outside the controls inside it.
+    pub fn on_double_click(mut self, message: M) -> Self {
+        self.on_double = Some(message);
+        self
+    }
+
+    /// Sends what `handler` makes of a point of the window when the secondary button goes down there on the
+    /// element, outside the controls inside it.
+    pub fn on_menu(mut self, handler: impl Fn(Point) -> M + 'static) -> Self {
+        self.on_menu = Some(Rc::new(handler));
+        self
+    }
+
     /// Offers this element the keys nothing inside it used. Returning a message uses the key.
     pub fn on_key(mut self, handler: impl Fn(&KeyEvent) -> Option<M> + 'static) -> Self {
         self.on_key = Some(Rc::new(handler));
@@ -443,6 +492,14 @@ impl<M> Element<M> {
     /// Makes this the element focus rests on whenever nothing else holds it, as the page does.
     pub fn default_focus(mut self) -> Self {
         self.rest = true;
+        self.focus = self.focus.max(Focus::Keys);
+        self
+    }
+
+    /// Gives this element the keyboard's focus when it first shows, as a field that opens in place of what
+    /// it edits.
+    pub fn takes_focus(mut self) -> Self {
+        self.takes_focus = true;
         self.focus = self.focus.max(Focus::Keys);
         self
     }
@@ -472,6 +529,21 @@ impl<M> Element<M> {
         self
     }
 
+    /// Shows the tooltip without being pointed at, while the element has news to tell. One under the pointer
+    /// or the keyboard's focus still comes first.
+    pub fn telling(mut self, telling: bool) -> Self {
+        self.telling = telling;
+        self
+    }
+
+    /// Brings the element into view of whatever scrolls it, when it first shows and each time it takes this
+    /// over from another: for the row a list has picked while focus stays in a field. One element of a
+    /// window at a time.
+    pub fn in_view(mut self, in_view: bool) -> Self {
+        self.in_view = in_view;
+        self
+    }
+
     /// Attaches a popover. Without [`Popover::open`], pressing the element opens and closes it.
     pub fn popover(mut self, popover: Popover<M>) -> Self {
         self.popover = Some(Box::new(popover));
@@ -494,6 +566,23 @@ impl<M> Element<M> {
         if let Content::Canvas(canvas) = &mut self.content {
             canvas.on_pointer = Some(Rc::new(handler));
         }
+        self
+    }
+
+    /// Has the app told where the pointer rests on the canvas, through [`App::point`](crate::App::point). A
+    /// window has one such canvas at most, since the app is not told which.
+    pub fn pointed(mut self) -> Self {
+        if let Content::Canvas(canvas) = &mut self.content {
+            canvas.pointed = true;
+        }
+        self
+    }
+
+    /// Keeps a canvas from taking focus, for one that is only a picture. In a popover beside another element
+    /// it may still show that element's caret: the caret set here blinks while that element has focus, and
+    /// a press here leaves focus with it.
+    pub fn passive(mut self) -> Self {
+        self.focus = Focus::No;
         self
     }
 
@@ -538,6 +627,12 @@ impl<M> Element<M> {
 
     pub fn selected(mut self, selected: bool) -> Self {
         self.access.selected = Some(selected);
+        self
+    }
+
+    /// Says whether a row that has others under it shows them, as a folder in a tree.
+    pub fn expanded(mut self, expanded: bool) -> Self {
+        self.access.expanded = Some(expanded);
         self
     }
 

@@ -47,19 +47,27 @@ fn bad_arguments_are_refused() {
 #[test]
 fn export_and_import_are_subcommands() {
     let export = |file: &str, to, output, force| Ok(Command::Export(Export { file: file.into(), to, output, force }));
-    let import = |paths: &[&str], recursive, json| {
-        Ok(Command::Import(Import { paths: paths.iter().map(PathBuf::from).collect(), recursive, json }))
+    let import_with = |paths: &[&str], pictures: &[&str], recursive, json| {
+        let list = |paths: &[&str]| paths.iter().map(PathBuf::from).collect();
+        Ok(Command::Import(Import { paths: list(paths), pictures: list(pictures), recursive, json }))
     };
+    let import = |paths: &[&str], recursive, json| import_with(paths, &[], recursive, json);
     let to_file = |name: &str| Some(Output::File(name.into()));
     let cases = [
         ("export a.let --to md", export("a.let", Format::Markdown, None, false)),
         ("export --to=html a.let", export("a.let", Format::Html, None, false)),
+        ("export a.let --to docx", export("a.let", Format::Docx, None, false)),
         ("export a.let --to html -o out/a.html --force", export("a.let", Format::Html, to_file("out/a.html"), true)),
         ("export a.let --to md --output=-", export("a.let", Format::Markdown, Some(Output::Stdout), false)),
+        ("export a.let --to pdf", export("a.let", Format::Pdf, None, false)),
         ("export --to md -o - -- --odd.let", export("--odd.let", Format::Markdown, Some(Output::Stdout), false)),
         ("import notes", import(&["notes"], false, false)),
         ("import notes a.md --recursive --json", import(&["notes", "a.md"], true, true)),
         ("import -r -- --odd.md", import(&["--odd.md"], true, false)),
+        (
+            "import notes --pictures-from shared --pictures-from=../art",
+            import_with(&["notes"], &["shared", "../art"], false, false),
+        ),
         ("import notes --help", Ok(Command::Help)),
         // Only the first argument names a subcommand, so files of those names still open.
         ("-- export", Ok(Command::Run(Options { file: Some("export".into()), ..Options::default() }))),
@@ -76,7 +84,7 @@ fn bad_subcommand_arguments_are_refused() {
         "export",
         "export a.let",
         "export --to md",
-        "export a.let --to pdf",
+        "export a.let --to odt",
         "export a.let --to",
         "export a.let b.let --to md",
         "export a.let --to md --recursive",
@@ -84,6 +92,7 @@ fn bad_subcommand_arguments_are_refused() {
         "import --json",
         "import notes --to md",
         "import notes --headless",
+        "import notes --pictures-from",
     ] {
         assert!(parse(args(line)).is_err(), "{line:?}");
     }

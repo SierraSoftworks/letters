@@ -3,7 +3,9 @@
 //! The source is the LaTeX that KaTeX accepts. [`typeset`] turns it into a [`Formula`], whose items go into
 //! the same display list as everything else, so one renderer draws maths on every backend. Layout keeps a
 //! [`Cache`], since a formula is set far more often than it changes. [`commands`] and [`environments`] list
-//! what the engine understands, for completion while typing.
+//! what the engine understands, for completion while typing. [`Formula::svg`] draws one where there is no
+//! renderer, as on an exported page. [`mathml`] gives a formula's structure to the formats that hold maths
+//! as a tree.
 //!
 //! A formula holds only glyphs, rules and outlines, so nothing in one can load, and there is no command for
 //! an image. `\href` and `\url` are drawn as links only where [`Style::links`] allows it. The address is not
@@ -15,6 +17,8 @@ mod cache;
 mod commands;
 mod engine;
 mod fonts;
+mod mathml;
+mod svg;
 mod table;
 
 use std::fmt;
@@ -24,6 +28,7 @@ use letters_render::{Color, DisplayList, Item, Point, Size};
 
 pub use crate::cache::Cache;
 pub use crate::commands::{Command, commands, environments};
+pub use crate::fonts::{FILES as FONT_FILES, provide as provide_fonts};
 
 /// How much larger than the text beside it a formula is set. The maths faces are small on the body, so at
 /// the same size a formula looks slight next to prose. This is the ratio KaTeX uses.
@@ -97,4 +102,13 @@ impl std::error::Error for Error {}
 /// Typesets `source`, which is TeX with no `$` around it.
 pub fn typeset(source: &str, style: &Style) -> Result<Formula, Error> {
     engine::typeset(source, style)
+}
+
+/// Writes `source` as presentation MathML, for the formats and tools that take a formula as its structure
+/// and not as a drawing. The result is one `math` element, set as a block of its own when `display` is set.
+///
+/// Fails as [`typeset`] does on a source that does not parse, and on the few things MathML has no element
+/// for: a commutative diagram and a proof tree.
+pub fn mathml(source: &str, display: bool) -> Result<String, Error> {
+    mathml::write(source, display)
 }

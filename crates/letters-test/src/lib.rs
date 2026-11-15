@@ -8,9 +8,9 @@
 use std::rc::Rc;
 
 use accesskit::{ActionRequest, Toggled};
-use accesskit_consumer::{NodeRef, Tree};
-use letters_editor::{Clip, Editor, InputEvent, Key, KeyEvent, Modifiers, Platform};
-use letters_model::{Document, Pos, ReplicaId, Selection, Style};
+use accesskit_consumer::{NodeRef, Tree, TreeChangeHandler};
+use letters_editor::{Clip, Editor, InputEvent, Key, KeyEvent, Modifiers, Picture, Platform};
+use letters_model::{Document, Pos, ReplicaId, Selection};
 use letters_render::{DisplayList, Point, Rect, Size};
 use letters_ui::{App, EditorApp, FixedShaper, Keys, Ui, Window};
 
@@ -23,6 +23,8 @@ pub const WINDOW: Size = Size { width: 1280.0, height: 800.0 };
 #[derive(Clone, Debug, Default)]
 pub struct TestPlatform {
     pub now_ms: u64,
+    /// The time of day, in seconds since 1970. `None` is a shell without a clock.
+    pub wall: Option<u64>,
     pub clipboard: Option<Clip>,
     /// The words the person added to their own dictionary.
     pub learned: Vec<String>,
@@ -32,6 +34,10 @@ pub struct TestPlatform {
 impl Platform for TestPlatform {
     fn now_ms(&self) -> u64 {
         self.now_ms
+    }
+
+    fn wall_time(&self) -> Option<u64> {
+        self.wall
     }
 
     fn clipboard_read(&mut self) -> Option<Clip> {
@@ -67,6 +73,8 @@ pub struct Found {
     pub toggled: Option<bool>,
     /// Whether the popover it opens is showing.
     pub expanded: Option<bool>,
+    /// Whether it is the one picked among its siblings, as an option of a list is.
+    pub selected: Option<bool>,
 }
 
 impl Found {
@@ -84,6 +92,7 @@ impl Found {
             disabled: node.is_disabled(),
             toggled: node.toggled().map(|toggled| toggled == Toggled::True),
             expanded: node.data().is_expanded(),
+            selected: node.is_selected(),
         }
     }
 
@@ -96,6 +105,19 @@ impl Found {
 pub struct Harness<A: App = EditorApp> {
     ui: Ui<A>,
     pub platform: TestPlatform,
+    /// The accessibility tree as a screen reader holds it: given whole once, and kept up by changes for as
+    /// long as the harness alone has asked the window for them.
+    heard: Option<Tree>,
+}
+
+/// Takes the changes to the tree without a word, as the harness only reads how it stands.
+struct Unheard;
+
+impl TreeChangeHandler for Unheard {
+    fn node_added(&mut self, _node: &NodeRef) {}
+    fn node_updated(&mut self, _old_node: &NodeRef, _new_node: &NodeRef) {}
+    fn focus_moved(&mut self, _old_node: Option<&NodeRef>, _new_node: Option<&NodeRef>) {}
+    fn node_removed(&mut self, _node: &NodeRef) {}
 }
 
 impl<A: App> Harness<A> {
@@ -108,7 +130,7 @@ impl<A: App> Harness<A> {
     pub fn with(mut ui: Ui<A>) -> Self {
         ui.resize(WINDOW, 1.0);
         ui.set_keys(Keys::Standard);
-        Self { ui, platform: TestPlatform::default() }
+        Self { ui, platform: TestPlatform::default(), heard: None }
     }
 
     /// The same window under macOS key conventions.
@@ -123,6 +145,8 @@ impl<A: App> Harness<A> {
 
     /// The window itself, for calls the harness has no shorthand for.
     pub fn ui(&mut self) -> &mut Ui<A> {
+        // The caller may ask for the tree too, and the changes after that would not add up to it here.
+        self.heard = None;
         &mut self.ui
     }
 
@@ -146,9 +170,17 @@ impl<A: App> Harness<A> {
             out.push(Found::of(&node));
             node.children().for_each(|child| walk(child, out));
         }
-        let tree = Tree::new(self.ui.access(), true);
+        // A screen reader is given the tree whole once and the changes from then on, and so is this one.
+        let tree = match self.heard.take() {
+            Some(mut tree) => {
+                tree.update_and_process_changes(self.ui.access_changes(), &mut Unheard);
+                tree
+            }
+            None => Tree::new(self.ui.access(), true),
+        };
         let mut out = Vec::new();
         walk(tree.state().root(), &mut out);
+        self.heard = Some(tree);
         out
     }
 
@@ -214,6 +246,19 @@ impl<A: App> Harness<A> {
         let at = self.expect(role, name).center();
         self.ui.pointer_move(at, &mut self.platform);
         self
+    }
+
+    /// Moves the pointer to a point with no button held.
+    pub fn hover_at(&mut self, at: Point) -> &mut Self {
+        self.ui.pointer_move(at, &mut self.platform);
+        self
+    }
+
+    /// Clicks at a point with Ctrl or Cmd held.
+    pub fn mod_click_at(&mut self, at: Point) -> &mut Self {
+        self.ui.pointer_move(at, &mut self.platform);
+        self.ui.pointer_down(at, Modifiers { primary: true, ..Modifiers::default() }, &mut self.platform);
+        self.release_at(at)
     }
 
     pub fn press_at(&mut self, at: Point) -> &mut Self {
@@ -303,7 +348,7 @@ impl<A: App> Harness<A> {
 impl Harness<EditorApp> {
     /// The editor's window on a document, with the bundled fonts and the default style.
     pub fn open(document: Document) -> Self {
-        Self::with(Window::new(Editor::new(document, ReplicaId::from(1)), Style::default()))
+        Self::with(Window::new(Editor::new(document, ReplicaId::from(1))))
     }
 
     /// The editor's window on a document written as Markdown.
@@ -327,6 +372,31 @@ impl Harness<EditorApp> {
         let anchor = Pos { block: block.clone(), offset: start };
         self.ui.select(Selection { anchor, head: Pos { block, offset: start + text.len() } });
         self
+    }
+
+    /// Holds pictures over a point, as files dragged over the window are, or takes them away again with
+    /// `None`. Returns whether they could be let go there.
+    pub fn hold_pictures(&mut self, at: Option<Point>) -> bool {
+        self.ui.drag_pictures(at)
+    }
+
+    /// Lets pictures go at a point, or hands over pictures chosen in a dialog with `None`.
+    pub fn drop_pictures(&mut self, at: Option<Point>, pictures: Vec<Picture>) -> &mut Self {
+        self.ui.insert_pictures(pictures, at, &mut self.platform);
+        self
+    }
+
+    /// Hands over the bytes of a linked picture to keep in the document, as a shell that was asked to
+    /// embed it does.
+    pub fn embed_picture(&mut self, figure: &str, picture: Picture) -> &mut Self {
+        self.ui.embed_picture(&figure.into(), picture, &mut self.platform);
+        self
+    }
+
+    /// Holds a finger on a point, as a touch screen's shell passes it on. Returns whether a word was
+    /// selected.
+    pub fn long_press_at(&mut self, at: Point) -> bool {
+        self.ui.select_word_at(at, &mut self.platform)
     }
 
     pub fn editor(&self) -> &Editor {

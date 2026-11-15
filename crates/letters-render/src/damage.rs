@@ -320,6 +320,11 @@ fn entry(item: &Item, images: &Images, fonts: &mut FontCache, by: By) -> Entry {
             mix = Mix(8);
             (Point::default(), Extent::Anywhere)
         }
+        // A part of the document shows nothing, so no change to one is a change to the frame.
+        Item::Open { .. } | Item::Close => {
+            mix = Mix(9);
+            (Point::default(), Extent::Nowhere)
+        }
     };
     let shape = mix.finish();
     let mut mix = Mix(shape);

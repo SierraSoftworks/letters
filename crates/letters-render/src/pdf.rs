@@ -3,10 +3,14 @@
 //! Fonts are embedded as subsets, a variable font as the instance its runs use. A run that carries its
 //! [`RunText`] can be selected and searched as it was written. One that does not is spelled from its font's
 //! character map, which loses ligatures. An image is stored once however often it is drawn.
+//!
+//! Where lists say what their parts are ([`Item::Open`]), the file is tagged: a reader that cannot see the
+//! page gets its headings, paragraphs, lists, figures and tables in reading order.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::num::NonZeroU16;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -16,12 +20,16 @@ use krilla::color::rgb;
 use krilla::destination::XyzDestination;
 use krilla::geom::{PathBuilder, Transform};
 use krilla::image::{BitsPerComponent, CustomImage, ImageColorspace};
-use krilla::metadata::Metadata;
+use krilla::metadata::{DateTime, Metadata};
 use krilla::num::NormalizedF32;
 use krilla::outline::{Outline, OutlineNode};
 use krilla::page::PageSettings;
 use krilla::paint::{Fill, FillRule, LineCap, LineJoin, Stroke};
 use krilla::surface::Surface;
+use krilla::tagging::{
+    Artifact, ArtifactType, ContentTag, Identifier, ListNumbering, Node, Placement, SpanTag, TableHeaderScope,
+    Tag as Kind, TagGroup, TagKind, TagTree,
+};
 use krilla::text::{GlyphId, KrillaGlyph, Tag};
 use krilla::{Document, geom};
 use skrifa::raw::TableProvider;
@@ -32,7 +40,7 @@ use vello_cpu::kurbo::{self, Shape};
 use crate::cpu::{CpuRenderer, Frame};
 use crate::image::Images;
 use crate::paint::{EMBOLDEN, bez_path, rounded};
-use crate::{Color, DisplayList, Font, Glyph, Item, Point, Rect, RunText, Size};
+use crate::{Color, DisplayList, Font, Glyph, Item, Point, Rect, Role, RunText, Size};
 
 /// PDF points in a logical pixel: 72 to the inch against 96.
 const POINTS: f32 = 0.75;
@@ -42,6 +50,9 @@ const TOLERANCE: f64 = 0.01;
 const SHADOW_SCALE: f32 = 2.0;
 /// The longest side a shadow's picture may have, in pixels.
 const SHADOW_SIDE: f32 = 2048.0;
+/// How deep parts may lie inside one another. A part opened deeper is read as more of the part around it,
+/// so that no list can make the structure too deep to walk.
+const DEPTH: usize = 32;
 
 /// A part of a page that takes the reader somewhere.
 #[derive(Clone, Debug, PartialEq)]
@@ -49,6 +60,8 @@ pub struct Link {
     /// Where on the page it is, in logical pixels from the page's top left.
     pub rect: Rect,
     pub target: Target,
+    /// The id of the [`Role::Link`] part that holds the link's text, if the page's list has one.
+    pub part: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -77,6 +90,8 @@ pub struct Info {
     pub authors: Vec<String>,
     /// The language most of the text is in, as a BCP 47 tag such as `en-GB`.
     pub language: String,
+    /// When the file was written, in seconds since 1970 began in UTC. The shell says: the core has no clock.
+    pub created: Option<u64>,
     /// The headings in reading order.
     pub outline: Vec<Heading>,
 }
@@ -110,6 +125,7 @@ pub struct Pdf {
     /// The furthest page a link goes to.
     furthest: Option<usize>,
     kept: Kept,
+    structure: Structure,
 }
 
 /// What pages share, so that each font and image goes into the file once.
@@ -140,7 +156,13 @@ impl Default for Pdf {
 
 impl Pdf {
     pub fn new() -> Self {
-        Self { document: Document::new(), pages: 0, furthest: None, kept: Kept::default() }
+        Self {
+            document: Document::new(),
+            pages: 0,
+            furthest: None,
+            kept: Kept::default(),
+            structure: Structure::default(),
+        }
     }
 
     /// Adds a page of `size` logical pixels that shows `list`, with its top left at the list's origin. An
@@ -149,29 +171,45 @@ impl Pdf {
         let sheet = PageSettings::from_wh(size.width * POINTS, size.height * POINTS)
             .unwrap_or_else(|| PageSettings::from_wh(1.0, 1.0).expect("a point square is a valid page"));
         let mut page = self.document.start_page_with(sheet);
-        for link in links {
-            let Rect { x, y, width, height } = link.rect;
+        let mut surface = page.surface();
+        surface.push_transform(&Transform::from_scale(POINTS, POINTS));
+        let mut painter = Painter {
+            surface: &mut surface,
+            kept: &mut self.kept,
+            assets: images,
+            structure: &mut self.structure,
+            // A list that names no part is not known to be decoration, so nothing in it is marked.
+            parts: list.items.iter().any(|item| matches!(item, Item::Open { .. })),
+            marked: None,
+        };
+        painter.paint(list);
+        surface.pop();
+        surface.finish();
+        for Link { rect, target, part } in links {
+            let Rect { x, y, width, height } = *rect;
             if !(width > 0.0 && height > 0.0) {
                 continue;
             }
             let Some(rect) = geom::Rect::from_xywh(x * POINTS, y * POINTS, width * POINTS, height * POINTS) else {
                 continue;
             };
-            let opens = match &link.target {
+            let opens = match target {
                 Target::Url(url) => Opens::Action(Action::Link(LinkAction::new(url.clone()))),
                 Target::Place { page, at } => {
                     self.furthest = self.furthest.max(Some(*page));
                     Opens::Destination(place(*page, *at).into())
                 }
             };
-            page.add_annotation(Annotation::new_link(LinkAnnotation::new(rect, opens), None));
+            let link = Annotation::new_link(LinkAnnotation::new(rect, opens), None);
+            // A link that names its text is read where the text is. The others can only be clicked.
+            let linked = part
+                .and_then(|part| self.structure.known.get(&part))
+                .map(|element| &mut self.structure.elements[*element]);
+            match linked.filter(|element| element.role == Role::Link) {
+                Some(element) => element.parts.push(Part::Content(page.add_tagged_annotation(link))),
+                None => page.add_annotation(link),
+            }
         }
-
-        let mut surface = page.surface();
-        surface.push_transform(&Transform::from_scale(POINTS, POINTS));
-        Painter { surface: &mut surface, kept: &mut self.kept, assets: images }.paint(list);
-        surface.pop();
-        surface.finish();
         page.finish();
         self.pages += 1;
     }
@@ -191,6 +229,9 @@ impl Pdf {
         if !info.language.is_empty() {
             metadata = metadata.language(info.language.clone());
         }
+        if let Some(created) = info.created {
+            metadata = metadata.creation_date(date(created));
+        }
         self.document.set_metadata(metadata);
 
         let headings: Vec<&Heading> = info.outline.iter().filter(|heading| heading.page < self.pages).collect();
@@ -202,11 +243,39 @@ impl Pdf {
             }
             self.document.set_outline(outline);
         }
+        if !self.structure.elements.is_empty() {
+            let language = (!info.language.is_empty()).then(|| info.language.clone());
+            let mut tree = TagTree::new().with_lang(language);
+            tree.children = self.structure.nodes(&self.structure.top);
+            self.document.set_tag_tree(tree);
+        }
         self.document.finish().map_err(|error| match error {
             krilla::error::KrillaError::Font(_, reason) => PdfError::Font(reason),
             other => PdfError::Other(format!("{other:?}")),
         })
     }
+}
+
+/// The date and time in UTC that is `seconds` after 1970 began.
+fn date(seconds: u64) -> DateTime {
+    let (days, seconds) = (seconds / 86_400, seconds % 86_400);
+    // Counted in years that start in March, so that a leap day is the last day of its year.
+    let days = days + 719_468;
+    let (era, day_of_era) = (days / 146_097, days % 146_097);
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month + 2) / 5 + 1;
+    let (month, year) = if month < 10 { (month + 3, 0) } else { (month - 9, 1) };
+    let year = (year + year_of_era + era * 400).min(9999);
+    DateTime::new(year as u16)
+        .month(month as u8)
+        .day(day as u8)
+        .hour((seconds / 3_600) as u8)
+        .minute((seconds / 60 % 60) as u8)
+        .second((seconds % 60) as u8)
+        .utc_offset_hour(0)
+        .utc_offset_minute(0)
 }
 
 fn place(page: usize, at: Point) -> XyzDestination {
@@ -225,11 +294,148 @@ fn nested(rest: &mut &[&Heading]) -> OutlineNode {
     node
 }
 
+/// The parts of the document, as its pages opened them.
+#[derive(Default)]
+struct Structure {
+    elements: Vec<Element>,
+    /// By the id each element was opened with.
+    known: HashMap<u64, usize>,
+    /// What lies under no element, in reading order.
+    top: Vec<Part>,
+}
+
+struct Element {
+    role: Role,
+    /// In the order they were first drawn or opened, which is the order they are read in.
+    parts: Vec<Part>,
+}
+
+#[derive(Clone, Copy)]
+enum Part {
+    Element(usize),
+    /// A stretch of one page's content, or a link on it.
+    Content(Identifier),
+}
+
+impl Structure {
+    /// The element `id` names, made under `parent` the first time it opens.
+    fn open(&mut self, role: &Role, id: u64, parent: Option<usize>) -> usize {
+        if let Some(known) = self.known.get(&id) {
+            return *known;
+        }
+        let element = self.elements.len();
+        self.elements.push(Element { role: role.clone(), parts: Vec::new() });
+        self.known.insert(id, element);
+        match parent {
+            Some(parent) => self.elements[parent].parts.push(Part::Element(element)),
+            None => self.top.push(Part::Element(element)),
+        }
+        element
+    }
+
+    /// The tags for `parts`, with list items that follow one another gathered into lists. An element with
+    /// nothing in it is left out.
+    fn nodes(&self, parts: &[Part]) -> Vec<Node> {
+        let mut nodes = Vec::new();
+        let mut rest = parts;
+        while let Some((first, after)) = rest.split_first() {
+            let group = match first {
+                Part::Content(content) => {
+                    nodes.push(Node::Leaf(*content));
+                    rest = after;
+                    continue;
+                }
+                Part::Element(_) if self.item(Some(first)).is_some() => self.list(&mut rest),
+                Part::Element(element) => {
+                    rest = after;
+                    let Element { role, parts } = &self.elements[*element];
+                    TagGroup::with_children(tag(role), self.nodes(parts))
+                }
+            };
+            if !group.children.is_empty() {
+                nodes.push(group.into());
+            }
+        }
+        nodes
+    }
+
+    /// The list item `part` is, with its depth and how its list is marked.
+    fn item(&self, part: Option<&Part>) -> Option<(&Element, u8, ListNumbering)> {
+        let Part::Element(element) = part? else { return None };
+        let element = &self.elements[*element];
+        let Role::ListItem { depth, numbered, checked } = element.role else { return None };
+        let marked = match (numbered, checked) {
+            (true, _) => ListNumbering::Decimal,
+            // A task's box is its label, which says whether it is ticked.
+            (false, Some(_)) => ListNumbering::None,
+            (false, None) => ListNumbering::Disc,
+        };
+        Some((element, depth, marked))
+    }
+
+    /// Takes the list that `rest` starts with off it. A deeper item starts a list under the item before it.
+    fn list(&self, rest: &mut &[Part]) -> TagGroup {
+        let (_, depth, marked) = self.item(rest.first()).expect("the caller checks that a list item is first");
+        let mut list = TagGroup::new(Kind::L(marked));
+        while let Some((element, ..)) = self.item(rest.first()).filter(|(_, at, how)| (*at, *how) == (depth, marked)) {
+            *rest = &rest[1..];
+            let label = |part: &Part| matches!(part, Part::Element(part) if self.elements[*part].role == Role::Label);
+            let (labels, text): (Vec<Part>, Vec<Part>) = element.parts.iter().partition(|part| label(part));
+            let mut body = TagGroup::with_children(Kind::LBody, self.nodes(&text));
+            while self.item(rest.first()).is_some_and(|(_, at, _)| at > depth) {
+                body.push(self.list(rest));
+            }
+            let mut item = TagGroup::new(Kind::LI);
+            for part in labels {
+                let Part::Element(part) = part else { continue };
+                let said = match element.role {
+                    Role::ListItem { checked: Some(true), .. } => Some("\u{2611}"),
+                    Role::ListItem { checked: Some(false), .. } => Some("\u{2610}"),
+                    _ => None,
+                };
+                let tag = Kind::Lbl.with_actual_text(said.map(str::to_owned));
+                item.push(TagGroup::with_children(tag, self.nodes(&self.elements[part].parts)));
+            }
+            item.push(body);
+            list.push(item);
+        }
+        list
+    }
+}
+
+/// The PDF structure type for a role.
+fn tag(role: &Role) -> TagKind {
+    let said = |alt: &str| (!alt.is_empty()).then(|| alt.to_owned());
+    match role {
+        Role::Heading(level) => Kind::Hn(NonZeroU16::new(u16::from(*level)).unwrap_or(NonZeroU16::MIN), None).into(),
+        Role::Paragraph => Kind::P.into(),
+        Role::ListItem { .. } => Kind::LI.into(),
+        Role::Label => Kind::Lbl.into(),
+        Role::Quote => Kind::BlockQuote.into(),
+        // PDF's own Note is a footnote, which a callout is not.
+        Role::Note => Kind::Div.into(),
+        Role::Code => Kind::Code.with_placement(Some(Placement::Block)).into(),
+        Role::Figure { alt } => Kind::Figure(said(alt)).into(),
+        Role::Caption => Kind::Caption.into(),
+        Role::Formula { alt } => Kind::Formula(said(alt)).into(),
+        Role::Link => Kind::Link.into(),
+        Role::Table => Kind::Table.into(),
+        Role::Row => Kind::TR.into(),
+        Role::Cell { header: true } => Kind::TH(TableHeaderScope::Column).into(),
+        Role::Cell { header: false } => Kind::TD.into(),
+    }
+}
+
 /// Draws display lists on one page's surface.
 struct Painter<'a, 'b> {
     surface: &'a mut Surface<'b>,
     kept: &'a mut Kept,
     assets: &'a Images,
+    structure: &'a mut Structure,
+    /// Whether the list says what its parts are.
+    parts: bool,
+    /// The element the content being drawn is marked as part of, or `Some(None)` for decoration.
+    marked: Option<Option<usize>>,
 }
 
 impl Painter<'_, '_> {
@@ -237,8 +443,21 @@ impl Painter<'_, '_> {
         // Whether each open clip is one the surface holds. A clip that lets nothing through is not, and
         // nothing is drawn until it closes.
         let mut clips: Vec<bool> = Vec::new();
+        // The elements that are open, innermost last.
+        let mut open: Vec<Option<usize>> = Vec::new();
         for item in &list.items {
+            // Marked content may not straddle a clip, and belongs to one element.
+            if matches!(item, Item::PushClip { .. } | Item::PopClip | Item::Open { .. } | Item::Close) {
+                self.unmark();
+            }
             match item {
+                Item::Open { role, id } => {
+                    let around = open.last().copied().flatten();
+                    let deep = open.len() >= DEPTH;
+                    open.push(if deep { around } else { Some(self.structure.open(role, *id, around)) });
+                }
+                // A close with nothing open is ignored.
+                Item::Close => drop(open.pop()),
                 Item::PushClip { rect, radius } => {
                     let path = rounded(rect, *radius).and_then(|shape| path(shape.path_elements(TOLERANCE)));
                     if let Some(path) = &path {
@@ -253,11 +472,38 @@ impl Painter<'_, '_> {
                     }
                 }
                 _ if clips.contains(&false) => {}
-                item => self.draw(item),
+                item => {
+                    self.mark(open.last().copied().flatten());
+                    self.draw(item);
+                }
             }
         }
+        self.unmark();
         for _ in clips.into_iter().filter(|held| *held) {
             self.surface.pop();
+        }
+    }
+
+    /// Marks what is drawn from here on as content of `element`, or as decoration.
+    fn mark(&mut self, element: Option<usize>) {
+        if !self.parts || self.marked == Some(element) {
+            return;
+        }
+        self.unmark();
+        match element {
+            Some(element) => {
+                // A reader takes what the content is from its element, so one tag serves text and pictures.
+                let content = self.surface.start_tagged(ContentTag::Span(SpanTag::empty()));
+                self.structure.elements[element].parts.push(Part::Content(content));
+            }
+            None => drop(self.surface.start_tagged(ContentTag::Artifact(Artifact::with_kind(ArtifactType::Other)))),
+        }
+        self.marked = Some(element);
+    }
+
+    fn unmark(&mut self) {
+        if self.marked.take().is_some() {
+            self.surface.end_tagged();
         }
     }
 
@@ -343,12 +589,19 @@ impl Painter<'_, '_> {
             Item::Image { rect, asset } => {
                 let (Some(_), Some(image)) = (rounded(rect, 0.0), self.assets.get(asset)) else { return };
                 let stored = self.kept.images.entry(image.id).or_insert_with(|| {
-                    picture(image.pixels.data_as_u8_slice(), (image.width(), image.height()), image.id)
+                    // A photo goes in as the file it came from. A JPEG the writer cannot take goes in as pixels.
+                    let file = image.jpeg.as_ref().and_then(|jpeg| {
+                        let data: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(jpeg.clone());
+                        krilla::image::Image::from_jpeg(data.into(), true).ok()
+                    });
+                    file.unwrap_or_else(|| {
+                        picture(image.pixels.data_as_u8_slice(), (image.width(), image.height()), image.id)
+                    })
                 });
                 let stored = stored.clone();
                 self.place(stored, *rect);
             }
-            Item::PushClip { .. } | Item::PopClip => {}
+            Item::PushClip { .. } | Item::PopClip | Item::Open { .. } | Item::Close => {}
         }
     }
 

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 pub const USAGE: &str = "\
 Usage: letters [OPTIONS] [FILE]
-       letters export --to md|html [OPTIONS] FILE
+       letters export --to md|html|docx|pdf [OPTIONS] FILE
        letters import [OPTIONS] PATH...
 
 Opens FILE, or a new document when none is given.
@@ -19,13 +19,16 @@ Options:
   -V, --version
   -h, --help
 
-Export writes FILE as Markdown or as one HTML file, beside it unless told otherwise:
-      --to md|html         The format to write
+Export writes FILE as Markdown, one HTML file, a Word document or a PDF, beside it unless told otherwise:
+      --to FORMAT          The format to write: md, html, docx or pdf
   -o, --output PATH        Where to write, or - for standard output
   -f, --force              Replace the output if it is already there
 
-Import makes a document beside each Markdown file, leaves the original alone and prints one line per file:
+Import makes a document beside each Markdown or Word file, leaves the original alone and prints one line
+per file:
   -r, --recursive          Look through the folders inside each PATH as well
+      --pictures-from DIR  Also bring in the pictures Markdown names in DIR, which may be given more than
+                           once. Those under a PATH come along without it; any others stay links
       --json               Print each line as a JSON object
 
 Environment:
@@ -57,6 +60,8 @@ pub struct Export {
 pub enum Format {
     Markdown,
     Html,
+    Docx,
+    Pdf,
 }
 
 impl Format {
@@ -65,6 +70,8 @@ impl Format {
         match self {
             Self::Markdown => "md",
             Self::Html => "html",
+            Self::Docx => "docx",
+            Self::Pdf => "pdf",
         }
     }
 }
@@ -75,12 +82,14 @@ pub enum Output {
     Stdout,
 }
 
-/// `letters import`: a document made from each Markdown file.
+/// `letters import`: a document made from each Markdown or Word file.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Import {
-    /// Files, and folders whose Markdown files are meant.
+    /// Files, and folders whose Markdown and Word files are meant.
     pub paths: Vec<PathBuf>,
     pub recursive: bool,
+    /// Folders outside `paths` that Markdown's pictures may also be read from.
+    pub pictures: Vec<PathBuf>,
     /// Whether each line of the report is a JSON object.
     pub json: bool,
 }
@@ -186,7 +195,9 @@ fn parse_export(args: impl Iterator<Item = OsString>) -> Result<Command, String>
                 to = Some(match value(inline, name)?.to_str() {
                     Some("md" | "markdown") => Format::Markdown,
                     Some("html") => Format::Html,
-                    _ => return Err("--to takes md or html".into()),
+                    Some("docx") => Format::Docx,
+                    Some("pdf") => Format::Pdf,
+                    _ => return Err("--to takes md, html, docx or pdf".into()),
                 });
             }
             Arg::Flag(name @ ("-o" | "--output"), inline) => {
@@ -199,19 +210,25 @@ fn parse_export(args: impl Iterator<Item = OsString>) -> Result<Command, String>
         }
     }
     let file = file.ok_or("export needs the file to export")?;
-    let to = to.ok_or("export needs --to md or --to html")?;
+    let to = to.ok_or("export needs --to md, --to html or --to docx")?;
     Ok(Command::Export(Export { file, to, output, force }))
 }
 
 fn parse_import(args: impl Iterator<Item = OsString>) -> Result<Command, String> {
     let mut import = Import::default();
     let mut only_paths = false;
-    for arg in args {
+    let mut args = args;
+    while let Some(arg) = args.next() {
         match classify(&arg, only_paths) {
             Arg::Flag("--", None) => only_paths = true,
             Arg::Flag("-V" | "--version", None) => return Ok(Command::Version),
             Arg::Flag("-h" | "--help", None) => return Ok(Command::Help),
             Arg::Flag("-r" | "--recursive", None) => import.recursive = true,
+            // The folder is written into the flag after `=`, or is the argument after it.
+            Arg::Flag("--pictures-from", inline) => {
+                let folder = inline.map(OsString::from).or_else(|| args.next());
+                import.pictures.push(folder.ok_or("--pictures-from needs a folder")?.into());
+            }
             Arg::Flag("--json", None) => import.json = true,
             Arg::Flag(name, _) => return Err(format!("import: unknown option {name}")),
             Arg::Path => import.paths.push(arg.into()),

@@ -41,6 +41,13 @@ pub(crate) struct Engine {
     sources: Vec<(u64, Arc<[u8]>)>,
     /// Font instances already handed out, so that painting clones one and allocates nothing.
     instances: Vec<(u64, Font)>,
+    /// The families registered, in the order they came.
+    families: Vec<FamilyId>,
+    /// Each face registered: its family's name, and whether it is italic.
+    faces: Vec<(String, bool)>,
+    /// Whether text shaped since this was last cleared asked for a face that is not registered, and so was
+    /// set in another. Such text is set again when more fonts arrive.
+    pub short: bool,
 }
 
 const OPSZ: Tag = Tag::new(b"opsz");
@@ -59,26 +66,42 @@ impl Engine {
             lcx: LayoutContext::new(),
             sources: Vec::new(),
             instances: Vec::new(),
+            families: Vec::new(),
+            faces: Vec::new(),
+            short: false,
         };
-        let mut families: Vec<FamilyId> = Vec::new();
+        engine.add(fonts);
+        engine
+    }
+
+    /// Registers the faces of `fonts` that are not registered yet, and says whether there were any.
+    pub fn add(&mut self, fonts: &Fonts) -> bool {
+        let known = self.sources.len();
         for font in &fonts.faces {
-            if engine.sources.iter().any(|(_, data)| Arc::ptr_eq(data, &font.data)) {
+            if self.sources.iter().any(|(_, data)| Arc::ptr_eq(data, &font.data) || data == &font.data) {
                 continue;
             }
             let blob = Blob::new(Arc::new(font.data.clone()));
-            engine.sources.push((blob.id(), font.data.clone()));
-            for (family, _) in engine.fcx.collection.register_fonts(blob, None) {
-                if !families.contains(&family) {
-                    families.push(family);
+            self.sources.push((blob.id(), font.data.clone()));
+            for (family, faces) in self.fcx.collection.register_fonts(blob, None) {
+                if !self.families.contains(&family) {
+                    self.families.push(family);
                 }
+                let name = self.fcx.collection.family_name(family).unwrap_or_default().to_owned();
+                self.faces.extend(faces.iter().map(|face| (name.clone(), face.style() != FontStyle::Normal)));
             }
         }
+        if self.sources.len() == known {
+            return false;
+        }
         // Every family backs up every other, so a glyph one face lacks comes from the next that has it.
-        let (mono, sans): (Vec<_>, Vec<_>) = families.iter().partition(|family| engine.is_monospace(**family));
+        let families = self.families.clone();
+        let (mono, sans): (Vec<_>, Vec<_>) = families.iter().partition(|family| self.is_monospace(**family));
         let generic = |first: &[FamilyId], rest: &[FamilyId]| first.iter().chain(rest).copied().collect::<Vec<_>>();
-        engine.fcx.collection.set_generic_families(GenericFamily::SansSerif, generic(&sans, &mono).into_iter());
-        engine.fcx.collection.set_generic_families(GenericFamily::Monospace, generic(&mono, &sans).into_iter());
-        engine
+        self.fcx.collection.set_generic_families(GenericFamily::SansSerif, generic(&sans, &mono).into_iter());
+        self.fcx.collection.set_generic_families(GenericFamily::Monospace, generic(&mono, &sans).into_iter());
+        self.short = false;
+        true
     }
 
     fn is_monospace(&mut self, family: FamilyId) -> bool {
@@ -129,6 +152,10 @@ impl Engine {
         locale: Option<Language>,
         layout: &mut Layout<Brush>,
     ) {
+        let has = |spec: &Spec| {
+            self.faces.iter().any(|(family, italic)| *italic == spec.italic && family.eq_ignore_ascii_case(spec.family))
+        };
+        self.short |= !specs.iter().all(has);
         let mut builder = self.lcx.style_run_builder(&mut self.fcx, text, 1.0, true);
         for spec in specs {
             let generic = if spec.mono { GenericFamily::Monospace } else { GenericFamily::SansSerif };

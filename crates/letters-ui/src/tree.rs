@@ -69,6 +69,10 @@ pub(crate) struct Layer<M> {
     pub modal: bool,
     /// Whether focus shows on what takes it when the layer opens.
     pub shows_focus: bool,
+    /// Whether focus stays where it is when the layer opens, and Tab goes round it and its anchor as one.
+    pub beside: bool,
+    /// Whether a press outside leaves the layer open.
+    pub stays: bool,
     pub controlled: bool,
     pub on_close: Option<M>,
 }
@@ -101,6 +105,8 @@ impl<M> Tree<M> {
             layer.placement = popover.placement;
             layer.modal = popover.modal;
             layer.shows_focus = popover.shows_focus;
+            layer.beside = popover.beside;
+            layer.stays = popover.stays;
             layer.controlled = popover.open.is_some();
             layer.on_close = popover.on_close;
         }
@@ -125,6 +131,8 @@ impl<M> Tree<M> {
             placement: Placement::default(),
             modal: false,
             shows_focus: false,
+            beside: false,
+            stays: false,
             controlled: false,
             on_close: None,
         });

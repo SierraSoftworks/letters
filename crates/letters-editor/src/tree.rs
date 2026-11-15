@@ -1,6 +1,6 @@
 //! Finding blocks in the document tree. Carets live only in blocks that hold text.
 
-use letters_model::{Block, BlockId, Body, Document};
+use letters_model::{Block, BlockId, BlockKind, Body, Document};
 
 pub(crate) fn is_text(block: &Block) -> bool {
     matches!(block.body, Body::Text(_))
@@ -22,6 +22,12 @@ impl<'a> Place<'a> {
     }
 }
 
+impl<'a> From<letters_model::Place<'a>> for Place<'a> {
+    fn from(place: letters_model::Place<'a>) -> Self {
+        Self { parent: place.parent, index: place.index }
+    }
+}
+
 pub(crate) fn place<'a>(doc: &'a Document, id: &BlockId) -> Option<Place<'a>> {
     fn find<'a>(blocks: &'a [Block], parent: Option<&'a Block>, id: &BlockId) -> Option<Place<'a>> {
         blocks.iter().enumerate().find_map(|(index, block)| {
@@ -29,6 +35,40 @@ pub(crate) fn place<'a>(doc: &'a Document, id: &BlockId) -> Option<Place<'a>> {
         })
     }
     find(&doc.blocks, None, id)
+}
+
+pub(crate) fn is_figure(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Figure { .. })
+}
+
+pub(crate) fn is_gallery(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Gallery { .. })
+}
+
+/// Whether a block of text is a part of something larger: a figure, whose text is its caption, a cell in
+/// its row, or the caption of a gallery. A part is never split, joined to other text or turned into
+/// another kind of block. A cell or a caption that stands alone is a line like any other.
+pub(crate) fn is_part(block: &Block, parent: Option<&Block>) -> bool {
+    match block.kind {
+        BlockKind::Figure { .. } => true,
+        BlockKind::TableCell => parent.is_some_and(|parent| parent.kind == BlockKind::TableRow),
+        BlockKind::Caption => parent.is_some_and(is_gallery),
+        _ => false,
+    }
+}
+
+/// Whether text flows through a block as it does through a paragraph: it holds text and is no figure.
+pub(crate) fn flows(block: &Block) -> bool {
+    is_text(block) && !is_figure(block)
+}
+
+/// The first and the last block of text inside `block`, or the block itself when it holds text.
+pub(crate) fn first_text(block: &Block) -> Option<&Block> {
+    if is_text(block) { Some(block) } else { block.body.blocks().iter().find_map(first_text) }
+}
+
+pub(crate) fn last_text(block: &Block) -> Option<&Block> {
+    if is_text(block) { Some(block) } else { block.body.blocks().iter().rev().find_map(last_text) }
 }
 
 /// The blocks that hold text, in document order.

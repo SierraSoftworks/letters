@@ -30,6 +30,25 @@ fn concurrent_edits_all_survive_a_merge() {
             vec![Op::DeleteText { block: id("p"), range: 3..8 }],
             vec!["Hel", "rld", ""],
         ),
+        // Text that replaces a word stands where the word stood, behind what was typed before it.
+        (
+            "typing before a word that is replaced",
+            vec![typed("p", 6, "big ")],
+            vec![Op::DeleteText { block: id("p"), range: 6..11 }, typed("p", 6, "moon")],
+            vec!["Hello big moon", ""],
+        ),
+        (
+            "replacing a word that is typed before",
+            vec![Op::DeleteText { block: id("p"), range: 6..11 }, typed("p", 6, "moon")],
+            vec![typed("p", 6, "big ")],
+            vec!["Hello big moon", ""],
+        ),
+        (
+            "typing after a word that is replaced",
+            vec![typed("p", 11, ", again")],
+            vec![Op::DeleteText { block: id("p"), range: 6..11 }, typed("p", 6, "moon")],
+            vec!["Hello moon, again", ""],
+        ),
         (
             "typing into a removed block",
             vec![Op::RemoveBlock { block: id("p") }],
@@ -200,6 +219,66 @@ fn undo_takes_back_only_its_own_edit_after_a_merge() {
         assert_eq!(a.doc(), b.doc(), "{name}");
         assert_eq!(texts(&b), expected, "{name}, on the other replica");
     }
+}
+
+#[test]
+fn an_edit_that_others_left_nothing_of_is_still_a_step_to_undo() {
+    // This replica types twice, and the other deletes what the second edit typed.
+    let (mut a, mut b) = pair();
+    a.apply([typed("p", 0, "Oh. ")]).unwrap();
+    a.apply([typed("p", 15, "!")]).unwrap();
+    sync(&mut a, &mut b);
+    b.apply([Op::DeleteText { block: id("p"), range: 15..16 }]).unwrap();
+    a.merge(&b.save()).unwrap();
+    assert_eq!(texts(&a), ["Oh. Hello world", ""]);
+
+    // Whoever counts its edits steps back as many: over the second, which changes nothing, to the first.
+    assert_eq!(a.undo(), Some(Change::default()));
+    a.undo().unwrap();
+    assert_eq!(texts(&a), ["Hello world", ""]);
+    assert!(a.undo().is_none());
+    a.redo().unwrap();
+    assert_eq!(a.redo(), Some(Change::default()));
+    assert_eq!(texts(&a), ["Oh. Hello world", ""]);
+    assert!(a.redo().is_none());
+}
+
+#[test]
+fn ops_of_one_batch_name_blocks_that_share_an_id_as_they_stood_before_it() {
+    // Each replica adds a block under the same id. Merged, the second goes by a number.
+    let (mut a, mut b) = pair();
+    let added =
+        |text: &str| Op::InsertBlock { parent: None, index: 1, block: Block::text("n", BlockKind::Paragraph, text) };
+    a.apply([added("one")]).unwrap();
+    b.apply([added("two")]).unwrap();
+    sync(&mut a, &mut b);
+    let second = a.block(&id("n~2")).expect("the second of the two").plain_text();
+
+    // Taking the first away renames the second, which the ops after it still call by its number.
+    let ops = [Op::RemoveBlock { block: id("n") }, typed("n~2", 0, "> "), Op::RemoveBlock { block: id("d") }];
+    a.apply(ops).unwrap();
+    assert_eq!(texts(&a), ["Hello world".to_string(), format!("> {second}")]);
+    assert!(a.block(&id("n~2")).is_none());
+    a.undo().unwrap();
+    assert_eq!(a.block(&id("n~2")).map(Block::plain_text), Some(second));
+}
+
+#[test]
+fn a_block_named_like_a_copy_is_told_from_the_copies() {
+    // "n~2" is a block of its own. Each replica adds a block under the id "n" after it, and merged, the
+    // second of those goes by the next free number.
+    let own = Document { blocks: vec![Block::text("n~2", BlockKind::Paragraph, "own")], ..Document::default() };
+    let (mut a, mut b) = (Model::new(own.clone(), ReplicaId::from(1)), Model::new(own, ReplicaId::from(2)));
+    let added =
+        |text: &str| Op::InsertBlock { parent: None, index: 1, block: Block::text("n", BlockKind::Paragraph, text) };
+    a.apply([added("one")]).unwrap();
+    b.apply([added("two")]).unwrap();
+    sync(&mut a, &mut b);
+    let second = a.block(&id("n~3")).expect("the second of the two").plain_text();
+
+    // With the first of the two gone, an op that names the second still means it.
+    a.apply([Op::RemoveBlock { block: id("n") }, typed("n~3", 0, "> ")]).unwrap();
+    assert_eq!(texts(&a), ["own".to_string(), format!("> {second}")]);
 }
 
 #[test]

@@ -9,7 +9,12 @@ use std::ops::Range;
 use letters_model::{Block, BlockId, BlockKind, Body, ListKind, Mark, Op, Pos, Run, Tone};
 
 use crate::markers::Sides;
-use crate::{Editor, Platform, text, tree};
+use crate::{Caret, Editor, Platform, text};
+
+/// Whether a block is a quote or a callout, which a tag at its top makes a callout.
+fn quoted(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Quote | BlockKind::Callout { .. })
+}
 
 /// What shorthand at the start of a block turns the block into.
 #[derive(Debug, PartialEq)]
@@ -73,6 +78,36 @@ pub(crate) fn fence(text: &str) -> Option<Option<String>> {
     named.then(|| (!language.is_empty()).then(|| language.to_owned()))
 }
 
+/// Whether the last line of a block of source is the fence that closes it: of code, or of a formula.
+pub(crate) fn closes(kind: &BlockKind, text: &str) -> bool {
+    let fence = if *kind == BlockKind::Formula { "$$" } else { "```" };
+    text.rsplit('\n').next() == Some(fence)
+}
+
+/// `typed` with every escaped dollar sign hidden. `\$` is a dollar sign in TeX and in prose, never a marker.
+fn unescaped(typed: &str) -> String {
+    typed.replace("\\$", "\\\u{1}")
+}
+
+/// The formula that the `$` ending `typed` closes: the opening and closing markers of `$x$` or `$$x$$`.
+fn maths(typed: &str) -> Option<(Range<usize>, Range<usize>)> {
+    let (open, close) = pair(&unescaped(typed), '$')?;
+    let content = &typed[open.end..close.start];
+    let edged = content.starts_with(char::is_whitespace) || content.ends_with(char::is_whitespace);
+    // A sum of money is no formula, nor is the first of two as in `$5-$10`.
+    let sum = content.trim_end_matches(['-', '–']);
+    let money = sum.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | ','));
+    (close.len() <= 2 && !edged && !money).then_some((open, close))
+}
+
+/// Whether `typed` ends inside a formula that is still being written: after a `$` with TeX straight after
+/// it. Shorthand typed there is TeX, and stays as typed.
+fn in_maths(typed: &str) -> bool {
+    let typed = unescaped(typed);
+    let after = typed.rfind('$').map(|at| &typed[at + 1..]);
+    after.is_some_and(|after| after.starts_with(|c: char| !c.is_whitespace() && !c.is_ascii_digit()))
+}
+
 /// A span of text between a pair of typed markers.
 #[derive(Debug, PartialEq)]
 struct Span {
@@ -132,13 +167,17 @@ fn link(typed: &str) -> Option<Span> {
 impl Editor {
     /// Applies the shorthand that the text just typed completes. Returns whether any did.
     pub(crate) fn apply_rules(&mut self, platform: &mut dyn Platform) -> bool {
-        let Some(caret) = self.caret.clone().filter(|caret| caret.selection.is_caret()) else { return false };
+        let at = |caret: &Caret| caret.selection.is_caret() && !caret.picture;
+        let Some(caret) = self.caret.clone().filter(at) else { return false };
         let pos = caret.selection.head;
+        if self.label_rule(&pos) || self.reference_rule(&pos, &caret.marks) {
+            return true;
+        }
         let doc = self.doc();
-        let (Some(block), Some(place)) = (doc.block(&pos.block), tree::place(doc, &pos.block)) else {
+        let (Some(block), Some(place)) = (doc.block(&pos.block), self.seat(&pos.block)) else {
             return false;
         };
-        if text::is_code(block) {
+        if text::is_source(block) {
             return false;
         }
         let (id, text) = (pos.block.clone(), block.plain_text());
@@ -165,19 +204,69 @@ impl Editor {
                 self.apply(vec![clear, insert]);
             }
             // The tag belongs at the top of a quote, and retyping it in a callout changes the tone.
-            Some(BlockRule::Callout(tone)) if place.index == 0 && place.parent.is_some() => {
+            Some(BlockRule::Callout(tone)) if place.index == 0 && place.parent.is_some_and(quoted) => {
                 let parent = place.parent_id().expect("the block has a parent");
                 self.apply(vec![clear, Op::SetKind { block: parent, kind: BlockKind::Callout { tone } }]);
             }
-            _ => return self.apply_inline_rule(&id, typed, &caret.marks),
+            _ => return self.apply_inline_rule(&id, typed, &caret.marks, platform),
         }
-        self.place(Pos::new(id, 0));
+        self.place(Pos::new(self.renamed(&id), 0));
         true
     }
 
-    fn apply_inline_rule(&mut self, id: &BlockId, typed: &str, marks: &BTreeSet<Mark>) -> bool {
-        // Inside code the markers are meant as written.
-        let Some(span) = inline_rule(typed).filter(|_| !marks.contains(&Mark::Code)) else { return false };
+    /// Turns `$x$` into inline maths, and a paragraph that is all `$$x$$` into a formula block.
+    fn apply_maths_rule(
+        &mut self,
+        id: &BlockId,
+        typed: &str,
+        marks: &BTreeSet<Mark>,
+        platform: &mut dyn Platform,
+    ) -> bool {
+        let Some((open, close)) = maths(typed) else { return false };
+        let doc = self.doc();
+        let (Some(block), Some(place)) = (doc.block(id), self.seat(id)) else { return false };
+        if text::marks_after(block.body.runs(), open.start).contains(&Mark::Code) {
+            return false;
+        }
+        let content = open.start..close.start - open.len();
+        let delete = |range: &Range<usize>| Op::DeleteText { block: id.clone(), range: range.clone() };
+        let whole = open == (0..2) && close.end == text::len(block) && block.kind == BlockKind::Paragraph;
+        let below = (place.parent_id(), place.index + 1);
+        self.apply(vec![delete(&close), delete(&open)]);
+        if whole {
+            // A display formula stands alone, and the writing goes on below it.
+            let new = BlockId::new(platform.new_id());
+            let line = Block::new(new.clone(), BlockKind::Paragraph);
+            let mut ops = self.format(id, content, &BTreeSet::new(), &None);
+            ops.push(Op::SetKind { block: id.clone(), kind: BlockKind::Formula });
+            ops.push(Op::InsertBlock { parent: below.0, index: below.1, block: line });
+            self.apply(ops);
+            self.place(Pos::new(new, 0));
+        } else {
+            // TeX is plain text, whatever it was typed in.
+            let ops = self.format(id, content.clone(), &BTreeSet::from([Mark::Math]), &None);
+            self.apply(ops);
+            // The caret stays outside the formula it has just closed.
+            self.place_with(Pos::new(id.clone(), content.end), marks.clone());
+        }
+        true
+    }
+
+    fn apply_inline_rule(
+        &mut self,
+        id: &BlockId,
+        typed: &str,
+        marks: &BTreeSet<Mark>,
+        platform: &mut dyn Platform,
+    ) -> bool {
+        // Inside code and maths the markers are meant as written.
+        if marks.contains(&Mark::Code) || marks.contains(&Mark::Math) {
+            return false;
+        }
+        if typed.ends_with('$') {
+            return self.apply_maths_rule(id, typed, marks, platform);
+        }
+        let Some(span) = inline_rule(typed).filter(|_| !in_maths(typed)) else { return false };
         let Some(runs) = self.block(id).map(|block| block.body.runs()) else { return false };
         if text::marks_after(runs, span.open.start).contains(&Mark::Code) {
             return false;
@@ -215,7 +304,7 @@ impl Editor {
                 }
                 true
             }
-            ("*", kind) if !matches!(kind, BlockKind::Code { .. }) => {
+            ("*", _) if !text::is_source(block) && !caret.marks.contains(&Mark::Math) => {
                 let sides = Sides::at(block, pos.offset);
                 let mut stops = sides.before(&caret.marks);
                 stops.extend(sides.after(&caret.marks));

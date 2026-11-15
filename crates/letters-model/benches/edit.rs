@@ -3,6 +3,7 @@
 //! Run with `cargo bench -p letters-model`. It exits with an error when a budget is broken. A key press
 //! has 8 ms to reach the screen on the reference machine, an M1 Pro, and the model should use little of it.
 
+use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Hold, Mark, Model, Op, Pos, ReplicaId, Run};
@@ -102,6 +103,10 @@ fn main() {
         drop(model.apply([Op::Join { block: new_id(99 - run) }]).expect("joined"))
     });
     kept &= report("undo a join", 100, Some(STRUCTURE), |_| drop(model.undo().expect("a step to undo")));
+    // The first search after blocks came or went reads where every block is. Later ones do not.
+    let found = |block: usize| black_box(model.place(&id(block))).is_some();
+    report("find a block, the first time", 1, None, |_| assert!(found(BLOCKS - 1)));
+    kept &= report("find a block by its id", 2_000, Some(EDIT), |run| assert!(found(run * 5)));
 
     // What another replica typed arrives while this one has moved on.
     report("merge a remote key press", 100, None, |run| {
@@ -112,6 +117,28 @@ fn main() {
     report("merge a remote kind change", 100, None, |run| {
         other.apply([heading(run)]).expect("a new kind");
         model.merge(&other.updates_since(&loaded.revision())).expect("a replica reads another's edits");
+    });
+    // Two copies change different blocks apart, as most do, and then one word. The one that takes the
+    // other in asks each time what cannot both stand.
+    let mut part = |model: &mut Model, block: usize| {
+        let at = |block: usize| Pos { block: id(block), offset: 5 };
+        model.apply([Op::InsertText { at: at(11), text: "x".into() }]).expect("typed");
+        other.apply([Op::InsertText { at: at(block), text: "y".into() }]).expect("typed");
+        let stood = (model.revision(), other.revision());
+        model.merge(&other.updates_since(&loaded.revision())).expect("a replica reads another's edits");
+        stood
+    };
+    let (ours, theirs) = part(&mut model, 12);
+    report("ask what two copies changed", 20, None, |_| {
+        assert_eq!(model.conflicts(&ours, &theirs).expect("revisions the history holds"), []);
+    });
+    let (ours, theirs) = part(&mut model, 11);
+    report("the same, when it is one word", 20, None, |_| {
+        assert_eq!(model.conflicts(&ours, &theirs).expect("revisions the history holds").len(), 1);
+    });
+    // The first of these writes the change. The rest find it written.
+    report("settle that word", 20, None, |_| {
+        assert_eq!(model.settle(&ours, &theirs).expect("revisions the history holds").1.len(), 1);
     });
     // A character in a block the edits above left alone.
     let text = model.doc().block(&id(BLOCKS / 4)).expect("the block").plain_text();

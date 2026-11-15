@@ -1,30 +1,75 @@
 //! Document to Markdown.
 
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::ops::Range;
 
-use letters_model::{Block, BlockKind, Document, ListKind, Mark, Run, Tone};
+use letters_model::{
+    Align, Block, BlockKind, BodyShape, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone,
+};
 
+use super::read::{FENCES, front_matter};
 use super::{TAGS, TONES, from_markdown};
+use crate::figures;
 
 /// Writes Markdown. Reading the result back gives an equal document, apart from block ids and what Markdown
 /// cannot say:
 ///
-/// - Emphasis never starts or ends on a space, so spaces at the edge of a bold, italic or struck span leave it.
-///   Inline code cannot hold a line break, so the break leaves it too.
+/// - Emphasis and maths never start or end on a space, so spaces at the edge of a bold, italic or struck span
+///   or of maths leave it. Inline code and maths cannot hold a line break, so the break leaves them too.
+/// - Maths that dollar signs cannot hold, such as a brace with no partner, is written as code. A formula they
+///   cannot hold is written as a code block in the language `math`, which reads back as a formula, as any
+///   code block in that language does.
 /// - An empty paragraph is left out, and a list item sits at most one level below the item before it.
-/// - An unknown block is written as its fallback text. Unknown marks and fields are left out.
+/// - A table's first row always heads it, so a table with no header gets an empty first row, which reads back
+///   as none. A header row with no text in it therefore reads back as no header. Short rows are filled with
+///   empty cells, and a justified column reads back as aligned to the start.
+/// - A figure is its picture alone in a paragraph, then its caption as an emphasised paragraph. A gallery is
+///   its pictures in one paragraph, a line each, so a gallery of one reads back as a figure. A numbered
+///   caption opens with its number as "Figure 2:", and a reference reads as "Figure 2". A picture is named by
+///   its address, or by its entry in the document's file, which [`markdown_assets`] lists. Its size is left
+///   out, and so are italics within a caption and the caption of a picture inside a gallery.
+/// - An unknown block is written as its fallback text. Unknown marks and fields are left out, and so are the
+///   languages of blocks and runs and the page breaks before blocks, which Markdown has no way to say.
 pub fn to_markdown(doc: &Document) -> String {
-    let mut out = blocks(&doc.blocks).join("\n");
+    let doc = &figures::labelled(doc);
+    let mut lines = doc.properties.as_ref().map(properties).unwrap_or_default();
+    let body = blocks(&doc.blocks);
+    if !lines.is_empty() && !body.is_empty() {
+        lines.push(String::new());
+    }
+    lines.extend(body);
+    let mut out = lines.join("\n");
     if !out.is_empty() {
         out.push('\n');
     }
     out
 }
 
-/// A table cell, for the reader to keep a table as source.
-pub(crate) fn cell(runs: &[Run]) -> String {
-    text(runs, Context::Cell)
+/// The entries of the document's file that its Markdown shows. [`to_markdown`] names each by its entry name,
+/// as a path from the Markdown file's folder, so an export writes them there for the pictures to show.
+pub fn markdown_assets(doc: &Document) -> BTreeSet<String> {
+    let asset = |block: &Block| match &block.kind {
+        BlockKind::Figure { asset, .. } => asset.clone(),
+        _ => None,
+    };
+    doc.walk().filter_map(asset).collect()
+}
+
+/// Writes a document's properties as front matter, where they read back as it. Those that would not, such as
+/// ones that hold a line like their own fence, are written as a code block, so that nothing is lost.
+fn properties(properties: &Properties) -> Vec<String> {
+    let (fence, format) =
+        FENCES.iter().find(|(_, format)| *format == properties.format).expect("each format has a fence");
+    let source = properties.source.strip_suffix('\n').unwrap_or(&properties.source);
+    let mut written = vec![(*fence).to_owned()];
+    written.extend(lines(source).into_iter().filter(|_| !properties.source.is_empty()));
+    written.push((*fence).to_owned());
+    let front = format!("{}\n", written.join("\n"));
+    match front_matter(&front) {
+        (Some(read), "") if read.source.strip_suffix('\n').unwrap_or(&read.source) == source => written,
+        _ => code(if *format == PropertiesFormat::Yaml { "yaml" } else { "toml" }, source),
+    }
 }
 
 /// One nesting level of the list being written.
@@ -38,12 +83,15 @@ struct Level {
 }
 
 /// Writes sibling blocks as lines, with a blank line between blocks and none between the items of a list.
-fn blocks(blocks: &[Block]) -> Vec<String> {
+fn blocks<'a>(blocks: impl IntoIterator<Item = &'a Block>) -> Vec<String> {
     let mut out = Vec::new();
     let mut levels: Vec<Level> = Vec::new();
     // The item before this one, while a list is being written.
     let mut last: Option<&Block> = None;
-    for block in blocks.iter().filter(|block| is_written(block)) {
+    // Whether the block before this one ends in a picture with no caption, which would take an emphasised
+    // paragraph under it for one.
+    let mut bare = false;
+    for block in blocks.into_iter().filter(|block| is_written(block)) {
         if let BlockKind::ListItem { list, depth } = block.kind {
             let after_text = last.is_some_and(|last| !last.plain_text().is_empty());
             let (lines, gap) = item(&mut levels, list, depth, block.body.runs(), after_text);
@@ -56,18 +104,50 @@ fn blocks(blocks: &[Block]) -> Vec<String> {
             if !out.is_empty() {
                 out.push(String::new());
             }
-            out.extend(other(block));
+            match block.kind {
+                BlockKind::Paragraph if bare && is_emphasised(block) => {
+                    out.extend(lines(&written(block.body.runs(), Context::Lines, true)));
+                }
+                _ => out.extend(other(block)),
+            }
             levels.clear();
             last = None;
         }
+        bare = match block.kind {
+            BlockKind::Figure { .. } => !is_shown(block),
+            BlockKind::Gallery { .. } => block.body.blocks().iter().all(|part| is_picture(part) || !is_written(part)),
+            _ => false,
+        };
     }
     out
 }
 
+fn is_picture(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Figure { .. })
+}
+
+/// Whether a block has text that shows.
+fn is_shown(block: &Block) -> bool {
+    !block.plain_text().trim().is_empty()
+}
+
+/// Whether all of a block's text that shows is in italics, as a caption is written.
+fn is_emphasised(block: &Block) -> bool {
+    let shown = |run: &&Run| !run.text.trim().is_empty();
+    is_shown(block) && block.body.runs().iter().filter(shown).all(|run| run.marks.contains(&Mark::Italic))
+}
+
 /// Whether a block has a Markdown form. An empty paragraph has none, nor has an unknown block with no fallback.
+/// A table has one as soon as it has a row, since its cells are there to be filled.
 fn is_written(block: &Block) -> bool {
     match block.kind {
-        BlockKind::Paragraph => !block.plain_text().is_empty(),
+        BlockKind::Paragraph | BlockKind::TableCell => !block.plain_text().is_empty(),
+        BlockKind::Caption => is_shown(block),
+        BlockKind::Gallery { .. } => block.body.blocks().iter().any(is_written),
+        BlockKind::Table { .. } => {
+            block.body.blocks().iter().any(|row| row.kind == BlockKind::TableRow || is_written(row))
+        }
+        BlockKind::TableRow => true,
         BlockKind::Unknown { .. } => !fallback(block).is_empty(),
         _ => true,
     }
@@ -121,15 +201,53 @@ fn other(block: &Block) -> Vec<String> {
             vec![format!("{marker} {}", text(runs, Context::Heading)).trim_end_matches(' ').to_owned()]
         }
         BlockKind::Code { language } => code(language.as_deref().unwrap_or_default(), &block.plain_text()),
+        BlockKind::Formula => formula(&block.plain_text()),
         BlockKind::Quote => quote(None, block.body.blocks()),
         BlockKind::Callout { tone } => quote(Some(*tone), block.body.blocks()),
         BlockKind::Divider => vec!["---".to_owned()],
+        BlockKind::Table { columns, header } => table(columns, *header, block.body.blocks()),
+        // A merge can leave a row outside a table and a cell outside a row.
+        BlockKind::TableRow => table(&[], false, std::slice::from_ref(block)),
+        BlockKind::TableCell => lines(&text(runs, Context::Lines)),
+        BlockKind::Caption => emphasised(runs),
+        BlockKind::Figure { .. } => {
+            let mut out = vec![picture(block)];
+            if is_shown(block) {
+                out.push(String::new());
+                out.extend(emphasised(runs));
+            }
+            out
+        }
+        // Its pictures share a paragraph, and what else it holds follows them.
+        BlockKind::Gallery { .. } => {
+            let parts = block.body.blocks();
+            let mut out: Vec<String> = parts.iter().filter(|part| is_picture(part)).map(picture).collect();
+            let rest = blocks(parts.iter().filter(|part| !is_picture(part)));
+            if !out.is_empty() && !rest.is_empty() {
+                out.push(String::new());
+            }
+            out.extend(rest);
+            out
+        }
         BlockKind::Unknown { .. } => lines(&text(&[Run::plain(fallback(block))], Context::Lines)),
         // A list item is written by `item`, which knows the list around it.
         BlockKind::ListItem { .. } => Vec::new(),
-        // STAND-IN: the kinds layout is built against, until the model has them.
-        _ => Vec::new(),
     }
+}
+
+/// Writes a figure's picture, described by its alt text.
+fn picture(figure: &Block) -> String {
+    let BlockKind::Figure { asset, src, alt, .. } = &figure.kind else { return String::new() };
+    let alt = [Run::plain(alt.replace(['\n', '\r'], " "))];
+    // A gallery's pictures share a paragraph, where a dollar in each of two could pair up as maths.
+    let alt = Inline { maths: true, ..Inline::new(&alt) }.write(Context::Heading, None);
+    format!("![{alt}]({})", destination(asset.as_deref().or(src.as_deref()).unwrap_or_default()))
+}
+
+/// Writes a caption: its text, emphasised from end to end.
+fn emphasised(runs: &[Run]) -> Vec<String> {
+    let emphasise = |run: &Run| Run { marks: run.marks.iter().cloned().chain([Mark::Italic]).collect(), ..run.clone() };
+    lines(&text(&runs.iter().map(emphasise).collect::<Vec<_>>(), Context::Lines))
 }
 
 fn lines(text: &str) -> Vec<String> {
@@ -151,6 +269,17 @@ fn code(language: &str, text: &str) -> Vec<String> {
     out
 }
 
+/// Writes display maths between dollar signs where it reads back from them. They sit in a paragraph, which a
+/// blank line or a line that starts another block would end. A tab is as wide as where it sits, so inside a
+/// quote it could start a block that it does not start here.
+fn formula(tex: &str) -> Vec<String> {
+    let dollars = if tex.is_empty() { "$$\n$$".to_owned() } else { format!("$$\n{tex}\n$$") };
+    let (doc, _) = from_markdown(&dollars, &mut String::new);
+    let reads_back =
+        matches!(doc.blocks.as_slice(), [block] if block.kind == BlockKind::Formula && block.plain_text() == tex);
+    if reads_back && !tex.contains('\t') { lines(&dollars) } else { code("math", tex) }
+}
+
 fn quote(tone: Option<Tone>, children: &[Block]) -> Vec<String> {
     let inner = blocks(children);
     let mut out = Vec::new();
@@ -170,6 +299,42 @@ fn quote(tone: Option<Tone>, children: &[Block]) -> Vec<String> {
     out.into_iter().map(|line| if line.is_empty() { ">".to_owned() } else { format!("> {line}") }).collect()
 }
 
+/// Writes a table as GFM has them: a line to a row, with a rule under the first that aligns the columns. The
+/// first row heads the table there, so a table with no header is given a row of empty cells for one. A row
+/// that is short of cells is filled up. What a table holds that is not a row is written after it.
+fn table(columns: &[Align], header: bool, children: &[Block]) -> Vec<String> {
+    let is_row = |child: &&Block| child.kind == BlockKind::TableRow;
+    let cell = |cell: &Block| match cell.kind {
+        BlockKind::Unknown { .. } => text(&[Run::plain(fallback(cell))], Context::Cell),
+        _ => text(cell.body.runs(), Context::Cell),
+    };
+    let mut rows: Vec<Vec<String>> =
+        children.iter().filter(is_row).map(|row| row.body.blocks().iter().map(cell).collect()).collect();
+    let mut out = Vec::new();
+    if !rows.is_empty() {
+        let width = rows.iter().map(Vec::len).chain([columns.len()]).max().unwrap_or(0).max(1);
+        let rule = |column: usize| match columns.get(column) {
+            Some(Align::Center) => ":-:",
+            Some(Align::End) => "--:",
+            _ => "---",
+        };
+        if !header {
+            rows.insert(0, Vec::new());
+        }
+        rows.insert(1, (0..width).map(|column| rule(column).to_owned()).collect());
+        for mut row in rows {
+            row.resize(width, String::new());
+            out.push(format!("| {} |", row.join(" | ")));
+        }
+    }
+    let rest = blocks(children.iter().filter(|child| !is_row(child)));
+    if !out.is_empty() && !rest.is_empty() {
+        out.push(String::new());
+    }
+    out.extend(rest);
+    out
+}
+
 fn longest_run(text: &str, of: char) -> usize {
     text.split(|c| c != of).map(str::len).max().unwrap_or(0)
 }
@@ -186,11 +351,33 @@ enum Context {
 }
 
 /// Writes a block's text. Emphasis is written with Markdown's delimiters where they read back as written, and
-/// as HTML tags where Markdown's rules about the characters beside a delimiter would lose it.
+/// as HTML tags where Markdown's rules about the characters beside a delimiter would lose it. Maths is written
+/// between dollar signs where it reads back from them, and as code where it does not.
 fn text(runs: &[Run], context: Context) -> String {
-    let inline = Inline::new(runs);
-    let written = inline.write(context, false);
-    if inline.has(EMPHASIS) && !inline.reads_back(&written, context) { inline.write(context, true) } else { written }
+    written(runs, context, false)
+}
+
+/// Writes a block's text. With `set`, italics are written with the tag for text that is only set that way,
+/// which tells a paragraph that is all in italics apart from the caption of the picture above it.
+fn written(runs: &[Run], context: Context, set: bool) -> String {
+    let mut inline = Inline::new(runs);
+    loop {
+        if !set {
+            let written = inline.write(context, None);
+            if !inline.has(EMPHASIS | MATH) || inline.reads_back(&written, context) {
+                return written;
+            }
+        }
+        let tagged = inline.write(context, Some(if set { "i" } else { "em" }));
+        if !inline.has(MATH) || inline.reads_back(&tagged, context) {
+            return tagged;
+        }
+        inline
+            .formats
+            .iter_mut()
+            .filter(|format| format.marks & MATH != 0)
+            .for_each(|format| format.marks ^= MATH | CODE);
+    }
 }
 
 const BOLD: u8 = 1;
@@ -199,10 +386,12 @@ const STRIKE: u8 = 4;
 const UNDERLINE: u8 = 8;
 const HIGHLIGHT: u8 = 16;
 const CODE: u8 = 32;
+const MATH: u8 = 64;
 /// The marks written with delimiters, which Markdown only accepts next to the right characters.
 const EMPHASIS: u8 = BOLD | ITALIC | STRIKE;
 
-const MARKS: [(u8, Mark); 6] = [
+const MARKS: [(u8, Mark); 7] = [
+    (MATH, Mark::Math),
     (BOLD, Mark::Bold),
     (ITALIC, Mark::Italic),
     (STRIKE, Mark::Strike),
@@ -237,7 +426,7 @@ impl Format<'_> {
 struct Inline<'a> {
     chars: Vec<char>,
     formats: Vec<Format<'a>>,
-    /// One dollar is a price. Two could hold maths between them, so they are escaped.
+    /// Whether a dollar in the text could be read as the edge of maths. One dollar alone is a price.
     maths: bool,
 }
 
@@ -248,17 +437,23 @@ impl<'a> Inline<'a> {
         for run in runs {
             let bit = |mark| MARKS.iter().find(|(_, known)| known == mark).map_or(0, |(bit, _)| *bit);
             let marks = run.marks.iter().fold(0, |marks, mark| marks | bit(mark));
+            // Maths is written as its source, which is not also code.
+            let marks = if marks & MATH != 0 { marks & !CODE } else { marks };
             for c in run.text.chars() {
-                // A code span cannot hold a line break.
-                let marks = if matches!(c, '\n' | '\r') { marks & !CODE } else { marks };
+                // Neither a code span nor maths can hold a line break.
+                let marks = if matches!(c, '\n' | '\r') { marks & !(CODE | MATH) } else { marks };
                 chars.push(c);
                 formats.push(Format { marks, link: run.link.as_deref() });
             }
         }
 
-        // Markdown cannot open emphasis before a space or close it after one, so those spaces leave the span.
-        let space = |i: usize, formats: &[Format]| chars[i].is_whitespace() && formats[i].marks & CODE == 0;
-        for bit in [BOLD, ITALIC, STRIKE] {
+        // Markdown cannot open emphasis or maths before a space or close it after one, so those spaces leave the
+        // span. Maths goes first: the spaces that leave it are then spaces of the emphasis around it.
+        for bit in [MATH, BOLD, ITALIC, STRIKE] {
+            let space = |i: usize, formats: &[Format]| match bit {
+                MATH => chars[i].is_ascii_whitespace(),
+                _ => chars[i].is_whitespace() && formats[i].marks & (CODE | MATH) == 0,
+            };
             let mut start = 0;
             while start < chars.len() {
                 let end = start + formats[start..].iter().take_while(|format| format.marks & bit != 0).count();
@@ -270,7 +465,8 @@ impl<'a> Inline<'a> {
                 start = end.max(start + 1);
             }
         }
-        let maths = chars.iter().filter(|c| **c == '$').count() > 1;
+        let maths =
+            chars.iter().filter(|c| **c == '$').count() > 1 || formats.iter().any(|format| format.marks & MATH != 0);
         Self { chars, formats, maths }
     }
 
@@ -302,14 +498,23 @@ impl<'a> Inline<'a> {
                 ..Run::default()
             })
             .collect();
-        // A heading stands in for a cell: both are one line of text.
-        let source = if context == Context::Lines { written.to_owned() } else { format!("# {written}") };
+        let source = match context {
+            Context::Lines => written.to_owned(),
+            Context::Heading => format!("# {written}"),
+            Context::Cell => format!("| {written} |\n| --- |"),
+        };
         let (doc, _) = from_markdown(&source, &mut String::new);
-        matches!(doc.blocks.as_slice(), [block] if block.body.runs() == runs)
+        let read = match (context, doc.blocks.as_slice()) {
+            (Context::Cell, [table]) => table.body.blocks().first().and_then(|row| row.body.blocks().first()),
+            (_, [block]) => Some(block),
+            _ => None,
+        };
+        read.is_some_and(|block| block.kind.shape() == BodyShape::Text && block.body.runs() == runs)
     }
 
-    /// Writes the text. With `tags`, emphasis is written as HTML, which reads back whatever sits beside it.
-    fn write(&self, context: Context, tags: bool) -> String {
+    /// Writes the text. With `tags`, emphasis is written as HTML, which reads back whatever sits beside it,
+    /// and italics as the tag it names.
+    fn write(&self, context: Context, tags: Option<&str>) -> String {
         let segments = self.segments();
         let mut out = String::new();
         let mut open: Vec<Span> = Vec::new();
@@ -317,7 +522,10 @@ impl<'a> Inline<'a> {
             let autolink = self.is_autolink(&segments, i);
             let mut spans: Vec<Span> = format.link.filter(|_| !autolink).map(Span::Link).into_iter().collect();
             spans.extend(
-                MARKS.iter().filter(|(bit, _)| *bit != CODE && format.marks & bit != 0).map(|m| Span::Mark(m.0)),
+                MARKS
+                    .iter()
+                    .filter(|(bit, _)| bit & (CODE | MATH) == 0 && format.marks & bit != 0)
+                    .map(|m| Span::Mark(m.0)),
             );
 
             // Close what ends here, along with everything opened inside it.
@@ -348,6 +556,9 @@ impl<'a> Inline<'a> {
                 let spaced = text.starts_with(' ') && text.ends_with(' ') && !text.trim_matches(' ').is_empty();
                 let pad = if spaced || text.starts_with('`') || text.ends_with('`') { " " } else { "" };
                 out.push_str(&format!("{fence}{pad}{text}{pad}{fence}"));
+            } else if format.marks & MATH != 0 {
+                let text = if context == Context::Cell { text.replace('|', "\\|") } else { text };
+                out.push_str(&format!("${text}$"));
             } else {
                 self.escape(range.clone(), context, &mut out);
             }
@@ -366,7 +577,7 @@ impl<'a> Inline<'a> {
         let alone = (i == 0 || segments[i - 1].1.link != format.link)
             && segments.get(i + 1).is_none_or(|(_, next)| next.link != format.link);
         alone
-            && format.marks & CODE == 0
+            && format.marks & (CODE | MATH) == 0
             && !url.contains('$')
             && self.chars[range.clone()].iter().copied().eq(url.chars())
             && (2..=32).contains(&scheme.len())
@@ -402,6 +613,11 @@ impl<'a> Inline<'a> {
             }
 
             let escaped = match c {
+                // A digit straight after maths would make its dollar signs read as prices.
+                '0'..='9' if i == range.start && i > 0 && self.formats[i - 1].marks & MATH != 0 => {
+                    out.push_str(&format!("&#{};", u32::from(c)));
+                    continue;
+                }
                 // Markdown trims a line, so the spaces at its ends are written as references.
                 ' ' | '\t' | '\r' if c == '\r' || before.is_none() || after.is_none() => {
                     out.push_str(&format!("&#{};", u32::from(c)));
@@ -429,29 +645,30 @@ impl<'a> Inline<'a> {
     }
 }
 
-fn start(span: Span, tags: bool) -> String {
+fn start(span: Span, tags: Option<&str>) -> String {
     let delimiter = match span {
         Span::Link(_) => "[",
-        Span::Mark(BOLD) if !tags => "**",
-        Span::Mark(ITALIC) if !tags => "*",
-        Span::Mark(STRIKE) if !tags => "~~",
-        Span::Mark(bit) => return format!("<{}>", tag(bit)),
+        Span::Mark(BOLD) if tags.is_none() => "**",
+        Span::Mark(ITALIC) if tags.is_none() => "*",
+        Span::Mark(STRIKE) if tags.is_none() => "~~",
+        Span::Mark(bit) => return format!("<{}>", tag(bit, tags)),
     };
     delimiter.to_owned()
 }
 
-fn close(span: Span, tags: bool) -> String {
+fn close(span: Span, tags: Option<&str>) -> String {
     match span {
         Span::Link(url) => format!("]({})", destination(url)),
-        Span::Mark(bit) if tags || bit & EMPHASIS == 0 => format!("</{}>", tag(bit)),
+        Span::Mark(bit) if tags.is_some() || bit & EMPHASIS == 0 => format!("</{}>", tag(bit, tags)),
         Span::Mark(_) => start(span, tags),
     }
 }
 
-/// The HTML tag that stands for a mark.
-fn tag(bit: u8) -> &'static str {
+/// The HTML tag that stands for a mark. `tags` names the one for italics.
+fn tag(bit: u8, tags: Option<&str>) -> &str {
     let named = |mark: &Mark| TAGS.iter().find(|(_, tagged)| tagged == mark).map(|(name, _)| *name);
-    MARKS.iter().find(|(known, _)| *known == bit).and_then(|(_, mark)| named(mark)).expect("every mark has a tag")
+    let known = MARKS.iter().find(|(known, _)| *known == bit).and_then(|(_, mark)| named(mark));
+    tags.filter(|_| bit == ITALIC).or(known).expect("every mark has a tag")
 }
 
 /// Writes a link's address. One with a space in it is wrapped in angle brackets, and none can hold a line break.

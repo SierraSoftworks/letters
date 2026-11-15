@@ -1,0 +1,42 @@
+[package]
+name = "letters-fuzz"
+description = "Fuzz targets for Letters, run under AFL++ by scripts/fuzz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["shell"]
+# The targets that need the desktop shell, which brings its window and GPU crates with it.
+shell = ["dep:letters"]
+
+[dependencies]
+letters-model.workspace = true
+letters-format.workspace = true
+letters-convert.workspace = true
+letters-editor.workspace = true
+letters-layout.workspace = true
+letters-fonts.workspace = true
+letters-math.workspace = true
+letters-spell.workspace = true
+letters-trust.workspace = true
+letters = { path = "../apps/letters", optional = true }
+letters-render.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+xxhash-rust.workspace = true
+zip.workspace = true
+
+# cargo-afl builds with `--cfg fuzzing`. Any other build reads one input and needs no AFL++.
+[target.'cfg(fuzzing)'.dependencies]
+afl = "0.18"
+
+[lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[lints.clippy]
+todo = "allow"

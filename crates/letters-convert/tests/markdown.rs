@@ -2,8 +2,10 @@
 
 mod common;
 
-use letters_convert::{ImportNote, from_markdown, to_markdown};
-use letters_model::{Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Run, Tone};
+use letters_convert::{ImportNote, from_markdown, import_markdown, markdown_assets, to_markdown};
+use letters_model::{
+    Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone,
+};
 use proptest::prelude::*;
 
 use common::outline;
@@ -16,7 +18,20 @@ fn read(markdown: &str) -> (Document, Vec<ImportNote>) {
     })
 }
 
-fn doc(blocks: Vec<Block>) -> Document {
+/// A document of `blocks`, each given an id where it has none, as every block of a document has one.
+fn doc(mut blocks: Vec<Block>) -> Document {
+    fn name(blocks: &mut [Block], next: &mut usize) {
+        for block in blocks {
+            *next += 1;
+            if block.id.as_str().is_empty() {
+                block.id = format!("n{next}").as_str().into();
+            }
+            if let Body::Blocks(children) = &mut block.body {
+                name(children, next);
+            }
+        }
+    }
+    name(&mut blocks, &mut 0);
     Document { blocks, ..Document::default() }
 }
 
@@ -32,19 +47,73 @@ fn item(list: ListKind, depth: u8, text: &str) -> Block {
     with_text(BlockKind::ListItem { list, depth }, vec![Run::plain(text)])
 }
 
+/// A table of rows of cells, each cell holding its text.
+fn table(columns: &[Align], header: bool, rows: &[&[&str]]) -> Block {
+    let cell = |text: &&str| with_text(BlockKind::TableCell, vec![Run::plain(*text)]);
+    let row = |cells: &&[&str]| holding(BlockKind::TableRow, cells.iter().map(cell).collect());
+    holding(BlockKind::Table { columns: columns.to_vec(), header }, rows.iter().map(row).collect())
+}
+
+/// A figure whose picture is still at `src`, at the size one has until its own is known.
+fn figure(src: &str, alt: &str, numbered: bool, caption: Vec<Run>) -> Block {
+    let kind = BlockKind::Figure {
+        asset: None,
+        src: Some(src.into()),
+        alt: alt.into(),
+        width: 320.0,
+        height: 240.0,
+        numbered,
+    };
+    with_text(kind, caption)
+}
+
+/// A picture of 40 by 20 pixels, and one of 1200 by 600.
+const SMALL: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x28\x00\x00\x00\x14\x01\x00\x00\x00\x00\xd7\x3d\x42\x16\x00\x00\x00\x0c\x49\x44\x41\x54\x78\xda\x63\x60\x18\x18\x00\x00\x00\x78\x00\x01\x35\x33\x6e\xa4\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+const WIDE: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x04\xb0\x00\x00\x02\x58\x01\x00\x00\x00\x00\x5a\x9d\x22\xb7\x00\x00\x00\x6f\x49\x44\x41\x54\x78\xda\xed\xc1\x81\x00\x00\x00\x00\xc3\xa0\xf9\x53\x5f\xe1\x00\x55\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xaf\x01\x61\xf7\x00\x01\x76\x1d\xb3\x81\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
 fn linked(text: &str, url: &str) -> Run {
     Run { link: Some(url.into()), ..Run::plain(text) }
 }
 
-/// A document with what a round trip may change set aside: block ids, emphasis on spaces and code on line breaks.
+/// A document with what a round trip may change set aside: block ids, emphasis on spaces, code on line breaks,
+/// and the cells a table's short rows lack.
 fn settled(doc: &Document) -> Document {
     fn settle_block(block: &Block) -> Block {
-        let body = match &block.body {
-            Body::Text(runs) if !matches!(block.kind, BlockKind::Code { .. }) => Body::Text(settle(runs)),
+        let mut body = match &block.body {
+            Body::Text(runs) if !matches!(block.kind, BlockKind::Code { .. } | BlockKind::Formula) => {
+                Body::Text(settle(runs))
+            }
             Body::Blocks(blocks) => Body::Blocks(blocks.iter().map(settle_block).collect()),
             other => other.clone(),
         };
-        Block { id: BlockId::new(""), body, ..block.clone() }
+        let mut kind = block.kind.clone();
+        // A caption is written in italics from end to end, and one with nothing to show is not written.
+        let numbered = match &mut kind {
+            BlockKind::Figure { alt, numbered, .. } => {
+                *alt = alt.replace(['\n', '\r'], " ");
+                Some(*numbered)
+            }
+            BlockKind::Caption => Some(true),
+            _ => None,
+        };
+        if let (Some(numbered), Body::Text(runs)) = (numbered, &mut body) {
+            let upright = |run: &Run| Run {
+                marks: run.marks.iter().filter(|mark| **mark != Mark::Italic).cloned().collect(),
+                ..run.clone()
+            };
+            let shown = numbered || block.body.runs().iter().any(|run| !run.text.trim().is_empty());
+            *runs = settle(&block.body.runs().iter().filter(|_| shown).map(upright).collect::<Vec<_>>());
+        }
+        if let (BlockKind::Table { columns, .. }, Body::Blocks(rows)) = (&mut kind, &mut body) {
+            let width = rows.iter().map(|row| row.body.blocks().len()).chain([columns.len(), 1]).max().unwrap_or(1);
+            columns.resize(width, Align::Start);
+            for row in rows {
+                if let Body::Blocks(cells) = &mut row.body {
+                    cells.resize(width, with_text(BlockKind::TableCell, Vec::new()));
+                }
+            }
+        }
+        Block { id: BlockId::new(""), kind, body, ..block.clone() }
     }
     fn settle(runs: &[Run]) -> Vec<Run> {
         let mut out: Vec<Run> = Vec::new();
@@ -117,6 +186,357 @@ fn reads_every_mark() {
 }
 
 #[test]
+fn reads_maths() {
+    let cases: &[(&str, &[&str])] = &[
+        (r"Euler: $e^{i\pi} + 1 = 0$.", &[r#"p "Euler: <math|e^{i\\pi} + 1 = 0>.""#]),
+        ("**$x$** and [$y$](/z)", &[r#"p "<bold,math|x> and <math,@/z|y>""#]),
+        ("$a\nb$", &[r#"p "<math|a b>""#]),
+        ("$$x^2$$", &[r#"formula "x^2""#]),
+        ("$$\na &= b \\\\\n  &= c\n$$", &[r#"formula "a &= b \\\\\n  &= c""#]),
+        ("```math\nx^2\n```", &[r#"formula "x^2""#]),
+        ("where\n$$\nx^2\n$$\nholds", &[r#"p "where""#, r#"formula "x^2""#, r#"p "holds""#]),
+        ("- step\n  $$\n  x^2\n  $$\n- next", &[r#"bullet/0 "step""#, r#"formula "x^2""#, r#"bullet/0 "next""#]),
+        ("> $$x^2$$", &["quote", r#"  formula "x^2""#]),
+        ("# On $$x^2$$", &[r#"h1 "On <math|x^2>""#]),
+    ];
+    for (markdown, expected) in cases {
+        assert_eq!(outline(&read(markdown).0), *expected, "reading {markdown:?}");
+    }
+}
+
+#[test]
+fn reads_a_table() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "| Year | Rate |\n|:-----|-----:|\n| 2026 | **4 %** |\n| 2027 |",
+            &[
+                "table:start,end headed",
+                "  row",
+                r#"    cell "Year""#,
+                r#"    cell "Rate""#,
+                "  row",
+                r#"    cell "2026""#,
+                r#"    cell "<bold|4 %>""#,
+                "  row",
+                r#"    cell "2027""#,
+                r#"    cell """#,
+            ],
+        ),
+        ("a|b\n:-:|-\n", &["table:center,start headed", "  row", r#"    cell "a""#, r#"    cell "b""#]),
+        // A first row with nothing in it is how Markdown writes a table that has no header.
+        (
+            "|   |   |\n|---|---|\n| 1 | a<br>b \\| c |",
+            &["table:start,start", "  row", r#"    cell "1""#, r#"    cell "a\nb | c""#],
+        ),
+        (
+            "> | a |\n> |---|\n\n- item\n\n  | b |\n  |---|",
+            &[
+                "quote",
+                "  table:start headed",
+                "    row",
+                r#"      cell "a""#,
+                r#"bullet/0 "item""#,
+                "table:start headed",
+                "  row",
+                r#"    cell "b""#,
+            ],
+        ),
+    ];
+    for (markdown, expected) in cases {
+        assert_eq!(outline(&read(markdown).0), *expected, "reading {markdown:?}");
+    }
+}
+
+#[test]
+fn writes_a_table() {
+    let (start, end) = (Align::Start, Align::End);
+    let cases = [
+        (
+            table(&[start, end], true, &[&["Year", "Rate"], &["2026", "4 %"]]),
+            "| Year | Rate |\n| --- | --: |\n| 2026 | 4 % |\n",
+        ),
+        (table(&[Align::Center, Align::Justify], true, &[&["a", "b"]]), "| a | b |\n| :-: | --- |\n"),
+        // Markdown has no table without a header, so an empty one stands in.
+        (table(&[start, start], false, &[&["1", "2"]]), "|  |  |\n| --- | --- |\n| 1 | 2 |\n"),
+        // A row that a merge left short is filled, and one left long widens the table.
+        (table(&[start], true, &[&["a", "b"], &[], &["c"]]), "| a | b |\n| --- | --- |\n|  |  |\n| c |  |\n"),
+        (table(&[start], true, &[&["a|b\nc", " "]]), "| a\\|b<br>c | &#32; |\n| --- | --- |\n"),
+        // A row that a merge left outside its table.
+        (
+            holding(BlockKind::TableRow, vec![with_text(BlockKind::TableCell, vec![Run::plain("a")])]),
+            "|  |\n| --- |\n| a |\n",
+        ),
+    ];
+    for (block, expected) in cases {
+        assert_eq!(to_markdown(&doc(vec![block.clone()])), expected, "writing {block:?}");
+    }
+}
+
+#[test]
+fn reads_pictures() {
+    let (a, b) = ("https://example.com/a.png", "https://example.com/b.png");
+    let cases: &[(String, &[&str])] = &[
+        (format!("![A cat]({a})"), &[r#"figure https://example.com/a.png [A cat] """#]),
+        // The caption is the emphasised paragraph under the picture, or the emphasised line.
+        (
+            format!("![A *fine* cat]({a})\n\n*It **sat** down.*\n\nNext"),
+            &[r#"figure https://example.com/a.png [A fine cat] "It <bold|sat> down.""#, r#"p "Next""#],
+        ),
+        (format!("![a]({a})\n_Under it_"), &[r#"figure https://example.com/a.png [a] "Under it""#]),
+        (format!("![a]({a} \"Its title\")"), &[r#"figure https://example.com/a.png [a] "Its title""#]),
+        (
+            format!("![a]({a})\n![b]({b})\n\n*Both*"),
+            &[
+                "gallery",
+                r#"  figure https://example.com/a.png [a] """#,
+                r#"  figure https://example.com/b.png [b] """#,
+                r#"  caption "Both""#,
+            ],
+        ),
+        // Only a paragraph that is emphasised from end to end is a caption.
+        (
+            format!("![a]({a})\n\n*Not* a caption"),
+            &[r#"figure https://example.com/a.png [a] """#, r#"p "<italic|Not> a caption""#],
+        ),
+        (
+            format!("![a]({a})\n\n<i>Aside</i>"),
+            &[r#"figure https://example.com/a.png [a] """#, r#"p "<italic|Aside>""#],
+        ),
+        // A caption that opens with a number makes its figure numbered, and the text can refer to it.
+        (
+            format!("See Figure 2, not Figure 9.\n\n![a]({a})\n\n*Figure 2: Rates*"),
+            &[r#"p "See <ref:b2|Figure 2>, not Figure 9.""#, r#"figure# https://example.com/a.png [a] "Rates""#],
+        ),
+        (
+            format!("![a]({a})\n![b]({b})\n\n*Figure 1*\n\nAs Figure 1 shows."),
+            &[
+                "gallery#",
+                r#"  figure https://example.com/a.png [a] """#,
+                r#"  figure https://example.com/b.png [b] """#,
+                r#"p "As <ref:b3|Figure 1> shows.""#,
+            ],
+        ),
+    ];
+    for (markdown, expected) in cases {
+        let (doc, notes) = read(markdown);
+        assert_eq!(outline(&doc), *expected, "reading {markdown:?}");
+        assert_eq!(notes, [], "reading {markdown:?}");
+    }
+}
+
+#[test]
+fn brings_in_the_pictures_a_file_names() {
+    let files = |path: &str| match path {
+        "img/small one.png" => Some(SMALL.to_vec()),
+        "wide.png" => Some(WIDE.to_vec()),
+        "notes.txt" => Some(b"not a picture".to_vec()),
+        _ => None,
+    };
+    let markdown = concat!(
+        "![Small](img/small%20one.png)\n\n![Wide](wide.png)\n\n![Again](<img/small one.png>)\n\n",
+        "![Text](notes.txt)\n\n![Gone](gone.png)\n\n![Plain](http://example.com/plain.png)\n",
+    );
+    let mut next = 0;
+    let mut new_id = || {
+        next += 1;
+        format!("b{next}")
+    };
+    let import = import_markdown(markdown, &mut new_id, &mut { files });
+
+    let sizes: Vec<(Option<String>, f32, f32)> = import
+        .document
+        .blocks
+        .iter()
+        .filter_map(|block| match &block.kind {
+            BlockKind::Figure { asset, width, height, .. } => Some((asset.clone(), *width, *height)),
+            _ => None,
+        })
+        .collect();
+    let [(Some(small), 30.0, 15.0), (Some(wide), 480.0, 240.0), (Some(again), 30.0, 15.0)] = sizes.as_slice() else {
+        panic!("three figures at the sizes of their pictures, the wide one fitted to a page: {sizes:?}");
+    };
+    assert_eq!(small, again, "one picture is kept once");
+    assert!(small.starts_with("assets/") && small.ends_with(".png"), "{small}");
+    assert_eq!(import.assets.get(small).map(Vec::as_slice), Some(SMALL));
+    assert_eq!(import.assets.get(wide).map(Vec::as_slice), Some(WIDE));
+    assert_eq!(import.assets.len(), 2);
+
+    // What cannot be shown stays, as a link to where it was.
+    let kept: Vec<&Block> = import.document.blocks.iter().filter(|block| block.kind == BlockKind::Paragraph).collect();
+    let links: Vec<_> = kept.iter().map(|block| block.body.runs()[0].link.as_deref()).collect();
+    assert_eq!(links, [Some("notes.txt"), Some("gone.png"), Some("http://example.com/plain.png")]);
+    assert_eq!(import.notes.len(), 3, "{:?}", import.notes);
+
+    // An export names each picture by its entry, and reads back with those entries beside it.
+    let exported = to_markdown(&import.document);
+    assert!(exported.contains(&format!("![Small]({small})")), "{exported}");
+    assert_eq!(
+        markdown_assets(&import.document).into_iter().collect::<Vec<_>>(),
+        import.assets.keys().cloned().collect::<Vec<_>>()
+    );
+    let again = import_markdown(&exported, &mut String::new, &mut |path| import.assets.get(path).cloned());
+    assert_eq!(settled(&again.document), settled(&import.document));
+}
+
+#[test]
+fn writes_pictures() {
+    let (a, b) = ("https://example.com/a.png", "https://example.com/b.png");
+    let plain = |text: &str| with_text(BlockKind::Paragraph, vec![Run::plain(text)]);
+    let held = BlockKind::Figure {
+        asset: Some("assets/0a1b.png".into()),
+        src: None,
+        alt: "Held".into(),
+        width: 30.0,
+        height: 15.0,
+        numbered: false,
+    };
+    let both = |numbered, caption: Option<&str>| {
+        let caption = caption.map(|text| with_text(BlockKind::Caption, vec![Run::plain(text)]));
+        let parts = [figure(a, "a", false, vec![]), figure(b, "b", false, vec![])].into_iter().chain(caption);
+        holding(BlockKind::Gallery { numbered }, parts.collect())
+    };
+    let cases = [
+        (vec![figure(a, "A cat", false, vec![])], "![A cat](https://example.com/a.png)\n".to_owned()),
+        (vec![with_text(held, vec![])], "![Held](assets/0a1b.png)\n".to_owned()),
+        (
+            vec![figure(
+                a,
+                "A [fine]\ncat",
+                false,
+                vec![Run::plain("It "), Run::marked("sat", [Mark::Bold]), Run::plain(" down.")],
+            )],
+            format!("![A \\[fine\\] cat]({a})\n\n*It **sat** down.*\n"),
+        ),
+        (vec![both(false, Some("Both"))], format!("![a]({a})\n![b]({b})\n\n*Both*\n")),
+        // A numbered caption opens with its number, and a reference reads as it whatever text it holds.
+        (
+            vec![
+                with_text(
+                    BlockKind::Paragraph,
+                    vec![Run::plain("See "), Run::marked("the chart", [Mark::Ref("f".into())]), Run::plain(".")],
+                ),
+                figure(a, "a", true, vec![Run::plain("Rates")]),
+                Block { id: "f".into(), ..both(true, None) },
+            ],
+            format!("See Figure 2.\n\n![a]({a})\n\n*Figure 1: Rates*\n\n![a]({a})\n![b]({b})\n\n*Figure 2*\n"),
+        ),
+        // A paragraph in italics under a picture with no caption is not its caption.
+        (
+            vec![
+                figure(a, "a", false, vec![]),
+                with_text(BlockKind::Paragraph, vec![Run::marked("Aside", [Mark::Italic])]),
+                plain("b"),
+            ],
+            format!("![a]({a})\n\n<i>Aside</i>\n\nb\n"),
+        ),
+    ];
+    for (blocks, expected) in cases {
+        assert_eq!(to_markdown(&doc(blocks)), expected);
+    }
+}
+
+#[test]
+fn reads_a_price_as_text() {
+    let cases =
+        ["costs $5", "between $5 and $10", "$5-$10 each", "US$5/kg and US$6", "$1.50, $2 or $3.25", "5$ and 10$"];
+    for markdown in cases {
+        assert_eq!(outline(&read(markdown).0), [format!("p {markdown:?}")], "reading {markdown:?}");
+        let (back, _) = read(&to_markdown(&read(markdown).0));
+        assert_eq!(outline(&back), [format!("p {markdown:?}")], "writing {markdown:?}");
+    }
+}
+
+#[test]
+fn writes_maths_between_dollar_signs() {
+    let maths = |tex: &str| Run::marked(tex, [Mark::Math]);
+    let formula = |tex: &str| with_text(BlockKind::Formula, vec![Run::plain(tex)]);
+    let cases = [
+        (
+            with_text(BlockKind::Paragraph, vec![Run::plain("so "), maths("x^2"), Run::plain(" holds")]),
+            "so $x^2$ holds\n",
+        ),
+        (with_text(BlockKind::Paragraph, vec![Run::marked("x", [Mark::Math, Mark::Bold])]), "**$x$**\n"),
+        (with_text(BlockKind::Heading { level: 2 }, vec![Run::plain("On "), maths("a_1*b_2")]), "## On $a_1*b_2$\n"),
+        (with_text(BlockKind::Paragraph, vec![maths("x"), Run::plain(" costs $5")]), "$x$ costs \\$5\n"),
+        (formula("x^2"), "$$\nx^2\n$$\n"),
+        (formula("a &= b \\\\\n&= c"), "$$\na &= b \\\\\n&= c\n$$\n"),
+        (Block::new("", BlockKind::Formula), "$$\n$$\n"),
+        (holding(BlockKind::Quote, vec![formula("x^2")]), "> $$\n> x^2\n> $$\n"),
+    ];
+    for (block, expected) in cases {
+        assert_eq!(to_markdown(&doc(vec![block.clone()])), expected, "writing {block:?}");
+    }
+}
+
+#[test]
+fn maths_survives_a_round_trip() {
+    let inline = [
+        r"\frac{a}{b}",
+        "a_1 + b_2^{n}",
+        r"\text{cost: } \$5",
+        "x < y & z > 0",
+        "a|b",
+        r"\{x\}",
+        "a*b*c",
+        "[x](y)",
+        "f`x`",
+        r"a \\ b",
+        "#1 ~ !x",
+        r"\text{$y$}",
+        "2",
+    ];
+    let display =
+        ["x^2", "a &= b \\\\\n  &= c", "a\n- b", "a\n\nb", "", " x ", "> a", "# a", "a\n===", "x $$ y", "a {", "```"];
+    let around = |tex: &str| {
+        let maths = Run::marked(tex, [Mark::Math]);
+        vec![
+            with_text(BlockKind::Paragraph, vec![maths.clone()]),
+            with_text(BlockKind::Paragraph, vec![Run::plain("so "), maths.clone(), Run::plain(" and "), maths.clone()]),
+            with_text(BlockKind::Paragraph, vec![Run::plain("a"), maths.clone(), Run::plain("2 $")]),
+            with_text(BlockKind::Heading { level: 1 }, vec![Run::marked("On ", [Mark::Italic]), maths.clone()]),
+            item(ListKind::Bullet, 0, "item"),
+            with_text(
+                BlockKind::ListItem { list: ListKind::Bullet, depth: 1 },
+                vec![Run { link: Some("/a".into()), ..maths }],
+            ),
+        ]
+    };
+    let formula = |tex: &str| {
+        let formula = with_text(
+            BlockKind::Formula,
+            Some(tex).filter(|tex| !tex.is_empty()).map(Run::plain).into_iter().collect(),
+        );
+        vec![
+            with_text(BlockKind::Paragraph, vec![Run::plain("before")]),
+            formula.clone(),
+            item(ListKind::Ordered, 0, "item"),
+            formula.clone(),
+            holding(BlockKind::Callout { tone: Tone::Tip }, vec![formula]),
+        ]
+    };
+    let cases = inline.iter().map(|tex| around(tex)).chain(display.iter().map(|tex| formula(tex)));
+    for blocks in cases {
+        let before = doc(blocks);
+        let markdown = to_markdown(&before);
+        let (after, notes) = read(&markdown);
+        assert_eq!(settled(&after), settled(&before), "through {markdown:?}");
+        assert_eq!(notes, [], "through {markdown:?}");
+    }
+}
+
+#[test]
+fn writes_maths_that_dollar_signs_cannot_hold_as_code() {
+    let cases = [("a } b", "`a } b`"), ("x $ y", "`x $ y`"), (" x ", " $x$ "), ("a\nb", "$a$\\\n$b$")];
+    for (tex, expected) in cases {
+        let block = with_text(
+            BlockKind::Paragraph,
+            vec![Run::plain("so"), Run::marked(tex, [Mark::Math]), Run::plain("holds")],
+        );
+        assert_eq!(to_markdown(&doc(vec![block])), format!("so{expected}holds\n"), "writing {tex:?}");
+    }
+}
+
+#[test]
 fn reads_callout_tags_and_their_aliases() {
     let cases = [
         ("INFO", Tone::Info),
@@ -166,13 +586,10 @@ fn notes_what_an_import_simplified() {
         ("3. three\n4. four", "started at 3", "three"),
         ("- one\n\n  two", "joined", "one\ntwo"),
         ("- item\n\n  ```\n  code\n  ```", "Moved out of a list item", "code"),
-        ("| a | b |\n|---|--:|\n| 1 | 2 |", "Table", "| 1 | 2 |"),
         ("<div class=\"x\">\nraw\n</div>", "HTML", "<div class=\"x\">"),
         ("text <span>inline</span>", "HTML", "<span>inline</span>"),
-        ("---\ntitle: Notes\n---\n\nBody", "Front matter", "title: Notes"),
-        ("+++\r\ntitle = \"Notes\"\r\nlang = \"en\"\r\n+++\r\nBody", "Front matter", "title = \"Notes\"\nlang"),
-        ("Euler: $e^{i\\pi} + 1 = 0$", "Maths", "$e^{i\\pi} + 1 = 0$"),
-        ("$$\nx^2\n$$", "Maths", "x^2"),
+        ("# Title $$x^2$$", "Display maths", "x^2"),
+        ("- item $$x^2$$", "Moved out of a list item", "x^2"),
         ("Claim[^1]\n\n[^1]: Source", "Footnote", "[^1]: Source"),
         ("![A cat](cat.png)", "Image", "A cat"),
         ("[a](/b \"Hover\")", "Hover", "a"),
@@ -184,6 +601,62 @@ fn notes_what_an_import_simplified() {
         assert!(!noted.is_empty(), "notes for {markdown:?}: {notes:?}");
         assert!(noted.iter().all(|note| doc.block(&BlockId::new(&note.block)).is_some()), "{notes:?} sit on blocks");
         assert!(doc.walk().any(|block| block.plain_text().contains(kept)), "{kept:?} kept from {markdown:?}");
+    }
+}
+
+#[test]
+fn keeps_front_matter_as_the_documents_properties() {
+    let cases = [
+        (
+            "---\ntitle: Notes\ntags: [a, b]\n---\n\n# Title\n",
+            PropertiesFormat::Yaml,
+            "title: Notes\ntags: [a, b]\n",
+            1,
+        ),
+        ("+++\r\ntitle = \"Notes\"\r\n+++\r\nBody", PropertiesFormat::Toml, "title = \"Notes\"\n", 1),
+        ("---\n# a comment\n\nkey: |\n  - text\n---\n", PropertiesFormat::Yaml, "# a comment\n\nkey: |\n  - text\n", 0),
+        ("---\n---\nBody", PropertiesFormat::Yaml, "", 1),
+    ];
+    for (markdown, format, source, blocks) in cases {
+        let (doc, notes) = read(markdown);
+        let properties = doc.properties.as_ref().unwrap_or_else(|| panic!("{markdown:?} has front matter"));
+        assert_eq!((properties.format, properties.source.as_str()), (format, source), "reading {markdown:?}");
+        assert_eq!((doc.blocks.len(), notes.as_slice()), (blocks, [].as_slice()), "reading {markdown:?}");
+        let (back, _) = read(&to_markdown(&doc));
+        assert_eq!(settled(&back), settled(&doc), "through {:?}", to_markdown(&doc));
+    }
+}
+
+#[test]
+fn reads_front_matter_only_where_a_file_starts_with_it() {
+    let cases = [
+        "---\n\ntitle: a divider and text\n\n---\n",
+        "Text\n\n---\ntitle: Notes\n---\n",
+        "---\nnever closed\n",
+        " ---\na: b\n---\n",
+    ];
+    for markdown in cases {
+        let (doc, _) = read(markdown);
+        assert_eq!(doc.properties, None, "reading {markdown:?}");
+        assert!(!doc.blocks.is_empty(), "reading {markdown:?}");
+    }
+}
+
+#[test]
+fn writes_properties_that_front_matter_cannot_hold_as_code() {
+    let properties =
+        |source: &str| Properties { format: PropertiesFormat::Yaml, source: source.into(), extra: Default::default() };
+    let cases = [
+        ("title: Notes\n", "---\ntitle: Notes\n---\n\nBody\n"),
+        ("title: Notes", "---\ntitle: Notes\n---\n\nBody\n"),
+        ("", "---\n---\n\nBody\n"),
+        ("a: 1\n---\nb: 2\n", "```yaml\na: 1\n---\nb: 2\n```\n\nBody\n"),
+        ("\na: 1\n", "```yaml\n\na: 1\n```\n\nBody\n"),
+    ];
+    for (source, expected) in cases {
+        let body = with_text(BlockKind::Paragraph, vec![Run::plain("Body")]);
+        let doc = Document { properties: Some(properties(source)), ..doc(vec![body]) };
+        assert_eq!(to_markdown(&doc), expected, "writing {source:?}");
     }
 }
 
@@ -351,6 +824,13 @@ fn round_trips_canonical_markdown_unchanged() {
         "-\n  -\n",
         "- bullets\n\n1. then numbers\n",
         "- not a | table\n  - \\|\n",
+        "Before\n\n| Name | Size |\n| --- | --: |\n| `a\\|b` | $x^2$ |\n| *c* |  |\n\nAfter\n",
+        "> |  |  |\n> | :-: | --- |\n> | no | header |\n",
+        "See Figure 1.\n\n![A cat](https://example.com/cat.png)\n\n*Figure 1: A **fine** cat.*\n",
+        "![a](https://example.com/a.png)\n![b](<https://example.com/b c.png>)\n\n*Both.*\n\n*Not a caption.*\n",
+        "> ![a](https://example.com/a.png)\n>\n> <i>An aside.</i>\n",
+        "---\ntitle: Notes\n---\n\n# Notes\n\nSo $x^2$ holds:\n\n$$\nx^2 \\ge 0\n$$\n",
+        "+++\ntitle = \"Notes\"\n+++\n",
     ];
     for markdown in cases {
         assert_eq!(to_markdown(&read(markdown).0), markdown);
@@ -359,10 +839,15 @@ fn round_trips_canonical_markdown_unchanged() {
 
 /// The conformance corpus ships each sample with the export a reader should expect.
 #[test]
-fn exports_the_conformance_report() {
-    let report = include_str!("../../letters-format/corpus/document/report.json");
-    let report = Document::from_json(report).expect("the corpus holds a valid document");
-    assert_eq!(to_markdown(&report), include_str!("corpus/report.md"));
+fn exports_the_conformance_samples() {
+    let cases = [
+        (include_str!("../../letters-format/corpus/document/report.json"), include_str!("corpus/report.md")),
+        (include_str!("../../letters-format/corpus/document/notice.json"), include_str!("corpus/notice.md")),
+    ];
+    for (sample, expected) in cases {
+        let sample = Document::from_json(sample).expect("the corpus holds a valid document");
+        assert_eq!(to_markdown(&sample), expected);
+    }
 }
 
 #[test]
@@ -391,6 +876,43 @@ fn any_text() -> impl Strategy<Value = String> {
     proptest::collection::vec(piece, 1..8).prop_map(|pieces| pieces.concat())
 }
 
+/// TeX that sits between dollar signs: its braces pair up, its dollars are escaped, and no space is at its edge.
+fn any_tex() -> impl Strategy<Value = String> {
+    let piece = proptest::sample::select(vec![
+        "x",
+        "2",
+        "a_1",
+        "^2",
+        " + ",
+        " ",
+        "=",
+        r"\frac{a}{b}",
+        r"\alpha",
+        r"\$",
+        "{y}",
+        "|",
+        "*",
+        "_",
+        "<",
+        ">",
+        "&",
+        "[",
+        "]",
+        "(",
+        ")",
+        "`",
+        r"\\",
+        "-",
+        "!",
+        "#",
+        "~",
+        "é",
+    ]);
+    proptest::collection::vec(piece, 1..6)
+        .prop_map(|pieces| pieces.concat().trim().to_owned())
+        .prop_filter("maths has a source", |tex| !tex.is_empty())
+}
+
 fn any_runs() -> impl Strategy<Value = Vec<Run>> {
     let marks = [Mark::Bold, Mark::Italic, Mark::Underline, Mark::Strike, Mark::Highlight, Mark::Code];
     let marks = prop_oneof![
@@ -408,8 +930,11 @@ fn any_runs() -> impl Strategy<Value = Vec<Run>> {
         "https://a.b/$c",
     ];
     let link = proptest::option::weighted(0.2, proptest::sample::select(urls));
-    let run = (any_text(), marks, link)
-        .prop_map(|(text, marks, link)| Run { link: link.map(str::to_owned), ..Run::marked(text, marks) });
+    let text = (any_text(), marks);
+    let maths = (any_tex(), proptest::sample::subsequence(vec![Mark::Math, Mark::Bold, Mark::Underline], 1..=3))
+        .prop_map(|(tex, marks)| (tex, [vec![Mark::Math], marks].concat()));
+    let run = (prop_oneof![5 => text, 1 => maths], link)
+        .prop_map(|((text, marks), link)| Run { link: link.map(str::to_owned), ..Run::marked(text, marks) });
     proptest::collection::vec(run, 1..4)
 }
 
@@ -429,6 +954,11 @@ fn any_blocks() -> impl Strategy<Value = Vec<Block>> {
             with_text(BlockKind::Code { language }, code.into_iter().map(Run::plain).collect())
         }),
         1 => Just(Block::new("", BlockKind::Divider)),
+        1 => proptest::option::of(prop_oneof![any_tex(), any_text()])
+            .prop_map(|tex| with_text(BlockKind::Formula, tex.into_iter().map(Run::plain).collect())),
+        1 => any_table(),
+        1 => any_figure(prop_oneof![2 => any_runs(), 1 => Just(Vec::new())]),
+        1 => any_gallery(),
     ];
     let block = leaf.prop_recursive(3, 16, 4, move |inner| {
         let children = proptest::collection::vec(inner, 0..4);
@@ -438,6 +968,45 @@ fn any_blocks() -> impl Strategy<Value = Vec<Block>> {
         ]
     });
     proptest::collection::vec(block, 0..6).prop_map(nest_items)
+}
+
+/// A table as a merge may leave one: rows of any length under any number of columns. Its first row heads it
+/// only where that row has text, since Markdown writes a table with no header as one with an empty first row.
+fn any_table() -> impl Strategy<Value = Block> {
+    let cell =
+        prop_oneof![3 => any_runs(), 1 => Just(Vec::new())].prop_map(|runs| with_text(BlockKind::TableCell, runs));
+    let row = proptest::collection::vec(cell, 0..4).prop_map(|cells| holding(BlockKind::TableRow, cells));
+    let align = proptest::sample::select(vec![Align::Start, Align::Center, Align::End]);
+    (proptest::collection::vec(align, 0..4), any::<bool>(), proptest::collection::vec(row, 1..4)).prop_map(
+        |(columns, header, rows)| {
+            let headed = rows[0].body.blocks().iter().any(|cell| !cell.plain_text().is_empty());
+            holding(BlockKind::Table { columns, header: header && headed || rows.len() == 1 }, rows)
+        },
+    )
+}
+
+/// A figure whose picture is still remote, which is what Markdown alone can name.
+fn any_figure(caption: impl Strategy<Value = Vec<Run>>) -> impl Strategy<Value = Block> {
+    let src = proptest::sample::select(vec!["https://example.com/a.png", "https://example.com/b (c).png?d=1&amp;e"]);
+    (src, any_text(), any::<bool>(), caption)
+        .prop_map(|(src, alt, numbered, caption)| figure(src, &alt, numbered, caption))
+}
+
+/// A gallery as Markdown can say one: several pictures with no captions of their own, then at most one caption.
+fn any_gallery() -> impl Strategy<Value = Block> {
+    let caption = any_runs()
+        .prop_filter("a caption shows", |runs| runs.iter().any(|run| !run.text.trim().is_empty()))
+        .prop_map(|runs| with_text(BlockKind::Caption, runs));
+    let figures = proptest::collection::vec(any_figure(Just(Vec::new())), 2..4);
+    (figures, proptest::option::of(caption), any::<bool>()).prop_map(|(mut parts, caption, numbered)| {
+        for part in &mut parts {
+            if let BlockKind::Figure { numbered, .. } = &mut part.kind {
+                *numbered = false;
+            }
+        }
+        parts.extend(caption);
+        holding(BlockKind::Gallery { numbered }, parts)
+    })
 }
 
 /// Markdown nests a list item under the one before it, so an item goes at most one level deeper than that.
@@ -458,6 +1027,28 @@ fn nest_items(mut blocks: Vec<Block>) -> Vec<Block> {
     blocks
 }
 
+/// Front matter as a file holds it: lines of anything but a blank first line or the fence that would end it.
+fn any_properties() -> impl Strategy<Value = Option<Properties>> {
+    let line = proptest::sample::select(vec![
+        "title: Notes",
+        "tags: [a, b]",
+        "# - *x* $",
+        "  - nested",
+        "",
+        "+++",
+        "---",
+        "\t",
+    ]);
+    let format = proptest::sample::select(vec![(PropertiesFormat::Yaml, "---"), (PropertiesFormat::Toml, "+++")]);
+    let properties = (format, proptest::collection::vec(line, 0..4)).prop_map(|((format, fence), lines)| {
+        let lines: Vec<&str> = lines.into_iter().filter(|line| *line != fence).collect();
+        let source: String =
+            lines.iter().skip_while(|line| line.trim().is_empty()).map(|line| format!("{line}\n")).collect();
+        Properties { format, source, extra: Default::default() }
+    });
+    proptest::option::of(properties)
+}
+
 /// Anything a Markdown file might hold, well formed or not.
 fn any_markdown() -> impl Strategy<Value = String> {
     let piece = prop_oneof![
@@ -466,7 +1057,7 @@ fn any_markdown() -> impl Strategy<Value = String> {
             "\n", "\n\n", "# ", "## ", "###### ", "- ", "* ", "1. ", "7) ", "- [ ] ", "- [x] ", "> ", "> > ", "  ", "    ",
             "```\n", "~~~rust\n", "---\n", "===\n", "> [!NOTE]\n", "> [!warn] ", "[!TIP]", "| a | b |\n|---|---|\n", "<div>\n",
             "<!-- c -->", "<u>", "</u>", "<mark>", "<br>", "<span>", "$", "$$\n", "[^1]", "[^1]: ", "[a]: /b\n", "[a]",
-            "[[w]]", "![i](s)", "[l](u \"t\")", "<https://e.com>", "&#32;", "&amp;", "\\\n", "  \n", "+++\n", "\r\n",
+            "[[w]]", "![i](s)", "![i](https://e.com/s.png)\n", "*Figure 1: c*\n", "Figure 1", "[l](u \"t\")", "<https://e.com>", "&#32;", "&amp;", "\\\n", "  \n", "+++\n", "\r\n",
         ])
         .prop_map(str::to_owned),
     ];
@@ -475,8 +1066,8 @@ fn any_markdown() -> impl Strategy<Value = String> {
 
 proptest! {
     #[test]
-    fn a_document_survives_a_round_trip(blocks in any_blocks()) {
-        let before = doc(blocks);
+    fn a_document_survives_a_round_trip(blocks in any_blocks(), properties in any_properties()) {
+        let before = Document { properties, ..doc(blocks) };
         let markdown = to_markdown(&before);
         let (after, notes) = read(&markdown);
         prop_assert_eq!(settled(&after), settled(&before), "through {:?}", markdown);

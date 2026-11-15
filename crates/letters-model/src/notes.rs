@@ -4,9 +4,11 @@
 //! as for `document.json`, and unknown fields and note types are kept and written back.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::mem;
 use std::ops::Range;
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::json::{Result, err, object, string, write_extra};
 use crate::{Block, BlockId, Extra, Hold, Model, Pos, Run, StablePos};
@@ -45,7 +47,8 @@ pub enum NoteKind {
     Comment,
     /// What an import simplified at this passage.
     Import,
-    /// Two versions of one block that were changed apart. Picking one resolves the note.
+    /// Two versions of one block that were changed apart, the later edit last: the one the document shows
+    /// until a person picks. Picking one resolves the note.
     Conflict { versions: Box<[Version; 2]> },
     /// A type this build does not know. Its fields sit in [`Note::extra`] and are written back verbatim.
     Unknown { type_name: String },
@@ -54,10 +57,12 @@ pub enum NoteKind {
 /// One side of a conflict.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Version {
+    /// Empty when the writer gave no name.
     pub author: String,
     /// When this side was last edited, as RFC 3339.
     pub edited: String,
-    pub block: Block,
+    /// The block as this side left it. `None` when this side took it away.
+    pub block: Option<Block>,
     pub extra: Extra,
 }
 
@@ -71,6 +76,35 @@ pub struct Anchor {
     /// those are in the `document.json` beside them, for readers that know nothing of the history.
     pub stable: Option<(StablePos, StablePos)>,
     pub extra: Extra,
+}
+
+impl Note {
+    /// The note a merge raises for a block that two writers changed in the same words. `versions` are the
+    /// block as each left it, the later edit last.
+    ///
+    /// Everything in it, the id too, comes from the block and the two versions alone, so every device that
+    /// merges the same pair raises the same note.
+    pub fn conflict(block: impl Into<BlockId>, versions: [Version; 2]) -> Self {
+        let block = block.into();
+        let mut hash = Sha256::new();
+        hash.update(block.as_str());
+        for version in &versions {
+            hash.update([0]);
+            hash.update(write_version(version).to_string());
+        }
+        let id: String = hash.finalize()[..16].iter().map(|byte| format!("{byte:02x}")).collect();
+        Self {
+            id: format!("conflict-{id}"),
+            created: versions[1].edited.clone(),
+            kind: NoteKind::Conflict { versions: Box::new(versions) },
+            anchor: Anchor::block(block),
+            author: "Letters".into(),
+            resolved: false,
+            content: Vec::new(),
+            replies: Vec::new(),
+            extra: Extra::new(),
+        }
+    }
 }
 
 impl Anchor {
@@ -160,6 +194,23 @@ impl Notes {
         self.notes.iter_mut().for_each(|note| note.anchor.follow(model));
     }
 
+    /// Adds the conflicts that a merge found. Raising one that is held already changes nothing.
+    ///
+    /// A conflict is resolved by a newer one on its block, whichever copy raised that: the newer versions
+    /// are the ones left to choose from. So this is also called with none, after notes came in.
+    pub fn raise(&mut self, conflicts: impl IntoIterator<Item = Note>) {
+        self.merge(&Notes { notes: conflicts.into_iter().collect(), extra: Extra::new() });
+        let is_conflict = |note: &Note| matches!(note.kind, NoteKind::Conflict { .. });
+        let mut newest: BTreeMap<BlockId, String> = BTreeMap::new();
+        for note in self.notes.iter().filter(|note| is_conflict(note)) {
+            let held = newest.entry(note.anchor.block.clone()).or_default();
+            *held = note.created.clone().max(mem::take(held));
+        }
+        // Times that tie leave both open: there is no telling which of the two came after the other.
+        let older = |note: &&mut Note| is_conflict(note) && note.created < newest[&note.anchor.block];
+        self.notes.iter_mut().filter(older).for_each(|note| note.resolved = true);
+    }
+
     /// Takes in the notes of another copy of the document. Returns whether anything here changed.
     ///
     /// The result depends only on the two sets of notes, never on which side merges or in what order, so every
@@ -168,7 +219,7 @@ impl Notes {
     pub fn merge(&mut self, other: &Notes) -> bool {
         let before = self.clone();
         let mut notes: BTreeMap<String, Note> = BTreeMap::new();
-        for note in std::mem::take(&mut self.notes).into_iter().chain(other.notes.iter().cloned()) {
+        for note in mem::take(&mut self.notes).into_iter().chain(other.notes.iter().cloned()) {
             let joined = match notes.remove(&note.id) {
                 Some(held) => join(held, note),
                 None => note,
@@ -293,12 +344,12 @@ fn read_anchor(value: Value, path: &str) -> Result<Anchor> {
 
 fn read_version(value: Value, path: &str) -> Result<Version> {
     let mut map = object(value, path)?;
-    let author = required(&mut map, "author", path, "an author")?;
-    let edited = required(&mut map, "edited", path, "an edit time")?;
-    let block = match map.remove("block") {
-        Some(block) => Block::from_value(block, &format!("{path}.block"))?,
-        None => return err(&format!("{path}.block"), "every version needs its block"),
+    // A writer who gave no name is still a side of the conflict.
+    let Some(author) = string(&mut map, "author", path)? else {
+        return err(&format!("{path}.author"), "expected an author");
     };
+    let edited = required(&mut map, "edited", path, "an edit time")?;
+    let block = map.remove("block").map(|block| Block::from_value(block, &format!("{path}.block"))).transpose()?;
     Ok(Version { author, edited, block, extra: map.into_iter().collect() })
 }
 
@@ -351,7 +402,9 @@ fn write_version(version: &Version) -> Value {
     let mut map = Map::new();
     map.insert("author".into(), version.author.as_str().into());
     map.insert("edited".into(), version.edited.as_str().into());
-    map.insert("block".into(), version.block.to_value());
+    if let Some(block) = &version.block {
+        map.insert("block".into(), block.to_value());
+    }
     write_extra(&mut map, &version.extra);
     Value::Object(map)
 }

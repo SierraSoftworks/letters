@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/*"]
+members = ["crates/*", "apps/*", "platform/*", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,6 +23,8 @@ letters-spell = { path = "crates/letters-spell" }
 letters-math = { path = "crates/letters-math" }
 letters-trust = { path = "crates/letters-trust" }
 letters-test = { path = "crates/letters-test" }
+# The one crate with unsafe code. Only the desktop shell may name it.
+letters-frame = { path = "platform/letters-frame" }
 
 serde = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -32,6 +34,8 @@ proptest = "1"
 unicode-segmentation = "1"
 # The CRDT behind letters-model. No other crate may name it.
 loro = { version = "1.17", default-features = false }
+# The checksum Loro seals a history with. Only the fuzz targets name it, to seal the histories they try.
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
 jsonschema = { version = "0.61", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 vello_cpu = "0.4"
@@ -53,6 +57,8 @@ parley = { version = "0.13", default-features = false, features = ["std"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 # Tokenizes clipboard HTML. No dependencies of its own.
 html5gum = "0.9"
+# Reads the XML inside a .docx. Read-only, no dependencies of its own.
+roxmltree = "0.21"
 # Reads Hunspell dictionaries. MPL-2.0, used unmodified.
 spellbook = "0.4"
 # yewi's highlighter. Its own lexers need no dependencies; the `syntect` feature adds grammars and weight.
@@ -73,14 +79,35 @@ toml_edit = { version = "0.25", default-features = false, features = ["parse", "
 winit = "0.30"
 softbuffer = "0.4"
 accesskit_winit = "0.34"
-arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
 rfd = "0.17"
+# The desktop shell fetches linked pictures with it: no cookies, no proxies, the system's own roots.
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
+# A server for the fetch's tests.
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # Already in the tree through accesskit. Linux only: it asks the desktop for its settings.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 getrandom = "0.4"
+# The person's time zone, for the dates the landing card shows. No time zone reaches the core.
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+# Older system dictionaries are not in UTF-8. The app reads them: nothing in the core needs this.
+encoding_rs = "0.8"
+
+# What letters-frame calls the desktop with, in the versions winit and softbuffer already bring.
+raw-window-handle = "0.6"
+wayland-client = "0.31"
+# Loaded when a window turns out to be a Wayland one, as winit does: nothing links against it.
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+memmap2 = "0.9"
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSData", "NSGeometry", "NSString", "NSThread"] }
+objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSToolbar", "NSView", "NSWindow"] }
 
 # The browser shell. The command-line `wasm-bindgen` must be the version the lock file names.
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = "0.3"
 
@@ -92,8 +119,44 @@ todo = "allow"
 
 [profile.dev]
 debug = "line-tables-only"
+# Each test binary links the whole tree, and incremental state and dependency debug info filled 30 GB disks.
+incremental = false
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# What scripts/fuzz builds: quick to link, and a panic names its line.
+[profile.fuzz]
+inherits = "release"
+lto = false
+debug = "line-tables-only"
+
+# The browser's wasm is downloaded before it runs, so it is built small, except where a frame is made:
+# shaping, layout and painting keep their speed. Measured at 17% less to download for the same frame times.
+[profile.web]
+inherits = "release"
+opt-level = "z"
+
+[profile.web.package]
+letters-editor.opt-level = 3
+letters-layout.opt-level = 3
+letters-render.opt-level = 3
+letters-ui.opt-level = 3
+color.opt-level = 3
+fearless_simd.opt-level = 3
+fontique.opt-level = 3
+glifo.opt-level = 3
+harfrust.opt-level = 3
+kurbo.opt-level = 3
+parley.opt-level = 3
+parley_engine.opt-level = 3
+peniko.opt-level = 3
+read-fonts.opt-level = 3
+skrifa.opt-level = 3
+vello_common.opt-level = 3
+vello_cpu.opt-level = 3

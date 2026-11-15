@@ -73,7 +73,8 @@ fn from_linear(value: f32) -> u8 {
     (s * 255.0).round() as u8
 }
 
-fn to_oklch(c: Rgba) -> [f32; 3] {
+/// A colour as OKLCH: lightness from 0 to 1, chroma, and hue in degrees. Alpha is left behind.
+pub(crate) fn to_oklch(c: Rgba) -> [f32; 3] {
     let (r, g, b) = (to_linear(c.r), to_linear(c.g), to_linear(c.b));
     let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
     let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
@@ -84,7 +85,8 @@ fn to_oklch(c: Rgba) -> [f32; 3] {
     [lightness, a.hypot(b), b.atan2(a).to_degrees()]
 }
 
-fn from_oklch([lightness, chroma, hue]: [f32; 3], alpha: u8) -> Rgba {
+/// The sRGB colour nearest an OKLCH one, each channel clipped to what a screen shows, as browsers do.
+pub(crate) fn from_oklch([lightness, chroma, hue]: [f32; 3], alpha: u8) -> Rgba {
     let (a, b) = (chroma * hue.to_radians().cos(), chroma * hue.to_radians().sin());
     let l = (lightness + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
     let m = (lightness - 0.105_561_346 * a - 0.063_854_17 * b).powi(3);

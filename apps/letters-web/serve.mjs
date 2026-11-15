@@ -9,7 +9,13 @@ import { fileURLToPath } from "node:url";
 
 const DIST = fileURLToPath(new URL("dist", import.meta.url));
 // A browser compiles wasm as it downloads only when it is served as wasm.
-const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".wasm": "application/wasm" };
+const TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript",
+  ".ttf": "font/ttf",
+  ".txt": "text/plain; charset=utf-8",
+  ".wasm": "application/wasm",
+};
 const port = Number(process.argv[2] ?? 8080);
 
 createServer(async (request, response) => {

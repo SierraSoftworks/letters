@@ -18,6 +18,11 @@ letters-editor.workspace = true
 letters-ui.workspace = true
 letters-format.workspace = true
 letters-convert.workspace = true
+letters-fonts.workspace = true
+letters-layout.workspace = true
+letters-trust.workspace = true
+letters-spell.workspace = true
+letters-frame.workspace = true
 serde_json.workspace = true
 
 winit.workspace = true
@@ -26,7 +31,17 @@ accesskit_winit.workspace = true
 arboard.workspace = true
 rfd.workspace = true
 getrandom.workspace = true
+jiff.workspace = true
+encoding_rs.workspace = true
+toml_edit.workspace = true
+image.workspace = true
+ureq.workspace = true
 pollster.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus.workspace = true
+
+[dev-dependencies]
+hayro.workspace = true
+rcgen.workspace = true
+rustls.workspace = true

@@ -19,7 +19,9 @@
 //!
 //! A position is a block and a byte offset in its text, as the model has it. Some text is not drawn as it is
 //! written: a formula is typeset in place of its TeX, so every offset inside the source is at the formula's
-//! right edge. A picture of a gallery has no text on the page, and a position in it is on the picture.
+//! right edge. While the caret is in a formula, its source shows instead. See [`DocLayout::reveal`]. A
+//! reference to a figure reads as the figure's label, whatever its own text is. A picture of a gallery has
+//! no text on the page, and a position in it is on the picture.
 
 mod engine;
 mod flow;
@@ -29,6 +31,7 @@ mod paginate;
 mod palette;
 mod reveal;
 mod shape;
+mod split;
 mod theme;
 mod tokens;
 
@@ -36,20 +39,23 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
+use std::sync::Arc;
 
 use letters_model::{BlockId, BlockKind, Body, Change, Document, Markers, Page, Pos, Selection, Style};
-use letters_render::{DisplayList, Font, Item, Point, Rect};
+use letters_render::{DisplayList, Font, Item, Point, Rect, Role as Tag};
 use parley::{Alignment, Language};
 
 use crate::engine::Engine;
-use crate::flow::{Frame, Leaf, Look, Part, Role, Table, Types, What, Words};
+use crate::flow::{Frame, Leaf, Look, Part, Picture, Role, Table, Types, What, Words};
 use crate::ink::{Brush, Ink, Inks};
-use crate::leaf::{Extent, Laid, Over, Painter, Source, Text};
+use crate::leaf::{Extent, Laid, Lay, Open, Over, Painter, Source, Swap, Text};
 use crate::reveal::{Reveal, Shapes, Shifts};
 
-pub use crate::paginate::{Heading, PageLink, Pages, Sheet};
+pub use crate::paginate::{Heading, PageBlock, PageLink, Pages, Sheet};
 pub use crate::palette::{Callout, Palette, Scheme, Syntax};
 pub use crate::shape::{FontSpec, ShapedRun, ShapedText, Shaper};
+pub use crate::split::{Arrangement, Piece, Side, Split, Window};
+pub use crate::theme::CAPTION_INSET;
 pub use crate::tokens::{Token, TokenKind};
 
 /// The fonts layout may use. The shell supplies them, since the core never reads files.
@@ -71,12 +77,15 @@ const EAGER: usize = 32;
 /// Where a figure is drawn. See [`DocLayout::figure`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FigureBox {
-    /// The picture. For a gallery, all its rows of pictures.
+    /// The picture. For a gallery, all its rows of pictures. For a link that is loaded, the box its picture
+    /// is fitted in.
     pub image: Rect,
-    /// The caption under it. While there is none this is where its first line would be, which reaches into
-    /// the space below the figure.
+    /// The caption under it, the whole width of the figure. While there is none this is where its first
+    /// line would be, which reaches into the space below the figure unless
+    /// [`DocLayout::set_caption_open`] keeps that line open.
     pub caption: Rect,
-    /// The cloud on a picture that is still a link, when the picture has room for one.
+    /// The cloud on a picture that is still a link, when the picture has room for one. It keeps its place
+    /// when the picture is loaded and drawn, where nothing marks it.
     pub badge: Option<Rect>,
 }
 
@@ -86,6 +95,11 @@ pub fn figure_numbers(doc: &Document) -> Vec<(BlockId, u32)> {
     let mut numbers = Vec::new();
     flow::numbers(&doc.blocks, &mut 0, &mut numbers);
     numbers
+}
+
+/// The word a style gives its figure labels, such as "Figure", for whoever reads a label typed by hand.
+pub fn figure_word(style: &Style) -> &str {
+    flow::figure_word(style)
 }
 
 /// The label layout draws before the caption of the `number`th numbered figure, such as "Figure 2:". The
@@ -143,6 +157,13 @@ impl DocLayout {
             pending: 0,
             held: 0,
             clock: 0,
+            open: None,
+            in_place: true,
+            good: None,
+            stands: false,
+            numbers: HashMap::new(),
+            loaded: HashMap::new(),
+            caption: None,
             scratch: Laid::default(),
         };
         Self { state: RefCell::new(state) }
@@ -171,7 +192,7 @@ impl DocLayout {
 
     /// Shows the Markdown markers around the caret: `at` is the caret and what the editor's `markers()`
     /// gives for it, or `None` to show none. Call it after every call to the editor, since markers change
-    /// while the caret stays put. Returns whether a marker appears or goes.
+    /// while the caret stays put. Returns whether a marker appears or goes, or a formula opens or closes.
     ///
     /// Markers never change the layout. One inside a line pushes the rest of that line aside, past the text
     /// edge when the line is full, and no other line moves. A heading's hangs left of the text edge, or as
@@ -179,6 +200,11 @@ impl DocLayout {
     /// callout's sits in the corner of its box. [`DocLayout::caret`], [`DocLayout::hit`] and the other
     /// queries answer for the page as drawn, so a caret among markers at its offset sits after the first
     /// `before_caret` of them.
+    ///
+    /// A formula is the one thing that is laid out again. While the caret is in it or at either end of it,
+    /// its TeX shows in its place, written as code, with the editor's markers around it like any others.
+    /// It is typeset again when the caret leaves, or with `None`. A window that shows the source somewhere
+    /// else turns this off with [`DocLayout::set_formula_source`].
     ///
     /// A change is shown at once. To animate it, see [`DocLayout::set_reveal_progress`].
     pub fn reveal(&mut self, at: Option<(&Pos, &Markers)>) -> bool {
@@ -201,10 +227,72 @@ impl DocLayout {
         self.state.get_mut().margin = margin.max(0.0);
     }
 
+    /// Adds faces to the fonts given at the start, for a shell whose fonts arrive one after another. Until a
+    /// face arrives, text that asks for it is set in what there is: its family's upright face slanted for
+    /// an italic, or the first family given for a family that is missing.
+    ///
+    /// Only the blocks with such text are laid out again, as after an edit: each keeps its height as an
+    /// estimate until it is. Returns whether there are any, which is whether the page may now look different.
+    pub fn add_fonts(&mut self, fonts: &Fonts) -> bool {
+        self.state.get_mut().add_fonts(fonts)
+    }
+
+    /// Says that the picture a link leads to is there to draw, with its size in pixels, or with `None` that
+    /// it no longer is. A figure that is still a link shows as a frame with its host and a cloud, since
+    /// whether to fetch it is the shell's to decide. Once loaded it is drawn as [`Item::Image`] with the
+    /// link for its `asset`, written as the document writes it: the name to keep the picture under among
+    /// the images the page is rendered with. A sheet draws it too, and a picture that was never loaded
+    /// stays a frame there.
+    ///
+    /// The size a link's figure stores may be a guess, as it is for one written without a size, and loading
+    /// does not change the document. So the picture is drawn at its own shape, as large as fits in the
+    /// figure's box and in the middle of it. Nothing is laid out again.
+    ///
+    /// Returns whether the document shows the picture, which is whether to paint again: a name that no
+    /// figure links to changes nothing. [`FigureBox::image`] stays the figure's box and
+    /// [`FigureBox::badge`] answers either way, since a loaded picture is a link until it is embedded.
+    pub fn set_loaded(&mut self, src: &str, size: Option<(u32, u32)>) -> bool {
+        self.state.get_mut().set_loaded(src, size)
+    }
+
+    /// Makes one figure or gallery ready for its caption to be written: the one the selection is at. `block`
+    /// is the figure or the gallery, a picture of the gallery or the gallery's caption, and `None` or any
+    /// other block names none.
+    ///
+    /// Its caption keeps a line while it is empty. A figure with no caption and no number is only as tall
+    /// as its picture, so that [`FigureBox::caption`] and the caret of an empty caption lie over the block
+    /// below. With the line open they have a line of their own, and nothing moves when the first letter is
+    /// typed.
+    ///
+    /// Its caption is also set [`CAPTION_INSET`] in from the right, written or not, which leaves the end of
+    /// its lines to what a window stands there. A centred caption is set as far in from the left, so it
+    /// stays in the middle, and one set from the start stays where it is unless a line of it reached that
+    /// far. [`FigureBox::caption`] stays the whole width.
+    ///
+    /// Returns whether a figure is laid out anew for it, which can move what is below. Only the screen
+    /// shows any of this: a sheet shows the document.
+    pub fn set_caption_open(&mut self, block: Option<&BlockId>) -> bool {
+        self.state.get_mut().set_caption_open(block)
+    }
+
     /// Lets formulas link, as `\\href` asks. Off until set, and only a document that is trusted may have it on.
     /// Formulas are set again, since one that links may be drawn another way.
     pub fn set_maths_links(&mut self, links: bool) {
         self.state.get_mut().set_maths_links(links);
+    }
+
+    /// Sets whether a formula shows its source in its place while the caret is in it, which it does until
+    /// set. A window that shows the source on a sheet of its own turns this off: every formula then stays
+    /// typeset, and [`DocLayout::formula_rect`] is where the sheet hangs. Either way takes hold at the next
+    /// [`DocLayout::reveal`].
+    ///
+    /// A formula that stays typeset does so while it is being written too. When its source stops being
+    /// TeX that can be typeset, as at every half-typed command, it stands as it last was typeset for as
+    /// long as the caret is in it, so its line does not jump. [`DocLayout::reveal`] returns `true` when the
+    /// caret leaves one that stands so: it then shows as written, in the colour of a warning. Only the
+    /// screen keeps what was: a sheet shows the document.
+    pub fn set_formula_source(&mut self, in_place: bool) {
+        self.state.get_mut().set_formula_source(in_place);
     }
 
     /// Underlines the text an input method is composing: a block and a byte range in it, as the editor's
@@ -239,6 +327,22 @@ impl DocLayout {
         state.height
     }
 
+    /// The width the document is laid out at.
+    pub(crate) fn width(&self) -> f32 {
+        self.state.borrow().width
+    }
+
+    /// The stretch of the column that a block takes up with the space above it, from the column's top. A
+    /// block inside another, as a cell is in a table, answers for the whole top-level block around it.
+    pub(crate) fn band(&self, block: &BlockId) -> Option<(f32, f32)> {
+        self.state.borrow_mut().band(block)
+    }
+
+    /// The position at a point, or the nearest to it, among what a stretch of the column holds.
+    pub(crate) fn hit_in(&self, point: Point, band: (f32, f32)) -> Option<Pos> {
+        self.state.borrow_mut().hit(point, Some(band))
+    }
+
     /// Emits the part of the document that falls inside `viewport`.
     pub fn paint(&self, viewport: Rect, out: &mut DisplayList) {
         self.state.borrow_mut().paint(viewport, false, out);
@@ -253,11 +357,14 @@ impl DocLayout {
     /// a gallery breaks only between its rows, and a row of a table stays whole. Only something taller than
     /// a page breaks these rules.
     ///
+    /// Pages hold the document and nothing of the editor, so a formula that shows its source for the caret
+    /// is paged, and painted, typeset.
+    ///
     /// This is a pass over the heights of lines and shapes nothing, so it is cheap to run again after an
     /// edit. It first lays out whatever is still estimated, which on a long document that was never
     /// settled takes as long as settling it.
     pub fn paginate(&self, page: &Page) -> Pages {
-        self.state.borrow_mut().paginate(page)
+        self.state.borrow_mut().printed(|state| state.paginate(page))
     }
 
     /// Emits one sheet of `pages`, with the sheet's top left at the origin: the text in its text area and
@@ -266,31 +373,46 @@ impl DocLayout {
     ///
     /// A sheet is white paper. It is painted with [`Palette::LIGHT`] whatever palette is set, and nothing
     /// is drawn behind the text, so the caller fills the paper with that palette's `page` colour.
+    ///
+    /// A sheet also says what its parts are, for a reader that cannot see it: [`Item::Open`] and
+    /// [`Item::Close`] go around what each block draws. A list item's marker is its label, a formula says
+    /// how it was written, a picture what it shows, and a figure holds its caption. A quote or callout goes
+    /// around the blocks inside it, and a table around its rows of cells. A block that runs on to the next
+    /// sheet opens there under the same id. The page number is part of nothing, and nor are the boxes and
+    /// rules of the page.
     pub fn paint_page(&self, pages: &Pages, index: usize, out: &mut DisplayList) {
-        self.state.borrow_mut().paint_page(pages, index, out);
+        self.state.borrow_mut().printed(|state| state.paint_page(pages, index, out));
     }
 
     /// The page of `pages` that shows the line `pos` is on.
     pub fn page_of(&self, pages: &Pages, pos: &Pos) -> Option<usize> {
-        self.state.borrow_mut().page_of(pages, pos)
+        self.state.borrow_mut().printed(|state| state.page_of(pages, pos))
     }
 
-    /// The links on one sheet of `pages`, in reading order. A link that runs over several lines has a
-    /// rectangle for each.
+    /// The top-level blocks one sheet of `pages` shows, in order, each with where it stands on the sheet.
+    /// Print view marks where a page was made to start, and offers to start one, between them. A block
+    /// that runs on to the next sheet is on both.
+    pub fn page_blocks(&self, pages: &Pages, index: usize) -> Vec<PageBlock> {
+        self.state.borrow_mut().printed(|state| state.page_blocks(pages, index))
+    }
+
+    /// The links on one sheet of `pages`, in reading order: those that lead out of the document, and each
+    /// reference that names a figure, which leads to where its figure is. A link that runs over several
+    /// lines has a rectangle for each.
     pub fn page_links(&self, pages: &Pages, index: usize) -> Vec<PageLink> {
-        self.state.borrow_mut().page_links(pages, index)
+        self.state.borrow_mut().printed(|state| state.page_links(pages, index))
     }
 
     /// The document's headings in order, each with the sheet of `pages` it is on. Headings with no text are
     /// left out.
     pub fn outline(&self, pages: &Pages) -> Vec<Heading> {
-        self.state.borrow_mut().outline(pages)
+        self.state.borrow_mut().printed(|state| state.outline(pages))
     }
 
     /// The position nearest to a point: in the nearest text, or on a picture of a gallery. `None` when the
     /// document holds neither.
     pub fn hit(&self, point: Point) -> Option<Pos> {
-        self.state.borrow_mut().hit(point)
+        self.state.borrow_mut().hit(point, None)
     }
 
     /// Where a caret at `pos` is drawn. An offset where a line wraps belongs to the start of the next line.
@@ -299,8 +421,8 @@ impl DocLayout {
     }
 
     /// Where the formula at `pos` is drawn: the one `pos` is in or beside, in a line of text or as a block of
-    /// its own. The sheet its source is written on slides out from under this. `None` when `pos` is at no
-    /// formula. A source that cannot be typeset has the place where it shows as text.
+    /// its own. `None` when `pos` is at no formula. One that shows as its source, because the caret is in it
+    /// or it cannot be typeset, has the place of that text.
     pub fn formula_rect(&self, pos: &Pos) -> Option<Rect> {
         self.state.borrow_mut().formula_rect(pos)
     }
@@ -310,6 +432,17 @@ impl DocLayout {
     /// A figure inside a gallery has the gallery's caption, since a gallery has one for all its pictures.
     pub fn figure(&self, block: &BlockId) -> Option<FigureBox> {
         self.state.borrow_mut().figure(block)
+    }
+
+    /// The pictures `viewport` shows that are still links, in order, each with where its cloud sits. One
+    /// with no room for a cloud is left out.
+    pub fn linked(&self, viewport: Rect) -> Vec<(BlockId, Rect)> {
+        self.state.borrow_mut().linked(viewport)
+    }
+
+    /// The code blocks that `viewport` shows, in order, each with the box drawn behind its text.
+    pub fn code_boxes(&self, viewport: Rect) -> Vec<(BlockId, Rect)> {
+        self.state.borrow_mut().code_boxes(viewport)
     }
 
     /// The rectangles that highlight a selection, one per line it touches.
@@ -347,6 +480,12 @@ impl DocLayout {
         self.state.get_mut().settle(viewport, budget)
     }
 }
+
+/// How a sheet names its parts. A leaf's parts are numbered from its place in the column, with room under it
+/// for the parts inside it, and a quote, callout or table from its own place among those.
+const PARTS: u32 = 32;
+const FRAME: u64 = 1 << 63;
+const TABLE: u64 = 1 << 62;
 
 /// Where a block's positions are: a leaf, and the part of it that shows the block.
 #[derive(Clone, Copy)]
@@ -388,6 +527,21 @@ struct State {
     held: usize,
     /// Counts queries, to tell which layouts were used last.
     clock: u64,
+    /// The formula the caret is in: its block, and which of the block's formulas it is.
+    open: Option<(BlockId, usize)>,
+    /// Whether the formula the caret is in shows its source in its place.
+    in_place: bool,
+    /// The last source of the formula the caret is in that could be typeset.
+    good: Option<Arc<str>>,
+    /// Whether that formula is set from it now, because its source as written cannot be typeset.
+    stands: bool,
+    /// The number of each numbered figure and gallery.
+    numbers: HashMap<BlockId, u32>,
+    /// The links whose pictures the shell has, which are drawn in place of their frames, each with the
+    /// size of its picture.
+    loaded: HashMap<String, (f32, f32)>,
+    /// The figure or gallery that keeps the line of its caption while it has none.
+    caption: Option<BlockId>,
     /// A layout to measure with, so that measuring allocates nothing.
     scratch: Laid,
 }
@@ -470,12 +624,25 @@ impl State {
     fn reflow(&mut self, doc: &Document, carry: Option<&Change>) {
         let mut old = std::mem::take(&mut self.leaves);
         let mut index = std::mem::take(&mut self.index);
-        let flow = flow::flow(doc, &self.types, self.width, carry.map(|change| &change.blocks), |block| {
+        let numbers: HashMap<BlockId, u32> = figure_numbers(doc).into_iter().collect();
+        let renumbered = numbers != self.numbers;
+        self.numbers = numbers;
+        let changed = carry.map(|change| &change.blocks);
+        let flow = flow::flow(doc, &self.types, &self.numbers, self.width, changed, |block| {
             // A block inside a leaf, such as a cell, has no leaf to hand over.
             let at = index.get(block)?.leaf;
             (old[at].id.as_ref() == Some(block)).then(|| std::mem::take(&mut old[at]))
         });
         (self.leaves, self.frames, self.tables) = (flow.leaves, flow.frames, flow.tables);
+        // A reference reads as the number of its figure, so it is set again when the numbers change, and a
+        // cell that holds one is measured again.
+        for leaf in self.leaves.iter_mut().filter(|leaf| renumbered && leaf.refers()) {
+            (leaf.exact, leaf.laid) = (false, None);
+            for cell in leaf.cells.iter_mut().filter(|cell| !cell.words.refs.is_empty()) {
+                cell.fit = None;
+                self.tables[leaf.table].sized = false;
+            }
+        }
         index.clear();
         for (at, leaf) in self.leaves.iter().enumerate() {
             if let (What::Gallery | What::Row, Some(id)) = (leaf.what, &leaf.id) {
@@ -503,6 +670,8 @@ impl State {
         self.spelling.retain(|id, ranges| worded(id) && !ranges.is_empty());
         self.recount();
         self.stale = 0;
+        // A leaf made anew for the figure whose caption is open, as when its picture is resized, opens too.
+        self.open_caption(true);
     }
 
     /// Counts the leaves whose height is a guess and those that hold a layout.
@@ -522,6 +691,40 @@ impl State {
         }
     }
 
+    fn add_fonts(&mut self, fonts: &Fonts) -> bool {
+        if !self.engine.add(fonts) {
+            return false;
+        }
+        // How wide text of each type runs is an estimate taken from its face, and markers are shaped once.
+        if let Some(style) = &self.style {
+            self.types = Types::resolve(style, &mut self.engine);
+        }
+        self.shapes.clear();
+        let mut again = false;
+        for leaf in self.leaves.iter_mut().filter(|leaf| leaf.short) {
+            (leaf.short, leaf.exact, leaf.laid) = (false, false, None);
+            // A cell may be another width in its own face.
+            for cell in &mut leaf.cells {
+                cell.fit = None;
+            }
+            if let Some(table) = self.tables.get_mut(leaf.table).filter(|_| leaf.what == What::Row) {
+                table.sized = false;
+            }
+            again = true;
+        }
+        self.recount();
+        again
+    }
+
+    fn set_loaded(&mut self, src: &str, size: Option<(u32, u32)>) -> bool {
+        let changed = match size.map(|(width, height)| (width.max(1) as f32, height.max(1) as f32)) {
+            Some(size) => self.loaded.insert(src.to_owned(), size) != Some(size),
+            None => self.loaded.remove(src).is_some(),
+        };
+        let shows = |picture: &Picture| picture.asset.is_none() && picture.src.as_deref() == Some(src);
+        changed && self.leaves.iter().any(|leaf| leaf.pictures.iter().any(shows))
+    }
+
     fn set_maths_links(&mut self, links: bool) {
         if std::mem::replace(&mut self.engine.links, links) != links {
             // A formula may be another size now. Formulas are few, so everything is set again.
@@ -537,7 +740,121 @@ impl State {
         if self.shapes.len() > 64 {
             self.shapes.clear();
         }
-        self.reveal.set(at)
+        let formula = |caret: &Pos| {
+            let Slot { leaf, part } = *self.index.get(&caret.block)?;
+            Some((caret.block.clone(), self.leaves[leaf].formula(part, caret.offset)?.0))
+        };
+        let open = at.and_then(|(caret, _)| formula(caret));
+        // The formula the caret has left is set as the document has it again, where it was not: its source
+        // showed, or it stood as it last could be typeset.
+        let moved = open != self.open;
+        let reset = moved && self.shows_open();
+        if reset {
+            self.unlay_open();
+        }
+        if moved {
+            (self.open, self.good, self.stands) = (open, None, false);
+            self.unlay_open();
+            // One that stays typeset is set at once, to know what it is set from before its source changes.
+            if let Some(&Slot { leaf, .. }) = self.open_slot().filter(|_| !self.in_place) {
+                self.lay(leaf);
+            }
+        }
+        self.reveal.set(at) | reset
+    }
+
+    fn set_formula_source(&mut self, in_place: bool) {
+        if self.in_place != in_place {
+            // Which formula the caret is in is told again by the next reveal.
+            self.unlay_open();
+            (self.in_place, self.open, self.good, self.stands) = (in_place, None, None, false);
+        }
+    }
+
+    fn open_slot(&self) -> Option<&Slot> {
+        self.open.as_ref().and_then(|(block, _)| self.index.get(block))
+    }
+
+    /// Whether the caret's being in a formula changes what the page shows.
+    fn shows_open(&self) -> bool {
+        self.in_place || self.stands
+    }
+
+    /// Drops the layout of the leaf with the formula the caret is in, which is laid out again when the
+    /// caret comes or goes. A cell whose formula stands as it was is measured again too: as written, it is
+    /// another size.
+    fn unlay_open(&mut self) {
+        let Some(&Slot { leaf, part }) = self.open_slot() else { return };
+        let table = self.tables.get_mut(self.leaves[leaf].table).filter(|_| self.stands);
+        if let (Part::Cell(index), Some(table)) = (part, table) {
+            (self.leaves[leaf].cells[index].fit, table.sized) = (None, false);
+        }
+        self.unlay(leaf);
+    }
+
+    /// Runs `work` on the document as it prints, where no formula shows for the caret and no caption is
+    /// set for being written. The pages of one pagination are then the same wherever the caret goes
+    /// meanwhile.
+    fn printed<T>(&mut self, work: impl FnOnce(&mut Self) -> T) -> T {
+        // The leaf of the formula the caret is in, where the caret changes how that shows.
+        let shown = self.open_slot().map(|slot| slot.leaf).filter(|_| self.shows_open());
+        if shown.is_some() {
+            self.unlay_open();
+        }
+        let (open, captioned) = (self.open.take(), self.open_caption(false));
+        // Every sheet below it is placed by the height it prints at, whichever sheet is asked for first.
+        if let Some(leaf) = shown {
+            self.measure(leaf);
+        }
+        let done = work(self);
+        self.open = open;
+        if shown.is_some() {
+            self.unlay_open();
+        }
+        if captioned {
+            self.open_caption(true);
+        }
+        done
+    }
+
+    fn set_caption_open(&mut self, block: Option<&BlockId>) -> bool {
+        // A picture of a gallery and the gallery's caption both name the gallery.
+        let leaf = block.and_then(|block| self.index.get(block)).map(|slot| &self.leaves[slot.leaf]);
+        let named =
+            leaf.filter(|leaf| matches!(leaf.what, What::Figure | What::Gallery)).and_then(|leaf| leaf.id.clone());
+        if named == self.caption {
+            return false;
+        }
+        let closed = self.open_caption(false);
+        self.caption = named;
+        self.open_caption(true) | closed
+    }
+
+    /// Makes the leaf of the figure whose caption is being written ready for that, or sets it at rest.
+    /// Returns whether the leaf is laid out anew for it.
+    fn open_caption(&mut self, open: bool) -> bool {
+        let Some(&Slot { leaf: at, .. }) = self.caption.as_ref().and_then(|block| self.index.get(block)) else {
+            return false;
+        };
+        if !self.leaves[at].ready(open, &self.types) {
+            return false;
+        }
+        // It is what the selection is at, so it is given its height at once.
+        self.unlay(at);
+        self.lay(at);
+        true
+    }
+
+    /// Drops a leaf's layout, so that it is laid out again when next needed. Its height stays as the
+    /// estimate until then, so nothing jumps.
+    fn unlay(&mut self, at: usize) {
+        let leaf = &mut self.leaves[at];
+        if leaf.laid.take().is_some() {
+            self.held -= 1;
+        }
+        if std::mem::take(&mut leaf.exact) {
+            self.pending += 1;
+        }
     }
 
     /// The markers revealed in one text of a leaf that holds its layout.
@@ -574,6 +891,16 @@ impl State {
         }
     }
 
+    fn band(&mut self, block: &BlockId) -> Option<(f32, f32)> {
+        let at = self.index.get(block)?.leaf;
+        let under = |leaf: &Leaf| leaf.root == self.leaves[at].root;
+        let first = self.leaves[..at].iter().rposition(|leaf| !under(leaf)).map_or(0, |above| above + 1);
+        let last = self.leaves[at..].iter().position(|leaf| !under(leaf)).map_or(self.leaves.len(), |end| at + end) - 1;
+        self.place(last);
+        let top = first.checked_sub(1).map_or(0.0, |above| self.leaves[above].span().1);
+        Some((top, self.leaves[last].span().1))
+    }
+
     fn place_all(&mut self) {
         self.place(usize::MAX);
         self.height = self.leaves.last().map_or(0.0, |last| last.span().1);
@@ -583,7 +910,7 @@ impl State {
     fn lay(&mut self, at: usize) {
         self.leaves[at].used = self.clock;
         self.size(at);
-        if self.leaves[at].laid.is_some() || matches!(self.leaves[at].what, What::Rule | What::Blank) {
+        if self.leaves[at].laid.is_some() || self.leaves[at].fixed() {
             return;
         }
         if self.held >= KEPT {
@@ -592,6 +919,7 @@ impl State {
         let mut laid = Box::<Laid>::default();
         self.shape(at, &mut laid);
         leaf::adorn(&mut self.engine, &self.types, &self.leaves[at], &mut laid);
+        self.leaves[at].short |= self.engine.short;
         self.leaves[at].laid = Some(laid);
         self.held += 1;
     }
@@ -610,14 +938,29 @@ impl State {
     /// Shapes the texts of a leaf into `laid`, and records what they say of the leaf: its height, and the
     /// lines pagination may split it at.
     fn shape(&mut self, at: usize, laid: &mut Laid) {
-        let Self { engine, types, leaves, tables, palette, locale, .. } = self;
+        let Self { engine, types, leaves, index, palette, locale, open, in_place, good, numbers, .. } = self;
         let leaf = &leaves[at];
-        let aligns = tables.get(leaf.table).filter(|_| leaf.what == What::Row).map_or(&[][..], |table| &table.aligns);
-        let color = ink::of(types, palette, leaf.role);
-        leaf::lay(engine, types, leaf, aligns, color, *locale, laid);
+        // Whether the leaf has the formula the caret is in, and that stays typeset.
+        let slot = open.as_ref().filter(|_| !*in_place).and_then(|(block, _)| index.get(block));
+        let here = slot.is_some_and(|slot| slot.leaf == at);
+        let page = leaf::Page { color: ink::of(types, palette, leaf.role), numbers };
+        let open =
+            open.as_ref().map(|(block, which)| Open { block, which: *which, in_place: *in_place, good: good.as_ref() });
+        engine.short = false;
+        leaf::lay(engine, types, leaf, &Lay { open, page, locale: *locale }, laid);
+        let short = engine.short;
+        if here {
+            // What the caret's formula is set from is kept, to stand while its source cannot be typeset.
+            let set = leaf::opened(leaf, laid);
+            self.stands = set.is_some_and(|(_, swap)| swap.kept.is_some());
+            if let Some((part, Swap { source, kept: None, .. })) = set {
+                self.good = leaf.text(part).and_then(|words| words.text.get(source.clone())).map(Arc::from);
+            }
+        }
         let Extent { height, lines, ends, joined } = leaf::extent(leaf, laid);
         let leaf = &mut self.leaves[at];
         (leaf.lines, leaf.ends, leaf.joined) = (lines, ends, joined);
+        leaf.short |= short;
         if !std::mem::replace(&mut leaf.exact, true) {
             self.pending -= 1;
         }
@@ -630,21 +973,27 @@ impl State {
     /// Gives the table of a row its columns, when it still has cells that were never measured. This shapes
     /// each of those once, without breaking lines. Rows whose cells move are to be laid out again.
     fn size(&mut self, row: usize) {
-        let Self { engine, types, leaves, tables, palette, locale, scratch, .. } = self;
+        let Self { engine, types, leaves, tables, palette, locale, numbers, scratch, open, in_place, good, .. } = self;
         let leaf = &leaves[row];
         let Some(table) = tables.get_mut(leaf.table).filter(|table| leaf.what == What::Row && !table.sized) else {
             return;
         };
+        // A cell is as wide as its formulas are typeset, also while one shows its source for the caret.
+        let open = open.as_ref().filter(|_| !*in_place);
+        let open = open.map(|(block, which)| Open { block, which: *which, in_place: false, good: good.as_ref() });
         for at in table.rows.clone() {
-            let color = ink::of(types, palette, leaves[at].role);
+            let page = leaf::Page { color: ink::of(types, palette, leaves[at].role), numbers };
             for index in 0..leaves[at].cells.len() {
                 let leaf = &leaves[at];
                 if leaf.cells[index].fit.is_some() {
                     continue;
                 }
-                let source = Source::cell(leaf, &leaf.cells[index], Alignment::Start, color);
+                let open = open.and_then(|open| open.of(leaf, Part::Cell(index)));
+                let source = Source::cell(leaf, &leaf.cells[index], Alignment::Start, open, page);
+                engine.short = false;
                 let fit = leaf::fit(engine, types, &source, *locale, &mut scratch.text);
                 leaves[at].cells[index].fit = Some(fit);
+                leaves[at].short |= engine.short;
             }
         }
         table.size(leaves, types);
@@ -703,7 +1052,7 @@ impl State {
         }
         frames.sort_unstable();
         for frame in frames {
-            let Self { engine, types, leaves, frames, reveal, shapes, .. } = self;
+            let Self { engine, types, leaves, frames, reveal, shapes, numbers, loaded, .. } = self;
             let frame = &frames[frame];
             let (top, bottom) = frame.span(leaves);
             let rect = Rect::new(frame.x, top, frame.width, bottom - top);
@@ -725,25 +1074,52 @@ impl State {
             for (tag, level) in reveal.beside(&frame.id).filter(|_| seen) {
                 let (shape, width) = shapes.get(engine, types, Role::Body, true, tag);
                 if let Some(shape) = shapes.layout(shape) {
-                    Painter { engine, types, inks: &inks, band, spelt: false, out }.sign(shape, at, level);
+                    Painter { engine, types, inks: &inks, band, spelt: false, part: None, numbers, loaded, out }
+                        .sign(shape, at, level);
                 }
                 at.x += width;
             }
         }
+        // The boxes and rules of the leaves are decoration too, and go behind all their text.
+        // An empty gallery or table is boxed only for whoever edits it.
+        let backed = self.leaves[first..end].iter().filter(|leaf| !(print && leaf.what == What::Empty));
+        out.items.extend(backed.filter_map(|leaf| leaf::backing(leaf, palette)));
+        // A sheet says what its parts are. `around` is what is open around the leaf being painted, outermost
+        // first: its quotes and callouts, and its table.
+        let mut around: Vec<u64> = Vec::new();
         for at in first..end {
             // A viewport taller than the cache holds has dropped its first layouts by now.
             self.lay(at);
             let leaf = &self.leaves[at];
-            if leaf.what == What::Rule {
-                let rect = Rect::new(leaf.x, leaf.y, leaf.width, leaf.height);
-                out.push(Item::Fill { rect, color: palette.line, radius: 0.0 });
-                continue;
+            let mut inside = Vec::new();
+            if print {
+                inside.extend((leaf.what == What::Row).then_some((TABLE | leaf.table as u64, Tag::Table)));
+                let mut next = leaf.frame;
+                while let Some(frame) = next {
+                    let role = match self.frames[frame].look {
+                        Look::Quote => Tag::Quote,
+                        Look::Callout(_) => Tag::Note,
+                    };
+                    inside.push((FRAME | frame as u64, role));
+                    next = self.frames[frame].parent;
+                }
+                inside.reverse();
             }
+            let shared = around.iter().zip(&inside).take_while(|(open, (id, _))| *open == id).count();
+            out.items.extend(around.drain(shared..).map(|_| Item::Close));
+            for (id, role) in inside.drain(shared..) {
+                out.push(Item::Open { role, id });
+                around.push(id);
+            }
+            // A row holds its cells.
+            let name = print.then_some((at as u64 + 1) << PARTS);
+            let row = name.filter(|_| leaf.what == What::Row);
+            out.items.extend(row.map(|id| Item::Open { role: Tag::Row, id }));
             // The leaf's own text and what stands around it, then the text of each of its cells.
             let cells = leaf.cells.len();
             for part in [Part::Text].into_iter().chain((0..cells).map(Part::Cell)) {
                 let shifts = if print { Shifts::default() } else { self.shifts(at, part) };
-                let Self { engine, types, leaves, tokens, spelling, shapes, composition, .. } = self;
+                let Self { engine, types, leaves, tokens, spelling, shapes, composition, numbers, loaded, .. } = self;
                 let leaf = &leaves[at];
                 let Some(laid) = &leaf.laid else { continue };
                 // What belongs to editing is found by the block the text is of.
@@ -752,17 +1128,19 @@ impl State {
                 let composing = composition.as_ref().filter(|(block, _)| own(block)).map(|(_, range)| range.clone());
                 let spelling = block.and_then(|id| spelling.get(id)).map_or(&[][..], Vec::as_slice);
                 let over = Over { shifts: &shifts, shapes, composing, spelling };
-                let mut painter = Painter { engine, types, inks: &inks, band, spelt: print, out };
+                let mut painter =
+                    Painter { engine, types, inks: &inks, band, spelt: print, part: name, numbers, loaded, out };
                 match part {
                     Part::Cell(index) => painter.cell(leaf, index, &over),
-                    _ if leaf.what == What::Row => painter.rule(leaf),
                     _ => {
                         let tokens = leaf.id.as_ref().and_then(|id| tokens.get(id));
                         painter.leaf(leaf, laid, tokens.map(Vec::as_slice), &over);
                     }
                 }
             }
+            out.items.extend(row.map(|_| Item::Close));
         }
+        out.items.extend(around.drain(..).map(|_| Item::Close));
     }
 
     fn paginate(&mut self, page: &Page) -> Pages {
@@ -801,7 +1179,7 @@ impl State {
             out.translate(from, origin);
         }
         // The page number sits in the middle of the margin beneath the text, if the margin has room for it.
-        let Self { engine, types, scratch, palette, .. } = self;
+        let Self { engine, types, scratch, palette, numbers, loaded, .. } = self;
         let (label, number) = ((index + 1).to_string(), &mut scratch.text.layout);
         let spec = types.get(Role::Caption).spec(false, Brush { ink: Ink::Style(Role::Caption), back: None });
         engine.build(&label, &[spec], &[(0, 0..label.len())], None, number);
@@ -811,7 +1189,9 @@ impl State {
             let x = area.x + (area.width - number.full_width()) / 2.0;
             let at = Point { x: x.round(), y: below + ((foot - number.height()) / 2.0).round() };
             let inks = Inks::new(types, *palette);
-            Painter { engine, types, inks: &inks, band: (f32::MIN, f32::MAX), spelt: true, out }
+            // The number is of the sheet and not of the document, so it is part of nothing.
+            let band = (f32::MIN, f32::MAX);
+            Painter { engine, types, inks: &inks, band, spelt: true, part: None, numbers, loaded, out }
                 .glyphs(number, &label, at);
         }
     }
@@ -826,6 +1206,11 @@ impl State {
         pages.sheets.partition_point(|sheet| sheet.first <= (at, line)).checked_sub(1)
     }
 
+    fn page_blocks(&mut self, pages: &Pages, index: usize) -> Vec<PageBlock> {
+        self.place_all();
+        paginate::blocks(&self.leaves, &self.frames, pages, index)
+    }
+
     fn page_links(&mut self, pages: &Pages, index: usize) -> Vec<PageLink> {
         let mut links = Vec::new();
         let (Some(sheet), Some(origin)) = (pages.sheets.get(index), pages.origin(index)) else { return links };
@@ -833,7 +1218,7 @@ impl State {
         self.place_all();
         for (block, lines) in &sheet.blocks {
             let Some(at) = self.index.get(block).map(|slot| slot.leaf) else { continue };
-            let linked = |words: &Words| !words.links.is_empty();
+            let linked = |words: &Words| !words.links.is_empty() || !words.refs.is_empty();
             if !linked(&self.leaves[at].words) && !self.leaves[at].cells.iter().any(|cell| linked(&cell.words)) {
                 continue;
             }
@@ -841,17 +1226,40 @@ impl State {
             let leaf = &self.leaves[at];
             for part in [Part::Text].into_iter().chain((0..leaf.cells.len()).map(Part::Cell)) {
                 let Some(text) = Text::of(leaf, part) else { continue };
-                for (range, target) in &text.source.links {
+                let out = text.source.links.iter().map(|(range, target)| (range, target.clone(), None));
+                // A reference leads to its figure when it names one. Each link and reference is numbered as
+                // painting numbers them, which names its text on the sheet.
+                let places =
+                    text.source.refs.iter().map(|(range, target)| (range, String::new(), self.leads_to(pages, target)));
+                let led = |(_, target, place): &(_, String, Option<_>)| !target.is_empty() || place.is_some();
+                let mut found: Vec<_> = out.chain(places).enumerate().filter(|(_, link)| led(link)).collect();
+                found.sort_by_key(|(_, (range, ..))| range.start);
+                for (which, (range, target, place)) in found {
+                    let name = ((at as u64 + 1) << PARTS) | leaf::link(part, which);
+                    let named = (leaf.role != Role::Code).then_some(name);
                     leaf::stretches(text.set, range, &Shifts::default(), |line, part_of| {
                         if lines.contains(&leaf.line_of(part, line)) {
                             let (x, y) = (origin.x + text.at.x + part_of.x, origin.y + text.at.y + part_of.y);
-                            links.push(PageLink { rect: Rect { x, y, ..part_of }, target: target.clone() });
+                            let (rect, target) = (Rect { x, y, ..part_of }, target.clone());
+                            links.push(PageLink { rect, target, place, part: named });
                         }
                     });
                 }
             }
         }
         links
+    }
+
+    /// Where a sheet shows the figure that a reference to `target` reads as: the sheet, and the top left of
+    /// the figure's picture on it. `None` for a block with no number, which no reference names.
+    fn leads_to(&self, pages: &Pages, target: &BlockId) -> Option<(usize, Point)> {
+        let at = self.index.get(target).filter(|_| self.numbers.contains_key(target))?.leaf;
+        let leaf = &self.leaves[at];
+        let page = pages.sheets.partition_point(|sheet| sheet.first <= (at, 0)).checked_sub(1)?;
+        let origin = pages.origin(page)?;
+        // A figure's picture stands where its caption's lines do. A gallery starts at the column's edge.
+        let across = leaf.pictures.first().filter(|_| leaf.what == What::Figure).map_or(0.0, |picture| picture.rect.x);
+        Some((page, Point { x: origin.x + leaf.x + across, y: origin.y + leaf.y }))
     }
 
     fn outline(&mut self, pages: &Pages) -> Vec<Heading> {
@@ -871,13 +1279,21 @@ impl State {
         headings
     }
 
-    fn hit(&mut self, point: Point) -> Option<Pos> {
+    /// The position at a point, among the leaves of a stretch of the column if `band` gives one.
+    fn hit(&mut self, point: Point, band: Option<(f32, f32)>) -> Option<Pos> {
         self.clock += 1;
         self.place_all();
-        let at = self.leaves.partition_point(|leaf| leaf.y + leaf.height < point.y);
+        let (first, end) = match band {
+            Some((top, bottom)) => {
+                let first = self.leaves.partition_point(|leaf| leaf.span().1 <= top);
+                (first, self.leaves.partition_point(|leaf| leaf.span().0 < bottom).max(first))
+            }
+            None => (0, self.leaves.len()),
+        };
+        let at = first + self.leaves[first..end].partition_point(|leaf| leaf.y + leaf.height < point.y);
         // The nearest leaf that a position can be in, above or below.
-        let below = self.leaves.get(at..).and_then(|rest| rest.iter().position(Leaf::holds)).map(|skip| at + skip);
-        let above = self.leaves[..at.min(self.leaves.len())].iter().rposition(Leaf::holds);
+        let below = self.leaves[at..end].iter().position(Leaf::holds).map(|skip| at + skip);
+        let above = self.leaves[first..at].iter().rposition(Leaf::holds).map(|back| first + back);
         let at = match (above, below) {
             (Some(above), Some(below)) => {
                 let gap_above = point.y - (self.leaves[above].y + self.leaves[above].height);
@@ -912,19 +1328,23 @@ impl State {
             let x = if pos.offset == 0 { picture.x } else { picture.x + picture.width - theme::CARET };
             return Some(Rect::new(leaf.x + x, leaf.y + picture.y, theme::CARET, picture.height));
         }
+        if leaf.what == What::Empty {
+            return Some(Rect::new(leaf.x, leaf.y, theme::CARET, leaf.height));
+        }
         Some(leaf::caret(&Text::of(leaf, part)?, &shifts, pos.offset))
     }
 
     fn formula_rect(&mut self, pos: &Pos) -> Option<Rect> {
         let Slot { leaf: at, part } = *self.index.get(&pos.block)?;
+        let (_, source) = self.leaves[at].formula(part, pos.offset)?;
         self.clock += 1;
         self.lay(at);
         self.place(at);
         let shifts = self.shifts(at, part);
         let leaf = &self.leaves[at];
-        let found = leaf::formula_at(&Text::of(leaf, part)?, &shifts, pos.offset);
-        // A formula block with nothing typeset in it still has its place.
+        // A formula block with nothing written in it still has its place.
         let whole = || Rect::new(leaf.x, leaf.y, leaf.width, leaf.height);
+        let found = leaf::formula_at(&Text::of(leaf, part)?, &shifts, &source);
         found.or_else(|| (leaf.what == What::Formula).then(whole))
     }
 
@@ -949,6 +1369,25 @@ impl State {
         let text = leaf.laid.as_ref().map_or(0.0, |laid| laid.text.layout.height());
         let caption = on_page(Rect::new(0.0, leaf.lead, leaf.width, text));
         Some(FigureBox { image, caption, badge: leaf::badge(image).filter(|_| remote) })
+    }
+
+    fn linked(&mut self, viewport: Rect) -> Vec<(BlockId, Rect)> {
+        let (first, end) = self.show(viewport.y, viewport.y + viewport.height);
+        let mut found = Vec::new();
+        for leaf in &self.leaves[first..end] {
+            let links = leaf.pictures.iter().filter(|picture| picture.asset.is_none());
+            found.extend(links.filter_map(|picture| {
+                let image = Rect { x: leaf.x + picture.rect.x, y: leaf.y + picture.rect.y, ..picture.rect };
+                Some((picture.id.clone(), leaf::badge(image)?))
+            }));
+        }
+        found
+    }
+
+    fn code_boxes(&mut self, viewport: Rect) -> Vec<(BlockId, Rect)> {
+        let (first, end) = self.show(viewport.y, viewport.y + viewport.height);
+        let coded = self.leaves[first..end].iter().filter(|leaf| matches!(leaf.kind, Some(BlockKind::Code { .. })));
+        coded.filter_map(|leaf| Some((leaf.id.clone()?, leaf::boxed(leaf)))).collect()
     }
 
     fn selection(&mut self, selection: &Selection, viewport: Option<Rect>) -> Vec<Rect> {
@@ -1017,6 +1456,7 @@ impl State {
         let leaf = &self.leaves[at];
         let rows = leaf.pictures.last().map_or(0, |last| last.row + 1);
         let part = match leaf.what {
+            What::Empty => Part::Whole,
             What::Row => leaf.cell_at(x).map(Part::Cell)?,
             // From above a gallery is entered by its first row, and from below by its caption.
             What::Gallery if rows > 0 && (down || leaf.caption.is_none()) => {
