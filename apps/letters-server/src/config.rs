@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use letters_trust::Source;
 use serde::Deserialize;
@@ -199,7 +199,8 @@ impl Config {
                     "two spaces are called \"{name}\", or names that differ only in case and signs"
                 )));
             }
-            if !space.path.starts_with('/') {
+            // On Windows a root has a drive before it, so the system's own reading of the path decides.
+            if !Path::new(&space.path).has_root() {
                 return Err(ConfigError(format!("the path of the space \"{name}\" must start at the root, with a /")));
             }
             let plain = space.path.replace(USERNAME, "");

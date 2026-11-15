@@ -30,10 +30,10 @@ fn the_clients_secret_is_read_from_the_settings_or_from_a_file() {
     let cases = [
         (String::new(), Ok(None)),
         ("client_secret = \"inline\"".to_owned(), Ok(Some("inline"))),
-        (format!("client_secret_file = \"{}\"", file.display()), Ok(Some("from a file"))),
+        (format!("client_secret_file = '{}'", file.display()), Ok(Some("from a file"))),
         ("client_secret_file = \"/nowhere/secret\"".to_owned(), Err("client_secret_file")),
         ("client_secret = \"\"".to_owned(), Err("nothing in it")),
-        (format!("client_secret = \"a\"\nclient_secret_file = \"{}\"", file.display()), Err("both")),
+        (format!("client_secret = \"a\"\nclient_secret_file = '{}'", file.display()), Err("both")),
     ];
     for (setting, expected) in cases {
         let line = "client_id = \"letters\"";
@@ -61,8 +61,8 @@ fn settings_that_cannot_be_run_with_say_why() {
         ("client_id = \"letters\"", "client_id = \"letters\"\nscopes = [\"profile\"]", "openid"),
         ("name = \"Family\"", "name = \"home\"", "two spaces"),
         ("name = \"Family\"", "name = \"!!\"", "letter"),
-        ("path = \"/srv/letters/family\"", "path = \"family\"", "root"),
-        ("path = \"/srv/letters/family\"", "path = \"/srv/{group}/family\"", "braces"),
+        ("path = '/srv/letters/family'", "path = \"family\"", "root"),
+        ("path = '/srv/letters/family'", "path = \"/srv/{group}/family\"", "braces"),
         ("editors = [\"family\"]\ncommenters = [\"reviewers\"]\nreaders = [\"friends\"]", "", "nobody"),
     ];
     for (from, to, word) in cases {
@@ -75,7 +75,7 @@ fn settings_that_cannot_be_run_with_say_why() {
     }
     let personal = with(|sound| {
         sound.replace(
-            "path = \"/srv/letters/home/{username}\"",
+            "path = '/srv/letters/home/{username}'",
             "path = \"/srv/letters/home/{username}\"\nreaders = [\"x\"]",
         )
     });
