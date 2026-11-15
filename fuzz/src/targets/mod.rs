@@ -14,6 +14,7 @@ mod layout;
 mod markdown;
 mod maths;
 mod model;
+mod page;
 mod save;
 mod spell;
 mod trust;
@@ -106,6 +107,12 @@ pub const TARGETS: &[Target] = &[
         about: "writers who have seen the same edits show the same document, whatever the edits and their order",
         run: model::run,
         seeds: model::seeds,
+    },
+    Target {
+        name: "page",
+        about: "whatever a fetched page holds, what a link preview reads of it is short plain text",
+        run: page::run,
+        seeds: page::seeds,
     },
     Target {
         name: "save",
