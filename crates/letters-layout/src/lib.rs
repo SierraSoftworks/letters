@@ -337,17 +337,6 @@ impl DocLayout {
         self.state.get_mut().engine.lists.take()
     }
 
-    /// Says that the maths engine is here, for a shell that hands it over once a document shows maths: see
-    /// [`letters_math::provide_engine`]. Until then a formula shows as its source, as one does at the
-    /// caret. The blocks with such a formula are laid out again all at once, as [`Self::add_fonts`] does,
-    /// so a line moves once and not for each formula. Returns whether there are any. Where the engine is
-    /// built in there never are.
-    pub fn maths_arrived(&mut self) -> bool {
-        let state = self.state.get_mut();
-        state.engine.retrace();
-        state.redo()
-    }
-
     /// Says that the picture a link leads to is there to draw, with its size in pixels, or with `None` that
     /// it no longer is. A figure that is still a link shows as a frame with its host and a cloud, since
     /// whether to fetch it is the shell's to decide. Once loaded it is drawn as [`Item::Image`] with the
