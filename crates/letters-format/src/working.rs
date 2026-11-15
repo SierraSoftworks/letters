@@ -212,14 +212,22 @@ impl WorkingCopy {
     /// read. Fails with [`Error::Unmerged`] when its history shares nothing with this one, or when it holds a
     /// style or notes this build cannot read, and with [`Error::History`] when its history cannot be read.
     pub fn merge_from<R: Read + Seek>(&mut self, other: &mut Archive<R>) -> Result<Change, Error> {
+        let theirs = Theirs::read(other, self.model.replica(), false, self.wary)?;
+        self.merge_read(Reading { theirs, file: other })
+    }
+
+    /// Merges a file that was [read](Reading::of) before, as [`Self::merge_from`] merges one it reads
+    /// itself, and fails as that does.
+    pub fn merge_read<R: Read + Seek>(&mut self, read: Reading<'_, R>) -> Result<Change, Error> {
+        let Reading { theirs, file } = read;
         // A style or notes that cannot be read would be left behind, in a copy the user may then throw away.
-        let change = self.take_in(Theirs::read(other, self.model.replica(), false, self.wary)?, false)?;
+        let change = self.take_in(theirs, false)?;
         // The save writes over this document's own file, so what only the other file holds comes into memory.
         let core = |name: &str| [DOCUMENT, STYLE, NOTES].contains(&name) || name.starts_with(HISTORY);
-        let names: Vec<String> = other.names().filter(|name| !core(name)).map(str::to_owned).collect();
+        let names: Vec<String> = file.names().filter(|name| !core(name)).map(str::to_owned).collect();
         for name in names {
             if !self.entries.contains_key(&name) && !self.seen.contains_key(&name) {
-                let bytes = other.read(&name)?.ok_or_else(|| Error::Missing(name.clone()))?;
+                let bytes = file.read(&name)?.ok_or_else(|| Error::Missing(name.clone()))?;
                 self.entries.insert(name, bytes);
             }
         }
@@ -445,6 +453,26 @@ impl Replica for WorkingCopy {
         }
         self.unread_notes &= !written.entries.contains_key(NOTES);
         self.history = written.entries.remove(OPLOG);
+    }
+}
+
+/// Another file of a document, read to be merged: the half of [`WorkingCopy::merge_from`] that needs no
+/// working copy, which takes a while when the history is long. A host that many write through reads the
+/// file before it holds the document, and holds the document for [`WorkingCopy::merge_read`] alone.
+pub struct Reading<'a, R> {
+    theirs: Theirs,
+    /// For the entries only this file holds, which are read as they are merged.
+    file: &'a mut Archive<R>,
+}
+
+impl<'a, R: Read + Seek> Reading<'a, R> {
+    /// Reads `file` as a stranger's, so that a [wary](WorkingCopy::wary) copy can merge it: its history is
+    /// read with [`Model::check`] before a model loads it. Fails with [`Error::History`] when the history
+    /// cannot be read.
+    ///
+    /// Any `replica` will do, the one that merges the file too: nothing is written under it.
+    pub fn of(file: &'a mut Archive<R>, replica: ReplicaId) -> Result<Self, Error> {
+        Ok(Self { theirs: Theirs::read(file, replica, false, true)?, file })
     }
 }
 

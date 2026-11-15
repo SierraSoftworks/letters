@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use letters_api::{Action, Code, Role};
-use letters_format::{ASSETS, Archive, Error, Files, Save, Saved, Unsaved, is_journal};
+use letters_format::{ASSETS, Archive, Error, Files, Reading, Save, Saved, Unsaved, is_journal};
 use letters_sync::{Access, ClientMessage, LOOK_EVERY, Outbound, Refusal as Ended, Room, SessionId};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
@@ -379,28 +379,35 @@ impl Rooms {
         done
     }
 
-    /// Merges `theirs`, another copy of the document at `place`, into it. A room that is open for the file
-    /// takes the copy in itself and saves at once: the copy is read once, and whoever has the document
-    /// open is told what it brought. With no room, or one that is not saving, `beside` merges the copy
-    /// into the file as any other writer of its folder would.
-    pub fn merge<R: Read + Seek>(
+    /// Merges `theirs`, another copy of the document `id`, into it at `place`. A room that is open for the
+    /// file takes the copy in itself and saves at once: whoever has the document open is told what the
+    /// copy brought. With no room, or one that is not saving, `beside` merges the copy into the file as
+    /// any other writer of its folder would.
+    ///
+    /// The copy was read before this, with no room held: a long history takes a while to read, and
+    /// people write on meanwhile. A room that is another document's by now is left alone, and the answer
+    /// is [`moved`](crate::library::moved).
+    pub fn merge<'a, R: Read + Seek>(
         &self,
         root: &Root,
         place: &Place,
-        theirs: &mut Archive<R>,
-        beside: impl FnOnce(&mut Archive<R>) -> Answer<()>,
+        id: &str,
+        theirs: Reading<'a, R>,
+        beside: impl FnOnce(Reading<'a, R>) -> Answer<()>,
     ) -> Answer<()> {
+        let mut theirs = Some(theirs);
         let open = lock(&self.open).get(&key(root, place)).cloned();
         if let Some(open) = open {
             let mut state = lock(&open.state);
             let hosted = matches!(*state, State::Open(_));
-            match open.act(self, &mut state, |hosted, now| hosted.merge(theirs, now)) {
+            match open.act(self, &mut state, |hosted, now| hosted.merge(id, &mut theirs, now)) {
                 Some(Some(merged)) => return merged,
                 // The room failed at the copy and was closed, with its file as it was.
                 None if hosted => return Err(Refusal::invalid(crate::library::HARMFUL)),
                 _ => {}
             }
         }
+        let theirs = theirs.expect("a room that took the copy answered for it");
         self.around(root, place, || beside(theirs))
     }
 
@@ -668,14 +675,19 @@ impl Hosted {
         open.wake.notify_one();
     }
 
-    /// Merges another copy of the document into what the room holds, and saves at once. `None` when the
-    /// room is not saving to its file, where what the copy brought would be held in memory alone.
-    fn merge<R: Read + Seek>(&mut self, theirs: &mut Archive<R>, now: u64) -> Option<Answer<()>> {
+    /// Merges another copy of the document `id` into what the room holds, and saves at once. `None`, with
+    /// the copy left to the caller, when the room is not saving to its file, where what the copy brought
+    /// would be held in memory alone.
+    fn merge<R: Read + Seek>(&mut self, id: &str, theirs: &mut Option<Reading<'_, R>>, now: u64) -> Option<Answer<()>> {
         if self.parked {
             return None;
         }
         self.folder(now)?;
-        if let Err(error) = self.room.merge_from(theirs, &mut self.state, now) {
+        // The copy was read before the room was held, and its document may have left this place since.
+        if self.room.copy().id != id {
+            return Some(Err(crate::library::moved()));
+        }
+        if let Err(error) = self.room.merge_read(theirs.take()?, &mut self.state, now) {
             return Some(Err(crate::library::unmerged(error)));
         }
         // A save that fails is tried again by the room, which holds what the copy brought.

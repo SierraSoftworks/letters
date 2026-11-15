@@ -6,7 +6,7 @@ mod common;
 use std::io::Cursor;
 
 use common::{CREATED, ID, NAME, World, doc, find, note, open_file, save_file, texts, typed};
-use letters_format::{Archive, Error, Files, OPLOG, Replica, Saved, WorkingCopy, hash};
+use letters_format::{Archive, Error, Files, OPLOG, Reading, Replica, Saved, WorkingCopy, hash};
 use letters_model::{Block, BlockKind, Document, Note, NoteKind, Op, ReplicaId, Style};
 use letters_sync::{Access, LOOK_EVERY, Link, Progress, Role, SAVE_AFTER, SAVE_WITHIN};
 
@@ -156,20 +156,28 @@ fn a_copy_handed_to_the_room_reaches_every_session_and_the_file_at_the_next_save
     let line = Block::text("z", BlockKind::Paragraph, "Something else");
     stranger.apply([Op::InsertBlock { parent: None, index: 0, block: line }]).unwrap();
 
+    // Each is read before the room is held, and Ada writes on meanwhile.
+    let (mut stranger, mut away) = (handed(&stranger), handed(&away));
+    let read = |file| Reading::of(file, ReplicaId::from(902)).unwrap();
+    let (stranger, away) = (read(&mut stranger), read(&mut away));
+    world.edit(ada, [typed("p", 0, "Oh. ")]);
+    world.settle();
+    let sent = [ada, ben].map(|device| world.devices[device].edits_sent());
+
     let room = world.room.as_mut().expect("the room is open");
-    let refused = room.merge_from(&mut handed(&stranger), &mut world.state, world.now);
+    let refused = room.merge_read(stranger, &mut world.state, world.now);
     assert!(matches!(refused, Err(Error::Unmerged)), "{refused:?}");
-    room.merge_from(&mut handed(&away), &mut world.state, world.now).unwrap();
+    room.merge_read(away, &mut world.state, world.now).unwrap();
     assert!(matches!(world.flush(), Ok(Saved::Written)));
     world.settle();
 
-    for device in [ada, ben] {
+    for (device, sent) in [ada, ben].into_iter().zip(sent) {
         let device = &world.devices[device];
-        assert_eq!(texts(device.document()), ["Hello world", "Second opinion"], "{}", device.name);
+        assert_eq!(texts(device.document()), ["Oh. Hello world", "Second opinion"], "{}", device.name);
         assert!(find(&device.notes, "n9").is_some(), "{}", device.name);
-        assert_eq!(device.edits_sent(), 0, "{} sent the news back", device.name);
+        assert_eq!(device.edits_sent(), sent, "{} sent the news back", device.name);
     }
-    assert_eq!(on_disk(&world), ["Hello world", "Second opinion"]);
+    assert_eq!(on_disk(&world), ["Oh. Hello world", "Second opinion"]);
     assert!(copies(&world).is_empty());
 }
 

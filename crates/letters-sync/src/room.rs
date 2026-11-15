@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Seek};
 use std::mem;
 
-use letters_format::{ASSETS, Archive, Error, Files, Journal, Save, Saved, Stamp, WorkingCopy, hash};
+use letters_format::{ASSETS, Error, Files, Journal, Reading, Save, Saved, Stamp, WorkingCopy, hash};
 use letters_model::{Extent, Notes, Revision, Style};
 
 use crate::access::{Access, Refusal, Role, comments};
@@ -291,17 +291,18 @@ impl Room {
     /// with nothing of it in the journal: the host calls [`Room::flush`] at once, and says only then that
     /// the copy was merged.
     ///
-    /// The copy is read once. A host that merged it into the file instead would have the room read the
-    /// whole file back. Fails as [`WorkingCopy::merge_from`] does.
-    pub fn merge_from<R: Read + Seek>(
+    /// The copy is read once, and before the host holds the room: sessions write on while a long history
+    /// is read. A host that merged it into the file instead would have the room read the whole file back.
+    /// Fails as [`WorkingCopy::merge_read`] does.
+    pub fn merge_read<R: Read + Seek>(
         &mut self,
-        other: &mut Archive<R>,
+        other: Reading<'_, R>,
         state: &mut impl Files,
         now: u64,
     ) -> Result<(), Error> {
         let before = (self.copy.model().extent(), self.copy.notes.clone());
-        let merged = self.copy.merge_from(other);
-        // A copy that broke off half read may have brought something in all the same.
+        let merged = self.copy.merge_read(other);
+        // A copy that broke off half merged may have brought something in all the same.
         if merged.is_ok() || self.copy.model().extent() != before.0 {
             self.touch(now);
         }

@@ -6,12 +6,14 @@ mod common;
 use std::io::Cursor;
 use std::time::Duration;
 
-use axum::http::{Method, StatusCode};
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, Method, StatusCode};
 use common::desk::{Desk, settle};
 use common::{Client, Server, texts};
 use letters_api::{Code, Entry, Listing, Move, NewFolder, Rename, Tag, paths};
-use letters_format::{Archive, MIMETYPE, OPLOG, Package, WorkingCopy, hash};
+use letters_format::{Archive, MIMETYPE, OPLOG, Package, Reading, WorkingCopy, hash};
 use letters_model::{Block, BlockKind, Op, Pos, ReplicaId};
+use letters_server::session::Signed;
 use letters_sync::{Link, Refusal, Role};
 
 /// A smallest PNG, by its first bytes.
@@ -242,11 +244,7 @@ async fn a_device_hands_its_whole_file_over_and_nothing_is_replaced() {
     let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
     settle([&mut desk]).await;
     // A device wrote on its own copy of the file while it was away, and someone else wrote here.
-    let was = ada.send(Method::GET, &paths::file(&id), "", Vec::new()).await.body;
-    let mut away = WorkingCopy::open(&mut Archive::open(Cursor::new(was)).unwrap(), ReplicaId::from(9)).unwrap();
-    let first = away.model().doc().blocks[0].id.clone();
-    away.apply([Op::InsertText { at: Pos::new(first, 0), text: "Written away. ".into() }]).unwrap();
-    let theirs = letters_server::library::packed(&away).expect("the copy is a file");
+    let theirs = written_away(&ada, &id).await;
     desk.write("Written here. ");
     settle([&mut desk]).await;
 
@@ -272,6 +270,77 @@ async fn a_device_hands_its_whole_file_over_and_nothing_is_replaced() {
     let text = desk.texts().join("\n");
     assert!(text.contains("Written away.") && text.contains("Written here."), "whoever has it open is told: {text}");
     assert_eq!(on_file(&ada, &id).await, text);
+}
+
+/// A copy of the document `id` that a device wrote "Written away." on, as a file.
+async fn written_away(who: &Client, id: &str) -> Vec<u8> {
+    let was = who.send(Method::GET, &paths::file(id), "", Vec::new()).await.body;
+    let mut away = WorkingCopy::open(&mut Archive::open(Cursor::new(was)).unwrap(), ReplicaId::from(9)).unwrap();
+    let first = away.model().doc().blocks[0].id.clone();
+    away.apply([Op::InsertText { at: Pos::new(first, 0), text: "Written away. ".into() }]).unwrap();
+    letters_server::library::packed(&away).expect("the copy is a file")
+}
+
+/// Who the server takes `who` for.
+fn signed(server: &Server, who: &Client) -> Signed {
+    let mut headers = HeaderMap::new();
+    let token = who.token.as_deref().expect("the person is signed in");
+    headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+    Signed::read(&server.app, &Method::PUT, &headers).expect("the sign-in holds")
+}
+
+/// A copy is read before its document is held, and a long history takes long enough to read for the
+/// document to go elsewhere meanwhile.
+#[tokio::test]
+async fn a_copy_whose_document_left_its_place_while_it_was_read_is_merged_nowhere() {
+    // What becomes of the document between the read and the merge, with a room open where it was or not.
+    for meanwhile in ["renamed", "thrown away", "replaced"] {
+        for open in [false, true] {
+            let what = format!("{meanwhile}, a room open: {open}");
+            let (server, ada, id) = shared(&format!("left-{}-{open}", meanwhile.replace(' ', "-"))).await;
+            let mut desks = Vec::new();
+            if open {
+                desks.push(Desk::open(&server, &ada, &id).await.unwrap());
+            }
+            let theirs = written_away(&ada, &id).await;
+            let found = server.app.locate(&signed(&server, &ada), &id).unwrap();
+            let mut copy = Archive::open(Cursor::new(theirs.clone())).unwrap();
+            let read = Reading::of(&mut copy, ReplicaId::from(10)).unwrap();
+
+            match meanwhile {
+                "thrown away" => ada.post::<()>(&paths::trash(&id), &()).await.unwrap(),
+                _ => drop(ada.post::<Entry>(&paths::rename(&id), &Rename { name: "Scheme".into() }).await.unwrap()),
+            }
+            // Another document where this one was, which the copy is not of.
+            let mut other = None;
+            if meanwhile == "replaced" {
+                let started = ada.start("family", "", "Plan").await.id.unwrap();
+                if open {
+                    desks.push(Desk::open(&server, &ada, &started).await.unwrap());
+                }
+                other = Some(started);
+            }
+            let before = server.scratch.names("family");
+
+            let merged = server.app.merge_read(&found, &id, read);
+            assert_eq!(merged.err().map(|refusal| refusal.code()), Some(Code::Stale), "{what}");
+            assert_eq!(server.scratch.names("family"), before, "{what}: nothing is written where it was");
+            let there = [(meanwhile != "thrown away").then_some(&id), other.as_ref()];
+            for document in there.into_iter().flatten() {
+                assert!(!on_file(&ada, document).await.contains("Written away."), "{what}");
+            }
+
+            // Asked again, the copy finds its document where it is now.
+            let again = ada.send(Method::PUT, &paths::file(&id), MIMETYPE, theirs).await.status;
+            match meanwhile {
+                "thrown away" => assert_eq!(again, StatusCode::NOT_FOUND, "{what}"),
+                _ => {
+                    assert_eq!(again, StatusCode::NO_CONTENT, "{what}");
+                    assert!(on_file(&ada, &id).await.contains("Written away."), "{what}");
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]

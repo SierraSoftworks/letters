@@ -28,7 +28,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 pub use journal::{Journal, Mark, Unsaved, is_journal, journal_name};
 pub use name::{file_name, suggested_name};
 pub use save::{DiskCopy, Files, Replica, Save, Saved, Stamp, conflict_copy_of, save};
-pub use working::{OPLOG, WorkingCopy};
+pub use working::{OPLOG, Reading, WorkingCopy};
 
 /// The media type of a `.let` file, stored in its first entry.
 pub const MIMETYPE: &str = "application/vnd.letters.document+zip";

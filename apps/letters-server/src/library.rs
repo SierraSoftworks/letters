@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Cursor, Read, Seek};
 use std::sync::Mutex;
 
-use letters_format::{Archive, Files, OPLOG, Replica, Save, Saved, WorkingCopy, conflict_copy_of, file_name, hash};
+use letters_format::{
+    Archive, Files, OPLOG, Reading, Replica, Save, Saved, WorkingCopy, conflict_copy_of, file_name, hash,
+};
 use letters_model::{Block, BlockId, BlockKind, Document, Model, NoteKind, Op, ReplicaId, Style};
 use serde::{Deserialize, Serialize};
 
@@ -308,24 +310,35 @@ impl Library {
         bytes.ok_or_else(Refusal::not_found)
     }
 
-    /// Merges `theirs`, another copy of the document at `place`, into its file. Nothing in the file is
+    /// Merges `theirs`, another copy of the document `id`, into its file at `place`. Nothing in the file is
     /// replaced: the two meet as two writers of one folder do, and merging the same copy again changes
     /// nothing.
+    ///
+    /// The copy was read before this, where the document was found then. A file that is not there any
+    /// more, or is another document's, is left alone, and the answer is [`moved`].
     pub fn merge<R: Read + Seek>(
         &self,
         store: &Store,
         root: &Root,
         place: &Place,
-        theirs: &mut Archive<R>,
+        id: &str,
+        theirs: Reading<'_, R>,
         now: u64,
     ) -> Answer<()> {
         let (folder, name) = place.split();
-        let mut folder = root.folder(&folder)?;
-        let mut ours = Archive::open(BufReader::new(folder.open(name)?))?;
-        // Neither file is the server's own writing: the copy's history is checked before it is loaded, and
-        // the file's too, unless the index knows it.
+        let gone = |error: std::io::Error| match Refusal::from(error) {
+            refusal if refusal.code() == Code::NotFound => moved(),
+            refusal => refusal,
+        };
+        let mut folder = root.folder(&folder).map_err(gone)?;
+        let mut ours = Archive::open(BufReader::new(folder.open(name).map_err(gone)?))?;
+        if ours.manifest().id != id {
+            return Err(moved());
+        }
+        // The file is not the server's own writing either: its history is checked before it is loaded,
+        // unless the index knows it.
         let mut copy = opened(store, root, place, &mut ours)?;
-        copy.merge_from(theirs).map_err(unmerged)?;
+        copy.merge_read(theirs).map_err(unmerged)?;
         let (token, day) = (ids::block_id(), ids::rfc3339(now));
         let label = format!("{} server", day.get(..10).unwrap_or(&day));
         let save = Save { name, token: &token, label: &label, attempts: 3 };
@@ -537,6 +550,13 @@ pub(crate) fn unmerged(error: letters_format::Error) -> Refusal {
         letters_format::Error::History(_) => Refusal::invalid(HARMFUL),
         error => error.into(),
     }
+}
+
+/// What a copy is refused with when its document is not where it was found any more: a copy is read
+/// before its document is held, and the document may be moved or thrown away meanwhile. Asked again, the
+/// merge finds the document where it is now.
+pub(crate) fn moved() -> Refusal {
+    Refusal::new(Code::Stale, "The document was moved or deleted while the file was being read. Try again.")
 }
 
 /// What is said of a copy whose history cannot be read, or closed the room that tried it.

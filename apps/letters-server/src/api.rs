@@ -3,6 +3,7 @@
 //! Each address is a thin async wrapper: the work is in plain functions over [`App`], which read folders
 //! and the store and so run where blocking is allowed.
 
+use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -17,12 +18,13 @@ use letters_api::{
     Action, Allows, Code, Entry, EntryKind, Fetch, Listing, Move, NewDocument, NewFolder, Opened, PROTOCOL, Person,
     Preview, Rename, Renewal, Role, Server, Settings, Space, Tag, Token, Trust, paths,
 };
-use letters_format::{ASSETS, MIMETYPE, NOTES, STYLE, file_name};
-use letters_model::{Document, Style};
+use letters_format::{ASSETS, Archive, MIMETYPE, NOTES, Reading, STYLE, file_name};
+use letters_model::{Document, ReplicaId, Style};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::{Answer, Refusal};
+use crate::ids;
 use crate::library::{Row, untitled};
 use crate::session::{Carrier, Reader, Signed};
 use crate::spaces::{EXTENSION, Place, Root, seconds, shown};
@@ -368,6 +370,12 @@ async fn recent(State(app): State<Shared>, who: Signed) -> Answer<Json<Vec<Entry
     blocking(move || app.recent(&who).map(Json)).await
 }
 
+/// Reads a copy that is to be merged into a document, as a stranger's: its history is checked before it
+/// is loaded. The replica only reads, so any id will do for it.
+fn read<R: Read + Seek>(theirs: &mut Archive<R>) -> Answer<Reading<'_, R>> {
+    Reading::of(theirs, ReplicaId::new(&ids::block_id())).map_err(crate::library::unmerged)
+}
+
 /// Everything there is to take away of a document.
 const ALL: Allows = Allows { download: true, copy: true, print: true };
 
@@ -555,13 +563,21 @@ impl App {
     pub fn merge(&self, who: &Signed, id: &str, file: &[u8]) -> Answer<()> {
         let found = self.locate(who, id)?;
         found.must(Role::Editor)?;
-        let mut theirs = letters_format::Archive::open(std::io::Cursor::new(file))?;
+        let mut theirs = Archive::open(std::io::Cursor::new(file))?;
         // A copy made by hand that became a document of its own is not this one any more.
         if theirs.manifest().id != id {
             return Err(Refusal::invalid("That file is of another document."));
         }
-        let beside = |theirs: &mut _| self.library.merge(&self.store, &found.root, &found.place, theirs, self.now());
-        self.rooms.merge(&found.root, &found.place, &mut theirs, beside)
+        self.merge_read(&found, id, read(&mut theirs)?)
+    }
+
+    /// Merges a copy that was read into the document `id`, which was found at `found` before the read:
+    /// through its room when it is open, and into its file otherwise. A long history takes a while to
+    /// read, so the copy is read with nothing held, and the document may have been moved or thrown away
+    /// by now: the copy is then refused, and merged nowhere.
+    pub fn merge_read<R: Read + Seek>(&self, found: &Found, id: &str, theirs: Reading<'_, R>) -> Answer<()> {
+        let beside = |theirs| self.library.merge(&self.store, &found.root, &found.place, id, theirs, self.now());
+        self.rooms.merge(&found.root, &found.place, id, theirs, beside)
     }
 
     /// Merges into the document `id` every conflict copy beside it, through its room when it is open, and
@@ -573,9 +589,7 @@ impl App {
         let mut merged = Vec::new();
         for copy in rows.iter().filter(|row| row.copy_of.as_ref() == Some(&found.place)) {
             let mut theirs = self.library.open(&found.root, &copy.place)?;
-            let beside =
-                |theirs: &mut _| self.library.merge(&self.store, &found.root, &found.place, theirs, self.now());
-            self.rooms.merge(&found.root, &found.place, &mut theirs, beside)?;
+            self.merge_read(&found, id, read(&mut theirs)?)?;
             // Closed before it is moved, which a folder on Windows asks for.
             drop(theirs);
             self.library.trash(&self.store, &found.root, &copy.place, self.now())?;

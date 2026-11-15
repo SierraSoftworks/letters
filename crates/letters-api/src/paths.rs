@@ -73,6 +73,8 @@ pub fn document(id: &str) -> String {
 /// `GET`: the whole `.let` file, pictures and history included, as the server would save it now. `PUT`: a
 /// device's own copy of the document, for work that is too much for the socket. It is merged into the
 /// document and replaces nothing, and may be as large as [`Limits::document`](crate::Limits::document).
+/// A copy is read before it is merged, and [`Code::Stale`](crate::Code::Stale) says the document was
+/// moved or thrown away meanwhile: asked again, the merge finds the document where it is now.
 pub fn file(id: &str) -> String {
     format!("{}/file", document(id))
 }
@@ -94,6 +96,7 @@ pub fn trash(id: &str) -> String {
 
 /// `POST`: merges into the document every conflict copy a sync tool left beside it, and moves each to
 /// its space's trash: the names of the copies it took, as a list. No copy is merged unless this is asked.
+/// Refused as a `PUT` of [`file`] is when the document goes elsewhere meanwhile.
 pub fn merge_conflicts(id: &str) -> String {
     format!("{}/merge-conflicts", document(id))
 }
