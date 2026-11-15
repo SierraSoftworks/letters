@@ -13,6 +13,7 @@ pub mod color;
 mod copying;
 mod describe;
 mod element;
+mod figures;
 mod folders;
 mod highlight;
 pub mod icon;

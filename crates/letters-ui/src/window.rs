@@ -26,6 +26,7 @@ use crate::color::{fade, resolve, same};
 use crate::copying::{self, Copy, CopyFormat, Copying};
 use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
+use crate::figures::{self, Grip, Moving, Resizing};
 use crate::highlight;
 use crate::icon::{self, Icon};
 use crate::importing::{Import, ImportOffer, Importing};
@@ -590,6 +591,7 @@ pub struct EditorApp {
     /// The bar that says where pictures held over the page would land, in the layout's coordinates.
     drop: Option<Rect>,
     linked: Linked,
+    grip: Grip,
     /// What the bar says of a write that was just done, as where the document was first saved, and since
     /// when, once a frame has said so.
     note: Option<(String, Option<u64>)>,
@@ -667,6 +669,7 @@ impl EditorApp {
             wanted: HashSet::new(),
             drop: None,
             linked: Linked::default(),
+            grip: Grip::default(),
             note: None,
             naming: false,
             renaming: None,
@@ -880,6 +883,63 @@ impl EditorApp {
         Some((figure, place.badge.is_some_and(|badge| pictures::pressed(badge, at))))
     }
 
+    /// A point of the page area as the layout counts it.
+    fn in_layout(&self, at: Point) -> Point {
+        Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP }
+    }
+
+    /// The gallery a picture is one of.
+    fn gallery_of(&self, figure: &BlockId) -> Option<&Block> {
+        let holds = |block: &&Block| {
+            let gallery = matches!(block.kind, BlockKind::Gallery { .. });
+            gallery && block.body.blocks().iter().any(|part| part.id == *figure)
+        };
+        self.editor.doc().walk().find(holds)
+    }
+
+    /// The selected picture and its place, when it stands alone. One of a gallery takes its size from its
+    /// row, so it has no corners to be resized by.
+    fn lone_picture(&self) -> Option<(BlockId, Rect)> {
+        let figure = self.editor.picture().filter(|figure| self.gallery_of(figure).is_none())?;
+        Some((figure.clone(), self.layout.figure(figure)?.image))
+    }
+
+    /// Where the picture that is carried would land if it were let go at a point of the page area, and the
+    /// bar that says so. Nowhere when that is where it is.
+    fn carried_to(&self, at: Point) -> Option<(Spot, Option<Rect>)> {
+        let moved = &self.grip.moving.as_ref().filter(|moving| moving.carried().is_some())?.figure;
+        let alone = self.gallery_of(moved).is_none();
+        self.spot(at).filter(|(spot, _)| match spot {
+            Spot::Beside { figure, .. } => figure != moved,
+            // A picture of a gallery leaves it for a line of its own.
+            Spot::Line { block, .. } => !alone || block != moved,
+        })
+    }
+
+    /// Draws a picture small where the pointer carries it, in the page area.
+    fn carry(&self, image: Rect, at: Point, out: &mut DisplayList) {
+        let (rect, by) = figures::carried(image, at);
+        let color = |ink| resolve(ink, self.scheme, 1.0);
+        let radius = tokens::RADIUS_SM;
+        for shadow in tokens::SHADOW_OVERLAY {
+            let offset = Point { x: shadow.x, y: shadow.y };
+            out.push(Item::Shadow { rect, color: color(shadow.color), blur: shadow.blur, offset, radius });
+        }
+        // The picture is what the layout paints where the figure is, made small.
+        let mut picture = DisplayList::default();
+        self.layout.paint(image, &mut picture);
+        pictures::awaited(&self.images, self.scheme, &mut picture);
+        out.push(Item::PushClip { rect, radius });
+        out.push(Item::Fill { rect, color: self.palette.page, radius: 0.0 });
+        let first = out.items.len();
+        out.items.extend(picture.items);
+        out.translate(first, Point { x: -image.x, y: -image.y });
+        out.scale(first, by);
+        out.translate(first, Point { x: rect.x, y: rect.y });
+        out.push(Item::PopClip);
+        out.push(Item::Stroke { rect, color: color(tokens::SURFACE), width: 2.0, radius });
+    }
+
     /// Opens the menu on a linked picture's cloud, and puts away what else hangs from the page.
     fn link_menu(&mut self, figure: BlockId) {
         (self.link, self.spelling.fix) = (None, None);
@@ -978,6 +1038,10 @@ impl EditorApp {
             self.unpoint();
             self.highlight((!change.structure).then_some(&change.blocks));
             self.tell_links((!change.structure).then_some(&change.blocks));
+            // A picture that was held may be gone, or another size.
+            if self.grip.release() {
+                self.drop = None;
+            }
             let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
             self.spelling.edited(change, self.editor.doc(), caret, &mut self.layout);
         }
@@ -1121,7 +1185,12 @@ impl EditorApp {
         let linked = self.references.rest().and_then(|at| self.linked_at(at));
         // Each is taken, whichever changed.
         let clouded = self.linked.point(linked);
-        self.references.point(found) || copy || clouded
+        let corner = self.references.rest().filter(|_| !self.hung()).and_then(|at| {
+            let (_, image) = self.lone_picture()?;
+            figures::corner_at(image, self.in_layout(at))
+        });
+        let gripped = std::mem::replace(&mut self.grip.over, corner) != corner;
+        self.references.point(found) || copy || clouded || gripped
     }
 
     /// Forgets where the pointer rests until it next moves, as when the person goes on writing.
@@ -1161,6 +1230,15 @@ impl EditorApp {
                     self.dragging = false;
                     return self.references.press(None);
                 }
+                // A press on a corner of the selected picture takes hold of it.
+                let spot = self.in_layout(at);
+                if let Some((figure, image)) = self.lone_picture()
+                    && let Some(corner) = figures::corner_at(image, spot)
+                {
+                    self.grip.resizing = Some(Resizing::start(figure, image, corner, spot));
+                    self.dragging = false;
+                    return self.references.press(None);
+                }
                 // A press that stays on a reference follows it. Any other press is the caret's alone.
                 let pressed = self.reference(at).filter(|_| clicks == 1 && !mods.shift);
                 self.references.press(pressed.map(|reference| (reference, at)));
@@ -1177,10 +1255,13 @@ impl EditorApp {
                 if let Some(figure) = figure.filter(|_| !mods.shift) {
                     self.editor.select_picture(&head.block);
                     self.dragging = false;
-                    // The cloud on a picture that is still a link opens its menu.
+                    // The cloud on a picture that is still a link opens its menu. From anywhere else on it
+                    // the picture can be carried off.
                     let cloud = figure.badge.is_some_and(|badge| pictures::pressed(badge, on_page));
                     if cloud && self.link_of(&head.block).is_some() {
                         self.link_menu(head.block);
+                    } else {
+                        self.grip.moving = Some(Moving::start(head.block, at));
                     }
                     return self.reveal();
                 }
@@ -1194,6 +1275,32 @@ impl EditorApp {
                     1 => self.reveal(),
                     2 => self.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform)),
                     _ => self.edit(platform, |editor, platform| editor.run(Command::SelectBlock, platform)),
+                }
+            }
+            Pointer::Drag { at } if self.grip.resizing.is_some() => {
+                let (spot, widest) = (self.in_layout(at), self.column.1);
+                if let Some(resizing) = &mut self.grip.resizing {
+                    resizing.drag(spot, widest);
+                }
+            }
+            Pointer::Drag { at } if self.grip.moving.is_some() => {
+                if self.grip.moving.as_mut().is_some_and(|moving| moving.drag(at, DRAG_SLOP)) {
+                    self.drop = self.carried_to(at).and_then(|(_, bar)| bar);
+                }
+            }
+            Pointer::Up { .. } if self.grip.resizing.is_some() => {
+                let resized =
+                    self.grip.resizing.take().filter(|resizing| self.editor.picture() == Some(&resizing.figure));
+                if let Some((width, height)) = resized.and_then(|resizing| resizing.size()) {
+                    let size = Command::ResizeFigure { width: width / PT, height: height / PT };
+                    self.edit(platform, |editor, platform| editor.run(size, platform));
+                }
+            }
+            Pointer::Up { at } if self.grip.moving.is_some() => {
+                let spot = self.carried_to(at).map(|(spot, _)| spot);
+                (self.grip.moving, self.drop) = (None, None);
+                if let Some(spot) = spot {
+                    self.edit(platform, |editor, platform| editor.run(Command::MoveFigure(spot), platform));
                 }
             }
             Pointer::Drag { at } if self.dragging => {
@@ -1431,6 +1538,19 @@ impl EditorApp {
             let rect = Rect::new(image.x - RING, image.y - RING, image.width + 2.0 * RING, image.height + 2.0 * RING);
             Item::Stroke { rect, color: ring, width: 2.0, radius: 2.0 }
         }));
+        // A selected picture that stands alone is resized by its corners, which are drawn as its ring is.
+        let accent = self.accent.base;
+        match (&self.grip.resizing, self.lone_picture()) {
+            (Some(resizing), _) => resizing.paint(accent, self.scheme, &mut list),
+            (None, Some((_, image))) => figures::handles(image, accent, self.scheme, &mut list),
+            (None, None) => {}
+        }
+        // A picture that is carried is faint where it was.
+        let carried = self.grip.moving.as_ref().and_then(|moving| Some((moving.carried()?, &moving.figure)));
+        let carried = carried.and_then(|(at, figure)| Some((at, self.layout.figure(figure)?.image)));
+        if let Some((_, image)) = carried {
+            list.items.push(fill(image, Color { a: 178, ..self.palette.page }));
+        }
         // A picture that is still a link has its cloud on a chip while it is selected or under the pointer.
         for (figure, lit) in self.linked.clouds(self.editor.picture()) {
             let badge = self.layout.figure(figure).and_then(|place| place.badge);
@@ -1449,6 +1569,9 @@ impl EditorApp {
         }
         let mut over = DisplayList::default();
         self.previewed = self.preview(origin, room, &mut over);
+        if let Some((at, image)) = carried {
+            self.carry(image, at, &mut over);
+        }
 
         let written = sheet.is_none() && self.editor.picture().is_none();
         let caret = selection.filter(|_| written).and_then(|selection| self.layout.caret(&selection.head));
@@ -1522,7 +1645,11 @@ impl EditorApp {
         // A press on a reference follows it, one on a copy button copies and one on a cloud opens its menu,
         // which the pointer's shape says.
         let pressable = self.references.pointed().is_some() || self.code_copy.pointed() || self.linked.on_cloud();
-        if pressable { element.cursor(Cursor::Pointer) } else { element }
+        match self.grip.corner() {
+            Some(corner) => element.cursor(Cursor::Resize(figures::edge(corner))),
+            None if pressable => element.cursor(Cursor::Pointer),
+            None => element,
+        }
     }
 
     /// Draws the figure of the reference under the pointer small beside it, when it is out of view. `origin`
@@ -2380,6 +2507,11 @@ impl App for EditorApp {
     }
 
     fn key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        // Escape lets go of a picture held by a corner or carried, which stays as it was.
+        if event.key == Key::Escape && self.grip.release() {
+            self.drop = None;
+            return true;
+        }
         if self.insert_key(event, platform) || self.refer_key(event, platform) || self.list_key(event, platform) {
             return true;
         }

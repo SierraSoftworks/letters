@@ -2704,3 +2704,138 @@ fn an_embedded_picture_is_the_documents_own_and_one_that_cannot_be_kept_stays_a_
         "the picture is asked for as any of the document's"
     );
 }
+
+/// The size a figure is kept at, in points.
+fn size(window: &Harness, id: &str) -> (f32, f32) {
+    match window.editor().doc().block(&id.into()).map(|block| &block.kind) {
+        Some(BlockKind::Figure { width, height, .. }) => (*width, *height),
+        kind => panic!("no figure: {kind:?}"),
+    }
+}
+
+/// The middle of a place on the page.
+fn middle(place: Rect) -> Point {
+    Point { x: place.x + place.width / 2.0, y: place.y + place.height / 2.0 }
+}
+
+/// A point just outside a corner of a picture, where its handle is.
+fn corner(place: Rect, right: bool, bottom: bool) -> Point {
+    let x = if right { place.x + place.width + 2.0 } else { place.x - 2.0 };
+    Point { x, y: if bottom { place.y + place.height + 2.0 } else { place.y - 2.0 } }
+}
+
+#[test]
+fn a_selected_picture_is_resized_by_a_corner_and_keeps_its_shape() {
+    // The corner taken hold of, as whether it is on the right and at the bottom, how far it is dragged, and
+    // the width in points the picture has then. It starts 300 points wide and half as tall.
+    let cases = [
+        ((true, true), (-100.0, -50.0), 225.0),
+        ((false, false), (-40.0, -20.0), 330.0),
+        ((true, false), (-200.0, 0.0), 150.0),
+        ((true, true), (0.0, 0.0), 300.0),
+        // No wider than the text.
+        ((true, true), (2000.0, 0.0), f32::INFINITY),
+    ];
+    for ((right, bottom), (across, down), width) in cases {
+        let mut window = illustrated();
+        let place = picture(&mut window).0;
+        let from = corner(place, right, bottom);
+        let to = Point { x: from.x + across, y: from.y + down };
+        let page = window.ui().style().page.clone();
+        let width = width.min(page.width - page.margin_left - page.margin_right);
+
+        window.press_at(from).release_at(to).advance(1000);
+        assert_eq!(size(&window, "g"), (300.0, 150.0), "a picture that is not selected has no corners");
+        window.click_at(middle(place)).advance(1000).press_at(from).release_at(to);
+        let (wide, high) = size(&window, "g");
+        assert!((wide - width).abs() < 1.5 && (high - wide / 2.0).abs() < 1.0, "{wide} by {high}, for {width}");
+        assert_eq!(window.editor().picture().map(|figure| figure.as_str()), Some("g"), "it stays selected");
+    }
+}
+
+#[test]
+fn a_picture_of_a_gallery_keeps_the_size_its_row_gives_it() {
+    let mut window = illustrated();
+    let place = picture(&mut window).0;
+    window.drop_pictures(Some(Point { x: place.x + place.width - 10.0, y: place.y + 20.0 }), vec![png()]);
+    assert_eq!(blocks(&window), ["The roof today:", "gallery of 2", "Reply by Friday."]);
+    let (place, before) = (picture(&mut window).0, size(&window, "g"));
+    let from = corner(place, true, true);
+    window
+        .click_at(middle(place))
+        .advance(1000)
+        .press_at(from)
+        .release_at(Point { x: from.x - 40.0, y: from.y - 40.0 });
+    assert_eq!(size(&window, "g"), before);
+}
+
+/// Two figures with the captions "a" and "b", and a paragraph before, between and after them.
+fn album() -> Harness {
+    let figure = |id: &str| {
+        let asset = Some(format!("assets/{id}.png"));
+        let kind =
+            BlockKind::Figure { asset, src: None, alt: String::new(), width: 300.0, height: 150.0, numbered: false };
+        text(id, kind, id)
+    };
+    let blocks = vec![
+        text("p1", BlockKind::Paragraph, "One."),
+        figure("a"),
+        text("p2", BlockKind::Paragraph, "Two."),
+        figure("b"),
+        text("p3", BlockKind::Paragraph, "Three."),
+    ];
+    Harness::open(Document { blocks, ..Document::default() })
+}
+
+/// Where a frame draws each picture, in order.
+fn pictures(window: &mut Harness) -> Vec<Rect> {
+    let drawn = |item: &Item| match item {
+        Item::Image { rect, .. } => Some(*rect),
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(drawn).collect()
+}
+
+#[test]
+fn a_picture_is_carried_to_where_the_bar_shows_and_put_down_there() {
+    // Where the first picture is carried to, and the document once it is let go.
+    let cases = [
+        ("low on the last line", vec!["One.", "Two.", "b", "Three.", "a"]),
+        ("the right of the other picture", vec!["One.", "Two.", "gallery of 2", "Three."]),
+        ("a step from where it was", vec!["One.", "a", "Two.", "b", "Three."]),
+    ];
+    for (to, after) in cases {
+        let mut window = album();
+        let (places, line) = (pictures(&mut window), spot(&mut window, "p3", 3));
+        let from = middle(places[0]);
+        let carried = to != "a step from where it was";
+        let to = match to {
+            "low on the last line" => Point { x: line.x, y: line.y + line.height - 2.0 },
+            "the right of the other picture" => Point { x: places[1].x + places[1].width - 10.0, ..middle(places[1]) },
+            _ => Point { x: from.x + 2.0, y: from.y + 2.0 },
+        };
+        window.press_at(from).hover_at(to);
+        assert_eq!(bars(&mut window).len(), usize::from(carried), "a bar says where it would land");
+        assert_eq!(pictures(&mut window).len(), 2 + usize::from(carried), "and it shows small under the pointer");
+
+        window.release_at(to);
+        assert_eq!(blocks(&window), after);
+        assert_eq!((bars(&mut window).len(), pictures(&mut window).len()), (0, 2), "nothing is carried any more");
+    }
+}
+
+#[test]
+fn escape_lets_go_of_a_picture_that_is_carried_or_held_by_a_corner() {
+    let mut window = album();
+    let (places, line) = (pictures(&mut window), spot(&mut window, "p3", 3));
+    let low = Point { x: line.x, y: line.y + line.height - 2.0 };
+    window.press_at(middle(places[0])).hover_at(low).key("Escape");
+    assert_eq!((bars(&mut window).len(), pictures(&mut window).len()), (0, 2));
+    window.release_at(low).advance(1000);
+    assert_eq!(blocks(&window), ["One.", "a", "Two.", "b", "Three."], "it stays where it was");
+
+    let from = corner(places[0], true, true);
+    let to = Point { x: from.x - 100.0, y: from.y - 50.0 };
+    window.click_at(middle(places[0])).advance(1000).press_at(from).hover_at(to).key("Escape").release_at(to);
+    assert_eq!(size(&window, "a"), (300.0, 150.0), "and the size it had");
+}
