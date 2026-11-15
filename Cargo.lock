@@ -3283,6 +3283,7 @@ version = "0.1.0"
 dependencies = [
  "accesskit_winit",
  "arboard",
+ "axum",
  "encoding_rs",
  "fontdb",
  "getrandom 0.4.3",
@@ -3300,6 +3301,7 @@ dependencies = [
  "letters-layout",
  "letters-model",
  "letters-render",
+ "letters-server",
  "letters-spell",
  "letters-sync",
  "letters-trust",
@@ -3314,6 +3316,7 @@ dependencies = [
  "sha2",
  "skrifa 0.49.0",
  "softbuffer",
+ "tokio",
  "toml_edit",
  "trash",
  "tungstenite 0.30.0",

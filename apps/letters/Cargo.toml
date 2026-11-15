@@ -54,5 +54,8 @@ pollster.workspace = true
 zbus.workspace = true
 
 [dev-dependencies]
+letters-server = { path = "../letters-server" }
+tokio.workspace = true
+axum.workspace = true
 hayro.workspace = true
 rcgen.workspace = true
