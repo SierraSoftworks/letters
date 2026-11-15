@@ -358,7 +358,9 @@ impl Editor {
         }
         let sides = Sides::at(block, pos.offset);
         let stops = if right { sides.after(&caret.marks) } else { sides.before(&caret.marks) };
-        if let Some((mark, opens)) = if right { stops.first() } else { stops.last() } {
+        // A marker that is not shown is no stop: see [`Editor::markers`].
+        let stop = if right { stops.first() } else { stops.last() };
+        if let Some((mark, opens)) = stop.filter(|_| !self.read_only) {
             // Going right an opening marker leads into its span, and a closing one out of it.
             let mut marks = caret.marks.clone();
             if *opens == right {

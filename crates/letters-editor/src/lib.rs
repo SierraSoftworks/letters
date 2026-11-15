@@ -648,7 +648,7 @@ impl Editor {
     /// commands only [`Command::Move`], [`Command::LineBelow`], the three that select and
     /// [`Command::Copy`] apply, and none of them makes a line for the caret. There is nothing to undo
     /// or redo, no reference is in the making, [`Editor::take_unfetched`] names nothing, and no
-    /// version is marked or named. What other writers wrote still comes in through
+    /// version is marked or named. No marker is shown by [`Editor::markers`], and none stops the caret. What other writers wrote still comes in through
     /// [`Editor::merge`], [`Editor::rewrite`] and [`Editor::attach`], since the page follows them.
     /// What was there to undo is there again once writing is allowed.
     pub fn set_read_only(&mut self, on: bool) {

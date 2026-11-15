@@ -5,7 +5,7 @@ mod common;
 use common::Do::{K, T};
 use common::{Action, Harness, SAMPLE, action, canon, clip, perform, sound};
 use letters_editor::{Clip, Command, InputEvent, Motion};
-use letters_model::{Change, Document, Mark, Revision, Style, TagKind, TextStyle};
+use letters_model::{Change, Document, Mark, Markers, Revision, Style, TagKind, TextStyle};
 use proptest::prelude::*;
 
 /// An editor on a document that it may only read, with something on the clipboard.
@@ -129,6 +129,32 @@ fn the_caret_still_moves_and_selects_and_the_selection_is_copied() {
     editor.editor.select(common::parse("p one ^two|").1.expect("a selection"));
     assert!(editor.key("Mod+c"));
     assert_eq!(editor.platform.clip.as_ref().map(|clip: &Clip| clip.text.as_str()), Some("two"));
+}
+
+#[test]
+fn no_marker_shows_or_stops_the_caret_of_one_who_only_reads() {
+    for state in ["h1 A *ti|tle*", "p **one|** two", "p a $x|y$ b", "tip> p in|side"] {
+        let mut editor = Harness::new(state);
+        assert_ne!(editor.editor.markers(), Markers::default(), "{state:?} shows its markers to a writer");
+        editor.editor.set_read_only(true);
+        assert_eq!(editor.editor.markers(), Markers::default(), "{state:?}");
+    }
+
+    // Each press of an arrow moves the caret a character, past the edges of the marked text too.
+    let walk = |editor: &mut Harness, key: &str, times: usize| -> Vec<Option<usize>> {
+        let press = |_| {
+            editor.key(key);
+            editor.editor.selection().map(|selection| selection.head.offset)
+        };
+        (0..times).map(press).collect()
+    };
+    let mut editor = reader("p |a**b**`c`$d$e");
+    assert_eq!(walk(&mut editor, "Right", 5), [1, 2, 3, 4, 5].map(Some));
+    assert_eq!(walk(&mut editor, "Left", 5), [4, 3, 2, 1, 0].map(Some));
+
+    // A writer's caret stops at each marker on the way.
+    let mut editor = Harness::new("p |a**b**`c`$d$e");
+    assert_ne!(walk(&mut editor, "Right", 5), [1, 2, 3, 4, 5].map(Some));
 }
 
 #[test]
