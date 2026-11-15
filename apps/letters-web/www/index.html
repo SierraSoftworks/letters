@@ -5,15 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <title>Letters</title>
-    <!-- Everything the editor needs is asked for at once, not each when the one before has arrived. -->
+    <!-- What the editor's first frame needs is asked for at once, not each when the one before has arrived. -->
     <link rel="modulepreload" href="letters.js" />
     <link rel="preload" as="fetch" crossorigin href="letters_bg.wasm" />
-    <!-- The text of the first paint is waiting for this one. -->
+    <!-- The text of the first paint and the editor's first frame are waiting for this one. The other fonts
+         are asked for when the editor starts, so that they do not hold up what it waits for. -->
     <link rel="preload" as="fetch" crossorigin fetchpriority="high" href="fonts/Inter.ttf" />
-    <link rel="preload" as="fetch" crossorigin href="fonts/Inter-Italic.ttf" />
-    <link rel="preload" as="fetch" crossorigin href="fonts/FiraCode.ttf" />
-    <link rel="preload" as="fetch" crossorigin href="fonts/Montserrat.ttf" />
-    <link rel="preload" as="fetch" crossorigin href="fonts/Montserrat-Italic.ttf" />
     <!-- The build writes in here what this document's first frame waits for besides: the maths faces, if it has maths. -->
     <!--letters:preload-->
     <style>

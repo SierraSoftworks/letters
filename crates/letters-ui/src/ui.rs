@@ -227,6 +227,12 @@ impl<A: App> Ui<A> {
         }
     }
 
+    /// Shapes every label again before the next frame, for a shaper whose fonts changed.
+    pub fn reshape(&mut self) {
+        self.cache = TextCache::default();
+        self.stale.view = true;
+    }
+
     pub fn app(&self) -> &A {
         &self.app
     }

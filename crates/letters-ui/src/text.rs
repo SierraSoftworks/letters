@@ -142,6 +142,14 @@ impl Default for FontShaper {
     }
 }
 
+impl FontShaper {
+    /// Adds faces that arrived after the shaper was made. Returns whether any was new, when a label shaped
+    /// before may have been set without it.
+    pub fn add_fonts(&self, fonts: &Fonts) -> bool {
+        self.0.add_fonts(fonts)
+    }
+}
+
 impl TextShaper for FontShaper {
     fn shape(&self, text: &str, style: &TextStyle, max_width: Option<f32>) -> Shaped {
         let family = match style.family {

@@ -38,25 +38,30 @@ impl Letters {
     /// Starts the editor in `canvas`, whose size the page's CSS decides. The files it fetches are found
     /// under `base`, a URL that is empty or ends in a slash: `fonts/`, `maths/` and `dictionaries/`.
     ///
-    /// The first frame waits for the fonts, and for the maths faces only when the page's document holds
-    /// maths. The rest is fetched once that frame is on the canvas.
+    /// The first frame waits for the first font, which sets most text, and for the maths faces only when
+    /// the page's document holds maths. The other fonts are set in as they arrive, and the rest is fetched
+    /// once that frame is on the canvas. A browser that kept the fonts from an earlier visit has them all
+    /// at once, and its first frame is drawn with all of them.
     pub async fn start(canvas: HtmlCanvasElement, base: String) -> Result<Letters, JsValue> {
         std::panic::set_hook(Box::new(|panic| web_sys::console::error_1(&panic.to_string().into())));
         let window = web_sys::window().ok_or("there is no window")?;
         let mut platform = Browser::new(&window)?;
         let opened = shell::carried(&window, &mut platform);
         let maths = page::has_maths(&opened);
-        let mut urls = shell::urls(&base, "fonts", &letters_fonts::FILES);
+        let fonts = shell::urls(&base, "fonts", &letters_fonts::FILES);
+        let first = if platform.kept(&window, &fonts[0]) { fonts.len() } else { 1 };
+        let mut urls = fonts[..first].to_vec();
         if maths {
             urls.extend(shell::urls(&base, "maths", &letters_math::FONT_FILES));
         }
-        let mut fonts = browser::files(&window, &urls).await?;
-        let faces = fonts.split_off(letters_fonts::FILES.len());
-        letters_fonts::provide(fonts);
+        let mut files = browser::files(&window, &urls).await?;
+        let faces = files.split_off(first);
+        letters_fonts::provide(files);
         if maths {
             letters_math::provide_fonts(faces);
         }
-        Ok(Self { shell: Shell::start(canvas, platform, opened, Later { base, maths: !maths })? })
+        let later = Later { base, fonts: fonts[first..].to_vec(), maths: !maths };
+        Ok(Self { shell: Shell::start(canvas, platform, opened, later)? })
     }
 
     /// The document, as `document.json` stores it.
@@ -103,6 +108,12 @@ impl Letters {
     #[wasm_bindgen(getter)]
     pub fn spelling(&self) -> bool {
         self.shell.borrow().stats().spelling
+    }
+
+    /// Whether every font has arrived, so that no text stands in another's face.
+    #[wasm_bindgen(getter)]
+    pub fn fonts(&self) -> bool {
+        self.shell.borrow().stats().fonts
     }
 
     /// How long the mirror last took to bring up to date, in milliseconds.

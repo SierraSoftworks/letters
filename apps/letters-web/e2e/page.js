@@ -1,9 +1,9 @@
 // What the tests ask of the harness page.
 
-/** Opens the page and waits for its first frame, and for the dictionaries that follow it. */
+/** Opens the page and waits for its first frame, and for the fonts and dictionaries that follow it. */
 export const ready = async (page) => {
   await page.goto("/");
-  await page.waitForFunction(() => window.letters?.frames > 0 && window.letters.spelling);
+  await page.waitForFunction(() => window.letters?.frames > 0 && window.letters.fonts && window.letters.spelling);
 };
 
 /** The document on screen, one entry per block: its type and its text. */

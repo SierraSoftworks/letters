@@ -1,12 +1,12 @@
 //! What the browser lends the editor: a clock, identifiers, the clipboard for as long as a clipboard event
 //! lasts, somewhere to keep the person's own words and default style, and the files beside the wasm.
 
-use js_sys::{Promise, Uint8Array};
+use js_sys::{Promise, Reflect, Uint8Array};
 use letters_editor::{Clip, Platform, block_id};
 use letters_model::Style;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Crypto, Performance, Response, Storage, Window};
+use web_sys::{Crypto, Performance, Response, Storage, Url, Window};
 
 /// Fetches the files at `urls`, all at once. A page that preloads them has them here by the time the wasm
 /// is running.
@@ -46,6 +46,17 @@ impl Browser {
         let performance = window.performance().ok_or("this browser has no clock")?;
         let storage = window.local_storage().ok().flatten();
         Ok(Self { performance, crypto: window.crypto()?, storage, pasted: None, copied: None })
+    }
+
+    /// Whether the browser had `url` from an earlier visit when the page asked for it, as its preload did.
+    /// What came from the cache crossed no network, or only as much of one as asking whether it had changed.
+    pub fn kept(&self, window: &Window, url: &str) -> bool {
+        let page = window.location().href().unwrap_or_default();
+        let Ok(resolved) = Url::new_with_base(url, &page) else { return false };
+        let Some(entry) = self.performance.get_entries_by_name(&resolved.href()).iter().last() else { return false };
+        let size = |name: &str| Reflect::get(&entry, &name.into()).ok().and_then(|size| size.as_f64());
+        // A browser that does not say is taken to have fetched it.
+        matches!((size("transferSize"), size("encodedBodySize")), (Some(sent), Some(held)) if sent < held)
     }
 
     /// The words the person has added to their own dictionary in this browser.

@@ -68,12 +68,17 @@ pub struct Stats {
     pub mirror_ms: f64,
     /// Whether the dictionaries have arrived, so that misspellings are marked.
     pub spelling: bool,
+    /// Whether every font has arrived, so that no text stands in another's face.
+    pub fonts: bool,
 }
 
-/// What the first frame does without, to fetch once it is on the canvas.
+/// What the first frame does without. The fonts are fetched at once, and the rest once the frame is on the
+/// canvas.
 pub struct Later {
     /// Where the files are found: a URL that is empty or ends in a slash.
     pub base: String,
+    /// Where the fonts still to come are, in the order `letters_fonts::provide` takes them.
+    pub fonts: Vec<String>,
     /// Whether the maths faces are still to come. A document that holds maths had them before it was shown.
     pub maths: bool,
 }
@@ -291,6 +296,7 @@ impl Shell {
         input.focus()?;
         shell.borrow().rest();
         shell.borrow_mut().show();
+        shell.borrow_mut().fetch_fonts();
         Ok(shell)
     }
 
@@ -323,6 +329,28 @@ impl Shell {
         self.changed();
         self.sync();
         Ok(())
+    }
+
+    /// Fetches the fonts the first frame does not wait for. Text that asks for one is set in the first font
+    /// until it arrives, and set again then.
+    fn fetch_fonts(&mut self) {
+        let urls = self.later.as_mut().map(|later| std::mem::take(&mut later.fonts)).unwrap_or_default();
+        if urls.is_empty() {
+            self.stats.fonts = true;
+            return;
+        }
+        let (shell, window) = (self.me.clone(), self.window.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            match browser::files(&window, &urls).await {
+                Ok(files) => letters_fonts::provide(files),
+                Err(error) => return web_sys::console::error_1(&error),
+            }
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            shell.view.add_fonts(letters_fonts::bundled());
+            shell.stats.fonts = true;
+            shell.sync();
+        });
     }
 
     /// Fetches what the first frame did without, and puts it to use: the document's spelling is checked

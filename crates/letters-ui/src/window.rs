@@ -12,7 +12,7 @@ use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
 use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Platform};
 use letters_layout::{Callout, DocLayout, Fonts, Palette, Syntax};
 use letters_model::{Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Mark, Marker, Pos, Selection, Style};
-use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
+use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
 
 use crate::chrome::Chrome;
@@ -288,6 +288,22 @@ impl Ui<EditorApp> {
     /// in a language without a dictionary is left alone.
     pub fn add_dictionary(&mut self, language: &str, dictionary: Dictionary) {
         self.app_mut().spelling.add_dictionary(language, dictionary);
+    }
+
+    /// Adds faces that arrived after the window opened, for a shell whose fonts come one after another: pass
+    /// `letters_fonts::bundled()` again once it holds more. Text that was set without a face is set again
+    /// with it, and the next frame shows it. Faces the window already has change nothing.
+    pub fn add_fonts(&mut self, faces: Vec<Font>) {
+        let fonts = Fonts { faces };
+        let app = self.app_mut();
+        let labels = app.shaper.add_fonts(&fonts);
+        if app.held(|app| app.layout.add_fonts(&fonts)) {
+            // Blocks set again keep their heights as estimates until idle time settles them.
+            app.estimated = true;
+        }
+        if labels {
+            self.reshape();
+        }
     }
 
     /// Lets formulas link, as `\\href` asks. The shell turns it on for a document the person trusts, and it
