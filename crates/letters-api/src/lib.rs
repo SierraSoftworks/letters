@@ -26,7 +26,7 @@ pub use documents::{
 };
 pub use error::{Code, Error};
 pub use session::{Appearance, Exchange, Limits, Person, Renewal, Server, Settings, Token};
-pub use sharing::{Access, Action, Allows, CreatedLink, Grant, Grantee, Link, NewLink, Role, Shares, Who};
+pub use sharing::{Access, Action, Allows, CreatedLink, Grant, Grantee, Link, NewLink, Role, Shares, Via, Who};
 
 /// The version of this interface. It rises only for a change an older shell could not live with, and a
 /// server names every version it still answers in [`Server::protocols`].

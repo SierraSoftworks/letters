@@ -127,6 +127,24 @@ test("a copy that cannot be written leaves its card to ask again", async ({ page
   await expect(card(page)).not.toBeAttached();
 });
 
+test("a copy has its formulas set whether or not the page has its maths engine", async ({ page }) => {
+  // The exports set formulas themselves, so a page that could not fetch its engine still prints them.
+  await page.route("**/maths.js", (route) => route.abort());
+  await ready(page);
+  const maths = [{ text: "Mass, " }, { text: "\\frac{a}{b}", marks: ["math"] }];
+  const document = { format: 1, language: "en", blocks: [{ id: "p1", type: "paragraph", content: maths }] };
+  await page.evaluate((json) => window.letters.open(json), JSON.stringify(document));
+  await rested(page);
+  expect(await page.evaluate(() => window.letters.maths)).toBe(false);
+
+  await ask(page, "Maths", "PDF");
+  const [, pdf] = await saved(page);
+  expect(pdf).toMatch(/KaTeX_Ma(th|in)/);
+  await ask(page, "Maths", "Web page");
+  const [, html] = await saved(page);
+  expect(html).toMatch(/class="math inline"[^>]*><svg/);
+});
+
 test.describe("a PDF of emoji and of scripts the fonts lack", () => {
   // The faces that back up the fonts are fetched as the page is built, and a build without a network has none.
   const built = existsSync(new URL("../dist/fallback/NotoColorEmoji.ttf", import.meta.url));

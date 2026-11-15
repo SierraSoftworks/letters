@@ -75,6 +75,27 @@ fn the_dialog_lists_where_the_person_is_signed_in_and_signs_them_out() {
 }
 
 #[test]
+fn the_keyboard_stays_in_the_dialog_when_the_row_it_was_on_goes() {
+    let mut window = signed_in(vec![server(HOME, "Sam Okafor")]);
+    open(&mut window);
+    for _ in 0..6 {
+        if window.focused().is_some_and(|found| found.name == "Sign out") {
+            break;
+        }
+        window.key("Tab");
+    }
+    window.key("Enter");
+    assert_eq!(window.ui().take_requests(), [Request::SignOut { server: HOME.into() }]);
+
+    // What is typed next reaches neither the page under the dialog nor a button nobody chose.
+    window.type_text("x").key("Enter").key("Backspace");
+    window.assert_markdown("# Roof plan\n\nThe roofer needs the scaffold up by 3 March.");
+    let dialog = window.find(Role::Dialog, "Servers").expect("the dialog stays");
+    let next = window.key("Tab").focused().expect("Tab goes on in the dialog");
+    assert!(dialog.bounds.contains(next.center()), "{next:?}");
+}
+
+#[test]
 fn a_server_is_signed_in_to_through_the_browser() {
     // What is typed, how it is sent, and the server the shell is asked to sign in to.
     let cases: [(&str, Does, Option<&str>); 4] = [
@@ -244,10 +265,11 @@ fn only_a_shell_that_signs_in_to_servers_offers_the_dialog() {
 
 #[test]
 fn a_dialog_that_is_asked_for_takes_the_place_of_another() {
-    let dialogs = ["Servers", "Settings", "Share"];
+    // Open is a card of the window's own for someone signed in to a server.
+    let dialogs = ["Servers", "Settings", "Share", "Open"];
     let pairs = dialogs.iter().flat_map(|first| dialogs.iter().map(move |second| (*first, *second)));
     for (first, second) in pairs.filter(|(first, second)| first != second) {
-        let mut window = signed_in(Vec::new());
+        let mut window = signed_in(vec![server(HOME, "Sam Okafor")]);
         // The commands are reached by their key from under a dialog too.
         for dialog in [first, second] {
             window.key("Mod+Shift+P").type_text(&dialog.to_lowercase()).key("Enter");

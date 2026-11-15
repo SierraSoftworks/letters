@@ -188,6 +188,20 @@ test("a linked picture the server does not fetch unasked waits for the person, w
   await expect.poll(() => told(asked).at(-1)).toBe(`PUT /${shot.name}`);
 });
 
+test("a linked picture the server will not fetch just now keeps its place, and is asked for again when the server says", async ({ page }) => {
+  const slow = { status: 429, headers: { "retry-after": "1" }, body: { code: "slow", message: "Too many pictures and previews at once. Wait a minute." } };
+  let turns = 0;
+  const answer = fetches({ fetch: () => picture(INK).bytes });
+  const asked = await serve(page, opened(), (method, path, body) => (path.endsWith("/fetch/picture") && turns++ < 1 ? slow : answer(method, path, body)), linked);
+  await rested(page);
+  // It is not a picture that failed, and nothing is asked again before the server's time.
+  await expect(page.getByText(/Not loaded/)).not.toBeAttached();
+  expect(told(asked)).toEqual([asking(false)]);
+
+  await expect.poll(() => inked(page)).toBeGreaterThan(1000);
+  expect(told(asked)).toEqual([asking(false), asking(false)]);
+});
+
 test("a document in safe mode has no linked picture fetched until the person trusts it", async ({ page }) => {
   const answer = fetches({ fetch: () => picture(INK).bytes });
   const asked = await serve(page, opened({ trust: "safe" }), (method, path, body) => (path === TRUST ? { status: 204 } : answer(method, path, body)), linked);

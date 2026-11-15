@@ -92,7 +92,9 @@ pub fn twin(home: &Path, id: &str, known: &[PathBuf]) -> Option<PathBuf> {
         others.filter(|real| *real != own && !copy_by_name(real)).filter_map(|real| read(real, id)).peekable();
     // Its own history is read only when there is a file to tell it from.
     twins.peek()?;
-    let model = Model::load(&read(own.clone(), id)?.history, ReplicaId::new("twin")).ok()?;
+    // Nobody may vouch for this file, and its history is loaded here whatever the window does with it.
+    let history = Some(read(own.clone(), id)?.history).filter(|history| crate::strangers::stands(history))?;
+    let model = Model::load(&history, ReplicaId::new("twin")).ok()?;
     let made = |path: &Path| fs::metadata(path).and_then(|file| file.created()).ok();
     let born = made(&own);
     let copied = |twin: &Copy| match model.compare(&twin.history) {

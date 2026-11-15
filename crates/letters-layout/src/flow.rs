@@ -919,11 +919,20 @@ pub(crate) struct Frame {
     pub lead: f32,
     /// How far the frame reaches below its last leaf's text.
     pub reach: f32,
-    /// Whether a quote reads from the right, which is then the side its bar stands at.
+    /// Whether it reads from the right, which is then the side its bar and a callout's head stand at.
     pub rtl: bool,
 }
 
 impl Frame {
+    /// Where a part of a callout's head is drawn: `width` wide and `after` from the head's start, which is at
+    /// the side the callout's lines start at.
+    pub fn headed(&self, after: f32, width: f32) -> f32 {
+        match self.rtl {
+            true => self.x + self.width - theme::BOX_PAD_X - after - width,
+            false => self.x + theme::BOX_PAD_X + after,
+        }
+    }
+
     /// The frame's top and bottom edges, from the leaves it encloses.
     pub fn span(&self, leaves: &[Leaf]) -> (f32, f32) {
         let last = &leaves[self.last];
@@ -1295,8 +1304,8 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                         }
                         _ => (Look::Quote, theme::QUOTE_INSET, 0.0, 0.0),
                     };
-                    // A quote's bar stands at the side its lines start at.
-                    let rtl = look == Look::Quote && leads(block.body.blocks());
+                    // The bar stands at the side its lines start at, and a callout's head with it.
+                    let rtl = leads(block.body.blocks());
                     let (left, right) = if rtl { (right, left) } else { (left, right) };
                     let shrink = (left + right).min(width - theme::MIN_WIDTH).max(0.0);
                     let left = left.min(shrink);

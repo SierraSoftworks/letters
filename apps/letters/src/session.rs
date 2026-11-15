@@ -9,8 +9,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use letters_api::{
-    Access, Code, CreatedLink, Entry, Grant, Limits, Listing, Move, NewFolder, NewLink, Opened, Person, Rename, Shares,
-    Space, Token, paths,
+    Access, Code, CreatedLink, Entry, Grant, Limits, Listing, Move, NewDocument, NewFolder, NewLink, Opened, Person,
+    Rename, Shares, Space, Token, paths,
 };
 
 use crate::keychain::{Keychain, Unkept};
@@ -188,6 +188,12 @@ impl Session {
         self.ask(|server, token| server.post(token, &paths::relocate(id), &to))
     }
 
+    /// Starts a document in `folder` of a space. It is "Untitled" there until its first heading names it.
+    pub fn new_document(&self, space: &str, folder: &str) -> Result<Entry, Refused> {
+        let new = NewDocument { folder: folder.to_owned(), name: None };
+        self.ask(|server, token| server.post(token, &paths::documents(space), &new))
+    }
+
     /// Makes the folder `name` in `parent` of a space.
     pub fn new_folder(&self, space: &str, parent: &str, name: &str) -> Result<Entry, Refused> {
         let new = NewFolder { parent: parent.to_owned(), name: name.to_owned() };
@@ -206,8 +212,15 @@ impl Session {
     }
 
     /// Who reached a document through a share, newest first.
-    pub fn access_log(&self, id: &str) -> Result<Vec<Access>, Refused> {
-        self.ask(|server, token| server.get(token, &paths::access(id)))
+    /// A page of them: the newest, or with `before` those from before that row's time.
+    pub fn access_log(&self, id: &str, before: Option<u64>) -> Result<Vec<Access>, Refused> {
+        let page = before.map_or_else(|| paths::access(id), |time| format!("{}?before={time}", paths::access(id)));
+        self.ask(|server, token| server.get(token, &page))
+    }
+
+    /// How many days the server keeps a row of that log. 0 from one that does not say.
+    pub fn log_days(&self) -> Result<u32, Refused> {
+        Ok(self.said()?.log_days)
     }
 
     /// Makes a link to a document. Its address is told this once.

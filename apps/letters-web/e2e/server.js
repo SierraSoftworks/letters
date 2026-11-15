@@ -150,7 +150,7 @@ export const room = (said = opened(), document = undefined) => {
 
 /**
  * Opens the server's page for the document `said` is about, and waits for the editor as `ready` does.
- * `answer(method, path, body)` is what the server answers a request with, as `{ status, body, type }` or a
+ * `answer(method, path, body)` is what the server answers a request with, as `{ status, body, type, headers }` or a
  * promise of it: nothing is there otherwise. `document` is its `document.json`, the welcome document if none is given. The page's
  * socket leads to `host`, a room of that document that is the page's own unless one is given. Resolves to the
  * requests the page made of the server, as they come, once the page is in session if the room lets it be.
@@ -181,9 +181,9 @@ export const serve = async (page, said, answer = () => undefined, document = und
       asked.push({ method: request.method(), path, body: request.postDataBuffer(), type: await request.headerValue("content-type") });
     }
     const nothing = { status: 404, body: { code: "not_found", message: "Nothing is there." } };
-    const { status = 200, body = "", type = "application/json" } = (await answer(request.method(), path, request.postData())) ?? nothing;
+    const { status = 200, body = "", type = "application/json", headers } = (await answer(request.method(), path, request.postData())) ?? nothing;
     const sent = typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body);
-    await route.fulfill({ status, contentType: type, body: sent });
+    await route.fulfill({ status, contentType: type, headers, body: sent });
   });
   await page.goto(`/d/${said.id}`);
   await page.waitForFunction(() => window.letters?.frames > 0 && window.letters.fonts && window.letters.spelling);

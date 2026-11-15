@@ -223,7 +223,13 @@ fn side(rtl: bool) -> BaseDirection {
 
 /// Typesets a formula for a place `room` wide, and says at what em. One too wide is set smaller to fit.
 fn typeset(engine: &mut Engine, source: &str, like: Maths, room: f32) -> Option<(Arc<Formula>, f32)> {
-    let set = engine.maths.typeset(source, &like).ok()?;
+    // A shell may hand the engine over late. The source stands until then, and its text is set again when
+    // the engine comes, as when a face does.
+    let waits = |error: letters_math::Error| error.is_pending();
+    let set = engine.maths.typeset(source, &like).map_err(waits);
+    engine.waits = set == Err(true);
+    engine.short |= engine.waits;
+    let set = set.ok()?;
     if set.size.width <= room {
         return Some((set, like.size));
     }
@@ -338,8 +344,9 @@ fn build(
                 set.open = open.map(|_| set.swaps.len()).or(set.open);
                 set.swaps.push(Swap { source: start..span.end, shown: from..shown.len(), maths, kept });
             } else {
-                // A source that cannot be typeset shows as it is written, in the colour of a warning.
-                bits |= marks::CODE | marks::MATH;
+                // A source that cannot be typeset shows as it is written, in the colour of a warning. One
+                // that only waits for its engine is not at fault.
+                bits |= marks::CODE | if engine.waits { 0 } else { marks::MATH };
                 shown.push_str(piece);
             }
         }

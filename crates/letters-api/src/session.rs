@@ -16,6 +16,9 @@ pub struct Server {
     /// Whether documents can be shared by link here. It is off unless the server's owner turns it on.
     #[serde(default)]
     pub links: bool,
+    /// How many days a row of a document's access log is kept. 0 from a server that does not say.
+    #[serde(default)]
+    pub log_days: u32,
     #[serde(default)]
     pub limits: Limits,
 }

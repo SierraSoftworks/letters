@@ -18,9 +18,10 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
+use std::io::{Read, Seek};
 use std::mem;
 
-use letters_format::{ASSETS, Error, Files, Journal, Save, Saved, Stamp, WorkingCopy, hash};
+use letters_format::{ASSETS, Error, Files, Journal, Reading, Save, Saved, Stamp, WorkingCopy, hash};
 use letters_model::{Extent, Notes, Revision, Style};
 
 use crate::access::{Access, Refusal, Role, comments};
@@ -283,6 +284,30 @@ impl Room {
             }
         }
         self.flush(folder, state, save, now).map(Some)
+    }
+
+    /// Merges another copy of the document into the room's own: a device's whole file, or a conflict copy
+    /// beside the document. What it brought goes to every session and is owed to the file like an edit,
+    /// with nothing of it in the journal: the host calls [`Room::flush`] at once, and says only then that
+    /// the copy was merged.
+    ///
+    /// The copy is read once, and before the host holds the room: sessions write on while a long history
+    /// is read. A host that merged it into the file instead would have the room read the whole file back.
+    /// Fails as [`WorkingCopy::merge_read`] does.
+    pub fn merge_read<R: Read + Seek>(
+        &mut self,
+        other: Reading<'_, R>,
+        state: &mut impl Files,
+        now: u64,
+    ) -> Result<(), Error> {
+        let before = (self.copy.model().extent(), self.copy.notes.clone());
+        let merged = self.copy.merge_read(other);
+        // A copy that broke off half merged may have brought something in all the same.
+        if merged.is_ok() || self.copy.model().extent() != before.0 {
+            self.touch(now);
+        }
+        let told = self.tell_news(&before, state, now);
+        merged.and(told)
     }
 
     /// Saves now, whatever is due: before the host renders the file or moves it to the trash. Like

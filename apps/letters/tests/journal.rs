@@ -34,7 +34,7 @@ impl Desk {
     fn at(journals: &mut Journals, opened: Opened) -> Self {
         let replica = ReplicaId::new(&platform::block_id());
         let mut model = Model::new(opened.document, replica).with_style(opened.style);
-        let rest = opened.rest.read(replica, Some(journals.folder())).unwrap();
+        let rest = opened.rest.read(replica, Some(journals.folder()), |_| false).unwrap();
         let Working { copy, history, news, claim, journalled } = rest;
         if let Some(history) = history {
             model.attach(history);

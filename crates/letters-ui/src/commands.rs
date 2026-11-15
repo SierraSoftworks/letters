@@ -61,10 +61,18 @@ pub(crate) enum Act {
     Link,
     /// Starts a comment on the selection.
     Comment,
+    /// Opens the note after the one that is open, or the one before it. With none open, the nearest to
+    /// the caret that way.
+    Note {
+        back: bool,
+    },
     /// Lets the person choose pictures to put in.
     Pictures,
     /// Asks for the address of a link preview to put in.
     Preview,
+    /// Shows a link preview as a link in the text: the one whose card is out, or the one the caret stands
+    /// right after.
+    CardAsLink,
     /// Turns the line under a picture to its alt text.
     AltText,
     /// Opens the card of the callout the caret is in.
@@ -166,7 +174,7 @@ const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> E
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 100] = [
+pub(crate) static ENTRIES: [Entry; 104] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -203,6 +211,8 @@ pub(crate) static ENTRIES: [Entry; 100] = [
     callout("Danger", "error red", CalloutEdit::Tone(Tone::Danger)),
     callout("Use the type's defaults", "reset title icon colour color", CalloutEdit::Reset),
     callout("Turn into body text", "remove unwrap plain", CalloutEdit::Remove),
+    run("Link", "Show link as card", "preview bookmark box turn convert", Command::LinkAsCard),
+    entry("Link", "Show card as link", "preview bookmark text address turn convert", Act::CardAsLink),
     kind("Body text", "paragraph normal plain", BlockKind::Paragraph),
     kind("Heading 1", "h1 title", BlockKind::Heading { level: 1 }),
     kind("Heading 2", "h2", BlockKind::Heading { level: 2 }),
@@ -249,6 +259,8 @@ pub(crate) static ENTRIES: [Entry; 100] = [
     entry("View", "History", "versions earlier before rewind restore", Act::History),
     entry("View", "History of selection", "passage versions changed who restore", Act::SelectionHistory),
     entry("View", "Print view", "pages paper sheets preview", Act::Print),
+    entry("View", "Next note", "comment margin marker import", Act::Note { back: false }),
+    entry("View", "Previous note", "comment margin marker import", Act::Note { back: true }),
     entry("View", "Next conflict", "changed two places choice", Act::Review(Reviewing::Step { back: false })),
     entry("View", "Previous conflict", "changed two places choice", Act::Review(Reviewing::Step { back: true })),
     entry("Document", "New document", "create", Act::NewDocument),
@@ -275,7 +287,7 @@ const PRIMARY_ALT: Modifiers = Modifiers { primary: true, shift: false, alt: tru
 
 /// The keys the window binds itself, for what is no command of the editor's. Where a command has two, the
 /// second is the one a Mac's menus write: there the system keeps Cmd with H to hide the application.
-static KEYS: [(KeyEvent, Act); 13] = [
+static KEYS: [(KeyEvent, Act); 16] = [
     (
         KeyEvent { key: Key::F(7), mods: Modifiers { primary: false, shift: false, alt: false } },
         Act::Misspelling { back: false },
@@ -287,6 +299,9 @@ static KEYS: [(KeyEvent, Act); 13] = [
     (KeyEvent { key: Key::Char('p'), mods: PRIMARY_SHIFT }, Act::Palette),
     (KeyEvent { key: Key::Char('p'), mods: PRIMARY }, Act::Print),
     (KeyEvent { key: Key::Char('k'), mods: PRIMARY }, Act::Link),
+    (KeyEvent { key: Key::Char('m'), mods: PRIMARY_ALT }, Act::Comment),
+    (KeyEvent { key: Key::PageDown, mods: PRIMARY_ALT }, Act::Note { back: false }),
+    (KeyEvent { key: Key::PageUp, mods: PRIMARY_ALT }, Act::Note { back: true }),
     (KeyEvent { key: Key::Char(','), mods: PRIMARY }, Act::Settings),
     (KeyEvent { key: Key::Char('s'), mods: PRIMARY }, Act::Save),
     (KeyEvent { key: Key::Char('s'), mods: PRIMARY_SHIFT }, Act::SaveCopy),
@@ -564,6 +579,8 @@ mod tests {
             (Act::Find, Some("Ctrl+F")),
             (Act::Replace, Some("Ctrl+H")),
             (Act::FindStep { back: true }, Some("Ctrl+Shift+G")),
+            (Act::Comment, Some("Ctrl+Alt+M")),
+            (Act::Note { back: true }, Some("Ctrl+Alt+Page Up")),
             (Act::Share, None),
         ];
         for (act, key) in cases {

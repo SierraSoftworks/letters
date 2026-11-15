@@ -265,6 +265,70 @@ fn a_room_admits_what_a_device_writes_in_order_and_refuses_a_gap() {
     assert_eq!(room.doc(), device.doc());
 }
 
+/// Text longer than the history keeps as one insert, with characters of every width.
+fn paste() -> String {
+    "A naïve café, 文字 and 👩‍👩‍👧. ".repeat(120)
+}
+
+#[test]
+fn a_long_paste_is_one_edit() {
+    let (mut a, mut b) = pair();
+    let (text, steps, before) = (paste(), a.timeline().len(), a.revision());
+    let pasted = format!("Hello{text} world");
+    let one = Change { blocks: [id("p")].into(), ..Change::default() };
+
+    assert_eq!(a.apply([typed("p", 5, &text)]).as_ref(), Ok(&one));
+    assert_eq!(texts(&a)[0], pasted);
+    assert_eq!(a.timeline().len(), steps + 1, "one step of the history");
+    assert_eq!(a.changed(&before, &a.revision()).as_ref(), Ok(&one));
+
+    // Another device takes it in as one change, and a file holds it.
+    assert_eq!(b.merge(&a.save()).as_ref(), Ok(&one));
+    assert_eq!(b.doc(), a.doc());
+    assert_eq!(Model::load(&a.save(), ReplicaId::from(3)).unwrap().doc(), a.doc());
+
+    // One step back takes all of it, and one forward puts it back.
+    a.undo().unwrap();
+    assert_eq!(texts(&a), ["Hello world", ""]);
+    a.redo().unwrap();
+    assert_eq!(texts(&a)[0], pasted);
+}
+
+#[test]
+fn a_long_text_two_devices_read_from_a_file_is_one_change() {
+    let mut long = doc();
+    long.blocks[0].body = Body::Text(vec![Run::plain(paste()), Run::marked(paste(), [Mark::Bold]), Run::plain("end")]);
+    // As the document a history starts with, and as what another tool made of a shorter one.
+    let opened: [fn(&Document, u64) -> Model; 2] = [
+        |long, replica| Model::new(long.clone(), ReplicaId::from(replica)),
+        |long, replica| {
+            let mut model = Model::new(doc(), ReplicaId::from(replica));
+            model.rewrite(long.clone()).unwrap();
+            model
+        },
+    ];
+    for open in opened {
+        let (mut a, b) = (open(&long, 1), open(&long, 2));
+        assert_eq!(a.doc(), &long);
+        assert_eq!(a.compare(&b.save()), Ok(Some(Ordering::Equal)), "both hold the same history");
+        assert_eq!(a.merge(&b.save()), Ok(Change::default()));
+        assert_eq!(Model::load(&a.save(), ReplicaId::from(3)).unwrap().doc(), &long);
+    }
+}
+
+#[test]
+fn long_texts_put_in_at_one_place_stay_whole() {
+    let (mut a, mut b) = pair();
+    let (hers, his) = (paste(), "Zwölf Boxkämpfer jagen Viktor quer über den großen Sylter Deich. ".repeat(90));
+    a.apply([typed("p", 5, &hers)]).unwrap();
+    b.apply([typed("p", 5, &his)]).unwrap();
+    sync(&mut a, &mut b);
+
+    assert_eq!(a.doc(), b.doc());
+    let merged = &texts(&a)[0];
+    assert!(merged.contains(&hers) && merged.contains(&his), "one text was cut up by the other");
+}
+
 #[test]
 fn an_update_to_the_history_a_model_gave_up_is_not_admitted() {
     let (file, history) = saved();

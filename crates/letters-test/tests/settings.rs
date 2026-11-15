@@ -158,3 +158,29 @@ fn a_window_is_drawn_in_the_accent_that_was_set() {
         assert_eq!(colours(&mut window), before, "{route}: yewi's accent comes back when the choice is undone");
     }
 }
+
+#[test]
+fn usage_reports_are_switched_only_where_a_shell_sends_them() {
+    const USAGE: &str = "Share anonymous usage reports";
+    // A shell that sends none never says, and its window has no switch.
+    let mut window = settings();
+    assert!(window.find(Role::CheckBox, USAGE).is_none());
+
+    let on = |window: &mut Harness| window.find(Role::CheckBox, USAGE).and_then(|found| found.toggled);
+    for said in [true, false] {
+        let mut window = letter();
+        window.ui().set_usage_reports(said);
+        window.key("Mod+,");
+        assert_eq!(on(&mut window), Some(said));
+        assert_eq!(window.ui().take_requests(), [], "{said}: the shell's word asks for nothing");
+        // The switch shows at once, and the shell is asked to keep it.
+        window.click(Role::CheckBox, USAGE);
+        assert_eq!(on(&mut window), Some(!said));
+        assert_eq!(window.ui().take_requests(), [Request::UsageReports(!said)]);
+        assert_eq!(*window.ui().settings(), Settings::default(), "it is no setting of the documents");
+        // Another window turned them back: the switch follows, and asks nothing.
+        window.ui().set_usage_reports(said);
+        assert_eq!(on(&mut window), Some(said));
+        assert_eq!(window.ui().take_requests(), []);
+    }
+}

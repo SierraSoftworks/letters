@@ -17,6 +17,7 @@
 //! A document's content lives in its `.let` file alone. Whatever else writes that file, over a share or
 //! with a sync tool, is another writer like the server, and the save in `letters_format` merges with it.
 
+pub mod access;
 pub mod api;
 pub mod auth;
 pub mod config;
@@ -33,6 +34,7 @@ pub mod shares;
 pub mod socket;
 pub mod spaces;
 pub mod store;
+pub mod telemetry;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,6 +42,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::serve::ListenerExt;
 use letters_api::{Person, Role, Space};
 
+use crate::access::Log;
 use crate::config::Config;
 use crate::error::{Answer, Refusal};
 use crate::fetch::{Fetches, Roots};
@@ -51,6 +54,7 @@ use crate::rooms::Rooms;
 use crate::session::Signed;
 use crate::spaces::Root;
 use crate::store::Store;
+use crate::telemetry::Telemetry;
 
 /// Tells the time, in seconds since 1970.
 pub type Clock = Box<dyn Fn() -> u64 + Send + Sync>;
@@ -67,6 +71,9 @@ pub struct App {
     pub fetches: Fetches,
     /// What following share links has cost each address of late.
     pub doors: Doors,
+    /// What the access logs noted of late.
+    pub log: Log,
+    pub telemetry: Telemetry,
     clock: Clock,
 }
 
@@ -75,10 +82,11 @@ pub type Shared = Arc<App>;
 impl App {
     pub fn new(config: Config, store: Store) -> Self {
         let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
-        let (provider, rooms) = (Provider::new(&config), Rooms::new(&config.server.state));
+        let (provider, rooms) = (Provider::new(&config), Rooms::new(&config.server.state, store.clone()));
         let (editor, fetches) = (Editor::compiled(), Fetches::new(Roots::System));
-        let (library, doors) = (Library::new(), Doors::default());
-        Self { config, store, library, provider, rooms, editor, fetches, doors, clock: Box::new(clock) }
+        let (library, doors, log) = (Library::new(), Doors::default(), Log::default());
+        let telemetry = Telemetry::default();
+        Self { config, store, library, provider, rooms, editor, fetches, doors, log, telemetry, clock: Box::new(clock) }
     }
 
     /// The same server taking another word on who a site is, for tests against a site of their own.
@@ -189,7 +197,10 @@ pub async fn serve(
     // The index is brought up to the folders while the first requests are already answered.
     let scanning = app.clone();
     tokio::task::spawn_blocking(move || scanning.scan());
-    let closing = app.clone();
+    if app.config.telemetry.enabled && telemetry::here() {
+        app.telemetry.start(telemetry::SERVER);
+    }
+    let (closing, reporting) = (app.clone(), app.clone());
     let stopped = async move {
         stop.await;
         if tokio::task::spawn_blocking(move || closing.rooms.close()).await.is_err() {
@@ -200,7 +211,10 @@ pub async fn serve(
     let listener = listener.tap_io(|socket| drop(socket.set_nodelay(true)));
     // Each request is told the address it came from, which following a link is counted by.
     let routes = api::router(app).into_make_service_with_connect_info::<std::net::SocketAddr>();
-    axum::serve(listener, routes).with_graceful_shutdown(stopped).await
+    let served = axum::serve(listener, routes).with_graceful_shutdown(stopped).await;
+    // Last, and briefly: everything is saved by now.
+    reporting.telemetry.stop(std::time::Duration::from_secs(1)).await;
+    served
 }
 
 /// Writes a line to the server's log, which is its standard error.

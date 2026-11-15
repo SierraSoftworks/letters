@@ -2,7 +2,7 @@
 //! asks of the shell.
 
 use letters_api::{
-    Access as Reach, Action, Allows, CreatedLink, Grant, Grantee, Link, NewLink, Role as Grade, Shares, Who,
+    Access as Reach, Action, Allows, CreatedLink, Grant, Grantee, Link, NewLink, Role as Grade, Shares, Via, Who,
 };
 use letters_test::{Found, Harness, Role};
 use letters_ui::{Access, Connection, Request, Shared};
@@ -93,7 +93,7 @@ fn guest(label: &str) -> Who {
 /// Something done to the plan through a share, so long before noon.
 fn reach(ago: u64, who: Who, action: Action, role: Grade) -> Reach {
     let (address, browser) = ("203.0.113.7".into(), "Firefox on Linux".into());
-    Reach { time: NOON - ago, who, action, role, refused: false, address, browser }
+    Reach { time: NOON - ago, who, link: None, action, role, refused: false, lasted: None, address, browser }
 }
 
 /// The plan's log, newest first: two entries today, one yesterday, two on Thursday and one in October.
@@ -129,6 +129,18 @@ fn shown(window: &mut Harness) -> Vec<String> {
 
 fn has(window: &mut Harness, role: Role, name: &str) -> bool {
     window.find(role, name).is_some()
+}
+
+/// Presses a button of the dialog from the keyboard, as one far down a list that scrolls is reached. One
+/// that is not there, or is not to be pressed, is passed by.
+fn press(window: &mut Harness, name: &str) {
+    for _ in 0..6 {
+        if window.focused().is_some_and(|found| found.name == name) {
+            window.key("Enter");
+            return;
+        }
+        window.key("Tab");
+    }
 }
 
 #[test]
@@ -564,25 +576,93 @@ fn the_log_tells_its_days_and_times_by_the_persons_clock() {
 }
 
 #[test]
-fn a_log_with_nothing_or_too_much_in_it_says_so() {
-    const NOBODY: &str = "Nobody has reached this document through a share yet.";
-    // How many entries the server tells, how many are listed, and what is said of the rest.
+fn a_log_with_nothing_in_it_says_so() {
+    let mut window = plan();
+    activity(&mut window, Vec::new());
+    assert!(has(&mut window, Role::Label, "Nobody has reached this document through a share yet."));
+    assert!(rows(&mut window).is_empty());
+}
+
+#[test]
+fn earlier_entries_are_asked_for_a_page_at_a_time() {
+    let entry = |at: u64| reach(at * HOUR, guest("Builder"), Action::Open, Grade::Reader);
+    // A log shorter than the server's page is whole.
+    let mut window = plan();
+    activity(&mut window, (0..199).map(entry).collect());
+    assert!(!has(&mut window, Role::Button, "Show earlier"));
+
+    // A full page may have others before it: they are asked for from its last row on.
+    let mut window = plan();
+    activity(&mut window, (0..200).map(entry).collect());
+    press(&mut window, "Show earlier");
+    let before = || Request::AccessLogBefore(NOON - 199 * HOUR);
+    assert_eq!(window.ui().take_requests(), [before()]);
+    assert!(window.find(Role::Button, "Show earlier").is_some_and(|found| found.disabled), "it waits");
+    press(&mut window, "Show earlier");
+    assert_eq!(window.ui().take_requests(), [], "asked once, however long the answer takes");
+
+    // What the server refuses can be asked for again.
+    window.ui().refuse_share(REFUSAL);
+    press(&mut window, "Show earlier");
+    assert_eq!(window.ui().take_requests(), [before()]);
+
+    window.ui().add_access_log((200..400).map(entry).collect());
+    assert_eq!(rows(&mut window).len(), 400, "the earlier rows follow those that were listed");
+    press(&mut window, "Show earlier");
+    assert_eq!(window.ui().take_requests(), [Request::AccessLogBefore(NOON - 399 * HOUR)]);
+    // A page that is not full is the last.
+    window.ui().add_access_log((400..430).map(entry).collect());
+    assert_eq!(rows(&mut window).len(), 430);
+    assert!(!has(&mut window, Role::Button, "Show earlier"));
+
+    // Rows nobody asked for come too late, as after the log was told afresh.
+    window.ui().add_access_log((430..440).map(entry).collect());
+    assert_eq!(rows(&mut window).len(), 430);
+}
+
+#[test]
+fn a_row_says_how_long_an_edit_lasted_and_the_link_someone_came_by() {
+    // How many seconds a session of edits has lasted, and what its row says.
     let cases = [
-        (0, 0, Some(NOBODY)),
-        (1, 1, None),
-        (200, 200, None),
-        (201, 200, Some("One earlier entry is not listed.")),
-        (230, 200, Some("30 earlier entries are not listed.")),
+        (None, "Ben Price started editing"),
+        (Some(59), "Ben Price started editing"),
+        (Some(60), "Ben Price edited for 1 minute"),
+        (Some(12 * 60 + 30), "Ben Price edited for 12 minutes"),
+        (Some(HOUR), "Ben Price edited for 1 hour"),
+        (Some(HOUR + 5 * 60), "Ben Price edited for 1 hour 5 minutes"),
+        (Some(2 * HOUR + 60), "Ben Price edited for 2 hours 1 minute"),
     ];
-    for (told, kept, said) in cases {
-        let entry = |at: u64| reach(at * HOUR, guest("Builder"), Action::Open, Grade::Reader);
+    for (lasted, said) in cases {
         let mut window = plan();
-        activity(&mut window, (0..told).map(entry).collect());
-        assert_eq!(rows(&mut window).len(), kept, "{told}");
-        let sentences = [NOBODY, "One earlier entry is not listed.", "30 earlier entries are not listed."];
-        for sentence in sentences {
-            assert_eq!(has(&mut window, Role::Label, sentence), said == Some(sentence), "{told}: {sentence}");
+        activity(&mut window, vec![Reach { lasted, ..reach(HOUR, by("Ben Price"), Action::Edit, Grade::Editor) }]);
+        assert_eq!(rows(&mut window), [said], "{lasted:?}");
+    }
+
+    // Someone signed in who came by a link is named, and the link with them.
+    let mut window = plan();
+    let link = Some(Via { id: "l1".into(), label: "Accountant".into() });
+    activity(&mut window, vec![Reach { link, ..reach(HOUR, by("Carla Diaz"), Action::Open, Grade::Reader) }]);
+    let row = window.find(Role::ListItem, "Carla Diaz opened the document").expect("named");
+    assert!(row.description.unwrap_or_default().contains("by the link for Accountant"));
+    assert!(has(&mut window, Role::Label, "Accountant"), "the link is on the row");
+}
+
+#[test]
+fn the_log_says_how_long_the_server_keeps_it() {
+    // The days a shell says the server keeps a row, and what the tab says over the log.
+    let cases = [
+        (None, "Everything that reached this document through a share, newest first."),
+        (Some(0), "Everything that reached this document through a share, newest first."),
+        (Some(1), "Everything that reached this document through a share in the last day, newest first."),
+        (Some(365), "Everything that reached this document through a share in the last 365 days, newest first."),
+    ];
+    for (days, said) in cases {
+        let mut window = plan();
+        if let Some(days) = days {
+            window.ui().set_log_days(days);
         }
+        activity(&mut window, log());
+        assert!(has(&mut window, Role::Label, said), "{days:?}");
     }
 }
 

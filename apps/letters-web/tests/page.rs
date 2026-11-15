@@ -109,7 +109,7 @@ fn a_served_page_carries_what_the_server_says_whatever_it_holds() {
         // lets no inline script run still starts the editor.
         assert!(page.contains("<base href=\"/assets/abc123/\" />"), "{name}");
         let shown = between(&page, "srcdoc=\"", "\"");
-        assert!(shown.contains("/assets/abc123/fonts/Inter.ttf"), "{name}: the first paint has its fonts");
+        assert!(shown.contains("/assets/abc123/fonts/"), "{name}: the first paint has its fonts");
         let around = page.replace(shown, "");
         let kind = |(at, _): (usize, &str)| match &around[at..] {
             tag if tag.starts_with("<script type=\"application/json\"") => "data",
@@ -169,10 +169,12 @@ fn a_template_without_places_for_a_document_is_left_as_it_is() {
 
 #[test]
 fn the_export_is_set_as_the_window_sets_the_document_in_the_windows_fonts() {
-    let first = first_paint_of(&page::welcome(&mut || "b".into()));
+    let welcome = page::welcome(&mut || "b".into());
+    let first = first_paint_of(&welcome);
     let shown = between(&first, "srcdoc=\"", "\"").replace("&quot;", "\"").replace("&amp;", "&");
     assert!(shown.contains("--column"), "the column is the window's");
-    for file in letters_fonts::FILES {
+    // The first font is the file the editor's first frame waits for, whole or its stand-in.
+    for file in std::iter::once(page::first_font(&welcome)).chain(letters_fonts::FILES.into_iter().skip(1)) {
         assert!(shown.contains(&format!("fonts/{file}")), "{file} can be fetched");
     }
     assert!(shown.contains("prefers-color-scheme: dark"), "a dark page is read in the window's dark colours");
@@ -312,17 +314,48 @@ fn only_a_document_with_maths_has_its_first_frame_wait_for_the_maths_faces() {
         assert_eq!(page::has_maths(&document), maths, "{name}");
         let preloads = page::preloads(&document, "/static/");
         assert_eq!(
-            preloads.matches("<link rel=\"preload\"").count(),
+            preloads.matches("href=\"/static/maths/KaTeX_").count(),
             if maths { letters_math::FONT_FILES.len() } else { 0 },
             "{name}"
         );
-        assert_eq!(
-            preloads.matches("href=\"/static/maths/KaTeX_").count(),
-            preloads.matches("<link").count(),
-            "{name}"
-        );
+        // The engine that sets them is asked for with them, as a module and its wasm.
+        let engine = ["<link rel=\"modulepreload\" href=\"/static/maths.js\"", "href=\"/static/maths_bg.wasm\""];
+        for file in engine {
+            assert_eq!(preloads.contains(file), maths, "{name}: {file}");
+        }
+        // Besides them it waits for one font, and for nothing else.
+        assert_eq!(preloads.matches("href=\"/static/fonts/").count(), 1, "{name}");
+        let asked = 1 + if maths { engine.len() + letters_math::FONT_FILES.len() } else { 0 };
+        assert_eq!(preloads.matches("href=").count(), asked, "{name}");
         let page = page::compose("<head><!--letters:preload--></head>", &preloads, "", "{}");
         assert_eq!(page, format!("<head>{preloads}</head>"), "{name}");
+    }
+}
+
+#[test]
+fn the_first_frame_waits_for_the_stand_in_only_where_it_writes_all_the_document_says() {
+    let [stand_in, whole] = [letters_fonts::FIRST, letters_fonts::FILES[0]];
+    let says = |text: &str| Block::text(BlockId::new("p"), BlockKind::Paragraph, text);
+    let quoted = Block { body: Body::Blocks(vec![says("Ελληνικά")]), ..Block::new("q", BlockKind::Quote) };
+    let cases = [
+        ("nothing", vec![], stand_in),
+        ("Latin", vec![says("Minutes of the café, 3 – 4 pm: “agreed” → done")], stand_in),
+        ("Greek", vec![says("Minutes"), says("Ελληνικά")], whole),
+        ("Greek in a quote", vec![says("Minutes"), quoted], whole),
+        ("Chinese", vec![says("会议记录")], whole),
+    ];
+    for (name, blocks, font) in cases {
+        let other = if font == stand_in { whole } else { stand_in };
+        let document = Document { blocks, ..Document::default() };
+        assert_eq!(page::first_font(&document), font, "{name}");
+
+        // The page asks for that file early, and its first paint is set in it: one font is fetched, once.
+        let page = page::served(&document, &opened("Minutes", "Ada", Trust::Trusted), "/assets/abc123/");
+        let shown = between(&page, "srcdoc=\"", "\"");
+        let around = page.replace(shown, "");
+        assert!(around.contains(&format!("href=\"/assets/abc123/fonts/{font}\"")), "{name}");
+        assert!(shown.contains(&format!("/assets/abc123/fonts/{font}")), "{name}");
+        assert!(!page.contains(&format!("fonts/{other}")), "{name}: {other} is not asked for");
     }
 }
 

@@ -304,6 +304,9 @@ impl fmt::Debug for Prepared {
 }
 
 /// A shell hands these to the thread that owns the window, and may make them on another.
+/// Raised whenever [`Model::check`] comes to refuse a history that it passed before.
+const CHECK: u32 = 1;
+
 const _: fn() = || {
     fn sent<T: Send>() {}
     sent::<Model>();
@@ -383,6 +386,13 @@ impl Model {
         let read = read.map_err(|_| unreadable("reading it panicked"))?;
         drop(scratch.map(mem::ManuallyDrop::into_inner));
         read
+    }
+
+    /// Names what [`Model::check`] holds a history to: the version of the history library, and how often
+    /// the check itself has changed. Whoever keeps the word that a history passed drops it when the name
+    /// is another.
+    pub fn check_name() -> String {
+        format!("loro {} check {CHECK}", loro::LORO_VERSION.trim())
     }
 
     /// Tries an update from a stranger on a copy of this history, before [`Model::merge`] takes it. The

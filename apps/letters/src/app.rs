@@ -26,7 +26,7 @@ use letters_sync::{Local, Progress, Refusal};
 use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDecision, Origin, Trust};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
-    Access, Allows, Appearance, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind,
+    Access, Allows, Appearance, Browsed, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind,
     ImportOffer, Landing, LinkPreviewFound, Location, MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState,
     Scheme, Settings, SignIn, Window as View, tokens,
 };
@@ -67,6 +67,7 @@ use crate::server::Client;
 use crate::servers;
 use crate::session::Session;
 use crate::settings;
+use crate::telemetry::{self, Page, Telemetry};
 use crate::trust::{self, Trusted};
 use crate::versions::Rests;
 use crate::words::{self, Words};
@@ -152,6 +153,8 @@ pub enum Event {
     /// The sign-in a window asked for, which ended when this was set, has ended: in a session, or in a
     /// sentence on why not, or in neither if the person gave it up.
     SignedIn(WindowId, Arc<AtomicBool>, Result<Arc<Session>, Option<String>>),
+    /// A server said what a place of it holds, for a window's Open card, or why it could not be read.
+    Browsed(WindowId, Result<Box<Browsed>, String>),
     /// The socket of this number, to the server of a window's document, has something to say.
     Heard(WindowId, Said),
     /// A picture of this name, which the copy of a window's document lacked, was asked of the document's
@@ -190,6 +193,10 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
     let mut app = App {
         starting: true,
         report_launch,
+        telemetry: Telemetry::off(),
+        reports: None,
+        notice: false,
+        page: None,
         typing: match options.mode {
             Mode::TypingReport { keys } => Some(TypingRun { keys, stats: Typing::default(), typed: None, next: None }),
             _ => None,
@@ -385,6 +392,14 @@ struct App {
     /// Whether the first window is still to open.
     starting: bool,
     report_launch: bool,
+    /// Off until the first frame is drawn, and for good in a run that measures.
+    telemetry: Telemetry,
+    /// Whether the person lets this run report. `None` in a run that never would, which shows no switch.
+    reports: Option<bool>,
+    /// Whether the landing card says that reports are sent: for the one run that first sends any.
+    notice: bool,
+    /// The page last reported.
+    page: Option<Page>,
     /// The typing report in progress, in that mode.
     typing: Option<TypingRun>,
     /// The stopwatch, until the first frame is on screen.
@@ -499,6 +514,8 @@ struct Remote {
     looked: Option<Instant>,
     /// The folders of the document's space as the server last listed them, which it can move among.
     shelves: Vec<Shelf>,
+    /// The name and the place the list of recent documents has for it, once it is on that list.
+    listed: Option<(String, String)>,
 }
 
 impl Remote {
@@ -559,6 +576,27 @@ impl Remote {
     /// The folder the server keeps the document in, as the bar is told it.
     fn folder(&self) -> String {
         self.key(self.opened.path.rsplit_once('/').map_or("", |(folder, _)| folder))
+    }
+
+    /// Where the server keeps the document, as a list of recent documents says it: the server, the space
+    /// by its name if the server told it, and the folders down to the document's.
+    fn shown(&self) -> String {
+        let space = self.shelves.first().map(|shelf| shelf.name.as_str());
+        let folder = self.opened.path.rsplit_once('/').map_or("", |(folder, _)| folder);
+        let parts = [Some(self.host.as_str()), space].into_iter().flatten().chain(folder.split('/'));
+        parts.filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" / ")
+    }
+
+    /// The document as the list of recent ones is to hold it, if the list does not hold it so yet.
+    fn lately(&mut self) -> Option<servers::Lately> {
+        let now = (self.opened.name.clone(), self.shown());
+        if self.listed.as_ref() == Some(&now) {
+            return None;
+        }
+        self.listed = Some(now.clone());
+        let address =
+            format!("{}{}", self.line.session().server().origin(), letters_api::paths::editor_page(&self.opened.id));
+        Some(servers::Lately { address, name: now.0, folder: now.1, opened: platform::now_rfc3339() })
     }
 
     /// The space and the folder of it that the bar knows by `key`, if it is one the server listed.
@@ -1350,6 +1388,7 @@ impl DocWindow {
             live: false,
             looked: None,
             shelves: Vec::new(),
+            listed: None,
         });
         self.recopy(library);
         self.recomment();
@@ -1491,10 +1530,12 @@ impl DocWindow {
     }
 
     /// Takes how the document stands at its server, which was asked about its name and place. `answers`
-    /// says that the bar asked and waits to be told.
-    fn placed(&mut self, answers: bool, placed: Placed, library: &Library) {
-        let Some(remote) = &mut self.remote else { return };
+    /// says that the bar asked and waits to be told. Gives the document for the list of recent ones, if
+    /// the server said how it stands and the list has it otherwise.
+    fn placed(&mut self, answers: bool, placed: Placed, library: &Library) -> Option<servers::Lately> {
+        let remote = self.remote.as_mut()?;
         remote.placing = false;
+        let said = placed.opened.is_some();
         if let Some(now) = placed.opened {
             let opened = &mut remote.opened;
             (opened.name, opened.named, opened.space, opened.path) = (now.name, now.named, now.space, now.path);
@@ -1521,15 +1562,20 @@ impl DocWindow {
             }
         }
         self.retitle();
+        self.remote.as_mut().filter(|_| said && self.keeps).and_then(Remote::lately)
     }
 
     /// Starts reading what the first paint did not need, on another thread.
-    fn start_read(&mut self, proxy: &EventLoopProxy<Event>, journals: &Journals) {
+    ///
+    /// A document that would open in safe mode is read as a stranger's: see [`Rest::read`].
+    fn start_read(&mut self, proxy: &EventLoopProxy<Event>, journals: &Journals, trust: &Trust) {
         let Some(rest) = self.rest.take() else { return };
         let (id, proxy, replica) = (self.window.id(), proxy.clone(), self.view.editor().model().replica());
         let journals = self.keeps.then(|| journals.folder().to_owned());
+        let (vouched, trust, path) = (self.vouched(), trust.clone(), self.place.path().map(Path::to_owned));
+        let wary = move |id: &str| !vouched && trust::mode(&trust, id, path.as_deref()) != letters_trust::Mode::Trusted;
         self.reading = Some(thread::spawn(move || {
-            let working = rest.read(replica, journals.as_deref()).map_err(|error| error.to_string());
+            let working = rest.read(replica, journals.as_deref(), wary).map_err(|error| error.to_string());
             let _ = proxy.send_event(Event::Read(id));
             working
         }));
@@ -1542,7 +1588,9 @@ impl DocWindow {
             (Some(reading), _) => reading.join().unwrap_or_else(|_| Err("reading it stopped unexpectedly".into())),
             (None, Some(rest)) => {
                 let replica = self.view.editor().model().replica();
-                rest.read(replica, self.keeps.then(|| journals.folder())).map_err(|error| error.to_string())
+                // With nothing at hand that says who is trusted, only what is vouched for here is.
+                let (journals, vouched) = (self.keeps.then(|| journals.folder()), self.vouched());
+                rest.read(replica, journals, |_| !vouched).map_err(|error| error.to_string())
             }
             (None, None) => return Ok(()),
         };
@@ -2158,6 +2206,10 @@ impl App {
         window.retitle();
         window.reframe(&self.buttons);
         window.follow(&self.settings, self.writer());
+        if let Some(on) = self.reports {
+            window.view.set_usage_reports(on);
+            window.view.set_usage_notice(self.notice);
+        }
         if self.servers_told {
             window.view.set_servers(self.servers());
         }
@@ -2182,9 +2234,18 @@ impl App {
                 path: recent.path.to_str()?.to_owned(),
             })
         };
+        // A server's document is listed by the address of its page, which `Request::Open` asks its server for.
+        let served = |lately: servers::Lately| {
+            let (opened, at) = (platform::local(&lately.opened), lately.opened);
+            (at, letters_ui::Recent { name: lately.name, folder: lately.folder, opened, path: lately.address })
+        };
+        let here = self.library.recents().into_iter().filter_map(|kept| Some((kept.opened.clone(), recent(kept)?)));
+        let mut recents: Vec<_> = here.chain(servers::lately(&self.home).into_iter().map(served)).collect();
+        // Both lists are newest first, and a sort that is stable keeps each in its order.
+        recents.sort_by(|a, b| b.0.cmp(&a.0));
         Landing {
             now: platform::local(&platform::now_rfc3339()),
-            recents: self.library.recents().into_iter().filter_map(recent).take(LISTED).collect(),
+            recents: recents.into_iter().map(|(_, recent)| recent).take(LISTED).collect(),
         }
     }
 
@@ -2194,9 +2255,19 @@ impl App {
         let mut refused = false;
         let requests = window.view.take_requests();
         let served = !requests.is_empty();
+        let page = Page::of(window.view.mode());
+        if self.reports.is_some() && self.page != Some(page) {
+            self.page = Some(page);
+            self.telemetry.page(page);
+        }
         for request in requests {
+            telemetry::Event::asked(&request).into_iter().for_each(|event| self.telemetry.record(event));
             match request {
-                Request::Open(path) => self.act(event_loop, id, Action::Open(Some(path.into()))),
+                // The address of a document's page is no file: its server is asked.
+                Request::Open(path) => match connected::address(&path) {
+                    Some((origin, document)) => self.reach(Some(id), &origin, document),
+                    None => self.act(event_loop, id, Action::Open(Some(path.into()))),
+                },
                 Request::OpenDialog => self.act(event_loop, id, Action::Open(None)),
                 Request::New => self.act(event_loop, id, Action::New),
                 // The name is taken on the way to a save, which reads it from the document. A server's
@@ -2279,6 +2350,7 @@ impl App {
                 }
                 Request::SaveDefaultStyle(json) => self.keep_style(id, &json),
                 Request::Settings(settings) => self.keep_settings(id, settings),
+                Request::UsageReports(on) => self.keep_reports(on),
                 Request::ImportStyle => {
                     let Some(window) = self.windows.get_mut(&id) else { continue };
                     let dialog = FileDialog::new().add_filter(STYLESHEETS, &[STYLESHEET]);
@@ -2340,7 +2412,8 @@ impl App {
                 | Request::SharePeople(_)
                 | Request::MakeLink(_)
                 | Request::RevokeLink(_)
-                | Request::AccessLog => {
+                | Request::AccessLog
+                | Request::AccessLogBefore(_) => {
                     let window = self.windows.get_mut(&id);
                     let Some(remote) = window.and_then(|window| window.remote.as_mut()) else { continue };
                     remote.shares.push(match request {
@@ -2348,6 +2421,7 @@ impl App {
                         Request::MakeLink(new) => Sharing::Link(new),
                         Request::RevokeLink(link) => Sharing::Revoke(link),
                         Request::AccessLog => Sharing::Log,
+                        Request::AccessLogBefore(time) => Sharing::Earlier(time),
                         _ => Sharing::Look,
                     });
                 }
@@ -2358,6 +2432,9 @@ impl App {
                     }
                 }
                 Request::SignOut { server } => self.sign_out(&server, now),
+                Request::Browse { server, place } => self.browse(id, server, place, now),
+                Request::OpenFrom { server, id: document } => self.reach(Some(id), &server, document),
+                Request::NewAt { server, space, path } => self.start_at(id, &server, space, path),
                 // A request this shell does not know yet.
                 _ => {}
             }
@@ -2389,6 +2466,17 @@ impl App {
                 "Your settings could not be kept, and will last only until Letters closes.\n\n{error}"
             ));
         }
+    }
+
+    /// Follows the person's word on usage reports in every window, and keeps it for the next launch. A
+    /// word that could not be kept still holds until the app closes.
+    fn keep_reports(&mut self, on: bool) {
+        if let Err(error) = telemetry::keep(&self.home, "enabled", on) {
+            eprintln!("letters: the choice on usage reports could not be kept, since {error}");
+        }
+        self.reports = Some(on);
+        self.telemetry.allow(on);
+        self.windows.values_mut().for_each(|window| window.view.set_usage_reports(on));
     }
 
     /// Keeps a style as the person's default, for every window to offer from now on. The window that
@@ -2661,6 +2749,61 @@ impl App {
         self.tell_servers(now);
     }
 
+    /// Asks the server at `server` what a place of it holds, for a window's Open card, on another thread.
+    /// The answer arrives as an event.
+    fn browse(&mut self, id: WindowId, server: String, place: letters_ui::Place, now: Instant) {
+        let Some(session) = self.sessions.get(&server).filter(|session| !session.ended()).cloned() else {
+            // The card lists a server nobody is signed in to any more: it goes with the server's row.
+            self.browsed(id, Err("Sign in to this server again to see its documents.".to_owned()), now);
+            return self.tell_servers(now);
+        };
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            let held = match &place {
+                letters_ui::Place::Spaces => session.spaces().map(|spaces| (spaces, Vec::new())),
+                letters_ui::Place::Folder { space, path } => {
+                    session.entries(space, path).map(|listing| (Vec::new(), listing.entries))
+                }
+                letters_ui::Place::Shared => session.shared().map(|entries| (Vec::new(), entries)),
+                letters_ui::Place::Recent => session.recent().map(|entries| (Vec::new(), entries)),
+            };
+            let browsed = held
+                .map(|(spaces, entries)| Box::new(Browsed { server, place, spaces, entries }))
+                .map_err(|refused| connected::sentence(&refused));
+            let _ = proxy.send_event(Event::Browsed(id, browsed));
+        });
+    }
+
+    /// Starts a document in `folder` of a space of the server at `server` and brings it here, on another
+    /// thread, for the window that asked. It opens as a document of the server does: see [`Self::reached`].
+    fn start_at(&mut self, id: WindowId, server: &str, space: String, folder: String) {
+        let Some(session) = self.sessions.get(server).filter(|session| !session.ended()).cloned() else {
+            let nobody = Err(Some("Nobody is signed in to that server any more.".to_owned()));
+            return drop(self.proxy.send_event(Event::Reached(Some(id), nobody)));
+        };
+        let (proxy, home) = (self.proxy.clone(), self.home.clone());
+        thread::spawn(move || {
+            let started = session.new_document(&space, &folder).map_err(|refused| connected::sentence(&refused));
+            let reached = started.and_then(|entry| {
+                let document = entry.id.ok_or("The server did not say which document it started.")?;
+                connected::reach(&session, &document, &home).map_err(|error| error.to_string())
+            });
+            let entered = reached.map(|reached| Box::new((session, reached))).map_err(Some);
+            let _ = proxy.send_event(Event::Reached(Some(id), entered));
+        });
+    }
+
+    /// Tells a window's Open card what a place holds, or why it could not be read.
+    fn browsed(&mut self, id: WindowId, browsed: Result<Box<Browsed>, String>, now: Instant) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        match browsed {
+            Ok(browsed) => window.view.set_listing(*browsed),
+            Err(why) => window.view.refuse_browse(&why),
+        }
+        window.access_stale = true;
+        window.sync(now);
+    }
+
     /// Where the person is signed in, as the Servers dialog lists it.
     fn servers(&self) -> Vec<letters_ui::Server> {
         let signed_in = self.sessions.values().filter(|session| !session.ended());
@@ -2735,7 +2878,11 @@ impl App {
                 connected::Shared::Made(link) => window.view.link_made(link),
                 // The dialog dropped the link when it asked.
                 connected::Shared::Revoked => {}
-                connected::Shared::Log(log) => window.view.set_access_log(log),
+                connected::Shared::Log(log, days) => {
+                    window.view.set_log_days(days);
+                    window.view.set_access_log(log);
+                }
+                connected::Shared::Earlier(rows) => window.view.add_access_log(rows),
                 connected::Shared::Refused(why) => window.view.refuse_share(&why),
             }
         }
@@ -3133,6 +3280,12 @@ impl App {
     }
 
     fn act(&mut self, event_loop: &ActiveEventLoop, id: WindowId, action: Action) {
+        match &action {
+            Action::New => self.telemetry.record(telemetry::Event::DocumentOpened(telemetry::Source::New)),
+            Action::Open(Some(_)) => self.telemetry.record(telemetry::Event::DocumentOpened(telemetry::Source::Listed)),
+            Action::Open(None) => self.telemetry.record(telemetry::Event::DocumentOpened(telemetry::Source::Chosen)),
+            _ => {}
+        }
         match action {
             Action::New => {
                 if let Err(error) = self.open_window(event_loop, None, false) {
@@ -3313,6 +3466,23 @@ impl ApplicationHandler<Event> for App {
                     }
                     // Nor where the person is signed in, which the keychain is asked for.
                     read_kept(&self.proxy, &self.home);
+                    // Nor what Letters reports of its use, which a run that measures never does.
+                    if self.typing.is_none() && telemetry::here() {
+                        let said = letters_trust::Store::read(&mut trust::Settings::of(&self.home))
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        let allowed = telemetry::allowed(&said);
+                        self.telemetry = Telemetry::start(telemetry::SERVER, allowed);
+                        self.reports = Some(allowed);
+                        // The card says so in the first run that reports, and not again.
+                        self.notice = allowed && !telemetry::noticed(&said);
+                        if self.notice {
+                            let _ = telemetry::keep(&self.home, "noticed", true);
+                        }
+                        window.view.set_usage_reports(allowed);
+                        window.view.set_usage_notice(self.notice);
+                    }
                     // The desktop is asked over D-Bus, which is not worth holding a frame for.
                     let (proxy, folders) = (self.proxy.clone(), self.dictionaries.clone());
                     thread::spawn(move || {
@@ -3364,7 +3534,7 @@ impl ApplicationHandler<Event> for App {
                 if window.rest.is_some() {
                     window.reword(&self.words);
                     window.view.set_default_style(Some(new_style()));
-                    window.start_read(&self.proxy, &self.journals);
+                    window.start_read(&self.proxy, &self.journals, self.trust.trust());
                     window.ask_dictionaries(&self.proxy, &self.dictionaries);
                     window.relocate(library);
                 }
@@ -3573,6 +3743,16 @@ impl ApplicationHandler<Event> for App {
                 }
             }
             Event::SignedIn(id, given_up, signed) => self.signed_in(id, &given_up, signed, now),
+            Event::Browsed(id, browsed) => {
+                self.browsed(id, browsed, now);
+                // A session that ended while it was asked is no longer listed, and the card goes with it.
+                if self.sessions.values().any(|session| session.ended()) {
+                    self.sessions.retain(|_, session| !session.ended());
+                    self.tell_servers(now);
+                }
+                // The card asks for the next place once it has the spaces.
+                self.serve(event_loop, id, now);
+            }
             Event::Heard(id, said) => {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.heard(said, now);
@@ -3582,8 +3762,10 @@ impl ApplicationHandler<Event> for App {
             }
             Event::Placed(id, answers, placed) => {
                 if let Some(window) = self.windows.get_mut(&id) {
-                    window.placed(answers, *placed, &self.library);
+                    let lately = window.placed(answers, *placed, &self.library);
                     window.sync(now);
+                    // A list that cannot be written costs a row on a card.
+                    let _ = lately.map(|lately| servers::opened(&self.home, lately));
                 }
                 // What was asked meanwhile goes to the server now.
                 self.place(id);
@@ -3748,6 +3930,8 @@ impl ApplicationHandler<Event> for App {
         for copy in self.copies.drain(..) {
             let _ = copy.join();
         }
+        // Last, and briefly: the person's work is safe by now, and a report is not worth their wait.
+        std::mem::replace(&mut self.telemetry, Telemetry::off()).stop(Duration::from_millis(300));
     }
 
     /// Runs after each batch of events: starts due saves and sleeps until the next thing is due.

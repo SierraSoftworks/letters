@@ -14,25 +14,26 @@
 //! A room is of a file and not of a document, since a copy made by hand carries the id of its original.
 
 use std::collections::HashMap;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use letters_api::{Code, Role};
-use letters_format::{ASSETS, Archive, Error, Files, Save, Saved, Unsaved, WorkingCopy, is_journal};
-use letters_model::ReplicaId;
-use letters_sync::{Access, LOOK_EVERY, Outbound, Refusal as Ended, Room, SessionId};
+use letters_api::{Action, Code, Role};
+use letters_format::{ASSETS, Archive, Error, Files, Reading, Save, Saved, Unsaved, is_journal};
+use letters_sync::{Access, ClientMessage, LOOK_EVERY, Outbound, Refusal as Ended, Room, SessionId};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 
+use crate::access::Reach;
 use crate::api::{Found, blocking};
 use crate::error::{Answer, Refusal};
 use crate::ids;
 use crate::session::Signed;
 use crate::spaces::{Folder, Place, Root};
+use crate::store::Store;
 use crate::{App, Shared, log};
 
 /// How many frames may wait for one socket. A device that falls this far behind is let go, and joins
@@ -93,6 +94,8 @@ fn failed(error: Error) -> Refusal {
 pub struct Rooms {
     /// Where the journals are: `<state>/rooms`.
     folder: PathBuf,
+    /// The server's records, for what a room's save tells the index.
+    store: Store,
     /// By [`key`]. This lock is never taken by whoever holds a room's.
     open: Mutex<HashMap<String, Arc<Open>>>,
     /// The journals no room has: the id of the document each is of, and its folder's name. The room
@@ -140,6 +143,8 @@ struct Hosted {
     parked: bool,
     /// The file was not there at the last look.
     missing: bool,
+    /// A save wrote the file, and the index has not been told.
+    wrote: bool,
     /// The file is gone from its place. The room is dropped at its keeper's next turn.
     lost: bool,
 }
@@ -153,6 +158,8 @@ struct Seated {
     /// Whether a share had a say in what the session may do. Such a session joins again when the
     /// document's shares change.
     lent: bool,
+    /// How the document's access log knows the session, when a share or a link led it here.
+    reach: Option<Reach>,
 }
 
 /// One device's place in a room. Dropping it leaves the room.
@@ -166,9 +173,10 @@ pub struct Seat {
 }
 
 impl Rooms {
-    pub fn new(state: &Path) -> Self {
+    pub fn new(state: &Path, store: Store) -> Self {
         Self {
             folder: state.join("rooms"),
+            store,
             open: Mutex::new(HashMap::new()),
             left: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
@@ -358,7 +366,7 @@ impl Rooms {
     /// Does `work`, which writes to the file at `place` as any other writer of its folder would. A room
     /// that is open for the file saves first and reads the file again at once, so that its sessions are
     /// told what was written.
-    pub fn around<T>(&self, root: &Root, place: &Place, work: impl FnOnce() -> Answer<T>) -> Answer<T> {
+    fn around<T>(&self, root: &Root, place: &Place, work: impl FnOnce() -> Answer<T>) -> Answer<T> {
         let open = lock(&self.open).get(&key(root, place)).cloned();
         let Some(open) = open else { return work() };
         let mut state = lock(&open.state);
@@ -369,6 +377,38 @@ impl Rooms {
         let done = work();
         open.act(self, &mut state, save);
         done
+    }
+
+    /// Merges `theirs`, another copy of the document `id`, into it at `place`. A room that is open for the
+    /// file takes the copy in itself and saves at once: whoever has the document open is told what the
+    /// copy brought. With no room, or one that is not saving, `beside` merges the copy into the file as
+    /// any other writer of its folder would.
+    ///
+    /// The copy was read before this, with no room held: a long history takes a while to read, and
+    /// people write on meanwhile. A room that is another document's by now is left alone, and the answer
+    /// is [`moved`](crate::library::moved).
+    pub fn merge<'a, R: Read + Seek>(
+        &self,
+        root: &Root,
+        place: &Place,
+        id: &str,
+        theirs: Reading<'a, R>,
+        beside: impl FnOnce(Reading<'a, R>) -> Answer<()>,
+    ) -> Answer<()> {
+        let mut theirs = Some(theirs);
+        let open = lock(&self.open).get(&key(root, place)).cloned();
+        if let Some(open) = open {
+            let mut state = lock(&open.state);
+            let hosted = matches!(*state, State::Open(_));
+            match open.act(self, &mut state, |hosted, now| hosted.merge(id, &mut theirs, now)) {
+                Some(Some(merged)) => return merged,
+                // The room failed at the copy and was closed, with its file as it was.
+                None if hosted => return Err(Refusal::invalid(crate::library::HARMFUL)),
+                _ => {}
+            }
+        }
+        let theirs = theirs.expect("a room that took the copy answered for it");
+        self.around(root, place, || beside(theirs))
     }
 
     /// Brings every file up to its room and ends every session, as the server stops. Each file is
@@ -541,6 +581,11 @@ impl Open {
         let done = catch_unwind(AssertUnwindSafe(|| {
             let done = work(hosted, now);
             hosted.settle(self, now);
+            // The index learns what a save wrote from the room, and so does not read the file for it: with
+            // a long history, checking and loading it again would cost more than the save did.
+            if std::mem::take(&mut hosted.wrote) {
+                crate::library::wrote(&rooms.store, &hosted.root, &hosted.place, hosted.room.copy());
+            }
             done
         }));
         if done.is_err()
@@ -570,8 +615,9 @@ impl Hosted {
         let stamp = Files::stamp(&mut folder, name).ok().flatten();
         let mut archive = Archive::open(BufReader::new(folder.open(name)?))?;
         // A replica of this room's own: what it settles between two devices is written under it. Any
-        // writer of the folder may have left the file, so its history is checked before it is loaded.
-        let copy = WorkingCopy::open_wary(&mut archive, ReplicaId::new(&ids::block_id()))?;
+        // writer of the folder may have left the file, so its history is checked before it is loaded,
+        // unless the index knows these very bytes to be sound.
+        let copy = crate::library::opened(&rooms.store, root, place, &mut archive)?;
         let journal = journal.or_else(|| rooms.adopt(&copy.id)).unwrap_or_else(ids::block_id);
         let unavailable = || Refusal::new(Code::Unavailable, "The server cannot keep what is written just now.");
         let mut state = rooms.journals(&journal).ok_or_else(unavailable)?;
@@ -590,6 +636,7 @@ impl Hosted {
             hold: 0,
             parked: false,
             missing: false,
+            wrote: false,
             lost: false,
         })
     }
@@ -626,6 +673,26 @@ impl Hosted {
         let due = if over { Some(now) } else { due };
         open.due.store(due.unwrap_or(u64::MAX), Ordering::Release);
         open.wake.notify_one();
+    }
+
+    /// Merges another copy of the document `id` into what the room holds, and saves at once. `None`, with
+    /// the copy left to the caller, when the room is not saving to its file, where what the copy brought
+    /// would be held in memory alone.
+    fn merge<R: Read + Seek>(&mut self, id: &str, theirs: &mut Option<Reading<'_, R>>, now: u64) -> Option<Answer<()>> {
+        if self.parked {
+            return None;
+        }
+        self.folder(now)?;
+        // The copy was read before the room was held, and its document may have left this place since.
+        if self.room.copy().id != id {
+            return Some(Err(crate::library::moved()));
+        }
+        if let Err(error) = self.room.merge_read(theirs.take()?, &mut self.state, now) {
+            return Some(Err(crate::library::unmerged(error)));
+        }
+        // A save that fails is tried again by the room, which holds what the copy brought.
+        self.save(now, true);
+        Some(Ok(()))
     }
 
     /// Saves everything the room has, and reads a file that was written back at once. That is when the
@@ -700,7 +767,11 @@ impl Hosted {
                 }
                 false
             }
-            Ok(saved) => matches!(saved, Some(Saved::Written | Saved::Restored { .. })),
+            Ok(saved) => {
+                let wrote = matches!(saved, Some(Saved::Written | Saved::Restored { .. }));
+                self.wrote |= wrote;
+                wrote
+            }
             Err(error) => {
                 log(&format!("\"{name}\" could not be saved, and is tried again: {error}"));
                 false
@@ -785,15 +856,16 @@ impl App {
         let (app, who, id) = (self.clone(), who.clone(), id.to_owned());
         blocking(move || {
             let found = app.locate(&who, &id)?;
-            app.seat(&who, &found)
+            app.seat(&who, &found, &id)
         })
         .await
     }
 
     /// Seats `who` in the room of a document they were found to reach.
-    fn seat(self: &Arc<Self>, who: &Signed, found: &Found) -> Answer<(Seat, mpsc::Receiver<Out>)> {
+    fn seat(self: &Arc<Self>, who: &Signed, found: &Found, id: &str) -> Answer<(Seat, mpsc::Receiver<Out>)> {
         let access = Access { role: may(found.role), name: self.signs_as(who)? };
         let lent = found.space.as_ref().is_none_or(|space| space.role < found.role);
+        let reach = self.reached(who, found, id);
         let (to, from) = mpsc::channel(BACKLOG);
         let (signed, person) = (who.session.clone(), who.person.username.clone());
         let (open, session) = self.rooms.within(self, &found.root, &found.place, |hosted, now| {
@@ -801,7 +873,7 @@ impl App {
                 return Err(Refusal::not_found());
             }
             let session = hosted.room.join(access, now);
-            hosted.seats.insert(session, Seated { to, signed, person, lent });
+            hosted.seats.insert(session, Seated { to, signed, person, lent, reach });
             Ok(session)
         })?;
         Ok((Seat { app: self.clone(), open, session, left: false, until: found.until }, from))
@@ -819,9 +891,20 @@ impl Seat {
 
     /// A binary message came from the device.
     pub async fn received(&self, frame: Vec<u8>) {
+        let app = self.app.clone();
         let heard = self.inside(move |hosted, session, now| {
-            if let Err(error) = hosted.room.received(session, &frame, &mut hosted.state, now) {
-                log(&format!("a room could not journal an edit, which waits for the next save: {error}"));
+            match hosted.room.received(session, &frame, &mut hosted.state, now) {
+                // What a share or a link let someone write is noted: a comment, or a session of edits.
+                Ok(true) => {
+                    if let Some(reach) = hosted.seats.get(&session).and_then(|seated| seated.reach.as_ref()) {
+                        let notes = matches!(ClientMessage::decode(&frame), Ok(Some(ClientMessage::Notes { .. })));
+                        app.noted(reach, if notes { Action::Comment } else { Action::Edit }, false);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    log(&format!("a room could not journal an edit, which waits for the next save: {error}"));
+                }
             }
             if hosted.room.unreadable(session) >= UNREADABLE {
                 let person = hosted.seats.get(&session).map_or("someone", |seated| seated.person.as_str());

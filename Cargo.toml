@@ -104,6 +104,9 @@ trash = "5.3"
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
 # A server for the fetch's tests.
 rcgen = "0.14"
+# Reports which features are used and how long sessions last, to a privacy-preserving analytics server.
+# Only its Analytics battery: no Sentry, no OpenTelemetry. It is published through git alone.
+tracing-batteries = { git = "https://github.com/SierraSoftworks/tracing-batteries-rs.git", default-features = false, features = ["analytics"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # The system's own word on a server's certificate, for the socket to a Letters server. ureq brings it too.
 rustls-platform-verifier = "0.7"

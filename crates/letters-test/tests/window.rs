@@ -7,7 +7,7 @@ use letters_render::image::Image;
 use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
 use letters_ui::{
-    Chrome, Cursor, Edge, Folder, Frame, Landing, Location, PictureState, Recent, Request, SafeMode, SaveState,
+    Chrome, Cursor, Edge, Folder, Frame, Landing, Location, Mode, PictureState, Recent, Request, SafeMode, SaveState,
     Settings, WindowButton,
 };
 
@@ -1199,6 +1199,40 @@ fn a_change_from_outside_shows_on_the_page_without_moving_it() {
     assert!(block_text(&window, "p0").len() > 1000, "the editor holds the change");
     let after = caret(&mut window);
     assert!((after.y - before.y).abs() <= 1.0, "the line the writer is on stays put: {before:?} to {after:?}");
+}
+
+#[test]
+fn the_landing_card_says_that_usage_reports_are_sent_while_the_shell_has_it_say_so() {
+    const SAID: &str = "Letters shares anonymous usage reports. You can turn this off in Settings.";
+    let mut window = blank();
+    window.ui().set_landing(Some(landing()));
+    assert!(window.find(Role::Label, SAID).is_none(), "a shell that sends none says nothing");
+    window.ui().set_usage_reports(true);
+    window.ui().set_usage_notice(true);
+    assert!(window.find(Role::Label, SAID).is_some());
+    // The way to where they are turned off is beside it.
+    window.click(Role::Button, "Settings").assert_open(Role::Dialog, "Settings");
+    assert!(window.find(Role::CheckBox, "Share anonymous usage reports").is_some());
+    window.key("Escape");
+    window.ui().set_usage_notice(false);
+    assert!(window.find(Role::Label, SAID).is_none());
+}
+
+#[test]
+fn the_window_says_what_it_shows_to_a_shell_that_counts_the_time_in_it() {
+    let mut window = blank();
+    assert_eq!(window.ui().mode(), Mode::Editor);
+    window.ui().set_landing(Some(landing()));
+    assert_eq!(window.ui().mode(), Mode::Landing);
+    window.ui().set_landing(None);
+    assert_eq!(window.ui().mode(), Mode::Editor);
+
+    // What is asked for through the palette, and what the window then shows.
+    for (asked, mode) in [("history", Mode::History), ("print view", Mode::Print)] {
+        let mut window = Harness::doc("# Roof plan\n\nThe roofer needs the scaffold up by 3 March.");
+        window.key("Mod+Shift+P").type_text(asked).key("Enter");
+        assert_eq!(window.ui().mode(), mode, "{asked}");
+    }
 }
 
 #[test]

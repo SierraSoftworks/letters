@@ -5,7 +5,7 @@ mod common;
 use std::cmp::Ordering;
 
 use common::{Folder, ID, bytes, open, package, paragraph};
-use letters_format::{Error, NOTES, OPLOG, STYLE, Save, Saved, WorkingCopy, conflict_copy_of, save};
+use letters_format::{Error, NOTES, OPLOG, Reading, STYLE, Save, Saved, WorkingCopy, conflict_copy_of, save};
 use letters_model::{
     Anchor, Block, BlockId, BlockKind, Body, Document, Note, NoteKind, Op, Pos, ReplicaId, Run, Style, Version,
 };
@@ -225,6 +225,34 @@ fn edits_that_arrive_without_their_file_settle_as_two_files_do() {
     assert_eq!(text(by_edits.model().doc()), "Hello underworld");
     assert_eq!(by_edits.notes, by_file.notes);
     assert!(level(&by_edits, &by_file), "each wrote the same change to settle it");
+}
+
+#[test]
+fn a_file_read_ahead_merges_as_one_read_at_the_merge() {
+    // The same clash twice, with a picture only the laptop's file holds. The desk writes on before the two
+    // meet: once after the file was read, as a host does that reads a file before it holds the document.
+    let meet = |ahead: bool| {
+        let (_, mut desk, mut laptop) = clashing();
+        laptop.entries.insert("assets/laptop.png".into(), vec![1; 16]);
+        let mut his = Folder::default();
+        save_from(&mut his, &mut laptop, "laptop");
+        let mut file = open(&his.files[NAME]);
+        if ahead {
+            let read = Reading::of(&mut file, ReplicaId::from(9)).unwrap();
+            typed(&mut desk, 0, "Oh. ");
+            desk.merge_read(read).unwrap();
+        } else {
+            typed(&mut desk, 0, "Oh. ");
+            desk.merge_from(&mut file).unwrap();
+        }
+        desk
+    };
+    let (ahead, at_once) = (meet(true), meet(false));
+
+    assert_eq!(clashes(&ahead), [[wrote("Ana", "Oh. Hello worlds"), wrote("Ben", "Hello underworld")]]);
+    assert_eq!(clashes(&ahead), clashes(&at_once));
+    assert_eq!(text(ahead.model().doc()), text(at_once.model().doc()));
+    assert!(ahead.entries.contains_key("assets/laptop.png"), "{:?}", ahead.entries.keys());
 }
 
 #[test]
@@ -693,6 +721,9 @@ fn bytes_from_a_stranger_that_cannot_be_read_are_refused_and_change_nothing() {
         folder.put("other.let", with_history(history));
         let merged = copy.merge_from(&mut open(&folder.files["other.let"]));
         assert!(matches!(merged, Err(Error::History(_))), "{why}: {merged:?}");
+        let mut other = open(&folder.files["other.let"]);
+        let read = Reading::of(&mut other, ReplicaId::from(9)).err();
+        assert!(matches!(read, Some(Error::History(_))), "{why}, read ahead: {read:?}");
         assert_eq!(copy.model().compare(&before).unwrap(), Some(Ordering::Equal), "{why}");
         assert_eq!(text(copy.model().doc()), "Hello world", "{why}");
 

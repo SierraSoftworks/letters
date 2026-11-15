@@ -19,9 +19,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{Found, blocking};
 use crate::error::{Answer, Refusal};
-use crate::session::{PEOPLE, Signed};
+use crate::session::{PEOPLE, Reader, Signed};
 use crate::spaces::{Place, Root};
 use crate::store::Table;
+use crate::telemetry::Event;
 use crate::{App, Shared};
 
 /// What is kept of a document's shares.
@@ -98,7 +99,9 @@ async fn people(State(app): State<Shared>, who: Signed) -> Answer<Json<Vec<Grant
     blocking(move || app.directory(&who).map(Json)).await
 }
 
-async fn shares(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -> Answer<Json<Shares>> {
+/// Asked by whoever has the document open, which a link's reader may. They are told in words that the
+/// shares are not theirs to see, where anything else of the server takes them for signed out.
+async fn shares(State(app): State<Shared>, Reader(who): Reader, Path(id): Path<String>) -> Answer<Json<Shares>> {
     blocking(move || app.shares(&who, &id).map(Json)).await
 }
 
@@ -108,6 +111,7 @@ async fn share(
     Path(id): Path<String>,
     Json(shares): Json<Shares>,
 ) -> Answer<Json<Shares>> {
+    app.telemetry.record(Event::ShareChanged);
     blocking(move || app.share(&who, &id, &shares.people).map(Json)).await
 }
 

@@ -10,7 +10,7 @@ use std::io::{Read, Seek};
 use std::mem;
 
 use letters_model::{
-    Block, BlockId, Change, Document, Model, Note, Notes, Op, OpError, ReplicaId, Revision, Stood, Style,
+    Block, BlockId, Change, Document, HistoryError, Model, Note, Notes, Op, OpError, ReplicaId, Revision, Stood, Style,
 };
 
 use crate::journal::Unsaved;
@@ -19,6 +19,10 @@ use crate::{Archive, DOCUMENT, Error, HISTORY, Manifest, NOTES, Package, STYLE};
 
 /// The entry that holds the document's history, as [`Model::save`] writes it.
 pub const OPLOG: &str = "history/oplog";
+
+/// How a [wary](WorkingCopy::wary) copy reads a stranger's whole history before a model loads it. See
+/// [`WorkingCopy::check`].
+pub type Check = fn(&[u8]) -> Result<(), HistoryError>;
 
 /// A document in memory between saves. It is the [`Replica`] that [`save`](crate::save) writes.
 pub struct WorkingCopy {
@@ -54,6 +58,9 @@ pub struct WorkingCopy {
     /// fail with [`Error::History`]. Edits that build on others this copy lacks are refused too, where a
     /// copy that is not wary lets them wait. See [`Self::open_wary`].
     pub wary: bool,
+    /// What a wary copy reads a whole history with in place of [`Model::check`], which contains a panic
+    /// only where panics unwind. An app whose panics end the process has a safer place to run it.
+    pub check: Check,
 }
 
 impl WorkingCopy {
@@ -77,6 +84,7 @@ impl WorkingCopy {
             history: None,
             was: None,
             wary: false,
+            check: Model::check,
         }
     }
 
@@ -86,17 +94,26 @@ impl WorkingCopy {
     /// changed in them goes into the history as one more change, and a file without a readable history
     /// starts one.
     pub fn open<R: Read + Seek>(file: &mut Archive<R>, replica: ReplicaId) -> Result<Self, Error> {
-        Self::opened(file, replica, false)
+        Self::opened(file, replica, None)
     }
 
     /// Reads a file from a stranger for editing, as [`Self::open`] does a person's own: one that came from
     /// elsewhere, or any file on a server. Its history is read with [`Model::check`] first, and one that
     /// is refused is left out as one that cannot be read is. The copy stays [wary](Self::wary).
     pub fn open_wary<R: Read + Seek>(file: &mut Archive<R>, replica: ReplicaId) -> Result<Self, Error> {
-        Self::opened(file, replica, true)
+        Self::open_checked(file, replica, Model::check)
     }
 
-    fn opened<R: Read + Seek>(file: &mut Archive<R>, replica: ReplicaId, wary: bool) -> Result<Self, Error> {
+    /// [`Self::open_wary`] for a copy that reads whole histories with `check`. See [`Self::check`].
+    pub fn open_checked<R: Read + Seek>(
+        file: &mut Archive<R>,
+        replica: ReplicaId,
+        check: Check,
+    ) -> Result<Self, Error> {
+        Self::opened(file, replica, Some(check))
+    }
+
+    fn opened<R: Read + Seek>(file: &mut Archive<R>, replica: ReplicaId, wary: Option<Check>) -> Result<Self, Error> {
         let Theirs { model, mut notes, history, unread_style, unread_notes } = Theirs::read(file, replica, true, wary)?;
         notes.pin(&model);
         let manifest = file.manifest();
@@ -111,7 +128,8 @@ impl WorkingCopy {
             seen: manifest.hashes.clone(),
             history,
             was: None,
-            wary,
+            wary: wary.is_some(),
+            check: wary.unwrap_or(Model::check),
         })
     }
 
@@ -212,18 +230,31 @@ impl WorkingCopy {
     /// read. Fails with [`Error::Unmerged`] when its history shares nothing with this one, or when it holds a
     /// style or notes this build cannot read, and with [`Error::History`] when its history cannot be read.
     pub fn merge_from<R: Read + Seek>(&mut self, other: &mut Archive<R>) -> Result<Change, Error> {
+        let theirs = Theirs::read(other, self.model.replica(), false, self.checks())?;
+        self.merge_read(Reading { theirs, file: other })
+    }
+
+    /// Merges a file that was [read](Reading::of) before, as [`Self::merge_from`] merges one it reads
+    /// itself, and fails as that does.
+    pub fn merge_read<R: Read + Seek>(&mut self, read: Reading<'_, R>) -> Result<Change, Error> {
+        let Reading { theirs, file } = read;
         // A style or notes that cannot be read would be left behind, in a copy the user may then throw away.
-        let change = self.take_in(Theirs::read(other, self.model.replica(), false, self.wary)?, false)?;
+        let change = self.take_in(theirs, false)?;
         // The save writes over this document's own file, so what only the other file holds comes into memory.
         let core = |name: &str| [DOCUMENT, STYLE, NOTES].contains(&name) || name.starts_with(HISTORY);
-        let names: Vec<String> = other.names().filter(|name| !core(name)).map(str::to_owned).collect();
+        let names: Vec<String> = file.names().filter(|name| !core(name)).map(str::to_owned).collect();
         for name in names {
             if !self.entries.contains_key(&name) && !self.seen.contains_key(&name) {
-                let bytes = other.read(&name)?.ok_or_else(|| Error::Missing(name.clone()))?;
+                let bytes = file.read(&name)?.ok_or_else(|| Error::Missing(name.clone()))?;
                 self.entries.insert(name, bytes);
             }
         }
         Ok(change)
+    }
+
+    /// What a file's whole history is read with before a model loads it, if this copy is wary.
+    fn checks(&self) -> Option<Check> {
+        self.wary.then_some(self.check)
     }
 
     /// Tries a history from elsewhere where the document cannot be hurt by it, if this copy is wary. It is
@@ -381,6 +412,7 @@ impl WorkingCopy {
             history: None,
             was: None,
             wary: true,
+            check: Model::check,
         };
         copy.replay(unsaved)?;
         copy.wary = false;
@@ -403,7 +435,7 @@ impl Replica for WorkingCopy {
         }
         let held = &disk.manifest().hashes;
         if held != &self.seen {
-            self.take_in(Theirs::read(disk, self.model.replica(), false, self.wary)?, true)?;
+            self.take_in(Theirs::read(disk, self.model.replica(), false, self.checks())?, true)?;
             self.seen = disk.manifest().hashes.clone();
         }
         // Notes this build cannot read are other people's words, which a note added here must not replace.
@@ -448,6 +480,26 @@ impl Replica for WorkingCopy {
     }
 }
 
+/// Another file of a document, read to be merged: the half of [`WorkingCopy::merge_from`] that needs no
+/// working copy, which takes a while when the history is long. A host that many write through reads the
+/// file before it holds the document, and holds the document for [`WorkingCopy::merge_read`] alone.
+pub struct Reading<'a, R> {
+    theirs: Theirs,
+    /// For the entries only this file holds, which are read as they are merged.
+    file: &'a mut Archive<R>,
+}
+
+impl<'a, R: Read + Seek> Reading<'a, R> {
+    /// Reads `file` as a stranger's, so that a [wary](WorkingCopy::wary) copy can merge it: its history is
+    /// read with [`Model::check`] before a model loads it. Fails with [`Error::History`] when the history
+    /// cannot be read.
+    ///
+    /// Any `replica` will do, the one that merges the file too: nothing is written under it.
+    pub fn of(file: &'a mut Archive<R>, replica: ReplicaId) -> Result<Self, Error> {
+        Ok(Self { theirs: Theirs::read(file, replica, false, Some(Model::check))?, file })
+    }
+}
+
 /// A file as read for merging: its history brought up to its document and style, and its notes.
 struct Theirs {
     model: Model,
@@ -470,7 +522,7 @@ impl Theirs {
         file: &mut Archive<R>,
         replica: ReplicaId,
         opening: bool,
-        wary: bool,
+        wary: Option<Check>,
     ) -> Result<Self, Error> {
         let document = file.document()?;
         let (style, notes) = (file.style(), file.notes());
@@ -481,8 +533,8 @@ impl Theirs {
 
         let history = file.read(OPLOG)?;
         let load = |bytes: &[u8]| {
-            if wary {
-                Model::check(bytes)?;
+            if let Some(check) = wary {
+                check(bytes)?;
             }
             Model::load(bytes, replica)
         };

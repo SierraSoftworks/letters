@@ -42,6 +42,8 @@ getrandom.workspace = true
 jiff.workspace = true
 yew.workspace = true
 yewi.workspace = true
+# Reports which features are asked for and how long the server runs. See src/telemetry.rs.
+tracing-batteries.workspace = true
 
 [build-dependencies]
 brotli.workspace = true

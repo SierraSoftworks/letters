@@ -16,7 +16,9 @@ use axum::body::Body;
 use axum::http::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, ORIGIN, SET_COOKIE};
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use http_body_util::BodyExt;
-use letters_api::{Entry, Error, NewDocument, Person, paths};
+use letters_api::{
+    Allows, CreatedLink, Entry, Error, Grant, Grantee, NewDocument, NewLink, Person, Role, Shares, paths,
+};
 use letters_server::config::Config;
 use letters_server::fetch::Roots;
 use letters_server::pages::editor::Editor;
@@ -127,7 +129,17 @@ impl Server {
 
     /// A server whose owner lets links be made.
     pub fn linking(name: &str) -> Self {
-        let linking = |at: &Path| format!("{}\n[links]\nenabled = true\n", sound(at));
+        Self::behind(name, None)
+    }
+
+    /// A server that makes links, and takes the word of `proxies` for where a request came from. `None`
+    /// leaves that as the settings have it unasked.
+    pub fn behind(name: &str, proxies: Option<&[&str]>) -> Self {
+        let named = proxies.map(|proxies| format!("[server]\nproxies = {proxies:?}"));
+        let linking = |at: &Path| {
+            let settings = format!("{}\n[links]\nenabled = true\n", sound(at));
+            named.as_ref().map_or(settings.clone(), |named| settings.replacen("[server]", named, 1))
+        };
         Self::over(Scratch::new(name), &linking, |app| app)
     }
 
@@ -428,4 +440,35 @@ pub fn texts(file: Vec<u8>) -> Vec<String> {
 /// The names of some rows, in their order.
 pub fn names(entries: &[Entry]) -> Vec<&str> {
     entries.iter().map(|entry| entry.name.as_str()).collect()
+}
+
+/// A link to make, for whoever its label says, that lets its reader take nothing away.
+pub fn link(label: &str, role: Role) -> NewLink {
+    NewLink { label: label.into(), role, expires: None, passphrase: None, allows: Allows::default() }
+}
+
+/// A server that makes links, where Ada has "Plan" in her own space and shares it with Ben to edit: the
+/// server, Ada, Ben, and the document's id.
+pub async fn planned(name: &str) -> (Server, Client, Client, String) {
+    let server = Server::linking(name);
+    let (ada, ben) = (server.person("ada", &[]), server.person("ben", &[]));
+    let id = ada.start("home", "", "Plan").await.id.expect("a document has an id");
+    let to = Grantee::Person { id: "sub-ben".into(), name: String::new() };
+    let people = vec![Grant { to, role: Role::Editor }];
+    ada.put::<Shares>(&paths::shares(&id), &Shares { people, links: Vec::new() }).await.unwrap();
+    (server, ada, ben, id)
+}
+
+/// Follows a link's address with a browser.
+pub async fn follow(browser: &mut Browser, made: &CreatedLink) -> Raw {
+    browser.get(made.url.strip_prefix(URL).expect("the address is this server's")).await
+}
+
+/// Ada makes a link to the document and a browser nobody is signed in with follows it.
+pub async fn let_in(server: &Server, ada: &Client, id: &str, new: &NewLink) -> (Browser, CreatedLink) {
+    let made: CreatedLink = ada.post(&paths::links(id), new).await.unwrap();
+    let mut browser = server.visitor();
+    let door = follow(&mut browser, &made).await;
+    assert_eq!(door.location(), paths::editor_page(id), "the link lets its reader in: {}", door.status);
+    (browser, made)
 }

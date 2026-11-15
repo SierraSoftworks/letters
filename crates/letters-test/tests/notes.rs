@@ -4,10 +4,12 @@
 use std::ops::Range;
 
 use letters_editor::Clip;
-use letters_model::{Anchor, Block, BlockKind, Document, Mark, Note, NoteKind, Notes, Pos, Reply, Run, Selection};
+use letters_model::{
+    Anchor, Block, BlockKind, Body, Document, Mark, Note, NoteKind, Notes, Pos, Reply, Run, Selection,
+};
 use letters_render::{Item, Point, Rect};
 use letters_test::{Found, Harness, Role};
-use letters_ui::{Cursor, Request};
+use letters_ui::{Cursor, Landing, Request};
 
 /// A paragraph `a` about a written quote, a picture `g` and a paragraph `b`, written by Sam.
 fn letter() -> Harness {
@@ -930,4 +932,123 @@ fn a_panel_with_no_open_notes_says_so() {
     window.click(Role::Button, "Notes");
     assert_eq!(listed(&mut window), Vec::<String>::new());
     assert!(window.controls().iter().any(|found| found.name == "No open notes."));
+}
+
+#[test]
+fn a_comment_is_started_from_the_keyboard_on_what_is_selected() {
+    let mut window = letter();
+    window.select("written quote").key("Mod+Alt+M");
+    assert!(window.find(Role::TextInput, "Comment").is_some_and(|field| field.focused), "ready to be typed");
+    window.type_text("Chased?").key("Enter");
+    assert_eq!(kept(&mut window), [("written quote".to_owned(), "Chased?".to_owned())]);
+
+    // A caret has nothing to comment on.
+    caret_at(&mut window, "b", 0);
+    window.key("Mod+Alt+M").assert_closed(Role::Dialog, "New comment");
+}
+
+/// The keys that step to the next note and to the one before.
+const NEXT: &str = "Mod+Alt+PageDown";
+const BACK: &str = "Mod+Alt+PageUp";
+
+/// The letter with two comments beside paragraph `a` and an import note beside paragraph `b`.
+fn thrice() -> Harness {
+    noted(vec![chased(), slates(), note("split", NoteKind::Import, Anchor::block("b"), "Merged cells split")])
+}
+
+#[test]
+fn the_keyboard_steps_through_the_notes_in_the_order_of_the_page() {
+    let (chased, slates, split) = ("Has anyone chased it?", "Welsh ones?", "Merged cells split");
+    // The block the caret is in, the keys pressed, and what the note that is open then starts with.
+    let cases: [(&str, &[&str], &str); 9] = [
+        ("a", &[NEXT], chased),
+        ("a", &[NEXT, NEXT], slates),
+        ("a", &[NEXT, NEXT, NEXT], split),
+        ("a", &[NEXT, NEXT, NEXT, NEXT], chased),
+        ("a", &[BACK], slates),
+        ("a", &[BACK, BACK, BACK], split),
+        ("g", &[NEXT], split),
+        ("g", &[BACK], slates),
+        ("b", &[BACK, BACK], slates),
+    ];
+    for (block, keys, starts) in cases {
+        let mut window = thrice();
+        caret_at(&mut window, block, 0);
+        let caret = window.editor().selection().cloned();
+        for key in keys {
+            window.key(key);
+        }
+        assert_eq!(reading(&mut window).as_deref(), Some(starts), "from {block}: {keys:?}");
+        assert_eq!(window.editor().selection().cloned(), caret, "from {block}: the caret stays where it was");
+    }
+}
+
+#[test]
+fn the_keyboard_steps_only_where_there_is_another_note_to_go_to() {
+    // No notes: nothing opens, and the palette does not offer the step.
+    let mut window = noted(Vec::new());
+    window.key(NEXT);
+    assert_eq!(reading(&mut window), None);
+    window.key("Mod+Shift+P").type_text("next note");
+    assert_eq!(listed(&mut window), [""; 0]);
+
+    // The only note opens, and then there is no other to step to.
+    let mut window = noted(vec![chased()]);
+    window.key(NEXT);
+    assert_eq!(reading(&mut window).as_deref(), Some("Has anyone chased it?"));
+    window.key("Mod+Shift+P").type_text("next note");
+    assert_eq!(listed(&mut window), [""; 0]);
+
+    // A reply that is being typed keeps its note open.
+    let mut window = thrice();
+    window.key(NEXT).type_text("On Tuesday").key(NEXT);
+    assert_eq!(reading(&mut window).as_deref(), Some("Has anyone chased it?"));
+
+    // A card over the window is answered first: there is no page to open a note on.
+    let mut window = thrice();
+    window.ui().set_landing(Some(Landing::default()));
+    window.key(NEXT);
+    window.ui().set_landing(None);
+    assert_eq!(reading(&mut window), None);
+
+    // The palette names the step and its key, and takes it.
+    let mut window = thrice();
+    caret_at(&mut window, "b", 0);
+    window.key("Mod+Shift+P").type_text("previous note");
+    let row = window.find(Role::ListBoxOption, "Previous note").expect("the step is a command");
+    assert_eq!(row.description.as_deref(), Some("Ctrl+Alt+Page Up"));
+    window.key("Enter");
+    assert_eq!(reading(&mut window).as_deref(), Some("Merged cells split"));
+}
+
+#[test]
+fn the_first_step_counts_from_the_block_the_caret_is_in_however_deep_it_stands() {
+    // A quote between two lines that each have a comment, and the caret in the line the quote holds.
+    let line = |id: &str, text: &str| Block::text(id, BlockKind::Paragraph, text);
+    let quote = Block { body: Body::Blocks(vec![line("in", "As they wrote")]), ..Block::new("q", BlockKind::Quote) };
+    let blocks = vec![line("a", "Above the quote"), quote, line("b", "Below the quote")];
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    let about = |id: &str, says: &str| note(id, NoteKind::Comment, Anchor::block(id), says);
+    window.ui().set_notes(Notes { notes: vec![about("a", "Above it"), about("b", "Below it")], ..Notes::default() });
+    caret_at(&mut window, "in", 0);
+    window.key(NEXT);
+    assert_eq!(reading(&mut window).as_deref(), Some("Below it"));
+}
+
+#[test]
+fn a_step_to_a_note_that_shows_leaves_the_page_where_it_is_read() {
+    // A long letter with the caret at its top, read further down where a comment is.
+    let line = |n: usize| Block::text(format!("p{n}").as_str(), BlockKind::Paragraph, format!("Item {n} of the works"));
+    let mut window = Harness::open(Document { blocks: (0..60).map(line).collect(), ..Document::default() });
+    let far = note("far", NoteKind::Comment, Anchor::block("p40"), "Still to do?");
+    window.ui().set_notes(Notes { notes: vec![far], ..Notes::default() });
+    caret_at(&mut window, "p0", 0);
+    let page = area(&mut window);
+    window.scroll_at(Point { x: page.x + page.width / 2.0, y: page.y + page.height / 2.0 }, 1000.0);
+    let marker = window.find(Role::Button, "1 comment").expect("the block of the comment is in view").bounds;
+
+    window.key(NEXT);
+    assert_eq!(reading(&mut window).as_deref(), Some("Still to do?"));
+    let after = window.find(Role::Button, "1 comment").map(|marker| marker.bounds);
+    assert_eq!(after, Some(marker), "the page is not brought to the caret on the way");
 }

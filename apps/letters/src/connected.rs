@@ -16,7 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 use letters_api::{Access, Code, CreatedLink, EntryKind, Grant, NewLink, Opened, Shares, paths};
-use letters_format::{Archive, WorkingCopy};
+use letters_format::{Archive, OPLOG, WorkingCopy};
 use letters_model::{Model, Notes, ReplicaId, Selection};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
 use sha2::{Digest, Sha256};
@@ -247,7 +247,7 @@ pub fn place(session: &Session, id: &str, copy: &Path, asks: &[Placing]) -> Plac
 
 /// Why a server did not do what the person asked, as they are to read it: the server's own sentence where
 /// it gave one.
-fn sentence(refused: &Refused) -> String {
+pub fn sentence(refused: &Refused) -> String {
     match refused {
         Refused::Said(said) => said.to_string(),
         other => format!("That could not be done: {other}."),
@@ -267,6 +267,8 @@ pub enum Sharing {
     Revoke(String),
     /// Who reached the document through a share.
     Log,
+    /// Who did before this time, which is that of the oldest row the dialog holds.
+    Earlier(u64),
 }
 
 /// What a document's server answered the Share dialog.
@@ -277,8 +279,11 @@ pub enum Shared {
     /// The link that was asked for, with its address.
     Made(CreatedLink),
     Revoked,
-    /// Who reached the document through a share, newest first.
-    Log(Vec<Access>),
+    /// Who reached the document through a share, newest first, and how many days the server keeps such
+    /// a row: 0 if it does not say.
+    Log(Vec<Access>, u32),
+    /// The page of that log that [`Sharing::Earlier`] asked for.
+    Earlier(Vec<Access>),
     /// Why it was not done, as the person is to read it.
     Refused(String),
 }
@@ -291,7 +296,8 @@ pub fn share(session: &Session, id: &str, ask: &Sharing) -> Shared {
         Sharing::People(people) => session.share(id, people).map(told),
         Sharing::Link(new) => session.make_link(id, new).map(Shared::Made),
         Sharing::Revoke(link) => session.revoke_link(id, link).map(|()| Shared::Revoked),
-        Sharing::Log => session.access_log(id).map(Shared::Log),
+        Sharing::Log => session.access_log(id, None).map(|log| Shared::Log(log, session.log_days().unwrap_or(0))),
+        Sharing::Earlier(time) => session.access_log(id, Some(*time)).map(Shared::Earlier),
     };
     answered.unwrap_or_else(|refused| {
         Shared::Refused(match refused {
@@ -562,11 +568,7 @@ impl Handing {
     /// The history and the notes of the document as the server's file holds it, to merge here. This
     /// waits on the network.
     fn bring(&self) -> Option<(Vec<u8>, Notes)> {
-        let file = self.session.file(&self.id, self.session.limits().ok()?.document).ok()?;
-        let mut file = Archive::open(io::Cursor::new(file)).ok()?;
-        // Nothing is written with it, so whose copy it is does not matter.
-        let copy = WorkingCopy::open(&mut file, ReplicaId::new(&crate::platform::block_id())).ok()?;
-        Some((copy.model().save(), copy.notes))
+        mergeable(self.session.file(&self.id, self.session.limits().ok()?.document).ok()?)
     }
 
     /// Owes the server the pictures in the copy's file that it does not list.
@@ -581,6 +583,20 @@ impl Handing {
             }
         }
     }
+}
+
+/// The history and the notes of a `.let` file that came from a server, for the window that has the
+/// document open to merge. `None` if there is nothing to merge without harm.
+///
+/// Others wrote the file, so its history is tried in a process of its own, where it can hurt nothing,
+/// before any document takes it in. A file with no history, or with none that stands, is not merged: a history
+/// started here for it would bring every block a second time.
+pub fn mergeable(file: Vec<u8>) -> Option<(Vec<u8>, Notes)> {
+    let mut file = Archive::open(io::Cursor::new(file)).ok()?;
+    crate::strangers::check(&file.read(OPLOG).ok()??).ok()?;
+    // Nothing is written with it, so whose copy it is does not matter.
+    let copy = WorkingCopy::open(&mut file, ReplicaId::new(&crate::platform::block_id())).ok()?;
+    Some((copy.model().save(), copy.notes))
 }
 
 /// Where a document keeps its pictures, as its blocks name them.

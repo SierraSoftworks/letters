@@ -207,6 +207,15 @@ impl Margin {
         open.filter_map(|note| Some((note, Kind::of(note)?)))
     }
 
+    /// The open notes an import left: how many, and the first in the order of the page, or as they were
+    /// added when none of them has a marker.
+    pub fn imports(&self) -> (usize, Option<&str>) {
+        let left: Vec<&Note> = self.open().filter(|(_, kind)| *kind == Kind::Import).map(|(note, _)| note).collect();
+        let mut marked = self.marks.iter().flat_map(|marker| &marker.notes);
+        let first = marked.find_map(|id| left.iter().copied().find(|note| note.id == *id)).or(left.first().copied());
+        (left.len(), first.map(|note| note.id.as_str()))
+    }
+
     /// The markers beside the blocks that have open notes.
     pub fn marks(&self) -> &[Marker] {
         &self.marks
@@ -275,6 +284,41 @@ impl Margin {
             (Some(at), true) => (at + all.len() - 1) % all.len(),
         };
         all.get(next).map(|id| (*id).to_owned())
+    }
+
+    /// The note the keyboard steps to, of those that have a marker, in the order of the document: the one
+    /// after the note that is open, or with `back` the one before it, round and round. With none open,
+    /// the first beside the block the caret is in or below it, or with `back` the last beside that block
+    /// or above it. `None` where there is no other note to go to, and while a reply is being typed, which
+    /// keeps its note open.
+    pub fn next(&self, back: bool, doc: &Document, caret: Option<&BlockId>) -> Option<String> {
+        fn holds(block: &Block, id: &BlockId) -> bool {
+            block.id == *id || block.body.blocks().iter().any(|part| holds(part, id))
+        }
+        if self.thread.as_ref().is_some_and(|(_, reply)| !reply.is_blank()) {
+            return None;
+        }
+        // Each note with where the block of its marker stands in the document.
+        let mut all: Vec<(Option<usize>, &String)> = Vec::new();
+        for marker in &self.marks {
+            let at = doc.blocks.iter().position(|top| top.id == marker.block);
+            all.extend(marker.notes.iter().map(|note| (at, note)));
+        }
+        let open = self.thread.as_ref().and_then(|(open, _)| all.iter().position(|(_, note)| *note == open));
+        let next = match open {
+            _ if all.is_empty() => return None,
+            Some(_) if all.len() == 1 => return None,
+            Some(at) if back => (at + all.len() - 1) % all.len(),
+            Some(at) => (at + 1) % all.len(),
+            None => {
+                // The notes beside the blocks above the caret's, and with `back` those beside its own too.
+                let own = caret.and_then(|caret| doc.blocks.iter().position(|top| holds(top, caret)));
+                let before = |at: usize| own.is_some_and(|own| at < own || (back && at == own));
+                let passed = all.iter().filter(|(at, _)| at.is_some_and(before)).count();
+                if back { (passed + all.len() - 1) % all.len() } else { passed % all.len() }
+            }
+        };
+        Some(all[next].1.clone())
     }
 
     /// Settles the conflict that is open, once one of its versions was chosen, and puts it away. Returns

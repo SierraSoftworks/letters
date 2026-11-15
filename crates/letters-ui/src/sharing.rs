@@ -10,7 +10,7 @@ use accesskit::Role;
 use letters_api::{Access as Reach, Allows, CreatedLink, Grant, Grantee, Link, NewLink, Role as Grade, Shares};
 use letters_editor::{Clip, Platform};
 
-use crate::activity;
+use crate::activity::{self, Earlier};
 use crate::color::fade;
 use crate::element::Element;
 use crate::icon::{self, Icon};
@@ -73,6 +73,8 @@ pub enum Sharing {
     Close,
     /// Shows one of the dialog's lists.
     Tab(Tab),
+    /// Asks for the rows of the log from before those listed.
+    Earlier,
     /// What the field for a group's name holds.
     Group(String),
     /// Shares the document with the group that is typed.
@@ -149,6 +151,10 @@ pub(crate) struct Share {
     tab: Tab,
     /// Who reached the document through a share, as the server last said. `None` until it has.
     log: Option<Vec<Reach>>,
+    /// Whether the server may have rows from before those.
+    earlier: Earlier,
+    /// How many days the server keeps a row of the log. 0 until a shell says.
+    kept: u32,
 }
 
 impl Share {
@@ -161,7 +167,21 @@ impl Share {
 
     /// Takes in who reached the document through a share, newest first.
     pub fn logged(&mut self, log: Vec<Reach>) {
+        self.earlier = paged(&log);
         self.log = Some(log);
+    }
+
+    /// Takes in the rows from before those held, which were asked for. Others come too late.
+    pub fn logged_earlier(&mut self, rows: Vec<Reach>) {
+        if let (Some(log), Earlier::Asked) = (&mut self.log, self.earlier) {
+            self.earlier = paged(&rows);
+            log.extend(rows);
+        }
+    }
+
+    /// Takes in how many days the server keeps a row of the log.
+    pub fn keeps(&mut self, days: u32) {
+        self.kept = days;
     }
 
     /// Takes in the shares as the server says they stand.
@@ -175,6 +195,10 @@ impl Share {
         self.notice = Some(why.to_owned());
         if let Some(form) = &mut self.form {
             form.asked = false;
+        }
+        // The earlier rows can be asked for again.
+        if self.earlier == Earlier::Asked {
+            self.earlier = Earlier::Offered;
         }
         if std::mem::take(&mut self.unsure) {
             requests.push(Request::Shares);
@@ -239,6 +263,13 @@ impl Share {
                 self.tab = tab;
                 if tab == Tab::Activity && served {
                     requests.push(Request::AccessLog);
+                }
+            }
+            Sharing::Earlier => {
+                let last = self.log.as_ref().and_then(|log| log.last());
+                if let (Some(last), Earlier::Offered) = (last, self.earlier) {
+                    requests.push(Request::AccessLogBefore(last.time));
+                    self.earlier = Earlier::Asked;
                 }
             }
             Sharing::Add(role) => {
@@ -387,7 +418,7 @@ impl Share {
     /// Who reached the document through a share, once the server has said.
     fn activity(&self) -> Element<Message> {
         match &self.log {
-            Some(log) => activity::view(log, self.now, self.zone),
+            Some(log) => activity::view(log, self.now, self.zone, self.kept, self.earlier),
             None if self.notice.is_some() => Element::column(),
             None => said("Asking the server who has reached this document."),
         }
@@ -722,6 +753,11 @@ fn dated(seconds: u64, now: Option<u64>, zone: i32) -> String {
 }
 
 /// A sentence that stands where a list would.
+/// Whether a page of the log may have rows before it: a server tells a full page while it has more.
+fn paged(rows: &[Reach]) -> Earlier {
+    if rows.len() >= activity::PAGE { Earlier::Offered } else { Earlier::None }
+}
+
 pub(crate) fn said(sentence: &str) -> Element<Message> {
     Element::paragraph(sentence, TextStyle::body()).fg(tokens::FG_MUTED)
 }

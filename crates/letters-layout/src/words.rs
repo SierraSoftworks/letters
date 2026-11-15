@@ -119,6 +119,11 @@ impl Lists {
         slot.is_some()
     }
 
+    /// Whether text of the list's script was set without it.
+    pub fn missed(&self, list: WordList) -> bool {
+        self.met & list.bit() != 0
+    }
+
     /// Notes a character of text being set. Returns whether its script is short of its list.
     pub fn note(&mut self, ch: char) -> bool {
         let Some(list) = WordList::of(ch).filter(|_| !WordList::BUILT_IN) else { return false };

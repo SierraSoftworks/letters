@@ -690,6 +690,76 @@ fn a_quotes_bar_stands_where_its_first_text_starts() {
 }
 
 #[test]
+fn a_callout_is_barred_and_headed_where_its_first_text_starts() {
+    const OWN: Color = Color::rgb(0xaa, 0x33, 0x66);
+    let cases: Vec<(&str, Vec<Block>, bool)> = vec![
+        ("Latin", vec![paragraph("a", "Hello")], false),
+        ("Hebrew", vec![paragraph("a", HEBREW)], true),
+        ("Arabic", vec![paragraph("a", ARABIC)], true),
+        ("Hebrew after Latin", vec![paragraph("a", "Hello"), paragraph("b", HEBREW)], false),
+        ("Latin after Hebrew", vec![paragraph("a", HEBREW), paragraph("b", "Hello")], true),
+    ];
+    for (script, inside, right) in cases {
+        for (head, title) in [("its tone's title", None), ("an icon alone", Some(String::new()))] {
+            let name = format!("{script} under {head}");
+            let titled = title.is_none();
+            let kind = BlockKind::Callout { tone: Tone::Warn, title, icon: None, color: Some("#aa3366".into()) };
+            let layout = laid(&doc(vec![container("c", kind, inside.clone())]));
+            let items = painted(&layout, everything());
+            let own = |item: &&Item| color_of(item) == Some(OWN);
+            let reach = |spans: Vec<(f32, f32)>| {
+                spans.into_iter().fold((f32::MAX, f32::MIN), |all, span| (all.0.min(span.0), all.1.max(span.1)))
+            };
+            let bar = reach(
+                items.iter().filter(|item| matches!(item, Item::Fill { .. })).filter(own).filter_map(across).collect(),
+            );
+            let written = reach(
+                items
+                    .iter()
+                    .filter(|item| matches!(item, Item::Glyphs { .. }))
+                    .filter(own)
+                    .filter_map(across)
+                    .collect(),
+            );
+            let icons: Vec<f32> = items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Path { origin, .. } => Some(origin.x),
+                    _ => None,
+                })
+                .collect();
+            let [icon] = icons.as_slice() else { panic!("{name}: one icon, not {icons:?}") };
+            let start = layout.caret(&Pos::new("a", 0)).unwrap();
+            let heads = layout.callouts(everything());
+            let [(_, pressed)] = heads.as_slice() else { panic!("{name}: one head, not {heads:?}") };
+            let (from, to) = (pressed.x, pressed.x + pressed.width);
+
+            assert!(bar.0 >= 0.0 && bar.1 <= WIDTH && from >= 0.0 && to <= WIDTH, "{name}: all of it is in the column");
+            assert!(
+                (from - 0.5..=to).contains(icon),
+                "{name}: a press on the icon is on the head, {icon} in {pressed:?}"
+            );
+            match right {
+                true => {
+                    assert!(start.x + start.width <= bar.0, "{name}: the bar is right of the text, {bar:?}");
+                    assert!(from > WIDTH / 2.0 && to <= bar.0, "{name}: the head is at the bar's side, {pressed:?}");
+                }
+                false => {
+                    assert!(bar.1 <= start.x, "{name}: the bar is left of the text, {bar:?}");
+                    assert!(to < WIDTH / 2.0 && bar.1 <= from, "{name}: the head is at the bar's side, {pressed:?}");
+                }
+            }
+            if titled {
+                assert!(from - 0.5 <= written.0 && written.1 <= to, "{name}: and one on the title, {written:?}");
+                assert_eq!(*icon > written.1, right, "{name}: the icon leads the title, {icon} and {written:?}");
+            } else {
+                assert_eq!(start.x <= *icon, right, "{name}: the text starts past the icon, {icon} and {start:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn plain_strings_are_shaped_for_widgets() {
     let shaper = Shaper::new(fonts());
     let font = FontSpec::new(letters_fonts::SANS, 13.0);
@@ -715,6 +785,44 @@ fn plain_strings_are_shaped_for_widgets() {
     let [Item::Glyphs { origin, glyphs, .. }] = &list.items[..] else { panic!("one run of glyphs") };
     assert_eq!((origin.x, origin.y), (10.0, 20.0 + label.baseline));
     assert_eq!(glyphs.len(), text.len());
+}
+
+#[test]
+fn a_label_of_thai_wraps_between_words_once_its_word_list_is_here() {
+    let font = FontSpec::new(letters_fonts::SANS, 13.0);
+    let (text, list) = (THAI.concat(), WordList::Thai.data());
+    let between: Vec<usize> =
+        THAI.iter().scan(0, |end, word| Some(std::mem::replace(end, *end + word.len()))).collect();
+    // Where the label's first line ends, at each of several widths.
+    let ends = |shaper: &Shaper| -> Vec<usize> {
+        let whole = shaper.shape(&text, &font, None).width;
+        let at =
+            |tenths: u8| shaper.shape(&text, &font, Some(whole * f32::from(tenths) / 10.0)).stops.last().unwrap().0;
+        (3..9).map(at).collect()
+    };
+    let whole = |ends: &[usize]| ends.iter().all(|end| between.contains(end));
+
+    let shaper = Shaper::new(fonts());
+    let first = ends(&shaper);
+    assert!(first.iter().all(|end| *end < text.len()), "a width wraps the label: {first:?}");
+    // A build either has the lists in it, or is handed each when a label turns out to need it.
+    if !WordList::BUILT_IN {
+        assert!(!whole(&first), "without the list a line ends wherever it fills: {first:?}");
+        assert_eq!(shaper.take_unlisted(), [WordList::Thai], "the script is told of");
+        assert_eq!(shaper.take_unlisted(), [], "and only once");
+        assert!(!shaper.add_word_list(WordList::Thai, &WordList::Lao.data()), "another script's list is refused");
+        assert!(shaper.add_word_list(WordList::Thai, &list), "labels of the script are to be shaped again");
+    }
+    assert_eq!(shaper.take_unlisted(), [], "a script is not told of where its list is");
+    assert!(!shaper.add_word_list(WordList::Thai, &list), "a list that is here already changes nothing");
+    let kept = ends(&shaper);
+    assert!(whole(&kept), "no line ends inside a word: {kept:?} of {between:?}");
+
+    // A list that comes before any label of its script leaves nothing to shape again.
+    let ahead = Shaper::new(fonts());
+    ahead.shape("Save changes", &font, Some(40.0));
+    assert!(!ahead.add_word_list(WordList::Thai, &list), "no label was of the script");
+    assert_eq!((ends(&ahead), ahead.take_unlisted()), (kept, vec![]), "as if the list had come late");
 }
 
 #[test]

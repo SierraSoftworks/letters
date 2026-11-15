@@ -45,6 +45,18 @@ pub fn ask(
     path: &str,
     body: Option<(&str, &[u8])>,
 ) -> impl Future<Output = Result<Vec<u8>, letters_api::Error>> + 'static + use<> {
+    let answered = ask_and_wait(window, method, path, body);
+    async move { answered.await.map_err(|(refusal, _)| refusal) }
+}
+
+/// As [`ask`], with how many seconds the server said to wait before the same is asked again, where a
+/// refusal says: its `Retry-After`.
+pub fn ask_and_wait(
+    window: &Window,
+    method: &str,
+    path: &str,
+    body: Option<(&str, &[u8])>,
+) -> impl Future<Output = Result<Vec<u8>, (letters_api::Error, Option<u32>)>> + 'static + use<> {
     let request = RequestInit::new();
     request.set_method(method);
     if let Some((kind, bytes)) = body {
@@ -56,19 +68,21 @@ pub fn ask(
     }
     let sent = window.fetch_with_str_and_init(path, &request);
     async move {
-        let lost = |_| letters_api::Error::new(letters_api::Code::Unavailable, "The server could not be reached.");
+        let lost =
+            |_| (letters_api::Error::new(letters_api::Code::Unavailable, "The server could not be reached."), None);
         let response: Response = JsFuture::from(sent).await.map_err(lost)?.dyn_into().map_err(lost)?;
         let bytes = JsFuture::from(response.array_buffer().map_err(lost)?).await.map_err(lost)?;
         let bytes = Uint8Array::new(&bytes).to_vec();
         if response.ok() {
             return Ok(bytes);
         }
+        let wait = response.headers().get("retry-after").ok().flatten().and_then(|wait| wait.trim().parse().ok());
         // What stands between the page and the server may refuse in words of its own.
         let unread = || {
             let message = format!("The server answered {} and did not say why.", response.status());
             letters_api::Error::new(letters_api::Code::Unknown, message)
         };
-        Err(serde_json::from_slice(&bytes).unwrap_or_else(|_| unread()))
+        Err((serde_json::from_slice(&bytes).unwrap_or_else(|_| unread()), wait))
     }
 }
 

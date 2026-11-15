@@ -22,6 +22,8 @@ use letters_api::{
     Access, Action, Allows, Code, CreatedLink, Exchange, Grant, Grantee, Link, NewLink, Opened, Person, Renewal, Role,
     Shares, Space, SpaceKind, Token, Trust, Who, paths,
 };
+use letters_format::{OPLOG, Package};
+use letters_model::{Block, BlockKind, Document, Model, ReplicaId};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -141,7 +143,7 @@ impl Letters {
         };
         match asked.line.as_str() {
             "GET /api/v1/server" => json(&serde_json::json!({
-                "product": "letters-server", "name": "Home", "version": "0.1.0", "protocols": [1],
+                "product": "letters-server", "name": "Home", "version": "0.1.0", "protocols": [1], "log_days": 90,
             })),
             "POST /api/v1/session/exchange" => {
                 let Exchange { code, verifier } = serde_json::from_slice(&asked.body).unwrap();
@@ -199,12 +201,15 @@ impl Letters {
             "GET /api/v1/documents/d1/access" => json(&[Access {
                 time: 3,
                 who: Who::Link { id: "link-1".into(), label: "Accountant".into() },
+                link: None,
                 action: Action::Open,
                 role: Role::Reader,
                 refused: false,
+                lasted: None,
                 address: "192.0.2.7".into(),
                 browser: "Firefox".into(),
             }]),
+            "GET /api/v1/documents/d1/access?before=3" => json(&Vec::<Access>::new()),
             "GET /api/v1/forbidden" => said(Code::Forbidden, "That is not yours to read."),
             "GET /api/v1/elsewhere" => Answer("302 Found", "location: https://elsewhere.example/\r\n", Vec::new()),
             "GET /api/v1/page" => {
@@ -707,6 +712,32 @@ fn a_server_signed_in_to_is_listed_until_the_person_signs_out() {
 }
 
 #[test]
+fn a_servers_documents_are_recent_until_the_person_signs_out_of_it() {
+    let home = Scratch::new("connected-lately");
+    let lately = |host: &str, name: &str| servers::Lately {
+        address: format!("https://{host}/d/d1"),
+        name: name.into(),
+        folder: format!("{host} / Home"),
+        opened: "2026-11-15T20:00:00Z".into(),
+    };
+    let names = || servers::lately(&home.0).into_iter().map(|lately| lately.name).collect::<Vec<_>>();
+    assert!(names().is_empty());
+
+    // The newest is first, and a document that is opened again, renamed since, has one row.
+    for (host, name) in
+        [("a.example", "Roof"), ("b.example", "Garden"), ("a.example.org", "Rates"), ("a.example", "Roof repairs")]
+    {
+        servers::opened(&home.0, lately(host, name)).unwrap();
+    }
+    assert_eq!(names(), ["Roof repairs", "Rates", "Garden"]);
+    assert_eq!(servers::lately(&home.0)[0], lately("a.example", "Roof repairs"));
+
+    // Signing out of a server takes its documents off the list, and no other server's.
+    servers::forget(&home.0, "https://a.example").unwrap();
+    assert_eq!(names(), ["Rates", "Garden"]);
+}
+
+#[test]
 fn a_sign_in_that_did_not_work_says_why_in_a_sentence() {
     let (home, server) = (Scratch::new("connected-unsigned"), Server::start());
     let stranger = Client::new(server.client().origin(), &Roots::These(Vec::new())).unwrap();
@@ -730,6 +761,38 @@ fn nobody_is_sent_to_sign_in_at_what_is_no_letters_server() {
         connected::enter(&stranger, "d1", None, None, &home.0, &no_browser, &|_, _| (), &AtomicBool::new(false));
 
     assert!(matches!(entered, Err(Unreached::Refused(Refused::Unreachable(_)))));
+}
+
+/// A history as a stranger writes it: one that Loro panics on.
+const HARMFUL: &[u8] = include_bytes!("../../../fuzz/corpus/history/a-history-loro-panics-on.bin");
+
+#[test]
+fn a_servers_file_is_merged_only_with_a_history_that_does_no_harm() {
+    common::app();
+    let blocks = vec![Block::text("p", BlockKind::Paragraph, "Slates first.")];
+    let model = Model::new(Document { blocks, ..Document::default() }, ReplicaId::new("a device"));
+    let file = |history: Option<Vec<u8>>| {
+        let mut package = Package {
+            id: "8f14e45f-ceea-467f-a0e6-5b1d3c2a9f01".into(),
+            created: "2026-11-15T20:00:00Z".into(),
+            document: model.doc().clone(),
+            entries: Default::default(),
+        };
+        package.entries.extend(history.map(|history| (OPLOG.to_owned(), history)));
+        let mut out = std::io::Cursor::new(Vec::new());
+        letters_format::write(&mut out, &package).unwrap();
+        out.into_inner()
+    };
+
+    let (history, _) = connected::mergeable(file(Some(model.save()))).expect("a sound history is merged");
+    let merged = Model::load(&history, ReplicaId::new("another device")).unwrap();
+    assert_eq!(merged.doc().blocks, model.doc().blocks);
+
+    // One that would harm is not, and neither is a file with none: its blocks would come a second time.
+    for (unsound, why) in [(Some(HARMFUL.to_vec()), "harmful"), (None, "no history"), (Some(vec![1, 2, 3]), "unread")] {
+        assert!(connected::mergeable(file(unsound)).is_none(), "{why}");
+    }
+    assert!(connected::mergeable(b"no file".to_vec()).is_none());
 }
 
 #[test]
@@ -774,8 +837,11 @@ fn the_share_dialog_is_answered_by_the_documents_server() {
     assert!(now.links.iter().any(|link| link.id == made.link.id && link.revoked.is_some()), "{now:?}");
 
     // Who came through a share is listed as the server logged it.
-    let Shared::Log(log) = share(Sharing::Log) else { panic!("the log is told") };
+    let Shared::Log(log, days) = share(Sharing::Log) else { panic!("the log is told") };
     assert!(matches!(&log[..], [Access { who: Who::Link { label, .. }, .. }] if label == "Accountant"), "{log:?}");
+    assert_eq!(days, 90, "and how long the server keeps it");
+    // The page before its oldest row is asked for by that row's time.
+    assert_eq!(share(Sharing::Earlier(log[0].time)), Shared::Earlier(Vec::new()));
 
     // A refusal is the server's own sentence, and a server that shares nothing yet is named as one.
     assert_eq!(

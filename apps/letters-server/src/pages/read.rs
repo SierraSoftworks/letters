@@ -4,6 +4,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use letters_api::Action;
 use letters_convert::{HtmlPage, WebFont, to_html_with};
 use letters_fonts::{DISPLAY, MONO, SANS};
 use letters_ui::{Scheme, palette};
@@ -46,6 +47,7 @@ pub async fn page(State(app): State<Shared>, Opener(who): Opener, Path(id): Path
             let mut archive = app.library.open(&found.root, &found.place)?;
             let (document, style) = (archive.document()?, archive.style()?);
             app.note_opened(&who, &id)?;
+            app.note(&who, &found, &id, Action::Open, false);
             let urls = FAMILIES.map(|(_, file, _)| format!("{}/{FACES}/{file}", statics().base));
             let fonts: Vec<WebFont> = FAMILIES
                 .iter()

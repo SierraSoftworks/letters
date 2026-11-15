@@ -3,21 +3,29 @@
 use std::io;
 
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::header::RETRY_AFTER;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use letters_api::{Code, Error};
 
 use crate::store::StoreError;
 
-/// A request that was refused. It is answered with its [`Error`] under the status of its code.
+/// A request that was refused. It is answered with its [`Error`] under the status of its code, and with
+/// the seconds to wait before asking again, where the refusal knows them.
 #[derive(Debug)]
-pub struct Refusal(pub Error);
+pub struct Refusal(pub Error, Option<u32>);
 
 pub type Answer<T> = Result<T, Refusal>;
 
 impl Refusal {
     pub fn new(code: Code, message: impl Into<String>) -> Self {
-        Self(Error::new(code, message))
+        Self(Error::new(code, message), None)
+    }
+
+    /// Too much was asked at once. In `seconds` it is worth asking again, which the answer says as
+    /// `Retry-After`, for a page that asks by itself.
+    pub fn slow(seconds: u64, message: impl Into<String>) -> Self {
+        Self(Error::new(Code::Slow, message), Some(u32::try_from(seconds.max(1)).unwrap_or(u32::MAX)))
     }
 
     pub fn invalid(message: impl Into<String>) -> Self {
@@ -41,12 +49,22 @@ impl Refusal {
     pub fn code(&self) -> Code {
         self.0.code
     }
+
+    /// The seconds to wait before asking again, where the refusal knows them.
+    pub fn wait(&self) -> Option<u32> {
+        self.1
+    }
 }
 
 impl IntoResponse for Refusal {
     fn into_response(self) -> Response {
-        let status = StatusCode::from_u16(self.0.code.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (status, Json(self.0)).into_response()
+        let Self(error, wait) = self;
+        let status = StatusCode::from_u16(error.code.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let mut response = (status, Json(error)).into_response();
+        if let Some(seconds) = wait {
+            response.headers_mut().insert(RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        response
     }
 }
 

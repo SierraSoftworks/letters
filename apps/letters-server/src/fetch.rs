@@ -65,7 +65,7 @@ impl Fetches {
     /// Waits for a turn to fetch, as long as a fetch itself may take. The turn is to be kept until the
     /// fetch has ended, whether or not whoever asked still waits for it.
     pub async fn turn(&self) -> Answer<OwnedSemaphorePermit> {
-        let busy = || Refusal::new(Code::Slow, "The server is fetching all it can just now. Try again in a moment.");
+        let busy = || Refusal::slow(5, "The server is fetching all it can just now. Try again in a moment.");
         let turn = tokio::time::timeout(LIMIT, self.turns.clone().acquire_owned()).await;
         turn.map_err(|_| busy())?.map_err(|_| busy())
     }
@@ -135,9 +135,13 @@ struct Trusted {
 const TRUSTED: Table<Trusted> = Table::new("trusted");
 
 impl App {
-    /// The person trusts the document `id` from now on.
+    /// The person trusts the document `id` from now on. Whoever only a link let in trusts it for their
+    /// own visit: the link's next holder decides anew.
     pub fn trust(&self, who: &Signed, id: &str) -> Answer<()> {
         self.locate(who, id)?;
+        if who.alone() {
+            return self.trust_visit(&who.session);
+        }
         Ok(self.store.write(|batch| {
             let mut trusted = batch.get(&TRUSTED, &who.person.id)?.unwrap_or_default();
             if !trusted.documents.iter().any(|document| document == id) {
@@ -153,6 +157,9 @@ impl App {
     pub fn trusts(&self, who: &Signed, found: &Found, id: &str) -> Answer<bool> {
         if found.space.is_some() {
             return Ok(true);
+        }
+        if let Some(linked) = who.link.as_ref().filter(|linked| linked.alone) {
+            return Ok(linked.trusted);
         }
         let trusted = self.store.get(&TRUSTED, &who.person.id)?.unwrap_or_default();
         Ok(trusted.documents.iter().any(|document| document == id))

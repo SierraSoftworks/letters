@@ -134,8 +134,12 @@ const download = (files) => [(bytes) => bytes.length, (bytes) => gzipSync(bytes,
 );
 
 /** The files of a folder that the editor fetches. Their licences travel with them and are never asked for. */
-const folder = (name) => readdirSync(join(dist, name)).filter((file) => !file.endsWith(".txt")).map((file) => read(name, file));
-const [fonts, maths, dictionaries] = ["fonts", "maths", "dictionaries"].map(folder);
+const names = (name) => readdirSync(join(dist, name)).filter((file) => !file.endsWith(".txt"));
+const folder = (name) => names(name).map((file) => read(name, file));
+const [maths, dictionaries] = ["maths", "dictionaries"].map(folder);
+/** The first frame of a document in Latin script waits for this stand-in for the first font, and no other. */
+const FIRST = "Inter-Latin.ttf";
+const fonts = names("fonts").filter((file) => file !== FIRST).map((file) => read("fonts", file));
 /** The faces that back up the fonts. A document fetches one when it first shows a character of its script. */
 const fallback = readdirSync(join(dist, "fallback")).filter((file) => !file.endsWith(".txt"));
 /** The scripts `letters.js` imports, which `wasm-bindgen` writes beside it. */
@@ -145,10 +149,12 @@ const snippets = readdirSync(join(dist, "snippets"), { recursive: true })
 const downloads = [
   ["letters_bg.wasm", [served]],
   ["letters.js", [read("letters.js"), ...snippets]],
-  [`fonts (${fonts.length} files)`, fonts],
+  [`fonts/${FIRST}`, [read("fonts", FIRST)]],
 ];
 // A document with maths has the maths faces before its first frame, too.
 const later = [
+  [`fonts (${fonts.length} files)`, fonts],
+  ["maths, at a first formula", [read("maths_bg.wasm"), read("maths.js")]],
   [`maths (${maths.length} files)`, maths],
   [`dictionaries (${dictionaries.length})`, dictionaries],
   ["exports, when asked for", [read("export_bg.wasm"), read("export.js")]],

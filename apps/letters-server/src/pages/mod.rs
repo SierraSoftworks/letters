@@ -36,6 +36,7 @@ use yew::ServerRenderer;
 use crate::api::blocking;
 use crate::auth::{Desktop, browser};
 use crate::error::{Answer, Refusal};
+use crate::links::Caller;
 use crate::session::{Carrier, Reader, Signed, named_document};
 use crate::shares::may_share;
 use crate::spaces::{Place, seconds, shown};
@@ -119,7 +120,10 @@ impl FromRequestParts<Shared> for Opener {
     async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Response> {
         let id = named_document(parts, app).await;
         match Reader::read(app, &parts.method, &parts.headers, id.as_deref()) {
-            Ok(Reader(who)) if who.carrier == Carrier::Cookie => Ok(Self(who)),
+            Ok(Reader(mut who)) if who.carrier == Carrier::Cookie => {
+                who.from = Caller::of(parts, app);
+                Ok(Self(who))
+            }
             Ok(_) => Err(turned_away(app, parts, &Refusal::signed_out()).await),
             Err(refusal) => Err(turned_away(app, parts, &refusal).await),
         }

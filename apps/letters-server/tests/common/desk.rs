@@ -3,7 +3,7 @@
 use axum::http::header::{AUTHORIZATION, COOKIE};
 use axum::http::{HeaderMap, Method};
 use letters_api::Error;
-use letters_model::{Block, Model, Notes, Op, Pos, ReplicaId};
+use letters_model::{Anchor, Block, Extra, Model, Note, NoteKind, Notes, Op, Pos, ReplicaId, Run};
 use letters_server::rooms::{Out, Seat};
 use letters_server::session::{Reader, Signed};
 use letters_sync::{Client as Line, Event, Local, Refusal};
@@ -80,6 +80,25 @@ impl Desk {
     pub fn write(&mut self, text: &str) -> u64 {
         let first = self.model.as_ref().expect("the desk holds a copy").doc().blocks[0].id.clone();
         self.edit([Op::InsertText { at: Pos::new(first, 0), text: text.into() }])
+    }
+
+    /// The person writes a comment at the start of the document.
+    pub fn comment(&mut self, says: &str) -> u64 {
+        let model = self.model.as_ref().expect("the desk holds a copy");
+        let mut note = Note {
+            id: letters_server::ids::block_id(),
+            kind: NoteKind::Comment,
+            anchor: Anchor::range(model.doc().blocks[0].id.clone(), 0..0),
+            author: "Someone".into(),
+            created: "2026-11-15T12:00:00Z".into(),
+            resolved: false,
+            content: vec![Run::plain(says)],
+            replies: Vec::new(),
+            extra: Extra::new(),
+        };
+        note.anchor.pin(model);
+        self.notes.notes.push(note);
+        self.line.changed(Local { model: self.model.as_ref(), notes: &self.notes }, NOW)
     }
 
     /// Whether the server said it keeps what the desk held when a call returned `number`.

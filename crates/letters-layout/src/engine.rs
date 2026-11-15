@@ -58,6 +58,8 @@ pub(crate) struct Engine {
     traced: Option<(Box<str>, letters_math::Style, Option<Formula>)>,
     /// Whether a formula may link. Only a document that is trusted may.
     pub links: bool,
+    /// Whether the formula last asked for was not set only because the maths engine is not here yet.
+    pub waits: bool,
     fcx: FontContext,
     lcx: LayoutContext<Brush>,
     /// The bytes behind each registered blob, by blob id.
@@ -99,6 +101,7 @@ impl Engine {
             maths: letters_math::Cache::default(),
             traced: None,
             links: false,
+            waits: false,
             fcx: FontContext { collection, source_cache: SourceCache::default() },
             lcx: LayoutContext::new(),
             sources: Vec::new(),
@@ -114,6 +117,11 @@ impl Engine {
         };
         engine.add(fonts);
         engine
+    }
+
+    /// Forgets the formula last traced, which is none where the engine was not there to trace it.
+    pub fn retrace(&mut self) {
+        self.traced = None;
     }
 
     /// The formula of `source` with the term in `color` that a caret at the byte `caret` of it is at, where

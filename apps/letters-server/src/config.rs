@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use letters_trust::Source;
@@ -25,6 +25,8 @@ pub struct Config {
     pub trust: Trust,
     #[serde(default)]
     pub links: Links,
+    #[serde(default)]
+    pub telemetry: Telemetry,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -40,6 +42,10 @@ pub struct Server {
     pub url: String,
     /// Where the server keeps what files cannot hold. On local disk.
     pub state: PathBuf,
+    /// The proxies whose word is taken for where a request came from, by their own addresses. This
+    /// machine unless set, which is where `tailscale serve` stands. Nobody else is believed.
+    #[serde(default = "default_proxies")]
+    pub proxies: Vec<IpAddr>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -126,12 +132,35 @@ pub struct Links {
     pub enabled: bool,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Telemetry {
+    /// Whether the server reports how it is used, with nothing of its documents or its people. On unless
+    /// the server's owner says no. See `telemetry.rs` for all that is said.
+    #[serde(default = "default_reports")]
+    pub enabled: bool,
+}
+
+impl Default for Telemetry {
+    fn default() -> Self {
+        Self { enabled: default_reports() }
+    }
+}
+
+const fn default_reports() -> bool {
+    true
+}
+
 fn default_name() -> String {
     "Letters".into()
 }
 
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 8080))
+}
+
+fn default_proxies() -> Vec<IpAddr> {
+    vec![Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()]
 }
 
 fn default_session_days() -> u32 {

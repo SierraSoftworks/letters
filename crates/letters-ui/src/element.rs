@@ -153,6 +153,7 @@ pub struct Element<M> {
     pub(crate) popover: Option<Box<Popover<M>>>,
     pub(crate) tooltip: Option<(String, Side)>,
     pub(crate) telling: bool,
+    pub(crate) hollow: bool,
     pub(crate) in_view: bool,
     pub(crate) fitted: Option<Fitted>,
     pub(crate) later: Option<Later<M>>,
@@ -192,6 +193,7 @@ impl<M> Element<M> {
             popover: None,
             tooltip: None,
             telling: false,
+            hollow: false,
             in_view: false,
             fitted: None,
             later: None,
@@ -411,6 +413,13 @@ impl<M> Element<M> {
     /// goes last among the children to be drawn and hit above them.
     pub fn overlay(mut self) -> Self {
         self.style.overlay = true;
+        self
+    }
+
+    /// Leaves the pointer to what lies under the element wherever none of its children is, for an overlay
+    /// that only says where the things it holds go.
+    pub fn hollow(mut self) -> Self {
+        self.hollow = true;
         self
     }
 

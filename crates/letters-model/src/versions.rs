@@ -151,14 +151,26 @@ pub(crate) fn revisions(loro: &LoroDoc) -> Vec<(Frontiers, Frontiers)> {
 }
 
 /// The changes of a history in the order every device lists them.
+///
+/// Loro stores what a writer wrote at once in parts of about 4 KB, each written on the one before. They
+/// are told here as the one change they were written as, so that a long paste is one step.
 fn changes(loro: &LoroDoc) -> Vec<ChangeMeta> {
-    let mut changes = Vec::new();
+    let mut changes: Vec<ChangeMeta> = Vec::new();
     for (peer, end) in loro.oplog_vv().iter() {
-        let mut counter = 0;
+        let (first, mut counter) = (changes.len(), 0);
         while counter < *end {
-            let Some(change) = loro.get_change(ID::new(*peer, counter)) else { break };
-            counter = change.id.counter + i32::try_from(change.len.max(1)).unwrap_or(i32::MAX);
-            changes.push(change);
+            let Some(part) = loro.get_change(ID::new(*peer, counter)) else { break };
+            counter = part.id.counter + i32::try_from(part.len.max(1)).unwrap_or(i32::MAX);
+            match changes[first..].last_mut() {
+                Some(change)
+                    if part.timestamp == change.timestamp
+                        && part.message == change.message
+                        && part.deps.as_single() == Some(last(change)) =>
+                {
+                    change.len += part.len;
+                }
+                _ => changes.push(part),
+            }
         }
     }
     changes.sort_by_key(|change| (change.lamport, change.id.peer));

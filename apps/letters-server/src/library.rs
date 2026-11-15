@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Cursor, Read, Seek};
 use std::sync::Mutex;
 
-use letters_format::{Archive, Files, OPLOG, Replica, Save, Saved, WorkingCopy, conflict_copy_of, file_name};
+use letters_format::{
+    Archive, Files, OPLOG, Reading, Replica, Save, Saved, WorkingCopy, conflict_copy_of, file_name, hash,
+};
 use letters_model::{Block, BlockId, BlockKind, Document, Model, NoteKind, Op, ReplicaId, Style};
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +50,29 @@ pub struct Known {
     pub contributors: Vec<String>,
     /// The import notes nobody has settled.
     pub import_notes: u32,
+    /// The file's history, when it is known to be sound.
+    #[serde(default)]
+    sound: Option<Sound>,
+}
+
+/// A history that need not be checked again: it passed the check, or the server itself wrote it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Sound {
+    /// The hash of the history's bytes, as the server worked it out from the bytes it read or wrote. What
+    /// a file's manifest says of them is never taken for it.
+    history: String,
+    /// The check it stands for, as [`Model::check_name`] names it. Another check knows nothing of it.
+    by: String,
+}
+
+impl Sound {
+    fn of(history: &[u8]) -> Self {
+        Self { history: hash(history), by: Model::check_name() }
+    }
+
+    fn is(&self, history: &[u8]) -> bool {
+        self.by == Model::check_name() && self.history == hash(history)
+    }
 }
 
 /// A file that holds a document: a root, by its key, and the place in it.
@@ -117,7 +142,7 @@ impl Library {
                 false => Some(match store.get(&FILES, &file_key(root, &at))? {
                     Some(known) if (known.len, known.modified) == (listed.stamp.len, listed.stamp.modified) => known,
                     was => {
-                        let now = read(&folder, &listed);
+                        let now = read(&folder, &listed, was.as_ref());
                         changed.push((at.clone(), was, now.clone()));
                         now
                     }
@@ -285,26 +310,45 @@ impl Library {
         bytes.ok_or_else(Refusal::not_found)
     }
 
-    /// Merges `theirs`, another copy of the document at `place`, into its file. Nothing in the file is
+    /// Merges `theirs`, another copy of the document `id`, into its file at `place`. Nothing in the file is
     /// replaced: the two meet as two writers of one folder do, and merging the same copy again changes
     /// nothing.
-    pub fn merge<R: Read + Seek>(&self, root: &Root, place: &Place, theirs: &mut Archive<R>, now: u64) -> Answer<()> {
+    ///
+    /// The copy was read before this, where the document was found then. A file that is not there any
+    /// more, or is another document's, is left alone, and the answer is [`moved`].
+    pub fn merge<R: Read + Seek>(
+        &self,
+        store: &Store,
+        root: &Root,
+        place: &Place,
+        id: &str,
+        theirs: Reading<'_, R>,
+        now: u64,
+    ) -> Answer<()> {
         let (folder, name) = place.split();
-        let mut folder = root.folder(&folder)?;
-        let mut ours = Archive::open(BufReader::new(folder.open(name)?))?;
-        // Neither file is the server's own writing: a wary copy checks both histories before it loads them.
-        let mut copy = WorkingCopy::open_wary(&mut ours, ReplicaId::new(&ids::block_id()))?;
-        copy.merge_from(theirs).map_err(|error| match error {
-            letters_format::Error::Unmerged => Refusal::invalid("That file shares nothing with the document."),
-            letters_format::Error::History(_) => Refusal::invalid("That file's history cannot be merged."),
-            error => error.into(),
-        })?;
+        let gone = |error: std::io::Error| match Refusal::from(error) {
+            refusal if refusal.code() == Code::NotFound => moved(),
+            refusal => refusal,
+        };
+        let mut folder = root.folder(&folder).map_err(gone)?;
+        let mut ours = Archive::open(BufReader::new(folder.open(name).map_err(gone)?))?;
+        if ours.manifest().id != id {
+            return Err(moved());
+        }
+        // The file is not the server's own writing either: its history is checked before it is loaded,
+        // unless the index knows it.
+        let mut copy = opened(store, root, place, &mut ours)?;
+        copy.merge_read(theirs).map_err(unmerged)?;
         let (token, day) = (ids::block_id(), ids::rfc3339(now));
         let label = format!("{} server", day.get(..10).unwrap_or(&day));
         let save = Save { name, token: &token, label: &label, attempts: 3 };
         // A copy beside the file holds the document as safely as the file would.
-        if let Saved::ConflictCopy { name: beside, cause } = letters_format::save(&mut folder, &mut copy, &save)? {
-            crate::log(&format!("\"{name}\" could not be written ({cause}), and what was merged went to \"{beside}\""));
+        match letters_format::save(&mut folder, &mut copy, &save)? {
+            Saved::ConflictCopy { name: beside, cause } => crate::log(&format!(
+                "\"{name}\" could not be written ({cause}), and what was merged went to \"{beside}\""
+            )),
+            Saved::Written | Saved::Restored { .. } => wrote(store, root, place, &copy),
+            Saved::Unchanged => {}
         }
         Ok(())
     }
@@ -421,24 +465,102 @@ fn index(
 
 /// Reads what the index keeps of a file. One that cannot be read is known as such, and not read again
 /// until it changes.
-fn read(folder: &Folder, listed: &Listed) -> Known {
+fn read(folder: &Folder, listed: &Listed, was: Option<&Known>) -> Known {
     let (len, modified) = (listed.stamp.len, listed.stamp.modified);
-    let damaged = Known { len, modified, id: None, created: None, contributors: Vec::new(), import_notes: 0 };
+    let damaged =
+        Known { len, modified, id: None, created: None, contributors: Vec::new(), import_notes: 0, sound: None };
     let Ok(file) = folder.open(&listed.name) else { return damaged };
     let Ok(mut archive) = Archive::open(BufReader::new(file)) else { return damaged };
     let manifest = archive.manifest();
     let (id, created) = (Some(manifest.id.clone()), Some(manifest.created.clone()));
-    // Who wrote it is in the history, which is checked first: a folder holds whatever was put there. The
-    // replica only reads, so any id will do for it.
-    let history = archive.read(OPLOG).ok().flatten().filter(|history| Model::check(history).is_ok());
-    let model = history.and_then(|history| Model::load(&history, ReplicaId::from(0)).ok());
-    let contributors = model.map(|model| model.authors().into_iter().filter(|name| !name.is_empty()).collect());
     let open = |notes: letters_model::Notes| {
         notes.notes.iter().filter(|note| note.kind == NoteKind::Import && !note.resolved).count() as u32
     };
     let import_notes = archive.notes().map(open).unwrap_or(0);
-    Known { len, modified, id, created, contributors: contributors.unwrap_or_default(), import_notes }
+    let history = archive.read(OPLOG).ok().flatten();
+    // The history the file had before was checked then, and says the same of who wrote it.
+    let same = |was: &&Known| was.sound.as_ref().zip(history.as_deref()).is_some_and(|(sound, now)| sound.is(now));
+    if let Some(was) = was.filter(same) {
+        let (contributors, sound) = (was.contributors.clone(), was.sound.clone());
+        return Known { len, modified, id, created, contributors, import_notes, sound };
+    }
+    // Who wrote it is in the history, which is checked first: a folder holds whatever was put there. The
+    // replica only reads, so any id will do for it.
+    let history = history.filter(|history| Model::check(history).is_ok());
+    let sound = history.as_deref().map(Sound::of);
+    let model = history.and_then(|history| Model::load(&history, ReplicaId::from(0)).ok());
+    let contributors = model.map(|model| model.authors().into_iter().filter(|name| !name.is_empty()).collect());
+    Known { len, modified, id, created, contributors: contributors.unwrap_or_default(), import_notes, sound }
 }
+
+/// Opens the document in `archive`, which is the file at `place`, for the server to write on. A folder
+/// holds whatever was put there, so the history is checked before it is loaded, unless the index knows
+/// these very bytes to be sound: a long history is then read once, where the check reads it twice more.
+pub(crate) fn opened<R: Read + Seek>(
+    store: &Store,
+    root: &Root,
+    place: &Place,
+    archive: &mut Archive<R>,
+) -> Result<WorkingCopy, letters_format::Error> {
+    let replica = ReplicaId::new(&ids::block_id());
+    let known = store.get(&FILES, &file_key(root, place)).ok().flatten().and_then(|known| known.sound);
+    let sound = match known {
+        Some(sound) => archive.read(OPLOG)?.is_some_and(|history| sound.is(&history)),
+        None => false,
+    };
+    if !sound {
+        return WorkingCopy::open_wary(archive, replica);
+    }
+    let mut copy = WorkingCopy::open(archive, replica)?;
+    // What is merged into it from here on is tried first, as with a copy that was opened warily.
+    copy.wary = true;
+    Ok(copy)
+}
+
+/// Takes into the index what the server itself just wrote to the file at `place`, as the copy it wrote
+/// tells it. The file is then not read to learn what the server knows: a long history would be checked and
+/// loaded again after every save. A fault here is none: the next listing reads the file.
+pub(crate) fn wrote(store: &Store, root: &Root, place: &Place, copy: &WorkingCopy) {
+    let (folder, name) = place.split();
+    let stamp = root.folder(&folder).ok().and_then(|mut folder| Files::stamp(&mut folder, name).ok().flatten());
+    let Some(stamp) = stamp else { return };
+    let open = copy.notes.notes.iter().filter(|note| note.kind == NoteKind::Import && !note.resolved);
+    // The history as the save wrote it, which the copy keeps: what the server wrote it need not check.
+    let history = copy.package().entries.remove(OPLOG);
+    let known = Known {
+        len: stamp.len,
+        modified: stamp.modified,
+        id: Some(copy.id.clone()),
+        created: Some(copy.created.clone()),
+        contributors: copy.model().authors().into_iter().filter(|name| !name.is_empty()).collect(),
+        import_notes: open.count() as u32,
+        sound: history.as_deref().map(Sound::of),
+    };
+    let key = file_key(root, place);
+    let _ = store.write(|batch| {
+        let was = batch.get(&FILES, &key)?;
+        index(batch, root, place, was.as_ref(), Some(&known))
+    });
+}
+
+/// How a copy that could not be merged into a document is refused.
+pub(crate) fn unmerged(error: letters_format::Error) -> Refusal {
+    match error {
+        letters_format::Error::Unmerged => Refusal::invalid("That file shares nothing with the document."),
+        letters_format::Error::History(_) => Refusal::invalid(HARMFUL),
+        error => error.into(),
+    }
+}
+
+/// What a copy is refused with when its document is not where it was found any more: a copy is read
+/// before its document is held, and the document may be moved or thrown away meanwhile. Asked again, the
+/// merge finds the document where it is now.
+pub(crate) fn moved() -> Refusal {
+    Refusal::new(Code::Stale, "The document was moved or deleted while the file was being read. Try again.")
+}
+
+/// What is said of a copy whose history cannot be read, or closed the room that tried it.
+pub(crate) const HARMFUL: &str = "That file's history cannot be merged.";
 
 /// A `.let` file as bytes, from a working copy: for a document no file holds yet.
 pub fn packed(copy: &WorkingCopy) -> Answer<Vec<u8>> {

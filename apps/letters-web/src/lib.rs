@@ -4,6 +4,7 @@
 //! - [`input`] turns the hidden input's events into the editor's input, and [`browser`] lends the editor
 //!   the browser's clock, identifiers and clipboard.
 //! - [`faces`] says which face backs up the fonts for a character they lack.
+//! - [`maths`] reaches the maths engine, a module of its own that a document with no formula never fetches.
 //! - [`mirror`] keeps the window readable as HTML beside the canvas, for assistive technology.
 //! - [`page`] is the page a server sends: the document as HTML to read at once, and for the editor to open.
 //! - [`Letters`] is what a page holds: `await Letters.start(canvas, base)` starts the editor.
@@ -11,10 +12,13 @@
 //! Frames are rasterised on the CPU, so the page needs no WebGPU. The fonts are fetched beside the wasm and
 //! are no part of it, so a new build of the code leaves them in the browser's cache. The dictionaries, and
 //! the maths faces of a document without maths, are fetched after the first frame, which has no use for them.
+//! The maths engine is a module of its own, fetched for the first frame of a document with maths and
+//! otherwise when a formula is first written.
 
 pub mod browser;
 pub mod faces;
 pub mod input;
+pub mod maths;
 pub mod mirror;
 pub mod page;
 pub mod shell;
@@ -41,9 +45,11 @@ impl Letters {
     /// under `base`, a URL that is empty or ends in a slash: `fonts/`, `maths/` and `dictionaries/`.
     ///
     /// The first frame waits for the first font, which sets most text, and for the maths faces only when
-    /// the page's document holds maths. The other fonts are set in as they arrive, and the rest is fetched
-    /// once that frame is on the canvas. A browser that kept the fonts from an earlier visit has them all
-    /// at once, and its first frame is drawn with all of them.
+    /// the page's document holds maths. A document the first font's stand-in writes waits for that
+    /// instead, a third of the download, and the whole face takes its place with the others. The other
+    /// fonts are set in as they arrive, and the rest is fetched once that frame is on the canvas. A browser
+    /// that kept the fonts from an earlier visit has them all at once, and its first frame is drawn with
+    /// all of them.
     pub async fn start(canvas: HtmlCanvasElement, base: String) -> Result<Letters, JsValue> {
         std::panic::set_hook(Box::new(|panic| web_sys::console::error_1(&panic.to_string().into())));
         let window = web_sys::window().ok_or("there is no window")?;
@@ -52,16 +58,30 @@ impl Letters {
         let server = shell::served(&window);
         let maths = page::has_maths(&opened);
         let fonts = shell::urls(&base, "fonts", &letters_fonts::FILES);
-        let first = if platform.kept(&window, &fonts[0]) { fonts.len() } else { 1 };
-        let mut urls = fonts[..first].to_vec();
+        // The page asked for this one as it loaded: see `page::preloads`.
+        let asked = shell::urls(&base, "fonts", &[page::first_font(&opened)]).remove(0);
+        let kept = platform.kept(&window, &asked);
+        let stands_in = asked != fonts[0] && !kept;
+        let first = if kept { fonts.len() } else { usize::from(!stands_in) };
+        let mut urls = if stands_in { vec![asked] } else { fonts[..first].to_vec() };
+        let faces = urls.len();
         if maths {
             urls.extend(shell::urls(&base, "maths", &letters_math::FONT_FILES));
         }
         let mut files = browser::files(&window, &urls).await?;
-        let faces = files.split_off(first);
-        letters_fonts::provide(files);
+        let maths_faces = files.split_off(faces);
+        match stands_in {
+            true => files.into_iter().for_each(letters_fonts::provide_first),
+            false => letters_fonts::provide(files),
+        }
+        // A document with maths is shown with its formulas set, so its first frame waits for the engine
+        // too, which the page asked for as it loaded. One it cannot have shows them as their source, and
+        // asks again.
         if maths {
-            letters_math::provide_fonts(faces);
+            letters_math::provide_fonts(maths_faces.clone());
+            if let Err(error) = shell::engine(&window, &base, 0, Some(maths_faces)).await {
+                web_sys::console::error_1(&error);
+            }
         }
         let later = Later { base, fonts: fonts[first..].to_vec(), maths: !maths };
         Ok(Self { shell: Shell::start(canvas, platform, opened, server, later)? })
@@ -117,6 +137,12 @@ impl Letters {
     #[wasm_bindgen(getter)]
     pub fn fonts(&self) -> bool {
         self.shell.borrow().stats().fonts
+    }
+
+    /// Whether the maths engine is here: it is fetched when a formula is first asked for.
+    #[wasm_bindgen(getter)]
+    pub fn maths(&self) -> bool {
+        maths::here()
     }
 
     /// Whether the page is in session with its server, and its document's history is the server's.

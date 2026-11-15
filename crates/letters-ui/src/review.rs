@@ -289,6 +289,12 @@ impl Review {
         self.open.as_mut().filter(|_| kept).is_some_and(|open| open.first.add_word_list(list, data))
     }
 
+    /// The maths engine is here. Returns whether the version that is held back shows a formula it could
+    /// not set before.
+    pub fn maths_arrived(&mut self) -> bool {
+        self.open.as_mut().is_some_and(|open| open.first.maths_arrived())
+    }
+
     /// The scripts the version held back was set in without their word list since this was last asked.
     pub fn take_unlisted(&mut self) -> Vec<WordList> {
         self.open.as_mut().map(|open| open.first.take_unlisted()).unwrap_or_default()

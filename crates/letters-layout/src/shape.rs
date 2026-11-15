@@ -5,9 +5,9 @@ use std::cell::RefCell;
 use letters_render::{Color, DisplayList, Font, Glyph, Item, Point};
 use parley::{Layout, LineHeight, PositionedLayoutItem};
 
-use crate::Fonts;
 use crate::engine::{Engine, Spec, Uncovered};
 use crate::ink::Brush;
+use crate::{Fonts, WordList};
 
 /// The face a plain string is set in.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -55,6 +55,23 @@ impl Shaper {
     /// [`crate::DocLayout::take_uncovered`] tells them. A plain string has no language.
     pub fn take_uncovered(&self) -> Vec<Uncovered> {
         self.state.borrow_mut().0.take_uncovered()
+    }
+
+    /// Hands over the word list of a script written without spaces, as [`crate::DocLayout::add_word_list`]
+    /// does. Strings shaped before are not changed. Returns whether one of them was of that script, and so
+    /// may wrap elsewhere now: shape again whatever may hold it. `false` too for a list that is here already
+    /// or is not that list, and always where the lists are built in.
+    pub fn add_word_list(&self, list: WordList, data: &[u8]) -> bool {
+        let lists = &mut self.state.borrow_mut().0.lists;
+        let missed = lists.missed(list);
+        lists.add(list, data) && missed
+    }
+
+    /// The scripts of the strings shaped since this was last asked whose word list is not here, as
+    /// [`crate::DocLayout::take_unlisted`] tells them: each once ever. Always empty where the lists are
+    /// built in.
+    pub fn take_unlisted(&self) -> Vec<WordList> {
+        self.state.borrow_mut().0.lists.take()
     }
 
     /// Shapes `text`. With `max_width` it wraps to that width, and without one only line breaks in the text

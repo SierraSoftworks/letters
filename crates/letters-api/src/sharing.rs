@@ -128,6 +128,13 @@ pub enum Who {
     },
 }
 
+/// A link someone came by.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Via {
+    pub id: String,
+    pub label: String,
+}
+
 /// What was done, or asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -151,12 +158,20 @@ pub enum Action {
 pub struct Access {
     pub time: u64,
     pub who: Who,
+    /// The link they came by, for someone signed in who followed one. A link's own reader is a
+    /// [`Who::Link`] already.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<Via>,
     pub action: Action,
     /// The role the access was made under.
     pub role: Role,
     /// Whether the server refused it.
     #[serde(default)]
     pub refused: bool,
+    /// For a session of edits, how many seconds it has lasted so far. It grows while the session goes
+    /// on, and a session that comes back within a few minutes goes on in the same row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lasted: Option<u64>,
     /// The network address it came from.
     pub address: String,
     /// The browser or app, as it named itself.

@@ -5,7 +5,7 @@
 //! moves the hidden input under the caret, where the input method's candidate window should open.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::mem;
 use std::ops::Range;
@@ -41,6 +41,7 @@ use web_sys::{
 use crate::browser::{self, Browser};
 use crate::faces::{self, Face};
 use crate::input::{Around, Clipboard, Dom, Finger, Gesture, Held, Reply, TextInput, Touch, modifiers};
+use crate::maths;
 use crate::mirror::{Act, Mirror, Page};
 use crate::page;
 
@@ -142,6 +143,11 @@ pub struct Shell {
     base: String,
     /// The exports, once the person has printed or saved a copy: a module of its own, fetched then.
     exporter: Option<Promise>,
+    /// Whether the maths engine has been asked for and is on its way.
+    engine_coming: bool,
+    /// How often it could not be fetched, and when it last could not: it is asked for again only after a
+    /// while, however often a formula asks for it.
+    engine_lost: (u32, u64),
     /// How often the exports could not be fetched.
     refetches: u32,
     /// The files asked for because a document needed them, and how far each has come.
@@ -190,6 +196,12 @@ pub struct Shell {
     /// The pictures the document links to that the server fetched, by the address each link is written
     /// as, for a PDF to show what the window shows.
     linked: HashMap<String, Vec<u8>>,
+    /// The linked pictures the server would not fetch just then, having fetched all it does in a while, in
+    /// the order they are asked for again.
+    slow: VecDeque<(String, Linking)>,
+    on_slow: Function,
+    /// The timer for the next of them. `None` with pictures waiting while one is being asked for.
+    slow_timer: Option<i32>,
     /// The hosts whose pictures the person said they trust, for as long as the page is open. The server
     /// has nowhere to keep them.
     hosts: Vec<String>,
@@ -367,6 +379,8 @@ impl Shell {
                 me: shell.clone(),
                 base: later.base.clone(),
                 exporter: None,
+                engine_coming: false,
+                engine_lost: (0, 0),
                 refetches: 0,
                 extras: Vec::new(),
                 handed: Vec::new(),
@@ -389,6 +403,9 @@ impl Shell {
                 identity,
                 server,
                 linked: HashMap::new(),
+                slow: VecDeque::new(),
+                on_slow: callback(shell, Self::link_again),
+                slow_timer: None,
                 hosts: Vec::new(),
                 leaving: None,
                 links: None,
@@ -614,6 +631,8 @@ impl Shell {
                 Ok(files) => letters_fonts::provide(files),
                 Err(error) => return web_sys::console::error_1(&error),
             }
+            // The engine draws the letters the maths faces lack in the first font, which may be whole only now.
+            maths::rebody();
             let Some(shell) = shell.upgrade() else { return };
             let mut shell = shell.borrow_mut();
             shell.view.add_fonts(letters_fonts::bundled());
@@ -915,6 +934,34 @@ impl Shell {
         self.uncovered.retain(|_| waits.next() == Some(true));
         let lacking: Vec<Extra> = faces::lacking(&chosen, &asked).into_iter().map(Extra::Face).collect();
         self.fetch_extras(&lacking);
+    }
+
+    /// Fetches the maths engine once the window asked for a formula and there was none to set it. Until it
+    /// comes a formula shows as its source, and all of them are set together when it does.
+    fn want_engine(&mut self) {
+        if !letters_math::take_pending() || self.engine_coming || maths::here() {
+            return;
+        }
+        let (tries, lost) = self.engine_lost;
+        if tries > 0 && self.platform.now_ms() < lost + ENGINE_AGAIN_MS {
+            return;
+        }
+        self.engine_coming = true;
+        let (shell, window, base) = (self.me.clone(), self.window.clone(), self.base.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let fetched = engine(&window, &base, tries, None).await;
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            shell.engine_coming = false;
+            match fetched {
+                Ok(()) => drop(shell.view.maths_arrived()),
+                Err(error) => {
+                    web_sys::console::error_1(&error);
+                    shell.engine_lost = (tries + 1, shell.platform.now_ms());
+                }
+            }
+            shell.arrived();
+        });
     }
 
     /// Fetches the files among `extras` that were never asked for. One that arrives is the window's from
@@ -1358,6 +1405,7 @@ impl Shell {
         self.keep_up();
         self.go();
         self.cover();
+        self.want_engine();
         if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
             self.frame_due = self.window.request_animation_frame(&self.on_frame).is_ok();
         }
@@ -2332,7 +2380,9 @@ impl Shell {
             self.view.set_picture_state(&src, Some(PictureState::Loading));
         }
         let (id, fetch) = (server.id.clone(), Fetch { url: src.clone(), asked });
-        let sent = fetching(&self.window, &paths::fetch_picture(&id), &fetch);
+        let fetch = serde_json::to_vec(&fetch).expect("an address to fetch is JSON");
+        let sent =
+            browser::ask_and_wait(&self.window, "POST", &paths::fetch_picture(&id), Some((letters_api::JSON, &fetch)));
         let (shell, window) = (self.me.clone(), self.window.clone());
         wasm_bindgen_futures::spawn_local(async move {
             let fetched = sent.await;
@@ -2345,15 +2395,20 @@ impl Shell {
             let Some(shell) = shell.upgrade() else { return };
             let mut shell = shell.borrow_mut();
             let shell = &mut *shell;
-            // The page may show another document by now.
+            // The page may show another document by now, which those that waited are not of either.
             if shell.server.as_ref().is_none_or(|server| server.id != id) {
-                return;
+                return shell.slow.clear();
             }
             let failed = |why: &str| Some(PictureState::Failed(why.to_owned()));
             match (fetched, link) {
                 // It waits to be asked for, as any picture from a source nobody said they trust.
-                (Err(refusal), Linking::Open) if refusal.code == Code::Untrusted => {}
-                (Err(refusal), _) => shell.view.set_picture_state(&src, failed(&reason(&refusal))),
+                (Err((refusal, _)), Linking::Open) if refusal.code == Code::Untrusted => {}
+                // The server has fetched all it does for now: the picture waits as it is, and its turn comes.
+                (Err((refusal, wait)), link) if refusal.code == Code::Slow => {
+                    shell.slow.push_back((src, link));
+                    return shell.link_later(wait.unwrap_or(SLOW_SECONDS));
+                }
+                (Err((refusal, _)), _) => shell.view.set_picture_state(&src, failed(&reason(&refusal))),
                 (Ok(_), Linking::Embed(figure)) => match picture {
                     Some(picture) => {
                         shell.view.set_picture_state(&src, None);
@@ -2369,8 +2424,28 @@ impl Shell {
                     None => shell.view.set_picture_state(&src, failed(NO_PICTURE)),
                 },
             }
+            // The server fetches again, so the next of those it would not is asked for.
+            if shell.slow_timer.is_none() {
+                shell.link_again();
+            }
             shell.arrived();
         });
+    }
+
+    /// Asks for the first of the pictures that wait for the server in `seconds`, unless a time is set.
+    fn link_later(&mut self, seconds: u32) {
+        let wait = seconds.clamp(1, SLOW_LONGEST).saturating_mul(1000) as i32;
+        let set = || self.window.set_timeout_with_callback_and_timeout_and_arguments_0(&self.on_slow, wait).ok();
+        self.slow_timer = self.slow_timer.or_else(set);
+    }
+
+    /// Asks for the first of the pictures that wait for the server. One is asked at a time: all of them
+    /// at once would be all the server fetches in that while, and each refused again.
+    fn link_again(&mut self) {
+        self.slow_timer = None;
+        if let Some((src, link)) = self.slow.pop_front() {
+            self.link(src, link);
+        }
     }
 
     /// Has the server read the page at an address for the window's link previews: what the page says of
@@ -2724,6 +2799,25 @@ fn said(error: &JsValue) -> String {
     message.or_else(|| error.as_string()).unwrap_or_else(|| "it failed without saying why".to_owned())
 }
 
+/// How long the maths engine is not asked for again after it could not be fetched, in milliseconds.
+const ENGINE_AGAIN_MS: u64 = 5_000;
+
+/// Fetches the maths engine, a module of its own, and its faces, and has it set the editor's formulas. A
+/// page whose document holds maths preloads both, so its first frame waits for little more than the
+/// faces alone. `tries` is how often it could not be fetched before, and `faces` are the maths faces where
+/// the caller has them already.
+pub async fn engine(window: &Window, base: &str, tries: u32, faces: Option<Vec<Vec<u8>>>) -> Result<(), JsValue> {
+    // A browser remembers a module it could not fetch, so another try asks under another address.
+    let again = Some(tries).filter(|tries| *tries > 0).map(|tries| format!("?again={tries}"));
+    let module = format!("{base}maths.js{}", again.unwrap_or_default());
+    let module = Url::new_with_base(&module, &window.location().href()?)?;
+    let faces = match faces {
+        Some(faces) => faces,
+        None => browser::files(window, &urls(base, "maths", &letters_math::FONT_FILES)).await?,
+    };
+    maths::provide(load(&module.href()).await?, faces)
+}
+
 /// Calls a function that a module exports.
 fn call(module: &JsValue, name: &str, arguments: &Array) -> Result<JsValue, JsValue> {
     Reflect::get(module, &name.into())?.dyn_into::<Function>()?.apply(&JsValue::NULL, arguments)
@@ -2832,6 +2926,12 @@ enum Linking {
     /// The person wants it kept in this figure.
     Embed(BlockId),
 }
+
+/// How long a picture waits for a server that has fetched all it does for now and does not say how long:
+/// its count starts again with each minute.
+const SLOW_SECONDS: u32 = 60;
+/// The longest such a wait is, whatever the server says.
+const SLOW_LONGEST: u32 = 600;
 
 /// What a figure says of a file that was fetched for it and is no picture, as the desktop does.
 const NO_PICTURE: &str = "it is not a picture Letters can show";

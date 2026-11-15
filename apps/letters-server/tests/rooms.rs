@@ -6,12 +6,14 @@ mod common;
 use std::io::Cursor;
 use std::time::Duration;
 
-use axum::http::{Method, StatusCode};
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, Method, StatusCode};
 use common::desk::{Desk, settle};
 use common::{Client, Server, texts};
 use letters_api::{Code, Entry, Listing, Move, NewFolder, Rename, Tag, paths};
-use letters_format::{Archive, MIMETYPE, OPLOG, WorkingCopy, hash};
+use letters_format::{Archive, MIMETYPE, OPLOG, Package, Reading, WorkingCopy, hash};
 use letters_model::{Block, BlockKind, Op, Pos, ReplicaId};
+use letters_server::session::Signed;
 use letters_sync::{Link, Refusal, Role};
 
 /// A smallest PNG, by its first bytes.
@@ -33,6 +35,27 @@ async fn on_file(who: &Client, id: &str) -> String {
     let sent = who.send(Method::GET, &paths::file(id), "", Vec::new()).await;
     assert_eq!(sent.status, StatusCode::OK);
     texts(sent.body).join("\n")
+}
+
+/// The file of `package` with an entry of no meaning added, so that it is `len` bytes long.
+fn padded(package: &Package, len: usize) -> Vec<u8> {
+    let made = |filler: usize, mut seed: u32| {
+        // Bytes that packing does not shrink.
+        let mut noise = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        };
+        let mut package = package.clone();
+        package.entries.insert("filler.bin".into(), (0..filler).map(|_| noise()).collect());
+        let mut bytes = Cursor::new(Vec::new());
+        letters_format::write(&mut bytes, &package).unwrap();
+        bytes.into_inner()
+    };
+    // The manifest names the filler's hash and is packed too, so a byte more of filler is not always a
+    // byte more of file: every length near the one that should fit is tried, with other noise each round.
+    let short = len.checked_sub(made(0, 0).len()).expect("the file is short of that");
+    let tries = (0..64).flat_map(|seed| (short.saturating_sub(48)..short + 8).map(move |filler| (filler, seed)));
+    tries.map(|(filler, seed)| made(filler, seed)).find(|file| file.len() == len).expect("a file of that length")
 }
 
 /// The row of the family's only document.
@@ -71,6 +94,27 @@ async fn two_people_write_one_document_and_its_file_holds_both() {
     b.leave().await;
     assert!(row(&ada).await.tags.is_empty(), "nobody has it open now");
     assert_eq!(on_file(&ben, &id).await, text);
+}
+
+#[tokio::test]
+async fn the_file_table_says_of_a_document_the_server_saved_what_its_file_says() {
+    let (server, ada, id) = shared("indexed").await;
+    let ben = server.person("ben", &["family"]);
+    let mut desk = Desk::open(&server, &ben, &id).await.unwrap();
+    desk.write("Ben wrote here. ");
+    settle([&mut desk]).await;
+    desk.leave().await;
+    // The server tells its file table what it saved, and does not read the file for it.
+    let told = row(&ada).await;
+    assert!(!told.contributors.is_empty(), "whoever wrote it is named");
+
+    // With another time on it the file is read anew, and says the same.
+    let file = std::fs::File::options().write(true).open(server.scratch.0.join("family/Plan.let")).unwrap();
+    file.set_modified(std::time::SystemTime::now() + Duration::from_secs(60)).unwrap();
+    drop(file);
+    let read = row(&ada).await;
+    assert_ne!(read.modified, told.modified, "the file has another time");
+    assert_eq!((read.id, read.contributors, read.tags), (told.id, told.contributors, told.tags));
 }
 
 #[tokio::test]
@@ -200,11 +244,7 @@ async fn a_device_hands_its_whole_file_over_and_nothing_is_replaced() {
     let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
     settle([&mut desk]).await;
     // A device wrote on its own copy of the file while it was away, and someone else wrote here.
-    let was = ada.send(Method::GET, &paths::file(&id), "", Vec::new()).await.body;
-    let mut away = WorkingCopy::open(&mut Archive::open(Cursor::new(was)).unwrap(), ReplicaId::from(9)).unwrap();
-    let first = away.model().doc().blocks[0].id.clone();
-    away.apply([Op::InsertText { at: Pos::new(first, 0), text: "Written away. ".into() }]).unwrap();
-    let theirs = letters_server::library::packed(&away).expect("the copy is a file");
+    let theirs = written_away(&ada, &id).await;
     desk.write("Written here. ");
     settle([&mut desk]).await;
 
@@ -230,6 +270,77 @@ async fn a_device_hands_its_whole_file_over_and_nothing_is_replaced() {
     let text = desk.texts().join("\n");
     assert!(text.contains("Written away.") && text.contains("Written here."), "whoever has it open is told: {text}");
     assert_eq!(on_file(&ada, &id).await, text);
+}
+
+/// A copy of the document `id` that a device wrote "Written away." on, as a file.
+async fn written_away(who: &Client, id: &str) -> Vec<u8> {
+    let was = who.send(Method::GET, &paths::file(id), "", Vec::new()).await.body;
+    let mut away = WorkingCopy::open(&mut Archive::open(Cursor::new(was)).unwrap(), ReplicaId::from(9)).unwrap();
+    let first = away.model().doc().blocks[0].id.clone();
+    away.apply([Op::InsertText { at: Pos::new(first, 0), text: "Written away. ".into() }]).unwrap();
+    letters_server::library::packed(&away).expect("the copy is a file")
+}
+
+/// Who the server takes `who` for.
+fn signed(server: &Server, who: &Client) -> Signed {
+    let mut headers = HeaderMap::new();
+    let token = who.token.as_deref().expect("the person is signed in");
+    headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+    Signed::read(&server.app, &Method::PUT, &headers).expect("the sign-in holds")
+}
+
+/// A copy is read before its document is held, and a long history takes long enough to read for the
+/// document to go elsewhere meanwhile.
+#[tokio::test]
+async fn a_copy_whose_document_left_its_place_while_it_was_read_is_merged_nowhere() {
+    // What becomes of the document between the read and the merge, with a room open where it was or not.
+    for meanwhile in ["renamed", "thrown away", "replaced"] {
+        for open in [false, true] {
+            let what = format!("{meanwhile}, a room open: {open}");
+            let (server, ada, id) = shared(&format!("left-{}-{open}", meanwhile.replace(' ', "-"))).await;
+            let mut desks = Vec::new();
+            if open {
+                desks.push(Desk::open(&server, &ada, &id).await.unwrap());
+            }
+            let theirs = written_away(&ada, &id).await;
+            let found = server.app.locate(&signed(&server, &ada), &id).unwrap();
+            let mut copy = Archive::open(Cursor::new(theirs.clone())).unwrap();
+            let read = Reading::of(&mut copy, ReplicaId::from(10)).unwrap();
+
+            match meanwhile {
+                "thrown away" => ada.post::<()>(&paths::trash(&id), &()).await.unwrap(),
+                _ => drop(ada.post::<Entry>(&paths::rename(&id), &Rename { name: "Scheme".into() }).await.unwrap()),
+            }
+            // Another document where this one was, which the copy is not of.
+            let mut other = None;
+            if meanwhile == "replaced" {
+                let started = ada.start("family", "", "Plan").await.id.unwrap();
+                if open {
+                    desks.push(Desk::open(&server, &ada, &started).await.unwrap());
+                }
+                other = Some(started);
+            }
+            let before = server.scratch.names("family");
+
+            let merged = server.app.merge_read(&found, &id, read);
+            assert_eq!(merged.err().map(|refusal| refusal.code()), Some(Code::Stale), "{what}");
+            assert_eq!(server.scratch.names("family"), before, "{what}: nothing is written where it was");
+            let there = [(meanwhile != "thrown away").then_some(&id), other.as_ref()];
+            for document in there.into_iter().flatten() {
+                assert!(!on_file(&ada, document).await.contains("Written away."), "{what}");
+            }
+
+            // Asked again, the copy finds its document where it is now.
+            let again = ada.send(Method::PUT, &paths::file(&id), MIMETYPE, theirs).await.status;
+            match meanwhile {
+                "thrown away" => assert_eq!(again, StatusCode::NOT_FOUND, "{what}"),
+                _ => {
+                    assert_eq!(again, StatusCode::NO_CONTENT, "{what}");
+                    assert!(on_file(&ada, &id).await.contains("Written away."), "{what}");
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -266,6 +377,35 @@ async fn a_file_whose_history_would_harm_is_never_merged_and_opens_without_it() 
     opened.write("Written after. ");
     settle([&mut opened]).await;
     assert!(on_file(&ada, &other).await.contains("Written after."), "its history starts over");
+}
+
+#[tokio::test]
+async fn a_file_of_the_size_and_time_the_server_knows_with_another_history_is_checked_again() {
+    let (server, ada, _) = shared("swapped").await;
+    let other = ada.start("family", "", "Other").await.id.unwrap();
+    let path = server.scratch.0.join("family/Other.let");
+    let sound = Archive::open(Cursor::new(std::fs::read(&path).unwrap())).unwrap().package().unwrap();
+    let mut harmful = sound.clone();
+    harmful.entries.insert(OPLOG.into(), HARMFUL.to_vec());
+    let len = HARMFUL.len() + 8 * 1024;
+
+    // The file table reads the file, checks its history, and from then on knows it to be sound.
+    std::fs::write(&path, padded(&sound, len)).unwrap();
+    let listing: Listing = ada.get(&paths::entries("family", "")).await.expect("the folder lists");
+    assert_eq!(listing.entries.len(), 2);
+    // Another writer leaves a file that looks the same from outside, with a history Loro panics on.
+    let stamp = std::fs::metadata(&path).unwrap();
+    std::fs::write(&path, padded(&harmful, len)).unwrap();
+    std::fs::File::options().write(true).open(&path).unwrap().set_modified(stamp.modified().unwrap()).unwrap();
+    let swapped = std::fs::metadata(&path).unwrap();
+    assert_eq!((swapped.len(), swapped.modified().unwrap()), (stamp.len(), stamp.modified().unwrap()));
+
+    // The history is another all the same, so it is checked before the room loads it, and starts over.
+    let mut opened = Desk::open(&server, &ada, &other).await.unwrap();
+    settle([&mut opened]).await;
+    opened.write("Written after. ");
+    settle([&mut opened]).await;
+    assert!(on_file(&ada, &other).await.contains("Written after."));
 }
 
 #[tokio::test]

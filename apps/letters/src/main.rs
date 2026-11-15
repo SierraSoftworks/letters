@@ -11,6 +11,7 @@ fn main() -> ExitCode {
         Ok(Command::Run(options)) => options,
         Ok(Command::Export(export)) => return letters::convert::export(&export),
         Ok(Command::Import(import)) => return letters::convert::import(&import),
+        Ok(Command::CheckHistory) => return letters::strangers::child(),
         Ok(Command::Version) => {
             println!("letters {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;

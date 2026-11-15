@@ -284,7 +284,7 @@ mod server {
     use letters_model::{Document, ReplicaId, Style};
     use letters_ui::{Scheme, palette};
 
-    use super::{OPENED, Skeleton, compose, first_paint, outline, preloads, script, served_window};
+    use super::{OPENED, Skeleton, compose, first_font, first_paint, outline, preloads, script, served_window};
 
     /// The page every document is sent in.
     const TEMPLATE: &str = include_str!("../www/index.html");
@@ -334,7 +334,10 @@ mod server {
     ///
     /// A server makes it, so the editor's own code does not carry the export.
     pub fn export(document: &Document, style: &Style, title: &str, fonts: &str) -> String {
-        let urls = FACES.map(|(_, file, _)| format!("{fonts}{file}"));
+        // The text is in the font the editor's first frame will be in, so the browser fetches the one file.
+        let first = first_font(document);
+        let urls =
+            FACES.map(|(_, file, _)| format!("{fonts}{}", if file == letters_fonts::FILES[0] { first } else { file }));
         let faces: Vec<WebFont> = FACES
             .iter()
             .zip(&urls)
@@ -408,11 +411,30 @@ pub fn has_maths(document: &Document) -> bool {
     document.walk().any(|block| block.kind == BlockKind::Formula || inline(block))
 }
 
-/// What a page asks its browser to fetch early for `document`, beyond what every page does: the maths
-/// faces, when its first frame waits for them. `base` is where the files are found, as the editor is given it.
+/// The font file the first frame of a page on `document` waits for, which its first paint is set in too:
+/// the stand-in for the first font where that writes all the document says, else the whole face.
+pub fn first_font(document: &Document) -> &'static str {
+    let written = document.walk().all(|block| letters_fonts::first_writes(&block.plain_text()));
+    if written { letters_fonts::FIRST } else { letters_fonts::FILES[0] }
+}
+
+/// What a page asks its browser to fetch early for `document`, beyond what every page does: the font its
+/// first frame waits for, ahead of the rest, and the maths engine and its faces when that frame waits for
+/// them too. `base` is where the files are found, as the editor is given it.
 pub fn preloads(document: &Document, base: &str) -> String {
+    let font = first_font(document);
+    let first =
+        format!("<link rel=\"preload\" as=\"fetch\" crossorigin fetchpriority=\"high\" href=\"{base}fonts/{font}\" />");
     let files = letters_math::FONT_FILES.iter().filter(|_| has_maths(document));
-    files.map(|file| format!("<link rel=\"preload\" as=\"fetch\" crossorigin href=\"{base}maths/{file}\" />")).collect()
+    let maths =
+        files.map(|file| format!("<link rel=\"preload\" as=\"fetch\" crossorigin href=\"{base}maths/{file}\" />"));
+    // The engine that sets them is a module of its own, which no other document's first frame waits for.
+    let engine = [
+        format!("<link rel=\"modulepreload\" href=\"{base}maths.js\" />"),
+        format!("<link rel=\"preload\" as=\"fetch\" crossorigin href=\"{base}maths_bg.wasm\" />"),
+    ];
+    let engine = engine.into_iter().filter(|_| has_maths(document));
+    std::iter::once(first).chain(engine).chain(maths).collect()
 }
 
 /// Fills a page's template with a document: `preloads` and `first_paint` are what [`preloads`] and

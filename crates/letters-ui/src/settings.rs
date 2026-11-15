@@ -22,6 +22,12 @@ const NAMES: f32 = 116.0;
 const DOT: f32 = 20.0;
 /// The tallest the list of languages grows before it scrolls.
 const LANGUAGES: f32 = 296.0;
+/// The box that is ticked while usage reports are on.
+const TICK: f32 = 16.0;
+/// What the switch for usage reports is called, and what the reports hold.
+const USAGE: &str = "Share anonymous usage reports";
+const USAGE_HOLDS: &str = "Which features are used and how long Letters is open. Never anything from your \
+                           documents, and nothing that says who you are.";
 
 /// Whether the window is light or dark.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -64,6 +70,8 @@ pub enum Setting {
     /// Drops what was typed into either field.
     Forget,
     Language(String),
+    /// Turns the shell's usage reports on or off.
+    Usage(bool),
 }
 
 /// The accents offered. Any other colour can be typed.
@@ -92,6 +100,8 @@ pub(crate) struct Dialog {
     pub languages: Vec<String>,
     /// The name edits carry while the person has set none.
     pub account: Option<String>,
+    /// Whether the shell's usage reports are on. `None` where a shell sends none, and there is no switch.
+    pub usage: Option<bool>,
 }
 
 impl Dialog {
@@ -118,6 +128,8 @@ impl Dialog {
             }
             Setting::Forget => (self.name, self.hex) = (None, None),
             Setting::Language(language) => settings.language = Some(language),
+            // Shown at once. The shell keeps it: it is no setting of the documents.
+            Setting::Usage(on) => self.usage = self.usage.map(|_| on),
         }
         *settings != before
     }
@@ -146,7 +158,9 @@ impl Dialog {
             .child(SidePanel::section("Appearance"))
             .child(Element::column().gap(tokens::SPACE_MD).child(appearance(settings)).child(self.accent(settings)))
             .child(SidePanel::section("Writing"))
-            .child(Element::column().gap(tokens::SPACE_MD).child(self.name(settings)).child(self.language(settings)));
+            .child(Element::column().gap(tokens::SPACE_MD).child(self.name(settings)).child(self.language(settings)))
+            .children(self.usage.map(|_| SidePanel::section("Privacy")))
+            .children(self.usage.map(usage));
         let dialog = Popover::new(content)
             .flush()
             .label("Settings")
@@ -260,6 +274,30 @@ fn appearance(settings: &Settings) -> Element<Message> {
 }
 
 /// One setting: its name, the control that sets it, and perhaps a word about what it does.
+/// The switch for the shell's usage reports, with what they hold under it.
+fn usage(on: bool) -> Element<Message> {
+    let tick = Element::row().width(TICK).height(TICK).radius(4.0).align(Align::Center).justify(Justify::Center);
+    let tick = match on {
+        true => tick.bg(accent().solid).child(Element::icon(icon::CHECK, 12.0).fg(tokens::ON_SOLID)),
+        false => tick.border(Edges::all(1.0), tokens::LINE_STRONG),
+    };
+    let choice = Element::row()
+        .align(Align::Center)
+        .gap(tokens::SPACE_SM)
+        .height(tokens::CONTROL_HEIGHT)
+        .radius(tokens::RADIUS_CONTROL)
+        .ring(Ring::Outline(2.0))
+        .role(Role::CheckBox)
+        .label(USAGE)
+        .description(USAGE_HOLDS)
+        .checked(on)
+        .focusable()
+        .on_press(Message::Settings(Setting::Usage(!on)))
+        .child(tick.decorative())
+        .child(Element::text(USAGE, TextStyle::control()).decorative());
+    row("Usage", Element::row().child(choice), Some(USAGE_HOLDS))
+}
+
 fn row(name: &str, control: Element<Message>, about: Option<&str>) -> Element<Message> {
     // The control names itself to assistive technology, so the name beside it is for the eye.
     let name = Element::row()

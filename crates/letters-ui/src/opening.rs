@@ -5,6 +5,7 @@
 use letters_model::{BlockId, Revision};
 use letters_render::Point;
 
+use crate::browsing::Place;
 use crate::chrome::Edge;
 use crate::copying::CopyFormat;
 use crate::notes;
@@ -91,6 +92,10 @@ pub enum Request {
     /// `Window::set_settings`. The window that asks already follows the accent. The rest is the shell's to
     /// follow: light or dark, the name edits are signed with, and the language of new documents.
     Settings(Settings),
+    /// The person turned this shell's anonymous usage reports on or off in the Settings dialog, which has
+    /// the switch once the shell has said `Window::set_usage_reports`. Keep it, follow it, and tell every
+    /// other window.
+    UsageReports(bool),
     /// Move the window with the pointer, which is held down on the bar: a bar that is the title bar asks
     /// (see `Window::set_chrome`).
     DragWindow,
@@ -200,6 +205,10 @@ pub enum Request {
     /// Answer with `Window::set_access_log` and the server's rows, newest first, or with
     /// `Window::refuse_share`.
     AccessLog,
+    /// The Activity tab's "Show earlier" was pressed: the rows of the access log from before this time,
+    /// which is that of the last row the window holds (the server's `?before=`). Answer with
+    /// `Window::add_access_log`, or with `Window::refuse_share`.
+    AccessLogBefore(u64),
     /// Sign in to the server at this address, as the person typed it, through the system's browser. Say
     /// how far it has come with `Window::set_sign_in`. Once it is done, say who is signed in where with
     /// `Window::set_servers`, and then that no sign-in is under way with `Window::set_sign_in(None)`.
@@ -212,6 +221,25 @@ pub enum Request {
     /// signed in where with `Window::set_servers`.
     SignOut {
         server: String,
+    },
+    /// Say what a place of the server at this address holds, with `Window::set_listing`, or why it could
+    /// not be read with `Window::refuse_browse`. The card that opens a server's documents asks it.
+    Browse {
+        server: String,
+        place: Place,
+    },
+    /// Open the document with this id that the server at this address keeps, as `Open` opens a file.
+    OpenFrom {
+        server: String,
+        id: String,
+    },
+    /// Start a document in a folder of a space the server at this address keeps, and open it, as `New`
+    /// starts one on this device. `path` is the folder's path in the space, empty for the space itself.
+    /// The card that opens a server's documents asks it, only of a space the person edits.
+    NewAt {
+        server: String,
+        space: String,
+        path: String,
     },
 }
 

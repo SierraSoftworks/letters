@@ -13,6 +13,11 @@
 //! kept either way, so a formula cannot yet be clicked through.
 //!
 //! The engine is RaTeX and the faces are KaTeX's, compiled in. Neither shows in this interface.
+//!
+//! A build with the `provided` feature carries neither where it does not call [`built_in`]: its shell hands
+//! over the faces with [`provide_fonts`] and an [`Engine`] with [`provide_engine`], which may be one that
+//! runs elsewhere and sends each formula back with [`Formula::to_bytes`]. Until then a source is answered
+//! with an error that [`Error::is_pending`], and [`take_pending`] tells the shell that one was asked for.
 
 mod cache;
 mod commands;
@@ -22,9 +27,12 @@ mod mathml;
 mod parts;
 mod svg;
 mod table;
+mod wire;
 
 use std::fmt;
 use std::ops::Range;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use letters_render::{Color, DisplayList, Item, Point, Size};
 
@@ -134,6 +142,17 @@ pub struct Error {
     pub span: Option<Range<usize>>,
 }
 
+/// What an engine that is not here yet answers.
+const PENDING: &str = "The maths engine is not here yet.";
+
+impl Error {
+    /// Whether the source may be good, and only the engine is not here yet: see [`provide_engine`]. What
+    /// asked can show the source as it is written, and ask again once the engine has been handed over.
+    pub fn is_pending(&self) -> bool {
+        self.span.is_none() && self.message == PENDING
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
@@ -142,8 +161,61 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// What sets formulas: the engine this crate carries, which [`built_in`] gives, or one a shell stands in
+/// for it, such as a module a page fetches only once a document shows maths.
+#[derive(Clone, Copy, Debug)]
+pub struct Engine {
+    /// [`typeset`], and [`typeset_mapped`] where the last argument is set.
+    pub typeset: fn(&str, &Style, bool) -> Result<Formula, Error>,
+    /// [`mathml`].
+    pub mathml: fn(&str, bool) -> Result<String, Error>,
+}
+
+/// The engine this crate carries. A build with the `provided` feature that never calls this does not hold
+/// the engine at all.
+pub fn built_in() -> Engine {
+    let typeset = |source: &str, style: &Style, mapped: bool| match mapped {
+        true => engine::typeset_mapped(source, style),
+        false => engine::typeset(source, style),
+    };
+    Engine { typeset, mathml: mathml::write }
+}
+
+static ENGINE: OnceLock<Engine> = OnceLock::new();
+/// Whether a formula was asked for and there was no engine, since [`take_pending`] last told.
+static ASKED: AtomicBool = AtomicBool::new(false);
+
+/// Hands over the engine, for a build with the `provided` feature. It is taken once and kept for as long as
+/// the program runs. Hand the faces over first: see [`provide_fonts`]. A formula asked for before then is
+/// answered with an error that [`Error::is_pending`], and whatever keeps formulas must ask again: a
+/// [`Cache`] keeps no such answer. A build without the feature sets every formula itself and has no use
+/// for one.
+pub fn provide_engine(engine: Engine) {
+    if cfg!(feature = "provided") {
+        let _ = ENGINE.set(engine);
+    }
+}
+
+/// Whether a formula was asked for since this was last asked and there was no engine to set it: the cue for
+/// a shell to fetch its engine. Always `false` in a build without the `provided` feature.
+pub fn take_pending() -> bool {
+    ASKED.swap(false, Ordering::Relaxed)
+}
+
+/// The engine that was handed over.
+#[cfg(feature = "provided")]
+fn provided() -> Result<Engine, Error> {
+    ENGINE.get().copied().ok_or_else(|| {
+        ASKED.store(true, Ordering::Relaxed);
+        Error { message: PENDING.into(), span: None }
+    })
+}
+
 /// Typesets `source`, which is TeX with no `$` around it.
 pub fn typeset(source: &str, style: &Style) -> Result<Formula, Error> {
+    #[cfg(feature = "provided")]
+    return (provided()?.typeset)(source, style, false);
+    #[cfg(not(feature = "provided"))]
     engine::typeset(source, style)
 }
 
@@ -157,6 +229,9 @@ pub fn typeset(source: &str, style: &Style) -> Result<Formula, Error> {
 /// traced to that definition, where it is written. What a command draws of its own is in no part: the bar
 /// of a fraction, a root sign, an accent, a bracket that `\left` sizes.
 pub fn typeset_mapped(source: &str, style: &Style) -> Result<Formula, Error> {
+    #[cfg(feature = "provided")]
+    return (provided()?.typeset)(source, style, true);
+    #[cfg(not(feature = "provided"))]
     engine::typeset_mapped(source, style)
 }
 
@@ -166,5 +241,8 @@ pub fn typeset_mapped(source: &str, style: &Style) -> Result<Formula, Error> {
 /// Fails as [`typeset`] does on a source that does not parse, and on the few things MathML has no element
 /// for: a commutative diagram and a proof tree.
 pub fn mathml(source: &str, display: bool) -> Result<String, Error> {
+    #[cfg(feature = "provided")]
+    return (provided()?.mathml)(source, display);
+    #[cfg(not(feature = "provided"))]
     mathml::write(source, display)
 }

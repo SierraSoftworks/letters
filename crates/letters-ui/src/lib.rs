@@ -8,6 +8,7 @@
 
 mod access;
 mod activity;
+mod browsing;
 mod callouts;
 mod captions;
 mod chrome;
@@ -67,6 +68,7 @@ mod window;
 mod words;
 
 pub use accesskit::Role;
+pub use browsing::{Browsed, Place};
 pub use callouts::Calling;
 pub use chrome::{Chrome, Edge, Frame, WindowButton};
 pub use contents::Listing;
@@ -92,4 +94,4 @@ pub use text::{Family, FixedShaper, FontShaper, GlyphRun, Shaped, Stop, TextShap
 pub use theme::Accent;
 pub use tokens::{Color as Ink, Scheme};
 pub use ui::{App, Idle, Keys, Ui};
-pub use window::{Access, Allows, Connection, DocLines, EditorApp, SaveState, Window, palette};
+pub use window::{Access, Allows, Connection, DocLines, EditorApp, Mode, SaveState, Window, palette};

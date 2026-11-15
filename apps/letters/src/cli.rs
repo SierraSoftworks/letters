@@ -42,6 +42,9 @@ pub enum Command {
     Run(Options),
     Export(Export),
     Import(Import),
+    /// Try the history on standard input and nothing else: the app runs itself this way, so the usage does
+    /// not list it. See [`crate::strangers`].
+    CheckHistory,
     Version,
     Help,
 }
@@ -130,6 +133,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     match args.peek().and_then(|first| first.to_str()) {
         Some("export") => return parse_export(args.skip(1)),
         Some("import") => return parse_import(args.skip(1)),
+        Some(crate::strangers::ARGUMENT) => return Ok(Command::CheckHistory),
         _ => {}
     }
     let mut options = Options::default();

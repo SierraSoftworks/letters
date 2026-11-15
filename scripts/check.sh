@@ -2,6 +2,8 @@
 # The gate every commit to main must pass: `./scripts/check.sh` runs every step in turn.
 # CI runs the same steps as jobs side by side, each by its name: `./scripts/check.sh lint`.
 set -eu
+# No check reports its use as a person's (see apps/letters/src/telemetry.rs).
+export LETTERS_TELEMETRY=0
 
 fmt() {
   cargo fmt --all --check

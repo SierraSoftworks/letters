@@ -21,13 +21,15 @@ use std::sync::{Mutex, PoisonError};
 
 use argon2::Argon2;
 use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
+use axum::http::header::USER_AGENT;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, post};
 use axum::{Json, Router};
-use letters_api::{Code, CreatedLink, Link, NewLink, Role, paths};
+use letters_api::{Action, Code, CreatedLink, Link, NewLink, Role, paths};
 use serde::{Deserialize, Serialize};
 
+use crate::access::Reach;
 use crate::api::blocking;
 use crate::error::{Answer, Refusal};
 use crate::ids::{self, hashed, secret};
@@ -35,6 +37,7 @@ use crate::session::{Linked, Signed, cookies};
 use crate::shares::BETWEEN;
 use crate::spaces::{Place, Root};
 use crate::store::Table;
+use crate::telemetry::Event;
 use crate::{App, Shared};
 
 /// What is kept of a link.
@@ -72,6 +75,10 @@ struct Visit {
     leads: Leads,
     /// When the link is to be followed again.
     ends: u64,
+    /// Whether whoever sits at the browser took the document out of safe mode. A link is passed on, so
+    /// one holder of it does not decide for the next.
+    #[serde(default)]
+    trusted: bool,
 }
 
 /// By the hash of the secret in the browser's cookie.
@@ -90,7 +97,8 @@ const MOST_COOKIES: usize = 8;
 /// How often the visits that are over are cleared away.
 const SWEEP: u64 = 60 * 60;
 /// What one address may spend on following links each minute: a look at a link costs 1 and a try at a
-/// passphrase [`TRY`], which makes five tries a minute.
+/// passphrase [`TRY`], which makes five tries a minute. A visit may ask the server for as many pictures
+/// and previews a minute, so that one link does not take up the fetches everyone shares.
 const PER_MINUTE: u32 = 30;
 const TRY: u32 = 6;
 /// How many addresses are counted before the ones of minutes past are forgotten.
@@ -135,29 +143,47 @@ impl Doors {
         entry.1 = entry.1.saturating_add(cost);
         entry.1 <= PER_MINUTE
     }
+
+    /// The seconds until whoever spent everything may spend anew.
+    fn anew(now: u64) -> u64 {
+        60 - now % 60
+    }
 }
 
 /// Where a request came from, as far as the server can tell.
+#[derive(Clone, Debug, Default)]
 pub struct Caller {
     /// The address of the browser. Empty when the server was not told one.
     pub address: String,
+    /// The browser or the app, as it names itself.
+    pub browser: String,
 }
 
-impl<S: Sync> FromRequestParts<S> for Caller {
-    type Rejection = Infallible;
-
-    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Infallible> {
-        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|connected| connected.0.ip());
-        // What stands in front of the server on its own machine, as `tailscale serve` does, says last who
-        // it asks for. Anything else that says so is not believed.
+impl Caller {
+    /// Where the request in `parts` came from.
+    pub fn of(parts: &Parts, app: &App) -> Self {
+        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|connected| connected.0.ip().to_canonical());
+        // A proxy the settings name, as `tailscale serve` on this machine is unless they say otherwise,
+        // says last who it asks for. Anything else that says so is not believed.
         let said = parts.headers.get("x-forwarded-for").and_then(|value| value.to_str().ok());
         let forwarded = said.and_then(|said| said.rsplit(',').next()).map(str::trim).filter(|said| !said.is_empty());
         let address = match (peer, forwarded) {
-            (Some(peer), Some(forwarded)) if peer.is_loopback() => forwarded.chars().take(64).collect(),
+            (Some(peer), Some(forwarded)) if app.config.server.proxies.contains(&peer) => {
+                forwarded.chars().take(64).collect()
+            }
             (Some(peer), _) => peer.to_string(),
             (None, _) => String::new(),
         };
-        Ok(Self { address })
+        let named = parts.headers.get(USER_AGENT).and_then(|value| value.to_str().ok()).unwrap_or_default();
+        Self { address, browser: named.chars().take(LONGEST).collect() }
+    }
+}
+
+impl FromRequestParts<Shared> for Caller {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Infallible> {
+        Ok(Self::of(parts, app))
     }
 }
 
@@ -217,6 +243,7 @@ async fn make(
     Path(id): Path<String>,
     Json(new): Json<NewLink>,
 ) -> Answer<Json<CreatedLink>> {
+    app.telemetry.record(Event::LinkMade);
     blocking(move || app.make_link(&who, &id, &new).map(Json)).await
 }
 
@@ -225,6 +252,7 @@ async fn revoke(
     who: Signed,
     Path((id, link)): Path<(String, String)>,
 ) -> Answer<StatusCode> {
+    app.telemetry.record(Event::LinkRevoked);
     blocking(move || app.revoke_link(&who, &id, &link)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -302,33 +330,46 @@ impl App {
     }
 
     /// The link the secret in an address leads to, while it works. Whatever else an address holds leads
-    /// nowhere, and is told no more than that.
-    fn follow(&self, token: &str) -> Answer<(Leads, Kept)> {
+    /// nowhere, and is told no more than that. The document's log is told of a link that has run out.
+    fn follow(&self, token: &str, caller: &Caller) -> Answer<(Leads, Kept)> {
         let nowhere = || Refusal::new(Code::NotFound, "This link does not work, or no longer does.");
         // A server whose owner turned links off again follows none.
         let leads = self.store.get(&TOKENS, &hashed(token))?.filter(|_| self.config.links.enabled);
         let leads = leads.ok_or_else(nowhere)?;
         let key = format!("{}{}", under(&leads.document, &leads.root), leads.link);
-        let kept = self.store.get(&LINKS, &key)?.filter(|kept| kept.live(self.now())).ok_or_else(nowhere)?;
+        let kept = self.store.get(&LINKS, &key)?.ok_or_else(nowhere)?;
+        if !kept.live(self.now()) {
+            self.turned_away(&leads, &kept, caller);
+            return Err(nowhere());
+        }
         Ok((leads, kept))
     }
 
-    /// Follows the link in an address for the browser at `address`, with the passphrase it tried when it
-    /// tried one.
-    pub fn enter(&self, token: &str, tried: Option<&str>, address: &str) -> Answer<Door> {
+    /// Notes in the document's log that its link opened nothing for whoever tried it.
+    fn turned_away(&self, leads: &Leads, kept: &Kept, caller: &Caller) {
+        let reach = Reach::of_link(&leads.document, &leads.root, &kept.link, caller);
+        self.noted(&reach, Action::Open, true);
+    }
+
+    /// Follows the link in an address for the browser `caller` tells of, with the passphrase it tried
+    /// when it tried one.
+    pub fn enter(&self, token: &str, tried: Option<&str>, caller: &Caller) -> Answer<Door> {
         let now = self.now();
-        if !self.doors.spend(address, if tried.is_some() { TRY } else { 1 }, now) {
-            return Err(Refusal::new(Code::Slow, "Too many tries from here. Wait a minute, and try again."));
+        if !self.doors.spend(&caller.address, if tried.is_some() { TRY } else { 1 }, now) {
+            return Err(Refusal::slow(Doors::anew(now), "Too many tries from here. Wait a minute, and try again."));
         }
-        let (leads, kept) = self.follow(token)?;
+        let (leads, kept) = self.follow(token, caller)?;
         match tried {
             None if kept.asks.is_some() => return Ok(Door::Asks { wrong: false }),
-            Some(tried) if !kept.admits(tried) => return Ok(Door::Asks { wrong: true }),
+            Some(tried) if !kept.admits(tried) => {
+                self.turned_away(&leads, &kept, caller);
+                return Ok(Door::Asks { wrong: true });
+            }
             _ => {}
         }
         let secret = secret();
         let ends = kept.link.expires.map_or(now + STAYS, |expires| expires.min(now + STAYS));
-        self.store.put(&VISITS, &hashed(&secret), &Visit { leads: leads.clone(), ends })?;
+        self.store.put(&VISITS, &hashed(&secret), &Visit { leads: leads.clone(), ends, trusted: false })?;
         self.sweep(now);
         let cookie = format!("{COOKIE}{}", leads.link);
         Ok(Door::Open { document: leads.document, cookie, secret, life: ends - now })
@@ -355,7 +396,7 @@ impl App {
         let named = cookies(headers).filter(|(name, _)| name.starts_with(COOKIE)).take(MOST_COOKIES);
         for (name, secret) in named.filter(|_| self.config.links.enabled) {
             let visit = hashed(secret);
-            let Ok(Some(Visit { leads, ends })) = self.store.get(&VISITS, &visit) else { continue };
+            let Ok(Some(Visit { leads, ends, trusted })) = self.store.get(&VISITS, &visit) else { continue };
             if leads.document != id || ends <= now || name.strip_prefix(COOKIE) != Some(leads.link.as_str()) {
                 continue;
             }
@@ -363,11 +404,29 @@ impl App {
             let Ok(Some(kept)) = self.store.get(&LINKS, &key) else { continue };
             if kept.live(now) {
                 let (document, root) = (leads.document, leads.root);
-                let linked = Linked { link: kept.link, document, root, alone: false, ends };
+                let linked = Linked { link: kept.link, document, root, alone: false, ends, trusted };
                 return Some(Guest { linked, secret: secret.to_owned(), visit });
             }
         }
         None
+    }
+
+    /// Whoever sits at the browser of the visit `visit` trusts its document, until the visit is over.
+    pub(crate) fn trust_visit(&self, visit: &str) -> Answer<()> {
+        Ok(self.store.write(|batch| match batch.get(&VISITS, visit)? {
+            Some(seen) => batch.put(&VISITS, visit, &Visit { trusted: true, ..seen }),
+            None => Ok(()),
+        })?)
+    }
+
+    /// Counts a picture or a preview the server is asked to fetch. Whoever only a link let in may ask for
+    /// so many a minute in one visit.
+    pub(crate) fn fetching(&self, who: &Signed) -> Answer<()> {
+        let now = self.now();
+        if who.alone() && !self.doors.spend(&format!("visit {}", who.session), 1, now) {
+            return Err(Refusal::slow(Doors::anew(now), "Too many pictures and previews at once. Wait a minute."));
+        }
+        Ok(())
     }
 
     /// Where the file of a link's document is, while it is in the folder the link was made in.

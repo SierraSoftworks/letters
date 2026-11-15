@@ -3,29 +3,15 @@
 
 mod common;
 
+use std::net::SocketAddr;
+
 use axum::http::{Method, StatusCode};
 use common::desk::{Desk, settle};
-use common::{Browser, Client, Raw, START, Server, URL, texts};
+use common::{Browser, Client, Raw, START, Server, URL, follow, let_in, link, planned, texts};
 use letters_api::{
-    Allows, Code, CreatedLink, Entry, Grant, Grantee, Listing, NewLink, Opened, Rename, Role, Shares, Tag, Trust, paths,
+    Allows, Code, CreatedLink, Entry, Error, Fetch, Listing, NewLink, Opened, Rename, Role, Shares, Tag, Trust, paths,
 };
 use letters_sync::Link::Live;
-
-fn link(label: &str, role: Role) -> NewLink {
-    NewLink { label: label.into(), role, expires: None, passphrase: None, allows: Allows::default() }
-}
-
-/// A server that makes links, where Ada has "Plan" in her own space and shares it with Ben to edit: the
-/// server, Ada, Ben, and the document's id.
-async fn planned(name: &str) -> (Server, Client, Client, String) {
-    let server = Server::linking(name);
-    let (ada, ben) = (server.person("ada", &[]), server.person("ben", &[]));
-    let id = ada.start("home", "", "Plan").await.id.expect("a document has an id");
-    let to = Grantee::Person { id: "sub-ben".into(), name: String::new() };
-    let people = vec![Grant { to, role: Role::Editor }];
-    ada.put::<Shares>(&paths::shares(&id), &Shares { people, links: Vec::new() }).await.unwrap();
-    (server, ada, ben, id)
-}
 
 /// How many links the row of Ada's document says lead to it.
 async fn counted(ada: &Client) -> Option<u32> {
@@ -33,18 +19,21 @@ async fn counted(ada: &Client) -> Option<u32> {
     own.entries[0].tags.iter().find_map(|tag| if let Tag::Links { count } = tag { Some(*count) } else { None })
 }
 
-/// Follows a link's address with a browser.
-async fn follow(browser: &mut Browser, made: &CreatedLink) -> Raw {
-    browser.get(made.url.strip_prefix(URL).expect("the address is this server's")).await
+/// Whether the document opens trusted in a browser.
+async fn trusted(browser: &mut Browser, id: &str) -> Trust {
+    browser.get(&paths::document(id)).await.json::<Opened>().trust
 }
 
-/// Ada makes a link to the document and a browser nobody is signed in with follows it.
-async fn let_in(server: &Server, ada: &Client, id: &str, new: &NewLink) -> (Browser, CreatedLink) {
-    let made: CreatedLink = ada.post(&paths::links(id), new).await.unwrap();
-    let mut browser = server.visitor();
-    let door = follow(&mut browser, &made).await;
-    assert_eq!(door.location(), paths::editor_page(id), "the link lets its reader in: {}", door.status);
-    (browser, made)
+/// The seconds a refusal says to wait before asking again. None, when it does not say.
+fn waits(refused: &Raw) -> u64 {
+    refused.header("retry-after").parse().unwrap_or(0)
+}
+
+/// Follows a link that leads nowhere on the server at `at`, as a proxy in front of it would for `address`.
+fn knock(at: SocketAddr, address: &str) -> u16 {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let asked = agent.get(&format!("http://{at}/l/nowhere")).header("X-Forwarded-For", address).call();
+    asked.expect("the server answers").status().as_u16()
 }
 
 /// Asks to revoke a link of the document: the status, and how much was said with it.
@@ -157,7 +146,6 @@ async fn a_link_lets_whoever_follows_it_in_to_its_document_and_to_nothing_else()
         paths::SHARED.to_owned(),
         paths::PEOPLE.to_owned(),
         paths::entries("home", ""),
-        paths::shares(&id),
         paths::document(&other),
         paths::file(&other),
     ];
@@ -165,6 +153,9 @@ async fn a_link_lets_whoever_follows_it_in_to_its_document_and_to_nothing_else()
         assert_eq!(guest.get(&path).await.status, StatusCode::UNAUTHORIZED, "{path}");
     }
     assert_eq!(guest.post(&paths::links(&id), &link("Mine", Role::Editor)).await.status, StatusCode::UNAUTHORIZED);
+    // Who the document is shared with is asked by its page, and is said in words to be none of theirs.
+    let shares = guest.get(&paths::shares(&id)).await;
+    assert_eq!((shares.status, shares.json::<Error>().code), (StatusCode::FORBIDDEN, Code::Forbidden));
     assert!(guest.get(&paths::folder_page("home", "")).await.location().starts_with(paths::SIGN_IN_PAGE));
     // And a commenter changes nothing of the document's name.
     let renamed = guest.post(&paths::rename(&id), &Rename { name: "Mine".into() }).await;
@@ -214,7 +205,8 @@ async fn a_link_that_asks_a_passphrase_lets_in_whoever_knows_it_and_takes_few_gu
         }
         guesses += 1;
     };
-    assert_eq!((slow.status, slow.header("retry-after")), (StatusCode::TOO_MANY_REQUESTS, "60"));
+    assert_eq!(slow.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!((1..=60).contains(&waits(&slow)), "the card's answer says when to try again");
     assert!(guesses <= 5, "{guesses} guesses in a minute");
     assert_eq!(guesser.submit(at, &right, None).await.status, StatusCode::TOO_MANY_REQUESTS);
     server.wait(60);
@@ -304,4 +296,64 @@ async fn a_link_that_edits_writes_to_the_document() {
     assert_eq!(reader.post(&paths::rename(&id), &Rename { name: "Mine".into() }).await.status, StatusCode::FORBIDDEN);
     let renamed: Entry = editor.post(&paths::rename(&id), &Rename { name: "Plans".into() }).await.json();
     assert_eq!((renamed.name.as_str(), renamed.space), ("Plans", None));
+}
+
+#[tokio::test]
+async fn whoever_a_link_lets_in_trusts_the_document_for_their_own_visit() {
+    let (server, ada, _, id) = planned("links-trust").await;
+    let made: CreatedLink = ada.post(&paths::links(&id), &link("Readers", Role::Reader)).await.unwrap();
+    let (mut one, mut next) = (server.visitor(), server.visitor());
+    follow(&mut one, &made).await;
+    follow(&mut next, &made).await;
+
+    assert_eq!(one.post(&paths::trust(&id), &()).await.status, StatusCode::NO_CONTENT);
+    let seen = (trusted(&mut one, &id).await, trusted(&mut next, &id).await);
+    assert_eq!(seen, (Trust::Trusted, Trust::Safe), "one holder of a link does not decide for the next");
+    // And for that visit alone: the link followed again is a document from a stranger again.
+    follow(&mut one, &made).await;
+    assert_eq!(trusted(&mut one, &id).await, Trust::Safe);
+}
+
+#[tokio::test]
+async fn a_visit_asks_the_server_for_so_many_fetches_a_minute_and_no_more() {
+    let (server, ada, ben, id) = planned("links-fetches").await;
+    let (mut guest, _) = let_in(&server, &ada, &id, &link("Accountant", Role::Reader)).await;
+    // A fetch the rules refuse at once is counted like any other.
+    let fetch = Fetch { url: "http://localhost/sky.png".into(), asked: true };
+    let mut fetched = 0;
+    let slow = loop {
+        let answer = guest.post(&paths::fetch_picture(&id), &fetch).await;
+        if answer.status != StatusCode::UNPROCESSABLE_ENTITY || fetched == 200 {
+            break answer;
+        }
+        fetched += 1;
+    };
+    assert_eq!(slow.status, StatusCode::TOO_MANY_REQUESTS, "after {fetched}");
+    assert!(fetched >= 10, "a page with some pictures loads: {fetched}");
+    assert!((1..=60).contains(&waits(&slow)), "the answer says when to ask again");
+
+    // Someone signed in is not counted with them, and the next minute the visit asks again.
+    let signed = ben.post::<()>(&paths::fetch_picture(&id), &fetch).await;
+    assert_eq!(signed.unwrap_err().code, Code::Untrusted);
+    server.wait(60);
+    assert_eq!(guest.post(&paths::fetch_picture(&id), &fetch).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn following_links_is_counted_by_the_address_a_named_proxy_tells() {
+    // The proxies the settings name, and whether a second address then has looks of its own. The test
+    // asks from this machine, which speaks for others unless the settings say that nobody does.
+    let cases: [(&str, Option<&[&str]>, bool); 2] =
+        [("links-proxied", None, true), ("links-unproxied", Some(&[]), false)];
+    for (name, proxies, apart) in cases {
+        let server = Server::behind(name, proxies);
+        let at = server.listen().await;
+        let asked = tokio::task::spawn_blocking(move || {
+            let looks = (0..100).take_while(|_| knock(at, "203.0.113.1") == 404).count();
+            (looks, knock(at, "203.0.113.2"))
+        });
+        let (looks, other) = asked.await.unwrap();
+        assert!(looks < 100, "{name}: an address runs out of looks");
+        assert_eq!(other == 404, apart, "{name}: the next address was answered {other}");
+    }
 }

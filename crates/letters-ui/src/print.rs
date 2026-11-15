@@ -6,7 +6,7 @@
 //!
 //! A page is made to start with a block here and nowhere else. Where one was, the sheet before says so
 //! under its last block, with a button that takes the break away. Between two blocks near the pointer a
-//! sheet offers to start a page.
+//! sheet offers to start a page. Tab walks the same places, and Enter there does what a press does.
 
 use std::rc::Rc;
 
@@ -25,6 +25,7 @@ use crate::icon::{self, Icon};
 use crate::paint::scrollbar;
 use crate::pictures;
 use crate::text::{Shaped, TextShaper, TextStyle};
+use crate::theme::accent;
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::widgets::{Button, Menu, MenuItem, Popover, Segmented, Side, TopBar};
 use crate::window::Message;
@@ -104,6 +105,17 @@ struct Gap {
     block: BlockId,
 }
 
+/// A place the keyboard stops at: the room above a block, where a page can be made to start, or the end
+/// of a sheet whose next was made to start.
+#[derive(Clone, Debug, PartialEq)]
+struct Stop {
+    /// The sheet it is on, and how far down that sheet, in the sheet's own measure.
+    sheet: usize,
+    y: f32,
+    /// The block that would start the page, or does.
+    block: BlockId,
+}
+
 /// How large the sheets show.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Zoom {
@@ -171,6 +183,7 @@ impl Spread {
 }
 
 /// The document as it is paged, which the sheets are drawn from.
+#[derive(Clone, Copy)]
 pub(crate) struct Paged<'a> {
     pub doc: &'a Document,
     pub layout: &'a DocLayout,
@@ -200,6 +213,8 @@ pub(crate) struct Print {
     hot: Vec<Hot>,
     /// What a press began on.
     pressed: Option<Breaking>,
+    /// The place the keyboard is on, by the block that would start a page there or does.
+    pick: Option<BlockId>,
     /// Whether the sheets are only looked at: where pages start and how the page is set up are for
     /// someone who writes the document.
     fixed: bool,
@@ -223,6 +238,7 @@ impl Print {
             gaps: Vec::new(),
             hot: Vec::new(),
             pressed: None,
+            pick: None,
             fixed: false,
             takes: (true, true),
         }
@@ -235,7 +251,7 @@ impl Print {
 
     /// Says whether the sheets are only looked at, as by someone who does not write the document.
     pub fn fix(&mut self, fixed: bool) {
-        (self.fixed, self.pressed) = (fixed, None);
+        (self.fixed, self.pressed, self.pick) = (fixed, None, None);
     }
 
     /// Notes where the pointer rests, and says whether the sheets show something else for it.
@@ -251,9 +267,10 @@ impl Print {
         self.over().is_some()
     }
 
-    /// Notes what a press began on.
+    /// Notes what a press began on. The pointer has the sheets now, and the keyboard lets go of its place.
     pub fn press(&mut self, at: Point) {
         self.pressed = self.at(at).map(|hot| hot.asks.clone());
+        self.pick = None;
     }
 
     /// What a press asks, when it ends on what it began on.
@@ -266,6 +283,44 @@ impl Print {
     /// pointer.
     pub fn asked(&self, block: &BlockId) -> Option<Breaking> {
         self.hot.iter().find(|hot| hot.asks.blocks.first() == Some(block)).map(|hot| hot.asks.clone())
+    }
+
+    /// Moves the keyboard to the next place where a page can start or was made to, or with `back` to the
+    /// one before, and brings it into view. With no place of its own in view it starts at the first one
+    /// there. Returns whether there was a place to go to: past the last one, and back from the first or
+    /// from none, the keyboard lets go and the key is not the sheets'.
+    pub fn walk(&mut self, back: bool, paged: Paged<'_>) -> bool {
+        let Some(spread) = self.spread.filter(|_| !self.fixed) else { return false };
+        let stops = stops(paged);
+        // How far down the view a place is.
+        let top = (self.down * spread.pitch).round();
+        let level = |stop: &Stop| spread.rect(stop.sheet).y + stop.y * spread.scale - top;
+        let shows = |stop: &Stop| (0.0..=self.room.height).contains(&level(stop));
+        let on = self.pick.as_ref().and_then(|pick| stops.iter().position(|stop| stop.block == *pick));
+        let next = match (on.filter(|on| shows(&stops[*on])), back) {
+            (Some(on), false) => Some(on + 1).filter(|next| *next < stops.len()),
+            (Some(on), true) => on.checked_sub(1),
+            (None, false) => stops.iter().position(|stop| level(stop) >= 0.0),
+            (None, true) => None,
+        };
+        let next = next.map(|next| &stops[next]);
+        if let Some(far) = next.filter(|stop| !shows(stop)).map(level) {
+            // The place comes to the middle of the view.
+            self.down += (far - self.room.height / 2.0) / spread.pitch;
+            self.keep(&spread);
+        }
+        self.pick = next.map(|stop| stop.block.clone());
+        self.pick.is_some()
+    }
+
+    /// What Enter asks at the place the keyboard is on.
+    pub fn picked(&self) -> Option<Breaking> {
+        self.asked(self.pick.as_ref()?)
+    }
+
+    /// Has the keyboard let go of its place, and says whether it was on one.
+    pub fn unpick(&mut self) -> bool {
+        self.pick.take().is_some()
     }
 
     fn at(&self, at: Point) -> Option<&Hot> {
@@ -343,7 +398,7 @@ impl Print {
         shaper: &dyn TextShaper,
         scheme: Scheme,
     ) -> (Element<Message>, Vec<String>) {
-        let Paged { doc, layout, pages } = paged;
+        let Paged { layout, pages, .. } = paged;
         let count = pages.sheets.len().max(1);
         let spread = Spread::of(Size { width: pages.width, height: pages.height }, count, self.zoom, room);
         (self.count, self.room) = (count, room);
@@ -394,32 +449,36 @@ impl Print {
             said.paint(Point { x, y }, color(tokens::FG_MUTED), &mut list);
 
             // Where the sheet's blocks stand says where a page can start, and where one was made to.
-            let stand = layout.page_blocks(pages, index);
+            let Places { rooms, ends } = places(paged, index);
             let down = |y: f32| at.y + y * spread.scale;
             let span = ((at.x + pages.area.x * spread.scale).round(), (pages.area.width * spread.scale).round());
-            for stands in stand.iter().skip(1) {
-                let Some(block) = doc.blocks.get(stands.index).filter(|_| stands.starts && !self.fixed) else {
-                    continue;
-                };
-                let y = down((stands.above + stands.top) / 2.0).round();
-                self.gaps.push(Gap { sheet: index, on: at, y, span, block: block.id.clone() });
+            for (y, block) in rooms.into_iter().filter(|_| !self.fixed) {
+                self.gaps.push(Gap { sheet: index, on: at, y: down(y).round(), span, block });
             }
-            let made = forced(doc, layout, pages, index + 1);
-            if let (Some(last), false) = (stand.last(), made.is_empty()) {
+            if let Some((bottom, made)) = ends {
                 let end = down(pages.area.y + pages.area.height);
-                let y = (down(last.bottom) + UNDER + LABEL / 2.0).min(at.y + at.height - LABEL / 2.0 - 2.0).round();
+                let y = (down(bottom) + UNDER + LABEL / 2.0).min(at.y + at.height - LABEL / 2.0 - 2.0).round();
                 // The marker says why the sheet ends here. A press on it takes the break away.
                 let over = self.pointer.filter(|_| !self.fixed);
-                let remove = labels.marker(Point { x: span.0, y }, span.1, over, &mut list);
+                let (label, remove) = labels.marker(Point { x: span.0, y }, span.1, over, &mut list);
                 hatch(Rect::new(span.0, y + LABEL / 2.0 + UNDER, span.1, end - y - LABEL / 2.0 - UNDER), &mut list);
+                if self.pick.is_some() && self.pick.as_ref() == made.first() {
+                    ring(label, LABEL / 2.0, &mut list);
+                }
                 if !self.fixed {
                     self.hot.push(Hot { rect: remove, sheet: index, asks: Breaking { blocks: made, on: false } });
                 }
             }
         }
-        // The offer lies over its sheet, where the pointer is.
-        if let Some(gap) = self.pointer.and_then(|at| self.offered(at)).map(|index| self.gaps[index].clone()) {
+        // An offer lies over its sheet where the pointer is, and one where the keyboard is.
+        let pointed = self.pointer.and_then(|at| self.offered(at));
+        let picked = self.pick.as_ref().and_then(|pick| self.gaps.iter().position(|gap| gap.block == *pick));
+        for index in [pointed, picked.filter(|_| picked != pointed)].into_iter().flatten() {
+            let gap = self.gaps[index].clone();
             let rect = labels.offer(Point { x: gap.span.0, y: gap.y }, gap.span.1, self.pointer, &mut list);
+            if picked == Some(index) {
+                ring(rect, LABEL / 2.0, &mut list);
+            }
             self.hot.push(Hot { rect, sheet: gap.sheet, asks: Breaking { blocks: vec![gap.block], on: true } });
         }
 
@@ -529,6 +588,45 @@ impl Print {
     }
 }
 
+/// Where pages can start on a sheet, each in the sheet's own measure.
+struct Places {
+    /// The middle of the room above every block that starts there after the first, with the block.
+    rooms: Vec<(f32, BlockId)>,
+    /// Where the sheet's last block ends when the next sheet was made to start, with the blocks that make
+    /// it.
+    ends: Option<(f32, Vec<BlockId>)>,
+}
+
+fn places(paged: Paged<'_>, index: usize) -> Places {
+    let Paged { doc, layout, pages } = paged;
+    let stand = layout.page_blocks(pages, index);
+    let starts = stand.iter().skip(1).filter(|stands| stands.starts);
+    let room = starts.filter_map(|stands| Some(((stands.above + stands.top) / 2.0, doc.blocks.get(stands.index)?)));
+    let rooms = room.map(|(y, block)| (y, block.id.clone())).collect();
+    let made = forced(doc, layout, pages, index + 1);
+    Places { rooms, ends: stand.last().filter(|_| !made.is_empty()).map(|last| (last.bottom, made)) }
+}
+
+/// Every place the keyboard stops at, in the order the sheets are read.
+fn stops(paged: Paged<'_>) -> Vec<Stop> {
+    let mut stops = Vec::new();
+    for sheet in 0..paged.pages.sheets.len() {
+        let Places { rooms, ends } = places(paged, sheet);
+        stops.extend(rooms.into_iter().map(|(y, block)| Stop { sheet, y, block }));
+        let made = ends.and_then(|(y, made)| Some((y, made.into_iter().next()?)));
+        stops.extend(made.map(|(y, block)| Stop { sheet, y, block }));
+    }
+    stops
+}
+
+/// Rings what the keyboard is on, as the toolkit rings what has focus. Paper is white whatever the theme.
+fn ring(rect: Rect, radius: f32, out: &mut DisplayList) {
+    let grow = 3.0;
+    let rect = Rect::new(rect.x - grow, rect.y - grow, rect.width + 2.0 * grow, rect.height + 2.0 * grow);
+    let color = resolve(accent().focus(), Scheme::Light, 1.0);
+    out.push(Item::Stroke { rect, color, width: 2.0, radius: radius + grow });
+}
+
 /// The blocks that make sheet `index` start where it does: its first block, and the first text it shows,
 /// when they are marked to start a page. None for a sheet that starts where the one before was full.
 fn forced(doc: &Document, layout: &DocLayout, pages: &Pages, index: usize) -> Vec<BlockId> {
@@ -564,8 +662,8 @@ impl Labels {
     }
 
     /// Marks a page break on a dashed line `width` long, whose left end and middle is `at`. Says less
-    /// where the line is short. Returns where its remove button is.
-    fn marker(&self, at: Point, width: f32, pointer: Option<Point>, out: &mut DisplayList) -> Rect {
+    /// where the line is short. Returns where its label is, and the remove button in it.
+    fn marker(&self, at: Point, width: f32, pointer: Option<Point>, out: &mut DisplayList) -> (Rect, Rect) {
         let ink = |ink: Ink| resolve(ink, Scheme::Light, 1.0);
         let bare = LABEL_PAD + SIGN + LABEL_GAP + REMOVE + (LABEL - REMOVE) / 2.0;
         let words = [&self.name, &self.note].map(|word| word.size.width + LABEL_GAP);
@@ -590,7 +688,7 @@ impl Labels {
         }
         let cross = Point { x: remove.x + (REMOVE - SIGN) / 2.0, y: at.y };
         sign(icon::X, cross, ink(if over { tokens::FG } else { tokens::FG_MUTED }), out);
-        remove
+        (label, remove)
     }
 
     /// Offers a page break on a line `width` long, whose left end and middle is `at`. Returns where its

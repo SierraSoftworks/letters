@@ -24,6 +24,7 @@ use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
 
+use crate::browsing::{Browsed, Browser, Browsing};
 use crate::callouts::{self, Calling, Callouts};
 use crate::captions::{self, Altering, Captions};
 use crate::chrome::Chrome;
@@ -41,7 +42,7 @@ use crate::finding::{self, Find, Finding};
 use crate::highlight;
 use crate::history::{self, History, Historying, Naming};
 use crate::icon::{self, Icon};
-use crate::importing::{Import, ImportOffer, Importing};
+use crate::importing::{self, Import, ImportOffer, Imported, Importing};
 use crate::insert::{Insert, Inserting, Put};
 use crate::languages::{self, Fence, Fencing, Languages, Languaging};
 use crate::maths::{self, Maths, Sheet, SheetLines, Source};
@@ -117,6 +118,9 @@ const CARD_WIDTH: f32 = 544.0;
 const RECENT_HEIGHT: f32 = 38.0;
 /// How long the bar says which folder a document was first written to, in milliseconds.
 const SAVED_NOTE_MS: u64 = 4000;
+/// How long the toast about an import stays. It has something to press, so it stays longer than a note
+/// that only tells.
+const IMPORTED_MS: u64 = 8000;
 /// The size of the icon that says how saving stands.
 const SAVE_ICON: f32 = 14.0;
 
@@ -156,6 +160,22 @@ pub enum Connection {
     /// The server ended the session for a reason that waiting does not mend, told in a sentence that stands
     /// by itself. A bar under the top bar says it, and offers another try with [`Request::Connect`].
     Refused(String),
+}
+
+/// What the window shows, as a shell that reports usage counts the time in it. It says nothing of the
+/// document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Mode {
+    /// A card over a page nobody has written on: the landing card, or the one that imports a file.
+    Landing,
+    /// The page, to write on or to read.
+    Editor,
+    /// The document's versions.
+    History,
+    /// A conflict is open to be settled.
+    Review,
+    /// Print view.
+    Print,
 }
 
 /// What the person may do with the document, as its server granted it. A document is theirs to change
@@ -200,6 +220,8 @@ pub enum Message {
     Sharing(Sharing),
     /// Something the Servers dialog asks.
     Servers(Signing),
+    /// Something the card that opens a server's documents asks.
+    Browse(Browsing),
     /// Brings the page to where someone else who has the document open is, by their session.
     Visit(u64),
     /// Puts the caret at the start of a block and brings the block to the top of the page.
@@ -241,6 +263,8 @@ pub enum Message {
     Rename(Rename),
     /// Chooses what an imported file brings, on the import card.
     Import(Import),
+    /// What is done about the toast that counts the notes of an import.
+    Imported(Imported),
     /// What is done on the card that saves a copy of the document, or writes it in another format.
     Copy(Copying),
     /// What the Styles panel asks for: the person's default, page setup and stylesheets.
@@ -454,6 +478,35 @@ impl Ui<EditorApp> {
         self.app().landing.is_some()
     }
 
+    /// Says that this shell sends anonymous usage reports, and whether the person has them on: at the
+    /// start, and whenever that changes. The Settings dialog then has a switch for them, which asks
+    /// [`Request::UsageReports`]. A shell that sends none never says, and its window has no switch.
+    pub fn set_usage_reports(&mut self, on: bool) {
+        self.app_mut().dialog.usage = Some(on);
+    }
+
+    /// Has the landing card say that usage reports are sent and where they are turned off, or not any
+    /// more. A shell shows it once, and remembers that it did.
+    pub fn set_usage_notice(&mut self, shown: bool) {
+        self.app_mut().usage_notice = shown;
+    }
+
+    /// What the window shows now: see [`Mode`]. A shell that reports usage counts the time in each.
+    pub fn mode(&self) -> Mode {
+        let app = self.app();
+        if app.carded() {
+            Mode::Landing
+        } else if app.printing.is_some() {
+            Mode::Print
+        } else if app.history.is_some() {
+            Mode::History
+        } else if app.review.note().is_some() {
+            Mode::Review
+        } else {
+            Mode::Editor
+        }
+    }
+
     /// Shows the import card for a file that has to be imported, in place of the landing card, or takes it
     /// away. The card asks with [`Request::Import`] and [`Request::CancelImport`].
     pub fn offer_import(&mut self, offer: Option<ImportOffer>) {
@@ -465,6 +518,21 @@ impl Ui<EditorApp> {
     /// Whether the import card is showing.
     pub fn importing(&self) -> bool {
         self.app().importing.is_some()
+    }
+
+    /// Says why the file on the import card was not imported, in a sentence that stands by itself, in
+    /// answer to a [`Request::Import`]. The card says it, waits no longer, and can ask again.
+    pub fn refuse_import(&mut self, why: &str) {
+        if let Some(card) = self.app_mut().importing.as_mut() {
+            card.refuse(why);
+        }
+    }
+
+    /// Says that the document in the window was just imported, once it is open and its notes are handed
+    /// over with [`Window::set_notes`]. A toast over the foot of the page counts the notes the import left
+    /// and leads to the first, for a few seconds.
+    pub fn say_imported(&mut self) {
+        self.app_mut().imported = Some(None);
     }
 
     /// Has the bar say for a few seconds which folder the document was written to, after its first write.
@@ -574,16 +642,31 @@ impl Ui<EditorApp> {
     }
 
     /// Says who reached the document through a share: the rows of the server's access log, newest first.
-    /// It answers [`Request::AccessLog`], and the Share dialog's Activity tab lists them by day.
+    /// It answers [`Request::AccessLog`], and the Share dialog's Activity tab lists them by day. The
+    /// server's own page is 200 rows: of a log that long the tab offers the rows before it.
     pub fn set_access_log(&mut self, log: Vec<letters_api::Access>) {
         self.app_mut().share.logged(log);
+    }
+
+    /// Says the rows of the access log from before those the window holds, newest first. It answers
+    /// [`Request::AccessLogBefore`]. A page of fewer than 200 rows is the last.
+    pub fn add_access_log(&mut self, earlier: Vec<letters_api::Access>) {
+        self.app_mut().share.logged_earlier(earlier);
+    }
+
+    /// Says how many days the server keeps a row of its access log (`letters_api::Server::log_days`), for
+    /// the Activity tab to say. 0, as from a server that does not say, and the tab says nothing of it.
+    pub fn set_log_days(&mut self, days: u32) {
+        self.app_mut().share.keeps(days);
     }
 
     /// Says where the person is signed in: see [`Server`]. A shell that signs in to servers says it once
     /// at the start, with none if there are none, and whenever it changes. The Servers dialog, which the
     /// window offers from then on, lists them and asks [`Request::SignIn`] and [`Request::SignOut`].
     pub fn set_servers(&mut self, servers: Vec<Server>) {
-        self.app_mut().servers.listed(servers);
+        let app = self.app_mut();
+        app.browser.signed(&servers);
+        app.servers.listed(servers);
     }
 
     /// Says how far a sign-in has come: see [`SignIn`]. `None` says that none is under way any more: it is
@@ -591,6 +674,19 @@ impl Ui<EditorApp> {
     /// ended, brings the dialog out while it lasts.
     pub fn set_sign_in(&mut self, state: Option<SignIn>) {
         self.app_mut().servers.told(state);
+    }
+
+    /// Says what a place of a server holds: see [`Browsed`]. It answers [`Request::Browse`]. An answer
+    /// about a place the card no longer shows is let go.
+    pub fn set_listing(&mut self, listing: Browsed) {
+        let app = self.app_mut();
+        app.browser.told(listing, &mut app.requests);
+    }
+
+    /// Says that a place a [`Request::Browse`] asked for could not be read, in a sentence that stands by
+    /// itself. The card shows it where the place's documents would be.
+    pub fn refuse_browse(&mut self, why: &str) {
+        self.app_mut().browser.refused(why);
     }
 
     /// Says what the person may take away of the document: see [`Allows`]. A shell says it of a document
@@ -741,6 +837,27 @@ impl Ui<EditorApp> {
         found.extend(app.history.iter_mut().flat_map(History::take_unlisted));
         found.retain(|list| app.unlisted.insert(*list));
         found
+    }
+
+    /// Says that the maths engine is here, for a shell that hands it over only once a formula is asked for
+    /// ([`letters_math::provide_engine`], which [`letters_math::take_pending`] is the cue for). Until then
+    /// a formula shows as its source wherever the window sets the document's text, and the sheet a
+    /// formula is written on offers its symbols without their pictures. All of them are set now, at once:
+    /// the next frame shows them. Returns whether a formula that showed as its source is among them. A
+    /// shell whose engine is built in has no use for this.
+    pub fn maths_arrived(&mut self) -> bool {
+        // The sheet draws from the engine at every frame, so there is one whatever was laid out.
+        let app = self.app_mut();
+        let mut shown = app.said.maths_arrived();
+        shown |= app.review.maths_arrived();
+        if let Some(history) = &mut app.history {
+            shown |= history.maths_arrived();
+        }
+        if app.held(|app| app.layout.maths_arrived()) {
+            // Blocks set again keep their heights as estimates until idle time settles them.
+            (app.estimated, shown) = (true, true);
+        }
+        shown
     }
 
     /// Lets formulas link, as `\\href` asks. The shell turns it on for a document the person trusts, and it
@@ -1122,8 +1239,13 @@ pub struct EditorApp {
     copy_location: Option<Location>,
     /// What the landing card offers, while it shows.
     landing: Option<Landing>,
+    /// Whether the landing card says that usage reports are sent.
+    usage_notice: bool,
     /// The file the import card offers, while it shows.
     importing: Option<Importing>,
+    /// Whether the toast about an import that was just done shows, and since when, once a frame has shown
+    /// it.
+    imported: Option<Option<u64>>,
     requests: Vec<Request>,
     /// The pictures the shell has handed over, by asset name.
     images: Images,
@@ -1171,6 +1293,7 @@ pub struct EditorApp {
     panel: Option<Panel>,
     share: Share,
     servers: Servers,
+    browser: Browser,
     /// The address in the link editor while it is open.
     link: Option<String>,
     /// What is typed into one of the style's fields, and the element type it was typed for.
@@ -1257,7 +1380,9 @@ impl EditorApp {
             location: Location::default(),
             copy_location: None,
             landing: None,
+            usage_notice: false,
             importing: None,
+            imported: None,
             requests: Vec::new(),
             images: Images::default(),
             wanted: HashSet::new(),
@@ -1287,6 +1412,7 @@ impl EditorApp {
             panel: None,
             share: Share::default(),
             servers: Servers::default(),
+            browser: Browser::default(),
             link: None,
             draft: None,
             styles: Styles::default(),
@@ -2049,6 +2175,19 @@ impl EditorApp {
         }
     }
 
+    /// The link preview a command is for, since no caret stands in one: the one whose card is out, or
+    /// the one right above the line the caret is at the start of, where Backspace does the same.
+    fn card_chosen(&self) -> Option<BlockId> {
+        if let Some(open) = &self.previews.open {
+            return Some(open.clone());
+        }
+        let caret = &self.editor.selection().filter(|selection| selection.is_caret())?.head;
+        let place = self.editor.model().place(&caret.block).filter(|_| caret.offset == 0)?;
+        let beside = place.parent.map_or(&self.editor.doc().blocks[..], |parent| parent.body.blocks());
+        let above = beside.get(place.index.checked_sub(1)?)?;
+        matches!(above.kind, BlockKind::LinkPreview { .. }).then(|| above.id.clone())
+    }
+
     /// What a command asks for where the caret is now, or `None` while it has nothing to act on.
     fn asked(&self, act: &Act) -> Option<Message> {
         let editor = &self.editor;
@@ -2067,9 +2206,10 @@ impl EditorApp {
             Act::Run(_) | Act::Load | Act::AlwaysLoad | Act::Panel(Panel::Notes) | Act::Review(_) => true,
             Act::NewDocument | Act::Open | Act::SaveCopy | Act::Export | Act::CleanCopy => true,
             Act::Settings | Act::Servers | Act::TrustDocument | Act::TrustFolder | Act::Print => true,
-            Act::Find | Act::FindStep { .. } | Act::Palette => true,
+            Act::Find | Act::FindStep { .. } | Act::Palette | Act::Note { .. } => true,
             Act::Comment => !self.margin.reads,
             Act::MoveRow { .. } | Act::MoveColumn { .. } | Act::Link | Act::Pictures | Act::Preview => false,
+            Act::CardAsLink => false,
             Act::AltText | Act::Callout | Act::CodeLanguage | Act::Embed | Act::EmbedAll => false,
             Act::Panel(Panel::Styles) | Act::Rename | Act::Save | Act::PageSetup => false,
             Act::MergeConflicts | Act::MergeFrom | Act::MergeInto | Act::Share => false,
@@ -2114,8 +2254,18 @@ impl EditorApp {
                 let selection = editor.selection().filter(|selection| !selection.is_caret())?;
                 notes::passage(editor.doc(), selection).map(|_| Message::Note(Noting::Write))?
             }
+            // A note opens under its passage on the page, so only while the page shows.
+            Act::Note { back } => {
+                let caret = editor.selection().map(|selection| &selection.head.block);
+                let next = self.margin.next(*back, editor.doc(), caret).filter(|_| !self.carded() && !self.away())?;
+                Message::Note(Noting::Open(next))
+            }
             Act::Pictures => Message::Ask(Request::Pictures),
             Act::Preview => Message::Preview(Previewing::New),
+            Act::CardAsLink => {
+                let command = Command::CardAsLink(self.card_chosen()?);
+                editor.applies(&command).then_some(Message::Run(command))?
+            }
             Act::AltText => self.captioned().map(|_| Message::Alt(Altering::Open))?,
             Act::Callout => editor.callout().map(|_| Message::Callout(Calling::Open))?,
             Act::CodeLanguage => self.code().map(|_| Message::Language(Languaging::Open))?,
@@ -2285,6 +2435,7 @@ impl EditorApp {
                 self.commands.close();
                 self.share.close();
                 self.servers.close();
+                self.browser.close();
                 if self.grip.release() {
                     self.drop = None;
                 }
@@ -2491,6 +2642,7 @@ impl EditorApp {
                 self.commands.close();
                 self.share.close();
                 self.servers.close();
+                self.browser.close();
                 if self.grip.release() {
                     self.drop = None;
                 }
@@ -2561,14 +2713,17 @@ impl EditorApp {
         sheets
     }
 
-    /// What a key does while Print view shows: it moves through the sheets, prints, takes a change back
-    /// or goes back to editing. Nothing is written there.
+    /// What a key does while Print view shows: it moves through the sheets, starts a page or no longer,
+    /// prints, takes a change back or goes back to editing. Nothing is written there.
     fn print_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
         if event.key == Key::Escape {
-            self.print(Printing::Back, platform);
+            // The keyboard lets go of its place on the sheets before it leaves them.
+            if !self.printing.as_mut().is_some_and(Print::unpick) {
+                self.print(Printing::Back, platform);
+            }
             return true;
         }
-        if self.printing.as_mut().is_some_and(|print| print.key(event)) {
+        if self.break_key(event, platform) || self.printing.as_mut().is_some_and(|print| print.key(event)) {
             return true;
         }
         // A change to the page is an edit, which undo takes back from here too.
@@ -2590,6 +2745,28 @@ impl EditorApp {
         bound
     }
 
+    /// What Tab and Enter do on the sheets: Tab goes to the next place where a page can start or was
+    /// made to, with Shift to the one before, and Enter starts a page there or no longer. Returns whether
+    /// the key was used: past the last place Tab is the window's again, and goes on to the bar.
+    fn break_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        if event.mods.primary || event.mods.alt {
+            return false;
+        }
+        match event.key {
+            Key::Tab => {
+                let pages = self.layout.paginate(&self.editor.model().style().page);
+                let paged = Paged { doc: self.editor.doc(), layout: &self.layout, pages: &pages };
+                self.printing.as_mut().is_some_and(|print| print.walk(event.mods.shift, paged))
+            }
+            Key::Enter if !event.mods.shift => {
+                let Some(asked) = self.printing.as_ref().and_then(Print::picked) else { return false };
+                self.break_pages(asked, platform);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The commands the palette lists: those that what is typed finds and that have something to act on,
     /// each with what it asks.
     fn offers(&self) -> Vec<(&'static Entry, Message)> {
@@ -2602,6 +2779,16 @@ impl EditorApp {
         self.dialog.update(Setting::Close, &mut self.settings);
         self.share.close();
         self.servers.close();
+        self.browser.close();
+    }
+
+    /// Does what the card that opens a server's documents asked.
+    fn browse(&mut self, asked: Browsing, platform: &mut dyn Platform) {
+        if asked == Browsing::Show {
+            self.undialog();
+        }
+        let clock = (platform.wall_time(), self.zone);
+        self.browser.update(asked, self.servers.signed_in(), clock, &mut self.requests);
     }
 
     /// Does what the command palette asked. A command that is taken is done as if its key were pressed.
@@ -3797,7 +3984,7 @@ impl EditorApp {
 
     /// The landing card, over the middle of a page nobody has written on: the documents opened lately, and
     /// the ways to open another or to start this one. A press on the page behind it starts this one.
-    fn card(landing: &Landing, room: Size) -> Popover<Message> {
+    fn card(landing: &Landing, room: Size, notice: bool) -> Popover<Message> {
         let quiet = |text: &str| Element::text(text, TextStyle::control().size(tokens::TEXT_SM)).fg(tokens::FG_MUTED);
         let recent = |recent: &Recent| {
             let when = opening::ago(&landing.now, &recent.opened);
@@ -3853,10 +4040,26 @@ impl EditorApp {
                 .child(list)
                 .child(line);
         }
+        // Said once by a shell that sends usage reports, with the way to where they are turned off.
+        let notice = notice.then(|| {
+            let said = "Letters shares anonymous usage reports. You can turn this off in Settings.";
+            let said = Element::paragraph(said, TextStyle::control().size(tokens::TEXT_SM)).fg(tokens::FG_MUTED);
+            let settings = Button::new("Settings").small().on_press(Message::Settings(Setting::Show));
+            let line = Element::row().height(1.0).bg(tokens::LINE).decorative();
+            let row = Element::row()
+                .align(Align::Center)
+                .gap(tokens::SPACE_SM)
+                .padding(Edges::left(tokens::SPACE_SM))
+                .child(Element::column().grow(1.0).child(said))
+                .child(settings);
+            Element::column().gap(tokens::SPACE_SM).child(line).child(row)
+        });
         // The card sits a little above the middle of the page area.
-        let height = listed * RECENT_HEIGHT + if listed > 0.0 { 120.0 } else { 64.0 };
+        let height = listed * RECENT_HEIGHT
+            + if listed > 0.0 { 120.0 } else { 64.0 }
+            + if notice.is_some() { 48.0 } else { 0.0 };
         let spot = Rect::new(room.width / 2.0, ((room.height - height) * 0.4).max(0.0), 0.0, 0.0);
-        Popover::new(card.child(foot))
+        Popover::new(card.child(foot).children(notice))
             .label("Open a document")
             .max_width(CARD_WIDTH + 2.0 * tokens::SPACE_MD)
             .at(spot)
@@ -4174,8 +4377,9 @@ impl EditorApp {
         let waits = self.margin.follows() && (sheet.is_some() || brought());
         if let Some(importing) = &self.importing {
             element = element.popover(importing.card(room));
-        } else if let Some(landing) = &self.landing {
-            element = element.popover(Self::card(landing, room));
+        } else if let Some(landing) = self.landing.as_ref().filter(|_| !self.browser.open()) {
+            // The card of a server's documents takes the landing card's place while it is out.
+            element = element.popover(Self::card(landing, room, self.usage_notice));
         } else if let Some(copy) = &self.copying {
             element = element.popover(copy.card(self.copies_to(), room));
         } else if let Some((figure, src)) =
@@ -5312,13 +5516,23 @@ impl EditorApp {
             Message::Context(asked) => self.contexting(asked, platform),
             Message::Misspelling { back } => self.misspelling(back),
             Message::Open(path) => self.requests.push(Request::Open(path)),
+            // Someone signed in to a server chooses among what it keeps, or a file of the device from there.
+            Message::OpenDialog if !self.servers.signed_in().is_empty() => self.browse(Browsing::Show, platform),
             Message::OpenDialog => self.requests.push(Request::OpenDialog),
+            Message::Browse(asked) => self.browse(asked, platform),
             Message::NewDocument => self.requests.push(Request::New),
             Message::Start => self.start(),
             Message::Rename(message) => self.rename(message),
             Message::Import(message) => {
                 let stays = self.importing.as_mut().is_some_and(|card| card.update(message, &mut self.requests));
                 self.importing = self.importing.take().filter(|_| stays);
+            }
+            Message::Imported(told) => {
+                self.imported = None;
+                let first = self.margin.imports().1.filter(|_| told == Imported::Show).map(str::to_owned);
+                if let Some(first) = first {
+                    self.does(Message::Note(Noting::Open(first)), platform);
+                }
             }
             Message::Copy(_) if !self.allows.download => {}
             Message::Copy(message) => self.copy(message),
@@ -5351,6 +5565,12 @@ impl EditorApp {
             Message::Settings(message) => {
                 if matches!(message, Setting::Show) {
                     self.undialog();
+                }
+                // Whether usage is reported is the shell's to keep.
+                if let Setting::Usage(on) = message
+                    && self.dialog.usage.is_some_and(|was| was != on)
+                {
+                    self.requests.push(Request::UsageReports(on));
                 }
                 if self.dialog.update(message, &mut self.settings) {
                     self.tint();
@@ -5391,10 +5611,10 @@ impl EditorApp {
         if self.history.is_some() {
             return self.history_key(event, platform);
         }
-        // Print view opens at what is being read. A key the editor is offered brings the caret into view,
-        // so this one is not offered: it is none of the editor's.
-        if commands::bound(event) == Some(&Act::Print) {
-            let asked = self.asked(&Act::Print);
+        // Print view opens at what is being read, and a note where it is. A key the editor is offered
+        // brings the caret into view, so these are not offered: they are none of the editor's.
+        if let Some(act @ (Act::Print | Act::Note { .. })) = commands::bound(event) {
+            let asked = self.asked(act);
             return asked.map(|message| self.update(message, platform)).is_some();
         }
         // Escape lets go of a picture held by a corner or carried, which stays as it was.
@@ -5497,13 +5717,19 @@ impl App for EditorApp {
             let end = room.width - if chapters.is_some() { chapters_width() } else { 0.0 };
             self.find.view(self.find.current(self.editor.selection()), bar, end, room.width)
         });
-        let page = Element::row().grow(1.0).child(page).children(chapters);
+        // The toast about an import lies over the foot of the page, and is the first stop after it.
+        let toast = self.imported.filter(|_| !printing && !away && !self.carded()).map(|_| {
+            let keys = commands::shortcut(&Act::Note { back: false }, self.editor.keymap(), self.mac);
+            importing::toast(self.margin.imports().0, keys.as_deref(), room)
+        });
+        let page = Element::row().grow(1.0).child(page).children(toast).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
         let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
         let over = over.chain(self.merges.card());
         let over = over.chain(self.share.view(&self.name().0, self.connection.is_some(), window.height));
         let over = over.chain(self.servers.view());
+        let over = over.chain(self.browser.view(self.servers.signed_in()));
         let commands = self.commands.open().then(|| {
             let (offers, keymap) = (self.offers(), self.editor.keymap());
             self.commands.view(&offers, keymap, self.mac, bar, window)
@@ -5705,7 +5931,7 @@ impl App for EditorApp {
         }
         // The first character typed over the landing card starts this document with it.
         let typed = matches!(event, InputEvent::Insert(_) | InputEvent::Commit(_) | InputEvent::SetComposition { .. });
-        if self.landing.is_some() && self.importing.is_none() && typed {
+        if self.landing.is_some() && self.importing.is_none() && !self.browser.open() && typed {
             self.start();
             self.edit(platform, |editor, platform| editor.input(event, platform));
         }
@@ -5768,6 +5994,12 @@ impl App for EditorApp {
         if note.is_none() {
             self.note = None;
         }
+        // So does the toast about an import.
+        let toast = self.imported.as_mut().map(|from| *from.get_or_insert(now_ms) + IMPORTED_MS);
+        let toast = toast.filter(|until| now_ms < *until);
+        if toast.is_none() {
+            self.imported = None;
+        }
         let slide = self.maths.animate(now_ms);
         let fade = self.fading.as_mut().map(|from| *from.get_or_insert(now_ms)).and_then(|from| {
             let progress = now_ms.saturating_sub(from) as f32 / tokens::DURATION_FAST;
@@ -5783,7 +6015,7 @@ impl App for EditorApp {
         let slid = self.review.animate(now_ms);
         let rested = self.peeks.animate(now_ms);
         let named = self.presence.animate(now_ms);
-        [note, slide, fade, light, copied, slid, rested, named].into_iter().flatten().min()
+        [note, toast, slide, fade, light, copied, slid, rested, named].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {

@@ -5,7 +5,7 @@ use letters_editor::Picture;
 use letters_model::{Block, BlockKind, Document};
 use letters_render::Point;
 use letters_test::{Found, Harness, Role};
-use letters_ui::{Landing, Request};
+use letters_ui::{Access, Landing, Request};
 
 /// A window on a document of `count` pages: a line for each, which after the first starts a page.
 fn paged(count: usize) -> Harness {
@@ -609,4 +609,142 @@ fn page_setup_is_asked_for_while_editing_and_found_in_the_styles_panel() {
         }
         assert!(!printing(&mut window), "by {name}");
     }
+}
+
+/// The offer to start a page where the keyboard or the pointer is.
+fn offer(window: &mut Harness) -> Option<Found> {
+    window.find(Role::Button, "Page break here")
+}
+
+#[test]
+fn tab_walks_the_places_where_a_page_can_start_and_enter_starts_one_there() {
+    let mut window = listed(12);
+    assert_eq!(offer(&mut window), None, "nothing is offered before a key asks");
+    window.key("Tab");
+    let first = offer(&mut window).expect("the first place is offered").center();
+    window.key("Tab");
+    let second = offer(&mut window).expect("then the next").center();
+    assert!(second.y > first.y, "which is further down the sheet: {second:?}, {first:?}");
+    window.key("Shift+Tab");
+    assert_eq!(offer(&mut window).map(|offer| offer.center()), Some(first), "Shift goes back");
+
+    window.key("Tab").key("Enter");
+    assert_eq!(breaks(&window), ["p2"], "the page starts with the block under the second place");
+    assert_eq!(
+        (numbers(&mut window), markers(&mut window)),
+        (vec!["Page 1 of 2".into(), "Page 2 of 2".into()], vec!["After page 1".into()])
+    );
+    // The keyboard is still on it: Enter takes the break away again, and undo is the document's.
+    window.key("Enter");
+    assert_eq!(breaks(&window), [""; 0]);
+    assert_eq!(offer(&mut window).map(|offer| offer.center()), Some(second), "the place is offered as before");
+    window.key("Mod+Z");
+    assert_eq!(breaks(&window), ["p2"]);
+}
+
+#[test]
+fn tab_reaches_the_breaks_a_document_has_and_then_goes_on_to_the_bar() {
+    // Three lines, each on a sheet of its own.
+    let mut window = paged(3);
+    window.key("Mod+P").key("Tab").key("Enter");
+    assert_eq!(breaks(&window), ["p2"], "the first break is gone");
+    window.key("Tab").key("Enter");
+    assert_eq!(breaks(&window), [""; 0], "and then the second");
+
+    // Past the last place the keyboard lets go, and Tab is the window's again.
+    let mut window = paged(3);
+    window.key("Mod+P").key("Tab").key("Tab").key("Tab");
+    assert!(window.focused().is_some_and(|found| found.role != Role::Document), "{:?}", window.focused());
+    // Back on the sheets it is on no place, and Enter changes no page.
+    window.key("Shift+Tab");
+    assert!(window.focused().is_some_and(|found| found.role == Role::Document), "{:?}", window.focused());
+    window.key("Enter");
+    assert_eq!(breaks(&window), ["p1", "p2"]);
+    // Back from no place Shift with Tab was never the sheets', and back from the first place it lets go.
+    for keys in [&["Shift+Tab"][..], &["Tab", "Shift+Tab"]] {
+        let mut window = listed(12);
+        for key in keys {
+            window.key(key);
+        }
+        assert_eq!(offer(&mut window), None, "after {keys:?}");
+        let focused = window.focused();
+        assert!(focused.is_some_and(|found| found.role != Role::Document), "after {keys:?}");
+    }
+}
+
+#[test]
+fn a_place_the_keyboard_goes_to_is_brought_into_view() {
+    // Lines over three sheets, shown as large as their paper: a sheet is taller than the window.
+    let mut window = listed(80);
+    window.click(Role::RadioButton, "100%");
+    let area = view(&mut window).bounds;
+    let mut pages = Vec::new();
+    for step in 0..100 {
+        window.key("Tab");
+        let Some(offer) = offer(&mut window) else { break };
+        let level = offer.center().y;
+        assert!(level > area.y && level < area.y + area.height, "step {step}: {offer:?} shows in {area:?}");
+        pages.extend(offer.description);
+    }
+    // Each sheet starts with a line that starts a page already.
+    assert_eq!(pages.len(), 80 - 3, "the room above every other line is a place");
+    pages.dedup();
+    assert_eq!(pages, ["On page 1", "On page 2", "On page 3"], "every sheet is walked in turn");
+    assert!(window.focused().is_some_and(|found| found.role != Role::Document), "the last Tab went on to the bar");
+
+    // After the sheets were moved by other keys, the walk starts again where they show.
+    let mut window = listed(80);
+    window.click(Role::RadioButton, "100%");
+    for _ in 0..40 {
+        window.key("Tab");
+    }
+    assert_eq!(offer(&mut window).and_then(|offer| offer.description).as_deref(), Some("On page 2"));
+    window.key("Home").key("Tab");
+    assert_eq!(offer(&mut window).and_then(|offer| offer.description).as_deref(), Some("On page 1"));
+
+    // With no place of its own the keyboard takes the first one in view, and moves no sheet for it.
+    let mut window = listed(80);
+    window.click(Role::RadioButton, "100%");
+    window.key("PageDown");
+    let top = sheets(&mut window)[0].bounds.y;
+    window.key("Tab");
+    assert!(offer(&mut window).is_some(), "a place in view is offered");
+    assert_eq!(sheets(&mut window)[0].bounds.y, top);
+}
+
+#[test]
+fn the_keyboard_lets_go_of_its_place_before_it_leaves_the_sheets() {
+    let mut window = listed(12);
+    window.key("Tab").key("Escape");
+    assert_eq!(offer(&mut window), None, "Escape lets go first");
+    assert!(printing(&mut window));
+    window.key("Enter");
+    assert_eq!(breaks(&window), [""; 0], "and Enter then starts no page");
+    window.key("Escape");
+    assert!(!printing(&mut window), "then it leaves");
+
+    // A press on the sheets takes them for the pointer.
+    let mut window = listed(12);
+    window.key("Tab");
+    let sheet = sheets(&mut window)[0].bounds;
+    window.click_at(Point { x: sheet.x + sheet.width / 2.0, y: sheet.y + sheet.height * 0.02 });
+    assert_eq!(offer(&mut window), None);
+}
+
+#[test]
+fn someone_who_only_reads_is_offered_no_place_by_the_keyboard() {
+    let mut window = listed(12);
+    window.key("Escape").ui().set_access(Access::Reads);
+    window.key("Mod+P").key("Tab");
+    assert!(printing(&mut window));
+    assert_eq!(offer(&mut window), None);
+    assert!(window.focused().is_some_and(|found| found.role != Role::Document), "Tab is the window's");
+    window.key("Enter");
+    assert_eq!(breaks(&window), [""; 0]);
+
+    // The keyboard lets go of its place when the document may no longer be changed.
+    let mut window = listed(12);
+    window.key("Tab").ui().set_access(Access::Reads);
+    window.ui().set_access(Access::Edits);
+    assert_eq!(offer(&mut window), None);
 }

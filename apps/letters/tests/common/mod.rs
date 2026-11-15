@@ -14,6 +14,11 @@ pub struct Writer {
     pub copy: WorkingCopy,
 }
 
+/// Says where the app is, which a test is not: a stranger's history is tried by running it again.
+pub fn app() {
+    letters::strangers::run_with(env!("CARGO_BIN_EXE_letters"));
+}
+
 fn replica() -> ReplicaId {
     ReplicaId::new(&platform::block_id())
 }
@@ -21,6 +26,7 @@ fn replica() -> ReplicaId {
 impl Writer {
     /// The writer of a new document.
     pub fn new(document: &Document, style: Style) -> Self {
+        app();
         let model = Model::new(document.clone(), replica()).with_style(style.clone());
         Self { model, copy: files::new_copy(document.clone(), style) }
     }
@@ -28,10 +34,11 @@ impl Writer {
     /// The writer of a document that was opened, once the rest of its file is read as it is after the first
     /// paint. Returns where its saves go too.
     pub fn of(opened: Opened) -> (Self, Home) {
+        app();
         let replica = replica();
         // The editor's history starts from the style on screen, as a window's does.
         let mut model = Model::new(opened.document, replica).with_style(opened.style);
-        let Working { copy, history, .. } = opened.rest.read(replica, None).unwrap();
+        let Working { copy, history, .. } = opened.rest.read(replica, None, |_| false).unwrap();
         if let Some(history) = history {
             model.attach(history);
         }
