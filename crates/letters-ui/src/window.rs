@@ -226,7 +226,7 @@ pub enum Message {
     TableMenu,
     /// What is done on the card of a callout.
     Callout(Calling),
-    /// What is asked of a table of contents and of the menu on its chip.
+    /// What is asked of a table of contents and of its bar.
     Contents(Listing),
     /// What is asked of a link preview and of its card.
     Preview(Previewing),
@@ -986,7 +986,7 @@ pub struct EditorApp {
     tables: Tables,
     /// The callouts' icons and titles under the pointer, and the card of one.
     callouts: Callouts,
-    /// The tables of contents under the pointer, and the menu of one.
+    /// The tables of contents under the pointer, and the one that is selected.
     contents: Contents,
     /// The link previews under the pointer, the card of one, and what the shell says of fetching them.
     previews: Previews,
@@ -2604,7 +2604,7 @@ impl EditorApp {
         tables.iter().find_map(|table| Some((table.block.clone(), contents::part_at(table, at)?)))
     }
 
-    /// Does what is asked of a table of contents and of its menu.
+    /// Does what is asked of a table of contents and of its bar.
     fn listing(&mut self, asked: Listing, platform: &mut dyn Platform) {
         match asked {
             Listing::Open(table) => {
@@ -2612,7 +2612,7 @@ impl EditorApp {
                 self.contents.open = Some(table);
             }
             Listing::Levels(levels) => {
-                let Some(table) = self.contents.open.take() else { return };
+                let Some(table) = self.contents.open.clone() else { return };
                 let command = Command::SetContentsLevels { table, levels };
                 self.edit(platform, |editor, platform| editor.run(command, platform));
             }
@@ -3393,7 +3393,7 @@ impl EditorApp {
         }
         self.callouts.follow(&self.editor);
         self.languages.follow(&self.editor);
-        // A menu whose table of contents is gone goes with it, and so does the card of a preview.
+        // The bar of a table of contents that is gone goes with it, and so does the card of a preview.
         if self.contents.open.as_ref().is_some_and(|table| self.editor.doc().block(table).is_none()) {
             self.contents.open = None;
         }
@@ -3504,9 +3504,19 @@ impl EditorApp {
             self.callouts.paint(&block, head, self.scheme, &mut list);
         }
         // A table of contents shows what a press on it does, and a link preview that has only its
-        // address has the control that fetches the rest. The preview whose card is out has a ring.
+        // address has the control that fetches the rest. The table that is selected and the preview
+        // whose card is out have a ring.
+        let ring = |at: Rect, (across, down): (f32, f32)| {
+            let rect = Rect::new(at.x - across, at.y - down, at.width + 2.0 * across, at.height + 2.0 * down);
+            let color = resolve(accent().base, self.scheme, 1.0);
+            Item::Stroke { rect, color, width: 2.0, radius: tokens::RADIUS_CARD }
+        };
         for table in self.layout.contents(viewport) {
             self.contents.paint(&table, self.accent.text, self.scheme, &mut list);
+            if self.contents.open.as_ref() == Some(&table.block) {
+                // A table has no frame of its own, so its ring stands off its lines.
+                list.items.push(ring(table.rect, (tokens::SPACE_SM, tokens::SPACE_XS)));
+            }
         }
         for card in self.layout.previews(viewport) {
             if let Some(room) = card.control {
@@ -3514,10 +3524,7 @@ impl EditorApp {
                 self.previews.paint(&card.block, at, self.shaper.as_ref(), self.scheme, &mut list);
             }
             if self.previews.open.as_ref() == Some(&card.block) {
-                let at = card.rect;
-                let rect = Rect::new(at.x - RING, at.y - RING, at.width + 2.0 * RING, at.height + 2.0 * RING);
-                let color = resolve(accent().base, self.scheme, 1.0);
-                list.items.push(Item::Stroke { rect, color, width: 2.0, radius: tokens::RADIUS_CARD });
+                list.items.push(ring(card.rect, (RING, RING)));
             }
         }
         // Each code block has its copy button in its corner, over its text, and its language beside that.
@@ -3689,12 +3696,10 @@ impl EditorApp {
                 _ => None,
             })
         {
-            // The menu hangs from the table's chip.
+            // The bar hangs under the table, or from the caret when the table is out of view.
             let tables = self.layout.contents(viewport);
-            let shown = tables.iter().find(|shown| shown.block == *table);
-            let chip = shown.map(|shown| pictures::chip(contents::badge(shown))).unwrap_or_default();
-            let menu = contents::menu(levels).popover().at(self.onto(chip)).align(Align::End);
-            element = element.popover(menu.open(true).on_close(Message::Contents(Listing::Close)));
+            let shown = tables.iter().find(|shown| shown.block == *table).map(|shown| self.onto(shown.rect));
+            element = element.popover(contents::bar(levels, shown.or(caret).unwrap_or_default()));
         } else if self.previews.adding() {
             // The field hangs from the caret, where the preview will stand.
             element = element.popover(self.previews.asking(caret.unwrap_or_default()));

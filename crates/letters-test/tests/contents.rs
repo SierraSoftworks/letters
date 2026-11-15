@@ -6,7 +6,7 @@ use letters_test::{Found, Harness, Role};
 use letters_ui::SaveState;
 
 const OPTIONS: &str = "Table of contents options";
-const MENU: &str = "Table of contents";
+const BAR: &str = "Table of contents";
 
 /// How tall the window of [`plan`] is.
 const HEIGHT: f32 = 600.0;
@@ -72,31 +72,32 @@ fn a_press_on_a_line_goes_to_the_heading_it_lists() {
 
 #[test]
 fn the_chip_of_a_table_sets_how_deep_it_lists() {
-    // The depth chosen, and the headings the table then lists.
+    // The level chosen, and the headings the table then lists.
     let cases: [(&str, &[&str]); 4] = [
-        ("Heading 1 only", &[]),
-        ("Headings 1 and 2", &["Budget", "Schedule"]),
-        ("Headings 1 to 3", &["Budget", "Roof", "Schedule"]),
-        ("Headings 1 to 4", &["Budget", "Roof", "Slates", "Schedule"]),
+        ("1", &[]),
+        ("2", &["Budget", "Schedule"]),
+        ("3", &["Budget", "Roof", "Schedule"]),
+        ("4", &["Budget", "Roof", "Slates", "Schedule"]),
     ];
-    for (depth, lists) in cases {
+    for (level, lists) in cases {
         let mut window = plan();
-        window.click(Role::Button, OPTIONS).assert_open(Role::Menu, MENU);
-        let ticked = |window: &mut Harness, depth| window.find(Role::MenuItemCheckBox, depth)?.toggled;
-        assert_eq!(ticked(&mut window, "Headings 1 to 3"), Some(true), "the menu says how deep it lists now");
-        assert_eq!(ticked(&mut window, "Headings 1 to 4"), Some(false));
+        window.click(Role::Button, OPTIONS).assert_open(Role::Dialog, BAR);
+        let chosen = |window: &mut Harness, level| window.find(Role::RadioButton, level)?.toggled;
+        assert_eq!(chosen(&mut window, "3"), Some(true), "the bar says how deep it lists now");
+        assert_eq!(chosen(&mut window, "4"), Some(false));
         assert_eq!(caret(&window), Some(("title", 0)), "the caret stays where it was");
 
-        window.click(Role::MenuItemCheckBox, depth).assert_closed(Role::Menu, MENU);
-        assert_eq!(listed(&mut window), lists, "{depth}");
+        window.click(Role::RadioButton, level);
+        assert_eq!(chosen(&mut window, level), Some(true), "{level}: the bar stays, for another to be tried");
+        window.key("Escape").assert_closed(Role::Dialog, BAR);
+        assert_eq!(listed(&mut window), lists, "{level}");
     }
 
     // A table with nothing to list keeps its chip, and what it listed comes back in one step.
     let mut window = plan();
-    window.click(Role::Button, OPTIONS).click(Role::MenuItemCheckBox, "Heading 1 only");
-    window.click(Role::Button, OPTIONS).assert_open(Role::Menu, MENU);
-    window.key("Escape").assert_closed(Role::Menu, MENU);
-    window.key("Mod+Z");
+    window.click(Role::Button, OPTIONS).click(Role::RadioButton, "1").key("Escape");
+    window.click(Role::Button, OPTIONS).assert_open(Role::Dialog, BAR);
+    window.key("Escape").key("Mod+Z");
     assert_eq!(listed(&mut window).len(), 3, "undo brings the lines back");
 }
 
@@ -136,7 +137,7 @@ fn assistive_technology_presses_the_lines_and_the_chip_of_a_table() {
         window.ask(ActionRequest { action: Action::Click, target_tree: TreeId::ROOT, target_node, data: None });
         match role {
             Role::Link => assert_eq!(caret(&window), Some(("schedule", 0))),
-            _ => _ = window.assert_open(Role::Menu, MENU),
+            _ => _ = window.assert_open(Role::Dialog, BAR),
         }
     }
 }

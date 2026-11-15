@@ -1,5 +1,6 @@
 //! A table of contents on the page: a press on one of its lines goes to the heading the line lists, and a
-//! chip in its corner, which shows while the pointer is over the table, sets how deep the table lists.
+//! chip in its corner, which shows while the pointer is over the table, selects the table. A bar under a
+//! selected table sets how deep it lists.
 //!
 //! No caret stands in a table of contents, so the window asks this module what a press on one is on.
 
@@ -8,17 +9,23 @@ use letters_model::BlockId;
 use letters_render::{DisplayList, Item, Point, Rect};
 
 use crate::color::resolve;
+use crate::element::Element;
 use crate::icon;
 use crate::pictures;
+use crate::style::{Align, Edges};
+use crate::text::TextStyle;
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::widgets::{Menu, MenuItem};
+use crate::widgets::{Popover, Segmented};
 use crate::window::Message;
 
 /// What the chip of a table of contents is called.
 pub(crate) const LABEL: &str = "Table of contents options";
 
-/// What each depth a table can list to is called, from Heading 1 alone.
-const DEPTHS: [&str; 4] = ["Heading 1 only", "Headings 1 and 2", "Headings 1 to 3", "Headings 1 to 4"];
+/// What the bar of a table of contents is called, and what its choice of a depth is.
+const BAR: &str = "Table of contents";
+const LEVELS: &str = "Levels";
+/// The deepest heading a table can list.
+const DEEPEST: u8 = 4;
 
 /// The size of the sign in the chip, which is drawn as the cloud of a linked picture is.
 const SIGN: f32 = 16.0;
@@ -28,9 +35,9 @@ const REACH: f32 = 4.0;
 /// What is asked of a table of contents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Listing {
-    /// Shows the menu of a table, as a press on its chip does.
+    /// Selects a table, as a press on its chip does: its bar shows under it.
     Open(BlockId),
-    /// Has the table whose menu is out list the headings down to this level.
+    /// Has the table that is selected list the headings down to this level.
     Levels(u8),
     /// Escape or a press elsewhere.
     Close,
@@ -44,10 +51,10 @@ pub(crate) enum Part {
     Chip,
 }
 
-/// The tables of contents of the page, as the pointer and the menu have them.
+/// The tables of contents of the page, as the pointer and the bar have them.
 #[derive(Default)]
 pub(crate) struct Contents {
-    /// The table whose menu is out.
+    /// The table that is selected, whose bar is out.
     pub open: Option<BlockId>,
     /// The table under the pointer, and what of it.
     pub over: Option<(BlockId, Part)>,
@@ -70,14 +77,21 @@ pub(crate) fn part_at(table: &ContentsBox, at: Point) -> Option<Part> {
     line.map(|(heading, _)| Part::Line(heading.clone()))
 }
 
-/// The menu on a table's chip, for a table that lists down to `levels`.
-pub(crate) fn menu(levels: u8) -> Menu<Message> {
-    let mut menu = Menu::new().label("Table of contents").heading("Lists");
-    for (level, name) in (1..).zip(DEPTHS) {
-        let item = MenuItem::new(name).checked(level == levels);
-        menu = menu.item(item.on_select(Message::Contents(Listing::Levels(level))));
+/// The bar of a selected table that lists down to `levels`, which hangs under the table at `spot`. It
+/// stays out after a choice, for another depth to be tried.
+pub(crate) fn bar(levels: u8, spot: Rect) -> Popover<Message> {
+    let mut depths = Segmented::new(LEVELS).small();
+    for level in 1..=DEEPEST {
+        depths = depths.segment(level.to_string(), level == levels, Message::Contents(Listing::Levels(level)));
     }
-    menu
+    let said = Element::text(LEVELS, TextStyle::control().size(tokens::TEXT_SM)).fg(tokens::FG_MUTED).decorative();
+    let row = Element::row()
+        .align(Align::Center)
+        .gap(tokens::SPACE_SM)
+        .padding(Edges::xy(tokens::SPACE_SM, tokens::SPACE_XS))
+        .child(said)
+        .child(depths);
+    Popover::new(row).label(BAR).flush().at(spot).open(true).on_close(Message::Contents(Listing::Close))
 }
 
 impl Contents {
@@ -94,8 +108,8 @@ impl Contents {
     }
 
     /// Shows what a press on a table would do: the line under the pointer is filled, and the table under
-    /// the pointer, or with its menu out, has its chip. `accent` is the person's accent as it is written
-    /// on a surface.
+    /// the pointer, or the one that is selected, has its chip. `accent` is the person's accent as it is
+    /// written on a surface.
     pub fn paint(&self, table: &ContentsBox, accent: Ink, scheme: Scheme, out: &mut DisplayList) {
         let over = self.over.as_ref().filter(|(block, _)| *block == table.block).map(|(_, part)| part);
         let open = self.open.as_ref() == Some(&table.block);
