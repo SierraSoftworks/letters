@@ -8,9 +8,9 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
-use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Platform};
+use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Platform};
 use letters_layout::{Callout, DocLayout, Fonts, Palette, Syntax};
-use letters_model::{Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Mark, Pos, Selection, Style};
+use letters_model::{Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Mark, Marker, Pos, Selection, Style};
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
 
@@ -20,6 +20,7 @@ use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::highlight;
 use crate::icon::{self, Icon};
+use crate::maths::{self, Maths, Sheet, SheetLines, Source};
 use crate::motion::{self, FRAME_MS};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
@@ -41,7 +42,7 @@ const GUTTER: f32 = 24.0;
 const TOP: f32 = 48.0;
 /// Points to logical pixels.
 pub(crate) const PT: f32 = 96.0 / 72.0;
-const CARET_WIDTH: f32 = 1.5;
+pub(crate) const CARET_WIDTH: f32 = 1.5;
 /// How much text one idle step lays out, in bytes. Small enough to fit between two frames.
 const SETTLE_BYTES: usize = 4096;
 
@@ -152,12 +153,15 @@ pub enum Message {
     Styles(Styling),
     /// Asks the shell for something only it can do, such as moving the window.
     Ask(Request),
+    /// What is done on the sheet under a formula.
+    Maths(Sheet),
 }
 
 impl Ui<EditorApp> {
     /// The window on a document. It is drawn with the style its model holds: see `Model::with_style`.
     pub fn new(editor: Editor) -> Self {
-        Ui::host(EditorApp::new(editor), Rc::new(FontShaper::default()))
+        let shaper = Rc::new(FontShaper::default());
+        Ui::host(EditorApp::new(editor, shaper.clone()), shaper)
     }
 
     pub fn editor(&self) -> &Editor {
@@ -325,7 +329,7 @@ impl Lines for DocLines<'_> {
 /// Lends the editor the shell's platform together with the laid-out lines.
 struct Lent<'a> {
     platform: &'a mut dyn Platform,
-    lines: DocLines<'a>,
+    lines: SheetLines<DocLines<'a>>,
 }
 
 impl Platform for Lent<'_> {
@@ -361,7 +365,10 @@ impl Platform for Lent<'_> {
 pub struct EditorApp {
     editor: Editor,
     layout: DocLayout,
+    /// Shapes what the window draws on a canvas of its own, as the interface's text is shaped.
+    shaper: Rc<FontShaper>,
     palette: Palette,
+    scheme: Scheme,
     /// The text column's left edge inside the page area, and its width.
     column: (f32, f32),
     /// The height of the page area.
@@ -408,14 +415,20 @@ pub struct EditorApp {
     reduced_motion: bool,
     spelling: Spelling,
     dragging: bool,
+    maths: Maths,
 }
 
 impl EditorApp {
-    fn new(editor: Editor) -> Self {
+    fn new(editor: Editor, shaper: Rc<FontShaper>) -> Self {
+        let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
+        // A formula stays typeset under the caret: its source is written on a sheet under it.
+        layout.set_formula_source(false);
         Self {
             editor,
-            layout: DocLayout::new(Fonts { faces: letters_fonts::bundled() }),
+            layout,
+            shaper,
             palette: Palette::LIGHT,
+            scheme: Scheme::Light,
             column: (0.0, 0.0),
             height: 0.0,
             scroll: 0.0,
@@ -444,6 +457,7 @@ impl EditorApp {
             reduced_motion: false,
             spelling: Spelling::default(),
             dragging: false,
+            maths: Maths::default(),
         }
     }
 
@@ -569,7 +583,11 @@ impl EditorApp {
     /// text must not slide under its window.
     fn mark(&mut self) {
         let head = self.editor.selection().map(|selection| selection.head.clone());
-        let markers = self.editor.markers();
+        let mut markers = self.editor.markers();
+        // A formula's source is on its sheet, so nothing on the page has to say where it begins and ends.
+        let dollar = |marker: &Marker| marker.text == "$";
+        markers.before_caret -= markers.inline[..markers.before_caret].iter().filter(|marker| dollar(marker)).count();
+        markers.inline.retain(|marker| !dollar(marker));
         let changed = self.layout.reveal(head.as_ref().map(|head| (head, &markers)));
         self.layout.set_composition(self.editor.composition());
         let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
@@ -594,7 +612,17 @@ impl EditorApp {
 
     /// Runs something on the editor, which may ask the layout about lines while it works.
     fn edit(&mut self, platform: &mut dyn Platform, act: impl FnOnce(&mut Editor, &mut dyn Platform) -> Change) {
-        let mut lent = Lent { platform, lines: DocLines::new(&self.layout, self.height) };
+        // On a sheet the caret moves by the lines of the source, which the page does not show.
+        let source = Source::of(&self.editor, self.shaper.as_ref());
+        let formula = self.editor.selection().and_then(|selection| self.layout.formula_rect(&selection.head));
+        let room = 2.0 * self.column.0 + self.column.1;
+        let left = source.as_ref().zip(formula).map(|(source, rect)| Maths::left(source, rect.x, rect.width, room));
+        let lines = SheetLines {
+            page: DocLines::new(&self.layout, self.height),
+            source: source.filter(|_| left.is_some()),
+            left: left.unwrap_or_default(),
+        };
+        let mut lent = Lent { platform, lines };
         let change = act(&mut self.editor, &mut lent);
         self.changed(&change);
     }
@@ -685,6 +713,7 @@ impl EditorApp {
         match event {
             Pointer::Down { at, mods, clicks } => {
                 self.picked = None;
+                self.maths.typed(false);
                 // Under the last block there is always a line to write on, also when the document ends in
                 // something that holds the caret in, as a code block does.
                 if at.y + self.scrolled() - TOP > self.layout.height() && !mods.shift {
@@ -853,16 +882,29 @@ impl EditorApp {
         self.scroll = self.scroll.min(self.max_scroll());
 
         let viewport = self.viewport();
+        let origin = Point { x: left, y: TOP - self.scrolled() };
         let mut list = DisplayList::default();
         let selection = self.editor.selection();
-        if let Some(selection) = selection.filter(|selection| !selection.is_caret()) {
-            let color = self.palette.selection;
-            list.items.extend(self.layout.selection_in(selection, viewport).into_iter().map(|rect| fill(rect, color)));
+        // A formula with the caret in it has its source out on a sheet, while the place under it is in view
+        // and nothing else hangs from the page.
+        let alone = self.landing.is_none() && self.spelling.fix.is_none() && self.link.is_none();
+        let formula = selection.filter(|_| alone).and_then(|selection| self.layout.formula_rect(&selection.head));
+        let formula = formula.filter(|rect| (0.0..=room.height).contains(&(origin.y + rect.y + rect.height)));
+        let sheet = formula.and_then(|rect| Some((Source::of(&self.editor, self.shaper.as_ref())?, rect)));
+        self.maths.follow(sheet.as_ref().map(|(source, _)| source), self.reduced_motion);
+        match &sheet {
+            Some((_, rect)) => list.items.push(maths::tint(*rect, self.scheme)),
+            // On a sheet, the sheet shows what is selected.
+            None => {
+                let color = self.palette.selection;
+                let ranged = selection.filter(|selection| !selection.is_caret());
+                let spans = ranged.map(|selection| self.layout.selection_in(selection, viewport)).unwrap_or_default();
+                list.items.extend(spans.into_iter().map(|rect| fill(rect, color)));
+            }
         }
         self.layout.paint(viewport, &mut list);
 
-        let origin = Point { x: left, y: TOP - self.scrolled() };
-        let caret = selection.and_then(|selection| self.layout.caret(&selection.head));
+        let caret = selection.filter(|_| sheet.is_none()).and_then(|selection| self.layout.caret(&selection.head));
         let caret =
             caret.map(|caret| Rect { x: origin.x + caret.x, y: origin.y + caret.y, width: CARET_WIDTH, ..caret });
         let paint = PagePaint {
@@ -898,6 +940,10 @@ impl EditorApp {
                 Popover::new(Element::from(field).width(300.0)).label("Link").open(true).on_close(Message::LinkClose);
             // The editor hangs from the caret, in place.
             element = element.popover(editor.at(caret.unwrap_or_default())).cursor(Cursor::Text);
+        } else if let Some(((source, rect), selection)) = sheet.zip(selection) {
+            let spot = Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect };
+            element =
+                element.popover(self.maths.sheet(source, selection, rect.width, room.width, self.scheme).at(spot));
         }
         element
     }
@@ -1332,6 +1378,90 @@ impl EditorApp {
         self.panel = panel;
     }
 
+    /// Does what was asked on the sheet under the formula the caret is in.
+    fn sheet(&mut self, message: Sheet, platform: &mut dyn Platform) {
+        let Some((block, source)) = self.editor.formula().map(|(block, source)| (block.clone(), source)) else {
+            return;
+        };
+        let at = |offset: usize| Pos::new(block.clone(), offset.clamp(source.start, source.end));
+        match message {
+            Sheet::Press { offset, extend, clicks } => {
+                let head = at(offset);
+                let anchor = match self.editor.selection() {
+                    Some(selection) if extend => selection.anchor.clone(),
+                    _ => head.clone(),
+                };
+                self.editor.select(Selection { anchor, head });
+                match clicks {
+                    1 => self.stay(offset == source.start, platform),
+                    2 => self.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform)),
+                    _ => self.editor.select(Selection { anchor: at(source.start), head: at(source.end) }),
+                }
+                self.maths.dragging = clicks == 1;
+                self.maths.typed(false);
+                self.mark();
+            }
+            Sheet::Drag(offset) => {
+                // A pointer that has not left its character leaves the caret as the press put it.
+                let held = self.editor.selection().filter(|selection| selection.head != at(offset));
+                if let Some(anchor) = held.filter(|_| self.maths.dragging).map(|selection| selection.anchor.clone()) {
+                    self.editor.select(Selection { anchor, head: at(offset) });
+                    self.mark();
+                }
+            }
+            Sheet::Release => self.maths.dragging = false,
+            Sheet::Take(index) => self.take(index, platform),
+            // Escape puts the list of symbols away first.
+            Sheet::Leave if self.symbols().is_some() => self.maths.typed(false),
+            Sheet::Leave => self.edit(platform, |editor, platform| editor.run(Command::LeaveFormula, platform)),
+        }
+    }
+
+    /// The symbols the sheet offers for the command being typed at the caret, and the stretch of the
+    /// formula's block that one of them would replace.
+    fn symbols(&self) -> Option<(Pos, usize, Vec<&'static letters_math::Command>)> {
+        let source = Source::of(&self.editor, self.shaper.as_ref())?;
+        let (typed, symbols) = self.maths.symbols(&source, self.editor.selection()?)?;
+        Some((Pos::new(source.block, typed.start), typed.end, symbols))
+    }
+
+    /// Writes a symbol of the list in place of the command being typed. One that takes arguments gets its
+    /// braces, and the caret waits in the first pair.
+    fn take(&mut self, index: usize, platform: &mut dyn Platform) {
+        let Some((start, end, symbols)) = self.symbols() else { return };
+        let Some(symbol) = symbols.get(index) else { return };
+        self.editor.select(Selection { anchor: start.clone(), head: Pos::new(start.block.clone(), end) });
+        let written = InputEvent::Insert(maths::written(symbol));
+        self.edit(platform, |editor, platform| editor.input(written, platform));
+        if symbol.arguments > 0 {
+            let first = Pos::new(start.block, start.offset + symbol.command.len() + 1);
+            self.editor.select(Selection::caret(first));
+            self.mark();
+        }
+        self.maths.typed(false);
+    }
+
+    /// Lets the list of symbols have the keys that walk it and take from it, while it shows.
+    fn list_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        let plain = event.mods == Modifiers::default();
+        let Some((_, _, symbols)) = self.symbols().filter(|_| plain) else { return false };
+        match event.key {
+            Key::Down | Key::Up => self.maths.pick(event.key == Key::Down, symbols.len()),
+            Key::Tab => self.take(self.maths.picked(symbols.len()), platform),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Keeps a caret set at an end of inline maths inside it. Left there, text typed next would be written
+    /// beside the formula, and the sheet that was pressed would go.
+    fn stay(&mut self, at_start: bool, platform: &mut dyn Platform) {
+        if self.editor.formula().is_none() {
+            let to = if at_start { Motion::Right } else { Motion::Left };
+            self.edit(platform, |editor, platform| editor.run(Command::Move { to, extend: false }, platform));
+        }
+    }
+
     /// What the Styles panel asks for. A change to the style is one step for undo, and files are asked of
     /// the shell.
     fn styling(&mut self, message: Styling, platform: &mut dyn Platform) {
@@ -1411,7 +1541,10 @@ impl App for EditorApp {
 
     fn update(&mut self, message: Message, platform: &mut dyn Platform) {
         match message {
-            Message::Text(event) => self.edit(platform, |editor, platform| editor.input(event, platform)),
+            Message::Text(event) => {
+                self.edit(platform, |editor, platform| editor.input(event, platform));
+                self.maths.typed(true);
+            }
             Message::Pointer(event) => self.pointer(event, platform),
             Message::Run(command) => self.edit(platform, |editor, platform| editor.run(command, platform)),
             Message::Panel(panel) => self.show((self.panel != Some(panel)).then_some(panel)),
@@ -1443,6 +1576,7 @@ impl App for EditorApp {
             Message::Rename(message) => self.rename(message),
             Message::Styles(message) => self.styling(message, platform),
             Message::Ask(request) => self.requests.push(request),
+            Message::Maths(message) => self.sheet(message, platform),
             Message::Jump(block) => {
                 let start = Pos { block, offset: 0 };
                 self.editor.select(Selection::caret(start.clone()));
@@ -1480,12 +1614,20 @@ impl App for EditorApp {
     }
 
     fn key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
-        let mut used = false;
+        if self.list_key(event, platform) {
+            return true;
+        }
+        let (mut used, mut edited) = (false, false);
         self.edit(platform, |editor, platform| {
             let change = editor.key(event.clone(), platform);
             used = change.is_some();
+            edited = change.as_ref().is_some_and(|change| !change.blocks.is_empty());
             change.unwrap_or_default()
         });
+        // A key that deletes is typing too. One that moves the caret is not, and puts the symbols away.
+        if used {
+            self.maths.typed(edited);
+        }
         // The editor leaves this one to the window, which edits the link in place.
         let link = event.key == Key::Char('k') && event.mods == Modifiers { primary: true, ..Modifiers::default() };
         if !used && link {
@@ -1533,6 +1675,7 @@ impl App for EditorApp {
     }
 
     fn scheme(&mut self, scheme: Scheme) {
+        self.scheme = scheme;
         self.palette = palette(scheme);
         self.layout.set_palette(self.palette);
     }
@@ -1557,15 +1700,17 @@ impl App for EditorApp {
         if note.is_none() {
             self.saved_in = None;
         }
-        let Some(from) = self.fading.as_mut().map(|from| *from.get_or_insert(now_ms)) else { return note };
-        let progress = now_ms.saturating_sub(from) as f32 / tokens::DURATION_FAST;
-        // The last step is the page exactly as it will stay.
-        self.layout.set_reveal_progress(if progress < 1.0 { motion::ease(progress) } else { 1.0 });
-        if progress < 1.0 {
-            return Some(now_ms + FRAME_MS);
-        }
-        self.fading = None;
-        note
+        let slide = self.maths.animate(now_ms);
+        let fade = self.fading.as_mut().map(|from| *from.get_or_insert(now_ms)).and_then(|from| {
+            let progress = now_ms.saturating_sub(from) as f32 / tokens::DURATION_FAST;
+            // The last step is the page exactly as it will stay.
+            self.layout.set_reveal_progress(if progress < 1.0 { motion::ease(progress) } else { 1.0 });
+            if progress >= 1.0 {
+                self.fading = None;
+            }
+            (progress < 1.0).then_some(now_ms + FRAME_MS)
+        });
+        [note, slide, fade].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {

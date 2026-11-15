@@ -18,6 +18,7 @@ letters-render.workspace = true
 letters-fonts.workspace = true
 letters-layout.workspace = true
 letters-editor.workspace = true
+letters-math.workspace = true
 accesskit.workspace = true
 yewi-highlight.workspace = true
 yewi-tokens.workspace = true

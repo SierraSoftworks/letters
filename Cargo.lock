@@ -2738,6 +2738,7 @@ dependencies = [
  "letters-editor",
  "letters-fonts",
  "letters-layout",
+ "letters-math",
  "letters-model",
  "letters-render",
  "letters-spell",

@@ -15,6 +15,7 @@ mod highlight;
 pub mod icon;
 mod input;
 mod layout;
+mod maths;
 pub mod motion;
 mod opening;
 mod paint;

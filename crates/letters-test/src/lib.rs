@@ -67,6 +67,8 @@ pub struct Found {
     pub toggled: Option<bool>,
     /// Whether the popover it opens is showing.
     pub expanded: Option<bool>,
+    /// Whether it is the one picked among its siblings, as an option of a list is.
+    pub selected: Option<bool>,
 }
 
 impl Found {
@@ -84,6 +86,7 @@ impl Found {
             disabled: node.is_disabled(),
             toggled: node.toggled().map(|toggled| toggled == Toggled::True),
             expanded: node.data().is_expanded(),
+            selected: node.is_selected(),
         }
     }
 

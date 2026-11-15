@@ -1736,3 +1736,206 @@ fn a_click_on_the_page_shows_the_markers_where_it_lands() {
     let shown = spot(&mut marked(true), "b1", landed.offset);
     assert_eq!(caret(&mut window).x, shown.x, "the markers show as they do when the caret is put there");
 }
+
+/// The source of the inline formula [`formulas`] writes, and of its formula block.
+const INLINE: &str = "c = a + b";
+const DISPLAY: &str = "x = a\n+ b";
+
+/// A paragraph `p1` that ends in inline maths with the caret just after it, over a formula block `f1` of
+/// two lines. Nothing moves, so a sheet is out as soon as the caret is in a formula.
+fn formulas() -> Harness {
+    let blocks = vec![
+        text("p1", BlockKind::Paragraph, "A rafter has length "),
+        text("f1", BlockKind::Formula, DISPLAY),
+        text("p2", BlockKind::Paragraph, "Reply by Friday."),
+    ];
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.ui().set_reduced_motion(true);
+    window.ui().select(Selection::caret(Pos::new("p1", 20)));
+    window.type_text(&format!("${INLINE}$"));
+    window
+}
+
+/// The sheet under a formula, if one is out: its description is the source it shows.
+fn sheet(window: &mut Harness) -> Option<letters_test::Found> {
+    window.find(Role::Code, "Formula source")
+}
+
+/// The source the sheet shows.
+fn source(window: &mut Harness) -> Option<String> {
+    sheet(window).and_then(|sheet| sheet.description)
+}
+
+#[test]
+fn the_source_of_a_formula_is_on_a_sheet_under_it_while_the_caret_is_in_it() {
+    let mut window = formulas();
+    assert_eq!(source(&mut window), None, "the caret is past the formula it closed");
+    let line = caret(&mut window);
+
+    window.key("Left");
+    assert_eq!(source(&mut window).as_deref(), Some(INLINE));
+    let (sheet, caret) = (sheet(&mut window).expect("a sheet").bounds, caret(&mut window));
+    assert!(sheet.y >= line.y + line.height - 4.0, "the sheet hangs under the line: {sheet:?} under {line:?}");
+    let middle = Point { x: caret.x, y: caret.y + caret.height / 2.0 };
+    assert!(sheet.contains(middle), "the caret is on the sheet: {caret:?} in {sheet:?}");
+
+    // What is typed goes into the formula, and the sheet shows it.
+    window.type_text("x");
+    assert_eq!(block_text(&window, "p1"), format!("A rafter has length {INLINE}x"));
+    assert_eq!(source(&mut window), Some(format!("{INLINE}x")));
+
+    // The sheet is for the formula the caret is in, whichever kind.
+    window.ui().select(Selection::caret(Pos::new("f1", 2)));
+    assert_eq!(source(&mut window).as_deref(), Some(DISPLAY));
+}
+
+#[test]
+fn the_sheet_goes_when_the_caret_leaves_its_formula() {
+    let far = spot(&mut formulas(), "p2", 4);
+    // How the caret leaves from the end of the inline formula. None of it adds to the document.
+    for way in ["Escape", "Right", "a press elsewhere on the page"] {
+        let mut window = formulas();
+        window.key("Left");
+        let before = window.markdown();
+        match way {
+            "Escape" | "Right" => window.key(way),
+            _ => window.click_at(Point { x: far.x, y: far.y + far.height / 2.0 }),
+        };
+        assert_eq!(source(&mut window), None, "{way}");
+        assert_eq!(window.editor().formula(), None, "{way}");
+        assert_eq!(window.markdown(), before, "{way}: the document is as it was");
+    }
+}
+
+#[test]
+fn up_and_down_move_through_the_lines_of_the_source_before_they_leave_the_formula() {
+    let mut window = formulas();
+    window.ui().select(Selection::caret(Pos::new("f1", 2)));
+    window.key("Down");
+    assert_eq!(head(&window), Pos::new("f1", 8), "the same column of the second line");
+    window.key("End");
+    assert_eq!(head(&window), Pos::new("f1", 9));
+    window.key("Home");
+    assert_eq!(head(&window), Pos::new("f1", 6), "the start of the line of source, not of the formula");
+    window.key("Down");
+    assert_eq!(head(&window).block.as_str(), "p2", "past the last line the caret is on the page again");
+    window.key("Up");
+    assert_eq!(head(&window).block.as_str(), "f1");
+    assert_eq!(source(&mut window).as_deref(), Some(DISPLAY));
+}
+
+#[test]
+fn a_press_on_the_sheet_puts_the_caret_there_in_the_source() {
+    let mut window = formulas();
+    window.key("Left");
+    let sheet = sheet(&mut window).expect("a sheet").bounds;
+    let at = |part: f32| Point { x: sheet.x + sheet.width * part, y: sheet.y + sheet.height / 2.0 };
+
+    window.click_at(at(0.5));
+    let middle = head(&window).offset;
+    assert!(middle > 20 && middle < 29, "somewhere inside the source: {middle}");
+    assert_eq!(source(&mut window).as_deref(), Some(INLINE), "the sheet stays out");
+
+    // The start of the source is still in the formula: what is typed there is part of it.
+    window.click_at(at(0.0));
+    assert_eq!(head(&window), Pos::new("p1", 20));
+    window.type_text("2");
+    assert_eq!(source(&mut window), Some(format!("2{INLINE}")));
+
+    // A drag selects source, which typing replaces. It comes too late to be a double click.
+    window.advance(1000).press_at(at(0.0)).release_at(at(1.0));
+    assert_eq!(selected(&window), format!("2{INLINE}"));
+    window.type_text("y");
+    assert_eq!(source(&mut window).as_deref(), Some("y"));
+    assert_eq!(block_text(&window, "p1"), "A rafter has length y");
+}
+
+#[test]
+fn a_sheet_slides_out_from_under_its_formula() {
+    let mut window = formulas();
+    window.ui().set_reduced_motion(false);
+    window.key("Left");
+    let mut heights = Vec::new();
+    for _ in 0..30 {
+        heights.push(sheet(&mut window).expect("a sheet").bounds.height);
+        window.advance(8);
+    }
+    assert!(heights[0] < heights[29], "it starts short of its height: {heights:?}");
+    assert!(heights.windows(2).all(|pair| pair[0] <= pair[1]), "and only grows: {heights:?}");
+    assert_eq!(heights[28], heights[29], "to rest within a quarter of a second: {heights:?}");
+}
+
+/// The symbols the sheet lists, top to bottom: each command, its plain name, and whether it is the one
+/// picked.
+fn symbols(window: &mut Harness) -> Vec<(String, String, bool)> {
+    let option = |found: letters_test::Found| {
+        let picked = found.selected.filter(|_| found.role == Role::ListBoxOption)?;
+        Some((found.name, found.description.unwrap_or_default(), picked))
+    };
+    window.controls().into_iter().filter_map(option).collect()
+}
+
+/// [`formulas`] with the caret at the end of the inline formula, and `typed` typed there.
+fn typing(typed: &str) -> Harness {
+    let mut window = formulas();
+    window.key("Left").type_text(typed);
+    window
+}
+
+#[test]
+fn a_backslash_lists_the_symbols_that_match_what_follows_it() {
+    let mut window = typing(r" \ap");
+    window.assert_open(Role::ListBox, "Symbols");
+    let listed = symbols(&mut window);
+    assert_eq!(listed[0], (r"\approx".to_owned(), "approximately equal to".to_owned(), true), "{listed:?}");
+    assert!(listed.len() > 1 && listed[1..].iter().all(|symbol| !symbol.2), "one is picked: {listed:?}");
+
+    // The list follows what is typed, and a plain name finds a symbol as well as its command does.
+    window.key("Backspace").key("Backspace").type_text("fraction");
+    assert_eq!(symbols(&mut window)[0].0, r"\frac");
+    window.type_text("zz");
+    window.assert_closed(Role::ListBox, "Symbols");
+}
+
+#[test]
+fn tab_writes_the_picked_symbol_and_a_press_writes_the_one_pressed() {
+    let mut window = typing(r" \ap");
+    let second = symbols(&mut window)[1].0.clone();
+    window.key("Down");
+    assert!(symbols(&mut window)[1].2, "Down picks the next one");
+    window.key("Tab");
+    assert_eq!(source(&mut window), Some(format!("{INLINE} {second}")));
+    window.assert_closed(Role::ListBox, "Symbols");
+
+    // One that takes arguments gets its braces, and the caret waits in the first pair.
+    window.type_text(r" \fra").click(Role::ListBoxOption, r"\frac");
+    assert_eq!(source(&mut window), Some(format!(r"{INLINE} {second} \frac{{}}{{}}")));
+    window.type_text("a");
+    assert_eq!(source(&mut window), Some(format!(r"{INLINE} {second} \frac{{a}}{{}}")));
+
+    window.key("Mod+Z").key("Mod+Z");
+    assert_eq!(source(&mut window), Some(format!(r"{INLINE} {second} \fra")), "taking a symbol is one step");
+}
+
+#[test]
+fn the_list_of_symbols_is_put_away_without_leaving_the_formula() {
+    // What is done while the list shows, and the source afterwards.
+    let ways: [(&str, &str, &str); 3] = [
+        ("Escape", "Escape", r"c = a + b \ap"),
+        ("an arrow", "Left", r"c = a + b \ap"),
+        ("a space", "Space", r"c = a + b \ap "),
+    ];
+    for (way, key, after) in ways {
+        let mut window = typing(r" \ap");
+        match key {
+            "Space" => window.type_text(" "),
+            key => window.key(key),
+        };
+        window.assert_closed(Role::ListBox, "Symbols");
+        assert_eq!(source(&mut window).as_deref(), Some(after), "{way}: the sheet is still out");
+    }
+    // Escape once more steps out of the formula.
+    let mut window = typing(r" \ap");
+    window.key("Escape").key("Escape");
+    assert_eq!(source(&mut window), None);
+}
