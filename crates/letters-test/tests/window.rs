@@ -2968,6 +2968,10 @@ fn what_the_shell_says_of_a_linked_picture_is_on_its_cloud_and_in_its_menu() {
         let (mut window, _, cloud) = linked(false);
         window.ui().set_picture_state(LINK, state.clone());
         assert_eq!(chip(&mut window, cloud), state.is_some(), "{state:?}: the cloud says it with nothing selected");
+        // The figure says it too, to whoever does not see the cloud.
+        let figure = window.controls().into_iter().find(|found| found.role == Role::Figure).expect("the figure");
+        assert_eq!(figure.description.is_some(), said.is_some(), "{state:?}");
+        assert!(figure.description.zip(said).is_none_or(|(told, said)| told.contains(said)), "{state:?}");
 
         window.click_at(cloud).assert_open(Role::Menu, "Linked picture");
         let note =

@@ -230,6 +230,9 @@ fn a_fetch_that_finds_nothing_says_why_and_offers_another_try() {
         assert!(tall(&mut window) > alone, "{case}: a line under its address says why");
         let again = window.find(Role::Button, "Try again").unwrap_or_else(|| panic!("{case}: another try is offered"));
         assert_eq!(again.description.as_deref(), Some(said), "{case}");
+        // The preview says it too, to whoever does not see the line under it.
+        let card = |window: &mut Harness| window.find(Role::Link, QUOTE).expect("the preview").description;
+        assert_eq!(card(&mut window).as_deref(), Some(said), "{case}");
         // The card of the preview says it too.
         window.click(Role::Button, EDIT);
         assert_eq!(status(&mut window).as_deref(), Some(said), "{case}");
@@ -238,6 +241,7 @@ fn a_fetch_that_finds_nothing_says_why_and_offers_another_try() {
         window.click(Role::Button, "Try again");
         assert_eq!(fetches(&mut window), [QUOTE], "{case}");
         window.assert_open(Role::Button, "Fetching");
+        assert_eq!(card(&mut window), None, "{case}: nothing is said of a try that is on its way");
         assert_eq!(tall(&mut window), alone, "{case}: the line goes for another try");
     }
 }

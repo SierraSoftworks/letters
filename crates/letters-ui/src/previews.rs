@@ -253,6 +253,11 @@ impl Previews {
         }
     }
 
+    /// What the page writes on its previews now: why the page of each was not fetched.
+    pub fn noted(&self) -> &BTreeMap<BlockId, String> {
+        &self.noted
+    }
+
     /// What a control that fetches the page at an address says now.
     pub fn says(&self, url: &str) -> &'static str {
         match self.fetches.get(url) {

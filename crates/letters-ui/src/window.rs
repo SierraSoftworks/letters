@@ -5171,7 +5171,17 @@ impl App for EditorApp {
         if let Some(history) = &self.history {
             return history.describe(told, whole, page, nodes);
         }
-        describe::page(self.editor.doc(), self.editor.selection(), told, whole, page, nodes);
+        // What the page shows of a block that is not its text is told with the block: why the page of a
+        // link preview was not fetched, and how a linked picture that does not show is doing.
+        let mut said: HashMap<BlockId, String> = self.previews.noted().clone().into_iter().collect();
+        if self.linked.says() {
+            let state = |block: &Block| {
+                let src = pictures::link(block)?;
+                Some((block.id.clone(), pictures::says(src, Some(self.linked.said(src)?))))
+            };
+            said.extend(self.editor.doc().walk().filter_map(state));
+        }
+        describe::page(self.editor.doc(), self.editor.selection(), &said, told, whole, page, nodes);
         if let Some((caption, rect)) = &self.previewed {
             describe::preview(caption, *rect, page, nodes);
         }
