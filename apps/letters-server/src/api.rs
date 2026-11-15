@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use letters_api::{
-    Code, Entry, EntryKind, Fetch, Listing, Move, NewDocument, NewFolder, Opened, PROTOCOL, Person, Preview, Rename,
-    Renewal, Role, Server, Settings, Space, Tag, Token, Trust, paths,
+    Allows, Code, Entry, EntryKind, Fetch, Listing, Move, NewDocument, NewFolder, Opened, PROTOCOL, Person, Preview,
+    Rename, Renewal, Role, Server, Settings, Space, Tag, Token, Trust, paths,
 };
 use letters_format::{ASSETS, MIMETYPE, NOTES, STYLE, file_name};
 use letters_model::{Document, Style};
@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use crate::error::{Answer, Refusal};
 use crate::library::{Row, untitled};
-use crate::session::{Carrier, Signed};
+use crate::session::{Carrier, Reader, Signed};
 use crate::spaces::{EXTENSION, Place, Root, seconds, shown};
 use crate::store::Table;
 use crate::{App, Shared};
@@ -169,13 +169,16 @@ async fn new_folder(
     blocking(move || app.new_folder(&who, &space, &new).map(Json)).await
 }
 
-async fn document(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -> Answer<Json<Opened>> {
+async fn document(State(app): State<Shared>, Reader(who): Reader, Path(id): Path<String>) -> Answer<Json<Opened>> {
     blocking(move || app.opened(&who, &id, false).map(Json)).await
 }
 
-async fn file(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -> Answer<Response> {
+async fn file(State(app): State<Shared>, Reader(who): Reader, Path(id): Path<String>) -> Answer<Response> {
     let (name, bytes) = blocking(move || {
         let found = app.locate(&who, &id)?;
+        if !found.allows.download {
+            return Err(Refusal::forbidden("This link does not let its reader take the file away."));
+        }
         // What the document's room holds goes to the file first, so that the file sent is whole.
         app.rooms.save(&found.root, &found.place);
         Ok((found.place.name().to_owned(), app.library.bytes(&found.root, &found.place)?))
@@ -187,7 +190,7 @@ async fn file(State(app): State<Shared>, who: Signed, Path(id): Path<String>) ->
     Ok(([(CONTENT_TYPE, MIMETYPE.to_owned()), (CONTENT_DISPOSITION, disposition)], bytes).into_response())
 }
 
-async fn assets(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -> Answer<Json<Vec<String>>> {
+async fn assets(State(app): State<Shared>, Reader(who): Reader, Path(id): Path<String>) -> Answer<Json<Vec<String>>> {
     blocking(move || {
         let found = app.locate(&who, &id)?;
         let archive = app.library.open(&found.root, &found.place)?;
@@ -208,7 +211,11 @@ fn asset_entry(name: &str) -> Answer<String> {
     plain.then(|| format!("{ASSETS}{name}")).ok_or_else(Refusal::not_found)
 }
 
-async fn asset(State(app): State<Shared>, who: Signed, Path((id, name)): Path<(String, String)>) -> Answer<Response> {
+async fn asset(
+    State(app): State<Shared>,
+    Reader(who): Reader,
+    Path((id, name)): Path<(String, String)>,
+) -> Answer<Response> {
     let bytes = blocking(move || {
         let found = app.locate(&who, &id)?;
         let entry = asset_entry(&name)?;
@@ -232,7 +239,7 @@ async fn asset(State(app): State<Shared>, who: Signed, Path((id, name)): Path<(S
 /// `POST`: a picture the document links to, fetched here so that its site learns nothing of the reader.
 async fn fetch_picture(
     State(app): State<Shared>,
-    who: Signed,
+    Reader(who): Reader,
     Path(id): Path<String>,
     Json(fetch): Json<Fetch>,
 ) -> Answer<Response> {
@@ -254,7 +261,7 @@ async fn fetch_picture(
 /// `POST`: what the page behind a link says of itself.
 async fn fetch_preview(
     State(app): State<Shared>,
-    who: Signed,
+    Reader(who): Reader,
     Path(id): Path<String>,
     Json(fetch): Json<Fetch>,
 ) -> Answer<Json<Preview>> {
@@ -266,7 +273,7 @@ async fn fetch_preview(
     .await
 }
 
-async fn trust(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -> Answer<StatusCode> {
+async fn trust(State(app): State<Shared>, Reader(who): Reader, Path(id): Path<String>) -> Answer<StatusCode> {
     blocking(move || app.trust(&who, &id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -285,7 +292,7 @@ fn unread(rejection: BytesRejection, large: &str) -> Refusal {
 /// merged into the document and replaces nothing.
 async fn merge_file(
     State(app): State<Shared>,
-    who: Signed,
+    Reader(who): Reader,
     Path(id): Path<String>,
     body: Result<Bytes, BytesRejection>,
 ) -> Answer<StatusCode> {
@@ -297,7 +304,7 @@ async fn merge_file(
 /// `PUT`: a picture for the document, ahead of the edit that names it.
 async fn add_asset(
     State(app): State<Shared>,
-    who: Signed,
+    Reader(who): Reader,
     Path((id, name)): Path<(String, String)>,
     body: Result<Bytes, BytesRejection>,
 ) -> Answer<StatusCode> {
@@ -322,7 +329,7 @@ async fn add_asset(
 
 async fn rename(
     State(app): State<Shared>,
-    who: Signed,
+    Reader(who): Reader,
     Path(id): Path<String>,
     Json(to): Json<Rename>,
 ) -> Answer<Json<Entry>> {
@@ -350,12 +357,19 @@ async fn recent(State(app): State<Shared>, who: Signed) -> Answer<Json<Vec<Entry
     blocking(move || app.recent(&who).map(Json)).await
 }
 
+/// Everything there is to take away of a document.
+const ALL: Allows = Allows { download: true, copy: true, print: true };
+
 /// A document as a session reaches it.
 pub struct Found {
     /// The space it is in, for a session that reaches the space. `None` when only a share leads to it.
     pub space: Option<Space>,
     /// What the session may do with it: what its space lets it, or a share when that is more.
     pub role: Role,
+    /// What the session may take away of it: everything, but for a link's reader what the link allows.
+    pub allows: Allows,
+    /// When the session's reach of it ends by itself, as the visit of a link does.
+    pub until: Option<u64>,
     pub root: Root,
     pub place: Place,
 }
@@ -378,8 +392,8 @@ impl Found {
 }
 
 impl App {
-    /// Where the document `id` is, for `who`: in a space they reach, or wherever a share leads them. One
-    /// that neither leads to is not there for them.
+    /// Where the document `id` is, for `who`: in a space they reach, or wherever a share leads them, or
+    /// a link their browser was let in by. One that none of these leads to is not there for them.
     pub fn locate(&self, who: &Signed, id: &str) -> Answer<Found> {
         let reach = self.reach(who);
         let roots: Vec<&Root> = reach.iter().map(|(_, root)| root).collect();
@@ -387,10 +401,15 @@ impl App {
             let (space, root) = reach.into_iter().nth(at).expect("the library answers with a root it was given");
             // A share may let someone do more with one document than its space lets them do with all.
             let role = self.in_space(who, id, &root, space.role).role;
-            return Ok(Found { space: Some(space), role, root, place });
+            return Ok(Found { space: Some(space), role, allows: ALL, until: None, root, place });
         }
-        let (role, root, place) = self.lent(who, id)?.ok_or_else(Refusal::not_found)?;
-        Ok(Found { space: None, role, root, place })
+        if let Some((role, root, place)) = self.lent(who, id)? {
+            return Ok(Found { space: None, role, allows: ALL, until: None, root, place });
+        }
+        let linked = who.link.as_ref().filter(|linked| linked.document == id).ok_or_else(Refusal::not_found)?;
+        let (root, place) = self.led(linked)?.ok_or_else(Refusal::not_found)?;
+        let (role, allows) = (linked.link.role, linked.link.allows);
+        Ok(Found { space: None, role, allows, until: Some(linked.ends), root, place })
     }
 
     pub fn listing(&self, who: &Signed, space: &str, folder: &str) -> Answer<Listing> {
@@ -603,15 +622,18 @@ impl App {
             author: self.signs_as(who)?,
             socket: paths::socket(&manifest.id),
             trust: if self.trusts(who, &found, &manifest.id)? { Trust::Trusted } else { Trust::Safe },
-            allows: letters_api::Allows { download: true, copy: true, print: true },
+            allows: found.allows,
             style,
             notes,
         };
         Ok((opened, archive))
     }
 
-    /// Puts the document first among the person's recents.
+    /// Puts the document first among the person's recents. Whoever only a link let in has none.
     pub fn note_opened(&self, who: &Signed, id: &str) -> Answer<()> {
+        if who.alone() {
+            return Ok(());
+        }
         Ok(self.store.write(|batch| {
             let mut recent = batch.get(&RECENT, &who.person.id)?.unwrap_or_default();
             recent.retain(|other| other != id);

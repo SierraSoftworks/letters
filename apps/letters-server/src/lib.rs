@@ -44,6 +44,7 @@ use crate::config::Config;
 use crate::error::{Answer, Refusal};
 use crate::fetch::{Fetches, Roots};
 use crate::library::Library;
+use crate::links::Doors;
 use crate::oidc::Provider;
 use crate::pages::editor::Editor;
 use crate::rooms::Rooms;
@@ -64,6 +65,8 @@ pub struct App {
     /// The browser's editor, when the server was built with one. Without it a browser reads.
     pub editor: Option<Editor>,
     pub fetches: Fetches,
+    /// What following share links has cost each address of late.
+    pub doors: Doors,
     clock: Clock,
 }
 
@@ -74,7 +77,8 @@ impl App {
         let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
         let (provider, rooms) = (Provider::new(&config), Rooms::new(&config.server.state));
         let (editor, fetches) = (Editor::compiled(), Fetches::new(Roots::System));
-        Self { config, store, library: Library::new(), provider, rooms, editor, fetches, clock: Box::new(clock) }
+        let (library, doors) = (Library::new(), Doors::default());
+        Self { config, store, library, provider, rooms, editor, fetches, doors, clock: Box::new(clock) }
     }
 
     /// The same server taking another word on who a site is, for tests against a site of their own.
@@ -96,10 +100,11 @@ impl App {
         (self.clock)()
     }
 
-    /// The spaces `who` reaches, in the order the settings list them.
+    /// The spaces `who` reaches, in the order the settings list them. Whoever only a link let in reaches
+    /// none: not even a space of their own, which everyone who signs in has.
     pub fn spaces(&self, who: &Signed) -> Vec<(&config::Space, Role)> {
         let reached = |space| Some((space, config::Space::role(space, &who.groups)?));
-        self.config.spaces.iter().filter_map(reached).collect()
+        self.config.spaces.iter().filter(|_| !who.alone()).filter_map(reached).collect()
     }
 
     /// The space `id` as `who` reaches it. One they do not reach is not there for them.
@@ -193,7 +198,9 @@ pub async fn serve(
     };
     // A frame that relays what someone typed is small, and is not held back to be sent with the next.
     let listener = listener.tap_io(|socket| drop(socket.set_nodelay(true)));
-    axum::serve(listener, api::router(app)).with_graceful_shutdown(stopped).await
+    // Each request is told the address it came from, which following a link is counted by.
+    let routes = api::router(app).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    axum::serve(listener, routes).with_graceful_shutdown(stopped).await
 }
 
 /// Writes a line to the server's log, which is its standard error.

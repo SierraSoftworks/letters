@@ -1,16 +1,16 @@
 //! A device with a document open through the server: what a shell holds of it, and its seat in the room.
 
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, COOKIE};
 use axum::http::{HeaderMap, Method};
 use letters_api::Error;
 use letters_model::{Block, Model, Notes, Op, Pos, ReplicaId};
 use letters_server::rooms::{Out, Seat};
-use letters_server::session::Signed;
+use letters_server::session::{Reader, Signed};
 use letters_sync::{Client as Line, Event, Local, Refusal};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::error::TryRecvError;
 
-use super::{Client, Server};
+use super::{Browser, Client, Server};
 
 /// The time a desk tells its line. Nothing here waits on the line's own timers.
 const NOW: u64 = 1_800_000_000_000;
@@ -33,7 +33,22 @@ impl Desk {
         let token = who.token.as_deref().unwrap_or_default();
         headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
         let signed = Signed::read(&server.app, &Method::GET, &headers).map_err(|refusal| refusal.0)?;
-        let seat = server.app.join(&signed, id).await.map_err(|refusal| refusal.0)?;
+        Self::seated(server, &signed, id).await
+    }
+
+    /// Opens the document `id` as the page of a browser would, with whatever its cookies stand for: a
+    /// sign-in, or a link that let it in.
+    pub async fn paged(server: &Server, browser: &Browser, id: &str) -> Result<Self, Error> {
+        let mut headers = HeaderMap::new();
+        let cookies: Vec<String> = browser.cookies.iter().map(|(name, value)| format!("{name}={value}")).collect();
+        headers.insert(COOKIE, cookies.join("; ").parse().unwrap());
+        let Reader(signed) =
+            Reader::read(&server.app, &Method::GET, &headers, Some(id)).map_err(|refusal| refusal.0)?;
+        Self::seated(server, &signed, id).await
+    }
+
+    async fn seated(server: &Server, signed: &Signed, id: &str) -> Result<Self, Error> {
+        let seat = server.app.join(signed, id).await.map_err(|refusal| refusal.0)?;
         let mut line = Line::new("");
         line.start(NOW);
         let mut desk = Self {

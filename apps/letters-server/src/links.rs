@@ -8,21 +8,32 @@
 //!
 //! Like a share, a link is of the file where it is: it is kept under the document's id and the folder its
 //! space is in.
+//!
+//! Whoever follows a link is let in for a while by a cookie of that link, after the passphrase when the
+//! link asks one. From then on they ask about the document as a [`Reader`](crate::session::Reader), and
+//! reach nothing else. Following links is counted by address, so that nobody guesses at them fast.
+
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use argon2::Argon2;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, post};
 use axum::{Json, Router};
-use letters_api::{CreatedLink, Link, NewLink, Role, paths};
+use letters_api::{Code, CreatedLink, Link, NewLink, Role, paths};
 use serde::{Deserialize, Serialize};
 
 use crate::api::blocking;
 use crate::error::{Answer, Refusal};
 use crate::ids::{self, hashed, secret};
-use crate::session::Signed;
+use crate::session::{Linked, Signed, cookies};
 use crate::shares::BETWEEN;
-use crate::spaces::Root;
+use crate::spaces::{Place, Root};
 use crate::store::Table;
 use crate::{App, Shared};
 
@@ -36,6 +47,9 @@ pub(crate) struct Kept {
     /// What is kept of the passphrase it asks.
     #[serde(default)]
     asks: Option<String>,
+    /// How many links the document had before it, which orders two that were made in the same second.
+    #[serde(default)]
+    nth: u32,
 }
 
 /// Where a link's secret leads.
@@ -52,10 +66,35 @@ const LINKS: Table<Kept> = Table::new("links");
 /// By the hash of the link's secret.
 const TOKENS: Table<Leads> = Table::new("link_tokens");
 
+/// A browser a link let in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Visit {
+    leads: Leads,
+    /// When the link is to be followed again.
+    ends: u64,
+}
+
+/// By the hash of the secret in the browser's cookie.
+const VISITS: Table<Visit> = Table::new("link_visits");
+
 /// How long a link's label and its passphrase may be.
 const LONGEST: usize = 200;
 /// How many links lead to one document at once. Each is someone to remember having let in.
 const MOST: usize = 50;
+/// What the cookie of a visit is called, before the link's id.
+pub const COOKIE: &str = "letters_link_";
+/// How long a browser stays let in before its link is followed again.
+const STAYS: u64 = 12 * 60 * 60;
+/// How many link cookies of one request are looked at.
+const MOST_COOKIES: usize = 8;
+/// How often the visits that are over are cleared away.
+const SWEEP: u64 = 60 * 60;
+/// What one address may spend on following links each minute: a look at a link costs 1 and a try at a
+/// passphrase [`TRY`], which makes five tries a minute.
+const PER_MINUTE: u32 = 30;
+const TRY: u32 = 6;
+/// How many addresses are counted before the ones of minutes past are forgotten.
+const COUNTED: usize = 10_000;
 
 fn under(id: &str, root: &str) -> String {
     format!("{id}{BETWEEN}{root}{BETWEEN}")
@@ -66,6 +105,77 @@ impl Kept {
     pub fn live(&self, now: u64) -> bool {
         self.link.revoked.is_none() && self.link.expires.is_none_or(|expires| now < expires)
     }
+
+    /// Whether `tried` is the passphrase the link asks. One that asks none takes anything.
+    fn admits(&self, tried: &str) -> bool {
+        self.asks.as_deref().is_none_or(|kept| passphrase_is(kept, tried))
+    }
+}
+
+/// What following links has cost each address this minute, and when the visits were last cleared.
+#[derive(Default)]
+pub struct Doors {
+    /// By address: the minute that is counted, and what was spent in it.
+    spent: Mutex<HashMap<String, (u64, u32)>>,
+    swept: AtomicU64,
+}
+
+impl Doors {
+    /// Spends `cost` of what `address` may in this minute. False once it has no more.
+    fn spend(&self, address: &str, cost: u32, now: u64) -> bool {
+        let mut spent = self.spent.lock().unwrap_or_else(PoisonError::into_inner);
+        let minute = now / 60;
+        if spent.len() >= COUNTED {
+            spent.retain(|_, (counted, _)| *counted == minute);
+        }
+        let entry = spent.entry(address.to_owned()).or_insert((minute, 0));
+        if entry.0 != minute {
+            *entry = (minute, 0);
+        }
+        entry.1 = entry.1.saturating_add(cost);
+        entry.1 <= PER_MINUTE
+    }
+}
+
+/// Where a request came from, as far as the server can tell.
+pub struct Caller {
+    /// The address of the browser. Empty when the server was not told one.
+    pub address: String,
+}
+
+impl<S: Sync> FromRequestParts<S> for Caller {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Infallible> {
+        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|connected| connected.0.ip());
+        // What stands in front of the server on its own machine, as `tailscale serve` does, says last who
+        // it asks for. Anything else that says so is not believed.
+        let said = parts.headers.get("x-forwarded-for").and_then(|value| value.to_str().ok());
+        let forwarded = said.and_then(|said| said.rsplit(',').next()).map(str::trim).filter(|said| !said.is_empty());
+        let address = match (peer, forwarded) {
+            (Some(peer), Some(forwarded)) if peer.is_loopback() => forwarded.chars().take(64).collect(),
+            (Some(peer), _) => peer.to_string(),
+            (None, _) => String::new(),
+        };
+        Ok(Self { address })
+    }
+}
+
+/// What became of following a link.
+#[derive(Debug)]
+pub enum Door {
+    /// The browser is let in to the document, by a cookie of this name and value for this long.
+    Open { document: String, cookie: String, secret: String, life: u64 },
+    /// The link asks a passphrase. `wrong` when one was tried and is not it.
+    Asks { wrong: bool },
+}
+
+/// A link's reader, as a request's cookie names them.
+pub(crate) struct Guest {
+    pub linked: Linked,
+    /// The secret in the cookie, and what the visit goes by among the open sockets.
+    pub secret: String,
+    pub visit: String,
 }
 
 /// What is kept of a passphrase: its salt and what Argon2 makes of the two, so that whoever reads the
@@ -80,6 +190,19 @@ fn stretched(passphrase: &str, salt: &[u8]) -> [u8; 32] {
     // The sizes are fixed, so Argon2 has nothing to refuse.
     Argon2::default().hash_password_into(passphrase.as_bytes(), salt, &mut out).expect("a passphrase is hashed");
     out
+}
+
+fn passphrase_is(kept: &str, tried: &str) -> bool {
+    let Some((salt, hash)) = kept.split_once('$') else { return false };
+    let unhex = |text: &str| -> Option<Vec<u8>> {
+        let digit = |at: usize| u8::from_str_radix(text.get(at..at + 2)?, 16).ok();
+        (0..text.len() / 2).map(|pair| digit(2 * pair)).collect()
+    };
+    let (Some(salt), Some(hash)) = (unhex(salt), unhex(hash)) else { return false };
+    // Every byte is looked at, so that how long this takes says nothing of where the two differ.
+    let differs =
+        stretched(tried, &salt).iter().zip(&hash).fold(hash.len() ^ 32, |seen, (a, b)| seen | usize::from(a ^ b));
+    differs == 0
 }
 
 pub fn routes() -> Router<Shared> {
@@ -111,7 +234,8 @@ impl App {
     pub(crate) fn links_of(&self, id: &str, root: &Root) -> Answer<Vec<Kept>> {
         let mut links: Vec<Kept> =
             self.store.under(&LINKS, &under(id, &root.key))?.into_iter().map(|(_, kept)| kept).collect();
-        links.sort_by(|one, other| (one.link.created, &one.link.id).cmp(&(other.link.created, &other.link.id)));
+        let order = |kept: &Kept| (kept.link.created, kept.nth, kept.link.id.clone());
+        links.sort_by_key(order);
         Ok(links)
     }
 
@@ -134,7 +258,8 @@ impl App {
         if new.passphrase.as_ref().is_some_and(|passphrase| passphrase.is_empty() || passphrase.len() > LONGEST) {
             return Err(Refusal::invalid("A passphrase is some text, and not a long one."));
         }
-        if self.links_of(id, &found.root)?.iter().filter(|kept| kept.live(now)).count() >= MOST {
+        let before = self.links_of(id, &found.root)?;
+        if before.iter().filter(|kept| kept.live(now)).count() >= MOST {
             return Err(Refusal::invalid("Too many links lead to this document. Revoke one first."));
         }
         let token = secret();
@@ -148,8 +273,8 @@ impl App {
             created: now,
             revoked: None,
         };
-        let kept =
-            Kept { link: link.clone(), token: hashed(&token), asks: new.passphrase.as_deref().map(kept_passphrase) };
+        let (asks, nth) = (new.passphrase.as_deref().map(kept_passphrase), before.len() as u32);
+        let kept = Kept { link: link.clone(), token: hashed(&token), asks, nth };
         let leads = Leads { document: id.to_owned(), root: found.root.key.clone(), link: link.id.clone() };
         self.store.write(|batch| {
             batch.put(&LINKS, &format!("{}{}", under(id, &found.root.key), link.id), &kept)?;
@@ -174,5 +299,82 @@ impl App {
             .ok_or_else(Refusal::not_found)?;
         self.rooms.reseat(&found.root, &found.place);
         Ok(())
+    }
+
+    /// The link the secret in an address leads to, while it works. Whatever else an address holds leads
+    /// nowhere, and is told no more than that.
+    fn follow(&self, token: &str) -> Answer<(Leads, Kept)> {
+        let nowhere = || Refusal::new(Code::NotFound, "This link does not work, or no longer does.");
+        // A server whose owner turned links off again follows none.
+        let leads = self.store.get(&TOKENS, &hashed(token))?.filter(|_| self.config.links.enabled);
+        let leads = leads.ok_or_else(nowhere)?;
+        let key = format!("{}{}", under(&leads.document, &leads.root), leads.link);
+        let kept = self.store.get(&LINKS, &key)?.filter(|kept| kept.live(self.now())).ok_or_else(nowhere)?;
+        Ok((leads, kept))
+    }
+
+    /// Follows the link in an address for the browser at `address`, with the passphrase it tried when it
+    /// tried one.
+    pub fn enter(&self, token: &str, tried: Option<&str>, address: &str) -> Answer<Door> {
+        let now = self.now();
+        if !self.doors.spend(address, if tried.is_some() { TRY } else { 1 }, now) {
+            return Err(Refusal::new(Code::Slow, "Too many tries from here. Wait a minute, and try again."));
+        }
+        let (leads, kept) = self.follow(token)?;
+        match tried {
+            None if kept.asks.is_some() => return Ok(Door::Asks { wrong: false }),
+            Some(tried) if !kept.admits(tried) => return Ok(Door::Asks { wrong: true }),
+            _ => {}
+        }
+        let secret = secret();
+        let ends = kept.link.expires.map_or(now + STAYS, |expires| expires.min(now + STAYS));
+        self.store.put(&VISITS, &hashed(&secret), &Visit { leads: leads.clone(), ends })?;
+        self.sweep(now);
+        let cookie = format!("{COOKIE}{}", leads.link);
+        Ok(Door::Open { document: leads.document, cookie, secret, life: ends - now })
+    }
+
+    /// Clears away the visits that are over, now and then.
+    fn sweep(&self, now: u64) {
+        let last = self.doors.swept.load(Ordering::Relaxed);
+        let due = now >= last.saturating_add(SWEEP);
+        if !due || self.doors.swept.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let over = |(key, visit): (String, Visit)| (visit.ends <= now).then_some(key);
+        let over: Vec<String> =
+            self.store.under(&VISITS, "").unwrap_or_default().into_iter().filter_map(over).collect();
+        // What is left behind is cleared the next time.
+        let _ = self.store.write(|batch| over.iter().try_for_each(|key| batch.remove(&VISITS, key)));
+    }
+
+    /// The link that let the browser of a request in to the document `id`, while the visit and the link
+    /// both last.
+    pub(crate) fn let_in(&self, headers: &HeaderMap, id: &str) -> Option<Guest> {
+        let now = self.now();
+        let named = cookies(headers).filter(|(name, _)| name.starts_with(COOKIE)).take(MOST_COOKIES);
+        for (name, secret) in named.filter(|_| self.config.links.enabled) {
+            let visit = hashed(secret);
+            let Ok(Some(Visit { leads, ends })) = self.store.get(&VISITS, &visit) else { continue };
+            if leads.document != id || ends <= now || name.strip_prefix(COOKIE) != Some(leads.link.as_str()) {
+                continue;
+            }
+            let key = format!("{}{}", under(&leads.document, &leads.root), leads.link);
+            let Ok(Some(kept)) = self.store.get(&LINKS, &key) else { continue };
+            if kept.live(now) {
+                let (document, root) = (leads.document, leads.root);
+                let linked = Linked { link: kept.link, document, root, alone: false, ends };
+                return Some(Guest { linked, secret: secret.to_owned(), visit });
+            }
+        }
+        None
+    }
+
+    /// Where the file of a link's document is, while it is in the folder the link was made in.
+    pub(crate) fn led(&self, linked: &Linked) -> Answer<Option<(Root, Place)>> {
+        let folders = self.folders();
+        let Some(rooted) = folders.iter().find(|rooted| rooted.root.key == linked.root) else { return Ok(None) };
+        let found = self.library.find(&self.store, &[&rooted.root], &linked.document, self.now())?;
+        found.map(|(_, place)| Ok((rooted.root.again()?, place))).transpose()
     }
 }

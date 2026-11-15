@@ -113,6 +113,9 @@ pub enum Card {
     Failed { title: String, message: String, again: Option<(String, String)> },
     /// The desktop app asks to be signed in as the person.
     HandOver { name: String, challenge: String, port: String, state: String },
+    /// A share link asks its passphrase, at the address the form goes to. `wrong` after one that was not
+    /// it.
+    Passphrase { action: String, wrong: bool },
 }
 
 #[derive(Properties, PartialEq)]
@@ -620,6 +623,19 @@ fn said(page: &Page, card: &Card) -> Html {
             }}>
                 { message.clone() }
             </EmptyState>
+        },
+        Card::Passphrase { action, wrong } => html! {
+            <>
+                <EmptyState title="This link asks for a passphrase" icon={icons::KEY_ROUND}>
+                    { "Whoever sent you the link has it." }
+                </EmptyState>
+                <form class="lt-card__ask" method="post" action={action.clone()}>
+                    <Field label="Passphrase" error={if *wrong { html! { "That is not the passphrase." } } else { Html::default() }}>
+                        <TextInput name="passphrase" kind={TextInputKind::Password} required=true max_length={200} autocomplete="off" attrs={attrs! { "autofocus" => "" }} />
+                    </Field>
+                    <Button variant={ButtonVariant::Primary} kind={ButtonKind::Submit}>{ "Open" }</Button>
+                </form>
+            </>
         },
         Card::HandOver { name, challenge, port, state } => html! {
             <>

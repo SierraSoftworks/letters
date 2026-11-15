@@ -7,8 +7,10 @@
 //! - [`statics`] is what a page loads.
 //! - [`read`] is a document as plain HTML, to read with no editor.
 //! - [`editor`] is a document in the browser's editor, and the files of that editor.
+//! - [`door`] is where a share link leads.
 
 mod acts;
+mod door;
 pub mod editor;
 mod read;
 mod statics;
@@ -34,7 +36,7 @@ use yew::ServerRenderer;
 use crate::api::blocking;
 use crate::auth::{Desktop, browser};
 use crate::error::{Answer, Refusal};
-use crate::session::Signed;
+use crate::session::{Carrier, Reader, Signed, named_document};
 use crate::shares::may_share;
 use crate::spaces::{Place, seconds, shown};
 use crate::{App, Shared};
@@ -74,6 +76,7 @@ pub fn routes() -> Router<Shared> {
         .route(TRASH_PAGE, get(trash))
         .route("/d/{id}", get(editor::page))
         .route("/d/{id}/read", get(read::page))
+        .route("/l/{token}", get(door::follow).post(door::tried))
         .route("/static/{version}/{*file}", get(statics::file))
         .route("/assets/{version}/{*file}", get(editor::file))
         .merge(acts::routes())
@@ -89,14 +92,36 @@ impl FromRequestParts<Shared> for Visitor {
     async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Response> {
         match browser(app, &parts.method, &parts.headers) {
             Ok(who) => Ok(Self(who)),
-            // A form that some other site's page sent.
-            Err(refusal) if refusal.code() == Code::Forbidden => Err(refused(app, None, &refusal).await),
-            Err(_) => {
-                // Only a page can be come back to: what a form asked for is asked again from its page.
-                let asked = parts.uri.path_and_query().map_or(paths::HOME_PAGE, |asked| asked.as_str());
-                let here = if parts.method == Method::GET { asked } else { paths::HOME_PAGE };
-                Err(Redirect::to(&paths::sign_in_page(here)).into_response())
-            }
+            Err(refusal) => Err(turned_away(app, parts, &refusal).await),
+        }
+    }
+}
+
+/// What a browser that a page is not for is answered with.
+async fn turned_away(app: &Shared, parts: &Parts, refusal: &Refusal) -> Response {
+    // A form that some other site's page sent.
+    if refusal.code() == Code::Forbidden {
+        return refused(app, None, refusal).await;
+    }
+    // Only a page can be come back to: what a form asked for is asked again from its page.
+    let asked = parts.uri.path_and_query().map_or(paths::HOME_PAGE, |asked| asked.as_str());
+    let here = if parts.method == Method::GET { asked } else { paths::HOME_PAGE };
+    Redirect::to(&paths::sign_in_page(here)).into_response()
+}
+
+/// Whoever a document's page is for: someone signed in with this browser, or someone a share link let in
+/// to the document. A browser that is neither is sent to sign in, as for any page.
+pub struct Opener(pub Signed);
+
+impl FromRequestParts<Shared> for Opener {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Response> {
+        let id = named_document(parts, app).await;
+        match Reader::read(app, &parts.method, &parts.headers, id.as_deref()) {
+            Ok(Reader(who)) if who.carrier == Carrier::Cookie => Ok(Self(who)),
+            Ok(_) => Err(turned_away(app, parts, &Refusal::signed_out()).await),
+            Err(refusal) => Err(turned_away(app, parts, &refusal).await),
         }
     }
 }
@@ -185,15 +210,20 @@ pub async fn failed(app: &App, refusal: &Refusal) -> Response {
     card(app, status(refusal), title, said, None).await
 }
 
-/// Tells the person what a page could not show, inside the frame when they are signed in.
+/// Tells the person what a page could not show, inside the frame when they are signed in. Whoever only a
+/// link let in has no frame: nothing in it would be theirs.
 pub async fn refused(app: &App, who: Option<&Signed>, refusal: &Refusal) -> Response {
+    let linked = who.is_some_and(Signed::alone);
+    let who = who.filter(|who| !who.alone());
     let title = match refusal.code() {
         Code::NotFound => "Nothing here",
+        Code::Forbidden if linked => "Not with this link",
         Code::Forbidden => "Not yours to change",
         Code::Unavailable => "Out of reach just now",
         _ => "That did not work",
     };
-    let again = Some((paths::HOME_PAGE.to_owned(), "Back to your documents".to_owned()));
+    // Whoever only a link let in has no documents here to go back to.
+    let again = (!linked).then(|| (paths::HOME_PAGE.to_owned(), "Back to your documents".to_owned()));
     let said = Card::Failed { title: title.into(), message: refusal.0.message.clone(), again };
     match who {
         Some(who) => send(status(refusal), title, page(app, Some(who), At::Nowhere, Body::Card(said)), None).await,

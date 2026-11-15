@@ -161,6 +161,8 @@ pub struct Seat {
     open: Arc<Open>,
     session: SessionId,
     left: bool,
+    /// When the seat is to be given up whatever the sign-in says: a link's visit is over then.
+    pub until: Option<u64>,
 }
 
 impl Rooms {
@@ -801,7 +803,7 @@ impl App {
             hosted.seats.insert(session, Seated { to, signed, person, lent });
             Ok(session)
         })?;
-        Ok((Seat { app: self.clone(), open, session, left: false }, from))
+        Ok((Seat { app: self.clone(), open, session, left: false, until: found.until }, from))
     }
 }
 

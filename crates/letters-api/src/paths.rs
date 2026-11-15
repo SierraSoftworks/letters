@@ -176,6 +176,12 @@ pub fn editor_page(id: &str) -> String {
 }
 
 /// A page: where a share link leads. `token` is the link's secret, which only its address holds.
+///
+/// Following it, after the passphrase when the link asks one, lets the browser in to the link's document
+/// and sends it on to [`editor_page`]. From then on that browser is answered at what is asked of the
+/// document itself ([`document`], [`file()`], [`assets`], [`socket`], [`rename`] and the fetches) as the
+/// link says: with its role and its [`Allows`](crate::Allows), in no space, and by the link's label for a
+/// name. With nobody signed in, everything else of the server refuses it as signed out.
 pub fn link_page(token: &str) -> String {
     format!("/l/{}", segment(token))
 }

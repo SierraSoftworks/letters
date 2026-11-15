@@ -260,6 +260,12 @@ impl Raw {
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
+
+    /// What the answer says, read as the interface writes it.
+    pub fn json<T: DeserializeOwned>(&self) -> T {
+        serde_json::from_slice(&self.body)
+            .unwrap_or_else(|error| panic!("{} said {}: {error}", self.status, self.text()))
+    }
 }
 
 impl Client {
@@ -347,7 +353,14 @@ impl Browser {
         self.send(Method::POST, path, "application/x-www-form-urlencoded", body, &origin).await
     }
 
-    async fn send(&mut self, method: Method, path: &str, kind: &str, body: Vec<u8>, said: &[(&str, &str)]) -> Raw {
+    /// Asks the interface to change something, as a script of one of the server's own pages would.
+    pub async fn post(&mut self, path: &str, body: &impl Serialize) -> Raw {
+        let body = serde_json::to_vec(body).unwrap();
+        self.send(Method::POST, path, letters_api::JSON, body, &[(ORIGIN.as_str(), URL)]).await
+    }
+
+    /// Sends a request with the browser's cookies, a body of `kind`, and the headers in `said`.
+    pub async fn send(&mut self, method: Method, path: &str, kind: &str, body: Vec<u8>, said: &[(&str, &str)]) -> Raw {
         let mut request = Request::builder().method(method).uri(path);
         if !self.cookies.is_empty() {
             let cookies: Vec<String> = self.cookies.iter().map(|(name, value)| format!("{name}={value}")).collect();

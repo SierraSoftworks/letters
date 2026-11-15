@@ -4,11 +4,11 @@
 //! groups as the provider gave them then. A browser carries its token in a cookie and the desktop app in a
 //! header. The store keeps only a hash of each token, so that reading the store signs nobody in.
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, RawPathParams};
 use axum::http::header::{AUTHORIZATION, COOKIE, ORIGIN};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method};
-use letters_api::{Code, Person, Token};
+use letters_api::{Code, Link, Person, Token};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Answer, Refusal};
@@ -161,11 +161,15 @@ pub fn carried(headers: &HeaderMap) -> Option<(Carrier, &str)> {
     cookie(headers, COOKIE_NAME).map(|token| (Carrier::Cookie, token))
 }
 
+/// The cookies a request carries, each by its name.
+pub fn cookies(headers: &HeaderMap) -> impl Iterator<Item = (&str, &str)> {
+    let cookies = headers.get_all(COOKIE).into_iter().filter_map(|value| value.to_str().ok());
+    cookies.flat_map(|line| line.split(';')).filter_map(|pair| pair.trim().split_once('='))
+}
+
 /// The value of the cookie `name` among the ones a request carries.
 pub fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    let cookies = headers.get_all(COOKIE).into_iter().filter_map(|value| value.to_str().ok());
-    let mut pairs = cookies.flat_map(|line| line.split(';')).filter_map(|pair| pair.trim().split_once('='));
-    pairs.find(|(found, _)| *found == name).map(|(_, value)| value)
+    cookies(headers).find(|(found, _)| *found == name).map(|(_, value)| value)
 }
 
 /// Whoever a request comes from, signed in. A request without a session is refused as signed out.
@@ -180,7 +184,29 @@ pub struct Signed {
     pub session: String,
     /// When the sign-in ends, renewed or not.
     pub ends: u64,
+    /// The link that let the request's browser in to the document the request is about. Only a
+    /// [`Reader`] has one.
+    pub link: Option<Linked>,
 }
+
+/// A link that let a browser in to its document.
+#[derive(Clone, Debug)]
+pub struct Linked {
+    pub link: Link,
+    /// The document it leads to, and the key of the root that document's file is in.
+    pub document: String,
+    pub root: String,
+    /// Whether the link is all the request has, with nobody signed in.
+    pub alone: bool,
+    /// When the visit that let the browser in is over: the link's own end, or sooner.
+    pub ends: u64,
+}
+
+/// Whoever a request about one document comes from: someone signed in, or someone a link let in to that
+/// document. Only what is asked of a document itself takes a reader. Everything else asks for [`Signed`],
+/// which a link never is.
+#[derive(Clone, Debug)]
+pub struct Reader(pub Signed);
 
 impl Signed {
     pub fn read(app: &App, method: &Method, headers: &HeaderMap) -> Answer<Self> {
@@ -204,7 +230,53 @@ impl Signed {
             token: token.to_owned(),
             session: named,
             ends,
+            link: None,
         })
+    }
+
+    /// Whether a link is all that stands for them: nobody is signed in, and they reach the link's
+    /// document and nothing else.
+    pub fn alone(&self) -> bool {
+        self.link.as_ref().is_some_and(|linked| linked.alone)
+    }
+}
+
+impl Reader {
+    /// Whoever asks about the document `id`. Someone signed in asks as themselves, and a link their
+    /// browser was let in by comes along for what they do not reach otherwise. With nobody signed in, a
+    /// link's reader goes by the link's label.
+    pub fn read(app: &App, method: &Method, headers: &HeaderMap, id: Option<&str>) -> Answer<Self> {
+        let guest = id.and_then(|id| app.let_in(headers, id));
+        match (Signed::read(app, method, headers), guest) {
+            (Ok(mut who), guest) => {
+                who.link = guest.map(|guest| guest.linked);
+                Ok(Self(who))
+            }
+            (Err(refusal), Some(guest)) if matches!(refusal.code(), Code::SignedOut | Code::Expired) => {
+                // The cookie of a link is sent along like any other, with whatever another site's page asks.
+                let reads = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
+                if !reads && !same_origin(app, headers) {
+                    return Err(Refusal::forbidden("This request did not come from the server's own pages."));
+                }
+                let (linked, ends) = (Linked { alone: true, ..guest.linked }, guest.linked.ends);
+                Ok(Self(Signed {
+                    // No person has an id like it: one the provider gives is trimmed, and this starts
+                    // with a space.
+                    person: Person {
+                        id: format!(" link:{}", linked.link.id),
+                        username: String::new(),
+                        name: linked.link.label.clone(),
+                    },
+                    groups: Vec::new(),
+                    carrier: Carrier::Cookie,
+                    token: guest.secret,
+                    session: guest.visit,
+                    ends,
+                    link: Some(linked),
+                }))
+            }
+            (Err(refusal), _) => Err(refusal),
+        }
     }
 }
 
@@ -219,5 +291,20 @@ impl FromRequestParts<Shared> for Signed {
 
     async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Refusal> {
         Self::read(app, &parts.method, &parts.headers)
+    }
+}
+
+/// The document a request's address names, as the routes call it.
+pub async fn named_document(parts: &mut Parts, app: &Shared) -> Option<String> {
+    let params = RawPathParams::from_request_parts(parts, app).await.ok()?;
+    params.iter().find(|(name, _)| *name == "id").map(|(_, id)| id.to_owned())
+}
+
+impl FromRequestParts<Shared> for Reader {
+    type Rejection = Refusal;
+
+    async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Refusal> {
+        let id = named_document(parts, app).await;
+        Self::read(app, &parts.method, &parts.headers, id.as_deref())
     }
 }

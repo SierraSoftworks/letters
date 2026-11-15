@@ -19,7 +19,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use letters_api::{Code, paths};
 use sha2::{Digest, Sha256};
 
-use super::{Visitor, guarded, refused};
+use super::{Opener, guarded, refused};
 use crate::api::blocking;
 use crate::error::Refusal;
 use crate::ids::hex;
@@ -72,7 +72,7 @@ impl Editor {
 }
 
 /// `GET /d/{id}`: the document in the editor. A server built with no editor shows it to read.
-pub async fn page(State(app): State<Shared>, Visitor(who): Visitor, Path(id): Path<String>) -> Response {
+pub async fn page(State(app): State<Shared>, Opener(who): Opener, Path(id): Path<String>) -> Response {
     let Some(base) = app.editor.as_ref().map(|editor| editor.base.clone()) else {
         return Redirect::to(&paths::read_page(&id)).into_response();
     };

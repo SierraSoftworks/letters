@@ -41,6 +41,7 @@ a.lt-file__name:hover { text-decoration: underline; }
   color: var(--yi-fg);
 }
 .lt-card > .yi-empty-state { max-inline-size: 30rem; }
+.lt-card__ask { display: grid; gap: var(--yi-space-md); inline-size: min(100%, 20rem); }
 .lt-card__other {
   display: flex;
   align-items: center;
