@@ -14,7 +14,8 @@
 //! once with those words marked, and a line over blocks that only one version has says so.
 //!
 //! Under the page a strip has a cell for each version, to press on or drag along, and the bar names the
-//! version that is picked: a name is a mark in the history, which is saved and is no edit.
+//! version that is picked: a name is a mark in the history, which is saved and is no edit. The bar's menu
+//! asks for a copy of the picked version, through the card that saves a copy of the document.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -29,6 +30,7 @@ use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Item, PathEl, Point, Rect, Size};
 
 use crate::color::resolve;
+use crate::copying::{CopyFormat, Copying, Earlier};
 use crate::describe::{self, Told};
 use crate::element::{Cursor, Element, Paint, Pointer};
 use crate::highlight;
@@ -44,7 +46,7 @@ use crate::text::{Family, TextShaper, TextStyle};
 use crate::theme::accent;
 use crate::threads;
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::widgets::{Button, ControlSize, Menu, MenuItem, Segmented, SidePanel, TextField, TopBar};
+use crate::widgets::{self, Button, ControlSize, Menu, MenuItem, Segmented, SidePanel, TextField, TopBar};
 use crate::window::{GUTTER, Message, PT, TOP};
 
 /// How long writing rests before what comes after it is another version, in seconds.
@@ -1134,10 +1136,24 @@ impl History {
         }
     }
 
+    /// The picked version as a copy of it is asked for: what the copy's name says it is of is the
+    /// version's name, or the day it was written. `None` for the document as it reads now, which is
+    /// copied as the document is.
+    pub fn copied(&self) -> Option<Earlier> {
+        let version = self.picked();
+        let called = match version.name() {
+            Some(name) => name.to_owned(),
+            None if version.time == 0 => "earlier version".to_owned(),
+            None => version.date(self.today(), self.zone),
+        };
+        (!self.newest()).then(|| Earlier { revision: version.at.clone(), called })
+    }
+
     /// Fills the bar while the history shows: the way back, what the version is of and when it was
-    /// written, what it is compared with, and the button that restores it. A narrow window has the bar
-    /// folded.
-    pub fn bar(&self, bar: TopBar<Message>, name: &str) -> TopBar<Message> {
+    /// written, what it is compared with, the button that restores it, and a menu that saves a copy of
+    /// it. A narrow window has the bar folded. `told` is what there is to say of a copy that was just
+    /// written, which the menu's button says, and `keys` the keys that ask for a copy.
+    pub fn bar(&self, bar: TopBar<Message>, name: &str, told: Option<&str>, keys: &str) -> TopBar<Message> {
         let back = Message::History(Historying::Back);
         let mut compare = Segmented::new("Compare with").small();
         let mut compares = Menu::new().label("Compare with");
@@ -1179,6 +1195,23 @@ impl History {
             .middle(TopBar::rule())
             .middle(naming(Button::new("Name").icon(icon::TAG)))
             .middle(restore(Button::new("Restore this version").icon(icon::ROTATE_CCW)));
+        // A copy of the version is asked for where the bar has its other commands while the page is edited.
+        let copy = |format: CopyFormat| Message::Copy(Copying::Open(format));
+        let menu = Menu::new()
+            .label("More")
+            .item(
+                MenuItem::new("Save a copy of this version")
+                    .icon(icon::COPY)
+                    .aside(keys)
+                    .on_select(copy(CopyFormat::Letters)),
+            )
+            .item(MenuItem::new("Export this version").icon(icon::DOWNLOAD).on_select(copy(CopyFormat::Pdf)));
+        let more = Button::icon_only(icon::ELLIPSIS, "More").subtle().small();
+        let more = Element::from(more.popover(menu.popover().align(Align::End)));
+        let more = match told {
+            Some(told) => more.tooltip(told, widgets::Side::Bottom).telling(true),
+            None => more,
+        };
         bar.form(FORMS.1)
             .start(Button::icon_only(icon::ARROW_LEFT, "Back to editing").small().on_press(back))
             .start(name())
@@ -1186,6 +1219,7 @@ impl History {
             .middle(TopBar::rule())
             .middle(naming(Button::icon_only(icon::TAG, "Name")))
             .middle(restore(Button::icon_only(icon::ROTATE_CCW, "Restore this version")))
+            .end(more)
     }
 
     /// The strip under the page and the panel: a cell for each version, the oldest first, with a head at

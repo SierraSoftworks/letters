@@ -1,9 +1,11 @@
 //! Saving a copy of a document, or writing it in another format: one card over the page asks for the
-//! copy's name, its format and its folder.
+//! copy's name, its format and its folder. Opened while the history shows an earlier version, the card
+//! asks for a copy of that version.
 //!
 //! The window only asks: the shell writes the copy, and answers with where it went or with why it could not.
 
 use accesskit::Role;
+use letters_model::Revision;
 use letters_render::{Rect, Size};
 
 use crate::element::Element;
@@ -46,9 +48,10 @@ impl CopyFormat {
         }
     }
 
-    /// What the card says of a copy in this format.
-    fn about(self) -> &'static str {
+    /// What the card says of a copy in this format. `earlier` is for a copy of an earlier version.
+    fn about(self, earlier: bool) -> &'static str {
         match self {
+            Self::Letters if earlier => "A document of its own that starts with this version\u{2019}s text.",
             Self::Letters => "A document of its own that starts with this one\u{2019}s text and history.",
             Self::Word => "A .docx file for Word and other editors.",
             Self::Pdf => "A .pdf file, set in pages as it would print.",
@@ -75,6 +78,14 @@ pub enum Copying {
     Close,
 }
 
+/// A version the history shows that is not the document as it reads now, for a copy of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Earlier {
+    pub revision: Revision,
+    /// What the copy's name says it is a copy of: the version's name, or the day it was written.
+    pub called: String,
+}
+
 /// How a message left the card.
 pub(crate) enum Outcome {
     Open,
@@ -95,14 +106,28 @@ pub(crate) struct Copy {
     notice: Option<String>,
     /// Whether the shell refused because a file is in the way, which the person may have it replace.
     replaceable: bool,
+    /// The version the copy is of, where that is not the document as it reads now.
+    version: Option<Earlier>,
 }
 
 impl Copy {
-    /// Starts with a name for the copy and the folder the document is in.
-    pub fn open(format: CopyFormat, location: &Location, title: &str) -> Self {
+    /// Starts with a name for the copy and the folder the document is in. `version` is the version to copy,
+    /// for one the history shows that is not the document as it reads now.
+    pub fn open(format: CopyFormat, location: &Location, title: &str, version: Option<Earlier>) -> Self {
         let mut tree = Tree::open(location);
         tree.picked = Some(location.folder.clone()).filter(|folder| !folder.is_empty());
-        Self { name: suggested(format, title), typed: false, format, tree, notice: None, replaceable: false }
+        let name = suggested(format, title, version.as_ref());
+        Self { name, typed: false, format, tree, notice: None, replaceable: false, version }
+    }
+
+    /// Whether the copy is of an earlier version, which only the history has to show.
+    pub fn earlier(&self) -> bool {
+        self.version.is_some()
+    }
+
+    /// What the card is called, and says over its name field.
+    fn title(&self) -> &'static str {
+        if self.earlier() { "Save a copy of this version" } else { "Save a copy" }
     }
 
     pub fn format(&self) -> CopyFormat {
@@ -132,7 +157,7 @@ impl Copy {
             Copying::Format(format) => {
                 self.format = format;
                 if !self.typed {
-                    self.name = suggested(format, title);
+                    self.name = suggested(format, title, self.version.as_ref());
                 }
             }
             Copying::Browse(message) => self.tree.update(message, location, requests),
@@ -143,7 +168,11 @@ impl Copy {
                 }
                 let folder = self.tree.picked.clone().filter(|_| message == Copying::Save);
                 let replace = self.replaceable && message == Copying::Save;
-                requests.push(Request::SaveCopy { name, format: self.format, folder, replace });
+                let format = self.format;
+                requests.push(match self.version.clone() {
+                    Some(Earlier { revision, .. }) => Request::SaveVersion { revision, name, format, folder, replace },
+                    None => Request::SaveCopy { name, format, folder, replace },
+                });
                 (self.notice, self.replaceable) = (None, false);
                 return Outcome::Asked;
             }
@@ -173,7 +202,7 @@ impl Copy {
         let mut head = Element::column()
             .gap(tokens::SPACE_SM)
             .padding(Edges::all(tokens::SPACE_MD))
-            .child(Element::text("Save a copy", TextStyle::title()))
+            .child(Element::text(self.title(), TextStyle::title()))
             .child(Element::from(name).key("copying").takes_focus());
         if let Some(notice) = &self.notice {
             head = head.child(Element::paragraph(notice, quiet).fg(tokens::DANGER).role(Role::Alert).label(notice));
@@ -195,7 +224,7 @@ impl Copy {
             .gap(tokens::SPACE_SM)
             .padding(Edges { top: 0.0, ..Edges::all(tokens::SPACE_MD) })
             .child(formats)
-            .child(Element::paragraph(self.format.about(), quiet).fg(tokens::FG_MUTED));
+            .child(Element::paragraph(self.format.about(self.earlier()), quiet).fg(tokens::FG_MUTED));
 
         let mut card = Element::column().width(CARD_WIDTH).child(head).child(formats);
         let mut rows = 0.0;
@@ -216,7 +245,7 @@ impl Copy {
         let height = 230.0 + rows * folders::ROW_HEIGHT;
         let spot = Rect::new(room.width / 2.0, ((room.height - height) * 0.4).max(0.0), 0.0, 0.0);
         Popover::new(card)
-            .label("Save a copy")
+            .label(self.title())
             .flush()
             .max_width(CARD_WIDTH + 2.0)
             .at(spot)
@@ -252,9 +281,14 @@ impl Copy {
     }
 }
 
-/// The name a copy starts with. Another document cannot share its folder with this one under one name.
-fn suggested(format: CopyFormat, title: &str) -> String {
-    if format == CopyFormat::Letters { format!("{title} copy") } else { title.to_owned() }
+/// The name a copy starts with. Another document cannot share its folder with this one under one name,
+/// and a copy of an earlier version says which it is of.
+fn suggested(format: CopyFormat, title: &str, version: Option<&Earlier>) -> String {
+    match version {
+        Some(version) => format!("{title}, {}", version.called),
+        None if format == CopyFormat::Letters => format!("{title} copy"),
+        None => title.to_owned(),
+    }
 }
 
 fn browse(message: Browse) -> Message {

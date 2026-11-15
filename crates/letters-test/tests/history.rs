@@ -1,12 +1,13 @@
 //! The history: the document's versions listed by day beside the one that is picked, which is read where
 //! the page was, shows how it differs from the version before it or from the document, and can be restored
-//! or given a name. A strip under the page has a cell for each version.
+//! or given a name, and a copy of it saved as a document of its own. A strip under the page has a cell for
+//! each version.
 
 use letters_editor::Editor;
 use letters_model::{Block, Change, ReplicaId, TagKind};
 use letters_render::{Color, Item, Point, Rect};
 use letters_test::{Found, Harness, Role};
-use letters_ui::{Window, tokens};
+use letters_ui::{CopyFormat, Landing, Request, Window, tokens};
 
 /// Midnight before Sunday 15 November 2026 in UTC, in seconds since 1970.
 const SUNDAY: u64 = 1_794_700_800;
@@ -271,6 +272,17 @@ fn kept(window: &mut Harness) -> Kept {
 
 /// A way of doing something to a window.
 type Act = fn(&mut Harness);
+
+/// Chooses a command from the More menu of the bar.
+fn more(window: &mut Harness, command: &str) {
+    window.click(Role::Button, "More").click(Role::MenuItem, command);
+}
+
+/// What the name field of the card that saves a copy holds, while the card shows.
+fn copy_name(window: &mut Harness) -> Option<String> {
+    window.find(Role::TextInput, "Name of the copy").and_then(|field| field.value)
+}
+
 /// A document with its history showing.
 type Open = fn() -> Harness;
 /// A way of picking the version that is so many back from the newest.
@@ -850,4 +862,79 @@ fn a_cleared_name_is_taken_off_and_a_version_the_shell_marked_keeps_its_mark_unt
         assert_eq!(picked(&mut window).as_deref(), Some(listed), "{what}");
         assert_eq!(shown(&mut window), VERSIONS[0].1, "{what}");
     }
+}
+
+#[test]
+fn a_copy_of_the_version_that_shows_is_asked_of_the_shell() {
+    // A way of asking for the copy, and the format the card opens on.
+    let ways: [(&str, Act, CopyFormat); 3] = [
+        ("the key", |window| _ = window.key("Mod+Shift+S"), CopyFormat::Letters),
+        ("the menu", |window| more(window, "Save a copy of this version Ctrl+Shift+S"), CopyFormat::Letters),
+        ("Export", |window| more(window, "Export this version"), CopyFormat::Pdf),
+    ];
+    for (way, ask, opens_on) in ways {
+        let mut window = history();
+        window.click(Role::ListBoxOption, "11:30");
+        ask(&mut window);
+        window.assert_open(Role::Dialog, "Save a copy of this version");
+        // The copy's name says which version it is of: the one written on Tuesday 10 November.
+        assert_eq!(copy_name(&mut window).as_deref(), Some("Cottage renovation, 10 Nov"), "by {way}");
+        window.key("Enter").assert_closed(Role::Dialog, "Save a copy of this version");
+        assert!(showing(&mut window), "by {way}: the history still shows");
+
+        let asked = window.ui().take_requests();
+        let [Request::SaveVersion { revision, name, format, .. }] = &asked[..] else { panic!("by {way}: {asked:?}") };
+        assert_eq!((name.as_str(), *format), ("Cottage renovation, 10 Nov", opens_on), "by {way}");
+        let (read, _) = window.ui().document_at(revision).expect("a version of the history");
+        let paragraphs: Vec<String> = read.blocks.iter().skip(1).map(Block::plain_text).collect();
+        assert_eq!(paragraphs, VERSIONS[2].1, "by {way}: the revision asked for is the version that shows");
+    }
+}
+
+#[test]
+fn a_copy_is_named_after_its_version_and_the_newest_is_copied_as_the_document_is() {
+    let mut window = history();
+    window.click(Role::ListBoxOption, "16:42").click(Role::Button, "Name");
+    window.type_text("Sent to the roofer").key("Enter").key("Mod+Shift+S");
+    assert_eq!(copy_name(&mut window).as_deref(), Some("Cottage renovation, Sent to the roofer"));
+    // Escape puts the card away first, and only then leaves the history.
+    window.key("Escape");
+    assert_eq!((copy_name(&mut window), showing(&mut window)), (None, true));
+
+    // The newest version is the document as it reads now, which is copied whole, its history too.
+    window.click(Role::ListBoxOption, "Current version").key("Mod+Shift+S");
+    assert_eq!(copy_name(&mut window).as_deref(), Some("Cottage renovation copy"));
+    window.ui().take_requests();
+    window.key("Enter");
+    let asked = window.ui().take_requests();
+    assert!(matches!(asked[..], [Request::SaveCopy { format: CopyFormat::Letters, .. }]), "{asked:?}");
+}
+
+#[test]
+fn what_the_shell_answers_about_a_copy_of_a_version_is_said_in_the_history() {
+    let mut window = history();
+    window.click(Role::ListBoxOption, "11:30").key("Mod+Shift+S").key("Enter");
+    window.ui().refuse_copy("There is already a document of that name in the folder.", false);
+    window.assert_open(Role::Dialog, "Save a copy of this version");
+    window.assert_open(Role::Alert, "There is already a document of that name in the folder.");
+    window.ui().take_requests();
+    window.type_text(" for Sam").key("Enter");
+    let asked = window.ui().take_requests();
+    let again = |asked: &Request| matches!(asked, Request::SaveVersion { name, .. } if name.ends_with("for Sam"));
+    assert!(asked.len() == 1 && again(&asked[0]), "{asked:?}");
+
+    window.ui().set_copied("House");
+    assert!(window.find(Role::Tooltip, "Copy saved in House").is_some(), "the bar says where the copy went");
+    assert!(showing(&mut window) && copy_name(&mut window).is_none());
+}
+
+#[test]
+fn a_card_for_a_copy_of_a_version_goes_when_the_history_does() {
+    let mut window = history();
+    window.click(Role::ListBoxOption, "11:30").key("Mod+Shift+S");
+    assert!(copy_name(&mut window).is_some());
+    // A card of the shell's over the window takes the history away, and the version with it.
+    window.ui().set_landing(Some(Landing::default()));
+    window.ui().set_landing(None);
+    assert_eq!((showing(&mut window), copy_name(&mut window)), (false, None));
 }

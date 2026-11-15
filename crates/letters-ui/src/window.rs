@@ -15,8 +15,8 @@ use letters_editor::{
 };
 use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax};
 use letters_model::{
-    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, Notes, Pos, Selection,
-    Style,
+    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, Notes, Pos, Revision,
+    Selection, Style,
 };
 use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
@@ -597,6 +597,12 @@ impl Ui<EditorApp> {
         true
     }
 
+    /// The document and its style as they read at a revision of the history, for the shell that writes
+    /// the copy a [`Request::SaveVersion`] asks for. `None` for a revision the history does not hold.
+    pub fn document_at(&mut self, revision: &Revision) -> Option<(Document, Style)> {
+        self.app_mut().editor.document_at(revision).ok()
+    }
+
     /// Runs something on the editor from outside, such as taking in another writer's edits, and brings the
     /// page up to date with what it changed. The page stays where it is scrolled to.
     pub fn change<E>(&mut self, act: impl FnOnce(&mut Editor) -> Result<Change, E>) -> Result<(), E> {
@@ -896,7 +902,9 @@ impl EditorApp {
                 && self.landing.is_none()
                 && self.importing.is_none()
             {
-                self.copying = Some(Copy::open(format, &self.location, &title));
+                // While the history shows an earlier version, the copy is of that.
+                let version = self.history.as_ref().and_then(History::copied);
+                self.copying = Some(Copy::open(format, &self.location, &title, version));
             }
             return;
         };
@@ -1684,6 +1692,8 @@ impl EditorApp {
         if self.history.take().is_some() {
             // The nodes that stood for a version's blocks are not the page's.
             self.told.get_mut().forget();
+            // A card that asks for a copy of a version has that version nowhere to be seen.
+            self.copying.take_if(|copy| copy.earlier());
         }
     }
 
@@ -1697,16 +1707,20 @@ impl EditorApp {
                 self.requests.push(Request::Asset(asset));
             }
         }
-        version
+        match &self.copying {
+            Some(copy) => version.popover(copy.card(&self.location, room)),
+            None => version,
+        }
     }
 
     /// What a key does while the history shows: it steps through the versions, moves through the one
     /// that shows, or goes back to editing. Nothing is written there.
     fn history_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
-        // Saving where it is asked for writes nothing on the document, and is asked from here as well.
-        let save = commands::bound(event).filter(|act| **act == Act::Save).and_then(|act| self.asked(act));
-        if let Some(save) = save {
-            self.update(save, platform);
+        // Saving where it is asked for writes nothing on the document, and is asked from here as well. So
+        // is a copy, which is of the version that shows.
+        let kept = commands::bound(event).filter(|act| matches!(act, Act::Save | Act::SaveCopy));
+        if let Some(asked) = kept.and_then(|act| self.asked(act)) {
+            self.update(asked, platform);
             return true;
         }
         let plain = !event.mods.primary && !event.mods.alt;
@@ -2927,7 +2941,11 @@ impl EditorApp {
                 let told = self.note.as_ref().map(|(note, _)| note.as_str());
                 print.bar(bar, &self.name().0, told, &styles::paper_name(page), || self.styles.setup(page))
             }
-            (None, Some(history)) => history.bar(bar, &self.name().0),
+            (None, Some(history)) => {
+                let told = self.note.as_ref().map(|(note, _)| note.as_str());
+                let keys = commands::shortcut(&Act::SaveCopy, self.editor.keymap(), self.mac).unwrap_or_default();
+                history.bar(bar, &self.name().0, told, &keys)
+            }
             (None, None) => self.editing(bar),
         };
         if let Some(buttons) = chrome.buttons().filter(|_| !chrome.buttons_at_start) {

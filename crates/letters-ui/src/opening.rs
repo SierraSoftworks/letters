@@ -2,7 +2,7 @@
 //!
 //! The window knows no file system. A path is a string the shell made, which it gets back unchanged.
 
-use letters_model::BlockId;
+use letters_model::{BlockId, Revision};
 use letters_render::Point;
 
 use crate::chrome::Edge;
@@ -45,6 +45,16 @@ pub enum Request {
     /// A file of that name is in the way unless `replace` is set, which it is once the person has said so.
     /// Answer with `Window::set_copied`, or with `Window::refuse_copy` when it cannot be done.
     SaveCopy {
+        name: String,
+        format: CopyFormat,
+        folder: Option<String>,
+        replace: bool,
+    },
+    /// Write a copy of the document as it read at `revision`, a version the person picked in the history,
+    /// which `Window::document_at` reads. The rest is as for [`Request::SaveCopy`], and so are the answers.
+    /// A copy in [`CopyFormat::Letters`] is a document of its own that starts with that version's text.
+    SaveVersion {
+        revision: Revision,
         name: String,
         format: CopyFormat,
         folder: Option<String>,
