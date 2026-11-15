@@ -2,7 +2,8 @@
 //! document first shows maths.
 //!
 //! The engine is built in unless letters-math has its `provided` feature, and then there is nothing to wait
-//! for: `cargo test -p letters-layout --features letters-math/provided --test pending` runs this in earnest.
+//! for: `cargo test -p letters-layout --features letters-math/provided --test pending` runs this in earnest,
+//! as `./scripts/check.sh wasm` does.
 
 use std::fs;
 use std::path::Path;
@@ -31,6 +32,8 @@ fn across(items: &[Item]) -> Vec<(u32, f32)> {
 fn a_formula_shows_as_its_source_until_the_engine_comes_and_is_set_once_it_does() {
     let style = letters_math::Style { size: 16.0, color: Color::rgb(0, 0, 0), display: false, links: false };
     if !letters_math::typeset(TEX, &style).is_err_and(|error| error.is_pending()) {
+        // The gate says when it means the run in earnest, so that this cannot come to skip it unseen.
+        assert!(std::env::var_os("LETTERS_MATHS_WAITS").is_none(), "the engine is built in, and nothing waits");
         return;
     }
     let end = |layout: &DocLayout| layout.caret(&Pos::new("z", 0)).unwrap().y;
