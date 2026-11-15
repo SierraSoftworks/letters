@@ -124,6 +124,49 @@ fn a_picture_still_a_link_shows_where_it_comes_from() {
 }
 
 #[test]
+fn a_linked_picture_is_drawn_once_it_is_loaded() {
+    let src = "https://images.example.org/harbour/office.png";
+    let linked = || remote(figure("f", (300.0, 200.0), "The harbour"), src);
+    let cases = [
+        ("a figure", linked()),
+        ("a picture of a gallery", gallery("g", vec![figure("g0", (300.0, 200.0), ""), linked()], None)),
+    ];
+    // Where the picture of the link is drawn, on screen and on a sheet.
+    let drawn = |layout: &DocLayout| {
+        let mut sheet = DisplayList::default();
+        layout.paint_page(&layout.paginate(&paper(WIDTH, 1.0e6)), 0, &mut sheet);
+        let of = |items: Vec<Item>| images(&items).iter().find(|(asset, _)| *asset == src).map(|(_, rect)| *rect);
+        [painted(layout, everything()), sheet.items].map(of)
+    };
+    for (name, block) in cases {
+        let page = doc(vec![block, paragraph("z", "End")]);
+        let mut layout = laid(&page);
+        let (was, height) = (layout.figure(&"f".into()).unwrap(), layout.height());
+        let other = "https://images.example.org/harbour/quay.png";
+        assert!(!layout.set_loaded(other, true), "{name}: the picture of another link is not on the page");
+        assert_eq!(drawn(&layout), [None, None], "{name}: so the frame stays");
+
+        assert!(layout.set_loaded(src, true), "{name}: its own is");
+        let [screen, sheet] = drawn(&layout);
+        assert_eq!(screen, Some(was.image), "{name}: it is drawn under its link, where its frame stood");
+        assert!(sheet.is_some(), "{name}: and on a sheet");
+        let cloud = was.badge.expect("a cloud marked it");
+        let marked =
+            |item: &Item| matches!(item, Item::Path { origin, .. } if (origin.x, origin.y) == (cloud.x, cloud.y));
+        assert!(!painted(&layout, everything()).iter().any(marked), "{name}: with no cloud drawn over it");
+        assert!(!spelt(&layout).contains("images.example.org"), "{name}: nor its host");
+        let still = (layout.figure(&"f".into()), layout.height());
+        assert_eq!(still, (Some(was), height), "{name}: it is a link yet, with its cloud's place, and nothing moves");
+        assert!(!layout.set_loaded(src, true), "{name}: told again, nothing changes");
+
+        layout.update(&page, &Style::default(), WIDTH / 2.0, None);
+        assert!(drawn(&layout)[0].is_some(), "{name}: it stays loaded when the page is laid out again");
+        assert!(layout.set_loaded(src, false), "{name}: a picture that is dropped");
+        assert_eq!(drawn(&layout), [None, None], "{name}: is a frame again");
+    }
+}
+
+#[test]
 fn a_picture_is_no_taller_than_a_page_holds() {
     // A style whose page has a text area as wide as the column and `room` tall.
     let room = 400.0;

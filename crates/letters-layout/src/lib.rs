@@ -36,7 +36,7 @@ mod theme;
 mod tokens;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
@@ -46,7 +46,7 @@ use letters_render::{DisplayList, Font, Item, Point, Rect, Role as Tag};
 use parley::{Alignment, Language};
 
 use crate::engine::Engine;
-use crate::flow::{Frame, Leaf, Look, Part, Role, Table, Types, What, Words};
+use crate::flow::{Frame, Leaf, Look, Part, Picture, Role, Table, Types, What, Words};
 use crate::ink::{Brush, Ink, Inks};
 use crate::leaf::{Extent, Laid, Lay, Open, Over, Painter, Source, Swap, Text};
 use crate::reveal::{Reveal, Shapes, Shifts};
@@ -81,7 +81,8 @@ pub struct FigureBox {
     /// The caption under it. While there is none this is where its first line would be, which reaches into
     /// the space below the figure.
     pub caption: Rect,
-    /// The cloud on a picture that is still a link, when the picture has room for one.
+    /// The cloud on a picture that is still a link, when the picture has room for one. It keeps its place
+    /// when the picture is loaded and drawn, where nothing marks it.
     pub badge: Option<Rect>,
 }
 
@@ -158,6 +159,7 @@ impl DocLayout {
             good: None,
             stands: false,
             numbers: HashMap::new(),
+            loaded: HashSet::new(),
             scratch: Laid::default(),
         };
         Self { state: RefCell::new(state) }
@@ -229,6 +231,19 @@ impl DocLayout {
     /// estimate until it is. Returns whether there are any, which is whether the page may now look different.
     pub fn add_fonts(&mut self, fonts: &Fonts) -> bool {
         self.state.get_mut().add_fonts(fonts)
+    }
+
+    /// Says that the picture a link leads to is there to draw, or no longer is. A figure that is still a
+    /// link shows as a frame with its host and a cloud, since whether to fetch it is the shell's to decide.
+    /// Once loaded it is drawn as [`Item::Image`] with the link for its `asset`, written as the document
+    /// writes it: the name to keep the picture under among the images the page is rendered with. A sheet
+    /// draws it too, and a picture that was never loaded stays a frame there.
+    ///
+    /// Nothing is laid out again, since a figure's size is stored. Returns whether the document shows the
+    /// picture, which is whether to paint again: a name that no figure links to changes nothing.
+    /// [`FigureBox::badge`] answers either way, since a loaded picture is a link until it is embedded.
+    pub fn set_loaded(&mut self, src: &str, loaded: bool) -> bool {
+        self.state.get_mut().set_loaded(src, loaded)
     }
 
     /// Lets formulas link, as `\\href` asks. Off until set, and only a document that is trusted may have it on.
@@ -475,6 +490,8 @@ struct State {
     stands: bool,
     /// The number of each numbered figure and gallery.
     numbers: HashMap<BlockId, u32>,
+    /// The links whose pictures the shell has, which are drawn in place of their frames.
+    loaded: HashSet<String>,
     /// A layout to measure with, so that measuring allocates nothing.
     scratch: Laid,
 }
@@ -645,6 +662,12 @@ impl State {
         }
         self.recount();
         again
+    }
+
+    fn set_loaded(&mut self, src: &str, loaded: bool) -> bool {
+        let changed = if loaded { self.loaded.insert(src.to_owned()) } else { self.loaded.remove(src) };
+        let shows = |picture: &Picture| picture.asset.is_none() && picture.src.as_deref() == Some(src);
+        changed && self.leaves.iter().any(|leaf| leaf.pictures.iter().any(shows))
     }
 
     fn set_maths_links(&mut self, links: bool) {
@@ -937,7 +960,7 @@ impl State {
         }
         frames.sort_unstable();
         for frame in frames {
-            let Self { engine, types, leaves, frames, reveal, shapes, numbers, .. } = self;
+            let Self { engine, types, leaves, frames, reveal, shapes, numbers, loaded, .. } = self;
             let frame = &frames[frame];
             let (top, bottom) = frame.span(leaves);
             let rect = Rect::new(frame.x, top, frame.width, bottom - top);
@@ -959,7 +982,7 @@ impl State {
             for (tag, level) in reveal.beside(&frame.id).filter(|_| seen) {
                 let (shape, width) = shapes.get(engine, types, Role::Body, true, tag);
                 if let Some(shape) = shapes.layout(shape) {
-                    Painter { engine, types, inks: &inks, band, spelt: false, part: None, numbers, out }
+                    Painter { engine, types, inks: &inks, band, spelt: false, part: None, numbers, loaded, out }
                         .sign(shape, at, level);
                 }
                 at.x += width;
@@ -1004,7 +1027,7 @@ impl State {
             let cells = leaf.cells.len();
             for part in [Part::Text].into_iter().chain((0..cells).map(Part::Cell)) {
                 let shifts = if print { Shifts::default() } else { self.shifts(at, part) };
-                let Self { engine, types, leaves, tokens, spelling, shapes, composition, numbers, .. } = self;
+                let Self { engine, types, leaves, tokens, spelling, shapes, composition, numbers, loaded, .. } = self;
                 let leaf = &leaves[at];
                 let Some(laid) = &leaf.laid else { continue };
                 // What belongs to editing is found by the block the text is of.
@@ -1013,7 +1036,8 @@ impl State {
                 let composing = composition.as_ref().filter(|(block, _)| own(block)).map(|(_, range)| range.clone());
                 let spelling = block.and_then(|id| spelling.get(id)).map_or(&[][..], Vec::as_slice);
                 let over = Over { shifts: &shifts, shapes, composing, spelling };
-                let mut painter = Painter { engine, types, inks: &inks, band, spelt: print, part: name, numbers, out };
+                let mut painter =
+                    Painter { engine, types, inks: &inks, band, spelt: print, part: name, numbers, loaded, out };
                 match part {
                     Part::Cell(index) => painter.cell(leaf, index, &over),
                     _ => {
@@ -1063,7 +1087,7 @@ impl State {
             out.translate(from, origin);
         }
         // The page number sits in the middle of the margin beneath the text, if the margin has room for it.
-        let Self { engine, types, scratch, palette, numbers, .. } = self;
+        let Self { engine, types, scratch, palette, numbers, loaded, .. } = self;
         let (label, number) = ((index + 1).to_string(), &mut scratch.text.layout);
         let spec = types.get(Role::Caption).spec(false, Brush { ink: Ink::Style(Role::Caption), back: None });
         engine.build(&label, &[spec], &[(0, 0..label.len())], None, number);
@@ -1075,7 +1099,7 @@ impl State {
             let inks = Inks::new(types, *palette);
             // The number is of the sheet and not of the document, so it is part of nothing.
             let band = (f32::MIN, f32::MAX);
-            Painter { engine, types, inks: &inks, band, spelt: true, part: None, numbers, out }
+            Painter { engine, types, inks: &inks, band, spelt: true, part: None, numbers, loaded, out }
                 .glyphs(number, &label, at);
         }
     }

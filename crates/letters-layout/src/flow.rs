@@ -343,7 +343,9 @@ pub(crate) struct Picture {
     pub asset: Option<String>,
     /// What it shows, for a reader that cannot see it.
     pub alt: Arc<str>,
-    /// Where a linked image comes from.
+    /// The link an image that is not in the document comes from, as the document writes it.
+    pub src: Option<String>,
+    /// The host that link names.
     pub host: String,
     /// Its stored size, which gives its shape.
     pub size: (f32, f32),
@@ -356,7 +358,7 @@ pub(crate) struct Picture {
 impl Picture {
     /// Whether `other` shows the same image at the same shape.
     fn same(&self, other: &Self) -> bool {
-        (&self.id, &self.asset, &self.host, self.size) == (&other.id, &other.asset, &other.host, other.size)
+        (&self.id, &self.asset, &self.src, self.size) == (&other.id, &other.asset, &other.src, other.size)
     }
 
     fn of(block: &Block) -> Option<Self> {
@@ -369,7 +371,7 @@ impl Picture {
         });
         let size = ((width * theme::PT).max(1.0), (height * theme::PT).max(1.0));
         let (id, asset, alt, host) = (block.id.clone(), asset.clone(), alt.as_str().into(), host.to_owned());
-        Some(Self { id, asset, alt, host, size, rect: Rect::default(), row: 0 })
+        Some(Self { id, asset, alt, src: src.clone(), host, size, rect: Rect::default(), row: 0 })
     }
 }
 

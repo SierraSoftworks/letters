@@ -1,6 +1,6 @@
 //! The texts of a leaf: shaping them with Parley, painting them and answering where things are inside them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::iter::Peekable;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
@@ -672,6 +672,8 @@ pub(crate) struct Painter<'a> {
     pub part: Option<u64>,
     /// The number of each numbered figure, which says whether a reference leads anywhere.
     pub numbers: &'a HashMap<BlockId, u32>,
+    /// The links whose pictures are there to draw.
+    pub loaded: &'a HashSet<String>,
     pub out: &'a mut DisplayList,
 }
 
@@ -817,7 +819,9 @@ impl Painter<'_> {
             if alone {
                 self.open(PICTURES + index as u64, || Tag::Figure { alt: picture.alt.clone() });
             }
-            if let Some(asset) = &picture.asset {
+            // A picture that is still a link is drawn once it is loaded, under its link for a name.
+            let linked = picture.src.as_ref().filter(|src| self.loaded.contains(*src));
+            if let Some(asset) = picture.asset.as_ref().or(linked) {
                 self.out.push(Item::Image { rect, asset: asset.clone() });
             } else {
                 self.remote(picture, rect, laid.names.iter().find(|(at, _)| *at == index).map(|(_, name)| name));
