@@ -31,7 +31,6 @@ fn files(files: &Array) -> Vec<Vec<u8>> {
 pub fn fonts(fonts: &Array, maths: &Array) {
     letters_fonts::provide(files(fonts));
     letters_math::provide_fonts(files(maths));
-    // The exports set their formulas themselves: the editor's engine is a module they cannot reach.
     letters_math::provide_engine(letters_math::built_in());
 }
 

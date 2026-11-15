@@ -154,7 +154,6 @@ const downloads = [
 // A document with maths has the maths faces before its first frame, too.
 const later = [
   [`fonts (${fonts.length} files)`, fonts],
-  ["maths, at a first formula", [read("maths_bg.wasm"), read("maths.js")]],
   [`maths (${maths.length} files)`, maths],
   [`dictionaries (${dictionaries.length})`, dictionaries],
   ["exports, when asked for", [read("export_bg.wasm"), read("export.js")]],

@@ -95,11 +95,6 @@ letters-convert.workspace = true
 name = "export"
 crate-type = ["cdylib"]
 
-# So is the maths engine, which the page fetches when a document first shows a formula.
-[[example]]
-name = "maths"
-crate-type = ["cdylib"]
-
 [dev-dependencies]
 letters-format.workspace = true
 letters-layout.workspace = true

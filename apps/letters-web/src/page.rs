@@ -419,8 +419,8 @@ pub fn first_font(document: &Document) -> &'static str {
 }
 
 /// What a page asks its browser to fetch early for `document`, beyond what every page does: the font its
-/// first frame waits for, ahead of the rest, and the maths engine and its faces when that frame waits for
-/// them too. `base` is where the files are found, as the editor is given it.
+/// first frame waits for, ahead of the rest, and the maths faces when that frame waits for them too. `base`
+/// is where the files are found, as the editor is given it.
 pub fn preloads(document: &Document, base: &str) -> String {
     let font = first_font(document);
     let first =
@@ -428,13 +428,7 @@ pub fn preloads(document: &Document, base: &str) -> String {
     let files = letters_math::FONT_FILES.iter().filter(|_| has_maths(document));
     let maths =
         files.map(|file| format!("<link rel=\"preload\" as=\"fetch\" crossorigin href=\"{base}maths/{file}\" />"));
-    // The engine that sets them is a module of its own, which no other document's first frame waits for.
-    let engine = [
-        format!("<link rel=\"modulepreload\" href=\"{base}maths.js\" />"),
-        format!("<link rel=\"preload\" as=\"fetch\" crossorigin href=\"{base}maths_bg.wasm\" />"),
-    ];
-    let engine = engine.into_iter().filter(|_| has_maths(document));
-    std::iter::once(first).chain(engine).chain(maths).collect()
+    std::iter::once(first).chain(maths).collect()
 }
 
 /// Fills a page's template with a document: `preloads` and `first_paint` are what [`preloads`] and
