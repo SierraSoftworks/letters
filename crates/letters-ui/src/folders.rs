@@ -46,6 +46,9 @@ pub(crate) struct Tree {
     naming: Option<String>,
     /// A folder the shell was asked to make, to be picked once it is listed: its parent's path and its name.
     made: Option<(String, String)>,
+    /// Whether the folder the document is in is marked as that. Not among the folders that copies go to
+    /// when the document is kept somewhere else.
+    pub marks: bool,
 }
 
 impl Tree {
@@ -57,7 +60,7 @@ impl Tree {
             open.insert(location.folder.clone());
             open.extend(ancestors(folders, at).map(path));
         }
-        Self { open, ..Self::default() }
+        Self { open, marks: true, ..Self::default() }
     }
 
     /// Does what a row or the new folder's field asked. A new folder is asked of the shell.
@@ -90,6 +93,11 @@ impl Tree {
             self.open.insert(parent);
         }
         self.picked = self.picked.take().filter(|picked| folders.iter().any(|folder| folder.path == *picked));
+    }
+
+    /// Takes in that the folder asked for was not made, so that none of its name is picked later.
+    pub fn unmade(&mut self) {
+        self.made = None;
     }
 
     /// The name of the folder that is picked.
@@ -149,7 +157,8 @@ impl Tree {
             let parent = folders.get(at + 1).is_some_and(|next| next.depth > folder.depth);
             let open = parent.then(|| self.open.contains(&folder.path));
             hidden = (open == Some(false)).then_some(folder.depth);
-            rows.push(self.folder(folder, open, folder.path == location.folder, send));
+            let here = self.marks && folder.path == location.folder;
+            rows.push(self.folder(folder, open, here, send));
         }
         rows
     }

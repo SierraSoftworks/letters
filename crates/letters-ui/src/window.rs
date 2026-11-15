@@ -386,8 +386,18 @@ impl Ui<EditorApp> {
         let app = self.app_mut();
         app.copy_location = location;
         let place = app.copy_location.as_ref().unwrap_or(&app.location);
+        let own = app.copy_location.is_none();
         if let Some(copy) = &mut app.copying {
-            copy.placed(place);
+            copy.placed(place, own);
+        }
+    }
+
+    /// Says why a folder that the card that saves a copy asked for could not be made, as the person is to
+    /// read it. The card says so by its folders until something on it changes. Nothing is said once the
+    /// card is put away.
+    pub fn refuse_copy_folder(&mut self, notice: &str) {
+        if let Some(copy) = &mut self.app_mut().copying {
+            copy.unmade(notice);
         }
     }
 
@@ -1337,7 +1347,7 @@ impl EditorApp {
         }
         // Copies that go elsewhere are placed by what the shell says of that place.
         if let Some(copy) = self.copying.as_mut().filter(|_| self.copy_location.is_none()) {
-            copy.placed(&self.location);
+            copy.placed(&self.location, true);
         }
     }
 
@@ -1357,7 +1367,7 @@ impl EditorApp {
             {
                 // While the history shows an earlier version, the copy is of that.
                 let version = self.history.as_ref().and_then(History::copied);
-                let place = self.copy_location.as_ref().unwrap_or(&self.location);
+                let place = (self.copies_to(), self.copy_location.is_none());
                 let mut copy = Copy::open(format, place, &title, version);
                 self.weigh(&mut copy);
                 self.copying = Some(copy);

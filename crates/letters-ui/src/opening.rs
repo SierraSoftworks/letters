@@ -31,7 +31,8 @@ pub enum Request {
     /// Let the person choose a folder that is not in the tree, and move the document there.
     MoveElsewhere,
     /// Make a folder called `name` in the folder with the path `parent`, and list it with
-    /// `Window::set_location`.
+    /// `Window::set_location`. One the card that saves a copy asked for, while copies have a place of their
+    /// own, is listed with `Window::set_copy_location`, or refused with `Window::refuse_copy_folder`.
     NewFolder {
         parent: String,
         name: String,
