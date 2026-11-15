@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
-use letters_format::{Archive, Files, Save, Saved, Stamp, WorkingCopy};
+use letters_format::{ASSETS, Archive, Files, Save, Saved, Stamp, WorkingCopy};
 use letters_model::{Block, BlockId, BlockKind, Document, Model, Prepared, ReplicaId, Revision, Style};
+use letters_render::image::Image;
 
 use crate::journal::{self, Claim};
 use crate::platform;
@@ -312,6 +313,15 @@ pub struct Working {
     /// The revision the journal's next edits build on. `None` for a new document, whose journal starts
     /// with its whole history.
     pub journalled: Option<Revision>,
+    /// The document's pictures by asset name, ready to draw.
+    pub pictures: Vec<(String, Image)>,
+}
+
+/// A picture among a document's entries, decoded. `None` for an entry that is no picture or cannot be
+/// read as one: its place on the page stays empty.
+fn picture(name: &str, bytes: &[u8]) -> Option<(String, Image)> {
+    let image = name.starts_with(ASSETS).then(|| Image::decode(bytes).ok())??;
+    Some((name.to_owned(), image))
 }
 
 impl Rest {
@@ -327,16 +337,20 @@ impl Rest {
     /// is on screen.
     pub fn read(self, editor: ReplicaId, journals: Option<&Path>) -> Result<Working, Error> {
         let claim = |copy: &WorkingCopy| journals.and_then(|folder| journal::claim(folder, &copy.id));
-        let (mut copy, kept) = match self.0 {
+        let (mut copy, kept, mut pictures) = match self.0 {
             Source::File(bytes) => {
                 let mut archive = Archive::open(Cursor::new(bytes))?;
-                (WorkingCopy::open(&mut archive, ReplicaId::new(&platform::block_id()))?, None)
+                let copy = WorkingCopy::open(&mut archive, ReplicaId::new(&platform::block_id()))?;
+                let names: Vec<String> =
+                    archive.names().filter(|name| name.starts_with(ASSETS)).map(String::from).collect();
+                let held = names.iter().filter_map(|name| picture(name, &archive.read(name).ok()??));
+                (copy, None, held.collect::<Vec<_>>())
             }
             Source::New(copy) => {
-                let claim = claim(&copy);
-                return Ok(Working { copy: *copy, history: None, news: None, claim, journalled: None });
+                let (claim, pictures) = (claim(&copy), Vec::new());
+                return Ok(Working { copy: *copy, history: None, news: None, claim, journalled: None, pictures });
             }
-            Source::Kept(copy, claim) => (*copy, Some(claim)),
+            Source::Kept(copy, claim) => (*copy, Some(claim), Vec::new()),
         };
         // The editor takes the history as the copy holds it, so a document changed outside Letters is one
         // change in both and not one in each.
@@ -359,7 +373,9 @@ impl Rest {
             })
         });
         let journalled = Some(copy.model().revision());
-        Ok(Working { history: Some(history), news, claim, journalled, copy })
+        // And the pictures no file holds yet, which a journal brought back.
+        pictures.extend(copy.entries.iter().filter_map(|(name, bytes)| picture(name, bytes)));
+        Ok(Working { history: Some(history), news, claim, journalled, copy, pictures })
     }
 }
 

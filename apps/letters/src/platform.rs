@@ -4,6 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use letters_editor::{Clip, Platform};
 
+use crate::pictures;
 use crate::words::Words;
 
 pub struct Desktop {
@@ -12,11 +13,13 @@ pub struct Desktop {
     clipboard: Option<arboard::Clipboard>,
     /// Where a word the person teaches the app is kept.
     words: Option<Words>,
+    /// The assets the editor handed over since they were last taken.
+    stored: Vec<(String, Vec<u8>)>,
 }
 
 impl Desktop {
     pub fn new() -> Self {
-        Self { start: Instant::now(), clipboard: None, words: None }
+        Self { start: Instant::now(), clipboard: None, words: None, stored: Vec::new() }
     }
 
     /// Keeps the words the person adds in `words`. Without this they last as long as their window.
@@ -27,6 +30,12 @@ impl Desktop {
     /// The moment the editor's clock reads `ms`.
     pub fn instant(&self, ms: u64) -> Instant {
         self.start + Duration::from_millis(ms)
+    }
+
+    /// The assets the editor has stored since this was last asked, for the window whose document names
+    /// them: its file, its journal and its screen all need them.
+    pub fn take_assets(&mut self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut self.stored)
     }
 
     fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
@@ -54,10 +63,19 @@ impl Platform for Desktop {
 
     fn clipboard_read(&mut self) -> Option<Clip> {
         let clipboard = self.clipboard()?;
+        // Copied picture files are pasted as their pictures, not as the paths that come with them.
+        let files = clipboard.get().file_list().unwrap_or_default();
+        let pictures = pictures::from_files(&files);
+        if !pictures.is_empty() {
+            return Some(Clip { pictures, ..Clip::default() });
+        }
         let html = clipboard.get().html().ok().filter(|html| !html.is_empty());
         let text = clipboard.get_text().ok().filter(|text| !text.is_empty());
         if text.is_none() && html.is_none() {
-            return None;
+            // Only a picture, as a screenshot is.
+            let image = clipboard.get_image().ok()?;
+            let picture = pictures::from_rgba(image.width as u32, image.height as u32, &image.bytes)?;
+            return Some(Clip { pictures: vec![picture], ..Clip::default() });
         }
         Some(Clip { text: text.unwrap_or_default(), html, ..Clip::default() })
     }
@@ -73,6 +91,10 @@ impl Platform for Desktop {
 
     fn new_id(&mut self) -> String {
         block_id()
+    }
+
+    fn store_asset(&mut self, name: &str, bytes: &[u8]) {
+        self.stored.push((name.to_owned(), bytes.to_vec()));
     }
 
     fn learn_word(&mut self, word: &str) {

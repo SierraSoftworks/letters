@@ -108,6 +108,11 @@ enum Message {
         key: u64,
         edits: Vec<u8>,
     },
+    Asset {
+        key: u64,
+        name: String,
+        bytes: Vec<u8>,
+    },
     /// A save has been handed everything journalled so far.
     Saving {
         key: u64,
@@ -227,6 +232,12 @@ impl Journal {
         self.send(Message::Edits { key: self.key, edits });
     }
 
+    /// Records an asset no file holds yet, ahead of the edits that name it.
+    pub fn asset(&mut self, name: &str, bytes: &[u8]) {
+        self.owed = true;
+        self.send(Message::Asset { key: self.key, name: name.into(), bytes: bytes.into() });
+    }
+
     /// Notes that a save is being handed everything recorded so far.
     pub fn saving(&mut self) {
         self.covered |= std::mem::take(&mut self.owed);
@@ -289,6 +300,9 @@ fn write(mut folder: Folder, messages: Receiver<Message>) {
             }
             Message::Edits { key, edits } => {
                 open.get_mut(&key).map_or(Ok(()), |journal| journal.records.edits(&mut folder, &edits))
+            }
+            Message::Asset { key, name, bytes } => {
+                open.get_mut(&key).map_or(Ok(()), |journal| journal.records.asset(&mut folder, &name, &bytes))
             }
             Message::Saving { key } => {
                 if let Some(journal) = open.get_mut(&key) {

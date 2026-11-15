@@ -21,6 +21,7 @@ pub mod input;
 pub mod journal;
 pub mod library;
 pub mod measure;
+pub mod pictures;
 pub mod platform;
 pub mod present;
 pub mod shadow;

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use letters_frame::Strip;
 use letters_render::cpu::{CpuRenderer, Damage, Frame, PixelFormat};
-use letters_render::image::Images;
+use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Item, Rect};
 use winit::window::Window;
 
@@ -170,6 +170,11 @@ impl Presenter {
 
     pub fn on_gpu(&self) -> bool {
         matches!(self.surface, Surface::Gpu(_))
+    }
+
+    /// Gives the window a picture to draw wherever the display list names `asset`.
+    pub fn show(&mut self, asset: String, image: Image) {
+        self.images.insert(asset, image);
     }
 
     /// Moves the window to the GPU if it will take a surface there. Otherwise nothing changes.

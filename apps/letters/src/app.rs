@@ -5,7 +5,7 @@
 //! and nobody is asked where: a new document gets a file of its own once it has content. What is typed
 //! goes into a journal sooner than that, so that it outlives a crash.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fs;
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Platform as _};
 use letters_format::WorkingCopy;
 use letters_model::{Model, ReplicaId, Revision, Style};
-use letters_render::image::Images;
+use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Point, Size};
 use letters_spell::Dictionary;
 use letters_trust::Trust;
@@ -81,6 +81,8 @@ pub enum Event {
     Buttons(Buttons),
     /// The name of the person writing has been found.
     Writer(String),
+    /// A picture that was put into a window's document is ready to draw, under its asset's name.
+    Picture(WindowId, String, Image),
     /// A system dictionary a window's document asked for has been read, under the name it has on disk.
     Dictionary(WindowId, String, Box<Dictionary>),
 }
@@ -352,6 +354,8 @@ struct DocWindow {
     /// The view's edit count the journal was last given.
     journalled_edits: u64,
     journal_at: Option<Instant>,
+    /// Assets the document names that no save has been handed yet.
+    assets: BTreeMap<String, Vec<u8>>,
 }
 
 /// A save on its way back from its thread: the copy, and how the save ended.
@@ -418,6 +422,23 @@ impl DocWindow {
         let model = self.view.editor().model();
         journal.edits(self.journalled.as_ref().map_or_else(|| model.save(), |seen| model.updates_since(seen)));
         (self.journalled, self.journalled_edits) = (Some(model.revision()), self.view.edits());
+    }
+
+    /// Keeps the assets the editor stored for this window's document: in the journal at once, in the file
+    /// with the next save, and on screen as soon as each is decoded, which is not done on this thread.
+    fn keep(&mut self, assets: Vec<(String, Vec<u8>)>, proxy: &EventLoopProxy<Event>) {
+        for (name, bytes) in assets {
+            if let Some(journal) = &mut self.journal {
+                journal.asset(&name, &bytes);
+            }
+            let (id, proxy, asset, encoded) = (self.window.id(), proxy.clone(), name.clone(), bytes.clone());
+            thread::spawn(move || {
+                if let Ok(image) = Image::decode(&encoded) {
+                    let _ = proxy.send_event(Event::Picture(id, asset, image));
+                }
+            });
+            self.assets.insert(name, bytes);
+        }
     }
 
     /// Tells the journal where the document's file is, which may have changed.
@@ -690,7 +711,11 @@ impl DocWindow {
             (None, None) => return Ok(()),
         };
         match working {
-            Ok(Working { copy, history, news, claim, journalled }) => {
+            Ok(Working { copy, history, news, claim, journalled, pictures }) => {
+                for (asset, image) in pictures {
+                    self.presenter.show(asset, image);
+                }
+                self.window.request_redraw();
                 if let Some(history) = history {
                     let _ = self.view.change(|editor| Ok::<_, Infallible>(editor.attach(history)));
                 }
@@ -707,7 +732,10 @@ impl DocWindow {
                         self.save_at = Some(Instant::now());
                     }
                     (self.journal, self.journalled) = (Some(journal), journalled);
-                    // What was typed before the history arrived is typed all the same.
+                    // What was put in or typed before the history arrived is kept all the same.
+                    if let Some(journal) = &mut self.journal {
+                        self.assets.iter().for_each(|(name, bytes)| journal.asset(name, bytes));
+                    }
                     self.record();
                 }
                 self.copy = Some(copy);
@@ -729,6 +757,8 @@ impl DocWindow {
             // The window only offers styles the file format takes.
             let _ = copy.set_style(self.sent_style.clone());
         }
+        // The assets go into the file with the edits that name them.
+        copy.entries.append(&mut self.assets);
         let model = self.view.editor().model();
         let edits = self.sent.as_ref().map_or_else(|| model.save(), |sent| model.updates_since(sent));
         (edits, model.revision())
@@ -987,6 +1017,7 @@ impl App {
             journalled: None,
             journalled_edits: 0,
             journal_at: None,
+            assets: BTreeMap::new(),
         };
         window.view.set_reduced_motion(self.reduced_motion);
         if let Some(writer) = &self.writer {
@@ -1277,7 +1308,7 @@ impl ApplicationHandler<Event> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let Self { windows, platform, mods, library, .. } = self;
+        let Self { windows, platform, mods, library, proxy, .. } = self;
         let Some(window) = windows.get_mut(&id) else { return };
         window.access.process_event(&window.window, &event);
         let mut action = None;
@@ -1441,6 +1472,8 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::CloseRequested => action = Some(Action::Close),
             _ => {}
         }
+        // A paste or a drop may have put pictures in.
+        window.keep(platform.take_assets(), proxy);
         let now = Instant::now();
         window.sync(now);
         self.serve(event_loop, id, now);
@@ -1489,6 +1522,11 @@ impl ApplicationHandler<Event> for App {
                     window.view.set_reduced_motion(reduced);
                 }
             }
+            Event::Picture(id, asset, image) => {
+                let Some(window) = self.windows.get_mut(&id) else { return };
+                window.presenter.show(asset, image);
+                window.window.request_redraw();
+            }
             Event::Writer(name) => {
                 self.windows.values_mut().for_each(|window| window.view.set_author(&name));
                 self.writer = Some(name);
@@ -1517,6 +1555,7 @@ impl ApplicationHandler<Event> for App {
                     }
                     accesskit_winit::WindowEvent::ActionRequested(request) => {
                         window.view.access_action(request, &mut self.platform);
+                        window.keep(self.platform.take_assets(), &self.proxy);
                         window.access_stale = true;
                     }
                     accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
