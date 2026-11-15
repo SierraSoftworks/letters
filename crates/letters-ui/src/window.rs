@@ -13,7 +13,9 @@ use letters_editor::{
     Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Picture, Platform, Seek, Spot,
     TableEdit,
 };
-use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax, Uncovered};
+use letters_layout::{
+    CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax, Uncovered, WordList,
+};
 use letters_model::{
     Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, Notes, Pos, Revision,
     Selection, Style,
@@ -66,6 +68,7 @@ use crate::widgets::{
     Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, Title, TopBar, banner, side_panel,
     top_bar,
 };
+use crate::words::WordLists;
 
 /// Space kept beside the text column.
 pub(crate) const GUTTER: f32 = 24.0;
@@ -496,6 +499,51 @@ impl Ui<EditorApp> {
         found
     }
 
+    /// Hands over the word list of a script that is written without spaces, as [`WordList::data`] gives it.
+    /// Lines of that script then end between words wherever the window sets the document's text: on the
+    /// page, in an earlier version, in a conflict and in a note. Which lists to fetch,
+    /// [`Self::take_unlisted`] says. Where they are built in ([`WordList::BUILT_IN`]) none is taken.
+    ///
+    /// The list is kept for whatever is laid out later. A file that is not the list as this build reads
+    /// it changes nothing, and the list is still taken after it. Returns whether lines that were set may
+    /// now end elsewhere, which the next frame shows.
+    pub fn add_word_list(&mut self, list: WordList, data: &[u8]) -> bool {
+        let data: Rc<[u8]> = data.into();
+        let app = self.app_unseen();
+        if !app.lists.keep(list, &data) {
+            return false;
+        }
+        let mut shown = app.said.add_word_list(list, &data);
+        shown |= app.review.add_word_list(list, &data);
+        if let Some(history) = &mut app.history {
+            shown |= history.add_word_list(list, &data);
+        }
+        if app.held(|app| app.layout.add_word_list(list, &data)) {
+            // Blocks set again keep their heights as estimates until idle time settles them.
+            (app.estimated, shown) = (true, true);
+        }
+        if shown {
+            self.app_mut();
+        }
+        shown
+    }
+
+    /// The scripts whose lines the window could not end between words since this was last asked, since
+    /// their word list is not here: on the page, in an earlier version, in a conflict or in a note. Each
+    /// is told once for as long as the window lives. Hand what is fetched to [`Self::add_word_list`].
+    ///
+    /// Scripts are met as text is laid out, so ask after a frame. It costs nothing when there are none,
+    /// asks for no frame, and is always empty where the lists are built in.
+    pub fn take_unlisted(&mut self) -> Vec<WordList> {
+        let app = self.app_unseen();
+        let mut found = app.layout.take_unlisted();
+        found.extend(app.said.take_unlisted());
+        found.extend(app.review.take_unlisted());
+        found.extend(app.history.iter_mut().flat_map(History::take_unlisted));
+        found.retain(|list| app.unlisted.insert(*list));
+        found
+    }
+
     /// Lets formulas link, as `\\href` asks. The shell turns it on for a document the person trusts, and it
     /// is off until then.
     pub fn set_maths_links(&mut self, links: bool) {
@@ -854,6 +902,10 @@ pub struct EditorApp {
     backup: Fonts,
     /// The characters without a glyph that the shell was told of. None is told twice.
     uncovered: HashSet<char>,
+    /// The word lists the shell handed over, for what is laid out after they came.
+    lists: WordLists,
+    /// The scripts without their word list that the shell was told of. None is told twice.
+    unlisted: HashSet<WordList>,
 }
 
 impl EditorApp {
@@ -931,6 +983,8 @@ impl EditorApp {
             told: RefCell::default(),
             backup: Fonts::default(),
             uncovered: HashSet::new(),
+            lists: WordLists::default(),
+            unlisted: HashSet::new(),
         }
     }
 
@@ -1713,6 +1767,9 @@ impl EditorApp {
                 let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
                 let mut history = History::new(&steps, current, platform.wall_time(), self.zone);
                 history.add_fallback_fonts(&self.backup);
+                for (list, data) in self.lists.iter() {
+                    history.add_word_list(list, data);
+                }
                 self.history = Some(history);
                 // The nodes that stand for the blocks go with the page, and are told whole when it is back.
                 self.told.get_mut().forget();

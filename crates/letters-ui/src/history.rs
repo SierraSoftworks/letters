@@ -30,7 +30,7 @@ use std::rc::Rc;
 
 use accesskit::{Node, NodeId, Role};
 use letters_editor::{Command, Editor, Key, KeyEvent, Platform};
-use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split, Uncovered};
+use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split, Uncovered, WordList};
 use letters_model::{
     Block, BlockId, BlockKind, Body, Change, Document, Point as Step, Pos, ReplicaId, Revision, Selection, Style, Tag,
     TagKind,
@@ -56,6 +56,7 @@ use crate::threads;
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::widgets::{self, Button, ControlSize, Menu, MenuItem, Popover, Segmented, SidePanel, TextField, TopBar};
 use crate::window::{GUTTER, Message, PT, TOP};
+use crate::words::WordLists;
 
 /// How long writing rests before what comes after it is another version, in seconds.
 const PAUSE: u64 = 600;
@@ -656,6 +657,8 @@ pub(crate) struct History {
     lines: Option<(Rect, Rect, bool)>,
     /// The faces of the system that back the fonts up, for the layout of a version shown after they came.
     backup: Fonts,
+    /// The word lists, for the same.
+    lists: WordLists,
 }
 
 impl History {
@@ -681,6 +684,7 @@ impl History {
             split: None,
             lines: None,
             backup: Fonts::default(),
+            lists: WordLists::default(),
         };
         history.follow(steps, current);
         history
@@ -771,8 +775,8 @@ impl History {
         };
         let captions = [[format!("Removed{by}"), format!("Added{by}")], ["Before".to_owned(), format!("Changed{by}")]];
         let last = self.leaf.take();
-        let backup = &self.backup;
-        self.leaf = later.map(|later| Leaf::new(between, earlier.as_deref(), &later, captions, last, backup));
+        let late = (&self.backup, &self.lists);
+        self.leaf = later.map(|later| Leaf::new(between, earlier.as_deref(), &later, captions, last, late));
         // The versions just shown are the ones a step is most likely to want again.
         let spare = self.read.len().saturating_sub(KEPT);
         self.read.drain(..spare);
@@ -844,6 +848,30 @@ impl History {
         let Some(leaf) = &mut self.leaf else { return Vec::new() };
         let mut found = leaf.layout.take_uncovered();
         found.extend(leaf.earlier.iter_mut().flat_map(|(_, layout)| layout.take_uncovered()));
+        found
+    }
+
+    /// Takes the word list of a script, for the versions shown from now on. Returns whether lines of the
+    /// one that shows may now end elsewhere.
+    pub fn add_word_list(&mut self, list: WordList, data: &Rc<[u8]>) -> bool {
+        if !self.lists.keep(list, data) {
+            return false;
+        }
+        let Some(leaf) = &mut self.leaf else { return false };
+        let earlier = leaf.earlier.as_mut().is_some_and(|(_, layout)| layout.add_word_list(list, data));
+        let shown = leaf.layout.add_word_list(list, data) || earlier;
+        leaf.estimated |= shown;
+        if let Some((_, spare, _)) = &mut leaf.spare {
+            spare.add_word_list(list, data);
+        }
+        shown
+    }
+
+    /// The scripts the versions were set in without their word list since this was last asked.
+    pub fn take_unlisted(&mut self) -> Vec<WordList> {
+        let Some(leaf) = &mut self.leaf else { return Vec::new() };
+        let mut found = leaf.layout.take_unlisted();
+        found.extend(leaf.earlier.iter_mut().flat_map(|(_, layout)| layout.take_unlisted()));
         found
     }
 
@@ -1482,15 +1510,15 @@ impl History {
 
 impl Leaf {
     /// A version to show: `later`, as it read or as it differs from `earlier`. `captions` are what the
-    /// lines in its bands say. `last` is the version that showed until now, and `backup` the faces of the
-    /// system for a layout that is made new.
+    /// lines in its bands say. `last` is the version that showed until now, and `late` what a layout that
+    /// is made new is handed: the faces of the system and the word lists.
     fn new(
         between: (Option<Revision>, Revision),
         earlier: Option<&(Document, Style)>,
         later: &(Document, Style),
         captions: [[String; 2]; 2],
         last: Option<Self>,
-        backup: &Fonts,
+        late: (&Fonts, &WordLists),
     ) -> Self {
         let (doc, found) = match earlier {
             Some((earlier, _)) => compare(earlier, &later.0),
@@ -1511,7 +1539,8 @@ impl Leaf {
             }
             None => {
                 let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
-                layout.add_fallback_fonts(backup);
+                layout.add_fallback_fonts(late.0);
+                late.1.hand(&mut layout);
                 // Nothing has a caret here, so a formula is typeset and never shows its source.
                 layout.set_formula_source(false);
                 (layout, None)

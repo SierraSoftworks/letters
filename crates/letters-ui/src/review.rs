@@ -13,9 +13,10 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 
 use accesskit::{Node, NodeId};
-use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split, Uncovered, Window};
+use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split, Uncovered, Window, WordList};
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Note, NoteKind, Pos, Selection, Style, Version};
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 
@@ -30,6 +31,7 @@ use crate::threads;
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::widgets::{Banner, Button, Tone};
 use crate::window::Message;
+use crate::words::WordLists;
 
 /// The room at the head of a version for the line that says whose it is, the room under its text, and
 /// the room between its frame and what the page has above it.
@@ -115,6 +117,8 @@ pub(crate) struct Review {
     open: Option<Open>,
     /// The faces of the system that back the fonts up, for a conflict opened after they came.
     backup: Fonts,
+    /// The word lists, for a conflict opened after they came.
+    lists: WordLists,
     /// What can be pressed, where it shows in the page area.
     hot: Vec<(Rect, Press)>,
     /// Where the held-back version shows in the page area, which the page has nothing under.
@@ -226,6 +230,7 @@ impl Review {
         if !self.open.as_ref().is_some_and(same) {
             let mut open = Open::new(note, versions, doc, page, self.traded.get(&note.id));
             open.first.add_fallback_fonts(&self.backup);
+            self.lists.hand(&mut open.first);
             open.seen = selection.cloned();
             self.open = Some(open);
         }
@@ -275,6 +280,18 @@ impl Review {
     /// The characters the version held back showed without a glyph since this was last asked.
     pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
         self.open.as_mut().map(|open| open.first.take_uncovered()).unwrap_or_default()
+    }
+
+    /// Takes the word list of a script, for the version that is held back. Returns whether its lines may
+    /// now end elsewhere.
+    pub fn add_word_list(&mut self, list: WordList, data: &Rc<[u8]>) -> bool {
+        let kept = self.lists.keep(list, data);
+        self.open.as_mut().filter(|_| kept).is_some_and(|open| open.first.add_word_list(list, data))
+    }
+
+    /// The scripts the version held back was set in without their word list since this was last asked.
+    pub fn take_unlisted(&mut self) -> Vec<WordList> {
+        self.open.as_mut().map(|open| open.first.take_unlisted()).unwrap_or_default()
     }
 
     /// The page as the open conflict splits it, in a page area `room` wide: counted from the top of what
