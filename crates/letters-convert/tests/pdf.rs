@@ -3,7 +3,7 @@
 
 use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::object::{Array, Dict};
-use letters_convert::{PdfInfo, to_pdf};
+use letters_convert::{PdfInfo, to_pdf, to_pdf_with};
 use letters_layout::Fonts;
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Run, Style};
 
@@ -65,4 +65,31 @@ fn links_lead_out_of_the_document_and_references_to_their_figures() {
     let inner: Vec<usize> = links.iter().filter_map(sheet).collect();
     assert_eq!(inner.len(), 1, "the reference");
     assert!(inner[0] > 0, "the reference leads to the sheet its figure is on, not to its own");
+}
+
+#[test]
+fn a_shell_backs_the_fonts_up_for_what_they_lack() {
+    // The body's family alone, which draws no card suit. The code face does, and stands for a system's.
+    let bundled = letters_fonts::bundled();
+    let (body, system) = (Fonts { faces: bundled[..2].to_vec() }, Fonts { faces: bundled[2..3].to_vec() });
+    let cases = [("what the fonts cover", "Rates change in January.", vec![]), ("a card suit", "♠ Spades", vec!['♠'])];
+    for (name, text, lacking) in cases {
+        let doc = Document { blocks: vec![Block::text("a", BlockKind::Paragraph, text)], ..Document::default() };
+        let faces = |bytes: Vec<u8>| {
+            let pdf = Pdf::new(bytes).expect("a reader can open the PDF");
+            pdf.pages()[0].resources().fonts.keys().count()
+        };
+        let plain = to_pdf(&doc, &Style::default(), body.clone(), &mut |_| None, &PdfInfo::default()).unwrap();
+
+        let mut asked = Vec::new();
+        let mut backups = |lacking: &[letters_layout::Uncovered]| {
+            asked.push(lacking.iter().map(|missing| missing.ch).collect::<Vec<_>>());
+            system.clone()
+        };
+        let info = PdfInfo::default();
+        let backed = to_pdf_with(&doc, &Style::default(), body.clone(), &mut |_| None, &info, &mut backups).unwrap();
+        let expected: Vec<Vec<char>> = if lacking.is_empty() { vec![] } else { vec![lacking.clone()] };
+        assert_eq!(asked, expected, "{name}: asked once, for what is lacking alone");
+        assert_eq!(faces(backed) - faces(plain), lacking.len(), "{name}: the face that draws it is embedded");
+    }
 }
