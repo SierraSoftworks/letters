@@ -23,6 +23,8 @@ letters-layout = { workspace = true, features = ["dictionaries"] }
 letters-trust.workspace = true
 letters-spell.workspace = true
 letters-frame.workspace = true
+letters-api.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 winit.workspace = true
@@ -34,6 +36,7 @@ fontdb.workspace = true
 trash.workspace = true
 skrifa.workspace = true
 getrandom.workspace = true
+sha2.workspace = true
 jiff.workspace = true
 encoding_rs.workspace = true
 toml_edit.workspace = true

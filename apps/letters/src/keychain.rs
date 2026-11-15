@@ -51,7 +51,7 @@ impl From<Error> for Unkept {
 }
 
 /// The keychain sign-ins are kept in. One for the whole app.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Keychain(());
 
 impl Keychain {
