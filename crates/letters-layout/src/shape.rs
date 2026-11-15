@@ -71,6 +71,7 @@ impl Shaper {
             brush: Brush::default(),
             underline: false,
             strike: false,
+            locale: None,
         };
         let runs = if text.is_empty() { Vec::new() } else { vec![(0, 0..text.len())] };
         engine.build(text, &[spec], &runs, None, layout);

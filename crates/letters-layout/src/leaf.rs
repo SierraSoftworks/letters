@@ -123,6 +123,8 @@ pub(crate) struct Source<'a> {
     /// The formula of this text that the caret is in.
     pub open: Option<Open<'a>>,
     pub page: Page<'a>,
+    /// The language its block names, or takes from the blocks around it.
+    pub lang: Option<Language>,
 }
 
 /// The formula the caret is in.
@@ -170,6 +172,7 @@ impl<'a> Source<'a> {
             formula: leaf.what == What::Formula,
             open,
             page,
+            lang: leaf.words.lang.or(leaf.lang),
         }
     }
 
@@ -186,6 +189,7 @@ impl<'a> Source<'a> {
             formula: false,
             open,
             page,
+            lang: cell.words.lang.or(leaf.lang),
         }
     }
 }
@@ -215,16 +219,21 @@ fn build(
     let always = if source.bold { marks::BOLD } else { 0 };
     let mut specs: Vec<Spec<'_>> = Vec::with_capacity(spans.len().max(1));
     let mut runs = Vec::with_capacity(spans.len().max(1));
-    // One spec per distinct set of marks, however many spans share it.
-    let mut slots = [u16::MAX; 256];
-    let mut slot = |bits: u8| {
+    // A stretch is in its own language, or else its block's, or else the document's.
+    let locale = source.lang.or(locale);
+    // One spec per distinct set of marks and language, however many spans share it.
+    let mut slots: Vec<(u8, u8)> = Vec::new();
+    let mut slot = |bits: u8, lang: u8| {
         let bits = bits | always;
-        let slot = &mut slots[usize::from(bits)];
-        if *slot == u16::MAX {
-            *slot = specs.len() as u16;
-            specs.push(marked(of, code, source.role == Role::Code, source.ink, bits));
-        }
-        *slot
+        let known = slots.iter().position(|slot| *slot == (bits, lang));
+        let at = known.unwrap_or_else(|| {
+            let spec = marked(of, code, source.role == Role::Code, source.ink, bits);
+            let locale = lang.checked_sub(1).and_then(|at| source.words.langs.get(usize::from(at))).copied();
+            specs.push(Spec { locale, ..spec });
+            slots.push((bits, lang));
+            slots.len() - 1
+        });
+        at as u16
     };
     set.swaps.clear();
     set.open = None;
@@ -234,11 +243,11 @@ fn build(
     if !swapped && !source.formula && source.label.is_none() {
         let mut start = 0;
         for span in spans {
-            runs.push((slot(span.marks & !marks::MATH), start..span.end));
+            runs.push((slot(span.marks & !marks::MATH, span.lang), start..span.end));
             start = span.end;
         }
         if spans.is_empty() {
-            let plain = slot(0);
+            let plain = slot(0, 0);
             runs.extend((!text.is_empty()).then_some((plain, 0..text.len())));
         }
         set.shown = None;
@@ -253,9 +262,9 @@ fn build(
         shown.push_str(label);
         shown.push(' ');
         set.swaps.push(Swap { source: 0..0, shown: 0..shown.len(), maths: None, kept: None });
-        runs.push((slot(0), 0..shown.len()));
+        runs.push((slot(0, 0), 0..shown.len()));
     }
-    let whole = [flow::Span { end: text.len(), marks: if source.formula { marks::MATH } else { 0 } }];
+    let whole = [flow::Span { end: text.len(), marks: if source.formula { marks::MATH } else { 0 }, lang: 0 }];
     let color = source.page.color;
     let like = Maths { size: of.size * TEXT_RATIO, color, display: source.formula, links: engine.links };
     let (mut start, mut formulas) = (0, 0..);
@@ -305,12 +314,12 @@ fn build(
             }
         }
         if shown.len() > from {
-            runs.push((slot(bits), from..shown.len()));
+            runs.push((slot(bits, span.lang), from..shown.len()));
         }
         start = span.end;
     }
     if runs.is_empty() {
-        slot(0);
+        slot(0, 0);
     }
     engine.build_with(&shown, &specs, &runs, &boxes, by_words, locale, &mut set.layout);
     set.shown = Some(shown);
