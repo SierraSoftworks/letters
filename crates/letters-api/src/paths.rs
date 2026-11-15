@@ -151,7 +151,11 @@ pub fn link(id: &str, link: &str) -> String {
     format!("{}/links/{}", document(id), segment(link))
 }
 
-/// `GET`: the document's access log as [`Access`](crate::Access) rows, newest first.
+/// `GET`: the document's access log as [`Access`](crate::Access) rows, newest first, for whoever may say
+/// who the document is shared with. `?limit=<n>` asks for so many rows: 200 unless asked, and never more
+/// than 1000. `?before=<time>` asks for the rows from before a row's [`Access::time`], which is how the
+/// next page is asked for: a page runs over its limit to end between two seconds, so none is missed. How
+/// long a row is kept is [`Server::log_days`](crate::Server::log_days).
 pub fn access(id: &str) -> String {
     format!("{}/access", document(id))
 }

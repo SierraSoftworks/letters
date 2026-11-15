@@ -7,47 +7,16 @@ use std::net::SocketAddr;
 
 use axum::http::{Method, StatusCode};
 use common::desk::{Desk, settle};
-use common::{Browser, Client, Raw, START, Server, URL, texts};
+use common::{Browser, Client, START, Server, URL, follow, let_in, link, planned, texts};
 use letters_api::{
-    Allows, Code, CreatedLink, Entry, Error, Fetch, Grant, Grantee, Listing, NewLink, Opened, Rename, Role, Shares,
-    Tag, Trust, paths,
+    Allows, Code, CreatedLink, Entry, Error, Fetch, Listing, NewLink, Opened, Rename, Role, Shares, Tag, Trust, paths,
 };
 use letters_sync::Link::Live;
-
-fn link(label: &str, role: Role) -> NewLink {
-    NewLink { label: label.into(), role, expires: None, passphrase: None, allows: Allows::default() }
-}
-
-/// A server that makes links, where Ada has "Plan" in her own space and shares it with Ben to edit: the
-/// server, Ada, Ben, and the document's id.
-async fn planned(name: &str) -> (Server, Client, Client, String) {
-    let server = Server::linking(name);
-    let (ada, ben) = (server.person("ada", &[]), server.person("ben", &[]));
-    let id = ada.start("home", "", "Plan").await.id.expect("a document has an id");
-    let to = Grantee::Person { id: "sub-ben".into(), name: String::new() };
-    let people = vec![Grant { to, role: Role::Editor }];
-    ada.put::<Shares>(&paths::shares(&id), &Shares { people, links: Vec::new() }).await.unwrap();
-    (server, ada, ben, id)
-}
 
 /// How many links the row of Ada's document says lead to it.
 async fn counted(ada: &Client) -> Option<u32> {
     let own: Listing = ada.get(&paths::entries("home", "")).await.unwrap();
     own.entries[0].tags.iter().find_map(|tag| if let Tag::Links { count } = tag { Some(*count) } else { None })
-}
-
-/// Follows a link's address with a browser.
-async fn follow(browser: &mut Browser, made: &CreatedLink) -> Raw {
-    browser.get(made.url.strip_prefix(URL).expect("the address is this server's")).await
-}
-
-/// Ada makes a link to the document and a browser nobody is signed in with follows it.
-async fn let_in(server: &Server, ada: &Client, id: &str, new: &NewLink) -> (Browser, CreatedLink) {
-    let made: CreatedLink = ada.post(&paths::links(id), new).await.unwrap();
-    let mut browser = server.visitor();
-    let door = follow(&mut browser, &made).await;
-    assert_eq!(door.location(), paths::editor_page(id), "the link lets its reader in: {}", door.status);
-    (browser, made)
 }
 
 /// Whether the document opens trusted in a browser.

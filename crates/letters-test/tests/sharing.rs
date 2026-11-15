@@ -93,7 +93,7 @@ fn guest(label: &str) -> Who {
 /// Something done to the plan through a share, so long before noon.
 fn reach(ago: u64, who: Who, action: Action, role: Grade) -> Reach {
     let (address, browser) = ("203.0.113.7".into(), "Firefox on Linux".into());
-    Reach { time: NOON - ago, who, action, role, refused: false, address, browser }
+    Reach { time: NOON - ago, who, link: None, action, role, refused: false, lasted: None, address, browser }
 }
 
 /// The plan's log, newest first: two entries today, one yesterday, two on Thursday and one in October.

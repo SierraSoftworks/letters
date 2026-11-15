@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Answer, Refusal};
 use crate::ids::{self, hashed, secret};
+use crate::links::Caller;
 use crate::store::{Batch, StoreError, Table};
 use crate::{App, Shared};
 
@@ -187,6 +188,9 @@ pub struct Signed {
     /// The link that let the request's browser in to the document the request is about. Only a
     /// [`Reader`] has one.
     pub link: Option<Linked>,
+    /// Where the request came from, for the access log. Nothing is known of one that was not read
+    /// from a request.
+    pub from: Caller,
 }
 
 /// A link that let a browser in to its document.
@@ -233,6 +237,7 @@ impl Signed {
             session: named,
             ends,
             link: None,
+            from: Caller::default(),
         })
     }
 
@@ -275,6 +280,7 @@ impl Reader {
                     session: guest.visit,
                     ends,
                     link: Some(linked),
+                    from: Caller::default(),
                 }))
             }
             (Err(refusal), _) => Err(refusal),
@@ -292,7 +298,9 @@ impl FromRequestParts<Shared> for Signed {
     type Rejection = Refusal;
 
     async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Refusal> {
-        Self::read(app, &parts.method, &parts.headers)
+        let mut who = Self::read(app, &parts.method, &parts.headers)?;
+        who.from = Caller::of(parts, app);
+        Ok(who)
     }
 }
 
@@ -307,6 +315,8 @@ impl FromRequestParts<Shared> for Reader {
 
     async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Refusal> {
         let id = named_document(parts, app).await;
-        Self::read(app, &parts.method, &parts.headers, id.as_deref())
+        let mut reader = Self::read(app, &parts.method, &parts.headers, id.as_deref())?;
+        reader.0.from = Caller::of(parts, app);
+        Ok(reader)
     }
 }

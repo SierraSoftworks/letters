@@ -21,13 +21,15 @@ use std::sync::{Mutex, PoisonError};
 
 use argon2::Argon2;
 use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
+use axum::http::header::USER_AGENT;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, post};
 use axum::{Json, Router};
-use letters_api::{Code, CreatedLink, Link, NewLink, Role, paths};
+use letters_api::{Action, Code, CreatedLink, Link, NewLink, Role, paths};
 use serde::{Deserialize, Serialize};
 
+use crate::access::Reach;
 use crate::api::blocking;
 use crate::error::{Answer, Refusal};
 use crate::ids::{self, hashed, secret};
@@ -143,9 +145,12 @@ impl Doors {
 }
 
 /// Where a request came from, as far as the server can tell.
+#[derive(Clone, Debug, Default)]
 pub struct Caller {
     /// The address of the browser. Empty when the server was not told one.
     pub address: String,
+    /// The browser or the app, as it names itself.
+    pub browser: String,
 }
 
 impl Caller {
@@ -163,7 +168,8 @@ impl Caller {
             (Some(peer), _) => peer.to_string(),
             (None, _) => String::new(),
         };
-        Self { address }
+        let named = parts.headers.get(USER_AGENT).and_then(|value| value.to_str().ok()).unwrap_or_default();
+        Self { address, browser: named.chars().take(LONGEST).collect() }
     }
 }
 
@@ -316,28 +322,41 @@ impl App {
     }
 
     /// The link the secret in an address leads to, while it works. Whatever else an address holds leads
-    /// nowhere, and is told no more than that.
-    fn follow(&self, token: &str) -> Answer<(Leads, Kept)> {
+    /// nowhere, and is told no more than that. The document's log is told of a link that has run out.
+    fn follow(&self, token: &str, caller: &Caller) -> Answer<(Leads, Kept)> {
         let nowhere = || Refusal::new(Code::NotFound, "This link does not work, or no longer does.");
         // A server whose owner turned links off again follows none.
         let leads = self.store.get(&TOKENS, &hashed(token))?.filter(|_| self.config.links.enabled);
         let leads = leads.ok_or_else(nowhere)?;
         let key = format!("{}{}", under(&leads.document, &leads.root), leads.link);
-        let kept = self.store.get(&LINKS, &key)?.filter(|kept| kept.live(self.now())).ok_or_else(nowhere)?;
+        let kept = self.store.get(&LINKS, &key)?.ok_or_else(nowhere)?;
+        if !kept.live(self.now()) {
+            self.turned_away(&leads, &kept, caller);
+            return Err(nowhere());
+        }
         Ok((leads, kept))
     }
 
-    /// Follows the link in an address for the browser at `address`, with the passphrase it tried when it
-    /// tried one.
-    pub fn enter(&self, token: &str, tried: Option<&str>, address: &str) -> Answer<Door> {
+    /// Notes in the document's log that its link opened nothing for whoever tried it.
+    fn turned_away(&self, leads: &Leads, kept: &Kept, caller: &Caller) {
+        let reach = Reach::of_link(&leads.document, &leads.root, &kept.link, caller);
+        self.noted(&reach, Action::Open, true);
+    }
+
+    /// Follows the link in an address for the browser `caller` tells of, with the passphrase it tried
+    /// when it tried one.
+    pub fn enter(&self, token: &str, tried: Option<&str>, caller: &Caller) -> Answer<Door> {
         let now = self.now();
-        if !self.doors.spend(address, if tried.is_some() { TRY } else { 1 }, now) {
+        if !self.doors.spend(&caller.address, if tried.is_some() { TRY } else { 1 }, now) {
             return Err(Refusal::new(Code::Slow, "Too many tries from here. Wait a minute, and try again."));
         }
-        let (leads, kept) = self.follow(token)?;
+        let (leads, kept) = self.follow(token, caller)?;
         match tried {
             None if kept.asks.is_some() => return Ok(Door::Asks { wrong: false }),
-            Some(tried) if !kept.admits(tried) => return Ok(Door::Asks { wrong: true }),
+            Some(tried) if !kept.admits(tried) => {
+                self.turned_away(&leads, &kept, caller);
+                return Ok(Door::Asks { wrong: true });
+            }
             _ => {}
         }
         let secret = secret();

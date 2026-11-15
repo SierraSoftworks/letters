@@ -21,13 +21,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use letters_api::{Code, Role};
+use letters_api::{Action, Code, Role};
 use letters_format::{ASSETS, Archive, Error, Files, Save, Saved, Unsaved, WorkingCopy, is_journal};
 use letters_model::ReplicaId;
-use letters_sync::{Access, LOOK_EVERY, Outbound, Refusal as Ended, Room, SessionId};
+use letters_sync::{Access, ClientMessage, LOOK_EVERY, Outbound, Refusal as Ended, Room, SessionId};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 
+use crate::access::Reach;
 use crate::api::{Found, blocking};
 use crate::error::{Answer, Refusal};
 use crate::ids;
@@ -153,6 +154,8 @@ struct Seated {
     /// Whether a share had a say in what the session may do. Such a session joins again when the
     /// document's shares change.
     lent: bool,
+    /// How the document's access log knows the session, when a share or a link led it here.
+    reach: Option<Reach>,
 }
 
 /// One device's place in a room. Dropping it leaves the room.
@@ -785,15 +788,16 @@ impl App {
         let (app, who, id) = (self.clone(), who.clone(), id.to_owned());
         blocking(move || {
             let found = app.locate(&who, &id)?;
-            app.seat(&who, &found)
+            app.seat(&who, &found, &id)
         })
         .await
     }
 
     /// Seats `who` in the room of a document they were found to reach.
-    fn seat(self: &Arc<Self>, who: &Signed, found: &Found) -> Answer<(Seat, mpsc::Receiver<Out>)> {
+    fn seat(self: &Arc<Self>, who: &Signed, found: &Found, id: &str) -> Answer<(Seat, mpsc::Receiver<Out>)> {
         let access = Access { role: may(found.role), name: self.signs_as(who)? };
         let lent = found.space.as_ref().is_none_or(|space| space.role < found.role);
+        let reach = self.reached(who, found, id);
         let (to, from) = mpsc::channel(BACKLOG);
         let (signed, person) = (who.session.clone(), who.person.username.clone());
         let (open, session) = self.rooms.within(self, &found.root, &found.place, |hosted, now| {
@@ -801,7 +805,7 @@ impl App {
                 return Err(Refusal::not_found());
             }
             let session = hosted.room.join(access, now);
-            hosted.seats.insert(session, Seated { to, signed, person, lent });
+            hosted.seats.insert(session, Seated { to, signed, person, lent, reach });
             Ok(session)
         })?;
         Ok((Seat { app: self.clone(), open, session, left: false, until: found.until }, from))
@@ -819,9 +823,20 @@ impl Seat {
 
     /// A binary message came from the device.
     pub async fn received(&self, frame: Vec<u8>) {
+        let app = self.app.clone();
         let heard = self.inside(move |hosted, session, now| {
-            if let Err(error) = hosted.room.received(session, &frame, &mut hosted.state, now) {
-                log(&format!("a room could not journal an edit, which waits for the next save: {error}"));
+            match hosted.room.received(session, &frame, &mut hosted.state, now) {
+                // What a share or a link let someone write is noted: a comment, or a session of edits.
+                Ok(true) => {
+                    if let Some(reach) = hosted.seats.get(&session).and_then(|seated| seated.reach.as_ref()) {
+                        let notes = matches!(ClientMessage::decode(&frame), Ok(Some(ClientMessage::Notes { .. })));
+                        app.noted(reach, if notes { Action::Comment } else { Action::Edit }, false);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    log(&format!("a room could not journal an edit, which waits for the next save: {error}"));
+                }
             }
             if hosted.room.unreadable(session) >= UNREADABLE {
                 let person = hosted.seats.get(&session).map_or("someone", |seated| seated.person.as_str());

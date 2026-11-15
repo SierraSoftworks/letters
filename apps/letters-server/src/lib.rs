@@ -17,6 +17,7 @@
 //! A document's content lives in its `.let` file alone. Whatever else writes that file, over a share or
 //! with a sync tool, is another writer like the server, and the save in `letters_format` merges with it.
 
+pub mod access;
 pub mod api;
 pub mod auth;
 pub mod config;
@@ -40,6 +41,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::serve::ListenerExt;
 use letters_api::{Person, Role, Space};
 
+use crate::access::Log;
 use crate::config::Config;
 use crate::error::{Answer, Refusal};
 use crate::fetch::{Fetches, Roots};
@@ -67,6 +69,8 @@ pub struct App {
     pub fetches: Fetches,
     /// What following share links has cost each address of late.
     pub doors: Doors,
+    /// What the access logs noted of late.
+    pub log: Log,
     clock: Clock,
 }
 
@@ -77,8 +81,8 @@ impl App {
         let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
         let (provider, rooms) = (Provider::new(&config), Rooms::new(&config.server.state));
         let (editor, fetches) = (Editor::compiled(), Fetches::new(Roots::System));
-        let (library, doors) = (Library::new(), Doors::default());
-        Self { config, store, library, provider, rooms, editor, fetches, doors, clock: Box::new(clock) }
+        let (library, doors, log) = (Library::new(), Doors::default(), Log::default());
+        Self { config, store, library, provider, rooms, editor, fetches, doors, log, clock: Box::new(clock) }
     }
 
     /// The same server taking another word on who a site is, for tests against a site of their own.

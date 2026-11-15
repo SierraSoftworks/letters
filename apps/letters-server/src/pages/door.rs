@@ -43,7 +43,7 @@ pub async fn tried(
 async fn knock(app: Shared, caller: Caller, token: String, tried: Option<String>) -> Response {
     let door = blocking({
         let (app, token) = (app.clone(), token.clone());
-        move || app.enter(&token, tried.as_deref(), &caller.address)
+        move || app.enter(&token, tried.as_deref(), &caller)
     });
     let mut response = match door.await {
         Ok(Door::Open { document, cookie: name, secret, life }) => {

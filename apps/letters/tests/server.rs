@@ -199,9 +199,11 @@ impl Letters {
             "GET /api/v1/documents/d1/access" => json(&[Access {
                 time: 3,
                 who: Who::Link { id: "link-1".into(), label: "Accountant".into() },
+                link: None,
                 action: Action::Open,
                 role: Role::Reader,
                 refused: false,
+                lasted: None,
                 address: "192.0.2.7".into(),
                 browser: "Firefox".into(),
             }]),

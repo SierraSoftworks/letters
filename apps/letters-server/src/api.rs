@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use letters_api::{
-    Allows, Code, Entry, EntryKind, Fetch, Listing, Move, NewDocument, NewFolder, Opened, PROTOCOL, Person, Preview,
-    Rename, Renewal, Role, Server, Settings, Space, Tag, Token, Trust, paths,
+    Action, Allows, Code, Entry, EntryKind, Fetch, Listing, Move, NewDocument, NewFolder, Opened, PROTOCOL, Person,
+    Preview, Rename, Renewal, Role, Server, Settings, Space, Tag, Token, Trust, paths,
 };
 use letters_format::{ASSETS, MIMETYPE, NOTES, STYLE, file_name};
 use letters_model::{Document, Style};
@@ -85,6 +85,7 @@ async fn server(State(app): State<Shared>) -> Json<Server> {
         version: env!("CARGO_PKG_VERSION").into(),
         protocols: vec![PROTOCOL],
         links: app.config.links.enabled,
+        log_days: crate::access::KEPT_DAYS,
         limits: letters_api::Limits::default(),
     })
 }
@@ -176,6 +177,11 @@ async fn document(State(app): State<Shared>, Reader(who): Reader, Path(id): Path
 async fn file(State(app): State<Shared>, Reader(who): Reader, Path(id): Path<String>) -> Answer<Response> {
     let (name, bytes) = blocking(move || {
         let found = app.locate(&who, &id)?;
+        // The app keeps a copy of what it has open and asks for the file to keep it whole: that is part of
+        // its opening the document. A browser that asks takes the file away.
+        if who.carrier == Carrier::Cookie {
+            app.note(&who, &found, &id, Action::Download, !found.allows.download);
+        }
         if !found.allows.download {
             return Err(Refusal::forbidden("This link does not let its reader take the file away."));
         }
@@ -612,6 +618,7 @@ impl App {
         };
         let (style, notes) = (json(&mut archive, STYLE)?, json(&mut archive, NOTES)?);
         self.note_opened(who, &manifest.id)?;
+        self.note(who, &found, &manifest.id, Action::Open, false);
         let opened = Opened {
             id: manifest.id.clone(),
             created: manifest.created,
@@ -697,6 +704,7 @@ fn entry(row: &Row, role: Role) -> Entry {
 
 /// The routes with their state, for the server and for tests.
 pub fn router(app: Arc<App>) -> Router {
-    let routes = routes().merge(crate::shares::routes()).merge(crate::links::routes()).merge(crate::socket::routes());
+    let routes = routes().merge(crate::shares::routes()).merge(crate::links::routes());
+    let routes = routes.merge(crate::access::routes()).merge(crate::socket::routes());
     routes.merge(crate::auth::routes()).merge(crate::pages::routes()).with_state(app)
 }

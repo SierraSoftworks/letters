@@ -3,7 +3,7 @@
 
 use letters_api::{
     Access, Action, Allows, Code, Entry, EntryKind, Error, Grant, Grantee, Limits, Link, Listing, NewLink, Opened,
-    PROTOCOL, Person, Role, Server, Settings, Shares, Space, SpaceKind, Tag, Token, Trust, Who, paths,
+    PROTOCOL, Person, Role, Server, Settings, Shares, Space, SpaceKind, Tag, Token, Trust, Via, Who, paths,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -57,6 +57,7 @@ fn every_body_reads_back_as_written() {
         version: "0.1.0".into(),
         protocols: vec![PROTOCOL],
         links: true,
+        log_days: 365,
         limits: Limits::default(),
     });
     round_trip(&Token { token: "t".into(), expires: 10, renew: "r".into(), ends: 20, person: person() });
@@ -99,9 +100,22 @@ fn every_body_reads_back_as_written() {
     round_trip(&Access {
         time: 5,
         who: Who::Link { id: "l1".into(), label: "Accountant".into() },
+        link: None,
         action: Action::Download,
         role: Role::Reader,
         refused: true,
+        lasted: None,
+        address: "203.0.113.9".into(),
+        browser: "Firefox".into(),
+    });
+    round_trip(&Access {
+        time: 6,
+        who: Who::Person { id: "p1".into(), name: "Carol".into() },
+        link: Some(Via { id: "l1".into(), label: "Accountant".into() }),
+        action: Action::Edit,
+        role: Role::Editor,
+        refused: false,
+        lasted: Some(720),
         address: "203.0.113.9".into(),
         browser: "Firefox".into(),
     });
@@ -146,6 +160,7 @@ fn a_server_of_another_kind_or_version_is_told_apart() {
         version: String::new(),
         protocols,
         links: false,
+        log_days: 0,
         limits: Limits::default(),
     };
     assert!(server(Server::PRODUCT, vec![PROTOCOL]).speaks());
