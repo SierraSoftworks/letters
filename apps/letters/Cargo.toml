@@ -20,6 +20,7 @@ letters-format.workspace = true
 letters-convert.workspace = true
 letters-fonts.workspace = true
 letters-layout.workspace = true
+letters-trust.workspace = true
 serde_json.workspace = true
 
 winit.workspace = true

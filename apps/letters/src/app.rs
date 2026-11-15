@@ -38,6 +38,7 @@ use crate::library::{Library, Place, Recent, Refused, UNTITLED, has_content};
 use crate::measure::{FIRST_FRAME, Launch, Typing};
 use crate::platform::{self, Desktop};
 use crate::present::{Painter, Presenter};
+use crate::trust::{self, Trusted};
 use crate::words::{self, Words};
 
 const MAC: bool = cfg!(target_os = "macos");
@@ -94,6 +95,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         platform: Desktop::new().with_words(Words::of(&home)),
         library: Library::of(&home),
         words: Words::of(&home),
+        trust: trust::store(&home),
         reduced_motion: false,
         gpu: match std::env::var("LETTERS_RENDERER").as_deref() {
             Ok("cpu") => GpuState::Off,
@@ -200,6 +202,7 @@ struct App {
     platform: Desktop,
     library: Library,
     words: Words,
+    trust: Trusted,
     /// Whether the desktop asked for less motion. Asked once, after the first frame.
     reduced_motion: bool,
     gpu: GpuState,
@@ -259,6 +262,11 @@ struct DocWindow {
     words_seen: words::Stamp,
     /// Whether the primary button went down as a secondary one, as it does with Control held on a Mac.
     menu_press: bool,
+    /// Whether the document was made in this window, which is what makes it trusted from the start.
+    made_here: bool,
+    /// The id of a document made here that has just been written for the first time, for the app to
+    /// record as trusted wherever its file goes.
+    vouch: Option<String>,
     /// The view's edit count that is safely on disk.
     saved_edits: u64,
     /// The edit count a save was last planned for.
@@ -576,6 +584,7 @@ impl DocWindow {
         self.relist(library);
         if first && let Some(path) = &self.listed {
             self.view.set_saved_in(&library.shown(path.parent().unwrap_or(Path::new(""))));
+            self.vouch = self.copy.as_ref().filter(|_| self.made_here).map(|copy| copy.id.clone());
         }
         self.relocate(library);
         self.sent = Some(revision);
@@ -661,6 +670,7 @@ impl App {
         opened: Option<Opened>,
         landing: bool,
     ) -> Result<(), Box<dyn Error>> {
+        let made_here = opened.is_none();
         let (document, style, place, rest) = match opened {
             Some(Opened { document, style, home, rest }) => (document, style, Place::at(home), rest),
             None => {
@@ -697,6 +707,8 @@ impl App {
             located: None,
             words_seen: None,
             menu_press: false,
+            made_here,
+            vouch: None,
             saved_edits: 0,
             noticed_edits: 0,
             save_at: None,
@@ -849,9 +861,21 @@ impl App {
         }
     }
 
+    /// Records the documents made here that have just been written, so that they stay trusted wherever
+    /// their files go.
+    fn vouch(&mut self) {
+        for id in self.windows.values_mut().filter_map(|window| window.vouch.take()) {
+            if let Err(error) = self.trust.trust_document(&id) {
+                eprintln!("letters: could not record a new document as trusted: {error}");
+            }
+        }
+    }
+
     fn close(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
         // Nothing is asked at closing: the document is saved, and stays open only if that fails.
-        if self.windows.get_mut(&id).is_some_and(|window| window.save_or_say(false, &self.library)) {
+        let saved = self.windows.get_mut(&id).is_some_and(|window| window.save_or_say(false, &self.library));
+        self.vouch();
+        if saved {
             self.windows.remove(&id);
         }
         if self.windows.is_empty() {
@@ -907,6 +931,10 @@ impl ApplicationHandler<Event> for App {
                     if self.report_launch {
                         println!("{FIRST_FRAME}\n{}", launch.report());
                         return event_loop.exit();
+                    }
+                    // What the person trusts is in a file, which the first frame did not need either.
+                    if let Err(error) = self.trust.load() {
+                        eprintln!("letters: nothing is trusted, since {error}");
                     }
                     // The desktop is asked over D-Bus, which is not worth holding a frame for.
                     let proxy = self.proxy.clone();
@@ -1109,12 +1137,14 @@ impl ApplicationHandler<Event> for App {
                 eprintln!("letters: {error}");
             }
         }
+        self.vouch();
     }
 
     /// Runs after each batch of events: starts due saves and sleeps until the next thing is due.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         let now_ms = self.platform.now_ms();
+        self.vouch();
         let mut next: Option<Instant> = None;
         for window in self.windows.values_mut() {
             if window.wake_ms.is_some_and(|wake| wake <= now_ms) {
