@@ -2668,14 +2668,17 @@ impl EditorApp {
         sheets
     }
 
-    /// What a key does while Print view shows: it moves through the sheets, prints, takes a change back
-    /// or goes back to editing. Nothing is written there.
+    /// What a key does while Print view shows: it moves through the sheets, starts a page or no longer,
+    /// prints, takes a change back or goes back to editing. Nothing is written there.
     fn print_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
         if event.key == Key::Escape {
-            self.print(Printing::Back, platform);
+            // The keyboard lets go of its place on the sheets before it leaves them.
+            if !self.printing.as_mut().is_some_and(Print::unpick) {
+                self.print(Printing::Back, platform);
+            }
             return true;
         }
-        if self.printing.as_mut().is_some_and(|print| print.key(event)) {
+        if self.break_key(event, platform) || self.printing.as_mut().is_some_and(|print| print.key(event)) {
             return true;
         }
         // A change to the page is an edit, which undo takes back from here too.
@@ -2695,6 +2698,28 @@ impl EditorApp {
             self.update(message, platform);
         }
         bound
+    }
+
+    /// What Tab and Enter do on the sheets: Tab goes to the next place where a page can start or was
+    /// made to, with Shift to the one before, and Enter starts a page there or no longer. Returns whether
+    /// the key was used: past the last place Tab is the window's again, and goes on to the bar.
+    fn break_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        if event.mods.primary || event.mods.alt {
+            return false;
+        }
+        match event.key {
+            Key::Tab => {
+                let pages = self.layout.paginate(&self.editor.model().style().page);
+                let paged = Paged { doc: self.editor.doc(), layout: &self.layout, pages: &pages };
+                self.printing.as_mut().is_some_and(|print| print.walk(event.mods.shift, paged))
+            }
+            Key::Enter if !event.mods.shift => {
+                let Some(asked) = self.printing.as_ref().and_then(Print::picked) else { return false };
+                self.break_pages(asked, platform);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The commands the palette lists: those that what is typed finds and that have something to act on,

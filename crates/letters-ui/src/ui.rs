@@ -63,7 +63,8 @@ pub trait App {
     fn update(&mut self, message: Self::Msg, platform: &mut dyn Platform);
 
     /// Offered every key while the page has focus, and otherwise the shortcuts no element used. `true` uses
-    /// the key.
+    /// the key. The window is described again either way, so a key that is left for the window may still
+    /// change what the app shows.
     fn key(&mut self, _event: &KeyEvent, _platform: &mut dyn Platform) -> bool {
         false
     }
@@ -825,7 +826,7 @@ impl<A: App> Ui<A> {
 
     fn offer(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
         let used = self.app.key(event, platform);
-        self.stale.view |= used;
+        self.stale.view = true;
         used
     }
 
