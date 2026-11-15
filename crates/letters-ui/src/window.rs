@@ -570,6 +570,12 @@ impl Ui<EditorApp> {
         self.app_mut().share.made(created);
     }
 
+    /// Says who reached the document through a share: the rows of the server's access log, newest first.
+    /// It answers [`Request::AccessLog`], and the Share dialog's Activity tab lists them by day.
+    pub fn set_access_log(&mut self, log: Vec<letters_api::Access>) {
+        self.app_mut().share.logged(log);
+    }
+
     /// Says what the person may take away of the document: see [`Allows`]. A shell says it of a document
     /// that a share link opened, from what the link allows. What is withheld is not offered and not done:
     /// nothing of the page goes to the clipboard, no copy is saved or exported, nothing is printed. Print

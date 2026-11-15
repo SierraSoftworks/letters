@@ -7,6 +7,7 @@
 //! - [`Window`] is the editor's window, which the shells and the test harness drive through the same calls.
 
 mod access;
+mod activity;
 mod callouts;
 mod captions;
 mod chrome;
@@ -83,7 +84,7 @@ pub use previews::{LinkPreviewFound, Previewing};
 pub use restyle::StyleEdit;
 pub use safe::SafeMode;
 pub use settings::{Appearance, Settings};
-pub use sharing::{Shared, Sharing, Take};
+pub use sharing::{Shared, Sharing, Tab, Take};
 pub use style::{Align, Dir, Edges, Justify, Look, Ring, Style};
 pub use text::{Family, FixedShaper, FontShaper, GlyphRun, Shaped, Stop, TextShaper, TextStyle};
 pub use theme::Accent;

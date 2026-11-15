@@ -1,7 +1,9 @@
 //! The Share dialog: who a document on a server is shared with, the links made for it, and what the window
 //! asks of the shell.
 
-use letters_api::{Allows, CreatedLink, Grant, Grantee, Link, NewLink, Role as Grade, Shares};
+use letters_api::{
+    Access as Reach, Action, Allows, CreatedLink, Grant, Grantee, Link, NewLink, Role as Grade, Shares, Who,
+};
 use letters_test::{Found, Harness, Role};
 use letters_ui::{Access, Connection, Request, Shared};
 
@@ -76,6 +78,54 @@ fn button(window: &mut Harness, name: &str, about: &str) -> Option<Found> {
 
 /// Something a test does to the window.
 type Does = fn(&mut Harness);
+
+const HOUR: u64 = 3_600;
+const ASKING: &str = "Asking the server who has reached this document.";
+
+fn by(name: &str) -> Who {
+    Who::Person { id: name.to_lowercase(), name: name.into() }
+}
+
+fn guest(label: &str) -> Who {
+    Who::Link { id: label.to_lowercase(), label: label.into() }
+}
+
+/// Something done to the plan through a share, so long before noon.
+fn reach(ago: u64, who: Who, action: Action, role: Grade) -> Reach {
+    let (address, browser) = ("203.0.113.7".into(), "Firefox on Linux".into());
+    Reach { time: NOON - ago, who, action, role, refused: false, address, browser }
+}
+
+/// The plan's log, newest first: two entries today, one yesterday, two on Thursday and one in October.
+fn log() -> Vec<Reach> {
+    vec![
+        reach(HOUR, by("Ben Price"), Action::Edit, Grade::Editor),
+        Reach { refused: true, ..reach(3 * HOUR, guest("Builder"), Action::Download, Grade::Reader) },
+        reach(DAY + 2 * HOUR, by("Carla Diaz"), Action::Comment, Grade::Commenter),
+        reach(3 * DAY, guest("Builder"), Action::Open, Grade::Reader),
+        reach(3 * DAY + HOUR, guest("Builder"), Action::Print, Grade::Reader),
+        reach(20 * DAY, by("Ben Price"), Action::Download, Grade::Editor),
+    ]
+}
+
+/// Opens the dialog on its Activity tab and answers what it asks, as a shell does.
+fn activity(window: &mut Harness, log: Vec<Reach>) {
+    open(window, shared(true, Vec::new()));
+    window.click(Role::Tab, "Activity");
+    window.ui().take_requests();
+    window.ui().set_access_log(log);
+}
+
+/// The names of what the dialog lists under a role, in order.
+fn listed(window: &mut Harness, role: Role) -> Vec<String> {
+    window.controls().into_iter().filter(|found| found.role == role).map(|found| found.name).collect()
+}
+
+/// Which of the dialog's tabs is shown.
+fn shown(window: &mut Harness) -> Vec<String> {
+    let tabs = window.controls().into_iter().filter(|found| found.role == Role::Tab && found.selected == Some(true));
+    tabs.map(|found| found.name).collect()
+}
 
 fn has(window: &mut Harness, role: Role, name: &str) -> bool {
     window.find(role, name).is_some()
@@ -430,4 +480,178 @@ fn sharing_is_for_someone_who_writes_the_document() {
         window.ui().set_access(Access::Edits);
         window.click(Role::Button, "Share").assert_open(Role::Dialog, "Share");
     }
+}
+
+#[test]
+fn the_owner_reads_who_reached_the_document_by_day() {
+    let mut window = plan();
+    open(&mut window, shared(true, vec![link("l1", "Builder")]));
+    assert_eq!(shown(&mut window), ["Access"], "the dialog opens on who may reach the document");
+
+    window.click(Role::Tab, "Activity");
+    assert_eq!(window.ui().take_requests(), [Request::AccessLog]);
+    assert_eq!(shown(&mut window), ["Activity"]);
+    assert!(has(&mut window, Role::Label, ASKING), "the wait is said");
+    assert!(rows(&mut window).is_empty(), "the people are on the other tab");
+    assert!(!has(&mut window, Role::TextInput, "Add a group"));
+
+    window.ui().set_access_log(log());
+    assert!(!has(&mut window, Role::Label, ASKING));
+    assert_eq!(listed(&mut window, Role::List), ["Today", "Yesterday", "Thursday", "26 Oct"]);
+    let said = [
+        "Ben Price started editing",
+        "Guest was refused a download",
+        "Carla Diaz wrote a comment",
+        "Guest opened the document",
+        "Guest printed the document",
+        "Ben Price downloaded a copy",
+    ];
+    assert_eq!(rows(&mut window), said, "newest first");
+    // A row says the role, the link a guest came by, where from and when.
+    let refused = window.find(Role::ListItem, "Guest was refused a download").expect("listed above");
+    let about = refused.description.unwrap_or_default();
+    for part in ["Reader", "Builder", "203.0.113.7", "Firefox on Linux", "09:00"] {
+        assert!(about.contains(part), "{part}: {about}");
+    }
+    assert_eq!(window.ui().take_requests(), [], "the answer asks for nothing");
+
+    // The other tab is as it was, and the log is asked for afresh each time it is turned to.
+    window.click(Role::Tab, "Access");
+    assert_eq!(rows(&mut window).len(), 3);
+    assert_eq!(window.ui().take_requests(), []);
+    window.click(Role::Tab, "Activity");
+    assert_eq!(window.ui().take_requests(), [Request::AccessLog]);
+    assert_eq!(rows(&mut window).len(), said.len(), "what was last said shows meanwhile");
+
+    // The dialog opens on who may reach the document, whatever it was closed on.
+    window.click(Role::Button, "Done").click(Role::Button, "Share");
+    assert_eq!(shown(&mut window), ["Access"]);
+    assert_eq!(window.ui().take_requests(), [Request::Shares]);
+}
+
+#[test]
+fn the_log_tells_its_days_and_times_by_the_persons_clock() {
+    let half = HOUR / 2;
+    // How far the clock is ahead of UTC in minutes, and where two entries of half past eleven and half
+    // past ten at night UTC on the 14th then fall for someone whose clock says the 15th.
+    let cases = [
+        (0, [("Yesterday", "23:30"), ("Yesterday", "22:30")]),
+        (60, [("Today", "00:30"), ("Yesterday", "23:30")]),
+        (-300, [("Yesterday", "18:30"), ("Yesterday", "17:30")]),
+        (330, [("Today", "05:00"), ("Today", "04:00")]),
+    ];
+    for (zone, falls) in cases {
+        let mut window = plan();
+        window.ui().set_utc_offset(zone);
+        let entry = |ago: u64| reach(ago, by("Ben Price"), Action::Open, Grade::Editor);
+        activity(&mut window, vec![entry(12 * HOUR + half), entry(13 * HOUR + half)]);
+        let mut days: Vec<&str> = falls.iter().map(|(day, _)| *day).collect();
+        days.dedup();
+        assert_eq!(listed(&mut window, Role::List), days, "{zone}");
+        let rows: Vec<Found> = window.controls().into_iter().filter(|found| found.role == Role::ListItem).collect();
+        for (row, (_, clock)) in rows.iter().zip(falls) {
+            assert!(row.description.as_deref().unwrap_or_default().ends_with(clock), "{zone}: {clock}");
+            assert!(has(&mut window, Role::Label, clock), "{zone}: the time is on the row");
+        }
+    }
+
+    // The day it is now is the person's too: half an hour into the 16th by their clock, the 15th is yesterday.
+    let mut window = plan();
+    window.platform.wall = Some(NOON + 11 * HOUR + half);
+    window.ui().set_utc_offset(60);
+    activity(&mut window, vec![reach(HOUR, by("Ben Price"), Action::Open, Grade::Editor)]);
+    assert_eq!(listed(&mut window, Role::List), ["Yesterday"]);
+}
+
+#[test]
+fn a_log_with_nothing_or_too_much_in_it_says_so() {
+    const NOBODY: &str = "Nobody has reached this document through a share yet.";
+    // How many entries the server tells, how many are listed, and what is said of the rest.
+    let cases = [
+        (0, 0, Some(NOBODY)),
+        (1, 1, None),
+        (200, 200, None),
+        (201, 200, Some("One earlier entry is not listed.")),
+        (230, 200, Some("30 earlier entries are not listed.")),
+    ];
+    for (told, kept, said) in cases {
+        let entry = |at: u64| reach(at * HOUR, guest("Builder"), Action::Open, Grade::Reader);
+        let mut window = plan();
+        activity(&mut window, (0..told).map(entry).collect());
+        assert_eq!(rows(&mut window).len(), kept, "{told}");
+        let sentences = [NOBODY, "One earlier entry is not listed.", "30 earlier entries are not listed."];
+        for sentence in sentences {
+            assert_eq!(has(&mut window, Role::Label, sentence), said == Some(sentence), "{told}: {sentence}");
+        }
+    }
+}
+
+#[test]
+fn who_reached_the_document_is_its_owners_to_read() {
+    // Someone else has the one list, and so has a document no server keeps.
+    let mut window = plan();
+    open(&mut window, shared(false, Vec::new()));
+    assert!(listed(&mut window, Role::Tab).is_empty(), "not the owner");
+    let mut window = plan();
+    window.ui().set_connection(None);
+    window.click(Role::Button, "Share");
+    assert!(listed(&mut window, Role::Tab).is_empty(), "kept on this device");
+
+    // While a link is made its form stands alone.
+    let mut window = plan();
+    open(&mut window, shared(true, Vec::new()));
+    assert_eq!(listed(&mut window, Role::Tab), ["Access", "Activity"]);
+    window.click(Role::Button, "New link");
+    assert!(listed(&mut window, Role::Tab).is_empty(), "the form");
+    window.click(Role::Button, "Cancel");
+
+    // An owner who stops being one while reading the log is shown the people again.
+    window.click(Role::Tab, "Activity");
+    window.ui().set_access_log(log());
+    window.ui().set_shares(shared(false, Vec::new()));
+    assert!(listed(&mut window, Role::Tab).is_empty());
+    assert_eq!(rows(&mut window), ["Alice Martin, Owner", "Ben Price, Editor", "Family, Commenter"]);
+}
+
+#[test]
+fn a_log_the_server_refuses_is_said_and_not_asked_for_again() {
+    let mut window = plan();
+    open(&mut window, shared(true, Vec::new()));
+    window.click(Role::Tab, "Activity");
+    window.ui().take_requests();
+    window.ui().refuse_share(REFUSAL);
+    window.assert_open(Role::Alert, REFUSAL).assert_open(Role::Dialog, "Share");
+    assert_eq!(window.ui().take_requests(), [], "a server out of reach is not asked for ever");
+    assert!(rows(&mut window).is_empty());
+    assert!(!has(&mut window, Role::Label, ASKING), "nothing is waited for any more");
+    assert_eq!(shown(&mut window), ["Activity"], "the tab stays");
+
+    // The other tab is not held up by it, and turning back asks once more.
+    window.click(Role::Tab, "Access").assert_closed(Role::Alert, REFUSAL);
+    assert_eq!(rows(&mut window).len(), 3);
+    window.click(Role::Tab, "Activity");
+    assert_eq!(window.ui().take_requests(), [Request::AccessLog]);
+    window.ui().set_access_log(log());
+    assert_eq!(rows(&mut window).len(), log().len());
+}
+
+#[test]
+fn the_tabs_are_turned_with_the_arrow_keys() {
+    let at = |window: &mut Harness| window.focused().map(|found| (found.role, found.name));
+    let mut window = plan();
+    open(&mut window, shared(true, Vec::new()));
+    // The tabs are one stop for the Tab key, after the way out.
+    window.key("Tab");
+    assert_eq!(at(&mut window), Some((Role::Tab, "Access".into())));
+    window.key("Right");
+    assert_eq!(at(&mut window), Some((Role::Tab, "Activity".into())));
+    assert_eq!(shown(&mut window), ["Access"], "moving along them turns nothing");
+    window.key("Enter");
+    assert_eq!(shown(&mut window), ["Activity"]);
+    assert_eq!(window.ui().take_requests(), [Request::AccessLog]);
+    assert_eq!(at(&mut window), Some((Role::Tab, "Activity".into())), "the keyboard stays on the tab");
+    window.key("Left").key("Enter");
+    assert_eq!(shown(&mut window), ["Access"]);
+    window.key("Tab");
+    assert_ne!(at(&mut window).map(|(role, _)| role), Some(Role::Tab), "one press passes them both");
 }

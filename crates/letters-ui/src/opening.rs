@@ -7,6 +7,7 @@ use letters_render::Point;
 
 use crate::chrome::Edge;
 use crate::copying::CopyFormat;
+use crate::notes;
 use crate::settings::Settings;
 
 /// What the window asks its shell to do. Collect them with `Window::take_requests` after each event.
@@ -194,6 +195,11 @@ pub enum Request {
     /// The owner revoked the link with this id. The dialog has dropped it already. Answer only when it could
     /// not be done, with `Window::refuse_share`.
     RevokeLink(String),
+    /// Someone who may share the document turned to the Share dialog's Activity tab: who reached it
+    /// through a share?
+    /// Answer with `Window::set_access_log` and the server's rows, newest first, or with
+    /// `Window::refuse_share`.
+    AccessLog,
 }
 
 /// A document opened lately, as the landing card lists it.
@@ -242,6 +248,44 @@ pub struct Folder {
 pub(crate) const WEEKDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 pub(crate) const MONTHS: [&str; 12] =
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// A moment on the person's clock, which is `zone` minutes ahead of UTC.
+pub(crate) fn local(seconds: u64, zone: i32) -> i64 {
+    i64::try_from(seconds).unwrap_or(i64::MAX).saturating_add(i64::from(zone) * 60)
+}
+
+/// The day a moment falls on where the person is, counted from 1970.
+pub(crate) fn day(seconds: u64, zone: i32) -> i64 {
+    local(seconds, zone).div_euclid(86_400)
+}
+
+/// The time of day a moment falls at where the person is: "09:14".
+pub(crate) fn clock(seconds: u64, zone: i32) -> String {
+    let of_day = local(seconds, zone).rem_euclid(86_400);
+    format!("{:02}:{:02}", of_day / 3_600, of_day / 60 % 60)
+}
+
+/// What a day is called on `today`: "Today", "Yesterday", the weekday for a week back, and the date before
+/// that.
+pub(crate) fn day_called(day: i64, today: Option<i64>) -> String {
+    match today.map(|today| today - day) {
+        Some(0) => "Today".to_owned(),
+        Some(1) => "Yesterday".to_owned(),
+        Some(2..7) => WEEKDAYS[(day + 4).rem_euclid(7) as usize].to_owned(),
+        _ => date_called(day, today),
+    }
+}
+
+/// A day as a date: "6 Nov", with its year where that is not plain.
+pub(crate) fn date_called(day: i64, today: Option<i64>) -> String {
+    let (year, month, date) = notes::date(u64::try_from(day).unwrap_or_default());
+    let month = MONTHS[(month.clamp(1, 12) - 1) as usize];
+    match today.map(|today| today - day) {
+        // A date without its year is plain for most of a year back.
+        Some(0..300) => format!("{date} {month}"),
+        _ => format!("{date} {month} {year}"),
+    }
+}
 
 /// A moment as RFC 3339 writes it.
 struct Moment {

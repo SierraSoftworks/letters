@@ -1,21 +1,23 @@
 //! Sharing a document a server keeps: one dialog lists the people and groups it is shared with, each with
-//! what they may do, and the links made for people without an account.
+//! what they may do, and the links made for people without an account. Its owner also reads there who
+//! reached it: see `activity`.
 //!
 //! The window only asks: the shell talks to the server, and answers with the shares as they then stand or
 //! with why something could not be done. What the person changes shows at once, and is asked for again
 //! when the server refuses it.
 
 use accesskit::Role;
-use letters_api::{Allows, CreatedLink, Grant, Grantee, Link, NewLink, Role as Grade, Shares};
+use letters_api::{Access as Reach, Allows, CreatedLink, Grant, Grantee, Link, NewLink, Role as Grade, Shares};
 use letters_editor::{Clip, Platform};
 
+use crate::activity;
 use crate::color::fade;
 use crate::element::Element;
 use crate::icon::{self, Icon};
-use crate::notes;
-use crate::opening::{MONTHS, Request};
-use crate::style::{Align, Edges, Justify, Look, Ring};
+use crate::opening::{Request, date_called, day};
+use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::text::TextStyle;
+use crate::theme::accent;
 use crate::threads::initials;
 use crate::tokens::{self, Color as Ink};
 use crate::widgets::{Button, Menu, MenuItem, Popover, Segmented, TextField};
@@ -54,11 +56,23 @@ pub enum Take {
     Print,
 }
 
+/// The two lists of the dialog.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tab {
+    /// Who the document is shared with.
+    #[default]
+    Access,
+    /// Who reached it through a share.
+    Activity,
+}
+
 /// What the Share dialog sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Sharing {
     Open,
     Close,
+    /// Shows one of the dialog's lists.
+    Tab(Tab),
     /// What the field for a group's name holds.
     Group(String),
     /// Shares the document with the group that is typed.
@@ -131,13 +145,23 @@ pub(crate) struct Share {
     zone: i32,
     /// Whether the dialog shows a change that the server has not answered for.
     unsure: bool,
+    /// Which of its lists the dialog shows.
+    tab: Tab,
+    /// Who reached the document through a share, as the server last said. `None` until it has.
+    log: Option<Vec<Reach>>,
 }
 
 impl Share {
     /// Puts the dialog away. What was typed and not sent goes with it.
     pub fn close(&mut self) {
         (self.open, self.form, self.notice, self.copied) = (false, None, None, None);
+        self.tab = Tab::Access;
         self.group.clear();
+    }
+
+    /// Takes in who reached the document through a share, newest first.
+    pub fn logged(&mut self, log: Vec<Reach>) {
+        self.log = Some(log);
     }
 
     /// Takes in the shares as the server says they stand.
@@ -209,8 +233,14 @@ impl Share {
                     self.copied = Some(id);
                 }
             }
-            // The rest changes who reaches the document, which is its owner's to do.
+            // The rest changes who reaches the document, or tells who did, which is for whoever may share it.
             _ if !owner => {}
+            Sharing::Tab(tab) => {
+                self.tab = tab;
+                if tab == Tab::Activity && served {
+                    requests.push(Request::AccessLog);
+                }
+            }
             Sharing::Add(role) => {
                 let name = std::mem::take(&mut self.group).trim().to_owned();
                 if name.is_empty() || role.shares() {
@@ -293,8 +323,12 @@ impl Share {
             (None, _, true) if self.notice.is_some() => (Element::column(), vec![done()]),
             (None, _, true) => (said("Asking the server who this document is shared with."), vec![done()]),
             (Some(_), Some(form), true) => (form.card(self.now.is_some()), form.ends()),
+            (Some(shared), None, true) if shared.owner && self.tab == Tab::Activity => (self.activity(), vec![done()]),
             (Some(shared), None, true) => (self.shares(shared), vec![done()]),
         };
+        // Who reached the document is told to whoever may share it.
+        let owner = self.shared.as_ref().is_some_and(|shared| shared.owner);
+        let tabs = (served && owner && self.form.is_none()).then(|| self.tabs());
         let foot = Element::row().justify(Justify::End).gap(tokens::SPACE_SM).children(ends);
         // What scrolls runs to the dialog's edges, so that its thumb stands clear of what it scrolls.
         let side = Edges::xy(tokens::SPACE_XL, 0.0);
@@ -305,6 +339,7 @@ impl Share {
             .gap(tokens::SPACE_LG)
             .padding(Edges { top: tokens::SPACE_LG, bottom: tokens::SPACE_XL, ..Edges::all(0.0) })
             .child(within(head))
+            .children(tabs.map(within))
             .children(notice.map(within))
             .child(body)
             .child(within(foot));
@@ -316,6 +351,46 @@ impl Share {
             .open(true)
             .on_close(send(Sharing::Close));
         Some(Element::row().overlay().popover(dialog))
+    }
+
+    /// The two lists as tabs: who may reach the document, and who did.
+    fn tabs(&self) -> Element<Message> {
+        let tab = |said: &'static str, tab: Tab| {
+            let shown = self.tab == tab;
+            let (ink, under) = match shown {
+                true => (tokens::FG, accent().base),
+                false => (tokens::FG_MUTED, fade(tokens::LINE, 0.0)),
+            };
+            Element::row()
+                .padding(Edges::xy(tokens::SPACE_MD, tokens::SPACE_SM))
+                .border(Edges::bottom(2.0), under)
+                .fg(ink)
+                .hover(Look::bg(tokens::NEUTRAL_SOFT))
+                .ring(Ring::Outline(2.0))
+                .role(Role::Tab)
+                .label(said)
+                .selected(shown)
+                .focusable()
+                .on_press(send(Sharing::Tab(tab)))
+                .child(Element::text(said, TextStyle::control().weight(if shown { 600 } else { 400 })))
+        };
+        Element::row()
+            .role(Role::TabList)
+            .label("Share")
+            .border(Edges::bottom(1.0), tokens::LINE)
+            .arrows(Dir::Row)
+            .one_stop()
+            .child(tab("Access", Tab::Access))
+            .child(tab("Activity", Tab::Activity))
+    }
+
+    /// Who reached the document through a share, once the server has said.
+    fn activity(&self) -> Element<Message> {
+        match &self.log {
+            Some(log) => activity::view(log, self.now, self.zone),
+            None if self.notice.is_some() => Element::column(),
+            None => said("Asking the server who has reached this document."),
+        }
     }
 
     /// The people and the links.
@@ -561,7 +636,7 @@ fn choose(at: usize, name: &str, role: Grade) -> Element<Message> {
 }
 
 /// A role as a label, in its colour: sharing is where a role's colour shows.
-fn cap(role: Grade) -> Element<Message> {
+pub(crate) fn cap(role: Grade) -> Element<Message> {
     let (mark, ink, soft) = marks(role);
     Element::row()
         .align(Align::Center)
@@ -583,7 +658,7 @@ fn limit(mark: Icon, said: &str, off: bool) -> Element<Message> {
     Element::row().align(Align::Center).gap(tokens::SPACE_XS).fg(ink).child(mark).child(Element::text(said, quiet()))
 }
 
-fn named(role: Grade) -> &'static str {
+pub(crate) fn named(role: Grade) -> &'static str {
     match role {
         Grade::Reader => "Reader",
         Grade::Commenter => "Commenter",
@@ -604,7 +679,7 @@ fn does(role: Grade) -> &'static str {
 
 /// A role's icon, its colour and the ground it stands on: an eye in grey, a speech bubble in the blue of
 /// comments, a pencil in green, and a crown in the same green for the owner.
-fn marks(role: Grade) -> (Icon, Ink, Ink) {
+pub(crate) fn marks(role: Grade) -> (Icon, Ink, Ink) {
     match role {
         Grade::Reader => (icon::EYE, tokens::FG_MUTED, tokens::NEUTRAL_SOFT),
         Grade::Commenter => (icon::MESSAGE_SQUARE, tokens::INFO, tokens::INFO_SOFT),
@@ -641,24 +716,17 @@ fn expiry(expires: Option<u64>, now: Option<u64>, zone: i32) -> (String, bool) {
     }
 }
 
-/// A day as the dialog says it: "4 Nov", with its year where that is not this one.
+/// A day as the dialog says it: "4 Nov", with its year where that is not plain.
 fn dated(seconds: u64, now: Option<u64>, zone: i32) -> String {
-    let day =
-        |seconds: u64| u64::try_from((seconds as i64 + i64::from(zone) * 60).div_euclid(86_400)).unwrap_or_default();
-    let (year, month, date) = notes::date(day(seconds));
-    let month = MONTHS[(month.clamp(1, 12) - 1) as usize];
-    match now.map(|now| notes::date(day(now)).0) {
-        Some(this) if this == year => format!("{date} {month}"),
-        _ => format!("{date} {month} {year}"),
-    }
+    date_called(day(seconds, zone), now.map(|now| day(now, zone)))
 }
 
-/// A sentence that stands where the shares would.
-fn said(sentence: &str) -> Element<Message> {
+/// A sentence that stands where a list would.
+pub(crate) fn said(sentence: &str) -> Element<Message> {
     Element::paragraph(sentence, TextStyle::body()).fg(tokens::FG_MUTED)
 }
 
-fn quiet() -> TextStyle {
+pub(crate) fn quiet() -> TextStyle {
     TextStyle::control().size(tokens::TEXT_SM)
 }
 
