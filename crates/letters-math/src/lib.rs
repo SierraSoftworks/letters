@@ -3,7 +3,8 @@
 //! The source is the LaTeX that KaTeX accepts. [`typeset`] turns it into a [`Formula`], whose items go into
 //! the same display list as everything else, so one renderer draws maths on every backend. Layout keeps a
 //! [`Cache`], since a formula is set far more often than it changes. [`commands`] and [`environments`] list
-//! what the engine understands, for completion while typing. [`Formula::svg`] draws one where there is no
+//! what the engine understands, for completion while typing. [`typeset_mapped`] also traces what is drawn
+//! to the source, to light the term at the caret. [`Formula::svg`] draws a formula where there is no
 //! renderer, as on an exported page. [`mathml`] gives a formula's structure to the formats that hold maths
 //! as a tree.
 //!
@@ -18,6 +19,7 @@ mod commands;
 mod engine;
 mod fonts;
 mod mathml;
+mod parts;
 mod svg;
 mod table;
 
@@ -59,6 +61,19 @@ pub struct Formula {
     /// What to draw, with the top left of the box at the origin. As in TeX, ink may reach a little outside
     /// the box.
     pub items: Vec<Item>,
+    /// Which bytes of the source the items are set from, in the order they are drawn. Empty unless the
+    /// formula is from [`typeset_mapped`], and for the few formulas that cannot be traced.
+    pub parts: Vec<Part>,
+}
+
+/// A stretch of a formula's source, and what draws it. One stretch is in several parts when what draws it
+/// is not drawn all at once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Part {
+    /// The bytes of the source it is set from.
+    pub source: Range<usize>,
+    /// Which of the formula's items draw it.
+    pub items: Range<usize>,
 }
 
 impl fmt::Debug for Formula {
@@ -68,6 +83,7 @@ impl fmt::Debug for Formula {
             .field("size", &self.size)
             .field("baseline", &self.baseline)
             .field("items", &self.items.len())
+            .field("parts", &self.parts.len())
             .finish()
     }
 }
@@ -78,6 +94,33 @@ impl Formula {
         let from = out.items.len();
         out.items.extend(self.items.iter().cloned());
         out.translate(from, origin);
+    }
+
+    /// The term a caret at the byte `caret` of the source is at, as its bytes of the source: the one to
+    /// light while it is written. A term the caret is in or just after comes before one it is just before,
+    /// and a shorter one before a longer.
+    pub fn term(&self, caret: usize) -> Option<Range<usize>> {
+        let sources = self.parts.iter().map(|part| &part.source);
+        let near = sources.filter(|source| source.start <= caret && caret <= source.end);
+        near.min_by_key(|source| (source.start == caret, source.len())).cloned()
+    }
+
+    /// The formula with what is set from the bytes `source` of its source in `color`: a term from
+    /// [`term`](Self::term), or any stretch, such as a selection. Only a part that is all in the stretch is
+    /// coloured.
+    pub fn tinted(&self, source: &Range<usize>, color: Color) -> Formula {
+        let mut tinted = self.clone();
+        let within = |part: &&Part| source.start <= part.source.start && part.source.end <= source.end;
+        for part in self.parts.iter().filter(within) {
+            for item in tinted.items.get_mut(part.items.clone()).into_iter().flatten() {
+                if let Item::Fill { color: ink, .. } | Item::Glyphs { color: ink, .. } | Item::Path { color: ink, .. } =
+                    item
+                {
+                    *ink = color;
+                }
+            }
+        }
+        tinted
     }
 }
 
@@ -102,6 +145,19 @@ impl std::error::Error for Error {}
 /// Typesets `source`, which is TeX with no `$` around it.
 pub fn typeset(source: &str, style: &Style) -> Result<Formula, Error> {
     engine::typeset(source, style)
+}
+
+/// Typesets `source` as [`typeset`] does, and traces what it draws to the source in [`Formula::parts`], so
+/// that the term at a caret can be lit: see [`Formula::term`] and [`Formula::tinted`]. The formula draws the
+/// same and takes about three times as long to set, so this is for the one formula being written, each time
+/// its source changes.
+///
+/// A part is a symbol, an operator such as `\sum`, what a macro of the engine's draws, such as `\ne`, or
+/// what is set as one whole: a run in a font, a line of text. What a macro defined in the source draws is
+/// traced to that definition, where it is written. What a command draws of its own is in no part: the bar
+/// of a fraction, a root sign, an accent, a bracket that `\left` sizes.
+pub fn typeset_mapped(source: &str, style: &Style) -> Result<Formula, Error> {
+    engine::typeset_mapped(source, style)
 }
 
 /// Writes `source` as presentation MathML, for the formats and tools that take a formula as its structure

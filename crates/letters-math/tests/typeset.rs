@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use letters_math::{Style, typeset};
+use letters_math::{Style, typeset, typeset_mapped};
 use letters_render::{Color, DisplayList, Item, Point};
 
 /// Sources that between them use glyphs, rules, stretched outlines and strokes.
@@ -205,15 +205,14 @@ fn hostile_sources_fail_or_stay_drawable() {
         &nested,
         &roots,
     ];
-    for source in sources {
-        // Either answer is fine. Neither may hang, crash or hand the renderer something it cannot draw.
-        if let Ok(formula) = typeset(source, &display(16.0)) {
-            assert!(formula.size.width.is_finite() && formula.size.height.is_finite() && formula.baseline.is_finite());
-            let mut list = DisplayList::default();
-            formula.paint(Point { x: 4.0, y: 4.0 }, &mut list);
-            let mut frame = letters_render::cpu::Frame::new(64, 64);
-            letters_render::cpu::CpuRenderer::new().render(&list, &Default::default(), 1.0, WHITE, &mut frame);
-        }
+    let set = sources.iter().flat_map(|source| [typeset, typeset_mapped].map(|set| set(source, &display(16.0))));
+    // Either answer is fine. Neither may hang, crash or hand the renderer something it cannot draw.
+    for formula in set.flatten() {
+        assert!(formula.size.width.is_finite() && formula.size.height.is_finite() && formula.baseline.is_finite());
+        let mut list = DisplayList::default();
+        formula.paint(Point { x: 4.0, y: 4.0 }, &mut list);
+        let mut frame = letters_render::cpu::Frame::new(64, 64);
+        letters_render::cpu::CpuRenderer::new().render(&list, &Default::default(), 1.0, WHITE, &mut frame);
     }
 }
 

@@ -12,11 +12,11 @@ use ratex_layout::{FallbackGlyphMetrics, LayoutOptions};
 use ratex_parser::ParseError;
 use ratex_parser::parse_node::{ArrayTag, ParseNode, ProofBranch};
 use ratex_parser::parser::Parser;
-use ratex_types::display_item::DisplayItem;
+use ratex_types::display_item::{DisplayItem, DisplayList};
 use ratex_types::math_style::MathStyle;
 use ratex_types::path_command::PathCommand;
 
-use crate::{Error, Formula, Style, fonts};
+use crate::{Error, Formula, Part, Style, fonts, parts};
 
 /// The width, in em, of a stroked line such as `\cancel`'s: the thickness of TeX's rules.
 const STROKE: f32 = 0.04;
@@ -29,11 +29,28 @@ const HAIRLINE: f32 = 1.0;
 const MAX_DASHES: usize = 1024;
 
 pub(crate) fn typeset(source: &str, style: &Style) -> Result<Formula, Error> {
+    let nodes = parse(source, style)?;
+    draw(set(source, &nodes, style)?, style, &[])
+}
+
+/// As [`typeset`], with the parts of the formula that can be traced to their source.
+pub(crate) fn typeset_mapped(source: &str, style: &Style) -> Result<Formula, Error> {
+    let nodes = parse(source, style)?;
+    let list = set(source, &nodes, style)?;
+    let sources = sources(source, nodes, &list, style).unwrap_or_default();
+    draw(list, style, &sources)
+}
+
+fn parse(source: &str, style: &Style) -> Result<Vec<ParseNode>, Error> {
     let mut nodes = Parser::new(source).parse().map_err(|error| parse_error(source, error))?;
     if !style.links {
         unlink(&mut nodes);
     }
+    Ok(nodes)
+}
 
+/// Lays a parsed formula out, as the list of what the engine draws.
+fn set(source: &str, nodes: &[ParseNode], style: &Style) -> Result<DisplayList, Error> {
     let options = LayoutOptions {
         style: if style.display { MathStyle::Display } else { MathStyle::Text },
         color: ratex_types::Color::new(
@@ -46,14 +63,63 @@ pub(crate) fn typeset(source: &str, style: &Style) -> Result<Formula, Error> {
     };
     let body = body_metrics(source);
     let tree = if body.is_empty() {
-        ratex_layout::layout(&nodes, &options)
+        ratex_layout::layout(nodes, &options)
     } else {
-        ratex_layout::layout_with_fallback_metrics(&nodes, &options, Arc::new(body))
+        ratex_layout::layout_with_fallback_metrics(nodes, &options, Arc::new(body))
     };
     // The engine's guard against a small source that asks for a vast drawing.
     ratex_layout::validate_layout(&tree).map_err(|message| Error { message, span: None })?;
-    let list = ratex_layout::to_display_list(&tree);
+    Ok(ratex_layout::to_display_list(&tree))
+}
 
+/// For each thing in `list`, the bytes of the source it was set from, where that can be told. `None` when
+/// nothing can.
+///
+/// The engine's drawing keeps no positions, so the formula is laid out again with each part in a colour of
+/// its own, and a part is whatever comes out in its colour.
+fn sources(
+    source: &str,
+    mut nodes: Vec<ParseNode>,
+    list: &DisplayList,
+    style: &Style,
+) -> Option<Vec<Option<Range<usize>>>> {
+    // The same source, one byte along. A position that moves with it is a place in the source. One that
+    // stays is a place in a macro of the engine's own, which only looks like one.
+    let mut moved = parse(&format!(" {source}"), style).ok()?;
+    let parts = parts::mark(source, &mut nodes, &mut moved)?;
+    let marked = set(source, &moved, style).ok()?;
+    // A mark must change nothing but colours, or its drawing is another formula's.
+    let alike = marked.items.len() == list.items.len() && marked.items.iter().zip(&list.items).all(|(a, b)| same(a, b));
+    alike.then(|| marked.items.iter().zip(&list.items).map(|(marked, real)| parts.source(marked, real)).collect())
+}
+
+/// Whether two things are drawn alike but for their colour.
+fn same(a: &DisplayItem, b: &DisplayItem) -> bool {
+    use DisplayItem as D;
+    match (a, b) {
+        (
+            D::GlyphPath { x, y, scale, font, char_code, color: _ },
+            D::GlyphPath { x: x2, y: y2, scale: scale2, font: font2, char_code: code2, color: _ },
+        ) => (x, y, scale, font, char_code) == (x2, y2, scale2, font2, code2),
+        (
+            D::Line { x, y, width, thickness, dashed, color: _ },
+            D::Line { x: x2, y: y2, width: width2, thickness: thickness2, dashed: dashed2, color: _ },
+        ) => (x, y, width, thickness, dashed) == (x2, y2, width2, thickness2, dashed2),
+        (
+            D::Rect { x, y, width, height, color: _ },
+            D::Rect { x: x2, y: y2, width: width2, height: height2, color: _ },
+        ) => (x, y, width, height) == (x2, y2, width2, height2),
+        (
+            D::Path { x, y, commands, fill, color: _ },
+            D::Path { x: x2, y: y2, commands: commands2, fill: fill2, color: _ },
+        ) => (x, y, commands, fill) == (x2, y2, commands2, fill2),
+        _ => false,
+    }
+}
+
+/// Turns what the engine draws into a formula. `sources` says where in the source each thing in `list` is
+/// from, and is empty for a formula that is not traced.
+fn draw(list: DisplayList, style: &Style, sources: &[Option<Range<usize>>]) -> Result<Formula, Error> {
     let em = if style.size.is_finite() { style.size.max(0.0) } else { 0.0 };
     let px = |length: f64| (length * f64::from(em)) as f32;
     let size = Size { width: px(list.width), height: px(list.height + list.depth) };
@@ -61,14 +127,22 @@ pub(crate) fn typeset(source: &str, style: &Style) -> Result<Formula, Error> {
         return Err(Error { message: "The formula is too large".into(), span: None });
     }
 
-    let mut items = Vec::new();
-    for item in list.items {
+    let (mut items, mut parts) = (Vec::new(), Vec::<Part>::new());
+    let mut before = &None;
+    for (index, item) in list.items.into_iter().enumerate() {
+        let source = sources.get(index).unwrap_or(&None);
+        let from = items.len();
         match item {
             DisplayItem::GlyphPath { x, y, scale, font, char_code, color } => {
                 let face = FontId::parse(&font).unwrap_or(FontId::MainRegular);
                 let character = ratex_font::katex_ttf_glyph_char(face, char_code);
                 let Some((font, id)) = fonts::glyph(face.as_str(), character) else { continue };
-                glyph(&mut items, font, id, em * scale as f32, color.into_ink(), Point { x: px(x), y: px(y) });
+                // A run holds one part, so that a part is whole items.
+                let run = if source == before { items.last_mut() } else { None };
+                let glyph = (font, id, em * scale as f32, color.into_ink(), Point { x: px(x), y: px(y) });
+                if let Some(new) = glyph_in(run, glyph) {
+                    items.push(new);
+                }
             }
             // A line is placed by its vertical centre.
             DisplayItem::Line { x, y, width, thickness, color, dashed } => {
@@ -97,8 +171,14 @@ pub(crate) fn typeset(source: &str, style: &Style) -> Result<Formula, Error> {
                 }
             }
         }
+        before = source;
+        let Some(source) = source.as_ref().filter(|_| items.len() > from) else { continue };
+        match parts.last_mut() {
+            Some(part) if part.source == *source && part.items.end == from => part.items.end = items.len(),
+            _ => parts.push(Part { source: source.clone(), items: from..items.len() }),
+        }
     }
-    Ok(Formula { size, baseline: px(list.height), items })
+    Ok(Formula { size, baseline: px(list.height), items, parts })
 }
 
 /// The engine counts positions in bytes of the source, as the document does. One from inside a macro of the
@@ -134,7 +214,7 @@ fn unlink(nodes: &mut [ParseNode]) {
 
 /// Adds the nodes directly inside `node`. Every kind of node is named, so that a kind new to the engine
 /// cannot hide a link: it does not compile until it has a place here.
-fn children<'a>(node: &'a mut ParseNode, out: &mut Vec<&'a mut ParseNode>) {
+pub(crate) fn children<'a>(node: &'a mut ParseNode, out: &mut Vec<&'a mut ParseNode>) {
     use ParseNode as N;
     match node {
         N::Atom { .. }
@@ -188,9 +268,10 @@ fn children<'a>(node: &'a mut ParseNode, out: &mut Vec<&'a mut ParseNode>) {
         | N::CdLabel { label: body, .. }
         | N::CdLabelParent { fragment: body, .. } => out.push(body),
         N::GenFrac { numer, denom, .. } => out.extend([&mut **numer, &mut **denom]),
+        // In the order they are written: the one in square brackets comes first.
         N::Sqrt { body, index: other, .. } | N::XArrow { body, below: other, .. } => {
-            out.push(body);
             out.extend(other.as_deref_mut());
+            out.push(body);
         }
         N::SupSub { base, sup, sub, .. } => out.extend([base, sup, sub].into_iter().filter_map(Option::as_deref_mut)),
         N::CdArrow { label_above, label_below, .. } => {
@@ -233,19 +314,22 @@ fn body_metrics(source: &str) -> HashMap<char, FallbackGlyphMetrics> {
         .collect()
 }
 
-/// Adds a glyph, to the run before it when that is in the same face, size and colour.
-fn glyph(items: &mut Vec<Item>, font: letters_render::Font, id: u32, size: f32, color: Color, at: Point) {
-    if let Some(Item::Glyphs { origin, font: run_font, size: run_size, color: run_color, glyphs, .. }) =
-        items.last_mut()
+/// Adds a glyph to `run` when that is a run in the same face, size and colour. Otherwise gives a run of
+/// its own for it.
+fn glyph_in(
+    run: Option<&mut Item>,
+    (font, id, size, color, at): (letters_render::Font, u32, f32, Color, Point),
+) -> Option<Item> {
+    if let Some(Item::Glyphs { origin, font: run_font, size: run_size, color: run_color, glyphs, .. }) = run
         && *run_font == font
         && *run_size == size
         && *run_color == color
     {
         glyphs.push(Glyph { id, x: at.x - origin.x, y: at.y - origin.y });
-        return;
+        return None;
     }
     let glyphs = vec![Glyph { id, x: 0.0, y: 0.0 }];
-    items.push(Item::Glyphs { origin: at, font, size, color, skew: 0.0, embolden: false, glyphs, text: None });
+    Some(Item::Glyphs { origin: at, font, size, color, skew: 0.0, embolden: false, glyphs, text: None })
 }
 
 /// Adds a filled rectangle. A side thinner than a hairline grows to one about its centre.
