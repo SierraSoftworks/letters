@@ -75,6 +75,19 @@ pub struct Anchor {
     /// The two ends of the range as positions that stay with their text. The block and range above say where
     /// those are in the `document.json` beside them, for readers that know nothing of the history.
     pub stable: Option<(StablePos, StablePos)>,
+    /// Where the block stood, for a note on a block that the document no longer holds.
+    pub stood: Option<Stood>,
+    pub extra: Extra,
+}
+
+/// Where a block stood before it was taken away, told by blocks that were still there afterwards. One
+/// with neither stood first in the document.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Stood {
+    /// The nearest block before it in the same parent.
+    pub after: Option<BlockId>,
+    /// The block that held it. `None` at the top level.
+    pub parent: Option<BlockId>,
     pub extra: Extra,
 }
 
@@ -109,11 +122,11 @@ impl Note {
 
 impl Anchor {
     pub fn block(block: impl Into<BlockId>) -> Self {
-        Self { block: block.into(), range: None, stable: None, extra: Extra::new() }
+        Self { block: block.into(), range: None, stable: None, stood: None, extra: Extra::new() }
     }
 
     pub fn range(block: impl Into<BlockId>, range: Range<usize>) -> Self {
-        Self { block: block.into(), range: Some(range), stable: None, extra: Extra::new() }
+        Self { block: block.into(), range: Some(range), stable: None, stood: None, extra: Extra::new() }
     }
 
     /// Ties the range to the text it covers in `model`, so that it can [`follow`](Self::follow) that text.
@@ -339,7 +352,18 @@ fn read_anchor(value: Value, path: &str) -> Result<Anchor> {
         (None, None) => None,
         _ => return err(path, "expected stable_start and stable_end beside a start and end, or neither"),
     };
-    Ok(Anchor { block, range, stable, extra: map.into_iter().collect() })
+    let stood = map.remove("stood").map(|stood| read_stood(stood, &format!("{path}.stood"))).transpose()?;
+    Ok(Anchor { block, range, stable, stood, extra: map.into_iter().collect() })
+}
+
+fn read_stood(value: Value, path: &str) -> Result<Stood> {
+    let mut map = object(value, path)?;
+    let mut id = |key: &str| match string(&mut map, key, path)? {
+        Some(id) if id.is_empty() => err(&format!("{path}.{key}"), "expected the id of a block"),
+        id => Ok(id.map(BlockId::new)),
+    };
+    let (after, parent) = (id("after")?, id("parent")?);
+    Ok(Stood { after, parent, extra: map.into_iter().collect() })
 }
 
 fn read_version(value: Value, path: &str) -> Result<Version> {
@@ -381,6 +405,16 @@ fn write_note(note: &Note) -> Value {
     if let Some((start, end)) = &note.anchor.stable {
         anchor.insert("stable_start".into(), start.to_string().into());
         anchor.insert("stable_end".into(), end.to_string().into());
+    }
+    if let Some(stood) = &note.anchor.stood {
+        let mut map = Map::new();
+        for (key, id) in [("after", &stood.after), ("parent", &stood.parent)] {
+            if let Some(id) = id {
+                map.insert(key.into(), id.as_str().into());
+            }
+        }
+        write_extra(&mut map, &stood.extra);
+        anchor.insert("stood".into(), map.into());
     }
     write_extra(&mut anchor, &note.anchor.extra);
     map.insert("anchor".into(), anchor.into());

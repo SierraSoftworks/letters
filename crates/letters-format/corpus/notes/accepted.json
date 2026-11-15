@@ -15,5 +15,8 @@
   { "why": "a side of a conflict that took the block away has no block",
     "json": { "format": 1, "notes": [{ "id": "n", "type": "conflict", "anchor": { "block": "b" }, "author": "Letters", "created": "2026-11-14T19:05:00Z",
       "versions": [{ "author": "Ana", "edited": "2026-11-14T19:00:00Z", "block": { "id": "b", "type": "divider" } },
-                   { "author": "Ben", "edited": "2026-11-14T19:05:00Z" }] }] } }
+                   { "author": "Ben", "edited": "2026-11-14T19:05:00Z" }] }] } },
+  { "why": "an anchor may say where a block that is gone stood",
+    "json": { "format": 1, "notes": [{ "id": "n", "type": "comment", "anchor": { "block": "b", "stood": { "after": "a", "parent": "q" } }, "author": "Ana", "created": "2026-11-14T20:00:00Z" },
+                                     { "id": "m", "type": "comment", "anchor": { "block": "c", "stood": {} }, "author": "Ana", "created": "2026-11-14T20:00:00Z" }] } }
 ]

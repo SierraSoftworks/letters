@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
 
-use letters_model::{Change, Document, Model, Note, Notes, Op, OpError, ReplicaId, Style};
+use letters_model::{Block, BlockId, Change, Document, Model, Note, Notes, Op, OpError, ReplicaId, Stood, Style};
 
 use crate::journal::Unsaved;
 use crate::save::{DiskCopy, Replica};
@@ -175,19 +175,26 @@ impl WorkingCopy {
         let restyled = self.unread_style.as_ref().is_some_and(|carried| carried != self.model.style());
         // Only copies that each hold edits the other lacks can have changed the same words.
         let apart = self.model.compare(&merged).map_err(Error::History)?.is_none();
-        let apart = apart.then(|| (self.model.revision(), model.revision()));
+        // The document as it reads here before the two meet, for a block that the other side took away.
+        let apart = apart.then(|| (self.model.revision(), model.revision(), self.model.doc().clone()));
 
         self.notes.pin(&self.model);
         let mut change = self.model.merge(&merged).map_err(Error::History)?;
         self.notes.merge(&notes);
         let mut raised = Vec::new();
-        if let Some((ours, theirs)) = apart {
+        if let Some((ours, theirs, before)) = apart {
             // Each block the two changed in the same words reads as the later side left it from here on.
             let (settled, conflicts) = self.model.settle(&ours, &theirs).map_err(Error::History)?;
             change.absorb(settled);
             for conflict in conflicts {
                 let [earlier, later] = [1 - conflict.later, conflict.later].map(|side| conflict.sides[side].version());
-                raised.push(Note::conflict(conflict.block, [earlier, later]));
+                let mut note = Note::conflict(conflict.block, [earlier, later]);
+                if self.model.block(&note.anchor.block).is_none() {
+                    // The side that kept the block knows where it stood, and the note has no other place.
+                    let held = if conflict.later == 0 { model.doc() } else { &before };
+                    note.anchor.stood = stood(held, &self.model, &note.anchor.block);
+                }
+                raised.push(note);
             }
         }
         // With none raised too: a note that came in can be newer than one held for the same block.
@@ -203,6 +210,38 @@ impl WorkingCopy {
         }
         Ok(change)
     }
+}
+
+/// Where `block` stood in `held`, told by the blocks around it that `now` still holds. Where the block
+/// that held it went too, that one's place stands in. `None` when `held` has no such block.
+fn stood(held: &Document, now: &Model, block: &BlockId) -> Option<Stood> {
+    /// The way down to a block: at each level the blocks there, and which of them leads on.
+    fn find<'a>(blocks: &'a [Block], id: &BlockId, way: &mut Vec<(&'a [Block], usize)>) -> bool {
+        blocks.iter().enumerate().any(|(nth, block)| {
+            way.push((blocks, nth));
+            let found = block.id == *id || find(block.body.blocks(), id, way);
+            if !found {
+                way.pop();
+            }
+            found
+        })
+    }
+    let mut way = Vec::new();
+    if !find(&held.blocks, block, &mut way) {
+        return None;
+    }
+    let parent = |level: usize| level.checked_sub(1).map(|above| &way[above].0[way[above].1]);
+    let mut level = way.len() - 1;
+    while parent(level).is_some_and(|parent| now.block(&parent.id).is_none()) {
+        level -= 1;
+    }
+    let (beside, nth) = way[level];
+    let after = beside[..nth].iter().rev().find(|block| now.block(&block.id).is_some());
+    Some(Stood {
+        after: after.map(|block| block.id.clone()),
+        parent: parent(level).map(|parent| parent.id.clone()),
+        extra: Default::default(),
+    })
 }
 
 impl WorkingCopy {

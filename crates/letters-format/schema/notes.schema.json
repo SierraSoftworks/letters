@@ -53,7 +53,15 @@
         "start": { "type": "integer", "minimum": 0 },
         "end": { "type": "integer", "minimum": 0 },
         "stable_start": { "$ref": "#/$defs/stable" },
-        "stable_end": { "$ref": "#/$defs/stable" }
+        "stable_end": { "$ref": "#/$defs/stable" },
+        "stood": {
+          "type": "object",
+          "description": "Where the block stood, for a note on a block that document.json no longer holds, as a conflict whose later side took the block away. With neither field it stood first in the document.",
+          "properties": {
+            "after": { "type": "string", "minLength": 1, "description": "The id of the nearest block before it in the same parent that was still there." },
+            "parent": { "type": "string", "minLength": 1, "description": "The id of the block that held it. Absent at the top level." }
+          }
+        }
       },
       "dependentRequired": {
         "start": ["end"],
