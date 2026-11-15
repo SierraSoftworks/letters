@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use common::Scratch;
-use letters::connected::{self, Reached, Shared, Sharing, Unreached};
+use letters::connected::{self, Line, Reached, Said, Shared, Sharing, Told, Unreached};
 use letters::keychain::Keychain;
 use letters::remote::Roots;
 use letters::server::{Client, Refused};
@@ -24,6 +24,7 @@ use letters_api::{
 };
 use letters_format::{OPLOG, Package};
 use letters_model::{Block, BlockKind, Document, Model, ReplicaId};
+use letters_sync::{Local, Refusal};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -133,6 +134,8 @@ struct Letters {
     barred: bool,
     /// Who the document is shared with.
     shares: Shares,
+    /// How many more times the document is found moved while a file handed over for it was read.
+    moved: u32,
 }
 
 impl Letters {
@@ -171,6 +174,11 @@ impl Letters {
             "GET /api/v1/documents/d1" if self.barred => said(Code::Forbidden, "That is not yours to read."),
             "GET /api/v1/documents/d1" => json(&opened()),
             "GET /api/v1/documents/d1/file" => Answer("200 OK", "content-type: application/zip\r\n", FILE.to_vec()),
+            "PUT /api/v1/documents/d1/file" if self.moved > 0 => {
+                self.moved -= 1;
+                said(Code::Stale, "That document was moved just now.")
+            }
+            "PUT /api/v1/documents/d1/file" => Answer("204 No Content", "", Vec::new()),
             "PUT /api/v1/documents/d1/assets/sky.png" => Answer("204 No Content", "", Vec::new()),
             // A picture is asked for by the hash of its bytes, and one name gets another's bytes.
             line if line.strip_prefix("GET /api/v1/documents/d1/assets/").is_some_and(|name| name == held()) => {
@@ -761,6 +769,35 @@ fn nobody_is_sent_to_sign_in_at_what_is_no_letters_server() {
         connected::enter(&stranger, "d1", None, None, &home.0, &no_browser, &|_, _| (), &AtomicBool::new(false));
 
     assert!(matches!(entered, Err(Unreached::Refused(Refused::Unreachable(_)))));
+}
+
+#[test]
+fn a_file_for_a_document_that_moved_meanwhile_is_handed_over_once_more() {
+    let server = Server::start();
+    let session = Arc::new(server.session());
+    let moved = |times: u32| {
+        server.letters.lock().unwrap().moved = times;
+        let handed = session.keep_file("d1", b"a file");
+        let asks = server.asked().iter().filter(|(line, _)| line == "PUT /api/v1/documents/d1/file").count();
+        (handed, asks)
+    };
+
+    assert_eq!(moved(0), (Ok(()), 1));
+    assert_eq!(moved(1), (Ok(()), 2), "asked again, the server finds the document where it is now");
+    let (refused, asks) = moved(2);
+    assert_eq!(asks, 2, "and no more often than that");
+    let refused = refused.expect_err("the server refused twice");
+    assert_eq!(refused.code(), Some(Code::Stale));
+
+    // The window is then told in the server's own sentence, and that a file is too large in the line's.
+    let tell: connected::Tell = Arc::new(|_| ());
+    let roots = Roots::These(vec![server.certificate.clone()]);
+    let mut line = Line::new(session, &opened(), std::path::Path::new("no-copy.let"), roots, tell);
+    let nothing = Default::default();
+    let mut told = |refused| line.heard(Said::Sent(Some(refused)), Local { model: None, notes: &nothing }, 0);
+    assert_eq!(told(refused), [Told::Unsent("That document was moved just now.".into())]);
+    let large = Refused::Said(letters_api::Error::new(Code::TooLarge, "That is too large."));
+    assert_eq!(told(large), [Told::Refused(Refusal::TooLarge)]);
 }
 
 /// A history as a stranger writes it: one that Loro panics on.

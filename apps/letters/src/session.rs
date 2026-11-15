@@ -162,8 +162,16 @@ impl Session {
     }
 
     /// Hands the server a document's whole `.let` file, for work that no frame of its socket carries.
+    ///
+    /// The server reads the file before it holds the document, which may be moved or thrown away
+    /// meanwhile: it then answers [`Code::Stale`], and is asked once more, to find the document where it
+    /// is now.
     pub fn keep_file(&self, id: &str, bytes: &[u8]) -> Result<(), Refused> {
-        self.ask(|server, token| server.keep_file(token, id, bytes))
+        let keep = || self.ask(|server, token| server.keep_file(token, id, bytes));
+        match keep() {
+            Err(refused) if refused.code() == Some(Code::Stale) => keep(),
+            kept => kept,
+        }
     }
 
     /// The names of the pictures the server holds for a document, each without `assets/`.

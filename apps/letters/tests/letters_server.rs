@@ -387,6 +387,7 @@ impl Desk {
                     told.extend(self.tell());
                 }
                 Told::Refused(refusal) => self.refused.push(refusal),
+                Told::Unsent(sentence) => panic!("the server did not take the file: {sentence}"),
                 Told::Unkept(name) => self.unkept.push(name),
                 Told::Whole => {
                     self.save();

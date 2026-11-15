@@ -455,6 +455,9 @@ pub enum Told {
     Notes(Notes),
     /// The server did not take work that was sent, and why. The work stays in the copy here.
     Refused(Refusal),
+    /// The server did not take the copy's file, and said why in this sentence, which is the person's to
+    /// read. The work stays in the copy here.
+    Unsent(String),
     /// The server did not take the picture of this name, so the others will not see it.
     Unkept(String),
     /// What was written here fits no frame, so the server takes the copy's file whole. Save the copy, and
@@ -719,9 +722,13 @@ impl Line {
                 (self.whole, self.send_at) = (Whole::Wanted, Some(now + HAND_AGAIN));
                 return Vec::new();
             }
-            Said::Sent(Some(_)) => {
+            Said::Sent(Some(refused)) => {
                 self.whole = Whole::No;
-                return vec![Told::Refused(Refusal::TooLarge)];
+                // Too large is the line's own word. Whatever else the server found, it says for itself.
+                return vec![match refused.code() {
+                    Some(Code::TooLarge) | None => Told::Refused(Refusal::TooLarge),
+                    Some(_) => Told::Unsent(sentence(&refused)),
+                }];
             }
             Said::Brought(brought) => {
                 self.whole = Whole::No;

@@ -1498,6 +1498,7 @@ impl DocWindow {
                 }
                 // The work stays in the copy here. The person is told why it went no further.
                 Told::Refused(refusal) => self.view.set_notice(Some(&refusal.to_string())),
+                Told::Unsent(sentence) => self.view.set_notice(Some(&sentence)),
                 Told::Unkept(_) => self.view.set_notice(Some(UNKEPT)),
                 // The file goes to the server whole, once a save has put everything in it.
                 Told::Whole => {
