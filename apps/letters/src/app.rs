@@ -49,7 +49,7 @@ use crate::files::{self, EXTENSION, Exchange, Home, Merged, Opened, Rest, STYLES
 use crate::gpu::Gpu;
 use crate::import::{self, Choices, Plan};
 use crate::input::{self, Composer, Press};
-use crate::journal::{Journal, Journals};
+use crate::journal::{self, Journal, Journals};
 use crate::library::{Library, Place, Recent, Refused, UNTITLED, has_content};
 use crate::links::{self, Step};
 use crate::measure::{FIRST_FRAME, Launch, Typing};
@@ -98,8 +98,8 @@ pub enum Event {
     /// What a window's first paint did not need has been read.
     Read(WindowId),
     /// The folder of a window's document, whose file is at this path, was looked through for conflict
-    /// copies of it.
-    Copies(WindowId, PathBuf, Vec<conflicts::Copy>),
+    /// copies of it, and for the file it is itself a conflict copy of.
+    Beside(WindowId, PathBuf, Box<conflicts::Beside>),
     /// The search for a GPU has ended, with one or without.
     Gpu(Option<Box<Gpu>>),
     /// The desktop has said whether it wants less motion.
@@ -488,6 +488,19 @@ struct DocWindow {
     merging: Vec<(PathBuf, bool)>,
     /// The files the save that is running merges.
     carried: Vec<(PathBuf, bool)>,
+    /// The file this document was copied from by hand, which it still says it is. With its first edit
+    /// it becomes a document of its own. `None` once it has, and for a document with no such file.
+    twin: Option<PathBuf>,
+    /// Whether that file was looked for, which is done once.
+    twinned: bool,
+    /// The id the document had and the one it took as it became its own, until the app has carried what
+    /// the person trusts of the first over to the second.
+    forked: Option<(String, String)>,
+    /// The file this document is a conflict copy of, as the view was last told.
+    original: Option<PathBuf>,
+    /// The conflict copy this window left for its original, and that original. The copy goes to the
+    /// trash once a save has merged the document into the original's file.
+    left: Option<(PathBuf, PathBuf)>,
     /// Pictures the page asked for whose files were not to be had while a read or a save was under way.
     awaited: Vec<String>,
     /// Linked pictures that were asked for before the file said which document this is, which decides
@@ -1126,7 +1139,7 @@ impl DocWindow {
         // The journal has everything a save is handed, and a new document's before it is given a file.
         self.record();
         let Some(home) = self.settle(true, library, now) else { return };
-        if !self.unsaved() && !self.owes() && self.merging.is_empty() {
+        if !self.unsaved() && !self.owes() && self.merging.is_empty() && self.left.is_none() {
             // Only the name was due.
             return self.relist(library);
         }
@@ -1225,19 +1238,25 @@ impl DocWindow {
 
     /// Looks beside the document's file for conflict copies of it, on another thread. What is found
     /// arrives as an event. Nothing is looked for until the file exists and has said which document it is.
-    fn look_for_copies(&self, proxy: &EventLoopProxy<Event>) {
+    ///
+    /// The first look is also for the file the document was copied from by hand, beside it or among the
+    /// recent documents.
+    fn look_for_copies(&mut self, proxy: &EventLoopProxy<Event>, library: &Library) {
         let home = self.place.home().filter(|home| self.keeps && home.written());
         let (Some(id), Some(home)) = (self.id.clone(), home.map(|home| home.path().to_owned())) else { return };
         let (window, proxy) = (self.window.id(), proxy.clone());
+        let recent = || library.recents().into_iter().map(|recent| recent.path).collect::<Vec<_>>();
+        let known = (!std::mem::replace(&mut self.twinned, true)).then(recent);
         thread::spawn(move || {
-            let copies = conflicts::beside(&home, &id);
-            let _ = proxy.send_event(Event::Copies(window, home, copies));
+            let found = conflicts::look(&home, &id, known.as_deref());
+            let _ = proxy.send_event(Event::Beside(window, home, Box::new(found)));
         });
     }
 
-    /// Tells the view of the conflict copies found beside the file at `home`: those that hold what the
-    /// document lacks, and are not on their way in already.
-    fn found_copies(&mut self, home: &Path, found: Vec<conflicts::Copy>, library: &Library) {
+    /// Tells the view what was found beside the file at `home`: the conflict copies that hold what the
+    /// document lacks and are not on their way in already, and the file the document is itself a
+    /// conflict copy of.
+    fn found_beside(&mut self, home: &Path, found: conflicts::Beside, library: &Library) {
         // The document may have been moved since its folder was read.
         if self.place.path() != Some(home) {
             return;
@@ -1245,11 +1264,82 @@ impl DocWindow {
         let model = self.view.editor().model();
         let waiting = |path: &Path| self.merging.iter().chain(&self.carried).any(|(other, _)| other == path);
         let adds = |copy: &conflicts::Copy| copy.adds_to(model) && !waiting(&copy.path);
-        let copies: Vec<PathBuf> = found.into_iter().filter(adds).map(|copy| copy.path).collect();
+        let copies: Vec<PathBuf> = found.copies.into_iter().filter(adds).map(|copy| copy.path).collect();
+        let original = found.original.filter(|file| file.related_to(model)).map(|file| file.path);
         // Told once whatever was found, and then only of a change: a bar the person hid stays hidden.
         if self.copies.as_ref() != Some(&copies) {
             self.tell_copies(copies, library);
         }
+        if self.original != original {
+            self.view.set_conflict_original(original.as_deref().map(|path| merge_file(path, library)));
+            self.original = original;
+        }
+        if found.twin.is_some() {
+            self.twin = found.twin;
+        }
+    }
+
+    /// Makes the document one of its own, if it is a copy made by hand that has just been written in:
+    /// it takes a new id, which its next save writes, and keeps its history. Its original is the one
+    /// document of the old id again.
+    fn become_own(&mut self, journals: &mut Journals) {
+        if self.twin.is_none() || self.view.edits() == self.saved_edits {
+            return;
+        }
+        // The copy is away while a save runs. A journal that holds an earlier session's work goes by
+        // the old id until a save has found that work in the file.
+        if self.saving.is_some() || self.journal.as_ref().is_some_and(Journal::owes) {
+            return;
+        }
+        let (Some(copy), Some(was)) = (&mut self.copy, self.id.clone()) else { return };
+        let id = platform::document_id();
+        copy.fork(id.clone());
+        // Journals go by id, and the old one is the original's from here on. Nothing written in this
+        // window is in it.
+        self.journal = None;
+        if self.keeps
+            && let Some(claim) = journal::claim(journals.folder(), &id)
+        {
+            self.journal = Some(journals.open(claim, &id, &copy.created, self.place.path()));
+        }
+        (self.id, self.forked, self.twin) = (Some(id.clone()), Some((was, id)), None);
+    }
+
+    /// Leaves the conflict copy the window shows for `original`, the file it is a copy of: the next save
+    /// goes there, and merges with what that file holds. Fails with what to tell the person when the
+    /// copy's own file could not first be brought up to date.
+    fn leave_for(&mut self, original: PathBuf, library: &Library, journals: &mut Journals) -> Result<(), String> {
+        // Everything is in the copy's file first, so that nothing is only in memory if the original
+        // does not take the merge.
+        self.save_now(true, library, journals)?;
+        let Some(copy) = self.place.path().map(Path::to_owned) else { return Ok(()) };
+        self.place.saved(Home::at(&original));
+        self.rehome();
+        self.left = Some((copy, original));
+        self.original = None;
+        self.view.set_conflict_original(None);
+        self.retitle();
+        self.relocate(library);
+        Ok(())
+    }
+
+    /// Ends the move from a conflict copy to its original, now that a save has gone through: the copy
+    /// goes to the trash if the original took the document. Returns the copy's name if it did.
+    fn arrived(&mut self, copy: &Path, original: &Path) -> Option<String> {
+        if self.place.path() != Some(original) {
+            // The save could not replace the original, and wrote the document beside it once more.
+            self.view.refuse_merge(&format!(
+                "This document could not be merged into {}, and is kept as {}.",
+                named(original),
+                self.place.path().map(named).unwrap_or_default()
+            ));
+            return None;
+        }
+        if let Err(error) = conflicts::discard(copy) {
+            let said = format!("{} was merged, but could not be moved to the trash: {error}", named(copy));
+            self.view.refuse_merge(&said);
+        }
+        Some(named(copy))
     }
 
     fn tell_copies(&mut self, copies: Vec<PathBuf>, library: &Library) {
@@ -1267,20 +1357,20 @@ impl DocWindow {
     }
 
     /// Deals with the files a save was to merge: a conflict copy that is in the document goes to the
-    /// trash, and the person reads of each file that is not.
-    fn merged(&mut self, merged: Vec<Merged>, library: &Library) {
+    /// trash, and the person reads of each file that is not. Returns the names of those that are.
+    fn merged(&mut self, merged: Vec<Merged>, library: &Library) -> Vec<String> {
         let carried = std::mem::take(&mut self.carried);
-        let mut refused = Vec::new();
+        let (mut names, mut refused) = (Vec::new(), Vec::new());
         for Merged { path, result } in merged {
             let copy = carried.iter().any(|(carried, copy)| *copy && *carried == path);
             match result {
-                Ok(()) if copy => {
-                    if let Err(error) = conflicts::discard(&path) {
+                Ok(()) => {
+                    names.push(named(&path));
+                    if copy && let Err(error) = conflicts::discard(&path) {
                         refused
                             .push(format!("{} was merged, but could not be moved to the trash: {error}", named(&path)));
                     }
                 }
-                Ok(()) => {}
                 Err(files::Error::Format(letters_format::Error::Unmerged)) => refused.push(format!(
                     "{} could not be merged: it is not a copy of this document, or a newer Letters wrote it.",
                     named(&path)
@@ -1298,6 +1388,7 @@ impl DocWindow {
                 self.tell_copies(left, library);
             }
         }
+        names
     }
 
     /// Says whether comments can be written, now that the copy is back from a read or a save: not on
@@ -1320,7 +1411,8 @@ impl DocWindow {
     fn saved(&mut self, exchange: Exchange, edits: u64, revision: Revision, library: &Library) {
         let Exchange { home, news, notes, held, merged } = exchange;
         // A merge the person asked for is a version however lately another was marked.
-        let asked = merged.iter().any(|merged| merged.result.is_ok());
+        let left = self.left.take();
+        let asked = left.is_some() || merged.iter().any(|merged| merged.result.is_ok());
         self.place.saved(home);
         self.rehome();
         if let Some(journal) = &mut self.journal {
@@ -1361,7 +1453,13 @@ impl DocWindow {
             let at = self.view.editor().model().revision();
             self.mark(&at, TagKind::Merge, None);
         }
-        self.merged(merged, library);
+        let mut names = self.merged(merged, library);
+        names.extend(left.and_then(|(copy, original)| self.arrived(&copy, &original)));
+        if !names.is_empty() {
+            // Said where "Saved" stands, so that is said first.
+            self.retitle();
+            self.view.set_merged(names);
+        }
     }
 
     /// Saves to `home` on this thread, with the copy the window keeps for it.
@@ -1392,10 +1490,12 @@ impl DocWindow {
         let now = Instant::now();
         self.finish_read(journals)?;
         self.finish_save(library, now);
+        self.become_own(journals);
         // A copy that could not be read was reported when that failed, and holds nothing back now.
         let Some(mut copy) = self.copy.take() else { return Ok(()) };
         self.record();
-        let due = |window: &Self| window.unsaved() || window.owes() || !window.merging.is_empty();
+        let merges = |window: &Self| !window.merging.is_empty() || window.left.is_some();
+        let due = |window: &Self| window.unsaved() || window.owes() || merges(window);
         let home = self.settle(caret, library, now).filter(|_| due(self));
         let saved = home.map(|home| self.exchange(&home, &mut copy, library));
         // A file that was just written is read back, which lets the journal go. A journal that stays is
@@ -1537,6 +1637,11 @@ impl App {
             copies: None,
             merging: Vec::new(),
             carried: Vec::new(),
+            twin: None,
+            twinned: false,
+            forked: None,
+            original: None,
+            left: None,
             awaited: Vec::new(),
             links: Vec::new(),
             linked: BTreeMap::new(),
@@ -1692,6 +1797,7 @@ impl App {
                 Request::Print => self.print(id),
                 Request::MergeConflicts { confirmed } => self.merge_conflicts(id, confirmed, now),
                 Request::MergeFrom { path, confirmed } => self.merge_from(id, path.map(PathBuf::from), confirmed, now),
+                Request::MergeIntoOriginal { confirmed } => self.merge_into_original(id, confirmed, now),
                 // A request this shell does not know yet.
                 _ => {}
             }
@@ -2013,6 +2119,22 @@ impl App {
         window.tell_copies(Vec::new(), &self.library);
     }
 
+    /// Merges a window's document, which is a conflict copy, into the file it is a copy of, and carries
+    /// on in that file. The press is enough in a trusted document, and safe mode asks first, as for the
+    /// copies of a document. Every asking is answered: with a question, a refusal, or no original left
+    /// to offer.
+    fn merge_into_original(&mut self, id: WindowId, confirmed: bool, now: Instant) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        let Some(original) = window.original.clone() else { return window.view.set_conflict_original(None) };
+        if !confirmed && !window.trusted(self.trust.trust()) {
+            return window.view.ask_merge_into(merge_file(&original, &self.library));
+        }
+        if let Err(error) = window.leave_for(original, &self.library, &mut self.journals) {
+            return window.view.refuse_merge(&error);
+        }
+        window.save_at = Some(now);
+    }
+
     /// Merges a file into a window's document with its next save: the one at `path`, or one the person
     /// picks. A file no trusted folder vouches for is asked about first, unless that was `confirmed`.
     fn merge_from(&mut self, id: WindowId, path: Option<PathBuf>, confirmed: bool, now: Instant) {
@@ -2200,6 +2322,23 @@ impl App {
                 eprintln!("letters: could not record a new document as trusted: {error}");
             }
         }
+        // A copy made by hand is trusted as its original was when the two parted: a document the person
+        // trusts stays trusted, and one they brought in from elsewhere is still no folder's to vouch for.
+        let forked: Vec<(String, String)> =
+            self.windows.values_mut().filter_map(|window| window.forked.take()).collect();
+        for (was, id) in &forked {
+            let (trusted, imported) = (self.trust.trust().trusts_document(was), self.trust.trust().imported(was));
+            let kept = imported.then(|| self.trust.import_document(id)).transpose();
+            let kept = kept.and_then(|_| trusted.then(|| self.trust.trust_document(id)).transpose());
+            if let Err(error) = kept {
+                eprintln!("letters: could not carry over what is trusted of a copied document: {error}");
+            }
+        }
+        if !forked.is_empty() {
+            for window in self.windows.values_mut() {
+                window.retrust(self.trust.trust(), &self.library);
+            }
+        }
     }
 
     fn close(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
@@ -2365,7 +2504,7 @@ impl ApplicationHandler<Event> for App {
                 if focused && window.rest.is_none() {
                     window.reword(&self.words);
                     // A sync tool may have left a copy of the document while the window was left alone.
-                    window.look_for_copies(&self.proxy);
+                    window.look_for_copies(&self.proxy, &self.library);
                 }
                 // The clock may have moved to summer time, or the person to another zone, while the
                 // window was left alone.
@@ -2469,9 +2608,9 @@ impl ApplicationHandler<Event> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         let now = Instant::now();
         match event {
-            Event::Copies(id, home, copies) => {
+            Event::Beside(id, home, found) => {
                 if let Some(window) = self.windows.get_mut(&id) {
-                    window.found_copies(&home, copies, &self.library);
+                    window.found_beside(&home, *found, &self.library);
                     window.sync(now);
                 }
             }
@@ -2479,7 +2618,7 @@ impl ApplicationHandler<Event> for App {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.finish_save(&self.library, now);
                     // A sync tool may have left a copy since the folder was last looked at.
-                    window.look_for_copies(&self.proxy);
+                    window.look_for_copies(&self.proxy, &self.library);
                     window.ask_again(&mut self.decoder, &self.proxy);
                     // Another writer's edits may have come in with it, in a language of their own.
                     window.ask_dictionaries(&self.proxy, &self.dictionaries);
@@ -2516,7 +2655,7 @@ impl ApplicationHandler<Event> for App {
                 window.ask_again(&mut self.decoder, &self.proxy);
                 // The file has said which document it is, so what the person trusts can be asked about it.
                 window.retrust(self.trust.trust(), &self.library);
-                window.look_for_copies(&self.proxy);
+                window.look_for_copies(&self.proxy, &self.library);
                 let links = std::mem::take(&mut window.links);
                 window.access_stale = true;
                 window.sync(now);
@@ -2662,6 +2801,8 @@ impl ApplicationHandler<Event> for App {
                 window.wake_ms = window.view.animate(now_ms);
                 window.sync(now);
             }
+            // Before anything of the edit is journalled or saved under the id of its original.
+            window.become_own(&mut self.journals);
             if window.journal_at.is_some_and(|at| at <= now) {
                 window.record();
             }
@@ -2689,6 +2830,10 @@ impl ApplicationHandler<Event> for App {
             for due in [wake, save, window.journal_at, type_next].into_iter().flatten() {
                 next = Some(next.map_or(due, |next| next.min(due)));
             }
+        }
+        // A document that just became its own is trusted as its original was, before anything asks.
+        if self.windows.values().any(|window| window.forked.is_some()) {
+            self.vouch();
         }
         event_loop.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }

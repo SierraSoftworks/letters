@@ -108,6 +108,12 @@ impl Home {
         Self { path: path.into(), written: false }
     }
 
+    /// The home of a document in the file at `path`, which is there already and holds that document, as
+    /// the original of a conflict copy does. A save merges with what the file holds.
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into(), written: true }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -434,6 +440,11 @@ pub fn reopen(claim: Claim) -> Option<Opened> {
     let on_file = unsaved.home.as_deref().map(Path::new).and_then(|path| {
         let mut archive = Archive::open(Cursor::new(fs::read(path).ok()?)).ok()?;
         let mut copy = WorkingCopy::open(&mut archive, replica()).ok()?;
+        // A copy made by hand that became a document of its own, and never reached its file as one: the
+        // file still says it is the original. A file that is neither refuses the journal.
+        if copy.id != unsaved.id {
+            copy.fork(unsaved.id.clone());
+        }
         let added = copy.replay(unsaved).ok()?;
         Some((Home { path: path.into(), written: true }, copy, added))
     });

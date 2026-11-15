@@ -720,3 +720,33 @@ fn text_that_reads_from_the_right_is_set_from_the_right() {
     }
     assert!(text.contains("plaintext"), "by its own first letter: {text}");
 }
+
+#[test]
+fn a_list_item_and_a_quote_that_read_from_the_right_stand_at_the_right() {
+    // An item says its side where it is not the side of the item it sits in.
+    let list = "- Left\n  - Nested left\n- שלום\n  - מקונן\n  - Left in right\n\n1. مرحبا\n\n- [x] משימה\n";
+    let html = export(&document(list));
+    let items: Vec<&str> =
+        html.match_indices("<li").map(|(at, _)| &html[at..at + html[at..].find('>').unwrap()]).collect();
+    let sides: Vec<Option<&str>> =
+        items.iter().map(|item| item.split("dir=\"").nth(1).map(|side| &side[..3])).collect();
+    assert_eq!(sides, [None, None, Some("rtl"), None, Some("ltr"), Some("rtl"), Some("rtl")], "{items:?}");
+
+    // An item's indent and what stands before it are measured from the side it starts at, whichever that is.
+    let css = stylesheet(&html);
+    let of_items =
+        |rule: &&str| rule.split('{').next().unwrap().split([' ', ',', '>']).any(|part| part.starts_with("li"));
+    for rule in css.split('}').filter(of_items) {
+        assert!(!rule.contains("-left") && !rule.contains("-right") && !rule.contains(" right"), "{rule}");
+    }
+    assert!(css.contains("padding-inline-start"), "an item is set in at its own side");
+
+    let quotes = export(&document("> שלום\n>\n> Left\n\n> Left\n>\n> שלום\n"));
+    let quotes = article(&quotes);
+    assert_eq!(quotes.matches("<blockquote").count(), 2);
+    assert_eq!(quotes.matches("<blockquote class=\"rtl\">").count(), 1, "its first block says: {quotes}");
+    assert!(quotes.starts_with("<blockquote class=\"rtl\">"), "{quotes}");
+
+    // A copy says the side too, for whatever it is pasted into.
+    assert!(to_html_fragment(&document("- שלום\n").blocks).contains("<li dir=\"rtl\">"));
+}

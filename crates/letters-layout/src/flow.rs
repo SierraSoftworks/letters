@@ -344,7 +344,7 @@ pub fn rtl(block: &Block) -> bool {
 
 /// Whether what a quote holds reads from the right: its first block says, a text by its letters and a quote
 /// or callout by what it holds in turn.
-fn leads(blocks: &[Block]) -> bool {
+pub fn leads(blocks: &[Block]) -> bool {
     blocks.first().is_some_and(|first| match &first.body {
         Body::Blocks(inside) if matches!(first.kind, BlockKind::Quote | BlockKind::Callout { .. }) => leads(inside),
         Body::Text(_) => rtl(first),

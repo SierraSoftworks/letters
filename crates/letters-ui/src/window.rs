@@ -1104,14 +1104,34 @@ impl EditorApp {
             {
                 // While the history shows an earlier version, the copy is of that.
                 let version = self.history.as_ref().and_then(History::copied);
-                self.copying = Some(Copy::open(format, &self.location, &title, version));
+                let mut copy = Copy::open(format, &self.location, &title, version);
+                self.weigh(&mut copy);
+                self.copying = Some(copy);
             }
             return;
         };
+        let format = copy.format();
         match copy.update(message, &self.location, &title, &mut self.requests) {
-            copying::Outcome::Open => self.copying = Some(copy),
+            copying::Outcome::Open => {
+                if copy.format() != format {
+                    self.weigh(&mut copy);
+                }
+                self.copying = Some(copy);
+            }
             copying::Outcome::Asked => self.copy_asked = Some(copy),
             copying::Outcome::Closed => {}
+        }
+    }
+
+    /// Has the card list what a copy in its format will simplify, from what the copy is made of.
+    fn weigh(&mut self, copy: &mut Copy) {
+        let earlier = copy.version().map(|revision| self.editor.document_at(revision));
+        let shown = |address: &str| self.images.get(address).is_some();
+        match &earlier {
+            // An earlier version is copied without the notes, which were made on what the document reads now.
+            Some(Ok((document, _))) => copy.weigh(document, &Notes::default(), &shown),
+            Some(Err(_)) => {}
+            None => copy.weigh(self.editor.doc(), &self.margin.notes, &shown),
         }
     }
 
@@ -1791,6 +1811,7 @@ impl EditorApp {
             Act::Save => (self.save == SaveState::Edited).then_some(Message::Ask(Request::Save))?,
             Act::SaveCopy => Message::Copy(Copying::Open(CopyFormat::Letters)),
             Act::Export => Message::Copy(Copying::Open(CopyFormat::Pdf)),
+            Act::CleanCopy => Message::Copy(Copying::Open(CopyFormat::Clean)),
             Act::Share => Message::Share(true),
             Act::Settings => Message::Settings(Setting::Show),
             Act::PageSetup => Message::Styles(Styling::PageSetup),

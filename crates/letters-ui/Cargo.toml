@@ -18,6 +18,7 @@ letters-render.workspace = true
 letters-fonts.workspace = true
 letters-layout.workspace = true
 letters-editor.workspace = true
+letters-convert.workspace = true
 letters-math.workspace = true
 image.workspace = true
 accesskit.workspace = true

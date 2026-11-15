@@ -55,7 +55,8 @@ pub type Assets<'a> = &'a mut dyn FnMut(&str) -> Option<Vec<u8>>;
 /// - A block or a passage in another language than the document's says so with `lang`, and a block that
 ///   starts a page with `data-page-break`, which the stylesheet turns into a break when the page is printed.
 /// - Text that starts with a letter read from the right is set from the right, as on the page. A list item
-///   is not: its marker is drawn in its line, and would change sides with it.
+///   that does says so with `dir`, and has its marker and its indent at the right, and so has a quote, of
+///   the class `rtl`, whose first block does.
 /// - A table of contents is a line for each heading it lists, which leads to the heading. A link preview
 ///   is a card that is one link, with its picture written in.
 /// - An unknown block is written as its fallback text. Unknown marks and fields are left out.
@@ -256,12 +257,22 @@ fn escape(text: &str, out: &mut String) {
 fn blocks(blocks: &[Block], page: &mut Writing, out: &mut String) {
     // The lists that are open, outermost first, each with its latest item still open.
     let mut lists: Vec<&str> = Vec::new();
+    // Whether each open item reads from the right, outermost first.
+    let mut sides: Vec<bool> = Vec::new();
     for block in blocks {
         if let BlockKind::ListItem { list, depth } = block.kind {
             let start = out.len();
             item(&mut lists, list, depth, block.body.runs(), page.text(0), out);
             // The item is the last one opened: text never holds a tag.
-            told(block, out[start..].rfind("<li").map(|at| start + at), page, out);
+            let opened = out[start..].rfind("<li").map(|at| start + at);
+            told(block, opened, page, out);
+            // An item takes the side of the one it sits in, so it says its own only where they differ.
+            sides.truncate(lists.len().saturating_sub(1));
+            let (rtl, around) = (letters_layout::rtl(block), sides.last().copied().unwrap_or(false));
+            if let (Some(opened), true) = (opened, rtl != around) {
+                out.insert_str(opened + "<li".len(), if rtl { " dir=\"rtl\"" } else { " dir=\"ltr\"" });
+            }
+            sides.push(rtl);
             continue;
         }
         close(&mut lists, 0, out);
@@ -316,7 +327,12 @@ fn written(block: &Block, page: &mut Writing, out: &mut String) {
             maths(&block.plain_text(), true, page.text(0).maths, out);
             out.push('\n');
         }
-        BlockKind::Quote => container("<blockquote>", "</blockquote>", block.body.blocks(), page, out),
+        BlockKind::Quote => {
+            // Its bar stands where its first block starts, as layout draws it.
+            let open =
+                if letters_layout::leads(block.body.blocks()) { "<blockquote class=\"rtl\">" } else { "<blockquote>" };
+            container(open, "</blockquote>", block.body.blocks(), page, out);
+        }
         BlockKind::Callout { tone, .. } => {
             let open = callout(&block.kind, tone_name(*tone));
             container(&open, "</div>", block.body.blocks(), page, out);
@@ -1029,15 +1045,15 @@ fn colours(style: &Style, on: &Palette, css: &mut String) {
 
 /// Writes what stands before each list item, where layout draws it: ending 8 pixels before the text, a
 /// bullet or a box level with the middle of a lower-case letter. A browser's own markers sit a few pixels
-/// off, and it greys a box that cannot be ticked.
+/// off, and it greys a box that cannot be ticked. The measures are from the side the item starts at.
 fn markers(text: f32, css: &mut String) {
     let dot = (text * 0.36).round().max(3.0);
     // An empty marker, where `none` would have some screen readers stop calling the list a list.
     let _ = write!(
         css,
         "li {{ list-style-type: \"\"; }}\n\
-         li::before {{ display: inline-block; box-sizing: border-box; margin-right: 8px; }}\n\
-         ul > li::before {{ content: \"\"; width: {dot}px; height: {dot}px; margin-left: -{reach}px; \
+         li::before {{ display: inline-block; box-sizing: border-box; margin-inline-end: 8px; }}\n\
+         ul > li::before {{ content: \"\"; width: {dot}px; height: {dot}px; margin-inline-start: -{reach}px; \
          vertical-align: calc(0.34em - {half}px); border-radius: 50%; background: currentColor; }}\n",
         reach = dot + 8.0,
         half = dot / 2.0,
@@ -1050,15 +1066,19 @@ fn markers(text: f32, css: &mut String) {
             _ => "border: 0; border-radius: 0; background: currentColor;",
         };
         let _ = writeln!(css, "{}ul > li::before {{ {shape} }}", "li ".repeat(depth));
+        // An item that reads the other way than the one it sits in has its whole indent at its own side.
+        let inset = depth * 24;
+        let _ = writeln!(css, "{}li[dir] {{ margin-inline: {inset}px -{inset}px; }}", "li ".repeat(depth));
     }
     css.push_str(concat!(
         "ol { counter-reset: item; }\n",
         "ol > li { counter-increment: item; }\n",
-        "ol > li::before { content: counter(item) \".\"; width: 4em; margin-left: calc(-4em - 8px); ",
-        "text-align: right; }\n",
+        "ol > li::before { content: counter(item) \".\"; width: 4em; margin-inline-start: calc(-4em - 8px); ",
+        "text-align: end; }\n",
         "li.task::before { content: none; }\n",
         "li.task > input { appearance: none; -webkit-appearance: none; box-sizing: border-box; width: 14px; ",
-        "height: 14px; margin: 0 8px 0 -22px; vertical-align: calc(0.34em - 7px); border: 1.5px solid; ",
+        "height: 14px; margin: 0; margin-inline: -22px 8px; vertical-align: calc(0.34em - 7px); ",
+        "border: 1.5px solid; ",
         "border-radius: 3px; }\n",
     ));
 }
@@ -1139,11 +1159,13 @@ fn css(style: &Style, with: &HtmlPage, css: &mut String) {
          .unknown {{ padding: 11px 15px; border: 1px solid; border-radius: 6px; }}\n\
          pre {{ padding: 12px 16px; border-radius: 6px; white-space: pre-wrap; \
          overflow-wrap: anywhere; tab-size: 4; }}\n\
-         ul, ol {{ margin: {before} 0 {after}; padding-left: 24px; }}\n\
+         ul, ol {{ margin: {before} 0 {after}; padding: 0; }}\n\
+         li {{ padding-inline-start: 24px; }}\n\
          li + li, li > ul, li > ol {{ margin-top: {between}; }}\n\
          li > ul, li > ol {{ margin-bottom: 0; }}\n\
          :is(ul, ol) + :is(ul, ol) {{ margin-top: {beside}; }}\n\
          blockquote {{ margin: {after} 0; padding: 0 0 0 16px; border-left: 3px solid; }}\n\
+         blockquote.rtl {{ padding: 0 16px 0 0; border-width: 0 3px 0 0; border-style: solid; }}\n\
          .callout {{ margin: {callout_gap} 0; padding: 12px 16px 12px 13px; border-left: 3px solid; \
          border-radius: 6px; }}\n\
          .callout > .callout-title {{ display: flex; align-items: center; gap: 8px; margin: 0 0 4px; \

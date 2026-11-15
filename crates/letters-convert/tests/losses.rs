@@ -41,10 +41,14 @@ fn everything() -> (Document, Notes) {
     let mut later = Block::text("later", BlockKind::Heading { level: 2 }, "Later");
     later.page_break = true;
     let bright = BlockKind::Callout { tone: Tone::Tip, title: None, icon: Some("star".into()), color: None };
+    let preview =
+        BlockKind::LinkPreview { url: "https://example.com/".into(), title: None, description: None, image: None };
     let nested = vec![
         Block::text("q1", BlockKind::Paragraph, "Kept in the quote"),
         Block::text("q2", BlockKind::Code { language: Some("rust".into()) }, "let rate = 4;"),
         Block::text("q3", BlockKind::Heading { level: 3 }, "Inside"),
+        // Word keeps this one in the quote, as it does the paragraph.
+        Block::new("q4", preview.clone()),
     ];
     let blocks = vec![
         Block::text("p", BlockKind::Paragraph, "Rates change in January."),
@@ -65,10 +69,7 @@ fn everything() -> (Document, Notes) {
         holding("quote", BlockKind::Quote, nested),
         Block::text("bare", BlockKind::Code { language: None }, "plain text"),
         Block::new("toc", BlockKind::TableOfContents { levels: 3 }),
-        Block::new(
-            "card",
-            BlockKind::LinkPreview { url: "https://example.com/".into(), title: None, description: None, image: None },
-        ),
+        Block::new("card", preview),
     ];
     let version = || Version {
         author: "Ada".into(),
@@ -104,7 +105,7 @@ fn each_format_lists_what_it_cannot_carry() {
                 (PageBreaks, 1),
                 (Languages, 2),
                 // Its table of contents is written as the list it shows.
-                (LinkPreviews, 1),
+                (LinkPreviews, 2),
             ],
         ),
         (Target::Html, vec![(UnknownBlocks, 1), (UnknownMarks, 1), (Comments, 2), (LinkedPictures, 1)]),

@@ -36,7 +36,7 @@ pub enum Refused {
 impl Refused {
     /// Whether the copy can be asked for again with the file that is in the way replaced.
     pub fn replaceable(&self) -> bool {
-        matches!(self, Self::Taken { format, .. } if *format != CopyFormat::Letters)
+        matches!(self, Self::Taken { format, .. } if !document(*format))
     }
 }
 
@@ -46,7 +46,7 @@ impl fmt::Display for Refused {
             Self::NoName => f.write_str("A copy needs a name."),
             Self::Nothing => f.write_str("There is nothing to copy yet."),
             Self::NoVersion => f.write_str("That version could not be read."),
-            Self::Taken { name, format: CopyFormat::Letters } => {
+            Self::Taken { name, format } if document(*format) => {
                 write!(f, "There is already a document called \u{201c}{name}\u{201d} in that folder.")
             }
             Self::Taken { name, .. } => write!(f, "\u{201c}{name}\u{201d} is already in that folder."),
@@ -56,6 +56,11 @@ impl fmt::Display for Refused {
 }
 
 impl std::error::Error for Refused {}
+
+/// Whether a copy in a format is a Letters document, which never takes the place of another.
+fn document(format: CopyFormat) -> bool {
+    matches!(format, CopyFormat::Letters | CopyFormat::Clean)
+}
 
 /// What a file in a format ends in.
 pub fn extension(format: CopyFormat) -> &'static str {
@@ -68,7 +73,7 @@ pub fn extension(format: CopyFormat) -> &'static str {
 /// The format's name for a file dialog.
 pub fn kind(format: CopyFormat) -> &'static str {
     match format {
-        CopyFormat::Letters => "Letters document",
+        CopyFormat::Letters | CopyFormat::Clean => "Letters document",
         CopyFormat::Word => "Word document",
         CopyFormat::Pdf => "PDF",
         CopyFormat::WebPage => "Web page",
@@ -80,6 +85,7 @@ pub fn kind(format: CopyFormat) -> &'static str {
 fn exported(format: CopyFormat) -> Option<Format> {
     match format {
         CopyFormat::Letters => None,
+        CopyFormat::Clean => Some(Format::Clean),
         CopyFormat::Word => Some(Format::Docx),
         CopyFormat::Pdf => Some(Format::Pdf),
         CopyFormat::WebPage => Some(Format::Html),
@@ -160,9 +166,9 @@ fn put(
     let failed = |error: &dyn fmt::Display| Refused::Failed(error.to_string());
     let name = |path: &Path| path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let title = output.file_stem().unwrap_or_default().to_string_lossy();
-    let taken = |path: &Path| match format {
-        CopyFormat::Letters => Refused::Taken { name: title.to_string(), format },
-        _ => Refused::Taken { name: name(path), format },
+    let taken = |path: &Path| match document(format) {
+        true => Refused::Taken { name: title.to_string(), format },
+        false => Refused::Taken { name: name(path), format },
     };
     let refused = |path: &Path, error: io::Error| match error.kind() {
         io::ErrorKind::AlreadyExists => taken(path),
@@ -184,6 +190,7 @@ fn put(
     for line in &exported.simplified {
         eprintln!("letters: {}: {line}", output.display());
     }
-    exported.write(output, replace).map_err(|(path, error)| refused(&path, error))?;
-    Ok(None)
+    exported.write(output, replace && !document(format)).map_err(|(path, error)| refused(&path, error))?;
+    // A clean copy is a document of its own, which the shell is told of as it is of any copy.
+    Ok(exported.id)
 }
