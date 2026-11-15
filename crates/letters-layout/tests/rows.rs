@@ -587,6 +587,12 @@ fn a_reference_reads_as_its_figure_is_numbered() {
     assert!(caret(start).x < caret(end).x, "the caret steps over a reference");
     assert!((start + 1..end).all(|inside| caret(inside) == caret(end)), "and is never inside one");
     assert!(caret(end).x < caret(end + 2).x, "the text after it runs on from its end");
+
+    let (from, to) = (caret(start), caret(end));
+    let press = |share: f32| layout.hit(Point { x: from.x + (to.x - from.x) * share, y: from.y + from.height / 2.0 });
+    for (share, offset) in [(0.05, start), (0.3, start), (0.7, end), (0.95, end)] {
+        assert_eq!(press(share), Some(Pos::new("a", offset)), "a press {share} along it is at its nearer end");
+    }
 }
 
 /// Figures, a gallery and tables, with a paragraph and a cell that refer to them.

@@ -71,7 +71,8 @@ impl Set {
         at
     }
 
-    /// The source offset of a place in the layout.
+    /// The source offset of a place in the layout. A place inside what stands for a stretch of the source is
+    /// at the nearer end of that stretch, since the two read differently.
     pub fn outward(&self, index: usize) -> usize {
         let mut at = index;
         for swap in &self.swaps {
@@ -79,7 +80,8 @@ impl Set {
                 break;
             }
             if index < swap.shown.end {
-                return if index == swap.shown.start { swap.source.start } else { swap.source.end };
+                let first = index - swap.shown.start < swap.shown.end - index;
+                return if first { swap.source.start } else { swap.source.end };
             }
             at = swap.source.end + (index - swap.shown.end);
         }
