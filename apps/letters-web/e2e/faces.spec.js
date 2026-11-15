@@ -55,6 +55,20 @@ test("Han is fetched as its neighbours are written, and what that face lacks fro
   await expect.poll(() => asked).toEqual(["NotoSansJP.otf", "NotoSansSC.otf"]);
 });
 
+for (const [script, text, face] of [
+  ["Arabic", "العربية", "NotoSansArabic.ttf"],
+  ["Hebrew", "עברית", "NotoSansHebrew.ttf"],
+  ["Devanagari", "हिन्दी", "NotoSansDevanagari.ttf"],
+  ["Thai", "ภาษาไทย", "NotoSansThai.ttf"],
+]) {
+  test(`${script} is drawn in a face of its own`, async ({ page }) => {
+    const asked = faces(page);
+    await ready(page);
+    await page.keyboard.insertText(text);
+    await expect.poll(() => asked).toEqual([face]);
+  });
+}
+
 test("a face that cannot be fetched is done without, and not asked for again", async ({ page }) => {
   await page.route("**/fallback/NotoColorEmoji.ttf", (route) => route.abort());
   const asked = faces(page);

@@ -1,6 +1,7 @@
 //! The faces that back up the fonts in a browser. A page cannot read the system's fonts, so a face for
-//! emoji and one for each way of writing Chinese, Japanese and Korean are kept beside the wasm, and
-//! fetched when a document first shows a character the fonts lack.
+//! emoji, one for each way of writing Chinese, Japanese and Korean, and one for each other script the
+//! desktop shows are kept beside the wasm, and fetched when a document first shows a character the fonts
+//! lack.
 
 use std::ops::RangeInclusive;
 
@@ -17,10 +18,24 @@ pub enum Face {
     /// Chinese as the mainland writes it. It has the most Han characters, so it is the first face for Han
     /// that nothing says more about.
     Simplified,
+    Arabic,
+    Hebrew,
+    Devanagari,
+    Thai,
 }
 
 impl Face {
-    pub const ALL: [Self; 5] = [Self::Emoji, Self::Japanese, Self::Korean, Self::Traditional, Self::Simplified];
+    pub const ALL: [Self; 9] = [
+        Self::Emoji,
+        Self::Japanese,
+        Self::Korean,
+        Self::Traditional,
+        Self::Simplified,
+        Self::Arabic,
+        Self::Hebrew,
+        Self::Devanagari,
+        Self::Thai,
+    ];
 
     /// Its file in `fallback/`.
     pub fn file(self) -> &'static str {
@@ -30,14 +45,26 @@ impl Face {
             Self::Korean => "NotoSansKR.otf",
             Self::Traditional => "NotoSansTC.otf",
             Self::Simplified => "NotoSansSC.otf",
+            Self::Arabic => "NotoSansArabic.ttf",
+            Self::Hebrew => "NotoSansHebrew.ttf",
+            Self::Devanagari => "NotoSansDevanagari.ttf",
+            Self::Thai => "NotoSansThai.ttf",
         }
     }
 }
 
-const HANGUL: [RangeInclusive<u32>; 5] =
-    [0x1100..=0x11FF, 0x3130..=0x318F, 0xA960..=0xA97F, 0xAC00..=0xD7FF, 0xFFA0..=0xFFDC];
-const KANA: [RangeInclusive<u32>; 4] = [0x3040..=0x30FF, 0x31F0..=0x31FF, 0xFF66..=0xFF9F, 0x1B000..=0x1B16F];
-const BOPOMOFO: [RangeInclusive<u32>; 2] = [0x3100..=0x312F, 0x31A0..=0x31BF];
+/// The scripts that one face writes, and where their characters are.
+#[expect(clippy::single_range_in_vec_init, reason = "a script may be in one stretch of Unicode or in several")]
+const SCRIPTS: [(Face, &[RangeInclusive<u32>]); 7] = [
+    (Face::Korean, &[0x1100..=0x11FF, 0x3130..=0x318F, 0xA960..=0xA97F, 0xAC00..=0xD7FF, 0xFFA0..=0xFFDC]),
+    (Face::Japanese, &[0x3040..=0x30FF, 0x31F0..=0x31FF, 0xFF66..=0xFF9F, 0x1B000..=0x1B16F]),
+    // Bopomofo.
+    (Face::Traditional, &[0x3100..=0x312F, 0x31A0..=0x31BF]),
+    (Face::Arabic, &[0x0600..=0x06FF, 0x0750..=0x077F, 0x08A0..=0x08FF, 0xFB50..=0xFDFF, 0xFE70..=0xFEFF]),
+    (Face::Hebrew, &[0x0590..=0x05FF, 0xFB1D..=0xFB4F]),
+    (Face::Devanagari, &[0x0900..=0x097F, 0x1CD0..=0x1CFF, 0xA8E0..=0xA8FF]),
+    (Face::Thai, &[0x0E00..=0x0E7F]),
+];
 /// Han, and the signs and full-width forms the three languages share.
 const SHARED: [RangeInclusive<u32>; 10] = [
     0x2E80..=0x2FDF,
@@ -100,13 +127,12 @@ pub fn chosen<'a>(
     let told: Vec<(char, Told)> = uncovered
         .into_iter()
         .map(|(ch, emoji, lang)| {
-            let told = match ch {
+            let script = SCRIPTS.iter().find(|(_, ranges)| within(ranges, ch));
+            let told = match script {
                 _ if emoji => Told::Face(Face::Emoji),
-                _ if within(&HANGUL, ch) => Told::Face(Face::Korean),
-                _ if within(&KANA, ch) => Told::Face(Face::Japanese),
-                _ if within(&BOPOMOFO, ch) => Told::Face(Face::Traditional),
-                _ if within(&SHARED, ch) => Told::Han(lang.and_then(written)),
-                _ => Told::Nothing,
+                Some((face, _)) => Told::Face(*face),
+                None if within(&SHARED, ch) => Told::Han(lang.and_then(written)),
+                None => Told::Nothing,
             };
             (ch, told)
         })

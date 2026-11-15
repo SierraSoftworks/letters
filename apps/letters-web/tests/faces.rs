@@ -15,8 +15,12 @@ fn fetched(text: &str, lang: Option<&str>, asked: &[Face]) -> Vec<Face> {
 
 #[test]
 fn a_character_asks_for_the_face_of_its_script() {
-    let cases: [(&str, Option<&str>, &[Face]); 9] = [
+    let cases: [(&str, Option<&str>, &[Face]); 13] = [
         ("🙂🎉", None, &[Face::Emoji]),
+        ("العربية", None, &[Face::Arabic]),
+        ("עברית", None, &[Face::Hebrew]),
+        ("हिन्दी", None, &[Face::Devanagari]),
+        ("ภาษาไทย", None, &[Face::Thai]),
         ("한글", None, &[Face::Korean]),
         ("ひらがなカタカナ", None, &[Face::Japanese]),
         ("ㄅㄆㄇ", None, &[Face::Traditional]),
@@ -69,5 +73,5 @@ fn a_character_its_face_lacks_takes_the_next_that_may_have_it() {
 fn nothing_is_fetched_twice_or_for_a_script_no_face_is_kept_for() {
     assert_eq!(fetched("🙂🙂 かな", None, &[Face::Emoji, Face::Japanese]), []);
     assert_eq!(fetched("🙂🙂 かな かな", None, &[]), [Face::Emoji, Face::Japanese]);
-    assert_eq!(fetched("हिन्दी العربية", None, &[]), []);
+    assert_eq!(fetched("ქართული தமிழ்", None, &[]), []);
 }
