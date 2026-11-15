@@ -72,6 +72,11 @@ impl Desk {
         self.held.iter().any(|held| *held >= number)
     }
 
+    /// The room of the document fails, as it would at a fault in its work.
+    pub async fn fault(&self) {
+        self.seat.as_ref().expect("the desk has a seat").0.fault().await;
+    }
+
     /// The person closes the document.
     pub async fn leave(&mut self) {
         if let Some((seat, _)) = self.seat.take() {

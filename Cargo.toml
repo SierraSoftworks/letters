@@ -200,6 +200,13 @@ panic = "abort"
 [profile.release.package.brotli]
 opt-level = 3
 
+# What a server is built with: `cargo build --profile server -p letters-server`. It has many people's
+# documents open at once, and closes the one a panic came from and keeps the others. Where a panic aborts,
+# as in the apps, it would end them all.
+[profile.server]
+inherits = "release"
+panic = "unwind"
+
 # What scripts/fuzz builds: quick to link, and a panic names its line.
 [profile.fuzz]
 inherits = "release"

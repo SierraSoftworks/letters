@@ -259,6 +259,32 @@ async fn a_conflict_copy_is_merged_when_an_editor_asks_and_then_thrown_away() {
     assert_eq!(merge(&ada).await.unwrap(), [""; 0], "with no copy left there is nothing to merge");
 }
 
+#[tokio::test]
+async fn a_room_that_fails_is_closed_alone_and_its_document_opens_with_what_was_kept() {
+    let (server, ada, id) = shared("failed").await;
+    let other = ada.start("family", "", "Other").await.id.expect("a document has an id");
+    let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
+    let mut beside = Desk::open(&server, &ada, &other).await.unwrap();
+    settle([&mut desk, &mut beside]).await;
+    let kept = desk.write("Kept through it. ");
+    settle([&mut desk, &mut beside]).await;
+    assert!(desk.holds(kept), "the server said it keeps this");
+
+    desk.fault().await;
+    settle([&mut desk, &mut beside]).await;
+
+    assert!(!matches!(desk.line.link(), Link::Live(_)), "its devices are let go: {:?}", desk.line.link());
+    assert!(!matches!(desk.line.link(), Link::Refused(_)), "to come back: {:?}", desk.line.link());
+    assert_eq!(beside.line.link(), Link::Live(Role::Editor), "and nobody else's are");
+    let mut again = Desk::open(&server, &ada, &id).await.unwrap();
+    settle([&mut again]).await;
+    assert!(again.texts().join("\n").contains("Kept through it."), "the next room has what the last was told");
+    again.write("And written on. ");
+    settle([&mut again, &mut beside]).await;
+    again.leave().await;
+    assert!(on_file(&ada, &id).await.contains("And written on."), "and is saved as any other");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_file_moved_behind_the_servers_back_is_not_written_again_where_it_was() {
     let (server, ada, id) = shared("moved-away").await;

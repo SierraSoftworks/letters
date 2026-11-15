@@ -7,10 +7,15 @@
 //! `<state>/rooms/`, and a journal that a run of the server left behind is taken to its file as the next
 //! run starts: what a device was told the server holds is not lost with the server.
 //!
+//! A panic in a room's work is a fault of that room alone. The room is closed, its devices come back to
+//! the room that is opened next, and every other document goes on. That holds where a panic unwinds,
+//! which is what the `server` profile builds.
+//!
 //! A room is of a file and not of a document, since a copy made by hand carries the id of its original.
 
 use std::collections::HashMap;
 use std::io::BufReader;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -194,9 +199,8 @@ impl Rooms {
                 rooms.entry(key.clone()).or_insert_with(|| Arc::new(Open::new())).clone()
             };
             let mut state = lock(&open.state);
-            let now = self.now();
             if matches!(*state, State::Opening) {
-                match Hosted::open(self, root, place, None, now) {
+                match Hosted::open(self, root, place, None, self.now()) {
                     Ok(hosted) => {
                         *state = State::Open(Box::new(hosted));
                         tokio::spawn(keep(app.clone(), open.clone()));
@@ -209,16 +213,16 @@ impl Rooms {
                     }
                 }
             }
-            let State::Open(hosted) = &mut *state else {
+            if !matches!(*state, State::Open(_)) {
                 // Dropped as this came for it.
                 drop(state);
                 self.forget(&key, &open);
                 continue;
-            };
-            let done = work(hosted, now);
-            hosted.settle(&open, now);
+            }
+            let done = open.act(self, &mut state, work);
             drop(state);
-            return done.map(|done| (open, done));
+            let failed = || Refusal::new(Code::Internal, "The server failed while answering.");
+            return done.ok_or_else(failed)?.map(|done| (open, done));
         }
     }
 
@@ -226,22 +230,14 @@ impl Rooms {
     fn if_open<T>(&self, key: &str, work: impl FnOnce(&mut Hosted, u64) -> T) -> Option<T> {
         let open = lock(&self.open).get(key).cloned()?;
         let mut state = lock(&open.state);
-        let State::Open(hosted) = &mut *state else { return None };
-        let now = self.now();
-        let done = work(hosted, now);
-        hosted.settle(&open, now);
-        Some(done)
+        open.act(self, &mut state, work)
     }
 
     /// Does `work` in every open room.
     fn each(&self, mut work: impl FnMut(&mut Hosted, u64)) {
         let rooms: Vec<Arc<Open>> = lock(&self.open).values().cloned().collect();
         for open in rooms {
-            if let State::Open(hosted) = &mut *lock(&open.state) {
-                let now = self.now();
-                work(hosted, now);
-                hosted.settle(&open, now);
-            }
+            open.act(self, &mut lock(&open.state), &mut work);
         }
     }
 
@@ -302,34 +298,29 @@ impl Rooms {
         let from = key(from.0, from.1);
         let Some(open) = rooms.get(&from).cloned() else { return work() };
         let mut state = lock(&open.state);
-        let State::Open(hosted) = &mut *state else { return work() };
-        let now = self.now();
         // What cannot be saved now stays in the journal, and goes to the file where it is next.
-        hosted.save_through(now);
-        let done = match work() {
-            Ok(done) => done,
-            Err(refusal) => {
-                hosted.settle(&open, now);
-                return Err(refusal);
-            }
-        };
+        if open.act(self, &mut state, |hosted, now| hosted.save_through(now)).is_none() {
+            return work();
+        }
+        let done = work()?;
         rooms.remove(&from);
         match to {
             Some((root, place)) => {
-                if let Err(error) = hosted.room.moved(&home(&root, &place), &mut hosted.state) {
-                    log(&format!("a room's journal could not be told of a move: {error}"));
+                let to = key(&root, &place);
+                let moved = open.act(self, &mut state, |hosted, _| {
+                    if let Err(error) = hosted.room.moved(&home(&root, &place), &mut hosted.state) {
+                        log(&format!("a room's journal could not be told of a move: {error}"));
+                    }
+                    (hosted.root, hosted.place) = (root, place);
+                    (hosted.parked, hosted.missing, hosted.hold) = (false, false, 0);
+                });
+                if moved.is_some() {
+                    rooms.insert(to, open.clone());
                 }
-                rooms.insert(key(&root, &place), open.clone());
-                (hosted.root, hosted.place) = (root, place);
-                (hosted.parked, hosted.missing, hosted.hold) = (false, false, 0);
-                hosted.settle(&open, now);
             }
             None => {
-                hosted.end(Ended::Gone);
-                hosted.settle(&open, now);
-                hosted.discard(self);
-                *state = State::Gone;
-                open.gone();
+                open.act(self, &mut state, |hosted, _| hosted.end(Ended::Gone));
+                open.close(self, &mut state);
             }
         }
         Ok(done)
@@ -351,12 +342,12 @@ impl Rooms {
         let open = lock(&self.open).get(&key(root, place)).cloned();
         let Some(open) = open else { return work() };
         let mut state = lock(&open.state);
-        let State::Open(hosted) = &mut *state else { return work() };
-        let now = self.now();
-        hosted.save(now, true);
+        let save = |hosted: &mut Hosted, now: u64| {
+            hosted.save(now, true);
+        };
+        open.act(self, &mut state, save);
         let done = work();
-        hosted.save(now, true);
-        hosted.settle(&open, now);
+        open.act(self, &mut state, save);
         done
     }
 
@@ -375,8 +366,7 @@ impl Rooms {
         };
         for open in rooms {
             let mut state = lock(&open.state);
-            if let State::Open(hosted) = &mut *state {
-                let now = self.now();
+            open.act(self, &mut state, |hosted, now| {
                 hosted.stop(now);
                 // Each device hears what the save let the server say it holds, and then its socket closes.
                 hosted.settle(&open, now);
@@ -385,31 +375,31 @@ impl Rooms {
                     let _ = seated.to.try_send(Out::Close);
                     hosted.room.leave(session);
                 }
-                hosted.discard(self);
-            }
-            *state = State::Gone;
-            open.gone();
+            });
+            open.close(self, &mut state);
         }
     }
 
     /// One turn of a room's keeper: what is due is done. Says whether the room is gone.
     fn turn(&self, open: &Arc<Open>) -> bool {
         let mut state = lock(&open.state);
-        let State::Open(hosted) = &mut *state else { return true };
-        let now = self.now();
-        hosted.room.tick(now);
-        if hosted.room.due(now) && now >= hosted.hold {
-            hosted.save(now, false);
-        }
-        hosted.settle(open, now);
-        if !hosted.lost && (!hosted.room.is_idle() || now < hosted.linger) {
+        let turned = open.act(self, &mut state, |hosted, now| {
+            hosted.room.tick(now);
+            if hosted.room.due(now) && now >= hosted.hold {
+                hosted.save(now, false);
+            }
+            now
+        });
+        let stays = |hosted: &Hosted, now| !hosted.lost && (!hosted.room.is_idle() || now < hosted.linger);
+        if let (Some(now), State::Open(hosted)) = (turned, &*state)
+            && stays(hosted, now)
+        {
             return false;
         }
-        let key = key(&hosted.root, &hosted.place);
-        hosted.discard(self);
-        *state = State::Gone;
+        open.close(self, &mut state);
         drop(state);
-        self.forget(&key, open);
+        // By what it is and not by its file: a room that failed is listed, and no longer says where.
+        lock(&self.open).retain(|_, listed| !Arc::ptr_eq(listed, open));
         true
     }
 
@@ -422,24 +412,33 @@ impl Rooms {
         let all: Vec<&Root> = roots.iter().collect();
         for folder in folders.flatten() {
             let Ok(name) = folder.file_name().into_string() else { continue };
-            let Some(mut state) = self.journals(&name) else { continue };
-            let Some(left) = left_in(&folder.path(), &mut state) else {
-                // Nothing is owed to any file.
-                let _ = std::fs::remove_dir_all(folder.path());
-                continue;
-            };
-            let home = left.home.as_deref().unwrap_or_default();
-            let said = all.iter().filter_map(|root| Some((*root, placed(root, home)?)));
-            let said = said.max_by_key(|(root, _)| root.key.len());
-            let found = said.filter(|(root, place)| holds(root, place, &left.id)).or_else(|| {
-                let (at, place) = app.library.find(&app.store, &all, &left.id, app.now()).ok()??;
-                Some((all[at], place))
-            });
-            let taken = found.is_some_and(|(root, place)| self.resume(app, root, &place, &name));
-            if !taken {
-                log(&format!("the journal {name} waits for its document, which was not found"));
-                lock(&self.left).push((left.id, name));
+            // One journal's fault keeps no other from its file, nor the server from starting.
+            let taken = catch_unwind(AssertUnwindSafe(|| self.take(app, &all, &folder.path(), &name)));
+            if taken.is_err() {
+                log(&format!("the journal {name} failed as it was read, and is kept for the next start"));
             }
+        }
+    }
+
+    /// Takes the journal folder `name`, which is at `path`, to its document's file.
+    fn take(&self, app: &Shared, all: &[&Root], path: &Path, name: &str) {
+        let Some(mut state) = self.journals(name) else { return };
+        let Some(left) = left_in(path, &mut state) else {
+            // Nothing is owed to any file.
+            let _ = std::fs::remove_dir_all(path);
+            return;
+        };
+        let home = left.home.as_deref().unwrap_or_default();
+        let said = all.iter().filter_map(|root| Some((*root, placed(root, home)?)));
+        let said = said.max_by_key(|(root, _)| root.key.len());
+        let found = said.filter(|(root, place)| holds(root, place, &left.id)).or_else(|| {
+            let (at, place) = app.library.find(&app.store, all, &left.id, app.now()).ok()??;
+            Some((all[at], place))
+        });
+        let taken = found.is_some_and(|(root, place)| self.resume(app, root, &place, name));
+        if !taken {
+            log(&format!("the journal {name} waits for its document, which was not found"));
+            lock(&self.left).push((left.id, name.to_owned()));
         }
     }
 
@@ -512,6 +511,32 @@ impl Open {
         lock(&self.people).clear();
         self.due.store(0, Ordering::Release);
         self.wake.notify_one();
+    }
+
+    /// Does `work` in the room, and then what the room asks. `None` when no room is open, and when the
+    /// work panicked: the fault is this room's alone, and the room is closed for it.
+    fn act<T>(&self, rooms: &Rooms, state: &mut State, work: impl FnOnce(&mut Hosted, u64) -> T) -> Option<T> {
+        let State::Open(hosted) = &mut *state else { return None };
+        let now = rooms.now();
+        let done = catch_unwind(AssertUnwindSafe(|| {
+            let done = work(hosted, now);
+            hosted.settle(self, now);
+            done
+        }));
+        if done.is_err()
+            && let State::Open(hosted) = std::mem::replace(state, State::Gone)
+        {
+            hosted.fail(rooms);
+            self.gone();
+        }
+        done.ok()
+    }
+
+    /// Drops the room, and lets go of its journal.
+    fn close(&self, rooms: &Rooms, state: &mut State) {
+        self.act(rooms, state, |hosted, _| hosted.discard(rooms));
+        *state = State::Gone;
+        self.gone();
     }
 }
 
@@ -682,6 +707,18 @@ impl Hosted {
         sessions.into_iter().for_each(|session| self.room.dismiss(session, why));
     }
 
+    /// Closes a room whose work panicked. Its document may not be fit for another call: one that panicked
+    /// inside Loro panics at each. Every socket closes with no reason given, so each device comes back,
+    /// to the room that is opened next. That room reads the file and this one's journal, which between
+    /// them hold whatever a device was told the server keeps.
+    fn fail(self: Box<Self>, rooms: &Rooms) {
+        let Self { room, journal, place, .. } = *self;
+        log(&format!("the room of \"{}\" failed and was closed: whoever had it open joins it anew", place.name()));
+        lock(&rooms.left).push((room.copy().id.clone(), journal));
+        // Never dropped: a document that panicked inside Loro panics again as it is dropped.
+        std::mem::forget(room);
+    }
+
     /// Lets go of the room's journal folder: removed once its file holds everything, and left for the
     /// room that is opened next for the document otherwise.
     fn discard(&mut self, rooms: &Rooms) {
@@ -754,11 +791,7 @@ impl Seat {
     fn inside(&self, work: impl FnOnce(&mut Hosted, SessionId, u64) + Send + 'static) -> tokio::task::JoinHandle<()> {
         let (app, open, session) = (self.app.clone(), self.open.clone(), self.session);
         tokio::task::spawn_blocking(move || {
-            let mut state = lock(&open.state);
-            let State::Open(hosted) = &mut *state else { return };
-            let now = app.rooms.now();
-            work(hosted, session, now);
-            hosted.settle(&open, now);
+            open.act(&app.rooms, &mut lock(&open.state), |hosted, now| work(hosted, session, now));
         })
     }
 
@@ -770,6 +803,12 @@ impl Seat {
             }
         });
         let _ = heard.await;
+    }
+
+    /// Panics in the seat's room, as a fault in the room's work would. Only a test asks for it.
+    #[doc(hidden)]
+    pub async fn fault(&self) {
+        let _ = self.inside(|_, _, _| panic!("a fault in a room's work, which a test asked for")).await;
     }
 
     /// The sign-in the socket was opened with has run out.
