@@ -1,6 +1,6 @@
-//! Fetching a picture that is still a link.
+//! Fetching a picture that is still a link, or the page a link preview is made from.
 //!
-//! `letters_trust` decides what may be fetched, and its [`ImageFetch`] is asked before every step. This
+//! `letters_trust` decides what may be fetched, and its [`Fetch`] is asked before every step. This
 //! owns the socket: it connects only to addresses the guard passed, follows redirects by hand, sends no
 //! cookies and nothing that tells one person from another, and gives up after [`LIMIT`].
 
@@ -9,7 +9,7 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use letters_trust::{FetchError, ImageFetch, ImageType};
+use letters_trust::{Fetch, FetchError, HttpsUrl, ImageFetch, ImageType, Kind, PageFetch};
 use ureq::config::{AutoHeaderValue, Config};
 use ureq::http::{HeaderMap, header};
 use ureq::tls::{Certificate, RootCerts, TlsConfig};
@@ -22,7 +22,9 @@ pub const LIMIT: Duration = Duration::from_secs(10);
 /// All a server is told about who asks.
 const CLIENT: &str = "Letters";
 /// The kinds of picture a document shows.
-const ACCEPT: &str = "image/png, image/jpeg, image/gif, image/webp";
+const PICTURES: &str = "image/png, image/jpeg, image/gif, image/webp";
+/// What a page is asked for as.
+const PAGES: &str = "text/html, application/xhtml+xml";
 
 /// Whose word is taken that a server is the one it says it is.
 #[derive(Clone, Debug, Default)]
@@ -41,12 +43,21 @@ pub struct Fetched {
     pub bytes: Vec<u8>,
 }
 
-/// Why a fetch brought no picture.
+/// A page as its server sent it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchedPage {
+    /// Where the page was found once its redirects were followed. An address written on the page is read
+    /// against this one.
+    pub url: HttpsUrl,
+    pub bytes: Vec<u8>,
+}
+
+/// Why a fetch brought nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Failed {
     /// The guard refused a step.
     Refused(FetchError),
-    /// The server answered with this status and no picture.
+    /// The server answered with this status and nothing to read.
     Status(u16),
     /// It took longer than [`LIMIT`].
     Slow,
@@ -77,14 +88,14 @@ impl From<FetchError> for Failed {
 /// Looks a host up and keeps the addresses the guard lets a fetch connect to. The connection is made to
 /// one of them and the name is not looked up again, so it cannot lead elsewhere a moment later.
 #[derive(Debug)]
-struct Guarded {
-    guard: ImageFetch,
+struct Guarded<K> {
+    guard: Fetch<K>,
     inner: DefaultResolver,
     /// Why no address was kept, when none was.
     refused: Arc<Mutex<Option<FetchError>>>,
 }
 
-impl Resolver for Guarded {
+impl<K: Kind + fmt::Debug + Send + Sync + 'static> Resolver for Guarded<K> {
     fn resolve(
         &self,
         uri: &ureq::http::Uri,
@@ -104,14 +115,29 @@ impl Resolver for Guarded {
 }
 
 /// Fetches the picture `guard` was made for. This waits on the network, so it is not for the UI thread.
-pub fn fetch(mut guard: ImageFetch, roots: &Roots) -> Result<Fetched, Failed> {
+pub fn fetch(guard: ImageFetch, roots: &Roots) -> Result<Fetched, Failed> {
+    let (_, kind, bytes) = get(guard, roots, PICTURES)?;
+    Ok(Fetched { kind, bytes })
+}
+
+/// Fetches the page `guard` was made for, as [`fetch`] does a picture.
+pub fn fetch_page(guard: PageFetch, roots: &Roots) -> Result<FetchedPage, Failed> {
+    let (url, (), bytes) = get(guard, roots, PAGES)?;
+    Ok(FetchedPage { url, bytes })
+}
+
+/// Fetches what `guard` was made for, asked for as `accept`, and says where it was found at last.
+fn get<K>(mut guard: Fetch<K>, roots: &Roots, accept: &str) -> Result<(HttpsUrl, K::Found, Vec<u8>), Failed>
+where
+    K: Kind + Clone + fmt::Debug + Send + Sync + 'static,
+{
     let started = Instant::now();
     loop {
         let left = LIMIT.checked_sub(started.elapsed()).filter(|left| !left.is_zero()).ok_or(Failed::Slow)?;
         let refused = Arc::new(Mutex::new(None));
         let resolver = Guarded { guard: guard.clone(), inner: DefaultResolver::default(), refused: refused.clone() };
         // An agent for each address: it keeps no connection and remembers nothing between them.
-        let agent = Agent::with_parts(config(roots, left), DefaultConnector::default(), resolver);
+        let agent = Agent::with_parts(config(roots, left, accept), DefaultConnector::default(), resolver);
         let mut response = agent.get(guard.url().to_string()).call().map_err(|error| {
             let refused = refused.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
             refused.map_or_else(|| failed(error), Failed::Refused)
@@ -140,8 +166,8 @@ pub fn fetch(mut guard: ImageFetch, roots: &Roots) -> Result<Fetched, Failed> {
                 }
             }
         }
-        let kind = guard.finish(&bytes)?;
-        return Ok(Fetched { kind, bytes });
+        let url = guard.url().clone();
+        return Ok((url, guard.finish(&bytes)?, bytes));
     }
 }
 
@@ -157,7 +183,7 @@ fn failed(error: Error) -> Failed {
     }
 }
 
-fn config(roots: &Roots, left: Duration) -> Config {
+fn config(roots: &Roots, left: Duration, accept: &str) -> Config {
     let roots = match roots {
         Roots::System => RootCerts::PlatformVerifier,
         Roots::These(certificates) => {
@@ -174,7 +200,7 @@ fn config(roots: &Roots, left: Duration) -> Config {
         .max_redirects_will_error(false)
         .http_status_as_error(false)
         .user_agent(CLIENT)
-        .accept(ACCEPT)
+        .accept(accept)
         // The body is counted as it arrives, so it is asked for as it is.
         .accept_encoding(AutoHeaderValue::None)
         .max_idle_connections(0)

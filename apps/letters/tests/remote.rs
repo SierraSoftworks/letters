@@ -16,6 +16,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 /// The largest picture the fetches here take, in bytes.
 const MOST: u64 = 2048;
 
+/// A page with no picture in it.
+const PAGE: &[u8] = b"<p>No picture</p>";
+
 /// A small picture's file.
 fn png() -> Vec<u8> {
     letters::pictures::from_rgba(4, 2, &[0x80; 32]).unwrap().bytes
@@ -32,7 +35,9 @@ fn answer(path: &str) -> Vec<u8> {
         "/moved" => with("302 Found", "location: /sky.png\r\n", b""),
         "/round" => with("302 Found", "location: /round\r\n", b""),
         "/away" => with("302 Found", "location: https://elsewhere.example/sky.png\r\n", b""),
-        "/page" => with("200 OK", "content-type: text/html\r\n", b"<p>No picture</p>"),
+        "/page" => with("200 OK", "content-type: text/html; charset=utf-8\r\n", PAGE),
+        "/moved/page" => with("302 Found", "location: /page\r\n", b""),
+        "/long" => with("200 OK", "content-type: text/html\r\n", &[PAGE, &vec![b' '; MOST as usize]].concat()),
         "/unlabelled" => with("200 OK", "", b"words, with no word on what they are"),
         "/huge" => with("200 OK", "content-type: image/png\r\n", &[png(), vec![0; MOST as usize]].concat()),
         _ => with("404 Not Found", "", b""),
@@ -134,6 +139,34 @@ fn a_linked_picture_is_fetched_only_as_its_guard_allows() {
             assert_eq!(fetched.bytes, png(), "{path}");
         }
     }
+}
+
+#[test]
+fn a_page_is_fetched_as_a_picture_is_and_says_where_it_was_found() {
+    let (home, server) = (Scratch::new("remote-page"), Server::start());
+    let store = trusting(&home, &server);
+    let refused = |error| Err(Failed::Refused(error));
+    let cases = [
+        ("/page", Ok("/page")),
+        ("/moved/page", Ok("/page")),
+        ("/sky.png", refused(FetchError::NotAPage)),
+        ("/unlabelled", refused(FetchError::NotAPage)),
+        ("/long", refused(FetchError::TooLarge(MOST))),
+        ("/nothing", Err(Failed::Status(404))),
+    ];
+    for (path, expected) in cases {
+        let limits = Limits { max_bytes: MOST, ..Limits::page() };
+        let guard = store.trust().gate("document", Origin::Created).fetch_page(&server.address(path), limits);
+        let fetched = remote::fetch_page(guard.expect("a page may be asked for"), &server.roots());
+
+        let found = fetched.as_ref().map(|page| page.url.to_string()).map_err(Clone::clone);
+        assert_eq!(found, expected.map(|path| server.address(path)), "{path}");
+        if let Ok(page) = fetched {
+            assert_eq!(page.bytes, PAGE, "{path}");
+        }
+    }
+    let asked = server.asked.lock().unwrap();
+    assert!(asked.iter().all(|request| request.contains("accept: text/html")), "a page is asked for as one");
 }
 
 #[test]
