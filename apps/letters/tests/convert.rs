@@ -592,7 +592,13 @@ fn a_clean_copy_is_the_document_without_its_history_and_notes() {
         height: 20.0,
         numbered: false,
     };
-    let blocks = vec![Block::text("p", BlockKind::Paragraph, "Rates"), Block::new("f", shown)];
+    let card = BlockKind::LinkPreview {
+        url: "https://example.com/rates".into(),
+        title: Some("Rates".into()),
+        description: None,
+        image: Some("assets/card.png".into()),
+    };
+    let blocks = vec![Block::text("p", BlockKind::Paragraph, "Rates"), Block::new("f", shown), Block::new("c", card)];
     let mut model = Model::new(Document { blocks, ..Document::default() }, ReplicaId::new("a device"));
     model.set_author("Ada Lovelace");
     model.apply([Op::InsertText { at: Pos::new("p", 5), text: " change in January.".into() }]).unwrap();
@@ -603,8 +609,9 @@ fn a_clean_copy_is_the_document_without_its_history_and_notes() {
         entries: Default::default(),
     };
     package.entries.insert(OPLOG.into(), model.save());
-    // A picture the page shows, and one only an earlier version did.
+    // A picture the page shows in a figure, one a link preview shows, and one only an earlier version did.
     package.entries.insert("assets/shown.png".into(), PICTURE.to_vec());
+    package.entries.insert("assets/card.png".into(), PICTURE.to_vec());
     package.entries.insert("assets/removed.png".into(), PICTURE.to_vec());
     package.set_style(&Style::default());
     let mut out = Cursor::new(Vec::new());
@@ -629,7 +636,7 @@ fn a_clean_copy_is_the_document_without_its_history_and_notes() {
     let names: Vec<&str> = clean.entries.keys().map(String::as_str).collect();
     assert!(!names.iter().any(|name| name.starts_with(letters_format::HISTORY)), "no history: {names:?}");
     assert!(clean.notes().unwrap().notes.is_empty(), "no notes");
-    assert_eq!(pictures_held(&names), ["assets/shown.png"], "only the pictures the page shows");
+    assert_eq!(pictures_held(&names), ["assets/card.png", "assets/shown.png"], "only the pictures the page shows");
     assert!(names.contains(&letters_format::STYLE), "and its style");
 
     // The copy opens and exports like any document.
