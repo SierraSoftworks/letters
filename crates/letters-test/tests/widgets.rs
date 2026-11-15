@@ -199,6 +199,15 @@ fn arrow_keys_walk_a_menu_past_disabled_items_and_wrap() {
 }
 
 #[test]
+fn the_first_key_in_a_menu_opened_by_the_pointer_goes_where_it_says() {
+    for (key, lands) in [("Down", "New"), ("Home", "New"), ("Up", "Delete"), ("End", "Delete")] {
+        let mut desk = desk();
+        desk.click(Role::Button, "File").key(key);
+        assert_eq!(focus_name(&mut desk), lands, "{key}");
+    }
+}
+
+#[test]
 fn a_menu_closes_without_choosing() {
     for way in ["Escape", "outside", "button"] {
         let mut desk = desk();

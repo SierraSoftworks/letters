@@ -783,14 +783,20 @@ impl<A: App> Ui<A> {
 
     /// Moves focus among the focusable elements inside `container`, wrapping at the ends.
     fn rove(&mut self, container: usize, from: usize, step: Step) {
-        // After the pointer, the first arrow key only shows where focus is.
+        let stops = self.tree.focusables(container + 1..self.tree.nodes[container].end);
+        let mut at = stops.iter().position(|&stop| stop == from);
         if !self.focus_visible {
             self.focus_visible = true;
             self.stale.paint = true;
-            return;
+            if self.tree.nodes[container].layer > 0 {
+                // In a popover, focus that does not show was put there as it opened. To the person nothing
+                // is focused yet, so the key goes to the end it names or points away from.
+                at = None;
+            } else if matches!(step, Step::Next | Step::Previous) {
+                // After the pointer, the first arrow key only shows where focus is.
+                return;
+            }
         }
-        let stops = self.tree.focusables(container + 1..self.tree.nodes[container].end);
-        let at = stops.iter().position(|&stop| stop == from);
         let next = match (step, at) {
             (Step::First, _) | (Step::Next, None) => 0,
             (Step::Last, _) | (Step::Previous, None) => stops.len().saturating_sub(1),
