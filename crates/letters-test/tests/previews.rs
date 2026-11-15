@@ -86,10 +86,15 @@ fn field(window: &mut Harness, name: &str) -> Option<String> {
 
 /// A line that links to the guide, in a document that keeps this of the guide's page.
 fn linked(kept: Option<Preview>) -> Harness {
-    let link = Run { link: Some(GUIDE.to_owned()), ..Run::plain("the quarries of Gwynedd") };
+    linked_to(GUIDE, kept)
+}
+
+/// A line with a link to an address, in a document that keeps this of the page there.
+fn linked_to(url: &str, kept: Option<Preview>) -> Harness {
+    let link = Run { link: Some(url.to_owned()), ..Run::plain("the quarries of Gwynedd") };
     let runs = vec![Run::plain("Slate from "), link, Run::plain(" lasts a century.")];
     let line = Block { body: Body::Text(runs), ..Block::new("line", BlockKind::Paragraph) };
-    let previews = kept.into_iter().map(|kept| (GUIDE.to_owned(), kept)).collect();
+    let previews = kept.into_iter().map(|kept| (url.to_owned(), kept)).collect();
     let mut window = Harness::open(Document { blocks: vec![line], previews, ..Document::default() });
     window.paint();
     window
@@ -260,7 +265,7 @@ fn print_view_shows_a_preview_as_it_prints_whatever_is_said_of_its_fetch() {
 }
 
 #[test]
-fn what_is_found_goes_to_every_preview_that_waits_for_the_address_and_to_no_other() {
+fn what_is_found_goes_to_every_preview_that_leads_to_the_address_and_to_no_other() {
     let bare = |id: &str, url: &str| Block::new(id, preview(url, None, None));
     let mut window = notes(vec![bare("card", QUOTE), bare("twin", QUOTE), bare("other", GUIDE)]);
     let controls = window.controls().into_iter().filter(|found| found.name == FETCH);
@@ -269,8 +274,8 @@ fn what_is_found_goes_to_every_preview_that_waits_for_the_address_and_to_no_othe
     }
     assert_eq!(fetches(&mut window), [QUOTE, GUIDE], "an address is asked for once, however many wait for it");
 
-    // The third preview is given another address while its page is fetched: it waits for that page no
-    // more, and offers a fetch of where it leads now.
+    // The third preview is given another address while its page is fetched: that page is not for it any
+    // more, and it offers a fetch of where it leads now.
     let third = window.controls().into_iter().filter(|found| found.name == EDIT).nth(2).expect("three previews");
     let elsewhere = "https://slate.example.org/guides/cornish";
     window.click_at(third.center()).click(Role::TextInput, "Address").key("Mod+A").type_text(elsewhere);
@@ -281,7 +286,47 @@ fn what_is_found_goes_to_every_preview_that_waits_for_the_address_and_to_no_othe
     window.fill_preview(found(GUIDE, Some("Welsh slate"), None));
     let titles: Vec<_> = all_shown(&window).into_iter().map(|(url, title, ..)| (url, title)).collect();
     let quote = (QUOTE.to_owned(), Some("Spring quotes".to_owned()));
+    assert_eq!(titles, [quote.clone(), quote.clone(), (elsewhere.to_owned(), None)]);
+
+    // An answer that nothing waits for any more is not taken.
+    window.fill_preview(found(QUOTE, Some("Autumn quotes"), None));
+    let titles: Vec<_> = all_shown(&window).into_iter().map(|(url, title, ..)| (url, title)).collect();
     assert_eq!(titles, [quote.clone(), quote, (elsewhere.to_owned(), None)]);
+}
+
+/// What the document keeps of the guide's page for the links in its text: the page's title.
+fn kept(window: &Harness) -> Option<String> {
+    window.editor().doc().previews.get(GUIDE).and_then(|kept| kept.title.clone())
+}
+
+#[test]
+fn the_page_of_an_address_put_into_the_text_is_asked_for_at_once() {
+    type Put = fn(&mut Harness);
+    // How the address comes to be in the text, and whether it stands as a card of its own then.
+    let ways: [(&str, Put, bool); 3] = [
+        ("typed in a line of text", |window| _ = window.type_text(&format!("See {GUIDE} ")), false),
+        (
+            "set on a passage",
+            |window| _ = window.type_text("See the guide").select("guide").key("Mod+K").type_text(GUIDE).key("Enter"),
+            false,
+        ),
+        ("typed on a line of its own", |window| _ = window.type_text(GUIDE).key("Enter"), true),
+    ];
+    for (way, put, card) in ways {
+        let blocks = vec![Block::text("p", BlockKind::Paragraph, "")];
+        let mut window = Harness::open(Document { blocks, ..Document::default() });
+        window.ui().set_save_state(SaveState::Unsaved);
+        put(&mut window);
+        assert_eq!(all_shown(&window).len(), usize::from(card), "{way}: a card stands for a link alone on its line");
+        assert_eq!(fetches(&mut window), [GUIDE], "{way}: its page is asked for once");
+
+        // What is found is the card's, or kept for the link, and one undo takes it back.
+        let title = |window: &Harness| if card { shown(window).1 } else { kept(window) };
+        window.fill_preview(found(GUIDE, Some("Choosing Welsh slate"), None));
+        assert_eq!(title(&window).as_deref(), Some("Choosing Welsh slate"), "{way}");
+        window.key("Escape").key("Mod+Z");
+        assert_eq!(title(&window), None, "{way}: undo takes what was found back at once");
+    }
 }
 
 #[test]
@@ -305,6 +350,12 @@ fn a_shell_that_cannot_fetch_is_asked_for_nothing_and_offers_no_fetch() {
     assert_eq!(offers(&mut window), [""; 0]);
     window.click(Role::TextInput, "Title").type_text("Spring quotes");
     assert_eq!(shown(&window).1.as_deref(), Some("Spring quotes"));
+
+    // An address typed on a line of its own stays a link in the text: a card would have nothing to show.
+    window.key("Escape").type_text(GUIDE).key("Enter");
+    assert_eq!(all_shown(&window).len(), 1, "no card is made of it");
+    assert!(window.markdown().contains(GUIDE), "it is written all the same");
+    assert_eq!(fetches(&mut window), [""; 0]);
 }
 
 #[test]
@@ -368,9 +419,17 @@ fn the_card_goes_with_its_preview() {
 
 #[test]
 fn assistive_technology_presses_a_preview_and_its_control() {
+    // A link in the text whose card shows, with nothing kept of its page.
+    let resting = || {
+        let mut window = linked(None);
+        let at = link(&mut window);
+        window.hover_at(at);
+        rested(&mut window).expect("the card of the link");
+        window
+    };
     // What is pressed, by name, and whether the page is then asked for.
-    for (name, fetched) in [(EDIT, false), (FETCH, true)] {
-        let mut window = bare();
+    let cases = [(bare(), EDIT, false), (bare(), FETCH, true), (resting(), FETCH, true)];
+    for (mut window, name, fetched) in cases {
         let tree = window.ui().access();
         let named = |node: &accesskit::Node| node.role() == Role::Button && node.label() == Some(name);
         let (target_node, node) = tree.nodes.iter().find(|(_, node)| named(node)).expect("it is told");
@@ -413,14 +472,77 @@ fn a_link_in_text_shows_what_is_kept_of_its_page_while_the_pointer_rests_on_it()
 }
 
 #[test]
-fn a_link_shows_no_card_when_nothing_is_kept_of_its_page() {
+fn the_card_of_a_link_offers_the_fetch_of_a_page_the_document_keeps_nothing_of() {
     for kept in [None, Some(Preview::default())] {
         let mut window = linked(kept.clone());
         let at = link(&mut window);
         window.hover_at(at);
-        assert_eq!(rested(&mut window), None, "{kept:?}");
+        let card = rested(&mut window).expect("a card that says where the link leads");
+        assert!(card.name.contains("slate.example.org"), "{kept:?}: {:?}", card.name);
         assert_eq!(fetches(&mut window), [""; 0], "{kept:?}: resting on a link fetches nothing");
+
+        // The card stays while the pointer goes to its button, and only a press there asks for the page.
+        let button = window.find(Role::Button, FETCH).expect("a button on the card");
+        assert!(card.bounds.contains(button.center()), "{:?} on {:?}", button.bounds, card.bounds);
+        window.click_at(Point { x: card.bounds.x + 3.0, y: card.bounds.y + 3.0 });
+        assert_eq!(fetches(&mut window), [""; 0], "{kept:?}: a press beside the button");
+        window.click_at(button.center());
+        assert_eq!(fetches(&mut window), [GUIDE], "{kept:?}");
+        assert_eq!(window.editor().selection().map(|caret| caret.head.offset), Some(11), "the caret stays");
+        window.assert_closed(Role::Button, FETCH);
+        assert!(rested(&mut window).is_some(), "{kept:?}: the card says that the page is fetched");
+
+        // A fetch that found nothing says why, and can be tried again.
+        window.ui().fail_preview(GUIDE, "the server answered 404");
+        let card = rested(&mut window).expect("the card is still there");
+        assert!(card.name.contains("Not fetched: the server answered 404"), "{kept:?}: {:?}", card.name);
+        window.click(Role::Button, "Try again");
+        assert_eq!(fetches(&mut window), [GUIDE], "{kept:?}");
+
+        // What is found is kept for the link, and its card shows it from then on.
+        window.fill_preview(found(GUIDE, Some("Choosing Welsh slate"), None));
+        window.hover_at(Point { x: at.x, y: at.y + 200.0 }).hover_at(at);
+        let card = rested(&mut window).expect("the card of the link");
+        assert!(card.name.contains("Choosing Welsh slate"), "{kept:?}: {:?}", card.name);
+        window.assert_closed(Role::Button, FETCH).assert_closed(Role::Button, "Try again");
     }
+}
+
+#[test]
+fn a_link_has_no_card_where_nothing_is_kept_of_its_page_and_none_can_be_fetched() {
+    // Where the link leads, and whether the shell fetches pages: only a web page is fetched.
+    let cases = [(GUIDE, false), ("mailto:quarry@example.org", true), ("file:///srv/quarry/notes.html", true)];
+    for (url, fetching) in cases {
+        let mut window = linked_to(url, None);
+        window.ui().set_preview_fetching(fetching);
+        let at = link(&mut window);
+        window.hover_at(at);
+        assert_eq!(rested(&mut window), None, "{url}");
+        window.key("Mod+K").assert_open(Role::Dialog, "Link").assert_closed(Role::Button, FETCH);
+        assert_eq!(fetches(&mut window), [""; 0], "{url}");
+    }
+}
+
+#[test]
+fn the_card_that_edits_a_link_fetches_its_page() {
+    let mut window = linked(None);
+    link(&mut window);
+    window.key("Mod+K").assert_open(Role::Dialog, "Link");
+    window.click(Role::Button, FETCH);
+    assert_eq!(fetches(&mut window), [GUIDE]);
+    assert_eq!(window.find(Role::Button, "Fetching").map(|button| button.disabled), Some(true));
+
+    window.ui().fail_preview(GUIDE, "the server answered 404");
+    assert_eq!(status(&mut window).as_deref(), Some("Not fetched: the server answered 404"));
+    window.click(Role::Button, "Try again");
+    assert_eq!(fetches(&mut window), [GUIDE]);
+    window.fill_preview(found(GUIDE, Some("Choosing Welsh slate"), None));
+    assert_eq!(kept(&window).as_deref(), Some("Choosing Welsh slate"));
+
+    // The card reads what was found, and offers it again. Another address in the field is not the link's
+    // yet, so there is nothing of it to fetch.
+    window.key("Mod+K").assert_open(Role::Label, "Choosing Welsh slate").assert_open(Role::Button, "Fetch again");
+    window.type_text(QUOTE).assert_closed(Role::Button, "Fetch again").assert_closed(Role::Button, FETCH);
 }
 
 #[test]

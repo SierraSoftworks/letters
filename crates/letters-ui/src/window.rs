@@ -711,30 +711,36 @@ impl Ui<EditorApp> {
     }
 
     /// Takes what the shell found of the page at `found.url`, in answer to a [`Request::FetchPreview`]:
-    /// its title, its description and its picture stand in place of what each link preview that waits
-    /// for the address had, as one step to undo. Nothing is taken by a preview that is gone or leads to
-    /// another address by now. A page that says nothing a card can show is told as a fetch that found
-    /// nothing.
+    /// its title, its description and its picture stand in place of what each link preview that leads
+    /// to the address had, and the document keeps them for the links in its text that lead there, as one
+    /// step to undo. Nothing is taken for an address that was not asked for, or that nothing leads to by
+    /// now. A page that says nothing a card can show is told as a fetch that found nothing.
     pub fn fill_preview(&mut self, found: LinkPreviewFound, platform: &mut dyn Platform) {
         if !found.says() {
             return self.fail_preview(&found.url, Previews::nothing());
         }
         let app = self.app_mut();
-        for block in app.previews.answered(&found.url, None) {
-            let LinkPreviewFound { url, title, description, picture } = found.clone();
-            let command = Command::Preview { block, edit: PreviewEdit::Fetched { url, title, description, picture } };
-            // The answer comes when it comes: the page stays where the person has it.
-            let change = app.run(platform, |editor, platform| editor.run(command, platform));
-            app.follow(&change);
+        if !app.previews.answered(&found.url, None) {
+            return;
         }
+        let LinkPreviewFound { url, title, description, picture } = found;
+        let command = Command::Fetched { url, title, description, picture };
+        // The answer comes when it comes: the page stays where the person has it.
+        let change = app.run(platform, |editor, platform| editor.run(command, platform));
+        app.follow(&change);
     }
 
     /// Says whether this shell can fetch what a page says of itself, which it can until told otherwise.
     /// Where it cannot, no [`Request::FetchPreview`] is raised and nothing offers one: a link preview that
-    /// shows its address alone has no "Fetch preview", and its card no button for it. What the document
-    /// keeps of a page shows as it does anywhere.
+    /// shows its address alone has no "Fetch preview" and keeps no room for it, its card has no button for
+    /// it, and an address put on a line of its own stays a link in the text. What the document keeps of a
+    /// page shows as it does anywhere.
     pub fn set_preview_fetching(&mut self, offered: bool) {
-        self.app_mut().previews.offer(offered);
+        let app = self.app_mut();
+        app.previews.offer(offered);
+        app.editor.set_preview_fetching(offered);
+        // A card that gives up the room of its control, or takes it again, leaves what is read where it is.
+        app.held(|app| app.layout.set_preview_control(offered));
     }
 
     /// Says that the page at an address was not fetched and why, in a few words that read on from
@@ -852,6 +858,17 @@ impl Lines for DocLines<'_> {
         let line = self.layout.caret(&self.layout.hit(Point::default()).unwrap_or(Pos::new("", 0)));
         line.map_or(20, |line| ((self.page / line.height.max(1.0)) as usize).saturating_sub(1).max(1))
     }
+}
+
+/// The card of a link in the text as it was drawn.
+struct Peeked {
+    /// What it says, for someone who cannot see it.
+    said: String,
+    rect: Rect,
+    /// Its button, when it has one to press.
+    button: Option<Rect>,
+    /// The pictures it shows that are not here yet.
+    awaited: Vec<String>,
 }
 
 /// Lends the editor the shell's platform together with the laid-out lines.
@@ -2439,7 +2456,12 @@ impl EditorApp {
             left: left.unwrap_or_default(),
         };
         let mut lent = Lent { platform, lines };
-        act(&mut self.editor, &mut lent)
+        let change = act(&mut self.editor, &mut lent);
+        // The page of an address the writer just put in is asked for at once, as a link or as a card.
+        for url in self.editor.take_unfetched() {
+            self.fetch(url);
+        }
+        change
     }
 
     /// Brings the layout and the viewport up to date after the editor did something.
@@ -2458,6 +2480,7 @@ impl EditorApp {
             self.estimated = true;
         }
         if edited {
+            self.previews.edited();
             // What the pointer rested on may be gone, or somewhere else.
             self.unpoint();
             self.highlight((!change.structure).then_some(&change.blocks));
@@ -2658,38 +2681,60 @@ impl EditorApp {
         let at = self.in_layout(at);
         let cards = self.layout.previews(Rect::new(at.x, at.y, 0.0, 1.0));
         let card = cards.into_iter().find(|card| card.rect.contains(at))?;
-        let room = card.control.filter(|_| self.previews.offered());
-        let on_control = room.is_some_and(|room| previews::control(room).contains(at));
+        let on_control = card.control.is_some_and(|room| previews::control(room).contains(at));
         Some((card.block, on_control))
     }
 
-    /// The link in text at a point of the page area whose page the document keeps something of, while
-    /// nothing hangs over the page.
+    /// What the document keeps of the page at an address, when it keeps anything.
+    fn kept(&self, url: &str) -> Option<&letters_model::Preview> {
+        self.editor.doc().previews.get(url).filter(|kept| !kept.is_empty())
+    }
+
+    /// Whether a fetch of the page at an address is offered: the shell fetches, and it is a web page's.
+    fn fetchable(&self, url: &str) -> bool {
+        self.previews.offered() && previews::web(url)
+    }
+
+    /// The link in text at a point of the page area that has a card to show, while nothing hangs over the
+    /// page: one whose page the document keeps something of, or whose page can be fetched.
     fn peek_at(&self, at: Point) -> Option<Peek> {
         if self.hung() || self.away() || self.dragging {
             return None;
         }
-        let doc = self.editor.doc();
-        let (url, line) = safe::link_line_at(doc, &self.layout, self.in_layout(at))?;
-        doc.previews.get(&url).is_some_and(|kept| !kept.is_empty()).then_some(Peek { url, line })
+        // A card with a button stays while the pointer is on it, or on its way there from the link.
+        if let Some(held) = self.peeks.held(at) {
+            return Some(held.clone());
+        }
+        let (block, url, line) = safe::link_line_at(self.editor.doc(), &self.layout, self.in_layout(at))?;
+        (self.kept(&url).is_some() || self.fetchable(&url)).then_some(Peek { block, url, line })
     }
 
-    /// Draws what the document keeps of the page of the link under the pointer, in a card beside the
-    /// link. `room` is the size of the page area. Returns what the card says, where it is, and the
-    /// pictures it waits for.
-    fn peek(&self, room: Size, out: &mut DisplayList) -> Option<(String, Rect, Vec<String>)> {
-        let Peek { url, line } = self.peeks.shown()?.clone();
+    /// Draws the card of the link under the pointer beside the link: what the document keeps of its page,
+    /// or the fetch of a page it keeps nothing of. `room` is the size of the page area. Returns what the
+    /// card says, where it and its button are, and the pictures it waits for.
+    fn peek(&self, room: Size, out: &mut DisplayList) -> Option<Peeked> {
+        let Peek { url, line, .. } = self.peeks.shown()?.clone();
         let anchor = self.onto(line);
-        let kept = self.editor.doc().previews.get(&url)?;
+        let kept = self.kept(&url);
+        let offer = (kept.is_none() && self.fetchable(&url)).then(|| peek::Offer {
+            says: self.previews.says(&url),
+            waits: self.previews.waits(&url),
+            failed: self.previews.failed(&url),
+            aimed: self.peeks.aimed(),
+        });
+        if kept.is_none() && offer.is_none() {
+            return None;
+        }
         let size = |image: &Image| (image.width(), image.height());
-        let picture = kept.image.as_deref().and_then(|asset| self.images.get(asset)).map(size);
-        let card = peek::Card { url: &url, kept, picture, anchor, room };
+        let image = kept.and_then(|kept| kept.image.as_deref());
+        let picture = image.and_then(|asset| self.images.get(asset)).map(size);
+        let card = peek::Card { url: &url, kept, picture, offer, anchor, room };
         let mut drawn = DisplayList::default();
-        let rect = card.paint(self.shaper.as_ref(), self.scheme, &mut drawn);
+        let (rect, button) = card.paint(self.shaper.as_ref(), self.scheme, &mut drawn);
         // A picture that is not here yet has its place kept.
         let awaited = pictures::awaited(&self.images, self.scheme, &mut drawn);
         out.items.extend(drawn.items);
-        Some((card.said(), rect, awaited))
+        Some(Peeked { said: card.said(), rect, button, awaited })
     }
 
     /// The address a link preview leads to.
@@ -2697,12 +2742,18 @@ impl EditorApp {
         self.editor.doc().block(preview).and_then(|block| previews::address(&block.kind))
     }
 
-    /// Asks the shell for what the page of a link preview says of itself, unless its address is being
-    /// fetched already.
-    fn fetch_preview(&mut self, preview: &BlockId) {
-        let Some(url) = self.address_of(preview).map(str::to_owned) else { return };
-        if self.previews.fetch(preview, &url) {
+    /// Asks the shell for what the page at an address says of itself, unless it is being fetched already.
+    fn fetch(&mut self, url: String) {
+        if self.previews.fetch(&url) {
             self.requests.push(Request::FetchPreview { url });
+        }
+    }
+
+    /// Asks for the page of a link preview, or of the link in the text whose card shows in that block.
+    fn fetch_preview(&mut self, block: &BlockId) {
+        let shown = self.peeks.shown().filter(|peek| peek.block == *block).map(|peek| peek.url.clone());
+        if let Some(url) = self.address_of(block).map(str::to_owned).or(shown) {
+            self.fetch(url);
         }
     }
 
@@ -2723,15 +2774,10 @@ impl EditorApp {
                     let command = Command::Preview { block, edit: PreviewEdit::Url(url) };
                     self.edit(platform, |editor, platform| editor.run(command, platform));
                 }
+                // The card that is put in shows what the document keeps of its page. When that is nothing
+                // it shows its address alone, and its page is asked for at once, as for every address put in.
                 Some((None, url)) => {
-                    let change =
-                        self.run(platform, |editor, platform| editor.run(Command::InsertPreview(url), platform));
-                    self.changed(&change);
-                    // The card that was put in shows its address alone, and its page is asked for at once.
-                    let new = change.blocks.iter().find(|block| self.address_of(block).is_some()).cloned();
-                    if let Some(new) = new {
-                        self.fetch_preview(&new);
-                    }
+                    self.edit(platform, |editor, platform| editor.run(Command::InsertPreview(url), platform));
                 }
                 None => {}
             },
@@ -2745,6 +2791,7 @@ impl EditorApp {
                     self.fetch_preview(&preview);
                 }
             }
+            Previewing::FetchLink(url) => self.fetch(url),
             Previewing::Close => self.previews.close(),
         }
     }
@@ -3000,6 +3047,7 @@ impl EditorApp {
         let called = (std::mem::replace(&mut self.previews.over, carded.clone()) != carded) || called;
         let peeked = self.references.rest().and_then(|at| self.peek_at(at));
         let called = self.peeks.point(peeked) || called;
+        let called = self.peeks.aim(self.references.rest()) || called;
         let linked = self.references.rest().and_then(|at| self.linked_at(at));
         // Each is taken, whichever changed.
         let clouded = self.linked.point(linked);
@@ -3095,6 +3143,16 @@ impl EditorApp {
                             self.unpoint();
                         }
                     };
+                }
+                // A press on the card of a link in the text is the card's: on its button it fetches the
+                // link's page, and elsewhere it does nothing.
+                if let Some(held) = self.peeks.held(at).cloned() {
+                    self.dragging = false;
+                    self.references.press(None);
+                    if self.peeks.aimed() {
+                        self.fetch(held.url);
+                    }
+                    return;
                 }
                 // A press on a link preview opens its card, and one on its control fetches its page. With
                 // Ctrl or Cmd held the preview is a link like any other.
@@ -3486,7 +3544,7 @@ impl EditorApp {
         }
         // A preview says under its address why its page was not fetched, for as long as that holds. A line
         // that comes or goes above the view leaves what is read where it is.
-        let notes = self.previews.notes();
+        let notes = self.previews.notes(self.editor.doc());
         if !notes.is_empty() {
             self.held(|page| {
                 for (preview, note) in &notes {
@@ -3590,9 +3648,9 @@ impl EditorApp {
             }
         }
         for card in self.layout.previews(viewport) {
-            if let Some(room) = card.control.filter(|_| self.previews.offered()) {
+            if let Some((room, url)) = card.control.zip(self.address_of(&card.block)) {
                 let at = previews::control(room);
-                self.previews.paint(&card.block, at, self.shaper.as_ref(), self.scheme, &mut list);
+                self.previews.paint((&card.block, url), at, self.shaper.as_ref(), self.scheme, &mut list);
             }
             if self.previews.open.as_ref() == Some(&card.block) {
                 list.items.push(ring(card.rect, (RING, RING)));
@@ -3689,9 +3747,9 @@ impl EditorApp {
             review::cuts(cut, shift, room)
         });
         self.previewed = self.preview(room, &mut over);
-        if self.previewed.is_none()
-            && let Some((said, rect, awaited)) = self.peek(room, &mut over)
-        {
+        let peeked = if self.previewed.is_none() { self.peek(room, &mut over) } else { None };
+        self.peeks.drew(peeked.as_ref().map(|peeked| (peeked.rect, peeked.button)));
+        if let Some(Peeked { said, rect, awaited, .. }) = peeked {
             // The card's picture is the document's own, asked for once like any other the page shows.
             for asset in awaited {
                 if self.wanted.insert(asset.clone()) {
@@ -3792,7 +3850,7 @@ impl EditorApp {
             let cards = self.layout.previews(viewport);
             let shown = cards.into_iter().find(|card| card.block == *preview).map(|card| self.onto(card.rect));
             let spot = shown.or(caret).unwrap_or_default();
-            if let Some(card) = self.previews.card(preview, kind, spot) {
+            if let Some(card) = self.previews.card(kind, spot) {
                 element = element.popover(card);
             }
         } else if let Some(context) = &self.context {
@@ -3814,8 +3872,9 @@ impl EditorApp {
             let row = row.child(Element::from(field).grow(1.0)).child(open);
             // What the document keeps of the page there is read here too, by someone with no pointer.
             let mut card = Element::column().gap(tokens::SPACE_SM).width(LINK_WIDTH).child(row);
-            if let Some(kept) = self.editor.doc().previews.get(address.trim()) {
-                let quiet = TextStyle::control().size(tokens::TEXT_SM);
+            let (url, quiet) = (address.trim(), TextStyle::control().size(tokens::TEXT_SM));
+            let kept = self.kept(url);
+            if let Some(kept) = kept {
                 let lines =
                     [(&kept.title, tokens::FG, quiet.weight(600)), (&kept.description, tokens::FG_MUTED, quiet)];
                 let said = lines.into_iter().filter_map(|(line, ink, style)| {
@@ -3823,6 +3882,17 @@ impl EditorApp {
                     Some(Element::paragraph(said, style).fg(ink).max_width(LINK_WIDTH))
                 });
                 card = card.child(Element::column().gap(tokens::SPACE_XS).children(said));
+            }
+            // The page of the link as it is written can be fetched from here, for the first time or again.
+            if self.editor.link() == Some(url) && self.fetchable(url) {
+                if let Some(failed) = self.previews.failed(url) {
+                    let said = Element::paragraph(failed, quiet).fg(tokens::DANGER).max_width(LINK_WIDTH);
+                    card = card.child(said.role(Role::Status));
+                }
+                let fetch = Button::new(self.previews.asks(url, kept.is_some())).small();
+                let fetch = fetch.disabled(self.previews.waits(url));
+                let fetch = fetch.on_press(Message::Preview(Previewing::FetchLink(url.to_owned())));
+                card = card.child(Element::row().child(fetch));
             }
             let editor = Popover::new(card)
                 .label("Link")
@@ -3876,7 +3946,7 @@ impl EditorApp {
         let pressable = pressable || self.captions.over || self.margin.over.is_some() || self.review.pressable();
         let pressable = pressable || self.tables.pointed();
         let pressable = pressable || self.callouts.over.is_some() || self.languages.over.is_some();
-        let pressable = pressable || self.contents.pointed() || self.previews.over.is_some();
+        let pressable = pressable || self.contents.pointed() || self.previews.over.is_some() || self.peeks.aimed();
         match self.grip.corner() {
             Some(corner) => element.cursor(Cursor::Resize(figures::edge(corner))),
             None if pressable => element.cursor(Cursor::Pointer),
@@ -5015,11 +5085,18 @@ impl App for EditorApp {
         for card in self.layout.previews(view) {
             let at = self.onto(card.rect);
             describe::whole(&card.block, Whole::Preview, (previews::LABEL, None), at, page, nodes);
-            if let Some(room) = card.control.filter(|_| self.previews.offered()) {
-                let failed = self.previews.failed(&card.block);
-                let told = (self.previews.says(&card.block), failed.as_deref());
+            if let Some((room, url)) = card.control.zip(self.address_of(&card.block)) {
+                let failed = self.previews.failed(url);
+                let told = (self.previews.says(url), failed.as_deref());
                 describe::whole(&card.block, Whole::Fetch, told, self.onto(previews::control(room)), page, nodes);
             }
+        }
+        // The button on the card of a link in the text, which fetches the link's page.
+        let offered = self.peeks.shown().filter(|peek| !self.previews.waits(&peek.url));
+        if let Some((peek, button)) = offered.zip(self.peeks.button()) {
+            let failed = self.previews.failed(&peek.url);
+            let told = (self.previews.says(&peek.url), failed.as_deref());
+            describe::whole(&peek.block, Whole::Fetch, told, button, page, nodes);
         }
         if let Some(shown) = self.table() {
             for (part, at) in shown.parts() {
