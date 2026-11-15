@@ -18,10 +18,10 @@ use crate::color::{fade, resolve};
 use crate::element::{Cursor, Element, Paint, Pointer};
 use crate::layout::MARGIN;
 use crate::motion::{self, FRAME_MS};
-use crate::style::{Align, Edges, Look};
+use crate::style::{Align, Edges};
 use crate::text::{Family, Shaped, TextShaper, TextStyle};
 use crate::tokens::{self, Scheme};
-use crate::widgets::Popover;
+use crate::widgets::{Choice, Options, Popover};
 use crate::window::{CARET_WIDTH, Message};
 
 const TEXT: TextStyle = TextStyle::control().family(Family::Mono).size(tokens::TEXT_SM).leading(tokens::LEADING);
@@ -287,8 +287,7 @@ impl Maths {
 
     /// Moves the pick one symbol down or up a list of `listed`, round its ends.
     pub fn pick(&mut self, down: bool, listed: usize) {
-        let step = if down { 1 } else { listed.saturating_sub(1) };
-        self.picked = (self.picked.min(listed.saturating_sub(1)) + step) % listed.max(1);
+        self.picked = Options::<Message>::step(self.picked, down, listed);
     }
 
     /// The symbol that is picked among `listed`.
@@ -480,35 +479,19 @@ impl Maths {
         };
         let pictures: Vec<Option<Formula>> = symbols.iter().map(picture).collect();
         let across = pictures.iter().flatten().map(|picture| picture.size.width).fold(PICTURE.width, f32::max);
-        let picked = self.picked(symbols.len());
-        let row = |(index, (symbol, picture)): (usize, (&&'static Symbol, Option<Formula>))| {
+        let command = TextStyle::control().family(Family::Mono).size(tokens::TEXT_SM);
+        let name = TextStyle::control().size(tokens::TEXT_XS);
+        let mut options = Options::new("Symbols").picked(self.picked(symbols.len()));
+        for (index, (symbol, picture)) in symbols.iter().zip(pictures).enumerate() {
             let picture = Element::canvas(Rc::new(Picture(picture))).width(across).height(PICTURE.height);
-            let picture = picture.passive().decorative();
-            let command = TextStyle::control().family(Family::Mono).size(tokens::TEXT_SM);
-            let name = Element::text(symbol.name, TextStyle::control().size(tokens::TEXT_XS)).fg(tokens::FG_MUTED);
-            let mut row = Element::row()
-                .key(symbol.command)
-                .align(Align::Center)
-                .gap(tokens::SPACE_SM)
-                .padding(Edges::xy(tokens::SPACE_SM, 3.0))
-                .radius(tokens::RADIUS_CONTROL)
-                .hover(Look::bg(tokens::NEUTRAL_SOFT))
-                .role(Role::ListBoxOption)
-                .label(symbol.command)
-                .description(symbol.name)
-                .selected(index == picked)
-                .on_press(Message::Maths(Sheet::Take(index)))
-                .child(picture)
-                .child(Element::text(symbol.command, command))
-                .child(Element::row().grow(1.0).min_width(tokens::SPACE_SM))
-                .child(name);
-            if index == picked {
-                row = row.bg(tokens::ACCENT_SOFT);
-            }
-            row
-        };
-        let rows = symbols.iter().zip(pictures).enumerate().map(row);
-        Element::column().role(Role::ListBox).label("Symbols").children(rows)
+            let choice = Choice::new(symbol.command)
+                .style(command)
+                .lead(picture.passive().decorative())
+                .aside(symbol.name, name)
+                .on_take(Message::Maths(Sheet::Take(index)));
+            options = options.choice(choice);
+        }
+        options.into()
     }
 }
 

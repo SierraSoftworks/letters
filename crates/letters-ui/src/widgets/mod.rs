@@ -3,6 +3,7 @@
 
 mod button;
 mod menu;
+mod options;
 mod popover;
 pub(crate) mod side_panel;
 mod text_field;
@@ -10,6 +11,7 @@ pub(crate) mod top_bar;
 
 pub use button::{Button, ControlSize, Variant};
 pub use menu::{Menu, MenuItem, Tone};
+pub use options::{Choice, Options};
 pub use popover::{Placement, Popover, Side};
 pub use side_panel::SidePanel;
 pub use text_field::TextField;
