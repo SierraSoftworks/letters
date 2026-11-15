@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/*", "platform/*"]
+members = ["crates/*", "apps/*", "platform/*", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -34,6 +34,8 @@ proptest = "1"
 unicode-segmentation = "1"
 # The CRDT behind letters-model. No other crate may name it.
 loro = { version = "1.17", default-features = false }
+# The checksum Loro seals a history with. Only the fuzz targets name it, to seal the histories they try.
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
 jsonschema = { version = "0.61", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 vello_cpu = "0.4"
@@ -127,6 +129,12 @@ debug = false
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# What scripts/fuzz builds: quick to link, and a panic names its line.
+[profile.fuzz]
+inherits = "release"
+lto = false
+debug = "line-tables-only"
 
 # The browser's wasm is downloaded before it runs, so it is built small, except where a frame is made:
 # shaping, layout and painting keep their speed. Measured at 17% less to download for the same frame times.
