@@ -201,6 +201,10 @@ pub enum Request {
     /// Answer with `Window::set_access_log` and the server's rows, newest first, or with
     /// `Window::refuse_share`.
     AccessLog,
+    /// The Activity tab's "Show earlier" was pressed: the rows of the access log from before this time,
+    /// which is that of the last row the window holds (the server's `?before=`). Answer with
+    /// `Window::add_access_log`, or with `Window::refuse_share`.
+    AccessLogBefore(u64),
     /// Sign in to the server at this address, as the person typed it, through the system's browser. Say
     /// how far it has come with `Window::set_sign_in`. Once it is done, say who is signed in where with
     /// `Window::set_servers`, and then that no sign-in is under way with `Window::set_sign_in(None)`.

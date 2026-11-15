@@ -577,9 +577,22 @@ impl Ui<EditorApp> {
     }
 
     /// Says who reached the document through a share: the rows of the server's access log, newest first.
-    /// It answers [`Request::AccessLog`], and the Share dialog's Activity tab lists them by day.
+    /// It answers [`Request::AccessLog`], and the Share dialog's Activity tab lists them by day. The
+    /// server's own page is 200 rows: of a log that long the tab offers the rows before it.
     pub fn set_access_log(&mut self, log: Vec<letters_api::Access>) {
         self.app_mut().share.logged(log);
+    }
+
+    /// Says the rows of the access log from before those the window holds, newest first. It answers
+    /// [`Request::AccessLogBefore`]. A page of fewer than 200 rows is the last.
+    pub fn add_access_log(&mut self, earlier: Vec<letters_api::Access>) {
+        self.app_mut().share.logged_earlier(earlier);
+    }
+
+    /// Says how many days the server keeps a row of its access log (`letters_api::Server::log_days`), for
+    /// the Activity tab to say. 0, as from a server that does not say, and the tab says nothing of it.
+    pub fn set_log_days(&mut self, days: u32) {
+        self.app_mut().share.keeps(days);
     }
 
     /// Says where the person is signed in: see [`Server`]. A shell that signs in to servers says it once
