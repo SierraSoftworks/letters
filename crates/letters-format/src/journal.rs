@@ -124,19 +124,16 @@ impl Journal {
         self.add(files, ASSET, &payload)
     }
 
-    /// Records where the document is saved from now on: after its first save, a move, or a conflict copy
-    /// that became its home.
+    /// Records where the document is saved from now on: when a home is chosen for it, after a move, or
+    /// when a conflict copy became its home.
     pub fn moved(&mut self, files: &mut impl Files, home: &str) -> Result<(), Error> {
         if self.about.home.as_deref() == Some(home) {
             return Ok(());
         }
         self.about.home = Some(home.into());
-        if self.head == 0 {
-            // Nothing is recorded yet, and what comes builds on the file at that home.
-            self.about.whole = false;
-            return Ok(());
-        }
-        self.add(files, HEADER, &self.about.to_json())
+        // With nothing recorded yet there is no file to add to, and the first record will say the home. A
+        // journal opened without one still starts from the whole history, whenever the home was chosen.
+        if self.head == 0 { Ok(()) } else { self.add(files, HEADER, &self.about.to_json()) }
     }
 
     /// Everything journalled so far. Take it as a save is handed its edits, and give it to

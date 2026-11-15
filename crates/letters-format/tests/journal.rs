@@ -112,6 +112,22 @@ fn a_document_that_never_reached_a_file_comes_back_from_its_journal() {
 }
 
 #[test]
+fn a_home_chosen_before_the_first_write_keeps_the_journal_whole() {
+    let mut state = Folder::default();
+    let mut editor = Model::new(document(), ReplicaId::from(2));
+    let (mut journal, _) = Journal::open(&mut state, ID, CREATED, None).unwrap();
+    journal.moved(&mut state, NAME).unwrap();
+    editor.apply([Op::InsertText { at: Pos::new("p", 0), text: "A title. ".into() }]).unwrap();
+    journal.edits(&mut state, &editor.save()).unwrap();
+
+    // The crash comes before the first save, so there is no file at that home to add to.
+    let unsaved = Unsaved::read(&mut state, &journal_name(ID)).unwrap().unwrap();
+    assert_eq!(unsaved.home.as_deref(), Some(NAME));
+    let copy = WorkingCopy::recover(&unsaved, ReplicaId::from(3)).unwrap().expect("the journal stands alone");
+    assert_eq!(text(copy.model().doc()), "A title. Hello world");
+}
+
+#[test]
 fn edits_made_since_the_last_save_come_back_and_leave_once_saved() {
     let (mut folder, mut state) = (shared(), Folder::default());
     let mut session = Session::open(&folder, &mut state, 2);
