@@ -121,6 +121,19 @@ fn the_settings_file_turns_reporting_off() {
 }
 
 #[test]
+fn the_persons_word_is_kept_beside_what_else_the_file_holds() {
+    let file = "# mine\n[writer]\nname = \"Ada Lovelace\"\n";
+    let off = telemetry::written(file, "enabled", false).expect("the file is TOML");
+    assert!(!telemetry::allowed(&off) && !telemetry::noticed(&off), "{off}");
+    assert!(off.starts_with(file), "{off}");
+    let told = telemetry::written(&off, "noticed", true).expect("the file is TOML");
+    assert!(!telemetry::allowed(&told) && telemetry::noticed(&told), "{told}");
+    let on = telemetry::written(&told, "enabled", true).expect("the file is TOML");
+    assert!(telemetry::allowed(&on) && telemetry::noticed(&on), "{on}");
+    assert_eq!(telemetry::written("not toml [", "enabled", false), None);
+}
+
+#[test]
 fn a_session_reports_its_pages_and_events() {
     let (address, hears) = server();
     let telemetry = Telemetry::start(address, true);

@@ -194,6 +194,9 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         starting: true,
         report_launch,
         telemetry: Telemetry::off(),
+        reports: None,
+        notice: false,
+        page: None,
         typing: match options.mode {
             Mode::TypingReport { keys } => Some(TypingRun { keys, stats: Typing::default(), typed: None, next: None }),
             _ => None,
@@ -391,6 +394,12 @@ struct App {
     report_launch: bool,
     /// Off until the first frame is drawn, and for good in a run that measures.
     telemetry: Telemetry,
+    /// Whether the person lets this run report. `None` in a run that never would, which shows no switch.
+    reports: Option<bool>,
+    /// Whether the landing card says that reports are sent: for the one run that first sends any.
+    notice: bool,
+    /// The page last reported.
+    page: Option<Page>,
     /// The typing report in progress, in that mode.
     typing: Option<TypingRun>,
     /// The stopwatch, until the first frame is on screen.
@@ -2197,6 +2206,10 @@ impl App {
         window.retitle();
         window.reframe(&self.buttons);
         window.follow(&self.settings, self.writer());
+        if let Some(on) = self.reports {
+            window.view.set_usage_reports(on);
+            window.view.set_usage_notice(self.notice);
+        }
         if self.servers_told {
             window.view.set_servers(self.servers());
         }
@@ -2242,6 +2255,11 @@ impl App {
         let mut refused = false;
         let requests = window.view.take_requests();
         let served = !requests.is_empty();
+        let page = Page::of(window.view.mode());
+        if self.reports.is_some() && self.page != Some(page) {
+            self.page = Some(page);
+            self.telemetry.page(page);
+        }
         for request in requests {
             telemetry::Event::asked(&request).into_iter().for_each(|event| self.telemetry.record(event));
             match request {
@@ -2332,6 +2350,7 @@ impl App {
                 }
                 Request::SaveDefaultStyle(json) => self.keep_style(id, &json),
                 Request::Settings(settings) => self.keep_settings(id, settings),
+                Request::UsageReports(on) => self.keep_reports(on),
                 Request::ImportStyle => {
                     let Some(window) = self.windows.get_mut(&id) else { continue };
                     let dialog = FileDialog::new().add_filter(STYLESHEETS, &[STYLESHEET]);
@@ -2447,6 +2466,17 @@ impl App {
                 "Your settings could not be kept, and will last only until Letters closes.\n\n{error}"
             ));
         }
+    }
+
+    /// Follows the person's word on usage reports in every window, and keeps it for the next launch. A
+    /// word that could not be kept still holds until the app closes.
+    fn keep_reports(&mut self, on: bool) {
+        if let Err(error) = telemetry::keep(&self.home, "enabled", on) {
+            eprintln!("letters: the choice on usage reports could not be kept, since {error}");
+        }
+        self.reports = Some(on);
+        self.telemetry.allow(on);
+        self.windows.values_mut().for_each(|window| window.view.set_usage_reports(on));
     }
 
     /// Keeps a style as the person's default, for every window to offer from now on. The window that
@@ -3442,8 +3472,16 @@ impl ApplicationHandler<Event> for App {
                             .ok()
                             .flatten()
                             .unwrap_or_default();
-                        self.telemetry = Telemetry::start(telemetry::SERVER, telemetry::allowed(&said));
-                        self.telemetry.page(if window.view.landing() { Page::Landing } else { Page::Editor });
+                        let allowed = telemetry::allowed(&said);
+                        self.telemetry = Telemetry::start(telemetry::SERVER, allowed);
+                        self.reports = Some(allowed);
+                        // The card says so in the first run that reports, and not again.
+                        self.notice = allowed && !telemetry::noticed(&said);
+                        if self.notice {
+                            let _ = telemetry::keep(&self.home, "noticed", true);
+                        }
+                        window.view.set_usage_reports(allowed);
+                        window.view.set_usage_notice(self.notice);
                     }
                     // The desktop is asked over D-Bus, which is not worth holding a frame for.
                     let (proxy, folders) = (self.proxy.clone(), self.dictionaries.clone());

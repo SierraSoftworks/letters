@@ -13,6 +13,8 @@
 //! [telemetry]
 //! enabled = false
 //! ```
+//!
+//! `noticed = true` beside it says that the landing card has told the person of the reports once.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -20,8 +22,14 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread;
 use std::time::Duration;
 
-use letters_ui::{CopyFormat, Request};
-use toml_edit::DocumentMut;
+use std::io;
+use std::path::Path;
+
+use letters_trust::Store as _;
+use letters_ui::{CopyFormat, Mode, Request};
+use toml_edit::{DocumentMut, Item, Table, value};
+
+use crate::trust::Settings;
 use tracing_batteries::{Analytics, Session};
 
 /// Where reports go: Sierra Softworks' own analytics server, which keeps no address and no identifier.
@@ -49,6 +57,17 @@ pub enum Page {
 
 impl Page {
     pub const ALL: [Self; 5] = [Self::Landing, Self::Editor, Self::History, Self::Review, Self::Print];
+
+    /// The page for what the window shows.
+    pub const fn of(mode: Mode) -> Self {
+        match mode {
+            Mode::Landing => Self::Landing,
+            Mode::Editor => Self::Editor,
+            Mode::History => Self::History,
+            Mode::Review => Self::Review,
+            Mode::Print => Self::Print,
+        }
+    }
 
     pub const fn path(self) -> &'static str {
         match self {
@@ -204,6 +223,29 @@ impl Event {
 pub fn allowed(settings: &str) -> bool {
     let Ok(file) = settings.parse::<DocumentMut>() else { return true };
     file.get("telemetry").and_then(|table| table.get("enabled")).and_then(|enabled| enabled.as_bool()) != Some(false)
+}
+
+/// Whether the settings file's text says that the person was told of the reports.
+pub fn noticed(settings: &str) -> bool {
+    let Ok(file) = settings.parse::<DocumentMut>() else { return false };
+    file.get("telemetry").and_then(|table| table.get("noticed")).and_then(|noticed| noticed.as_bool()) == Some(true)
+}
+
+/// The settings file's text with `key` under `[telemetry]` set, and all else as its writer had it. `None`
+/// for text that is no TOML, which nothing could be written into without losing what its writer meant.
+pub fn written(settings: &str, key: &str, set: bool) -> Option<String> {
+    let mut file = settings.parse::<DocumentMut>().ok()?;
+    let table = file.entry("telemetry").or_insert_with(|| Item::Table(Table::new()));
+    table.as_table_like_mut()?.insert(key, value(set));
+    Some(file.to_string())
+}
+
+/// Keeps `key` under `[telemetry]` in the settings of the person whose home folder is `home`.
+pub fn keep(home: &Path, key: &str, set: bool) -> io::Result<()> {
+    let mut file = Settings::of(home);
+    let text = file.read()?.unwrap_or_default();
+    let text = written(&text, key, set).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no TOML"))?;
+    file.write(&text)
 }
 
 enum Said {
