@@ -275,6 +275,12 @@ fn positions_in_a_gallery_are_on_its_pictures() {
     let (block, named) = (tiles(5, Some("Along the harbour")), named(5));
     let layout = around(block);
     let place = |id: &str| layout.figure(&id.into()).unwrap().image;
+    let edges = [false, true].map(|end| layout.line_edge(&Pos::new("gc", 3), end));
+    assert_eq!(
+        edges,
+        [0, "Along the harbour".len()].map(|offset| Some(Pos::new("gc", offset))),
+        "a caption has its ends"
+    );
     for (id, _) in &named {
         let (id, tile) = (id.as_str(), place(id));
         assert_eq!(layout.hit(middle(tile)), Some(Pos::new(id, 0)), "a point on {id} is at it");
@@ -414,6 +420,10 @@ fn positions_in_a_table_are_in_its_cells() {
                 let found = layout.hit(middle(caret(&id, offset)));
                 assert_eq!(found, Some(Pos::new(id.as_str(), offset)), "a point at a caret in {id} is that position");
             }
+            let edges = [false, true].map(|end| layout.line_edge(&Pos::new(id.as_str(), 1), end));
+            let inside = |edge: &Option<Pos>| edge.as_ref().is_some_and(|pos| pos.block == BlockId::from(id.as_str()));
+            assert!(edges.iter().all(inside), "the ends of a line in {id} are in it: {edges:?}");
+            assert_eq!(edges[0], Some(Pos::new(id.as_str(), 0)), "and its first line starts the cell");
         }
     }
 

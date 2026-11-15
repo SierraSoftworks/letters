@@ -31,6 +31,7 @@ mod paginate;
 mod palette;
 mod reveal;
 mod shape;
+mod split;
 mod theme;
 mod tokens;
 
@@ -53,6 +54,7 @@ use crate::reveal::{Reveal, Shapes, Shifts};
 pub use crate::paginate::{Heading, PageLink, Pages, Sheet};
 pub use crate::palette::{Callout, Palette, Scheme, Syntax};
 pub use crate::shape::{FontSpec, ShapedRun, ShapedText, Shaper};
+pub use crate::split::{Arrangement, Piece, Side, Split, Window};
 pub use crate::tokens::{Token, TokenKind};
 
 /// The fonts layout may use. The shell supplies them, since the core never reads files.
@@ -266,6 +268,22 @@ impl DocLayout {
         state.height
     }
 
+    /// The width the document is laid out at.
+    pub(crate) fn width(&self) -> f32 {
+        self.state.borrow().width
+    }
+
+    /// The stretch of the column that a block takes up with the space above it, from the column's top. A
+    /// block inside another, as a cell is in a table, answers for the whole top-level block around it.
+    pub(crate) fn band(&self, block: &BlockId) -> Option<(f32, f32)> {
+        self.state.borrow_mut().band(block)
+    }
+
+    /// The position at a point, or the nearest to it, among what a stretch of the column holds.
+    pub(crate) fn hit_in(&self, point: Point, band: (f32, f32)) -> Option<Pos> {
+        self.state.borrow_mut().hit(point, Some(band))
+    }
+
     /// Emits the part of the document that falls inside `viewport`.
     pub fn paint(&self, viewport: Rect, out: &mut DisplayList) {
         self.state.borrow_mut().paint(viewport, false, out);
@@ -328,7 +346,7 @@ impl DocLayout {
     /// The position nearest to a point: in the nearest text, or on a picture of a gallery. `None` when the
     /// document holds neither.
     pub fn hit(&self, point: Point) -> Option<Pos> {
-        self.state.borrow_mut().hit(point)
+        self.state.borrow_mut().hit(point, None)
     }
 
     /// Where a caret at `pos` is drawn. An offset where a line wraps belongs to the start of the next line.
@@ -718,6 +736,16 @@ impl State {
         }
     }
 
+    fn band(&mut self, block: &BlockId) -> Option<(f32, f32)> {
+        let at = self.index.get(block)?.leaf;
+        let under = |leaf: &Leaf| leaf.root == self.leaves[at].root;
+        let first = self.leaves[..at].iter().rposition(|leaf| !under(leaf)).map_or(0, |above| above + 1);
+        let last = self.leaves[at..].iter().position(|leaf| !under(leaf)).map_or(self.leaves.len(), |end| at + end) - 1;
+        self.place(last);
+        let top = first.checked_sub(1).map_or(0.0, |above| self.leaves[above].span().1);
+        Some((top, self.leaves[last].span().1))
+    }
+
     fn place_all(&mut self) {
         self.place(usize::MAX);
         self.height = self.leaves.last().map_or(0.0, |last| last.span().1);
@@ -1084,13 +1112,21 @@ impl State {
         headings
     }
 
-    fn hit(&mut self, point: Point) -> Option<Pos> {
+    /// The position at a point, among the leaves of a stretch of the column if `band` gives one.
+    fn hit(&mut self, point: Point, band: Option<(f32, f32)>) -> Option<Pos> {
         self.clock += 1;
         self.place_all();
-        let at = self.leaves.partition_point(|leaf| leaf.y + leaf.height < point.y);
+        let (first, end) = match band {
+            Some((top, bottom)) => {
+                let first = self.leaves.partition_point(|leaf| leaf.span().1 <= top);
+                (first, self.leaves.partition_point(|leaf| leaf.span().0 < bottom).max(first))
+            }
+            None => (0, self.leaves.len()),
+        };
+        let at = first + self.leaves[first..end].partition_point(|leaf| leaf.y + leaf.height < point.y);
         // The nearest leaf that a position can be in, above or below.
-        let below = self.leaves.get(at..).and_then(|rest| rest.iter().position(Leaf::holds)).map(|skip| at + skip);
-        let above = self.leaves[..at.min(self.leaves.len())].iter().rposition(Leaf::holds);
+        let below = self.leaves[at..end].iter().position(Leaf::holds).map(|skip| at + skip);
+        let above = self.leaves[first..at].iter().rposition(Leaf::holds).map(|back| first + back);
         let at = match (above, below) {
             (Some(above), Some(below)) => {
                 let gap_above = point.y - (self.leaves[above].y + self.leaves[above].height);
