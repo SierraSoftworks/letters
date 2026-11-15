@@ -34,8 +34,9 @@ pub fn fonts(fonts: &Array, maths: &Array) {
 /// is what such a file's name ends in: `pdf`, `docx`, `html` or `md`. `assets` holds the pictures the
 /// document shows, by their names in it. `created` is in seconds since 1970 began.
 ///
-/// The format `let` is a document of its own that starts with this one's text and `history`, which is
-/// what `Model::save` writes.
+/// The format `let` is the document's own file: it takes its `history`, which is what `Model::save`
+/// writes, and its `identity`, which is its id and when it was created as RFC 3339. A copy is given an
+/// identity of its own, so that the two never pass for one document written in two places.
 ///
 /// Returns the file's name, its media type and its bytes. The name is `title` as a file can be called,
 /// and `undefined` when nothing of the title can name a file.
@@ -51,6 +52,7 @@ pub fn exported(
     created: Option<f64>,
     assets: &Map,
     history: Option<Vec<u8>>,
+    identity: Option<Vec<String>>,
 ) -> Result<Array, JsError> {
     let (document, style) = (Document::from_json(document)?, Style::from_json(style)?);
     let mut asset =
@@ -85,13 +87,9 @@ pub fn exported(
             }
         }
         "let" => {
-            // A document of its own has its own id: with this one's, the two would pass for one document
-            // that was written in two places.
-            let id = web_sys::window().and_then(|window| window.crypto().ok()).map(|crypto| crypto.random_uuid());
-            let id = id.ok_or_else(|| JsError::new("the browser gave the copy no id"))?;
-            let now = String::from(Date::new_0().to_iso_string());
-            // To the second, as every other writer of the format dates a document.
-            let created = format!("{}Z", now.get(..19).unwrap_or(&now));
+            let Some([id, created]) = identity.and_then(|identity| <[String; 2]>::try_from(identity).ok()) else {
+                return Err(JsError::new("the document came without its id"));
+            };
             let mut package = Package { id, created, document, entries: BTreeMap::new() };
             package.set_style(&style);
             package.set_notes(&Notes::from_json(notes)?);
@@ -130,7 +128,8 @@ fn zipped(files: impl Iterator<Item = (Vec<u8>, String)>) -> ZipResult<Vec<u8>> 
 }
 
 /// Reads a `.let` file for the editor to open. Returns its `document.json`, `style.json` and `notes.json`
-/// as this build writes them, its history as `Model::prepare` takes it, and its pictures by their names.
+/// as this build writes them, its history as `Model::prepare` takes it, its pictures by their names, and
+/// its identity as [`exported`] takes it.
 ///
 /// A style or notes that this build cannot read are `undefined`, as a newer build's may be, and so is the
 /// history of a file that has none.
@@ -155,5 +154,8 @@ pub fn opened(file: Vec<u8>) -> Result<Array, JsError> {
             assets.set(&name.into(), &Uint8Array::from(&picture[..]));
         }
     }
-    Ok(Array::of5(&document.into(), &style.into(), &notes.into(), &history.into(), &assets))
+    let identity = Array::of2(&file.manifest().id.as_str().into(), &file.manifest().created.as_str().into());
+    let read: [JsValue; 6] =
+        [document.into(), style.into(), notes.into(), history.into(), assets.into(), identity.into()];
+    Ok(read.into_iter().collect())
 }

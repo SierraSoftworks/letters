@@ -1,5 +1,7 @@
 // What the tests ask of the harness page.
 
+import { inflateRawSync } from "node:zlib";
+
 /** Opens the page and waits for its first frame, and for the fonts and dictionaries that follow it. */
 export const ready = async (page) => {
   await page.goto("/");
@@ -20,3 +22,16 @@ export const frames = (page) => page.evaluate(() => window.letters.frames);
 
 /** Waits for the frame that follows an edit, and for the spelling check that runs once it is painted. */
 export const rested = (page) => page.evaluate(() => new Promise((done) => requestAnimationFrame(() => setTimeout(done, 100))));
+
+/** An entry of a zip that Letters wrote, as text. `zip` is a `Buffer`. */
+export const entry = (zip, name) => {
+  for (let at = 0; zip.readUInt32LE(at) === 0x04034b50; ) {
+    const [method, packed] = [zip.readUInt16LE(at + 8), zip.readUInt32LE(at + 18)];
+    const start = at + 30 + zip.readUInt16LE(at + 26) + zip.readUInt16LE(at + 28);
+    const bytes = zip.subarray(start, start + packed);
+    if (zip.toString("utf8", at + 30, at + 30 + zip.readUInt16LE(at + 26)) === name) {
+      return (method === 0 ? bytes : inflateRawSync(bytes)).toString("utf8");
+    }
+    at = start + packed;
+  }
+};

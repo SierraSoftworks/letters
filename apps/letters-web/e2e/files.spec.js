@@ -1,10 +1,10 @@
-// Opening a document's file: chosen after "Open", or let go on the page.
+// A document's file: saved from the page, chosen after "Open", or let go on the page.
 
 import { readFile } from "node:fs/promises";
 
 import { expect, test } from "@playwright/test";
 
-import { blocks, ready, rested, texts } from "./page.js";
+import { blocks, entry, ready, rested, texts } from "./page.js";
 
 /** Pastes a small picture, which becomes a figure. */
 const picture = async (page) => {
@@ -47,7 +47,58 @@ const drop = (page, files) =>
     document.getElementById("letters").dispatchEvent(new DragEvent("drop", { dataTransfer: data, ...at }));
   }, files.map((file) => ({ ...file, bytes: [...file.buffer] })));
 
+/** The file the browser is handed when `key` is pressed: its name, and its bytes. */
+const saved = async (page, key = "ControlOrMeta+s") => {
+  const kept = page.waitForEvent("download");
+  await page.keyboard.press(key);
+  const file = await kept;
+  return { name: file.suggestedFilename(), mimeType: "", buffer: await readFile(await file.path()) };
+};
+
+/** What makes a file's document that one and no other. */
+const identity = (file) => {
+  const { id, created } = JSON.parse(entry(file.buffer, "manifest.json"));
+  return { id, created };
+};
+
 test.beforeEach(({ page }) => ready(page));
+
+test("Ctrl or Cmd with S keeps the document as its own file, which stays the same document however often", async ({ page }) => {
+  await page.evaluate(() => {
+    window.saves = [];
+    const heard = (event) => event.key === "s" && window.saves.push(event.defaultPrevented);
+    window.addEventListener("keydown", heard);
+  });
+  await page.keyboard.type("Saved by hand");
+  const first = await saved(page);
+  // The browser's own answer to the key would save the page.
+  expect(await page.evaluate(() => window.saves)).toEqual([true]);
+  expect(first.name).toBe(`${await page.title()}.let`);
+  expect(entry(first.buffer, "document.json")).toContain("Saved by hand");
+
+  await page.keyboard.type(", and again");
+  const second = await saved(page);
+  expect(entry(second.buffer, "document.json")).toContain("Saved by hand, and again");
+  expect(identity(second)).toEqual(identity(first));
+});
+
+test("a file that was opened is saved as the same document, and copied as another", async ({ page }) => {
+  await page.keyboard.type("From one page");
+  const file = await saved(page);
+  await ready(page);
+  await drop(page, [file]);
+  await expect.poll(() => texts(page)).toContain("From one page");
+
+  await page.keyboard.type("Written in another. ");
+  const again = await saved(page);
+  expect(entry(again.buffer, "document.json")).toContain("Written in another.");
+  expect(identity(again)).toEqual(identity(file));
+
+  await page.keyboard.press("ControlOrMeta+Shift+s");
+  await expect(page.getByRole("dialog", { name: "Save a copy" })).toBeAttached();
+  const copy = await saved(page, "Enter");
+  expect(identity(copy).id).not.toBe(identity(file).id);
+});
 
 test("Open asks for a document's file, and shows it with its name, its pictures and its history", async ({ page }) => {
   const { file, history } = await written(page, "Written before it was kept");

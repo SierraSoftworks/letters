@@ -157,6 +157,9 @@ pub struct Shell {
     /// What `View::edits` said when the document was opened or last kept as a file of its own. What was
     /// written since is nowhere but on the page.
     kept: u64,
+    /// The document's id and when it was created, which its file says. One that never had a file is
+    /// given them when it is first saved.
+    identity: Option<[String; 2]>,
     /// The handles at the ends of the selection, the anchor's first, and how each was last styled.
     handles: [(HtmlElement, String); 2],
     /// Whether the page was last pressed by a finger, which is who the handles are for.
@@ -274,6 +277,7 @@ impl Shell {
                 picker: picker.clone(),
                 opener: opener.clone(),
                 kept: view.edits(),
+                identity: None,
                 handles: handles.clone(),
                 fingers: false,
                 editing: false,
@@ -425,7 +429,7 @@ impl Shell {
     /// Shows `document` in place of the one on screen.
     pub fn open(&mut self, document: Document) {
         self.view = view(document, &mut self.platform, self.mac);
-        self.kept = self.view.edits();
+        (self.kept, self.identity) = (self.view.edits(), None);
         self.text = TextInput::new(self.mac);
         self.touch = Touch::default();
         self.rest();
@@ -552,9 +556,13 @@ impl Shell {
 
     /// Has the exports write the document as it now is, in the format whose files end in `format`, and
     /// hands `then` the file, or why there is none in words that end a sentence.
+    ///
+    /// A file of the format `let` is the document's own when `own` is set, and otherwise a document of
+    /// its own that starts with this one's text and history.
     fn export(
         &mut self,
         format: &'static str,
+        own: bool,
         title: String,
         then: impl FnOnce(&mut Self, Result<Exported, String>) + 'static,
     ) {
@@ -567,9 +575,15 @@ impl Shell {
         for (name, file) in self.platform.assets.iter().filter(|(name, _)| document.contains(name.as_str())) {
             assets.set(&name.into(), &Uint8Array::from(&file[..]));
         }
-        // A document of its own takes the history with it, which nothing else has a use for.
+        // A document's file takes the history with it, which nothing else has a use for.
         let history = (format == "let").then(|| Uint8Array::from(&editor.model().save()[..]));
-        let asked: [JsValue; 9] = [
+        let identity = history.is_some().then(|| match own {
+            true => self.identity.get_or_insert_with(|| self.platform.identity()).clone(),
+            // A copy never passes for the document it was made of.
+            false => self.platform.identity(),
+        });
+        let identity = identity.map(|identity| identity.into_iter().map(JsValue::from).collect::<Array>());
+        let asked: [JsValue; 10] = [
             format.into(),
             title.into(),
             document.into(),
@@ -579,6 +593,7 @@ impl Shell {
             created.into(),
             assets.into(),
             history.into(),
+            identity.into(),
         ];
         self.ask("exported", asked.into_iter().collect(), |shell, made| {
             let made = made.map(|made| Exported {
@@ -635,7 +650,7 @@ impl Shell {
             CopyFormat::Markdown => "md",
         };
         let written = self.view.edits();
-        self.export(format, name, move |shell, made| {
+        self.export(format, false, name, move |shell, made| {
             let failed = |why: String| format!("The copy could not be written: {why}.");
             let refused = match made {
                 Ok(Exported { name: None, .. }) => Some("A copy needs a name.".to_owned()),
@@ -657,7 +672,29 @@ impl Shell {
         });
     }
 
-    // Opening a file
+    // Saving and opening a file
+
+    /// Keeps the document as its own file, which the browser hands to the person: there is nowhere else
+    /// to write it until a server is behind the page. The file has the document's id and history, so the
+    /// desktop takes it for a newer state of the file it was opened from.
+    fn save(&mut self) {
+        let written = self.view.edits();
+        let title = self.window.document().map(|page| page.title()).unwrap_or_default();
+        self.export("let", true, title, move |shell, made| {
+            let saved = made.and_then(|file| {
+                // A document whose name no file can have is kept all the same.
+                let name = file.name.unwrap_or_else(|| format!("Untitled{DOCUMENTS}"));
+                shell.download(&file.file, &file.kind, &name).map_err(|error| said(&error))
+            });
+            match saved {
+                Ok(()) => {
+                    shell.kept = written;
+                    shell.view.set_saved_in("your downloads");
+                }
+                Err(why) => shell.say(format!("The document could not be saved: {why}.")),
+            }
+        });
+    }
 
     /// The document the person chose after "Open" takes the place of the one on the page.
     fn chosen(&mut self, _: Event) {
@@ -713,6 +750,8 @@ impl Shell {
         let notes = text(2).map(|notes| Notes::from_json(&notes)).transpose().map_err(failed)?;
         let history = Some(file.get(3)).filter(|history| !history.is_undefined());
         let pictures: Map = file.get(4).unchecked_into();
+        let identity: Array = file.get(5).unchecked_into();
+        let identity = [0, 1].map(|at| identity.get(at).as_string().unwrap_or_default());
 
         // The page shows the file as it is. Its history takes the document in, so that a file changed
         // outside Letters is still the document.
@@ -739,7 +778,7 @@ impl Shell {
             let picture = Uint8Array::new(&picture).to_vec();
             self.platform.assets.extend(name.as_string().map(|name| (name, picture)));
         });
-        self.kept = view.edits();
+        (self.kept, self.identity) = (view.edits(), Some(identity));
         self.view = view;
         self.text = TextInput::new(self.mac);
         self.touch = Touch::default();
@@ -756,7 +795,7 @@ impl Shell {
             return;
         }
         let title = self.window.document().map(|page| page.title()).unwrap_or_default();
-        self.export("pdf", title, |shell, made| {
+        self.export("pdf", false, title, |shell, made| {
             shell.printing = false;
             let printed = made.and_then(|pdf| shell.hand_to_print(&pdf.file).map_err(|error| said(&error)));
             if let Err(why) = printed {
@@ -1102,6 +1141,13 @@ impl Shell {
 
     fn key_down(&mut self, event: KeyboardEvent) {
         let ime = event.is_composing() || event.key_code() == 229;
+        // The window has no save command, since a document with a home is saved as it is written. A
+        // page has no home for it yet, and the browser's own answer to the key would save the page.
+        let primary = if self.mac { event.meta_key() } else { event.ctrl_key() };
+        if primary && !ime && !event.shift_key() && !event.alt_key() && event.key().eq_ignore_ascii_case("s") {
+            event.prevent_default();
+            return self.save();
+        }
         self.text(Dom::KeyDown { key: &event.key(), code: &event.code(), held: held!(event), ime }, &event);
     }
 
