@@ -1945,6 +1945,71 @@ fn a_press_on_the_sheet_puts_the_caret_there_in_the_source() {
     assert_eq!(block_text(&window, "p1"), "A rafter has length y");
 }
 
+/// Whether the next frame draws the caret where it can be seen: whole, inside whatever clips it.
+fn caret_shows(window: &mut Harness) -> bool {
+    let caret = caret(window);
+    let holds = |clip: &Rect| clip.x <= caret.x && caret.x + caret.width <= clip.x + clip.width;
+    let mut clips = Vec::new();
+    window.paint().items.iter().any(|item| match item {
+        Item::PushClip { rect, .. } => {
+            clips.push(*rect);
+            false
+        }
+        Item::PopClip => {
+            clips.pop();
+            false
+        }
+        Item::Fill { rect, .. } => {
+            (rect.x, rect.y) == (caret.x, caret.y) && rect.width < 3.0 && clips.iter().all(holds)
+        }
+        _ => false,
+    })
+}
+
+#[test]
+fn the_caret_shows_and_blinks_at_the_end_of_a_source_as_wide_as_its_sheet() {
+    // Written far wider than it typesets, so the sheet is no wider than the source.
+    const LONG: &str = "c = \\sqrt{a^2 + b^2}";
+    let blocks = vec![text("p1", BlockKind::Paragraph, "A rafter has length "), text("f1", BlockKind::Formula, LONG)];
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.ui().set_reduced_motion(true);
+    window.ui().select(Selection::caret(Pos::new("p1", 20)));
+    window.type_text(&format!("${LONG}$"));
+    // How the caret comes to the end of a source: in a paragraph, in a block, and after a space typed there.
+    for way in ["in a paragraph", "in a block", "after a space"] {
+        match way {
+            "in a paragraph" => _ = window.key("Left"),
+            "in a block" => window.ui().select(Selection::caret(Pos::new("f1", LONG.len()))),
+            _ => _ = window.type_text(" "),
+        }
+        assert_eq!(source(&mut window).map(|source| source.trim_end().to_owned()).as_deref(), Some(LONG), "{way}");
+        let seen: Vec<bool> = (0..20).map(|_| caret_shows(window.advance(100))).collect();
+        assert!(seen.contains(&true), "{way}: the caret shows past the last character");
+        assert!(seen.contains(&false), "{way}: and it blinks");
+    }
+}
+
+#[test]
+fn what_is_typed_shows_the_caret_where_a_long_source_scrolls_under_it() {
+    let long = "a + ".repeat(60);
+    let mut window =
+        Harness::open(Document { blocks: vec![text("f1", BlockKind::Formula, &long)], ..Document::default() });
+    window.ui().set_reduced_motion(true);
+    window.ui().select(Selection::caret(Pos::new("f1", long.len())));
+    let at = caret(&mut window);
+    for typed in ["b", "Left Right"] {
+        // The caret has blinked out when the next key comes.
+        let out = (0..20).any(|_| !caret_shows(window.advance(100)));
+        assert!(out, "{typed}: the caret blinks");
+        match typed {
+            "b" => _ = window.type_text(typed),
+            _ => typed.split(' ').for_each(|key| _ = window.key(key)),
+        }
+        assert_eq!(caret(&mut window), at, "{typed}: the caret keeps its place at the end of the sheet");
+        assert!(caret_shows(&mut window), "{typed}: and shows at once");
+    }
+}
+
 #[test]
 fn a_sheet_slides_out_from_under_its_formula() {
     let mut window = formulas();

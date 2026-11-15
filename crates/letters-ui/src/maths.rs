@@ -32,6 +32,9 @@ const PADDING: Edges =
 pub(crate) const HALO: f32 = 3.0;
 /// How much wider than its formula a sheet is at the least.
 const WIDER: f32 = 24.0;
+/// The room kept past the end of the source for a caret there, whole however the sheet's edges snap to
+/// device pixels.
+const CARET_ROOM: f32 = CARET_WIDTH + 1.0;
 /// How long the sheet takes to slide out, in milliseconds.
 const SLIDE_MS: f32 = 140.0;
 /// How far together the source of a closed formula is pressed at the most, as a share of its width.
@@ -380,11 +383,16 @@ impl Maths {
         }
     }
 
+    /// How wide the source is with a caret past its end.
+    fn span(source: &Source) -> f32 {
+        source.size().width + CARET_ROOM
+    }
+
     /// How wide the sheet shows its source: as wide as the source or a little wider than its formula,
     /// whichever is more, and no wider than the page area has room for.
     fn width(source: &Source, formula: f32, room: f32) -> f32 {
         let most = (room - 2.0 * MARGIN - PADDING.left - PADDING.right).max(1.0);
-        source.size().width.max(formula + WIDER).min(most)
+        Self::span(source).max(formula + WIDER).min(most)
     }
 
     /// Where the left edge of the source is, for a sheet centred under a formula that starts at `x` and is
@@ -408,7 +416,7 @@ impl Maths {
         let (size, width) = (source.size(), Self::width(&source, formula, room).max(least));
         let caret = source.caret(selection.head.offset);
         // A source too long for the window shows the part around the caret.
-        let across = (caret.x - width / 2.0).clamp(0.0, (size.width - width).max(0.0));
+        let across = (caret.x - width / 2.0).clamp(0.0, (Self::span(&source) - width).max(0.0));
         // The sheet comes out from under the formula, its last line first.
         let shift = Point { x: across, y: (1.0 - self.slid) * size.height };
         let (start, end) =

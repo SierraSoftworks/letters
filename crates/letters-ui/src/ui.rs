@@ -660,7 +660,11 @@ impl<A: App> Ui<A> {
         let Some(i) = self.focused() else { return };
         match &self.tree.nodes[i].el.content {
             Content::Input(_) => self.input_text(i, event),
-            Content::Canvas(canvas) => self.queue.extend(canvas.on_text.as_ref().map(|handler| handler(event))),
+            Content::Canvas(canvas) => {
+                self.queue.extend(canvas.on_text.as_ref().map(|handler| handler(event)));
+                // What is typed shows the caret, even where the text scrolls under it and it keeps its place.
+                self.restart_blink();
+            }
             // Space presses a focused button. It arrives as text, like every other character.
             _ if matches!(&event, InputEvent::Insert(text) | InputEvent::Commit(text) if text == " ") => {
                 self.activate(i)
@@ -702,6 +706,7 @@ impl<A: App> Ui<A> {
         }
         let on_page = focused.is_none_or(|i| matches!(self.tree.nodes[i].el.content, Content::Canvas(_)));
         if on_page && self.offer(event, platform) {
+            self.restart_blink();
             return true;
         }
         if let Some(i) = focused {
