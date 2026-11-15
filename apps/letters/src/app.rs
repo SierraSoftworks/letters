@@ -26,9 +26,9 @@ use letters_sync::{Local, Progress, Refusal};
 use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDecision, Origin, Trust};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
-    Access, Appearance, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer,
-    Landing, LinkPreviewFound, Location, MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState, Scheme,
-    Settings, Window as View, tokens,
+    Access, Allows, Appearance, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind,
+    ImportOffer, Landing, LinkPreviewFound, Location, MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState,
+    Scheme, Settings, Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -475,6 +475,12 @@ impl Remote {
             (false, true) => Access::Comments,
             (false, false) => Access::Reads,
         }
+    }
+
+    /// What the person may take away of the document, as the server last said.
+    fn allows(&self) -> Allows {
+        let letters_api::Allows { download, copy, print } = self.opened.allows;
+        Allows { copy, download, print }
     }
 
     /// Whether the server vouches for the document: one in the person's own spaces, not one only shared
@@ -940,6 +946,7 @@ impl DocWindow {
         let progress = remote.filter(|remote| remote.started).map(|remote| remote.line.progress());
         self.view.set_connection(remote.map(Remote::connection));
         self.view.set_access(remote.map_or(Access::Edits, Remote::access));
+        self.view.set_allows(remote.map_or_else(Allows::default, Remote::allows));
         self.view.set_save_state(match (self.save_failed, self.place.home().is_some(), self.unsaved()) {
             (true, _, _) => SaveState::Failed,
             // A document with no file yet has nothing to say about saving.
