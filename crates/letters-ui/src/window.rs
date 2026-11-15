@@ -649,13 +649,18 @@ impl EditorApp {
         }
     }
 
+    /// The most a row of a formula's source may take across on its sheet, which is no wider than the text.
+    fn wide(&self) -> f32 {
+        Maths::wide(self.column.1, 2.0 * self.column.0 + self.column.1)
+    }
+
     /// Runs something on the editor, which may ask the layout about lines while it works.
     fn edit(&mut self, platform: &mut dyn Platform, act: impl FnOnce(&mut Editor, &mut dyn Platform) -> Change) {
         // On a sheet the caret moves by the lines of the source, which the page does not show.
-        let source = Source::of(&self.editor, self.shaper.as_ref());
+        let wide = self.wide();
+        let source = Source::of(&self.editor, self.shaper.as_ref(), wide);
         let formula = self.editor.selection().and_then(|selection| self.layout.formula_rect(&selection.head));
-        let room = 2.0 * self.column.0 + self.column.1;
-        let left = source.as_ref().zip(formula).map(|(source, rect)| Maths::left(source, rect.x, rect.width, room));
+        let left = source.as_ref().zip(formula).map(|(source, rect)| Maths::left(source, rect.x, rect.width, wide));
         let lines = SheetLines {
             page: DocLines::new(&self.layout, self.height),
             source: source.filter(|_| left.is_some()),
@@ -938,7 +943,7 @@ impl EditorApp {
         let alone = self.landing.is_none() && self.spelling.fix.is_none() && self.link.is_none();
         let formula = selection.filter(|_| alone).and_then(|selection| self.layout.formula_rect(&selection.head));
         let formula = formula.filter(|rect| (0.0..=room.height).contains(&(origin.y + rect.y + rect.height)));
-        let sheet = formula.and_then(|rect| Some((Source::of(&self.editor, self.shaper.as_ref())?, rect)));
+        let sheet = formula.and_then(|rect| Some((Source::of(&self.editor, self.shaper.as_ref(), self.wide())?, rect)));
         self.maths.follow(sheet.as_ref().map(|(source, _)| source), self.reduced_motion);
         match &sheet {
             Some((_, rect)) => list.items.push(maths::tint(*rect, self.scheme)),
@@ -1011,7 +1016,7 @@ impl EditorApp {
         } else if let Some(((source, rect), selection)) = sheet.zip(selection) {
             let spot = Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect };
             element =
-                element.popover(self.maths.sheet(source, selection, rect.width, room.width, self.scheme).at(spot));
+                element.popover(self.maths.sheet(source, selection, rect.width, self.wide(), self.scheme).at(spot));
         }
         element
     }
@@ -1488,7 +1493,7 @@ impl EditorApp {
     /// The symbols the sheet offers for the command being typed at the caret, and the stretch of the
     /// formula's block that one of them would replace.
     fn symbols(&self) -> Option<(Pos, usize, Vec<&'static letters_math::Command>)> {
-        let source = Source::of(&self.editor, self.shaper.as_ref())?;
+        let source = Source::of(&self.editor, self.shaper.as_ref(), self.wide())?;
         let (typed, symbols) = self.maths.symbols(&source, self.editor.selection()?)?;
         Some((Pos::new(source.block, typed.start), typed.end, symbols))
     }

@@ -1989,27 +1989,6 @@ fn the_caret_shows_and_blinks_at_the_end_of_a_source_as_wide_as_its_sheet() {
     }
 }
 
-#[test]
-fn what_is_typed_shows_the_caret_where_a_long_source_scrolls_under_it() {
-    let long = "a + ".repeat(60);
-    let mut window =
-        Harness::open(Document { blocks: vec![text("f1", BlockKind::Formula, &long)], ..Document::default() });
-    window.ui().set_reduced_motion(true);
-    window.ui().select(Selection::caret(Pos::new("f1", long.len())));
-    let at = caret(&mut window);
-    for typed in ["b", "Left Right"] {
-        // The caret has blinked out when the next key comes.
-        let out = (0..20).any(|_| !caret_shows(window.advance(100)));
-        assert!(out, "{typed}: the caret blinks");
-        match typed {
-            "b" => _ = window.type_text(typed),
-            _ => typed.split(' ').for_each(|key| _ = window.key(key)),
-        }
-        assert_eq!(caret(&mut window), at, "{typed}: the caret keeps its place at the end of the sheet");
-        assert!(caret_shows(&mut window), "{typed}: and shows at once");
-    }
-}
-
 /// A formula block `f1` that holds `source`, with the caret in it at `caret` and its sheet out.
 fn written(source: &str, caret: usize) -> Harness {
     let mut window =
@@ -2017,6 +1996,47 @@ fn written(source: &str, caret: usize) -> Harness {
     window.ui().set_reduced_motion(true);
     window.ui().select(Selection::caret(Pos::new("f1", caret)));
     window
+}
+
+#[test]
+fn a_key_shows_the_caret_at_once_though_it_moves_nowhere() {
+    let mut window = written("a + b", 5);
+    let at = caret(&mut window);
+    let out = (0..20).any(|_| !caret_shows(window.advance(100)));
+    assert!(out, "the caret blinks");
+    window.key("End");
+    assert_eq!(caret(&mut window), at, "End at the end of the source moves nothing");
+    assert!(caret_shows(&mut window), "and the caret shows at once");
+}
+
+#[test]
+fn a_block_of_maths_is_written_on_as_many_rows_as_it_needs() {
+    let row = sheet(&mut written("a + b", 0)).expect("a sheet").bounds.height;
+
+    // Enter starts a new line of the source, and the sheet grows by a row.
+    let mut window = written("a + b", 5);
+    window.key("Enter").type_text("+ c");
+    assert_eq!(source(&mut window).as_deref(), Some("a + b\n+ c"));
+    let two = sheet(&mut window).expect("a sheet").bounds.height;
+    assert!((two - 2.0 * row).abs() <= 1.0, "two rows: {two} for {row} each");
+
+    // A line too long for the sheet goes on in a new row, and the sheet stays inside the page.
+    let long = "a + ".repeat(60);
+    let long = long.trim_end();
+    let mut window = written(long, 0);
+    let (rows, page) = (sheet(&mut window).expect("a sheet").bounds, page(&mut window));
+    assert!(rows.height >= 2.0 * row, "more rows than one: {rows:?}");
+    assert!(page.x <= rows.x && rows.x + rows.width <= page.x + page.width, "{rows:?} in {page:?}");
+
+    // End keeps to the row the caret is on, and the end of the source is on the last.
+    let first = caret(&mut window);
+    window.key("End");
+    let end = caret(&mut window);
+    assert!(end.y == first.y && end.x > first.x && end.x < rows.x + rows.width, "{end:?} on the row of {first:?}");
+    window.ui().select(Selection::caret(Pos::new("f1", long.len())));
+    let last = caret(&mut window);
+    assert!(last.y > end.y && last.y + last.height <= rows.y + rows.height + 1.0, "{last:?} in {rows:?}");
+    assert!(caret_shows(&mut window), "the caret shows at the end of the last row");
 }
 
 /// The colour each character of a one-line source is drawn in on its sheet, by its place in the source.

@@ -2,6 +2,7 @@
 //!
 //! The formula stays typeset on the page. Its source is written on a sheet that slides out from under it
 //! when the caret reaches it, and the caret shows there, at the place in the source the editor holds it.
+//! The sheet is as many rows high as the source has lines, and a line too long for it goes on in a new row.
 //! A backslash typed there lists the symbols that match what follows it, each one typeset. The `$` that
 //! closes a formula blends the source it was typed as into its glyphs.
 //!
@@ -72,7 +73,53 @@ pub enum Sheet {
     Leave,
 }
 
-/// A formula's source, shaped line by line as the sheet shows it.
+/// A row of a source as its sheet shows it: a line, or a part of one that is too long for the sheet.
+struct Row {
+    /// Where it starts in the block.
+    start: usize,
+    shaped: Shaped,
+    /// Whether its line goes on in the next row.
+    wrapped: bool,
+}
+
+impl Row {
+    /// Where the row ends in the block.
+    fn end(&self) -> usize {
+        self.start + self.shaped.stops.last().map_or(0, |stop| stop.offset)
+    }
+
+    /// The last place in the row where the caret is in it. Past the end of a row that goes on, the caret is
+    /// at the start of the next.
+    fn last(&self) -> usize {
+        let end = self.shaped.stops.last().map_or(0, |stop| stop.offset);
+        self.start + if self.wrapped { self.shaped.previous(end) } else { end }
+    }
+
+    /// The offset in the block nearest a distance from the row's left edge.
+    fn nearest(&self, x: f32) -> usize {
+        (self.start + self.shaped.offset_at(x)).min(self.last())
+    }
+}
+
+/// Where a line too long for `wide` goes on in a new row, as offsets in the line: after a space where the
+/// row has one, else between two characters.
+fn breaks(line: &str, shaped: &Shaped, wide: f32) -> Vec<usize> {
+    let mut breaks = Vec::new();
+    let mut from = 0;
+    loop {
+        let left = shaped.x_at(from);
+        // A row takes what fits, and one character whatever the room.
+        let fits = shaped.stops.iter().rev().find(|stop| stop.offset > from && stop.x - left <= wide);
+        let limit = fits.map_or_else(|| shaped.next(from), |stop| stop.offset);
+        if limit >= line.len() || limit <= from {
+            return breaks;
+        }
+        from = line[from..limit].rfind(' ').map_or(limit, |space| from + space + 1);
+        breaks.push(from);
+    }
+}
+
+/// A formula's source, shaped row by row as the sheet shows it.
 pub(crate) struct Source {
     pub block: BlockId,
     /// Where the source sits in its block's text.
@@ -82,24 +129,37 @@ pub(crate) struct Source {
     display: bool,
     /// The part an input method is still composing, as offsets in the block.
     composing: Option<Range<usize>>,
-    /// Each line: where it starts in the block, and its text shaped.
-    lines: Vec<(usize, Shaped)>,
+    rows: Vec<Row>,
 }
 
 impl Source {
-    /// The source of the formula the editor's caret is in.
-    pub fn of(editor: &Editor, shaper: &dyn TextShaper) -> Option<Self> {
+    /// The source of the formula the editor's caret is in, in rows no more than `wide` across.
+    pub fn of(editor: &Editor, shaper: &dyn TextShaper, wide: f32) -> Option<Self> {
         let (block, range) = editor.formula()?;
         let held = editor.doc().block(block)?;
-        let (text, display) = (held.plain_text().get(range.clone())?.to_owned(), held.kind == BlockKind::Formula);
-        let mut start = range.start;
-        let mut lines = Vec::new();
-        for line in text.split('\n') {
-            lines.push((start, shaper.shape(line, &TEXT, None)));
-            start += line.len() + 1;
-        }
+        let (text, display) = (held.plain_text(), held.kind == BlockKind::Formula);
         let composing = editor.composition().filter(|composing| composing.0 == block).map(|composing| composing.1);
-        Some(Self { block: block.clone(), range, text, display, composing, lines })
+        let text = text.get(range.clone())?;
+        Some(Self { composing, ..Self::shaped(block.clone(), range.start, text, display, shaper, wide) })
+    }
+
+    /// A source that starts `start` bytes into its block, in rows no more than `wide` across.
+    fn shaped(block: BlockId, start: usize, text: &str, display: bool, shaper: &dyn TextShaper, wide: f32) -> Self {
+        let mut rows = Vec::new();
+        let mut at = start;
+        for line in text.split('\n') {
+            let whole = shaper.shape(line, &TEXT, None);
+            let breaks = breaks(line, &whole, wide);
+            let mut from = 0;
+            for to in breaks.iter().copied() {
+                rows.push(Row { start: at + from, shaped: shaper.shape(&line[from..to], &TEXT, None), wrapped: true });
+                from = to;
+            }
+            let rest = if from == 0 { whole } else { shaper.shape(&line[from..], &TEXT, None) };
+            rows.push(Row { start: at + from, shaped: rest, wrapped: false });
+            at += line.len() + 1;
+        }
+        Self { block, range: start..start + text.len(), text: text.to_owned(), display, composing: None, rows }
     }
 
     /// The stretches of the source that are not in plain ink with the colour of each, and those a line is
@@ -144,8 +204,8 @@ impl Source {
     }
 
     pub fn size(&self) -> Size {
-        let width = self.lines.iter().map(|(_, line)| line.size.width).fold(0.0, f32::max);
-        Size { width, height: self.lines.len() as f32 * Self::line_height() }
+        let width = self.rows.iter().map(|row| row.shaped.size.width).fold(0.0, f32::max);
+        Size { width, height: self.rows.len() as f32 * Self::line_height() }
     }
 
     /// Whether a position is in this source, either end included.
@@ -153,37 +213,29 @@ impl Source {
         pos.block == self.block && (self.range.start..=self.range.end).contains(&pos.offset)
     }
 
-    /// The line an offset in the block is on.
-    fn line(&self, offset: usize) -> usize {
-        self.lines.iter().rposition(|(start, _)| *start <= offset).unwrap_or(0)
-    }
-
-    /// The offsets in the block a line runs between.
-    fn ends(&self, line: usize) -> (usize, usize) {
-        let (start, shaped) = &self.lines[line];
-        (*start, start + shaped.stops.last().map_or(0, |stop| stop.offset))
+    /// The row an offset in the block is on.
+    fn row(&self, offset: usize) -> usize {
+        self.rows.iter().rposition(|row| row.start <= offset).unwrap_or(0)
     }
 
     /// Where the caret is drawn for an offset in the block, from the top left of the source.
     pub fn caret(&self, offset: usize) -> Rect {
-        let line = self.line(offset);
-        let (start, shaped) = &self.lines[line];
-        let (x, height) = (shaped.x_at(offset.saturating_sub(*start)), Self::line_height());
-        Rect::new(x, line as f32 * height, CARET_WIDTH, height)
+        let at = self.row(offset);
+        let row = &self.rows[at];
+        let (x, height) = (row.shaped.x_at(offset.saturating_sub(row.start)), Self::line_height());
+        Rect::new(x, at as f32 * height, CARET_WIDTH, height)
     }
 
     /// The offset in the block nearest a point of the source.
     pub fn hit(&self, at: Point) -> usize {
-        let line = (at.y / Self::line_height()).floor().max(0.0) as usize;
-        let (start, shaped) = &self.lines[line.min(self.lines.len() - 1)];
-        start + shaped.offset_at(at.x)
+        let row = (at.y / Self::line_height()).floor().max(0.0) as usize;
+        self.rows[row.min(self.rows.len() - 1)].nearest(at.x)
     }
 
-    /// The offset one line up or down from `offset`, nearest to `x`. `None` past the first and last line.
+    /// The offset one row up or down from `offset`, nearest to `x`. `None` past the first and last row.
     fn step(&self, offset: usize, x: f32, down: bool) -> Option<usize> {
-        let line = self.line(offset);
-        let (start, shaped) = self.lines.get(if down { line + 1 } else { line.checked_sub(1)? })?;
-        Some(start + shaped.offset_at(x))
+        let row = self.row(offset);
+        Some(self.rows.get(if down { row + 1 } else { row.checked_sub(1)? })?.nearest(x))
     }
 
     /// The command being typed at an offset in the block: where it sits, from its backslash to its last
@@ -201,17 +253,16 @@ impl Source {
         Some((self.range.start + slash..self.range.start + at + after, &before[slash + 1..]))
     }
 
-    /// The rectangles under a stretch of the source, one per line it touches.
+    /// The rectangles under a stretch of the source, one per row it touches.
     fn spans(&self, range: &Range<usize>) -> Vec<Rect> {
         let height = Self::line_height();
-        let span = |line: usize| {
-            let (start, end) = self.ends(line);
-            let (from, to) = (range.start.max(start), range.end.min(end));
-            let shaped = &self.lines[line].1;
-            let (left, right) = (shaped.x_at(from.saturating_sub(start)), shaped.x_at(to.saturating_sub(start)));
-            (from < to).then(|| Rect::new(left, line as f32 * height, right - left, height))
+        let span = |at: usize| {
+            let row = &self.rows[at];
+            let (from, to) = (range.start.max(row.start), range.end.min(row.end()));
+            let x = |offset: usize| row.shaped.x_at(offset.saturating_sub(row.start));
+            (from < to).then(|| Rect::new(x(from), at as f32 * height, x(to) - x(from), height))
         };
-        (self.line(range.start)..=self.line(range.end)).filter_map(span).collect()
+        (self.row(range.start)..=self.row(range.end)).filter_map(span).collect()
     }
 }
 
@@ -271,8 +322,8 @@ impl<L: Lines> Lines for SheetLines<L> {
     fn line_edge(&self, pos: &Pos, end: bool) -> Option<Pos> {
         match self.on_sheet(pos) {
             Some(source) => {
-                let (start, last) = source.ends(source.line(pos.offset));
-                Some(Pos::new(pos.block.clone(), if end { last } else { start }))
+                let row = &source.rows[source.row(pos.offset)];
+                Some(Pos::new(pos.block.clone(), if end { row.last() } else { row.start }))
             }
             None => self.page.line_edge(pos, end),
         }
@@ -458,27 +509,33 @@ impl Maths {
         source.size().width + CARET_ROOM
     }
 
-    /// How wide the sheet shows its source: as wide as the source or a little wider than its formula,
-    /// whichever is more, and no wider than the page area has room for.
-    fn width(source: &Source, formula: f32, room: f32) -> f32 {
-        let most = (room - 2.0 * MARGIN - PADDING.left - PADDING.right).max(1.0);
-        Self::span(source).max(formula + WIDER).min(most)
+    /// The most a row of a source may take across: what a sheet no wider than the text, `column` across in
+    /// a page area `room` across, has room for.
+    pub fn wide(column: f32, room: f32) -> f32 {
+        (column.min(room - 2.0 * MARGIN) - PADDING.left - PADDING.right - CARET_ROOM).max(1.0)
+    }
+
+    /// How wide the sheet shows its source: as wide as its longest row or a little wider than its formula,
+    /// whichever is more, and no wider than rows may be.
+    fn width(source: &Source, formula: f32, wide: f32) -> f32 {
+        Self::span(source).max(formula + WIDER).min(wide + CARET_ROOM)
     }
 
     /// Where the left edge of the source is, for a sheet centred under a formula that starts at `x` and is
     /// `formula` wide.
-    pub fn left(source: &Source, x: f32, formula: f32, room: f32) -> f32 {
-        x + (formula - Self::width(source, formula, room)) / 2.0
+    pub fn left(source: &Source, x: f32, formula: f32, wide: f32) -> f32 {
+        x + (formula - Self::width(source, formula, wide)) / 2.0
     }
 
-    /// The sheet under a formula whose box is `formula` wide, in a page area `room` wide: the source with
-    /// the selection as the editor holds it, over the symbols on offer when a command is being typed.
+    /// The sheet under a formula whose box is `formula` wide, for a source in rows of `wide` at the most:
+    /// the source with the selection as the editor holds it, over the symbols on offer when a command is
+    /// being typed.
     pub fn sheet(
         &self,
         source: Source,
         selection: &Selection,
         formula: f32,
-        room: f32,
+        wide: f32,
         scheme: Scheme,
     ) -> Popover<Message> {
         let symbols = self.symbols(&source, selection);
@@ -492,12 +549,10 @@ impl Maths {
             (None, Some(_)) => FAULT_WIDTH,
             (None, None) => 0.0,
         };
-        let (size, width) = (source.size(), Self::width(&source, formula, room).max(least));
+        let (size, width) = (source.size(), Self::width(&source, formula, wide).max(least));
         let caret = source.caret(selection.head.offset);
-        // A source too long for the window shows the part around the caret.
-        let across = (caret.x - width / 2.0).clamp(0.0, (Self::span(&source) - width).max(0.0));
-        // The sheet comes out from under the formula, its last line first.
-        let shift = Point { x: across, y: (1.0 - self.slid) * size.height };
+        // The sheet comes out from under the formula, its last row first.
+        let shift = (1.0 - self.slid) * size.height;
         let (start, end) =
             (selection.anchor.offset.min(selection.head.offset), selection.anchor.offset.max(selection.head.offset));
         let label = source.text.clone();
@@ -511,7 +566,7 @@ impl Maths {
         let selected = source.spans(&(start..end));
         let paint = SourcePaint { source: source.clone(), selected, inks, lined, composing, shift };
         let pointed = move |event: Pointer| {
-            let offset = |at: Point| source.hit(Point { x: at.x + shift.x, y: at.y + shift.y });
+            let offset = |at: Point| source.hit(Point { x: at.x, y: at.y + shift });
             match event {
                 Pointer::Down { at, mods, clicks } => {
                     Some(Sheet::Press { offset: offset(at), extend: mods.shift, clicks })
@@ -522,7 +577,7 @@ impl Maths {
                 Pointer::Menu { .. } | Pointer::Scroll { .. } => None,
             }
         };
-        let shown = (self.slid >= 1.0).then_some(Rect { x: caret.x - across, ..caret });
+        let shown = (self.slid >= 1.0).then_some(caret);
         let text = Element::canvas(Rc::new(paint))
             .width(width)
             .height(size.height * self.slid)
@@ -633,13 +688,13 @@ struct SourcePaint {
     lined: Vec<Stretch>,
     /// What an input method is still composing.
     composing: Vec<Rect>,
-    /// How far the source is moved left and up under the canvas.
-    shift: Point,
+    /// How far the source is moved up under the canvas, while the sheet slides out.
+    shift: f32,
 }
 
 impl Paint for SourcePaint {
     fn paint(&self, rect: Rect, _visible: Rect, scheme: Scheme, out: &mut DisplayList) {
-        let origin = Point { x: rect.x - self.shift.x, y: rect.y - self.shift.y };
+        let origin = Point { x: rect.x, y: rect.y - self.shift };
         let placed = |span: &Rect| Rect { x: origin.x + span.x, y: origin.y + span.y, ..*span };
         let selection = resolve(fade(tokens::ACCENT, 0.3), scheme, 1.0);
         out.items.extend(self.selected.iter().map(|span| Item::Fill {
@@ -650,14 +705,14 @@ impl Paint for SourcePaint {
         let plain = resolve(tokens::FG, scheme, 1.0);
         let inks: Vec<(Rect, Color)> =
             self.inks.iter().map(|(span, ink)| (*span, resolve(*ink, scheme, 1.0))).collect();
-        for (line, (_, shaped)) in self.source.lines.iter().enumerate() {
-            let top = line as f32 * Source::line_height();
+        for (at, row) in self.source.rows.iter().enumerate() {
+            let top = at as f32 * Source::line_height();
             // A glyph is in the colour of the stretch it starts in.
             let ink = |x: f32| {
                 let holds = |span: &Rect| span.y == top && span.x <= x + 0.5 && x + 0.5 < span.x + span.width;
                 inks.iter().rev().find(|(span, _)| holds(span)).map_or(plain, |(_, ink)| *ink)
             };
-            shaped.paint_inked(Point { x: origin.x, y: origin.y + top }, ink, out);
+            row.shaped.paint_inked(Point { x: origin.x, y: origin.y + top }, ink, out);
         }
         let under = |span: Rect| Rect::new(span.x, span.y + span.height - 2.0, span.width, 1.0);
         // Text still being composed is underlined, as on the page.
@@ -678,23 +733,14 @@ mod tests {
     use super::*;
     use crate::text::FixedShaper;
 
-    /// A source of three lines in block `f`, which starts ten bytes into its block.
+    /// A source in block `f`, which starts ten bytes into its block, in rows of `wide` at the most.
+    fn rows(text: &str, wide: f32) -> Source {
+        Source::shaped("f".into(), 10, text, true, &FixedShaper, wide)
+    }
+
+    /// A source of three lines.
     fn source() -> Source {
-        let text = "a = b\n+ c\n+ dd";
-        let mut start = 10;
-        let mut lines = Vec::new();
-        for line in text.split('\n') {
-            lines.push((start, FixedShaper.shape(line, &TEXT, None)));
-            start += line.len() + 1;
-        }
-        Source {
-            block: "f".into(),
-            range: 10..10 + text.len(),
-            text: text.into(),
-            display: true,
-            composing: None,
-            lines,
-        }
+        rows("a = b\n+ c\n+ dd", f32::INFINITY)
     }
 
     /// The page's lines, which answer with a place of their own.
@@ -753,6 +799,47 @@ mod tests {
         assert_eq!(lines.line_edge(&Pos::new("p", 3), true), Some(Pos::new("page", 1)), "the page's own lines");
     }
 
+    /// Rows of eight characters at the most.
+    fn eight() -> f32 {
+        8.0 * FixedShaper::advance(TEXT.size)
+    }
+
+    #[test]
+    fn a_line_too_long_for_the_sheet_goes_on_in_a_new_row() {
+        // A source, and where in it each of its rows starts.
+        let cases: [(&str, &[usize]); 5] = [
+            ("aaa bbb", &[0]),
+            ("aaa bbb ccc ddd", &[0, 8]),
+            // A word too long for a row breaks inside it.
+            ("aaaaaaaaaaaa", &[0, 8]),
+            ("aa aaaaaaaaaaaa", &[0, 3, 11]),
+            // Each line breaks for itself.
+            ("aaa bbb ccc\nd", &[0, 8, 12]),
+        ];
+        for (text, starts) in cases {
+            let rows: Vec<usize> = rows(text, eight()).rows.iter().map(|row| row.start - 10).collect();
+            assert_eq!(rows, starts, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_caret_keeps_to_its_row_where_a_line_goes_on() {
+        let lines = SheetLines { page: Page, source: Some(rows("aaa bbb ccc ddd", eight())), left: 0.0 };
+        let at = |offset: usize| Pos::new("f", 10 + offset);
+        // Where the caret is, and where Home and End take it: End stops before the space the row breaks at.
+        for (from, start, end) in [(2, 0, 7), (7, 0, 7), (8, 8, 15), (12, 8, 15)] {
+            assert_eq!(lines.line_edge(&at(from), false), Some(at(start)), "home from {from}");
+            assert_eq!(lines.line_edge(&at(from), true), Some(at(end)), "end from {from}");
+        }
+        let x = lines.caret_x(&at(2)).expect("a column");
+        assert_eq!(lines.line_step(&at(2), x, true), Some(at(10)), "down keeps the column");
+        assert_eq!(lines.line_step(&at(10), x, false), Some(at(2)), "and so does up");
+        let source = lines.source.as_ref().expect("a source");
+        assert_eq!(source.hit(Point { x: 500.0, y: 1.0 }), 17, "a point past the first row is at its end");
+        let second = source.caret(18);
+        assert_eq!((second.x, second.y), (0.0, Source::line_height()), "where it breaks is the start of the next");
+    }
+
     #[test]
     fn a_command_is_being_typed_from_its_backslash_to_its_last_letter() {
         // The source, where the caret is in it, and the command found there with what was typed of it.
@@ -766,9 +853,7 @@ mod tests {
             (r"a \\ \be", 8, Some((5..8, "be"))),
         ];
         for (text, caret, expected) in cases {
-            let lines = vec![(10, FixedShaper.shape(text, &TEXT, None))];
-            let range = 10..10 + text.len();
-            let source = Source { block: "f".into(), range, text: text.into(), display: false, composing: None, lines };
+            let source = rows(text, f32::INFINITY);
             let expected =
                 expected.map(|(range, typed): (Range<usize>, &str)| (range.start + 10..range.end + 10, typed));
             assert_eq!(source.typed(10 + caret), expected, "{text:?} at {caret}");
