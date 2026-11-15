@@ -12,8 +12,7 @@ use std::ops::RangeInclusive;
 
 use accesskit::{Node, NodeId, Role};
 use letters_editor::Editor;
-use letters_fonts::{DISPLAY, MONO, SANS};
-use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Pos, ReplicaId, Selection, Style};
+use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Pos, ReplicaId, Selection};
 use letters_render::Size;
 use letters_ui::{Ink, Scheme, Window, tokens};
 
@@ -26,20 +25,6 @@ pub const DOCUMENT: &str = "letters-document";
 const FIRST_PAINT_SLOT: &str = "<!--letters:first-paint-->";
 const DOCUMENT_SLOT: &str = "<!--letters:document-->";
 const PRELOAD_SLOT: &str = "<!--letters:preload-->";
-
-/// The window's own measures for the column a document is set in: the least room it keeps beside the
-/// column, and the room above and below it. The browser tests hold the two to each other.
-const GUTTER: f32 = 24.0;
-const TOP: f32 = 48.0;
-
-/// The fonts as a page names them: the family, its file among [`letters_fonts::FILES`], and its slant.
-const FACES: [(&str, &str, &str); 5] = [
-    (SANS, "Inter.ttf", "normal"),
-    (SANS, "Inter-Italic.ttf", "italic"),
-    (MONO, "FiraCode.ttf", "normal"),
-    (DISPLAY, "Montserrat.ttf", "normal"),
-    (DISPLAY, "Montserrat-Italic.ttf", "italic"),
-];
 
 /// The widths of window a [`Skeleton`] is laid out for. A narrower or wider one carries on from the nearest.
 const WIDTHS: RangeInclusive<u16> = 240..=1600;
@@ -210,12 +195,60 @@ fn hex(ink: Ink, scheme: Scheme) -> String {
     format!("#{:02x}{:02x}{:02x}", ink.r, ink.g, ink.b)
 }
 
-/// What stands in for the window until the editor has painted it: `skeleton` for its controls, and
-/// `export`, the document's export as a whole HTML file in `style`, set where the window sets the document.
-/// `fonts` is where the page fetches the fonts from, a URL that ends in a slash.
+#[cfg(not(target_arch = "wasm32"))]
+pub use server::export;
+
+/// What a server needs to make a page and the editor's own code does without.
+#[cfg(not(target_arch = "wasm32"))]
+mod server {
+    use letters_convert::{Column, HtmlPage, WebFont};
+    use letters_fonts::{DISPLAY, MONO, SANS};
+    use letters_model::{Document, Style};
+    use letters_ui::{Scheme, palette};
+
+    /// The window's own measures for the column a document is set in: the least room it keeps beside the
+    /// column, and the room above and below it. The browser tests hold the two to each other.
+    const GUTTER: f32 = 24.0;
+    const TOP: f32 = 48.0;
+
+    /// The fonts as a page names them: the family, its file among [`letters_fonts::FILES`], and whether it
+    /// is the family's italic.
+    const FACES: [(&str, &str, bool); 5] = [
+        (SANS, "Inter.ttf", false),
+        (SANS, "Inter-Italic.ttf", true),
+        (MONO, "FiraCode.ttf", false),
+        (DISPLAY, "Montserrat.ttf", false),
+        (DISPLAY, "Montserrat-Italic.ttf", true),
+    ];
+
+    /// The document as HTML for the first paint to show: its export, set where the window sets the document,
+    /// in the fonts the window draws with and in the window's colours. `fonts` is where the page fetches the
+    /// fonts from, a URL that ends in a slash.
+    ///
+    /// A server makes it, so the editor's own code does not carry the export.
+    pub fn export(document: &Document, style: &Style, title: &str, fonts: &str) -> String {
+        let urls = FACES.map(|(_, file, _)| format!("{fonts}{file}"));
+        let faces: Vec<WebFont> = FACES
+            .iter()
+            .zip(&urls)
+            .map(|((family, _, italic), url)| WebFont { family, url, italic: *italic })
+            .collect();
+        let page = HtmlPage {
+            dark: Some(&palette(Scheme::Dark)),
+            fonts: &faces,
+            window: Some(Column { gutter: GUTTER, top: TOP }),
+            // The frame scrolls as the canvas will, with no bar of its own, and is as busy as the page around it.
+            css: "html { scrollbar-width: none; cursor: progress; }\n",
+        };
+        letters_convert::to_html_with(document, style, title, &mut |_| None, &page)
+    }
+}
+
+/// What stands in for the window until the editor has painted it: `skeleton` for how its bar starts, and
+/// `export`, what [`export`] made of the document.
 ///
 /// Nothing the document holds can end the frame early or run in it.
-pub fn first_paint(skeleton: &Skeleton, style: &Style, fonts: &str, export: &str) -> String {
+pub fn first_paint(skeleton: &Skeleton, export: &str) -> String {
     let (light, dark) = (Scheme::Light, Scheme::Dark);
     let bar = number(skeleton.bar);
     let mut css = format!(
@@ -238,32 +271,6 @@ pub fn first_paint(skeleton: &Skeleton, style: &Style, fonts: &str, export: &str
         radius = number(tokens::RADIUS_CONTROL),
     );
     skeleton.css(&mut css);
-
-    // The export is a file to keep, so it sets itself as a page of its own and fetches nothing. Here it
-    // sets the document as the window does, in the fonts the window draws with.
-    let mut within = String::new();
-    for (family, file, slant) in FACES {
-        let _ = writeln!(
-            within,
-            "@font-face {{ font-family: \"{family}\"; src: url(\"{fonts}{file}\"); font-weight: 1 1000; \
-             font-style: {slant}; font-display: swap; }}"
-        );
-    }
-    let page = &style.page;
-    let _ = write!(
-        within,
-        "html {{ scrollbar-width: none; cursor: progress; }}\n\
-         article {{ --column: min({column}px, 100% - {gutters}px); max-width: none; width: var(--column); \
-         padding: {top}px 0; margin: 0 auto; margin-left: round(calc((100% - var(--column)) / 2), 1px); }}\n",
-        column = number((page.width - page.margin_left - page.margin_right) * 96.0 / 72.0),
-        gutters = number(2.0 * GUTTER),
-        top = number(TOP),
-    );
-    let export = export.replacen("default-src 'none';", "default-src 'none'; font-src 'self';", 1).replacen(
-        "</head>",
-        &format!("<style>\n{within}</style>\n</head>"),
-        1,
-    );
 
     let mut out = format!("<div id=\"{FIRST_PAINT}\"><style>\n{css}</style>");
     let _ = write!(

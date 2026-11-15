@@ -1,7 +1,6 @@
 //! The page a server sends: a template with the document in it twice, under the shape of the window's bar.
 
-use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, ReplicaId, Style};
-use letters_ui::{Scheme, palette};
+use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, ReplicaId};
 use letters_web::page::{self, DOCUMENT, FIRST_PAINT, Place, Skeleton, Span};
 
 const TEMPLATE: &str =
@@ -17,9 +16,8 @@ fn between<'a>(page: &'a str, open: &str, close: &str) -> &'a str {
 fn first_paint_of(document: &Document) -> String {
     let mut window = page::window(document.clone(), ReplicaId::new("test"));
     let style = window.style().clone();
-    let html = letters_convert::to_html_themed(document, &style, "Title", &mut |_| None, &palette(Scheme::Dark));
-    let skeleton = Skeleton::of(&mut window);
-    page::first_paint(&skeleton, &style, "fonts/", &html)
+    let html = page::export(document, &style, "Title", "fonts/");
+    page::first_paint(&Skeleton::of(&mut window), &html)
 }
 
 /// Where the spans put each control in a window of `width`.
@@ -42,7 +40,7 @@ fn a_page_carries_its_document_to_read_and_to_open_whatever_it_holds() {
         let block = Block::text(BlockId::new("b1"), BlockKind::Paragraph, text);
         let document = Document { blocks: vec![block], ..Document::default() };
         let html = format!("<!doctype html><title>\"T\" & more</title><article><p>{text}</p></article>");
-        let first = page::first_paint(&Skeleton::default(), &Style::default(), "fonts/", &html);
+        let first = page::first_paint(&Skeleton::default(), &html);
         let page = page::compose(TEMPLATE, "", &first, &document.to_json());
 
         // A browser reads the attribute back to the HTML it was given, and the script's text to the JSON.
@@ -53,7 +51,7 @@ fn a_page_carries_its_document_to_read_and_to_open_whatever_it_holds() {
 
         // Nothing the document holds becomes part of the page around it, and nothing in the frame may run.
         let around = page.replace(shown, "").replace(carried, "");
-        let empty = page::first_paint(&Skeleton::default(), &Style::default(), "fonts/", "");
+        let empty = page::first_paint(&Skeleton::default(), "");
         let script = format!("<script type=\"application/json\" id=\"{DOCUMENT}\"></script>");
         let expected =
             TEMPLATE.replace("<!--letters:first-paint-->", &empty).replace("<!--letters:document-->", &script);
@@ -72,12 +70,11 @@ fn a_template_without_places_for_a_document_is_left_as_it_is() {
 fn the_export_is_set_as_the_window_sets_the_document_in_the_windows_fonts() {
     let first = first_paint_of(&page::welcome(&mut || "b".into()));
     let shown = between(&first, "srcdoc=\"", "\"").replace("&quot;", "\"").replace("&amp;", "&");
-    // The export's own rules come first, so the page's are the ones that hold.
-    let rules = shown.rfind("<style>").expect("the page's rules are in the frame");
-    assert!(shown[rules..].contains("article {"), "the column is set");
+    assert!(shown.contains("--column"), "the column is the window's");
     for file in letters_fonts::FILES {
-        assert!(shown[rules..].contains(&format!("url(\"fonts/{file}\")")), "{file} can be fetched");
+        assert!(shown.contains(&format!("fonts/{file}")), "{file} can be fetched");
     }
+    assert!(shown.contains("prefers-color-scheme: dark"), "a dark page is read in the window's dark colours");
     assert!(shown.contains("font-src 'self'"), "the frame may fetch the page's fonts");
     assert!(!shown.contains("script-src"), "and still runs nothing");
 }

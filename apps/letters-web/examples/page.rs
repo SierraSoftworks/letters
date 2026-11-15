@@ -1,5 +1,5 @@
 //! Writes the harness page as a server would send it: the template with the welcome document in it, as
-//! HTML to read at once and as the editor opens it, under the shapes of the window's controls.
+//! HTML to read at once and as the editor opens it, under the shape of how the window's bar starts.
 //!
 //! `cargo run -p letters-web --example page -- www/index.html > dist/index.html`
 //!
@@ -8,7 +8,6 @@
 use std::{env, fs, io};
 
 use letters_model::{Document, ReplicaId};
-use letters_ui::{Scheme, palette};
 use letters_web::page::{self, Skeleton};
 
 const TITLE: &str = "Letters in the browser";
@@ -27,9 +26,8 @@ fn main() -> io::Result<()> {
     // The window as the editor will open it.
     let mut window = page::window(document.clone(), ReplicaId::new("page"));
     let style = window.style().clone();
-    let html = letters_convert::to_html_themed(&document, &style, TITLE, &mut |_| None, &palette(Scheme::Dark));
-    let skeleton = Skeleton::of(&mut window);
-    let first = page::first_paint(&skeleton, &style, "fonts/", &html);
+    let html = page::export(&document, &style, TITLE, "fonts/");
+    let first = page::first_paint(&Skeleton::of(&mut window), &html);
     print!("{}", page::compose(&template, &page::preloads(&document, ""), &first, &json));
     Ok(())
 }
