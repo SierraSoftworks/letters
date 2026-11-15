@@ -684,6 +684,7 @@ pub fn action() -> impl Strategy<Value = Action> {
         "|",
         "\n",
         "Figure 1",
+        "https://a.example",
     ]);
     let keys = prop::sample::select(vec![
         "Left",
@@ -758,6 +759,13 @@ pub fn action() -> impl Strategy<Value = Action> {
         Just(Command::InsertTable { rows: 2, columns: 2 }),
         Just(Command::InsertContents),
         Just(Command::InsertPreview("https://a.example".into())),
+        Just(Command::LinkAsCard),
+        prop::sample::select(vec![Some(" A  page "), None]).prop_map(|title| Command::Fetched {
+            url: "https://a.example".into(),
+            title: title.map(str::to_owned),
+            description: None,
+            picture: Some(png(9, 400, 300)),
+        }),
         Just(Command::ShiftFigure { right: true }),
         Just(Command::ResizeFigure { width: 120.0, height: 90.0 }),
         Just(Command::SetAlt("boats".into())),
@@ -852,6 +860,9 @@ pub fn perform(editor: &mut Harness, action: &Action) {
                 };
                 // Each command acts on its own kind of block, and the other has no use for it.
                 editor.run(Command::SetContentsLevels { table: id.clone(), levels: *way as u8 });
+                if *way == 7 {
+                    editor.run(Command::CardAsLink(id.clone()));
+                }
                 editor.run(Command::Preview { block: id, edit });
             }
         }

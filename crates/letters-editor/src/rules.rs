@@ -270,6 +270,10 @@ impl Editor {
         if typed.ends_with('$') {
             return self.apply_maths_rule(id, typed, marks, platform);
         }
+        if let Some(before) = typed.strip_suffix(' ') {
+            // A space after the address of a web page makes a link of it.
+            return !in_maths(typed) && self.link_typed(id, before.len());
+        }
         let Some(span) = inline_rule(typed).filter(|_| !in_maths(typed)) else { return false };
         let Some(runs) = self.block(id).map(|block| block.body.runs()) else { return false };
         if text::marks_after(runs, span.open.start).contains(&Mark::Code) {
@@ -278,6 +282,7 @@ impl Editor {
         let content = span.open.start..span.close.start - span.open.len();
         let delete = |range: &Range<usize>| Op::DeleteText { block: id.clone(), range: range.clone() };
         let mut ops = vec![delete(&span.close), delete(&span.open)];
+        let mut put_in = None;
         match span.style {
             Style::Marks(marks) => ops.extend(marks.iter().map(|mark| Op::SetMark {
                 block: id.clone(),
@@ -285,9 +290,15 @@ impl Editor {
                 mark: mark.clone(),
                 on: true,
             })),
-            Style::Link(link) => ops.push(Op::SetLink { block: id.clone(), range: content.clone(), link: Some(link) }),
+            Style::Link(link) => {
+                ops.push(Op::SetLink { block: id.clone(), range: content.clone(), link: Some(link.clone()) });
+                put_in = Some(link);
+            }
         }
         self.apply(ops);
+        if let Some(link) = put_in {
+            self.put_in(&link);
+        }
         // The caret stays outside the pair it has just closed.
         self.place_with(Pos::new(id.clone(), content.end), marks.clone());
         true

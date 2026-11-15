@@ -13,6 +13,7 @@ mod figures;
 mod find;
 mod input;
 mod keymap;
+mod links;
 mod markers;
 mod merge;
 mod motion;
@@ -168,9 +169,12 @@ pub enum Command {
     /// divider is: below the caret's block, or in place of an empty line, with the caret in the text
     /// below it.
     InsertContents,
-    /// Puts in a link preview: a card that leads to an address, placed as a divider is. It shows the
-    /// address alone until [`PreviewEdit::Fetched`] says what the page holds. An address with nothing in
-    /// it is not taken.
+    /// Puts in a link preview: a card that leads to an address, placed as a divider is. It shows what
+    /// the document keeps of the page, and when that is nothing the address alone, until
+    /// [`PreviewEdit::Fetched`] says what the page holds. An address with nothing in it is not taken.
+    ///
+    /// The address of a web page makes one by itself where it is put on a line of its own: pasted on an
+    /// empty line, or typed there and followed by Enter. Backspace after a card turns it back.
     InsertPreview(String),
     /// Sets how deep the headings go that a table of contents lists, from 1 to 4. The table is named,
     /// since no caret stands in it.
@@ -182,6 +186,27 @@ pub enum Command {
     Preview {
         block: BlockId,
         edit: PreviewEdit,
+    },
+    /// Shows the link that the caret's line holds alone as a link preview in the line's place, with what
+    /// the document keeps of its page. The caret goes to the text below it, on a line made when there is
+    /// none. The words the link was written with are not kept.
+    LinkAsCard,
+    /// Shows a link preview as the link it leads to: a line of text in its place that holds the address
+    /// as a link, as Backspace after the card does. What the card showed of its page is kept for the
+    /// link by its address, see [`Command::Fetched`]. The card is named, since no caret stands in it.
+    CardAsLink(BlockId),
+    /// Says what a fetch found of the page at an address, for all the document shows of it. Every link
+    /// preview that leads there takes it as [`PreviewEdit::Fetched`] says. For a link in the text that
+    /// leads there, the document keeps it by the address the link is written with, in
+    /// [`Document::previews`], for the link to show without the network. It takes the place of what
+    /// was shown: what was not found is shown no longer. Nothing is taken for an address that neither
+    /// leads to by now, as when the link went while the fetch took its time. The picture's bytes go to
+    /// [`Platform::store_asset`]. One undo step.
+    Fetched {
+        url: String,
+        title: Option<String>,
+        description: Option<String>,
+        picture: Option<Picture>,
     },
     /// Puts pictures in: one as a figure, several as a gallery, and the last is left selected. With no
     /// spot they go below the block the selection ends in, in place of an empty line, or beside the
@@ -413,6 +438,10 @@ pub struct Editor {
     dismissed: Option<(BlockId, usize)>,
     /// The blocks that the command at hand put back under another id, see [`shared`].
     renames: shared::Renames,
+    /// The addresses the writer has put in that want a fetch, until the shell asks for them.
+    unfetched: Vec<String>,
+    /// Whether the shell can fetch what a page says of itself.
+    fetching: bool,
 }
 
 impl Editor {
@@ -439,6 +468,8 @@ impl Editor {
             origin: Kept::default(),
             dismissed: None,
             renames: Vec::new(),
+            unfetched: Vec::new(),
+            fetching: true,
         };
         if let Some(pos) = first {
             editor.place(pos);
@@ -558,6 +589,27 @@ impl Editor {
         Some((&self.selection()?.head.block, composing.range.clone()))
     }
 
+    /// The addresses of web pages that the writer has put in since the last call, as a link in the text
+    /// or as a link preview, and that the document keeps nothing of yet: by typing or pasting an address,
+    /// by [`Command::SetLink`], or with a card. The shell fetches each page, and [`Command::Fetched`]
+    /// takes what it finds. What came with another writer's edits, an undo, a version or a file is
+    /// never named, so that reading a document fetches nothing, and neither are the links inside
+    /// pasted text.
+    pub fn take_unfetched(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.unfetched)
+    }
+
+    /// Says whether the shell can fetch what a page says of itself, which it can until told otherwise.
+    /// Where it cannot, the address of a web page put on a line of its own stays a link in a line of
+    /// text, since a card would have nothing to show, and [`Editor::take_unfetched`] names nothing. A
+    /// card that is asked for is made all the same.
+    pub fn set_preview_fetching(&mut self, offered: bool) {
+        self.fetching = offered;
+        if !offered {
+            self.unfetched.clear();
+        }
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty() || self.composing.is_some()
     }
@@ -615,6 +667,12 @@ impl Editor {
             Command::InsertPreview(url) => return whole::address(url).is_some(),
             Command::SetContentsLevels { table, levels } => return self.takes_levels(table, *levels),
             Command::Preview { block, edit } => return self.takes_preview(block, edit),
+            Command::CardAsLink(card) => {
+                return self.block(card).is_some_and(|card| matches!(card.kind, BlockKind::LinkPreview { .. }));
+            }
+            Command::Fetched { url, title, description, picture } => {
+                return self.takes_fetched(url, title, description, picture.as_ref());
+            }
             _ => {}
         }
         if let Command::UseVersion { block, version } = command {
@@ -660,6 +718,7 @@ impl Editor {
                 ranged || !(caret.picture || matches!(kind, Some(BlockKind::Code { .. } | BlockKind::Formula)))
             }
             Command::SetLink(_) => ranged || self.link().is_some(),
+            Command::LinkAsCard => self.takes_card(),
             Command::Copy | Command::Cut => ranged || caret.picture,
             Command::LeaveFormula => self.formula().is_some(),
             Command::Table(_) => self.cell().is_some(),
@@ -697,7 +756,7 @@ impl Editor {
                 kind = Kind::Deleting;
             }
             Command::LineBelow => self.line_below(platform),
-            Command::Split => kind = self.split(platform),
+            Command::Split => kind = self.split(true, platform),
             Command::LeaveFormula => self.leave_formula(platform),
             Command::LineBreak => self.insert("\n"),
             Command::Indent => self.indent(true, platform),
@@ -713,6 +772,11 @@ impl Editor {
             Command::InsertPreview(url) => self.insert_preview(&url, platform),
             Command::SetContentsLevels { table, levels } => self.set_levels(&table, levels),
             Command::Preview { block, edit } => self.preview_edit(&block, &edit, platform),
+            Command::LinkAsCard => self.link_as_card(platform),
+            Command::CardAsLink(card) => self.card_as_link(&card, platform),
+            Command::Fetched { url, title, description, picture } => {
+                self.fetched(&url, &title, &description, picture.as_ref(), platform);
+            }
             Command::InsertFigures { pictures, at } => self.insert_figures(&pictures, at.as_ref(), platform),
             Command::MoveFigure(spot) => self.move_figure(&spot, platform),
             Command::ShiftFigure { right } => self.shift_figure(right, platform),

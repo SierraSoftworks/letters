@@ -73,12 +73,15 @@ fn an_address_with_nothing_in_it_makes_no_card() {
 fn the_caret_steps_over_a_block_with_no_text_and_what_deletes_beside_it_takes_it_whole() {
     for whole in ["toc:3", FILLED] {
         let around = |one: &str, two: &str| format!("p {one}\n{whole}\np {two}");
+        // Backspace after a card is the one exception: it turns the card back into its link.
+        let link = "p one\np [https://a.example](https://a.example)\np |two";
+        let backed = if whole == FILLED { link } else { "p one\np |two" };
         // The key, the document before and after, and whether the key changed the document.
         let cases = [
             ("Right", around("one|", "two"), around("one", "|two"), false),
             ("Left", around("one", "|two"), around("one|", "two"), false),
             ("Down", around("on|e", "two"), around("one", "tw|o"), false),
-            ("Backspace", around("one", "|two"), "p one\np |two".to_owned(), true),
+            ("Backspace", around("one", "|two"), backed.to_owned(), true),
             ("Delete", around("one|", "two"), "p one|\np two".to_owned(), true),
             // A selection across it takes it along.
             ("Backspace", around("o^ne", "t|wo"), "p o|wo".to_owned(), true),
