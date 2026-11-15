@@ -11,9 +11,10 @@
 //! A version shows with what it changed, or with what has changed since: compared with the version before
 //! it or with the document as it reads now. A block that was rewritten shows as it read before and after,
 //! the page split there as it is at a conflict. A block that only gained words, or only lost some, shows
-//! once with those words marked. Blocks that only one version has lie in a band of that version's colour
-//! right across the page, as if the paper were cut there and pulled apart over them, under a line that says
-//! whose they are.
+//! once with those words marked. Blocks that only one version has lie in a band right across the page, as
+//! if the paper were cut there and pulled apart over them, under a line that says whose they are. What a
+//! version put in is green and lies over the page, and what it took out is red and lies under it: the
+//! colours of a diff, and not those of a conflict, whose two sides neither came first.
 //!
 //! Under the page a strip has a cell for each version, to press on or drag along, and the bar names the
 //! version that is picked: a name is a mark in the history, which is saved and is no edit. The bar's menu
@@ -73,15 +74,19 @@ const CLEAR: f32 = 3.0;
 const HEAD: f32 = 20.0;
 /// The sign of a version that was given a name.
 const SIGN: f32 = 12.0;
+/// What a version took out is red and what it put in is green, as a diff has them. Amber and blue are kept
+/// for a conflict, so that nobody takes one side of that for the earlier or the lesser.
+const TONES: review::Tones = [(tokens::DANGER_SOFT, tokens::DANGER), (tokens::OK_SOFT, tokens::OK)];
 /// The band that a stretch of blocks lies in that only one version has: the room it keeps clear of what
 /// stands over it, the room in it over the stretch for the line that says whose the stretch is, and the
-/// room in it under the stretch. Its edges are this thick, and broken into dashes this long where the
-/// stretch was taken out.
+/// room in it under the stretch. Where the stretch was taken out, the cut in the page is a line this thick
+/// along each edge, broken into dashes this long. What casts a shadow reaches this far past a band.
 const ABOVE: f32 = tokens::SPACE_MD;
 const CAPTION: f32 = 22.0;
 const UNDER: f32 = tokens::SPACE_MD;
 const EDGE: f32 = 1.0;
 const DASH: f32 = 4.0;
+const CAST: f32 = 48.0;
 /// How many times a version is split again before it is drawn, while laying out what shows changes heights.
 const SETTLES: usize = 3;
 /// How many versions that were read are kept, so that a step to the next version reads one and not two.
@@ -559,6 +564,43 @@ fn part(split: &mut Split, first: &BlockId, band: (f32, f32)) {
     split.height += room;
 }
 
+/// Draws the band of a stretch that only one version has, in that version's colour. What was put in is a
+/// sheet laid over the page, which casts a shadow on it. What was taken out lies under the page and shows
+/// through the cut, with the shadow of the page on it and the cut a broken line along each edge: the two
+/// are told apart without their colours.
+fn band(band: Rect, added: bool, page: Color, scheme: Scheme, list: &mut DisplayList) {
+    let ink = |ink: Ink| resolve(ink, scheme, 1.0);
+    let (soft, tone) = TONES[usize::from(added)];
+    let cast = |of: Rect, list: &mut DisplayList| {
+        for shadow in tokens::SHADOW_OVERLAY {
+            let offset = Point { x: shadow.x, y: shadow.y };
+            // Wider than the band, so that the shadow is as dark at the ends of the band as in its middle.
+            let rect = Rect::new(of.x - CAST, of.y, of.width + 2.0 * CAST, of.height);
+            list.push(Item::Shadow { rect, color: ink(shadow.color), blur: shadow.blur, offset, radius: 0.0 });
+        }
+    };
+    if added {
+        cast(band, list);
+        list.push(Item::Fill { rect: band, color: page, radius: 0.0 });
+        list.push(Item::Fill { rect: band, color: ink(soft), radius: 0.0 });
+        return;
+    }
+    list.push(Item::Fill { rect: band, color: ink(soft), radius: 0.0 });
+    // The page over the cut and the page under it both stand over what shows through it.
+    list.push(Item::PushClip { rect: band, radius: 0.0 });
+    cast(Rect::new(band.x, band.y - CAST, band.width, CAST), list);
+    cast(Rect::new(band.x, band.y + band.height, band.width, CAST), list);
+    list.push(Item::PopClip);
+    for y in [band.y, band.y + band.height - EDGE] {
+        let mut x = band.x;
+        while x < band.x + band.width {
+            let rect = Rect::new(x, y, DASH.min(band.x + band.width - x), EDGE);
+            list.push(Item::Fill { rect, color: ink(tone), radius: 0.0 });
+            x += 2.0 * DASH;
+        }
+    }
+}
+
 /// The part of its version's column that a piece of a split page shows in `view`, a part of what the
 /// split counts from.
 fn cut(piece: &Piece, view: Rect) -> Option<Rect> {
@@ -591,8 +633,8 @@ impl Head {
         let ink = |ink: Ink| resolve(ink, scheme, 1.0);
         let small = TextStyle::control().size(tokens::TEXT_SM);
         let (label, tone) = match side {
-            Side::First => ("Before", tokens::WARN),
-            Side::Second => ("After", tokens::INFO),
+            Side::First => ("Before", TONES[0].1),
+            Side::Second => ("After", TONES[1].1),
         };
         let (left, right) =
             (frame.x + review::MARGIN - review::INSET, frame.x + frame.width - review::MARGIN + review::INSET);
@@ -1246,6 +1288,23 @@ impl History {
         let shift = Point { x: middle.round() - middle, y: -view.y };
         let passage = self.passage().cloned();
         let ink = |ink: Ink| resolve(ink, scheme, 1.0);
+        // A stretch that only one version has lies in a band from one edge of the page area to the other.
+        let stretch = |piece: &Piece| {
+            let block = piece.block.as_ref().filter(|block| !leaf.pairs.contains(block))?;
+            leaf.found.runs.iter().find(|run| run.first == *block)
+        };
+        // The bands lie under all the text: those of what was taken out first, which the page is over,
+        // then those of what was put in, which are over the page.
+        for added in [false, true] {
+            for piece in split.pieces.iter().filter(|piece| stretch(piece).is_some_and(|run| run.added == added)) {
+                let (top, bottom) = (piece.rect.y + shift.y, piece.rect.y + piece.rect.height + shift.y);
+                if bottom > -CAST && top < room.height + CAST {
+                    let over = (top + ABOVE).round();
+                    let rect = Rect::new(0.0, over, room.width, bottom.round() - over);
+                    band(rect, added, palette.page, scheme, list);
+                }
+            }
+        }
         for piece in &split.pieces {
             let (top, bottom) = (piece.rect.y + shift.y, piece.rect.y + piece.rect.height + shift.y);
             if bottom <= 0.0 || top >= room.height {
@@ -1257,35 +1316,16 @@ impl History {
                 // One version of a rewritten block: a frame round it, and a line at its head.
                 let frame = review::frame(piece, width, shift, room.width);
                 let (tone, head) = match piece.side {
-                    Side::First => (tokens::WARN, &leaf.heads[0]),
-                    Side::Second => (tokens::INFO, &leaf.heads[1]),
+                    Side::First => (TONES[0].1, &leaf.heads[0]),
+                    Side::Second => (TONES[1].1, &leaf.heads[1]),
                 };
                 list.push(Item::Stroke { rect: frame, color: ink(tokens::LINE), width: 1.0, radius: 0.0 });
                 list.push(Item::Fill { rect: Rect { height: review::RULE, ..frame }, color: ink(tone), radius: 0.0 });
                 head.paint(piece.side, frame, shaper, scheme, list);
                 self.frames.push((block.clone(), piece.side, frame));
-            } else if let Some(run) = block.and_then(|block| leaf.found.runs.iter().find(|run| run.first == *block)) {
-                // A stretch that only one version has lies in a band of that version's colour, from one edge
-                // of the page area to the other: the paper cut there and pulled apart over what was put in
-                // or taken out. What was taken out has broken edges, so that the two are told apart without
-                // their colours.
-                let (tone, soft, caption) = match run.added {
-                    true => (tokens::INFO, tokens::INFO_SOFT, &leaf.captions[1]),
-                    false => (tokens::WARN, tokens::WARN_SOFT, &leaf.captions[0]),
-                };
-                let over = (top + ABOVE).round();
-                let band = Rect::new(0.0, over, room.width, bottom.round() - over);
-                list.push(Item::Fill { rect: band, color: ink(soft), radius: 0.0 });
-                let (dash, gap) = if run.added { (band.width, 0.0) } else { (DASH, DASH) };
-                for y in [band.y, band.y + band.height - EDGE] {
-                    let mut x = 0.0;
-                    while x < band.width {
-                        let rect = Rect::new(x, y, dash.min(band.width - x), EDGE);
-                        list.push(Item::Fill { rect, color: ink(tone), radius: 0.0 });
-                        x += dash + gap;
-                    }
-                }
-                // A line over its first line says whose it is.
+            } else if let Some(run) = stretch(piece) {
+                // A line over the first line of a stretch says whose it is.
+                let (tone, caption) = (TONES[usize::from(run.added)].1, &leaf.captions[usize::from(run.added)]);
                 let first = run.text.as_ref().and_then(|text| leaf.layout.caret(&Pos::new(text.clone(), 0)));
                 let over = origin.y + first.map_or(piece.band.0, |line| line.y) - CAPTION;
                 let said = shaper.shape(caption, &TextStyle::control().size(tokens::TEXT_SM).weight(600), None);
@@ -1305,12 +1345,12 @@ impl History {
             match piece.side {
                 Side::First => {
                     for words in &leaf.found.gone {
-                        review::mark(&layout.selection_in(words, cut), Side::First, scheme, list);
+                        review::mark(&layout.selection_in(words, cut), Side::First, &TONES, scheme, list);
                     }
                 }
                 Side::Second => {
                     for (words, side) in &leaf.found.words {
-                        review::mark(&layout.selection_in(words, cut), *side, scheme, list);
+                        review::mark(&layout.selection_in(words, cut), *side, &TONES, scheme, list);
                     }
                 }
             }
@@ -1563,8 +1603,8 @@ impl History {
         } else if size.is_some() {
             // What it put in and what it took out, in the colours those have on the page.
             let figures = quiet.family(Family::Mono);
-            let put_in = Element::text(format!("+{}", count(version.added)), figures).fg(tokens::INFO);
-            let taken_out = Element::text(format!("\u{2212}{}", count(version.removed)), figures).fg(tokens::WARN);
+            let put_in = Element::text(format!("+{}", count(version.added)), figures).fg(TONES[1].1);
+            let taken_out = Element::text(format!("\u{2212}{}", count(version.removed)), figures).fg(TONES[0].1);
             head = head.child(Element::row().gap(tokens::SPACE_XS).child(put_in).child(taken_out).decorative());
         }
         let mut body =

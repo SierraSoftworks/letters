@@ -2931,7 +2931,13 @@ impl EditorApp {
         self.margin.follow(selection);
         // The words in which the page's version of a block differs from the one held back.
         for words in self.review.words() {
-            review::mark(&self.layout.selection_in(words, viewport), Version::Second, self.scheme, &mut list);
+            review::mark(
+                &self.layout.selection_in(words, viewport),
+                Version::Second,
+                &review::TONES,
+                self.scheme,
+                &mut list,
+            );
         }
         for (passage, open) in self.margin.commented() {
             notes::mark(&self.layout.selection_in(&passage, viewport), open, self.scheme, &mut list);
