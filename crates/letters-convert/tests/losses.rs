@@ -64,6 +64,11 @@ fn everything() -> (Document, Notes) {
         holding("plain", BlockKind::callout(Tone::Info), vec![Block::text("i1", BlockKind::Paragraph, "A note")]),
         holding("quote", BlockKind::Quote, nested),
         Block::text("bare", BlockKind::Code { language: None }, "plain text"),
+        Block::new("toc", BlockKind::TableOfContents { levels: 3 }),
+        Block::new(
+            "card",
+            BlockKind::LinkPreview { url: "https://example.com/".into(), title: None, description: None, image: None },
+        ),
     ];
     let version = || Version {
         author: "Ada".into(),
@@ -98,6 +103,8 @@ fn each_format_lists_what_it_cannot_carry() {
                 (Galleries, 1),
                 (PageBreaks, 1),
                 (Languages, 2),
+                (Contents, 1),
+                (LinkPreviews, 1),
             ],
         ),
         (Target::Html, vec![(UnknownBlocks, 1), (UnknownMarks, 1), (Comments, 2), (LinkedPictures, 1)]),
@@ -111,6 +118,8 @@ fn each_format_lists_what_it_cannot_carry() {
                 // Word shows no icon, so the callout that keeps its tone's loses it too.
                 (CalloutLooks, 2),
                 (CodeLanguages, 1),
+                (Contents, 1),
+                (LinkPreviews, 1),
             ],
         ),
         (Target::Pdf, vec![(UnknownBlocks, 1), (UnknownMarks, 1), (Comments, 2), (LinkedPictures, 1)]),

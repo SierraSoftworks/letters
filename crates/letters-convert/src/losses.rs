@@ -40,8 +40,12 @@ pub enum LossKind {
     PageBreaks,
     /// Passages said to be in a language other than the document's, which Markdown cannot say.
     Languages,
-    /// Code blocks whose language the format does not keep.
+    /// Code blocks in a language, which Word neither names nor colours. A reader misses the colours.
     CodeLanguages,
+    /// Tables of contents, where the format does not write one yet.
+    Contents,
+    /// Link previews, where the format writes the link under its title, without picture or description.
+    LinkPreviews,
     /// The history: every earlier version, and who wrote what. A clean copy is the document as it stands.
     /// Counted once.
     History,
@@ -120,6 +124,16 @@ pub fn losses_with(doc: &Document, notes: &Notes, to: Target, loaded: &dyn Fn(&s
             blocks(&|block| block.lang.is_some()) + runs().filter(|run| run.lang.is_some()).count(),
         ),
         (CodeLanguages, to == Docx, blocks(&coded)),
+        (
+            Contents,
+            matches!(to, Markdown | Docx),
+            blocks(&|block| matches!(block.kind, BlockKind::TableOfContents { .. })),
+        ),
+        (
+            LinkPreviews,
+            matches!(to, Markdown | Docx),
+            blocks(&|block| matches!(block.kind, BlockKind::LinkPreview { .. })),
+        ),
         (History, to == Clean, 1),
         (Conflicts, to == Clean, notes.notes.iter().filter(|note| open_conflict(note)).count()),
     ];
@@ -174,7 +188,11 @@ impl fmt::Display for Loss {
                 write!(f, "{passages} no longer marked as such")
             }
             LossKind::CodeLanguages => {
-                write!(f, "{} language", count("code block loses its", "code blocks lose their"))
+                write!(f, "{} colours", count("code block loses its", "code blocks lose their"))
+            }
+            LossKind::Contents => write!(f, "{} left out", count("table of contents is", "tables of contents are")),
+            LossKind::LinkPreviews => {
+                write!(f, "{}", count("link preview becomes a plain link", "link previews become plain links"))
             }
             LossKind::History => write!(f, "the history is left out"),
             LossKind::Conflicts => write!(f, "{} dropped", count("open conflict is", "open conflicts are")),
