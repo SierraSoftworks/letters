@@ -108,7 +108,8 @@ fn each_format_lists_what_it_cannot_carry() {
                 (UnknownMarks, 1),
                 (LinkedPictures, 1),
                 (NestedBlocks, 2),
-                (CalloutLooks, 1),
+                // Word shows no icon, so the callout that keeps its tone's loses it too.
+                (CalloutLooks, 2),
                 (CodeLanguages, 1),
             ],
         ),

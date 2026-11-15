@@ -31,7 +31,8 @@ pub enum LossKind {
     LinkedPictures,
     /// Blocks inside a quote or a callout that Word writes outside it, since it cannot nest them.
     NestedBlocks,
-    /// Callouts with an icon or a colour of their own, where the format has a place for neither.
+    /// Callouts with an icon or a colour of their own, where the format has a place for neither. Word has
+    /// no place for an icon at all, so there it is every callout that shows one.
     CalloutLooks,
     /// Galleries, where the format has pictures but no way to set them side by side.
     Galleries,
@@ -88,8 +89,10 @@ pub fn losses_with(doc: &Document, notes: &Notes, to: Target, loaded: &dyn Fn(&s
         BlockKind::Figure { asset: None, src: Some(src), .. } => to != Pdf || !loaded(src),
         _ => false,
     };
-    let looks = |block: &Block| match &block.kind {
-        BlockKind::Callout { icon, color, .. } => icon.is_some() || color.is_some(),
+    let looks = |block: &Block| match (&block.kind, block.kind.callout_look()) {
+        // Word draws a callout's tone and the line that heads it, and no icon.
+        (_, Some(look)) if to == Docx => look.icon.is_some() || look.color.is_some(),
+        (BlockKind::Callout { icon, color, .. }, _) => icon.is_some() || color.is_some(),
         _ => false,
     };
     let coded =
@@ -154,6 +157,10 @@ impl fmt::Display for Loss {
             LossKind::NestedBlocks => {
                 let blocks = count("block inside a quote or callout is", "blocks inside quotes or callouts are");
                 write!(f, "{blocks} written outside it, since Word cannot nest them")
+            }
+            LossKind::CalloutLooks if self.to == Target::Docx => {
+                let callouts = count("callout loses its icon", "callouts lose their icons");
+                write!(f, "{callouts} and any colour of {} own", if one { "its" } else { "their" })
             }
             LossKind::CalloutLooks => {
                 write!(f, "{} own icon and colour", count("callout loses its", "callouts lose their"))
