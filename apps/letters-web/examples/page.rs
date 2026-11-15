@@ -29,6 +29,7 @@ fn main() -> io::Result<()> {
     let style = window.style().clone();
     let html = letters_convert::to_html_themed(&document, &style, TITLE, &mut |_| None, &palette(Scheme::Dark));
     let skeleton = Skeleton::of(&mut window);
-    print!("{}", page::compose(&template, &page::first_paint(&skeleton, &style, "fonts/", &html), &json));
+    let first = page::first_paint(&skeleton, &style, "fonts/", &html);
+    print!("{}", page::compose(&template, &page::preloads(&document, ""), &first, &json));
     Ok(())
 }

@@ -28,6 +28,7 @@ use letters_render::{Color, DisplayList, Item, Point, Size};
 
 pub use crate::cache::Cache;
 pub use crate::commands::{Command, commands, environments};
+pub use crate::fonts::{FILES as FONT_FILES, provide as provide_fonts};
 
 /// How much larger than the text beside it a formula is set. The maths faces are small on the body, so at
 /// the same size a formula looks slight next to prose. This is the ratio KaTeX uses.

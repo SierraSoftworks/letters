@@ -14,6 +14,7 @@ mod proofing;
 mod speller;
 mod text;
 
+pub use bundled::{FILES as ENGLISH_FILES, provide as provide_english};
 pub use dictionary::{Dictionary, DictionaryError};
 pub use proofing::{Checked, Proofing, language_at};
 pub use speller::{Checker, Speller};

@@ -133,15 +133,23 @@ const download = (files) => [(bytes) => bytes.length, (bytes) => gzipSync(bytes,
   (measure) => files.reduce((sum, bytes) => sum + measure(bytes), 0),
 );
 
-const fonts = readdirSync(join(dist, "fonts")).map((file) => read("fonts", file));
+/** The files of a folder that the editor fetches. Their licences travel with them and are never asked for. */
+const folder = (name) => readdirSync(join(dist, name)).filter((file) => !file.endsWith(".txt")).map((file) => read(name, file));
+const [fonts, maths, dictionaries] = ["fonts", "maths", "dictionaries"].map(folder);
 const downloads = [
   ["letters_bg.wasm", [served]],
   ["letters.js", [read("letters.js")]],
   [`fonts (${fonts.length} files)`, fonts],
 ];
+// A document with maths has the maths faces before its first frame, too.
+const later = [
+  [`maths (${maths.length} files)`, maths],
+  [`dictionaries (${dictionaries.length})`, dictionaries],
+];
 console.log(`${"What the browser downloads".padEnd(24)}${["as served", "gzip", "brotli"].map((head) => head.padStart(11)).join("")}`);
 downloads.forEach(([label, files]) => row(label, ...download(files)));
-row("all of it", ...download(downloads.flatMap(([, files]) => files)));
+row("for the first frame", ...download(downloads.flatMap(([, files]) => files)));
+later.forEach(([label, files]) => row(label, ...download(files)));
 console.log("What the wasm holds");
 row("code", size(10));
 row("data", size(11));

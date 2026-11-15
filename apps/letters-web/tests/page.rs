@@ -1,6 +1,6 @@
 //! The page a server sends: a template with the document in it twice, under the shape of the window's bar.
 
-use letters_model::{Block, BlockId, BlockKind, Document, ReplicaId, Style};
+use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, ReplicaId, Style};
 use letters_ui::{Scheme, palette};
 use letters_web::page::{self, DOCUMENT, FIRST_PAINT, Place, Skeleton, Span};
 
@@ -43,7 +43,7 @@ fn a_page_carries_its_document_to_read_and_to_open_whatever_it_holds() {
         let document = Document { blocks: vec![block], ..Document::default() };
         let html = format!("<!doctype html><title>\"T\" & more</title><article><p>{text}</p></article>");
         let first = page::first_paint(&Skeleton::default(), &Style::default(), "fonts/", &html);
-        let page = page::compose(TEMPLATE, &first, &document.to_json());
+        let page = page::compose(TEMPLATE, "", &first, &document.to_json());
 
         // A browser reads the attribute back to the HTML it was given, and the script's text to the JSON.
         let shown = between(&page, "srcdoc=\"", "\"");
@@ -65,7 +65,7 @@ fn a_page_carries_its_document_to_read_and_to_open_whatever_it_holds() {
 
 #[test]
 fn a_template_without_places_for_a_document_is_left_as_it_is() {
-    assert_eq!(page::compose("<body></body>", "<p>text</p>", "{}"), "<body></body>");
+    assert_eq!(page::compose("<body></body>", "<link>", "<p>text</p>", "{}"), "<body></body>");
 }
 
 #[test]
@@ -127,6 +127,40 @@ fn the_skeleton_is_the_start_of_the_windows_bar_and_none_of_its_tools() {
         for pair in places.windows(2) {
             assert!(pair[0][0] + pair[0][2] <= pair[1][0] + 0.1, "at {width}: {pair:?} overlap");
         }
+    }
+}
+
+#[test]
+fn only_a_document_with_maths_has_its_first_frame_wait_for_the_maths_faces() {
+    let formula = Block::text(BlockId::new("f"), BlockKind::Formula, "x^2");
+    let mut inline = Block::text(BlockId::new("p"), BlockKind::Paragraph, "x^2");
+    if let Body::Text(runs) = &mut inline.body {
+        runs[0].marks.insert(Mark::Math);
+    }
+    let quoted = Block { body: Body::Blocks(vec![inline.clone()]), ..Block::new("q", BlockKind::Quote) };
+    let plain = Block::text(BlockId::new("p"), BlockKind::Paragraph, "x^2 is not maths until it is marked");
+    let cases = [
+        ("a formula", formula, true),
+        ("maths in a line", inline, true),
+        ("maths in a quote", quoted, true),
+        ("none", plain, false),
+    ];
+    for (name, block, maths) in cases {
+        let document = Document { blocks: vec![block], ..Document::default() };
+        assert_eq!(page::has_maths(&document), maths, "{name}");
+        let preloads = page::preloads(&document, "/static/");
+        assert_eq!(
+            preloads.matches("<link rel=\"preload\"").count(),
+            if maths { letters_math::FONT_FILES.len() } else { 0 },
+            "{name}"
+        );
+        assert_eq!(
+            preloads.matches("href=\"/static/maths/KaTeX_").count(),
+            preloads.matches("<link").count(),
+            "{name}"
+        );
+        let page = page::compose("<head><!--letters:preload--></head>", &preloads, "", "{}");
+        assert_eq!(page, format!("<head>{preloads}</head>"), "{name}");
     }
 }
 

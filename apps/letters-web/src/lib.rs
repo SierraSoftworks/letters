@@ -5,10 +5,11 @@
 //!   the browser's clock, identifiers and clipboard.
 //! - [`mirror`] keeps the window readable as HTML beside the canvas, for assistive technology.
 //! - [`page`] is the page a server sends: the document as HTML to read at once, and for the editor to open.
-//! - [`Letters`] is what a page holds: `await Letters.start(canvas, "fonts/")` starts the editor.
+//! - [`Letters`] is what a page holds: `await Letters.start(canvas, "")` starts the editor.
 //!
 //! Frames are rasterised on the CPU, so the page needs no WebGPU. The fonts are fetched beside the wasm and
-//! are no part of it, so a new build of the code leaves them in the browser's cache.
+//! are no part of it, so a new build of the code leaves them in the browser's cache. The dictionaries, and
+//! the maths faces of a document without maths, are fetched after the first frame, which has no use for them.
 
 pub mod browser;
 pub mod input;
@@ -23,7 +24,8 @@ use letters_model::Document;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
-use crate::shell::Shell;
+use crate::browser::Browser;
+use crate::shell::{Later, Shell};
 
 /// The editor on a page.
 #[wasm_bindgen]
@@ -33,13 +35,28 @@ pub struct Letters {
 
 #[wasm_bindgen]
 impl Letters {
-    /// Starts the editor in `canvas`, whose size the page's CSS decides, with the fonts found under
-    /// `fonts`, a URL that ends in a slash.
-    pub async fn start(canvas: HtmlCanvasElement, fonts: String) -> Result<Letters, JsValue> {
+    /// Starts the editor in `canvas`, whose size the page's CSS decides. The files it fetches are found
+    /// under `base`, a URL that is empty or ends in a slash: `fonts/`, `maths/` and `dictionaries/`.
+    ///
+    /// The first frame waits for the fonts, and for the maths faces only when the page's document holds
+    /// maths. The rest is fetched once that frame is on the canvas.
+    pub async fn start(canvas: HtmlCanvasElement, base: String) -> Result<Letters, JsValue> {
         std::panic::set_hook(Box::new(|panic| web_sys::console::error_1(&panic.to_string().into())));
         let window = web_sys::window().ok_or("there is no window")?;
-        letters_fonts::provide(browser::fonts(&window, &fonts).await?);
-        Ok(Self { shell: Shell::start(canvas)? })
+        let mut platform = Browser::new(&window)?;
+        let opened = shell::carried(&window, &mut platform);
+        let maths = page::has_maths(&opened);
+        let mut urls = shell::urls(&base, "fonts", &letters_fonts::FILES);
+        if maths {
+            urls.extend(shell::urls(&base, "maths", &letters_math::FONT_FILES));
+        }
+        let mut fonts = browser::files(&window, &urls).await?;
+        let faces = fonts.split_off(letters_fonts::FILES.len());
+        letters_fonts::provide(fonts);
+        if maths {
+            letters_math::provide_fonts(faces);
+        }
+        Ok(Self { shell: Shell::start(canvas, platform, opened, Later { base, maths: !maths })? })
     }
 
     /// The document, as `document.json` stores it.
@@ -80,6 +97,12 @@ impl Letters {
     #[wasm_bindgen(getter, js_name = frameMs)]
     pub fn frame_ms(&self) -> f64 {
         self.shell.borrow().stats().frame_ms
+    }
+
+    /// Whether the dictionaries have arrived, so that misspellings are marked.
+    #[wasm_bindgen(getter)]
+    pub fn spelling(&self) -> bool {
+        self.shell.borrow().stats().spelling
     }
 
     /// How long the mirror last took to bring up to date, in milliseconds.

@@ -14,6 +14,8 @@
     <link rel="preload" as="fetch" crossorigin href="fonts/FiraCode.ttf" />
     <link rel="preload" as="fetch" crossorigin href="fonts/Montserrat.ttf" />
     <link rel="preload" as="fetch" crossorigin href="fonts/Montserrat-Italic.ttf" />
+    <!-- The build writes in here what this document's first frame waits for besides: the maths faces, if it has maths. -->
+    <!--letters:preload-->
     <style>
       html,
       body {
@@ -40,7 +42,7 @@
 
       await init();
       // The console and the tests reach the editor here.
-      window.letters = await Letters.start(document.getElementById("letters"), "fonts/");
+      window.letters = await Letters.start(document.getElementById("letters"), "");
     </script>
   </body>
 </html>

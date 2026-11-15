@@ -11,6 +11,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Leaves the faces out of the binary. The shell fetches the files and hands them over with
+# `provide_fonts`, before any formula is set.
+provided = []
+
 [dependencies]
 letters-fonts.workspace = true
 letters-render.workspace = true

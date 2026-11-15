@@ -64,7 +64,7 @@ impl Speller {
             return Some(exact);
         }
         if tag.language == "en" {
-            return Some(English::of(tag.region.as_deref()).dictionary());
+            return English::of(tag.region.as_deref()).dictionary();
         }
         same()
             .find(|(added, _)| added.region.is_none())

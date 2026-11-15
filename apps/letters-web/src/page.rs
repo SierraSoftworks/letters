@@ -13,7 +13,7 @@ use std::ops::RangeInclusive;
 use accesskit::{Node, NodeId, Role};
 use letters_editor::Editor;
 use letters_fonts::{DISPLAY, MONO, SANS};
-use letters_model::{Block, BlockId, BlockKind, Document, Pos, ReplicaId, Selection, Style};
+use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Pos, ReplicaId, Selection, Style};
 use letters_render::Size;
 use letters_ui::{Ink, Scheme, Window, tokens};
 
@@ -25,6 +25,7 @@ pub const DOCUMENT: &str = "letters-document";
 /// Where each goes in a page's template.
 const FIRST_PAINT_SLOT: &str = "<!--letters:first-paint-->";
 const DOCUMENT_SLOT: &str = "<!--letters:document-->";
+const PRELOAD_SLOT: &str = "<!--letters:preload-->";
 
 /// The window's own measures for the column a document is set in: the least room it keeps beside the
 /// column, and the room above and below it. The browser tests hold the two to each other.
@@ -284,15 +285,33 @@ pub fn first_paint(skeleton: &Skeleton, style: &Style, fonts: &str, export: &str
     out
 }
 
-/// Fills a page's template with a document: `first_paint` is what [`first_paint`] made of it, and `json`
-/// its `document.json`, which cannot end its element early whatever the document holds.
-pub fn compose(template: &str, first_paint: &str, json: &str) -> String {
+/// Whether the first frame of `document` needs the maths faces: it holds a formula, or maths in a line.
+pub fn has_maths(document: &Document) -> bool {
+    let inline = |block: &Block| match &block.body {
+        Body::Text(runs) => runs.iter().any(|run| run.marks.contains(&Mark::Math)),
+        _ => false,
+    };
+    document.walk().any(|block| block.kind == BlockKind::Formula || inline(block))
+}
+
+/// What a page asks its browser to fetch early for `document`, beyond what every page does: the maths
+/// faces, when its first frame waits for them. `base` is where the files are found, as the editor is given it.
+pub fn preloads(document: &Document, base: &str) -> String {
+    let files = letters_math::FONT_FILES.iter().filter(|_| has_maths(document));
+    files.map(|file| format!("<link rel=\"preload\" as=\"fetch\" crossorigin href=\"{base}maths/{file}\" />")).collect()
+}
+
+/// Fills a page's template with a document: `preloads` and `first_paint` are what [`preloads`] and
+/// [`first_paint`] made of it, and `json` its `document.json`, which cannot end its element early
+/// whatever the document holds.
+pub fn compose(template: &str, preloads: &str, first_paint: &str, json: &str) -> String {
     // Inside a script, `<` could begin the tag that ends it. JSON reads the escape as the same character.
     let json = json.replace('<', "\\u003c");
     let script = format!("<script type=\"application/json\" id=\"{DOCUMENT}\">{json}</script>");
-    // The script goes in first: it holds no `<`, so it cannot be mistaken for the first paint's place,
-    // while the first paint may hold anything.
-    template.replacen(DOCUMENT_SLOT, &script, 1).replacen(FIRST_PAINT_SLOT, first_paint, 1)
+    // The script goes in first: it holds no `<`, so it cannot be mistaken for another's place, while the
+    // first paint may hold anything.
+    let page = template.replacen(DOCUMENT_SLOT, &script, 1).replacen(PRELOAD_SLOT, preloads, 1);
+    page.replacen(FIRST_PAINT_SLOT, first_paint, 1)
 }
 
 /// The window the editor opens on `document`: the caret waits at its end. A page's [`Skeleton`] is taken

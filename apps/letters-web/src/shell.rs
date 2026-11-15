@@ -24,7 +24,7 @@ use web_sys::{
     KeyboardEvent, MediaQueryList, MouseEvent, PointerEvent, Url, WheelEvent, Window,
 };
 
-use crate::browser::Browser;
+use crate::browser::{self, Browser};
 use crate::input::{Clipboard, Dom, Finger, Gesture, Held, Reply, TextInput, Touch, modifiers};
 use crate::mirror::{Act, Mirror, Page};
 use crate::page;
@@ -66,9 +66,22 @@ pub struct Stats {
     pub frame_ms: f64,
     /// How long the mirror last took to bring up to date.
     pub mirror_ms: f64,
+    /// Whether the dictionaries have arrived, so that misspellings are marked.
+    pub spelling: bool,
+}
+
+/// What the first frame does without, to fetch once it is on the canvas.
+pub struct Later {
+    /// Where the files are found: a URL that is empty or ends in a slash.
+    pub base: String,
+    /// Whether the maths faces are still to come. A document that holds maths had them before it was shown.
+    pub maths: bool,
 }
 
 pub struct Shell {
+    /// The shell itself, for what finishes after the call that began it.
+    me: Weak<RefCell<Self>>,
+    later: Option<Later>,
     window: Window,
     canvas: HtmlCanvasElement,
     context: CanvasRenderingContext2d,
@@ -112,7 +125,12 @@ pub struct Shell {
 
 impl Shell {
     /// Shows the editor in `canvas`, whose size the page's CSS decides, and adds the hidden input after it.
-    pub fn start(canvas: HtmlCanvasElement) -> Result<Rc<RefCell<Self>>, JsValue> {
+    pub fn start(
+        canvas: HtmlCanvasElement,
+        mut platform: Browser,
+        opened: Document,
+        later: Later,
+    ) -> Result<Rc<RefCell<Self>>, JsValue> {
         let window = web_sys::window().ok_or("there is no window")?;
         let document = window.document().ok_or("there is no document")?;
         // The view paints every pixel, so the canvas needs no alpha.
@@ -146,24 +164,15 @@ impl Shell {
         }
         holder.insert_adjacent_element("afterend", &chooser)?;
 
-        let mut platform = Browser::new(&window)?;
         let mac = window.navigator().platform().is_ok_and(|name| name.starts_with("Mac") || name.starts_with("iP"));
         let dark_mode = window.match_media("(prefers-color-scheme: dark)")?;
         let less_motion = window.match_media("(prefers-reduced-motion: reduce)")?;
-        // A page that carries a document shows it. The harness may carry none.
-        let carried = document.get_element_by_id(page::DOCUMENT).and_then(|carried| carried.text_content());
-        let opened = match carried.as_deref().map(Document::from_json) {
-            Some(Ok(opened)) => opened,
-            Some(Err(error)) => {
-                web_sys::console::error_1(&format!("the page's document cannot be read: {error}").into());
-                page::welcome(&mut || platform.new_id())
-            }
-            None => page::welcome(&mut || platform.new_id()),
-        };
         let view = view(opened, &mut platform, mac);
 
         let shell = Rc::new_cyclic(|shell| {
             RefCell::new(Self {
+                me: shell.clone(),
+                later: Some(later),
                 on_frame: callback(shell, Self::paint),
                 on_wake: callback(shell, Self::wake),
                 on_mirror: callback(shell, Self::reflect),
@@ -316,6 +325,38 @@ impl Shell {
         Ok(())
     }
 
+    /// Fetches what the first frame did without, and puts it to use: the document's spelling is checked
+    /// once there are dictionaries to check it against.
+    fn fetch(&self, later: Later) {
+        let (shell, window) = (self.me.clone(), self.window.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut urls = urls(&later.base, "dictionaries", &letters_spell::ENGLISH_FILES);
+            if later.maths {
+                urls.extend(self::urls(&later.base, "maths", &letters_math::FONT_FILES));
+            }
+            let mut files = match browser::files(&window, &urls).await {
+                Ok(files) => files,
+                Err(error) => return web_sys::console::error_1(&error),
+            };
+            let faces = files.split_off(letters_spell::ENGLISH_FILES.len());
+            if later.maths {
+                letters_math::provide_fonts(faces);
+            }
+            let text = |file: Vec<u8>| String::from_utf8_lossy(&file).into_owned();
+            letters_spell::provide_english(files.into_iter().map(text).collect());
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            let words = shell.platform.user_words();
+            shell.view.set_user_words(words);
+            shell.stats.spelling = true;
+            // The check runs in the time a frame leaves over, so there must be a frame.
+            if !shell.frame_due {
+                shell.frame_due = shell.window.request_animation_frame(&shell.on_frame).is_ok();
+            }
+            shell.sync();
+        });
+    }
+
     /// Offers `text` to the person as a file to keep, named after the document.
     fn download(&self, text: &str, extension: &str) -> Result<(), JsValue> {
         let page = self.window.document().ok_or("there is no document")?;
@@ -456,6 +497,9 @@ impl Shell {
         // The canvas shows the window now, so what stood in for it goes.
         if let Some(first) = first {
             first.remove();
+        }
+        if let Some(later) = self.later.take() {
+            self.fetch(later);
         }
         self.stats.frame_ms = end - start;
         self.wake_at(wake);
@@ -699,6 +743,26 @@ fn read_to(first: &Element) -> f64 {
     let frame =
         first.query_selector("iframe").ok().flatten().and_then(|frame| frame.dyn_into::<HtmlIFrameElement>().ok());
     frame.and_then(|frame| frame.content_window()).and_then(|inner| inner.scroll_y().ok()).unwrap_or(0.0)
+}
+
+/// The document the page carries for the editor to open. The harness may carry none, and is welcomed.
+pub fn carried(window: &Window, platform: &mut Browser) -> Document {
+    let page = window.document();
+    let carried =
+        page.and_then(|page| page.get_element_by_id(page::DOCUMENT)).and_then(|carried| carried.text_content());
+    match carried.as_deref().map(Document::from_json) {
+        Some(Ok(opened)) => opened,
+        Some(Err(error)) => {
+            web_sys::console::error_1(&format!("the page's document cannot be read: {error}").into());
+            page::welcome(&mut || platform.new_id())
+        }
+        None => page::welcome(&mut || platform.new_id()),
+    }
+}
+
+/// Where the files called `names` are, in the folder `folder` under `base`.
+pub fn urls(base: &str, folder: &str, names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| format!("{base}{folder}/{name}")).collect()
 }
 
 /// A window on `document`, set up for this browser.

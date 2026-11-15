@@ -1,5 +1,5 @@
 //! What the browser lends the editor: a clock, identifiers, the clipboard for as long as a clipboard event
-//! lasts, somewhere to keep the person's own words and default style, and the fonts.
+//! lasts, somewhere to keep the person's own words and default style, and the files beside the wasm.
 
 use js_sys::{Promise, Uint8Array};
 use letters_editor::{Clip, Platform, block_id};
@@ -8,21 +8,20 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Crypto, Performance, Response, Storage, Window};
 
-/// Fetches the font files from under `base`, a URL that ends in a slash, all at once. A page that preloads
-/// them has them here by the time the wasm is running.
-pub async fn fonts(window: &Window, base: &str) -> Result<Vec<Vec<u8>>, JsValue> {
-    let requests: Vec<Promise> =
-        letters_fonts::FILES.iter().map(|name| window.fetch_with_str(&format!("{base}{name}"))).collect();
-    let mut fonts = Vec::new();
-    for (request, name) in requests.into_iter().zip(letters_fonts::FILES) {
+/// Fetches the files at `urls`, all at once. A page that preloads them has them here by the time the wasm
+/// is running.
+pub async fn files(window: &Window, urls: &[String]) -> Result<Vec<Vec<u8>>, JsValue> {
+    let requests: Vec<Promise> = urls.iter().map(|url| window.fetch_with_str(url)).collect();
+    let mut files = Vec::new();
+    for (request, url) in requests.into_iter().zip(urls) {
         let response: Response = JsFuture::from(request).await?.dyn_into()?;
         if !response.ok() {
-            return Err(format!("the font {base}{name} could not be fetched: {}", response.status()).into());
+            return Err(format!("{url} could not be fetched: {}", response.status()).into());
         }
         let bytes = JsFuture::from(response.array_buffer()?).await?;
-        fonts.push(Uint8Array::new(&bytes).to_vec());
+        files.push(Uint8Array::new(&bytes).to_vec());
     }
-    Ok(fonts)
+    Ok(files)
 }
 
 /// Where this browser keeps the person's own words, a line each, as their dictionary file does elsewhere.

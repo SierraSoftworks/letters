@@ -11,6 +11,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Leaves the dictionaries out of the binary. The shell fetches the files and hands them over with
+# `provide_english`, and English goes unchecked until it has.
+provided = []
+
 [dependencies]
 letters-model.workspace = true
 spellbook.workspace = true

@@ -18,8 +18,11 @@ rm -rf dist
 "$bindgen" "$wasm" --target web --no-typescript --out-name letters --out-dir dist \
   --remove-name-section --remove-producers-section
 cargo run --quiet -p letters-web --example page -- www/index.html > dist/index.html
-mkdir dist/fonts
-cp ../../crates/letters-fonts/fonts/*.ttf dist/fonts/
+# What the editor fetches beside the wasm, each with its licence.
+for files in fonts:letters-fonts/fonts maths:letters-math/fonts dictionaries:letters-spell/dictionaries; do
+  mkdir "dist/${files%%:*}"
+  cp ../../crates/"${files#*:}"/* "dist/${files%%:*}/"
+done
 
 # The same module with its function names left in, which the report reads to say whose the code is.
 "$bindgen" "$wasm" --target web --no-typescript --out-name letters --out-dir "$target/letters-web-named" --no-demangle
