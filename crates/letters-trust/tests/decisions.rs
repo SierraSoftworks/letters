@@ -24,6 +24,26 @@ fn a_document_is_trusted_by_who_made_it_its_id_or_its_folder() {
 }
 
 #[test]
+fn no_folder_vouches_for_a_document_the_user_imported() {
+    let settings =
+        "[trust]\ndocuments = [\"doc-both\"]\nfolders = [\"~/Documents\"]\nimported = [\"doc-in\", \"doc-both\"]";
+    let trust = trust(settings);
+    let kept = Origin::File("/home/ada/Documents/Letters/Trip.let");
+    let cases = [
+        // In a trusted folder, an import stays as it arrived, and what was not imported is vouched for.
+        ("doc-in", kept, Mode::Safe),
+        ("doc-other", kept, Mode::Trusted),
+        // Trusting the document itself is what lifts it, wherever it is.
+        ("doc-both", kept, Mode::Trusted),
+        ("doc-both", Origin::File("/home/ada/Downloads/Trip.let"), Mode::Trusted),
+        ("doc-in", Origin::Outside, Mode::Safe),
+    ];
+    for (id, origin, mode) in cases {
+        assert_eq!(trust.mode(id, origin), mode, "{id} from {origin:?}");
+    }
+}
+
+#[test]
 fn nothing_is_trusted_without_settings() {
     let trust = Trust::default();
     assert_eq!(trust.mode("doc-trusted", Origin::File("/home/ada/Documents/report.let")), Mode::Safe);

@@ -1723,7 +1723,15 @@ impl App {
     fn vouch_for(&mut self, id: WindowId, folder: bool) {
         let Some(window) = self.windows.get(&id) else { return };
         let kept = match (folder, window.folder(), &window.id) {
-            (true, Some(folder), _) => folder.to_str().map(|folder| self.trust.trust_folder(folder)),
+            (true, Some(folder), id) => folder.to_str().map(|folder| {
+                self.trust.trust_folder(folder)?;
+                // A folder does not vouch for a document that was imported. Asked from that document's
+                // own bar, the person means it too.
+                match id.as_deref().filter(|id| self.trust.trust().imported(id)) {
+                    Some(id) => self.trust.trust_document(id),
+                    None => Ok(()),
+                }
+            }),
             (false, _, Some(id)) => Some(self.trust.trust_document(id)),
             _ => None,
         };
@@ -1798,6 +1806,13 @@ impl App {
     fn bring_in(&mut self, id: WindowId, folders: &[String], comments: bool) {
         let Some(window) = self.windows.get_mut(&id) else { return };
         let Some(plan) = window.plan.take() else { return window.view.offer_import(None) };
+        // Recorded before the document exists: unless the file lies in a trusted folder, the document opens
+        // in safe mode from the first, wherever it is saved, until the person trusts it from its own bar.
+        if let Err(error) = trust::import(&mut self.trust, &plan.id, plan.source()) {
+            window.view.offer_import(None);
+            window.sync(Instant::now());
+            return window.alert(&format!("The file was not brought in: the import could not be recorded.\n\n{error}"));
+        }
         // The card names the folders as it was given them.
         let chosen =
             plan.folders.iter().filter(|folder| folders.iter().any(|path| *path == folder.path.to_string_lossy()));

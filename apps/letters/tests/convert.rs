@@ -15,10 +15,12 @@ use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::object::{Array, Dict, String as Bytes};
 use hayro::hayro_syntax::page::Page;
 use hayro::kurbo::{Affine, BezPath};
+use letters::trust;
 use letters_format::{Archive, OPLOG, Package};
 use letters_model::{
     Anchor, Block, BlockKind, Document, Mark, Model, Note, NoteKind, Notes, Op, Pos, ReplicaId, Run, Style,
 };
+use letters_trust::Mode;
 
 /// A scratch folder that is removed when the test ends.
 struct Folder(PathBuf);
@@ -45,7 +47,11 @@ impl Folder {
 
     /// Runs the app in this folder.
     fn letters(&self, args: &[&str]) -> Ran {
-        let output = Command::new(env!("CARGO_BIN_EXE_letters")).args(args).current_dir(&self.0).output().unwrap();
+        // The scratch folder is the home too, so that nothing of the person running the tests is read or
+        // written: their style, or what they trust.
+        let mut command = Command::new(env!("CARGO_BIN_EXE_letters"));
+        command.args(args).current_dir(&self.0).env("HOME", &self.0).env("USERPROFILE", &self.0);
+        let output = command.output().unwrap();
         Ran::from(output)
     }
 }
@@ -358,6 +364,57 @@ fn import_refuses_what_only_looks_like_word() {
     // An older file says how to get one that can be read.
     assert!(lines[0]["error"].as_str().unwrap().contains(".docx"), "{}", lines[0]);
     assert!(!folder.path("old.let").exists() && !folder.path("torn.let").exists());
+}
+
+/// How a document imported from `from` is treated when it is kept at `kept`, by a person who trusts the
+/// folder `trusted`. All three are inside the scratch folder.
+fn imported(name: &str, from: &str, kept: &str, trusted: &str) -> (Mode, Mode) {
+    let folder = Folder::new(name);
+    let source = folder.write(&format!("{from}/Trip.md"), "# Trip\n");
+    fs::create_dir_all(folder.path(trusted)).unwrap();
+    let mut trust = trust::store(&folder.0);
+    trust.trust_folder(fs::canonicalize(folder.path(trusted)).unwrap().to_str().unwrap()).unwrap();
+
+    let run = folder.letters(&["import", source.to_str().unwrap()]);
+    assert!(run.ok, "{}", run.stderr);
+    let made = source.with_extension("let");
+    let id = open(&made).manifest().id.clone();
+    let kept = folder.path(&format!("{kept}/Trip.let"));
+    fs::create_dir_all(kept.parent().unwrap()).unwrap();
+    fs::rename(&made, &kept).unwrap();
+
+    trust.load().unwrap();
+    let before = trust::mode(trust.trust(), &id, Some(&kept));
+    trust.trust_document(&id).unwrap();
+    (before, trust::mode(trust.trust(), &id, Some(&kept)))
+}
+
+#[test]
+fn the_folder_a_file_is_imported_from_vouches_for_the_document() {
+    // (name, imported from, kept in, trusted folder, how it opens)
+    let cases = [
+        ("from-trusted", "notes", "notes", "notes", Mode::Trusted),
+        ("from-trusted-moved", "notes", "elsewhere", "notes", Mode::Trusted),
+        ("from-below-trusted", "notes/2026", "notes/2026", "notes", Mode::Trusted),
+        ("from-outside", "downloads", "downloads", "notes", Mode::Safe),
+        ("from-outside-moved-in", "downloads", "notes", "notes", Mode::Safe),
+    ];
+    for (name, from, kept, trusted, opens) in cases {
+        let (before, after) = imported(name, from, kept, trusted);
+        assert_eq!(before, opens, "{name}");
+        assert_eq!(after, Mode::Trusted, "{name}: the person trusts the document itself");
+    }
+}
+
+#[test]
+fn nothing_is_imported_when_the_import_cannot_be_recorded() {
+    let folder = Folder::new("unrecorded");
+    folder.write("Trip.md", "# Trip\n");
+    // The settings cannot be written: a file lies where their folder goes.
+    folder.write(".letters", "in the way");
+    let run = folder.letters(&["import", "Trip.md"]);
+    assert!(!run.ok, "{}", run.stdout);
+    assert!(!folder.path("Trip.let").exists());
 }
 
 /// Collects the text of a PDF page in the order it is drawn.

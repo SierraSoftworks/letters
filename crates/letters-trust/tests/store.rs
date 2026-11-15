@@ -47,6 +47,27 @@ fn what_the_user_trusts_is_written_and_read_back() {
 }
 
 #[test]
+fn an_import_is_remembered_until_the_user_trusts_the_document() {
+    for settings in ["", SETTINGS] {
+        let (mut store, memory) = store(settings);
+        let kept = Origin::File("/home/ada/Documents/Letters/Trip.let");
+        store.trust_folder("/home/ada/Documents").unwrap();
+        store.import_document("doc-in").unwrap();
+        for trust in [store.trust().clone(), reopened(&memory)] {
+            assert_eq!(trust.mode("doc-in", kept), Mode::Safe, "{settings:?}");
+            assert!(trust.ignored().is_empty(), "{settings:?}: {:?}", trust.ignored());
+        }
+
+        store.trust_document("doc-in").unwrap();
+        assert_eq!(reopened(&memory).mode("doc-in", kept), Mode::Trusted, "{settings:?}");
+        // A change of mind puts it back as it arrived, not under the folder's word.
+        store.forget_document("doc-in").unwrap();
+        assert_eq!(reopened(&memory).mode("doc-in", kept), Mode::Safe, "{settings:?}");
+    }
+    assert!(store("").0.import_document("").is_err(), "a document with no id cannot be told apart");
+}
+
+#[test]
 fn what_the_user_forgets_is_no_longer_trusted() {
     let (mut store, memory) = store(SETTINGS);
     store.forget_document("doc-trusted").unwrap();

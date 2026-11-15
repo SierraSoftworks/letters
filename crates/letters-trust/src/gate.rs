@@ -64,11 +64,12 @@ pub struct Gate<'a> {
 
 impl Trust {
     /// A document is trusted when the user made it, trusted it by id, or keeps it in a trusted folder.
-    /// One that arrives from outside is vouched for by its id alone, wherever it is saved.
+    /// One that arrives from outside is vouched for by its id alone, wherever it is saved, and so is one
+    /// the user imported, whenever it is opened again.
     pub fn mode(&self, id: &str, origin: Origin<'_>) -> Mode {
         let trusted = match origin {
             Origin::Created => true,
-            Origin::File(path) => self.trusts_document(id) || self.trusts_folder(path),
+            Origin::File(path) => self.trusts_document(id) || (self.trusts_folder(path) && !self.imported(id)),
             Origin::Outside => self.trusts_document(id),
         };
         if trusted { Mode::Trusted } else { Mode::Safe }

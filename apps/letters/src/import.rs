@@ -119,6 +119,9 @@ impl Imported {
 /// A file that can be brought in, and what there is to choose about it.
 #[derive(Debug)]
 pub struct Plan {
+    /// The id the document will have. It is known before the document is made so that the import can be
+    /// recorded first, with `trust::import`: only the folder the file lies in vouches for what it holds.
+    pub id: String,
     /// What to call the document: the file's name without its extension.
     pub name: String,
     pub kind: Kind,
@@ -129,6 +132,7 @@ pub struct Plan {
     /// How many comments a Word file carries.
     pub comments: usize,
     /// The file's folder, which the paths in it start from.
+    source: PathBuf,
     folder: PathBuf,
     created: String,
     content: Content,
@@ -151,17 +155,19 @@ impl Plan {
         let bytes = fs::read(source).map_err(|error| error.to_string())?;
         let name = source.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let folder = normal(source.parent().unwrap_or(Path::new("")));
-        let created = platform::now_rfc3339();
+        let (id, created) = (platform::document_id(), platform::now_rfc3339());
         if WORD_STARTS.iter().any(|start| bytes.starts_with(start)) {
             let word =
                 from_docx(&bytes, style, &created, &mut platform::block_id).map_err(|error| error.to_string())?;
             let (comments, content) = (word.comments.len(), Content::Word(Box::new(word)));
             return Ok(Self {
+                id,
                 name,
                 kind: Kind::Word,
                 folders: Vec::new(),
                 missing: 0,
                 comments,
+                source: source.to_owned(),
                 folder,
                 created,
                 content,
@@ -191,11 +197,13 @@ impl Plan {
         });
         let content = Content::Markdown(markdown, Box::new(style.clone()));
         Ok(Self {
+            id,
             name,
             kind: Kind::Markdown,
             folders: folders.collect(),
             missing,
             comments: 0,
+            source: source.to_owned(),
             folder,
             created,
             content,
@@ -210,13 +218,9 @@ impl Plan {
 
     /// Makes the document.
     pub fn import(self, choices: &Choices) -> Imported {
-        let Self { folder, created, content, .. } = self;
-        let mut package = Package {
-            id: platform::document_id(),
-            created: created.clone(),
-            document: Document::default(),
-            entries: Default::default(),
-        };
+        let Self { id, folder, created, content, .. } = self;
+        let mut package =
+            Package { id, created: created.clone(), document: Document::default(), entries: Default::default() };
         let mut notes = Vec::new();
         let simplified = match content {
             Content::Word(word) => {
@@ -245,6 +249,11 @@ impl Plan {
             package.set_notes(&Notes { notes, ..Notes::default() });
         }
         Imported { package, notes: simplified.len() }
+    }
+
+    /// The file, as it was named.
+    pub fn source(&self) -> &Path {
+        &self.source
     }
 
     /// The file's folder, with its `.` and `..` worked out.
