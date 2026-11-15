@@ -5,6 +5,8 @@ use super::Icon;
 
 /// `arrow-left`
 pub const ARROW_LEFT: Icon = Icon::new("M12 19l-7-7 7-7M19 12H5");
+/// `arrow-left-right`
+pub const ARROW_LEFT_RIGHT: Icon = Icon::new("M8 3 4 7l4 4M4 7h16M16 21l4-4-4-4M20 17H4");
 /// `baseline`
 pub const BASELINE: Icon = Icon::new("M4 20h16M6 16l6-12 6 12M8 12h8");
 /// `bold`

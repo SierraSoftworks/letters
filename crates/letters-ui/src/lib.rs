@@ -34,6 +34,7 @@ mod refer;
 mod references;
 mod renaming;
 mod restyle;
+mod review;
 mod safe;
 mod settings;
 mod spelling;

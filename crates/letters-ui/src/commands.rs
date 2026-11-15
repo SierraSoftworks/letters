@@ -10,6 +10,7 @@ use letters_model::{Align as ColumnAlign, BlockKind, ListKind, Mark, Tone};
 use letters_render::{Rect, Size};
 
 use crate::element::Element;
+use crate::review::Reviewing;
 use crate::style::{Align, Edges};
 use crate::text::TextStyle;
 use crate::tokens;
@@ -86,6 +87,8 @@ pub(crate) enum Act {
     TrustFolder,
     /// Shows the document on the sheets it prints on.
     Print,
+    /// Steps through the conflicts that wait for a choice, or settles the one that is open.
+    Review(Reviewing),
     /// Shows the palette itself. It is not one of its own commands.
     Palette,
 }
@@ -125,7 +128,10 @@ const fn table(name: &'static str, also: &'static str, edit: TableEdit) -> Entry
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 72] = [
+pub(crate) static ENTRIES: [Entry; 77] = [
+    entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
+    entry("Conflict", "Use the other version", "choose held back earlier settle resolve", Act::Review(Reviewing::Use)),
+    entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
     run("Image", "Edit caption", "picture", Command::EditCaption),
     entry("Image", "Edit alt text", "picture describe description", Act::AltText),
     run("Image", "Number this figure", "picture label caption", Command::SetNumbered(true)),
@@ -188,6 +194,8 @@ pub(crate) static ENTRIES: [Entry; 72] = [
     entry("View", "Notes panel", "show hide comments", Act::Panel(Panel::Notes)),
     entry("View", "History panel", "show hide versions", Act::Panel(Panel::History)),
     entry("View", "Print view", "pages paper sheets preview", Act::Print),
+    entry("View", "Next conflict", "changed two places choice", Act::Review(Reviewing::Step { back: false })),
+    entry("View", "Previous conflict", "changed two places choice", Act::Review(Reviewing::Step { back: true })),
     entry("Document", "New document", "create", Act::NewDocument),
     entry("Document", "Open", "file", Act::Open),
     entry("Document", "Rename or move", "name folder", Act::Rename),

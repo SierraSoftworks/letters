@@ -98,7 +98,7 @@ impl Margin {
 
     /// Whether the tools may show over the selection: not once they were put away over it.
     pub fn offers(&self) -> bool {
-        self.away.is_none() && self.draft.is_none() && self.thread.is_none()
+        self.away.is_none() && self.draft.is_none() && self.reading().is_none()
     }
 
     pub fn put_away(&mut self, selection: Option<&Selection>) {
@@ -215,11 +215,55 @@ impl Margin {
         self.marks = marks;
     }
 
-    /// The note that is open under its passage, and the reply typed into it so far.
+    /// The note that is open under its passage, and the reply typed into it so far. A conflict whose
+    /// versions show in the page is not read there: see [`Margin::reviewing`].
     pub fn reading(&self) -> Option<(&Note, &str)> {
         let (id, reply) = self.thread.as_ref()?;
         let note = self.notes.notes.iter().find(|note| &note.id == id && !note.resolved)?;
-        Some((note, reply))
+        (!self.reviewed(note)).then_some((note, reply))
+    }
+
+    /// Whether a note is a conflict about a block that the page still has, so that both versions can be
+    /// shown where the block is.
+    fn reviewed(&self, note: &Note) -> bool {
+        let conflict = matches!(note.kind, NoteKind::Conflict { .. });
+        conflict && self.marks.iter().any(|marker| marker.notes.contains(&note.id))
+    }
+
+    /// The conflict that is open: the page shows both of its versions.
+    pub fn reviewing(&self) -> Option<&Note> {
+        let (id, _) = self.thread.as_ref()?;
+        self.notes.notes.iter().find(|note| &note.id == id && !note.resolved).filter(|note| self.reviewed(note))
+    }
+
+    /// The open conflicts whose versions the page can show, in the order of the document.
+    pub fn conflicts(&self) -> Vec<&str> {
+        let conflict = |id: &&String| self.open().any(|(note, kind)| kind == Kind::Conflict && &note.id == *id);
+        self.marks.iter().flat_map(|marker| marker.notes.iter().filter(conflict)).map(String::as_str).collect()
+    }
+
+    /// The conflict after the one that is open, or with `back` the one before it, round and round. With
+    /// none open, the first or the last.
+    pub fn step(&self, back: bool) -> Option<String> {
+        let all = self.conflicts();
+        let at = self.reviewing().and_then(|note| all.iter().position(|id| *id == note.id));
+        let next = match (at, back) {
+            (None, false) => 0,
+            (None, true) => all.len().checked_sub(1)?,
+            (Some(at), false) => (at + 1) % all.len(),
+            (Some(at), true) => (at + all.len() - 1) % all.len(),
+        };
+        all.get(next).map(|id| (*id).to_owned())
+    }
+
+    /// Settles the conflict that is open, once one of its versions was chosen, and puts it away. Returns
+    /// whether it did.
+    pub fn settle(&mut self) -> bool {
+        let open = self.reviewing().filter(|_| self.refused.is_none()).map(|note| note.id.clone());
+        let Some(id) = open else { return false };
+        self.thread = None;
+        self.notes.notes.iter_mut().filter(|note| note.id == id).for_each(|note| note.resolved = true);
+        true
     }
 
     /// Opens a note under its passage. What was being written elsewhere is dropped.
@@ -277,13 +321,14 @@ impl Margin {
         true
     }
 
-    /// Resolves the open note and puts it away. Returns whether it did: a conflict is resolved by
-    /// choosing one of its versions, which is not done here.
+    /// Resolves the note that is read and puts it away. Returns whether it did. A conflict whose versions
+    /// show in the page is not read: choosing one of them settles it, see [`Margin::settle`].
     pub fn resolve(&mut self) -> bool {
-        let Some((id, _)) = self.thread.take().filter(|_| self.refused.is_none()) else { return false };
-        let note = self.notes.notes.iter_mut().find(|note| note.id == id && !note.resolved);
-        let note = note.filter(|note| matches!(note.kind, NoteKind::Comment | NoteKind::Import));
-        note.map(|note| note.resolved = true).is_some()
+        let read = self.reading().filter(|_| self.refused.is_none()).map(|(note, _)| note.id.clone());
+        let Some(id) = read else { return false };
+        self.thread = None;
+        self.notes.notes.iter_mut().filter(|note| note.id == id).for_each(|note| note.resolved = true);
+        true
     }
 
     /// Resolves every open import note. Returns whether there were any.

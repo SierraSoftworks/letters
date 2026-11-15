@@ -25,6 +25,9 @@ const COPY: u8 = 4;
 const ALT: u8 = 5;
 const NOTE: u8 = 6;
 const BREAK: u8 = 7;
+const KEEP: u8 = 8;
+const USE: u8 = 9;
+const HELD: u8 = 10;
 
 /// FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
 fn hashed(bytes: impl Iterator<Item = u8>) -> u64 {
@@ -124,6 +127,46 @@ pub(crate) fn marker(block: &BlockId, label: &str, rect: Rect, page: &mut Node, 
     let id = part_node(block, NOTE);
     page.push_child(id);
     nodes.push((id, marker));
+}
+
+/// Adds the button that chooses one version of a block two writers changed apart: the one on the page
+/// with `keep`, and else the one held back. `place` says whose it is and where it stands.
+pub(crate) fn choice(
+    block: &BlockId,
+    keep: bool,
+    label: &str,
+    place: &str,
+    rect: Rect,
+    page: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
+    let mut button = Node::new(Role::Button);
+    button.set_label(label);
+    button.set_description(place);
+    button.add_action(Action::Click);
+    button.set_bounds(placed(page, rect));
+    let id = part_node(block, if keep { KEEP } else { USE });
+    page.push_child(id);
+    nodes.push((id, button));
+}
+
+/// Adds the version of a block that a conflict holds back, which shows beside the page's own: what it
+/// reads, under a name that says whose it is.
+pub(crate) fn held_back(
+    block: &BlockId,
+    label: &str,
+    text: &str,
+    rect: Rect,
+    page: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
+    let mut held = Node::new(Role::Note);
+    held.set_label(label);
+    held.set_value(text);
+    held.set_bounds(placed(page, rect));
+    let id = part_node(block, HELD);
+    page.push_child(id);
+    nodes.push((id, held));
 }
 
 /// Adds what Print view shows of a page break under its canvas: a button that takes the break before a
@@ -338,6 +381,11 @@ pub(crate) enum Request {
     Note(BlockId),
     /// Presses what Print view shows of the page break before a block.
     Break(BlockId),
+    /// Chooses a version of a block two writers changed apart: the one on the page, or the one held back.
+    Choose {
+        block: BlockId,
+        keep: bool,
+    },
 }
 
 pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request> {
@@ -359,7 +407,9 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
             let switched = || part(ALT).map(|block| Request::Alt(block.id.clone()));
             let noted = || part(NOTE).map(|block| Request::Note(block.id.clone()));
             let broken = || part(BREAK).map(|block| Request::Break(block.id.clone()));
-            ticked.or_else(copied).or_else(switched).or_else(noted).or_else(broken)
+            let chosen = |keep| part(if keep { KEEP } else { USE }).map(|block| (block.id.clone(), keep));
+            let chosen = || chosen(true).or_else(|| chosen(false)).map(|(block, keep)| Request::Choose { block, keep });
+            ticked.or_else(copied).or_else(switched).or_else(noted).or_else(broken).or_else(chosen)
         }
         _ => None,
     }
