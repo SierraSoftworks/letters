@@ -1,8 +1,9 @@
 //! What the browser lends the editor: a clock, identifiers, the clipboard for as long as a clipboard event
-//! lasts, somewhere to keep the person's own words, and the fonts.
+//! lasts, somewhere to keep the person's own words and default style, and the fonts.
 
 use js_sys::{Promise, Uint8Array};
 use letters_editor::{Clip, Platform, block_id};
+use letters_model::Style;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Crypto, Performance, Response, Storage, Window};
@@ -27,6 +28,9 @@ pub async fn fonts(window: &Window, base: &str) -> Result<Vec<Vec<u8>>, JsValue>
 /// Where this browser keeps the person's own words, a line each, as their dictionary file does elsewhere.
 const WORDS: &str = "letters.words";
 
+/// Where this browser keeps the person's default style, as a `style.json`, until an account keeps it.
+const STYLE: &str = "letters.style";
+
 pub struct Browser {
     performance: Performance,
     crypto: Crypto,
@@ -49,6 +53,18 @@ impl Browser {
     pub fn user_words(&self) -> Vec<String> {
         let kept = self.storage.as_ref().and_then(|storage| storage.get_item(WORDS).ok().flatten());
         kept.unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
+    /// The style the person's new documents start with: the one they kept in this browser, else the
+    /// built-in one. `None` where the browser keeps nothing, so there is no default to change.
+    pub fn default_style(&self) -> Option<Style> {
+        let kept = self.storage.as_ref()?.get_item(STYLE).ok().flatten();
+        Some(kept.and_then(|json| Style::from_json(&json).ok()).unwrap_or_default())
+    }
+
+    /// Keeps `json`, a `style.json`, as the person's default style. `false` when it could not be kept.
+    pub fn keep_default_style(&self, json: &str) -> bool {
+        self.storage.as_ref().is_some_and(|storage| storage.set_item(STYLE, json).is_ok())
     }
 
     /// Milliseconds since the page started loading, to a fraction.

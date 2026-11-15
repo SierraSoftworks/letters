@@ -17,10 +17,11 @@ use letters_render::{Color, DisplayList, Point, Rect, Size};
 use letters_ui::{Cursor, Edge, Keys, Request, Scheme, Window as View, tokens};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
+use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    CanvasRenderingContext2d, ClipboardEvent, CompositionEvent, Element, Event, EventTarget, HtmlCanvasElement,
-    HtmlIFrameElement, HtmlTextAreaElement, ImageData, KeyboardEvent, MediaQueryList, MouseEvent, PointerEvent,
-    WheelEvent, Window,
+    Blob, BlobPropertyBag, CanvasRenderingContext2d, ClipboardEvent, CompositionEvent, Element, Event, EventTarget,
+    HtmlAnchorElement, HtmlCanvasElement, HtmlIFrameElement, HtmlInputElement, HtmlTextAreaElement, ImageData,
+    KeyboardEvent, MediaQueryList, MouseEvent, PointerEvent, Url, WheelEvent, Window,
 };
 
 use crate::browser::Browser;
@@ -82,6 +83,8 @@ pub struct Shell {
     holder: Element,
     /// The timer that brings the mirror up to date once the window has settled.
     mirror_timer: Option<i32>,
+    /// The file input the person chooses a stylesheet with. It is never shown.
+    chooser: HtmlInputElement,
 
     view: View,
     platform: Browser,
@@ -135,6 +138,13 @@ impl Shell {
         canvas.set_attribute("aria-hidden", "true")?;
         let holder = document.create_element("div")?;
         input.insert_adjacent_element("afterend", &holder)?;
+        let chooser: HtmlInputElement = document.create_element("input")?.dyn_into()?;
+        for (name, value) in
+            [("type", "file"), ("accept", ".letstyle,application/json"), ("hidden", ""), ("tabindex", "-1")]
+        {
+            chooser.set_attribute(name, value)?;
+        }
+        holder.insert_adjacent_element("afterend", &chooser)?;
 
         let mut platform = Browser::new(&window)?;
         let mac = window.navigator().platform().is_ok_and(|name| name.starts_with("Mac") || name.starts_with("iP"));
@@ -160,6 +170,7 @@ impl Shell {
                 mirror: Page::new(&document, holder.clone()),
                 holder: holder.clone(),
                 mirror_timer: None,
+                chooser: chooser.clone(),
                 window: window.clone(),
                 canvas: canvas.clone(),
                 context,
@@ -220,6 +231,24 @@ impl Shell {
             report(focus.focus());
         })?;
 
+        // A stylesheet the person chose is read, which takes a moment, and then offered in the window.
+        let offered = Rc::downgrade(&shell);
+        listen(&chooser, "change", move |event| {
+            let chooser: HtmlInputElement = event.target().expect("the chooser heard it").unchecked_into();
+            let Some(file) = chooser.files().and_then(|files| files.get(0)) else { return };
+            // The same file chosen again is a change again.
+            chooser.set_value("");
+            let (offered, name) = (offered.clone(), file.name());
+            wasm_bindgen_futures::spawn_local(async move {
+                let text = JsFuture::from(file.text()).await.ok().and_then(|text| text.as_string());
+                let Some(shell) = offered.upgrade() else { return };
+                let mut shell = shell.borrow_mut();
+                shell.view.offer_stylesheet(&name, &text.unwrap_or_default());
+                shell.changed();
+                shell.sync();
+            });
+        })?;
+
         hear(&shell, &canvas, "pointerdown", Self::pointer_down)?;
         hear(&shell, &canvas, "pointermove", Self::pointer_move)?;
         hear(&shell, &canvas, "pointerup", Self::pointer_up)?;
@@ -241,8 +270,11 @@ impl Shell {
         hear(&shell, &input, "focus", |shell, _: Event| shell.view.focus(true))?;
         hear(&shell, &input, "blur", |shell, _: Event| shell.view.focus(false))?;
         hear(&shell, &window, "resize", |shell, _: Event| shell.fit())?;
-        // Another tab of the editor may have added to the person's words.
-        hear(&shell, &window, "storage", |shell, _: Event| shell.view.set_user_words(shell.platform.user_words()))?;
+        // Another tab of the editor may have added to the person's words, or kept another default style.
+        hear(&shell, &window, "storage", |shell, _: Event| {
+            shell.view.set_user_words(shell.platform.user_words());
+            shell.view.set_default_style(shell.platform.default_style());
+        })?;
         for setting in [&dark_mode, &less_motion].into_iter().flatten() {
             hear(&shell, setting, "change", |shell, _: Event| shell.fit())?;
         }
@@ -284,6 +316,20 @@ impl Shell {
         Ok(())
     }
 
+    /// Offers `text` to the person as a file to keep, named after the document.
+    fn download(&self, text: &str, extension: &str) -> Result<(), JsValue> {
+        let page = self.window.document().ok_or("there is no document")?;
+        let parts = js_sys::Array::of1(&text.into());
+        let options = BlobPropertyBag::new();
+        options.set_type("application/json");
+        let url = Url::create_object_url_with_blob(&Blob::new_with_str_sequence_and_options(&parts, &options)?)?;
+        let link: HtmlAnchorElement = page.create_element("a")?.dyn_into()?;
+        link.set_href(&url);
+        link.set_download(&format!("{}.{extension}", page.title()));
+        link.click();
+        Url::revoke_object_url(&url)
+    }
+
     /// Brings a new view to the canvas.
     fn show(&mut self) {
         let active = self.window.document().and_then(|page| page.active_element());
@@ -321,12 +367,24 @@ impl Shell {
     /// Brings everything outside the canvas up to date with the view, after any event.
     fn sync(&mut self) {
         for request in self.view.take_requests() {
-            // Opening, starting, renaming and moving need files, which wait for a server behind the page.
-            if let Request::Named(name) = request {
-                self.view.set_document_name(&name);
-                if let Some(page) = self.window.document() {
-                    page.set_title(&name);
+            match request {
+                // There are no folders to move between, so a name is the person's to give.
+                Request::Named(name) | Request::Rename(name) => {
+                    self.view.set_document_name(&name);
+                    if let Some(page) = self.window.document() {
+                        page.set_title(&name);
+                    }
                 }
+                Request::SaveDefaultStyle(json) => {
+                    if !self.platform.keep_default_style(&json) {
+                        self.view.set_default_style(self.platform.default_style());
+                    }
+                }
+                // The browser asks the person for the file, and the chooser's `change` hands it over.
+                Request::ImportStyle => self.chooser.click(),
+                Request::ExportStyle(json) => report(self.download(&json, "letstyle")),
+                // Opening, starting and moving need files, which wait for a server behind the page.
+                _ => {}
             }
         }
         if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
@@ -648,6 +706,7 @@ fn view(document: Document, platform: &mut Browser, mac: bool) -> View {
     let mut view = page::window(document, ReplicaId::new(&platform.new_id()));
     view.set_keys(if mac { Keys::Mac } else { Keys::Standard });
     view.set_user_words(platform.user_words());
+    view.set_default_style(platform.default_style());
     view
 }
 

@@ -27,6 +27,8 @@ wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 web-sys = { workspace = true, features = [
+  "Blob",
+  "BlobPropertyBag",
   "CanvasRenderingContext2d",
   "ClipboardEvent",
   "CompositionEvent",
@@ -38,9 +40,13 @@ web-sys = { workspace = true, features = [
   "Element",
   "Event",
   "EventTarget",
+  "File",
+  "FileList",
+  "HtmlAnchorElement",
   "HtmlCanvasElement",
   "HtmlElement",
   "HtmlIFrameElement",
+  "HtmlInputElement",
   "HtmlTextAreaElement",
   "ImageData",
   "InputEvent",
@@ -53,6 +59,7 @@ web-sys = { workspace = true, features = [
   "PointerEvent",
   "Response",
   "Storage",
+  "Url",
   "WheelEvent",
   "Window",
   "console",
