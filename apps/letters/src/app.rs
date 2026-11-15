@@ -2185,12 +2185,13 @@ impl App {
                         Request::NewFolder { parent, name } => match remote.shelf(&parent) {
                             Some((space, parent)) => Some(Placing::NewFolder { space, parent, name }),
                             // The card that saves a copy asked, for a folder of this device. The person's
-                            // own folder is listed before anything was written to it. One that is made, or
-                            // was there already, is listed and so picked.
+                            // own folder is listed before anything was written to it.
                             None => {
                                 let _ = fs::create_dir_all(&parent);
-                                let _ = self.library.new_folder(Path::new(&parent), &name);
-                                window.recopy(&self.library);
+                                match self.library.new_folder(Path::new(&parent), &name) {
+                                    Ok(_) => window.recopy(&self.library),
+                                    Err(refused) => window.view.refuse_copy_folder(&refused.to_string()),
+                                }
                                 continue;
                             }
                         },
