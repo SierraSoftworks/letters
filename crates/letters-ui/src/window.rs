@@ -9,9 +9,13 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
-use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Platform};
+use letters_editor::{
+    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Picture, Platform, Spot,
+};
 use letters_layout::{Callout, DocLayout, Fonts, Palette, Syntax};
-use letters_model::{Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Mark, Marker, Pos, Selection, Style};
+use letters_model::{
+    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Pos, Selection, Style,
+};
 use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
@@ -51,6 +55,9 @@ pub(crate) const PT: f32 = 96.0 / 72.0;
 pub(crate) const CARET_WIDTH: f32 = 1.5;
 /// How far outside a selected picture its ring is drawn.
 const RING: f32 = 3.0;
+/// The bar that says where pictures held over the page would land: how thick it is, and how far it stands
+/// from what they would land beside.
+const BAR: (f32, f32) = (3.0, 3.0);
 /// The least a picture's place measures for the sign of a picture to show in it while it is awaited, and the
 /// size of that sign.
 const AWAITED: (f32, f32) = (48.0, 24.0);
@@ -354,6 +361,29 @@ impl Ui<EditorApp> {
         }
     }
 
+    /// Shows where pictures held over a point of the window would land if they were let go there, as
+    /// files dragged over the window are: a bar beside a picture, or between two blocks. `None` puts the
+    /// bar away. Returns whether the point is on the page.
+    pub fn drag_pictures(&mut self, at: Option<Point>) -> bool {
+        let spot = at.and_then(|at| self.on_canvas(at)).and_then(|at| self.app().spot(at));
+        let bar = spot.as_ref().and_then(|(_, bar)| *bar);
+        if self.app().drop != bar {
+            self.app_mut().drop = bar;
+        }
+        spot.is_some()
+    }
+
+    /// Puts pictures into the document: one as a figure, several as a gallery. Let go at a point of the
+    /// page they land where [`Window::drag_pictures`] showed. With no point, or one that is not on the
+    /// page, they land where the selection is, as pictures chosen in a dialog do (see
+    /// [`Request::Pictures`]). What is no picture Letters can show is left out.
+    pub fn insert_pictures(&mut self, pictures: Vec<Picture>, at: Option<Point>, platform: &mut dyn Platform) {
+        let at = at.and_then(|at| self.on_canvas(at)).and_then(|at| self.app().spot(at)).map(|(spot, _)| spot);
+        let app = self.app_mut();
+        app.drop = None;
+        app.edit(platform, |editor, platform| editor.run(Command::InsertFigures { pictures, at }, platform));
+    }
+
     /// Where the two ends of the selection are in the window as last laid out, the anchor first and then
     /// the end that moves: each as tall as its line, for a shell that draws handles there on a touch
     /// screen. `None` for an end the page does not show, and for both without a selection.
@@ -488,6 +518,8 @@ pub struct EditorApp {
     images: Images,
     /// The assets the shell was asked for, or told of by itself.
     wanted: HashSet<String>,
+    /// The bar that says where pictures held over the page would land, in the layout's coordinates.
+    drop: Option<Rect>,
     /// The folder the bar says the document was saved in, and since when, once a frame has said so.
     saved_in: Option<(String, Option<u64>)>,
     /// Whether the caret is in the heading that will name the document.
@@ -552,6 +584,7 @@ impl EditorApp {
             requests: Vec::new(),
             images: Images::default(),
             wanted: HashSet::new(),
+            drop: None,
             saved_in: None,
             naming: false,
             renaming: None,
@@ -1132,6 +1165,9 @@ impl EditorApp {
             None => {}
         }
 
+        if let Some(bar) = self.drop {
+            list.items.push(Item::Fill { rect: bar, color: resolve(tokens::ACCENT, self.scheme, 1.0), radius: 2.0 });
+        }
         // A figure that is selected has a ring round its picture, and a selected picture is where the caret is.
         let ring = resolve(tokens::ACCENT, self.scheme, 1.0);
         let pictures = self.editor.figures().into_iter().filter_map(|figure| self.layout.figure(&figure));
@@ -1228,6 +1264,46 @@ impl EditorApp {
         let preview = Preview { layout: &self.layout, picture, page, caption: &caption, anchor, room };
         let rect = preview.paint(self.shaper.as_ref(), self.scheme, out);
         Some((caption, rect))
+    }
+
+    /// How far down the page a block reaches, from its top to its bottom, in the layout's coordinates.
+    fn extent(&self, block: &Block) -> Option<(f32, f32)> {
+        if let Some(figure) = self.layout.figure(&block.id) {
+            let captioned = !block.plain_text().is_empty() || block.body.blocks().iter().any(|part| !is_figure(part));
+            let under = if captioned { figure.caption } else { figure.image };
+            return Some((figure.image.y, under.y + under.height));
+        }
+        let mut texts = Vec::new();
+        written(block, &mut texts);
+        let (first, last) = (texts.first()?, texts.last()?);
+        let top = self.layout.caret(&Pos::new(first.id.clone(), 0))?;
+        let bottom = self.layout.caret(&Pos::new(last.id.clone(), last.plain_text().len()))?;
+        Some((top.y, bottom.y + bottom.height))
+    }
+
+    /// Where pictures let go at a point of the page area would land, and the bar that says so, in the
+    /// layout's coordinates: beside a picture from its left or right quarter, and otherwise on a line of
+    /// their own, above or below the block there.
+    fn spot(&self, at: Point) -> Option<(Spot, Option<Rect>)> {
+        let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        let block = self.layout.hit(at)?.block;
+        let (thick, gap) = BAR;
+        let picture = self.layout.figure(&block).map(|figure| figure.image).filter(|image| image.contains(at));
+        let across = picture.map(|image| (image, (at.x - image.x) / image.width.max(1.0)));
+        if let Some((image, across)) = across.filter(|(_, across)| !(0.25..=0.75).contains(across)) {
+            let after = across > 0.5;
+            let x = if after { image.x + image.width + gap } else { image.x - gap - thick };
+            let bar = Rect::new(x, image.y, thick, image.height);
+            return Some((Spot::Beside { figure: block, after }, Some(bar)));
+        }
+        // A block inside a table or a gallery stands for the whole of it.
+        let extent = whole(self.editor.doc(), &block).and_then(|whole| self.extent(whole));
+        let below = extent.is_some_and(|(top, bottom)| at.y > (top + bottom) / 2.0);
+        let bar = extent.map(|(top, bottom)| {
+            let y = if below { bottom + gap } else { top - gap - thick };
+            Rect::new(0.0, y, self.column.1, thick)
+        });
+        Some((Spot::Line { block, below }, bar))
     }
 
     /// The heading the top of the view is under.
@@ -1735,6 +1811,8 @@ impl EditorApp {
             Put::Kind(kind) => Command::SetBlock(kind),
             // A header row over two more, three cells across: enough to start with.
             Put::Table => Command::InsertTable { rows: 3, columns: 3 },
+            // The shell lets the person choose them, and they take the place of the line that is now empty.
+            Put::Pictures => return self.requests.push(Request::Pictures),
         };
         self.edit(platform, |editor, platform| editor.run(command, platform));
     }
@@ -2183,6 +2261,26 @@ impl Paint for PagePaint {
 
 fn fill(rect: Rect, color: Color) -> Item {
     Item::Fill { rect, color, radius: 0.0 }
+}
+
+fn is_figure(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Figure { .. })
+}
+
+/// The blocks of text in `block`, itself among them, in the order of the document.
+fn written<'a>(block: &'a Block, out: &mut Vec<&'a Block>) {
+    if matches!(block.body, Body::Text(_)) {
+        out.push(block);
+    }
+    block.body.blocks().iter().for_each(|part| written(part, out));
+}
+
+/// The block of the document's own that `id` is in, or is.
+fn whole<'a>(doc: &'a Document, id: &BlockId) -> Option<&'a Block> {
+    fn holds(block: &Block, id: &BlockId) -> bool {
+        &block.id == id || block.body.blocks().iter().any(|part| holds(part, id))
+    }
+    doc.blocks.iter().find(|block| holds(block, id))
 }
 
 /// Keeps the place of each picture in `list` that is not among `images`: a quiet box with the sign of a

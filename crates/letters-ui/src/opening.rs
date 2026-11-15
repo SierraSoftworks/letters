@@ -65,6 +65,8 @@ pub enum Request {
     ToggleMaximise,
     /// Close the window.
     Close,
+    /// Let the person choose pictures, and hand them to `Window::insert_pictures` with no point.
+    Pictures,
     /// Read this asset of the document, by its entry name, and hand it decoded to `Window::set_image`.
     /// Asked once for each picture the page comes to show, which keeps its place until then.
     Asset(String),

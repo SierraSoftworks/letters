@@ -1,7 +1,7 @@
 //! The editor's window, as a shell shows it: the page, the top bar and the side panel.
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, Toggled, TreeId, TreeUpdate};
-use letters_editor::InputEvent;
+use letters_editor::{InputEvent, Picture};
 use letters_model::{Align, Block, BlockKind, Document, ListKind, Pos, Selection, Style, TextStyle};
 use letters_render::image::Image;
 use letters_render::{Color, Item, PathEl, Point, Rect};
@@ -2467,4 +2467,98 @@ fn a_long_press_selects_the_word_under_it_on_the_page_alone() {
     let share = window.find(Role::Button, "Share").expect("a Share button").center();
     assert!(!window.long_press_at(share), "the bar is not the page");
     assert_eq!(selected(&window).trim(), "Roofing");
+}
+
+/// A picture as a shell hands one over: bytes that begin as a PNG's do.
+fn png() -> Picture {
+    let bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    Picture { bytes, mime: "image/png".into(), width: 400, height: 200 }
+}
+
+/// What the document's own blocks are, in order: text by its words, a figure by its caption or as "new"
+/// without one, and a gallery by how many pictures it holds.
+fn blocks(window: &Harness) -> Vec<String> {
+    let figure = |block: &&Block| matches!(block.kind, BlockKind::Figure { .. });
+    let named = |block: &Block| match &block.kind {
+        BlockKind::Gallery { .. } => format!("gallery of {}", block.body.blocks().iter().filter(figure).count()),
+        BlockKind::Figure { .. } if block.plain_text().is_empty() => "new".into(),
+        _ => block.plain_text(),
+    };
+    window.editor().doc().blocks.iter().map(named).collect()
+}
+
+/// The bars a frame draws to say where held pictures would land, each as whether it stands upright.
+fn bars(window: &mut Harness) -> Vec<bool> {
+    let bar = |item: &Item| match item {
+        Item::Fill { rect, radius, .. } if *radius == 2.0 && rect.width.min(rect.height) == 3.0 => {
+            Some(rect.height > rect.width)
+        }
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(bar).collect()
+}
+
+#[test]
+fn pictures_held_over_the_page_show_where_they_would_land_and_land_there() {
+    let (roof, today, reply) = ("Seen from the garden", "The roof today:", "Reply by Friday.");
+    // Where on the page they are held, whether the bar there stands upright, and the document after.
+    let cases = [
+        ("low on the last line", false, vec![today, roof, reply, "new"]),
+        ("high on the last line", false, vec![today, roof, "new", reply]),
+        ("the right of the picture", true, vec![today, "gallery of 2", reply]),
+        ("the left of the picture", true, vec![today, "gallery of 2", reply]),
+        ("the top of the picture", false, vec![today, "new", roof, reply]),
+    ];
+    for (held, upright, after) in cases {
+        let mut window = illustrated();
+        let (picture, line) = (picture(&mut window).0, spot(&mut window, "p2", 3));
+        let middle = Point { x: picture.x + picture.width / 2.0, y: picture.y + picture.height / 2.0 };
+        let at = match held {
+            "low on the last line" => Point { x: line.x, y: line.y + line.height - 2.0 },
+            "high on the last line" => Point { x: line.x, y: line.y + 2.0 },
+            "the right of the picture" => Point { x: picture.x + picture.width - 10.0, ..middle },
+            "the left of the picture" => Point { x: picture.x + 10.0, ..middle },
+            _ => Point { y: picture.y + 10.0, ..middle },
+        };
+        assert_eq!(bars(&mut window), [false; 0], "{held}: nothing is held yet");
+        assert!(window.hold_pictures(Some(at)), "{held}");
+        assert_eq!(bars(&mut window), [upright], "{held}");
+
+        window.drop_pictures(Some(at), vec![png()]);
+        assert_eq!(blocks(&window), after, "{held}");
+        assert_eq!(bars(&mut window), [false; 0], "{held}: the bar goes with the drop");
+        assert!(window.editor().picture().is_some(), "{held}: what was dropped is selected");
+    }
+}
+
+#[test]
+fn pictures_held_over_anything_but_the_page_have_nowhere_to_land() {
+    let mut window = illustrated();
+    let line = spot(&mut window, "p2", 3);
+    let share = window.find(Role::Button, "Share").expect("a Share button").center();
+    assert!(!window.hold_pictures(Some(share)));
+    assert_eq!(bars(&mut window), [false; 0]);
+
+    // Taken away again, they leave no bar behind.
+    assert!(window.hold_pictures(Some(Point { x: line.x, y: line.y + 2.0 })));
+    assert!(!window.hold_pictures(None));
+    assert_eq!(bars(&mut window), [false; 0]);
+
+    // Let go off the page, they go where the caret is.
+    window.drop_pictures(Some(share), vec![png()]);
+    assert_eq!(blocks(&window).last().map(String::as_str), Some("new"), "under the line of the caret");
+}
+
+#[test]
+fn the_insert_menu_asks_the_shell_for_pictures_which_take_the_place_of_the_line() {
+    let mut window = blank();
+    window.type_text("/ima").key("Enter");
+    window.assert_closed(Role::ListBox, "Insert");
+    assert_eq!(window.ui().take_requests(), [Request::Pictures]);
+    assert_eq!(block_text(&window, "p"), "", "the slash is gone");
+
+    window.drop_pictures(None, vec![png(), png()]);
+    assert_eq!(blocks(&window), ["gallery of 2"], "several pictures are a gallery, where the line was");
+    window.paint();
+    assert!(matches!(window.ui().take_requests()[..], [Request::Asset(_), ..]), "and are asked for to be shown");
 }

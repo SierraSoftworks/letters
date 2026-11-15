@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use accesskit::{ActionRequest, Toggled};
 use accesskit_consumer::{NodeRef, Tree, TreeChangeHandler};
-use letters_editor::{Clip, Editor, InputEvent, Key, KeyEvent, Modifiers, Platform};
+use letters_editor::{Clip, Editor, InputEvent, Key, KeyEvent, Modifiers, Picture, Platform};
 use letters_model::{Document, Pos, ReplicaId, Selection};
 use letters_render::{DisplayList, Point, Rect, Size};
 use letters_ui::{App, EditorApp, FixedShaper, Keys, Ui, Window};
@@ -358,6 +358,18 @@ impl Harness<EditorApp> {
         let (block, start) = found.unwrap_or_else(|| panic!("the document does not hold {text:?}"));
         let anchor = Pos { block: block.clone(), offset: start };
         self.ui.select(Selection { anchor, head: Pos { block, offset: start + text.len() } });
+        self
+    }
+
+    /// Holds pictures over a point, as files dragged over the window are, or takes them away again with
+    /// `None`. Returns whether they could be let go there.
+    pub fn hold_pictures(&mut self, at: Option<Point>) -> bool {
+        self.ui.drag_pictures(at)
+    }
+
+    /// Lets pictures go at a point, or hands over pictures chosen in a dialog with `None`.
+    pub fn drop_pictures(&mut self, at: Option<Point>, pictures: Vec<Picture>) -> &mut Self {
+        self.ui.insert_pictures(pictures, at, &mut self.platform);
         self
     }
 

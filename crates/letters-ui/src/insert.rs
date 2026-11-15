@@ -33,6 +33,8 @@ pub(crate) enum Put {
     Kind(BlockKind),
     /// Puts a table in the line's place.
     Table,
+    /// Asks for pictures to put in the line's place.
+    Pictures,
 }
 
 /// Something the menu puts on the line.
@@ -57,7 +59,7 @@ const fn list(list: ListKind) -> Put {
     Put::Kind(BlockKind::ListItem { list, depth: 0 })
 }
 
-pub(crate) static OFFERS: [Offer; 12] = [
+pub(crate) static OFFERS: [Offer; 13] = [
     offer("Text", "Heading 1", icon::HEADING_1, "#", kind(BlockKind::Heading { level: 1 })),
     offer("Text", "Heading 2", icon::HEADING_2, "##", kind(BlockKind::Heading { level: 2 })),
     offer("Text", "Heading 3", icon::HEADING_3, "###", kind(BlockKind::Heading { level: 3 })),
@@ -67,6 +69,7 @@ pub(crate) static OFFERS: [Offer; 12] = [
     offer("Text", "Quote", icon::TEXT_QUOTE, ">", kind(BlockKind::Quote)),
     offer("Text", "Code block", icon::CODE_XML, "```", kind(BlockKind::Code { language: None })),
     offer("Elements", "Table", icon::TABLE, "| a | b |", Put::Table),
+    offer("Elements", "Image", icon::IMAGE, "![]()", Put::Pictures),
     offer("Elements", "Callout", icon::INFO, "> [!INFO]", kind(BlockKind::Callout { tone: Tone::Info })),
     offer("Elements", "Formula", icon::SIGMA, "$$", kind(BlockKind::Formula)),
     offer("Elements", "Divider", icon::SEPARATOR_HORIZONTAL, "---", kind(BlockKind::Divider)),
