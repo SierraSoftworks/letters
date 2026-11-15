@@ -372,6 +372,21 @@ impl<A: App> Ui<A> {
         self.caret_holder().is_some_and(|i| matches!(self.tree.nodes[i].el.content, Content::Canvas(_)))
     }
 
+    /// Where the app's own canvas is in the window as last laid out: the one focus rests on, such as the
+    /// page.
+    pub(crate) fn canvas(&self) -> Option<Rect> {
+        let own = self.tree.nodes.iter().find(|node| node.el.rest && matches!(node.el.content, Content::Canvas(_)));
+        own.map(|node| inner(node.rect, &node.el.style))
+    }
+
+    /// A point of the window as the app's own canvas counts it, when a press there would be the canvas's:
+    /// nothing lies over it at that point.
+    pub(crate) fn on_canvas(&self, at: Point) -> Option<Point> {
+        let i = self.hit(at).and_then(|hit| self.target(hit))?;
+        let node = &self.tree.nodes[i];
+        (node.el.rest && matches!(node.el.content, Content::Canvas(_))).then(|| self.within(i, at))
+    }
+
     /// Where the caret is in the window as last laid out, for the input method's candidate window.
     pub fn caret_rect(&self) -> Option<Rect> {
         let node = &self.tree.nodes[self.caret_holder()?];

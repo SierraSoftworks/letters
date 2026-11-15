@@ -361,6 +361,12 @@ impl Harness<EditorApp> {
         self
     }
 
+    /// Holds a finger on a point, as a touch screen's shell passes it on. Returns whether a word was
+    /// selected.
+    pub fn long_press_at(&mut self, at: Point) -> bool {
+        self.ui.select_word_at(at, &mut self.platform)
+    }
+
     pub fn editor(&self) -> &Editor {
         self.ui.editor()
     }

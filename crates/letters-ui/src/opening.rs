@@ -65,6 +65,9 @@ pub enum Request {
     ToggleMaximise,
     /// Close the window.
     Close,
+    /// Read this asset of the document, by its entry name, and hand it decoded to `Window::set_image`.
+    /// Asked once for each picture the page comes to show, which keeps its place until then.
+    Asset(String),
 }
 
 /// A document opened lately, as the landing card lists it.

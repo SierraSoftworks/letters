@@ -3,6 +3,7 @@
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, Toggled, TreeId, TreeUpdate};
 use letters_editor::InputEvent;
 use letters_model::{Align, Block, BlockKind, Document, ListKind, Pos, Selection, Style, TextStyle};
+use letters_render::image::Image;
 use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
 use letters_ui::{Chrome, Cursor, Edge, Folder, Frame, Landing, Location, Recent, Request, SaveState, WindowButton};
@@ -2375,4 +2376,95 @@ fn a_press_on_a_picture_selects_its_figure_and_one_on_its_caption_writes_there()
     assert_eq!(window.editor().picture(), None);
     assert_eq!(head(&window), Pos::new("g", 4));
     assert_eq!(rings(&mut window, picture), before, "the ring goes with the selection");
+}
+
+/// A paragraph `p1`, a figure `g` whose picture is the asset `assets/roof.png`, and a paragraph `p2`.
+fn illustrated() -> Harness {
+    let figure = BlockKind::Figure {
+        asset: Some("assets/roof.png".into()),
+        src: None,
+        alt: "A slate roof".into(),
+        width: 300.0,
+        height: 150.0,
+        numbered: false,
+    };
+    let blocks = vec![
+        text("p1", BlockKind::Paragraph, "The roof today:"),
+        text("g", figure, "Seen from the garden"),
+        text("p2", BlockKind::Paragraph, "Reply by Friday."),
+    ];
+    Harness::open(Document { blocks, ..Document::default() })
+}
+
+/// Where a frame draws a picture, and how many boxes it fills in that very place before it, to keep it.
+fn picture(window: &mut Harness) -> (Rect, usize) {
+    let frame = window.paint();
+    let drawn = |item: &Item| match item {
+        Item::Image { rect, .. } => Some(*rect),
+        _ => None,
+    };
+    let (at, picture) =
+        frame.items.iter().enumerate().find_map(|(at, item)| Some((at, drawn(item)?))).expect("a picture");
+    let under = frame.items[..at].iter().filter(|item| matches!(item, Item::Fill { rect, .. } if *rect == picture));
+    (picture, under.count())
+}
+
+#[test]
+fn a_picture_is_asked_of_the_shell_once_and_its_place_kept_until_it_comes() {
+    let mut window = illustrated();
+    let (place, kept) = picture(&mut window);
+    assert_eq!(kept, 1, "the place of a picture that has not come is filled in under it");
+    assert_eq!(window.ui().take_requests(), [Request::Asset("assets/roof.png".into())]);
+    window.type_text("x");
+    window.paint();
+    assert_eq!(window.ui().take_requests(), [], "it is asked for once");
+
+    let image = Image::from_rgba8(2, 1, vec![255; 8]).expect("two pixels");
+    window.ui().set_image("assets/roof.png", Some(image));
+    assert_eq!(picture(&mut window), (place, 0), "the picture is drawn where its place was kept");
+    assert!(window.ui().images().get("assets/roof.png").is_some(), "from what the shell's renderer is handed");
+}
+
+#[test]
+fn a_picture_that_cannot_be_had_keeps_its_place_and_is_not_asked_for_again() {
+    let mut window = illustrated();
+    // The shell may know before it is asked.
+    window.ui().set_image("assets/roof.png", None);
+    assert_eq!(picture(&mut window).1, 1);
+    assert_eq!(window.ui().take_requests(), []);
+}
+
+#[test]
+fn the_ends_of_the_selection_are_told_where_the_page_shows_them() {
+    let mut window = long();
+    let (start, end) = (spot(&mut window, "p1", 4), spot(&mut window, "p1", 8));
+    window.ui().select(Selection { anchor: Pos::new("p1", 4), head: Pos::new("p1", 8) });
+    window.paint();
+    let near = |end: Option<Rect>, caret: Rect| {
+        end.is_some_and(|end| (end.x - caret.x).abs() < 1.0 && end.y == caret.y && end.height == caret.height)
+    };
+    let [anchor, head] = window.ui().selection_ends();
+    assert!(near(anchor, start) && near(head, end), "{anchor:?} and {head:?} at {start:?} and {end:?}");
+
+    // An end the page has scrolled away from is not told.
+    window.ui().select(Selection { anchor: Pos::new("p1", 4), head: Pos::new("p150", 8) });
+    window.paint();
+    let [anchor, head] = window.ui().selection_ends();
+    assert!(anchor.is_none() && head.is_some(), "{anchor:?} and {head:?}");
+
+    let mut window = Harness::open(Document::default());
+    window.paint();
+    assert_eq!(window.ui().selection_ends(), [None, None], "a page with nowhere to write has no ends");
+}
+
+#[test]
+fn a_long_press_selects_the_word_under_it_on_the_page_alone() {
+    let mut window = letter();
+    let word = spot(&mut window, "p1", 10);
+    assert!(window.long_press_at(Point { x: word.x + 2.0, y: word.y + word.height / 2.0 }));
+    assert_eq!(selected(&window).trim(), "Roofing");
+
+    let share = window.find(Role::Button, "Share").expect("a Share button").center();
+    assert!(!window.long_press_at(share), "the bar is not the page");
+    assert_eq!(selected(&window).trim(), "Roofing");
 }

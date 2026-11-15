@@ -63,6 +63,8 @@ pub const HEADING_3: Icon = Icon::new("M4 12h8M4 18V6M12 18V6M17.5 10.5c1.7-1 3.
 pub const HIGHLIGHTER: Icon = Icon::new("M9 11l-6 6v3h9l3-3M22 12l-4.6 4.6a2 2 0 0 1-2.8 0l-5.2-5.2a2 2 0 0 1 0-2.8L14 4");
 /// `history`
 pub const HISTORY: Icon = Icon::new("M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8M3 3v5h5M12 7v5l4 2");
+/// `image`
+pub const IMAGE: Icon = Icon::new("M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2zM7 9a2 2 0 1 0 4 0a2 2 0 1 0 -4 0M21 15l-3.086-3.086a2 2 0 0 0-2.828 0L6 21");
 /// `info`
 pub const INFO: Icon = Icon::new("M2 12a10 10 0 1 0 20 0a10 10 0 1 0 -20 0M12 16v-4M12 8h.01");
 /// `italic`

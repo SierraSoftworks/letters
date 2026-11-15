@@ -4,7 +4,7 @@
 //! document's layout painted for the part in view. Everything around it is made of the toolkit's widgets.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
@@ -12,11 +12,12 @@ use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
 use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Platform};
 use letters_layout::{Callout, DocLayout, Fonts, Palette, Syntax};
 use letters_model::{Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Mark, Marker, Pos, Selection, Style};
+use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
 
 use crate::chrome::Chrome;
-use crate::color::{fade, resolve, same};
+use crate::color::{blend, fade, resolve, same};
 use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::highlight;
@@ -50,6 +51,9 @@ pub(crate) const PT: f32 = 96.0 / 72.0;
 pub(crate) const CARET_WIDTH: f32 = 1.5;
 /// How far outside a selected picture its ring is drawn.
 const RING: f32 = 3.0;
+/// The least a picture's place measures for the sign of a picture to show in it while it is awaited, and the
+/// size of that sign.
+const AWAITED: (f32, f32) = (48.0, 24.0);
 /// How much text one idle step lays out, in bytes. Small enough to fit between two frames.
 const SETTLE_BYTES: usize = 4096;
 
@@ -333,6 +337,49 @@ impl Ui<EditorApp> {
         app.estimated = true;
     }
 
+    /// The decoded pictures the window's display list draws, by asset name: what a shell hands its
+    /// renderer with each frame.
+    pub fn images(&self) -> &Images {
+        &self.app().images
+    }
+
+    /// Hands over a picture the window asked for with [`Request::Asset`], decoded. `None` says it cannot
+    /// be had: its place stays empty and it is not asked for again.
+    pub fn set_image(&mut self, asset: &str, image: Option<Image>) {
+        let app = self.app_mut();
+        app.wanted.insert(asset.to_owned());
+        match image {
+            Some(image) => app.images.insert(asset, image),
+            None => _ = app.images.remove(asset),
+        }
+    }
+
+    /// Where the two ends of the selection are in the window as last laid out, the anchor first and then
+    /// the end that moves: each as tall as its line, for a shell that draws handles there on a touch
+    /// screen. `None` for an end the page does not show, and for both without a selection.
+    pub fn selection_ends(&self) -> [Option<Rect>; 2] {
+        let app = self.app();
+        let Some((page, selection)) = self.canvas().zip(app.editor.selection()) else { return [None, None] };
+        let end = |pos: &Pos| {
+            let caret = app.layout.caret(pos)?;
+            let (x, y) = (page.x + app.column.0 + caret.x, page.y + TOP - app.scrolled() + caret.y);
+            let shown = y + caret.height > page.y && y < page.y + page.height;
+            shown.then_some(Rect { x, y, ..caret })
+        };
+        [end(&selection.anchor), end(&selection.head)]
+    }
+
+    /// Selects the word at a point of the window, as a double click there does: for a long press on a
+    /// touch screen. Returns whether the page had text to select there. A point on anything that lies over
+    /// the page selects nothing.
+    pub fn select_word_at(&mut self, at: Point, platform: &mut dyn Platform) -> bool {
+        let Some(head) = self.on_canvas(at).and_then(|at| self.app().hit(at)) else { return false };
+        let app = self.app_mut();
+        app.editor.select(Selection::caret(head));
+        app.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform));
+        true
+    }
+
     /// Runs something on the editor from outside, such as taking in another writer's edits, and brings the
     /// page up to date with what it changed. The page stays where it is scrolled to.
     pub fn change<E>(&mut self, act: impl FnOnce(&mut Editor) -> Result<Change, E>) -> Result<(), E> {
@@ -437,6 +484,10 @@ pub struct EditorApp {
     /// The file the import card offers, while it shows.
     importing: Option<Importing>,
     requests: Vec<Request>,
+    /// The pictures the shell has handed over, by asset name.
+    images: Images,
+    /// The assets the shell was asked for, or told of by itself.
+    wanted: HashSet<String>,
     /// The folder the bar says the document was saved in, and since when, once a frame has said so.
     saved_in: Option<(String, Option<u64>)>,
     /// Whether the caret is in the heading that will name the document.
@@ -499,6 +550,8 @@ impl EditorApp {
             landing: None,
             importing: None,
             requests: Vec::new(),
+            images: Images::default(),
+            wanted: HashSet::new(),
             saved_in: None,
             naming: false,
             renaming: None,
@@ -1066,6 +1119,12 @@ impl EditorApp {
             }
         }
         self.layout.paint(viewport, &mut list);
+        // A picture the shell has not handed over is asked for once, and its place is kept until it comes.
+        for asset in awaited(&self.images, self.scheme, &mut list) {
+            if self.wanted.insert(asset.clone()) {
+                self.requests.push(Request::Asset(asset));
+            }
+        }
         // A formula that was just closed still has its source over it, on the way out.
         match self.maths.closing().map(|at| self.layout.formula_rect(at)) {
             Some(Some(rect)) => self.maths.blend(rect, self.palette.text, &mut list),
@@ -2124,6 +2183,41 @@ impl Paint for PagePaint {
 
 fn fill(rect: Rect, color: Color) -> Item {
     Item::Fill { rect, color, radius: 0.0 }
+}
+
+/// Keeps the place of each picture in `list` that is not among `images`: a quiet box with the sign of a
+/// picture in it, under where the picture will be drawn. Returns the assets that are awaited.
+fn awaited(images: &Images, scheme: Scheme, list: &mut DisplayList) -> Vec<String> {
+    let missing = |item: &Item| matches!(item, Item::Image { asset, .. } if images.get(asset).is_none());
+    if !list.items.iter().any(missing) {
+        return Vec::new();
+    }
+    // The box is of one piece: a picture that comes with clear parts has the page behind them, not the box.
+    let ground = resolve(blend(tokens::SURFACE, tokens::FG, 0.06), scheme, 1.0);
+    let sign = resolve(tokens::FG_SUBTLE, scheme, 1.0);
+    let mut assets = Vec::new();
+    let mut items = Vec::with_capacity(list.items.len() + 2);
+    for item in std::mem::take(&mut list.items) {
+        if let Item::Image { rect, asset } = &item
+            && images.get(asset).is_none()
+        {
+            items.push(Item::Fill { rect: *rect, color: ground, radius: 2.0 });
+            if rect.width.min(rect.height) >= AWAITED.0 {
+                let (x, y) = (rect.x + (rect.width - AWAITED.1) / 2.0, rect.y + (rect.height - AWAITED.1) / 2.0);
+                items.push(Item::Path {
+                    origin: Point { x, y },
+                    scale: AWAITED.1 / icon::GRID,
+                    path: icon::IMAGE.outline(),
+                    color: sign,
+                    stroke: Some(tokens::ICON_STROKE),
+                });
+            }
+            assets.push(asset.clone());
+        }
+        items.push(item);
+    }
+    list.items = items;
+    assets
 }
 
 /// The colours the page is painted in. The light page is the one documents are styled for and exports use.
