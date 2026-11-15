@@ -16,6 +16,7 @@ use std::time::Duration;
 use letters_api::{Code, Opened, paths};
 use letters_model::{Model, Notes, Selection, Style};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
+use sha2::{Digest, Sha256};
 use ureq::http::Uri;
 
 use crate::keychain::Keychain;
@@ -150,6 +151,16 @@ pub fn reach(session: &Session, id: &str, home: &Path) -> Result<Reached, Unreac
     Ok(Reached { opened, path, online: true })
 }
 
+/// One picture of a server's document that the copy here lacks, by the name the document has for it:
+/// `assets/HASH.png`. `None` when the server has none of that name, and when what it sent is not the
+/// picture: a name is the hash of what it names. This waits on the network.
+pub fn picture(session: &Session, id: &str, name: &str) -> Option<Vec<u8>> {
+    let short = name.strip_prefix("assets/")?;
+    let bytes = session.asset(id, short, session.limits().ok()?.asset).ok()?;
+    let hash: String = Sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+    (short.split('.').next() == Some(hash.as_str())).then_some(bytes)
+}
+
 /// How long a person has at the browser to sign in.
 const SIGN_IN_WITHIN: Duration = Duration::from_secs(300);
 
@@ -248,6 +259,11 @@ impl Line {
         let address = session.server().socket(&opened.socket);
         let sync = Syncing::new(opened.id.clone());
         Self { session, address, roots, sync, socket: None, sockets: 0, tell, denied: false, ended: None }
+    }
+
+    /// The session the line asks its server with.
+    pub fn session(&self) -> &Arc<Session> {
+        &self.session
     }
 
     /// Goes online. Only once the file's history is attached to the editor's model.

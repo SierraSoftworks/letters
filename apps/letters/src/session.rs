@@ -5,7 +5,7 @@
 //! works once, so two must never go out together.
 
 use std::fmt;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use letters_api::{Code, Entry, Limits, Listing, Opened, Person, Space, Token, paths};
@@ -24,6 +24,8 @@ pub struct Session {
     /// `None` where the system has no keychain: the session then lasts as long as the app is open.
     keychain: Option<Keychain>,
     held: Mutex<Held>,
+    /// What the server holds its callers to, once it was asked.
+    limits: OnceLock<Limits>,
 }
 
 struct Held {
@@ -44,13 +46,18 @@ impl Session {
     /// signed out since. Nothing is asked of the server.
     pub fn kept(server: Client, keychain: Keychain) -> Result<Option<Self>, Unkept> {
         let Some(token) = kept(&keychain, &server)? else { return Ok(None) };
-        Ok(Some(Self { server, keychain: Some(keychain), held: Mutex::new(Held { token, unkept: None }) }))
+        Ok(Some(Self {
+            server,
+            keychain: Some(keychain),
+            held: Mutex::new(Held { token, unkept: None }),
+            limits: OnceLock::new(),
+        }))
     }
 
     /// The session a sign-in ended in, which is kept from here on.
     pub fn begin(server: Client, keychain: Option<Keychain>, token: Token) -> Self {
         let unkept = keep(keychain.as_ref(), &server, &token).err();
-        Self { server, keychain, held: Mutex::new(Held { token, unkept }) }
+        Self { server, keychain, held: Mutex::new(Held { token, unkept }), limits: OnceLock::new() }
     }
 
     pub fn server(&self) -> &Client {
@@ -98,9 +105,13 @@ impl Session {
         }
     }
 
-    /// What the server holds its callers to. Needs no session, but is asked beside one.
+    /// What the server holds its callers to, asked once. Needs no session, but is asked beside one.
     pub fn limits(&self) -> Result<Limits, Refused> {
-        Ok(self.server.discover()?.limits)
+        if let Some(limits) = self.limits.get() {
+            return Ok(*limits);
+        }
+        let limits = self.server.discover()?.limits;
+        Ok(*self.limits.get_or_init(|| limits))
     }
 
     /// Every space the person reaches.

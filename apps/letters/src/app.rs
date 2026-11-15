@@ -145,6 +145,9 @@ pub enum Event {
     Reached(Option<WindowId>, Result<Box<(Arc<Session>, Reached)>, String>),
     /// The socket of this number, to the server of a window's document, has something to say.
     Heard(WindowId, u64, Heard),
+    /// A picture of this name, which the copy of a window's document lacked, was asked of the document's
+    /// server: its file, if the server had it.
+    Brought(WindowId, String, Option<Vec<u8>>),
 }
 
 impl From<accesskit_winit::Event> for Event {
@@ -434,6 +437,10 @@ struct Remote {
     selection: Option<Selection>,
     /// Whether the person was told why the server ended the line.
     said: bool,
+    /// The pictures the server was asked for, each once.
+    asked: BTreeSet<String>,
+    /// Pictures the copy lacks, until the server is asked for them.
+    lacking: Vec<String>,
 }
 
 impl Remote {
@@ -818,6 +825,10 @@ impl DocWindow {
             }
             // A file that does not hold it yet may once the read or the save under way is done.
             None if self.busy() => self.awaited.push(name),
+            // The copy of a server's document lacks what others put in since it was brought here.
+            None if self.remote.as_mut().is_some_and(|remote| remote.asked.insert(name.clone())) => {
+                self.remote.iter_mut().for_each(|remote| remote.lacking.push(name.clone()));
+            }
             None => self.view.set_image(&name, None),
             Some(image) => {
                 // A picture that is held whole has nothing sharper to give.
@@ -1181,6 +1192,8 @@ impl DocWindow {
             style,
             selection: None,
             said: false,
+            asked: BTreeSet::new(),
+            lacking: Vec::new(),
         });
         self.recomment();
         self.located = None;
@@ -3053,6 +3066,30 @@ impl ApplicationHandler<Event> for App {
             Event::Picture(id, asset, image, within) => {
                 let Some(window) = self.windows.get_mut(&id) else { return };
                 window.picture(asset, image, within);
+                // What the copy of a server's document lacks is asked of the server.
+                let Some(remote) = &mut window.remote else { return };
+                for name in std::mem::take(&mut remote.lacking) {
+                    let (session, document) = (remote.line.session().clone(), remote.opened.id.clone());
+                    let proxy = self.proxy.clone();
+                    self.fetching.run(move || {
+                        let brought = connected::picture(&session, &document, &name);
+                        let _ = proxy.send_event(Event::Brought(id, name, brought));
+                    });
+                }
+            }
+            Event::Brought(id, name, brought) => {
+                let Some(window) = self.windows.get_mut(&id) else { return };
+                match brought {
+                    Some(bytes) => {
+                        // No edit, but the copy is to hold it: it goes in with the next save.
+                        window.assets.insert(name.clone(), bytes);
+                        window.marks = true;
+                        window.save_at.get_or_insert(now + SAVE_AFTER);
+                        window.want(name, &mut self.decoder, &self.proxy);
+                    }
+                    None => window.view.set_image(&name, None),
+                }
+                window.sync(now);
             }
             Event::Previewed(id, url, found) => {
                 if let Some(window) = self.windows.get_mut(&id) {

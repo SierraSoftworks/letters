@@ -83,6 +83,17 @@ fn spaces() -> Vec<Space> {
     vec![Space { id: "ada".into(), name: "Ada".into(), kind: SpaceKind::Personal, role: Role::Owner }]
 }
 
+/// A small picture's file.
+fn png() -> Vec<u8> {
+    letters::pictures::from_rgba(4, 2, &[0x80; 32]).unwrap().bytes
+}
+
+/// The name the server holds that picture under: the hash of its bytes.
+fn held() -> String {
+    let hash: String = Sha256::digest(png()).iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{hash}.png")
+}
+
 /// What the server says of its one document.
 fn opened() -> Opened {
     Opened {
@@ -152,6 +163,11 @@ impl Letters {
             "GET /api/v1/documents/d1" => json(&opened()),
             "GET /api/v1/documents/d1/file" => Answer("200 OK", "content-type: application/zip\r\n", FILE.to_vec()),
             "PUT /api/v1/documents/d1/assets/sky.png" => Answer("204 No Content", "", Vec::new()),
+            // A picture is asked for by the hash of its bytes, and one name gets another's bytes.
+            line if line.strip_prefix("GET /api/v1/documents/d1/assets/").is_some_and(|name| name == held()) => {
+                Answer("200 OK", "content-type: image/png\r\n", png())
+            }
+            "GET /api/v1/documents/d1/assets/0000.png" => Answer("200 OK", "content-type: image/png\r\n", png()),
             "GET /api/v1/forbidden" => said(Code::Forbidden, "That is not yours to read."),
             "GET /api/v1/elsewhere" => Answer("302 Found", "location: https://elsewhere.example/\r\n", Vec::new()),
             "GET /api/v1/page" => {
@@ -334,7 +350,7 @@ fn a_document_and_its_pictures_travel_whole() {
     let server = Server::start();
     server.letters.lock().unwrap().issued = 1;
     let client = server.client();
-    let picture = letters::pictures::from_rgba(4, 2, &[0x80; 32]).unwrap().bytes;
+    let picture = png();
 
     assert_eq!(client.file("token-1", "d1", 1024).as_deref(), Ok(FILE));
     assert_eq!(client.file("token-1", "d1", 4), Err(Refused::TooLarge));
@@ -624,4 +640,20 @@ fn nobody_is_sent_to_sign_in_at_what_is_no_letters_server() {
     let entered = connected::enter(&stranger, "d1", None, None, &home.0, &no_browser, &AtomicBool::new(false));
 
     assert!(matches!(entered, Err(Unreached::Refused(Refused::Unreachable(_)))));
+}
+
+#[test]
+fn a_picture_the_copy_lacks_is_had_from_the_server_only_as_what_its_name_says() {
+    let server = Server::start();
+    let session = server.session();
+    let cases = [
+        (format!("assets/{}", held()), Some(png())),
+        // Bytes that are not what the name says are no picture of the document.
+        ("assets/0000.png".to_owned(), None),
+        ("assets/gone.png".to_owned(), None),
+        (held(), None),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(connected::picture(&session, "d1", &name), expected, "{name}");
+    }
 }
