@@ -22,7 +22,10 @@ use letters_render::{Color, DisplayList, Point, Size};
 use letters_spell::Dictionary;
 use letters_trust::Trust;
 // The editor's window is the view here, where `Window` is the system's.
-use letters_ui::{Chrome, Cursor, Edge, Frame, Landing, Location, Request, SaveState, Scheme, Window as View, tokens};
+use letters_ui::{
+    Appearance, Chrome, Cursor, Edge, Frame, Landing, Location, Request, SaveState, Scheme, Settings, Window as View,
+    tokens,
+};
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -45,6 +48,7 @@ use crate::library::{Library, Place, Recent, Refused, UNTITLED, has_content};
 use crate::measure::{FIRST_FRAME, Launch, Typing};
 use crate::platform::{self, Desktop};
 use crate::present::{Painter, Presenter};
+use crate::settings;
 use crate::trust::{self, Trusted};
 use crate::words::{self, Words};
 use crate::writer;
@@ -79,8 +83,10 @@ pub enum Event {
     Motion(bool),
     /// The desktop has said which buttons its windows carry.
     Buttons(Buttons),
-    /// The name of the person writing has been found.
-    Writer(String),
+    /// What the person's account calls them has been found.
+    Account(String),
+    /// The languages the system has dictionaries for have been listed.
+    Languages(Vec<String>),
     /// A picture that was put into a window's document is ready to draw, under its asset's name.
     Picture(WindowId, String, Image),
     /// A system dictionary a window's document asked for has been read, under the name it has on disk.
@@ -101,6 +107,10 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
     let event_loop = event_loop(report_launch)?;
     let home = std::env::home_dir().unwrap_or_default();
     launch.mark("event loop built");
+    // The first frame is drawn light or dark and in the person's accent, so this one small file is read
+    // before it. A run that only measures is the same for everyone.
+    let measuring = options.mode != Mode::Edit;
+    let settings = if measuring { Settings::default() } else { settings::load(&home) };
     let mut app = App {
         starting: true,
         report_launch,
@@ -120,7 +130,9 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         dictionaries: dictionaries::system_folders(&home).into(),
         reduced_motion: false,
         buttons: Buttons::guess(),
-        writer: None,
+        settings,
+        account: None,
+        languages: Vec::new(),
         gpu: match std::env::var("LETTERS_RENDERER").as_deref() {
             Ok("cpu") => GpuState::Off,
             Ok("gpu") => GpuState::Wanted { software: true },
@@ -252,8 +264,13 @@ struct App {
     reduced_motion: bool,
     /// The buttons the desktop's windows carry: a guess until it has been asked, after the first frame.
     buttons: Buttons,
-    /// The name edits are signed with, once it has been found, after the first frame.
-    writer: Option<String>,
+    /// What the person set for themselves.
+    settings: Settings,
+    /// What the person's account calls them, once it has been found, after the first frame. Edits are
+    /// signed with it while the settings give no name.
+    account: Option<String>,
+    /// The languages the system has dictionaries for, once they have been listed, after the first frame.
+    languages: Vec<String>,
     gpu: GpuState,
     windows: HashMap<WindowId, DocWindow>,
     mods: ModifiersState,
@@ -299,6 +316,8 @@ struct DocWindow {
     access_whole: bool,
     /// The frame the view was last told to draw.
     chrome: Chrome,
+    /// Whether the person set the window light or dark, or left it to the system.
+    appearance: Appearance,
     /// The height of the unified title bar the system gave the window, which the bar then fills.
     bar: Option<f32>,
     /// When the view next wants a frame without being asked, on the editor's clock.
@@ -399,7 +418,31 @@ impl DocWindow {
     }
 
     fn dark(&self) -> bool {
-        self.window.theme() == Some(Theme::Dark)
+        match self.appearance {
+            Appearance::System => self.window.theme() == Some(Theme::Dark),
+            Appearance::Light => false,
+            Appearance::Dark => true,
+        }
+    }
+
+    /// Follows what the person set, at the start and whenever it changes in any window. `writer` is the
+    /// name their edits carry: the one they set, or else their account's once that is known.
+    fn follow(&mut self, settings: &Settings, writer: Option<&str>) {
+        if *self.view.settings() != *settings {
+            self.view.set_settings(settings.clone());
+        }
+        if let Some(writer) = writer {
+            self.view.set_author(writer);
+        }
+        self.appearance = settings.appearance;
+        // What the system draws of the window goes light or dark with it: a title bar, or its buttons.
+        self.window.set_theme(match settings.appearance {
+            Appearance::System => None,
+            Appearance::Light => Some(Theme::Light),
+            Appearance::Dark => Some(Theme::Dark),
+        });
+        self.fit();
+        self.window.request_redraw();
     }
 
     /// Where the document's file is, once it has been written. A journal builds on the file it is told of.
@@ -960,7 +1003,11 @@ impl App {
                 (document, style, home.map_or_else(Place::new, Place::at), rest)
             }
             None => {
-                let (document, style) = (files::blank(), new_style());
+                let (mut document, style) = (files::blank(), new_style());
+                // A new document is written in the person's language.
+                if let Some(language) = &self.settings.language {
+                    document.language.clone_from(language);
+                }
                 let rest = Rest::new(&document, &style);
                 (document, style, Place::new(), rest)
             }
@@ -991,6 +1038,7 @@ impl App {
             access_stale: false,
             access_whole: true,
             chrome: Chrome::default(),
+            appearance: Appearance::System,
             bar,
             wake_ms: None,
             place,
@@ -1020,9 +1068,8 @@ impl App {
             assets: BTreeMap::new(),
         };
         window.view.set_reduced_motion(self.reduced_motion);
-        if let Some(writer) = &self.writer {
-            window.view.set_author(writer);
-        }
+        window.view.set_account_name(self.account.as_deref());
+        window.view.set_languages(&self.languages);
         if !window.place.naming() {
             window.view.set_document_name(&window.place.name());
         }
@@ -1032,7 +1079,7 @@ impl App {
         window.retrust(self.trust.trust());
         window.retitle();
         window.reframe(&self.buttons);
-        window.fit();
+        window.follow(&self.settings, self.writer());
         self.mark("laid out");
         window.window.set_visible(true);
         self.mark("window shown");
@@ -1104,6 +1151,7 @@ impl App {
                     }
                 }
                 Request::SaveDefaultStyle(json) => self.keep_style(id, &json),
+                Request::Settings(settings) => self.keep_settings(id, settings),
                 Request::ImportStyle => {
                     let Some(window) = self.windows.get_mut(&id) else { continue };
                     let dialog = FileDialog::new().add_filter(STYLESHEETS, &[STYLESHEET]);
@@ -1135,6 +1183,25 @@ impl App {
         if served && let Some(window) = self.windows.get_mut(&id) {
             window.access_stale = true;
             window.sync(now);
+        }
+    }
+
+    /// The name the person's edits carry: the one they set, or else their account's.
+    fn writer(&self) -> Option<&str> {
+        self.settings.name.as_deref().or(self.account.as_deref())
+    }
+
+    /// Keeps what the person set in one window, and has every window follow it. Settings that could not
+    /// be written still hold until the app closes, and the window that asked says so.
+    fn keep_settings(&mut self, id: WindowId, settings: Settings) {
+        let kept = settings::keep(&std::env::home_dir().unwrap_or_default(), &settings);
+        self.settings = settings;
+        let writer = self.settings.name.as_deref().or(self.account.as_deref());
+        self.windows.values_mut().for_each(|window| window.follow(&self.settings, writer));
+        if let (Err(error), Some(window)) = (kept, self.windows.get(&id)) {
+            window.alert(&format!(
+                "Your settings could not be kept, and will last only until Letters closes.\n\n{error}"
+            ));
         }
     }
 
@@ -1328,11 +1395,11 @@ impl ApplicationHandler<Event> for App {
                         eprintln!("letters: nothing is trusted, since {error}");
                     }
                     // The desktop is asked over D-Bus, which is not worth holding a frame for.
-                    let proxy = self.proxy.clone();
+                    let (proxy, folders) = (self.proxy.clone(), self.dictionaries.clone());
                     thread::spawn(move || {
                         // First, since it is wanted before the first edit.
-                        if let Some(writer) = std::env::home_dir().and_then(|home| writer::find(&home)) {
-                            let _ = proxy.send_event(Event::Writer(writer));
+                        if let Some(account) = writer::account() {
+                            let _ = proxy.send_event(Event::Account(account));
                         }
                         if let Some(reduced) = chrome::reduced_motion() {
                             let _ = proxy.send_event(Event::Motion(reduced));
@@ -1340,6 +1407,9 @@ impl ApplicationHandler<Event> for App {
                         if let Some(buttons) = Buttons::ask().filter(|_| Host::HERE == Host::Linux) {
                             let _ = proxy.send_event(Event::Buttons(buttons));
                         }
+                        // Last, since only the settings offer them.
+                        let languages = dictionaries::installed(&folders).into_iter().collect();
+                        let _ = proxy.send_event(Event::Languages(languages));
                     });
                 }
                 if let Some(run) = &mut self.typing
@@ -1527,9 +1597,19 @@ impl ApplicationHandler<Event> for App {
                 window.presenter.show(asset, image);
                 window.window.request_redraw();
             }
-            Event::Writer(name) => {
-                self.windows.values_mut().for_each(|window| window.view.set_author(&name));
-                self.writer = Some(name);
+            Event::Account(name) => {
+                self.account = Some(name);
+                let writer = self.settings.name.as_deref().or(self.account.as_deref());
+                for window in self.windows.values_mut() {
+                    window.view.set_account_name(self.account.as_deref());
+                    if let Some(writer) = writer {
+                        window.view.set_author(writer);
+                    }
+                }
+            }
+            Event::Languages(languages) => {
+                self.languages = languages;
+                self.windows.values_mut().for_each(|window| window.view.set_languages(&self.languages));
             }
             Event::Buttons(buttons) => {
                 self.buttons = buttons;

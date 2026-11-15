@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use letters::dictionaries::{find, languages, load};
+use letters::dictionaries::{find, installed, languages, load};
 use letters_model::{Block, BlockKind, Body, Document, Run};
 
 /// Folders of dictionaries for one test, removed when the test ends.
@@ -130,4 +130,16 @@ fn a_language_without_a_usable_dictionary_is_left_alone() {
     for language in ["es", "it"] {
         assert!(load(&shelves.folders(&[""]), language).is_none(), "{language}");
     }
+}
+
+#[test]
+fn the_languages_with_a_dictionary_are_listed_once_each() {
+    let shelves = Shelves::new("installed");
+    shelves.stock("own", &["de_DE", "de_DE_frami", "pt_BR", "en_ZA"]);
+    shelves.stock("shared", &["de_DE", "fr", "notes"]);
+    // Half a dictionary is none.
+    fs::write(shelves.0.join("shared/nl_NL.aff"), b"SET UTF-8\n").unwrap();
+    let listed = installed(&shelves.folders(&["own", "shared", "missing"]));
+    // English is built in, so the system's is not offered a second time.
+    assert_eq!(Vec::from_iter(listed), ["de-DE", "fr", "pt-BR"]);
 }

@@ -83,6 +83,21 @@ pub fn system_folders(home: &Path) -> Vec<PathBuf> {
     folders
 }
 
+/// The languages the system has dictionaries for, as tags such as `de-CH`, each once. English is left out:
+/// it is built in, and never read from the system.
+pub fn installed(folders: &[PathBuf]) -> BTreeSet<String> {
+    let mut languages = BTreeSet::new();
+    for entry in folders.iter().flat_map(|folder| fs::read_dir(folder).into_iter().flatten().flatten()) {
+        let aff = entry.path();
+        let named = aff.extension().is_some_and(|extension| extension == "aff") && aff.with_extension("dic").is_file();
+        let tag = aff.file_stem().and_then(|name| name.to_str()).filter(|_| named).and_then(Tag::parse);
+        if let Some(tag) = tag.filter(|tag| tag.language != "en") {
+            languages.insert(tag.written());
+        }
+    }
+    languages
+}
+
 /// A dictionary found on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
