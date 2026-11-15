@@ -60,7 +60,8 @@ impl fmt::Display for Failed {
             Self::Refused(error) => error.fmt(f),
             Self::Status(status) => write!(f, "the server answered {status}"),
             Self::Slow => write!(f, "the server took longer than {} seconds", LIMIT.as_secs()),
-            Self::Unreachable(reason) => write!(f, "the server could not be reached: {reason}"),
+            // The reason is the network's own wording, which is kept for whoever debugs and not shown.
+            Self::Unreachable(_) => write!(f, "the server could not be reached"),
         }
     }
 }

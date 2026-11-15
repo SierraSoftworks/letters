@@ -20,11 +20,11 @@ use letters_model::{BlockId, Model, ReplicaId, Revision, Style};
 use letters_render::image::Image;
 use letters_render::{Color, DisplayList, Point, Size};
 use letters_spell::Dictionary;
-use letters_trust::{Gate, HttpsUrl, Limits, Origin, Trust};
+use letters_trust::{FetchError, Gate, HttpsUrl, Limits, Origin, Trust};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
     Appearance, Chrome, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer, Landing, Location,
-    Request, SaveState, Scheme, Settings, Window as View, tokens,
+    PictureState, Request, SaveState, Scheme, Settings, Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -102,10 +102,9 @@ pub enum Event {
     Planned(WindowId, PathBuf, Result<Box<Plan>, String>),
     /// A file was brought in for a window and kept as a new document at this path, or could not be.
     Imported(WindowId, Result<PathBuf, String>),
-    /// A picture a window's document links to was fetched and decoded, to draw under its address.
-    Linked(WindowId, String, Image),
-    /// A picture a window's document links to was fetched, to be kept in the document by this figure.
-    Embed(WindowId, BlockId, Picture),
+    /// A picture a window's document links to, at this address, was fetched for this: its file, or why
+    /// there is none.
+    Linked(WindowId, String, Link, Result<Vec<u8>, String>),
     /// A system dictionary a window's document asked for has been read, under the name it has on disk.
     Dictionary(WindowId, String, Box<Dictionary>),
 }
@@ -423,6 +422,11 @@ struct DocWindow {
     /// Linked pictures that were asked for before the file said which document this is, which decides
     /// what it may fetch.
     links: Vec<(String, Link)>,
+    /// The files of linked pictures that are held narrower than they are, by their addresses, so that a
+    /// sharper screen does not ask their servers again.
+    linked: BTreeMap<String, Vec<u8>>,
+    /// The addresses of linked pictures that safe mode holds back.
+    withheld: BTreeSet<String>,
     /// The pictures the view was handed, and how wide each could be held at most.
     held: BTreeMap<String, u32>,
 }
@@ -433,10 +437,9 @@ struct Saving {
     result: Result<Exchange, String>,
 }
 
-/// Something a key asks of the app, not of the document.
-#[derive(Clone, Debug, PartialEq, Eq)]
 /// What a linked picture is fetched for.
-enum Link {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Link {
     /// To show, if the person's trust lets it load as its document opens.
     Open,
     /// To show this once, because the person asked.
@@ -445,6 +448,11 @@ enum Link {
     Embed(BlockId),
 }
 
+/// Why a file that is no picture after all is not shown, as it reads on from "Not loaded:".
+const NO_PICTURE: &str = "it is not a picture Letters can show";
+
+/// Something a key asks of the app, not of the document.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Action {
     New,
     /// Opens the document at a path, or one the person picks.
@@ -561,9 +569,10 @@ impl DocWindow {
     }
 
     /// Has a picture the page asked for decoded, from wherever its file is now: with this window if no
-    /// save has had it, else in the document's file.
+    /// save has had it or it was fetched, else in the document's file.
     fn want(&mut self, name: String, decoder: &mut Decoder, proxy: &EventLoopProxy<Event>) {
         let unsaved = self.assets.get(&name).or_else(|| self.copy.as_ref()?.entries.get(&name));
+        let unsaved = unsaved.or_else(|| self.linked.get(&name));
         let source = match unsaved {
             Some(bytes) => Some(Source::Bytes(bytes.clone())),
             None => self.file().map(|file| Source::Document(file.to_owned())),
@@ -583,12 +592,19 @@ impl DocWindow {
     /// Takes a picture that was decoded for the page, or the word that it could not be had.
     fn picture(&mut self, name: String, image: Option<Image>, within: u32) {
         match image {
+            None if self.linked.remove(&name).is_some() => {
+                self.view.set_picture_state(&name, Some(PictureState::Failed(NO_PICTURE.to_owned())));
+            }
             // A file that does not hold it yet may once the read or the save under way is done.
             None if self.busy() => self.awaited.push(name),
             None => self.view.set_image(&name, None),
             Some(image) => {
+                // A linked picture that is held whole has nothing sharper to give, so its file is let go.
+                let whole = image.width() < within && self.linked.remove(&name).is_some();
                 self.view.set_image(&name, Some(image));
-                self.held.insert(name, within);
+                if !whole {
+                    self.held.insert(name, within);
+                }
             }
         }
         self.window.request_redraw();
@@ -1200,6 +1216,8 @@ impl App {
             dropped: Vec::new(),
             awaited: Vec::new(),
             links: Vec::new(),
+            linked: BTreeMap::new(),
+            withheld: BTreeSet::new(),
             held: BTreeMap::new(),
         };
         window.view.set_reduced_motion(self.reduced_motion);
@@ -1440,6 +1458,7 @@ impl App {
         let done = window.replace(&self.library, now, change);
         // A trusted folder vouches for what is in it, so a move can change how the document is treated.
         window.retrust(self.trust.trust());
+        self.release(id);
         done
     }
 
@@ -1488,7 +1507,7 @@ impl App {
     }
 
     /// Fetches a picture a window's document links to, off this thread, if the document may: one that
-    /// may not keeps its frame. Linked pictures are fetched a few at a time.
+    /// may not keeps its frame, and its cloud says why. Linked pictures are fetched a few at a time.
     fn link(&mut self, id: WindowId, src: String, link: Link) {
         let Some(window) = self.windows.get_mut(&id) else { return };
         if !window.made_here && window.id.is_none() {
@@ -1499,21 +1518,57 @@ impl App {
             Link::Open => gate.fetch_on_open(&src, limits),
             Link::Once | Link::Embed(_) => gate.fetch_on_request(&src, limits),
         };
-        let Ok(guard) = guard else { return };
-        let (proxy, within) = (self.proxy.clone(), window.widest());
-        self.fetching.run(move || {
-            let Ok(fetched) = remote::fetch(guard, &Roots::System) else { return };
-            let event = match link {
-                Link::Embed(figure) => pictures::read(fetched.bytes).map(|picture| Event::Embed(id, figure, picture)),
-                Link::Open | Link::Once => {
-                    let image = Image::decode_within(&fetched.bytes, within).ok();
-                    image.map(|image| Event::Linked(id, src, image))
-                }
-            };
-            if let Some(event) = event {
-                let _ = proxy.send_event(event);
+        window.withheld.remove(&src);
+        let state = match &guard {
+            Ok(_) => Some(PictureState::Loading),
+            Err(FetchError::Held) => {
+                window.withheld.insert(src.clone());
+                Some(PictureState::Held)
             }
+            // It waits to be asked for, as any picture from a host the person has not said they trust.
+            Err(FetchError::UntrustedSource) => None,
+            Err(error) => Some(PictureState::Failed(error.to_string())),
+        };
+        window.view.set_picture_state(&src, state);
+        let Ok(guard) = guard else { return };
+        let proxy = self.proxy.clone();
+        self.fetching.run(move || {
+            let fetched = remote::fetch(guard, &Roots::System);
+            let fetched = fetched.map(|fetched| fetched.bytes).map_err(|failed| failed.to_string());
+            let _ = proxy.send_event(Event::Linked(id, src, link, fetched));
         });
+    }
+
+    /// Takes a linked picture's file from its fetch, to show or to keep in the document, or tells the
+    /// window why there is none.
+    fn linked(&mut self, id: WindowId, src: String, link: Link, fetched: Result<Vec<u8>, String>) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        let failed = |reason: &str| Some(PictureState::Failed(reason.to_owned()));
+        match (fetched, link) {
+            (Err(reason), _) => window.view.set_picture_state(&src, failed(&reason)),
+            (Ok(bytes), Link::Embed(figure)) => match pictures::read(bytes) {
+                Some(picture) => {
+                    window.view.set_picture_state(&src, None);
+                    window.view.embed_picture(&figure, picture, &mut self.platform);
+                    window.keep(self.platform.take_assets());
+                }
+                None => window.view.set_picture_state(&src, failed(NO_PICTURE)),
+            },
+            // It is decoded as any picture of the document is, and again for a sharper screen.
+            (Ok(bytes), Link::Open | Link::Once) => {
+                window.linked.insert(src.clone(), bytes);
+                window.want(src, &mut self.decoder, &self.proxy);
+            }
+        }
+    }
+
+    /// Asks again about the linked pictures safe mode held back in a window, whose document may be
+    /// trusted now.
+    fn release(&mut self, id: WindowId) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        for src in std::mem::take(&mut window.withheld) {
+            self.link(id, src, Link::Open);
+        }
     }
 
     /// Keeps the host of a linked picture as one whose pictures load from now on.
@@ -1981,16 +2036,11 @@ impl ApplicationHandler<Event> for App {
                 let Some(window) = self.windows.get_mut(&id) else { return };
                 window.picture(asset, image, within);
             }
-            Event::Linked(id, src, image) => {
-                let Some(window) = self.windows.get_mut(&id) else { return };
-                window.view.set_image(&src, Some(image));
-                window.sync(now);
-            }
-            Event::Embed(id, figure, picture) => {
-                let Some(window) = self.windows.get_mut(&id) else { return };
-                window.view.embed_picture(&figure, picture, &mut self.platform);
-                window.keep(self.platform.take_assets());
-                window.sync(now);
+            Event::Linked(id, src, link, fetched) => {
+                self.linked(id, src, link, fetched);
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.sync(now);
+                }
             }
             Event::Planned(id, path, plan) => self.offer(id, &path, plan),
             Event::Imported(id, kept) => self.imported(event_loop, id, kept),
