@@ -8,7 +8,7 @@ use crate::icon::{self, Icon};
 use crate::style::{Align, Dir, Edges, Look};
 use crate::text::{Family, TextStyle};
 use crate::tokens;
-use crate::widgets::Popover;
+use crate::widgets::{Popover, Side};
 
 const ICON: f32 = 16.0;
 
@@ -32,6 +32,7 @@ pub struct MenuItem<M> {
     tone: Tone,
     disabled: bool,
     on_select: Option<M>,
+    more: Option<Box<Menu<M>>>,
 }
 
 impl<M> MenuItem<M> {
@@ -45,6 +46,7 @@ impl<M> MenuItem<M> {
             tone: Tone::Default,
             disabled: false,
             on_select: None,
+            more: None,
         }
     }
 
@@ -83,6 +85,12 @@ impl<M> MenuItem<M> {
 
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Makes the item open a menu of its own beside it, in place of being chosen.
+    pub fn submenu(mut self, menu: Menu<M>) -> Self {
+        self.more = Some(Box::new(menu));
         self
     }
 
@@ -170,6 +178,8 @@ impl<M> From<Menu<M>> for Element<M> {
             element = element.label(label);
         }
 
+        // Where any item has an icon, the labels of all of them line up after it.
+        let iconed = menu.entries.iter().any(|entry| matches!(entry, Entry::Item(item) if item.icon.is_some()));
         let mut danger_before = None;
         let mut ruled = true;
         let mut leads = menu.leads;
@@ -210,7 +220,7 @@ impl<M> From<Menu<M>> for Element<M> {
                     danger_before = Some(item.tone == Tone::Danger);
                     let first = leads && !item.disabled;
                     leads &= !first;
-                    element = element.child(row(item, first));
+                    element = element.child(row(item, first, iconed));
                 }
             }
         }
@@ -223,7 +233,7 @@ fn rule<M>() -> Element<M> {
     Element::column().padding(Edges::xy(0.0, tokens::SPACE_XS)).child(line).decorative()
 }
 
-fn row<M>(item: MenuItem<M>, leads: bool) -> Element<M> {
+fn row<M>(item: MenuItem<M>, leads: bool, iconed: bool) -> Element<M> {
     let (fg, active) = match item.tone {
         Tone::Default => (tokens::FG, tokens::NEUTRAL_SOFT),
         Tone::Warn => (tokens::WARN, tokens::NEUTRAL_SOFT),
@@ -241,13 +251,18 @@ fn row<M>(item: MenuItem<M>, leads: bool) -> Element<M> {
         .grow(1.0)
         .role(if item.checked.is_some() { Role::MenuItemCheckBox } else { Role::MenuItem })
         .focusable()
-        .closes()
         .disabled(item.disabled);
+    // An item with a menu of its own leaves this one open for it.
+    if item.more.is_none() {
+        row = row.closes();
+    }
     if item.disabled {
         row = row.opacity(tokens::DISABLED_OPACITY);
     }
     if let Some(icon) = item.icon {
         row = row.child(Element::icon(icon, ICON).fg(fade(fg, 0.7)));
+    } else if iconed {
+        row = row.child(Element::row().width(ICON).height(ICON));
     }
     row = row.child(Element::text(item.label, TextStyle::control().family(item.face)).grow(1.0));
     let trailing = Edges::left(tokens::SPACE_XS);
@@ -260,7 +275,11 @@ fn row<M>(item: MenuItem<M>, leads: bool) -> Element<M> {
         let tick = if checked { Element::icon(icon::CHECK, ICON) } else { Element::row().width(ICON).height(ICON) };
         row = row.child(Element::row().padding(trailing).child(tick)).checked(checked);
     }
-    if let Some(message) = item.on_select {
+    if let Some(more) = item.more {
+        let arrow = Element::icon(icon::CHEVRON_RIGHT, ICON).fg(tokens::FG_MUTED);
+        row = row.child(Element::row().padding(trailing).child(arrow));
+        row = row.popover(Popover::new(*more).list(HasPopup::Menu).side(Side::Right).gap(2.0).nested());
+    } else if let Some(message) = item.on_select {
         row = row.on_press(message);
     }
     if leads {

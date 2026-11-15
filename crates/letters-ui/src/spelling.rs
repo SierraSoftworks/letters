@@ -133,6 +133,42 @@ impl Spelling {
         self.fix = Some(Fix { block: pos.block.clone(), range, word, suggestions });
     }
 
+    /// The misspelled word after `from`, or the one before it, going on round the document's ends. What
+    /// still waits to be checked is checked first, so that the answer is about the whole document.
+    pub fn next(
+        &mut self,
+        doc: &Document,
+        from: Option<&Pos>,
+        back: bool,
+        layout: &mut DocLayout,
+    ) -> Option<(BlockId, Range<usize>)> {
+        while !self.done {
+            self.check(BATCH, doc, None, false, layout);
+        }
+        // Every block in the order it is read, and the words marked in each.
+        fn read<'a>(blocks: &'a [letters_model::Block], order: &mut Vec<&'a BlockId>) {
+            for block in blocks {
+                order.push(&block.id);
+                read(block.body.blocks(), order);
+            }
+        }
+        let mut order = Vec::new();
+        read(&doc.blocks, &mut order);
+        let words = order
+            .iter()
+            .enumerate()
+            .flat_map(|(at, block)| self.proofing.marks(block).iter().map(move |word| (at, *block, word.clone())));
+        let words: Vec<_> = words.collect();
+        let here = from.and_then(|from| Some((order.iter().position(|block| **block == from.block)?, from.offset)));
+        let found = match (here, back) {
+            (None, false) => words.first(),
+            (None, true) => words.last(),
+            (Some(here), false) => words.iter().find(|(at, _, word)| (*at, word.start) > here).or(words.first()),
+            (Some(here), true) => words.iter().rev().find(|(at, _, word)| (*at, word.end) < here).or(words.last()),
+        };
+        found.map(|(_, block, word)| ((*block).clone(), word.clone()))
+    }
+
     /// Accepts a word from now on as one of the person's own.
     pub fn learn(&mut self, word: &str) {
         self.mine.insert(word.to_owned());

@@ -154,21 +154,19 @@ fn before(window: &mut Harness) -> Option<Found> {
     window.controls().into_iter().find(|found| found.role == Role::Note && found.name.starts_with("Before"))
 }
 
-/// What is tinted as only the earlier version's, and as only the later one's.
+/// What is filled with one of the toolkit's colours.
+fn filled(window: &mut Harness, ink: tokens::Color) -> Vec<Rect> {
+    let tint = Color::rgba(ink.light.r, ink.light.g, ink.light.b, ink.light.a);
+    let fills = window.paint().items.into_iter().filter_map(|item| match item {
+        Item::Fill { rect, color, .. } if color == tint => Some(rect),
+        _ => None,
+    });
+    fills.collect()
+}
+
+/// What is tinted as only the earlier version's, which is red, and as only the later one's, which is green.
 fn tinted(window: &mut Harness) -> [Vec<Rect>; 2] {
-    let fills: Vec<(Rect, Color)> = window
-        .paint()
-        .items
-        .into_iter()
-        .filter_map(|item| match item {
-            Item::Fill { rect, color, .. } => Some((rect, color)),
-            _ => None,
-        })
-        .collect();
-    [tokens::WARN_SOFT, tokens::INFO_SOFT].map(|ink| {
-        let tint = Color::rgba(ink.light.r, ink.light.g, ink.light.b, ink.light.a);
-        fills.iter().filter(|(_, color)| *color == tint).map(|(rect, _)| *rect).collect()
-    })
+    [tokens::DANGER_SOFT, tokens::OK_SOFT].map(|ink| filled(window, ink))
 }
 
 /// How many stretches of words are marked as only the earlier version's, and as only the later one's.
@@ -181,6 +179,24 @@ fn marked(window: &mut Harness) -> [usize; 2] {
 fn bands(window: &mut Harness) -> [Vec<Rect>; 2] {
     let area = area(window);
     tinted(window).map(|tinted| tinted.into_iter().filter(|rect| rect.width >= area.width).collect())
+}
+
+/// The shadows that fall where the version shows: what casts each, and the part of the window it is kept
+/// to, if it is kept to one.
+fn shadows(window: &mut Harness) -> Vec<(Rect, Option<Rect>)> {
+    let area = area(window);
+    let (mut clips, mut found) = (Vec::new(), Vec::new());
+    for item in window.paint().items {
+        match item {
+            Item::PushClip { rect, .. } => clips.push(rect),
+            Item::PopClip => _ = clips.pop(),
+            Item::Shadow { rect, .. } if rect.y < area.y + area.height && rect.y + rect.height > area.y => {
+                found.push((rect, clips.last().copied()));
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 /// The part of the window the version shows in.
@@ -615,6 +631,9 @@ fn a_version_shows_what_it_changed_from_the_version_before_it() {
     assert_eq!(before.value.as_deref(), Some(PLAN[1]));
     let [gone, came] = marked(&mut window);
     assert!(gone >= 2 && came >= 2, "words of both versions are marked: {gone} and {came}");
+    // The amber and blue of a conflict's two sides mark nothing: of these versions one came first.
+    let conflict = [tokens::WARN_SOFT, tokens::INFO_SOFT].map(|ink| filled(&mut window, ink).len());
+    assert_eq!(conflict, [0, 0], "nothing is in a conflict's colours");
     assert_eq!(window.markdown(), document, "the document itself is as it was");
 }
 
@@ -636,6 +655,26 @@ fn what_only_one_version_has_lies_in_a_band_across_the_page() {
     let [gone, came] = bands(&mut window);
     let (gone, came) = (gone[0], came[0]);
     assert!(gone.y + gone.height <= came.y, "down the page as the stretches are: {gone:?} and {came:?}");
+}
+
+#[test]
+fn what_was_added_lies_over_the_page_and_what_was_taken_out_under_it() {
+    let mut window = plan();
+    let [gone, came] = bands(&mut window);
+    let (gone, came) = (gone[0], came[0]);
+    let shadows = shadows(&mut window);
+    // What casts a shadow stands over what the shadow falls on.
+    let over = |caster: &Rect, band: Rect| caster.y + caster.height <= band.y;
+    let under = |caster: &Rect, band: Rect| caster.y >= band.y + band.height;
+    let is = |caster: &Rect, band: Rect| caster.y == band.y && caster.height == band.height;
+    // The band of what was added casts one on the page round it.
+    assert!(shadows.iter().any(|(caster, kept)| is(caster, came) && *kept != Some(came)), "added: {shadows:?}");
+    // The page casts one into the band of what was taken out, from each side of it. That band casts none.
+    let into: Vec<&Rect> = shadows.iter().filter(|(_, kept)| *kept == Some(gone)).map(|(caster, _)| caster).collect();
+    assert!(into.iter().any(|caster| over(caster, gone)), "taken out, from the page over it: {shadows:?}");
+    assert!(into.iter().any(|caster| under(caster, gone)), "taken out, from the page under it: {shadows:?}");
+    let cast = shadows.iter().filter(|(caster, _)| !over(caster, gone) && !under(caster, gone)).count();
+    assert_eq!(cast, 0, "taken out: {shadows:?}");
 }
 
 #[test]

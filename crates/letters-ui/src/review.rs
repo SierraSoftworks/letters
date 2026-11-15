@@ -403,8 +403,8 @@ impl Review {
                 continue;
             }
             let (first, tone) = match piece.side {
-                Side::First => (true, tokens::WARN),
-                Side::Second => (false, tokens::INFO),
+                Side::First => (true, TONES[0].1),
+                Side::Second => (false, TONES[1].1),
             };
             out.push(Item::Stroke { rect: frame, color: ink(tokens::LINE), width: 1.0, radius: 0.0 });
             out.push(fill(Rect { height: RULE, ..frame }, ink(tone)));
@@ -434,7 +434,7 @@ impl Review {
             }
             if let Some(cut) = split.shown(Side::First, view) {
                 for words in &open.words[0] {
-                    mark(&open.first.selection_in(words, cut), Side::First, scheme, out);
+                    mark(&open.first.selection_in(words, cut), Side::First, &TONES, scheme, out);
                 }
                 open.first.paint(cut, out);
             }
@@ -727,14 +727,18 @@ fn fill(rect: Rect, color: Color) -> Item {
     Item::Fill { rect, color, radius: 0.0 }
 }
 
-/// Marks the words of one version that the other does not have, under their text: amber with a dotted
-/// line for the earlier version and blue with a whole line for the later, so that the two are told apart
-/// without their colours.
-pub(crate) fn mark(lines: &[Rect], side: Side, scheme: Scheme, out: &mut DisplayList) {
-    let (soft, strong) = match side {
-        Side::First => (tokens::WARN_SOFT, tokens::WARN),
-        Side::Second => (tokens::INFO_SOFT, tokens::INFO),
-    };
+/// The soft and the strong colour of what only the first of two versions has, then of what only the
+/// second has.
+pub(crate) type Tones = [(Ink, Ink); 2];
+
+/// The two sides of a conflict are amber and blue: colours that put neither before the other.
+pub(crate) const TONES: Tones = [(tokens::WARN_SOFT, tokens::WARN), (tokens::INFO_SOFT, tokens::INFO)];
+
+/// Marks the words of one version that the other does not have, under their text and in that version's
+/// colours: with a dotted line for the first version and a whole line for the second, so that the two are
+/// told apart without their colours.
+pub(crate) fn mark(lines: &[Rect], side: Side, tones: &Tones, scheme: Scheme, out: &mut DisplayList) {
+    let (soft, strong) = tones[if side == Side::First { 0 } else { 1 }];
     let (soft, strong) = (resolve(soft, scheme, 1.0), resolve(strong, scheme, 1.0));
     for line in lines.iter().filter(|line| line.width > 0.0) {
         out.push(Item::Fill { rect: *line, color: soft, radius: 2.0 });

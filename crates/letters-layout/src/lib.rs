@@ -35,6 +35,7 @@ mod shape;
 mod split;
 mod theme;
 mod tokens;
+mod words;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -60,6 +61,7 @@ pub use crate::shape::{FontSpec, ShapedRun, ShapedText, Shaper};
 pub use crate::split::{Arrangement, Piece, Side, Split, Window};
 pub use crate::theme::CAPTION_INSET;
 pub use crate::tokens::{Token, TokenKind};
+pub use crate::words::WordList;
 
 /// The fonts layout may use. The shell supplies them, since the core never reads files.
 ///
@@ -281,6 +283,22 @@ impl DocLayout {
     /// have them.
     pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
         self.state.get_mut().engine.take_uncovered()
+    }
+
+    /// Hands over the word list of a script that is written without spaces, as [`WordList::data`] gives it.
+    /// Lines of that script then end between words. Only the blocks set without a list are laid out again,
+    /// as [`Self::add_fonts`] does. Returns whether the page may now look different: `false` for a list
+    /// that is there already, for bytes that are not that list as this build reads it (a file cut short,
+    /// or one kept from another build), and always where the lists are built in.
+    pub fn add_word_list(&mut self, list: WordList, data: &[u8]) -> bool {
+        self.state.get_mut().add_word_list(list, data)
+    }
+
+    /// The scripts met since this was last asked whose lines cannot end between words yet, since their
+    /// word list is not here: each once ever. Text is looked at as it is laid out, as for
+    /// [`Self::take_uncovered`]. Always empty where the lists are built in.
+    pub fn take_unlisted(&mut self) -> Vec<WordList> {
+        self.state.get_mut().engine.lists.take()
     }
 
     /// Says that the picture a link leads to is there to draw, with its size in pixels, or with `None` that
@@ -763,10 +781,20 @@ impl State {
             self.types = Types::resolve(style, &mut self.engine);
         }
         self.shapes.clear();
+        // A character that has its glyph now was met somewhere, if only in a marker.
+        self.redo() || backup
+    }
+
+    fn add_word_list(&mut self, list: WordList, data: &[u8]) -> bool {
+        self.engine.lists.add(list, data) && self.redo()
+    }
+
+    /// Has the leaves that were set short of something laid out again, and says whether there are any.
+    fn redo(&mut self) -> bool {
         let mut again = false;
         for leaf in self.leaves.iter_mut().filter(|leaf| leaf.short) {
             (leaf.short, leaf.exact, leaf.laid) = (false, false, None);
-            // A cell may be another width in its own face.
+            // A cell may be another width in its own face, or with its words kept whole.
             for cell in &mut leaf.cells {
                 cell.fit = None;
             }
@@ -776,8 +804,7 @@ impl State {
             again = true;
         }
         self.recount();
-        // A character that has its glyph now was met somewhere, if only in a marker.
-        again || backup
+        again
     }
 
     fn set_loaded(&mut self, src: &str, size: Option<(u32, u32)>) -> bool {

@@ -2787,6 +2787,7 @@ dependencies = [
  "letters-layout",
  "letters-model",
  "proptest",
+ "regex",
  "serde_json",
  "sha2",
  "unicode-segmentation",
@@ -2851,7 +2852,10 @@ dependencies = [
 name = "letters-layout"
 version = "0.1.0"
 dependencies = [
+ "font-test-data",
  "icu_properties",
+ "icu_provider",
+ "icu_segmenter",
  "letters-editor",
  "letters-fonts",
  "letters-math",
@@ -2860,6 +2864,7 @@ dependencies = [
  "parley",
  "parley_data",
  "proptest",
+ "zerovec",
 ]
 
 [[package]]

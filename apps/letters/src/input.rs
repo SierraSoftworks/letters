@@ -72,6 +72,7 @@ fn named_key(key: NamedKey) -> Option<Key> {
         NamedKey::End => Key::End,
         NamedKey::PageUp => Key::PageUp,
         NamedKey::PageDown => Key::PageDown,
+        NamedKey::F7 => Key::F(7),
         _ => return None,
     })
 }

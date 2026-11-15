@@ -438,6 +438,7 @@ fn named(name: &str) -> Option<Key> {
         "PageUp" => Key::PageUp,
         "PageDown" => Key::PageDown,
         "Space" => Key::Char(' '),
+        _ if name.len() > 1 && name.starts_with('F') => Key::F(name[1..].parse().ok()?),
         _ => {
             let mut chars = name.chars();
             let c = chars.next().filter(|_| chars.next().is_none())?;

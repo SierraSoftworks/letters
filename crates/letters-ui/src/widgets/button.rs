@@ -48,6 +48,7 @@ impl ControlSize {
 pub struct Button<M> {
     label: String,
     icon: Option<Icon>,
+    mark: Option<(Icon, tokens::Color)>,
     icon_only: bool,
     variant: Variant,
     size: ControlSize,
@@ -62,6 +63,7 @@ impl<M> Button<M> {
         Self {
             label: label.into(),
             icon: None,
+            mark: None,
             icon_only: false,
             variant: Variant::Default,
             size: ControlSize::Medium,
@@ -80,6 +82,12 @@ impl<M> Button<M> {
     /// An icon before the label.
     pub fn icon(mut self, icon: Icon) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// A second icon drawn over the first in a colour of its own, as the plus on a button that adds.
+    pub fn mark(mut self, mark: Icon, color: tokens::Color) -> Self {
+        self.mark = Some((mark, color));
         self
     }
 
@@ -196,7 +204,9 @@ impl<M> From<Button<M>> for Element<M> {
             element = element.pressed(pressed);
         }
         if let Some(icon) = button.icon {
-            element = element.child(Element::icon(icon, (text * 1.15).round()));
+            let size = (text * 1.15).round();
+            let mark = button.mark.map(|(mark, color)| Element::icon(mark, size).fg(color).overlay());
+            element = element.child(Element::row().child(Element::icon(icon, size)).children(mark));
         }
         if !button.icon_only {
             element = element.child(Element::text(button.label, TextStyle::control().size(text).weight(500)));

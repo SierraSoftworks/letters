@@ -543,6 +543,7 @@ impl<A: App> Ui<A> {
             }
         }
         self.update_hover();
+        self.open_nested();
         self.flush(platform);
         self.update_pointed();
     }
@@ -779,6 +780,16 @@ impl<A: App> Ui<A> {
                 self.activate(i);
                 return true;
             }
+            // A sub-menu opens with the arrow that points at it, and closes with the one that points back.
+            if event.key == Key::Right && plain && node.trigger.is_some_and(|trigger| trigger.nested) {
+                self.open.insert(node.id);
+                self.stale.view = true;
+                return true;
+            }
+            if event.key == Key::Left && plain && self.tree.layers[node.layer].nested {
+                self.close_layer(node.layer);
+                return true;
+            }
             // What the element did not use is offered to each element it sits in.
             for at in self.tree.ancestors(i).collect::<Vec<_>>() {
                 let el = &self.tree.nodes[at].el;
@@ -947,7 +958,8 @@ impl<A: App> Ui<A> {
             // A field keeps no history of its own, and the document's must not move under it.
             (Key::Char('z' | 'y'), _) if mods.primary => None,
             (Key::Enter, _) if !mods.primary && !mods.alt => {
-                let Some(message) = input.on_submit.clone() else { return false };
+                let back = input.on_submit_back.clone().filter(|_| mods.shift);
+                let Some(message) = back.or_else(|| input.on_submit.clone()) else { return false };
                 self.queue.push(message);
                 return true;
             }
@@ -1120,13 +1132,45 @@ impl<A: App> Ui<A> {
         let node = &self.tree.nodes[i];
         self.queue.extend(node.el.on_press.clone());
         // A popover the app controls opens and closes through the message.
-        if node.trigger.is_some_and(|trigger| !trigger.controlled) && !self.open.remove(&node.id) {
+        // A sub-menu the pointer opened by resting on its anchor stays open through a press there.
+        let stays = node.trigger.is_some_and(|trigger| trigger.nested);
+        if node.trigger.is_some_and(|trigger| !trigger.controlled) && (stays || !self.open.remove(&node.id)) {
             self.open.insert(node.id);
         }
         self.stale.view = true;
         if node.el.closes && node.layer > 0 {
-            self.close_layer(node.layer);
+            // A choice in a sub-menu closes the menus it was reached through as well.
+            let mut layer = node.layer;
+            loop {
+                self.close_layer(layer);
+                let Layer { nested, anchor, .. } = &self.tree.layers[layer];
+                match anchor.filter(|_| *nested).map(|anchor| self.tree.nodes[anchor].layer) {
+                    Some(outer) if outer > 0 => layer = outer,
+                    _ => break,
+                }
+            }
         }
+    }
+
+    /// Opens the sub-menu whose anchor the pointer rests on, and closes one whose anchor it left for
+    /// something else of the same menu that can be pressed.
+    fn open_nested(&mut self) {
+        let Some(hit) = self.pointer.and_then(|at| self.hit(at)) else { return };
+        let nested = |i: &usize| self.tree.nodes[*i].trigger.is_some_and(|trigger| trigger.nested);
+        let over = self.tree.ancestors(hit).find(nested).filter(|&i| !self.tree.disabled(i));
+        let pressable = self.tree.ancestors(hit).any(|i| self.tree.nodes[i].el.on_press.is_some());
+        let layer = self.tree.nodes[hit].layer;
+        let mut changed = false;
+        if over.is_some() || pressable {
+            let beside = self.tree.layers.iter().filter(|layer| layer.nested).filter_map(|layer| layer.anchor);
+            for anchor in beside.filter(|&anchor| self.tree.nodes[anchor].layer == layer && Some(anchor) != over) {
+                changed |= self.open.remove(&self.tree.nodes[anchor].id);
+            }
+        }
+        if let Some(over) = over {
+            changed |= self.open.insert(self.tree.nodes[over].id);
+        }
+        self.stale.view |= changed;
     }
 
     /// Tells a field that focus is leaving it.

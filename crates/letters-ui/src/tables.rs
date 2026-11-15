@@ -2,9 +2,9 @@
 //!
 //! A table the pointer is over, or the caret is in, has a handle over one column and one beside one row:
 //! those under the pointer, or else those of the caret. A press on a handle opens the menu of its column
-//! or row, and a drag carries it to another place among them. A bar along the right of the table adds a
-//! column at its end, and one under it a row. The page is drawn on a canvas, so all of it is drawn there
-//! and the window asks this module what a press is on.
+//! or row, and a drag carries it to another place among them. On the borders either side of the column
+//! and the row that have a handle is a plus, which adds one there at a press. The page is drawn on a
+//! canvas, so all of it is drawn there and the window asks this module what a press is on.
 
 use letters_editor::{Command, TableEdit};
 use letters_layout::TableBox;
@@ -21,10 +21,10 @@ use crate::window::Message;
 /// How thick a handle is, and how long.
 const THICK: f32 = 10.0;
 const LONG: f32 = 28.0;
-/// How far the handles and the bars keep from the table.
+/// How far the handles keep from the table.
 const GAP: f32 = 2.0;
-/// How thick a bar that adds is, and the plus on it.
-const BAR: f32 = 10.0;
+/// The side of the plus on a border between two columns or rows, and of the sign on it.
+const INSERT: f32 = 12.0;
 const PLUS: f32 = 8.0;
 /// How near a press has to come to count, as near as a finger comes.
 const REACH: f32 = 3.0;
@@ -46,8 +46,9 @@ pub enum Axis {
 pub(crate) enum Part {
     /// The handle of a column or a row, counted from 0.
     Handle(Axis, usize),
-    /// The bar that adds a column at the end, or a row.
-    Add(Axis),
+    /// The plus on the border before a column or row, which adds one there. Past the last, it adds one
+    /// at the end.
+    Insert(Axis, usize),
 }
 
 /// What a press that has ended asks for.
@@ -55,8 +56,8 @@ pub(crate) enum Part {
 pub(crate) enum Asked {
     /// The menu of a column or row.
     Menu(Axis, usize),
-    /// A column at the end, or a row.
-    Add(Axis),
+    /// A column or row before the one counted `before`, or at the end when there is none.
+    Insert { axis: Axis, before: usize },
     /// The column or row `from` to stand `to`th among them.
     Move { axis: Axis, from: usize, to: usize },
 }
@@ -73,9 +74,10 @@ fn grown(rect: Rect, by: f32) -> Rect {
     Rect::new(rect.x - by, rect.y - by, rect.width + 2.0 * by, rect.height + 2.0 * by)
 }
 
-/// The table with its handles and bars, and the room between them: what the pointer is over the table in.
+/// The table with its handles and the room between them: what the pointer is over the table in.
 fn reach(table: &TableBox) -> Rect {
-    let (before, after) = (GAP + THICK + REACH, GAP + BAR + REACH);
+    // A plus on an outer border reaches half its width past the table.
+    let (before, after) = (GAP + THICK + REACH, INSERT / 2.0 + REACH);
     let rect = table.rect;
     Rect::new(rect.x - before, rect.y - before, rect.width + before + after, rect.height + before + after)
 }
@@ -111,7 +113,8 @@ fn place(table: &TableBox, cell: &BlockId) -> Option<(usize, usize)> {
 /// Where the handle of a column or row is.
 fn handle(table: &TableBox, axis: Axis, index: usize) -> Option<Rect> {
     let (start, long) = *spans(table, axis).get(index)?;
-    let (length, rect) = (LONG.min(long), table.rect);
+    // A narrow column still has room for the plus on each of its borders.
+    let (length, rect) = (LONG.min(long - INSERT - 2.0 * REACH).max(THICK), table.rect);
     let from = (start + (long - length) / 2.0).round();
     Some(match axis {
         Axis::Column => Rect::new(from, rect.y - GAP - THICK, length, THICK),
@@ -119,13 +122,29 @@ fn handle(table: &TableBox, axis: Axis, index: usize) -> Option<Rect> {
     })
 }
 
-/// Where the bar is that adds a column at the end, or a row.
-fn bar(table: &TableBox, axis: Axis) -> Rect {
-    let rect = table.rect;
+/// Where the plus is on the border before the column or row counted `gap`: on the line of the handles.
+fn plus(table: &TableBox, axis: Axis, gap: usize) -> Rect {
+    let spans = spans(table, axis);
+    let edge = spans.get(gap).map(|(start, _)| *start).or(spans.last().map(|(start, long)| start + long));
+    let (at, rect) = ((edge.unwrap_or_default() - INSERT / 2.0).round(), table.rect);
+    let beside = GAP + THICK / 2.0 + INSERT / 2.0;
     match axis {
-        Axis::Column => Rect::new(rect.x + rect.width + GAP, rect.y, BAR, rect.height),
-        Axis::Row => Rect::new(rect.x, rect.y + rect.height + GAP, rect.width, BAR),
+        Axis::Column => Rect::new(at, rect.y - beside, INSERT, INSERT),
+        Axis::Row => Rect::new(rect.x - beside, at, INSERT, INSERT),
     }
+}
+
+/// The column or row a point is in, or the nearest one for a point on the line of their handles, where
+/// the plus on an outer border reaches past the table.
+fn index_near(table: &TableBox, axis: Axis, at: Point) -> Option<usize> {
+    let rect = table.rect;
+    let on_line = match axis {
+        Axis::Column => at.y < rect.y,
+        Axis::Row => at.x < rect.x,
+    };
+    let last = spans(table, axis).len().checked_sub(1)?;
+    let nearest = || gap_at(table, axis, at).saturating_sub(1).min(last);
+    index_at(table, axis, at).or_else(|| on_line.then(nearest))
 }
 
 /// The place among the columns or rows that a point is nearest to the start of: as many as there are for
@@ -157,8 +176,8 @@ impl Shown {
         let at = at.or_else(|| tables.iter().position(|table| caret(table).is_some()))?;
         let table = tables.into_iter().nth(at)?;
         let (over, caret) = (over(&table), caret(&table));
-        let column = over.and_then(|at| index_at(&table, Axis::Column, at)).or(caret.map(|(_, column)| column));
-        let row = over.and_then(|at| index_at(&table, Axis::Row, at)).or(caret.map(|(row, _)| row));
+        let column = over.and_then(|at| index_near(&table, Axis::Column, at)).or(caret.map(|(_, column)| column));
+        let row = over.and_then(|at| index_near(&table, Axis::Row, at)).or(caret.map(|(row, _)| row));
         Some(Self { table, column, row })
     }
 
@@ -169,8 +188,13 @@ impl Shown {
             let index = index?;
             Some((Part::Handle(axis, index), handle(&self.table, axis, index)?))
         };
-        let bars = [Axis::Column, Axis::Row].map(|axis| (Part::Add(axis), bar(&self.table, axis)));
-        handles.into_iter().filter_map(handle).chain(bars).collect()
+        // The borders either side of what has a handle each have a plus.
+        let plus = |(axis, index): (Axis, Option<usize>)| {
+            let sides = index.map(|index| [index, index + 1]);
+            sides.into_iter().flatten().map(move |gap| (Part::Insert(axis, gap), plus(&self.table, axis, gap)))
+        };
+        let pluses = handles.into_iter().flat_map(plus);
+        pluses.chain(handles.into_iter().filter_map(handle)).collect()
     }
 
     /// What a press at `at` is on.
@@ -273,12 +297,12 @@ impl Tables {
             }
             (part, _) if pressed.shown.part_at(at) != Some(part) => return None,
             (Part::Handle(axis, index), _) => Asked::Menu(axis, index),
-            (Part::Add(axis), _) => Asked::Add(axis),
+            (Part::Insert(axis, before), _) => Asked::Insert { axis, before },
         };
         Some((pressed.shown, asked))
     }
 
-    /// Draws the handles and bars of the table that shows. `accent` marks the handle whose menu is out and
+    /// Draws the handles and pluses of the table that shows. `accent` marks the handle whose menu is out and
     /// the one that is carried.
     pub fn paint(&self, shown: &Shown, accent: Ink, scheme: Scheme, out: &mut DisplayList) {
         let down = self.pressed.as_ref().map(|pressed| pressed.part);
@@ -319,10 +343,19 @@ impl Tables {
                         out.push(Item::Fill { rect: dot, color: resolve(dots, scheme, 1.0), radius: DOT / 2.0 });
                     }
                 }
-                Part::Add(_) => {
-                    let (wash, ink) = if over { (1.0, tokens::FG) } else { (0.5, tokens::FG_MUTED) };
-                    let radius = tokens::RADIUS_SM;
-                    out.push(Item::Fill { rect, color: resolve(tokens::NEUTRAL_SOFT, scheme, wash), radius });
+                Part::Insert(axis, gap) => {
+                    // Under the pointer it is lit, with a line where the new column or row would go.
+                    let (fill, edge, ink) = match over {
+                        true => (accent, accent, tokens::SURFACE),
+                        false => (tokens::SURFACE, tokens::LINE_STRONG, tokens::FG_MUTED),
+                    };
+                    if over {
+                        let line = landing(&shown.table, axis, gap);
+                        out.push(Item::Fill { rect: line, color: resolve(accent, scheme, 1.0), radius: LANDING / 2.0 });
+                    }
+                    let radius = INSERT / 2.0;
+                    out.push(Item::Fill { rect, color: resolve(fill, scheme, 1.0), radius });
+                    out.push(Item::Stroke { rect, color: resolve(edge, scheme, 1.0), width: 1.0, radius });
                     out.push(Item::Path {
                         origin: Point { x: rect.x + (rect.width - PLUS) / 2.0, y: rect.y + (rect.height - PLUS) / 2.0 },
                         scale: PLUS / GRID,
@@ -336,13 +369,16 @@ impl Tables {
     }
 }
 
-/// What a part is called, for a reader that cannot see it. Columns and rows are counted from 1.
-pub(crate) fn label(part: Part) -> String {
+/// What a part is called, for a reader that cannot see it. Columns and rows are counted from 1. A plus
+/// past the `last` column or row adds one at the end.
+pub(crate) fn label(part: Part, last: bool) -> String {
     match part {
         Part::Handle(Axis::Column, index) => format!("Column {}", index + 1),
         Part::Handle(Axis::Row, index) => format!("Row {}", index + 1),
-        Part::Add(Axis::Column) => "Add column".to_owned(),
-        Part::Add(Axis::Row) => "Add row".to_owned(),
+        Part::Insert(Axis::Column, _) if last => "Add column at the end".to_owned(),
+        Part::Insert(Axis::Row, _) if last => "Add row at the end".to_owned(),
+        Part::Insert(Axis::Column, before) => format!("Add column before column {}", before + 1),
+        Part::Insert(Axis::Row, before) => format!("Add row before row {}", before + 1),
     }
 }
 
@@ -435,6 +471,9 @@ mod tests {
             (None, Some(&caret), Some((Some(2), Some(1)))),
             (Some(Point { x: 900.0, y: 210.0 }), None, None),
             (None, None, None),
+            // On the plus of an outer border, just past the table, the column or row at that end keeps it.
+            (Some(Point { x: 403.0, y: 192.0 }), None, Some((Some(2), None))),
+            (Some(Point { x: 92.0, y: 201.0 }), None, Some((None, Some(0)))),
         ];
         for (pointer, caret, expected) in cases {
             let shown = Shown::find(vec![table()], pointer, caret);
@@ -443,10 +482,10 @@ mod tests {
     }
 
     #[test]
-    fn handles_and_bars_stand_outside_the_table_beside_what_they_act_on() {
+    fn handles_and_pluses_stand_outside_the_table_beside_what_they_act_on() {
         let shown = Shown { table: table(), column: Some(1), row: Some(1) };
         let (rect, parts) = (shown.table.rect, shown.parts());
-        assert_eq!(parts.len(), 4, "a handle each for the column and the row, and two bars");
+        assert_eq!(parts.len(), 6, "a handle and two pluses each for the column and the row");
         for (part, at) in parts {
             let apart = at.x + at.width <= rect.x
                 || at.y + at.height <= rect.y
@@ -457,8 +496,13 @@ mod tests {
             match part {
                 Part::Handle(Axis::Column, _) => assert!((220.0..300.0).contains(&middle(at).x) && at.y < rect.y),
                 Part::Handle(Axis::Row, _) => assert!((230.0..260.0).contains(&middle(at).y) && at.x < rect.x),
-                Part::Add(Axis::Column) => assert!(at.x >= rect.x + rect.width),
-                Part::Add(Axis::Row) => assert!(at.y >= rect.y + rect.height),
+                // On the border it adds at: those of the second column are at 220 and 300.
+                Part::Insert(Axis::Column, gap) => {
+                    assert_eq!((middle(at).x, at.y < rect.y), ([220.0, 300.0][gap - 1], true))
+                }
+                Part::Insert(Axis::Row, gap) => {
+                    assert_eq!((middle(at).y, at.x < rect.x), ([230.0, 260.0][gap - 1], true))
+                }
             }
         }
         assert_eq!(shown.part_at(middle(rect)), None, "the table itself is text to write in");
@@ -474,15 +518,25 @@ mod tests {
         // (pressed on, dragged through, let go at, asked)
         let cases = [
             (column, None, at(column), Some(Asked::Menu(Axis::Column, 0))),
-            (Part::Add(Axis::Row), None, at(Part::Add(Axis::Row)), Some(Asked::Add(Axis::Row))),
-            (Part::Add(Axis::Row), None, middle(table().rect), None),
+            (Part::Insert(Axis::Row, 1), None, middle(table().rect), None),
+            (
+                Part::Insert(Axis::Row, 1),
+                None,
+                at(Part::Insert(Axis::Row, 1)),
+                Some(Asked::Insert { axis: Axis::Row, before: 1 }),
+            ),
             (column, Some(over(270.0)), over(270.0), moved(1)),
             (column, Some(over(390.0)), over(390.0), moved(2)),
             (column, Some(over(1000.0)), over(1000.0), moved(2)),
             // Carried away and back, it stays where it was and opens nothing.
             (column, Some(over(270.0)), over(150.0), None),
-            // A bar is not carried.
-            (Part::Add(Axis::Row), Some(over(270.0)), at(Part::Add(Axis::Row)), Some(Asked::Add(Axis::Row))),
+            // A plus is not carried.
+            (
+                Part::Insert(Axis::Row, 1),
+                Some(over(270.0)),
+                at(Part::Insert(Axis::Row, 1)),
+                Some(Asked::Insert { axis: Axis::Row, before: 1 }),
+            ),
         ];
         for (part, through, end, asked) in cases {
             let mut tables = Tables::default();

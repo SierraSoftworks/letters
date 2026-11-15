@@ -1,7 +1,7 @@
 //! The menu about what is under the pointer: a strip of small buttons over the actions of that thing.
 
 use letters_editor::Clip;
-use letters_model::{Align, Block, BlockKind, Document, ListKind, Pos, Selection};
+use letters_model::{Block, BlockKind, Document, Pos, Selection};
 use letters_render::{Item, Point, Rect};
 use letters_test::{Found, Harness, Role};
 use letters_ui::Request;
@@ -81,7 +81,7 @@ fn ask(window: &mut Harness, place: &str) {
 /// The row of the menu for an action. A row is named with its key, where it has one.
 fn row(window: &mut Harness, item: &str) -> Option<Found> {
     let named = |found: &Found| {
-        found.role == Role::MenuItem
+        matches!(found.role, Role::MenuItem | Role::MenuItemCheckBox)
             && found.name.strip_prefix(item).is_some_and(|key| key.is_empty() || key.starts_with(' '))
     };
     window.controls().into_iter().find(named)
@@ -106,12 +106,16 @@ fn kind_of<'a>(window: &'a Harness, block: &str) -> &'a BlockKind {
 fn the_menu_lists_what_can_be_done_with_the_thing_it_is_asked_on() {
     // Where the menu is asked for, what it lists there, and what it leaves to other places.
     let cases: [(&str, &[&str], &[&str]); 9] = [
-        ("brown", &["Paste as plain text", "Select all", "All commands"], &["Copy code", "Add row above", "Indent"]),
-        ("step", &["Edit callout", "Turn into body text"], &["Copy code", "Remove row"]),
+        (
+            "brown",
+            &["Turn into", "Paste as plain text", "Select all", "All commands"],
+            &["Copy code", "Type", "Indent"],
+        ),
+        ("step", &["Edit callout", "Type", "Turn into body text"], &["Copy code", "Tip"]),
         ("manual", &["Open link", "Edit link", "Copy link address", "Remove link"], &["Copy code"]),
         ("Second", &["Indent", "Outdent"], &["Open link", "Add row above"]),
         ("main", &["Copy code", "Copy as picture"], &["Open link", "Remove row"]),
-        ("Pears", &["Add row above", "Add column to the right", "Remove row", "Turn header row off"], &["Copy code"]),
+        ("Pears", &["Paste as plain text"], &["Copy code", "Turn into", "Remove row"]),
         ("the formula", &["Copy TeX source"], &["Copy code", "Remove row"]),
         ("the picture", &["Edit caption", "Edit alt text", "Delete image"], &["Open link", "Indent"]),
         ("the empty line", &["Table", "Image", "Divider"], &["Copy code", "Delete image"]),
@@ -166,24 +170,109 @@ fn the_strip_offers_only_what_has_something_to_act_on() {
 }
 
 #[test]
-fn the_strip_turns_a_block_into_another_kind_and_lines_a_column_up() {
-    let mut window = note();
-    ask(&mut window, "Second");
-    assert_eq!(window.find(Role::Button, "Bulleted list").and_then(|list| list.toggled), Some(true));
-    window.click(Role::Button, "Numbered list");
-    let second = window.editor().selection().expect("a caret").head.block.clone();
-    assert!(matches!(kind_of(&window, second.as_str()), BlockKind::ListItem { list: ListKind::Ordered, .. }));
+fn a_choice_among_several_is_a_menu_of_its_own_beside_its_row() {
+    // The row that opens the menu, how it is opened, what is chosen there, and the kind the block is then.
+    let heading = |window: &Harness| matches!(kind_of(window, "b1"), BlockKind::Heading { level: 2 });
+    for keys in [false, true] {
+        let mut window = note();
+        ask(&mut window, "brown");
+        assert!(!listed(&mut window, "Heading 2"), "the kinds wait in their own menu");
+        if keys {
+            // The keyboard is on the list: the arrow that points at the menu opens it.
+            while window.focused().is_some_and(|found| !found.name.starts_with("Turn into")) {
+                window.key("Down");
+            }
+            window.key("Right");
+            assert!(listed(&mut window, "Heading 2"), "the arrow opens it");
+            window.key("Left");
+            assert!(!listed(&mut window, "Heading 2"), "and the other arrow closes it");
+            assert!(window.focused().is_some_and(|found| found.name.starts_with("Turn into")), "back on its row");
+            window.key("Right");
+        } else {
+            let at = row(&mut window, "Turn into").expect("the row").center();
+            window.hover_at(at);
+        }
+        let body = row(&mut window, "Body text").expect("the kind the block is");
+        assert_eq!(body.toggled, Some(true), "the kind it is has the tick");
+        choose(&mut window, "Heading 2");
+        window.assert_closed(Role::Menu, MENU);
+        assert!(heading(&window), "keys: {keys}: {}", window.markdown());
+        assert!(window.focused().is_some_and(|found| found.role == Role::Document), "back on the page");
+    }
 
+    // A callout's types are such a menu too.
+    let mut window = note();
+    ask(&mut window, "step");
+    let at = row(&mut window, "Type").expect("the row").center();
+    window.hover_at(at);
+    choose(&mut window, "Warning");
+    assert!(window.markdown().contains("[!WARNING]"), "{}", window.markdown());
+}
+
+#[test]
+fn the_strip_works_on_the_row_and_the_column_of_a_cell() {
+    // The button, and the rows of the table as Markdown writes them afterwards.
+    let cases = [
+        ("Add row above", "| Apples | 3 |\n|  |  |\n| Pears | 12 |"),
+        ("Add row below", "| Pears | 12 |\n|  |  |"),
+        ("Move row up", "| Pears | 12 |\n| Apples | 3 |"),
+        ("Remove row", "| Name | Count |\n| --- | --- |\n| Apples | 3 |\n\n"),
+        ("Add column to the left", "| Apples |  | 3 |"),
+        ("Add column to the right", "| Apples | 3 |  |"),
+        ("Move column left", "| 12 | Pears |"),
+        ("Remove column", "| Name |\n| --- |\n| Apples |\n| Pears |"),
+        ("Align column right", "| --- | --: |"),
+        ("Turn header row off", "|  |  |\n| --- | --- |\n| Name | Count |"),
+    ];
+    for (button, written) in cases {
+        let mut window = note();
+        ask(&mut window, "12");
+        assert!(window.find(Role::Button, "Bold").is_some(), "the marks are there in a cell too");
+        window.click(Role::Button, button).assert_open(Role::Menu, MENU);
+        assert!(window.markdown().contains(written), "{button}: {}", window.markdown());
+    }
+
+    // What has nowhere to go cannot be pressed.
     let mut window = note();
     ask(&mut window, "12");
-    assert!(window.find(Role::Button, "Heading 1").is_none(), "a cell is no heading");
-    window.click(Role::Button, "Align column right");
-    let aligned = window.editor().doc().walk().find_map(|block| match &block.kind {
-        BlockKind::Table { columns, .. } => Some(columns.clone()),
-        _ => None,
-    });
-    assert_eq!(aligned.as_deref(), Some(&[Align::Start, Align::End][..]));
-    assert_eq!(window.find(Role::Button, "Align column right").and_then(|right| right.toggled), Some(true));
+    for (button, offered) in [("Move row down", false), ("Move column right", false), ("Move row up", true)] {
+        let found = window.find(Role::Button, button).unwrap_or_else(|| panic!("no {button}"));
+        assert_eq!(!found.disabled, offered, "{button}");
+    }
+}
+
+#[test]
+fn misspelled_words_are_stepped_through_and_mended_by_keys() {
+    let mut window = Harness::doc("The quik brown fox.\n\nA plain line.\n\nOne more lnie of it.");
+    for _ in 0..200 {
+        window.advance(50);
+    }
+    let word = |window: &Harness| {
+        let caret = window.editor().selection().expect("a caret").head.clone();
+        let text = window.editor().doc().block(&caret.block).expect("the block").plain_text();
+        text[caret.offset..].split(' ').next().unwrap_or_default().to_owned()
+    };
+    // The key, and the misspelled word the menu is then about. The steps go on round the document's ends.
+    for (key, at) in [("F7", "quik"), ("F7", "lnie"), ("F7", "quik"), ("Shift+F7", "lnie"), ("Shift+F7", "quik")] {
+        window.key(key).assert_open(Role::Menu, MENU);
+        assert_eq!(word(&window), at, "after {key}");
+        assert!(listed(&mut window, "quick") == (at == "quik"), "the corrections are those of {at}");
+    }
+    // The number beside a correction takes it, alone or with the key the list names.
+    let second = window.controls().into_iter().filter(|found| found.name.ends_with("+2")).count();
+    assert_eq!(second, 1, "the second correction says how it is taken");
+    assert!(row(&mut window, "quick").is_some_and(|found| found.name.ends_with("+2")), "quick is the second");
+    window.key("Mod+2").assert_closed(Role::Menu, MENU);
+    assert!(window.markdown().contains("The quick brown fox."), "{}", window.markdown());
+    window.key("F7").assert_open(Role::Menu, MENU);
+    assert_eq!(word(&window), "lnie");
+    window.key("1").assert_closed(Role::Menu, MENU);
+    assert!(!window.markdown().contains("lnie"), "{}", window.markdown());
+    // With nothing left there is nothing to open.
+    for _ in 0..200 {
+        window.advance(50);
+    }
+    window.key("F7").assert_closed(Role::Menu, MENU);
 }
 
 #[test]
@@ -236,9 +325,9 @@ fn the_items_about_a_link_a_table_and_a_picture_do_what_they_say() {
     assert!(window.markdown().contains("reads the manual twice"), "{}", window.markdown());
 
     ask(&mut window, "Pears");
-    choose(&mut window, "Remove row");
+    window.click(Role::Button, "Remove row");
     assert!(!window.markdown().contains("Pears"), "{}", window.markdown());
-    window.key("Mod+Z");
+    window.key("Escape").key("Mod+Z");
     assert!(window.markdown().contains("Pears"), "one undo brings the row back");
 
     ask(&mut window, "the picture");
@@ -249,10 +338,10 @@ fn the_items_about_a_link_a_table_and_a_picture_do_what_they_say() {
 #[test]
 fn the_keyboard_starts_on_the_list_and_a_paste_with_nothing_to_give_is_the_shells_to_do() {
     let mut window = note();
-    ask(&mut window, "Pears");
-    assert_eq!(window.focused().map(|found| found.name), Some("Add row above".to_owned()));
-    window.key("Down").key("Enter").assert_closed(Role::Menu, MENU);
-    assert_eq!(window.markdown().matches("|  |  |").count(), 1, "the second row was taken: {}", window.markdown());
+    ask(&mut window, "Second");
+    assert!(window.focused().is_some_and(|found| found.name.starts_with("Indent")), "the first row has it");
+    window.key("Enter").assert_closed(Role::Menu, MENU);
+    assert!(window.markdown().contains("  - Second item"), "the row was taken: {}", window.markdown());
 
     // Whether the shell has the clipboard at once, the item, and what is asked of the shell.
     let cases = [

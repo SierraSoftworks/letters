@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
 use letters_editor::{
-    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Picture, Platform, Spot,
+    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Picture, Platform, Seek, Spot,
     TableEdit,
 };
 use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax, Uncovered};
@@ -33,6 +33,7 @@ use crate::copying::{self, Copy, CopyFormat, Copying};
 use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::figures::{self, Grip, Moving, Resizing};
+use crate::finding::{self, Find, Finding};
 use crate::highlight;
 use crate::history::{self, History, Historying, Naming};
 use crate::icon::{self, Icon};
@@ -179,6 +180,10 @@ pub enum Message {
     },
     /// What the menu about what is under the pointer asks for.
     Context(Contexting),
+    /// Goes to the next misspelled word and offers its corrections, or to the one before.
+    Misspelling {
+        back: bool,
+    },
     /// Asks the shell for a recent document, by its path.
     Open(String),
     /// Asks the shell to let the person choose a document.
@@ -218,6 +223,8 @@ pub enum Message {
     Safe(Safely),
     /// What is asked of the command palette.
     Commands(Commanding),
+    /// What is asked of the bar that finds and replaces.
+    Find(Finding),
     /// What is asked of Print view.
     Print(Printing),
     /// What is asked of the history.
@@ -822,6 +829,7 @@ pub struct EditorApp {
     maths: Maths,
     insert: Insert,
     commands: Commands,
+    find: Find,
     /// Print view, while it shows in place of the page.
     printing: Option<Print>,
     /// The history, while one of the document's versions shows in place of the page.
@@ -836,6 +844,8 @@ pub struct EditorApp {
     callouts: Callouts,
     /// The menu about what is under the pointer, while it is open.
     context: Option<Context>,
+    /// How many of those menus were opened.
+    menus: u32,
     /// The preview of a figure that shows over the page: its caption, and where it is in the page area.
     previewed: Option<(String, Rect)>,
     /// How the document read when assistive technology was last told of it.
@@ -906,6 +916,7 @@ impl EditorApp {
             maths: Maths::default(),
             insert: Insert::default(),
             commands: Commands::default(),
+            find: Find::default(),
             printing: None,
             history: None,
             zone: 0,
@@ -915,6 +926,7 @@ impl EditorApp {
             tables: Tables::default(),
             callouts: Callouts::default(),
             context: None,
+            menus: 0,
             previewed: None,
             told: RefCell::default(),
             backup: Fonts::default(),
@@ -1442,6 +1454,10 @@ impl EditorApp {
         if self.dragging || !self.margin.offers() || self.commands.open() {
             return None;
         }
+        // A place that was found is selected to be looked at, not to have something made of it.
+        if self.find.current(Some(selection)).is_some() {
+            return None;
+        }
         notes::passage(self.editor.doc(), selection)?;
         let lines = self.layout.selection_in(selection, viewport);
         let (first, last) = (lines.first()?, lines.last()?);
@@ -1595,6 +1611,7 @@ impl EditorApp {
                 };
                 (fits && editor.applies(command)).then(|| Message::Run(command.clone()))?
             }
+            Act::Misspelling { back } => Message::Misspelling { back: *back },
             Act::MoveRow { down } => {
                 let cell = editor.cell()?;
                 Message::Run(Command::Table(TableEdit::MoveRow { to: beside(cell.row, cell.rows, *down)? }))
@@ -1649,6 +1666,15 @@ impl EditorApp {
                 fits.then(|| Message::Review(asked.clone()))?
             }
             Act::Palette => (!self.carded()).then_some(Message::Commands(Commanding::Toggle))?,
+            // Text is found on the page, so only while the page shows.
+            Act::Find | Act::Replace => {
+                let open = Finding::Open { replace: *act == Act::Replace };
+                (!self.carded() && !self.away()).then_some(Message::Find(open))?
+            }
+            Act::FindStep { back } => {
+                let steps = self.find.steps() && !self.carded() && !self.away();
+                steps.then_some(Message::Find(Finding::Step { back: *back }))?
+            }
         };
         Some(message)
     }
@@ -1950,6 +1976,47 @@ impl EditorApp {
         }
     }
 
+    /// Does what the bar that finds and replaces asked.
+    fn finding(&mut self, asked: Finding, platform: &mut dyn Platform) {
+        match self.find.update(asked, &self.editor) {
+            Some(finding::Does::Go(to)) => self.go(to),
+            Some(finding::Does::Run(command)) => {
+                let one = matches!(&command, Command::Replace { only: Some(_), .. });
+                let held = self.find.current(self.editor.selection()).is_some();
+                self.edit(platform, |editor, platform| editor.run(command, platform));
+                // After one place is replaced, the next is the one to look at. After all of them, the one
+                // that was selected to be looked at is let go of.
+                let start = self.editor.selection().map(|selection| Selection::caret(selection.anchor.clone()));
+                let next = if one { self.find.seek(&self.editor, Seek::Here) } else { start.filter(|_| held) };
+                if let Some(next) = next {
+                    self.go(next);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Selects a place the text was found at and brings it into view, clear of the bar that found it.
+    fn go(&mut self, to: Selection) {
+        self.editor.select(to);
+        self.mark();
+        self.unpoint();
+        // Twice, since laying out what comes into view can move the place.
+        for _ in 0..2 {
+            let head = self.editor.selection().map(|selection| &selection.head);
+            let Some(line) = head.and_then(|head| self.layout.caret(head)) else { break };
+            let top = self.down(line.y) + TOP;
+            let margin = GUTTER.min(self.height / 4.0);
+            let cover = self.find.cover().min(self.height / 2.0);
+            let seen = self.scroll + cover + margin..=self.scroll + self.height - margin;
+            if !seen.contains(&top) || !seen.contains(&(top + line.height)) {
+                // A place out of view is brought a third of the way down the page.
+                self.scroll = (top - self.height / 3.0).clamp(0.0, self.max_scroll());
+            }
+            self.layout.settle(self.viewport(), 0);
+        }
+    }
+
     /// Tells the shell again of each linked picture that does not show, since what it held back may load
     /// now. With `freed` the document has left safe mode, which no longer holds any of them.
     fn ask_again(&mut self, freed: bool) {
@@ -2090,6 +2157,7 @@ impl EditorApp {
             let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
             self.spelling.edited(change, self.editor.doc(), caret, &mut self.layout);
             self.margin.edited(self.editor.model());
+            self.find.refresh(&self.editor);
         }
         if change.document {
             self.spelling.reworded(None, self.editor.doc(), &mut self.layout);
@@ -2287,7 +2355,13 @@ impl EditorApp {
     fn tabled(&mut self, shown: &tables::Shown, asked: tables::Asked, platform: &mut dyn Platform) {
         let (axis, index) = match asked {
             tables::Asked::Menu(axis, index) | tables::Asked::Move { axis, from: index, .. } => (axis, Some(index)),
-            tables::Asked::Add(axis) => (axis, None),
+            tables::Asked::Insert { axis, before } => {
+                let count = match axis {
+                    tables::Axis::Column => shown.table.columns.len(),
+                    tables::Axis::Row => shown.table.rows.len(),
+                };
+                (axis, Some(before).filter(|before| *before < count))
+            }
         };
         // The commands of a table act where the caret is, so it goes there first.
         let Some(cell) = shown.cell(axis, index, self.caret_cell()) else { return };
@@ -2302,8 +2376,9 @@ impl EditorApp {
                 self.tables.open = Some(axis);
                 return self.reveal();
             }
-            (tables::Asked::Add(_), tables::Axis::Column) => TableEdit::AddColumn { after: true },
-            (tables::Asked::Add(_), tables::Axis::Row) => TableEdit::AddRow { below: true },
+            // Past the last there is none to go before.
+            (tables::Asked::Insert { .. }, tables::Axis::Column) => TableEdit::AddColumn { after: index.is_none() },
+            (tables::Asked::Insert { .. }, tables::Axis::Row) => TableEdit::AddRow { below: index.is_none() },
             (tables::Asked::Move { to, .. }, tables::Axis::Column) => TableEdit::MoveColumn { to },
             (tables::Asked::Move { to, .. }, tables::Axis::Row) => TableEdit::MoveRow { to },
         };
@@ -2642,13 +2717,43 @@ impl EditorApp {
         };
         let note = self.margin.open().find(|(note, kind)| *kind == threads::Kind::Comment && on(note));
         let note = note.map(|(note, _)| note.id.clone());
-        self.context = Some(Context { at, reference, note });
+        self.menus = self.menus.wrapping_add(1);
+        self.context = Some(Context { at, reference, note, serial: self.menus });
+    }
+
+    /// Goes to the next misspelled word, or the one before, and opens the menu about it there.
+    fn misspelling(&mut self, back: bool) {
+        if self.away() || self.carded() {
+            return;
+        }
+        self.context = None;
+        if self.hung() {
+            return;
+        }
+        let from = self.editor.selection().map(|selection| selection.head.clone());
+        let Some((block, word)) = self.spelling.next(self.editor.doc(), from.as_ref(), back, &mut self.layout) else {
+            return;
+        };
+        self.editor.select(Selection::caret(Pos::new(block, word.start)));
+        self.mark();
+        // Twice, since laying out what comes into view can move the word.
+        for _ in 0..2 {
+            self.reveal();
+            self.layout.settle(self.viewport(), 0);
+        }
+        let Some(caret) = self.editor.selection().and_then(|selection| self.layout.caret(&selection.head)) else {
+            return;
+        };
+        let caret = self.onto(caret);
+        self.menu(Point { x: caret.x + 1.0, y: caret.y + caret.height / 2.0 });
     }
 
     /// Does what the menu about what is under the pointer asked.
     fn contexting(&mut self, asked: Contexting, platform: &mut dyn Platform) {
         match asked {
-            Contexting::Close => self.context = None,
+            Contexting::Close(serial) => {
+                self.context.take_if(|context| context.serial == serial);
+            }
             Contexting::CopyText(block) => match self.editor.doc().block(&block) {
                 Some(code) if matches!(code.kind, BlockKind::Code { .. }) => self.copy_code(block, platform),
                 Some(written) => platform.clipboard_write(Clip { text: written.plain_text(), ..Clip::default() }),
@@ -2661,7 +2766,14 @@ impl EditorApp {
                 let boxes = self.layout.code_boxes(Rect::new(0.0, top, self.column.1, bottom - top));
                 let Some((_, code)) = boxes.into_iter().find(|(id, _)| *id == block) else { return };
                 // The picture alone, so that what it is pasted into takes it for a picture.
-                if let Some(picture) = context::picture(&self.layout, &self.images, code, self.palette.page) {
+                // Where each line of the code begins, for its number.
+                let text = self.editor.doc().block(&block).map(|code| code.plain_text()).unwrap_or_default();
+                let starts = std::iter::once(0).chain(text.match_indices('\n').map(|(at, _)| at + 1));
+                let lines: Vec<Rect> =
+                    starts.filter_map(|at| self.layout.caret(&Pos::new(block.clone(), at))).collect();
+                let (ink, page) = (self.palette.text, self.palette.page);
+                let shaper = self.shaper.as_ref();
+                if let Some(picture) = context::picture(&self.layout, &self.images, shaper, code, &lines, ink, page) {
                     platform.clipboard_write(Clip { pictures: vec![picture], ..Clip::default() });
                     self.code_copy.copied(block, platform.now_ms());
                 }
@@ -2816,10 +2928,21 @@ impl EditorApp {
         self.margin.follow(selection);
         // The words in which the page's version of a block differs from the one held back.
         for words in self.review.words() {
-            review::mark(&self.layout.selection_in(words, viewport), Version::Second, self.scheme, &mut list);
+            review::mark(
+                &self.layout.selection_in(words, viewport),
+                Version::Second,
+                &review::TONES,
+                self.scheme,
+                &mut list,
+            );
         }
         for (passage, open) in self.margin.commented() {
             notes::mark(&self.layout.selection_in(&passage, viewport), open, self.scheme, &mut list);
+        }
+        // Every place the find bar found, but for the one that is selected.
+        let band = |block: &BlockId| self.layout.band(block);
+        for found in self.find.shown(selection, band, (viewport.y, viewport.y + viewport.height)) {
+            finding::mark(&self.layout.selection_in(found, viewport), self.scheme, &mut list);
         }
         match &sheet {
             Some((_, rect)) => list.items.push(maths::tint(*rect, self.scheme)),
@@ -3891,6 +4014,7 @@ impl EditorApp {
             Message::ClosePanel => self.show(None),
             Message::Share(open) => self.sharing = open,
             Message::Correct(text) => {
+                self.context = None;
                 let Some(fix) = self.spelling.fix.take() else { return };
                 let (anchor, head) = (Pos::new(fix.block.clone(), fix.range.start), Pos::new(fix.block, fix.range.end));
                 self.editor.select(Selection { anchor, head });
@@ -3909,6 +4033,7 @@ impl EditorApp {
                 self.spelling.reworded(Some(fix.block), self.editor.doc(), &mut self.layout);
             }
             Message::Context(asked) => self.contexting(asked, platform),
+            Message::Misspelling { back } => self.misspelling(back),
             Message::Open(path) => self.requests.push(Request::Open(path)),
             Message::OpenDialog => self.requests.push(Request::OpenDialog),
             Message::NewDocument => self.requests.push(Request::New),
@@ -3932,6 +4057,7 @@ impl EditorApp {
             Message::Alt(asked) => self.altering(asked, platform),
             Message::Note(asked) => self.noting(asked, platform),
             Message::Commands(asked) => self.commanding(asked, platform),
+            Message::Find(asked) => self.finding(asked, platform),
             Message::Print(asked) => self.print(asked, platform),
             Message::History(asked) => self.historying(asked, platform),
             Message::Review(asked) => self.reviewing(asked, platform),
@@ -4075,6 +4201,11 @@ impl App for EditorApp {
             (false, false) => self.page(room),
         };
         let chapters = if away { None } else { self.chapters() };
+        // The find bar hangs under the bars, at the end of the page area.
+        let find = (self.find.open() && !away && !self.carded()).then(|| {
+            let end = room.width - if chapters.is_some() { chapters_width() } else { 0.0 };
+            self.find.view(self.find.current(self.editor.selection()), bar, end, room.width)
+        });
         let page = Element::row().grow(1.0).child(page).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
@@ -4084,7 +4215,9 @@ impl App for EditorApp {
             self.commands.view(&offers, keymap, self.mac, bar, window)
         });
         let over = over.chain(commands);
-        let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).children(self.safe.bar());
+        // It comes first, so that whatever else opens lies over it and is the first that Escape puts away.
+        let all = Element::column().bg(tokens::BG).fg(tokens::FG).children(find);
+        let all = all.child(self.bar()).children(self.safe.bar());
         let all = all.children(conflicts).child(body).children(strip).children(over);
         if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
     }
@@ -4121,13 +4254,18 @@ impl App for EditorApp {
         }
         if let Some(shown) = self.table() {
             for (part, at) in shown.parts() {
-                let (axis, index, add) = match part {
-                    tables::Part::Handle(axis, index) => (axis, Some(index), false),
-                    tables::Part::Add(axis) => (axis, None, true),
+                let (axis, index, does) = match part {
+                    tables::Part::Handle(axis, index) => (axis, index, 0),
+                    tables::Part::Insert(axis, before) => (axis, before, 2),
                 };
-                let Some(cell) = shown.cell(axis, index, self.caret_cell()) else { continue };
-                let told = (axis == tables::Axis::Row, add);
-                describe::table_part(&cell, told, &tables::label(part), self.onto(at), page, nodes);
+                // The plus past the last column or row is told by a cell of the last, as adding at the end.
+                let caret = self.caret_cell();
+                let within = shown.cell(axis, Some(index), caret).map(|cell| (cell, does));
+                let Some((cell, does)) = within.or_else(|| Some((shown.cell(axis, None, caret)?, 1))) else {
+                    continue;
+                };
+                let (told, label) = ((axis == tables::Axis::Row, does), tables::label(part, does == 1));
+                describe::table_part(&cell, told, &label, self.onto(at), page, nodes);
             }
         }
         self.review.describe(page, nodes);
@@ -4162,14 +4300,18 @@ impl App for EditorApp {
             }
             Some(describe::Request::Copy(block)) => self.copy_code(block, platform),
             Some(describe::Request::Note(block)) => self.noting(Noting::Press(block), platform),
-            Some(describe::Request::Table { cell, row, add }) => {
+            Some(describe::Request::Table { cell, row, does }) => {
                 // The caret goes to the cell, and its table then shows the handles of its column and row.
                 self.editor.select(Selection::caret(Pos::new(cell, 0)));
                 self.mark();
                 let axis = if row { tables::Axis::Row } else { tables::Axis::Column };
                 let Some((at, shown)) = self.editor.cell().zip(self.table()) else { return };
                 let index = if row { at.row } else { at.column };
-                let asked = if add { tables::Asked::Add(axis) } else { tables::Asked::Menu(axis, index) };
+                let asked = match does {
+                    0 => tables::Asked::Menu(axis, index),
+                    1 => tables::Asked::Insert { axis, before: index + 1 },
+                    _ => tables::Asked::Insert { axis, before: index },
+                };
                 self.tabled(&shown, asked, platform);
             }
             Some(describe::Request::Callout(block)) => self.call(&block, platform),
@@ -4199,6 +4341,14 @@ impl App for EditorApp {
     }
 
     fn text(&mut self, event: InputEvent, platform: &mut dyn Platform) {
+        // With the menu about a misspelled word open, a number takes the correction of that place. A
+        // browser keeps that number with Ctrl for its tabs.
+        if let (Some(_), Some(fix), InputEvent::Insert(typed)) = (&self.context, &self.spelling.fix, &event) {
+            let place = typed.parse::<usize>().ok().and_then(|place| place.checked_sub(1));
+            if let Some(word) = place.and_then(|place| fix.suggestions.get(place)).cloned() {
+                return self.update(Message::Correct(word), platform);
+            }
+        }
         // The first character typed over the landing card starts this document with it.
         let typed = matches!(event, InputEvent::Insert(_) | InputEvent::Commit(_) | InputEvent::SetComposition { .. });
         if self.landing.is_some() && self.importing.is_none() && typed {

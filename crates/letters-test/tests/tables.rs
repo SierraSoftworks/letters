@@ -45,14 +45,17 @@ fn text(window: &mut Harness, text: &str) -> Point {
 #[test]
 fn a_table_shows_its_handles_under_the_pointer_and_round_the_caret() {
     let mut window = note();
-    let all = ["Column 1", "Column 2", "Column 3", "Row 1", "Row 2", "Row 3", "Add column", "Add row"];
+    let all = ["Column 1", "Column 2", "Column 3", "Row 1", "Row 2", "Row 3"];
     let shown =
         |window: &mut Harness| all.iter().filter(|name| button(window, name).is_some()).copied().collect::<Vec<_>>();
     assert!(shown(&mut window).is_empty(), "nothing round a table that is left alone");
 
     let over = text(&mut window, "80");
     window.hover_at(over);
-    assert_eq!(shown(&mut window), ["Column 2", "Row 3", "Add column", "Add row"], "those of the cell pointed at");
+    assert_eq!(shown(&mut window), ["Column 2", "Row 3"], "those of the cell pointed at");
+    let pluses =
+        ["Add column before column 2", "Add column before column 3", "Add row before row 3", "Add row at the end"];
+    assert!(pluses.iter().all(|name| button(&mut window, name).is_some()), "with a plus on each border beside them");
 
     let away = text(&mut window, "After");
     window.hover_at(away);
@@ -61,20 +64,20 @@ fn a_table_shows_its_handles_under_the_pointer_and_round_the_caret() {
     window.select("4");
     let caret = window.editor().selection().map(|selection| selection.head.clone()).expect("a selection");
     window.ui().select(letters_model::Selection::caret(caret));
-    assert_eq!(shown(&mut window), ["Column 3", "Row 2", "Add column", "Add row"], "those of the caret's cell");
+    assert_eq!(shown(&mut window), ["Column 3", "Row 2"], "those of the caret's cell");
 }
 
 #[test]
-fn the_bars_add_a_column_and_a_row_at_the_end() {
+fn a_plus_past_the_last_adds_a_column_or_a_row_at_the_end() {
     let cases = [
-        ("Add column", ["Band|Homes|Rate", "A|120|4", "B|80|6"].as_slice(), 4),
-        ("Add row", ["Band|Homes|Rate", "A|120|4", "B|80|6", ""].as_slice(), 3),
+        ("Add column at the end", ["Band|Homes|Rate", "A|120|4", "B|80|6"].as_slice(), 4),
+        ("Add row at the end", ["Band|Homes|Rate", "A|120|4", "B|80|6", ""].as_slice(), 3),
     ];
     for (bar, expected, columns) in cases {
         let mut window = note();
-        let over = text(&mut window, "120");
+        let over = text(&mut window, "6");
         window.hover_at(over);
-        let at = button(&mut window, bar).expect("the bar shows");
+        let at = button(&mut window, bar).expect("the plus shows");
         window.click_at(at);
         assert_eq!(rows(&window), expected, "{bar}: what was written stays where it was");
         let cell = window.editor().cell().expect("the caret is in the table");
@@ -82,6 +85,35 @@ fn the_bars_add_a_column_and_a_row_at_the_end() {
         assert_eq!(cell.rows, expected.len(), "{bar}");
         window.type_text("new");
         assert!(rows(&window).iter().any(|row| row.contains("new")), "{bar}: and the table is written in at once");
+    }
+}
+
+#[test]
+fn a_plus_on_a_border_adds_a_column_or_a_row_there() {
+    // (the cell pointed at, the plus, the cell that then stands after the new one, the new column or row)
+    let cases = [
+        ("120", "Add column before column 2", "Homes", 1),
+        ("120", "Add column before column 3", "Rate", 2),
+        ("Band", "Add column before column 1", "Band", 0),
+        ("120", "Add row before row 3", "80", 2),
+        ("80", "Add row before row 3", "80", 2),
+    ];
+    for (cell, plus, after, added) in cases {
+        let mut window = note();
+        let over = text(&mut window, cell);
+        window.hover_at(over);
+        let at = button(&mut window, plus).unwrap_or_else(|| panic!("{plus} shows"));
+        window.click_at(at);
+        let caret = window.editor().cell().expect("the caret is in the table");
+        let by_column = plus.contains("column");
+        assert_eq!((caret.columns, caret.rows), if by_column { (4, 3) } else { (3, 4) }, "{plus}: one more");
+        let stands = if by_column { caret.column } else { caret.row };
+        assert_eq!(stands, added, "{plus}: the caret is in what was added");
+        window.type_text("new");
+        let rows = rows(&window);
+        let all: Vec<&str> = rows.iter().flat_map(|row| row.split('|')).collect();
+        let (new, after) = (all.iter().position(|cell| *cell == "new"), all.iter().position(|cell| *cell == after));
+        assert!(new.is_some() && new < after, "{plus}: it stands before {after:?}: {rows:?}");
     }
 }
 

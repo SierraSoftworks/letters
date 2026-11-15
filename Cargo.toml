@@ -32,6 +32,8 @@ sha2 = "0.11"
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 proptest = "1"
 unicode-segmentation = "1"
+# Finds text by a pattern, in time that grows only with the text. Pure Rust, and already under the maths engine.
+regex = "1"
 # The CRDT behind letters-model. No other crate may name it.
 loro = { version = "1.17", default-features = false }
 # The checksum Loro seals a history with. Only the fuzz targets name it, to seal the histories they try.
@@ -60,6 +62,11 @@ parley = { version = "0.13", default-features = false, features = ["std"] }
 parley_data = "0.13"
 # The classes parley_data answers in, for telling which side a text reads from: the version parley_data has.
 icu_properties = { version = "2.3", default-features = false }
+# The segmenter parley breaks lines with, its data provider and the type its word lists are read as, for
+# handing parley a list while the program runs: the versions parley has, which asks for this very minor one.
+icu_segmenter = { version = "~2.3.0", default-features = false, features = ["compiled_data"] }
+icu_provider = { version = "2.4", default-features = false }
+zerovec = { version = "0.11", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false }
 # Tokenizes clipboard HTML. No dependencies of its own.
 html5gum = "0.9"

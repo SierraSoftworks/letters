@@ -28,8 +28,9 @@ const BREAK: u8 = 7;
 const KEEP: u8 = 8;
 const USE: u8 = 9;
 const HELD: u8 = 10;
-/// The handle of a cell's column and of its row, and the bars that add a column and a row after it.
-const TABLE: [u8; 4] = [11, 12, 13, 14];
+/// The handle of a cell's column and of its row, and the pluses that add a column and a row after it and
+/// before it.
+const TABLE: [u8; 6] = [11, 12, 13, 14, 16, 17];
 const CALLOUT: u8 = 15;
 
 /// FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
@@ -167,10 +168,11 @@ pub(crate) fn marker(block: &BlockId, label: &str, rect: Rect, page: &mut Node, 
 
 /// Adds a handle or a bar of the table that shows them under the page: a button, which a click presses.
 /// It is told by `cell`, a cell of the column or row it acts on. `row` is whether it acts on a row, and
-/// `add` whether it adds one at the end. `rect` is where it stands in the page area.
+/// `does` what a press does: 0 opens its menu, 1 adds one at the end and 2 adds one before it. `rect` is
+/// where it stands in the page area.
 pub(crate) fn table_part(
     cell: &BlockId,
-    (row, add): (bool, bool),
+    (row, does): (bool, u8),
     label: &str,
     rect: Rect,
     page: &mut Node,
@@ -180,7 +182,7 @@ pub(crate) fn table_part(
     button.set_label(label);
     button.add_action(Action::Click);
     button.set_bounds(placed(page, rect));
-    let id = part_node(cell, TABLE[usize::from(row) + 2 * usize::from(add)]);
+    let id = part_node(cell, TABLE[usize::from(row) + 2 * usize::from(does)]);
     page.push_child(id);
     nodes.push((id, button));
 }
@@ -461,11 +463,12 @@ pub(crate) enum Request {
     Alt(BlockId),
     /// Presses the marker of the notes beside a block.
     Note(BlockId),
-    /// Presses the handle of a cell's column or of its row, or the bar that adds one after it.
+    /// Presses the handle of a cell's column or of its row, the plus that adds one at the end or the plus
+    /// that adds one before it: `does` is 0, 1 or 2 in that order.
     Table {
         cell: BlockId,
         row: bool,
-        add: bool,
+        does: u8,
     },
     /// Presses what Print view shows of the page break before a block.
     Break(BlockId),
@@ -503,7 +506,7 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
                 (0..TABLE.len()).find_map(found).map(|(cell, at)| Request::Table {
                     cell,
                     row: at % 2 == 1,
-                    add: at >= 2,
+                    does: (at / 2) as u8,
                 })
             };
             let found = ticked.or_else(copied).or_else(switched).or_else(called).or_else(noted).or_else(broken);

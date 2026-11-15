@@ -82,6 +82,7 @@ pub(crate) struct Input<M> {
     pub style: TextStyle,
     pub on_input: Option<Rc<dyn Fn(String) -> M>>,
     pub on_submit: Option<M>,
+    pub on_submit_back: Option<M>,
     pub on_leave: Option<M>,
     pub on_cancel: Option<M>,
 }
