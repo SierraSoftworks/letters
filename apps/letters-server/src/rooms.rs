@@ -22,8 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use letters_api::{Action, Code, Role};
-use letters_format::{ASSETS, Archive, Error, Files, Save, Saved, Unsaved, WorkingCopy, is_journal};
-use letters_model::ReplicaId;
+use letters_format::{ASSETS, Archive, Error, Files, Save, Saved, Unsaved, is_journal};
 use letters_sync::{Access, ClientMessage, LOOK_EVERY, Outbound, Refusal as Ended, Room, SessionId};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
@@ -609,8 +608,9 @@ impl Hosted {
         let stamp = Files::stamp(&mut folder, name).ok().flatten();
         let mut archive = Archive::open(BufReader::new(folder.open(name)?))?;
         // A replica of this room's own: what it settles between two devices is written under it. Any
-        // writer of the folder may have left the file, so its history is checked before it is loaded.
-        let copy = WorkingCopy::open_wary(&mut archive, ReplicaId::new(&ids::block_id()))?;
+        // writer of the folder may have left the file, so its history is checked before it is loaded,
+        // unless the index knows these very bytes to be sound.
+        let copy = crate::library::opened(&rooms.store, root, place, &mut archive)?;
         let journal = journal.or_else(|| rooms.adopt(&copy.id)).unwrap_or_else(ids::block_id);
         let unavailable = || Refusal::new(Code::Unavailable, "The server cannot keep what is written just now.");
         let mut state = rooms.journals(&journal).ok_or_else(unavailable)?;

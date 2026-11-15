@@ -10,7 +10,7 @@ use axum::http::{Method, StatusCode};
 use common::desk::{Desk, settle};
 use common::{Client, Server, texts};
 use letters_api::{Code, Entry, Listing, Move, NewFolder, Rename, Tag, paths};
-use letters_format::{Archive, MIMETYPE, OPLOG, WorkingCopy, hash};
+use letters_format::{Archive, MIMETYPE, OPLOG, Package, WorkingCopy, hash};
 use letters_model::{Block, BlockKind, Op, Pos, ReplicaId};
 use letters_sync::{Link, Refusal, Role};
 
@@ -33,6 +33,27 @@ async fn on_file(who: &Client, id: &str) -> String {
     let sent = who.send(Method::GET, &paths::file(id), "", Vec::new()).await;
     assert_eq!(sent.status, StatusCode::OK);
     texts(sent.body).join("\n")
+}
+
+/// The file of `package` with an entry of no meaning added, so that it is `len` bytes long.
+fn padded(package: &Package, len: usize) -> Vec<u8> {
+    let made = |filler: usize, mut seed: u32| {
+        // Bytes that packing does not shrink.
+        let mut noise = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        };
+        let mut package = package.clone();
+        package.entries.insert("filler.bin".into(), (0..filler).map(|_| noise()).collect());
+        let mut bytes = Cursor::new(Vec::new());
+        letters_format::write(&mut bytes, &package).unwrap();
+        bytes.into_inner()
+    };
+    // The manifest names the filler's hash and is packed too, so a byte more of filler is not always a
+    // byte more of file: every length near the one that should fit is tried, with other noise each round.
+    let short = len.checked_sub(made(0, 0).len()).expect("the file is short of that");
+    let tries = (0..64).flat_map(|seed| (short.saturating_sub(48)..short + 8).map(move |filler| (filler, seed)));
+    tries.map(|(filler, seed)| made(filler, seed)).find(|file| file.len() == len).expect("a file of that length")
 }
 
 /// The row of the family's only document.
@@ -287,6 +308,35 @@ async fn a_file_whose_history_would_harm_is_never_merged_and_opens_without_it() 
     opened.write("Written after. ");
     settle([&mut opened]).await;
     assert!(on_file(&ada, &other).await.contains("Written after."), "its history starts over");
+}
+
+#[tokio::test]
+async fn a_file_of_the_size_and_time_the_server_knows_with_another_history_is_checked_again() {
+    let (server, ada, _) = shared("swapped").await;
+    let other = ada.start("family", "", "Other").await.id.unwrap();
+    let path = server.scratch.0.join("family/Other.let");
+    let sound = Archive::open(Cursor::new(std::fs::read(&path).unwrap())).unwrap().package().unwrap();
+    let mut harmful = sound.clone();
+    harmful.entries.insert(OPLOG.into(), HARMFUL.to_vec());
+    let len = HARMFUL.len() + 8 * 1024;
+
+    // The file table reads the file, checks its history, and from then on knows it to be sound.
+    std::fs::write(&path, padded(&sound, len)).unwrap();
+    let listing: Listing = ada.get(&paths::entries("family", "")).await.expect("the folder lists");
+    assert_eq!(listing.entries.len(), 2);
+    // Another writer leaves a file that looks the same from outside, with a history Loro panics on.
+    let stamp = std::fs::metadata(&path).unwrap();
+    std::fs::write(&path, padded(&harmful, len)).unwrap();
+    std::fs::File::options().write(true).open(&path).unwrap().set_modified(stamp.modified().unwrap()).unwrap();
+    let swapped = std::fs::metadata(&path).unwrap();
+    assert_eq!((swapped.len(), swapped.modified().unwrap()), (stamp.len(), stamp.modified().unwrap()));
+
+    // The history is another all the same, so it is checked before the room loads it, and starts over.
+    let mut opened = Desk::open(&server, &ada, &other).await.unwrap();
+    settle([&mut opened]).await;
+    opened.write("Written after. ");
+    settle([&mut opened]).await;
+    assert!(on_file(&ada, &other).await.contains("Written after."));
 }
 
 #[tokio::test]
