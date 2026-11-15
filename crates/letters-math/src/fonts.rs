@@ -82,23 +82,6 @@ pub fn provide(files: Vec<Vec<u8>>) {
     }
 }
 
-/// A maths face's place among [`FILES`], if `font` is one of them.
-pub(crate) fn place(font: &Font) -> Option<usize> {
-    let held = faces().iter().find(|face| face.font == *font)?;
-    NAMES.iter().position(|name| *name == held.name)
-}
-
-/// The maths face at a place among [`FILES`], if it is here.
-pub(crate) fn placed(place: usize) -> Option<Font> {
-    let name = NAMES.get(place)?;
-    faces().iter().find(|face| face.name == *name).map(|face| face.font.clone())
-}
-
-/// The body face, which draws the letters the maths faces lack.
-pub(crate) fn body_font() -> Option<Font> {
-    letters_fonts::bundled().into_iter().next()
-}
-
 /// The face and glyph that draw `character`: the named face, else the main one, else the body face. `None`
 /// when no bundled face has it, as for Chinese.
 pub(crate) fn glyph(face: &str, character: char) -> Option<(Font, u32)> {
@@ -128,7 +111,7 @@ pub(crate) fn body_metrics(character: char) -> Option<[f64; 3]> {
 
 /// A glyph of the body face, which draws the letters the maths faces lack, such as Cyrillic in `\text`.
 fn body(character: char) -> Option<(Font, GlyphId)> {
-    let font = body_font()?;
+    let font = letters_fonts::bundled().into_iter().next()?;
     let chars = FontRef::from_index(&font.data, font.index).ok()?.charmap();
     let id = chars.map(character).filter(|id| *id != GlyphId::NOTDEF)?;
     Some((font, id))

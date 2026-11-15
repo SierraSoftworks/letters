@@ -49,8 +49,6 @@ impl Letters {
     pub async fn start(canvas: HtmlCanvasElement, base: String) -> Result<Letters, JsValue> {
         std::panic::set_hook(Box::new(|panic| web_sys::console::error_1(&panic.to_string().into())));
         let window = web_sys::window().ok_or("there is no window")?;
-        // The engine is the editor's own again: no formula waits for one.
-        letters_math::provide_engine(letters_math::built_in());
         let mut platform = Browser::new(&window)?;
         let opened = shell::carried(&window, &mut platform);
         let server = shell::served(&window);

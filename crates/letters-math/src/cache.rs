@@ -54,10 +54,6 @@ impl Cache {
         }
 
         let result = typeset(source, style).map(Arc::new);
-        // An engine that is not here yet will be: what it sets then is what to keep.
-        if result.as_ref().is_err_and(Error::is_pending) {
-            return result;
-        }
         if self.entries.len() >= self.capacity
             && !self.entries.contains_key(&key)
             && let Some(oldest) = self.entries.iter().min_by_key(|(_, entry)| entry.used).map(|(key, _)| *key)

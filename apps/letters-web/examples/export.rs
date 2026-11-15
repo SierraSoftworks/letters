@@ -31,7 +31,6 @@ fn files(files: &Array) -> Vec<Vec<u8>> {
 pub fn fonts(fonts: &Array, maths: &Array) {
     letters_fonts::provide(files(fonts));
     letters_math::provide_fonts(files(maths));
-    letters_math::provide_engine(letters_math::built_in());
 }
 
 // The editor's own module, taken by its file: naming the editor's crate here would link the editor in.
