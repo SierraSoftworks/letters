@@ -44,7 +44,7 @@ use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowAttributes
 use crate::chrome::{self, Buttons, Host};
 use crate::cli::{Format, Mode, Options};
 use crate::conflicts;
-use crate::connected::{self, Line, Placed, Placing, Reached, Said, Told};
+use crate::connected::{self, Line, Placed, Placing, Reached, Said, Shelf, Told};
 use crate::convert;
 use crate::copies;
 use crate::dictionaries;
@@ -423,6 +423,11 @@ enum GpuState {
     Ready(Box<Gpu>),
 }
 
+/// A folder of this device as the window lists it. One whose path is no text is left out.
+fn shown(folder: crate::library::Folder) -> Option<letters_ui::Folder> {
+    Some(letters_ui::Folder { path: folder.path.to_str()?.to_owned(), name: folder.name, depth: folder.depth })
+}
+
 /// What a window holds of a document that lives on a server.
 struct Remote {
     line: Line,
@@ -450,6 +455,8 @@ struct Remote {
     /// the document stands.
     live: bool,
     looked: Option<Instant>,
+    /// The folders of the document's space as the server last listed them, which it can move among.
+    shelves: Vec<Shelf>,
 }
 
 impl Remote {
@@ -501,11 +508,21 @@ impl Remote {
         }
     }
 
-    /// The folder the server keeps the document in, as the bar is told it.
-    fn folder(&self) -> PathBuf {
-        let folder = self.opened.path.rsplit_once('/').map_or("", |(folder, _)| folder);
+    /// What the bar is told a folder of the document's space by: no path on this device.
+    fn key(&self, folder: &str) -> String {
         let parts = [self.host.as_str(), self.opened.space.as_deref().unwrap_or_default(), folder];
-        parts.iter().filter(|part| !part.is_empty()).collect()
+        parts.into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("/")
+    }
+
+    /// The folder the server keeps the document in, as the bar is told it.
+    fn folder(&self) -> String {
+        self.key(self.opened.path.rsplit_once('/').map_or("", |(folder, _)| folder))
+    }
+
+    /// The space and the folder of it that the bar knows by `key`, if it is one the server listed.
+    fn shelf(&self, key: &str) -> Option<(String, String)> {
+        let shelf = self.shelves.iter().find(|shelf| self.key(&shelf.path) == key)?;
+        Some((self.opened.space.clone()?, shelf.path.clone()))
     }
 
     /// Has the server asked how the document stands, if it has not been for a while: nothing tells an
@@ -706,7 +723,6 @@ fn lies_at(folder: &Path, other: &Path) -> bool {
 const UNKEPT: &str = "The server did not take a picture, so the others who open this document will not see it.";
 
 /// What the bar says when asked to rename or move a server's document.
-const AT_ITS_SERVER: &str = "This document lives on a server, and is moved there.";
 /// How long a server's answer about a document's name and place holds for a window that is turned to
 /// again.
 const LOOK_AFTER: Duration = Duration::from_secs(30);
@@ -969,22 +985,45 @@ impl DocWindow {
         // has only a stand-in name for takes its first heading's, as a new document does.
         let named = self.remote.as_ref().map_or(!self.place.naming(), |remote| remote.opened.named);
         let name = named.then(|| self.place.name());
-        let at = self.remote.as_ref().map(Remote::folder);
-        let remote = at.is_some();
+        let at = self.remote.as_ref().map(|remote| PathBuf::from(remote.folder()));
         let folder = at.unwrap_or_else(|| self.place.folder(library));
         if self.located.as_ref().is_some_and(|(told, at)| (told, at) == (&name, &folder)) {
             return;
         }
-        let shown = |folder: crate::library::Folder| {
-            Some(letters_ui::Folder { path: folder.path.to_str()?.to_owned(), name: folder.name, depth: folder.depth })
+        // It moves among the folders of its space, which are all the places there are for it.
+        let folders = match &self.remote {
+            Some(remote) => {
+                let shown = |shelf: &Shelf| letters_ui::Folder {
+                    path: remote.key(&shelf.path),
+                    name: shelf.name.clone(),
+                    depth: shelf.depth,
+                };
+                remote.shelves.iter().map(shown).collect()
+            }
+            None => library.folders(&folder).into_iter().filter_map(shown).collect(),
         };
         self.view.set_location(Location {
             name: name.clone(),
             folder: folder.to_string_lossy().into_owned(),
-            folders: if remote { Vec::new() } else { library.folders(&folder).into_iter().filter_map(shown).collect() },
-            ..Location::default()
+            folders,
+            closed: self.remote.is_some(),
         });
         self.located = Some((name, folder));
+    }
+
+    /// Tells the view where copies of a server's document go: among the person's own folders, since the
+    /// folders the bar lists are the server's. A copy of any other document goes beside it.
+    fn recopy(&mut self, library: &Library) {
+        let own = self.remote.is_some().then(|| {
+            let folder = library.default_folder();
+            Location {
+                name: None,
+                folders: library.folders(&folder).into_iter().filter_map(shown).collect(),
+                folder: folder.to_string_lossy().into_owned(),
+                closed: false,
+            }
+        });
+        self.view.set_copy_location(own);
     }
 
     /// Renames or moves the document, or makes a folder for it, as the bar asked, and answers the bar:
@@ -1266,7 +1305,9 @@ impl DocWindow {
             turn: 0,
             live: false,
             looked: None,
+            shelves: Vec::new(),
         });
+        self.recopy(library);
         self.recomment();
         self.located = None;
         self.relocate(library);
@@ -1414,6 +1455,11 @@ impl DocWindow {
             let opened = &mut remote.opened;
             (opened.name, opened.named, opened.space, opened.path) = (now.name, now.named, now.space, now.path);
             self.place.call(&remote.opened.name);
+        }
+        if let Some(shelves) = placed.shelves.filter(|shelves| turn == remote.turn && *shelves != remote.shelves) {
+            remote.shelves = shelves;
+            // The bar lists them, whether or not the document is where it was.
+            self.located = None;
         }
         match placed.refused {
             // The name field comes back with what was typed, so the bar is told only what changed.
@@ -2121,15 +2167,31 @@ impl App {
                     if self.windows.get(&id).is_some_and(|window| window.remote.is_some()) =>
                 {
                     let Some(window) = self.windows.get_mut(&id) else { continue };
-                    match (request, &mut window.remote) {
-                        // Its server renames it, and the bar is told once the server has answered.
-                        (Request::Rename(name), Some(remote)) => remote.asks.push(Placing::Rename(name)),
-                        // Only the server can, and nothing here asks it to yet.
-                        _ => {
-                            window.view.set_notice(Some(AT_ITS_SERVER));
+                    let Some(remote) = &mut window.remote else { continue };
+                    // Its server renames and moves it, and the bar is told once the server has answered.
+                    let ask = match request {
+                        Request::Rename(name) => Some(Placing::Rename(name)),
+                        Request::Move(key) => remote.shelf(&key).map(|(space, folder)| Placing::Move { space, folder }),
+                        Request::NewFolder { parent, name } => match remote.shelf(&parent) {
+                            Some((space, parent)) => Some(Placing::NewFolder { space, parent, name }),
+                            // The card that saves a copy asked, for a folder of this device. The person's
+                            // own folder is listed before anything was written to it. One that is made, or
+                            // was there already, is listed and so picked.
+                            None => {
+                                let _ = fs::create_dir_all(&parent);
+                                let _ = self.library.new_folder(Path::new(&parent), &name);
+                                window.recopy(&self.library);
+                                continue;
+                            }
+                        },
+                        _ => None,
+                    };
+                    match ask {
+                        Some(ask) => remote.asks.push(ask),
+                        // A folder the server no longer lists: the bar is told what there is.
+                        None => {
                             window.located = None;
                             window.relocate(&self.library);
-                            refused = true;
                         }
                     }
                 }
@@ -2314,9 +2376,20 @@ impl App {
         }
         let source = window.file().ok_or(copies::Refused::Nothing)?.to_owned();
         let (output, replace) = match folder {
-            Some(folder) => (copies::path(folder, name, format)?, replace),
+            Some(folder) => {
+                // The person's own folder is offered for a server's document before anything is in it.
+                if window.remote.is_some() {
+                    let _ = fs::create_dir_all(folder);
+                }
+                (copies::path(folder, name, format)?, replace)
+            }
             None => {
-                let suggested = copies::path(&window.place.folder(&self.library), name, format)?;
+                // A server's document is copied to the person's own folders, not beside its copy here.
+                let beside = match window.remote {
+                    Some(_) => self.library.default_folder(),
+                    None => window.place.folder(&self.library),
+                };
+                let suggested = copies::path(&beside, name, format)?;
                 let dialog = FileDialog::new()
                     .add_filter(copies::kind(format), &[copies::extension(format)])
                     .set_directory(suggested.parent().unwrap_or(Path::new("")))
