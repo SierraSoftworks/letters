@@ -11,8 +11,19 @@ use letters_model::{
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
+use proptest::test_runner::RngSeed;
 
 const REPLICAS: usize = 3;
+
+/// The cases a run draws. A plain run draws the same ones every time, so that a fault in a rare
+/// interleaving fails the change that made it, and no change after. `PROPTEST_CASES=1500` draws that many
+/// afresh, which is how new faults are looked for. One that fails is kept beside this file and run first.
+fn cases(cases: u32) -> ProptestConfig {
+    match std::env::var_os("PROPTEST_CASES") {
+        Some(_) => ProptestConfig::default(),
+        None => ProptestConfig { cases, rng_seed: RngSeed::Fixed(1_800_000_000), ..ProptestConfig::default() },
+    }
+}
 
 /// An edit by rough place. [`op`] fits it to whatever the document holds when its turn comes.
 #[derive(Clone, Debug)]
@@ -420,7 +431,7 @@ fn touched(word: usize, touch: &Touch) -> (Vec<Op>, usize, Option<usize>) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+    #![proptest_config(cases(512))]
 
     /// Settling only ever replaces text where two writers changed the same word. Text typed beside a word
     /// is no change to the word, and neither is anything done to another word: all of it stays.
@@ -465,7 +476,7 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+    #![proptest_config(cases(128))]
 
     #[test]
     fn replicas_converge_however_their_edits_interleave(steps in vec(step(), 1..48)) {
