@@ -112,8 +112,11 @@ pub fn from_docx(
         counts: BTreeMap::new(),
         assets: BTreeMap::new(),
         pictures: BTreeMap::new(),
+        turns: turns(body),
     };
     let mut blocks = reader.blocks(body, &rels);
+    // The parts read from here on count their nodes anew.
+    reader.turns.clear();
 
     // Notes follow the text, in the order it first cites them.
     let (footnotes_xml, endnotes_xml) = (read(&footnotes)?, read(&endnotes)?);
@@ -149,6 +152,7 @@ pub fn from_docx(
         blocks.append(&mut inner);
     }
     settle(&mut blocks);
+    let language = languages(&mut blocks, reader.styles.language());
 
     if furniture.iter().any(|part| shows_text(part)) {
         reader.whole.push(HEADERS.into());
@@ -174,8 +178,8 @@ pub fn from_docx(
     }
 
     let mut document = Document { blocks, ..Document::default() };
-    if let Some(language) = reader.styles.language.as_deref().filter(|tag| is_language(tag)) {
-        document.language = language.to_owned();
+    if let Some(language) = language {
+        document.language = language;
     }
     let notes = match (&comments, read(&comments)?) {
         (Some((.., rels)), Some(xml)) => {
@@ -187,9 +191,93 @@ pub fn from_docx(
     Ok(DocxImport { document, style, notes: reader.notes, comments: notes, assets: reader.assets })
 }
 
-/// Whether a tag is shaped as BCP 47 asks.
-fn is_language(tag: &str) -> bool {
-    !tag.is_empty() && tag.split('-').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric()))
+/// The paragraphs after which a new page starts because a section ends there. A section says how it starts
+/// in its own properties, which sit where it ends.
+fn turns(body: Node) -> BTreeSet<usize> {
+    let mut turns = BTreeSet::new();
+    // The paragraph that ended the section before, until the next section says how it starts.
+    let mut ended = None;
+    let sections = body.descendants().filter(|node| node.is("sectPr"));
+    for (section, parent) in sections.filter_map(|section| Some((section, section.parent()?))) {
+        let paragraph = parent.parent().filter(|paragraph| parent.is("pPr") && paragraph.is("p"));
+        if paragraph.is_none() && !parent.is("body") {
+            continue;
+        }
+        let page = !matches!(section.value("type"), Some("continuous" | "nextColumn"));
+        turns.extend(ended.take().filter(|_| page));
+        ended = paragraph.map(|paragraph| paragraph.id().get_usize());
+    }
+    turns
+}
+
+/// Settles which language each text is in, and returns the document's.
+///
+/// Word names a language on nearly every run, often another than the one its styles start from. So the
+/// language most of the text is in is the document's, and only text in another keeps a tag: on its block
+/// where the whole block agrees, and on its runs otherwise.
+fn languages(blocks: &mut [Block], declared: Option<&str>) -> Option<String> {
+    fn count(blocks: &[Block], declared: Option<&str>, sizes: &mut BTreeMap<Option<String>, usize>) {
+        for block in blocks {
+            for run in block.body.runs().iter().filter(|run| spoken(run)) {
+                let language = run.lang.as_deref().or(declared).map(str::to_owned);
+                *sizes.entry(language).or_default() += run.text.len();
+            }
+            count(block.body.blocks(), declared, sizes);
+        }
+    }
+    /// Tags what differs from `main`, and says whether the blocks hold any words.
+    fn tag(blocks: &mut [Block], declared: Option<&str>, main: Option<&str>) -> bool {
+        let mut any = false;
+        for block in blocks {
+            let worded = match &mut block.body {
+                Body::Text(runs) => {
+                    for run in runs.iter_mut() {
+                        let language = run.lang.take().or_else(|| declared.map(str::to_owned));
+                        run.lang = language.filter(|language| spoken(run) && Some(language.as_str()) != main);
+                    }
+                    let mut words = runs.iter().filter(|run| spoken(run)).map(|run| run.lang.clone());
+                    let first = words.next();
+                    if let Some(Some(shared)) = first.clone().filter(|first| words.all(|other| other == *first)) {
+                        runs.iter_mut().for_each(|run| run.lang = None);
+                        block.lang = Some(shared);
+                    }
+                    merge(runs);
+                    first.is_some()
+                }
+                Body::Blocks(inner) => {
+                    let worded = tag(inner, declared, main);
+                    // A quote all in one language says so once.
+                    let mut inside = inner.iter().filter(|block| words(block)).map(|block| block.lang.clone());
+                    let first = inside.next();
+                    if let Some(Some(shared)) = first.clone().filter(|first| inside.all(|other| other == *first)) {
+                        inner.iter_mut().for_each(|block| block.lang = None);
+                        block.lang = Some(shared);
+                    }
+                    worded
+                }
+                Body::None => false,
+            };
+            any |= worded;
+        }
+        any
+    }
+    fn words(block: &Block) -> bool {
+        block.body.runs().iter().any(spoken) || block.body.blocks().iter().any(words)
+    }
+
+    let mut sizes = BTreeMap::new();
+    count(blocks, declared, &mut sizes);
+    // Most of the text decides, and what the styles say settles a tie.
+    let declared_key = declared.map(str::to_owned);
+    let most = sizes.iter().max_by_key(|(language, size)| (**size, **language == declared_key));
+    let main = most.and_then(|(language, _)| language.clone()).or(declared_key);
+    tag(blocks, declared, main.as_deref());
+    main
+}
+
+/// Whether a run holds words in some language: code and maths are in none.
+fn spoken(run: &Run) -> bool {
+    !run.text.trim().is_empty() && !run.marks.contains(&Mark::Code) && !run.marks.contains(&Mark::Math)
 }
 
 /// Whether a header or footer shows any words or numbers.
@@ -206,7 +294,7 @@ fn text_of(node: Node) -> String {
 /// Joins neighbouring runs that share their formatting.
 fn merge(runs: &mut Vec<Run>) {
     runs.dedup_by(|next, last| {
-        let same = last.marks == next.marks && last.link == next.link;
+        let same = last.marks == next.marks && last.link == next.link && last.lang == next.lang;
         if same {
             last.text.push_str(&next.text);
         }
@@ -308,6 +396,12 @@ struct Para {
     ruled: bool,
     /// Whether any of it belongs to a table of contents.
     contents: bool,
+    /// The language of the run being read.
+    lang: Option<String>,
+    /// Whether a page break comes before any of the text.
+    breaks: bool,
+    /// Whether a page break comes after some of the text.
+    broken: bool,
 }
 
 impl Para {
@@ -316,9 +410,10 @@ impl Para {
             return;
         }
         self.len += text.len();
+        let lang = self.lang.clone();
         match self.runs.last_mut() {
-            Some(last) if last.marks == *marks && last.link == link => last.text.push_str(text),
-            _ => self.runs.push(Run { text: text.into(), marks: marks.clone(), link, ..Run::default() }),
+            Some(last) if last.marks == *marks && last.link == link && last.lang == lang => last.text.push_str(text),
+            _ => self.runs.push(Run { text: text.into(), marks: marks.clone(), link, lang, ..Run::default() }),
         }
     }
 
@@ -353,6 +448,8 @@ struct Out {
     pending: Vec<&'static str>,
     /// The numbers the page will give the list being read, level by level.
     counters: Vec<u32>,
+    /// Whether the next block starts a new page.
+    broken: bool,
 }
 
 struct Reader<'a, 'f> {
@@ -387,6 +484,8 @@ struct Reader<'a, 'f> {
     assets: BTreeMap<String, Vec<u8>>,
     /// The asset each picture part became, or why it became none, so that a part is read once.
     pictures: BTreeMap<String, Result<String, String>>,
+    /// The paragraphs of the body after which a section starts a new page, by the number of their node.
+    turns: BTreeSet<usize>,
 }
 
 impl Reader<'_, '_> {
@@ -406,8 +505,9 @@ impl Reader<'_, '_> {
         }
     }
 
-    /// Adds a block, with the notes that were waiting for one.
-    fn push(&mut self, block: Block, out: &mut Out) {
+    /// Adds a block, with the notes and the page break that were waiting for one.
+    fn push(&mut self, mut block: Block, out: &mut Out) {
+        block.page_break |= std::mem::take(&mut out.broken);
         for message in std::mem::take(&mut out.pending) {
             self.note(&block.id, message);
         }
@@ -498,12 +598,19 @@ impl Reader<'_, '_> {
             task: None,
             ruled: direct.ruled == Some(true),
             contents: role == Role::Contents || self.fields.iter().any(|field| field.contents),
+            lang: None,
+            breaks: false,
+            broken: false,
         };
         self.inline(node, &Inline { rels, link: None, depth: 0 }, &mut para);
         if !para.is_blank() && props.align.unwrap_or(Align::Start) != expected.unwrap_or(Align::Start) {
             self.whole(DIRECT);
         }
+        // A break before the text starts this block on a new page, and one after it the block that follows.
+        out.broken |= para.breaks || props.page_break == Some(true);
+        let later = para.broken || self.turns.contains(&node.id().get_usize());
         self.emit(para, &props, out);
+        out.broken |= later;
     }
 
     /// Turns a paragraph into its block, or into more of the block before it.
@@ -581,7 +688,8 @@ impl Reader<'_, '_> {
             // Word spaces text with empty paragraphs. Here the style does that.
         } else if para.role == Role::Code {
             let text: String = runs.iter().map(|run| run.text.as_str()).collect();
-            let open = out.blocks.last_mut().filter(|_| out.open == Open::Code);
+            // Code that starts a new page is a block of its own.
+            let open = out.blocks.last_mut().filter(|_| out.open == Open::Code && !out.broken);
             if let Some(Block { id, body: Body::Text(code), .. }) = open {
                 let base = code.iter().map(|run| run.text.len()).sum::<usize>() + 1;
                 code.push(Run::plain(format!("\n{text}")));
@@ -603,6 +711,8 @@ impl Reader<'_, '_> {
             }
         } else if para.role == Role::Caption && captions(out.blocks.last()) && after.is_empty() {
             let figure = out.blocks.last_mut().expect("a figure was just found");
+            runs.iter_mut().for_each(|run| run.lang = None);
+            merge(&mut runs);
             figure.extra.insert("content".into(), Run::list_to_value(&runs));
             let id = figure.id.clone();
             place(self, &id, 0);
@@ -660,6 +770,7 @@ impl Reader<'_, '_> {
             match wrapper {
                 Open::Nothing => self.push(block, out),
                 _ if out.open == wrapper => {
+                    block.page_break = std::mem::take(&mut out.broken);
                     if let Some(Body::Blocks(inner)) = out.blocks.last_mut().map(|block| &mut block.body) {
                         inner.push(block);
                     }

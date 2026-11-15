@@ -72,6 +72,8 @@ const STYLES: &str = r#"
   <w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style>
 <w:style w:type="paragraph" w:styleId="Warn"><w:name w:val="Callout Warn"/><w:basedOn w:val="Std"/></w:style>
 <w:style w:type="paragraph" w:styleId="Toc1"><w:name w:val="toc 1"/><w:basedOn w:val="Std"/></w:style>
+<w:style w:type="paragraph" w:styleId="Chapter"><w:name w:val="Chapter"/><w:basedOn w:val="H1"/>
+  <w:pPr><w:pageBreakBefore/></w:pPr></w:style>
 <w:style w:type="character" w:styleId="Mono"><w:name w:val="Verbatim Char"/>
   <w:rPr><w:rFonts w:ascii="Fira Code" w:hAnsi="Fira Code"/></w:rPr></w:style>
 <w:style w:type="character" w:styleId="Link"><w:name w:val="Hyperlink"/>
@@ -432,6 +434,98 @@ fn reads_lists() {
     }
 }
 
+/// The text of each block that starts a new page.
+fn turned(doc: &Document) -> Vec<String> {
+    doc.walk().filter(|block| block.page_break).map(Block::plain_text).collect()
+}
+
+#[test]
+fn reads_where_pages_start() {
+    let page = r#"<w:r><w:br w:type="page"/></w:r>"#;
+    let breaking = |props: &str, text: &str| para(&format!("{props}<w:pageBreakBefore/>"), &t(text));
+    let ending = |section: &str, text: &str| para(&format!("<w:sectPr>{section}</w:sectPr>"), &t(text));
+    let running = r#"<w:type w:val="continuous"/>"#;
+    let cases: &[(String, &[&str])] = &[
+        (p("a") + &breaking("", "b") + &p("c"), &["b"]),
+        // A style can start each of its paragraphs on a page.
+        (p("a") + &styled("Chapter", "b") + &styled("Chapter", "c"), &["b", "c"]),
+        // A break in the text: in the empty paragraph Word's button makes, before a paragraph's text, and after it.
+        (p("a") + &format!("<w:p>{page}</w:p>") + &p("b"), &["b"]),
+        (p("a") + &format!("<w:p>{page}{}</w:p>", t("b")), &["b"]),
+        (format!("<w:p>{}{page}</w:p>", t("a")) + &p("b") + &p("c"), &["b"]),
+        // A section starts on a new page unless it says that it runs on. Each says so where it ends.
+        (ending("", "a") + &p("b") + "<w:sectPr/>", &["b"]),
+        (ending("", "a") + &ending(running, "b") + &p("c") + "<w:sectPr/>", &["c"]),
+        (ending("", "a") + &p("b") + &format!("<w:sectPr>{running}</w:sectPr>"), &[]),
+        // Inside a quote the break stays on its paragraph, and code that starts a page is a block of its own.
+        (styled("Q", "a") + &breaking(r#"<w:pStyle w:val="Q"/>"#, "b"), &["b"]),
+        (styled("Src", "a") + &breaking(r#"<w:pStyle w:val="Src"/>"#, "b") + &styled("Src", "c"), &["b\nc"]),
+        // A column break is no page break, and neither is a line break.
+        (p("a") + r#"<w:p><w:r><w:br w:type="column"/><w:br/></w:r></w:p>"# + &p("b"), &[]),
+    ];
+    for (body, expected) in cases {
+        assert_eq!(turned(&read(&word(body)).document), *expected, "reading {body}");
+    }
+}
+
+/// Each block that holds words or names a language: its language where it names one, then its text with
+/// each run in a language of its own as `<fr|mot>`.
+fn tongues(doc: &Document) -> Vec<String> {
+    let run = |run: &Run| match &run.lang {
+        Some(lang) => format!("<{lang}|{}>", run.text),
+        None => run.text.clone(),
+    };
+    let line = |block: &Block| {
+        let text: String = block.body.runs().iter().map(run).collect();
+        let lang = block.lang.as_ref().map(|lang| format!("{lang}: "));
+        (lang.is_some() || !text.is_empty()).then(|| lang.unwrap_or_default() + &text)
+    };
+    doc.walk().filter_map(line).collect()
+}
+
+#[test]
+fn reads_the_language_text_is_in() {
+    let lang = |tag: &str, text: &str| run(&format!(r#"<w:lang w:val="{tag}"/>"#), text);
+    let quoted = |inner: &str| para(r#"<w:pStyle w:val="Q"/>"#, inner);
+    // The shared styles start from British English.
+    let cases: &[(String, &str, &[&str])] = &[
+        (p("Hello") + &p("World"), "en-GB", &["Hello", "World"]),
+        // A passage in another language is tagged, and a block all in one says so once.
+        (format!("<w:p>{}{}</w:p>", t("The word "), lang("fr-FR", "mot")), "en-GB", &["The word <fr-FR|mot>"]),
+        (
+            p("Hello there, everyone")
+                + &format!("<w:p>{}{}</w:p>", lang("fr-FR", "Bonjour "), lang("fr-FR", "à tous")),
+            "en-GB",
+            &["Hello there, everyone", "fr-FR: Bonjour à tous"],
+        ),
+        (
+            p("Hello there, all") + &quoted(&lang("es", "Hola")) + &quoted(&lang("es", "Mundo")),
+            "en-GB",
+            &["Hello there, all", "es: ", "Hola", "Mundo"],
+        ),
+        // Word tags every run with the language it was typed in, whatever its styles start from. The
+        // language of most of the text is the document's.
+        (
+            format!("<w:p>{}</w:p>", lang("de-DE", "Guten Morgen zusammen")) + &p("Hello") + &p("12"),
+            "de-DE",
+            &["Guten Morgen zusammen", "en-GB: Hello", "en-GB: 12"],
+        ),
+        // Code is in no language.
+        (
+            format!("<w:p>{}{}</w:p>", lang("fr-FR", "Bonjour "), run(r#"<w:rStyle w:val="Mono"/>"#, "x"))
+                + &p("Hello, all"),
+            "en-GB",
+            &["fr-FR: Bonjour x", "Hello, all"],
+        ),
+    ];
+    for (body, language, expected) in cases {
+        let document = read(&word(body)).document;
+        assert_eq!(tongues(&document), *expected, "reading {body}");
+        assert_eq!(document.language, *language, "reading {body}");
+    }
+    assert_eq!(read(&bare(&p("Hello"))).document.language, Document::default().language, "a file that names none");
+}
+
 #[test]
 fn notes_numbers_the_page_will_not_show() {
     // The body, the item to look at, and the number Word gave it where the page starts again at 1.
@@ -549,6 +643,11 @@ fn keeps_the_text_of_what_it_simplifies_and_says_so() {
         (chart.to_owned(), &["Chart: "], "drawing"),
         (styled("T", "Report"), &["Report"], "Title"),
         (styled("H6", "Deep"), &["Deep"], "level 6"),
+        (
+            format!(r#"<w:p>{}<w:r><w:br w:type="page"/></w:r>{}</w:p>"#, t("Before "), t("after")),
+            &["Before after"],
+            "page break",
+        ),
     ];
     for (body, texts, note) in cases {
         let import = read(&word(body));
@@ -881,6 +980,37 @@ fn a_document_survives_a_round_trip() {
         assert_eq!(back.notes, [], "nothing of {markdown:?} is simplified");
         assert_eq!(back.document.language, doc.language);
     }
+}
+
+#[test]
+fn page_breaks_and_languages_survive_a_round_trip() {
+    let text = |kind: BlockKind, text: &str| Block::text("", kind, text);
+    let turning = |block: Block| Block { page_break: true, ..block };
+    let in_lang = |lang: &str, block: Block| Block { lang: Some(lang.into()), ..block };
+    let item = BlockKind::ListItem { list: ListKind::Ordered, depth: 0 };
+    let mixed = vec![Run::plain("The word "), Run { lang: Some("de".into()), ..Run::marked("Wort", [Mark::Bold]) }];
+    let quote = Block {
+        body: Body::Blocks(vec![text(BlockKind::Paragraph, "Hola"), turning(text(item.clone(), "Mundo"))]),
+        ..in_lang("es", Block::new("", BlockKind::Quote))
+    };
+    let blocks = vec![
+        text(BlockKind::Paragraph, "Hello there, everyone"),
+        turning(text(BlockKind::Heading { level: 1 }, "Chapter two")),
+        in_lang("fr-FR", text(BlockKind::Paragraph, "Bonjour")),
+        paragraph("", mixed),
+        turning(quote),
+        turning(in_lang("fr-FR", text(item, "Un"))),
+        text(BlockKind::Code { language: None }, "one()"),
+        turning(text(BlockKind::Code { language: None }, "two()")),
+        turning(Block::new("", BlockKind::Divider)),
+    ];
+    let doc = Document { blocks, language: "en-AU".into(), ..Document::default() };
+    let back = returned(&doc).document;
+
+    assert_eq!(outline(&back), outline(&doc));
+    assert_eq!(turned(&back), turned(&doc));
+    assert_eq!(tongues(&back), tongues(&doc));
+    assert_eq!(back.language, "en-AU");
 }
 
 #[test]

@@ -31,6 +31,8 @@ pub(super) struct RunProps {
     pub color: Option<String>,
     /// The character style named here.
     pub style: Option<String>,
+    /// The language the text is in, as a BCP 47 tag.
+    pub lang: Option<String>,
 }
 
 impl RunProps {
@@ -48,6 +50,7 @@ impl RunProps {
             size: self.size.or(base.size),
             color: self.color.or_else(|| base.color.clone()),
             style: self.style.or_else(|| base.style.clone()),
+            lang: self.lang.or_else(|| base.lang.clone()),
         }
     }
 
@@ -74,8 +77,14 @@ impl RunProps {
             size: props.number::<f32>("sz").map(|half| half / 2.0).filter(|size| *size > 0.0),
             color: props.value("color").and_then(color),
             style: props.value("rStyle").map(str::to_owned),
+            lang: props.value("lang").filter(|tag| is_language(tag)).map(str::to_owned),
         }
     }
+}
+
+/// Whether a tag is shaped as BCP 47 asks.
+fn is_language(tag: &str) -> bool {
+    !tag.is_empty() && tag.split('-').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// A colour as the style writes one. Word's `auto` is black on a white page.
@@ -260,8 +269,6 @@ pub(super) struct Styles {
     run: RunProps,
     /// The paragraph style of a paragraph that names none.
     normal: Option<String>,
-    /// The language the document is written in, when Word recorded one.
-    pub language: Option<String>,
 }
 
 impl Styles {
@@ -271,7 +278,6 @@ impl Styles {
         if let Some(defaults) = root.child("docDefaults") {
             if let Some(props) = defaults.child("rPrDefault").and_then(|node| node.child("rPr")) {
                 styles.run = RunProps::read(props, theme);
-                styles.language = props.value("lang").map(str::to_owned);
             }
             if let Some(props) = defaults.child("pPrDefault").and_then(|node| node.child("pPr")) {
                 styles.para = ParaProps::read(props);
@@ -293,6 +299,11 @@ impl Styles {
             styles.by_id.insert(id.to_owned(), read);
         }
         styles
+    }
+
+    /// The language text is in where nothing says otherwise, when Word recorded one.
+    pub fn language(&self) -> Option<&str> {
+        self.run.lang.as_deref()
     }
 
     /// A style and those it is based on, nearest first.

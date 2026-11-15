@@ -35,6 +35,8 @@ const TASKS_DONE: usize = 3;
 const LIST_INDENT: usize = 360;
 /// The longest address Word follows. A longer one is written as its text alone.
 const LONGEST_LINK: usize = 2000;
+/// What starts a paragraph on a new page.
+const BREAK: &str = "<w:pageBreakBefore/>";
 
 /// Writes a `.docx` with `style` as its styles.
 ///
@@ -57,6 +59,8 @@ pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets
         anchors: BTreeMap::new(),
         pending: Vec::new(),
         measure: (page.width - page.margin_left - page.margin_right).max(1.0),
+        breaks: false,
+        lang: None,
     };
     let comments = writer.plan(doc, notes);
     writer.blocks(&doc.blocks, None);
@@ -299,6 +303,10 @@ struct Writer<'d, 'a> {
     pending: Vec<Range<usize>>,
     /// The width of the text column in points, which no picture is drawn wider than.
     measure: f32,
+    /// Whether the next paragraph starts a new page.
+    breaks: bool,
+    /// The language of the block being written, where it is not the document's.
+    lang: Option<&'d str>,
 }
 
 impl<'d> Writer<'d, '_> {
@@ -322,7 +330,11 @@ impl<'d> Writer<'d, '_> {
 
     /// Writes sibling blocks. `within` is the style of the quote or callout around them.
     fn blocks(&mut self, blocks: &'d [Block], within: Option<&'static str>) {
+        let around = self.lang;
         for block in blocks {
+            // The first paragraph a block writes carries its page break, and all of them its language.
+            self.breaks |= block.page_break;
+            self.lang = block.lang.as_deref().or(around);
             let mut spans = Vec::new();
             for (range, comments) in self.anchors.remove(block.id.as_str()).unwrap_or_default() {
                 match range.filter(|_| !block.body.runs().is_empty()) {
@@ -370,6 +382,7 @@ impl<'d> Writer<'d, '_> {
                 }
             }
         }
+        self.lang = around;
     }
 
     /// Writes what a quote or a callout holds. Word has no block that holds others, so each paragraph inside
@@ -416,10 +429,14 @@ impl<'d> Writer<'d, '_> {
         mut spans: Vec<(Range<usize>, Range<usize>)>,
     ) {
         self.out.push_str("<w:p>");
-        if !style.is_empty() || list.is_some() {
+        let breaks = std::mem::take(&mut self.breaks);
+        if !style.is_empty() || list.is_some() || breaks {
             self.out.push_str("<w:pPr>");
             if !style.is_empty() {
                 let _ = write!(self.out, "<w:pStyle w:val=\"{style}\"/>");
+            }
+            if breaks {
+                self.out.push_str(BREAK);
             }
             if let Some((list, depth)) = list {
                 let _ = write!(self.out, "<w:numPr><w:ilvl w:val=\"{depth}\"/><w:numId w:val=\"{list}\"/></w:numPr>");
@@ -429,7 +446,7 @@ impl<'d> Writer<'d, '_> {
         let len: usize = runs.iter().map(|run| run.text.len()).sum();
         spans.extend(self.pending.drain(..).map(|comments| (0..len, comments)));
         let mut out = std::mem::take(&mut self.out);
-        inline(runs, &spans, &mut self.links, &mut out);
+        inline(runs, &spans, self.lang, &mut self.links, &mut out);
         self.out = out;
         self.out.push_str("</w:p>");
     }
@@ -482,7 +499,8 @@ impl<'d> Writer<'d, '_> {
                      <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData>\
                      </a:graphic></wp:inline></w:drawing></w:r>"
                 );
-                self.out.push_str("<w:p><w:pPr><w:keepNext/></w:pPr>");
+                let breaks = if std::mem::take(&mut self.breaks) { BREAK } else { "" };
+                let _ = write!(self.out, "<w:p><w:pPr><w:keepNext/>{breaks}</w:pPr>");
                 self.whole(&picture);
                 self.out.push_str("</w:p>");
             }
@@ -553,7 +571,7 @@ impl<'d> Writer<'d, '_> {
                 escaped(&initials),
                 paragraph(index),
             );
-            inline(comment.content, &[], &mut self.links, &mut out);
+            inline(comment.content, &[], None, &mut self.links, &mut out);
             out.push_str("</w:p></w:comment>");
             let _ = write!(threads, "<w15:commentEx w15:paraId=\"{}\"", paragraph(index));
             if let Some(parent) = comment.parent {
@@ -573,7 +591,14 @@ fn close(id: usize, out: &mut String) {
 }
 
 /// Writes runs, with each comment's passage marked around its text. Offsets are bytes into the runs' text.
-fn inline(runs: &[Run], spans: &[(Range<usize>, Range<usize>)], links: &mut Links, out: &mut String) {
+/// `lang` is the language of the block around them, where that is not the document's.
+fn inline(
+    runs: &[Run],
+    spans: &[(Range<usize>, Range<usize>)],
+    lang: Option<&str>,
+    links: &mut Links,
+    out: &mut String,
+) {
     let len: usize = runs.iter().map(|run| run.text.len()).sum();
     // Where passages start and end. One that ends at a point is written before another starts there.
     let mut marks: Vec<(usize, u8, usize)> = Vec::new();
@@ -620,7 +645,7 @@ fn inline(runs: &[Run], spans: &[(Range<usize>, Range<usize>)], links: &mut Link
                 let _ = write!(out, "<w:hyperlink r:id=\"{}\">", links.id(&target, "hyperlink"));
                 open = link;
             }
-            text(piece, run, open.is_some(), out);
+            text(piece, run, open.is_some(), run.lang.as_deref().or(lang), out);
             at += piece.len();
             rest = after;
         }
@@ -631,12 +656,13 @@ fn inline(runs: &[Run], spans: &[(Range<usize>, Range<usize>)], links: &mut Link
     mark(usize::MAX, out);
 }
 
-/// Writes one run of text with its marks. Marks are direct formatting, as Word's own buttons make.
-fn text(text: &str, run: &Run, linked: bool, out: &mut String) {
+/// Writes one run of text with its marks, and its language where that is not the document's. Marks are
+/// direct formatting, as Word's own buttons make.
+fn text(text: &str, run: &Run, linked: bool, lang: Option<&str>, out: &mut String) {
     out.push_str("<w:r>");
     let has = |mark: Mark| run.marks.contains(&mark);
     let style = if has(Mark::Code) { Some(INLINE_CODE.0) } else { linked.then_some(LINK.0) };
-    if style.is_some() || !run.marks.is_empty() {
+    if style.is_some() || !run.marks.is_empty() || lang.is_some() {
         out.push_str("<w:rPr>");
         if let Some(style) = style {
             let _ = write!(out, "<w:rStyle w:val=\"{style}\"/>");
@@ -651,6 +677,9 @@ fn text(text: &str, run: &Run, linked: bool, out: &mut String) {
         ];
         for (_, format) in formats.iter().filter(|(mark, _)| has(mark.clone())) {
             out.push_str(format);
+        }
+        if let Some(lang) = lang {
+            let _ = write!(out, "<w:lang w:val=\"{}\"/>", escaped(lang));
         }
         out.push_str("</w:rPr>");
     }

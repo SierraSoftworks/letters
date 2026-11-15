@@ -25,6 +25,7 @@ const SYMBOL: &str = "A symbol from a symbol font could not be converted";
 const INTERNAL_LINK: &str = "A link to a place in the document was kept as text";
 const TEXT_BOX: &str = "Text box flattened into the text here";
 const DRAWING: &str = "A drawing or chart was left out";
+const BREAK_MOVED: &str = "A page break inside the paragraph now follows it";
 
 impl Reader<'_, '_> {
     /// Reads the runs inside a paragraph, a link or anything else that wraps them.
@@ -96,6 +97,8 @@ impl Reader<'_, '_> {
         let own = direct.over(&character);
         let look = own.clone().over(&para.styled);
         let linked = around.link.is_some() || self.fields.iter().any(|field| field.link.is_some());
+        // The words of a comment are in no language of the document's.
+        para.lang = look.lang.clone().filter(|_| !self.detached);
 
         let on = |value: Option<bool>| value.unwrap_or(false);
         let base = &para.baseline;
@@ -127,8 +130,11 @@ impl Reader<'_, '_> {
             match child.word() {
                 Some("t") => self.text(&text_of(child), &marks, around, para),
                 Some("tab" | "ptab") => self.text("\t", &marks, around, para),
-                // A page or column break is not text. A break of any other kind starts a new line.
-                Some("br") if matches!(child.attr("type"), Some("page" | "column")) => {}
+                // A page break is not text: it says where the next page starts. Nor is a column break.
+                Some("br") if child.attr("type") == Some("page") => {
+                    *(if para.len == 0 { &mut para.breaks } else { &mut para.broken }) = true;
+                }
+                Some("br") if child.attr("type") == Some("column") => {}
                 Some("br" | "cr") => self.text("\n", &marks, around, para),
                 Some("noBreakHyphen") => self.text("\u{2011}", &marks, around, para),
                 Some("softHyphen") => self.text("\u{ad}", &marks, around, para),
@@ -176,8 +182,12 @@ impl Reader<'_, '_> {
                 if on(look.shifted) {
                     para.note(SHIFTED);
                 }
+                if para.broken {
+                    para.note(BREAK_MOVED);
+                }
             }
         }
+        para.lang = None;
     }
 
     /// Adds text to the paragraph, unless it is a field's instructions.
