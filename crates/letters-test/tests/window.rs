@@ -489,6 +489,23 @@ fn the_bar_restyles_every_block_of_the_type_at_the_caret() {
     let pressed = |window: &mut Harness, name| window.find(Role::Button, name).unwrap().toggled;
     assert_eq!((pressed(&mut window, "Align centre"), pressed(&mut window, "Align left")), (Some(true), Some(false)));
     assert_eq!(window.find(Role::Button, "Font").unwrap().description.as_deref(), Some("Fira Code"));
+
+    // Each change to the style is a step that undo takes back.
+    window.click(Role::Button, "Undo");
+    assert_eq!(style_of(&mut window, "heading1").align, body.align);
+    assert_eq!(spot(&mut window, "h1", 0).x, left, "and the page shows it");
+    assert_eq!(style_of(&mut window, "heading1").weight, 300, "one step at a time");
+}
+
+#[test]
+fn a_style_changed_by_another_writer_shows_on_the_page() {
+    let mut window = letter();
+    let left = spot(&mut window, "h1", 0).x;
+    let mut style = window.ui().style().clone();
+    style.types.get_mut("heading1").expect("a style for headings").align = Align::Center;
+    window.ui().change(|editor| editor.rewrite_style(style)).expect("the style is taken in");
+    assert!(spot(&mut window, "h1", 0).x > left, "the heading is centred");
+    assert_eq!(window.find(Role::Button, "Align centre").unwrap().toggled, Some(true), "and the bar says so");
 }
 
 #[test]
@@ -969,6 +986,15 @@ fn a_word_is_accepted_from_the_menu_or_from_the_persons_own_list() {
         assert!(waves(&mut window).is_empty(), "{route}: and the rest of the document after it");
         assert_eq!(window.platform.learned, if kept { vec!["Zorvex"] } else { vec![] }, "{route}");
         window.assert_markdown("Ask Zorvex for a quote.\n\nZorvex replied.");
+
+        // A word added to the document is part of it: saved with it, and taken back by undo.
+        let in_document = route == "Add to this document";
+        assert_eq!(window.editor().doc().dictionary.contains("Zorvex"), in_document, "{route}");
+        if in_document {
+            window.key("Mod+z");
+            rest(&mut window);
+            assert_eq!(waves(&mut window).len(), 2, "undo has the name marked again");
+        }
     }
 }
 

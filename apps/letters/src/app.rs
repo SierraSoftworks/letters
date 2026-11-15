@@ -153,7 +153,7 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
     let scale = 2.0;
     let (width, height) = ((WINDOW_SIZE.width * scale) as u32, (WINDOW_SIZE.height * scale) as u32);
     let replica = ReplicaId::new(&Desktop::new().new_id());
-    let mut view = View::new(Editor::new(document, replica), style);
+    let mut view = View::new(Editor::with_model(Model::new(document, replica).with_style(style)));
     view.resize(Size { width: WINDOW_SIZE.width as f32, height: WINDOW_SIZE.height as f32 }, scale as f32);
     launch.mark("laid out");
     let mut list = DisplayList::default();
@@ -735,7 +735,7 @@ impl App {
         let mut window = DocWindow {
             sent_style: style.clone(),
             // The editor's history starts from the style on screen, as the working copy's does.
-            view: View::new(Editor::with_model(Model::new(document, replica).with_style(style.clone())), style),
+            view: View::new(Editor::with_model(Model::new(document, replica).with_style(style))),
             window,
             presenter,
             access,

@@ -10,7 +10,7 @@ use std::rc::{Rc, Weak};
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Function, Object, Reflect};
 use letters_editor::{Clip, Editor, Modifiers, Platform as _};
-use letters_model::{Document, HistoryError, Pos, ReplicaId, Selection, Style};
+use letters_model::{Document, HistoryError, Pos, ReplicaId, Selection};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Rect, Size};
@@ -620,7 +620,7 @@ fn place(event: &PointerEvent) -> Point {
 /// A window on `document`, set up for this browser.
 fn view(document: Document, platform: &mut Browser, mac: bool) -> View {
     let end = document.blocks.last().map(|block| Pos::new(block.id.clone(), usize::MAX));
-    let mut view = View::new(Editor::new(document, ReplicaId::new(&platform.new_id())), Style::default());
+    let mut view = View::new(Editor::new(document, ReplicaId::new(&platform.new_id())));
     view.set_keys(if mac { Keys::Mac } else { Keys::Standard });
     view.set_user_words(platform.user_words());
     if let Some(end) = end {

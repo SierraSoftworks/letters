@@ -6,7 +6,6 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 
-use letters_editor::Platform;
 use letters_layout::DocLayout;
 use letters_model::{BlockId, Change, Document, Pos};
 use letters_spell::{Dictionary, Proofing, Speller};
@@ -17,20 +16,6 @@ const EAGER: usize = 16;
 const BATCH: usize = 16;
 /// The most corrections the menu offers.
 const SUGGESTIONS: usize = 5;
-
-/// Adds words to a document's own dictionary.
-///
-/// The document model does not take a word as an operation yet. Until it does, the window keeps the words
-/// added to a document in a list of its own: they are accepted at once, but are not saved with it.
-pub trait Words {
-    fn learn(&mut self, word: &str);
-}
-
-impl Words for BTreeSet<String> {
-    fn learn(&mut self, word: &str) {
-        self.insert(word.to_owned());
-    }
-}
 
 /// A misspelled word with the menu about it open.
 pub(crate) struct Fix {
@@ -45,10 +30,9 @@ pub(crate) struct Fix {
 pub(crate) struct Spelling {
     speller: Speller,
     proofing: Proofing,
-    /// The person's own words, as the shell gave them and as they were added here.
+    /// The person's own words, as the shell gave them and as they were added here. The document's own are
+    /// in the document.
     mine: BTreeSet<String>,
-    /// The words added to this document. See [`Words`].
-    own: BTreeSet<String>,
     /// Whether every block has been checked since anything changed.
     done: bool,
     /// A misspelled word that is not marked, because the caret has not left it since it was typed.
@@ -69,7 +53,7 @@ impl Spelling {
     }
 
     fn reword(&mut self) {
-        self.speller.set_user_words(self.mine.iter().chain(&self.own));
+        self.speller.set_user_words(&self.mine);
         self.done = false;
     }
 
@@ -149,19 +133,21 @@ impl Spelling {
         self.fix = Some(Fix { block: pos.block.clone(), range, word, suggestions });
     }
 
-    /// Accepts the word the menu is about from now on, in the person's own dictionary or in this document's,
-    /// and checks its block again at once. The rest of the document follows in idle time.
-    pub fn learn(&mut self, mine: bool, doc: &Document, layout: &mut DocLayout, platform: &mut dyn Platform) {
-        let Some(fix) = self.fix.take() else { return };
-        if mine {
-            platform.learn_word(&fix.word);
-            self.mine.insert(fix.word);
-        } else {
-            self.own.learn(&fix.word);
-        }
+    /// Accepts a word from now on as one of the person's own.
+    pub fn learn(&mut self, word: &str) {
+        self.mine.insert(word.to_owned());
         self.reword();
-        self.proofing.invalidate(&Change { blocks: BTreeSet::from([fix.block]), ..Change::default() });
-        self.check(1, doc, None, false, layout);
+    }
+
+    /// Checks again after the words that are right changed, the person's or the document's: `block` at
+    /// once, and the rest of the document in idle time.
+    pub fn reworded(&mut self, block: Option<BlockId>, doc: &Document, layout: &mut DocLayout) {
+        self.fix = None;
+        self.done = false;
+        if let Some(block) = block {
+            self.proofing.invalidate(&Change { blocks: BTreeSet::from([block]), ..Change::default() });
+            self.check(1, doc, None, false, layout);
+        }
     }
 }
 

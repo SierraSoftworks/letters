@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use letters_editor::Editor;
-use letters_model::{Block, BlockId, BlockKind, Document, ListKind, ReplicaId, Style};
+use letters_model::{Block, BlockId, BlockKind, Document, ListKind, ReplicaId};
 use letters_render::Size;
 use letters_ui::Window;
 use letters_web::mirror::{Act, Item, Mirror};
@@ -12,7 +12,7 @@ use letters_web::mirror::{Act, Item, Mirror};
 fn window(kinds: &[(&str, BlockKind)]) -> Window {
     let blocks = kinds.iter().map(|(name, kind)| Block::text(BlockId::new(*name), kind.clone(), *name)).collect();
     let editor = Editor::new(Document { blocks, ..Document::default() }, ReplicaId::new("test"));
-    let mut window = Window::new(editor, Style::default());
+    let mut window = Window::new(editor);
     window.resize(Size { width: 1000.0, height: 700.0 }, 1.0);
     window
 }

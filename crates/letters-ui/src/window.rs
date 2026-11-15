@@ -23,7 +23,7 @@ use crate::motion::{self, FRAME_MS};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
 use crate::renaming::{Outcome, Rename, Renaming};
-use crate::restyle::{self, Field, StyleEdit, Styles};
+use crate::restyle::{self, Field, StyleEdit};
 use crate::spelling::{Fix, Spelling};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::text::{Family, FontShaper, TextStyle};
@@ -149,8 +149,9 @@ pub enum Message {
 }
 
 impl Ui<EditorApp> {
-    pub fn new(editor: Editor, style: Style) -> Self {
-        Ui::host(EditorApp::new(editor, style), Rc::new(FontShaper::default()))
+    /// The window on a document. It is drawn with the style its model holds: see `Model::with_style`.
+    pub fn new(editor: Editor) -> Self {
+        Ui::host(EditorApp::new(editor), Rc::new(FontShaper::default()))
     }
 
     pub fn editor(&self) -> &Editor {
@@ -167,7 +168,7 @@ impl Ui<EditorApp> {
 
     /// The document's style, which a shell writes when it saves.
     pub fn style(&self) -> &Style {
-        &self.app().style
+        self.app().editor.model().style()
     }
 
     /// Goes up each time the document changes.
@@ -330,7 +331,6 @@ impl Platform for Lent<'_> {
 
 pub struct EditorApp {
     editor: Editor,
-    style: Style,
     layout: DocLayout,
     palette: Palette,
     /// The text column's left edge inside the page area, and its width.
@@ -375,10 +375,9 @@ pub struct EditorApp {
 }
 
 impl EditorApp {
-    fn new(editor: Editor, style: Style) -> Self {
+    fn new(editor: Editor) -> Self {
         Self {
             editor,
-            style,
             layout: DocLayout::new(Fonts { faces: letters_fonts::bundled() }),
             palette: Palette::LIGHT,
             column: (0.0, 0.0),
@@ -469,7 +468,8 @@ impl EditorApp {
         if self.renaming.is_some() && self.folded.form.is_some() {
             return;
         }
-        let style = self.element().and_then(|element| Some((element, &self.style.types.get(element)?.family)));
+        let types = &self.editor.model().style().types;
+        let style = self.element().and_then(|element| Some((element, &types.get(element)?.family)));
         let mut hasher = DefaultHasher::new();
         (width.to_bits(), self.name(), style).hash(&mut hasher);
         let key = hasher.finish();
@@ -480,17 +480,13 @@ impl EditorApp {
         }
     }
 
-    /// Restyles every block of the type under the caret. Line breaks everywhere may change, so the whole
-    /// document is laid out again.
-    fn restyle(&mut self, edit: &StyleEdit) {
+    /// Restyles every block of the type under the caret, as one step that undo takes back.
+    fn restyle(&mut self, edit: &StyleEdit, platform: &mut dyn Platform) {
         let Some(element) = self.element() else { return };
-        let Some(mut style) = self.style.style().types.get(element).cloned() else { return };
+        let Some(mut style) = self.editor.model().style().types.get(element).cloned() else { return };
         edit.apply(&mut style);
-        self.style.restyle(element, style);
-        self.edits += 1;
-        self.layout.update(self.editor.doc(), &self.style, self.column.1, None);
-        self.estimated = true;
-        self.reveal();
+        let command = Command::SetStyle { element: element.to_owned(), style };
+        self.edit(platform, |editor, platform| editor.run(command, platform));
     }
 
     /// Colours the code blocks among `changed`, or every one in the document. A block is lexed again only
@@ -564,13 +560,23 @@ impl EditorApp {
 
     /// Brings the layout up to date with a change to the document, and what is marked on the page with it.
     fn follow(&mut self, change: &Change) {
-        if !change.blocks.is_empty() || change.structure {
-            self.edits += 1;
-            self.layout.update(self.editor.doc(), &self.style, self.column.1, Some(change));
+        let edited = !change.blocks.is_empty() || change.structure;
+        if edited || change.style {
+            // Every block is drawn from the style, so a change to it lays all of them out again.
+            let touched = (!change.style).then_some(change);
+            self.layout.update(self.editor.doc(), self.editor.model().style(), self.column.1, touched);
             self.estimated = true;
+        }
+        if edited {
             self.highlight((!change.structure).then_some(&change.blocks));
             let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
             self.spelling.edited(change, self.editor.doc(), caret, &mut self.layout);
+        }
+        if change.document {
+            self.spelling.reworded(None, self.editor.doc(), &mut self.layout);
+        }
+        if edited || change.style || change.document {
+            self.edits += 1;
         }
         self.mark();
     }
@@ -777,12 +783,12 @@ impl EditorApp {
 
     /// Lays the document out for the room it has and paints the part in view.
     fn page(&mut self, room: Size) -> Element<Message> {
-        let page = &self.style.page;
+        let page = &self.editor.model().style().page;
         let text = (page.width - page.margin_left - page.margin_right) * PT;
         let width = text.min(room.width - 2.0 * GUTTER).max(1.0);
         let left = ((room.width - width) / 2.0).max(0.0).round();
         if width != self.column.1 {
-            self.layout.update(self.editor.doc(), &self.style, width, None);
+            self.layout.update(self.editor.doc(), self.editor.model().style(), width, None);
             self.highlight(None);
         }
         (self.column, self.height) = ((left, width), room.height);
@@ -1055,7 +1061,7 @@ impl EditorApp {
     /// folded further the name is a button that opens the rest.
     fn style_group(&self, fold: Fold) -> Vec<Element<Message>> {
         let Some(element) = self.element() else { return Vec::new() };
-        let Some(style) = self.style.style().types.get(element) else { return Vec::new() };
+        let Some(style) = self.editor.model().style().types.get(element) else { return Vec::new() };
 
         // The type follows the caret: it is a label here, and changed on the page.
         let name = restyle::name(element);
@@ -1216,7 +1222,9 @@ impl EditorApp {
 
     fn side(&self, panel: Panel) -> Element<Message> {
         let rows: Vec<Element<Message>> = match panel {
-            Panel::Styles => self.style.types.iter().map(|(name, style)| style_row(name, style)).collect(),
+            Panel::Styles => {
+                self.editor.model().style().types.iter().map(|(name, style)| style_row(name, style)).collect()
+            }
             Panel::Notes | Panel::History => Vec::new(),
         };
         let empty = match panel {
@@ -1265,7 +1273,18 @@ impl App for EditorApp {
                 self.editor.select(Selection { anchor, head });
                 self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(text), platform));
             }
-            Message::Learn { mine } => self.spelling.learn(mine, self.editor.doc(), &mut self.layout, platform),
+            Message::Learn { mine } => {
+                let Some(fix) = self.spelling.fix.take() else { return };
+                if mine {
+                    platform.learn_word(&fix.word);
+                    self.spelling.learn(&fix.word);
+                } else {
+                    // The document's own words are part of it, so undo takes one back and saving keeps it.
+                    let word = Command::AddWord(fix.word);
+                    self.edit(platform, |editor, platform| editor.run(word, platform));
+                }
+                self.spelling.reworded(Some(fix.block), self.editor.doc(), &mut self.layout);
+            }
             Message::Unfix => self.spelling.fix = None,
             Message::Open(path) => self.requests.push(Request::Open(path)),
             Message::OpenDialog => self.requests.push(Request::OpenDialog),
@@ -1289,7 +1308,7 @@ impl App for EditorApp {
             Message::Restyle(edit) => {
                 // A choice made outright replaces whatever was half typed.
                 self.draft = None;
-                self.restyle(&edit);
+                self.restyle(&edit, platform);
             }
             Message::Forget => self.draft = None,
             Message::Draft(field, text) => self.draft = self.element().map(|element| (field, element, text)),
@@ -1297,7 +1316,7 @@ impl App for EditorApp {
                 let typed =
                     self.draft.take_if(|draft| draft.0 == field).filter(|draft| Some(draft.1) == self.element());
                 if let Some(edit) = typed.and_then(|draft| field.read(&draft.2)) {
-                    self.restyle(&edit);
+                    self.restyle(&edit, platform);
                 }
             }
             Message::LinkApply => {
