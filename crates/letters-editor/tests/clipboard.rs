@@ -92,6 +92,8 @@ fn text_from_elsewhere_is_read_as_markdown() {
         ("p **A|B**", "one", None, "p **Aone|B**"),
         // Text that is only space has no Markdown to read.
         ("p A|B", "  ", None, "p A  |B"),
+        // Front matter belongs to a document. Pasted, its lines are kept as they are written.
+        ("p |", "---\ntitle: T\n---\n\ntext\n", None, "code:yaml title: T\np text|"),
         // HTML with nothing to show leaves the text beside it.
         ("p A|B", "*one*", Some("<div><p></p></div>"), "p A*one*|B"),
         // Code takes text as it is written.

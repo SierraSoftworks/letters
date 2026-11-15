@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use letters_convert::{from_html, from_markdown, to_html_fragment, to_markdown};
-use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Op, Pos, Run};
+use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Op, Pos, PropertiesFormat, Run};
 use serde_json::Value;
 
 use crate::{Clip, Editor, Platform, text, tree};
@@ -72,7 +72,17 @@ fn to_text(blocks: &[Block]) -> String {
 
 /// The blocks that text from another application stands for, read as Markdown.
 fn from_text(text: &str, platform: &mut dyn Platform) -> Vec<Block> {
-    let mut read = |markdown: &str| from_markdown(markdown, &mut || platform.new_id()).0.blocks;
+    let mut read = |markdown: &str| {
+        let mut doc = from_markdown(markdown, &mut || platform.new_id()).0;
+        // Front matter is read as the properties of a document, and a paste is not one. Its lines stay.
+        if let Some(properties) = doc.properties {
+            let language = if properties.format == PropertiesFormat::Toml { "toml" } else { "yaml" };
+            let kind = BlockKind::Code { language: Some(language.into()) };
+            let source = properties.source.strip_suffix('\n').unwrap_or(&properties.source);
+            doc.blocks.insert(0, Block::text(platform.new_id().as_str(), kind, source));
+        }
+        doc.blocks
+    };
     let line = text.trim_matches('\n');
     if line.contains('\n') {
         return read(text);
