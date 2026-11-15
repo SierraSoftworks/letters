@@ -5,12 +5,13 @@
 //! moves the hidden input under the caret, where the input method's candidate window should open.
 
 use std::cell::RefCell;
+use std::ops::Range;
 use std::rc::{Rc, Weak};
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Function, Object, Reflect};
 use letters_editor::{Clip, Modifiers, Platform as _};
-use letters_model::{Document, HistoryError, ReplicaId};
+use letters_model::{BlockKind, Document, HistoryError, Mark, ReplicaId};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Rect, Size};
@@ -25,7 +26,7 @@ use web_sys::{
 };
 
 use crate::browser::{self, Browser};
-use crate::input::{Clipboard, Dom, Finger, Gesture, Held, Reply, TextInput, Touch, modifiers};
+use crate::input::{Around, Clipboard, Dom, Finger, Gesture, Held, Reply, TextInput, Touch, modifiers};
 use crate::mirror::{Act, Mirror, Page};
 use crate::page;
 
@@ -35,6 +36,9 @@ const WHEEL_LINE: f32 = 40.0;
 /// font size keeps phones from zooming in on it.
 const HIDDEN: &str = "position:fixed;width:1px;padding:0;border:0;margin:0;outline:0;resize:none;overflow:hidden;\
                       opacity:0;pointer-events:none;white-space:pre;font-size:16px;";
+
+/// The hidden input when a keyboard is to leave what is typed as it is.
+const HELP: [(&str, &str); 2] = [("autocapitalize", "off"), ("autocorrect", "off")];
 
 /// The mirror: over the canvas, so that what it says about where things are is true, and out of sight and
 /// out of the pointer's way. Its text is not for the eye, so the page lays out as little of it as it can.
@@ -145,15 +149,11 @@ impl Shell {
         let context: CanvasRenderingContext2d = context.dyn_into()?;
 
         let input: HtmlTextAreaElement = document.create_element("textarea")?.dyn_into()?;
-        for (name, value) in [
-            ("style", HIDDEN),
-            ("aria-label", "Document"),
-            ("autocomplete", "off"),
-            ("autocorrect", "off"),
-            // The input holds none of the sentence, so a keyboard asked to capitalise would do it to every word.
-            ("autocapitalize", "off"),
-            ("spellcheck", "false"),
-        ] {
+        for (name, value) in
+            [("style", HIDDEN), ("aria-label", "Document"), ("autocomplete", "off"), ("spellcheck", "false")]
+                .into_iter()
+                .chain(HELP)
+        {
             input.set_attribute(name, value)?;
         }
         canvas.insert_adjacent_element("afterend", &input)?;
@@ -294,7 +294,7 @@ impl Shell {
         }
 
         input.focus()?;
-        shell.borrow().rest();
+        shell.borrow_mut().rest();
         shell.borrow_mut().show();
         shell.borrow_mut().fetch_fonts();
         Ok(shell)
@@ -459,6 +459,7 @@ impl Shell {
         if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
             self.frame_due = self.window.request_animation_frame(&self.on_frame).is_ok();
         }
+        self.rest();
         let caret = self.view.caret_rect();
         if let Some(at) = caret.filter(|_| caret != self.caret) {
             let canvas = self.canvas.get_bounding_client_rect();
@@ -616,19 +617,50 @@ impl Shell {
                 event.prevent_default();
             }
         }
-        if !self.text.composing() && matches!(event.type_().as_str(), "input" | "compositionend") {
-            self.rest();
+    }
+
+    /// Puts the hidden input back to what it holds between edits: the text around the caret, with the
+    /// selection where the editor's is. A keyboard that corrects, capitalises or predicts reads it there.
+    fn rest(&mut self) {
+        let around = self.around();
+        // Code and formulas are written as they are meant, with no help from the keyboard. Nor is there
+        // any where the input holds none of the sentence: every word would be taken for its first.
+        let help = if around.is_some() { [("autocapitalize", "sentences"), ("autocorrect", "on")] } else { HELP };
+        for (name, value) in help {
+            if self.input.get_attribute(name).as_deref() != Some(value) {
+                report(self.input.set_attribute(name, value));
+            }
+        }
+        let Some((value, selection)) = self.text.hold(&around.unwrap_or_default()) else { return };
+        // Writing to the input restarts a soft keyboard's session, so it is left alone when it can be.
+        if self.input.value() != value {
+            self.input.set_value(value);
+        }
+        let at = |end: Result<Option<u32>, JsValue>| end.ok().flatten();
+        if (at(self.input.selection_start()), at(self.input.selection_end()))
+            != (Some(selection.start), Some(selection.end))
+        {
+            report(self.input.set_selection_range(selection.start, selection.end));
         }
     }
 
-    /// Puts the hidden input back to what it holds between edits, with the caret after it.
-    fn rest(&self) {
-        // Writing to the input restarts a soft keyboard's session, so it is left alone when it can be.
-        if self.input.value() != TextInput::REST {
-            self.input.set_value(TextInput::REST);
-        }
-        let end = TextInput::REST.encode_utf16().count() as u32;
-        report(self.input.set_selection_range(end, end));
+    /// The text around the editor's selection, when the keyboard is with the page and the selection is in
+    /// one block of prose.
+    fn around(&self) -> Option<Around> {
+        let editor = self.view.editor();
+        let selection = editor.selection().filter(|_| self.view.types_in_canvas() && editor.picture().is_none())?;
+        let (anchor, head) = (&selection.anchor, &selection.head);
+        let block = editor.doc().block(&head.block).filter(|_| anchor.block == head.block)?;
+        let range = anchor.offset.min(head.offset)..anchor.offset.max(head.offset);
+        let mut end = 0;
+        let source = block.body.runs().iter().any(|run| {
+            let start = end;
+            end += run.text.len();
+            let written = run.marks.contains(&Mark::Code) || run.marks.contains(&Mark::Math);
+            written && start <= range.end && range.start <= end
+        });
+        let prose = !matches!(block.kind, BlockKind::Code { .. } | BlockKind::Formula) && !source;
+        prose.then(|| Around::of(&block.plain_text(), range))
     }
 
     fn key_down(&mut self, event: KeyboardEvent) {
@@ -638,17 +670,23 @@ impl Shell {
 
     fn before_input(&mut self, event: web_sys::InputEvent) {
         let (kind, data) = (event.input_type(), event.data());
-        self.text(Dom::BeforeInput { kind: &kind, data: data.as_deref(), cancelable: event.cancelable() }, &event);
+        let (cancelable, selection) = (event.cancelable(), self.selected());
+        self.text(Dom::BeforeInput { kind: &kind, data: data.as_deref(), cancelable, selection }, &event);
     }
 
     fn input(&mut self, event: Event) {
-        let end = |end: Result<Option<u32>, JsValue>| end.ok().flatten().unwrap_or(0);
-        let selection = end(self.input.selection_start())..end(self.input.selection_end());
-        self.text(Dom::Input { value: &self.input.value(), selection }, &event);
+        self.text(Dom::Input { value: &self.input.value(), selection: self.selected() }, &event);
     }
 
     fn composition_end(&mut self, event: CompositionEvent) {
-        self.text(Dom::CompositionEnd { data: &event.data().unwrap_or_default() }, &event);
+        let (data, value) = (event.data().unwrap_or_default(), self.input.value());
+        self.text(Dom::CompositionEnd { data: &data, value: &value }, &event);
+    }
+
+    /// The selection in the hidden input, in UTF-16 units.
+    fn selected(&self) -> Range<u32> {
+        let end = |end: Result<Option<u32>, JsValue>| end.ok().flatten().unwrap_or(0);
+        end(self.input.selection_start())..end(self.input.selection_end())
     }
 
     /// Carries a clipboard event out through the editor's own copy, cut and paste, which read and write the

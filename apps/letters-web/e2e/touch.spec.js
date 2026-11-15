@@ -70,15 +70,15 @@ test("a soft keyboard's backspace and Enter arrive although no key says so", asy
   const input = page.locator("textarea");
   const last = async () => (await blocks(page)).at(-1).text;
   const length = (await last()).length;
-  // The keyboard deletes the space the input rests on, and reports only that the input changed.
+  // The keyboard deletes the letter before the caret, and reports only that the input changed.
   await input.evaluate((input) => {
-    input.value = "";
+    input.value = input.value.slice(0, -1);
     input.dispatchEvent(new InputEvent("input", { inputType: "deleteContentBackward" }));
   });
   await expect.poll(async () => (await last()).length).toBe(length - 1);
-  await expect(input).toHaveValue(" ");
+  await expect(input).toHaveValue(` ${await last()}`);
   await input.evaluate((input) => {
-    input.value = " \n";
+    input.value += "\n";
     input.dispatchEvent(new InputEvent("input", { inputType: "insertLineBreak" }));
   });
   await expect.poll(async () => (await blocks(page)).length).toBe(121);

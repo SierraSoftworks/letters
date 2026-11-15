@@ -366,6 +366,12 @@ impl<A: App> Ui<A> {
         sooner(Some(from + (phase + 1) * BLINK_MS))
     }
 
+    /// Whether what is typed goes to the app's own canvas, such as the page, and not to a field of the
+    /// window, as last laid out. A shell that shows a keyboard the text around the caret asks this first.
+    pub fn types_in_canvas(&self) -> bool {
+        self.caret_holder().is_some_and(|i| matches!(self.tree.nodes[i].el.content, Content::Canvas(_)))
+    }
+
     /// Where the caret is in the window as last laid out, for the input method's candidate window.
     pub fn caret_rect(&self) -> Option<Rect> {
         let node = &self.tree.nodes[self.caret_holder()?];
