@@ -102,7 +102,7 @@ pub(crate) fn typeset(source: &str, style: &Style) -> Result<Formula, Error> {
 
 /// The engine counts positions in bytes of the source, as the document does. A position that is not in the
 /// source (the engine can report one from inside a macro) is left out.
-fn parse_error(source: &str, error: ParseError) -> Error {
+pub(crate) fn parse_error(source: &str, error: ParseError) -> Error {
     let span = error.loc.map(|loc| loc.start..loc.end).filter(|span| {
         span.start <= span.end && source.is_char_boundary(span.start) && source.is_char_boundary(span.end)
     });

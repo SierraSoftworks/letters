@@ -23,3 +23,5 @@ skrifa.workspace = true
 [dev-dependencies]
 # Pixel snapshots, for the tests alone.
 letters-render = { workspace = true, features = ["snapshot"] }
+# Reads the MathML the tests check.
+roxmltree.workspace = true

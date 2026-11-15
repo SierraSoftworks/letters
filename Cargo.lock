@@ -2666,6 +2666,7 @@ dependencies = [
  "ratex-layout",
  "ratex-parser",
  "ratex-types",
+ "roxmltree",
  "skrifa 0.49.0",
 ]
 
