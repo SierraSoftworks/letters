@@ -705,6 +705,8 @@ mod tests {
             time,
             edits: 1,
             size: 10,
+            added: 10,
+            removed: 0,
             tags: Vec::new(),
         }
     }

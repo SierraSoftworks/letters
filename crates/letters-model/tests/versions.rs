@@ -124,6 +124,26 @@ fn changed_tells_what_differs_between_two_revisions() {
 }
 
 #[test]
+fn a_step_counts_the_characters_it_put_in_and_took_out() {
+    let cases: Vec<(&str, Vec<Op>, (usize, usize))> = vec![
+        ("typing", vec![typed("p", 11, "!")], (1, 0)),
+        ("a letter of two bytes", vec![typed("p", 0, "\u{e9}")], (1, 0)),
+        ("a cut", vec![Op::DeleteText { block: id("p"), range: 0..6 }], (0, 6)),
+        ("a word for another", vec![Op::DeleteText { block: id("p"), range: 6..11 }, typed("p", 6, "moon")], (4, 5)),
+        ("a split", vec![split("p", 5, "p2")], (0, 0)),
+        ("a block removed", vec![Op::RemoveBlock { block: id("p") }], (0, 11)),
+        ("a style", vec![italic_asides()], (0, 0)),
+    ];
+    for (name, ops, expected) in cases {
+        let mut model = Model::new(common::doc(), ReplicaId::from(1));
+        model.apply(ops).unwrap();
+        let steps = model.timeline();
+        let last = steps.last().unwrap();
+        assert_eq!((last.added, last.removed), expected, "{name}");
+    }
+}
+
+#[test]
 fn a_marked_version_travels_with_the_history() {
     let (mut ana, mut ben) = writers();
     ana.apply([typed("p", 11, "!")]).unwrap();

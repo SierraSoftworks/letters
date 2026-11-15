@@ -4,11 +4,12 @@
 //! tells one stretch of writing from the next. A version is a revision someone, or the shell, marked to
 //! be listed and kept. The marks live in the map `versions`, so they travel and merge with the history.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use loro::{Frontiers, ID, LoroDoc, ValueOrContainer};
+use loro::{ContainerTrait, Frontiers, ID, JsonOpContent, JsonTextOp, LoroDoc, ValueOrContainer, VersionVector};
 use serde_json::{Map, Value};
 
+use crate::flat::MARKER;
 use crate::{Revision, crdt};
 
 const VERSIONS: &str = "versions";
@@ -32,6 +33,10 @@ pub struct Point {
     pub edits: usize,
     /// How much it changed: about the characters put in and taken out.
     pub size: usize,
+    /// The characters of text it put in, and those it took out. A step that changed only formatting, the
+    /// kind of a block or where blocks part has neither.
+    pub added: usize,
+    pub removed: usize,
     /// The versions marked at this step: those it is the first to hold all of. A version marked on one
     /// device while another wrote can lack some of what `after` holds, so show a version at its own
     /// revision.
@@ -118,6 +123,8 @@ pub(crate) fn timeline(loro: &LoroDoc) -> Vec<Point> {
             time: u64::try_from(change.timestamp).unwrap_or_default(),
             edits: 1,
             size: change.len,
+            added: 0,
+            removed: 0,
             tags: Vec::new(),
         });
     }
@@ -126,6 +133,7 @@ pub(crate) fn timeline(loro: &LoroDoc) -> Vec<Point> {
         let held = starts.partition_point(|(counter, _)| *counter <= id.counter).checked_sub(1)?;
         Some(starts[held].1)
     };
+    count(loro, &mut points, step);
     for tag in tags(loro) {
         // A revision holds all that its newest changes were written on, so the last of them to be listed
         // is the step that completes it. A mark on a revision this history lacks is left out.
@@ -135,6 +143,42 @@ pub(crate) fn timeline(loro: &LoroDoc) -> Vec<Point> {
         }
     }
     points
+}
+
+/// Counts the characters of text each step put in and took out. `step` tells the step that holds an edit.
+fn count(loro: &LoroDoc, points: &mut [Point], step: impl Fn(ID) -> Option<usize>) {
+    let Ok(edits) = loro.export_json_updates_without_peer_compression(&VersionVector::default(), &loro.oplog_vv())
+    else {
+        return;
+    };
+    let sequence = &loro.get_text(crdt::BODY).id();
+    let texts = || {
+        edits.changes.iter().flat_map(move |change| {
+            let ops = change.ops.iter().filter(move |op| op.container == *sequence);
+            ops.map(move |op| (ID::new(change.id.peer, op.counter), &op.content))
+        })
+    };
+    // A marker starts a block and is no character of text, put in or taken out.
+    let mut markers = HashSet::new();
+    for (id, edit) in texts() {
+        if let JsonOpContent::Text(JsonTextOp::Insert { text, .. }) = edit {
+            let marks = text.chars().zip(id.counter..).filter(|(c, _)| MARKER.starts_with(*c));
+            markers.extend(marks.map(|(_, counter)| ID::new(id.peer, counter)));
+        }
+    }
+    for (id, edit) in texts() {
+        let Some(point) = step(id).and_then(|at| points.get_mut(at)) else { continue };
+        match edit {
+            JsonOpContent::Text(JsonTextOp::Insert { text, .. }) => {
+                point.added += text.chars().filter(|c| !MARKER.starts_with(*c)).count();
+            }
+            JsonOpContent::Text(JsonTextOp::Delete { len, start_id, .. }) => {
+                let gone = (0..len.abs()).map(|nth| ID::new(start_id.peer, start_id.counter + nth));
+                point.removed += gone.filter(|id| !markers.contains(id)).count();
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Marks a version in the change that is open, over any mark its revision already has.
