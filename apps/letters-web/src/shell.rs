@@ -122,6 +122,8 @@ pub struct Shell {
     handles: [(HtmlElement, String); 2],
     /// Whether the page was last pressed by a finger, which is who the handles are for.
     fingers: bool,
+    /// Whether the event being handled is an edit to the hidden input.
+    editing: bool,
     /// The handle a finger holds, and where the finger is from the middle of the line its end is on.
     grab: Option<(usize, Point)>,
 
@@ -221,6 +223,7 @@ impl Shell {
                 picker: picker.clone(),
                 handles: handles.clone(),
                 fingers: false,
+                editing: false,
                 grab: None,
                 window: window.clone(),
                 canvas: canvas.clone(),
@@ -327,7 +330,8 @@ impl Shell {
         hear(&shell, &input, "compositionstart", |shell, event: Event| shell.text(Dom::CompositionStart, &event))?;
         hear(&shell, &input, "compositionend", Self::composition_end)?;
         // Every browser reports a selection that moved to the document, and only some to the input too.
-        hear(&shell, &document, "selectionchange", Self::selection_change)?;
+        // Hearing it is enough: whatever the shell hears, it first looks where the keyboard left the caret.
+        hear(&shell, &document, "selectionchange", |_, _: Event| {})?;
         hear(&shell, &input, "copy", |shell, event| shell.clipboard(event, Clipboard::Copy))?;
         hear(&shell, &input, "cut", |shell, event| shell.clipboard(event, Clipboard::Cut))?;
         hear(&shell, &input, "paste", |shell, event| shell.clipboard(event, Clipboard::Paste))?;
@@ -496,6 +500,10 @@ impl Shell {
 
     /// Brings everything outside the canvas up to date with the view, after any event.
     fn sync(&mut self) {
+        // During an edit the hidden input's selection is what the edit is aimed at, and no move of the caret.
+        if !std::mem::take(&mut self.editing) {
+            self.keyboard_moved();
+        }
         for request in self.view.take_requests() {
             match request {
                 // There are no folders to move between, so a name is the person's to give.
@@ -692,13 +700,8 @@ impl Shell {
                 self.view.input(text, &mut self.platform);
                 event.prevent_default();
             }
-            Reply::Select(range) => {
-                let Some(block) = self.view.editor().selection().map(|selection| selection.head.block.clone()) else {
-                    return;
-                };
-                let (anchor, head) = (Pos::new(block.clone(), range.start), Pos::new(block, range.end));
-                self.view.select(Selection { anchor, head });
-            }
+            // Asked for only by `keyboard_moved`, which does the selecting.
+            Reply::Select(_) => {}
         }
     }
 
@@ -761,11 +764,14 @@ impl Shell {
         self.text(Dom::Input { value: &self.input.value(), selection: self.selected() }, &event);
     }
 
-    /// The selection moved somewhere on the page. In the hidden input, only a keyboard moves it.
-    fn selection_change(&mut self, event: Event) {
-        let active = self.window.document().and_then(|page| page.active_element());
-        if active.is_some_and(|active| active == **self.input) {
-            self.text(Dom::Select { value: &self.input.value(), selection: self.selected() }, &event);
+    /// Follows a caret the keyboard moved in the hidden input, as a swipe along a soft keyboard's space bar
+    /// does. The browser says so only later, and by then the shell may have put the selection back.
+    fn keyboard_moved(&mut self) {
+        let moved = self.text.event(Dom::Select { value: &self.input.value(), selection: self.selected() });
+        let block = self.view.editor().selection().map(|selection| selection.head.block.clone());
+        if let (Reply::Select(range), Some(block)) = (moved, block) {
+            let (anchor, head) = (Pos::new(block.clone(), range.start), Pos::new(block, range.end));
+            self.view.select(Selection { anchor, head });
         }
     }
 
@@ -1156,9 +1162,15 @@ fn hear<E: JsCast + 'static>(
     let shell = Rc::downgrade(shell);
     // The pointer's travels change nothing the mirror says.
     let quiet = matches!(kind, "pointermove" | "pointerleave" | "wheel" | "dragover" | "dragleave");
+    let edit = matches!(kind, "beforeinput" | "input" | "compositionstart" | "compositionend");
     listen(target, kind, move |event| {
         let Some(shell) = shell.upgrade() else { return };
         let mut shell = shell.borrow_mut();
+        // What the event asks for is done where the keyboard left the caret.
+        match edit {
+            true => shell.editing = true,
+            false => shell.keyboard_moved(),
+        }
         handler(&mut shell, event.unchecked_into());
         if !quiet {
             shell.changed();
