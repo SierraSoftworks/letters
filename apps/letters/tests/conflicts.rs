@@ -147,3 +147,80 @@ fn a_file_that_cannot_be_merged_is_said_and_does_not_hold_the_save_back() {
     let written = paragraphs(&["One, says Ada"]);
     assert_eq!((ada.model.doc(), &files::open(&path, Style::default).unwrap().document), (&written, &written));
 }
+
+#[test]
+fn an_open_conflict_copy_finds_its_original_and_is_saved_into_it() {
+    let folder = Scratch::new("conflicts-original");
+    let path = create(&folder, "Report.let", &["One", "Two"]);
+    let copy = conflict(&path, "Report (conflicted copy 2026-11-15 desk).let", &["One", "Two, at the desk"]);
+    let (mut ada, home) = writer(&path);
+    ada.save(&home, &paragraphs(&["One, says Ada", "Two"]));
+    let (mut desk, _) = writer(&copy);
+    let id = desk.copy.id.clone();
+
+    let original = conflicts::original(&copy, &id).expect("the file the copy is named after");
+    assert_eq!(original.path, path);
+    assert!(original.related_to(&desk.model), "the two began as one document");
+    // (a file, why nothing is found for it)
+    let another = create(&folder, "Minutes.let", &["Another document"]);
+    conflict(&another, "Notes (conflicted copy 2026-11-15 desk).let", &["Another document"]);
+    fs::copy(&another, folder.0.join("Plan.let")).unwrap();
+    let none = [
+        (path.clone(), "it is no conflict copy"),
+        (folder.0.join("Notes (conflicted copy 2026-11-15 desk).let"), "its original is not there"),
+        (folder.0.join("Plan (conflicted copy 2026-11-15 desk).let"), "its original is another document"),
+    ];
+    for (file, why) in none {
+        assert!(conflicts::original(&file, &id).is_none(), "{}: {why}", file.display());
+    }
+
+    // The copy's writer carries on in the original, where a save merges the two.
+    let saved = exchange(&mut desk, &Home::at(&path), &[]);
+    let both = paragraphs(&["One, says Ada", "Two, at the desk"]);
+    assert_eq!(saved.home.path(), path, "no further copy was needed");
+    assert_eq!((desk.model.doc(), &files::open(&path, Style::default).unwrap().document), (&both, &both));
+}
+
+#[test]
+fn a_copy_made_by_hand_finds_the_file_it_was_copied_from() {
+    let folder = Scratch::new("conflicts-twin");
+    let real = |path: &Path| fs::canonicalize(path).unwrap();
+    let path = create(&folder, "Report.let", &["One", "Two"]);
+    let id = writer(&path).0.copy.id.clone();
+    // Long enough for the system to tell which of two files was made first.
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let by_hand = folder.0.join("Report copy.let");
+    fs::copy(&path, &by_hand).unwrap();
+    fs::create_dir(folder.0.join("Sent")).unwrap();
+    let elsewhere = folder.0.join("Sent").join("Report.let");
+    fs::copy(&path, &elsewhere).unwrap();
+    let copy = conflict(&path, "Report (conflicted copy 2026-11-15 desk).let", &["One", "Two, at the desk"]);
+    let other = create(&folder, "Minutes.let", &["Another document"]);
+    let other_id = writer(&other).0.copy.id.clone();
+
+    assert_eq!(conflicts::twin(&by_hand, &id, &[]), Some(real(&path)));
+    // One in another folder is only known by the documents the person has opened.
+    assert_eq!(conflicts::twin(&elsewhere, &id, std::slice::from_ref(&path)), Some(real(&path)));
+    // (a file and the document it holds, why it was copied from nothing)
+    let none = [
+        (&elsewhere, &id, "nothing says where its original is"),
+        (&copy, &id, "a conflict copy is its original still"),
+        (&other, &other_id, "no other file holds this document"),
+    ];
+    for (file, id, why) in none {
+        assert_eq!(conflicts::twin(file, id, &[]), None, "{}: {why}", file.display());
+    }
+    // The original keeps what it is, where the system says that it was there first.
+    let made = |path: &Path| fs::metadata(path).and_then(|file| file.created()).ok();
+    if made(&path).zip(made(&by_hand)).is_some_and(|(first, second)| first < second) {
+        assert_eq!(conflicts::twin(&path, &id, std::slice::from_ref(&elsewhere)), None);
+    }
+    // And once it was carried on, whenever the file that now holds it was made.
+    let (mut ada, home) = writer(&path);
+    ada.save(&home, &paragraphs(&["One, says Ada", "Two"]));
+    assert_eq!(conflicts::twin(&path, &id, std::slice::from_ref(&elsewhere)), None, "it holds what its copies lack");
+    assert_eq!(conflicts::twin(&by_hand, &id, &[]), Some(real(&path)), "and a copy is left behind");
+    // A file that was moved left nothing behind to be a copy of.
+    fs::remove_file(&path).unwrap();
+    assert_eq!(conflicts::twin(&by_hand, &id, &[path]), None);
+}

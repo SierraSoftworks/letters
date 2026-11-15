@@ -5,7 +5,7 @@ use std::path::Path;
 
 use common::{Scratch, Writer, comment, comments};
 use letters::files::{self, Exchange, Home, Opened, Rest, Working};
-use letters::journal::{Journal, Journals};
+use letters::journal::{self, Journal, Journals};
 use letters::platform;
 use letters_model::{Block, BlockKind, Document, Model, Notes, ReplicaId, Revision, Style};
 
@@ -243,4 +243,41 @@ fn a_comment_written_before_a_crash_comes_back_and_reaches_the_file() {
     desk.save();
     let (reader, _) = Writer::of(files::open(&path, Style::default).unwrap());
     assert_eq!(comments(&reader.copy.notes), ["n1"], "the file holds the comment");
+}
+
+#[test]
+fn a_copy_that_became_its_own_document_comes_back_as_that_after_a_crash() {
+    let scratch = Scratch::new("journal-forked");
+    let (path, copied) = (scratch.0.join("Notes.let"), scratch.0.join("Notes copy.let"));
+    let mut journals = Journals::at(scratch.0.join("unsaved"));
+    let mut desk = Desk::at(&mut journals, new(Some(&path)));
+    desk.write(&document("First thoughts"));
+    assert!(!desk.save() && desk.save());
+    let original = desk.writer.copy.id.clone();
+    drop(desk);
+    fs::copy(&path, &copied).unwrap();
+
+    // The copy is written in: it takes an id of its own, and a journal under that id, before anything
+    // of the edit is journalled.
+    let mut desk = Desk::at(&mut journals, files::open(&copied, Style::default).unwrap());
+    let own = platform::document_id();
+    desk.writer.copy.fork(own.clone());
+    let claim = journal::claim(journals.folder(), &own).expect("nobody has a journal of that id");
+    desk.journal = Some(journals.open(claim, &own, &desk.writer.copy.created, Some(&copied)));
+    let typed = document("First thoughts, and others in the copy");
+    desk.write(&typed);
+
+    // Its file still says it is the original, and the journal says what it became.
+    let mut journals = crash(desk, journals);
+    let mut back = brought_back(&journals);
+    assert_eq!(back.len(), 1);
+    let opened = back.remove(0);
+    assert_eq!((&opened.document, opened.home.as_ref().map(Home::path)), (&typed, Some(copied.as_path())));
+    let mut desk = Desk::at(&mut journals, opened);
+    assert!(!desk.save() && desk.save());
+
+    let id = |path: &Path| Writer::of(files::open(path, Style::default).unwrap()).0.copy.id.clone();
+    assert_eq!((id(&copied), id(&path)), (own, original), "each file is one document, and they are two");
+    assert_eq!(files::open(&copied, Style::default).unwrap().document, typed);
+    assert_eq!(files::open(&path, Style::default).unwrap().document, document("First thoughts"));
 }
