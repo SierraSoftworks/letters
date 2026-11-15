@@ -143,7 +143,8 @@ impl Provider {
         let mut claims = self.read(known, &tokens.id_token, &sent.nonce, now)?;
         // A provider may keep some claims out of the token and tell them when asked.
         let lacks = |claim: &String| !claims.contains_key(claim);
-        if lacks(&self.oidc.username_claim) || lacks(&self.oidc.groups_claim) {
+        let oidc = &self.oidc;
+        if lacks(&oidc.username_claim) || lacks(&oidc.name_claim) || lacks(&oidc.groups_claim) {
             let known = self.known(now)?;
             if let (Some(endpoint), Some(access)) = (&known.discovery.userinfo_endpoint, &tokens.access_token) {
                 let told = self.ask(

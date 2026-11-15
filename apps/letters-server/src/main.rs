@@ -63,6 +63,8 @@ fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(listen).await?;
         log(&format!("listening on {listen} as {}", app.config.server.url));
+        #[cfg(not(panic = "unwind"))]
+        log("built so that a fault in one document stops the server: `--profile server` builds one that goes on");
         letters_server::serve(app, listener, stopped()).await?;
         log("stopped, with what was open saved");
         Ok(())

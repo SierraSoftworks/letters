@@ -313,6 +313,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "argon2"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "134c52ddac6d63c576bef8168db10c83c49c26444ecbc68060fef078925a901c"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.3.1",
+ "password-hash",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -759,6 +771,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "031043d04099746d8db04daf1fa424b2bc8bd69d92b25962dcde24da39ab64a2"
 dependencies = [
  "typenum",
+]
+
+[[package]]
+name = "blake2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b5d4d889834ee8ecfc0f8426ad30faf7cdcb10f741a8e6d7224d95325479f6f"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -3704,6 +3725,7 @@ name = "letters-fonts"
 version = "0.1.0"
 dependencies = [
  "letters-render",
+ "skrifa 0.49.0",
 ]
 
 [[package]]
@@ -3823,7 +3845,10 @@ dependencies = [
 name = "letters-server"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "axum",
+ "brotli",
+ "brotli-decompressor",
  "cap-std",
  "getrandom 0.4.3",
  "http-body-util",
@@ -3838,7 +3863,10 @@ dependencies = [
  "letters-sync",
  "letters-trust",
  "letters-ui",
+ "letters-web",
+ "rcgen",
  "redb",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -3876,6 +3904,7 @@ version = "0.1.0"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
+ "letters-api",
  "letters-convert",
  "letters-editor",
  "letters-model",
@@ -3896,6 +3925,7 @@ version = "0.1.0"
 dependencies = [
  "accesskit",
  "image",
+ "letters-api",
  "letters-convert",
  "letters-editor",
  "letters-fonts",
@@ -3913,6 +3943,7 @@ name = "letters-web"
 version = "0.1.0"
 dependencies = [
  "accesskit",
+ "axum",
  "js-sys",
  "letters-api",
  "letters-convert",
@@ -3923,6 +3954,7 @@ dependencies = [
  "letters-math",
  "letters-model",
  "letters-render",
+ "letters-server",
  "letters-spell",
  "letters-sync",
  "letters-test",
@@ -3930,6 +3962,7 @@ dependencies = [
  "letters-ui",
  "serde_json",
  "skrifa 0.49.0",
+ "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -5129,6 +5162,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "password-hash"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
+dependencies = [
+ "phc",
+]
+
+[[package]]
 name = "pdf-writer"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5250,6 +5292,16 @@ dependencies = [
  "fixedbitset",
  "hashbrown 0.15.5",
  "indexmap",
+]
+
+[[package]]
+name = "phc"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44dc769b75f93afdddd8c7fa12d685292ddeff1e66f7f0f3a234cf1818afe892"
+dependencies = [
+ "base64ct",
+ "ctutils",
 ]
 
 [[package]]

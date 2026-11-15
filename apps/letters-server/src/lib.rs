@@ -7,8 +7,12 @@
 //! - [`spaces`] is the only way to a file, and cannot leave a space's folder.
 //! - [`library`] lists a space and finds a document by its id, wherever its file was moved to.
 //! - [`api`] answers the interface `letters_api` lays down.
+//! - [`shares`] is who reaches a document besides those its space lets in, and [`links`] are the
+//!   addresses that let in whoever holds one.
+//! - [`fetch`] is what the server fetches for a document from elsewhere: a linked picture, a link's page.
 //! - [`rooms`] are the documents that are open now, and [`socket`] is each device's line to one.
-//! - [`pages`] are the server's own pages for a browser: the documents a person reaches, and one to read.
+//! - [`pages`] are the server's own pages for a browser: the documents a person reaches, one to read, and
+//!   one in the editor, which is compiled in when the server is built with it.
 //!
 //! A document's content lives in its `.let` file alone. Whatever else writes that file, over a share or
 //! with a sync tool, is another writer like the server, and the save in `letters_format` merges with it.
@@ -17,12 +21,15 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod fetch;
 pub mod ids;
 pub mod library;
+pub mod links;
 pub mod oidc;
 pub mod pages;
 pub mod rooms;
 pub mod session;
+pub mod shares;
 pub mod socket;
 pub mod spaces;
 pub mod store;
@@ -31,12 +38,15 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::serve::ListenerExt;
-use letters_api::{Role, Space};
+use letters_api::{Person, Role, Space};
 
 use crate::config::Config;
 use crate::error::{Answer, Refusal};
+use crate::fetch::{Fetches, Roots};
 use crate::library::Library;
+use crate::links::Doors;
 use crate::oidc::Provider;
+use crate::pages::editor::Editor;
 use crate::rooms::Rooms;
 use crate::session::Signed;
 use crate::spaces::Root;
@@ -52,6 +62,11 @@ pub struct App {
     pub library: Library,
     pub provider: Provider,
     pub rooms: Rooms,
+    /// The browser's editor, when the server was built with one. Without it a browser reads.
+    pub editor: Option<Editor>,
+    pub fetches: Fetches,
+    /// What following share links has cost each address of late.
+    pub doors: Doors,
     clock: Clock,
 }
 
@@ -61,7 +76,19 @@ impl App {
     pub fn new(config: Config, store: Store) -> Self {
         let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
         let (provider, rooms) = (Provider::new(&config), Rooms::new(&config.server.state));
-        Self { config, store, library: Library::new(), provider, rooms, clock: Box::new(clock) }
+        let (editor, fetches) = (Editor::compiled(), Fetches::new(Roots::System));
+        let (library, doors) = (Library::new(), Doors::default());
+        Self { config, store, library, provider, rooms, editor, fetches, doors, clock: Box::new(clock) }
+    }
+
+    /// The same server taking another word on who a site is, for tests against a site of their own.
+    pub fn with_roots(self, roots: Roots) -> Self {
+        Self { fetches: Fetches::new(roots), ..self }
+    }
+
+    /// The same server with another editor for its browsers, or with none.
+    pub fn with_editor(self, editor: Option<Editor>) -> Self {
+        Self { editor, ..self }
     }
 
     /// The same server telling another time, for tests of what runs out.
@@ -73,10 +100,11 @@ impl App {
         (self.clock)()
     }
 
-    /// The spaces `who` reaches, in the order the settings list them.
+    /// The spaces `who` reaches, in the order the settings list them. Whoever only a link let in reaches
+    /// none: not even a space of their own, which everyone who signs in has.
     pub fn spaces(&self, who: &Signed) -> Vec<(&config::Space, Role)> {
         let reached = |space| Some((space, config::Space::role(space, &who.groups)?));
-        self.config.spaces.iter().filter_map(reached).collect()
+        self.config.spaces.iter().filter(|_| !who.alone()).filter_map(reached).collect()
     }
 
     /// The space `id` as `who` reaches it. One they do not reach is not there for them.
@@ -99,21 +127,32 @@ impl App {
     }
 }
 
+/// A folder the server knows of, open.
+pub(crate) struct Rooted<'a> {
+    pub space: &'a config::Space,
+    /// Whose it is, when it is one person's own.
+    pub whose: Option<Person>,
+    pub root: Root,
+}
+
 impl App {
-    /// Every folder the server knows of, each with its space's name: the shared spaces, and the own space
-    /// of everyone who has signed in. One that cannot be opened is said and passed over.
-    fn folders(&self) -> Vec<(&str, Root)> {
+    /// Every folder the server knows of: the shared spaces, and the own space of everyone who has signed
+    /// in. One that cannot be opened is said and passed over, and so is the own space of someone who
+    /// has not come to it yet, which is no fault.
+    pub(crate) fn folders(&self) -> Vec<Rooted<'_>> {
         let people = self.store.under(&session::PEOPLE, "").unwrap_or_default();
-        let names: Vec<String> = people.into_iter().map(|(_, seen)| seen.person.username).collect();
+        let people: Vec<Person> = people.into_iter().map(|(_, seen)| seen.person).collect();
         let mut roots = Vec::new();
         for space in &self.config.spaces {
-            let folders: Vec<String> = match space.personal() {
-                true => names.iter().filter(|name| spaces::username_ok(name)).map(|name| space.folder(name)).collect(),
-                false => vec![space.folder("")],
+            let own = people.iter().filter(|person| spaces::username_ok(&person.username));
+            let folders: Vec<(String, Option<Person>)> = match space.personal() {
+                true => own.map(|person| (space.folder(&person.username), Some(person.clone()))).collect(),
+                false => vec![(space.folder(""), None)],
             };
-            for folder in folders {
+            for (folder, whose) in folders {
                 match Root::open(&folder, false) {
-                    Ok(root) => roots.push((space.name.as_str(), root)),
+                    Ok(root) => roots.push(Rooted { space, whose, root }),
+                    Err(error) if whose.is_some() && error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => log(&format!("the space \"{}\" could not be opened: {error}", space.name)),
                 }
             }
@@ -123,15 +162,15 @@ impl App {
 
     /// Every folder the server knows of that can be opened now.
     pub fn roots(&self) -> Vec<Root> {
-        self.folders().into_iter().map(|(_, root)| root).collect()
+        self.folders().into_iter().map(|rooted| rooted.root).collect()
     }
 
     /// Reads every folder the server knows of into the index. One that cannot be read is said and passed
     /// over.
     pub fn scan(&self) {
-        for (space, root) in self.folders() {
+        for Rooted { space, root, .. } in self.folders() {
             if let Err(refusal) = self.library.scan(&self.store, &root) {
-                log(&format!("the space \"{space}\" could not be scanned: {}", refusal.0));
+                log(&format!("the space \"{}\" could not be scanned: {}", space.name, refusal.0));
             }
         }
     }
@@ -159,7 +198,9 @@ pub async fn serve(
     };
     // A frame that relays what someone typed is small, and is not held back to be sent with the next.
     let listener = listener.tap_io(|socket| drop(socket.set_nodelay(true)));
-    axum::serve(listener, api::router(app)).with_graceful_shutdown(stopped).await
+    // Each request is told the address it came from, which following a link is counted by.
+    let routes = api::router(app).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    axum::serve(listener, routes).with_graceful_shutdown(stopped).await
 }
 
 /// Writes a line to the server's log, which is its standard error.

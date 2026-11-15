@@ -110,3 +110,100 @@ jobs:
         run: |
           xvfb-run -a -s "-screen 0 1400x1000x24" ./scripts/budgets.sh --window ubuntu-latest | tee budgets.txt
           { echo '```text'; cat budgets.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+
+  # The tests that are too slow for every push, each night and when asked for.
+  slow:
+    name: Slow tests
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: slow
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install a session bus
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends dbus-daemon
+
+      - name: Test
+        run: ./scripts/check.sh slow
+
+  # The server as it ships: its own profile, with the browser's editor compiled in. Nothing else builds
+  # it, and thin LTO on one codegen unit takes minutes, so each night and when asked for.
+  server:
+    name: Server build
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: server
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the browser's editor
+        run: ./apps/letters-web/build.sh
+
+      - name: Build
+        env:
+          LETTERS_WEB_DIST: ${{ github.workspace }}/apps/letters-web/dist
+        run: cargo build --profile server -p letters-server
+
+      # The least a server must do: read its settings and say they are sound.
+      - name: Check that it starts
+        shell: bash
+        run: |
+          cat >"$RUNNER_TEMP/letters.toml" <<EOF
+          [server]
+          name = "Smoke"
+          url = "https://letters.example.test"
+          state = '$RUNNER_TEMP/state'
+
+          [auth.oidc]
+          issuer = "https://id.example.test"
+          client_id = "letters"
+
+          [[space]]
+          name = "Home"
+          path = '$RUNNER_TEMP/home/{username}'
+          EOF
+          target/server/letters-server --check --config "$RUNNER_TEMP/letters.toml"
+
+  # What layout costs a frame. The bench holds its own budgets and fails when a measurement is over one.
+  bench:
+    name: Layout bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build
+        run: cargo bench -p letters-layout --no-run
+
+      - name: Bench
+        shell: bash
+        run: |
+          cargo bench -p letters-layout | tee bench.txt
+          { echo '```text'; cat bench.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"

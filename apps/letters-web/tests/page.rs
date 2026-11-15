@@ -2,10 +2,13 @@
 
 use std::convert::Infallible;
 
+use accesskit::Node;
 use letters_api::{Allows, Opened, Role, Trust};
 use letters_editor::InputEvent;
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, ReplicaId, Style};
+use letters_render::Size;
 use letters_test::TestPlatform;
+use letters_ui::Window;
 use letters_web::page::{self, DOCUMENT, FIRST_PAINT, OPENED, Place, Skeleton, Span};
 use serde_json::json;
 
@@ -32,6 +35,7 @@ fn opened(name: &str, author: &str, trust: Trust) -> Opened {
         id: "0190f3a2-7c1e-7b4a-9c55-3f2a1b0c9d8e".into(),
         created: "2026-11-15T10:00:00Z".into(),
         name: name.into(),
+        named: true,
         space: None,
         path: String::new(),
         role: Role::Editor,
@@ -189,18 +193,26 @@ fn spans_put_every_control_where_the_window_showed_it() {
         (width, places)
     };
     let all: Vec<(f32, Vec<Place>)> = (300..=700).map(|width| shown(width as f32)).collect();
-    let spans = page::spans(&all);
-    assert!(spans.len() <= 4, "a line is one span, however many widths it holds: {}", spans.len());
-    for (width, places) in &all {
-        let at = placed(&spans, *width);
-        assert_eq!(at.len(), places.len(), "at {width}");
-        for (at, place) in at.iter().zip(places) {
-            assert!((0..4).all(|i| (at[i] - place[i]).abs() < 0.1), "at {width}: {at:?} for {place:?}");
+    // Every width, and only those that tell the lines apart: where one bends, and each side of a break.
+    let told = [300.0, 344.0, 499.0, 500.0, 700.0].map(shown).to_vec();
+    for (samples, most) in [(all.clone(), 4), (told, 3)] {
+        let spans = page::spans(&samples);
+        let widths = samples.len();
+        assert!(spans.len() <= most, "from {widths} widths, a line is one span however many it holds: {}", spans.len());
+        for (width, places) in &all {
+            let at = placed(&spans, *width);
+            assert_eq!(at.len(), places.len(), "from {widths} widths, at {width}");
+            for (at, place) in at.iter().zip(places) {
+                assert!(
+                    (0..4).all(|i| (at[i] - place[i]).abs() < 0.1),
+                    "from {widths} widths, at {width}: {at:?} for {place:?}"
+                );
+            }
         }
+        // Between the widths that were laid out, and past the widest, each keeps to its line.
+        assert_eq!(placed(&spans, 2000.0).last().map(|place| place[0]), Some(1960.0));
+        assert_eq!(placed(&spans, 600.5).last().map(|place| place[0]), Some(560.5));
     }
-    // Between the widths that were laid out, and past the widest, each keeps to its line.
-    assert_eq!(placed(&spans, 2000.0).last().map(|place| place[0]), Some(1960.0));
-    assert_eq!(placed(&spans, 600.5).last().map(|place| place[0]), Some(560.5));
 }
 
 #[test]
@@ -221,6 +233,62 @@ fn the_skeleton_is_the_start_of_the_windows_bar_and_none_of_its_tools() {
         for pair in places.windows(2) {
             assert!(pair[0][0] + pair[0][2] <= pair[1][0] + 0.1, "at {width}: {pair:?} overlap");
         }
+    }
+}
+
+/// Where the window has the button called `name` when it is `width` wide.
+fn button(window: &mut Window, width: f32, name: &str) -> Place {
+    window.resize(Size { width, height: 2.0 * width }, 1.0);
+    let update = window.access();
+    let named = |node: &&Node| node.role() == accesskit::Role::Button && node.label() == Some(name);
+    let node = update.nodes.iter().map(|(_, node)| node).find(named).unwrap_or_else(|| panic!("at {width}: no {name}"));
+    let bounds = node.bounds().expect("a button is somewhere");
+    [bounds.x0 as f32, bounds.y0 as f32, bounds.width() as f32, bounds.height() as f32]
+}
+
+#[test]
+fn the_skeleton_has_the_name_where_the_window_has_it_at_widths_it_was_not_laid_out_at() {
+    let cases =
+        [("Minutes", Trust::Trusted), ("The minutes of a meeting that went on for a long time indeed", Trust::Safe)];
+    for (name, trust) in cases {
+        let said = opened(name, "Ada", trust);
+        let mut window = page::served_window(page::welcome(&mut || "b".into()), &said, ReplicaId::new("test"));
+        let skeleton = Skeleton::of(&mut window);
+        for width in (320..=1600).step_by(7).map(|width| width as f32) {
+            let [left, top, wide, high] = button(&mut window, width, name);
+            let shape = placed(&skeleton.spans, width)[0];
+            let near = |a: f32, b: f32| (a - b).abs() < 0.1;
+            assert!(
+                near(shape[0], left) && near(shape[1], top) && near(shape[3], high),
+                "{name} at {width}: {shape:?}"
+            );
+            // The bar cuts a name short where its tools begin.
+            assert!(shape[2] <= wide + 0.1, "{name} at {width}: {shape:?} is no wider than the {wide} of the name");
+        }
+    }
+}
+
+#[test]
+fn a_served_page_has_the_skeleton_of_the_window_on_all_of_a_long_document() {
+    let text = |n: usize, kind| Block::text(BlockId::new(format!("b{n}")), kind, format!("What block {n} says."));
+    // A name of its own or its first heading's, which is deep in the document, and the caret in each kind of last block.
+    let cases = [
+        (true, BlockKind::Paragraph),
+        (false, BlockKind::Heading { level: 2 }),
+        (false, BlockKind::Code { language: None }),
+    ];
+    for (named, last) in cases {
+        let mut blocks: Vec<Block> = (0..200).map(|n| text(n, BlockKind::Paragraph)).collect();
+        blocks[40] = text(40, BlockKind::Heading { level: 1 });
+        blocks.push(text(200, last.clone()));
+        let document = Document { blocks, ..Document::default() };
+        let said = Opened { named, ..opened("Minutes", "Ada", Trust::Trusted) };
+
+        let mut window = page::served_window(document.clone(), &said, ReplicaId::new("test"));
+        let style = window.style().clone();
+        let whole =
+            page::first_paint(&Skeleton::of(&mut window), &page::export(&document, &style, &said.name, "/fonts/"));
+        assert!(page::served(&document, &said, "/").contains(&whole), "named {named}, ending in {last:?}");
     }
 }
 

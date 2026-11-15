@@ -25,6 +25,8 @@ pub struct Folder {
     /// When each file last changed, on a clock that ticks once per change.
     modified: BTreeMap<String, u64>,
     clock: u64,
+    /// How often a file was read whole.
+    pub reads: usize,
     /// Refuses every write and rename.
     pub read_only: bool,
     /// Renames onto this name are refused, as a file held open on SMB refuses them.
@@ -60,6 +62,7 @@ impl Files for Folder {
     }
 
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        self.reads += 1;
         Ok(self.files.get(name).cloned())
     }
 
@@ -231,8 +234,11 @@ impl World {
     /// starts again.
     pub fn open_room(&mut self) -> Result<(), Error> {
         self.replicas += 1;
+        let stamp = self.folder.stamp(NAME).unwrap().expect("the document has a file");
         let copy = open_file(&self.folder, self.replicas);
-        self.room = Some(Room::open(copy, "/srv/letters/report.let", &mut self.state, self.now)?);
+        let mut room = Room::open(copy, "/srv/letters/report.let", &mut self.state, self.now)?;
+        room.read_as(stamp);
+        self.room = Some(room);
         Ok(())
     }
 
@@ -319,6 +325,18 @@ impl World {
         }
     }
 
+    /// The server stops as it was asked to: the room writes what its file lacks and lets every socket
+    /// go, and is gone.
+    pub fn shut_down(&mut self) -> Result<Option<Saved>, Error> {
+        let mut room = self.room.take().expect("the room is open");
+        let saved = room.stop(&mut self.folder, &mut self.state, &save_as("stop"), self.now);
+        while let Some(outbound) = room.poll() {
+            self.deliver(outbound);
+        }
+        self.settle();
+        saved
+    }
+
     /// The network between a device and the server goes down.
     pub fn cut(&mut self, device: usize) {
         let (now, device) = (self.now, &mut self.devices[device]);
@@ -342,39 +360,40 @@ impl World {
             }
             while let Some(outbound) = self.room.as_mut().and_then(Room::poll) {
                 busy = true;
-                let now = self.now;
-                let (session, frame) = match outbound {
-                    Outbound::Send(session, frame) => (session, Some(frame)),
-                    Outbound::Close(session) => (session, None),
-                };
-                if let Some(frame) = &frame {
-                    self.told.push((session, ServerMessage::decode(frame).unwrap().unwrap()));
-                }
-                let to = self.devices.iter().position(|device| device.session == Some(session) && !device.frozen);
-                let Some(to) = to else { continue };
-                let device = &mut self.devices[to];
-                match frame {
-                    Some(frame) => {
-                        device.client.received(
-                            &frame,
-                            Local { model: device.model.as_ref(), notes: &device.notes },
-                            now,
-                        );
-                    }
-                    None => {
-                        device.session = None;
-                        device.client.closed(now);
-                    }
-                }
-                // A shell drains its client after every call, so a socket the client gave up is closed
-                // before the server's own close of it could be told.
-                self.drain(to);
+                self.deliver(outbound);
             }
             if !busy {
                 return;
             }
         }
         panic!("the world does not settle");
+    }
+
+    /// Does what the room asked of its host: a frame goes to its device, or the device's socket closes.
+    fn deliver(&mut self, outbound: Outbound) {
+        let now = self.now;
+        let (session, frame) = match outbound {
+            Outbound::Send(session, frame) => (session, Some(frame)),
+            Outbound::Close(session) => (session, None),
+        };
+        if let Some(frame) = &frame {
+            self.told.push((session, ServerMessage::decode(frame).unwrap().unwrap()));
+        }
+        let to = self.devices.iter().position(|device| device.session == Some(session) && !device.frozen);
+        let Some(to) = to else { return };
+        let device = &mut self.devices[to];
+        match frame {
+            Some(frame) => {
+                device.client.received(&frame, Local { model: device.model.as_ref(), notes: &device.notes }, now);
+            }
+            None => {
+                device.session = None;
+                device.client.closed(now);
+            }
+        }
+        // A shell drains its client after every call, so a socket the client gave up is closed before the
+        // server's own close of it could be told.
+        self.drain(to);
     }
 
     /// Does what a device's client asks for. Returns whether it asked for anything.

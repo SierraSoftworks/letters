@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use letters_api::{Code, Opened, paths};
-use letters_format::Archive;
-use letters_model::{Model, Notes, Selection};
+use letters_api::{Access, Code, CreatedLink, EntryKind, Grant, NewLink, Opened, Shares, paths};
+use letters_format::{Archive, WorkingCopy};
+use letters_model::{Model, Notes, ReplicaId, Selection};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
 use sha2::{Digest, Sha256};
 use ureq::http::Uri;
@@ -136,11 +136,6 @@ pub fn reach(session: &Session, id: &str, home: &Path) -> Result<Reached, Unreac
             return Err(Unreached::Refused(refused));
         }
     };
-    let keep = |to: &Path, bytes: &[u8]| {
-        // Written beside and renamed, so that a crash leaves a whole file or none.
-        let beside = to.with_extension("new");
-        fs::write(&beside, bytes).and_then(|()| fs::rename(&beside, to))
-    };
     if let Some(folder) = path.parent() {
         fs::create_dir_all(folder).map_err(Unreached::Unkept)?;
     }
@@ -149,9 +144,188 @@ pub fn reach(session: &Session, id: &str, home: &Path) -> Result<Reached, Unreac
         let file = session.file(id, most).map_err(Unreached::Refused)?;
         keep(&path, &file).map_err(Unreached::Unkept)?;
     }
-    // Kept for the day the document is opened with no server in reach.
-    let _ = serde_json::to_vec(&opened).map(|json| keep(&said, &json));
+    remember(&path, &opened);
     Ok(Reached { opened, path, online: true })
+}
+
+/// Writes a file beside its place and renames it there, so that a crash leaves a whole file or none.
+fn keep(to: &Path, bytes: &[u8]) -> io::Result<()> {
+    let beside = to.with_extension("new");
+    fs::write(&beside, bytes).and_then(|()| fs::rename(&beside, to))
+}
+
+/// Keeps what the server said of the document whose copy is at `copy`, for the day the document is
+/// opened with no server in reach.
+fn remember(copy: &Path, opened: &Opened) {
+    let _ = serde_json::to_vec(opened).map(|json| keep(&copy.with_extension("json"), &json));
+}
+
+/// A folder of the space a server keeps a document in, as a tree to move the document in lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shelf {
+    /// Where it is in its space, as [`Move::folder`](letters_api::Move::folder) names it. Empty for the
+    /// space itself.
+    pub path: String,
+    pub name: String,
+    /// How far down the tree it is. The space is at 0.
+    pub depth: u8,
+}
+
+/// The most folders of a space that are listed, each of which is asked for.
+const SHELVES: usize = 200;
+/// The last number a first heading's name is tried with, where others have the name.
+const NUMBERED: u32 = 9;
+
+/// What is asked of a server about what a document is called and where it is kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Placing {
+    /// Only how it stands now: nothing tells a device that someone renamed or moved the document.
+    Look,
+    /// The name its first heading gives a document that has none of its own. It takes one once, with a
+    /// number after a name that is taken, and a server that will not have it is not asked twice.
+    Name(String),
+    Rename(String),
+    /// Another folder of `space`, by its [`Shelf::path`].
+    Move {
+        space: String,
+        folder: String,
+    },
+    /// A folder to make in `parent`, for the document to move to.
+    NewFolder {
+        space: String,
+        parent: String,
+        name: String,
+    },
+}
+
+/// How a document stands at its server once that was asked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Placed {
+    /// What the server says of the document now, if it said.
+    pub opened: Option<Opened>,
+    /// The folders of the document's space in tree order, the space itself first, if the server said.
+    /// A document that reaches the person only through a share has none.
+    pub shelves: Option<Vec<Shelf>>,
+    /// Why something that was asked was not done, as the person is to read it. What was asked after it
+    /// was left alone.
+    pub refused: Option<String>,
+}
+
+/// Asks the server of the document whose copy is at `copy` for each of `asks` in turn, up to the first
+/// it refuses, and then how the document stands. This waits on the network.
+pub fn place(session: &Session, id: &str, copy: &Path, asks: &[Placing]) -> Placed {
+    let ask = |ask: &Placing| match ask {
+        Placing::Look => Ok(()),
+        // What its first heading asks for is nothing the person asked for, and is refused in silence.
+        Placing::Name(name) => {
+            let _ = name_once(session, id, name);
+            Ok(())
+        }
+        Placing::Rename(name) => session.rename(id, name).map(drop),
+        Placing::Move { space, folder } => session.relocate(id, space, folder).map(drop),
+        Placing::NewFolder { space, parent, name } => session.new_folder(space, parent, name).map(drop),
+    };
+    let refused = asks.iter().try_for_each(ask).err().map(|refused| sentence(&refused));
+    let opened = session.open(id).ok();
+    if let Some(opened) = &opened {
+        remember(copy, opened);
+    }
+    let space = opened.as_ref().and_then(|opened| opened.space.as_deref());
+    Placed { shelves: space.and_then(|space| shelves(session, space).ok()), opened, refused }
+}
+
+/// Why a server did not do what the person asked, as they are to read it: the server's own sentence where
+/// it gave one.
+fn sentence(refused: &Refused) -> String {
+    match refused {
+        Refused::Said(said) => said.to_string(),
+        other => format!("That could not be done: {other}."),
+    }
+}
+
+/// What the Share dialog asks of a document's server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Sharing {
+    /// Who the document is shared with.
+    Look,
+    /// All its people from here on.
+    People(Vec<Grant>),
+    /// A link to make.
+    Link(NewLink),
+    /// A link to revoke, by its id.
+    Revoke(String),
+    /// Who reached the document through a share.
+    Log,
+}
+
+/// What a document's server answered the Share dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Shared {
+    /// Who the document is shared with now, and whether the server makes links.
+    Shares(Shares, bool),
+    /// The link that was asked for, with its address.
+    Made(CreatedLink),
+    Revoked,
+    /// Who reached the document through a share, newest first.
+    Log(Vec<Access>),
+    /// Why it was not done, as the person is to read it.
+    Refused(String),
+}
+
+/// Asks a document's server what the Share dialog asked. This waits on the network.
+pub fn share(session: &Session, id: &str, ask: &Sharing) -> Shared {
+    let told = |shares| Shared::Shares(shares, session.links().unwrap_or(false));
+    let answered = match ask {
+        Sharing::Look => session.shares(id).map(told),
+        Sharing::People(people) => session.share(id, people).map(told),
+        Sharing::Link(new) => session.make_link(id, new).map(Shared::Made),
+        Sharing::Revoke(link) => session.revoke_link(id, link).map(|()| Shared::Revoked),
+        Sharing::Log => session.access_log(id).map(Shared::Log),
+    };
+    answered.unwrap_or_else(|refused| {
+        Shared::Refused(match refused {
+            // No word of why: the server is one from before documents were shared.
+            Refused::Status(404 | 405) => "This server does not share documents yet.".to_owned(),
+            refused => sentence(&refused),
+        })
+    })
+}
+
+/// Gives a document the name of its first heading, unless it has a name of its own by now: another
+/// device may have named it since this one last asked.
+fn name_once(session: &Session, id: &str, name: &str) -> Result<(), Refused> {
+    if session.open(id)?.named {
+        return Ok(());
+    }
+    let mut tried = session.rename(id, name);
+    for number in 2..=NUMBERED {
+        if tried.as_ref().err().and_then(Refused::code) != Some(Code::NameTaken) {
+            break;
+        }
+        tried = session.rename(id, &format!("{name} {number}"));
+    }
+    tried.map(drop)
+}
+
+/// The folders of a space in tree order, the space itself first.
+fn shelves(session: &Session, space: &str) -> Result<Vec<Shelf>, Refused> {
+    let inside = |folder: &str, depth: u8| {
+        let listing = session.entries(space, folder)?;
+        let folders = listing.entries.into_iter().filter(|entry| entry.kind == EntryKind::Folder);
+        // Each is taken from the end, so the first of a folder is the next listed.
+        let mut folders: Vec<_> = folders.map(|entry| (entry, depth)).collect();
+        folders.reverse();
+        Ok((listing.space.name, folders))
+    };
+    let (name, mut left) = inside("", 1)?;
+    let mut out = vec![Shelf { path: String::new(), name, depth: 0 }];
+    while let Some((folder, depth)) = left.pop().filter(|_| out.len() < SHELVES) {
+        if let Some(deeper) = depth.checked_add(1) {
+            left.extend(inside(&folder.path, deeper)?.1);
+        }
+        out.push(Shelf { path: folder.path, name: folder.name, depth });
+    }
+    Ok(out)
 }
 
 /// One picture of a server's document that the copy here lacks, by the name the document has for it:
@@ -205,6 +379,7 @@ fn unsaid(id: &str) -> Opened {
         id: id.to_owned(),
         created: String::new(),
         name: id.to_owned(),
+        named: true,
         space: None,
         path: String::new(),
         role: letters_api::Role::Reader,
@@ -229,6 +404,9 @@ pub enum Told {
     Refused(Refusal),
     /// The server did not take the picture of this name, so the others will not see it.
     Unkept(String),
+    /// What was written here fits no frame, so the server takes the copy's file whole. Save the copy, and
+    /// call [`Line::saved`] once its file holds all of it.
+    Whole,
     /// [`Line::link`] changed.
     Link,
     /// [`Line::progress`] changed.
@@ -238,12 +416,28 @@ pub enum Told {
 }
 
 /// What a line's window hands back to [`Line::heard`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Said {
     /// The socket of this number had something to say.
     Socket(u64, Heard),
     /// The pictures the server was owed were handed over, or could not be for now.
     Handed,
+    /// The copy's file was sent to the server whole, or why it was not.
+    Sent(Option<Refused>),
+    /// The document's file was brought from the server whole: its history and its notes. `None` when it
+    /// could not be had.
+    Brought(Option<(Vec<u8>, Notes)>),
+}
+
+/// A document's file on its way whole, when what one side has for the other fits no frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Whole {
+    No,
+    /// The server is to be sent the copy's file, once it holds what was written here.
+    Wanted,
+    Sending,
+    /// The server's file is on its way here.
+    Bringing,
 }
 
 /// What tells a line's window that there is something for [`Line::heard`]. It is called on another thread.
@@ -312,6 +506,22 @@ impl Handing {
         }
     }
 
+    /// Sends the server the copy's file whole. This waits on the network.
+    fn send(&self) -> Result<(), Refused> {
+        let file = fs::read(&self.copy).map_err(|error| Refused::Unreachable(error.to_string()))?;
+        self.session.keep_file(&self.id, &file)
+    }
+
+    /// The history and the notes of the document as the server's file holds it, to merge here. This
+    /// waits on the network.
+    fn bring(&self) -> Option<(Vec<u8>, Notes)> {
+        let file = self.session.file(&self.id, self.session.limits().ok()?.document).ok()?;
+        let mut file = Archive::open(io::Cursor::new(file)).ok()?;
+        // Nothing is written with it, so whose copy it is does not matter.
+        let copy = WorkingCopy::open(&mut file, ReplicaId::new(&crate::platform::block_id())).ok()?;
+        Some((copy.model().save(), copy.notes))
+    }
+
     /// Owes the server the pictures in the copy's file that it does not list.
     fn compare(&self, there: &BTreeSet<String>) {
         let Ok(file) = fs::File::open(&self.copy) else { return };
@@ -361,6 +571,9 @@ pub struct Line {
     hands: bool,
     /// When to try that again, after the server could not be given them.
     hand_at: Option<u64>,
+    whole: Whole,
+    /// When to try again to send the copy's file, after the server could not be reached.
+    send_at: Option<u64>,
 }
 
 impl Line {
@@ -389,6 +602,8 @@ impl Line {
             handing,
             hands: false,
             hand_at: None,
+            whole: Whole::No,
+            send_at: None,
         }
     }
 
@@ -429,6 +644,28 @@ impl Line {
                 // What is still owed could not be handed over now.
                 self.hand_at = self.owes().then_some(now + HAND_AGAIN);
                 return self.changed(local, now);
+            }
+            Said::Sent(None) => {
+                // The server has it all now, which a new handshake tells the client.
+                self.whole = Whole::No;
+                self.sync.stop();
+                self.sync.start(now);
+                return self.drain();
+            }
+            Said::Sent(Some(refused)) if passes(&refused) => {
+                (self.whole, self.send_at) = (Whole::Wanted, Some(now + HAND_AGAIN));
+                return Vec::new();
+            }
+            Said::Sent(Some(_)) => {
+                self.whole = Whole::No;
+                return vec![Told::Refused(Refusal::TooLarge)];
+            }
+            Said::Brought(brought) => {
+                self.whole = Whole::No;
+                let Some((edits, notes)) = brought else { return vec![Told::Link] };
+                // With the file merged, a handshake has little left to bring.
+                self.sync.start(now);
+                return [vec![Told::Merge(edits), Told::Notes(notes), Told::Link], self.drain()].concat();
             }
         };
         if socket != self.sockets {
@@ -476,6 +713,20 @@ impl Line {
         self.drain()
     }
 
+    /// The copy's file holds all that was written here, as after a save. Whatever waited for that goes.
+    pub fn saved(&mut self) {
+        if self.whole == Whole::Wanted {
+            self.send();
+        }
+    }
+
+    /// Sends the server the copy's file whole, on a thread of its own.
+    fn send(&mut self) {
+        (self.whole, self.send_at) = (Whole::Sending, None);
+        let (handing, tell) = (self.handing.clone(), self.tell.clone());
+        thread::spawn(move || tell(Said::Sent(handing.send().err())));
+    }
+
     /// Whether the server is owed pictures.
     fn owes(&self) -> bool {
         !self.handing.owed().pictures.is_empty()
@@ -512,23 +763,33 @@ impl Line {
     pub fn tick(&mut self, now: u64) -> Vec<Told> {
         self.sync.tick(now);
         self.hand(now);
+        // The file held the work when the server could not be reached, and holds it still.
+        if self.whole == Whole::Wanted && self.send_at.is_some_and(|at| at <= now) {
+            self.send();
+        }
         self.drain()
     }
 
     /// When to call [`Line::tick`] next. `None` when nothing is due.
     pub fn wake_at(&self) -> Option<u64> {
-        let (sync, hand) = (self.sync.wake_at(), self.hand_at);
-        sync.zip(hand).map(|(sync, hand)| sync.min(hand)).or(sync).or(hand)
+        [self.sync.wake_at(), self.hand_at, self.send_at].into_iter().flatten().min()
     }
 
     /// How the document stands to its server.
     pub fn link(&self) -> Link {
-        self.ended.map_or_else(|| self.sync.link(), Link::Refused)
+        match self.ended {
+            Some(refusal) => Link::Refused(refusal),
+            // The file is on its way, and the line starts again when it is here.
+            None if self.whole == Whole::Bringing => Link::Connecting,
+            None => self.sync.link(),
+        }
     }
 
-    /// Where the work written here is. Edits that wait for their pictures are on their way.
+    /// Where the work written here is. Edits that wait for their pictures are on their way, and so is
+    /// work that travels as the file.
     pub fn progress(&self) -> Progress {
         match self.sync.progress() {
+            _ if matches!(self.whole, Whole::Wanted | Whole::Sending) => Progress::Saving,
             Progress::Saved if self.hands || self.owes() => Progress::Saving,
             progress => progress,
         }
@@ -560,8 +821,23 @@ impl Line {
                 Event::Notes(notes) => told.push(Told::Notes(notes)),
                 // The copy on this device and its journal keep the work whether or not the server has it.
                 Event::Held(_) => {}
+                // No frame carries what was written here, so the file goes whole.
+                Event::Refused(Refusal::TooLarge) => {
+                    if self.whole != Whole::Sending {
+                        self.whole = Whole::Wanted;
+                        told.push(Told::Whole);
+                    }
+                }
                 Event::Refused(refusal) => told.push(Told::Refused(refusal)),
-                Event::Link => told.push(Told::Link),
+                Event::Link => {
+                    // No frame carries what the server has for this device, so its file comes whole.
+                    if self.sync.link() == Link::Refused(Refusal::TooLarge) && self.whole == Whole::No {
+                        self.whole = Whole::Bringing;
+                        let (handing, tell) = (self.handing.clone(), self.tell.clone());
+                        thread::spawn(move || tell(Said::Brought(handing.bring())));
+                    }
+                    told.push(Told::Link);
+                }
                 Event::Progress => told.push(Told::Progress),
                 Event::Peers => told.push(Told::Peers),
             }

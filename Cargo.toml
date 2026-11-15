@@ -117,6 +117,8 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 # Already in the tree through accesskit. Linux only: it asks the desktop for its settings.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 getrandom = "0.4"
+# What the server keeps of a share link's passphrase, so that whoever reads its store guesses slowly.
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 # The person's time zone, for the dates the landing card shows. No time zone reaches the core.
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 # Older system dictionaries are not in UTF-8. The app reads them: nothing in the core needs this.
@@ -148,6 +150,10 @@ yew = { version = "0.23", default-features = false, features = ["ssr"] }
 yewi = { version = "0.3", features = ["ssr", "fonts"] }
 # Drives the server's routes in its tests with no socket between.
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# The browser's editor is compiled into the server in brotli, made when the server is built. In Rust alone.
+brotli = "8"
+# For the browser that asks for a file of the editor and does not read brotli.
+brotli-decompressor = "5"
 http-body-util = "0.1"
 
 # The browser shell. The command-line `wasm-bindgen` must be the version the lock file names.
@@ -176,16 +182,48 @@ debug = false
 debug = false
 debug-assertions = false
 
+# The server's build compresses the browser's editor once, as small as it goes. Unoptimised, that takes
+# minutes, and a build script is not optimised unless it is said here.
+[profile.dev.package.brotli]
+opt-level = 3
+
+# Slow by design, and unoptimised a hundred times slower still: a test that opens a link with a passphrase
+# would wait seconds on each try.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+# Loro's debug assertions hold for histories Loro wrote. One from anywhere else can fail them, and a panic
+# inside an import leaves the document's locks poisoned, so the process aborts. A release build has no such
+# assertions and reads the same bytes as an update, and so a debug build does too.
+[profile.dev.package.loro-internal]
+debug = false
+debug-assertions = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+[profile.release.package.brotli]
+opt-level = 3
+
+# What a server is built with: `cargo build --profile server -p letters-server`. It has many people's
+# documents open at once, and closes the one a panic came from and keeps the others. Where a panic aborts,
+# as in the apps, it would end them all.
+[profile.server]
+inherits = "release"
+panic = "unwind"
 
 # What scripts/fuzz builds: quick to link, and a panic names its line.
 [profile.fuzz]
 inherits = "release"
 lto = false
 debug = "line-tables-only"
+# A target may catch a panic of code it cannot make refuse, as `Model::check` does with Loro's.
+panic = "unwind"
 
 # The browser's wasm is downloaded before it runs, so it is built small, except where a frame is made:
 # shaping, layout and painting keep their speed. Measured at 17% less to download for the same frame times.

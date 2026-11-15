@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ::image::imageops::{self, FilterType};
-use ::image::{DynamicImage, ImageDecoder, ImageReader, Limits, Rgba, RgbaImage};
+use ::image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, Rgba, RgbaImage};
 use vello_cpu::peniko::ImageAlphaType;
 use vello_cpu::{PixelMetadata, Pixmap};
 
@@ -100,6 +100,10 @@ impl Image {
             .with_guessed_format()
             .map_err(|error| ImageError::Invalid(error.to_string()))?;
         let Some(format) = reader.format() else { return Err(ImageError::Unsupported) };
+        // Another crate in the build can turn on more of `image`'s decoders, so the list is kept here.
+        if !matches!(format, ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP) {
+            return Err(ImageError::Unsupported);
+        }
         let mut limits = Limits::default();
         limits.max_image_width = Some(MAX_SIDE);
         limits.max_image_height = Some(MAX_SIDE);
@@ -118,8 +122,7 @@ impl Image {
         #[cfg_attr(not(feature = "pdf"), expect(unused_mut, reason = "only the PDF backend keeps the file"))]
         let mut image = Self::from_rgba8(image.width(), image.height(), image.into_raw())?;
         #[cfg(feature = "pdf")]
-        if whole && format == ::image::ImageFormat::Jpeg && orientation == ::image::metadata::Orientation::NoTransforms
-        {
+        if whole && format == ImageFormat::Jpeg && orientation == ::image::metadata::Orientation::NoTransforms {
             image.jpeg = Some(bytes.into());
         }
         #[cfg(not(feature = "pdf"))]

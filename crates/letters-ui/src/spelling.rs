@@ -37,6 +37,8 @@ pub(crate) struct Spelling {
     done: bool,
     /// A misspelled word that is not marked, because the caret has not left it since it was typed.
     withheld: Option<(BlockId, Range<usize>)>,
+    /// Whether no word is marked, as for someone who cannot mend one.
+    quiet: bool,
     pub fix: Option<Fix>,
 }
 
@@ -45,6 +47,19 @@ impl Spelling {
     pub fn set_user_words(&mut self, words: impl IntoIterator<Item = impl AsRef<str>>) {
         self.mine = words.into_iter().map(|word| word.as_ref().trim().to_owned()).collect();
         self.reword();
+    }
+
+    /// Stops marking misspelled words, or marks them again. Words are marked for someone who can mend
+    /// them: to anyone else the marks are noise on what they read.
+    pub fn hush(&mut self, quiet: bool, doc: &Document, layout: &mut DocLayout) {
+        if self.quiet == quiet {
+            return;
+        }
+        (self.quiet, self.fix, self.withheld) = (quiet, None, None);
+        for block in doc.walk() {
+            let marks = if quiet { Vec::new() } else { self.proofing.marks(&block.id).to_vec() };
+            layout.set_spelling(&block.id, marks);
+        }
     }
 
     pub fn add_dictionary(&mut self, language: &str, dictionary: Dictionary) {
@@ -106,14 +121,14 @@ impl Spelling {
                 self.withheld = Some((checked.block.clone(), marks.remove(touched)));
             }
             // Set even when the block has none, since the page carries an edited block's old marks along.
-            layout.set_spelling(&checked.block, marks);
+            layout.set_spelling(&checked.block, if self.quiet { Vec::new() } else { marks });
         }
         changed
     }
 
     /// Marks the word that was being typed, once the caret has left it. `caret` is where a caret now stands.
     pub fn moved(&mut self, caret: Option<&Pos>, layout: &mut DocLayout) {
-        let Some((block, word)) = &self.withheld else { return };
+        let Some((block, word)) = self.withheld.as_ref().filter(|_| !self.quiet) else { return };
         if caret.is_some_and(|caret| caret.block == *block && touches(word, caret.offset)) {
             return;
         }

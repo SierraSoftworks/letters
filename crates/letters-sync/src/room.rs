@@ -3,12 +3,13 @@
 //! The host owns the sockets, the folders and the clock, and lends them call by call. The times it tells
 //! are milliseconds since 1970. For each open document the host:
 //!
-//! - reads the file into a [`WorkingCopy`] and opens a room over it with [`Room::open`];
+//! - takes the file's stamp, reads the file into a [`WorkingCopy`], opens a room over it with
+//!   [`Room::open`] and hands it the stamp with [`Room::read_as`];
 //! - admits each socket it has checked with [`Room::join`], feeds its frames to [`Room::received`], and
 //!   says when it closed with [`Room::leave`];
 //! - drains [`Room::poll`] after every call, for the frames to send and the sockets to close;
 //! - at [`Room::wake_at`], calls [`Room::tick`] and then [`Room::exchange`];
-//! - drops the room once [`Room::is_idle`].
+//! - drops the room once [`Room::is_idle`], and calls [`Room::stop`] on each room before it stops itself.
 //!
 //! Every change is in the room's journal before it is acknowledged, so a server that stops loses nothing
 //! it said it held. The file is rewritten when the edits pause, the way every writer of a shared folder
@@ -53,6 +54,8 @@ struct Session {
     /// Where the device's copy stood at its hello, while that copy and the room each hold edits the
     /// other lacks: the device wrote while it was away. Its first edits settle against it.
     apart: Option<Revision>,
+    /// How many of its messages were refused as unreadable.
+    unreadable: u32,
 }
 
 /// One open document on the server.
@@ -94,7 +97,12 @@ impl Room {
     /// the document is saved, in the host's own words. What a run that stopped early left in the journal
     /// is taken in, and is then owed to the file. Fails when the journal cannot be read or does not fit
     /// the document.
+    ///
+    /// The copy is [wary](WorkingCopy::wary) from here on: what devices send and what other writers leave
+    /// in the file is tried apart from the document before it is merged. A host opens the file itself
+    /// with [`WorkingCopy::open_wary`], so that the history it starts from is checked as well.
     pub fn open(mut copy: WorkingCopy, home: &str, state: &mut impl Files, now: u64) -> Result<Self, Error> {
+        copy.wary = true;
         let (journal, left) = Journal::open(state, &copy.id, &copy.created, Some(home))?;
         if let Some(left) = &left {
             copy.replay(left)?;
@@ -117,6 +125,13 @@ impl Room {
         })
     }
 
+    /// How the document's file looked just before the host read the copy this room was opened over. The
+    /// room then leaves the file alone until a writer changes it. A host that does not say costs the
+    /// first look a read of the whole file, and nothing else.
+    pub fn read_as(&mut self, stamp: Stamp) {
+        self.stamp = Some(stamp);
+    }
+
     /// The document as the room holds it, for the host to render or export.
     pub fn copy(&self) -> &WorkingCopy {
         &self.copy
@@ -128,7 +143,8 @@ impl Room {
         let taken = |colour: &u8| self.sessions.values().any(|session| session.colour == *colour);
         // The first colour nobody here has, so that few people look as different as the window can make them.
         let colour = (0..=u8::MAX).find(|colour| !taken(colour)).unwrap_or(self.last as u8);
-        let session = Session { access, colour, greeted: false, heard: now, selection: None, apart: None };
+        let session =
+            Session { access, colour, greeted: false, heard: now, selection: None, apart: None, unreadable: 0 };
         self.sessions.insert(SessionId(self.last), session);
         SessionId(self.last)
     }
@@ -166,11 +182,9 @@ impl Room {
                 Ok(self.pass_on(Some(session), &ServerMessage::Selection { session, selection }))
             }
             ClientMessage::Edits { seq, .. } | ClientMessage::Style { seq, .. } if !role.edits() => {
-                Ok(self.to(session, &ServerMessage::Refused { seq, why: Refusal::ReadOnly }))
+                Ok(self.refuse(session, seq, Refusal::ReadOnly))
             }
-            ClientMessage::Notes { seq, .. } if !role.comments() => {
-                Ok(self.to(session, &ServerMessage::Refused { seq, why: Refusal::NoComments }))
-            }
+            ClientMessage::Notes { seq, .. } if !role.comments() => Ok(self.refuse(session, seq, Refusal::NoComments)),
             ClientMessage::Edits { seq, updates } => self.edits(session, seq, &updates, state, now),
             ClientMessage::Style { seq, style } => self.style(session, seq, style, state, now),
             ClientMessage::Notes { seq, notes } => self.notes(session, role, seq, notes, state, now),
@@ -271,8 +285,8 @@ impl Room {
         self.flush(folder, state, save, now).map(Some)
     }
 
-    /// Saves now, whatever is due: before the host renders the file, moves it to the trash, or stops.
-    /// Like [`Room::exchange`] in everything else.
+    /// Saves now, whatever is due: before the host renders the file or moves it to the trash. Like
+    /// [`Room::exchange`] in everything else. A host that stops calls [`Room::stop`].
     pub fn flush(
         &mut self,
         folder: &mut impl Files,
@@ -317,6 +331,33 @@ impl Room {
         Ok(saved)
     }
 
+    /// The host is stopping, or drops the room with people in it. Writes to the file whatever it lacks,
+    /// and closes every session once it was sent what the save let the room say. Drain [`Room::poll`]
+    /// afterwards.
+    ///
+    /// `None` when the file lacked nothing, and for a room that waits for [`Room::moved`], whose file
+    /// would only be given another copy. What the file does not hold then stays in the journal, as it
+    /// does when the save fails, and the room that is opened over the file next takes it in.
+    ///
+    /// The devices are told no reason, so each asks again and is back once the server is.
+    pub fn stop(
+        &mut self,
+        folder: &mut impl Files,
+        state: &mut impl Files,
+        save: &Save,
+        now: u64,
+    ) -> Result<Option<Saved>, Error> {
+        let saved = match self.parked || self.unsaved.is_none() {
+            true => Ok(None),
+            false => self.flush(folder, state, save, now).map(Some),
+        };
+        for session in mem::take(&mut self.sessions).into_keys() {
+            self.out.push_back(Outbound::Close(session));
+        }
+        self.owed.clear();
+        saved
+    }
+
     /// The document is saved at `home` from now on, in the host's own words: after a move or a rename,
     /// or to save again after a conflict copy. The next [`Room::exchange`] saves there.
     pub fn moved(&mut self, home: &str, state: &mut impl Files) -> Result<(), Error> {
@@ -337,6 +378,12 @@ impl Room {
         self.sessions.values().filter(|session| session.greeted).map(|session| session.access.name.as_str())
     }
 
+    /// How many of a session's messages the room refused as [`Refusal::Unreadable`] and went on. A sound
+    /// device hangs up at the first, so a host may end a session that keeps sending them.
+    pub fn unreadable(&self, session: SessionId) -> u32 {
+        self.sessions.get(&session).map_or(0, |session| session.unreadable)
+    }
+
     /// Whether the room has no sessions and nothing that is due to the file, so that the host may drop
     /// it. What the journal still holds is taken in by the room that is opened next.
     pub fn is_idle(&self) -> bool {
@@ -349,6 +396,14 @@ impl Room {
     fn to(&mut self, session: SessionId, message: &ServerMessage) -> bool {
         self.out.push_back(Outbound::Send(session, message.encode()));
         false
+    }
+
+    /// Tells a session that its message numbered `seq` was not taken. Always `false`.
+    fn refuse(&mut self, session: SessionId, seq: u64, why: Refusal) -> bool {
+        if let Some(from) = self.sessions.get_mut(&session).filter(|_| why == Refusal::Unreadable) {
+            from.unreadable = from.unreadable.saturating_add(1);
+        }
+        self.to(session, &ServerMessage::Refused { seq, why })
     }
 
     /// Sends a message to every session that said hello, but for one.
@@ -434,10 +489,15 @@ impl Room {
         now: u64,
     ) -> Result<bool, Error> {
         let before = (self.copy.model().extent(), self.copy.model().revision());
-        let read = self.copy.edit(updates).is_ok();
-        // Edits that build on others the room never saw wait outside the document, and are not held.
+        // The copy is wary, and tries a device's update apart from the document first. One that the
+        // history library panics on, or cannot save and read again, would cost everyone the document,
+        // and one that builds on edits the room never saw would wait in it unseen.
+        if self.copy.edit(updates).is_err() {
+            return Ok(self.refuse(session, seq, Refusal::Unreadable));
+        }
+        // Held is a promise, so the room sees for itself that the document now reaches all of the update.
         let reaches = |reach: Extent| self.copy.model().extent().partial_cmp(&reach);
-        let whole = read && matches!(Extent::of(updates).map(reaches), Ok(Some(Ordering::Greater | Ordering::Equal)));
+        let whole = matches!(Extent::of(updates).map(reaches), Ok(Some(Ordering::Greater | Ordering::Equal)));
         let apart = self.sessions.get_mut(&session).and_then(|session| session.apart.take()).filter(|_| whole);
         let met = (self.copy.model().extent(), apart.is_some().then(|| self.copy.notes.clone()));
         if let Some(theirs) = &apart {
@@ -461,7 +521,7 @@ impl Room {
         } else if whole {
             self.owed.push((session, seq));
         } else {
-            self.to(session, &ServerMessage::Refused { seq, why: Refusal::Unreadable });
+            self.refuse(session, seq, Refusal::Unreadable);
         }
         kept
     }
@@ -476,7 +536,7 @@ impl Room {
     ) -> Result<bool, Error> {
         let before = self.copy.model().extent();
         if self.copy.set_style(style).is_err() {
-            return Ok(self.to(session, &ServerMessage::Refused { seq, why: Refusal::Unreadable }));
+            return Ok(self.refuse(session, seq, Refusal::Unreadable));
         }
         // The room wrote the change, so the session that asked for it lacks it too.
         let kept = self.keep_edits(None, &before, state, now);
@@ -519,7 +579,7 @@ impl Room {
             true => sent.clone(),
             false => match comments(&self.copy.notes, &sent) {
                 Ok(allowed) => allowed,
-                Err(why) => return Ok(self.to(session, &ServerMessage::Refused { seq, why })),
+                Err(why) => return Ok(self.refuse(session, seq, why)),
             },
         };
         let before = self.copy.notes.clone();

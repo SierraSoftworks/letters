@@ -42,7 +42,7 @@ pub enum Tag {
     ImportNotes { count: u32 },
     /// Who has it open to edit now, by the names they sign with.
     Editing { people: Vec<String> },
-    /// Shared with this many people or groups beyond its space.
+    /// Shared with this many people or groups beyond its space. Told to whoever says who it is shared with.
     Shared { with: u32 },
     /// This many links lead to it.
     Links { count: u32 },
@@ -150,6 +150,10 @@ pub struct Opened {
     pub created: String,
     /// The name to show.
     pub name: String,
+    /// Whether the name is the document's own. One started without a name is called "Untitled" until
+    /// its first heading names it, which a shell does at [`paths::rename`](crate::paths::rename).
+    #[serde(default = "yes")]
+    pub named: bool,
     /// Where it is, for a session that reaches it through a space: see [`Entry::space`] and [`Entry::path`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space: Option<String>,
@@ -170,6 +174,10 @@ pub struct Opened {
     /// The document's `notes.json`. In a page only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<Value>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// An address for the server to fetch on a document's behalf: a page a browser may not read itself, sent

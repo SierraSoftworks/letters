@@ -9,13 +9,16 @@ use std::time::Duration;
 use axum::http::{Method, StatusCode};
 use common::desk::{Desk, settle};
 use common::{Client, Server, texts};
-use letters_api::{Entry, Listing, Move, NewFolder, Rename, Tag, paths};
-use letters_format::{Archive, MIMETYPE, WorkingCopy, hash};
+use letters_api::{Code, Entry, Listing, Move, NewFolder, Rename, Tag, paths};
+use letters_format::{Archive, MIMETYPE, OPLOG, WorkingCopy, hash};
 use letters_model::{Block, BlockKind, Op, Pos, ReplicaId};
 use letters_sync::{Link, Refusal, Role};
 
 /// A smallest PNG, by its first bytes.
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n and the rest";
+
+/// A history with a sound checksum that Loro panics on, from the fuzzer's findings.
+const HARMFUL: &[u8] = include_bytes!("../../../fuzz/corpus/history/a-history-loro-panics-on.bin");
 
 /// A server with the document "Plan" in the family's space, the person who made it, and its id.
 async fn shared(name: &str) -> (Server, Client, String) {
@@ -227,6 +230,98 @@ async fn a_device_hands_its_whole_file_over_and_nothing_is_replaced() {
     let text = desk.texts().join("\n");
     assert!(text.contains("Written away.") && text.contains("Written here."), "whoever has it open is told: {text}");
     assert_eq!(on_file(&ada, &id).await, text);
+}
+
+#[tokio::test]
+async fn a_file_whose_history_would_harm_is_never_merged_and_opens_without_it() {
+    let (server, ada, id) = shared("harmful").await;
+    let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
+    desk.write("Kept. ");
+    settle([&mut desk]).await;
+    // A file as a stranger writes it: every hash sound, and a history that Loro panics on.
+    let harmful = |file: Vec<u8>| {
+        let mut package = Archive::open(Cursor::new(file)).unwrap().package().unwrap();
+        package.entries.insert(OPLOG.into(), HARMFUL.to_vec());
+        let mut bytes = Cursor::new(Vec::new());
+        letters_format::write(&mut bytes, &package).unwrap();
+        bytes.into_inner()
+    };
+
+    // Handed over to be merged into the document, it is refused, and the document is as it was.
+    let was = ada.send(Method::GET, &paths::file(&id), "", Vec::new()).await.body;
+    let handed = ada.send(Method::PUT, &paths::file(&id), MIMETYPE, harmful(was)).await;
+    assert_eq!(handed.status, StatusCode::BAD_REQUEST);
+    settle([&mut desk]).await;
+    assert!(on_file(&ada, &id).await.contains("Kept."));
+    assert_eq!(desk.line.link(), Link::Live(Role::Editor), "its room goes on");
+
+    // Left in the folder by another writer, it is listed like any file, and opens with its text.
+    let other = ada.start("family", "", "Other").await.id.unwrap();
+    let file = ada.send(Method::GET, &paths::file(&other), "", Vec::new()).await.body;
+    std::fs::write(server.scratch.0.join("family/Other.let"), harmful(file)).unwrap();
+    let listing: Listing = ada.get(&paths::entries("family", "")).await.expect("the folder lists");
+    assert_eq!(listing.entries.len(), 2);
+    let mut opened = Desk::open(&server, &ada, &other).await.unwrap();
+    settle([&mut opened]).await;
+    opened.write("Written after. ");
+    settle([&mut opened]).await;
+    assert!(on_file(&ada, &other).await.contains("Written after."), "its history starts over");
+}
+
+#[tokio::test]
+async fn a_conflict_copy_is_merged_when_an_editor_asks_and_then_thrown_away() {
+    let (server, ada, id) = shared("merge-conflicts").await;
+    let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
+    settle([&mut desk]).await;
+    // A sync tool leaves what another machine wrote beside the document, and someone writes here.
+    let was = ada.send(Method::GET, &paths::file(&id), "", Vec::new()).await.body;
+    let mut away = WorkingCopy::open(&mut Archive::open(Cursor::new(was)).unwrap(), ReplicaId::from(9)).unwrap();
+    let first = away.model().doc().blocks[0].id.clone();
+    away.apply([Op::InsertText { at: Pos::new(first, 0), text: "Written away. ".into() }]).unwrap();
+    let copy = "Plan (conflicted copy 2026-11-15)";
+    let beside = server.scratch.0.join("family").join(format!("{copy}.let"));
+    std::fs::write(beside, letters_server::library::packed(&away).unwrap()).unwrap();
+    desk.write("Written here. ");
+    settle([&mut desk]).await;
+
+    let merge = async |who: &Client| who.post::<Vec<String>>(&paths::merge_conflicts(&id), &()).await;
+    let guest = server.person("guest", &["friends"]);
+    assert_eq!(merge(&guest).await.expect_err("a reader merges nothing").code, Code::Forbidden);
+    assert!(!on_file(&ada, &id).await.contains("Written away."), "nothing is merged before an editor asks");
+
+    assert_eq!(merge(&ada).await.unwrap(), [copy]);
+    settle([&mut desk]).await;
+    let text = desk.texts().join("\n");
+    assert!(text.contains("Written away.") && text.contains("Written here."), "whoever has it open is told: {text}");
+    assert_eq!(on_file(&ada, &id).await, text);
+    assert_eq!(server.scratch.names("family/.letters-trash"), [format!("{copy}.let")], "the copy can be put back");
+    assert_eq!(merge(&ada).await.unwrap(), [""; 0], "with no copy left there is nothing to merge");
+}
+
+#[tokio::test]
+async fn a_room_that_fails_is_closed_alone_and_its_document_opens_with_what_was_kept() {
+    let (server, ada, id) = shared("failed").await;
+    let other = ada.start("family", "", "Other").await.id.expect("a document has an id");
+    let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
+    let mut beside = Desk::open(&server, &ada, &other).await.unwrap();
+    settle([&mut desk, &mut beside]).await;
+    let kept = desk.write("Kept through it. ");
+    settle([&mut desk, &mut beside]).await;
+    assert!(desk.holds(kept), "the server said it keeps this");
+
+    desk.fault().await;
+    settle([&mut desk, &mut beside]).await;
+
+    assert!(!matches!(desk.line.link(), Link::Live(_)), "its devices are let go: {:?}", desk.line.link());
+    assert!(!matches!(desk.line.link(), Link::Refused(_)), "to come back: {:?}", desk.line.link());
+    assert_eq!(beside.line.link(), Link::Live(Role::Editor), "and nobody else's are");
+    let mut again = Desk::open(&server, &ada, &id).await.unwrap();
+    settle([&mut again]).await;
+    assert!(again.texts().join("\n").contains("Kept through it."), "the next room has what the last was told");
+    again.write("And written on. ");
+    settle([&mut again, &mut beside]).await;
+    again.leave().await;
+    assert!(on_file(&ada, &id).await.contains("And written on."), "and is saved as any other");
 }
 
 #[tokio::test(start_paused = true)]

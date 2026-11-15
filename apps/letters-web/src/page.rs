@@ -9,12 +9,12 @@
 //! A server calls [`served`] and sends what it answers. Beside the document such a page carries the
 //! server's [`Opened`]: which document it is, who writes in it and what they may do.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::ops::RangeInclusive;
 
 use accesskit::{Node, NodeId, Role};
-use letters_api::{Opened, Trust};
+use letters_api::{Allows, Opened, Trust};
 use letters_editor::Editor;
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Model, Notes, Pos, ReplicaId, Selection, Style};
 use letters_render::Size;
@@ -36,8 +36,11 @@ const PRELOAD_SLOT: &str = "<!--letters:preload-->";
 pub const NO_COMMENTS: &str = "Comments cannot be added here: this document's notes are in a form this version of \
                                Letters cannot read.";
 
-/// The widths of window a [`Skeleton`] is laid out for. A narrower or wider one carries on from the nearest.
+/// The widths of window a [`Skeleton`] is for. A narrower or wider one carries on from the nearest.
 const WIDTHS: RangeInclusive<u16> = 240..=1600;
+/// How far apart the widths are that a [`Skeleton`] lays the window out at whatever it shows. Between two
+/// of them it is laid out only where the controls leave their lines.
+const STRIDE: usize = 170;
 
 /// Where a control is in the window: its left, top, width and height.
 pub type Place = [f32; 4];
@@ -52,30 +55,47 @@ pub struct Span {
     pub controls: Vec<(Place, Place)>,
 }
 
-/// Joins what the window showed at each width into spans. `shown` runs from the narrowest window up.
+/// Joins what the window showed at each width into spans. `shown` runs from the narrowest window up, and
+/// between two widths that are not next to each other every control kept to a line.
 pub fn spans(shown: &[(f32, Vec<Place>)]) -> Vec<Span> {
-    let mut spans: Vec<Span> = Vec::new();
-    // How many widths the last span holds. Its second says how its controls move.
-    let mut held = 0;
-    for (width, places) in shown {
-        let fits = spans.last_mut().filter(|span| span.controls.len() == places.len()).is_some_and(|span| {
-            let wider = width - span.from;
-            if held == 1 {
-                for ((at, moves), place) in span.controls.iter_mut().zip(places) {
-                    *moves = std::array::from_fn(|i| (place[i] - at[i]) / wider);
-                }
+    /// Whether `places` are where `span` has its controls in a window of `width`. A span that holds one
+    /// width takes its lines from the second.
+    fn fits(span: &mut Span, held: usize, width: f32, places: &[Place]) -> bool {
+        if span.controls.len() != places.len() {
+            return false;
+        }
+        let wider = width - span.from;
+        if held == 1 {
+            for ((at, moves), place) in span.controls.iter_mut().zip(places) {
+                *moves = std::array::from_fn(|i| (place[i] - at[i]) / wider);
             }
-            let on_its_line = |(at, moves): &(Place, Place), place: &Place| {
-                (0..4).all(|i| (at[i] + moves[i] * wider - place[i]).abs() < 0.05)
-            };
-            span.controls.iter().zip(places).all(|(control, place)| on_its_line(control, place))
-        });
-        if fits {
+        }
+        let on_its_line = |(at, moves): &(Place, Place), place: &Place| {
+            (0..4).all(|i| (at[i] + moves[i] * wider - place[i]).abs() < 0.05)
+        };
+        span.controls.iter().zip(places).all(|(control, place)| on_its_line(control, place))
+    }
+    let begun = |width: f32, places: &[Place]| Span {
+        from: width,
+        controls: places.iter().map(|place| (*place, [0.0; 4])).collect(),
+    };
+
+    let mut spans: Vec<Span> = Vec::new();
+    // How many widths the last span holds.
+    let mut held = 0;
+    let mut before: Option<&(f32, Vec<Place>)> = None;
+    for sample in shown {
+        let (width, places) = sample;
+        if spans.last_mut().is_some_and(|span| fits(span, held, *width, places)) {
             held += 1;
         } else {
-            spans.push(Span { from: *width, controls: places.iter().map(|place| (*place, [0.0; 4])).collect() });
-            held = 1;
+            // Across widths that were not laid out, the line that ends here began where the last one was.
+            let bend = before.filter(|(last, were)| width - last > 1.0 && were.len() == places.len());
+            let mut span = bend.map_or_else(|| begun(*width, places), |(last, were)| begun(*last, were));
+            held = if bend.is_some() && fits(&mut span, 1, *width, places) { 2 } else { 1 };
+            spans.push(span);
         }
+        before = Some(sample);
     }
     spans
 }
@@ -90,54 +110,39 @@ pub struct Skeleton {
 }
 
 impl Skeleton {
-    /// Lays the window out at every width a browser is likely to give it, and notes where its bar starts.
+    /// Notes where the window's bar starts at every width a browser is likely to give it. The window is
+    /// laid out at the widths that tell one line of the controls from the next, which are few: a server
+    /// does this for every page it sends.
     pub fn of(window: &mut Window) -> Self {
-        let mut bar = 0.0;
-        let mut shown: Vec<(f32, Vec<(NodeId, Place)>)> = Vec::new();
-        let mut lead: HashSet<NodeId> = HashSet::new();
-        for width in WIDTHS {
-            let width = f32::from(width);
-            window.resize(Size { width, height: 2.0 * width }, 1.0);
-            let update = window.access();
-            let nodes: HashMap<NodeId, &Node> = update.nodes.iter().map(|(id, node)| (*id, node)).collect();
-            let mut controls = Vec::new();
-            if let Some(tree) = &update.tree {
-                gather(&nodes, tree.root, &mut controls);
-            }
-            let document = nodes.values().find(|node| node.role() == Role::Document);
-            bar = document.and_then(|document| document.bounds()).map_or(bar, |bounds| bounds.y0 as f32);
-            // The bar starts with the document's name and then how saving stands, the one label it has.
-            let ends = controls.iter().position(|(id, _)| nodes[id].role() == Role::Label).map_or(0, |at| at + 1);
-            lead.extend(controls[..ends].iter().map(|(id, _)| *id));
-            shown.push((width, controls));
-        }
+        let (narrowest, widest) = (*WIDTHS.start(), *WIDTHS.end());
+        let mut laid = Laid { window, bar: 0.0, lead: HashSet::new(), at_end: HashSet::new(), shown: BTreeMap::new() };
         // The controls at the bar's end follow the window's far edge, which the two widest windows tell
-        // from the rest. The rest are cut off a gap before those begin, as the bar cuts them.
-        let mut at_end: HashSet<NodeId> = HashSet::new();
-        if let [.., (narrower, before), (wider, after)] = &shown[..] {
+        // from the rest.
+        laid.lay_out(widest - 1);
+        laid.lay_out(widest);
+        if let (Some(before), Some(after)) = (laid.shown.get(&(widest - 1)), laid.shown.get(&widest)) {
             let follows = |(id, place): &(NodeId, Place)| {
                 let was = before.iter().find(|(other, _)| other == id);
-                was.is_some_and(|(_, was)| (place[0] - was[0] - (wider - narrower)).abs() < 0.01)
+                was.is_some_and(|(_, was)| (place[0] - was[0] - 1.0).abs() < 0.01)
             };
-            at_end.extend(after.iter().filter(|control| follows(control)).map(|(id, _)| *id));
+            laid.at_end = after.iter().filter(|control| follows(control)).map(|(id, _)| *id).collect();
         }
-        let shown: Vec<(f32, Vec<Place>)> = shown
-            .into_iter()
-            .map(|(width, controls)| {
-                let ends = controls.iter().filter(|(id, _)| at_end.contains(id));
-                let edge = ends.map(|(_, place)| place[0]).fold(width, f32::min) - tokens::SPACE_SM;
-                let cut = |(id, [left, top, wide, high]): (NodeId, Place)| match at_end.contains(&id) {
-                    true => Some([left, top, wide, high]),
-                    // A sliver of a control would read as a mark of its own.
-                    false => Some([left, top, wide.min(edge - left), high]).filter(|cut| cut[2] >= high / 2.0),
-                };
-                let mut places: Vec<Place> =
-                    controls.into_iter().filter(|(id, _)| lead.contains(id)).filter_map(cut).collect();
-                places.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
-                (width, places)
-            })
-            .collect();
-        Self { bar, spans: spans(&shown) }
+        // Between two widths the controls keep to a line when they are on it halfway.
+        let marks: Vec<u16> = (narrowest..widest).step_by(STRIDE).chain([widest]).collect();
+        let mut between: Vec<(u16, u16)> = marks.windows(2).map(|pair| (pair[0], pair[1])).collect();
+        marks.into_iter().for_each(|width| laid.lay_out(width));
+        while let Some((from, to)) = between.pop() {
+            let half = from + (to - from) / 2;
+            if half > from {
+                laid.lay_out(half);
+                if !laid.straight(from, half, to) {
+                    between.extend([(from, half), (half, to)]);
+                }
+            }
+        }
+        let shown: Vec<(f32, Vec<Place>)> =
+            laid.shown.keys().map(|width| (f32::from(*width), laid.places(*width))).collect();
+        Self { bar: laid.bar, spans: spans(&shown) }
     }
 
     /// The most controls any width of window shows.
@@ -174,6 +179,68 @@ impl Skeleton {
             }
             css.push_str("}\n");
         }
+    }
+}
+
+/// A window as it is laid out for a [`Skeleton`], and what it showed at each width so far.
+struct Laid<'a> {
+    window: &'a mut Window,
+    /// Where the widest window's bar ends.
+    bar: f32,
+    /// What the bar starts with at any width: the document's name and how saving stands.
+    lead: HashSet<NodeId>,
+    /// The controls that follow the window's far edge.
+    at_end: HashSet<NodeId>,
+    shown: BTreeMap<u16, Vec<(NodeId, Place)>>,
+}
+
+impl Laid<'_> {
+    fn lay_out(&mut self, width: u16) {
+        if self.shown.contains_key(&width) {
+            return;
+        }
+        let wide = f32::from(width);
+        self.window.resize(Size { width: wide, height: 2.0 * wide }, 1.0);
+        let update = self.window.access();
+        let nodes: HashMap<NodeId, &Node> = update.nodes.iter().map(|(id, node)| (*id, node)).collect();
+        let mut controls = Vec::new();
+        if let Some(tree) = &update.tree {
+            gather(&nodes, tree.root, &mut controls);
+        }
+        let document = nodes.values().find(|node| node.role() == Role::Document);
+        if let Some(bounds) = document.and_then(|document| document.bounds()).filter(|_| width == *WIDTHS.end()) {
+            self.bar = bounds.y0 as f32;
+        }
+        // The bar starts with the document's name and then how saving stands, the one label it has.
+        let ends = controls.iter().position(|(id, _)| nodes[id].role() == Role::Label).map_or(0, |at| at + 1);
+        self.lead.extend(controls[..ends].iter().map(|(id, _)| *id));
+        self.shown.insert(width, controls);
+    }
+
+    /// The shapes for a window of `width`, which was laid out: what the bar starts with, cut off a gap
+    /// before the controls at its end begin, as the bar cuts them.
+    fn places(&self, width: u16) -> Vec<Place> {
+        let controls = &self.shown[&width];
+        let ends = controls.iter().filter(|(id, _)| self.at_end.contains(id));
+        let edge = ends.map(|(_, place)| place[0]).fold(f32::from(width), f32::min) - tokens::SPACE_SM;
+        let cut = |(id, [left, top, wide, high]): &(NodeId, Place)| match self.at_end.contains(id) {
+            true => Some([*left, *top, *wide, *high]),
+            // A sliver of a control would read as a mark of its own.
+            false => Some([*left, *top, wide.min(edge - left), *high]).filter(|cut| cut[2] >= high / 2.0),
+        };
+        let mut places: Vec<Place> = controls.iter().filter(|(id, _)| self.lead.contains(id)).filter_map(cut).collect();
+        places.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+        places
+    }
+
+    /// Whether the shapes at `half` are on the lines from where they are at `from` to where they are at `to`.
+    fn straight(&self, from: u16, half: u16, to: u16) -> bool {
+        let (start, middle, end) = (self.places(from), self.places(half), self.places(to));
+        let along = f32::from(half - from) / f32::from(to - from);
+        let on_its_line = |((start, middle), end): ((&Place, &Place), &Place)| {
+            (0..4).all(|i| (start[i] + (end[i] - start[i]) * along - middle[i]).abs() < 0.02)
+        };
+        start.len() == middle.len() && middle.len() == end.len() && start.iter().zip(&middle).zip(&end).all(on_its_line)
     }
 }
 
@@ -217,7 +284,7 @@ mod server {
     use letters_model::{Document, ReplicaId, Style};
     use letters_ui::{Scheme, palette};
 
-    use super::{OPENED, Skeleton, compose, first_paint, preloads, script, served_window};
+    use super::{OPENED, Skeleton, compose, first_paint, outline, preloads, script, served_window};
 
     /// The page every document is sent in.
     const TEMPLATE: &str = include_str!("../www/index.html");
@@ -232,8 +299,8 @@ mod server {
     ///
     /// The page runs one script, a file under `base`, so a policy that lets no inline script run suits it.
     pub fn served(document: &Document, opened: &Opened, base: &str) -> String {
-        // The window as the editor will open it.
-        let mut window = served_window(document.clone(), opened, ReplicaId::new("page"));
+        // The window as the editor will open it, as far as its bar goes: a long document costs no more.
+        let mut window = served_window(outline(document), opened, ReplicaId::new("page"));
         let style = window.style().clone();
         let html = export(document, &style, &opened.name, &format!("{base}fonts/"));
         let first = first_paint(&Skeleton::of(&mut window), &html);
@@ -372,7 +439,8 @@ pub fn window(document: Document, replica: ReplicaId) -> Window {
 
 /// The window the editor opens on a document a server sent, as `opened` says of it: in the document's
 /// style and under its name, with its notes, signing edits as the session does, and held in safe mode
-/// until the person trusts it. [`served`] takes the page's [`Skeleton`] from the same window.
+/// until the person trusts it, and offering what the person may take away of it. [`served`] takes the
+/// page's [`Skeleton`] from the same window.
 pub fn served_window(document: Document, opened: &Opened, replica: ReplicaId) -> Window {
     // The built-in style stands in for one this build cannot read, as it does on the desktop.
     let style = opened.style.as_ref().and_then(|style| Style::from_json(&style.to_string()).ok());
@@ -383,7 +451,10 @@ pub fn served_window(document: Document, opened: &Opened, replica: ReplicaId) ->
 /// it has arrived.
 pub fn served_on(model: Model, opened: &Opened) -> Window {
     let mut window = at_end(Window::new(Editor::with_model(model)));
-    window.set_document_name(&opened.name);
+    // A document started without a name takes its first heading's, which the window then asks for.
+    if opened.named {
+        window.set_document_name(&opened.name);
+    }
     window.set_author(&opened.author);
     match opened.notes.as_ref().map(|notes| Notes::from_json(&notes.to_string())) {
         Some(Ok(notes)) => window.set_notes(notes),
@@ -394,7 +465,31 @@ pub fn served_on(model: Model, opened: &Opened) -> Window {
     if opened.trust == Trust::Safe {
         window.set_safe_mode(Some(SafeMode { folder: None }));
     }
+    // What a share link withholds is not offered.
+    let Allows { download, copy, print } = opened.allows;
+    window.set_allows(letters_ui::Allows { copy, download, print });
     window
+}
+
+/// What of `document` the start of the window's bar is drawn from: its first Heading 1, which names a
+/// document that has no name of its own, and its last block, where the caret waits. A window on it is laid
+/// out for a [`Skeleton`] at the same cost however long the document is.
+pub fn outline(document: &Document) -> Document {
+    fn heading(blocks: &[Block]) -> Option<&Block> {
+        blocks.iter().find_map(|block| match block.kind {
+            BlockKind::Heading { level: 1 } => Some(block),
+            _ => heading(block.body.blocks()),
+        })
+    }
+    let (last, rest) = document.blocks.split_last().map_or((None, &[][..]), |(last, rest)| (Some(last), rest));
+    Document {
+        language: document.language.clone(),
+        dictionary: document.dictionary.clone(),
+        properties: document.properties.clone(),
+        previews: document.previews.clone(),
+        blocks: heading(rest).into_iter().chain(last).cloned().collect(),
+        extra: document.extra.clone(),
+    }
 }
 
 /// Puts the caret at the document's end, where the person writes on.

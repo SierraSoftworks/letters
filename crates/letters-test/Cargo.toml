@@ -15,6 +15,7 @@ workspace = true
 letters-model.workspace = true
 letters-editor.workspace = true
 letters-ui.workspace = true
+letters-api.workspace = true
 letters-convert.workspace = true
 letters-render.workspace = true
 accesskit.workspace = true

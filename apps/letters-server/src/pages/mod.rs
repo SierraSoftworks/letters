@@ -6,8 +6,12 @@
 //! - [`view`] is what a page shows, and [`acts`] what its forms do.
 //! - [`statics`] is what a page loads.
 //! - [`read`] is a document as plain HTML, to read with no editor.
+//! - [`editor`] is a document in the browser's editor, and the files of that editor.
+//! - [`door`] is where a share link leads.
 
 mod acts;
+mod door;
+pub mod editor;
 mod read;
 mod statics;
 pub mod view;
@@ -32,7 +36,8 @@ use yew::ServerRenderer;
 use crate::api::blocking;
 use crate::auth::{Desktop, browser};
 use crate::error::{Answer, Refusal};
-use crate::session::Signed;
+use crate::session::{Carrier, Reader, Signed, named_document};
+use crate::shares::may_share;
 use crate::spaces::{Place, seconds, shown};
 use crate::{App, Shared};
 
@@ -52,7 +57,10 @@ pub const ACT_NEW_FOLDER: &str = "/act/new-folder";
 pub const ACT_RENAME: &str = "/act/rename";
 pub const ACT_MOVE: &str = "/act/move";
 pub const ACT_TRASH: &str = "/act/trash";
+pub const ACT_MERGE: &str = "/act/merge-conflicts";
 pub const ACT_PUT_BACK: &str = "/act/put-back";
+pub const ACT_SHARE: &str = "/act/share";
+pub const ACT_UNSHARE: &str = "/act/unshare";
 
 /// How many folders a document is offered to be moved to. A space with more is tidied in the editor's own
 /// file dialogs or on the disk.
@@ -66,9 +74,11 @@ pub fn routes() -> Router<Shared> {
         .route(RECENT_PAGE, get(recent))
         .route(SHARED_PAGE, get(shared))
         .route(TRASH_PAGE, get(trash))
-        .route("/d/{id}", get(editor))
+        .route("/d/{id}", get(editor::page))
         .route("/d/{id}/read", get(read::page))
+        .route("/l/{token}", get(door::follow).post(door::tried))
         .route("/static/{version}/{*file}", get(statics::file))
+        .route("/assets/{version}/{*file}", get(editor::file))
         .merge(acts::routes())
 }
 
@@ -82,14 +92,36 @@ impl FromRequestParts<Shared> for Visitor {
     async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Response> {
         match browser(app, &parts.method, &parts.headers) {
             Ok(who) => Ok(Self(who)),
-            // A form that some other site's page sent.
-            Err(refusal) if refusal.code() == Code::Forbidden => Err(refused(app, None, &refusal).await),
-            Err(_) => {
-                // Only a page can be come back to: what a form asked for is asked again from its page.
-                let asked = parts.uri.path_and_query().map_or(paths::HOME_PAGE, |asked| asked.as_str());
-                let here = if parts.method == Method::GET { asked } else { paths::HOME_PAGE };
-                Err(Redirect::to(&paths::sign_in_page(here)).into_response())
-            }
+            Err(refusal) => Err(turned_away(app, parts, &refusal).await),
+        }
+    }
+}
+
+/// What a browser that a page is not for is answered with.
+async fn turned_away(app: &Shared, parts: &Parts, refusal: &Refusal) -> Response {
+    // A form that some other site's page sent.
+    if refusal.code() == Code::Forbidden {
+        return refused(app, None, refusal).await;
+    }
+    // Only a page can be come back to: what a form asked for is asked again from its page.
+    let asked = parts.uri.path_and_query().map_or(paths::HOME_PAGE, |asked| asked.as_str());
+    let here = if parts.method == Method::GET { asked } else { paths::HOME_PAGE };
+    Redirect::to(&paths::sign_in_page(here)).into_response()
+}
+
+/// Whoever a document's page is for: someone signed in with this browser, or someone a share link let in
+/// to the document. A browser that is neither is sent to sign in, as for any page.
+pub struct Opener(pub Signed);
+
+impl FromRequestParts<Shared> for Opener {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Response> {
+        let id = named_document(parts, app).await;
+        match Reader::read(app, &parts.method, &parts.headers, id.as_deref()) {
+            Ok(Reader(who)) if who.carrier == Carrier::Cookie => Ok(Self(who)),
+            Ok(_) => Err(turned_away(app, parts, &Refusal::signed_out()).await),
+            Err(refusal) => Err(turned_away(app, parts, &refusal).await),
         }
     }
 }
@@ -178,15 +210,20 @@ pub async fn failed(app: &App, refusal: &Refusal) -> Response {
     card(app, status(refusal), title, said, None).await
 }
 
-/// Tells the person what a page could not show, inside the frame when they are signed in.
+/// Tells the person what a page could not show, inside the frame when they are signed in. Whoever only a
+/// link let in has no frame: nothing in it would be theirs.
 pub async fn refused(app: &App, who: Option<&Signed>, refusal: &Refusal) -> Response {
+    let linked = who.is_some_and(Signed::alone);
+    let who = who.filter(|who| !who.alone());
     let title = match refusal.code() {
         Code::NotFound => "Nothing here",
+        Code::Forbidden if linked => "Not with this link",
         Code::Forbidden => "Not yours to change",
         Code::Unavailable => "Out of reach just now",
         _ => "That did not work",
     };
-    let again = Some((paths::HOME_PAGE.to_owned(), "Back to your documents".to_owned()));
+    // Whoever only a link let in has no documents here to go back to.
+    let again = (!linked).then(|| (paths::HOME_PAGE.to_owned(), "Back to your documents".to_owned()));
     let said = Card::Failed { title: title.into(), message: refusal.0.message.clone(), again };
     match who {
         Some(who) => send(status(refusal), title, page(app, Some(who), At::Nowhere, Body::Card(said)), None).await,
@@ -222,7 +259,7 @@ async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
 /// What a folder's address asks for beside the folder.
 #[derive(Default, Deserialize)]
 struct Asked {
-    /// The question to open the page with: `rename`, `move` or `trash`, about the document `id`.
+    /// The question to open the page with: `rename`, `move`, `trash` or `share`, about the document `id`.
     #[serde(default)]
     ask: Option<String>,
     #[serde(default)]
@@ -237,16 +274,31 @@ pub fn asking(here: &str, what: &str, id: &str) -> String {
     format!("{here}?ask={what}&id={}", paths::segment(id))
 }
 
+/// What an address says in place of a code when a conflict copy could not be merged.
+const UNMERGED: &str = "unmerged";
+
+/// The address of `back` saying `word` of what was asked there.
+fn saying(back: &str, word: &str) -> String {
+    format!("{}?error={word}", back.split(['?', '#']).next().unwrap_or_default())
+}
+
 /// The address of `back` saying that what was asked there was refused.
 pub fn refusing(back: &str, refusal: &Refusal) -> String {
     let code = serde_json::to_value(refusal.code()).ok();
-    let code = code.as_ref().and_then(|code| code.as_str()).unwrap_or_default().to_owned();
-    format!("{}?error={code}", back.split(['?', '#']).next().unwrap_or_default())
+    saying(back, code.as_ref().and_then(|code| code.as_str()).unwrap_or_default())
+}
+
+/// The address of `back` saying that a conflict copy could not be merged.
+pub fn unmerged(back: &str) -> String {
+    saying(back, UNMERGED)
 }
 
 /// What a page says of a refusal an address names. Only words of the server's own: whoever writes the
 /// address chooses among them.
 fn refusal(code: &str) -> String {
+    if code == UNMERGED {
+        return "That copy could not be merged, and is still where it was.".to_owned();
+    }
     let code = serde_json::from_value(serde_json::Value::String(code.to_owned())).unwrap_or(Code::Unknown);
     let said = match code {
         Code::NameTaken => "Something of that name is already there.",
@@ -276,7 +328,13 @@ async fn folder(
             let now = app.now();
             let edits = listing.space.role.edits();
             let about = |id: &String| listing.entries.iter().find(|entry| entry.id.as_ref() == Some(id)).cloned();
+            let shares = may_share(listing.space.role);
             let ask = match (asked.ask.as_deref(), asked.id.as_ref().and_then(about)) {
+                // Whoever may not share is asked nothing, as with a document that is gone.
+                (Some("share"), Some(entry)) => {
+                    let people = entry.id.as_ref().and_then(|id| app.shares(&who, id).ok());
+                    people.map(|shares| Ask::Share(entry, shares.people, app.directory(&who).unwrap_or_default()))
+                }
                 (Some("rename"), Some(entry)) if edits => Some(Ask::Rename(entry)),
                 (Some("trash"), Some(entry)) if edits => Some(Ask::Trash(entry)),
                 (Some("move"), Some(entry)) if edits => {
@@ -288,7 +346,7 @@ async fn folder(
             let title = listing.path.rsplit('/').next().filter(|name| !name.is_empty());
             let title = title.unwrap_or(&listing.space.name).to_owned();
             let rows = listing.entries.into_iter().map(|entry| row(entry, None, now)).collect();
-            let body = Body::Folder(Box::new(Folder { space: listing.space, path: listing.path, rows, ask }));
+            let body = Body::Folder(Box::new(Folder { space: listing.space, path: listing.path, rows, shares, ask }));
             let mut page = page(&app, Some(&who), at, body);
             page.refused = asked.error.as_deref().map(refusal);
             Ok((title, page))
@@ -332,9 +390,10 @@ async fn recent(State(app): State<Shared>, Visitor(who): Visitor, Query(asked): 
         move || {
             let (entries, now) = (app.recent(&who)?, app.now());
             let spaces = app.spaces(&who);
+            // What a share led to is in no space of theirs.
             let named = |entry: &Entry| {
                 let space = spaces.iter().find(|(space, _)| Some(space.id()) == entry.space);
-                space.map(|(space, _)| space.name.clone())
+                Some(space.map_or_else(|| "Shared with me".to_owned(), |(space, _)| space.name.clone()))
             };
             let rows = entries.into_iter().map(|entry| row(entry.clone(), named(&entry), now)).collect();
             Ok(page(&app, Some(&who), At::Recent, Body::Recent(rows)))
@@ -343,8 +402,16 @@ async fn recent(State(app): State<Shared>, Visitor(who): Visitor, Query(asked): 
     listed(&app, &who, "Recent", shown.await, asked).await
 }
 
-async fn shared(State(app): State<Shared>, Visitor(who): Visitor) -> Response {
-    send(StatusCode::OK, "Shared with me", page(&app, Some(&who), At::Shared, Body::Shared), None).await
+async fn shared(State(app): State<Shared>, Visitor(who): Visitor, Query(asked): Query<Asked>) -> Response {
+    let shown = blocking({
+        let (app, who) = (app.clone(), who.clone());
+        move || {
+            let (lent, now) = (app.shared(&who)?, app.now());
+            let rows = lent.into_iter().map(|(entry, whose)| row(entry, Some(whose), now)).collect();
+            Ok(page(&app, Some(&who), At::Shared, Body::Shared(rows)))
+        }
+    });
+    listed(&app, &who, "Shared with me", shown.await, asked).await
 }
 
 async fn trash(State(app): State<Shared>, Visitor(who): Visitor, Query(asked): Query<Asked>) -> Response {
@@ -387,11 +454,6 @@ async fn listed(app: &App, who: &Signed, title: &str, shown: Answer<Page>, asked
         }
         Err(refusal) => refused(app, Some(who), &refusal).await,
     }
-}
-
-/// The document in the browser's editor. Until the editor is part of the server, it is shown to read.
-async fn editor(Visitor(_): Visitor, Path(id): Path<String>) -> Response {
-    Redirect::to(&paths::read_page(&id)).into_response()
 }
 
 /// A row of a file table, with its times as the table says them.

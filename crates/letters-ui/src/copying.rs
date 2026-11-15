@@ -126,8 +126,10 @@ pub(crate) struct Copy {
     typed: bool,
     format: CopyFormat,
     tree: Tree,
-    /// Why the shell could not write the copy.
+    /// Why the shell could not write the copy, or make a folder the card asked for.
     notice: Option<String>,
+    /// Whether the refusal is of a folder, which the name of the copy is not to blame for.
+    of_folder: bool,
     /// Whether the shell refused because a file is in the way, which the person may have it replace.
     replaceable: bool,
     /// The version the copy is of, where that is not the document as it reads now.
@@ -137,13 +139,16 @@ pub(crate) struct Copy {
 }
 
 impl Copy {
-    /// Starts with a name for the copy and the folder the document is in. `version` is the version to copy,
-    /// for one the history shows that is not the document as it reads now.
-    pub fn open(format: CopyFormat, location: &Location, title: &str, version: Option<Earlier>) -> Self {
+    /// Starts with a name for the copy and the folder of `location`, which is where the document is when
+    /// `own` says so and else only where copies go. `version` is the version to copy, for one the history
+    /// shows that is not the document as it reads now.
+    pub fn open(format: CopyFormat, (location, own): (&Location, bool), title: &str, version: Option<Earlier>) -> Self {
         let mut tree = Tree::open(location);
         tree.picked = Some(location.folder.clone()).filter(|folder| !folder.is_empty());
+        tree.marks = own;
         let name = suggested(format, title, version.as_ref());
-        Self { name, typed: false, format, tree, notice: None, replaceable: false, version, simplified: Vec::new() }
+        let (notice, of_folder, replaceable, simplified) = (None, false, false, Vec::new());
+        Self { name, typed: false, format, tree, notice, of_folder, replaceable, version, simplified }
     }
 
     /// The revision the copy is of, where that is not the document as it reads now.
@@ -181,7 +186,13 @@ impl Copy {
     /// Comes back with why the shell could not write the copy. `replaceable` offers to replace the file
     /// that was in the way.
     pub fn refused(&mut self, notice: &str, replaceable: bool) {
-        (self.notice, self.replaceable) = (Some(notice.to_owned()), replaceable);
+        (self.notice, self.of_folder, self.replaceable) = (Some(notice.to_owned()), false, replaceable);
+    }
+
+    /// Takes in why the shell could not make the folder the card asked for.
+    pub fn unmade(&mut self, notice: &str) {
+        (self.notice, self.of_folder, self.replaceable) = (Some(notice.to_owned()), true, false);
+        self.tree.unmade();
     }
 
     pub fn update(
@@ -225,8 +236,9 @@ impl Copy {
         Outcome::Open
     }
 
-    /// Takes in what the shell now says of the folders.
-    pub fn placed(&mut self, location: &Location) {
+    /// Takes in what the shell now says of the folders, and whether the document is among them.
+    pub fn placed(&mut self, location: &Location, own: bool) {
+        self.tree.marks = own;
         self.tree.placed(location);
     }
 
@@ -240,7 +252,7 @@ impl Copy {
 
         let name = TextField::new("Name of the copy", &self.name)
             .weight(600)
-            .invalid(self.notice.is_some())
+            .invalid(self.notice.is_some() && !self.of_folder)
             .on_input(|name| Message::Copy(Copying::Name(name)))
             .on_submit(send(Copying::Save));
         let mut head = Element::column()
@@ -248,8 +260,11 @@ impl Copy {
             .padding(Edges::all(tokens::SPACE_MD))
             .child(Element::text(self.title(), TextStyle::title()))
             .child(Element::from(name).key("copying").takes_focus());
-        if let Some(notice) = &self.notice {
-            head = head.child(Element::paragraph(notice, quiet).fg(tokens::DANGER).role(Role::Alert).label(notice));
+        // A refusal is said where it belongs: by the name for the copy, by the folders for a folder.
+        let alert =
+            |notice: &String| Element::paragraph(notice, quiet).fg(tokens::DANGER).role(Role::Alert).label(notice);
+        if let Some(notice) = self.notice.as_ref().filter(|_| !self.of_folder) {
+            head = head.child(alert(notice));
         }
 
         let format = |format: CopyFormat| {
@@ -276,13 +291,20 @@ impl Copy {
         if !location.folders.is_empty() {
             let title = Element::text(folders::title(location), quiet.weight(600)).fg(tokens::FG_MUTED);
             let tree = self.tree.list(location, "Folder", ROWS, browse);
-            rows = (location.folders.len() as f32).min(ROWS) + 2.0;
+            rows = (location.folders.len() as f32).min(ROWS) + 1.0;
             card = card
                 .child(line())
                 .child(Element::column().padding(section).child(title))
-                .child(Element::column().padding(inset).child(tree))
-                .child(line())
-                .child(Element::column().padding(inset).child(folders::elsewhere(send(Copying::Elsewhere))));
+                .child(Element::column().padding(inset).child(tree));
+            if !location.closed {
+                let other = folders::elsewhere(send(Copying::Elsewhere));
+                card = card.child(line()).child(Element::column().padding(inset).child(other));
+                rows += 1.0;
+            }
+        }
+        if let Some(notice) = self.notice.as_ref().filter(|_| self.of_folder) {
+            card = card
+                .child(Element::column().padding(Edges::xy(tokens::SPACE_MD, tokens::SPACE_SM)).child(alert(notice)));
         }
         card = card.child(line()).child(self.foot(location));
 

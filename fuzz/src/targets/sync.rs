@@ -1,5 +1,5 @@
 //! Realtime sync with anything on the socket: each side reads a frame or refuses it, a room holds every
-//! session to its role, and what the room holds is there after a stop and in the file it saves.
+//! session to its role, and what the room holds is there after a crash and in the file a stop leaves.
 
 use letters_format::{Archive, Save, WorkingCopy};
 use letters_model::{Extent, Model, Notes, Selection, Style};
@@ -22,6 +22,7 @@ const PAYLOAD: usize = 8 * 1024;
 const ROLES: [Role; 3] = [Role::Editor, Role::Commenter, Role::Reader];
 
 // The kinds of frame a script writes with a payload of its own, as letters-sync numbers them.
+const HELLO: u8 = 1;
 const EDITS: u8 = 2;
 const NOTES: u8 = 3;
 const STYLE: u8 = 4;
@@ -52,12 +53,24 @@ struct Sockets {
 }
 
 impl Sockets {
+    /// Opens a socket as a device that holds no copy.
     fn hello(room: &mut Room, state: &mut Folder, role: Role, now: u64) -> SessionId {
-        let session = room.join(Access { role, name: format!("{role:?}") }, now);
         let hello = Hello { protocol: PROTOCOL, document: ID.into(), extent: Extent::default(), revision: None };
-        let taken = room.received(session, &ClientMessage::Hello(hello).encode(), state, now);
-        taken.expect("a folder that takes every write is journalled to");
+        Self::open(room, state, role, &ClientMessage::Hello(hello).encode(), now)
+    }
+
+    /// Opens a socket whose first frame is `hello`, whatever that holds.
+    fn open(room: &mut Room, state: &mut Folder, role: Role, hello: &[u8], now: u64) -> SessionId {
+        let session = room.join(Access { role, name: format!("{role:?}") }, now);
+        room.received(session, hello, state, now).expect("a folder that takes every write is journalled to");
         session
+    }
+
+    /// Closes the socket of a role and opens one in its place with `hello`.
+    fn again(&mut self, room: &mut Room, state: &mut Folder, who: usize, hello: &[u8], now: u64) {
+        room.leave(self.sessions[who]);
+        self.sessions[who] = Self::open(room, state, ROLES[who], hello, now);
+        self.drain(room, state, now);
     }
 
     /// Reads everything the room has to say, and opens a socket again for each one it closed.
@@ -145,8 +158,8 @@ pub fn run(data: &[u8]) {
     let mut room = Room::open(open(&folder, 2), HOME, &mut state, 0).expect("a room opens over a new file");
     let mut sockets = Sockets { sessions: ROLES.map(|role| Sockets::hello(&mut room, &mut state, role, 0)) };
     sockets.drain(&mut room, &mut state, 0);
-    // A sound device, for edits that fit the document.
-    let mut device = open(&folder, 4).model().fork(5.into());
+    // Two sound devices, for edits that fit the document. The number of a step says which one acts.
+    let mut devices = [5, 6].map(|replica: u64| open(&folder, 4).model().fork(replica.into()));
 
     let mut now = 0;
     for _ in 0..STEPS {
@@ -155,16 +168,37 @@ pub fn run(data: &[u8]) {
         }
         now += 1_000;
         let (who, seq) = (script.pick(ROLES.len()), script.byte());
-        let frame = match script.pick(6) {
+        let device = &mut devices[usize::from(seq & 1)];
+        let frame = match script.pick(9) {
             0 => script.bytes(PAYLOAD).to_vec(),
             1 => numbered(EDITS, seq, &sealed(script.bytes(PAYLOAD))),
             2 => {
-                let _ = device.apply(ops(&mut script, &shown(&device), 3));
+                let _ = device.apply(ops(&mut script, &shown(device), 3));
                 numbered(EDITS, seq, &device.updates_for(&room.copy().model().extent()))
             }
             3 => numbered(NOTES, seq, script.bytes(PAYLOAD)),
             4 => numbered(STYLE, seq, script.bytes(PAYLOAD)),
-            _ => [&[SELECTION, 1][..], &field(script.bytes(64)), &field(script.bytes(64))].concat(),
+            5 => [&[SELECTION, 1][..], &field(script.bytes(64)), &field(script.bytes(64))].concat(),
+            6 => {
+                // The device writes and keeps it to itself, as one that is away does.
+                let _ = device.apply(ops(&mut script, &shown(device), 3));
+                continue;
+            }
+            7 => {
+                // The socket opens again, and the device says where its copy stands. What it wrote while
+                // away meets what the room took in since, once it sends it.
+                let (extent, revision) = (device.extent(), Some(device.revision()));
+                let hello = Hello { protocol: PROTOCOL, document: ID.into(), extent, revision };
+                sockets.again(&mut room, &mut state, who, &ClientMessage::Hello(hello).encode(), now);
+                continue;
+            }
+            _ => {
+                // A hello that claims a copy of any extent, standing at any revision.
+                let claimed = [&field(script.bytes(64))[..], &[1], &field(script.bytes(64))].concat();
+                let hello = [&[HELLO][..], &PROTOCOL.to_le_bytes(), &field(ID.as_bytes()), &claimed].concat();
+                sockets.again(&mut room, &mut state, who, &hello, now);
+                continue;
+            }
         };
 
         let before = (shown(room.copy().model()), room.copy().notes.clone());
@@ -180,14 +214,16 @@ pub fn run(data: &[u8]) {
         sockets.drain(&mut room, &mut state, now);
     }
 
-    // A room that is opened after a stop holds what this one does, with no save in between.
+    // A room that is opened after a crash holds what this one does, with no save in between.
     let held = shown(room.copy().model());
     let again = Room::open(open(&folder, 6), HOME, &mut state, now);
     let again = again.expect("a room opens over what the last one journalled");
     assert_eq!(shown(again.copy().model()), held, "a room that stopped came back with another document");
     assert_eq!(again.copy().notes, room.copy().notes, "a room that stopped came back with other notes");
 
-    room.flush(&mut folder, &mut state, &save("last"), now).expect("a folder that takes every write is saved to");
+    // A room that is asked to stop lets every socket go, and leaves a file that holds the document.
+    room.stop(&mut folder, &mut state, &save("last"), now).expect("a folder that takes every write is saved to");
+    assert_eq!(room.sessions(), 0, "a room that stopped kept a socket");
     assert_eq!(shown(open(&folder, 7).model()), held, "the file holds another document than the room");
 }
 
@@ -203,6 +239,7 @@ pub fn seeds() -> Vec<Vec<u8>> {
     let _ = writer.apply(ops(&mut Script::new(&[0, 1, 2, 3, 4, 5, 6, 7]), &shown(&writer), 1));
     let updates = writer.updates_for(&start);
 
+    // A step is who sends, a number whose last bit picks the device, the kind of step, and what it holds.
     let mut script = Vec::new();
     for who in 0..ROLES.len() as u8 {
         script.extend([who, 1, 0]);
@@ -217,7 +254,21 @@ pub fn seeds() -> Vec<Vec<u8>> {
         script.extend([who, 6, 5]);
         put(&mut script, 64, passage.anchor.to_string().as_bytes());
         put(&mut script, 64, passage.head.to_string().as_bytes());
+        script.extend([who, 7, 8]);
+        put(&mut script, 64, &writer.extent().to_bytes());
+        put(&mut script, 64, writer.revision().to_string().as_bytes());
     }
+
+    // Two devices change one word apart, and the one that was away comes back and sends its change. An
+    // edit here is one op, a letter typed into the first block of text: after its first or second
+    // character, and then at its start.
+    let typed = |after: u8, letter: u8| [0, 0, 0, after, 0, 1, letter];
+    let mut apart = vec![0, 0, 2];
+    apart.extend(typed(1, 0));
+    apart.extend([0, 1, 6]);
+    apart.extend(typed(2, 1));
+    apart.extend([0, 1, 7, 0, 1, 2]);
+    apart.extend(typed(0, 0));
 
     let peer = Peer { session: SessionId(2), name: "Ada".into(), colour: 1, selection: Some(passage.clone()) };
     let hello =
@@ -245,5 +296,5 @@ pub fn seeds() -> Vec<Vec<u8>> {
         ServerMessage::Goodbye { why: Refusal::AccessChanged },
     ];
     let frames = devices.iter().map(ClientMessage::encode).chain(servers.iter().map(ServerMessage::encode));
-    [script].into_iter().chain(frames).collect()
+    [script, apart].into_iter().chain(frames).collect()
 }

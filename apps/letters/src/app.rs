@@ -26,9 +26,9 @@ use letters_sync::{Local, Progress, Refusal};
 use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDecision, Origin, Trust};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
-    Appearance, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer, Landing,
-    LinkPreviewFound, Location, MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState, Scheme, Settings,
-    Window as View, tokens,
+    Access, Allows, Appearance, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind,
+    ImportOffer, Landing, LinkPreviewFound, Location, MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState,
+    Scheme, Settings, Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -44,7 +44,7 @@ use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowAttributes
 use crate::chrome::{self, Buttons, Host};
 use crate::cli::{Format, Mode, Options};
 use crate::conflicts;
-use crate::connected::{self, Line, Reached, Said, Told};
+use crate::connected::{self, Line, Placed, Placing, Reached, Said, Sharing, Shelf, Told};
 use crate::convert;
 use crate::copies;
 use crate::dictionaries;
@@ -147,6 +147,11 @@ pub enum Event {
     /// A picture of this name, which the copy of a window's document lacked, was asked of the document's
     /// server: its file, if the server had it.
     Brought(WindowId, String, Option<Vec<u8>>),
+    /// The server of a window's document was asked about the document's name and place: how the
+    /// document stands there now. The flag says that the window's bar asked.
+    Placed(WindowId, bool, Box<Placed>),
+    /// The server of a window's document answered what the window's Share dialog asked, in that order.
+    Shared(WindowId, Vec<connected::Shared>),
 }
 
 impl From<accesskit_winit::Event> for Event {
@@ -420,6 +425,11 @@ enum GpuState {
     Ready(Box<Gpu>),
 }
 
+/// A folder of this device as the window lists it. One whose path is no text is left out.
+fn shown(folder: crate::library::Folder) -> Option<letters_ui::Folder> {
+    Some(letters_ui::Folder { path: folder.path.to_str()?.to_owned(), name: folder.name, depth: folder.depth })
+}
+
 /// What a window holds of a document that lives on a server.
 struct Remote {
     line: Line,
@@ -439,6 +449,20 @@ struct Remote {
     asked: BTreeSet<String>,
     /// Pictures the copy lacks, until the server is asked for them.
     lacking: Vec<String>,
+    /// What is to be asked of the server about the document's name and place, in this order.
+    asks: Vec<Placing>,
+    /// Whether the server is being asked. One thing is asked at a time, so that the server does them
+    /// in the order the person did.
+    placing: bool,
+    /// What the Share dialog asks of the server, in this order, and whether the server is being asked.
+    shares: Vec<Sharing>,
+    sharing: bool,
+    /// Whether the line was live when it last said how it stood, and when the server was last asked how
+    /// the document stands.
+    live: bool,
+    looked: Option<Instant>,
+    /// The folders of the document's space as the server last listed them, which it can move among.
+    shelves: Vec<Shelf>,
 }
 
 impl Remote {
@@ -452,13 +476,24 @@ impl Remote {
         Some(self.born + Duration::from_millis(self.line.wake_at()?))
     }
 
-    /// Whether the person may only read the document: as the line says while it is live, and as the
-    /// server last said otherwise.
-    fn reads(&self) -> bool {
-        match self.line.link() {
-            letters_sync::Link::Live(role) if self.started => !role.comments(),
-            _ => self.opened.role == letters_api::Role::Reader,
+    /// What the person may do with the document: as the line says while it is live, and as the server
+    /// last said otherwise, which is what holds while there is no line.
+    fn access(&self) -> Access {
+        let (edits, comments) = match self.line.link() {
+            letters_sync::Link::Live(role) if self.started => (role.edits(), role.comments()),
+            _ => (self.opened.role >= letters_api::Role::Editor, self.opened.role.comments()),
+        };
+        match (edits, comments) {
+            (true, _) => Access::Edits,
+            (false, true) => Access::Comments,
+            (false, false) => Access::Reads,
         }
+    }
+
+    /// What the person may take away of the document, as the server last said.
+    fn allows(&self) -> Allows {
+        let letters_api::Allows { download, copy, print } = self.opened.allows;
+        Allows { copy, download, print }
     }
 
     /// Whether the server vouches for the document: one in the person's own spaces, not one only shared
@@ -476,6 +511,32 @@ impl Remote {
             letters_sync::Link::Connecting => Connection::Connecting,
             letters_sync::Link::Live(_) => Connection::Live,
             letters_sync::Link::Refused(refusal) => Connection::Refused(refusal.to_string()),
+        }
+    }
+
+    /// What the bar is told a folder of the document's space by: no path on this device.
+    fn key(&self, folder: &str) -> String {
+        let parts = [self.host.as_str(), self.opened.space.as_deref().unwrap_or_default(), folder];
+        parts.into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("/")
+    }
+
+    /// The folder the server keeps the document in, as the bar is told it.
+    fn folder(&self) -> String {
+        self.key(self.opened.path.rsplit_once('/').map_or("", |(folder, _)| folder))
+    }
+
+    /// The space and the folder of it that the bar knows by `key`, if it is one the server listed.
+    fn shelf(&self, key: &str) -> Option<(String, String)> {
+        let shelf = self.shelves.iter().find(|shelf| self.key(&shelf.path) == key)?;
+        Some((self.opened.space.clone()?, shelf.path.clone()))
+    }
+
+    /// Has the server asked how the document stands, if it has not been for a while: nothing tells an
+    /// open window that someone else renamed or moved the document.
+    fn look(&mut self, now: Instant) {
+        let lately = self.looked.is_some_and(|looked| now.saturating_duration_since(looked) < LOOK_AFTER);
+        if self.live && !lately && !self.asks.contains(&Placing::Look) {
+            self.asks.push(Placing::Look);
         }
     }
 
@@ -668,10 +729,9 @@ fn lies_at(folder: &Path, other: &Path) -> bool {
 const UNKEPT: &str = "The server did not take a picture, so the others who open this document will not see it.";
 
 /// What the bar says when asked to rename or move a server's document.
-const AT_ITS_SERVER: &str = "This document lives on a server, and is renamed and moved there.";
-/// What the Comment tool says of a server's document the person may only read.
-const READS: &str = "You can read this document, but not comment on it.";
-
+/// How long a server's answer about a document's name and place holds for a window that is turned to
+/// again.
+const LOOK_AFTER: Duration = Duration::from_secs(30);
 /// What the Comment tool says of a document whose notes this build could not read.
 const NO_COMMENTS: &str = "Comments cannot be added here: this document's notes are in a form this version of \
                            Letters cannot read.";
@@ -907,6 +967,8 @@ impl DocWindow {
         // A server's document that is all in its copy here is saved once the server keeps it.
         let progress = remote.filter(|remote| remote.started).map(|remote| remote.line.progress());
         self.view.set_connection(remote.map(Remote::connection));
+        self.view.set_access(remote.map_or(Access::Edits, Remote::access));
+        self.view.set_allows(remote.map_or_else(Allows::default, Remote::allows));
         self.view.set_save_state(match (self.save_failed, self.place.home().is_some(), self.unsaved()) {
             (true, _, _) => SaveState::Failed,
             // A document with no file yet has nothing to say about saving.
@@ -925,26 +987,49 @@ impl DocWindow {
     /// Tells the view what the document is called and where it is kept, when either has changed. A
     /// document with no name of its own is told so, and the view shows its first heading meanwhile.
     fn relocate(&mut self, library: &Library) {
-        let name = (!self.place.naming()).then(|| self.place.name());
-        // A server's document is where the server says, and is moved there.
-        let at = self.remote.as_ref().map(|remote| {
-            let parts = [remote.host.as_str(), remote.opened.space.as_deref().unwrap_or_default(), &remote.opened.path];
-            parts.iter().filter(|part| !part.is_empty()).collect::<PathBuf>()
-        });
-        let remote = at.is_some();
+        // A server's document is called what the server says and is where the server says. One the server
+        // has only a stand-in name for takes its first heading's, as a new document does.
+        let named = self.remote.as_ref().map_or(!self.place.naming(), |remote| remote.opened.named);
+        let name = named.then(|| self.place.name());
+        let at = self.remote.as_ref().map(|remote| PathBuf::from(remote.folder()));
         let folder = at.unwrap_or_else(|| self.place.folder(library));
         if self.located.as_ref().is_some_and(|(told, at)| (told, at) == (&name, &folder)) {
             return;
         }
-        let shown = |folder: crate::library::Folder| {
-            Some(letters_ui::Folder { path: folder.path.to_str()?.to_owned(), name: folder.name, depth: folder.depth })
+        // It moves among the folders of its space, which are all the places there are for it.
+        let folders = match &self.remote {
+            Some(remote) => {
+                let shown = |shelf: &Shelf| letters_ui::Folder {
+                    path: remote.key(&shelf.path),
+                    name: shelf.name.clone(),
+                    depth: shelf.depth,
+                };
+                remote.shelves.iter().map(shown).collect()
+            }
+            None => library.folders(&folder).into_iter().filter_map(shown).collect(),
         };
         self.view.set_location(Location {
             name: name.clone(),
             folder: folder.to_string_lossy().into_owned(),
-            folders: if remote { Vec::new() } else { library.folders(&folder).into_iter().filter_map(shown).collect() },
+            folders,
+            closed: self.remote.is_some(),
         });
         self.located = Some((name, folder));
+    }
+
+    /// Tells the view where copies of a server's document go: among the person's own folders, since the
+    /// folders the bar lists are the server's. A copy of any other document goes beside it.
+    fn recopy(&mut self, library: &Library) {
+        let own = self.remote.is_some().then(|| {
+            let folder = library.default_folder();
+            Location {
+                name: None,
+                folders: library.folders(&folder).into_iter().filter_map(shown).collect(),
+                folder: folder.to_string_lossy().into_owned(),
+                closed: false,
+            }
+        });
+        self.view.set_copy_location(own);
     }
 
     /// Renames or moves the document, or makes a folder for it, as the bar asked, and answers the bar:
@@ -1203,7 +1288,6 @@ impl DocWindow {
         // The copy is kept under the document's id, and is no file the person copied by hand or would
         // look for among their own, whatever else has its id.
         self.place.call(&reached.opened.name);
-        self.view.set_document_name(&reached.opened.name);
         (self.twinned, self.listed) = (true, self.place.path().map(Path::to_owned));
         if !reached.opened.author.is_empty() {
             self.view.set_author(&reached.opened.author);
@@ -1223,7 +1307,15 @@ impl DocWindow {
             selection: None,
             asked: BTreeSet::new(),
             lacking: Vec::new(),
+            asks: Vec::new(),
+            placing: false,
+            shares: Vec::new(),
+            sharing: false,
+            live: false,
+            looked: None,
+            shelves: Vec::new(),
         });
+        self.recopy(library);
         self.recomment();
         self.located = None;
         self.relocate(library);
@@ -1332,7 +1424,24 @@ impl DocWindow {
                 // The work stays in the copy here. The person is told why it went no further.
                 Told::Refused(refusal) => self.view.set_notice(Some(&refusal.to_string())),
                 Told::Unkept(_) => self.view.set_notice(Some(UNKEPT)),
-                Told::Link | Told::Progress => stands = true,
+                // The file goes to the server whole, once a save has put everything in it.
+                Told::Whole => {
+                    if self.unsaved() || self.saving.is_some() {
+                        self.save_at = Some(now);
+                    } else if let Some(remote) = &mut self.remote {
+                        remote.line.saved();
+                    }
+                }
+                Told::Link => {
+                    stands = true;
+                    // A document may have been renamed or moved while there was no line to its server.
+                    if let Some(remote) = &mut self.remote {
+                        let live = matches!(remote.line.link(), letters_sync::Link::Live(_));
+                        (remote.live, remote.looked) = (live, remote.looked.filter(|_| live));
+                        remote.look(now);
+                    }
+                }
+                Told::Progress => stands = true,
                 // Said below, with where each of them is now.
                 Told::Peers => {}
             }
@@ -1343,6 +1452,39 @@ impl DocWindow {
             self.recomment();
             self.retitle();
         }
+    }
+
+    /// Takes how the document stands at its server, which was asked about its name and place. `answers`
+    /// says that the bar asked and waits to be told.
+    fn placed(&mut self, answers: bool, placed: Placed, library: &Library) {
+        let Some(remote) = &mut self.remote else { return };
+        remote.placing = false;
+        if let Some(now) = placed.opened {
+            let opened = &mut remote.opened;
+            (opened.name, opened.named, opened.space, opened.path) = (now.name, now.named, now.space, now.path);
+            // What the person may do holds while there is no line, and says whether they share it.
+            (opened.role, opened.allows) = (now.role, now.allows);
+            self.place.call(&remote.opened.name);
+        }
+        if let Some(shelves) = placed.shelves.filter(|shelves| *shelves != remote.shelves) {
+            remote.shelves = shelves;
+            // The bar lists them, whether or not the document is where it was.
+            self.located = None;
+        }
+        match placed.refused {
+            // The name field comes back with what was typed, so the bar is told only what changed.
+            Some(refused) => {
+                self.relocate(library);
+                self.view.set_notice(Some(&refused));
+            }
+            None => {
+                if answers {
+                    self.located = None;
+                }
+                self.relocate(library);
+            }
+        }
+        self.retitle();
     }
 
     /// Starts reading what the first paint did not need, on another thread.
@@ -1708,8 +1850,7 @@ impl DocWindow {
     /// notes this build could not read, where a save that added one would be refused.
     fn recomment(&mut self) {
         if let Some(copy) = &self.copy {
-            let reads = self.remote.as_ref().is_some_and(Remote::reads);
-            self.view.refuse_comments(if copy.notes_unread() { Some(NO_COMMENTS) } else { reads.then_some(READS) });
+            self.view.refuse_comments(copy.notes_unread().then_some(NO_COMMENTS));
         }
     }
 
@@ -1742,6 +1883,9 @@ impl DocWindow {
         self.relocate(library);
         self.sent = Some(revision);
         self.save_failed = false;
+        if let Some(remote) = &mut self.remote {
+            remote.line.saved();
+        }
         let typed_since = self.view.edits() != edits;
         let mut met = false;
         if let Some(news) = news
@@ -2016,10 +2160,14 @@ impl App {
                 Request::Open(path) => self.act(event_loop, id, Action::Open(Some(path.into()))),
                 Request::OpenDialog => self.act(event_loop, id, Action::Open(None)),
                 Request::New => self.act(event_loop, id, Action::New),
-                // The name is taken on the way to a save, which reads it from the document.
-                Request::Named(_) => {
+                // The name is taken on the way to a save, which reads it from the document. A server's
+                // document takes it at its server, if it has none of its own there.
+                Request::Named(name) => {
                     if let Some(window) = self.windows.get_mut(&id) {
                         window.save_at = Some(now);
+                        if let Some(remote) = window.remote.as_mut().filter(|remote| !remote.opened.named) {
+                            remote.asks.push(Placing::Name(name));
+                        }
                     }
                 }
                 // What was asked along with something refused is left for the person to ask again.
@@ -2028,13 +2176,35 @@ impl App {
                 Request::Rename(_) | Request::Move(_) | Request::MoveElsewhere | Request::NewFolder { .. }
                     if self.windows.get(&id).is_some_and(|window| window.remote.is_some()) =>
                 {
-                    // Only the server can, and nothing here asks it to yet.
-                    if let Some(window) = self.windows.get_mut(&id) {
-                        window.view.set_notice(Some(AT_ITS_SERVER));
-                        window.located = None;
-                        window.relocate(&self.library);
+                    let Some(window) = self.windows.get_mut(&id) else { continue };
+                    let Some(remote) = &mut window.remote else { continue };
+                    // Its server renames and moves it, and the bar is told once the server has answered.
+                    let ask = match request {
+                        Request::Rename(name) => Some(Placing::Rename(name)),
+                        Request::Move(key) => remote.shelf(&key).map(|(space, folder)| Placing::Move { space, folder }),
+                        Request::NewFolder { parent, name } => match remote.shelf(&parent) {
+                            Some((space, parent)) => Some(Placing::NewFolder { space, parent, name }),
+                            // The card that saves a copy asked, for a folder of this device. The person's
+                            // own folder is listed before anything was written to it.
+                            None => {
+                                let _ = fs::create_dir_all(&parent);
+                                match self.library.new_folder(Path::new(&parent), &name) {
+                                    Ok(_) => window.recopy(&self.library),
+                                    Err(refused) => window.view.refuse_copy_folder(&refused.to_string()),
+                                }
+                                continue;
+                            }
+                        },
+                        _ => None,
+                    };
+                    match ask {
+                        Some(ask) => remote.asks.push(ask),
+                        // A folder the server no longer lists: the bar is told what there is.
+                        None => {
+                            window.located = None;
+                            window.relocate(&self.library);
+                        }
                     }
-                    refused = true;
                 }
                 Request::Rename(name) => {
                     refused = !self.replace(id, now, |place, library| place.rename(&name, library))
@@ -2126,6 +2296,22 @@ impl App {
                 Request::MergeFrom { path, confirmed } => self.merge_from(id, path.map(PathBuf::from), confirmed, now),
                 Request::MergeIntoOriginal { confirmed } => self.merge_into_original(id, confirmed, now),
                 Request::Connect => self.reconnect(id, now),
+                // The Share dialog asks of a document's server. With no server it asks nothing.
+                Request::Shares
+                | Request::SharePeople(_)
+                | Request::MakeLink(_)
+                | Request::RevokeLink(_)
+                | Request::AccessLog => {
+                    let window = self.windows.get_mut(&id);
+                    let Some(remote) = window.and_then(|window| window.remote.as_mut()) else { continue };
+                    remote.shares.push(match request {
+                        Request::SharePeople(people) => Sharing::People(people),
+                        Request::MakeLink(new) => Sharing::Link(new),
+                        Request::RevokeLink(link) => Sharing::Revoke(link),
+                        Request::AccessLog => Sharing::Log,
+                        _ => Sharing::Look,
+                    });
+                }
                 // A request this shell does not know yet.
                 _ => {}
             }
@@ -2135,6 +2321,9 @@ impl App {
             window.access_stale = true;
             window.sync(now);
         }
+        // What was asked of the document's server goes there now.
+        self.place(id);
+        self.share(id);
     }
 
     /// The name the person's edits carry: the one they set, or else their account's.
@@ -2215,9 +2404,20 @@ impl App {
         }
         let source = window.file().ok_or(copies::Refused::Nothing)?.to_owned();
         let (output, replace) = match folder {
-            Some(folder) => (copies::path(folder, name, format)?, replace),
+            Some(folder) => {
+                // The person's own folder is offered for a server's document before anything is in it.
+                if window.remote.is_some() {
+                    let _ = fs::create_dir_all(folder);
+                }
+                (copies::path(folder, name, format)?, replace)
+            }
             None => {
-                let suggested = copies::path(&window.place.folder(&self.library), name, format)?;
+                // A server's document is copied to the person's own folders, not beside its copy here.
+                let beside = match window.remote {
+                    Some(_) => self.library.default_folder(),
+                    None => window.place.folder(&self.library),
+                };
+                let suggested = copies::path(&beside, name, format)?;
                 let dialog = FileDialog::new()
                     .add_filter(copies::kind(format), &[copies::extension(format)])
                     .set_directory(suggested.parent().unwrap_or(Path::new("")))
@@ -2323,6 +2523,62 @@ impl App {
             let entered = connected::enter(&server, &id, held, keychain, &home, &|page| links::open(page), &waiting);
             let _ = proxy.send_event(Event::Reached(asker, entered.map(Box::new).map_err(|error| error.to_string())));
         });
+    }
+
+    /// Asks the server of a window's document what the window has to ask about the document's name and
+    /// place, on another thread. How the document then stands arrives as an event.
+    fn place(&mut self, id: WindowId) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        let Some(copy) = window.place.path().map(Path::to_owned) else { return };
+        let waits = |remote: &&mut Remote| !remote.placing && !remote.asks.is_empty();
+        let Some(remote) = window.remote.as_mut().filter(waits) else { return };
+        let asks = std::mem::take(&mut remote.asks);
+        (remote.placing, remote.looked) = (true, Some(Instant::now()));
+        // What its first heading asks for is nothing the bar waits to hear of.
+        let answers = asks.iter().any(|ask| !matches!(ask, Placing::Look | Placing::Name(_)));
+        let (session, document, proxy) = (remote.line.session().clone(), remote.opened.id.clone(), self.proxy.clone());
+        thread::spawn(move || {
+            let placed = Box::new(connected::place(&session, &document, &copy, &asks));
+            let _ = proxy.send_event(Event::Placed(id, answers, placed));
+        });
+    }
+
+    /// Asks the server of a window's document what the window's Share dialog asked, on another thread.
+    /// The answers arrive as an event.
+    fn share(&mut self, id: WindowId) {
+        let Some(remote) = self.windows.get_mut(&id).and_then(|window| window.remote.as_mut()) else { return };
+        if remote.sharing || remote.shares.is_empty() {
+            return;
+        }
+        let asks = std::mem::take(&mut remote.shares);
+        remote.sharing = true;
+        let (session, document, proxy) = (remote.line.session().clone(), remote.opened.id.clone(), self.proxy.clone());
+        thread::spawn(move || {
+            let answers = asks.iter().map(|ask| connected::share(&session, &document, ask)).collect();
+            let _ = proxy.send_event(Event::Shared(id, answers));
+        });
+    }
+
+    /// Tells a window's Share dialog what the document's server answered it.
+    fn shared(&mut self, id: WindowId, answers: Vec<connected::Shared>, now: Instant) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        let Some(remote) = &mut window.remote else { return };
+        remote.sharing = false;
+        let owner = remote.opened.role.shares();
+        for answer in answers {
+            match answer {
+                connected::Shared::Shares(shares, links) => {
+                    window.view.set_shares(letters_ui::Shared { shares, owner, links });
+                }
+                connected::Shared::Made(link) => window.view.link_made(link),
+                // The dialog dropped the link when it asked.
+                connected::Shared::Revoked => {}
+                connected::Shared::Log(log) => window.view.set_access_log(log),
+                connected::Shared::Refused(why) => window.view.refuse_share(&why),
+            }
+        }
+        window.access_stale = true;
+        window.sync(now);
     }
 
     /// Tries a document's server again, as the person asked of a window whose line the server ended. A
@@ -2955,6 +3211,10 @@ impl ApplicationHandler<Event> for App {
                     window.reword(&self.words);
                     // A sync tool may have left a copy of the document while the window was left alone.
                     window.look_for_copies(&self.proxy, &self.library);
+                    // And someone may have renamed or moved it at its server.
+                    if let Some(remote) = &mut window.remote {
+                        remote.look(Instant::now());
+                    }
                 }
                 // The clock may have moved to summer time, or the person to another zone, while the
                 // window was left alone.
@@ -3121,6 +3381,20 @@ impl ApplicationHandler<Event> for App {
                     window.heard(said, now);
                     window.sync(now);
                 }
+                self.place(id);
+            }
+            Event::Placed(id, answers, placed) => {
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.placed(answers, *placed, &self.library);
+                    window.sync(now);
+                }
+                // What was asked meanwhile goes to the server now.
+                self.place(id);
+            }
+            Event::Shared(id, answers) => {
+                self.shared(id, answers, now);
+                // A dialog that was refused may ask how things stand, and more may have been asked.
+                self.serve(event_loop, id, now);
             }
             Event::Dictionary(id, name, dictionary) => {
                 if let Some(window) = self.windows.get_mut(&id) {

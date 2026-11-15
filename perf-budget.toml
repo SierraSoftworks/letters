@@ -10,7 +10,7 @@
 
 # The launch here is of a window, on a display in memory with the CPU renderer. The others launch headless.
 [ubuntu-latest]
-launch_ms = 80
+launch_ms = 50
 keystroke_median_ms = 2.3
 keystroke_p99_ms = 6
 
@@ -19,8 +19,7 @@ launch_ms = 50
 keystroke_median_ms = 1.7
 keystroke_p99_ms = 5
 
-# Not measured yet: the tests do not pass on Windows.
 [windows-latest]
-launch_ms = 150
-keystroke_median_ms = 8
-keystroke_p99_ms = 16
+launch_ms = 95
+keystroke_median_ms = 4.2
+keystroke_p99_ms = 7.5

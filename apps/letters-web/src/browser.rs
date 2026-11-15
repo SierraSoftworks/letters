@@ -9,6 +9,7 @@ use letters_editor::{Clip, Picture, Platform, block_id};
 use letters_model::Style;
 use letters_render::image::Image;
 use letters_ui::{Appearance, Settings};
+use serde_json::Value;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -161,6 +162,8 @@ pub struct Browser {
     pub assets: HashMap<String, Vec<u8>>,
     /// The names of those the editor put in since the shell last looked, for a server to be handed.
     pub stored: Vec<String>,
+    /// Whether the person added a word to their own since the shell last looked, for a server to be told.
+    pub learned: bool,
 }
 
 /// The page's async clipboard. Read by name: the binding to it is not in every release of `web-sys`.
@@ -276,6 +279,7 @@ impl Browser {
             copied: None,
             assets: HashMap::new(),
             stored: Vec::new(),
+            learned: false,
         })
     }
 
@@ -294,6 +298,19 @@ impl Browser {
     pub fn user_words(&self) -> Vec<String> {
         let kept = self.storage.as_ref().and_then(|storage| storage.get_item(WORDS).ok().flatten());
         kept.unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
+    /// Keeps `words` as the person's own, in place of what this browser kept.
+    pub fn keep_user_words(&self, words: &[String]) {
+        if let Some(storage) = &self.storage {
+            let _ = storage.set_item(WORDS, &words.join("\n"));
+        }
+    }
+
+    /// The `style.json` the person kept as their default in this browser, if they kept one.
+    pub fn kept_default_style(&self) -> Option<Value> {
+        let kept = self.storage.as_ref()?.get_item(STYLE).ok().flatten()?;
+        serde_json::from_str(&kept).ok()
     }
 
     /// The style the person's new documents start with: the one they kept in this browser, else the
@@ -403,8 +420,7 @@ impl Platform for Browser {
         }
         words.push(word.to_owned());
         // Storage that is full or turned off keeps nothing, and the word still holds until the page closes.
-        if let Some(storage) = &self.storage {
-            let _ = storage.set_item(WORDS, &words.join("\n"));
-        }
+        self.keep_user_words(&words);
+        self.learned = true;
     }
 }

@@ -149,12 +149,14 @@ impl Renaming {
             }
             let title = Element::text(folders::title(location), quiet.weight(600)).fg(tokens::FG_MUTED);
             let tree = self.tree.list(location, "Move to", ROWS, browse);
-            let other = folders::elsewhere(Message::Rename(Rename::Elsewhere));
+            // The row that reaches the folders the tree does not list, with the line over it.
+            let other =
+                || Element::column().padding(inset).child(folders::elsewhere(Message::Rename(Rename::Elsewhere)));
+            let other = (!location.closed).then(|| [line(), other()]).into_iter().flatten();
             flyout = flyout
                 .child(Element::column().padding(Edges { bottom: 0.0, ..Edges::all(tokens::SPACE_MD) }).child(title))
                 .child(Element::column().padding(inset).child(tree))
-                .child(line())
-                .child(Element::column().padding(inset).child(other))
+                .children(other)
                 .child(line())
                 .child(self.foot(location));
         }

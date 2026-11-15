@@ -102,7 +102,7 @@ fn images_that_cannot_be_drawn_are_refused() {
     let cases: [(&str, Vec<u8>, Check); 6] = [
         ("no data", Vec::new(), |error| *error == ImageError::Unsupported),
         ("text", b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec(), |error| *error == ImageError::Unsupported),
-        ("a format left out", [b"BM".as_slice(), &[0; 64]].concat(), |error| *error == ImageError::Unsupported),
+        ("a format left out", encoded(8, 8, ImageFormat::Bmp), |error| *error == ImageError::Unsupported),
         ("a truncated file", png[..png.len() / 2].to_vec(), |error| matches!(error, ImageError::Invalid(_))),
         ("a header with no picture", png[..8].to_vec(), |error| matches!(error, ImageError::Invalid(_))),
         ("a vast picture", vast, |error| *error == ImageError::TooLarge),

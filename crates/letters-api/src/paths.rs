@@ -29,6 +29,9 @@ pub const SPACES: &str = "/api/v1/spaces";
 pub const RECENT: &str = "/api/v1/recent";
 /// `GET`: the documents shared with the person from beyond their spaces, as [`Entry`](crate::Entry)s.
 pub const SHARED: &str = "/api/v1/shared";
+/// `GET`: who a document can be shared with, as [`Grantee`](crate::Grantee)s: everyone else who has signed
+/// in to the server, and then the groups it has heard of.
+pub const PEOPLE: &str = "/api/v1/people";
 /// `GET`: the sources the server itself fetches pictures and previews from, as a list of addresses.
 pub const SOURCES: &str = "/api/v1/trust/sources";
 
@@ -89,6 +92,12 @@ pub fn trash(id: &str) -> String {
     format!("{}/trash", document(id))
 }
 
+/// `POST`: merges into the document every conflict copy a sync tool left beside it, and moves each to
+/// its space's trash: the names of the copies it took, as a list. No copy is merged unless this is asked.
+pub fn merge_conflicts(id: &str) -> String {
+    format!("{}/merge-conflicts", document(id))
+}
+
 /// `GET`: the names of the document's assets, as [`asset`] takes them. A device that wrote offline asks
 /// this to learn which of its pictures the server lacks, and hands those over before its edits.
 pub fn assets(id: &str) -> String {
@@ -122,17 +131,22 @@ pub fn trust(id: &str) -> String {
     format!("{}/trust", document(id))
 }
 
-/// `GET`: the document's [`Shares`](crate::Shares). `PUT` them: replaces its people.
+/// `GET`: the document's [`Shares`](crate::Shares), for whoever says who it is shared with. Anyone else is
+/// refused as [`Code::Forbidden`](crate::Code::Forbidden).
+///
+/// `PUT` a [`Shares`](crate::Shares): its people are all the document's people from here on, and its links
+/// are not read. Answers the shares as they then are, people and links.
 pub fn shares(id: &str) -> String {
     format!("{}/shares", document(id))
 }
 
-/// `POST` a [`NewLink`](crate::NewLink): a [`CreatedLink`](crate::CreatedLink).
+/// `POST` a [`NewLink`](crate::NewLink): a [`CreatedLink`](crate::CreatedLink), the one time the link's
+/// address is told. A server makes links only when its [`Server::links`](crate::Server::links) says so.
 pub fn links(id: &str) -> String {
     format!("{}/links", document(id))
 }
 
-/// `DELETE`: revokes the link with this [`Link::id`](crate::Link::id).
+/// `DELETE`: revokes the link with this [`Link::id`](crate::Link::id). Answers with no body.
 pub fn link(id: &str, link: &str) -> String {
     format!("{}/links/{}", document(id), segment(link))
 }
@@ -159,6 +173,17 @@ pub fn sign_in_page(then: &str) -> String {
 /// A page: the document in the browser's editor.
 pub fn editor_page(id: &str) -> String {
     format!("/d/{}", segment(id))
+}
+
+/// A page: where a share link leads. `token` is the link's secret, which only its address holds.
+///
+/// Following it, after the passphrase when the link asks one, lets the browser in to the link's document
+/// and sends it on to [`editor_page`]. From then on that browser is answered at what is asked of the
+/// document itself ([`document`], [`file()`], [`assets`], [`socket`], [`rename`] and the fetches) as the
+/// link says: with its role and its [`Allows`](crate::Allows), in no space, and by the link's label for a
+/// name. With nobody signed in, everything else of the server refuses it as signed out.
+pub fn link_page(token: &str) -> String {
+    format!("/l/{}", segment(token))
 }
 
 /// A page: the document as plain HTML, to read with no editor.

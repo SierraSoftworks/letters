@@ -62,8 +62,9 @@ jobs:
       - name: Configure system for AFL++
         run: cargo afl system-config
 
+      # By the script, which holds the compiler flags of a fuzz build. It ends by naming the targets.
       - name: Build fuzz targets
-        run: cargo afl build --profile fuzz -p letters-fuzz --target-dir target/afl
+        run: ./scripts/fuzz
 
       - name: Run fuzz targets
         id: fuzz

@@ -7,8 +7,8 @@ use letters_api::{self as api, EntryKind, Person, SpaceKind, paths};
 use yew::prelude::*;
 use yewi::prelude::*;
 
-use super::{ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH};
-use super::{RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking};
+use super::{ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH};
+use super::{ACT_SHARE, ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking};
 
 /// Everything one page shows. It is made where the request is answered and drawn on another thread, so it
 /// holds plain text.
@@ -41,7 +41,7 @@ pub enum At {
 pub enum Body {
     Folder(Box<Folder>),
     Recent(Vec<Row>),
-    Shared,
+    Shared(Vec<Row>),
     Trash(Vec<Trashed>),
     /// The person is signed in, and none of the server's spaces is open to them.
     NoSpaces,
@@ -56,7 +56,7 @@ pub struct Row {
     /// When it was made and last written, as the table says them.
     pub created: String,
     pub modified: String,
-    /// The name of its space, in a table that mixes spaces.
+    /// Where it is from, in a table that mixes places: the name of its space, or whose it is.
     pub space: Option<String>,
 }
 
@@ -66,6 +66,8 @@ pub struct Folder {
     /// The folder's place in its space. Empty for the space itself.
     pub path: String,
     pub rows: Vec<Row>,
+    /// Whether the person says who the documents here are shared with.
+    pub shares: bool,
     /// The question the page opens with, when a row's menu asked for one.
     pub ask: Option<Ask>,
 }
@@ -77,6 +79,8 @@ pub enum Ask {
     /// Where to, among the folders the person may put it in.
     Move(api::Entry, Vec<Target>),
     Trash(api::Entry),
+    /// Who it is shared with, and who it can be shared with besides.
+    Share(api::Entry, Vec<api::Grant>, Vec<api::Grantee>),
 }
 
 /// A folder a document can be moved to.
@@ -109,6 +113,9 @@ pub enum Card {
     Failed { title: String, message: String, again: Option<(String, String)> },
     /// The desktop app asks to be signed in as the person.
     HandOver { name: String, challenge: String, port: String, state: String },
+    /// A share link asks its passphrase, at the address the form goes to. `wrong` after one that was not
+    /// it.
+    Passphrase { action: String, wrong: bool },
 }
 
 #[derive(Properties, PartialEq)]
@@ -169,7 +176,7 @@ fn framed(page: &Page, who: &Person, body: &Body) -> Html {
     let content = match body {
         Body::Folder(folder) => self::folder(folder),
         Body::Recent(rows) => recent(rows),
-        Body::Shared => shared(),
+        Body::Shared(rows) => shared(rows),
         Body::Trash(trashed) => trash(trashed),
         Body::NoSpaces => html! {
             <EmptyState title="No space is open to you" icon={icons::FOLDER_OPEN}>
@@ -197,14 +204,15 @@ fn hidden(name: &'static str, value: &str) -> Html {
     html! { <input type="hidden" {name} value={value.to_owned()} /> }
 }
 
-/// The headings every file table has. `places` adds where each row is, for a table that mixes spaces.
-fn headings(places: bool) -> Html {
+/// The headings every file table has. `places` heads where each row is from, for a table that mixes
+/// places.
+fn headings(places: Option<&'static str>) -> Html {
     html! {
         <thead>
             <tr>
                 <th scope="col">{ "Name" }</th>
-                if places {
-                    <th scope="col">{ "In" }</th>
+                if let Some(places) = places {
+                    <th scope="col">{ places }</th>
                 }
                 <th scope="col" class="lt-wide">{ "Contributors" }</th>
                 <th scope="col" class="lt-wide">{ "Created" }</th>
@@ -219,9 +227,7 @@ fn headings(places: bool) -> Html {
 fn tag(tag: &api::Tag) -> Html {
     let count = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
     match tag {
-        api::Tag::ConflictCopy { .. } => {
-            html! { <Tag icon={icons::GIT_MERGE} tone={Tone::Warn}>{ "Conflicted copy" }</Tag> }
-        }
+        api::Tag::ConflictCopy { .. } => html! { <Tag icon={icons::GIT_MERGE}>{ "Conflicted copy" }</Tag> },
         api::Tag::ImportNotes { count: notes } => html! {
             <Tag icon={icons::FILE_INPUT} tone={Tone::Warn}>{ count(*notes as usize, "import note", "import notes") }</Tag>
         },
@@ -240,15 +246,32 @@ fn tag(tag: &api::Tag) -> Html {
 }
 
 /// One row. `here` is the page the table is on, which a question about the row is asked over, and `None`
-/// where a table asks none.
-fn file(row: &Row, here: Option<&str>, places: bool) -> Html {
+/// where a table asks none. `shares` is whether the person says who the row is shared with.
+fn file(row: &Row, here: Option<&str>, places: bool, shares: bool) -> Html {
     let entry = &row.entry;
     let space = entry.space.as_deref().unwrap_or_default();
+    // A conflict copy has the id of its original, so whatever is asked by id is asked of the original.
+    // The copy itself is only merged.
+    let copy = entry.tags.iter().any(|tag| matches!(tag, api::Tag::ConflictCopy { .. }));
     let (icon, href) = match (&entry.kind, &entry.id) {
         (EntryKind::Folder, _) => (icons::FOLDER, Some(paths::folder_page(space, &entry.path))),
-        (EntryKind::Document, Some(id)) => (icons::FILE_TEXT, Some(paths::editor_page(id))),
-        (EntryKind::Document, None) => (icons::FILE_TEXT, None),
+        (EntryKind::Document, Some(id)) if !copy => (icons::FILE_TEXT, Some(paths::editor_page(id))),
+        (EntryKind::Document, _) => (icons::FILE_TEXT, None),
     };
+    let merge = entry.id.as_ref().zip(here).filter(|_| copy && entry.role.edits());
+    // The button says what the tag would.
+    let tags = entry.tags.iter().filter(|tag| merge.is_none() || !matches!(tag, api::Tag::ConflictCopy { .. }));
+    let merge = merge.map(|(id, here)| {
+        html! {
+            <form method="post" action={ACT_MERGE}>
+                { hidden("id", id) }
+                { hidden("back", here) }
+                <Button size={Size::Small} variant={ButtonVariant::Primary} icon={icons::GIT_MERGE} kind={ButtonKind::Submit}>
+                    { "Merge conflicts" }
+                </Button>
+            </form>
+        }
+    });
     let name = match href {
         Some(href) => html! { <a class="lt-file__name" {href}>{ entry.name.clone() }</a> },
         None => html! { <span class="lt-file__name">{ entry.name.clone() }</span> },
@@ -263,12 +286,16 @@ fn file(row: &Row, here: Option<&str>, places: bool) -> Html {
         }
     };
     let more = match &entry.id {
-        Some(id) => {
+        Some(id) if !copy => {
             let ask = |what: &str| here.filter(|_| entry.role.edits()).map(|here| asking(here, what, id));
+            let share = here.filter(|_| shares).map(|here| asking(here, "share", id));
             html! {
                 <MenuButton label={format!("More for {}", entry.name)} icon_only=true variant={ButtonVariant::Subtle} size={Size::Small} placement={Placement::BottomEnd}>
                     <MenuItem icon={icons::BOOK_OPEN} href={paths::read_page(id)}>{ "Read" }</MenuItem>
                     <MenuItem icon={icons::DOWNLOAD} href={paths::file(id)}>{ "Download" }</MenuItem>
+                    if let Some(share) = share {
+                        <MenuItem icon={icons::SHARE_2} href={share}>{ "Share" }</MenuItem>
+                    }
                     if let (Some(rename), Some(relocate), Some(bin)) = (ask("rename"), ask("move"), ask("trash")) {
                         <MenuSeparator />
                         <MenuItem icon={icons::PENCIL} href={rename}>{ "Rename" }</MenuItem>
@@ -278,12 +305,12 @@ fn file(row: &Row, here: Option<&str>, places: bool) -> Html {
                 </MenuButton>
             }
         }
-        None => Html::default(),
+        _ => Html::default(),
     };
     html! {
         <tr class="yi-table__row">
             <th scope="row">
-                <span class="lt-file"><Icon {icon} />{ name }{ for entry.tags.iter().map(tag) }</span>
+                <span class="lt-file"><Icon {icon} />{ name }{ for tags.map(tag) }{ for merge }</span>
             </th>
             if places {
                 <td class="lt-dim">{ row.space.clone().unwrap_or_default() }</td>
@@ -335,8 +362,8 @@ fn folder(folder: &Folder) -> Html {
     } else {
         html! {
             <SimpleTable label="Documents" variant={TableVariant::Ruled}>
-                { headings(false) }
-                <tbody>{ for folder.rows.iter().map(|row| file(row, Some(&here), false)) }</tbody>
+                { headings(None) }
+                <tbody>{ for folder.rows.iter().map(|row| file(row, Some(&here), false, folder.shares)) }</tbody>
             </SimpleTable>
         }
     };
@@ -379,6 +406,7 @@ fn asked(ask: &Ask, here: &str) -> Html {
         Ask::Rename(entry) => (entry, format!("Rename {}", entry.name), "Rename", ACT_RENAME),
         Ask::Move(entry, _) => (entry, format!("Move {}", entry.name), "Move", ACT_MOVE),
         Ask::Trash(entry) => (entry, format!("Move {} to the trash?", entry.name), "Move to trash", ACT_TRASH),
+        Ask::Share(entry, people, offered) => return sharing(entry, people, offered, here),
     };
     let fields = match ask {
         Ask::Rename(entry) => html! {
@@ -396,6 +424,7 @@ fn asked(ask: &Ask, here: &str) -> Html {
             }
         }
         Ask::Trash(_) => html! { <p>{ "It can be put back from the trash." }</p> },
+        Ask::Share(..) => Html::default(),
     };
     let variant = if matches!(ask, Ask::Trash(_)) { ButtonVariant::Danger } else { ButtonVariant::Primary };
     let footer = html! {
@@ -425,22 +454,107 @@ fn recent(rows: &[Row]) -> Html {
                 </EmptyState>
             } else {
                 <SimpleTable label="Documents opened lately" variant={TableVariant::Ruled}>
-                    { headings(true) }
-                    <tbody>{ for rows.iter().map(|row| file(row, None, true)) }</tbody>
+                    { headings(Some("In")) }
+                    <tbody>{ for rows.iter().map(|row| file(row, None, true, false)) }</tbody>
                 </SimpleTable>
             }
         </Stack>
     }
 }
 
-fn shared() -> Html {
+fn shared(rows: &[Row]) -> Html {
     html! {
         <Stack gap={Space::Lg}>
             <PageHeader title="Shared with me" />
-            <EmptyState title="Nothing is shared with you" icon={icons::SHARE_2}>
-                { "Documents that people share with you from their own spaces are listed here." }
-            </EmptyState>
+            if rows.is_empty() {
+                <EmptyState title="Nothing is shared with you" icon={icons::SHARE_2}>
+                    { "Documents that people share with you from spaces you are not in are listed here." }
+                </EmptyState>
+            } else {
+                <SimpleTable label="Documents shared with you" variant={TableVariant::Ruled}>
+                    { headings(Some("From")) }
+                    <tbody>{ for rows.iter().map(|row| file(row, None, true, false)) }</tbody>
+                </SimpleTable>
+            }
         </Stack>
+    }
+}
+
+/// What a role is called, as the editor's own Share dialog calls it.
+fn role(role: api::Role) -> &'static str {
+    match role {
+        api::Role::Reader => "Reader",
+        api::Role::Commenter => "Commenter",
+        api::Role::Editor => "Editor",
+        api::Role::Owner => "Owner",
+    }
+}
+
+/// What a form sends to name a person or a group, and what the person reads: the two kinds apart, since a
+/// group may be called what a person's id is.
+fn grantee(to: &api::Grantee) -> (String, String) {
+    match to {
+        api::Grantee::Person { id, name } => (format!("p:{id}"), name.clone()),
+        api::Grantee::Group { name } => (format!("g:{name}"), format!("Everyone in {name}")),
+    }
+}
+
+/// The Share dialog, open over the folder at `here`: who the document is shared with, each with the way to
+/// take them out, and a form that shares it with one more or gives one of them another role.
+fn sharing(entry: &api::Entry, people: &[api::Grant], offered: &[api::Grantee], here: &str) -> Html {
+    let id = entry.id.as_deref().unwrap_or_default();
+    let row = |grant: &api::Grant| {
+        let (value, label) = grantee(&grant.to);
+        let face = match &grant.to {
+            api::Grantee::Person { .. } => html! { <Avatar name={label.clone()} size={Size::Small} decorative=true /> },
+            api::Grantee::Group { .. } => html! { <Icon icon={icons::USERS} /> },
+        };
+        html! {
+            <li class="lt-shares__row">
+                { face }
+                <span class="lt-shares__name">{ label.clone() }</span>
+                <span class="lt-dim">{ role(grant.role) }</span>
+                if grant.role != api::Role::Owner {
+                    <form method="post" action={ACT_UNSHARE}>
+                        { hidden("id", id) }
+                        { hidden("back", here) }
+                        { hidden("to", &value) }
+                        <Button size={Size::Small} variant={ButtonVariant::Subtle} kind={ButtonKind::Submit} attrs={attrs! { "aria-label" => format!("Remove {label}") }}>
+                            { "Remove" }
+                        </Button>
+                    </form>
+                }
+            </li>
+        }
+    };
+    let pairs = |(value, label): (String, String)| (AttrValue::from(value), AttrValue::from(label));
+    let options: Rc<[(AttrValue, AttrValue)]> = offered.iter().map(grantee).map(pairs).collect();
+    let roles = [api::Role::Reader, api::Role::Commenter, api::Role::Editor];
+    let roles: Rc<[(AttrValue, AttrValue)]> =
+        roles.iter().map(|given| (role(*given).to_lowercase().into(), role(*given).into())).collect();
+    html! {
+        <Dialog id="asked" open=true title={format!("Share {}", entry.name)} footer={html! {
+            <Button href={here.to_owned()}>{ "Done" }</Button>
+        }}>
+            <Stack gap={Space::Lg}>
+                if people.is_empty() {
+                    <p class="lt-dim">{ "Shared with nobody yet. Whoever is in its space reaches it as before." }</p>
+                } else {
+                    <ul class="lt-shares" aria-label="Shared with">{ for people.iter().map(row) }</ul>
+                }
+                <form class="lt-shares__add" method="post" action={ACT_SHARE}>
+                    { hidden("id", id) }
+                    { hidden("back", here) }
+                    <Field label="Share with" class="lt-shares__to">
+                        <NativeSelect name="to" {options} placeholder="Choose a person or a group" required=true attrs={attrs! { "autofocus" => "" }} />
+                    </Field>
+                    <Field label="As">
+                        <NativeSelect name="role" options={roles} value="reader" />
+                    </Field>
+                    <Button variant={ButtonVariant::Primary} kind={ButtonKind::Submit}>{ "Share" }</Button>
+                </form>
+            </Stack>
+        </Dialog>
     }
 }
 
@@ -509,6 +623,19 @@ fn said(page: &Page, card: &Card) -> Html {
             }}>
                 { message.clone() }
             </EmptyState>
+        },
+        Card::Passphrase { action, wrong } => html! {
+            <>
+                <EmptyState title="This link asks for a passphrase" icon={icons::KEY_ROUND}>
+                    { "Whoever sent you the link has it." }
+                </EmptyState>
+                <form class="lt-card__ask" method="post" action={action.clone()}>
+                    <Field label="Passphrase" error={if *wrong { html! { "That is not the passphrase." } } else { Html::default() }}>
+                        <TextInput name="passphrase" kind={TextInputKind::Password} required=true max_length={200} autocomplete="off" attrs={attrs! { "autofocus" => "" }} />
+                    </Field>
+                    <Button variant={ButtonVariant::Primary} kind={ButtonKind::Submit}>{ "Open" }</Button>
+                </form>
+            </>
         },
         Card::HandOver { name, challenge, port, state } => html! {
             <>

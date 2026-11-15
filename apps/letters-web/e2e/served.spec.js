@@ -7,15 +7,15 @@ import { expect, test } from "@playwright/test";
 import { createHash } from "node:crypto";
 
 import { INK, blocks, carry, entry, file, inked, png, rested, texts } from "./page.js";
-import { album, opened, picture, serve } from "./server.js";
+import { album, opened, picture, room, serve } from "./server.js";
 
 const DOCUMENT = `/api/v1/documents/${opened().id}`;
 const TRUST = `${DOCUMENT}/trust`;
 const bar = (page) => page.getByText(/^Safe mode:/);
 
 /** Clicks the control with this name where the canvas draws it. */
-const click = async (page, name) => {
-  const box = await page.getByRole("button", { name, exact: true }).boundingBox();
+const click = async (page, name, role = "button") => {
+  const box = await page.getByRole(role, { name, exact: true }).boundingBox();
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
 };
 
@@ -233,4 +233,157 @@ test("a link preview the server could not read says why in the server's words, a
   await click(page, "Edit link preview");
   await expect(page.getByText("Not fetched: the page answered 404")).toBeAttached();
   expect(await preview(page)).toEqual(expect.objectContaining({ url: PAGE }));
+});
+
+test("what the person set elsewhere is how the page is, and what they set here is kept by the server whole", async ({ page }) => {
+  const theirs = {
+    name: "Countess of Lovelace",
+    appearance: "dark",
+    accent: [31, 138, 91],
+    dictionary: ["quik"],
+    default_style: { format: 1, page: { margin_top: 99 } },
+  };
+  const settings = (method, path) => (path !== "/api/v1/settings" ? undefined : method === "GET" ? { body: theirs } : { status: 204 });
+  const asked = await serve(page, opened(), settings);
+  await page.keyboard.press("ControlOrMeta+,");
+  for (const name of ["Dark", "Green"]) {
+    await expect(page.getByRole("button", { name, exact: true, pressed: true })).toBeAttached();
+  }
+  // This browser keeps a copy, which the next page starts with.
+  const kept = () => page.evaluate(() => ["theme", "name", "words"].map((key) => localStorage.getItem(`letters.${key}`)));
+  expect(await kept()).toEqual(["dark", "Countess of Lovelace", "quik"]);
+  expect(asked).toEqual([]);
+
+  await click(page, "Light");
+  await expect.poll(() => asked.map(({ method, path }) => `${method} ${path}`)).toEqual(["PUT /api/v1/settings"]);
+  expect(JSON.parse(asked[0].body)).toEqual({ ...theirs, appearance: "light" });
+});
+
+/** The served document in a folder of a space, and what the server says of a document there. */
+const HOUSE = { space: "family", path: "House/Minutes.let" };
+const listed = (name, id = opened().id) => ({ kind: "document", name, space: "family", path: `House/${name}.let`, id, modified: 0, role: "editor" });
+
+const renames = [
+  { name: "takes", answer: { body: listed("Agenda") }, title: "Agenda" },
+  { name: "refuses", answer: { status: 409, body: { code: "name_taken", message: "Another document here is called Agenda." } }, title: "Minutes" },
+];
+for (const { name, answer, title } of renames) {
+  test(`the document is renamed by its server, which ${name} the name`, async ({ page }) => {
+    const asked = await serve(page, opened(HOUSE), (method, path) => (path === `${DOCUMENT}/rename` ? answer : undefined));
+    await run(page, "Rename or move");
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.type("Agenda");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => told(asked)).toEqual(['POST /rename {"name":"Agenda"}']);
+    await expect(page).toHaveTitle(title);
+    // The name field stays with what was typed and says why, or the bar has the new name.
+    const said = answer.status ? page.getByRole("alert", { name: "Another document here is called Agenda." }) : page.getByRole("button", { name: "Agenda", exact: true });
+    await expect(said).toBeAttached();
+  });
+}
+
+test("a new document is started beside this one, and the page goes to it once what was written is kept", async ({ page }) => {
+  const [host, made] = [room(), listed("Untitled", "0190f3a2-7c1e-7b4a-9c55-000000000002")];
+  const documents = "/api/v1/spaces/family/documents";
+  const asked = await serve(page, opened(HOUSE), (method, path) => (path === documents ? { status: 201, body: made } : undefined), undefined, host);
+  await page.route(`**/d/${made.id}`, (route) => route.fulfill({ contentType: "text/html", body: "<title>The new one</title>" }));
+  await page.keyboard.type("Kept first.");
+  await run(page, "New document");
+  await expect(page).toHaveTitle("The new one");
+  expect(told(asked)).toEqual([`POST ${documents} {"folder":"House"}`]);
+  expect((await host.texts()).join()).toContain("Kept first.");
+  host.close();
+});
+
+test("the person's other documents are on the server's page for the folder", async ({ page }) => {
+  await serve(page, opened(HOUSE));
+  await page.route("**/s/family/House", (route) => route.fulfill({ contentType: "text/html", body: "<title>House</title>" }));
+  await run(page, "Open");
+  await expect(page).toHaveTitle("House");
+});
+
+test("a document started without a name takes its first heading's, on the server too", async ({ page }) => {
+  const named = (method, path) => (path === `${DOCUMENT}/rename` ? { body: listed("Letters in the browser") } : undefined);
+  const asked = await serve(page, opened({ ...HOUSE, name: "Untitled", named: false }), named);
+  // The caret leaves the heading.
+  await page.keyboard.press("ControlOrMeta+Home");
+  await page.keyboard.press("ArrowDown");
+  await expect.poll(() => told(asked)).toEqual(['POST /rename {"name":"Letters in the browser"}']);
+  await expect(page).toHaveTitle("Letters in the browser");
+});
+
+const links = [
+  ["allows", true],
+  ["withholds", false],
+];
+for (const [name, allowed] of links) {
+  test(`what a share link ${name} of the document is ${allowed ? "" : "not "}offered, by the browser's own print too`, async ({ page }) => {
+    await serve(page, opened({ allows: { download: allowed, copy: allowed, print: allowed } }));
+    await click(page, "More");
+    await expect(page.getByRole("menuitem", { name: "Settings" })).toBeAttached();
+    for (const item of ["Save a copy", "Export"]) {
+      await expect(page.getByRole("menuitem", { name: item })).toHaveCount(allowed ? 1 : 0);
+    }
+    await page.emulateMedia({ media: "print" });
+    await expect(page.locator("canvas")).toBeVisible({ visible: allowed });
+  });
+}
+
+const grace = { to: { kind: "person", id: "sub-grace", name: "Grace Hopper" }, role: "reader" };
+const friends = { to: { kind: "group", name: "friends" }, role: "reader" };
+const link = { id: "l1", label: "Accountant", role: "reader", created: 1794000000, allows: {} };
+const REFUSAL = { status: 403, body: { code: "forbidden", message: "Only the owner says who a document is shared with." } };
+/** A server that shares the document with Grace and answers what the Share dialog asks, or `refuses` to change anything. */
+const sharing = (refuses) => (method, path, body) => {
+  if (path === "/api/v1/server") return { body: { product: "letters", name: "Letters", version: "0.1.0", protocols: [1], links: true } };
+  if (method !== "GET" && refuses) return REFUSAL;
+  if (path === `${DOCUMENT}/shares`) return { body: { people: method === "PUT" ? JSON.parse(body).people : [grace], links: [] } };
+  if (path === `${DOCUMENT}/links`) return { status: 201, body: { link, url: "https://letters.example/l/abc" } };
+  if (path === `${DOCUMENT}/access`) return { body: [{ time: 1794000000, who: grace.to, action: "open", role: "reader", address: "192.0.2.7", browser: "Firefox" }] };
+  return path === `${DOCUMENT}/links/l1` ? { status: 204 } : undefined;
+};
+const shared = (page, name) => page.getByRole("list", { name: "Shared with" }).getByRole("listitem", { name });
+/** Adds the group `friends` as readers in the Share dialog. */
+const add = async (page) => {
+  await click(page, "Share");
+  await expect(shared(page, /Grace Hopper/)).toBeAttached();
+  await click(page, "Add a group", "textbox");
+  await page.keyboard.type("friends");
+  await click(page, "Add reader");
+};
+
+test("the owner shares the document through its server: with a group, and by a link that is then revoked", async ({ page }) => {
+  const asked = await serve(page, opened({ role: "owner" }), sharing(false));
+  await add(page);
+  await expect(shared(page, /friends/)).toBeAttached();
+  await click(page, "New link");
+  await page.keyboard.type("Accountant");
+  await click(page, "Make link");
+  await expect(page.getByRole("button", { name: "Copy link" })).toBeAttached();
+  await click(page, "Revoke");
+  await expect.poll(() => told(asked).at(-1)).toBe("DELETE /links/l1");
+
+  const [about, shares, put, post] = told(asked);
+  expect([about, shares]).toEqual(["GET /api/v1/server", "GET /shares"]);
+  expect(JSON.parse(put.replace("PUT /shares ", "")).people).toEqual([grace, friends]);
+  expect(JSON.parse(post.replace("POST /links ", ""))).toMatchObject({ label: "Accountant", role: "reader" });
+  expect(await page.evaluate(() => window.blocked)).toEqual([]);
+});
+
+test("a change to the shares that the server refuses is told in its words, and the list is the server's again", async ({ page }) => {
+  const asked = await serve(page, opened({ role: "owner" }), sharing(true));
+  await add(page);
+  await expect(page.getByRole("dialog", { name: "Share" }).getByRole("alert", { name: REFUSAL.body.message })).toBeAttached();
+  await expect(shared(page, /friends/)).toHaveCount(0);
+  await expect(shared(page, /Grace Hopper/)).toBeAttached();
+  expect(told(asked).filter((line) => line === "GET /shares")).toHaveLength(2);
+});
+
+test("who reached the document through a share is asked of its server when the owner turns to Activity", async ({ page }) => {
+  const asked = await serve(page, opened({ role: "owner" }), sharing(false));
+  await click(page, "Share");
+  await expect(shared(page, /Grace Hopper/)).toBeAttached();
+  await click(page, "Activity", "tab");
+  await expect(page.getByRole("dialog", { name: "Share" }).getByRole("listitem", { name: /Grace Hopper/ })).toBeAttached();
+  expect(told(asked).at(-1)).toBe("GET /access");
 });

@@ -288,6 +288,12 @@ impl DocLayout {
     /// face arrives, text that asks for it is set in what there is: its family's upright face slanted for
     /// an italic, or the first family given for a family that is missing.
     ///
+    /// A face takes the place of one given earlier that it is again: the same family, width, style and
+    /// weight, with the same axes. So a page can start in a part of a face, as its Latin alone, and take
+    /// the whole after its first frame. Text is set in the later face from then on, and what is laid out
+    /// keeps the earlier one until it is laid out again, which is right while the two set what both hold
+    /// alike: the same glyph numbers and advances.
+    ///
     /// Only the blocks with such text are laid out again, as after an edit: each keeps its height as an
     /// estimate until it is. Returns whether there are any, which is whether the page may now look different.
     pub fn add_fonts(&mut self, fonts: &Fonts) -> bool {

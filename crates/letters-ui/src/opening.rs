@@ -7,6 +7,7 @@ use letters_render::Point;
 
 use crate::chrome::Edge;
 use crate::copying::CopyFormat;
+use crate::notes;
 use crate::settings::Settings;
 
 /// What the window asks its shell to do. Collect them with `Window::take_requests` after each event.
@@ -31,7 +32,8 @@ pub enum Request {
     /// Let the person choose a folder that is not in the tree, and move the document there.
     MoveElsewhere,
     /// Make a folder called `name` in the folder with the path `parent`, and list it with
-    /// `Window::set_location`.
+    /// `Window::set_location`. One the card that saves a copy asked for, while copies have a place of their
+    /// own, is listed with `Window::set_copy_location`, or refused with `Window::refuse_copy_folder`.
     NewFolder {
         parent: String,
         name: String,
@@ -179,6 +181,38 @@ pub enum Request {
     /// The person wants the server asked again, after it ended the session: see
     /// [`Connection::Refused`](crate::Connection). Answer with `Window::set_connection`.
     Connect,
+    /// The Share dialog opened on a document a server keeps: who is it shared with? Answer with
+    /// `Window::set_shares`, or with `Window::refuse_share` and the server's sentence. Asked again after a
+    /// refusal, since the dialog then shows what may not be so.
+    Shares,
+    /// The document's owner changed who it is shared with: these are all its people from here on, as the
+    /// server's `PUT` of a document's shares takes them. The dialog shows them already. Answer as for
+    /// [`Request::Shares`].
+    SharePeople(Vec<letters_api::Grant>),
+    /// The owner asked for a link. Answer with `Window::link_made` and what the server made, which is the
+    /// one time its address is told, or with `Window::refuse_share`.
+    MakeLink(letters_api::NewLink),
+    /// The owner revoked the link with this id. The dialog has dropped it already. Answer only when it could
+    /// not be done, with `Window::refuse_share`.
+    RevokeLink(String),
+    /// Someone who may share the document turned to the Share dialog's Activity tab: who reached it
+    /// through a share?
+    /// Answer with `Window::set_access_log` and the server's rows, newest first, or with
+    /// `Window::refuse_share`.
+    AccessLog,
+    /// Sign in to the server at this address, as the person typed it, through the system's browser. Say
+    /// how far it has come with `Window::set_sign_in`. Once it is done, say who is signed in where with
+    /// `Window::set_servers`, and then that no sign-in is under way with `Window::set_sign_in(None)`.
+    SignIn {
+        server: String,
+    },
+    /// Give up the sign-in that is under way.
+    CancelSignIn,
+    /// Sign out of the server at this [`Server::address`](crate::Server::address), and say who is then
+    /// signed in where with `Window::set_servers`.
+    SignOut {
+        server: String,
+    },
 }
 
 /// A document opened lately, as the landing card lists it.
@@ -210,6 +244,9 @@ pub struct Location {
     pub folder: String,
     /// The folders it can move to, in tree order.
     pub folders: Vec<Folder>,
+    /// Whether `folders` are all the places there are for it, as for a document a server keeps. Nothing
+    /// then offers "Other location", which asks for a folder of the device.
+    pub closed: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -224,6 +261,44 @@ pub struct Folder {
 pub(crate) const WEEKDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 pub(crate) const MONTHS: [&str; 12] =
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// A moment on the person's clock, which is `zone` minutes ahead of UTC.
+pub(crate) fn local(seconds: u64, zone: i32) -> i64 {
+    i64::try_from(seconds).unwrap_or(i64::MAX).saturating_add(i64::from(zone) * 60)
+}
+
+/// The day a moment falls on where the person is, counted from 1970.
+pub(crate) fn day(seconds: u64, zone: i32) -> i64 {
+    local(seconds, zone).div_euclid(86_400)
+}
+
+/// The time of day a moment falls at where the person is: "09:14".
+pub(crate) fn clock(seconds: u64, zone: i32) -> String {
+    let of_day = local(seconds, zone).rem_euclid(86_400);
+    format!("{:02}:{:02}", of_day / 3_600, of_day / 60 % 60)
+}
+
+/// What a day is called on `today`: "Today", "Yesterday", the weekday for a week back, and the date before
+/// that.
+pub(crate) fn day_called(day: i64, today: Option<i64>) -> String {
+    match today.map(|today| today - day) {
+        Some(0) => "Today".to_owned(),
+        Some(1) => "Yesterday".to_owned(),
+        Some(2..7) => WEEKDAYS[(day + 4).rem_euclid(7) as usize].to_owned(),
+        _ => date_called(day, today),
+    }
+}
+
+/// A day as a date: "6 Nov", with its year where that is not plain.
+pub(crate) fn date_called(day: i64, today: Option<i64>) -> String {
+    let (year, month, date) = notes::date(u64::try_from(day).unwrap_or_default());
+    let month = MONTHS[(month.clamp(1, 12) - 1) as usize];
+    match today.map(|today| today - day) {
+        // A date without its year is plain for most of a year back.
+        Some(0..300) => format!("{date} {month}"),
+        _ => format!("{date} {month} {year}"),
+    }
+}
 
 /// A moment as RFC 3339 writes it.
 struct Moment {

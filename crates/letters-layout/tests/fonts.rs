@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 use letters_fonts::{DISPLAY, MONO, SANS};
 use letters_layout::{DocLayout, FontSpec, Fonts, Shaper};
-use letters_model::{Align, Block, BlockKind, Document, Mark, Model, Op, ReplicaId, Style};
+use letters_model::{Align, Block, BlockKind, Document, Mark, Model, Op, Pos, ReplicaId, Style};
 use letters_render::{Font, Item, Rect};
 
 mod common;
@@ -77,6 +77,31 @@ fn emboldened(font: &Font) -> Fonts {
     Fonts { faces: vec![Font::new(data.into(), 0)] }
 }
 
+/// The Latin part of a face, as a page starts with to show its first words early: a copy that maps no
+/// character past Latin Extended-B. Its glyphs keep their numbers, so what it sets reads the same in the
+/// whole face.
+fn latin(font: &Font) -> Fonts {
+    let mut data = font.data.to_vec();
+    let long =
+        |data: &[u8], at: usize| u32::from_be_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) as usize;
+    let short = |data: &[u8], at: usize| usize::from(u16::from_be_bytes([data[at], data[at + 1]]));
+    let records = (0..short(&data, 4)).map(|record| 12 + 16 * record);
+    let record = records.into_iter().find(|at| &data[*at..*at + 4] == b"cmap").expect("a face maps its characters");
+    let maps = long(&data, record + 8);
+    // Each of its tables of characters is listed with where it starts. The one of format 12 lists stretches
+    // of characters in order, so it is cut after the last Latin one, and every listing is pointed at it.
+    let listed: Vec<usize> = (0..short(&data, maps + 2)).map(|at| maps + 4 + 8 * at + 4).collect();
+    let full = listed.iter().map(|at| long(&data, *at)).find(|table| short(&data, maps + table) == 12);
+    let full = full.expect("a table of every character");
+    let stretch = |data: &[u8], at: usize| long(data, maps + full + 16 + 12 * at + 4);
+    let kept = (0..long(&data, maps + full + 12)).take_while(|at| stretch(&data, *at) < 0x250).count();
+    data[maps + full + 12..maps + full + 16].copy_from_slice(&(kept as u32).to_be_bytes());
+    for at in listed {
+        data[at..at + 4].copy_from_slice(&(full as u32).to_be_bytes());
+    }
+    Fonts { faces: vec![Font::new(data.into(), 0)] }
+}
+
 /// The default style with its top headings in the display family.
 fn style() -> Style {
     let mut style = Style::default();
@@ -128,6 +153,53 @@ fn text_set_short_of_its_face_is_set_again_when_the_face_arrives() {
         assert_eq!(layout.height(), whole.height(), "{name}: at the same height");
         assert!(!layout.add_fonts(&fonts()), "{name}: fonts that are there already change nothing");
     }
+}
+
+#[test]
+fn the_whole_of_a_face_takes_the_place_of_the_part_a_page_started_with() {
+    const GREEK: &str = "Τιμές";
+    let (part, whole) = (latin(&fonts().faces[0]), first());
+    let set_in = |items: &[Item], fonts: &Fonts| {
+        let mut runs = glyph_runs(items).peekable();
+        runs.peek().is_some()
+            && runs.all(|item| matches!(item, Item::Glyphs { font, .. } if font.data.same(&fonts.faces[0].data)))
+    };
+    // What a paragraph says before the whole face arrives, and whether that is set short of a character.
+    for (name, early, short) in [("Latin first", "Rates", false), ("Greek first", GREEK, true)] {
+        let mut model = Model::new(doc(vec![paragraph("p", PROSE), paragraph("x", early)]), ReplicaId::from(1));
+        let mut layout = DocLayout::new(part.clone());
+        layout.update(model.doc(), &Style::default(), WIDTH, None);
+        settled(&mut layout);
+        let before = painted(&layout, everything());
+        assert!(set_in(&before, &part), "{name}: the page starts in the part");
+        assert_eq!(!layout.take_uncovered().is_empty(), short, "{name}: which lacks only what is not Latin");
+
+        assert_eq!(layout.add_fonts(&whole), short, "{name}: only text that was short of a character is set again");
+        settled(&mut layout);
+        if !short {
+            assert!(painted(&layout, everything()) == before, "{name}: and what was laid out stays as it was");
+        }
+
+        // What is written from then on is set in the whole face, which has every character.
+        let change = model.apply(vec![Op::InsertText { at: Pos::new("x", 0), text: GREEK.into() }]).unwrap();
+        layout.update(model.doc(), &Style::default(), WIDTH, Some(&change));
+        settled(&mut layout);
+        let after = painted(&layout, everything());
+        let mut written = DocLayout::new(whole.clone());
+        written.update(model.doc(), &Style::default(), WIDTH, None);
+        assert_eq!(placed(&after), placed(&painted(&written, everything())), "{name}: the page reads as in the whole");
+        assert!(placed(&after).iter().all(|(glyph, ..)| *glyph != 0), "{name}: with a glyph for every character");
+        assert!(layout.take_uncovered().is_empty(), "{name}: and nothing is told as lacking");
+        let line = layout.band(&"x".into()).map(|(top, height)| Rect::new(0.0, top, WIDTH, height)).unwrap();
+        assert!(set_in(&painted(&layout, line), &whole), "{name}: the new words are in the whole face");
+        assert!(!layout.add_fonts(&part), "{name}: the part given again changes nothing");
+    }
+
+    let (late, wanted) = (Shaper::new(part), Shaper::new(whole.clone()));
+    let font = FontSpec::new(SANS, 14.0);
+    assert!(late.shape(GREEK, &font, None) != wanted.shape(GREEK, &font, None), "a shaper lacks them too");
+    late.add_fonts(&whole);
+    assert!(late.shape(GREEK, &font, None) == wanted.shape(GREEK, &font, None), "until the whole face comes");
 }
 
 #[test]

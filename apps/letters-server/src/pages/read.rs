@@ -9,9 +9,10 @@ use letters_fonts::{DISPLAY, MONO, SANS};
 use letters_ui::{Scheme, palette};
 
 use super::statics::{FACES, statics};
-use super::{Visitor, guarded, refused};
+use super::{Opener, guarded, refused};
 use crate::Shared;
 use crate::api::blocking;
+use crate::error::Refusal;
 use crate::spaces::shown;
 
 /// The families a document is set in, each with its file among [`letters_fonts::FILES`] and whether that
@@ -29,11 +30,17 @@ const POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src dat
                       form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
 
 /// `GET /d/{id}/read`.
-pub async fn page(State(app): State<Shared>, Visitor(who): Visitor, Path(id): Path<String>) -> Response {
+pub async fn page(State(app): State<Shared>, Opener(who): Opener, Path(id): Path<String>) -> Response {
     let written = blocking({
         let (app, who) = (app.clone(), who.clone());
         move || {
             let found = app.locate(&who, &id)?;
+            // The page is the document's text, for a browser to copy, print and keep as it likes.
+            if !(found.allows.copy && found.allows.print) {
+                let editor =
+                    "This link shows the document in the editor alone: its text is not to be copied or printed.";
+                return Err(Refusal::forbidden(editor));
+            }
             // What is being written now is read too.
             app.rooms.save(&found.root, &found.place);
             let mut archive = app.library.open(&found.root, &found.place)?;

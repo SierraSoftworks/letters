@@ -6,8 +6,8 @@ use std::cmp::Ordering;
 
 use common::{doc, id, pair, saved, split, sync, texts, typed};
 use letters_model::{
-    Block, BlockKind, Body, Change, Document, Extent, HistoryError, Hold, Mark, Model, Op, OpError, Page, Pos,
-    ReplicaId, Revision, Run, StablePos, Style,
+    Block, BlockKind, Body, BodyShape, Change, Document, Extent, HistoryError, Hold, Mark, Model, Op, OpError, Page,
+    Pos, ReplicaId, Revision, Run, StablePos, Style,
 };
 
 /// A name, what each of two replicas does unseen by the other, and the text of every block once merged.
@@ -165,6 +165,7 @@ fn an_update_that_arrives_before_what_it_builds_on_waits_and_the_extent_tells() 
     let holds = |model: &Model| model.extent() >= reach;
 
     let held = b.extent();
+    assert_eq!(Model::check(&second), Ok(()), "an update that waits is one that reads");
     assert_eq!(b.merge(&second), Ok(Change::default()), "an update with a gap before it showed");
     assert!(b.extent() == held && !holds(&b), "an update that waits counts as held");
 
@@ -197,11 +198,125 @@ fn an_extent_tells_copies_of_other_documents_apart() {
 fn a_history_that_cannot_be_read_is_refused() {
     let mut m = Model::new(doc(), ReplicaId::from(1));
     let before = (m.doc().clone(), m.revision());
+    assert_eq!(Model::check(&m.save()), Ok(()));
     for bytes in [&b""[..], b"not a history", &m.save()[..40]] {
+        assert!(matches!(Model::check(bytes), Err(HistoryError::Unreadable(_))));
         assert!(matches!(Model::load(bytes, ReplicaId::from(2)), Err(HistoryError::Unreadable(_))));
         assert!(matches!(m.merge(bytes), Err(HistoryError::Unreadable(_))));
         assert!(matches!(m.compare(bytes), Err(HistoryError::Unreadable(_))));
         assert_eq!((m.doc().clone(), m.revision()), before);
+    }
+}
+
+/// Found by fuzzing: a history with a sound checksum that no writer makes. Loro panics on it where its debug
+/// assertions are on, which the check contains, and reads it as an update that waits where they are off.
+#[test]
+fn a_history_no_writer_makes_is_stopped_by_the_check_or_changes_nothing() {
+    let odd = include_bytes!("../../../fuzz/corpus/history/bytes-after-a-block-header.bin");
+    let mut m = Model::new(doc(), ReplicaId::from(1));
+    let before = m.doc().clone();
+    if Model::check(odd).is_ok() {
+        let _ = Model::load(odd, ReplicaId::from(2));
+        let _ = (m.compare(odd), m.related(odd), m.merge(odd));
+    }
+    assert_eq!(m.doc(), &before);
+    m.apply([typed("p", 11, "!")]).unwrap();
+    assert_eq!(Model::load(&m.save(), ReplicaId::from(2)).unwrap().doc(), m.doc());
+}
+
+/// Found by fuzzing, each with a sound checksum. Loro reads the first and then writes out a history it
+/// cannot read. It panics on the second, which poisons the document that was reading it.
+#[test]
+fn the_check_refuses_a_history_that_loro_cannot_keep() {
+    let cases: [(&str, &[u8]); 2] = [
+        ("its save cannot be read", include_bytes!("../../../fuzz/corpus/history/a-history-loro-cannot-write-out.bin")),
+        ("Loro panics on it", include_bytes!("../../../fuzz/corpus/history/a-history-loro-panics-on.bin")),
+    ];
+    for (name, history) in cases {
+        assert!(matches!(Model::check(history), Err(HistoryError::Unreadable(_))), "{name}");
+    }
+    let (a, _) = pair();
+    assert_eq!(Model::check(&a.save()), Ok(()), "a history is read after one that was refused");
+}
+
+/// What a device wrote since it held `held`, as it sends it to a room.
+fn sent(device: &mut Model, ops: Vec<Op>) -> Vec<u8> {
+    let held = device.extent();
+    device.apply(ops).unwrap();
+    device.updates_for(&held)
+}
+
+#[test]
+fn a_room_admits_what_a_device_writes_in_order_and_refuses_a_gap() {
+    let (mut device, mut room) = pair();
+    let first = sent(&mut device, vec![typed("p", 0, "1")]);
+    let bold = Op::SetMark { block: id("p"), range: 0..3, mark: Mark::Bold, on: true };
+    let second = sent(&mut device, vec![split("p", 5, "p2"), bold]);
+
+    assert!(matches!(room.admit(&second), Err(HistoryError::Unreadable(_))), "an update with a gap before it");
+    assert!(matches!(room.admit(b"not an update"), Err(HistoryError::Unreadable(_))));
+    for update in [&first, &second] {
+        assert_eq!(room.admit(update), Ok(()));
+        room.merge(update).unwrap();
+        // The room writes as well, and the next update is tried on a copy that holds it.
+        room.apply([typed("p", 0, "r")]).unwrap();
+    }
+    device.merge(&room.save()).unwrap();
+    assert_eq!(room.doc(), device.doc());
+}
+
+#[test]
+fn an_update_to_the_history_a_model_gave_up_is_not_admitted() {
+    let (file, history) = saved();
+    let open = |replica: u64| Model::new(file.clone(), ReplicaId::from(replica));
+    let (mut room, mut device) = (open(2), open(3));
+    let update = sent(&mut device, vec![typed("p", 0, "1")]);
+    assert_eq!(room.admit(&update), Ok(()));
+
+    // The file's history takes the place of the one the update builds on.
+    room.attach(open(2).prepare(Some(&history)).unwrap());
+    assert!(matches!(room.admit(&update), Err(HistoryError::Unreadable(_))));
+}
+
+/// A room's history and three updates to it that fuzzing made, each with a sound checksum. Loro panics as
+/// the first lands, cannot write out a history that holds the second, and reads the third differently once
+/// it is saved.
+#[test]
+fn an_update_that_would_cost_a_room_its_document_is_not_admitted() {
+    let base = include_bytes!("corpus/strangers/base.bin");
+    let harmful: [(&str, &[u8]); 3] = [
+        ("Loro panics as it lands", include_bytes!("corpus/strangers/update-panics.bin")),
+        ("the save cannot be read", include_bytes!("corpus/strangers/update-unwritable.bin")),
+        ("a saved copy reads differently", include_bytes!("corpus/strangers/update-diverges.bin")),
+    ];
+    let mut room = Model::load(base, ReplicaId::from(7)).unwrap();
+    let mut device = Model::load(base, ReplicaId::from(8)).unwrap();
+    for (name, update) in harmful {
+        assert!(matches!(room.admit(update), Err(HistoryError::Unreadable(_))), "{name}");
+        // The room goes on taking what a device writes.
+        let update = sent(&mut device, vec![typed("p", 0, "x")]);
+        assert_eq!(room.admit(&update), Ok(()), "after {name}");
+        room.merge(&update).unwrap();
+    }
+    assert_eq!(room.doc(), device.doc());
+    assert_eq!(Model::load(&room.save(), ReplicaId::from(9)).unwrap().doc(), room.doc());
+}
+
+/// Found by fuzzing: markers whose JSON was damaged until it told no id, first in the document and later.
+#[test]
+fn a_block_whose_marker_tells_no_id_is_one_a_file_can_hold() {
+    let cases: [&[u8]; 2] = [
+        include_bytes!("../../../fuzz/corpus/history/a-first-marker-without-an-id.bin"),
+        include_bytes!("../../../fuzz/corpus/history/a-marker-without-an-id.bin"),
+    ];
+    for history in cases {
+        let mut m = Model::load(history, ReplicaId::from(2)).unwrap();
+        assert_eq!(Document::from_json(&m.doc().to_json()).as_ref(), Ok(m.doc()));
+        // Every block takes text under the id it reads by.
+        let texts: Vec<_> = m.doc().walk().filter(|block| block.kind.shape() == BodyShape::Text).collect();
+        let typed: Vec<Op> = texts.iter().map(|block| typed(block.id.as_str(), 0, "x")).collect();
+        m.apply(typed).unwrap();
+        assert_eq!(Model::load(&m.save(), ReplicaId::from(3)).unwrap().doc(), m.doc());
     }
 }
 

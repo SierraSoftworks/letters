@@ -8,7 +8,10 @@ use std::fmt;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use letters_api::{Code, Entry, Limits, Listing, Opened, Person, Space, Token, paths};
+use letters_api::{
+    Access, Code, CreatedLink, Entry, Grant, Limits, Listing, Move, NewFolder, NewLink, Opened, Person, Rename, Shares,
+    Space, Token, paths,
+};
 
 use crate::keychain::{Keychain, Unkept};
 use crate::server::{Client, Refused};
@@ -24,8 +27,8 @@ pub struct Session {
     /// `None` where the system has no keychain: the session then lasts as long as the app is open.
     keychain: Option<Keychain>,
     held: Mutex<Held>,
-    /// What the server holds its callers to, once it was asked.
-    limits: OnceLock<Limits>,
+    /// What the server says of itself, once it was asked.
+    said: OnceLock<letters_api::Server>,
 }
 
 struct Held {
@@ -50,14 +53,14 @@ impl Session {
             server,
             keychain: Some(keychain),
             held: Mutex::new(Held { token, unkept: None }),
-            limits: OnceLock::new(),
+            said: OnceLock::new(),
         }))
     }
 
     /// The session a sign-in ended in, which is kept from here on.
     pub fn begin(server: Client, keychain: Option<Keychain>, token: Token) -> Self {
         let unkept = keep(keychain.as_ref(), &server, &token).err();
-        Self { server, keychain, held: Mutex::new(Held { token, unkept }), limits: OnceLock::new() }
+        Self { server, keychain, held: Mutex::new(Held { token, unkept }), said: OnceLock::new() }
     }
 
     pub fn server(&self) -> &Client {
@@ -107,11 +110,20 @@ impl Session {
 
     /// What the server holds its callers to, asked once. Needs no session, but is asked beside one.
     pub fn limits(&self) -> Result<Limits, Refused> {
-        if let Some(limits) = self.limits.get() {
-            return Ok(*limits);
+        Ok(self.said()?.limits)
+    }
+
+    /// Whether the server makes links to its documents. Asked with its limits.
+    pub fn links(&self) -> Result<bool, Refused> {
+        Ok(self.said()?.links)
+    }
+
+    fn said(&self) -> Result<&letters_api::Server, Refused> {
+        if let Some(said) = self.said.get() {
+            return Ok(said);
         }
-        let limits = self.server.discover()?.limits;
-        Ok(*self.limits.get_or_init(|| limits))
+        let said = self.server.discover()?;
+        Ok(self.said.get_or_init(|| said))
     }
 
     /// Every space the person reaches.
@@ -149,6 +161,11 @@ impl Session {
         self.ask(|server, token| server.asset(token, id, name, most))
     }
 
+    /// Hands the server a document's whole `.let` file, for work that no frame of its socket carries.
+    pub fn keep_file(&self, id: &str, bytes: &[u8]) -> Result<(), Refused> {
+        self.ask(|server, token| server.keep_file(token, id, bytes))
+    }
+
     /// The names of the pictures the server holds for a document, each without `assets/`.
     pub fn assets(&self, id: &str) -> Result<Vec<String>, Refused> {
         self.ask(|server, token| server.get(token, &paths::assets(id)))
@@ -157,6 +174,50 @@ impl Session {
     /// Hands the server a picture of a document, before the edit that names it is sent.
     pub fn keep_asset(&self, id: &str, name: &str, bytes: &[u8]) -> Result<(), Refused> {
         self.ask(|server, token| server.keep_asset(token, id, name, bytes))
+    }
+
+    /// Calls a document `name`. A name another document has in its folder is refused as [`Code::NameTaken`].
+    pub fn rename(&self, id: &str, name: &str) -> Result<Entry, Refused> {
+        let to = Rename { name: name.to_owned() };
+        self.ask(|server, token| server.post(token, &paths::rename(id), &to))
+    }
+
+    /// Moves a document to `folder` of `space`, under the name it has.
+    pub fn relocate(&self, id: &str, space: &str, folder: &str) -> Result<Entry, Refused> {
+        let to = Move { space: space.to_owned(), folder: folder.to_owned() };
+        self.ask(|server, token| server.post(token, &paths::relocate(id), &to))
+    }
+
+    /// Makes the folder `name` in `parent` of a space.
+    pub fn new_folder(&self, space: &str, parent: &str, name: &str) -> Result<Entry, Refused> {
+        let new = NewFolder { parent: parent.to_owned(), name: name.to_owned() };
+        self.ask(|server, token| server.post(token, &paths::folders(space), &new))
+    }
+
+    /// Who a document is shared with, besides those its space lets in.
+    pub fn shares(&self, id: &str) -> Result<Shares, Refused> {
+        self.ask(|server, token| server.get(token, &paths::shares(id)))
+    }
+
+    /// Makes `people` all the people a document is shared with, and gives its shares as they then are.
+    pub fn share(&self, id: &str, people: &[Grant]) -> Result<Shares, Refused> {
+        let shares = Shares { people: people.to_vec(), links: Vec::new() };
+        self.ask(|server, token| server.put(token, &paths::shares(id), &shares))
+    }
+
+    /// Who reached a document through a share, newest first.
+    pub fn access_log(&self, id: &str) -> Result<Vec<Access>, Refused> {
+        self.ask(|server, token| server.get(token, &paths::access(id)))
+    }
+
+    /// Makes a link to a document. Its address is told this once.
+    pub fn make_link(&self, id: &str, new: &NewLink) -> Result<CreatedLink, Refused> {
+        self.ask(|server, token| server.post(token, &paths::links(id), new))
+    }
+
+    /// Revokes a link to a document, by the link's id.
+    pub fn revoke_link(&self, id: &str, link: &str) -> Result<(), Refused> {
+        self.ask(|server, token| server.delete(token, &paths::link(id, link)))
     }
 
     /// Ends the session here and at the server. The server is told if it can be reached, and the sign-in

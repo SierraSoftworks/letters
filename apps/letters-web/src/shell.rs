@@ -7,13 +7,14 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::mem;
 use std::ops::Range;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Array, Function, Map, Object, Promise, Reflect, Uint8Array};
-use letters_api::{Code, Fetch, Opened, Preview, paths};
+use letters_api::{Code, Fetch, Opened, Preview, Shares, paths};
 use letters_editor::{Clip, Editor, Key, KeyEvent, Modifiers, Picture, Platform as _};
 use letters_model::{
     BlockId, BlockKind, Change, Document, HistoryError, Mark, Model, Notes, Pos, ReplicaId, Revision, Selection, Style,
@@ -21,11 +22,11 @@ use letters_model::{
 };
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::{Color, DisplayList, Font, Point, Rect, Size};
-use letters_sync::{Client, Link, Local, Progress};
+use letters_sync::{Client, Link, Local, Progress, Role};
 use letters_trust::{LinkDecision, Origin, Trust};
 use letters_ui::{
-    Appearance, Connection, CopyFormat, Cursor, Edge, Keys, LinkPreviewFound, Peer, PictureState, Request, SaveState,
-    Scheme, Settings, Uncovered, Window as View, WordList, tokens,
+    Access, Appearance, Connection, CopyFormat, Cursor, Edge, Keys, LinkPreviewFound, Peer, PictureState, Request,
+    SaveState, Scheme, Settings, Shared, Uncovered, Window as View, WordList, tokens,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
@@ -192,6 +193,13 @@ pub struct Shell {
     /// The hosts whose pictures the person said they trust, for as long as the page is open. The server
     /// has nowhere to keep them.
     hosts: Vec<String>,
+    /// The page of the server the person asked for, which waits until the server has what they wrote.
+    leaving: Option<String>,
+    /// Whether the server makes links to its documents, once it has said.
+    links: Option<bool>,
+    /// What the person set for themselves as their server keeps it, once it has said. What this browser
+    /// keeps of it is a copy, which the page starts with.
+    account: Option<letters_api::Settings>,
     /// The document's line to its server: it says what to send over the socket, and what to merge.
     client: Option<Client>,
     /// The socket the client last asked for.
@@ -205,11 +213,14 @@ pub struct Shell {
     attached: bool,
     /// How many pictures are on their way to the server. The edits that name them wait for them.
     uploading: u32,
-    /// Whether the server lets this person write in the document. It says so with the page, and again
-    /// with each session.
-    edits: bool,
-    /// Whether the editor was last told that the person may write.
-    writing: bool,
+    /// What the server lets this person do with the document. It says so with the page, and again with
+    /// each session.
+    role: Role,
+    /// What the window was last told the person may do.
+    access: Access,
+    /// Whether the editor is kept from writing though the window offers to: in the first moments of a
+    /// page, before the server's history is the document's.
+    held: bool,
     /// The selection as the client was last told it.
     told: Option<Selection>,
     /// How the window was last told it stands to the server.
@@ -279,6 +290,13 @@ impl Shell {
     ) -> Result<Rc<RefCell<Self>>, JsValue> {
         let window = web_sys::window().ok_or("there is no window")?;
         let document = window.document().ok_or("there is no document")?;
+        // The window offers no printing that is withheld. The browser's own would print the canvas: the
+        // page's styles leave it out of what a page so marked prints.
+        if let Some(root) =
+            document.document_element().filter(|_| server.as_ref().is_some_and(|server| !server.allows.print))
+        {
+            root.set_attribute("data-print", "withheld")?;
+        }
         // The view paints every pixel, so the canvas needs no alpha.
         let options = Object::new();
         Reflect::set(&options, &"alpha".into(), &false.into())?;
@@ -372,14 +390,18 @@ impl Shell {
                 server,
                 linked: HashMap::new(),
                 hosts: Vec::new(),
+                leaving: None,
+                links: None,
+                account: None,
                 client: None,
                 socket: None,
                 hung: None,
                 sockets: 0,
                 attached: false,
                 uploading: 0,
-                edits: true,
-                writing: true,
+                role: Role::Editor,
+                access: Access::Edits,
+                held: false,
                 told: None,
                 connection: None,
                 quiet_until: None,
@@ -509,6 +531,14 @@ impl Shell {
         hear(&shell, &input, "focus", |shell, _: Event| shell.view.focus(true))?;
         hear(&shell, &input, "blur", |shell, _: Event| shell.view.focus(false))?;
         hear(&shell, &window, "resize", |shell, _: Event| shell.fit())?;
+        // Someone else may have renamed or moved the document while the person was away.
+        hear(&shell, &window, "focus", |shell, _: Event| shell.look())?;
+        // The browser asks before it leaves a page whose work the server lacks.
+        hear(&shell, &window, "beforeunload", |shell, event: Event| {
+            if shell.unsent() {
+                event.prevent_default();
+            }
+        })?;
         // Another tab of the editor may have added to the person's words, kept another default style, or
         // changed their settings.
         hear(&shell, &window, "storage", |shell, _: Event| {
@@ -529,6 +559,7 @@ impl Shell {
         shell.borrow_mut().show();
         shell.borrow_mut().fetch_fonts();
         shell.borrow_mut().go_online();
+        shell.borrow_mut().ask_settings();
         Ok(shell)
     }
 
@@ -1243,17 +1274,12 @@ impl Shell {
         }
         for request in self.view.take_requests() {
             match request {
-                // There are no folders to move between, so a name is the person's to give.
-                Request::Named(name) | Request::Rename(name) => {
-                    self.view.set_document_name(&name);
-                    if let Some(page) = self.window.document() {
-                        page.set_title(&name);
-                    }
-                }
+                Request::Named(name) | Request::Rename(name) => self.rename(name),
                 Request::SaveDefaultStyle(json) => {
                     if !self.platform.keep_default_style(&json) {
                         self.view.set_default_style(self.platform.default_style());
                     }
+                    self.keep_settings();
                 }
                 // The browser asks the person for the file, and the chooser's `change` hands it over.
                 Request::ImportStyle => self.chooser.click(),
@@ -1262,7 +1288,14 @@ impl Shell {
                     report(self.download(&json.into(), "application/json", &format!("{name}.letstyle")));
                 }
                 Request::Pictures => self.picker.click(),
-                Request::OpenDialog => self.opener.click(),
+                // A server's documents are listed on its own pages. Without one, the browser asks the person
+                // for a file, and the chooser's `change` hands it over.
+                Request::OpenDialog => match self.folder() {
+                    Some((space, folder)) => self
+                        .leave(space.map_or(paths::HOME_PAGE.to_owned(), |space| paths::folder_page(&space, &folder))),
+                    None => self.opener.click(),
+                },
+                Request::New => self.start_document(),
                 Request::Save => self.save(),
                 Request::Paste { plain } => self.paste_later(plain),
                 Request::Print => self.print(),
@@ -1282,12 +1315,18 @@ impl Shell {
                     self.platform.keep_settings(&settings);
                     follow(&mut self.view, settings);
                     self.view.set_dark(self.dark());
+                    self.keep_settings();
                 }
                 // A page has no folders to write in: a copy is a file the browser keeps for the person.
                 Request::SaveCopy { name, format, .. } => self.copy(name, format, None),
                 // A version that shows in the history is copied as it read then.
                 Request::SaveVersion { revision, name, format, .. } => self.copy(name, format, Some(&revision)),
-                // Recent documents, new ones and moves need files, which wait for a server behind the page.
+                asked @ (Request::Shares
+                | Request::SharePeople(_)
+                | Request::MakeLink(_)
+                | Request::RevokeLink(_)
+                | Request::AccessLog) => self.share(asked),
+                // Moves and folders wait for the server's listings.
                 _ => {}
             }
         }
@@ -1313,7 +1352,11 @@ impl Shell {
             self.changed();
         }
         self.keep_pictures();
+        if mem::take(&mut self.platform.learned) {
+            self.keep_settings();
+        }
         self.keep_up();
+        self.go();
         self.cover();
         if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
             self.frame_due = self.window.request_animation_frame(&self.on_frame).is_ok();
@@ -1734,6 +1777,278 @@ impl Shell {
         }
     }
 
+    // The server's documents
+
+    /// The space and the folder the served document is in. `None` on a page of no server, and no space
+    /// for a document that reaches the person only through a share.
+    fn folder(&self) -> Option<(Option<String>, String)> {
+        let server = self.server.as_ref()?;
+        let folder = server.path.rsplit_once('/').map_or("", |(folder, _)| folder);
+        Some((server.space.clone(), folder.to_owned()))
+    }
+
+    /// Calls the document `name`. A server's document is renamed by its server, which may refuse.
+    fn rename(&mut self, name: String) {
+        let Some(id) = self.server.as_ref().map(|server| server.id.clone()) else {
+            // There are no folders to move between, so a name is the person's to give.
+            return self.called(&name);
+        };
+        let body = serde_json::to_vec(&letters_api::Rename { name }).unwrap_or_default();
+        let asked = browser::ask(&self.window, "POST", &paths::rename(&id), Some((letters_api::JSON, &body)));
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let answer = asked.await;
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            // The page may show another document by now.
+            if shell.server.as_ref().is_none_or(|server| server.id != id) {
+                return;
+            }
+            match answer.map(|entry| serde_json::from_slice::<letters_api::Entry>(&entry)) {
+                Ok(Ok(entry)) => {
+                    shell.called(&entry.name);
+                    if let Some(server) = &mut shell.server {
+                        (server.name, server.path, server.named) = (entry.name, entry.path, true);
+                    }
+                }
+                Ok(Err(_)) => shell.view.set_notice(Some("The server's answer could not be read.")),
+                Err(refusal) => shell.view.set_notice(Some(&refusal.message)),
+            }
+            shell.arrived();
+        });
+    }
+
+    /// Asks the document's server what the Share dialog asked, and tells the window the answer: the shares
+    /// as they then are, the link that was made, who reached the document, or the server's sentence for
+    /// what it would not do.
+    fn share(&mut self, asked: Request) {
+        const UNREAD: &str = "The server's answer could not be read.";
+        let Some(server) = &self.server else { return };
+        let (id, owner) = (server.id.clone(), server.role.shares());
+        let (method, path, body) = match &asked {
+            Request::Shares => ("GET", paths::shares(&id), None),
+            // The people are put as the shares are read. The links are not a put's to change.
+            Request::SharePeople(people) => {
+                let shares = Shares { people: people.clone(), links: Vec::new() };
+                ("PUT", paths::shares(&id), serde_json::to_vec(&shares).ok())
+            }
+            Request::MakeLink(link) => ("POST", paths::links(&id), serde_json::to_vec(link).ok()),
+            Request::RevokeLink(link) => ("DELETE", paths::link(&id, link), None),
+            Request::AccessLog => ("GET", paths::access(&id), None),
+            _ => return,
+        };
+        // Whether the server makes links is asked once, with the first of these.
+        let about = self.links.is_none().then(|| browser::ask(&self.window, "GET", paths::SERVER, None));
+        let body = body.as_deref().map(|body| (letters_api::JSON, body));
+        let sent = browser::ask(&self.window, method, &path, body);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let about = match about {
+                Some(about) => {
+                    about.await.ok().and_then(|about| serde_json::from_slice::<letters_api::Server>(&about).ok())
+                }
+                None => None,
+            };
+            let answer = sent.await;
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            // The page may show another document by now.
+            if shell.server.as_ref().is_none_or(|server| server.id != id) {
+                return;
+            }
+            shell.links = shell.links.or(about.map(|server| server.links));
+            // A server that does not say makes none.
+            let links = shell.links.unwrap_or(false);
+            match (asked, answer) {
+                (_, Err(refusal)) => shell.view.refuse_share(&refusal.message),
+                (Request::Shares | Request::SharePeople(_), Ok(answer)) => match serde_json::from_slice(&answer) {
+                    Ok(shares) => shell.view.set_shares(Shared { shares, owner, links }),
+                    Err(_) => shell.view.refuse_share(UNREAD),
+                },
+                (Request::MakeLink(_), Ok(answer)) => match serde_json::from_slice(&answer) {
+                    Ok(made) => shell.view.link_made(made),
+                    Err(_) => shell.view.refuse_share(UNREAD),
+                },
+                (Request::AccessLog, Ok(answer)) => match serde_json::from_slice(&answer) {
+                    Ok(log) => shell.view.set_access_log(log),
+                    Err(_) => shell.view.refuse_share(UNREAD),
+                },
+                // The dialog dropped a revoked link already.
+                _ => {}
+            }
+            shell.arrived();
+        });
+    }
+
+    /// Asks the server what the document is called and where it is now: nothing tells an open page that
+    /// someone else renamed or moved it.
+    fn look(&mut self) {
+        let Some(id) = self.server.as_ref().map(|server| server.id.clone()) else { return };
+        let asked = browser::ask(&self.window, "GET", &paths::document(&id), None);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Ok(Ok(now)) = asked.await.map(|answer| serde_json::from_slice::<Opened>(&answer)) else { return };
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            let Some(server) = shell.server.as_mut().filter(|server| server.id == id) else { return };
+            let renamed = server.name != now.name;
+            (server.space, server.path, server.named) = (now.space, now.path, now.named);
+            if renamed {
+                server.name.clone_from(&now.name);
+                shell.called(&now.name);
+                shell.arrived();
+            }
+        });
+    }
+
+    /// Shows the document under `name`, in the window and on the browser's tab.
+    fn called(&mut self, name: &str) {
+        self.view.set_document_name(name);
+        if let Some(page) = self.window.document() {
+            page.set_title(name);
+        }
+    }
+
+    /// Starts another document beside the served one and goes to it. A page of no server has nowhere to
+    /// keep a second one.
+    fn start_document(&mut self) {
+        let Some((space, folder)) = self.folder() else { return };
+        // A document shared from elsewhere has no folder of the person's: they choose one on the server's pages.
+        let Some(space) = space else { return self.leave(paths::HOME_PAGE.to_owned()) };
+        let body = serde_json::to_vec(&letters_api::NewDocument { folder, name: None }).unwrap_or_default();
+        let asked = browser::ask(&self.window, "POST", &paths::documents(&space), Some((letters_api::JSON, &body)));
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let answer = asked.await;
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            let made = answer
+                .map(|entry| serde_json::from_slice::<letters_api::Entry>(&entry).ok().and_then(|entry| entry.id));
+            match made {
+                Ok(Some(id)) => shell.leave(paths::editor_page(&id)),
+                Ok(None) => shell.say("The server's answer could not be read.".to_owned()),
+                Err(refusal) => shell.say(refusal.message),
+            }
+            shell.sync();
+        });
+    }
+
+    /// Goes to another of the server's pages, once the server has what the person wrote on this one.
+    fn leave(&mut self, to: String) {
+        self.leaving = Some(to);
+    }
+
+    /// Whether the page holds work its server lacks.
+    fn unsent(&self) -> bool {
+        let saved = self.client.as_ref().is_none_or(|client| !self.attached || client.progress() == Progress::Saved);
+        self.uploading > 0 || !saved
+    }
+
+    /// Leaves for the page the person asked for, if nothing written here would be lost with this one.
+    fn go(&mut self) {
+        if self.leaving.is_none() || self.uploading > 0 {
+            return;
+        }
+        match self.client.as_ref().filter(|_| self.attached).map(Client::progress) {
+            // It is on its way, and the page goes once it is there.
+            Some(Progress::Saving) => {}
+            Some(Progress::Edited) => {
+                self.leaving = None;
+                self.say("What you wrote is not with the server yet. Try again once the bar says Saved.".to_owned());
+            }
+            _ => {
+                if let Some(to) = self.leaving.take() {
+                    report(self.window.location().assign(&to));
+                }
+            }
+        }
+    }
+
+    // The person's settings
+
+    /// Asks the server what the person set for themselves, on whatever device. The page starts with
+    /// what this browser kept, so that it does not change its look once it shows.
+    fn ask_settings(&mut self) {
+        if self.server.is_none() {
+            return;
+        }
+        let asked = browser::ask(&self.window, "GET", paths::SETTINGS, None);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            // A server that does not say leaves the person with what this browser kept.
+            let Ok(settings) = asked.await.map(|answer| serde_json::from_slice(&answer)) else { return };
+            let (Ok(settings), Some(shell)) = (settings, shell.upgrade()) else { return };
+            let mut shell = shell.borrow_mut();
+            shell.take_settings(settings);
+            shell.arrived();
+        });
+    }
+
+    /// Takes what the server keeps for the person, in place of what this browser kept. The words and the
+    /// default style this browser has and the server lacks are theirs too, and the server is told.
+    fn take_settings(&mut self, theirs: letters_api::Settings) {
+        let settings = Settings {
+            appearance: match theirs.appearance {
+                Some(letters_api::Appearance::Light) => Appearance::Light,
+                Some(letters_api::Appearance::Dark) => Appearance::Dark,
+                None => Appearance::System,
+            },
+            accent: theirs.accent,
+            name: theirs.name.clone(),
+            language: theirs.language.clone(),
+        };
+        self.platform.keep_settings(&settings);
+        let mut words = theirs.dictionary.clone();
+        let ours = self.platform.user_words();
+        words.extend(ours.into_iter().filter(|word| !theirs.dictionary.contains(word)));
+        self.platform.keep_user_words(&words);
+        if let Some(style) = &theirs.default_style {
+            self.platform.keep_default_style(&style.to_string());
+        }
+        self.view.set_user_words(words);
+        self.view.set_default_style(self.platform.default_style());
+        // Without a name of their own choosing, the person is who the server says they are.
+        if let (None, Some(server)) = (&settings.name, &self.server) {
+            self.view.set_author(&server.author);
+        }
+        follow(&mut self.view, settings);
+        self.fit();
+        self.account = Some(theirs);
+        self.keep_settings();
+    }
+
+    /// Has the server keep what the person set, where it differs from what the server has. The server
+    /// keeps the whole as it is sent.
+    fn keep_settings(&mut self) {
+        let Some(kept) = &self.account else { return };
+        let set = self.view.settings();
+        let ours = letters_api::Settings {
+            name: set.name.clone(),
+            language: set.language.clone(),
+            appearance: match set.appearance {
+                Appearance::Light => Some(letters_api::Appearance::Light),
+                Appearance::Dark => Some(letters_api::Appearance::Dark),
+                Appearance::System => None,
+            },
+            accent: set.accent,
+            dictionary: self.platform.user_words(),
+            default_style: self.platform.kept_default_style().or_else(|| kept.default_style.clone()),
+        };
+        if ours == *kept {
+            return;
+        }
+        let Ok(body) = serde_json::to_vec(&ours) else { return };
+        let sent = browser::ask(&self.window, "PUT", paths::SETTINGS, Some((letters_api::JSON, &body)));
+        self.account = Some(ours);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Err(refusal) = sent.await else { return };
+            let Some(shell) = shell.upgrade() else { return };
+            // The settings hold in this browser, and the person knows that they are nowhere else.
+            shell.borrow().say(refusal.message);
+        });
+    }
+
     // The line to the server
 
     /// Starts the served document's line to its server. The socket is asked for at once, beside the
@@ -1745,7 +2060,11 @@ impl Shell {
         client.start(now);
         self.client = Some(client);
         self.quiet_until = Some(now + QUIET_MS);
-        self.edits = server.role >= letters_api::Role::Editor;
+        self.role = match server.role {
+            letters_api::Role::Reader => Role::Reader,
+            letters_api::Role::Commenter => Role::Commenter,
+            letters_api::Role::Editor | letters_api::Role::Owner => Role::Editor,
+        };
         self.allow();
         self.pump();
     }
@@ -1757,7 +2076,8 @@ impl Shell {
         }
         self.hang_up();
         // The window that shows the other document is a new one.
-        (self.attached, self.told, self.quiet_until, self.peers_at, self.writing) = (false, None, None, None, true);
+        (self.attached, self.told, self.quiet_until, self.peers_at) = (false, None, None, None);
+        (self.access, self.held) = (Access::Edits, false);
         self.beat_at();
     }
 
@@ -1791,7 +2111,11 @@ impl Shell {
                 // The bar is told how the link and saving stand with every look, in `sync`.
                 letters_sync::Event::Link => {
                     if let Some(Link::Live(role)) = self.client.as_ref().map(Client::link) {
-                        (self.edits, self.quiet_until) = (role.edits(), None);
+                        (self.role, self.quiet_until) = (role, None);
+                        // Back after a while without the server, the document may be called otherwise.
+                        if self.sockets > 1 {
+                            self.look();
+                        }
                     }
                 }
                 letters_sync::Event::Progress => {}
@@ -1857,16 +2181,33 @@ impl Shell {
         Ok(())
     }
 
-    /// Lets the person write in the document, or only read it. What is written before the server's
-    /// history is the document's would have no place in it, and a role may read and not write.
+    /// Tells the window what the person may do with the document: what their role allows, and nothing
+    /// but reading until the server's history is the document's, since what is written before would have
+    /// no place in it.
     fn allow(&mut self) {
-        let may = self.client.is_none() || (self.attached && self.edits);
-        if may != self.writing {
-            self.writing = may;
-            _ = self.view.change(|editor| {
-                editor.set_read_only(!may);
-                Ok::<_, Infallible>(Change::default())
-            });
+        let waits = self.client.is_some() && !self.attached;
+        let access = match self.role {
+            _ if self.client.is_none() => Access::Edits,
+            // A wait the person notices is told by the bar. A shorter one changes nothing they see.
+            _ if waits && self.quiet_until.is_none() => Access::Reads,
+            Role::Editor => Access::Edits,
+            Role::Commenter => Access::Comments,
+            Role::Reader => Access::Reads,
+        };
+        if access != self.access {
+            self.access = access;
+            self.view.set_access(access);
+        }
+        // For that shorter wait the window offers its tools, and the editor writes nothing.
+        let held = waits && access == Access::Edits;
+        if held != self.held {
+            self.held = held;
+            if access == Access::Edits {
+                _ = self.view.change(|editor| {
+                    editor.set_read_only(held);
+                    Ok::<_, Infallible>(Change::default())
+                });
+            }
         }
     }
 
@@ -1884,7 +2225,7 @@ impl Shell {
         self.view = view;
         self.backed();
         // The new window is told of the link and the others anew, and lets the person write until told.
-        (self.connection, self.peers_at, self.writing) = (None, None, true);
+        (self.connection, self.peers_at, self.access, self.held) = (None, None, Access::Edits, false);
         (self.kept, self.written, self.rested, self.session) = (self.view.edits(), self.view.edits(), None, None);
         self.text = TextInput::new(self.mac);
         self.touch = Touch::default();

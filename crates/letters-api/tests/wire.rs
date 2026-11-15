@@ -73,6 +73,7 @@ fn every_body_reads_back_as_written() {
         id: "doc-1".into(),
         created: "2026-11-14T09:00:00Z".into(),
         name: "Roof quote".into(),
+        named: false,
         space: None,
         path: String::new(),
         role: Role::Commenter,
@@ -125,6 +126,16 @@ fn a_reader_lives_with_a_newer_writer() {
     assert_eq!(tag, Tag::Unknown);
     let action: Action = serde_json::from_value(json!("exported")).expect("it reads");
     assert_eq!(action, Action::Other);
+}
+
+#[test]
+fn a_document_an_older_server_opens_has_a_name_of_its_own() {
+    let opened: Opened = serde_json::from_value(json!({
+        "id": "doc-1", "created": "2026-11-14T09:00:00Z", "name": "Untitled", "role": "editor", "author": "Ben",
+        "socket": paths::socket("doc-1"), "trust": "trusted", "allows": Allows::default()
+    }))
+    .expect("what is left out takes its default");
+    assert!(opened.named, "a shell renames nothing it was not told to");
 }
 
 #[test]
@@ -195,6 +206,7 @@ fn an_address_keeps_each_part_in_its_place() {
         (paths::document("a/b?c#d"), "/api/v1/documents/a%2Fb%3Fc%23d"),
         (paths::file("../../etc"), "/api/v1/documents/..%2F..%2Fetc/file"),
         (paths::assets("doc 1"), "/api/v1/documents/doc%201/assets"),
+        (paths::merge_conflicts("doc 1"), "/api/v1/documents/doc%201/merge-conflicts"),
         (paths::asset("doc 1", "ab12.png"), "/api/v1/documents/doc%201/assets/ab12.png"),
         (paths::sign_in_page("/d/a?b=c"), "/auth/sign-in?then=%2Fd%2Fa%3Fb%3Dc"),
         (paths::entries("home", ""), "/api/v1/spaces/home/entries"),

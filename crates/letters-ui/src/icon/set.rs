@@ -79,12 +79,18 @@ pub const HEADING_3: Icon = Icon::new("M4 12h8M4 18V6M12 18V6M17.5 10.5c1.7-1 3.
 pub const HIGHLIGHTER: Icon = Icon::new("M9 11l-6 6v3h9l3-3M22 12l-4.6 4.6a2 2 0 0 1-2.8 0l-5.2-5.2a2 2 0 0 1 0-2.8L14 4");
 /// `history`
 pub const HISTORY: Icon = Icon::new("M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8M3 3v5h5M12 7v5l4 2");
+/// `hourglass`
+pub const HOURGLASS: Icon = Icon::new("M5 22h14M5 2h14M17 22v-4.172a2 2 0 0 0-.586-1.414L12 12l-4.414 4.414A2 2 0 0 0 7 17.828V22M7 2v4.172a2 2 0 0 0 .586 1.414L12 12l4.414-4.414A2 2 0 0 0 17 6.172V2");
 /// `image`
 pub const IMAGE: Icon = Icon::new("M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2zM7 9a2 2 0 1 0 4 0a2 2 0 1 0 -4 0M21 15l-3.086-3.086a2 2 0 0 0-2.828 0L6 21");
+/// `infinity`
+pub const INFINITY: Icon = Icon::new("M6 16c5 0 7-8 12-8a4 4 0 0 1 0 8c-5 0-7-8-12-8a4 4 0 1 0 0 8");
 /// `info`
 pub const INFO: Icon = Icon::new("M2 12a10 10 0 1 0 20 0a10 10 0 1 0 -20 0M12 16v-4M12 8h.01");
 /// `italic`
 pub const ITALIC: Icon = Icon::new("M19 4L10 4M14 20L5 20M15 4L9 20");
+/// `key-round`
+pub const KEY_ROUND: Icon = Icon::new("M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4zM16 7.5a0.5 0.5 0 1 0 1 0a0.5 0.5 0 1 0 -1 0");
 /// `line-height`
 pub const LINE_HEIGHT: Icon = Icon::new("M15 14H9M21 21H3M21 3H3M8 16l3.453-7.648a.6.6 0 011.094.001L16 16");
 /// `link`
@@ -143,6 +149,8 @@ pub const SETTINGS: Icon = Icon::new("M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 
 pub const SHIELD: Icon = Icon::new("M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z");
 /// `sigma`
 pub const SIGMA: Icon = Icon::new("M18 7V5a1 1 0 0 0-1-1H6.5a.5.5 0 0 0-.4.8l4.5 6a2 2 0 0 1 0 2.4l-4.5 6a.5.5 0 0 0 .4.8H17a1 1 0 0 0 1-1v-2");
+/// `slash`
+pub const SLASH: Icon = Icon::new("M22 2 2 22");
 /// `square`
 pub const SQUARE: Icon = Icon::new("M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z");
 /// `strikethrough`

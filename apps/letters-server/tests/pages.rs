@@ -6,7 +6,8 @@ use axum::http::StatusCode;
 use common::{Browser, Server, URL, names};
 use letters_api::{Entry, Listing, paths};
 use letters_server::pages::{
-    ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH, RECENT_PAGE, TRASH_PAGE, asking,
+    ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_SHARE, ACT_TRASH, ACT_UNSHARE,
+    RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking,
 };
 
 /// What the folder at `path` of a space holds, as the interface tells the browser's own session.
@@ -29,7 +30,9 @@ async fn a_browser_with_no_session_is_shown_the_way_in() {
     let front = page(&mut visitor, paths::HOME_PAGE).await;
     assert!(front.contains(&paths::sign_in_page(paths::HOME_PAGE)), "the front page offers to sign in");
     // A page deeper in comes back to itself once the person has signed in.
-    for path in ["/s/family/House?ask=rename&id=x", RECENT_PAGE, TRASH_PAGE, "/d/some-id", "/d/some-id/read"] {
+    let deeper =
+        ["/s/family/House?ask=rename&id=x", RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, "/d/some-id", "/d/some-id/read"];
+    for path in deeper {
         let raw = visitor.get(path).await;
         assert_eq!(raw.location(), paths::sign_in_page(path), "{path}");
         assert!(!raw.text().contains("House"), "{path} tells nothing");
@@ -67,7 +70,7 @@ async fn a_folders_page_lists_it_and_offers_what_the_role_allows() {
     assert!(editors.contains(ACT_NEW_DOCUMENT) && editors.contains(ACT_NEW_FOLDER));
 
     // Each question opens over the folder, as a form that goes where the answer is taken.
-    for (what, act) in [("rename", ACT_RENAME), ("move", ACT_MOVE), ("trash", ACT_TRASH)] {
+    for (what, act) in [("rename", ACT_RENAME), ("move", ACT_MOVE), ("trash", ACT_TRASH), ("share", ACT_SHARE)] {
         let ask = asking(&here, what, &id);
         assert!(editors.contains(&ask.replace('&', "&amp;")), "the row asks to {what}");
         assert!(!editors.contains(act), "no question is open until one is asked");
@@ -77,10 +80,12 @@ async fn a_folders_page_lists_it_and_offers_what_the_role_allows() {
     let mut guest = server.reader("guest", &["friends"]);
     let readers = page(&mut guest, &here).await;
     assert!(readers.contains(&format!("href=\"{}\"", paths::read_page(&id))), "a reader can read it");
-    for offer in [ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, "ask=rename", "ask=trash"] {
+    for offer in [ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, "ask=rename", "ask=trash", "ask=share"] {
         assert!(!readers.contains(offer), "a reader is not offered {offer}");
     }
-    assert!(!page(&mut guest, &asking(&here, "trash", &id)).await.contains(ACT_TRASH), "nor by address");
+    for (what, act) in [("trash", ACT_TRASH), ("share", ACT_SHARE)] {
+        assert!(!page(&mut guest, &asking(&here, what, &id)).await.contains(act), "nor by address to {what}");
+    }
 
     // What is out of reach is not there, and says nothing of what is.
     let mut stranger = server.reader("stranger", &[]);
@@ -119,6 +124,58 @@ async fn the_forms_make_rename_move_and_throw_away() {
     ben.fill(ACT_TRASH, &[("id", &id), ("back", &top)]).await;
     assert_eq!(names(&listed(&ben, "family", "").await), ["House"]);
     assert!(page(&mut ben, TRASH_PAGE).await.contains("Roof"), "the trash lists it");
+}
+
+#[tokio::test]
+async fn the_share_dialog_shares_a_document_and_whoever_it_names_finds_it() {
+    let server = Server::new("share-form");
+    let (mut ada, mut ben) = (server.reader("ada", &[]), server.reader("ben", &[]));
+    let id = ada.pages().start("home", "", "Plan").await.id.unwrap();
+    let here = paths::folder_page("home", "");
+    let ask = asking(&here, "share", &id);
+    let about = [("id", id.as_str()), ("back", here.as_str())];
+
+    // Who to is offered by the dialog, and taken as the dialog wrote it. It is shown again afterwards.
+    assert!(page(&mut ada, &ask).await.contains("value=\"p:sub-ben\""), "whoever has signed in is offered");
+    let shared = ada.fill(ACT_SHARE, &[about[0], about[1], ("to", "p:sub-ben"), ("role", "commenter")]).await;
+    assert_eq!(shared.location(), ask);
+    let dialog = page(&mut ada, &ask).await;
+    assert!(dialog.contains(ACT_UNSHARE) && dialog.contains("Commenter"), "the dialog lists who it is shared with");
+
+    // Ben finds it among what is shared with him, with whose it is, and is asked nothing about its place.
+    let theirs = page(&mut ben, SHARED_PAGE).await;
+    assert!(theirs.contains(&format!("href=\"{}\"", paths::editor_page(&id))) && theirs.contains("Ada"), "{theirs}");
+    assert!(!theirs.contains("ask="), "a shared document is not his to move, throw away or share");
+    let taken = ben.fill(ACT_UNSHARE, &[about[0], about[1], ("to", "p:sub-ben")]).await;
+    assert!(taken.location().contains("error=forbidden"), "{}", taken.location());
+
+    let taken = ada.fill(ACT_UNSHARE, &[about[0], about[1], ("to", "p:sub-ben")]).await;
+    assert_eq!(taken.location(), ask);
+    assert!(!page(&mut ben, SHARED_PAGE).await.contains("Plan"), "what is no longer shared is not listed");
+}
+
+#[tokio::test]
+async fn a_conflict_copy_offers_its_merge_to_whoever_may_edit_and_nothing_else() {
+    let server = Server::new("merge-form");
+    let mut ben = server.reader("ben", &["family"]);
+    let id = ben.pages().start("family", "", "Plan").await.id.unwrap();
+    let (family, copy) = (server.scratch.0.join("family"), "Plan (conflicted copy 2026-11-15)");
+    std::fs::copy(family.join("Plan.let"), family.join(format!("{copy}.let"))).unwrap();
+    let here = paths::folder_page("family", "");
+
+    let editors = page(&mut ben, &here).await;
+    assert!(editors.contains(ACT_MERGE) && editors.contains("Merge conflicts"), "the copy's row offers the merge");
+    // The copy has the id of its original, so a link or a menu on its row would act on the original.
+    let opens = format!("href=\"{}\"", paths::editor_page(&id));
+    assert_eq!(editors.matches(&opens).count(), 1, "only the original's row opens the document");
+    let mut guest = server.reader("guest", &["friends"]);
+    let readers = page(&mut guest, &here).await;
+    assert!(readers.contains(copy) && !readers.contains(ACT_MERGE), "a reader sees the copy and is offered nothing");
+
+    let merged = ben.fill(ACT_MERGE, &[("id", &id), ("back", &here)]).await;
+    assert_eq!(merged.location(), here);
+    assert_eq!(names(&listed(&ben, "family", "").await), ["Plan"]);
+    assert!(page(&mut ben, TRASH_PAGE).await.contains(copy), "the copy waits in the trash");
 }
 
 #[tokio::test]
@@ -202,7 +259,7 @@ async fn a_document_reads_as_a_page_that_runs_nothing() {
     let policy = raw.header("content-security-policy");
     assert!(policy.contains("default-src 'none'") && !policy.contains("script-src"), "{policy}");
     assert_eq!(raw.header("cache-control"), "no-store");
-    // Until the editor is part of the server, a document opens to read.
+    // A server that was built with no editor opens a document to read.
     assert_eq!(ben.get(&paths::editor_page(&id)).await.location(), paths::read_page(&id));
     assert!(page(&mut ben, RECENT_PAGE).await.contains("Plan"), "what was read is among the recent");
 

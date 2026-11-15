@@ -608,6 +608,87 @@ fn a_frame_a_device_cannot_read_costs_it_the_socket_and_nothing_else() {
     assert_eq!(texts(world.devices[ada].document())[0], "Mine. Hello world");
 }
 
+/// The update of issue 2: its checksum is sound, and the history library's debug assertions panic on it.
+const TRIPS: &[u8] = include_bytes!("../../../fuzz/corpus/history/bytes-after-a-block-header.bin");
+
+#[test]
+fn an_update_the_history_library_trips_on_is_refused_and_the_room_goes_on() {
+    let (mut world, ada, ben) = editors();
+    let before = world.state.files.clone();
+    world.forge(ben, &ClientMessage::Edits { seq: 5, updates: TRIPS.to_vec() }.encode());
+    world.settle();
+
+    let refused = ServerMessage::Refused { seq: 5, why: Refusal::Unreadable };
+    assert!(world.told.iter().any(|(_, message)| *message == refused), "{:?}", world.told.last());
+    assert_eq!(world.state.files, before, "nothing of it is kept");
+    assert_eq!(texts(world.held()), texts(&doc()));
+
+    // The document goes on, for the device that sent it too once it is back.
+    world.advance(5_000);
+    let number = world.edit(ada, [typed("p", 0, "After. ")]);
+    world.settle();
+    assert!(world.devices[ada].holds(number));
+    assert_eq!(texts(world.devices[ben].document())[0], "After. Hello world");
+}
+
+/// A history and three updates to it that fuzzing made, each with a sound checksum, as `letters-model`
+/// keeps them: the history library panics as the first lands, cannot write out a history that holds the
+/// second, and reads the third differently once it is saved.
+#[test]
+fn an_update_that_would_cost_the_room_its_document_is_refused() {
+    let base = include_bytes!("../../letters-model/tests/corpus/strangers/base.bin");
+    let harmful: [(&str, &[u8]); 3] = [
+        ("it panics as it lands", include_bytes!("../../letters-model/tests/corpus/strangers/update-panics.bin")),
+        ("its save cannot be read", include_bytes!("../../letters-model/tests/corpus/strangers/update-unwritable.bin")),
+        (
+            "it reads differently saved",
+            include_bytes!("../../letters-model/tests/corpus/strangers/update-diverges.bin"),
+        ),
+    ];
+    for (what, update) in harmful {
+        let (mut world, ada, ben) = editors();
+        // The history the update was made for comes first, as a device's work.
+        world.forge(ben, &ClientMessage::Edits { seq: 1, updates: base.to_vec() }.encode());
+        world.settle();
+        assert!(world.told.iter().any(|(_, message)| *message == ServerMessage::Held { seq: 1 }), "{what}");
+        let before = (texts(world.held()), world.state.files.clone());
+
+        world.forge(ben, &ClientMessage::Edits { seq: 2, updates: update.to_vec() }.encode());
+        world.settle();
+        let refused = ServerMessage::Refused { seq: 2, why: Refusal::Unreadable };
+        assert!(world.told.iter().any(|(_, message)| *message == refused), "{what}: {:?}", world.told.last());
+        assert_eq!((texts(world.held()), world.state.files.clone()), before, "{what}: nothing of it is kept");
+
+        // The document goes on, and its file reads as the room holds it.
+        world.advance(5_000);
+        let number = world.edit(ada, [typed("p", 0, "After. ")]);
+        world.settle();
+        assert!(world.devices[ada].holds(number), "{what}");
+        world.flush().unwrap();
+        assert_eq!(texts(&world.folder.read_document(NAME).0), texts(world.held()), "{what}");
+        assert_eq!(texts(world.devices[ben].document()), texts(world.held()), "{what}");
+    }
+}
+
+#[test]
+fn the_host_can_tell_a_session_that_keeps_sending_what_cannot_be_read() {
+    let (mut world, ada, ben) = editors();
+    world.edit(ada, [typed("p", 0, "Sound. ")]);
+    let (sound, odd) = (world.devices[ada].session.unwrap(), world.devices[ben].session.unwrap());
+    // A sound device hangs up at the first refusal. This one goes on.
+    for seq in 1..=3 {
+        world.forge(ben, &ClientMessage::Edits { seq, updates: TRIPS.to_vec() }.encode());
+    }
+    let room = world.room.as_mut().unwrap();
+    assert_eq!((room.unreadable(sound), room.unreadable(odd)), (0, 3));
+
+    // What the host does about it is its own rule. The room ends the session when told to.
+    room.dismiss(odd, Refusal::Unreadable);
+    assert_eq!((room.sessions(), room.unreadable(odd)), (1, 0));
+    world.settle();
+    assert_eq!(texts(world.devices[ada].document())[0], "Sound. Hello world");
+}
+
 #[test]
 fn edits_that_build_on_some_the_room_never_saw_are_not_held() {
     let (mut world, ada, ben) = editors();

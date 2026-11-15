@@ -48,7 +48,9 @@ fn with(name: &str, then: impl FnOnce(&Target) -> std::io::Result<()>) -> ExitCo
 #[cfg(fuzzing)]
 fn fuzz(target: &Target) -> std::io::Result<()> {
     let run = target.run;
-    afl::fuzz!(|data: &[u8]| run(data));
+    // Not `fuzz!`, whose hook ends the process at a panic, before a target that catches one gets to. A
+    // panic that leaves the target still ends the process, and is a finding.
+    afl::fuzz_nohook!(|data: &[u8]| run(data));
     Ok(())
 }
 

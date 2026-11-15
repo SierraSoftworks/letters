@@ -21,6 +21,18 @@ use crate::store::{Batch, Store, StoreError, Table};
 
 /// What a new document is called until its first heading names it.
 pub const UNTITLED: &str = "Untitled";
+
+/// Whether `name` is what a document with no name of its own is called: "Untitled", or "Untitled 2" and
+/// so on. The name alone says so, since other writers of a folder start documents the same way.
+pub fn untitled(name: &str) -> bool {
+    match name.strip_prefix(UNTITLED) {
+        Some("") => true,
+        Some(rest) => {
+            rest.strip_prefix(' ').is_some_and(|count| !count.is_empty() && count.bytes().all(|c| c.is_ascii_digit()))
+        }
+        None => false,
+    }
+}
 /// How long a root is taken as scanned. A lost document is looked for again only after that, so asking
 /// for ids that do not exist cannot keep the server walking its folders.
 const SCAN_REST: u64 = 30;
@@ -280,9 +292,11 @@ impl Library {
         let (folder, name) = place.split();
         let mut folder = root.folder(&folder)?;
         let mut ours = Archive::open(BufReader::new(folder.open(name)?))?;
-        let mut copy = WorkingCopy::open(&mut ours, ReplicaId::new(&ids::block_id()))?;
+        // Neither file is the server's own writing: a wary copy checks both histories before it loads them.
+        let mut copy = WorkingCopy::open_wary(&mut ours, ReplicaId::new(&ids::block_id()))?;
         copy.merge_from(theirs).map_err(|error| match error {
             letters_format::Error::Unmerged => Refusal::invalid("That file shares nothing with the document."),
+            letters_format::Error::History(_) => Refusal::invalid("That file's history cannot be merged."),
             error => error.into(),
         })?;
         let (token, day) = (ids::block_id(), ids::rfc3339(now));
@@ -414,8 +428,9 @@ fn read(folder: &Folder, listed: &Listed) -> Known {
     let Ok(mut archive) = Archive::open(BufReader::new(file)) else { return damaged };
     let manifest = archive.manifest();
     let (id, created) = (Some(manifest.id.clone()), Some(manifest.created.clone()));
-    // Who wrote it is in the history. The replica only reads, so any id will do for it.
-    let history = archive.read(OPLOG).ok().flatten();
+    // Who wrote it is in the history, which is checked first: a folder holds whatever was put there. The
+    // replica only reads, so any id will do for it.
+    let history = archive.read(OPLOG).ok().flatten().filter(|history| Model::check(history).is_ok());
     let model = history.and_then(|history| Model::load(&history, ReplicaId::from(0)).ok());
     let contributors = model.map(|model| model.authors().into_iter().filter(|name| !name.is_empty()).collect());
     let open = |notes: letters_model::Notes| {

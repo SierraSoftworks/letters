@@ -22,6 +22,10 @@ letters-trust.workspace = true
 letters-convert.workspace = true
 letters-ui.workspace = true
 letters-fonts.workspace = true
+# The page a document is sent to a browser in. The editor that page runs is compiled in by the build
+# script, from what `apps/letters-web/build.sh` made.
+letters-web = { path = "../letters-web" }
+brotli-decompressor.workspace = true
 
 axum.workspace = true
 tokio.workspace = true
@@ -33,14 +37,22 @@ ureq.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
+argon2.workspace = true
 getrandom.workspace = true
 jiff.workspace = true
 yew.workspace = true
 yewi.workspace = true
 
+[build-dependencies]
+brotli.workspace = true
+
 [dev-dependencies]
+brotli.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
 zip.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tungstenite.workspace = true
+# A site for the server's fetches to be tried against.
+rcgen.workspace = true
+rustls.workspace = true

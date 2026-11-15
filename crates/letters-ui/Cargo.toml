@@ -20,6 +20,7 @@ letters-layout.workspace = true
 letters-editor.workspace = true
 letters-convert.workspace = true
 letters-math.workspace = true
+letters-api.workspace = true
 image.workspace = true
 accesskit.workspace = true
 yewi-highlight.workspace = true

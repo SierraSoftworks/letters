@@ -51,7 +51,7 @@ use crate::element::{Cursor, Element, Paint, Pointer};
 use crate::highlight;
 use crate::icon;
 use crate::notes;
-use crate::opening::{MONTHS, WEEKDAYS};
+use crate::opening::{clock, date_called, day, day_called};
 use crate::paint::scrollbar;
 use crate::pictures;
 use crate::review;
@@ -238,8 +238,7 @@ impl Version {
 
     /// The time of day it was last written at, on the person's clock.
     fn clock(&self, zone: i32) -> Option<String> {
-        let of_day = local(self.time, zone).rem_euclid(86_400);
-        (self.time > 0).then(|| format!("{:02}:{:02}", of_day / 3_600, of_day / 60 % 60))
+        (self.time > 0).then(|| clock(self.time, zone))
     }
 
     /// What it is listed as: its name, what made it a version, or else the time it was written at. `first`
@@ -287,36 +286,13 @@ impl Version {
         if self.time == 0 {
             return "Undated".to_owned();
         }
-        let day = day(self.time, zone);
-        match today.map(|today| today - day) {
-            Some(0) => "Today".to_owned(),
-            Some(1) => "Yesterday".to_owned(),
-            Some(2..7) => WEEKDAYS[(day + 4).rem_euclid(7) as usize].to_owned(),
-            _ => self.date(today, zone),
-        }
+        day_called(day(self.time, zone), today)
     }
 
     /// The date it was written on: "6 Nov", with its year where that is not plain.
     fn date(&self, today: Option<i64>, zone: i32) -> String {
-        let day = day(self.time, zone);
-        let (year, month, date) = notes::date(u64::try_from(day).unwrap_or_default());
-        let month = MONTHS[(month.clamp(1, 12) - 1) as usize];
-        match today.map(|today| today - day) {
-            // A date without its year is plain for most of a year back.
-            Some(0..300) => format!("{date} {month}"),
-            _ => format!("{date} {month} {year}"),
-        }
+        date_called(day(self.time, zone), today)
     }
-}
-
-/// A moment on the person's clock, which is `zone` minutes ahead of UTC.
-fn local(seconds: u64, zone: i32) -> i64 {
-    i64::try_from(seconds).unwrap_or(i64::MAX).saturating_add(i64::from(zone) * 60)
-}
-
-/// The day a moment falls on where the person is, counted from 1970.
-fn day(seconds: u64, zone: i32) -> i64 {
-    local(seconds, zone).div_euclid(86_400)
 }
 
 /// A count of characters as the panel has room for it: in thousands from ten thousand on.
@@ -1728,8 +1704,9 @@ impl History {
     /// Fills the bar while the history shows: the way back, what the version is of and when it was
     /// written, what it is compared with, the button that restores it, and a menu that saves a copy of
     /// it. A narrow window has the bar folded. `told` is what there is to say of a copy that was just
-    /// written, which the menu's button says, and `keys` the keys that ask for a copy.
-    pub fn bar(&self, bar: TopBar<Message>, name: &str, told: Option<&str>, keys: &str) -> TopBar<Message> {
+    /// written, which the menu's button says, and `keys` the keys that ask for a copy: `None` where no
+    /// copy is to be had, and the bar is without the menu.
+    pub fn bar(&self, bar: TopBar<Message>, name: &str, told: Option<&str>, keys: Option<&str>) -> TopBar<Message> {
         if let Some(passage) = &self.passage {
             return self.passage_bar(passage, bar, name);
         }
@@ -1773,7 +1750,15 @@ impl History {
             .middle(compare)
             .middle(TopBar::rule())
             .middle(naming(Button::new("Name").icon(icon::TAG)))
-            .middle(restore(Button::new("Restore this version").icon(icon::ROTATE_CCW)));
+            .middle(restore(Button::new("Restore this version").icon(icon::ROTATE_CCW)))
+            .form(FORMS.1)
+            .start(Button::icon_only(icon::ARROW_LEFT, "Back to editing").small().on_press(back))
+            .start(name())
+            .middle(Element::from(Button::new(with).small().menu(compares)).description("Compare with"))
+            .middle(TopBar::rule())
+            .middle(naming(Button::icon_only(icon::TAG, "Name")))
+            .middle(restore(Button::icon_only(icon::ROTATE_CCW, "Restore this version")));
+        let Some(keys) = keys else { return bar };
         // A copy of the version is asked for where the bar has its other commands while the page is edited.
         let copy = |format: CopyFormat| Message::Copy(Copying::Open(format));
         let menu = Menu::new()
@@ -1791,14 +1776,7 @@ impl History {
             Some(told) => more.tooltip(told, widgets::Side::Bottom).telling(true),
             None => more,
         };
-        bar.form(FORMS.1)
-            .start(Button::icon_only(icon::ARROW_LEFT, "Back to editing").small().on_press(back))
-            .start(name())
-            .middle(Element::from(Button::new(with).small().menu(compares)).description("Compare with"))
-            .middle(TopBar::rule())
-            .middle(naming(Button::icon_only(icon::TAG, "Name")))
-            .middle(restore(Button::icon_only(icon::ROTATE_CCW, "Restore this version")))
-            .end(more)
+        bar.end(more)
     }
 
     /// Fills the bar while the history is of a passage: the way back, what shows, the way to every
