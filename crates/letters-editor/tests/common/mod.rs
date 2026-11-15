@@ -39,6 +39,8 @@ const TONES: [(&str, Tone); 4] =
 #[derive(Default)]
 pub struct Fake {
     pub now: u64,
+    /// The time of day, for a writer whose edits are dated.
+    pub clock: Option<u64>,
     pub clip: Option<Clip>,
     pub wrap: Option<Wrapped>,
     /// What this writer's new ids start with, so that two writers never make the same one.
@@ -49,6 +51,9 @@ pub struct Fake {
 impl Platform for Fake {
     fn now_ms(&self) -> u64 {
         self.now
+    }
+    fn wall_time(&self) -> Option<u64> {
+        self.clock
     }
     fn clipboard_read(&mut self) -> Option<Clip> {
         self.clip.clone()

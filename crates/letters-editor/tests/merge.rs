@@ -62,6 +62,32 @@ fn undo_takes_back_only_this_writers_edits() {
 }
 
 #[test]
+fn edits_carry_their_writer_and_the_time_the_platform_tells() {
+    // On the minute, as edits are dated to the minute.
+    const MORNING: u64 = 1_800_000_000;
+    let mut ana = Harness::new("p one|");
+    let mut ben = ana.fork(2);
+    for (writer, name, clock) in [(&mut ana, "Ana", Some(MORNING)), (&mut ben, "Ben", None)] {
+        writer.editor.set_author(name);
+        writer.platform.clock = clock;
+    }
+    ana.type_text(" two");
+    ben.play(&[K("Mod+Home"), T("zero ")]);
+    ben.platform.clock = Some(MORNING + 3600);
+    ben.type_text("and ");
+    assert_eq!(ben.editor.model().authors(), ["Ben".to_owned()].into(), "a writer is named from the first edit");
+
+    // Both changed the one paragraph, which a reader of the two histories is told with who and when.
+    let (hers, his) = (ana.editor.model().revision(), ben.editor.model().revision());
+    let mut reader = Model::load(&ana.editor.model().save(), ReplicaId::from(3)).unwrap();
+    reader.merge(&ben.editor.model().save()).unwrap();
+    let found = reader.conflicts(&hers, &his).unwrap();
+    let written: Vec<_> =
+        found.iter().flat_map(|conflict| &conflict.sides).map(|side| (&*side.author, side.edited)).collect();
+    assert_eq!(written, [("Ana", MORNING), ("Ben", MORNING + 3600)]);
+}
+
+#[test]
 fn a_composition_goes_on_through_a_merge() {
     let mut mine = Harness::new("p one |two");
     let mut other = mine.fork(2);

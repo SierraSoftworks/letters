@@ -170,6 +170,10 @@ pub enum Command {
 pub trait Platform {
     /// Milliseconds since an arbitrary start. Only differences are meaningful.
     fn now_ms(&self) -> u64;
+    /// The time of day, in seconds since 1970, which edits are dated with. `None` leaves them undated.
+    fn wall_time(&self) -> Option<u64> {
+        None
+    }
     fn clipboard_read(&mut self) -> Option<Clip>;
     fn clipboard_write(&mut self, clip: Clip);
     /// A new identifier, unique across devices.
@@ -313,6 +317,11 @@ impl Editor {
         &self.model
     }
 
+    /// Names who writes here. Edits made from here on carry the name, for every copy of the document.
+    pub fn set_author(&mut self, name: &str) {
+        self.model.set_author(name);
+    }
+
     /// `None` when the document has nowhere to put a caret.
     pub fn selection(&self) -> Option<&Selection> {
         self.caret.as_ref().map(|caret| &caret.selection)
@@ -404,6 +413,7 @@ impl Editor {
 
     /// Feeds text input. Returns what changed, for layout.
     pub fn input(&mut self, event: InputEvent, platform: &mut dyn Platform) -> Change {
+        self.date(platform);
         self.handle(event, platform);
         std::mem::take(&mut self.change)
     }
@@ -411,12 +421,21 @@ impl Editor {
     /// Feeds a key press. Returns `None` when the key means nothing here, so the shell may use it.
     pub fn key(&mut self, event: KeyEvent, platform: &mut dyn Platform) -> Option<Change> {
         let command = self.keymap.command(&event)?.clone();
+        self.date(platform);
         self.exec(command, platform).then(|| std::mem::take(&mut self.change))
     }
 
     pub fn run(&mut self, command: Command, platform: &mut dyn Platform) -> Change {
+        self.date(platform);
         self.exec(command, platform);
         std::mem::take(&mut self.change)
+    }
+
+    /// Tells the model the time before it is edited, as it has no clock of its own.
+    fn date(&mut self, platform: &dyn Platform) {
+        if let Some(seconds) = platform.wall_time() {
+            self.model.set_time(seconds);
+        }
     }
 
     /// Whether a command has anything to act on, so that a key it is bound to can fall through when not.
