@@ -27,6 +27,8 @@ Export writes FILE as Markdown, one HTML file, a Word document or a PDF, beside 
 Import makes a document beside each Markdown or Word file, leaves the original alone and prints one line
 per file:
   -r, --recursive          Look through the folders inside each PATH as well
+      --pictures-from DIR  Also bring in the pictures Markdown names in DIR, which may be given more than
+                           once. Those under a PATH come along without it; any others stay links
       --json               Print each line as a JSON object
 
 Environment:
@@ -86,6 +88,8 @@ pub struct Import {
     /// Files, and folders whose Markdown and Word files are meant.
     pub paths: Vec<PathBuf>,
     pub recursive: bool,
+    /// Folders outside `paths` that Markdown's pictures may also be read from.
+    pub pictures: Vec<PathBuf>,
     /// Whether each line of the report is a JSON object.
     pub json: bool,
 }
@@ -213,12 +217,18 @@ fn parse_export(args: impl Iterator<Item = OsString>) -> Result<Command, String>
 fn parse_import(args: impl Iterator<Item = OsString>) -> Result<Command, String> {
     let mut import = Import::default();
     let mut only_paths = false;
-    for arg in args {
+    let mut args = args;
+    while let Some(arg) = args.next() {
         match classify(&arg, only_paths) {
             Arg::Flag("--", None) => only_paths = true,
             Arg::Flag("-V" | "--version", None) => return Ok(Command::Version),
             Arg::Flag("-h" | "--help", None) => return Ok(Command::Help),
             Arg::Flag("-r" | "--recursive", None) => import.recursive = true,
+            // The folder is written into the flag after `=`, or is the argument after it.
+            Arg::Flag("--pictures-from", inline) => {
+                let folder = inline.map(OsString::from).or_else(|| args.next());
+                import.pictures.push(folder.ok_or("--pictures-from needs a folder")?.into());
+            }
             Arg::Flag("--json", None) => import.json = true,
             Arg::Flag(name, _) => return Err(format!("import: unknown option {name}")),
             Arg::Path => import.paths.push(arg.into()),

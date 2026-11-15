@@ -14,30 +14,20 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use letters_convert::{
-    ImportNote, PdfInfo, from_docx, import_markdown, markdown_assets, to_docx, to_html, to_markdown, to_pdf,
-};
-use letters_format::{Archive, OPLOG, Package};
+use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf};
+use letters_format::{Archive, OPLOG};
 use letters_layout::Fonts;
-use letters_model::{
-    Anchor, Block, BlockKind, Body, Document, Mark, Model, Note, NoteKind, Notes, ReplicaId, Run, Style,
-};
+use letters_model::{Block, BlockKind, Body, Document, Mark, Model, ReplicaId, Run, Style};
 use serde_json::json;
 
 use crate::cli::{Export, Format, Import, Output};
-use crate::{files, platform};
+use crate::files;
+use crate::import::{Choices, Plan, normal};
 
 /// The extensions of the Markdown files an import looks for in a folder.
 const MARKDOWN: [&str; 2] = ["md", "markdown"];
 /// The extension of the Word files it looks for.
 const WORD: &str = "docx";
-/// How a zip starts, and how the older kind of Word file does. Either is read as Word, whatever its name.
-const WORD_STARTS: [&[u8]; 2] = [b"PK\x03\x04", &[0xd0, 0xcf, 0x11, 0xe0]];
-/// The largest picture an import reads, in bytes. The reader keeps none larger.
-const LARGEST_PICTURE: u64 = 64 << 20;
-/// The name import notes are written under.
-const IMPORTER: &str = "Letters import";
-
 /// Runs `letters export`.
 pub fn export(export: &Export) -> ExitCode {
     match try_export(export) {
@@ -191,9 +181,11 @@ pub fn import(import: &Import) -> ExitCode {
     for path in &import.paths {
         find(path, import.recursive, &mut found);
     }
-    // What was asked for: each folder named, and the folder of each file named.
+    // Pictures come from what was asked for: each folder named, the folder of each file named, and any
+    // folder added for them.
     let folder = |path: &PathBuf| if path.is_dir() { normal(path) } else { normal(path.parent().unwrap_or(path)) };
-    let roots: Vec<PathBuf> = import.paths.iter().map(folder).collect();
+    let roots: Vec<PathBuf> =
+        import.paths.iter().map(folder).chain(import.pictures.iter().map(|path| normal(path))).collect();
     let mut sources = BTreeSet::new();
     found.retain(|(path, error)| error.is_some() || sources.insert(normal(path)));
     if found.is_empty() {
@@ -276,21 +268,8 @@ fn is_word(path: &Path) -> bool {
     path.extension().unwrap_or_default().eq_ignore_ascii_case(WORD)
 }
 
-/// A path from the root with its `.` and `..` worked out, so that two spellings of one file compare equal.
-fn normal(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for part in std::path::absolute(path).unwrap_or_else(|_| path.into()).components() {
-        match part {
-            Component::CurDir => {}
-            Component::ParentDir => _ = out.pop(),
-            part => out.push(part),
-        }
-    }
-    out
-}
-
 /// Makes a document beside one Markdown or Word file. `sources` holds every file of this import, by
-/// [`normal`] path, and `roots` the folders it was asked to bring in.
+/// [`normal`] path, and `roots` the folders its pictures may be read from.
 fn import_file(source: &Path, style: &Style, sources: &BTreeSet<PathBuf>, roots: &[PathBuf]) -> Outcome {
     let failed = |error: &dyn std::fmt::Display| Outcome::Failed { error: error.to_string() };
     let output = source.with_extension(files::EXTENSION);
@@ -298,84 +277,20 @@ fn import_file(source: &Path, style: &Style, sources: &BTreeSet<PathBuf>, roots:
     if output.exists() {
         return Outcome::Skipped { output };
     }
-    let bytes = match fs::read(source) {
-        Ok(bytes) => bytes,
+    let choices = Choices { pictures: roots.to_vec(), comments: true };
+    let mut imported = match Plan::of(source, style) {
+        Ok(plan) => plan.import(&choices),
         Err(error) => return failed(&error),
     };
-    let created = platform::now_rfc3339();
-    let mut package = Package {
-        id: platform::document_id(),
-        created: created.clone(),
-        document: Document::default(),
-        entries: Default::default(),
-    };
-    let mut notes = Vec::new();
-    let simplified = if WORD_STARTS.iter().any(|start| bytes.starts_with(start)) {
-        let word = match from_docx(&bytes, style, &created, &mut platform::block_id) {
-            Ok(word) => word,
-            Err(error) => return failed(&error),
-        };
-        package.document = word.document;
-        // Word's own styles are laid over the user's, so the document looks as it did.
-        package.set_style(&word.style);
-        package.entries.extend(word.assets);
-        // People's comments come along, and are not what the import counts as its notes.
-        notes = word.comments;
-        word.notes
-    } else {
-        let markdown = match String::from_utf8(bytes) {
-            Ok(markdown) => markdown,
-            Err(_) => return failed(&"the file is neither Markdown in UTF-8 nor a Word document"),
-        };
-        let folder = source.parent().unwrap_or(Path::new(""));
-        let read = import_markdown(&markdown, &mut platform::block_id, &mut |path| picture(folder, path, roots));
-        package.document = read.document;
-        package.entries.extend(read.assets);
-        relink(&mut package.document.blocks, folder, sources);
-        package.set_style(style);
-        read.notes
-    };
-    if package.document.blocks.is_empty() {
-        package.document = files::blank();
-    }
-    notes.extend(simplified.iter().map(|note| import_note(note, &created)));
-    if !notes.is_empty() {
-        package.set_notes(&Notes { notes, ..Notes::default() });
-    }
+    relink(&mut imported.package.document.blocks, source.parent().unwrap_or(Path::new("")), sources);
     let mut bytes = Cursor::new(Vec::new());
-    if let Err(error) = letters_format::write(&mut bytes, &package) {
+    if let Err(error) = letters_format::write(&mut bytes, &imported.package) {
         return failed(&error);
     }
     match write(&output, bytes.get_ref(), false) {
-        Ok(()) => Outcome::Imported { output, notes: simplified.len() },
+        Ok(()) => Outcome::Imported { output, notes: imported.notes },
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Outcome::Skipped { output },
         Err(error) => failed(&error),
-    }
-}
-
-/// Reads a picture that a Markdown file in `folder` names by `path`.
-///
-/// A file an import was not asked for is not read: one that the path reaches by climbing out of every
-/// folder of `roots`. A Markdown file from elsewhere could otherwise carry a picture off this machine in
-/// the document made from it.
-fn picture(folder: &Path, path: &str, roots: &[PathBuf]) -> Option<Vec<u8>> {
-    let file = normal(&folder.join(path));
-    let size = fs::metadata(&file).ok().filter(|about| about.is_file())?.len();
-    (size <= LARGEST_PICTURE && roots.iter().any(|root| file.starts_with(root))).then(|| fs::read(&file).ok())?
-}
-
-/// The note that marks, on its block, something the import simplified.
-fn import_note(note: &ImportNote, created: &str) -> Note {
-    Note {
-        id: platform::block_id(),
-        kind: NoteKind::Import,
-        anchor: Anchor::block(note.block.as_str()),
-        author: IMPORTER.into(),
-        created: created.into(),
-        resolved: false,
-        content: vec![Run::plain(note.message.as_str())],
-        replies: Vec::new(),
-        extra: Default::default(),
     }
 }
 

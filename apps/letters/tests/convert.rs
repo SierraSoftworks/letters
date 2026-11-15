@@ -542,6 +542,24 @@ fn pictures_follow_markdown_in_and_out() {
 }
 
 #[test]
+fn import_reads_pictures_from_the_folders_it_is_given() {
+    // What is added to the command, and how many of the two pictures the document then holds.
+    let cases: [(&[&str], usize); 3] =
+        [(&[], 1), (&["--pictures-from", "shared"], 2), (&["--pictures-from=shared", "--pictures-from", "none"], 2)];
+    for (index, (added, expected)) in cases.into_iter().enumerate() {
+        let folder = Folder::new(&format!("pictures-from-{index}"));
+        folder.write("notes/cat.png", PICTURE);
+        // The same picture with a byte after its end, so that the two are kept apart.
+        folder.write("shared/owl.png", [PICTURE, &[0]].concat());
+        folder.write("notes/Pets.md", "![A cat](cat.png)\n\n![An owl](../shared/owl.png)\n");
+
+        let run = folder.letters(&[&["import", "notes/Pets.md"], added].concat());
+        assert!(run.ok, "{added:?}: {}", run.stderr);
+        assert_eq!(pictures(&folder.path("notes/Pets.let")).len(), expected, "{added:?}");
+    }
+}
+
+#[test]
 fn an_export_writes_no_picture_outside_its_folder() {
     let folder = Folder::new("climb");
     let asset = Some("../stolen.png".to_owned());

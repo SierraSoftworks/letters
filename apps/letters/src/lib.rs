@@ -8,6 +8,7 @@
 //! - [`dictionaries`] finds the system's dictionaries for languages other than English.
 //! - [`measure`] checks the performance budgets, and [`baseline`] is the empty window it compares with.
 //! - [`convert`] runs the `export` and `import` subcommands, which need no window.
+//! - [`import`] makes a document of a Markdown or Word file, for that subcommand and for a window.
 
 pub mod app;
 pub mod baseline;
@@ -17,6 +18,7 @@ pub mod convert;
 pub mod dictionaries;
 pub mod files;
 pub mod gpu;
+pub mod import;
 pub mod input;
 pub mod journal;
 pub mod library;
