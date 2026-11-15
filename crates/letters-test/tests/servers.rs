@@ -265,10 +265,11 @@ fn only_a_shell_that_signs_in_to_servers_offers_the_dialog() {
 
 #[test]
 fn a_dialog_that_is_asked_for_takes_the_place_of_another() {
-    let dialogs = ["Servers", "Settings", "Share"];
+    // Open is a card of the window's own for someone signed in to a server.
+    let dialogs = ["Servers", "Settings", "Share", "Open"];
     let pairs = dialogs.iter().flat_map(|first| dialogs.iter().map(move |second| (*first, *second)));
     for (first, second) in pairs.filter(|(first, second)| first != second) {
-        let mut window = signed_in(Vec::new());
+        let mut window = signed_in(vec![server(HOME, "Sam Okafor")]);
         // The commands are reached by their key from under a dialog too.
         for dialog in [first, second] {
             window.key("Mod+Shift+P").type_text(&dialog.to_lowercase()).key("Enter");

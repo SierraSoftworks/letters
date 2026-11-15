@@ -24,6 +24,7 @@ use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
 
+use crate::browsing::{Browsed, Browser, Browsing};
 use crate::callouts::{self, Calling, Callouts};
 use crate::captions::{self, Altering, Captions};
 use crate::chrome::Chrome;
@@ -200,6 +201,8 @@ pub enum Message {
     Sharing(Sharing),
     /// Something the Servers dialog asks.
     Servers(Signing),
+    /// Something the card that opens a server's documents asks.
+    Browse(Browsing),
     /// Brings the page to where someone else who has the document open is, by their session.
     Visit(u64),
     /// Puts the caret at the start of a block and brings the block to the top of the page.
@@ -583,7 +586,9 @@ impl Ui<EditorApp> {
     /// at the start, with none if there are none, and whenever it changes. The Servers dialog, which the
     /// window offers from then on, lists them and asks [`Request::SignIn`] and [`Request::SignOut`].
     pub fn set_servers(&mut self, servers: Vec<Server>) {
-        self.app_mut().servers.listed(servers);
+        let app = self.app_mut();
+        app.browser.signed(&servers);
+        app.servers.listed(servers);
     }
 
     /// Says how far a sign-in has come: see [`SignIn`]. `None` says that none is under way any more: it is
@@ -591,6 +596,19 @@ impl Ui<EditorApp> {
     /// ended, brings the dialog out while it lasts.
     pub fn set_sign_in(&mut self, state: Option<SignIn>) {
         self.app_mut().servers.told(state);
+    }
+
+    /// Says what a place of a server holds: see [`Browsed`]. It answers [`Request::Browse`]. An answer
+    /// about a place the card no longer shows is let go.
+    pub fn set_listing(&mut self, listing: Browsed) {
+        let app = self.app_mut();
+        app.browser.told(listing, &mut app.requests);
+    }
+
+    /// Says that a place a [`Request::Browse`] asked for could not be read, in a sentence that stands by
+    /// itself. The card shows it where the place's documents would be.
+    pub fn refuse_browse(&mut self, why: &str) {
+        self.app_mut().browser.refused(why);
     }
 
     /// Says what the person may take away of the document: see [`Allows`]. A shell says it of a document
@@ -1171,6 +1189,7 @@ pub struct EditorApp {
     panel: Option<Panel>,
     share: Share,
     servers: Servers,
+    browser: Browser,
     /// The address in the link editor while it is open.
     link: Option<String>,
     /// What is typed into one of the style's fields, and the element type it was typed for.
@@ -1287,6 +1306,7 @@ impl EditorApp {
             panel: None,
             share: Share::default(),
             servers: Servers::default(),
+            browser: Browser::default(),
             link: None,
             draft: None,
             styles: Styles::default(),
@@ -2285,6 +2305,7 @@ impl EditorApp {
                 self.commands.close();
                 self.share.close();
                 self.servers.close();
+                self.browser.close();
                 if self.grip.release() {
                     self.drop = None;
                 }
@@ -2491,6 +2512,7 @@ impl EditorApp {
                 self.commands.close();
                 self.share.close();
                 self.servers.close();
+                self.browser.close();
                 if self.grip.release() {
                     self.drop = None;
                 }
@@ -2602,6 +2624,16 @@ impl EditorApp {
         self.dialog.update(Setting::Close, &mut self.settings);
         self.share.close();
         self.servers.close();
+        self.browser.close();
+    }
+
+    /// Does what the card that opens a server's documents asked.
+    fn browse(&mut self, asked: Browsing, platform: &mut dyn Platform) {
+        if asked == Browsing::Show {
+            self.undialog();
+        }
+        let clock = (platform.wall_time(), self.zone);
+        self.browser.update(asked, self.servers.signed_in(), clock, &mut self.requests);
     }
 
     /// Does what the command palette asked. A command that is taken is done as if its key were pressed.
@@ -4174,7 +4206,8 @@ impl EditorApp {
         let waits = self.margin.follows() && (sheet.is_some() || brought());
         if let Some(importing) = &self.importing {
             element = element.popover(importing.card(room));
-        } else if let Some(landing) = &self.landing {
+        } else if let Some(landing) = self.landing.as_ref().filter(|_| !self.browser.open()) {
+            // The card of a server's documents takes the landing card's place while it is out.
             element = element.popover(Self::card(landing, room));
         } else if let Some(copy) = &self.copying {
             element = element.popover(copy.card(self.copies_to(), room));
@@ -5312,7 +5345,10 @@ impl EditorApp {
             Message::Context(asked) => self.contexting(asked, platform),
             Message::Misspelling { back } => self.misspelling(back),
             Message::Open(path) => self.requests.push(Request::Open(path)),
+            // Someone signed in to a server chooses among what it keeps, or a file of the device from there.
+            Message::OpenDialog if !self.servers.signed_in().is_empty() => self.browse(Browsing::Show, platform),
             Message::OpenDialog => self.requests.push(Request::OpenDialog),
+            Message::Browse(asked) => self.browse(asked, platform),
             Message::NewDocument => self.requests.push(Request::New),
             Message::Start => self.start(),
             Message::Rename(message) => self.rename(message),
@@ -5504,6 +5540,7 @@ impl App for EditorApp {
         let over = over.chain(self.merges.card());
         let over = over.chain(self.share.view(&self.name().0, self.connection.is_some(), window.height));
         let over = over.chain(self.servers.view());
+        let over = over.chain(self.browser.view(self.servers.signed_in()));
         let commands = self.commands.open().then(|| {
             let (offers, keymap) = (self.offers(), self.editor.keymap());
             self.commands.view(&offers, keymap, self.mac, bar, window)
@@ -5705,7 +5742,7 @@ impl App for EditorApp {
         }
         // The first character typed over the landing card starts this document with it.
         let typed = matches!(event, InputEvent::Insert(_) | InputEvent::Commit(_) | InputEvent::SetComposition { .. });
-        if self.landing.is_some() && self.importing.is_none() && typed {
+        if self.landing.is_some() && self.importing.is_none() && !self.browser.open() && typed {
             self.start();
             self.edit(platform, |editor, platform| editor.input(event, platform));
         }

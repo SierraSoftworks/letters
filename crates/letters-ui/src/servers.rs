@@ -81,6 +81,11 @@ impl Servers {
         self.servers.is_some()
     }
 
+    /// The servers the person is signed in to.
+    pub fn signed_in(&self) -> &[Server] {
+        self.servers.as_deref().unwrap_or_default()
+    }
+
     /// Puts the dialog away. A sign-in goes on behind it: the browser has it.
     pub fn close(&mut self) {
         (self.open, self.copied) = (false, false);
@@ -276,7 +281,7 @@ fn waiting(said: &str) -> Element<Message> {
 }
 
 /// A server as it is called where it is listed: its address without what every address has.
-fn host(address: &str) -> &str {
+pub(crate) fn host(address: &str) -> &str {
     let address = address.trim_end_matches('/');
     address.strip_prefix("https://").or_else(|| address.strip_prefix("http://")).unwrap_or(address)
 }

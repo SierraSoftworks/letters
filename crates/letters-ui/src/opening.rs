@@ -5,6 +5,7 @@
 use letters_model::{BlockId, Revision};
 use letters_render::Point;
 
+use crate::browsing::Place;
 use crate::chrome::Edge;
 use crate::copying::CopyFormat;
 use crate::notes;
@@ -212,6 +213,17 @@ pub enum Request {
     /// signed in where with `Window::set_servers`.
     SignOut {
         server: String,
+    },
+    /// Say what a place of the server at this address holds, with `Window::set_listing`, or why it could
+    /// not be read with `Window::refuse_browse`. The card that opens a server's documents asks it.
+    Browse {
+        server: String,
+        place: Place,
+    },
+    /// Open the document with this id that the server at this address keeps, as `Open` opens a file.
+    OpenFrom {
+        server: String,
+        id: String,
     },
 }
 

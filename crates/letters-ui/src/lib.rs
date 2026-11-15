@@ -8,6 +8,7 @@
 
 mod access;
 mod activity;
+mod browsing;
 mod callouts;
 mod captions;
 mod chrome;
@@ -67,6 +68,7 @@ mod window;
 mod words;
 
 pub use accesskit::Role;
+pub use browsing::{Browsed, Place};
 pub use callouts::Calling;
 pub use chrome::{Chrome, Edge, Frame, WindowButton};
 pub use contents::Listing;
