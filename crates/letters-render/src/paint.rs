@@ -6,7 +6,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use skrifa::bitmap::{BitmapFormat, Origin};
+use skrifa::instance::{LocationRef, Size};
 use skrifa::raw::TableProvider;
+use skrifa::{GlyphId, MetadataProvider};
 
 use vello_cpu::kurbo::{Affine, BezPath, Cap, Diagonal2, Join, Rect as KRect, RoundedRect, Shape, Stroke};
 use vello_cpu::peniko::{Blob, Fill, FontData, ImageSampler};
@@ -127,11 +130,15 @@ impl FontCache {
         self.faces.entry(key).or_insert_with(|| {
             let blob = Blob::new(Arc::new(font.data.clone()));
             let id = blob.id();
-            let head = skrifa::FontRef::from_index(&font.data, font.index).map(|face| face.head());
+            let face = skrifa::FontRef::from_index(&font.data, font.index);
+            let head = face.as_ref().map(|face| face.head());
             let glyph_box = match &head {
                 Ok(Ok(head)) => {
                     let em = f32::from(head.units_per_em().max(1));
-                    [head.x_min(), head.y_min(), head.x_max(), head.y_max()].map(|unit| f32::from(unit) / em)
+                    let outlines =
+                        [head.x_min(), head.y_min(), head.x_max(), head.y_max()].map(|unit| f32::from(unit) / em);
+                    let colour = face.as_ref().ok().and_then(|face| colour_reach(face, em));
+                    colour.map_or(outlines, |colour| joined(outlines, colour))
                 }
                 // A face with no header still draws, so assume a generous box.
                 _ => [-1.0, -1.0, 2.0, 2.0],
@@ -145,6 +152,47 @@ impl FontCache {
     pub fn trim(&mut self) {
         self.faces.retain(|_, face| Arc::strong_count(&face.data) > 1 + usize::from(face.handle.is_some()));
     }
+}
+
+/// The box that holds two boxes, each as left, bottom, right, top.
+fn joined(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+}
+
+/// How far a face's colour glyphs reach, in ems with y up: left, bottom, right, top. An emoji's picture is
+/// not an outline, so the header's box does not hold it. `None` for a face with no colour glyphs.
+fn colour_reach(face: &skrifa::FontRef<'_>, em: f32) -> Option<[f32; 4]> {
+    let glyphs = u32::from(face.maxp().ok()?.num_glyphs());
+    let mut reach: Option<[f32; 4]> = None;
+    let mut hold = |sides: [f32; 4]| {
+        if sides.iter().all(|side| side.is_finite()) {
+            reach = Some(reach.map_or(sides, |reach| joined(reach, sides)));
+        }
+    };
+    let strikes = face.bitmap_strikes();
+    let sbix = strikes.format() == Some(BitmapFormat::Sbix);
+    for strike in strikes.iter() {
+        for glyph in (0..glyphs).filter_map(|id| strike.get(GlyphId::new(id))) {
+            let (wide, tall) = (glyph.width as f32 / glyph.ppem_x, glyph.height as f32 / glyph.ppem_y);
+            let left = glyph.inner_bearing_x / glyph.ppem_x;
+            let top = glyph.inner_bearing_y / glyph.ppem_y
+                + if glyph.placement_origin == Origin::BottomLeft { tall } else { 0.0 };
+            let (aside, above) = (glyph.bearing_x / em, glyph.bearing_y / em);
+            hold([left + aside, top + above - tall, left + aside + wide, top + above]);
+            if sbix {
+                // Apple's emoji face is drawn an eighth of an em lower than it says, and without its bearings.
+                hold([left, top - tall - 0.125, left + wide, top - 0.125]);
+            }
+        }
+    }
+    if face.colr().is_ok() {
+        let painted = face.color_glyphs();
+        let clips = (0..glyphs).filter_map(|id| painted.get(GlyphId::new(id)));
+        for clip in clips.filter_map(|glyph| glyph.bounding_box(LocationRef::default(), Size::unscaled())) {
+            hold([clip.x_min, clip.y_min, clip.x_max, clip.y_max].map(|unit| unit / em));
+        }
+    }
+    reach
 }
 
 /// Which part of a display list to draw, and how large.

@@ -1597,6 +1597,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "font-test-data"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5506e662553754eb20bc3c31674d11e8999cf6216d12340c8ca7bf4fdde61689"
+dependencies = [
+ "font-types 0.12.7",
+]
+
+[[package]]
 name = "font-types"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2858,6 +2867,7 @@ name = "letters-render"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "font-test-data",
  "glifo 0.5.0",
  "hayro",
  "image",

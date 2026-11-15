@@ -31,6 +31,7 @@ vello_gpu = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
 
 [dev-dependencies]
+font-test-data.workspace = true
 hayro.workspace = true
 letters-fonts.workspace = true
 # Turns the snapshot feature on for this crate's own tests.

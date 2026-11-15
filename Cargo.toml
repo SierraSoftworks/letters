@@ -50,6 +50,8 @@ skrifa = "0.49"
 bytemuck = "1"
 # Writes PDF: font subsets, text that can be selected, outlines and links. Without its own text shaping.
 krilla = { version = "0.8", default-features = false, features = ["raster-images"] }
+# Small fonts of every glyph format, by skrifa's authors. For tests of colour glyphs.
+font-test-data = "0.10"
 # Reads and draws PDF, by krilla's authors. For tests of what letters-render writes.
 hayro = "0.9"
 # Text shaping and line breaking. No system fonts: only the bundled faces are registered.

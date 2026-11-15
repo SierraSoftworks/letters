@@ -13,7 +13,7 @@ use letters_render::{Color, Font, Item, Point, Rect};
 #[test]
 fn scenes_match_their_snapshots() {
     let images = scene_images();
-    for (name, scene, scale) in SCENES {
+    for (name, scene, scale) in SCENES.into_iter().chain([EMOJI]) {
         let (width, height) = ((240.0 * scale) as u32, (160.0 * scale) as u32);
 
         snapshot::assert(&snapshot_path(name), &shot(&list(scene()), &images, width, height, scale));

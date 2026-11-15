@@ -51,6 +51,30 @@ pub fn close(a: Color, b: Color, tolerance: u8) -> bool {
     [(a.r, b.r), (a.g, b.g), (a.b, b.b), (a.a, b.a)].iter().all(|(a, b)| a.abs_diff(*b) <= tolerance)
 }
 
+/// A face of each colour glyph format the systems' emoji faces use, with a glyph of it that has a picture.
+pub fn colour_faces() -> Vec<(&'static str, Font, u32)> {
+    use skrifa::color::ColorGlyphFormat::{ColrV0, ColrV1};
+    let painted = |format| {
+        let face = FontRef::new(font_test_data::COLRV0V1).expect("the test font parses");
+        let glyphs = 0..face.outline_glyphs().iter().count() as u32;
+        let found = glyphs.into_iter().find(|id| face.color_glyphs().get_with_format((*id).into(), format).is_some());
+        found.expect("the test font has a glyph of each COLR version")
+    };
+    let face = |data: &'static [u8]| Font::new(data.into(), 0);
+    vec![
+        ("COLR layers", face(font_test_data::COLRV0V1), painted(ColrV0)),
+        ("COLR paints", face(font_test_data::COLRV0V1), painted(ColrV1)),
+        ("CBDT", face(font_test_data::CBDT), 3),
+        ("sbix", face(font_test_data::NOTO_HANDWRITING_SBIX), 7),
+    ]
+}
+
+/// One glyph by its id, in black, with its origin on the baseline at `origin`.
+pub fn glyph(font: &Font, id: u32, size: f32, origin: Point) -> Item {
+    let glyphs = vec![Glyph { id, x: 0.0, y: 0.0 }];
+    Item::Glyphs { origin, font: font.clone(), size, color: BLACK, skew: 0.0, embolden: false, glyphs, text: None }
+}
+
 /// The largest difference between two frames on any channel of any pixel.
 pub fn furthest_apart(a: &Frame, b: &Frame) -> u8 {
     assert_eq!((a.width(), a.height(), a.format()), (b.width(), b.height(), b.format()), "the frames match");
@@ -212,6 +236,9 @@ pub type Scene = (&'static str, fn() -> Vec<Item>, f32);
 /// Scenes that between them use every kind of item.
 pub const SCENES: [Scene; 3] = [("shapes", shapes, 1.0), ("type", type_specimen, 1.0), ("card@2x", card, 2.0)];
 
+/// Colour glyphs, which each renderer places and smooths a little differently, so only a snapshot holds it.
+pub const EMOJI: Scene = ("emoji", emoji, 1.0);
+
 /// The images the scenes draw.
 pub fn scene_images() -> Images {
     let mut images = Images::default();
@@ -255,6 +282,19 @@ fn shapes() -> Vec<Item> {
 }
 
 /// The bundled faces across sizes, weights and synthetic styles.
+/// Colour glyphs of every format, small and large, beside the text they would sit in.
+fn emoji() -> Vec<Item> {
+    let mut items = vec![fill(0.0, 0.0, 240.0, 160.0, PAPER)];
+    for (row, size) in [14.0_f32, 22.0, 36.0].into_iter().enumerate() {
+        let y = 30.0 + 40.0 * row as f32 + size / 3.0;
+        items.push(text(&sans(400.0), size.min(22.0), INK, at(10.0, y), "Hey"));
+        for (column, (_, font, id)) in colour_faces().into_iter().enumerate() {
+            items.push(glyph(&font, id, size, at(64.0 + 44.0 * column as f32, y)));
+        }
+    }
+    items
+}
+
 fn type_specimen() -> Vec<Item> {
     let mut items = vec![fill(0.0, 0.0, 240.0, 160.0, Color::rgb(255, 255, 255))];
     items.push(text(&display(700.0), 22.0, INK, at(10.0, 28.0), "Letters, typeset"));
