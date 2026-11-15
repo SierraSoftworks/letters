@@ -1,10 +1,11 @@
 //! HTML export, through its one public function.
 
 use letters_convert::{
-    Column, HtmlPage, WebFont, from_html, from_markdown, to_html, to_html_themed, to_html_with, to_markdown,
+    Column, HtmlPage, WebFont, from_html, from_markdown, to_html, to_html_fragment, to_html_themed, to_html_with,
+    to_markdown,
 };
 use letters_layout::{Palette, Scheme};
-use letters_model::{Block, BlockKind, Document, ListKind, Mark, Run, Style};
+use letters_model::{Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Run, Style};
 use letters_render::Color;
 
 fn document(markdown: &str) -> Document {
@@ -54,7 +55,7 @@ fn nests(html: &str) -> bool {
             if open.pop().as_deref() != Some(closed) {
                 return false;
             }
-        } else if !["br", "hr", "input", "meta", "!doctype", "path", "rect"].contains(&tag.as_str()) {
+        } else if !["br", "hr", "img", "input", "meta", "!doctype", "path", "rect"].contains(&tag.as_str()) {
             open.push(tag);
         }
     }
@@ -425,6 +426,100 @@ fn an_image_the_page_cannot_hold_keeps_its_place() {
         assert_eq!(article(&html), expected, "{fields:?}");
         assert!(!tags(&html).iter().any(|tag| tag == "img"), "{fields:?}");
     }
+}
+
+/// A picture the file holds, 60 points tall, with its id as its description.
+fn picture(id: &str, width: f32, numbered: bool, caption: &str) -> Block {
+    let asset = Some(format!("assets/{id}.png"));
+    let kind = BlockKind::Figure { asset, src: None, alt: id.into(), width, height: 60.0, numbered };
+    Block::text(id, kind, caption)
+}
+
+/// A paragraph that refers to each of `figures`, each reference carrying text that has gone stale.
+fn referring(figures: &[&str]) -> Block {
+    let refer = |id: &&str| Run::marked("Figure 9", [Mark::Ref(BlockId::new(id))]);
+    let mut block = Block::new("p", BlockKind::Paragraph);
+    block.body = Body::Text(figures.iter().flat_map(|id| [Run::plain("see "), refer(id)]).collect());
+    block
+}
+
+/// A page of `doc`, whose file holds every picture it asks for.
+fn pictured(doc: &Document, style: &Style) -> String {
+    article(&to_html(doc, style, "Report", &mut |_| Some(vec![0x89, b'P', b'N', b'G'])))
+}
+
+#[test]
+fn figures_are_numbered_and_references_lead_to_them() {
+    let mut worded = Style::default();
+    worded.types.get_mut("caption").expect("a style has captions").extra.insert("label".into(), "Abbildung".into());
+    for (style, word) in [(Style::default(), "Figure"), (worded, "Abbildung")] {
+        let blocks = vec![
+            referring(&["cat", "bare", "gone"]),
+            picture("plain", 80.0, false, "Not counted"),
+            picture("cat", 80.0, true, "A cat"),
+            picture("bare", 80.0, true, ""),
+        ];
+        let html = pictured(&Document { blocks, ..Document::default() }, &style);
+
+        // A numbered figure's caption opens with its label, and the figure can be led to.
+        assert!(html.contains(&format!("<figcaption>{word} 1: A cat</figcaption>")), "{html}");
+        assert!(html.contains(&format!("<figcaption>{word} 2:</figcaption>")), "{html}");
+        assert!(html.contains("<figure id=\"cat\">") && html.contains("<figure id=\"bare\">"), "{html}");
+        assert!(html.contains("<figcaption>Not counted</figcaption>"), "{html}");
+        // A reference reads as its figure's label now, not as the text it was written with.
+        assert!(html.contains(&format!("href=\"#cat\">{word} 1</a>")), "{html}");
+        assert!(html.contains(&format!("href=\"#bare\">{word} 2</a>")), "{html}");
+        assert!(!html.contains("Figure 9"), "{html}");
+        // One to a figure that is gone says so, and leads nowhere.
+        assert!(html.contains(&format!("{word} ?")) && !html.contains("#gone"), "{html}");
+    }
+}
+
+#[test]
+fn a_reference_leads_to_a_figure_whatever_its_id_holds() {
+    let id = "a b\"<c>/\u{e9}";
+    let doc = Document { blocks: vec![referring(&[id]), picture(id, 80.0, true, "")], ..Document::default() };
+    let html = pictured(&doc, &Style::default());
+    assert!(html.contains("id=\"a b&quot;&lt;c&gt;/\u{e9}\""), "{html}");
+    assert!(html.contains("href=\"#a%20b%22%3Cc%3E%2F%C3%A9\""), "{html}");
+}
+
+#[test]
+fn a_gallery_is_one_figure_of_rows() {
+    // How many pictures, and how many of them each row holds: up to three, and the last is never alone.
+    let cases: [(usize, &[usize]); 5] = [(1, &[1]), (3, &[3]), (4, &[2, 2]), (5, &[3, 2]), (7, &[3, 2, 2])];
+    for (count, rows) in cases {
+        let mut gallery = Block::new("g", BlockKind::Gallery { numbered: true });
+        let mut held: Vec<Block> = (0..count).map(|index| picture(&format!("p{index}"), 90.0, false, "")).collect();
+        held.push(Block::text("c", BlockKind::Caption, "Cats"));
+        gallery.body = Body::Blocks(held);
+        let doc = Document { blocks: vec![referring(&["g"]), gallery], ..Document::default() };
+        let html = pictured(&doc, &Style::default());
+
+        let (_, figure) = html.split_once("<figure").expect("the gallery is a figure");
+        assert_eq!(figure.matches("<figure").count(), 0, "{count}: one figure holds every picture");
+        let found: Vec<usize> = figure.split("<div").skip(1).map(|row| row.matches("<img").count()).collect();
+        assert_eq!(found, rows, "{count} pictures");
+        assert!(figure.contains("<figcaption>Figure 1: Cats</figcaption>"), "{count}: {figure}");
+        assert!(figure.contains("id=\"g\"") && html.contains("href=\"#g\">Figure 1</a>"), "{count}: {html}");
+        assert!(nests(&html), "{count}: {html}");
+    }
+}
+
+#[test]
+fn a_reference_read_back_from_a_page_is_its_label() {
+    let doc = Document { blocks: vec![referring(&["cat"]), picture("cat", 80.0, true, "")], ..Document::default() };
+    let html = to_html(&doc, &Style::default(), "Report", &mut |_| None);
+    let (read, _) = from_html(&html, &mut || "new".into());
+    let runs = read.blocks[0].body.runs();
+    assert_eq!(read.blocks[0].plain_text(), "see Figure 1");
+    assert!(runs.iter().all(|run| run.link.is_none()), "a link into the page it came from leads nowhere: {runs:?}");
+}
+
+#[test]
+fn a_copied_reference_is_its_text() {
+    let html = to_html_fragment(&[referring(&["cat"])]);
+    assert!(html.contains("Figure 9") && !html.contains("<a"), "{html}");
 }
 
 #[test]

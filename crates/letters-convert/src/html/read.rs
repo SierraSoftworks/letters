@@ -380,7 +380,11 @@ impl Style {
         style.heavy |= matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th");
         match name {
             "kbd" | "samp" | "tt" => _ = style.marks.insert(Mark::Code),
-            "a" => style.link = href(element.attribute("href")).filter(|address| address.len() <= MAX_ADDRESS),
+            "a" => {
+                // A link to a place on its own page, as a reference to a figure is, leads nowhere from a document.
+                let leads = |address: &String| !address.starts_with('#') && address.len() <= MAX_ADDRESS;
+                style.link = href(element.attribute("href")).filter(leads);
+            }
             _ => style.marks.extend(TAGS.iter().filter(|(tag, _)| *tag == name).map(|(_, mark)| mark.clone())),
         }
 

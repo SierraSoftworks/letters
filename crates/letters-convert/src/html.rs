@@ -6,12 +6,13 @@
 
 mod read;
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 pub use read::from_html;
 
-use letters_layout::{Palette, TokenKind as Ink};
-use letters_model::{Align, Block, BlockKind, Document, ListKind, Mark, Run, Style, TextStyle, Tone};
+use letters_layout::{Palette, TokenKind as Ink, figure_label, figure_numbers};
+use letters_model::{Align, Block, BlockId, BlockKind, Document, ListKind, Mark, Run, Style, TextStyle, Tone};
 use letters_render::{Color, Size};
 use yewi_highlight::{TokenKind, tokenize};
 
@@ -46,6 +47,8 @@ pub type Assets<'a> = &'a mut dyn FnMut(&str) -> Option<Vec<u8>>;
 /// - An image held by the file is written in as a `data:` address. One that is still remote becomes a link
 ///   to it, so that opening the page fetches nothing.
 /// - A link that would run script is written as its text alone.
+/// - A numbered figure's caption opens with its label, and a reference to it reads as that label and leads to
+///   the figure, which carries its block's id. A gallery is one figure of rows, tiled as the editor tiles them.
 /// - Maths is set and written in as a drawing, in the colour of the text around it. Its TeX source is kept on
 ///   the element, of the class `math`, where [`from_html`] reads it back. Maths that cannot be set is
 ///   written as its source.
@@ -130,17 +133,20 @@ pub fn to_html_with(doc: &Document, style: &Style, title: &str, assets: Assets, 
         if points.is_finite() && points > 0.0 { points * PIXELS } else { TextStyle::default().size * PIXELS }
     };
     let sizes = [size("body"), size("heading1"), size("heading2"), size("heading3"), size("heading4")];
-    blocks(&doc.blocks, &mut Writing { assets, maths: Some(sizes), window: page.window.is_some() }, &mut out);
+    let figures = Some(Figures::of(doc, style));
+    let mut writing = Writing { assets, maths: Some(sizes), window: page.window.is_some(), figures };
+    blocks(&doc.blocks, &mut writing, &mut out);
     out.push_str("</article>\n</body>\n</html>\n");
     out
 }
 
 /// Writes `blocks` as the elements a page's body would hold, with no page around them: what a copy offers to
-/// other applications. Nothing is styled, and no image is written in. Maths is written as its TeX source
+/// other applications. Nothing is styled, no image is written in, and a reference to a figure is its text. Maths is written as its TeX source
 /// between `\(` and `\)`, or `\[` and `\]` for a formula, for whatever takes the paste to set.
 pub fn to_html_fragment(blocks: &[Block]) -> String {
     let mut out = String::new();
-    self::blocks(blocks, &mut Writing { assets: &mut |_| None, maths: None, window: false }, &mut out);
+    let mut writing = Writing { assets: &mut |_| None, maths: None, window: false, figures: None };
+    self::blocks(blocks, &mut writing, &mut out);
     out
 }
 
@@ -153,12 +159,47 @@ struct Writing<'a> {
     maths: Option<[f32; 5]>,
     /// Blocks are drawn as the editor's window draws them, where that is not how a page of its own reads best.
     window: bool,
+    /// The document's numbered figures, on a page that spells their numbers out. `None` leaves a caption
+    /// without a label and writes a reference as the text it carries.
+    figures: Option<Figures>,
 }
 
 impl Writing<'_> {
-    /// The size maths is typeset at in a heading of `level`, or in other text for level 0.
-    fn text(&self, level: u8) -> Option<f32> {
-        self.maths.map(|sizes| sizes[usize::from(level.min(4))])
+    /// What the text of a heading of `level` is written with, or other text for level 0.
+    fn text(&self, level: u8) -> Line<'_> {
+        let maths = self.maths.map(|sizes| sizes[usize::from(level.min(4))]);
+        Line { maths, figures: self.figures.as_ref() }
+    }
+}
+
+/// What a line of text is written with.
+#[derive(Clone, Copy)]
+struct Line<'a> {
+    /// The size maths in the line is typeset at. `None` writes it as its source.
+    maths: Option<f32>,
+    figures: Option<&'a Figures>,
+}
+
+/// What the numbers of a document's figures read as. A document does not store them: they follow from the
+/// order of its figures, so a page has to spell them out.
+struct Figures {
+    /// What a reference to each numbered figure reads as, such as "Figure 2". Its caption opens with the same
+    /// and a colon.
+    names: BTreeMap<BlockId, String>,
+    /// What a reference reads as when its figure is gone or is no longer numbered.
+    missing: String,
+}
+
+impl Figures {
+    /// The figures of `doc`, numbered and named as layout does it, with the style's own word for a figure.
+    fn of(doc: &Document, style: &Style) -> Self {
+        let name = |number: u32| figure_label(style, number).trim_end_matches(':').to_owned();
+        let any = name(0);
+        let word = any.rsplit_once(' ').map_or(any.as_str(), |(word, _)| word);
+        Self {
+            missing: format!("{word} ?"),
+            names: figure_numbers(doc).into_iter().map(|(id, number)| (id, name(number))).collect(),
+        }
     }
 }
 
@@ -193,7 +234,7 @@ fn blocks(blocks: &[Block], page: &mut Writing, out: &mut String) {
             }
             BlockKind::Code { language } => code(language.as_deref(), &block.plain_text(), out),
             BlockKind::Formula => {
-                maths(&block.plain_text(), true, page.text(0), out);
+                maths(&block.plain_text(), true, page.text(0).maths, out);
                 out.push('\n');
             }
             BlockKind::Quote => container("<blockquote>", "</blockquote>", block.body.blocks(), page, out),
@@ -205,14 +246,14 @@ fn blocks(blocks: &[Block], page: &mut Writing, out: &mut String) {
             BlockKind::Figure { asset, src, alt, width, height, .. } => {
                 let image =
                     Figure { asset: asset.as_deref(), src: src.as_deref(), alt, width: *width, height: *height };
-                figure(&image, block.body.runs(), page, out);
+                figure(&image, block.body.runs(), Some(&block.id), page, out);
             }
             BlockKind::Table { columns, header } => table(columns, *header, block.body.blocks(), page, out),
             // A merge can leave a row outside a table and a cell outside a row.
             BlockKind::TableRow => table(&[], false, std::slice::from_ref(block), page, out),
-            // Until galleries are written as such, what they hold is written in order.
+            // A merge can leave a caption outside a gallery too.
             BlockKind::Caption | BlockKind::TableCell => element("p", block.body.runs(), page.text(0), out),
-            BlockKind::Gallery { .. } => self::blocks(block.body.blocks(), page, out),
+            BlockKind::Gallery { .. } => gallery(block, page, out),
             // A reader that does not build figures yet hands one over as an unknown block, its fields beside it.
             BlockKind::Unknown { type_name } if type_name == "figure" => {
                 let field = |name: &str| block.extra.get(name);
@@ -226,7 +267,7 @@ fn blocks(blocks: &[Block], page: &mut Writing, out: &mut String) {
                     width: size("width"),
                     height: size("height"),
                 };
-                figure(&image, &caption.unwrap_or_default(), page, out);
+                figure(&image, &caption.unwrap_or_default(), None, page, out);
             }
             BlockKind::Unknown { type_name } if page.window => {
                 out.push_str("<p class=\"unknown\">Unsupported block: ");
@@ -258,12 +299,12 @@ fn tone_name(tone: Tone) -> &'static str {
 }
 
 /// Writes a text block. One with no text keeps its line, as it does on the page.
-fn element(tag: &str, runs: &[Run], maths: Option<f32>, out: &mut String) {
+fn element(tag: &str, runs: &[Run], line: Line, out: &mut String) {
     let _ = write!(out, "<{tag}>");
     if runs.iter().all(|run| run.text.is_empty()) {
         out.push_str("<br>");
     } else {
-        inline(runs, maths, out);
+        inline(runs, line, out);
     }
     let _ = writeln!(out, "</{tag}>");
 }
@@ -324,7 +365,7 @@ fn close(lists: &mut Vec<&str>, keep: usize, out: &mut String) {
 }
 
 /// Writes a list item, opening and closing lists around it to reach its depth.
-fn item(lists: &mut Vec<&'static str>, list: ListKind, depth: u8, runs: &[Run], maths: Option<f32>, out: &mut String) {
+fn item(lists: &mut Vec<&'static str>, list: ListKind, depth: u8, runs: &[Run], line: Line, out: &mut String) {
     let tag = if list == ListKind::Ordered { "ol" } else { "ul" };
     // An item nests inside the one before it, so it can sit at most one level deeper.
     let depth = usize::from(depth).min(lists.len());
@@ -347,7 +388,7 @@ fn item(lists: &mut Vec<&'static str>, list: ListKind, depth: u8, runs: &[Run], 
         ListKind::Task { checked: false } => "<li class=\"task\"><input type=\"checkbox\" disabled>",
         ListKind::Bullet | ListKind::Ordered => "<li>",
     });
-    inline(runs, maths, out);
+    inline(runs, line, out);
 }
 
 /// Writes a code block, with a span around each token the highlighter colours.
@@ -384,40 +425,99 @@ struct Figure<'a> {
     height: f32,
 }
 
-/// Writes a figure and its caption.
+/// Writes a figure and its caption. `id` is its block's, for a figure that can be numbered and referred to.
+fn figure(image: &Figure, caption: &[Run], id: Option<&BlockId>, page: &mut Writing, out: &mut String) {
+    open("figure", id, page, out);
+    picture(image, None, page, out);
+    self::caption(caption, id, page, out);
+    out.push_str("</figure>\n");
+}
+
+/// Writes a gallery as one figure: its pictures in the rows layout tiles them in, and its caption under them.
+fn gallery(block: &Block, page: &mut Writing, out: &mut String) {
+    let children = block.body.blocks();
+    let pictures = children.iter().filter_map(|child| match &child.kind {
+        BlockKind::Figure { asset, src, alt, width, height, .. } => {
+            Some(Figure { asset: asset.as_deref(), src: src.as_deref(), alt, width: *width, height: *height })
+        }
+        _ => None,
+    });
+    let pictures: Vec<Figure> = pictures.collect();
+    open("figure class=\"gallery\"", Some(&block.id), page, out);
+    let mut rest = &pictures[..];
+    while !rest.is_empty() {
+        // Up to three to a row, and the last picture is never left alone.
+        let (row, after) = rest.split_at(if rest.len() == 4 { 2 } else { rest.len().min(3) });
+        out.push_str("<div class=\"row\">\n");
+        for image in row {
+            // Each takes its share of the row by its shape, which gives the row one height.
+            let shape = if image.width > 0.0 && image.height > 0.0 { image.width / image.height } else { 1.0 };
+            picture(image, Some(shape), page, out);
+        }
+        out.push_str("</div>\n");
+        rest = after;
+    }
+    let last = children.iter().rfind(|child| child.kind == BlockKind::Caption);
+    caption(last.map_or(&[], |last| last.body.runs()), Some(&block.id), page, out);
+    out.push_str("</figure>\n");
+}
+
+/// Opens a figure's element. One that is numbered carries its block's id, where a reference to it leads.
+fn open(tag: &str, id: Option<&BlockId>, page: &Writing, out: &mut String) {
+    let _ = write!(out, "<{tag}");
+    let named = page.figures.as_ref().zip(id).filter(|(figures, id)| figures.names.contains_key(id));
+    if let Some((_, id)) = named {
+        out.push_str(" id=\"");
+        escape(id.as_str(), out);
+        out.push('"');
+    }
+    out.push_str(">\n");
+}
+
+/// Writes a picture. In a gallery's row, `tile` is its width over its height.
 ///
 /// An image the file holds is written into the page. One that is still remote is not: the page must fetch
 /// nothing, so it becomes a link. One that cannot be found leaves its description in its place.
-fn figure(image: &Figure, caption: &[Run], page: &mut Writing, out: &mut String) {
-    out.push_str("<figure>\n");
+fn picture(image: &Figure, tile: Option<f32>, page: &mut Writing, out: &mut String) {
     let held = image.asset.and_then(|name| {
         let bytes = (page.assets)(name)?;
         Some((media_type(name, &bytes)?, bytes))
     });
     let remote = image.src.and_then(href);
+    let share = tile.map(|shape| format!(" style=\"flex: {}\"", number(shape))).unwrap_or_default();
     if let Some((media, bytes)) = held {
         let _ = write!(out, "<img src=\"data:{media};base64,{}\" alt=\"", base64(&bytes));
         escape(image.alt, out);
         // In CSS pixels, so the page keeps the image's place while it decodes.
         let pixels = |points: f32| (points * PIXELS).round().max(1.0);
-        let _ = writeln!(out, "\" width=\"{}\" height=\"{}\">", pixels(image.width), pixels(image.height));
+        let _ = writeln!(out, "\" width=\"{}\" height=\"{}\"{share}>", pixels(image.width), pixels(image.height));
     } else if let Some(address) = remote {
-        out.push_str("<p><a href=\"");
+        let _ = write!(out, "<p{share}><a href=\"");
         escape(&address, out);
         out.push_str("\">");
         escape(if image.alt.is_empty() { &address } else { image.alt }, out);
         out.push_str("</a></p>\n");
     } else if !image.alt.is_empty() {
-        out.push_str("<p class=\"fallback\">");
+        let _ = write!(out, "<p class=\"fallback\"{share}>");
         escape(image.alt, out);
         out.push_str("</p>\n");
     }
-    if caption.iter().any(|run| !run.text.is_empty()) {
-        out.push_str("<figcaption>");
-        inline(caption, page.text(0), out);
-        out.push_str("</figcaption>\n");
+}
+
+/// Writes the caption of the figure with `id`. A numbered figure's opens with its label, as on the page.
+fn caption(runs: &[Run], id: Option<&BlockId>, page: &Writing, out: &mut String) {
+    let label = page.figures.as_ref().zip(id).and_then(|(figures, id)| figures.names.get(id));
+    let captioned = runs.iter().any(|run| !run.text.is_empty());
+    if label.is_none() && !captioned {
+        return;
     }
-    out.push_str("</figure>\n");
+    out.push_str("<figcaption>");
+    if let Some(label) = label {
+        escape(label, out);
+        out.push_str(if captioned { ": " } else { ":" });
+    }
+    inline(runs, page.text(0), out);
+    out.push_str("</figcaption>\n");
 }
 
 /// The media type of an image a browser can show, told from its first bytes. SVG is text, so its name tells.
@@ -487,7 +587,7 @@ fn maths(tex: &str, display: bool, text: Option<f32>, out: &mut String) {
 }
 
 /// Writes a block's runs. Neighbouring runs of one link share its anchor.
-fn inline(runs: &[Run], maths: Option<f32>, out: &mut String) {
+fn inline(runs: &[Run], line: Line, out: &mut String) {
     let mut rest = runs;
     while let Some(first) = rest.first() {
         let (linked, after) = rest.split_at(rest.iter().take_while(|run| run.link == first.link).count());
@@ -500,10 +600,17 @@ fn inline(runs: &[Run], maths: Option<f32>, out: &mut String) {
         for run in linked.iter().filter(|run| !run.text.is_empty()) {
             let tags = || MARKS.iter().filter(|(mark, _)| run.marks.contains(mark)).map(|(_, tag)| *tag);
             tags().for_each(|tag| _ = write!(out, "<{tag}>"));
-            if run.marks.contains(&Mark::Math) {
-                self::maths(&run.text, false, maths, out);
-            } else {
-                text(&run.text, out);
+            let target = run.marks.iter().find_map(|mark| match mark {
+                Mark::Ref(target) => Some(target),
+                _ => None,
+            });
+            match (target, line.figures) {
+                // An anchor cannot hold another, so a reference inside a link is its label alone.
+                (Some(target), Some(figures)) => reference(target, figures, address.is_none(), out),
+                // A reference is not also a formula: its text is what is shown where it cannot be followed.
+                (Some(_), None) => text(&run.text, out),
+                (None, _) if run.marks.contains(&Mark::Math) => self::maths(&run.text, false, line.maths, out),
+                (None, _) => text(&run.text, out),
             }
             tags().rev().for_each(|tag| _ = write!(out, "</{tag}>"));
         }
@@ -511,6 +618,32 @@ fn inline(runs: &[Run], maths: Option<f32>, out: &mut String) {
             out.push_str("</a>");
         }
         rest = after;
+    }
+}
+
+/// Writes a reference to the figure `target`: the figure's label, whatever text the reference carries, as a
+/// link to the figure where `linked`. One whose figure is gone, or is no longer numbered, says so.
+fn reference(target: &BlockId, figures: &Figures, linked: bool, out: &mut String) {
+    match figures.names.get(target) {
+        Some(name) if linked => {
+            out.push_str("<a class=\"ref\" href=\"#");
+            // An id may hold what an address cannot.
+            for byte in target.as_str().bytes() {
+                match byte {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(byte as char),
+                    _ => _ = write!(out, "%{byte:02X}"),
+                }
+            }
+            out.push_str("\">");
+            escape(name, out);
+            out.push_str("</a>");
+        }
+        Some(name) => escape(name, out),
+        None => {
+            out.push_str("<span class=\"ref missing\">");
+            escape(&figures.missing, out);
+            out.push_str("</span>");
+        }
     }
 }
 
@@ -659,6 +792,8 @@ fn colours(style: &Style, on: &Palette, css: &mut String) {
          blockquote, .unknown {{ border-color: {line_strong}; }}\n\
          hr, th, td {{ border-color: {line}; }}\n\
          a {{ color: {link}; }}\n\
+         a.ref {{ color: inherit; }}\n\
+         .ref.missing {{ color: {warning}; }}\n\
          mark {{ background: {highlight}; }}\n",
         inline_code = color(on.inline_code),
         code_fill = color(on.code),
@@ -674,6 +809,7 @@ fn colours(style: &Style, on: &Palette, css: &mut String) {
         line_strong = color(on.line_strong),
         line = color(on.line),
         link = color(on.link),
+        warning = color(on.warn.accent),
         highlight = color(on.highlight),
     );
     for (tone, look) in [(Tone::Tip, on.tip), (Tone::Info, on.info), (Tone::Warn, on.warn), (Tone::Danger, on.danger)] {
@@ -820,8 +956,12 @@ fn css(style: &Style, with: &HtmlPage, css: &mut String) {
          th {{ font-weight: 600; }}\n\
          figure {{ margin: {after} 0; }}\n\
          figure > * {{ margin: 0; }}\n\
-         figure > figcaption {{ margin-top: {between}; }}\n\
+         figure > figcaption {{ margin-top: 8px; }}\n\
          img {{ display: block; max-width: 100%; height: auto; }}\n\
+         .gallery > .row {{ display: flex; align-items: flex-start; gap: 8px; }}\n\
+         .gallery > .row + .row {{ margin-top: 8px; }}\n\
+         .gallery > .row > * {{ flex: 1; min-width: 0; margin: 0; }}\n\
+         a.ref {{ text-decoration: none; }}\n\
          .math.display > svg {{ display: block; margin: 0 auto; max-width: 100%; height: auto; }}\n\
          article > :first-child, blockquote > :first-child, .callout > :first-child {{ margin-top: 0; }}\n\
          article > :last-child, blockquote > :last-child, .callout > :last-child {{ margin-bottom: 0; }}\n\
@@ -829,7 +969,6 @@ fn css(style: &Style, with: &HtmlPage, css: &mut String) {
          mark {{ color: inherit; }}\n\
          .tok-comment {{ font-style: italic; }}\n",
         after = px(unit),
-        between = px(unit * 0.5),
         rule_gap = px(unit * 2.0),
     );
     colours(style, &PAGE, css);

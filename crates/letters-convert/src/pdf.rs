@@ -72,8 +72,12 @@ pub fn to_pdf(
             }
         }
         let links = layout.page_links(&pages, index).into_iter().filter_map(|link| {
-            let address = href(&link.target)?;
-            Some(Link { rect: link.rect, target: Target::Url(address), part: None })
+            // A reference leads to its figure, and any other link out of the document.
+            let target = match link.place {
+                Some((page, at)) => Target::Place { page, at },
+                None => Target::Url(href(&link.target)?),
+            };
+            Some(Link { rect: link.rect, target, part: link.part })
         });
         pdf.page(sheet, &list, &images, &links.collect::<Vec<_>>());
     }
