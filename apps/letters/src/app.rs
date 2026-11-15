@@ -723,7 +723,7 @@ impl App {
         if !window.place.naming() {
             window.view.set_document_name(&window.place.name());
         }
-        if landing && window.keeps {
+        if landing && made_here && window.keeps {
             window.view.set_landing(Some(self.landing()));
         }
         window.retitle();
