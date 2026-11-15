@@ -22,6 +22,7 @@ async fn only_the_discovery_answers_a_stranger() {
         paths::SESSION.to_owned(),
         paths::SPACES.to_owned(),
         paths::SETTINGS.to_owned(),
+        paths::DICTIONARY.to_owned(),
         paths::RECENT.to_owned(),
         paths::SOURCES.to_owned(),
         paths::entries("home", ""),

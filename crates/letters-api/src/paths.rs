@@ -22,6 +22,9 @@ pub const RENEW: &str = "/api/v1/session/renew";
 pub const SIGN_OUT: &str = "/api/v1/session/sign-out";
 /// `GET` and `PUT`: the person's [`Settings`](crate::Settings).
 pub const SETTINGS: &str = "/api/v1/settings";
+/// `GET`: the words the person taught the spell checker, as a list of strings. They change a word at a
+/// time, at [`word`].
+pub const DICTIONARY: &str = "/api/v1/settings/dictionary";
 
 /// `GET`: every [`Space`](crate::Space) the session reaches.
 pub const SPACES: &str = "/api/v1/spaces";
@@ -45,6 +48,13 @@ pub const DESKTOP_PAGE: &str = "/auth/desktop";
 pub const CALLBACK_PAGE: &str = "/auth/callback";
 /// A page: the documents the person reaches.
 pub const HOME_PAGE: &str = "/";
+
+/// `PUT` adds the word to the person's own and `DELETE` takes it out. Each answers the words as they are
+/// then, and minds neither a word already there nor one already gone. Two devices that change words at
+/// once both have their way, which two `PUT`s of a whole list would not give them.
+pub fn word(word: &str) -> String {
+    format!("{DICTIONARY}/{}", segment(word))
+}
 
 /// `GET`: the [`Listing`](crate::Listing) of the folder `?path=` names, or of the space itself.
 pub fn entries(space: &str, folder: &str) -> String {

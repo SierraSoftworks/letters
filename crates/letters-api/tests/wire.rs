@@ -230,6 +230,7 @@ fn an_address_keeps_each_part_in_its_place() {
         (paths::link("d", "l/1"), "/api/v1/documents/d/links/l%2F1"),
         (paths::desktop_sign_in("abc-_", 4711, "x&y"), "/auth/desktop?challenge=abc-_&port=4711&state=x%26y"),
         (paths::editor_page("é"), "/d/%C3%A9"),
+        (paths::word("naïve/2"), "/api/v1/settings/dictionary/na%C3%AFve%2F2"),
     ];
     for (address, expected) in cases {
         assert_eq!(address, expected);

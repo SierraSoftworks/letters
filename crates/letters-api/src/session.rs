@@ -97,7 +97,7 @@ pub enum Appearance {
 }
 
 /// What a person set for themselves, kept by the server so that every device has it. Each is `None` or
-/// empty until they set it. A `PUT` replaces the whole.
+/// empty until they set it. A `PUT` replaces the whole, but for the words of their dictionary.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     /// The name their edits are signed with, in place of [`Person::name`].
@@ -112,7 +112,9 @@ pub struct Settings {
     /// The accent as sRGB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accent: Option<[u8; 3]>,
-    /// The words they taught the spell checker.
+    /// The words they taught the spell checker. A `PUT` leaves them as they are, whatever it sends here:
+    /// they change a word at a time ([`paths::word`](crate::paths::word)), so that a device with an old
+    /// list cannot bring back a word another one took out.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dictionary: Vec<String>,
     /// The `style.json` their new documents start with.

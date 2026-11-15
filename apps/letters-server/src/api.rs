@@ -12,7 +12,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, SET_COOKIE, X_CONTENT_TYPE_OPTIONS};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use letters_api::{
     Action, Allows, Code, Entry, EntryKind, Fetch, Listing, Move, NewDocument, NewFolder, Opened, PROTOCOL, Person,
@@ -41,6 +41,10 @@ const SETTINGS: Table<Settings> = Table::new("settings");
 const RECENT: Table<Vec<String>> = Table::new("recent");
 /// How many documents a person's recents hold.
 const RECENTS: usize = 30;
+/// How long a word of a person's dictionary may be, in characters.
+const WORD: usize = 64;
+/// How many words a person's dictionary holds.
+const WORDS: usize = 10_000;
 
 pub fn routes() -> Router<Shared> {
     let limits = letters_api::Limits::default();
@@ -50,6 +54,8 @@ pub fn routes() -> Router<Shared> {
         .route(paths::RENEW, post(renew))
         .route(paths::SIGN_OUT, post(sign_out))
         .route(paths::SETTINGS, get(settings).put(set_settings))
+        .route(paths::DICTIONARY, get(words))
+        .route("/api/v1/settings/dictionary/{word}", put(add_word).delete(forget_word))
         .route(paths::SPACES, get(spaces))
         .route(paths::RECENT, get(recent))
         .route(paths::SOURCES, get(sources))
@@ -121,7 +127,7 @@ async fn settings(State(app): State<Shared>, who: Signed) -> Answer<Json<Setting
 async fn set_settings(
     State(app): State<Shared>,
     who: Signed,
-    Json(settings): Json<Settings>,
+    Json(mut settings): Json<Settings>,
 ) -> Answer<Json<Settings>> {
     if let Some(style) = &settings.default_style
         && let Err(error) = Style::from_json(&style.to_string())
@@ -129,10 +135,27 @@ async fn set_settings(
         return Err(Refusal::invalid(format!("The default style cannot be read: {error}.")));
     }
     blocking(move || {
-        app.store.put(&SETTINGS, &who.person.id, &settings)?;
-        Ok(Json(settings))
+        // The words change one at a time (`App::word`). What a whole list sent here would do is bring
+        // back a word that another device took out, so the words kept stay as they are.
+        Ok(Json(app.store.write(|batch| {
+            settings.dictionary = batch.get(&SETTINGS, &who.person.id)?.unwrap_or_default().dictionary;
+            batch.put(&SETTINGS, &who.person.id, &settings)?;
+            Ok(settings)
+        })?))
     })
     .await
+}
+
+async fn words(State(app): State<Shared>, who: Signed) -> Answer<Json<Vec<String>>> {
+    blocking(move || Ok(Json(app.store.get(&SETTINGS, &who.person.id)?.unwrap_or_default().dictionary))).await
+}
+
+async fn add_word(State(app): State<Shared>, who: Signed, Path(word): Path<String>) -> Answer<Json<Vec<String>>> {
+    blocking(move || app.word(&who, &word, true).map(Json)).await
+}
+
+async fn forget_word(State(app): State<Shared>, who: Signed, Path(word): Path<String>) -> Answer<Json<Vec<String>>> {
+    blocking(move || app.word(&who, &word, false).map(Json)).await
 }
 
 async fn spaces(State(app): State<Shared>, who: Signed) -> Json<Vec<Space>> {
@@ -524,6 +547,32 @@ impl App {
     pub fn signs_as(&self, who: &Signed) -> Answer<String> {
         let settings = self.store.get(&SETTINGS, &who.person.id)?.unwrap_or_default();
         Ok(settings.name.unwrap_or_else(|| who.person.name.clone()))
+    }
+
+    /// Adds a word to the person's own, or takes it out, and answers the words as they are then. One
+    /// read and write of the store, so two devices that change words at once both have their way.
+    pub fn word(&self, who: &Signed, word: &str, add: bool) -> Answer<Vec<String>> {
+        // Only a word going in is held to the rule: whatever is there can be taken out.
+        let fits = !word.is_empty() && word.chars().count() <= WORD;
+        if add && !(fits && word.chars().all(|letter| !letter.is_whitespace() && !letter.is_control())) {
+            return Err(Refusal::invalid(format!(
+                "A word in your dictionary is a single word of up to {WORD} characters, with no spaces."
+            )));
+        }
+        let words = self.store.write(|batch| {
+            let mut settings = batch.get(&SETTINGS, &who.person.id)?.unwrap_or_default();
+            let at = settings.dictionary.iter().position(|known| known == word);
+            match (add, at) {
+                (true, None) if settings.dictionary.len() >= WORDS => return Ok(None),
+                (true, None) => settings.dictionary.push(word.to_owned()),
+                (false, Some(at)) => drop(settings.dictionary.remove(at)),
+                _ => return Ok(Some(settings.dictionary)),
+            }
+            batch.put(&SETTINGS, &who.person.id, &settings)?;
+            Ok(Some(settings.dictionary))
+        })?;
+        let full = || format!("Your dictionary already holds {WORDS} words. Remove some before adding more.");
+        words.ok_or_else(|| Refusal::invalid(full()))
     }
 
     pub fn new_document(&self, who: &Signed, space: &str, new: &NewDocument) -> Answer<Entry> {

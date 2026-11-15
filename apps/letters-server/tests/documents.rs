@@ -8,8 +8,8 @@ use std::io::Cursor;
 use axum::http::{Method, StatusCode};
 use common::{Server, names};
 use letters_api::{
-    Code, Entry, EntryKind, Listing, Move, NewDocument, NewFolder, Opened, Rename, Role, Settings, Space, SpaceKind,
-    Tag, Trust, paths,
+    Code, Entry, EntryKind, Error, Listing, Move, NewDocument, NewFolder, Opened, Rename, Role, Settings, Space,
+    SpaceKind, Tag, Trust, paths,
 };
 use letters_format::{Archive, MIMETYPE, WorkingCopy};
 use letters_model::{Document, ReplicaId, Style};
@@ -17,6 +17,11 @@ use letters_model::{Document, ReplicaId, Style};
 /// What the folder at `path` of a space lists for `who`.
 async fn listed(who: &common::Client, space: &str, path: &str) -> Vec<Entry> {
     who.get::<Listing>(&paths::entries(space, path)).await.expect("the folder lists").entries
+}
+
+/// The words as a dictionary answers them.
+fn owned(words: &[&str]) -> Vec<String> {
+    words.iter().map(|word| (*word).to_owned()).collect()
 }
 
 /// A smallest PNG, by its first bytes.
@@ -355,6 +360,45 @@ async fn what_a_person_opened_lately_is_listed_newest_first() {
 }
 
 #[tokio::test]
+async fn a_dictionary_changes_a_word_at_a_time_and_only_so() {
+    let server = Server::new("words");
+    let ben = server.person("ben", &[]);
+    assert!(ben.get::<Vec<String>>(paths::DICTIONARY).await.unwrap().is_empty());
+
+    // A word already there and a word already gone are no trouble, and a word is told from another
+    // exactly as it is written.
+    let steps: [(Method, &str, &[&str]); 6] = [
+        (Method::PUT, "yewi", &["yewi"]),
+        (Method::PUT, "naïve/2", &["yewi", "naïve/2"]),
+        (Method::PUT, "yewi", &["yewi", "naïve/2"]),
+        (Method::PUT, "Yewi", &["yewi", "naïve/2", "Yewi"]),
+        (Method::DELETE, "yewi", &["naïve/2", "Yewi"]),
+        (Method::DELETE, "yewi", &["naïve/2", "Yewi"]),
+    ];
+    for (method, word, then) in steps {
+        let answer = ben.send(method.clone(), &paths::word(word), "", Vec::new()).await;
+        assert_eq!(answer.json::<Vec<String>>(), owned(then), "{method} {word}");
+    }
+    let kept = owned(&["naïve/2", "Yewi"]);
+    assert_eq!(ben.get::<Vec<String>>(paths::DICTIONARY).await.unwrap(), kept);
+
+    // A device with an old list sends its settings whole: the words stay as they are, and the rest is kept.
+    let old = Settings { language: Some("en-GB".into()), dictionary: owned(&["yewi"]), ..Settings::default() };
+    let told = ben.put::<Settings>(paths::SETTINGS, &old).await.unwrap();
+    assert_eq!((told.language.as_deref(), &told.dictionary), (Some("en-GB"), &kept));
+    assert_eq!(ben.get::<Settings>(paths::SETTINGS).await.unwrap().dictionary, kept);
+
+    // What is not one word is refused, and the words are the person's own.
+    let long = "a".repeat(65);
+    for word in ["two words", "tab\tbed", long.as_str()] {
+        let refused = ben.send(Method::PUT, &paths::word(word), "", Vec::new()).await;
+        assert_eq!(refused.json::<Error>().code, Code::Invalid, "{word}");
+    }
+    assert_eq!(ben.get::<Vec<String>>(paths::DICTIONARY).await.unwrap(), kept);
+    assert!(server.person("alice", &[]).get::<Vec<String>>(paths::DICTIONARY).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn what_a_person_set_is_kept_and_shapes_their_new_documents() {
     let server = Server::new("settings");
     let ben = server.person("ben", &[]);
@@ -365,7 +409,6 @@ async fn what_a_person_set_is_kept_and_shapes_their_new_documents() {
     let settings = Settings {
         name: Some("Benjamin".into()),
         accent: Some([10, 120, 60]),
-        dictionary: vec!["yewi".into()],
         default_style: Some(serde_json::from_str(&style.to_json()).unwrap()),
         ..Settings::default()
     };
