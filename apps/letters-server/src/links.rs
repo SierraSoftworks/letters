@@ -143,6 +143,11 @@ impl Doors {
         entry.1 = entry.1.saturating_add(cost);
         entry.1 <= PER_MINUTE
     }
+
+    /// The seconds until whoever spent everything may spend anew.
+    fn anew(now: u64) -> u64 {
+        60 - now % 60
+    }
 }
 
 /// Where a request came from, as far as the server can tell.
@@ -351,7 +356,7 @@ impl App {
     pub fn enter(&self, token: &str, tried: Option<&str>, caller: &Caller) -> Answer<Door> {
         let now = self.now();
         if !self.doors.spend(&caller.address, if tried.is_some() { TRY } else { 1 }, now) {
-            return Err(Refusal::new(Code::Slow, "Too many tries from here. Wait a minute, and try again."));
+            return Err(Refusal::slow(Doors::anew(now), "Too many tries from here. Wait a minute, and try again."));
         }
         let (leads, kept) = self.follow(token, caller)?;
         match tried {
@@ -417,8 +422,9 @@ impl App {
     /// Counts a picture or a preview the server is asked to fetch. Whoever only a link let in may ask for
     /// so many a minute in one visit.
     pub(crate) fn fetching(&self, who: &Signed) -> Answer<()> {
-        if who.alone() && !self.doors.spend(&format!("visit {}", who.session), 1, self.now()) {
-            return Err(Refusal::new(Code::Slow, "Too many pictures and previews at once. Wait a minute."));
+        let now = self.now();
+        if who.alone() && !self.doors.spend(&format!("visit {}", who.session), 1, now) {
+            return Err(Refusal::slow(Doors::anew(now), "Too many pictures and previews at once. Wait a minute."));
         }
         Ok(())
     }

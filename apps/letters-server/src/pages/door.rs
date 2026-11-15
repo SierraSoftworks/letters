@@ -56,7 +56,6 @@ async fn knock(app: Shared, caller: Caller, token: String, tried: Option<String>
             card(&app, status, title, Card::Passphrase { action: paths::link_page(&token), wrong }, None).await
         }
         Err(refusal) => {
-            let slow = refusal.code() == Code::Slow;
             let (title, message) = match refusal.code() {
                 Code::Slow => ("Too many tries", "Wait a minute, and follow the link again."),
                 Code::NotFound => (
@@ -67,8 +66,8 @@ async fn knock(app: Shared, caller: Caller, token: String, tried: Option<String>
             };
             let said = Card::Failed { title: title.into(), message: message.into(), again: None };
             let mut response = card(&app, status(&refusal), title, said, None).await;
-            if slow {
-                response.headers_mut().insert(RETRY_AFTER, HeaderValue::from_static("60"));
+            if let Some(seconds) = refusal.wait() {
+                response.headers_mut().insert(RETRY_AFTER, HeaderValue::from(seconds));
             }
             response
         }

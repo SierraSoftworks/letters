@@ -65,7 +65,7 @@ impl Fetches {
     /// Waits for a turn to fetch, as long as a fetch itself may take. The turn is to be kept until the
     /// fetch has ended, whether or not whoever asked still waits for it.
     pub async fn turn(&self) -> Answer<OwnedSemaphorePermit> {
-        let busy = || Refusal::new(Code::Slow, "The server is fetching all it can just now. Try again in a moment.");
+        let busy = || Refusal::slow(5, "The server is fetching all it can just now. Try again in a moment.");
         let turn = tokio::time::timeout(LIMIT, self.turns.clone().acquire_owned()).await;
         turn.map_err(|_| busy())?.map_err(|_| busy())
     }

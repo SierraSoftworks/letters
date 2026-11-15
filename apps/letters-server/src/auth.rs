@@ -276,7 +276,7 @@ impl App {
         })?;
         match room {
             true => Ok((address, state)),
-            false => Err(Refusal::new(Code::Slow, "Too many sign-ins are under way. Try again in a few minutes.")),
+            false => Err(Refusal::slow(3 * 60, "Too many sign-ins are under way. Try again in a few minutes.")),
         }
     }
 

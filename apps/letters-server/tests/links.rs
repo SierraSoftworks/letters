@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 
 use axum::http::{Method, StatusCode};
 use common::desk::{Desk, settle};
-use common::{Browser, Client, START, Server, URL, follow, let_in, link, planned, texts};
+use common::{Browser, Client, Raw, START, Server, URL, follow, let_in, link, planned, texts};
 use letters_api::{
     Allows, Code, CreatedLink, Entry, Error, Fetch, Listing, NewLink, Opened, Rename, Role, Shares, Tag, Trust, paths,
 };
@@ -22,6 +22,11 @@ async fn counted(ada: &Client) -> Option<u32> {
 /// Whether the document opens trusted in a browser.
 async fn trusted(browser: &mut Browser, id: &str) -> Trust {
     browser.get(&paths::document(id)).await.json::<Opened>().trust
+}
+
+/// The seconds a refusal says to wait before asking again. None, when it does not say.
+fn waits(refused: &Raw) -> u64 {
+    refused.header("retry-after").parse().unwrap_or(0)
 }
 
 /// Follows a link that leads nowhere on the server at `at`, as a proxy in front of it would for `address`.
@@ -200,7 +205,8 @@ async fn a_link_that_asks_a_passphrase_lets_in_whoever_knows_it_and_takes_few_gu
         }
         guesses += 1;
     };
-    assert_eq!((slow.status, slow.header("retry-after")), (StatusCode::TOO_MANY_REQUESTS, "60"));
+    assert_eq!(slow.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!((1..=60).contains(&waits(&slow)), "the card's answer says when to try again");
     assert!(guesses <= 5, "{guesses} guesses in a minute");
     assert_eq!(guesser.submit(at, &right, None).await.status, StatusCode::TOO_MANY_REQUESTS);
     server.wait(60);
@@ -324,6 +330,7 @@ async fn a_visit_asks_the_server_for_so_many_fetches_a_minute_and_no_more() {
     };
     assert_eq!(slow.status, StatusCode::TOO_MANY_REQUESTS, "after {fetched}");
     assert!(fetched >= 10, "a page with some pictures loads: {fetched}");
+    assert!((1..=60).contains(&waits(&slow)), "the answer says when to ask again");
 
     // Someone signed in is not counted with them, and the next minute the visit asks again.
     let signed = ben.post::<()>(&paths::fetch_picture(&id), &fetch).await;
