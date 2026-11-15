@@ -18,11 +18,13 @@ server that adds identity, sharing and sync without owning any content.
 - `crates/letters-test`: the headless interaction-test harness.
 - `apps/letters`: the desktop app.
 - `apps/letters-web`: the browser shell, which paints the same engine on a canvas.
+- `fuzz`: the fuzz targets, which a nightly workflow runs and files issues from.
 
 ## Working on it
 
 ```sh
 ./scripts/check.sh   # format, lint, test and the wasm build
+./scripts/fuzz       # names the fuzz targets, and runs one under AFL++ when given its name
 ```
 
 The browser shell is built and tested from `apps/letters-web`:

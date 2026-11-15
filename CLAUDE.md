@@ -29,4 +29,6 @@ Build what it specifies, and prefer simple and polished over complex.
   agreed but not built.
 - **Tests.** Cover core use cases and failure modes through public interfaces. Use data-driven cases and
   shared fixtures, keep assertions in the test body, and assert on what the user needs, not on exact output.
+- **Fuzzing.** `./scripts/fuzz <target>` runs a target of `fuzz/`, and a nightly workflow files what they find
+  as issues. The fix for a finding keeps its input in `fuzz/corpus/<target>/`, where the tests run it.
 - **Dependencies.** Shared versions live in the root `Cargo.toml`. Pure Rust only in the core.
