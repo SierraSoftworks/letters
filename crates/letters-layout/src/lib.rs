@@ -38,6 +38,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
+use std::sync::Arc;
 
 use letters_model::{BlockId, BlockKind, Body, Change, Document, Markers, Page, Pos, Selection, Style};
 use letters_render::{DisplayList, Font, Item, Point, Rect, Role as Tag};
@@ -46,7 +47,7 @@ use parley::{Alignment, Language};
 use crate::engine::Engine;
 use crate::flow::{Frame, Leaf, Look, Part, Role, Table, Types, What, Words};
 use crate::ink::{Brush, Ink, Inks};
-use crate::leaf::{Extent, Laid, Lay, Over, Painter, Source, Text};
+use crate::leaf::{Extent, Laid, Lay, Open, Over, Painter, Source, Swap, Text};
 use crate::reveal::{Reveal, Shapes, Shifts};
 
 pub use crate::paginate::{Heading, PageLink, Pages, Sheet};
@@ -147,6 +148,8 @@ impl DocLayout {
             clock: 0,
             open: None,
             in_place: true,
+            good: None,
+            stands: false,
             numbers: HashMap::new(),
             scratch: Laid::default(),
         };
@@ -219,8 +222,14 @@ impl DocLayout {
 
     /// Sets whether a formula shows its source in its place while the caret is in it, which it does until
     /// set. A window that shows the source on a sheet of its own turns this off: every formula then stays
-    /// typeset, and [`DocLayout::formula_rect`] is where the sheet hangs. Turning it on shows the source
-    /// from the next [`DocLayout::reveal`].
+    /// typeset, and [`DocLayout::formula_rect`] is where the sheet hangs. Either way takes hold at the next
+    /// [`DocLayout::reveal`].
+    ///
+    /// A formula that stays typeset does so while it is being written too. When its source stops being
+    /// TeX that can be typeset, as at every half-typed command, it stands as it last was typeset for as
+    /// long as the caret is in it, so its line does not jump. [`DocLayout::reveal`] returns `true` when the
+    /// caret leaves one that stands so: it then shows as written, in the colour of a warning. Only the
+    /// screen keeps what was: a sheet shows the document.
     pub fn set_formula_source(&mut self, in_place: bool) {
         self.state.get_mut().set_formula_source(in_place);
     }
@@ -423,10 +432,14 @@ struct State {
     held: usize,
     /// Counts queries, to tell which layouts were used last.
     clock: u64,
-    /// The formula whose source shows in its place: its block, and which of the block's formulas it is.
+    /// The formula the caret is in: its block, and which of the block's formulas it is.
     open: Option<(BlockId, usize)>,
     /// Whether the formula the caret is in shows its source in its place.
     in_place: bool,
+    /// The last source of the formula the caret is in that could be typeset.
+    good: Option<Arc<str>>,
+    /// Whether that formula is set from it now, because its source as written cannot be typeset.
+    stands: bool,
     /// The number of each numbered figure and gallery.
     numbers: HashMap<BlockId, u32>,
     /// A layout to measure with, so that measuring allocates nothing.
@@ -591,45 +604,71 @@ impl State {
         if self.shapes.len() > 64 {
             self.shapes.clear();
         }
-        // The formula the caret is in or beside shows its source, and the one it has left is typeset again.
         let formula = |caret: &Pos| {
             let Slot { leaf, part } = *self.index.get(&caret.block)?;
             Some((caret.block.clone(), self.leaves[leaf].formula(part, caret.offset)?.0))
         };
-        let open = at.filter(|_| self.in_place).and_then(|(caret, _)| formula(caret));
-        let reset = open != self.open;
+        let open = at.and_then(|(caret, _)| formula(caret));
+        // The formula the caret has left is set as the document has it again, where it was not: its source
+        // showed, or it stood as it last could be typeset.
+        let moved = open != self.open;
+        let reset = moved && self.shows_open();
         if reset {
             self.unlay_open();
-            self.open = open;
+        }
+        if moved {
+            (self.open, self.good, self.stands) = (open, None, false);
             self.unlay_open();
+            // One that stays typeset is set at once, to know what it is set from before its source changes.
+            if let Some(&Slot { leaf, .. }) = self.open_slot().filter(|_| !self.in_place) {
+                self.lay(leaf);
+            }
         }
         self.reveal.set(at) | reset
     }
 
     fn set_formula_source(&mut self, in_place: bool) {
-        self.in_place = in_place;
-        if !in_place {
+        if self.in_place != in_place {
+            // Which formula the caret is in is told again by the next reveal.
             self.unlay_open();
-            self.open = None;
+            (self.in_place, self.open, self.good, self.stands) = (in_place, None, None, false);
         }
     }
 
-    /// Drops the layout of the leaf whose formula shows its source, which is laid out again when the
-    /// formula opens or closes.
+    fn open_slot(&self) -> Option<&Slot> {
+        self.open.as_ref().and_then(|(block, _)| self.index.get(block))
+    }
+
+    /// Whether the caret's being in a formula changes what the page shows.
+    fn shows_open(&self) -> bool {
+        self.in_place || self.stands
+    }
+
+    /// Drops the layout of the leaf with the formula the caret is in, which is laid out again when the
+    /// caret comes or goes. A cell whose formula stands as it was is measured again too: as written, it is
+    /// another size.
     fn unlay_open(&mut self) {
-        if let Some(&Slot { leaf, .. }) = self.open.as_ref().and_then(|(block, _)| self.index.get(block)) {
-            self.unlay(leaf);
+        let Some(&Slot { leaf, part }) = self.open_slot() else { return };
+        let table = self.tables.get_mut(self.leaves[leaf].table).filter(|_| self.stands);
+        if let (Part::Cell(index), Some(table)) = (part, table) {
+            (self.leaves[leaf].cells[index].fit, table.sized) = (None, false);
         }
+        self.unlay(leaf);
     }
 
-    /// Runs `work` on the document as it prints, where no formula shows its source. The pages of one
+    /// Runs `work` on the document as it prints, where no formula shows for the caret. The pages of one
     /// pagination are then the same wherever the caret goes meanwhile.
     fn printed<T>(&mut self, work: impl FnOnce(&mut Self) -> T) -> T {
-        self.unlay_open();
+        let shows = self.shows_open();
+        if shows {
+            self.unlay_open();
+        }
         let open = self.open.take();
         let done = work(self);
         self.open = open;
-        self.unlay_open();
+        if shows {
+            self.unlay_open();
+        }
         done
     }
 
@@ -715,10 +754,23 @@ impl State {
     /// Shapes the texts of a leaf into `laid`, and records what they say of the leaf: its height, and the
     /// lines pagination may split it at.
     fn shape(&mut self, at: usize, laid: &mut Laid) {
-        let Self { engine, types, leaves, palette, locale, open, numbers, .. } = self;
+        let Self { engine, types, leaves, index, palette, locale, open, in_place, good, numbers, .. } = self;
         let leaf = &leaves[at];
+        // Whether the leaf has the formula the caret is in, and that stays typeset.
+        let slot = open.as_ref().filter(|_| !*in_place).and_then(|(block, _)| index.get(block));
+        let here = slot.is_some_and(|slot| slot.leaf == at);
         let page = leaf::Page { color: ink::of(types, palette, leaf.role), numbers };
-        leaf::lay(engine, types, leaf, &Lay { open: open.as_ref(), page, locale: *locale }, laid);
+        let open =
+            open.as_ref().map(|(block, which)| Open { block, which: *which, in_place: *in_place, good: good.as_ref() });
+        leaf::lay(engine, types, leaf, &Lay { open, page, locale: *locale }, laid);
+        if here {
+            // What the caret's formula is set from is kept, to stand while its source cannot be typeset.
+            let set = leaf::opened(leaf, laid);
+            self.stands = set.is_some_and(|(_, swap)| swap.kept.is_some());
+            if let Some((part, Swap { source, kept: None, .. })) = set {
+                self.good = leaf.text(part).and_then(|words| words.text.get(source.clone())).map(Arc::from);
+            }
+        }
         let Extent { height, lines, ends, joined } = leaf::extent(leaf, laid);
         let leaf = &mut self.leaves[at];
         (leaf.lines, leaf.ends, leaf.joined) = (lines, ends, joined);
@@ -734,11 +786,14 @@ impl State {
     /// Gives the table of a row its columns, when it still has cells that were never measured. This shapes
     /// each of those once, without breaking lines. Rows whose cells move are to be laid out again.
     fn size(&mut self, row: usize) {
-        let Self { engine, types, leaves, tables, palette, locale, numbers, scratch, .. } = self;
+        let Self { engine, types, leaves, tables, palette, locale, numbers, scratch, open, in_place, good, .. } = self;
         let leaf = &leaves[row];
         let Some(table) = tables.get_mut(leaf.table).filter(|table| leaf.what == What::Row && !table.sized) else {
             return;
         };
+        // A cell is as wide as its formulas are typeset, also while one shows its source for the caret.
+        let open = open.as_ref().filter(|_| !*in_place);
+        let open = open.map(|(block, which)| Open { block, which: *which, in_place: false, good: good.as_ref() });
         for at in table.rows.clone() {
             let page = leaf::Page { color: ink::of(types, palette, leaves[at].role), numbers };
             for index in 0..leaves[at].cells.len() {
@@ -746,7 +801,8 @@ impl State {
                 if leaf.cells[index].fit.is_some() {
                     continue;
                 }
-                let source = Source::cell(leaf, &leaf.cells[index], Alignment::Start, None, page);
+                let open = open.and_then(|open| open.of(leaf, Part::Cell(index)));
+                let source = Source::cell(leaf, &leaf.cells[index], Alignment::Start, open, page);
                 let fit = leaf::fit(engine, types, &source, *locale, &mut scratch.text);
                 leaves[at].cells[index].fit = Some(fit);
             }

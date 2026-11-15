@@ -34,6 +34,8 @@ pub(crate) struct Swap {
     pub shown: Range<usize>,
     /// The em of the formula set there, and whether it is set as a block. `None` for text.
     pub maths: Option<(f32, bool)>,
+    /// What the formula is set from, when its source as written cannot be typeset.
+    pub kept: Option<Arc<str>>,
 }
 
 /// A text as laid out. Its layout may hold other text than its source: a formula is one box in place of its
@@ -45,6 +47,8 @@ pub(crate) struct Set {
     pub shown: Option<String>,
     /// Where the layout's text departs from the source, in order.
     pub swaps: Vec<Swap>,
+    /// Which of them is the formula the caret is in, when that is typeset and not shown as its source.
+    pub open: Option<usize>,
 }
 
 impl Set {
@@ -114,9 +118,29 @@ pub(crate) struct Source<'a> {
     pub bold: bool,
     /// The whole text is the source of one formula, set as a block.
     pub formula: bool,
-    /// The formula whose source shows in its place, counted from the text's first: the one the caret is in.
-    pub open: Option<usize>,
+    /// The formula of this text that the caret is in.
+    pub open: Option<Open<'a>>,
     pub page: Page<'a>,
+}
+
+/// The formula the caret is in.
+#[derive(Clone, Copy)]
+pub(crate) struct Open<'a> {
+    pub block: &'a BlockId,
+    /// Which of its text's formulas it is, counted from the first.
+    pub which: usize,
+    /// Whether its source shows in its place. Otherwise it stays typeset.
+    pub in_place: bool,
+    /// The last of its sources that could be typeset, which it is set from while its source cannot be. So
+    /// the line does not jump at every half-written command.
+    pub good: Option<&'a Arc<str>>,
+}
+
+impl<'a> Open<'a> {
+    /// The formula, if it is in this text of a leaf.
+    pub fn of(self, leaf: &Leaf, part: Part) -> Option<Self> {
+        (leaf.owner(part) == Some(self.block)).then_some(self)
+    }
 }
 
 /// What a text takes from the page it is on.
@@ -130,7 +154,7 @@ pub(crate) struct Page<'a> {
 
 impl<'a> Source<'a> {
     /// A leaf's own text.
-    pub fn own(leaf: &'a Leaf, types: &Types, open: Option<usize>, page: Page<'a>) -> Self {
+    pub fn own(leaf: &'a Leaf, types: &Types, open: Option<Open<'a>>, page: Page<'a>) -> Self {
         // The source of a formula block reads from the left, as code does.
         let plain = leaf.boxed() || leaf.what == What::Formula;
         Self {
@@ -148,7 +172,7 @@ impl<'a> Source<'a> {
     }
 
     /// The text of a cell of a table row.
-    pub fn cell(leaf: &'a Leaf, cell: &'a Cell, align: Alignment, open: Option<usize>, page: Page<'a>) -> Self {
+    pub fn cell(leaf: &'a Leaf, cell: &'a Cell, align: Alignment, open: Option<Open<'a>>, page: Page<'a>) -> Self {
         Self {
             words: &cell.words,
             role: leaf.role,
@@ -201,6 +225,7 @@ fn build(
         *slot
     };
     set.swaps.clear();
+    set.open = None;
     // Code shows its text as written, whatever is marked in it.
     let swapped = source.role != Role::Code
         && (!source.words.refs.is_empty() || spans.iter().any(|span| span.marks & marks::MATH != 0));
@@ -225,7 +250,7 @@ fn build(
     if let Some(label) = &source.label {
         shown.push_str(label);
         shown.push(' ');
-        set.swaps.push(Swap { source: 0..0, shown: 0..shown.len(), maths: None });
+        set.swaps.push(Swap { source: 0..0, shown: 0..shown.len(), maths: None, kept: None });
         runs.push((slot(0), 0..shown.len()));
     }
     let whole = [flow::Span { end: text.len(), marks: if source.formula { marks::MATH } else { 0 } }];
@@ -241,30 +266,41 @@ fn build(
             let number = source.page.numbers.get(target).copied();
             shown.push_str(&types.reference(number));
             bits |= if number.is_none() { marks::MATH } else { 0 };
-            set.swaps.push(Swap { source: start..span.end, shown: from..shown.len(), maths: None });
+            set.swaps.push(Swap { source: start..span.end, shown: from..shown.len(), maths: None, kept: None });
         } else if span.marks & marks::MATH == 0 {
             shown.push_str(piece);
-        } else if formulas.next() == source.open || piece.trim().is_empty() {
-            // The formula the caret is in shows its source in its place, and so does one still to be written.
-            bits |= marks::CODE;
-            shown.push_str(piece);
-        } else if let Some((formula, size)) = typeset(engine, piece, like, source.width) {
-            shown.push(OBJECT);
-            boxes.push(InlineBox {
-                id: set.swaps.len() as u64,
-                kind: InlineBoxKind::InFlow,
-                index: from,
-                width: formula.size.width,
-                height: formula.size.height,
-                baseline: Some(formula.baseline),
-                vertical_align: VerticalAlign::default(),
-            });
-            let maths = Some((size, source.formula));
-            set.swaps.push(Swap { source: start..span.end, shown: from..shown.len(), maths });
         } else {
-            // A source that cannot be typeset shows as it is written, in the colour of a warning.
-            bits |= marks::CODE | marks::MATH;
-            shown.push_str(piece);
+            let which = formulas.next();
+            let open = source.open.filter(|open| Some(open.which) == which);
+            let good = open.and_then(|open| open.good);
+            if open.is_some_and(|open| open.in_place) || piece.trim().is_empty() {
+                // The formula the caret is in shows its source in its place, and so does one still to be
+                // written.
+                bits |= marks::CODE;
+                shown.push_str(piece);
+            } else if let Some(((formula, size), kept)) = typeset(engine, piece, like, source.width)
+                .map(|set| (set, None))
+                // While the caret is in it, the last of it that could be typeset stands in its place.
+                .or_else(|| Some((typeset(engine, good?, like, source.width)?, good.cloned())))
+            {
+                shown.push(OBJECT);
+                boxes.push(InlineBox {
+                    id: set.swaps.len() as u64,
+                    kind: InlineBoxKind::InFlow,
+                    index: from,
+                    width: formula.size.width,
+                    height: formula.size.height,
+                    baseline: Some(formula.baseline),
+                    vertical_align: VerticalAlign::default(),
+                });
+                let maths = Some((size, source.formula));
+                set.open = open.map(|_| set.swaps.len()).or(set.open);
+                set.swaps.push(Swap { source: start..span.end, shown: from..shown.len(), maths, kept });
+            } else {
+                // A source that cannot be typeset shows as it is written, in the colour of a warning.
+                bits |= marks::CODE | marks::MATH;
+                shown.push_str(piece);
+            }
         }
         if shown.len() > from {
             runs.push((slot(bits), from..shown.len()));
@@ -402,18 +438,15 @@ fn numbered(number: u32) -> String {
 
 /// How a leaf's texts are to be laid out, beyond what the leaf says itself.
 pub(crate) struct Lay<'a> {
-    /// The formula that shows its source in its place: its block, and which of the block's formulas it is.
-    pub open: Option<&'a (BlockId, usize)>,
+    /// The formula the caret is in.
+    pub open: Option<Open<'a>>,
     pub page: Page<'a>,
     pub locale: Option<Language>,
 }
 
 /// Lays out the texts of a leaf: its own, and those of its cells.
 pub(crate) fn lay(engine: &mut Engine, types: &Types, leaf: &Leaf, how: &Lay<'_>, laid: &mut Laid) {
-    let open = |part: Part| {
-        let (block, which) = how.open?;
-        (leaf.owner(part) == Some(block)).then_some(*which)
-    };
+    let open = |part: Part| how.open.and_then(|open| open.of(leaf, part));
     if leaf.what != What::Row {
         let source = Source::own(leaf, types, open(Part::Text), how.page);
         shape(engine, types, &source, how.locale, &mut laid.text);
@@ -423,6 +456,13 @@ pub(crate) fn lay(engine: &mut Engine, types: &Types, leaf: &Leaf, how: &Lay<'_>
         let source = Source::cell(leaf, cell, cell.align, open(Part::Cell(index)), how.page);
         shape(engine, types, &source, how.locale, set);
     }
+}
+
+/// The formula the caret is in, where a leaf's layout has it typeset: the text it is in, and its swap.
+pub(crate) fn opened<'a>(leaf: &Leaf, laid: &'a Laid) -> Option<(Part, &'a Swap)> {
+    let cells = laid.cells.iter().enumerate().map(|(index, set)| (Part::Cell(index), set));
+    let own = (leaf.what != What::Row).then_some((Part::Text, &laid.text));
+    own.into_iter().chain(cells).find_map(|(part, set)| Some((part, set.swaps.get(set.open?)?)))
 }
 
 /// Adds to a leaf's layout what is drawn beside its text: the sign its marker needs, and the names on
@@ -923,8 +963,8 @@ impl Painter<'_> {
     /// Draws the formula of one of a text's swaps with the top left of its box at `origin`. The cache holds
     /// it from when the text was shaped, unless the colours have changed since.
     fn formula(&mut self, text: &Text<'_>, swap: usize, origin: Point) {
-        let Some(Swap { source, maths: Some((size, display)), .. }) = text.set.swaps.get(swap) else { return };
-        let Some(source) = text.source.text.get(source.clone()) else { return };
+        let Some(Swap { source, maths: Some((size, display)), kept, .. }) = text.set.swaps.get(swap) else { return };
+        let Some(source) = kept.as_deref().or_else(|| text.source.text.get(source.clone())) else { return };
         let color = self.inks.ink(Ink::Style(text.role));
         let style = Maths { size: *size, color, display: *display, links: self.engine.links };
         if let Ok(formula) = self.engine.maths.typeset(source, &style) {

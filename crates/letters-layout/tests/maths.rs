@@ -1,8 +1,8 @@
 //! Formulas: typeset in a line of text or as a block of their own, shown as their source at the caret, and
 //! shown as written when they cannot be typeset.
 
-use letters_layout::Palette;
-use letters_model::{BlockKind, Document, Mark, Markers, Model, Op, Pos, ReplicaId, Style};
+use letters_layout::{DocLayout, Palette};
+use letters_model::{Align, BlockKind, Document, Mark, Markers, Model, Op, Pos, ReplicaId, Style};
 use letters_render::{Color, Item, Point, Rect};
 
 mod common;
@@ -44,6 +44,20 @@ fn both(tex: &str) -> [Case; 2] {
     let (doc, as_code) = (block(tex, true), block(tex, false));
     let alone = Case { name: "as a block", doc, as_code, block: "f", ends: (0, tex.len()), outside: Pos::new("p", 0) };
     [in_line, alone]
+}
+
+/// A table whose first cell, `t00`, holds `tex` as a formula.
+fn cell(tex: &str) -> Document {
+    let table = table("t", &[Align::Start, Align::Start], false, &[&[tex, "Rate"], &["Mass", "Energy"]]);
+    let mut model = Model::new(doc(vec![table, paragraph("z", "End")]), ReplicaId::from(1));
+    model.apply(vec![Op::SetMark { block: "t00".into(), range: 0..tex.len(), mark: Mark::Math, on: true }]).unwrap();
+    model.doc().clone()
+}
+
+/// Makes an edit and brings the layout up to date with it.
+fn edited(model: &mut Model, layout: &mut DocLayout, ops: Vec<Op>) {
+    let change = model.apply(ops).unwrap();
+    layout.update(model.doc(), &Style::default(), WIDTH, Some(&change));
 }
 
 /// The items anchored inside `place`: a run by the start of its baseline, a box by its corner, a path by its
@@ -202,6 +216,45 @@ fn a_formula_stays_typeset_where_its_source_shows_elsewhere() {
         assert_ne!(painted(&layout, everything()), typeset, "{name}: as its source");
         layout.set_formula_source(false);
         assert_eq!(painted(&layout, everything()), typeset, "{name}: and closes when that ends");
+    }
+}
+
+#[test]
+fn a_formula_stands_as_it_was_while_its_source_cannot_be_typeset() {
+    let (none, warning) = (Markers::default(), Palette::LIGHT.warn.accent);
+    let typing = |block: &str, offset: usize, text: &str| {
+        vec![Op::InsertText { at: Pos::new(block, offset), text: text.into() }]
+    };
+    let cases = both(TEX).map(|case| (case.name, case.doc, case.block, case.ends.1, case.outside));
+    let in_a_cell = ("in a cell", cell(TEX), "t00", TEX.len(), Pos::new("z", 0));
+    for (name, doc, id, end, outside) in cases.into_iter().chain([in_a_cell]) {
+        let mut model = Model::new(doc, ReplicaId::from(1));
+        let mut layout = laid(model.doc());
+        layout.set_formula_source(false);
+        let at = |offset: usize| Pos::new(id, offset);
+        layout.reveal(Some((&at(end), &none)));
+        let whole = painted(&layout, everything());
+
+        // A command half typed where the source shows.
+        edited(&mut model, &mut layout, typing(id, end, r"\ap"));
+        assert!(!layout.reveal(Some((&at(end + 3), &none))), "{name}: nothing opens");
+        assert!(painted(&layout, everything()) == whole, "{name}: it stands as it was last typeset");
+        assert!(spelt(&layout).contains(r"\ap"), "{name}: a sheet shows what is written");
+        assert!(painted(&layout, everything()) == whole, "{name}: and the screen is as it was after printing");
+
+        assert!(layout.reveal(Some((&outside, &none))), "{name}: it gives way when the caret leaves");
+        let broken = painted(&layout, everything());
+        assert!(!inked(&broken, warning).is_empty(), "{name}: its source shows as a warning");
+        assert!(broken == painted(&laid(model.doc()), everything()), "{name}: as the document has it");
+        layout.reveal(Some((&at(end + 3), &none)));
+        assert!(painted(&layout, everything()) == broken, "{name}: with nothing to stand for it, the source stays");
+
+        edited(&mut model, &mut layout, typing(id, end + 3, "prox c"));
+        let mended = painted(&layout, everything());
+        assert!(mended == painted(&laid(model.doc()), everything()), "{name}: a source that parses is typeset again");
+        assert!(mended != whole && inked(&mended, warning).is_empty(), "{name}: as it now reads");
+        edited(&mut model, &mut layout, typing(id, end + 9, "^{"));
+        assert!(painted(&layout, everything()) == mended, "{name}: and that stands when it breaks again");
     }
 }
 
