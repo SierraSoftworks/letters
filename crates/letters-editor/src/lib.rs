@@ -13,6 +13,7 @@ mod figures;
 mod find;
 mod input;
 mod keymap;
+mod lang;
 mod links;
 mod markers;
 mod merge;
@@ -39,6 +40,7 @@ pub use callout::CalloutEdit;
 pub use figures::Spot;
 pub use find::{BadQuery, Query, Seek};
 pub use keymap::Keymap;
+pub use lang::Lang;
 /// The markers [`Editor::markers`] returns. They live in the model so that layout can draw them.
 pub use letters_model::{Marker, Markers};
 use merge::Kept;
@@ -309,6 +311,14 @@ pub enum Command {
     ReplaceStyle(Style),
     /// Sets the language the document is written in.
     SetLanguage(String),
+    /// Says what language a passage is written in, as a BCP 47 tag, where it is another than the
+    /// document's. `None` leaves it to what is around it again. [`Editor::lang`] tells the one in force.
+    ///
+    /// At a caret it is said of the block the caret is in. Of a selection it is said of the selected
+    /// text, and of each block that is selected whole. A block it is said of takes it as its own, and
+    /// none of its text keeps another. Code and formulas have no language and are passed over. One undo
+    /// step.
+    SetLang(Option<String>),
     /// Adds a word to the document's own dictionary. [`Platform::learn_word`] keeps one for the person.
     AddWord(String),
     RemoveWord(String),
@@ -776,6 +786,7 @@ impl Editor {
                 ranged || !(caret.picture || matches!(kind, Some(BlockKind::Code { .. } | BlockKind::Formula)))
             }
             Command::SetLink(_) => ranged || self.link().is_some(),
+            Command::SetLang(_) => self.takes_lang(),
             Command::LinkAsCard => self.takes_card(),
             Command::Copy | Command::Cut => ranged || caret.picture,
             Command::LeaveFormula => self.formula().is_some(),
@@ -881,6 +892,7 @@ impl Editor {
             Command::Restore(revision) => self.restore_version(&revision),
             Command::ReplaceStyle(style) => _ = self.apply(vec![Op::ReplaceStyle { style }]),
             Command::SetLanguage(language) => _ = self.apply(vec![Op::SetLanguage { language }]),
+            Command::SetLang(lang) => self.set_lang(lang),
             Command::AddWord(word) => _ = self.apply(vec![Op::AddWord { word }]),
             Command::RemoveWord(word) => _ = self.apply(vec![Op::RemoveWord { word }]),
         }
@@ -907,6 +919,7 @@ impl Editor {
             Op::DeleteText { block, .. }
             | Op::SetMark { block, .. }
             | Op::SetLink { block, .. }
+            | Op::SetLang { block, .. }
             | Op::SetKind { block, .. }
             | Op::SetBlockProps { block, .. } => Some(block.clone()),
             _ => None,

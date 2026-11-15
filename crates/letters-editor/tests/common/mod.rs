@@ -756,6 +756,8 @@ pub fn action() -> impl Strategy<Value = Action> {
         Just(Command::AddWord("mot".into())),
         Just(Command::RemoveWord("mot".into())),
         Just(Command::SetLanguage("fr".into())),
+        Just(Command::SetLang(Some("fr".into()))),
+        Just(Command::SetLang(None)),
         Just(Command::InsertTable { rows: 2, columns: 2 }),
         Just(Command::InsertContents),
         Just(Command::InsertPreview("https://a.example".into())),
