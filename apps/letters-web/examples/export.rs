@@ -1,5 +1,5 @@
-//! The exports as a module of their own, which the page fetches when the person first prints or saves a
-//! copy.
+//! The exports and the reader of a document's file as a module of their own, which the page fetches when
+//! the person first prints, saves a copy or opens a file.
 //!
 //! They bring a PDF writer, the Word and web page writers, the picture decoders, font subsetting and the
 //! document's own file format: more than two megabytes that the editor's first frame would otherwise wait
@@ -10,7 +10,7 @@ use std::io::{Cursor, Write};
 
 use js_sys::{Array, Date, Map, Uint8Array};
 use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf};
-use letters_format::{MIMETYPE, OPLOG, Package};
+use letters_format::{ASSETS, Archive, Error, MIMETYPE, OPLOG, Package};
 use letters_layout::Fonts;
 use letters_model::{Document, Notes, Style};
 use wasm_bindgen::prelude::*;
@@ -127,4 +127,33 @@ fn zipped(files: impl Iterator<Item = (Vec<u8>, String)>) -> ZipResult<Vec<u8>> 
         zip.write_all(&file)?;
     }
     Ok(zip.finish()?.into_inner())
+}
+
+/// Reads a `.let` file for the editor to open. Returns its `document.json`, `style.json` and `notes.json`
+/// as this build writes them, its history as `Model::prepare` takes it, and its pictures by their names.
+///
+/// A style or notes that this build cannot read are `undefined`, as a newer build's may be, and so is the
+/// history of a file that has none.
+#[wasm_bindgen]
+pub fn opened(file: Vec<u8>) -> Result<Array, JsError> {
+    let mut file = Archive::open(Cursor::new(file))?;
+    let document = file.document()?.to_json();
+    let style = match file.style() {
+        Err(Error::Style(_)) => None,
+        style => Some(style?.to_json()),
+    };
+    let notes = match file.notes() {
+        Err(Error::Notes(_)) => None,
+        notes => Some(notes?.to_json()),
+    };
+    let history = file.read(OPLOG)?.map(|history| Uint8Array::from(&history[..]));
+    let assets = Map::new();
+    let names: Vec<String> = file.names().filter(|name| name.starts_with(ASSETS)).map(str::to_owned).collect();
+    for name in names {
+        // A picture that cannot be read is treated as missing, and its description stands in for it.
+        if let Ok(Some(picture)) = file.read(&name) {
+            assets.set(&name.into(), &Uint8Array::from(&picture[..]));
+        }
+    }
+    Ok(Array::of5(&document.into(), &style.into(), &notes.into(), &history.into(), &assets))
 }

@@ -5,13 +5,14 @@
 //! moves the hidden input under the caret, where the input method's candidate window should open.
 
 use std::cell::RefCell;
+use std::convert::Infallible;
 use std::ops::Range;
 use std::rc::{Rc, Weak};
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Array, Function, Map, Object, Promise, Reflect, Uint8Array};
-use letters_editor::{Clip, KeyEvent, Modifiers, Picture, Platform as _};
-use letters_model::{BlockKind, Document, HistoryError, Mark, Pos, ReplicaId, Selection};
+use letters_editor::{Clip, Editor, KeyEvent, Modifiers, Picture, Platform as _};
+use letters_model::{BlockKind, Document, HistoryError, Mark, Model, Notes, Pos, ReplicaId, Selection, Style};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::{Color, DisplayList, Point, Rect, Size};
 use letters_trust::{LinkDecision, Origin, Trust};
@@ -64,6 +65,11 @@ const DOT: f32 = 7.0;
 
 /// The kinds of picture a document keeps, which is what the person is offered to choose from.
 const PICTURES: &str = "image/png,image/jpeg,image/gif,image/webp";
+/// What a document's file is called, which is what the person is offered to open.
+const DOCUMENTS: &str = ".let";
+/// What the Comment tool says of a document whose notes this build could not read, as the desktop does.
+const NO_COMMENTS: &str = "Comments cannot be added here: this document's notes are in a form this version of \
+                           Letters cannot read.";
 
 /// The mirror: over the canvas, so that what it says about where things are is true, and out of sight and
 /// out of the pointer's way. Its text is not for the eye, so the page lays out as little of it as it can.
@@ -146,6 +152,11 @@ pub struct Shell {
     chooser: HtmlInputElement,
     /// The file input the person chooses pictures with.
     picker: HtmlInputElement,
+    /// The file input the person chooses a document to open with.
+    opener: HtmlInputElement,
+    /// What `View::edits` said when the document was opened or last kept as a file of its own. What was
+    /// written since is nowhere but on the page.
+    kept: u64,
     /// The handles at the ends of the selection, the anchor's first, and how each was last styled.
     handles: [(HtmlElement, String); 2],
     /// Whether the page was last pressed by a finger, which is who the handles are for.
@@ -223,6 +234,11 @@ impl Shell {
             picker.set_attribute(name, value)?;
         }
         chooser.insert_adjacent_element("afterend", &picker)?;
+        let opener: HtmlInputElement = document.create_element("input")?.dyn_into()?;
+        for (name, value) in [("type", "file"), ("accept", DOCUMENTS), ("hidden", ""), ("tabindex", "-1")] {
+            opener.set_attribute(name, value)?;
+        }
+        picker.insert_adjacent_element("afterend", &opener)?;
         let handle = || -> Result<(HtmlElement, String), JsValue> {
             let handle: HtmlElement = document.create_element("div")?.dyn_into()?;
             for (name, value) in [("data-letters", "handle"), ("aria-hidden", "true"), ("hidden", "")] {
@@ -256,6 +272,8 @@ impl Shell {
                 mirror_timer: None,
                 chooser: chooser.clone(),
                 picker: picker.clone(),
+                opener: opener.clone(),
+                kept: view.edits(),
                 handles: handles.clone(),
                 fingers: false,
                 editing: false,
@@ -339,6 +357,7 @@ impl Shell {
         })?;
 
         hear(&shell, &picker, "change", Self::picked)?;
+        hear(&shell, &opener, "change", Self::chosen)?;
         hear(&shell, &canvas, "dragover", Self::drag_over)?;
         hear(&shell, &canvas, "dragleave", |shell, _: Event| _ = shell.view.drag_pictures(None))?;
         hear(&shell, &canvas, "drop", Self::drop)?;
@@ -406,6 +425,7 @@ impl Shell {
     /// Shows `document` in place of the one on screen.
     pub fn open(&mut self, document: Document) {
         self.view = view(document, &mut self.platform, self.mac);
+        self.kept = self.view.edits();
         self.text = TextInput::new(self.mac);
         self.touch = Touch::default();
         self.rest();
@@ -560,26 +580,38 @@ impl Shell {
             assets.into(),
             history.into(),
         ];
+        self.ask("exported", asked.into_iter().collect(), |shell, made| {
+            let made = made.map(|made| Exported {
+                name: made.get(0).as_string(),
+                kind: made.get(1).as_string().unwrap_or_default(),
+                file: made.get(2),
+            });
+            then(shell, made);
+        });
+    }
+
+    /// Calls a function of the exports with what is `asked`, and hands `then` what it returns, or why
+    /// there is nothing in words that end a sentence.
+    fn ask(
+        &mut self,
+        function: &'static str,
+        asked: Array,
+        then: impl FnOnce(&mut Self, Result<Array, String>) + 'static,
+    ) {
         self.exporting += 1;
         let (shell, exporter) = (self.me.clone(), self.exporter());
         wasm_bindgen_futures::spawn_local(async move {
             let asked_of = exporter.clone();
             let exporter = JsFuture::from(exporter).await;
             let made = match &exporter {
-                Ok(exporter) => call(exporter, "exported", &asked.into_iter().collect()).map_err(|error| said(&error)),
+                Ok(exporter) => {
+                    call(exporter, function, &asked).map(JsCast::unchecked_into).map_err(|error| said(&error))
+                }
                 Err(error) => {
                     web_sys::console::error_1(error);
-                    Err("what writes it could not be fetched".to_owned())
+                    Err("the part of Letters that does it could not be fetched".to_owned())
                 }
             };
-            let made = made.map(|made| {
-                let made: Array = made.unchecked_into();
-                Exported {
-                    name: made.get(0).as_string(),
-                    kind: made.get(1).as_string().unwrap_or_default(),
-                    file: made.get(2),
-                }
-            });
             let Some(shell) = shell.upgrade() else { return };
             let mut shell = shell.borrow_mut();
             shell.exporting -= 1;
@@ -602,7 +634,8 @@ impl Shell {
             CopyFormat::WebPage => "html",
             CopyFormat::Markdown => "md",
         };
-        self.export(format, name, |shell, made| {
+        let written = self.view.edits();
+        self.export(format, name, move |shell, made| {
             let failed = |why: String| format!("The copy could not be written: {why}.");
             let refused = match made {
                 Ok(Exported { name: None, .. }) => Some("A copy needs a name.".to_owned()),
@@ -613,9 +646,106 @@ impl Shell {
             };
             match refused {
                 Some(notice) => shell.view.refuse_copy(&notice, false),
-                None => shell.view.set_copied("your downloads"),
+                None => {
+                    // A document of its own holds everything written up to when it was asked for.
+                    if format == "let" {
+                        shell.kept = written;
+                    }
+                    shell.view.set_copied("your downloads");
+                }
             }
         });
+    }
+
+    // Opening a file
+
+    /// The document the person chose after "Open" takes the place of the one on the page.
+    fn chosen(&mut self, _: Event) {
+        let file = self.opener.files().and_then(|files| files.get(0));
+        // The same file chosen again is a change again.
+        self.opener.set_value("");
+        if let Some(file) = file {
+            self.open_file(file);
+        }
+    }
+
+    /// Opens a document's file in place of the document on the page, which has nowhere to be kept: the
+    /// person is asked first when they wrote in it. What reads the file is fetched the first time.
+    fn open_file(&mut self, file: File) {
+        let name = file.name();
+        let name = name.strip_suffix(DOCUMENTS).unwrap_or(&name).to_owned();
+        if self.view.edits() != self.kept {
+            let lost = format!(
+                "Open \u{201c}{name}\u{201d} in place of this document? What was written here is not kept unless \
+                 a copy of it was saved."
+            );
+            if !self.window.confirm_with_message(&lost).unwrap_or(false) {
+                return;
+            }
+        }
+        self.exporting += 1;
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let read = JsFuture::from(file.array_buffer()).await;
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            shell.exporting -= 1;
+            let failed = |name: &str, why: String| format!("\u{201c}{name}\u{201d} could not be opened: {why}.");
+            match read {
+                Ok(read) => shell.ask("opened", Array::of1(&Uint8Array::new(&read)), move |shell, file| {
+                    if let Err(why) = file.and_then(|file| shell.show_file(&name, &file)) {
+                        shell.say(failed(&name, why));
+                    }
+                }),
+                Err(error) => shell.say(failed(&name, said(&error))),
+            }
+            shell.sync();
+        });
+    }
+
+    /// Shows a file the exports read, called `name`, in place of the document on the page.
+    fn show_file(&mut self, name: &str, file: &Array) -> Result<(), String> {
+        let failed = |error: letters_model::JsonError| error.to_string();
+        let text = |at: u32| file.get(at).as_string();
+        let document = Document::from_json(&text(0).unwrap_or_default()).map_err(failed)?;
+        // The built-in style stands in for one this build cannot read, as it does on the desktop.
+        let style = text(1).map(|style| Style::from_json(&style)).transpose().map_err(failed)?.unwrap_or_default();
+        let notes = text(2).map(|notes| Notes::from_json(&notes)).transpose().map_err(failed)?;
+        let history = Some(file.get(3)).filter(|history| !history.is_undefined());
+        let pictures: Map = file.get(4).unchecked_into();
+
+        // The page shows the file as it is. Its history takes the document in, so that a file changed
+        // outside Letters is still the document.
+        let replica = ReplicaId::new(&self.platform.new_id());
+        let shown = || Model::new(document.clone(), replica).with_style(style.clone());
+        let mut view = set_up(View::new(Editor::with_model(shown())), &mut self.platform, self.mac);
+        if let Some(history) = history {
+            match shown().prepare(Some(&Uint8Array::new(&history).to_vec())) {
+                Ok(history) => _ = view.change(|editor| Ok::<_, Infallible>(editor.attach(history))),
+                // A history that cannot be read starts over from the document.
+                Err(error) => web_sys::console::error_1(&format!("{name}: {error}").into()),
+            }
+        }
+        match notes {
+            Some(notes) => view.set_notes(notes),
+            None => view.refuse_comments(Some(NO_COMMENTS)),
+        }
+        view.set_document_name(name);
+        if let Some(page) = self.window.document() {
+            page.set_title(name);
+        }
+        self.platform.assets.clear();
+        pictures.for_each(&mut |picture, name| {
+            let picture = Uint8Array::new(&picture).to_vec();
+            self.platform.assets.extend(name.as_string().map(|name| (name, picture)));
+        });
+        self.kept = view.edits();
+        self.view = view;
+        self.text = TextInput::new(self.mac);
+        self.touch = Touch::default();
+        self.rest();
+        self.show();
+        Ok(())
     }
 
     /// Makes the PDF of the document, which is what Print view shows, and hands it to the browser's print
@@ -741,6 +871,7 @@ impl Shell {
                     report(self.download(&json.into(), "application/json", &format!("{name}.letstyle")));
                 }
                 Request::Pictures => self.picker.click(),
+                Request::OpenDialog => self.opener.click(),
                 Request::Print => self.print(),
                 Request::Asset(name) => self.load(name),
                 Request::OpenLink { href, confirmed } => self.open_link(&href, confirmed),
@@ -753,7 +884,7 @@ impl Shell {
                 }
                 // A page has no folders to write in: a copy is a file the browser keeps for the person.
                 Request::SaveCopy { name, format, .. } => self.copy(name, format),
-                // Opening, starting and moving need files, which wait for a server behind the page.
+                // Recent documents, new ones and moves need files, which wait for a server behind the page.
                 _ => {}
             }
         }
@@ -1094,14 +1225,25 @@ impl Shell {
         let Some(data) = event.data_transfer().filter(|data| data.types().includes(&"Files".into(), 0)) else { return };
         // The browser would leave the page for a file let go on it, so every place answers.
         event.prevent_default();
-        let lands = self.view.drag_pictures(Some(Point { x: event.offset_x() as f32, y: event.offset_y() as f32 }));
-        data.set_drop_effect(if lands { "copy" } else { "none" });
+        // Until they are let go, files say only what kind they are. One that is no picture may be a
+        // document, which is opened wherever it lands.
+        let items = data.items();
+        let pictures =
+            (0..items.length()).filter_map(|at| items.get(at)).all(|item| item.type_().starts_with("image/"));
+        let at = Point { x: event.offset_x() as f32, y: event.offset_y() as f32 };
+        let lands = self.view.drag_pictures(pictures.then_some(at));
+        data.set_drop_effect(if lands || !pictures { "copy" } else { "none" });
     }
 
     fn drop(&mut self, event: DragEvent) {
         event.prevent_default();
         let at = Point { x: event.offset_x() as f32, y: event.offset_y() as f32 };
-        let files = files(event.data_transfer().and_then(|data| data.files()));
+        let mut files = files(event.data_transfer().and_then(|data| data.files()));
+        // A document among them is what was meant, and it takes the page.
+        if let Some(document) = files.iter().position(|file| file.name().ends_with(DOCUMENTS)) {
+            _ = self.view.drag_pictures(None);
+            return self.open_file(files.swap_remove(document));
+        }
         self.pictures(files, move |shell, pictures| {
             shell.view.insert_pictures(pictures, Some(at), &mut shell.platform)
         });
@@ -1354,7 +1496,11 @@ pub fn urls(base: &str, folder: &str, names: &[&str]) -> Vec<String> {
 
 /// A window on `document`, set up for this browser.
 fn view(document: Document, platform: &mut Browser, mac: bool) -> View {
-    let mut view = page::window(document, ReplicaId::new(&platform.new_id()));
+    set_up(page::window(document, ReplicaId::new(&platform.new_id())), platform, mac)
+}
+
+/// Sets a window up for this browser and the person in it.
+fn set_up(mut view: View, platform: &mut Browser, mac: bool) -> View {
     view.set_keys(if mac { Keys::Mac } else { Keys::Standard });
     view.set_user_words(platform.user_words());
     view.set_default_style(platform.default_style());

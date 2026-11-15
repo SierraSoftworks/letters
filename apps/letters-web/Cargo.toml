@@ -38,6 +38,8 @@ web-sys = { workspace = true, features = [
   "Crypto",
   "CssStyleDeclaration",
   "DataTransfer",
+  "DataTransferItem",
+  "DataTransferItemList",
   "Document",
   "DragEvent",
   "DomRect",
