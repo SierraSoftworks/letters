@@ -143,6 +143,9 @@ cap-std = "4"
 # Checks the identity provider's signature on an ID token, in Rust alone.
 jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"] }
 toml = "1"
+# The server's own pages: yewi components drawn where they are served, so that no wasm goes to the browser.
+yew = { version = "0.23", default-features = false, features = ["ssr"] }
+yewi = { version = "0.3", features = ["ssr", "fonts"] }
 # Drives the server's routes in its tests with no socket between.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 http-body-util = "0.1"

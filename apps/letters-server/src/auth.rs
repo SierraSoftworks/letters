@@ -89,13 +89,13 @@ pub fn no_session_cookie(app: &App) -> HeaderValue {
 }
 
 /// `to` when it is a place on this server, and the front page when it could lead anywhere else.
-fn local(to: Option<&str>) -> String {
+pub fn local(to: Option<&str>) -> String {
     let inside = |to: &&str| to.starts_with('/') && !to.starts_with("//") && !to.contains(['\\', '\r', '\n']);
     to.filter(inside).unwrap_or(paths::HOME_PAGE).to_owned()
 }
 
 /// The browser's own session, when it has one.
-fn browser(app: &App, method: &Method, headers: &HeaderMap) -> Answer<Signed> {
+pub fn browser(app: &App, method: &Method, headers: &HeaderMap) -> Answer<Signed> {
     Signed::read(app, method, headers).and_then(|who| match who.carrier {
         Carrier::Cookie => Ok(who),
         Carrier::Bearer => Err(Refusal::signed_out()),
@@ -123,7 +123,7 @@ async fn sign_in(State(app): State<Shared>, headers: HeaderMap, Query(start): Qu
             let state = cookie(&app, STATE_COOKIE, &state, STATE_PATH, SIGN_IN_TIME);
             ([(SET_COOKIE, state)], Redirect::to(&address)).into_response()
         }
-        Err(refusal) => pages::failed(&app, &refusal),
+        Err(refusal) => pages::failed(&app, &refusal).await,
     }
 }
 
@@ -152,7 +152,7 @@ async fn callback(State(app): State<Shared>, headers: HeaderMap, Query(back): Qu
             let session = (SET_COOKIE, session_cookie(&app, &token));
             (AppendHeaders([spent, session]), Redirect::to(&to)).into_response()
         }
-        Err(refusal) => (AppendHeaders([spent]), pages::failed(&app, &refusal)).into_response(),
+        Err(refusal) => (AppendHeaders([spent]), pages::failed(&app, &refusal).await).into_response(),
     }
 }
 
@@ -166,7 +166,7 @@ async fn sign_out(State(app): State<Shared>, headers: HeaderMap) -> Response {
             });
             match ended.await {
                 Ok(()) => ([(SET_COOKIE, no_session_cookie(&app))], Redirect::to(paths::HOME_PAGE)).into_response(),
-                Err(refusal) => pages::failed(&app, &refusal),
+                Err(refusal) => pages::failed(&app, &refusal).await,
             }
         }
         // Nobody was signed in, or the request is another site's: either way there is nothing to end.
@@ -208,10 +208,10 @@ async fn desktop(
 ) -> Response {
     let asked = match asked {
         Ok(Query(asked)) if asked.sound() => asked,
-        _ => return pages::failed(&app, &not_the_app()),
+        _ => return pages::failed(&app, &not_the_app()).await,
     };
     match browser(&app, &Method::GET, &headers) {
-        Ok(who) => pages::hand_over(&app, &who.person, &asked),
+        Ok(who) => pages::hand_over(&app, &who.person, &asked).await,
         // The person signs in first, and comes back here to agree.
         Err(_) => {
             let here = paths::desktop_sign_in(&asked.challenge, asked.port, &asked.state);
@@ -228,11 +228,11 @@ async fn hand_over(
 ) -> Response {
     let asked = match asked {
         Ok(Form(asked)) if asked.sound() => asked,
-        _ => return pages::failed(&app, &not_the_app()),
+        _ => return pages::failed(&app, &not_the_app()).await,
     };
     let who = match browser(&app, &Method::POST, &headers) {
         Ok(who) => who,
-        Err(refusal) => return pages::failed(&app, &refusal),
+        Err(refusal) => return pages::failed(&app, &refusal).await,
     };
     let handed = blocking({
         let (app, asked) = (app.clone(), asked.clone());
@@ -243,7 +243,7 @@ async fn hand_over(
             let query = form(&[("code", &code), ("state", &asked.state)]);
             Redirect::to(&format!("{}/?{query}", asked.listener())).into_response()
         }
-        Err(refusal) => pages::failed(&app, &refusal),
+        Err(refusal) => pages::failed(&app, &refusal).await,
     }
 }
 

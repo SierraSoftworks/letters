@@ -135,6 +135,11 @@ impl Root {
             _ => Ok(Folder { dir: self.dir.open_dir(TRASH)? }),
         }
     }
+
+    /// The trash, when something was ever thrown away here. Looking makes nothing.
+    pub fn thrown(&self) -> io::Result<Option<Folder>> {
+        Ok(found(self.dir.open_dir(TRASH))?.map(|dir| Folder { dir }))
+    }
 }
 
 /// What a folder holds under one name.

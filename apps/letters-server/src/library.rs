@@ -16,7 +16,7 @@ use letters_api::Code;
 
 use crate::error::{Answer, Refusal};
 use crate::ids;
-use crate::spaces::{EXTENSION, Folder, Listed, Place, Root};
+use crate::spaces::{EXTENSION, Folder, Listed, Place, Root, name_ok, seconds};
 use crate::store::{Batch, Store, StoreError, Table};
 
 /// What a new document is called until its first heading names it.
@@ -49,6 +49,18 @@ struct At {
 const FILES: Table<Known> = Table::new("files");
 /// By document id: every file that holds the document.
 const HOMES: Table<Vec<At>> = Table::new("homes");
+
+/// What the trash remembers of a file in it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Thrown {
+    /// Where the file was in its space.
+    pub path: String,
+    /// When it was thrown away.
+    pub at: u64,
+}
+
+/// By root and the file's name in the trash. A file some other program put there has no row.
+const THROWN: Table<Thrown> = Table::new("trash");
 
 fn file_key(root: &Root, place: &Place) -> String {
     format!("{}\0{}", root.key, place.as_str())
@@ -268,22 +280,47 @@ impl Library {
         self.forget(store, from.0, from.1)
     }
 
-    /// Moves the document at `place` to its root's trash.
-    pub fn trash(&self, store: &Store, root: &Root, place: &Place) -> Answer<()> {
+    /// Moves the document at `place` to its root's trash, which remembers where it was.
+    pub fn trash(&self, store: &Store, root: &Root, place: &Place, now: u64) -> Answer<()> {
         let (folder, name) = place.split();
         let (folder, trash) = (root.folder(&folder)?, root.trash()?);
-        let stem = name.strip_suffix(EXTENSION).unwrap_or(name);
-        for n in 1.. {
-            let kept = if n == 1 { name.to_owned() } else { format!("{stem} {n}{EXTENSION}") };
-            match folder.move_to(name, &trash, &kept) {
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                done => {
-                    done?;
-                    break;
-                }
-            }
-        }
+        let kept = moved_free(&folder, name, &trash, name)?;
+        store.put(&THROWN, &format!("{}\0{kept}", root.key), &Thrown { path: place.as_str().to_owned(), at: now })?;
         self.forget(store, root, place)
+    }
+
+    /// The documents in the trash of `root`, the last thrown away first, each with what the trash
+    /// remembers of it.
+    pub fn thrown(&self, store: &Store, root: &Root) -> Answer<Vec<(Listed, Option<Thrown>)>> {
+        let Some(trash) = root.thrown()? else { return Ok(Vec::new()) };
+        let prefix = format!("{}\0", root.key);
+        let mut remembered: HashMap<String, Thrown> = store.under(&THROWN, &prefix)?.into_iter().collect();
+        let files = trash.list()?.into_iter().filter(|listed| !listed.folder);
+        let mut thrown: Vec<(Listed, Option<Thrown>)> = files
+            .map(|listed| {
+                let was = remembered.remove(&format!("{prefix}{}", listed.name));
+                (listed, was)
+            })
+            .collect();
+        thrown.sort_by_key(|(listed, was)| std::cmp::Reverse(was.as_ref().map_or(seconds(listed.stamp), |was| was.at)));
+        Ok(thrown)
+    }
+
+    /// Takes `file` out of the trash of `root` and puts it back where it was, or at the top of its space
+    /// when that folder is gone. Says where it is now: under another name when its own was taken meanwhile.
+    pub fn put_back(&self, store: &Store, root: &Root, file: &str) -> Answer<Place> {
+        let trash = root.thrown()?.filter(|trash| name_ok(file) && trash.has(file)).ok_or_else(Refusal::not_found)?;
+        let key = format!("{}\0{file}", root.key);
+        let was = store.get(&THROWN, &key)?.and_then(|was| Place::parse(&was.path).ok());
+        // The name it had: the trash may hold it under another, beside a file of the same name.
+        let (place, name) = match &was {
+            Some(was) if root.folder(&was.split().0).is_ok() => (was.split().0, was.name()),
+            Some(was) => (Place::default(), was.name()),
+            None => (Place::default(), file),
+        };
+        let kept = moved_free(&trash, file, &root.folder(&place)?, name)?;
+        store.remove(&THROWN, &key)?;
+        place.child(&kept)
     }
 
     /// Takes the file at `place` out of the index, once it is no longer there.
@@ -293,6 +330,23 @@ impl Library {
             None => Ok(()),
         })?)
     }
+}
+
+/// Moves the document `name` of `from` to `to` as `wanted`, or as the first of "`wanted` 2" and so on that
+/// is free there. Says the name it has now.
+fn moved_free(from: &Folder, name: &str, to: &Folder, wanted: &str) -> Answer<String> {
+    let stem = wanted.strip_suffix(EXTENSION).unwrap_or(wanted);
+    for n in 1.. {
+        let kept = if n == 1 { wanted.to_owned() } else { format!("{stem} {n}{EXTENSION}") };
+        match from.move_to(name, to, &kept) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            done => {
+                done?;
+                return Ok(kept);
+            }
+        }
+    }
+    unreachable!("some number is free")
 }
 
 /// Brings the index up to what the file at `place` now says: `now`, or nothing when the file is gone.

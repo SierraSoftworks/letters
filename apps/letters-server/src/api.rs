@@ -216,12 +216,7 @@ async fn relocate(
 }
 
 async fn trash(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -> Answer<()> {
-    blocking(move || {
-        let found = app.locate(&who, &id)?;
-        found.must(Role::Editor)?;
-        app.library.trash(&app.store, &found.root, &found.place)
-    })
-    .await
+    blocking(move || app.trash(&who, &id)).await
 }
 
 async fn recent(State(app): State<Shared>, who: Signed) -> Answer<Json<Vec<Entry>>> {
@@ -328,6 +323,24 @@ impl App {
         self.entry(&space.told(role), &root, &place)
     }
 
+    /// Moves the document `id` to the trash of its space.
+    pub fn trash(&self, who: &Signed, id: &str) -> Answer<()> {
+        let found = self.locate(who, id)?;
+        found.must(Role::Editor)?;
+        self.library.trash(&self.store, &found.root, &found.place, self.now())
+    }
+
+    /// Puts `file` back from the trash of `space`, and says where it is now.
+    pub fn put_back(&self, who: &Signed, space: &str, file: &str) -> Answer<Entry> {
+        let (space, role) = self.space(who, space)?;
+        if !role.edits() {
+            return Err(Refusal::forbidden("You can read this space, but not add to it."));
+        }
+        let root = self.root(who, space)?;
+        let place = self.library.put_back(&self.store, &root, file)?;
+        self.entry(&space.told(role), &root, &place)
+    }
+
     /// The document `id`, ready to edit. A `page` carries its style and its notes along.
     pub fn opened(&self, who: &Signed, id: &str, page: bool) -> Answer<Opened> {
         let found = self.locate(who, id)?;
@@ -358,7 +371,7 @@ impl App {
     }
 
     /// Puts the document first among the person's recents.
-    fn note_opened(&self, who: &Signed, id: &str) -> Answer<()> {
+    pub fn note_opened(&self, who: &Signed, id: &str) -> Answer<()> {
         Ok(self.store.write(|batch| {
             let mut recent = batch.get(&RECENT, &who.person.id)?.unwrap_or_default();
             recent.retain(|other| other != id);
@@ -413,5 +426,5 @@ fn entry(space: &Space, row: &Row) -> Entry {
 
 /// The routes with their state, for the server and for tests.
 pub fn router(app: Arc<App>) -> Router {
-    routes().merge(crate::auth::routes()).with_state(app)
+    routes().merge(crate::auth::routes()).merge(crate::pages::routes()).with_state(app)
 }

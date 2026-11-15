@@ -146,6 +146,14 @@ impl Server {
         Browser { router: self.router.clone(), cookies: BTreeMap::new() }
     }
 
+    /// A browser that someone in these groups is signed in with, at the server's pages.
+    pub fn reader(&self, username: &str, groups: &[&str]) -> Browser {
+        let mut browser = self.visitor();
+        let token = self.browser(username, groups).token.expect("a session has a token");
+        browser.cookies.insert(COOKIE_NAME.into(), token);
+        browser
+    }
+
     /// Someone with no session.
     pub fn stranger(&self) -> Client {
         Client {
@@ -262,6 +270,11 @@ pub struct Browser {
 impl Browser {
     pub async fn get(&mut self, path: &str) -> Raw {
         self.send(Method::GET, path, "", Vec::new(), None).await
+    }
+
+    /// Sends a form from one of the server's own pages.
+    pub async fn fill(&mut self, path: &str, fields: &[(&str, &str)]) -> Raw {
+        self.submit(path, fields, Some(URL)).await
     }
 
     /// Sends a form, as a page that came from `origin` would.

@@ -7,6 +7,7 @@
 //! - [`spaces`] is the only way to a file, and cannot leave a space's folder.
 //! - [`library`] lists a space and finds a document by its id, wherever its file was moved to.
 //! - [`api`] answers the interface `letters_api` lays down.
+//! - [`pages`] are the server's own pages for a browser: the documents a person reaches, and one to read.
 //!
 //! A document's content lives in its `.let` file alone. Whatever else writes that file, over a share or
 //! with a sync tool, is another writer like the server, and the save in `letters_format` merges with it.
