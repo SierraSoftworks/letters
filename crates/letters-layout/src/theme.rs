@@ -36,6 +36,9 @@ pub(crate) const WAVE_SWING: f32 = 1.0;
 
 /// The gap between a picture and the caption under it.
 pub(crate) const CAPTION_GAP: f32 = 8.0;
+/// How far in from each side a caption is set while [`crate::DocLayout::set_caption_open`] names its figure:
+/// room at the ends of its line for what a window stands there.
+pub const CAPTION_INSET: f32 = 44.0;
 /// How many lines of caption still fit a page under a picture that is as tall as layout lets it be.
 pub(crate) const CAPTION_LINES: f32 = 3.0;
 /// The gap between the pictures of a gallery.

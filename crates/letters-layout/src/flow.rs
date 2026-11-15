@@ -416,8 +416,8 @@ pub(crate) struct Leaf {
     pub pictures: Vec<Picture>,
     /// The number a numbered figure or gallery is given, which its caption opens with.
     pub number: Option<u32>,
-    /// Whether a figure or gallery keeps the line of its caption while it has none, for whoever is about
-    /// to write one.
+    /// Whether a figure or gallery is ready for its caption to be written: the caption keeps its line while
+    /// it is empty, and is set in from the ends of that line.
     pub open: bool,
     /// The cells of a table row.
     pub cells: Vec<Cell>,
@@ -483,7 +483,8 @@ impl Leaf {
             What::Rule => theme::RULE,
             What::Blank | What::Empty => of.line,
             What::Text | What::Label | What::Figure | What::Gallery => {
-                self.tall((self.newlines as f32 + wrapped(self.words.text.len(), self.width)) * of.line)
+                let width = self.width - 2.0 * self.inset();
+                self.tall((self.newlines as f32 + wrapped(self.words.text.len(), width)) * of.line)
             }
             What::Formula => (of.line * 2.5).round(),
             What::Row => {
@@ -496,6 +497,13 @@ impl Leaf {
     /// Whether a figure or gallery has a line for a caption under its pictures.
     pub fn captioned(&self) -> bool {
         !self.words.text.is_empty() || self.number.is_some() || self.open
+    }
+
+    /// How far in from each side a figure or gallery sets its caption while the caption is being written,
+    /// or less where there is not the room.
+    pub fn inset(&self) -> f32 {
+        let room = (self.width - theme::MIN_WIDTH).max(0.0) / 2.0;
+        if self.open { theme::CAPTION_INSET.min(room) } else { 0.0 }
     }
 
     /// Whether the leaf sets a text of its own, and not only those of its cells.

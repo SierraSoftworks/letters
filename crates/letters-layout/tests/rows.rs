@@ -1,7 +1,7 @@
 //! Figures, galleries and tables: a picture over its caption, pictures tiled in rows, rows of cells, and the
 //! numbers and references that follow the figures of a document.
 
-use letters_layout::{DocLayout, FigureBox, Palette, figure_label, figure_numbers};
+use letters_layout::{CAPTION_INSET, DocLayout, FigureBox, Palette, figure_label, figure_numbers};
 use letters_model::{Align, Block, BlockId, BlockKind, Document, Mark, Model, Op, Pos, ReplicaId, Selection, Style};
 use letters_render::{DisplayList, Font, Item, Point, Rect};
 
@@ -240,21 +240,21 @@ fn an_empty_caption_has_a_line_of_its_own_where_one_is_about_to_be_written() {
 }
 
 #[test]
-fn a_caption_line_is_open_only_where_it_is_missing() {
+fn a_caption_line_opens_only_where_it_is_missing() {
     let below = |layout: &DocLayout| layout.caret(&Pos::new("z", 0)).unwrap().y;
-    // Figures that have their caption's line already, and one whose gallery has no caption to write in.
+    // What holds pictures, and whether it lacks a line for a caption.
     let cases = [
         ("a figure with a caption", picture("f", "The harbour"), false),
         ("a numbered figure", numbered(picture("f", "")), false),
         ("a gallery with no caption block", gallery("f", vec![picture("f0", ""), picture("f1", "")], None), true),
     ];
-    for (name, block, opens) in cases {
+    for (name, block, missing) in cases {
         let mut layout = laid(&doc(vec![block, paragraph("z", PROSE)]));
         let closed = below(&layout);
-        assert_eq!(layout.set_caption_open(Some(&"f".into())), opens, "{name}");
-        assert_eq!(below(&layout) > closed, opens, "{name}: the block below moves only for a line that opens");
-        assert_eq!(layout.set_caption_open(None), opens, "{name}: and back");
-        assert_eq!(below(&layout), closed, "{name}");
+        layout.set_caption_open(Some(&"f".into()));
+        assert_eq!(below(&layout) > closed, missing, "{name}: the block below moves only for a line that opens");
+        layout.set_caption_open(None);
+        assert_eq!(below(&layout), closed, "{name}: and back");
     }
 
     // A picture that is resized is a new figure to layout, and keeps its line.
@@ -266,6 +266,41 @@ fn a_caption_line_is_open_only_where_it_is_missing() {
     layout.update(model.doc(), &Style::default(), WIDTH, Some(&change));
     let line = layout.figure(&"f".into()).unwrap().caption;
     assert!(bottom(line) <= below(&layout), "the line stays open under a picture of another size: {line:?}");
+}
+
+#[test]
+fn a_caption_being_written_keeps_clear_of_the_ends_of_its_line() {
+    let pair = || vec![picture("f0", ""), picture("f1", "")];
+    // What holds pictures over a caption long enough to wrap, and the block the caption is.
+    let cases = [
+        ("a figure", picture("f", PROSE), "f"),
+        ("a numbered figure", numbered(picture("f", PROSE)), "f"),
+        ("a gallery", gallery("f", pair(), Some(PROSE)), "fc"),
+    ];
+    for (name, block, caption) in cases {
+        let mut layout = laid(&doc(vec![block, paragraph("z", "End")]));
+        let whole = Selection { anchor: Pos::new(caption, 0), head: Pos::new(caption, PROSE.len()) };
+        let line = |layout: &DocLayout| layout.figure(&"f".into()).unwrap().caption;
+        let below = |layout: &DocLayout| layout.caret(&Pos::new("z", 0)).unwrap().y;
+        let (ends, rest) = (line(&layout), layout.selection(&whole));
+        // Whether each line of the caption leaves the room at both ends of the figure's width. The space a
+        // line wraps at may hang past its end.
+        let clear = |lines: &[Rect]| {
+            let (from, to) = (ends.x + CAPTION_INSET - 0.5, right(ends) - CAPTION_INSET + 6.0);
+            lines.iter().all(|line| line.x >= from && right(*line) <= to)
+        };
+        assert!(!clear(&rest), "{name}: at rest its caption runs the width of the figure");
+
+        assert!(layout.set_caption_open(Some(&"f".into())), "{name}: it is set anew to be written");
+        let written = layout.selection(&whole);
+        assert!(clear(&written), "{name}: and stands in from both ends: {written:?}");
+        let now = line(&layout);
+        assert_eq!((now.x, now.width), (ends.x, ends.width), "{name}: its line is still the figure's width");
+        assert!(bottom(now) <= below(&layout), "{name}: the block below makes way for the lines it takes");
+
+        assert!(layout.set_caption_open(None), "{name}: left alone, it is set anew again");
+        assert!(layout.selection(&whole) == rest, "{name}: as it was at rest");
+    }
 }
 
 #[test]
