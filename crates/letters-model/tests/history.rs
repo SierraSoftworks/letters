@@ -229,8 +229,8 @@ fn a_history_no_writer_makes_is_stopped_by_the_check_or_changes_nothing() {
 #[test]
 fn the_check_refuses_a_history_that_loro_cannot_keep() {
     let cases: [(&str, &[u8]); 2] = [
-        ("its save cannot be read", include_bytes!("corpus/strangers/history-unwritable.bin")),
-        ("Loro panics on it", include_bytes!("corpus/strangers/history-panics.bin")),
+        ("its save cannot be read", include_bytes!("../../../fuzz/corpus/history/a-history-loro-cannot-write-out.bin")),
+        ("Loro panics on it", include_bytes!("../../../fuzz/corpus/history/a-history-loro-panics-on.bin")),
     ];
     for (name, history) in cases {
         assert!(matches!(Model::check(history), Err(HistoryError::Unreadable(_))), "{name}");
@@ -263,6 +263,19 @@ fn a_room_admits_what_a_device_writes_in_order_and_refuses_a_gap() {
     }
     device.merge(&room.save()).unwrap();
     assert_eq!(room.doc(), device.doc());
+}
+
+#[test]
+fn an_update_to_the_history_a_model_gave_up_is_not_admitted() {
+    let (file, history) = saved();
+    let open = |replica: u64| Model::new(file.clone(), ReplicaId::from(replica));
+    let (mut room, mut device) = (open(2), open(3));
+    let update = sent(&mut device, vec![typed("p", 0, "1")]);
+    assert_eq!(room.admit(&update), Ok(()));
+
+    // The file's history takes the place of the one the update builds on.
+    room.attach(open(2).prepare(Some(&history)).unwrap());
+    assert!(matches!(room.admit(&update), Err(HistoryError::Unreadable(_))));
 }
 
 /// A room's history and three updates to it that fuzzing made, each with a sound checksum. Loro panics as

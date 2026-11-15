@@ -356,7 +356,8 @@ impl Model {
     /// again as it is dropped. Here such a panic is answered as an error, in a build whose panics unwind,
     /// as a server's must. Where a panic ends the process there is nothing to contain.
     ///
-    /// It costs about two loads and a save. An update that builds on a history is for [`Model::admit`].
+    /// It costs about two loads and a save. Of an update that builds on a history only the reading is
+    /// checked, which is cheap: what it does to a document is for [`Model::admit`] to try.
     pub fn check(history: &[u8]) -> Result<(), HistoryError> {
         /// What a history shows, read as [`Model::load`] reads it.
         fn shown(loro: &LoroDoc) -> (Document, Style) {
@@ -369,10 +370,15 @@ impl Model {
             let [first, second] = &scratch;
             crdt::configure(first);
             crdt::configure(second);
-            first.import(history).map_err(unreadable)?;
+            let took = first.import(history).map_err(unreadable)?;
+            if took.success.is_empty() && took.pending.is_some() {
+                // An update that waits for the edits it builds on. Nothing of it landed to be saved.
+                return Ok(());
+            }
             let saved = first.export(ExportMode::all_updates()).map_err(unreadable)?;
             second.import(&saved).map_err(unreadable)?;
-            if shown(first) == shown(second) { Ok(()) } else { Err(unreadable("it is saved as another history")) }
+            let same = first.oplog_vv() == second.oplog_vv() && shown(first) == shown(second);
+            if same { Ok(()) } else { Err(unreadable("it is saved as another history")) }
         }));
         let read = read.map_err(|_| unreadable("reading it panicked"))?;
         drop(scratch.map(mem::ManuallyDrop::into_inner));
@@ -497,6 +503,8 @@ impl Model {
         // Whatever replica the history was prepared for, this model's is the one that writes.
         let _ = history.loro.set_peer_id(self.replica.0);
         self.history = OnceLock::from(history);
+        // A copy of the history that was held is no copy of this one.
+        *self.guard.get_mut().unwrap_or_else(PoisonError::into_inner) = None;
         self.reader = None;
         self.pen.signed = false;
         let shown = mem::replace(&mut self.doc, theirs.doc);

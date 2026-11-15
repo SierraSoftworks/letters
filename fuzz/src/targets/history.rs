@@ -1,5 +1,6 @@
-//! A history from anywhere: it loads or is refused, a model that takes it in still tells one document,
-//! and a model that refuses it is left as it was.
+//! A history from anywhere: it is checked before a document reads it, as a server checks every history
+//! and a shell those it does not trust. One that passes loads and merges, a model that takes it in still
+//! tells one document, and a model that refuses it is left as it was.
 
 use letters_model::Model;
 
@@ -23,7 +24,9 @@ pub fn sealed(history: &[u8]) -> Vec<u8> {
 
 pub fn run(data: &[u8]) {
     let history = sealed(bounded(data));
-    if let Ok(model) = Model::load(&history, 2.into()) {
+    // Loro takes in histories that it cannot keep, and panics on some. The check refuses those.
+    let loaded = Model::check(&history).and_then(|()| Model::load(&history, 2.into()));
+    if let Ok(model) = loaded {
         sound(model.doc(), "a loaded history");
         assert_eq!(shown(&model), reread(&model), "a loaded history is saved as another");
     }
@@ -31,7 +34,7 @@ pub fn run(data: &[u8]) {
     let mut model = Model::new(sample(), 1.into());
     let before = shown(&model);
     let (compared, related) = (model.compare(&history), model.related(&history));
-    match model.merge(&history) {
+    match model.admit(&history).and_then(|()| model.merge(&history)) {
         Ok(_) => {
             sound(model.doc(), "a merged history");
             assert_eq!(shown(&model), reread(&model), "a merged history is saved as another");
