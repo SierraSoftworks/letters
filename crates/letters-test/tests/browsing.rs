@@ -259,7 +259,12 @@ fn the_places_are_one_stop_of_the_tab_key_at_the_place_that_is_looked_at() {
     let mut window = signed_in(&[HOME]);
     open(&mut window, own());
     let at = |window: &mut Harness| window.focused().map(|found| found.name).unwrap_or_default();
-    window.key("Shift+Tab");
+    // Back from the documents, past what stands over them, to the places.
+    for _ in 0..3 {
+        if at(&mut window) != "Sam Okafor" {
+            window.key("Shift+Tab");
+        }
+    }
     assert_eq!(at(&mut window), "Sam Okafor");
     window.key("Shift+Tab");
     assert_eq!(at(&mut window), "This device", "the places cost one press to pass");
@@ -269,6 +274,46 @@ fn the_places_are_one_stop_of_the_tab_key_at_the_place_that_is_looked_at() {
     // While the server is asked, what is typed does not reach the page under the card.
     window.type_text("x").key("Enter").key("Backspace");
     window.assert_markdown("# Roof plan\n\nThe roofer needs the scaffold up by 3 March.");
+}
+
+#[test]
+fn a_document_is_started_in_the_folder_that_is_looked_at() {
+    // The folder that is gone into, and the path the document is started at.
+    for (folder, path) in [(None, ""), (Some("House"), "House")] {
+        let mut window = signed_in(&[HOME]);
+        open(&mut window, own());
+        if let Some(folder) = folder {
+            window.click(Role::ListBoxOption, folder);
+            window.ui().take_requests();
+        }
+        let new = window.find(Role::Button, "New document").expect("offered");
+        assert_eq!(new.description.as_deref(), Some(format!("In {}", folder.unwrap_or("Sam Okafor")).as_str()));
+        window.click(Role::Button, "New document");
+        let asked = Request::NewAt { server: HOME.into(), space: "sam".into(), path: path.into() };
+        assert_eq!(window.ui().take_requests(), [asked], "{folder:?}");
+        window.assert_closed(Role::Dialog, "Open");
+    }
+}
+
+#[test]
+fn a_document_is_started_only_where_the_person_may_write() {
+    // What the person may do in the space, the place that is pressed, and whether a document is offered.
+    let cases = [
+        (Grade::Owner, "Family", true),
+        (Grade::Editor, "Family", true),
+        (Grade::Commenter, "Family", false),
+        (Grade::Reader, "Family", false),
+        (Grade::Owner, "Shared with me", false),
+        (Grade::Owner, "Recent", false),
+    ];
+    for (role, place, offered) in cases {
+        let mut window = signed_in(&[HOME]);
+        window.click(Role::Button, "More").click(Role::MenuItem, "Open");
+        let spaces = vec![Space { role, ..space("family", "Family", SpaceKind::Shared) }];
+        window.ui().set_listing(Browsed { server: HOME.into(), place: Place::Spaces, spaces, entries: Vec::new() });
+        window.click(Role::ListBoxOption, place);
+        assert_eq!(has(&mut window, Role::Button, "New document"), offered, "{role:?} in {place}");
+    }
 }
 
 #[test]

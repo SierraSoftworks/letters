@@ -5,7 +5,7 @@
 //! could not be read.
 
 use accesskit::Role;
-use letters_api::{Entry, EntryKind, Space, SpaceKind, Tag};
+use letters_api::{Entry, EntryKind, Role as Grade, Space, SpaceKind, Tag};
 
 use crate::color::fade;
 use crate::element::Element;
@@ -63,6 +63,8 @@ pub enum Browsing {
     Open(String),
     /// Choose a file of this device instead.
     Device,
+    /// Start a document in the folder that is looked at.
+    New,
 }
 
 #[derive(Default)]
@@ -157,7 +159,22 @@ impl Browser {
                 requests.push(Request::OpenDialog);
                 self.close();
             }
+            Browsing::New => {
+                if let Some((space, path)) = self.written() {
+                    let (server, space, path) = (self.server.clone(), space.to_owned(), path.to_owned());
+                    requests.push(Request::NewAt { server, space, path });
+                    self.close();
+                }
+            }
         }
+    }
+
+    /// The folder that is looked at, by its space and its path there, if the person may write in it: a
+    /// document is started only in a space they edit.
+    fn written(&self) -> Option<(&str, &str)> {
+        let Some(Place::Folder { space, path }) = &self.place else { return None };
+        let known = self.spaces.as_deref()?.iter().find(|known| known.id == *space)?;
+        (known.role >= Grade::Editor).then_some((space.as_str(), path.as_str()))
     }
 
     /// Turns to a server, and asks what spaces the person has there.
@@ -266,7 +283,7 @@ impl Browser {
         let pane = Element::column()
             .grow(1.0)
             .padding(Edges::all(tokens::SPACE_XS))
-            .gap(tokens::SPACE_2XS)
+            .gap(tokens::SPACE_XS)
             .children(self.way());
         let said = |sentence: &str, role: Role, ink: Ink| {
             // Set in as far as the rows it stands for.
@@ -307,7 +324,8 @@ impl Browser {
         pane.child(list)
     }
 
-    /// The way to the folder that is looked at, from its space down. Each step but the last leads back.
+    /// The way to the folder that is looked at, from its space down. Each step but the last leads back. At
+    /// its end a document is started in the folder, where the person may write.
     fn way(&self) -> Option<Element<Message>> {
         let Some(Place::Folder { space, path }) = &self.place else { return None };
         let name = self
@@ -332,6 +350,11 @@ impl Browser {
                 let back = Place::Folder { space: space.clone(), path: folders[..at].join("/") };
                 way = way.child(Button::new(step).subtle().small().on_press(send(Browsing::Go(back))));
             }
+        }
+        if self.written().is_some() {
+            let here = folders.last().copied().or(name).unwrap_or_default();
+            let new = Button::new("New document").icon(icon::PLUS).small().on_press(send(Browsing::New));
+            way = way.child(Element::row().grow(1.0)).child(Element::from(new).description(format!("In {here}")));
         }
         Some(way.height(tokens::CONTROL_HEIGHT_SM))
     }

@@ -225,6 +225,14 @@ pub enum Request {
         server: String,
         id: String,
     },
+    /// Start a document in a folder of a space the server at this address keeps, and open it, as `New`
+    /// starts one on this device. `path` is the folder's path in the space, empty for the space itself.
+    /// The card that opens a server's documents asks it, only of a space the person edits.
+    NewAt {
+        server: String,
+        space: String,
+        path: String,
+    },
 }
 
 /// A document opened lately, as the landing card lists it.
