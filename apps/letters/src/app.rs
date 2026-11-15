@@ -26,9 +26,9 @@ use letters_sync::{Local, Progress, Refusal};
 use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDecision, Origin, Trust};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
-    Appearance, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer, Landing,
-    LinkPreviewFound, Location, MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState, Scheme, Settings,
-    Window as View, tokens,
+    Access, Appearance, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer,
+    Landing, LinkPreviewFound, Location, MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState, Scheme,
+    Settings, Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -452,12 +452,17 @@ impl Remote {
         Some(self.born + Duration::from_millis(self.line.wake_at()?))
     }
 
-    /// Whether the person may only read the document: as the line says while it is live, and as the
-    /// server last said otherwise.
-    fn reads(&self) -> bool {
-        match self.line.link() {
-            letters_sync::Link::Live(role) if self.started => !role.comments(),
-            _ => self.opened.role == letters_api::Role::Reader,
+    /// What the person may do with the document: as the line says while it is live, and as the server
+    /// last said otherwise, which is what holds while there is no line.
+    fn access(&self) -> Access {
+        let (edits, comments) = match self.line.link() {
+            letters_sync::Link::Live(role) if self.started => (role.edits(), role.comments()),
+            _ => (self.opened.role >= letters_api::Role::Editor, self.opened.role.comments()),
+        };
+        match (edits, comments) {
+            (true, _) => Access::Edits,
+            (false, true) => Access::Comments,
+            (false, false) => Access::Reads,
         }
     }
 
@@ -669,9 +674,6 @@ const UNKEPT: &str = "The server did not take a picture, so the others who open 
 
 /// What the bar says when asked to rename or move a server's document.
 const AT_ITS_SERVER: &str = "This document lives on a server, and is renamed and moved there.";
-/// What the Comment tool says of a server's document the person may only read.
-const READS: &str = "You can read this document, but not comment on it.";
-
 /// What the Comment tool says of a document whose notes this build could not read.
 const NO_COMMENTS: &str = "Comments cannot be added here: this document's notes are in a form this version of \
                            Letters cannot read.";
@@ -907,6 +909,7 @@ impl DocWindow {
         // A server's document that is all in its copy here is saved once the server keeps it.
         let progress = remote.filter(|remote| remote.started).map(|remote| remote.line.progress());
         self.view.set_connection(remote.map(Remote::connection));
+        self.view.set_access(remote.map_or(Access::Edits, Remote::access));
         self.view.set_save_state(match (self.save_failed, self.place.home().is_some(), self.unsaved()) {
             (true, _, _) => SaveState::Failed,
             // A document with no file yet has nothing to say about saving.
@@ -1716,8 +1719,7 @@ impl DocWindow {
     /// notes this build could not read, where a save that added one would be refused.
     fn recomment(&mut self) {
         if let Some(copy) = &self.copy {
-            let reads = self.remote.as_ref().is_some_and(Remote::reads);
-            self.view.refuse_comments(if copy.notes_unread() { Some(NO_COMMENTS) } else { reads.then_some(READS) });
+            self.view.refuse_comments(copy.notes_unread().then_some(NO_COMMENTS));
         }
     }
 
