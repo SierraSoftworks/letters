@@ -10,7 +10,7 @@ use std::rc::{Rc, Weak};
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Function, Object, Reflect};
 use letters_editor::{Clip, Editor, Modifiers, Platform as _};
-use letters_model::{Block, BlockId, BlockKind, Document, HistoryError, Pos, ReplicaId, Selection, Style};
+use letters_model::{Document, HistoryError, Pos, ReplicaId, Selection, Style};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Rect, Size};
@@ -25,6 +25,7 @@ use web_sys::{
 use crate::browser::Browser;
 use crate::input::{Clipboard, Dom, Finger, Gesture, Held, Reply, TextInput, Touch, modifiers};
 use crate::mirror::{Act, Mirror, Page};
+use crate::page;
 
 /// The distance one line of a mouse wheel scrolls, in logical pixels.
 const WHEEL_LINE: f32 = 40.0;
@@ -138,7 +139,17 @@ impl Shell {
         let mac = window.navigator().platform().is_ok_and(|name| name.starts_with("Mac") || name.starts_with("iP"));
         let dark_mode = window.match_media("(prefers-color-scheme: dark)")?;
         let less_motion = window.match_media("(prefers-reduced-motion: reduce)")?;
-        let view = view(welcome(&mut platform), &mut platform, mac);
+        // A page that carries a document shows it. The harness may carry none.
+        let carried = document.get_element_by_id(page::DOCUMENT).and_then(|carried| carried.text_content());
+        let opened = match carried.as_deref().map(Document::from_json) {
+            Some(Ok(opened)) => opened,
+            Some(Err(error)) => {
+                web_sys::console::error_1(&format!("the page's document cannot be read: {error}").into());
+                page::welcome(&mut || platform.new_id())
+            }
+            None => page::welcome(&mut || platform.new_id()),
+        };
+        let view = view(opened, &mut platform, mac);
 
         let shell = Rc::new_cyclic(|shell| {
             RefCell::new(Self {
@@ -361,7 +372,14 @@ impl Shell {
         }
         let end = self.platform.now();
         self.stats.frames += 1;
-        self.stats.first_frame_ms.get_or_insert(end);
+        if self.stats.first_frame_ms.is_none() {
+            self.stats.first_frame_ms = Some(end);
+            // The canvas shows the document now, so the HTML that stood in for it goes.
+            let page = self.window.document();
+            if let Some(first) = page.and_then(|page| page.get_element_by_id(page::FIRST_PAINT)) {
+                first.remove();
+            }
+        }
         self.stats.frame_ms = end - start;
         self.wake_at(wake);
     }
@@ -609,19 +627,6 @@ fn view(document: Document, platform: &mut Browser, mac: bool) -> View {
         view.select(Selection::caret(end));
     }
     view
-}
-
-/// What the page shows until it is given a document.
-fn welcome(platform: &mut Browser) -> Document {
-    let mut block = |kind, text| Block::text(BlockId::new(platform.new_id()), kind, text);
-    Document {
-        blocks: vec![
-            block(BlockKind::Heading { level: 1 }, "Letters in the browser"),
-            block(BlockKind::Paragraph, "The same engine as the desktop app, painted on a canvas. Type to try it."),
-            block(BlockKind::Paragraph, ""),
-        ],
-        ..Document::default()
-    }
 }
 
 /// Copies one rectangle of the frame to the same place on the canvas.

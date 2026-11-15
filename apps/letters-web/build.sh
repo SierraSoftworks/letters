@@ -16,7 +16,7 @@ cargo build -p letters-web --lib --release --target wasm32-unknown-unknown
 rm -rf dist
 "$bindgen" "$wasm" --target web --no-typescript --out-name letters --out-dir dist \
   --remove-name-section --remove-producers-section
-cp www/index.html dist/
+cargo run --quiet -p letters-web --example page -- www/index.html > dist/index.html
 mkdir dist/fonts
 cp ../../crates/letters-fonts/fonts/*.ttf dist/fonts/
 

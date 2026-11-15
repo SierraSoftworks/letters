@@ -4,6 +4,7 @@
 //! - [`input`] turns the hidden input's events into the editor's input, and [`browser`] lends the editor
 //!   the browser's clock, identifiers and clipboard.
 //! - [`mirror`] keeps the window readable as HTML beside the canvas, for assistive technology.
+//! - [`page`] is the page a server sends: the document as HTML to read at once, and for the editor to open.
 //! - [`Letters`] is what a page holds: `await Letters.start(canvas, "fonts/")` starts the editor.
 //!
 //! Frames are rasterised on the CPU, so the page needs no WebGPU. The fonts are fetched beside the wasm and
@@ -12,6 +13,7 @@
 pub mod browser;
 pub mod input;
 pub mod mirror;
+pub mod page;
 pub mod shell;
 
 use std::cell::RefCell;

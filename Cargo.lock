@@ -2730,6 +2730,7 @@ version = "0.1.0"
 dependencies = [
  "accesskit",
  "js-sys",
+ "letters-convert",
  "letters-editor",
  "letters-fonts",
  "letters-model",
