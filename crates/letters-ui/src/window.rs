@@ -258,6 +258,10 @@ impl Ui<EditorApp> {
 
     /// What the window asks of its shell, since this was last called. Call it after every event.
     pub fn take_requests(&mut self) -> Vec<Request> {
+        // Reaching for the app's state asks for a frame, which a call after every event must not do.
+        if self.app().requests.is_empty() {
+            return Vec::new();
+        }
         std::mem::take(&mut self.app_mut().requests)
     }
 

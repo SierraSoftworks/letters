@@ -36,6 +36,14 @@ test("boots to a painted document that fills the page", async ({ page }) => {
   expect(await colours(page)).toBeGreaterThan(16);
 });
 
+test("a page where nothing changes paints only its caret's blink", async ({ page }) => {
+  // Long enough for the first frame's fade and the spelling check to be over.
+  await page.waitForTimeout(500);
+  const before = await frames(page);
+  await page.waitForTimeout(1000);
+  expect((await frames(page)) - before).toBeLessThan(10);
+});
+
 test("typing reaches the document and the canvas", async ({ page }) => {
   const [before, painted] = [await texts(page), await frames(page)];
   await page.keyboard.type("Typed in a browser");
