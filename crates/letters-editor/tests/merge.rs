@@ -1,7 +1,7 @@
 mod common;
 
 use common::Do::{K, T};
-use common::{Do, Harness, SAMPLE, action, canon, check, clip, parse, perform};
+use common::{Do, Harness, SAMPLE, action, canon, clip, parse, perform, sound};
 use letters_editor::InputEvent;
 use letters_model::{Model, ReplicaId};
 use proptest::prelude::*;
@@ -139,20 +139,20 @@ proptest! {
         for (mine, action, share) in &turns {
             let (writer, other) = if *mine { (&mut first, &mut second) } else { (&mut second, &mut first) };
             perform(writer, action);
-            check(writer)?;
+            sound(writer)?;
             if *share {
                 prop_assert!(other.merge(writer));
-                check(other)?;
+                sound(other)?;
             }
         }
         // Each writer may also take back all of its own edits, whatever the other has done since.
         for turn in [true, false] {
             let (writer, other) = if turn { (&mut first, &mut second) } else { (&mut second, &mut first) };
             while writer.key("Mod+z") {
-                check(writer)?;
+                sound(writer)?;
             }
             prop_assert!(other.merge(writer));
-            check(other)?;
+            sound(other)?;
         }
         prop_assert!(first.merge(&second));
         prop_assert_eq!(first.text(), second.text());

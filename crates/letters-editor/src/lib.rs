@@ -13,6 +13,7 @@ mod keymap;
 mod markers;
 mod merge;
 mod motion;
+mod parts;
 mod rules;
 mod text;
 mod tree;
@@ -216,6 +217,8 @@ pub struct Picture {
 struct Caret {
     selection: Selection,
     marks: BTreeSet<Mark>,
+    /// Whether the caret is on a figure's picture, and not in the caption its position names.
+    picture: bool,
 }
 
 /// One undo step: a run of model edits that are undone together, and the carets either side of them.
@@ -316,7 +319,8 @@ impl Editor {
     }
 
     /// Moves the selection, as a click or a drag does. Positions are brought onto the nearest character, and a
-    /// selection that names no text block is ignored.
+    /// selection that names no text block is ignored. In a figure the positions are in its caption:
+    /// [`Editor::select_picture`] selects the picture.
     pub fn select(&mut self, selection: Selection) {
         self.end_composition();
         (self.rule, self.goal) = (false, None);
@@ -433,13 +437,16 @@ impl Editor {
         match command {
             Command::Indent | Command::Outdent => {
                 matches!(kind, Some(BlockKind::ListItem { .. } | BlockKind::Code { .. }))
+                    || self.grid(&caret.selection.head.block).is_some()
             }
             Command::ToggleChecked => {
                 matches!(kind, Some(BlockKind::ListItem { list: ListKind::Task { .. }, .. }))
             }
-            Command::ToggleMark(_) => ranged || !matches!(kind, Some(BlockKind::Code { .. } | BlockKind::Formula)),
+            Command::ToggleMark(_) => {
+                ranged || !(caret.picture || matches!(kind, Some(BlockKind::Code { .. } | BlockKind::Formula)))
+            }
             Command::SetLink(_) => ranged || self.link().is_some(),
-            Command::Copy | Command::Cut => ranged,
+            Command::Copy | Command::Cut => ranged || caret.picture,
             Command::LeaveFormula => self.formula().is_some(),
             Command::Undo => self.can_undo(),
             Command::Redo => self.can_redo(),
@@ -469,8 +476,8 @@ impl Editor {
             Command::Split => kind = self.split(platform),
             Command::LeaveFormula => self.leave_formula(platform),
             Command::LineBreak => self.insert("\n"),
-            Command::Indent => self.indent(true),
-            Command::Outdent => self.indent(false),
+            Command::Indent => self.indent(true, platform),
+            Command::Outdent => self.indent(false, platform),
             Command::ToggleMark(mark) => self.toggle_mark(mark),
             Command::SetLink(link) => self.set_link(link),
             Command::SetBlock(block) => self.set_block(block, platform),
@@ -551,6 +558,10 @@ impl Editor {
     /// Closes the edits made since the last call as one undo step, or adds them to the step before when
     /// they continue it. `fresh` keeps them apart.
     fn commit(&mut self, kind: Kind, now: u64, fresh: bool) {
+        // An edit may have taken away the block its caret was left in.
+        if self.caret.as_ref().is_some_and(|caret| self.fit(caret).as_ref() != Some(caret)) {
+            self.restore(self.caret.clone());
+        }
         let before = self.origin.clone();
         let count = std::mem::take(&mut self.steps);
         if count == 0 {
@@ -624,13 +635,14 @@ impl Editor {
     }
 
     fn block(&self, id: &BlockId) -> Option<&Block> {
-        self.doc().block(id)
+        self.model.block(id)
     }
 
     /// The position on a character boundary of a text block that is nearest to `pos`.
     fn clamp(&self, pos: &Pos) -> Option<Pos> {
         let block = self.block(&pos.block).filter(|block| tree::is_text(block))?;
-        Some(Pos::new(pos.block.clone(), text::snap(&block.plain_text(), pos.offset)))
+        let offset = pos.offset.min(self.span(block));
+        Some(Pos::new(pos.block.clone(), text::snap(&block.plain_text(), offset)))
     }
 
     /// The ends of a selection in document order.
@@ -683,7 +695,8 @@ impl Editor {
             let block = self.block(&start.block).filter(|block| !text::is_source(block));
             block.map(|block| text::marks_after(block.body.runs(), start.offset)).unwrap_or_default()
         };
-        self.caret = Some(Caret { selection, marks });
+        let picture = selection.is_caret() && self.member(&selection.head.block);
+        self.caret = Some(Caret { selection, marks, picture });
     }
 
     fn place(&mut self, pos: Pos) {
@@ -692,6 +705,7 @@ impl Editor {
 
     /// Puts the caret at `pos` with marks chosen by the caller.
     fn place_with(&mut self, pos: Pos, marks: BTreeSet<Mark>) {
-        self.caret = Some(Caret { selection: Selection::caret(pos), marks });
+        let picture = self.member(&pos.block);
+        self.caret = Some(Caret { selection: Selection::caret(pos), marks, picture });
     }
 }

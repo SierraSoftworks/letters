@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use letters_model::{Block, BlockId, BlockKind, Mark, Marker, Markers, Tone};
 
-use crate::{Editor, text, tree};
+use crate::{Editor, text};
 
 /// The marks that show a pair of markers, outermost first.
 pub(crate) const PAIRED: [Mark; 5] = [Mark::Bold, Mark::Italic, Mark::Strike, Mark::Code, Mark::Math];
@@ -79,7 +79,7 @@ impl Editor {
         let head = &caret.selection.head;
         let Some(block) = self.block(&head.block) else { return Markers::default() };
         let mut markers = Markers { block: self.block_marker(block), ..Markers::default() };
-        if !caret.selection.is_caret() || text::is_source(block) {
+        if !caret.selection.is_caret() || caret.picture || text::is_source(block) {
             return markers;
         }
 
@@ -117,7 +117,7 @@ impl Editor {
             return Some((block.id.clone(), "#".repeat(level.into())));
         }
         let mut id = block.id.clone();
-        while let Some(parent) = tree::place(self.doc(), &id).and_then(|place| place.parent) {
+        while let Some(parent) = self.seat(&id).and_then(|place| place.parent) {
             if let BlockKind::Callout { tone } = parent.kind {
                 return Some((parent.id.clone(), tag(tone).to_owned()));
             }

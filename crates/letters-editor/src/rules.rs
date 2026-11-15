@@ -9,7 +9,12 @@ use std::ops::Range;
 use letters_model::{Block, BlockId, BlockKind, Body, ListKind, Mark, Op, Pos, Run, Tone};
 
 use crate::markers::Sides;
-use crate::{Editor, Platform, text, tree};
+use crate::{Caret, Editor, Platform, text};
+
+/// Whether a block is a quote or a callout, which a tag at its top makes a callout.
+fn quoted(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Quote | BlockKind::Callout { .. })
+}
 
 /// What shorthand at the start of a block turns the block into.
 #[derive(Debug, PartialEq)]
@@ -162,10 +167,11 @@ fn link(typed: &str) -> Option<Span> {
 impl Editor {
     /// Applies the shorthand that the text just typed completes. Returns whether any did.
     pub(crate) fn apply_rules(&mut self, platform: &mut dyn Platform) -> bool {
-        let Some(caret) = self.caret.clone().filter(|caret| caret.selection.is_caret()) else { return false };
+        let at = |caret: &Caret| caret.selection.is_caret() && !caret.picture;
+        let Some(caret) = self.caret.clone().filter(at) else { return false };
         let pos = caret.selection.head;
         let doc = self.doc();
-        let (Some(block), Some(place)) = (doc.block(&pos.block), tree::place(doc, &pos.block)) else {
+        let (Some(block), Some(place)) = (doc.block(&pos.block), self.seat(&pos.block)) else {
             return false;
         };
         if text::is_source(block) {
@@ -195,7 +201,7 @@ impl Editor {
                 self.apply(vec![clear, insert]);
             }
             // The tag belongs at the top of a quote, and retyping it in a callout changes the tone.
-            Some(BlockRule::Callout(tone)) if place.index == 0 && place.parent.is_some() => {
+            Some(BlockRule::Callout(tone)) if place.index == 0 && place.parent.is_some_and(quoted) => {
                 let parent = place.parent_id().expect("the block has a parent");
                 self.apply(vec![clear, Op::SetKind { block: parent, kind: BlockKind::Callout { tone } }]);
             }
@@ -215,7 +221,7 @@ impl Editor {
     ) -> bool {
         let Some((open, close)) = maths(typed) else { return false };
         let doc = self.doc();
-        let (Some(block), Some(place)) = (doc.block(id), tree::place(doc, id)) else { return false };
+        let (Some(block), Some(place)) = (doc.block(id), self.seat(id)) else { return false };
         if text::marks_after(block.body.runs(), open.start).contains(&Mark::Code) {
             return false;
         }

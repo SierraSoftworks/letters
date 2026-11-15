@@ -117,7 +117,7 @@ impl Editor {
     pub(crate) fn recall(&mut self, kept: &Kept) {
         let moved = (kept.merges != self.merges).then(|| self.found(kept.held.clone())).flatten();
         let caret = kept.caret.clone();
-        self.restore(caret.map(|caret| Caret { selection: moved.unwrap_or(caret.selection), marks: caret.marks }));
+        self.restore(caret.map(|caret| Caret { selection: moved.unwrap_or(caret.selection.clone()), ..caret }));
     }
 
     /// A range holds on to the text inside it and a caret to the character before it, so what another
@@ -138,12 +138,8 @@ impl Editor {
     }
 
     /// Sets a caret that may no longer fit the document, on the text there is now.
-    fn restore(&mut self, caret: Option<Caret>) {
-        let fit = |caret: &Caret| {
-            let (anchor, head) = (self.clamp(&caret.selection.anchor)?, self.clamp(&caret.selection.head)?);
-            Some(Caret { selection: Selection { anchor, head }, marks: caret.marks.clone() })
-        };
-        self.caret = caret.as_ref().and_then(fit);
+    pub(crate) fn restore(&mut self, caret: Option<Caret>) {
+        self.caret = caret.as_ref().and_then(|caret| self.fit(caret));
         // Its block is gone, so the caret goes to the first text there is.
         let first = tree::texts(self.doc()).first().map(|block| Pos::new(block.id.clone(), 0));
         if let (None, Some(first)) = (&self.caret, first) {

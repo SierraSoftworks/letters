@@ -51,6 +51,14 @@ impl Editor {
         if text.is_empty() || !self.ensure_caret(platform) {
             return;
         }
+        if self.picture().is_some() {
+            // A picture takes no text. A line break typed on one is Enter, which starts its caption.
+            if text == "\n" {
+                self.edit_caption(platform);
+                self.commit(Kind::Other, now, true);
+            }
+            return;
+        }
         if self.type_marker(&text) {
             return self.commit(Kind::Other, now, true);
         }
@@ -71,10 +79,13 @@ impl Editor {
 
     /// Inserts text that may hold line breaks. Outside code each one starts a new block, as Enter does.
     pub(crate) fn insert_lines(&mut self, text: &str, platform: &mut dyn Platform) {
-        let code =
-            self.selection().and_then(|selection| self.block(&selection.head.block)).is_some_and(text::is_source);
-        if code || !text.contains('\n') {
+        let Some(head) = self.selection().map(|selection| selection.head.block.clone()) else { return };
+        if self.block(&head).is_some_and(text::is_source) || !text.contains('\n') {
             return self.insert(text);
+        }
+        if self.part(&head) && text != "\n" {
+            // A caption and a cell hold one stretch of text, so lines pasted into one run on.
+            return self.insert(&text.replace('\n', " "));
         }
         for (index, line) in text.split('\n').enumerate() {
             if index > 0 {
@@ -96,11 +107,14 @@ impl Editor {
     fn compose(&mut self, text: &str, selection: Option<Range<usize>>, platform: &mut dyn Platform, now: u64) {
         if self.composing.is_none() {
             self.mark();
-            if text.is_empty() || !self.ensure_caret(platform) {
+            if text.is_empty() || !self.ensure_caret(platform) || self.picture().is_some() {
                 return;
             }
             self.redo.clear();
-            self.delete_selection();
+            if self.delete_selection() && (!self.ensure_caret(platform) || self.picture().is_some()) {
+                // What was selected went with all the text there was to compose in.
+                return self.commit(Kind::Other, now, true);
+            }
             let Some(at) = self.selection().map(|selection| selection.head.offset) else { return };
             self.composing = Some(Composing { range: at..at, at: now });
         }
@@ -113,12 +127,12 @@ impl Editor {
         let at = |offset: usize| Pos::new(block.clone(), offset);
         let start = composing.range.start;
         let composed = Selection { anchor: at(start), head: at(composing.range.end) };
-        self.caret = Some(Caret { selection: composed, marks: caret.marks.clone() });
+        self.caret = Some(Caret { selection: composed, ..caret.clone() });
         self.insert(text);
 
         let inside = selection.unwrap_or(text.len()..text.len());
         let (anchor, head) = (start + text::snap(text, inside.start), start + text::snap(text, inside.end));
-        self.caret = Some(Caret { selection: Selection { anchor: at(anchor), head: at(head) }, marks: caret.marks });
+        self.caret = Some(Caret { selection: Selection { anchor: at(anchor), head: at(head) }, ..caret });
         (composing.range, composing.at) = (start..start + text.len(), now);
         self.composing = Some(composing);
     }
@@ -134,7 +148,7 @@ impl Editor {
         let block = caret.selection.head.block.clone();
         let at = |offset: usize| Pos::new(block.clone(), offset);
         let composed = Selection { anchor: at(composing.range.start), head: at(composing.range.end) };
-        self.caret = Some(Caret { selection: composed, marks: caret.marks });
+        self.caret = Some(Caret { selection: composed, ..caret });
         self.insert(text);
         self.commit(Kind::Other, now, true);
         self.run_rules(platform, now);
@@ -143,7 +157,7 @@ impl Editor {
     /// Replaces a range of the caret's block, keeping the formatting of the text it replaces.
     fn replace_range(&mut self, range: Range<usize>, replacement: &str, now: u64) {
         self.mark();
-        let Some(caret) = self.caret.clone() else { return };
+        let Some(caret) = self.caret.clone().filter(|caret| !caret.picture) else { return };
         let head = caret.selection.head.clone();
         let Some(block) = self.block(&head.block) else { return };
         let text = block.plain_text();
@@ -170,6 +184,14 @@ impl Editor {
     fn delete_surrounding(&mut self, before: usize, after: usize, now: u64) {
         self.mark();
         let Some(caret) = self.caret.clone() else { return };
+        if caret.picture {
+            // A soft keyboard's backspace takes a selected picture away as the key does.
+            if before > 0 {
+                self.remove_picture(&caret.selection.head.block);
+                self.commit(Kind::Other, now, true);
+            }
+            return;
+        }
         let (start, end) = self.ordered(&caret.selection);
         let Some(block) = self.block(&start.block).filter(|_| start.block == end.block) else { return };
         let text = block.plain_text();
@@ -181,7 +203,7 @@ impl Editor {
         self.apply(ops.collect());
         let moved = |pos: &Pos| Pos::new(pos.block.clone(), pos.offset - (start.offset - from));
         let selection = Selection { anchor: moved(&caret.selection.anchor), head: moved(&caret.selection.head) };
-        self.caret = Some(Caret { selection, marks: caret.marks });
+        self.caret = Some(Caret { selection, ..caret });
         self.commit(Kind::Deleting, now, false);
     }
 }

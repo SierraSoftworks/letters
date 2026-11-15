@@ -2,10 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use letters_model::{Document, Mark, Pos, Selection};
+use letters_model::{Block, BlockId, Document, Mark, Pos, Selection};
 
 use crate::markers::{PAIRED, Sides};
-use crate::{Caret, Editor, Motion, Platform, text, tree};
+use crate::{Caret, Editor, Motion, Platform, parts, text, tree};
 
 /// What movement between lines asks of layout. `letters_layout::DocLayout` can answer all of it.
 pub trait Lines {
@@ -72,11 +72,12 @@ impl Editor {
         let doc = self.doc();
         let texts = tree::texts(doc);
         let Some(index) = texts.iter().position(|block| block.id == from.block) else { return from.clone() };
-        let text = texts[index].plain_text();
+        // A picture in a gallery shows no text to move through.
+        let text = if self.member(&from.block) { String::new() } else { texts[index].plain_text() };
         let offset = text::snap(&text, from.offset);
         let here = |offset: usize| Pos::new(from.block.clone(), offset);
         let start_of = |index: usize| Pos::new(texts[index].id.clone(), 0);
-        let end_of = |index: usize| Pos::new(texts[index].id.clone(), text::len(texts[index]));
+        let end_of = |index: usize| Pos::new(texts[index].id.clone(), self.span(texts[index]));
         let (first, last) = (0, texts.len() - 1);
 
         let fallback = HardLines(doc);
@@ -132,12 +133,103 @@ impl Editor {
         }
     }
 
-    /// Whether the document has no line of text above or below `pos`.
-    fn outermost(&self, pos: &Pos, down: bool, platform: &dyn Platform) -> bool {
-        let fallback = HardLines(self.doc());
-        let lines = platform.lines().unwrap_or(&fallback);
-        let x = lines.caret_x(pos).unwrap_or(0.0);
-        lines.line_step(pos, x, down).and_then(|pos| self.clamp(&pos)).is_none()
+    /// Where a caret goes one line up or down from a place in text or, with the flag set, from a picture.
+    /// `None` when the document has no line there.
+    ///
+    /// A figure is one stop above its caption, the pictures of a gallery stand side by side above theirs,
+    /// and a cell is left for the cell above or below it. None of that depends on how the lines are laid out.
+    fn line(&self, (pos, picture): &(Pos, bool), x: f32, down: bool, lines: &dyn Lines) -> Option<(Pos, bool)> {
+        let doc = self.doc();
+        let block = self.block(&pos.block)?;
+        let parent = self.seat(&pos.block)?.parent;
+        let step = || lines.line_step(pos, x, down).and_then(|pos| self.clamp(&pos));
+        let leaves = || step().is_none_or(|to| to.block != pos.block);
+        // The text before or after everything in a gallery or a table.
+        let beyond = |unit: &Block| {
+            let texts = tree::texts(doc);
+            let edge = if down { tree::last_text(unit) } else { tree::first_text(unit) }?;
+            let at = texts.iter().position(|block| block.id == edge.id)?;
+            let next = if down { texts.get(at + 1) } else { at.checked_sub(1).and_then(|at| texts.get(at)) }?;
+            Some(self.enter(Pos::new(next.id.clone(), if down { 0 } else { self.span(next) }), down))
+        };
+        let figure = tree::is_figure(block);
+        let on = |figure: &Block| Some((Pos::new(figure.id.clone(), 0), true));
+        if let Some(gallery) = parent.filter(|parent| tree::is_gallery(parent)) {
+            if figure {
+                let caption = parts::caption(gallery).filter(|_| down);
+                return caption.map(|caption| (Pos::new(caption.id.clone(), 0), false)).or_else(|| beyond(gallery));
+            }
+            let last = gallery.body.blocks().iter().rev().find(|part| tree::is_figure(part));
+            if let Some(last) = last.filter(|_| !down && leaves()) {
+                return on(last);
+            }
+        } else if figure && *picture && down {
+            return Some((pos.clone(), false));
+        } else if figure && !*picture && !down && leaves() {
+            return on(block);
+        } else if let Some((table, row, column)) = self.grid(&pos.block).filter(|_| leaves()) {
+            let rows = parts::rows(table);
+            let Some(next) = (if down { rows.get(row + 1) } else { row.checked_sub(1).and_then(|row| rows.get(row)) })
+            else {
+                return beyond(table);
+            };
+            let cells = parts::cells(next);
+            let cell = cells.get(column).or(cells.last())?;
+            return Some((Pos::new(cell.id.clone(), text::snap(&cell.plain_text(), pos.offset)), false));
+        }
+        let to = step()?;
+        // No figure is stepped over, wherever the layout has its lines.
+        let texts = tree::texts(doc);
+        let index = |id: &BlockId| texts.iter().position(|block| block.id == *id);
+        let (from, at) = (index(&pos.block)?, index(&to.block)?);
+        let over = |i: &usize| tree::is_figure(texts[*i]);
+        let between = if down { (from + 1..at).find(over) } else { (at + 1..from).rev().find(over) };
+        let to = between.map_or(to, |i| Pos::new(texts[i].id.clone(), if down { 0 } else { self.span(texts[i]) }));
+        Some(self.enter(to, down))
+    }
+
+    /// Where a caret that comes to `pos` from the line above or below stands. A figure is come to by its
+    /// picture from above, and from below by its caption when it has one.
+    fn enter(&self, pos: Pos, down: bool) -> (Pos, bool) {
+        match self.block(&pos.block).filter(|block| tree::is_figure(block)) {
+            Some(figure) if down || self.span(figure) == 0 => (Pos::new(pos.block, 0), true),
+            _ => (pos, false),
+        }
+    }
+
+    /// Moves a caret up or down by a line or a page.
+    fn rise(&mut self, caret: Caret, to: Motion, goal: &mut Option<f32>, platform: &mut dyn Platform) {
+        let down = matches!(to, Motion::Down | Motion::PageDown);
+        let paged = matches!(to, Motion::PageUp | Motion::PageDown);
+        let head = caret.selection.head.clone();
+        let (at, moved, ended) = {
+            let fallback = HardLines(self.doc());
+            let lines = platform.lines().unwrap_or(&fallback);
+            let x = goal.or_else(|| lines.caret_x(&head)).unwrap_or(0.0);
+            *goal = Some(x);
+            let (mut at, mut moved, mut ended) = ((head, caret.picture), false, false);
+            for _ in 0..if paged { lines.page_lines().max(1) } else { 1 } {
+                match self.line(&at, x, down, lines) {
+                    Some(next) => (at, moved) = (next, true),
+                    None => {
+                        ended = true;
+                        break;
+                    }
+                }
+            }
+            (at, moved, ended)
+        };
+        // An arrow that has no line to go to makes one, where there is something to leave.
+        if !moved && !paged && self.open(down, platform) {
+            return;
+        }
+        if ended && !at.1 {
+            // Past the first or last line, the caret goes to the end of the line it is on.
+            let edge = if down { Motion::LineEnd } else { Motion::LineStart };
+            let pos = self.target(&at.0, edge, &mut None, platform);
+            return self.place(pos);
+        }
+        self.land(at);
     }
 
     pub(crate) fn move_to(&mut self, to: Motion, extend: bool, goal: Option<f32>, platform: &mut dyn Platform) {
@@ -149,8 +241,10 @@ impl Editor {
             let head = self.target(&selection.head, to, &mut goal, platform);
             self.set_selection(Selection { anchor: selection.anchor, head });
         } else if !selection.is_caret() {
-            // A plain move collapses a selection towards the way it points.
+            // A plain move collapses a selection towards the way it points. A figure that the selection
+            // took whole at that end stays selected.
             let (start, end) = self.ordered(&selection);
+            let taken = self.taken(&start, &end);
             let pos = match to {
                 Motion::Left => start,
                 Motion::Right => end,
@@ -158,15 +252,20 @@ impl Editor {
                 Motion::Down | Motion::PageDown => self.target(&end, to, &mut goal, platform),
                 _ => self.target(&selection.head, to, &mut goal, platform),
             };
-            self.place(pos);
+            if matches!(to, Motion::Left | Motion::Right) && taken.contains(&pos.block) {
+                self.place_picture(&pos.block);
+            } else {
+                self.place(pos);
+            }
+        } else if vertical {
+            self.rise(caret, to, &mut goal, platform);
         } else if matches!(to, Motion::Left | Motion::Right) {
             self.step(caret, to == Motion::Right, platform);
         } else {
-            // An arrow that has no line to go to makes one, where there is something to leave.
-            let down = to == Motion::Down;
-            let edge = matches!(to, Motion::Up | Motion::Down) && self.outermost(&selection.head, down, platform);
-            if !(edge && self.open(down, platform)) {
-                let pos = self.target(&selection.head, to, &mut goal, platform);
+            let pos = self.target(&selection.head, to, &mut goal, platform);
+            if pos.block != selection.head.block || to == Motion::DocStart {
+                self.land(self.arrive(pos));
+            } else if pos != selection.head || !caret.picture {
                 self.place(pos);
             }
         }
@@ -174,10 +273,24 @@ impl Editor {
     }
 
     /// Moves a caret one stop sideways. A revealed marker is a stop of its own, so crossing one changes the
-    /// marks typed text will take and leaves the caret where it is.
+    /// marks typed text will take and leaves the caret where it is. A picture is a stop before its caption.
     fn step(&mut self, caret: Caret, right: bool, platform: &mut dyn Platform) {
         let pos = caret.selection.head.clone();
         let Some(block) = self.block(&pos.block) else { return };
+        let to = if right { Motion::Right } else { Motion::Left };
+        if caret.picture {
+            // Right of a picture is its caption, when it has one. Otherwise the caret leaves the figure.
+            let span = self.span(block);
+            if right && span > 0 {
+                return self.place(pos);
+            }
+            let from = Pos::new(pos.block, if right { span } else { 0 });
+            match self.target(&from, to, &mut None, platform) {
+                target if target == from => _ = self.open(right, platform),
+                target => self.land(self.arrive(target)),
+            }
+            return;
+        }
         let sides = Sides::at(block, pos.offset);
         let stops = if right { sides.after(&caret.marks) } else { sides.before(&caret.marks) };
         if let Some((mark, opens)) = if right { stops.first() } else { stops.last() } {
@@ -190,13 +303,20 @@ impl Editor {
             }
             return self.place_with(pos, marks);
         }
+        if !right && pos.offset == 0 && tree::is_figure(block) {
+            return self.place_picture(&pos.block);
+        }
 
-        let to = if right { Motion::Right } else { Motion::Left };
         let target = self.target(&pos, to, &mut None, platform);
         if target == pos {
             // The document ends here, so the caret leaves what holds it in by a line made for it.
             self.open(right, platform);
             return;
+        }
+        if target.block != pos.block
+            && let (on, true) = self.arrive(target.clone())
+        {
+            return self.place_picture(&on.block);
         }
         // The caret lands on the near side of any marker at its new place: it keeps the paired marks of
         // the character it crossed, or none when it came from another block.
@@ -218,7 +338,7 @@ impl Editor {
         let texts = tree::texts(self.doc());
         let (Some(first), Some(last)) = (texts.first(), texts.last()) else { return };
         let selection =
-            Selection { anchor: Pos::new(first.id.clone(), 0), head: Pos::new(last.id.clone(), text::len(last)) };
+            Selection { anchor: Pos::new(first.id.clone(), 0), head: Pos::new(last.id.clone(), self.span(last)) };
         self.set_selection(selection);
     }
 
@@ -232,7 +352,7 @@ impl Editor {
 
     pub(crate) fn select_block(&mut self) {
         let Some(head) = self.selection().map(|selection| selection.head.clone()) else { return };
-        let Some(len) = self.block(&head.block).map(text::len) else { return };
+        let Some(len) = self.block(&head.block).map(|block| self.span(block)) else { return };
         let at = |offset: usize| Pos::new(head.block.clone(), offset);
         self.set_selection(Selection { anchor: at(0), head: at(len) });
     }

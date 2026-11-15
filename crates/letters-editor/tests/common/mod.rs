@@ -1,17 +1,23 @@
 //! Shared fixtures: a scripted editor, and a one-line-per-block notation for documents with a selection.
 //!
 //! Each line is a block: a kind (`p`, `h1` to `h4`, `ul`, `ol`, `todo`, `done`, `code`, `code:rust`, `formula`,
-//! `hr`) and its text. Two spaces before the kind nest a list item one level. `> ` puts the block in a quote, and
-//! `tip> `, `info> `, `warn> ` or `danger> ` in a callout. In the text, `**`, `*`, `~~`, `` ` ``, `__`, `==` and
-//! `$` switch bold, italic, strike, code, underline, highlight and maths, `[text](address)` is a link, `⏎` is a
-//! line break, `|` is the caret and `^` the other end of a selection. A backslash makes the next character text.
+//! `hr`, `cap`, `fig`) and its text. Two spaces before the kind nest a list item one level. `> ` puts the block
+//! in a quote, and `tip> `, `info> `, `warn> ` or `danger> ` in a callout. In the text, `**`, `*`, `~~`, `` ` ``,
+//! `__`, `==` and `$` switch bold, italic, strike, code, underline, highlight and maths, `[text](address)` is a
+//! link, `⏎` is a line break, `|` is the caret and `^` the other end of a selection. A backslash makes the next
+//! character text.
+//!
+//! A figure's text is its caption. `fig#` is numbered, and a `*` after the kind says its picture is selected.
+//! `g> ` puts a figure or a caption in a gallery, and `g#> ` in a numbered one. A cell is `td`, or `th` in a
+//! row that heads its table, after the row it is in: `r1> `, `r2> ` and so on. Consecutive rows are one table.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
 
 use letters_editor::{Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Marker, Modifiers, Platform};
 use letters_model::{
-    Block, BlockKind, Body, Change, Document, ListKind, Mark, Model, Pos, ReplicaId, Run, Selection, Tone,
+    Align, Block, BlockId, BlockKind, Body, Change, Document, ListKind, Mark, Model, Pos, ReplicaId, Run, Selection,
+    Tone,
 };
 use proptest::prelude::*;
 
@@ -124,11 +130,14 @@ pub struct Harness {
 impl Harness {
     /// An editor on the document that `state` describes, with the standard keymap on every system.
     pub fn new(state: &str) -> Self {
-        let (doc, selection) = parse(state);
+        let (doc, selection, picture) = read(state);
         let mut editor = Editor::new(doc, ReplicaId::from(1));
         editor.set_keymap(Keymap::standard());
         if let Some(selection) = selection {
             editor.select(selection);
+        }
+        if let Some(picture) = picture {
+            editor.select_picture(&picture);
         }
         Self { editor, platform: Fake::default() }
     }
@@ -159,12 +168,12 @@ impl Harness {
 
     /// The document and selection in the notation.
     pub fn state(&self) -> String {
-        render(self.editor.doc(), self.editor.selection())
+        render(self.editor.doc(), self.editor.selection(), self.editor.picture())
     }
 
     /// The document alone.
     pub fn text(&self) -> String {
-        render(self.editor.doc(), None)
+        render(self.editor.doc(), None, None)
     }
 
     pub fn input(&mut self, event: InputEvent) -> Change {
@@ -265,33 +274,69 @@ pub fn key(name: &str) -> KeyEvent {
 /// The notation as the fixture itself writes it, so that a test may place the caret on either side of a
 /// switch.
 pub fn canon(state: &str) -> String {
-    let (doc, selection) = parse(state);
-    render(&doc, selection.as_ref())
+    let (doc, selection, picture) = read(state);
+    render(&doc, selection.as_ref(), picture.as_ref())
 }
 
-/// Reads the notation. Blocks are named `b1`, `b2` and so on in document order, containers included.
+/// What a line of the notation is put in.
+enum Outer {
+    Holder(BlockKind),
+    Row(usize),
+}
+
+/// The figure that the notation's `fig` stands for.
+pub fn picture(id: &str, numbered: bool) -> BlockKind {
+    let asset = Some(format!("assets/{id}.png"));
+    BlockKind::Figure { asset, src: None, alt: String::new(), width: 240.0, height: 160.0, numbered }
+}
+
+fn holding(id: String, kind: BlockKind, parts: Vec<Block>) -> Block {
+    Block { body: Body::Blocks(parts), ..Block::new(id.as_str(), kind) }
+}
+
+/// Reads the notation, without the picture it may say is selected.
 pub fn parse(state: &str) -> (Document, Option<Selection>) {
+    let (doc, selection, _) = read(state);
+    (doc, selection)
+}
+
+/// Reads the notation. Blocks are named `b1`, `b2` and so on in the order they are met, a block before what
+/// holds it.
+pub fn read(state: &str) -> (Document, Option<Selection>, Option<BlockId>) {
     let mut blocks: Vec<Block> = Vec::new();
-    let (mut anchor, mut head) = (None, None);
+    let (mut anchor, mut head, mut selected) = (None, None, None);
     let mut count = 0;
     let mut id = || {
         count += 1;
         format!("b{count}")
     };
+    // The number of the row that the line before was in.
+    let mut row = 0;
     for line in state.lines() {
+        let numbered = |row: &str| row.strip_prefix('r').and_then(|number| number.parse::<usize>().ok());
         let (container, line) = match line.split_once("> ") {
-            Some(("", rest)) => (Some(BlockKind::Quote), rest),
+            Some(("", rest)) => (Some(Outer::Holder(BlockKind::Quote)), rest),
+            Some(("g", rest)) => (Some(Outer::Holder(BlockKind::Gallery { numbered: false })), rest),
+            Some(("g#", rest)) => (Some(Outer::Holder(BlockKind::Gallery { numbered: true })), rest),
             Some((tone, rest)) if TONES.iter().any(|(name, _)| *name == tone) => {
                 let tone = TONES.iter().find(|(name, _)| *name == tone).expect("checked above").1;
-                (Some(BlockKind::Callout { tone }), rest)
+                (Some(Outer::Holder(BlockKind::Callout { tone })), rest)
             }
+            Some((name, rest)) if numbered(name).is_some() => (numbered(name).map(Outer::Row), rest),
             _ => (None, line),
         };
         let depth = (line.len() - line.trim_start_matches(' ').len()) / 2;
         let (kind, text) = line.trim_start_matches(' ').split_once(' ').unwrap_or((line.trim_start_matches(' '), ""));
         let list = |list| BlockKind::ListItem { list, depth: depth as u8 };
+        let name = id();
+        let (kind, on) = kind.strip_suffix('*').map_or((kind, false), |kind| (kind, true));
+        let heads = kind == "th";
         let kind = match kind {
             "p" => BlockKind::Paragraph,
+            "cap" => BlockKind::Caption,
+            "fig" => picture(&name, false),
+            "fig#" => picture(&name, true),
+            "td" | "th" => BlockKind::TableCell,
             "h1" | "h2" | "h3" | "h4" => BlockKind::Heading { level: kind[1..].parse().expect("a heading level") },
             "ul" => list(ListKind::Bullet),
             "ol" => list(ListKind::Ordered),
@@ -306,28 +351,52 @@ pub fn parse(state: &str) -> (Document, Option<Selection>) {
             },
         };
 
-        let mut block = Block::new(id().as_str(), kind);
+        let mut block = Block::new(name.as_str(), kind);
         if matches!(block.body, Body::Text(_)) {
             let (runs, at_anchor, at_head) = inline(text);
             block.body = Body::Text(runs);
             anchor = at_anchor.map(|offset| Pos::new(block.id.clone(), offset)).or(anchor);
             head = at_head.map(|offset| Pos::new(block.id.clone(), offset)).or(head);
         }
+        if on {
+            selected = Some(block.id.clone());
+        }
+        let last = (row, std::mem::take(&mut row)).0;
         match (container, blocks.last_mut()) {
             (None, _) => blocks.push(block),
-            // Consecutive lines with the same prefix share one quote or callout.
-            (Some(kind), Some(Block { kind: open, body: Body::Blocks(children), .. })) if *open == kind => {
+            (Some(Outer::Row(number)), open) => {
+                row = number;
+                match open {
+                    // Consecutive rows share one table, and consecutive cells one row.
+                    Some(Block { kind: BlockKind::Table { columns, header }, body: Body::Blocks(rows), .. })
+                        if last > 0 && number >= last =>
+                    {
+                        *header |= heads;
+                        match rows.last_mut() {
+                            Some(Block { body: Body::Blocks(cells), .. }) if number == last => cells.push(block),
+                            _ => rows.push(holding(id(), BlockKind::TableRow, vec![block])),
+                        }
+                        let width = rows.first().map_or(0, |row| row.body.blocks().len());
+                        *columns = vec![Align::Start; width];
+                    }
+                    _ => {
+                        let cells = holding(id(), BlockKind::TableRow, vec![block]);
+                        let table = BlockKind::Table { columns: vec![Align::Start], header: heads };
+                        blocks.push(holding(id(), table, vec![cells]));
+                    }
+                }
+            }
+            // Consecutive lines with the same prefix share one quote, callout or gallery.
+            (Some(Outer::Holder(kind)), Some(Block { kind: open, body: Body::Blocks(children), .. }))
+                if *open == kind =>
+            {
                 children.push(block)
             }
-            (Some(kind), _) => {
-                let mut outer = Block::new(id().as_str(), kind);
-                outer.body = Body::Blocks(vec![block]);
-                blocks.push(outer);
-            }
+            (Some(Outer::Holder(kind)), _) => blocks.push(holding(id(), kind, vec![block])),
         }
     }
     let selection = head.map(|head| Selection { anchor: anchor.unwrap_or_else(|| head.clone()), head });
-    (Document { blocks, ..Document::default() }, selection)
+    (Document { blocks, ..Document::default() }, selection, selected)
 }
 
 /// The runs a line of text describes, and the offsets of `^` and `|` in it.
@@ -382,25 +451,47 @@ fn inline(text: &str) -> (Vec<Run>, Option<usize>, Option<usize>) {
 }
 
 /// Writes the notation. Runs with the same formatting read as one, however the model split them.
-pub fn render(doc: &Document, selection: Option<&Selection>) -> String {
+pub fn render(doc: &Document, selection: Option<&Selection>, picture: Option<&BlockId>) -> String {
     let mut lines = Vec::new();
+    let line = |block: &Block| line(block, selection, picture);
     for block in &doc.blocks {
         match (&block.kind, &block.body) {
             (BlockKind::Quote, Body::Blocks(children)) => {
-                lines.extend(children.iter().map(|child| format!("> {}", line(child, selection))));
+                lines.extend(children.iter().map(|child| format!("> {}", line(child))));
             }
             (BlockKind::Callout { tone }, Body::Blocks(children)) => {
                 let name = TONES.iter().find(|(_, other)| other == tone).expect("every tone has a name").0;
-                lines.extend(children.iter().map(|child| format!("{name}> {}", line(child, selection))));
+                lines.extend(children.iter().map(|child| format!("{name}> {}", line(child))));
             }
-            _ => lines.push(line(block, selection)),
+            (BlockKind::Gallery { numbered }, Body::Blocks(children)) => {
+                let name = if *numbered { "g#" } else { "g" };
+                lines.extend(children.iter().map(|child| format!("{name}> {}", line(child))));
+            }
+            (BlockKind::Table { header, .. }, Body::Blocks(rows)) => {
+                for (i, row) in rows.iter().enumerate() {
+                    let cell = |cell: &Block| match *header && i == 0 {
+                        true => format!("r{}> {}", i + 1, line(cell).replacen("td", "th", 1)),
+                        false => format!("r{}> {}", i + 1, line(cell)),
+                    };
+                    lines.extend(row.body.blocks().iter().map(cell));
+                }
+            }
+            _ => lines.push(line(block)),
         }
     }
     lines.join("\n")
 }
 
-fn line(block: &Block, selection: Option<&Selection>) -> String {
+fn line(block: &Block, selection: Option<&Selection>, picture: Option<&BlockId>) -> String {
+    // A selected picture is marked on its kind, and the caret that stands for it is not drawn.
+    let on = picture == Some(&block.id);
+    let selection = selection.filter(|_| !on);
     let (indent, kind) = match &block.kind {
+        BlockKind::Caption => (0, "cap".to_owned()),
+        BlockKind::Figure { numbered, .. } => {
+            (0, format!("fig{}{}", if *numbered { "#" } else { "" }, if on { "*" } else { "" }))
+        }
+        BlockKind::TableCell => (0, "td".to_owned()),
         BlockKind::Paragraph => (0, "p".to_owned()),
         BlockKind::Heading { level } => (0, format!("h{level}")),
         BlockKind::ListItem { list, depth } => {
@@ -581,7 +672,7 @@ pub fn action() -> impl Strategy<Value = Action> {
         4 => typed.prop_map(|text| Action::Type(text.into())),
         4 => keys.prop_map(Action::Key),
         1 => commands.prop_map(Action::Run),
-        1 => (0..16usize, 0..24usize, 0..16usize, 0..24usize).prop_map(|(a, b, c, d)| Action::Select(a, b, c, d)),
+        2 => (0..40usize, 0..24usize, 0..40usize, 0..24usize).prop_map(|(a, b, c, d)| Action::Select(a, b, c, d)),
         1 => inputs.prop_map(Action::Input),
         1 => prop::sample::select(vec![10u64, 2_000]).prop_map(Action::Wait),
     ]
@@ -604,8 +695,34 @@ pub fn perform(editor: &mut Harness, action: &Action) {
     }
 }
 
-/// What must hold after anything: every block has its own id, and the selection sits on characters of text.
+/// What must hold after anything one writer does: [`sound`], and the blocks made of parts are whole. Two
+/// writers at once can leave a table ragged or a gallery with one picture, which the model allows.
 pub fn check(editor: &Harness) -> Result<(), TestCaseError> {
+    sound(editor)?;
+    let doc = editor.editor.doc();
+    for block in doc.walk() {
+        let parts = block.body.blocks();
+        match &block.kind {
+            BlockKind::Table { columns, .. } => {
+                let whole = |row: &Block| row.kind == BlockKind::TableRow && row.body.blocks().len() == columns.len();
+                prop_assert!(!parts.is_empty() && !columns.is_empty() && parts.iter().all(whole), "a table is ragged");
+            }
+            BlockKind::Gallery { .. } => {
+                let pictures = parts.iter().filter(|part| matches!(part.kind, BlockKind::Figure { .. })).count();
+                prop_assert!(pictures >= 2, "a gallery has fewer than two pictures");
+                let captions = parts.iter().filter(|part| part.kind == BlockKind::Caption).count();
+                let last = parts.last().is_some_and(|part| part.kind == BlockKind::Caption);
+                prop_assert!(captions == 0 || (captions == 1 && last), "a gallery's caption is not one at its end");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// What must hold after anything at all: every block has its own id, the document can be stored, the
+/// selection sits on characters of text, and a picture is selected only where there is one.
+pub fn sound(editor: &Harness) -> Result<(), TestCaseError> {
     let doc = editor.editor.doc();
     let ids: BTreeSet<_> = doc.walk().map(|block| &block.id).collect();
     prop_assert_eq!(ids.len(), doc.walk().count(), "two blocks share an id");
@@ -616,8 +733,23 @@ pub fn check(editor: &Harness) -> Result<(), TestCaseError> {
             prop_assert!(text.is_some_and(|text| text.is_char_boundary(pos.offset)), "the selection is off the text");
         }
     }
+    let stored = Document::from_json(&doc.to_json());
+    prop_assert_eq!(stored.as_ref(), Ok(doc), "the document cannot be stored");
+    let figure = |block: &&Block| matches!(block.kind, BlockKind::Figure { .. });
+    // In a gallery the caret is always on a picture, since the pictures there have no caption of their own.
+    let head = editor.editor.selection().filter(|selection| selection.is_caret()).map(|selection| &selection.head);
+    let on = head.and_then(|head| doc.block(&head.block)).filter(figure);
+    let member = |id: &BlockId| {
+        doc.walk().any(|block| {
+            matches!(block.kind, BlockKind::Gallery { .. }) && block.body.blocks().iter().any(|part| part.id == *id)
+        })
+    };
+    match editor.editor.picture() {
+        Some(picture) => prop_assert!(on.is_some_and(|block| block.id == *picture), "a picture that is no figure"),
+        None => prop_assert!(!on.is_some_and(|block| member(&block.id)), "a caret in a picture of a gallery"),
+    }
     Ok(())
 }
 
 /// A document with every kind of block and mark, for scripts to run on.
-pub const SAMPLE: &str = "h1 A *title*|\np Some **bold** and [linked](https://a.example) text, ünïcödé 👩‍👧.\nul one\n  todo two\nhr\n> p quoted\n> p lines\ntip> p a tip\ncode:rust fn main() {⏎    body();⏎}\np";
+pub const SAMPLE: &str = "h1 A *title*|\np Some **bold** and [linked](https://a.example) text, ünïcödé 👩‍👧.\nul one\n  todo two\nhr\n> p quoted\n> p lines\ntip> p a tip\ncode:rust fn main() {⏎    body();⏎}\nfig Boats at sea\ng> fig\ng> fig\ng> cap Two more\nr1> th Boat\nr1> th Length\nr2> td Skiff\nr2> td 4 m\np";
