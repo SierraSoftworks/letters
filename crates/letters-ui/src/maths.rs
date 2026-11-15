@@ -2,7 +2,8 @@
 //!
 //! The formula stays typeset on the page. Its source is written on a sheet that slides out from under it
 //! when the caret reaches it, and the caret shows there, at the place in the source the editor holds it.
-//! A backslash typed there lists the symbols that match what follows it, each one typeset.
+//! A backslash typed there lists the symbols that match what follows it, each one typeset. The `$` that
+//! closes a formula blends the source it was typed as into its glyphs.
 
 use std::ops::Range;
 use std::rc::Rc;
@@ -11,7 +12,7 @@ use accesskit::Role;
 use letters_editor::{Editor, Lines};
 use letters_math::{Command as Symbol, Formula, TEXT_RATIO, commands, typeset};
 use letters_model::{BlockId, Pos, Selection};
-use letters_render::{DisplayList, Item, Point, Rect, Size};
+use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 
 use crate::color::{fade, resolve};
 use crate::element::{Cursor, Element, Paint, Pointer};
@@ -33,6 +34,8 @@ pub(crate) const HALO: f32 = 3.0;
 const WIDER: f32 = 24.0;
 /// How long the sheet takes to slide out, in milliseconds.
 const SLIDE_MS: f32 = 140.0;
+/// How far together the source of a closed formula is pressed at the most, as a share of its width.
+const SQUEEZE: f32 = 0.5;
 /// How many symbols the list shows, and the least room it takes across.
 const LISTED: usize = 6;
 const LIST_WIDTH: f32 = 300.0;
@@ -234,6 +237,20 @@ pub(crate) fn written(symbol: &Symbol) -> String {
     format!("{}{}", symbol.command, "{}".repeat(symbol.arguments.into()))
 }
 
+/// A formula that was just closed, while the source it was typed as still blends into its glyphs.
+struct Blend {
+    /// A place in the formula, by which the layout says where it is drawn.
+    at: Pos,
+    /// The source as the page showed it while it was typed, with its dollar signs.
+    typed: Shaped,
+    /// The middle of the left edge of the source where it was typed. `None` where the formula starts.
+    from: Option<Point>,
+    /// When the blend began, once a frame has said so.
+    since: Option<u64>,
+    /// How much of the formula shows, from 0 to 1. The source shows as much less.
+    shown: f32,
+}
+
 /// The sheet's own state: which formula it is out under, and how far out it has slid.
 #[derive(Default)]
 pub(crate) struct Maths {
@@ -249,6 +266,7 @@ pub(crate) struct Maths {
     typing: bool,
     /// The symbol picked in the list, counted from the first.
     picked: usize,
+    blend: Option<Blend>,
 }
 
 impl Maths {
@@ -286,14 +304,81 @@ impl Maths {
         Some((range, matching(typed))).filter(|(_, found)| !found.is_empty())
     }
 
-    /// Slides the sheet further out. Returns when the next frame is due, while it still moves.
+    /// Slides the sheet further out, and blends a closed formula further in. Returns when the next frame is
+    /// due, while either still moves.
     pub fn animate(&mut self, now_ms: u64) -> Option<u64> {
-        if self.out.is_none() || self.slid >= 1.0 {
-            return None;
+        let blending = self.blend.as_mut().map(|blend| {
+            let progress = now_ms.saturating_sub(*blend.since.get_or_insert(now_ms)) as f32 / tokens::DURATION_FAST;
+            blend.shown = motion::ease(progress);
+            progress < 1.0
+        });
+        if blending == Some(false) {
+            self.blend = None;
         }
-        let progress = now_ms.saturating_sub(*self.since.get_or_insert(now_ms)) as f32 / SLIDE_MS;
-        self.slid = if progress < 1.0 { motion::ease(progress) } else { 1.0 };
-        (progress < 1.0).then_some(now_ms + FRAME_MS)
+        let mut sliding = false;
+        if self.out.is_some() && self.slid < 1.0 {
+            let progress = now_ms.saturating_sub(*self.since.get_or_insert(now_ms)) as f32 / SLIDE_MS;
+            self.slid = if progress < 1.0 { motion::ease(progress) } else { 1.0 };
+            sliding = progress < 1.0;
+        }
+        (sliding || blending == Some(true)).then_some(now_ms + FRAME_MS)
+    }
+
+    /// Begins to blend the source of a formula that was just closed into its glyphs. `at` is a place in the
+    /// formula, and `typed` its source as the page showed it, with its dollar signs. `from` is the middle
+    /// of its left edge there, when that is not where the formula now starts.
+    pub fn close(&mut self, at: Pos, typed: Shaped, from: Option<Point>) {
+        self.blend = Some(Blend { at, typed, from, since: None, shown: 0.0 });
+    }
+
+    /// A place in the formula whose source is still blending into its glyphs.
+    pub fn closing(&self) -> Option<&Pos> {
+        self.blend.as_ref().map(|blend| &blend.at)
+    }
+
+    /// Gives up a blend whose formula is no longer there to blend into.
+    pub fn settle(&mut self) {
+        self.blend = None;
+    }
+
+    /// Draws the blend into what the page painted: the formula drawn in `rect` shows as far as the blend has
+    /// come, and over it the source goes in `ink`, from where it was typed, its characters pressed together
+    /// towards the formula's width.
+    pub fn blend(&self, rect: Rect, ink: Color, list: &mut DisplayList) {
+        let Some(blend) = &self.blend else { return };
+        let faded = |color: Color, share: f32| Color { a: (f32::from(color.a) * share).round() as u8, ..color };
+        let around = Rect::new(rect.x - 1.0, rect.y - 1.0, rect.width + 2.0, rect.height + 2.0);
+        let inside = |part: &Rect| {
+            around.contains(Point { x: part.x, y: part.y })
+                && around.contains(Point { x: part.x + part.width, y: part.y + part.height })
+        };
+        for item in &mut list.items {
+            let color = match item {
+                Item::Glyphs { origin, color, .. } | Item::Path { origin, color, .. } if around.contains(*origin) => {
+                    color
+                }
+                Item::Fill { rect, color, .. } | Item::Stroke { rect, color, .. } if inside(rect) => color,
+                _ => continue,
+            };
+            *color = faded(*color, blend.shown);
+        }
+        let typed = &blend.typed;
+        let between = |from: f32, to: f32| from + (to - from) * blend.shown;
+        let least = (rect.width / typed.size.width.max(1.0)).clamp(SQUEEZE, 1.0);
+        let pressed = between(1.0, least);
+        // The source ends up in the middle of the formula, as wide as it is when that is not too narrow.
+        let middle = rect.y + rect.height / 2.0;
+        let from = blend.from.unwrap_or(Point { x: rect.x, y: middle });
+        let left = between(from.x, rect.x + (rect.width - typed.size.width * least) / 2.0);
+        let top = between(from.y, middle) - typed.size.height / 2.0;
+        let first = list.items.len();
+        typed.paint(Point { x: 0.0, y: top }, faded(ink, 1.0 - blend.shown), list);
+        for item in &mut list.items[first..] {
+            if let Item::Glyphs { origin, glyphs, .. } = item {
+                origin.x = left + origin.x * pressed;
+                glyphs.iter_mut().for_each(|glyph| glyph.x *= pressed);
+            }
+        }
     }
 
     /// How wide the sheet shows its source: as wide as the source or a little wider than its formula,

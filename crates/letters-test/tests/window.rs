@@ -1939,3 +1939,42 @@ fn the_list_of_symbols_is_put_away_without_leaving_the_formula() {
     window.key("Escape").key("Escape");
     assert_eq!(source(&mut window), None);
 }
+
+/// How strongly each run of glyphs on the page is drawn, back to front: the alpha of its ink.
+fn inks(window: &mut Harness) -> Vec<u8> {
+    let page = page(window);
+    let ink = |item: &Item| match item {
+        Item::Glyphs { origin, color, .. } if page.contains(*origin) => Some(color.a),
+        _ => None,
+    };
+    window.paint().items.iter().filter_map(ink).collect()
+}
+
+#[test]
+fn the_dollar_that_closes_a_formula_blends_its_source_into_its_glyphs() {
+    // A formula closed in a line of text, and one closed alone in its paragraph.
+    for (start, typed) in [("A rafter has length ", "$c = a + b$"), ("", "$$x = a + b$$")] {
+        let closed = |reduced_motion: bool| {
+            let blocks = vec![text("p1", BlockKind::Paragraph, start)];
+            let mut window = Harness::open(Document { blocks, ..Document::default() });
+            window.ui().set_reduced_motion(reduced_motion);
+            window.ui().select(Selection::caret(Pos::new("p1", start.len())));
+            window.type_text(typed);
+            window
+        };
+        let rest = inks(&mut closed(true));
+        assert_eq!(inks(closed(true).advance(400)), rest, "{typed}: nothing blends under reduced motion");
+
+        let mut window = closed(false);
+        let mut frames = Vec::new();
+        for _ in 0..30 {
+            frames.push(inks(&mut window));
+            window.advance(8);
+        }
+        assert!(frames[0].len() > rest.len(), "{typed}: the source is still on the page: {:?}", frames[0]);
+        assert!(frames[0].contains(&0), "{typed}: and the formula has yet to show: {:?}", frames[0]);
+        let between = |inks: &Vec<u8>| inks.iter().filter(|ink| (1..255).contains(*ink)).count() >= 2;
+        assert!(frames.iter().any(between), "{typed}: each shows through the other on the way: {frames:?}");
+        assert_eq!(frames[29], rest, "{typed}: within a quarter of a second the formula is all that shows");
+    }
+}

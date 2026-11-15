@@ -29,7 +29,7 @@ use crate::restyle::{self, Field, StyleEdit};
 use crate::spelling::{Fix, Spelling};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::styles::{self, Styles, Styling};
-use crate::text::{Family, FontShaper, TextStyle};
+use crate::text::{Family, FontShaper, TextShaper, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::ui::{App, Idle, Keys, Ui};
 use crate::widgets::{
@@ -903,6 +903,12 @@ impl EditorApp {
             }
         }
         self.layout.paint(viewport, &mut list);
+        // A formula that was just closed still has its source over it, on the way out.
+        match self.maths.closing().map(|at| self.layout.formula_rect(at)) {
+            Some(Some(rect)) => self.maths.blend(rect, self.palette.text, &mut list),
+            Some(None) => self.maths.settle(),
+            None => {}
+        }
 
         let caret = selection.filter(|_| sheet.is_none()).and_then(|selection| self.layout.caret(&selection.head));
         let caret =
@@ -1453,6 +1459,47 @@ impl EditorApp {
         true
     }
 
+    /// Blends the source of a formula into its glyphs, when a `$` typed at `before` has just closed one.
+    /// `start` is where the block of `before` began on the page then.
+    fn close(&mut self, before: &Pos, start: Option<Rect>) {
+        let Some(block) = self.editor.doc().block(&before.block) else { return };
+        let Some(head) = self.editor.selection().map(|selection| &selection.head) else { return };
+        let closed = if block.kind == BlockKind::Formula {
+            // `$$x$$` alone in its paragraph made a formula of it, and the caret went on below. The source
+            // began where the paragraph did, and the formula may stand anywhere on its line.
+            let from = start.map(|start| Point { x: start.x, y: start.y + start.height / 2.0 });
+            (head.block != block.id).then(|| (0, format!("$${}$$", block.plain_text()), from))
+        } else if head.block == block.id && self.editor.formula().is_none() {
+            // Inline maths that ends at the caret, which is outside it, was closed there.
+            let (mut at, mut from) = (0, None);
+            for run in block.body.runs() {
+                if at >= head.offset {
+                    break;
+                }
+                from = if run.marks.contains(&Mark::Math) { from.or(Some(at)) } else { None };
+                at += run.text.len();
+            }
+            let text = block.plain_text();
+            let source = from.filter(|_| at == head.offset).and_then(|from| Some((from, text.get(from..at)?)));
+            source.map(|(from, source)| (from, format!("${source}$"), None))
+        } else {
+            None
+        };
+        let Some((offset, typed, from)) = closed else { return };
+        // The source goes as it was written: in the face of its block, as near as the interface has it.
+        let types = &self.editor.model().style().types;
+        let written = restyle::element(self.editor.doc(), &block.id).and_then(|element| types.get(element));
+        let face = written.map_or(TextStyle::body(), |style| TextStyle {
+            family: FAMILIES.iter().find(|(family, _)| *family == style.family).map_or(Family::Sans, |found| found.1),
+            size: style.size * PT,
+            weight: style.weight,
+            italic: style.italic,
+            leading: style.line_height,
+        });
+        let typed = self.shaper.shape(&typed.replace('\n', " "), &face, None);
+        self.maths.close(Pos::new(block.id.clone(), offset), typed, from);
+    }
+
     /// Keeps a caret set at an end of inline maths inside it. Left there, text typed next would be written
     /// beside the formula, and the sheet that was pressed would go.
     fn stay(&mut self, at_start: bool, platform: &mut dyn Platform) {
@@ -1542,8 +1589,17 @@ impl App for EditorApp {
     fn update(&mut self, message: Message, platform: &mut dyn Platform) {
         match message {
             Message::Text(event) => {
+                let dollar =
+                    matches!(&event, InputEvent::Insert(text) | InputEvent::Commit(text) if text.ends_with('$'));
+                // Where the caret is and where its block starts, should this close a formula.
+                let before = self.editor.selection().filter(|_| dollar && !self.reduced_motion);
+                let before = before.map(|selection| selection.head.clone());
+                let before = before.map(|head| (self.layout.caret(&Pos::new(head.block.clone(), 0)), head));
                 self.edit(platform, |editor, platform| editor.input(event, platform));
                 self.maths.typed(true);
+                if let Some((start, head)) = before {
+                    self.close(&head, start);
+                }
             }
             Message::Pointer(event) => self.pointer(event, platform),
             Message::Run(command) => self.edit(platform, |editor, platform| editor.run(command, platform)),
