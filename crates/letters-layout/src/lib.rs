@@ -47,13 +47,13 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use letters_model::{BlockId, BlockKind, Body, Change, Document, Markers, Page, Pos, Selection, Style};
-use letters_render::{DisplayList, Font, Item, Point, Rect, Role as Tag};
+use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Role as Tag};
 use parley::{Alignment, Language, PositionedLayoutItem};
 
 use crate::engine::Engine;
 use crate::flow::{Frame, Leaf, Look, Part, Picture, Role, Table, Types, What, Words};
 use crate::ink::{Brush, Ink, Inks};
-use crate::leaf::{Extent, Laid, Lay, Open, Over, Painter, Source, Swap, Text};
+use crate::leaf::{Extent, Laid, Lay, Lit, Open, Over, Painter, Source, Swap, Text};
 use crate::reveal::{Reveal, Shapes, Shifts};
 
 pub use crate::callout::icon_path;
@@ -215,6 +215,7 @@ impl DocLayout {
             in_place: true,
             good: None,
             stands: false,
+            term: None,
             numbers: HashMap::new(),
             loaded: HashMap::new(),
             caption: None,
@@ -390,6 +391,18 @@ impl DocLayout {
     /// screen keeps what was: a sheet shows the document.
     pub fn set_formula_source(&mut self, in_place: bool) {
         self.state.get_mut().set_formula_source(in_place);
+    }
+
+    /// Lights the term a caret is at in a formula that stays typeset while it is written. `at` is the caret
+    /// in the formula's source, as [`DocLayout::formula_rect`] takes one, and the colour its term is drawn in.
+    /// `None` draws every formula plain again. Nothing is laid out for it: that one formula is drawn another
+    /// way from the next [`DocLayout::paint`], so only its block is to be drawn again.
+    ///
+    /// A term is what [`letters_math::Formula::term`] gives: a symbol, an operator, a run in a font. Nothing
+    /// is lit where the caret is at none, in a formula that shows its source in its place, or in one that
+    /// stands as it last could be typeset. Only the screen shows it: a sheet shows the document.
+    pub fn tint_term(&mut self, at: Option<(&Pos, Color)>) {
+        self.state.get_mut().term = at.map(|(caret, color)| (caret.clone(), color));
     }
 
     /// Underlines the text an input method is composing: a block and a byte range in it, as the editor's
@@ -713,6 +726,8 @@ struct State {
     good: Option<Arc<str>>,
     /// Whether that formula is set from it now, because its source as written cannot be typeset.
     stands: bool,
+    /// A caret in the source of a formula, and the colour the term it is at is lit in.
+    term: Option<(Pos, Color)>,
     /// The number of each numbered figure and gallery.
     numbers: HashMap<BlockId, u32>,
     /// The links whose pictures the shell has, which are drawn in place of their frames, each with the
@@ -1382,6 +1397,7 @@ impl State {
             let cells = leaf.cells.len();
             for part in [Part::Text].into_iter().chain((0..cells).map(Part::Cell)) {
                 let shifts = if print { Shifts::default() } else { self.shifts(at, part) };
+                let lit = if print { None } else { self.lit(at, part) };
                 let Self {
                     engine, types, leaves, index, tokens, spelling, shapes, composition, numbers, loaded, ..
                 } = self;
@@ -1393,7 +1409,7 @@ impl State {
                 let composing = composition.as_ref().filter(|(block, _)| own(block)).map(|(_, range)| range.clone());
                 let spelling = block.and_then(|id| spelling.get(id)).map_or(&[][..], Vec::as_slice);
                 let sheet_of = &|block: &BlockId| sheet_of(pages?, index.get(block)?.leaf);
-                let over = Over { shifts: &shifts, shapes, composing, spelling, sheet_of };
+                let over = Over { shifts: &shifts, shapes, composing, spelling, sheet_of, lit };
                 let mut painter =
                     Painter { engine, types, inks: &inks, band, spelt: print, part: name, numbers, loaded, out };
                 match part {
@@ -1407,6 +1423,15 @@ impl State {
             out.items.extend(row.map(|_| Item::Close));
         }
         out.items.extend(around.drain(..).map(|_| Item::Close));
+    }
+
+    /// The term to light in a text of a leaf: the one at the caret [`DocLayout::tint_term`] was told, where
+    /// that is in a formula of this text.
+    fn lit(&self, at: usize, part: Part) -> Option<Lit> {
+        let (caret, color) = self.term.as_ref()?;
+        let leaf = &self.leaves[at];
+        let (_, source) = leaf.formula(part, caret.offset).filter(|_| leaf.owner(part) == Some(&caret.block))?;
+        Some(Lit { caret: caret.offset - source.start, source, color: *color })
     }
 
     fn paginate(&mut self, page: &Page) -> Pages {

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use icu_properties::props::BidiClass;
+use letters_math::Formula;
 use letters_render::{Color, Font, FontBytes, Glyph, Item, Point};
 use parley::fontique::{Blob, CharmapIndex, Collection, CollectionOptions, FamilyId, SourceCache};
 use parley::setting::Tag;
@@ -51,6 +52,8 @@ pub(crate) struct Spec<'a> {
 pub(crate) struct Engine {
     /// The formulas typeset so far. They are set far more often than they change.
     pub maths: letters_math::Cache,
+    /// The last formula a term was lit in, traced to its source: the one being written.
+    traced: Option<(Box<str>, letters_math::Style, Option<Formula>)>,
     /// Whether a formula may link. Only a document that is trusted may.
     pub links: bool,
     fcx: FontContext,
@@ -92,6 +95,7 @@ impl Engine {
         let collection = Collection::new(CollectionOptions { shared: false, system_fonts: false });
         let mut engine = Self {
             maths: letters_math::Cache::default(),
+            traced: None,
             links: false,
             fcx: FontContext { collection, source_cache: SourceCache::default() },
             lcx: LayoutContext::new(),
@@ -108,6 +112,19 @@ impl Engine {
         };
         engine.add(fonts);
         engine
+    }
+
+    /// The formula of `source` with the term in `color` that a caret at the byte `caret` of it is at, where
+    /// it is at one. Tracing a formula to its source takes as long as setting it three times, and this is
+    /// asked at every paint, so the last one traced is kept.
+    pub fn lit(&mut self, source: &str, style: &letters_math::Style, caret: usize, color: Color) -> Option<Formula> {
+        let held = self.traced.as_ref().is_some_and(|(of, like, _)| **of == *source && like == style);
+        if !held {
+            let formula = letters_math::typeset_mapped(source, style).ok();
+            self.traced = Some((source.into(), *style, formula));
+        }
+        let formula = self.traced.as_ref()?.2.as_ref()?;
+        Some(formula.tinted(&formula.term(caret)?, color))
     }
 
     /// Registers the faces of `fonts` that are not registered yet, and says whether there were any.

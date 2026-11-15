@@ -339,6 +339,49 @@ fn a_formula_takes_the_colour_of_its_text() {
 }
 
 #[test]
+fn the_term_at_the_caret_is_lit_in_a_formula_that_stays_typeset() {
+    const ACCENT: Color = Color::rgb(0x2f, 0x6f, 0xed);
+    let none = Markers::default();
+    let typing = |at: Pos, text: &str| vec![Op::InsertText { at, text: text.into() }];
+    let cases = both(TEX).map(|case| (case.name, case.doc, case.block, case.ends, case.outside));
+    let in_a_cell = ("in a cell", cell(TEX), "t00", (0, TEX.len()), Pos::new("z", 0));
+    for (name, doc, id, (start, end), outside) in cases.into_iter().chain([in_a_cell]) {
+        let mut model = Model::new(doc, ReplicaId::from(1));
+        let mut layout = laid(model.doc());
+        layout.set_formula_source(false);
+        let plain = painted(&layout, everything());
+
+        // In `\frac{a}{b}`, a caret after the `a` and one after the `b`.
+        let [above, below] = [7, 10].map(|offset| {
+            layout.tint_term(Some((&Pos::new(id, start + offset), ACCENT)));
+            let items = painted(&layout, everything());
+            assert_eq!(placed(&items), placed(&plain), "{name}: it is drawn where it was, and once, at {offset}");
+            inked(&items, ACCENT)
+        });
+        assert_eq!((above.len(), below.len()), (1, 1), "{name}: one letter is lit");
+        assert_ne!(above, below, "{name}: the one the caret is at");
+        let pages = layout.paginate(&paper(WIDTH, 1.0e6));
+        assert!(inked(&sheet(&layout, &pages, 0), ACCENT).is_empty(), "{name}: a sheet shows the document");
+
+        for at in [Some(&outside), None] {
+            layout.tint_term(at.map(|caret| (caret, ACCENT)));
+            assert!(painted(&layout, everything()) == plain, "{name}: no term is lit with the caret at {at:?}");
+        }
+
+        // The term follows what is written, and waits while that cannot be typeset.
+        let mut caret = Pos::new(id, end);
+        layout.reveal(Some((&caret, &none)));
+        for (text, lit) in [(r"\ap", 0), ("prox c", 1)] {
+            edited(&mut model, &mut layout, typing(caret.clone(), text));
+            caret.offset += text.len();
+            layout.reveal(Some((&caret, &none)));
+            layout.tint_term(Some((&caret, ACCENT)));
+            assert_eq!(inked(&painted(&layout, everything()), ACCENT).len(), lit, "{name}: after `{text}` is typed");
+        }
+    }
+}
+
+#[test]
 fn a_formula_links_only_where_that_is_allowed() {
     let page = |tex: &str, links: bool| {
         let mut layout = laid(&line(tex, Mark::Math));
