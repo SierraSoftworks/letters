@@ -17,8 +17,8 @@ use letters_layout::{
     CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax, Uncovered, WordList,
 };
 use letters_model::{
-    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, Notes, Pos, Revision,
-    Selection, Style,
+    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, NoteKind, Notes, Pos,
+    Revision, Selection, Style,
 };
 use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
@@ -1410,6 +1410,16 @@ impl EditorApp {
                 self.edits += u64::from(self.margin.answer(created));
             }
             Noting::Resolve => self.edits += u64::from(self.margin.resolve()),
+            Noting::PutBack => {
+                let Some(back) = self.put_back() else { return };
+                // The page keeps its place while the block comes back, and then shows it with the version
+                // that took it out beside it.
+                self.held(|app| {
+                    let change = app.run(platform, |editor, platform| editor.run(back, platform));
+                    app.follow(&change);
+                });
+                return self.show_review();
+            }
             Noting::ResolveImports => self.edits += u64::from(self.margin.resolve_imports()),
         }
         if opens && self.margin.reading().is_some() {
@@ -1427,6 +1437,18 @@ impl EditorApp {
         if opens && self.review.note().is_some_and(|open| Some(open) != reviewed.as_deref()) {
             self.show_review();
         }
+    }
+
+    /// What puts the block of the conflict that is read in a note back on the page: the version that still
+    /// has it, where the block stood. `None` unless the note is such a conflict and the block can go back.
+    fn put_back(&self) -> Option<Command> {
+        let (note, _) = self.margin.reading()?;
+        let NoteKind::Conflict { versions } = &note.kind else { return None };
+        let version = versions.iter().find_map(|version| version.block.clone())?;
+        // The version stands under the id the note is about, whatever it goes by itself.
+        let block = Box::new(Block { id: note.anchor.block.clone(), ..version });
+        let back = Command::PutBack { block, stood: note.anchor.stood.clone()? };
+        (self.margin.refused.is_none() && self.editor.applies(&back)).then_some(back)
     }
 
     /// The first and the last line of the passage a note is about, in the layout's coordinates: of its
@@ -3274,9 +3296,10 @@ impl EditorApp {
             // The note hangs under the last line of its passage. One whose text is gone hangs from the
             // top of the margin its marker stood in.
             let under = self.note_lines(note).map(|(_, last)| self.onto(last));
+            let ways = (self.margin.follows(), self.put_back().is_some());
             let said = self.said.of(note, threads::SAID, self.palette);
             let (now, refused) = (self.margin.now.as_str(), self.margin.refused.as_deref());
-            let thread = threads::thread(note, reply, said, now, refused, self.margin.follows());
+            let thread = threads::thread(note, reply, said, now, refused, ways);
             element = element.popover(match under {
                 Some(under) => thread.at(under),
                 None => thread.at(Rect::new(room.width - GUTTER, GUTTER, 0.0, 0.0)).align(Align::End),

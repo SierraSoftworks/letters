@@ -50,6 +50,8 @@ const TALL: f32 = 320.0;
 
 /// How much of the text a note is about the panel quotes, and how much of what the note says, in characters.
 const QUOTED: usize = 60;
+/// How much a conflict tells of the version that is no longer on the page.
+const KEPT: usize = 280;
 const TOLD: usize = 160;
 
 /// Who a note is by when its writer gave no name.
@@ -439,14 +441,14 @@ fn voice(index: usize, (who, when): (&str, &str), said: &Rc<Spoken>, import: boo
 /// A note that is open, to hang under its passage: what was said, by whom and when, with Resolve at its
 /// top right and a reply under it. `said` is what the note and each reply say, as [`Said::of`] set them,
 /// and `refused` why nothing can be added to the notes of this document. `follows` is for a note the caret
-/// opened by coming into its passage.
+/// opened by coming into its passage, and `back` for a conflict whose block can be put back on the page.
 pub(crate) fn thread(
     note: &Note,
     reply: &str,
     said: &[Rc<Spoken>],
     now: &str,
     refused: Option<&str>,
-    follows: bool,
+    (follows, back): (bool, bool),
 ) -> Popover<Message> {
     let small = TextStyle::control().size(tokens::TEXT_SM);
     let kind = Kind::of(note).unwrap_or(Kind::Comment);
@@ -467,6 +469,10 @@ pub(crate) fn thread(
         // Only a conflict about a block that is gone is read here: there is no place to show its versions.
         let says = Element::paragraph(conflict(versions, false), small.leading(1.4)).role(Role::Paragraph);
         all = all.child(top).child(says);
+        // The version that still has the block can go back where the block stood, to be read on the page
+        // beside the one that took it out.
+        let kept = versions.iter().find(|version| version.block.is_some()).filter(|_| back);
+        all = all.children(kept.map(|version| self::kept(version, now)));
     } else {
         let by = iter::once((note.author.as_str(), note.created.as_str()));
         let by = by.chain(note.replies.iter().map(|reply| (reply.author.as_str(), reply.created.as_str())));
@@ -515,6 +521,30 @@ pub(crate) fn thread(
     }
     // A stray press on the page does not cost what was typed: Escape drops it.
     if reply.trim().is_empty() { thread } else { thread.stays() }
+}
+
+/// The version of a conflict that still has the block the page lost: who wrote it and when, how it reads,
+/// and the button that puts it back on the page.
+fn kept(version: &Version, now: &str) -> Element<Message> {
+    let small = TextStyle::control().size(tokens::TEXT_SM);
+    let (name, ago) = (named(&version.author), opening::ago(now, &version.edited));
+    let reads = version.block.as_ref().map(Block::plain_text).unwrap_or_default();
+    let by = Element::row()
+        .align(Align::Center)
+        .gap(tokens::SPACE_SM)
+        .child(Element::text(name, small.weight(600)).shrink())
+        .child(Element::text(ago.as_str(), small).fg(tokens::FG_MUTED));
+    let reads = Element::paragraph(cut(reads.trim(), KEPT), small.leading(1.4)).role(Role::Paragraph);
+    let back = Button::new("Use this version").icon(icon::ARROW_LEFT_RIGHT).small().on_press(send(Noting::PutBack));
+    let told = Element::column().gap(tokens::SPACE_XS).grow(1.0).child(by).child(reads);
+    let told = told.child(Element::row().padding(Edges::top(tokens::SPACE_XS)).child(back));
+    Element::row()
+        .align(Align::Start)
+        .gap(tokens::SPACE_SM)
+        .padding(Edges::top(tokens::SPACE_MD))
+        .border(Edges::top(1.0), tokens::LINE)
+        .child(face(name, false))
+        .child(told)
 }
 
 /// The text a note is about, cut short: its passage, or the start of its block.
