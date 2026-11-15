@@ -36,7 +36,7 @@ use crate::flat::{Attrs, BLOCK, DEPTH, Entry, MARKER, build, head, insert, order
 use crate::history::read_id;
 use crate::json::{mark_name, read_mark};
 use crate::undo::Script;
-use crate::{Block, BlockKind, Document, Properties, Run, STYLE_FORMAT, Style};
+use crate::{Block, BlockId, BlockKind, Document, Mark, Properties, Run, STYLE_FORMAT, Style};
 
 pub(crate) const BODY: &str = "body";
 const BLOCKS: &str = "blocks";
@@ -51,6 +51,8 @@ const PROPERTIES: &str = "properties";
 pub(crate) const LINK: &str = "link";
 /// The attribute for a run's language. It is the field `lang`, as a build that did not know it kept it.
 pub(crate) const LANG: &str = "x.lang";
+/// The attribute for the block a run refers to. Like [`LANG`], it is the field `ref` as an older build kept it.
+pub(crate) const REF: &str = "x.ref";
 /// Prefix of a mark's attribute, whose value is `true`.
 const MARK: &str = "m.";
 /// Prefix of the attribute for a run field this build does not know, whose value is the field's JSON.
@@ -71,9 +73,25 @@ fn key(prefix: &str, name: &str) -> String {
     format!("{prefix}{}", name.replace('%', "%25").replace(':', "%3A"))
 }
 
-/// The attribute that carries `mark`.
-pub(crate) fn mark_attr(mark: &crate::Mark) -> String {
-    key(MARK, mark_name(mark))
+/// The attribute that carries `mark`, and the value that sets it.
+pub(crate) fn mark_attr(mark: &Mark) -> (String, LoroValue) {
+    match mark_name(mark) {
+        Some(name) => (key(MARK, name), true.into()),
+        None => (REF.to_owned(), field(mark_target(mark).unwrap_or_default())),
+    }
+}
+
+/// The id of the block a reference names.
+fn mark_target(mark: &Mark) -> Option<&str> {
+    match mark {
+        Mark::Ref(target) => Some(target.as_str()),
+        _ => None,
+    }
+}
+
+/// A text field as the attribute for an unknown field holds it: its JSON.
+fn field(text: &str) -> LoroValue {
+    Value::from(text).to_string().into()
 }
 
 fn name(key: &str) -> String {
@@ -89,7 +107,7 @@ fn text(value: &LoroValue) -> Option<&str> {
 
 /// What the [`LANG`] attribute holds for a language, or for none.
 pub(crate) fn lang_value(lang: Option<&str>) -> LoroValue {
-    lang.map_or(LoroValue::Null, |lang| Value::from(lang).to_string().into())
+    lang.map_or(LoroValue::Null, field)
 }
 
 /// Changes a run's formatting as text attributes say. A null value clears, and unknown keys are left alone.
@@ -104,9 +122,15 @@ pub(crate) fn format<S: BuildHasher>(run: &mut Run, attrs: &Attrs<S>) {
             } else {
                 run.marks.remove(&mark);
             }
-        } else if attr == LANG {
-            let lang = text(value).and_then(|json| serde_json::from_str::<String>(json).ok());
-            run.lang = lang.filter(|lang| !lang.is_empty());
+        } else if attr == LANG || attr == REF {
+            let field = text(value).and_then(|json| serde_json::from_str::<String>(json).ok());
+            let field = field.filter(|field| !field.is_empty());
+            if attr == LANG {
+                run.lang = field;
+            } else {
+                run.marks.retain(|mark| mark_target(mark).is_none());
+                run.marks.extend(field.map(|target| Mark::Ref(BlockId::new(target))));
+            }
         } else if let Some(field) = attr.strip_prefix(FIELD) {
             match text(value).and_then(|json| serde_json::from_str(json).ok()) {
                 Some(value) => run.extra.insert(name(field), value),
@@ -118,12 +142,13 @@ pub(crate) fn format<S: BuildHasher>(run: &mut Run, attrs: &Attrs<S>) {
 
 /// The attributes that give text the formatting of `run`, in a fixed order.
 pub(crate) fn attrs(run: &Run) -> Vec<(String, LoroValue)> {
-    let marks = run.marks.iter().map(|mark| (key(MARK, mark_name(mark)), true.into()));
+    let marks = run.marks.iter().filter(|mark| mark_target(mark).is_none()).map(mark_attr);
     let link = run.link.iter().map(|link| (LINK.to_owned(), link.as_str().into()));
     let extra = run.extra.iter().map(|(field, value)| (key(FIELD, field), value.to_string().into()));
-    // Last, so that it stands over a field of the same name among the unknown ones.
-    let lang = run.lang.iter().filter(|lang| !lang.is_empty()).map(|lang| (LANG.to_owned(), lang_value(Some(lang))));
-    marks.chain(link).chain(extra).chain(lang).collect()
+    // Last, so that each stands over a field of the same name among the unknown ones.
+    let lang = run.lang.iter().filter(|lang| !lang.is_empty()).map(|lang| (LANG.to_owned(), field(lang)));
+    let target = run.marks.iter().filter(|mark| mark_target(mark).is_some_and(|id| !id.is_empty())).map(mark_attr);
+    marks.chain(link).chain(extra).chain(lang).chain(target).collect()
 }
 
 /// What the history keeps for each marker, under the id Loro gave the marker character. No other

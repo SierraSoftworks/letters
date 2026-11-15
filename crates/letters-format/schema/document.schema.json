@@ -33,7 +33,7 @@
         "id": { "type": "string", "minLength": 1, "description": "Stable, and unique within the document." },
         "type": {
           "type": "string",
-          "description": "paragraph, heading, list_item, code, formula, quote, callout or divider. A block of any other type is kept as written and drawn from its fallback text."
+          "description": "paragraph, heading, list_item, code, formula, quote, callout, divider, caption, figure, gallery, table, table_row or table_cell. A block of any other type is kept as written and drawn from its fallback text."
         },
         "fallback": { "type": "string", "description": "Plain text a reader shows for a type it does not know." },
         "lang": { "$ref": "#/$defs/lang" },
@@ -88,6 +88,79 @@
             "required": ["tone"],
             "properties": { "tone": { "enum": ["tip", "info", "warn", "danger"] } }
           }
+        },
+        {
+          "if": { "properties": { "type": { "const": "caption" } } },
+          "then": { "$ref": "#/$defs/text", "description": "A line in the caption style, as under a gallery." }
+        },
+        {
+          "if": { "properties": { "type": { "const": "figure" } } },
+          "then": {
+            "$ref": "#/$defs/text",
+            "description": "A picture. The text is its caption, and it names its picture as an asset or as a src, never both.",
+            "required": ["width", "height"],
+            "oneOf": [{ "required": ["asset"] }, { "required": ["src"] }],
+            "properties": {
+              "asset": { "type": "string", "description": "The entry of the file that holds the picture, such as assets/<sha256>.png." },
+              "src": { "type": "string", "description": "The https address of a picture that is still remote." },
+              "alt": { "type": "string", "description": "What the picture shows, for a reader who cannot see it. Defaults to empty." },
+              "width": { "type": "number", "exclusiveMinimum": 0, "description": "The width it is shown at, in points." },
+              "height": { "type": "number", "exclusiveMinimum": 0, "description": "The height it is shown at, in points." },
+              "numbered": { "type": "boolean", "description": "Whether the caption opens with a generated number. Defaults to false." }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "gallery" } } },
+          "then": {
+            "description": "Pictures shown together. Holds figures and captions: one caption, last, unless two people's changes left more.",
+            "properties": {
+              "numbered": { "type": "boolean", "description": "Whether the caption opens with a generated number. Defaults to false." },
+              "blocks": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/block",
+                  "properties": { "type": { "not": { "enum": ["paragraph", "heading", "list_item", "code", "formula", "quote", "callout", "divider", "gallery", "table", "table_row", "table_cell"] } } }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "table" } } },
+          "then": {
+            "description": "Holds rows. A row may hold fewer or more cells than there are columns, as two people's changes can leave it: a missing cell reads as empty, and a column past the last one named aligns to the start.",
+            "properties": {
+              "columns": { "type": "array", "items": { "enum": ["start", "center", "end", "justify"] }, "description": "How each column aligns. Defaults to none named." },
+              "header": { "type": "boolean", "description": "Whether the first row heads the columns. Defaults to false." },
+              "blocks": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/block",
+                  "properties": { "type": { "not": { "enum": ["paragraph", "heading", "list_item", "code", "formula", "quote", "callout", "divider", "caption", "figure", "gallery", "table", "table_cell"] } } }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "table_row" } } },
+          "then": {
+            "description": "Holds cells.",
+            "properties": {
+              "blocks": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/block",
+                  "properties": { "type": { "not": { "enum": ["paragraph", "heading", "list_item", "code", "formula", "quote", "callout", "divider", "caption", "figure", "gallery", "table", "table_row"] } } }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "table_cell" } } },
+          "then": { "$ref": "#/$defs/text", "description": "One cell of a row." }
         }
       ]
     },
@@ -112,6 +185,7 @@
           "description": "bold, italic, underline, strike, highlight, code or math. Text marked math is TeX source set in the line. Any other mark is kept as written."
         },
         "link": { "type": "string", "description": "The address this text links to." },
+        "ref": { "type": "string", "minLength": 1, "description": "The id of a block this text refers to, such as a figure. The text is what a reader that cannot follow it shows, and the block may be gone." },
         "lang": { "$ref": "#/$defs/lang" }
       }
     },

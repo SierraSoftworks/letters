@@ -1,4 +1,4 @@
-use letters_model::{BlockKind, Document, Mark, PropertiesFormat};
+use letters_model::{Align, Block, BlockKind, Document, Mark, PropertiesFormat};
 use proptest::prelude::*;
 
 const CORPUS: [&str; 2] = [include_str!("corpus/design-sample.json"), include_str!("corpus/every-block.json")];
@@ -55,6 +55,47 @@ fn maths_is_read_as_its_source() {
 }
 
 #[test]
+fn pictures_are_read_with_their_captions() {
+    let doc = Document::from_json(CORPUS[1]).unwrap();
+    let figure = doc.block(&"i".into()).unwrap();
+    let BlockKind::Figure { asset, src, alt, width, height, numbered } = &figure.kind else {
+        panic!("{:?} is no figure", figure.kind)
+    };
+    assert_eq!((asset.as_deref(), src.as_deref()), (Some("assets/5e884898da28.png"), None));
+    assert_eq!((alt.as_str(), *width, *height, *numbered), ("A harbour at dusk", 320.0, 213.5, true));
+    assert_eq!(figure.plain_text(), "The harbour");
+
+    let gallery = doc.block(&"j".into()).unwrap();
+    assert_eq!(gallery.kind, BlockKind::Gallery { numbered: true });
+    let parts: Vec<(bool, String)> =
+        gallery.body.blocks().iter().map(|part| (part.kind == BlockKind::Caption, part.plain_text())).collect();
+    assert_eq!(parts, [(false, String::new()), (false, String::new()), (true, "Boats and nets".into())]);
+
+    let reference = &doc.block(&"h".into()).unwrap().body.runs()[1];
+    assert_eq!(reference.text, "Figure 1");
+    assert!(reference.marks.contains(&Mark::Ref("i".into())) && reference.extra.is_empty());
+}
+
+#[test]
+fn a_table_is_read_as_rows_of_cells() {
+    let doc = Document::from_json(CORPUS[1]).unwrap();
+    let table = doc.block(&"t".into()).unwrap();
+    assert_eq!(table.kind, BlockKind::Table { columns: vec![Align::Start, Align::End], header: true });
+    let cells = |row: &Block| row.body.blocks().iter().map(Block::plain_text).collect::<Vec<_>>();
+    let rows: Vec<Vec<String>> = table.body.blocks().iter().map(cells).collect();
+    assert_eq!(rows, [["Boat", "Length"], ["Skiff", "4 m"]]);
+
+    // Two people changing one table can leave a row short or long, so a file may hold one.
+    let ragged = r#"{"format":1,"blocks":[{"id":"t","type":"table","columns":["start"],"blocks":[
+        {"id":"r1","type":"table_row","blocks":[]},
+        {"id":"r2","type":"table_row","blocks":[{"id":"a","type":"table_cell"},{"id":"b","type":"table_cell"}]}]}]}"#;
+    let doc = Document::from_json(ragged).unwrap();
+    let cells: Vec<usize> = doc.blocks[0].body.blocks().iter().map(|row| row.body.blocks().len()).collect();
+    assert_eq!(cells, [0, 2]);
+    assert_eq!(Document::from_json(&doc.to_json()).unwrap(), doc);
+}
+
+#[test]
 fn schema_breaks_are_refused_with_their_path() {
     let cases = [
         (r#"[]"#, ""),
@@ -78,6 +119,38 @@ fn schema_breaks_are_refused_with_their_path() {
         (
             r#"{"format":1,"blocks":[{"id":"a","type":"paragraph","content":[{"text":"x","lang":5}]}]}"#,
             "blocks[0].content[0].lang",
+        ),
+        (
+            r#"{"format":1,"blocks":[{"id":"a","type":"paragraph","content":[{"text":"x","ref":""}]}]}"#,
+            "blocks[0].content[0].ref",
+        ),
+        (r#"{"format":1,"blocks":[{"id":"a","type":"figure","width":9,"height":9}]}"#, "blocks[0]"),
+        (
+            r#"{"format":1,"blocks":[{"id":"a","type":"figure","asset":"a.png","src":"https://x.test/a.png","width":9,"height":9}]}"#,
+            "blocks[0]",
+        ),
+        (
+            r#"{"format":1,"blocks":[{"id":"a","type":"figure","asset":"a.png","width":0,"height":9}]}"#,
+            "blocks[0].width",
+        ),
+        (r#"{"format":1,"blocks":[{"id":"a","type":"figure","asset":"a.png","width":9}]}"#, "blocks[0].height"),
+        (
+            r#"{"format":1,"blocks":[{"id":"a","type":"figure","asset":"a.png","width":9,"height":9,"numbered":"yes"}]}"#,
+            "blocks[0].numbered",
+        ),
+        (
+            r#"{"format":1,"blocks":[{"id":"g","type":"gallery","blocks":[{"id":"a","type":"paragraph"}]}]}"#,
+            "blocks[0].blocks[0]",
+        ),
+        (r#"{"format":1,"blocks":[{"id":"t","type":"table","columns":["left"]}]}"#, "blocks[0].columns"),
+        (
+            r#"{"format":1,"blocks":[{"id":"t","type":"table","columns":[],"blocks":[{"id":"a","type":"table_cell"}]}]}"#,
+            "blocks[0].blocks[0]",
+        ),
+        (
+            r#"{"format":1,"blocks":[{"id":"t","type":"table","columns":[],"blocks":[
+                {"id":"r","type":"table_row","blocks":[{"id":"a","type":"table_row"}]}]}]}"#,
+            "blocks[0].blocks[0].blocks[0]",
         ),
         (r#"{"format":1,"properties":{"format":"ini","source":""},"blocks":[]}"#, "properties.format"),
         (r#"{"format":1,"properties":{"format":"toml"},"blocks":[]}"#, "properties.source"),
@@ -130,14 +203,17 @@ fn document_json() -> impl Strategy<Value = String> {
     let run =
         (".{0,12}", prop::collection::vec("bold|italic|code|math|odd", 0..3), prop::option::of("https://[a-z]{1,8}"))
             .prop_map(|(text, marks, link)| serde_json::json!({ "text": text, "marks": marks, "link": link }));
-    let run = (run, lang()).prop_map(|(run, lang)| with(run, "lang", lang));
+    let run = (run, lang(), prop::option::of("b0|gone"))
+        .prop_map(|(run, lang, target)| with(with(run, "lang", lang), "ref", target));
     let block = (
-        "paragraph|heading|list_item|code|formula|divider|mystery",
+        "paragraph|heading|list_item|code|formula|caption|figure|table_cell|divider|mystery",
         prop::collection::vec(run, 0..4),
         prop::collection::btree_map("[a-z]{4,8}_x", json_value(), 0..3),
     )
         .prop_map(|(kind, content, extra)| {
             let mut block = serde_json::json!({ "type": kind, "level": 3, "list": "task", "content": content });
+            block["asset"] = "assets/a.png".into();
+            (block["width"], block["height"]) = (120.into(), 80.25.into());
             block.as_object_mut().unwrap().extend(extra);
             block
         });

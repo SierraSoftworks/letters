@@ -5,7 +5,7 @@
   { "why": "missing content and child blocks mean empty",
     "json": { "format": 1, "blocks": [{ "id": "a", "type": "paragraph" }, { "id": "b", "type": "quote" }, { "id": "c", "type": "code" }] } },
   { "why": "a block of an unknown type is kept whatever it holds",
-    "json": { "format": 1, "blocks": [{ "id": "a", "type": "figure", "asset": "assets/0a1b.png", "level": "none", "content": 7 }] } },
+    "json": { "format": 1, "blocks": [{ "id": "a", "type": "hologram", "asset": "assets/0a1b.png", "level": "none", "content": 7 }] } },
   { "why": "unknown marks and fields are kept",
     "json": { "format": 1, "theme": { "accent": "blue" }, "blocks": [{ "id": "a", "type": "paragraph", "pinned": true,
       "content": [{ "text": "x", "marks": ["blink"], "revision": 4 }] }] } },
@@ -13,7 +13,19 @@
     "json": { "format": 1, "language": "ja", "blocks": [{ "id": "a", "type": "paragraph", "content": [{ "text": "" }, { "text": "手紙 ✉️ é" }] }] } },
   { "why": "a formula with no content is empty", "json": { "format": 1, "blocks": [{ "id": "a", "type": "formula" }] } },
   { "why": "any block may carry a language and a page break, whatever its type",
-    "json": { "format": 1, "blocks": [{ "id": "a", "type": "figure", "lang": "pt-BR", "break": "page" }, { "id": "b", "type": "divider", "break": "page" }] } },
+    "json": { "format": 1, "blocks": [{ "id": "a", "type": "hologram", "lang": "pt-BR", "break": "page" }, { "id": "b", "type": "divider", "break": "page" }] } },
   { "why": "properties keep the keys a reader does not know",
-    "json": { "format": 1, "properties": { "source": "title = \"x\"\n", "format": "toml", "schema": "post" } } }
+    "json": { "format": 1, "properties": { "source": "title = \"x\"\n", "format": "toml", "schema": "post" } } },
+  { "why": "a figure names an asset or an address, and its caption may be missing",
+    "json": { "format": 1, "blocks": [{ "id": "a", "type": "figure", "asset": "assets/0a1b.png", "width": 320, "height": 213.5 },
+      { "id": "b", "type": "figure", "src": "https://example.com/a.png", "alt": "A boat", "width": 1, "height": 1, "numbered": true, "content": [{ "text": "x" }] }] } },
+  { "why": "a gallery holds figures, captions and types a reader does not know",
+    "json": { "format": 1, "blocks": [{ "id": "g", "type": "gallery", "numbered": true, "blocks": [
+      { "id": "a", "type": "figure", "asset": "assets/0a1b.png", "width": 9, "height": 9 }, { "id": "b", "type": "caption" }, { "id": "c", "type": "hologram" }] }] } },
+  { "why": "a row may hold any number of cells, and a table need not name its columns",
+    "json": { "format": 1, "blocks": [{ "id": "t", "type": "table", "columns": ["start"], "header": true, "blocks": [
+      { "id": "r1", "type": "table_row" }, { "id": "r2", "type": "table_row", "blocks": [{ "id": "a", "type": "table_cell" }, { "id": "b", "type": "table_cell", "content": [{ "text": "x" }] }] }] },
+      { "id": "u", "type": "table" }] } },
+  { "why": "text may refer to a block that is not there",
+    "json": { "format": 1, "blocks": [{ "id": "a", "type": "paragraph", "content": [{ "text": "Figure 2", "ref": "gone" }] }] } }
 ]

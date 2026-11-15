@@ -132,7 +132,7 @@ pub(crate) fn element(doc: &Document, block: &BlockId) -> Option<&'static str> {
                 BlockKind::Heading { level: 3 } => "heading3",
                 BlockKind::Heading { .. } => "heading4",
                 BlockKind::Code { .. } => "code",
-                BlockKind::Unknown { .. } => "caption",
+                BlockKind::Unknown { .. } | BlockKind::Caption | BlockKind::Figure { .. } => "caption",
                 _ if quoted => "quote",
                 _ => "body",
             })

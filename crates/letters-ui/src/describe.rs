@@ -51,6 +51,12 @@ fn push_block(block: &Block, nodes: &mut Vec<(NodeId, Node)>) {
         BlockKind::Quote => Role::Blockquote,
         BlockKind::Callout { .. } => Role::Note,
         BlockKind::Divider => Role::Splitter,
+        BlockKind::Caption => Role::Caption,
+        BlockKind::Figure { .. } => Role::Figure,
+        BlockKind::Gallery { .. } => Role::Group,
+        BlockKind::Table { .. } => Role::Table,
+        BlockKind::TableRow => Role::Row,
+        BlockKind::TableCell => Role::Cell,
         BlockKind::Unknown { .. } => Role::Unknown,
     });
     match &block.kind {

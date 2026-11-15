@@ -225,7 +225,8 @@ impl Words {
                     Mark::Highlight => marks::HIGHLIGHT,
                     Mark::Code => marks::CODE,
                     Mark::Math => marks::MATH,
-                    Mark::Other(_) => 0,
+                    // Until a reference shows its target's label, its own text stands as it is.
+                    Mark::Ref(_) | Mark::Other(_) => 0,
                 };
             }
             match words.spans.last_mut() {
@@ -480,7 +481,7 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                 BlockKind::Heading { level: 3 } => Role::Heading3,
                 BlockKind::Heading { .. } => Role::Heading4,
                 BlockKind::Code { .. } => Role::Code,
-                BlockKind::Unknown { .. } => Role::Caption,
+                BlockKind::Unknown { .. } | BlockKind::Caption | BlockKind::Figure { .. } => Role::Caption,
                 _ => prose,
             };
             let of = self.types.get(role);
@@ -522,7 +523,13 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
             }
 
             match &block.kind {
-                BlockKind::Quote | BlockKind::Callout { .. } => {
+                // Until galleries and tables are laid out as such, each shows as a quote of its parts, and a
+                // figure as its caption.
+                BlockKind::Quote
+                | BlockKind::Callout { .. }
+                | BlockKind::Gallery { .. }
+                | BlockKind::Table { .. }
+                | BlockKind::TableRow => {
                     let (look, left, right, pad) = match &block.kind {
                         BlockKind::Callout { tone } => {
                             (Look::Callout(*tone), theme::BOX_PAD_X, theme::BOX_PAD_X, theme::BOX_PAD_Y)
@@ -538,7 +545,7 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                     let framed = Frame { id, look, parent: frame, first, last: first, x, width, lead, reach: 0.0 };
                     self.out.frames.push(framed);
                     self.pad = lead + pad;
-                    let quoted = quoted || look == Look::Quote;
+                    let quoted = quoted || block.kind == BlockKind::Quote;
                     self.place(block.body.blocks(), x + left, width - shrink, Some(this), quoted);
                     if self.out.leaves.len() == first {
                         let blank = Leaf { what: What::Blank, role: prose, ..Leaf::default() };

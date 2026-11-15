@@ -110,7 +110,17 @@ fn blocks(blocks: &[Block], assets: Assets, out: &mut String) {
                 container(&open, "</div>", block.body.blocks(), assets, out);
             }
             BlockKind::Divider => out.push_str("<hr>\n"),
-            // The model does not hold figures yet, so one arrives as an unknown block with its fields beside it.
+            BlockKind::Figure { asset, src, alt, width, height, .. } => {
+                let image =
+                    Figure { asset: asset.as_deref(), src: src.as_deref(), alt, width: *width, height: *height };
+                figure(&image, block.body.runs(), assets, out);
+            }
+            // Until galleries and tables are written as such, what they hold is written in order.
+            BlockKind::Caption | BlockKind::TableCell => element("p", block.body.runs(), out),
+            BlockKind::Gallery { .. } | BlockKind::Table { .. } | BlockKind::TableRow => {
+                self::blocks(block.body.blocks(), assets, out);
+            }
+            // A reader that does not build figures yet hands one over as an unknown block, its fields beside it.
             BlockKind::Unknown { type_name } if type_name == "figure" => {
                 let field = |name: &str| block.extra.get(name);
                 let text = |name: &str| field(name).and_then(|value| value.as_str());

@@ -31,6 +31,12 @@ pub fn outline(doc: &Document) -> Vec<String> {
                 BlockKind::Quote => "quote".to_owned(),
                 BlockKind::Callout { tone } => format!("callout:{tone:?}").to_lowercase(),
                 BlockKind::Divider => "divider".to_owned(),
+                BlockKind::Caption => format!("caption {}", runs(block)),
+                BlockKind::Figure { .. } => format!("figure {}", runs(block)),
+                BlockKind::Gallery { .. } => "gallery".to_owned(),
+                BlockKind::Table { .. } => "table".to_owned(),
+                BlockKind::TableRow => "row".to_owned(),
+                BlockKind::TableCell => format!("cell {}", runs(block)),
                 BlockKind::Unknown { type_name } => format!("unknown:{type_name}"),
             };
             out.push(format!("{:indent$}{line}", ""));

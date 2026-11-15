@@ -48,7 +48,7 @@ pub enum Align {
     Justify,
 }
 
-const ALIGNS: [(&str, Align); 4] =
+pub(crate) const ALIGNS: [(&str, Align); 4] =
     [("start", Align::Start), ("center", Align::Center), ("end", Align::End), ("justify", Align::Justify)];
 
 /// Paper size and margins, in points.
@@ -260,7 +260,7 @@ fn read_page(value: Value) -> Result<Page> {
 }
 
 /// Whole numbers are written without a fraction, and the rest as the shortest decimal that reads back the same.
-fn write_number(n: f32) -> Value {
+pub(crate) fn write_number(n: f32) -> Value {
     if n.fract() == 0.0 && n.abs() < 16_777_216.0 {
         Value::from(n as i64)
     } else {

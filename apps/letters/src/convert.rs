@@ -86,9 +86,13 @@ fn try_export(export: &Export) -> Result<(), String> {
 /// What the format cannot carry over, a line for each kind of loss.
 fn simplified(document: &Document, to: Format) -> Vec<String> {
     let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    // HTML and Word already write figures, which the model has yet to learn.
-    let known = |name: &str| matches!(to, Format::Html | Format::Docx) && name == "figure";
-    let lost = |block: &&Block| matches!(&block.kind, BlockKind::Unknown { type_name } if !known(type_name));
+    // Only HTML and Word write figures yet, whether the model holds one as such or as an unknown block.
+    let pictured = matches!(to, Format::Html | Format::Docx);
+    let lost = |block: &&Block| match &block.kind {
+        BlockKind::Unknown { type_name } => !(pictured && type_name == "figure"),
+        BlockKind::Figure { .. } => !pictured,
+        _ => false,
+    };
     let unknown = document.walk().filter(lost).count();
     let other = |run: &&Run| run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)));
     let marks = document.walk().flat_map(|block| block.body.runs()).filter(other).count();

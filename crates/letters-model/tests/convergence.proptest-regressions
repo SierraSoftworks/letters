@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc b6fd721dfd2df6558b648ce4f9fa66cd81edaf91e703386aa118515108833cbf # shrinks to steps = [Edit { replica: 2, edits: [Remove { block: 3 }, Kind { block: 44, kind: 1 }] }, Sync { from: 2, to: 0, whole: false }, Edit { replica: 1, edits: [Insert { parent: Some(20), index: 0, kind: 14, id: 0, text: "a" }] }, Sync { from: 0, to: 1, whole: false }]
+cc b9eaadce857ad5d0be3782c1fd0cfa6e0213a1c45f28fdcbb2b770455f9163a3 # shrinks to steps = [Rewrite { replica: 0, edits: [Split { block: 0, at: 0, id: 0 }] }, Edit { replica: 2, edits: [Join { block: 5 }] }, Edit { replica: 0, edits: [Remove { block: 32 }] }, Edit { replica: 2, edits: [Type { block: 16, at: 0, text: "a" }] }]

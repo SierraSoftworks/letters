@@ -24,7 +24,7 @@ use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Mark, Page, Po
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     /// Inserts text, which takes the formatting of the character before it, or at the start of a block
-    /// that of the character after it.
+    /// that of the character after it. Text put at the end of a reference is no part of it.
     InsertText {
         at: Pos,
         text: String,
@@ -59,7 +59,8 @@ pub enum Op {
     Join {
         block: BlockId,
     },
-    /// Changes a block's kind to another kind that holds the same shape of body.
+    /// Changes a block's kind to another kind that holds the same shape of body, or changes the fields of
+    /// its kind, as resizing a figure does.
     SetKind {
         block: BlockId,
         kind: BlockKind,
@@ -70,7 +71,8 @@ pub enum Op {
         page_break: bool,
         lang: Option<String>,
     },
-    /// Inserts a block at `index` among the children of `parent`, or at the top level.
+    /// Inserts a block at `index` among the children of `parent`, or at the top level. Removing a block
+    /// and inserting it elsewhere under its own id, in one edit, moves it.
     InsertBlock {
         parent: Option<BlockId>,
         index: usize,
@@ -114,8 +116,10 @@ pub enum Op {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpError {
     NoSuchBlock(BlockId),
-    /// The block does not hold what the operation needs (text, or child blocks).
+    /// The block does not hold what the operation needs: text, child blocks, or children of that kind.
     WrongBody(BlockId),
+    /// The kind the block was to have breaks the rules of its type, as a figure without a picture does.
+    BadKind(BlockId),
     /// An offset is past the end of the text or inside a character.
     BadOffset {
         block: BlockId,
@@ -138,6 +142,7 @@ impl fmt::Display for OpError {
         match self {
             Self::NoSuchBlock(id) => write!(f, "there is no block \"{id}\""),
             Self::WrongBody(id) => write!(f, "block \"{id}\" does not hold what this operation changes"),
+            Self::BadKind(id) => write!(f, "block \"{id}\" was given a kind that breaks the rules of its type"),
             Self::BadOffset { block, offset } => write!(f, "offset {offset} is not a position in block \"{block}\""),
             Self::BadIndex { index } => write!(f, "index {index} is past the end of the list"),
             Self::DuplicateId(id) => write!(f, "the id \"{id}\" is already in use"),
@@ -910,12 +915,20 @@ impl Model {
                 place = Some((spot.i, spot.start));
                 if !text.is_empty() {
                     let mut end = 0;
-                    let format = runs.iter().find(|run| {
+                    let run = runs.iter().position(|run| {
                         end += run.text.len();
                         at.offset <= end
                     });
+                    let mut format = run.map(|run| attrs(&runs[run])).unwrap_or_default();
+                    // Text is part of a reference only when it is typed between two characters of it.
+                    let target = |run: &Run| run.marks.iter().find(|mark| matches!(mark, Mark::Ref(_))).cloned();
+                    let after = run.filter(|_| at.offset == end).and_then(|run| runs.get(run + 1));
+                    let goes_on = run.zip(after).is_some_and(|(run, after)| target(&runs[run]) == target(after));
+                    if at.offset == 0 || (at.offset == end && !goes_on) {
+                        format.retain(|(key, _)| key != crdt::REF);
+                    }
                     spot.reach(chars, &mut delta);
-                    delta.push(insert(&crdt::clean(text), format.map(attrs).unwrap_or_default()));
+                    delta.push(insert(&crdt::clean(text), format));
                 }
             }
             Op::DeleteText { block, range } => {
@@ -928,9 +941,10 @@ impl Model {
                 }
             }
             Op::SetMark { block, range, mark, on } => {
-                let value = if *on { true.into() } else { LoroValue::Null };
+                let (key, value) = crdt::mark_attr(mark);
+                let value = if *on { value } else { LoroValue::Null };
                 let set = |run: &Run| run.marks.contains(mark) == *on;
-                place = Some(self.restyle(block, range, crdt::mark_attr(mark), value, set, &mut delta)?);
+                place = Some(self.restyle(block, range, key, value, set, &mut delta)?);
             }
             Op::SetLink { block, range, link } => {
                 let value = link.as_deref().map_or(LoroValue::Null, Into::into);
@@ -969,6 +983,15 @@ impl Model {
                 if spot.block.kind == *kind {
                     return Ok((delta, None));
                 }
+                if !kind.sound() {
+                    return Err(OpError::BadKind(block.clone()));
+                }
+                // The block must still fit where it sits, and what it holds must fit it.
+                let parent = (spot.entry.level > 0).then(|| nth(&self.doc.blocks, &self.index, spot.entry.parent));
+                let fits = parent.flatten().is_none_or(|parent| parent.kind.admits(kind));
+                if !fits || !children(spot.block).iter().all(|child| kind.admits(&child.kind)) {
+                    return Err(OpError::WrongBody(block.clone()));
+                }
                 self.rehead(&spot, Block { kind: kind.clone(), ..spot.block.clone_bare() }, &mut delta);
             }
             Op::SetBlockProps { block, page_break, lang } => {
@@ -986,6 +1009,12 @@ impl Model {
                     if self.spot(&block.id).is_ok() || !ids.insert(&block.id) {
                         return Err(OpError::DuplicateId(block.id.clone()));
                     }
+                    if !block.kind.sound() {
+                        return Err(OpError::BadKind(block.id.clone()));
+                    }
+                    if !children(block).iter().all(|child| block.kind.admits(&child.kind)) {
+                        return Err(OpError::WrongBody(block.id.clone()));
+                    }
                     stack.extend(children(block));
                 }
                 let (siblings, depth, end) = match parent {
@@ -995,6 +1024,9 @@ impl Model {
                         let Body::Blocks(children) = &spot.block.body else {
                             return Err(OpError::WrongBody(parent.clone()));
                         };
+                        if !spot.block.kind.admits(&block.kind) {
+                            return Err(OpError::WrongBody(parent.clone()));
+                        }
                         (children.as_slice(), spot.entry.level + 1, self.after(spot.i))
                     }
                 };

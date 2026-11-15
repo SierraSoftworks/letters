@@ -352,7 +352,14 @@ impl<'d> Writer<'d, '_> {
                     self.container(block, style);
                 }
                 BlockKind::Divider => self.paragraph(DIVIDER.0, None, &[], Vec::new()),
-                // The model does not hold figures yet, so one arrives as an unknown block with its fields beside it.
+                BlockKind::Figure { .. } => self.figure(block),
+                // Until galleries and tables are written as such, what they hold is written in order.
+                BlockKind::Caption => self.paragraph("Caption", None, block.body.runs(), spans),
+                BlockKind::TableCell => self.paragraph(within.unwrap_or(""), None, block.body.runs(), spans),
+                BlockKind::Gallery { .. } | BlockKind::Table { .. } | BlockKind::TableRow => {
+                    self.blocks(block.body.blocks(), within);
+                }
+                // A reader that does not build figures yet hands one over as an unknown block, its fields beside it.
                 BlockKind::Unknown { type_name } if type_name == "figure" => self.figure(block),
                 BlockKind::Unknown { .. } => {
                     let fallback =
@@ -432,15 +439,22 @@ impl<'d> Writer<'d, '_> {
         let field = |name: &str| block.extra.get(name);
         let text = |name: &str| field(name).and_then(|value| value.as_str());
         let size = |name: &str| field(name).and_then(|value| value.as_f64()).unwrap_or_default() as f32;
-        let caption =
-            field("content").and_then(|runs| Run::list_from_value(runs.clone(), "content").ok()).unwrap_or_default();
-        let alt = text("alt").unwrap_or_default();
-        let (mut width, mut height) = (size("width").max(1.0), size("height").max(1.0));
+        let (asset, src, alt, width, height, caption) = match &block.kind {
+            BlockKind::Figure { asset, src, alt, width, height, .. } => {
+                (asset.as_deref(), src.as_deref(), alt.as_str(), *width, *height, block.body.runs().to_vec())
+            }
+            _ => {
+                let caption = field("content").and_then(|runs| Run::list_from_value(runs.clone(), "content").ok());
+                let alt = text("alt").unwrap_or_default();
+                (text("asset"), text("src"), alt, size("width"), size("height"), caption.unwrap_or_default())
+            }
+        };
+        let (mut width, mut height) = (width.max(1.0), height.max(1.0));
         if width > self.measure {
             (width, height) = (self.measure, height * self.measure / width);
         }
 
-        let held = text("asset").and_then(|name| match self.pictures.get(name) {
+        let held = asset.and_then(|name| match self.pictures.get(name) {
             Some(known) => known.clone(),
             None => {
                 let id = self.embed(name);
@@ -448,7 +462,7 @@ impl<'d> Writer<'d, '_> {
                 id
             }
         });
-        match (held, text("src").and_then(address)) {
+        match (held, src.and_then(address)) {
             (Some(id), _) => {
                 let number = self.out.matches("<wp:docPr ").count() + 1;
                 let emu = |points: f32| (points * 12700.0).round() as u64;

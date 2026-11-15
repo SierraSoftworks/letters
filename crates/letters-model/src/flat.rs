@@ -198,9 +198,11 @@ pub(crate) struct Built {
 
 /// Puts flat blocks back into a tree. This is where every sequence is given its one reading:
 ///
-/// - A block sits as deep as its marker asks, but no deeper than the containers open before it allow.
+/// - A block sits as deep as its marker asks, but no deeper than the containers open before it allow, and
+///   in none that cannot hold its kind.
 /// - An id that an earlier block uses gets a suffix, so ids stay unique whatever was merged.
-/// - Text without a marker becomes a paragraph named after the block before it.
+/// - Text without a marker becomes a paragraph named after the block before it, or a cell in a row and a
+///   caption in a gallery.
 pub(crate) fn build(flat: Vec<Flat>) -> Built {
     /// Puts a finished block into the container it belongs to, and says where among its siblings.
     fn place(open: &mut [(Block, usize)], roots: &mut Vec<Block>, block: Block) -> usize {
@@ -245,6 +247,21 @@ pub(crate) fn build(flat: Vec<Flat>) -> Built {
         block.id = id;
 
         entry.level = entry.depth.min(open.len()).min(MAX_DEPTH);
+        if !entry.marker {
+            // Text left without its marker reads as what the container around it holds.
+            let kind = match entry.level.checked_sub(1).map(|above| &open[above].0.kind) {
+                Some(BlockKind::TableRow) => BlockKind::TableCell,
+                Some(BlockKind::Gallery { .. }) => BlockKind::Caption,
+                _ => BlockKind::Paragraph,
+            };
+            if mem::replace(&mut block.kind, kind) != block.kind && !dirty && !renamed {
+                built.dirty.push(block.id.clone());
+            }
+        }
+        // A block its container cannot hold sits after that container, in the first one that can.
+        while entry.level > 0 && !open[entry.level - 1].0.kind.admits(&block.kind) {
+            entry.level -= 1;
+        }
         while open.len() > entry.level {
             let (closed, at) = open.pop().expect("the loop runs while a container is open");
             built.index[at].nth = place(&mut open, &mut built.blocks, closed);
@@ -287,16 +304,22 @@ pub(crate) fn spell(block: &Block, depth: usize, delta: &mut Vec<TextDelta>) {
 
 /// Whether a block, taken without its children, reads back from the sequence exactly as it stands.
 fn canonical(block: &Block) -> bool {
-    let kind = match &block.kind {
-        BlockKind::Paragraph | BlockKind::ListItem { .. } | BlockKind::Code { .. } | BlockKind::Formula => true,
-        BlockKind::Quote | BlockKind::Callout { .. } | BlockKind::Divider => true,
-        BlockKind::Heading { level } => (1..=4).contains(level),
-        // It may be a type this build knows under its real name.
-        BlockKind::Unknown { .. } => false,
-    };
+    // An unknown type may be one this build knows under its real name.
+    let kind = block.kind.sound() && !matches!(block.kind, BlockKind::Unknown { .. });
     let body = match (&block.body, block.kind.shape()) {
         (Body::Text(runs), BodyShape::Text) => {
-            let known = |run: &Run| !run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)));
+            // An unknown mark may be a known one by name, and a run names one block at most.
+            let known = |run: &Run| {
+                let mut refs = 0;
+                run.marks.iter().all(|mark| match mark {
+                    Mark::Other(_) => false,
+                    Mark::Ref(target) => {
+                        refs += 1;
+                        refs == 1 && !target.as_str().is_empty()
+                    }
+                    _ => true,
+                })
+            };
             let plain = |run: &Run| run.extra.is_empty() && run.lang.as_deref() != Some("") && known(run);
             let apart = runs.windows(2).all(|pair| !pair[0].same_format(&pair[1]));
             apart && runs.iter().all(|run| !run.text.is_empty() && !run.text.contains(MARKER) && plain(run))
@@ -314,6 +337,14 @@ fn canonical(block: &Block) -> bool {
 pub(crate) fn normal(blocks: Vec<Block>) -> Built {
     fn walk(blocks: Vec<Block>, depth: usize, out: &mut Vec<Flat>) {
         for mut block in blocks {
+            // A block made as an unknown type keeps its text and children beside its other fields. Under
+            // a name this build knows, it is read as that type, or they would be lost with its marker.
+            if let BlockKind::Unknown { type_name } = &block.kind
+                && crate::json::shape(type_name).is_some()
+                && let Ok(known) = Block::from_value(block.to_value(), "")
+            {
+                block = known;
+            }
             let inside = match &mut block.body {
                 Body::Blocks(inside) if block.kind.shape() == BodyShape::Blocks => mem::take(inside),
                 _ => Vec::new(),

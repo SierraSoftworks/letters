@@ -70,7 +70,12 @@ fn blocks(blocks: &[Block]) -> Vec<String> {
 /// Whether a block has a Markdown form. An empty paragraph has none, nor has an unknown block with no fallback.
 fn is_written(block: &Block) -> bool {
     match block.kind {
-        BlockKind::Paragraph => !block.plain_text().is_empty(),
+        BlockKind::Paragraph | BlockKind::Caption | BlockKind::Figure { .. } | BlockKind::TableCell => {
+            !block.plain_text().is_empty()
+        }
+        BlockKind::Gallery { .. } | BlockKind::Table { .. } | BlockKind::TableRow => {
+            block.body.blocks().iter().any(is_written)
+        }
         BlockKind::Unknown { .. } => !fallback(block).is_empty(),
         _ => true,
     }
@@ -128,6 +133,10 @@ fn other(block: &Block) -> Vec<String> {
         BlockKind::Quote => quote(None, block.body.blocks()),
         BlockKind::Callout { tone } => quote(Some(*tone), block.body.blocks()),
         BlockKind::Divider => vec!["---".to_owned()],
+        // Until Markdown writes pictures and tables, a figure goes out as its caption, a caption and a cell as
+        // paragraphs, and what a gallery or a table holds in order.
+        BlockKind::Caption | BlockKind::Figure { .. } | BlockKind::TableCell => lines(&text(runs, Context::Lines)),
+        BlockKind::Gallery { .. } | BlockKind::Table { .. } | BlockKind::TableRow => blocks(block.body.blocks()),
         BlockKind::Unknown { .. } => lines(&text(&[Run::plain(fallback(block))], Context::Lines)),
         // A list item is written by `item`, which knows the list around it.
         BlockKind::ListItem { .. } => Vec::new(),

@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 
 use letters_model::{
-    Block, BlockId, BlockKind, Body, BodyShape, Change, Document, ListKind, Mark, Model, Op, OpError, Page, Pos,
+    Align, Block, BlockId, BlockKind, Body, BodyShape, Change, Document, ListKind, Mark, Model, Op, OpError, Page, Pos,
     Properties, PropertiesFormat, ReplicaId, Run, Style, Tone,
 };
 use proptest::collection::vec;
@@ -87,7 +87,14 @@ fn edit() -> impl Strategy<Value = Edit> {
     let n = || 0..64usize;
     // Few enough ids that two replicas sometimes pick the same one.
     let id = || 0..24usize;
-    let mark = prop_oneof![Just(Mark::Bold), Just(Mark::Italic), Just(Mark::Math), Just(Mark::Other("x:y%".into()))];
+    let mark = prop_oneof![
+        Just(Mark::Bold),
+        Just(Mark::Italic),
+        Just(Mark::Math),
+        Just(Mark::Other("x:y%".into())),
+        Just(Mark::Ref("q1".into())),
+        Just(Mark::Ref("gone".into())),
+    ];
     let link = prop_oneof![Just(None), Just(Some("https://example.com/a".to_owned()))];
     prop_oneof![
         6 => (n(), n(), text()).prop_map(|(block, at, text)| Edit::Type { block, at, text }),
@@ -123,7 +130,16 @@ fn step() -> impl Strategy<Value = Step> {
     ]
 }
 
-/// A document with every shape of block, formatted text and a nested container.
+fn picture(asset: Option<&str>, src: Option<&str>, width: f32) -> BlockKind {
+    let (numbered, asset, src) = (src.is_some(), asset.map(str::to_owned), src.map(str::to_owned));
+    BlockKind::Figure { asset, src, alt: "é".into(), width, height: 90.5, numbered }
+}
+
+fn holding(id: &str, kind: BlockKind, parts: Vec<Block>) -> Block {
+    Block { body: Body::Blocks(parts), ..Block::new(id, kind) }
+}
+
+/// A document with every shape of block, formatted text, nested containers and blocks made of parts.
 fn fixture() -> Document {
     let mut marked = Block::new("m", BlockKind::Paragraph);
     marked.body = Body::Text(vec![
@@ -142,6 +158,31 @@ fn fixture() -> Document {
         quote,
         Block::new("d", BlockKind::Divider),
         Block::text("l", BlockKind::ListItem { list: ListKind::Bullet, depth: 0 }, "Item é字🙂"),
+        holding(
+            "g",
+            BlockKind::Gallery { numbered: false },
+            vec![
+                Block::text("g1", picture(Some("assets/a.png"), None, 120.0), "One"),
+                Block::text("g2", picture(None, Some("https://example.com/b.png"), 64.0), ""),
+                Block::text("g3", BlockKind::Caption, "Both"),
+            ],
+        ),
+        holding(
+            "t",
+            BlockKind::Table { columns: vec![Align::Start, Align::End], header: true },
+            vec![
+                holding(
+                    "r1",
+                    BlockKind::TableRow,
+                    ["c1", "c2"].map(|id| Block::text(id, BlockKind::TableCell, id)).into(),
+                ),
+                holding(
+                    "r2",
+                    BlockKind::TableRow,
+                    ["c3", "c4"].map(|id| Block::text(id, BlockKind::TableCell, id)).into(),
+                ),
+            ],
+        ),
     ];
     Document { blocks, ..Document::default() }
 }
@@ -154,8 +195,20 @@ fn kinds(shape: BodyShape) -> Vec<BlockKind> {
             BlockKind::ListItem { list: ListKind::Task { checked: true }, depth: 1 },
             BlockKind::Code { language: Some("rust".into()) },
             BlockKind::Formula,
+            BlockKind::Caption,
+            BlockKind::TableCell,
+            picture(Some("assets/c.jpg"), None, 200.0),
+            picture(None, Some("https://example.com/d.png"), 33.25),
+            // No file would hold this one, so no edit may make it.
+            picture(None, None, 10.0),
         ],
-        BodyShape::Blocks => vec![BlockKind::Quote, BlockKind::Callout { tone: Tone::Warn }],
+        BodyShape::Blocks => vec![
+            BlockKind::Quote,
+            BlockKind::Callout { tone: Tone::Warn },
+            BlockKind::Gallery { numbered: true },
+            BlockKind::Table { columns: vec![Align::Center], header: false },
+            BlockKind::TableRow,
+        ],
         BodyShape::None => vec![BlockKind::Divider],
     }
 }
@@ -210,14 +263,18 @@ fn op((doc, style): &Shown, edit: &Edit) -> Option<Op> {
             Op::SetKind { block: block.id, kind: kinds[kind % kinds.len()].clone() }
         }
         Edit::Insert { parent, index, kind, id, text } => {
-            let kinds: Vec<BlockKind> = [BodyShape::Text, BodyShape::Blocks, BodyShape::None].map(kinds).concat();
+            let containers: Vec<&Block> =
+                all.iter().copied().filter(|block| block.kind.shape() == BodyShape::Blocks).collect();
+            let parent = parent.and_then(|n| pick(&containers, n));
+            // Mostly a kind its parent takes, so that tables and galleries fill up. Now and then any kind.
+            let mut kinds: Vec<BlockKind> = [BodyShape::Text, BodyShape::Blocks, BodyShape::None].map(kinds).concat();
+            if kind % 8 > 0 {
+                kinds.retain(|kind| parent.as_ref().is_none_or(|parent| parent.kind.admits(kind)));
+            }
             let mut block = Block::new(new(*id), kinds[kind % kinds.len()].clone());
             if let Body::Text(runs) = &mut block.body {
                 runs.push(Run::marked(text.as_str(), [Mark::Italic]));
             }
-            let containers: Vec<&Block> =
-                all.iter().copied().filter(|block| block.kind.shape() == BodyShape::Blocks).collect();
-            let parent = parent.and_then(|n| pick(&containers, n));
             let siblings = parent.as_ref().map_or(doc.blocks.len(), |parent| parent.body.blocks().len());
             Op::InsertBlock { parent: parent.map(|parent| parent.id), index: index % (siblings + 1), block }
         }

@@ -10,7 +10,7 @@ use serde::de::{DeserializeSeed, Deserializer, Error, MapAccess, SeqAccess, Visi
 use serde_json::{Map, Value};
 
 use super::{block_from, read_mark, shape};
-use crate::{Block, Body, BodyShape, Document, Extra, Run};
+use crate::{Block, BlockId, Body, BodyShape, Document, Extra, Mark, Run};
 
 /// The document, or `None` when the file needs the slow reader.
 pub(super) fn document(json: &str) -> Option<Document> {
@@ -180,22 +180,24 @@ impl<'de> Visitor<'de> for OneRun {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Run, A::Error> {
-        let (mut text, mut marks, mut link, mut lang) = (None, None, None, None);
+        let (mut text, mut marks, mut link, mut lang, mut target) = (None, None, None, None, None);
         let mut extra = Extra::new();
-        while let Some(key) = map.next_key_seed(Key(&["text", "marks", "link", "lang"]))? {
+        while let Some(key) = map.next_key_seed(Key(&["text", "marks", "link", "lang", "ref"]))? {
             let repeated = match key {
                 Ok(0) => text.replace(map.next_value::<String>()?).is_some(),
                 Ok(1) => marks.replace(map.next_value::<Vec<String>>()?).is_some(),
                 Ok(2) => link.replace(map.next_value::<String>()?).is_some(),
-                Ok(_) => lang.replace(map.next_value::<String>()?).is_some(),
+                Ok(3) => lang.replace(map.next_value::<String>()?).is_some(),
+                Ok(_) => target.replace(map.next_value::<String>()?).is_some(),
                 Err(key) => extra.insert(key, map.next_value()?).is_some(),
             };
-            if repeated || lang.as_deref() == Some("") {
+            if repeated || lang.as_deref() == Some("") || target.as_deref() == Some("") {
                 return Err(decline());
             }
         }
         let text = text.ok_or_else(decline)?;
-        let marks = marks.unwrap_or_default().iter().map(|name| read_mark(name)).collect();
+        let marks = marks.unwrap_or_default().into_iter().map(|name| read_mark(&name));
+        let marks = marks.chain(target.map(|target| Mark::Ref(BlockId::new(target)))).collect();
         Ok(Run { text, marks, link, lang, extra })
     }
 }
