@@ -5,9 +5,9 @@ mod common;
 
 use std::io::Cursor;
 
-use common::{NAME, World, doc, find, note, open_file, save_file, texts, typed};
-use letters_format::{Archive, Error, Files, OPLOG, Saved, hash};
-use letters_model::{Block, BlockKind, Note, NoteKind, Op};
+use common::{CREATED, ID, NAME, World, doc, find, note, open_file, save_file, texts, typed};
+use letters_format::{Archive, Error, Files, OPLOG, Replica, Saved, WorkingCopy, hash};
+use letters_model::{Block, BlockKind, Document, Note, NoteKind, Op, ReplicaId, Style};
 use letters_sync::{Access, LOOK_EVERY, Link, Progress, Role, SAVE_AFTER, SAVE_WITHIN};
 
 const HOME: &str = "/srv/letters/report.let";
@@ -138,6 +138,39 @@ fn what_another_writer_puts_in_the_file_reaches_every_session() {
     }
     assert!(copies(&world).is_empty());
     assert_eq!(written(&world), 0, "the room had nothing of its own to write");
+}
+
+#[test]
+fn a_copy_handed_to_the_room_reaches_every_session_and_the_file_at_the_next_save() {
+    let (mut world, ada, ben) = editors();
+    // A device's own file, written on while it was away, and one of a document that shares only the id.
+    let handed = |copy: &WorkingCopy| {
+        let mut file = Cursor::new(Vec::new());
+        letters_format::write(&mut file, &copy.package()).unwrap();
+        Archive::open(Cursor::new(file.into_inner())).unwrap()
+    };
+    let mut away = open_file(&world.folder, 900);
+    away.apply([typed("q", 6, " opinion")]).unwrap();
+    away.add_note(note("n9", "p", 0..5, "Sam", "Written away."));
+    let mut stranger = WorkingCopy::new(ID, CREATED, Document::default(), Style::default(), ReplicaId::from(901));
+    let line = Block::text("z", BlockKind::Paragraph, "Something else");
+    stranger.apply([Op::InsertBlock { parent: None, index: 0, block: line }]).unwrap();
+
+    let room = world.room.as_mut().expect("the room is open");
+    let refused = room.merge_from(&mut handed(&stranger), &mut world.state, world.now);
+    assert!(matches!(refused, Err(Error::Unmerged)), "{refused:?}");
+    room.merge_from(&mut handed(&away), &mut world.state, world.now).unwrap();
+    assert!(matches!(world.flush(), Ok(Saved::Written)));
+    world.settle();
+
+    for device in [ada, ben] {
+        let device = &world.devices[device];
+        assert_eq!(texts(device.document()), ["Hello world", "Second opinion"], "{}", device.name);
+        assert!(find(&device.notes, "n9").is_some(), "{}", device.name);
+        assert_eq!(device.edits_sent(), 0, "{} sent the news back", device.name);
+    }
+    assert_eq!(on_disk(&world), ["Hello world", "Second opinion"]);
+    assert!(copies(&world).is_empty());
 }
 
 /// Histories that fuzzing made, each with a sound checksum: the history library panics on the first and

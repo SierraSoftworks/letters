@@ -294,11 +294,7 @@ impl Library {
         let mut ours = Archive::open(BufReader::new(folder.open(name)?))?;
         // Neither file is the server's own writing: a wary copy checks both histories before it loads them.
         let mut copy = WorkingCopy::open_wary(&mut ours, ReplicaId::new(&ids::block_id()))?;
-        copy.merge_from(theirs).map_err(|error| match error {
-            letters_format::Error::Unmerged => Refusal::invalid("That file shares nothing with the document."),
-            letters_format::Error::History(_) => Refusal::invalid("That file's history cannot be merged."),
-            error => error.into(),
-        })?;
+        copy.merge_from(theirs).map_err(unmerged)?;
         let (token, day) = (ids::block_id(), ids::rfc3339(now));
         let label = format!("{} server", day.get(..10).unwrap_or(&day));
         let save = Save { name, token: &token, label: &label, attempts: 3 };
@@ -439,6 +435,18 @@ fn read(folder: &Folder, listed: &Listed) -> Known {
     let import_notes = archive.notes().map(open).unwrap_or(0);
     Known { len, modified, id, created, contributors: contributors.unwrap_or_default(), import_notes }
 }
+
+/// How a copy that could not be merged into a document is refused.
+pub(crate) fn unmerged(error: letters_format::Error) -> Refusal {
+    match error {
+        letters_format::Error::Unmerged => Refusal::invalid("That file shares nothing with the document."),
+        letters_format::Error::History(_) => Refusal::invalid(HARMFUL),
+        error => error.into(),
+    }
+}
+
+/// What is said of a copy whose history cannot be read, or closed the room that tried it.
+pub(crate) const HARMFUL: &str = "That file's history cannot be merged.";
 
 /// A `.let` file as bytes, from a working copy: for a document no file holds yet.
 pub fn packed(copy: &WorkingCopy) -> Answer<Vec<u8>> {

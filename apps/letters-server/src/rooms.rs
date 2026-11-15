@@ -14,7 +14,7 @@
 //! A room is of a file and not of a document, since a copy made by hand carries the id of its original.
 
 use std::collections::HashMap;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -361,7 +361,7 @@ impl Rooms {
     /// Does `work`, which writes to the file at `place` as any other writer of its folder would. A room
     /// that is open for the file saves first and reads the file again at once, so that its sessions are
     /// told what was written.
-    pub fn around<T>(&self, root: &Root, place: &Place, work: impl FnOnce() -> Answer<T>) -> Answer<T> {
+    fn around<T>(&self, root: &Root, place: &Place, work: impl FnOnce() -> Answer<T>) -> Answer<T> {
         let open = lock(&self.open).get(&key(root, place)).cloned();
         let Some(open) = open else { return work() };
         let mut state = lock(&open.state);
@@ -372,6 +372,31 @@ impl Rooms {
         let done = work();
         open.act(self, &mut state, save);
         done
+    }
+
+    /// Merges `theirs`, another copy of the document at `place`, into it. A room that is open for the file
+    /// takes the copy in itself and saves at once: the copy is read once, and whoever has the document
+    /// open is told what it brought. With no room, or one that is not saving, `beside` merges the copy
+    /// into the file as any other writer of its folder would.
+    pub fn merge<R: Read + Seek>(
+        &self,
+        root: &Root,
+        place: &Place,
+        theirs: &mut Archive<R>,
+        beside: impl FnOnce(&mut Archive<R>) -> Answer<()>,
+    ) -> Answer<()> {
+        let open = lock(&self.open).get(&key(root, place)).cloned();
+        if let Some(open) = open {
+            let mut state = lock(&open.state);
+            let hosted = matches!(*state, State::Open(_));
+            match open.act(self, &mut state, |hosted, now| hosted.merge(theirs, now)) {
+                Some(Some(merged)) => return merged,
+                // The room failed at the copy and was closed, with its file as it was.
+                None if hosted => return Err(Refusal::invalid(crate::library::HARMFUL)),
+                _ => {}
+            }
+        }
+        self.around(root, place, || beside(theirs))
     }
 
     /// Brings every file up to its room and ends every session, as the server stops. Each file is
@@ -629,6 +654,21 @@ impl Hosted {
         let due = if over { Some(now) } else { due };
         open.due.store(due.unwrap_or(u64::MAX), Ordering::Release);
         open.wake.notify_one();
+    }
+
+    /// Merges another copy of the document into what the room holds, and saves at once. `None` when the
+    /// room is not saving to its file, where what the copy brought would be held in memory alone.
+    fn merge<R: Read + Seek>(&mut self, theirs: &mut Archive<R>, now: u64) -> Option<Answer<()>> {
+        if self.parked {
+            return None;
+        }
+        self.folder(now)?;
+        if let Err(error) = self.room.merge_from(theirs, &mut self.state, now) {
+            return Some(Err(crate::library::unmerged(error)));
+        }
+        // A save that fails is tried again by the room, which holds what the copy brought.
+        self.save(now, true);
+        Some(Ok(()))
     }
 
     /// Saves everything the room has, and reads a file that was written back at once. That is when the

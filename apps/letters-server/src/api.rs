@@ -560,8 +560,8 @@ impl App {
         if theirs.manifest().id != id {
             return Err(Refusal::invalid("That file is of another document."));
         }
-        let merged = || self.library.merge(&found.root, &found.place, &mut theirs, self.now());
-        self.rooms.around(&found.root, &found.place, merged)
+        let beside = |theirs: &mut _| self.library.merge(&found.root, &found.place, theirs, self.now());
+        self.rooms.merge(&found.root, &found.place, &mut theirs, beside)
     }
 
     /// Merges into the document `id` every conflict copy beside it, through its room when it is open, and
@@ -573,8 +573,8 @@ impl App {
         let mut merged = Vec::new();
         for copy in rows.iter().filter(|row| row.copy_of.as_ref() == Some(&found.place)) {
             let mut theirs = self.library.open(&found.root, &copy.place)?;
-            let merge = || self.library.merge(&found.root, &found.place, &mut theirs, self.now());
-            self.rooms.around(&found.root, &found.place, merge)?;
+            let beside = |theirs: &mut _| self.library.merge(&found.root, &found.place, theirs, self.now());
+            self.rooms.merge(&found.root, &found.place, &mut theirs, beside)?;
             // Closed before it is moved, which a folder on Windows asks for.
             drop(theirs);
             self.library.trash(&self.store, &found.root, &copy.place, self.now())?;
