@@ -9,8 +9,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use letters_api::{
-    Access, Code, CreatedLink, Entry, Grant, Limits, Listing, Move, NewFolder, NewLink, Opened, Person, Rename, Shares,
-    Space, Token, paths,
+    Access, Code, CreatedLink, Entry, Grant, Limits, Listing, Move, NewDocument, NewFolder, NewLink, Opened, Person,
+    Rename, Shares, Space, Token, paths,
 };
 
 use crate::keychain::{Keychain, Unkept};
@@ -186,6 +186,12 @@ impl Session {
     pub fn relocate(&self, id: &str, space: &str, folder: &str) -> Result<Entry, Refused> {
         let to = Move { space: space.to_owned(), folder: folder.to_owned() };
         self.ask(|server, token| server.post(token, &paths::relocate(id), &to))
+    }
+
+    /// Starts a document in `folder` of a space. It is "Untitled" there until its first heading names it.
+    pub fn new_document(&self, space: &str, folder: &str) -> Result<Entry, Refused> {
+        let new = NewDocument { folder: folder.to_owned(), name: None };
+        self.ask(|server, token| server.post(token, &paths::documents(space), &new))
     }
 
     /// Makes the folder `name` in `parent` of a space.

@@ -670,8 +670,7 @@ fn a_document_is_named_renamed_and_moved_at_its_server() {
     let spaces = session.spaces().unwrap();
     let space = spaces.iter().find(|space| space.kind == SpaceKind::Personal).unwrap().id.clone();
     server.document(&session, "Roof repairs");
-    let start = |server: &Client, token: &str| server.post(token, &paths::documents(&space), &NewDocument::default());
-    let id = session.ask(start).map(|made: Entry| made.id.unwrap()).unwrap();
+    let id = session.new_document(&space, "").unwrap().id.unwrap();
     let home = Scratch::new("placing-home");
     let copy = connected::reach(&session, &id, &home.0).expect("the document is brought here").path;
     let place = |asks: &[Placing]| connected::place(&session, &id, &copy, asks);

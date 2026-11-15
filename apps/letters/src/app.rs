@@ -26,7 +26,7 @@ use letters_sync::{Local, Progress, Refusal};
 use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDecision, Origin, Trust};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
-    Access, Allows, Appearance, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind,
+    Access, Allows, Appearance, Browsed, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind,
     ImportOffer, Landing, LinkPreviewFound, Location, MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState,
     Scheme, Settings, SignIn, Window as View, tokens,
 };
@@ -153,6 +153,8 @@ pub enum Event {
     /// The sign-in a window asked for, which ended when this was set, has ended: in a session, or in a
     /// sentence on why not, or in neither if the person gave it up.
     SignedIn(WindowId, Arc<AtomicBool>, Result<Arc<Session>, Option<String>>),
+    /// A server said what a place of it holds, for a window's Open card, or why it could not be read.
+    Browsed(WindowId, Result<Box<Browsed>, String>),
     /// The socket of this number, to the server of a window's document, has something to say.
     Heard(WindowId, Said),
     /// A picture of this name, which the copy of a window's document lacked, was asked of the document's
@@ -2207,7 +2209,11 @@ impl App {
         for request in requests {
             telemetry::Event::asked(&request).into_iter().for_each(|event| self.telemetry.record(event));
             match request {
-                Request::Open(path) => self.act(event_loop, id, Action::Open(Some(path.into()))),
+                // The address of a document's page is no file: its server is asked.
+                Request::Open(path) => match connected::address(&path) {
+                    Some((origin, document)) => self.reach(Some(id), &origin, document),
+                    None => self.act(event_loop, id, Action::Open(Some(path.into()))),
+                },
                 Request::OpenDialog => self.act(event_loop, id, Action::Open(None)),
                 Request::New => self.act(event_loop, id, Action::New),
                 // The name is taken on the way to a save, which reads it from the document. A server's
@@ -2369,6 +2375,9 @@ impl App {
                     }
                 }
                 Request::SignOut { server } => self.sign_out(&server, now),
+                Request::Browse { server, place } => self.browse(id, server, place, now),
+                Request::OpenFrom { server, id: document } => self.reach(Some(id), &server, document),
+                Request::NewAt { server, space, path } => self.start_at(id, &server, space, path),
                 // A request this shell does not know yet.
                 _ => {}
             }
@@ -2670,6 +2679,61 @@ impl App {
             });
         }
         self.tell_servers(now);
+    }
+
+    /// Asks the server at `server` what a place of it holds, for a window's Open card, on another thread.
+    /// The answer arrives as an event.
+    fn browse(&mut self, id: WindowId, server: String, place: letters_ui::Place, now: Instant) {
+        let Some(session) = self.sessions.get(&server).filter(|session| !session.ended()).cloned() else {
+            // The card lists a server nobody is signed in to any more: it goes with the server's row.
+            self.browsed(id, Err("Sign in to this server again to see its documents.".to_owned()), now);
+            return self.tell_servers(now);
+        };
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            let held = match &place {
+                letters_ui::Place::Spaces => session.spaces().map(|spaces| (spaces, Vec::new())),
+                letters_ui::Place::Folder { space, path } => {
+                    session.entries(space, path).map(|listing| (Vec::new(), listing.entries))
+                }
+                letters_ui::Place::Shared => session.shared().map(|entries| (Vec::new(), entries)),
+                letters_ui::Place::Recent => session.recent().map(|entries| (Vec::new(), entries)),
+            };
+            let browsed = held
+                .map(|(spaces, entries)| Box::new(Browsed { server, place, spaces, entries }))
+                .map_err(|refused| connected::sentence(&refused));
+            let _ = proxy.send_event(Event::Browsed(id, browsed));
+        });
+    }
+
+    /// Starts a document in `folder` of a space of the server at `server` and brings it here, on another
+    /// thread, for the window that asked. It opens as a document of the server does: see [`Self::reached`].
+    fn start_at(&mut self, id: WindowId, server: &str, space: String, folder: String) {
+        let Some(session) = self.sessions.get(server).filter(|session| !session.ended()).cloned() else {
+            let nobody = Err(Some("Nobody is signed in to that server any more.".to_owned()));
+            return drop(self.proxy.send_event(Event::Reached(Some(id), nobody)));
+        };
+        let (proxy, home) = (self.proxy.clone(), self.home.clone());
+        thread::spawn(move || {
+            let started = session.new_document(&space, &folder).map_err(|refused| connected::sentence(&refused));
+            let reached = started.and_then(|entry| {
+                let document = entry.id.ok_or("The server did not say which document it started.")?;
+                connected::reach(&session, &document, &home).map_err(|error| error.to_string())
+            });
+            let entered = reached.map(|reached| Box::new((session, reached))).map_err(Some);
+            let _ = proxy.send_event(Event::Reached(Some(id), entered));
+        });
+    }
+
+    /// Tells a window's Open card what a place holds, or why it could not be read.
+    fn browsed(&mut self, id: WindowId, browsed: Result<Box<Browsed>, String>, now: Instant) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        match browsed {
+            Ok(browsed) => window.view.set_listing(*browsed),
+            Err(why) => window.view.refuse_browse(&why),
+        }
+        window.access_stale = true;
+        window.sync(now);
     }
 
     /// Where the person is signed in, as the Servers dialog lists it.
@@ -3599,6 +3663,16 @@ impl ApplicationHandler<Event> for App {
                 }
             }
             Event::SignedIn(id, given_up, signed) => self.signed_in(id, &given_up, signed, now),
+            Event::Browsed(id, browsed) => {
+                self.browsed(id, browsed, now);
+                // A session that ended while it was asked is no longer listed, and the card goes with it.
+                if self.sessions.values().any(|session| session.ended()) {
+                    self.sessions.retain(|_, session| !session.ended());
+                    self.tell_servers(now);
+                }
+                // The card asks for the next place once it has the spaces.
+                self.serve(event_loop, id, now);
+            }
             Event::Heard(id, said) => {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.heard(said, now);

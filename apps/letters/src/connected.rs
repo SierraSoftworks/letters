@@ -247,7 +247,7 @@ pub fn place(session: &Session, id: &str, copy: &Path, asks: &[Placing]) -> Plac
 
 /// Why a server did not do what the person asked, as they are to read it: the server's own sentence where
 /// it gave one.
-fn sentence(refused: &Refused) -> String {
+pub fn sentence(refused: &Refused) -> String {
     match refused {
         Refused::Said(said) => said.to_string(),
         other => format!("That could not be done: {other}."),
