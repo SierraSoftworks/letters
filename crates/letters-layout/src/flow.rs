@@ -417,8 +417,10 @@ pub(crate) struct Leaf {
     /// The number a numbered figure or gallery is given, which its caption opens with.
     pub number: Option<u32>,
     /// Whether a figure or gallery is ready for its caption to be written: the caption keeps its line while
-    /// it is empty, and is set in from the ends of that line.
+    /// it is empty, and is set in from the end of that line.
     pub open: bool,
+    /// How far in from the left and from the right a figure or gallery sets its caption. Nothing at rest.
+    pub inset: (f32, f32),
     /// The cells of a table row.
     pub cells: Vec<Cell>,
     /// The table a row is part of, and whether it is its header.
@@ -483,7 +485,7 @@ impl Leaf {
             What::Rule => theme::RULE,
             What::Blank | What::Empty => of.line,
             What::Text | What::Label | What::Figure | What::Gallery => {
-                let width = self.width - 2.0 * self.inset();
+                let width = self.width - self.inset.0 - self.inset.1;
                 self.tall((self.newlines as f32 + wrapped(self.words.text.len(), width)) * of.line)
             }
             What::Formula => (of.line * 2.5).round(),
@@ -499,11 +501,20 @@ impl Leaf {
         !self.words.text.is_empty() || self.number.is_some() || self.open
     }
 
-    /// How far in from each side a figure or gallery sets its caption while the caption is being written,
-    /// or less where there is not the room.
-    pub fn inset(&self) -> f32 {
-        let room = (self.width - theme::MIN_WIDTH).max(0.0) / 2.0;
-        if self.open { theme::CAPTION_INSET.min(room) } else { 0.0 }
+    /// Makes a figure or gallery ready for its caption to be written, or sets it at rest. Returns whether
+    /// that is a change to it.
+    ///
+    /// A caption being written leaves room at the right of its lines, where a window stands something, or
+    /// less where the leaf is too narrow. A centred one leaves as much at the left, to stay in the middle.
+    /// One set from the start then stays where it is unless its lines reached that far.
+    pub fn ready(&mut self, open: bool, types: &Types) -> bool {
+        if !matches!(self.what, What::Figure | What::Gallery) || self.open == open {
+            return false;
+        }
+        let room = if open { theme::CAPTION_INSET.min((self.width - theme::MIN_WIDTH).max(0.0) / 2.0) } else { 0.0 };
+        let centred = types.get(self.role).align == Alignment::Center;
+        (self.open, self.inset) = (open, (if centred { room } else { 0.0 }, room));
+        true
     }
 
     /// Whether the leaf sets a text of its own, and not only those of its cells.

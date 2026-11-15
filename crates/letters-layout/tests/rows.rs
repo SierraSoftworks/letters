@@ -269,7 +269,7 @@ fn a_caption_line_opens_only_where_it_is_missing() {
 }
 
 #[test]
-fn a_caption_being_written_keeps_clear_of_the_ends_of_its_line() {
+fn a_caption_being_written_keeps_clear_of_the_end_of_its_line() {
     let pair = || vec![picture("f0", ""), picture("f1", "")];
     // What holds pictures over a caption long enough to wrap, and the block the caption is.
     let cases = [
@@ -277,23 +277,30 @@ fn a_caption_being_written_keeps_clear_of_the_ends_of_its_line() {
         ("a numbered figure", numbered(picture("f", PROSE)), "f"),
         ("a gallery", gallery("f", pair(), Some(PROSE)), "fc"),
     ];
-    for (name, block, caption) in cases {
-        let mut layout = laid(&doc(vec![block, paragraph("z", "End")]));
-        let whole = Selection { anchor: Pos::new(caption, 0), head: Pos::new(caption, PROSE.len()) };
+    // How a style sets its captions, and the room such a caption leaves at its left while it is written.
+    let ways = [(Align::Start, 0.0), (Align::Center, CAPTION_INSET)];
+    for ((name, block, caption), (align, left)) in cases.iter().flat_map(|case| ways.map(|way| (case, way))) {
+        let name = format!("{name}, set from {align:?}");
+        let mut style = Style::default();
+        style.types.get_mut("caption").expect("a style has captions").align = align;
+        let mut layout = DocLayout::new(fonts());
+        layout.update(&doc(vec![block.clone(), paragraph("z", "End")]), &style, WIDTH, None);
+        let whole = Selection { anchor: Pos::new(*caption, 0), head: Pos::new(*caption, PROSE.len()) };
         let line = |layout: &DocLayout| layout.figure(&"f".into()).unwrap().caption;
         let below = |layout: &DocLayout| layout.caret(&Pos::new("z", 0)).unwrap().y;
         let (ends, rest) = (line(&layout), layout.selection(&whole));
-        // Whether each line of the caption leaves the room at both ends of the figure's width. The space a
-        // line wraps at may hang past its end.
-        let clear = |lines: &[Rect]| {
-            let (from, to) = (ends.x + CAPTION_INSET - 0.5, right(ends) - CAPTION_INSET + 6.0);
-            lines.iter().all(|line| line.x >= from && right(*line) <= to)
-        };
-        assert!(!clear(&rest), "{name}: at rest its caption runs the width of the figure");
+        // Where a line may end while a window stands something at the end of it. The space a line wraps at
+        // may hang past that.
+        let room = right(ends) - CAPTION_INSET + 6.0;
+        assert!(rest.iter().any(|line| right(*line) > room), "{name}: at rest its caption runs the figure's width");
 
         assert!(layout.set_caption_open(Some(&"f".into())), "{name}: it is set anew to be written");
         let written = layout.selection(&whole);
-        assert!(clear(&written), "{name}: and stands in from both ends: {written:?}");
+        let clear = |line: &Rect| line.x >= ends.x + left - 0.5 && right(*line) <= room;
+        assert!(written.iter().all(clear), "{name}: its lines leave the end of the figure's width: {written:?}");
+        // What the way it is set holds still: where its first line starts, or the middle of that line.
+        let held = |lines: &[Rect]| if left > 0.0 { middle(lines[0]).x } else { lines[0].x };
+        assert!((held(&written) - held(&rest)).abs() < 4.0, "{name}: and are set as they were: {written:?}");
         let now = line(&layout);
         assert_eq!((now.x, now.width), (ends.x, ends.width), "{name}: its line is still the figure's width");
         assert!(bottom(now) <= below(&layout), "{name}: the block below makes way for the lines it takes");

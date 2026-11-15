@@ -264,8 +264,10 @@ impl DocLayout {
     /// below. With the line open they have a line of their own, and nothing moves when the first letter is
     /// typed.
     ///
-    /// Its caption is also set [`CAPTION_INSET`] in from each side, written or not, which leaves the ends
-    /// of its lines to what a window stands there. [`FigureBox::caption`] stays the whole width.
+    /// Its caption is also set [`CAPTION_INSET`] in from the right, written or not, which leaves the end of
+    /// its lines to what a window stands there. A centred caption is set as far in from the left, so it
+    /// stays in the middle, and one set from the start stays where it is unless a line of it reached that
+    /// far. [`FigureBox::caption`] stays the whole width.
     ///
     /// Returns whether a figure is laid out anew for it, which can move what is below. Only the screen
     /// shows any of this: a sheet shows the document.
@@ -816,8 +818,7 @@ impl State {
         let Some(&Slot { leaf: at, .. }) = self.caption.as_ref().and_then(|block| self.index.get(block)) else {
             return false;
         };
-        let leaf = &mut self.leaves[at];
-        if !matches!(leaf.what, What::Figure | What::Gallery) || std::mem::replace(&mut leaf.open, open) == open {
+        if !self.leaves[at].ready(open, &self.types) {
             return false;
         }
         // It is what the selection is at, so it is given its height at once.

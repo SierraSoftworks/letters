@@ -164,7 +164,7 @@ impl<'a> Source<'a> {
             role: leaf.role,
             ink: if leaf.what == What::Label { Ink::Marker } else { Ink::Style(leaf.role) },
             align: if plain { Alignment::Start } else { types.get(leaf.role).align },
-            width: leaf.width - 2.0 * leaf.inset(),
+            width: leaf.width - leaf.inset.0 - leaf.inset.1,
             label: leaf.number.map(|number| types.label(number)),
             bold: false,
             formula: leaf.what == What::Formula,
@@ -663,7 +663,7 @@ impl<'a> Text<'a> {
     pub fn of(leaf: &'a Leaf, part: Part) -> Option<Self> {
         let laid = leaf.laid.as_deref()?;
         let (set, source, x, y) = match part {
-            Part::Text if leaf.what != What::Row => (&laid.text, &leaf.words, leaf.inset(), leaf.lead),
+            Part::Text if leaf.what != What::Row => (&laid.text, &leaf.words, leaf.inset.0, leaf.lead),
             Part::Cell(index) => {
                 let cell = leaf.cells.get(index)?;
                 (laid.cells.get(index)?, &cell.words, cell.x, theme::CELL_PAD_Y)
