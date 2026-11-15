@@ -142,6 +142,22 @@ pub enum Request {
         href: String,
         confirmed: bool,
     },
+    /// Merge every conflict copy last told of with `Window::set_conflict_copies` into the document, and
+    /// move each to the trash once its edits are in. The shell judges the files first: it merges them, or
+    /// has the window name them and ask with `Window::ask_merge`, or says why not with
+    /// `Window::refuse_merge`. `confirmed` is set once the person has read that card and said yes. The
+    /// button waits for one of the three: `Window::set_conflict_copies` says which copies are left.
+    MergeConflicts {
+        confirmed: bool,
+    },
+    /// Merge another file of this document into it, and leave that file where it is. `path` is `None` for
+    /// the shell to let the person choose the file. Once the person has said yes to a `Window::ask_merge`
+    /// it is the path of the file on that card, with `confirmed` set. Answered as
+    /// [`Request::MergeConflicts`] is, or not at all when the person chose no file.
+    MergeFrom {
+        path: Option<String>,
+        confirmed: bool,
+    },
 }
 
 /// A document opened lately, as the landing card lists it.

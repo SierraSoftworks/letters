@@ -89,6 +89,10 @@ pub(crate) enum Act {
     PageSetup,
     TrustDocument,
     TrustFolder,
+    /// Merges the conflict copies a sync tool left of the document.
+    MergeConflicts,
+    /// Lets the person choose another file of the document to merge into it.
+    MergeFrom,
     /// Shows the document on the sheets it prints on.
     Print,
     /// Shows the document's earlier versions.
@@ -152,7 +156,7 @@ const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> E
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 92] = [
+pub(crate) static ENTRIES: [Entry; 94] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -245,6 +249,8 @@ pub(crate) static ENTRIES: [Entry; 92] = [
     entry("Document", "Settings", "preferences appearance accent", Act::Settings),
     entry("Document", "Trust this document", "safe mode", Act::TrustDocument),
     entry("Document", "Trust this folder", "safe mode", Act::TrustFolder),
+    entry("Document", "Merge conflicts", "conflict copy copies sync", Act::MergeConflicts),
+    entry("Document", "Merge from file", "duplicate copy combine", Act::MergeFrom),
 ];
 
 const PRIMARY: Modifiers = Modifiers { primary: true, shift: false, alt: false };

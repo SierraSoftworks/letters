@@ -42,6 +42,7 @@ use crate::icon::{self, Icon};
 use crate::importing::{Import, ImportOffer, Importing};
 use crate::insert::{Insert, Inserting, Put};
 use crate::maths::{self, Maths, Sheet, SheetLines, Source};
+use crate::merging::{Confirmed, MergeAsk, MergeFile, Merges, Merging};
 use crate::motion::{self, FRAME_MS};
 use crate::notes::{self, Margin, Noting};
 use crate::opening::{self, Landing, Location, Recent, Request};
@@ -224,6 +225,8 @@ pub enum Message {
     Note(Noting),
     /// What the safe mode bar, a link and the card about a link ask for.
     Safe(Safely),
+    /// What the bar about conflict copies and the card about files to merge ask for.
+    Merge(Merging),
     /// What is asked of the command palette.
     Commands(Commanding),
     /// What is asked of the bar that finds and replaces.
@@ -575,6 +578,28 @@ impl Ui<EditorApp> {
         self.app_mut().safe.refuse(href, why);
     }
 
+    /// Says which conflict copies of the document there are: files a sync tool left beside it that hold
+    /// edits it lacks. A bar under the top bar offers to merge them with [`Request::MergeConflicts`], and
+    /// goes when there are none. Each call replaces the list. Until the first call, an empty one included,
+    /// the window offers no merge at all: a shell that cannot merge, or a document that is in no file yet,
+    /// is never asked for one.
+    pub fn set_conflict_copies(&mut self, copies: Vec<MergeFile>) {
+        self.app_mut().merges.set(copies);
+    }
+
+    /// Names the files about to be merged and asks whether to go on, in answer to a
+    /// [`Request::MergeConflicts`] or a [`Request::MergeFrom`] that was not confirmed. A yes asks again
+    /// with `confirmed` set: for the conflict copies when `conflicts` is set, else for the first file.
+    pub fn ask_merge(&mut self, ask: MergeAsk) {
+        self.app_mut().merges.ask(ask);
+    }
+
+    /// Says why files could not be merged, in a sentence that stands by itself. The bar under the top bar
+    /// says it until the person puts it away or asks for another merge.
+    pub fn refuse_merge(&mut self, why: &str) {
+        self.app_mut().merges.refuse(why);
+    }
+
     /// The document's notes: the comments on its passages, and what imports and merges left on them. A
     /// shell writes them into the document's file with each save. A comment that is written counts among
     /// [`Window::edits`].
@@ -834,6 +859,7 @@ pub struct EditorApp {
     drop: Option<Rect>,
     linked: Linked,
     safe: Safe,
+    merges: Merges,
     grip: Grip,
     captions: Captions,
     margin: Margin,
@@ -943,6 +969,7 @@ impl EditorApp {
             drop: None,
             linked: Linked::default(),
             safe: Safe::default(),
+            merges: Merges::default(),
             grip: Grip::default(),
             captions: Captions::default(),
             margin: Margin::default(),
@@ -1734,6 +1761,8 @@ impl EditorApp {
             Act::PageSetup => Message::Styles(Styling::PageSetup),
             Act::TrustDocument => self.safe.on().then_some(Message::Safe(Safely::TrustDocument))?,
             Act::TrustFolder => self.safe.folder().then_some(Message::Safe(Safely::TrustFolder))?,
+            Act::MergeConflicts => self.merges.waiting().then_some(Message::Merge(Merging::Conflicts))?,
+            Act::MergeFrom => self.merges.can().then_some(Message::Merge(Merging::FromFile))?,
             // A card over the window is answered first: there is no document to act on behind it.
             Act::Print => (!self.carded()).then_some(Message::Print(Printing::Show))?,
             Act::History => (!self.carded()).then_some(Message::History(Historying::Show))?,
@@ -2180,6 +2209,27 @@ impl EditorApp {
                 }
             }
             Safely::Leave => self.safe.leave(),
+        }
+    }
+
+    /// Does what the bar about conflict copies or the card about files to merge asked. The merge itself
+    /// is the shell's to do.
+    fn merging(&mut self, asked: Merging) {
+        match asked {
+            Merging::Conflicts => {
+                self.merges.asked();
+                self.requests.push(Request::MergeConflicts { confirmed: false });
+            }
+            Merging::FromFile => self.requests.push(Request::MergeFrom { path: None, confirmed: false }),
+            Merging::Confirm => match self.merges.confirm() {
+                Some(Confirmed::Conflicts) => self.requests.push(Request::MergeConflicts { confirmed: true }),
+                Some(Confirmed::File(path)) => {
+                    self.requests.push(Request::MergeFrom { path: Some(path), confirmed: true });
+                }
+                None => {}
+            },
+            Merging::Leave => self.merges.leave(),
+            Merging::Hide => self.merges.hide(),
         }
     }
 
@@ -4199,6 +4249,7 @@ impl EditorApp {
             Message::TableMenu => self.tables.open = None,
             Message::Callout(asked) => self.calling(asked, platform),
             Message::Safe(asked) => self.safely(asked),
+            Message::Merge(asked) => self.merging(asked),
             Message::Alt(asked) => self.altering(asked, platform),
             Message::Note(asked) => self.noting(asked, platform),
             Message::Commands(asked) => self.commanding(asked, platform),
@@ -4335,8 +4386,10 @@ impl App for EditorApp {
         let open = self.margin.reviewing().and_then(|open| waiting.iter().position(|id| *id == open.id));
         let conflicts = (!waiting.is_empty() && !away).then(|| review::bar(waiting.len(), open));
         let told = if conflicts.is_some() { banner::HEIGHT } else { 0.0 };
-        // The safe mode bar lies under the top bar and takes its height from the page.
+        // The bars of safe mode and of conflict copies lie under the top bar and take their height from
+        // the page.
         let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height() + told;
+        let bar = bar + self.merges.height();
         // The history has a strip of its versions under the page and the panel.
         let strip = self.history.as_ref().map(History::strip);
         let foot = if strip.is_some() { history::STRIP } else { 0.0 };
@@ -4356,6 +4409,7 @@ impl App for EditorApp {
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
         let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
+        let over = over.chain(self.merges.card());
         let commands = self.commands.open().then(|| {
             let (offers, keymap) = (self.offers(), self.editor.keymap());
             self.commands.view(&offers, keymap, self.mac, bar, window)
@@ -4363,7 +4417,7 @@ impl App for EditorApp {
         let over = over.chain(commands);
         // It comes first, so that whatever else opens lies over it and is the first that Escape puts away.
         let all = Element::column().bg(tokens::BG).fg(tokens::FG).children(find);
-        let all = all.child(self.bar()).children(self.safe.bar());
+        let all = all.child(self.bar()).children(self.safe.bar()).children(self.merges.bar());
         let all = all.children(conflicts).child(body).children(strip).children(over);
         if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
     }
