@@ -274,7 +274,7 @@ pub(crate) fn paint(canvas: &mut impl Canvas, fonts: &mut FontCache, list: &Disp
                 clips -= 1;
                 canvas.pop_clip();
             }
-            Item::PopClip => {}
+            Item::PopClip | Item::Open { .. } | Item::Close => {}
         }
     }
     for _ in 0..clips {

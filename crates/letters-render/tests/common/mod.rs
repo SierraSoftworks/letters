@@ -9,7 +9,7 @@ use image::{ImageFormat, Rgb, RgbImage};
 use letters_render::cpu::{CpuRenderer, Frame};
 use letters_render::image::{Image, Images};
 use letters_render::snapshot::Shot;
-use letters_render::{Color, DisplayList, Font, Glyph, Item, PathEl, Point, Rect};
+use letters_render::{Color, DisplayList, Font, Glyph, Item, PathEl, Point, Rect, Role};
 use skrifa::instance::{LocationRef, Size};
 use skrifa::raw::types::F2Dot14;
 use skrifa::{FontRef, MetadataProvider};
@@ -25,6 +25,14 @@ pub fn list(items: impl IntoIterator<Item = Item>) -> DisplayList {
 
 pub fn fill(x: f32, y: f32, width: f32, height: f32, color: Color) -> Item {
     Item::Fill { rect: Rect::new(x, y, width, height), color, radius: 0.0 }
+}
+
+/// A part of the document with `inside` as what it holds.
+pub fn part(role: Role, id: u64, inside: impl IntoIterator<Item = Item>) -> Vec<Item> {
+    let mut items = vec![Item::Open { role, id }];
+    items.extend(inside);
+    items.push(Item::Close);
+    items
 }
 
 /// Draws `list` over white on a fresh renderer.

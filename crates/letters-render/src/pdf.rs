@@ -3,10 +3,14 @@
 //! Fonts are embedded as subsets, a variable font as the instance its runs use. A run that carries its
 //! [`RunText`] can be selected and searched as it was written. One that does not is spelled from its font's
 //! character map, which loses ligatures. An image is stored once however often it is drawn.
+//!
+//! Where lists say what their parts are ([`Item::Open`]), the file is tagged: a reader that cannot see the
+//! page gets its headings, paragraphs, lists, figures and tables in reading order.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::num::NonZeroU16;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -22,6 +26,10 @@ use krilla::outline::{Outline, OutlineNode};
 use krilla::page::PageSettings;
 use krilla::paint::{Fill, FillRule, LineCap, LineJoin, Stroke};
 use krilla::surface::Surface;
+use krilla::tagging::{
+    Artifact, ArtifactType, ContentTag, Identifier, ListNumbering, Node, Placement, SpanTag, TableHeaderScope,
+    Tag as Kind, TagGroup, TagKind, TagTree,
+};
 use krilla::text::{GlyphId, KrillaGlyph, Tag};
 use krilla::{Document, geom};
 use skrifa::raw::TableProvider;
@@ -32,7 +40,7 @@ use vello_cpu::kurbo::{self, Shape};
 use crate::cpu::{CpuRenderer, Frame};
 use crate::image::Images;
 use crate::paint::{EMBOLDEN, bez_path, rounded};
-use crate::{Color, DisplayList, Font, Glyph, Item, Point, Rect, RunText, Size};
+use crate::{Color, DisplayList, Font, Glyph, Item, Point, Rect, Role, RunText, Size};
 
 /// PDF points in a logical pixel: 72 to the inch against 96.
 const POINTS: f32 = 0.75;
@@ -42,6 +50,9 @@ const TOLERANCE: f64 = 0.01;
 const SHADOW_SCALE: f32 = 2.0;
 /// The longest side a shadow's picture may have, in pixels.
 const SHADOW_SIDE: f32 = 2048.0;
+/// How deep parts may lie inside one another. A part opened deeper is read as more of the part around it,
+/// so that no list can make the structure too deep to walk.
+const DEPTH: usize = 32;
 
 /// A part of a page that takes the reader somewhere.
 #[derive(Clone, Debug, PartialEq)]
@@ -112,6 +123,7 @@ pub struct Pdf {
     /// The furthest page a link goes to.
     furthest: Option<usize>,
     kept: Kept,
+    structure: Structure,
 }
 
 /// What pages share, so that each font and image goes into the file once.
@@ -142,7 +154,13 @@ impl Default for Pdf {
 
 impl Pdf {
     pub fn new() -> Self {
-        Self { document: Document::new(), pages: 0, furthest: None, kept: Kept::default() }
+        Self {
+            document: Document::new(),
+            pages: 0,
+            furthest: None,
+            kept: Kept::default(),
+            structure: Structure::default(),
+        }
     }
 
     /// Adds a page of `size` logical pixels that shows `list`, with its top left at the list's origin. An
@@ -171,7 +189,16 @@ impl Pdf {
 
         let mut surface = page.surface();
         surface.push_transform(&Transform::from_scale(POINTS, POINTS));
-        Painter { surface: &mut surface, kept: &mut self.kept, assets: images }.paint(list);
+        let mut painter = Painter {
+            surface: &mut surface,
+            kept: &mut self.kept,
+            assets: images,
+            structure: &mut self.structure,
+            // A list that names no part is not known to be decoration, so nothing in it is marked.
+            parts: list.items.iter().any(|item| matches!(item, Item::Open { .. })),
+            marked: None,
+        };
+        painter.paint(list);
         surface.pop();
         surface.finish();
         page.finish();
@@ -206,6 +233,12 @@ impl Pdf {
                 outline.push_child(nested(&mut rest));
             }
             self.document.set_outline(outline);
+        }
+        if !self.structure.elements.is_empty() {
+            let language = (!info.language.is_empty()).then(|| info.language.clone());
+            let mut tree = TagTree::new().with_lang(language);
+            tree.children = self.structure.nodes(&self.structure.top);
+            self.document.set_tag_tree(tree);
         }
         self.document.finish().map_err(|error| match error {
             krilla::error::KrillaError::Font(_, reason) => PdfError::Font(reason),
@@ -252,11 +285,147 @@ fn nested(rest: &mut &[&Heading]) -> OutlineNode {
     node
 }
 
+/// The parts of the document, as its pages opened them.
+#[derive(Default)]
+struct Structure {
+    elements: Vec<Element>,
+    /// By the id each element was opened with.
+    known: HashMap<u64, usize>,
+    /// What lies under no element, in reading order.
+    top: Vec<Part>,
+}
+
+struct Element {
+    role: Role,
+    /// In the order they were first drawn or opened, which is the order they are read in.
+    parts: Vec<Part>,
+}
+
+#[derive(Clone, Copy)]
+enum Part {
+    Element(usize),
+    /// A stretch of one page's content.
+    Content(Identifier),
+}
+
+impl Structure {
+    /// The element `id` names, made under `parent` the first time it opens.
+    fn open(&mut self, role: &Role, id: u64, parent: Option<usize>) -> usize {
+        if let Some(known) = self.known.get(&id) {
+            return *known;
+        }
+        let element = self.elements.len();
+        self.elements.push(Element { role: role.clone(), parts: Vec::new() });
+        self.known.insert(id, element);
+        match parent {
+            Some(parent) => self.elements[parent].parts.push(Part::Element(element)),
+            None => self.top.push(Part::Element(element)),
+        }
+        element
+    }
+
+    /// The tags for `parts`, with list items that follow one another gathered into lists. An element with
+    /// nothing in it is left out.
+    fn nodes(&self, parts: &[Part]) -> Vec<Node> {
+        let mut nodes = Vec::new();
+        let mut rest = parts;
+        while let Some((first, after)) = rest.split_first() {
+            let group = match first {
+                Part::Content(content) => {
+                    nodes.push(Node::Leaf(*content));
+                    rest = after;
+                    continue;
+                }
+                Part::Element(_) if self.item(Some(first)).is_some() => self.list(&mut rest),
+                Part::Element(element) => {
+                    rest = after;
+                    let Element { role, parts } = &self.elements[*element];
+                    TagGroup::with_children(tag(role), self.nodes(parts))
+                }
+            };
+            if !group.children.is_empty() {
+                nodes.push(group.into());
+            }
+        }
+        nodes
+    }
+
+    /// The list item `part` is, with its depth and how its list is marked.
+    fn item(&self, part: Option<&Part>) -> Option<(&Element, u8, ListNumbering)> {
+        let Part::Element(element) = part? else { return None };
+        let element = &self.elements[*element];
+        let Role::ListItem { depth, numbered, checked } = element.role else { return None };
+        let marked = match (numbered, checked) {
+            (true, _) => ListNumbering::Decimal,
+            // A task's box is its label, which says whether it is ticked.
+            (false, Some(_)) => ListNumbering::None,
+            (false, None) => ListNumbering::Disc,
+        };
+        Some((element, depth, marked))
+    }
+
+    /// Takes the list that `rest` starts with off it. A deeper item starts a list under the item before it.
+    fn list(&self, rest: &mut &[Part]) -> TagGroup {
+        let (_, depth, marked) = self.item(rest.first()).expect("the caller checks that a list item is first");
+        let mut list = TagGroup::new(Kind::L(marked));
+        while let Some((element, ..)) = self.item(rest.first()).filter(|(_, at, how)| (*at, *how) == (depth, marked)) {
+            *rest = &rest[1..];
+            let label = |part: &Part| matches!(part, Part::Element(part) if self.elements[*part].role == Role::Label);
+            let (labels, text): (Vec<Part>, Vec<Part>) = element.parts.iter().partition(|part| label(part));
+            let mut body = TagGroup::with_children(Kind::LBody, self.nodes(&text));
+            while self.item(rest.first()).is_some_and(|(_, at, _)| at > depth) {
+                body.push(self.list(rest));
+            }
+            let mut item = TagGroup::new(Kind::LI);
+            for part in labels {
+                let Part::Element(part) = part else { continue };
+                let said = match element.role {
+                    Role::ListItem { checked: Some(true), .. } => Some("\u{2611}"),
+                    Role::ListItem { checked: Some(false), .. } => Some("\u{2610}"),
+                    _ => None,
+                };
+                let tag = Kind::Lbl.with_actual_text(said.map(str::to_owned));
+                item.push(TagGroup::with_children(tag, self.nodes(&self.elements[part].parts)));
+            }
+            item.push(body);
+            list.push(item);
+        }
+        list
+    }
+}
+
+/// The PDF structure type for a role.
+fn tag(role: &Role) -> TagKind {
+    let said = |alt: &str| (!alt.is_empty()).then(|| alt.to_owned());
+    match role {
+        Role::Heading(level) => Kind::Hn(NonZeroU16::new(u16::from(*level)).unwrap_or(NonZeroU16::MIN), None).into(),
+        Role::Paragraph => Kind::P.into(),
+        Role::ListItem { .. } => Kind::LI.into(),
+        Role::Label => Kind::Lbl.into(),
+        Role::Quote => Kind::BlockQuote.into(),
+        // PDF's own Note is a footnote, which a callout is not.
+        Role::Note => Kind::Div.into(),
+        Role::Code => Kind::Code.with_placement(Some(Placement::Block)).into(),
+        Role::Figure { alt } => Kind::Figure(said(alt)).into(),
+        Role::Caption => Kind::Caption.into(),
+        Role::Formula { alt } => Kind::Formula(said(alt)).into(),
+        Role::Table => Kind::Table.into(),
+        Role::Row => Kind::TR.into(),
+        Role::Cell { header: true } => Kind::TH(TableHeaderScope::Column).into(),
+        Role::Cell { header: false } => Kind::TD.into(),
+    }
+}
+
 /// Draws display lists on one page's surface.
 struct Painter<'a, 'b> {
     surface: &'a mut Surface<'b>,
     kept: &'a mut Kept,
     assets: &'a Images,
+    structure: &'a mut Structure,
+    /// Whether the list says what its parts are.
+    parts: bool,
+    /// The element the content being drawn is marked as part of, or `Some(None)` for decoration.
+    marked: Option<Option<usize>>,
 }
 
 impl Painter<'_, '_> {
@@ -264,8 +433,21 @@ impl Painter<'_, '_> {
         // Whether each open clip is one the surface holds. A clip that lets nothing through is not, and
         // nothing is drawn until it closes.
         let mut clips: Vec<bool> = Vec::new();
+        // The elements that are open, innermost last.
+        let mut open: Vec<Option<usize>> = Vec::new();
         for item in &list.items {
+            // Marked content may not straddle a clip, and belongs to one element.
+            if matches!(item, Item::PushClip { .. } | Item::PopClip | Item::Open { .. } | Item::Close) {
+                self.unmark();
+            }
             match item {
+                Item::Open { role, id } => {
+                    let around = open.last().copied().flatten();
+                    let deep = open.len() >= DEPTH;
+                    open.push(if deep { around } else { Some(self.structure.open(role, *id, around)) });
+                }
+                // A close with nothing open is ignored.
+                Item::Close => drop(open.pop()),
                 Item::PushClip { rect, radius } => {
                     let path = rounded(rect, *radius).and_then(|shape| path(shape.path_elements(TOLERANCE)));
                     if let Some(path) = &path {
@@ -280,11 +462,38 @@ impl Painter<'_, '_> {
                     }
                 }
                 _ if clips.contains(&false) => {}
-                item => self.draw(item),
+                item => {
+                    self.mark(open.last().copied().flatten());
+                    self.draw(item);
+                }
             }
         }
+        self.unmark();
         for _ in clips.into_iter().filter(|held| *held) {
             self.surface.pop();
+        }
+    }
+
+    /// Marks what is drawn from here on as content of `element`, or as decoration.
+    fn mark(&mut self, element: Option<usize>) {
+        if !self.parts || self.marked == Some(element) {
+            return;
+        }
+        self.unmark();
+        match element {
+            Some(element) => {
+                // A reader takes what the content is from its element, so one tag serves text and pictures.
+                let content = self.surface.start_tagged(ContentTag::Span(SpanTag::empty()));
+                self.structure.elements[element].parts.push(Part::Content(content));
+            }
+            None => drop(self.surface.start_tagged(ContentTag::Artifact(Artifact::with_kind(ArtifactType::Other)))),
+        }
+        self.marked = Some(element);
+    }
+
+    fn unmark(&mut self) {
+        if self.marked.take().is_some() {
+            self.surface.end_tagged();
         }
     }
 
@@ -382,7 +591,7 @@ impl Painter<'_, '_> {
                 let stored = stored.clone();
                 self.place(stored, *rect);
             }
-            Item::PushClip { .. } | Item::PopClip => {}
+            Item::PushClip { .. } | Item::PopClip | Item::Open { .. } | Item::Close => {}
         }
     }
 

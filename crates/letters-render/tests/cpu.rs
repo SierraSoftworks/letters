@@ -7,7 +7,7 @@ use std::sync::Arc;
 use common::*;
 use letters_render::cpu::{CpuRenderer, Frame};
 use letters_render::image::Images;
-use letters_render::{Color, DisplayList, Font, Item, PathEl, Point, Rect};
+use letters_render::{Color, DisplayList, Font, Item, PathEl, Point, Rect, Role};
 
 fn at(frame: &Frame, x: u32, y: u32) -> Color {
     frame.pixel(x, y).expect("the probe is inside the frame")
@@ -374,4 +374,16 @@ fn a_frame_converts_to_window_pixels() {
     frame.copy_to_xrgb(&mut window);
 
     assert_eq!(window, [0x00ff_ffff, 0x0012_3456]);
+}
+
+#[test]
+fn the_parts_of_a_document_change_nothing_on_screen() {
+    let words = text(&sans(400.0), 16.0, BLACK, Point { x: 10.0, y: 30.0 }, "Parts");
+    let plain = list([fill(0.0, 0.0, 30.0, 30.0, RED), words.clone()]);
+    let mut marked = part(Role::Paragraph, 1, [fill(0.0, 0.0, 30.0, 30.0, RED), words]);
+    marked.extend([Item::Close, Item::Open { role: Role::Heading(1), id: 2 }]);
+
+    let (plain, marked) = (render(&plain, 80, 40, 1.0), render(&list(marked), 80, 40, 1.0));
+
+    assert_eq!(furthest_apart(&plain, &marked), 0);
 }

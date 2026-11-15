@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use common::*;
@@ -13,14 +14,14 @@ use hayro::hayro_interpret::{
     InterpreterSettings, SoftMask, interpret_page,
 };
 use hayro::hayro_syntax::Pdf as Read;
-use hayro::hayro_syntax::object::{Array, Dict, Object, Rect as Corners, String as Bytes};
+use hayro::hayro_syntax::object::{Array, Dict, Name, Object, Rect as Corners, String as Bytes};
 use hayro::hayro_syntax::page::Page;
 use hayro::kurbo::{Affine, BezPath};
 use hayro::vello_cpu::color::palette::css;
 use hayro::{PixmapSettings, RenderCache, RenderSettings};
 use letters_render::image::{Image, Images};
 use letters_render::pdf::{Heading, Info, Link, Pdf, PdfError, Target};
-use letters_render::{Color, DisplayList, Item, Point, Rect, RunText, Size};
+use letters_render::{Color, DisplayList, Item, Point, Rect, Role, RunText, Size};
 
 /// The scenes' size in logical pixels, and in the points a PDF measures in.
 const SHEET: Size = Size { width: 240.0, height: 160.0 };
@@ -48,19 +49,58 @@ fn shown(page: &Page<'_>) -> Vec<[u8; 4]> {
     pixmap.data().iter().map(|pixel| [pixel.r, pixel.g, pixel.b, pixel.a]).collect()
 }
 
-/// Collects the text of a page in the order it is drawn.
+/// Collects the text of a page in the order it is drawn, and what each stretch of it is marked as.
 #[derive(Default)]
-struct Reader(String);
+struct Reader {
+    all: String,
+    /// The marks that are open, innermost last.
+    marks: Vec<Mark>,
+    /// The text of each stretch that belongs to the structure, by its number on the page.
+    content: HashMap<i32, String>,
+    /// The text marked as no part of the document.
+    decoration: String,
+}
+
+#[derive(Clone, Copy)]
+enum Mark {
+    None,
+    Decoration,
+    Content(i32),
+}
 
 impl<'a> Device<'a> for Reader {
     fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {
+        let mut text = String::new();
         for glyph in run.glyphs() {
             match glyph.as_unicode() {
-                Some(BfString::Char(character)) => self.0.push(character),
-                Some(BfString::String(text)) => self.0.push_str(&text),
+                Some(BfString::Char(character)) => text.push(character),
+                Some(BfString::String(more)) => text.push_str(&more),
                 None => {}
             }
         }
+        self.all.push_str(&text);
+        match self.marks.last() {
+            Some(Mark::Content(number)) => self.content.entry(*number).or_default().push_str(&text),
+            Some(Mark::Decoration) => self.decoration.push_str(&text),
+            Some(Mark::None) | None => {}
+        }
+    }
+
+    fn begin_marked_content(&mut self, tag: &[u8], properties: Option<&Dict<'_>>) {
+        let around = self.marks.last().copied().unwrap_or(Mark::None);
+        let number = properties.and_then(|properties| properties.get::<i32>("MCID"));
+        if let Some(number) = number {
+            self.content.entry(number).or_default();
+        }
+        self.marks.push(match number {
+            Some(number) => Mark::Content(number),
+            None if tag == b"Artifact" => Mark::Decoration,
+            None => around,
+        });
+    }
+
+    fn end_marked_content(&mut self) {
+        self.marks.pop();
     }
 
     fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
@@ -71,14 +111,76 @@ impl<'a> Device<'a> for Reader {
     fn pop_transparency_group(&mut self) {}
 }
 
-/// The text a reader finds on a page when it is searched or copied.
-fn text_of(page: &Page<'_>) -> String {
+fn read_through(page: &Page<'_>) -> Reader {
     let cache = InterpreterCache::default();
     let bounds = hayro::kurbo::Rect::new(0.0, 0.0, 1e4, 1e4);
     let mut context = Context::new(Affine::IDENTITY, bounds, &cache, page.xref(), InterpreterSettings::default());
     let mut reader = Reader::default();
     interpret_page(page, &mut context, &mut reader);
-    reader.0
+    reader
+}
+
+/// The text a reader finds on a page when it is searched or copied.
+fn text_of(page: &Page<'_>) -> String {
+    read_through(page).all
+}
+
+/// The index of the page that `dict` names under `key`.
+fn page_at(read: &Read, dict: &Dict<'_>, key: &str) -> Option<usize> {
+    let page = dict.get::<Dict<'_>>(key)?.obj_id()?;
+    read.pages().iter().position(|other| other.raw().obj_id() == Some(page))
+}
+
+/// The element at the top of the PDF's structure, if it has one.
+fn document_of(read: &Read) -> Option<Dict<'_>> {
+    let root = read.xref().get::<Dict<'_>>(read.xref().root_id()).expect("a PDF has a catalogue");
+    root.get::<Dict<'_>>("StructTreeRoot")?.get::<Array<'_>>("K")?.iter::<Dict<'_>>().next()
+}
+
+/// The document as a reader that cannot see the pages gets it: each element as its PDF type, then what
+/// kind of list it is, then `[the words that stand for it]`, around `{what it holds}` in reading order. A
+/// stretch of a page is the text it draws, or `*` if it draws none. Empty if the PDF says nothing.
+fn structure_of(read: &Read) -> String {
+    fn element(read: &Read, pages: &[Reader], dict: &Dict<'_>) -> String {
+        let kind = dict.get::<Name<'_>>("S").map(|kind| kind.as_str().to_owned()).unwrap_or_default();
+        let page = page_at(read, dict, "Pg");
+        let stretch = |page: Option<usize>, number: Option<i32>| {
+            let text = page.zip(number).and_then(|(page, number)| pages.get(page)?.content.get(&number));
+            match text.map(|text| text.trim()) {
+                Some("") => "*".to_owned(),
+                Some(text) => text.to_owned(),
+                None => "nothing on the page".to_owned(),
+            }
+        };
+        let attributes: Vec<Dict<'_>> = match dict.get::<Object<'_>>("A") {
+            Some(Object::Dict(one)) => vec![one],
+            Some(Object::Array(many)) => many.iter::<Dict<'_>>().collect(),
+            _ => vec![],
+        };
+        let numbering = attributes.iter().find_map(|attribute| attribute.get::<Name<'_>>("ListNumbering"));
+        let numbering = numbering.map(|numbering| format!(":{}", numbering.as_str())).unwrap_or_default();
+        let stands = string(dict, "Alt").or_else(|| string(dict, "ActualText"));
+        let stands = stands.map(|stands| format!("[{stands}]")).unwrap_or_default();
+        let holds: Vec<Object<'_>> = match dict.get::<Object<'_>>("K") {
+            Some(Object::Array(many)) => many.iter::<Object<'_>>().collect(),
+            Some(one) => vec![one],
+            None => vec![],
+        };
+        let holds: Vec<String> = holds
+            .iter()
+            .map(|held| match held {
+                Object::Number(number) => stretch(page, Some(number.as_i64() as i32)),
+                Object::Dict(inner) if inner.contains_key("S") => element(read, pages, inner),
+                Object::Dict(marked) => stretch(page_at(read, marked, "Pg").or(page), marked.get::<i32>("MCID")),
+                _ => "something else".to_owned(),
+            })
+            .collect();
+        format!("{kind}{numbering}{stands}{{{}}}", holds.join(" "))
+    }
+    let Some(document) = document_of(read) else { return String::new() };
+    let pages: Vec<Reader> = read.pages().iter().map(read_through).collect();
+    let all = element(read, &pages, &document);
+    all.strip_prefix("Document{").and_then(|inside| inside.strip_suffix('}')).unwrap_or(&all).to_owned()
 }
 
 fn string(dict: &Dict<'_>, key: &str) -> Option<String> {
@@ -139,6 +241,11 @@ fn spelling(set: &str, said: &str, clusters: &[u32]) -> Item {
     };
     let text = Some(Arc::new(RunText { text: said.into(), clusters: clusters.into() }));
     Item::Glyphs { origin, font, size, color, skew, embolden, glyphs, text }
+}
+
+/// A line of plain text, on the row given.
+fn line(said: &str, row: u8) -> Item {
+    text(&sans(400.0), 12.0, BLACK, Point { x: 10.0, y: 20.0 + 14.0 * f32::from(row) }, said)
 }
 
 /// One page's worth of a PDF, read back.
@@ -371,5 +478,171 @@ fn what_cannot_be_drawn_is_left_out() {
         let read = page_of(items, &images);
 
         assert!(shown(&read.pages()[0]) == expected, "{name} draws nothing and stops nothing");
+    }
+}
+
+#[test]
+fn a_reader_that_cannot_see_the_page_gets_its_parts_in_reading_order() {
+    let item = |depth, numbered, checked| Role::ListItem { depth, numbered, checked };
+    let item_of = |role: Role, id: u64, label: Option<&str>, said: &str| {
+        let label = label.map(|label| part(Role::Label, id + 100, [line(label, 0)])).unwrap_or_default();
+        part(role, id, label.into_iter().chain([line(said, 1)]))
+    };
+    let cell = |header, id, said| part(Role::Cell { header }, id, [line(said, 0)]);
+    let cases: Vec<(&str, Vec<Vec<Item>>, &str)> =
+        vec![
+            (
+                "headings and paragraphs",
+                vec![
+                    part(Role::Heading(1), 1, [line("Title", 0)]),
+                    part(Role::Paragraph, 2, [line("Body goes on", 1)]),
+                    part(Role::Heading(2), 3, [line("More", 3)]),
+                ],
+                "H1{Title} P{Body goes on} H2{More}",
+            ),
+            (
+                "a part inside another",
+                vec![
+                    part(Role::Quote, 1, part(Role::Paragraph, 2, [line("Said", 0)])),
+                    part(
+                        Role::Paragraph,
+                        3,
+                        [line("Area", 1)]
+                            .into_iter()
+                            .chain(part(Role::Formula { alt: "a^2".into() }, 4, [line("a2", 1)]))
+                            .chain([line("here", 1)]),
+                    ),
+                    part(Role::Note, 5, part(Role::Paragraph, 6, [line("Mind", 2)])),
+                    part(Role::Code, 7, [line("let", 3)]),
+                ],
+                "BlockQuote{P{Said}} P{Area Formula[a^2]{a2} here} Div{P{Mind}} Code{let}",
+            ),
+            (
+                "list items that follow one another, and deeper ones",
+                vec![
+                    item_of(item(0, true, None), 1, Some("1."), "One"),
+                    item_of(item(1, false, None), 2, None, "Inner"),
+                    item_of(item(1, false, None), 3, None, "Other"),
+                    item_of(item(0, true, None), 4, Some("2."), "Two"),
+                    item_of(item(0, false, Some(true)), 5, Some("x"), "Done"),
+                    item_of(item(0, false, Some(false)), 6, Some("o"), "Open"),
+                    part(Role::Paragraph, 7, [line("After", 2)]),
+                    item_of(item(0, false, None), 8, None, "Apart"),
+                ],
+                "L:Decimal{LI{Lbl{1.} LBody{One L:Disc{LI{LBody{Inner}} LI{LBody{Other}}}}} LI{Lbl{2.} LBody{Two}}} \
+             L:None{LI{Lbl[\u{2611}]{x} LBody{Done}} LI{Lbl[\u{2610}]{o} LBody{Open}}} P{After} \
+             L:Disc{LI{LBody{Apart}}}",
+            ),
+            (
+                "a figure and a table",
+                vec![
+                    part(
+                        Role::Figure { alt: "A red square".into() },
+                        1,
+                        [fill(10.0, 10.0, 20.0, 20.0, RED)].into_iter().chain(part(Role::Caption, 2, [line("Fig", 2)])),
+                    ),
+                    part(Role::Figure { alt: "".into() }, 3, [fill(40.0, 10.0, 20.0, 20.0, BLUE)]),
+                    part(
+                        Role::Table,
+                        4,
+                        part(Role::Row, 5, [cell(true, 6, "Name"), cell(true, 7, "Age")].concat())
+                            .into_iter()
+                            .chain(part(Role::Row, 8, [cell(false, 9, "Ada"), cell(false, 10, "36")].concat())),
+                    ),
+                ],
+                "Figure[A red square]{* Caption{Fig}} Figure{*} Table{TR{TH{Name} TH{Age}} TR{TD{Ada} TD{36}}}",
+            ),
+        ];
+
+    for (name, parts, expected) in cases {
+        let read = page_of(parts.concat(), &Images::default());
+
+        assert_eq!(structure_of(&read), expected, "{name}");
+    }
+}
+
+#[test]
+fn a_part_that_runs_on_to_the_next_page_is_one_part() {
+    let first = part(Role::Heading(1), 1, [line("Title", 0)]).into_iter().chain(part(
+        Role::Quote,
+        2,
+        part(Role::Paragraph, 3, [line("Starts", 1)]),
+    ));
+    let second = part(
+        Role::Quote,
+        2,
+        [part(Role::Paragraph, 3, [line("ends", 0)]), part(Role::Paragraph, 4, [line("Next", 1)])].concat(),
+    );
+    let pages = [(on_white(first), vec![]), (on_white(second), vec![])];
+    let info = Info { language: "en-GB".into(), ..Info::default() };
+
+    let read = read(written(&pages, &Images::default(), &info).expect("the pages can be written"));
+
+    assert_eq!(structure_of(&read), "H1{Title} BlockQuote{P{Starts ends} P{Next}}");
+    let document = document_of(&read);
+    assert_eq!(document.and_then(|document| string(&document, "Lang")).as_deref(), Some("en-GB"), "the language");
+}
+
+#[test]
+fn what_is_drawn_inside_no_part_is_decoration() {
+    let number = line("Page 1", 5);
+    let parts = part(Role::Paragraph, 1, [line("Body", 0)]);
+    let with_parts = page_of(parts.into_iter().chain([number.clone()]), &Images::default());
+    let without = page_of([line("Body", 0), number], &Images::default());
+
+    assert_eq!(structure_of(&with_parts), "P{Body}", "the page number is no part of the document");
+    assert_eq!(read_through(&with_parts.pages()[0]).decoration, "Page 1", "and is marked as decoration");
+    assert_eq!(structure_of(&without), "", "a list that names no parts says nothing of structure");
+    assert_eq!(read_through(&without.pages()[0]).decoration, "", "and none of it is called decoration");
+    assert_eq!(text_of(&with_parts.pages()[0]), text_of(&without.pages()[0]), "the text is found either way");
+}
+
+#[test]
+fn parts_that_do_not_pair_up_change_nothing_on_the_page() {
+    let words = [line("One", 0), line("Two", 1), line("Three", 2)];
+    let expected = page_of(words.clone(), &Images::default());
+    let open = |id| Item::Open { role: Role::Paragraph, id };
+    let hidden = Item::PushClip { rect: Rect::new(0.0, 0.0, 0.0, 0.0), radius: 0.0 };
+    let [one, two, three] = words.clone();
+    let cases: Vec<(&str, Vec<Item>)> = vec![
+        ("a close with nothing open", vec![Item::Close, one.clone(), two.clone(), three.clone()]),
+        ("a part that never closes", vec![one.clone(), open(1), two.clone(), three.clone()]),
+        ("a part with nothing in it", vec![open(1), Item::Close, one.clone(), two.clone(), three.clone()]),
+        ("a part inside itself", vec![open(1), one.clone(), open(1), two.clone(), Item::Close, three.clone()]),
+        (
+            "a part around a clip's end",
+            vec![
+                Item::PushClip { rect: Rect::new(0.0, 0.0, 240.0, 160.0), radius: 0.0 },
+                open(1),
+                one.clone(),
+                Item::PopClip,
+                two.clone(),
+                Item::Close,
+                three.clone(),
+            ],
+        ),
+        (
+            "a part opened where nothing shows",
+            vec![
+                hidden,
+                open(1),
+                fill(0.0, 0.0, 240.0, 160.0, BLUE),
+                Item::PopClip,
+                one.clone(),
+                two.clone(),
+                three.clone(),
+            ],
+        ),
+        (
+            "parts nested very deep",
+            (0..10_000).map(open).chain(words.clone()).chain((0..10_000).map(|_| Item::Close)).collect(),
+        ),
+    ];
+
+    for (name, items) in cases {
+        let read = page_of(items, &Images::default());
+
+        assert!(shown(&read.pages()[0]) == shown(&expected.pages()[0]), "{name} shows what the plain page shows");
+        assert_eq!(text_of(&read.pages()[0]), "OneTwoThree", "{name} keeps the text");
     }
 }

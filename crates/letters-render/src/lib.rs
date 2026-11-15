@@ -131,6 +131,42 @@ pub enum PathEl {
     Close,
 }
 
+/// What a part of a document is, for a backend that writes its structure, such as a tagged PDF.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Role {
+    /// A heading, 1 for the top level.
+    Heading(u8),
+    Paragraph,
+    /// One item of a list. Items that follow one another make a list, and a deeper item lies under the
+    /// item before it. `checked` is the state of a task's box, which is drawn in the item's [`Role::Label`].
+    ListItem {
+        depth: u8,
+        numbered: bool,
+        checked: Option<bool>,
+    },
+    /// The bullet, number or box that marks its list item.
+    Label,
+    Quote,
+    /// A callout: a note, tip or warning set apart from the text.
+    Note,
+    Code,
+    /// A picture. `alt` says what it shows, and is empty if nobody said.
+    Figure {
+        alt: Arc<str>,
+    },
+    Caption,
+    /// Maths. `alt` is how it was written.
+    Formula {
+        alt: Arc<str>,
+    },
+    Table,
+    Row,
+    Cell {
+        header: bool,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Item {
@@ -190,6 +226,15 @@ pub enum Item {
         radius: f32,
     },
     PopClip,
+    /// Starts a part of the document: what is drawn up to the matching [`Item::Close`] is its content, and
+    /// a part opened inside it lies under it. An `id` that opens again goes on with the same part, as a
+    /// paragraph does on its next page. What is drawn inside no part is decoration. Nothing on screen
+    /// changes.
+    Open {
+        role: Role,
+        id: u64,
+    },
+    Close,
 }
 
 /// Items in paint order, back to front.
@@ -220,7 +265,7 @@ impl DisplayList {
                     origin.x += by.x;
                     origin.y += by.y;
                 }
-                Item::PopClip => {}
+                Item::PopClip | Item::Open { .. } | Item::Close => {}
             }
         }
     }
