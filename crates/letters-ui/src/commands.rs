@@ -99,6 +99,14 @@ pub(crate) enum Act {
     Misspelling {
         back: bool,
     },
+    /// Shows the bar that finds text, with the keyboard in its field.
+    Find,
+    /// Shows the bar that finds text with the line that replaces what is found.
+    Replace,
+    /// Goes to the next place the text was found at, or to the one before.
+    FindStep {
+        back: bool,
+    },
     /// Shows the palette itself. It is not one of its own commands.
     Palette,
 }
@@ -142,7 +150,7 @@ const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> E
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 87] = [
+pub(crate) static ENTRIES: [Entry; 91] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -213,6 +221,10 @@ pub(crate) static ENTRIES: [Entry; 87] = [
     run("Edit", "Select all", "", Command::SelectAll),
     entry("Edit", "Next spelling mistake", "misspelled word typo check", Act::Misspelling { back: false }),
     entry("Edit", "Previous spelling mistake", "misspelled word typo check", Act::Misspelling { back: true }),
+    entry("Edit", "Find", "search look for text", Act::Find),
+    entry("Edit", "Find and replace", "search substitute change text", Act::Replace),
+    entry("Edit", "Find next", "search result", Act::FindStep { back: false }),
+    entry("Edit", "Find previous", "search result", Act::FindStep { back: true }),
     entry("View", "Styles panel", "show hide fonts page", Act::Panel(Panel::Styles)),
     entry("View", "Notes panel", "show hide comments", Act::Panel(Panel::Notes)),
     entry("View", "History", "versions earlier before rewind restore", Act::History),
@@ -234,9 +246,11 @@ pub(crate) static ENTRIES: [Entry; 87] = [
 
 const PRIMARY: Modifiers = Modifiers { primary: true, shift: false, alt: false };
 const PRIMARY_SHIFT: Modifiers = Modifiers { primary: true, shift: true, alt: false };
+const PRIMARY_ALT: Modifiers = Modifiers { primary: true, shift: false, alt: true };
 
-/// The keys the window binds itself, for what is no command of the editor's.
-static KEYS: [(KeyEvent, Act); 8] = [
+/// The keys the window binds itself, for what is no command of the editor's. Where a command has two, the
+/// second is the one a Mac's menus write: there the system keeps Cmd with H to hide the application.
+static KEYS: [(KeyEvent, Act); 13] = [
     (
         KeyEvent { key: Key::F(7), mods: Modifiers { primary: false, shift: false, alt: false } },
         Act::Misspelling { back: false },
@@ -251,6 +265,11 @@ static KEYS: [(KeyEvent, Act); 8] = [
     (KeyEvent { key: Key::Char(','), mods: PRIMARY }, Act::Settings),
     (KeyEvent { key: Key::Char('s'), mods: PRIMARY }, Act::Save),
     (KeyEvent { key: Key::Char('s'), mods: PRIMARY_SHIFT }, Act::SaveCopy),
+    (KeyEvent { key: Key::Char('f'), mods: PRIMARY }, Act::Find),
+    (KeyEvent { key: Key::Char('h'), mods: PRIMARY }, Act::Replace),
+    (KeyEvent { key: Key::Char('f'), mods: PRIMARY_ALT }, Act::Replace),
+    (KeyEvent { key: Key::Char('g'), mods: PRIMARY }, Act::FindStep { back: false }),
+    (KeyEvent { key: Key::Char('g'), mods: PRIMARY_SHIFT }, Act::FindStep { back: true }),
 ];
 
 /// The command that does `act`, for its name where something other than the palette offers it.
@@ -272,7 +291,10 @@ pub(crate) fn bound(event: &KeyEvent) -> Option<&'static Act> {
 pub(crate) fn shortcut(act: &Act, keymap: &Keymap, mac: bool) -> Option<String> {
     let key = match act {
         Act::Run(command) => keymap.key(command),
-        act => KEYS.iter().find(|(_, bound)| bound == act).map(|(key, _)| key),
+        act => {
+            let mut keys = KEYS.iter().filter(|(_, bound)| bound == act).map(|(key, _)| key);
+            if mac { keys.next_back() } else { keys.next() }
+        }
     };
     key.map(|key| chord(key, mac))
 }
@@ -512,11 +534,17 @@ mod tests {
             (Act::Save, Some("Ctrl+S")),
             (Act::SaveCopy, Some("Ctrl+Shift+S")),
             (Act::Palette, Some("Ctrl+Shift+P")),
+            (Act::Find, Some("Ctrl+F")),
+            (Act::Replace, Some("Ctrl+H")),
+            (Act::FindStep { back: true }, Some("Ctrl+Shift+G")),
             (Act::Share, None),
         ];
         for (act, key) in cases {
             assert_eq!(shortcut(&act, &keymap, false).as_deref(), key, "{act:?}");
         }
+        // A Mac hides the application on Cmd with H, so its menus write the other key.
+        assert_eq!(shortcut(&Act::Replace, &keymap, true).as_deref(), Some("\u{2325}\u{2318}F"));
+        assert_eq!(shortcut(&Act::Find, &keymap, true).as_deref(), Some("\u{2318}F"));
         for (key, act) in &KEYS {
             assert_eq!(bound(key), Some(act));
             assert!(keymap.command(key).is_none(), "{key:?} is the window's to bind");

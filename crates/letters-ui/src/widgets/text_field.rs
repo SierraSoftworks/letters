@@ -23,6 +23,7 @@ pub struct TextField<M> {
     disabled: bool,
     on_input: Option<Rc<dyn Fn(String) -> M>>,
     on_submit: Option<M>,
+    on_submit_back: Option<M>,
     on_leave: Option<M>,
     on_cancel: Option<M>,
 }
@@ -41,6 +42,7 @@ impl<M> TextField<M> {
             disabled: false,
             on_input: None,
             on_submit: None,
+            on_submit_back: None,
             on_leave: None,
             on_cancel: None,
         }
@@ -91,6 +93,13 @@ impl<M> TextField<M> {
         self
     }
 
+    /// Sent when Enter is pressed with Shift held, for a field whose Enter steps on and can step back.
+    /// Without it, Shift changes nothing about Enter.
+    pub fn on_submit_back(mut self, message: M) -> Self {
+        self.on_submit_back = Some(message);
+        self
+    }
+
     /// Sent when focus leaves the field, or the popover it is in closes under it: the moment to take or drop
     /// what was typed.
     pub fn on_leave(mut self, message: M) -> Self {
@@ -135,6 +144,7 @@ impl<M> From<TextField<M>> for Element<M> {
             style,
             on_input: field.on_input,
             on_submit: field.on_submit,
+            on_submit_back: field.on_submit_back,
             on_leave: field.on_leave,
             on_cancel: field.on_cancel,
         })

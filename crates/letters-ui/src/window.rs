@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
 use letters_editor::{
-    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Picture, Platform, Spot,
+    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Picture, Platform, Seek, Spot,
     TableEdit,
 };
 use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax, Uncovered};
@@ -33,6 +33,7 @@ use crate::copying::{self, Copy, CopyFormat, Copying};
 use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::figures::{self, Grip, Moving, Resizing};
+use crate::finding::{self, Find, Finding};
 use crate::highlight;
 use crate::history::{self, History, Historying, Naming};
 use crate::icon::{self, Icon};
@@ -222,6 +223,8 @@ pub enum Message {
     Safe(Safely),
     /// What is asked of the command palette.
     Commands(Commanding),
+    /// What is asked of the bar that finds and replaces.
+    Find(Finding),
     /// What is asked of Print view.
     Print(Printing),
     /// What is asked of the history.
@@ -826,6 +829,7 @@ pub struct EditorApp {
     maths: Maths,
     insert: Insert,
     commands: Commands,
+    find: Find,
     /// Print view, while it shows in place of the page.
     printing: Option<Print>,
     /// The history, while one of the document's versions shows in place of the page.
@@ -912,6 +916,7 @@ impl EditorApp {
             maths: Maths::default(),
             insert: Insert::default(),
             commands: Commands::default(),
+            find: Find::default(),
             printing: None,
             history: None,
             zone: 0,
@@ -1449,6 +1454,10 @@ impl EditorApp {
         if self.dragging || !self.margin.offers() || self.commands.open() {
             return None;
         }
+        // A place that was found is selected to be looked at, not to have something made of it.
+        if self.find.current(Some(selection)).is_some() {
+            return None;
+        }
         notes::passage(self.editor.doc(), selection)?;
         let lines = self.layout.selection_in(selection, viewport);
         let (first, last) = (lines.first()?, lines.last()?);
@@ -1657,6 +1666,15 @@ impl EditorApp {
                 fits.then(|| Message::Review(asked.clone()))?
             }
             Act::Palette => (!self.carded()).then_some(Message::Commands(Commanding::Toggle))?,
+            // Text is found on the page, so only while the page shows.
+            Act::Find | Act::Replace => {
+                let open = Finding::Open { replace: *act == Act::Replace };
+                (!self.carded() && !self.away()).then_some(Message::Find(open))?
+            }
+            Act::FindStep { back } => {
+                let steps = self.find.steps() && !self.carded() && !self.away();
+                steps.then_some(Message::Find(Finding::Step { back: *back }))?
+            }
         };
         Some(message)
     }
@@ -1958,6 +1976,47 @@ impl EditorApp {
         }
     }
 
+    /// Does what the bar that finds and replaces asked.
+    fn finding(&mut self, asked: Finding, platform: &mut dyn Platform) {
+        match self.find.update(asked, &self.editor) {
+            Some(finding::Does::Go(to)) => self.go(to),
+            Some(finding::Does::Run(command)) => {
+                let one = matches!(&command, Command::Replace { only: Some(_), .. });
+                let held = self.find.current(self.editor.selection()).is_some();
+                self.edit(platform, |editor, platform| editor.run(command, platform));
+                // After one place is replaced, the next is the one to look at. After all of them, the one
+                // that was selected to be looked at is let go of.
+                let start = self.editor.selection().map(|selection| Selection::caret(selection.anchor.clone()));
+                let next = if one { self.find.seek(&self.editor, Seek::Here) } else { start.filter(|_| held) };
+                if let Some(next) = next {
+                    self.go(next);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Selects a place the text was found at and brings it into view, clear of the bar that found it.
+    fn go(&mut self, to: Selection) {
+        self.editor.select(to);
+        self.mark();
+        self.unpoint();
+        // Twice, since laying out what comes into view can move the place.
+        for _ in 0..2 {
+            let head = self.editor.selection().map(|selection| &selection.head);
+            let Some(line) = head.and_then(|head| self.layout.caret(head)) else { break };
+            let top = self.down(line.y) + TOP;
+            let margin = GUTTER.min(self.height / 4.0);
+            let cover = self.find.cover().min(self.height / 2.0);
+            let seen = self.scroll + cover + margin..=self.scroll + self.height - margin;
+            if !seen.contains(&top) || !seen.contains(&(top + line.height)) {
+                // A place out of view is brought a third of the way down the page.
+                self.scroll = (top - self.height / 3.0).clamp(0.0, self.max_scroll());
+            }
+            self.layout.settle(self.viewport(), 0);
+        }
+    }
+
     /// Tells the shell again of each linked picture that does not show, since what it held back may load
     /// now. With `freed` the document has left safe mode, which no longer holds any of them.
     fn ask_again(&mut self, freed: bool) {
@@ -2098,6 +2157,7 @@ impl EditorApp {
             let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
             self.spelling.edited(change, self.editor.doc(), caret, &mut self.layout);
             self.margin.edited(self.editor.model());
+            self.find.refresh(&self.editor);
         }
         if change.document {
             self.spelling.reworded(None, self.editor.doc(), &mut self.layout);
@@ -2875,6 +2935,11 @@ impl EditorApp {
         }
         for (passage, open) in self.margin.commented() {
             notes::mark(&self.layout.selection_in(&passage, viewport), open, self.scheme, &mut list);
+        }
+        // Every place the find bar found, but for the one that is selected.
+        let band = |block: &BlockId| self.layout.band(block);
+        for found in self.find.shown(selection, band, (viewport.y, viewport.y + viewport.height)) {
+            finding::mark(&self.layout.selection_in(found, viewport), self.scheme, &mut list);
         }
         match &sheet {
             Some((_, rect)) => list.items.push(maths::tint(*rect, self.scheme)),
@@ -3989,6 +4054,7 @@ impl EditorApp {
             Message::Alt(asked) => self.altering(asked, platform),
             Message::Note(asked) => self.noting(asked, platform),
             Message::Commands(asked) => self.commanding(asked, platform),
+            Message::Find(asked) => self.finding(asked, platform),
             Message::Print(asked) => self.print(asked, platform),
             Message::History(asked) => self.historying(asked, platform),
             Message::Review(asked) => self.reviewing(asked, platform),
@@ -4132,6 +4198,11 @@ impl App for EditorApp {
             (false, false) => self.page(room),
         };
         let chapters = if away { None } else { self.chapters() };
+        // The find bar hangs under the bars, at the end of the page area.
+        let find = (self.find.open() && !away && !self.carded()).then(|| {
+            let end = room.width - if chapters.is_some() { chapters_width() } else { 0.0 };
+            self.find.view(self.find.current(self.editor.selection()), bar, end, room.width)
+        });
         let page = Element::row().grow(1.0).child(page).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
@@ -4141,7 +4212,9 @@ impl App for EditorApp {
             self.commands.view(&offers, keymap, self.mac, bar, window)
         });
         let over = over.chain(commands);
-        let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).children(self.safe.bar());
+        // It comes first, so that whatever else opens lies over it and is the first that Escape puts away.
+        let all = Element::column().bg(tokens::BG).fg(tokens::FG).children(find);
+        let all = all.child(self.bar()).children(self.safe.bar());
         let all = all.children(conflicts).child(body).children(strip).children(over);
         if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
     }

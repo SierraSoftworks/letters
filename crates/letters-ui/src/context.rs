@@ -187,6 +187,8 @@ fn icon_of(act: &Act) -> Option<Icon> {
         Act::Embed | Act::EmbedAll => icon::DOWNLOAD,
         Act::Misspelling { back: false } => icon::CHEVRON_DOWN,
         Act::Misspelling { back: true } => icon::CHEVRON_UP,
+        Act::Find => icon::TEXT_SEARCH,
+        Act::Replace => icon::REPLACE,
         Act::Palette => icon::SEARCH,
         _ => return None,
     })
@@ -418,7 +420,7 @@ impl Context {
         if turns {
             menu = menu.item(MenuItem::new("Turn into").icon(icon::PILCROW).submenu(kinds));
         }
-        for item in about.items(&[run(Command::PastePlain), run(Command::SelectAll)]) {
+        for item in about.items(&[run(Command::PastePlain), run(Command::SelectAll), Act::Find, Act::Replace]) {
             menu = menu.item(item);
         }
         if let Some(palette) = (about.asked)(&Act::Palette) {

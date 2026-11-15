@@ -11,6 +11,8 @@ pub const ARROW_LEFT_RIGHT: Icon = Icon::new("M8 3 4 7l4 4M4 7h16M16 21l4-4-4-4M
 pub const BASELINE: Icon = Icon::new("M4 20h16M6 16l6-12 6 12M8 12h8");
 /// `bold`
 pub const BOLD: Icon = Icon::new("M6 12h9a4 4 0 010 8H7a1 1 0 01-1-1V5a1 1 0 011-1h7a4 4 0 010 8");
+/// `case-sensitive`
+pub const CASE_SENSITIVE: Icon = Icon::new("M2 16l4.039-9.69a.5.5 0 0 1 .923 0L11 16M22 9v7M3.304 13h6.392M15 12.5a3.5 3.5 0 1 0 7 0a3.5 3.5 0 1 0 -7 0");
 /// `check`
 pub const CHECK: Icon = Icon::new("M20 6 9 17l-5-5");
 /// `chevron-down`
@@ -117,6 +119,10 @@ pub const PRINTER: Icon = Icon::new("M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2
 pub const REDO_2: Icon = Icon::new("M15 14l5-5-5-5M20 9H9.5A5.5 5.5 0 0 0 4 14.5A5.5 5.5 0 0 0 9.5 20H13");
 /// `refresh-cw`
 pub const REFRESH_CW: Icon = Icon::new("M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8M21 3v5h-5M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16M8 16H3v5");
+/// `regex`
+pub const REGEX: Icon = Icon::new("M17 3v10M12.67 5.5l8.66 5M12.67 10.5l8.66-5M9 17a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v2a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2v-2z");
+/// `replace`
+pub const REPLACE: Icon = Icon::new("M14 4a1 1 0 0 1 1-1M15 10a1 1 0 0 1-1-1M21 4a1 1 0 0 0-1-1M21 9a1 1 0 0 1-1 1M3 7l3 3 3-3M6 10V5a2 2 0 0 1 2-2h2M4 14h5a1 1 0 0 1 1 1v5a1 1 0 0 1 -1 1h-5a1 1 0 0 1 -1 -1v-5a1 1 0 0 1 1 -1z");
 /// `rotate-ccw`
 pub const ROTATE_CCW: Icon = Icon::new("M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8M3 3v5h5");
 /// `save`
@@ -157,6 +163,8 @@ pub const TAG: Icon = Icon::new(
 );
 /// `text-quote`
 pub const TEXT_QUOTE: Icon = Icon::new("M17 5H3M21 12H8M21 19H8M3 12v7");
+/// `text-search`
+pub const TEXT_SEARCH: Icon = Icon::new("M21 5H3M10 12H3M10 19H3M14 15a3 3 0 1 0 6 0a3 3 0 1 0 -6 0M21 19l-1.9-1.9");
 /// `trash-2`
 pub const TRASH_2: Icon = Icon::new("M10 11v6M14 11v6M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2");
 /// `type`
@@ -169,6 +177,8 @@ pub const UNDO_2: Icon = Icon::new("M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5
 pub const UPLOAD: Icon = Icon::new("M12 3v12M17 8l-5-5-5 5M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4");
 /// `users`
 pub const USERS: Icon = Icon::new("M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M16 3.128a4 4 0 0 1 0 7.744M22 21v-2a4 4 0 0 0-3-3.87M5 7a4 4 0 1 0 8 0a4 4 0 1 0 -8 0");
+/// `whole-word`
+pub const WHOLE_WORD: Icon = Icon::new("M4 12a3 3 0 1 0 6 0a3 3 0 1 0 -6 0M10 9v6M14 12a3 3 0 1 0 6 0a3 3 0 1 0 -6 0M14 7v8M22 17v1c0 .5-.5 1-1 1H3c-.5 0-1-.5-1-1v-1");
 /// `x`
 pub const X: Icon = Icon::new("M18 6 6 18M6 6l12 12");
 /// `arrow-right`

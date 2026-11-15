@@ -958,7 +958,8 @@ impl<A: App> Ui<A> {
             // A field keeps no history of its own, and the document's must not move under it.
             (Key::Char('z' | 'y'), _) if mods.primary => None,
             (Key::Enter, _) if !mods.primary && !mods.alt => {
-                let Some(message) = input.on_submit.clone() else { return false };
+                let back = input.on_submit_back.clone().filter(|_| mods.shift);
+                let Some(message) = back.or_else(|| input.on_submit.clone()) else { return false };
                 self.queue.push(message);
                 return true;
             }
