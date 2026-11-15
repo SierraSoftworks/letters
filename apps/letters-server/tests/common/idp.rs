@@ -66,6 +66,8 @@ pub enum Quirk {
     OtherParty,
     /// The token holds the subject alone, and the rest is told at the userinfo address.
     ClaimsOnRequest,
+    /// The token holds everything but the person's name, as Tailscale's provider has it.
+    NameOnRequest,
     /// The secret is only read from the form.
     SecretInForm,
 }
@@ -232,9 +234,9 @@ async fn token(
     let quirk = inner.quirk;
     let access = format!("access-{}", inner.made);
     let mut claims = grant.claims.as_object().unwrap().clone();
-    if quirk == Quirk::ClaimsOnRequest {
+    if matches!(quirk, Quirk::ClaimsOnRequest | Quirk::NameOnRequest) {
         inner.told.insert(access.clone(), Value::Object(claims.clone()));
-        claims.retain(|claim, _| claim == "sub");
+        claims.retain(|claim, _| claim == "sub" || (quirk == Quirk::NameOnRequest && claim != "name"));
     }
     claims.insert(
         "iss".into(),

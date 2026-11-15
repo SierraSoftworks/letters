@@ -20,6 +20,7 @@ server that adds identity, sharing and sync without owning any content.
 - `apps/letters`: the desktop app.
 - `apps/letters-web`: the browser shell, which paints the same engine on a canvas.
 - `apps/letters-server`: the server, which shares folders of documents with the people an identity provider names.
+  [Letters on a tailnet](apps/letters-server/docs/tailscale.md) sets one up with Tailscale as that provider.
 - `fuzz`: the fuzz targets, which a nightly workflow runs and files issues from.
 
 ## Working on it

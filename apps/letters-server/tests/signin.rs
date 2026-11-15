@@ -94,6 +94,7 @@ async fn a_person_is_read_from_the_claims_the_settings_name() {
             ("grace", "Grace", true),
         ),
         ("", Quirk::ClaimsOnRequest, ben(), ("ben", "Ben Example", true)),
+        ("", Quirk::NameOnRequest, ben(), ("ben", "Ben Example", true)),
         ("", Quirk::SecretInForm, ben(), ("ben", "Ben Example", true)),
     ];
     for (i, (settings, quirk, claims, (username, name, family))) in cases.into_iter().enumerate() {
