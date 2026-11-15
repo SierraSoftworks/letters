@@ -181,6 +181,14 @@ pub enum Command {
     EditCaption,
     /// Steps out of a caption, as Esc does: back to the picture it stands under.
     LeaveCaption,
+    /// Keeps a linked picture in the document: the figure shows `picture` from the file's assets in place
+    /// of the address it was loaded from, as wide as it was and as high as the picture's own shape makes
+    /// that. The figure is named, since the bytes may arrive when the caret is elsewhere. Nothing happens
+    /// when the figure is gone or already kept, or the bytes are no picture Letters shows.
+    EmbedFigure {
+        figure: BlockId,
+        picture: Picture,
+    },
     /// Puts a reference to a numbered figure or gallery at the caret, in place of the words typed for
     /// it, which [`Editor::referring`] tells of, or of the selection. It reads as the figure's label and
     /// follows the figure's number.
@@ -503,6 +511,10 @@ impl Editor {
     /// Whether a command has anything to act on, so that a key it is bound to can fall through when not, and
     /// a menu can show what is of no use here.
     pub fn applies(&self, command: &Command) -> bool {
+        if let Command::EmbedFigure { figure, picture } = command {
+            // The figure is named, so the caret has no say.
+            return self.embeddable(figure, picture);
+        }
         let Some(caret) = &self.caret else {
             return match command {
                 Command::Undo => self.can_undo(),
@@ -588,6 +600,7 @@ impl Editor {
             }
             Command::EditCaption => self.edit_caption(platform),
             Command::LeaveCaption => self.leave_caption(),
+            Command::EmbedFigure { figure, picture } => self.embed_figure(&figure, &picture, platform),
             Command::TakeReference(to) => self.take_reference(&to),
             Command::DismissReference => self.dismiss_reference(),
             Command::Undo => _ = self.undo_step(),

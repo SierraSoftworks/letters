@@ -36,6 +36,14 @@ fn extension(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// The name a picture's bytes are kept under among the file's assets, which is the same for the same
+/// bytes. `None` for bytes that are no picture Letters can show.
+fn asset_name(bytes: &[u8]) -> Option<String> {
+    let extension = extension(bytes)?;
+    let hash: String = Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+    Some(format!("assets/{hash}.{extension}"))
+}
+
 /// The size in points to show a picture of so many pixels at: three quarters of a point to the pixel, as
 /// on a web page, and no wider than `widest`.
 fn fitted(width: u32, height: u32, widest: f32) -> (f32, f32) {
@@ -157,12 +165,34 @@ impl Editor {
         });
     }
 
+    /// Whether a figure still shows its picture from an address, and `picture` can be kept in its place.
+    pub(crate) fn embeddable(&self, figure: &BlockId, picture: &Picture) -> bool {
+        let linked = |block: &Block| matches!(block.kind, BlockKind::Figure { asset: None, .. });
+        self.block(figure).is_some_and(linked) && extension(&picture.bytes).is_some()
+    }
+
+    /// Keeps a linked picture's bytes in the file, and has its figure name them in place of the address.
+    pub(crate) fn embed_figure(&mut self, figure: &BlockId, picture: &Picture, platform: &mut dyn Platform) {
+        let Some(mut kind) = self.block(figure).map(|block| block.kind.clone()) else { return };
+        let (BlockKind::Figure { asset: asset @ None, src, width, height, .. }, Some(name)) =
+            (&mut kind, asset_name(&picture.bytes))
+        else {
+            return;
+        };
+        platform.store_asset(&name, &picture.bytes);
+        (*asset, *src) = (Some(name), None);
+        // The size stored with a link may be a guess. The picture's own shape is not, so it sets the height
+        // for the width the figure is shown at.
+        if picture.width > 0 && picture.height > 0 {
+            *height = (*width * picture.height as f32 / picture.width as f32).max(1.0);
+        }
+        self.apply(vec![Op::SetKind { block: figure.clone(), kind }]);
+    }
+
     /// Hands a picture's bytes to the shell under a name made from them, and makes the figure that shows
     /// it. `None` for bytes that are no picture Letters can show.
     fn figure(&self, picture: &Picture, platform: &mut dyn Platform) -> Option<Block> {
-        let extension = extension(&picture.bytes)?;
-        let hash: String = Sha256::digest(&picture.bytes).iter().map(|byte| format!("{byte:02x}")).collect();
-        let asset = format!("assets/{hash}.{extension}");
+        let asset = asset_name(&picture.bytes)?;
         platform.store_asset(&asset, &picture.bytes);
         let page = &self.model.style().page;
         let (width, height) = fitted(picture.width, picture.height, page.width - page.margin_left - page.margin_right);

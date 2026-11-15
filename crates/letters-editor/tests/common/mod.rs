@@ -7,7 +7,8 @@
 //! link, `⟦text⟧(id)` is a reference to the block with that id, `⏎` is a line break, `|` is the caret and `^`
 //! the other end of a selection. A backslash makes the next character text.
 //!
-//! A figure's text is its caption. `fig#` is numbered, and a `*` after the kind says its picture is selected.
+//! A figure's text is its caption. `fig#` is numbered, `fig@` shows a picture that is still at an address,
+//! and a `*` after the kind says its picture is selected.
 //! `g> ` puts a figure or a caption in a gallery, and `g#> ` in a numbered one. A cell is `td`, or `th` in a
 //! row that heads its table, after the row it is in: `r1> `, `r2> ` and so on. Consecutive rows are one table.
 #![allow(dead_code)]
@@ -308,6 +309,12 @@ pub fn picture(id: &str, numbered: bool) -> BlockKind {
     BlockKind::Figure { asset, src: None, alt: String::new(), width: 240.0, height: 160.0, numbered }
 }
 
+/// The figure that the notation's `fig@` stands for.
+fn linked(id: &str, numbered: bool) -> BlockKind {
+    let src = Some(format!("https://pictures.example/{id}.png"));
+    BlockKind::Figure { asset: None, src, alt: String::new(), width: 240.0, height: 160.0, numbered }
+}
+
 fn holding(id: String, kind: BlockKind, parts: Vec<Block>) -> Block {
     Block { body: Body::Blocks(parts), ..Block::new(id.as_str(), kind) }
 }
@@ -354,6 +361,8 @@ pub fn read(state: &str) -> (Document, Option<Selection>, Option<BlockId>) {
             "cap" => BlockKind::Caption,
             "fig" => picture(&name, false),
             "fig#" => picture(&name, true),
+            "fig@" => linked(&name, false),
+            "fig@#" => linked(&name, true),
             "td" | "th" => BlockKind::TableCell,
             "h1" | "h2" | "h3" | "h4" => BlockKind::Heading { level: kind[1..].parse().expect("a heading level") },
             "ul" => list(ListKind::Bullet),
@@ -516,8 +525,9 @@ fn line(block: &Block, selection: Option<&Selection>, picture: Option<&BlockId>)
     let selection = selection.filter(|_| !on);
     let (indent, kind) = match &block.kind {
         BlockKind::Caption => (0, "cap".to_owned()),
-        BlockKind::Figure { numbered, .. } => {
-            (0, format!("fig{}{}", if *numbered { "#" } else { "" }, if on { "*" } else { "" }))
+        BlockKind::Figure { asset, numbered, .. } => {
+            let flags = [(asset.is_none(), "@"), (*numbered, "#"), (on, "*")];
+            (0, format!("fig{}", flags.iter().filter(|(set, _)| *set).map(|(_, flag)| *flag).collect::<String>()))
         }
         BlockKind::TableCell => (0, "td".to_owned()),
         BlockKind::Paragraph => (0, "p".to_owned()),
@@ -605,6 +615,8 @@ pub enum Action {
     MoveFigure(usize, bool, bool),
     /// Refers to a block, counted in document order and wrapped into range.
     Refer(usize),
+    /// Keeps a picture in the document for a block, counted the same way.
+    Embed(usize),
 }
 
 pub fn action() -> impl Strategy<Value = Action> {
@@ -749,6 +761,7 @@ pub fn action() -> impl Strategy<Value = Action> {
             .prop_map(|(count, spot)| Action::Figures(count, spot)),
         1 => (0..40usize, any::<bool>(), any::<bool>()).prop_map(|(at, beside, after)| Action::MoveFigure(at, beside, after)),
         1 => (0..40usize).prop_map(Action::Refer),
+        1 => (0..40usize).prop_map(Action::Embed),
     ]
 }
 
@@ -768,6 +781,12 @@ pub fn perform(editor: &mut Harness, action: &Action) {
         Action::MoveFigure(at, beside, after) => {
             if let Some(spot) = spot_by(editor, *at, *beside, *after) {
                 editor.run(Command::MoveFigure(spot));
+            }
+        }
+        Action::Embed(at) => {
+            let ids: Vec<_> = editor.editor.doc().walk().map(|block| block.id.clone()).collect();
+            if let Some(id) = ids.get(at % ids.len().max(1)) {
+                editor.run(Command::EmbedFigure { figure: id.clone(), picture: png(*at as u8, 400, 300) });
             }
         }
         Action::Refer(at) => {
@@ -873,4 +892,4 @@ fn referred(block: &Block, offset: usize) -> bool {
 }
 
 /// A document with every kind of block and mark, for scripts to run on.
-pub const SAMPLE: &str = "h1 A *title*|\np Some **bold** and [linked](https://a.example) text, ünïcödé 👩‍👧.\nul one\n  todo two\nhr\n> p quoted\n> p lines\ntip> p a tip\ncode:rust fn main() {⏎    body();⏎}\nfig# Boats at sea\ng> fig\ng> fig\ng> cap Two more\nr1> th Boat\nr1> th Length\nr2> td Skiff\nr2> td 4 m\np\np See ⟦Figure 1⟧(b12) for more.";
+pub const SAMPLE: &str = "h1 A *title*|\np Some **bold** and [linked](https://a.example) text, ünïcödé 👩‍👧.\nul one\n  todo two\nhr\n> p quoted\n> p lines\ntip> p a tip\ncode:rust fn main() {⏎    body();⏎}\nfig# Boats at sea\ng> fig\ng> fig\ng> cap Two more\nr1> th Boat\nr1> th Length\nr2> td Skiff\nr2> td 4 m\np\np See ⟦Figure 1⟧(b12) for more.\nfig@ A linked one";

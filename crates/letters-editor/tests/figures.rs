@@ -4,7 +4,7 @@ mod common;
 
 use common::Do::{K, T};
 use common::{Do, Harness, canon, check, clip, png};
-use letters_editor::{Clip, Command, Keymap, Spot};
+use letters_editor::{Clip, Command, Keymap, Picture, Spot};
 use letters_model::{Block, BlockId, BlockKind};
 
 /// How a test names a spot, which the notation has no ids for.
@@ -256,5 +256,54 @@ fn pictures_on_the_clipboard_are_pasted_as_figures() {
         editor.platform.clip = Some(pictured(text));
         editor.key("Mod+v");
         assert_eq!(editor.state(), canon(after), "{text:?} with a picture pasted in {before:?}");
+    }
+}
+
+#[test]
+fn a_linked_picture_is_kept_in_the_document_by_its_bytes() {
+    // The caret is elsewhere each time, and stays there. A linked figure is 240 points wide, and its height
+    // follows the picture's own shape when the picture tells its size.
+    let cases = [
+        ("p one|\nfig@ Boats\np two", (400, 300), "p one|\nfig Boats\np two", 180.0),
+        ("g> fig@\ng> fig\np one|", (100, 200), "g> fig\ng> fig\np one|", 480.0),
+        ("p one|\nfig@# Boats", (0, 0), "p one|\nfig# Boats", 160.0),
+    ];
+    for (before, (wide, high), after, tall) in cases {
+        let mut editor = Harness::new(before);
+        let linked = figures(&editor)[0].id.clone();
+        let picture = Picture { width: wide, height: high, ..png(1, 400, 300) };
+        let command = Command::EmbedFigure { figure: linked, picture: picture.clone() };
+        assert!(editor.editor.applies(&command), "a linked picture can be kept, in {before:?}");
+        editor.run(command.clone());
+        assert_eq!(editor.state(), canon(after), "keeping the picture of {before:?}");
+
+        let BlockKind::Figure { asset: Some(asset), src: None, width, height, .. } = figures(&editor)[0].kind.clone()
+        else {
+            panic!("the figure names an asset and no address, in {before:?}")
+        };
+        assert_eq!(editor.platform.assets.get(&asset), Some(&picture.bytes), "the bytes are kept under its name");
+        assert_eq!((width, height), (240.0, tall), "a picture of {wide} by {high} pixels in {before:?}");
+        assert!(!editor.editor.applies(&command), "a picture that is kept is not kept again");
+        undone(&mut editor, before, "keeping a picture");
+    }
+}
+
+#[test]
+fn nothing_is_kept_without_a_linked_figure_and_a_picture() {
+    let text = Picture { bytes: b"not a picture".to_vec(), mime: "text/plain".into(), width: 1, height: 1 };
+    let cases = [
+        // A figure that is kept already, no figure at all, a block that is no figure, and bytes that are no picture.
+        ("p one|\nfig Boats", "b2", png(1, 400, 300)),
+        ("p one|\nfig@ Boats", "gone", png(1, 400, 300)),
+        ("p one|\nfig@ Boats", "b1", png(1, 400, 300)),
+        ("p one|\nfig@ Boats", "b2", text),
+    ];
+    for (state, figure, picture) in cases {
+        let mut editor = Harness::new(state);
+        let command = Command::EmbedFigure { figure: BlockId::new(figure), picture };
+        assert!(!editor.editor.applies(&command), "keeping a picture for {figure} in {state:?}");
+        editor.run(command);
+        assert_eq!(editor.state(), canon(state), "keeping a picture for {figure} in {state:?}");
+        assert!(editor.platform.assets.is_empty(), "nothing is handed over for {figure} in {state:?}");
     }
 }
