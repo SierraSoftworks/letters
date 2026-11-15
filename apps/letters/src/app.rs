@@ -493,9 +493,9 @@ struct DocWindow {
     /// Linked pictures that were asked for before the file said which document this is, which decides
     /// what it may fetch.
     links: Vec<(String, Link)>,
-    /// The files of linked pictures that are held narrower than they are, by their addresses, so that a
-    /// sharper screen does not ask their servers again.
-    linked: BTreeMap<String, Vec<u8>>,
+    /// The files of the linked pictures the page shows, by their addresses, so that a sharper screen, a
+    /// print or a PDF copy does not ask their servers again.
+    linked: copies::Linked,
     /// The pictures the view was handed, and how wide each could be held at most.
     held: BTreeMap<String, u32>,
 }
@@ -710,11 +710,12 @@ impl DocWindow {
             None if self.busy() => self.awaited.push(name),
             None => self.view.set_image(&name, None),
             Some(image) => {
-                // A linked picture that is held whole has nothing sharper to give, so its file is let go.
-                let whole = image.width() < within && self.linked.remove(&name).is_some();
+                // A picture that is held whole has nothing sharper to give.
+                let whole = image.width() < within && self.linked.contains_key(&name);
                 self.view.set_image(&name, Some(image));
-                if !whole {
-                    self.held.insert(name, within);
+                match whole {
+                    true => drop(self.held.remove(&name)),
+                    false => drop(self.held.insert(name, within)),
                 }
             }
         }
@@ -1792,12 +1793,14 @@ impl App {
                 (copies::ending(chosen, format), true)
             }
         };
+        // Only a PDF shows a linked picture, and only one the window has loaded.
+        let linked = if format == CopyFormat::Pdf { window.linked.clone() } else { copies::Linked::new() };
         let proxy = self.proxy.clone();
         self.copies.retain(|copy| !copy.is_finished());
         self.copies.push(thread::spawn(move || {
             let written = match version {
-                Some(version) => copies::write_version(&source, version, &output, format, replace),
-                None => copies::write(&source, &output, format, replace),
+                Some(version) => copies::write_version(&source, version, &output, format, replace, &linked),
+                None => copies::write(&source, &output, format, replace, &linked),
             };
             let _ = proxy.send_event(Event::Copied(id, output, written));
         }));
@@ -1823,11 +1826,14 @@ impl App {
             (Ok(()), Some(file)) => file.to_owned(),
         };
         window.printing = true;
-        let (proxy, title) = (self.proxy.clone(), window.name());
+        // The paper shows the linked pictures the window has loaded, and no other.
+        let (proxy, title, linked) = (self.proxy.clone(), window.name(), window.linked.clone());
         self.copies.retain(|copy| !copy.is_finished());
         self.copies.push(thread::spawn(move || {
             let file = fs::read(&source).map_err(|error| error.to_string());
-            let pdf = file.and_then(|file| convert::exported(file, &title, Format::Pdf)).map(|pdf| pdf.bytes);
+            let mut linked = |address: &str| linked.get(address).cloned();
+            let pdf = file.and_then(|file| convert::exported_with(file, &title, Format::Pdf, &mut linked));
+            let pdf = pdf.map(|pdf| pdf.bytes);
             let _ = proxy.send_event(Event::Pdf(id, pdf));
         }));
     }

@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 
 use common::{Scratch, Writer};
 
-use letters::copies::{self, Refused};
+use letters::copies::{self, Linked, Refused};
 use letters::files::{self, Home};
+use letters::pictures;
 use letters_format::Archive;
 use letters_model::{Block, BlockKind, Document, Style};
 use letters_ui::CopyFormat;
@@ -39,7 +40,7 @@ fn id(path: &Path) -> String {
 fn a_copy_is_a_document_of_its_own_with_the_same_text() {
     let (scratch, source) = saved("copies-own");
     let output = copies::path(&scratch.0, "Roof repairs copy", CopyFormat::Letters).unwrap();
-    let made = copies::write(&source, &output, CopyFormat::Letters, false).unwrap();
+    let made = copies::write(&source, &output, CopyFormat::Letters, false, &Linked::new()).unwrap();
 
     assert_eq!(output, scratch.0.join("Roof repairs copy.let"));
     assert_eq!(files::open(&output, Style::default).unwrap().document, letter());
@@ -61,12 +62,45 @@ fn an_export_is_a_file_in_its_format_that_holds_the_text() {
     for (format, name, start, readable) in cases {
         let output = copies::path(&scratch.0, "Roof repairs", format).unwrap();
         assert_eq!(output, scratch.0.join(name));
-        assert_eq!(copies::write(&source, &output, format, false).unwrap(), None, "{name}: no document is made");
+        assert_eq!(
+            copies::write(&source, &output, format, false, &Linked::new()).unwrap(),
+            None,
+            "{name}: no document is made"
+        );
         let written = fs::read(&output).unwrap();
         assert!(written.starts_with(start), "{name}");
         if readable {
             assert!(String::from_utf8_lossy(&written).contains("Harland Roofing sent a quote."), "{name}");
         }
+    }
+}
+
+#[test]
+fn a_pdf_shows_the_linked_pictures_it_is_handed_and_no_other() {
+    let scratch = Scratch::new("copies-linked");
+    let source = scratch.0.join("Roof.let");
+    let (src, alt) = (Some("https://example.org/roof.png".to_owned()), "The roof".to_owned());
+    let figure = BlockKind::Figure { asset: None, src, alt, width: 64.0, height: 64.0, numbered: false };
+    let document = Document { blocks: vec![Block::new("f", figure)], ..Document::default() };
+    Writer::new(&document, Style::default()).save(&Home::new(&source), &document);
+    // Pixels that do not repeat, so that the picture's file is of some size.
+    let pixels: Vec<u8> = (0u32..64 * 64 * 4).map(|n| (n.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    let picture = pictures::from_rgba(64, 64, &pixels).unwrap().bytes;
+
+    // (the pictures the window has loaded, whether the figure's is among them)
+    let cases = [
+        (Linked::new(), false),
+        (Linked::from([("https://example.org/roof.png".to_owned(), picture.clone())]), true),
+        (Linked::from([("https://example.org/other.png".to_owned(), picture.clone())]), false),
+    ];
+    let mut sizes = cases.iter().enumerate().map(|(n, (linked, _))| {
+        let output = scratch.0.join(format!("{n}.pdf"));
+        copies::write(&source, &output, CopyFormat::Pdf, false, linked).unwrap();
+        fs::metadata(&output).unwrap().len()
+    });
+    let empty = sizes.next().unwrap();
+    for ((_, shown), size) in cases.iter().skip(1).zip(sizes) {
+        assert_eq!(size > empty + 1024, *shown, "{size} bytes, {empty} with an empty frame");
     }
 }
 
@@ -81,7 +115,7 @@ fn a_copy_of_an_older_version_holds_what_the_document_read_then() {
     let then = || (letter(), Style::default());
 
     let output = copies::path(&scratch.0, "As quoted", CopyFormat::Letters).unwrap();
-    let made = copies::write_version(&source, then(), &output, CopyFormat::Letters, false).unwrap();
+    let made = copies::write_version(&source, then(), &output, CopyFormat::Letters, false, &Linked::new()).unwrap();
     assert_eq!(files::open(&output, Style::default).unwrap().document, letter());
     assert!(made.is_some_and(|made| made == id(&output) && made != id(&source)), "a document of its own");
     let archive = Archive::open(fs::File::open(&output).unwrap()).unwrap();
@@ -90,7 +124,7 @@ fn a_copy_of_an_older_version_holds_what_the_document_read_then() {
 
     for format in [CopyFormat::WebPage, CopyFormat::Markdown] {
         let output = copies::path(&scratch.0, "As quoted", format).unwrap();
-        copies::write_version(&source, then(), &output, format, false).unwrap();
+        copies::write_version(&source, then(), &output, format, false, &Linked::new()).unwrap();
         let written = fs::read_to_string(&output).unwrap();
         assert!(written.contains("Harland Roofing sent a quote."), "{format:?}: the version's text");
         assert!(!written.contains("The roof is mended."), "{format:?}: and not what was written since");
@@ -104,12 +138,12 @@ fn a_file_in_the_way_is_replaced_only_when_asked_and_a_document_never() {
         let output = copies::path(&scratch.0, "Other", format).unwrap();
         fs::write(&output, "kept").unwrap();
 
-        let refused = copies::write(&source, &output, format, false).unwrap_err();
+        let refused = copies::write(&source, &output, format, false, &Linked::new()).unwrap_err();
         assert!(matches!(refused, Refused::Taken { .. }), "{format:?}: {refused}");
         assert_eq!(refused.replaceable(), format != CopyFormat::Letters, "{format:?}");
         assert_eq!(fs::read(&output).unwrap(), b"kept", "{format:?}: nothing was written");
 
-        let again = copies::write(&source, &output, format, true);
+        let again = copies::write(&source, &output, format, true, &Linked::new());
         let replaced = fs::read(&output).unwrap() != b"kept";
         assert_eq!((again.is_ok(), replaced), (EXPORTS.contains(&format), EXPORTS.contains(&format)), "{format:?}");
     }
@@ -130,7 +164,7 @@ fn a_copy_that_cannot_be_made_says_why() {
         ("a document that is not there", scratch.0.join("Missing.let"), scratch.0.join("Copy.pdf")),
     ];
     for (case, source, output) in cases {
-        let refused = copies::write(&source, &output, CopyFormat::Pdf, false).unwrap_err();
+        let refused = copies::write(&source, &output, CopyFormat::Pdf, false, &Linked::new()).unwrap_err();
         assert!(matches!(refused, Refused::Failed(_)) && !refused.replaceable(), "{case}: {refused}");
         assert!(!output.exists(), "{case}");
     }

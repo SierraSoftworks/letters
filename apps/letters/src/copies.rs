@@ -3,6 +3,7 @@
 //! A copy is made from the document's file, which its window saves first. Nothing here replaces a document,
 //! and a file in another format is replaced only when its writer has said so.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, Cursor};
@@ -103,11 +104,21 @@ pub fn ending(chosen: PathBuf, format: CopyFormat) -> PathBuf {
     path.into()
 }
 
+/// The files of the linked pictures a window shows, by their addresses. A PDF shows them too. A copy
+/// fetches nothing itself, so a linked picture the window does not show is an empty frame there.
+pub type Linked = BTreeMap<String, Vec<u8>>;
+
 /// Writes a copy of the document in the file at `source` to `output`, and returns the id of the document
 /// it made, if it made one. `replace` lets a file in another format take the place of one at `output`.
-pub fn write(source: &Path, output: &Path, format: CopyFormat, replace: bool) -> Result<Option<String>, Refused> {
+pub fn write(
+    source: &Path,
+    output: &Path,
+    format: CopyFormat,
+    replace: bool,
+    linked: &Linked,
+) -> Result<Option<String>, Refused> {
     let file = fs::read(source).map_err(|error| Refused::Failed(error.to_string()))?;
-    put(file, output, format, replace)
+    put(file, output, format, replace, linked)
 }
 
 /// Writes a copy of the document as an older version of it read: `version`, with the pictures the file
@@ -119,6 +130,7 @@ pub fn write_version(
     output: &Path,
     format: CopyFormat,
     replace: bool,
+    linked: &Linked,
 ) -> Result<Option<String>, Refused> {
     let failed = |error: &dyn fmt::Display| Refused::Failed(error.to_string());
     let file = fs::read(source).map_err(|error| failed(&error))?;
@@ -134,11 +146,17 @@ pub fn write_version(
     }
     let mut bytes = Cursor::new(Vec::new());
     letters_format::write(&mut bytes, &package).map_err(|error| failed(&error))?;
-    put(bytes.into_inner(), output, format, replace)
+    put(bytes.into_inner(), output, format, replace, linked)
 }
 
 /// Writes a copy of the document in `file`, the bytes of a `.let` file.
-fn put(file: Vec<u8>, output: &Path, format: CopyFormat, replace: bool) -> Result<Option<String>, Refused> {
+fn put(
+    file: Vec<u8>,
+    output: &Path,
+    format: CopyFormat,
+    replace: bool,
+    linked: &Linked,
+) -> Result<Option<String>, Refused> {
     let failed = |error: &dyn fmt::Display| Refused::Failed(error.to_string());
     let name = |path: &Path| path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let title = output.file_stem().unwrap_or_default().to_string_lossy();
@@ -161,7 +179,8 @@ fn put(file: Vec<u8>, output: &Path, format: CopyFormat, replace: bool) -> Resul
         convert::write(output, bytes.get_ref(), false).map_err(|error| refused(output, error))?;
         return Ok(Some(package.id));
     };
-    let exported = convert::exported(file, &title, to).map_err(|error| failed(&error))?;
+    let mut linked = |address: &str| linked.get(address).cloned();
+    let exported = convert::exported_with(file, &title, to, &mut linked).map_err(|error| failed(&error))?;
     for line in &exported.simplified {
         eprintln!("letters: {}: {line}", output.display());
     }
