@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::mem;
+use std::ops::Range;
 use std::sync::Arc;
 
 use letters_render::{Color, Glyph, Item, PathEl, Point, Rect, Size};
@@ -100,13 +101,22 @@ pub(crate) fn typeset(source: &str, style: &Style) -> Result<Formula, Error> {
     Ok(Formula { size, baseline: px(list.height), items })
 }
 
-/// The engine counts positions in bytes of the source, as the document does. A position that is not in the
-/// source (the engine can report one from inside a macro) is left out.
+/// The engine counts positions in bytes of the source, as the document does. One from inside a macro of the
+/// engine's own is a position in that macro, which only looks like one in the source, and is left out.
 pub(crate) fn parse_error(source: &str, error: ParseError) -> Error {
-    let span = error.loc.map(|loc| loc.start..loc.end).filter(|span| {
-        span.start <= span.end && source.is_char_boundary(span.start) && source.is_char_boundary(span.end)
-    });
+    let span = match &error.loc {
+        Some(loc) => Some(loc.start..loc.end).filter(|span| written(source, span)),
+        // What is missing is missing at the end.
+        None => error.message.ends_with("'EOF'").then_some(source.len()..source.len()),
+    };
     Error { message: error.message.replace("'EOF'", "the end of the formula"), span }
+}
+
+/// Whether the place of an error is a place in the source: only such a place moves when the source does.
+fn written(source: &str, span: &Range<usize>) -> bool {
+    let moved = Parser::new(&format!(" {source}")).parse().err().and_then(|error| error.loc);
+    source.get(span.clone()).is_some()
+        && moved.is_some_and(|moved| (moved.start, moved.end) == (span.start + 1, span.end + 1))
 }
 
 /// Sets every link as its plain argument: the text of `\href` and the address of `\url`, drawn as what is

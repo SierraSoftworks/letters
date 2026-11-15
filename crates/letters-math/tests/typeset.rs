@@ -155,6 +155,7 @@ fn an_error_points_at_the_fault() {
         // Positions count bytes, as the document does.
         (r"é + \foo", r"\foo", r"\foo"),
         (r"\text{наука} \frac{a}", "", "end"),
+        (r"\begin{matrix} a & b \\ c", "", "end"),
     ];
     for (source, fault, word) in cases {
         let Err(error) = typeset(source, &inline(16.0)) else { panic!("{source} was typeset") };
@@ -170,11 +171,23 @@ fn an_error_points_at_the_fault() {
 
 #[test]
 fn an_error_without_a_position_still_says_what_is_wrong() {
-    for source in [r"\begin{nonsense} a \end{nonsense}", r"\begin{matrix} a & b \\ c", "$x$"] {
+    for source in [r"\begin{nonsense} a \end{nonsense}", r"\begin{matrix} a \end{pmatrix}", "$x$"] {
         let Err(error) = typeset(source, &inline(16.0)) else { panic!("{source} was typeset") };
 
         assert!(!error.message.is_empty(), "{source}");
         assert!(error.span.is_none_or(|span| source.get(span).is_some()), "{source}: a position outside the source");
+    }
+}
+
+#[test]
+fn an_error_in_a_macro_of_the_engines_is_not_placed_elsewhere() {
+    // (source, the macro at fault). The engine places each in its macro, at bytes that are also in the source.
+    let cases = [(r"\text{\R}", r"\R"), (r"a + b + c + d + e + f + g + h \text{\iff}", r"\iff")];
+    for (source, fault) in cases {
+        let Err(error) = typeset(source, &inline(16.0)) else { panic!("{source} was typeset") };
+
+        let at = error.span.clone().map(|span| &source[span]);
+        assert!(at.is_none_or(|at| at.contains(fault)), "{source}: {error} at {at:?}");
     }
 }
 
