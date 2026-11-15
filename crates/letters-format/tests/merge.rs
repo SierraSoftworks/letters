@@ -612,3 +612,92 @@ fn a_file_copied_by_hand_becomes_its_own_document_with_its_first_edit() {
     let Saved::ConflictCopy { cause: Error::OtherDocument(id), .. } = saved else { panic!("{saved:?}") };
     assert_eq!((id.as_str(), &folder.files[COPY]), (ID, &before));
 }
+
+/// Histories with sound checksums that Loro cannot be trusted with, from the fuzzer's findings.
+const PANICS: &[u8] = include_bytes!("../../../fuzz/corpus/history/a-history-loro-panics-on.bin");
+const UNWRITABLE: &[u8] = include_bytes!("../../../fuzz/corpus/history/a-history-loro-cannot-write-out.bin");
+
+/// The shared file as a writer left it with `history` for its history, and every hash sound.
+fn with_history(history: &[u8]) -> Vec<u8> {
+    let mut package = open(&opened_bytes()).package().unwrap();
+    package.document.blocks[0] = paragraph("p", "Hello from elsewhere");
+    package.entries.insert(OPLOG.into(), history.to_vec());
+    bytes(&package)
+}
+
+#[test]
+fn a_file_whose_history_cannot_be_read_is_set_aside_and_never_merged() {
+    // A person's own document refuses what is no history. One that takes every file for a stranger's
+    // also refuses what only a trial in a scratch document shows.
+    let cases: [(&str, bool, &[u8]); 4] = [
+        ("no history, own", false, b"no history at all"),
+        ("no history, wary", true, b"no history at all"),
+        ("Loro panics on it", true, PANICS),
+        ("Loro cannot write it out", true, UNWRITABLE),
+    ];
+    for (why, wary, history) in cases {
+        let (mut folder, mut desk, _) = shared();
+        desk.wary = wary;
+        typed(&mut desk, 0, "Oh. ");
+        let broken = with_history(history);
+        folder.put(NAME, broken.clone());
+
+        let saved = save_from(&mut folder, &mut desk, "desk");
+        let Saved::Restored { aside } = saved else { panic!("{why}: {saved:?}") };
+        assert_eq!(folder.files[&aside], broken, "{why}: the file is kept as it was, under another name");
+        assert_eq!(text(open_at(&folder, NAME, 4).model().doc()), "Oh. Hello world", "{why}");
+        assert_eq!(text(desk.model().doc()), "Oh. Hello world", "{why}: nothing of it was merged");
+    }
+}
+
+#[test]
+fn wary_copies_merge_sound_files_and_edits_as_any_do() {
+    let (mut folder, mut desk, mut laptop) = shared();
+    (desk.wary, laptop.wary) = (true, true);
+    typed(&mut laptop, 0, "Oh. ");
+    // Edits from an editor of its own reach a copy as bytes too.
+    let mut editor = letters_model::Model::load(&desk.model().save(), ReplicaId::from(12)).unwrap();
+    let stood = editor.revision();
+    editor.apply([Op::InsertText { at: Pos::new("p", 5), text: ",".into() }]).unwrap();
+    desk.edit(&editor.updates_since(&stood)).unwrap();
+
+    let saves = in_turn(&mut folder, &mut desk, &mut laptop, 5);
+    assert!(matches!(saves[..], [.., Saved::Unchanged, Saved::Unchanged]), "{saves:?}");
+    for (who, copy) in [("the desk", &desk), ("the laptop", &laptop)] {
+        assert_eq!(text(copy.model().doc()), "Oh. Hello, world", "{who}");
+    }
+
+    // A word both then change is settled as between any two copies.
+    desk.sign("Ana", at(0));
+    typed(&mut desk, 16, "s");
+    laptop.sign("Ben", at(10));
+    typed(&mut laptop, 11, "under");
+    let saves = in_turn(&mut folder, &mut desk, &mut laptop, 5);
+    assert!(matches!(saves[..], [.., Saved::Unchanged, Saved::Unchanged]), "{saves:?}");
+    for (who, copy) in [("the desk", &desk), ("the laptop", &laptop)] {
+        assert_eq!(text(copy.model().doc()), "Oh. Hello, underworld", "{who}");
+        assert_eq!(clashes(copy).len(), 1, "{who}");
+    }
+}
+
+#[test]
+fn bytes_from_a_stranger_that_cannot_be_read_are_refused_and_change_nothing() {
+    let (folder, _, _) = shared();
+    let mut folder = folder;
+    let mut copy = WorkingCopy::open_wary(&mut open(&folder.files[NAME]), ReplicaId::from(7)).unwrap();
+    assert!(copy.wary, "a copy opened from a stranger stays wary of what joins it");
+    let before = copy.model().save();
+
+    assert!(matches!(copy.edit(b"no edits at all"), Err(Error::History(_))));
+    for (why, history) in [("no history", &b"no history at all"[..]), ("Loro panics on it", PANICS)] {
+        folder.put("other.let", with_history(history));
+        let merged = copy.merge_from(&mut open(&folder.files["other.let"]));
+        assert!(matches!(merged, Err(Error::History(_))), "{why}: {merged:?}");
+        assert_eq!(copy.model().compare(&before).unwrap(), Some(Ordering::Equal), "{why}");
+        assert_eq!(text(copy.model().doc()), "Hello world", "{why}");
+
+        // Opened for editing, such a file still gives its document: the history starts over.
+        let opened = WorkingCopy::open_wary(&mut open(&folder.files["other.let"]), ReplicaId::from(8)).unwrap();
+        assert_eq!(text(opened.model().doc()), "Hello from elsewhere", "{why}");
+    }
+}

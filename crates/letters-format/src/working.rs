@@ -45,6 +45,15 @@ pub struct WorkingCopy {
     /// The id the file went by when this document became its own, until the file is seen to carry the new
     /// one. See [`Self::fork`].
     was: Option<String>,
+    /// Whether histories that reach this copy are taken for a stranger's: the file's as a save merges it,
+    /// another file's, edits, and a journal's. Each is then read with [`Model::check`] before a model
+    /// loads it, and tried with [`Model::admit`] before this one merges it. Off for a person's own
+    /// documents, which open and merge at no added cost.
+    ///
+    /// One that is refused is never merged: a save sets its file aside as damaged, and the other calls
+    /// fail with [`Error::History`]. Edits that build on others this copy lacks are refused too, where a
+    /// copy that is not wary lets them wait. See [`Self::open_wary`].
+    pub wary: bool,
 }
 
 impl WorkingCopy {
@@ -67,6 +76,7 @@ impl WorkingCopy {
             unread_notes: false,
             history: None,
             was: None,
+            wary: false,
         }
     }
 
@@ -76,7 +86,18 @@ impl WorkingCopy {
     /// changed in them goes into the history as one more change, and a file without a readable history
     /// starts one.
     pub fn open<R: Read + Seek>(file: &mut Archive<R>, replica: ReplicaId) -> Result<Self, Error> {
-        let Theirs { model, mut notes, history, unread_style, unread_notes } = Theirs::read(file, replica, true)?;
+        Self::opened(file, replica, false)
+    }
+
+    /// Reads a file from a stranger for editing, as [`Self::open`] does a person's own: one that came from
+    /// elsewhere, or any file on a server. Its history is read with [`Model::check`] first, and one that
+    /// is refused is left out as one that cannot be read is. The copy stays [wary](Self::wary).
+    pub fn open_wary<R: Read + Seek>(file: &mut Archive<R>, replica: ReplicaId) -> Result<Self, Error> {
+        Self::opened(file, replica, true)
+    }
+
+    fn opened<R: Read + Seek>(file: &mut Archive<R>, replica: ReplicaId, wary: bool) -> Result<Self, Error> {
+        let Theirs { model, mut notes, history, unread_style, unread_notes } = Theirs::read(file, replica, true, wary)?;
         notes.pin(&model);
         let manifest = file.manifest();
         Ok(Self {
@@ -90,6 +111,7 @@ impl WorkingCopy {
             seen: manifest.hashes.clone(),
             history,
             was: None,
+            wary,
         })
     }
 
@@ -151,6 +173,7 @@ impl WorkingCopy {
     /// Takes in edits made on another replica of this session, such as the editor's, as [`Model::save`] or
     /// [`Model::updates_since`] wrote them. Notes follow their text.
     pub fn edit(&mut self, history: &[u8]) -> Result<Change, Error> {
+        self.admit(history)?;
         self.notes.pin(&self.model);
         let change = self.model.merge(history).map_err(Error::History)?;
         self.notes.follow(&self.model);
@@ -187,10 +210,10 @@ impl WorkingCopy {
     ///
     /// Nothing is lost from either side, and merging the same file again changes nothing. The file is only
     /// read. Fails with [`Error::Unmerged`] when its history shares nothing with this one, or when it holds a
-    /// style or notes this build cannot read.
+    /// style or notes this build cannot read, and with [`Error::History`] when its history cannot be read.
     pub fn merge_from<R: Read + Seek>(&mut self, other: &mut Archive<R>) -> Result<Change, Error> {
         // A style or notes that cannot be read would be left behind, in a copy the user may then throw away.
-        let change = self.take_in(Theirs::read(other, self.model.replica(), false)?, false)?;
+        let change = self.take_in(Theirs::read(other, self.model.replica(), false, self.wary)?, false)?;
         // The save writes over this document's own file, so what only the other file holds comes into memory.
         let core = |name: &str| [DOCUMENT, STYLE, NOTES].contains(&name) || name.starts_with(HISTORY);
         let names: Vec<String> = other.names().filter(|name| !core(name)).map(str::to_owned).collect();
@@ -201,6 +224,12 @@ impl WorkingCopy {
             }
         }
         Ok(change)
+    }
+
+    /// Tries a history from elsewhere where the document cannot be hurt by it, if this copy is wary. It is
+    /// to be merged next: the model keeps what it admitted.
+    fn admit(&self, history: &[u8]) -> Result<(), Error> {
+        if self.wary { self.model.admit(history).map_err(Error::History) } else { Ok(()) }
     }
 
     /// Merges the history and notes of another copy. `home` says it is the file this document is saved to,
@@ -225,6 +254,7 @@ impl WorkingCopy {
         // The document as it reads here before the two meet, for a block that the other side took away.
         let apart = apart.then(|| (self.model.revision(), model.revision(), self.model.doc().clone()));
 
+        self.admit(&merged)?;
         self.notes.pin(&self.model);
         let mut change = self.model.merge(&merged).map_err(Error::History)?;
         self.notes.merge(&notes);
@@ -296,6 +326,7 @@ impl WorkingCopy {
     /// file. Returns whether it held anything this copy lacked, which is then owed a save.
     ///
     /// Fails with [`Error::Unmerged`] when the journal's edits build on a history this copy does not hold.
+    /// A [wary](Self::wary) copy fails with [`Error::History`] there, and has taken none of them in.
     pub fn replay(&mut self, unsaved: &Unsaved) -> Result<bool, Error> {
         if unsaved.id != self.id {
             return Err(Error::OtherDocument(unsaved.id.clone()));
@@ -307,6 +338,7 @@ impl WorkingCopy {
         let mut added = false;
         self.notes.pin(&self.model);
         for edits in &unsaved.edits {
+            self.admit(edits)?;
             if !held(&self.model, edits)? {
                 self.model.merge(edits).map_err(Error::History)?;
                 added = true;
@@ -335,6 +367,8 @@ impl WorkingCopy {
     /// `None` when the journal only adds to a file.
     pub fn recover(unsaved: &Unsaved, replica: ReplicaId) -> Result<Option<Self>, Error> {
         let Some(first) = unsaved.edits.first().filter(|_| unsaved.whole) else { return Ok(None) };
+        // A journal is read after a crash, which may be why it ended: it is checked whoever wrote it.
+        Model::check(first).map_err(Error::History)?;
         let mut copy = Self {
             id: unsaved.id.clone(),
             created: unsaved.created.clone(),
@@ -346,8 +380,10 @@ impl WorkingCopy {
             unread_notes: false,
             history: None,
             was: None,
+            wary: true,
         };
         copy.replay(unsaved)?;
+        copy.wary = false;
         Ok(Some(copy))
     }
 }
@@ -367,7 +403,7 @@ impl Replica for WorkingCopy {
         }
         let held = &disk.manifest().hashes;
         if held != &self.seen {
-            self.take_in(Theirs::read(disk, self.model.replica(), false)?, true)?;
+            self.take_in(Theirs::read(disk, self.model.replica(), false, self.wary)?, true)?;
             self.seen = disk.manifest().hashes.clone();
         }
         // Notes this build cannot read are other people's words, which a note added here must not replace.
@@ -430,7 +466,12 @@ impl Theirs {
     ///
     /// Sharing the reader's replica id is safe: a copy that is only read writes nothing under it, and an
     /// outside change is written under an id of its own.
-    fn read<R: Read + Seek>(file: &mut Archive<R>, replica: ReplicaId, opening: bool) -> Result<Self, Error> {
+    fn read<R: Read + Seek>(
+        file: &mut Archive<R>,
+        replica: ReplicaId,
+        opening: bool,
+        wary: bool,
+    ) -> Result<Self, Error> {
         let document = file.document()?;
         let (style, notes) = (file.style(), file.notes());
         let (unread_style, unread_notes) =
@@ -439,8 +480,15 @@ impl Theirs {
         let notes = if unread_notes { Notes::default() } else { notes? };
 
         let history = file.read(OPLOG)?;
-        let loaded = match history.as_deref().map(|bytes| Model::load(bytes, replica)) {
-            Some(Err(_)) if !opening => return Err(Error::Unmerged),
+        let load = |bytes: &[u8]| {
+            if wary {
+                Model::check(bytes)?;
+            }
+            Model::load(bytes, replica)
+        };
+        let loaded = match history.as_deref().map(load) {
+            // A file that is merged with a history no build can read is damaged, and is not this document.
+            Some(Err(error)) if !opening => return Err(Error::History(error)),
             loaded => loaded.and_then(Result::ok),
         };
         let (model, history) = match loaded {
