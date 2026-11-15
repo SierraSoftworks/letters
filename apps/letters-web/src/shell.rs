@@ -22,11 +22,11 @@ use letters_model::{
 };
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::{Color, DisplayList, Font, Point, Rect, Size};
-use letters_sync::{Client, Link, Local, Progress};
+use letters_sync::{Client, Link, Local, Progress, Role};
 use letters_trust::{LinkDecision, Origin, Trust};
 use letters_ui::{
-    Appearance, Connection, CopyFormat, Cursor, Edge, Keys, LinkPreviewFound, Peer, PictureState, Request, SaveState,
-    Scheme, Settings, Uncovered, Window as View, WordList, tokens,
+    Access, Appearance, Connection, CopyFormat, Cursor, Edge, Keys, LinkPreviewFound, Peer, PictureState, Request,
+    SaveState, Scheme, Settings, Uncovered, Window as View, WordList, tokens,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
@@ -211,11 +211,14 @@ pub struct Shell {
     attached: bool,
     /// How many pictures are on their way to the server. The edits that name them wait for them.
     uploading: u32,
-    /// Whether the server lets this person write in the document. It says so with the page, and again
-    /// with each session.
-    edits: bool,
-    /// Whether the editor was last told that the person may write.
-    writing: bool,
+    /// What the server lets this person do with the document. It says so with the page, and again with
+    /// each session.
+    role: Role,
+    /// What the window was last told the person may do.
+    access: Access,
+    /// Whether the editor is kept from writing though the window offers to: in the first moments of a
+    /// page, before the server's history is the document's.
+    held: bool,
     /// The selection as the client was last told it.
     told: Option<Selection>,
     /// How the window was last told it stands to the server.
@@ -386,8 +389,9 @@ impl Shell {
                 sockets: 0,
                 attached: false,
                 uploading: 0,
-                edits: true,
-                writing: true,
+                role: Role::Editor,
+                access: Access::Edits,
+                held: false,
                 told: None,
                 connection: None,
                 quiet_until: None,
@@ -1979,7 +1983,11 @@ impl Shell {
         client.start(now);
         self.client = Some(client);
         self.quiet_until = Some(now + QUIET_MS);
-        self.edits = server.role >= letters_api::Role::Editor;
+        self.role = match server.role {
+            letters_api::Role::Reader => Role::Reader,
+            letters_api::Role::Commenter => Role::Commenter,
+            letters_api::Role::Editor | letters_api::Role::Owner => Role::Editor,
+        };
         self.allow();
         self.pump();
     }
@@ -1991,7 +1999,8 @@ impl Shell {
         }
         self.hang_up();
         // The window that shows the other document is a new one.
-        (self.attached, self.told, self.quiet_until, self.peers_at, self.writing) = (false, None, None, None, true);
+        (self.attached, self.told, self.quiet_until, self.peers_at) = (false, None, None, None);
+        (self.access, self.held) = (Access::Edits, false);
         self.beat_at();
     }
 
@@ -2025,7 +2034,7 @@ impl Shell {
                 // The bar is told how the link and saving stand with every look, in `sync`.
                 letters_sync::Event::Link => {
                     if let Some(Link::Live(role)) = self.client.as_ref().map(Client::link) {
-                        (self.edits, self.quiet_until) = (role.edits(), None);
+                        (self.role, self.quiet_until) = (role, None);
                         // Back after a while without the server, the document may be called otherwise.
                         if self.sockets > 1 {
                             self.look();
@@ -2095,16 +2104,33 @@ impl Shell {
         Ok(())
     }
 
-    /// Lets the person write in the document, or only read it. What is written before the server's
-    /// history is the document's would have no place in it, and a role may read and not write.
+    /// Tells the window what the person may do with the document: what their role allows, and nothing
+    /// but reading until the server's history is the document's, since what is written before would have
+    /// no place in it.
     fn allow(&mut self) {
-        let may = self.client.is_none() || (self.attached && self.edits);
-        if may != self.writing {
-            self.writing = may;
-            _ = self.view.change(|editor| {
-                editor.set_read_only(!may);
-                Ok::<_, Infallible>(Change::default())
-            });
+        let waits = self.client.is_some() && !self.attached;
+        let access = match self.role {
+            _ if self.client.is_none() => Access::Edits,
+            // A wait the person notices is told by the bar. A shorter one changes nothing they see.
+            _ if waits && self.quiet_until.is_none() => Access::Reads,
+            Role::Editor => Access::Edits,
+            Role::Commenter => Access::Comments,
+            Role::Reader => Access::Reads,
+        };
+        if access != self.access {
+            self.access = access;
+            self.view.set_access(access);
+        }
+        // For that shorter wait the window offers its tools, and the editor writes nothing.
+        let held = waits && access == Access::Edits;
+        if held != self.held {
+            self.held = held;
+            if access == Access::Edits {
+                _ = self.view.change(|editor| {
+                    editor.set_read_only(held);
+                    Ok::<_, Infallible>(Change::default())
+                });
+            }
         }
     }
 
@@ -2122,7 +2148,7 @@ impl Shell {
         self.view = view;
         self.backed();
         // The new window is told of the link and the others anew, and lets the person write until told.
-        (self.connection, self.peers_at, self.writing) = (None, None, true);
+        (self.connection, self.peers_at, self.access, self.held) = (None, None, Access::Edits, false);
         (self.kept, self.written, self.rested, self.session) = (self.view.edits(), self.view.edits(), None, None);
         self.text = TextInput::new(self.mac);
         self.touch = Touch::default();

@@ -26,7 +26,8 @@ const minutes = (text) => ({
 });
 
 /** How the bar says the document stands to its server. */
-const mark = (page, said) => page.getByRole("toolbar", { name: "Document" }).getByText(said, { exact: true });
+const tools = (page) => page.getByRole("toolbar", { name: "Document" });
+const mark = (page, said) => tools(page).getByText(said, { exact: true });
 const held = async (host) => (await host.texts()).join("\n");
 const shown = async (page) => (await texts(page)).join("\n");
 
@@ -61,17 +62,25 @@ test("two people with the document open read what the other writes, and see who 
   await expect(page.getByLabel("Grace Hopper")).not.toBeAttached();
 });
 
-test("someone who may only read the document reads what is written and writes nothing", async ({ page, context }) => {
-  const [host, reader] = [hosted(), await context.newPage()];
-  await serve(page, opened(), undefined, undefined, host);
-  await serve(reader, opened({ role: "reader", author: "Grace Hopper" }), undefined, undefined, host);
-  await reader.keyboard.type("Not mine to write.");
-  await page.bringToFront();
-  await page.keyboard.type("From Ada.");
-  await expect.poll(() => shown(reader)).toContain("From Ada.");
-  expect(await shown(reader)).not.toContain("Not mine to write.");
-  expect(await held(host)).not.toContain("Not mine to write.");
-});
+const roles = [
+  { role: "reader", does: "reads", said: "Reading" },
+  { role: "commenter", does: "comments on", said: "Commenting" },
+];
+for (const { role, does, said } of roles) {
+  test(`someone who only ${does} the document reads what is written and writes nothing, and the bar says so`, async ({ page, context }) => {
+    const [host, reader] = [hosted(), await context.newPage()];
+    await serve(page, opened(), undefined, undefined, host);
+    await serve(reader, opened({ role, author: "Grace Hopper" }), undefined, undefined, host);
+    await expect(tools(reader).getByText(said, { exact: true })).toBeAttached();
+    await expect(reader.getByRole("button", { name: "Bold" })).not.toBeAttached();
+    await reader.keyboard.type("Not mine to write.");
+    await page.bringToFront();
+    await page.keyboard.type("From Ada.");
+    await expect.poll(() => shown(reader)).toContain("From Ada.");
+    expect(await shown(reader)).not.toContain("Not mine to write.");
+    expect(await held(host)).not.toContain("Not mine to write.");
+  });
+}
 
 test("a page written before the document changed shows the document as the server holds it", async ({ page }) => {
   const host = hosted(minutes("As the server holds it."));
@@ -105,9 +114,11 @@ test("a page that has not reached its server yet is read and not written, and sa
   await rested(page);
   expect(await shown(page)).not.toContain("Too early.");
   await expect(mark(page, /^(Offline|Connecting)$/)).toBeAttached();
+  await expect(mark(page, "Reading")).toBeAttached();
 
   host.mend();
   await page.waitForFunction(() => window.letters.live, undefined, { timeout: 15_000 });
+  await expect(page.getByRole("button", { name: "Bold" })).toBeAttached();
   await page.keyboard.type("In time.");
   await expect.poll(() => held(host)).toContain("In time.");
   await expect(mark(page, "Saved")).toBeAttached();
