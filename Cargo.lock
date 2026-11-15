@@ -3725,6 +3725,7 @@ name = "letters-fonts"
 version = "0.1.0"
 dependencies = [
  "letters-render",
+ "skrifa 0.49.0",
 ]
 
 [[package]]

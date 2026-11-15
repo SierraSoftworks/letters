@@ -17,3 +17,6 @@ provided = []
 
 [dependencies]
 letters-render.workspace = true
+
+[dev-dependencies]
+skrifa.workspace = true
