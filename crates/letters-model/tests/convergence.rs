@@ -580,12 +580,14 @@ proptest! {
                         // that the later side has made away with may be the one.
                         let away = |block: &Block| held[first].block(&block.id).is_none() && replicas[to].block(&block.id).is_none();
                         joined[1] |= held[last].block(&conflict.block).is_none() && held[last].walk().any(away);
+                        // A later side that both joined a block to it and cut it in two holds some of the
+                        // joined block's text, and what the earlier side made of that is in between as well.
                         let whole = match (&now, &later) {
-                            (Some(now), Some(later)) if joined[0] => now.starts_with(later.as_str()),
                             (Some(now), Some(later)) if joined[1] => {
                                 let mut rest = now.chars();
                                 later.chars().all(|c| rest.any(|next| next == c))
                             }
+                            (Some(now), Some(later)) if joined[0] => now.starts_with(later.as_str()),
                             _ => now == later,
                         };
                         prop_assert!(whole, "a settled block reads {:?}, and the later side left it {:?}", now, later);
