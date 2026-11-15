@@ -14,9 +14,11 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use letters_convert::{Loss, PdfInfo, Target, losses, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with};
+use letters_convert::{
+    Linked, Loss, PdfInfo, PdfSources, Target, losses_with, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with,
+};
 use letters_format::{Archive, OPLOG};
-use letters_layout::Fonts;
+use letters_layout::{Fonts, Uncovered};
 use letters_model::{Block, Body, Model, ReplicaId, Style};
 use serde_json::json;
 
@@ -80,6 +82,13 @@ pub struct Exported {
 /// Writes the document in `file`, the bytes of a `.let` file, in another format. `title` is what the
 /// document is called where the format has a place for a name.
 pub fn exported(file: Vec<u8>, title: &str, to: Format) -> Result<Exported, String> {
+    exported_with(file, title, to, &mut |_| None)
+}
+
+/// As [`exported`], for a window that has loaded pictures its document only links to. `linked` hands over
+/// the file an address led to, as it was fetched, and a PDF then shows that picture as the window does.
+/// An export fetches nothing itself, so any other linked picture is an empty frame there.
+pub fn exported_with(file: Vec<u8>, title: &str, to: Format, linked: Linked) -> Result<Exported, String> {
     let failed = |error: letters_format::Error| error.to_string();
     let mut archive = Archive::open(Cursor::new(file)).map_err(failed)?;
     let document = archive.document().map_err(failed)?;
@@ -93,7 +102,8 @@ pub fn exported(file: Vec<u8>, title: &str, to: Format) -> Result<Exported, Stri
         Format::Docx => Target::Docx,
         Format::Pdf => Target::Pdf,
     };
-    let simplified = losses(&document, &notes, target).iter().map(Loss::to_string).collect();
+    // The addresses of the linked pictures a PDF was handed.
+    let mut shown = BTreeSet::new();
     let bytes = match to {
         Format::Markdown => to_markdown(&document).into_bytes(),
         // An image that cannot be read is treated as missing, and its description stands in for it.
@@ -111,8 +121,16 @@ pub fn exported(file: Vec<u8>, title: &str, to: Format) -> Result<Exported, Stri
             // What the bundled fonts cannot draw is set in the system's faces, as the window sets it. The
             // system's fonts are read only when a page has such a character.
             let mut assets = |name: &str| archive.read(name).ok().flatten();
-            to_pdf_with(&document, &style, fonts, &mut assets, &info, &mut |lacking| fallback::system_fonts(lacking))
-                .map_err(|error| error.to_string())?
+            let mut backups = |lacking: &[Uncovered]| fallback::system_fonts(lacking);
+            let mut linked = |address: &str| {
+                let picture = linked(address);
+                if picture.is_some() {
+                    shown.insert(address.to_owned());
+                }
+                picture
+            };
+            let sources = PdfSources { backups: Some(&mut backups), words: None, linked: Some(&mut linked) };
+            to_pdf_with(&document, &style, fonts, &mut assets, &info, sources).map_err(|error| error.to_string())?
         }
     };
     // The Markdown names each picture by its entry in the file, as a path from its own folder. A name
@@ -121,7 +139,8 @@ pub fn exported(file: Vec<u8>, title: &str, to: Format) -> Result<Exported, Stri
     let entries = markdown_assets(&document).into_iter().filter(|_| to == Format::Markdown).filter(inside);
     let pictures = entries.filter_map(|entry| Some((archive.read(&entry).ok().flatten()?, entry)));
     let pictures = pictures.map(|(bytes, entry)| (entry, bytes)).collect();
-    Ok(Exported { bytes, pictures, simplified })
+    let lost = losses_with(&document, &notes, target, &|address| shown.contains(address));
+    Ok(Exported { bytes, pictures, simplified: lost.iter().map(Loss::to_string).collect() })
 }
 
 impl Exported {

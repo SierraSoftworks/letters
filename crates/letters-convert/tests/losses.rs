@@ -1,6 +1,6 @@
 //! What an export says it will simplify, before it writes.
 
-use letters_convert::{Loss, LossKind, Target, losses};
+use letters_convert::{Loss, LossKind, Target, losses, losses_with};
 use letters_model::{Anchor, Block, BlockKind, Body, Document, Mark, Note, NoteKind, Notes, Run, Tone};
 
 const TARGETS: [Target; 4] = [Target::Markdown, Target::Html, Target::Docx, Target::Pdf];
@@ -144,4 +144,17 @@ fn a_loss_reads_as_a_line_that_says_how_many() {
     // One and many are worded apart.
     let lines = |count| TARGETS.map(|to| Loss { kind: LossKind::Comments, count, to }.to_string());
     assert_ne!(lines(1).map(|line| line.replace('1', "")), lines(3).map(|line| line.replace('3', "")));
+}
+
+#[test]
+fn a_linked_picture_the_shell_has_loaded_is_no_loss_in_a_pdf() {
+    let (doc, notes) = everything();
+    let loaded = |address: &str| address == "https://example.com/cat.png";
+    for to in TARGETS {
+        let before = losses(&doc, &notes, to);
+        let after = losses_with(&doc, &notes, to, &loaded);
+        let linked = |losses: &[Loss]| losses.iter().any(|loss| loss.kind == LossKind::LinkedPictures);
+        assert_eq!(linked(&after), linked(&before) && to != Target::Pdf, "{to:?}: only a PDF shows it");
+        assert_eq!(after.len(), before.len() - usize::from(to == Target::Pdf), "{to:?}: the rest stands");
+    }
 }

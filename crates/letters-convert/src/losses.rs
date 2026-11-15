@@ -58,6 +58,13 @@ pub struct Loss {
 /// is read back, which each writer documents: the sizes of pictures in Markdown, a justified column, and
 /// the like. An empty list means the export carries the document as the reader sees it.
 pub fn losses(doc: &Document, notes: &Notes, to: Target) -> Vec<Loss> {
+    losses_with(doc, notes, to, &|_| false)
+}
+
+/// As [`losses`], for a shell that hands a PDF the linked pictures it has loaded, as
+/// `PdfSources::linked` takes them. `loaded` says whether it has the picture at an address: a PDF shows
+/// that one, so it is no loss there.
+pub fn losses_with(doc: &Document, notes: &Notes, to: Target, loaded: &dyn Fn(&str) -> bool) -> Vec<Loss> {
     use LossKind::*;
     use Target::*;
     let blocks = |is: &dyn Fn(&Block) -> bool| doc.walk().filter(|block| is(block)).count();
@@ -70,7 +77,10 @@ pub fn losses(doc: &Document, notes: &Notes, to: Target) -> Vec<Loss> {
         let boxes = doc.walk().filter(|block| matches!(block.kind, BlockKind::Quote | BlockKind::Callout { .. }));
         boxes.flat_map(|outer| outer.body.blocks()).filter(|inner| !kept(&inner.kind)).count()
     };
-    let linked = |block: &Block| matches!(&block.kind, BlockKind::Figure { asset: None, src: Some(_), .. });
+    let linked = |block: &Block| match &block.kind {
+        BlockKind::Figure { asset: None, src: Some(src), .. } => to != Pdf || !loaded(src),
+        _ => false,
+    };
     let looks = |block: &Block| match &block.kind {
         BlockKind::Callout { icon, color, .. } => icon.is_some() || color.is_some(),
         _ => false,

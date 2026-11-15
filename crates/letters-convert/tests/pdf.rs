@@ -3,7 +3,7 @@
 
 use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::object::{Array, Dict};
-use letters_convert::{PdfInfo, to_pdf, to_pdf_with, to_pdf_with_words};
+use letters_convert::{PdfInfo, PdfSources, to_pdf, to_pdf_with};
 use letters_layout::{Fonts, WordList};
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Run, Style};
 
@@ -87,7 +87,8 @@ fn a_shell_backs_the_fonts_up_for_what_they_lack() {
             system.clone()
         };
         let info = PdfInfo::default();
-        let backed = to_pdf_with(&doc, &Style::default(), body.clone(), &mut |_| None, &info, &mut backups).unwrap();
+        let sources = PdfSources { backups: Some(&mut backups), ..PdfSources::default() };
+        let backed = to_pdf_with(&doc, &Style::default(), body.clone(), &mut |_| None, &info, sources).unwrap();
         let expected: Vec<Vec<char>> = if lacking.is_empty() { vec![] } else { vec![lacking.clone()] };
         assert_eq!(asked, expected, "{name}: asked once, for what is lacking alone");
         assert_eq!(faces(backed) - faces(plain), lacking.len(), "{name}: the face that draws it is embedded");
@@ -108,10 +109,52 @@ fn a_shell_finds_the_word_list_of_a_script_written_without_spaces() {
             asked.push(list);
             Some(list.data())
         };
-        let listed = to_pdf_with_words(&doc, &style, fonts(), &mut |_| None, &info, &mut |_| fonts(), &mut words);
+        let sources = PdfSources { words: Some(&mut words), ..PdfSources::default() };
+        let listed = to_pdf_with(&doc, &style, fonts(), &mut |_| None, &info, sources);
         // A build that has the lists asks for none, and its lines end between words anyway.
         let lacking = if WordList::BUILT_IN { vec![] } else { lists };
         assert_eq!(asked, lacking, "{name}: asked once, for the list of a script it shows");
         assert_eq!(listed.unwrap() != plain, !lacking.is_empty(), "{name}: the lines end where the list says");
     }
+}
+
+/// A picture four pixels wide and two high, as a file a link led to.
+const PICTURE: [u8; 73] = [
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0xf0, 0xca, 0xea, 0x34, 0x00, 0x00, 0x00, 0x10, 0x49,
+    0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x38, 0x61, 0x23, 0x02, 0x47, 0x0c, 0xc8, 0x1c, 0x00, 0x77, 0x7a, 0x08, 0xc1,
+    0xe9, 0x61, 0x87, 0x97, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+#[test]
+fn a_linked_picture_is_drawn_when_the_shell_has_loaded_it() {
+    let linked = |id: &str, src: &str| {
+        let src = Some(src.to_owned());
+        Block::new(
+            id,
+            BlockKind::Figure { asset: None, src, alt: String::new(), width: 80.0, height: 60.0, numbered: false },
+        )
+    };
+    let (near, far) = ("https://example.com/near.png", "https://example.com/far.png");
+    // The same picture twice, and one the shell never loaded.
+    let blocks = vec![linked("a", near), linked("b", near), linked("c", far)];
+    let doc = Document { blocks, ..Document::default() };
+    let pictures = |bytes: Vec<u8>| {
+        let pdf = Pdf::new(bytes).expect("a reader can open the PDF");
+        pdf.pages()[0].resources().x_objects.keys().count()
+    };
+    let fonts = || Fonts { faces: letters_fonts::bundled() };
+    let (style, info) = (Style::default(), PdfInfo::default());
+    let plain = to_pdf(&doc, &style, fonts(), &mut |_| None, &info).unwrap();
+    assert_eq!(pictures(plain), 0, "an export fetches nothing, so a link is an empty frame");
+
+    let mut asked = Vec::new();
+    let mut loaded = |address: &str| {
+        asked.push(address.to_owned());
+        (address == near).then(|| PICTURE.to_vec())
+    };
+    let sources = PdfSources { linked: Some(&mut loaded), ..PdfSources::default() };
+    let shown = to_pdf_with(&doc, &style, fonts(), &mut |_| None, &info, sources).unwrap();
+    assert_eq!(asked, [near, far], "each address is asked for once");
+    assert_eq!(pictures(shown), 1, "the picture the shell has is in the PDF, once for both places");
 }
