@@ -1042,8 +1042,8 @@ fn a_word_is_not_called_wrong_while_it_is_being_typed() {
 fn the_menu_on_a_misspelled_word_puts_a_correction_in_its_place() {
     let mut window = misspelled();
     ask_about_first_wave(&mut window);
-    window.assert_open(Role::Menu, "Spelling").click(Role::MenuItem, "quick");
-    window.assert_markdown("The quick brown fox.").assert_closed(Role::Menu, "Spelling");
+    window.assert_open(Role::Menu, "Context menu").click(Role::MenuItem, "quick");
+    window.assert_markdown("The quick brown fox.").assert_closed(Role::Menu, "Context menu");
     assert!(waves(&mut window).is_empty(), "nothing is left to mark");
     assert!(window.focused().is_some_and(|found| found.role == Role::Document), "the keyboard is back on the page");
 
@@ -1052,9 +1052,9 @@ fn the_menu_on_a_misspelled_word_puts_a_correction_in_its_place() {
 }
 
 #[test]
-fn the_menu_opens_for_a_marked_word_alone_by_pointer_or_the_menu_key() {
-    // Where in "The quik brown fox." the menu is asked for, and whether there is one to open.
-    for (offset, opens) in [(6, true), (8, true), (1, false), (12, false)] {
+fn the_menu_offers_corrections_for_a_marked_word_alone_by_pointer_or_the_menu_key() {
+    // Where in "The quik brown fox." the menu is asked for, and whether it has corrections to offer.
+    for (offset, offers) in [(6, true), (8, true), (1, false), (12, false)] {
         for by in ["pointer", "menu key"] {
             let mut window = misspelled();
             let at = spot(&mut window, "b1", offset);
@@ -1062,8 +1062,9 @@ fn the_menu_opens_for_a_marked_word_alone_by_pointer_or_the_menu_key() {
                 "pointer" => window.secondary_click_at(Point { x: at.x, y: at.y + at.height / 2.0 }),
                 _ => window.menu_key(),
             };
-            assert_eq!(window.find(Role::Menu, "Spelling").is_some(), opens, "at {offset} by {by}");
-            window.key("Escape").assert_closed(Role::Menu, "Spelling");
+            window.assert_open(Role::Menu, "Context menu");
+            assert_eq!(window.find(Role::MenuItem, "Add to my dictionary").is_some(), offers, "at {offset} by {by}");
+            window.key("Escape").assert_closed(Role::Menu, "Context menu");
             assert!(window.focused().is_some_and(|found| found.role == Role::Document), "at {offset} by {by}");
         }
     }
@@ -1072,7 +1073,7 @@ fn the_menu_opens_for_a_marked_word_alone_by_pointer_or_the_menu_key() {
     rest(&mut window);
     let end = spot(&mut window, "b1", 15);
     window.secondary_click_at(Point { x: end.x + 200.0, y: end.y + end.height / 2.0 });
-    window.assert_closed(Role::Menu, "Spelling");
+    assert!(window.find(Role::MenuItem, "Add to my dictionary").is_none(), "the room beside a word is not the word");
 }
 
 #[test]
@@ -2702,11 +2703,12 @@ fn the_cloud_on_a_linked_picture_asks_the_shell_to_load_trust_or_embed_it() {
 }
 
 #[test]
-fn the_menu_of_a_linked_picture_opens_from_its_cloud_or_a_secondary_press_alone() {
+fn the_menu_of_a_linked_picture_opens_from_its_cloud_alone_and_a_secondary_press_lists_what_it_offers() {
     let (mut window, middle, _) = linked(false);
     window.click_at(middle).assert_closed(Role::Menu, "Linked picture");
-    window.secondary_click_at(middle).assert_open(Role::Menu, "Linked picture");
-    window.key("Escape").assert_closed(Role::Menu, "Linked picture");
+    window.secondary_click_at(middle).assert_closed(Role::Menu, "Linked picture");
+    assert!(window.find(Role::MenuItem, "Load image once").is_some(), "the menu about the picture can load it");
+    window.key("Escape").assert_closed(Role::Menu, "Context menu");
     assert_eq!(window.ui().take_requests(), [], "a menu put away asks nothing");
 
     // A picture the document holds has no cloud and no such menu.
@@ -2716,6 +2718,7 @@ fn the_menu_of_a_linked_picture_opens_from_its_cloud_or_a_secondary_press_alone(
         (Point { x: place.x + 150.0, y: place.y + 75.0 }, Point { x: place.x + 284.0, y: place.y + 16.0 });
     window.click_at(corner).assert_closed(Role::Menu, "Linked picture");
     window.secondary_click_at(middle).assert_closed(Role::Menu, "Linked picture");
+    assert!(window.find(Role::MenuItem, "Load image once").is_none(), "nothing to load when the document holds it");
 }
 
 #[test]

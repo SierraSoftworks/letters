@@ -2916,6 +2916,7 @@ name = "letters-ui"
 version = "0.1.0"
 dependencies = [
  "accesskit",
+ "image",
  "letters-editor",
  "letters-fonts",
  "letters-layout",

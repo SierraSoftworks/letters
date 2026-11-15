@@ -25,10 +25,7 @@ test("a word added from the Menu key's menu is kept in this browser", async ({ p
   await page.keyboard.press("ArrowLeft");
   await page.keyboard.press("ArrowLeft");
   await page.locator("textarea").dispatchEvent("contextmenu");
-  // The person's own dictionary is the last thing the menu offers.
-  await page.keyboard.press("ArrowDown");
-  await page.keyboard.press("End");
-  await page.keyboard.press("Enter");
+  await page.getByRole("menuitem", { name: "Add to my dictionary" }).dispatchEvent("click");
   await expect.poll(() => page.evaluate(() => localStorage.getItem("letters.words"))).toBe("Zorvex");
   expect((await texts(page)).at(-1)).toBe("Zorvex ");
 });

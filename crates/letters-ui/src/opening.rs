@@ -40,6 +40,12 @@ pub enum Request {
     /// by a press on the bar's save mark, from the palette, or with Ctrl or Cmd with S. Answer with
     /// `Window::set_save_state`.
     Save,
+    /// Paste the clipboard, with no formatting when `plain` is set. Asked when a menu or the palette pastes
+    /// and the shell had nothing to give at once, as a browser has outside a paste event: a shell that can
+    /// read the clipboard later does, and has the editor paste it then. Others let it go.
+    Paste {
+        plain: bool,
+    },
     /// Write a copy of the document called `name` in `format`, and leave this window on the document it
     /// has. `folder` is the path of the folder to write it to, or `None` to let the person choose where.
     /// A file of that name is in the way unless `replace` is set, which it is once the person has said so.

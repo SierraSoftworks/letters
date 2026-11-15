@@ -11,7 +11,7 @@ use std::rc::{Rc, Weak};
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Array, Function, Map, Object, Promise, Reflect, Uint8Array};
-use letters_editor::{Clip, Editor, KeyEvent, Modifiers, Picture, Platform as _};
+use letters_editor::{Clip, Editor, Key, KeyEvent, Modifiers, Picture, Platform as _};
 use letters_model::{
     BlockKind, Change, Document, HistoryError, Mark, Model, Notes, Pos, ReplicaId, Revision, Selection, Style, TagKind,
 };
@@ -972,6 +972,7 @@ impl Shell {
                 Request::Pictures => self.picker.click(),
                 Request::OpenDialog => self.opener.click(),
                 Request::Save => self.save(),
+                Request::Paste { plain } => self.paste_later(plain),
                 Request::Print => self.print(),
                 Request::Asset(name) => self.load(name),
                 Request::OpenLink { href, confirmed } => self.open_link(&href, confirmed),
@@ -1177,6 +1178,8 @@ impl Shell {
                 if self.view.key(key, &mut self.platform) || claim {
                     event.prevent_default();
                 }
+                // A key on a menu's row copies as a press on it does.
+                self.hand_over();
             }
             Reply::Text(text) => {
                 self.view.input(text, &mut self.platform);
@@ -1318,6 +1321,21 @@ impl Shell {
         self.platform.pasted = None;
     }
 
+    /// Reads the clipboard for a paste that no paste event carries, as one asked from a menu is, and has
+    /// the editor paste what it holds once the browser hands it over.
+    fn paste_later(&self, plain: bool) {
+        let (shell, window) = (self.me.clone(), self.window.clone());
+        let mods = Modifiers { primary: true, shift: plain, alt: false };
+        wasm_bindgen_futures::spawn_local(async move {
+            let Some(clip) = browser::paste(&window).await else { return };
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            shell.paste(KeyEvent { key: Key::Char('v'), mods }, clip);
+            shell.changed();
+            shell.sync();
+        });
+    }
+
     // Pictures
 
     /// Reads `files`, which takes a moment, and hands `then` those that are pictures Letters can show.
@@ -1424,7 +1442,7 @@ impl Shell {
     /// code block's copy button does.
     fn hand_over(&mut self) {
         if let Some(clip) = self.platform.copied.take() {
-            report(browser::copy(&self.window, &clip.text));
+            report(browser::copy(&self.window, &clip));
         }
     }
 

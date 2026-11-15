@@ -28,6 +28,7 @@ use crate::chrome::Chrome;
 use crate::code_copy::{self, CodeCopy};
 use crate::color::{fade, resolve, same};
 use crate::commands::{self, Act, Commanding, Commands, Entry};
+use crate::context::{self, About, Context, Contexting};
 use crate::copying::{self, Copy, CopyFormat, Copying};
 use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
@@ -51,7 +52,7 @@ use crate::restyle::{self, Field, StyleEdit};
 use crate::review::{self, Review, Reviewing, Shown};
 use crate::safe::{self, Safe, SafeMode, Safely};
 use crate::settings::{Dialog, Setting, Settings};
-use crate::spelling::{Fix, Spelling};
+use crate::spelling::Spelling;
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::styles::{self, Styles, Styling};
 use crate::tables::{self, Tables};
@@ -176,8 +177,8 @@ pub enum Message {
     Learn {
         mine: bool,
     },
-    /// Puts the menu about a misspelled word away.
-    Unfix,
+    /// What the menu about what is under the pointer asks for.
+    Context(Contexting),
     /// Asks the shell for a recent document, by its path.
     Open(String),
     /// Asks the shell to let the person choose a document.
@@ -787,6 +788,8 @@ pub struct EditorApp {
     tables: Tables,
     /// The callouts' icons and titles under the pointer, and the card of one.
     callouts: Callouts,
+    /// The menu about what is under the pointer, while it is open.
+    context: Option<Context>,
     /// The preview of a figure that shows over the page: its caption, and where it is in the page area.
     previewed: Option<(String, Rect)>,
     /// How the document read when assistive technology was last told of it.
@@ -861,6 +864,7 @@ impl EditorApp {
             code_copy: CodeCopy::default(),
             tables: Tables::default(),
             callouts: Callouts::default(),
+            context: None,
             previewed: None,
             told: RefCell::default(),
         }
@@ -1259,6 +1263,8 @@ impl EditorApp {
             Noting::Write => {
                 self.margin.write(self.editor.model(), self.editor.selection());
                 (self.link, self.spelling.fix, self.linked.open, self.captions.alt) = (None, None, None, None);
+                self.context = None;
+                self.context = None;
             }
             Noting::Drop => self.margin.drop_draft(),
             Noting::Send => {
@@ -1285,6 +1291,7 @@ impl EditorApp {
         }
         if opens && self.margin.reading().is_some() {
             (self.link, self.spelling.fix, self.linked.open, self.captions.alt) = (None, None, None, None);
+            self.context = None;
         }
         // Once a comment is kept or dropped, the tools wait for another selection.
         if self.margin.writing().is_none() {
@@ -2090,7 +2097,7 @@ impl EditorApp {
     /// Whether a card, a menu or a field that the person asked for is out over the page.
     fn covered(&self) -> bool {
         let card = self.landing.is_some() || self.importing.is_some() || self.copying.is_some();
-        let asked = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
+        let asked = self.context.is_some() || self.link.is_some() || self.linked.open.is_some();
         let asked = asked || self.captions.alt.is_some() || self.tables.open.is_some();
         card || asked || self.commands.open() || self.callouts.open.is_some()
     }
@@ -2523,36 +2530,71 @@ impl EditorApp {
         }
     }
 
-    /// Opens the menu about what is at a point of the page area: a picture that is still a link, or a word
-    /// marked as misspelled.
+    /// Opens the menu about what is at a point of the page area. A press on a picture selects it, and one
+    /// outside what is selected puts the caret there, as the primary button would.
     fn menu(&mut self, at: Point) {
-        let Some(pos) = self.hit(at) else { return };
-        if self.linked_at(at).is_some() {
-            self.editor.select_picture(&pos.block);
-            self.mark();
-            return self.link_menu(pos.block);
+        if self.hung() {
+            return;
         }
-        let Some(range) = self.layout.spelling_at(&pos) else { return };
-        // The word itself was meant, not the room its line leaves beside it.
-        let word = Selection {
-            anchor: Pos::new(pos.block.clone(), range.start),
-            head: Pos::new(pos.block.clone(), range.end),
-        };
+        let Some(pos) = self.hit(at) else { return };
         let spot = self.in_layout(at);
+        (self.link, self.spelling.fix, self.linked.open) = (None, None, None);
         let near = |rect: &Rect| {
             (rect.x - 2.0..=rect.x + rect.width + 2.0).contains(&spot.x)
                 && (rect.y..=rect.y + rect.height).contains(&spot.y)
         };
-        if !self.layout.selection(&word).iter().any(near) {
-            return;
+        if self.layout.figure(&pos.block).is_some_and(|figure| figure.image.contains(spot)) {
+            self.editor.select_picture(&pos.block);
+        } else {
+            // A selection that was pressed on is left alone, so that the menu serves it.
+            let ranged = self.editor.selection().filter(|selection| !selection.is_caret());
+            if !ranged.is_some_and(|selection| self.layout.selection(selection).iter().any(near)) {
+                self.editor.select(Selection::caret(pos.clone()));
+            }
+            // A misspelled word is offered its corrections where the word itself was meant, not the room
+            // its line leaves beside it.
+            let word = self.layout.spelling_at(&pos).map(|range| Selection {
+                anchor: Pos::new(pos.block.clone(), range.start),
+                head: Pos::new(pos.block.clone(), range.end),
+            });
+            if word.is_some_and(|word| self.layout.selection(&word).iter().any(near)) {
+                self.spelling.ask(self.editor.doc(), &pos, &self.layout);
+            }
         }
-        // A selection is left alone, so that the menu can come to serve it as well.
-        if self.editor.selection().is_none_or(Selection::is_caret) {
-            self.editor.select(Selection::caret(pos.clone()));
-            self.mark();
+        self.mark();
+        let reference = Reference::at(self.editor.doc(), &self.layout, spot).map(|reference| reference.target);
+        let on = |note: &Note| {
+            notes::stretch(&note.anchor).is_some_and(|passage| self.layout.selection(&passage).iter().any(near))
+        };
+        let note = self.margin.open().find(|(note, kind)| *kind == threads::Kind::Comment && on(note));
+        let note = note.map(|(note, _)| note.id.clone());
+        self.context = Some(Context { at, reference, note });
+    }
+
+    /// Does what the menu about what is under the pointer asked.
+    fn contexting(&mut self, asked: Contexting, platform: &mut dyn Platform) {
+        match asked {
+            Contexting::Close => self.context = None,
+            Contexting::CopyText(block) => match self.editor.doc().block(&block) {
+                Some(code) if matches!(code.kind, BlockKind::Code { .. }) => self.copy_code(block, platform),
+                Some(written) => platform.clipboard_write(Clip { text: written.plain_text(), ..Clip::default() }),
+                None => {}
+            },
+            Contexting::CopyPicture(block) => {
+                let Some((top, bottom)) = self.editor.doc().block(&block).and_then(|code| self.extent(code)) else {
+                    return;
+                };
+                let boxes = self.layout.code_boxes(Rect::new(0.0, top, self.column.1, bottom - top));
+                let Some((_, code)) = boxes.into_iter().find(|(id, _)| *id == block) else { return };
+                // The picture alone, so that what it is pasted into takes it for a picture.
+                if let Some(picture) = context::picture(&self.layout, &self.images, code, self.palette.page) {
+                    platform.clipboard_write(Clip { pictures: vec![picture], ..Clip::default() });
+                    self.code_copy.copied(block, platform.now_ms());
+                }
+            }
+            Contexting::CopyLink(address) => platform.clipboard_write(Clip { text: address, ..Clip::default() }),
+            Contexting::ShowFigure(figure) => self.show_figure(&figure),
         }
-        self.link = None;
-        self.spelling.ask(self.editor.doc(), &pos, &self.layout);
     }
 
     /// The landing card, over the middle of a page nobody has written on: the documents opened lately, and
@@ -2627,20 +2669,6 @@ impl EditorApp {
             .on_close(Message::Start)
     }
 
-    /// The menu about a misspelled word: corrections, and the two dictionaries that can take the word.
-    fn fixes(fix: &Fix) -> Menu<Message> {
-        let mut menu = Menu::new().label("Spelling");
-        for suggestion in &fix.suggestions {
-            menu = menu.item(MenuItem::new(suggestion).on_select(Message::Correct(suggestion.clone())));
-        }
-        if fix.suggestions.is_empty() {
-            menu = menu.item(MenuItem::new("No suggestions").disabled(true));
-        }
-        menu.separator()
-            .item(MenuItem::new("Add to this document").on_select(Message::Learn { mine: false }))
-            .item(MenuItem::new("Add to my dictionary").on_select(Message::Learn { mine: true }))
-    }
-
     /// Lays the document out for the room it has and paints the part in view.
     fn page(&mut self, room: Size) -> Element<Message> {
         let page = &self.editor.model().style().page;
@@ -2662,7 +2690,7 @@ impl EditorApp {
             self.captions.alt = None;
         }
         // A note that was open goes when something else comes to hang from the page.
-        let other = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
+        let other = self.context.is_some() || self.link.is_some() || self.linked.open.is_some();
         if (other || self.captions.alt.is_some()) && self.margin.reviewing().is_none() {
             self.margin.shut();
         }
@@ -2702,7 +2730,7 @@ impl EditorApp {
         let alone = self.landing.is_none()
             && self.importing.is_none()
             && self.copying.is_none()
-            && self.spelling.fix.is_none()
+            && self.context.is_none()
             && self.link.is_none();
         let formula = selection.filter(|_| alone).and_then(|selection| self.layout.formula_rect(&selection.head));
         let formula = formula.filter(|rect| {
@@ -2895,12 +2923,11 @@ impl EditorApp {
             // The card hangs under the icon and title, or from the caret when the callout shows neither.
             let spot = head.map(|head| self.onto(callouts::target(head))).or(caret).unwrap_or_default();
             element = element.popover(self.callouts.card(kind, spot).expect("the block is a callout"));
-        } else if let Some(fix) = &self.spelling.fix {
-            // The menu hangs from the start of its word.
-            let start = self.layout.caret(&Pos::new(fix.block.clone(), fix.range.start)).unwrap_or_default();
-            let spot = self.onto(start);
-            let menu = Self::fixes(fix).popover().at(spot).open(true).on_close(Message::Unfix);
-            element = element.popover(menu);
+        } else if let Some(context) = &self.context {
+            let asked = |act: &Act| self.asked(act);
+            let fix = self.spelling.fix.as_ref();
+            let about = About { editor: &self.editor, asked: &asked, mac: self.mac, fix, room: room.height };
+            element = element.popover(context.menu(&about));
         } else if let Some(address) = &self.link {
             let field = TextField::new("Link", address)
                 .placeholder("Paste or type a link")
@@ -3771,7 +3798,18 @@ impl EditorApp {
             // The page behind the import card is not written on.
             Message::Pointer(_) if self.importing.is_some() => {}
             Message::Pointer(event) => self.pointer(event, platform),
-            Message::Run(command) => self.edit(platform, |editor, platform| editor.run(command, platform)),
+            Message::Run(command) => {
+                // A shell that has the clipboard only later is asked to paste once it has.
+                let plain = match command {
+                    Command::Paste => Some(false),
+                    Command::PastePlain => Some(true),
+                    _ => None,
+                };
+                if let Some(plain) = plain.filter(|_| platform.clipboard_read().is_none()) {
+                    return self.requests.push(Request::Paste { plain });
+                }
+                self.edit(platform, |editor, platform| editor.run(command, platform))
+            }
             Message::Panel(panel) => {
                 self.margin.now = platform.wall_time().map(notes::stamp).unwrap_or_default();
                 self.show((self.panel != Some(panel)).then_some(panel));
@@ -3796,7 +3834,7 @@ impl EditorApp {
                 }
                 self.spelling.reworded(Some(fix.block), self.editor.doc(), &mut self.layout);
             }
-            Message::Unfix => self.spelling.fix = None,
+            Message::Context(asked) => self.contexting(asked, platform),
             Message::Open(path) => self.requests.push(Request::Open(path)),
             Message::OpenDialog => self.requests.push(Request::OpenDialog),
             Message::NewDocument => self.requests.push(Request::New),
@@ -3930,6 +3968,10 @@ impl App for EditorApp {
     }
 
     fn view(&mut self, window: Size) -> Element<Message> {
+        // A menu about the page does not wait for the page to come back.
+        if self.away() || self.carded() {
+            self.context = None;
+        }
         // A floating window that Letters frames has a border, which everything else stands inside.
         let border = self.chrome.border();
         let window = Size { width: window.width - 2.0 * border, height: window.height - 2.0 * border };

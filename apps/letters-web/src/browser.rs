@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use js_sys::{Array, Promise, Reflect, Uint8Array};
+use js_sys::{Array, Object, Promise, Reflect, Uint8Array};
 use letters_editor::{Clip, Picture, Platform, block_id};
 use letters_model::Style;
 use letters_render::image::Image;
@@ -113,22 +113,98 @@ pub struct Browser {
     pub assets: HashMap<String, Vec<u8>>,
 }
 
-/// Puts text on the clipboard outside a clipboard event, as a press on a copy button asks. The browser
-/// allows it only in the wake of a press or a key, and not at all on a page served over plain HTTP.
-pub fn copy(window: &Window, text: &str) -> Result<(), JsValue> {
-    // Read by name: the binding to the async clipboard is not in every release of `web-sys`.
+/// The page's async clipboard. Read by name: the binding to it is not in every release of `web-sys`.
+fn clipboard(window: &Window) -> Result<JsValue, JsValue> {
     let clipboard = Reflect::get(&window.navigator(), &"clipboard".into())?;
     if clipboard.is_undefined() {
-        return Err("this page may not write to the clipboard".into());
+        return Err("this page may not reach the clipboard".into());
     }
-    let write: js_sys::Function = Reflect::get(&clipboard, &"writeText".into())?.dyn_into()?;
-    let written: Promise = write.call1(&clipboard, &text.into())?.dyn_into()?;
+    Ok(clipboard)
+}
+
+/// Calls a method of the async clipboard, which answers later.
+fn call(clipboard: &JsValue, method: &str, argument: Option<&JsValue>) -> Result<Promise, JsValue> {
+    let method: js_sys::Function = Reflect::get(clipboard, &method.into())?.dyn_into()?;
+    let answer = match argument {
+        Some(argument) => method.call1(clipboard, argument)?,
+        None => method.call0(clipboard)?,
+    };
+    answer.dyn_into()
+}
+
+fn blob(bytes: &[u8], kind: &str) -> Result<JsValue, JsValue> {
+    let bag = BlobPropertyBag::new();
+    bag.set_type(kind);
+    Ok(Blob::new_with_u8_array_sequence_and_options(&Array::of1(&Uint8Array::from(bytes)), &bag)?.into())
+}
+
+/// Puts a clip on the clipboard outside a clipboard event, as a press on a copy button asks: a picture
+/// alone as that picture, and words as text and, where they have it, HTML. The browser allows it only in
+/// the wake of a press or a key, and not at all on a page served over plain HTTP.
+pub fn copy(window: &Window, clip: &Clip) -> Result<(), JsValue> {
+    let clipboard = clipboard(window)?;
+    let picture = clip.pictures.first().filter(|_| clip.text.is_empty() && clip.html.is_none());
+    let kinds = Object::new();
+    if let Some(picture) = picture {
+        Reflect::set(&kinds, &picture.mime.as_str().into(), &blob(&picture.bytes, &picture.mime)?)?;
+    } else if let Some(html) = &clip.html {
+        Reflect::set(&kinds, &"text/plain".into(), &blob(clip.text.as_bytes(), "text/plain")?)?;
+        Reflect::set(&kinds, &"text/html".into(), &blob(html.as_bytes(), "text/html")?)?;
+    }
+    let item = Reflect::get(window, &"ClipboardItem".into())?;
+    let written = match item.dyn_ref::<js_sys::Function>() {
+        Some(item) if picture.is_some() || clip.html.is_some() => {
+            let item = Reflect::construct(item, &Array::of1(&kinds))?;
+            call(&clipboard, "write", Some(&Array::of1(&item)))?
+        }
+        // A browser without clipboard items has no way to take a picture.
+        _ if picture.is_some() => return Err("this browser cannot copy a picture".into()),
+        _ => call(&clipboard, "writeText", Some(&clip.text.as_str().into()))?,
+    };
     wasm_bindgen_futures::spawn_local(async move {
         if let Err(refused) = JsFuture::from(written).await {
             web_sys::console::error_1(&refused);
         }
     });
     Ok(())
+}
+
+/// What a blob of text holds.
+async fn words(held: &Blob) -> Option<String> {
+    JsFuture::from(held.text()).await.ok()?.as_string()
+}
+
+/// Reads the clipboard outside a paste event, as a menu's Paste asks. The browser asks the person first,
+/// or shows a button of its own to press, and gives nothing when they decline. A browser that hands over
+/// only text is asked for that.
+pub async fn paste(window: &Window) -> Option<Clip> {
+    let clipboard = clipboard(window).ok()?;
+    let Ok(items) = call(&clipboard, "read", None) else {
+        let text = JsFuture::from(call(&clipboard, "readText", None).ok()?).await.ok()?.as_string()?;
+        return Some(Clip { text, ..Clip::default() }).filter(|clip| !clip.text.is_empty());
+    };
+    let items: Array = JsFuture::from(items).await.ok()?.dyn_into().ok()?;
+    let mut clip = Clip::default();
+    for item in items.iter() {
+        let kinds: Array = Reflect::get(&item, &"types".into()).ok()?.dyn_into().ok()?;
+        for kind in kinds.iter().filter_map(|kind| kind.as_string()) {
+            let Ok(held) = call(&item, "getType", Some(&kind.as_str().into())) else { continue };
+            let Some(held) = JsFuture::from(held).await.ok().and_then(|held| held.dyn_into::<Blob>().ok()) else {
+                continue;
+            };
+            match kind.as_str() {
+                "text/plain" => clip.text = words(&held).await.unwrap_or_default(),
+                "text/html" => clip.html = words(&held).await.filter(|html| !html.is_empty()),
+                kind if kind.starts_with("image/") => clip.pictures.extend(picture(window, &held).await),
+                _ => {}
+            }
+        }
+    }
+    // Pictures beside words are a rendering of the words.
+    if !clip.text.is_empty() {
+        clip.pictures.clear();
+    }
+    Some(clip).filter(|clip| !clip.text.is_empty() || clip.html.is_some() || !clip.pictures.is_empty())
 }
 
 impl Browser {

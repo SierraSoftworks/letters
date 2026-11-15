@@ -239,6 +239,16 @@ static KEYS: [(KeyEvent, Act); 6] = [
     (KeyEvent { key: Key::Char('s'), mods: PRIMARY_SHIFT }, Act::SaveCopy),
 ];
 
+/// The command that does `act`, for its name where something other than the palette offers it.
+pub(crate) fn entry_of(act: &Act) -> Option<&'static Entry> {
+    ENTRIES.iter().find(|entry| entry.act == *act)
+}
+
+/// The commands of one group, in the palette's order.
+pub(crate) fn group(group: &'static str) -> impl Iterator<Item = &'static Entry> {
+    ENTRIES.iter().filter(move |entry| entry.group == group)
+}
+
 /// What a key does that the editor's keymap leaves to the window.
 pub(crate) fn bound(event: &KeyEvent) -> Option<&'static Act> {
     KEYS.iter().find(|(key, _)| key == event).map(|(_, act)| act)
