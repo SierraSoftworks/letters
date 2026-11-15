@@ -20,8 +20,8 @@ mod versions;
 
 pub use conflict::{Conflict, Side};
 pub use doc::{
-    Block, BlockId, BlockKind, Body, BodyShape, CalloutLook, Document, Extra, FORMAT, ListKind, Mark, Properties,
-    PropertiesFormat, Run, Tone,
+    Block, BlockId, BlockKind, Body, BodyShape, CalloutLook, Document, Extra, FORMAT, ListKind, Mark, Preview,
+    Properties, PropertiesFormat, Run, Tone,
 };
 pub use history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
 pub use json::JsonError;

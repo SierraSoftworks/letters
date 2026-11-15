@@ -54,5 +54,11 @@
   { "why": "a link preview's title has two lines", "at": "blocks[0].title", "json": { "format": 1, "blocks": [{ "id": "a", "type": "link_preview", "url": "https://example.com/", "title": "one\ntwo" }] } },
   { "why": "a link preview's picture is an address", "at": "blocks[0].image",
     "json": { "format": 1, "blocks": [{ "id": "a", "type": "link_preview", "url": "https://example.com/", "image": "https://example.com/a.png" }] } },
-  { "why": "a gallery holds a table of contents", "at": "blocks[0].blocks[0]", "json": { "format": 1, "blocks": [{ "id": "g", "type": "gallery", "blocks": [{ "id": "a", "type": "table_of_contents", "levels": 2 }] }] } }
+  { "why": "a gallery holds a table of contents", "at": "blocks[0].blocks[0]", "json": { "format": 1, "blocks": [{ "id": "g", "type": "gallery", "blocks": [{ "id": "a", "type": "table_of_contents", "levels": 2 }] }] } },
+  { "why": "the previews are not an object", "at": "previews", "json": { "format": 1, "previews": ["https://example.com/"] } },
+  { "why": "a preview is not an object", "at": "previews[https://example.com/]", "json": { "format": 1, "previews": { "https://example.com/": "A post" } } },
+  { "why": "a preview has no address", "at": "previews[]", "json": { "format": 1, "previews": { "": { "title": "A post" } } } },
+  { "why": "a preview's address is two lines", "at": "previews[https://example.com/\npost]", "json": { "format": 1, "previews": { "https://example.com/\npost": { "title": "A post" } } } },
+  { "why": "a preview's title is two lines", "at": "previews[https://example.com/].title", "json": { "format": 1, "previews": { "https://example.com/": { "title": "one\ntwo" } } } },
+  { "why": "a preview's picture is an address", "at": "previews[https://example.com/].image", "json": { "format": 1, "previews": { "https://example.com/": { "image": "https://example.com/a.png" } } } }
 ]

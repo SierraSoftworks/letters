@@ -36,5 +36,12 @@
       { "id": "b", "type": "link_preview", "title": "", "image": "", "description": "Two\nlines", "url": "mailto:ask@example.com" }] } },
   { "why": "a table of contents may stand anywhere a block may, and many may stand in one document",
     "json": { "format": 1, "blocks": [{ "id": "a", "type": "table_of_contents", "levels": 1 },
-      { "id": "q", "type": "quote", "blocks": [{ "id": "b", "type": "table_of_contents", "levels": 4 }] }] } }
+      { "id": "q", "type": "quote", "blocks": [{ "id": "b", "type": "table_of_contents", "levels": 4 }] }] } },
+  { "why": "a document keeps what it knows of the pages its links lead to, also of one no link names, with fields it does not know",
+    "json": { "format": 1,
+      "previews": { "https://example.com/post": { "title": "A post", "description": "Two\nlines", "image": "assets/0a1b.jpg", "site": "Example" },
+        "mailto:ask@example.com": { "title": "Ask" } },
+      "blocks": [{ "id": "a", "type": "paragraph", "content": [{ "text": "a post", "link": "https://example.com/post" }] }] } },
+  { "why": "a preview that tells nothing reads as none, and a field that is empty as one left out",
+    "json": { "format": 1, "previews": { "https://example.com/": {}, "https://example.org/": { "title": "", "image": "", "description": "Kept" } } } }
 ]
