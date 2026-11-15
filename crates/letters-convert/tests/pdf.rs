@@ -13,6 +13,16 @@ fn written(doc: &Document, info: &PdfInfo) -> Pdf {
     Pdf::new(bytes).expect("a reader can open the PDF")
 }
 
+fn fonts() -> Fonts {
+    Fonts { faces: letters_fonts::bundled() }
+}
+
+/// How many pictures the first page of a PDF draws from.
+fn pictures(bytes: Vec<u8>) -> usize {
+    let pdf = Pdf::new(bytes).expect("a reader can open the PDF");
+    pdf.pages()[0].resources().x_objects.keys().count()
+}
+
 fn export(info: &PdfInfo) -> Pdf {
     let doc = Document { blocks: vec![Block::text("a", BlockKind::Paragraph, "Rates")], ..Document::default() };
     written(&doc, info)
@@ -139,11 +149,6 @@ fn a_linked_picture_is_drawn_when_the_shell_has_loaded_it() {
     // The same picture twice, and one the shell never loaded.
     let blocks = vec![linked("a", near), linked("b", near), linked("c", far)];
     let doc = Document { blocks, ..Document::default() };
-    let pictures = |bytes: Vec<u8>| {
-        let pdf = Pdf::new(bytes).expect("a reader can open the PDF");
-        pdf.pages()[0].resources().x_objects.keys().count()
-    };
-    let fonts = || Fonts { faces: letters_fonts::bundled() };
     let (style, info) = (Style::default(), PdfInfo::default());
     let plain = to_pdf(&doc, &style, fonts(), &mut |_| None, &info).unwrap();
     assert_eq!(pictures(plain), 0, "an export fetches nothing, so a link is an empty frame");
@@ -157,4 +162,26 @@ fn a_linked_picture_is_drawn_when_the_shell_has_loaded_it() {
     let shown = to_pdf_with(&doc, &style, fonts(), &mut |_| None, &info, sources).unwrap();
     assert_eq!(asked, [near, far], "each address is asked for once");
     assert_eq!(pictures(shown), 1, "the picture the shell has is in the PDF, once for both places");
+}
+
+#[test]
+fn a_link_preview_shows_its_picture() {
+    let card = |id: &str| {
+        let kind = BlockKind::LinkPreview {
+            url: "https://example.com/rates".into(),
+            title: Some("Rates".into()),
+            description: None,
+            image: Some("assets/card.png".into()),
+        };
+        Block::new(id, kind)
+    };
+    let doc = Document { blocks: vec![card("a"), card("b")], ..Document::default() };
+    let mut asked = 0;
+    let mut assets = |name: &str| {
+        asked += 1;
+        (name == "assets/card.png").then(|| PICTURE.to_vec())
+    };
+    let shown = to_pdf(&doc, &Style::default(), fonts(), &mut assets, &PdfInfo::default()).unwrap();
+    assert_eq!(pictures(shown), 1, "the picture is in the PDF, once for both cards");
+    assert_eq!(asked, 1, "and is read once");
 }

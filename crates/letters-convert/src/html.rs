@@ -58,7 +58,7 @@ pub type Assets<'a> = &'a mut dyn FnMut(&str) -> Option<Vec<u8>>;
 ///   that does says so with `dir`, and has its marker and its indent at the right, and so has a quote, of
 ///   the class `rtl`, whose first block does.
 /// - A table of contents is a line for each heading it lists, which leads to the heading. A link preview
-///   is a card that is one link, with its picture written in.
+///   is a card that is one link, with its picture written in. Both are set as layout draws them.
 /// - An unknown block is written as its fallback text. Unknown marks and fields are left out.
 pub fn to_html(doc: &Document, style: &Style, title: &str, assets: Assets) -> String {
     to_html_with(doc, style, title, assets, &HtmlPage::default())
@@ -218,10 +218,20 @@ impl Figures {
 /// headings, so a page has to spell them out.
 #[derive(Default)]
 struct Contents {
-    /// The lines of each table: the heading each leads to, its level and its text.
-    tables: BTreeMap<BlockId, Vec<(BlockId, u8, String)>>,
+    /// The lines of each table.
+    tables: BTreeMap<BlockId, Vec<Entry>>,
     /// The headings some table lists. Each carries its block's id, for a line to lead to.
     listed: BTreeSet<BlockId>,
+}
+
+/// A line of a table of contents.
+struct Entry {
+    heading: BlockId,
+    level: u8,
+    /// The heading's text, as a link to the heading.
+    runs: Vec<Run>,
+    /// Whether it reads from the right, and so is set in from there.
+    rtl: bool,
 }
 
 impl Contents {
@@ -229,11 +239,18 @@ impl Contents {
         let mut contents = Self::default();
         for table in doc.walk().filter(|block| matches!(block.kind, BlockKind::TableOfContents { .. })) {
             let line = |heading: &Block| match heading.kind {
-                BlockKind::Heading { level } => Some((heading.id.clone(), level, heading.plain_text())),
+                BlockKind::Heading { level } => {
+                    let mut address = String::from("#");
+                    fragment(&heading.id, &mut address);
+                    // The whole line leads to the heading, so nothing in it leads anywhere of its own.
+                    let leads = |run: &Run| Run { link: Some(address.clone()), ..run.clone() };
+                    let runs = heading.body.runs().iter().map(leads).collect();
+                    Some(Entry { heading: heading.id.clone(), level, runs, rtl: letters_layout::rtl(heading) })
+                }
                 _ => None,
             };
             let lines: Vec<_> = doc.contents(&table.id).into_iter().filter_map(line).collect();
-            contents.listed.extend(lines.iter().map(|(id, ..)| id.clone()));
+            contents.listed.extend(lines.iter().map(|line| line.heading.clone()));
             contents.tables.insert(table.id.clone(), lines);
         }
         contents
@@ -361,17 +378,6 @@ fn written(block: &Block, page: &mut Writing, out: &mut String) {
                 out.push_str("</p>\n");
             }
         }
-        // Until layout draws these two as what they are, the window shows a line that says what stands
-        // there, and the page that stands in for the window shows the same.
-        BlockKind::TableOfContents { .. } | BlockKind::LinkPreview { .. } if page.window => {
-            let said = match &block.kind {
-                BlockKind::LinkPreview { url, title, .. } => title.as_deref().unwrap_or(url),
-                _ => "Table of contents",
-            };
-            out.push_str("<p class=\"unknown\">");
-            escape(said, out);
-            out.push_str("</p>\n");
-        }
         BlockKind::LinkPreview { url, title, description, image } if page.contents.is_some() => {
             let card =
                 Preview { url, title: title.as_deref(), description: description.as_deref(), image: image.as_deref() };
@@ -388,19 +394,24 @@ fn written(block: &Block, page: &mut Writing, out: &mut String) {
     }
 }
 
-/// Writes a table of contents: a line for each heading it lists, set in by the heading's depth, that leads
-/// to the heading. One that lists nothing is left out, and so is one in a copy, which has no page to lead into.
+/// Writes a table of contents as layout draws it: a line for each heading it lists, in the heading's own
+/// words, set in by the heading's depth, that leads to the heading. One that lists nothing says so in the
+/// window alone, and one in a copy is left out, which has no page to lead into.
 fn contents(table: &BlockId, page: &Writing, out: &mut String) {
-    let lines = page.contents.as_ref().and_then(|contents| contents.tables.get(table));
-    let Some(lines) = lines.filter(|lines| !lines.is_empty()) else { return };
-    let top = lines.iter().map(|(_, level, _)| *level).min().unwrap_or(1);
+    let Some(lines) = page.contents.as_ref().and_then(|contents| contents.tables.get(table)) else { return };
+    if lines.is_empty() {
+        if page.window {
+            out.push_str("<nav class=\"contents\">\n<p class=\"none\">No headings yet</p>\n</nav>\n");
+        }
+        return;
+    }
+    let top = lines.iter().map(|line| line.level).min().unwrap_or(1);
     out.push_str("<nav class=\"contents\">\n");
-    for (heading, level, title) in lines {
-        let _ = write!(out, "<p class=\"level-{}\"><a href=\"#", level - top + 1);
-        fragment(heading, out);
-        out.push_str("\">");
-        escape(title, out);
-        out.push_str("</a></p>\n");
+    for line in lines {
+        let _ =
+            write!(out, "<p class=\"level-{}\"{}>", line.level - top + 1, if line.rtl { " dir=\"rtl\"" } else { "" });
+        inline(&line.runs, page.text(0), out);
+        out.push_str("</p>\n");
     }
     out.push_str("</nav>\n");
 }
@@ -423,9 +434,9 @@ struct Preview<'a> {
     image: Option<&'a str>,
 }
 
-/// Writes a link preview as a card that is one link: its picture, its title, its description and where it
-/// leads. One that was never fetched shows its address alone. An address that would run script makes a
-/// card that leads nowhere.
+/// Writes a link preview as layout draws it, a card that is one link: its picture, then its title, its
+/// description and the host it leads to. One that was never fetched shows its address alone. An address
+/// that would run script makes a card that leads nowhere.
 fn preview(card: &Preview, page: &mut Writing, out: &mut String) {
     let address = href(card.url);
     let tag = if address.is_some() { "a" } else { "div" };
@@ -436,6 +447,12 @@ fn preview(card: &Preview, page: &mut Writing, out: &mut String) {
         out.push('"');
     }
     out.push_str(">\n");
+    if (card.title, card.description, card.image) == (None, None, None) {
+        out.push_str("<span class=\"url\">");
+        escape(card.url.trim(), out);
+        let _ = writeln!(out, "</span>\n</{tag}>");
+        return;
+    }
     let held = card.image.and_then(|name| {
         let bytes = (page.assets)(name)?;
         Some((media_type(name, &bytes)?, bytes))
@@ -444,19 +461,14 @@ fn preview(card: &Preview, page: &mut Writing, out: &mut String) {
         // The title beside it says what the picture is of.
         let _ = writeln!(out, "<img src=\"data:{media};base64,{}\" alt=\"\">", base64(&bytes));
     }
-    let title = card.title.filter(|title| !title.trim().is_empty());
-    out.push_str("<span class=\"preview-text\"><strong>");
-    escape(title.unwrap_or(card.url), out);
-    out.push_str("</strong>");
-    if let Some(description) = card.description.filter(|description| !description.trim().is_empty()) {
-        out.push_str("<span>");
-        text(description, out);
-        out.push_str("</span>");
-    }
-    if title.is_some() {
-        out.push_str("<small>");
-        escape(host(card.url), out);
-        out.push_str("</small>");
+    out.push_str("<span class=\"preview-text\">");
+    let host = Some(host(card.url)).filter(|host| !host.is_empty()).unwrap_or(card.url);
+    for (tag, said) in [("strong", card.title), ("span", card.description), ("small", Some(host))] {
+        if let Some(said) = said {
+            let _ = write!(out, "<{tag}>");
+            escape(said.trim(), out);
+            let _ = write!(out, "</{tag}>");
+        }
     }
     let _ = writeln!(out, "</span>\n</{tag}>");
 }
@@ -975,7 +987,7 @@ fn space_rule(selector: &str, before: f32, after: f32, css: &mut String) {
 }
 
 /// The element types that set text, each with the elements written in it.
-const TYPES: [(&str, &str); 11] = [
+const TYPES: [(&str, &str); 12] = [
     ("body", "p, li"),
     ("body", "th, td"),
     ("body", ".preview"),
@@ -986,6 +998,7 @@ const TYPES: [(&str, &str); 11] = [
     ("quote", "blockquote p, blockquote li"),
     ("code", "pre"),
     ("caption", "figcaption, .fallback, .unknown"),
+    ("caption", ".preview-text > span"),
     ("title", ".title"),
 ];
 
@@ -1007,13 +1020,15 @@ fn colours(style: &Style, on: &Palette, css: &mut String) {
         css,
         ":not(pre) > code {{ background: {inline_code}; }}\n\
          pre {{ background: {code_fill}; }}\n\
-         li::before, .unknown {{ color: {marker}; }}\n\
+         li::before, .unknown, .contents > .none, .preview-text > small {{ color: {marker}; }}\n\
+         .preview > img {{ background: {code_fill}; }}\n\
          li.task > input {{ border-color: {line_strong}; }}\n\
          li.task > input:checked {{ border-color: {accent}; background: {accent} {tick}; }}\n\
          blockquote, .unknown {{ border-color: {line_strong}; }}\n\
          hr, th, td, .preview {{ border-color: {line}; }}\n\
          a {{ color: {link}; }}\n\
          a.ref, .contents a {{ color: inherit; }}\n\
+         .preview > .url {{ color: {link}; }}\n\
          .ref.missing {{ color: {warning}; }}\n\
          mark {{ background: {highlight}; }}\n",
         inline_code = color(on.inline_code),
@@ -1132,7 +1147,10 @@ fn css(style: &Style, with: &HtmlPage, css: &mut String) {
     type_rule("p, li", &body, false, css);
     type_rule("th, td", &body, false, css);
     type_rule(".preview", &body, false, css);
+    type_rule(".preview-text > span, .preview-text > small", &of("caption"), false, css);
     space_rule("p", body.space_before, body.space_after, css);
+    // A table of contents and a link preview keep the room a paragraph does.
+    space_rule(".contents, .preview", body.space_before, body.space_after, css);
     for level in 1..=4 {
         let (heading, selector) = (of(&format!("heading{level}")), format!("h{level}"));
         type_rule(&selector, &heading, false, css);
@@ -1140,6 +1158,7 @@ fn css(style: &Style, with: &HtmlPage, css: &mut String) {
     }
     type_rule("blockquote p, blockquote li", &quote, false, css);
     space_rule("blockquote p", quote.space_before, quote.space_after, css);
+    space_rule("blockquote .contents, blockquote .preview", quote.space_before, quote.space_after, css);
     type_rule("pre", &code, true, css);
     space_rule("pre", code.space_before.max(code.space_after), code.space_after, css);
     for (key, selector) in [("caption", "figcaption, .fallback, .unknown"), ("title", ".title")] {
@@ -1196,20 +1215,25 @@ fn css(style: &Style, with: &HtmlPage, css: &mut String) {
          .gallery > .row + .row {{ margin-top: 8px; }}\n\
          .gallery > .row > * {{ flex: 1; min-width: 0; margin: 0; }}\n\
          a.ref {{ text-decoration: none; }}\n\
-         .contents {{ margin: {after} 0; }}\n\
-         .contents > p {{ margin: 0; }}\n\
-         .contents > .level-2 {{ padding-left: 16px; }}\n\
-         .contents > .level-3 {{ padding-left: 32px; }}\n\
-         .contents > .level-4 {{ padding-left: 48px; }}\n\
-         .contents a, .preview {{ text-decoration: none; }}\n\
-         .preview {{ display: flex; align-items: flex-start; gap: 16px; margin: {after} 0; padding: 12px 16px; \
-         border: 1px solid; border-radius: 6px; }}\n\
-         .preview > img {{ flex: none; width: 96px; border-radius: 4px; }}\n\
-         .preview-text {{ min-width: 0; overflow-wrap: anywhere; }}\n\
-         .preview-text > * {{ display: block; }}\n\
-         .preview-text > strong {{ font-weight: 600; }}\n\
-         .preview-text > small {{ opacity: 0.7; }}\n\
          p, h1, h2, h3, h4, th, td, figcaption {{ unicode-bidi: plaintext; }}\n\
+         .contents > p {{ margin: 0; padding-inline-end: {page_number}; }}\n\
+         .contents > p + p {{ margin-top: 3px; }}\n\
+         .contents > .level-2 {{ padding-inline-start: 24px; }}\n\
+         .contents > .level-3 {{ padding-inline-start: 48px; }}\n\
+         .contents > .level-4 {{ padding-inline-start: 72px; }}\n\
+         .contents a, .preview {{ text-decoration: none; }}\n\
+         .preview {{ display: flex; align-items: flex-start; gap: 16px; padding: 11px 15px; border: 1px solid; \
+         border-radius: 6px; container-type: inline-size; }}\n\
+         .preview > img {{ flex: none; width: 120px; height: 80px; object-fit: cover; border-radius: 3px; }}\n\
+         @container (max-width: 295px) {{ .preview > img {{ display: none; }} }}\n\
+         .preview-text {{ flex: 1; min-width: 0; align-self: center; display: flex; flex-direction: column; \
+         gap: 3px; }}\n\
+         .preview-text > *, .preview > .url {{ display: -webkit-box; -webkit-box-orient: vertical; \
+         overflow: hidden; unicode-bidi: plaintext; }}\n\
+         .preview-text > strong, .preview > .url {{ -webkit-line-clamp: 2; line-clamp: 2; }}\n\
+         .preview-text > span {{ -webkit-line-clamp: 3; line-clamp: 3; text-align: start; }}\n\
+         .preview-text > small {{ -webkit-line-clamp: 1; line-clamp: 1; text-align: start; }}\n\
+         .preview > .url {{ flex: 1; min-width: 0; padding-inline-end: 128px; }}\n\
          .math.display > svg {{ display: block; margin: 0 auto; max-width: 100%; height: auto; }}\n\
          article > :first-child, blockquote > :first-child, .callout > :first-child, \
          .callout > .callout-title + * {{ margin-top: 0; }}\n\
@@ -1218,6 +1242,8 @@ fn css(style: &Style, with: &HtmlPage, css: &mut String) {
          mark {{ color: inherit; }}\n\
          .tok-comment {{ font-style: italic; }}\n",
         after = px(unit),
+        // The room a sheet sets a page number in, which a line keeps on screen too, so that it breaks alike.
+        page_number = px((body.size * PIXELS * 2.6).round()),
         rule_gap = px(unit * 2.0),
     );
     colours(style, &PAGE, css);

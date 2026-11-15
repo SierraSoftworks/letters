@@ -95,18 +95,21 @@ pub fn to_pdf_with(
             layout.set_tokens(&block.id, tokens(language.as_deref(), &block.plain_text()));
         }
     }
-    // Each image is read and decoded once: a linked one here, so that its place is drawn at its own shape,
-    // and one the file holds when the first page that shows it is painted.
+    // Each image is read and decoded once: one the file holds when the first page that shows it is
+    // painted, and those layout must know the size of here. A linked one is drawn at its own shape, and
+    // a link preview's fills its slot only at a size that is known.
     let (mut images, mut asked) = (Images::default(), BTreeSet::new());
-    if let Some(linked) = &mut sources.linked {
-        for block in doc.walk() {
-            if let BlockKind::Figure { asset: None, src: Some(src), .. } = &block.kind
-                && asked.insert(src.clone())
-                && let Some(image) = linked(src).and_then(|bytes| Image::decode(&bytes).ok())
-            {
-                layout.set_loaded(src, Some((image.width(), image.height())));
-                images.insert(src.clone(), image);
+    for block in doc.walk() {
+        let (name, bytes) = match (&block.kind, &mut sources.linked) {
+            (BlockKind::Figure { asset: None, src: Some(src), .. }, Some(linked)) if asked.insert(src.clone()) => {
+                (src, linked(src))
             }
+            (BlockKind::LinkPreview { image: Some(name), .. }, _) if asked.insert(name.clone()) => (name, assets(name)),
+            _ => continue,
+        };
+        if let Some(image) = bytes.and_then(|bytes| Image::decode(&bytes).ok()) {
+            layout.set_loaded(name, Some((image.width(), image.height())));
+            images.insert(name.clone(), image);
         }
     }
     let mut pages = layout.paginate(page);
