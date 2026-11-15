@@ -153,6 +153,26 @@ fn replicas_that_trade_extents_send_only_what_the_other_lacks() {
     }
 }
 
+#[test]
+fn an_update_that_arrives_before_what_it_builds_on_waits_and_the_extent_tells() {
+    let (mut a, mut b) = pair();
+    let start = a.extent();
+    a.apply([typed("p", 0, "1")]).unwrap();
+    let (first, between) = (a.updates_for(&start), a.extent());
+    a.apply([typed("p", 0, "2")]).unwrap();
+    let second = a.updates_for(&between);
+    let reach = Extent::of(&second).unwrap();
+    let holds = |model: &Model| model.extent() >= reach;
+
+    let held = b.extent();
+    assert_eq!(b.merge(&second), Ok(Change::default()), "an update with a gap before it showed");
+    assert!(b.extent() == held && !holds(&b), "an update that waits counts as held");
+
+    b.merge(&first).unwrap();
+    assert_eq!(texts(&b)[0], "21Hello world", "the update did not land once the gap was filled");
+    assert!(holds(&b) && b.extent() == a.extent());
+}
+
 fn round_trip(extent: &Extent) -> Extent {
     Extent::from_bytes(&extent.to_bytes()).unwrap()
 }

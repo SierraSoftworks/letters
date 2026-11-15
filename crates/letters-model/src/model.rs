@@ -817,6 +817,10 @@ impl Model {
 
     /// Takes in what another replica wrote. Merging is commutative and idempotent: replicas that have seen
     /// the same edits show the same document, and a merge that adds nothing changes nothing.
+    ///
+    /// An update that builds on edits this history lacks changes nothing yet. It waits, in memory only, and
+    /// lands when those edits arrive. Until then [`Model::extent`] does not cover it and [`Model::save`]
+    /// does not hold it, so a replica that must not lose it asks for what is missing by its extent.
     pub fn merge(&mut self, history: &[u8]) -> Result<Change, HistoryError> {
         self.loro().import(history).map_err(unreadable)?;
         Ok(self.drain())
