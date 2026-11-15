@@ -115,15 +115,18 @@ fn marked(reduced_motion: bool) -> Harness {
 
 const INSIDE: usize = 11;
 
-/// Lets the window do the work it keeps for idle time, all of it.
+/// Lets the window do the work it keeps for idle time, all of it, as a shell does: it asks what moves, paints
+/// the frame, and comes back for as long as it is told to at once.
 fn rest(window: &mut Harness) {
-    // A frame that is owed comes first.
-    window.paint();
     let mut steps = 0;
-    while window.ui().animate(0) == Some(0) {
+    loop {
+        let again = window.ui().animate(0);
+        window.paint();
+        if again != Some(0) {
+            break;
+        }
         steps += 1;
         assert!(steps < 10_000, "idle work comes to an end");
-        window.paint();
     }
 }
 
@@ -863,6 +866,26 @@ fn misspelled_words_are_underlined_once_the_window_has_a_moment() {
     let (from, to) = (spot(&mut window, "b1", 4), spot(&mut window, "b1", 8));
     assert!((start.x - from.x).abs() < 1.5 && (end.x - to.x).abs() < 1.5, "the line runs under the word");
     assert!(start.y > from.y && start.y < from.y + from.height + 4.0, "at the foot of its letters");
+}
+
+#[test]
+fn a_long_document_is_checked_where_the_reader_is_first() {
+    let lines = (0..400).map(|n| text(&format!("p{n}"), BlockKind::Paragraph, "One more lnie of the letter."));
+    let mut window = Harness::open(Document { blocks: lines.collect(), ..Document::default() });
+    let middle = page(&mut window);
+    let middle = Point { x: middle.x + middle.width / 2.0, y: middle.y + middle.height / 2.0 };
+    window.scroll_at(middle, 1e6);
+
+    let mut steps = 0;
+    while waves(&mut window).is_empty() {
+        assert_eq!(window.ui().animate(0), Some(0), "there is still work to do");
+        steps += 1;
+        assert!(steps < 10_000, "the words in view are marked");
+    }
+    window.scroll_at(middle, -1e6);
+    assert_eq!(waves(&mut window), [], "the top of the document waits its turn");
+    rest(&mut window);
+    assert!(!waves(&mut window).is_empty(), "which comes");
 }
 
 #[test]

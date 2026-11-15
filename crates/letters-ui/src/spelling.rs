@@ -82,21 +82,37 @@ impl Spelling {
         self.check(change.blocks.len().min(EAGER), doc, caret, true, layout);
     }
 
-    /// Checks a little more of the document. Returns whether any of it was left to check.
-    pub fn idle(&mut self, doc: &Document, caret: Option<&Pos>, layout: &mut DocLayout) -> bool {
-        if self.done {
-            return false;
-        }
-        self.check(BATCH, doc, caret, false, layout);
-        true
+    /// Whether every block has been checked since anything changed.
+    pub fn done(&self) -> bool {
+        self.done
     }
 
-    fn check(&mut self, blocks: usize, doc: &Document, caret: Option<&Pos>, typing: bool, layout: &mut DocLayout) {
+    /// Checks a little more of the document, the blocks `in_view` before the rest. Returns whether the marks
+    /// of any of those changed.
+    pub fn idle(&mut self, doc: &Document, caret: Option<&Pos>, in_view: &[BlockId], layout: &mut DocLayout) -> bool {
+        self.proofing.check_first(in_view);
+        let changed = self.check(BATCH, doc, caret, false, layout);
+        changed.iter().any(|block| in_view.contains(block))
+    }
+
+    /// Checks the next `blocks` blocks that wait for it. Returns those whose marks changed.
+    fn check(
+        &mut self,
+        blocks: usize,
+        doc: &Document,
+        caret: Option<&Pos>,
+        typing: bool,
+        layout: &mut DocLayout,
+    ) -> Vec<BlockId> {
+        let mut changed = Vec::new();
         for _ in 0..blocks {
             let Some(checked) = self.proofing.step(&self.speller, doc) else {
                 self.done = true;
-                return;
+                break;
             };
+            if checked.changed {
+                changed.push(checked.block.clone());
+            }
             let mut marks = self.proofing.marks(&checked.block).to_vec();
             // A word that was held back stays so through a check that no typing asked for.
             let held = self.withheld.take_if(|(block, _)| *block == checked.block).is_some();
@@ -108,6 +124,7 @@ impl Spelling {
             // Set even when the block has none, since the page carries an edited block's old marks along.
             layout.set_spelling(&checked.block, marks);
         }
+        changed
     }
 
     /// Marks the word that was being typed, once the caret has left it. `caret` is where a caret now stands.

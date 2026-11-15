@@ -28,7 +28,7 @@ use crate::spelling::{Fix, Spelling};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::text::{Family, FontShaper, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::ui::{App, Keys, Ui};
+use crate::ui::{App, Idle, Keys, Ui};
 use crate::widgets::{
     Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, TopBar, side_panel, top_bar,
 };
@@ -1373,14 +1373,29 @@ impl App for EditorApp {
         note
     }
 
-    fn idle(&mut self) -> bool {
+    fn idle(&mut self) -> Idle {
         if self.estimated {
             // Blocks above the part in view change height as they are laid out.
             self.held(|app| app.estimated = app.layout.settle(app.viewport(), SETTLE_BYTES));
-            return true;
+            return Idle::Unseen;
+        }
+        if self.spelling.done() {
+            return Idle::Done;
+        }
+        // What the reader is looking at is checked first.
+        let (doc, view) = (self.editor.doc(), self.viewport());
+        let at = |y: f32| self.layout.hit(Point { x: 0.0, y }).map(|pos| pos.block);
+        let mut in_view = Vec::new();
+        if let (Some(first), Some(last)) = (at(view.y.max(0.0)), at(view.y + view.height)) {
+            in_view.extend(doc.walk().map(|block| block.id.clone()).skip_while(|id| *id != first));
+            let shown = in_view.iter().position(|id| *id == last).map_or(in_view.len(), |at| at + 1);
+            in_view.truncate(shown);
         }
         let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
-        self.spelling.idle(self.editor.doc(), caret, &mut self.layout)
+        match self.spelling.idle(doc, caret, &in_view, &mut self.layout) {
+            true => Idle::Seen,
+            false => Idle::Unseen,
+        }
     }
 }
 

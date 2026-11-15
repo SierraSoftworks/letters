@@ -95,11 +95,22 @@ pub trait App {
         None
     }
 
-    /// Does a little of any work that was put off, such as laying out text that is out of sight. Returns
-    /// whether there was any. It is called while nothing else is happening.
-    fn idle(&mut self) -> bool {
-        false
+    /// Does a little of any work that was put off, such as laying out text that is out of sight. It is
+    /// called while nothing else is happening, until it says there was none.
+    fn idle(&mut self) -> Idle {
+        Idle::Done
     }
+}
+
+/// What a step of an app's idle work came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Idle {
+    /// There was nothing to do.
+    Done,
+    /// Something was done that changed nothing in sight.
+    Unseen,
+    /// Something was done that shows, so the window is described and painted again before the next step.
+    Seen,
 }
 
 #[derive(Clone, Copy)]
@@ -276,7 +287,8 @@ impl<A: App> Ui<A> {
     }
 
     /// Advances what moves on its own: the caret's blink, and the app's idle work. Returns when to call
-    /// again, or `None` when nothing is left to move.
+    /// again, or `None` when nothing is left to move. Idle work waits for a frame that is owed, so paint
+    /// between calls: the answer is `now_ms` until that work is done.
     pub fn animate(&mut self, now_ms: u64) -> Option<u64> {
         self.refresh();
         let moving = self.app.animate(now_ms);
@@ -289,10 +301,15 @@ impl<A: App> Ui<A> {
             (Some(next), Some(moving)) => Some(next.min(moving)),
             (next, moving) => next.or(moving),
         };
-        // A frame that is owed comes before work on what is out of sight.
-        if self.idle.0 && !self.needs_paint() {
-            if self.app.idle() {
-                self.idle.1 = true;
+        // A frame that is owed comes before work on what is out of sight, which the call after it does.
+        if self.idle.0 && self.needs_paint() {
+            return Some(now_ms);
+        }
+        if self.idle.0 {
+            let step = self.app.idle();
+            if step != Idle::Done {
+                self.stale.view |= step == Idle::Seen;
+                self.idle.1 |= step == Idle::Unseen;
                 return Some(now_ms);
             }
             // The work may have changed what shows, such as how far a page scrolls.

@@ -452,8 +452,9 @@ fn the_window_repaints_only_when_something_changed() {
 #[test]
 fn the_caret_blinks_while_a_field_has_focus() {
     let mut desk = named("Ana");
+    desk.paint();
     assert_eq!(desk.ui().animate(0), None, "nothing blinks without a caret");
-    desk.click(Role::TextInput, "Name");
+    desk.click(Role::TextInput, "Name").paint();
     let next = desk.ui().animate(1000).expect("a field's caret blinks");
     assert!(next > 1000);
     desk.paint();
