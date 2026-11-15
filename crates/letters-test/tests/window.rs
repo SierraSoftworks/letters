@@ -1960,9 +1960,9 @@ fn a_sheet_slides_out_from_under_its_formula() {
     assert_eq!(heights[28], heights[29], "to rest within a quarter of a second: {heights:?}");
 }
 
-/// The symbols the sheet lists, top to bottom: each command, its plain name, and whether it is the one
-/// picked.
-fn symbols(window: &mut Harness) -> Vec<(String, String, bool)> {
+/// The options a list beside the caret shows, top to bottom: each one's name, what is said beside it, and
+/// whether it is the one picked. The sheet's symbols are such a list, and so are the insert menu's offers.
+fn options(window: &mut Harness) -> Vec<(String, String, bool)> {
     let option = |found: letters_test::Found| {
         let picked = found.selected.filter(|_| found.role == Role::ListBoxOption)?;
         Some((found.name, found.description.unwrap_or_default(), picked))
@@ -1981,13 +1981,13 @@ fn typing(typed: &str) -> Harness {
 fn a_backslash_lists_the_symbols_that_match_what_follows_it() {
     let mut window = typing(r" \ap");
     window.assert_open(Role::ListBox, "Symbols");
-    let listed = symbols(&mut window);
+    let listed = options(&mut window);
     assert_eq!(listed[0], (r"\approx".to_owned(), "approximately equal to".to_owned(), true), "{listed:?}");
     assert!(listed.len() > 1 && listed[1..].iter().all(|symbol| !symbol.2), "one is picked: {listed:?}");
 
     // The list follows what is typed, and a plain name finds a symbol as well as its command does.
     window.key("Backspace").key("Backspace").type_text("fraction");
-    assert_eq!(symbols(&mut window)[0].0, r"\frac");
+    assert_eq!(options(&mut window)[0].0, r"\frac");
     window.type_text("zz");
     window.assert_closed(Role::ListBox, "Symbols");
 }
@@ -1995,9 +1995,9 @@ fn a_backslash_lists_the_symbols_that_match_what_follows_it() {
 #[test]
 fn tab_writes_the_picked_symbol_and_a_press_writes_the_one_pressed() {
     let mut window = typing(r" \ap");
-    let second = symbols(&mut window)[1].0.clone();
+    let second = options(&mut window)[1].0.clone();
     window.key("Down");
-    assert!(symbols(&mut window)[1].2, "Down picks the next one");
+    assert!(options(&mut window)[1].2, "Down picks the next one");
     window.key("Tab");
     assert_eq!(source(&mut window), Some(format!("{INLINE} {second}")));
     window.assert_closed(Role::ListBox, "Symbols");
@@ -2072,4 +2072,73 @@ fn the_dollar_that_closes_a_formula_blends_its_source_into_its_glyphs() {
         assert!(frames.iter().any(between), "{typed}: each shows through the other on the way: {frames:?}");
         assert_eq!(frames[29], rest, "{typed}: within a quarter of a second the formula is all that shows");
     }
+}
+
+/// The names of the options a list beside the caret shows.
+fn offered(window: &mut Harness) -> Vec<String> {
+    options(window).into_iter().map(|option| option.0).collect()
+}
+
+#[test]
+fn a_slash_on_an_empty_line_offers_what_to_put_there() {
+    let mut window = blank();
+    window.type_text("/");
+    window.assert_open(Role::ListBox, "Insert");
+    let all = options(&mut window);
+    assert_eq!(all[0], ("Heading 1".to_owned(), "#".to_owned(), true), "each offer shows its shorthand: {all:?}");
+    assert!(all.len() > 8 && all[1..].iter().all(|offer| !offer.2), "one is picked: {all:?}");
+
+    // What is typed after the slash narrows the menu, and what matches nothing puts it away for the moment.
+    window.type_text("li");
+    assert_eq!(offered(&mut window), ["Bulleted list", "Numbered list", "Task list"]);
+    window.type_text("zz");
+    window.assert_closed(Role::ListBox, "Insert");
+    window.key("Backspace").key("Backspace");
+    assert_eq!(offered(&mut window).len(), 3);
+    assert_eq!(block_text(&window, "p"), "/li", "the line is written as any other until an offer is taken");
+}
+
+#[test]
+fn the_insert_menu_puts_what_is_taken_on_its_line() {
+    // What is typed, how an offer is taken, and the document once "Roof" is written there.
+    let cases = [
+        ("/", "Enter", "# Roof"),
+        ("/", "Down Down Tab", "### Roof"),
+        ("/", "Up Enter", "---\n\nRoof"),
+        ("/task", "Enter", "- [ ] Roof"),
+        ("/quote", "a press", "> Roof"),
+        ("/code", "Enter", "```\nRoof\n```"),
+    ];
+    for (typed, take, expected) in cases {
+        let mut window = blank();
+        window.type_text(typed);
+        match take {
+            "a press" => window.click(Role::ListBoxOption, "Quote"),
+            keys => keys.split(' ').fold(&mut window, |window, key| window.key(key)),
+        };
+        window.assert_closed(Role::ListBox, "Insert");
+        window.type_text("Roof");
+        assert_eq!(window.markdown().trim_end(), expected, "{typed} then {take}");
+    }
+}
+
+#[test]
+fn the_insert_menu_stays_away_where_a_slash_is_only_a_slash() {
+    // A slash inside a line opens nothing.
+    let mut window = blank();
+    window.type_text("and/or");
+    window.assert_closed(Role::ListBox, "Insert");
+
+    // Escape puts the menu away and leaves the slash, which is then text like any other.
+    let mut window = blank();
+    window.type_text("/").key("Escape");
+    window.assert_closed(Role::ListBox, "Insert");
+    window.type_text("li");
+    window.assert_closed(Role::ListBox, "Insert");
+    assert_eq!(block_text(&window, "p"), "/li");
+
+    // So does a caret that leaves the end of the line.
+    let mut window = blank();
+    window.type_text("/").key("Left").key("Right");
+    window.assert_closed(Role::ListBox, "Insert");
 }

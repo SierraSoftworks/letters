@@ -25,6 +25,8 @@ pub const CLOUD_CHECK: Icon = Icon::new("M17 15l-5.5 5.5L9 18M5.516 16.07A7 7 0 
 pub const CLOUD_OFF: Icon = Icon::new("M10.94 5.274A7 7 0 0 1 15.71 10h1.79a4.5 4.5 0 0 1 4.222 6.057M18.796 18.81A4.5 4.5 0 0 1 17.5 19H9A7 7 0 0 1 5.79 5.78M2 2l20 20");
 /// `code`
 pub const CODE: Icon = Icon::new("M16 18l6-6-6-6M8 6l-6 6 6 6");
+/// `code-xml`
+pub const CODE_XML: Icon = Icon::new("M18 16l4-4-4-4M6 8l-4 4 4 4M14.5 4l-5 16");
 /// `copy`
 pub const COPY: Icon = Icon::new("M10 8h10a2 2 0 0 1 2 2v10a2 2 0 0 1 -2 2h-10a2 2 0 0 1 -2 -2v-10a2 2 0 0 1 2 -2zM4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2");
 /// `crown`
@@ -51,6 +53,12 @@ pub const FOLDER_OPEN: Icon = Icon::new("M6 14l1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 
 pub const FOLDER_PLUS: Icon = Icon::new("M12 10v6M9 13h6M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z");
 /// `folder-search`
 pub const FOLDER_SEARCH: Icon = Icon::new("M10.7 20H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v4.1M21 21l-1.9-1.9M14 17a3 3 0 1 0 6 0a3 3 0 1 0 -6 0");
+/// `heading-1`
+pub const HEADING_1: Icon = Icon::new("M4 12h8M4 18V6M12 18V6M17 12l3-2v8");
+/// `heading-2`
+pub const HEADING_2: Icon = Icon::new("M4 12h8M4 18V6M12 18V6M21 18h-4c0-4 4-3 4-6 0-1.5-2-2.5-4-1");
+/// `heading-3`
+pub const HEADING_3: Icon = Icon::new("M4 12h8M4 18V6M12 18V6M17.5 10.5c1.7-1 3.5 0 3.5 1.5a2 2 0 0 1-2 2M17 17.5c2 1.5 4 .3 4-1.5a2 2 0 0 0-2-2");
 /// `highlighter`
 pub const HIGHLIGHTER: Icon = Icon::new("M9 11l-6 6v3h9l3-3M22 12l-4.6 4.6a2 2 0 0 1-2.8 0l-5.2-5.2a2 2 0 0 1 0-2.8L14 4");
 /// `history`
@@ -63,6 +71,12 @@ pub const ITALIC: Icon = Icon::new("M19 4L10 4M14 20L5 20M15 4L9 20");
 pub const LINE_HEIGHT: Icon = Icon::new("M15 14H9M21 21H3M21 3H3M8 16l3.453-7.648a.6.6 0 011.094.001L16 16");
 /// `link`
 pub const LINK: Icon = Icon::new("M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71");
+/// `list`
+pub const LIST: Icon = Icon::new("M3 5h.01M3 12h.01M3 19h.01M8 5h13M8 12h13M8 19h13");
+/// `list-checks`
+pub const LIST_CHECKS: Icon = Icon::new("M13 5h8M13 12h8M13 19h8M3 17l2 2 4-4M3 7l2 2 4-4");
+/// `list-ordered`
+pub const LIST_ORDERED: Icon = Icon::new("M11 5h10M11 12h10M11 19h10M4 4h1v5M4 9h2M6.5 20H3.4c0-1 2.6-1.925 2.6-3.5a1.5 1.5 0 0 0-2.6-1.02");
 /// `list-tree`
 pub const LIST_TREE: Icon = Icon::new("M8 5h13M13 12h8M13 19h8M3 10a2 2 0 0 0 2 2h3M3 5v12a2 2 0 0 0 2 2h3");
 /// `message-square`
@@ -87,8 +101,12 @@ pub const REDO_2: Icon = Icon::new("M15 14l5-5-5-5M20 9H9.5A5.5 5.5 0 0 0 4 14.5
 pub const REFRESH_CW: Icon = Icon::new("M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8M21 3v5h-5M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16M8 16H3v5");
 /// `search`
 pub const SEARCH: Icon = Icon::new("M21 21l-4.34-4.34M3 11a8 8 0 1 0 16 0a8 8 0 1 0 -16 0");
+/// `separator-horizontal`
+pub const SEPARATOR_HORIZONTAL: Icon = Icon::new("M16 16l-4 4-4-4M3 12h18M8 8l4-4 4 4");
 /// `settings`
 pub const SETTINGS: Icon = Icon::new("M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915M9 12a3 3 0 1 0 6 0a3 3 0 1 0 -6 0");
+/// `sigma`
+pub const SIGMA: Icon = Icon::new("M18 7V5a1 1 0 0 0-1-1H6.5a.5.5 0 0 0-.4.8l4.5 6a2 2 0 0 1 0 2.4l-4.5 6a.5.5 0 0 0 .4.8H17a1 1 0 0 0 1-1v-2");
 /// `square`
 pub const SQUARE: Icon = Icon::new("M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z");
 /// `strikethrough`
@@ -101,6 +119,8 @@ pub const TEXT_ALIGN_END: Icon = Icon::new("M21 5H3M21 12H9M21 19H7");
 pub const TEXT_ALIGN_JUSTIFY: Icon = Icon::new("M3 5h18M3 12h18M3 19h18");
 /// `text-align-start`
 pub const TEXT_ALIGN_START: Icon = Icon::new("M21 5H3M15 12H3M17 19H3");
+/// `text-quote`
+pub const TEXT_QUOTE: Icon = Icon::new("M17 5H3M21 12H8M21 19H8M3 12v7");
 /// `trash-2`
 pub const TRASH_2: Icon = Icon::new("M10 11v6M14 11v6M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2");
 /// `type`

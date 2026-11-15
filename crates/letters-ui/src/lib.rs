@@ -14,6 +14,7 @@ mod element;
 mod highlight;
 pub mod icon;
 mod input;
+mod insert;
 mod layout;
 mod maths;
 pub mod motion;

@@ -21,6 +21,7 @@ use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::highlight;
 use crate::icon::{self, Icon};
+use crate::insert::{Insert, Inserting};
 use crate::maths::{self, Maths, Sheet, SheetLines, Source};
 use crate::motion::{self, FRAME_MS};
 use crate::opening::{self, Landing, Location, Recent, Request};
@@ -156,6 +157,7 @@ pub enum Message {
     Ask(Request),
     /// What is done on the sheet under a formula.
     Maths(Sheet),
+    Insert(Inserting),
 }
 
 impl Ui<EditorApp> {
@@ -430,6 +432,7 @@ pub struct EditorApp {
     spelling: Spelling,
     dragging: bool,
     maths: Maths,
+    insert: Insert,
     /// How the document read when assistive technology was last told of it.
     told: RefCell<describe::Told>,
 }
@@ -474,6 +477,7 @@ impl EditorApp {
             spelling: Spelling::default(),
             dragging: false,
             maths: Maths::default(),
+            insert: Insert::default(),
             told: RefCell::default(),
         }
     }
@@ -900,6 +904,7 @@ impl EditorApp {
 
         let viewport = self.viewport();
         let origin = Point { x: left, y: TOP - self.scrolled() };
+        self.insert.follow(&self.editor);
         let mut list = DisplayList::default();
         let selection = self.editor.selection();
         // A formula with the caret in it has its source out on a sheet, while the place under it is in view
@@ -963,6 +968,11 @@ impl EditorApp {
                 Popover::new(Element::from(field).width(300.0)).label("Link").open(true).on_close(Message::LinkClose);
             // The editor hangs from the caret, in place.
             element = element.popover(editor.at(caret.unwrap_or_default())).cursor(Cursor::Text);
+        } else if let Some((line, _, offers)) = self.insert.offers(&self.editor) {
+            // The menu hangs from the slash that opened it.
+            let slash = self.layout.caret(&Pos::new(line, 0)).unwrap_or_default();
+            let spot = Rect { x: origin.x + slash.x, y: origin.y + slash.y, ..slash };
+            element = element.popover(self.insert.menu(&offers).at(spot));
         } else if let Some(((source, rect), selection)) = sheet.zip(selection) {
             let spot = Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect };
             element =
@@ -1464,6 +1474,29 @@ impl EditorApp {
         self.maths.typed(false);
     }
 
+    /// Puts what an offer of the insert menu stands for on its line, in place of the slash and what was
+    /// typed after it.
+    fn put(&mut self, index: usize, platform: &mut dyn Platform) {
+        let Some((line, typed, offers)) = self.insert.offers(&self.editor) else { return };
+        let Some(kind) = offers.get(index).map(|offer| offer.kind.clone()) else { return };
+        self.insert.close();
+        self.editor.select(Selection { anchor: Pos::new(line.clone(), 0), head: Pos::new(line, typed) });
+        self.edit(platform, |editor, platform| editor.run(Command::Delete(Motion::Left), platform));
+        self.edit(platform, |editor, platform| editor.run(Command::SetBlock(kind), platform));
+    }
+
+    /// Lets the insert menu have the keys that walk it and take from it, while it shows.
+    fn insert_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        let plain = event.mods == Modifiers::default();
+        let Some((_, _, offers)) = self.insert.offers(&self.editor).filter(|_| plain) else { return false };
+        match event.key {
+            Key::Down | Key::Up => self.insert.pick(event.key == Key::Down, offers.len()),
+            Key::Enter | Key::Tab => self.put(self.insert.picked(offers.len()), platform),
+            _ => return false,
+        }
+        true
+    }
+
     /// Lets the list of symbols have the keys that walk it and take from it, while it shows.
     fn list_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
         let plain = event.mods == Modifiers::default();
@@ -1614,6 +1647,7 @@ impl App for EditorApp {
                 let before = before.map(|head| (self.layout.caret(&Pos::new(head.block.clone(), 0)), head));
                 self.edit(platform, |editor, platform| editor.input(event, platform));
                 self.maths.typed(true);
+                self.insert.typed(&self.editor);
                 if let Some((start, head)) = before {
                     self.close(&head, start);
                 }
@@ -1650,6 +1684,8 @@ impl App for EditorApp {
             Message::Styles(message) => self.styling(message, platform),
             Message::Ask(request) => self.requests.push(request),
             Message::Maths(message) => self.sheet(message, platform),
+            Message::Insert(Inserting::Take(index)) => self.put(index, platform),
+            Message::Insert(Inserting::Close) => self.insert.close(),
             Message::Jump(block) => {
                 let start = Pos { block, offset: 0 };
                 self.editor.select(Selection::caret(start.clone()));
@@ -1687,7 +1723,7 @@ impl App for EditorApp {
     }
 
     fn key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
-        if self.list_key(event, platform) {
+        if self.insert_key(event, platform) || self.list_key(event, platform) {
             return true;
         }
         let (mut used, mut edited) = (false, false);
