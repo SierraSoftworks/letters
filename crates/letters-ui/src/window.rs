@@ -242,6 +242,15 @@ impl Ui<EditorApp> {
         self.app_mut().spelling.add_dictionary(language, dictionary);
     }
 
+    /// Lets formulas link, as `\\href` asks. The shell turns it on for a document the person trusts, and it
+    /// is off until then.
+    pub fn set_maths_links(&mut self, links: bool) {
+        let app = self.app_mut();
+        app.held(|app| app.layout.set_maths_links(links));
+        // Formulas are set again, at heights that are estimates until idle time settles them.
+        app.estimated = true;
+    }
+
     /// Runs something on the editor from outside, such as taking in another writer's edits, and brings the
     /// page up to date with what it changed. The page stays where it is scrolled to.
     pub fn change<E>(&mut self, act: impl FnOnce(&mut Editor) -> Result<Change, E>) -> Result<(), E> {

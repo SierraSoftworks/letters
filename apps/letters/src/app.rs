@@ -18,6 +18,7 @@ use letters_model::{Model, ReplicaId, Revision, Style};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Size};
 use letters_spell::Dictionary;
+use letters_trust::Trust;
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{Cursor, Landing, Location, Request, SaveState, Scheme, Window as View, tokens};
 use rfd::{FileDialog, MessageDialog, MessageLevel};
@@ -274,6 +275,10 @@ struct DocWindow {
     /// The id of a document made here that has just been written for the first time, for the app to
     /// record as trusted wherever its file goes.
     vouch: Option<String>,
+    /// The document's id, once its file's manifest has been read or made.
+    id: Option<String>,
+    /// Whether the view was told that formulas may link, which a trusted document's may.
+    maths_links: bool,
     /// The languages a system dictionary has been looked for, each once whether or not there was one.
     asked: BTreeSet<String>,
     /// The view's edit count that is safely on disk.
@@ -395,6 +400,20 @@ impl DocWindow {
         }
         self.retitle();
         done.is_ok()
+    }
+
+    /// Tells the view how far the document is trusted, which for now decides whether its formulas may
+    /// link. One made in this window is trusted. One that was opened is unknown until its id is read.
+    fn retrust(&mut self, trust: &Trust) {
+        let mode = match (&self.id, self.place.path()) {
+            _ if self.made_here => letters_trust::Mode::Trusted,
+            (Some(id), path) => trust::mode(trust, id, path),
+            (None, _) => letters_trust::Mode::Safe,
+        };
+        let links = mode == letters_trust::Mode::Trusted;
+        if std::mem::replace(&mut self.maths_links, links) != links {
+            self.view.set_maths_links(links);
+        }
     }
 
     /// Looks for the system's dictionaries for the languages the document names and has not asked about
@@ -524,6 +543,7 @@ impl DocWindow {
                 if let Some(history) = history {
                     let _ = self.view.change(|editor| Ok::<_, Infallible>(editor.attach(history)));
                 }
+                self.id = Some(copy.id.clone());
                 self.copy = Some(copy);
                 Ok(())
             }
@@ -609,7 +629,7 @@ impl DocWindow {
         self.relist(library);
         if first && let Some(path) = &self.listed {
             self.view.set_saved_in(&library.shown(path.parent().unwrap_or(Path::new(""))));
-            self.vouch = self.copy.as_ref().filter(|_| self.made_here).map(|copy| copy.id.clone());
+            self.vouch = self.id.clone().filter(|_| self.made_here);
         }
         self.relocate(library);
         self.sent = Some(revision);
@@ -734,6 +754,8 @@ impl App {
             menu_press: false,
             made_here,
             vouch: None,
+            id: None,
+            maths_links: false,
             asked: BTreeSet::new(),
             saved_edits: 0,
             noticed_edits: 0,
@@ -752,6 +774,7 @@ impl App {
         if landing && made_here && window.keeps {
             window.view.set_landing(Some(self.landing()));
         }
+        window.retrust(self.trust.trust());
         window.retitle();
         window.fit();
         self.mark("laid out");
@@ -824,7 +847,11 @@ impl App {
         now: Instant,
         change: impl FnOnce(&mut Place, &Library) -> Result<(), Refused>,
     ) -> bool {
-        self.windows.get_mut(&id).is_some_and(|window| window.replace(&self.library, now, change))
+        let Some(window) = self.windows.get_mut(&id) else { return false };
+        let done = window.replace(&self.library, now, change);
+        // A trusted folder vouches for what is in it, so a move can change how the document is treated.
+        window.retrust(self.trust.trust());
+        done
     }
 
     fn mark(&mut self, stage: &'static str) {
@@ -1124,6 +1151,8 @@ impl ApplicationHandler<Event> for App {
                         false => eprintln!("letters: {error}"),
                     }
                 }
+                // The file has said which document it is, so what the person trusts can be asked about it.
+                window.retrust(self.trust.trust());
                 window.access_stale = true;
                 window.sync(now);
             }
