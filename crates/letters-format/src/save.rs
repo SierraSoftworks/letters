@@ -49,6 +49,12 @@ pub trait Replica {
     /// The document's identity. A file holding another document is never merged or replaced.
     fn id(&self) -> &str;
 
+    /// The id the document went by before it became a document of its own, while its file may still carry
+    /// that id. Such a file is this document's from before: it is merged and replaced like its own.
+    fn was(&self) -> Option<&str> {
+        None
+    }
+
     /// Takes in whatever the copy on disk holds that memory lacks. This is also where a writer learns which
     /// of its own journalled changes have reached the shared file.
     ///
@@ -204,8 +210,9 @@ fn open(bytes: Vec<u8>, replica: &mut impl Replica) -> (Option<DiskCopy>, Result
         Ok(copy) => copy,
         Err(error) => return (None, Err(error)),
     };
-    if copy.manifest().id != replica.id() {
-        return (None, Err(Error::OtherDocument(copy.manifest().id.clone())));
+    let id = copy.manifest().id.as_str();
+    if id != replica.id() && Some(id) != replica.was() {
+        return (None, Err(Error::OtherDocument(id.to_owned())));
     }
     match replica.merge(&mut copy) {
         Ok(()) => (Some(copy), Ok(())),
