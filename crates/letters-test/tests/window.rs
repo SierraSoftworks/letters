@@ -2965,12 +2965,14 @@ fn alt(window: &Harness, id: &str) -> String {
     }
 }
 
-/// A point on the first line under pictures that end at `under`, `along` of the way across the text, which
-/// starts where they do. The switch to the alt text stands at the end of that line.
+/// A point on the first line under `pictures`, `along` of the way across the text column, which stands in
+/// the middle of the page area wherever the pictures stand in it. The switch to the alt text stands at the
+/// end of that line.
 fn under(window: &mut Harness, pictures: &[Rect], along: f32) -> Point {
     let page = window.ui().style().page.clone();
     let wide = (page.width - page.margin_left - page.margin_right) * 96.0 / 72.0;
-    let left = pictures.iter().map(|place| place.x).fold(f32::INFINITY, f32::min);
+    let area = window.controls().into_iter().find(|found| found.role == Role::Document).expect("a page").bounds;
+    let left = (area.x + (area.width - wide) / 2.0).round();
     let bottom = pictures.iter().map(|place| place.y + place.height).fold(0.0, f32::max);
     Point { x: left + (wide - 24.0) * along + 12.0, y: bottom + 17.0 }
 }

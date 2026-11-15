@@ -109,7 +109,7 @@ impl Default for Style {
             ("body", body.clone()),
             ("quote", TextStyle { italic: true, ..body.clone() }),
             ("code", TextStyle { family: "Fira Code".into(), size: 10.0, ..body.clone() }),
-            ("caption", TextStyle { size: 9.0, ..body.clone() }),
+            ("caption", TextStyle { size: 9.0, align: Align::Center, ..body.clone() }),
         ];
         Self {
             types: types.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
