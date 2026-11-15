@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{Scratch, Writer};
-use letters::connected::{self, Line, Said, Told};
+use letters::connected::{self, Line, Placing, Said, Told};
 use letters::files::{self, Home};
 use letters::keychain::Keychain;
 use letters::pictures;
@@ -647,6 +647,65 @@ fn a_document_the_server_will_not_open_has_no_line() {
         assert!(matches!(line.link(), Link::Refused(Refusal::NoAccess | Refusal::Gone)), "{name}: {:?}", line.link());
         assert_eq!(line.wake_at(), None, "{name}");
     }
+}
+
+#[test]
+fn a_document_is_named_renamed_and_moved_at_its_server() {
+    let server = Server::start("placing");
+    let session = server.session(ada());
+    let spaces = session.spaces().unwrap();
+    let space = spaces.iter().find(|space| space.kind == SpaceKind::Personal).unwrap().id.clone();
+    server.document(&session, "Roof repairs");
+    let start = |server: &Client, token: &str| server.post(token, &paths::documents(&space), &NewDocument::default());
+    let id = session.ask(start).map(|made: Entry| made.id.unwrap()).unwrap();
+    let home = Scratch::new("placing-home");
+    let copy = connected::reach(&session, &id, &home.0).expect("the document is brought here").path;
+    let place = |asks: &[Placing]| connected::place(&session, &id, &copy, asks);
+    let called = |placed: &connected::Placed| placed.opened.as_ref().map(|opened| opened.name.clone());
+
+    // Its first heading names it once, with a number where another document has the name.
+    for heading in ["Roof repairs", "Something else"] {
+        let named = place(&[Placing::Name(heading.into())]);
+        assert_eq!((called(&named).as_deref(), named.refused), (Some("Roof repairs 2"), None), "{heading}");
+        assert!(named.opened.is_some_and(|opened| opened.named), "{heading}");
+    }
+
+    // What the server refuses is said in a sentence, and what was asked after it is left alone.
+    let nowhere = Placing::Move { space: space.clone(), folder: "Nowhere".into() };
+    let refusals = [
+        ("a name that is taken", vec![Placing::Rename("Roof repairs".into())]),
+        ("a folder that is not there", vec![nowhere, Placing::Rename("Never".into())]),
+    ];
+    for (case, asks) in refusals {
+        let placed = place(&asks);
+        assert!(placed.refused.as_ref().is_some_and(|refused| refused.ends_with('.')), "{case}");
+        assert_eq!(called(&placed).as_deref(), Some("Roof repairs 2"), "{case}");
+    }
+
+    // Folders are made for it, and it moves among those of its space.
+    let folder = |parent: &str, name: &str| Placing::NewFolder {
+        space: space.clone(),
+        parent: parent.into(),
+        name: name.into(),
+    };
+    let quotes = Placing::Move { space: space.clone(), folder: "House/Quotes".into() };
+    let placed = place(&[folder("", "House"), folder("House", "Quotes"), quotes, Placing::Rename("Quote".into())]);
+    assert_eq!(placed.refused, None);
+    let opened = placed.opened.expect("the server says where it is");
+    assert_eq!(
+        (opened.name.as_str(), opened.path.rsplit_once('/').map(|(folder, _)| folder)),
+        ("Quote", Some("House/Quotes"))
+    );
+    let shelves = placed.shelves.expect("its space has folders");
+    let tree: Vec<_> = shelves.iter().map(|shelf| (shelf.path.as_str(), shelf.depth)).collect();
+    assert_eq!(tree, [("", 0), ("House", 1), ("House/Quotes", 2)]);
+
+    // With the server away nothing is known anew, and the document opens under the name it last had.
+    server.cut();
+    assert_eq!(place(&[Placing::Look]), connected::Placed { opened: None, shelves: None, refused: None });
+    assert!(place(&[Placing::Rename("Later".into())]).refused.is_some());
+    let offline = connected::reach(&session, &id, &home.0).expect("the copy opens");
+    assert_eq!((offline.online, offline.opened.name.as_str()), (false, "Quote"));
 }
 
 #[test]

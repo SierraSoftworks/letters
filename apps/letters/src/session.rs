@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use letters_api::{Code, Entry, Limits, Listing, Opened, Person, Space, Token, paths};
+use letters_api::{Code, Entry, Limits, Listing, Move, NewFolder, Opened, Person, Rename, Space, Token, paths};
 
 use crate::keychain::{Keychain, Unkept};
 use crate::server::{Client, Refused};
@@ -162,6 +162,24 @@ impl Session {
     /// Hands the server a picture of a document, before the edit that names it is sent.
     pub fn keep_asset(&self, id: &str, name: &str, bytes: &[u8]) -> Result<(), Refused> {
         self.ask(|server, token| server.keep_asset(token, id, name, bytes))
+    }
+
+    /// Calls a document `name`. A name another document has in its folder is refused as [`Code::NameTaken`].
+    pub fn rename(&self, id: &str, name: &str) -> Result<Entry, Refused> {
+        let to = Rename { name: name.to_owned() };
+        self.ask(|server, token| server.post(token, &paths::rename(id), &to))
+    }
+
+    /// Moves a document to `folder` of `space`, under the name it has.
+    pub fn relocate(&self, id: &str, space: &str, folder: &str) -> Result<Entry, Refused> {
+        let to = Move { space: space.to_owned(), folder: folder.to_owned() };
+        self.ask(|server, token| server.post(token, &paths::relocate(id), &to))
+    }
+
+    /// Makes the folder `name` in `parent` of a space.
+    pub fn new_folder(&self, space: &str, parent: &str, name: &str) -> Result<Entry, Refused> {
+        let new = NewFolder { parent: parent.to_owned(), name: name.to_owned() };
+        self.ask(|server, token| server.post(token, &paths::folders(space), &new))
     }
 
     /// Ends the session here and at the server. The server is told if it can be reached, and the sign-in

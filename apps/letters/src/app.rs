@@ -44,7 +44,7 @@ use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowAttributes
 use crate::chrome::{self, Buttons, Host};
 use crate::cli::{Format, Mode, Options};
 use crate::conflicts;
-use crate::connected::{self, Line, Reached, Said, Told};
+use crate::connected::{self, Line, Placed, Placing, Reached, Said, Told};
 use crate::convert;
 use crate::copies;
 use crate::dictionaries;
@@ -147,6 +147,9 @@ pub enum Event {
     /// A picture of this name, which the copy of a window's document lacked, was asked of the document's
     /// server: its file, if the server had it.
     Brought(WindowId, String, Option<Vec<u8>>),
+    /// The server of a window's document was asked about the document's name and place, in this turn of
+    /// the window's asking: how the document stands there now. The flag says that the window's bar asked.
+    Placed(WindowId, u64, bool, Box<Placed>),
 }
 
 impl From<accesskit_winit::Event> for Event {
@@ -439,6 +442,14 @@ struct Remote {
     asked: BTreeSet<String>,
     /// Pictures the copy lacks, until the server is asked for them.
     lacking: Vec<String>,
+    /// What is to be asked of the server about the document's name and place, in this order.
+    asks: Vec<Placing>,
+    /// How often that was asked. Only the last answer says how the document stands.
+    turn: u64,
+    /// Whether the line was live when it last said how it stood, and when the server was last asked how
+    /// the document stands.
+    live: bool,
+    looked: Option<Instant>,
 }
 
 impl Remote {
@@ -481,6 +492,22 @@ impl Remote {
             letters_sync::Link::Connecting => Connection::Connecting,
             letters_sync::Link::Live(_) => Connection::Live,
             letters_sync::Link::Refused(refusal) => Connection::Refused(refusal.to_string()),
+        }
+    }
+
+    /// The folder the server keeps the document in, as the bar is told it.
+    fn folder(&self) -> PathBuf {
+        let folder = self.opened.path.rsplit_once('/').map_or("", |(folder, _)| folder);
+        let parts = [self.host.as_str(), self.opened.space.as_deref().unwrap_or_default(), folder];
+        parts.iter().filter(|part| !part.is_empty()).collect()
+    }
+
+    /// Has the server asked how the document stands, if it has not been for a while: nothing tells an
+    /// open window that someone else renamed or moved the document.
+    fn look(&mut self, now: Instant) {
+        let lately = self.looked.is_some_and(|looked| now.saturating_duration_since(looked) < LOOK_AFTER);
+        if self.live && !lately && !self.asks.contains(&Placing::Look) {
+            self.asks.push(Placing::Look);
         }
     }
 
@@ -673,7 +700,10 @@ fn lies_at(folder: &Path, other: &Path) -> bool {
 const UNKEPT: &str = "The server did not take a picture, so the others who open this document will not see it.";
 
 /// What the bar says when asked to rename or move a server's document.
-const AT_ITS_SERVER: &str = "This document lives on a server, and is renamed and moved there.";
+const AT_ITS_SERVER: &str = "This document lives on a server, and is moved there.";
+/// How long a server's answer about a document's name and place holds for a window that is turned to
+/// again.
+const LOOK_AFTER: Duration = Duration::from_secs(30);
 /// What the Comment tool says of a document whose notes this build could not read.
 const NO_COMMENTS: &str = "Comments cannot be added here: this document's notes are in a form this version of \
                            Letters cannot read.";
@@ -928,12 +958,11 @@ impl DocWindow {
     /// Tells the view what the document is called and where it is kept, when either has changed. A
     /// document with no name of its own is told so, and the view shows its first heading meanwhile.
     fn relocate(&mut self, library: &Library) {
-        let name = (!self.place.naming()).then(|| self.place.name());
-        // A server's document is where the server says, and is moved there.
-        let at = self.remote.as_ref().map(|remote| {
-            let parts = [remote.host.as_str(), remote.opened.space.as_deref().unwrap_or_default(), &remote.opened.path];
-            parts.iter().filter(|part| !part.is_empty()).collect::<PathBuf>()
-        });
+        // A server's document is called what the server says and is where the server says. One the server
+        // has only a stand-in name for takes its first heading's, as a new document does.
+        let named = self.remote.as_ref().map_or(!self.place.naming(), |remote| remote.opened.named);
+        let name = named.then(|| self.place.name());
+        let at = self.remote.as_ref().map(Remote::folder);
         let remote = at.is_some();
         let folder = at.unwrap_or_else(|| self.place.folder(library));
         if self.located.as_ref().is_some_and(|(told, at)| (told, at) == (&name, &folder)) {
@@ -1207,7 +1236,6 @@ impl DocWindow {
         // The copy is kept under the document's id, and is no file the person copied by hand or would
         // look for among their own, whatever else has its id.
         self.place.call(&reached.opened.name);
-        self.view.set_document_name(&reached.opened.name);
         (self.twinned, self.listed) = (true, self.place.path().map(Path::to_owned));
         if !reached.opened.author.is_empty() {
             self.view.set_author(&reached.opened.author);
@@ -1227,6 +1255,10 @@ impl DocWindow {
             selection: None,
             asked: BTreeSet::new(),
             lacking: Vec::new(),
+            asks: Vec::new(),
+            turn: 0,
+            live: false,
+            looked: None,
         });
         self.recomment();
         self.located = None;
@@ -1344,7 +1376,16 @@ impl DocWindow {
                         remote.line.saved();
                     }
                 }
-                Told::Link | Told::Progress => stands = true,
+                Told::Link => {
+                    stands = true;
+                    // A document may have been renamed or moved while there was no line to its server.
+                    if let Some(remote) = &mut self.remote {
+                        let live = matches!(remote.line.link(), letters_sync::Link::Live(_));
+                        (remote.live, remote.looked) = (live, remote.looked.filter(|_| live));
+                        remote.look(now);
+                    }
+                }
+                Told::Progress => stands = true,
                 // Said below, with where each of them is now.
                 Told::Peers => {}
             }
@@ -1355,6 +1396,32 @@ impl DocWindow {
             self.recomment();
             self.retitle();
         }
+    }
+
+    /// Takes how the document stands at its server, which was asked about its name and place. `answers`
+    /// says that the bar asked and waits to be told.
+    fn placed(&mut self, turn: u64, answers: bool, placed: Placed, library: &Library) {
+        let Some(remote) = &mut self.remote else { return };
+        // An answer that others were asked after says how the document stood, not how it stands.
+        if let Some(now) = placed.opened.filter(|_| turn == remote.turn) {
+            let opened = &mut remote.opened;
+            (opened.name, opened.named, opened.space, opened.path) = (now.name, now.named, now.space, now.path);
+            self.place.call(&remote.opened.name);
+        }
+        match placed.refused {
+            // The name field comes back with what was typed, so the bar is told only what changed.
+            Some(refused) => {
+                self.relocate(library);
+                self.view.set_notice(Some(&refused));
+            }
+            None => {
+                if answers {
+                    self.located = None;
+                }
+                self.relocate(library);
+            }
+        }
+        self.retitle();
     }
 
     /// Starts reading what the first paint did not need, on another thread.
@@ -2030,10 +2097,14 @@ impl App {
                 Request::Open(path) => self.act(event_loop, id, Action::Open(Some(path.into()))),
                 Request::OpenDialog => self.act(event_loop, id, Action::Open(None)),
                 Request::New => self.act(event_loop, id, Action::New),
-                // The name is taken on the way to a save, which reads it from the document.
-                Request::Named(_) => {
+                // The name is taken on the way to a save, which reads it from the document. A server's
+                // document takes it at its server, if it has none of its own there.
+                Request::Named(name) => {
                     if let Some(window) = self.windows.get_mut(&id) {
                         window.save_at = Some(now);
+                        if let Some(remote) = window.remote.as_mut().filter(|remote| !remote.opened.named) {
+                            remote.asks.push(Placing::Name(name));
+                        }
                     }
                 }
                 // What was asked along with something refused is left for the person to ask again.
@@ -2042,13 +2113,18 @@ impl App {
                 Request::Rename(_) | Request::Move(_) | Request::MoveElsewhere | Request::NewFolder { .. }
                     if self.windows.get(&id).is_some_and(|window| window.remote.is_some()) =>
                 {
-                    // Only the server can, and nothing here asks it to yet.
-                    if let Some(window) = self.windows.get_mut(&id) {
-                        window.view.set_notice(Some(AT_ITS_SERVER));
-                        window.located = None;
-                        window.relocate(&self.library);
+                    let Some(window) = self.windows.get_mut(&id) else { continue };
+                    match (request, &mut window.remote) {
+                        // Its server renames it, and the bar is told once the server has answered.
+                        (Request::Rename(name), Some(remote)) => remote.asks.push(Placing::Rename(name)),
+                        // Only the server can, and nothing here asks it to yet.
+                        _ => {
+                            window.view.set_notice(Some(AT_ITS_SERVER));
+                            window.located = None;
+                            window.relocate(&self.library);
+                            refused = true;
+                        }
                     }
-                    refused = true;
                 }
                 Request::Rename(name) => {
                     refused = !self.replace(id, now, |place, library| place.rename(&name, library))
@@ -2149,6 +2225,8 @@ impl App {
             window.access_stale = true;
             window.sync(now);
         }
+        // What was asked of the document's server goes there now.
+        self.place(id);
     }
 
     /// The name the person's edits carry: the one they set, or else their account's.
@@ -2336,6 +2414,24 @@ impl App {
             let (keychain, waiting) = (Keychain::system().ok(), AtomicBool::new(false));
             let entered = connected::enter(&server, &id, held, keychain, &home, &|page| links::open(page), &waiting);
             let _ = proxy.send_event(Event::Reached(asker, entered.map(Box::new).map_err(|error| error.to_string())));
+        });
+    }
+
+    /// Asks the server of a window's document what the window has to ask about the document's name and
+    /// place, on another thread. How the document then stands arrives as an event.
+    fn place(&mut self, id: WindowId) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        let Some(copy) = window.place.path().map(Path::to_owned) else { return };
+        let Some(remote) = window.remote.as_mut().filter(|remote| !remote.asks.is_empty()) else { return };
+        let asks = std::mem::take(&mut remote.asks);
+        (remote.turn, remote.looked) = (remote.turn + 1, Some(Instant::now()));
+        // What its first heading asks for is nothing the bar waits to hear of.
+        let answers = asks.iter().any(|ask| !matches!(ask, Placing::Look | Placing::Name(_)));
+        let (session, document, turn) = (remote.line.session().clone(), remote.opened.id.clone(), remote.turn);
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            let placed = Box::new(connected::place(&session, &document, &copy, &asks));
+            let _ = proxy.send_event(Event::Placed(id, turn, answers, placed));
         });
     }
 
@@ -2969,6 +3065,10 @@ impl ApplicationHandler<Event> for App {
                     window.reword(&self.words);
                     // A sync tool may have left a copy of the document while the window was left alone.
                     window.look_for_copies(&self.proxy, &self.library);
+                    // And someone may have renamed or moved it at its server.
+                    if let Some(remote) = &mut window.remote {
+                        remote.look(Instant::now());
+                    }
                 }
                 // The clock may have moved to summer time, or the person to another zone, while the
                 // window was left alone.
@@ -3133,6 +3233,13 @@ impl ApplicationHandler<Event> for App {
             Event::Heard(id, said) => {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.heard(said, now);
+                    window.sync(now);
+                }
+                self.place(id);
+            }
+            Event::Placed(id, turn, answers, placed) => {
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.placed(turn, answers, *placed, &self.library);
                     window.sync(now);
                 }
             }

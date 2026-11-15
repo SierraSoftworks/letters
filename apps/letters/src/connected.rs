@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use letters_api::{Code, Opened, paths};
+use letters_api::{Code, EntryKind, Opened, paths};
 use letters_format::{Archive, WorkingCopy};
 use letters_model::{Model, Notes, ReplicaId, Selection};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
@@ -136,11 +136,6 @@ pub fn reach(session: &Session, id: &str, home: &Path) -> Result<Reached, Unreac
             return Err(Unreached::Refused(refused));
         }
     };
-    let keep = |to: &Path, bytes: &[u8]| {
-        // Written beside and renamed, so that a crash leaves a whole file or none.
-        let beside = to.with_extension("new");
-        fs::write(&beside, bytes).and_then(|()| fs::rename(&beside, to))
-    };
     if let Some(folder) = path.parent() {
         fs::create_dir_all(folder).map_err(Unreached::Unkept)?;
     }
@@ -149,9 +144,134 @@ pub fn reach(session: &Session, id: &str, home: &Path) -> Result<Reached, Unreac
         let file = session.file(id, most).map_err(Unreached::Refused)?;
         keep(&path, &file).map_err(Unreached::Unkept)?;
     }
-    // Kept for the day the document is opened with no server in reach.
-    let _ = serde_json::to_vec(&opened).map(|json| keep(&said, &json));
+    remember(&path, &opened);
     Ok(Reached { opened, path, online: true })
+}
+
+/// Writes a file beside its place and renames it there, so that a crash leaves a whole file or none.
+fn keep(to: &Path, bytes: &[u8]) -> io::Result<()> {
+    let beside = to.with_extension("new");
+    fs::write(&beside, bytes).and_then(|()| fs::rename(&beside, to))
+}
+
+/// Keeps what the server said of the document whose copy is at `copy`, for the day the document is
+/// opened with no server in reach.
+fn remember(copy: &Path, opened: &Opened) {
+    let _ = serde_json::to_vec(opened).map(|json| keep(&copy.with_extension("json"), &json));
+}
+
+/// A folder of the space a server keeps a document in, as a tree to move the document in lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shelf {
+    /// Where it is in its space, as [`Move::folder`](letters_api::Move::folder) names it. Empty for the
+    /// space itself.
+    pub path: String,
+    pub name: String,
+    /// How far down the tree it is. The space is at 0.
+    pub depth: u8,
+}
+
+/// The most folders of a space that are listed, each of which is asked for.
+const SHELVES: usize = 200;
+/// The last number a first heading's name is tried with, where others have the name.
+const NUMBERED: u32 = 9;
+
+/// What is asked of a server about what a document is called and where it is kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Placing {
+    /// Only how it stands now: nothing tells a device that someone renamed or moved the document.
+    Look,
+    /// The name its first heading gives a document that has none of its own. It takes one once, with a
+    /// number after a name that is taken, and a server that will not have it is not asked twice.
+    Name(String),
+    Rename(String),
+    /// Another folder of `space`, by its [`Shelf::path`].
+    Move {
+        space: String,
+        folder: String,
+    },
+    /// A folder to make in `parent`, for the document to move to.
+    NewFolder {
+        space: String,
+        parent: String,
+        name: String,
+    },
+}
+
+/// How a document stands at its server once that was asked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Placed {
+    /// What the server says of the document now, if it said.
+    pub opened: Option<Opened>,
+    /// The folders of the document's space in tree order, the space itself first, if the server said.
+    /// A document that reaches the person only through a share has none.
+    pub shelves: Option<Vec<Shelf>>,
+    /// Why something that was asked was not done, as the person is to read it. What was asked after it
+    /// was left alone.
+    pub refused: Option<String>,
+}
+
+/// Asks the server of the document whose copy is at `copy` for each of `asks` in turn, up to the first
+/// it refuses, and then how the document stands. This waits on the network.
+pub fn place(session: &Session, id: &str, copy: &Path, asks: &[Placing]) -> Placed {
+    let ask = |ask: &Placing| match ask {
+        Placing::Look => Ok(()),
+        // What its first heading asks for is nothing the person asked for, and is refused in silence.
+        Placing::Name(name) => {
+            let _ = name_once(session, id, name);
+            Ok(())
+        }
+        Placing::Rename(name) => session.rename(id, name).map(drop),
+        Placing::Move { space, folder } => session.relocate(id, space, folder).map(drop),
+        Placing::NewFolder { space, parent, name } => session.new_folder(space, parent, name).map(drop),
+    };
+    let refused = asks.iter().try_for_each(ask).err().map(|refused| match refused {
+        Refused::Said(said) => said.to_string(),
+        other => format!("That could not be done: {other}."),
+    });
+    let opened = session.open(id).ok();
+    if let Some(opened) = &opened {
+        remember(copy, opened);
+    }
+    let space = opened.as_ref().and_then(|opened| opened.space.as_deref());
+    Placed { shelves: space.and_then(|space| shelves(session, space).ok()), opened, refused }
+}
+
+/// Gives a document the name of its first heading, unless it has a name of its own by now: another
+/// device may have named it since this one last asked.
+fn name_once(session: &Session, id: &str, name: &str) -> Result<(), Refused> {
+    if session.open(id)?.named {
+        return Ok(());
+    }
+    let mut tried = session.rename(id, name);
+    for number in 2..=NUMBERED {
+        if tried.as_ref().err().and_then(Refused::code) != Some(Code::NameTaken) {
+            break;
+        }
+        tried = session.rename(id, &format!("{name} {number}"));
+    }
+    tried.map(drop)
+}
+
+/// The folders of a space in tree order, the space itself first.
+fn shelves(session: &Session, space: &str) -> Result<Vec<Shelf>, Refused> {
+    let inside = |folder: &str, depth: u8| {
+        let listing = session.entries(space, folder)?;
+        let folders = listing.entries.into_iter().filter(|entry| entry.kind == EntryKind::Folder);
+        // Each is taken from the end, so the first of a folder is the next listed.
+        let mut folders: Vec<_> = folders.map(|entry| (entry, depth)).collect();
+        folders.reverse();
+        Ok((listing.space.name, folders))
+    };
+    let (name, mut left) = inside("", 1)?;
+    let mut out = vec![Shelf { path: String::new(), name, depth: 0 }];
+    while let Some((folder, depth)) = left.pop().filter(|_| out.len() < SHELVES) {
+        if let Some(deeper) = depth.checked_add(1) {
+            left.extend(inside(&folder.path, deeper)?.1);
+        }
+        out.push(Shelf { path: folder.path, name: folder.name, depth });
+    }
+    Ok(out)
 }
 
 /// One picture of a server's document that the copy here lacks, by the name the document has for it:
