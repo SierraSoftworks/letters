@@ -245,6 +245,9 @@ pub enum Command {
         block: BlockId,
         version: Option<Box<Block>>,
     },
+    /// Makes each of some blocks read as another version of it, as [`Command::UseVersion`] does one: a
+    /// passage that is restored from the history. One undo step for all of them.
+    UseVersions(Vec<(BlockId, Option<Box<Block>>)>),
     /// Makes the document and its style read as they did at a revision of the history. Nothing of the
     /// history is taken back, and it is one undo step. See [`letters_model::Model::restore`].
     Restore(Revision),
@@ -580,6 +583,9 @@ impl Editor {
         if let Command::UseVersion { block, version } = command {
             return self.takes_version(block, version.as_deref());
         }
+        if let Command::UseVersions(blocks) = command {
+            return blocks.iter().any(|(block, version)| self.takes_version(block, version.as_deref()));
+        }
         if let Command::Replace { query, only, .. } = command {
             // What is found is replaced wherever the caret is.
             return self.replaceable(query, only.as_ref());
@@ -697,6 +703,14 @@ impl Editor {
                 _ = self.apply(vec![Op::SetBlockProps { block, page_break: on, lang }]);
             }
             Command::UseVersion { block, version } => self.use_version(block, version),
+            Command::UseVersions(blocks) => {
+                for (block, version) in blocks {
+                    // One that came before may have changed what this one can take.
+                    if self.takes_version(&block, version.as_deref()) {
+                        self.use_version(block, version);
+                    }
+                }
+            }
             Command::Restore(revision) => self.restore_version(&revision),
             Command::ReplaceStyle(style) => _ = self.apply(vec![Op::ReplaceStyle { style }]),
             Command::SetLanguage(language) => _ = self.apply(vec![Op::SetLanguage { language }]),

@@ -285,6 +285,34 @@ fn a_block_is_made_to_read_as_another_version_of_it_in_one_undo_step() {
 }
 
 #[test]
+fn several_blocks_are_made_to_read_as_other_versions_in_one_undo_step() {
+    let version = |state: &str| Some(Box::new(parse(state).0.blocks.remove(0)));
+    let id = BlockId::new;
+    let cases = [
+        // (before, what each block is to read as, after)
+        (
+            "p one|\np two\np three",
+            vec![("b1", version("p un")), ("b3", version("h2 Trois"))],
+            "p un|\np two\nh2 Trois",
+        ),
+        // One that reads so already, or is nowhere, leaves the others to be done.
+        ("p one|\np two\np three", vec![("b1", version("p one")), ("b2", None), ("b9", None)], "p one|\np three"),
+    ];
+    for (before, versions, after) in cases {
+        let mut editor = Harness::new(before);
+        let versions: Vec<_> = versions.into_iter().map(|(block, version)| (id(block), version)).collect();
+        editor.run(Command::UseVersions(versions));
+        assert_eq!(editor.state(), canon(after), "{before:?}");
+        assert!(editor.key("Mod+z"));
+        assert_eq!(editor.text(), canon(before).replace(['|', '^'], ""), "undone in {before:?}");
+        assert!(!editor.editor.can_undo(), "one step, in {before:?}");
+    }
+    let editor = Harness::new("p one|\np two");
+    let same = Command::UseVersions(vec![(id("b2"), version("p two")), (id("nowhere"), None)]);
+    assert!(!editor.editor.applies(&same), "nothing of it changes a block");
+}
+
+#[test]
 fn a_version_is_only_used_where_it_changes_a_block_that_is_there() {
     let mut editor = Harness::new("p one|\np two");
     for same in [use_version(Some("p two")), Command::UseVersion { block: BlockId::new("nowhere"), version: None }] {
