@@ -7,6 +7,7 @@
 //! - [`Window`] is the editor's window, which the shells and the test harness drive through the same calls.
 
 mod access;
+mod captions;
 mod chrome;
 mod code_copy;
 pub mod color;

@@ -2,7 +2,8 @@
 //!
 //! Each block is a node of its role, and a text block holds one text run whose characters are Unicode scalar
 //! values. List items that follow one another stand under a list, a task's tick is a checkbox, a figure's
-//! picture an image named by its alt text and a code block's copy button a button. The page's own node carries the selection.
+//! picture an image named by its alt text with a button that turns to that text, and a code block's copy
+//! button a button. The page's own node carries the selection.
 //!
 //! A long document is not told again for every key: [`Told`] remembers how each block read, and a block that
 //! still reads the same is left out when only the changes are asked for.
@@ -20,6 +21,7 @@ const LIST: u8 = 1;
 const TICK: u8 = 2;
 const PICTURE: u8 = 3;
 const COPY: u8 = 4;
+const ALT: u8 = 5;
 
 /// FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
 fn hashed(bytes: impl Iterator<Item = u8>) -> u64 {
@@ -220,6 +222,11 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
             let mut picture = Node::new(Role::Image);
             picture.set_label(alt.as_str());
             part(PICTURE, picture, &mut children);
+            // The switch under it, which a click turns to the alt text.
+            let mut switch = Node::new(Role::Button);
+            switch.set_label(crate::captions::LABEL);
+            switch.add_action(Action::Click);
+            part(ALT, switch, &mut children);
         }
         _ => {}
     }
@@ -265,6 +272,8 @@ pub(crate) enum Request {
     Tick(BlockId),
     /// Copies a code block.
     Copy(BlockId),
+    /// Turns the line under a figure's picture to its alt text.
+    Alt(BlockId),
 }
 
 pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request> {
@@ -282,7 +291,8 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
         (Action::Click, _) => {
             let part = |part| doc.walk().find(|block| part_node(&block.id, part) == request.target_node);
             let ticked = part(TICK).map(|block| Request::Tick(block.id.clone()));
-            ticked.or_else(|| part(COPY).map(|block| Request::Copy(block.id.clone())))
+            let copied = || part(COPY).map(|block| Request::Copy(block.id.clone()));
+            ticked.or_else(copied).or_else(|| part(ALT).map(|block| Request::Alt(block.id.clone())))
         }
         _ => None,
     }

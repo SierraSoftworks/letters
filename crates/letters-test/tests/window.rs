@@ -942,6 +942,7 @@ fn a_screen_reader_finds_lists_ticks_and_pictures_as_what_they_are() {
         "    TextRun Measure",
         "Figure",
         "  Image A slate roof",
+        "  Button Alt text",
         "  TextRun The roof today",
     ];
     assert_eq!(read(&tree), expected);
@@ -952,6 +953,13 @@ fn a_screen_reader_finds_lists_ticks_and_pictures_as_what_they_are() {
     let ticked = |window: &Harness, id: &str| window.editor().doc().block(&id.into()).map(|block| block.kind.clone());
     assert!(matches!(ticked(&window, "e"), Some(BlockKind::ListItem { list: ListKind::Task { checked: true }, .. })));
     assert_eq!(head(&window), Pos::new("a", 2));
+
+    // A click on the button under a picture selects the picture and turns its line to the alt text.
+    let alt = tree.nodes.iter().find(|(_, node)| node.label() == Some("Alt text")).expect("a button").0;
+    window.ask(ActionRequest { action: Action::Click, target_tree: TreeId::ROOT, target_node: alt, data: None });
+    assert_eq!(window.editor().picture().map(|figure| figure.as_str()), Some("g"));
+    let field = window.find(Role::TextInput, "Alt text").expect("the field of the alt text");
+    assert_eq!((field.value.as_deref(), field.focused), (Some("A slate roof"), true));
 }
 
 #[test]
@@ -2838,4 +2846,181 @@ fn escape_lets_go_of_a_picture_that_is_carried_or_held_by_a_corner() {
     let to = Point { x: from.x - 100.0, y: from.y - 50.0 };
     window.click_at(middle(places[0])).advance(1000).press_at(from).hover_at(to).key("Escape").release_at(to);
     assert_eq!(size(&window, "a"), (300.0, 150.0), "and the size it had");
+}
+
+/// The alt text a figure keeps.
+fn alt(window: &Harness, id: &str) -> String {
+    match window.editor().doc().block(&id.into()).map(|block| &block.kind) {
+        Some(BlockKind::Figure { alt, .. }) => alt.clone(),
+        kind => panic!("no figure: {kind:?}"),
+    }
+}
+
+/// A point on the first line under pictures that end at `under`, `along` of the way across the text, which
+/// starts where they do. The switch to the alt text stands at the end of that line.
+fn under(window: &mut Harness, pictures: &[Rect], along: f32) -> Point {
+    let page = window.ui().style().page.clone();
+    let wide = (page.width - page.margin_left - page.margin_right) * 96.0 / 72.0;
+    let left = pictures.iter().map(|place| place.x).fold(f32::INFINITY, f32::min);
+    let bottom = pictures.iter().map(|place| place.y + place.height).fold(0.0, f32::max);
+    Point { x: left + (wide - 24.0) * along + 12.0, y: bottom + 17.0 }
+}
+
+/// A figure with the caption `caption`, between two paragraphs.
+fn captioned(caption: &str) -> Harness {
+    let asset = Some("assets/roof.png".into());
+    let kind = BlockKind::Figure { asset, src: None, alt: String::new(), width: 300.0, height: 150.0, numbered: false };
+    let blocks = vec![
+        text("p1", BlockKind::Paragraph, "The roof today:"),
+        text("g", kind, caption),
+        text("p2", BlockKind::Paragraph, "Reply by Friday."),
+    ];
+    Harness::open(Document { blocks, ..Document::default() })
+}
+
+#[test]
+fn a_selected_picture_without_a_caption_has_a_line_under_it_to_write_one_on() {
+    for gallery in [false, true] {
+        let mut window = captioned("");
+        if gallery {
+            let place = picture(&mut window).0;
+            window.drop_pictures(Some(Point { x: place.x + place.width - 10.0, y: place.y + 20.0 }), vec![png()]);
+        }
+        let below = spot(&mut window, "p2", 0).y;
+        let places = pictures(&mut window);
+        let line = under(&mut window, &places, 0.3);
+        window.click_at(line);
+        assert_eq!(head(&window).block.as_str(), "p2", "nothing is kept for a caption nobody is writing");
+
+        window.advance(1000).click_at(middle(places[0])).advance(1000).click_at(line);
+        let caption = head(&window);
+        assert_ne!(caption.block.as_str(), "p2", "gallery: {gallery}");
+        assert_eq!(window.editor().picture(), None, "the caret is in the caption");
+        // Left empty, the line goes again with the selection.
+        assert_eq!(spot(&mut window, "p2", 0).y, below, "gallery: {gallery}");
+
+        window.advance(1000).click_at(middle(places[0])).advance(1000).click_at(line).type_text("Two views");
+        let caption = head(&window).block;
+        assert_eq!(block_text(&window, caption.as_str()), "Two views", "gallery: {gallery}");
+    }
+}
+
+#[test]
+fn the_switch_under_a_picture_is_there_for_the_picture_the_selection_is_at() {
+    // Where the selection is, and whether the switch is there to press.
+    let cases = [("in a paragraph", false), ("on the picture", true), ("in its caption", true)];
+    for (selection, shows) in cases {
+        let mut window = illustrated();
+        let place = picture(&mut window).0;
+        let switch = under(&mut window, &[place], 1.0);
+        match selection {
+            "in a paragraph" => window.ui().select(Selection::caret(Pos::new("p1", 2))),
+            "on the picture" => drop(window.click_at(middle(place)).advance(1000)),
+            _ => window.ui().select(Selection::caret(Pos::new("g", 3))),
+        }
+        window.paint();
+        window.hover_at(switch);
+        assert_eq!(window.ui().cursor() == Cursor::Pointer, shows, "{selection}");
+        window.click_at(switch);
+        assert_eq!(window.find(Role::Dialog, "Alt text").is_some(), shows, "{selection}");
+    }
+}
+
+#[test]
+fn the_line_under_a_picture_turns_to_its_alt_text_and_back() {
+    // What is typed, how the line is given back to the caption, the alt text then and whether that is an
+    // edit to save.
+    let cases = [
+        (Some("Snow on the gable"), "Enter", "Snow on the gable", true),
+        (Some("  Snow on the gable "), "the switch", "Snow on the gable", true),
+        (Some("Snow"), "a press elsewhere", "Snow", true),
+        (Some("Snow"), "Escape", "A slate roof", false),
+        (None, "Enter", "A slate roof", false),
+        (None, "a press elsewhere", "A slate roof", false),
+    ];
+    for (typed, back, after, edited) in cases {
+        let mut window = illustrated();
+        let (place, elsewhere) = (picture(&mut window).0, spot(&mut window, "p1", 2));
+        let switch = under(&mut window, &[place], 1.0);
+        window.click_at(middle(place)).advance(1000).click_at(switch);
+        let field = window.find(Role::TextInput, "Alt text").expect("the field of the alt text");
+        assert_eq!(
+            (field.value.as_deref(), field.focused),
+            (Some("A slate roof"), true),
+            "it shows what the picture has"
+        );
+        let edits = window.ui().edits();
+        // What is typed takes the place of what was there.
+        if let Some(typed) = typed {
+            window.type_text(typed);
+        }
+        match back {
+            "the switch" => window.click(Role::Button, "Alt"),
+            "a press elsewhere" => window.click_at(Point { x: elsewhere.x, y: elsewhere.y + 2.0 }),
+            key => window.key(key),
+        };
+        window.assert_closed(Role::Dialog, "Alt text");
+        assert_eq!(alt(&window, "g"), after, "{typed:?}, {back}");
+        assert_eq!(window.ui().edits() > edits, edited, "{typed:?}, {back}");
+        assert_eq!(block_text(&window, "g"), "Seen from the garden", "the caption is as it was");
+    }
+}
+
+#[test]
+fn alt_text_in_a_gallery_belongs_to_the_selected_picture() {
+    let mut window = illustrated();
+    let place = picture(&mut window).0;
+    window.drop_pictures(Some(Point { x: place.x + place.width - 10.0, y: place.y + 20.0 }), vec![png()]);
+    let places = pictures(&mut window);
+    window.click_at(middle(places[1])).advance(1000);
+    let picked = window.editor().picture().expect("a picture is selected").clone();
+    assert_ne!(picked.as_str(), "g");
+
+    let switch = under(&mut window, &places, 1.0);
+    window.click_at(switch).assert_open(Role::Dialog, "Alt text");
+    window.type_text("The chimney from the scaffold").key("Enter");
+    assert_eq!(alt(&window, picked.as_str()), "The chimney from the scaffold");
+    assert_eq!(alt(&window, "g"), "A slate roof", "the other picture keeps its own");
+}
+
+#[test]
+fn a_double_click_in_a_caption_selects_the_word_first_pressed() {
+    let long = "Seen from the garden on the first dry morning after the storm, with the scaffold still up along \
+                the north gable and the new slates stacked by the door";
+    let mut window = captioned(long);
+    let place = picture(&mut window).0;
+    // In the second line of the caption.
+    let at = Point { y: place.y + place.height + 35.0, ..under(&mut window, &[place], 0.4) };
+    window.click_at(at);
+    let first = head(&window);
+    assert_eq!(first.block.as_str(), "g", "the press is in the caption");
+    // The caption makes room for its switch once the caret is in it, so the word is under the pointer no more.
+    let now = caret(&mut window);
+    assert!((now.x - at.x).abs() > 8.0 || (now.y - at.y).abs() > 16.0, "{now:?} for {at:?}");
+
+    window.click_at(at);
+    let selection = window.editor().selection().expect("a selection");
+    let (start, end) =
+        (selection.anchor.offset.min(selection.head.offset), selection.anchor.offset.max(selection.head.offset));
+    assert!(start < end && (start..=end).contains(&first.offset), "the word at {}: {start} to {end}", first.offset);
+}
+
+#[test]
+fn a_caption_line_that_closes_above_the_view_leaves_the_text_where_it_is_read() {
+    // Where the caret is after a press on the text, far below a picture that was selected.
+    let read = |caption: &str| {
+        let asset = Some("assets/roof.png".into());
+        let kind =
+            BlockKind::Figure { asset, src: None, alt: String::new(), width: 300.0, height: 150.0, numbered: false };
+        let lines = (0..60).map(|line| text(&format!("p{line}"), BlockKind::Paragraph, "Reply by Friday."));
+        let blocks = [text("g", kind, caption)].into_iter().chain(lines).collect();
+        let mut window = Harness::open(Document { blocks, ..Document::default() });
+        let place = picture(&mut window).0;
+        window.click_at(middle(place)).advance(1000);
+        window.paint();
+        window.scroll_at(middle(place), 600.0).click_at(Point { x: place.x + 40.0, y: place.y + 200.0 });
+        (head(&window), caret(&mut window))
+    };
+    // A picture with a caption has its line whatever is selected, so nothing moves there.
+    assert_eq!(read(""), read("Seen from the garden"));
 }

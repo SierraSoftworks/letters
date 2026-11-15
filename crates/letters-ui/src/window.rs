@@ -12,7 +12,7 @@ use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
 use letters_editor::{
     Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Picture, Platform, Spot,
 };
-use letters_layout::{Callout, DocLayout, Fonts, Palette, Syntax};
+use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Syntax};
 use letters_model::{
     Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Pos, Selection, Style,
 };
@@ -20,6 +20,7 @@ use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
 
+use crate::captions::{self, Altering, Captions};
 use crate::chrome::Chrome;
 use crate::code_copy::{self, CodeCopy};
 use crate::color::{fade, resolve, same};
@@ -187,6 +188,8 @@ pub enum Message {
     Settings(Setting),
     /// What the menu on a linked picture's cloud asks for.
     Linked(Linking),
+    /// What the field of a picture's alt text asks for.
+    Alt(Altering),
 }
 
 impl Ui<EditorApp> {
@@ -592,6 +595,7 @@ pub struct EditorApp {
     drop: Option<Rect>,
     linked: Linked,
     grip: Grip,
+    captions: Captions,
     /// What the bar says of a write that was just done, as where the document was first saved, and since
     /// when, once a frame has said so.
     note: Option<(String, Option<u64>)>,
@@ -670,6 +674,7 @@ impl EditorApp {
             drop: None,
             linked: Linked::default(),
             grip: Grip::default(),
+            captions: Captions::default(),
             note: None,
             naming: false,
             renaming: None,
@@ -904,6 +909,93 @@ impl EditorApp {
         Some((figure.clone(), self.layout.figure(figure)?.image))
     }
 
+    /// The figure the line under a picture is about: the one whose picture is selected, or one with the
+    /// selection in its caption.
+    fn captioned(&self) -> Option<&BlockId> {
+        let selection = self.editor.selection()?;
+        let within = selection.anchor.block == selection.head.block;
+        let figure = self.editor.doc().block(&selection.head.block).filter(|block| within && is_figure(block))?;
+        Some(&figure.id)
+    }
+
+    /// The line under a figure's picture, and the block that holds what is written there: the figure
+    /// itself, or the caption of its gallery once it has one.
+    fn caption_of(&self, figure: &BlockId) -> Option<(Rect, Option<&Block>)> {
+        let line = self.layout.figure(figure)?.caption;
+        let holder = match self.gallery_of(figure) {
+            Some(gallery) => gallery.body.blocks().iter().find(|part| part.kind == BlockKind::Caption),
+            None => self.editor.doc().block(figure),
+        };
+        Some((line, holder))
+    }
+
+    /// The size captions are written at and how they are aligned, as the document's style has them.
+    fn caption_text(&self) -> (f32, TextAlign) {
+        let style = self.editor.model().style().types.get("caption");
+        style.map_or((tokens::TEXT_SM, TextAlign::Start), |style| (style.size * PT, style.align))
+    }
+
+    /// The line under the selected picture while nothing is written or numbered there, and where on it
+    /// the hint to write a caption stands.
+    fn hint(&self) -> Option<(Rect, Rect)> {
+        let figure = self.editor.picture()?;
+        let (line, holder) = self.caption_of(figure)?;
+        let numbers = self.gallery_of(figure).or_else(|| self.editor.doc().block(figure));
+        let numbered = numbers.is_some_and(|block| {
+            matches!(block.kind, BlockKind::Figure { numbered: true, .. } | BlockKind::Gallery { numbered: true })
+        });
+        if numbered || holder.is_some_and(|block| !block.plain_text().is_empty()) {
+            return None;
+        }
+        // The caret of an empty caption is where its first letter goes.
+        let first = holder.and_then(|block| self.layout.caret(&Pos::new(block.id.clone(), 0)));
+        let (size, align) = self.caption_text();
+        Some((line, captions::hint_at(line, first, CAPTION_INSET, size, align, self.shaper.as_ref())))
+    }
+
+    /// The figure whose alt text the switch under it turns to, the line under its picture and where the
+    /// switch stands at the end of that line.
+    fn alt_switch(&self) -> Option<(&BlockId, Rect, Rect)> {
+        let figure = self.captioned()?;
+        let (line, holder) = self.caption_of(figure)?;
+        let first = holder.and_then(|block| self.layout.caret(&Pos::new(block.id.clone(), 0)));
+        let first = first.map_or((line.y, line.height), |caret| (caret.y, caret.height));
+        Some((figure, line, captions::switch_at(line, first, self.shaper.as_ref())))
+    }
+
+    /// Turns the line under a picture to its alt text, and puts away what else hangs from the page.
+    fn alter(&mut self, figure: BlockId) {
+        let Some(BlockKind::Figure { alt, .. }) = self.editor.doc().block(&figure).map(|block| &block.kind) else {
+            return;
+        };
+        self.captions.alt = Some((figure, alt.clone()));
+        (self.link, self.spelling.fix, self.linked.open) = (None, None, None);
+    }
+
+    /// Does what the field of a picture's alt text asked.
+    fn altering(&mut self, asked: Altering, platform: &mut dyn Platform) {
+        match asked {
+            Altering::Draft(text) => {
+                if let Some((_, typed)) = &mut self.captions.alt {
+                    *typed = text;
+                }
+            }
+            Altering::Drop => self.captions.alt = None,
+            Altering::Apply => {
+                let Some((figure, typed)) = self.captions.alt.take() else { return };
+                let typed = typed.trim().to_owned();
+                let before = match self.editor.doc().block(&figure).map(|block| &block.kind) {
+                    Some(BlockKind::Figure { alt, .. }) => alt,
+                    _ => return,
+                };
+                // Only for the picture the line is still about, and only what says something else.
+                if self.captioned() == Some(&figure) && *before != typed {
+                    self.edit(platform, |editor, platform| editor.run(Command::SetAlt(typed), platform));
+                }
+            }
+        }
+    }
+
     /// Where the picture that is carried would land if it were let go at a point of the page area, and the
     /// bar that says so. Nowhere when that is where it is.
     fn carried_to(&self, at: Point) -> Option<(Spot, Option<Rect>)> {
@@ -942,7 +1034,7 @@ impl EditorApp {
 
     /// Opens the menu on a linked picture's cloud, and puts away what else hangs from the page.
     fn link_menu(&mut self, figure: BlockId) {
-        (self.link, self.spelling.fix) = (None, None);
+        (self.link, self.spelling.fix, self.captions.alt) = (None, None, None);
         self.linked.open = Some(figure);
     }
 
@@ -1111,6 +1203,7 @@ impl EditorApp {
     fn hung(&self) -> bool {
         let card = self.landing.is_some() || self.importing.is_some() || self.copying.is_some();
         let asked = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
+        let asked = asked || self.captions.alt.is_some();
         card || asked || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
     }
 
@@ -1190,7 +1283,11 @@ impl EditorApp {
             figures::corner_at(image, self.in_layout(at))
         });
         let gripped = std::mem::replace(&mut self.grip.over, corner) != corner;
-        self.references.point(found) || copy || clouded || gripped
+        let over = self.references.rest().filter(|_| !self.hung()).is_some_and(|at| {
+            self.alt_switch().is_some_and(|(_, _, switch)| captions::pressed(switch, self.in_layout(at)))
+        });
+        let switched = std::mem::replace(&mut self.captions.over, over) != over;
+        self.references.point(found) || copy || clouded || gripped || switched
     }
 
     /// Forgets where the pointer rests until it next moves, as when the person goes on writing.
@@ -1239,6 +1336,21 @@ impl EditorApp {
                     self.dragging = false;
                     return self.references.press(None);
                 }
+                // A press on the switch at the end of the line under a picture turns that line to the alt
+                // text, and one on a line that offers a caption starts it.
+                if let Some((figure, _, switch)) = self.alt_switch()
+                    && captions::pressed(switch, spot)
+                {
+                    let figure = figure.clone();
+                    self.dragging = false;
+                    self.references.press(None);
+                    return self.alter(figure);
+                }
+                if self.hint().is_some_and(|(line, _)| line.contains(spot)) {
+                    self.dragging = false;
+                    self.references.press(None);
+                    return self.edit(platform, |editor, platform| editor.run(Command::EditCaption, platform));
+                }
                 // A press that stays on a reference follows it. Any other press is the caret's alone.
                 let pressed = self.reference(at).filter(|_| clicks == 1 && !mods.shift);
                 self.references.press(pressed.map(|reference| (reference, at)));
@@ -1269,7 +1381,11 @@ impl EditorApp {
                     Some(selection) if mods.shift => selection.anchor.clone(),
                     _ => head.clone(),
                 };
-                self.editor.select(Selection { anchor, head });
+                // The later presses of a double or triple click are about where the first put the caret,
+                // since the text may have moved under the pointer when the caret came to it.
+                if clicks == 1 || mods.shift || self.editor.selection().is_none() {
+                    self.editor.select(Selection { anchor, head });
+                }
                 self.dragging = clicks == 1;
                 match clicks {
                     1 => self.reveal(),
@@ -1472,7 +1588,25 @@ impl EditorApp {
         if self.linked.open.as_ref().is_some_and(|figure| self.link_of(figure).is_none()) {
             self.linked.open = None;
         }
+        // The alt text of a picture the selection has left is no longer being written.
+        if self.captions.alt.as_ref().is_some_and(|(figure, _)| self.captioned() != Some(figure)) {
+            self.captions.alt = None;
+        }
         (self.column, self.height) = ((left, width), room.height);
+        // The line under the picture the selection is at is made ready for its caption, once the button is
+        // up: a caption that made room for its switch under a pointer still held would be selected by its
+        // next move.
+        if !self.dragging {
+            let within = self.editor.selection().filter(|selection| selection.anchor.block == selection.head.block);
+            let named = within.map(|selection| selection.head.block.clone());
+            if named == self.captions.named {
+                self.layout.set_caption_open(named.as_ref());
+            } else {
+                // A line that opens or closes above the view leaves what is read where it is.
+                self.held(|page| page.layout.set_caption_open(named.as_ref()));
+                self.captions.named = named;
+            }
+        }
         // A heading's markers hang in the margin, beside the outline when it shows.
         let taken = if self.outlined() { chapters_width() } else { tokens::SPACE_SM };
         self.layout.set_margin(left - taken);
@@ -1545,6 +1679,13 @@ impl EditorApp {
             (None, Some((_, image))) => figures::handles(image, accent, self.scheme, &mut list),
             (None, None) => {}
         }
+        // The line under it offers a caption while it has none, and has the switch to its alt text.
+        if let Some((_, hint)) = self.hint() {
+            captions::hint(hint, self.caption_text().0, self.shaper.as_ref(), self.scheme, &mut list);
+        }
+        if let Some((_, _, switch)) = self.alt_switch().filter(|_| self.captions.alt.is_none()) {
+            captions::switch(switch, self.captions.over, self.shaper.as_ref(), self.scheme, &mut list);
+        }
         // A picture that is carried is faint where it was.
         let carried = self.grip.moving.as_ref().and_then(|moving| Some((moving.carried()?, &moving.figure)));
         let carried = carried.and_then(|(at, figure)| Some((at, self.layout.figure(figure)?.image)));
@@ -1612,6 +1753,9 @@ impl EditorApp {
             let spot = Rect { x: origin.x + from.x, y: origin.y + from.y, ..from };
             let menu = pictures::menu(src, self.images.get(src).is_some()).popover().at(spot).align(Align::End);
             element = element.popover(menu.open(true).on_close(Message::Linked(Linking::Close)));
+        } else if let Some(((_, text), (_, line, switch))) = self.captions.alt.as_ref().zip(self.alt_switch()) {
+            let onto = |rect: Rect| Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect };
+            element = element.popover(captions::sheet(text, onto(line), onto(switch)));
         } else if let Some(fix) = &self.spelling.fix {
             // The menu hangs from the start of its word.
             let start = self.layout.caret(&Pos::new(fix.block.clone(), fix.range.start)).unwrap_or_default();
@@ -1645,6 +1789,7 @@ impl EditorApp {
         // A press on a reference follows it, one on a copy button copies and one on a cloud opens its menu,
         // which the pointer's shape says.
         let pressable = self.references.pointed().is_some() || self.code_copy.pointed() || self.linked.on_cloud();
+        let pressable = pressable || self.captions.over;
         match self.grip.corner() {
             Some(corner) => element.cursor(Cursor::Resize(figures::edge(corner))),
             None if pressable => element.cursor(Cursor::Pointer),
@@ -2461,6 +2606,7 @@ impl App for EditorApp {
             Message::Insert(Inserting::Close) => self.insert.close(),
             Message::Refer(Picking::Take(figure)) => self.refer(figure, platform),
             Message::Linked(asked) => self.linking(asked),
+            Message::Alt(asked) => self.altering(asked, platform),
             Message::Refer(Picking::Close) => {
                 self.edit(platform, |editor, platform| editor.run(Command::DismissReference, platform));
             }
@@ -2566,6 +2712,12 @@ impl App for EditorApp {
                 self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(text), platform));
             }
             Some(describe::Request::Copy(block)) => self.copy_code(block, platform),
+            Some(describe::Request::Alt(figure)) => {
+                self.editor.select_picture(&figure);
+                self.mark();
+                self.reveal();
+                self.alter(figure);
+            }
             Some(describe::Request::Tick(block)) => {
                 // The editor ticks the task the caret is in, and the caret is not the reader's to lose.
                 let held = self.editor.selection().cloned();
