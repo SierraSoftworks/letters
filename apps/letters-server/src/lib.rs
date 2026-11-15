@@ -7,6 +7,7 @@
 //! - [`spaces`] is the only way to a file, and cannot leave a space's folder.
 //! - [`library`] lists a space and finds a document by its id, wherever its file was moved to.
 //! - [`api`] answers the interface `letters_api` lays down.
+//! - [`rooms`] are the documents that are open now, and [`socket`] is each device's line to one.
 //! - [`pages`] are the server's own pages for a browser: the documents a person reaches, and one to read.
 //!
 //! A document's content lives in its `.let` file alone. Whatever else writes that file, over a share or
@@ -20,7 +21,9 @@ pub mod ids;
 pub mod library;
 pub mod oidc;
 pub mod pages;
+pub mod rooms;
 pub mod session;
+pub mod socket;
 pub mod spaces;
 pub mod store;
 
@@ -33,6 +36,7 @@ use crate::config::Config;
 use crate::error::{Answer, Refusal};
 use crate::library::Library;
 use crate::oidc::Provider;
+use crate::rooms::Rooms;
 use crate::session::Signed;
 use crate::spaces::Root;
 use crate::store::Store;
@@ -46,6 +50,7 @@ pub struct App {
     pub store: Store,
     pub library: Library,
     pub provider: Provider,
+    pub rooms: Rooms,
     clock: Clock,
 }
 
@@ -54,8 +59,8 @@ pub type Shared = Arc<App>;
 impl App {
     pub fn new(config: Config, store: Store) -> Self {
         let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
-        let provider = Provider::new(&config);
-        Self { config, store, library: Library::new(), provider, clock: Box::new(clock) }
+        let (provider, rooms) = (Provider::new(&config), Rooms::new(&config.server.state));
+        Self { config, store, library: Library::new(), provider, rooms, clock: Box::new(clock) }
     }
 
     /// The same server telling another time, for tests of what runs out.
@@ -94,21 +99,38 @@ impl App {
 }
 
 impl App {
-    /// Reads every folder the server knows of into the index: the shared spaces, and the own space of
-    /// everyone who has signed in. A folder that cannot be read is said and passed over.
-    pub fn scan(&self) {
+    /// Every folder the server knows of, each with its space's name: the shared spaces, and the own space
+    /// of everyone who has signed in. One that cannot be opened is said and passed over.
+    fn folders(&self) -> Vec<(&str, Root)> {
         let people = self.store.under(&session::PEOPLE, "").unwrap_or_default();
         let names: Vec<String> = people.into_iter().map(|(_, seen)| seen.person.username).collect();
+        let mut roots = Vec::new();
         for space in &self.config.spaces {
             let folders: Vec<String> = match space.personal() {
                 true => names.iter().filter(|name| spaces::username_ok(name)).map(|name| space.folder(name)).collect(),
                 false => vec![space.folder("")],
             };
             for folder in folders {
-                let scanned = Root::open(&folder, false).map_err(Refusal::from);
-                if let Err(refusal) = scanned.and_then(|root| self.library.scan(&self.store, &root)) {
-                    log(&format!("the space \"{}\" could not be scanned: {}", space.name, refusal.0));
+                match Root::open(&folder, false) {
+                    Ok(root) => roots.push((space.name.as_str(), root)),
+                    Err(error) => log(&format!("the space \"{}\" could not be opened: {error}", space.name)),
                 }
+            }
+        }
+        roots
+    }
+
+    /// Every folder the server knows of that can be opened now.
+    pub fn roots(&self) -> Vec<Root> {
+        self.folders().into_iter().map(|(_, root)| root).collect()
+    }
+
+    /// Reads every folder the server knows of into the index. One that cannot be read is said and passed
+    /// over.
+    pub fn scan(&self) {
+        for (space, root) in self.folders() {
+            if let Err(refusal) = self.library.scan(&self.store, &root) {
+                log(&format!("the space \"{space}\" could not be scanned: {}", refusal.0));
             }
         }
     }

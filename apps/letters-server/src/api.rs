@@ -5,7 +5,10 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::body::Bytes;
+use axum::extract::rejection::{BytesRejection, FailedToBufferBody};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::StatusCode;
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, SET_COOKIE};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -53,7 +56,10 @@ pub fn routes() -> Router<Shared> {
         .route("/api/v1/documents/{id}/move", post(relocate))
         .route("/api/v1/documents/{id}/trash", post(trash))
         .route("/api/v1/documents/{id}/assets", get(assets))
-        .route("/api/v1/documents/{id}/assets/{name}", get(asset))
+        .route(
+            "/api/v1/documents/{id}/assets/{name}",
+            get(asset).put(add_asset).layer(DefaultBodyLimit::max(letters_api::Limits::default().asset as usize)),
+        )
 }
 
 /// Runs `work` where it may wait on a folder or the store.
@@ -160,6 +166,8 @@ async fn document(State(app): State<Shared>, who: Signed, Path(id): Path<String>
 async fn file(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -> Answer<Response> {
     let (name, bytes) = blocking(move || {
         let found = app.locate(&who, &id)?;
+        // What the document's room holds goes to the file first, so that the file sent is whole.
+        app.rooms.save(&found.root, &found.place);
         Ok((found.place.name().to_owned(), app.library.bytes(&found.root, &found.place)?))
     })
     .await?;
@@ -173,17 +181,31 @@ async fn assets(State(app): State<Shared>, who: Signed, Path(id): Path<String>) 
     blocking(move || {
         let found = app.locate(&who, &id)?;
         let archive = app.library.open(&found.root, &found.place)?;
-        Ok(Json(archive.names().filter_map(|name| name.strip_prefix(ASSETS)).map(str::to_owned).collect()))
+        // The file's, and the ones its room holds that the file is yet to get.
+        let mut names: Vec<String> = archive.names().map(str::to_owned).collect();
+        names.extend(app.rooms.assets(&found.root, &found.place));
+        names.sort();
+        names.dedup();
+        Ok(Json(names.iter().filter_map(|name| name.strip_prefix(ASSETS)).map(str::to_owned).collect()))
     })
     .await
+}
+
+/// The entry an asset called `name` is in. An asset is named by the hash of its bytes, with an ending:
+/// nothing else is one.
+fn asset_entry(name: &str) -> Answer<String> {
+    let plain = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.');
+    plain.then(|| format!("{ASSETS}{name}")).ok_or_else(Refusal::not_found)
 }
 
 async fn asset(State(app): State<Shared>, who: Signed, Path((id, name)): Path<(String, String)>) -> Answer<Response> {
     let bytes = blocking(move || {
         let found = app.locate(&who, &id)?;
-        // An asset is named by the hash of its bytes, with an ending: nothing else is one.
-        let plain = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.');
-        let entry = plain.then(|| format!("{ASSETS}{name}")).ok_or_else(Refusal::not_found)?;
+        let entry = asset_entry(&name)?;
+        // A picture that was only just handed over is in the document's room before it is in the file.
+        if let Some(bytes) = app.rooms.asset(&found.root, &found.place, &entry) {
+            return Ok(bytes);
+        }
         app.library.open(&found.root, &found.place)?.read(&entry)?.ok_or_else(Refusal::not_found)
     })
     .await?;
@@ -195,6 +217,37 @@ async fn asset(State(app): State<Shared>, who: Signed, Path((id, name)): Path<(S
         (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
     ];
     Ok((headers, bytes).into_response())
+}
+
+/// `PUT`: a picture for the document, ahead of the edit that names it.
+async fn add_asset(
+    State(app): State<Shared>,
+    who: Signed,
+    Path((id, name)): Path<(String, String)>,
+    body: Result<Bytes, BytesRejection>,
+) -> Answer<StatusCode> {
+    let bytes = body.map_err(|rejection| match rejection {
+        BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_)) => {
+            Refusal::new(Code::TooLarge, "The picture is larger than the server takes.")
+        }
+        _ => Refusal::invalid("The picture did not arrive whole."),
+    })?;
+    blocking(move || {
+        let found = app.locate(&who, &id)?;
+        found.must(Role::Editor)?;
+        let entry = asset_entry(&name)?;
+        // The bytes say what they are, whatever the request calls them.
+        if letters_trust::ImageType::sniff(&bytes).is_none() {
+            return Err(Refusal::invalid("That is not a picture Letters can show."));
+        }
+        // The same bytes go by the same name, so one the file holds is not taken twice.
+        if app.library.open(&found.root, &found.place)?.names().any(|held| held == entry) {
+            return Ok(());
+        }
+        app.rooms.add_asset(&app, &found.root, &found.place, &entry, bytes.into())
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn rename(
@@ -260,7 +313,7 @@ impl App {
         let (root, place) = (self.root(who, space)?, Place::parse(folder)?);
         let told = space.told(role);
         let rows = self.library.list(&self.store, &root, &place)?;
-        let entries = rows.iter().map(|row| entry(&told, row)).collect();
+        let entries = rows.iter().map(|row| self.told(&told, &root, row)).collect();
         Ok(Listing { space: told, path: place.as_str().to_owned(), entries })
     }
 
@@ -268,7 +321,24 @@ impl App {
     fn entry(&self, space: &Space, root: &Root, place: &Place) -> Answer<Entry> {
         let (folder, name) = place.split();
         let rows = self.library.list(&self.store, root, &folder)?;
-        rows.iter().find(|row| row.listed.name == name).map(|row| entry(space, row)).ok_or_else(Refusal::not_found)
+        let row = rows.iter().find(|row| row.listed.name == name).ok_or_else(Refusal::not_found)?;
+        Ok(self.told(space, root, row))
+    }
+
+    /// A row as a file table shows it, with who has it open now.
+    fn told(&self, space: &Space, root: &Root, row: &Row) -> Entry {
+        let mut entry = entry(space, row);
+        let people = if row.listed.folder { Vec::new() } else { self.rooms.people(root, &row.place) };
+        if !people.is_empty() {
+            entry.tags.push(Tag::Editing { people });
+        }
+        entry
+    }
+
+    /// The name `who` signs what they write with: the one they chose, or the one they sign in under.
+    pub fn signs_as(&self, who: &Signed) -> Answer<String> {
+        let settings = self.store.get(&SETTINGS, &who.person.id)?.unwrap_or_default();
+        Ok(settings.name.unwrap_or_else(|| who.person.name.clone()))
     }
 
     pub fn new_document(&self, who: &Signed, space: &str, new: &NewDocument) -> Answer<Entry> {
@@ -303,7 +373,8 @@ impl App {
         let name = file_name(name).ok_or_else(|| Refusal::invalid("That name cannot be used for a document."))?;
         let to = found.place.split().0.child(&format!("{name}{EXTENSION}"))?;
         if to != found.place {
-            self.library.relocate(&self.store, (&found.root, &found.place), (&found.root, &to))?;
+            let (from, at) = ((&found.root, &found.place), (found.root.again()?, to.clone()));
+            self.rooms.moving(from, Some(at), || self.library.relocate(&self.store, from, (&found.root, &to)))?;
         }
         self.entry(&found.space, &found.root, &to)
     }
@@ -318,7 +389,8 @@ impl App {
         let root = self.root(who, space)?;
         let place = Place::parse(&to.folder)?.child(found.place.name())?;
         if (root.key.as_str(), &place) != (found.root.key.as_str(), &found.place) {
-            self.library.relocate(&self.store, (&found.root, &found.place), (&root, &place))?;
+            let (from, at) = ((&found.root, &found.place), (root.again()?, place.clone()));
+            self.rooms.moving(from, Some(at), || self.library.relocate(&self.store, from, (&root, &place)))?;
         }
         self.entry(&space.told(role), &root, &place)
     }
@@ -327,7 +399,8 @@ impl App {
     pub fn trash(&self, who: &Signed, id: &str) -> Answer<()> {
         let found = self.locate(who, id)?;
         found.must(Role::Editor)?;
-        self.library.trash(&self.store, &found.root, &found.place, self.now())
+        let thrown = || self.library.trash(&self.store, &found.root, &found.place, self.now());
+        self.rooms.moving((&found.root, &found.place), None, thrown)
     }
 
     /// Puts `file` back from the trash of `space`, and says where it is now.
@@ -344,6 +417,10 @@ impl App {
     /// The document `id`, ready to edit. A `page` carries its style and its notes along.
     pub fn opened(&self, who: &Signed, id: &str, page: bool) -> Answer<Opened> {
         let found = self.locate(who, id)?;
+        if page {
+            // The style and the notes are read from the file, which its room may be ahead of.
+            self.rooms.save(&found.root, &found.place);
+        }
         let mut archive = self.library.open(&found.root, &found.place)?;
         let manifest = archive.manifest().clone();
         let json = |archive: &mut letters_format::Archive<_>, name: &str| -> Answer<Option<Value>> {
@@ -351,7 +428,6 @@ impl App {
             Ok(bytes.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
         };
         let (style, notes) = (json(&mut archive, STYLE)?, json(&mut archive, NOTES)?);
-        let settings = self.store.get(&SETTINGS, &who.person.id)?.unwrap_or_default();
         self.note_opened(who, &manifest.id)?;
         Ok(Opened {
             id: manifest.id.clone(),
@@ -360,7 +436,7 @@ impl App {
             space: Some(found.space.id.clone()),
             path: found.place.as_str().to_owned(),
             role: found.space.role,
-            author: settings.name.unwrap_or_else(|| who.person.name.clone()),
+            author: self.signs_as(who)?,
             socket: paths::socket(&manifest.id),
             // A document in a space the person reaches is vouched for by whoever let them in.
             trust: Trust::Trusted,
@@ -426,5 +502,6 @@ fn entry(space: &Space, row: &Row) -> Entry {
 
 /// The routes with their state, for the server and for tests.
 pub fn router(app: Arc<App>) -> Router {
-    routes().merge(crate::auth::routes()).merge(crate::pages::routes()).with_state(app)
+    let routes = routes().merge(crate::socket::routes()).merge(crate::auth::routes()).merge(crate::pages::routes());
+    routes.with_state(app)
 }

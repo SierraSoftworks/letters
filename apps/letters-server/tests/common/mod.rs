@@ -1,6 +1,7 @@
 //! A server over scratch folders, and people to ask it things.
 #![allow(dead_code)]
 
+pub mod desk;
 pub mod idp;
 
 use std::collections::{BTreeMap, HashMap};
@@ -106,6 +107,27 @@ impl Server {
         let app = App::new(config, Store::in_memory()).with_clock(Box::new(move || told.load(Ordering::Relaxed)));
         let app = Arc::new(app);
         Self { scratch, router: api::router(app.clone()), app, clock }
+    }
+
+    /// The server after it stopped and started again: the same folders, and nothing that was in memory.
+    pub fn restarted(self) -> Self {
+        let Self { scratch, .. } = self;
+        let config =
+            Config::parse(&settings(&scratch.0, "https://id.example.test", "")).expect("the settings are sound");
+        let clock = Arc::new(AtomicU64::new(START));
+        let told = clock.clone();
+        let app = App::new(config, Store::in_memory()).with_clock(Box::new(move || told.load(Ordering::Relaxed)));
+        let app = Arc::new(app);
+        Self { scratch, router: api::router(app.clone()), app, clock }
+    }
+
+    /// Serves on a port of this machine, for what a router alone cannot be asked: a socket.
+    pub async fn listen(&self) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("a port is free");
+        let address = listener.local_addr().unwrap();
+        let router = self.router.clone();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        address
     }
 
     /// Lets `seconds` pass.

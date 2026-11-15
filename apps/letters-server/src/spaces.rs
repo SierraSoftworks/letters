@@ -122,6 +122,11 @@ impl Root {
         Ok(Self { key: path.to_owned(), dir: Dir::open_ambient_dir(path, ambient_authority())? })
     }
 
+    /// The same folder, open once more: for whoever keeps it longer than the request that opened it.
+    pub fn again(&self) -> io::Result<Self> {
+        Ok(Self { key: self.key.clone(), dir: self.dir.try_clone()? })
+    }
+
     /// The folder at `place`.
     pub fn folder(&self, place: &Place) -> io::Result<Folder> {
         let dir = if place.is_root() { self.dir.try_clone() } else { self.dir.open_dir(place.as_str()) };

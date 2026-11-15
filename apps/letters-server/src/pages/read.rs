@@ -34,6 +34,8 @@ pub async fn page(State(app): State<Shared>, Visitor(who): Visitor, Path(id): Pa
         let (app, who) = (app.clone(), who.clone());
         move || {
             let found = app.locate(&who, &id)?;
+            // What is being written now is read too.
+            app.rooms.save(&found.root, &found.place);
             let mut archive = app.library.open(&found.root, &found.place)?;
             let (document, style) = (archive.document()?, archive.style()?);
             app.note_opened(&who, &id)?;

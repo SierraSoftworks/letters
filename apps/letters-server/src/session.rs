@@ -12,7 +12,7 @@ use letters_api::{Code, Person, Token};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Answer, Refusal};
-use crate::ids::{hashed, secret};
+use crate::ids::{self, hashed, secret};
 use crate::store::{Batch, StoreError, Table};
 use crate::{App, Shared};
 
@@ -33,6 +33,9 @@ pub enum Carrier {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
+    /// Names the sign-in through every token it is renewed to. Empty in a row an older build wrote.
+    #[serde(default)]
+    pub id: String,
     pub person: Person,
     pub groups: Vec<String>,
     pub carrier: Carrier,
@@ -73,7 +76,8 @@ impl App {
                 &person.id,
                 &Seen { person: person.clone(), groups: groups.clone(), first, last: now },
             )?;
-            issue(batch, Session { person, groups, carrier, expires: 0, ends, renewal: None }, now)
+            let id = ids::hex(&ids::random::<16>());
+            issue(batch, Session { id, person, groups, carrier, expires: 0, ends, renewal: None }, now)
         })?)
     }
 
@@ -94,15 +98,21 @@ impl App {
         token.ok_or_else(Refusal::signed_out)
     }
 
-    /// Ends the session `token` stands for.
+    /// Ends the session `token` stands for, and the sockets that were opened with it.
     pub fn sign_out(&self, token: &str) -> Answer<()> {
-        Ok(self.store.write(|batch| {
-            let key = hashed(token);
-            if let Some(Session { renewal: Some(renewal), .. }) = batch.get(&SESSIONS, &key)? {
-                batch.remove(&RENEWALS, &renewal)?;
+        let key = hashed(token);
+        let ended = self.store.write(|batch| {
+            let ended = batch.get(&SESSIONS, &key)?;
+            if let Some(Session { renewal: Some(renewal), .. }) = &ended {
+                batch.remove(&RENEWALS, renewal)?;
             }
-            batch.remove(&SESSIONS, &key)
-        })?)
+            batch.remove(&SESSIONS, &key)?;
+            Ok(ended)
+        })?;
+        if let Some(ended) = ended {
+            self.rooms.signed_out(&ended.named(&key));
+        }
+        Ok(())
     }
 
     /// The session `token` stands for, while it lasts.
@@ -116,6 +126,14 @@ impl App {
             }
             _ => Err(Refusal::signed_out()),
         }
+    }
+}
+
+impl Session {
+    /// What the sign-in goes by among the open sockets. `key` is the hash of the token it has now, which
+    /// stands in for a sign-in an older build started.
+    fn named(&self, key: &str) -> String {
+        if self.id.is_empty() { key.to_owned() } else { self.id.clone() }
     }
 }
 
@@ -158,6 +176,10 @@ pub struct Signed {
     pub carrier: Carrier,
     /// The token itself, to end the session with.
     pub token: String,
+    /// What the sign-in goes by through every token it is renewed to.
+    pub session: String,
+    /// When the sign-in ends, renewed or not.
+    pub ends: u64,
 }
 
 impl Signed {
@@ -174,7 +196,15 @@ impl Signed {
         if carrier == Carrier::Cookie && !reads && !same_origin(app, headers) {
             return Err(Refusal::forbidden("This request did not come from the server's own pages."));
         }
-        Ok(Self { person: session.person, groups: session.groups, carrier, token: token.to_owned() })
+        let (named, ends) = (session.named(&hashed(token)), session.ends);
+        Ok(Self {
+            person: session.person,
+            groups: session.groups,
+            carrier,
+            token: token.to_owned(),
+            session: named,
+            ends,
+        })
     }
 }
 
