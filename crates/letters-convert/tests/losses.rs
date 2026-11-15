@@ -103,7 +103,7 @@ fn each_format_lists_what_it_cannot_carry() {
                 (Galleries, 1),
                 (PageBreaks, 1),
                 (Languages, 2),
-                (Contents, 1),
+                // Its table of contents is written as the list it shows.
                 (LinkPreviews, 1),
             ],
         ),
