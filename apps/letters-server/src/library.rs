@@ -288,7 +288,14 @@ impl Library {
     /// Merges `theirs`, another copy of the document at `place`, into its file. Nothing in the file is
     /// replaced: the two meet as two writers of one folder do, and merging the same copy again changes
     /// nothing.
-    pub fn merge<R: Read + Seek>(&self, root: &Root, place: &Place, theirs: &mut Archive<R>, now: u64) -> Answer<()> {
+    pub fn merge<R: Read + Seek>(
+        &self,
+        store: &Store,
+        root: &Root,
+        place: &Place,
+        theirs: &mut Archive<R>,
+        now: u64,
+    ) -> Answer<()> {
         let (folder, name) = place.split();
         let mut folder = root.folder(&folder)?;
         let mut ours = Archive::open(BufReader::new(folder.open(name)?))?;
@@ -299,8 +306,12 @@ impl Library {
         let label = format!("{} server", day.get(..10).unwrap_or(&day));
         let save = Save { name, token: &token, label: &label, attempts: 3 };
         // A copy beside the file holds the document as safely as the file would.
-        if let Saved::ConflictCopy { name: beside, cause } = letters_format::save(&mut folder, &mut copy, &save)? {
-            crate::log(&format!("\"{name}\" could not be written ({cause}), and what was merged went to \"{beside}\""));
+        match letters_format::save(&mut folder, &mut copy, &save)? {
+            Saved::ConflictCopy { name: beside, cause } => crate::log(&format!(
+                "\"{name}\" could not be written ({cause}), and what was merged went to \"{beside}\""
+            )),
+            Saved::Written | Saved::Restored { .. } => wrote(store, root, place, &copy),
+            Saved::Unchanged => {}
         }
         Ok(())
     }
@@ -434,6 +445,29 @@ fn read(folder: &Folder, listed: &Listed) -> Known {
     };
     let import_notes = archive.notes().map(open).unwrap_or(0);
     Known { len, modified, id, created, contributors: contributors.unwrap_or_default(), import_notes }
+}
+
+/// Takes into the index what the server itself just wrote to the file at `place`, as the copy it wrote
+/// tells it. The file is then not read to learn what the server knows: a long history would be checked and
+/// loaded again after every save. A fault here is none: the next listing reads the file.
+pub(crate) fn wrote(store: &Store, root: &Root, place: &Place, copy: &WorkingCopy) {
+    let (folder, name) = place.split();
+    let stamp = root.folder(&folder).ok().and_then(|mut folder| Files::stamp(&mut folder, name).ok().flatten());
+    let Some(stamp) = stamp else { return };
+    let open = copy.notes.notes.iter().filter(|note| note.kind == NoteKind::Import && !note.resolved);
+    let known = Known {
+        len: stamp.len,
+        modified: stamp.modified,
+        id: Some(copy.id.clone()),
+        created: Some(copy.created.clone()),
+        contributors: copy.model().authors().into_iter().filter(|name| !name.is_empty()).collect(),
+        import_notes: open.count() as u32,
+    };
+    let key = file_key(root, place);
+    let _ = store.write(|batch| {
+        let was = batch.get(&FILES, &key)?;
+        index(batch, root, place, was.as_ref(), Some(&known))
+    });
 }
 
 /// How a copy that could not be merged into a document is refused.

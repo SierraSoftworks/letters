@@ -34,6 +34,7 @@ use crate::error::{Answer, Refusal};
 use crate::ids;
 use crate::session::Signed;
 use crate::spaces::{Folder, Place, Root};
+use crate::store::Store;
 use crate::{App, Shared, log};
 
 /// How many frames may wait for one socket. A device that falls this far behind is let go, and joins
@@ -94,6 +95,8 @@ fn failed(error: Error) -> Refusal {
 pub struct Rooms {
     /// Where the journals are: `<state>/rooms`.
     folder: PathBuf,
+    /// The server's records, for what a room's save tells the index.
+    store: Store,
     /// By [`key`]. This lock is never taken by whoever holds a room's.
     open: Mutex<HashMap<String, Arc<Open>>>,
     /// The journals no room has: the id of the document each is of, and its folder's name. The room
@@ -141,6 +144,8 @@ struct Hosted {
     parked: bool,
     /// The file was not there at the last look.
     missing: bool,
+    /// A save wrote the file, and the index has not been told.
+    wrote: bool,
     /// The file is gone from its place. The room is dropped at its keeper's next turn.
     lost: bool,
 }
@@ -169,9 +174,10 @@ pub struct Seat {
 }
 
 impl Rooms {
-    pub fn new(state: &Path) -> Self {
+    pub fn new(state: &Path, store: Store) -> Self {
         Self {
             folder: state.join("rooms"),
+            store,
             open: Mutex::new(HashMap::new()),
             left: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
@@ -569,6 +575,11 @@ impl Open {
         let done = catch_unwind(AssertUnwindSafe(|| {
             let done = work(hosted, now);
             hosted.settle(self, now);
+            // The index learns what a save wrote from the room, and so does not read the file for it: with
+            // a long history, checking and loading it again would cost more than the save did.
+            if std::mem::take(&mut hosted.wrote) {
+                crate::library::wrote(&rooms.store, &hosted.root, &hosted.place, hosted.room.copy());
+            }
             done
         }));
         if done.is_err()
@@ -618,6 +629,7 @@ impl Hosted {
             hold: 0,
             parked: false,
             missing: false,
+            wrote: false,
             lost: false,
         })
     }
@@ -743,7 +755,11 @@ impl Hosted {
                 }
                 false
             }
-            Ok(saved) => matches!(saved, Some(Saved::Written | Saved::Restored { .. })),
+            Ok(saved) => {
+                let wrote = matches!(saved, Some(Saved::Written | Saved::Restored { .. }));
+                self.wrote |= wrote;
+                wrote
+            }
             Err(error) => {
                 log(&format!("\"{name}\" could not be saved, and is tried again: {error}"));
                 false

@@ -74,6 +74,27 @@ async fn two_people_write_one_document_and_its_file_holds_both() {
 }
 
 #[tokio::test]
+async fn the_file_table_says_of_a_document_the_server_saved_what_its_file_says() {
+    let (server, ada, id) = shared("indexed").await;
+    let ben = server.person("ben", &["family"]);
+    let mut desk = Desk::open(&server, &ben, &id).await.unwrap();
+    desk.write("Ben wrote here. ");
+    settle([&mut desk]).await;
+    desk.leave().await;
+    // The server tells its file table what it saved, and does not read the file for it.
+    let told = row(&ada).await;
+    assert!(!told.contributors.is_empty(), "whoever wrote it is named");
+
+    // With another time on it the file is read anew, and says the same.
+    let file = std::fs::File::options().write(true).open(server.scratch.0.join("family/Plan.let")).unwrap();
+    file.set_modified(std::time::SystemTime::now() + Duration::from_secs(60)).unwrap();
+    drop(file);
+    let read = row(&ada).await;
+    assert_ne!(read.modified, told.modified, "the file has another time");
+    assert_eq!((read.id, read.contributors, read.tags), (told.id, told.contributors, told.tags));
+}
+
+#[tokio::test]
 async fn a_role_in_the_space_decides_what_a_session_may_write() {
     let (server, ada, id) = shared("roles").await;
     let cases =

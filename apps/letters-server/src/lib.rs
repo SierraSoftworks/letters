@@ -82,7 +82,7 @@ pub type Shared = Arc<App>;
 impl App {
     pub fn new(config: Config, store: Store) -> Self {
         let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
-        let (provider, rooms) = (Provider::new(&config), Rooms::new(&config.server.state));
+        let (provider, rooms) = (Provider::new(&config), Rooms::new(&config.server.state, store.clone()));
         let (editor, fetches) = (Editor::compiled(), Fetches::new(Roots::System));
         let (library, doors, log) = (Library::new(), Doors::default(), Log::default());
         let telemetry = Telemetry::default();

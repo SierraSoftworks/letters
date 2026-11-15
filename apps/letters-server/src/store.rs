@@ -9,6 +9,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::Arc;
 
 use redb::backends::InMemoryBackend;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
@@ -80,21 +81,23 @@ impl<V> Table<V> {
     }
 }
 
+/// The server's records. A clone is the same records, for a part of the server that writes by itself.
+#[derive(Clone)]
 pub struct Store {
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl Store {
     /// Opens the store in `folder`, which is made if it is not there.
     pub fn open(folder: &Path) -> Result<Self, StoreError> {
         std::fs::create_dir_all(folder)?;
-        Ok(Self { db: Database::create(folder.join(FILE))? })
+        Ok(Self { db: Arc::new(Database::create(folder.join(FILE))?) })
     }
 
     /// A store that is gone when it is dropped, for tests.
     pub fn in_memory() -> Self {
         let db = Database::builder().create_with_backend(InMemoryBackend::new());
-        Self { db: db.expect("a store in memory opens") }
+        Self { db: Arc::new(db.expect("a store in memory opens")) }
     }
 
     pub fn get<V: DeserializeOwned>(&self, table: &Table<V>, key: &str) -> Result<Option<V>, StoreError> {
