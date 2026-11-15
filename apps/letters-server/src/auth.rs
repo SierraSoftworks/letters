@@ -23,6 +23,7 @@ use crate::ids::{base64url, hashed, secret};
 use crate::oidc::{Sent, form};
 use crate::session::{self, Carrier, Signed};
 use crate::store::Table;
+use crate::telemetry::{Event, Through};
 use crate::{App, Shared, log, pages};
 
 /// How long a person has at the provider before the sign-in must be started again.
@@ -149,6 +150,7 @@ async fn callback(State(app): State<Shared>, headers: HeaderMap, Query(back): Qu
     let spent = (SET_COOKIE, cookie(&app, STATE_COOKIE, "", STATE_PATH, 0));
     match finished.await {
         Ok((token, to)) => {
+            app.telemetry.record(Event::SignedIn(Through::Browser));
             let session = (SET_COOKIE, session_cookie(&app, &token));
             (AppendHeaders([spent, session]), Redirect::to(&to)).into_response()
         }
@@ -248,7 +250,9 @@ async fn hand_over(
 }
 
 async fn exchange(State(app): State<Shared>, Json(exchange): Json<Exchange>) -> Answer<Json<Token>> {
-    blocking(move || app.exchange(&exchange).map(Json)).await
+    let reporting = app.clone();
+    let exchanged = blocking(move || app.exchange(&exchange).map(Json)).await;
+    exchanged.inspect(|_| reporting.telemetry.record(Event::SignedIn(Through::Desktop)))
 }
 
 impl App {

@@ -4020,6 +4020,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+ "tracing-batteries",
  "tungstenite 0.30.0",
  "ureq",
  "yew",

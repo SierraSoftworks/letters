@@ -25,6 +25,8 @@ pub struct Config {
     pub trust: Trust,
     #[serde(default)]
     pub links: Links,
+    #[serde(default)]
+    pub telemetry: Telemetry,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -128,6 +130,25 @@ pub struct Links {
     /// Whether documents can be shared by link. Off unless the server's owner says so.
     #[serde(default)]
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Telemetry {
+    /// Whether the server reports how it is used, with nothing of its documents or its people. On unless
+    /// the server's owner says no. See `telemetry.rs` for all that is said.
+    #[serde(default = "default_reports")]
+    pub enabled: bool,
+}
+
+impl Default for Telemetry {
+    fn default() -> Self {
+        Self { enabled: default_reports() }
+    }
+}
+
+const fn default_reports() -> bool {
+    true
 }
 
 fn default_name() -> String {

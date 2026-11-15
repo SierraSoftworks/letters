@@ -19,6 +19,7 @@ use crate::Shared;
 use crate::error::{Answer, Refusal};
 use crate::rooms::{Out, Seat};
 use crate::session::{Carrier, Reader, same_origin};
+use crate::telemetry::{Event, Through};
 
 /// How long a write waits on a device that has stopped reading.
 const STALLED: Duration = Duration::from_secs(30);
@@ -40,6 +41,7 @@ async fn open(
         return Err(Refusal::forbidden("This request did not come from the server's own pages."));
     }
     let (seat, out) = app.join(&who, &id).await?;
+    app.telemetry.record(Event::SyncJoined(Through::of(&who)));
     // A link's visit may be over before the sign-in is.
     let ends = seat.until.map_or(who.ends, |until| until.min(who.ends));
     let lasts = Duration::from_secs(ends.saturating_sub(app.now()));

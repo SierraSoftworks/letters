@@ -22,6 +22,7 @@ use crate::error::{Answer, Refusal};
 use crate::session::{PEOPLE, Reader, Signed};
 use crate::spaces::{Place, Root};
 use crate::store::Table;
+use crate::telemetry::Event;
 use crate::{App, Shared};
 
 /// What is kept of a document's shares.
@@ -110,6 +111,7 @@ async fn share(
     Path(id): Path<String>,
     Json(shares): Json<Shares>,
 ) -> Answer<Json<Shares>> {
+    app.telemetry.record(Event::ShareChanged);
     blocking(move || app.share(&who, &id, &shares.people).map(Json)).await
 }
 

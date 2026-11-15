@@ -102,6 +102,18 @@ readers = ["friends"]
   provider. A tailnet's first policy allows all of it, and a stricter one grants it.
 - **Check.** `letters-server --check` reads the settings and says what is wrong with them.
 
+## Usage reports
+
+A release build tells `analytics.sierrasoftworks.com` that a server runs, for how long, and how often its
+features are asked for: event names out of a closed list in `src/telemetry.rs`, the version, the system's
+kind, its language and its time zone. Nothing of a document, a person, a group, a link or an address is
+sent. It is the only host the server reaches beside the provider and the trusted sources.
+
+```toml
+[telemetry]
+enabled = false
+```
+
 ## Share links
 
 Links are off until the settings turn them on. A link opens one document for whoever holds its address,

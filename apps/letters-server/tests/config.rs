@@ -17,6 +17,9 @@ fn sound_settings_are_read_with_their_defaults() {
     assert_eq!(config.auth.oidc.groups_claim, "groups");
     assert!(config.auth.oidc.scopes.iter().any(|scope| scope == "openid"));
     assert!(!config.links.enabled, "links are off until the owner turns them on");
+    assert!(config.telemetry.enabled, "usage is reported until the owner says no");
+    let quiet = with(|sound| format!("{sound}\n[telemetry]\nenabled = false\n")).expect("the settings are sound");
+    assert!(!quiet.telemetry.enabled);
     assert!(config.server.proxies.iter().all(|proxy| proxy.is_loopback()), "only this machine speaks for others");
     let ids: Vec<String> = config.spaces.iter().map(|space| space.id()).collect();
     assert_eq!(ids, ["home", "family"]);
@@ -53,7 +56,8 @@ fn the_clients_secret_is_read_from_the_settings_or_from_a_file() {
 #[test]
 fn settings_that_cannot_be_run_with_say_why() {
     // What is changed in sound settings, and a word the refusal must hold.
-    let cases: [(&str, &str, &str); 12] = [
+    let cases: [(&str, &str, &str); 13] = [
+        ("name = \"Test\"", "name = \"Test\"\n[telemetry]\nserver = \"https://elsewhere.example\"", "server"),
         ("editors = [\"family\"]", "editor = [\"family\"]", "editor"),
         ("url = \"https://letters.example.test\"", "url = \"http://letters.example.test\"", "TLS"),
         ("url = \"https://letters.example.test\"", "url = \"https://letters.example.test/app\"", "host"),

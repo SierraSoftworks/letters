@@ -27,6 +27,7 @@ use crate::library::{Row, untitled};
 use crate::session::{Carrier, Reader, Signed};
 use crate::spaces::{EXTENSION, Place, Root, seconds, shown};
 use crate::store::Table;
+use crate::telemetry::Event;
 use crate::{App, Shared};
 
 /// A document's file, open to be read.
@@ -158,6 +159,7 @@ async fn new_document(
     Path(space): Path<String>,
     Json(new): Json<NewDocument>,
 ) -> Answer<Json<Entry>> {
+    app.telemetry.record(Event::DocumentMade);
     blocking(move || app.new_document(&who, &space, &new).map(Json)).await
 }
 
@@ -358,6 +360,7 @@ async fn trash(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -
 }
 
 async fn merge_conflicts(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -> Answer<Json<Vec<String>>> {
+    app.telemetry.record(Event::ConflictsMerged);
     blocking(move || app.merge_conflicts(&who, &id).map(Json)).await
 }
 

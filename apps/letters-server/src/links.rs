@@ -37,6 +37,7 @@ use crate::session::{Linked, Signed, cookies};
 use crate::shares::BETWEEN;
 use crate::spaces::{Place, Root};
 use crate::store::Table;
+use crate::telemetry::Event;
 use crate::{App, Shared};
 
 /// What is kept of a link.
@@ -237,6 +238,7 @@ async fn make(
     Path(id): Path<String>,
     Json(new): Json<NewLink>,
 ) -> Answer<Json<CreatedLink>> {
+    app.telemetry.record(Event::LinkMade);
     blocking(move || app.make_link(&who, &id, &new).map(Json)).await
 }
 
@@ -245,6 +247,7 @@ async fn revoke(
     who: Signed,
     Path((id, link)): Path<(String, String)>,
 ) -> Answer<StatusCode> {
+    app.telemetry.record(Event::LinkRevoked);
     blocking(move || app.revoke_link(&who, &id, &link)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
