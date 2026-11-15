@@ -596,6 +596,13 @@ fn reads_the_language_text_is_in() {
             "de-DE",
             &["Guten Morgen zusammen", "en-GB: Hello", "en-GB: 12"],
         ),
+        // Text that reads from the right is in the language Word keeps for such text.
+        (
+            p("Hello there, everyone")
+                + &format!("<w:p>{}</w:p>", run(r#"<w:rtl/><w:lang w:val="en-US" w:bidi="he-IL"/>"#, "שלום לכולם")),
+            "en-GB",
+            &["Hello there, everyone", "he-IL: שלום לכולם"],
+        ),
         // Code is in no language.
         (
             format!("<w:p>{}{}</w:p>", lang("fr-FR", "Bonjour "), run(r#"<w:rStyle w:val="Mono"/>"#, "x"))
@@ -1375,6 +1382,7 @@ fn page_breaks_and_languages_survive_a_round_trip() {
         text(BlockKind::Paragraph, "Hello there, everyone"),
         turning(text(BlockKind::Heading { level: 1 }, "Chapter two")),
         in_lang("fr-FR", text(BlockKind::Paragraph, "Bonjour")),
+        in_lang("ar", text(BlockKind::Paragraph, "مرحبا بالعالم")),
         paragraph("", mixed),
         turning(quote),
         turning(in_lang("fr-FR", text(item, "Un"))),
@@ -1483,6 +1491,34 @@ fn a_formula_is_written_as_an_equation_and_one_with_a_mistake_as_its_source() {
     assert_eq!(equations(&mistaken), (0, 0, 0, true));
     let texts: Vec<String> = returned(&mistaken).document.walk().map(Block::plain_text).collect();
     assert_eq!(texts, [r"See \frac{a", r"\frac{a"], "the source is not lost");
+}
+
+#[test]
+fn text_that_reads_from_the_right_is_set_from_the_right() {
+    // What a paragraph holds, whether Word sets it from the right, and the stretches Word is told read
+    // from the right.
+    let cases: &[(&str, bool, &[&str])] = &[
+        ("Plain text, with 3 digits.", false, &[]),
+        ("مرحبا بالعالم، 3 مرات.", true, &["مرحبا بالعالم، 3 مرات."]),
+        ("The word مرحبا بالعالم means hello.", false, &["مرحبا بالعالم"]),
+        ("שלום English שלום", true, &["שלום ", " שלום"]),
+    ];
+    for (text, turned, stretches) in cases {
+        let doc = Document { blocks: vec![Block::text("p", BlockKind::Paragraph, *text)], ..Document::default() };
+        let body = part(&export(&doc), "word/document.xml");
+        let xml = roxmltree::Document::parse(&body).expect("the body is XML");
+        let named = |node: &roxmltree::Node, name: &str| node.tag_name().name() == name;
+        let rtl = xml.descendants().filter(|run| named(run, "r") && run.descendants().any(|held| named(&held, "rtl")));
+        let said: Vec<String> = rtl
+            .map(|run| run.descendants().filter(|held| named(held, "t")).filter_map(|held| held.text()).collect())
+            .collect();
+        let back = returned(&doc);
+
+        assert_eq!(xml.descendants().any(|held| named(&held, "bidi")), *turned, "{text}");
+        assert_eq!(said, *stretches, "{text}");
+        assert_eq!(back.document.blocks[0].plain_text(), *text);
+        assert_eq!(back.notes, [], "{text}");
+    }
 }
 
 #[test]
@@ -1919,7 +1955,7 @@ fn any_text() -> impl Strategy<Value = String> {
         4 => "[a-z]{1,4}",
         2 => Just(" ".to_owned()),
         3 => proptest::sample::select(vec![
-            "<", ">", "&", "\"", "'", "&amp;", "]]>", "<w:t>", "</w:p>", "\n", "\t", "  ", "é", "中", "🙂", "\u{a0}", "[^1]", "1.",
+            "<", ">", "&", "\"", "'", "&amp;", "]]>", "<w:t>", "</w:p>", "\n", "\t", "  ", "é", "中", "🙂", "\u{a0}", "[^1]", "1.", "שלום", "مرحبا",
         ])
         .prop_map(str::to_owned),
     ];

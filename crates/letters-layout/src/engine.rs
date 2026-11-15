@@ -407,7 +407,7 @@ impl Engine {
 }
 
 /// The side a letter reads from, `true` for the right. Digits, spaces and signs have none of their own.
-pub(crate) fn reads(ch: char) -> Option<bool> {
+pub fn reads(ch: char) -> Option<bool> {
     if ch.is_ascii() {
         return ch.is_ascii_alphabetic().then_some(false);
     }

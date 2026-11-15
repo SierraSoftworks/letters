@@ -121,7 +121,7 @@ impl Reader<'_, '_> {
         let look = own.clone().over(&para.styled);
         let linked = around.link.is_some() || self.fields.iter().any(|field| field.link.is_some());
         // The words of a comment are in no language of the document's.
-        para.lang = look.lang.clone().filter(|_| !self.detached);
+        para.lang = look.language().map(str::to_owned).filter(|_| !self.detached);
 
         let on = |value: Option<bool>| value.unwrap_or(false);
         let base = &para.baseline;

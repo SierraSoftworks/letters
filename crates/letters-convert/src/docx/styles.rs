@@ -33,6 +33,9 @@ pub(super) struct RunProps {
     pub style: Option<String>,
     /// The language the text is in, as a BCP 47 tag.
     pub lang: Option<String>,
+    /// Whether the text reads from the right, and the language Word keeps for text that does.
+    pub rtl: Option<bool>,
+    pub lang_rtl: Option<String>,
 }
 
 impl RunProps {
@@ -51,7 +54,14 @@ impl RunProps {
             color: self.color.or_else(|| base.color.clone()),
             style: self.style.or_else(|| base.style.clone()),
             lang: self.lang.or_else(|| base.lang.clone()),
+            rtl: self.rtl.or(base.rtl),
+            lang_rtl: self.lang_rtl.or_else(|| base.lang_rtl.clone()),
         }
+    }
+
+    /// The language the text is in. Word names one for text that reads from the right and one for the rest.
+    pub fn language(&self) -> Option<&str> {
+        if self.rtl == Some(true) { self.lang_rtl.as_deref() } else { self.lang.as_deref() }
     }
 
     /// Reads a `w:rPr`.
@@ -78,6 +88,12 @@ impl RunProps {
             color: props.value("color").and_then(color),
             style: props.value("rStyle").map(str::to_owned),
             lang: props.value("lang").filter(|tag| is_language(tag)).map(str::to_owned),
+            rtl: toggle("rtl"),
+            lang_rtl: props
+                .child("lang")
+                .and_then(|lang| lang.attr("bidi"))
+                .filter(|tag| is_language(tag))
+                .map(str::to_owned),
         }
     }
 }

@@ -1,9 +1,11 @@
 //! Document to Word document.
 //!
 //! Every paragraph names a style and carries no formatting of its own, so changing a style in Word restyles
-//! the document as it does here. Marks are the one thing written onto runs, as Word's own buttons would.
+//! the document as it does here. Marks are the one thing written onto runs, as Word's own buttons would,
+//! beside the side text reads from, which Word wants said where the page works it out.
 //! The exceptions are what Word has no style for: how a column of a table is aligned, which each of its
-//! cells says, where a picture stands on its line, and how far in an item of a list sits inside a quote.
+//! cells says, where a picture stands on its line, how far in an item of a list sits inside a quote, and
+//! the side a quote's bar is at where its text reads from the right.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -49,6 +51,8 @@ const BOX_INSET: usize = 285;
 const LONGEST_LINK: usize = 2000;
 /// What starts a paragraph on a new page.
 const BREAK: &str = "<w:pageBreakBefore/>";
+/// What sets a paragraph from the right.
+const BIDI: &str = "<w:bidi/>";
 /// The gap between two pictures of a gallery, in points, which is the page's. A space too small to see
 /// stands there, spread to a little under the gap, so that a row never runs over its line.
 const TILE_GAP: f32 = 8.0;
@@ -69,6 +73,8 @@ const CELL_PAD: (u32, u32) = (200, 120);
 /// - A table is a Word table, its header row repeated on each page it runs to.
 /// - A callout opens with the line that heads it on the page, in a style of its own. Its icon is left out,
 ///   and so is a colour of its own.
+/// - A block that reads from the right on the page is set from the right, and so is each stretch of text
+///   in a line that does.
 /// - A link that would run script is written as its text alone, and an unknown block as its fallback text.
 pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets: Assets) -> Vec<u8> {
     let page = &style.page;
@@ -97,6 +103,8 @@ pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets
         measure: (page.width - page.margin_left - page.margin_right).max(1.0),
         breaks: false,
         lang: None,
+        rtl: false,
+        turn: false,
         labels: labels.collect(),
         pictured,
         drawn: 0,
@@ -363,6 +371,10 @@ struct Writer<'d, 'a> {
     breaks: bool,
     /// The language of the block being written, where it is not the document's.
     lang: Option<&'d str>,
+    /// Whether the block being written reads from the right, as the page finds.
+    rtl: bool,
+    /// Whether the next paragraph is set from the right.
+    turn: bool,
     /// The label of each numbered figure and gallery.
     labels: BTreeMap<BlockId, Label>,
     /// Where a picture stands on its line, which is where the caption's style sets text.
@@ -398,11 +410,13 @@ impl<'d> Writer<'d, '_> {
 
     /// Writes sibling blocks. `within` is the style of the quote or callout around them.
     fn blocks(&mut self, blocks: &'d [Block], within: Option<&'static str>) {
-        let around = self.lang;
+        let (around, turned) = (self.lang, self.rtl);
         for block in blocks {
-            // The first paragraph a block writes carries its page break, and all of them its language.
+            // The first paragraph a block writes carries its page break, and all of them its language and
+            // the side it reads from.
             self.breaks |= block.page_break;
             self.lang = block.lang.as_deref().or(around);
+            self.rtl = letters_layout::rtl(block);
             let spans = self.noted(block);
             if !matches!(block.kind, BlockKind::ListItem { .. }) {
                 self.counters.clear();
@@ -466,7 +480,7 @@ impl<'d> Writer<'d, '_> {
                 BlockKind::TableOfContents { .. } => {}
             }
         }
-        self.lang = around;
+        (self.lang, self.rtl) = (around, turned);
     }
 
     /// Takes the comments on a block. Those on a passage of its text are returned, and those on the whole of
@@ -538,7 +552,8 @@ impl<'d> Writer<'d, '_> {
         self.out.push_str("<w:p>");
         let (breaks, keep, align) =
             (std::mem::take(&mut self.breaks), std::mem::take(&mut self.keep), self.align.take());
-        if !style.is_empty() || list.is_some() || breaks || keep || align.is_some() {
+        let turn = std::mem::take(&mut self.turn);
+        if !style.is_empty() || list.is_some() || breaks || keep || align.is_some() || turn {
             // In the order Word's schema asks for.
             self.out.push_str("<w:pPr>");
             if !style.is_empty() {
@@ -552,12 +567,25 @@ impl<'d> Writer<'d, '_> {
             }
             if let Some((list, depth)) = list {
                 let _ = write!(self.out, "<w:numPr><w:ilvl w:val=\"{depth}\"/><w:numId w:val=\"{list}\"/></w:numPr>");
-                if !style.is_empty() && style != LIST.0 {
-                    // An item in a quote or a callout. Word draws a frame where a paragraph's first line
-                    // starts, so every marker stands at the frame's inset, and the text as deep as its level.
-                    let hang = LIST_INDENT * (usize::from(depth) + 1);
-                    let _ = write!(self.out, "<w:ind w:left=\"{}\" w:hanging=\"{hang}\"/>", BOX_INSET + hang);
-                }
+            }
+            if turn && style == "Quote" {
+                // A frame's sides are the page's and not the text's, so the bar is moved to where the text
+                // starts, as the page draws it.
+                let bar = border("right", 18, 12, &hex(PAGE.line_strong));
+                let _ = write!(self.out, "<w:pBdr><w:left w:val=\"nil\"/>{bar}</w:pBdr>");
+            }
+            if turn {
+                // Word then counts a style's left inset from the side the text starts at, as the page does.
+                self.out.push_str(BIDI);
+            }
+            if let Some((_, depth)) = list
+                && !style.is_empty()
+                && style != LIST.0
+            {
+                // An item in a quote or a callout. Word draws a frame where a paragraph's first line starts,
+                // so every marker stands at the frame's inset, and the text as deep as its level.
+                let hang = LIST_INDENT * (usize::from(depth) + 1);
+                let _ = write!(self.out, "<w:ind w:left=\"{}\" w:hanging=\"{hang}\"/>", BOX_INSET + hang);
             }
             if let Some(align) = align {
                 let _ = write!(self.out, "<w:jc w:val=\"{}\"/>", justification(align));
@@ -580,13 +608,14 @@ impl<'d> Writer<'d, '_> {
         runs: &[Run],
         mut spans: Vec<(Range<usize>, Range<usize>)>,
     ) {
+        self.turn = self.rtl;
         self.open(style, list);
         let lead = std::mem::take(&mut self.lead);
         self.out.push_str(&lead);
         let len: usize = runs.iter().map(|run| run.text.len()).sum();
         spans.extend(self.pending.drain(..).map(|comments| (0..len, comments)));
         let mut out = std::mem::take(&mut self.out);
-        inline(runs, &spans, self.lang, &self.labels, &mut self.links, &mut out);
+        inline(runs, &spans, self.lang, self.rtl, &self.labels, &mut self.links, &mut out);
         self.out = out;
         self.out.push_str("</w:p>");
     }
@@ -834,15 +863,19 @@ impl<'d> Writer<'d, '_> {
         for (index, comment) in comments.iter().enumerate() {
             let initials: String =
                 comment.author.split_whitespace().filter_map(|word| word.chars().next()).take(3).collect();
+            // A comment reads from the side its first letter does, as a block does.
+            let rtl = comment.content.iter().flat_map(|run| run.text.chars()).find_map(letters_layout::reads);
+            let rtl = rtl.unwrap_or(false);
             let _ = write!(
                 out,
-                "<w:comment w:id=\"{index}\" w:author=\"{}\" w:date=\"{}\" w:initials=\"{}\"><w:p w14:paraId=\"{}\">",
+                "<w:comment w:id=\"{index}\" w:author=\"{}\" w:date=\"{}\" w:initials=\"{}\"><w:p w14:paraId=\"{}\">{}",
                 escaped(comment.author),
                 escaped(comment.created),
                 escaped(&initials),
                 paragraph(index),
+                if rtl { format!("<w:pPr>{BIDI}</w:pPr>") } else { String::new() },
             );
-            inline(comment.content, &[], None, &self.labels, &mut self.links, &mut out);
+            inline(comment.content, &[], None, rtl, &self.labels, &mut self.links, &mut out);
             out.push_str("</w:p></w:comment>");
             let _ = write!(threads, "<w15:commentEx w15:paraId=\"{}\"", paragraph(index));
             if let Some(parent) = comment.parent {
@@ -869,13 +902,51 @@ fn close(id: usize, out: &mut String) {
     let _ = write!(out, "<w:commentRangeEnd w:id=\"{id}\"/><w:r><w:commentReference w:id=\"{id}\"/></w:r>");
 }
 
+/// Where a paragraph's text turns to read the other way, in bytes, and the way it reads from each turn on,
+/// `true` for from the right. It starts as the paragraph reads, which `rtl` says.
+///
+/// A letter says for itself. What has no side of its own, as spaces, digits and signs have none, reads as
+/// the letters on both sides of it do where they agree, and as the paragraph does where they do not. Word
+/// asks to be told, where the page works it out.
+fn turns(runs: &[Run], rtl: bool) -> Vec<(usize, bool)> {
+    let mut turns = vec![(0, rtl)];
+    let mut set = |at: usize, side: bool| match turns.last_mut() {
+        Some((from, last)) if *from == at => *last = side,
+        Some((_, last)) if *last == side => {}
+        _ => turns.push((at, side)),
+    };
+    let (mut last, mut open, mut at) = (rtl, None, 0);
+    for run in runs {
+        // A formula stands in its line as one thing, whatever its source is written in.
+        let formula = run.marks.contains(&Mark::Math);
+        for (offset, letter) in run.text.char_indices() {
+            match (!formula).then_some(letter).and_then(letters_layout::reads) {
+                Some(side) => {
+                    if let Some(start) = open.take() {
+                        set(start, if last == side { side } else { rtl });
+                    }
+                    set(at + offset, side);
+                    last = side;
+                }
+                None => _ = open.get_or_insert(at + offset),
+            }
+        }
+        at += run.text.len();
+    }
+    if let Some(start) = open {
+        set(start, rtl);
+    }
+    turns
+}
+
 /// Writes runs, with each comment's passage marked around its text. Offsets are bytes into the runs' text.
-/// `lang` is the language of the block around them, where that is not the document's, and `labels` are
-/// those of the figures a run can refer to.
+/// `lang` is the language of the block around them, where that is not the document's, `rtl` says that
+/// their paragraph reads from the right, and `labels` are those of the figures a run can refer to.
 fn inline(
     runs: &[Run],
     spans: &[(Range<usize>, Range<usize>)],
     lang: Option<&str>,
+    rtl: bool,
     labels: &BTreeMap<BlockId, Label>,
     links: &mut Links,
     out: &mut String,
@@ -902,7 +973,10 @@ fn inline(
         }
     };
 
-    let cuts: Vec<usize> = spans.iter().flat_map(|(range, _)| [range.start, range.end]).collect();
+    let turns = turns(runs, rtl);
+    let turned = |at: usize| turns.iter().rev().find(|(from, _)| *from <= at).is_some_and(|(_, side)| *side);
+    let mut cuts: Vec<usize> = spans.iter().flat_map(|(range, _)| [range.start, range.end]).collect();
+    cuts.extend(turns.iter().map(|(from, _)| *from));
     let mut at = 0;
     let mut open: Option<&str> = None;
     for run in runs {
@@ -915,8 +989,9 @@ fn inline(
         // the figure's label, which Word keeps up as figures come and go. Neither is text to cut.
         let whole = match figure {
             Some(label) => {
-                let mut shown = String::new();
-                text(&label.shown(), run, false, own, &mut shown);
+                let (named, mut shown) = (label.shown(), String::new());
+                let side = named.chars().find_map(letters_layout::reads).unwrap_or(false);
+                text(&named, run, false, own, side, &mut shown);
                 Some(field(&format!("REF {BOOKMARK}{} \\h", label.number), &shown))
             }
             None => run.marks.contains(&Mark::Math).then(|| equation(&run.text, false)).flatten(),
@@ -943,7 +1018,7 @@ fn inline(
             }
             match &whole {
                 Some(whole) => out.push_str(whole),
-                None => text(piece, run, open.is_some(), own, out),
+                None => text(piece, run, open.is_some(), own, turned(at), out),
             }
             at += piece.len();
             rest = after;
@@ -955,15 +1030,15 @@ fn inline(
     mark(usize::MAX, out);
 }
 
-/// Writes one run of text with its marks, and its language where that is not the document's. Marks are
-/// direct formatting, as Word's own buttons make.
-fn text(text: &str, run: &Run, linked: bool, lang: Option<&str>, out: &mut String) {
+/// Writes one run of text with its marks, its language where that is not the document's, and that it
+/// reads from the right where `rtl` says so. Marks are direct formatting, as Word's own buttons make.
+fn text(text: &str, run: &Run, linked: bool, lang: Option<&str>, rtl: bool, out: &mut String) {
     out.push_str("<w:r>");
     let has = |mark: Mark| run.marks.contains(&mark);
     // A formula comes here only as its source, when it has a mistake in it, and source reads as code.
     let code = has(Mark::Code) || has(Mark::Math);
     let style = if code { Some(INLINE_CODE.0) } else { linked.then_some(LINK.0) };
-    if style.is_some() || !run.marks.is_empty() || lang.is_some() {
+    if style.is_some() || !run.marks.is_empty() || lang.is_some() || rtl {
         out.push_str("<w:rPr>");
         if let Some(style) = style {
             let _ = write!(out, "<w:rStyle w:val=\"{style}\"/>");
@@ -979,8 +1054,13 @@ fn text(text: &str, run: &Run, linked: bool, lang: Option<&str>, out: &mut Strin
         for (_, format) in formats.iter().filter(|(mark, _)| has(mark.clone())) {
             out.push_str(format);
         }
-        if let Some(lang) = lang {
-            let _ = write!(out, "<w:lang w:val=\"{}\"/>", escaped(lang));
+        if rtl {
+            out.push_str("<w:rtl/>");
+        }
+        if let Some(lang) = lang.map(escaped) {
+            // Word keeps the language of text that reads from the right apart from that of the rest.
+            let turned = if rtl { format!(" w:bidi=\"{lang}\"") } else { String::new() };
+            let _ = write!(out, "<w:lang w:val=\"{lang}\"{turned}/>");
         }
         out.push_str("</w:rPr>");
     }
@@ -1071,16 +1151,18 @@ fn styles(style: &Style, language: &str) -> String {
     };
 
     // A box is drawn with borders in its fill's colour, whose gaps to the text are its padding. Word draws
-    // borders outside the text, so the paragraph is set in by as much.
+    // borders outside the text, so the paragraph is set in by as much. Both sides are as far from the text
+    // as each other: Word turns the insets of a paragraph that reads from the right over and leaves its
+    // borders where they are, and the box must still be one.
     let boxed = |bar: &str, fill: &str| {
         let sides = ["top", "left", "bottom", "right"].map(|side| match side {
             "left" => border(side, 18, 12, bar),
             "top" | "bottom" => border(side, 4, 9, fill),
-            _ => border(side, 4, 12, fill),
+            _ => border(side, 2, 14, fill),
         });
         format!("<w:pBdr>{}</w:pBdr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{fill}\"/>", sides.concat())
     };
-    let inset = format!("<w:ind w:left=\"{BOX_INSET}\" w:right=\"250\"/>");
+    let inset = format!("<w:ind w:left=\"{BOX_INSET}\" w:right=\"{BOX_INSET}\"/>");
     let inset = inset.as_str();
 
     let quoted = format!("<w:ind w:left=\"{BOX_INSET}\"/>");

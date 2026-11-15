@@ -279,7 +279,7 @@ pub(crate) fn language(tag: Option<&str>) -> Option<Language> {
 
 /// Whether a block's text reads from the right: its first letter does. The source of a formula is passed
 /// over, since the formula stands in its place, and code reads from the left whatever is written in it.
-pub(crate) fn rtl(block: &Block) -> bool {
+pub fn rtl(block: &Block) -> bool {
     if matches!(block.kind, BlockKind::Code { .. } | BlockKind::Formula) {
         return false;
     }
