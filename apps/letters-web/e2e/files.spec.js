@@ -131,6 +131,22 @@ test("what a file held when it was opened is a version of its own once it is wri
   await expect(earlier).toHaveCount(1);
 });
 
+test("a copy of an earlier version in the history is a document of its own, as that version read", async ({ page }) => {
+  await page.keyboard.type("Written since. ");
+  const now = await saved(page);
+  await history(page);
+  // The history opens on the newest version, and the one before it is what the page began with.
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.press("ControlOrMeta+Shift+s");
+  await expect(page.getByRole("dialog", { name: "Save a copy" })).toBeAttached();
+  const copy = await saved(page, "Enter");
+
+  expect(entry(now.buffer, "document.json")).toContain("Written since.");
+  expect(entry(copy.buffer, "document.json")).not.toContain("Written since.");
+  expect(entry(copy.buffer, "document.json")).toContain("Letters in the browser");
+  expect(identity(copy).id).not.toBe(identity(now).id);
+});
+
 test("Open asks for a document's file, and shows it with its name, its pictures and its history", async ({ page }) => {
   const { file, history } = await written(page, "Written before it was kept");
   expect(await texts(page)).not.toContain("Written before it was kept");

@@ -582,33 +582,43 @@ impl Shell {
         self.exporter.insert(exporter).clone()
     }
 
-    /// Has the exports write the document as it now is, in the format whose files end in `format`, and
-    /// hands `then` the file, or why there is none in words that end a sentence.
-    ///
-    /// A file of the format `let` is the document's own when `own` is set, and otherwise a document of
-    /// its own that starts with this one's text and history.
+    /// Has the exports write `source` in the format whose files end in `format`, and hands `then` the
+    /// file, or why there is none in words that end a sentence.
     fn export(
         &mut self,
         format: &'static str,
-        own: bool,
+        source: Source,
         title: String,
         then: impl FnOnce(&mut Self, Result<Exported, String>) + 'static,
     ) {
         let editor = self.view.editor();
-        let (document, style, notes) =
-            (editor.doc().to_json(), self.view.style().to_json(), self.view.notes().to_json());
+        // A document's file takes the history with it, which nothing else has a use for.
+        let kept = format == "let";
+        let (document, style, notes, history) = match &source {
+            // A version starts a document of its own, whose history begins with what it read. The notes
+            // are on what is written now, and stay with it.
+            Source::Version(version) => {
+                let (document, style) = &**version;
+                let replica = ReplicaId::new(&self.platform.new_id());
+                let history = kept.then(|| Model::new(document.clone(), replica).with_style(style.clone()).save());
+                (document.to_json(), style.to_json(), Notes::default().to_json(), history)
+            }
+            Source::Own | Source::Copy => {
+                let history = kept.then(|| editor.model().save());
+                (editor.doc().to_json(), self.view.style().to_json(), self.view.notes().to_json(), history)
+            }
+        };
+        let history = history.map(|history| Uint8Array::from(&history[..]));
         let authors: Array = editor.model().authors().iter().map(|author| JsValue::from(author.as_str())).collect();
         let created = self.platform.wall_time().map(|seconds| seconds as f64);
         let assets = Map::new();
         for (name, file) in self.platform.assets.iter().filter(|(name, _)| document.contains(name.as_str())) {
             assets.set(&name.into(), &Uint8Array::from(&file[..]));
         }
-        // A document's file takes the history with it, which nothing else has a use for.
-        let history = (format == "let").then(|| Uint8Array::from(&editor.model().save()[..]));
-        let identity = history.is_some().then(|| match own {
-            true => self.identity.get_or_insert_with(|| self.platform.identity()).clone(),
+        let identity = kept.then(|| match source {
+            Source::Own => self.identity.get_or_insert_with(|| self.platform.identity()).clone(),
             // A copy never passes for the document it was made of.
-            false => self.platform.identity(),
+            Source::Copy | Source::Version(..) => self.platform.identity(),
         });
         let identity = identity.map(|identity| identity.into_iter().map(JsValue::from).collect::<Array>());
         let asked: [JsValue; 10] = [
@@ -669,7 +679,12 @@ impl Shell {
 
     /// Writes a copy of the document, as a file the browser keeps for the person, and answers the card
     /// that asked for it.
-    fn copy(&mut self, name: String, format: CopyFormat) {
+    fn copy(&mut self, name: String, format: CopyFormat, version: Option<&Revision>) {
+        let source = match version.map(|version| self.view.document_at(version)) {
+            None => Source::Copy,
+            Some(Some(version)) => Source::Version(Box::new(version)),
+            Some(None) => return self.view.refuse_copy("That version could not be read.", false),
+        };
         let format = match format {
             CopyFormat::Letters => "let",
             CopyFormat::Word => "docx",
@@ -677,8 +692,9 @@ impl Shell {
             CopyFormat::WebPage => "html",
             CopyFormat::Markdown => "md",
         };
-        let written = self.view.edits();
-        self.export(format, false, name, move |shell, made| {
+        // Only a copy of the document as it is holds everything written up to when it was asked for.
+        let whole = (format == "let" && version.is_none()).then(|| self.view.edits());
+        self.export(format, source, name, move |shell, made| {
             let failed = |why: String| format!("The copy could not be written: {why}.");
             let refused = match made {
                 Ok(Exported { name: None, .. }) => Some("A copy needs a name.".to_owned()),
@@ -690,10 +706,7 @@ impl Shell {
             match refused {
                 Some(notice) => shell.view.refuse_copy(&notice, false),
                 None => {
-                    // A document of its own holds everything written up to when it was asked for.
-                    if format == "let" {
-                        shell.kept = written;
-                    }
+                    shell.kept = whole.unwrap_or(shell.kept);
                     shell.view.set_copied("your downloads");
                 }
             }
@@ -709,7 +722,7 @@ impl Shell {
         let written = self.view.edits();
         let title = self.window.document().map(|page| page.title()).unwrap_or_default();
         self.saving = true;
-        self.export("let", true, title, move |shell, made| {
+        self.export("let", Source::Own, title, move |shell, made| {
             shell.saving = false;
             let saved = made.and_then(|file| {
                 // A document whose name no file can have is kept all the same.
@@ -831,7 +844,7 @@ impl Shell {
             return;
         }
         let title = self.window.document().map(|page| page.title()).unwrap_or_default();
-        self.export("pdf", false, title, |shell, made| {
+        self.export("pdf", Source::Copy, title, |shell, made| {
             shell.printing = false;
             let printed = made.and_then(|pdf| shell.hand_to_print(&pdf.file).map_err(|error| said(&error)));
             if let Err(why) = printed {
@@ -970,7 +983,9 @@ impl Shell {
                     self.view.set_dark(self.dark());
                 }
                 // A page has no folders to write in: a copy is a file the browser keeps for the person.
-                Request::SaveCopy { name, format, .. } => self.copy(name, format),
+                Request::SaveCopy { name, format, .. } => self.copy(name, format, None),
+                // A version that shows in the history is copied as it read then.
+                Request::SaveVersion { revision, name, format, .. } => self.copy(name, format, Some(&revision)),
                 // Recent documents, new ones and moves need files, which wait for a server behind the page.
                 _ => {}
             }
@@ -1540,6 +1555,16 @@ impl Shell {
 }
 
 /// A file the exports wrote.
+/// What a file is written from.
+enum Source {
+    /// The document as it now is, as its own file.
+    Own,
+    /// The document as it now is, as a document of its own that starts with this one's text and history.
+    Copy,
+    /// The document and its style as they read at a version, as a document of its own.
+    Version(Box<(Document, Style)>),
+}
+
 struct Exported {
     /// What to call it, unless nothing of what it was to be called can name a file.
     name: Option<String>,
