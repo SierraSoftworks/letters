@@ -53,6 +53,8 @@ fn a_table_shows_its_handles_under_the_pointer_and_round_the_caret() {
     let over = text(&mut window, "80");
     window.hover_at(over);
     assert_eq!(shown(&mut window), ["Column 2", "Row 3", "Add column", "Add row"], "those of the cell pointed at");
+    let pluses = ["Add column before column 2", "Add column before column 3", "Add row before row 3"];
+    assert!(pluses.iter().all(|name| button(&mut window, name).is_some()), "with a plus on each border beside them");
 
     let away = text(&mut window, "After");
     window.hover_at(away);
@@ -82,6 +84,35 @@ fn the_bars_add_a_column_and_a_row_at_the_end() {
         assert_eq!(cell.rows, expected.len(), "{bar}");
         window.type_text("new");
         assert!(rows(&window).iter().any(|row| row.contains("new")), "{bar}: and the table is written in at once");
+    }
+}
+
+#[test]
+fn a_plus_on_a_border_adds_a_column_or_a_row_there() {
+    // (the cell pointed at, the plus, the cell that then stands after the new one, the new column or row)
+    let cases = [
+        ("120", "Add column before column 2", "Homes", 1),
+        ("120", "Add column before column 3", "Rate", 2),
+        ("Band", "Add column before column 1", "Band", 0),
+        ("120", "Add row before row 3", "80", 2),
+        ("80", "Add row before row 3", "80", 2),
+    ];
+    for (cell, plus, after, added) in cases {
+        let mut window = note();
+        let over = text(&mut window, cell);
+        window.hover_at(over);
+        let at = button(&mut window, plus).unwrap_or_else(|| panic!("{plus} shows"));
+        window.click_at(at);
+        let caret = window.editor().cell().expect("the caret is in the table");
+        let by_column = plus.contains("column");
+        assert_eq!((caret.columns, caret.rows), if by_column { (4, 3) } else { (3, 4) }, "{plus}: one more");
+        let stands = if by_column { caret.column } else { caret.row };
+        assert_eq!(stands, added, "{plus}: the caret is in what was added");
+        window.type_text("new");
+        let rows = rows(&window);
+        let all: Vec<&str> = rows.iter().flat_map(|row| row.split('|')).collect();
+        let (new, after) = (all.iter().position(|cell| *cell == "new"), all.iter().position(|cell| *cell == after));
+        assert!(new.is_some() && new < after, "{plus}: it stands before {after:?}: {rows:?}");
     }
 }
 

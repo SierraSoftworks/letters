@@ -2296,6 +2296,13 @@ impl EditorApp {
         let (axis, index) = match asked {
             tables::Asked::Menu(axis, index) | tables::Asked::Move { axis, from: index, .. } => (axis, Some(index)),
             tables::Asked::Add(axis) => (axis, None),
+            tables::Asked::Insert { axis, before } => {
+                let count = match axis {
+                    tables::Axis::Column => shown.table.columns.len(),
+                    tables::Axis::Row => shown.table.rows.len(),
+                };
+                (axis, Some(before).filter(|before| *before < count))
+            }
         };
         // The commands of a table act where the caret is, so it goes there first.
         let Some(cell) = shown.cell(axis, index, self.caret_cell()) else { return };
@@ -2312,6 +2319,9 @@ impl EditorApp {
             }
             (tables::Asked::Add(_), tables::Axis::Column) => TableEdit::AddColumn { after: true },
             (tables::Asked::Add(_), tables::Axis::Row) => TableEdit::AddRow { below: true },
+            // Past the last there is none to go before.
+            (tables::Asked::Insert { .. }, tables::Axis::Column) => TableEdit::AddColumn { after: index.is_none() },
+            (tables::Asked::Insert { .. }, tables::Axis::Row) => TableEdit::AddRow { below: index.is_none() },
             (tables::Asked::Move { to, .. }, tables::Axis::Column) => TableEdit::MoveColumn { to },
             (tables::Asked::Move { to, .. }, tables::Axis::Row) => TableEdit::MoveRow { to },
         };
@@ -4168,12 +4178,14 @@ impl App for EditorApp {
         }
         if let Some(shown) = self.table() {
             for (part, at) in shown.parts() {
-                let (axis, index, add) = match part {
-                    tables::Part::Handle(axis, index) => (axis, Some(index), false),
-                    tables::Part::Add(axis) => (axis, None, true),
+                let (axis, index, does) = match part {
+                    tables::Part::Handle(axis, index) => (axis, Some(index), 0),
+                    tables::Part::Add(axis) => (axis, None, 1),
+                    tables::Part::Insert(axis, before) => (axis, Some(before), 2),
                 };
+                // The plus past the last column or row does what the bar there does, which is told.
                 let Some(cell) = shown.cell(axis, index, self.caret_cell()) else { continue };
-                let told = (axis == tables::Axis::Row, add);
+                let told = (axis == tables::Axis::Row, does);
                 describe::table_part(&cell, told, &tables::label(part), self.onto(at), page, nodes);
             }
         }
@@ -4209,14 +4221,18 @@ impl App for EditorApp {
             }
             Some(describe::Request::Copy(block)) => self.copy_code(block, platform),
             Some(describe::Request::Note(block)) => self.noting(Noting::Press(block), platform),
-            Some(describe::Request::Table { cell, row, add }) => {
+            Some(describe::Request::Table { cell, row, does }) => {
                 // The caret goes to the cell, and its table then shows the handles of its column and row.
                 self.editor.select(Selection::caret(Pos::new(cell, 0)));
                 self.mark();
                 let axis = if row { tables::Axis::Row } else { tables::Axis::Column };
                 let Some((at, shown)) = self.editor.cell().zip(self.table()) else { return };
                 let index = if row { at.row } else { at.column };
-                let asked = if add { tables::Asked::Add(axis) } else { tables::Asked::Menu(axis, index) };
+                let asked = match does {
+                    0 => tables::Asked::Menu(axis, index),
+                    1 => tables::Asked::Add(axis),
+                    _ => tables::Asked::Insert { axis, before: index },
+                };
                 self.tabled(&shown, asked, platform);
             }
             Some(describe::Request::Callout(block)) => self.call(&block, platform),
