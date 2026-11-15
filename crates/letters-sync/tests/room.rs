@@ -3,8 +3,10 @@
 
 mod common;
 
+use std::io::Cursor;
+
 use common::{NAME, World, doc, find, note, open_file, save_file, texts, typed};
-use letters_format::{Error, Saved, hash};
+use letters_format::{Archive, Error, Files, OPLOG, Saved, hash};
 use letters_model::{Block, BlockKind, Note, NoteKind, Op};
 use letters_sync::{Access, LOOK_EVERY, Link, Progress, Role, SAVE_AFTER, SAVE_WITHIN};
 
@@ -136,6 +138,43 @@ fn what_another_writer_puts_in_the_file_reaches_every_session() {
     }
     assert!(copies(&world).is_empty());
     assert_eq!(written(&world), 0, "the room had nothing of its own to write");
+}
+
+/// Histories that fuzzing made, each with a sound checksum: the history library panics on the first and
+/// cannot write the second out again.
+#[test]
+fn a_file_whose_history_would_cost_the_room_its_document_is_set_aside() {
+    let harmful: [(&str, &[u8]); 2] = [
+        ("it panics", include_bytes!("../../../fuzz/corpus/history/a-history-loro-panics-on.bin")),
+        ("it is not written out", include_bytes!("../../../fuzz/corpus/history/a-history-loro-cannot-write-out.bin")),
+    ];
+    for (what, history) in harmful {
+        let (mut world, ada, ben) = editors();
+        world.edit(ada, [typed("p", 0, "Mine. ")]);
+        world.settle();
+        // Another writer leaves the file with such a history, and every hash sound.
+        let mut package = Archive::open(Cursor::new(world.folder.files[NAME].clone())).unwrap().package().unwrap();
+        package.entries.insert(OPLOG.into(), history.to_vec());
+        let mut left = Cursor::new(Vec::new());
+        letters_format::write(&mut left, &package).unwrap();
+        let left = left.into_inner();
+        world.folder.write(NAME, &left).unwrap();
+
+        world.advance(LOOK_EVERY + SAVE_WITHIN);
+        let aside = world.saves.iter().find_map(|saved| match saved {
+            Saved::Restored { aside } => Some(aside.clone()),
+            _ => None,
+        });
+        let aside = aside.unwrap_or_else(|| panic!("{what}: the file was not set aside: {:?}", world.saves));
+        assert_eq!(world.folder.files[&aside], left, "{what}: the file is kept as it was, under another name");
+        assert_eq!(on_disk(&world)[0], "Mine. Hello world", "{what}: the document is written again");
+
+        // The document goes on for everyone.
+        let number = world.edit(ben, [typed("p", 0, "After. ")]);
+        world.settle();
+        assert!(world.devices[ben].holds(number), "{what}");
+        assert_eq!(texts(world.devices[ada].document())[0], "After. Mine. Hello world", "{what}");
+    }
 }
 
 #[test]

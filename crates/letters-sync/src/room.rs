@@ -97,7 +97,12 @@ impl Room {
     /// the document is saved, in the host's own words. What a run that stopped early left in the journal
     /// is taken in, and is then owed to the file. Fails when the journal cannot be read or does not fit
     /// the document.
+    ///
+    /// The copy is [wary](WorkingCopy::wary) from here on: what devices send and what other writers leave
+    /// in the file is tried apart from the document before it is merged. A host opens the file itself
+    /// with [`WorkingCopy::open_wary`], so that the history it starts from is checked as well.
     pub fn open(mut copy: WorkingCopy, home: &str, state: &mut impl Files, now: u64) -> Result<Self, Error> {
+        copy.wary = true;
         let (journal, left) = Journal::open(state, &copy.id, &copy.created, Some(home))?;
         if let Some(left) = &left {
             copy.replay(left)?;
@@ -483,17 +488,16 @@ impl Room {
         state: &mut impl Files,
         now: u64,
     ) -> Result<bool, Error> {
-        // A device's update is tried on a copy of the history first. One that the history library panics
-        // on, or cannot save and read again, would cost everyone the document, and one that builds on
-        // edits the room never saw would wait in it unseen.
-        if self.copy.model().admit(updates).is_err() {
+        let before = (self.copy.model().extent(), self.copy.model().revision());
+        // The copy is wary, and tries a device's update apart from the document first. One that the
+        // history library panics on, or cannot save and read again, would cost everyone the document,
+        // and one that builds on edits the room never saw would wait in it unseen.
+        if self.copy.edit(updates).is_err() {
             return Ok(self.refuse(session, seq, Refusal::Unreadable));
         }
-        let before = (self.copy.model().extent(), self.copy.model().revision());
-        let read = self.copy.edit(updates).is_ok();
         // Held is a promise, so the room sees for itself that the document now reaches all of the update.
         let reaches = |reach: Extent| self.copy.model().extent().partial_cmp(&reach);
-        let whole = read && matches!(Extent::of(updates).map(reaches), Ok(Some(Ordering::Greater | Ordering::Equal)));
+        let whole = matches!(Extent::of(updates).map(reaches), Ok(Some(Ordering::Greater | Ordering::Equal)));
         let apart = self.sessions.get_mut(&session).and_then(|session| session.apart.take()).filter(|_| whole);
         let met = (self.copy.model().extent(), apart.is_some().then(|| self.copy.notes.clone()));
         if let Some(theirs) = &apart {
