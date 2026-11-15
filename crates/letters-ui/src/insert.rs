@@ -35,6 +35,10 @@ pub(crate) enum Put {
     Table,
     /// Asks for pictures to put in the line's place.
     Pictures,
+    /// Puts a table of contents in the line's place.
+    Contents,
+    /// Asks for the address of a link preview to put in the line's place.
+    Preview,
 }
 
 /// Something the menu puts on the line.
@@ -59,7 +63,7 @@ const fn list(list: ListKind) -> Put {
     Put::Kind(BlockKind::ListItem { list, depth: 0 })
 }
 
-pub(crate) static OFFERS: [Offer; 13] = [
+pub(crate) static OFFERS: [Offer; 15] = [
     offer("Text", "Heading 1", icon::HEADING_1, "#", kind(BlockKind::Heading { level: 1 })),
     offer("Text", "Heading 2", icon::HEADING_2, "##", kind(BlockKind::Heading { level: 2 })),
     offer("Text", "Heading 3", icon::HEADING_3, "###", kind(BlockKind::Heading { level: 3 })),
@@ -71,8 +75,10 @@ pub(crate) static OFFERS: [Offer; 13] = [
     offer("Elements", "Table", icon::TABLE, "| a | b |", Put::Table),
     offer("Elements", "Image", icon::IMAGE, "![]()", Put::Pictures),
     offer("Elements", "Callout", icon::INFO, "> [!INFO]", kind(BlockKind::callout(Tone::Info))),
+    offer("Elements", "Table of contents", icon::LIST_TREE, "", Put::Contents),
     offer("Elements", "Formula", icon::SIGMA, "$$", kind(BlockKind::Formula)),
     offer("Elements", "Divider", icon::SEPARATOR_HORIZONTAL, "---", kind(BlockKind::Divider)),
+    offer("Elements", "Link preview", icon::LINK, "", Put::Preview),
 ];
 
 /// The offers that match what is typed after the slash: those with a word that begins with it, in the

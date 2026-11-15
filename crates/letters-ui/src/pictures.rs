@@ -9,7 +9,7 @@ use letters_render::image::Images;
 use letters_render::{DisplayList, Item, Point, Rect};
 
 use crate::color::{blend, resolve};
-use crate::icon;
+use crate::icon::{self, Icon};
 use crate::safe::Safely;
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::widgets::{Menu, MenuItem, Tone};
@@ -206,14 +206,27 @@ pub(crate) fn cloud(
     scheme: Scheme,
     out: &mut DisplayList,
 ) {
-    let rect = chip(badge);
-    let radius = rect.height / 2.0;
-    let (sign, quiet, loud) = match state {
+    let (cloud, quiet, loud) = match state {
         Some(PictureState::Loading) => (icon::CLOUD_DOWNLOAD, tokens::FG_MUTED, accent),
         Some(PictureState::Failed(_)) => (icon::CLOUD_ALERT, tokens::DANGER, tokens::DANGER),
         Some(PictureState::Held) => (icon::CLOUD_OFF, tokens::FG_MUTED, accent),
         None => (icon::CLOUD, tokens::FG_MUTED, accent),
     };
+    sign(badge, cloud, lit, (quiet, loud), scheme, out);
+}
+
+/// Draws a sign at `badge`, on a chip that sets it off from what is under it. One that is lit is on
+/// `loud`, and one that is not is in `quiet` on the surface.
+pub(crate) fn sign(
+    badge: Rect,
+    sign: Icon,
+    lit: bool,
+    (quiet, loud): (Ink, Ink),
+    scheme: Scheme,
+    out: &mut DisplayList,
+) {
+    let rect = chip(badge);
+    let radius = rect.height / 2.0;
     let (ground, ink) = if lit { (loud, tokens::SURFACE) } else { (tokens::SURFACE, quiet) };
     out.push(Item::Fill { rect, color: resolve(ground, scheme, 1.0), radius });
     if !lit {

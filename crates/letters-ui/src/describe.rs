@@ -33,6 +33,12 @@ const HELD: u8 = 10;
 const TABLE: [u8; 6] = [11, 12, 13, 14, 16, 17];
 const CALLOUT: u8 = 15;
 const LANGUAGE: u8 = 18;
+/// The chip of a table of contents, a line of one, a link preview as something to press, and the control
+/// that fetches its page.
+const CONTENTS: u8 = 19;
+const LINE: u8 = 20;
+const PREVIEW: u8 = 21;
+const FETCH: u8 = 22;
 
 /// FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
 fn hashed(bytes: impl Iterator<Item = u8>) -> u64 {
@@ -52,6 +58,11 @@ fn run_node(id: &BlockId) -> NodeId {
 fn part_node(id: &BlockId, part: u8) -> NodeId {
     // No id holds a byte of 0xff, so no block's own node is this one.
     NodeId(hashed(id.as_str().bytes().chain([0xff, part])) & !1)
+}
+
+/// The node of a line of a table of contents. The heading it lists tells it from the table's other lines.
+fn line_node(table: &BlockId, heading: &BlockId) -> NodeId {
+    NodeId(hashed(table.as_str().bytes().chain([0xff, LINE]).chain(heading.as_str().bytes())) & !1)
 }
 
 /// How each block read when assistive technology was last told of it.
@@ -165,6 +176,69 @@ pub(crate) fn marker(block: &BlockId, label: &str, rect: Rect, page: &mut Node, 
     let id = part_node(block, NOTE);
     page.push_child(id);
     nodes.push((id, marker));
+}
+
+/// Adds a line of a table of contents under the page: a link named by the heading it lists, which a
+/// click goes to. `rect` is where the line stands in the page area.
+pub(crate) fn contents_line(
+    table: &BlockId,
+    heading: &BlockId,
+    label: &str,
+    rect: Rect,
+    page: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
+    let mut line = Node::new(Role::Link);
+    line.set_label(label);
+    line.add_action(Action::Click);
+    line.set_bounds(placed(page, rect));
+    let id = line_node(table, heading);
+    page.push_child(id);
+    nodes.push((id, line));
+}
+
+/// What is pressed of a block that holds no text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Whole {
+    /// The chip of a table of contents, which opens its menu.
+    Contents,
+    /// A link preview, which opens its card.
+    Preview,
+    /// The control of a link preview that fetches its page.
+    Fetch,
+}
+
+impl Whole {
+    /// The part of its block that it is told as.
+    fn part(self) -> u8 {
+        match self {
+            Self::Contents => CONTENTS,
+            Self::Preview => PREVIEW,
+            Self::Fetch => FETCH,
+        }
+    }
+}
+
+/// Adds something to press of a block that holds no text under the page: a button, which a click presses.
+/// `said` is what is told of it beside its name, and `rect` where it stands in the page area.
+pub(crate) fn whole(
+    block: &BlockId,
+    whole: Whole,
+    (label, said): (&str, Option<&str>),
+    rect: Rect,
+    page: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
+    let mut button = Node::new(Role::Button);
+    button.set_label(label);
+    if let Some(said) = said {
+        button.set_description(said);
+    }
+    button.add_action(Action::Click);
+    button.set_bounds(placed(page, rect));
+    let id = part_node(block, whole.part());
+    page.push_child(id);
+    nodes.push((id, button));
 }
 
 /// Adds a handle or a bar of the table that shows them under the page: a button, which a click presses.
@@ -332,6 +406,7 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
         BlockKind::Figure { alt, .. } => alt.hash(&mut reads),
         BlockKind::Callout { .. } => block.kind.callout_look().map(|look| look.title.to_owned()).hash(&mut reads),
         BlockKind::Code { language } => language.hash(&mut reads),
+        BlockKind::LinkPreview { url, title, .. } => (url, title).hash(&mut reads),
         _ => {}
     }
     block.body.runs().iter().for_each(|run| run.text.hash(&mut reads));
@@ -409,6 +484,12 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
             copy.add_action(Action::Click);
             part(COPY, copy, &mut children);
         }
+        BlockKind::TableOfContents { .. } => node.set_label("Table of contents"),
+        BlockKind::LinkPreview { url, title, .. } => {
+            // A card is named by the title of its page, and by its address while it has none.
+            node.set_label(title.as_deref().unwrap_or(url));
+            node.set_value(url.as_str());
+        }
         BlockKind::Figure { alt, .. } => {
             // The picture comes before its caption, named by what it shows.
             let mut picture = Node::new(Role::Image);
@@ -470,6 +551,10 @@ pub(crate) enum Request {
     Language(BlockId),
     /// Presses a callout's icon and title, which opens its card.
     Callout(BlockId),
+    /// Presses something of a block that holds no text.
+    Whole(BlockId, Whole),
+    /// Presses the line of a table of contents that lists this heading.
+    Line(BlockId),
     /// Turns the line under a figure's picture to its alt text.
     Alt(BlockId),
     /// Presses the marker of the notes beside a block.
@@ -521,8 +606,17 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
                     does: (at / 2) as u8,
                 })
             };
+            let whole = |whole: Whole| part(whole.part()).map(|block| Request::Whole(block.id.clone(), whole));
+            let whole = || [Whole::Contents, Whole::Preview, Whole::Fetch].into_iter().find_map(whole);
+            // A line is told by its table and the heading it lists, so each table's lines are gone through.
+            let lined = || {
+                let tables = doc.walk().filter(|block| matches!(block.kind, BlockKind::TableOfContents { .. }));
+                let listed = tables.flat_map(|table| doc.contents(&table.id).into_iter().map(move |to| (table, to)));
+                let mut listed = listed.filter(|(table, to)| line_node(&table.id, &to.id) == request.target_node);
+                listed.next().map(|(_, heading)| Request::Line(heading.id.clone()))
+            };
             let found = ticked.or_else(copied).or_else(switched).or_else(called).or_else(noted).or_else(broken);
-            found.or_else(chosen).or_else(tabled).or_else(languaged)
+            found.or_else(chosen).or_else(tabled).or_else(languaged).or_else(whole).or_else(lined)
         }
         _ => None,
     }

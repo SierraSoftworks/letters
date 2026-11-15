@@ -2486,13 +2486,13 @@ fn a_slash_on_an_empty_line_offers_what_to_put_there() {
     assert!(all.len() > 8 && all[1..].iter().all(|offer| !offer.2), "one is picked: {all:?}");
 
     // What is typed after the slash narrows the menu, and what matches nothing puts it away for the moment.
-    window.type_text("li");
+    window.type_text("list");
     assert_eq!(offered(&mut window), ["Bulleted list", "Numbered list", "Task list"]);
     window.type_text("zz");
     window.assert_closed(Role::ListBox, "Insert");
     window.key("Backspace").key("Backspace");
     assert_eq!(offered(&mut window).len(), 3);
-    assert_eq!(block_text(&window, "p"), "/li", "the line is written as any other until an offer is taken");
+    assert_eq!(block_text(&window, "p"), "/list", "the line is written as any other until an offer is taken");
 }
 
 #[test]
@@ -2501,7 +2501,9 @@ fn the_insert_menu_puts_what_is_taken_on_its_line() {
     let cases = [
         ("/", "Enter", "# Roof"),
         ("/", "Down Down Tab", "### Roof"),
-        ("/", "Up Enter", "---\n\nRoof"),
+        // Up from the first offer goes round to the last.
+        ("/head", "Up Enter", "### Roof"),
+        ("/div", "Enter", "---\n\nRoof"),
         ("/task", "Enter", "- [ ] Roof"),
         ("/quote", "a press", "> Roof"),
         ("/code", "Enter", "```\nRoof\n```"),
