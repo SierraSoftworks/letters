@@ -1431,12 +1431,10 @@ impl App {
                     refused = !self.replace(id, now, |_, library| make(library));
                 }
                 Request::SaveCopy { name, format, folder, replace } => {
-                    let folder = folder.as_deref().map(Path::new);
-                    if let Err(refused) = self.copy(id, &name, format, folder, replace)
-                        && let Some(window) = self.windows.get_mut(&id)
-                    {
-                        window.view.refuse_copy(&refused.to_string(), refused.replaceable());
-                    }
+                    self.copy_or_say(id, None, &name, format, folder.as_deref(), replace);
+                }
+                Request::SaveVersion { revision, name, format, folder, replace } => {
+                    self.copy_or_say(id, Some(revision), &name, format, folder.as_deref(), replace);
                 }
                 Request::Close => self.act(event_loop, id, Action::Close),
                 Request::DragWindow
@@ -1547,17 +1545,41 @@ impl App {
         }
     }
 
+    /// Writes the copy a window asked for, of its document or of an older `version` of it, and tells the
+    /// window when it cannot be written.
+    fn copy_or_say(
+        &mut self,
+        id: WindowId,
+        version: Option<Revision>,
+        name: &str,
+        format: CopyFormat,
+        folder: Option<&str>,
+        replace: bool,
+    ) {
+        if let Err(refused) = self.copy(id, version, name, format, folder.map(Path::new), replace)
+            && let Some(window) = self.windows.get_mut(&id)
+        {
+            window.view.refuse_copy(&refused.to_string(), refused.replaceable());
+        }
+    }
+
     /// Starts writing a copy of a window's document called `name`, in `folder` or where the person then
     /// chooses. The copy is made from the document's file on another thread, and arrives as an event.
     fn copy(
         &mut self,
         id: WindowId,
+        version: Option<Revision>,
         name: &str,
         format: CopyFormat,
         folder: Option<&Path>,
         replace: bool,
     ) -> Result<(), copies::Refused> {
         let Some(window) = self.windows.get_mut(&id) else { return Ok(()) };
+        // An older version is read here, where the history is, and written with the file's pictures.
+        let version = match version {
+            Some(revision) => Some(window.view.document_at(&revision).ok_or(copies::Refused::NoVersion)?),
+            None => None,
+        };
         // The file is brought up to date first. A title still being typed names it only if nothing
         // else would give the document a file.
         for caret in [true, false] {
@@ -1582,7 +1604,10 @@ impl App {
         let proxy = self.proxy.clone();
         self.copies.retain(|copy| !copy.is_finished());
         self.copies.push(thread::spawn(move || {
-            let written = copies::write(&source, &output, format, replace);
+            let written = match version {
+                Some(version) => copies::write_version(&source, version, &output, format, replace),
+                None => copies::write(&source, &output, format, replace),
+            };
             let _ = proxy.send_event(Event::Copied(id, output, written));
         }));
         Ok(())

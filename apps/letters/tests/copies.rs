@@ -71,6 +71,33 @@ fn an_export_is_a_file_in_its_format_that_holds_the_text() {
 }
 
 #[test]
+fn a_copy_of_an_older_version_holds_what_the_document_read_then() {
+    let (scratch, source) = saved("copies-version");
+    // The document was written on since the version that is asked for.
+    let mut newer = letter();
+    newer.blocks[1] = Block::text("p", BlockKind::Paragraph, "The roof is mended.");
+    let (mut writer, home) = Writer::of(files::open(&source, Style::default).unwrap());
+    writer.save(&home, &newer);
+    let then = || (letter(), Style::default());
+
+    let output = copies::path(&scratch.0, "As quoted", CopyFormat::Letters).unwrap();
+    let made = copies::write_version(&source, then(), &output, CopyFormat::Letters, false).unwrap();
+    assert_eq!(files::open(&output, Style::default).unwrap().document, letter());
+    assert!(made.is_some_and(|made| made == id(&output) && made != id(&source)), "a document of its own");
+    let archive = Archive::open(fs::File::open(&output).unwrap()).unwrap();
+    assert!(!archive.names().any(|name| name.starts_with(letters_format::HISTORY)), "it starts with that text");
+    assert_eq!(files::open(&source, Style::default).unwrap().document, newer, "the original is left alone");
+
+    for format in [CopyFormat::WebPage, CopyFormat::Markdown] {
+        let output = copies::path(&scratch.0, "As quoted", format).unwrap();
+        copies::write_version(&source, then(), &output, format, false).unwrap();
+        let written = fs::read_to_string(&output).unwrap();
+        assert!(written.contains("Harland Roofing sent a quote."), "{format:?}: the version's text");
+        assert!(!written.contains("The roof is mended."), "{format:?}: and not what was written since");
+    }
+}
+
+#[test]
 fn a_file_in_the_way_is_replaced_only_when_asked_and_a_document_never() {
     let (scratch, source) = saved("copies-taken");
     for format in CopyFormat::ALL {
