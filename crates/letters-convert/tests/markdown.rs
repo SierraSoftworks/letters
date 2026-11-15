@@ -435,6 +435,91 @@ fn writes_pictures() {
     }
 }
 
+/// A link preview with what a page said of itself.
+fn preview(url: &str, title: Option<&str>, description: Option<&str>) -> Block {
+    let (title, description) = (title.map(String::from), description.map(String::from));
+    Block::new(
+        "",
+        BlockKind::LinkPreview { url: url.into(), title, description, image: Some("assets/5e2f.jpg".into()) },
+    )
+}
+
+#[test]
+fn reads_the_line_that_stands_for_a_table_of_contents() {
+    let contents: &[&str] = &["contents:4"];
+    let cases: &[(&str, &[&str])] = &[
+        ("[TOC]", contents),
+        ("[toc]", contents),
+        ("[[_TOC_]]", contents),
+        ("# Guide\n\n[TOC]\n\nText", &[r#"h1 "Guide""#, "contents:4", r#"p "Text""#]),
+        ("> [TOC]", &["quote", "  contents:4"]),
+        // Only a line of its own is one, and only as written.
+        ("\\[TOC\\]", &[r#"p "[TOC]""#]),
+        ("See [TOC] above", &[r#"p "See [TOC] above""#]),
+        ("[TOC]\n\n[TOC]: https://example.com", &[r#"p "<@https://example.com|TOC>""#]),
+    ];
+    for (markdown, expected) in cases {
+        let (doc, notes) = read(markdown);
+        assert_eq!(outline(&doc), *expected, "reading {markdown:?}");
+        assert_eq!(notes, [], "reading {markdown:?}");
+    }
+}
+
+#[test]
+fn writes_a_table_of_contents_as_links_to_its_headings() {
+    let heading = |level, text: &str| with_text(BlockKind::Heading { level }, vec![Run::plain(text)]);
+    let contents = |levels| Block::new("", BlockKind::TableOfContents { levels });
+    let written = |blocks: Vec<Block>| to_markdown(&doc(blocks));
+    let headings = || {
+        vec![
+            heading(2, "Getting started"),
+            with_text(BlockKind::Heading { level: 3 }, vec![Run::plain("What's "), Run::marked("new", [Mark::Bold])]),
+            heading(4, "Too deep to list"),
+            heading(2, "Getting started"),
+        ]
+    };
+
+    let markdown = written([vec![heading(1, "Guide"), contents(3)], headings()].concat());
+    let list: Vec<&str> = markdown.lines().skip_while(|line| !line.starts_with('-')).take(4).collect();
+    // Each line leads to the anchor a renderer gives its heading, and a second heading of one text is told apart.
+    let expected = [
+        "- [Getting started](#getting-started)",
+        "  - [What's **new**](#whats-new)",
+        "- [Getting started](#getting-started-1)",
+        "",
+    ];
+    assert_eq!(list, expected, "{markdown}");
+
+    // A table lists what follows it, so one at the end of a document lists it all but the title.
+    let last = written([vec![heading(1, "Guide")], headings(), vec![contents(2)]].concat());
+    assert!(
+        last.ends_with("- [Getting started](#getting-started)\n- [Getting started](#getting-started-1)\n"),
+        "{last}"
+    );
+
+    // With no heading to list, it is not there.
+    assert_eq!(written(vec![heading(1, "Guide"), contents(3)]), "# Guide\n");
+}
+
+#[test]
+fn writes_a_link_preview_as_its_linked_title_and_description() {
+    let cases = [
+        (
+            preview("https://example.com/fees", Some("Harbour fees"), Some("What a night costs.")),
+            "[Harbour fees](https://example.com/fees)\\\nWhat a night costs.\n",
+        ),
+        (
+            preview("https://example.com/fees", Some("Harbour [fees]"), None),
+            "[Harbour \\[fees\\]](https://example.com/fees)\n",
+        ),
+        // One that has not been fetched is its address.
+        (preview("https://example.com/fees", None, None), "<https://example.com/fees>\n"),
+    ];
+    for (block, expected) in cases {
+        assert_eq!(to_markdown(&doc(vec![block.clone()])), expected, "writing {:?}", block.kind);
+    }
+}
+
 #[test]
 fn reads_a_price_as_text() {
     let cases =
@@ -859,6 +944,7 @@ fn exports_the_conformance_samples() {
     let cases = [
         (include_str!("../../letters-format/corpus/document/report.json"), include_str!("corpus/report.md")),
         (include_str!("../../letters-format/corpus/document/notice.json"), include_str!("corpus/notice.md")),
+        (include_str!("../../letters-format/corpus/document/guide.json"), include_str!("corpus/guide.md")),
     ];
     for (sample, expected) in cases {
         let sample = Document::from_json(sample).expect("the corpus holds a valid document");

@@ -1,11 +1,12 @@
 //! Document to Markdown.
 
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use letters_model::{
-    Align, Block, BlockKind, BodyShape, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone,
+    Align, Block, BlockId, BlockKind, Body, BodyShape, Document, ListKind, Mark, Properties, PropertiesFormat, Run,
+    Tone,
 };
 
 use super::read::{FENCES, front_matter};
@@ -29,10 +30,16 @@ use crate::figures;
 ///   caption opens with its number as "Figure 2:", and a reference reads as "Figure 2". A picture is named by
 ///   its address, or by its entry in the document's file, which [`markdown_assets`] lists. Its size is left
 ///   out, and so are italics within a caption and the caption of a picture inside a gallery.
+/// - A table of contents is the list it shows, each line a link to its heading at the anchor GitHub gives
+///   one, which most renderers follow. It reads back as that list. `[TOC]` reads as a table.
+/// - A link preview is its title as a link to the page, then on the next line what the page says of itself.
+///   Its picture is left out. It reads back as that paragraph.
 /// - An unknown block is written as its fallback text. Unknown marks and fields are left out, and so are the
 ///   languages of blocks and runs and the page breaks before blocks, which Markdown has no way to say.
 pub fn to_markdown(doc: &Document) -> String {
-    let doc = &figures::labelled(doc);
+    let mut doc = figures::labelled(doc);
+    list_contents(&mut doc);
+    let doc = &doc;
     let mut lines = doc.properties.as_ref().map(properties).unwrap_or_default();
     let body = blocks(&doc.blocks);
     if !lines.is_empty() && !body.is_empty() {
@@ -54,6 +61,70 @@ pub fn markdown_assets(doc: &Document) -> BTreeSet<String> {
         _ => None,
     };
     doc.walk().filter_map(asset).collect()
+}
+
+/// Makes each table of contents the list it shows: an item to a heading, nested by the heading's level and
+/// linked to the heading's anchor. Markdown has no word for the table that every renderer reads.
+fn list_contents(doc: &mut Document) {
+    fn swap(blocks: &mut Vec<Block>, lists: &mut BTreeMap<BlockId, Vec<Block>>) {
+        let mut at = 0;
+        while at < blocks.len() {
+            let table = matches!(blocks[at].kind, BlockKind::TableOfContents { .. });
+            match lists.remove(&blocks[at].id).filter(|_| table) {
+                Some(list) => {
+                    let lines = list.len();
+                    blocks.splice(at..=at, list);
+                    at += lines;
+                }
+                None => {
+                    if let Body::Blocks(children) = &mut blocks[at].body {
+                        swap(children, lists);
+                    }
+                    at += 1;
+                }
+            }
+        }
+    }
+    let is_table = |block: &&Block| matches!(block.kind, BlockKind::TableOfContents { .. });
+    let tables: Vec<BlockId> = doc.walk().filter(is_table).map(|table| table.id.clone()).collect();
+    if tables.is_empty() {
+        return;
+    }
+    let anchors = anchors(doc);
+    let level = |heading: &Block| match heading.kind {
+        BlockKind::Heading { level } => level,
+        _ => 0,
+    };
+    let line = |heading: &Block, top: u8| {
+        let link = anchors.get(&heading.id).map(|anchor| format!("#{anchor}"));
+        let runs = heading.body.runs().iter().map(|run| Run { link: link.clone(), ..run.clone() });
+        // A line sits as deep as its heading is below the highest one listed.
+        let kind = BlockKind::ListItem { list: ListKind::Bullet, depth: level(heading) - top };
+        Block { body: Body::Text(runs.collect()), ..Block::new(format!("{}-line", heading.id).as_str(), kind) }
+    };
+    let list = |table: BlockId| {
+        let headings = doc.contents(&table);
+        let top = headings.iter().map(|heading| level(heading)).min().unwrap_or(0);
+        (table, headings.into_iter().map(|heading| line(heading, top)).collect())
+    };
+    let mut lists: BTreeMap<BlockId, Vec<Block>> = tables.into_iter().map(list).collect();
+    swap(&mut doc.blocks, &mut lists);
+}
+
+/// The anchor of each heading as GitHub makes it: the heading's text in lower case, with a hyphen for each
+/// space and without punctuation, and numbered from the second heading of the same text on.
+fn anchors(doc: &Document) -> BTreeMap<BlockId, String> {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let headings = doc.walk().filter(|block| matches!(block.kind, BlockKind::Heading { .. }));
+    let anchor = |heading: &Block| {
+        let kept = |c: &char| c.is_alphanumeric() || c.is_whitespace() || matches!(c, '-' | '_');
+        let text: String = heading.plain_text().trim().to_lowercase().chars().filter(kept).collect();
+        let text: String = text.chars().map(|c| if c.is_whitespace() { '-' } else { c }).collect();
+        let count = seen.entry(text.clone()).or_default();
+        *count += 1;
+        (heading.id.clone(), if *count > 1 { format!("{text}-{}", *count - 1) } else { text })
+    };
+    headings.map(anchor).collect()
 }
 
 /// Writes a document's properties as front matter, where they read back as it. Those that would not, such as
@@ -149,7 +220,7 @@ fn is_written(block: &Block) -> bool {
         }
         BlockKind::TableRow => true,
         BlockKind::Unknown { .. } => !fallback(block).is_empty(),
-        // Not written yet: its lines are for the page to make.
+        // One met here has no document to list the headings of.
         BlockKind::TableOfContents { .. } => false,
         _ => true,
     }
@@ -236,13 +307,14 @@ fn other(block: &Block) -> Vec<String> {
             out
         }
         BlockKind::Unknown { .. } => lines(&text(&[Run::plain(fallback(block))], Context::Lines)),
-        // Until it has a mapping of its own, a preview is the link it holds, under its title.
-        BlockKind::LinkPreview { url, title, .. } => {
-            let link = Run { link: Some(url.clone()), ..Run::plain(title.as_deref().unwrap_or(url)) };
-            lines(&text(&[link], Context::Lines))
+        // What its card reads as: the title, which leads to the page, over what the page says of itself.
+        BlockKind::LinkPreview { url, title, description, .. } => {
+            let mut runs = vec![Run { link: Some(url.clone()), ..Run::plain(title.as_deref().unwrap_or(url)) }];
+            runs.extend(description.iter().map(|description| Run::plain(format!("\n{description}"))));
+            lines(&text(&runs, Context::Lines))
         }
-        // A list item is written by `item`, which knows the list around it, and a table of contents
-        // is not written yet.
+        // A list item is written by `item`, which knows the list around it, and a table of contents as
+        // the items `list_contents` made of it.
         BlockKind::ListItem { .. } | BlockKind::TableOfContents { .. } => Vec::new(),
     }
 }
