@@ -80,6 +80,8 @@ pub(crate) enum Act {
     Export,
     Share,
     Settings,
+    /// Shows where the paper and the margins are set.
+    PageSetup,
     TrustDocument,
     TrustFolder,
     /// Shows the document on the sheets it prints on.
@@ -123,7 +125,7 @@ const fn table(name: &'static str, also: &'static str, edit: TableEdit) -> Entry
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 71] = [
+pub(crate) static ENTRIES: [Entry; 72] = [
     run("Image", "Edit caption", "picture", Command::EditCaption),
     entry("Image", "Edit alt text", "picture describe description", Act::AltText),
     run("Image", "Number this figure", "picture label caption", Command::SetNumbered(true)),
@@ -192,6 +194,7 @@ pub(crate) static ENTRIES: [Entry; 71] = [
     entry("Document", "Save a copy", "duplicate", Act::SaveCopy),
     entry("Document", "Export", "pdf word markdown html web", Act::Export),
     entry("Document", "Share", "", Act::Share),
+    entry("Document", "Page setup", "paper margins orientation size landscape portrait", Act::PageSetup),
     entry("Document", "Settings", "preferences appearance accent", Act::Settings),
     entry("Document", "Trust this document", "safe mode", Act::TrustDocument),
     entry("Document", "Trust this folder", "safe mode", Act::TrustFolder),

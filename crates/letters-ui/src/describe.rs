@@ -24,6 +24,7 @@ const PICTURE: u8 = 3;
 const COPY: u8 = 4;
 const ALT: u8 = 5;
 const NOTE: u8 = 6;
+const BREAK: u8 = 7;
 
 /// FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
 fn hashed(bytes: impl Iterator<Item = u8>) -> u64 {
@@ -123,6 +124,27 @@ pub(crate) fn marker(block: &BlockId, label: &str, rect: Rect, page: &mut Node, 
     let id = part_node(block, NOTE);
     page.push_child(id);
     nodes.push((id, marker));
+}
+
+/// Adds what Print view shows of a page break under its canvas: a button that takes the break before a
+/// block away, or one that offers to make it. `place` says which sheet it is on, and `rect` where it shows
+/// in the canvas.
+pub(crate) fn page_break(
+    block: &BlockId,
+    label: &str,
+    place: &str,
+    rect: Rect,
+    canvas: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
+    let mut button = Node::new(Role::Button);
+    button.set_label(label);
+    button.set_description(place);
+    button.add_action(Action::Click);
+    button.set_bounds(placed(canvas, rect));
+    let id = part_node(block, BREAK);
+    canvas.push_child(id);
+    nodes.push((id, button));
 }
 
 /// Adds a sheet of Print view under its canvas: a picture of the page, named by its number. `rect` is where
@@ -314,6 +336,8 @@ pub(crate) enum Request {
     Alt(BlockId),
     /// Presses the marker of the notes beside a block.
     Note(BlockId),
+    /// Presses what Print view shows of the page break before a block.
+    Break(BlockId),
 }
 
 pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request> {
@@ -334,7 +358,8 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
             let copied = || part(COPY).map(|block| Request::Copy(block.id.clone()));
             let switched = || part(ALT).map(|block| Request::Alt(block.id.clone()));
             let noted = || part(NOTE).map(|block| Request::Note(block.id.clone()));
-            ticked.or_else(copied).or_else(switched).or_else(noted)
+            let broken = || part(BREAK).map(|block| Request::Break(block.id.clone()));
+            ticked.or_else(copied).or_else(switched).or_else(noted).or_else(broken)
         }
         _ => None,
     }

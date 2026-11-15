@@ -2,7 +2,7 @@
 //!
 //! The panel shows and asks. A style changes through the editor, and files are the shell's to read and write.
 
-use accesskit::Role;
+use accesskit::{HasPopup, Role};
 use letters_layout::Palette;
 use letters_model::{Page, Style, TextStyle as TypeStyle};
 
@@ -13,7 +13,7 @@ use crate::restyle;
 use crate::style::{Align, Edges, Justify, Look, Ring};
 use crate::text::{Family, TextStyle};
 use crate::tokens;
-use crate::widgets::{Button, ControlSize, Menu, MenuItem, SidePanel, TextField};
+use crate::widgets::{Button, ControlSize, Menu, MenuItem, Popover, SidePanel, TextField};
 use crate::window::{FAMILIES, Message, PT, WEIGHTS, hex_color};
 
 /// The papers offered, by their short and long sides in points.
@@ -45,6 +45,8 @@ pub enum Styling {
     Apply,
     /// Puts the stylesheet on offer away, unused.
     Decline,
+    /// Shows the panel with the page's setup in view.
+    PageSetup,
     /// Changes the paper to one of the papers offered, the same way up.
     Paper(usize),
     Landscape(bool),
@@ -66,6 +68,8 @@ pub(crate) struct Styles {
     pub refused: Option<String>,
     /// What is being typed into the margins field.
     pub margins: Option<String>,
+    /// Whether the panel was asked for to set up the page, which it then brings into view.
+    pub setup: bool,
 }
 
 impl Styles {
@@ -79,7 +83,7 @@ impl Styles {
 
     /// Drops what the panel was in the middle of, as it closes.
     pub fn leave(&mut self) {
-        (self.offered, self.refused, self.margins) = (None, None, None);
+        (self.offered, self.refused, self.margins, self.setup) = (None, None, None, false);
     }
 
     /// Whether the document's style is no longer the person's default.
@@ -105,7 +109,9 @@ impl Styles {
         });
         body.child(Element::column().gap(tokens::SPACE_2XS).children(rows))
             .child(SidePanel::section("Page"))
-            .child(if offered.is_some() { page_as_read(&shown.page) } else { self.page(&shown.page) })
+            .child(
+                if offered.is_some() { page_as_read(&shown.page) } else { self.page(&shown.page) }.in_view(self.setup),
+            )
             .child(SidePanel::section("Stylesheet"))
             .child(self.sheet())
     }
@@ -128,7 +134,22 @@ impl Styles {
             .child(Element::text(name, quiet()))
             .child(Element::icon(icon::CHEVRON_DOWN, 14.0).fg(tokens::FG_MUTED))
             .popover(papers(page).popover());
+        let margins = self.margins_row(page);
+        Element::row().align(Align::Center).justify(Justify::Between).gap(tokens::SPACE_SM).child(paper).child(margins)
+    }
 
+    /// What the paper button of Print view opens: the papers and the two ways up, and the margins under
+    /// them.
+    pub fn setup(&self, page: &Page) -> Popover<Message> {
+        let margins = Element::row()
+            .padding(Edges::xy(tokens::SPACE_MD, tokens::SPACE_SM))
+            .border(Edges::top(1.0), tokens::LINE)
+            .child(self.margins_row(page));
+        Popover::new(Element::column().child(papers(page)).child(margins)).list(HasPopup::Dialog).label("Page setup")
+    }
+
+    /// The field that takes the margins of every side, in millimetres.
+    fn margins_row(&self, page: &Page) -> Element<Message> {
         let typed = self.margins.as_ref();
         let shown = margins(page).map(|margins| margins.to_string()).unwrap_or_default();
         let field = TextField::new("Margins", typed.cloned().unwrap_or(shown))
@@ -139,13 +160,12 @@ impl Styles {
             .on_submit(Message::Styles(Styling::TakeMargins))
             .on_leave(Message::Styles(Styling::TakeMargins))
             .on_cancel(Message::Styles(Styling::ForgetMargins));
-        let margins = Element::row()
+        Element::row()
             .align(Align::Center)
             .gap(tokens::SPACE_SM)
             .child(Element::text("Margins", quiet()).fg(tokens::FG_MUTED).decorative())
             .child(Element::from(field).width(56.0))
-            .child(Element::text("mm", quiet()).fg(tokens::FG_MUTED));
-        Element::row().align(Align::Center).justify(Justify::Between).gap(tokens::SPACE_SM).child(paper).child(margins)
+            .child(Element::text("mm", quiet()).fg(tokens::FG_MUTED))
     }
 
     /// Stylesheets in and out, which the shell reads and writes.

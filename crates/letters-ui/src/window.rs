@@ -41,7 +41,7 @@ use crate::notes::{self, Margin, Noting};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
 use crate::pictures::{self, Linked, Linking, PictureState};
-use crate::print::{Print, Printing};
+use crate::print::{Breaking, Paged, Print, Printing};
 use crate::refer::{Picking, Refer};
 use crate::references::{self, Preview, Reference, References};
 use crate::renaming::{Outcome, Rename, Renaming};
@@ -1394,6 +1394,7 @@ impl EditorApp {
             Act::Export => Message::Copy(Copying::Open(CopyFormat::Pdf)),
             Act::Share => Message::Share(true),
             Act::Settings => Message::Settings(Setting::Show),
+            Act::PageSetup => Message::Styles(Styling::PageSetup),
             Act::TrustDocument => self.safe.on().then_some(Message::Safe(Safely::TrustDocument))?,
             Act::TrustFolder => self.safe.folder().then_some(Message::Safe(Safely::TrustFolder))?,
             // A card over the window is answered first: there is no document to act on behind it.
@@ -1416,7 +1417,7 @@ impl EditorApp {
     }
 
     /// Does what is asked of Print view.
-    fn print(&mut self, asked: Printing) {
+    fn print(&mut self, asked: Printing, platform: &mut dyn Platform) {
         match asked {
             Printing::Show if self.printing.is_some() || self.carded() => {}
             Printing::Show => {
@@ -1437,6 +1438,22 @@ impl EditorApp {
             Printing::Zoom(zoom) => self.printing.iter_mut().for_each(|print| print.zoom(zoom)),
             Printing::Scroll(delta) => self.printing.iter_mut().for_each(|print| print.scroll(delta)),
             Printing::Print => self.requests.push(Request::Print),
+            Printing::Down(at) => self.printing.iter_mut().for_each(|print| print.press(at)),
+            Printing::Up(at) => {
+                if let Some(asked) = self.printing.as_mut().and_then(|print| print.release(at)) {
+                    self.break_pages(asked, platform);
+                }
+            }
+        }
+    }
+
+    /// Makes pages start with blocks, or no longer start there, as Print view asked. Each is an edit that
+    /// undo takes back. The page is not brought to its caret for it: nothing of a break shows there.
+    fn break_pages(&mut self, asked: Breaking, platform: &mut dyn Platform) {
+        for block in asked.blocks {
+            let command = Command::SetPageBreak { block, on: asked.on };
+            let change = self.run(platform, |editor, platform| editor.run(command, platform));
+            self.follow(&change);
         }
     }
 
@@ -1455,8 +1472,8 @@ impl EditorApp {
         let pages = self.layout.paginate(&self.editor.model().style().page);
         self.estimated = false;
         let Some(print) = self.printing.as_mut() else { return Element::row() };
-        let (mut sheets, awaited) =
-            print.view(&self.layout, &pages, room, &self.images, self.shaper.as_ref(), self.scheme);
+        let paged = Paged { doc: self.editor.doc(), layout: &self.layout, pages: &pages };
+        let (mut sheets, awaited) = print.view(paged, room, &self.images, self.shaper.as_ref(), self.scheme);
         for asset in awaited {
             if self.wanted.insert(asset.clone()) {
                 self.requests.push(Request::Asset(asset));
@@ -1472,7 +1489,7 @@ impl EditorApp {
     /// or goes back to editing. Nothing is written there.
     fn print_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
         if event.key == Key::Escape {
-            self.print(Printing::Back);
+            self.print(Printing::Back, platform);
             return true;
         }
         if self.printing.as_mut().is_some_and(|print| print.key(event)) {
@@ -1610,6 +1627,16 @@ impl EditorApp {
 
     /// Runs something on the editor, which may ask the layout about lines while it works.
     fn edit(&mut self, platform: &mut dyn Platform, act: impl FnOnce(&mut Editor, &mut dyn Platform) -> Change) {
+        let change = self.run(platform, act);
+        self.changed(&change);
+    }
+
+    /// Lets the editor do something with what the window lends it, and returns what that changed.
+    fn run(
+        &mut self,
+        platform: &mut dyn Platform,
+        act: impl FnOnce(&mut Editor, &mut dyn Platform) -> Change,
+    ) -> Change {
         // On a sheet the caret moves by the lines of the source, which the page does not show.
         let wide = self.wide();
         let source = Source::of(&self.editor, self.shaper.as_ref(), wide);
@@ -1621,8 +1648,7 @@ impl EditorApp {
             left: left.unwrap_or_default(),
         };
         let mut lent = Lent { platform, lines };
-        let change = act(&mut self.editor, &mut lent);
-        self.changed(&change);
+        act(&mut self.editor, &mut lent)
     }
 
     /// Brings the layout and the viewport up to date after the editor did something.
@@ -2547,7 +2573,7 @@ impl EditorApp {
             Some(print) => {
                 let page = &self.editor.model().style().page;
                 let told = self.note.as_ref().map(|(note, _)| note.as_str());
-                print.bar(bar, &self.name().0, told, &styles::paper_name(page), || styles::papers(page))
+                print.bar(bar, &self.name().0, told, &styles::paper_name(page), || self.styles.setup(page))
             }
             None => self.editing(bar),
         };
@@ -2592,7 +2618,7 @@ impl EditorApp {
                     .aside(keys(Act::Print))
                     .on_select(Message::Print(Printing::Show)),
             )
-            .item(MenuItem::new("Page setup").icon(icon::FILE_TEXT).disabled(true))
+            .item(MenuItem::new("Page setup").icon(icon::FILE_TEXT).on_select(Message::Styles(Styling::PageSetup)))
             .separator()
             .item(MenuItem::new("Settings").icon(icon::SETTINGS).on_select(Message::Settings(Setting::Show)));
 
@@ -3097,6 +3123,11 @@ impl EditorApp {
                 self.show(Some(Panel::Styles));
                 None
             }
+            Styling::PageSetup => {
+                self.show(Some(Panel::Styles));
+                self.styles.setup = true;
+                None
+            }
             Styling::Pick(element) => {
                 self.picked = Some((element, self.editor.selection().cloned()));
                 None
@@ -3249,7 +3280,7 @@ impl App for EditorApp {
             Message::Alt(asked) => self.altering(asked, platform),
             Message::Note(asked) => self.noting(asked, platform),
             Message::Commands(asked) => self.commanding(asked, platform),
-            Message::Print(asked) => self.print(asked),
+            Message::Print(asked) => self.print(asked, platform),
             Message::Refer(Picking::Close) => {
                 self.edit(platform, |editor, platform| editor.run(Command::DismissReference, platform));
             }
@@ -3355,8 +3386,15 @@ impl App for EditorApp {
     }
 
     fn access_action(&mut self, request: &ActionRequest, platform: &mut dyn Platform) {
-        // The sheets of Print view are read, and the document is changed where it is edited.
-        if self.printing.is_some() {
+        // The sheets of Print view are read, and all that is changed on them is where pages start.
+        if let Some(print) = &self.printing {
+            let pressed = match describe::request(self.editor.doc(), request) {
+                Some(describe::Request::Break(block)) => print.asked(&block),
+                _ => None,
+            };
+            if let Some(asked) = pressed {
+                self.break_pages(asked, platform);
+            }
             return;
         }
         match describe::request(self.editor.doc(), request) {
@@ -3386,7 +3424,7 @@ impl App for EditorApp {
                     self.mark();
                 }
             }
-            None => {}
+            Some(describe::Request::Break(_)) | None => {}
         }
     }
 
@@ -3426,6 +3464,9 @@ impl App for EditorApp {
     }
 
     fn point(&mut self, at: Option<Point>) -> bool {
+        if let Some(print) = self.printing.as_mut() {
+            return print.point(at);
+        }
         self.references.set_rest(at);
         self.repoint()
     }
