@@ -130,7 +130,7 @@ pub enum Event {
     Planned(WindowId, PathBuf, Result<Box<Plan>, String>),
     /// A file of this name was brought in for a window and kept as a new document at this path, or could
     /// not be.
-    Imported(WindowId, String, Result<PathBuf, String>),
+    Imported(WindowId, String, Result<PathBuf, (Box<Plan>, String)>),
     /// How far the person's clock is ahead of UTC, in minutes.
     Offset(i32),
     /// A picture a window's document links to, at this address, was fetched for this: its file, or why
@@ -1608,10 +1608,11 @@ impl DocWindow {
                 self.id = Some(copy.id.clone());
                 // What the file held is where the last session ended, should this one write anything.
                 let found = copy.model().revision();
-                match self.imported.take() {
+                let imported = self.imported.take();
+                match &imported {
                     // A document that was just brought in says so, and from what.
                     Some(source) => {
-                        self.mark(&found, TagKind::Import, Some(&source));
+                        self.mark(&found, TagKind::Import, Some(source));
                         self.save_at = Some(Instant::now() + SAVE_AFTER);
                     }
                     None if self.made_here && self.file().is_none() => {}
@@ -1621,6 +1622,10 @@ impl DocWindow {
                 let mut notes = copy.notes.clone();
                 let early = notes.merge(self.view.notes());
                 self.view.set_notes(notes);
+                // With its notes in the window, an import can say how many it left.
+                if imported.is_some() {
+                    self.view.say_imported();
+                }
                 if !early {
                     self.journalled_notes = self.view.notes().clone();
                 }
@@ -2400,7 +2405,7 @@ impl App {
                 Request::Import { folders, comments } => self.bring_in(id, &folders, comments),
                 Request::CancelImport => {
                     if let Some(window) = self.windows.get_mut(&id) {
-                        window.plan = None;
+                        (window.plan, window.importing) = (None, None);
                     }
                 }
                 Request::Print => self.print(id),
@@ -3224,36 +3229,57 @@ impl App {
         // Recorded before the document exists: unless the file lies in a trusted folder, the document opens
         // in safe mode from the first, wherever it is saved, until the person trusts it from its own bar.
         if let Err(error) = trust::import(&mut self.trust, &plan.id, plan.source()) {
-            window.view.offer_import(None);
-            window.sync(Instant::now());
-            return window.alert(&format!("The file was not brought in: the import could not be recorded.\n\n{error}"));
+            // The card stays and says why, with the file's plan for another try.
+            window.plan = Some(plan);
+            window.view.refuse_import(&format!(
+                "The file was not imported because the import could not be recorded: {error}."
+            ));
+            return window.sync(Instant::now());
         }
         // The card names the folders as it was given them.
         let chosen =
             plan.folders.iter().filter(|folder| folders.iter().any(|path| *path == folder.path.to_string_lossy()));
         let choices = Choices { pictures: chosen.map(|folder| folder.path.clone()).collect(), comments };
         let (proxy, folder) = (self.proxy.clone(), self.library.default_folder());
-        let source = window.importing.take().unwrap_or_default();
+        let source = window.importing.clone().unwrap_or_default();
         thread::spawn(move || {
-            let name = plan.name.clone();
-            let kept = plan.import(&choices).keep(&folder, &name);
-            let _ = proxy.send_event(Event::Imported(id, source, kept));
+            // The plan comes back with a document that could not be kept, for the card to try again.
+            let kept = (*plan).clone().import(&choices).keep(&folder, &plan.name);
+            let _ = proxy.send_event(Event::Imported(id, source, kept.map_err(|error| (plan, error))));
         });
     }
 
-    /// Opens the document a file was brought in as, in place of the window that offered it.
-    fn imported(&mut self, event_loop: &ActiveEventLoop, id: WindowId, source: String, kept: Result<PathBuf, String>) {
+    /// Opens the document a file was brought in as, in place of the window that offered it. If the document
+    /// could not be kept, the card says why and can ask again.
+    fn imported(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        id: WindowId,
+        source: String,
+        kept: Result<PathBuf, (Box<Plan>, String)>,
+    ) {
+        let path = match kept {
+            Ok(path) => path,
+            Err((plan, error)) => {
+                let folder = self.library.shown(&self.library.default_folder());
+                let why = format!("The document could not be saved in {folder}: {error}.");
+                match self.windows.get_mut(&id) {
+                    Some(window) if window.view.importing() => {
+                        window.plan = Some(plan);
+                        window.view.refuse_import(&why);
+                        window.sync(Instant::now());
+                    }
+                    // The card was put away meanwhile, or its window closed.
+                    window => alert(window.map(|window| &window.window), &why),
+                }
+                return;
+            }
+        };
         if let Some(window) = self.windows.get_mut(&id) {
+            (window.plan, window.importing) = (None, None);
             window.view.offer_import(None);
             window.sync(Instant::now());
         }
-        let path = match kept {
-            Ok(path) => path,
-            Err(error) => {
-                let parent = self.windows.get(&id).map(|window| &window.window);
-                return alert(parent, &format!("The file could not be brought in.\n\n{error}"));
-            }
-        };
         match self.windows.contains_key(&id) {
             true => self.act(event_loop, id, Action::Open(Some(path.clone()))),
             // The window was closed meanwhile, and the document is there all the same.

@@ -117,7 +117,7 @@ impl Imported {
 }
 
 /// A file that can be brought in, and what there is to choose about it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Plan {
     /// The id the document will have. It is known before the document is made so that the import can be
     /// recorded first, with `trust::import`: only the folder the file lies in vouches for what it holds.
@@ -138,7 +138,7 @@ pub struct Plan {
     content: Content,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Content {
     /// The source, which is read again once its pictures are chosen, and the style its document takes.
     Markdown(String, Box<Style>),

@@ -183,6 +183,22 @@ fn an_imported_document_is_kept_under_a_free_name_and_replaces_nothing() {
 }
 
 #[test]
+fn a_plan_whose_document_could_not_be_kept_makes_it_again() {
+    let folder = Folder::new("again");
+    let plan = Plan::of(&notes(&folder), &Style::default()).unwrap();
+    let choices = Choices { pictures: vec![folder.0.join("notes")], comments: true };
+    // A file lies where the documents' folder should be.
+    let taken = folder.write("Taken", "a file");
+
+    let refused = plan.clone().import(&choices).keep(&taken, "Animals");
+    assert!(refused.is_err_and(|why| !why.is_empty()), "nothing can be kept in a file");
+    let kept = plan.import(&choices).keep(&folder.0.join("Letters"), "Animals").expect("the plan is whole still");
+
+    let opened = letters::files::open(&kept, Style::default).expect("what was kept opens as a document");
+    assert_eq!(pictures(&opened.document, 0).1, 2);
+}
+
+#[test]
 fn a_picture_folder_is_named_so_that_its_own_name_shows() {
     let (beside, home) = (Path::new("/home/ada/notes/trip"), Path::new("/home/ada"));
     let cases = [
