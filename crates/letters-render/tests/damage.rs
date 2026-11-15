@@ -272,10 +272,11 @@ fn any_run_of_changes_leaves_the_frame_a_fresh_render_would() {
             state ^= state << 17;
             (state % below as u64) as usize
         };
+        let emoji = colour_faces();
         let make = |random: &mut dyn FnMut(usize) -> usize| {
             let (x, y) = (random(200) as f32, random(130) as f32);
             let color = Color::rgba(random(256) as u8, random(256) as u8, random(256) as u8, 120 + random(136) as u8);
-            match random(6) {
+            match random(7) {
                 0 => fill(x, y, 10.0 + random(60) as f32, 6.0 + random(40) as f32, color),
                 1 => Item::Stroke { rect: Rect::new(x, y, 50.0, 30.0), color, width: 2.0, radius: random(12) as f32 },
                 2 => Item::Shadow {
@@ -293,6 +294,10 @@ fn any_run_of_changes_leaves_the_frame_a_fresh_render_would() {
                     "Wavy fjord",
                 ),
                 4 => Item::Image { rect: Rect::new(x, y, 30.0, 24.0), asset: "swatch".into() },
+                5 => {
+                    let (_, font, id) = &emoji[random(emoji.len())];
+                    glyph(font, *id, 12.0 + random(30) as f32, Point { x, y: y + 20.0 })
+                }
                 _ => Item::Fill { rect: Rect::new(x, y, 36.0, 36.0), color, radius: 18.0 },
             }
         };

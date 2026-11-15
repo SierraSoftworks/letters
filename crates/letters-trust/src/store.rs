@@ -2,7 +2,7 @@
 
 use std::{fmt, io};
 
-use crate::file::{self, DOCUMENTS, FOLDERS, SOURCES};
+use crate::file::{self, DOCUMENTS, FOLDERS, IMPORTED, SOURCES};
 use crate::path::Path;
 use crate::{Source, Trust};
 
@@ -79,6 +79,15 @@ impl<S: Store> TrustStore<S> {
 
     pub fn forget_document(&mut self, id: &str) -> Result<(), TrustError> {
         self.change(DOCUMENTS, false, |list| file::remove(list, |entry| entry == id))
+    }
+
+    /// Records that the user made this document from another file, as an import does. From then on no
+    /// folder vouches for it, wherever it is kept: it is trusted once the user trusts the document itself.
+    pub fn import_document(&mut self, id: &str) -> Result<(), TrustError> {
+        if id.is_empty() {
+            return Err(TrustError::NoDocument);
+        }
+        self.change(IMPORTED, true, |list| file::add(list, id, |entry| entry == id))
     }
 
     /// "Trust this folder", and every folder inside it. `path` is absolute.

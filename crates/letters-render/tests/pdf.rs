@@ -683,3 +683,37 @@ fn a_link_is_read_with_the_text_it_covers() {
     let links = read.pages()[0].raw().get::<Array<'_>>("Annots").map(|links| links.iter::<Dict<'_>>().count());
     assert_eq!(links, Some(4), "a link that names no link's text can still be clicked");
 }
+
+#[test]
+fn a_colour_glyph_is_written_in_its_own_colours_where_the_screen_shows_it() {
+    /// How many pixels are plainly coloured, and the middle of them.
+    fn coloured(pixels: impl Iterator<Item = [u8; 4]>) -> (usize, f32, f32) {
+        let spread = |[r, g, b, _]: [u8; 4]| r.max(g).max(b) - r.min(g).min(b);
+        let at: Vec<usize> = pixels.enumerate().filter(|(_, pixel)| spread(*pixel) > 60).map(|(at, _)| at).collect();
+        let (width, count) = (SHEET.width as usize, at.len().max(1) as f32);
+        let middle = |of: fn(usize, usize) -> usize| at.iter().map(|at| of(*at, width) as f32).sum::<f32>() / count;
+        (at.len(), middle(|at, width| at % width), middle(|at, width| at / width))
+    }
+    let size = 40.0;
+    for (format, font, id) in colour_faces() {
+        let Item::Glyphs { origin, font, size, color, skew, embolden, glyphs, .. } =
+            glyph(&font, id, size, Point { x: 80.0, y: 100.0 })
+        else {
+            unreachable!()
+        };
+        let text = Some(Arc::new(RunText { text: "\u{1F600}".into(), clusters: [0].into() }));
+        let glyph = Item::Glyphs { origin, font, size, color, skew, embolden, glyphs, text };
+        let screen = render(&on_white([glyph.clone()]), SHEET.width as u32, SHEET.height as u32, 1.0);
+
+        let read = page_of([glyph], &Images::default());
+
+        let (on_screen, x, y) = coloured(screen.data().as_chunks::<4>().0.iter().copied());
+        let (on_page, page_x, page_y) = coloured(shown(&read.pages()[0]).into_iter());
+        assert!(on_screen > 100, "{format} is in colour on screen");
+        let ratio = on_page as f32 / on_screen as f32;
+        assert!((0.7..1.4).contains(&ratio), "{format} is as large on the page: {on_page} against {on_screen}");
+        let apart = (page_x - x).abs().max((page_y - y).abs());
+        assert!(apart < 0.2 * size, "{format} is where the screen shows it: {apart} pixels away");
+        assert_eq!(text_of(&read.pages()[0]), "\u{1F600}", "{format} is found as the character it stands for");
+    }
+}

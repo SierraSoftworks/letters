@@ -25,6 +25,11 @@ const COPY: u8 = 4;
 const ALT: u8 = 5;
 const NOTE: u8 = 6;
 const BREAK: u8 = 7;
+const KEEP: u8 = 8;
+const USE: u8 = 9;
+const HELD: u8 = 10;
+/// The handle of a cell's column and of its row, and the bars that add a column and a row after it.
+const TABLE: [u8; 4] = [11, 12, 13, 14];
 
 /// FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
 fn hashed(bytes: impl Iterator<Item = u8>) -> u64 {
@@ -63,6 +68,10 @@ struct Telling<'a> {
     before: Option<&'a HashMap<NodeId, u64>>,
     now: HashMap<NodeId, u64>,
     nodes: &'a mut Vec<(NodeId, Node)>,
+    /// Whether the document is written on. One that is only read has nothing to press.
+    written: bool,
+    /// What is said of a block beside what it reads, as of one that a version of the document added.
+    said: Option<&'a HashMap<BlockId, String>>,
 }
 
 impl Telling<'_> {
@@ -96,8 +105,37 @@ pub(crate) fn page(
     {
         page.set_text_selection(TextSelection { anchor, focus });
     }
+    tell(doc, None, told, whole, page, nodes);
+}
+
+/// Adds the blocks of a version of the document under the canvas that shows it, as [`page`] does for
+/// the document itself. A version is read and not written on: nothing in it takes a selection or a press.
+/// `said` holds what is told of a block beside what it reads: how it differs from another version.
+pub(crate) fn version(
+    doc: &Document,
+    said: &HashMap<BlockId, String>,
+    told: &mut Told,
+    whole: bool,
+    canvas: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
+    canvas.set_language(doc.language.as_str());
+    tell(doc, Some(said), told, whole, canvas, nodes);
+}
+
+/// Adds the blocks of `doc` under `page`. With something `said` of its blocks the document is a version
+/// that is only read, and otherwise the one that is written on.
+fn tell(
+    doc: &Document,
+    said: Option<&HashMap<BlockId, String>>,
+    told: &mut Told,
+    whole: bool,
+    page: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
     let before = mem::take(&mut told.0);
-    let mut telling = Telling { before: (!whole).then_some(&before), now: HashMap::with_capacity(before.len()), nodes };
+    let now = HashMap::with_capacity(before.len());
+    let mut telling = Telling { before: (!whole).then_some(&before), now, nodes, written: said.is_none(), said };
     page.set_children(push_blocks(&doc.blocks, &mut telling));
     told.0 = telling.now;
 }
@@ -124,6 +162,66 @@ pub(crate) fn marker(block: &BlockId, label: &str, rect: Rect, page: &mut Node, 
     let id = part_node(block, NOTE);
     page.push_child(id);
     nodes.push((id, marker));
+}
+
+/// Adds a handle or a bar of the table that shows them under the page: a button, which a click presses.
+/// It is told by `cell`, a cell of the column or row it acts on. `row` is whether it acts on a row, and
+/// `add` whether it adds one at the end. `rect` is where it stands in the page area.
+pub(crate) fn table_part(
+    cell: &BlockId,
+    (row, add): (bool, bool),
+    label: &str,
+    rect: Rect,
+    page: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
+    let mut button = Node::new(Role::Button);
+    button.set_label(label);
+    button.add_action(Action::Click);
+    button.set_bounds(placed(page, rect));
+    let id = part_node(cell, TABLE[usize::from(row) + 2 * usize::from(add)]);
+    page.push_child(id);
+    nodes.push((id, button));
+}
+
+/// Adds the button that chooses one version of a block two writers changed apart: the one on the page
+/// with `keep`, and else the one held back. `place` says whose it is and where it stands.
+pub(crate) fn choice(
+    block: &BlockId,
+    keep: bool,
+    label: &str,
+    place: &str,
+    rect: Rect,
+    page: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
+    let mut button = Node::new(Role::Button);
+    button.set_label(label);
+    button.set_description(place);
+    button.add_action(Action::Click);
+    button.set_bounds(placed(page, rect));
+    let id = part_node(block, if keep { KEEP } else { USE });
+    page.push_child(id);
+    nodes.push((id, button));
+}
+
+/// Adds the version of a block that a conflict holds back, which shows beside the page's own: what it
+/// reads, under a name that says whose it is.
+pub(crate) fn held_back(
+    block: &BlockId,
+    label: &str,
+    text: &str,
+    rect: Rect,
+    page: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
+    let mut held = Node::new(Role::Note);
+    held.set_label(label);
+    held.set_value(text);
+    held.set_bounds(placed(page, rect));
+    let id = part_node(block, HELD);
+    page.push_child(id);
+    nodes.push((id, held));
 }
 
 /// Adds what Print view shows of a page break under its canvas: a button that takes the break before a
@@ -232,6 +330,8 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
     }
     block.body.runs().iter().for_each(|run| run.text.hash(&mut reads));
     (&under, &inner).hash(&mut reads);
+    let said = telling.said.and_then(|said| said.get(&block.id));
+    said.hash(&mut reads);
     if !telling.differs(id, reads.finish()) {
         return id;
     }
@@ -253,7 +353,11 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
         BlockKind::TableCell => Role::Cell,
         BlockKind::Unknown { .. } => Role::Unknown,
     });
+    if let Some(said) = said {
+        node.set_description(said.as_str());
+    }
     let mut children = Vec::new();
+    let written = telling.written;
     let mut part = |part: u8, node: Node, children: &mut Vec<NodeId>| {
         telling.nodes.push((part_node(&block.id, part), node));
         children.push(part_node(&block.id, part));
@@ -266,11 +370,13 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
                 // The tick is a checkbox of its own, which a click ticks.
                 let mut tick = Node::new(Role::CheckBox);
                 tick.set_toggled(if *checked { Toggled::True } else { Toggled::False });
-                tick.add_action(Action::Click);
+                if written {
+                    tick.add_action(Action::Click);
+                }
                 part(TICK, tick, &mut children);
             }
         }
-        BlockKind::Code { .. } => {
+        BlockKind::Code { .. } if written => {
             // The button in the corner of the box, which a click presses.
             let mut copy = Node::new(Role::Button);
             copy.set_label(crate::code_copy::LABEL);
@@ -282,11 +388,13 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
             let mut picture = Node::new(Role::Image);
             picture.set_label(alt.as_str());
             part(PICTURE, picture, &mut children);
-            // The switch under it, which a click turns to the alt text.
-            let mut switch = Node::new(Role::Button);
-            switch.set_label(crate::captions::LABEL);
-            switch.add_action(Action::Click);
-            part(ALT, switch, &mut children);
+            if written {
+                // The switch under it, which a click turns to the alt text.
+                let mut switch = Node::new(Role::Button);
+                switch.set_label(crate::captions::LABEL);
+                switch.add_action(Action::Click);
+                part(ALT, switch, &mut children);
+            }
         }
         _ => {}
     }
@@ -336,8 +444,19 @@ pub(crate) enum Request {
     Alt(BlockId),
     /// Presses the marker of the notes beside a block.
     Note(BlockId),
+    /// Presses the handle of a cell's column or of its row, or the bar that adds one after it.
+    Table {
+        cell: BlockId,
+        row: bool,
+        add: bool,
+    },
     /// Presses what Print view shows of the page break before a block.
     Break(BlockId),
+    /// Chooses a version of a block two writers changed apart: the one on the page, or the one held back.
+    Choose {
+        block: BlockId,
+        keep: bool,
+    },
 }
 
 pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request> {
@@ -359,7 +478,17 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
             let switched = || part(ALT).map(|block| Request::Alt(block.id.clone()));
             let noted = || part(NOTE).map(|block| Request::Note(block.id.clone()));
             let broken = || part(BREAK).map(|block| Request::Break(block.id.clone()));
-            ticked.or_else(copied).or_else(switched).or_else(noted).or_else(broken)
+            let chosen = |keep| part(if keep { KEEP } else { USE }).map(|block| (block.id.clone(), keep));
+            let chosen = || chosen(true).or_else(|| chosen(false)).map(|(block, keep)| Request::Choose { block, keep });
+            let tabled = || {
+                let found = |at: usize| Some((part(TABLE[at])?.id.clone(), at));
+                (0..TABLE.len()).find_map(found).map(|(cell, at)| Request::Table {
+                    cell,
+                    row: at % 2 == 1,
+                    add: at >= 2,
+                })
+            };
+            ticked.or_else(copied).or_else(switched).or_else(noted).or_else(broken).or_else(chosen).or_else(tabled)
         }
         _ => None,
     }

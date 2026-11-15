@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use letters_trust::{Gate, Mode, Origin, Store, Trust, TrustStore};
+use letters_trust::{Gate, Mode, Origin, Store, Trust, TrustError, TrustStore};
 
 /// The settings file. Whatever else it holds is left as its writer had it.
 #[derive(Clone, Debug)]
@@ -73,5 +73,18 @@ pub fn gate<'a>(trust: &'a Trust, id: &str, path: Option<&Path>) -> Gate<'a> {
     match real.as_deref().and_then(Path::to_str) {
         Some(path) => trust.gate(id, Origin::File(path)),
         None => trust.gate(id, Origin::Outside),
+    }
+}
+
+/// Records the import of the file at `source` as the document `id`, before the document is written.
+///
+/// What an import holds came from the file, so the folder the file lies in vouches for it, not the folder
+/// the document is saved to. From a trusted folder the document is trusted wherever it is kept. From
+/// anywhere else it opens in safe mode until the person trusts the document itself.
+pub fn import(trust: &mut Trusted, id: &str, source: &Path) -> Result<Mode, TrustError> {
+    let real = fs::canonicalize(source).ok();
+    match real.as_deref().and_then(Path::to_str).is_some_and(|path| trust.trust().trusts_folder(path)) {
+        true => trust.trust_document(id).map(|()| Mode::Trusted),
+        false => trust.import_document(id).map(|()| Mode::Safe),
     }
 }

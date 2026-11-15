@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Picture, Platform as _};
 use letters_format::WorkingCopy;
-use letters_model::{BlockId, Model, Notes, ReplicaId, Revision, Style};
+use letters_frame::Lights;
+use letters_model::{BlockId, Change, Model, Notes, ReplicaId, Revision, Style, TagKind};
 use letters_render::image::Image;
 use letters_render::{Color, DisplayList, Point, Size};
 use letters_spell::Dictionary;
@@ -57,6 +58,7 @@ use crate::printing;
 use crate::remote::{self, Roots};
 use crate::settings;
 use crate::trust::{self, Trusted};
+use crate::versions::Rests;
 use crate::words::{self, Words};
 use crate::workers::Workers;
 use crate::writer;
@@ -107,8 +109,11 @@ pub enum Event {
     /// The file at a path, which a window was asked to bring in, has been read: what it would bring is
     /// known, or why it cannot be brought in.
     Planned(WindowId, PathBuf, Result<Box<Plan>, String>),
-    /// A file was brought in for a window and kept as a new document at this path, or could not be.
-    Imported(WindowId, Result<PathBuf, String>),
+    /// A file of this name was brought in for a window and kept as a new document at this path, or could
+    /// not be.
+    Imported(WindowId, String, Result<PathBuf, String>),
+    /// How far the person's clock is ahead of UTC, in minutes.
+    Offset(i32),
     /// A picture a window's document links to, at this address, was fetched for this: its file, or why
     /// there is none.
     Linked(WindowId, String, Link, Result<Vec<u8>, String>),
@@ -156,6 +161,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         fetching: Workers::new(4),
         dictionaries: dictionaries::system_folders(&home).into(),
         reduced_motion: false,
+        offset: None,
         buttons: Buttons::guess(),
         settings,
         account: None,
@@ -305,6 +311,8 @@ struct App {
     dictionaries: Arc<[PathBuf]>,
     /// Whether the desktop asked for less motion. Asked once, after the first frame.
     reduced_motion: bool,
+    /// How far the person's clock is ahead of UTC, in minutes, once that has been looked up.
+    offset: Option<i32>,
     /// The buttons the desktop's windows carry: a guess until it has been asked, after the first frame.
     buttons: Buttons,
     /// What the person set for themselves.
@@ -363,8 +371,11 @@ struct DocWindow {
     chrome: Chrome,
     /// Whether the person set the window light or dark, or left it to the system.
     appearance: Appearance,
-    /// The height of the unified title bar the system gave the window, which the bar then fills.
+    /// The height of the unified title bar the system gave the window, which the bar fills until the
+    /// lights are seen.
     bar: Option<f32>,
+    /// Where the system last stood the window's lights, which the bar is then centred on.
+    lights: Option<Lights>,
     /// When the view next wants a frame without being asked, on the editor's clock.
     wake_ms: Option<u64>,
 
@@ -428,6 +439,14 @@ struct DocWindow {
     dropped: Vec<PathBuf>,
     /// Whether the document is on its way to the print dialog, or the dialog is up.
     printing: bool,
+    /// The name of the file this window offers to bring in, for the card and for the history.
+    importing: Option<String>,
+    /// The name of the file this document was just brought in from, until its history says so.
+    imported: Option<String>,
+    /// Where the writing rested, for the versions the history lists.
+    rests: Rests,
+    /// Whether versions were marked that no save has been handed. A mark is no edit, but it is saved.
+    marks: bool,
     /// Pictures the page asked for whose files were not to be had while a read or a save was under way.
     awaited: Vec<String>,
     /// Linked pictures that were asked for before the file said which document this is, which decides
@@ -455,6 +474,11 @@ pub enum Link {
     Once,
     /// To keep in the document, in this figure.
     Embed(BlockId),
+}
+
+/// Whether a change shows in the document, as text or a block that came, went or moved.
+fn moved(change: &Change) -> bool {
+    *change != Change::default()
 }
 
 /// Whether two folders are one, however each is spelled. One that cannot be resolved is taken as written.
@@ -501,7 +525,18 @@ impl DocWindow {
     }
 
     fn unsaved(&self) -> bool {
-        self.keeps && self.view.edits() != self.saved_edits
+        self.keeps && (self.view.edits() != self.saved_edits || self.marks)
+    }
+
+    /// Marks a version in the document's history, where the editor finds one worth marking. The mark
+    /// goes to the file with the next save.
+    fn mark(&mut self, at: &Revision, kind: TagKind, name: Option<&str>) {
+        let was = self.view.editor().model().revision();
+        let marked = self.view.change(|editor| editor.mark_version(at, kind, name).map(|()| Change::default()));
+        match marked {
+            Ok(()) => self.marks |= self.view.editor().model().revision() != was,
+            Err(error) => eprintln!("letters: could not mark a version of {}: {error}", self.name()),
+        }
     }
 
     fn dark(&self) -> bool {
@@ -847,7 +882,11 @@ impl DocWindow {
     /// buttons, and whether it floats or fills its place.
     fn reframe(&mut self, buttons: &Buttons) {
         let (maximized, full_screen) = (self.window.is_maximized(), self.window.fullscreen().is_some());
-        let chrome = Host::HERE.chrome(buttons, maximized, full_screen, self.bar);
+        // The lights are read while they stand in the window, and remembered while they do not.
+        if let Some(lights) = letters_frame::lights(&self.window) {
+            self.lights = Some(lights);
+        }
+        let chrome = Host::HERE.chrome(buttons, maximized, full_screen, self.bar, self.lights);
         if self.chrome != chrome {
             self.chrome = chrome.clone();
             self.view.set_chrome(chrome);
@@ -911,6 +950,11 @@ impl DocWindow {
         }
         if self.view.edits() != self.noticed_edits {
             self.noticed_edits = self.view.edits();
+            // Where the last session ended, or writing rested for long, is a version of its own.
+            if let Some((at, kind)) = self.rests.edited(now) {
+                self.mark(&at, kind, None);
+            }
+            self.rests.rest(self.view.editor().model().revision(), now);
             self.save_at = Some(now + SAVE_AFTER);
             self.journal_at.get_or_insert(now + JOURNAL_AFTER);
             self.retitle();
@@ -951,6 +995,17 @@ impl DocWindow {
                     eprintln!("letters: could not bring back unsaved work in {}: {error}", self.name());
                 }
                 self.id = Some(copy.id.clone());
+                // What the file held is where the last session ended, should this one write anything.
+                let found = copy.model().revision();
+                match self.imported.take() {
+                    // A document that was just brought in says so, and from what.
+                    Some(source) => {
+                        self.mark(&found, TagKind::Import, Some(&source));
+                        self.save_at = Some(Instant::now() + SAVE_AFTER);
+                    }
+                    None if self.made_here && self.file().is_none() => {}
+                    None => self.rests.opened(found),
+                }
                 // The window keeps the notes from here on. A comment written before they arrived stays.
                 let mut notes = copy.notes.clone();
                 let early = notes.merge(self.view.notes());
@@ -991,8 +1046,9 @@ impl DocWindow {
             // The window only offers styles the file format takes.
             let _ = copy.set_style(self.sent_style.clone());
         }
-        // The assets go into the file with the edits that name them.
+        // The assets go into the file with the edits that name them, and so do the versions marked.
         copy.entries.append(&mut self.assets);
+        self.marks = false;
         let model = self.view.editor().model();
         let edits = self.sent.as_ref().map_or_else(|| model.save(), |sent| model.updates_since(sent));
         (edits, model.revision())
@@ -1098,8 +1154,9 @@ impl DocWindow {
         self.sent = Some(revision);
         self.save_failed = false;
         let typed_since = self.view.edits() != edits;
+        let mut met = false;
         if let Some(news) = news
-            && let Err(error) = self.view.change(|editor| editor.merge(&news))
+            && let Err(error) = self.view.change(|editor| editor.merge(&news).inspect(|change| met = moved(change)))
         {
             eprintln!("letters: could not take in what {} held: {error}", self.name());
         }
@@ -1114,6 +1171,12 @@ impl DocWindow {
         self.saved_edits = if typed_since { edits } else { self.view.edits() };
         if !typed_since {
             self.noticed_edits = self.saved_edits;
+        }
+        // Another writer's words changed the document: where the two met is a version. A mark of theirs
+        // alone changes nothing to read, and is not answered with one, or two windows would never rest.
+        if met && self.rests.merged(Instant::now()) {
+            let at = self.view.editor().model().revision();
+            self.mark(&at, TagKind::Merge, None);
         }
     }
 
@@ -1249,6 +1312,7 @@ impl App {
             chrome: Chrome::default(),
             appearance: Appearance::System,
             bar,
+            lights: None,
             wake_ms: None,
             place,
             keeps: self.typing.is_none() && !self.report_launch,
@@ -1279,12 +1343,19 @@ impl App {
             plan: None,
             dropped: Vec::new(),
             printing: false,
+            importing: None,
+            imported: None,
+            rests: Rests::default(),
+            marks: false,
             awaited: Vec::new(),
             links: Vec::new(),
             linked: BTreeMap::new(),
             held: BTreeMap::new(),
         };
         window.view.set_reduced_motion(self.reduced_motion);
+        if let Some(minutes) = self.offset {
+            window.view.set_utc_offset(minutes);
+        }
         window.view.set_account_name(self.account.as_deref());
         window.view.set_languages(&self.languages);
         if !window.place.naming() {
@@ -1299,6 +1370,8 @@ impl App {
         window.follow(&self.settings, self.writer());
         self.mark("laid out");
         window.window.set_visible(true);
+        // macOS places a window's lights for good as it shows it, which is before the first frame.
+        window.reframe(&self.buttons);
         self.mark("window shown");
         window.window.request_redraw();
         let id = window.window.id();
@@ -1358,12 +1431,10 @@ impl App {
                     refused = !self.replace(id, now, |_, library| make(library));
                 }
                 Request::SaveCopy { name, format, folder, replace } => {
-                    let folder = folder.as_deref().map(Path::new);
-                    if let Err(refused) = self.copy(id, &name, format, folder, replace)
-                        && let Some(window) = self.windows.get_mut(&id)
-                    {
-                        window.view.refuse_copy(&refused.to_string(), refused.replaceable());
-                    }
+                    self.copy_or_say(id, None, &name, format, folder.as_deref(), replace);
+                }
+                Request::SaveVersion { revision, name, format, folder, replace } => {
+                    self.copy_or_say(id, Some(revision), &name, format, folder.as_deref(), replace);
                 }
                 Request::Close => self.act(event_loop, id, Action::Close),
                 Request::DragWindow
@@ -1474,17 +1545,41 @@ impl App {
         }
     }
 
+    /// Writes the copy a window asked for, of its document or of an older `version` of it, and tells the
+    /// window when it cannot be written.
+    fn copy_or_say(
+        &mut self,
+        id: WindowId,
+        version: Option<Revision>,
+        name: &str,
+        format: CopyFormat,
+        folder: Option<&str>,
+        replace: bool,
+    ) {
+        if let Err(refused) = self.copy(id, version, name, format, folder.map(Path::new), replace)
+            && let Some(window) = self.windows.get_mut(&id)
+        {
+            window.view.refuse_copy(&refused.to_string(), refused.replaceable());
+        }
+    }
+
     /// Starts writing a copy of a window's document called `name`, in `folder` or where the person then
     /// chooses. The copy is made from the document's file on another thread, and arrives as an event.
     fn copy(
         &mut self,
         id: WindowId,
+        version: Option<Revision>,
         name: &str,
         format: CopyFormat,
         folder: Option<&Path>,
         replace: bool,
     ) -> Result<(), copies::Refused> {
         let Some(window) = self.windows.get_mut(&id) else { return Ok(()) };
+        // An older version is read here, where the history is, and written with the file's pictures.
+        let version = match version {
+            Some(revision) => Some(window.view.document_at(&revision).ok_or(copies::Refused::NoVersion)?),
+            None => None,
+        };
         // The file is brought up to date first. A title still being typed names it only if nothing
         // else would give the document a file.
         for caret in [true, false] {
@@ -1509,7 +1604,10 @@ impl App {
         let proxy = self.proxy.clone();
         self.copies.retain(|copy| !copy.is_finished());
         self.copies.push(thread::spawn(move || {
-            let written = copies::write(&source, &output, format, replace);
+            let written = match version {
+                Some(version) => copies::write_version(&source, version, &output, format, replace),
+                None => copies::write(&source, &output, format, replace),
+            };
             let _ = proxy.send_event(Event::Copied(id, output, written));
         }));
         Ok(())
@@ -1661,7 +1759,15 @@ impl App {
     fn vouch_for(&mut self, id: WindowId, folder: bool) {
         let Some(window) = self.windows.get(&id) else { return };
         let kept = match (folder, window.folder(), &window.id) {
-            (true, Some(folder), _) => folder.to_str().map(|folder| self.trust.trust_folder(folder)),
+            (true, Some(folder), id) => folder.to_str().map(|folder| {
+                self.trust.trust_folder(folder)?;
+                // A folder does not vouch for a document that was imported. Asked from that document's
+                // own bar, the person means it too.
+                match id.as_deref().filter(|id| self.trust.trust().imported(id)) {
+                    Some(id) => self.trust.trust_document(id),
+                    None => Ok(()),
+                }
+            }),
             (false, _, Some(id)) => Some(self.trust.trust_document(id)),
             _ => None,
         };
@@ -1715,6 +1821,7 @@ impl App {
             pictures: folder.pictures as u32,
             chosen: folder.beside,
         });
+        window.importing = Some(name.clone());
         window.view.offer_import(Some(ImportOffer {
             name,
             kind: match plan.kind {
@@ -1735,32 +1842,47 @@ impl App {
     fn bring_in(&mut self, id: WindowId, folders: &[String], comments: bool) {
         let Some(window) = self.windows.get_mut(&id) else { return };
         let Some(plan) = window.plan.take() else { return window.view.offer_import(None) };
+        // Recorded before the document exists: unless the file lies in a trusted folder, the document opens
+        // in safe mode from the first, wherever it is saved, until the person trusts it from its own bar.
+        if let Err(error) = trust::import(&mut self.trust, &plan.id, plan.source()) {
+            window.view.offer_import(None);
+            window.sync(Instant::now());
+            return window.alert(&format!("The file was not brought in: the import could not be recorded.\n\n{error}"));
+        }
         // The card names the folders as it was given them.
         let chosen =
             plan.folders.iter().filter(|folder| folders.iter().any(|path| *path == folder.path.to_string_lossy()));
         let choices = Choices { pictures: chosen.map(|folder| folder.path.clone()).collect(), comments };
         let (proxy, folder) = (self.proxy.clone(), self.library.default_folder());
+        let source = window.importing.take().unwrap_or_default();
         thread::spawn(move || {
             let name = plan.name.clone();
             let kept = plan.import(&choices).keep(&folder, &name);
-            let _ = proxy.send_event(Event::Imported(id, kept));
+            let _ = proxy.send_event(Event::Imported(id, source, kept));
         });
     }
 
     /// Opens the document a file was brought in as, in place of the window that offered it.
-    fn imported(&mut self, event_loop: &ActiveEventLoop, id: WindowId, kept: Result<PathBuf, String>) {
+    fn imported(&mut self, event_loop: &ActiveEventLoop, id: WindowId, source: String, kept: Result<PathBuf, String>) {
         if let Some(window) = self.windows.get_mut(&id) {
             window.view.offer_import(None);
             window.sync(Instant::now());
         }
-        match (kept, self.windows.contains_key(&id)) {
-            (Ok(path), true) => self.act(event_loop, id, Action::Open(Some(path))),
-            // The window was closed meanwhile, and the document is there all the same.
-            (Ok(path), false) => _ = self.open_path(event_loop, &path, None),
-            (Err(error), _) => {
+        let path = match kept {
+            Ok(path) => path,
+            Err(error) => {
                 let parent = self.windows.get(&id).map(|window| &window.window);
-                alert(parent, &format!("The file could not be brought in.\n\n{error}"));
+                return alert(parent, &format!("The file could not be brought in.\n\n{error}"));
             }
+        };
+        match self.windows.contains_key(&id) {
+            true => self.act(event_loop, id, Action::Open(Some(path.clone()))),
+            // The window was closed meanwhile, and the document is there all the same.
+            false => _ = self.open_path(event_loop, &path, None),
+        }
+        // Its history says where it came from, once the window that shows it has read the history.
+        if let Some(window) = self.windows.values_mut().find(|window| window.file() == Some(path.as_path())) {
+            window.imported = Some(source);
         }
     }
 
@@ -1936,6 +2058,7 @@ impl ApplicationHandler<Event> for App {
                         if let Some(reduced) = chrome::reduced_motion() {
                             let _ = proxy.send_event(Event::Motion(reduced));
                         }
+                        let _ = proxy.send_event(Event::Offset(platform::utc_offset()));
                         if let Some(buttons) = Buttons::ask().filter(|_| Host::HERE == Host::Linux) {
                             let _ = proxy.send_event(Event::Buttons(buttons));
                         }
@@ -1993,9 +2116,18 @@ impl ApplicationHandler<Event> for App {
             }
             WindowEvent::Focused(focused) => {
                 window.view.focus(focused);
+                // The lights may have been moved since they were last looked for.
+                window.reframe(&self.buttons);
                 // Another window, or another copy of the app, may have taught the dictionary a word.
                 if focused && window.rest.is_none() {
                     window.reword(&self.words);
+                }
+                // The clock may have moved to summer time, or the person to another zone, while the
+                // window was left alone.
+                if focused && self.offset.is_some() {
+                    let minutes = platform::utc_offset();
+                    self.offset = Some(minutes);
+                    window.view.set_utc_offset(minutes);
                 }
                 window.access_stale = true;
             }
@@ -2178,7 +2310,13 @@ impl ApplicationHandler<Event> for App {
                     window.alert(&format!("{} could not be printed.\n\n{error}", window.name()));
                 }
             }
-            Event::Imported(id, kept) => self.imported(event_loop, id, kept),
+            Event::Imported(id, source, kept) => self.imported(event_loop, id, source, kept),
+            Event::Offset(minutes) => {
+                self.offset = Some(minutes);
+                for window in self.windows.values_mut() {
+                    window.view.set_utc_offset(minutes);
+                }
+            }
             Event::Account(name) => {
                 self.account = Some(name);
                 let writer = self.settings.name.as_deref().or(self.account.as_deref());

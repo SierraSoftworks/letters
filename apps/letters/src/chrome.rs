@@ -4,12 +4,16 @@
 //! the bar's own, and they follow the desktop's `button-layout` setting: which buttons, in what order, on
 //! which side. Whether things may move is the desktop's to say too.
 
+use letters_frame::Lights;
 use letters_ui::{Chrome, Frame, WindowButton};
 
 /// Room the bar leaves for the three lights macOS draws over its start.
 const LIGHTS: f32 = 78.0;
-/// The same in a unified title bar, whose lights stand 13 pt further from the window's edge.
+/// The same in a unified title bar, whose lights stand 13 pt further from the window's edge, until the
+/// lights were seen.
 const LIGHTS_UNIFIED: f32 = 91.0;
+/// The room between the last light and what the bar shows first.
+const AFTER_LIGHTS: f32 = 19.0;
 
 /// Whose rules a window's frame follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,18 +38,31 @@ impl Host {
 
     /// What the desktop expects of a window's frame and bar. A window that is maximised or full screen
     /// has no edge of its own to show or to be resized by. `bar` is the height of the title bar where the
-    /// system made it a unified one, which the bar then fills so that its contents line up with the lights.
-    pub fn chrome(self, buttons: &Buttons, maximized: bool, full_screen: bool, bar: Option<f32>) -> Chrome {
+    /// system made it a unified one, and `lights` is where its lights were last seen to stand. The bar
+    /// is centred on their line, since the system does not always centre them in its own title bar, and
+    /// until they were seen it fills the title bar.
+    pub fn chrome(
+        self,
+        buttons: &Buttons,
+        maximized: bool,
+        full_screen: bool,
+        bar: Option<f32>,
+        lights: Option<Lights>,
+    ) -> Chrome {
         match self {
             Self::Other => Chrome::default(),
             Self::Mac => {
-                let inset_start = match bar {
+                // The lights of a plain title bar stand too high for any bar to be centred on.
+                let lights = lights.filter(|_| bar.is_some());
+                let inset_start = match (bar, lights) {
                     // A full screen window has no lights to leave room for.
                     _ if full_screen => 0.0,
-                    Some(_) => LIGHTS_UNIFIED,
-                    None => LIGHTS,
+                    (_, Some(lights)) => lights.end + AFTER_LIGHTS,
+                    (Some(_), None) => LIGHTS_UNIFIED,
+                    (None, None) => LIGHTS,
                 };
-                Chrome { frame: Frame::Unified, inset_start, bar_height: bar, maximized, ..Chrome::default() }
+                let bar_height = lights.map(|lights| 2.0 * lights.centre).or(bar);
+                Chrome { frame: Frame::Unified, inset_start, bar_height, maximized, ..Chrome::default() }
             }
             Self::Linux => Chrome {
                 buttons: buttons.order.iter().map(|button| button.shown()).collect(),

@@ -1,19 +1,32 @@
 //! The Parley setup everything is shaped with: the registered faces and the scratch space layouts are built in.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
 use letters_render::{Color, Font, Glyph, Item, Point};
-use parley::fontique::{Blob, Collection, CollectionOptions, FamilyId, SourceCache};
+use parley::fontique::{Blob, CharmapIndex, Collection, CollectionOptions, FamilyId, SourceCache};
 use parley::setting::Tag;
 use parley::{
     FontContext, FontFamily, FontFamilyName, FontStyle, FontVariation, FontVariations, FontWeight, GenericFamily,
     GlyphRun, InlineBox, Language, Layout, LayoutContext, LineHeight, OverflowWrap, Run, TextStyle,
 };
+use parley_data::Properties;
 
 use crate::Fonts;
 use crate::ink::Brush;
+
+/// A character that is shown without a glyph, since no face has one. See [`crate::DocLayout::take_uncovered`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Uncovered {
+    pub ch: char,
+    /// Whether it is written to show as an emoji, which takes a colour emoji face and not one for text.
+    pub emoji: bool,
+    /// The language of its text, as a BCP 47 tag. Han is drawn another way in each of Chinese, Japanese and
+    /// Korean, so this says which face to fetch for it.
+    pub lang: Option<String>,
+}
 
 /// How one stretch of text is set.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -41,12 +54,21 @@ pub(crate) struct Engine {
     sources: Vec<(u64, Arc<[u8]>)>,
     /// Font instances already handed out, so that painting clones one and allocates nothing.
     instances: Vec<(u64, Font)>,
-    /// The families registered, in the order they came.
+    /// The families of the document's fonts, in the order they came.
     families: Vec<FamilyId>,
-    /// Each face registered: its family's name, and whether it is italic.
+    /// The families that only back those up, in the order they came.
+    backups: Vec<FamilyId>,
+    /// Each face of the document's fonts: its family's name, and whether it is italic.
     faces: Vec<(String, bool)>,
+    /// The character map of every face registered, with its blob, its family and its place in its file.
+    maps: Vec<(u64, FamilyId, u32, CharmapIndex)>,
+    /// Whether a face has a glyph for a character, for each one met beyond ASCII.
+    covered: HashMap<char, bool>,
+    /// The characters met without a glyph since they were last taken: whether each is an emoji, and the
+    /// language of its text.
+    missed: Vec<(char, bool, Option<Language>)>,
     /// Whether text shaped since this was last cleared asked for a face that is not registered, and so was
-    /// set in another. Such text is set again when more fonts arrive.
+    /// set in another, or held a character no face has. Such text is set again when more fonts arrive.
     pub short: bool,
 }
 
@@ -56,7 +78,8 @@ const OPSZ: Tag = Tag::new(b"opsz");
 const SLANT: f32 = 14.0;
 
 impl Engine {
-    /// Registers exactly `fonts`. System fonts are never consulted, so text looks the same everywhere.
+    /// Registers exactly `fonts`. The system's fonts are never looked up, so text looks the same everywhere:
+    /// its faces come only as the backups a shell hands to [`Engine::back`].
     pub fn new(fonts: &Fonts) -> Self {
         let collection = Collection::new(CollectionOptions { shared: false, system_fonts: false });
         let mut engine = Self {
@@ -67,7 +90,11 @@ impl Engine {
             sources: Vec::new(),
             instances: Vec::new(),
             families: Vec::new(),
+            backups: Vec::new(),
             faces: Vec::new(),
+            maps: Vec::new(),
+            covered: HashMap::new(),
+            missed: Vec::new(),
             short: false,
         };
         engine.add(fonts);
@@ -78,30 +105,135 @@ impl Engine {
     pub fn add(&mut self, fonts: &Fonts) -> bool {
         let known = self.sources.len();
         for font in &fonts.faces {
-            if self.sources.iter().any(|(_, data)| Arc::ptr_eq(data, &font.data) || data == &font.data) {
+            if self.source(&font.data).is_some() {
                 continue;
             }
             let blob = Blob::new(Arc::new(font.data.clone()));
             self.sources.push((blob.id(), font.data.clone()));
-            for (family, faces) in self.fcx.collection.register_fonts(blob, None) {
+            for (family, faces) in self.fcx.collection.register_fonts(blob.clone(), None) {
                 if !self.families.contains(&family) {
                     self.families.push(family);
                 }
                 let name = self.fcx.collection.family_name(family).unwrap_or_default().to_owned();
                 self.faces.extend(faces.iter().map(|face| (name.clone(), face.style() != FontStyle::Normal)));
+                self.maps.extend(faces.iter().map(|face| (blob.id(), family, face.index(), face.charmap_index())));
             }
         }
         if self.sources.len() == known {
             return false;
         }
         // Every family backs up every other, so a glyph one face lacks comes from the next that has it.
+        // The backups come after them all: what the document's fonts cover is set as if there were none.
         let families = self.families.clone();
         let (mono, sans): (Vec<_>, Vec<_>) = families.iter().partition(|family| self.is_monospace(**family));
-        let generic = |first: &[FamilyId], rest: &[FamilyId]| first.iter().chain(rest).copied().collect::<Vec<_>>();
-        self.fcx.collection.set_generic_families(GenericFamily::SansSerif, generic(&sans, &mono).into_iter());
-        self.fcx.collection.set_generic_families(GenericFamily::Monospace, generic(&mono, &sans).into_iter());
+        let generic = |first: &[FamilyId], rest: &[FamilyId]| {
+            first.iter().chain(rest).chain(&self.backups).copied().collect::<Vec<_>>()
+        };
+        let (proportional, fixed) = (generic(&sans, &mono), generic(&mono, &sans));
+        self.fcx.collection.set_generic_families(GenericFamily::SansSerif, proportional.into_iter());
+        self.fcx.collection.set_generic_families(GenericFamily::Monospace, fixed.into_iter());
+        self.recover();
         self.short = false;
         true
+    }
+
+    /// Takes the faces of `fonts` as backups: text is set in one only where no face given to
+    /// [`Engine::add`] has its characters, and never because a style names it, so a document does not
+    /// depend on which of them a machine has. Says whether a character that had no glyph has one now.
+    pub fn back(&mut self, fonts: &Fonts) -> bool {
+        let mut new = Vec::new();
+        for font in &fonts.faces {
+            let source = self.source(&font.data).or_else(|| {
+                let blob = Blob::new(Arc::new(font.data.clone()));
+                // A file that holds a family of the document's is left out. The two would be one family,
+                // and the document's own text could come out in the other's faces.
+                if self.clashes(&blob) {
+                    return None;
+                }
+                self.sources.push((blob.id(), font.data.clone()));
+                for (family, faces) in self.fcx.collection.register_fonts(blob.clone(), None) {
+                    self.maps.extend(faces.iter().map(|face| (blob.id(), family, face.index(), face.charmap_index())));
+                }
+                Some(blob.id())
+            });
+            // A file may hold several families. Only that of the face asked for backs anything up.
+            let face = self.maps.iter().find(|(blob, _, index, _)| Some(*blob) == source && *index == font.index);
+            let family = face.map(|(_, family, ..)| *family).filter(|family| !self.usable(*family));
+            new.extend(family);
+            self.backups.extend(family);
+        }
+        for generic in [GenericFamily::SansSerif, GenericFamily::Monospace] {
+            self.fcx.collection.append_generic_families(generic, new.iter().copied());
+        }
+        self.recover()
+    }
+
+    /// The characters met without a glyph since this was last asked, each once.
+    pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
+        let told = |(ch, emoji, lang): (char, bool, Option<Language>)| Uncovered {
+            ch,
+            emoji,
+            lang: lang.map(|lang| lang.to_string()),
+        };
+        self.missed.drain(..).map(told).collect()
+    }
+
+    /// The blob registered with these bytes.
+    fn source(&self, data: &Arc<[u8]>) -> Option<u64> {
+        self.sources.iter().find(|(_, known)| Arc::ptr_eq(known, data) || known == data).map(|(id, _)| *id)
+    }
+
+    /// Whether a font file holds a family the document's fonts have.
+    fn clashes(&self, blob: &Blob<u8>) -> bool {
+        let mut probe = Collection::new(CollectionOptions { shared: false, system_fonts: false });
+        let families = probe.register_fonts(blob.clone(), None);
+        families.iter().any(|(family, _)| {
+            let name = probe.family_name(*family).unwrap_or_default();
+            self.faces.iter().any(|(own, _)| own.eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// Whether text may be set in a family.
+    fn usable(&self, family: FamilyId) -> bool {
+        self.families.contains(&family) || self.backups.contains(&family)
+    }
+
+    /// Whether a face text may be set in has a glyph for `ch`.
+    fn covers(&self, ch: char) -> bool {
+        self.maps.iter().filter(|(_, family, ..)| self.usable(*family)).any(|(blob, .., map)| {
+            let data = self.sources.iter().find(|(id, _)| id == blob).map(|(_, data)| data);
+            data.and_then(|data| map.charmap(data)).and_then(|map| map.map(ch)).is_some_and(|glyph| glyph != 0)
+        })
+    }
+
+    /// Looks again for the characters that had no glyph, and says whether any has one now.
+    fn recover(&mut self) -> bool {
+        let lacking = self.covered.iter().filter(|(_, has)| !**has).map(|(ch, _)| *ch);
+        let found: Vec<char> = lacking.filter(|ch| self.covers(*ch)).collect();
+        self.covered.extend(found.iter().map(|ch| (*ch, true)));
+        let covered = &self.covered;
+        self.missed.retain(|(ch, ..)| !covered[ch]);
+        !found.is_empty()
+    }
+
+    /// Notes which characters of `text` no face has a glyph for.
+    fn note(&mut self, text: &str, locale: Option<Language>) {
+        if text.is_ascii() {
+            return;
+        }
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch.is_ascii() {
+                continue;
+            }
+            let has = self.covered.get(&ch).copied().unwrap_or_else(|| {
+                let has = !drawn(ch) || self.covers(ch);
+                self.covered.insert(ch, has);
+                self.missed.extend((!has).then(|| (ch, emoji(ch, chars.peek().copied()), locale)));
+                has
+            });
+            self.short |= !has;
+        }
     }
 
     fn is_monospace(&mut self, family: FamilyId) -> bool {
@@ -156,14 +288,18 @@ impl Engine {
             self.faces.iter().any(|(family, italic)| *italic == spec.italic && family.eq_ignore_ascii_case(spec.family))
         };
         self.short |= !specs.iter().all(has);
+        self.note(text, locale);
         let mut builder = self.lcx.style_run_builder(&mut self.fcx, text, 1.0, true);
         for spec in specs {
             let generic = if spec.mono { GenericFamily::Monospace } else { GenericFamily::SansSerif };
             let stack = [FontFamilyName::named(spec.family), FontFamilyName::Generic(generic)];
+            // A backup is never had by its name: the same style would then look another way elsewhere.
+            let own = self.faces.iter().any(|(family, _)| family.eq_ignore_ascii_case(spec.family));
+            let stack = &stack[usize::from(!own)..];
             // Optical size follows the font size, as it does on the web. A face with no such axis ignores it.
             let optical = [FontVariation::new(OPSZ, spec.size)];
             builder.push_style(TextStyle {
-                font_family: FontFamily::List(Cow::Borrowed(&stack)),
+                font_family: FontFamily::List(Cow::Borrowed(stack)),
                 font_size: spec.size,
                 font_weight: FontWeight::new(spec.weight),
                 font_style: if spec.italic { FontStyle::Italic } else { FontStyle::Normal },
@@ -247,4 +383,17 @@ impl Engine {
         self.instances.push((id, font.clone()));
         Some(font)
     }
+}
+
+/// Whether a character shows as a glyph at all. One that does not is never missed. U+FFFC is where a box
+/// stands in a line.
+fn drawn(ch: char) -> bool {
+    !(ch.is_control() || ch.is_whitespace() || ch == '\u{fffc}' || Properties::get(ch).is_default_ignorable())
+}
+
+/// Whether a character is written to show as an emoji: one that is an emoji by itself, the keycap that
+/// makes one of a digit, or a symbol with the selector after it that asks for its emoji form.
+fn emoji(ch: char, next: Option<char>) -> bool {
+    let of = Properties::get(ch);
+    of.is_emoji_presentation() || ch == '\u{20e3}' || (of.is_emoji_or_pictograph() && next == Some('\u{fe0f}'))
 }

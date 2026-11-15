@@ -4,7 +4,7 @@
 //! contiguous range. An open popover's content is a layer of its own after the window's content, which puts
 //! it on top for painting and first for hit testing.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
@@ -77,6 +77,14 @@ pub(crate) struct Layer<M> {
     pub on_close: Option<M>,
 }
 
+/// What the window keeps of its elements from one build of the tree to the next, that a build asks for.
+pub(crate) struct Kept<'a> {
+    /// The popovers that open and close themselves and are open.
+    pub open: &'a HashSet<Id>,
+    /// The elements built only near what shows that were near it at the last layout.
+    pub near: &'a HashSet<Id>,
+}
+
 pub(crate) struct Tree<M> {
     pub nodes: Vec<Node<M>>,
     pub layers: Vec<Layer<M>>,
@@ -90,17 +98,17 @@ impl<M> Default for Tree<M> {
 }
 
 impl<M> Tree<M> {
-    /// Flattens `root`. `is_open` answers for popovers that open and close themselves.
-    pub fn build(root: Element<M>, is_open: impl Fn(Id) -> bool) -> Self {
+    /// Flattens `root`.
+    pub fn build(root: Element<M>, kept: &Kept<'_>) -> Self {
         let mut tree = Tree::default();
         let mut pending = VecDeque::new();
-        tree.add_layer(root, None, Id::WINDOW, &is_open, &mut pending);
+        tree.add_layer(root, None, Id::WINDOW, kept, &mut pending);
         // Popovers found while flattening one layer become later layers, so a nested one lands above its
         // parent.
         while let Some((anchor, popover)) = pending.pop_front() {
             let popover: Popover<M> = *popover;
             let id = tree.nodes[anchor].id.child(POPOVER);
-            let layer = tree.add_layer(popover.content, Some(anchor), id, &is_open, &mut pending);
+            let layer = tree.add_layer(popover.content, Some(anchor), id, kept, &mut pending);
             let layer = &mut tree.layers[layer];
             layer.placement = popover.placement;
             layer.modal = popover.modal;
@@ -119,7 +127,7 @@ impl<M> Tree<M> {
         root: Element<M>,
         anchor: Option<usize>,
         parent_id: Id,
-        is_open: &impl Fn(Id) -> bool,
+        kept: &Kept<'_>,
         pending: &mut VecDeque<(usize, Box<Popover<M>>)>,
     ) -> usize {
         let layer = self.layers.len();
@@ -136,7 +144,7 @@ impl<M> Tree<M> {
             controlled: false,
             on_close: None,
         });
-        self.add(root, None, parent_id, &mut Vec::new(), layer, is_open, pending);
+        self.add(root, None, parent_id, &mut Vec::new(), layer, kept, pending);
         self.layers[layer].end = self.nodes.len();
         layer
     }
@@ -149,7 +157,7 @@ impl<M> Tree<M> {
         parent_id: Id,
         siblings: &mut Vec<u64>,
         layer: usize,
-        is_open: &impl Fn(Id) -> bool,
+        kept: &Kept<'_>,
         pending: &mut VecDeque<(usize, Box<Popover<M>>)>,
     ) {
         // Siblings with the same key are told apart by their order among themselves, so an element keeps
@@ -160,9 +168,12 @@ impl<M> Tree<M> {
         let id = parent_id.child(key).child(nth);
 
         let at = self.nodes.len();
-        let children = std::mem::take(&mut el.children);
+        let mut children = std::mem::take(&mut el.children);
+        if let Some(build) = el.later.as_ref().filter(|_| kept.near.contains(&id)) {
+            children.push(build());
+        }
         let trigger = el.popover.take().map(|popover| {
-            let open = popover.open.unwrap_or_else(|| is_open(id));
+            let open = popover.open.unwrap_or_else(|| kept.open.contains(&id));
             let trigger = Trigger { controlled: popover.open.is_some(), open, popup: popover.popup };
             if open {
                 pending.push_back((at, popover));
@@ -185,7 +196,7 @@ impl<M> Tree<M> {
         });
         let mut seen = Vec::new();
         for child in children {
-            self.add(child, Some(at), id, &mut seen, layer, is_open, pending);
+            self.add(child, Some(at), id, &mut seen, layer, kept, pending);
         }
         self.nodes[at].end = self.nodes.len();
     }

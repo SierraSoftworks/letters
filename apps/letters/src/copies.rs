@@ -8,7 +8,8 @@ use std::fs;
 use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 
-use letters_format::Archive;
+use letters_format::{Archive, HISTORY, NOTES};
+use letters_model::{Document, Style};
 use letters_ui::CopyFormat;
 
 use crate::cli::Format;
@@ -21,6 +22,8 @@ pub enum Refused {
     NoName,
     /// The document has no file to copy, since nothing was written in it.
     Nothing,
+    /// The version asked for is not in the document's history.
+    NoVersion,
     /// A file of that name is in the folder already. A document is never replaced.
     Taken {
         name: String,
@@ -41,6 +44,7 @@ impl fmt::Display for Refused {
         match self {
             Self::NoName => f.write_str("A copy needs a name."),
             Self::Nothing => f.write_str("There is nothing to copy yet."),
+            Self::NoVersion => f.write_str("That version could not be read."),
             Self::Taken { name, format: CopyFormat::Letters } => {
                 write!(f, "There is already a document called \u{201c}{name}\u{201d} in that folder.")
             }
@@ -102,6 +106,39 @@ pub fn ending(chosen: PathBuf, format: CopyFormat) -> PathBuf {
 /// Writes a copy of the document in the file at `source` to `output`, and returns the id of the document
 /// it made, if it made one. `replace` lets a file in another format take the place of one at `output`.
 pub fn write(source: &Path, output: &Path, format: CopyFormat, replace: bool) -> Result<Option<String>, Refused> {
+    let file = fs::read(source).map_err(|error| Refused::Failed(error.to_string()))?;
+    put(file, output, format, replace)
+}
+
+/// Writes a copy of the document as an older version of it read: `version`, with the pictures the file
+/// at `source` still holds. A document of its own starts with the version's text and has no history.
+/// The document's comments stay behind, since they were made on what it reads now.
+pub fn write_version(
+    source: &Path,
+    version: (Document, Style),
+    output: &Path,
+    format: CopyFormat,
+    replace: bool,
+) -> Result<Option<String>, Refused> {
+    let failed = |error: &dyn fmt::Display| Refused::Failed(error.to_string());
+    let file = fs::read(source).map_err(|error| failed(&error))?;
+    let mut package =
+        Archive::open(Cursor::new(file)).and_then(|mut file| file.package()).map_err(|error| failed(&error))?;
+    let (document, style) = version;
+    package.document = document;
+    package.set_style(&style);
+    package.entries.remove(NOTES);
+    // An export names who wrote the document from its history, which a document of its own leaves behind.
+    if format == CopyFormat::Letters {
+        package.entries.retain(|name, _| !name.starts_with(HISTORY));
+    }
+    let mut bytes = Cursor::new(Vec::new());
+    letters_format::write(&mut bytes, &package).map_err(|error| failed(&error))?;
+    put(bytes.into_inner(), output, format, replace)
+}
+
+/// Writes a copy of the document in `file`, the bytes of a `.let` file.
+fn put(file: Vec<u8>, output: &Path, format: CopyFormat, replace: bool) -> Result<Option<String>, Refused> {
     let failed = |error: &dyn fmt::Display| Refused::Failed(error.to_string());
     let name = |path: &Path| path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let title = output.file_stem().unwrap_or_default().to_string_lossy();
@@ -113,7 +150,6 @@ pub fn write(source: &Path, output: &Path, format: CopyFormat, replace: bool) ->
         io::ErrorKind::AlreadyExists => taken(path),
         _ => failed(&error),
     };
-    let file = fs::read(source).map_err(|error| failed(&error))?;
     let Some(to) = exported(format) else {
         // A document of its own has its own id: with this one's, the two would pass for one document
         // that was written in two places.

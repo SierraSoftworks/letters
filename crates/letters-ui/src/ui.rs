@@ -20,7 +20,7 @@ use crate::style::{Align, Dir};
 use crate::text::TextShaper;
 use crate::theme::{self, Accent};
 use crate::tokens::Scheme;
-use crate::tree::{Id, Tree};
+use crate::tree::{Id, Kept, Tree};
 use crate::widgets::Placement;
 
 /// Half a caret blink.
@@ -200,6 +200,8 @@ pub struct Ui<A: App> {
     canvas_caret: Option<Rect>,
     /// The element that was last brought into view because it asked: see `Element::in_view`.
     shown: Option<Id>,
+    /// The elements built only near what shows that were near it at the last layout: see `Element::later`.
+    near: HashSet<Id>,
     /// Whether the app may have work for idle time, and whether it did any since the window was described.
     idle: (bool, bool),
     blink_from: Option<u64>,
@@ -242,6 +244,7 @@ impl<A: App> Ui<A> {
             scroll: HashMap::new(),
             canvas_caret: None,
             shown: None,
+            near: HashSet::new(),
             idle: (true, false),
             blink_from: None,
             moving: false,
@@ -1058,7 +1061,14 @@ impl<A: App> Ui<A> {
     fn within(&self, i: usize, at: Point) -> Point {
         let node = &self.tree.nodes[i];
         let content = inner(node.rect, &node.el.style);
-        Point { x: at.x - content.x, y: at.y - content.y }
+        let at = Point { x: at.x - content.x, y: at.y - content.y };
+        match &node.el.content {
+            // A canvas that spreads over its room is told how far across and down it the point is.
+            Content::Canvas(canvas) if canvas.spread => {
+                Point { x: at.x / content.width.max(1.0), y: at.y / content.height.max(1.0) }
+            }
+            _ => at,
+        }
     }
 
     /// The offset in a text input's value nearest to a window position.
@@ -1250,13 +1260,18 @@ impl<A: App> Ui<A> {
 
     /// Brings the tree and its layout up to date with the app.
     fn refresh(&mut self) {
+        self.refresh_in(true);
+    }
+
+    /// As [`Ui::refresh`]. `again` is whether the window may be built once more for the rows that show.
+    fn refresh_in(&mut self, again: bool) {
         if self.stale.view {
             self.stale = Stale { view: false, layout: true, paint: true };
             self.idle.0 = true;
-            let (open, app, size) = (&self.open, &mut self.app, self.size);
+            let (kept, app, size) = (Kept { open: &self.open, near: &self.near }, &mut self.app, self.size);
             // The widgets take the accent as they are built.
             self.accent = app.accent();
-            self.tree = theme::with(self.accent, || Tree::build(app.view(size), |id| open.contains(&id)));
+            self.tree = theme::with(self.accent, || Tree::build(app.view(size), &kept));
             self.settle();
         }
         if self.stale.layout {
@@ -1272,10 +1287,33 @@ impl<A: App> Ui<A> {
             if self.fold() {
                 // A popover hung from something that is no longer shown: build the window without it.
                 self.stale.view = true;
-                return self.refresh();
+                return self.refresh_in(again);
+            }
+            // A row that shows and was not built: the window is built with it, once. Rows that are others
+            // at every build would have it built without end.
+            if self.near() && again {
+                self.stale.view = true;
+                return self.refresh_in(false);
             }
             self.update_hover();
         }
+    }
+
+    /// Finds the elements that are built only near what shows and are near it now: in the window, or
+    /// within its height above it or below, so that a row is there before it scrolls in. Returns whether
+    /// one of them is in the window and not built.
+    fn near(&mut self) -> bool {
+        let (tree, tall) = (&self.tree, self.size.height);
+        let (mut near, mut missing) = (HashSet::new(), false);
+        for (i, node) in tree.nodes.iter().enumerate().filter(|(_, node)| node.el.later.is_some()) {
+            let (top, bottom) = (node.rect.y, node.rect.y + node.rect.height);
+            if bottom > -tall && top < 2.0 * tall && !tree.gone(i) {
+                near.insert(node.id);
+                missing |= bottom > 0.0 && top < tall && node.end == i + 1;
+            }
+        }
+        self.near = near;
+        missing
     }
 
     /// Takes focus and popovers away from what the layout left out, as a bar folding for a narrower window.

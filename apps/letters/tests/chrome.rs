@@ -1,4 +1,5 @@
 use letters::chrome::{self, Button, Buttons, Host};
+use letters_frame::Lights;
 use letters_ui::{Chrome, Frame, WindowButton};
 
 const ALL: [Button; 3] = [Button::Minimise, Button::Maximise, Button::Close];
@@ -109,7 +110,7 @@ fn a_window_is_framed_as_its_desktop_expects() {
         (Host::Other, false, false, Frame::System, 0),
     ];
     for (host, maximized, full_screen, frame, count) in cases {
-        let chrome = host.chrome(&buttons, maximized, full_screen, None);
+        let chrome = host.chrome(&buttons, maximized, full_screen, None, None);
         let case = format!("{host:?}, maximised {maximized}, full screen {full_screen}");
         assert_eq!(chrome.frame, frame, "{case}");
         assert_eq!(chrome.buttons, shown[..count], "{case}");
@@ -121,20 +122,42 @@ fn a_window_is_framed_as_its_desktop_expects() {
 #[test]
 fn the_bar_leaves_room_for_the_lights_macos_draws() {
     let none = Buttons::parse("");
-    let usual = Host::Mac.chrome(&none, false, false, None);
+    let usual = Host::Mac.chrome(&none, false, false, None, None);
     assert!(usual.inset_start > 0.0 && usual.bar_height.is_none());
-    assert_eq!(Host::Mac.chrome(&none, false, true, None).inset_start, 0.0, "a full screen window has no lights");
-    assert_eq!(Host::Linux.chrome(&none, false, false, None).inset_start, 0.0);
-    assert_eq!(Host::Other.chrome(&none, true, true, None), Chrome::default());
+    let full_screen = Host::Mac.chrome(&none, false, true, None, None);
+    assert_eq!(full_screen.inset_start, 0.0, "a full screen window has no lights");
+    assert_eq!(Host::Linux.chrome(&none, false, false, None, None).inset_start, 0.0);
+    assert_eq!(Host::Other.chrome(&none, true, true, None, None), Chrome::default());
 }
 
 #[test]
-fn the_bar_fills_a_unified_title_bar_so_its_contents_meet_the_lights() {
+fn the_bar_fills_a_unified_title_bar_until_its_lights_are_seen() {
     let none = Buttons::parse("");
     let (usual, unified) =
-        (Host::Mac.chrome(&none, false, false, None), Host::Mac.chrome(&none, false, false, Some(52.0)));
-    assert_eq!(unified.bar_height, Some(52.0), "the bar is as tall as the title bar, whose lights are centred");
+        (Host::Mac.chrome(&none, false, false, None, None), Host::Mac.chrome(&none, false, false, Some(52.0), None));
+    assert_eq!(unified.bar_height, Some(52.0), "the bar is as tall as the title bar");
     assert!(unified.inset_start > usual.inset_start, "the lights of a unified title bar stand further in");
-    let full_screen = Host::Mac.chrome(&none, false, true, Some(52.0));
+    let full_screen = Host::Mac.chrome(&none, false, true, Some(52.0), None);
     assert_eq!((full_screen.inset_start, full_screen.bar_height), (0.0, Some(52.0)));
+}
+
+#[test]
+fn the_bar_is_centred_on_the_lights_wherever_the_system_stands_them() {
+    let none = Buttons::parse("");
+    // (the title bar's height, the lights' line and where they end)
+    let cases = [(52.0, 26.0, 72.0), (64.0, 26.0, 72.0), (64.0, 32.0, 86.0)];
+    for (bar, centre, end) in cases {
+        let lights = Some(Lights { centre, end });
+        let chrome = Host::Mac.chrome(&none, false, false, Some(bar), lights);
+        let case = format!("a bar of {bar} with lights at {centre}");
+        assert_eq!(chrome.bar_height.map(|height| height / 2.0), Some(centre), "{case}: the centre line");
+        assert!(chrome.inset_start > end, "{case}: the bar starts after the last light");
+
+        let full_screen = Host::Mac.chrome(&none, false, true, Some(bar), lights);
+        assert_eq!(full_screen.bar_height, chrome.bar_height, "{case}: full screen keeps the bar's height");
+        assert_eq!(full_screen.inset_start, 0.0, "{case}: and has no lights to leave room for");
+    }
+    // A plain title bar's lights stand too high to centre a bar on.
+    let plain = Host::Mac.chrome(&none, false, false, None, Some(Lights { centre: 14.0, end: 59.0 }));
+    assert_eq!(plain, Host::Mac.chrome(&none, false, false, None, None));
 }

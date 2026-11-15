@@ -2,7 +2,7 @@
 //!
 //! The window knows no file system. A path is a string the shell made, which it gets back unchanged.
 
-use letters_model::BlockId;
+use letters_model::{BlockId, Revision};
 use letters_render::Point;
 
 use crate::chrome::Edge;
@@ -36,11 +36,25 @@ pub enum Request {
         parent: String,
         name: String,
     },
+    /// Save the document now. Asked only while the shell says it is [`SaveState::Edited`](crate::SaveState):
+    /// by a press on the bar's save mark, from the palette, or with Ctrl or Cmd with S. Answer with
+    /// `Window::set_save_state`.
+    Save,
     /// Write a copy of the document called `name` in `format`, and leave this window on the document it
     /// has. `folder` is the path of the folder to write it to, or `None` to let the person choose where.
     /// A file of that name is in the way unless `replace` is set, which it is once the person has said so.
     /// Answer with `Window::set_copied`, or with `Window::refuse_copy` when it cannot be done.
     SaveCopy {
+        name: String,
+        format: CopyFormat,
+        folder: Option<String>,
+        replace: bool,
+    },
+    /// Write a copy of the document as it read at `revision`, a version the person picked in the history,
+    /// which `Window::document_at` reads. The rest is as for [`Request::SaveCopy`], and so are the answers.
+    /// A copy in [`CopyFormat::Letters`] is a document of its own that starts with that version's text.
+    SaveVersion {
+        revision: Revision,
         name: String,
         format: CopyFormat,
         folder: Option<String>,
@@ -164,8 +178,9 @@ pub struct Folder {
     pub depth: u8,
 }
 
-const WEEKDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+pub(crate) const WEEKDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+pub(crate) const MONTHS: [&str; 12] =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 /// A moment as RFC 3339 writes it.
 struct Moment {

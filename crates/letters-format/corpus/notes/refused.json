@@ -28,6 +28,7 @@
   { "why": "a version's block breaks the rules for blocks", "at": "notes[0].versions[1].block.level", "json": { "format": 1, "notes": [{ "id": "n", "type": "conflict", "anchor": { "block": "b" }, "author": "Letters", "created": "2026-11-14T20:00:00Z",
       "versions": [{ "author": "Ana", "edited": "2026-11-14T19:00:00Z", "block": { "id": "b", "type": "divider" } },
                    { "author": "Ben", "edited": "2026-11-14T19:05:00Z", "block": { "id": "b", "type": "heading", "level": 9 } }] }] } },
+  { "why": "the place a block stood names no block", "at": "notes[0].anchor.stood.after", "json": { "format": 1, "notes": [{ "id": "n", "type": "comment", "anchor": { "block": "b", "stood": { "after": "" } }, "author": "Ana", "created": "2026-11-14T20:00:00Z" }] } },
   { "why": "two notes share an id", "at": "notes", "schema_accepts": true,
     "json": { "format": 1, "notes": [{ "id": "n", "type": "comment", "anchor": { "block": "b" }, "author": "Ana", "created": "2026-11-14T20:00:00Z" },
                                      { "id": "n", "type": "import", "anchor": { "block": "c" }, "author": "Letters import", "created": "2026-11-14T20:00:00Z" }] } }

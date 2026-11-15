@@ -1,6 +1,6 @@
 //! The command palette: every action by name, from the keyboard.
 
-use letters_model::{Block, BlockKind, Change, Document};
+use letters_model::{Block, BlockKind, Change, Document, Note, Notes, Version};
 use letters_test::{Found, Harness, Role};
 use letters_ui::{Landing, PictureState, Request, SafeMode};
 
@@ -44,6 +44,28 @@ fn pictured() -> Harness {
     picked.expect("a picture to select");
     window.paint();
     window.ui().take_requests();
+    window
+}
+
+/// A line `a` and a line `b` that two writers each changed apart, with the first `settled` of the two
+/// conflicts settled.
+fn conflicted(settled: usize) -> Harness {
+    let line = |id: &str, text: &str| Block::text(id, BlockKind::Paragraph, text);
+    let conflict = |id: &str| {
+        let by = |text: &str| Version {
+            author: String::new(),
+            edited: String::new(),
+            block: Some(line(id, text)),
+            extra: Default::default(),
+        };
+        Note::conflict(id, [by("Slates first"), by("Roof first")])
+    };
+    let blocks = vec![line("a", "Roof first"), line("b", "Roof first")];
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.ui().set_notes(Notes { notes: vec![conflict("a"), conflict("b")], ..Notes::default() });
+    for _ in 0..settled {
+        window.click(Role::Button, "Next conflict").click(Role::Button, "Keep this version");
+    }
     window
 }
 
@@ -195,9 +217,15 @@ fn a_command_is_listed_only_where_it_has_something_to_act_on() {
         window.key("Right");
         window
     }
+    // Two conflicts of which `settled` are settled, with the next one open.
+    fn reviewing(settled: usize) -> Harness {
+        let mut window = conflicted(settled);
+        window.click(Role::Button, "Next conflict");
+        window
+    }
     // A window, a command, and whether the palette lists it there.
     type Open = fn() -> Harness;
-    let cases: [(&str, Open, &str, bool); 20] = [
+    let cases: [(&str, Open, &str, bool); 27] = [
         ("words selected", line, "Comment", true),
         ("a caret", caret, "Comment", false),
         ("nothing done yet", line, "Undo", false),
@@ -218,6 +246,13 @@ fn a_command_is_listed_only_where_it_has_something_to_act_on() {
         ("a trusted document", line, "Trust this document", false),
         ("a held document", || held(None), "Trust this folder", false),
         ("a held document in a folder", || held(Some("Downloads")), "Trust this folder", true),
+        ("no conflicts", line, "Next conflict", false),
+        ("conflicts that wait", || conflicted(0), "Next conflict", true),
+        ("conflicts that wait", || conflicted(0), "Keep this version", false),
+        ("one conflict of two open", || reviewing(0), "Use the other version", true),
+        ("one conflict of two open", || reviewing(0), "Previous conflict", true),
+        ("the only conflict open", || reviewing(1), "Close conflict", true),
+        ("the only conflict open", || reviewing(1), "Next conflict", false),
     ];
     for (what, open, command, lists) in cases {
         let mut window = open();
@@ -271,6 +306,7 @@ fn the_commands_of_the_window_open_what_its_buttons_open() {
         ("link", Role::TextInput, "Link", true),
         ("comment", Role::TextInput, "Comment", true),
         ("rename", Role::TextInput, "Document name", true),
+        ("history", Role::Complementary, "History", false),
     ];
     for (typed, role, name, focused) in cases {
         let mut window = line();

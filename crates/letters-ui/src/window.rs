@@ -13,10 +13,10 @@ use letters_editor::{
     Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Picture, Platform, Spot,
     TableEdit,
 };
-use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Syntax};
+use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax};
 use letters_model::{
-    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, Notes, Pos, Selection,
-    Style,
+    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, Notes, Pos, Revision,
+    Selection, Style,
 };
 use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
@@ -32,6 +32,7 @@ use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::figures::{self, Grip, Moving, Resizing};
 use crate::highlight;
+use crate::history::{self, History, Historying, Naming};
 use crate::icon::{self, Icon};
 use crate::importing::{Import, ImportOffer, Importing};
 use crate::insert::{Insert, Inserting, Put};
@@ -46,26 +47,29 @@ use crate::refer::{Picking, Refer};
 use crate::references::{self, Preview, Reference, References};
 use crate::renaming::{Outcome, Rename, Renaming};
 use crate::restyle::{self, Field, StyleEdit};
+use crate::review::{self, Review, Reviewing, Shown};
 use crate::safe::{self, Safe, SafeMode, Safely};
 use crate::settings::{Dialog, Setting, Settings};
 use crate::spelling::{Fix, Spelling};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::styles::{self, Styles, Styling};
+use crate::tables::{self, Tables};
 use crate::text::{Family, FontShaper, TextShaper, TextStyle};
 use crate::theme::{Accent, accent};
 use crate::threads::{self, Said};
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::ui::{App, DRAG_SLOP, Idle, Keys, Ui};
 use crate::widgets::{
-    Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, Title, TopBar, side_panel, top_bar,
+    Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, Title, TopBar, banner, side_panel,
+    top_bar,
 };
 
 /// Space kept beside the text column.
-const GUTTER: f32 = 24.0;
+pub(crate) const GUTTER: f32 = 24.0;
 /// How wide the link editor is: its field and the button that opens the address in it.
 const LINK_WIDTH: f32 = 336.0;
 /// Space kept above and below the text.
-const TOP: f32 = 48.0;
+pub(crate) const TOP: f32 = 48.0;
 /// Points to logical pixels.
 pub(crate) const PT: f32 = 96.0 / 72.0;
 pub(crate) const CARET_WIDTH: f32 = 1.5;
@@ -104,7 +108,9 @@ const SAVE_ICON: f32 = 14.0;
 /// The editor's window.
 pub type Window = Ui<EditorApp>;
 
-/// What the top bar says about saving. There is no save command: the title is the file's name.
+/// What the top bar says about saving. A document is saved as it is written, so there is no save command:
+/// the title is the file's name. Only a shell that keeps the document when asked reports
+/// [`SaveState::Edited`], which is when the window asks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SaveState {
     #[default]
@@ -116,24 +122,25 @@ pub enum SaveState {
     Unsaved,
     /// The last write did not succeed.
     Failed,
+    /// The document was written on since it was last kept, by a shell that keeps it only when asked, as a
+    /// browser does without a server. The bar's mark is then a button that asks with [`Request::Save`],
+    /// and so do the palette and Ctrl or Cmd with S.
+    Edited,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Panel {
     Styles,
     Notes,
-    History,
 }
 
 impl Panel {
-    const ALL: [(Panel, Icon); 3] =
-        [(Panel::Styles, icon::PALETTE), (Panel::Notes, icon::MESSAGE_SQUARE), (Panel::History, icon::HISTORY)];
+    const ALL: [(Panel, Icon); 2] = [(Panel::Styles, icon::PALETTE), (Panel::Notes, icon::MESSAGE_SQUARE)];
 
     fn title(self) -> &'static str {
         match self {
             Panel::Styles => "Styles",
             Panel::Notes => "Notes",
-            Panel::History => "History",
         }
     }
 }
@@ -197,6 +204,8 @@ pub enum Message {
     Settings(Setting),
     /// What the menu on a linked picture's cloud asks for.
     Linked(Linking),
+    /// Puts the menu of the caret's column or row away.
+    TableMenu,
     /// What the field of a picture's alt text asks for.
     Alt(Altering),
     /// What the tools over a selection and the field of a comment ask for.
@@ -207,6 +216,10 @@ pub enum Message {
     Commands(Commanding),
     /// What is asked of Print view.
     Print(Printing),
+    /// What is asked of the history.
+    History(Historying),
+    /// What is asked about the conflicts that wait, and about the one that is open.
+    Review(Reviewing),
 }
 
 impl Ui<EditorApp> {
@@ -218,6 +231,13 @@ impl Ui<EditorApp> {
 
     pub fn editor(&self) -> &Editor {
         &self.app().editor
+    }
+
+    /// Says how far the person's clock is ahead of UTC, in minutes: the history tells its days and times
+    /// by it, and by UTC until a shell says. One figure serves every date, so a time from the other side
+    /// of a change to summer time reads an hour off.
+    pub fn set_utc_offset(&mut self, minutes: i32) {
+        self.app_mut().zone = minutes;
     }
 
     /// Names who writes in this window. Edits made from here on carry the name.
@@ -406,6 +426,10 @@ impl Ui<EditorApp> {
         let app = self.app_mut();
         let labels = app.shaper.add_fonts(&fonts);
         app.said.again();
+        app.review.add_fonts(&fonts);
+        if let Some(history) = &mut app.history {
+            history.add_fonts(&fonts);
+        }
         if app.held(|app| app.layout.add_fonts(&fonts)) {
             // Blocks set again keep their heights as estimates until idle time settles them.
             app.estimated = true;
@@ -536,8 +560,8 @@ impl Ui<EditorApp> {
     /// page, they land where the selection is, as pictures chosen in a dialog do (see
     /// [`Request::Pictures`]). What is no picture Letters can show is left out.
     pub fn insert_pictures(&mut self, pictures: Vec<Picture>, at: Option<Point>, platform: &mut dyn Platform) {
-        // Nothing is written in Print view.
-        if self.app().printing.is_some() {
+        // Nothing is written in Print view, nor on an earlier version.
+        if self.app().away() {
             return;
         }
         let at = at.and_then(|at| self.on_canvas(at)).and_then(|at| self.app().spot(at)).map(|(spot, _)| spot);
@@ -551,11 +575,12 @@ impl Ui<EditorApp> {
     /// screen. `None` for an end the page does not show, and for both without a selection.
     pub fn selection_ends(&self) -> [Option<Rect>; 2] {
         let app = self.app();
-        let editing = self.canvas().filter(|_| app.printing.is_none());
+        let editing = self.canvas().filter(|_| !app.away());
         let Some((page, selection)) = editing.zip(app.editor.selection()) else { return [None, None] };
         let end = |pos: &Pos| {
             let caret = app.layout.caret(pos)?;
-            let (x, y) = (page.x + app.column.0 + caret.x, page.y + TOP - app.scrolled() + caret.y);
+            let at = app.onto(caret);
+            let (x, y) = (page.x + at.x, page.y + at.y);
             let shown = y + caret.height > page.y && y < page.y + page.height;
             shown.then_some(Rect { x, y, ..caret })
         };
@@ -566,11 +591,19 @@ impl Ui<EditorApp> {
     /// touch screen. Returns whether the page had text to select there. A point on anything that lies over
     /// the page selects nothing.
     pub fn select_word_at(&mut self, at: Point, platform: &mut dyn Platform) -> bool {
-        let Some(head) = self.on_canvas(at).and_then(|at| self.app().hit(at)) else { return false };
+        // The version a conflict holds back is read, not selected.
+        let on_page = self.on_canvas(at).filter(|at| !self.app().review.covers(*at));
+        let Some(head) = on_page.and_then(|at| self.app().hit(at)) else { return false };
         let app = self.app_mut();
         app.editor.select(Selection::caret(head));
         app.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform));
         true
+    }
+
+    /// The document and its style as they read at a revision of the history, for the shell that writes
+    /// the copy a [`Request::SaveVersion`] asks for. `None` for a revision the history does not hold.
+    pub fn document_at(&mut self, revision: &Revision) -> Option<(Document, Style)> {
+        self.app_mut().editor.document_at(revision).ok()
     }
 
     /// Runs something on the editor from outside, such as taking in another writer's edits, and brings the
@@ -667,7 +700,8 @@ pub struct EditorApp {
     dialog: Dialog,
     /// The text column's left edge inside the page area, and its width.
     column: (f32, f32),
-    /// The height of the page area.
+    /// The width and the height of the page area.
+    across: f32,
     height: f32,
     /// How far down the page was scrolled, which may be part of a pixel. See `scrolled`.
     scroll: f32,
@@ -692,6 +726,8 @@ pub struct EditorApp {
     grip: Grip,
     captions: Captions,
     margin: Margin,
+    /// The conflict whose two versions show in the page.
+    review: Review,
     /// What the note that is open says, set to be drawn.
     said: Said,
     /// What the bar says of a write that was just done, as where the document was first saved, and since
@@ -738,9 +774,14 @@ pub struct EditorApp {
     commands: Commands,
     /// Print view, while it shows in place of the page.
     printing: Option<Print>,
+    /// The history, while one of the document's versions shows in place of the page.
+    history: Option<History>,
+    /// How far the person's clock is ahead of UTC, in minutes.
+    zone: i32,
     refer: Refer,
     references: References,
     code_copy: CodeCopy,
+    tables: Tables,
     /// The preview of a figure that shows over the page: its caption, and where it is in the page area.
     previewed: Option<(String, Rect)>,
     /// How the document read when assistive technology was last told of it.
@@ -762,6 +803,7 @@ impl EditorApp {
             settings: Settings::default(),
             dialog: Dialog::default(),
             column: (0.0, 0.0),
+            across: 0.0,
             height: 0.0,
             scroll: 0.0,
             scale: 1.0,
@@ -778,6 +820,7 @@ impl EditorApp {
             grip: Grip::default(),
             captions: Captions::default(),
             margin: Margin::default(),
+            review: Review::default(),
             said: Said::default(),
             note: None,
             naming: false,
@@ -806,9 +849,12 @@ impl EditorApp {
             insert: Insert::default(),
             commands: Commands::default(),
             printing: None,
+            history: None,
+            zone: 0,
             refer: Refer::default(),
             references: References::default(),
             code_copy: CodeCopy::default(),
+            tables: Tables::default(),
             previewed: None,
             told: RefCell::default(),
         }
@@ -861,7 +907,9 @@ impl EditorApp {
                 && self.landing.is_none()
                 && self.importing.is_none()
             {
-                self.copying = Some(Copy::open(format, &self.location, &title));
+                // While the history shows an earlier version, the copy is of that.
+                let version = self.history.as_ref().and_then(History::copied);
+                self.copying = Some(Copy::open(format, &self.location, &title, version));
             }
             return;
         };
@@ -989,14 +1037,127 @@ impl EditorApp {
     fn linked_at(&self, at: Point) -> Option<(BlockId, bool)> {
         let figure = self.hit(at).filter(|_| !self.hung())?.block;
         self.link_of(&figure)?;
-        let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        let at = self.in_layout(at);
         let place = self.layout.figure(&figure).filter(|place| place.image.contains(at))?;
         Some((figure, place.badge.is_some_and(|badge| pictures::pressed(badge, at))))
     }
 
+    /// The page as the conflict that is open splits it, counted from the top of what scrolls. `None`
+    /// while the page shows whole.
+    fn cut(&self) -> Option<Split> {
+        self.review.split(&self.layout, self.across)
+    }
+
+    /// Where the page area shows the top left of what a split counts from. A split stands the page's
+    /// column in the very middle, and the page area on a whole pixel beside that.
+    fn shift(&self) -> Point {
+        let middle = ((self.across - self.column.1) / 2.0).max(0.0);
+        Point { x: self.column.0 - middle, y: TOP - self.scrolled() }
+    }
+
+    /// Where the page area shows the top left of the layout's column, for what is `y` down the column.
+    /// It is one place for the whole page, until a conflict that is open splits it.
+    fn origin(&self, y: f32) -> Point {
+        match self.cut() {
+            None => Point { x: self.column.0, y: TOP - self.scrolled() },
+            Some(cut) => {
+                let (part, shift) = (review::origin(&cut, y), self.shift());
+                Point { x: part.x + shift.x, y: part.y + shift.y }
+            }
+        }
+    }
+
+    /// Something of the layout where the page area shows it.
+    fn onto(&self, rect: Rect) -> Rect {
+        let origin = self.origin(rect.y);
+        Rect { x: rect.x + origin.x, y: rect.y + origin.y, ..rect }
+    }
+
     /// A point of the page area as the layout counts it.
     fn in_layout(&self, at: Point) -> Point {
-        Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP }
+        match self.cut() {
+            None => Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP },
+            Some(cut) => {
+                let shift = self.shift();
+                review::within(&cut, Point { x: at.x - shift.x, y: at.y - shift.y })
+            }
+        }
+    }
+
+    /// How far down what scrolls something `y` down the layout's column shows.
+    fn down(&self, y: f32) -> f32 {
+        self.cut().map_or(y, |cut| y + review::origin(&cut, y).y)
+    }
+
+    /// The height of what scrolls, without the room over and under it.
+    fn tall(&self) -> f32 {
+        self.cut().map_or_else(|| self.layout.height(), |cut| cut.height)
+    }
+
+    /// Brings what is kept of the open conflict up to date with the notes, the document and the page.
+    fn sync(&mut self) {
+        // Before the page was first shown there is no width to lay a version out at.
+        let open = self.margin.reviewing().filter(|_| self.column.1 > 0.0);
+        let made = (self.column.1, self.editor.model().style(), self.palette);
+        self.review.follow(open, self.editor.doc(), self.editor.selection(), made);
+    }
+
+    /// Does what is asked about the conflicts: steps through them, puts the open one away, has its two
+    /// versions trade places, or settles it with the one on the page. The page keeps its place while the
+    /// block's other version comes or goes.
+    fn reviewing(&mut self, asked: Reviewing, platform: &mut dyn Platform) {
+        match asked {
+            Reviewing::Step { back } => {
+                let Some(next) = self.margin.step(back) else { return };
+                return self.noting(Noting::Open(next), platform);
+            }
+            Reviewing::Close => self.held(|app| {
+                app.margin.shut();
+                app.sync();
+            }),
+            Reviewing::Keep => self.held(|app| {
+                // A choice is kept with the document, as a note that is resolved is.
+                app.edits += u64::from(app.margin.settle());
+                app.sync();
+            }),
+            Reviewing::Use => {
+                let held = self.review.held_back().filter(|_| self.margin.refused.is_none());
+                let Some((block, version)) = held else { return };
+                // A version that took the block out leaves nothing to write on: using it settles.
+                let settles = version.is_none();
+                let command = Command::UseVersion { block, version };
+                if !self.editor.applies(&command) {
+                    return;
+                }
+                self.held(|app| {
+                    if settles {
+                        app.edits += u64::from(app.margin.settle());
+                    }
+                    // The review takes what the page read as the version held back, once the page reads
+                    // as the one that was.
+                    let change = app.run(platform, |editor, platform| editor.run(command, platform));
+                    app.follow(&change);
+                    app.sync();
+                });
+            }
+        }
+        self.margin.remark(self.editor.doc());
+        self.sync();
+    }
+
+    /// Brings the two versions of the conflict that is open into view: a quarter of the way down the page
+    /// area, unless they show whole where they are.
+    fn show_review(&mut self) {
+        // Twice, since laying out what comes into view can move the block.
+        for _ in 0..2 {
+            let Some((top, bottom)) = self.cut().as_ref().and_then(review::pair) else { return };
+            let from = self.scroll - TOP;
+            if top >= from && bottom <= from + self.height {
+                break;
+            }
+            self.scroll = (top + TOP - self.height / 4.0).clamp(0.0, self.max_scroll());
+            self.layout.settle(self.viewport(), 0);
+        }
     }
 
     /// The gallery a picture is one of.
@@ -1124,6 +1285,12 @@ impl EditorApp {
             self.margin.put_away(self.editor.selection());
         }
         self.margin.remark(self.editor.doc());
+        // A conflict is not read under its passage: the page shows both of its versions.
+        let reviewed = self.review.note().map(str::to_owned);
+        self.held(Self::sync);
+        if opens && self.review.note().is_some_and(|open| Some(open) != reviewed.as_deref()) {
+            self.show_review();
+        }
     }
 
     /// The first and the last line of the passage a note is about, in the layout's coordinates: of its
@@ -1158,7 +1325,7 @@ impl EditorApp {
                 break;
             }
             // A quarter of the way down, the note has the rest of the page to hang in.
-            self.scroll = (top + TOP - self.height / 4.0).clamp(0.0, self.max_scroll());
+            self.scroll = (self.down(top) + TOP - self.height / 4.0).clamp(0.0, self.max_scroll());
             self.layout.settle(self.viewport(), 0);
         }
     }
@@ -1191,7 +1358,10 @@ impl EditorApp {
             let line = self.marked_line(marker, view)?;
             Some((marker, threads::place(marker, line, column, room, self.shaper.as_ref())))
         };
-        self.margin.marks().iter().filter_map(placed).collect()
+        // The block of the conflict that is open has the two versions where its marker would stand.
+        let open = self.review.note();
+        let stands = |marker: &&threads::Marker| !open.is_some_and(|open| marker.notes.iter().any(|note| note == open));
+        self.margin.marks().iter().filter(stands).filter_map(placed).collect()
     }
 
     /// The block whose marker is at a point of the layout.
@@ -1201,8 +1371,8 @@ impl EditorApp {
     }
 
     /// The tools over a selected stretch of text, once it is selected: over its first line, or under its
-    /// last when there is no room above. `origin` is where the layout's origin is in the page area.
-    fn selection_tools(&self, origin: Point, viewport: Rect) -> Option<Popover<Message>> {
+    /// last when there is no room above.
+    fn selection_tools(&self, viewport: Rect) -> Option<Popover<Message>> {
         let selection = self.editor.selection().filter(|selection| !selection.is_caret())?;
         if self.dragging || !self.margin.offers() || self.commands.open() {
             return None;
@@ -1210,10 +1380,9 @@ impl EditorApp {
         notes::passage(self.editor.doc(), selection)?;
         let lines = self.layout.selection_in(selection, viewport);
         let (first, last) = (lines.first()?, lines.last()?);
-        let above = origin.y + first.y >= notes::TOOLS_ROOM;
+        let above = self.onto(*first).y >= notes::TOOLS_ROOM;
         let from = if above { first } else { last };
-        let spot = Rect { x: origin.x + from.x, y: origin.y + from.y, ..*from };
-        Some(Margin::tools(self.editor.link().is_some(), above).at(spot))
+        Some(Margin::tools(self.editor.link().is_some(), above).at(self.onto(*from)))
     }
 
     /// Does what the field of a picture's alt text asked.
@@ -1390,6 +1559,8 @@ impl EditorApp {
             Act::NewDocument => Message::NewDocument,
             Act::Open => Message::OpenDialog,
             Act::Rename => Message::Rename(Rename::Open),
+            // Only where the shell keeps the document when asked, and has something to keep.
+            Act::Save => (self.save == SaveState::Edited).then_some(Message::Ask(Request::Save))?,
             Act::SaveCopy => Message::Copy(Copying::Open(CopyFormat::Letters)),
             Act::Export => Message::Copy(Copying::Open(CopyFormat::Pdf)),
             Act::Share => Message::Share(true),
@@ -1399,6 +1570,17 @@ impl EditorApp {
             Act::TrustFolder => self.safe.folder().then_some(Message::Safe(Safely::TrustFolder))?,
             // A card over the window is answered first: there is no document to act on behind it.
             Act::Print => (!self.carded()).then_some(Message::Print(Printing::Show))?,
+            Act::History => (!self.carded()).then_some(Message::History(Historying::Show))?,
+            Act::Review(asked) => {
+                let (open, can) = (self.margin.reviewing().is_some(), self.margin.refused.is_none());
+                let fits = match asked {
+                    // With one conflict that is open already there is nowhere to step to.
+                    Reviewing::Step { .. } => self.margin.conflicts().len() > usize::from(open),
+                    Reviewing::Keep | Reviewing::Use => open && can,
+                    Reviewing::Close => open,
+                };
+                fits.then(|| Message::Review(asked.clone()))?
+            }
             Act::Palette => (!self.carded()).then_some(Message::Commands(Commanding::Toggle))?,
         };
         Some(message)
@@ -1413,13 +1595,154 @@ impl EditorApp {
     fn uncover(&mut self) {
         if self.carded() {
             self.printing = None;
+            self.leave();
         }
+    }
+
+    /// Whether a view has the page's place: Print view, or the history.
+    fn away(&self) -> bool {
+        self.printing.is_some() || self.history.is_some()
+    }
+
+    /// Does what is asked of the history.
+    fn historying(&mut self, asked: Historying, platform: &mut dyn Platform) {
+        match asked {
+            Historying::Show if self.away() || self.carded() => {}
+            Historying::Show => {
+                // What hangs from the page waits there for the way back. What lies over the window goes.
+                self.commands.close();
+                self.sharing = false;
+                if self.grip.release() {
+                    self.drop = None;
+                }
+                self.dragging = false;
+                self.unpoint();
+                let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
+                let mut history = History::new(&steps, current, platform.wall_time(), self.zone);
+                history.still = self.reduced_motion;
+                self.history = Some(history);
+                // The nodes that stand for the blocks go with the page, and are told whole when it is back.
+                self.told.get_mut().forget();
+                self.turn();
+            }
+            Historying::Back => {
+                self.take_name();
+                self.leave();
+            }
+            Historying::Pick(at) => {
+                self.take_name();
+                self.history.iter_mut().for_each(|history| history.pick(at));
+                self.turn();
+            }
+            Historying::Step { back } => {
+                self.history.iter_mut().for_each(|history| history.step(back));
+                self.turn();
+            }
+            Historying::Scrub(across) => {
+                self.take_name();
+                let Some(history) = &mut self.history else { return };
+                // A drag sends many points for each version it passes.
+                let at = history.across(across);
+                if at != history.at() {
+                    history.pick(at);
+                    self.turn();
+                }
+            }
+            Historying::Name(Naming::Apply) => self.take_name(),
+            Historying::Name(asked) => self.history.iter_mut().for_each(|history| history.name(asked.clone())),
+            Historying::Scroll(delta) => self.history.iter_mut().for_each(|history| history.scroll(delta)),
+            Historying::Down(at) => self.history.iter_mut().for_each(|history| history.press(at)),
+            Historying::Up(at) => self.history.iter_mut().for_each(|history| history.release(at)),
+            Historying::Compare(with) => {
+                self.take_name();
+                self.history.iter_mut().for_each(|history| history.compare(with));
+                self.turn();
+            }
+            Historying::Restore => {
+                self.take_name();
+                let Some(revision) = self.history.as_ref().map(|history| history.picked().at.clone()) else { return };
+                // The document reads as the version again, and is there to be written on.
+                self.leave();
+                self.edit(platform, |editor, platform| editor.run(Command::Restore(revision), platform));
+            }
+        }
+    }
+
+    /// Gives the picked version the name that was typed for it, when one was. A name is a mark in the
+    /// history: something to save, though no edit and nothing that undo takes back.
+    fn take_name(&mut self) {
+        let Some((revision, name)) = self.history.as_mut().and_then(History::named) else { return };
+        if self.editor.name_version(&revision, name.as_deref()).is_ok() {
+            self.edits += 1;
+            let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
+            self.history.iter_mut().for_each(|history| history.follow(&steps, current.clone()));
+            self.turn();
+        }
+    }
+
+    /// Reads what the history is to show and has not read: the version it has picked, and the one that
+    /// is compared with.
+    fn turn(&mut self) {
+        let Some(history) = &mut self.history else { return };
+        for revision in history.wanted() {
+            if let Ok(read) = self.editor.document_at(&revision) {
+                history.take(revision, read);
+            }
+        }
+        history.show();
+    }
+
+    /// Gives the page its place back from the history.
+    fn leave(&mut self) {
+        if self.history.take().is_some() {
+            // The nodes that stood for a version's blocks are not the page's.
+            self.told.get_mut().forget();
+            // A card that asks for a copy of a version has that version nowhere to be seen.
+            self.copying.take_if(|copy| copy.earlier());
+        }
+    }
+
+    /// The version the history has picked, for the area the page has while it is edited.
+    fn version(&mut self, room: Size) -> Element<Message> {
+        let Some(history) = self.history.as_mut() else { return Element::row() };
+        let shaper = self.shaper.as_ref();
+        let (version, awaited) = history.view(room, &self.images, shaper, self.palette, self.scheme, self.scale);
+        for asset in awaited {
+            if self.wanted.insert(asset.clone()) {
+                self.requests.push(Request::Asset(asset));
+            }
+        }
+        match &self.copying {
+            Some(copy) => version.popover(copy.card(&self.location, room)),
+            None => version,
+        }
+    }
+
+    /// What a key does while the history shows: it steps through the versions, moves through the one
+    /// that shows, or goes back to editing. Nothing is written there.
+    fn history_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
+        // Saving where it is asked for writes nothing on the document, and is asked from here as well. So
+        // is a copy, which is of the version that shows.
+        let kept = commands::bound(event).filter(|act| matches!(act, Act::Save | Act::SaveCopy));
+        if let Some(asked) = kept.and_then(|act| self.asked(act)) {
+            self.update(asked, platform);
+            return true;
+        }
+        let plain = !event.mods.primary && !event.mods.alt;
+        let asked = match event.key {
+            Key::Escape => Historying::Back,
+            Key::Left if plain => Historying::Step { back: true },
+            Key::Right if plain => Historying::Step { back: false },
+            _ => return self.history.as_mut().is_some_and(|history| history.key(event)),
+        };
+        self.historying(asked, platform);
+        true
     }
 
     /// Does what is asked of Print view.
     fn print(&mut self, asked: Printing, platform: &mut dyn Platform) {
         match asked {
-            Printing::Show if self.printing.is_some() || self.carded() => {}
+            Printing::Show if self.away() || self.carded() => {}
             Printing::Show => {
                 // What hangs from the page waits there for the way back. What lies over the window goes.
                 self.commands.close();
@@ -1504,7 +1827,7 @@ impl EditorApp {
         }
         let asked = match commands::bound(event) {
             Some(Act::Print) => Some(Message::Print(Printing::Print)),
-            Some(act @ (Act::Settings | Act::SaveCopy)) => self.asked(act),
+            Some(act @ (Act::Settings | Act::Save | Act::SaveCopy)) => self.asked(act),
             _ => None,
         };
         let bound = asked.is_some();
@@ -1684,18 +2007,25 @@ impl EditorApp {
         }
         if edited || change.style || change.document {
             self.edits += 1;
+            // What came in under the history, as another writer's edits do, is its newest version.
+            if self.history.is_some() {
+                let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
+                self.history.iter_mut().for_each(|history| history.follow(&steps, current.clone()));
+                self.turn();
+            }
         }
         self.mark();
+        self.sync();
     }
 
     /// Does something that may change the height of what is above the view, and keeps the view's top line
     /// where it is.
     fn held<R>(&mut self, act: impl FnOnce(&mut Self) -> R) -> R {
         let pin = self.layout.hit(Point { x: 0.0, y: self.viewport().y.max(0.0) });
-        let top = |layout: &DocLayout| pin.as_ref().and_then(|pos| layout.caret(pos)).map(|caret| caret.y);
-        let before = top(&self.layout);
+        let top = |app: &Self| pin.as_ref().and_then(|pos| app.layout.caret(pos)).map(|caret| app.down(caret.y));
+        let before = top(self);
         let done = act(self);
-        if let (Some(before), Some(after)) = (before, top(&self.layout)) {
+        if let (Some(before), Some(after)) = (before, top(self)) {
             self.scroll_by(after - before);
         }
         done
@@ -1703,11 +2033,15 @@ impl EditorApp {
 
     /// The part of the document in view, in the layout's coordinates.
     fn viewport(&self) -> Rect {
-        Rect::new(0.0, self.scrolled() - TOP, self.column.1, self.height)
+        let top = self.scrolled() - TOP;
+        let Some(cut) = self.cut() else { return Rect::new(0.0, top, self.column.1, self.height) };
+        // Less of the page's own column shows while the version held back takes room of its own.
+        let (y, height) = review::shown(&cut, Rect::new(0.0, top, self.across, self.height));
+        Rect::new(0.0, y, self.column.1, height)
     }
 
     fn max_scroll(&self) -> f32 {
-        (self.layout.height() + 2.0 * TOP - self.height).max(0.0)
+        (self.tall() + 2.0 * TOP - self.height).max(0.0)
     }
 
     /// How far down the page shows: the nearest whole device pixel to where it was scrolled to. A frame that
@@ -1726,7 +2060,8 @@ impl EditorApp {
         let Some(caret) = self.editor.selection().and_then(|selection| self.layout.caret(&selection.head)) else {
             return;
         };
-        let (top, bottom) = (caret.y + TOP, caret.y + caret.height + TOP);
+        let top = self.down(caret.y) + TOP;
+        let bottom = top + caret.height;
         let margin = GUTTER.min(self.height / 4.0);
         if top < self.scroll + margin {
             self.scroll = top - margin;
@@ -1738,10 +2073,10 @@ impl EditorApp {
 
     /// The text position under a point of the page area, while the page shows there.
     fn hit(&self, at: Point) -> Option<Pos> {
-        if self.printing.is_some() {
+        if self.away() {
             return None;
         }
-        self.layout.hit(Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP })
+        self.layout.hit(self.in_layout(at))
     }
 
     /// Whether something hangs over the page and takes what the pointer does there.
@@ -1750,7 +2085,7 @@ impl EditorApp {
         let asked = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
         let asked = asked || self.captions.alt.is_some() || self.margin.writing().is_some();
         let asked = asked || self.margin.reading().is_some();
-        let asked = asked || self.commands.open();
+        let asked = asked || self.commands.open() || self.tables.open.is_some();
         card || asked || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
     }
 
@@ -1760,7 +2095,7 @@ impl EditorApp {
         if self.hung() {
             return None;
         }
-        let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        let at = self.in_layout(at);
         let boxes = self.layout.code_boxes(Rect::new(at.x, at.y, 0.0, 1.0));
         let (block, code) = boxes.into_iter().find(|(_, code)| code.contains(at))?;
         Some((block, code_copy::button(code).contains(at)))
@@ -1778,6 +2113,79 @@ impl EditorApp {
         self.code_copy.copied(block, platform.now_ms());
     }
 
+    /// The cell the caret is in, when it is in one.
+    fn caret_cell(&self) -> Option<&BlockId> {
+        self.editor.cell()?;
+        self.editor.selection().map(|selection| &selection.head.block)
+    }
+
+    /// The table whose handles show: the one a press on them holds, the one the pointer rests over or the
+    /// one the caret is in. None shows while a conflict is open, or something else hangs over the page.
+    fn table(&self) -> Option<tables::Shown> {
+        if let Some(held) = self.tables.held_on() {
+            return Some(held.clone());
+        }
+        let menu = self.tables.open.is_some();
+        let gripped = self.grip.resizing.is_some() || self.grip.moving.is_some();
+        if (self.hung() && !menu) || self.cut().is_some() || gripped {
+            return None;
+        }
+        let pointer = self.references.rest().filter(|_| !menu).map(|at| self.in_layout(at));
+        tables::Shown::find(self.layout.tables(self.viewport()), pointer, self.caret_cell())
+    }
+
+    /// The handle or bar of a table at a point of the page area.
+    fn table_part(&self, at: Point) -> Option<(tables::Shown, tables::Part)> {
+        let shown = self.table().filter(|_| self.tables.open.is_none())?;
+        let part = shown.part_at(self.in_layout(at))?;
+        Some((shown, part))
+    }
+
+    /// Does what a press on a table's handles asked for, at the column or row it was about.
+    fn tabled(&mut self, shown: &tables::Shown, asked: tables::Asked, platform: &mut dyn Platform) {
+        let (axis, index) = match asked {
+            tables::Asked::Menu(axis, index) | tables::Asked::Move { axis, from: index, .. } => (axis, Some(index)),
+            tables::Asked::Add(axis) => (axis, None),
+        };
+        // The commands of a table act where the caret is, so it goes there first.
+        let Some(cell) = shown.cell(axis, index, self.caret_cell()) else { return };
+        if self.caret_cell() != Some(&cell) || !self.editor.selection().is_some_and(Selection::is_caret) {
+            self.editor.select(Selection::caret(Pos::new(cell, 0)));
+            self.mark();
+        }
+        let edit = match (asked, axis) {
+            (tables::Asked::Menu(..), _) => {
+                (self.link, self.spelling.fix, self.captions.alt) = (None, None, None);
+                self.margin.shut();
+                self.tables.open = Some(axis);
+                return self.reveal();
+            }
+            (tables::Asked::Add(_), tables::Axis::Column) => TableEdit::AddColumn { after: true },
+            (tables::Asked::Add(_), tables::Axis::Row) => TableEdit::AddRow { below: true },
+            (tables::Asked::Move { to, .. }, tables::Axis::Column) => TableEdit::MoveColumn { to },
+            (tables::Asked::Move { to, .. }, tables::Axis::Row) => TableEdit::MoveRow { to },
+        };
+        self.edit(platform, |editor, platform| editor.run(Command::Table(edit), platform));
+    }
+
+    /// The menu of the caret's column or row, hung from its handle.
+    fn table_menu(&self) -> Option<Popover<Message>> {
+        let (axis, cell, shown) = (self.tables.open?, self.editor.cell()?, self.table()?);
+        let index = match axis {
+            tables::Axis::Column => cell.column,
+            tables::Axis::Row => cell.row,
+        };
+        let spot = self.onto(shown.rect(tables::Part::Handle(axis, index))?);
+        let aligned = match &self.editor.doc().block(&cell.table)?.kind {
+            BlockKind::Table { columns, .. } => columns.get(cell.column).copied(),
+            _ => None,
+        };
+        // Only the first row can be the header.
+        let header = self.header().filter(|_| cell.row == 0);
+        let menu = tables::menu(axis, |act| self.asked(act), aligned, header);
+        Some(menu.popover().at(spot).open(true).on_close(Message::TableMenu))
+    }
+
     /// Whether the first line a code block shows runs as far as the copy button at `button`, in the layout.
     fn reaches(&self, block: &BlockId, button: Rect) -> bool {
         let end = self.layout.line_edge(&Pos::new(block.clone(), 0), true);
@@ -1790,7 +2198,7 @@ impl EditorApp {
         if self.hung() {
             return None;
         }
-        let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        let at = self.in_layout(at);
         Reference::at(self.editor.doc(), &self.layout, at)
     }
 
@@ -1838,7 +2246,9 @@ impl EditorApp {
         let marker = rest.and_then(|at| self.marker_at(self.in_layout(at)));
         let marked = self.margin.over != marker;
         self.margin.over = marker;
-        self.references.point(found) || copy || clouded || gripped || switched || marked
+        let part = rest.and_then(|at| self.table_part(at)).map(|(_, part)| part);
+        let tabled = self.tables.point(part);
+        self.references.point(found) || copy || clouded || gripped || switched || marked || tabled
     }
 
     /// Forgets where the pointer rests until it next moves, as when the person goes on writing.
@@ -1860,7 +2270,7 @@ impl EditorApp {
                 break;
             }
             let above = ((self.height - (bottom - top)) / 2.0).max(GUTTER.min(self.height / 4.0));
-            self.scroll = (top + TOP - above).clamp(0.0, self.max_scroll());
+            self.scroll = (self.down(top) + TOP - above).clamp(0.0, self.max_scroll());
             self.layout.settle(self.viewport(), 0);
         }
         self.references.flash(figure);
@@ -1868,6 +2278,18 @@ impl EditorApp {
 
     fn pointer(&mut self, event: Pointer, platform: &mut dyn Platform) {
         match event {
+            // What stands round the two versions of a conflict, and the one held back, are not the page's.
+            Pointer::Down { at, .. } if self.review.press(at) => {
+                self.dragging = false;
+                self.references.press(None);
+            }
+            Pointer::Drag { .. } if self.review.pressed() => {}
+            Pointer::Up { at } if self.review.pressed() => {
+                if let Some(asked) = self.review.release(at) {
+                    self.reviewing(asked, platform);
+                }
+            }
+            Pointer::Menu { at } if self.review.covers(at) => {}
             Pointer::Down { at, mods, clicks } => {
                 self.picked = None;
                 self.maths.typed(false);
@@ -1883,6 +2305,12 @@ impl EditorApp {
                 let button = self.copy_button(at);
                 self.code_copy.press(button);
                 if self.code_copy.held() {
+                    self.dragging = false;
+                    return self.references.press(None);
+                }
+                // A press on a handle or a bar of a table is theirs, and so is where the pointer goes with it.
+                if let Some((shown, part)) = self.table_part(at) {
+                    self.tables.press(shown, part, self.in_layout(at));
                     self.dragging = false;
                     return self.references.press(None);
                 }
@@ -1921,13 +2349,13 @@ impl EditorApp {
                 self.references.press(pressed.map(|reference| (reference, at)));
                 // Under the last block there is always a line to write on, also when the document ends in
                 // something that holds the caret in, as a code block does.
-                if at.y + self.scrolled() - TOP > self.layout.height() && !mods.shift {
+                if at.y + self.scrolled() - TOP > self.tall() && !mods.shift {
                     self.dragging = false;
                     return self.edit(platform, |editor, platform| editor.run(Command::LineBelow, platform));
                 }
                 let Some(head) = self.hit(at) else { return };
                 // A press on a picture selects its figure. The caption under it is text like any other.
-                let on_page = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+                let on_page = self.in_layout(at);
                 let figure = self.layout.figure(&head.block).filter(|figure| figure.image.contains(on_page));
                 if let Some(figure) = figure.filter(|_| !mods.shift) {
                     self.editor.select_picture(&head.block);
@@ -1956,6 +2384,12 @@ impl EditorApp {
                     1 => self.reveal(),
                     2 => self.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform)),
                     _ => self.edit(platform, |editor, platform| editor.run(Command::SelectBlock, platform)),
+                }
+            }
+            Pointer::Drag { at } if self.tables.held() => self.tables.drag(self.in_layout(at), DRAG_SLOP),
+            Pointer::Up { at } if self.tables.held() => {
+                if let Some((shown, asked)) = self.tables.release(self.in_layout(at)) {
+                    self.tabled(&shown, asked, platform);
                 }
             }
             Pointer::Drag { at } if self.grip.resizing.is_some() => {
@@ -2035,7 +2469,7 @@ impl EditorApp {
             anchor: Pos::new(pos.block.clone(), range.start),
             head: Pos::new(pos.block.clone(), range.end),
         };
-        let spot = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        let spot = self.in_layout(at);
         let near = |rect: &Rect| {
             (rect.x - 2.0..=rect.x + rect.width + 2.0).contains(&spot.x)
                 && (rect.y..=rect.y + rect.height).contains(&spot.y)
@@ -2159,10 +2593,11 @@ impl EditorApp {
         }
         // A note that was open goes when something else comes to hang from the page.
         let other = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
-        if other || self.captions.alt.is_some() {
+        if (other || self.captions.alt.is_some()) && self.margin.reviewing().is_none() {
             self.margin.shut();
         }
-        (self.column, self.height) = ((left, width), room.height);
+        (self.column, self.across, self.height) = ((left, width), room.width, room.height);
+        self.sync();
         // The line under the picture the selection is at is made ready for its caption, once the button is
         // up: a caption that made room for its switch under a pointer still held would be selected by its
         // next move.
@@ -2182,10 +2617,13 @@ impl EditorApp {
         self.layout.set_margin(left - taken);
         // What is about to show is laid out for real. The rest waits for idle time.
         self.estimated = self.layout.settle(self.viewport(), 0);
+        // The version held back is laid out where it shows, like the page.
+        if let Some(cut) = self.cut() {
+            self.review.settle(&cut, Rect::new(0.0, self.scrolled() - TOP, room.width, room.height));
+        }
         self.scroll = self.scroll.min(self.max_scroll());
 
         let viewport = self.viewport();
-        let origin = Point { x: left, y: TOP - self.scrolled() };
         self.insert.follow(&self.editor);
         let mut list = DisplayList::default();
         let selection = self.editor.selection();
@@ -2197,10 +2635,17 @@ impl EditorApp {
             && self.spelling.fix.is_none()
             && self.link.is_none();
         let formula = selection.filter(|_| alone).and_then(|selection| self.layout.formula_rect(&selection.head));
-        let formula = formula.filter(|rect| (0.0..=room.height).contains(&(origin.y + rect.y + rect.height)));
+        let formula = formula.filter(|rect| {
+            let shown = self.onto(*rect);
+            (0.0..=room.height).contains(&(shown.y + shown.height))
+        });
         let sheet = formula.and_then(|rect| Some((Source::of(&self.editor, self.shaper.as_ref(), self.wide())?, rect)));
         self.maths.follow(sheet.as_ref().map(|(source, _)| source), self.reduced_motion);
         self.margin.follow(selection);
+        // The words in which the page's version of a block differs from the one held back.
+        for words in self.review.words() {
+            review::mark(&self.layout.selection_in(words, viewport), Version::Second, self.scheme, &mut list);
+        }
         for (passage, open) in self.margin.commented() {
             notes::mark(&self.layout.selection_in(&passage, viewport), open, self.scheme, &mut list);
         }
@@ -2236,6 +2681,11 @@ impl EditorApp {
             let button = code_copy::button(code);
             let behind = self.reaches(&block, button).then_some([self.palette.page, self.palette.code]);
             self.code_copy.paint(&block, button, behind, self.scheme, &mut list);
+        }
+
+        // The table the pointer is over or the caret is in has its handles round it.
+        if let Some(shown) = self.table() {
+            self.tables.paint(&shown, self.accent.base, self.scheme, &mut list);
         }
 
         // Beside each block with open notes is their marker, in the margin.
@@ -2292,22 +2742,38 @@ impl EditorApp {
             Some(((figure, _), None)) => references::mark(figure, self.scheme, &mut list),
             None => {}
         }
-        let mut over = DisplayList::default();
-        self.previewed = self.preview(origin, room, &mut over);
+        // What stands round the two versions of the conflict that is open, and the one held back.
+        let (mut under, mut over) = (DisplayList::default(), DisplayList::default());
+        let (cut, shift) = (self.cut(), self.shift());
+        let cuts = cut.as_ref().map_or_else(Vec::new, |cut| {
+            let shown = Shown {
+                shift,
+                room,
+                now: &self.margin.now,
+                choosing: self.margin.refused.is_none(),
+                page: self.palette.page,
+                scheme: self.scheme,
+                shaper: self.shaper.as_ref(),
+            };
+            self.review.paint(cut, &shown, &mut under, &mut over);
+            review::cuts(cut, shift, room)
+        });
+        self.previewed = self.preview(room, &mut over);
         if let Some((at, image)) = carried {
             self.carry(image, at, &mut over);
         }
 
         let written = sheet.is_none() && self.editor.picture().is_none();
         let caret = selection.filter(|_| written).and_then(|selection| self.layout.caret(&selection.head));
-        let caret =
-            caret.map(|caret| Rect { x: origin.x + caret.x, y: origin.y + caret.y, width: CARET_WIDTH, ..caret });
+        let caret = caret.map(|caret| Rect { width: CARET_WIDTH, ..self.onto(caret) });
         let paint = PagePaint {
             list,
+            under,
             over,
-            origin,
+            origin: Point { x: left, y: TOP - self.scrolled() },
+            cuts,
             page: self.palette.page,
-            content: self.layout.height() + 2.0 * TOP,
+            content: self.tall() + 2.0 * TOP,
             scroll: self.scrolled(),
         };
         let mut element = Element::canvas(Rc::new(paint))
@@ -2334,18 +2800,19 @@ impl EditorApp {
                 let corner = Rect::new(place.image.x + place.image.width, place.image.y, 0.0, 0.0);
                 place.badge.map_or(corner, pictures::chip)
             });
-            let spot = Rect { x: origin.x + from.x, y: origin.y + from.y, ..from };
+            let spot = self.onto(from);
             let (loaded, said) = (self.images.get(src).is_some(), self.linked.said(src));
             let menu = pictures::menu(src, loaded, said, self.linked.vouched(src), self.safe.on());
             let menu = menu.popover().at(spot).align(Align::End);
             element = element.popover(menu.open(true).on_close(Message::Linked(Linking::Close)));
+        } else if let Some(menu) = self.table_menu() {
+            element = element.popover(menu);
         } else if let Some(((_, text), (_, line, switch))) = self.captions.alt.as_ref().zip(self.alt_switch()) {
-            let onto = |rect: Rect| Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect };
-            element = element.popover(captions::sheet(text, onto(line), onto(switch)));
+            element = element.popover(captions::sheet(text, self.onto(line), self.onto(switch)));
         } else if let Some(fix) = &self.spelling.fix {
             // The menu hangs from the start of its word.
             let start = self.layout.caret(&Pos::new(fix.block.clone(), fix.range.start)).unwrap_or_default();
-            let spot = Rect { x: origin.x + start.x, y: origin.y + start.y, ..start };
+            let spot = self.onto(start);
             let menu = Self::fixes(fix).popover().at(spot).open(true).on_close(Message::Unfix);
             element = element.popover(menu);
         } else if let Some(address) = &self.link {
@@ -2370,8 +2837,7 @@ impl EditorApp {
         } else if let Some((note, reply)) = self.margin.reading() {
             // The note hangs under the last line of its passage. One whose text is gone hangs from the
             // top of the margin its marker stood in.
-            let under =
-                self.note_lines(note).map(|(_, last)| Rect { x: origin.x + last.x, y: origin.y + last.y, ..last });
+            let under = self.note_lines(note).map(|(_, last)| self.onto(last));
             let said = self.said.of(note, threads::SAID, self.palette);
             let thread = threads::thread(note, reply, said, &self.margin.now, self.margin.refused.as_deref());
             element = element.popover(match under {
@@ -2382,28 +2848,29 @@ impl EditorApp {
             // The field hangs under the last line of the passage the comment is about.
             let lines = notes::stretch(passage).map(|passage| self.layout.selection(&passage)).unwrap_or_default();
             let under = lines.last().copied().unwrap_or_default();
-            element = element.popover(field.at(Rect { x: origin.x + under.x, y: origin.y + under.y, ..under }));
+            element = element.popover(field.at(self.onto(under)));
         } else if let Some((line, _, offers)) = self.insert.offers(&self.editor) {
             // The menu hangs from the slash that opened it.
             let slash = self.layout.caret(&Pos::new(line, 0)).unwrap_or_default();
-            let spot = Rect { x: origin.x + slash.x, y: origin.y + slash.y, ..slash };
+            let spot = self.onto(slash);
             element = element.popover(self.insert.menu(&offers).at(spot));
         } else if let Some((typed, figures)) = Refer::offers(&self.editor) {
             // The list hangs from the start of the words typed for the reference.
             let start = self.layout.caret(&Pos::new(typed.block.clone(), typed.range.start)).unwrap_or_default();
-            let spot = Rect { x: origin.x + start.x, y: origin.y + start.y, ..start };
+            let spot = self.onto(start);
             element = element.popover(self.refer.list(&self.editor, &typed, &figures).at(spot));
         } else if let Some(((source, rect), selection)) = sheet.zip(selection) {
-            let spot = Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect };
+            let spot = self.onto(rect);
             element =
                 element.popover(self.maths.sheet(source, selection, rect.width, self.wide(), self.scheme).at(spot));
-        } else if let Some(tools) = self.selection_tools(origin, viewport) {
+        } else if let Some(tools) = self.selection_tools(viewport) {
             element = element.popover(tools);
         }
         // A press on a reference follows it, one on a copy button copies and one on a cloud opens its menu,
         // which the pointer's shape says.
         let pressable = self.references.pointed().is_some() || self.code_copy.pointed() || self.linked.on_cloud();
-        let pressable = pressable || self.captions.over || self.margin.over.is_some();
+        let pressable = pressable || self.captions.over || self.margin.over.is_some() || self.review.pressable();
+        let pressable = pressable || self.tables.pointed();
         match self.grip.corner() {
             Some(corner) => element.cursor(Cursor::Resize(figures::edge(corner))),
             None if pressable => element.cursor(Cursor::Pointer),
@@ -2411,17 +2878,16 @@ impl EditorApp {
         }
     }
 
-    /// Draws the figure of the reference under the pointer small beside it, when it is out of view. `origin`
-    /// is where the layout's origin is in the page area, and `room` the size of that area. Returns what the
-    /// preview says and where it is.
-    fn preview(&self, origin: Point, room: Size, out: &mut DisplayList) -> Option<(String, Rect)> {
+    /// Draws the figure of the reference under the pointer small beside it, when it is out of view. `room`
+    /// is the size of the page area. Returns what the preview says and where it is.
+    fn preview(&self, room: Size, out: &mut DisplayList) -> Option<(String, Rect)> {
         let reference = self.references.previewed()?;
         let rest = self.references.rest()?;
         let picture = self.layout.figure(&reference.target)?.image;
         let caption = references::caption(self.editor.doc(), self.editor.model().style(), &reference.target)?;
         // The preview hangs from the line of the label that the pointer is on.
         let lines = reference.lines(&self.layout);
-        let on_page = |line: &Rect| Rect { x: line.x + origin.x, y: line.y + origin.y, ..*line };
+        let on_page = |line: &Rect| self.onto(*line);
         let anchor = lines.iter().map(on_page).find(|line| line.contains(rest)).or(lines.first().map(on_page))?;
         let page = self.palette.page;
         let preview = Preview { layout: &self.layout, picture, page, caption: &caption, anchor, room };
@@ -2448,11 +2914,11 @@ impl EditorApp {
     /// layout's coordinates: beside a picture from its left or right quarter, and otherwise on a line of
     /// their own, above or below the block there.
     fn spot(&self, at: Point) -> Option<(Spot, Option<Rect>)> {
-        // Sheets take no pictures: the page does, where it is edited.
-        if self.printing.is_some() {
+        // Sheets take no pictures, nor does an earlier version: the page does, where it is edited.
+        if self.away() {
             return None;
         }
-        let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        let at = self.in_layout(at);
         let block = self.layout.hit(at)?.block;
         let (thick, gap) = BAR;
         let picture = self.layout.figure(&block).map(|figure| figure.image).filter(|image| image.contains(at));
@@ -2476,7 +2942,7 @@ impl EditorApp {
     /// The heading the top of the view is under.
     fn section(&self) -> Option<&BlockId> {
         // A heading brought to the top sits just under the page's top margin.
-        let top = self.layout.hit(Point { x: 0.0, y: self.scrolled() + CHAPTER_PITCH.0 })?;
+        let top = self.layout.hit(self.in_layout(Point { x: self.column.0, y: TOP + CHAPTER_PITCH.0 }))?;
         let mut section = None;
         for block in self.editor.doc().walk() {
             if matches!(block.kind, BlockKind::Heading { .. }) {
@@ -2569,13 +3035,18 @@ impl EditorApp {
             bar = bar.before(buttons).before(TopBar::rule());
         }
         // A view that takes the page's place keeps the window's controls and has the rest of the bar.
-        bar = match &self.printing {
-            Some(print) => {
+        bar = match (&self.printing, &self.history) {
+            (Some(print), _) => {
                 let page = &self.editor.model().style().page;
                 let told = self.note.as_ref().map(|(note, _)| note.as_str());
                 print.bar(bar, &self.name().0, told, &styles::paper_name(page), || self.styles.setup(page))
             }
-            None => self.editing(bar),
+            (None, Some(history)) => {
+                let told = self.note.as_ref().map(|(note, _)| note.as_str());
+                let keys = commands::shortcut(&Act::SaveCopy, self.editor.keymap(), self.mac).unwrap_or_default();
+                history.bar(bar, &self.name().0, told, &keys)
+            }
+            (None, None) => self.editing(bar),
         };
         if let Some(buttons) = chrome.buttons().filter(|_| !chrome.buttons_at_start) {
             bar = bar.end(TopBar::rule()).end(buttons);
@@ -2648,6 +3119,8 @@ impl EditorApp {
             let button = tool(icon, panel.title()).pressed(self.panel == Some(panel));
             panels = panels.child(button.on_press(Message::Panel(panel)));
         }
+        // The history is no panel: it takes the page's place, and lists the versions beside it.
+        panels = panels.child(tool(icon::HISTORY, "History").on_press(Message::History(Historying::Show)));
         bar.end(panels.child(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End))))
     }
 
@@ -2690,6 +3163,17 @@ impl EditorApp {
             }
             SaveState::Unsaved => {
                 lead.push(Element::row().width(SAVE_ICON).decorative());
+                return lead;
+            }
+            // What is not kept yet is kept by a press on the mark, which takes no more room for it.
+            SaveState::Edited => {
+                let save = Element::icon(icon::SAVE, SAVE_ICON)
+                    .role(Role::Button)
+                    .label("Save")
+                    .description("Changes are not saved yet")
+                    .tooltip("Save. Changes are not saved yet", Side::Bottom)
+                    .on_press(Message::Ask(Request::Save));
+                lead.push(save);
                 return lead;
             }
         };
@@ -2926,7 +3410,6 @@ impl EditorApp {
         let body = match panel {
             Panel::Styles => self.styles.view(self.editor.model().style(), self.element(), &self.palette),
             Panel::Notes => threads::listed(&self.margin, self.editor.doc()).unwrap_or_else(|| empty("No open notes.")),
-            Panel::History => empty("No earlier versions yet."),
         };
         SidePanel::new(panel.title()).on_close(Message::ClosePanel).child(body).into()
     }
@@ -3186,15 +3669,31 @@ impl App for EditorApp {
         let border = self.chrome.border();
         let window = Size { width: window.width - 2.0 * border, height: window.height - 2.0 * border };
         self.refold(window.width);
-        // Print view has the window to itself: the panels and the outline are for editing.
-        let printing = self.printing.is_some();
-        let panel = self.panel.filter(|_| !printing).map(|panel| self.side(panel));
+        // Print view has the window to itself: the panels and the outline are for editing. The history
+        // has its versions listed where a panel would be.
+        let (printing, away) = (self.printing.is_some(), self.away());
+        let panel = match &self.history {
+            Some(history) => Some(history.panel()),
+            None => self.panel.filter(|_| !away).map(|panel| self.side(panel)),
+        };
         let room = window.width - if panel.is_some() { side_panel::WIDTH } else { 0.0 };
+        // While conflicts wait, a bar over the page counts them and steps through them.
+        let waiting = self.margin.conflicts();
+        let open = self.margin.reviewing().and_then(|open| waiting.iter().position(|id| *id == open.id));
+        let conflicts = (!waiting.is_empty() && !away).then(|| review::bar(waiting.len(), open));
+        let told = if conflicts.is_some() { banner::HEIGHT } else { 0.0 };
         // The safe mode bar lies under the top bar and takes its height from the page.
-        let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height();
-        let room = Size { width: room.max(0.0), height: (window.height - bar).max(0.0) };
-        let page = if printing { self.sheets(room) } else { self.page(room) };
-        let chapters = if printing { None } else { self.chapters() };
+        let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height() + told;
+        // The history has a strip of its versions under the page and the panel.
+        let strip = self.history.as_ref().map(History::strip);
+        let foot = if strip.is_some() { history::STRIP } else { 0.0 };
+        let room = Size { width: room.max(0.0), height: (window.height - bar - foot).max(0.0) };
+        let page = match (printing, away) {
+            (true, _) => self.sheets(room),
+            (false, true) => self.version(room),
+            (false, false) => self.page(room),
+        };
+        let chapters = if away { None } else { self.chapters() };
         let page = Element::row().grow(1.0).child(page).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
@@ -3205,7 +3704,7 @@ impl App for EditorApp {
         });
         let over = over.chain(commands);
         let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).children(self.safe.bar());
-        let all = all.child(body).children(over);
+        let all = all.children(conflicts).child(body).children(strip).children(over);
         if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
     }
 
@@ -3276,11 +3775,14 @@ impl App for EditorApp {
             Message::Insert(Inserting::Close) => self.insert.close(),
             Message::Refer(Picking::Take(figure)) => self.refer(figure, platform),
             Message::Linked(asked) => self.linking(asked),
+            Message::TableMenu => self.tables.open = None,
             Message::Safe(asked) => self.safely(asked),
             Message::Alt(asked) => self.altering(asked, platform),
             Message::Note(asked) => self.noting(asked, platform),
             Message::Commands(asked) => self.commanding(asked, platform),
             Message::Print(asked) => self.print(asked, platform),
+            Message::History(asked) => self.historying(asked, platform),
+            Message::Review(asked) => self.reviewing(asked, platform),
             Message::Refer(Picking::Close) => {
                 self.edit(platform, |editor, platform| editor.run(Command::DismissReference, platform));
             }
@@ -3297,7 +3799,7 @@ impl App for EditorApp {
                 // Twice, since laying out what comes into view can move the block.
                 for _ in 0..2 {
                     let Some(line) = self.layout.caret(&start) else { break };
-                    self.scroll = line.y.clamp(0.0, self.max_scroll());
+                    self.scroll = self.down(line.y).clamp(0.0, self.max_scroll());
                     self.layout.settle(self.viewport(), 0);
                 }
             }
@@ -3330,6 +3832,9 @@ impl App for EditorApp {
         if self.printing.is_some() {
             return self.print_key(event, platform);
         }
+        if self.history.is_some() {
+            return self.history_key(event, platform);
+        }
         // Print view opens at what is being read. A key the editor is offered brings the caret into view,
         // so this one is not offered: it is none of the editor's.
         if commands::bound(event) == Some(&Act::Print) {
@@ -3360,8 +3865,13 @@ impl App for EditorApp {
         if used {
             return true;
         }
+        // Escape puts the conflict that is open away, once nothing nearer to the caret took it.
+        if event.key == Key::Escape && self.review.note().is_some() {
+            self.reviewing(Reviewing::Close, platform);
+            return true;
+        }
         // The editor leaves some keys to the window: the palette, the link that is edited in place, the
-        // settings and the card that saves a copy.
+        // settings, saving where it is asked for, and the card that saves a copy.
         let asked = commands::bound(event).and_then(|act| self.asked(act));
         let bound = asked.is_some();
         if let Some(message) = asked {
@@ -3375,14 +3885,28 @@ impl App for EditorApp {
             return print.describe(page, nodes);
         }
         let told = &mut self.told.borrow_mut();
+        if let Some(history) = &self.history {
+            return history.describe(told, whole, page, nodes);
+        }
         describe::page(self.editor.doc(), self.editor.selection(), told, whole, page, nodes);
         if let Some((caption, rect)) = &self.previewed {
             describe::preview(caption, *rect, page, nodes);
         }
         for (marker, at) in self.markers() {
-            let at = Rect { x: at.x + self.column.0, y: at.y + TOP - self.scrolled(), ..at };
-            describe::marker(&marker.block, &marker.label(), at, page, nodes);
+            describe::marker(&marker.block, &marker.label(), self.onto(at), page, nodes);
         }
+        if let Some(shown) = self.table() {
+            for (part, at) in shown.parts() {
+                let (axis, index, add) = match part {
+                    tables::Part::Handle(axis, index) => (axis, Some(index), false),
+                    tables::Part::Add(axis) => (axis, None, true),
+                };
+                let Some(cell) = shown.cell(axis, index, self.caret_cell()) else { continue };
+                let told = (axis == tables::Axis::Row, add);
+                describe::table_part(&cell, told, &tables::label(part), self.onto(at), page, nodes);
+            }
+        }
+        self.review.describe(page, nodes);
     }
 
     fn access_action(&mut self, request: &ActionRequest, platform: &mut dyn Platform) {
@@ -3397,6 +3921,10 @@ impl App for EditorApp {
             }
             return;
         }
+        // An earlier version is read, and nothing in it takes a press.
+        if self.history.is_some() {
+            return;
+        }
         match describe::request(self.editor.doc(), request) {
             Some(describe::Request::Select(selection)) => {
                 self.editor.select(selection);
@@ -3408,6 +3936,16 @@ impl App for EditorApp {
             }
             Some(describe::Request::Copy(block)) => self.copy_code(block, platform),
             Some(describe::Request::Note(block)) => self.noting(Noting::Press(block), platform),
+            Some(describe::Request::Table { cell, row, add }) => {
+                // The caret goes to the cell, and its table then shows the handles of its column and row.
+                self.editor.select(Selection::caret(Pos::new(cell, 0)));
+                self.mark();
+                let axis = if row { tables::Axis::Row } else { tables::Axis::Column };
+                let Some((at, shown)) = self.editor.cell().zip(self.table()) else { return };
+                let index = if row { at.row } else { at.column };
+                let asked = if add { tables::Asked::Add(axis) } else { tables::Asked::Menu(axis, index) };
+                self.tabled(&shown, asked, platform);
+            }
             Some(describe::Request::Alt(figure)) => {
                 self.editor.select_picture(&figure);
                 self.mark();
@@ -3422,6 +3960,11 @@ impl App for EditorApp {
                 if let Some(held) = held {
                     self.editor.select(held);
                     self.mark();
+                }
+            }
+            Some(describe::Request::Choose { block, keep }) => {
+                if let Some(asked) = self.review.asked(&block, keep) {
+                    self.reviewing(asked, platform);
                 }
             }
             Some(describe::Request::Break(_)) | None => {}
@@ -3460,6 +4003,8 @@ impl App for EditorApp {
 
     fn reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
+        self.review.still = reduced;
+        self.history.iter_mut().for_each(|history| history.still = reduced);
         self.references.set_reduced_motion(reduced);
     }
 
@@ -3467,8 +4012,13 @@ impl App for EditorApp {
         if let Some(print) = self.printing.as_mut() {
             return print.point(at);
         }
-        self.references.set_rest(at);
-        self.repoint()
+        if let Some(history) = self.history.as_mut() {
+            return history.point(at);
+        }
+        // The page has nothing of its own under the version held back, nor under the buttons.
+        let moved = self.review.point(at);
+        self.references.set_rest(at.filter(|at| !self.review.covers(*at)));
+        self.repoint() || moved
     }
 
     fn active(&mut self, active: bool) {
@@ -3499,10 +4049,16 @@ impl App for EditorApp {
         });
         let light = self.references.animate(now_ms);
         let copied = self.code_copy.animate(now_ms);
-        [note, slide, fade, light, copied].into_iter().flatten().min()
+        let slid = self.review.animate(now_ms);
+        let brought = self.history.as_mut().and_then(|history| history.animate(now_ms));
+        [note, slide, fade, light, copied, slid, brought].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {
+        // The version that shows is laid out before the page behind it.
+        if self.history.as_mut().is_some_and(History::settle) {
+            return Idle::Unseen;
+        }
         if self.estimated {
             // Blocks above the part in view change height as they are laid out.
             self.held(|app| app.estimated = app.layout.settle(app.viewport(), SETTLE_BYTES));
@@ -3531,10 +4087,16 @@ impl App for EditorApp {
 /// What the layout painted for the part of the page in view, placed where the page area is.
 struct PagePaint {
     list: DisplayList,
+    /// What lies under the page's text, placed in the page area: what stands round the two versions of a
+    /// conflict, and the version held back.
+    under: DisplayList,
     /// What hangs over the page, placed in the page area: the preview of a figure.
     over: DisplayList,
-    /// Where the layout's origin is inside the page area.
+    /// Where the layout's origin is inside the page area, while the page shows whole.
     origin: Point,
+    /// The parts a conflict cuts the page into, when one is open: what each is cut to in the page area,
+    /// and where the layout's origin is for it.
+    cuts: Vec<(Rect, Point)>,
     page: Color,
     /// The height of everything that scrolls, and how far it is scrolled.
     content: f32,
@@ -3545,8 +4107,25 @@ impl Paint for PagePaint {
     fn paint(&self, rect: Rect, _visible: Rect, scheme: Scheme, out: &mut DisplayList) {
         out.push(fill(rect, self.page));
         let first = out.items.len();
-        out.items.extend(self.list.items.iter().cloned());
-        out.translate(first, Point { x: rect.x + self.origin.x, y: rect.y + self.origin.y });
+        out.items.extend(self.under.items.iter().cloned());
+        out.translate(first, Point { x: rect.x, y: rect.y });
+        let whole = [(rect, self.origin)];
+        // Each part of a page that is cut shows what the layout painted, moved to where the part stands.
+        for (part, origin) in if self.cuts.is_empty() { &whole[..] } else { &self.cuts[..] } {
+            let cut = !self.cuts.is_empty();
+            if cut {
+                out.push(Item::PushClip {
+                    rect: Rect { x: rect.x + part.x, y: rect.y + part.y, ..*part },
+                    radius: 0.0,
+                });
+            }
+            let first = out.items.len();
+            out.items.extend(self.list.items.iter().cloned());
+            out.translate(first, Point { x: rect.x + origin.x, y: rect.y + origin.y });
+            if cut {
+                out.push(Item::PopClip);
+            }
+        }
         out.items.extend(scrollbar(rect, self.content, self.scroll, scheme, 1.0));
         let first = out.items.len();
         out.items.extend(self.over.items.iter().cloned());

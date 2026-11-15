@@ -94,6 +94,8 @@ pub(crate) struct Canvas<M> {
     pub caret: Option<Rect>,
     /// Whether the app hears where the pointer rests on it.
     pub pointed: bool,
+    /// Whether positions on it are told as parts of its width and height.
+    pub spread: bool,
 }
 
 /// Whether and how an element takes keyboard focus.
@@ -150,7 +152,11 @@ pub struct Element<M> {
     pub(crate) telling: bool,
     pub(crate) in_view: bool,
     pub(crate) fitted: Option<Fitted>,
+    pub(crate) later: Option<Later<M>>,
 }
+
+/// What builds the content of an [`Element::later`].
+pub(crate) type Later<M> = Rc<dyn Fn() -> Element<M>>;
 
 /// Where the layout says which child of an [`Element::fit`] it showed, counted from the first.
 pub type Fitted = Rc<Cell<Option<usize>>>;
@@ -185,12 +191,23 @@ impl<M> Element<M> {
             telling: false,
             in_view: false,
             fitted: None,
+            later: None,
         }
     }
 
     /// A box whose children sit side by side.
     pub fn row() -> Self {
         Self::new(Content::None)
+    }
+
+    /// A place `height` tall for what `build` makes, which is made only while the place is near what shows:
+    /// a row of a long list, which costs next to nothing while it is scrolled away. The place is as tall
+    /// from the start as the row will be, so what scrolls keeps its height. Give it a key, and say on it
+    /// whether the row asks to be in view.
+    pub fn later(height: f32, build: impl Fn() -> Element<M> + 'static) -> Self {
+        let mut element = Self::column().height(height);
+        element.later = Some(Rc::new(build));
+        element
     }
 
     /// A box whose children are stacked top to bottom.
@@ -225,8 +242,14 @@ impl<M> Element<M> {
     /// An area the app draws itself. It takes focus on a click, and text and pointer input once the handlers
     /// are set.
     pub fn canvas(paint: Rc<dyn Paint>) -> Self {
-        let mut element =
-            Self::new(Content::Canvas(Canvas { paint, on_text: None, on_pointer: None, caret: None, pointed: false }));
+        let mut element = Self::new(Content::Canvas(Canvas {
+            paint,
+            on_text: None,
+            on_pointer: None,
+            caret: None,
+            pointed: false,
+            spread: false,
+        }));
         element.focus = Focus::Click;
         element.style.clip = true;
         element
@@ -574,6 +597,16 @@ impl<M> Element<M> {
     pub fn pointed(mut self) -> Self {
         if let Content::Canvas(canvas) = &mut self.content {
             canvas.pointed = true;
+        }
+        self
+    }
+
+    /// Has positions on the canvas told as parts of its width and height, from 0 to 1 across it: for a
+    /// canvas that spreads what it draws over whatever room it is given, so that what handles a press need
+    /// not know how much room that was.
+    pub fn spread(mut self) -> Self {
+        if let Content::Canvas(canvas) = &mut self.content {
+            canvas.spread = true;
         }
         self
     }

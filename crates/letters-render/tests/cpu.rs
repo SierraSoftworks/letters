@@ -410,3 +410,22 @@ fn the_parts_of_a_document_change_nothing_on_screen() {
 
     assert_eq!(furthest_apart(&plain, &marked), 0);
 }
+
+#[test]
+fn a_colour_glyph_is_drawn_in_its_own_colours() {
+    for (format, font, id) in colour_faces() {
+        let plain = glyph(&font, id, 32.0, Point { x: 10.0, y: 50.0 });
+        let Item::Glyphs { origin, font, size, glyphs, text, .. } = plain.clone() else { unreachable!() };
+        let styled = Item::Glyphs { origin, font, size, color: BLACK, skew: 14.0, embolden: true, glyphs, text };
+
+        let (plain, styled) = (render(&list([plain]), 70, 70, 1.0), render(&list([styled]), 70, 70, 1.0));
+
+        let pixels = || (0..70).flat_map(|y| (0..70).map(move |x| (x, y)));
+        let coloured = |frame: &Frame| {
+            let spread = |color: Color| color.r.max(color.g).max(color.b) - color.r.min(color.g).min(color.b);
+            pixels().filter(|(x, y)| frame.pixel(*x, *y).is_some_and(|color| spread(color) > 60)).count()
+        };
+        assert!(coloured(&plain) > 40, "{format} shows its colours, not the text's black");
+        assert!(coloured(&styled) > 40, "{format} keeps its colours in bold and slanted text");
+    }
+}

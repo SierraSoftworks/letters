@@ -6,7 +6,9 @@ use std::cmp::Ordering;
 
 use common::{Folder, ID, bytes, open, package, paragraph};
 use letters_format::{Error, NOTES, OPLOG, STYLE, Save, Saved, WorkingCopy, conflict_copy_of, save};
-use letters_model::{Anchor, BlockId, Document, Note, NoteKind, Op, Pos, ReplicaId, Run, Style, Version};
+use letters_model::{
+    Anchor, Block, BlockId, BlockKind, Body, Document, Note, NoteKind, Op, Pos, ReplicaId, Run, Style, Version,
+};
 
 const NAME: &str = "report.let";
 
@@ -33,8 +35,13 @@ fn opened(file: Vec<u8>) -> (Folder, WorkingCopy, WorkingCopy) {
 
 /// A folder that holds a saved document reading "Hello world", and two devices that have it open.
 fn shared() -> (Folder, WorkingCopy, WorkingCopy) {
+    sharing(document())
+}
+
+/// A folder that holds `document` as saved, and two devices that have it open.
+fn sharing(document: Document) -> (Folder, WorkingCopy, WorkingCopy) {
     let mut folder = Folder::default();
-    let mut first = WorkingCopy::new(ID, "2026-11-14T20:00:00Z", document(), Style::default(), ReplicaId::from(1));
+    let mut first = WorkingCopy::new(ID, "2026-11-14T20:00:00Z", document, Style::default(), ReplicaId::from(1));
     save_from(&mut folder, &mut first, "first");
     opened(folder.files[NAME].clone())
 }
@@ -260,6 +267,38 @@ fn a_block_one_writer_removed_and_the_other_changed_goes_the_later_way_with_a_no
             let block = copy.model().doc().block(&BlockId::from("p"));
             assert_eq!(block.is_some(), stands, "{who}, removed at {removed}");
             assert_eq!(clashes(copy), std::slice::from_ref(&expected), "{who}, removed at {removed}");
+        }
+    }
+}
+
+#[test]
+fn a_note_on_a_block_that_went_says_where_it_stood() {
+    let quote = |blocks| Block { body: Body::Blocks(blocks), ..Block::new("q", BlockKind::Quote) };
+    let (above, below) = (paragraph("a", "Above"), paragraph("z", "Below"));
+    let p = paragraph("p", "Hello world");
+    type Place = (Option<&'static str>, Option<&'static str>);
+    // The document, what Ana removes from it after Ben changed "p", and the block before and around "p".
+    let cases: [(&str, Vec<Block>, &[&str], Place); 4] = [
+        ("between two", vec![above.clone(), p.clone(), below.clone()], &["p"], (Some("a"), None)),
+        ("with the one before", vec![above.clone(), p.clone(), below.clone()], &["a", "p"], (None, None)),
+        ("in a quote", vec![above.clone(), quote(vec![below.clone(), p.clone()])], &["p"], (Some("z"), Some("q"))),
+        ("with its quote", vec![above.clone(), quote(vec![below.clone(), p.clone()])], &["q"], (Some("a"), None)),
+    ];
+    for (why, blocks, removed, (after, parent)) in cases {
+        let (mut folder, mut desk, mut laptop) = sharing(Document { blocks, ..Document::default() });
+        laptop.sign("Ben", at(0));
+        typed(&mut laptop, 6, "under");
+        desk.sign("Ana", at(10));
+        desk.apply(removed.iter().map(|block| Op::RemoveBlock { block: (*block).into() })).unwrap();
+        let saves = in_turn(&mut folder, &mut desk, &mut laptop, 5);
+        assert!(matches!(saves[..], [.., Saved::Unchanged, Saved::Unchanged]), "{why}: {saves:?}");
+
+        for (who, copy) in [("the desk", &desk), ("the laptop", &laptop)] {
+            let [note] = &copy.notes.notes[..] else { panic!("{why}, {who}: {:?}", copy.notes.notes) };
+            assert_eq!(note.anchor.block.as_str(), "p", "{why}, {who}");
+            let stood = note.anchor.stood.as_ref().unwrap_or_else(|| panic!("{why}, {who}: no place"));
+            let ids = [&stood.after, &stood.parent].map(|id| id.as_ref().map(BlockId::as_str));
+            assert_eq!(ids, [after, parent], "{why}, {who}");
         }
     }
 }

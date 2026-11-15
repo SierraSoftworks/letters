@@ -6,7 +6,7 @@ use letters_render::{Color, DisplayList, Font, Glyph, Item, Point};
 use parley::{Layout, LineHeight, PositionedLayoutItem};
 
 use crate::Fonts;
-use crate::engine::{Engine, Spec};
+use crate::engine::{Engine, Spec, Uncovered};
 use crate::ink::Brush;
 
 /// The face a plain string is set in.
@@ -43,6 +43,18 @@ impl Shaper {
     /// before are not changed: shape again whatever named a family or an italic that was not there.
     pub fn add_fonts(&self, fonts: &Fonts) -> bool {
         self.state.borrow_mut().0.add(fonts)
+    }
+
+    /// Adds faces that only back up the fonts, as [`crate::DocLayout::add_fallback_fonts`] does. Returns
+    /// whether a character of a string shaped before has a glyph now: shape again whatever may hold one.
+    pub fn add_fallback_fonts(&self, fonts: &Fonts) -> bool {
+        self.state.borrow_mut().0.back(fonts)
+    }
+
+    /// The characters of the strings shaped since this was last asked that no face has a glyph for, as
+    /// [`crate::DocLayout::take_uncovered`] tells them. A plain string has no language.
+    pub fn take_uncovered(&self) -> Vec<Uncovered> {
+        self.state.borrow_mut().0.take_uncovered()
     }
 
     /// Shapes `text`. With `max_width` it wraps to that width, and without one only line breaks in the text

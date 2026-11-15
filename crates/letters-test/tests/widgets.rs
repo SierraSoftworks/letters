@@ -1,6 +1,7 @@
 //! The toolkit, driven the way a person drives it: through the pointer, the keyboard and the accessibility
 //! tree of a small window that uses every widget.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use letters_editor::{InputEvent, Platform};
@@ -444,6 +445,107 @@ fn a_long_panel_scrolls_under_the_wheel_and_stops_at_its_ends() {
     desk.scroll_at(over, 1e6);
     let last = desk.find(Role::Label, "Note 40").unwrap().bounds;
     assert!(last.y + last.height <= WINDOW.height, "the last row is in view at the end: {last:?}");
+}
+
+/// A window that is one long list, each row built only while it is near what shows. A press on a row
+/// picks it, and the button under the list picks the last. The row that is picked asks to be in view.
+struct Ledger {
+    rows: usize,
+    picked: usize,
+    /// How many times a row was built.
+    built: Rc<Cell<usize>>,
+    /// How many times the window was built, when its rows are to be others each time.
+    restless: Option<usize>,
+}
+
+const LEDGER_ROW: f32 = 24.0;
+
+impl App for Ledger {
+    type Msg = usize;
+
+    fn title(&self) -> String {
+        "Ledger".into()
+    }
+
+    fn view(&mut self, _window: Size) -> Element<usize> {
+        let builds = self.restless.as_mut().map(|builds| std::mem::replace(builds, *builds + 1));
+        let rows = (0..self.rows).map(|n| {
+            let built = self.built.clone();
+            let row = move || {
+                built.set(built.get() + 1);
+                Element::text(format!("Row {n}"), TextStyle::body()).on_click(n)
+            };
+            Element::later(LEDGER_ROW, row).key((n, builds)).in_view(n == self.picked)
+        });
+        let list = Element::column().grow(1.0).scroll().role(Role::List).label("Rows").children(rows);
+        Element::column().child(list).child(Button::new("Last").on_press(self.rows - 1))
+    }
+
+    fn update(&mut self, picked: usize, _platform: &mut dyn Platform) {
+        self.picked = picked;
+    }
+}
+
+fn ledger(rows: usize) -> (Harness<Ledger>, Rc<Cell<usize>>) {
+    let built = Rc::new(Cell::new(0));
+    (Harness::new(Ledger { rows, picked: 0, built: built.clone(), restless: None }), built)
+}
+
+/// The rows of the ledger that are built, by their numbers, and the part of the window its list has with
+/// the middle of that.
+fn ledger_rows(ledger: &mut Harness<Ledger>) -> (Vec<usize>, Rect, Point) {
+    let list = ledger.find(Role::List, "Rows").unwrap();
+    let rows = ledger.controls().into_iter().filter_map(|found| found.name.strip_prefix("Row ")?.parse().ok());
+    (rows.collect(), list.bounds, list.center())
+}
+
+#[test]
+fn a_long_list_builds_the_rows_near_what_shows_and_keeps_the_place_of_the_rest() {
+    let (mut ledger, built) = ledger(10_000);
+    let (rows, list, middle) = ledger_rows(&mut ledger);
+    let in_view = (list.height / LEDGER_ROW).ceil() as usize;
+    assert_eq!(rows.first(), Some(&0));
+    assert!(rows.len() >= in_view && rows.len() <= 3 * in_view, "{} rows are built for {in_view} in view", rows.len());
+    assert!(built.get() <= 3 * in_view, "no row was built that is far from view: {}", built.get());
+
+    // The rows just out of view are there before they scroll in, so the window is not built for them.
+    let before = built.get();
+    ledger.scroll_at(middle, 3.0 * LEDGER_ROW);
+    assert!(ledger.find(Role::Label, &format!("Row {}", in_view + 2)).is_some());
+    assert_eq!(built.get(), before);
+
+    // A row that scrolls into view is there, where its place was kept.
+    ledger.scroll_at(middle, 1_997.0 * LEDGER_ROW);
+    let (rows, ..) = ledger_rows(&mut ledger);
+    assert!(rows.contains(&2_000) && !rows.contains(&0), "the rows built are those in view now: {rows:?}");
+    assert_eq!(ledger.find(Role::Label, "Row 2000").unwrap().bounds.y, list.y);
+
+    // The list is as tall as all of its rows, so its end is the last row.
+    ledger.scroll_at(middle, 1e9);
+    let last = ledger.find(Role::Label, "Row 9999").expect("the last row at the end of the list").bounds;
+    assert_eq!(last.y + LEDGER_ROW, list.y + list.height);
+}
+
+#[test]
+fn a_row_far_from_view_that_asks_to_be_in_view_is_built_there() {
+    let (mut ledger, _) = ledger(10_000);
+    ledger.click(Role::Button, "Last");
+    let (rows, list, _) = ledger_rows(&mut ledger);
+    let last = ledger.find(Role::Label, "Row 9999").expect("the row that was picked").bounds;
+    assert!(last.y >= list.y && last.y + last.height <= list.y + list.height, "it is in view: {last:?}");
+    assert!(rows.len() < 200, "and only the rows near it are built with it: {}", rows.len());
+
+    // A press on a row that was built reaches it.
+    ledger.click(Role::Label, "Row 9990");
+    assert_eq!(ledger.app().picked, 9_990);
+}
+
+#[test]
+fn rows_that_are_others_at_every_build_do_not_have_the_window_built_without_end() {
+    let built = Rc::new(Cell::new(0));
+    let mut ledger = Harness::new(Ledger { rows: 100, picked: 0, built: built.clone(), restless: Some(0) });
+    assert!(!ledger.paint().items.is_empty());
+    assert!(built.get() <= 300, "the rows were built {} times", built.get());
 }
 
 #[test]

@@ -25,13 +25,13 @@ test("Print makes the document's PDF, with what makes it fetched only then", asy
   await page.keyboard.type("Printed from a browser");
   await page.keyboard.press("ControlOrMeta+p");
   await rested(page);
-  expect(fetched.filter((path) => path.includes("print"))).toEqual([]);
+  expect(fetched.filter((path) => path.includes("export"))).toEqual([]);
 
   await click(page, "Print");
   const pdf = await printed(page);
   expect(pdf.slice(0, 5)).toBe("%PDF-");
   expect(pdf).toContain("/Title");
-  expect(fetched).toContain("/print_bg.wasm");
+  expect(fetched).toContain("/export_bg.wasm");
 
   // A second print is made by the module already here, and takes the place of the first.
   fetched.length = 0;
@@ -39,5 +39,21 @@ test("Print makes the document's PDF, with what makes it fetched only then", asy
   await click(page, "Print");
   await expect.poll(() => page.locator("iframe[data-letters=print]").getAttribute("src")).not.toBe(first);
   expect(await page.locator("iframe[data-letters=print]").count()).toBe(1);
-  expect(fetched.filter((path) => path.includes("print"))).toEqual([]);
+  expect(fetched.filter((path) => path.includes("export"))).toEqual([]);
+});
+
+test("a print that cannot be made says so", async ({ page }) => {
+  await page.route("**/export.js*", (route) => route.abort());
+  await page.keyboard.press("ControlOrMeta+p");
+  await rested(page);
+  const said = page.waitForEvent("dialog");
+  await click(page, "Print");
+  const alert = await said;
+  expect(alert.message()).toContain("could not be printed");
+  await alert.dismiss();
+
+  // What could not be fetched is asked for again.
+  await page.unroute("**/export.js*");
+  await click(page, "Print");
+  expect((await printed(page)).slice(0, 5)).toBe("%PDF-");
 });

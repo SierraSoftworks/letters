@@ -132,6 +132,13 @@ pub fn copy(window: &Window, text: &str) -> Result<(), JsValue> {
 }
 
 impl Browser {
+    /// What makes a document that one and no other: a new id, and now as RFC 3339 to the second, which
+    /// is how every writer of the format dates a document.
+    pub fn identity(&self) -> [String; 2] {
+        let now = String::from(js_sys::Date::new_0().to_iso_string());
+        [self.crypto.random_uuid(), format!("{}Z", now.get(..19).unwrap_or(&now))]
+    }
+
     pub fn new(window: &Window) -> Result<Self, JsValue> {
         let performance = window.performance().ok_or("this browser has no clock")?;
         let storage = window.local_storage().ok().flatten();

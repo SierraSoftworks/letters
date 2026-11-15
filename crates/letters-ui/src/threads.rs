@@ -41,7 +41,7 @@ const REACH: f32 = 3.0;
 
 /// How wide a note that is open is, and the round face of who speaks in it.
 const WIDTH: f32 = 344.0;
-const FACE: f32 = 24.0;
+pub(crate) const FACE: f32 = 24.0;
 /// How wide what is said runs, beside the face of who says it.
 pub(crate) const SAID: f32 = WIDTH - FACE - tokens::SPACE_SM;
 /// How tall what is said in a note gets before it scrolls.
@@ -304,12 +304,12 @@ fn plain(runs: &[Run]) -> String {
     runs.iter().map(|run| run.text.as_str()).collect()
 }
 
-fn named(author: &str) -> &str {
+pub(crate) fn named(author: &str) -> &str {
     if author.trim().is_empty() { UNNAMED } else { author }
 }
 
 /// The first letters of a name's first and last words, as a face shows them.
-fn initials(name: &str) -> String {
+pub(crate) fn initials(name: &str) -> String {
     let mut letters = name.split_whitespace().filter_map(|word| word.chars().find(|c| c.is_alphanumeric()));
     let first = letters.next();
     first.into_iter().chain(letters.next_back()).flat_map(char::to_uppercase).collect()
@@ -324,14 +324,18 @@ fn cut(text: &str, most: usize) -> String {
     format!("{}\u{2026}", kept.trim_end())
 }
 
-/// What a conflict says of itself, while its two versions cannot be looked at side by side.
-fn conflict(versions: &[Version; 2]) -> String {
+/// What a conflict says of itself, where its two versions are not looked at side by side: in the panel,
+/// and once the page no longer has its block, which `there` tells.
+fn conflict(versions: &[Version; 2], there: bool) -> String {
     let changed = match (versions[0].author.trim(), versions[1].author.trim()) {
         ("", _) | (_, "") => "This was changed in two places".to_owned(),
         (one, other) if one == other => format!("{one} changed this in two places"),
         (one, other) => format!("{one} and {other} both changed this"),
     };
-    format!("{changed}. The page shows the later version.")
+    match there {
+        true => format!("{changed}. The page shows the later version."),
+        false => format!("{changed}. It is no longer on the page."),
+    }
 }
 
 fn send(asked: Noting) -> Message {
@@ -339,7 +343,7 @@ fn send(asked: Noting) -> Message {
 }
 
 /// The face of who speaks: the first letters of their name, or the sign of an import for what it noted.
-fn face(name: &str, import: bool) -> Element<Message> {
+pub(crate) fn face(name: &str, import: bool) -> Element<Message> {
     let round = Element::row()
         .width(FACE)
         .height(FACE)
@@ -416,12 +420,13 @@ pub(crate) fn thread(
         .min_height(tokens::CONTROL_HEIGHT_SM)
         .child(Element::text(head, small).fg(tokens::FG_MUTED));
     let mut all = Element::column().gap(tokens::SPACE_MD).width(WIDTH);
+    let resolve = Button::new("Resolve").icon(icon::CHECK).subtle().small();
+    top = top.child(resolve.disabled(refused.is_some()).on_press(send(Noting::Resolve)));
     if let NoteKind::Conflict { versions } = &note.kind {
-        let says = Element::paragraph(conflict(versions), small.leading(1.4)).role(Role::Paragraph);
+        // Only a conflict about a block that is gone is read here: there is no place to show its versions.
+        let says = Element::paragraph(conflict(versions, false), small.leading(1.4)).role(Role::Paragraph);
         all = all.child(top).child(says);
     } else {
-        let resolve = Button::new("Resolve").icon(icon::CHECK).subtle().small();
-        top = top.child(resolve.disabled(refused.is_some()).on_press(send(Noting::Resolve)));
         let by = iter::once((note.author.as_str(), note.created.as_str()));
         let by = by.chain(note.replies.iter().map(|reply| (reply.author.as_str(), reply.created.as_str())));
         let voices = by.zip(said).enumerate();
@@ -477,7 +482,7 @@ fn about(doc: &Document, note: &Note) -> Option<String> {
 fn row(note: &Note, kind: Kind, doc: &Document, now: &str, open: bool) -> Element<Message> {
     let small = TextStyle::control().size(tokens::TEXT_SM);
     let (who, says) = match &note.kind {
-        NoteKind::Conflict { versions } => ("Conflict", conflict(versions)),
+        NoteKind::Conflict { versions } => ("Conflict", conflict(versions, doc.block(&note.anchor.block).is_some())),
         _ => (named(&note.author), plain(&note.content)),
     };
     let (when, about) = (opening::ago(now, &note.created), about(doc, note));
@@ -558,7 +563,8 @@ pub(crate) fn listed(margin: &Margin, doc: &Document) -> Option<Element<Message>
         let resolve = Button::new("Resolve all").icon(icon::CHECK).subtle().small();
         count = count.child(resolve.disabled(margin.refused.is_some()).on_press(send(Noting::ResolveImports)));
     }
-    let read = margin.reading().map(|(note, _)| note.id.as_str());
+    // The row of the note that is open is the one picked, wherever that note shows.
+    let read = margin.reading().map(|(note, _)| note).or_else(|| margin.reviewing()).map(|note| note.id.as_str());
     let rows = shown.iter().map(|(note, kind)| row(note, *kind, doc, &margin.now, read == Some(note.id.as_str())));
     let list = Element::column()
         .gap(tokens::SPACE_2XS)
@@ -664,13 +670,15 @@ mod tests {
             block: None,
             extra: Default::default(),
         };
+        // Who wrote the two versions, whether the page still has their block, and what is said.
         let cases = [
-            (("Sam", "Alice"), "Sam and Alice both changed this. The page shows the later version."),
-            (("Sam", "Sam"), "Sam changed this in two places. The page shows the later version."),
-            (("", "Alice"), "This was changed in two places. The page shows the later version."),
+            (("Sam", "Alice"), true, "Sam and Alice both changed this. The page shows the later version."),
+            (("Sam", "Sam"), true, "Sam changed this in two places. The page shows the later version."),
+            (("", "Alice"), true, "This was changed in two places. The page shows the later version."),
+            (("Sam", "Alice"), false, "Sam and Alice both changed this. It is no longer on the page."),
         ];
-        for ((one, other), says) in cases {
-            assert_eq!(conflict(&[by(one), by(other)]), says);
+        for ((one, other), there, says) in cases {
+            assert_eq!(conflict(&[by(one), by(other)], there), says);
         }
     }
 }

@@ -83,7 +83,7 @@ test("copy and paste go through the browser's clipboard events", async ({ page }
 
 test("the copy button of a code block puts its code on the clipboard", async ({ page, context, browserName }) => {
   // A headless Chromium refuses the write that a press allows in a window. Firefox knows no such permission.
-  if (browserName === "chromium") await context.grantPermissions(["clipboard-write"]);
+  if (browserName === "chromium") await context.grantPermissions(["clipboard-write", "clipboard-read"]);
   await page.keyboard.type("```");
   await page.keyboard.press("Enter");
   await page.keyboard.type("let x = 1;");
@@ -103,6 +103,9 @@ test("the copy button of a code block puts its code on the clipboard", async ({ 
   const at = await found();
   expect(at, "a copy button under the pointer").toBeTruthy();
   await page.mouse.click(...at);
+  // The write is the browser's to finish, and a paste that comes before its end finds nothing.
+  const copied = () => page.evaluate(() => navigator.clipboard.readText());
+  if (browserName === "chromium") await expect.poll(copied).toBe("let x = 1;");
   // What was copied is pasted under the block.
   await page.keyboard.press("ControlOrMeta+End");
   await page.keyboard.press("ArrowDown");

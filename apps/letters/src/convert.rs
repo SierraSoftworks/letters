@@ -23,6 +23,7 @@ use serde_json::json;
 use crate::cli::{Export, Format, Import, Output};
 use crate::files;
 use crate::import::{Choices, Plan, normal};
+use crate::trust::{self, Trusted};
 
 /// The extensions of the Markdown files an import looks for in a folder.
 pub(crate) const MARKDOWN: [&str; 2] = ["md", "markdown"];
@@ -218,13 +219,19 @@ pub fn import(import: &Import) -> ExitCode {
         eprintln!("letters: no Markdown or Word files to import");
     }
 
-    let style = files::new_style(std::env::home_dir().as_deref());
+    let home = std::env::home_dir();
+    let style = files::new_style(home.as_deref());
+    // Each import is recorded where the person's trust is kept. With no home there is no such place, and
+    // then nothing is trusted at all.
+    let mut trust = home.as_deref().map(trust::store);
+    // Settings that cannot be read trust nothing, and each file then says why it could not be recorded.
+    let _ = trust.as_mut().map(Trusted::load);
     let mut stdout = io::stdout().lock();
     let mut failures = false;
     for (source, error) in found {
         let outcome = match error {
             Some(error) => Outcome::Failed { error },
-            None => import_file(&source, &style, &sources, &roots),
+            None => import_file(&source, &style, &sources, &roots, trust.as_mut()),
         };
         failures |= matches!(outcome, Outcome::Failed { .. });
         let line = if import.json { json_line(&source, &outcome) } else { text_line(&source, &outcome) };
@@ -296,7 +303,16 @@ pub(crate) fn is_word(path: &Path) -> bool {
 
 /// Makes a document beside one Markdown or Word file. `sources` holds every file of this import, by
 /// [`normal`] path, and `roots` the folders its pictures may be read from.
-fn import_file(source: &Path, style: &Style, sources: &BTreeSet<PathBuf>, roots: &[PathBuf]) -> Outcome {
+///
+/// The import is recorded in `trust` before the document is written: unless the file lies in a folder the
+/// person trusts, the document opens in safe mode until they trust it.
+fn import_file(
+    source: &Path,
+    style: &Style,
+    sources: &BTreeSet<PathBuf>,
+    roots: &[PathBuf],
+    trust: Option<&mut Trusted>,
+) -> Outcome {
     let failed = |error: &dyn std::fmt::Display| Outcome::Failed { error: error.to_string() };
     let output = source.with_extension(files::EXTENSION);
     // A document is a zip too, so this comes before the file is looked into.
@@ -304,10 +320,14 @@ fn import_file(source: &Path, style: &Style, sources: &BTreeSet<PathBuf>, roots:
         return Outcome::Skipped { output };
     }
     let choices = Choices { pictures: roots.to_vec(), comments: true };
-    let mut imported = match Plan::of(source, style) {
-        Ok(plan) => plan.import(&choices),
+    let plan = match Plan::of(source, style) {
+        Ok(plan) => plan,
         Err(error) => return failed(&error),
     };
+    if let Some(Err(error)) = trust.map(|trust| trust::import(trust, &plan.id, source)) {
+        return failed(&format!("the import could not be recorded, so nothing was written: {error}"));
+    }
+    let mut imported = plan.import(&choices);
     relink(&mut imported.package.document.blocks, source.parent().unwrap_or(Path::new("")), sources);
     let mut bytes = Cursor::new(Vec::new());
     if let Err(error) = letters_format::write(&mut bytes, &imported.package) {

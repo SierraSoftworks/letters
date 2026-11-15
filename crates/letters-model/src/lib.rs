@@ -27,7 +27,7 @@ pub use history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
 pub use json::JsonError;
 pub use markers::{Marker, Markers};
 pub use model::{Change, Model, Op, OpError, Place, Prepared};
-pub use notes::{Anchor, NOTES_FORMAT, Note, NoteKind, Notes, Reply, Version};
+pub use notes::{Anchor, NOTES_FORMAT, Note, NoteKind, Notes, Reply, Stood, Version};
 pub use pos::{Pos, Selection};
 pub use style::{Align, Page, STYLE_FORMAT, Style, TextStyle};
 pub use versions::{Point, Tag, TagKind};

@@ -5,7 +5,11 @@
 //! documents = ["0a6f1c2e"]
 //! folders = ["~/Documents", "~/Notes"]
 //! image_sources = ["https://upload.wikimedia.org/", "https://img.example.org/charts/"]
+//! imported = ["5c1d9e07"]
 //! ```
+//!
+//! `imported` lists the documents the user made from other files. Their content came from elsewhere, so
+//! no folder vouches for one: it is trusted when the user trusts the document itself.
 
 use std::collections::BTreeSet;
 
@@ -17,6 +21,7 @@ use crate::{HttpsUrl, Source, TrustError};
 pub(crate) const DOCUMENTS: &str = "documents";
 pub(crate) const FOLDERS: &str = "folders";
 pub(crate) const SOURCES: &str = "image_sources";
+pub(crate) const IMPORTED: &str = "imported";
 
 /// What one user trusts. The default trusts nothing.
 #[derive(Clone, Debug, Default)]
@@ -24,6 +29,7 @@ pub struct Trust {
     documents: BTreeSet<String>,
     folders: Vec<String>,
     sources: Vec<Source>,
+    imported: BTreeSet<String>,
     home: Option<String>,
     ignored: Vec<String>,
 }
@@ -43,7 +49,7 @@ impl Trust {
             trust.ignored.push("trust".into());
             return Ok(trust);
         };
-        for key in [DOCUMENTS, FOLDERS, SOURCES] {
+        for key in [DOCUMENTS, FOLDERS, SOURCES, IMPORTED] {
             let Some(item) = table.get(key) else { continue };
             let Some(array) = item.as_array() else {
                 trust.ignored.push(key.into());
@@ -67,6 +73,7 @@ impl Trust {
     fn take(&mut self, key: &str, entry: &str) -> bool {
         match key {
             DOCUMENTS if !entry.is_empty() => drop(self.documents.insert(entry.into())),
+            IMPORTED if !entry.is_empty() => drop(self.imported.insert(entry.into())),
             FOLDERS if Path::parse(entry, self.home.as_deref()).is_some_and(|path| path.is_folder()) => {
                 self.folders.push(entry.into());
             }
@@ -99,6 +106,11 @@ impl Trust {
 
     pub fn trusts_document(&self, id: &str) -> bool {
         self.documents.contains(id)
+    }
+
+    /// Whether the user made this document from another file. A folder does not vouch for such a one.
+    pub fn imported(&self, id: &str) -> bool {
+        self.imported.contains(id)
     }
 
     /// Whether a file or folder lies inside a trusted folder. `path` is absolute, with links and `..`

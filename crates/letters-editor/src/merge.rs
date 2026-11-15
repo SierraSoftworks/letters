@@ -25,7 +25,7 @@ pub(crate) struct Kept {
 
 /// Whether a change touched a block. One to the style or to the document's own fields moves no text, so
 /// every caret still counts the text it counted.
-fn moves(change: &Change) -> bool {
+pub(crate) fn moves(change: &Change) -> bool {
     change.structure || !change.blocks.is_empty()
 }
 

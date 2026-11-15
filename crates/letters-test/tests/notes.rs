@@ -3,9 +3,7 @@
 
 use std::ops::Range;
 
-use letters_model::{
-    Anchor, Block, BlockKind, Document, Mark, Note, NoteKind, Notes, Pos, Reply, Run, Selection, Version,
-};
+use letters_model::{Anchor, Block, BlockKind, Document, Mark, Note, NoteKind, Notes, Pos, Reply, Run, Selection};
 use letters_render::{Item, Point, Rect};
 use letters_test::{Found, Harness, Role};
 use letters_ui::{Cursor, Request};
@@ -50,13 +48,6 @@ fn note(id: &str, kind: NoteKind, anchor: Anchor, says: &str) -> Note {
 fn reply(says: &str) -> Reply {
     let (author, created) = ("Sam Okafor".into(), "2026-11-13T18:20:00Z".into());
     Reply { author, created, content: vec![Run::plain(says)], extra: Default::default() }
-}
-
-/// The two sides of a conflict, with nothing of what they changed.
-fn conflict() -> NoteKind {
-    let by =
-        |author: &str| Version { author: author.into(), edited: String::new(), block: None, extra: Default::default() };
-    NoteKind::Conflict { versions: Box::new([by("Sam Okafor"), by("Alice Moreau")]) }
 }
 
 /// Alice's comment on the written quote, which Sam answered.
@@ -400,23 +391,14 @@ fn a_note_says_when_each_part_of_it_was_written() {
 
 #[test]
 fn each_kind_of_note_opens_with_what_can_be_done_about_it() {
-    // The kind, what its marker and the open note are called, and whether it can be resolved and replied to.
-    let cases = [
-        (NoteKind::Comment, "1 comment", "Comments", true),
-        (NoteKind::Import, "1 import note", "Import note", true),
-        // A conflict is settled by choosing one of its versions.
-        (conflict(), "1 conflict", "Conflict", false),
-    ];
-    for (kind, marker, title, acts) in cases {
+    // The kind, and what its marker and the open note are called. A conflict opens in the page instead,
+    // with both of its versions: see the tests of conflict review.
+    let cases = [(NoteKind::Comment, "1 comment", "Comments"), (NoteKind::Import, "1 import note", "Import note")];
+    for (kind, marker, title) in cases {
         let mut window = noted(vec![note("n", kind, Anchor::block("b"), "Merged cells split")]);
         window.click(Role::Button, marker).assert_open(Role::Dialog, title);
-        let acted = [window.find(Role::Button, "Resolve").is_some(), window.find(Role::TextInput, "Reply").is_some()];
-        assert_eq!(acted, [acts, acts], "{title}");
-        if !acts {
-            let both = |text: &str| text.contains("Sam Okafor") && text.contains("Alice Moreau");
-            let says = |found: &Found| both(&found.name) || found.value.as_deref().is_some_and(both);
-            assert!(window.controls().iter().any(says), "{title}: it says whose changes met");
-        }
+        assert!(window.find(Role::Button, "Resolve").is_some(), "{title} can be resolved");
+        assert!(window.find(Role::TextInput, "Reply").is_some(), "{title} can be replied to");
     }
 }
 

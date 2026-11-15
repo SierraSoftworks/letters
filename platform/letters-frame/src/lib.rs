@@ -13,7 +13,7 @@ mod print;
 pub mod wayland;
 
 #[cfg(target_os = "macos")]
-pub use macos::unify_title_bar;
+pub use macos::{lights, unify_title_bar};
 #[cfg(target_os = "macos")]
 pub use print::print_pdf;
 
@@ -26,6 +26,21 @@ pub fn print_pdf(_window: &impl raw_window_handle::HasWindowHandle, _pdf: &[u8],
 /// Only macOS has the title bar this asks for. Nothing changes, and `None` says so.
 #[cfg(not(target_os = "macos"))]
 pub fn unify_title_bar(_window: &impl raw_window_handle::HasWindowHandle) -> Option<f32> {
+    None
+}
+
+/// Where macOS stands a window's three lights, in points.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lights {
+    /// How far the line through their centres is below the window's top edge.
+    pub centre: f32,
+    /// How far the last of them reaches from the window's left edge.
+    pub end: f32,
+}
+
+/// Only macOS has lights to look for. `None` says there are none.
+#[cfg(not(target_os = "macos"))]
+pub fn lights(_window: &impl raw_window_handle::HasWindowHandle) -> Option<Lights> {
     None
 }
 

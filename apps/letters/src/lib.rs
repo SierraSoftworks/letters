@@ -34,6 +34,7 @@ pub mod remote;
 pub mod settings;
 pub mod shadow;
 pub mod trust;
+pub mod versions;
 pub mod words;
 pub mod workers;
 pub mod writer;

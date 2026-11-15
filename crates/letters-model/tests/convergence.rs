@@ -608,6 +608,8 @@ proptest! {
                     last[replica] = None;
                     let model = &mut replicas[replica];
                     if let Some((revision, then)) = seen[replica].get(back % seen[replica].len().max(1)) {
+                        let afar = model.document_at(revision);
+                        prop_assert_eq!(afar.as_ref(), Ok(then), "an old revision reads differently from afar");
                         model.checkout(revision).expect("a replica knows its own revisions");
                         prop_assert_eq!(&shown(model), then, "an old revision reads differently than it did");
                         prop_assert!(model.is_latest() || model.apply([]) == Err(OpError::ReadOnly));
@@ -654,5 +656,15 @@ proptest! {
         prop_assert_eq!(stored.as_ref(), Ok(first.doc()), "the merged document cannot be stored");
         let stored = Style::from_json(&first.style().to_json());
         prop_assert_eq!(stored.as_ref(), Ok(first.style()), "the merged style cannot be stored");
+
+        // Every step reads as a copy that goes there shows it, stepping back through them and forth again.
+        let [mut first, ..] = replicas;
+        let mut copy = Model::load(&first.save(), ReplicaId::from(96)).expect("a saved history loads");
+        let steps = first.timeline();
+        for step in steps.iter().rev().chain(&steps) {
+            copy.checkout(&step.after).expect("a copy holds the whole history");
+            let read = first.document_at(&step.after);
+            prop_assert_eq!(read.as_ref(), Ok(&shown(&copy)), "a step reads differently than a copy shows it");
+        }
     }
 }
