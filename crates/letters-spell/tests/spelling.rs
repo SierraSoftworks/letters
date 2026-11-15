@@ -145,7 +145,7 @@ fn a_listed_word_close_to_the_typed_one_is_suggested_first() {
 
 #[test]
 fn only_misspelled_prose_is_flagged_in_text() {
-    let cases: [(&str, &[&str]); 16] = [
+    let cases: [(&str, &[&str]); 18] = [
         ("The quick brwn fox jumps ovr the lazy dog.", &["brwn", "ovr"]),
         ("Nothing wrong here, is there?", &[]),
         // Offsets are bytes, also after text that takes several of them.
@@ -155,6 +155,9 @@ fn only_misspelled_prose_is_flagged_in_text() {
         ("Write to ben@exampel.com or see https://exampel.com/pth and www.exampel.com.", &[]),
         ("Version 2b of report_finl.pdf covers the B12 and e.g. the 3rd qtr.", &["qtr"]),
         ("Points x and y lie on a line.", &[]),
+        // A word that directly follows a backslash is a command, as in a formula still being typed.
+        ("So $c = \\sqrt{a^2 + \\frac{b}{2}", &[]),
+        ("Not \\alpha but alhpa, in C:\\Usrs\\ben.", &["alhpa"]),
         // A hyphenated word is flagged by its wrong part.
         ("A well-known and well-knwn fact.", &["knwn"]),
         ("A non-trivial, state-of-the-art answer.", &[]),

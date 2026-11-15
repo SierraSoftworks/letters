@@ -5,7 +5,8 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Calls `each` with every word of `text`, as the byte ranges of its hyphen-joined parts: one range for
-/// "known", two for "well-known". Web and mail addresses are passed over.
+/// "known", two for "well-known". Web and mail addresses are passed over, and so is a word that directly
+/// follows a backslash: a TeX command such as `\sqrt` in a formula still being typed, or a step of a path.
 pub(crate) fn compounds(text: &str, mut each: impl FnMut(&[Range<usize>])) {
     let mut parts: Vec<Range<usize>> = Vec::new();
     let mut rest = 0;
@@ -17,6 +18,9 @@ pub(crate) fn compounds(text: &str, mut each: impl FnMut(&[Range<usize>])) {
         }
         for (at, word) in chunk.unicode_word_indices() {
             let range = start + at..start + at + word.len();
+            if text[..range.start].ends_with('\\') {
+                continue;
+            }
             if parts.last().is_some_and(|last| !is_hyphen(&text[last.end..range.start])) {
                 each(&parts);
                 parts.clear();
