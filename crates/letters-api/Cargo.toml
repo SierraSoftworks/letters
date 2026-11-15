@@ -1,0 +1,16 @@
+[package]
+name = "letters-api"
+description = "What a Letters server and the shells say to each other over HTTP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
