@@ -5,7 +5,7 @@
 //! moves the hidden input under the caret, where the input method's candidate window should open.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::mem;
 use std::ops::Range;
@@ -190,6 +190,12 @@ pub struct Shell {
     /// The pictures the document links to that the server fetched, by the address each link is written
     /// as, for a PDF to show what the window shows.
     linked: HashMap<String, Vec<u8>>,
+    /// The linked pictures the server would not fetch just then, having fetched all it does in a while, in
+    /// the order they are asked for again.
+    slow: VecDeque<(String, Linking)>,
+    on_slow: Function,
+    /// The timer for the next of them. `None` with pictures waiting while one is being asked for.
+    slow_timer: Option<i32>,
     /// The hosts whose pictures the person said they trust, for as long as the page is open. The server
     /// has nowhere to keep them.
     hosts: Vec<String>,
@@ -389,6 +395,9 @@ impl Shell {
                 identity,
                 server,
                 linked: HashMap::new(),
+                slow: VecDeque::new(),
+                on_slow: callback(shell, Self::link_again),
+                slow_timer: None,
                 hosts: Vec::new(),
                 leaving: None,
                 links: None,
@@ -2332,7 +2341,9 @@ impl Shell {
             self.view.set_picture_state(&src, Some(PictureState::Loading));
         }
         let (id, fetch) = (server.id.clone(), Fetch { url: src.clone(), asked });
-        let sent = fetching(&self.window, &paths::fetch_picture(&id), &fetch);
+        let fetch = serde_json::to_vec(&fetch).expect("an address to fetch is JSON");
+        let sent =
+            browser::ask_and_wait(&self.window, "POST", &paths::fetch_picture(&id), Some((letters_api::JSON, &fetch)));
         let (shell, window) = (self.me.clone(), self.window.clone());
         wasm_bindgen_futures::spawn_local(async move {
             let fetched = sent.await;
@@ -2345,15 +2356,20 @@ impl Shell {
             let Some(shell) = shell.upgrade() else { return };
             let mut shell = shell.borrow_mut();
             let shell = &mut *shell;
-            // The page may show another document by now.
+            // The page may show another document by now, which those that waited are not of either.
             if shell.server.as_ref().is_none_or(|server| server.id != id) {
-                return;
+                return shell.slow.clear();
             }
             let failed = |why: &str| Some(PictureState::Failed(why.to_owned()));
             match (fetched, link) {
                 // It waits to be asked for, as any picture from a source nobody said they trust.
-                (Err(refusal), Linking::Open) if refusal.code == Code::Untrusted => {}
-                (Err(refusal), _) => shell.view.set_picture_state(&src, failed(&reason(&refusal))),
+                (Err((refusal, _)), Linking::Open) if refusal.code == Code::Untrusted => {}
+                // The server has fetched all it does for now: the picture waits as it is, and its turn comes.
+                (Err((refusal, wait)), link) if refusal.code == Code::Slow => {
+                    shell.slow.push_back((src, link));
+                    return shell.link_later(wait.unwrap_or(SLOW_SECONDS));
+                }
+                (Err((refusal, _)), _) => shell.view.set_picture_state(&src, failed(&reason(&refusal))),
                 (Ok(_), Linking::Embed(figure)) => match picture {
                     Some(picture) => {
                         shell.view.set_picture_state(&src, None);
@@ -2369,8 +2385,28 @@ impl Shell {
                     None => shell.view.set_picture_state(&src, failed(NO_PICTURE)),
                 },
             }
+            // The server fetches again, so the next of those it would not is asked for.
+            if shell.slow_timer.is_none() {
+                shell.link_again();
+            }
             shell.arrived();
         });
+    }
+
+    /// Asks for the first of the pictures that wait for the server in `seconds`, unless a time is set.
+    fn link_later(&mut self, seconds: u32) {
+        let wait = seconds.clamp(1, SLOW_LONGEST).saturating_mul(1000) as i32;
+        let set = || self.window.set_timeout_with_callback_and_timeout_and_arguments_0(&self.on_slow, wait).ok();
+        self.slow_timer = self.slow_timer.or_else(set);
+    }
+
+    /// Asks for the first of the pictures that wait for the server. One is asked at a time: all of them
+    /// at once would be all the server fetches in that while, and each refused again.
+    fn link_again(&mut self) {
+        self.slow_timer = None;
+        if let Some((src, link)) = self.slow.pop_front() {
+            self.link(src, link);
+        }
     }
 
     /// Has the server read the page at an address for the window's link previews: what the page says of
@@ -2832,6 +2868,12 @@ enum Linking {
     /// The person wants it kept in this figure.
     Embed(BlockId),
 }
+
+/// How long a picture waits for a server that has fetched all it does for now and does not say how long:
+/// its count starts again with each minute.
+const SLOW_SECONDS: u32 = 60;
+/// The longest such a wait is, whatever the server says.
+const SLOW_LONGEST: u32 = 600;
 
 /// What a figure says of a file that was fetched for it and is no picture, as the desktop does.
 const NO_PICTURE: &str = "it is not a picture Letters can show";
