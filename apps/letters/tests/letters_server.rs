@@ -26,7 +26,7 @@ use letters_server::config::Config;
 use letters_server::session::{COOKIE_NAME, Carrier};
 use letters_server::store::Store;
 use letters_server::{App, api};
-use letters_sync::{ClientMessage, Link, Local, Progress, Refusal};
+use letters_sync::{ClientMessage, Link, Local, MAX_FRAME, Progress, Refusal};
 use sha2::{Digest, Sha256};
 
 /// Sign-ins are kept in memory here, never in the keychain of whoever runs the tests.
@@ -388,6 +388,10 @@ impl Desk {
                 }
                 Told::Refused(refusal) => self.refused.push(refusal),
                 Told::Unkept(name) => self.unkept.push(name),
+                Told::Whole => {
+                    self.save();
+                    self.line.saved();
+                }
                 Told::Link | Told::Progress | Told::Peers => {}
             }
         }
@@ -689,4 +693,52 @@ fn a_picture_is_with_the_server_before_the_edit_that_names_it() {
     let read = |desks: &[&mut Desk]| desks[1].reads().contains(&"Then the gutters.".to_owned());
     assert!(settle(&mut [&mut here, &mut there], read), "{:?}", there.reads());
     assert_eq!(here.unkept, ["assets/not-its-hash.png"]);
+}
+
+// A debug build takes two minutes to merge this much, and three sides here do.
+#[test]
+#[ignore = "takes minutes in a debug build: cargo test --release -p letters --test letters_server -- --ignored"]
+fn work_that_fits_no_frame_travels_as_the_file() {
+    let server = Server::start("line-whole");
+    let id = server.document(&server.session(ada()), "Roof repairs");
+    let mut here = Desk::open(&server, server.session(ada()), &id, "line-whole-here");
+    let mut there = Desk::open(&server, server.session(ada()), &id, "line-whole-there");
+    here.start();
+    there.start();
+    assert!(settle(&mut [&mut here, &mut there], |desks| desks.iter().all(|desk| live(desk))));
+
+    // More than a frame holds, in letters that do not pack: one device sends its file whole, and the
+    // other is brought the server's.
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut letters = |count: usize| -> String {
+        let letter = |_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            char::from(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"[(seed >> 58) as usize])
+        };
+        (0..count).map(letter).collect()
+    };
+    let paragraphs = MAX_FRAME / (64 << 10) + 32;
+    let mut document = here.writer.model.doc().clone();
+    document.blocks.extend(
+        (0..paragraphs).map(|n| Block::text(format!("p{n}").as_str(), BlockKind::Paragraph, letters(64 << 10))),
+    );
+    here.writer.write(&document);
+    let told = here.tell();
+    here.does(told);
+    assert_ne!(here.line.progress(), Progress::Saved);
+
+    let met = |desks: &[&mut Desk]| {
+        desks
+            .iter()
+            .all(|desk| live(desk) && desk.reads().len() == paragraphs && desk.line.progress() == Progress::Saved)
+    };
+    let all = settle(&mut [&mut here, &mut there], met);
+    assert!(all, "{:?} {:?} {} {}", here.line.link(), there.line.link(), here.reads().len(), there.reads().len());
+    assert!(here.refused.is_empty() && there.refused.is_empty(), "{:?} {:?}", here.refused, there.refused);
+
+    // And the line carries what is written after as it did before.
+    there.write("after", "Then the gutters.");
+    assert!(settle(&mut [&mut here, &mut there], |desks| desks[0].reads().len() == paragraphs + 1));
 }

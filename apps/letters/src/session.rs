@@ -149,6 +149,11 @@ impl Session {
         self.ask(|server, token| server.asset(token, id, name, most))
     }
 
+    /// Hands the server a document's whole `.let` file, for work that no frame of its socket carries.
+    pub fn keep_file(&self, id: &str, bytes: &[u8]) -> Result<(), Refused> {
+        self.ask(|server, token| server.keep_file(token, id, bytes))
+    }
+
     /// The names of the pictures the server holds for a document, each without `assets/`.
     pub fn assets(&self, id: &str) -> Result<Vec<String>, Refused> {
         self.ask(|server, token| server.get(token, &paths::assets(id)))

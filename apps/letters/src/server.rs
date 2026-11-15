@@ -181,6 +181,12 @@ impl Client {
         self.call(Verb::Put, &paths::asset(id, name), Some(token), Some((kind, bytes)), CARRYING, ANSWER).map(drop)
     }
 
+    /// Hands the server a document's whole `.let` file, which it merges into the document it holds.
+    pub fn keep_file(&self, token: &str, id: &str, bytes: &[u8]) -> Result<(), Refused> {
+        let body = Some((letters_format::MIMETYPE, bytes));
+        self.call(Verb::Put, &paths::file(id), Some(token), body, CARRYING, ANSWER).map(drop)
+    }
+
     fn send<T: DeserializeOwned>(
         &self,
         verb: Verb,

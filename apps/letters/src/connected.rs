@@ -16,8 +16,8 @@ use std::thread;
 use std::time::Duration;
 
 use letters_api::{Code, Opened, paths};
-use letters_format::Archive;
-use letters_model::{Model, Notes, Selection};
+use letters_format::{Archive, WorkingCopy};
+use letters_model::{Model, Notes, ReplicaId, Selection};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
 use sha2::{Digest, Sha256};
 use ureq::http::Uri;
@@ -230,6 +230,9 @@ pub enum Told {
     Refused(Refusal),
     /// The server did not take the picture of this name, so the others will not see it.
     Unkept(String),
+    /// What was written here fits no frame, so the server takes the copy's file whole. Save the copy, and
+    /// call [`Line::saved`] once its file holds all of it.
+    Whole,
     /// [`Line::link`] changed.
     Link,
     /// [`Line::progress`] changed.
@@ -239,12 +242,28 @@ pub enum Told {
 }
 
 /// What a line's window hands back to [`Line::heard`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Said {
     /// The socket of this number had something to say.
     Socket(u64, Heard),
     /// The pictures the server was owed were handed over, or could not be for now.
     Handed,
+    /// The copy's file was sent to the server whole, or why it was not.
+    Sent(Option<Refused>),
+    /// The document's file was brought from the server whole: its history and its notes. `None` when it
+    /// could not be had.
+    Brought(Option<(Vec<u8>, Notes)>),
+}
+
+/// A document's file on its way whole, when what one side has for the other fits no frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Whole {
+    No,
+    /// The server is to be sent the copy's file, once it holds what was written here.
+    Wanted,
+    Sending,
+    /// The server's file is on its way here.
+    Bringing,
 }
 
 /// What tells a line's window that there is something for [`Line::heard`]. It is called on another thread.
@@ -313,6 +332,22 @@ impl Handing {
         }
     }
 
+    /// Sends the server the copy's file whole. This waits on the network.
+    fn send(&self) -> Result<(), Refused> {
+        let file = fs::read(&self.copy).map_err(|error| Refused::Unreachable(error.to_string()))?;
+        self.session.keep_file(&self.id, &file)
+    }
+
+    /// The history and the notes of the document as the server's file holds it, to merge here. This
+    /// waits on the network.
+    fn bring(&self) -> Option<(Vec<u8>, Notes)> {
+        let file = self.session.file(&self.id, self.session.limits().ok()?.document).ok()?;
+        let mut file = Archive::open(io::Cursor::new(file)).ok()?;
+        // Nothing is written with it, so whose copy it is does not matter.
+        let copy = WorkingCopy::open(&mut file, ReplicaId::new(&crate::platform::block_id())).ok()?;
+        Some((copy.model().save(), copy.notes))
+    }
+
     /// Owes the server the pictures in the copy's file that it does not list.
     fn compare(&self, there: &BTreeSet<String>) {
         let Ok(file) = fs::File::open(&self.copy) else { return };
@@ -362,6 +397,9 @@ pub struct Line {
     hands: bool,
     /// When to try that again, after the server could not be given them.
     hand_at: Option<u64>,
+    whole: Whole,
+    /// When to try again to send the copy's file, after the server could not be reached.
+    send_at: Option<u64>,
 }
 
 impl Line {
@@ -390,6 +428,8 @@ impl Line {
             handing,
             hands: false,
             hand_at: None,
+            whole: Whole::No,
+            send_at: None,
         }
     }
 
@@ -430,6 +470,28 @@ impl Line {
                 // What is still owed could not be handed over now.
                 self.hand_at = self.owes().then_some(now + HAND_AGAIN);
                 return self.changed(local, now);
+            }
+            Said::Sent(None) => {
+                // The server has it all now, which a new handshake tells the client.
+                self.whole = Whole::No;
+                self.sync.stop();
+                self.sync.start(now);
+                return self.drain();
+            }
+            Said::Sent(Some(refused)) if passes(&refused) => {
+                (self.whole, self.send_at) = (Whole::Wanted, Some(now + HAND_AGAIN));
+                return Vec::new();
+            }
+            Said::Sent(Some(_)) => {
+                self.whole = Whole::No;
+                return vec![Told::Refused(Refusal::TooLarge)];
+            }
+            Said::Brought(brought) => {
+                self.whole = Whole::No;
+                let Some((edits, notes)) = brought else { return vec![Told::Link] };
+                // With the file merged, a handshake has little left to bring.
+                self.sync.start(now);
+                return [vec![Told::Merge(edits), Told::Notes(notes), Told::Link], self.drain()].concat();
             }
         };
         if socket != self.sockets {
@@ -477,6 +539,20 @@ impl Line {
         self.drain()
     }
 
+    /// The copy's file holds all that was written here, as after a save. Whatever waited for that goes.
+    pub fn saved(&mut self) {
+        if self.whole == Whole::Wanted {
+            self.send();
+        }
+    }
+
+    /// Sends the server the copy's file whole, on a thread of its own.
+    fn send(&mut self) {
+        (self.whole, self.send_at) = (Whole::Sending, None);
+        let (handing, tell) = (self.handing.clone(), self.tell.clone());
+        thread::spawn(move || tell(Said::Sent(handing.send().err())));
+    }
+
     /// Whether the server is owed pictures.
     fn owes(&self) -> bool {
         !self.handing.owed().pictures.is_empty()
@@ -513,23 +589,33 @@ impl Line {
     pub fn tick(&mut self, now: u64) -> Vec<Told> {
         self.sync.tick(now);
         self.hand(now);
+        // The file held the work when the server could not be reached, and holds it still.
+        if self.whole == Whole::Wanted && self.send_at.is_some_and(|at| at <= now) {
+            self.send();
+        }
         self.drain()
     }
 
     /// When to call [`Line::tick`] next. `None` when nothing is due.
     pub fn wake_at(&self) -> Option<u64> {
-        let (sync, hand) = (self.sync.wake_at(), self.hand_at);
-        sync.zip(hand).map(|(sync, hand)| sync.min(hand)).or(sync).or(hand)
+        [self.sync.wake_at(), self.hand_at, self.send_at].into_iter().flatten().min()
     }
 
     /// How the document stands to its server.
     pub fn link(&self) -> Link {
-        self.ended.map_or_else(|| self.sync.link(), Link::Refused)
+        match self.ended {
+            Some(refusal) => Link::Refused(refusal),
+            // The file is on its way, and the line starts again when it is here.
+            None if self.whole == Whole::Bringing => Link::Connecting,
+            None => self.sync.link(),
+        }
     }
 
-    /// Where the work written here is. Edits that wait for their pictures are on their way.
+    /// Where the work written here is. Edits that wait for their pictures are on their way, and so is
+    /// work that travels as the file.
     pub fn progress(&self) -> Progress {
         match self.sync.progress() {
+            _ if matches!(self.whole, Whole::Wanted | Whole::Sending) => Progress::Saving,
             Progress::Saved if self.hands || self.owes() => Progress::Saving,
             progress => progress,
         }
@@ -561,8 +647,23 @@ impl Line {
                 Event::Notes(notes) => told.push(Told::Notes(notes)),
                 // The copy on this device and its journal keep the work whether or not the server has it.
                 Event::Held(_) => {}
+                // No frame carries what was written here, so the file goes whole.
+                Event::Refused(Refusal::TooLarge) => {
+                    if self.whole != Whole::Sending {
+                        self.whole = Whole::Wanted;
+                        told.push(Told::Whole);
+                    }
+                }
                 Event::Refused(refusal) => told.push(Told::Refused(refusal)),
-                Event::Link => told.push(Told::Link),
+                Event::Link => {
+                    // No frame carries what the server has for this device, so its file comes whole.
+                    if self.sync.link() == Link::Refused(Refusal::TooLarge) && self.whole == Whole::No {
+                        self.whole = Whole::Bringing;
+                        let (handing, tell) = (self.handing.clone(), self.tell.clone());
+                        thread::spawn(move || tell(Said::Brought(handing.bring())));
+                    }
+                    told.push(Told::Link);
+                }
                 Event::Progress => told.push(Told::Progress),
                 Event::Peers => told.push(Told::Peers),
             }

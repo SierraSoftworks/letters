@@ -1332,6 +1332,14 @@ impl DocWindow {
                 // The work stays in the copy here. The person is told why it went no further.
                 Told::Refused(refusal) => self.view.set_notice(Some(&refusal.to_string())),
                 Told::Unkept(_) => self.view.set_notice(Some(UNKEPT)),
+                // The file goes to the server whole, once a save has put everything in it.
+                Told::Whole => {
+                    if self.unsaved() || self.saving.is_some() {
+                        self.save_at = Some(now);
+                    } else if let Some(remote) = &mut self.remote {
+                        remote.line.saved();
+                    }
+                }
                 Told::Link | Told::Progress => stands = true,
                 // Said below, with where each of them is now.
                 Told::Peers => {}
@@ -1742,6 +1750,9 @@ impl DocWindow {
         self.relocate(library);
         self.sent = Some(revision);
         self.save_failed = false;
+        if let Some(remote) = &mut self.remote {
+            remote.line.saved();
+        }
         let typed_since = self.view.edits() != edits;
         let mut met = false;
         if let Some(news) = news
