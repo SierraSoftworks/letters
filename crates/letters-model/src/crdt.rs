@@ -47,7 +47,7 @@ const EXTRA: &str = "extra";
 const STYLE: &str = "style";
 /// The writers' names, each against the replica its writer used.
 const AUTHORS: &str = "authors";
-/// The blocks whose conflict was settled, each against the replica the settling change is written as.
+/// The blocks whose conflict was settled, each against its [`Settling`].
 const SETTLED: &str = "settled";
 const LANGUAGE: &str = "language";
 const PROPERTIES: &str = "properties";
@@ -268,22 +268,31 @@ pub(crate) fn stretch(loro: &LoroDoc, body: &LoroText, range: Range<usize>) -> O
     Some((pieces, ids))
 }
 
+/// The settling of a block's conflict: the replica its change is written as, then who wrote the version it
+/// made stand, and when.
+pub(crate) type Settling = (u64, String, u64);
+
 /// Notes in the change that is open that it settles the conflict over `block`, for a later search to
-/// tell two settlings of one block apart.
-pub(crate) fn settled(loro: &LoroDoc, block: &BlockId) {
-    // Loro refuses no number under a string. The replica is the settling's own, and names it.
-    let _ = loro.get_map(SETTLED).insert(block.as_str(), loro.peer_id().cast_signed());
+/// tell two settlings of one block apart, and to tell whose version the block then reads as.
+pub(crate) fn settled(loro: &LoroDoc, block: &BlockId, author: &str, edited: u64) {
+    // The replica is the settling's own, and names it.
+    let held: Vec<LoroValue> = vec![loro.peer_id().cast_signed().into(), author.into(), edited.cast_signed().into()];
+    // Loro refuses no list of plain values under a string.
+    let _ = loro.get_map(SETTLED).insert(block.as_str(), held);
 }
 
-/// The replicas that settlings were written as, as the revision shown holds them. No person writes as one.
-pub(crate) fn settlers(loro: &LoroDoc) -> HashSet<u64> {
-    let mut settlers = HashSet::new();
-    loro.get_map(SETTLED).for_each(|_, held| {
-        if let ValueOrContainer::Value(LoroValue::I64(replica)) = held {
-            settlers.insert(replica.cast_unsigned());
+/// The last settling of each block, as the revision shown holds them. No person writes as its replica.
+pub(crate) fn settlings(loro: &LoroDoc) -> HashMap<String, Settling> {
+    let mut settlings = HashMap::new();
+    loro.get_map(SETTLED).for_each(|block, held| {
+        if let ValueOrContainer::Value(LoroValue::List(held)) = held
+            && let [LoroValue::I64(replica), author, LoroValue::I64(edited)] = held.as_slice()
+        {
+            let author = text(author).unwrap_or_default().to_owned();
+            settlings.insert(block.to_owned(), (replica.cast_unsigned(), author, edited.cast_unsigned()));
         }
     });
-    settlers
+    settlings
 }
 
 fn retain(retain: usize) -> TextDelta {

@@ -51,7 +51,8 @@ pub struct Conflict {
 pub struct Side {
     /// The block as this side left it. `None` when this side took it away.
     pub block: Option<Block>,
-    /// Who last changed it on this side. Empty when that writer gave no name.
+    /// Who last changed it on this side. Empty when that writer gave no name. Where a settled conflict was
+    /// the last change, it is the writer of the version that stood, and that version's time.
     pub author: String,
     /// When, in seconds since 1970 and right to the minute. A writer who never told the time is taken to
     /// have written when the newest edit it built on was made, and at 0 when none of those told either.
@@ -605,10 +606,11 @@ pub(crate) fn find(
     let near: Vec<Vec<ID>> = near.into_iter().map(|near| ids(&mut near.into_iter())).collect();
     show(sides[1])?;
     let (theirs, their_names) = (views(loro, body, &blocks, &olds, &second, &first), crdt::names(loro));
-    let their_settlers = crdt::settlers(loro);
+    let their_settlings = crdt::settlings(loro);
     show(sides[0])?;
     let (ours, our_names) = (views(loro, body, &blocks, &olds, &first, &second), crdt::names(loro));
-    let (names, settlers) = ([our_names, their_names], [crdt::settlers(loro), their_settlers]);
+    let (names, settlings) = ([our_names, their_names], [crdt::settlings(loro), their_settlings]);
+    let settlers = settlings.each_ref().map(|side| side.values().map(|by| by.0).collect::<HashSet<u64>>());
 
     // The characters either side may have cut: the old ones of the blocks and of what stands with them.
     let is_old = |id: &ID| shared.includes_id(*id);
@@ -648,12 +650,20 @@ pub(crate) fn find(
             [0, 1].map(|side| made[side].iter().filter_map(|id| Stamp::of(loro, *id)).max().unwrap_or(newest[side]));
         let later = usize::from(stamps[1] > stamps[0]);
         let [ours, theirs] = held;
-        let side = |nth: usize, held: &Held| Side {
-            block: held.block.clone(),
-            author: names[nth].get(&stamps[nth].replica).cloned().unwrap_or_default(),
-            edited: u64::try_from(stamps[nth].time).unwrap_or(0),
+        let side = |nth: usize, held: &Held| {
+            let stamp = stamps[nth];
+            // A side that a settling changed last reads as the version that settling made stand.
+            let kept = settlings[nth].get(old.block.as_str()).filter(|(replica, ..)| *replica == stamp.replica);
+            let (author, edited) = match kept {
+                Some((_, author, edited)) => (author.clone(), *edited),
+                None => {
+                    (names[nth].get(&stamp.replica).cloned().unwrap_or_default(), stamp.time.try_into().unwrap_or(0))
+                }
+            };
+            Side { block: held.block.clone(), author, edited }
         };
-        let conflict = Conflict { block: old.block, sides: [side(0, &ours), side(1, &theirs)], later };
+        let sides = [side(0, &ours), side(1, &theirs)];
+        let conflict = Conflict { block: old.block, sides, later };
         let settled = [0, 1].iter().all(|side| settlers[*side].contains(&stamps[*side].replica));
         let old = !old.place.is_empty();
         let (keep, drop) = if later == 0 { (ours, theirs) } else { (theirs, ours) };
@@ -867,7 +877,9 @@ pub(crate) fn settle(loro: &LoroDoc, body: &LoroText, sides: [&Frontiers; 2], cl
     }
     // A part Loro refused leaves the rest written, here as on every device.
     let _ = crdt::write_as_told(loro, body, &delta);
-    clashes.iter().for_each(|clash| crdt::settled(loro, &clash.conflict.block));
+    for Conflict { block, sides, later } in clashes.iter().map(|clash| &clash.conflict) {
+        crdt::settled(loro, block, &sides[*later].author, sides[*later].edited);
+    }
     loro.commit();
     true
 }

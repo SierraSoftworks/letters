@@ -449,6 +449,31 @@ fn a_block_two_devices_settled_apart_is_settled_again() {
 }
 
 #[test]
+fn a_version_a_settling_made_stand_is_told_as_its_writers() {
+    let (mut ana, mut ben) = writers();
+    write(&mut ana, vec![("h", Edit::Add("wain"))]);
+    write(&mut ben, vec![("h", Edit::Before("Boats", "Row"))]);
+    let (her, him) = (ana.revision(), ben.revision());
+    let (hers, his) = (ana.save(), ben.save());
+    // Eve reads on from Ben and parts his word in two, so Ana's ending is no change to a word of hers.
+    let mut eve = ben.fork(ReplicaId::from(3));
+    eve.set_author("Eve");
+    eve.set_time(MORNING + 2 * HOUR);
+    write(&mut eve, vec![("h", Edit::After("Row", " "))]);
+    let read = eve.revision();
+    assert_eq!(meet(&mut eve, &hers, &read, &her), []);
+    // Ana's device settled the heading meanwhile. Ben's version stood, by a change in no one's name.
+    assert_eq!(meet(&mut ana, &his, &her, &him).len(), 1);
+    assert_eq!(text(&ana, "h").as_deref(), Some("RowBoats"));
+
+    let (settled, written) = (ana.revision(), eve.revision());
+    let found = meet(&mut ana, &eve.save(), &settled, &written);
+    let [conflict] = found.as_slice() else { panic!("one block conflicts, not {}", found.len()) };
+    let told = conflict.sides.each_ref().map(|side| (side.author.as_str(), side.edited));
+    assert_eq!(told, [("Ben", MORNING + HOUR), ("Eve", MORNING + 2 * HOUR)]);
+}
+
+#[test]
 fn settling_twice_changes_nothing_and_no_undo_step_is_lost_to_it() {
     let (mut ana, mut ben) = writers();
     write(&mut ana, vec![("p2", Edit::Add(" We sailed.")), ("p1", Edit::Swap("quick", "slow"))]);
