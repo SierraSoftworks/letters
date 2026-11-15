@@ -104,6 +104,15 @@ ureq = { version = "3", default-features = false, features = ["rustls", "platfor
 # A server for the fetch's tests.
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# The system's own word on a server's certificate, for the socket to a Letters server. ureq brings it too.
+rustls-platform-verifier = "0.7"
+# Keeps a server's sign-in in the system's keychain: Keychain on macOS, Credential Manager on Windows, the
+# Secret Service elsewhere.
+keyring = "4"
+# What keyring is built on, named so that tests can keep sign-ins in memory and not in a real keychain.
+keyring-core = "1"
+# The socket a document syncs over in connected mode. It speaks over the TLS the shell sets up itself.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # Already in the tree through accesskit. Linux only: it asks the desktop for its settings.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 getrandom = "0.4"

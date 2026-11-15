@@ -39,6 +39,11 @@ encoding_rs.workspace = true
 toml_edit.workspace = true
 image.workspace = true
 ureq.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+tungstenite.workspace = true
+keyring.workspace = true
+keyring-core.workspace = true
 pollster.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
@@ -47,4 +52,3 @@ zbus.workspace = true
 [dev-dependencies]
 hayro.workspace = true
 rcgen.workspace = true
-rustls.workspace = true

@@ -11,7 +11,6 @@ use common::Scratch;
 use letters::remote::{self, Failed, Roots};
 use letters::trust::{self, Trusted};
 use letters_trust::{FetchError, ImageFetch, ImageType, Limits, Origin, Source};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// The largest picture the fetches here take, in bytes.
 const MOST: u64 = 2048;
@@ -66,20 +65,11 @@ struct Server {
 
 impl Server {
     fn start() -> Self {
-        let made = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-        let certificate = made.cert.der().to_vec();
-        let key = PrivateKeyDer::try_from(made.signing_key.serialize_der()).unwrap();
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![CertificateDer::from(certificate.clone())], key)
-            .unwrap();
+        let (config, certificate) = common::tls();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let asked = Arc::new(Mutex::new(Vec::new()));
-        let (config, heard) = (Arc::new(config), asked.clone());
+        let heard = asked.clone();
         thread::spawn(move || {
             for socket in listener.incoming().flatten() {
                 let Ok(connection) = rustls::ServerConnection::new(config.clone()) else { continue };
