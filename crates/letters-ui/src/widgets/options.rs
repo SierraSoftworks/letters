@@ -8,6 +8,7 @@ use accesskit::Role;
 use crate::element::Element;
 use crate::style::{Align, Edges, Look};
 use crate::text::TextStyle;
+use crate::theme::accent;
 use crate::tokens;
 
 /// The least height of a choice's row.
@@ -138,5 +139,5 @@ fn row<M>(choice: Choice<M>, picked: bool) -> Element<M> {
     if let Some(message) = choice.on_take {
         row = row.on_press(message);
     }
-    if picked { row.bg(tokens::ACCENT_SOFT) } else { row }
+    if picked { row.bg(accent().soft) } else { row }
 }

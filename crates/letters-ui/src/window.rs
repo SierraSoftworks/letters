@@ -36,10 +36,12 @@ use crate::refer::{Picking, Refer};
 use crate::references::{self, Preview, Reference, References};
 use crate::renaming::{Outcome, Rename, Renaming};
 use crate::restyle::{self, Field, StyleEdit};
+use crate::settings::{Dialog, Setting, Settings};
 use crate::spelling::{Fix, Spelling};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::styles::{self, Styles, Styling};
 use crate::text::{Family, FontShaper, TextShaper, TextStyle};
+use crate::theme::{Accent, accent};
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::ui::{App, DRAG_SLOP, Idle, Keys, Ui};
 use crate::widgets::{
@@ -178,6 +180,8 @@ pub enum Message {
     Insert(Inserting),
     /// What is asked of the list of figures under a reference being typed.
     Refer(Picking),
+    /// What the settings dialog asks for.
+    Settings(Setting),
 }
 
 impl Ui<EditorApp> {
@@ -285,6 +289,31 @@ impl Ui<EditorApp> {
         let app = self.app_mut();
         app.show(Some(Panel::Styles));
         app.styles.offer(name, json);
+    }
+
+    /// Says what the person has set for themselves, at the start and whenever another window changed it. The
+    /// window takes the accent from it. Light or dark stays with [`Window::set_dark`], and the name edits
+    /// carry with [`Window::set_author`], since only the shell knows what the system and the account say.
+    pub fn set_settings(&mut self, settings: Settings) {
+        let app = self.app_mut();
+        app.settings = settings;
+        app.tint();
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.app().settings
+    }
+
+    /// Names the languages the shell has dictionaries for, as BCP 47 tags, for the settings to offer beside
+    /// the kinds of English that are built in.
+    pub fn set_languages(&mut self, languages: impl IntoIterator<Item = impl Into<String>>) {
+        self.app_mut().dialog.languages = languages.into_iter().map(Into::into).collect();
+    }
+
+    /// Says what the person's account calls them: the name their edits carry while they have set none,
+    /// which the settings show in the empty name field.
+    pub fn set_account_name(&mut self, name: Option<&str>) {
+        self.app_mut().dialog.account = name.map(str::to_owned);
     }
 
     /// Says what the desktop expects of the window's frame and bar: see [`Chrome`]. Call it at the start
@@ -498,6 +527,10 @@ pub struct EditorApp {
     shaper: Rc<FontShaper>,
     palette: Palette,
     scheme: Scheme,
+    /// The person's accent, worked out from their settings.
+    accent: Accent,
+    settings: Settings,
+    dialog: Dialog,
     /// The text column's left edge inside the page area, and its width.
     column: (f32, f32),
     /// The height of the page area.
@@ -573,6 +606,9 @@ impl EditorApp {
             shaper,
             palette: Palette::LIGHT,
             scheme: Scheme::Light,
+            accent: Accent::YEWI,
+            settings: Settings::default(),
+            dialog: Dialog::default(),
             column: (0.0, 0.0),
             height: 0.0,
             scroll: 0.0,
@@ -612,6 +648,17 @@ impl EditorApp {
             previewed: None,
             told: RefCell::default(),
         }
+    }
+
+    /// Takes the page's colours for the scheme and the accent the person set. Of the page, only what is
+    /// selected shows in the accent: the rest is the document's to colour, and looks the same to everyone.
+    fn tint(&mut self) {
+        self.accent = self.settings.accent.map_or(Accent::YEWI, Accent::of);
+        self.palette = palette(self.scheme);
+        if self.accent != Accent::YEWI {
+            self.palette.selection = resolve(fade(self.accent.base, 0.3), self.scheme, 1.0);
+        }
+        self.layout.set_palette(self.palette);
     }
 
     /// The first Heading 1, which names a document that has no name of its own.
@@ -1169,7 +1216,7 @@ impl EditorApp {
             list.items.push(Item::Fill { rect: bar, color: resolve(tokens::ACCENT, self.scheme, 1.0), radius: 2.0 });
         }
         // A figure that is selected has a ring round its picture, and a selected picture is where the caret is.
-        let ring = resolve(tokens::ACCENT, self.scheme, 1.0);
+        let ring = resolve(accent().base, self.scheme, 1.0);
         let pictures = self.editor.figures().into_iter().filter_map(|figure| self.layout.figure(&figure));
         list.items.extend(pictures.map(|figure| {
             let image = figure.image;
@@ -1359,7 +1406,7 @@ impl EditorApp {
                 .width(width)
                 .height(pitch)
                 .padding(Edges::left(CHAPTER_INDENT * f32::from((level - shallowest).min(CHAPTER_STEPS))))
-                .fg(if here { tokens::ACCENT } else { fade(tokens::FG_MUTED, 0.5) })
+                .fg(if here { accent().base } else { fade(tokens::FG_MUTED, 0.5) })
                 .hover(Look::NONE.with_fg(tokens::FG))
                 .focused(Look::NONE.with_fg(tokens::FG))
                 .ring(Ring::Outline(0.0))
@@ -1397,7 +1444,9 @@ impl EditorApp {
             .separator()
             .item(MenuItem::new("Export").icon(icon::DOWNLOAD).disabled(true))
             .item(MenuItem::new("Print view").icon(icon::PRINTER).disabled(true))
-            .item(MenuItem::new("Page setup").icon(icon::SETTINGS).disabled(true));
+            .item(MenuItem::new("Page setup").icon(icon::FILE_TEXT).disabled(true))
+            .separator()
+            .item(MenuItem::new("Settings").icon(icon::SETTINGS).on_select(Message::Settings(Setting::Show)));
 
         // The forms of the bar, from the widest. Once the layout has said which fits, only that one is built.
         let forms = [
@@ -1605,7 +1654,7 @@ impl EditorApp {
             let dot = Element::row().width(18.0).height(18.0).radius(9.0).bg(shown(&hex));
             let swatch = Element::row()
                 .padding(Edges::all(2.0))
-                .border(Edges::all(2.0), if chosen { tokens::ACCENT } else { fade(tokens::FG, 0.0) })
+                .border(Edges::all(2.0), if chosen { accent().base } else { fade(tokens::FG, 0.0) })
                 .radius(13.0)
                 .hover(Look::bg(tokens::NEUTRAL_SOFT))
                 .ring(Ring::Outline(2.0))
@@ -1983,7 +2032,9 @@ impl App for EditorApp {
         let page = self.page(Size { width: room.max(0.0), height: (window.height - bar).max(0.0) });
         let page = Element::row().grow(1.0).child(page).children(self.chapters());
         let body = Element::row().grow(1.0).child(page).children(panel);
-        let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).child(body);
+        // The settings come last, so that they lie over whatever else is out.
+        let settings = self.dialog.view(&self.settings);
+        let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).child(body).children(settings);
         if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
     }
 
@@ -2048,6 +2099,12 @@ impl App for EditorApp {
             Message::Refer(Picking::Close) => {
                 self.edit(platform, |editor, platform| editor.run(Command::DismissReference, platform));
             }
+            Message::Settings(message) => {
+                if self.dialog.update(message, &mut self.settings) {
+                    self.tint();
+                    self.requests.push(Request::Settings(self.settings.clone()));
+                }
+            }
             Message::Jump(block) => {
                 let start = Pos { block, offset: 0 };
                 self.editor.select(Selection::caret(start.clone()));
@@ -2102,11 +2159,17 @@ impl App for EditorApp {
             self.unpoint();
         }
         // The editor leaves this one to the window, which edits the link in place.
-        let link = event.key == Key::Char('k') && event.mods == Modifiers { primary: true, ..Modifiers::default() };
+        let primary = Modifiers { primary: true, ..Modifiers::default() };
+        let link = event.key == Key::Char('k') && event.mods == primary;
         if !used && link {
             self.link = Some(self.editor.link().unwrap_or_default().to_owned());
         }
-        used || link
+        // The settings open as they do in most apps, where the system keeps no menu for them.
+        let settings = !used && event.key == Key::Char(',') && event.mods == primary;
+        if settings {
+            self.dialog.open = true;
+        }
+        used || link || settings
     }
 
     fn describe(&self, page: &mut AccessNode, nodes: &mut Vec<(NodeId, AccessNode)>, whole: bool) {
@@ -2163,8 +2226,11 @@ impl App for EditorApp {
 
     fn scheme(&mut self, scheme: Scheme) {
         self.scheme = scheme;
-        self.palette = palette(scheme);
-        self.layout.set_palette(self.palette);
+        self.tint();
+    }
+
+    fn accent(&self) -> Accent {
+        self.accent
     }
 
     fn reduced_motion(&mut self, reduced: bool) {

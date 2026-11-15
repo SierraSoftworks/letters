@@ -5,6 +5,7 @@
 use letters_render::Point;
 
 use crate::chrome::Edge;
+use crate::settings::Settings;
 
 /// What the window asks its shell to do. Collect them with `Window::take_requests` after each event.
 ///
@@ -51,6 +52,10 @@ pub enum Request {
     },
     /// The file that was offered is not wanted. The card is already gone.
     CancelImport,
+    /// Keep these as the person's settings, and tell every other window of them with
+    /// `Window::set_settings`. The window that asks already follows the accent. The rest is the shell's to
+    /// follow: light or dark, the name edits are signed with, and the language of new documents.
+    Settings(Settings),
     /// Move the window with the pointer, which is held down on the bar: a bar that is the title bar asks
     /// (see `Window::set_chrome`).
     DragWindow,

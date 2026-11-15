@@ -11,6 +11,7 @@ use crate::icon;
 use crate::opening::Request;
 use crate::style::{Align, Dir, Edges, Justify, Look};
 use crate::text::TextStyle;
+use crate::theme::accent;
 use crate::tokens;
 use crate::widgets::{Button, Popover};
 use crate::window::Message;
@@ -220,7 +221,7 @@ impl Importing {
     fn choice(&self, label: &str, on: bool, message: Message) -> Element<Message> {
         let tick = Element::row().width(TICK).height(TICK).radius(4.0).align(Align::Center).justify(Justify::Center);
         let tick = match on {
-            true => tick.bg(tokens::ACCENT_SOLID).child(Element::icon(icon::CHECK, 12.0).fg(tokens::ON_SOLID)),
+            true => tick.bg(accent().solid).child(Element::icon(icon::CHECK, 12.0).fg(tokens::ON_SOLID)),
             false => tick.border(Edges::all(1.0), tokens::LINE_STRONG),
         };
         Element::row()

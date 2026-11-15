@@ -18,6 +18,7 @@ use crate::layout::{Layout, TextCache, inner, position};
 use crate::paint::{self, Scene, Tip};
 use crate::style::{Align, Dir};
 use crate::text::TextShaper;
+use crate::theme::{self, Accent};
 use crate::tokens::Scheme;
 use crate::tree::{Id, Tree};
 use crate::widgets::Placement;
@@ -79,6 +80,12 @@ pub trait App {
 
     /// Told when the window turns light or dark, for what the app draws itself. Elements follow on their own.
     fn scheme(&mut self, _scheme: Scheme) {}
+
+    /// The accent the window shows: yewi's own, unless the app keeps another for the person. Asked before
+    /// the window is described, and every element then follows it.
+    fn accent(&self) -> Accent {
+        Accent::YEWI
+    }
 
     /// Told which system's key conventions to follow, for the keys the app handles itself. Text fields
     /// follow on their own.
@@ -165,6 +172,8 @@ pub struct Ui<A: App> {
     size: Size,
     scale: f32,
     scheme: Scheme,
+    /// The app's accent as of the last build, which the frame is painted in.
+    accent: Accent,
     keys: Keys,
     /// Whether the window has the keyboard.
     active: bool,
@@ -212,6 +221,7 @@ impl<A: App> Ui<A> {
             size: Size::default(),
             scale: 1.0,
             scheme: Scheme::Light,
+            accent: Accent::YEWI,
             keys: Keys::default(),
             active: true,
             stale: Stale { view: true, layout: true, paint: true },
@@ -315,7 +325,7 @@ impl<A: App> Ui<A> {
             scroll: &self.scroll,
             tip: self.tip.as_ref(),
         };
-        paint::paint(&self.tree, &scene, self.window(), out);
+        theme::with(self.accent, || paint::paint(&self.tree, &scene, self.window(), out));
     }
 
     /// Advances what moves on its own: the caret's blink, and the app's idle work. Returns when to call
@@ -1239,8 +1249,10 @@ impl<A: App> Ui<A> {
         if self.stale.view {
             self.stale = Stale { view: false, layout: true, paint: true };
             self.idle.0 = true;
-            let open = &self.open;
-            self.tree = Tree::build(self.app.view(self.size), |id| open.contains(&id));
+            let (open, app, size) = (&self.open, &mut self.app, self.size);
+            // The widgets take the accent as they are built.
+            self.accent = app.accent();
+            self.tree = theme::with(self.accent, || Tree::build(app.view(size), |id| open.contains(&id)));
             self.settle();
         }
         if self.stale.layout {

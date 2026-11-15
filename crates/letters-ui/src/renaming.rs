@@ -14,6 +14,7 @@ use crate::icon;
 use crate::opening::{Folder, Location, Request};
 use crate::style::{Align, Dir, Edges, Look};
 use crate::text::TextStyle;
+use crate::theme::accent;
 use crate::tokens;
 use crate::widgets::{Button, ControlSize, Popover, Side, TextField};
 use crate::window::Message;
@@ -274,8 +275,8 @@ impl Renaming {
             row = row.expanded(open);
         }
         if picked {
-            let over = Look::bg(fade(tokens::ACCENT, 0.18));
-            row = row.bg(tokens::ACCENT_SOFT).hover(over).focused(over);
+            let over = Look::bg(fade(accent().base, 0.18));
+            row = row.bg(accent().soft).hover(over).focused(over);
         }
         if here {
             let quiet = TextStyle::control().size(tokens::TEXT_SM);

@@ -16,6 +16,7 @@ use crate::layout::position;
 use crate::motion::{self, EASE_IN_OUT, FRAME_MS};
 use crate::style::Align;
 use crate::text::{TextShaper, TextStyle};
+use crate::theme::accent;
 use crate::tokens::{self, Scheme};
 use crate::widgets::{Placement, Side};
 
@@ -227,7 +228,7 @@ pub(crate) fn light(figure: Rect, pictures: &[Rect], progress: f32, scheme: Sche
         let (start, end) = (snap(left + n as f32 * strip), snap(left + (n + 1) as f32 * strip));
         // Brightest in the middle of the band, and nothing at its edges.
         let share = 1.0 - ((n as f32 + 0.5) / STRIPS as f32 * 2.0 - 1.0).abs();
-        let color = resolve(tokens::ACCENT, scheme, LIGHT * share);
+        let color = resolve(accent().base, scheme, LIGHT * share);
         for picture in pictures {
             let (from, to) = (start.max(picture.x), end.min(picture.x + picture.width));
             if from < to {
@@ -246,7 +247,7 @@ pub(crate) fn mark(picture: Rect, scheme: Scheme, out: &mut DisplayList) {
         picture.width + 2.0 * MARK_GAP,
         picture.height + 2.0 * MARK_GAP,
     );
-    out.push(Item::Stroke { rect, color: resolve(tokens::ACCENT, scheme, 1.0), width: 2.0, radius: MARK_GAP });
+    out.push(Item::Stroke { rect, color: resolve(accent().base, scheme, 1.0), width: 2.0, radius: MARK_GAP });
 }
 
 /// What a preview says under a figure's picture: its label and caption, cut short when it runs on. `None`

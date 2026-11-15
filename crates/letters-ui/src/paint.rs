@@ -12,6 +12,7 @@ use crate::input::InputState;
 use crate::layout::inner;
 use crate::style::{Edges, Ring};
 use crate::text::{Shaped, TextStyle};
+use crate::theme::accent;
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::tree::{Id, Tree};
 
@@ -196,7 +197,7 @@ fn node<M>(
                 let (start, end) = state.ordered(&input.value);
                 if focused && composing.is_none() && start != end {
                     let rect = span(start..end, top, shaped.size.height);
-                    out.push(Item::Fill { rect, color: color(fade(tokens::ACCENT, 0.3)), radius: 0.0 });
+                    out.push(Item::Fill { rect, color: color(fade(accent().base, 0.3)), radius: 0.0 });
                 }
                 match &n.hint {
                     Some(hint) => hint.paint(Point { x: content.x, y: top }, color(tokens::FG_SUBTLE), out),
@@ -250,7 +251,7 @@ fn node<M>(
         if let Some(grow) = offset {
             let ring = Rect::new(rect.x - grow, rect.y - grow, rect.width + 2.0 * grow, rect.height + 2.0 * grow);
             let radius = if style.radius > 0.0 { (style.radius + grow).max(0.0) } else { 0.0 };
-            let ink = el.focused.border.unwrap_or(tokens::FOCUS);
+            let ink = el.focused.border.unwrap_or(accent().focus());
             rings.push(Item::Stroke { rect: ring, color: color(ink), width: RING, radius });
         }
     }

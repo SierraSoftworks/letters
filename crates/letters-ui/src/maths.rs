@@ -26,6 +26,7 @@ use crate::motion::{self, FRAME_MS};
 use crate::style::{Align, Edges};
 use crate::tex::{self, Part};
 use crate::text::{Family, Shaped, TextShaper, TextStyle};
+use crate::theme::accent;
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::widgets::{Choice, Options, Popover};
 use crate::window::{CARET_WIDTH, Message};
@@ -559,7 +560,7 @@ impl Maths {
         let source = Rc::new(source);
         let (mut inks, mut lined) = source.marks(fault.as_ref().and_then(|fault| fault.range.as_ref()), writing);
         // The command being typed is in the accent and underlined, whatever it would be otherwise.
-        let typed = symbols.iter().flat_map(|(range, _)| source.spans(range)).map(|span| (span, tokens::ACCENT_TEXT));
+        let typed = symbols.iter().flat_map(|(range, _)| source.spans(range)).map(|span| (span, accent().text));
         inks.extend(typed.clone());
         lined.extend(typed);
         let composing = source.composing.iter().flat_map(|range| source.spans(range)).collect();
@@ -696,7 +697,7 @@ impl Paint for SourcePaint {
     fn paint(&self, rect: Rect, _visible: Rect, scheme: Scheme, out: &mut DisplayList) {
         let origin = Point { x: rect.x, y: rect.y - self.shift };
         let placed = |span: &Rect| Rect { x: origin.x + span.x, y: origin.y + span.y, ..*span };
-        let selection = resolve(fade(tokens::ACCENT, 0.3), scheme, 1.0);
+        let selection = resolve(fade(accent().base, 0.3), scheme, 1.0);
         out.items.extend(self.selected.iter().map(|span| Item::Fill {
             rect: placed(span),
             color: selection,
@@ -725,7 +726,7 @@ impl Paint for SourcePaint {
 /// The tint behind a formula whose sheet is out, for a formula drawn in `rect`.
 pub(crate) fn tint(rect: Rect, scheme: Scheme) -> Item {
     let rect = Rect::new(rect.x - HALO, rect.y - HALO, rect.width + 2.0 * HALO, rect.height + 2.0 * HALO);
-    Item::Fill { rect, color: resolve(tokens::ACCENT_SOFT, scheme, 1.0), radius: HALO }
+    Item::Fill { rect, color: resolve(accent().soft, scheme, 1.0), radius: HALO }
 }
 
 #[cfg(test)]

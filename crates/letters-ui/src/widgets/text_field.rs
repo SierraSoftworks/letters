@@ -8,6 +8,7 @@ use crate::color::mix;
 use crate::element::{Element, Input};
 use crate::style::{Edges, Look, Ring};
 use crate::text::{Family, TextStyle};
+use crate::theme::accent;
 use crate::tokens;
 use crate::widgets::ControlSize;
 
@@ -121,7 +122,7 @@ impl<M> From<TextField<M>> for Element<M> {
         }
         let read_only = field.on_input.is_none();
         let (border, accent) =
-            if field.invalid { (tokens::DANGER, tokens::DANGER) } else { (tokens::LINE_STRONG, tokens::FOCUS) };
+            if field.invalid { (tokens::DANGER, tokens::DANGER) } else { (tokens::LINE_STRONG, accent().focus()) };
         // A field that cannot be used steps back with a tonal fill, not by fading.
         let (bg, fg) = match (field.disabled, read_only) {
             (true, _) => (tokens::TONE_1, tokens::FG_MUTED),
