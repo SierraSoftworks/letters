@@ -1,5 +1,7 @@
-//! The native window calls winit does not make. This is the one crate of Letters that may use `unsafe`,
-//! and it holds nothing else.
+//! The native calls winit does not make. This is the one crate of Letters that may use `unsafe`, and it
+//! holds nothing else.
+//!
+//! Besides the window calls it maps font files into memory ([`map_font`]), which is unsafe for any crate.
 //!
 //! Every call is optional and is there on every system. Each says whether it worked, and where one did
 //! not the app runs as it would without this crate: square corners and no shadow of its own on Wayland, a
@@ -7,6 +9,7 @@
 
 #[cfg(target_os = "macos")]
 mod macos;
+mod map;
 #[cfg(target_os = "macos")]
 mod print;
 #[cfg_attr(not(all(unix, not(target_os = "macos"))), path = "no_wayland.rs")]
@@ -14,6 +17,7 @@ pub mod wayland;
 
 #[cfg(target_os = "macos")]
 pub use macos::{lights, unify_title_bar};
+pub use map::{Mapped, map_font};
 #[cfg(target_os = "macos")]
 pub use print::print_pdf;
 

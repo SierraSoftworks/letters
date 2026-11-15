@@ -154,21 +154,33 @@ fn before(window: &mut Harness) -> Option<Found> {
     window.controls().into_iter().find(|found| found.role == Role::Note && found.name.starts_with("Before"))
 }
 
-/// How many stretches of words are marked as only the earlier version's, and as only the later one's.
-fn marked(window: &mut Harness) -> [usize; 2] {
-    let fills: Vec<Color> = window
+/// What is tinted as only the earlier version's, and as only the later one's.
+fn tinted(window: &mut Harness) -> [Vec<Rect>; 2] {
+    let fills: Vec<(Rect, Color)> = window
         .paint()
         .items
         .into_iter()
         .filter_map(|item| match item {
-            Item::Fill { color, .. } => Some(color),
+            Item::Fill { rect, color, .. } => Some((rect, color)),
             _ => None,
         })
         .collect();
     [tokens::WARN_SOFT, tokens::INFO_SOFT].map(|ink| {
         let tint = Color::rgba(ink.light.r, ink.light.g, ink.light.b, ink.light.a);
-        fills.iter().filter(|color| **color == tint).count()
+        fills.iter().filter(|(_, color)| *color == tint).map(|(rect, _)| *rect).collect()
     })
+}
+
+/// How many stretches of words are marked as only the earlier version's, and as only the later one's.
+fn marked(window: &mut Harness) -> [usize; 2] {
+    let area = area(window);
+    tinted(window).map(|tinted| tinted.iter().filter(|rect| rect.width < area.width).count())
+}
+
+/// The bands across the page area that hold what only the earlier version has, and what only the later.
+fn bands(window: &mut Harness) -> [Vec<Rect>; 2] {
+    let area = area(window);
+    tinted(window).map(|tinted| tinted.into_iter().filter(|rect| rect.width >= area.width).collect())
 }
 
 /// The part of the window the version shows in.
@@ -607,6 +619,26 @@ fn a_version_shows_what_it_changed_from_the_version_before_it() {
 }
 
 #[test]
+fn what_only_one_version_has_lies_in_a_band_across_the_page() {
+    let mut window = plan();
+    let area = area(&mut window);
+    let [gone, came] = bands(&mut window);
+    // The band of each version's colour, and the last paragraph of what only that version has.
+    for (name, bands, holds) in [("taken out", gone, PLAN[4]), ("added", came, HERS[5])] {
+        let [band] = bands[..] else { panic!("{name}: one stretch lies in one band, not {bands:?}") };
+        assert!(band.x <= area.x && band.x + band.width >= area.x + area.width, "{name}: from edge to edge");
+        // What the band holds is the stretch: its last line is the paragraph's.
+        let line = lines(&mut window, band).pop().expect("text in the band");
+        let at = ends(area, line)[0];
+        window.advance(2_000).click_at(at).click_at(at).click_at(at).key("Mod+C");
+        assert_eq!(copied(&window), Some(holds), "{name}");
+    }
+    let [gone, came] = bands(&mut window);
+    let (gone, came) = (gone[0], came[0]);
+    assert!(gone.y + gone.height <= came.y, "down the page as the stretches are: {gone:?} and {came:?}");
+}
+
+#[test]
 fn a_version_compared_with_the_document_shows_what_has_changed_since() {
     let mut window = plan();
     window.click(Role::ListBoxOption, "11:30").click(Role::RadioButton, "Current");
@@ -645,6 +677,7 @@ fn a_version_with_nothing_to_compare_it_with_shows_as_it_read() {
         assert_eq!(differing(&mut window), [], "{name}: nothing is said to differ");
         assert!(before(&mut window).is_none(), "{name}: no block shows twice");
         assert_eq!(marked(&mut window), [0, 0], "{name}: no words are marked");
+        assert_eq!(bands(&mut window), [vec![], vec![]], "{name}: nothing lies in a band");
         // A heading is written here with the signs that Markdown makes one from.
         let expected: Vec<&str> = reads.iter().map(|text| text.trim_start_matches(['#', ' '])).collect();
         if !expected.is_empty() {

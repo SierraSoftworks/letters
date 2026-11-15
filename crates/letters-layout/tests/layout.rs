@@ -438,6 +438,26 @@ fn a_text_reads_from_the_side_its_first_letter_does() {
 }
 
 #[test]
+#[cfg(feature = "dictionaries")]
+fn a_line_of_thai_ends_between_words() {
+    // Thai is written without spaces. These are words a dictionary keeps whole.
+    const WORDS: [&str; 9] = ["ภาษา", "ไทย", "เป็น", "ภาษา", "ราชการ", "ของ", "ประเทศ", "ไทย", "และ"];
+    let text = WORDS.concat().repeat(4);
+    let layout = laid_at(&doc(vec![paragraph("a", &text)]), 300.0);
+    let line = |offset: usize| layout.caret(&Pos::new("a", offset)).unwrap().y;
+    let offsets: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+    let starts: Vec<usize> =
+        offsets.windows(2).filter(|pair| line(pair[1]) > line(pair[0])).map(|pair| pair[1]).collect();
+    let mut between = vec![0];
+    for word in WORDS.iter().cycle().take(WORDS.len() * 4) {
+        between.push(between[between.len() - 1] + word.len());
+    }
+    assert!(starts.len() > 2, "the text runs over several lines");
+    let inside: Vec<&usize> = starts.iter().filter(|start| !between.contains(start)).collect();
+    assert!(inside.is_empty(), "no line starts inside a word, as those at {inside:?} do");
+}
+
+#[test]
 fn a_list_item_is_marked_and_set_in_at_the_side_it_starts_at() {
     const LOUD: Color = Color::rgb(1, 200, 3);
     let palette = Palette { marker: LOUD, accent: LOUD, on_accent: LOUD, line_strong: LOUD, ..Palette::LIGHT };

@@ -19,7 +19,7 @@ letters-ui.workspace = true
 letters-format.workspace = true
 letters-convert.workspace = true
 letters-fonts.workspace = true
-letters-layout.workspace = true
+letters-layout = { workspace = true, features = ["dictionaries"] }
 letters-trust.workspace = true
 letters-spell.workspace = true
 letters-frame.workspace = true

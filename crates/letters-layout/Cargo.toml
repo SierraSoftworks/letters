@@ -11,6 +11,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Word lists for Thai, Lao, Khmer, Burmese, Chinese and Japanese, built into the binary: 3.7 MiB. With them a
+# line of Thai ends between words. Without, it ends at a space or wherever it fills. The desktop app has them.
+dictionaries = ["parley/complex-scripts"]
+
 [dependencies]
 icu_properties.workspace = true
 letters-math.workspace = true

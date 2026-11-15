@@ -22,6 +22,7 @@ cargo build -p letters-web --example export --profile web --target wasm32-unknow
 "$bindgen" "${wasm%/*}/examples/export.wasm" --target web --no-typescript --out-name export --out-dir dist \
   --remove-name-section --remove-producers-section
 cargo run --quiet -p letters-web --example page -- www/index.html > dist/index.html
+cp ../../assets/icons/favicon.ico dist/
 # What the editor fetches beside the wasm, each with its licence.
 for files in fonts:letters-fonts/fonts maths:letters-math/fonts dictionaries:letters-spell/dictionaries; do
   mkdir "dist/${files%%:*}"

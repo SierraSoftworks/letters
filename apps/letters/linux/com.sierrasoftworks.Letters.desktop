@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Letters
+GenericName=Word Processor
+Comment=Write and share documents
+Exec=letters %f
+Icon=com.sierrasoftworks.Letters
+Terminal=false
+Categories=Office;WordProcessor;
+MimeType=application/vnd.letters.document+zip;
+StartupWMClass=com.sierrasoftworks.Letters
