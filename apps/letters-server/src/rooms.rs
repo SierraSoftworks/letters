@@ -45,6 +45,9 @@ const LINGER: u64 = 60_000;
 const REST: u64 = 50;
 /// How often a save is tried before the document goes to a conflict copy.
 const ATTEMPTS: u32 = 3;
+/// How many messages that cannot be read a session may send before it is let go. A sound device hangs up
+/// at the first, and each costs the room a reading of its history.
+const UNREADABLE: u32 = 3;
 
 /// What a socket is told to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,6 +148,8 @@ struct Seated {
     to: mpsc::Sender<Out>,
     /// The sign-in the socket was opened with, to end the one with the other.
     signed: String,
+    /// The name the person signs in with, for the log.
+    person: String,
 }
 
 /// One device's place in a room. Dropping it leaves the room.
@@ -773,13 +778,13 @@ impl App {
     fn seat(self: &Arc<Self>, who: &Signed, found: &Found) -> Answer<(Seat, mpsc::Receiver<Out>)> {
         let access = Access { role: may(found.space.role), name: self.signs_as(who)? };
         let (to, from) = mpsc::channel(BACKLOG);
-        let signed = who.session.clone();
+        let (signed, person) = (who.session.clone(), who.person.username.clone());
         let (open, session) = self.rooms.within(self, &found.root, &found.place, |hosted, now| {
             if hosted.lost {
                 return Err(Refusal::not_found());
             }
             let session = hosted.room.join(access, now);
-            hosted.seats.insert(session, Seated { to, signed });
+            hosted.seats.insert(session, Seated { to, signed, person });
             Ok(session)
         })?;
         Ok((Seat { app: self.clone(), open, session, left: false }, from))
@@ -800,6 +805,12 @@ impl Seat {
         let heard = self.inside(move |hosted, session, now| {
             if let Err(error) = hosted.room.received(session, &frame, &mut hosted.state, now) {
                 log(&format!("a room could not journal an edit, which waits for the next save: {error}"));
+            }
+            if hosted.room.unreadable(session) >= UNREADABLE {
+                let person = hosted.seats.get(&session).map_or("someone", |seated| seated.person.as_str());
+                let name = hosted.place.name();
+                log(&format!("{person} kept sending \"{name}\" what cannot be read, and their session was ended"));
+                hosted.room.dismiss(session, Ended::Unreadable);
             }
         });
         let _ = heard.await;

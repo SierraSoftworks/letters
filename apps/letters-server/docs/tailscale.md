@@ -5,7 +5,8 @@ address and certificate, and [tsidp](https://github.com/tailscale/tsidp), Tailsc
 a person in as the owner of the device they are on, with no password. Nothing is open to the internet.
 
 The examples use the tailnet `example.ts.net`, a server machine named `letters`, and the tailnet groups
-`family` and `friends`. tsidp is experimental, and the shape of its grants may change.
+`family` and `friends`. The guide was written against tsidp v0.0.15. tsidp is experimental, and the shape of
+its grants may change.
 
 ## Publish
 

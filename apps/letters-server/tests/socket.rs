@@ -9,7 +9,7 @@ use common::{Server, URL, texts};
 use letters_api::paths;
 use letters_model::{Extent, Model, Op, Pos, ReplicaId};
 use letters_server::session::COOKIE_NAME;
-use letters_sync::{ClientMessage, Hello, PROTOCOL, Refusal, ServerMessage};
+use letters_sync::{ClientMessage, Hello, PROTOCOL, Refusal, ServerMessage, Welcome};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::http::header::{AUTHORIZATION, COOKIE, ORIGIN};
 use tungstenite::stream::MaybeTlsStream;
@@ -46,6 +46,16 @@ fn heard(socket: &mut Socket) -> Option<ServerMessage> {
     }
 }
 
+/// Opens the socket of the document `id` as `who` on a device that holds no copy: the socket in session,
+/// and what the server welcomed it with.
+fn joined(at: SocketAddr, id: &str, who: &common::Client) -> (Socket, Welcome) {
+    let mut socket = dial(at, id, &[(AUTHORIZATION, format!("Bearer {}", who.token.as_deref().unwrap()))]).unwrap();
+    let hello = Hello { protocol: PROTOCOL, document: String::new(), extent: Extent::default(), revision: None };
+    socket.send(Message::Binary(ClientMessage::Hello(hello).encode().into())).unwrap();
+    let Some(ServerMessage::Welcome(welcome)) = heard(&mut socket) else { panic!("the server answers a hello") };
+    (socket, welcome)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_socket_is_refused_with_a_status_before_it_opens() {
     let server = Server::new("socket-refused");
@@ -74,12 +84,7 @@ async fn frames_travel_both_ways_and_the_server_says_why_it_closes() {
     let server = Server::new("socket-frames");
     let ada = server.person("ada", &["family"]);
     let id = ada.start("family", "", "Plan").await.id.unwrap();
-    let at = server.listen().await;
-    let mut socket = dial(at, &id, &[(AUTHORIZATION, format!("Bearer {}", ada.token.as_deref().unwrap()))]).unwrap();
-
-    let hello = Hello { protocol: PROTOCOL, document: String::new(), extent: Extent::default(), revision: None };
-    socket.send(Message::Binary(ClientMessage::Hello(hello).encode().into())).unwrap();
-    let Some(ServerMessage::Welcome(welcome)) = heard(&mut socket) else { panic!("the server answers a hello") };
+    let (mut socket, welcome) = joined(server.listen().await, &id, &ada);
     assert_eq!(welcome.document, id);
     assert!(!welcome.updates.is_empty(), "a device with no copy is sent the document");
 
@@ -89,15 +94,36 @@ async fn frames_travel_both_ways_and_the_server_says_why_it_closes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_device_that_keeps_sending_what_cannot_be_read_is_let_go() {
+    let server = Server::new("socket-unreadable");
+    let ada = server.person("ada", &["family"]);
+    let id = ada.start("family", "", "Plan").await.id.unwrap();
+    let (mut socket, _) = joined(server.listen().await, &id, &ada);
+    let mut unread = |seq: u64| {
+        let edits = ClientMessage::Edits { seq, updates: b"no history at all".to_vec() };
+        socket.send(Message::Binary(edits.encode().into())).unwrap();
+        let refused = heard(&mut socket);
+        assert_eq!(refused, Some(ServerMessage::Refused { seq, why: Refusal::Unreadable }));
+        // Whether the session goes on is asked only while it does: nothing is sent to a closed socket.
+        if seq < 3 {
+            socket.send(Message::Binary(ClientMessage::Ping.encode().into())).unwrap();
+            assert_eq!(heard(&mut socket), Some(ServerMessage::Pong), "the session goes on after {seq}");
+        }
+    };
+    // A sound device hangs up at the first such refusal by itself, so the third is no accident.
+    (1..=3).for_each(&mut unread);
+
+    assert_eq!(heard(&mut socket), Some(ServerMessage::Goodbye { why: Refusal::Unreadable }));
+    assert_eq!(heard(&mut socket), None, "and then the socket is closed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_server_that_is_told_to_stop_saves_what_is_open_first() {
     let server = Server::new("socket-stop");
     let ada = server.person("ada", &["family"]);
     let id = ada.start("family", "", "Plan").await.id.unwrap();
     let (at, stop, served) = server.serving().await;
-    let mut socket = dial(at, &id, &[(AUTHORIZATION, format!("Bearer {}", ada.token.as_deref().unwrap()))]).unwrap();
-    let hello = Hello { protocol: PROTOCOL, document: String::new(), extent: Extent::default(), revision: None };
-    socket.send(Message::Binary(ClientMessage::Hello(hello).encode().into())).unwrap();
-    let Some(ServerMessage::Welcome(welcome)) = heard(&mut socket) else { panic!("the server answers a hello") };
+    let (mut socket, welcome) = joined(at, &id, &ada);
 
     let mut model = Model::load(&welcome.updates, ReplicaId::from(7)).unwrap();
     let (before, first) = (model.extent(), model.doc().blocks[0].id.clone());
