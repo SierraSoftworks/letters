@@ -682,14 +682,14 @@ impl Ui<EditorApp> {
         let app = self.app();
         let editing = self.canvas().filter(|_| !app.away());
         let Some((page, selection)) = editing.zip(app.editor.selection()) else { return [None, None] };
-        let end = |pos: &Pos| {
-            let caret = app.layout.caret(pos)?;
+        let end = |caret: Option<Rect>| {
+            let caret = caret?;
             let at = app.onto(caret);
             let (x, y) = (page.x + at.x, page.y + at.y);
             let shown = y + caret.height > page.y && y < page.y + page.height;
             shown.then_some(Rect { x, y, ..caret })
         };
-        [end(&selection.anchor), end(&selection.head)]
+        [end(app.layout.caret(&selection.anchor)), end(app.head())]
     }
 
     /// Selects the word at a point of the window, as a double click there does: for a long press on a
@@ -732,19 +732,22 @@ impl<'a> DocLines<'a> {
     }
 }
 
-// Layout does not yet tell the end of a line that wraps with no space from the start of the next, so
-// every place is taken and answered as its offset alone says.
+/// A place as layout tells it, with the side of a wrap it is on.
+fn sided((pos, before_wrap): (Pos, bool)) -> LinePos {
+    LinePos { pos, before_wrap }
+}
+
 impl Lines for DocLines<'_> {
     fn caret_x(&self, at: &LinePos) -> Option<f32> {
-        self.layout.caret(&at.pos).map(|caret| caret.x)
+        self.layout.caret_sided(&at.pos, at.before_wrap).map(|caret| caret.x)
     }
 
     fn line_step(&self, at: &LinePos, x: f32, down: bool) -> Option<LinePos> {
-        self.layout.line_step(&at.pos, x, down).map(LinePos::from)
+        self.layout.line_step_sided(&at.pos, at.before_wrap, x, down).map(sided)
     }
 
     fn line_edge(&self, at: &LinePos, end: bool) -> Option<LinePos> {
-        self.layout.line_edge(&at.pos, end).map(LinePos::from)
+        self.layout.line_edge_sided(&at.pos, at.before_wrap, end).map(sided)
     }
 
     fn page_lines(&self) -> usize {
@@ -2110,8 +2113,7 @@ impl EditorApp {
         self.unpoint();
         // Twice, since laying out what comes into view can move the place.
         for _ in 0..2 {
-            let head = self.editor.selection().map(|selection| &selection.head);
-            let Some(line) = head.and_then(|head| self.layout.caret(head)) else { break };
+            let Some(line) = self.head() else { break };
             let top = self.down(line.y) + TOP;
             let margin = GUTTER.min(self.height / 4.0);
             let cover = self.find.cover().min(self.height / 2.0);
@@ -2317,9 +2319,7 @@ impl EditorApp {
 
     /// Scrolls just far enough to show the head of the selection.
     fn reveal(&mut self) {
-        let Some(caret) = self.editor.selection().and_then(|selection| self.layout.caret(&selection.head)) else {
-            return;
-        };
+        let Some(caret) = self.head() else { return };
         let top = self.down(caret.y) + TOP;
         let bottom = top + caret.height;
         let margin = GUTTER.min(self.height / 4.0);
@@ -2337,6 +2337,21 @@ impl EditorApp {
             return None;
         }
         self.layout.hit(self.in_layout(at))
+    }
+
+    /// Where a press at a point of the page area puts the caret, and whether that is the end of a line that
+    /// wraps there with no space: past such a line's end the caret stays on it. See [`LinePos`].
+    fn hit_sided(&self, at: Point) -> Option<(Pos, bool)> {
+        if self.away() {
+            return None;
+        }
+        self.layout.hit_sided(self.in_layout(at))
+    }
+
+    /// Where the caret at the head of the selection is in the layout, on the side of a wrap it stands at.
+    fn head(&self) -> Option<Rect> {
+        let head = &self.editor.selection()?.head;
+        self.layout.caret_sided(head, self.editor.before_wrap())
     }
 
     /// Whether a card, a menu or a field that the person asked for is out over the page.
@@ -2681,7 +2696,7 @@ impl EditorApp {
                     self.dragging = false;
                     return self.edit(platform, |editor, platform| editor.run(Command::LineBelow, platform));
                 }
-                let Some(head) = self.hit(at) else { return };
+                let Some((head, before_wrap)) = self.hit_sided(at) else { return };
                 // A press on a picture selects its figure. The caption under it is text like any other.
                 let on_page = self.in_layout(at);
                 let figure = self.layout.figure(&head.block).filter(|figure| figure.image.contains(on_page));
@@ -2705,9 +2720,17 @@ impl EditorApp {
                 // The later presses of a double or triple click are about where the first put the caret,
                 // since the text may have moved under the pointer when the caret came to it.
                 if clicks == 1 || mods.shift || self.editor.selection().is_none() {
-                    self.editor.select(Selection { anchor, head });
+                    self.editor.select_at(Selection { anchor, head }, before_wrap);
                 }
                 self.dragging = clicks == 1;
+                // The end of a line that wraps with no space is where the next line's first word starts.
+                // The word that is meant is the one on the line that was pressed, so it is picked from the
+                // last place inside that line.
+                let inside = self.head().filter(|_| clicks == 2 && self.editor.before_wrap());
+                let inside = inside.and_then(|end| self.layout.hit(Point { x: end.x, y: end.y + end.height / 2.0 }));
+                if let Some(inside) = inside {
+                    self.editor.select(Selection::caret(inside));
+                }
                 match clicks {
                     1 => self.reveal(),
                     2 => self.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform)),
@@ -2747,12 +2770,14 @@ impl EditorApp {
                 }
             }
             Pointer::Drag { at } if self.dragging => {
-                let (Some(head), Some(selection)) = (self.hit(at), self.editor.selection()) else { return };
+                let Some(((head, before_wrap), selection)) = self.hit_sided(at).zip(self.editor.selection()) else {
+                    return;
+                };
                 // A drag that selects is no longer pointing at anything.
                 if head != selection.anchor {
                     self.references.point(None);
                 }
-                self.editor.select(Selection { anchor: selection.anchor.clone(), head });
+                self.editor.select_at(Selection { anchor: selection.anchor.clone(), head }, before_wrap);
                 // Dragging past an edge scrolls the page after the selection.
                 self.reveal();
             }
@@ -2788,7 +2813,7 @@ impl EditorApp {
         if self.hung() {
             return;
         }
-        let Some(pos) = self.hit(at) else { return };
+        let Some((pos, before_wrap)) = self.hit_sided(at) else { return };
         let spot = self.in_layout(at);
         (self.link, self.spelling.fix, self.linked.open) = (None, None, None);
         let near = |rect: &Rect| {
@@ -2801,7 +2826,7 @@ impl EditorApp {
             // A selection that was pressed on is left alone, so that the menu serves it.
             let ranged = self.editor.selection().filter(|selection| !selection.is_caret());
             if !ranged.is_some_and(|selection| self.layout.selection(selection).iter().any(near)) {
-                self.editor.select(Selection::caret(pos.clone()));
+                self.editor.select_at(Selection::caret(pos.clone()), before_wrap);
             }
             // A misspelled word is offered its corrections where the word itself was meant, not the room
             // its line leaves beside it.
@@ -2844,9 +2869,7 @@ impl EditorApp {
             self.reveal();
             self.layout.settle(self.viewport(), 0);
         }
-        let Some(caret) = self.editor.selection().and_then(|selection| self.layout.caret(&selection.head)) else {
-            return;
-        };
+        let Some(caret) = self.head() else { return };
         let caret = self.onto(caret);
         self.menu(Point { x: caret.x + 1.0, y: caret.y + caret.height / 2.0 });
     }
@@ -3166,7 +3189,7 @@ impl EditorApp {
         }
 
         let written = sheet.is_none() && self.editor.picture().is_none();
-        let caret = selection.filter(|_| written).and_then(|selection| self.layout.caret(&selection.head));
+        let caret = self.head().filter(|_| written);
         let caret = caret.map(|caret| Rect { width: CARET_WIDTH, ..self.onto(caret) });
         let paint = PagePaint {
             list,
@@ -3275,8 +3298,8 @@ impl EditorApp {
             element = element.popover(self.refer.list(&self.editor, &typed, &figures).at(spot));
         } else if let Some(((source, rect), selection)) = sheet.zip(selection) {
             let spot = self.onto(rect);
-            element =
-                element.popover(self.maths.sheet(source, selection, rect.width, self.wide(), self.scheme).at(spot));
+            let caret = (selection, self.editor.before_wrap());
+            element = element.popover(self.maths.sheet(source, caret, rect.width, self.wide(), self.scheme).at(spot));
         } else if let Some(tools) = self.selection_tools(viewport) {
             element = element.popover(tools);
         }
@@ -3845,13 +3868,18 @@ impl EditorApp {
         };
         let at = |offset: usize| Pos::new(block.clone(), offset.clamp(source.start, source.end));
         match message {
-            Sheet::Press { offset, extend, clicks } => {
-                let head = at(offset);
+            Sheet::Press { offset, before_wrap, extend, clicks } => {
+                // A second press picks a word of the row that was pressed: the end of a row that goes on with
+                // no space is where the next row's first word starts, so the word is picked a character in.
+                let text = self.editor.doc().block(&block).map(Block::plain_text).unwrap_or_default();
+                let inside = text.get(..offset).and_then(|before| before.char_indices().next_back());
+                let inside = inside.filter(|_| before_wrap && clicks == 2).map(|(inside, _)| inside);
+                let head = at(inside.unwrap_or(offset));
                 let anchor = match self.editor.selection() {
                     Some(selection) if extend => selection.anchor.clone(),
                     _ => head.clone(),
                 };
-                self.editor.select(Selection { anchor, head });
+                self.editor.select_at(Selection { anchor, head }, before_wrap && inside.is_none());
                 match clicks {
                     1 => self.stay(offset == source.start, platform),
                     2 => self.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform)),
@@ -3861,11 +3889,13 @@ impl EditorApp {
                 self.maths.typed(false);
                 self.mark();
             }
-            Sheet::Drag(offset) => {
+            Sheet::Drag(offset, before_wrap) => {
                 // A pointer that has not left its character leaves the caret as the press put it.
-                let held = self.editor.selection().filter(|selection| selection.head != at(offset));
+                let side = self.editor.before_wrap();
+                let stays = |selection: &&Selection| selection.head == at(offset) && side == before_wrap;
+                let held = self.editor.selection().filter(|selection| !stays(selection));
                 if let Some(anchor) = held.filter(|_| self.maths.dragging).map(|selection| selection.anchor.clone()) {
-                    self.editor.select(Selection { anchor, head: at(offset) });
+                    self.editor.select_at(Selection { anchor, head: at(offset) }, before_wrap);
                     self.mark();
                 }
             }
