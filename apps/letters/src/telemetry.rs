@@ -35,6 +35,10 @@ use tracing_batteries::{Analytics, Session};
 /// Where reports go: Sierra Softworks' own analytics server, which keeps no address and no identifier.
 pub const SERVER: &str = "https://analytics.sierrasoftworks.com";
 
+/// The site every part of Letters reports under. The desktop app's pages are those under `/desktop`,
+/// the server's under `/server`.
+pub const SITE: &str = "letters.app";
+
 /// Whether this run may report at all, whatever the person set: a release build, with neither
 /// `LETTERS_TELEMETRY=0` nor `DO_NOT_TRACK=1` around it. Builds for development and their tests stay quiet.
 pub fn here() -> bool {
@@ -71,11 +75,11 @@ impl Page {
 
     pub const fn path(self) -> &'static str {
         match self {
-            Self::Landing => "/landing",
-            Self::Editor => "/editor",
-            Self::History => "/history",
-            Self::Review => "/review",
-            Self::Print => "/print",
+            Self::Landing => "/desktop/landing",
+            Self::Editor => "/desktop/editor",
+            Self::History => "/desktop/history",
+            Self::Review => "/desktop/review",
+            Self::Print => "/desktop/print",
         }
     }
 }
@@ -315,7 +319,8 @@ fn report(server: &str, allowed: bool, waiting: &Receiver<Said>) {
         return;
     };
     let _entered = runtime.enter();
-    let battery = Analytics::new(server.to_owned()).without_initial_page().with_panic_capture(false);
+    let battery =
+        Analytics::new(server.to_owned()).with_hostname(SITE).without_initial_page().with_panic_capture(false);
     let metadata = Session::new("letters", env!("CARGO_PKG_VERSION")).with_debug_builds();
     let session = metadata.with_battery(battery);
     let switch = session.enable();

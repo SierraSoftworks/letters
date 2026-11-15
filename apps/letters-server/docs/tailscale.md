@@ -105,7 +105,7 @@ readers = ["friends"]
 ## Usage reports
 
 A release build tells `analytics.sierrasoftworks.com` that a server runs, for how long, and how often its
-features are asked for: event names out of a closed list in `src/telemetry.rs`, the version, the system's
+features are asked for, as the page `/server` of the site `letters.app`: event names out of a closed list in `src/telemetry.rs`, the version, the system's
 kind, its language and its time zone. Nothing of a document, a person, a group, a link or an address is
 sent. It is the only host the server reaches beside the provider and the trusted sources.
 

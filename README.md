@@ -26,7 +26,7 @@ server that adds identity, sharing and sync without owning any content.
 ## Usage reports
 
 Release builds of the desktop app tell `analytics.sierrasoftworks.com` which features are used and how long
-sessions last: page and event names out of a closed list in `apps/letters/src/telemetry.rs`, the version, the
+sessions last, as the site `letters.app` with its pages under `/desktop`: page and event names out of a closed list in `apps/letters/src/telemetry.rs`, the version, the
 system's kind, its language and time zone, and a random number that lasts one run. Nothing of a document or
 of a person is sent, and no errors. Turn it off in Settings, with `[telemetry] enabled = false` in
 `~/.letters/settings.toml`, or with `LETTERS_TELEMETRY=0` or `DO_NOT_TRACK=1` in the environment.

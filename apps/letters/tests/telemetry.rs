@@ -69,7 +69,7 @@ fn what_is_said_is_plain_words_from_a_closed_list() {
         }
     }
     for page in Page::ALL {
-        assert!(page.path().strip_prefix('/').is_some_and(plain), "{page:?}");
+        assert!(page.path().strip_prefix("/desktop/").is_some_and(plain), "{page:?}");
     }
 }
 
@@ -141,7 +141,7 @@ fn a_session_reports_its_pages_and_events() {
     telemetry.record(Event::DocumentCopied(CopyFormat::Pdf));
     telemetry.stop(Duration::from_secs(10));
     let heard = heard(&hears).join("\n");
-    assert!(heard.contains("/editor"), "{heard}");
+    assert!(heard.contains("letters.app/desktop/editor"), "{heard}");
     assert!(heard.contains("document_copied") && heard.contains("pdf"), "{heard}");
 }
 

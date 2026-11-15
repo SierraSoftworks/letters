@@ -51,6 +51,7 @@ async fn a_run_reports_that_it_started_what_was_asked_and_that_it_ended() {
     telemetry.stop(Duration::from_secs(10)).await;
     let heard = heard.lock().unwrap().join("\n");
     assert!(heard.contains("\"load\"") && heard.contains("\"unload\""), "{heard}");
+    assert!(heard.contains("letters.app/server"), "{heard}");
     assert!(heard.contains("sync_joined") && heard.contains("desktop"), "{heard}");
     assert!(!heard.contains("link_made"), "{heard}");
 }

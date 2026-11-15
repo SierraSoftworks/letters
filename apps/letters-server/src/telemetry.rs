@@ -24,6 +24,11 @@ use crate::session::{Carrier, Signed};
 /// Sierra Softworks' own analytics server, which keeps no address and no identifier.
 pub const SERVER: &str = "https://analytics.sierrasoftworks.com";
 
+/// The site every part of Letters reports under, and the one page of it that is the server's: a run is
+/// one long visit to it.
+pub const SITE: &str = "letters.app";
+pub const PAGE: &str = "/server";
+
 /// How a request reached the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Through {
@@ -104,7 +109,8 @@ impl Telemetry {
     /// Begins the session, which says that a server started. Called on the runtime the server answers on:
     /// each report is sent as a task of its own there, and no request waits for one.
     pub fn start(&self, server: &str) {
-        let battery = Analytics::new(server.to_owned()).with_panic_capture(false);
+        let battery =
+            Analytics::new(server.to_owned()).with_hostname(SITE).with_initial_page(PAGE).with_panic_capture(false);
         let session =
             Session::new("letters-server", env!("CARGO_PKG_VERSION")).with_debug_builds().with_battery(battery);
         *self.session.lock().unwrap_or_else(PoisonError::into_inner) = Some(session);
