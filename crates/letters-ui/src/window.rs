@@ -338,6 +338,10 @@ impl Platform for Lent<'_> {
         self.platform.now_ms()
     }
 
+    fn wall_time(&self) -> Option<u64> {
+        self.platform.wall_time()
+    }
+
     fn clipboard_read(&mut self) -> Option<Clip> {
         self.platform.clipboard_read()
     }
