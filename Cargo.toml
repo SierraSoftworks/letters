@@ -131,6 +131,12 @@ incremental = false
 [profile.dev.package."*"]
 debug = false
 
+# ICU writes a line to stderr for every stretch of Thai or CJK text it segments without a dictionary, but
+# only where debug assertions are on. A release build says nothing, and so a debug build does not either.
+[profile.dev.package.icu_provider]
+debug = false
+debug-assertions = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
