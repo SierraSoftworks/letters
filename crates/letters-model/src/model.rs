@@ -303,10 +303,10 @@ impl fmt::Debug for Prepared {
     }
 }
 
-/// A shell hands these to the thread that owns the window, and may make them on another.
 /// Raised whenever [`Model::check`] comes to refuse a history that it passed before.
 const CHECK: u32 = 1;
 
+/// A shell hands these to the thread that owns the window, and may make them on another.
 const _: fn() = || {
     fn sent<T: Send>() {}
     sent::<Model>();
