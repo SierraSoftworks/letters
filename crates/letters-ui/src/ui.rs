@@ -185,10 +185,11 @@ pub struct Ui<A: App> {
     last_press: Option<Press>,
     focus: Option<Id>,
     focus_visible: bool,
-    /// The anchors of the open popovers, as of the last build.
-    layers: Vec<Id>,
+    /// The open popovers, as of the last build: the anchor of each, and whether it is beside it. One that
+    /// takes the place of another on the same anchor is another popover when only one of them is beside.
+    layers: Vec<(Id, bool)>,
     /// For each open popover, where focus was before it opened.
-    returns: Vec<(Id, Option<Id>)>,
+    returns: Vec<((Id, bool), Option<Id>)>,
     /// The elements that ask for focus when they first show, as of the last build.
     asking: Vec<Id>,
     /// The popovers that open and close themselves, by anchor.
@@ -1335,7 +1336,8 @@ impl<A: App> Ui<A> {
     /// Carries focus, popovers and per-element state over to a newly built tree.
     fn settle(&mut self) {
         let tree = &self.tree;
-        let anchors: Vec<Id> = tree.layers.iter().filter_map(|layer| layer.anchor).map(|i| tree.nodes[i].id).collect();
+        let open = tree.layers.iter().filter_map(|layer| Some((tree.nodes[layer.anchor?].id, layer.beside)));
+        let anchors: Vec<(Id, bool)> = open.collect();
         let mut focus = self.focus;
 
         // A popover that closed gives focus back to where it was.

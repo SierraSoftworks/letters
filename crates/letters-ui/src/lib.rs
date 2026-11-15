@@ -24,6 +24,7 @@ mod insert;
 mod layout;
 mod maths;
 pub mod motion;
+mod notes;
 mod opening;
 mod paint;
 mod pictures;

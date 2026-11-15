@@ -139,7 +139,9 @@ fn waves(window: &mut Harness) -> Vec<(Point, Point)> {
     let wave = |item: &Item| match item {
         Item::Path { origin, path, stroke: Some(_), .. } if page.contains(*origin) => {
             let ends = path.iter().filter_map(|el| if let PathEl::QuadTo(_, end) = el { Some(end.x) } else { None });
-            Some((*origin, Point { x: origin.x + ends.fold(0.0, f32::max), y: origin.y }))
+            // An icon over the page is a stroked path too, but not one of waves alone.
+            let end = ends.reduce(f32::max)?;
+            Some((*origin, Point { x: origin.x + end, y: origin.y }))
         }
         _ => None,
     };

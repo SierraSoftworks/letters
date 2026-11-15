@@ -107,6 +107,8 @@ pub const REDO_2: Icon = Icon::new("M15 14l5-5-5-5M20 9H9.5A5.5 5.5 0 0 0 4 14.5
 pub const REFRESH_CW: Icon = Icon::new("M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8M21 3v5h-5M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16M8 16H3v5");
 /// `search`
 pub const SEARCH: Icon = Icon::new("M21 21l-4.34-4.34M3 11a8 8 0 1 0 16 0a8 8 0 1 0 -16 0");
+/// `send`
+pub const SEND: Icon = Icon::new("M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11zM21.854 2.147l-10.94 10.939");
 /// `separator-horizontal`
 pub const SEPARATOR_HORIZONTAL: Icon = Icon::new("M16 16l-4 4-4-4M3 12h18M8 8l4-4 4 4");
 /// `settings`

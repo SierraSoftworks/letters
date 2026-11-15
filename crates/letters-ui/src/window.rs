@@ -14,7 +14,7 @@ use letters_editor::{
 };
 use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Syntax};
 use letters_model::{
-    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Pos, Selection, Style,
+    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Notes, Pos, Selection, Style,
 };
 use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
@@ -34,6 +34,7 @@ use crate::importing::{Import, ImportOffer, Importing};
 use crate::insert::{Insert, Inserting, Put};
 use crate::maths::{self, Maths, Sheet, SheetLines, Source};
 use crate::motion::{self, FRAME_MS};
+use crate::notes::{self, Margin, Noting};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
 use crate::pictures::{self, Linked, Linking, PictureState};
@@ -190,6 +191,8 @@ pub enum Message {
     Linked(Linking),
     /// What the field of a picture's alt text asks for.
     Alt(Altering),
+    /// What the tools over a selection and the field of a comment ask for.
+    Note(Noting),
 }
 
 impl Ui<EditorApp> {
@@ -205,6 +208,7 @@ impl Ui<EditorApp> {
 
     /// Names who writes in this window. Edits made from here on carry the name.
     pub fn set_author(&mut self, name: &str) {
+        self.app_mut().margin.author = name.to_owned();
         self.app_mut().editor.set_author(name);
     }
 
@@ -399,6 +403,19 @@ impl Ui<EditorApp> {
         app.held(|app| app.layout.set_maths_links(links));
         // Formulas are set again, at heights that are estimates until idle time settles them.
         app.estimated = true;
+    }
+
+    /// The document's notes: the comments on its passages, and what imports and merges left on them. A
+    /// shell writes them into the document's file with each save. A comment that is written counts among
+    /// [`Window::edits`].
+    pub fn notes(&self) -> &Notes {
+        &self.app().margin.notes
+    }
+
+    /// Hands over the notes of the document that was opened, or what a merge made of them.
+    pub fn set_notes(&mut self, notes: Notes) {
+        let app = self.app_mut();
+        app.margin.take(notes, app.editor.model());
     }
 
     /// The decoded pictures the window's display list draws, by asset name: what a shell hands its
@@ -610,6 +627,7 @@ pub struct EditorApp {
     linked: Linked,
     grip: Grip,
     captions: Captions,
+    margin: Margin,
     /// What the bar says of a write that was just done, as where the document was first saved, and since
     /// when, once a frame has said so.
     note: Option<(String, Option<u64>)>,
@@ -689,6 +707,7 @@ impl EditorApp {
             linked: Linked::default(),
             grip: Grip::default(),
             captions: Captions::default(),
+            margin: Margin::default(),
             note: None,
             naming: false,
             renaming: None,
@@ -986,6 +1005,46 @@ impl EditorApp {
         (self.link, self.spelling.fix, self.linked.open) = (None, None, None);
     }
 
+    /// Does what the tools over a selection or the field of a comment asked.
+    fn noting(&mut self, asked: Noting, platform: &mut dyn Platform) {
+        match asked {
+            Noting::Away => self.margin.put_away(self.editor.selection()),
+            Noting::Write => {
+                self.margin.write(self.editor.model(), self.editor.selection());
+                (self.link, self.spelling.fix, self.linked.open, self.captions.alt) = (None, None, None, None);
+            }
+            Noting::Draft(text) => self.margin.typed(text),
+            Noting::Drop => self.margin.drop_draft(),
+            Noting::Send => {
+                let created = notes::stamp(platform.wall_time().unwrap_or(0));
+                if self.margin.send(self.editor.model(), platform.new_id(), created) {
+                    // A comment is kept with the document, so it is something to save.
+                    self.edits += 1;
+                }
+            }
+        }
+        // Once a comment is kept or dropped, the tools wait for another selection.
+        if self.margin.writing().is_none() {
+            self.margin.put_away(self.editor.selection());
+        }
+    }
+
+    /// The tools over a selected stretch of text, once it is selected: over its first line, or under its
+    /// last when there is no room above. `origin` is where the layout's origin is in the page area.
+    fn selection_tools(&self, origin: Point, viewport: Rect) -> Option<Popover<Message>> {
+        let selection = self.editor.selection().filter(|selection| !selection.is_caret())?;
+        if self.dragging || !self.margin.offers() {
+            return None;
+        }
+        notes::passage(self.editor.doc(), selection)?;
+        let lines = self.layout.selection_in(selection, viewport);
+        let (first, last) = (lines.first()?, lines.last()?);
+        let above = origin.y + first.y >= notes::TOOLS_ROOM;
+        let from = if above { first } else { last };
+        let spot = Rect { x: origin.x + from.x, y: origin.y + from.y, ..*from };
+        Some(Margin::tools(self.editor.link().is_some(), above).at(spot))
+    }
+
     /// Does what the field of a picture's alt text asked.
     fn altering(&mut self, asked: Altering, platform: &mut dyn Platform) {
         match asked {
@@ -1150,6 +1209,7 @@ impl EditorApp {
             }
             let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
             self.spelling.edited(change, self.editor.doc(), caret, &mut self.layout);
+            self.margin.edited(self.editor.model());
         }
         if change.document {
             self.spelling.reworded(None, self.editor.doc(), &mut self.layout);
@@ -1217,7 +1277,7 @@ impl EditorApp {
     fn hung(&self) -> bool {
         let card = self.landing.is_some() || self.importing.is_some() || self.copying.is_some();
         let asked = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
-        let asked = asked || self.captions.alt.is_some();
+        let asked = asked || self.captions.alt.is_some() || self.margin.writing().is_some();
         card || asked || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
     }
 
@@ -1644,6 +1704,10 @@ impl EditorApp {
         let formula = formula.filter(|rect| (0.0..=room.height).contains(&(origin.y + rect.y + rect.height)));
         let sheet = formula.and_then(|rect| Some((Source::of(&self.editor, self.shaper.as_ref(), self.wide())?, rect)));
         self.maths.follow(sheet.as_ref().map(|(source, _)| source), self.reduced_motion);
+        self.margin.follow(selection);
+        for (passage, open) in self.margin.commented() {
+            notes::mark(&self.layout.selection_in(&passage, viewport), open, self.scheme, &mut list);
+        }
         match &sheet {
             Some((_, rect)) => list.items.push(maths::tint(*rect, self.scheme)),
             // On a sheet, the sheet shows what is selected.
@@ -1788,6 +1852,11 @@ impl EditorApp {
                 Popover::new(Element::from(field).width(300.0)).label("Link").open(true).on_close(Message::LinkClose);
             // The editor hangs from the caret, in place.
             element = element.popover(editor.at(caret.unwrap_or_default())).cursor(Cursor::Text);
+        } else if let Some((field, passage)) = self.margin.field().zip(self.margin.writing()) {
+            // The field hangs under the last line of the passage the comment is about.
+            let lines = notes::stretch(passage).map(|passage| self.layout.selection(&passage)).unwrap_or_default();
+            let under = lines.last().copied().unwrap_or_default();
+            element = element.popover(field.at(Rect { x: origin.x + under.x, y: origin.y + under.y, ..under }));
         } else if let Some((line, _, offers)) = self.insert.offers(&self.editor) {
             // The menu hangs from the slash that opened it.
             let slash = self.layout.caret(&Pos::new(line, 0)).unwrap_or_default();
@@ -1802,6 +1871,8 @@ impl EditorApp {
             let spot = Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect };
             element =
                 element.popover(self.maths.sheet(source, selection, rect.width, self.wide(), self.scheme).at(spot));
+        } else if let Some(tools) = self.selection_tools(origin, viewport) {
+            element = element.popover(tools);
         }
         // A press on a reference follows it, one on a copy button copies and one on a cloud opens its menu,
         // which the pointer's shape says.
@@ -2624,6 +2695,7 @@ impl App for EditorApp {
             Message::Refer(Picking::Take(figure)) => self.refer(figure, platform),
             Message::Linked(asked) => self.linking(asked),
             Message::Alt(asked) => self.altering(asked, platform),
+            Message::Note(asked) => self.noting(asked, platform),
             Message::Refer(Picking::Close) => {
                 self.edit(platform, |editor, platform| editor.run(Command::DismissReference, platform));
             }
