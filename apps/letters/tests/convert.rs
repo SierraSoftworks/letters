@@ -15,8 +15,10 @@ use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::object::{Array, Dict, String as Bytes};
 use hayro::hayro_syntax::page::Page;
 use hayro::kurbo::{Affine, BezPath};
-use letters_format::{Archive, Package};
-use letters_model::{Anchor, Block, BlockKind, Document, Mark, Note, NoteKind, Notes, Run, Style};
+use letters_format::{Archive, OPLOG, Package};
+use letters_model::{
+    Anchor, Block, BlockKind, Document, Mark, Model, Note, NoteKind, Notes, Op, Pos, ReplicaId, Run, Style,
+};
 
 /// A scratch folder that is removed when the test ends.
 struct Folder(PathBuf);
@@ -474,4 +476,29 @@ fn export_writes_a_pdf_a_reader_can_search_and_find_its_way_in() {
     let title = pdf.metadata().title.as_deref().map(|title| String::from_utf8_lossy(title).into_owned());
     assert_eq!(title.as_deref(), Some("Rates"));
     assert!(pdf.metadata().creation_date.is_some(), "the PDF says when it was written");
+}
+
+#[test]
+fn a_pdf_names_those_who_wrote_the_document() {
+    let folder = Folder::new("authors");
+    let blocks = vec![Block::text("p", BlockKind::Paragraph, "Rates")];
+    let mut model = Model::new(Document { blocks, ..Document::default() }, ReplicaId::new("a device"));
+    model.set_author("Ada Lovelace");
+    model.apply([Op::InsertText { at: Pos::new("p", 5), text: " change in January.".into() }]).unwrap();
+    let mut package = Package {
+        id: "8f14e45f-ceea-467f-a0e6-5b1d3c2a9f01".into(),
+        created: "2026-11-14T20:00:00Z".into(),
+        document: model.doc().clone(),
+        entries: Default::default(),
+    };
+    package.entries.insert(OPLOG.into(), model.save());
+    let mut out = Cursor::new(Vec::new());
+    letters_format::write(&mut out, &package).unwrap();
+    folder.write("Rates.let", out.into_inner());
+
+    let run = folder.letters(&["export", "Rates.let", "--to", "pdf"]);
+    assert!(run.ok, "{}", run.stderr);
+    let pdf = Pdf::new(fs::read(folder.path("Rates.pdf")).unwrap()).expect("a reader can open the PDF");
+    let author = pdf.metadata().author.as_deref().map(String::from_utf8_lossy).unwrap_or_default().into_owned();
+    assert_eq!(author, "Ada Lovelace");
 }

@@ -13,9 +13,11 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use letters_convert::{ImportNote, PdfInfo, from_docx, from_markdown, to_docx, to_html, to_markdown, to_pdf};
-use letters_format::{Archive, Package};
+use letters_format::{Archive, OPLOG, Package};
 use letters_layout::Fonts;
-use letters_model::{Anchor, Block, BlockKind, Body, Document, Mark, Note, NoteKind, Notes, Run, Style};
+use letters_model::{
+    Anchor, Block, BlockKind, Body, Document, Mark, Model, Note, NoteKind, Notes, ReplicaId, Run, Style,
+};
 use serde_json::json;
 
 use crate::cli::{Export, Format, Import, Output};
@@ -65,9 +67,13 @@ fn try_export(export: &Export) -> Result<(), String> {
         }
         Format::Pdf => {
             let fonts = Fonts { faces: letters_fonts::bundled() };
-            // Who wrote a document is in its history, which a file does not hold yet.
             let created = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|since| since.as_secs());
-            let info = PdfInfo { title: title.to_string(), authors: Vec::new(), created };
+            // Who wrote a document is in its history. A file with none, or with one this build cannot read,
+            // names nobody.
+            let history = archive.read(OPLOG).ok().flatten();
+            let model = history.and_then(|history| Model::load(&history, ReplicaId::new("export")).ok());
+            let authors = model.map(|model| model.authors().into_iter().collect()).unwrap_or_default();
+            let info = PdfInfo { title: title.to_string(), authors, created };
             to_pdf(&document, &style, fonts, &mut |name| archive.read(name).ok().flatten(), &info)
                 .map_err(|error| failed(&error))?
         }
