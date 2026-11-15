@@ -1,7 +1,8 @@
 //! Importing a file that is not a Letters document: one card over the page that says what the file brings
 //! and lets the person choose what comes with it.
 //!
-//! The window only asks: the shell reads the file, offers it, and imports with what was chosen.
+//! The window only asks: the shell reads the file, offers it, and imports with what was chosen. Once the
+//! document is open, a toast counts the notes the import left on it and leads to the first.
 
 use accesskit::Role;
 use letters_render::{Rect, Size};
@@ -13,7 +14,7 @@ use crate::style::{Align, Dir, Edges, Justify, Look};
 use crate::text::TextStyle;
 use crate::theme::accent;
 use crate::tokens;
-use crate::widgets::{Button, Popover};
+use crate::widgets::{Button, Popover, Side, Toast};
 use crate::window::Message;
 
 /// As wide as the landing card, which it stands in for.
@@ -72,20 +73,36 @@ pub enum Import {
     Cancel,
 }
 
+/// What the toast about an import that was just done sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Imported {
+    /// Opens the first of the notes the import left.
+    Show,
+    /// Puts the toast away.
+    Hide,
+}
+
 /// The offer on the card, and what the person has ticked.
 #[derive(Clone, Debug)]
 pub(crate) struct Importing {
     offer: ImportOffer,
     allowed: Vec<bool>,
     comments: bool,
-    /// Whether the shell was asked to import, and has not yet answered by taking the card away.
+    /// Whether the shell was asked to import, and has not yet answered.
     asked: bool,
+    /// Why the shell could not import, in its own sentence.
+    refused: Option<String>,
 }
 
 impl Importing {
     pub fn new(offer: ImportOffer) -> Self {
         let allowed = offer.folders.iter().map(|folder| folder.chosen).collect();
-        Self { comments: offer.comments > 0, offer, allowed, asked: false }
+        Self { comments: offer.comments > 0, offer, allowed, asked: false, refused: None }
+    }
+
+    /// Has the card say why the import was not done. It waits no longer, and can be asked again.
+    pub fn refuse(&mut self, why: &str) {
+        (self.refused, self.asked) = (Some(why.to_owned()), false);
     }
 
     /// Takes a message from the card. Returns whether the card stays.
@@ -103,7 +120,7 @@ impl Importing {
                 let ticked = self.offer.folders.iter().zip(&self.allowed).filter(|(_, allowed)| **allowed);
                 let folders = ticked.map(|(folder, _)| folder.path.clone()).collect();
                 requests.push(Request::Import { folders, comments: self.comments });
-                self.asked = true;
+                (self.asked, self.refused) = (true, None);
             }
         }
         true
@@ -188,6 +205,12 @@ impl Importing {
             .padding(Edges::xy(tokens::SPACE_SM, 0.0))
             .children(notes.iter().map(note));
         card = card.child(line()).child(said);
+        let mut lines = notes.len();
+        if let Some(why) = &self.refused {
+            let why = Element::paragraph(why.as_str(), quiet).fg(tokens::DANGER).role(Role::Alert).label(why.as_str());
+            card = card.child(Element::column().padding(Edges::xy(tokens::SPACE_SM, 0.0)).child(why));
+            lines += 2;
+        }
 
         let apply = Button::new(if self.asked { "Importing" } else { "Import" })
             .icon(icon::FILE_DOWN)
@@ -202,7 +225,7 @@ impl Importing {
             .child(Button::new("Cancel").on_press(send(Import::Cancel)))
             .child(Element::from(apply).key("import").takes_focus());
 
-        let height = rows as f32 * ROW_HEIGHT + notes.len() as f32 * 24.0 + 140.0;
+        let height = rows as f32 * ROW_HEIGHT + lines as f32 * 24.0 + 140.0;
         let spot = Rect::new(room.width / 2.0, ((room.height - height) * 0.4).max(0.0), 0.0, 0.0);
         Popover::new(card.child(line()).child(foot))
             .label(format!("Import {}", offer.name))
@@ -240,6 +263,26 @@ impl Importing {
             .on_press(message)
             .child(tick.decorative())
     }
+}
+
+/// The toast over the foot of a page of this size, about the document that was just imported: how many
+/// notes the import left on it, and a way to the first when there is one. `keys` are the keys that go to
+/// the next note, as they are shown.
+pub(crate) fn toast(notes: usize, keys: Option<&str>, room: Size) -> Element<Message> {
+    let said = match notes {
+        0 => "Imported with no notes".to_owned(),
+        1 => "Imported with 1 note".to_owned(),
+        notes => format!("Imported with {notes} notes"),
+    };
+    let does = match (notes, keys) {
+        (1, _) => "Opens the note where the import left it".to_owned(),
+        (_, None) => "Opens the first note where the import left it".to_owned(),
+        (_, Some(keys)) => format!("Opens the first note where the import left it. {keys} goes on to the next"),
+    };
+    let show = Button::new(if notes == 1 { "Show it" } else { "Show the first" }).small();
+    let show = Element::from(show.on_press(Message::Imported(Imported::Show))).tooltip(does, Side::Top);
+    let toast = Toast::new(said).icon(icon::FILE_INPUT).on_dismiss(Message::Imported(Imported::Hide));
+    if notes == 0 { toast.over(room) } else { toast.action(show).over(room) }
 }
 
 /// A count with its noun: "1 picture", "3 pictures".

@@ -1053,7 +1053,7 @@ impl<A: App> Ui<A> {
         }
         // Later children are painted over earlier ones.
         let child = self.tree.children(i).filter_map(|child| self.hit_in(child, at, under)).last();
-        child.or(inside.then_some(i))
+        child.or((inside && !node.el.hollow).then_some(i))
     }
 
     /// Works out which tooltip shows: the one of the element under the pointer, or else of the element the

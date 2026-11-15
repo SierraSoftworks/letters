@@ -207,6 +207,15 @@ impl Margin {
         open.filter_map(|note| Some((note, Kind::of(note)?)))
     }
 
+    /// The open notes an import left: how many, and the first in the order of the page, or as they were
+    /// added when none of them has a marker.
+    pub fn imports(&self) -> (usize, Option<&str>) {
+        let left: Vec<&Note> = self.open().filter(|(_, kind)| *kind == Kind::Import).map(|(note, _)| note).collect();
+        let mut marked = self.marks.iter().flat_map(|marker| &marker.notes);
+        let first = marked.find_map(|id| left.iter().copied().find(|note| note.id == *id)).or(left.first().copied());
+        (left.len(), first.map(|note| note.id.as_str()))
+    }
+
     /// The markers beside the blocks that have open notes.
     pub fn marks(&self) -> &[Marker] {
         &self.marks

@@ -9,6 +9,7 @@ mod popover;
 mod segmented;
 pub(crate) mod side_panel;
 mod text_field;
+mod toast;
 pub(crate) mod top_bar;
 
 pub use banner::Banner;
@@ -19,4 +20,5 @@ pub use popover::{Placement, Popover, Side};
 pub use segmented::Segmented;
 pub use side_panel::SidePanel;
 pub use text_field::TextField;
+pub use toast::Toast;
 pub use top_bar::{Title, TopBar};

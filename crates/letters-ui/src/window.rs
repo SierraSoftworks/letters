@@ -42,7 +42,7 @@ use crate::finding::{self, Find, Finding};
 use crate::highlight;
 use crate::history::{self, History, Historying, Naming};
 use crate::icon::{self, Icon};
-use crate::importing::{Import, ImportOffer, Importing};
+use crate::importing::{self, Import, ImportOffer, Imported, Importing};
 use crate::insert::{Insert, Inserting, Put};
 use crate::languages::{self, Fence, Fencing, Languages, Languaging};
 use crate::maths::{self, Maths, Sheet, SheetLines, Source};
@@ -118,6 +118,9 @@ const CARD_WIDTH: f32 = 544.0;
 const RECENT_HEIGHT: f32 = 38.0;
 /// How long the bar says which folder a document was first written to, in milliseconds.
 const SAVED_NOTE_MS: u64 = 4000;
+/// How long the toast about an import stays. It has something to press, so it stays longer than a note
+/// that only tells.
+const IMPORTED_MS: u64 = 8000;
 /// The size of the icon that says how saving stands.
 const SAVE_ICON: f32 = 14.0;
 
@@ -260,6 +263,8 @@ pub enum Message {
     Rename(Rename),
     /// Chooses what an imported file brings, on the import card.
     Import(Import),
+    /// What is done about the toast that counts the notes of an import.
+    Imported(Imported),
     /// What is done on the card that saves a copy of the document, or writes it in another format.
     Copy(Copying),
     /// What the Styles panel asks for: the person's default, page setup and stylesheets.
@@ -513,6 +518,21 @@ impl Ui<EditorApp> {
     /// Whether the import card is showing.
     pub fn importing(&self) -> bool {
         self.app().importing.is_some()
+    }
+
+    /// Says why the file on the import card was not imported, in a sentence that stands by itself, in
+    /// answer to a [`Request::Import`]. The card says it, waits no longer, and can ask again.
+    pub fn refuse_import(&mut self, why: &str) {
+        if let Some(card) = self.app_mut().importing.as_mut() {
+            card.refuse(why);
+        }
+    }
+
+    /// Says that the document in the window was just imported, once it is open and its notes are handed
+    /// over with [`Window::set_notes`]. A toast over the foot of the page counts the notes the import left
+    /// and leads to the first, for a few seconds.
+    pub fn say_imported(&mut self) {
+        self.app_mut().imported = Some(None);
     }
 
     /// Has the bar say for a few seconds which folder the document was written to, after its first write.
@@ -1223,6 +1243,9 @@ pub struct EditorApp {
     usage_notice: bool,
     /// The file the import card offers, while it shows.
     importing: Option<Importing>,
+    /// Whether the toast about an import that was just done shows, and since when, once a frame has shown
+    /// it.
+    imported: Option<Option<u64>>,
     requests: Vec<Request>,
     /// The pictures the shell has handed over, by asset name.
     images: Images,
@@ -1359,6 +1382,7 @@ impl EditorApp {
             landing: None,
             usage_notice: false,
             importing: None,
+            imported: None,
             requests: Vec::new(),
             images: Images::default(),
             wanted: HashSet::new(),
@@ -5503,6 +5527,13 @@ impl EditorApp {
                 let stays = self.importing.as_mut().is_some_and(|card| card.update(message, &mut self.requests));
                 self.importing = self.importing.take().filter(|_| stays);
             }
+            Message::Imported(told) => {
+                self.imported = None;
+                let first = self.margin.imports().1.filter(|_| told == Imported::Show).map(str::to_owned);
+                if let Some(first) = first {
+                    self.does(Message::Note(Noting::Open(first)), platform);
+                }
+            }
             Message::Copy(_) if !self.allows.download => {}
             Message::Copy(message) => self.copy(message),
             Message::Styles(message) => self.styling(message, platform),
@@ -5686,7 +5717,12 @@ impl App for EditorApp {
             let end = room.width - if chapters.is_some() { chapters_width() } else { 0.0 };
             self.find.view(self.find.current(self.editor.selection()), bar, end, room.width)
         });
-        let page = Element::row().grow(1.0).child(page).children(chapters);
+        // The toast about an import lies over the foot of the page, and is the first stop after it.
+        let toast = self.imported.filter(|_| !printing && !away && !self.carded()).map(|_| {
+            let keys = commands::shortcut(&Act::Note { back: false }, self.editor.keymap(), self.mac);
+            importing::toast(self.margin.imports().0, keys.as_deref(), room)
+        });
+        let page = Element::row().grow(1.0).child(page).children(toast).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
         let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
@@ -5958,6 +5994,12 @@ impl App for EditorApp {
         if note.is_none() {
             self.note = None;
         }
+        // So does the toast about an import.
+        let toast = self.imported.as_mut().map(|from| *from.get_or_insert(now_ms) + IMPORTED_MS);
+        let toast = toast.filter(|until| now_ms < *until);
+        if toast.is_none() {
+            self.imported = None;
+        }
         let slide = self.maths.animate(now_ms);
         let fade = self.fading.as_mut().map(|from| *from.get_or_insert(now_ms)).and_then(|from| {
             let progress = now_ms.saturating_sub(from) as f32 / tokens::DURATION_FAST;
@@ -5973,7 +6015,7 @@ impl App for EditorApp {
         let slid = self.review.animate(now_ms);
         let rested = self.peeks.animate(now_ms);
         let named = self.presence.animate(now_ms);
-        [note, slide, fade, light, copied, slid, rested, named].into_iter().flatten().min()
+        [note, toast, slide, fade, light, copied, slid, rested, named].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {
