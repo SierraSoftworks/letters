@@ -319,6 +319,19 @@ impl Editor {
         true
     }
 
+    /// Puts the caret below everything: at the end of the text the document ends in, or on a line made
+    /// after a last block that would hold the caret in or cannot hold one.
+    pub(crate) fn line_below(&mut self, platform: &mut dyn Platform) {
+        if let Some(last) = self.doc().blocks.last().filter(|last| tree::is_text(last) && !text::is_code(last)) {
+            return self.place(Pos::new(last.id.clone(), text::len(last)));
+        }
+        let new = BlockId::new(platform.new_id());
+        let line = Block::new(new.clone(), BlockKind::Paragraph);
+        if self.apply(vec![Op::InsertBlock { parent: None, index: self.doc().blocks.len(), block: line }]) {
+            self.place(Pos::new(new, 0));
+        }
+    }
+
     /// Breaks the block at the caret, as Enter does.
     pub(crate) fn split(&mut self, platform: &mut dyn Platform) -> Kind {
         self.delete_selection();

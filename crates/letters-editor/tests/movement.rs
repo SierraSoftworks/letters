@@ -147,6 +147,30 @@ fn an_arrow_makes_no_line_where_there_is_one_or_nothing_to_leave() {
 }
 
 #[test]
+fn a_click_below_everything_gets_a_line_to_type_on() {
+    // The document, where the caret ends up, and whether a line had to be made.
+    let cases = [
+        ("code o|ne", "code one\np |", true),
+        ("> p o|ne", "> p one\np |", true),
+        ("> code o|ne", "> code one\np |", true),
+        ("p o|ne\nhr", "p one\nhr\np |", true),
+        ("hr", "hr\np |", true),
+        ("", "p |", true),
+        // Text the caret can simply be at the end of needs none.
+        ("p o|ne\nul two", "p one\nul two|", false),
+        ("h1 o^ne|\np", "h1 one\np |", false),
+    ];
+    for (before, after, made) in cases {
+        let mut editor = Harness::new(before);
+        editor.run(Command::LineBelow);
+        assert_eq!(editor.state(), canon(after), "below {before:?}");
+        assert_eq!(editor.editor.can_undo(), made, "below {before:?}");
+        editor.key("Mod+z");
+        assert_eq!(editor.text(), canon(before).replace(['^', '|'], ""), "undoing the line below {before:?}");
+    }
+}
+
+#[test]
 fn shift_extends_the_selection_and_a_plain_arrow_collapses_it() {
     let cases = [
         ("p one |two", &["Shift+Right", "Shift+Right"][..], "p one ^tw|o"),

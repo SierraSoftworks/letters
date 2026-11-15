@@ -107,14 +107,16 @@ pub enum Command {
     /// Moves the caret, or only the head of the selection when `extend` is set.
     ///
     /// An arrow with no text left to go to makes an empty line outside a code block, a quote or a callout,
-    /// or past a block that holds no text, and that is an edit. A click below the last block is
-    /// [`Motion::DocEnd`] and then [`Motion::Down`].
+    /// or past a block that holds no text, and that is an edit.
     Move {
         to: Motion,
         extend: bool,
     },
     /// Deletes the selection, or from the caret to where the motion leads.
     Delete(Motion),
+    /// Puts the caret below everything, as a click under the last block asks. It goes to the end of the
+    /// body text, heading or list item the document ends in. After anything else an empty line is made for it.
+    LineBelow,
     /// Breaks the block at the caret, as Enter does.
     Split,
     /// A line break that stays inside the block.
@@ -393,7 +395,7 @@ impl Editor {
             return match command {
                 Command::Undo => self.can_undo(),
                 Command::Redo => self.can_redo(),
-                Command::Paste | Command::PastePlain => true,
+                Command::Paste | Command::PastePlain | Command::LineBelow => true,
                 // The style and the document's own fields are there whether or not there is text.
                 Command::SetStyle { .. } | Command::SetPage(_) | Command::ReplaceStyle(_) => true,
                 Command::SetLanguage(_) | Command::AddWord(_) | Command::RemoveWord(_) => true,
@@ -436,6 +438,7 @@ impl Editor {
                 self.delete(motion, platform);
                 kind = Kind::Deleting;
             }
+            Command::LineBelow => self.line_below(platform),
             Command::Split => kind = self.split(platform),
             Command::LineBreak => self.insert("\n"),
             Command::Indent => self.indent(true),
