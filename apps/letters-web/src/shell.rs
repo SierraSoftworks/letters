@@ -547,7 +547,9 @@ impl Shell {
         for (name, file) in self.platform.assets.iter().filter(|(name, _)| document.contains(name.as_str())) {
             assets.set(&name.into(), &Uint8Array::from(&file[..]));
         }
-        let asked: [JsValue; 8] = [
+        // A document of its own takes the history with it, which nothing else has a use for.
+        let history = (format == "let").then(|| Uint8Array::from(&editor.model().save()[..]));
+        let asked: [JsValue; 9] = [
             format.into(),
             title.into(),
             document.into(),
@@ -556,6 +558,7 @@ impl Shell {
             authors.into(),
             created.into(),
             assets.into(),
+            history.into(),
         ];
         self.exporting += 1;
         let (shell, exporter) = (self.me.clone(), self.exporter());
@@ -589,16 +592,11 @@ impl Shell {
         });
     }
 
-    /// Writes a copy of the document in another format, as a file the browser keeps for the person, and
-    /// answers the card that asked for it.
+    /// Writes a copy of the document, as a file the browser keeps for the person, and answers the card
+    /// that asked for it.
     fn copy(&mut self, name: String, format: CopyFormat) {
         let format = match format {
-            // A document of its own has its history and a place among the person's documents, which wait
-            // for a server behind the page.
-            CopyFormat::Letters => {
-                let notice = "A Letters document cannot be saved from the browser yet. The other formats can.";
-                return self.view.refuse_copy(notice, false);
-            }
+            CopyFormat::Letters => "let",
             CopyFormat::Word => "docx",
             CopyFormat::Pdf => "pdf",
             CopyFormat::WebPage => "html",

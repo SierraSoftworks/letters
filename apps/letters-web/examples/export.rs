@@ -1,14 +1,16 @@
 //! The exports as a module of their own, which the page fetches when the person first prints or saves a
 //! copy.
 //!
-//! They bring a PDF writer, the Word and web page writers, the picture decoders and font subsetting: more
-//! than two megabytes that the editor's first frame would otherwise wait for, and that most visits never
-//! use.
+//! They bring a PDF writer, the Word and web page writers, the picture decoders, font subsetting and the
+//! document's own file format: more than two megabytes that the editor's first frame would otherwise wait
+//! for, and that most visits never use.
 
+use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 
 use js_sys::{Array, Date, Map, Uint8Array};
 use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf};
+use letters_format::{MIMETYPE, OPLOG, Package};
 use letters_layout::Fonts;
 use letters_model::{Document, Notes, Style};
 use wasm_bindgen::prelude::*;
@@ -32,6 +34,9 @@ pub fn fonts(fonts: &Array, maths: &Array) {
 /// is what such a file's name ends in: `pdf`, `docx`, `html` or `md`. `assets` holds the pictures the
 /// document shows, by their names in it. `created` is in seconds since 1970 began.
 ///
+/// The format `let` is a document of its own that starts with this one's text and `history`, which is
+/// what `Model::save` writes.
+///
 /// Returns the file's name, its media type and its bytes. The name is `title` as a file can be called,
 /// and `undefined` when nothing of the title can name a file.
 #[wasm_bindgen]
@@ -45,6 +50,7 @@ pub fn exported(
     authors: Vec<String>,
     created: Option<f64>,
     assets: &Map,
+    history: Option<Vec<u8>>,
 ) -> Result<Array, JsError> {
     let (document, style) = (Document::from_json(document)?, Style::from_json(style)?);
     let mut asset =
@@ -77,6 +83,27 @@ pub fn exported(
                     (zipped(std::iter::once(text).chain(pictures))?, "zip", "application/zip")
                 }
             }
+        }
+        "let" => {
+            // A document of its own has its own id: with this one's, the two would pass for one document
+            // that was written in two places.
+            let id = web_sys::window().and_then(|window| window.crypto().ok()).map(|crypto| crypto.random_uuid());
+            let id = id.ok_or_else(|| JsError::new("the browser gave the copy no id"))?;
+            let now = String::from(Date::new_0().to_iso_string());
+            // To the second, as every other writer of the format dates a document.
+            let created = format!("{}Z", now.get(..19).unwrap_or(&now));
+            let mut package = Package { id, created, document, entries: BTreeMap::new() };
+            package.set_style(&style);
+            package.set_notes(&Notes::from_json(notes)?);
+            let history = history.ok_or_else(|| JsError::new("the document came without its history"))?;
+            package.entries.insert(OPLOG.into(), history);
+            assets.for_each(&mut |file, name| {
+                let file = Uint8Array::new(&file).to_vec();
+                package.entries.extend(name.as_string().map(|name| (name, file)));
+            });
+            let mut file = Cursor::new(Vec::new());
+            letters_format::write(&mut file, &package)?;
+            (file.into_inner(), "let", MIMETYPE)
         }
         _ => return Err(JsError::new("there is no such format")),
     };

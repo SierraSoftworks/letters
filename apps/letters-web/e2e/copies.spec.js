@@ -1,4 +1,4 @@
-// Save a copy: the document in another format, as a file the browser keeps for the person.
+// Save a copy: the document again, or in another format, as a file the browser keeps for the person.
 
 import { readFile } from "node:fs/promises";
 
@@ -47,7 +47,9 @@ const picture = async (page) => {
 
 test.beforeEach(({ page }) => ready(page));
 
-for (const [format, ending, starts, holds] of [
+for (const [format, ending, starts, ...holds] of [
+  // A document of its own is an archive that says what it is first, and brings its history.
+  ["Letters", "let", "PK", "mimetypeapplication/vnd.letters.document+zip", "history/oplog"],
   ["Word", "docx", "PK", "word/document.xml"],
   ["PDF", "pdf", "%PDF-", "/Title"],
   ["Web page", "html", "<!doctype html>", "Kept from a browser"],
@@ -60,7 +62,7 @@ for (const [format, ending, starts, holds] of [
     // The name is what was typed, less what no file can be called.
     expect(name).toBe(`Kept a copy.${ending}`);
     expect(file.startsWith(starts)).toBe(true);
-    expect(file).toContain(holds);
+    for (const held of holds) expect(file).toContain(held);
     await expect(card(page)).not.toBeAttached();
   });
 }
@@ -100,15 +102,4 @@ test("a copy that cannot be written leaves its card to ask again", async ({ page
   const [name] = await saved(page);
   expect(name).toBe("Later.html");
   await expect(card(page)).not.toBeAttached();
-});
-
-test("a copy as a document of its own waits for somewhere to keep it", async ({ page }) => {
-  let downloads = 0;
-  page.on("download", () => downloads++);
-  await ask(page, "Twin", "Letters");
-  await page.keyboard.press("Enter");
-  // The mirror follows the window a moment later.
-  await page.waitForTimeout(400);
-  await expect(card(page)).toBeAttached();
-  expect(downloads).toBe(0);
 });
