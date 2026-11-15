@@ -26,6 +26,7 @@ use crate::renaming::{Outcome, Rename, Renaming};
 use crate::restyle::{self, Field, StyleEdit};
 use crate::spelling::{Fix, Spelling};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
+use crate::styles::{self, Styles, Styling};
 use crate::text::{Family, FontShaper, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::ui::{App, Idle, Keys, Ui};
@@ -38,7 +39,7 @@ const GUTTER: f32 = 24.0;
 /// Space kept above and below the text.
 const TOP: f32 = 48.0;
 /// Points to logical pixels.
-const PT: f32 = 96.0 / 72.0;
+pub(crate) const PT: f32 = 96.0 / 72.0;
 const CARET_WIDTH: f32 = 1.5;
 /// How much text one idle step lays out, in bytes. Small enough to fit between two frames.
 const SETTLE_BYTES: usize = 4096;
@@ -146,6 +147,8 @@ pub enum Message {
     Start,
     /// Renames the document where its name stands, or moves it from the flyout under the name.
     Rename(Rename),
+    /// What the Styles panel asks for: the person's default, page setup and stylesheets.
+    Styles(Styling),
 }
 
 impl Ui<EditorApp> {
@@ -220,6 +223,22 @@ impl Ui<EditorApp> {
     /// Has the bar say for a few seconds which folder the document was written to, after its first write.
     pub fn set_saved_in(&mut self, folder: &str) {
         self.app_mut().saved_in = Some((folder.to_owned(), None));
+    }
+
+    /// Says what the person's default style is, which their new documents start with. The Styles panel
+    /// then offers to save or reset to it whenever the document's style differs. `None` is for a shell that
+    /// keeps no default. It is also the answer to a [`Request::SaveDefaultStyle`].
+    pub fn set_default_style(&mut self, style: Option<Style>) {
+        self.app_mut().styles.default = style;
+    }
+
+    /// Shows a stylesheet the person chose, by its file's name and text, in the Styles panel as it will
+    /// look. Nothing changes until they apply it there. Text that is no stylesheet is refused there too, with
+    /// the reason. It is the answer to a [`Request::ImportStyle`].
+    pub fn offer_stylesheet(&mut self, name: &str, json: &str) {
+        let app = self.app_mut();
+        app.show(Some(Panel::Styles));
+        app.styles.offer(name, json);
     }
 
     /// What the window asks of its shell, since this was last called. Call it after every event.
@@ -363,6 +382,10 @@ pub struct EditorApp {
     link: Option<String>,
     /// What is typed into one of the style's fields, and the element type it was typed for.
     draft: Option<(Field, &'static str, String)>,
+    styles: Styles,
+    /// The type a row of the Styles panel has the bar show, and where the selection was then: the bar goes
+    /// back to the type at the caret once the caret moves.
+    picked: Option<(&'static str, Option<Selection>)>,
     folded: Folded,
     /// What each code block was last coloured for: its text and language, hashed.
     lexed: HashMap<BlockId, u64>,
@@ -398,6 +421,8 @@ impl EditorApp {
             sharing: false,
             link: None,
             draft: None,
+            styles: Styles::default(),
+            picked: None,
             folded: Folded::default(),
             lexed: HashMap::new(),
             fading: None,
@@ -456,9 +481,14 @@ impl EditorApp {
         }
     }
 
-    /// The element type whose style the caret's block is drawn with.
+    /// The element type whose style the bar shows: the one the caret's block is drawn with, unless a row of
+    /// the Styles panel picked another since the caret last moved.
     fn element(&self) -> Option<&'static str> {
-        restyle::element(self.editor.doc(), &self.editor.selection()?.head.block)
+        let selection = self.editor.selection();
+        match &self.picked {
+            Some((element, at)) if at.as_ref() == selection => Some(element),
+            _ => restyle::element(self.editor.doc(), &selection?.head.block),
+        }
     }
 
     /// Keeps up which form of the bar fits a window of `width`: forgotten when something that decides it
@@ -471,7 +501,8 @@ impl EditorApp {
         let types = &self.editor.model().style().types;
         let style = self.element().and_then(|element| Some((element, &types.get(element)?.family)));
         let mut hasher = DefaultHasher::new();
-        (width.to_bits(), self.name(), style).hash(&mut hasher);
+        let differs = self.styles.differs(self.editor.model().style());
+        (width.to_bits(), self.name(), style, differs).hash(&mut hasher);
         let key = hasher.finish();
         if key != self.folded.key {
             self.folded = Folded { key, form: None, seen: Fitted::default() };
@@ -637,6 +668,7 @@ impl EditorApp {
     fn pointer(&mut self, event: Pointer, platform: &mut dyn Platform) {
         match event {
             Pointer::Down { at, mods, clicks } => {
+                self.picked = None;
                 // Under the last block there is always a line to write on, also when the document ends in
                 // something that holds the caret in, as a code block does.
                 if at.y + self.scrolled() - TOP > self.layout.height() && !mods.shift {
@@ -1063,8 +1095,10 @@ impl EditorApp {
         let Some(element) = self.element() else { return Vec::new() };
         let Some(style) = self.editor.model().style().types.get(element) else { return Vec::new() };
 
-        // The type follows the caret: it is a label here, and changed on the page.
+        // The type follows the caret: it is named here and changed on the page. A dot says that the
+        // document's style is no longer the person's default, which the Styles panel can mend.
         let name = restyle::name(element);
+        let differs = self.styles.differs(self.editor.model().style());
         let label = Element::row()
             .align(Align::Center)
             .gap(tokens::SPACE_XS)
@@ -1074,7 +1108,8 @@ impl EditorApp {
             .radius(tokens::RADIUS_CONTROL)
             .bg(tokens::TONE_1)
             .fg(tokens::FG_MUTED)
-            .child(Element::text(name.clone(), TextStyle::control().size(tokens::TEXT_SM).weight(500)));
+            .child(Element::text(name.clone(), TextStyle::control().size(tokens::TEXT_SM).weight(500)))
+            .children(differs.then(styles::dot));
 
         let mut fonts = Menu::new().label("Font");
         for (family, face) in FAMILIES {
@@ -1186,6 +1221,16 @@ impl EditorApp {
 
         let looks = cluster().child(colour).child(aligns).child(spacing);
         if fold < Fold::Style {
+            let opens = "Opens the Styles panel";
+            let about = if differs { format!("Differs from your default. {opens}") } else { opens.to_owned() };
+            let label = label
+                .hover(Look::bg(tokens::NEUTRAL_SOFT))
+                .ring(Ring::Outline(2.0))
+                .role(Role::Button)
+                .label(name)
+                .description(about.clone())
+                .tooltip(about, Side::Bottom)
+                .on_press(Message::Styles(Styling::Show));
             return vec![label, font, size, looks, TopBar::rule()];
         }
         let title = format!("{name} style");
@@ -1221,24 +1266,79 @@ impl EditorApp {
     }
 
     fn side(&self, panel: Panel) -> Element<Message> {
-        let rows: Vec<Element<Message>> = match panel {
-            Panel::Styles => {
-                self.editor.model().style().types.iter().map(|(name, style)| style_row(name, style)).collect()
-            }
-            Panel::Notes | Panel::History => Vec::new(),
+        let empty = |said: &str| {
+            let said = Element::paragraph(said, TextStyle::body()).fg(tokens::FG_MUTED);
+            Element::column().padding(Edges::top(tokens::SPACE_MD)).child(said)
         };
-        let empty = match panel {
-            Panel::Styles => "This document has no styles.",
-            Panel::Notes => "No open notes.",
-            Panel::History => "No earlier versions yet.",
-        };
-        let body = Element::column().padding(Edges::top(tokens::SPACE_MD)).gap(tokens::SPACE_2XS);
-        let body = if rows.is_empty() {
-            body.child(Element::paragraph(empty, TextStyle::body()).fg(tokens::FG_MUTED))
-        } else {
-            body.children(rows)
+        let body = match panel {
+            Panel::Styles => self.styles.view(self.editor.model().style(), self.element(), &self.palette),
+            Panel::Notes => empty("No open notes."),
+            Panel::History => empty("No earlier versions yet."),
         };
         SidePanel::new(panel.title()).on_close(Message::ClosePanel).child(body).into()
+    }
+
+    /// Shows a panel, or none. What the Styles panel was in the middle of goes with it.
+    fn show(&mut self, panel: Option<Panel>) {
+        if self.panel == Some(Panel::Styles) && panel != self.panel {
+            self.picked = None;
+            self.styles.leave();
+        }
+        self.panel = panel;
+    }
+
+    /// What the Styles panel asks for. A change to the style is one step for undo, and files are asked of
+    /// the shell.
+    fn styling(&mut self, message: Styling, platform: &mut dyn Platform) {
+        let style = self.editor.model().style();
+        let command = match message {
+            Styling::Show => {
+                self.show(Some(Panel::Styles));
+                None
+            }
+            Styling::Pick(element) => {
+                self.picked = Some((element, self.editor.selection().cloned()));
+                None
+            }
+            Styling::SaveDefault => {
+                let kept = self.styles.offered.take().map_or_else(|| style.clone(), |(_, offered)| offered);
+                self.requests.push(Request::SaveDefaultStyle(kept.to_json()));
+                self.styles.default = Some(kept);
+                None
+            }
+            Styling::Import => {
+                self.styles.refused = None;
+                self.requests.push(Request::ImportStyle);
+                None
+            }
+            Styling::Export => {
+                self.requests.push(Request::ExportStyle(style.to_json()));
+                None
+            }
+            Styling::Decline => {
+                self.styles.offered = None;
+                None
+            }
+            Styling::Margins(typed) => {
+                self.styles.margins = Some(typed);
+                None
+            }
+            Styling::ForgetMargins => {
+                self.styles.margins = None;
+                None
+            }
+            Styling::Reset => self.styles.default.clone().map(Command::ReplaceStyle),
+            Styling::Apply => self.styles.offered.take().map(|(_, offered)| Command::ReplaceStyle(offered)),
+            Styling::Paper(paper) => styles::with_paper(&style.page, paper).map(Command::SetPage),
+            Styling::Landscape(landscape) => Some(Command::SetPage(styles::turned(&style.page, landscape))),
+            Styling::TakeMargins => {
+                let typed = self.styles.margins.take();
+                typed.and_then(|typed| styles::with_margins(&style.page, &typed)).map(Command::SetPage)
+            }
+        };
+        if let Some(command) = command {
+            self.edit(platform, |editor, platform| editor.run(command, platform));
+        }
     }
 }
 
@@ -1264,8 +1364,8 @@ impl App for EditorApp {
             Message::Text(event) => self.edit(platform, |editor, platform| editor.input(event, platform)),
             Message::Pointer(event) => self.pointer(event, platform),
             Message::Run(command) => self.edit(platform, |editor, platform| editor.run(command, platform)),
-            Message::Panel(panel) => self.panel = (self.panel != Some(panel)).then_some(panel),
-            Message::ClosePanel => self.panel = None,
+            Message::Panel(panel) => self.show((self.panel != Some(panel)).then_some(panel)),
+            Message::ClosePanel => self.show(None),
             Message::Share(open) => self.sharing = open,
             Message::Correct(text) => {
                 let Some(fix) = self.spelling.fix.take() else { return };
@@ -1291,6 +1391,7 @@ impl App for EditorApp {
             Message::NewDocument => self.requests.push(Request::New),
             Message::Start => self.start(),
             Message::Rename(message) => self.rename(message),
+            Message::Styles(message) => self.styling(message, platform),
             Message::Jump(block) => {
                 let start = Pos { block, offset: 0 };
                 self.editor.select(Selection::caret(start.clone()));
@@ -1459,7 +1560,7 @@ fn fill(rect: Rect, color: Color) -> Item {
 }
 
 /// The colours the page is painted in. The light page is the one documents are styled for and exports use.
-fn palette(scheme: Scheme) -> Palette {
+pub fn palette(scheme: Scheme) -> Palette {
     if scheme == Scheme::Light {
         return Palette::LIGHT;
     }
@@ -1553,7 +1654,7 @@ fn hex(ink: Ink) -> String {
 }
 
 /// Reads a style's `#rrggbb`.
-fn hex_color(hex: &str) -> Option<Color> {
+pub(crate) fn hex_color(hex: &str) -> Option<Color> {
     let rgb = u32::from_str_radix(hex.strip_prefix('#').filter(|digits| digits.len() == 6)?, 16).ok()?;
     Some(Color::rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
 }
@@ -1574,22 +1675,12 @@ const ALIGNS: [(Icon, &str, TextAlign); 4] = [
 ];
 
 /// The bundled families, each with the face the bar shows its name in.
-const FAMILIES: [(&str, Family); 3] = [
+pub(crate) const FAMILIES: [(&str, Family); 3] = [
     (letters_fonts::SANS, Family::Sans),
     (letters_fonts::DISPLAY, Family::Display),
     (letters_fonts::MONO, Family::Mono),
 ];
 
 /// The weights offered for a type. The bundled faces are variable, so every family has them all.
-const WEIGHTS: [(u16, &str); 5] = [(300, "Light"), (400, "Regular"), (500, "Medium"), (600, "Semibold"), (700, "Bold")];
-
-/// One of the document's element types, with the face it is set in.
-fn style_row(name: &str, style: &letters_model::TextStyle) -> Element<Message> {
-    let face = format!("{} {} pt", style.family, style.size);
-    Element::row()
-        .align(Align::Center)
-        .justify(Justify::Between)
-        .min_height(tokens::CONTROL_HEIGHT_SM)
-        .child(Element::text(name, TextStyle::control()))
-        .child(Element::text(face, TextStyle::control().size(tokens::TEXT_SM)).fg(tokens::FG_MUTED))
-}
+pub(crate) const WEIGHTS: [(u16, &str); 5] =
+    [(300, "Light"), (400, "Regular"), (500, "Medium"), (600, "Semibold"), (700, "Bold")];

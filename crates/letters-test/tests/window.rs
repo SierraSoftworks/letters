@@ -2,7 +2,7 @@
 
 use accesskit::{Action, ActionData, ActionRequest, TextPosition, TextSelection, TreeId};
 use letters_editor::InputEvent;
-use letters_model::{Align, Block, BlockKind, Document, Pos, Selection, TextStyle};
+use letters_model::{Align, Block, BlockKind, Document, Pos, Selection, Style, TextStyle};
 use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
 use letters_ui::{Folder, Landing, Location, Recent, Request, SaveState};
@@ -228,11 +228,11 @@ fn a_click_on_the_page_moves_the_caret_there() {
 fn the_bar_names_the_document_its_save_state_and_the_type_at_the_caret() {
     let mut window = letter();
     window.ui().set_document_name("Quote");
-    window.assert_open(Role::Button, "Quote").assert_open(Role::Label, "Saved").assert_open(Role::Label, "Heading 1");
+    window.assert_open(Role::Button, "Quote").assert_open(Role::Label, "Saved").assert_open(Role::Button, "Heading 1");
 
     window.ui().set_save_state(SaveState::Offline);
     window.ui().select(Selection::caret(Pos::new("p1", 0)));
-    window.assert_open(Role::Label, "Offline").assert_open(Role::Label, "Body");
+    window.assert_open(Role::Label, "Offline").assert_open(Role::Button, "Body");
     window.assert_closed(Role::Label, "Saved");
 }
 
@@ -1329,4 +1329,223 @@ fn a_press_under_the_last_block_gives_a_line_to_write_on() {
         assert!(matches!(block.kind, BlockKind::Paragraph), "after {ends_in} comes body text: {:?}", block.kind);
         assert_eq!(block.plain_text(), last, "after {ends_in}");
     }
+}
+
+/// The Styles panel's rows, top to bottom: each type's name, its font in words, and whether it is the
+/// one the bar shows.
+fn style_rows(window: &mut Harness) -> Vec<(String, String, bool)> {
+    let panel = window.find(Role::Complementary, "Styles").expect("the Styles panel").bounds;
+    let row = |found: letters_test::Found| {
+        let open = found.toggled.filter(|_| found.role == Role::Button && panel.contains(found.center()))?;
+        Some((found.name, found.description.unwrap_or_default(), open))
+    };
+    window.controls().into_iter().filter_map(row).collect()
+}
+
+/// The types whose rows are marked as the one the bar shows.
+fn open_rows(window: &mut Harness) -> Vec<String> {
+    style_rows(window).into_iter().filter(|row| row.2).map(|row| row.0).collect()
+}
+
+/// The bar's button for the type whose style it shows.
+fn type_label(window: &mut Harness, name: &str) -> letters_test::Found {
+    let bar = window.find(Role::Toolbar, "Document").expect("the bar").bounds;
+    let named =
+        |found: &letters_test::Found| found.role == Role::Button && found.name == name && bar.contains(found.center());
+    window.controls().into_iter().find(named).unwrap_or_else(|| panic!("the bar does not name {name}"))
+}
+
+/// What the window asked of its shell about stylesheets, the latest last.
+fn asked(window: &mut Harness) -> Vec<Request> {
+    window.ui().take_requests()
+}
+
+/// A stylesheet that is not the letter's own style: body text in Fira Code.
+fn other_sheet(window: &mut Harness) -> Style {
+    let mut sheet = window.ui().style().clone();
+    sheet.types.get_mut("body").expect("a style for body text").family = "Fira Code".into();
+    sheet
+}
+
+#[test]
+fn the_styles_panel_lists_each_named_style_with_its_font_and_marks_the_one_at_the_caret() {
+    let mut window = letter();
+    window.click(Role::Button, "Styles");
+    let rows = style_rows(&mut window);
+    let names: Vec<&str> = rows.iter().map(|row| row.0.as_str()).collect();
+    let expected = ["Title", "Heading 1", "Heading 2", "Heading 3", "Heading 4", "Body", "Quote", "Code", "Caption"];
+    assert_eq!(names, expected);
+    let font = |rows: &[(String, String, bool)], name: &str| {
+        rows.iter().find(|row| row.0 == name).map(|row| row.1.clone()).unwrap_or_default()
+    };
+    assert!(font(&rows, "Quote").contains("Italic"), "{rows:?}");
+    assert!(font(&rows, "Code").contains("Fira Code"), "{rows:?}");
+    assert_eq!(open_rows(&mut window), ["Heading 1"], "the caret is in a heading");
+
+    // A change made in the bar shows in the row, and the mark follows the caret.
+    window.click(Role::Button, "Font").click(Role::MenuItemCheckBox, "Fira Code");
+    assert!(font(&style_rows(&mut window), "Heading 1").contains("Fira Code"));
+    window.ui().select(Selection::caret(Pos::new("p1", 0)));
+    assert_eq!(open_rows(&mut window), ["Body"]);
+}
+
+#[test]
+fn a_row_of_the_panel_has_the_bar_restyle_a_type_the_caret_is_not_in() {
+    let mut window = letter();
+    window.click(Role::Button, "Styles").click(Role::Button, "Caption");
+    type_label(&mut window, "Caption");
+    assert_eq!(open_rows(&mut window), ["Caption"]);
+
+    window.click(Role::Button, "Align centre");
+    assert_eq!(style_of(&mut window, "caption").align, Align::Center);
+    assert_eq!(style_of(&mut window, "heading1").align, Align::Start, "the type at the caret keeps its style");
+    type_label(&mut window, "Caption");
+
+    // The bar goes back to the caret once it moves.
+    window.ui().select(Selection::caret(Pos::new("p1", 0)));
+    type_label(&mut window, "Body");
+    assert_eq!(open_rows(&mut window), ["Body"]);
+}
+
+#[test]
+fn a_style_that_is_not_the_persons_default_can_be_reset_to_it_or_saved_as_it() {
+    let mut window = letter();
+    let default = window.ui().style().clone();
+    window.ui().set_default_style(Some(default.clone()));
+    window.click(Role::Button, "Styles");
+    window.assert_closed(Role::Label, "Differs from your default");
+    assert!(!type_label(&mut window, "Heading 1").description.unwrap_or_default().contains("default"));
+
+    window.click(Role::Button, "Align centre");
+    window.assert_open(Role::Label, "Differs from your default");
+    let label = type_label(&mut window, "Heading 1");
+    assert!(label.description.unwrap_or_default().contains("Differs from your default"), "the bar says so too");
+
+    window.click(Role::Button, "Reset to my default");
+    assert_eq!(window.ui().style(), &default);
+    window.assert_closed(Role::Label, "Differs from your default");
+    window.click(Role::Button, "Undo");
+    assert_ne!(window.ui().style(), &default, "undo takes the reset back");
+
+    window.click(Role::Button, "Save as my default");
+    let saved = asked(&mut window).into_iter().find_map(|request| match request {
+        Request::SaveDefaultStyle(json) => Some(json),
+        _ => None,
+    });
+    let saved = Style::from_json(&saved.expect("the shell is asked to keep it")).expect("a style.json");
+    assert_eq!(&saved, window.ui().style());
+    window.assert_closed(Role::Label, "Differs from your default");
+}
+
+#[test]
+fn the_bars_type_opens_the_styles_panel() {
+    let mut window = letter();
+    let label = type_label(&mut window, "Heading 1");
+    window.click_at(label.center());
+    window.assert_open(Role::Complementary, "Styles");
+    window.click_at(label.center());
+    window.assert_open(Role::Complementary, "Styles");
+}
+
+#[test]
+fn a_stylesheet_is_shown_as_it_will_look_before_it_is_applied_in_one_step() {
+    let mut window = letter();
+    let (before, sheet) = (window.ui().style().clone(), other_sheet(&mut window));
+    window.click(Role::Button, "Styles").click(Role::Button, "Import");
+    assert!(asked(&mut window).contains(&Request::ImportStyle), "the shell is asked for a file");
+
+    window.ui().offer_stylesheet("travel.letstyle", &sheet.to_json());
+    window.assert_open(Role::Label, "travel.letstyle");
+    let shows = |window: &mut Harness, font: &str| {
+        window.controls().iter().any(|found| found.role == Role::Label && found.name.starts_with(font))
+    };
+    assert!(shows(&mut window, "Fira Code, 11"), "body text is listed as the stylesheet has it");
+    assert_eq!(window.ui().style(), &before, "nothing has changed yet");
+
+    window.click(Role::Button, "Apply");
+    assert_eq!(window.ui().style(), &sheet);
+    window.assert_closed(Role::Label, "travel.letstyle");
+    window.click(Role::Button, "Undo");
+    assert_eq!(window.ui().style(), &before, "the whole stylesheet is one step");
+}
+
+#[test]
+fn a_stylesheet_on_offer_leaves_the_document_alone_unless_it_is_applied() {
+    // The button pressed, and whether the shell is then asked to keep the stylesheet as the default.
+    for (button, kept) in [("Cancel", false), ("Save as my default", true)] {
+        let mut window = letter();
+        let (before, sheet) = (window.ui().style().clone(), other_sheet(&mut window));
+        window.ui().offer_stylesheet("travel.letstyle", &sheet.to_json());
+        window.assert_open(Role::Complementary, "Styles");
+        window.click(Role::Button, button);
+
+        assert_eq!(window.ui().style(), &before, "{button}");
+        window.assert_closed(Role::Label, "travel.letstyle");
+        let saved = asked(&mut window).into_iter().find_map(|request| match request {
+            Request::SaveDefaultStyle(json) => Style::from_json(&json).ok(),
+            _ => None,
+        });
+        assert_eq!(saved, kept.then_some(sheet), "{button}");
+    }
+}
+
+#[test]
+fn a_file_that_is_no_stylesheet_is_refused_and_the_panel_says_why() {
+    let mut window = letter();
+    let before = window.ui().style().clone();
+    window.ui().offer_stylesheet("notes.txt", "Dear Harland,");
+    let alert = window.controls().into_iter().find(|found| found.role == Role::Alert).expect("the panel says why");
+    assert!(alert.name.contains("notes.txt"), "{}", alert.name);
+    assert!(window.find(Role::Button, "Apply").is_none(), "there is nothing to apply");
+    assert_eq!(window.ui().style(), &before);
+
+    // The next file is judged on its own.
+    let sheet = other_sheet(&mut window);
+    window.ui().offer_stylesheet("travel.letstyle", &sheet.to_json());
+    assert!(window.controls().iter().all(|found| found.role != Role::Alert));
+}
+
+#[test]
+fn export_hands_the_shell_the_documents_style_as_a_stylesheet() {
+    let mut window = letter();
+    window.click(Role::Button, "Align centre").click(Role::Button, "Styles").click(Role::Button, "Export");
+    let sheet = asked(&mut window).into_iter().find_map(|request| match request {
+        Request::ExportStyle(json) => Some(json),
+        _ => None,
+    });
+    let sheet = Style::from_json(&sheet.expect("the shell is asked to write it")).expect("a stylesheet");
+    assert_eq!(&sheet, window.ui().style());
+}
+
+#[test]
+fn the_paper_and_its_margins_are_set_in_the_panel() {
+    let mut window = letter();
+    window.click(Role::Button, "Styles");
+    let a4 = window.ui().style().page.clone();
+    assert_eq!(window.find(Role::Button, "Paper").unwrap().description.as_deref(), Some("A4, portrait"));
+
+    window.click(Role::Button, "Paper").click(Role::MenuItemCheckBox, "Letter");
+    let letter = window.ui().style().page.clone();
+    assert!(letter.width > a4.width && letter.height < a4.height, "US Letter is wider and shorter than A4");
+    window.click(Role::Button, "Paper").click(Role::MenuItemCheckBox, "Landscape");
+    let turned = window.ui().style().page.clone();
+    assert_eq!((turned.width, turned.height), (letter.height, letter.width));
+    assert_eq!(window.find(Role::Button, "Paper").unwrap().description.as_deref(), Some("Letter, landscape"));
+
+    // Margins are typed in millimetres, and the paper has to have room for them.
+    for (typed, taken) in [("10", true), ("500", false), ("wide", false)] {
+        let before = window.ui().style().page.clone();
+        window.click(Role::TextInput, "Margins").key("Mod+A").type_text(typed).key("Enter");
+        let page = window.ui().style().page.clone();
+        assert_eq!(page != before, taken, "{typed:?}");
+        assert_eq!((page.width, page.height), (before.width, before.height), "the paper is as it was");
+        if taken {
+            let sides = [page.margin_top, page.margin_right, page.margin_bottom, page.margin_left];
+            assert!(sides.iter().all(|side| (side - 28.35).abs() < 0.1), "10 mm on every side: {sides:?}");
+        }
+        window.key("Escape");
+    }
+
+    window.click(Role::Button, "Undo");
+    assert_eq!(window.ui().style().page.margin_top, turned.margin_top, "page setup is undone like any edit");
 }

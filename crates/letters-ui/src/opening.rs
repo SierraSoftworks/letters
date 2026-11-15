@@ -26,6 +26,14 @@ pub enum Request {
     /// Make a folder called `name` in the folder with the path `parent`, and list it with
     /// `Window::set_location`.
     NewFolder { parent: String, name: String },
+    /// Keep this as the person's default style, which their new documents start with: the text of a
+    /// `style.json`. Answer with `Window::set_default_style` if it could not be kept.
+    SaveDefaultStyle(String),
+    /// Let the person choose a stylesheet, a `.letstyle` file, and hand its text to
+    /// `Window::offer_stylesheet`.
+    ImportStyle,
+    /// Let the person choose where to write this stylesheet: the text of a `.letstyle` file.
+    ExportStyle(String),
 }
 
 /// A document opened lately, as the landing card lists it.
