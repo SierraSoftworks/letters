@@ -93,6 +93,8 @@ pub(crate) enum Act {
     Print,
     /// Shows the document's earlier versions.
     History,
+    /// Shows the versions that changed what is selected.
+    SelectionHistory,
     /// Steps through the conflicts that wait for a choice, or settles the one that is open.
     Review(Reviewing),
     /// Goes to the next misspelled word and offers its corrections, or to the one before.
@@ -150,7 +152,7 @@ const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> E
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 91] = [
+pub(crate) static ENTRIES: [Entry; 92] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -228,6 +230,7 @@ pub(crate) static ENTRIES: [Entry; 91] = [
     entry("View", "Styles panel", "show hide fonts page", Act::Panel(Panel::Styles)),
     entry("View", "Notes panel", "show hide comments", Act::Panel(Panel::Notes)),
     entry("View", "History", "versions earlier before rewind restore", Act::History),
+    entry("View", "History of selection", "passage versions changed who restore", Act::SelectionHistory),
     entry("View", "Print view", "pages paper sheets preview", Act::Print),
     entry("View", "Next conflict", "changed two places choice", Act::Review(Reviewing::Step { back: false })),
     entry("View", "Previous conflict", "changed two places choice", Act::Review(Reviewing::Step { back: true })),

@@ -420,7 +420,8 @@ impl Context {
         if turns {
             menu = menu.item(MenuItem::new("Turn into").icon(icon::PILCROW).submenu(kinds));
         }
-        for item in about.items(&[run(Command::PastePlain), run(Command::SelectAll), Act::Find, Act::Replace]) {
+        let more = [run(Command::PastePlain), run(Command::SelectAll), Act::Find, Act::Replace, Act::SelectionHistory];
+        for item in about.items(&more) {
             menu = menu.item(item);
         }
         if let Some(palette) = (about.asked)(&Act::Palette) {

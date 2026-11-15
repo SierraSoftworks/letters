@@ -24,8 +24,14 @@
 //!
 //! A passage is copied out of a version as it is out of the page: the pointer selects it, and a tool over
 //! what is selected copies it, as the key for a copy does. There is no caret, since nothing is written.
+//!
+//! The history of a passage is asked for with text selected on the page. The passage is the blocks at the
+//! top of the document that the selection touches, and the history narrows to the versions that changed
+//! one of them: the panel lists those with what each did and how the passage read before and after, the
+//! page shows the picked one with all but the passage under a veil, and the bar restores the passage alone.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 
 use accesskit::{Node, NodeId, Role};
@@ -54,7 +60,9 @@ use crate::text::{Family, TextShaper, TextStyle};
 use crate::theme::accent;
 use crate::threads;
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::widgets::{self, Button, ControlSize, Menu, MenuItem, Popover, Segmented, SidePanel, TextField, TopBar};
+use crate::widgets::{
+    self, Button, ControlSize, Menu, MenuItem, Popover, Segmented, SidePanel, TextField, TopBar, side_panel,
+};
 use crate::window::{GUTTER, Message, PT, TOP};
 use crate::words::WordLists;
 
@@ -100,6 +108,19 @@ const NEAR: usize = 8;
 const TOLD: usize = 160;
 /// The most room the field takes that a version's name is typed in.
 const NAME_WIDTH: f32 = 200.0;
+/// What the panel shows of a passage as a version left it: how wide it is set, how much of the text before
+/// the first word that differs and after the last it keeps, in bytes, and the most of one version of it.
+const SHOWN: f32 = side_panel::WIDTH - 2.0 * tokens::SPACE_LG - 2.0 * tokens::SPACE_XS - TRACK - tokens::SPACE_SM;
+const LEAD: usize = 48;
+const MOST: usize = 320;
+/// The bands that hold a passage as it read before and after: the room inside them round each of the two,
+/// and how tall the line is that says which of them one is.
+const BOXED: f32 = tokens::SPACE_SM;
+const SIDE: f32 = 18.0;
+/// How much of the page's colour lies over what is not of the passage, and how far to the left of the
+/// passage's text its bar stands.
+const DIM: f32 = 0.6;
+const BAR_OUT: f32 = 16.0;
 /// The strip of versions under the page: how tall its bar is and how tall its cells are, the narrowest a
 /// cell is set apart from the next, the narrowest a version that stands out is drawn, and how wide the
 /// head at the picked version is and how far it reaches past the cells.
@@ -138,6 +159,10 @@ pub enum Historying {
     All,
     Copy,
     Unselect,
+    /// Shows the history of what is selected on the page: the versions that changed it. Then shows every
+    /// version again.
+    Passage,
+    Whole,
     /// Shows the picked version against another, or as it read.
     Compare(Compare),
     /// The pointer went down on the strip of versions, or moved along it while held: this far across it,
@@ -145,7 +170,7 @@ pub enum Historying {
     Scrub(f32),
     /// What is done about the picked version's name.
     Name(Naming),
-    /// Makes the document read as the picked version again.
+    /// Makes the document read as the picked version again, or of a passage's history the passage alone.
     Restore,
 }
 
@@ -563,12 +588,26 @@ fn band(band: Rect, added: bool, page: Color, scheme: Scheme, list: &mut Display
     cast(Rect::new(band.x, band.y + band.height, band.width, CAST), list);
     list.push(Item::PopClip);
     for y in [band.y, band.y + band.height - EDGE] {
-        let mut x = band.x;
-        while x < band.x + band.width {
-            let rect = Rect::new(x, y, DASH.min(band.x + band.width - x), EDGE);
-            list.push(Item::Fill { rect, color: ink(tone), radius: 0.0 });
-            x += 2.0 * DASH;
-        }
+        dashes(Rect::new(band.x, y, band.width, EDGE), ink(tone), list);
+    }
+}
+
+/// Draws a cut: a broken line along `line`.
+fn dashes(line: Rect, color: Color, list: &mut DisplayList) {
+    let (mut x, end) = (line.x, line.x + line.width);
+    while x < end {
+        list.push(Item::Fill { rect: Rect { x, width: DASH.min(end - x), ..line }, color, radius: 0.0 });
+        x += 2.0 * DASH;
+    }
+}
+
+/// The cut between a passage as it read before and as it read after, where the panel shows the two in
+/// bands.
+struct Cut;
+
+impl Paint for Cut {
+    fn paint(&self, rect: Rect, _visible: Rect, scheme: Scheme, out: &mut DisplayList) {
+        dashes(rect, resolve(TONES[0].1, scheme, 1.0), out);
     }
 }
 
@@ -578,6 +617,302 @@ fn cut(piece: &Piece, view: Rect) -> Option<Rect> {
     let top = (view.y - piece.origin.y).max(piece.band.0);
     let bottom = (view.y + view.height - piece.origin.y).min(piece.band.1);
     (top < bottom).then(|| Rect::new(view.x - piece.origin.x, top, view.width, bottom - top))
+}
+
+/// The blocks at the top of a document that a selection touches: the passage whose history can be asked
+/// for. A block that the selection only reaches the very start of is not one of them. `None` for a caret.
+pub(crate) fn touched(doc: &Document, selection: &Selection) -> Option<Vec<BlockId>> {
+    if selection.is_caret() {
+        return None;
+    }
+    let top = |pos: &Pos| doc.blocks.iter().position(|block| under(block, &pos.block).is_some());
+    let (anchor, head) = (top(&selection.anchor)?, top(&selection.head)?);
+    let (first, mut last, end) = match anchor <= head {
+        true => (anchor, head, &selection.head),
+        false => (head, anchor, &selection.anchor),
+    };
+    let begins = |block: &Block| written(block).is_some_and(|text| text.id == end.block) && end.offset == 0;
+    if last > first && begins(&doc.blocks[last]) {
+        last -= 1;
+    }
+    Some(doc.blocks[first..=last].iter().map(|block| block.id.clone()).collect())
+}
+
+/// A passage whose history shows: what was selected on the page when that was asked for, and the versions
+/// that changed it.
+struct Passage {
+    /// The blocks at the top of the document that the selection touched.
+    blocks: Vec<BlockId>,
+    /// The versions that changed one of them, oldest first and counted from the oldest of all: each with
+    /// the passage as it left it, which is the block of each of `blocks` that it has.
+    changes: Vec<(usize, Vec<Option<Block>>)>,
+    /// What each of those did, as the panel tells it.
+    deeds: Vec<Deed>,
+    /// What the panel shows of the passage before each and after it, set in the colours it was last asked
+    /// for in.
+    shown: Option<(Palette, Vec<Quoted>)>,
+}
+
+/// A passage as the panel shows it read before a version and after it, where it shows each.
+type Quoted = [Option<Rc<Shown>>; 2];
+
+impl Passage {
+    /// The place among the changes of the last one that a version has: its own, or one before it.
+    fn held(&self, at: usize) -> Option<usize> {
+        self.changes.iter().rposition(|(changed, _)| *changed <= at)
+    }
+
+    /// The version that left the passage as a version has it: the last at or before it that changed the
+    /// passage, or else the first that did.
+    fn left(&self, at: usize) -> usize {
+        self.changes[self.held(at).unwrap_or(0)].0
+    }
+
+    /// Whether a version changed the passage.
+    fn changed(&self, at: usize) -> bool {
+        self.changes.binary_search_by_key(&at, |(changed, _)| *changed).is_ok()
+    }
+
+    /// Marks on a version's page what is of the passage, with the words that the version put into it.
+    fn light(&self, leaf: &mut Leaf, at: usize) {
+        let deed = self.changes.iter().position(|(changed, _)| *changed == at).map(|place| &self.deeds[place]);
+        let said = deed.and_then(|deed| deed.said.as_deref());
+        let said = said.map_or_else(|| "Selection".to_owned(), |said| format!("Selection: {said}"));
+        // Blocks of it that follow one another on the page are one stretch.
+        let mut lit: Vec<(BlockId, BlockId)> = Vec::new();
+        let mut open = false;
+        for block in &leaf.doc.blocks {
+            let own = self.blocks.contains(&block.id);
+            match lit.last_mut().filter(|_| own && open) {
+                Some(stretch) => stretch.1 = block.id.clone(),
+                None if own => lit.push((block.id.clone(), block.id.clone())),
+                None => {}
+            }
+            if own {
+                leaf.said.insert(block.id.clone(), said.clone());
+            }
+            open = own;
+        }
+        leaf.lit = Some(lit);
+        let came = deed.map(|deed| deed.came.iter().cloned().map(|words| (words, Side::Second)).collect());
+        leaf.found.words = came.unwrap_or_default();
+    }
+}
+
+/// A paragraph the panel shows of a passage, and the stretches of it that are marked.
+type Paragraph = (String, Vec<Range<usize>>);
+
+/// What a version did to a passage.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Deed {
+    /// In a few words. `None` where the passage came with a version from elsewhere.
+    said: Option<String>,
+    /// What the panel shows of the passage as it read before and as it read after: the paragraphs of each,
+    /// cut to what differs, and the words in them that the other does not have. `None` for one that has
+    /// nothing to show beside the other.
+    sides: [Option<Vec<Paragraph>>; 2],
+    /// The words on the page that the version put in.
+    came: Vec<Selection>,
+}
+
+/// What a version did to a passage that read `was` before it and `is` after it: for each of the passage's
+/// blocks, the block as the version before had it and as this one has it. `apart` says that the version
+/// came from elsewhere, as an import does.
+fn deed(was: &[Option<Block>], is: &[Option<Block>], apart: bool) -> Deed {
+    let none = |side: &[Option<Block>]| side.iter().all(Option::is_none);
+    let differ = || was.iter().zip(is).filter(|(was, is)| was != is);
+    let before: Vec<&Block> = differ().filter_map(|(was, _)| was.as_ref()).collect();
+    let after: Vec<&Block> = differ().filter_map(|(_, is)| is.as_ref()).collect();
+    let (mut gone, mut came) = (Vec::new(), Vec::new());
+    // A passage that is all new, or all gone, has no words to tell apart from the rest of it.
+    if !none(was) && !none(is) {
+        // A block that only one of the two has differs whole.
+        let empty = |block: &Block| Block::new(block.id.clone(), BlockKind::Paragraph);
+        for (was, is) in differ() {
+            let [lost, put] = match (was, is) {
+                (Some(was), Some(is)) => review::differing(was, is),
+                (Some(was), None) => review::differing(was, &empty(was)),
+                (None, Some(is)) => review::differing(&empty(is), is),
+                (None, None) => continue,
+            };
+            gone.extend(lost);
+            came.extend(put);
+        }
+    }
+    let said = match (none(was), none(is), gone.is_empty(), came.is_empty()) {
+        (true, ..) => (!apart).then(|| "Wrote the passage".to_owned()),
+        (_, true, ..) => Some("Removed the passage".to_owned()),
+        (.., true, false) => Some(format!("Added {}", counted(&after, &came))),
+        (.., false, true) => Some(format!("Removed {}", counted(&before, &gone))),
+        (.., false, false) => Some("Rewrote the passage".to_owned()),
+        (.., true, true) => Some("Changed the formatting".to_owned()),
+    };
+    let sides = match (none(is), gone.is_empty(), came.is_empty()) {
+        (true, ..) | (false, false, true) => [extract(&before, &gone), None],
+        (false, false, false) => [extract(&before, &gone), extract(&after, &came)],
+        (false, true, _) => [None, extract(&after, &came)],
+    };
+    Deed { said, sides, came }
+}
+
+/// How many words the stretches `words` of some blocks' text are, as the panel says it: "4 words".
+fn counted(blocks: &[&Block], words: &[Selection]) -> String {
+    let texts = words.iter().filter_map(|words| {
+        let text = blocks.iter().find_map(|block| under(block, &words.anchor.block))?.plain_text();
+        let (from, to) = (words.anchor.offset.min(words.head.offset), words.anchor.offset.max(words.head.offset));
+        text.get(from..to).map(str::to_owned)
+    });
+    let word = |word: &&str| word.chars().any(char::is_alphanumeric);
+    match texts.map(|text| text.split_whitespace().filter(word).count()).sum() {
+        0 => "punctuation".to_owned(),
+        1 => "1 word".to_owned(),
+        count => format!("{count} words"),
+    }
+}
+
+/// What the panel shows of some blocks of a passage: each paragraph in them that has some of the words
+/// `marks`, cut to what lies round those, or the paragraphs they begin with when nothing is marked. No more
+/// than [`MOST`] bytes in all, with a sign where there was more. `None` when they hold no text.
+fn extract(blocks: &[&Block], marks: &[Selection]) -> Option<Vec<Paragraph>> {
+    fn texts<'a>(block: &'a Block, out: &mut Vec<&'a Block>) {
+        if matches!(block.body, Body::Text(_)) {
+            out.push(block);
+        }
+        block.body.blocks().iter().for_each(|part| texts(part, out));
+    }
+    let mut all = Vec::new();
+    blocks.iter().for_each(|block| texts(block, &mut all));
+    let stretch =
+        |words: &Selection| words.anchor.offset.min(words.head.offset)..words.anchor.offset.max(words.head.offset);
+    let mut shown: Vec<Paragraph> = Vec::new();
+    let mut room = MOST;
+    for block in all {
+        let mut of: Vec<Range<usize>> =
+            marks.iter().filter(|words| words.anchor.block == block.id).map(stretch).collect();
+        of.sort_by_key(|words| words.start);
+        let text = block.plain_text();
+        if text.trim().is_empty() || (of.is_empty() && !marks.is_empty()) {
+            continue;
+        }
+        if room < LEAD {
+            shown.push(("\u{2026}".to_owned(), Vec::new()));
+            break;
+        }
+        let (part, of) = excerpt(&text, &of, room);
+        room = room.saturating_sub(part.len());
+        shown.push((part, of));
+    }
+    (!shown.is_empty()).then_some(shown)
+}
+
+/// The part of a text round the stretches `marks` of it, which come in order: from a few words before the
+/// first to a few after the last, or from its start when there are none, and no more than `most` bytes of
+/// it. An end that leaves text out says so. Returns the stretches as they lie in the part.
+fn excerpt(text: &str, marks: &[Range<usize>], most: usize) -> (String, Vec<Range<usize>>) {
+    let edge = |at: usize| (0..=at.min(text.len())).rev().find(|at| text.is_char_boundary(*at)).unwrap_or(0);
+    let space = |(_, c): &(usize, char)| c.is_whitespace();
+    let first = marks.first().map_or(0, |mark| edge(mark.start));
+    let last = marks.last().map_or(0, |mark| edge(mark.end));
+    // It begins with a whole word, a few before the first stretch.
+    let mut start = edge(first.saturating_sub(LEAD));
+    if start > 0 {
+        let word = text[start..first].char_indices().find(space).map(|(at, c)| start + at + c.len_utf8());
+        start = word.unwrap_or(first);
+    }
+    let far = if marks.is_empty() { text.len() } else { last.saturating_add(LEAD) };
+    let mut end = edge(far.min(start.saturating_add(most)).min(text.len())).max(start);
+    if end < text.len() {
+        // And ends with the last whole word it has room for.
+        let from = last.clamp(start, end);
+        end = text[from..end].char_indices().rev().find(space).map_or(end, |(at, _)| from + at);
+    }
+    let more = |cut: bool| if cut { "\u{2026}" } else { "" };
+    let (lead, tail) = (more(start > 0), more(end < text.len()));
+    let part = format!("{lead}{}{tail}", text[start..end].trim_end());
+    let within = marks.iter().filter_map(|mark| {
+        let (from, to) = (mark.start.max(start), mark.end.min(end));
+        (from < to).then(|| from - start + lead.len()..to - start + lead.len())
+    });
+    (part, within.collect())
+}
+
+/// A passage as the panel shows it read, set and drawn once.
+struct Shown {
+    list: DisplayList,
+    size: Size,
+    /// What it reads, for assistive technology.
+    plain: String,
+}
+
+impl Paint for Shown {
+    fn paint(&self, rect: Rect, _visible: Rect, _scheme: Scheme, out: &mut DisplayList) {
+        let first = out.items.len();
+        out.items.extend(self.list.items.iter().cloned());
+        out.translate(first, Point { x: rect.x, y: rect.y });
+    }
+}
+
+/// Sets what the panel shows of a passage as one version has it: its paragraphs `width` wide in the small
+/// type of the interface, with the words marked that the other version does not have.
+fn set(layout: &mut DocLayout, paragraphs: &[Paragraph], side: Side, width: f32, scheme: Scheme) -> Shown {
+    let id = |at: usize| BlockId::new(format!("p{at}"));
+    let blocks = paragraphs.iter().enumerate();
+    let blocks = blocks.map(|(at, (text, _))| Block::text(id(at), BlockKind::Paragraph, text.as_str()));
+    let doc = Document { blocks: blocks.collect(), ..Document::default() };
+    layout.update(&doc, &threads::small(), width, None);
+    layout.settle(Rect::new(0.0, 0.0, width, f32::MAX), 0);
+    let height = layout.height().ceil();
+    let mut list = DisplayList::default();
+    for (at, (_, marks)) in paragraphs.iter().enumerate() {
+        for mark in marks {
+            let words = Selection { anchor: Pos::new(id(at), mark.start), head: Pos::new(id(at), mark.end) };
+            review::mark(&layout.selection(&words), side, &TONES, scheme, &mut list);
+        }
+    }
+    layout.paint(Rect::new(0.0, 0.0, width, height), &mut list);
+    let plain = paragraphs.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join("\n");
+    Shown { list, size: Size { width, height }, plain }
+}
+
+/// A version in the panel of a passage's history: what the panel says and shows of it.
+struct Line {
+    /// What it is listed as, and the day and the time it was written where that is not what it is listed as.
+    title: String,
+    when: Option<String>,
+    /// What it did to the passage.
+    said: Option<String>,
+    /// The passage as it read before and after, where the panel shows those.
+    shown: Quoted,
+    picked: bool,
+    /// Whether it is the first and the last that the panel lists, and whether it is the document as it
+    /// reads now.
+    ends: (bool, bool),
+    newest: bool,
+}
+
+impl Line {
+    /// Who wrote the version, when, and what it did to the passage.
+    fn by(&self, version: &Version) -> Vec<String> {
+        [version.who(), self.when.clone(), self.said.clone()].into_iter().flatten().collect()
+    }
+
+    /// How tall what it shows of the passage is, with the room over it.
+    fn quoted(&self) -> f32 {
+        let tall = |shown: &Option<Rc<Shown>>| shown.as_ref().map(|shown| shown.size.height);
+        let over = tokens::SPACE_2XS + tokens::SPACE_XS;
+        match (tall(&self.shown[0]), tall(&self.shown[1])) {
+            // A band for each, under a line that says which it is, and the cut between them.
+            (Some(before), Some(after)) => over + EDGE + 2.0 * (2.0 * BOXED + SIDE) + before + after,
+            (Some(one), None) | (None, Some(one)) => over + one,
+            (None, None) => 0.0,
+        }
+    }
+
+    /// How tall its row is.
+    fn tall(&self, version: &Version) -> f32 {
+        let by = if self.by(version).is_empty() { 0.0 } else { tokens::SPACE_2XS + threads::FACE };
+        2.0 * tokens::SPACE_SM + HEAD + by + self.quoted()
+    }
 }
 
 /// The version that is picked, read and laid out: as it read, or as it differs from another.
@@ -610,6 +945,9 @@ struct Leaf {
     spare: Option<Sheet>,
     /// Whether some of its heights are still estimates.
     estimated: bool,
+    /// While the history is of a passage, the stretches of the page that are of it: the first and the last
+    /// of each run of its blocks that follow one another. `None` while every version shows.
+    lit: Option<Vec<(BlockId, BlockId)>>,
 }
 
 /// A document, its layout, and what the layout has still to take in of it.
@@ -659,6 +997,12 @@ pub(crate) struct History {
     backup: Fonts,
     /// The word lists, for the same.
     lists: WordLists,
+    /// The passage the history is narrowed to, while it is, and whether the passage is to be brought into
+    /// view when the page is next drawn. Then the layout that sets what the panel shows of a passage, made
+    /// when the panel first shows one.
+    passage: Option<Passage>,
+    seeking: bool,
+    setter: Option<DocLayout>,
 }
 
 impl History {
@@ -685,6 +1029,9 @@ impl History {
             lines: None,
             backup: Fonts::default(),
             lists: WordLists::default(),
+            passage: None,
+            seeking: false,
+            setter: None,
         };
         history.follow(steps, current);
         history
@@ -725,6 +1072,10 @@ impl History {
     /// with. `None` where the picked version shows as it read, which it also does with nothing before it
     /// and when it is the document as it reads now.
     fn sides(&self) -> Option<(usize, usize)> {
+        // A passage shows as it read: what a version did to it is told beside the page.
+        if self.passage.is_some() {
+            return None;
+        }
         let newest = self.versions.len() - 1;
         match self.compare {
             Compare::Previous => self.at.checked_sub(1).map(|before| (before, self.at)),
@@ -741,12 +1092,18 @@ impl History {
         }
     }
 
+    /// Whether what shows is what is picked, of every version or of a passage as the history is.
+    fn showing(&self) -> bool {
+        let (between, narrowed) = (self.between(), self.passage.is_some());
+        self.leaf.as_ref().is_some_and(|leaf| leaf.between == between && leaf.lit.is_some() == narrowed)
+    }
+
     /// The revisions to read before what is picked can show.
     pub fn wanted(&self) -> Vec<Revision> {
-        let between = self.between();
-        if self.leaf.as_ref().is_some_and(|leaf| leaf.between == between) {
+        if self.showing() {
             return Vec::new();
         }
+        let between = self.between();
         let known = |revision: &Revision| self.read.iter().any(|(read, _)| read == revision);
         between.0.into_iter().chain([between.1]).filter(|revision| !known(revision)).collect()
     }
@@ -759,10 +1116,10 @@ impl History {
     /// Shows what is picked, from the revisions the window read. Without the revision that the page is of
     /// the page area stays empty, and without the one to compare it with the version shows as it read.
     pub fn show(&mut self) {
-        let between = self.between();
-        if self.leaf.as_ref().is_some_and(|leaf| leaf.between == between) {
+        if self.showing() {
             return;
         }
+        let between = self.between();
         let read =
             |revision: &Revision| self.read.iter().find(|(read, _)| read == revision).map(|(_, read)| read.clone());
         let (earlier, later) = (between.0.as_ref().and_then(read), read(&between.1));
@@ -777,6 +1134,9 @@ impl History {
         let last = self.leaf.take();
         let late = (&self.backup, &self.lists);
         self.leaf = later.map(|later| Leaf::new(between, earlier.as_deref(), &later, captions, last, late));
+        if let (Some(leaf), Some(passage)) = (&mut self.leaf, &self.passage) {
+            passage.light(leaf, self.at);
+        }
         // The versions just shown are the ones a step is most likely to want again.
         let spare = self.read.len().saturating_sub(KEPT);
         self.read.drain(..spare);
@@ -787,7 +1147,11 @@ impl History {
     }
 
     pub fn pick(&mut self, at: usize) {
-        self.at = at.min(self.versions.len() - 1);
+        let at = at.min(self.versions.len() - 1);
+        // Of a passage's history a version that changed the passage is picked: the one that left it as the
+        // version asked for has it. The passage stays where it is looked at.
+        self.at = self.passage.as_ref().map_or(at, |passage| passage.left(at));
+        self.seeking = self.passage.is_some();
     }
 
     /// Compares the picked version with another, or with none.
@@ -824,29 +1188,89 @@ impl History {
         changed.then(|| (version.at.clone(), Some(name.to_owned()).filter(|name| !name.is_empty())))
     }
 
-    /// Picks the version before the one picked, or the one after it, when there is one.
+    /// Picks the version before the one picked, or the one after it, when there is one. Of a passage's
+    /// history those are the versions that changed the passage.
     pub fn step(&mut self, back: bool) {
-        self.pick(if back { self.at.saturating_sub(1) } else { self.at + 1 });
+        let to = match &self.passage {
+            Some(passage) => {
+                let place = passage.held(self.at).unwrap_or(0);
+                let next = if back { place.saturating_sub(1) } else { (place + 1).min(passage.changes.len() - 1) };
+                passage.changes[next].0
+            }
+            None if back => self.at.saturating_sub(1),
+            None => self.at + 1,
+        };
+        self.pick(to);
+    }
+
+    /// Narrows the history to the versions that changed a passage: `blocks`, at the top of the document.
+    /// `read` reads the document as it was at a revision. The newest of those versions is picked, or, of a
+    /// history that was narrowed already, the one that left the passage as the picked version has it.
+    /// Returns whether a version has the passage: with none, every version stays.
+    pub fn narrow(&mut self, blocks: Vec<BlockId>, mut read: impl FnMut(&Revision) -> Option<Document>) -> bool {
+        let was = self.passage.take().is_some();
+        let mut reads: Vec<Option<Block>> = vec![None; blocks.len()];
+        let (mut changes, mut deeds) = (Vec::new(), Vec::new());
+        for (at, version) in self.versions.iter().enumerate() {
+            let Some(doc) = read(&version.at) else { continue };
+            let has = |id: &BlockId| doc.blocks.iter().find(|block| block.id == *id);
+            let now: Vec<Option<&Block>> = blocks.iter().map(has).collect();
+            if !now.iter().copied().eq(reads.iter().map(Option::as_ref)) {
+                let now: Vec<Option<Block>> = now.into_iter().map(Option::<&Block>::cloned).collect();
+                deeds.push(deed(&reads, &now, version.apart()));
+                changes.push((at, now.clone()));
+                reads = now;
+            }
+        }
+        let Some(newest) = changes.last().map(|(at, _)| *at) else { return false };
+        self.passage = Some(Passage { blocks, changes, deeds, shown: None });
+        self.naming = None;
+        self.pick(if was { self.at } else { newest });
+        true
+    }
+
+    /// The passage the history is narrowed to: its blocks.
+    pub fn narrowed(&self) -> Option<Vec<BlockId>> {
+        self.passage.as_ref().map(|passage| passage.blocks.clone())
+    }
+
+    /// Shows every version again, with the picked one still picked.
+    pub fn whole(&mut self) {
+        (self.passage, self.seeking) = (None, false);
+    }
+
+    /// The passage as the picked version has it, for the command that makes it read so again: each of its
+    /// blocks with the block that the version has for it, or with `None` where it has none. `None` while
+    /// every version shows.
+    pub fn restored(&self) -> Option<Vec<(BlockId, Option<Box<Block>>)>> {
+        let passage = self.passage.as_ref()?;
+        let (_, reads) = &passage.changes[passage.held(self.at)?];
+        let blocks = passage.blocks.iter().cloned().zip(reads.iter().map(|block| block.clone().map(Box::new)));
+        Some(blocks.collect())
     }
 
     /// Takes faces of the system that back the fonts up, for the versions shown from now on. Returns
     /// whether a character that was shown without a glyph has one now.
     pub fn add_fallback_fonts(&mut self, fonts: &Fonts) -> bool {
         self.backup.faces.extend(fonts.faces.iter().cloned());
-        let Some(leaf) = &mut self.leaf else { return false };
+        // What the panel shows of a passage is set again with them.
+        let quoted = self.setter.as_mut().is_some_and(|setter| setter.add_fallback_fonts(fonts));
+        self.passage.iter_mut().for_each(|passage| passage.shown = None);
+        let Some(leaf) = &mut self.leaf else { return quoted };
         let earlier = leaf.earlier.as_mut().is_some_and(|(_, layout)| layout.add_fallback_fonts(fonts));
         let shown = leaf.layout.add_fallback_fonts(fonts) || earlier;
         leaf.estimated |= shown;
         if let Some((_, spare, _)) = &mut leaf.spare {
             spare.add_fallback_fonts(fonts);
         }
-        shown
+        shown || quoted
     }
 
     /// The characters the versions showed without a glyph since this was last asked.
     pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
-        let Some(leaf) = &mut self.leaf else { return Vec::new() };
-        let mut found = leaf.layout.take_uncovered();
+        let mut found: Vec<Uncovered> = self.setter.iter_mut().flat_map(DocLayout::take_uncovered).collect();
+        let Some(leaf) = &mut self.leaf else { return found };
+        found.extend(leaf.layout.take_uncovered());
         found.extend(leaf.earlier.iter_mut().flat_map(|(_, layout)| layout.take_uncovered()));
         found
     }
@@ -857,26 +1281,35 @@ impl History {
         if !self.lists.keep(list, data) {
             return false;
         }
-        let Some(leaf) = &mut self.leaf else { return false };
+        // What the panel shows of a passage is set again with it: the setter holds only what it set last.
+        let quoted = self.setter.as_mut().is_some_and(|setter| {
+            setter.add_word_list(list, data);
+            self.passage.as_mut().is_some_and(|passage| passage.shown.take().is_some())
+        });
+        let Some(leaf) = &mut self.leaf else { return quoted };
         let earlier = leaf.earlier.as_mut().is_some_and(|(_, layout)| layout.add_word_list(list, data));
         let shown = leaf.layout.add_word_list(list, data) || earlier;
         leaf.estimated |= shown;
         if let Some((_, spare, _)) = &mut leaf.spare {
             spare.add_word_list(list, data);
         }
-        shown
+        shown || quoted
     }
 
     /// The scripts the versions were set in without their word list since this was last asked.
     pub fn take_unlisted(&mut self) -> Vec<WordList> {
-        let Some(leaf) = &mut self.leaf else { return Vec::new() };
-        let mut found = leaf.layout.take_unlisted();
+        let mut found: Vec<WordList> = self.setter.iter_mut().flat_map(DocLayout::take_unlisted).collect();
+        let Some(leaf) = &mut self.leaf else { return found };
+        found.extend(leaf.layout.take_unlisted());
         found.extend(leaf.earlier.iter_mut().flat_map(|(_, layout)| layout.take_unlisted()));
         found
     }
 
     /// Takes faces that arrived late.
     pub fn add_fonts(&mut self, fonts: &Fonts) {
+        if self.setter.as_mut().is_some_and(|setter| setter.add_fonts(fonts)) {
+            self.passage.iter_mut().for_each(|passage| passage.shown = None);
+        }
         if let Some(leaf) = &mut self.leaf {
             let earlier = leaf.earlier.as_mut().is_some_and(|(_, layout)| layout.add_fonts(fonts));
             if leaf.layout.add_fonts(fonts) || earlier {
@@ -1110,6 +1543,17 @@ impl History {
         (canvas.cursor(Cursor::Text), awaited)
     }
 
+    /// Scrolls so that the passage shows, a third of the way down the room it leaves free, when that was
+    /// asked for.
+    fn seek(&mut self, leaf: &Leaf, split: &Split) {
+        let first = leaf.lit.as_ref().and_then(|lit| lit.first()).filter(|_| self.seeking);
+        let own = |piece: &&Piece| first.is_some_and(|(first, _)| piece.block.as_ref() == Some(first));
+        if let Some(piece) = split.pieces.iter().find(own) {
+            let free = (self.room.height - piece.rect.height).max(0.0);
+            self.scroll = piece.rect.y + TOP - (free / 3.0).round();
+        }
+    }
+
     /// Lays out what shows of a version and draws it into `list`, in the page area's coordinates.
     fn draw(
         &mut self,
@@ -1133,6 +1577,7 @@ impl History {
         let mut split = leaf.split(room.width);
         for _ in 0..SETTLES {
             self.tall = split.height + 2.0 * TOP;
+            self.seek(leaf, &split);
             self.keep();
             if !leaf.settle(&split, self.viewport(), 0) {
                 break;
@@ -1140,7 +1585,9 @@ impl History {
             split = leaf.split(room.width);
         }
         self.tall = split.height + 2.0 * TOP;
+        self.seek(leaf, &split);
         self.keep();
+        self.seeking = false;
 
         let view = self.viewport();
         // A split stands the page's column in the very middle, and the page area on a whole pixel beside it.
@@ -1160,6 +1607,8 @@ impl History {
             let run = leaf.found.runs.iter().find(|run| run.first == *block)?;
             Some((run.added, &leaf.captions[0][usize::from(run.added)], run.text.as_ref()))
         };
+        // The block a passage begins with, which the line that says so stands over.
+        let lit = leaf.lit.iter().flatten().next().map(|(first, _)| first);
         // Where the band of a piece is in the page area: under the room the piece keeps clear over it.
         let place = |piece: &Piece| {
             let over = (piece.rect.y + shift.y + piece.head - CAPTION).round();
@@ -1198,6 +1647,18 @@ impl History {
                 if let Some(block) = piece.block.as_ref().filter(|_| piece.side == Side::First) {
                     self.before.push((block.clone(), place(piece)));
                 }
+            } else if let Some(first) = piece.block.as_ref().filter(|block| lit == Some(*block)) {
+                // The passage: a bar beside it, and a line over its first line that says which version of
+                // it this is.
+                let text = leaf.doc.blocks.iter().find(|held| held.id == *first).and_then(written);
+                let line = text.and_then(|text| leaf.layout.caret(&Pos::new(text.id.clone(), 0)));
+                let over = origin.y + line.map_or(piece.band.0, |line| line.y) - CAPTION;
+                let caption = format!("Selection, as of {}", self.when(self.picked()));
+                let said = shaper.shape(&caption, &TextStyle::control().size(tokens::TEXT_SM).weight(600), None);
+                let at = Point { x: origin.x, y: over + ((CAPTION - said.size.height) / 2.0).round() };
+                said.paint(at, ink(accent().text), list);
+                let bar = Rect::new(origin.x - BAR_OUT, over, review::RULE, bottom - UNDER - over);
+                list.push(Item::Fill { rect: bar, color: ink(accent().base), radius: 0.0 });
             }
             let Some(cut) = cut(piece, view) else { continue };
             list.push(Item::PushClip { rect: review::text(piece, shift), radius: 0.0 });
@@ -1228,6 +1689,26 @@ impl History {
             list.push(Item::PopClip);
         }
 
+        if let Some(lit) = &leaf.lit {
+            // What is not of the passage lies under a veil of the page's colour.
+            let veil = Color { a: (255.0 * DIM) as u8, ..palette.page };
+            let mut y = 0.0;
+            let clear = lit.iter().filter_map(|(first, last)| {
+                let (from, to) = (leaf.layout.band(first)?.0, leaf.layout.band(last)?.1);
+                let holds = |piece: &&Piece| piece.side == Side::Second && piece.band.0 <= from && from < piece.band.1;
+                let piece = split.pieces.iter().find(holds)?;
+                // The line over the passage is clear with it.
+                let over = if piece.block.as_ref() == Some(first) { CAPTION } else { 0.0 };
+                Some((piece.origin.y + shift.y + from - over, piece.origin.y + shift.y + to))
+            });
+            for (top, bottom) in clear.chain([(room.height, room.height)]) {
+                let top = top.min(room.height);
+                if top > y {
+                    list.push(Item::Fill { rect: Rect::new(0.0, y, room.width, top - y), color: veil, radius: 0.0 });
+                }
+                y = y.max(bottom);
+            }
+        }
         self.split = Some((split, shift));
     }
 
@@ -1249,6 +1730,9 @@ impl History {
     /// it. A narrow window has the bar folded. `told` is what there is to say of a copy that was just
     /// written, which the menu's button says, and `keys` the keys that ask for a copy.
     pub fn bar(&self, bar: TopBar<Message>, name: &str, told: Option<&str>, keys: &str) -> TopBar<Message> {
+        if let Some(passage) = &self.passage {
+            return self.passage_bar(passage, bar, name);
+        }
         let back = Message::History(Historying::Back);
         let mut compare = Segmented::new("Compare with").small();
         let mut compares = Menu::new().label("Compare with");
@@ -1317,22 +1801,61 @@ impl History {
             .end(more)
     }
 
+    /// Fills the bar while the history is of a passage: the way back, what shows, the way to every
+    /// version, and the button that restores the passage alone.
+    fn passage_bar(&self, passage: &Passage, bar: TopBar<Message>, name: &str) -> TopBar<Message> {
+        let (back, whole) = (Message::History(Historying::Back), Message::History(Historying::Whole));
+        let name = || Element::text(name, TextStyle::control().weight(600)).min_width(tokens::SPACE_3XL).shrink();
+        let what = Element::text("History of selection", TextStyle::control().size(tokens::TEXT_SM));
+        // The passage as it reads now is what a restore would leave: there is nothing to do.
+        let last = passage.changes.last().is_none_or(|(at, _)| *at == self.at);
+        let restore = |button: Button<Message>| {
+            button.primary().small().disabled(last).on_press(Message::History(Historying::Restore))
+        };
+        bar.apart()
+            .label("History of selection")
+            .form(FORMS.0)
+            .start(Button::new("Back to editing").icon(icon::ARROW_LEFT).small().on_press(back.clone()))
+            .start(name())
+            .start(what.fg(tokens::FG_MUTED).shrink())
+            .middle(Button::new("All versions").icon(icon::HISTORY).small().on_press(whole.clone()))
+            .middle(TopBar::rule())
+            .middle(restore(Button::new("Restore this passage").icon(icon::ROTATE_CCW)))
+            .form(FORMS.1)
+            .start(Button::icon_only(icon::ARROW_LEFT, "Back to editing").small().on_press(back))
+            .start(name())
+            .middle(Button::icon_only(icon::HISTORY, "All versions").small().on_press(whole))
+            .middle(TopBar::rule())
+            .middle(restore(Button::icon_only(icon::ROTATE_CCW, "Restore this passage")))
+    }
+
     /// The strip under the page and the panel: a cell for each version, the oldest first, with a head at
-    /// the one that is picked. A press on it picks the version there, and a drag goes through them.
+    /// the one that is picked. A press on it picks the version there, and a drag goes through them. Of a
+    /// passage's history the versions that changed the passage stand out, and are the ones picked.
     pub fn strip(&self) -> Element<Message> {
         let quiet = TextStyle::control().size(tokens::TEXT_SM);
         let label = |text: String| Element::text(text, quiet).fg(tokens::FG_MUTED);
         // The strip runs from the day of the oldest version that has one to now.
         let first = self.versions.iter().find(|version| version.time > 0);
         let first = first.map(|version| label(version.date(self.today(), self.zone)));
-        let out = self.versions.iter().map(|version| version.name().is_some() || version.apart()).collect();
+        let (out, told): (Vec<bool>, String) = match &self.passage {
+            Some(passage) => {
+                let place = passage.held(self.at).map_or(1, |place| place + 1);
+                let told = format!("{place} of {} that changed the selection", passage.changes.len());
+                ((0..self.versions.len()).map(|at| passage.changed(at)).collect(), told)
+            }
+            None => {
+                let out = self.versions.iter().map(|version| version.name().is_some() || version.apart());
+                (out.collect(), format!("{} of {}", self.at + 1, self.versions.len()))
+            }
+        };
         let track = Element::canvas(Rc::new(Strip { out, at: self.at }))
             .grow(1.0)
             .height(STRIP - 1.0)
             .passive()
             .role(Role::Image)
             .label("Versions, oldest first")
-            .description(format!("{} of {}", self.at + 1, self.versions.len()))
+            .description(told)
             .cursor(Cursor::Pointer)
             .spread()
             .on_pointer(|event| match event {
@@ -1397,8 +1920,13 @@ impl History {
     }
 
     /// The panel beside the version: every version, newest first under the day it was written on. A press
-    /// on one picks it.
-    pub fn panel(&self) -> Element<Message> {
+    /// on one picks it. Of a passage's history it lists the versions that changed the passage, each with
+    /// what it did, and what it shows of the passage is set in the colours given.
+    pub fn panel(&mut self, palette: Palette, scheme: Scheme) -> Element<Message> {
+        if self.passage.is_some() {
+            self.quote(palette, scheme);
+            return self.changes();
+        }
         let count = match self.versions.len() {
             1 => "1 version".to_owned(),
             count => format!("{count} versions"),
@@ -1419,6 +1947,151 @@ impl History {
             panel = panel.child(SidePanel::<Message>::section(&name)).child(list);
         }
         panel.into()
+    }
+
+    /// Sets what the panel shows of the passage before and after each version that changed it, when that
+    /// is not set in these colours.
+    fn quote(&mut self, palette: Palette, scheme: Scheme) {
+        let Self { passage: Some(passage), setter, backup, lists, .. } = self else { return };
+        if passage.shown.as_ref().is_some_and(|(set, _)| *set == palette) {
+            return;
+        }
+        let layout = setter.get_or_insert_with(|| {
+            let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
+            layout.add_fallback_fonts(backup);
+            lists.hand(&mut layout);
+            layout
+        });
+        layout.set_palette(palette);
+        let shown = passage.deeds.iter().map(|deed| {
+            // Two that show are in a box, and so a little narrower.
+            let boxed = deed.sides.iter().all(Option::is_some);
+            let width = if boxed { SHOWN - 2.0 * BOXED } else { SHOWN };
+            let mut side = |side: Side, at: usize| {
+                let paragraphs = deed.sides[at].as_ref()?;
+                Some(Rc::new(set(layout, paragraphs, side, width, scheme)))
+            };
+            [side(Side::First, 0), side(Side::Second, 1)]
+        });
+        passage.shown = Some((palette, shown.collect()));
+    }
+
+    /// The panel of a passage's history: the versions that changed the passage, newest first, each with
+    /// what it did and how the passage read before and after.
+    fn changes(&self) -> Element<Message> {
+        let Some(passage) = &self.passage else { return Element::column() };
+        let (count, zone) = (self.versions.len(), self.zone);
+        let of = if count == 1 { "version" } else { "versions" };
+        let panel = SidePanel::new("History of selection").aside(format!("{} of {count} {of}", passage.changes.len()));
+        let last = passage.changes.len() - 1;
+        let rows = passage.changes.iter().enumerate().rev().map(|(place, (at, _))| {
+            let (at, version) = (*at, &self.versions[*at]);
+            let newest = at + 1 == count;
+            let title = version.title((at == 0, newest), zone);
+            // The versions are not listed under their days here, so the day is said with the time.
+            let (title, when) = match version.clock(zone) {
+                Some(clock) if clock == title => (self.when(version), None),
+                Some(_) => (title, Some(self.when(version))),
+                None => (title, None),
+            };
+            let shown = passage.shown.as_ref().map(|(_, shown)| shown[place].clone()).unwrap_or_default();
+            let said = passage.deeds[place].said.clone();
+            let line =
+                Line { title, when, said, shown, picked: at == self.at, ends: (place == last, place == 0), newest };
+            let (tall, picked, versions) = (line.tall(version), line.picked, self.versions.clone());
+            Element::later(tall, move || Self::change(&versions[at], at, &line)).key(at).in_view(picked)
+        });
+        let list = Element::column()
+            .padding(Edges { top: tokens::SPACE_SM, ..Edges::ZERO })
+            .role(Role::ListBox)
+            .label("Versions that changed the selection")
+            .children(rows);
+        panel.child(list).into()
+    }
+
+    /// One version in the panel of a passage's history: its marker on the rail, what it is listed as, who
+    /// wrote it and what it did to the passage, and the passage as it read before and after it.
+    fn change(version: &Version, at: usize, line: &Line) -> Element<Message> {
+        let small = TextStyle::control().size(tokens::TEXT_SM);
+        let head = Element::row()
+            .align(Align::Center)
+            .min_height(HEAD)
+            .child(Element::text(line.title.as_str(), small).shrink());
+        let mut body =
+            Element::column().grow(1.0).gap(tokens::SPACE_2XS).padding(Edges::xy(0.0, tokens::SPACE_SM)).child(head);
+        let by = line.by(version);
+        if !by.is_empty() {
+            let face = version.authors.first().map(|(name, _)| threads::face(name, false));
+            let said = Element::text(by.join(" \u{b7} "), small).fg(tokens::FG_MUTED).shrink();
+            let said = Element::row().align(Align::Center).gap(tokens::SPACE_SM).children(face).child(said);
+            body = body.child(said.height(threads::FACE));
+        }
+        // The passage as it read, which a press on goes through to the row.
+        let quote = |shown: &Rc<Shown>, label: &str| {
+            let paint: Rc<dyn Paint> = shown.clone();
+            Element::canvas(paint)
+                .width(shown.size.width)
+                .height(shown.size.height)
+                .passive()
+                .role(Role::Paragraph)
+                .label(format!("{label}{}", shown.plain))
+        };
+        let over = Edges { top: tokens::SPACE_XS, ..Edges::ZERO };
+        match &line.shown {
+            [Some(before), Some(after)] => {
+                // What it took out over what it put in, in bands as on the page.
+                let half = |label: &str, (soft, tone): (Ink, Ink), shown: &Rc<Shown>| {
+                    let said = Element::text(label, small.weight(600)).fg(tone);
+                    Element::column()
+                        .padding(Edges::all(BOXED))
+                        .bg(soft)
+                        .child(Element::row().height(SIDE).child(said).decorative())
+                        .child(quote(shown, &format!("{label}: ")))
+                };
+                let cut: Rc<dyn Paint> = Rc::new(Cut);
+                // The row's own colour, where it is picked, does not show through the bands.
+                let pair = Element::column()
+                    .radius(tokens::RADIUS_CONTROL)
+                    .bg(tokens::SURFACE)
+                    .clip()
+                    .child(half("Before", TONES[0], before))
+                    .child(Element::canvas(cut).height(EDGE).passive().decorative())
+                    .child(half("After", TONES[1], after));
+                body = body.child(Element::column().padding(over).child(pair));
+            }
+            [Some(one), None] | [None, Some(one)] => {
+                body = body.child(Element::column().padding(over).child(quote(one, "")));
+            }
+            [None, None] => {}
+        }
+
+        let apart = version.apart();
+        let ink = match (line.newest, apart) {
+            (true, _) => accent().base,
+            (false, true) => tokens::INFO,
+            (false, false) => tokens::LINE_STRONG,
+        };
+        let (first, last) = line.ends;
+        let rail = Rail {
+            diamond: apart && !line.newest,
+            ink,
+            at: tokens::SPACE_SM + HEAD / 2.0,
+            above: !first,
+            below: !last,
+        };
+        let row = Element::row()
+            .gap(tokens::SPACE_SM)
+            .padding(Edges::xy(tokens::SPACE_XS, 0.0))
+            .radius(tokens::RADIUS_CONTROL)
+            .hover(Look::bg(tokens::NEUTRAL_SOFT))
+            .role(Role::ListBoxOption)
+            .label(line.title.as_str())
+            .description(by.join(", "))
+            .selected(line.picked)
+            .on_click(Message::History(Historying::Pick(at)))
+            .child(Element::canvas(Rc::new(rail)).width(TRACK).passive().decorative())
+            .child(body);
+        if line.picked { row.bg(accent().soft) } else { row }
     }
 
     /// One version in the panel: its marker on the day's rail, what it is listed as, who wrote it and how
@@ -1585,6 +2258,7 @@ impl Leaf {
             behind: [behind, second],
             spare,
             estimated: true,
+            lit: None,
         }
     }
 
@@ -1631,7 +2305,12 @@ impl Leaf {
             let (before, after) = first.band(block).zip(self.layout.band(block))?;
             Some((block, after, Some(before)))
         });
-        let mut bands: Vec<_> = runs.chain(pairs).collect();
+        // A passage has room over it too, for the line that says which version of it shows.
+        let passage = self.lit.iter().flatten().next().and_then(|(first, last)| {
+            let (over, under) = self.layout.band(first).zip(self.layout.band(last))?;
+            Some((first, (over.0, under.1), None))
+        });
+        let mut bands: Vec<_> = runs.chain(pairs).chain(passage).collect();
         bands.sort_by(|a, b| a.1.0.total_cmp(&b.1.0));
 
         let mut split = Split { arrangement: Arrangement::Stacked, height: 0.0, pieces: Vec::new() };

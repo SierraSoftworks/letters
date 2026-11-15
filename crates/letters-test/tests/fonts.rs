@@ -10,6 +10,9 @@ use letters_render::{Font, Item};
 use letters_test::{Harness, Role};
 use letters_ui::{Location, Window, WordList};
 
+/// The places of [`show`] that the history shows, which has the window to itself: nothing else shows with it.
+const HISTORY: [&str; 2] = ["a version", "a passage"];
+
 /// The sign for a mho, an ohm turned over, which no bundled face has.
 const MHO: &str = "\u{2127}";
 
@@ -99,8 +102,8 @@ fn set(window: &mut Harness) -> Vec<(f32, f32, usize)> {
 }
 
 /// Shows `what` somewhere in a letter that does not have it on its page: in a note that is opened, in the
-/// document's name, in the version the history shows, or in the version of a conflict that is held back
-/// beside the page.
+/// document's name, in the version the history shows, in what the history of a selection says a version
+/// did, or in the version of a conflict that is held back beside the page.
 fn show(window: &mut Harness, place: &str, what: &str) {
     match place {
         "a note" => {
@@ -121,13 +124,21 @@ fn show(window: &mut Harness, place: &str, what: &str) {
             window.select("Rates").type_text(what);
             window.click(Role::Button, "History");
         }
+        "a passage" => {
+            // Written at nine and taken out at ten: the page of the history has it no more than the
+            // letter's own, and the panel shows the paragraph as it read with it.
+            window.select("Rates").type_text(what);
+            window.platform.wall = window.platform.wall.map(|nine| nine + 3_600);
+            window.select(what).type_text("Rates");
+            window.select("Rates").key("Mod+Shift+P").type_text("History of selection").key("Enter");
+        }
         _ => {}
     }
 }
 
 #[test]
 fn a_character_no_bundled_face_has_is_told_once_wherever_it_shows() {
-    for place in ["the page", "a note", "the name", "a version", "a conflict"] {
+    for place in ["the page", "a note", "the name", "a version", "a passage", "a conflict"] {
         let on_page = place == "the page";
         let mut window = letter(if on_page { "\u{2127} rates rise in May." } else { "Rates rise in May." });
         assert_eq!(lacking(&mut window), if on_page { vec!['\u{2127}'] } else { Vec::new() }, "{place}");
@@ -136,8 +147,7 @@ fn a_character_no_bundled_face_has_is_told_once_wherever_it_shows() {
 
         // Asked again there is nothing new, nor when the same character shows somewhere else.
         assert_eq!(lacking(&mut window), Vec::<char>::new(), "{place}: once");
-        // The history has the window to itself, so there is nowhere else to look from it.
-        for elsewhere in ["the name", "a note"].into_iter().filter(|_| place != "a version") {
+        for elsewhere in ["the name", "a note"].into_iter().filter(|_| !HISTORY.contains(&place)) {
             show(&mut window, elsewhere, MHO);
             assert_eq!(lacking(&mut window), Vec::<char>::new(), "{place}, then {elsewhere}");
         }
@@ -183,7 +193,7 @@ fn asking_what_is_lacking_asks_for_no_frame() {
 #[test]
 fn a_face_of_the_system_sets_what_the_bundled_fonts_lack() {
     // Where the mho shows, when the shell hands the face over.
-    for place in ["the page", "a note", "the name", "a version", "a conflict"] {
+    for place in ["the page", "a note", "the name", "a version", "a passage", "a conflict"] {
         let on_page = place == "the page";
         let mut window = letter(if on_page { "\u{2127} rates rise in May." } else { "Rates rise in May." });
         show(&mut window, place, MHO);
@@ -195,7 +205,7 @@ fn a_face_of_the_system_sets_what_the_bundled_fonts_lack() {
 
 #[test]
 fn a_face_of_the_system_is_kept_for_what_is_laid_out_later() {
-    for place in ["a note", "the name", "a version", "a conflict"] {
+    for place in ["a note", "the name", "a version", "a passage", "a conflict"] {
         let mut window = letter("Rates rise in May.");
         window.paint();
         // Nothing lacks a glyph yet, so nothing changes, and what the fonts have stays in them.
@@ -215,7 +225,7 @@ fn asked(shows: bool) -> Vec<WordList> {
 #[test]
 fn a_script_without_its_word_list_is_told_once_wherever_it_shows() {
     let thai = thai();
-    for place in ["the page", "a note", "a version", "a conflict"] {
+    for place in ["the page", "a note", "a version", "a passage", "a conflict"] {
         let on_page = place == "the page";
         let mut window = letter(if on_page { &thai } else { "Rates rise in May." });
         assert_eq!(unlisted(&mut window), asked(on_page), "{place}");
@@ -224,7 +234,7 @@ fn a_script_without_its_word_list_is_told_once_wherever_it_shows() {
 
         // Asked again there is nothing new, nor when the same script shows somewhere else.
         assert_eq!(unlisted(&mut window), [], "{place}: once");
-        if place != "a version" {
+        if !HISTORY.contains(&place) {
             show(&mut window, "a note", &thai);
             assert_eq!(unlisted(&mut window), [], "{place}, then a note");
         }
@@ -234,7 +244,7 @@ fn a_script_without_its_word_list_is_told_once_wherever_it_shows() {
 #[test]
 fn a_word_list_ends_lines_between_words_wherever_its_script_shows() {
     let (thai, list) = (thai(), WordList::Thai.data());
-    for place in ["the page", "a note", "a version", "a conflict"] {
+    for place in ["the page", "a note", "a version", "a passage", "a conflict"] {
         // The list comes before the text shows, or once the shell was told that the text needs it.
         let shown = |ahead: bool| {
             let mut window = letter(if place == "the page" { &thai } else { "Rates rise in May." });
@@ -309,4 +319,17 @@ fn a_word_list_reaches_the_versions_the_history_steps_to() {
     for comes in ["first", "between"] {
         assert_eq!(set(&mut stepped(comes)), with, "{comes}: as when the list comes last");
     }
+}
+
+#[test]
+fn what_only_the_history_of_a_selection_shows_is_told_of_too() {
+    // Written at nine and taken out at ten, in a letter that a window opens afterwards: the panel alone
+    // shows it, where it says how the paragraph read.
+    let passage = |what: &str| {
+        let mut window = rewritten(&[("Rates", what), (what, "Rates")]);
+        window.select("Rates").key("Mod+Shift+P").type_text("History of selection").key("Enter");
+        window
+    };
+    assert_eq!(lacking(&mut passage(MHO)), ['\u{2127}'], "a character no bundled face has");
+    assert_eq!(unlisted(&mut passage(&thai())), asked(true), "a script without its word list");
 }

@@ -1711,6 +1711,10 @@ impl EditorApp {
             // A card over the window is answered first: there is no document to act on behind it.
             Act::Print => (!self.carded()).then_some(Message::Print(Printing::Show))?,
             Act::History => (!self.carded()).then_some(Message::History(Historying::Show))?,
+            Act::SelectionHistory => {
+                let touched = editor.selection().and_then(|selection| history::touched(editor.doc(), selection));
+                (touched.is_some() && !self.carded()).then_some(Message::History(Historying::Passage))?
+            }
             Act::Review(asked) => {
                 let (open, can) = (self.margin.reviewing().is_some(), self.margin.refused.is_none());
                 let fits = match asked {
@@ -1777,6 +1781,21 @@ impl EditorApp {
                 self.told.get_mut().forget();
                 self.turn();
             }
+            Historying::Passage => {
+                let selection = self.editor.selection();
+                let touched = selection.and_then(|selection| history::touched(self.editor.doc(), selection));
+                let Some(blocks) = touched else { return };
+                if self.history.is_none() {
+                    self.historying(Historying::Show, platform);
+                }
+                self.take_name();
+                self.narrow(blocks);
+                self.turn();
+            }
+            Historying::Whole => {
+                self.history.iter_mut().for_each(History::whole);
+                self.turn();
+            }
             Historying::Back => {
                 self.take_name();
                 self.leave();
@@ -1821,7 +1840,17 @@ impl EditorApp {
             }
             Historying::Restore => {
                 self.take_name();
-                let Some(revision) = self.history.as_ref().map(|history| history.picked().at.clone()) else { return };
+                let Some(history) = &self.history else { return };
+                // Of a passage's history only the passage is made to read as it did.
+                if let Some(blocks) = history.restored() {
+                    let command = Command::UseVersions(blocks);
+                    if self.editor.applies(&command) {
+                        self.leave();
+                        self.edit(platform, |editor, platform| editor.run(command, platform));
+                    }
+                    return;
+                }
+                let revision = history.picked().at.clone();
                 // The document reads as the version again, and is there to be written on.
                 self.leave();
                 self.edit(platform, |editor, platform| editor.run(Command::Restore(revision), platform));
@@ -1835,10 +1864,30 @@ impl EditorApp {
         let Some((revision, name)) = self.history.as_mut().and_then(History::named) else { return };
         if self.editor.name_version(&revision, name.as_deref()).is_ok() {
             self.edits += 1;
-            let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
-            self.history.iter_mut().for_each(|history| history.follow(&steps, current.clone()));
-            self.turn();
+            self.relist();
         }
+    }
+
+    /// Lists the history's versions again after the document changed under it, and finds a passage's
+    /// versions among them again.
+    fn relist(&mut self) {
+        // The timeline is read only for a history that shows: reading it costs more with every version.
+        if self.history.is_none() {
+            return;
+        }
+        let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
+        let Some(history) = &mut self.history else { return };
+        history.follow(&steps, current);
+        if let Some(blocks) = history.narrowed() {
+            self.narrow(blocks);
+        }
+        self.turn();
+    }
+
+    /// Narrows the history to the versions that changed a passage of the document: `blocks`, at its top.
+    fn narrow(&mut self, blocks: Vec<BlockId>) {
+        let (Some(history), editor) = (&mut self.history, &mut self.editor) else { return };
+        history.narrow(blocks, |revision| editor.document_at(revision).ok().map(|(doc, _)| doc));
     }
 
     /// Reads what the history is to show and has not read: the version it has picked, and the one that
@@ -2223,11 +2272,7 @@ impl EditorApp {
         if edited || change.style || change.document {
             self.edits += 1;
             // What came in under the history, as another writer's edits do, is its newest version.
-            if self.history.is_some() {
-                let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
-                self.history.iter_mut().for_each(|history| history.follow(&steps, current.clone()));
-                self.turn();
-            }
+            self.relist();
         }
         self.mark();
         self.sync();
@@ -4237,8 +4282,9 @@ impl App for EditorApp {
         // Print view has the window to itself: the panels and the outline are for editing. The history
         // has its versions listed where a panel would be.
         let (printing, away) = (self.printing.is_some(), self.away());
-        let panel = match &self.history {
-            Some(history) => Some(history.panel()),
+        let (palette, scheme) = (self.palette, self.scheme);
+        let panel = match &mut self.history {
+            Some(history) => Some(history.panel(palette, scheme)),
             None => self.panel.filter(|_| !away).map(|panel| self.side(panel)),
         };
         let room = window.width - if panel.is_some() { side_panel::WIDTH } else { 0.0 };

@@ -310,7 +310,7 @@ impl Said {
 }
 
 /// The interface's small text as a document's body type, with no room between paragraphs.
-fn small() -> Style {
+pub(crate) fn small() -> Style {
     let mut style = Style::default();
     let body = Type { size: tokens::TEXT_SM / PT, line_height: 1.4, space_after: 0.0, ..Type::default() };
     style.types.insert("body".into(), body);
