@@ -1,13 +1,20 @@
 //! What the browser lends the editor: a clock, identifiers, the clipboard for as long as a clipboard event
-//! lasts, somewhere to keep the person's own words, default style and settings, and the files beside the wasm.
+//! lasts, somewhere to keep the person's own words, default style and settings, the files beside the wasm, and
+//! its decoders for pictures.
 
-use js_sys::{Promise, Reflect, Uint8Array};
-use letters_editor::{Clip, Platform, block_id};
+use std::collections::HashMap;
+
+use js_sys::{Array, Promise, Reflect, Uint8Array};
+use letters_editor::{Clip, Picture, Platform, block_id};
 use letters_model::Style;
+use letters_render::image::Image;
 use letters_ui::{Appearance, Settings};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Crypto, Performance, Response, Storage, Url, Window};
+use web_sys::{
+    Blob, BlobPropertyBag, CanvasRenderingContext2d, Crypto, HtmlCanvasElement, ImageBitmap, Performance, Response,
+    Storage, Url, Window,
+};
 
 /// Fetches the files at `urls`, all at once. A page that preloads them has them here by the time the wasm
 /// is running.
@@ -23,6 +30,60 @@ pub async fn files(window: &Window, urls: &[String]) -> Result<Vec<Vec<u8>>, JsV
         files.push(Uint8Array::new(&bytes).to_vec());
     }
     Ok(files)
+}
+
+/// The longest side a picture is drawn from, in pixels. A photo straight from a camera is several times
+/// what any screen shows of it, and its pixels would be held twice over while they are handed across.
+const LONGEST: f64 = 4096.0;
+
+/// The media type of a picture in one of the formats a document keeps, told by its first bytes.
+fn mime(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0xff, 0xd8, 0xff, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Has the browser decode a picture: upright, as its EXIF orientation says.
+async fn bitmap(window: &Window, picture: &Blob) -> Option<ImageBitmap> {
+    let decoding = window.create_image_bitmap_with_blob(picture).ok()?;
+    JsFuture::from(decoding).await.ok()?.dyn_into().ok()
+}
+
+/// A picture from its file, as the person pasted, dropped or chose it. `None` for what is no picture
+/// Letters can show.
+pub async fn picture(window: &Window, file: &Blob) -> Option<Picture> {
+    let bytes = Uint8Array::new(&JsFuture::from(file.array_buffer()).await.ok()?).to_vec();
+    let mime = mime(&bytes)?.to_owned();
+    // The size it is shown at is its upright one, which only decoding it tells.
+    let decoded = bitmap(window, file).await?;
+    let (width, height) = (decoded.width(), decoded.height());
+    decoded.close();
+    Some(Picture { bytes, mime, width, height })
+}
+
+/// The pixels of a picture the document keeps, decoded by the browser, which has the decoders already and
+/// runs them off this thread.
+pub async fn decode(window: &Window, bytes: &[u8]) -> Option<Image> {
+    let kind = BlobPropertyBag::new();
+    kind.set_type(mime(bytes)?);
+    let file = Blob::new_with_u8_array_sequence_and_options(&Array::of1(&Uint8Array::from(bytes)), &kind).ok()?;
+    let decoded = bitmap(window, &file).await?;
+    let (width, height) = (f64::from(decoded.width()), f64::from(decoded.height()));
+    let scale = (LONGEST / width.max(height)).min(1.0);
+    let (width, height) = ((width * scale).round().max(1.0), (height * scale).round().max(1.0));
+    // A canvas is the one place a page can read decoded pixels from.
+    let canvas: HtmlCanvasElement = window.document()?.create_element("canvas").ok()?.dyn_into().ok()?;
+    canvas.set_width(width as u32);
+    canvas.set_height(height as u32);
+    let context: CanvasRenderingContext2d = canvas.get_context("2d").ok()??.dyn_into().ok()?;
+    context.draw_image_with_image_bitmap_and_dw_and_dh(&decoded, 0.0, 0.0, width, height).ok()?;
+    decoded.close();
+    let pixels = context.get_image_data(0.0, 0.0, width, height).ok()?;
+    Image::from_rgba8(pixels.width(), pixels.height(), pixels.data().0).ok()
 }
 
 /// Where this browser keeps the person's own words, a line each, as their dictionary file does elsewhere.
@@ -47,6 +108,9 @@ pub struct Browser {
     pub pasted: Option<Clip>,
     /// What the editor copied, for the `copy` or `cut` event that asked for it to carry away.
     pub copied: Option<Clip>,
+    /// The pictures put into the document here, by the names it has for them. They are kept until there
+    /// is a server to keep them.
+    pub assets: HashMap<String, Vec<u8>>,
 }
 
 /// Puts text on the clipboard outside a clipboard event, as a press on a copy button asks. The browser
@@ -71,7 +135,7 @@ impl Browser {
     pub fn new(window: &Window) -> Result<Self, JsValue> {
         let performance = window.performance().ok_or("this browser has no clock")?;
         let storage = window.local_storage().ok().flatten();
-        Ok(Self { performance, crypto: window.crypto()?, storage, pasted: None, copied: None })
+        Ok(Self { performance, crypto: window.crypto()?, storage, pasted: None, copied: None, assets: HashMap::new() })
     }
 
     /// Whether the browser had `url` from an earlier visit when the page asked for it, as its preload did.
@@ -182,6 +246,10 @@ impl Platform for Browser {
         let mut bytes = [0; 10];
         self.crypto.get_random_values_with_u8_array(&mut bytes).expect("the browser has a source of randomness");
         block_id(bytes)
+    }
+
+    fn store_asset(&mut self, name: &str, bytes: &[u8]) {
+        self.assets.entry(name.to_owned()).or_insert_with(|| bytes.to_vec());
     }
 
     fn learn_word(&mut self, word: &str) {

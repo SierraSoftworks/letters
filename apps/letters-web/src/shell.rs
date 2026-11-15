@@ -10,19 +10,18 @@ use std::rc::{Rc, Weak};
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Function, Object, Reflect};
-use letters_editor::{Clip, Modifiers, Platform as _};
+use letters_editor::{Clip, KeyEvent, Modifiers, Picture, Platform as _};
 use letters_model::{BlockKind, Document, HistoryError, Mark, Pos, ReplicaId, Selection};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
-use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Rect, Size};
 use letters_ui::{Appearance, Cursor, Edge, Keys, Request, Scheme, Settings, Window as View, tokens};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    Blob, BlobPropertyBag, CanvasRenderingContext2d, ClipboardEvent, CompositionEvent, Element, Event, EventTarget,
-    HtmlAnchorElement, HtmlCanvasElement, HtmlIFrameElement, HtmlInputElement, HtmlTextAreaElement, ImageData,
-    KeyboardEvent, MediaQueryList, MouseEvent, PointerEvent, Url, WheelEvent, Window,
+    Blob, BlobPropertyBag, CanvasRenderingContext2d, ClipboardEvent, CompositionEvent, DragEvent, Element, Event,
+    EventTarget, File, FileList, HtmlAnchorElement, HtmlCanvasElement, HtmlIFrameElement, HtmlInputElement,
+    HtmlTextAreaElement, ImageData, KeyboardEvent, MediaQueryList, MouseEvent, PointerEvent, Url, WheelEvent, Window,
 };
 
 use crate::browser::{self, Browser};
@@ -39,6 +38,9 @@ const HIDDEN: &str = "position:fixed;width:1px;padding:0;border:0;margin:0;outli
 
 /// The hidden input when a keyboard is to leave what is typed as it is.
 const HELP: [(&str, &str); 2] = [("autocapitalize", "off"), ("autocorrect", "off")];
+
+/// The kinds of picture a document keeps, which is what the person is offered to choose from.
+const PICTURES: &str = "image/png,image/jpeg,image/gif,image/webp";
 
 /// The mirror: over the canvas, so that what it says about where things are is true, and out of sight and
 /// out of the pointer's way. Its text is not for the eye, so the page lays out as little of it as it can.
@@ -107,6 +109,8 @@ pub struct Shell {
     mirror_timer: Option<i32>,
     /// The file input the person chooses a stylesheet with. It is never shown.
     chooser: HtmlInputElement,
+    /// The file input the person chooses pictures with.
+    picker: HtmlInputElement,
 
     view: View,
     platform: Browser,
@@ -168,6 +172,13 @@ impl Shell {
             chooser.set_attribute(name, value)?;
         }
         holder.insert_adjacent_element("afterend", &chooser)?;
+        let picker: HtmlInputElement = document.create_element("input")?.dyn_into()?;
+        for (name, value) in
+            [("type", "file"), ("accept", PICTURES), ("multiple", ""), ("hidden", ""), ("tabindex", "-1")]
+        {
+            picker.set_attribute(name, value)?;
+        }
+        chooser.insert_adjacent_element("afterend", &picker)?;
 
         let mac = window.navigator().platform().is_ok_and(|name| name.starts_with("Mac") || name.starts_with("iP"));
         let dark_mode = window.match_media("(prefers-color-scheme: dark)")?;
@@ -185,6 +196,7 @@ impl Shell {
                 holder: holder.clone(),
                 mirror_timer: None,
                 chooser: chooser.clone(),
+                picker: picker.clone(),
                 window: window.clone(),
                 canvas: canvas.clone(),
                 context,
@@ -263,6 +275,10 @@ impl Shell {
             });
         })?;
 
+        hear(&shell, &picker, "change", Self::picked)?;
+        hear(&shell, &canvas, "dragover", Self::drag_over)?;
+        hear(&shell, &canvas, "dragleave", |shell, _: Event| _ = shell.view.drag_pictures(None))?;
+        hear(&shell, &canvas, "drop", Self::drop)?;
         hear(&shell, &canvas, "pointerdown", Self::pointer_down)?;
         hear(&shell, &canvas, "pointermove", Self::pointer_move)?;
         hear(&shell, &canvas, "pointerup", Self::pointer_up)?;
@@ -465,6 +481,8 @@ impl Shell {
                 // The browser asks the person for the file, and the chooser's `change` hands it over.
                 Request::ImportStyle => self.chooser.click(),
                 Request::ExportStyle(json) => report(self.download(&json, "letstyle")),
+                Request::Pictures => self.picker.click(),
+                Request::Asset(name) => self.load(name),
                 // The window has taken the settings already. The rest is the shell's: keeping them, the
                 // name edits carry, and light or dark.
                 Request::Settings(settings) => {
@@ -538,7 +556,7 @@ impl Shell {
         self.view.paint(&mut self.list);
         let ink = tokens::BG.resolve(if self.dark() { Scheme::Dark } else { Scheme::Light });
         let background = Color::rgba(ink.r, ink.g, ink.b, ink.a);
-        let damage = self.renderer.render(&self.list, &Images::default(), self.scale, background, &mut self.frame);
+        let damage = self.renderer.render(&self.list, self.view.images(), self.scale, background, &mut self.frame);
         for rect in damage.rects() {
             report(put(&self.context, &self.frame, *rect, &mut self.strip));
         }
@@ -738,12 +756,22 @@ impl Shell {
         if action == Clipboard::Paste {
             let read = |kind| data.get_data(kind).ok().filter(|content| !content.is_empty());
             let (text, html) = (read("text/plain"), read("text/html"));
-            if text.is_none() && html.is_none() {
-                return;
+            let files = files(data.files());
+            // Pictures and no words, as a screenshot is, or picture files copied where they are kept. A
+            // picture copied from a page comes with HTML that only points at it.
+            if text.is_none() && !files.is_empty() {
+                let count = files.len();
+                return self.pictures(files, move |shell, pictures| {
+                    let pictures = if pictures.len() == count { pictures } else { Vec::new() };
+                    if !pictures.is_empty() || html.is_some() {
+                        let html = html.filter(|_| pictures.is_empty());
+                        shell.paste(key, Clip { html, pictures, ..Clip::default() });
+                    }
+                });
             }
-            self.platform.pasted = Some(Clip { text: text.unwrap_or_default(), html, ..Clip::default() });
-            self.view.key(key, &mut self.platform);
-            self.platform.pasted = None;
+            if text.is_some() || html.is_some() {
+                self.paste(key, Clip { text: text.unwrap_or_default(), html, ..Clip::default() });
+            }
         } else {
             self.platform.copied = None;
             self.view.key(key, &mut self.platform);
@@ -753,6 +781,71 @@ impl Shell {
                 report(data.set_data("text/html", &html));
             }
         }
+    }
+
+    /// Has the editor paste `clip`, which it reads from the clipboard while it handles the key.
+    fn paste(&mut self, key: KeyEvent, clip: Clip) {
+        self.platform.pasted = Some(clip);
+        self.view.key(key, &mut self.platform);
+        self.platform.pasted = None;
+    }
+
+    // Pictures
+
+    /// Reads `files`, which takes a moment, and hands `then` those that are pictures Letters can show.
+    fn pictures(&self, files: Vec<File>, then: impl FnOnce(&mut Self, Vec<Picture>) + 'static) {
+        let (shell, window) = (self.me.clone(), self.window.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut pictures = Vec::new();
+            for file in &files {
+                pictures.extend(browser::picture(&window, file).await);
+            }
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            then(&mut shell, pictures);
+            shell.changed();
+            shell.sync();
+        });
+    }
+
+    /// Decodes a picture the page has come to show, which takes a moment, and hands it to the window.
+    fn load(&mut self, name: String) {
+        // Only what was put in here can be had, until there is a server to ask.
+        let Some(bytes) = self.platform.assets.get(&name).cloned() else { return self.view.set_image(&name, None) };
+        let (shell, window) = (self.me.clone(), self.window.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let image = browser::decode(&window, &bytes).await;
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            shell.view.set_image(&name, image);
+            shell.sync();
+        });
+    }
+
+    /// The pictures chosen after "Image" in the insert menu go in at the caret.
+    fn picked(&mut self, _: Event) {
+        let files = files(self.picker.files());
+        // The same files chosen again are a change again.
+        self.picker.set_value("");
+        self.pictures(files, |shell, pictures| shell.view.insert_pictures(pictures, None, &mut shell.platform));
+    }
+
+    /// Files held over the page show where their pictures would land.
+    fn drag_over(&mut self, event: DragEvent) {
+        let Some(data) = event.data_transfer().filter(|data| data.types().includes(&"Files".into(), 0)) else { return };
+        // The browser would leave the page for a file let go on it, so every place answers.
+        event.prevent_default();
+        let lands = self.view.drag_pictures(Some(Point { x: event.offset_x() as f32, y: event.offset_y() as f32 }));
+        data.set_drop_effect(if lands { "copy" } else { "none" });
+    }
+
+    fn drop(&mut self, event: DragEvent) {
+        event.prevent_default();
+        let at = Point { x: event.offset_x() as f32, y: event.offset_y() as f32 };
+        let files = files(event.data_transfer().and_then(|data| data.files()));
+        self.pictures(files, move |shell, pictures| {
+            shell.view.insert_pictures(pictures, Some(at), &mut shell.platform)
+        });
     }
 
     // The pointer
@@ -842,6 +935,11 @@ impl Shell {
         let delta = Point { x: event.delta_x() as f32 * unit, y: event.delta_y() as f32 * unit };
         self.view.scroll(self.pointer, delta, &mut self.platform);
     }
+}
+
+/// The files a paste, a drop or a chooser carries.
+fn files(list: Option<FileList>) -> Vec<File> {
+    list.map(|list| (0..list.length()).filter_map(|at| list.get(at)).collect()).unwrap_or_default()
 }
 
 /// The pointer's id if it is a finger, whose movements are gestures.
@@ -946,7 +1044,7 @@ fn hear<E: JsCast + 'static>(
 ) -> Result<(), JsValue> {
     let shell = Rc::downgrade(shell);
     // The pointer's travels change nothing the mirror says.
-    let quiet = matches!(kind, "pointermove" | "pointerleave" | "wheel");
+    let quiet = matches!(kind, "pointermove" | "pointerleave" | "wheel" | "dragover" | "dragleave");
     listen(target, kind, move |event| {
         let Some(shell) = shell.upgrade() else { return };
         let mut shell = shell.borrow_mut();
