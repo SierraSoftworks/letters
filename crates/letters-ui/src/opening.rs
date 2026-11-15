@@ -41,6 +41,16 @@ pub enum Request {
     ImportStyle,
     /// Let the person choose where to write this stylesheet: the text of a `.letstyle` file.
     ExportStyle(String),
+    /// Import the file the shell offered with `Window::offer_import`, reading pictures and linked files
+    /// only from these folders, by the paths the offer gave them. Take the card away with
+    /// `Window::offer_import(None)` once the document is open, or offer again when it could not be done.
+    Import {
+        folders: Vec<String>,
+        /// Whether the file's comments come too.
+        comments: bool,
+    },
+    /// The file that was offered is not wanted. The card is already gone.
+    CancelImport,
     /// Move the window with the pointer, which is held down on the bar: a bar that is the title bar asks
     /// (see `Window::set_chrome`).
     DragWindow,

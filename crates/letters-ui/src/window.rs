@@ -21,6 +21,7 @@ use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::highlight;
 use crate::icon::{self, Icon};
+use crate::importing::{Import, ImportOffer, Importing};
 use crate::insert::{Insert, Inserting, Put};
 use crate::maths::{self, Maths, Sheet, SheetLines, Source};
 use crate::motion::{self, FRAME_MS};
@@ -155,6 +156,8 @@ pub enum Message {
     Start,
     /// Renames the document where its name stands, or moves it from the flyout under the name.
     Rename(Rename),
+    /// Chooses what an imported file brings, on the import card.
+    Import(Import),
     /// What the Styles panel asks for: the person's default, page setup and stylesheets.
     Styles(Styling),
     /// Asks the shell for something only it can do, such as moving the window.
@@ -239,6 +242,17 @@ impl Ui<EditorApp> {
     /// Whether the landing card is showing.
     pub fn landing(&self) -> bool {
         self.app().landing.is_some()
+    }
+
+    /// Shows the import card for a file that has to be imported, in place of the landing card, or takes it
+    /// away. The card asks with [`Request::Import`] and [`Request::CancelImport`].
+    pub fn offer_import(&mut self, offer: Option<ImportOffer>) {
+        self.app_mut().importing = offer.map(Importing::new);
+    }
+
+    /// Whether the import card is showing.
+    pub fn importing(&self) -> bool {
+        self.app().importing.is_some()
     }
 
     /// Has the bar say for a few seconds which folder the document was written to, after its first write.
@@ -420,6 +434,8 @@ pub struct EditorApp {
     location: Location,
     /// What the landing card offers, while it shows.
     landing: Option<Landing>,
+    /// The file the import card offers, while it shows.
+    importing: Option<Importing>,
     requests: Vec<Request>,
     /// The folder the bar says the document was saved in, and since when, once a frame has said so.
     saved_in: Option<(String, Option<u64>)>,
@@ -481,6 +497,7 @@ impl EditorApp {
             estimated: true,
             location: Location::default(),
             landing: None,
+            importing: None,
             requests: Vec::new(),
             saved_in: None,
             naming: false,
@@ -768,7 +785,8 @@ impl EditorApp {
 
     /// The reference to a figure at a point of the page area, while nothing hangs over the page.
     fn reference(&self, at: Point) -> Option<Reference> {
-        let hung = self.landing.is_some() || self.spelling.fix.is_some() || self.link.is_some();
+        let hung =
+            self.landing.is_some() || self.importing.is_some() || self.spelling.fix.is_some() || self.link.is_some();
         if hung || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some() {
             return None;
         }
@@ -1031,7 +1049,8 @@ impl EditorApp {
         let selection = self.editor.selection();
         // A formula with the caret in it has its source out on a sheet, while the place under it is in view
         // and nothing else hangs from the page.
-        let alone = self.landing.is_none() && self.spelling.fix.is_none() && self.link.is_none();
+        let alone =
+            self.landing.is_none() && self.importing.is_none() && self.spelling.fix.is_none() && self.link.is_none();
         let formula = selection.filter(|_| alone).and_then(|selection| self.layout.formula_rect(&selection.head));
         let formula = formula.filter(|rect| (0.0..=room.height).contains(&(origin.y + rect.y + rect.height)));
         let sheet = formula.and_then(|rect| Some((Source::of(&self.editor, self.shaper.as_ref(), self.wide())?, rect)));
@@ -1096,7 +1115,9 @@ impl EditorApp {
             .on_text(Message::Text)
             .on_pointer(|event| Some(Message::Pointer(event)))
             .pointed();
-        if let Some(landing) = &self.landing {
+        if let Some(importing) = &self.importing {
+            element = element.popover(importing.card(room));
+        } else if let Some(landing) = &self.landing {
             element = element.popover(Self::card(landing, room));
         } else if let Some(fix) = &self.spelling.fix {
             // The menu hangs from the start of its word.
@@ -1846,6 +1867,8 @@ impl App for EditorApp {
                     self.close(&head, start);
                 }
             }
+            // The page behind the import card is not written on.
+            Message::Pointer(_) if self.importing.is_some() => {}
             Message::Pointer(event) => self.pointer(event, platform),
             Message::Run(command) => self.edit(platform, |editor, platform| editor.run(command, platform)),
             Message::Panel(panel) => self.show((self.panel != Some(panel)).then_some(panel)),
@@ -1875,6 +1898,10 @@ impl App for EditorApp {
             Message::NewDocument => self.requests.push(Request::New),
             Message::Start => self.start(),
             Message::Rename(message) => self.rename(message),
+            Message::Import(message) => {
+                let stays = self.importing.as_mut().is_some_and(|card| card.update(message, &mut self.requests));
+                self.importing = self.importing.take().filter(|_| stays);
+            }
             Message::Styles(message) => self.styling(message, platform),
             Message::Ask(request) => self.requests.push(request),
             Message::Maths(message) => self.sheet(message, platform),
@@ -1980,7 +2007,7 @@ impl App for EditorApp {
     fn text(&mut self, event: InputEvent, platform: &mut dyn Platform) {
         // The first character typed over the landing card starts this document with it.
         let typed = matches!(event, InputEvent::Insert(_) | InputEvent::Commit(_) | InputEvent::SetComposition { .. });
-        if self.landing.is_some() && typed {
+        if self.landing.is_some() && self.importing.is_none() && typed {
             self.start();
             self.edit(platform, |editor, platform| editor.input(event, platform));
         }
