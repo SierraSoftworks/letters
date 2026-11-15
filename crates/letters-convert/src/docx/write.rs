@@ -2,6 +2,8 @@
 //!
 //! Every paragraph names a style and carries no formatting of its own, so changing a style in Word restyles
 //! the document as it does here. Marks are the one thing written onto runs, as Word's own buttons would.
+//! The exceptions are what Word has no style for: how a column of a table is aligned, which each of its
+//! cells says, and where a picture stands on its line.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -9,13 +11,18 @@ use std::io::{Cursor, Write as _};
 use std::ops::Range;
 
 use letters_layout::Palette;
-use letters_model::{Align, Block, BlockKind, Document, ListKind, Mark, NoteKind, Notes, Run, Style, TextStyle, Tone};
+use letters_model::{
+    Align, Block, BlockId, BlockKind, Document, ListKind, Mark, NoteKind, Notes, Run, Style, TextStyle, Tone,
+};
 use letters_render::Color;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use super::math::equation;
-use super::{CALLOUTS, DIVIDER, INLINE_CODE, LINK, LIST, SINGLE, TASK_DONE, TASK_OPEN, TWIPS, TYPES};
+use super::{
+    BOOKMARK, CALLOUTS, CELL, DIVIDER, HEAD_CELL, INLINE_CODE, LINK, LIST, SEQUENCE, SINGLE, TABLE, TABLE_SPACE,
+    TASK_DONE, TASK_OPEN, TWIPS, TYPES,
+};
 use crate::html::{Assets, href};
 
 /// Exports are drawn on the light page, whatever theme the editor is in.
@@ -39,6 +46,13 @@ const LIST_INDENT: usize = 360;
 const LONGEST_LINK: usize = 2000;
 /// What starts a paragraph on a new page.
 const BREAK: &str = "<w:pageBreakBefore/>";
+/// The gap between two pictures of a gallery, in points, which is the page's. A space too small to see
+/// stands there, spread to a little under the gap, so that a row never runs over its line.
+const TILE_GAP: f32 = 8.0;
+const TILE_SPACE: &str = "<w:r><w:rPr><w:spacing w:val=\"150\"/><w:sz w:val=\"2\"/><w:szCs w:val=\"2\"/></w:rPr>\
+                          <w:t xml:space=\"preserve\"> </w:t></w:r>";
+/// The padding inside a table cell, across and down, in twentieths of a point. The page's own.
+const CELL_PAD: (u32, u32) = (200, 120);
 
 /// Writes a `.docx` with `style` as its styles.
 ///
@@ -47,9 +61,23 @@ const BREAK: &str = "<w:pageBreakBefore/>";
 ///   conflicts stay behind.
 /// - `title` goes into the file's properties, and `assets` supplies the pictures.
 /// - A formula is written as a Word equation, and as its source where it has a mistake in it.
+/// - A numbered figure's caption opens with a label that Word counts, and a reference to the figure is a
+///   cross-reference to that label. The pictures of a gallery share a paragraph, in the rows the page sets.
+/// - A table is a Word table, its header row repeated on each page it runs to.
 /// - A link that would run script is written as its text alone, and an unknown block as its fallback text.
 pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets: Assets) -> Vec<u8> {
     let page = &style.page;
+    let labels = letters_layout::figure_numbers(doc).into_iter().map(|(id, number)| {
+        // The page's label, cut around its number, which Word writes.
+        let (label, digits) = (letters_layout::figure_label(style, number), number.to_string());
+        let (word, rest) = label.rsplit_once(&digits).unwrap_or((&label, ""));
+        (id, Label { number, word: word.to_owned(), rest: rest.to_owned() })
+    });
+    // As on the page, only a caption set to the middle or the end moves its picture.
+    let pictured = match style.types.get("caption").or_else(|| style.types.get("body")).map(|caption| caption.align) {
+        Some(align @ (Align::Center | Align::End)) => align,
+        _ => Align::Start,
+    };
     let mut writer = Writer {
         out: String::new(),
         links: Links::default(),
@@ -64,6 +92,12 @@ pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets
         measure: (page.width - page.margin_left - page.margin_right).max(1.0),
         breaks: false,
         lang: None,
+        labels: labels.collect(),
+        pictured,
+        drawn: 0,
+        keep: false,
+        align: None,
+        lead: String::new(),
     };
     let comments = writer.plan(doc, notes);
     writer.blocks(&doc.blocks, None);
@@ -285,6 +319,20 @@ struct Comment<'n> {
 /// A passage of a block and the comments that sit on it. No passage is the whole block.
 type Passage = (Option<Range<usize>>, Range<usize>);
 
+/// The label of a numbered figure, such as "Figure 2:", in the parts around its number.
+struct Label {
+    number: u32,
+    word: String,
+    rest: String,
+}
+
+impl Label {
+    /// What a reference to the figure reads as.
+    fn shown(&self) -> String {
+        format!("{}{}", self.word, self.number)
+    }
+}
+
 struct Writer<'d, 'a> {
     /// The document's body so far.
     out: String,
@@ -310,6 +358,18 @@ struct Writer<'d, 'a> {
     breaks: bool,
     /// The language of the block being written, where it is not the document's.
     lang: Option<&'d str>,
+    /// The label of each numbered figure and gallery.
+    labels: BTreeMap<BlockId, Label>,
+    /// Where a picture stands on its line, which is where the caption's style sets text.
+    pictured: Align,
+    /// How many pictures have been drawn. Word wants a number on each.
+    drawn: usize,
+    /// Whether the next paragraph stays on the page of the one after it.
+    keep: bool,
+    /// How the next paragraph is set, where that is not its style's to say.
+    align: Option<Align>,
+    /// What the next paragraph opens with before its text, as a caption does with its label.
+    lead: String,
 }
 
 impl<'d> Writer<'d, '_> {
@@ -338,14 +398,7 @@ impl<'d> Writer<'d, '_> {
             // The first paragraph a block writes carries its page break, and all of them its language.
             self.breaks |= block.page_break;
             self.lang = block.lang.as_deref().or(around);
-            let mut spans = Vec::new();
-            for (range, comments) in self.anchors.remove(block.id.as_str()).unwrap_or_default() {
-                // A passage of a formula's source is no passage of the equation it is written as.
-                match range.filter(|_| !block.body.runs().is_empty() && block.kind != BlockKind::Formula) {
-                    Some(range) => spans.push((range, comments)),
-                    None => self.pending.push(comments),
-                }
-            }
+            let spans = self.noted(block);
             if !matches!(block.kind, BlockKind::ListItem { .. }) {
                 self.counters.clear();
             }
@@ -376,15 +429,22 @@ impl<'d> Writer<'d, '_> {
                     self.container(block, style);
                 }
                 BlockKind::Divider => self.paragraph(DIVIDER.0, None, &[], Vec::new()),
-                BlockKind::Figure { .. } => self.figure(block),
-                // Until galleries and tables are written as such, what they hold is written in order.
+                BlockKind::Figure { .. } => self.figure(block, spans),
+                BlockKind::Gallery { .. } => self.gallery(block, within),
                 BlockKind::Caption => self.paragraph("Caption", None, block.body.runs(), spans),
-                BlockKind::TableCell => self.paragraph(within.unwrap_or(""), None, block.body.runs(), spans),
-                BlockKind::Gallery { .. } | BlockKind::Table { .. } | BlockKind::TableRow => {
-                    self.blocks(block.body.blocks(), within);
+                BlockKind::Table { columns, header } => {
+                    let is_row = |part: &&Block| part.kind == BlockKind::TableRow;
+                    let (rows, rest): (Vec<_>, Vec<_>) = block.body.blocks().iter().partition(is_row);
+                    self.table(&rows, columns, *header);
+                    // What a merge left in a table that is no row of it follows it, as on the page.
+                    for stray in rest {
+                        self.blocks(std::slice::from_ref(stray), within);
+                    }
                 }
-                // A reader that does not build figures yet hands one over as an unknown block, its fields beside it.
-                BlockKind::Unknown { type_name } if type_name == "figure" => self.figure(block),
+                // A merge can leave a row outside a table, which is a table of one row, and a cell outside
+                // a row, which is a line of text.
+                BlockKind::TableRow => self.table(&[block], &[], false),
+                BlockKind::TableCell => self.paragraph(within.unwrap_or(""), None, block.body.runs(), spans),
                 BlockKind::Unknown { .. } => {
                     let fallback =
                         block.extra.get("fallback").and_then(|fallback| fallback.as_str()).unwrap_or_default();
@@ -395,6 +455,26 @@ impl<'d> Writer<'d, '_> {
             }
         }
         self.lang = around;
+    }
+
+    /// Takes the comments on a block. Those on a passage of its text are returned, and those on the whole of
+    /// it wait for the first paragraph it writes.
+    fn noted(&mut self, block: &'d Block) -> Vec<(Range<usize>, Range<usize>)> {
+        let mut spans = Vec::new();
+        for (range, comments) in self.anchors.remove(block.id.as_str()).unwrap_or_default() {
+            // A passage of a formula's source is no passage of the equation it is written as.
+            match range.filter(|_| !block.body.runs().is_empty() && block.kind != BlockKind::Formula) {
+                Some(range) => spans.push((range, comments)),
+                None => self.pending.push(comments),
+            }
+        }
+        spans
+    }
+
+    /// Makes the comments on a block that writes no text of its own wait for the next paragraph.
+    fn defer(&mut self, block: &'d Block) {
+        let spans = self.noted(block);
+        self.pending.extend(spans.into_iter().map(|(_, comments)| comments));
     }
 
     /// Writes what a quote or a callout holds. Word has no block that holds others, so each paragraph inside
@@ -432,14 +512,20 @@ impl<'d> Writer<'d, '_> {
         }
     }
 
-    /// Starts a paragraph of a style, which takes the page break that waits for one.
+    /// Starts a paragraph of a style, which takes the page break that waits for one, and what else was set
+    /// for the next paragraph alone.
     fn open(&mut self, style: &str, list: Option<(usize, u8)>) {
         self.out.push_str("<w:p>");
-        let breaks = std::mem::take(&mut self.breaks);
-        if !style.is_empty() || list.is_some() || breaks {
+        let (breaks, keep, align) =
+            (std::mem::take(&mut self.breaks), std::mem::take(&mut self.keep), self.align.take());
+        if !style.is_empty() || list.is_some() || breaks || keep || align.is_some() {
+            // In the order Word's schema asks for.
             self.out.push_str("<w:pPr>");
             if !style.is_empty() {
                 let _ = write!(self.out, "<w:pStyle w:val=\"{style}\"/>");
+            }
+            if keep {
+                self.out.push_str("<w:keepNext/>");
             }
             if breaks {
                 self.out.push_str(BREAK);
@@ -447,8 +533,17 @@ impl<'d> Writer<'d, '_> {
             if let Some((list, depth)) = list {
                 let _ = write!(self.out, "<w:numPr><w:ilvl w:val=\"{depth}\"/><w:numId w:val=\"{list}\"/></w:numPr>");
             }
+            if let Some(align) = align {
+                let _ = write!(self.out, "<w:jc w:val=\"{}\"/>", justification(align));
+            }
             self.out.push_str("</w:pPr>");
         }
+    }
+
+    /// Writes a paragraph that holds nothing and takes no comment, which Word needs here and there.
+    fn empty(&mut self, style: &str) {
+        self.open(style, None);
+        self.out.push_str("</w:p>");
     }
 
     /// Writes one paragraph of a style, with the comments that sit on it.
@@ -460,79 +555,212 @@ impl<'d> Writer<'d, '_> {
         mut spans: Vec<(Range<usize>, Range<usize>)>,
     ) {
         self.open(style, list);
+        let lead = std::mem::take(&mut self.lead);
+        self.out.push_str(&lead);
         let len: usize = runs.iter().map(|run| run.text.len()).sum();
         spans.extend(self.pending.drain(..).map(|comments| (0..len, comments)));
         let mut out = std::mem::take(&mut self.out);
-        inline(runs, &spans, self.lang, &mut self.links, &mut out);
+        inline(runs, &spans, self.lang, &self.labels, &mut self.links, &mut out);
         self.out = out;
         self.out.push_str("</w:p>");
     }
 
     /// Writes a picture as a paragraph of its own, and its caption as the paragraph after.
-    fn figure(&mut self, block: &'d Block) {
-        let field = |name: &str| block.extra.get(name);
-        let text = |name: &str| field(name).and_then(|value| value.as_str());
-        let size = |name: &str| field(name).and_then(|value| value.as_f64()).unwrap_or_default() as f32;
-        let (asset, src, alt, width, height, caption) = match &block.kind {
-            BlockKind::Figure { asset, src, alt, width, height, .. } => {
-                (asset.as_deref(), src.as_deref(), alt.as_str(), *width, *height, block.body.runs().to_vec())
+    fn figure(&mut self, block: &'d Block, spans: Vec<(Range<usize>, Range<usize>)>) {
+        let BlockKind::Figure { alt, width, height, .. } = &block.kind else { return };
+        let captioned = self.labels.contains_key(&block.id) || block.body.runs().iter().any(|run| !run.text.is_empty());
+        match self.held(block) {
+            Some(id) => {
+                let (mut width, mut height) = (width.max(1.0), height.max(1.0));
+                if width > self.measure {
+                    (width, height) = (self.measure, height * self.measure / width);
+                }
+                let picture = self.drawing(&id, alt, width, height);
+                // A picture goes to the next page with its caption.
+                (self.keep, self.align) = (captioned, Some(self.pictured));
+                self.open("", None);
+                self.whole(&picture);
+                self.out.push_str("</w:p>");
             }
-            _ => {
-                let caption = field("content").and_then(|runs| Run::list_from_value(runs.clone(), "content").ok());
-                let alt = text("alt").unwrap_or_default();
-                (text("asset"), text("src"), alt, size("width"), size("height"), caption.unwrap_or_default())
-            }
-        };
-        let (mut width, mut height) = (width.max(1.0), height.max(1.0));
-        if width > self.measure {
-            (width, height) = (self.measure, height * self.measure / width);
+            None => self.stand_in(block),
         }
+        if captioned {
+            self.label(&block.id, block.body.runs());
+            self.paragraph("Caption", None, block.body.runs(), spans);
+        }
+    }
 
-        let held = asset.and_then(|name| match self.pictures.get(name) {
+    /// Writes pictures side by side as one paragraph, a line for each row the page sets them in, and their
+    /// caption as the paragraph after.
+    fn gallery(&mut self, block: &'d Block, within: Option<&'static str>) {
+        let inside = block.body.blocks();
+        let is_figure = |part: &&Block| matches!(part.kind, BlockKind::Figure { .. });
+        // The page shows the last caption under the pictures, and whatever else a merge left here after it.
+        let caption = inside.iter().rfind(|part| part.kind == BlockKind::Caption);
+        let shown = |part: &&Block| is_figure(part) || caption.is_some_and(|caption| caption.id == part.id);
+        let numbered = self.labels.contains_key(&block.id);
+
+        let (mut tiles, mut missing) = (Vec::new(), Vec::new());
+        for figure in inside.iter().filter(is_figure) {
+            // A picture here has no text of its own to hang a comment on.
+            self.defer(figure);
+            let BlockKind::Figure { alt, width, height, .. } = &figure.kind else { continue };
+            match self.held(figure) {
+                Some(id) => tiles.push((id, alt.as_str(), width.max(1.0) / height.max(1.0))),
+                None => missing.push(figure),
+            }
+        }
+        let (mut rows, mut at) = (String::new(), 0);
+        while at < tiles.len() {
+            // Up to three to a row, and the last picture is never left alone.
+            let left = tiles.len() - at;
+            let take = if left == 4 { 2 } else { left.min(3) };
+            let row = &tiles[at..at + take];
+            let room = (self.measure - TILE_GAP * (take - 1) as f32).max(take as f32);
+            let tall = (room / row.iter().map(|(.., shape)| shape).sum::<f32>()).max(1.0);
+            if at > 0 {
+                rows.push_str("<w:r><w:br/></w:r>");
+            }
+            for (index, (id, alt, shape)) in row.iter().enumerate() {
+                if index > 0 {
+                    rows.push_str(TILE_SPACE);
+                }
+                rows.push_str(&self.drawing(id, alt, (shape * tall).max(1.0), tall));
+            }
+            at += take;
+        }
+        if !rows.is_empty() {
+            (self.keep, self.align) = (numbered || caption.is_some(), Some(self.pictured));
+            self.open("", None);
+            self.whole(&rows);
+            self.out.push_str("</w:p>");
+        }
+        for figure in missing {
+            self.stand_in(figure);
+        }
+        self.label(&block.id, caption.map_or(&[], |caption| caption.body.runs()));
+        match caption {
+            Some(caption) => self.blocks(std::slice::from_ref(caption), within),
+            None if numbered => self.paragraph("Caption", None, &[], Vec::new()),
+            None => {}
+        }
+        for stray in inside.iter().filter(|part| !shown(part)) {
+            self.blocks(std::slice::from_ref(stray), within);
+        }
+    }
+
+    /// Readies the label that opens the caption of a numbered figure, for the paragraph written next.
+    fn label(&mut self, figure: &BlockId, caption: &[Run]) {
+        let Some(Label { number, word, rest }) = self.labels.get(figure) else { return };
+        // A reference to the figure names the bookmark, and shows what it holds: the label up to its number.
+        let _ = write!(
+            self.lead,
+            "<w:bookmarkStart w:id=\"{number}\" w:name=\"{BOOKMARK}{number}\"/><w:r><w:t xml:space=\"preserve\">{}</w:t>\
+             </w:r>{}<w:bookmarkEnd w:id=\"{number}\"/>",
+            escaped(word),
+            field(&format!("SEQ {SEQUENCE} \\* ARABIC"), &format!("<w:r><w:t>{number}</w:t></w:r>")),
+        );
+        if caption.iter().any(|run| !run.text.is_empty()) {
+            let _ = write!(self.lead, "<w:r><w:t xml:space=\"preserve\">{} </w:t></w:r>", escaped(rest));
+        }
+    }
+
+    /// The relationship of a figure's picture, for one the file can hold.
+    fn held(&mut self, figure: &'d Block) -> Option<String> {
+        let BlockKind::Figure { asset: Some(name), .. } = &figure.kind else { return None };
+        match self.pictures.get(name.as_str()) {
             Some(known) => known.clone(),
             None => {
                 let id = self.embed(name);
                 self.pictures.insert(name, id.clone());
                 id
             }
-        });
-        match (held, src.and_then(address)) {
-            (Some(id), _) => {
-                let number = self.out.matches("<wp:docPr ").count() + 1;
-                let emu = |points: f32| (points * 12700.0).round() as u64;
-                let (cx, cy) = (emu(width), emu(height));
-                let alt = escaped(alt);
-                let picture = format!(
-                    "<w:r><w:drawing><wp:inline \
-                     xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
-                     distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\"><wp:extent cx=\"{cx}\" cy=\"{cy}\"/>\
-                     <wp:docPr id=\"{number}\" name=\"Picture {number}\" descr=\"{alt}\"/>\
-                     <a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
-                     <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
-                     <pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
-                     <pic:nvPicPr><pic:cNvPr id=\"{number}\" name=\"Picture {number}\" descr=\"{alt}\"/><pic:cNvPicPr/>\
-                     </pic:nvPicPr><pic:blipFill><a:blip r:embed=\"{id}\"/><a:stretch><a:fillRect/></a:stretch>\
-                     </pic:blipFill><pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
-                     <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData>\
-                     </a:graphic></wp:inline></w:drawing></w:r>"
-                );
-                let breaks = if std::mem::take(&mut self.breaks) { BREAK } else { "" };
-                let _ = write!(self.out, "<w:p><w:pPr><w:keepNext/>{breaks}</w:pPr>");
-                self.whole(&picture);
-                self.out.push_str("</w:p>");
-            }
-            // A picture that is still remote is a link to it, so that opening the file fetches nothing.
-            (None, Some(url)) => {
+        }
+    }
+
+    /// Writes what stands for a picture the file cannot hold. One that is still remote is a link to it, so
+    /// that opening the file fetches nothing, and one that is missing is its description.
+    fn stand_in(&mut self, figure: &'d Block) {
+        let BlockKind::Figure { src, alt, .. } = &figure.kind else { return };
+        match src.as_deref().and_then(address) {
+            Some(url) => {
                 let label = if alt.is_empty() { url.as_str() } else { alt };
                 let link = Run { link: Some(url.clone()), ..Run::plain(label) };
                 self.paragraph("", None, &[link], Vec::new());
             }
-            (None, None) if !alt.is_empty() => self.paragraph("Caption", None, &[Run::plain(alt)], Vec::new()),
-            (None, None) => {}
+            None if !alt.is_empty() => self.paragraph("Caption", None, &[Run::plain(alt.as_str())], Vec::new()),
+            None => {}
         }
-        if caption.iter().any(|run| !run.text.is_empty()) {
-            self.paragraph("Caption", None, &caption, Vec::new());
+    }
+
+    /// A picture as it sits in a line, at a size in points.
+    fn drawing(&mut self, id: &str, alt: &str, width: f32, height: f32) -> String {
+        self.drawn += 1;
+        let number = self.drawn;
+        let emu = |points: f32| (points * 12700.0).round() as u64;
+        let (cx, cy) = (emu(width), emu(height));
+        let alt = escaped(alt);
+        format!(
+            "<w:r><w:drawing><wp:inline \
+             xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
+             distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\"><wp:extent cx=\"{cx}\" cy=\"{cy}\"/>\
+             <wp:docPr id=\"{number}\" name=\"Picture {number}\" descr=\"{alt}\"/>\
+             <a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+             <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+             <pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+             <pic:nvPicPr><pic:cNvPr id=\"{number}\" name=\"Picture {number}\" descr=\"{alt}\"/><pic:cNvPicPr/>\
+             </pic:nvPicPr><pic:blipFill><a:blip r:embed=\"{id}\"/><a:stretch><a:fillRect/></a:stretch>\
+             </pic:blipFill><pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
+             <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData>\
+             </a:graphic></wp:inline></w:drawing></w:r>"
+        )
+    }
+
+    /// Writes a table with a column for each cell of its longest row. A row short of cells ends in empty ones.
+    fn table(&mut self, rows: &[&'d Block], columns: &[Align], header: bool) {
+        let cells = |row: &'d Block| row.body.blocks().iter().filter(|cell| cell.kind == BlockKind::TableCell);
+        if rows.is_empty() {
+            return;
         }
+        if self.breaks {
+            // Word starts no new page inside a table, so an empty paragraph ahead of it starts one.
+            self.empty(TABLE_SPACE.0);
+        }
+        let across = rows.iter().map(|&row| cells(row).count()).max().unwrap_or(0).max(columns.len()).max(1);
+        // Word shares the width out by what the columns hold, as the page does. These are where it starts.
+        let wide = ((self.measure * TWIPS).round() as usize / across).max(1);
+        let (look, first) = if header { ("0620", 1) } else { ("0600", 0) };
+        let _ = write!(
+            self.out,
+            "<w:tbl><w:tblPr><w:tblStyle w:val=\"{}\"/><w:tblW w:w=\"5000\" w:type=\"pct\"/><w:tblLook w:val=\"{look}\" \
+             w:firstRow=\"{first}\" w:lastRow=\"0\" w:firstColumn=\"0\" w:lastColumn=\"0\" w:noHBand=\"1\" \
+             w:noVBand=\"1\"/></w:tblPr><w:tblGrid>{}</w:tblGrid>",
+            TABLE.0,
+            format!("<w:gridCol w:w=\"{wide}\"/>").repeat(across),
+        );
+        for (index, &row) in rows.iter().enumerate() {
+            self.defer(row);
+            self.out.push_str("<w:tr>");
+            if header && index == 0 {
+                self.out.push_str("<w:trPr><w:tblHeader/></w:trPr>");
+            }
+            // The cells of a row that heads the table are set by a style of their own, which any reader shows.
+            let style = if header && index == 0 { HEAD_CELL.0 } else { CELL.0 };
+            let mut held = cells(row);
+            for column in 0..across {
+                let _ = write!(self.out, "<w:tc><w:tcPr><w:tcW w:w=\"{wide}\" w:type=\"dxa\"/></w:tcPr>");
+                self.align = columns.get(column).copied().filter(|align| *align != Align::Start);
+                match held.next() {
+                    Some(cell) => self.blocks(std::slice::from_ref(cell), Some(style)),
+                    None => self.empty(style),
+                }
+                self.out.push_str("</w:tc>");
+            }
+            self.out.push_str("</w:tr>");
+        }
+        self.out.push_str("</w:tbl>");
+        // Word joins tables that touch and sets one against the text under it, so a paragraph keeps it apart.
+        self.empty(TABLE_SPACE.0);
     }
 
     /// Writes content that is not text into the open paragraph, inside the comments that wait for one.
@@ -588,7 +816,7 @@ impl<'d> Writer<'d, '_> {
                 escaped(&initials),
                 paragraph(index),
             );
-            inline(comment.content, &[], None, &mut self.links, &mut out);
+            inline(comment.content, &[], None, &self.labels, &mut self.links, &mut out);
             out.push_str("</w:p></w:comment>");
             let _ = write!(threads, "<w15:commentEx w15:paraId=\"{}\"", paragraph(index));
             if let Some(parent) = comment.parent {
@@ -602,17 +830,27 @@ impl<'d> Writer<'d, '_> {
     }
 }
 
+/// A field: the instructions Word follows, between marks, and then what they last came to, which is what
+/// a reader that follows none shows.
+fn field(code: &str, shown: &str) -> String {
+    let mark = |kind: &str| format!("<w:r><w:fldChar w:fldCharType=\"{kind}\"/></w:r>");
+    let code = format!("<w:r><w:instrText xml:space=\"preserve\"> {code} </w:instrText></w:r>");
+    [mark("begin"), code, mark("separate"), shown.to_owned(), mark("end")].concat()
+}
+
 /// Ends a comment's passage and leaves its mark, which is where Word hangs the comment.
 fn close(id: usize, out: &mut String) {
     let _ = write!(out, "<w:commentRangeEnd w:id=\"{id}\"/><w:r><w:commentReference w:id=\"{id}\"/></w:r>");
 }
 
 /// Writes runs, with each comment's passage marked around its text. Offsets are bytes into the runs' text.
-/// `lang` is the language of the block around them, where that is not the document's.
+/// `lang` is the language of the block around them, where that is not the document's, and `labels` are
+/// those of the figures a run can refer to.
 fn inline(
     runs: &[Run],
     spans: &[(Range<usize>, Range<usize>)],
     lang: Option<&str>,
+    labels: &BTreeMap<BlockId, Label>,
     links: &mut Links,
     out: &mut String,
 ) {
@@ -642,12 +880,26 @@ fn inline(
     let mut at = 0;
     let mut open: Option<&str> = None;
     for run in runs {
-        let maths = run.marks.contains(&Mark::Math).then(|| equation(&run.text, false)).flatten();
+        let own = run.lang.as_deref().or(lang);
+        let figure = run.marks.iter().find_map(|mark| match mark {
+            Mark::Ref(figure) => labels.get(figure),
+            _ => None,
+        });
+        // A formula is written as an equation, and a reference to a numbered figure as a field that shows
+        // the figure's label, which Word keeps up as figures come and go. Neither is text to cut.
+        let whole = match figure {
+            Some(label) => {
+                let mut shown = String::new();
+                text(&label.shown(), run, false, own, &mut shown);
+                Some(field(&format!("REF {BOOKMARK}{} \\h", label.number), &shown))
+            }
+            None => run.marks.contains(&Mark::Math).then(|| equation(&run.text, false)).flatten(),
+        };
         let mut rest = run.text.as_str();
         while !rest.is_empty() {
             // The run is cut where a passage starts or ends inside it, never inside a character or a formula.
             let cut = cuts.iter().map(|cut| cut.saturating_sub(at)).filter(|cut| *cut > 0 && *cut < rest.len());
-            let mut cut = cut.min().filter(|_| maths.is_none()).unwrap_or(rest.len());
+            let mut cut = cut.min().filter(|_| whole.is_none()).unwrap_or(rest.len());
             while !rest.is_char_boundary(cut) {
                 cut += 1;
             }
@@ -663,9 +915,9 @@ fn inline(
                 let _ = write!(out, "<w:hyperlink r:id=\"{}\">", links.id(&target, "hyperlink"));
                 open = link;
             }
-            match &maths {
-                Some(equation) => out.push_str(equation),
-                None => text(piece, run, open.is_some(), run.lang.as_deref().or(lang), out),
+            match &whole {
+                Some(whole) => out.push_str(whole),
+                None => text(piece, run, open.is_some(), own, out),
             }
             at += piece.len();
             rest = after;
@@ -728,12 +980,7 @@ fn text(text: &str, run: &Run, linked: bool, lang: Option<&str>, out: &mut Strin
 /// style adds goes in one of three places: `before` the spacing, `after` it, or `last`.
 fn paragraph_look(kind: &TextStyle, before: &str, after: &str, last: &str) -> String {
     let twips = |points: f32| (points * TWIPS).round().max(0.0) as u32;
-    let align = match kind.align {
-        Align::Start => "left",
-        Align::Center => "center",
-        Align::End => "right",
-        Align::Justify => "both",
-    };
+    let align = justification(kind.align);
     // 240 is single spacing.
     let line = (kind.line_height / SINGLE * 240.0).round().max(1.0) as u32;
     format!(
@@ -742,6 +989,16 @@ fn paragraph_look(kind: &TextStyle, before: &str, after: &str, last: &str) -> St
         twips(kind.space_before),
         twips(kind.space_after),
     )
+}
+
+/// How text is set across its line, as Word names it.
+fn justification(align: Align) -> &'static str {
+    match align {
+        Align::Start => "left",
+        Align::Center => "center",
+        Align::End => "right",
+        Align::Justify => "both",
+    }
 }
 
 /// The run properties an element type's style comes to. Every field is written, so no style leans on another.
@@ -781,7 +1038,7 @@ fn styles(style: &Style, language: &str) -> String {
         if based {
             out.push_str("<w:basedOn w:val=\"Normal\"/>");
         }
-        if id != "Normal" && id != LIST.0 {
+        if !["Normal", LIST.0, CELL.0, HEAD_CELL.0].contains(&id) {
             out.push_str("<w:next w:val=\"Normal\"/>");
         }
         let _ = write!(out, "<w:qFormat/>{look}{runs}</w:style>");
@@ -830,6 +1087,10 @@ fn styles(style: &Style, language: &str) -> String {
     }
     // Items of one list sit closer than paragraphs do.
     paragraph(LIST.0, LIST.1, true, &paragraph_look(body, "", "<w:contextualSpacing/>", ""), &run_look(body, ""));
+    // The text of a cell is body text with no space around it, and bold in a row that heads the table.
+    let cell = TextStyle { space_before: 0.0, space_after: 0.0, align: Align::Start, ..body.clone() };
+    paragraph(CELL.0, CELL.1, true, &paragraph_look(&cell, "", "", ""), "");
+    paragraph(HEAD_CELL.0, HEAD_CELL.1, true, &paragraph_look(&cell, "", "", ""), "<w:rPr><w:b/><w:bCs/></w:rPr>");
     // A rule across the page is the bottom border of a paragraph too small to see.
     let rule = format!("<w:pBdr>{}</w:pBdr>", border("bottom", 6, 0, &hex(PAGE.line)));
     let gap = (body.space_after * 2.0 * TWIPS).round() as u32;
@@ -839,6 +1100,31 @@ fn styles(style: &Style, language: &str) -> String {
          <w:next w:val=\"Normal\"/><w:qFormat/><w:pPr>{rule}<w:spacing w:before=\"{gap}\" w:after=\"{gap}\" \
          w:line=\"40\" w:lineRule=\"exact\"/></w:pPr><w:rPr><w:sz w:val=\"2\"/><w:szCs w:val=\"2\"/></w:rPr></w:style>",
         DIVIDER.0, DIVIDER.1
+    );
+
+    // A paragraph too small to see, which leaves under a table the space a paragraph leaves under itself.
+    let _ = write!(
+        out,
+        "<w:style w:type=\"paragraph\" w:styleId=\"{}\"><w:name w:val=\"{}\"/><w:basedOn w:val=\"Normal\"/>\
+         <w:next w:val=\"Normal\"/><w:pPr><w:spacing w:before=\"{}\" w:after=\"0\" w:line=\"20\" \
+         w:lineRule=\"exact\"/></w:pPr><w:rPr><w:sz w:val=\"2\"/><w:szCs w:val=\"2\"/></w:rPr></w:style>",
+        TABLE_SPACE.0,
+        TABLE_SPACE.1,
+        (body.space_after * TWIPS).round().max(0.0) as u32,
+    );
+    // A table is ruled under each row, as on the page, and more firmly under a row that heads it.
+    let (pad_x, pad_y) = CELL_PAD;
+    let _ = write!(
+        out,
+        "<w:style w:type=\"table\" w:styleId=\"{}\"><w:name w:val=\"{}\"/><w:qFormat/><w:tblPr><w:tblBorders>{}{}\
+         </w:tblBorders><w:tblCellMar><w:top w:w=\"{pad_y}\" w:type=\"dxa\"/><w:left w:w=\"{pad_x}\" w:type=\"dxa\"/>\
+         <w:bottom w:w=\"{pad_y}\" w:type=\"dxa\"/><w:right w:w=\"{pad_x}\" w:type=\"dxa\"/></w:tblCellMar></w:tblPr>\
+         <w:tblStylePr w:type=\"firstRow\"><w:tcPr><w:tcBorders>{}</w:tcBorders></w:tcPr></w:tblStylePr></w:style>",
+        TABLE.0,
+        TABLE.1,
+        border("bottom", 6, 0, &hex(PAGE.line)),
+        border("insideH", 6, 0, &hex(PAGE.line)),
+        border("bottom", 6, 0, &hex(PAGE.line_strong)),
     );
 
     let mono = escaped(&code.family);

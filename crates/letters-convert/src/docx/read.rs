@@ -5,6 +5,7 @@ mod inline;
 mod math;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 use letters_model::{Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Note, Run, Style};
 use roxmltree::Node;
@@ -21,8 +22,11 @@ const MAX_DEPTH: usize = 32;
 
 const CONTENTS: &str = "Table of contents left out";
 const TITLE: &str = "Title became a level 1 heading";
-const TABLE: &str = "Table flattened into lines of text";
+const MERGED: &str = "Merged table cells were split";
+const CELLS: &str = "Lists, headings and tables inside table cells became lines of text";
+const FRAME: &str = "A table of one column became its paragraphs";
 const PICTURE_MOVED: &str = "Picture moved out of its paragraph";
+const PICTURE_OUT: &str = "Picture moved out of its table";
 const DIRECT: &str = "Fonts, sizes, colours and alignment set on single passages were left out. The document's \
                       styles set them instead";
 const HEADERS: &str = "Headers and footers were left out";
@@ -114,6 +118,9 @@ pub fn from_docx(
         assets: BTreeMap::new(),
         pictures: BTreeMap::new(),
         turns: turns(body),
+        cells: 0,
+        bookmarks: BTreeMap::new(),
+        refs: Vec::new(),
     };
     let mut blocks = reader.blocks(body, &rels);
     // The parts read from here on count their nodes anew.
@@ -153,6 +160,7 @@ pub fn from_docx(
         blocks.append(&mut inner);
     }
     settle(&mut blocks);
+    reader.refer(&mut blocks);
     let language = languages(&mut blocks, reader.styles.language());
 
     if furniture.iter().any(|part| shows_text(part)) {
@@ -365,6 +373,8 @@ struct Field {
     link: Option<String>,
     /// Whether the field is a table of contents.
     contents: bool,
+    /// Where what it shows starts.
+    from: Option<Spot>,
 }
 
 /// What surrounds the inline content being read.
@@ -408,6 +418,8 @@ struct Para {
     breaks: bool,
     /// Whether a page break comes after some of the text.
     broken: bool,
+    /// The bytes of the number Word counted this paragraph with, as it does a caption.
+    counted: Option<Range<usize>>,
 }
 
 impl Para {
@@ -499,6 +511,12 @@ struct Reader<'a, 'f> {
     pictures: BTreeMap<String, Result<String, String>>,
     /// The paragraphs of the body after which a section starts a new page, by the number of their node.
     turns: BTreeSet<usize>,
+    /// How many table cells enclose what is being read.
+    cells: usize,
+    /// The paragraph each bookmark starts in.
+    bookmarks: BTreeMap<String, usize>,
+    /// Each cross-reference: where what it shows starts and ends, and the bookmark it points at.
+    refs: Vec<(Spot, usize, String)>,
 }
 
 impl Reader<'_, '_> {
@@ -559,6 +577,12 @@ impl Reader<'_, '_> {
                     }
                 }
                 Some("ins" | "moveTo" | "customXml" | "smartTag") => self.wrapped(node, rels, out),
+                // A bookmark between paragraphs marks the one after it.
+                Some("bookmarkStart") => {
+                    if let Some(name) = node.attr("name") {
+                        self.bookmarks.entry(name.to_owned()).or_insert(self.paras);
+                    }
+                }
                 // A comment can start and end between paragraphs.
                 Some("commentRangeStart") => self.span(node).0 = Some(Spot { para: self.paras, at: 0 }),
                 Some("commentRangeEnd") => {
@@ -596,6 +620,8 @@ impl Reader<'_, '_> {
         // Body text is measured against the default style, so what another style adds to it shows as marks.
         let (expected, baseline) = match role {
             Role::Body => (self.normal.0.align, self.normal.1.clone()),
+            // The page sets the row that heads a table itself. Anywhere else the style's look is marks.
+            Role::ColumnHead if self.cells == 0 => (self.normal.0.align, self.normal.1.clone()),
             _ => (style.align, styled.clone()),
         };
         let mut para = Para {
@@ -614,9 +640,12 @@ impl Reader<'_, '_> {
             lang: None,
             breaks: false,
             broken: false,
+            counted: None,
         };
         self.inline(node, &Inline { rels, link: None, depth: 0 }, &mut para);
-        if !para.is_blank() && props.align.unwrap_or(Align::Start) != expected.unwrap_or(Align::Start) {
+        // How a cell is aligned is its column's to say.
+        let aligned = self.cells > 0 || props.align.unwrap_or(Align::Start) == expected.unwrap_or(Align::Start);
+        if !para.is_blank() && !aligned {
             self.whole(DIRECT);
         }
         // A break before the text starts this block on a new page, and one after it the block that follows.
@@ -679,6 +708,15 @@ impl Reader<'_, '_> {
             }
             runs.retain(|run| !run.text.is_empty());
         }
+        // A caption under a picture is the picture's own text, and the page writes its number.
+        let captioned = !blank && para.role == Role::Caption && captions(out.blocks.last()) && after.is_empty();
+        let mut numbered = false;
+        if captioned {
+            let text: String = runs.iter().map(|run| run.text.as_str()).collect();
+            cut = label(&text, para.counted.as_ref());
+            numbered = cut > 0;
+            skip(&mut runs, cut);
+        }
         let place = |reader: &mut Self, block: &BlockId, base: usize| {
             if !reader.detached {
                 reader.placed.insert(para.index, Place { block: block.clone(), base, cut, len: para.len - cut });
@@ -722,14 +760,27 @@ impl Reader<'_, '_> {
                 self.push(block, out);
                 out.open = Open::Code;
             }
-        } else if para.role == Role::Caption && captions(out.blocks.last()) && after.is_empty() {
-            let figure = out.blocks.last_mut().expect("a figure was just found");
-            runs.iter_mut().for_each(|run| run.lang = None);
+        } else if captioned {
             merge(&mut runs);
-            figure.extra.insert("content".into(), Run::list_to_value(&runs));
-            let id = figure.id.clone();
-            place(self, &id, 0);
-            self.attach(&id, &notes);
+            let caption = Block { body: Body::Text(runs), ..Block::new(self.id(), BlockKind::Caption) };
+            let pictured = out.blocks.last_mut().expect("a picture was just found");
+            let id = match (&mut pictured.kind, &mut pictured.body) {
+                (BlockKind::Gallery { numbered: counted }, Body::Blocks(inner)) => {
+                    *counted = numbered;
+                    inner.push(caption);
+                    inner.last().map(|caption| caption.id.clone())
+                }
+                (BlockKind::Figure { numbered: counted, .. }, body) => {
+                    *counted = numbered;
+                    *body = caption.body;
+                    Some(pictured.id.clone())
+                }
+                _ => None,
+            };
+            if let Some(id) = id {
+                place(self, &id, 0);
+                self.attach(&id, &notes);
+            }
         } else {
             let list = match (para.task, level) {
                 (Some(checked), level) => Some((ListKind::Task { checked }, level.map_or(0, |(_, depth, _)| depth))),
@@ -739,7 +790,12 @@ impl Reader<'_, '_> {
             let item = list.map(|(list, depth)| BlockKind::ListItem { list, depth });
             // An equation with a paragraph to itself is set as a display.
             let alone = matches!(runs.as_slice(), [Run { marks, link: None, .. }] if marks.contains(&Mark::Math));
-            let text = item.unwrap_or(if alone { BlockKind::Formula } else { BlockKind::Paragraph });
+            let text = item.unwrap_or(match para.role {
+                _ if alone => BlockKind::Formula,
+                // A caption with no picture over it is still a line in the caption style.
+                Role::Caption => BlockKind::Caption,
+                _ => BlockKind::Paragraph,
+            });
             let (kind, wrapper) = match para.role {
                 Role::Heading(level) => {
                     if level > 4 {
@@ -808,6 +864,14 @@ impl Reader<'_, '_> {
             }
         }
 
+        let pictures = after.iter().all(|block| matches!(block.kind, BlockKind::Figure { .. }));
+        if blank && after.len() > 1 && pictures {
+            // Pictures that share a paragraph and nothing else stand side by side.
+            self.close(out);
+            let mut gallery = Block::new(self.id(), BlockKind::Gallery { numbered: false });
+            gallery.body = Body::Blocks(std::mem::take(&mut after));
+            self.push(gallery, out);
+        }
         if !after.is_empty() {
             self.close(out);
             for block in after.drain(..) {
@@ -830,45 +894,119 @@ impl Reader<'_, '_> {
         }
     }
 
-    /// Reads a table. The document holds none yet, so each row becomes a line of its cells.
+    /// Reads a table. A cell holds text alone, so whatever else one held becomes lines of it.
     fn table(&mut self, table: Node, rels: &Rels, out: &mut Out) {
         self.close(out);
-        let mut first = true;
+        let rows = parts(table, "tr", "tbl");
+        if rows.iter().all(|row| parts(*row, "tc", "tr").len() < 2) {
+            // A table of one column frames its paragraphs, which read on as they are.
+            out.pending.push(FRAME);
+            for cell in rows.iter().flat_map(|row| parts(*row, "tc", "tr")) {
+                self.wrapped(cell, rels, out);
+            }
+            self.close(out);
+            return;
+        }
+
+        let on =
+            |switch: Option<Node>| switch.is_some_and(|switch| !matches!(switch.val(), Some("0" | "false" | "off")));
+        let heads = rows.first().and_then(|row| row.child("trPr")).and_then(|props| props.child("tblHeader"));
+        let style = table.child("tblPr").and_then(|props| props.value("tblStyle"));
+        let header = on(heads) || first_row(table) && style.is_some_and(|style| self.styles.heads(style));
+        let (mut merged, mut flattened) = (false, false);
+        let mut columns: Vec<Option<Align>> = Vec::new();
+        let mut lines = Vec::new();
         let mut after = Vec::new();
-        let rows =
-            table.descendants().filter(|node| node.is("tr") && node.ancestors().find(|a| a.is("tbl")) == Some(table));
+        self.cells += 1;
         for row in rows {
-            let (from, noted) = (self.paras, self.notes.len());
-            let mut runs: Vec<Run> = Vec::new();
-            let mut moved = BTreeMap::new();
-            let cells =
-                row.descendants().filter(|node| node.is("tc") && node.ancestors().find(|a| a.is("tr")) == Some(row));
-            for (index, cell) in cells.enumerate() {
-                if index > 0 {
-                    runs.push(Run::plain("\t"));
-                }
+            let skipped = row.child("trPr").and_then(|props| props.number::<usize>("gridBefore")).unwrap_or(0);
+            let mut line: Vec<Block> = (0..skipped.min(MAX_SPAN)).map(|_| self.cell(Vec::new())).collect();
+            for cell in parts(row, "tc", "tr") {
+                let props = cell.child("tcPr");
+                let across = props.and_then(|props| props.number::<usize>("gridSpan")).unwrap_or(1).clamp(1, MAX_SPAN);
+                merged |= across > 1 || props.is_some_and(|props| props.child("vMerge").is_some());
+                let (from, noted) = (self.paras, self.notes.len());
                 let blocks = self.blocks(cell, rels);
+                // Paragraphs become lines and a formula stays one inside its line, which is no loss to name.
+                let kept = |kind: &BlockKind| {
+                    use BlockKind::{Figure, Formula, Gallery, Paragraph};
+                    matches!(kind, Paragraph | Formula | Figure { .. } | Gallery { .. })
+                };
+                flattened |= blocks.iter().any(|block| !kept(&block.kind));
+                let (mut runs, mut moved) = (Vec::new(), BTreeMap::new());
                 flatten(blocks, &mut runs, &mut moved, &mut after);
+                merge(&mut runs);
+                let block = self.cell(runs);
+                self.replace(from, noted, &moved, &block.id);
+                columns.resize(columns.len().max(line.len() + across), None);
+                // The first cell of a column to say how it is aligned says it for the column.
+                let align = cell.children().find(|inner| inner.is("p")).and_then(|first| {
+                    let direct = first.child("pPr").map(ParaProps::read).unwrap_or_default();
+                    let (style, _) = self.styles.paragraph(direct.style.as_deref());
+                    direct.over(&style).align
+                });
+                columns[line.len()] = columns[line.len()].or(align);
+                line.push(block);
+                line.extend((1..across).map(|_| self.cell(Vec::new())));
             }
-            merge(&mut runs);
-            if runs.iter().all(|run| run.text.trim().is_empty()) {
-                // A row of nothing leaves no block for its places and notes to be on.
-                self.placed.retain(|para, place| *para < from || !moved.contains_key(&place.block));
-                let mut made = self.notes.split_off(noted.min(self.notes.len()));
-                made.retain(|note| !moved.contains_key(&BlockId::new(&note.block)));
-                self.notes.append(&mut made);
-                continue;
+            let mut row = Block::new(self.id(), BlockKind::TableRow);
+            row.body = Body::Blocks(line);
+            lines.push(row);
+        }
+        self.cells -= 1;
+
+        let columns = columns.into_iter().map(|align| align.unwrap_or(Align::Start)).collect();
+        let mut block = Block::new(self.id(), BlockKind::Table { columns, header });
+        block.body = Body::Blocks(lines);
+        let id = block.id.clone();
+        self.push(block, out);
+        for (happened, message) in [(merged, MERGED), (flattened, CELLS)] {
+            if happened {
+                self.note(&id, message);
             }
-            let mut block = Block::new(self.id(), BlockKind::Paragraph);
-            block.body = Body::Text(runs);
-            self.replace(from, noted, &moved, &block.id);
-            if std::mem::take(&mut first) {
-                self.note(&block.id, TABLE);
-            }
-            self.push(block, out);
         }
         for block in after {
+            self.note(&block.id, PICTURE_OUT);
             self.push(block, out);
+        }
+    }
+
+    fn cell(&mut self, runs: Vec<Run>) -> Block {
+        Block { body: Body::Text(runs), ..Block::new(self.id(), BlockKind::TableCell) }
+    }
+
+    /// Makes each cross-reference to a picture's caption a reference to the picture.
+    fn refer(&mut self, blocks: &mut [Block]) {
+        fn find<'b>(blocks: &'b mut [Block], id: &BlockId) -> Option<&'b mut Block> {
+            blocks.iter_mut().find_map(|block| {
+                if block.id == *id {
+                    return Some(block);
+                }
+                match &mut block.body {
+                    Body::Blocks(inner) => find(inner, id),
+                    _ => None,
+                }
+            })
+        }
+        /// The picture or the pictures a caption belongs to.
+        fn pictured(blocks: &[Block], caption: &BlockId) -> Option<BlockId> {
+            blocks.iter().find_map(|block| match (&block.kind, &block.body) {
+                (BlockKind::Figure { .. }, _) => (block.id == *caption).then(|| block.id.clone()),
+                (BlockKind::Gallery { .. }, Body::Blocks(inner)) => {
+                    inner.iter().any(|held| held.id == *caption).then(|| block.id.clone())
+                }
+                (_, Body::Blocks(inner)) => pictured(inner, caption),
+                _ => None,
+            })
+        }
+        for (from, to, bookmark) in std::mem::take(&mut self.refs) {
+            let caption = self.bookmarks.get(&bookmark).and_then(|para| self.placed.get(para));
+            let Some(target) = caption.and_then(|place| pictured(blocks, &place.block)) else { continue };
+            let Some((place, start)) = self.locate(from) else { continue };
+            let Some((_, end)) = self.locate(Spot { para: from.para, at: to }) else { continue };
+            if let Some(Block { body: Body::Text(runs), .. }) = find(blocks, &place.block.clone()) {
+                mark(runs, start..end, Mark::Ref(target));
+            }
         }
     }
 
@@ -893,18 +1031,103 @@ impl Reader<'_, '_> {
     }
 }
 
-/// Whether the last block is a picture that has no caption yet.
+/// Whether the last block is a picture, or pictures side by side, with no caption yet.
 fn captions(last: Option<&Block>) -> bool {
-    last.is_some_and(|block| {
-        matches!(&block.kind, BlockKind::Unknown { type_name } if type_name == "figure")
-            && !block.extra.contains_key("content")
+    last.is_some_and(|block| match &block.kind {
+        BlockKind::Figure { .. } => block.body.runs().is_empty(),
+        BlockKind::Gallery { .. } => !block.body.blocks().iter().any(|held| held.kind == BlockKind::Caption),
+        _ => false,
     })
+}
+
+/// How many bytes at the start of a caption are a label and a number, such as "Figure 2: ", which the page
+/// writes by itself. Word counts with a field after one word. A caption typed by hand reads the same only
+/// where the number ends it or a mark follows, so that "Figure 2 shows the lot" stays as it is.
+fn label(text: &str, counted: Option<&Range<usize>>) -> usize {
+    let typed = counted.is_none();
+    let end = match counted {
+        Some(counted) => {
+            let word = text.get(..counted.start).unwrap_or_default().trim_end();
+            (!word.is_empty() && !word.contains(char::is_whitespace)).then_some(counted.end)
+        }
+        None => text.strip_prefix("Figure ").and_then(|rest| {
+            let digits = rest.len() - rest.trim_start_matches(|digit: char| digit.is_ascii_digit()).len();
+            (digits > 0).then_some("Figure ".len() + digits)
+        }),
+    };
+    let Some(rest) = end.and_then(|end| text.get(end..)) else { return 0 };
+    let rest = rest.trim_start();
+    let marked = rest.strip_prefix([':', '.', '-', '\u{2013}', '\u{2014}']);
+    if typed && marked.is_none() && !rest.is_empty() {
+        return 0;
+    }
+    text.len() - marked.unwrap_or(rest).trim_start().len()
+}
+
+/// Takes bytes off the start of runs.
+fn skip(runs: &mut Vec<Run>, mut bytes: usize) {
+    for run in runs.iter_mut() {
+        let cut = bytes.min(run.text.len());
+        if run.text.is_char_boundary(cut) {
+            run.text.drain(..cut);
+        }
+        bytes -= cut;
+    }
+    runs.retain(|run| !run.text.is_empty());
+}
+
+/// Adds a mark to a passage of runs, cutting the runs it starts and ends in.
+fn mark(runs: &mut Vec<Run>, passage: Range<usize>, mark: Mark) {
+    let mut at = 0;
+    let mut cut = Vec::with_capacity(runs.len() + 2);
+    for run in runs.drain(..) {
+        let (start, end) = (at, at + run.text.len());
+        at = end;
+        // Where the passage starts and ends inside this run, if it does.
+        let inside =
+            |edge: usize| (edge > start && edge < end && run.text.is_char_boundary(edge - start)).then(|| edge - start);
+        let mut edges = vec![0];
+        edges.extend(inside(passage.start));
+        edges.extend(inside(passage.end));
+        edges.push(run.text.len());
+        for pair in edges.windows(2).filter(|pair| pair[0] < pair[1]) {
+            let mut piece = Run { text: run.text[pair[0]..pair[1]].to_owned(), ..run.clone() };
+            if start + pair[0] >= passage.start && start + pair[1] <= passage.end {
+                piece.marks.insert(mark.clone());
+            }
+            cut.push(piece);
+        }
+    }
+    *runs = cut;
+}
+
+/// The rows of a table or the cells of a row, whatever wraps them, and none of a table further in.
+fn parts<'a, 'input>(of: Node<'a, 'input>, name: &str, outer: &str) -> Vec<Node<'a, 'input>> {
+    let own = |node: &Node| node.ancestors().skip(1).find(|above| above.is(outer)) == Some(of);
+    of.descendants().filter(|node| node.is(name) && own(node)).collect()
+}
+
+/// The most columns one cell is taken to span. A file can claim any number.
+const MAX_SPAN: usize = 64;
+
+/// Whether a table asks for the look its style gives a first row.
+fn first_row(table: Node) -> bool {
+    let Some(look) = table.child("tblPr").and_then(|props| props.child("tblLook")) else { return false };
+    match look.attr("firstRow") {
+        Some(first) => matches!(first, "1" | "true" | "on"),
+        // Older files pack the switches into one number.
+        None => look.val().and_then(|bits| u32::from_str_radix(bits, 16).ok()).is_some_and(|bits| bits & 0x20 != 0),
+    }
 }
 
 /// Joins the text of blocks into one list of runs, a line for each block. Pictures cannot join text, so they
 /// are set aside. `moved` records where each block's text starts in the result.
 fn flatten(blocks: Vec<Block>, runs: &mut Vec<Run>, moved: &mut BTreeMap<BlockId, usize>, aside: &mut Vec<Block>) {
     for block in blocks {
+        if matches!(block.kind, BlockKind::Figure { .. } | BlockKind::Gallery { .. }) {
+            aside.push(block);
+            continue;
+        }
         match block.body {
             Body::Text(mut text) => {
                 // A formula keeps being one inside the line.
@@ -923,7 +1146,6 @@ fn flatten(blocks: Vec<Block>, runs: &mut Vec<Run>, moved: &mut BTreeMap<BlockId
                 moved.insert(block.id, runs.iter().map(|run| run.text.len()).sum());
                 flatten(inner, runs, moved, aside);
             }
-            Body::None if matches!(&block.kind, BlockKind::Unknown { .. }) => aside.push(block),
             Body::None => {}
         }
     }

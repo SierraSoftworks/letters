@@ -91,10 +91,10 @@ fn try_export(export: &Export) -> Result<(), String> {
 /// What the format cannot carry over, a line for each kind of loss.
 fn simplified(document: &Document, to: Format) -> Vec<String> {
     let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    // Only HTML and Word write figures yet, whether the model holds one as such or as an unknown block.
+    // Only HTML and Word write figures yet. HTML also takes one that a reader handed over as an unknown block.
     let pictured = matches!(to, Format::Html | Format::Docx);
     let lost = |block: &&Block| match &block.kind {
-        BlockKind::Unknown { type_name } => !(pictured && type_name == "figure"),
+        BlockKind::Unknown { type_name } => !(to == Format::Html && type_name == "figure"),
         BlockKind::Figure { .. } => !pictured,
         _ => false,
     };

@@ -132,7 +132,7 @@ impl Reader<'_, '_> {
     }
 
     /// The block a spot ended up in, and the bytes into its text.
-    fn locate(&self, spot: Spot) -> Option<(&Place, usize)> {
+    pub(super) fn locate(&self, spot: Spot) -> Option<(&Place, usize)> {
         if let Some(place) = self.placed.get(&spot.para) {
             return Some((place, place.base + spot.at.saturating_sub(place.cut).min(place.len)));
         }

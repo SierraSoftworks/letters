@@ -79,6 +79,10 @@ const STYLES: &str = r#"
 <w:style w:type="character" w:styleId="Link"><w:name w:val="Hyperlink"/>
   <w:rPr><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr></w:style>
 <w:style w:type="character" w:styleId="Strong"><w:name w:val="Strong"/><w:rPr><w:b/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Head"><w:name w:val="Table Heading"/><w:basedOn w:val="Std"/>
+  <w:rPr><w:b/></w:rPr></w:style>
+<w:style w:type="table" w:styleId="Grid"><w:name w:val="Table Grid"/>
+  <w:tblStylePr w:type="firstRow"><w:rPr><w:b/></w:rPr></w:tblStylePr></w:style>
 "#;
 
 /// Lists by id: 1 bullets, 2 numbers, 3 numbers from 5, 4 open tasks, 5 ticked tasks, 6 an indent with no marker.
@@ -307,21 +311,67 @@ fn said(runs: &[Run]) -> String {
     runs.iter().map(|run| run.text.as_str()).collect()
 }
 
+/// A field as Word writes one it has worked out: its instructions, then what they last came to.
+fn field(code: &str, shown: &str) -> String {
+    let mark = |kind: &str| format!(r#"<w:r><w:fldChar w:fldCharType="{kind}"/></w:r>"#);
+    format!(
+        "{}<w:r><w:instrText>{code}</w:instrText></w:r>{}{}{}",
+        mark("begin"),
+        mark("separate"),
+        t(shown),
+        mark("end")
+    )
+}
+
+/// The same field as tools that write it in one piece do.
+fn simple_field(code: &str, shown: &str) -> String {
+    format!(r#"<w:fldSimple w:instr="{code}">{}</w:fldSimple>"#, t(shown))
+}
+
 /// The pictures of a document: what each shows, its alternative text and its caption.
-///
-/// The model has no figure yet, so one is an unknown block with its fields beside it.
 fn pictures(doc: &Document) -> Vec<(String, String, String)> {
-    let figure = |block: &Block| {
-        let field = |name: &str| block.extra.get(name).and_then(|value| value.as_str()).map(str::to_owned);
-        let caption =
-            block.extra.get("content").cloned().map(|runs| Run::list_from_value(runs, "content").expect("runs"));
-        let shown = field("asset").or_else(|| field("src"))?;
-        Some((shown, field("alt").unwrap_or_default(), said(&caption.unwrap_or_default())))
+    let figure = |block: &Block| match &block.kind {
+        BlockKind::Figure { asset, src, alt, .. } => {
+            Some((asset.clone().or_else(|| src.clone())?, alt.clone(), block.plain_text()))
+        }
+        _ => None,
     };
-    doc.walk()
-        .filter(|block| matches!(&block.kind, BlockKind::Unknown { type_name } if type_name == "figure"))
-        .filter_map(figure)
-        .collect()
+    doc.walk().filter_map(figure).collect()
+}
+
+/// A document as `outline` writes it, with every asset under one name. An import names a picture after
+/// what it holds, which no case could spell out.
+fn shape(doc: &Document) -> Vec<String> {
+    fn rename(blocks: &mut [Block]) {
+        for block in blocks {
+            if let BlockKind::Figure { asset: Some(name), .. } = &mut block.kind {
+                *name = "asset".into();
+            }
+            if let Body::Blocks(inner) = &mut block.body {
+                rename(inner);
+            }
+        }
+    }
+    let mut doc = doc.clone();
+    rename(&mut doc.blocks);
+    outline(&doc)
+}
+
+/// The references of a document: what each reads as, and the caption of the figure it is to.
+fn references(doc: &Document) -> Vec<(String, String)> {
+    let caption = |id: &BlockId| {
+        let figure = doc.block(id).expect("a reference names a block of the document");
+        let under = figure.body.blocks().iter().find(|part| part.kind == BlockKind::Caption);
+        under.unwrap_or(figure).plain_text()
+    };
+    let refers = |run: &Run| {
+        let to = run.marks.iter().find_map(|mark| match mark {
+            Mark::Ref(figure) => Some(caption(figure)),
+            _ => None,
+        });
+        Some((run.text.clone(), to?))
+    };
+    doc.walk().flat_map(|block| block.body.runs()).filter_map(refers).collect()
 }
 
 #[test]
@@ -409,6 +459,7 @@ fn a_style_shows_as_marks_only_where_it_differs_from_its_block() {
         (styled("Q", "x"), r#"  p "x""#),
         // A paragraph style of body text that slants it has nowhere else to say so.
         (styled("Stressed", "x"), r#"p "<italic|x>""#),
+        (styled("Head", "x"), r#"p "<bold|x>""#),
         // Emphasis a run asks for itself is kept, even where the style is as heavy.
         (para(r#"<w:pStyle w:val="H1"/>"#, &(t("a ") + &run("<w:b/>", "b"))), r#"h1 "a <bold|b>""#),
         (para(r#"<w:pStyle w:val="H1"/>"#, &run(r#"<w:b w:val="0"/><w:i/>"#, "x")), r#"h1 "<italic|x>""#),
@@ -724,13 +775,6 @@ fn keeps_the_text_of_what_it_simplifies_and_says_so() {
         p("In a box"),
         p("In a box"),
     );
-    let table = format!(
-        "<w:tbl><w:tr><w:tc>{}</w:tc><w:tc>{}</w:tc></w:tr><w:tr><w:tc>{}{}</w:tc><w:tc><w:p/></w:tc></w:tr></w:tbl>",
-        p("Name"),
-        p("Age"),
-        p("Ada"),
-        p("Lovelace"),
-    );
     let chart = r#"<w:p><w:r><w:t>Chart: </w:t></w:r><w:r><w:drawing><wp:inline><a:graphic/></wp:inline></w:drawing></w:r></w:p>"#;
     // Roots inside roots, further down than a formula is typeset.
     let deep = (0..40).fold(m("x"), |inner, _| structure("rad", "", &[("deg", String::new()), ("e", inner)]));
@@ -768,7 +812,6 @@ fn keeps_the_text_of_what_it_simplifies_and_says_so() {
             "link",
         ),
         (boxed, &["Beside", "In a box"], "Text box"),
-        (table, &["Name\tAge", "Ada\nLovelace\t"], "Table"),
         (chart.to_owned(), &["Chart: "], "drawing"),
         (styled("T", "Report"), &["Report"], "Title"),
         (styled("H6", "Deep"), &["Deep"], "level 6"),
@@ -949,7 +992,7 @@ fn reads_pictures_as_assets() {
     // A picture among words gets a block of its own, and one shown twice is kept once.
     let inline = format!("<w:p>{}{}{}</w:p>", t("Before "), picture(embedded, ""), t("after"));
     let twice = read(&word(&(inline + &format!("<w:p>{}</w:p>", picture(embedded, "")))).picture("png", PNG));
-    assert_eq!(outline(&twice.document), [r#"p "Before after""#, "unknown:figure", "unknown:figure"]);
+    assert_eq!(shape(&twice.document), [r#"p "Before after""#, r#"figure asset [] """#, r#"figure asset [] """#]);
     assert_eq!(twice.assets.len(), 1);
     assert!(twice.notes.iter().any(|note| note.message.contains("Picture moved")), "{:?}", twice.notes);
 
@@ -971,6 +1014,188 @@ fn reads_pictures_as_assets() {
     );
     assert_eq!(shown(&remote), [("https://example.com/p.png".to_owned(), "Far".to_owned(), String::new())]);
     assert!(remote.assets.is_empty());
+}
+
+#[test]
+fn reads_a_caption_as_its_pictures_text_and_its_label_as_a_number() {
+    let shot = picture(r#"r:embed="png""#, "A chart");
+    let alone = format!("<w:p>{shot}</w:p>");
+    let caption = |inner: &str| para(r#"<w:pStyle w:val="Cap"/>"#, inner);
+    let count = |number: &str| simple_field(r" SEQ Figure \* ARABIC ", number);
+    let cases: &[(String, &[&str])] = &[
+        (alone.clone() + &caption(&t("Sales by year")), &[r#"figure asset [A chart] "Sales by year""#]),
+        // Word counts figures with a field, and the page counts them itself.
+        (
+            alone.clone() + &caption(&(t("Figure ") + &count("3") + &t(": Sales"))),
+            &[r##"figure# asset [A chart] "Sales""##],
+        ),
+        (
+            alone.clone()
+                + &caption(&(t("Abbildung ") + &field(r" SEQ Abbildung \* ARABIC ", "2") + &t(" \u{2013} Umsatz"))),
+            &[r##"figure# asset [A chart] "Umsatz""##],
+        ),
+        (alone.clone() + &caption(&(t("Figure ") + &count("1"))), &[r##"figure# asset [A chart] """##]),
+        // A label typed by hand reads the same, and a sentence that opens like one does not.
+        (
+            alone.clone() + &caption(&(t("Figure 12. ") + &run("<w:i/>", "Sales"))),
+            &[r##"figure# asset [A chart] "<italic|Sales>""##],
+        ),
+        (
+            alone.clone() + &caption(&t("Figure 8 shows the lot")),
+            &[r#"figure asset [A chart] "Figure 8 shows the lot""#],
+        ),
+        // Pictures that share a paragraph stand side by side over one caption.
+        (
+            format!("<w:p>{shot}{shot}</w:p>") + &caption(&(t("Figure ") + &count("1") + &t(": Both"))),
+            &["gallery#", r#"  figure asset [A chart] """#, r#"  figure asset [A chart] """#, r#"  caption "Both""#],
+        ),
+        // A caption with no picture over it is a line of its own, as is a second one.
+        (p("Words") + &caption(&t("Figure 1: Loose")), &[r#"p "Words""#, r#"caption "Figure 1: Loose""#]),
+        (
+            alone.clone() + &caption(&t("One")) + &caption(&t("Two")),
+            &[r#"figure asset [A chart] "One""#, r#"caption "Two""#],
+        ),
+    ];
+    for (body, expected) in cases {
+        let import = read(&word(body).picture("png", PNG));
+        assert_eq!(shape(&import.document), *expected, "reading {body}");
+        assert_eq!(import.notes, [], "reading {body}");
+    }
+}
+
+#[test]
+fn reads_a_cross_reference_to_a_caption_as_a_reference_to_its_figure() {
+    let label = simple_field(r" SEQ Figure \* ARABIC ", "1");
+    let marked =
+        format!(r#"<w:bookmarkStart w:id="0" w:name="_Ref42"/>{}{label}<w:bookmarkEnd w:id="0"/>"#, t("Figure "));
+    let captioned = format!("<w:p>{}</w:p>", picture(r#"r:embed="png""#, ""))
+        + &para(r#"<w:pStyle w:val="Cap"/>"#, &(marked + &t(": Sales")));
+    let to_figure: &[(&str, &str)] = &[("Figure 1", "Sales")];
+    let cases = [
+        (simple_field(r" REF _Ref42 \h ", "Figure 1"), to_figure),
+        (field(r" REF _Ref42 \h ", "Figure 1"), to_figure),
+        // One to what is no figure, or one that shows a page, stays the words Word last showed.
+        (simple_field(r" REF _Ref7 \h ", "Figure 1"), &[]),
+        (field(r" PAGEREF _Ref42 \h ", "Figure 1"), &[]),
+    ];
+    for (reference, expected) in cases {
+        // A reference can come before what it points at.
+        let body = format!("<w:p>{}{reference}{}</w:p>{captioned}", t("See "), t(" for more."));
+        let import = read(&word(&body).picture("png", PNG));
+        let found = references(&import.document);
+        let found: Vec<(&str, &str)> = found.iter().map(|(text, to)| (text.as_str(), to.as_str())).collect();
+        assert_eq!(found, expected, "reading {reference}");
+        assert_eq!(import.document.blocks[0].plain_text(), "See Figure 1 for more.", "reading {reference}");
+    }
+}
+
+#[test]
+fn reads_tables() {
+    let cell = |props: &str, inner: &str| format!("<w:tc><w:tcPr>{props}</w:tcPr>{inner}</w:tc>");
+    let plain = |text: &str| format!("<w:tc>{}</w:tc>", p(text));
+    let set = |align: &str, text: &str| cell("", &para(&format!(r#"<w:jc w:val="{align}"/>"#), &t(text)));
+    let row = |props: &str, cells: &str| format!("<w:tr><w:trPr>{props}</w:trPr>{cells}</w:tr>");
+    let table = |props: &str, rows: &str| format!("<w:tbl><w:tblPr>{props}</w:tblPr>{rows}</w:tbl>");
+    let people = |heads: &str| row(heads, &(plain("Name") + &plain("Age"))) + &row("", &(plain("Ada") + &plain("36")));
+    let read_people =
+        [r#"  row"#, r#"    cell "Name""#, r#"    cell "Age""#, r#"  row"#, r#"    cell "Ada""#, r#"    cell "36""#];
+    let headed = |first: &'static str| [&[first][..], &read_people[..]].concat();
+    let picture = format!("<w:p>{}</w:p>", picture(r#"r:embed="png""#, ""));
+    // The body, the document it reads as, and a word of each note the import makes.
+    let cases: &[(String, Vec<&str>, &[&str])] = &[
+        (table("", &people("<w:tblHeader/>")), headed("table:start,start headed"), &[]),
+        (table("", &people("")), headed("table:start,start"), &[]),
+        // A style that sets a first row apart heads the tables that ask for that look.
+        (
+            table(r#"<w:tblStyle w:val="Grid"/><w:tblLook w:firstRow="1"/>"#, &people("")),
+            headed("table:start,start headed"),
+            &[],
+        ),
+        (
+            table(r#"<w:tblStyle w:val="Grid"/><w:tblLook w:val="0400"/>"#, &people("")),
+            headed("table:start,start"),
+            &[],
+        ),
+        // The page sets a row that heads a table itself, so what the style of its cells adds is no mark.
+        (
+            table("", &row("<w:tblHeader/>", &(cell("", &styled("Head", "Name")) + &cell("", &styled("Head", "Age"))))),
+            vec!["table:start,start headed", "  row", r#"    cell "Name""#, r#"    cell "Age""#],
+            &[],
+        ),
+        // A column is set as the first of its cells to say so is.
+        (
+            table(
+                "",
+                &(row("", &(plain("a") + &plain("b") + &set("right", "c")))
+                    + &row("", &(plain("d") + &set("center", "e") + &set("left", "f")))),
+            ),
+            vec![
+                "table:start,center,end",
+                "  row",
+                r#"    cell "a""#,
+                r#"    cell "b""#,
+                r#"    cell "c""#,
+                "  row",
+                r#"    cell "d""#,
+                r#"    cell "e""#,
+                r#"    cell "f""#,
+            ],
+            &[],
+        ),
+        // A cell that spans columns is the first of them, and the rest are empty.
+        (
+            table(
+                "",
+                &(row("", &(cell(r#"<w:gridSpan w:val="2"/>"#, &p("Wide")) + &plain("c")))
+                    + &row("", &(plain("a") + &plain("b") + &plain("c")))),
+            ),
+            vec![
+                "table:start,start,start",
+                "  row",
+                r#"    cell "Wide""#,
+                r#"    cell """#,
+                r#"    cell "c""#,
+                "  row",
+                r#"    cell "a""#,
+                r#"    cell "b""#,
+                r#"    cell "c""#,
+            ],
+            &["Merged"],
+        ),
+        // A cell holds text alone: its paragraphs are lines of it, and so is whatever else it held.
+        (
+            table(
+                "",
+                &row(
+                    "",
+                    &(cell("", &(p("Ada") + &p("Lovelace")))
+                        + &cell("", &(styled("H2", "Head") + &item(1, 0, "point")))),
+                ),
+            ),
+            vec!["table:start,start", "  row", r#"    cell "Ada\nLovelace""#, r#"    cell "Head\npoint""#],
+            &["Lists, headings and tables"],
+        ),
+        (
+            table("", &row("", &(plain("a") + &cell("", &picture)))),
+            vec!["table:start,start", "  row", r#"    cell "a""#, r#"    cell """#, r#"figure asset [] """#],
+            &["out of its table"],
+        ),
+        // A table of one column only frames what it holds.
+        (
+            table("", &(row("", &plain("One")) + &row("", &plain("Two")))),
+            vec![r#"p "One""#, r#"p "Two""#],
+            &["one column"],
+        ),
+    ];
+    for (body, expected, notes) in cases {
+        let import = read(&word(body).picture("png", PNG));
+        assert_eq!(shape(&import.document), *expected, "reading {body}");
+        let said: Vec<&str> = import.notes.iter().map(|note| note.message.as_str()).collect();
+        assert_eq!(said.len(), notes.len(), "reading {body}: {said:?}");
+        for note in *notes {
+            assert!(said.iter().any(|message| message.contains(note)), "no note of {note:?} reading {body}: {said:?}");
+        }
+    }
 }
 
 #[test]
@@ -1024,8 +1249,9 @@ fn document(markdown: &str) -> Document {
     doc
 }
 
+/// A document as a Word file, with the same picture for every asset it names.
 fn export(doc: &Document) -> Vec<u8> {
-    to_docx(doc, &Style::default(), &Notes::default(), "Report", &mut |_| None)
+    to_docx(doc, &Style::default(), &Notes::default(), "Report", &mut |_| Some(PNG.to_vec()))
 }
 
 /// What a document comes back as from the Word file it is written to.
@@ -1052,13 +1278,31 @@ fn paragraph(id: &str, runs: Vec<Run>) -> Block {
     Block { body: Body::Text(runs), ..Block::new(id, BlockKind::Paragraph) }
 }
 
-fn figure(id: &str, fields: &[(&str, &str)], caption: &str) -> Block {
-    let mut block = Block::new(id, BlockKind::Unknown { type_name: "figure".into() });
-    block.extra.extend(fields.iter().map(|(name, value)| ((*name).to_owned(), (*value).into())));
-    block.extra.insert("width".into(), 120.into());
-    block.extra.insert("height".into(), 80.into());
-    block.extra.insert("content".into(), Run::list_to_value(&[Run::plain(caption)]));
-    block
+/// A picture 120 points by 80 over a caption, which shows an asset or what is at an address.
+fn figure(id: &str, shows: &str, alt: &str, caption: &str) -> Block {
+    let (asset, src) = match shows.starts_with("https:") {
+        true => (None, Some(shows.to_owned())),
+        false => (Some(shows.to_owned()), None),
+    };
+    let kind = BlockKind::Figure { asset, src, alt: alt.into(), width: 120.0, height: 80.0, numbered: false };
+    Block::text(id, kind, caption)
+}
+
+/// A block that holds others.
+fn holding(id: &str, kind: BlockKind, blocks: Vec<Block>) -> Block {
+    Block { body: Body::Blocks(blocks), ..Block::new(id, kind) }
+}
+
+/// A table of plain text, a slice of cells for each row.
+fn table(id: &str, columns: &[Align], header: bool, rows: &[&[&str]]) -> Block {
+    let row = |(index, cells): (usize, &&[&str])| {
+        let cell = |(column, text): (usize, &&str)| {
+            Block::text(format!("{id}-{index}-{column}").as_str(), BlockKind::TableCell, *text)
+        };
+        holding(&format!("{id}-{index}"), BlockKind::TableRow, cells.iter().enumerate().map(cell).collect())
+    };
+    let kind = BlockKind::Table { columns: columns.to_vec(), header };
+    holding(id, kind, rows.iter().enumerate().map(row).collect())
 }
 
 fn comment(anchor: Anchor, author: &str, text: &str) -> Note {
@@ -1299,7 +1543,8 @@ fn the_style_is_written_as_word_styles_and_paragraphs_only_name_them() {
 #[test]
 fn the_parts_of_a_file_agree() {
     let mut doc = document(EVERYTHING);
-    doc.blocks.push(figure("fig", &[("asset", "assets/chart.png"), ("alt", "A chart")], "Sales"));
+    doc.blocks.push(figure("fig", "assets/chart.png", "A chart", "Sales"));
+    doc.blocks.push(table("t", &[Align::Start, Align::End], true, &[&["Item", "Price"], &["Pens", "3.50"]]));
     let first = doc.blocks[0].id.clone();
     let reply = Reply {
         author: "Grace".into(),
@@ -1414,10 +1659,10 @@ fn comments_survive_a_round_trip() {
 #[test]
 fn pictures_are_written_into_the_file() {
     let mut doc = document("Before");
-    doc.blocks.push(figure("held", &[("asset", "assets/chart.png"), ("alt", "A <chart>")], "Sales & costs"));
-    doc.blocks.push(figure("again", &[("asset", "assets/chart.png"), ("alt", "")], ""));
-    doc.blocks.push(figure("far", &[("src", "https://example.com/p.png"), ("alt", "Far")], ""));
-    doc.blocks.push(figure("lost", &[("asset", "assets/missing.png"), ("alt", "Lost")], "Its caption"));
+    doc.blocks.push(figure("held", "assets/chart.png", "A <chart>", "Sales & costs"));
+    doc.blocks.push(figure("again", "assets/chart.png", "", ""));
+    doc.blocks.push(figure("far", "https://example.com/p.png", "Far", ""));
+    doc.blocks.push(figure("lost", "assets/missing.png", "Lost", "Its caption"));
     let file = to_docx(&doc, &Style::default(), &Notes::default(), "Report", &mut |name| {
         (name == "assets/chart.png").then(|| PNG.to_vec())
     });
@@ -1434,6 +1679,143 @@ fn pictures_are_written_into_the_file() {
     assert!(lines.contains(&r#"p "<@https://example.com/p.png|Far>""#.to_owned()), "{lines:?}");
     let texts: Vec<String> = back.document.walk().map(Block::plain_text).collect();
     assert!(texts.contains(&"Lost".to_owned()) && texts.contains(&"Its caption".to_owned()), "{texts:?}");
+}
+
+#[test]
+fn figures_and_references_to_them_survive_a_round_trip() {
+    let numbered = |mut block: Block| {
+        if let BlockKind::Figure { numbered, .. } | BlockKind::Gallery { numbered } = &mut block.kind {
+            *numbered = true;
+        }
+        block
+    };
+    let to = |text: &str, figure: &str| Run::marked(text, [Mark::Ref(BlockId::new(figure))]);
+    let chart = "assets/chart.png";
+    let pair = vec![
+        figure("left", chart, "Left", ""),
+        figure("right", chart, "Right", ""),
+        Block::text("under", BlockKind::Caption, "Both years"),
+    ];
+    // A reference reads as the label of its figure, whatever its own text was when the figures last moved.
+    let words = vec![
+        Run::plain("See "),
+        to("Figure 1", "one"),
+        Run::plain(" and "),
+        to("Figure 9", "pair"),
+        Run::plain(", not "),
+        to("Figure ?", "gone"),
+        Run::plain(" or "),
+        to("the plain one", "plain"),
+        Run::plain("."),
+    ];
+    let blocks = vec![
+        paragraph("words", words),
+        numbered(figure("one", chart, "A chart", "Sales")),
+        figure("plain", chart, "", "Not counted"),
+        figure("bare", chart, "", ""),
+        numbered(holding("pair", BlockKind::Gallery { numbered: false }, pair)),
+        numbered(figure("last", chart, "", "")),
+    ];
+    let doc = Document { blocks, ..Document::default() };
+    let on_caption = comment(Anchor::range(BlockId::new("one"), 0..5), "Ada", "Which year?");
+    let notes = Notes { notes: vec![on_caption], ..Notes::default() };
+    let file = to_docx(&doc, &Style::default(), &notes, "Report", &mut |_| Some(PNG.to_vec()));
+    let back = import(&file, &Style::default()).expect("the export reads");
+
+    let lines = shape(&back.document);
+    assert_eq!(back.document.blocks[0].plain_text(), "See Figure 1 and Figure 2, not Figure ? or the plain one.");
+    assert_eq!(
+        lines[1..],
+        [
+            r#"figure# asset [A chart] "Sales""#,
+            r#"figure asset [] "Not counted""#,
+            r#"figure asset [] """#,
+            "gallery#",
+            r#"  figure asset [Left] """#,
+            r#"  figure asset [Right] """#,
+            r#"  caption "Both years""#,
+            r#"figure# asset [] """#,
+        ]
+    );
+    let read = references(&back.document);
+    assert_eq!(read, [("Figure 1".to_owned(), "Sales".to_owned()), ("Figure 2".to_owned(), "Both years".to_owned())]);
+    assert_eq!(anchored(&back.document, &back.comments[0].anchor), "Sales", "a comment stays on the caption's words");
+    assert_eq!(back.notes, []);
+
+    // Word keeps the numbers up itself: it counts each label with a field, and each reference names a label.
+    let body = part(&file, "word/document.xml");
+    let xml = roxmltree::Document::parse(&body).expect("the document is XML");
+    let codes = xml.descendants().filter(|node| node.tag_name().name() == "instrText");
+    let fields: Vec<&str> = codes.filter_map(|code| code.text()).map(str::trim).collect();
+    let named = |name: &'static str| fields.iter().filter_map(move |code| code.strip_prefix(name));
+    let labels: BTreeSet<String> = named("REF ").filter_map(|rest| rest.split(' ').next().map(str::to_owned)).collect();
+    assert!(labels.len() == 2 && labels.is_subset(&values(&body, "bookmarkStart", "name")), "{fields:?}");
+    let sequences: BTreeSet<&str> = named("SEQ ").collect();
+    assert_eq!((named("SEQ ").count(), sequences.len()), (3, 1), "each figure is counted in one sequence: {fields:?}");
+}
+
+#[test]
+fn a_gallery_is_written_in_the_rows_the_page_sets() {
+    let page = Style::default().page;
+    let measure = page.width - page.margin_left - page.margin_right;
+    // How many pictures a gallery holds, and how many share a row with each of them.
+    let cases: &[(usize, &[usize])] =
+        &[(2, &[2, 2]), (3, &[3, 3, 3]), (4, &[2, 2, 2, 2]), (5, &[3, 3, 3, 2, 2]), (7, &[3, 3, 3, 2, 2, 2, 2])];
+    for (count, expected) in cases {
+        let tiles = (0..*count).map(|index| figure(&format!("f{index}"), "assets/chart.png", "", "")).collect();
+        let gallery = holding("g", BlockKind::Gallery { numbered: false }, tiles);
+        let back = returned(&Document { blocks: vec![gallery], ..Document::default() }).document;
+        let beside = |block: &Block| match block.kind {
+            BlockKind::Figure { width, .. } => Some((measure / width).round() as usize),
+            _ => None,
+        };
+        assert_eq!(back.walk().filter_map(beside).collect::<Vec<_>>(), *expected, "{count} pictures");
+        assert_eq!(outline(&back).first().map(String::as_str), Some("gallery"), "{count} pictures stay together");
+    }
+}
+
+#[test]
+fn tables_survive_a_round_trip() {
+    let priced = &[&["Item", "Count", "Price"][..], &["Pens", "12", "3.50"], &["Ink"]];
+    let turning = |block: Block| Block { page_break: true, ..block };
+    let loose = [Block::text("x", BlockKind::TableCell, "A row"), Block::text("y", BlockKind::TableCell, "by itself")];
+    let blocks = vec![
+        Block::text("before", BlockKind::Paragraph, "Before"),
+        table("t", &[Align::Start, Align::Center, Align::End], true, priced),
+        // Two tables that touch stay two, and one can start a page.
+        turning(table("u", &[Align::Justify, Align::Start], false, &[&["a", "b"], &["two\nlines", ""]])),
+        // A row that a merge left outside its table is a table of one row.
+        holding("r", BlockKind::TableRow, loose.to_vec()),
+        Block::text("after", BlockKind::Paragraph, "After"),
+    ];
+    let doc = Document { blocks, ..Document::default() };
+    let on_cell = comment(Anchor::range(BlockId::new("t-1-0"), 0..4), "Ada", "Which pens?");
+    let notes = Notes { notes: vec![on_cell], ..Notes::default() };
+    let file = to_docx(&doc, &Style::default(), &notes, "Report", &mut |_| None);
+    let back = import(&file, &Style::default()).expect("the export reads");
+
+    let cells = |texts: &[&str]| {
+        let cells = texts.iter().map(|text| format!("    cell {text:?}"));
+        std::iter::once("  row".to_owned()).chain(cells).collect::<Vec<_>>()
+    };
+    let expected = [
+        vec![r#"p "Before""#.to_owned(), "table:start,center,end headed".to_owned()],
+        cells(&["Item", "Count", "Price"]),
+        cells(&["Pens", "12", "3.50"]),
+        // A row short of cells ends in empty ones.
+        cells(&["Ink", "", ""]),
+        vec!["table:justify,start".to_owned()],
+        cells(&["a", "b"]),
+        cells(&["two\nlines", ""]),
+        vec!["table:start,start".to_owned()],
+        cells(&["A row", "by itself"]),
+        vec![r#"p "After""#.to_owned()],
+    ];
+    assert_eq!(outline(&back.document), expected.concat());
+    let turned: Vec<&Block> = back.document.walk().filter(|block| block.page_break).collect();
+    assert!(matches!(turned[..], [Block { kind: BlockKind::Table { header: false, .. }, .. }]), "{turned:?}");
+    assert_eq!(anchored(&back.document, &back.comments[0].anchor), "Pens", "a comment stays on its cell");
+    assert_eq!(back.notes, []);
 }
 
 #[test]
@@ -1463,7 +1845,7 @@ fn text_cannot_break_the_file() {
     let kept = "</w:t></w:r></w:p> <w:p> & \" ' ]]> <!--  end";
     let link = Run { link: Some("https://example.com/\"><x y=\"'&<>\u{1} é".into()), ..Run::plain(hostile) };
     let mut doc = Document { blocks: vec![paragraph("a", vec![Run::plain(hostile), link])], ..Document::default() };
-    doc.blocks.push(figure("f", &[("asset", "assets/chart.png"), ("alt", hostile)], hostile));
+    doc.blocks.push(figure("f", "assets/chart.png", hostile, hostile));
     doc.language = "en\"><x".into();
     let note = Note { created: hostile.into(), ..comment(Anchor::block(BlockId::new("a")), hostile, hostile) };
     let notes = Notes { notes: vec![note], ..Notes::default() };
@@ -1537,10 +1919,27 @@ fn any_blocks() -> impl Strategy<Value = Vec<Block>> {
         3 => (list, 0..3u8, any_runs()).prop_map(move |(list, depth, runs)| with(BlockKind::ListItem { list, depth }, runs)),
     ];
     let tone = proptest::sample::select(vec![Tone::Tip, Tone::Info, Tone::Warn, Tone::Danger]);
-    let holding = |kind: BlockKind, blocks: Vec<Block>| Block { body: Body::Blocks(blocks), ..Block::new("", kind) };
+    let holding = |kind: BlockKind, blocks: Vec<Block>| holding("", kind, blocks);
     let inside = proptest::collection::vec(text.clone(), 1..4).prop_map(nested);
+    // A picture with a caption or none, and pictures side by side over one or none.
+    let caption = || proptest::option::of(any_runs());
+    let shot = || figure("", "assets/chart.png", "", "");
+    let pictured = caption().prop_map(move |runs| Block { body: Body::Text(runs.unwrap_or_default()), ..shot() });
+    let gallery = (2..6usize, caption()).prop_map(move |(count, runs)| {
+        let under = runs.map(|runs| with(BlockKind::Caption, runs));
+        holding(BlockKind::Gallery { numbered: false }, (0..count).map(|_| shot()).chain(under).collect())
+    });
+    // A table whose rows may fall short of its columns, which Word fills out.
+    let align = proptest::sample::select(vec![Align::Start, Align::Center, Align::End, Align::Justify]);
+    let cells = proptest::collection::vec(any_runs().prop_map(move |runs| with(BlockKind::TableCell, runs)), 1..4);
+    let rows = proptest::collection::vec(cells.prop_map(move |cells| holding(BlockKind::TableRow, cells)), 1..4);
+    let table = (proptest::collection::vec(align, 2..4), any::<bool>(), rows)
+        .prop_map(move |(columns, header, rows)| holding(BlockKind::Table { columns, header }, rows));
     let block = prop_oneof![
         6 => text,
+        1 => pictured,
+        1 => gallery,
+        1 => table,
         1 => (1..=4u8, any_runs()).prop_map(move |(level, runs)| with(BlockKind::Heading { level }, runs)),
         1 => any_text().prop_map(move |code| with(BlockKind::Code { language: None }, vec![Run::plain(code.trim_end_matches('\n'))])),
         1 => Just(Block::new("", BlockKind::Divider)),
@@ -1571,10 +1970,21 @@ fn settled(blocks: Vec<Block>) -> Vec<Block> {
                 same
             });
         }
+        // A row short of cells is filled out, and a cell past the last column that says how it is set is
+        // set from its start.
+        if let (BlockKind::Table { columns, .. }, Body::Blocks(rows)) = (&mut block.kind, &mut block.body) {
+            let across = rows.iter().map(|row| row.body.blocks().len()).max().unwrap_or(0).max(columns.len());
+            columns.resize(across, Align::Start);
+            for row in rows.iter_mut() {
+                if let Body::Blocks(cells) = &mut row.body {
+                    cells.resize_with(across, || Block::new("", BlockKind::TableCell));
+                }
+            }
+        }
         // Neighbouring paragraphs of one style are one quote, one callout or one block of code in Word.
         match (out.last_mut(), &block) {
             (Some(Block { kind, body: Body::Blocks(held), .. }), Block { body: Body::Blocks(more), .. })
-                if *kind == block.kind =>
+                if *kind == block.kind && matches!(kind, BlockKind::Quote | BlockKind::Callout { .. }) =>
             {
                 held.extend(more.iter().cloned());
             }
@@ -1616,7 +2026,7 @@ proptest! {
         let doc = Document { blocks, ..Document::default() };
         let back = returned(&doc);
         let expected = Document { blocks: settled(doc.blocks.clone()), ..Document::default() };
-        prop_assert_eq!(outline(&back.document), outline(&expected));
+        prop_assert_eq!(shape(&back.document), shape(&expected));
         prop_assert_eq!(back.notes, []);
     }
 
@@ -1644,6 +2054,20 @@ proptest! {
         for name in pictures(&import.document).iter().map(|(shown, ..)| shown).filter(|shown| shown.starts_with("assets/")) {
             prop_assert!(import.assets.contains_key(name), "{} is not kept", name);
         }
+        // A gallery holds pictures, a table rows of cells, and a reference is to a figure: what a file can hold.
+        for outer in import.document.walk() {
+            let strays: Vec<&Block> = outer.body.blocks().iter().filter(|part| !outer.kind.admits(&part.kind)).collect();
+            prop_assert!(strays.is_empty(), "{:?} holds {:?}", outer.kind, strays);
+        }
+        for mark in import.document.walk().flat_map(|block| block.body.runs()).flat_map(|run| &run.marks) {
+            if let Mark::Ref(to) = mark {
+                let kind = import.document.block(to).map(|figure| &figure.kind);
+                let pictured = matches!(kind, Some(BlockKind::Figure { .. } | BlockKind::Gallery { .. }));
+                prop_assert!(pictured, "{:?} refers to {:?}", to, kind);
+            }
+        }
+        let stored = Document::from_json(&import.document.to_json());
+        prop_assert_eq!(stored.as_ref(), Ok(&import.document), "a file holds the document as it was read");
     }
 }
 
@@ -1674,6 +2098,11 @@ fn any_body() -> impl Strategy<Value = String> {
         r#"<w:r><w:footnoteReference w:id="1"/></w:r>"#.to_owned(),
         r#"<w:r><w:footnoteReference w:id="9"/></w:r>"#.to_owned(),
         picture(r#"r:embed="png""#, "alt"),
+        simple_field(r" SEQ Figure \* ARABIC ", "1"),
+        r#"<w:r><w:instrText> SEQ Figure </w:instrText></w:r>"#.to_owned(),
+        r#"<w:bookmarkStart w:id="5" w:name="mark"/>"#.to_owned(),
+        simple_field(r" REF mark \h ", "Figure 1"),
+        r#"<w:r><w:instrText> REF mark </w:instrText></w:r>"#.to_owned(),
         "<m:oMath><m:r><m:t>x</m:t></m:r></m:oMath>".to_owned(),
         format!("<m:oMathPara><m:oMath>{}</m:oMath><m:oMath/></m:oMathPara>", m("a&amp;{b}^_")),
         format!(
@@ -1713,13 +2142,19 @@ fn any_body() -> impl Strategy<Value = String> {
         };
         let rows = proptest::collection::vec(proptest::collection::vec(blocks.clone(), 1..3), 1..3);
         prop_oneof![
-            rows.prop_map(|rows| {
-                let row =
-                    |cells: &Vec<String>| cells.iter().map(|cell| format!("<w:tc>{cell}</w:tc>")).collect::<String>();
-                format!(
-                    "<w:tbl>{}</w:tbl>",
-                    rows.iter().map(|cells| format!("<w:tr>{}</w:tr>", row(cells))).collect::<String>()
-                )
+            (rows, any::<bool>()).prop_map(|(rows, merged)| {
+                // Cells merged across and down, in rows that head the table and start past its first column.
+                let (wide, heading) = match merged {
+                    true => (r#"<w:tcPr><w:gridSpan w:val="70"/><w:vMerge/></w:tcPr>"#, "<w:tblHeader/>"),
+                    false => ("", ""),
+                };
+                let row = |cells: &Vec<String>| {
+                    cells.iter().map(|cell| format!("<w:tc>{wide}{cell}</w:tc>")).collect::<String>()
+                };
+                let rows = rows.iter().map(|cells| {
+                    format!(r#"<w:tr><w:trPr>{heading}<w:gridBefore w:val="2"/></w:trPr>{}</w:tr>"#, row(cells))
+                });
+                format!("<w:tbl>{}</w:tbl>", rows.collect::<String>())
             }),
             wrapped("<w:sdt><w:sdtContent>", "</w:sdtContent></w:sdt>"),
             wrapped("<w:ins>", "</w:ins>"),

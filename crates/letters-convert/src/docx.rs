@@ -1,8 +1,8 @@
 //! Word documents in both directions.
 //!
-//! Reading maps Word's paragraph styles, lists, links, footnotes and comments onto the document, and seeds the
-//! document's style from Word's own, so the result looks familiar. What the document cannot hold is flattened
-//! and named in a note on the passage it happened to.
+//! Reading maps Word's paragraph styles, lists, tables, pictures, links, footnotes and comments onto the
+//! document, and seeds the document's style from Word's own, so the result looks familiar. What the document
+//! cannot hold is flattened and named in a note on the passage it happened to.
 //!
 //! Writing generates real Word styles from the document's style and points each paragraph at one, so the file
 //! restyles in Word as the document does here. Only marks are written as formatting on runs.
@@ -81,6 +81,18 @@ const CALLOUTS: [(Tone, &str, &str); 4] = [
 const DIVIDER: (&str, &str) = ("Divider", "Divider");
 /// The paragraph style list items take, which sets them closer together than paragraphs.
 const LIST: (&str, &str) = ("ListParagraph", "List Paragraph");
+/// The style of a table, and the paragraph styles of the text in its cells and in the cells of a row that
+/// heads it. A cell's padding is its space, so its style leaves none of a paragraph's. LibreOffice has
+/// styles of these names for the same.
+const TABLE: (&str, &str) = ("Table", "Table");
+const CELL: (&str, &str) = ("TableText", "Table Text");
+const HEAD_CELL: (&str, &str) = ("TableHeading", "Table Heading");
+/// The paragraph style of the empty paragraph after a table. Word joins two tables that touch, and sets a
+/// table against the text under it.
+const TABLE_SPACE: (&str, &str) = ("TableSpace", "Table Space");
+/// What Word counts figures under, and what opens the name of the bookmark around a figure's label.
+const SEQUENCE: &str = "Figure";
+const BOOKMARK: &str = "_RefFigure";
 /// The character style of code inside a line.
 const INLINE_CODE: (&str, &str) = ("InlineCode", "Inline Code");
 /// The character style of a link.

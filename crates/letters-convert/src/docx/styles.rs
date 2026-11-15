@@ -1,7 +1,7 @@
 //! Word's styles as the reader needs them: what each resolves to, which element type it stands for, and the
 //! document style they seed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use letters_model::{Align, Page, Style, TextStyle, Tone};
 use roxmltree::{Document, Node};
@@ -218,6 +218,8 @@ pub(super) enum Role {
     Divider,
     /// An entry of a table of contents.
     Contents,
+    /// The text of a cell in a row that heads a table.
+    ColumnHead,
 }
 
 /// The names paragraph styles for code go by, in Word and in the tools that write `.docx`.
@@ -240,6 +242,7 @@ fn role(name: &str) -> Option<Role> {
     }
     Some(match name.as_str() {
         "title" => Role::Title,
+        "table heading" => Role::ColumnHead,
         "caption" => Role::Caption,
         "toc heading" | "table of figures" => Role::Contents,
         "horizontal line" => Role::Divider,
@@ -269,6 +272,8 @@ pub(super) struct Styles {
     run: RunProps,
     /// The paragraph style of a paragraph that names none.
     normal: Option<String>,
+    /// The table styles that set a first row apart.
+    headed: BTreeSet<String>,
 }
 
 impl Styles {
@@ -297,8 +302,17 @@ impl Styles {
                 run: style.child("rPr").map(|props| RunProps::read(props, theme)).unwrap_or_default(),
             };
             styles.by_id.insert(id.to_owned(), read);
+            let heads = |part: Node| part.is("tblStylePr") && part.attr("type") == Some("firstRow");
+            if style.attr("type") == Some("table") && style.children().any(heads) {
+                styles.headed.insert(id.to_owned());
+            }
         }
         styles
+    }
+
+    /// Whether a table style gives a table's first row a look of its own, as it does a row of headings.
+    pub fn heads(&self, id: &str) -> bool {
+        self.headed.contains(id)
     }
 
     /// The language text is in where nothing says otherwise, when Word recorded one.

@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 
 use letters_model::{Block, BlockKind, Mark};
 use roxmltree::Node;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{DIRECT, Field, Inline, MAX_DEPTH, Para, Reader, Spot, math, text_of};
@@ -72,7 +71,14 @@ impl Reader<'_, '_> {
                 Some("fldSimple") => {
                     let code = node.attr("instr").unwrap_or_default();
                     para.contents |= is_contents(code);
+                    let from = para.len;
                     self.inline(node, &around.deeper(hyperlink(code)), para);
+                    self.shown(code, from, para);
+                }
+                Some("bookmarkStart") => {
+                    if let Some(name) = node.attr("name") {
+                        self.bookmarks.entry(name.to_owned()).or_insert(para.index);
+                    }
                 }
                 Some("commentRangeStart") => self.span(node).0 = Some(Spot { para: para.index, at: para.len }),
                 Some("commentRangeEnd") => self.span(node).1 = Some(Spot { para: para.index, at: para.len }),
@@ -193,7 +199,8 @@ impl Reader<'_, '_> {
                 _ => {}
             }
             if para.len > before && child.is("t") {
-                if restyled {
+                // Space in another size or face is no loss.
+                if restyled && !text_of(child).trim().is_empty() {
                     self.whole(DIRECT);
                 }
                 if on(look.shifted) {
@@ -225,9 +232,31 @@ impl Reader<'_, '_> {
                     field.link = hyperlink(&field.code);
                     field.contents = is_contents(&field.code);
                     para.contents |= field.contents;
+                    field.from = Some(Spot { para: para.index, at: para.len });
                 }
             }
-            Some("end") => _ = self.fields.pop(),
+            Some("end") => {
+                let Some(field) = self.fields.pop() else { return };
+                // What a field shows is known only when it ends, and only where it stayed in one paragraph.
+                if let Some(from) = field.from.filter(|from| from.para == para.index) {
+                    self.shown(&field.code, from.at, para);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Takes in what a field showed from `from` on, where the document makes that itself: the number Word
+    /// counted a caption with, and a reference to one.
+    fn shown(&mut self, code: &str, from: usize, para: &mut Para) {
+        let mut words = code.split_whitespace();
+        match words.next().map(str::to_ascii_uppercase).as_deref() {
+            Some("SEQ") if para.counted.is_none() => para.counted = Some(from..para.len),
+            Some("REF") if !self.detached && para.len > from => {
+                if let Some(bookmark) = words.next() {
+                    self.refs.push((Spot { para: para.index, at: from }, para.len, bookmark.to_owned()));
+                }
+            }
             _ => {}
         }
     }
@@ -313,12 +342,12 @@ impl Reader<'_, '_> {
     fn picture(&mut self, target: &str, remote: bool, size: Option<(f32, f32)>, alt: &str) -> Result<Block, String> {
         // A picture Word did not record the size of is shown at a size that suits most.
         let (width, height) = size.unwrap_or((320.0, 240.0));
-        let mut block = Block::new(self.id(), BlockKind::Unknown { type_name: "figure".into() });
-        if remote {
+        let hundredths = |points: f32| (points * 100.0).round() / 100.0;
+        let (asset, src) = if remote {
             if !target.starts_with("https://") {
                 return Err("A picture linked from outside the file was left out".into());
             }
-            block.extra.insert("src".into(), target.into());
+            (None, Some(target.to_owned()))
         } else {
             let name = match self.pictures.get(target) {
                 Some(known) => known.clone(),
@@ -328,13 +357,11 @@ impl Reader<'_, '_> {
                     asset
                 }
             };
-            block.extra.insert("asset".into(), name?.into());
-        }
-        block.extra.insert("alt".into(), alt.into());
-        block.extra.insert("width".into(), number(width));
-        block.extra.insert("height".into(), number(height));
-        block.extra.insert("fallback".into(), if alt.is_empty() { "Picture" } else { alt }.into());
-        Ok(block)
+            (Some(name?), None)
+        };
+        let (width, height) = (hundredths(width), hundredths(height));
+        let kind = BlockKind::Figure { asset, src, alt: alt.into(), width, height, numbered: false };
+        Ok(Block::new(self.id(), kind))
     }
 
     /// Keeps a picture part as an asset named after its content, and returns the name.
@@ -358,15 +385,15 @@ impl Reader<'_, '_> {
     }
 }
 
-fn number(value: f32) -> Value {
-    let rounded = (f64::from(value) * 100.0).round() / 100.0;
-    if rounded.fract() == 0.0 { Value::from(rounded as i64) } else { Value::from(rounded) }
-}
-
 /// A size in points from an element that gives one in English Metric Units, as drawings do.
 fn extent(node: Node) -> Option<(f32, f32)> {
     let points = |name: &str| Some(node.attribute(name)?.trim().parse::<f32>().ok()? / 12700.0);
-    Some((points("cx")?, points("cy")?)).filter(|(width, height)| *width > 0.0 && *height > 0.0)
+    Some((points("cx")?, points("cy")?)).filter(|(width, height)| sized(*width) && sized(*height))
+}
+
+/// Whether a length is one a picture can have.
+fn sized(points: f32) -> bool {
+    points.is_finite() && points > 0.0
 }
 
 /// A size in points from the CSS-like style of an older drawing.
@@ -377,7 +404,7 @@ fn styled_size(style: &str) -> Option<(f32, f32)> {
         let (number, per_unit) = [("pt", 1.0), ("in", 72.0), ("px", 0.75), ("cm", 28.35), ("mm", 2.835)]
             .iter()
             .find_map(|(unit, scale)| Some((value.strip_suffix(unit)?, *scale)))?;
-        Some(number.trim().parse::<f32>().ok()? * per_unit).filter(|points| *points > 0.0)
+        Some(number.trim().parse::<f32>().ok()? * per_unit).filter(|points| sized(*points))
     };
     Some((length("width")?, length("height")?))
 }
