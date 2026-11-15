@@ -1,6 +1,6 @@
 //! The texts of a leaf: shaping them with Parley, painting them and answering where things are inside them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::iter::Peekable;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
@@ -496,6 +496,21 @@ pub(crate) fn adorn(engine: &mut Engine, types: &Types, leaf: &Leaf, laid: &mut 
     }
 }
 
+/// Where a loaded picture of a given size is drawn in the box of its figure, from the leaf's left edge and
+/// top. A link's stored size may be a guess, and loading it must not change the document, so the picture
+/// keeps its own shape: as large as fits the box, in the middle of it, on whole pixels as the box is.
+fn fitted(picture: &Picture, (width, height): (f32, f32)) -> Rect {
+    let frame = picture.rect;
+    // A figure that stores its picture's shape draws it as it would one the document holds.
+    if ((picture.size.0 / picture.size.1) / (width / height) - 1.0).abs() < 0.01 {
+        return frame;
+    }
+    let scale = (frame.width / width).min(frame.height / height);
+    let (width, height) = ((width * scale).round().max(1.0), (height * scale).round().max(1.0));
+    let (x, y) = (((frame.width - width) / 2.0).round(), ((frame.height - height) / 2.0).round());
+    Rect::new(frame.x + x, frame.y + y, width, height)
+}
+
 /// Where the cloud sits on a picture that is still a link, when the picture has room for it.
 pub(crate) fn badge(frame: Rect) -> Option<Rect> {
     let (side, inset) = (theme::BADGE, theme::BADGE_INSET);
@@ -672,8 +687,8 @@ pub(crate) struct Painter<'a> {
     pub part: Option<u64>,
     /// The number of each numbered figure, which says whether a reference leads anywhere.
     pub numbers: &'a HashMap<BlockId, u32>,
-    /// The links whose pictures are there to draw.
-    pub loaded: &'a HashSet<String>,
+    /// The links whose pictures are there to draw, each with its picture's size.
+    pub loaded: &'a HashMap<String, (f32, f32)>,
     pub out: &'a mut DisplayList,
 }
 
@@ -825,9 +840,13 @@ impl Painter<'_> {
                 self.open(PICTURES + index as u64, || Tag::Figure { alt: picture.alt.clone() });
             }
             // A picture that is still a link is drawn once it is loaded, under its link for a name.
-            let linked = picture.src.as_ref().filter(|src| self.loaded.contains(*src));
-            if let Some(asset) = picture.asset.as_ref().or(linked) {
+            let linked = || picture.src.as_ref().and_then(|src| Some((src, *self.loaded.get(src)?)));
+            if let Some(asset) = &picture.asset {
                 self.out.push(Item::Image { rect, asset: asset.clone() });
+            } else if let Some((src, size)) = linked() {
+                let at = fitted(picture, size);
+                let rect = Rect::new(leaf.x + at.x, leaf.y + at.y, at.width, at.height);
+                self.out.push(Item::Image { rect, asset: src.clone() });
             } else {
                 self.remote(picture, rect, laid.names.iter().find(|(at, _)| *at == index).map(|(_, name)| name));
             }

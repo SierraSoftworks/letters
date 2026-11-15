@@ -143,10 +143,10 @@ fn a_linked_picture_is_drawn_once_it_is_loaded() {
         let mut layout = laid(&page);
         let (was, height) = (layout.figure(&"f".into()).unwrap(), layout.height());
         let other = "https://images.example.org/harbour/quay.png";
-        assert!(!layout.set_loaded(other, true), "{name}: the picture of another link is not on the page");
+        assert!(!layout.set_loaded(other, Some((600, 400))), "{name}: the picture of another link is not on the page");
         assert_eq!(drawn(&layout), [None, None], "{name}: so the frame stays");
 
-        assert!(layout.set_loaded(src, true), "{name}: its own is");
+        assert!(layout.set_loaded(src, Some((600, 400))), "{name}: its own is");
         let [screen, sheet] = drawn(&layout);
         assert_eq!(screen, Some(was.image), "{name}: it is drawn under its link, where its frame stood");
         assert!(sheet.is_some(), "{name}: and on a sheet");
@@ -157,12 +157,39 @@ fn a_linked_picture_is_drawn_once_it_is_loaded() {
         assert!(!spelt(&layout).contains("images.example.org"), "{name}: nor its host");
         let still = (layout.figure(&"f".into()), layout.height());
         assert_eq!(still, (Some(was), height), "{name}: it is a link yet, with its cloud's place, and nothing moves");
-        assert!(!layout.set_loaded(src, true), "{name}: told again, nothing changes");
+        assert!(!layout.set_loaded(src, Some((600, 400))), "{name}: told again, nothing changes");
 
         layout.update(&page, &Style::default(), WIDTH / 2.0, None);
         assert!(drawn(&layout)[0].is_some(), "{name}: it stays loaded when the page is laid out again");
-        assert!(layout.set_loaded(src, false), "{name}: a picture that is dropped");
+        assert!(layout.set_loaded(src, None), "{name}: a picture that is dropped");
         assert_eq!(drawn(&layout), [None, None], "{name}: is a frame again");
+    }
+}
+
+#[test]
+fn a_loaded_picture_keeps_its_shape_in_the_box_its_figure_stores() {
+    // A link written without a size is stored at a guess, which loading it must not change.
+    let src = "https://images.example.org/harbour/office.png";
+    let mut layout = laid(&doc(vec![remote(figure("f", (320.0, 240.0), "The harbour"), src), paragraph("z", "End")]));
+    let (was, height) = (layout.figure(&"f".into()).unwrap(), layout.height());
+    // The picture's size in pixels: wider than the box, taller, smaller than it and far larger.
+    for size in [(1600, 400), (300, 900), (40, 20), (6000, 9000)] {
+        assert!(layout.set_loaded(src, Some(size)), "{size:?}: a picture of another size is drawn anew");
+        let items = painted(&layout, everything());
+        let (_, at) = images(&items)[0];
+        assert!(stretch(at, (size.0 as f32, size.1 as f32)) < 0.01, "{size:?}: it has its own shape: {at:?}");
+        let (frame, room) = (was.image, 1.0);
+        let inside = at.x >= frame.x - room && at.y >= frame.y - room;
+        assert!(
+            inside && right(at) <= right(frame) + room && bottom(at) <= bottom(frame) + room,
+            "{size:?}: in the box"
+        );
+        let filled = (at.width - frame.width).abs() < room || (at.height - frame.height).abs() < room;
+        assert!(filled, "{size:?}: as large as the box lets it be: {at:?}");
+        let (here, there) = (middle(at), middle(frame));
+        assert!((here.x - there.x).abs() < room && (here.y - there.y).abs() < room, "{size:?}: in its middle");
+        let still = (layout.figure(&"f".into()), layout.height());
+        assert_eq!(still, (Some(was), height), "{size:?}: the figure keeps its box, and nothing moves");
     }
 }
 

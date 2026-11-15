@@ -36,7 +36,7 @@ mod theme;
 mod tokens;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
@@ -76,7 +76,8 @@ const EAGER: usize = 32;
 /// Where a figure is drawn. See [`DocLayout::figure`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FigureBox {
-    /// The picture. For a gallery, all its rows of pictures.
+    /// The picture. For a gallery, all its rows of pictures. For a link that is loaded, the box its picture
+    /// is fitted in.
     pub image: Rect,
     /// The caption under it. While there is none this is where its first line would be, which reaches into
     /// the space below the figure.
@@ -159,7 +160,7 @@ impl DocLayout {
             good: None,
             stands: false,
             numbers: HashMap::new(),
-            loaded: HashSet::new(),
+            loaded: HashMap::new(),
             scratch: Laid::default(),
         };
         Self { state: RefCell::new(state) }
@@ -233,17 +234,22 @@ impl DocLayout {
         self.state.get_mut().add_fonts(fonts)
     }
 
-    /// Says that the picture a link leads to is there to draw, or no longer is. A figure that is still a
-    /// link shows as a frame with its host and a cloud, since whether to fetch it is the shell's to decide.
-    /// Once loaded it is drawn as [`Item::Image`] with the link for its `asset`, written as the document
-    /// writes it: the name to keep the picture under among the images the page is rendered with. A sheet
-    /// draws it too, and a picture that was never loaded stays a frame there.
+    /// Says that the picture a link leads to is there to draw, with its size in pixels, or with `None` that
+    /// it no longer is. A figure that is still a link shows as a frame with its host and a cloud, since
+    /// whether to fetch it is the shell's to decide. Once loaded it is drawn as [`Item::Image`] with the
+    /// link for its `asset`, written as the document writes it: the name to keep the picture under among
+    /// the images the page is rendered with. A sheet draws it too, and a picture that was never loaded
+    /// stays a frame there.
     ///
-    /// Nothing is laid out again, since a figure's size is stored. Returns whether the document shows the
-    /// picture, which is whether to paint again: a name that no figure links to changes nothing.
+    /// The size a link's figure stores may be a guess, as it is for one written without a size, and loading
+    /// does not change the document. So the picture is drawn at its own shape, as large as fits in the
+    /// figure's box and in the middle of it. Nothing is laid out again.
+    ///
+    /// Returns whether the document shows the picture, which is whether to paint again: a name that no
+    /// figure links to changes nothing. [`FigureBox::image`] stays the figure's box and
     /// [`FigureBox::badge`] answers either way, since a loaded picture is a link until it is embedded.
-    pub fn set_loaded(&mut self, src: &str, loaded: bool) -> bool {
-        self.state.get_mut().set_loaded(src, loaded)
+    pub fn set_loaded(&mut self, src: &str, size: Option<(u32, u32)>) -> bool {
+        self.state.get_mut().set_loaded(src, size)
     }
 
     /// Lets formulas link, as `\\href` asks. Off until set, and only a document that is trusted may have it on.
@@ -495,8 +501,9 @@ struct State {
     stands: bool,
     /// The number of each numbered figure and gallery.
     numbers: HashMap<BlockId, u32>,
-    /// The links whose pictures the shell has, which are drawn in place of their frames.
-    loaded: HashSet<String>,
+    /// The links whose pictures the shell has, which are drawn in place of their frames, each with the
+    /// size of its picture.
+    loaded: HashMap<String, (f32, f32)>,
     /// A layout to measure with, so that measuring allocates nothing.
     scratch: Laid,
 }
@@ -669,8 +676,11 @@ impl State {
         again
     }
 
-    fn set_loaded(&mut self, src: &str, loaded: bool) -> bool {
-        let changed = if loaded { self.loaded.insert(src.to_owned()) } else { self.loaded.remove(src) };
+    fn set_loaded(&mut self, src: &str, size: Option<(u32, u32)>) -> bool {
+        let changed = match size.map(|(width, height)| (width.max(1) as f32, height.max(1) as f32)) {
+            Some(size) => self.loaded.insert(src.to_owned(), size) != Some(size),
+            None => self.loaded.remove(src).is_some(),
+        };
         let shows = |picture: &Picture| picture.asset.is_none() && picture.src.as_deref() == Some(src);
         changed && self.leaves.iter().any(|leaf| leaf.pictures.iter().any(shows))
     }
