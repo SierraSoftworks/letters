@@ -83,6 +83,8 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
+    /// A function key, by its number from 1.
+    F(u8),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

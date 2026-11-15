@@ -179,6 +179,10 @@ pub enum Message {
     },
     /// What the menu about what is under the pointer asks for.
     Context(Contexting),
+    /// Goes to the next misspelled word and offers its corrections, or to the one before.
+    Misspelling {
+        back: bool,
+    },
     /// Asks the shell for a recent document, by its path.
     Open(String),
     /// Asks the shell to let the person choose a document.
@@ -836,6 +840,8 @@ pub struct EditorApp {
     callouts: Callouts,
     /// The menu about what is under the pointer, while it is open.
     context: Option<Context>,
+    /// How many of those menus were opened.
+    menus: u32,
     /// The preview of a figure that shows over the page: its caption, and where it is in the page area.
     previewed: Option<(String, Rect)>,
     /// How the document read when assistive technology was last told of it.
@@ -915,6 +921,7 @@ impl EditorApp {
             tables: Tables::default(),
             callouts: Callouts::default(),
             context: None,
+            menus: 0,
             previewed: None,
             told: RefCell::default(),
             backup: Fonts::default(),
@@ -1595,6 +1602,7 @@ impl EditorApp {
                 };
                 (fits && editor.applies(command)).then(|| Message::Run(command.clone()))?
             }
+            Act::Misspelling { back } => Message::Misspelling { back: *back },
             Act::MoveRow { down } => {
                 let cell = editor.cell()?;
                 Message::Run(Command::Table(TableEdit::MoveRow { to: beside(cell.row, cell.rows, *down)? }))
@@ -2642,13 +2650,43 @@ impl EditorApp {
         };
         let note = self.margin.open().find(|(note, kind)| *kind == threads::Kind::Comment && on(note));
         let note = note.map(|(note, _)| note.id.clone());
-        self.context = Some(Context { at, reference, note });
+        self.menus = self.menus.wrapping_add(1);
+        self.context = Some(Context { at, reference, note, serial: self.menus });
+    }
+
+    /// Goes to the next misspelled word, or the one before, and opens the menu about it there.
+    fn misspelling(&mut self, back: bool) {
+        if self.away() || self.carded() {
+            return;
+        }
+        self.context = None;
+        if self.hung() {
+            return;
+        }
+        let from = self.editor.selection().map(|selection| selection.head.clone());
+        let Some((block, word)) = self.spelling.next(self.editor.doc(), from.as_ref(), back, &mut self.layout) else {
+            return;
+        };
+        self.editor.select(Selection::caret(Pos::new(block, word.start)));
+        self.mark();
+        // Twice, since laying out what comes into view can move the word.
+        for _ in 0..2 {
+            self.reveal();
+            self.layout.settle(self.viewport(), 0);
+        }
+        let Some(caret) = self.editor.selection().and_then(|selection| self.layout.caret(&selection.head)) else {
+            return;
+        };
+        let caret = self.onto(caret);
+        self.menu(Point { x: caret.x + 1.0, y: caret.y + caret.height / 2.0 });
     }
 
     /// Does what the menu about what is under the pointer asked.
     fn contexting(&mut self, asked: Contexting, platform: &mut dyn Platform) {
         match asked {
-            Contexting::Close => self.context = None,
+            Contexting::Close(serial) => {
+                self.context.take_if(|context| context.serial == serial);
+            }
             Contexting::CopyText(block) => match self.editor.doc().block(&block) {
                 Some(code) if matches!(code.kind, BlockKind::Code { .. }) => self.copy_code(block, platform),
                 Some(written) => platform.clipboard_write(Clip { text: written.plain_text(), ..Clip::default() }),
@@ -2661,7 +2699,14 @@ impl EditorApp {
                 let boxes = self.layout.code_boxes(Rect::new(0.0, top, self.column.1, bottom - top));
                 let Some((_, code)) = boxes.into_iter().find(|(id, _)| *id == block) else { return };
                 // The picture alone, so that what it is pasted into takes it for a picture.
-                if let Some(picture) = context::picture(&self.layout, &self.images, code, self.palette.page) {
+                // Where each line of the code begins, for its number.
+                let text = self.editor.doc().block(&block).map(|code| code.plain_text()).unwrap_or_default();
+                let starts = std::iter::once(0).chain(text.match_indices('\n').map(|(at, _)| at + 1));
+                let lines: Vec<Rect> =
+                    starts.filter_map(|at| self.layout.caret(&Pos::new(block.clone(), at))).collect();
+                let (ink, page) = (self.palette.text, self.palette.page);
+                let shaper = self.shaper.as_ref();
+                if let Some(picture) = context::picture(&self.layout, &self.images, shaper, code, &lines, ink, page) {
                     platform.clipboard_write(Clip { pictures: vec![picture], ..Clip::default() });
                     self.code_copy.copied(block, platform.now_ms());
                 }
@@ -3891,6 +3936,7 @@ impl EditorApp {
             Message::ClosePanel => self.show(None),
             Message::Share(open) => self.sharing = open,
             Message::Correct(text) => {
+                self.context = None;
                 let Some(fix) = self.spelling.fix.take() else { return };
                 let (anchor, head) = (Pos::new(fix.block.clone(), fix.range.start), Pos::new(fix.block, fix.range.end));
                 self.editor.select(Selection { anchor, head });
@@ -3909,6 +3955,7 @@ impl EditorApp {
                 self.spelling.reworded(Some(fix.block), self.editor.doc(), &mut self.layout);
             }
             Message::Context(asked) => self.contexting(asked, platform),
+            Message::Misspelling { back } => self.misspelling(back),
             Message::Open(path) => self.requests.push(Request::Open(path)),
             Message::OpenDialog => self.requests.push(Request::OpenDialog),
             Message::NewDocument => self.requests.push(Request::New),
@@ -4199,6 +4246,14 @@ impl App for EditorApp {
     }
 
     fn text(&mut self, event: InputEvent, platform: &mut dyn Platform) {
+        // With the menu about a misspelled word open, a number takes the correction of that place. A
+        // browser keeps that number with Ctrl for its tabs.
+        if let (Some(_), Some(fix), InputEvent::Insert(typed)) = (&self.context, &self.spelling.fix, &event) {
+            let place = typed.parse::<usize>().ok().and_then(|place| place.checked_sub(1));
+            if let Some(word) = place.and_then(|place| fix.suggestions.get(place)).cloned() {
+                return self.update(Message::Correct(word), platform);
+            }
+        }
         // The first character typed over the landing card starts this document with it.
         let typed = matches!(event, InputEvent::Insert(_) | InputEvent::Commit(_) | InputEvent::SetComposition { .. });
         if self.landing.is_some() && self.importing.is_none() && typed {

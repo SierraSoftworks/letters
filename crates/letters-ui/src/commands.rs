@@ -95,6 +95,10 @@ pub(crate) enum Act {
     History,
     /// Steps through the conflicts that wait for a choice, or settles the one that is open.
     Review(Reviewing),
+    /// Goes to the next misspelled word and offers its corrections, or to the one before.
+    Misspelling {
+        back: bool,
+    },
     /// Shows the palette itself. It is not one of its own commands.
     Palette,
 }
@@ -138,7 +142,7 @@ const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> E
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 85] = [
+pub(crate) static ENTRIES: [Entry; 87] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -207,6 +211,8 @@ pub(crate) static ENTRIES: [Entry; 85] = [
     run("Edit", "Paste", "", Command::Paste),
     run("Edit", "Paste as plain text", "without formatting", Command::PastePlain),
     run("Edit", "Select all", "", Command::SelectAll),
+    entry("Edit", "Next spelling mistake", "misspelled word typo check", Act::Misspelling { back: false }),
+    entry("Edit", "Previous spelling mistake", "misspelled word typo check", Act::Misspelling { back: true }),
     entry("View", "Styles panel", "show hide fonts page", Act::Panel(Panel::Styles)),
     entry("View", "Notes panel", "show hide comments", Act::Panel(Panel::Notes)),
     entry("View", "History", "versions earlier before rewind restore", Act::History),
@@ -230,7 +236,15 @@ const PRIMARY: Modifiers = Modifiers { primary: true, shift: false, alt: false }
 const PRIMARY_SHIFT: Modifiers = Modifiers { primary: true, shift: true, alt: false };
 
 /// The keys the window binds itself, for what is no command of the editor's.
-static KEYS: [(KeyEvent, Act); 6] = [
+static KEYS: [(KeyEvent, Act); 8] = [
+    (
+        KeyEvent { key: Key::F(7), mods: Modifiers { primary: false, shift: false, alt: false } },
+        Act::Misspelling { back: false },
+    ),
+    (
+        KeyEvent { key: Key::F(7), mods: Modifiers { primary: false, shift: true, alt: false } },
+        Act::Misspelling { back: true },
+    ),
     (KeyEvent { key: Key::Char('p'), mods: PRIMARY_SHIFT }, Act::Palette),
     (KeyEvent { key: Key::Char('p'), mods: PRIMARY }, Act::Print),
     (KeyEvent { key: Key::Char('k'), mods: PRIMARY }, Act::Link),
@@ -281,6 +295,7 @@ fn chord(event: &KeyEvent, mac: bool) -> String {
         Key::End => "End".to_owned(),
         Key::PageUp => "Page Up".to_owned(),
         Key::PageDown => "Page Down".to_owned(),
+        Key::F(number) => format!("F{number}"),
     };
     let Modifiers { primary, shift, alt } = event.mods;
     // Each system has its own order for the keys held down.

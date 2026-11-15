@@ -76,3 +76,13 @@ test("the menu cuts, copies and pastes with no clipboard event to carry them", a
   // Asking for the menu moves the caret, so where each paste lands is not the point.
   await expect.poll(async () => (await texts(page)).at(-1).length).toBe("carried twicetwice".length);
 });
+
+test("F7 goes to a misspelled word, and the number of a correction mends it", async ({ page }) => {
+  await page.keyboard.type("The quik fox. ");
+  await rested(page);
+  await page.keyboard.press("F7");
+  await expect(page.getByRole("menu", { name: "Context menu" })).toBeAttached();
+  // A browser keeps the number with Ctrl for its tabs, so the number alone does it too.
+  await page.keyboard.press("2");
+  await expect.poll(async () => (await texts(page)).at(-1)).toBe("The quick fox. ");
+});

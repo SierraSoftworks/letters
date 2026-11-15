@@ -434,6 +434,7 @@ fn named_key(key: &str) -> Option<Key> {
         "End" => Key::End,
         "PageUp" => Key::PageUp,
         "PageDown" => Key::PageDown,
+        "F7" => Key::F(7),
         _ => return None,
     })
 }

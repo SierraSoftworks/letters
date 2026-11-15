@@ -1042,7 +1042,7 @@ fn a_word_is_not_called_wrong_while_it_is_being_typed() {
 fn the_menu_on_a_misspelled_word_puts_a_correction_in_its_place() {
     let mut window = misspelled();
     ask_about_first_wave(&mut window);
-    window.assert_open(Role::Menu, "Context menu").click(Role::MenuItem, "quick");
+    window.assert_open(Role::Menu, "Context menu").click(Role::MenuItem, "quick Ctrl+2");
     window.assert_markdown("The quick brown fox.").assert_closed(Role::Menu, "Context menu");
     assert!(waves(&mut window).is_empty(), "nothing is left to mark");
     assert!(window.focused().is_some_and(|found| found.role == Role::Document), "the keyboard is back on the page");
