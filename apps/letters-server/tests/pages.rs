@@ -4,10 +4,10 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{Browser, Server, URL, names};
-use letters_api::{Entry, Listing, paths};
+use letters_api::{Entry, Listing, Opened, paths};
 use letters_server::pages::{
     ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_SHARE, ACT_TRASH, ACT_UNSHARE,
-    RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking,
+    RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder,
 };
 
 /// What the folder at `path` of a space holds, as the interface tells the browser's own session.
@@ -124,6 +124,51 @@ async fn the_forms_make_rename_move_and_throw_away() {
     ben.fill(ACT_TRASH, &[("id", &id), ("back", &top)]).await;
     assert_eq!(names(&listed(&ben, "family", "").await), ["House"]);
     assert!(page(&mut ben, TRASH_PAGE).await.contains("Roof"), "the trash lists it");
+}
+
+#[tokio::test]
+async fn the_forms_rename_move_and_throw_away_a_folder_and_the_trash_puts_it_back() {
+    let server = Server::new("folder-forms");
+    let mut ben = server.reader("ben", &["family"]);
+    let top = paths::folder_page("family", "");
+    for name in ["House", "Garden"] {
+        ben.fill(ACT_NEW_FOLDER, &[("space", "family"), ("folder", ""), ("name", name)]).await;
+    }
+    let id = ben.pages().start("family", "House", "Plan").await.id.unwrap();
+
+    // A folder's row asks as a document's does, and a reader's asks nothing.
+    let editors = page(&mut ben, &top).await;
+    let readers = page(&mut server.reader("guest", &["friends"]), &top).await;
+    for (what, act) in [("rename", ACT_RENAME), ("move", ACT_MOVE), ("trash", ACT_TRASH)] {
+        let ask = asking_folder(&top, what, "House");
+        assert!(editors.contains(&ask.replace('&', "&amp;")), "the row asks to {what}");
+        assert!(page(&mut ben, &ask).await.contains(&format!("action=\"{act}\"")), "{what}");
+        assert!(!readers.contains(&format!("ask={what}")), "a reader is not offered to {what}");
+    }
+
+    let about = |folder: &'static str| [("space", "family"), ("folder", folder), ("back", top.as_str())];
+    let renamed = ben.fill(ACT_RENAME, &[&about("House")[..], &[("name", "Home")]].concat()).await;
+    assert_eq!(renamed.location(), top);
+    assert_eq!(names(&listed(&ben, "family", "").await), ["Garden", "Home"]);
+
+    let offered = page(&mut ben, &asking_folder(&top, "move", "Home")).await;
+    assert!(offered.contains("value=\"family/Garden\"") && offered.contains("value=\"home/\""), "other folders");
+    assert!(!offered.contains("value=\"family/Home\""), "not itself");
+    ben.fill(ACT_MOVE, &[&about("Home")[..], &[("to", "family/Garden")]].concat()).await;
+    assert_eq!(names(&listed(&ben, "family", "Garden").await), ["Home"]);
+
+    ben.fill(ACT_TRASH, &about("Garden/Home")).await;
+    assert!(listed(&ben, "family", "Garden").await.is_empty());
+    let trash = page(&mut ben, TRASH_PAGE).await;
+    assert!(trash.contains("Home") && trash.contains(ACT_PUT_BACK), "the trash offers the folder back");
+
+    // The folders were just looked through, for a document that is in the trash.
+    assert!(ben.pages().get::<Opened>(&paths::document(&id)).await.is_err(), "in the trash");
+    ben.fill(ACT_PUT_BACK, &[("space", "family"), ("file", "Home")]).await;
+    // Its document is found by its id at once all the same, before anyone looks into the folder.
+    let opened: Opened = ben.pages().get(&paths::document(&id)).await.expect("the document is back");
+    assert_eq!(opened.path, "Garden/Home/Plan.let");
+    assert!(!page(&mut ben, TRASH_PAGE).await.contains(ACT_PUT_BACK), "the trash is empty again");
 }
 
 #[tokio::test]

@@ -56,6 +56,9 @@ pub fn routes() -> Router<Shared> {
         .route("/api/v1/spaces/{space}/entries", get(entries))
         .route("/api/v1/spaces/{space}/documents", post(new_document))
         .route("/api/v1/spaces/{space}/folders", post(new_folder))
+        .route("/api/v1/spaces/{space}/folders/rename", post(rename_folder))
+        .route("/api/v1/spaces/{space}/folders/move", post(move_folder))
+        .route("/api/v1/spaces/{space}/folders/trash", post(trash_folder))
         .route("/api/v1/documents/{id}", get(document))
         .route(
             "/api/v1/documents/{id}/file",
@@ -172,6 +175,35 @@ async fn new_folder(
     Json(new): Json<NewFolder>,
 ) -> Answer<Json<Entry>> {
     blocking(move || app.new_folder(&who, &space, &new).map(Json)).await
+}
+
+async fn rename_folder(
+    State(app): State<Shared>,
+    who: Signed,
+    Path(space): Path<String>,
+    Query(at): Query<InFolder>,
+    Json(to): Json<Rename>,
+) -> Answer<Json<Entry>> {
+    blocking(move || app.rename_folder(&who, &space, &at.path, &to.name).map(Json)).await
+}
+
+async fn move_folder(
+    State(app): State<Shared>,
+    who: Signed,
+    Path(space): Path<String>,
+    Query(at): Query<InFolder>,
+    Json(to): Json<Move>,
+) -> Answer<Json<Entry>> {
+    blocking(move || app.move_folder(&who, &space, &at.path, &to).map(Json)).await
+}
+
+async fn trash_folder(
+    State(app): State<Shared>,
+    who: Signed,
+    Path(space): Path<String>,
+    Query(at): Query<InFolder>,
+) -> Answer<()> {
+    blocking(move || app.trash_folder(&who, &space, &at.path)).await
 }
 
 async fn document(State(app): State<Shared>, Reader(who): Reader, Path(id): Path<String>) -> Answer<Json<Opened>> {
@@ -526,8 +558,8 @@ impl App {
         let name = file_name(name).ok_or_else(|| Refusal::invalid("That name cannot be used for a document."))?;
         let to = found.place.split().0.child(&format!("{name}{EXTENSION}"))?;
         if to != found.place {
-            let (from, at) = ((&found.root, &found.place), (found.root.again()?, to.clone()));
-            self.rooms.moving(from, Some(at), || self.library.relocate(&self.store, from, (&found.root, &to)))?;
+            let (from, at) = ((&found.root, &found.place), (&found.root, &to));
+            self.rooms.moving(from, Some(at), || self.library.relocate(&self.store, from, at))?;
         }
         self.found_entry(who, &found, &to)
     }
@@ -543,10 +575,70 @@ impl App {
         let root = self.root(who, space)?;
         let place = Place::parse(&to.folder)?.child(found.place.name())?;
         if (root.key.as_str(), &place) != (found.root.key.as_str(), &found.place) {
-            let (from, at) = ((&found.root, &found.place), (root.again()?, place.clone()));
-            self.rooms.moving(from, Some(at), || self.library.relocate(&self.store, from, (&root, &place)))?;
+            let (from, at) = ((&found.root, &found.place), (&root, &place));
+            self.rooms.moving(from, Some(at), || self.library.relocate(&self.store, from, at))?;
         }
         self.entry(who, &space.told(role), &root, &place)
+    }
+
+    /// The folder at `path` in `space`, for `who` to rename, move or throw away: its space as they are
+    /// told it, the space's root, and the folder's place.
+    fn folder_in(&self, who: &Signed, space: &str, path: &str) -> Answer<(Space, Root, Place)> {
+        let (space, role) = self.space(who, space)?;
+        if !role.edits() {
+            return Err(Refusal::forbidden("You can read this space, but not change it."));
+        }
+        let (root, place) = (self.root(who, space)?, Place::parse(path)?);
+        if place.is_root() {
+            return Err(Refusal::invalid("A space itself cannot be renamed, moved or thrown away."));
+        }
+        // A document is asked for by its id, which follows it wherever it goes.
+        let (parent, name) = place.split();
+        let listed = root.folder(&parent)?.list()?;
+        if !listed.iter().any(|listed| listed.folder && listed.name == name) {
+            return Err(Refusal::not_found());
+        }
+        Ok((space.told(role), root, place))
+    }
+
+    /// Renames the folder at `path` in `space`. Whoever has a document in it open stays in it.
+    pub fn rename_folder(&self, who: &Signed, space: &str, path: &str, name: &str) -> Answer<Entry> {
+        let (space, root, place) = self.folder_in(who, space, path)?;
+        let name = file_name(name).ok_or_else(|| Refusal::invalid("That name cannot be used for a folder."))?;
+        let to = place.split().0.child(&name)?;
+        if to != place {
+            let (from, at) = ((&root, &place), (&root, &to));
+            self.rooms.moving(from, Some(at), || self.library.relocate(&self.store, from, at))?;
+        }
+        self.entry(who, &space, &root, &to)
+    }
+
+    /// Moves the folder at `path` in `space` into another folder, with everything in it.
+    pub fn move_folder(&self, who: &Signed, space: &str, path: &str, to: &Move) -> Answer<Entry> {
+        let (_, root, place) = self.folder_in(who, space, path)?;
+        let (space, role) = self.space(who, &to.space)?;
+        if !role.edits() {
+            return Err(Refusal::forbidden("You can read that space, but not add to it."));
+        }
+        let (there, into) = (self.root(who, space)?, Place::parse(&to.folder)?);
+        let at = into.child(place.name())?;
+        let own = there.key == root.key;
+        if own && (into == place || into.as_str().starts_with(&format!("{}/", place.as_str()))) {
+            return Err(Refusal::invalid("A folder cannot be moved into itself."));
+        }
+        if !own || at != place {
+            let (from, at) = ((&root, &place), (&there, &at));
+            self.rooms.moving(from, Some(at), || self.library.relocate(&self.store, from, at))?;
+        }
+        self.entry(who, &space.told(role), &there, &at)
+    }
+
+    /// Moves the folder at `path` in `space` to the space's trash, with everything in it. Whoever has a
+    /// document in it open is told that it is gone.
+    pub fn trash_folder(&self, who: &Signed, space: &str, path: &str) -> Answer<()> {
+        let (_, root, place) = self.folder_in(who, space, path)?;
+        let thrown = || self.library.trash(&self.store, &root, &place, self.now());
+        self.rooms.moving((&root, &place), None, thrown)
     }
 
     /// Moves the document `id` to the trash of its space.

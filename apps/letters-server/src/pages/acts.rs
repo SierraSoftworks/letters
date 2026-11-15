@@ -76,11 +76,16 @@ async fn new_folder(State(app): State<Shared>, Visitor(who): Visitor, Form(withi
     .await
 }
 
-/// A document, as the form of a question about it names it.
+/// A document, as the form of a question about it names it, or a folder when the form names no document.
 #[derive(Deserialize)]
 struct About {
     #[serde(default)]
     id: String,
+    /// The folder the question is about, and the space it is in.
+    #[serde(default)]
+    space: String,
+    #[serde(default)]
+    folder: String,
     /// The page the question was asked on.
     #[serde(default)]
     back: String,
@@ -103,7 +108,14 @@ impl About {
 }
 
 async fn rename(State(app): State<Shared>, Visitor(who): Visitor, Form(about): Form<About>) -> Response {
-    done(app, about.back(), move |app| app.rename(&who, &about.id, &about.name).map(|_| about.back())).await
+    done(app, about.back(), move |app| {
+        match about.id.is_empty() {
+            true => app.rename_folder(&who, &about.space, &about.folder, &about.name)?,
+            false => app.rename(&who, &about.id, &about.name)?,
+        };
+        Ok(about.back())
+    })
+    .await
 }
 
 async fn relocate(State(app): State<Shared>, Visitor(who): Visitor, Form(about): Form<About>) -> Response {
@@ -112,14 +124,25 @@ async fn relocate(State(app): State<Shared>, Visitor(who): Visitor, Form(about):
         if space.is_empty() {
             return Err(Refusal::invalid("Choose the folder to move it to."));
         }
-        app.relocate(&who, &about.id, &Move { space: space.to_owned(), folder: folder.to_owned() })?;
+        let to = Move { space: space.to_owned(), folder: folder.to_owned() };
+        match about.id.is_empty() {
+            true => app.move_folder(&who, &about.space, &about.folder, &to)?,
+            false => app.relocate(&who, &about.id, &to)?,
+        };
         Ok(about.back())
     })
     .await
 }
 
 async fn trash(State(app): State<Shared>, Visitor(who): Visitor, Form(about): Form<About>) -> Response {
-    done(app, about.back(), move |app| app.trash(&who, &about.id).map(|()| about.back())).await
+    done(app, about.back(), move |app| {
+        match about.id.is_empty() {
+            true => app.trash_folder(&who, &about.space, &about.folder)?,
+            false => app.trash(&who, &about.id)?,
+        };
+        Ok(about.back())
+    })
+    .await
 }
 
 impl About {

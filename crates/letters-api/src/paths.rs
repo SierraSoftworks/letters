@@ -65,6 +65,27 @@ pub fn folders(space: &str) -> String {
     format!("{SPACES}/{}/folders", segment(space))
 }
 
+/// `POST` a [`Rename`](crate::Rename): the folder at `path` under its new name, as an
+/// [`Entry`](crate::Entry). Whoever has a document in it open stays in it.
+pub fn rename_folder(space: &str, path: &str) -> String {
+    folder_act(space, path, "rename")
+}
+
+/// `POST` a [`Move`](crate::Move): the folder at `path` in another folder, with everything in it, as an
+/// [`Entry`](crate::Entry). A folder is not moved into itself, and nothing where it goes is replaced.
+pub fn move_folder(space: &str, path: &str) -> String {
+    folder_act(space, path, "move")
+}
+
+/// `POST`: moves the folder at `path` to its space's trash, with everything in it.
+pub fn trash_folder(space: &str, path: &str) -> String {
+    folder_act(space, path, "trash")
+}
+
+fn folder_act(space: &str, path: &str, act: &str) -> String {
+    format!("{SPACES}/{}/folders/{act}?path={}", segment(space), segment(path))
+}
+
 /// `GET`: the document as [`Opened`](crate::Opened).
 pub fn document(id: &str) -> String {
     format!("{API}/documents/{}", segment(id))

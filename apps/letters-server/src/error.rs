@@ -77,6 +77,10 @@ impl From<io::Error> for Refusal {
             io::ErrorKind::AlreadyExists => {
                 Self::new(Code::NameTaken, "A document or folder with that name already exists.")
             }
+            // Only a folder's move says so: a document is copied across.
+            io::ErrorKind::CrossesDevices => {
+                Self::invalid("A folder cannot be moved to a space on another disk. Move its documents instead.")
+            }
             _ => {
                 crate::log(&format!("a folder refused: {error}"));
                 Self::new(Code::Unavailable, "The folder behind this space cannot be used just now.")

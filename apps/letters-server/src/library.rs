@@ -357,26 +357,27 @@ impl Library {
     pub fn relocate(&self, store: &Store, from: (&Root, &Place), to: (&Root, &Place)) -> Answer<()> {
         let ((from_folder, from_name), (to_folder, to_name)) = (from.1.split(), to.1.split());
         from.0.folder(&from_folder)?.move_to(from_name, &to.0.folder(&to_folder)?, to_name)?;
-        self.forget(store, from.0, from.1)
+        self.forget(store, from.0, from.1)?;
+        self.carry(store, from, Some(to))
     }
 
-    /// Moves the document at `place` to its root's trash, which remembers where it was.
+    /// Moves the document or folder at `place` to its root's trash, which remembers where it was.
     pub fn trash(&self, store: &Store, root: &Root, place: &Place, now: u64) -> Answer<()> {
         let (folder, name) = place.split();
         let (folder, trash) = (root.folder(&folder)?, root.trash()?);
         let kept = moved_free(&folder, name, &trash, name)?;
         store.put(&THROWN, &format!("{}\0{kept}", root.key), &Thrown { path: place.as_str().to_owned(), at: now })?;
-        self.forget(store, root, place)
+        self.forget(store, root, place)?;
+        self.carry(store, (root, place), None)
     }
 
-    /// The documents in the trash of `root`, the last thrown away first, each with what the trash
-    /// remembers of it.
+    /// The documents and folders in the trash of `root`, the last thrown away first, each with what the
+    /// trash remembers of it.
     pub fn thrown(&self, store: &Store, root: &Root) -> Answer<Vec<(Listed, Option<Thrown>)>> {
         let Some(trash) = root.thrown()? else { return Ok(Vec::new()) };
         let prefix = format!("{}\0", root.key);
         let mut remembered: HashMap<String, Thrown> = store.under(&THROWN, &prefix)?.into_iter().collect();
-        let files = trash.list()?.into_iter().filter(|listed| !listed.folder);
-        let mut thrown: Vec<(Listed, Option<Thrown>)> = files
+        let mut thrown: Vec<(Listed, Option<Thrown>)> = (trash.list()?.into_iter())
             .map(|listed| {
                 let was = remembered.remove(&format!("{prefix}{}", listed.name));
                 (listed, was)
@@ -400,6 +401,9 @@ impl Library {
         };
         let kept = moved_free(&trash, file, &root.folder(&place)?, name)?;
         store.remove(&THROWN, &key)?;
+        // The documents of a folder that is back are in no index: the next one asked for by its id is
+        // looked for at once.
+        self.scanned.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&root.key);
         place.child(&kept)
     }
 
@@ -410,14 +414,42 @@ impl Library {
             None => Ok(()),
         })?)
     }
+
+    /// Takes what the index holds of the files in the folder that was at `from` along to `to`, where the
+    /// folder is now, or out of the index when the folder went to the trash. A document in a folder that
+    /// moved is then found by its id at once, where the next scan would find it only later.
+    fn carry(&self, store: &Store, from: (&Root, &Place), to: Option<(&Root, &Place)>) -> Answer<()> {
+        let prefix = format!("{}/", file_key(from.0, from.1));
+        let inside = |folder: &Place, rest: &str| Place::parse(&format!("{}/{rest}", folder.as_str())).ok();
+        let mut moved = Vec::new();
+        for (key, known) in store.under(&FILES, &prefix)? {
+            let rest = &key[prefix.len()..];
+            // A row that names no place is found out by the next scan.
+            let Some(was) = inside(from.1, rest) else { continue };
+            moved.push((was, to.and_then(|(root, folder)| Some((root, inside(folder, rest)?))), known));
+        }
+        Ok(store.write(|batch| {
+            for (was, now, known) in &moved {
+                index(batch, from.0, was, Some(known), None)?;
+                if let Some((root, now)) = now {
+                    let stale = batch.get(&FILES, &file_key(root, now))?;
+                    index(batch, root, now, stale.as_ref(), Some(known))?;
+                }
+            }
+            Ok(())
+        })?)
+    }
 }
 
-/// Moves the document `name` of `from` to `to` as `wanted`, or as the first of "`wanted` 2" and so on that
-/// is free there. Says the name it has now.
+/// Moves the document or folder `name` of `from` to `to` as `wanted`, or as the first of "`wanted` 2" and
+/// so on that is free there. Says the name it has now.
 fn moved_free(from: &Folder, name: &str, to: &Folder, wanted: &str) -> Answer<String> {
-    let stem = wanted.strip_suffix(EXTENSION).unwrap_or(wanted);
+    let (stem, ending) = match wanted.strip_suffix(EXTENSION) {
+        Some(stem) => (stem, EXTENSION),
+        None => (wanted, ""),
+    };
     for n in 1.. {
-        let kept = if n == 1 { wanted.to_owned() } else { format!("{stem} {n}{EXTENSION}") };
+        let kept = if n == 1 { wanted.to_owned() } else { format!("{stem} {n}{ending}") };
         match from.move_to(name, to, &kept) {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             done => {

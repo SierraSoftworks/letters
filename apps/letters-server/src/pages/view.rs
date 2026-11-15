@@ -8,7 +8,7 @@ use yew::prelude::*;
 use yewi::prelude::*;
 
 use super::{ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH};
-use super::{ACT_SHARE, ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking};
+use super::{ACT_SHARE, ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder};
 
 /// Everything one page shows. It is made where the request is answered and drawn on another thread, so it
 /// holds plain text.
@@ -72,7 +72,7 @@ pub struct Folder {
     pub ask: Option<Ask>,
 }
 
-/// A question about one document, asked in a dialog over its folder.
+/// A question about one document or one folder, asked in a dialog over the folder it is in.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ask {
     Rename(api::Entry),
@@ -92,10 +92,11 @@ pub struct Target {
     pub label: String,
 }
 
-/// A document in the trash of a space.
+/// A document or a folder in the trash of a space.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Trashed {
     pub space: api::Space,
+    pub folder: bool,
     /// The file's name in the trash.
     pub file: String,
     /// The name it had, and the space and folder it was in, as a person reads them.
@@ -305,6 +306,20 @@ fn file(row: &Row, here: Option<&str>, places: bool, shares: bool) -> Html {
                 </MenuButton>
             }
         }
+        // A folder is asked about by where it is.
+        None if entry.kind == EntryKind::Folder => match here.filter(|_| entry.role.edits()) {
+            Some(here) => {
+                let ask = |what: &str| asking_folder(here, what, &entry.path);
+                html! {
+                    <MenuButton label={format!("More for {}", entry.name)} icon_only=true variant={ButtonVariant::Subtle} size={Size::Small} placement={Placement::BottomEnd}>
+                        <MenuItem icon={icons::PENCIL} href={ask("rename")}>{ "Rename" }</MenuItem>
+                        <MenuItem icon={icons::FOLDER_INPUT} href={ask("move")}>{ "Move" }</MenuItem>
+                        <MenuItem icon={icons::TRASH_2} tone={Tone::Danger} href={ask("trash")}>{ "Move to trash" }</MenuItem>
+                    </MenuButton>
+                }
+            }
+            None => Html::default(),
+        },
         _ => Html::default(),
     };
     html! {
@@ -423,6 +438,9 @@ fn asked(ask: &Ask, here: &str) -> Html {
                 </Field>
             }
         }
+        Ask::Trash(entry) if entry.kind == EntryKind::Folder => html! {
+            <p>{ "Everything in it goes with it, and all of it can be put back from the trash." }</p>
+        },
         Ask::Trash(_) => html! { <p>{ "It can be put back from the trash." }</p> },
         Ask::Share(..) => Html::default(),
     };
@@ -436,7 +454,12 @@ fn asked(ask: &Ask, here: &str) -> Html {
     html! {
         <Dialog id="asked" open=true {title} size={Size::Small} {footer}>
             <form id="asked-form" method="post" {action}>
-                { hidden("id", entry.id.as_deref().unwrap_or_default()) }
+                if entry.kind == EntryKind::Folder {
+                    { hidden("space", entry.space.as_deref().unwrap_or_default()) }
+                    { hidden("folder", &entry.path) }
+                } else {
+                    { hidden("id", entry.id.as_deref().unwrap_or_default()) }
+                }
                 { hidden("back", here) }
                 { fields }
             </form>
@@ -564,7 +587,7 @@ fn trash(trashed: &[Trashed]) -> Html {
         html! {
             <tr class="yi-table__row">
                 <th scope="row">
-                    <span class="lt-file"><Icon icon={icons::FILE_TEXT} /><span class="lt-file__name">{ trashed.name.clone() }</span></span>
+                    <span class="lt-file"><Icon icon={if trashed.folder { icons::FOLDER } else { icons::FILE_TEXT }} /><span class="lt-file__name">{ trashed.name.clone() }</span></span>
                 </th>
                 <td class="lt-dim">{ trashed.from.clone() }</td>
                 <td class="lt-dim">{ trashed.thrown.clone() }</td>
@@ -587,7 +610,7 @@ fn trash(trashed: &[Trashed]) -> Html {
             <PageHeader title="Trash" />
             if trashed.is_empty() {
                 <EmptyState title="The trash is empty" icon={icons::TRASH_2}>
-                    { "Documents moved to the trash are kept here until they are put back." }
+                    { "Documents and folders moved to the trash are kept here until they are put back." }
                 </EmptyState>
             } else {
                 <SimpleTable label="Documents in the trash" variant={TableVariant::Ruled}>

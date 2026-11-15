@@ -188,6 +188,95 @@ async fn a_document_is_renamed_moved_and_thrown_away() {
     assert_eq!(server.scratch.names("home/ben/.letters-trash"), ["Quote roof.let"], "the file is kept, out of sight");
 }
 
+/// Makes the folders at `paths` in the family's space, each after the one it is in.
+async fn folders(who: &common::Client, paths: &[&str]) {
+    for path in paths {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        let new = NewFolder { parent: parent.into(), name: name.into() };
+        who.post::<Entry>(&paths::folders("family"), &new).await.expect("the folder is made");
+    }
+}
+
+#[tokio::test]
+async fn a_folder_is_renamed_moved_and_thrown_away_with_what_it_holds() {
+    let server = Server::new("folders");
+    let ben = server.person("ben", &["family"]);
+    folders(&ben, &["House", "House/Roof"]).await;
+    let id = ben.start("family", "House/Roof", "Quote").await.id.unwrap();
+    // The folders were just looked through for a document that is not there, so none is looked for again
+    // for a while: where this one is must be known as its folder moves.
+    assert_eq!(ben.get::<Opened>(&paths::document("no-such")).await.expect_err("nothing").code, Code::NotFound);
+    let at = async || {
+        let opened = ben.get::<Opened>(&paths::document(&id)).await.expect("the document is found");
+        (opened.space.unwrap_or_default(), opened.path)
+    };
+
+    let renamed: Entry =
+        ben.post(&paths::rename_folder("family", "House"), &Rename { name: "Home: ours".into() }).await.unwrap();
+    assert_eq!(
+        (renamed.kind, renamed.name.as_str(), renamed.path.as_str()),
+        (EntryKind::Folder, "Home ours", "Home ours")
+    );
+    assert_eq!(at().await, ("family".to_owned(), "Home ours/Roof/Quote.let".to_owned()));
+
+    let home = Move { space: "home".into(), folder: String::new() };
+    let moved: Entry = ben.post(&paths::move_folder("family", "Home ours/Roof"), &home).await.unwrap();
+    assert_eq!((moved.space.as_deref(), moved.path.as_str(), moved.role), (Some("home"), "Roof", Role::Owner));
+    assert_eq!(at().await, ("home".to_owned(), "Roof/Quote.let".to_owned()));
+    assert_eq!(names(&listed(&ben, "family", "Home ours").await), [] as [&str; 0], "nothing stays behind");
+
+    ben.post::<()>(&paths::trash_folder("home", "Roof"), &()).await.expect("thrown away");
+    assert!(listed(&ben, "home", "").await.is_empty());
+    assert_eq!(ben.get::<Opened>(&paths::document(&id)).await.expect_err("in the trash").code, Code::NotFound);
+    assert_eq!(server.scratch.names("home/ben/.letters-trash/Roof"), ["Quote.let"], "kept whole, out of sight");
+}
+
+#[tokio::test]
+async fn a_folder_goes_nowhere_it_cannot() {
+    let server = Server::new("folders-refused");
+    let ben = server.person("ben", &["family"]);
+    let guest = server.person("guest", &["friends"]);
+    folders(&ben, &["House", "House/Roof", "Garden", "Garden/Roof"]).await;
+    ben.start("family", "", "Plan").await;
+    let before = server.scratch.names("family");
+
+    let to = |folder: &str| Move { space: "family".into(), folder: folder.into() };
+    let moves = [
+        (&ben, "House", to("House"), Code::Invalid, "into itself"),
+        (&ben, "House", to("House/Roof"), Code::Invalid, "into a folder of its own"),
+        (&ben, "House/Roof", to("Garden"), Code::NameTaken, "where its name is taken"),
+        (&ben, "House", to("Nowhere"), Code::NotFound, "into no folder"),
+        (&ben, "Nowhere", to("Garden"), Code::NotFound, "no folder"),
+        (&ben, "Plan.let", to("Garden"), Code::NotFound, "a document, which goes by its id"),
+        (&ben, "", to("Garden"), Code::Invalid, "the space itself"),
+        (&ben, "House/../Garden", to(""), Code::Invalid, "no place in the space"),
+        (&guest, "House", to("Garden"), Code::Forbidden, "by a reader"),
+    ];
+    for (who, path, to, code, what) in moves {
+        let refused = who.post::<Entry>(&paths::move_folder("family", path), &to).await.expect_err(what);
+        assert_eq!(refused.code, code, "{what}");
+    }
+    let renames = [
+        (&ben, "House", "Garden", Code::NameTaken, "to a name that is taken"),
+        (&ben, "House", "Plan.let", Code::NameTaken, "to a document's name"),
+        (&ben, "House", "/", Code::Invalid, "to no name"),
+        (&guest, "House", "Home", Code::Forbidden, "by a reader"),
+    ];
+    for (who, path, name, code, what) in renames {
+        let rename = Rename { name: name.into() };
+        let refused = who.post::<Entry>(&paths::rename_folder("family", path), &rename).await.expect_err(what);
+        assert_eq!(refused.code, code, "{what}");
+    }
+    let thrown = guest.post::<()>(&paths::trash_folder("family", "House"), &()).await.expect_err("by a reader");
+    assert_eq!(thrown.code, Code::Forbidden);
+
+    assert_eq!(server.scratch.names("family"), before, "nothing moved");
+    assert_eq!(names(&listed(&ben, "family", "House").await), ["Roof"]);
+    // Where it already is, it stays, and that is no fault.
+    let stays: Entry = ben.post(&paths::move_folder("family", "House/Roof"), &to("House")).await.unwrap();
+    assert_eq!(stays.path, "House/Roof");
+}
+
 #[tokio::test]
 async fn a_reader_reads_and_changes_nothing() {
     let server = Server::new("reader");

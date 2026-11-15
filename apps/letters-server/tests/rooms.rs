@@ -164,6 +164,43 @@ async fn a_session_follows_its_document_when_it_is_renamed_and_moved() {
 }
 
 #[tokio::test]
+async fn a_session_follows_its_document_when_a_folder_above_it_is_renamed_moved_or_thrown_away() {
+    let server = Server::new("folder-follows");
+    let ada = server.person("ada", &["family"]);
+    for (parent, name) in [("", "Plans"), ("Plans", "Old"), ("", "Archive")] {
+        let new = NewFolder { parent: parent.into(), name: name.into() };
+        let _: Entry = ada.post(&paths::folders("family"), &new).await.unwrap();
+    }
+    let id = ada.start("family", "Plans/Old", "Plan").await.id.unwrap();
+    let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
+    settle([&mut desk]).await;
+    desk.write("Before. ");
+    settle([&mut desk]).await;
+
+    let _: Entry =
+        ada.post(&paths::rename_folder("family", "Plans"), &Rename { name: "Schemes".into() }).await.unwrap();
+    let there = Move { space: "family".into(), folder: "Archive".into() };
+    let _: Entry = ada.post(&paths::move_folder("family", "Schemes"), &there).await.unwrap();
+    desk.write("After. ");
+    settle([&mut desk]).await;
+    assert_eq!(desk.line.link(), Link::Live(Role::Editor), "the session went on");
+    let text = on_file(&ada, &id).await;
+    assert!(text.contains("Before.") && text.contains("After."), "{text}");
+    assert_eq!(server.scratch.names("family"), ["Archive"], "nothing is written where the folder was");
+    assert_eq!(server.scratch.names("family/Archive/Schemes/Old"), ["Plan.let"]);
+
+    desk.write("Kept all the same. ");
+    settle([&mut desk]).await;
+    ada.post::<()>(&paths::trash_folder("family", "Archive"), &()).await.unwrap();
+    settle([&mut desk]).await;
+    assert_eq!(desk.line.link(), Link::Refused(Refusal::Gone));
+    let thrown = server.scratch.0.join("family/.letters-trash/Archive/Schemes/Old/Plan.let");
+    let thrown = texts(std::fs::read(thrown).expect("it is in the trash, in its folder"));
+    assert!(thrown.join("\n").contains("Kept all the same."), "with what was written until then");
+    assert_eq!(server.scratch.names("family"), [".letters-trash"], "and nothing is written where it was");
+}
+
+#[tokio::test]
 async fn a_document_that_is_thrown_away_ends_its_sessions() {
     let (server, ada, id) = shared("thrown").await;
     let mut desk = Desk::open(&server, &ada, &id).await.unwrap();

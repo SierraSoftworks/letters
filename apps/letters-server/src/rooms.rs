@@ -302,43 +302,57 @@ impl Rooms {
         self.within(app, root, place, handed).map(|_| ())
     }
 
-    /// Does `work`, which moves or renames the file at `from` to `to`, or throws it away when there is no
-    /// `to`. A room that is open for the file saves first and follows the file, or ends with it.
+    /// Does `work`, which moves or renames the file or folder at `from` to `to`, or throws it away when
+    /// there is no `to`. A room that is open for the file, or for a file in the folder, saves first and
+    /// follows its file, or ends with it.
     ///
     /// No room is opened while a file moves, so that none writes to where the file was.
     pub fn moving<T>(
         &self,
         from: (&Root, &Place),
-        to: Option<(Root, Place)>,
+        to: Option<(&Root, &Place)>,
         work: impl FnOnce() -> Answer<T>,
     ) -> Answer<T> {
         let mut rooms = lock(&self.open);
-        let from = key(from.0, from.1);
-        let Some(open) = rooms.get(&from).cloned() else { return work() };
-        let mut state = lock(&open.state);
-        // What cannot be saved now stays in the journal, and goes to the file where it is next.
-        if open.act(self, &mut state, |hosted, now| hosted.save_through(now)).is_none() {
-            return work();
+        let at = key(from.0, from.1);
+        let inside =
+            |key: &str| key.strip_prefix(at.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+        let open: Vec<(String, Arc<Open>)> =
+            rooms.iter().filter(|(key, _)| inside(key)).map(|(key, open)| (key.clone(), open.clone())).collect();
+        let mut held = Vec::new();
+        for (was, open) in &open {
+            let mut state = lock(&open.state);
+            // What cannot be saved now stays in the journal, and goes to the file where it is next.
+            if open.act(self, &mut state, |hosted, now| hosted.save_through(now)).is_some() {
+                held.push((was, open, state));
+            }
         }
         let done = work()?;
-        rooms.remove(&from);
-        match to {
-            Some((root, place)) => {
-                let to = key(&root, &place);
-                let moved = open.act(self, &mut state, |hosted, _| {
-                    if let Err(error) = hosted.room.moved(&home(&root, &place), &mut hosted.state) {
-                        log(&format!("a room's journal could not be told of a move: {error}"));
+        for (was, open, mut state) in held {
+            rooms.remove(was);
+            // Where the file is now: `to` itself, or as far below it as the file was below `from`.
+            let rest = &was[at.len()..];
+            let now = to.and_then(|(root, place)| {
+                Some((root.again().ok()?, Place::parse(&format!("{}{rest}", place.as_str())).ok()?))
+            });
+            match now {
+                Some((root, place)) => {
+                    let to = key(&root, &place);
+                    let moved = open.act(self, &mut state, |hosted, _| {
+                        if let Err(error) = hosted.room.moved(&home(&root, &place), &mut hosted.state) {
+                            log(&format!("a room's journal could not be told of a move: {error}"));
+                        }
+                        (hosted.root, hosted.place) = (root, place);
+                        (hosted.parked, hosted.missing, hosted.hold) = (false, false, 0);
+                    });
+                    if moved.is_some() {
+                        rooms.insert(to, open.clone());
                     }
-                    (hosted.root, hosted.place) = (root, place);
-                    (hosted.parked, hosted.missing, hosted.hold) = (false, false, 0);
-                });
-                if moved.is_some() {
-                    rooms.insert(to, open.clone());
                 }
-            }
-            None => {
-                open.act(self, &mut state, |hosted, _| hosted.end(Ended::Gone));
-                open.close(self, &mut state);
+                None => {
+                    open.act(self, &mut state, |hosted, _| hosted.end(Ended::Gone));
+                    open.close(self, &mut state);
+                }
             }
         }
         Ok(done)

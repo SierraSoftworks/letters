@@ -208,7 +208,10 @@ impl Folder {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
         match self.dir.rename(name, &to.dir, new) {
-            Err(error) if error.kind() == io::ErrorKind::CrossesDevices => self.copy_to(name, to, new),
+            // A folder is not copied: half of it on each disk would be worse than where it is.
+            Err(error) if error.kind() == io::ErrorKind::CrossesDevices && !self.dir.metadata(name)?.is_dir() => {
+                self.copy_to(name, to, new)
+            }
             done => done,
         }
     }

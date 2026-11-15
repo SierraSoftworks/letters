@@ -29,7 +29,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use letters_api::{Code, Entry, Person, paths};
+use letters_api::{Code, Entry, EntryKind, Person, paths};
 use serde::Deserialize;
 use yew::ServerRenderer;
 
@@ -263,11 +263,14 @@ async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
 /// What a folder's address asks for beside the folder.
 #[derive(Default, Deserialize)]
 struct Asked {
-    /// The question to open the page with: `rename`, `move`, `trash` or `share`, about the document `id`.
+    /// The question to open the page with: `rename`, `move`, `trash` or `share`, about the document `id`,
+    /// or one of the first three about the folder at `folder`.
     #[serde(default)]
     ask: Option<String>,
     #[serde(default)]
     id: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
     /// The code of what a form on the page was refused with.
     #[serde(default)]
     error: Option<String>,
@@ -276,6 +279,12 @@ struct Asked {
 /// The address that opens the folder at `here` with a question about the document `id`.
 pub fn asking(here: &str, what: &str, id: &str) -> String {
     format!("{here}?ask={what}&id={}", paths::segment(id))
+}
+
+/// The address that opens the folder at `here` with a question about the folder at `path`, which is in
+/// it.
+pub fn asking_folder(here: &str, what: &str, path: &str) -> String {
+    format!("{here}?ask={what}&folder={}", paths::segment(path))
 }
 
 /// What an address says in place of a code when a conflict copy could not be merged.
@@ -332,8 +341,13 @@ async fn folder(
             let now = app.now();
             let edits = listing.space.role.edits();
             let about = |id: &String| listing.entries.iter().find(|entry| entry.id.as_ref() == Some(id)).cloned();
+            let within = |path: &String| {
+                let folders = listing.entries.iter().filter(|entry| entry.kind == EntryKind::Folder);
+                folders.clone().find(|entry| entry.path == *path).cloned()
+            };
+            let about = asked.id.as_ref().and_then(about).or_else(|| asked.folder.as_ref().and_then(within));
             let shares = may_share(listing.space.role);
-            let ask = match (asked.ask.as_deref(), asked.id.as_ref().and_then(about)) {
+            let ask = match (asked.ask.as_deref(), about) {
                 // Whoever may not share is asked nothing, as with a document that is gone.
                 (Some("share"), Some(entry)) => {
                     let people = entry.id.as_ref().and_then(|id| app.shares(&who, id).ok());
@@ -342,7 +356,14 @@ async fn folder(
                 (Some("rename"), Some(entry)) if edits => Some(Ask::Rename(entry)),
                 (Some("trash"), Some(entry)) if edits => Some(Ask::Trash(entry)),
                 (Some("move"), Some(entry)) if edits => {
-                    Some(Ask::Move(entry, targets(&app, &who, (&listing.space.id, &listing.path))))
+                    let mut targets = targets(&app, &who, (&listing.space.id, &listing.path));
+                    if entry.kind == EntryKind::Folder {
+                        // A folder goes into no folder of its own.
+                        let (own, inside) =
+                            (format!("{}/{}", listing.space.id, entry.path), |own: &str| format!("{own}/"));
+                        targets.retain(|target| target.value != own && !target.value.starts_with(&inside(&own)));
+                    }
+                    Some(Ask::Move(entry, targets))
                 }
                 _ => None,
             };
@@ -432,6 +453,7 @@ async fn trash(State(app): State<Shared>, Visitor(who): Visitor, Query(asked): Q
                     let (folder, name) = path.rsplit_once('/').unwrap_or(("", path));
                     let at = was.as_ref().map_or(seconds(listed.stamp), |was| was.at);
                     let thrown = Trashed {
+                        folder: listed.folder,
                         from: trail(&space.name, folder),
                         name: shown(name).to_owned(),
                         file: listed.name.clone(),

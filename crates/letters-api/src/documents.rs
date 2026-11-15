@@ -120,7 +120,7 @@ pub struct Rename {
     pub name: String,
 }
 
-/// Another folder for a document, in its own space or another the session may edit.
+/// Another folder for a document or a folder, in its own space or another the session may edit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Move {
     pub space: String,
