@@ -55,4 +55,23 @@ impl Words {
         let mut file = fs::OpenOptions::new().append(true).create(true).open(&self.path)?;
         file.write_all(format!("{gap}{word}\n").as_bytes())
     }
+
+    /// Takes a word out, wherever it stands. The list is written beside the file and renamed over it, so
+    /// that a window reading meanwhile finds the old list or the new one.
+    pub fn forget(&self, word: &str) -> io::Result<()> {
+        let known = match fs::read_to_string(&self.path) {
+            Ok(known) => known,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let word = word.trim();
+        let stays = |line: &&str| line.trim() != word;
+        if known.lines().all(|line| stays(&line)) {
+            return Ok(());
+        }
+        let kept: String = known.lines().filter(stays).flat_map(|line| [line, "\n"]).collect();
+        let beside = self.path.with_extension("txt.new");
+        fs::write(&beside, kept)?;
+        fs::rename(beside, &self.path)
+    }
 }

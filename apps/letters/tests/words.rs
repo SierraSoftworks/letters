@@ -81,3 +81,25 @@ fn a_word_the_editor_learns_is_kept_when_the_shell_says_where() {
     Desktop::new().with_words(shelf.words()).learn_word("veld");
     assert_eq!(shelf.read(), ["veld"]);
 }
+
+#[test]
+fn a_forgotten_word_is_gone_for_every_window_and_the_rest_stay() {
+    let shelf = Shelf::new("forgotten");
+    let (words, mut seen) = (shelf.words(), None);
+    for word in ["Pannell", "tailnet", "Yewi"] {
+        words.learn(word).unwrap();
+    }
+    assert_eq!(words.changed(&mut seen).map(|words| words.len()), Some(3));
+
+    words.forget(" tailnet ").unwrap();
+    assert_eq!(words.changed(&mut seen), Some(vec!["Pannell".to_owned(), "Yewi".to_owned()]));
+
+    // A word that is not there, and a dictionary that is not there, are nothing to do.
+    words.forget("tailnet").unwrap();
+    assert_eq!(words.changed(&mut seen), None, "the file is as it was");
+    Shelf::new("never-written").words().forget("anything").unwrap();
+
+    // A word learned afterwards stands on a line of its own.
+    words.learn("tailnet").unwrap();
+    assert_eq!(shelf.read(), ["Pannell", "Yewi", "tailnet"]);
+}

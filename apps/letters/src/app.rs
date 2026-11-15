@@ -23,7 +23,7 @@ use letters_render::image::Image;
 use letters_render::{Color, DisplayList, Font, Point, Size};
 use letters_spell::Dictionary;
 use letters_sync::{Local, Progress, Refusal};
-use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDecision, Origin, Trust};
+use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDecision, Origin, Trust, TrustError};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
     Access, Allows, Appearance, Browsed, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind,
@@ -727,6 +727,9 @@ struct DocWindow {
     twin: Option<PathBuf>,
     /// Whether that file was looked for, which is done once.
     twinned: bool,
+    /// Whether the person stopped trusting the document in this window, which then no longer vouches for
+    /// what was made in it.
+    forgotten: bool,
     /// The id the document had and the one it took as it became its own, until the app has carried what
     /// the person trusts of the first over to the second.
     forked: Option<(String, String)>,
@@ -1145,6 +1148,10 @@ impl DocWindow {
             let named = folder.and_then(|folder| Some(folder.file_name()?.to_string_lossy().into_owned()));
             self.view.set_safe_mode((!links).then_some(SafeMode { folder: named }));
         }
+        // What the Settings dialog lists, and whether it offers to stop trusting this document.
+        self.view.set_trusted_folders(trust::folders(trust));
+        self.view.set_trusted_sources(trust::sources(trust));
+        self.view.set_document_trusted(self.id.as_deref().is_some_and(|id| trust.trusts_document(id)));
     }
 
     /// Whether the document is trusted, and not in safe mode. One that has not said which document it is
@@ -1173,7 +1180,7 @@ impl DocWindow {
     /// Whether the document is trusted for where it came from, with nothing asked of what the person
     /// trusts: it was made in this window, or its server vouches for it.
     fn vouched(&self) -> bool {
-        self.made_here || self.remote.as_ref().is_some_and(Remote::vouched)
+        (self.made_here && !self.forgotten) || self.remote.as_ref().is_some_and(Remote::vouched)
     }
 
     /// Looks for the system's dictionaries for the languages the document names and has not asked about
@@ -2189,6 +2196,7 @@ impl App {
             twin: None,
             twinned: false,
             forked: None,
+            forgotten: false,
             remote: None,
             original: None,
             left: None,
@@ -2403,6 +2411,58 @@ impl App {
                 Request::TrustPictures(src) => self.trust_host(id, &src),
                 Request::TrustDocument => self.vouch_for(id, false),
                 Request::TrustFolder => self.vouch_for(id, true),
+                Request::TrustFolderDialog => {
+                    let Some(window) = self.windows.get(&id) else { continue };
+                    let dialog = FileDialog::new().set_directory(window.place.folder(&self.library));
+                    let chosen = dialog.set_parent(&*window.window).pick_folder();
+                    // Folders are matched as the system spells them.
+                    let folder = chosen.and_then(|folder| fs::canonicalize(folder).ok());
+                    if let Some(folder) = folder.as_deref().and_then(Path::to_str) {
+                        let kept = self.trust.trust_folder(folder);
+                        self.retrust(id, kept);
+                    }
+                }
+                Request::ForgetFolder(folder) => {
+                    let kept = self.trust.forget_folder(&folder);
+                    self.retrust(id, kept);
+                }
+                Request::TrustSource(typed) => match trust::source(&typed) {
+                    Ok(source) => {
+                        let kept = self.trust.trust_source(&source);
+                        self.retrust(id, kept);
+                    }
+                    Err(why) => {
+                        if let Some(window) = self.windows.get_mut(&id) {
+                            window.view.refuse_source(&why);
+                        }
+                    }
+                },
+                Request::ForgetSource(source) => {
+                    // One that cannot be read is none the file holds: the list is said again all the same.
+                    let kept = letters_trust::Source::parse(&source)
+                        .map_or(Ok(()), |source| self.trust.forget_source(&source));
+                    self.retrust(id, kept);
+                }
+                Request::ForgetDocument => {
+                    let Some(window) = self.windows.get_mut(&id) else { continue };
+                    let Some(document) = window.id.clone() else { continue };
+                    window.forgotten = true;
+                    let kept = self.trust.forget_document(&document);
+                    self.retrust(id, kept);
+                }
+                Request::ForgetWord(word) => {
+                    if let Err(error) = self.words.forget(&word) {
+                        eprintln!("letters: could not take {word:?} out of the dictionary: {error}");
+                        if let Some(window) = self.windows.get(&id) {
+                            window.alert(&format!(
+                                "The word could not be taken out of your dictionary{}.",
+                                files::because(&error)
+                            ));
+                        }
+                    }
+                    // Every window reads the list again, the one that asked too: it then shows what is kept.
+                    self.windows.values_mut().for_each(|window| window.reword(&self.words));
+                }
                 Request::OpenLink { href, confirmed } => self.open_link(id, &href, confirmed),
                 Request::Import { folders, comments } => self.bring_in(id, &folders, comments),
                 Request::CancelImport => {
@@ -3104,11 +3164,26 @@ impl App {
         match kept {
             Some(Err(error)) => window.alert(&format!("Your choice to trust it could not be kept.\n\n{error}")),
             Some(Ok(())) => {
+                // Trusted again, a document made in this window is vouched for as it was.
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.forgotten = false;
+                }
                 let (trust, library) = (self.trust.trust(), &self.library);
                 self.windows.values_mut().for_each(|window| window.retrust(trust, library));
             }
             None => {}
         }
+    }
+
+    /// Says to every window what the person trusts now, after a change the window `id` asked for, or tells
+    /// that window that the change could not be kept.
+    fn retrust(&mut self, id: WindowId, kept: Result<(), TrustError>) {
+        if let (Err(error), Some(window)) = (&kept, self.windows.get(&id)) {
+            window.alert(&format!("Your choice could not be kept.\n\n{error}"));
+        }
+        // Said again either way: a window shows a row until it is told the list without it.
+        let (trust, library) = (self.trust.trust(), &self.library);
+        self.windows.values_mut().for_each(|window| window.retrust(trust, library));
     }
 
     /// Opens a link that was clicked in a window, if the person's trust lets it: a link from a document
@@ -3187,8 +3262,16 @@ impl App {
         let kept = HttpsUrl::parse(src).map_err(|error| error.to_string()).and_then(|url| {
             self.trust.trust_source(&letters_trust::Source::host_of(&url)).map_err(|error| error.to_string())
         });
-        if let (Err(error), Some(window)) = (kept, self.windows.get(&id)) {
-            window.alert(&format!("The host could not be kept as one you trust.\n\n{error}"));
+        match (kept, self.windows.get(&id)) {
+            (Err(error), Some(window)) => {
+                window.alert(&format!("The host could not be kept as one you trust.\n\n{error}"));
+            }
+            (Err(_), None) => {}
+            // The Settings dialog of every window lists it from now on.
+            (Ok(()), _) => {
+                let (trust, library) = (self.trust.trust(), &self.library);
+                self.windows.values_mut().for_each(|window| window.retrust(trust, library));
+            }
         }
     }
 

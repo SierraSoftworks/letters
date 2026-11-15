@@ -5,7 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use letters_trust::{Gate, Mode, Origin, Store, Trust, TrustError, TrustStore};
+use letters_trust::{Gate, Mode, Origin, Source, Store, Trust, TrustError, TrustStore, UrlError};
+use letters_ui::{TrustedFolder, TrustedSource};
 
 /// The settings file. Whatever else it holds is left as its writer had it.
 #[derive(Clone, Debug)]
@@ -87,4 +88,32 @@ pub fn import(trust: &mut Trusted, id: &str, source: &Path) -> Result<Mode, Trus
         true => trust.trust_document(id).map(|()| Mode::Trusted),
         false => trust.import_document(id).map(|()| Mode::Safe),
     }
+}
+
+/// The folders the person trusts, for a window's Settings to list: each as the settings file writes it,
+/// which is under `~` where it can be, and is what [`TrustStore::forget_folder`] takes back.
+pub fn folders(trust: &Trust) -> Vec<TrustedFolder> {
+    trust.folders().iter().map(|folder| TrustedFolder { path: folder.clone(), shown: folder.clone() }).collect()
+}
+
+/// The sources linked pictures load from, for a window's Settings to list. All are the person's own: only
+/// a server has an administrator's.
+pub fn sources(trust: &Trust) -> Vec<TrustedSource> {
+    trust.sources().iter().map(|source| TrustedSource { source: source.to_string(), fixed: false }).collect()
+}
+
+/// The source a person typed in Settings, or why it is none, as they are to read it.
+pub fn source(typed: &str) -> Result<Source, String> {
+    Source::parse(typed).map_err(|error| {
+        match error {
+            UrlError::NotHttps => {
+                "A source must start with https://, so that nobody on the way sees what is asked for."
+            }
+            UrlError::Credentials => "A source cannot hold a user name or a password.",
+            UrlError::Private | UrlError::Malformed => {
+                "A source is a host such as img.example.org, or an address that starts with https://."
+            }
+        }
+        .to_owned()
+    })
 }

@@ -93,3 +93,42 @@ fn the_rest_of_the_settings_file_is_left_as_it_was() {
     let folder = fs::read_dir(home.settings().parent().unwrap()).unwrap();
     assert_eq!(folder.count(), 1, "nothing is left beside the file");
 }
+
+#[test]
+fn settings_list_what_is_trusted_as_the_file_writes_it() {
+    let home = Home::new("listed");
+    let folder = home.file("Documents/Letters/Rates.let").parent().unwrap().to_owned();
+    let mut trust = trust::store(&home.0);
+    trust.load().unwrap();
+    trust.trust_folder(folder.to_str().unwrap()).unwrap();
+    trust.trust_source(&trust::source("img.example.org").unwrap()).unwrap();
+
+    let folders = trust::folders(trust.trust());
+    let shown: Vec<&str> = folders.iter().map(|folder| folder.shown.as_str()).collect();
+    assert_eq!(shown, ["~/Documents/Letters"], "under the home folder, as the person knows it");
+    let sources = trust::sources(trust.trust());
+    assert!(matches!(sources.as_slice(), [source] if source.source.contains("img.example.org") && !source.fixed));
+
+    // What a list gave is what takes a row off it again.
+    trust.forget_folder(&folders[0].path).unwrap();
+    trust.forget_source(&trust::source(&sources[0].source).unwrap()).unwrap();
+    assert!(trust::folders(trust.trust()).is_empty() && trust::sources(trust.trust()).is_empty());
+    assert_eq!(trust::mode(trust.trust(), "some-id", Some(&folder.join("Rates.let"))), Mode::Safe);
+}
+
+#[test]
+fn a_source_that_is_none_is_refused_in_a_sentence() {
+    for typed in ["img.example.org", "https://img.example.org/charts/", " img.example.org:8443 "] {
+        assert!(trust::source(typed).is_ok(), "{typed:?}");
+    }
+    for typed in [
+        "",
+        "http://img.example.org",
+        "https://ada:secret@img.example.org",
+        "https://img.example.org/?q=1",
+        "not a host",
+    ] {
+        let why = trust::source(typed).expect_err(typed);
+        assert!(why.ends_with('.') && why.starts_with("A source"), "{typed:?}: {why}");
+    }
+}
