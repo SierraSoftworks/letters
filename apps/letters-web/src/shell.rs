@@ -18,7 +18,9 @@ use letters_model::{
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::{Color, DisplayList, Point, Rect, Size};
 use letters_trust::{LinkDecision, Origin, Trust};
-use letters_ui::{Appearance, CopyFormat, Cursor, Edge, Keys, Request, Scheme, Settings, Window as View, tokens};
+use letters_ui::{
+    Appearance, CopyFormat, Cursor, Edge, Keys, Request, SaveState, Scheme, Settings, Window as View, tokens,
+};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
@@ -166,6 +168,10 @@ pub struct Shell {
     /// The document's id and when it was created, which its file says. One that never had a file is
     /// given them when it is first saved.
     identity: Option<[String; 2]>,
+    /// Whether the document's file is being written.
+    saving: bool,
+    /// What the window was last told of saving.
+    save_state: SaveState,
     /// The revision a file was opened at, until the person writes on from it.
     session: Option<Revision>,
     /// What `View::edits` last said.
@@ -292,6 +298,8 @@ impl Shell {
                 opener: opener.clone(),
                 kept: view.edits(),
                 identity: None,
+                saving: false,
+                save_state: SaveState::default(),
                 session: None,
                 written: view.edits(),
                 rested: None,
@@ -449,6 +457,7 @@ impl Shell {
         self.view = view(document, &mut self.platform, self.mac);
         (self.kept, self.identity) = (self.view.edits(), None);
         (self.session, self.written, self.rested) = (None, self.kept, None);
+        self.save_state = SaveState::default();
         self.text = TextInput::new(self.mac);
         self.touch = Touch::default();
         self.rest();
@@ -699,7 +708,9 @@ impl Shell {
     fn save(&mut self) {
         let written = self.view.edits();
         let title = self.window.document().map(|page| page.title()).unwrap_or_default();
+        self.saving = true;
         self.export("let", true, title, move |shell, made| {
+            shell.saving = false;
             let saved = made.and_then(|file| {
                 // A document whose name no file can have is kept all the same.
                 let name = file.name.unwrap_or_else(|| format!("Untitled{DOCUMENTS}"));
@@ -803,6 +814,7 @@ impl Shell {
         });
         (self.kept, self.identity) = (view.edits(), Some(identity));
         (self.session, self.written, self.rested) = (session, self.kept, None);
+        self.save_state = SaveState::default();
         self.view = view;
         self.text = TextInput::new(self.mac);
         self.touch = Touch::default();
@@ -946,6 +958,7 @@ impl Shell {
                 }
                 Request::Pictures => self.picker.click(),
                 Request::OpenDialog => self.opener.click(),
+                Request::Save => self.save(),
                 Request::Print => self.print(),
                 Request::Asset(name) => self.load(name),
                 Request::OpenLink { href, confirmed } => self.open_link(&href, confirmed),
@@ -961,6 +974,16 @@ impl Shell {
                 // Recent documents, new ones and moves need files, which wait for a server behind the page.
                 _ => {}
             }
+        }
+        // The window offers to save what is nowhere but on the page.
+        let state = match self.view.edits() == self.kept {
+            _ if self.saving => SaveState::Saving,
+            true => SaveState::Saved,
+            false => SaveState::Edited,
+        };
+        if state != self.save_state {
+            self.save_state = state;
+            self.view.set_save_state(state);
         }
         if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
             self.frame_due = self.window.request_animation_frame(&self.on_frame).is_ok();
@@ -1195,8 +1218,8 @@ impl Shell {
 
     fn key_down(&mut self, event: KeyboardEvent) {
         let ime = event.is_composing() || event.key_code() == 229;
-        // The window has no save command, since a document with a home is saved as it is written. A
-        // page has no home for it yet, and the browser's own answer to the key would save the page.
+        // The window takes the key only while there is something to keep. The browser's own answer to it
+        // would save the page, and a file that was lost is asked for again with the same key.
         let primary = if self.mac { event.meta_key() } else { event.ctrl_key() };
         if primary && !ime && !event.shift_key() && !event.alt_key() && event.key().eq_ignore_ascii_case("s") {
             event.prevent_default();

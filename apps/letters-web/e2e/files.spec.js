@@ -82,6 +82,19 @@ test("Ctrl or Cmd with S keeps the document as its own file, which stays the sam
   expect(identity(second)).toEqual(identity(first));
 });
 
+test("the bar offers to save what was written on the page, until it is kept", async ({ page }) => {
+  const save = page.getByRole("button", { name: "Save", exact: true });
+  await expect(save).toHaveCount(0);
+
+  await page.keyboard.type("Kept from the bar");
+  await save.waitFor({ state: "attached" });
+  const kept = page.waitForEvent("download");
+  await save.dispatchEvent("click");
+  const file = await readFile(await (await kept).path());
+  expect(entry(file, "document.json")).toContain("Kept from the bar");
+  await expect(save).toHaveCount(0);
+});
+
 test("a file that was opened is saved as the same document, and copied as another", async ({ page }) => {
   await page.keyboard.type("From one page");
   const file = await saved(page);
