@@ -469,7 +469,12 @@ impl Desk {
 
 /// Lets the devices and the server carry on until `until` holds. Whether it came to hold in good time.
 fn settle(desks: &mut [&mut Desk], until: impl Fn(&[&mut Desk]) -> bool) -> bool {
-    let ended = Instant::now() + Duration::from_secs(20);
+    settle_within(Duration::from_secs(20), desks, until)
+}
+
+/// As [`settle`], for what takes a machine long to work out.
+fn settle_within(patience: Duration, desks: &mut [&mut Desk], until: impl Fn(&[&mut Desk]) -> bool) -> bool {
+    let ended = Instant::now() + patience;
     while Instant::now() < ended {
         desks.iter_mut().for_each(|desk| desk.turn());
         if until(desks) {
@@ -793,7 +798,9 @@ fn work_that_fits_no_frame_travels_as_the_file() {
             .iter()
             .all(|desk| live(desk) && desk.reads().len() == paragraphs && desk.line.progress() == Progress::Saved)
     };
-    let all = settle(&mut [&mut here, &mut there], met);
+    // Nothing here is waited out: the server reads and merges the file for seconds of one core, and so
+    // does the other device. A slow machine is given the time.
+    let all = settle_within(Duration::from_secs(120), &mut [&mut here, &mut there], met);
     assert!(all, "{:?} {:?} {} {}", here.line.link(), there.line.link(), here.reads().len(), there.reads().len());
     assert!(here.refused.is_empty() && there.refused.is_empty(), "{:?} {:?}", here.refused, there.refused);
 
