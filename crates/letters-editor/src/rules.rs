@@ -170,7 +170,9 @@ impl Editor {
         let at = |caret: &Caret| caret.selection.is_caret() && !caret.picture;
         let Some(caret) = self.caret.clone().filter(at) else { return false };
         let pos = caret.selection.head;
-        if self.label_rule(&pos) || self.reference_rule(&pos, &caret.marks) {
+        // A stretch of text on its own has no figure to label or to refer to, and stays the block it is.
+        let page = !self.inline_only;
+        if page && (self.label_rule(&pos) || self.reference_rule(&pos, &caret.marks)) {
             return true;
         }
         let doc = self.doc();
@@ -184,7 +186,7 @@ impl Editor {
         let (typed, rest) = text.split_at(pos.offset);
         let clear = Op::DeleteText { block: id.clone(), range: 0..pos.offset };
 
-        match block_rule(typed, rest, &block.kind) {
+        match block_rule(typed, rest, &block.kind).filter(|_| page) {
             Some(BlockRule::Kind(kind)) => {
                 self.apply(vec![clear, Op::SetKind { block: id.clone(), kind }]);
             }
@@ -267,14 +269,17 @@ impl Editor {
         if marks.contains(&Mark::Code) || marks.contains(&Mark::Math) {
             return false;
         }
-        if typed.ends_with('$') {
+        // Where no maths is written a dollar sign marks nothing, and holds no shorthand back.
+        let maths = !self.inline_only;
+        if maths && typed.ends_with('$') {
             return self.apply_maths_rule(id, typed, marks, platform);
         }
+        let in_maths = maths && in_maths(typed);
         if let Some(before) = typed.strip_suffix(' ') {
             // A space after the address of a web page makes a link of it.
-            return !in_maths(typed) && self.link_typed(id, before.len());
+            return !in_maths && self.link_typed(id, before.len());
         }
-        let Some(span) = inline_rule(typed).filter(|_| !in_maths(typed)) else { return false };
+        let Some(span) = inline_rule(typed).filter(|_| !in_maths) else { return false };
         let Some(runs) = self.block(id).map(|block| block.body.runs()) else { return false };
         if text::marks_after(runs, span.open.start).contains(&Mark::Code) {
             return false;

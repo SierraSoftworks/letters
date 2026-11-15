@@ -524,6 +524,11 @@ impl Editor {
     pub(crate) fn split(&mut self, pressed: bool, platform: &mut dyn Platform) -> Kind {
         self.delete_selection();
         let Some(caret) = self.caret.clone() else { return Kind::Other };
+        if self.inline_only {
+            // A stretch of text on its own is one block, so the break stays inside it.
+            self.insert("\n");
+            return Kind::Other;
+        }
         if caret.picture {
             // Enter on a picture starts its caption.
             self.edit_caption(platform);

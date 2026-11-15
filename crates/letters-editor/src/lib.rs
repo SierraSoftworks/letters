@@ -442,6 +442,8 @@ pub struct Editor {
     unfetched: Vec<String>,
     /// Whether the shell can fetch what a page says of itself.
     fetching: bool,
+    /// Whether typing leaves blocks as they are, see [`Editor::set_inline_only`].
+    inline_only: bool,
 }
 
 impl Editor {
@@ -470,6 +472,7 @@ impl Editor {
             renames: Vec::new(),
             unfetched: Vec::new(),
             fetching: true,
+            inline_only: false,
         };
         if let Some(pos) = first {
             editor.place(pos);
@@ -606,6 +609,19 @@ impl Editor {
     pub fn set_preview_fetching(&mut self, offered: bool) {
         self.fetching = offered;
         if !offered {
+            self.unfetched.clear();
+        }
+    }
+
+    /// Says that this editor writes a stretch of marked text, such as a comment, and not a page. It
+    /// writes a page until told otherwise. In a stretch of text, typing never makes or changes a block:
+    /// of the shorthand only what marks text counts (bold, italic, strike, code, a link in brackets, an
+    /// address typed out), a dollar sign starts no maths, no address becomes a card or is named by
+    /// [`Editor::take_unfetched`], and Enter breaks the line inside its block. Commands do what they
+    /// say all the same, so the caller holds back those that have no place there.
+    pub fn set_inline_only(&mut self, on: bool) {
+        self.inline_only = on;
+        if on {
             self.unfetched.clear();
         }
     }

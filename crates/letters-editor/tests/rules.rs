@@ -3,6 +3,7 @@ mod common;
 use common::Do::{self, K, T};
 use common::{Harness, canon};
 use letters_editor::InputEvent;
+use letters_model::{BlockKind, Mark};
 
 fn play(before: &str, script: &[Do]) -> String {
     let mut editor = Harness::new(before);
@@ -175,4 +176,73 @@ fn shorthand_typed_through_an_input_method_counts_too() {
     editor.input(InputEvent::SetComposition { text: "#".into(), selection: None });
     editor.input(InputEvent::Commit("# ".into()));
     assert_eq!(editor.state(), "h1 |");
+}
+
+/// An editor that writes a stretch of text on its own, such as a comment.
+fn inline(before: &str) -> Harness {
+    let mut editor = Harness::new(before);
+    editor.editor.set_inline_only(true);
+    editor
+}
+
+#[test]
+fn a_stretch_of_text_on_its_own_stays_the_block_it_is() {
+    // What on a page makes or changes a block, starts maths, or shows a page as a card.
+    let cases = [
+        "# ",
+        "- ",
+        "1. ",
+        "[ ] ",
+        "> ",
+        "---",
+        "[!info]",
+        "```rust\n",
+        "$$\n",
+        "$x$",
+        "$$x$$",
+        "| a | b |\n",
+        "https://a.example\n",
+        "one\ntwo",
+    ];
+    for typed in cases {
+        let mut editor = inline("p |");
+        editor.type_text(typed);
+
+        let blocks = &editor.editor.doc().blocks;
+        assert_eq!(blocks.len(), 1, "typing {typed:?}");
+        assert_eq!(blocks[0].kind, BlockKind::Paragraph, "typing {typed:?}");
+        assert_eq!(blocks[0].plain_text(), typed);
+        assert!(blocks[0].body.runs().iter().all(|run| run.marks.is_empty()), "typing {typed:?} marks nothing");
+    }
+    let mut editor = inline("p one|");
+    editor.play(&[K("Enter"), T("two")]);
+    assert_eq!(editor.editor.doc().blocks.len(), 1, "Enter breaks the line inside the block");
+}
+
+#[test]
+fn a_stretch_of_text_on_its_own_takes_the_shorthand_that_marks_text() {
+    let cases = [
+        ("**a**", "p **a|**"),
+        ("*a*", "p *a|*"),
+        ("~~a~~", "p ~~a|~~"),
+        ("`a`", "p `a|`"),
+        ("[a](https://a.example)", "p [a](https://a.example)|"),
+        ("https://a.example ", "p [https://a.example](https://a.example) |"),
+    ];
+    for (typed, after) in cases {
+        let mut editor = inline("p |");
+        editor.type_text(typed);
+        assert_eq!(editor.state(), canon(after), "typing {typed:?}");
+        assert!(editor.editor.take_unfetched().is_empty(), "{typed:?}: no page is fetched for a link there");
+
+        // Backspace straight after gives back what was typed, as it does on a page.
+        editor.key("Backspace");
+        assert_eq!(editor.state(), play("p |", &[T(typed), K("Backspace")]), "{typed:?} given back");
+        assert_eq!(editor.editor.doc().blocks[0].plain_text(), typed, "{typed:?} given back");
+    }
+    // A dollar sign is no start of maths there, so it holds no shorthand back.
+    let mut editor = inline("p |");
+    editor.type_text("$a *b*");
+    let runs = editor.editor.doc().blocks[0].body.runs();
+    assert!(runs.iter().any(|run| run.text == "b" && run.marks.contains(&Mark::Italic)), "{}", editor.state());
 }
