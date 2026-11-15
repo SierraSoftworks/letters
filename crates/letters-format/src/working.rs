@@ -94,6 +94,13 @@ impl WorkingCopy {
         self.model.style()
     }
 
+    /// Names who writes here and tells the time, in seconds since 1970, for a writer with no editor of its
+    /// own. Edits made from here on carry both, and a conflict shows them beside each version.
+    pub fn sign(&mut self, author: &str, time: u64) {
+        self.model.set_author(author);
+        self.model.set_time(time);
+    }
+
     /// Changes the style here, for a writer with no editor of its own. Fields left as they are stay open to
     /// what other writers make of them.
     pub fn set_style(&mut self, style: Style) -> Result<Change, OpError> {
@@ -160,9 +167,22 @@ impl WorkingCopy {
         }
         notes.pin(&model);
         let restyled = self.unread_style.as_ref().is_some_and(|carried| carried != self.model.style());
+        // Only copies that each hold edits the other lacks can have changed the same words.
+        let apart = self.model.compare(&merged).map_err(Error::History)?.is_none();
+        let apart = apart.then(|| (self.model.revision(), model.revision()));
 
         self.notes.pin(&self.model);
         let change = self.model.merge(&merged).map_err(Error::History)?;
+        if let Some((ours, theirs)) = apart {
+            for conflict in self.model.conflicts(&ours, &theirs).map_err(Error::History)? {
+                // A block one side took away has no second version to offer.
+                let Some(mut versions) = conflict.versions() else { continue };
+                if conflict.later == 0 {
+                    versions.swap(0, 1);
+                }
+                notes.notes.push(Note::conflict(conflict.block, versions));
+            }
+        }
         self.notes.merge(&notes);
         self.notes.follow(&self.model);
         if home {

@@ -7,5 +7,9 @@
   { "why": "a note of an unknown type is kept whatever else it holds",
     "json": { "format": 1, "scope": "all", "notes": [{ "id": "n", "type": "poll", "anchor": { "block": "b" }, "author": "Ana", "created": "2026-11-14T20:00:00Z", "versions": "none", "options": ["a", "b"] }] } },
   { "why": "an anchor may carry the stable ends Letters follows its text by",
-    "json": { "format": 1, "notes": [{ "id": "n", "type": "comment", "anchor": { "block": "b", "start": 4, "end": 9, "stable_start": "4@7001", "stable_end": "8@7001+" }, "author": "Ana", "created": "2026-11-14T20:00:00Z" }] } }
+    "json": { "format": 1, "notes": [{ "id": "n", "type": "comment", "anchor": { "block": "b", "start": 4, "end": 9, "stable_start": "4@7001", "stable_end": "8@7001+" }, "author": "Ana", "created": "2026-11-14T20:00:00Z" }] } },
+  { "why": "a side of a conflict may be by a writer who gave no name",
+    "json": { "format": 1, "notes": [{ "id": "n", "type": "conflict", "anchor": { "block": "b" }, "author": "Letters", "created": "2026-11-14T19:05:00Z",
+      "versions": [{ "author": "", "edited": "2026-11-14T19:00:00Z", "block": { "id": "b", "type": "divider" } },
+                   { "author": "Ben", "edited": "2026-11-14T19:05:00Z", "block": { "id": "b", "type": "divider" } }] }] } }
 ]

@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 
 use common::{Folder, ID, bytes, open, package, paragraph};
 use letters_format::{Error, NOTES, OPLOG, STYLE, Save, Saved, WorkingCopy, conflict_copy_of, save};
-use letters_model::{Anchor, BlockId, Document, Note, NoteKind, Op, Pos, ReplicaId, Run, Style};
+use letters_model::{Anchor, BlockId, Document, Note, NoteKind, Op, Pos, ReplicaId, Run, Style, Version};
 
 const NAME: &str = "report.let";
 
@@ -87,6 +87,26 @@ fn covered(copy: &WorkingCopy, note: &str) -> String {
     text(copy.model().doc())[anchor.range.clone().unwrap()].to_owned()
 }
 
+/// The two versions each conflict note of `copy` holds, as who wrote what.
+fn clashes(copy: &WorkingCopy) -> Vec<[(String, String); 2]> {
+    let side = |version: &Version| (version.author.clone(), version.block.plain_text());
+    let versions = |note: &Note| match &note.kind {
+        NoteKind::Conflict { versions } => Some([side(&versions[0]), side(&versions[1])]),
+        _ => None,
+    };
+    copy.notes.notes.iter().filter_map(versions).collect()
+}
+
+/// The desk and the laptop of [`shared`], after Ana and then Ben each changed "world" on their own.
+fn clashing() -> (Folder, WorkingCopy, WorkingCopy) {
+    let (folder, mut desk, mut laptop) = shared();
+    desk.sign("Ana", 1_794_000_000);
+    typed(&mut desk, 11, "s");
+    laptop.sign("Ben", 1_794_000_600);
+    typed(&mut laptop, 6, "under");
+    (folder, desk, laptop)
+}
+
 /// Whether two copies hold the same history.
 fn level(a: &WorkingCopy, b: &WorkingCopy) -> bool {
     a.model().compare(&b.model().save()).unwrap() == Some(Ordering::Equal)
@@ -123,6 +143,51 @@ fn two_writers_on_one_file_keep_everything_and_then_settle() {
     let saves = in_turn(&mut folder, &mut desk, &mut laptop, 4);
     assert!(saves.iter().all(|saved| matches!(saved, Saved::Unchanged)), "{saves:?}");
     assert_eq!(folder.changes(), settled);
+}
+
+#[test]
+fn one_word_changed_by_two_writers_raises_one_conflict_note_for_both() {
+    let (mut folder, mut desk, mut laptop) = clashing();
+    typed(&mut laptop, 0, "Oh. ");
+    let saves = in_turn(&mut folder, &mut desk, &mut laptop, 3);
+    assert!(saves.iter().all(|saved| matches!(saved, Saved::Written | Saved::Unchanged)), "{saves:?}");
+
+    let file = open_at(&folder, NAME, 4);
+    for (who, copy) in [("the file", &file), ("the desk", &desk), ("the laptop", &laptop)] {
+        let [[earlier, later]] = &clashes(copy)[..] else { panic!("{who}: {:?}", copy.notes.notes) };
+        assert_eq!(earlier, &("Ana".to_owned(), "Hello worlds".to_owned()), "{who}");
+        assert_eq!(later, &("Ben".to_owned(), "Oh. Hello underworld".to_owned()), "{who}: the later edit is last");
+        assert_eq!(copy.notes.notes[0].anchor.block.as_str(), "p", "{who}");
+        assert!(!copy.notes.notes[0].resolved, "{who}");
+    }
+
+    // A note that is picked on one device stays picked, and nothing raises it again.
+    desk.notes.notes[0].resolved = true;
+    let saves = in_turn(&mut folder, &mut desk, &mut laptop, 6);
+    assert!(matches!(saves[..], [.., Saved::Unchanged, Saved::Unchanged]), "{saves:?}");
+    for (who, copy) in [("the desk", &desk), ("the laptop", &laptop)] {
+        assert_eq!(clashes(copy).len(), 1, "{who}");
+        assert!(copy.notes.notes[0].resolved, "{who}");
+    }
+}
+
+#[test]
+fn devices_that_find_the_same_clash_apart_raise_the_same_note() {
+    let (_, mut desk, mut laptop) = clashing();
+    let (mut hers, mut his) = (Folder::default(), Folder::default());
+    save_from(&mut hers, &mut desk, "desk");
+    save_from(&mut his, &mut laptop, "laptop");
+    desk.merge_from(&mut open(&his.files[NAME])).unwrap();
+    laptop.merge_from(&mut open(&hers.files[NAME])).unwrap();
+
+    assert_eq!(clashes(&desk).len(), 1, "{:?}", desk.notes.notes);
+    assert_eq!(desk.notes, laptop.notes);
+    // Each then meets the other's note, which must not become a second one.
+    let (mut folder, _, _) = shared();
+    let saves = in_turn(&mut folder, &mut desk, &mut laptop, 4);
+    assert!(matches!(saves[..], [.., Saved::Unchanged, Saved::Unchanged]), "{saves:?}");
+    assert_eq!(clashes(&laptop).len(), 1);
+    assert_eq!(desk.notes, laptop.notes);
 }
 
 #[test]

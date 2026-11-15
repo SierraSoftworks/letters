@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::json::{Result, err, object, string, write_extra};
 use crate::{Block, BlockId, Extra, Hold, Model, Pos, Run, StablePos};
@@ -45,7 +46,7 @@ pub enum NoteKind {
     Comment,
     /// What an import simplified at this passage.
     Import,
-    /// Two versions of one block that were changed apart. Picking one resolves the note.
+    /// Two versions of one block that were changed apart, the later edit last. Picking one resolves the note.
     Conflict { versions: Box<[Version; 2]> },
     /// A type this build does not know. Its fields sit in [`Note::extra`] and are written back verbatim.
     Unknown { type_name: String },
@@ -54,6 +55,7 @@ pub enum NoteKind {
 /// One side of a conflict.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Version {
+    /// Empty when the writer gave no name.
     pub author: String,
     /// When this side was last edited, as RFC 3339.
     pub edited: String,
@@ -71,6 +73,35 @@ pub struct Anchor {
     /// those are in the `document.json` beside them, for readers that know nothing of the history.
     pub stable: Option<(StablePos, StablePos)>,
     pub extra: Extra,
+}
+
+impl Note {
+    /// The note a merge raises for a block that two writers changed in the same words. `versions` are the
+    /// block as each left it, the later edit last.
+    ///
+    /// Everything in it, the id too, comes from the block and the two versions alone, so every device that
+    /// merges the same pair raises the same note.
+    pub fn conflict(block: impl Into<BlockId>, versions: [Version; 2]) -> Self {
+        let block = block.into();
+        let mut hash = Sha256::new();
+        hash.update(block.as_str());
+        for version in &versions {
+            hash.update([0]);
+            hash.update(write_version(version).to_string());
+        }
+        let id: String = hash.finalize()[..16].iter().map(|byte| format!("{byte:02x}")).collect();
+        Self {
+            id: format!("conflict-{id}"),
+            created: versions[1].edited.clone(),
+            kind: NoteKind::Conflict { versions: Box::new(versions) },
+            anchor: Anchor::block(block),
+            author: "Letters".into(),
+            resolved: false,
+            content: Vec::new(),
+            replies: Vec::new(),
+            extra: Extra::new(),
+        }
+    }
 }
 
 impl Anchor {
@@ -293,7 +324,10 @@ fn read_anchor(value: Value, path: &str) -> Result<Anchor> {
 
 fn read_version(value: Value, path: &str) -> Result<Version> {
     let mut map = object(value, path)?;
-    let author = required(&mut map, "author", path, "an author")?;
+    // A writer who gave no name is still a side of the conflict.
+    let Some(author) = string(&mut map, "author", path)? else {
+        return err(&format!("{path}.author"), "expected an author");
+    };
     let edited = required(&mut map, "edited", path, "an edit time")?;
     let block = match map.remove("block") {
         Some(block) => Block::from_value(block, &format!("{path}.block"))?,
