@@ -102,7 +102,7 @@ impl Desk {
         let (edits, seen) = (self.model.save(), self.model.revision());
         // This editor writes no comments, so the notes are the copy's own.
         let notes = self.copy.notes.clone();
-        let exchange = home.exchange(&mut self.copy, &edits, notes, &seen);
+        let exchange = home.exchange(&mut self.copy, &edits, notes, &seen, &[]);
         let Exchange { home, news, held, .. } = exchange.expect("a save to a folder that takes every write ends");
         if let Some(news) = news {
             self.model.merge(&news).expect("an editor reads what its file held");

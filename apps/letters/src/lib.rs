@@ -3,7 +3,7 @@
 //! - [`app`] runs the winit event loop and owns the windows.
 //! - [`input`] and [`platform`] adapt the desktop to the engine's interfaces.
 //! - [`files`] opens and saves `.let` files, and [`library`] decides where they live.
-//! - [`journal`] keeps unsaved work through a crash.
+//! - [`journal`] keeps unsaved work through a crash, and [`conflicts`] finds the copies a sync tool left.
 //! - [`words`] keeps the person's own dictionary, [`trust`] what they trust, and [`settings`] what they set.
 //! - [`dictionaries`] finds the system's dictionaries for languages other than English, and [`fallback`]
 //!   its fonts for what the bundled ones cannot draw.
@@ -16,6 +16,7 @@ pub mod app;
 pub mod baseline;
 pub mod chrome;
 pub mod cli;
+pub mod conflicts;
 pub mod convert;
 pub mod copies;
 pub mod dictionaries;
