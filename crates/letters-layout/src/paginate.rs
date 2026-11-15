@@ -38,12 +38,15 @@ impl Pages {
 /// A link on a sheet, for an export that makes links work. See [`crate::DocLayout::page_links`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageLink {
-    /// One line of the link's text, from the sheet's top left.
+    /// One line of the link's text, from the sheet's top left. For a line of a table of contents, the line
+    /// across the whole table, and for a link preview its card.
     pub rect: Rect,
-    /// Where the link leads, as the document stores it. Empty for a reference to a figure.
+    /// Where the link leads, as the document stores it. Empty for one that leads to a place in the document.
     pub target: String,
-    /// Where a reference to a figure leads: the sheet its figure is on, counted from 0, and the top left of
-    /// its picture on that sheet. `None` for a link that leads out of the document.
+    /// Where a link into the document leads: the sheet, counted from 0, and a point on it. A reference to
+    /// a figure leads to the top left of the figure's picture, and a line of a table of contents to the top
+    /// left of its heading, as [`crate::DocLayout::outline`] has it. `None` for a link that leads out of
+    /// the document.
     pub place: Option<(usize, Point)>,
     /// The id of the [`letters_render::Role::Link`] part that holds the link's text on the sheet. Every
     /// rectangle of one link has the same one. `None` in a code block, where no text is told as a link.
