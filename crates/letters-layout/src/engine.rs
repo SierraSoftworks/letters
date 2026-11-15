@@ -7,7 +7,9 @@ use std::ops::Range;
 use icu_properties::props::BidiClass;
 use letters_math::Formula;
 use letters_render::{Color, Font, FontBytes, Glyph, Item, Point};
-use parley::fontique::{Blob, CharmapIndex, Collection, CollectionOptions, FamilyId, SourceCache};
+use parley::fontique::{
+    Blob, CharmapIndex, Collection, CollectionOptions, FamilyId, FontInfo, SourceCache, SourceKind,
+};
 use parley::setting::Tag;
 use parley::{
     BaseDirection, DictionaryProvider, FontContext, FontFamily, FontFamilyName, FontStyle, FontVariation,
@@ -127,7 +129,8 @@ impl Engine {
         Some(formula.tinted(&formula.term(caret)?, color))
     }
 
-    /// Registers the faces of `fonts` that are not registered yet, and says whether there were any.
+    /// Registers the faces of `fonts` that are not registered yet, and says whether there were any. A face
+    /// takes the place of one given earlier that it is again: see [`Engine::retire`].
     pub fn add(&mut self, fonts: &Fonts) -> bool {
         let known = self.sources.len();
         for font in &fonts.faces {
@@ -136,7 +139,11 @@ impl Engine {
             }
             let blob = Blob::new(font.data.shared());
             self.sources.push((blob.id(), font.data.clone()));
-            for (family, faces) in self.fcx.collection.register_fonts(blob.clone(), None) {
+            let mut registered = self.fcx.collection.register_fonts(blob.clone(), None);
+            if self.retire(blob.id(), &registered) {
+                registered = self.fcx.collection.register_fonts(blob.clone(), None);
+            }
+            for (family, faces) in registered {
                 if !self.families.contains(&family) {
                     self.families.push(family);
                 }
@@ -161,6 +168,44 @@ impl Engine {
         self.recover();
         self.short = false;
         true
+    }
+
+    /// Takes out each face of the document's fonts that a file just registered has again: one of the same
+    /// family, width, style and weight, with the same axes over the same ranges. Two such faces are one to
+    /// whoever asks for a face, and the earlier would go on answering. So the whole of a face can follow the
+    /// part of it a page started with, and what is written from then on is set in the whole.
+    ///
+    /// Returns whether it took any out. The collection takes out all faces of a kind at once, the later one
+    /// too, so the file is then to be registered again. What is laid out in an earlier face keeps it until
+    /// it is laid out again, so its bytes stay.
+    fn retire(&mut self, later: u64, registered: &[(FamilyId, Vec<FontInfo>)]) -> bool {
+        let axes = |face: &FontInfo| face.axes().iter().map(|axis| (axis.tag, axis.min, axis.max)).collect::<Vec<_>>();
+        let kind = |face: &FontInfo| (face.width(), face.style(), face.weight());
+        let blob = |face: &FontInfo| match &face.source().kind {
+            SourceKind::Memory(blob) => Some(blob.id()),
+            SourceKind::Path(_) => None,
+        };
+        let (mut gone, mut kinds) = (Vec::new(), Vec::new());
+        // A family that is new with this file has no earlier face.
+        for (family, faces) in registered.iter().filter(|(family, _)| self.families.contains(family)) {
+            let Some(held) = self.fcx.collection.family(*family) else { continue };
+            for face in faces {
+                let like = |old: &&FontInfo| blob(old) != Some(later) && kind(old) == kind(face);
+                if held.fonts().iter().filter(like).any(|old| axes(old) == axes(face)) {
+                    gone.extend(held.fonts().iter().filter(like).filter_map(|old| Some((blob(old)?, old.index()))));
+                    kinds.push((*family, kind(face)));
+                }
+            }
+        }
+        for (family, (width, style, weight)) in &kinds {
+            self.fcx.collection.unregister_font(*family, *width, *style, *weight);
+        }
+        if !gone.is_empty() {
+            self.maps.retain(|(blob, _, index, _)| !gone.contains(&(*blob, *index)));
+            // A character the earlier face had may be lacking now, so each is looked up again when met.
+            self.covered.retain(|_, has| !*has);
+        }
+        !kinds.is_empty()
     }
 
     /// Takes the faces of `fonts` as backups: text is set in one only where no face given to
