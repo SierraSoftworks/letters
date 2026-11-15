@@ -2787,6 +2787,7 @@ dependencies = [
  "letters-layout",
  "letters-model",
  "proptest",
+ "regex",
  "serde_json",
  "sha2",
  "unicode-segmentation",

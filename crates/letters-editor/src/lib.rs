@@ -10,6 +10,7 @@ mod callout;
 mod clipboard;
 mod edit;
 mod figures;
+mod find;
 mod input;
 mod keymap;
 mod markers;
@@ -34,6 +35,7 @@ use letters_model::{
 
 pub use callout::CalloutEdit;
 pub use figures::Spot;
+pub use find::{BadQuery, Query, Seek};
 pub use keymap::Keymap;
 /// The markers [`Editor::markers`] returns. They live in the model so that layout can draw them.
 pub use letters_model::{Marker, Markers};
@@ -216,6 +218,13 @@ pub enum Command {
     Paste,
     /// Pastes the clipboard's text as it is, with no formatting.
     PastePlain,
+    /// Puts `with` in place of what a query finds, which [`Editor::find`] tells of: at the one place
+    /// `only` names, or at every place. One undo step.
+    Replace {
+        query: Query,
+        with: String,
+        only: Option<Selection>,
+    },
     /// Sets the style of one element type, such as `heading1`, which every block of that type takes.
     /// A style the file format would refuse changes nothing.
     SetStyle {
@@ -547,6 +556,10 @@ impl Editor {
         if let Command::UseVersion { block, version } = command {
             return self.takes_version(block, version.as_deref());
         }
+        if let Command::Replace { query, only, .. } = command {
+            // What is found is replaced wherever the caret is.
+            return self.replaceable(query, only.as_ref());
+        }
         if let Command::Restore(revision) = command {
             // The document has no caret to ask, and a restore of what is there has nothing to do.
             return *revision != self.model.revision();
@@ -651,6 +664,7 @@ impl Editor {
             Command::Cut => self.cut(platform),
             Command::Paste => self.paste(false, platform),
             Command::PastePlain => self.paste(true, platform),
+            Command::Replace { query, with, only } => self.replace_found(&query, &with, only.as_ref()),
             Command::SetStyle { element, style } => _ = self.apply(vec![Op::SetStyle { element, style }]),
             Command::SetPage(page) => _ = self.apply(vec![Op::SetPage { page }]),
             Command::SetPageBreak { block, on } => {
