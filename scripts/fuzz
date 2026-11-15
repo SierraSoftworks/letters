@@ -26,7 +26,12 @@ if ! command -v cargo-afl >/dev/null 2>&1; then
 fi
 
 # Built apart from everything else, since the fuzzer's compiler flags would rebuild the whole tree.
-cargo afl build --profile fuzz -p letters-fuzz --target-dir target/afl
+# cargo-afl turns debug assertions on in every crate and puts these flags after its own. They are turned
+# off again for the crates Letters depends on, so that those are fuzzed as they ship: an assertion a
+# release build never makes is no fault of Letters. Letters' own crates keep theirs, by fuzz-rustc.
+# Overflow checks stay on everywhere.
+RUSTFLAGS="-C debug-assertions=off ${RUSTFLAGS:-}" RUSTC_WRAPPER="$PWD/scripts/fuzz-rustc" \
+    cargo afl build --profile fuzz -p letters-fuzz --target-dir target/afl
 binary="target/afl/fuzz/letters-fuzz"
 
 if [[ -z "$target" ]]; then

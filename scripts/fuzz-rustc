@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+# rustc as ./scripts/fuzz runs it. That build turns debug assertions off for the crates Letters depends
+# on. Letters' own crates keep theirs: what they assert is what the fuzzer is there to break.
+case ${CARGO_PKG_NAME:-} in
+  letters | letters-*) exec "$@" -C debug-assertions=on ;;
+  *) exec "$@" ;;
+esac
