@@ -450,6 +450,8 @@ pub(crate) struct Leaf {
     pub laid: Option<Box<Laid>>,
     /// When the layout was last used, for dropping the stalest.
     pub used: u64,
+    /// Whether its text was last set short of a face it asked for. It is set again when more fonts arrive.
+    pub short: bool,
 }
 
 impl Leaf {

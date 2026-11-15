@@ -216,6 +216,16 @@ impl DocLayout {
         self.state.get_mut().margin = margin.max(0.0);
     }
 
+    /// Adds faces to the fonts given at the start, for a shell whose fonts arrive one after another. Until a
+    /// face arrives, text that asks for it is set in what there is: its family's upright face slanted for
+    /// an italic, or the first family given for a family that is missing.
+    ///
+    /// Only the blocks with such text are laid out again, as after an edit: each keeps its height as an
+    /// estimate until it is. Returns whether there are any, which is whether the page may now look different.
+    pub fn add_fonts(&mut self, fonts: &Fonts) -> bool {
+        self.state.get_mut().add_fonts(fonts)
+    }
+
     /// Lets formulas link, as `\\href` asks. Off until set, and only a document that is trusted may have it on.
     /// Formulas are set again, since one that links may be drawn another way.
     pub fn set_maths_links(&mut self, links: bool) {
@@ -607,6 +617,31 @@ impl State {
         }
     }
 
+    fn add_fonts(&mut self, fonts: &Fonts) -> bool {
+        if !self.engine.add(fonts) {
+            return false;
+        }
+        // How wide text of each type runs is an estimate taken from its face, and markers are shaped once.
+        if let Some(style) = &self.style {
+            self.types = Types::resolve(style, &mut self.engine);
+        }
+        self.shapes.clear();
+        let mut again = false;
+        for leaf in self.leaves.iter_mut().filter(|leaf| leaf.short) {
+            (leaf.short, leaf.exact, leaf.laid) = (false, false, None);
+            // A cell may be another width in its own face.
+            for cell in &mut leaf.cells {
+                cell.fit = None;
+            }
+            if let Some(table) = self.tables.get_mut(leaf.table).filter(|_| leaf.what == What::Row) {
+                table.sized = false;
+            }
+            again = true;
+        }
+        self.recount();
+        again
+    }
+
     fn set_maths_links(&mut self, links: bool) {
         if std::mem::replace(&mut self.engine.links, links) != links {
             // A formula may be another size now. Formulas are few, so everything is set again.
@@ -764,6 +799,7 @@ impl State {
         let mut laid = Box::<Laid>::default();
         self.shape(at, &mut laid);
         leaf::adorn(&mut self.engine, &self.types, &self.leaves[at], &mut laid);
+        self.leaves[at].short |= self.engine.short;
         self.leaves[at].laid = Some(laid);
         self.held += 1;
     }
@@ -790,7 +826,9 @@ impl State {
         let page = leaf::Page { color: ink::of(types, palette, leaf.role), numbers };
         let open =
             open.as_ref().map(|(block, which)| Open { block, which: *which, in_place: *in_place, good: good.as_ref() });
+        engine.short = false;
         leaf::lay(engine, types, leaf, &Lay { open, page, locale: *locale }, laid);
+        let short = engine.short;
         if here {
             // What the caret's formula is set from is kept, to stand while its source cannot be typeset.
             let set = leaf::opened(leaf, laid);
@@ -802,6 +840,7 @@ impl State {
         let Extent { height, lines, ends, joined } = leaf::extent(leaf, laid);
         let leaf = &mut self.leaves[at];
         (leaf.lines, leaf.ends, leaf.joined) = (lines, ends, joined);
+        leaf.short |= short;
         if !std::mem::replace(&mut leaf.exact, true) {
             self.pending -= 1;
         }
@@ -831,8 +870,10 @@ impl State {
                 }
                 let open = open.and_then(|open| open.of(leaf, Part::Cell(index)));
                 let source = Source::cell(leaf, &leaf.cells[index], Alignment::Start, open, page);
+                engine.short = false;
                 let fit = leaf::fit(engine, types, &source, *locale, &mut scratch.text);
                 leaves[at].cells[index].fit = Some(fit);
+                leaves[at].short |= engine.short;
             }
         }
         table.size(leaves, types);
