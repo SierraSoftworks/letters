@@ -3,7 +3,7 @@ mod common;
 use std::net::IpAddr;
 
 use common::{PRIVATE_SOURCES, SETTINGS, safe, trust, trusted};
-use letters_trust::{FetchError, ImageFetch, ImageType, Limits, UrlError};
+use letters_trust::{FetchError, ImageFetch, ImageType, Limits, PageFetch, UrlError};
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
 const SMALL: Limits = Limits { max_bytes: 1024, max_redirects: 2 };
@@ -199,5 +199,126 @@ fn the_bytes_decide_what_the_image_is() {
         let fetch = asked("https://example.org/a.png");
         fetch.response(Some("image/png"), None).unwrap();
         assert_eq!(fetch.finish(body).ok(), kind, "{:?}", String::from_utf8_lossy(body));
+    }
+}
+
+/// The fetch of a page for a link preview, in a trusted document.
+fn page(url: &str) -> PageFetch {
+    trusted(&trust(SETTINGS)).fetch_page(url, Limits::page()).expect("the fetch may start")
+}
+
+#[test]
+fn a_page_is_fetched_for_a_preview_and_its_picture_after_it() {
+    let trust = trust(SETTINGS);
+    let mut fetch = page("https://news.example/2026/story");
+    fetch.connect("93.184.216.34".parse().unwrap()).unwrap();
+    fetch.redirect("/2026/11/story/").unwrap();
+    fetch.response(Some("text/html; charset=utf-8"), None).unwrap();
+    fetch.receive(2048).unwrap();
+
+    // The page names its picture as pages do, relative to where the page ended up.
+    let pictures = [
+        ("lead.png", "https://news.example/2026/11/story/lead.png"),
+        ("/img/lead.png", "https://news.example/img/lead.png"),
+        ("//cdn.example.net/lead.png", "https://cdn.example.net/lead.png"),
+    ];
+    for (written, address) in pictures {
+        let picture = fetch.url().join(written).unwrap().to_string();
+        assert_eq!(picture, address, "{written}");
+        assert!(trusted(&trust).fetch_on_request(&picture, Limits::default()).is_ok(), "{written}");
+    }
+    assert_eq!(fetch.finish(b"<!doctype html><title>Story</title>"), Ok(()));
+}
+
+#[test]
+fn a_page_is_held_to_the_rules_of_a_picture() {
+    let trust = trust(SETTINGS);
+    let cases = [
+        (trusted(&trust).fetch_page("https://news.example/story", Limits::page()), Ok(())),
+        // A preview is fetched for a writer who trusts the document, and for nobody else.
+        (safe(&trust).fetch_page("https://news.example/story", Limits::page()), Err(FetchError::Held)),
+        (safe(&trust).fetch_page("https://upload.wikimedia.org/story", Limits::page()), Err(FetchError::Held)),
+        (
+            trusted(&trust).fetch_page("http://news.example/story", Limits::page()),
+            Err(FetchError::Url(UrlError::NotHttps)),
+        ),
+        (
+            trusted(&trust).fetch_page("https://192.168.1.1/admin", Limits::page()),
+            Err(FetchError::Url(UrlError::Private)),
+        ),
+        (
+            trusted(&trust).fetch_page("https://ada@news.example/", Limits::page()),
+            Err(FetchError::Url(UrlError::Credentials)),
+        ),
+    ];
+    for (at, (fetch, expected)) in cases.into_iter().enumerate() {
+        assert_eq!(fetch.map(drop), expected, "case {at}");
+    }
+
+    let mut fetch = page("https://news.example/story");
+    let private: IpAddr = "10.0.0.5".parse().unwrap();
+    assert_eq!(fetch.connect(private), Err(FetchError::PrivateAddress(private)));
+    assert_eq!(fetch.redirect("https://127.0.0.1/admin"), Err(FetchError::Url(UrlError::Private)));
+    assert_eq!(fetch.redirect("http://news.example/story"), Err(FetchError::Url(UrlError::NotHttps)));
+    for hop in 1..=Limits::page().max_redirects {
+        fetch.redirect(&format!("/{hop}")).unwrap();
+    }
+    assert_eq!(fetch.redirect("/one-too-many"), Err(FetchError::TooManyRedirects));
+}
+
+#[test]
+fn only_a_response_that_says_it_is_a_page_is_read() {
+    let cases = [
+        (Some("text/html"), true),
+        (Some("Text/HTML; charset=utf-8"), true),
+        (Some("application/xhtml+xml"), true),
+        // Unlike a picture, a page has no bytes that prove what it is.
+        (None, false),
+        (Some("application/octet-stream"), false),
+        (Some("text/plain"), false),
+        (Some("application/json"), false),
+        (Some("application/pdf"), false),
+        (Some("image/png"), false),
+    ];
+    for (content_type, read) in cases {
+        let result = page("https://news.example/story").response(content_type, None);
+        assert_eq!(result, if read { Ok(()) } else { Err(FetchError::NotAPage) }, "{content_type:?}");
+    }
+}
+
+#[test]
+fn a_page_has_a_smaller_limit_than_a_picture() {
+    let limit = Limits::page().max_bytes;
+    assert!(limit < Limits::default().max_bytes);
+
+    let mut fetch = page("https://news.example/story");
+    assert_eq!(fetch.response(Some("text/html"), Some(limit + 1)), Err(FetchError::TooLarge(limit)));
+    assert_eq!(fetch.receive(limit as usize), Ok(()));
+    assert_eq!(fetch.receive(1), Err(FetchError::TooLarge(limit)));
+    assert_eq!(
+        page("https://news.example/story").finish(&vec![b' '; limit as usize + 1]),
+        Err(FetchError::TooLarge(limit))
+    );
+}
+
+#[test]
+fn every_refusal_says_why() {
+    let refusals = [
+        FetchError::Url(UrlError::NotHttps),
+        FetchError::Url(UrlError::Credentials),
+        FetchError::Url(UrlError::Private),
+        FetchError::Url(UrlError::Malformed),
+        FetchError::Held,
+        FetchError::UntrustedSource,
+        FetchError::PrivateAddress("10.0.0.5".parse().unwrap()),
+        FetchError::TooManyRedirects,
+        FetchError::TooLarge(1024),
+        FetchError::NotAnImage,
+        FetchError::NotAPage,
+    ];
+    let reasons: Vec<String> = refusals.iter().map(ToString::to_string).collect();
+    for (at, reason) in reasons.iter().enumerate() {
+        assert!(!reason.is_empty(), "{:?}", refusals[at]);
+        assert!(!reasons[..at].contains(reason), "{:?} reads like another refusal: {reason}", refusals[at]);
     }
 }

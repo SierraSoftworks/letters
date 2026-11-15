@@ -7,8 +7,8 @@
 //!   shell lends it. Trust lives outside the document, so a file cannot declare itself trusted.
 //! - [`Trust::gate`] decides how one open document is treated, and its [`Gate`] answers for each remote
 //!   image, link and merge.
-//! - [`ImageFetch`] guards one download: HTTPS only, no private addresses but those of a trusted source, and
-//!   limits on size and type.
+//! - [`Fetch`] guards one download, of a picture or of the page a link preview is made from: HTTPS only, no
+//!   private addresses but those of a trusted source, and limits on size and type.
 //!
 //! Nothing here opens a file or a socket: the shell does both and asks before each step.
 
@@ -22,7 +22,7 @@ mod store;
 mod url;
 
 pub use address::is_public;
-pub use fetch::{FetchError, ImageFetch, ImageType, Limits};
+pub use fetch::{Fetch, FetchError, Image, ImageFetch, ImageType, Kind, Limits, Page, PageFetch};
 pub use file::Trust;
 pub use gate::{Gate, ImageDecision, LinkDecision, MergeDecision, Mode, Origin};
 pub use source::Source;

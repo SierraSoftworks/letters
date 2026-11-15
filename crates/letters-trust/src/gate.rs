@@ -1,6 +1,6 @@
 //! How one open document is treated.
 
-use crate::fetch::{FetchError, ImageFetch, Limits};
+use crate::fetch::{Fetch, FetchError, ImageFetch, Kind, Limits, PageFetch};
 use crate::url::scheme;
 use crate::{HttpsUrl, Source, Trust, UrlError};
 
@@ -164,7 +164,16 @@ impl<'a> Gate<'a> {
         self.fetch(url, limits, false)
     }
 
-    fn fetch(&self, url: &str, limits: Limits, on_open: bool) -> Result<ImageFetch, FetchError> {
+    /// Starts the fetch of the page a link preview is made from, when the writer asks for the preview:
+    /// never on open, and never in safe mode. The address is held to the rules a picture's is.
+    ///
+    /// The page's own picture is then fetched with [`fetch_on_request`](Self::fetch_on_request), from the
+    /// address [`HttpsUrl::join`] reads against the page's.
+    pub fn fetch_page(&self, url: &str, limits: Limits) -> Result<PageFetch, FetchError> {
+        self.fetch(url, limits, false)
+    }
+
+    fn fetch<K: Kind>(&self, url: &str, limits: Limits, on_open: bool) -> Result<Fetch<K>, FetchError> {
         match self.image(url) {
             ImageDecision::Refused(error) => Err(FetchError::Url(error)),
             ImageDecision::Held => Err(FetchError::Held),
@@ -172,7 +181,7 @@ impl<'a> Gate<'a> {
             ImageDecision::Load | ImageDecision::OnRequest => {
                 let url = HttpsUrl::parse(url).map_err(FetchError::Url)?;
                 let within = on_open.then(|| self.sources().cloned().collect());
-                Ok(ImageFetch::new(url, limits, within, self.vouchers().to_vec()))
+                Ok(Fetch::new(url, limits, within, self.vouchers().to_vec()))
             }
         }
     }

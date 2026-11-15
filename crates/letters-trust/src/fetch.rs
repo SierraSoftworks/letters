@@ -1,20 +1,21 @@
-//! The guard on one remote image fetch.
+//! The guard on one remote fetch: a picture, or the page a link preview is made from.
 //!
 //! The shell owns the socket and asks before each step:
 //!
-//! 1. Resolve the host of [`ImageFetch::url`], pass every address to [`ImageFetch::connect`], and connect
-//!    to an address that passed. A private address passes only for a trusted source.
-//! 2. On a redirect call [`ImageFetch::redirect`] and start again from step 1. Never let the HTTP client
-//!    follow redirects by itself.
-//! 3. Pass the headers of a successful response to [`ImageFetch::response`], and the size of each piece of
-//!    the body to [`ImageFetch::receive`] as it arrives. Count the body as it will be kept: a compressed
-//!    response is counted after it is unpacked.
-//! 4. Pass the whole body to [`ImageFetch::finish`], which names the image's type.
+//! 1. Resolve the host of [`Fetch::url`], pass every address to [`Fetch::connect`], and connect to an
+//!    address that passed. A private address passes only for a trusted source.
+//! 2. On a redirect call [`Fetch::redirect`] and start again from step 1. Never let the HTTP client follow
+//!    redirects by itself.
+//! 3. Pass the headers of a successful response to [`Fetch::response`], and the size of each piece of the
+//!    body to [`Fetch::receive`] as it arrives. Count the body as it will be kept: a compressed response is
+//!    counted after it is unpacked.
+//! 4. Pass the whole body to [`Fetch::finish`], which for a picture names its type.
 //!
-//! Any error ends the fetch. The shell sets its own time limit, since the core has no clock, and sends no
-//! cookies or other credentials.
+//! Any error ends the fetch, and says why in words the shell can show. The shell sets its own time limit,
+//! since the core has no clock, and sends no cookies or other credentials.
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::net::IpAddr;
 
 use crate::{HttpsUrl, Source, UrlError, is_public};
@@ -26,9 +27,17 @@ pub struct Limits {
     pub max_redirects: u32,
 }
 
+/// The limits on a picture.
 impl Default for Limits {
     fn default() -> Self {
         Self { max_bytes: 16 * 1024 * 1024, max_redirects: 3 }
+    }
+}
+
+impl Limits {
+    /// The limits on a page read for a link preview. What a preview shows sits at the top of the page.
+    pub fn page() -> Self {
+        Self { max_bytes: 1024 * 1024, max_redirects: 3 }
     }
 }
 
@@ -78,6 +87,8 @@ pub enum FetchError {
     TooLarge(u64),
     /// The response is not a PNG, JPEG, GIF or WebP image.
     NotAnImage,
+    /// The response does not say it is an HTML page.
+    NotAPage,
 }
 
 impl fmt::Display for FetchError {
@@ -88,31 +99,94 @@ impl fmt::Display for FetchError {
             Self::UntrustedSource => write!(f, "the address is not a trusted source"),
             Self::PrivateAddress(address) => write!(f, "the host is at {address}, on this device or a private network"),
             Self::TooManyRedirects => write!(f, "the address redirected too many times"),
-            Self::TooLarge(limit) => write!(f, "the image is larger than {limit} bytes"),
+            Self::TooLarge(limit) => write!(f, "the address holds more than {limit} bytes"),
             Self::NotAnImage => write!(f, "the address does not hold a PNG, JPEG, GIF or WebP image"),
+            Self::NotAPage => write!(f, "the address does not hold a web page"),
         }
     }
 }
 
 impl std::error::Error for FetchError {}
 
-/// One fetch in progress. Made by [`Gate::fetch_on_open`](crate::Gate::fetch_on_open) or
+/// What a fetch is for, which decides the responses it accepts: [`Image`] or [`Page`].
+pub trait Kind: sealed::Sealed {
+    /// What [`Fetch::finish`] learns from the body.
+    type Found;
+    #[doc(hidden)]
+    const REFUSAL: FetchError;
+    /// Whether a response with this media type, in lower case and empty when it has none, is read at all.
+    #[doc(hidden)]
+    fn labelled(media_type: &str) -> bool;
+    #[doc(hidden)]
+    fn find(body: &[u8]) -> Option<Self::Found>;
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::Image {}
+    impl Sealed for super::Page {}
+}
+
+/// A picture. Its bytes say what it is, and a response that claims to be something else is not read.
+#[derive(Clone, Copy, Debug)]
+pub struct Image;
+
+/// An HTML page, read for its title, description and picture. The response must say it is one.
+#[derive(Clone, Copy, Debug)]
+pub struct Page;
+
+impl Kind for Image {
+    type Found = ImageType;
+    const REFUSAL: FetchError = FetchError::NotAnImage;
+
+    fn labelled(media_type: &str) -> bool {
+        // File stores often send images unlabelled. The bytes decide in `finish`.
+        let unlabelled = matches!(media_type, "" | "application/octet-stream" | "binary/octet-stream");
+        unlabelled || matches!(media_type, "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp")
+    }
+
+    fn find(body: &[u8]) -> Option<ImageType> {
+        ImageType::sniff(body)
+    }
+}
+
+impl Kind for Page {
+    type Found = ();
+    const REFUSAL: FetchError = FetchError::NotAPage;
+
+    fn labelled(media_type: &str) -> bool {
+        matches!(media_type, "text/html" | "application/xhtml+xml")
+    }
+
+    fn find(_: &[u8]) -> Option<()> {
+        Some(())
+    }
+}
+
+/// The fetch of a picture. Made by [`Gate::fetch_on_open`](crate::Gate::fetch_on_open) or
 /// [`Gate::fetch_on_request`](crate::Gate::fetch_on_request).
+pub type ImageFetch = Fetch<Image>;
+
+/// The fetch of a page for a link preview. Made by [`Gate::fetch_page`](crate::Gate::fetch_page).
+pub type PageFetch = Fetch<Page>;
+
+/// One fetch in progress.
 #[derive(Clone, Debug)]
-pub struct ImageFetch {
+pub struct Fetch<K> {
     url: HttpsUrl,
     limits: Limits,
-    /// The sources a redirect must stay inside. `None` when the user asked for the image.
+    /// The sources a redirect must stay inside. `None` when the user asked for the fetch.
     within: Option<Vec<Source>>,
     /// The sources that may be on a private address.
     vouchers: Vec<Source>,
     redirects: u32,
     received: u64,
+    kind: PhantomData<K>,
 }
 
-impl ImageFetch {
+impl<K: Kind> Fetch<K> {
     pub(crate) fn new(url: HttpsUrl, limits: Limits, within: Option<Vec<Source>>, vouchers: Vec<Source>) -> Self {
-        Self { url, limits, within, vouchers, redirects: 0, received: 0 }
+        Self { url, limits, within, vouchers, redirects: 0, received: 0, kind: PhantomData }
     }
 
     /// The address to request now. Request this text and not the document's own spelling of it.
@@ -148,13 +222,8 @@ impl ImageFetch {
         if content_length.is_some_and(|length| length > self.limits.max_bytes) {
             return Err(FetchError::TooLarge(self.limits.max_bytes));
         }
-        let essence = content_type.and_then(|value| value.split(';').next()).unwrap_or_default().trim();
-        match essence.to_ascii_lowercase().as_str() {
-            // File stores often send images unlabelled. The bytes decide in `finish`.
-            "" | "application/octet-stream" | "binary/octet-stream" => Ok(()),
-            "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp" => Ok(()),
-            _ => Err(FetchError::NotAnImage),
-        }
+        let media_type = content_type.and_then(|value| value.split(';').next()).unwrap_or_default().trim();
+        if K::labelled(&media_type.to_ascii_lowercase()) { Ok(()) } else { Err(K::REFUSAL) }
     }
 
     /// Counts a piece of the body as it arrives, so an endless one is cut off.
@@ -163,10 +232,10 @@ impl ImageFetch {
         self.check_size(self.received)
     }
 
-    /// Checks the whole body and names its type.
-    pub fn finish(self, body: &[u8]) -> Result<ImageType, FetchError> {
+    /// Checks the whole body. A picture's bytes name its type.
+    pub fn finish(self, body: &[u8]) -> Result<K::Found, FetchError> {
         self.check_size(body.len() as u64)?;
-        ImageType::sniff(body).ok_or(FetchError::NotAnImage)
+        K::find(body).ok_or(K::REFUSAL)
     }
 
     fn vouched(&self, url: &HttpsUrl) -> bool {
