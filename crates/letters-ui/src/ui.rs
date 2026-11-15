@@ -773,7 +773,10 @@ impl<A: App> Ui<A> {
             }
         }
         // A field the app draws has its keys first, as a text input has.
-        let on_page = focused.is_none_or(|i| self.own(i));
+        let on_page = match focused {
+            Some(i) => self.own(i),
+            None => self.tree.modal_layer().is_none(),
+        };
         if on_page && self.offer(event, platform) {
             self.restart_blink();
             return true;
@@ -866,17 +869,27 @@ impl<A: App> Ui<A> {
     }
 
     /// The elements Tab stops at. A group that is one stop gives the element in it that has focus, or else
-    /// its first.
+    /// the one that is chosen in it, or else its first.
     fn tab_stops(&self, range: std::ops::Range<usize>, focused: Option<usize>) -> Vec<usize> {
         let group = |i: usize| self.tree.ancestors(i).skip(1).find(|&at| self.tree.nodes[at].el.one_stop);
+        let chosen = |i: usize| self.tree.nodes[i].el.access.selected == Some(true);
         let within = focused.and_then(group);
-        let mut entered = HashSet::new();
+        let all = self.tree.focusables(range);
+        let mut entered: HashMap<usize, usize> = HashMap::new();
+        for &i in &all {
+            if let Some(group) = group(i) {
+                let stop = entered.entry(group).or_insert(i);
+                if chosen(i) && !chosen(*stop) {
+                    *stop = i;
+                }
+            }
+        }
         let stop = |i: &usize| match group(*i) {
             None => true,
             Some(group) if Some(group) == within => Some(*i) == focused,
-            Some(group) => entered.insert(group),
+            Some(group) => entered.get(&group) == Some(i),
         };
-        self.tree.focusables(range).into_iter().filter(stop).collect()
+        all.into_iter().filter(stop).collect()
     }
 
     /// Moves focus among the focusable elements inside `container`, wrapping at the ends.
@@ -1499,7 +1512,9 @@ impl<A: App> Ui<A> {
         }
 
         if focus.and_then(|id| tree.find(id)).is_none_or(|i| !tree.focusable(i)) {
-            focus = self.rest();
+            // Under a dialog the page is out of reach, and what is typed must not go to it. Nothing has
+            // focus until Tab is pressed, so that Enter presses nothing the person did not choose.
+            focus = if tree.modal_layer().is_some() { None } else { self.rest() };
         }
         if focus != self.focus {
             self.focus = focus;
