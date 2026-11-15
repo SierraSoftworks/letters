@@ -396,8 +396,7 @@ impl Shell {
                 let Some(shell) = offered.upgrade() else { return };
                 let mut shell = shell.borrow_mut();
                 shell.view.offer_stylesheet(&name, &text.unwrap_or_default());
-                shell.changed();
-                shell.sync();
+                shell.arrived();
             });
         })?;
 
@@ -512,7 +511,7 @@ impl Shell {
             let mut shell = shell.borrow_mut();
             shell.view.add_fonts(letters_fonts::bundled());
             shell.stats.fonts = true;
-            shell.sync();
+            shell.arrived();
         });
     }
 
@@ -544,7 +543,7 @@ impl Shell {
             if !shell.frame_due {
                 shell.frame_due = shell.window.request_animation_frame(&shell.on_frame).is_ok();
             }
-            shell.sync();
+            shell.arrived();
         });
     }
 
@@ -712,7 +711,7 @@ impl Shell {
                 shell.handed.clear();
             }
             then(&mut shell, made);
-            shell.sync();
+            shell.arrived();
         });
     }
 
@@ -811,7 +810,7 @@ impl Shell {
                     *kept = arrival;
                 }
                 shell.settle();
-                shell.sync();
+                shell.arrived();
             });
         }
     }
@@ -954,7 +953,7 @@ impl Shell {
                 }),
                 Err(error) => shell.say(failed(&name, said(&error))),
             }
-            shell.sync();
+            shell.arrived();
         });
     }
 
@@ -1260,6 +1259,13 @@ impl Shell {
 
     // The mirror
 
+    /// Takes in what came after a wait: a file that was fetched or read, or an answer of the exports.
+    /// Nothing the person did says that the window reads differently now, so the mirror is told here.
+    fn arrived(&mut self) {
+        self.changed();
+        self.sync();
+    }
+
     /// Says that the window may read differently, so the mirror is due once it has settled.
     fn changed(&mut self) {
         if let Some(timer) = self.mirror_timer.take() {
@@ -1508,8 +1514,7 @@ impl Shell {
             let Some(shell) = shell.upgrade() else { return };
             let mut shell = shell.borrow_mut();
             shell.paste(KeyEvent { key: Key::Char('v'), mods }, clip);
-            shell.changed();
-            shell.sync();
+            shell.arrived();
         });
     }
 
@@ -1526,8 +1531,7 @@ impl Shell {
             let Some(shell) = shell.upgrade() else { return };
             let mut shell = shell.borrow_mut();
             then(&mut shell, pictures);
-            shell.changed();
-            shell.sync();
+            shell.arrived();
         });
     }
 
@@ -1541,7 +1545,7 @@ impl Shell {
             let Some(shell) = shell.upgrade() else { return };
             let mut shell = shell.borrow_mut();
             shell.view.set_image(&name, image);
-            shell.sync();
+            shell.arrived();
         });
     }
 

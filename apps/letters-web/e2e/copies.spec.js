@@ -90,13 +90,17 @@ test("what writes a copy is fetched only when one is asked for", async ({ page }
 test("a copy that cannot be written leaves its card to ask again", async ({ page }) => {
   let downloads = 0;
   page.on("download", () => downloads++);
-  await page.route("**/export.js*", (route) => route.abort());
+  // The answer comes late, as it does over a network: long after the key that asked was heard.
+  const late = () => new Promise((done) => setTimeout(done, 700));
+  await page.route("**/export.js*", (route) => late().then(() => route.abort()));
   await ask(page, "Later", "Web page");
   const failed = page.waitForEvent("requestfailed");
   await page.keyboard.press("Enter");
   await failed;
   await rested(page);
   expect(downloads).toBe(0);
+  // Nothing was pressed since, so only the answer itself can have told a screen reader why.
+  await expect(card(page).getByRole("alert")).toHaveAccessibleName(/could not be fetched/, { timeout: 1000 });
 
   // The card was put away while the copy was made, and is back as it was to be told again.
   await page.unroute("**/export.js*");
