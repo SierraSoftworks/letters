@@ -131,6 +131,11 @@ pub fn now_rfc3339() -> String {
     rfc3339(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs()))
 }
 
+/// How far the person's clock is ahead of UTC right now, in minutes. Behind UTC it is negative.
+pub fn utc_offset() -> i32 {
+    jiff::Zoned::now().offset().seconds() / 60
+}
+
 /// A time written in UTC, as RFC 3339 with the offset of the person's own time zone. What is kept on disk
 /// stays in UTC: this is for what a window shows, which has no clock or time zone of its own.
 pub fn local(utc: &str) -> String {

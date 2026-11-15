@@ -70,3 +70,44 @@ fn a_version_is_named_and_its_name_taken_off_without_an_undo_step() {
     editor.editor.name_version(&then, None).expect("a revision of this history");
     assert_eq!(names(&mut editor), []);
 }
+
+#[test]
+fn a_shell_marks_where_writing_rested_and_leaves_a_name_alone() {
+    let (mut editor, then) = written();
+    let marks = |editor: &mut Harness| -> Vec<(TagKind, Option<String>)> {
+        let points = editor.editor.timeline();
+        points.iter().flat_map(|point| &point.tags).map(|tag| (tag.kind, tag.name.clone())).collect()
+    };
+    editor.editor.mark_version(&then, TagKind::Import, Some("Quote.md")).expect("a revision of this history");
+    assert_eq!(marks(&mut editor), [(TagKind::Import, Some("Quote.md".to_owned()))]);
+
+    // A revision holds one mark, and the first one stays.
+    editor.editor.mark_version(&then, TagKind::Pause, None).expect("a revision of this history");
+    assert_eq!(marks(&mut editor), [(TagKind::Import, Some("Quote.md".to_owned()))]);
+    editor.key("Mod+z");
+    assert_eq!(marks(&mut editor).len(), 1, "undo takes back typing, not the mark");
+}
+
+#[test]
+fn a_mark_with_nothing_written_since_the_last_is_not_made() {
+    let (mut editor, _) = written();
+    let marks = |editor: &mut Harness| editor.editor.timeline().iter().map(|point| point.tags.len()).sum::<usize>();
+    let imported = editor.editor.model().revision();
+    editor.editor.mark_version(&imported, TagKind::Import, None).expect("a revision of this history");
+    // What the next session finds differs from what was marked by the mark alone.
+    let found = editor.editor.model().revision();
+    assert_ne!(found, imported);
+    editor.editor.mark_version(&found, TagKind::Session, None).expect("a revision of this history");
+    assert_eq!(marks(&mut editor), 1, "asked before the session wrote");
+
+    editor.platform.now += 5_000;
+    editor.type_text(" again");
+    editor.editor.mark_version(&found, TagKind::Session, None).expect("a revision of this history");
+    assert_eq!(marks(&mut editor), 1, "asked at its first edit");
+
+    let rested = editor.editor.model().revision();
+    editor.platform.now += 700_000;
+    editor.type_text(" later");
+    editor.editor.mark_version(&rested, TagKind::Pause, None).expect("a revision of this history");
+    assert_eq!(marks(&mut editor), 2, "what was written since is a version");
+}

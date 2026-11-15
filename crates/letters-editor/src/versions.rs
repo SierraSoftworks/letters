@@ -20,6 +20,28 @@ impl Editor {
         self.model.document_at(revision)
     }
 
+    /// Marks `revision` as where a session, a pause, an import or a merge ended, for a shell that knows
+    /// of one, with the name of the file an import came from. Like a name, the mark is something to save
+    /// and no edit.
+    ///
+    /// Nothing is marked where a mark stands already: on the revision itself, so that no name a person
+    /// gave is lost, and on the step that ends it, since a mark with nothing written after the last one
+    /// would list an empty version. A revision nothing was written in needs none either.
+    pub fn mark_version(&mut self, revision: &Revision, kind: TagKind, name: Option<&str>) -> Result<(), HistoryError> {
+        let steps = self.model.timeline();
+        // How many steps the revision holds, where that can be told: all of them when it is the newest,
+        // and else those before the step that was written on it.
+        let held = match *revision == self.model.revision() {
+            true => Some(steps.len()),
+            false => steps.iter().position(|step| &step.before == revision),
+        };
+        let ended = held.map(|held| held.checked_sub(1).is_none_or(|last| !steps[last].tags.is_empty()));
+        if ended == Some(true) || self.model.tags().iter().any(|tag| &tag.at == revision) {
+            return Ok(());
+        }
+        self.model.tag(revision, kind, name)
+    }
+
     /// Marks `revision` as a version a person named, or with no name takes its mark off. A mark is part
     /// of the history and so something to save, but no edit and no undo step. See
     /// [`letters_model::Model::tag`].
