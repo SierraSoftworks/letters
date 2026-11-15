@@ -43,23 +43,54 @@ fn try_export(export: &Export) -> Result<(), String> {
     let name = export.file.display();
     let failed = |error: &dyn std::fmt::Display| format!("{name}: {error}");
     let bytes = fs::read(&export.file).map_err(|error| failed(&error))?;
-    let mut archive = Archive::open(Cursor::new(bytes)).map_err(|error| failed(&error))?;
-    let document = archive.document().map_err(|error| failed(&error))?;
-    // An export says what it will simplify before it writes.
-    for line in simplified(&document, export.to) {
+    let title = export.file.file_stem().unwrap_or_default().to_string_lossy();
+    let exported = exported(bytes, &title, export.to).map_err(|error| failed(&error))?;
+    // An export says what it simplified before it writes.
+    for line in &exported.simplified {
         eprintln!("letters: {name}: {line}");
     }
+    let output = match &export.output {
+        Some(Output::Stdout) => return io::stdout().write_all(&exported.bytes).map_err(|error| error.to_string()),
+        Some(Output::File(path)) => path.clone(),
+        None => export.file.with_extension(export.to.extension()),
+    };
+    exported.write(&output, export.force).map_err(|(path, error)| match error.kind() {
+        io::ErrorKind::AlreadyExists => {
+            format!("{} is already there: pass --force to replace it, or --output to write elsewhere", path.display())
+        }
+        _ => format!("{}: {error}", path.display()),
+    })?;
+    println!("{name} -> {}", output.display());
+    Ok(())
+}
+
+/// A document as another format holds it.
+pub struct Exported {
+    /// The one file the format writes.
+    pub bytes: Vec<u8>,
+    /// What goes beside that file: the pictures a Markdown file shows, each by its path from the file's
+    /// folder. The other formats hold their own.
+    pub pictures: Vec<(String, Vec<u8>)>,
+    /// What the format could not carry over, a line for each kind of loss.
+    pub simplified: Vec<String>,
+}
+
+/// Writes the document in `file`, the bytes of a `.let` file, in another format. `title` is what the
+/// document is called where the format has a place for a name.
+pub fn exported(file: Vec<u8>, title: &str, to: Format) -> Result<Exported, String> {
+    let failed = |error: letters_format::Error| error.to_string();
+    let mut archive = Archive::open(Cursor::new(file)).map_err(failed)?;
+    let document = archive.document().map_err(failed)?;
     // A style this build cannot read gives way to the built-in one, as it does on screen.
     let style = archive.style().unwrap_or_default();
-    let title = export.file.file_stem().unwrap_or_default().to_string_lossy();
-    let bytes = match export.to {
+    let bytes = match to {
         Format::Markdown => to_markdown(&document).into_bytes(),
         // An image that cannot be read is treated as missing, and its description stands in for it.
-        Format::Html => to_html(&document, &style, &title, &mut |name| archive.read(name).ok().flatten()).into_bytes(),
+        Format::Html => to_html(&document, &style, title, &mut |name| archive.read(name).ok().flatten()).into_bytes(),
         Format::Docx => {
             // Notes that cannot be read are left behind: the text matters more than its comments.
             let notes = archive.notes().unwrap_or_default();
-            to_docx(&document, &style, &notes, &title, &mut |name| archive.read(name).ok().flatten())
+            to_docx(&document, &style, &notes, title, &mut |name| archive.read(name).ok().flatten())
         }
         Format::Pdf => {
             let fonts = Fonts { faces: letters_fonts::bundled() };
@@ -69,43 +100,38 @@ fn try_export(export: &Export) -> Result<(), String> {
             let history = archive.read(OPLOG).ok().flatten();
             let model = history.and_then(|history| Model::load(&history, ReplicaId::new("export")).ok());
             let authors = model.map(|model| model.authors().into_iter().collect()).unwrap_or_default();
-            let info = PdfInfo { title: title.to_string(), authors, created };
+            let info = PdfInfo { title: title.to_owned(), authors, created };
             to_pdf(&document, &style, fonts, &mut |name| archive.read(name).ok().flatten(), &info)
-                .map_err(|error| failed(&error))?
+                .map_err(|error| error.to_string())?
         }
     };
+    // The Markdown names each picture by its entry in the file, as a path from its own folder. A name
+    // that climbs out of that folder is not written, whatever the file says it holds.
+    let inside = |entry: &String| Path::new(entry).components().all(|part| matches!(part, Component::Normal(_)));
+    let entries = markdown_assets(&document).into_iter().filter(|_| to == Format::Markdown).filter(inside);
+    let pictures = entries.filter_map(|entry| Some((archive.read(&entry).ok().flatten()?, entry)));
+    let pictures = pictures.map(|(bytes, entry)| (entry, bytes)).collect();
+    Ok(Exported { bytes, pictures, simplified: simplified(&document, to) })
+}
 
-    let output = match &export.output {
-        Some(Output::Stdout) => return io::stdout().write_all(&bytes).map_err(|error| error.to_string()),
-        Some(Output::File(path)) => path.clone(),
-        None => export.file.with_extension(export.to.extension()),
-    };
-    write(&output, &bytes, export.force).map_err(|error| match error.kind() {
-        io::ErrorKind::AlreadyExists => {
-            format!("{} is already there: pass --force to replace it, or --output to write elsewhere", output.display())
-        }
-        _ => format!("{}: {error}", output.display()),
-    })?;
-    if export.to == Format::Markdown {
-        // The Markdown names each picture by its entry in the file, as a path from its own folder.
+impl Exported {
+    /// Writes the file at `output`, and what goes with it beside it. Unless `replace` is set, a file
+    /// already at `output` is left alone and reported as `AlreadyExists`. A failure names the path it
+    /// was at.
+    pub fn write(&self, output: &Path, replace: bool) -> Result<(), (PathBuf, io::Error)> {
+        write(output, &self.bytes, replace).map_err(|error| (output.to_owned(), error))?;
         let folder = output.parent().unwrap_or(Path::new(""));
-        for entry in markdown_assets(&document) {
-            // A name that climbs out of that folder is not written, whatever the file says it holds.
-            let inside = Path::new(&entry).components().all(|part| matches!(part, Component::Normal(_)));
-            let Some(bytes) = archive.read(&entry).ok().flatten().filter(|_| inside) else { continue };
-            let picture = folder.join(&entry);
+        for (entry, bytes) in &self.pictures {
+            let picture = folder.join(entry);
             let made = fs::create_dir_all(picture.parent().unwrap_or(folder));
-            match made.and_then(|()| write(&picture, &bytes, export.force)) {
+            match made.and_then(|()| write(&picture, bytes, replace)) {
                 // A picture is named after what it holds, so one that is there already is this one.
-                Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
-                    return Err(format!("{}: {error}", picture.display()));
-                }
+                Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err((picture, error)),
                 _ => {}
             }
         }
+        Ok(())
     }
-    println!("{name} -> {}", output.display());
-    Ok(())
 }
 
 /// What the format cannot carry over, a line for each kind of loss.
@@ -143,7 +169,7 @@ fn simplified(document: &Document, to: Format) -> Vec<String> {
 }
 
 /// Writes a file. Unless `replace` is set, one that is already there is left alone and reported.
-fn write(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
+pub(crate) fn write(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
     let mut options = fs::OpenOptions::new();
     options.write(true);
     if replace {
