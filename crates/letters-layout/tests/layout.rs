@@ -627,3 +627,56 @@ fn the_code_blocks_in_view_are_told_with_the_boxes_drawn_behind_them() {
     let shown: Vec<_> = layout.code_boxes(top).into_iter().map(|(id, _)| id).collect();
     assert_eq!(shown.iter().map(|id| id.as_str()).collect::<Vec<_>>(), ["first"], "only what the view shows");
 }
+
+#[test]
+fn text_is_read_in_the_language_named_nearest_to_it() {
+    // Romanian sets its ş and ţ another way than other languages do, and no bundled face has Han.
+    const TEXT: &str = "Şţ şi ţară 漢";
+    let glyphs =
+        |layout: &DocLayout| placed(&painted(layout, everything())).iter().map(|glyph| glyph.0).collect::<Vec<_>>();
+    // The glyphs a page is set in from the start, and the language its Han is told with.
+    let read = |page: &Document| {
+        let mut layout = laid(page);
+        settled(&mut layout);
+        let told: Vec<_> = layout.take_uncovered().into_iter().map(|missing| missing.lang).collect();
+        (glyphs(&layout), told)
+    };
+    let quoted = || doc(vec![container("q", BlockKind::Quote, vec![paragraph("x", TEXT)])]);
+    let tabled = || doc(vec![table("t", &[Align::Start], false, &[&[TEXT]])]);
+    let named = |block: &str, lang: &str| {
+        let lang = Some(lang.to_owned());
+        Op::SetBlockProps { block: block.into(), page_break: false, lang }
+    };
+    let stretch = |block: &str, lang: &str| {
+        let lang = Some(lang.to_owned());
+        Op::SetLang { block: block.into(), range: 0..TEXT.len(), lang }
+    };
+    // An English page, what then names a language in it, and whether its text is Romanian for that.
+    let cases = [
+        ("the stretch itself", quoted(), vec![stretch("x", "ro")], true),
+        ("its block", quoted(), vec![named("x", "ro")], true),
+        ("a block around it", quoted(), vec![named("q", "ro")], true),
+        ("a stretch of a cell", tabled(), vec![stretch("t00", "ro")], true),
+        ("its cell", tabled(), vec![named("t00", "ro")], true),
+        ("its row", tabled(), vec![named("t0", "ro")], true),
+        ("its table", tabled(), vec![named("t", "ro")], true),
+        ("a stretch, over its block", quoted(), vec![named("x", "ro"), stretch("x", "en")], false),
+        ("a block, over the one around it", quoted(), vec![named("q", "ro"), named("x", "en")], false),
+        ("a tag that is no language", quoted(), vec![named("x", "not a language")], false),
+    ];
+    for (name, page, ops, foreign) in cases {
+        let (english, romanian) = (read(&page), read(&Document { language: "ro".into(), ..page.clone() }));
+        assert!(english.0 != romanian.0, "{name}: a language sets its letters its own way");
+        assert_eq!(romanian.1, [Some("ro".to_owned())], "{name}: and a character without a face is told with it");
+        let wanted = if foreign { romanian } else { english };
+
+        let mut model = Model::new(page, ReplicaId::from(1));
+        let mut layout = laid(model.doc());
+        settled(&mut layout);
+        let change = model.apply(ops).expect("a language can be named");
+        layout.update(model.doc(), &Style::default(), WIDTH, Some(&change));
+        settled(&mut layout);
+        assert!(glyphs(&layout) == wanted.0, "{name}: the text is set again for the language");
+        assert!(read(model.doc()) == wanted, "{name}: as on a page that starts with it, Han told with it");
+    }
+}

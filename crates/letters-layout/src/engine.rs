@@ -23,8 +23,9 @@ pub struct Uncovered {
     pub ch: char,
     /// Whether it is written to show as an emoji, which takes a colour emoji face and not one for text.
     pub emoji: bool,
-    /// The language of its text, as a BCP 47 tag. Han is drawn another way in each of Chinese, Japanese and
-    /// Korean, so this says which face to fetch for it.
+    /// The language of its text, as a BCP 47 tag: the one named for its stretch, else for its block or the
+    /// nearest block around it, else the document's. Han is drawn another way in each of Chinese, Japanese
+    /// and Korean, so this says which face to fetch for it.
     pub lang: Option<String>,
 }
 
@@ -41,6 +42,8 @@ pub(crate) struct Spec<'a> {
     pub brush: Brush,
     pub underline: bool,
     pub strike: bool,
+    /// The language of the stretch, where it is another than its text's.
+    pub locale: Option<Language>,
 }
 
 pub(crate) struct Engine {
@@ -249,6 +252,7 @@ impl Engine {
                 brush: Brush::default(),
                 underline: false,
                 strike: false,
+                locale: None,
             };
             let mut layout = Layout::new();
             self.build(text, &[spec], &[(0, 0..text.len())], None, &mut layout);
@@ -259,7 +263,8 @@ impl Engine {
     }
 
     /// Shapes `text` into `layout`. `runs` name a spec for each stretch of the text, in order and without gaps.
-    /// The caller still breaks the lines.
+    /// `locale` is the language of the text, which a spec may name another for. The caller still breaks the
+    /// lines.
     pub fn build(
         &mut self,
         text: &str,
@@ -288,7 +293,10 @@ impl Engine {
             self.faces.iter().any(|(family, italic)| *italic == spec.italic && family.eq_ignore_ascii_case(spec.family))
         };
         self.short |= !specs.iter().all(has);
-        self.note(text, locale);
+        for (spec, range) in runs {
+            let locale = specs.get(usize::from(*spec)).and_then(|spec| spec.locale).or(locale);
+            self.note(text.get(range.clone()).unwrap_or_default(), locale);
+        }
         let mut builder = self.lcx.style_run_builder(&mut self.fcx, text, 1.0, true);
         for spec in specs {
             let generic = if spec.mono { GenericFamily::Monospace } else { GenericFamily::SansSerif };
@@ -304,7 +312,7 @@ impl Engine {
                 font_weight: FontWeight::new(spec.weight),
                 font_style: if spec.italic { FontStyle::Italic } else { FontStyle::Normal },
                 font_variations: FontVariations::List(Cow::Borrowed(&optical)),
-                locale,
+                locale: spec.locale.or(locale),
                 brush: spec.brush,
                 has_underline: spec.underline,
                 has_strikethrough: spec.strike,

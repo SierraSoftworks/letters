@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use letters_layout::{DocLayout, Fonts, Palette, Token};
+use letters_layout::{DocLayout, Fonts, Palette, Token, Uncovered};
 use letters_model::{BlockKind, Document, Style};
 use letters_render::image::{Image, Images};
 use letters_render::pdf::{Heading, Info, Link, Pdf, PdfError, Target};
@@ -28,6 +28,12 @@ pub struct PdfInfo {
     pub created: Option<u64>,
 }
 
+/// Finds faces of the system for characters that none of the fonts has: emoji, and scripts the fonts do not
+/// cover. The core reads no files, so the shell does. It is asked once at most, with every such character
+/// of the document, and a face it returns only backs the fonts up, as
+/// [`DocLayout::add_fallback_fonts`] says.
+pub type Backups<'a> = &'a mut dyn FnMut(&[Uncovered]) -> Fonts;
+
 /// Writes a PDF of the document on the paper `style` sets up, in `fonts`. `assets` supplies the images the
 /// pages show, and `info` what the PDF says of itself.
 ///
@@ -36,12 +42,26 @@ pub struct PdfInfo {
 /// - A link that would run script is left as its text alone.
 /// - An image that `assets` lacks, or that cannot be decoded, leaves its place empty.
 /// - An unknown block is shown as a placeholder that names its type, as it is on screen.
+/// - A character that none of the fonts has is shown as a box. [`to_pdf_with`] takes faces for those.
 pub fn to_pdf(
     doc: &Document,
     style: &Style,
     fonts: Fonts,
     assets: Assets,
     info: &PdfInfo,
+) -> Result<Vec<u8>, PdfError> {
+    to_pdf_with(doc, style, fonts, assets, info, &mut |_| Fonts::default())
+}
+
+/// Writes a PDF as [`to_pdf`] does, with the faces `backups` finds for what the fonts lack, so that a page
+/// shows the emoji and scripts the window shows. A PDF carries its fonts, so these are embedded too.
+pub fn to_pdf_with(
+    doc: &Document,
+    style: &Style,
+    fonts: Fonts,
+    assets: Assets,
+    info: &PdfInfo,
+    backups: Backups,
 ) -> Result<Vec<u8>, PdfError> {
     let page = &style.page;
     let mut layout = DocLayout::new(fonts);
@@ -51,7 +71,12 @@ pub fn to_pdf(
             layout.set_tokens(&block.id, tokens(language.as_deref(), &block.plain_text()));
         }
     }
-    let pages = layout.paginate(page);
+    let mut pages = layout.paginate(page);
+    // Paging lays out every block, so each character that no face has is known by now.
+    let lacking = layout.take_uncovered();
+    if !lacking.is_empty() && layout.add_fallback_fonts(&backups(&lacking)) {
+        pages = layout.paginate(page);
+    }
     let sheet = Size { width: pages.width, height: pages.height };
 
     // Each image is read and decoded once, when the first page that shows it is painted.

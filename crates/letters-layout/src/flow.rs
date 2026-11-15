@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use letters_model::{Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Style, TextStyle, Tone};
 use letters_render::{Color, Point, Rect};
-use parley::{Alignment, Layout, LineHeight};
+use parley::{Alignment, Language, Layout, LineHeight};
 
 use crate::engine::{Engine, Spec};
 use crate::ink::Brush;
@@ -177,6 +177,7 @@ impl Type {
             brush,
             underline: false,
             strike: false,
+            locale: None,
         }
     }
 }
@@ -247,19 +248,30 @@ pub(crate) mod marks {
 pub(crate) struct Span {
     pub end: usize,
     pub marks: u8,
+    /// Which of its text's languages it is written in, counted from 1, or 0 for the language of the block.
+    pub lang: u8,
 }
 
 /// A text as the document holds it: the text, how each stretch of it is set, and where its links lead.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Words {
     pub text: String,
-    /// Empty when the whole text is unmarked.
+    /// Empty when the whole text is unmarked and in the language of its block.
     pub spans: Vec<Span>,
     /// In order: the bytes each link covers and where it leads.
     pub links: Vec<(Range<usize>, String)>,
     /// In order: the bytes of each reference to a figure, and the figure. The page shows the figure's label
     /// in their place.
     pub refs: Vec<(Range<usize>, BlockId)>,
+    /// The language the block names for itself. Without one it takes that of the blocks around it.
+    pub lang: Option<Language>,
+    /// The languages that stretches of the text name, each once.
+    pub langs: Vec<Language>,
+}
+
+/// The language a tag names, if it is one.
+pub(crate) fn language(tag: Option<&str>) -> Option<Language> {
+    Language::parse(tag?).ok()
 }
 
 impl Words {
@@ -269,7 +281,7 @@ impl Words {
 
     /// Reads a text block's runs.
     pub fn of(block: &Block) -> Self {
-        let mut words = Self::default();
+        let mut words = Self { lang: language(block.lang.as_deref()), ..Self::default() };
         for run in block.body.runs() {
             let start = words.text.len();
             words.text.push_str(&run.text);
@@ -304,13 +316,23 @@ impl Words {
             }
             // A reference stays a span of its own, and so do two formulas side by side, though marked alike.
             let alone = target.is_some() || words.refs.last().is_some_and(|(before, _)| before.end == start);
+            let lang = language(run.lang.as_deref()).filter(|_| !run.text.is_empty()).map_or(0, |lang| {
+                let known = words.langs.iter().position(|known| *known == lang);
+                let at = known.unwrap_or_else(|| {
+                    words.langs.push(lang);
+                    words.langs.len() - 1
+                });
+                // Past the 255th language of one text, a stretch is read in the block's.
+                u8::try_from(at + 1).unwrap_or(0)
+            });
+            let like = |last: &Span| (last.marks, last.lang) == (bits, lang) && bits & marks::MATH == 0 && !alone;
             match words.spans.last_mut() {
-                Some(last) if last.marks == bits && bits & marks::MATH == 0 && !alone => last.end = words.text.len(),
+                Some(last) if like(last) => last.end = words.text.len(),
                 _ if run.text.is_empty() => {}
-                _ => words.spans.push(Span { end: words.text.len(), marks: bits }),
+                _ => words.spans.push(Span { end: words.text.len(), marks: bits, lang }),
             }
         }
-        if matches!(words.spans[..], [Span { marks: 0, .. }]) && words.refs.is_empty() {
+        if matches!(words.spans[..], [Span { marks: 0, lang: 0, .. }]) && words.refs.is_empty() {
             words.spans.clear();
         }
         words
@@ -459,6 +481,8 @@ pub(crate) struct Leaf {
     pub used: u64,
     /// Whether its text was last set short of a face it asked for. It is set again when more fonts arrive.
     pub short: bool,
+    /// The language its texts take from the blocks around them, where one names any.
+    pub lang: Option<Language>,
 }
 
 impl Leaf {
@@ -877,7 +901,7 @@ pub(crate) fn flow(
     old: impl FnMut(&BlockId) -> Option<Leaf>,
 ) -> Flow {
     let out = Flow::default();
-    let mut walk = Walk { types, numbers, carry, old, out, pad: 0.0, breaks: false, root: 0, depth: 0 };
+    let mut walk = Walk { types, numbers, carry, old, out, pad: 0.0, breaks: false, root: 0, depth: 0, lang: None };
     walk.place(&doc.blocks, 0.0, width, None, false);
     walk.out
 }
@@ -895,6 +919,8 @@ struct Walk<'a, F> {
     root: usize,
     /// How far inside the document's own blocks the blocks being placed are.
     depth: usize,
+    /// The language the next leaf's texts take from the blocks around them.
+    lang: Option<Language>,
 }
 
 impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
@@ -953,7 +979,9 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
         let first = self.out.leaves.len();
         // A cell past the last column that says how it is set is set from its start.
         let aligns = || columns.iter().map(|align| alignment(*align)).chain(std::iter::repeat(Alignment::Start));
+        let around = self.lang;
         for (index, row) in rows.iter().enumerate() {
+            self.lang = language(row.lang.as_deref()).or(around);
             let (mut leaf, _) = self.leaf(row, What::Row);
             let cells = || row.body.blocks().iter().filter(|cell| cell.kind == BlockKind::TableCell);
             let mut reread = leaf.cells.len() != cells().count();
@@ -977,7 +1005,7 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                 reread |= std::mem::replace(&mut cell.align, align) != align;
             }
             let header = header && index == 0;
-            if leaf.header != header || leaf.role != role {
+            if leaf.header != header || leaf.role != role || leaf.lang != self.lang {
                 // Text set another way is another width.
                 leaf.cells.iter_mut().for_each(|cell| cell.fit = None);
                 reread = true;
@@ -988,6 +1016,7 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
             (leaf.role, leaf.table, leaf.header) = (role, self.out.tables.len(), header);
             self.push(leaf, x, width, if index == 0 { gap } else { 0.0 }, frame);
         }
+        self.lang = around;
         let mut table = Table { rows: first..self.out.leaves.len(), sized: false };
         table.size(&mut self.out.leaves, self.types);
         self.out.tables.push(table);
@@ -1001,10 +1030,14 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
         // The space after the block above, and whether that block was a list item.
         let mut above: Option<(f32, bool)> = None;
         let mut counters: Vec<u32> = Vec::new();
+        let around = self.lang;
         for (index, block) in blocks.iter().enumerate() {
             if self.depth == 0 {
                 self.root = index;
             }
+            // What a block holds takes its language. Its own text reads it from the block.
+            let holds = matches!(block.body, Body::Blocks(_));
+            self.lang = language(block.lang.as_deref()).filter(|_| holds).or(around);
             self.breaks |= breaks(block);
             let role = match &block.kind {
                 BlockKind::Heading { level: 1 } => Role::Heading1,
@@ -1167,6 +1200,7 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                 }
             }
         }
+        self.lang = around;
     }
 
     /// Adds a leaf to the column, `gap` below the row above and within the given edges.
@@ -1177,10 +1211,11 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
             false => (0.0, 0.0),
         };
         let (x, width) = (x + pad_x, (width - 2.0 * pad_x).max(1.0));
-        if (leaf.x, leaf.width) != (x, width) {
+        // Text is shaped for its language, so in another it is set again.
+        if (leaf.x, leaf.width, leaf.lang) != (x, width, self.lang) {
             (leaf.exact, leaf.laid) = (false, None);
         }
-        (leaf.x, leaf.width, leaf.pad) = (x, width, pad_x);
+        (leaf.x, leaf.width, leaf.pad, leaf.lang) = (x, width, pad_x, self.lang);
         leaf.root = self.root;
         leaf.top = gap + pad_y + std::mem::take(&mut self.pad);
         leaf.bottom = pad_y;
