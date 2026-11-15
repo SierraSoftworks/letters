@@ -12,7 +12,7 @@ use accesskit_consumer::{NodeRef, Tree, TreeChangeHandler};
 use letters_editor::{Clip, Editor, InputEvent, Key, KeyEvent, Modifiers, Picture, Platform};
 use letters_model::{Document, Pos, ReplicaId, Selection};
 use letters_render::{DisplayList, Point, Rect, Size};
-use letters_ui::{App, EditorApp, FixedShaper, Keys, Ui, Window};
+use letters_ui::{App, EditorApp, FixedShaper, Keys, LinkPreviewFound, Ui, Window};
 
 pub use letters_ui::Role;
 
@@ -397,6 +397,12 @@ impl Harness<EditorApp> {
     /// embed it does.
     pub fn embed_picture(&mut self, figure: &str, picture: Picture) -> &mut Self {
         self.ui.embed_picture(&figure.into(), picture, &mut self.platform);
+        self
+    }
+
+    /// Hands over what was found of the page at an address, as a shell that was asked to fetch it does.
+    pub fn fill_preview(&mut self, found: LinkPreviewFound) -> &mut Self {
+        self.ui.fill_preview(found, &mut self.platform);
         self
     }
 

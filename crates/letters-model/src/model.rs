@@ -5,7 +5,7 @@
 //! [`Model::doc`] is a view of that history, brought up to date by each change and never rebuilt.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::mem;
@@ -17,11 +17,14 @@ use loro::{ContainerTrait, ExportMode, Frontiers, LoroDoc, LoroText, LoroValue, 
 
 use crate::conflict::{self, Conflict};
 use crate::crdt::{self, Assign, Event, attrs};
+use crate::doc::line;
 use crate::flat::{self, BLOCK, DEPTH, Entry, Flat, children, head, insert, marker, nth, nth_mut, spell};
 use crate::history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
 use crate::undo::{Delta, Edit, Script, Step, Steps, is_skip};
 use crate::versions::{self, Point, Tag, TagKind};
-use crate::{Block, BlockId, BlockKind, Body, BodyShape, Document, Mark, Page, Pos, Properties, Run, Style, TextStyle};
+use crate::{
+    Block, BlockId, BlockKind, Body, BodyShape, Document, Mark, Page, Pos, Preview, Properties, Run, Style, TextStyle,
+};
 
 mod reader;
 
@@ -115,6 +118,12 @@ pub enum Op {
     SetProperties {
         properties: Option<Properties>,
     },
+    /// Sets what the document keeps of the page a link's address leads to, which a link in the text shows
+    /// without the network. `None` takes it away, and so does a preview that holds nothing.
+    SetPreview {
+        url: String,
+        preview: Option<Preview>,
+    },
 }
 
 /// Why an [`Op`] was refused. The document is left as it was.
@@ -140,6 +149,9 @@ pub enum OpError {
     ReadOnly,
     /// The style holds a value `style.json` would refuse, and this says which.
     BadStyle(String),
+    /// The preview of this address holds what `document.json` would refuse, as a title of two lines does,
+    /// or the address is not one line.
+    BadPreview(String),
 }
 
 impl fmt::Display for OpError {
@@ -154,6 +166,7 @@ impl fmt::Display for OpError {
             Self::NothingToJoin(id) => write!(f, "there is no text block before \"{id}\" to join"),
             Self::ReadOnly => f.write_str("an older revision cannot be edited"),
             Self::BadStyle(why) => write!(f, "the style cannot be used: {why}"),
+            Self::BadPreview(url) => write!(f, "the preview of \"{url}\" holds what a document cannot keep"),
         }
     }
 }
@@ -169,7 +182,8 @@ pub struct Change {
     pub structure: bool,
     /// Whether the style changed, which the layout of every block depends on.
     pub style: bool,
-    /// Whether the document's own fields changed: its language, its dictionary or its properties.
+    /// Whether the document's own fields changed: its language, its dictionary, its properties or the
+    /// previews of its links.
     pub document: bool,
 }
 
@@ -714,6 +728,7 @@ impl Model {
             language: doc.language.clone(),
             dictionary: doc.dictionary.clone(),
             properties: doc.properties.clone(),
+            previews: doc.previews.clone(),
             extra: doc.extra.clone(),
         }
     }
@@ -727,8 +742,8 @@ impl Model {
         let change =
             Change { style: style != self.style, document: fields(&read) != fields(&self.doc), ..Change::default() };
         let doc = &mut self.doc;
-        (doc.language, doc.dictionary, doc.properties, doc.extra) =
-            (read.language, read.dictionary, read.properties, read.extra);
+        (doc.language, doc.dictionary, doc.properties, doc.previews, doc.extra) =
+            (read.language, read.dictionary, read.properties, read.previews, read.extra);
         self.style = style;
         change
     }
@@ -1429,7 +1444,8 @@ impl Model {
             }
             // These change no block. `apply` makes them itself.
             Op::SetStyle { .. } | Op::SetPage { .. } | Op::ReplaceStyle { .. } => {}
-            Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. } | Op::SetProperties { .. } => {}
+            Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. } => {}
+            Op::SetProperties { .. } | Op::SetPreview { .. } => {}
         }
         Ok((delta, place))
     }
@@ -1592,7 +1608,7 @@ impl Copies {
 fn is_setting(op: &Op) -> bool {
     let style = matches!(op, Op::SetStyle { .. } | Op::SetPage { .. } | Op::ReplaceStyle { .. });
     let fields = matches!(op, Op::SetLanguage { .. } | Op::AddWord { .. } | Op::RemoveWord { .. });
-    style || fields || matches!(op, Op::SetProperties { .. })
+    style || fields || matches!(op, Op::SetProperties { .. } | Op::SetPreview { .. })
 }
 
 /// Makes such an operation, on copies of the fields and the style.
@@ -1602,6 +1618,16 @@ fn set(op: &Op, fields: &mut Document, style: &mut Style) -> Result<(), OpError>
         Op::AddWord { word } => drop(fields.dictionary.insert(word.clone())),
         Op::RemoveWord { word } => drop(fields.dictionary.remove(word)),
         Op::SetProperties { properties } => fields.properties.clone_from(properties),
+        Op::SetPreview { url, preview } => {
+            let kept = preview.as_ref().filter(|preview| !preview.is_empty());
+            if !line(url) || kept.is_some_and(|preview| !preview.sound()) {
+                return Err(OpError::BadPreview(url.clone()));
+            }
+            match kept {
+                Some(preview) => drop(fields.previews.insert(url.clone(), preview.clone())),
+                None => drop(fields.previews.remove(url)),
+            }
+        }
         Op::SetStyle { element, style: text } => drop(style.types.insert(element.clone(), text.clone())),
         Op::SetPage { page } => style.page.clone_from(page),
         Op::ReplaceStyle { style: whole } => style.clone_from(whole),
@@ -1617,8 +1643,8 @@ fn set(op: &Op, fields: &mut Document, style: &mut Style) -> Result<(), OpError>
 }
 
 /// The document's own fields that a [`Change`] speaks of.
-fn fields(doc: &Document) -> (&String, &BTreeSet<String>, &Option<Properties>) {
-    (&doc.language, &doc.dictionary, &doc.properties)
+fn fields(doc: &Document) -> (&String, &BTreeSet<String>, &Option<Properties>, &BTreeMap<String, Preview>) {
+    (&doc.language, &doc.dictionary, &doc.properties, &doc.previews)
 }
 
 /// The one change that two make together, when the first takes text out and the second puts text in at

@@ -19,7 +19,7 @@ use letters_convert::{
 };
 use letters_format::{ASSETS, Archive, HISTORY, NOTES, OPLOG, Package};
 use letters_layout::{Fonts, Uncovered};
-use letters_model::{Block, BlockKind, Body, Model, ReplicaId, Style};
+use letters_model::{Block, Body, Model, ReplicaId, Style};
 use serde_json::json;
 
 use crate::cli::{Export, Format, Import, Output};
@@ -164,18 +164,15 @@ pub fn exported_with(file: Vec<u8>, title: &str, to: Format, linked: Linked) -> 
 ///   was written in two places, and a merge would bring the history back.
 /// - The history goes, and with it every earlier version and who wrote what.
 /// - The notes go: comments, import notes and conflicts. The document stands as the page shows it.
-/// - A picture stays only where a figure shows it. The file may hold others that the history still named.
+/// - A picture stays only where the document shows it, in a figure or a link preview. The file may hold
+///   others that the history still named. The preview of a link the text no longer has goes too.
 /// - The style and the writer's own words for the spelling check stay, since they are the document's.
 fn clean(package: &mut Package) {
     (package.id, package.created) = (platform::document_id(), platform::now_rfc3339());
-    let shown: BTreeSet<&str> = package
-        .document
-        .walk()
-        .filter_map(|block| match &block.kind {
-            BlockKind::Figure { asset, .. } => asset.as_deref(),
-            _ => None,
-        })
-        .collect();
+    // A preview no link names is kept for the history's sake, which goes.
+    package.document.prune_previews();
+    // The document says which pictures it shows, so that none is left behind here.
+    let shown = package.document.assets();
     let kept = |name: &str| match name {
         NOTES => false,
         name if name.starts_with(HISTORY) => false,

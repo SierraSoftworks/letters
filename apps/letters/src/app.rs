@@ -24,8 +24,9 @@ use letters_spell::Dictionary;
 use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDecision, Origin, Trust};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
-    Appearance, Chrome, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer, Landing, Location,
-    MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState, Scheme, Settings, Window as View, tokens,
+    Appearance, Chrome, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer, Landing,
+    LinkPreviewFound, Location, MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState, Scheme, Settings,
+    Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -78,6 +79,9 @@ const TYPING_GAP: Duration = Duration::from_millis(20);
 const LISTED: usize = 12;
 /// The distance one notch of a mouse wheel scrolls, in logical pixels.
 const WHEEL_LINE: f32 = 40.0;
+/// The largest picture a link preview takes, in bytes. It is kept in the document, where a card shows it
+/// small.
+const PREVIEW_PICTURE: u64 = 4 * 1024 * 1024;
 const WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1100.0, 800.0);
 /// What a file dialog calls the files it lists for the Styles panel.
 const STYLESHEETS: &str = "Letters stylesheet";
@@ -124,6 +128,9 @@ pub enum Event {
     /// A picture a window's document links to, at this address, was fetched for this: its file, or why
     /// there is none.
     Linked(WindowId, String, Link, Result<Vec<u8>, String>),
+    /// The page at this address was read for a window's link previews: what it says of itself, or why
+    /// there is nothing.
+    Previewed(WindowId, String, Result<Box<LinkPreviewFound>, String>),
     /// A system dictionary a window's document asked for has been read, under the name it has on disk.
     Dictionary(WindowId, String, Box<Dictionary>),
 }
@@ -519,6 +526,17 @@ struct Saving {
     result: Result<Exchange, String>,
 }
 
+/// What a document may fetch: one that was made in its window, or else the document `id` in the file at
+/// `path`. Apart from its window, so that a thread can ask with what it was handed.
+fn gate_of<'a>(trust: &'a Trust, made_here: bool, id: Option<&str>, path: Option<&Path>) -> Gate<'a> {
+    match id {
+        _ if made_here => trust.gate(id.unwrap_or_default(), Origin::Created),
+        Some(id) => trust::gate(trust, id, path),
+        // Nothing vouches for a document that has not said which one it is.
+        None => trust.gate("", Origin::Outside),
+    }
+}
+
 /// What a linked picture is fetched for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Link {
@@ -861,12 +879,7 @@ impl DocWindow {
     /// What the document may fetch. One made in this window is trusted, and one that was opened is held
     /// to what the person trusts of its id and its folder.
     fn gate<'a>(&self, trust: &'a Trust) -> Gate<'a> {
-        match self.id.as_deref() {
-            _ if self.made_here => trust.gate(self.id.as_deref().unwrap_or_default(), Origin::Created),
-            Some(id) => trust::gate(trust, id, self.place.path()),
-            // Nothing vouches for a document that has not said which one it is.
-            None => trust.gate("", Origin::Outside),
-        }
+        gate_of(trust, self.made_here, self.id.as_deref(), self.place.path())
     }
 
     /// Looks for the system's dictionaries for the languages the document names and has not asked about
@@ -1782,6 +1795,7 @@ impl App {
                 }
                 Request::LinkedPicture(src) => self.link(id, src, Link::Open),
                 Request::LoadPicture(src) => self.link(id, src, Link::Once),
+                Request::FetchPreview { url } => self.preview(id, url),
                 Request::EmbedPicture { figure, src } => self.link(id, src, Link::Embed(figure)),
                 // The window asks for the pictures of that host again by itself.
                 Request::TrustPictures(src) => self.trust_host(id, &src),
@@ -2031,6 +2045,34 @@ impl App {
             let fetched = remote::fetch(guard, &Roots::System);
             let fetched = fetched.map(|fetched| fetched.bytes).map_err(|failed| failed.to_string());
             let _ = proxy.send_event(Event::Linked(id, src, link, fetched));
+        });
+    }
+
+    /// Reads the page at an address for a window's link previews, off this thread, if the document may:
+    /// what the page says of itself, and the picture it shows itself by. Never as a document opens, since
+    /// the window asks only when the person does. Each asking is answered once.
+    fn preview(&mut self, id: WindowId, url: String) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        let trust = self.trust.trust();
+        let guard = match window.gate(trust).fetch_page(&url, Limits::page()) {
+            Ok(guard) => guard,
+            Err(error) => return window.view.fail_preview(&url, &error.to_string()),
+        };
+        // The picture's address is known only once the page is read, so the thread asks about it itself,
+        // by what the person trusted when they asked for the preview.
+        let (trust, made_here) = (trust.clone(), window.made_here);
+        let (document, path) = (window.id.clone(), window.place.path().map(Path::to_owned));
+        let proxy = self.proxy.clone();
+        self.fetching.run(move || {
+            let gate = gate_of(&trust, made_here, document.as_deref(), path.as_deref());
+            let limits = Limits { max_bytes: PREVIEW_PICTURE, ..Limits::default() };
+            let found = remote::preview(guard, &|address| gate.fetch_on_request(address, limits), &Roots::System);
+            let found = found.map(|preview| {
+                let (title, description) = (preview.title, preview.description);
+                let picture = preview.picture.and_then(pictures::read);
+                Box::new(LinkPreviewFound { url: url.clone(), title, description, picture })
+            });
+            let _ = proxy.send_event(Event::Previewed(id, url, found.map_err(|failed| failed.to_string())));
         });
     }
 
@@ -2679,6 +2721,18 @@ impl ApplicationHandler<Event> for App {
             Event::Picture(id, asset, image, within) => {
                 let Some(window) = self.windows.get_mut(&id) else { return };
                 window.picture(asset, image, within);
+            }
+            Event::Previewed(id, url, found) => {
+                if let Some(window) = self.windows.get_mut(&id) {
+                    match found {
+                        Ok(found) => {
+                            window.view.fill_preview(*found, &mut self.platform);
+                            window.keep(self.platform.take_assets());
+                        }
+                        Err(why) => window.view.fail_preview(&url, &why),
+                    }
+                    window.sync(now);
+                }
             }
             Event::Linked(id, src, link, fetched) => {
                 self.linked(id, src, link, fetched);

@@ -78,6 +78,9 @@ const DOCUMENTS: &str = ".let";
 const NO_COMMENTS: &str = "Comments cannot be added here: this document's notes are in a form this version of \
                            Letters cannot read.";
 
+/// Why a link preview is not fetched, in words that read on from the window's "Not fetched:".
+const UNFETCHED: &str = "a preview cannot be fetched in the browser";
+
 /// How long writing rests before where it stopped is marked as a version, in seconds. The desktop marks
 /// after the same rest, and the history ends a version at it.
 const REST: u64 = 600;
@@ -1167,6 +1170,9 @@ impl Shell {
                 Request::SaveCopy { name, format, .. } => self.copy(name, format, None),
                 // A version that shows in the history is copied as it read then.
                 Request::SaveVersion { revision, name, format, .. } => self.copy(name, format, Some(&revision)),
+                // A page may not read another site's pages, so a preview waits for a server to fetch it. The
+                // window says so where the preview is, and keeps what it shows.
+                Request::FetchPreview { url } => self.view.fail_preview(&url, UNFETCHED),
                 // Recent documents, new ones and moves need files, which wait for a server behind the page.
                 _ => {}
             }

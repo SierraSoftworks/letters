@@ -2372,6 +2372,44 @@ fn tab_writes_the_picked_symbol_and_a_press_writes_the_one_pressed() {
 }
 
 #[test]
+fn tab_moves_the_caret_from_one_argument_to_the_next_and_then_past_the_last() {
+    let mut window = typing(r" \fra");
+    window.key("Tab").type_text("a").key("Tab").type_text("b").key("Tab").type_text("+c");
+    assert_eq!(source(&mut window), Some(format!(r"{INLINE} \frac{{a}}{{b}}+c")));
+}
+
+#[test]
+fn the_symbols_taken_last_are_listed_first() {
+    let mut window = typing(r" \in");
+    let listed = options(&mut window);
+    assert_eq!(listed[0].0, r"\in", "the command that is typed whole: {listed:?}");
+    let (first, second) = (listed[3].0.clone(), listed[4].0.clone());
+    window.click(Role::ListBoxOption, &first).type_text(r" \in");
+    window.click(Role::ListBoxOption, &second).type_text(r" \in");
+    let listed: Vec<String> = options(&mut window).into_iter().map(|option| option.0).collect();
+    assert_eq!(listed[..3], [r"\in".to_owned(), second, first], "then those taken, the last first");
+}
+
+#[test]
+fn begin_lists_the_environments_and_one_is_written_with_the_end_that_matches() {
+    let mut window = typing(r" \begin{pm");
+    window.assert_open(Role::ListBox, "Environments");
+    assert_eq!(options(&mut window)[0].0, "pmatrix");
+    // The caret waits between the two.
+    window.key("Tab").type_text("a");
+    assert_eq!(source(&mut window), Some(format!(r"{INLINE} \begin{{pmatrix}} a \end{{pmatrix}}")));
+    window.assert_closed(Role::ListBox, "Environments");
+
+    // An end that waits for its begin is not written again.
+    let mut window = typing(r" \end{matrix}");
+    for _ in 0..r" \end{matrix}".len() {
+        window.key("Left");
+    }
+    window.type_text(r" \begin{pm").key("Tab");
+    assert_eq!(source(&mut window), Some(format!(r"{INLINE} \begin{{pmatrix}} \end{{matrix}}")));
+}
+
+#[test]
 fn the_list_of_symbols_is_put_away_without_leaving_the_formula() {
     // What is done while the list shows, and the source afterwards.
     let ways: [(&str, &str, &str); 3] = [
@@ -2448,13 +2486,13 @@ fn a_slash_on_an_empty_line_offers_what_to_put_there() {
     assert!(all.len() > 8 && all[1..].iter().all(|offer| !offer.2), "one is picked: {all:?}");
 
     // What is typed after the slash narrows the menu, and what matches nothing puts it away for the moment.
-    window.type_text("li");
+    window.type_text("list");
     assert_eq!(offered(&mut window), ["Bulleted list", "Numbered list", "Task list"]);
     window.type_text("zz");
     window.assert_closed(Role::ListBox, "Insert");
     window.key("Backspace").key("Backspace");
     assert_eq!(offered(&mut window).len(), 3);
-    assert_eq!(block_text(&window, "p"), "/li", "the line is written as any other until an offer is taken");
+    assert_eq!(block_text(&window, "p"), "/list", "the line is written as any other until an offer is taken");
 }
 
 #[test]
@@ -2463,7 +2501,9 @@ fn the_insert_menu_puts_what_is_taken_on_its_line() {
     let cases = [
         ("/", "Enter", "# Roof"),
         ("/", "Down Down Tab", "### Roof"),
-        ("/", "Up Enter", "---\n\nRoof"),
+        // Up from the first offer goes round to the last.
+        ("/head", "Up Enter", "### Roof"),
+        ("/div", "Enter", "---\n\nRoof"),
         ("/task", "Enter", "- [ ] Roof"),
         ("/quote", "a press", "> Roof"),
         ("/code", "Enter", "```\nRoof\n```"),

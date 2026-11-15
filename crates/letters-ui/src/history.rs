@@ -2384,7 +2384,7 @@ fn differing(old: &Document, new: &Document) -> Change {
 }
 
 /// Gives a layout what the page's has beside the document: the colours of its code, and the pictures it
-/// links to that are there to draw. `only` names the blocks that changed since it last had them.
+/// links to or previews a link with that are there to draw. `only` names the blocks that changed since it last had them.
 fn dress(doc: &Document, layout: &mut DocLayout, images: &Images, only: Option<&Change>) {
     for block in doc.walk() {
         if let BlockKind::Code { language } = &block.kind
@@ -2393,7 +2393,13 @@ fn dress(doc: &Document, layout: &mut DocLayout, images: &Images, only: Option<&
             let tokens = highlight::tokens(&block.plain_text(), language.as_deref().unwrap_or_default());
             layout.set_tokens(&block.id, tokens);
         }
-        if let Some((src, image)) = pictures::link(block).and_then(|src| Some((src, images.get(src)?))) {
+        // A link preview fits its picture to its slot by the picture's size, which the document does not
+        // hold, so it is told as a linked picture is.
+        let shown = match &block.kind {
+            BlockKind::LinkPreview { image, .. } => image.as_deref(),
+            _ => pictures::link(block),
+        };
+        if let Some((src, image)) = shown.and_then(|src| Some((src, images.get(src)?))) {
             layout.set_loaded(src, Some((image.width(), image.height())));
         }
     }

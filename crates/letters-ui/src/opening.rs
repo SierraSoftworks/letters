@@ -167,6 +167,15 @@ pub enum Request {
     MergeIntoOriginal {
         confirmed: bool,
     },
+    /// The person asked for what the page at this address says of itself, for a link preview: they put
+    /// the preview in, or pressed its "Fetch preview". Read the page's title, its description and the
+    /// picture it gives for itself, and hand them to `Window::fill_preview`, or say why not with
+    /// `Window::fail_preview`. Each request is answered once, by its address: what waits for the address
+    /// says that it is being fetched until then, and no second request is made for it. Never asked when a
+    /// document opens: what a preview shows is kept in the document.
+    FetchPreview {
+        url: String,
+    },
 }
 
 /// A document opened lately, as the landing card lists it.

@@ -22,6 +22,20 @@
         "source": { "type": "string" }
       }
     },
+    "previews": {
+      "type": "object",
+      "description": "What is kept of the pages the text links to, each under its address as a run's link writes it, so that a link shows its page without the network. One whose address no link names is shown nowhere. One that tells nothing reads as none.",
+      "propertyNames": { "pattern": "^[^\\n\\r]+$" },
+      "additionalProperties": {
+        "type": "object",
+        "description": "A field that is empty reads as one left out.",
+        "properties": {
+          "title": { "type": "string", "pattern": "^[^\\n\\r]*$", "description": "The page's title." },
+          "description": { "type": "string", "description": "A few lines about the page." },
+          "image": { "type": "string", "pattern": "^(assets/[^\\n\\r]*)?$", "description": "The entry of the file that holds the page's picture, such as assets/<sha256>.jpg. Never an address." }
+        }
+      }
+    },
     "blocks": { "$ref": "#/$defs/blocks" }
   },
   "$defs": {

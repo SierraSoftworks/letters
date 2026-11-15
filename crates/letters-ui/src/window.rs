@@ -11,7 +11,7 @@ use std::rc::Rc;
 use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
 use letters_editor::{
     Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, LinePos, Lines, Modifiers, Motion, Picture, Platform,
-    Seek, Spot, TableEdit,
+    PreviewEdit, Seek, Spot, TableEdit,
 };
 use letters_layout::{
     CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax, Uncovered, WordList,
@@ -30,9 +30,10 @@ use crate::chrome::Chrome;
 use crate::code_copy::{self, CodeCopy};
 use crate::color::{fade, resolve, same};
 use crate::commands::{self, Act, Commanding, Commands, Entry};
+use crate::contents::{self, Contents, Listing};
 use crate::context::{self, About, Context, Contexting};
 use crate::copying::{self, Copy, CopyFormat, Copying};
-use crate::describe;
+use crate::describe::{self, Whole};
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::figures::{self, Grip, Moving, Resizing};
 use crate::finding::{self, Find, Finding};
@@ -48,7 +49,9 @@ use crate::motion::{self, FRAME_MS};
 use crate::notes::{self, Margin, Noting};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
+use crate::peek::{self, Peek, Peeks};
 use crate::pictures::{self, Linked, Linking, PictureState};
+use crate::previews::{self, LinkPreviewFound, Previewing, Previews};
 use crate::print::{Breaking, Paged, Print, Printing};
 use crate::refer::{Picking, Refer};
 use crate::references::{self, Preview, Reference, References};
@@ -224,6 +227,10 @@ pub enum Message {
     TableMenu,
     /// What is done on the card of a callout.
     Callout(Calling),
+    /// What is asked of a table of contents and of its bar.
+    Contents(Listing),
+    /// What is asked of a link preview and of its card.
+    Preview(Previewing),
     /// What the field of a picture's alt text asks for.
     Alt(Altering),
     /// What the tools over a selection and the field of a comment ask for.
@@ -703,6 +710,40 @@ impl Ui<EditorApp> {
             .edit(platform, |editor, platform| editor.run(Command::EmbedFigure { figure, picture }, platform));
     }
 
+    /// Takes what the shell found of the page at `found.url`, in answer to a [`Request::FetchPreview`]:
+    /// its title, its description and its picture stand in place of what each link preview that waits
+    /// for the address had, as one step to undo. Nothing is taken by a preview that is gone or leads to
+    /// another address by now. A page that says nothing a card can show is told as a fetch that found
+    /// nothing.
+    pub fn fill_preview(&mut self, found: LinkPreviewFound, platform: &mut dyn Platform) {
+        if !found.says() {
+            return self.fail_preview(&found.url, Previews::nothing());
+        }
+        let app = self.app_mut();
+        for block in app.previews.answered(&found.url, None) {
+            let LinkPreviewFound { url, title, description, picture } = found.clone();
+            let command = Command::Preview { block, edit: PreviewEdit::Fetched { url, title, description, picture } };
+            // The answer comes when it comes: the page stays where the person has it.
+            let change = app.run(platform, |editor, platform| editor.run(command, platform));
+            app.follow(&change);
+        }
+    }
+
+    /// Says whether this shell can fetch what a page says of itself, which it can until told otherwise.
+    /// Where it cannot, no [`Request::FetchPreview`] is raised and nothing offers one: a link preview that
+    /// shows its address alone has no "Fetch preview", and its card no button for it. What the document
+    /// keeps of a page shows as it does anywhere.
+    pub fn set_preview_fetching(&mut self, offered: bool) {
+        self.app_mut().previews.offer(offered);
+    }
+
+    /// Says that the page at an address was not fetched and why, in a few words that read on from
+    /// "Not fetched:", such as "the server answered 404", in answer to a [`Request::FetchPreview`]. What
+    /// waits for the address keeps what it shows and offers another try.
+    pub fn fail_preview(&mut self, url: &str, why: &str) {
+        self.app_mut().previews.answered(url, Some(why));
+    }
+
     /// Shows where pictures held over a point of the window would land if they were let go there, as
     /// files dragged over the window are: a bar beside a picture, or between two blocks. `None` puts the
     /// bar away. Returns whether the point is on the page.
@@ -954,11 +995,18 @@ pub struct EditorApp {
     tables: Tables,
     /// The callouts' icons and titles under the pointer, and the card of one.
     callouts: Callouts,
+    /// The tables of contents under the pointer, and the one that is selected.
+    contents: Contents,
+    /// The link previews under the pointer, the card of one, and what the shell says of fetching them.
+    previews: Previews,
+    /// The link in text under the pointer, whose page the document keeps something of.
+    peeks: Peeks,
     /// The menu about what is under the pointer, while it is open.
     context: Option<Context>,
     /// How many of those menus were opened.
     menus: u32,
-    /// The preview of a figure that shows over the page: its caption, and where it is in the page area.
+    /// The preview that shows over the page, of a figure or of the page a link leads to: what it says, and
+    /// where it is in the page area.
     previewed: Option<(String, Rect)>,
     /// How the document read when assistive technology was last told of it.
     told: RefCell<describe::Told>,
@@ -1044,6 +1092,9 @@ impl EditorApp {
             languages: Languages::default(),
             tables: Tables::default(),
             callouts: Callouts::default(),
+            contents: Contents::default(),
+            previews: Previews::default(),
+            peeks: Peeks::default(),
             context: None,
             menus: 0,
             previewed: None,
@@ -1789,6 +1840,7 @@ impl EditorApp {
                 notes::passage(editor.doc(), selection).map(|_| Message::Note(Noting::Write))?
             }
             Act::Pictures => Message::Ask(Request::Pictures),
+            Act::Preview => Message::Preview(Previewing::New),
             Act::AltText => self.captioned().map(|_| Message::Alt(Altering::Open))?,
             Act::Callout => editor.callout().map(|_| Message::Callout(Calling::Open))?,
             Act::CodeLanguage => self.code().map(|_| Message::Language(Languaging::Open))?,
@@ -2494,6 +2546,7 @@ impl EditorApp {
         let card = self.landing.is_some() || self.importing.is_some() || self.copying.is_some();
         let asked = self.context.is_some() || self.link.is_some() || self.linked.open.is_some();
         let asked = asked || self.captions.alt.is_some() || self.tables.open.is_some();
+        let asked = asked || self.contents.open.is_some() || self.previews.carded();
         card || asked || self.commands.open() || self.callouts.open.is_some() || self.languages.listed().is_some()
     }
 
@@ -2550,6 +2603,153 @@ impl EditorApp {
         }
         if let Some(edit) = self.callouts.update(asked, &self.editor) {
             self.edit(platform, |editor, platform| editor.run(Command::Callout(edit), platform));
+        }
+    }
+
+    /// The table of contents at a point of the page area, and what of it is there, while nothing hangs
+    /// over the page.
+    fn contents_at(&self, at: Point) -> Option<(BlockId, contents::Part)> {
+        if self.hung() || self.away() {
+            return None;
+        }
+        let at = self.in_layout(at);
+        let tables = self.layout.contents(Rect::new(at.x, at.y, 0.0, 1.0));
+        tables.iter().find_map(|table| Some((table.block.clone(), contents::part_at(table, at)?)))
+    }
+
+    /// Does what is asked of a table of contents and of its bar.
+    fn listing(&mut self, asked: Listing, platform: &mut dyn Platform) {
+        match asked {
+            Listing::Open(table) => {
+                self.put_away();
+                self.contents.open = Some(table);
+            }
+            Listing::Levels(levels) => {
+                let Some(table) = self.contents.open.clone() else { return };
+                let command = Command::SetContentsLevels { table, levels };
+                self.edit(platform, |editor, platform| editor.run(command, platform));
+            }
+            Listing::Close => self.contents.open = None,
+        }
+    }
+
+    /// The link preview at a point of the page area, and whether the point is on the control that fetches
+    /// its page, while nothing hangs over the page.
+    fn preview_at(&self, at: Point) -> Option<(BlockId, bool)> {
+        if self.hung() || self.away() {
+            return None;
+        }
+        let at = self.in_layout(at);
+        let cards = self.layout.previews(Rect::new(at.x, at.y, 0.0, 1.0));
+        let card = cards.into_iter().find(|card| card.rect.contains(at))?;
+        let room = card.control.filter(|_| self.previews.offered());
+        let on_control = room.is_some_and(|room| previews::control(room).contains(at));
+        Some((card.block, on_control))
+    }
+
+    /// The link in text at a point of the page area whose page the document keeps something of, while
+    /// nothing hangs over the page.
+    fn peek_at(&self, at: Point) -> Option<Peek> {
+        if self.hung() || self.away() || self.dragging {
+            return None;
+        }
+        let doc = self.editor.doc();
+        let (url, line) = safe::link_line_at(doc, &self.layout, self.in_layout(at))?;
+        doc.previews.get(&url).is_some_and(|kept| !kept.is_empty()).then_some(Peek { url, line })
+    }
+
+    /// Draws what the document keeps of the page of the link under the pointer, in a card beside the
+    /// link. `room` is the size of the page area. Returns what the card says, where it is, and the
+    /// pictures it waits for.
+    fn peek(&self, room: Size, out: &mut DisplayList) -> Option<(String, Rect, Vec<String>)> {
+        let Peek { url, line } = self.peeks.shown()?.clone();
+        let anchor = self.onto(line);
+        let kept = self.editor.doc().previews.get(&url)?;
+        let size = |image: &Image| (image.width(), image.height());
+        let picture = kept.image.as_deref().and_then(|asset| self.images.get(asset)).map(size);
+        let card = peek::Card { url: &url, kept, picture, anchor, room };
+        let mut drawn = DisplayList::default();
+        let rect = card.paint(self.shaper.as_ref(), self.scheme, &mut drawn);
+        // A picture that is not here yet has its place kept.
+        let awaited = pictures::awaited(&self.images, self.scheme, &mut drawn);
+        out.items.extend(drawn.items);
+        Some((card.said(), rect, awaited))
+    }
+
+    /// The address a link preview leads to.
+    fn address_of(&self, preview: &BlockId) -> Option<&str> {
+        self.editor.doc().block(preview).and_then(|block| previews::address(&block.kind))
+    }
+
+    /// Asks the shell for what the page of a link preview says of itself, unless its address is being
+    /// fetched already.
+    fn fetch_preview(&mut self, preview: &BlockId) {
+        let Some(url) = self.address_of(preview).map(str::to_owned) else { return };
+        if self.previews.fetch(preview, &url) {
+            self.requests.push(Request::FetchPreview { url });
+        }
+    }
+
+    /// Does what is asked of a link preview and of its card.
+    fn previewing(&mut self, asked: Previewing, platform: &mut dyn Platform) {
+        match asked {
+            Previewing::New => {
+                self.put_away();
+                self.previews.add();
+            }
+            Previewing::Open(preview) => {
+                self.put_away();
+                self.previews.show(preview);
+            }
+            Previewing::Address(typed) => self.previews.typed(typed),
+            Previewing::TakeAddress => match self.previews.take() {
+                Some((Some(block), url)) => {
+                    let command = Command::Preview { block, edit: PreviewEdit::Url(url) };
+                    self.edit(platform, |editor, platform| editor.run(command, platform));
+                }
+                Some((None, url)) => {
+                    let change =
+                        self.run(platform, |editor, platform| editor.run(Command::InsertPreview(url), platform));
+                    self.changed(&change);
+                    // The card that was put in shows its address alone, and its page is asked for at once.
+                    let new = change.blocks.iter().find(|block| self.address_of(block).is_some()).cloned();
+                    if let Some(new) = new {
+                        self.fetch_preview(&new);
+                    }
+                }
+                None => {}
+            },
+            Previewing::Forget => self.previews.forget(),
+            Previewing::Edit(edit) => {
+                let Some(block) = self.previews.open.clone() else { return };
+                self.edit(platform, |editor, platform| editor.run(Command::Preview { block, edit }, platform));
+            }
+            Previewing::Fetch => {
+                if let Some(preview) = self.previews.open.clone() {
+                    self.fetch_preview(&preview);
+                }
+            }
+            Previewing::Close => self.previews.close(),
+        }
+    }
+
+    /// Puts away what hangs from a place in the text, for something else to hang from the page.
+    fn put_away(&mut self) {
+        (self.link, self.spelling.fix, self.linked.open, self.captions.alt) = (None, None, None, None);
+        self.contents.open = None;
+        self.previews.close();
+    }
+
+    /// Puts the caret at the start of a block and brings the block to the top of the page.
+    fn jump(&mut self, block: BlockId) {
+        let start = Pos { block, offset: 0 };
+        self.editor.select(Selection::caret(start.clone()));
+        self.mark();
+        // Twice, since laying out what comes into view can move the block.
+        for _ in 0..2 {
+            let Some(line) = self.layout.caret(&start) else { break };
+            self.scroll = self.down(line.y).clamp(0.0, self.max_scroll());
+            self.layout.settle(self.viewport(), 0);
         }
     }
 
@@ -2778,6 +2978,12 @@ impl EditorApp {
         let called = std::mem::replace(&mut self.callouts.over, headed.clone()) != headed;
         let named = self.references.rest().and_then(|at| self.language_at(at));
         let called = (std::mem::replace(&mut self.languages.over, named.clone()) != named) || called;
+        let listed = self.references.rest().and_then(|at| self.contents_at(at));
+        let called = self.contents.point(listed) || called;
+        let carded = self.references.rest().and_then(|at| self.preview_at(at));
+        let called = (std::mem::replace(&mut self.previews.over, carded.clone()) != carded) || called;
+        let peeked = self.references.rest().and_then(|at| self.peek_at(at));
+        let called = self.peeks.point(peeked) || called;
         let linked = self.references.rest().and_then(|at| self.linked_at(at));
         // Each is taken, whichever changed.
         let clouded = self.linked.point(linked);
@@ -2860,6 +3066,31 @@ impl EditorApp {
                     self.dragging = false;
                     self.references.press(None);
                     return self.language(&block, platform);
+                }
+                // A press on a line of a table of contents goes to the heading it lists, and one on the
+                // table's chip opens its menu.
+                if let Some((table, part)) = self.contents_at(at) {
+                    self.dragging = false;
+                    self.references.press(None);
+                    return match part {
+                        contents::Part::Chip => self.listing(Listing::Open(table), platform),
+                        contents::Part::Line(heading) => {
+                            self.jump(heading);
+                            self.unpoint();
+                        }
+                    };
+                }
+                // A press on a link preview opens its card, and one on its control fetches its page. With
+                // Ctrl or Cmd held the preview is a link like any other.
+                if let Some((preview, on_control)) = self.preview_at(at) {
+                    self.dragging = false;
+                    self.references.press(None);
+                    let follows = mods.primary && !mods.shift && clicks == 1;
+                    return match self.address_of(&preview).filter(|_| follows).map(str::to_owned) {
+                        Some(href) => self.open_link(&href, false),
+                        None if on_control => self.fetch_preview(&preview),
+                        None => self.previewing(Previewing::Open(preview), platform),
+                    };
                 }
                 // A press on a copy button is the button's, and leaves the caret where it is.
                 let button = self.copy_button(at);
@@ -3207,6 +3438,11 @@ impl EditorApp {
         }
         self.callouts.follow(&self.editor);
         self.languages.follow(&self.editor);
+        // The bar of a table of contents that is gone goes with it, and so does the card of a preview.
+        if self.contents.open.as_ref().is_some_and(|table| self.editor.doc().block(table).is_none()) {
+            self.contents.open = None;
+        }
+        self.previews.follow(&self.editor);
         // The alt text of a picture the selection has left is no longer being written.
         if self.captions.alt.as_ref().is_some_and(|(figure, _)| self.captioned() != Some(figure)) {
             self.captions.alt = None;
@@ -3312,6 +3548,30 @@ impl EditorApp {
         for (block, head) in self.layout.callouts(viewport) {
             self.callouts.paint(&block, head, self.scheme, &mut list);
         }
+        // A table of contents shows what a press on it does, and a link preview that has only its
+        // address has the control that fetches the rest. The table that is selected and the preview
+        // whose card is out have a ring.
+        let ring = |at: Rect, (across, down): (f32, f32)| {
+            let rect = Rect::new(at.x - across, at.y - down, at.width + 2.0 * across, at.height + 2.0 * down);
+            let color = resolve(accent().base, self.scheme, 1.0);
+            Item::Stroke { rect, color, width: 2.0, radius: tokens::RADIUS_CARD }
+        };
+        for table in self.layout.contents(viewport) {
+            self.contents.paint(&table, self.accent.text, self.scheme, &mut list);
+            if self.contents.open.as_ref() == Some(&table.block) {
+                // A table has no frame of its own, so its ring stands off its lines.
+                list.items.push(ring(table.rect, (tokens::SPACE_SM, tokens::SPACE_XS)));
+            }
+        }
+        for card in self.layout.previews(viewport) {
+            if let Some(room) = card.control.filter(|_| self.previews.offered()) {
+                let at = previews::control(room);
+                self.previews.paint(&card.block, at, self.shaper.as_ref(), self.scheme, &mut list);
+            }
+            if self.previews.open.as_ref() == Some(&card.block) {
+                list.items.push(ring(card.rect, (RING, RING)));
+            }
+        }
         // Each code block has its copy button in its corner, over its text, and its language beside that.
         for (block, code) in self.layout.code_boxes(viewport) {
             let button = code_copy::button(code);
@@ -3403,6 +3663,17 @@ impl EditorApp {
             review::cuts(cut, shift, room)
         });
         self.previewed = self.preview(room, &mut over);
+        if self.previewed.is_none()
+            && let Some((said, rect, awaited)) = self.peek(room, &mut over)
+        {
+            // The card's picture is the document's own, asked for once like any other the page shows.
+            for asset in awaited {
+                if self.wanted.insert(asset.clone()) {
+                    self.requests.push(Request::Asset(asset));
+                }
+            }
+            self.previewed = Some((said, rect));
+        }
         if let Some((at, image)) = carried {
             self.carry(image, at, &mut over);
         }
@@ -3475,6 +3746,29 @@ impl EditorApp {
             let named = code.and_then(|code| Some(self.language_label(block, code)?.1));
             let spot = named.map(|named| self.onto(named)).or(caret).unwrap_or_default();
             element = element.popover(self.languages.card(spot));
+        } else if let Some((table, levels)) =
+            self.contents.open.as_ref().and_then(|open| match self.editor.doc().block(open)?.kind {
+                BlockKind::TableOfContents { levels } => Some((open, levels)),
+                _ => None,
+            })
+        {
+            // The bar hangs under the table, or from the caret when the table is out of view.
+            let tables = self.layout.contents(viewport);
+            let shown = tables.iter().find(|shown| shown.block == *table).map(|shown| self.onto(shown.rect));
+            element = element.popover(contents::bar(levels, shown.or(caret).unwrap_or_default()));
+        } else if self.previews.adding() {
+            // The field hangs from the caret, where the preview will stand.
+            element = element.popover(self.previews.asking(caret.unwrap_or_default()));
+        } else if let Some((preview, kind)) =
+            self.previews.open.as_ref().and_then(|open| Some((open, &self.editor.doc().block(open)?.kind)))
+        {
+            // The card hangs under the preview, or from the caret when the preview is out of view.
+            let cards = self.layout.previews(viewport);
+            let shown = cards.into_iter().find(|card| card.block == *preview).map(|card| self.onto(card.rect));
+            let spot = shown.or(caret).unwrap_or_default();
+            if let Some(card) = self.previews.card(preview, kind, spot) {
+                element = element.popover(card);
+            }
         } else if let Some(context) = &self.context {
             let asked = |act: &Act| self.asked(act);
             let fix = self.spelling.fix.as_ref();
@@ -3492,7 +3786,19 @@ impl EditorApp {
                 .on_press(Message::Safe(Safely::Follow(address.clone())));
             let row = Element::row().align(Align::Center).gap(tokens::SPACE_XS).width(LINK_WIDTH);
             let row = row.child(Element::from(field).grow(1.0)).child(open);
-            let editor = Popover::new(row)
+            // What the document keeps of the page there is read here too, by someone with no pointer.
+            let mut card = Element::column().gap(tokens::SPACE_SM).width(LINK_WIDTH).child(row);
+            if let Some(kept) = self.editor.doc().previews.get(address.trim()) {
+                let quiet = TextStyle::control().size(tokens::TEXT_SM);
+                let lines =
+                    [(&kept.title, tokens::FG, quiet.weight(600)), (&kept.description, tokens::FG_MUTED, quiet)];
+                let said = lines.into_iter().filter_map(|(line, ink, style)| {
+                    let said = line.as_deref().map(str::trim).filter(|said| !said.is_empty())?;
+                    Some(Element::paragraph(said, style).fg(ink).max_width(LINK_WIDTH))
+                });
+                card = card.child(Element::column().gap(tokens::SPACE_XS).children(said));
+            }
+            let editor = Popover::new(card)
                 .label("Link")
                 .max_width(LINK_WIDTH + 2.0 * tokens::SPACE_MD + 2.0)
                 .open(true)
@@ -3544,6 +3850,7 @@ impl EditorApp {
         let pressable = pressable || self.captions.over || self.margin.over.is_some() || self.review.pressable();
         let pressable = pressable || self.tables.pointed();
         let pressable = pressable || self.callouts.over.is_some() || self.languages.over.is_some();
+        let pressable = pressable || self.contents.pointed() || self.previews.over.is_some();
         match self.grip.corner() {
             Some(corner) => element.cursor(Cursor::Resize(figures::edge(corner))),
             None if pressable => element.cursor(Cursor::Pointer),
@@ -4140,26 +4447,42 @@ impl EditorApp {
 
     /// The symbols the sheet offers for the command being typed at the caret, and the stretch of the
     /// formula's block that one of them would replace.
-    fn symbols(&self) -> Option<(Pos, usize, Vec<&'static letters_math::Command>)> {
+    fn symbols(&self) -> Option<(Pos, maths::Offered)> {
         let source = Source::of(&self.editor, self.shaper.as_ref(), self.wide())?;
-        let (typed, symbols) = self.maths.symbols(&source, self.editor.selection()?)?;
-        Some((Pos::new(source.block, typed.start), typed.end, symbols))
+        let offered = self.maths.symbols(&source, self.editor.selection()?)?;
+        Some((Pos::new(source.block, offered.range.start), offered))
     }
 
     /// Writes a symbol of the list in place of the command being typed. One that takes arguments gets its
-    /// braces, and the caret waits in the first pair.
+    /// braces, and the caret waits in the first pair. An environment gets the `\end` that matches, and the
+    /// caret waits between the two.
     fn take(&mut self, index: usize, platform: &mut dyn Platform) {
-        let Some((start, end, symbols)) = self.symbols() else { return };
-        let Some(symbol) = symbols.get(index) else { return };
-        self.editor.select(Selection { anchor: start.clone(), head: Pos::new(start.block.clone(), end) });
-        let written = InputEvent::Insert(maths::written(symbol));
-        self.edit(platform, |editor, platform| editor.input(written, platform));
-        if symbol.arguments > 0 {
-            let first = Pos::new(start.block, start.offset + symbol.command.len() + 1);
-            self.editor.select(Selection::caret(first));
+        let Some((start, offered)) = self.symbols() else { return };
+        let Some(symbol) = offered.symbols.get(index).copied() else { return };
+        self.editor.select(Selection { anchor: start.clone(), head: Pos::new(start.block.clone(), offered.range.end) });
+        let (written, caret) = match offered.environments {
+            true => maths::begun(symbol, offered.ended),
+            false => maths::written(symbol),
+        };
+        let whole = written.len();
+        self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(written), platform));
+        if caret < whole {
+            self.editor.select(Selection::caret(Pos::new(start.block, start.offset + caret)));
             self.mark();
         }
+        self.maths.took(symbol);
+    }
+
+    /// Tab in a formula with no list out: the caret leaves the braces it is in, for the next argument
+    /// where one follows and for after them where none does. Outside braces the key is the editor's.
+    fn onward(&mut self) -> bool {
+        let Some(source) = Source::of(&self.editor, self.shaper.as_ref(), self.wide()) else { return false };
+        let caret = self.editor.selection().filter(|selection| selection.is_caret());
+        let Some(next) = caret.and_then(|caret| source.onward(caret.head.offset)) else { return false };
+        self.editor.select(Selection::caret(Pos::new(source.block, next)));
         self.maths.typed(false);
+        self.mark();
+        true
     }
 
     /// Puts what an offer of the insert menu stands for on its line, in place of the slash and what was
@@ -4175,6 +4498,9 @@ impl EditorApp {
             Put::Table => Command::InsertTable { rows: 3, columns: 3 },
             // The shell lets the person choose them, and they take the place of the line that is now empty.
             Put::Pictures => return self.requests.push(Request::Pictures),
+            Put::Contents => Command::InsertContents,
+            // The card asks for the address, and the preview takes the place of the line that is now empty.
+            Put::Preview => return self.previewing(Previewing::New, platform),
         };
         self.edit(platform, |editor, platform| editor.run(command, platform));
     }
@@ -4243,10 +4569,13 @@ impl EditorApp {
     /// Lets the list of symbols have the keys that walk it and take from it, while it shows.
     fn list_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
         let plain = event.mods == Modifiers::default();
-        let Some((_, _, symbols)) = self.symbols().filter(|_| plain) else { return false };
+        let Some((_, offered)) = self.symbols().filter(|_| plain) else {
+            return plain && event.key == Key::Tab && self.onward();
+        };
+        let listed = offered.symbols.len();
         match event.key {
-            Key::Down | Key::Up => self.maths.pick(event.key == Key::Down, symbols.len()),
-            Key::Tab => self.take(self.maths.picked(symbols.len()), platform),
+            Key::Down | Key::Up => self.maths.pick(event.key == Key::Down, listed),
+            Key::Tab => self.take(self.maths.picked(listed), platform),
             _ => return false,
         }
         true
@@ -4450,6 +4779,8 @@ impl EditorApp {
             Message::Linked(asked) => self.linking(asked),
             Message::TableMenu => self.tables.open = None,
             Message::Callout(asked) => self.calling(asked, platform),
+            Message::Contents(asked) => self.listing(asked, platform),
+            Message::Preview(asked) => self.previewing(asked, platform),
             Message::Safe(asked) => self.safely(asked),
             Message::Merge(asked) => self.merging(asked),
             Message::Alt(asked) => self.altering(asked, platform),
@@ -4468,17 +4799,7 @@ impl EditorApp {
                     self.requests.push(Request::Settings(self.settings.clone()));
                 }
             }
-            Message::Jump(block) => {
-                let start = Pos { block, offset: 0 };
-                self.editor.select(Selection::caret(start.clone()));
-                self.mark();
-                // Twice, since laying out what comes into view can move the block.
-                for _ in 0..2 {
-                    let Some(line) = self.layout.caret(&start) else { break };
-                    self.scroll = self.down(line.y).clamp(0.0, self.max_scroll());
-                    self.layout.settle(self.viewport(), 0);
-                }
-            }
+            Message::Jump(block) => self.jump(block),
             Message::EditLink => self.link = Some(self.editor.link().unwrap_or_default().to_owned()),
             Message::LinkDraft(address) => self.link = self.link.is_some().then_some(address),
             Message::LinkClose => self.link = None,
@@ -4655,6 +4976,25 @@ impl App for EditorApp {
         for (marker, at) in self.markers() {
             describe::marker(&marker.block, &marker.label(), self.onto(at), page, nodes);
         }
+        // What is pressed of the tables of contents and the link previews in view.
+        let view = self.viewport();
+        for table in self.layout.contents(view) {
+            for (heading, line) in &table.lines {
+                let listed = self.editor.doc().block(heading).map(Block::plain_text).unwrap_or_default();
+                describe::contents_line(&table.block, heading, listed.trim(), self.onto(*line), page, nodes);
+            }
+            let chip = self.onto(pictures::chip(contents::badge(&table)));
+            describe::whole(&table.block, Whole::Contents, (contents::LABEL, None), chip, page, nodes);
+        }
+        for card in self.layout.previews(view) {
+            let at = self.onto(card.rect);
+            describe::whole(&card.block, Whole::Preview, (previews::LABEL, None), at, page, nodes);
+            if let Some(room) = card.control.filter(|_| self.previews.offered()) {
+                let failed = self.previews.failed(&card.block).map(|why| format!("Not fetched: {why}"));
+                let told = (self.previews.says(&card.block), failed.as_deref());
+                describe::whole(&card.block, Whole::Fetch, told, self.onto(previews::control(room)), page, nodes);
+            }
+        }
         if let Some(shown) = self.table() {
             for (part, at) in shown.parts() {
                 let (axis, index, does) = match part {
@@ -4719,6 +5059,12 @@ impl App for EditorApp {
                 self.tabled(&shown, asked, platform);
             }
             Some(describe::Request::Callout(block)) => self.call(&block, platform),
+            Some(describe::Request::Whole(block, Whole::Contents)) => self.listing(Listing::Open(block), platform),
+            Some(describe::Request::Whole(block, Whole::Preview)) => {
+                self.previewing(Previewing::Open(block), platform);
+            }
+            Some(describe::Request::Whole(block, Whole::Fetch)) => self.fetch_preview(&block),
+            Some(describe::Request::Line(heading)) => self.jump(heading),
             Some(describe::Request::Alt(figure)) => {
                 self.editor.select_picture(&figure);
                 self.mark();
@@ -4831,7 +5177,8 @@ impl App for EditorApp {
         let light = self.references.animate(now_ms);
         let copied = self.code_copy.animate(now_ms);
         let slid = self.review.animate(now_ms);
-        [note, slide, fade, light, copied, slid].into_iter().flatten().min()
+        let rested = self.peeks.animate(now_ms);
+        [note, slide, fade, light, copied, slid, rested].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {

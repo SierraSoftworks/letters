@@ -4,7 +4,7 @@
 //!   Splitting or joining a paragraph is one character, so it merges with concurrent typing.
 //! - `blocks` and `depths` are maps from a marker character's own id to what its block is and how deep it
 //!   sits. Kept apart from the text, a block can change kind while someone types beside its marker.
-//! - `meta`, `dictionary` and `extra` are maps holding the document's own fields.
+//! - `meta`, `dictionary`, `previews` and `extra` are maps holding the document's own fields.
 //! - `style` is a map with one entry per field of the style, so two replicas that change different fields
 //!   of one element type both keep their change.
 //!
@@ -32,11 +32,12 @@ use loro::{
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::doc::line;
 use crate::flat::{Attrs, BLOCK, DEPTH, Entry, MARKER, build, head, insert, order, transform};
 use crate::history::read_id;
 use crate::json::{mark_name, read_mark};
 use crate::undo::Script;
-use crate::{Block, BlockId, BlockKind, Document, Mark, Properties, Run, STYLE_FORMAT, Style};
+use crate::{Block, BlockId, BlockKind, Document, Mark, Preview, Properties, Run, STYLE_FORMAT, Style};
 
 pub(crate) const BODY: &str = "body";
 const BLOCKS: &str = "blocks";
@@ -44,6 +45,9 @@ const DEPTHS: &str = "depths";
 const META: &str = "meta";
 const DICTIONARY: &str = "dictionary";
 const EXTRA: &str = "extra";
+/// What is kept of the pages the text links to, each as the JSON of its fields against its address. A
+/// preview is one value, so two writers who fill one address apart leave one of theirs whole.
+const PREVIEWS: &str = "previews";
 const STYLE: &str = "style";
 /// The writers' names, each against the replica its writer used.
 const AUTHORS: &str = "authors";
@@ -607,6 +611,8 @@ fn plan(doc: &Document, index: &[Entry]) -> Vec<Call> {
     let properties = doc.properties.iter().map(|properties| properties.to_value().to_string());
     calls.extend(properties.map(|json| Call::Set(META, PROPERTIES.into(), json.into())));
     calls.extend(doc.dictionary.iter().map(|word| Call::Set(DICTIONARY, word_key(word, ""), true.into())));
+    let previews = doc.previews.iter().map(|(url, preview)| (url.clone(), preview.to_value().to_string()));
+    calls.extend(previews.map(|(url, json)| Call::Set(PREVIEWS, url, json.into())));
     calls.extend(doc.extra.iter().map(|(key, value)| Call::Set(EXTRA, key.clone(), value.to_string().into())));
     calls
 }
@@ -713,6 +719,7 @@ pub(crate) fn read_meta(loro: &LoroDoc, doc: &mut Document) {
     let fresh = Document::default();
     doc.language = fresh.language;
     doc.dictionary.clear();
+    doc.previews.clear();
     doc.extra.clear();
     doc.properties = None;
     each(loro, META, |key, value| match (key, text(value)) {
@@ -726,6 +733,12 @@ pub(crate) fn read_meta(loro: &LoroDoc, doc: &mut Document) {
     each(loro, DICTIONARY, |key, value| {
         if matches!(value, LoroValue::Bool(true)) {
             doc.dictionary.insert(word_of(key).to_owned());
+        }
+    });
+    each(loro, PREVIEWS, |url, value| {
+        let read = text(value).and_then(|json| serde_json::from_str(json).ok());
+        if let Some(preview) = read.and_then(|value| Preview::from_value(value, "").ok()) {
+            doc.previews.insert(url.to_owned(), preview);
         }
     });
     each(loro, EXTRA, |key, value| {
@@ -760,6 +773,15 @@ pub(crate) fn normal_meta(doc: &mut Document) {
     {
         *properties = read;
     }
+    // A preview no file would hold is not kept, as one that tells nothing is not.
+    let kept = |url: &String, preview: &mut Preview| match Preview::from_value(preview.to_value(), "") {
+        Ok(read) if line(url) && !read.is_empty() => {
+            *preview = read;
+            true
+        }
+        _ => false,
+    };
+    doc.previews.retain(kept);
 }
 
 /// One value in one of the history's maps, as an edit sets it. `None` takes the key out.
@@ -814,6 +836,10 @@ pub(crate) fn meta_assigns(loro: &LoroDoc, from: &Document, to: &Document) -> Ve
     let add = format!("{}@{peer}", loro.oplog_vv().get(&peer).copied().unwrap_or(0));
     let added = to.dictionary.difference(&from.dictionary);
     assigns.extend(added.map(|word| set(DICTIONARY, &word_key(word, &add), Some(true.into()))));
+    let gone = from.previews.keys().filter(|url| !to.previews.contains_key(*url));
+    assigns.extend(gone.map(|url| set(PREVIEWS, url, None)));
+    let changed = to.previews.iter().filter(|(url, preview)| from.previews.get(*url) != Some(preview));
+    assigns.extend(changed.map(|(url, preview)| set(PREVIEWS, url, Some(preview.to_value().to_string().into()))));
     let gone = from.extra.keys().filter(|key| !to.extra.contains_key(*key));
     assigns.extend(gone.map(|key| set(EXTRA, key, None)));
     let changed = to.extra.iter().filter(|(key, value)| from.extra.get(*key) != Some(value));

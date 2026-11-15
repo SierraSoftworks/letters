@@ -14,7 +14,7 @@ use std::ops::Range;
 
 use letters_layout::Palette;
 use letters_model::{
-    Align, Block, BlockId, BlockKind, Document, ListKind, Mark, NoteKind, Notes, Run, Style, TextStyle, Tone,
+    Align, Block, BlockId, BlockKind, Document, ListKind, Mark, NoteKind, Notes, Preview, Run, Style, TextStyle, Tone,
 };
 use letters_render::Color;
 use letters_render::image::Image;
@@ -109,7 +109,7 @@ pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets
     }
     let mut writer = Writer {
         out: String::new(),
-        links: Links::default(),
+        links: Links::new(&doc.previews),
         media: Vec::new(),
         pictures: BTreeMap::new(),
         assets,
@@ -154,9 +154,9 @@ pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets
     );
     document.push('\n');
 
-    let body_links = std::mem::take(&mut writer.links);
+    let body_links = writer.links.part();
     let comments_xml = (!comments.is_empty()).then(|| writer.comments(&comments));
-    let comment_links = std::mem::take(&mut writer.links);
+    let comment_links = writer.links.part();
 
     // The parts beside the document, each with its type and the relationship that names it.
     let mut parts: Vec<(String, String, Vec<u8>)> = vec![
@@ -286,15 +286,41 @@ fn hex(color: Color) -> String {
 }
 
 /// The addresses one part links to, each with the number of its relationship.
-#[derive(Default)]
-struct Links {
+struct Links<'d> {
     targets: Vec<(String, &'static str)>,
     known: BTreeMap<String, usize>,
+    /// What the document keeps of the pages its links lead to, by address as a link writes it.
+    previews: &'d BTreeMap<String, Preview>,
 }
 
-impl Links {
+impl<'d> Links<'d> {
     /// How far the ids of the part's fixed relationships run.
     const FIXED: usize = 8;
+    /// The longest ScreenTip written, in UTF-16 units. Word limits how long one may be.
+    const TIP: usize = 255;
+
+    fn new(previews: &'d BTreeMap<String, Preview>) -> Self {
+        Self { targets: Vec::new(), known: BTreeMap::new(), previews }
+    }
+
+    /// Hands over the links of the part just written and starts the next part's.
+    fn part(&mut self) -> Self {
+        std::mem::replace(self, Self::new(self.previews))
+    }
+
+    /// What Word shows over a link that is pointed at: the title of its page, where the document keeps
+    /// one. Word has no place there for the description and the picture the page shows with it.
+    fn tip(&self, link: &str) -> Option<String> {
+        let title = self.previews.get(link)?.title.as_deref()?.trim();
+        let mut room = Self::TIP;
+        let fits = |c: &char| room.checked_sub(c.len_utf16()).map(|left| room = left).is_some();
+        let mut tip: String = title.chars().take_while(fits).collect();
+        if tip.len() < title.len() {
+            tip.pop();
+            tip.push('\u{2026}');
+        }
+        (!tip.is_empty()).then_some(tip)
+    }
 
     fn id(&mut self, target: &str, kind: &'static str) -> String {
         let next = self.targets.len();
@@ -307,7 +333,7 @@ impl Links {
 }
 
 /// A part's relationships: those written out in `fixed`, then its links and pictures.
-fn relationships(fixed: &str, links: &Links) -> String {
+fn relationships(fixed: &str, links: &Links<'_>) -> String {
     let mut out =
         format!("{HEAD}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{fixed}");
     for (index, (target, kind)) in links.targets.iter().enumerate() {
@@ -370,7 +396,7 @@ impl Label {
 struct Writer<'d, 'a> {
     /// The document's body so far.
     out: String,
-    links: Links,
+    links: Links<'d>,
     /// Pictures by the name of their part.
     media: Vec<(String, Vec<u8>)>,
     /// The relationship each asset already written goes by.
@@ -1086,7 +1112,7 @@ fn inline(
     lang: Option<&str>,
     rtl: bool,
     labels: &BTreeMap<BlockId, Label>,
-    links: &mut Links,
+    links: &mut Links<'_>,
     out: &mut String,
 ) {
     let len: usize = runs.iter().map(|run| run.text.len()).sum();
@@ -1151,7 +1177,11 @@ fn inline(
             if open.is_none()
                 && let Some(target) = link.and_then(address)
             {
-                let _ = write!(out, "<w:hyperlink r:id=\"{}\">", links.id(&target, "hyperlink"));
+                let _ = write!(out, "<w:hyperlink r:id=\"{}\"", links.id(&target, "hyperlink"));
+                if let Some(tip) = link.and_then(|link| links.tip(link)) {
+                    let _ = write!(out, " w:tooltip=\"{}\"", escaped(&tip));
+                }
+                out.push('>');
                 open = link;
             }
             match &whole {

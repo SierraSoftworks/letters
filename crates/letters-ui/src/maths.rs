@@ -3,8 +3,9 @@
 //! The formula stays typeset on the page. Its source is written on a sheet that slides out from under it
 //! when the caret reaches it, and the caret shows there, at the place in the source the editor holds it.
 //! The sheet is as many rows high as the source has lines, and a line too long for it goes on in a new row.
-//! A backslash typed there lists the symbols that match what follows it, each one typeset. The `$` that
-//! closes a formula blends the source it was typed as into its glyphs.
+//! A backslash typed there lists the symbols that match what follows it, each one typeset and those used
+//! last first, and `\begin{` lists the environments. Tab takes one, and then moves the caret from one
+//! argument to the next. The `$` that closes a formula blends the source it was typed as into its glyphs.
 //!
 //! The source is coloured as it is read: commands, words, comments, and each pair of brackets by how deep
 //! it is nested. What is wrong is in red, and what the maths engine says of it is under the source. Neither
@@ -15,7 +16,7 @@ use std::rc::Rc;
 
 use accesskit::Role;
 use letters_editor::{Editor, LinePos, Lines};
-use letters_math::{Command as Symbol, Formula, TEXT_RATIO, commands, typeset};
+use letters_math::{Command as Symbol, Formula, TEXT_RATIO, commands, environments, typeset};
 use letters_model::{BlockId, BlockKind, Pos, Selection};
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 
@@ -48,6 +49,8 @@ const SLIDE_MS: f32 = 140.0;
 const SQUEEZE: f32 = 0.5;
 /// How many symbols the list shows, and the least room it takes across.
 const LISTED: usize = 6;
+/// How many of the symbols taken last are remembered, to be listed first.
+const RECENT: usize = 8;
 const LIST_WIDTH: f32 = 300.0;
 /// The least room across for what the maths engine says is wrong.
 const FAULT_WIDTH: f32 = 240.0;
@@ -268,6 +271,53 @@ impl Source {
         Some((self.range.start + slash..self.range.start + at + after, &before[slash + 1..]))
     }
 
+    /// The environment being named at an offset in the block, after `\begin{`: where the whole of it sits,
+    /// from its backslash to the brace that closes the name if there is one, and the name before the offset.
+    pub fn beginning(&self, offset: usize) -> Option<(Range<usize>, &str)> {
+        let named = |byte: u8| byte.is_ascii_alphabetic() || byte == b'*';
+        let at = offset.checked_sub(self.range.start)?;
+        let before = self.text.get(..at)?;
+        let name = at - before.bytes().rev().take_while(|byte| named(*byte)).count();
+        let slash = before[..name].strip_suffix(r"\begin{")?.len();
+        // After the backslash that ends a row, `begin` is a word.
+        if before[..slash].bytes().rev().take_while(|byte| *byte == b'\\').count() % 2 == 1 {
+            return None;
+        }
+        let rest = &self.text[at..];
+        let after = rest.bytes().take_while(|byte| named(*byte)).count();
+        let closed = usize::from(rest[after..].starts_with('}'));
+        Some((self.range.start + slash..self.range.start + at + after + closed, &before[name..]))
+    }
+
+    /// Whether an `\end` waits for the `\begin` at a stretch of the block: the rest of the source ends
+    /// more environments than it begins.
+    pub fn awaited(&self, begin: &Range<usize>) -> bool {
+        let (before, after) = (begin.start - self.range.start, begin.end - self.range.start);
+        let count = |word: &str| self.text[..before].matches(word).count() + self.text[after..].matches(word).count();
+        count(r"\end{") > count(r"\begin{")
+    }
+
+    /// Where Tab takes a caret that is inside a pair of braces: into the pair that follows them at once,
+    /// as the next argument of a command does, or past them where none does. `None` in no braces.
+    pub fn onward(&self, offset: usize) -> Option<usize> {
+        let at = offset.checked_sub(self.range.start)?;
+        let mut open = Vec::new();
+        for token in tex::parts(&self.text).into_iter().filter(|token| matches!(token.part, Part::Paired(_))) {
+            match &self.text[token.range.clone()] {
+                "{" => open.push(token.range.start),
+                "}" => {
+                    // The first pair to close round the caret is the innermost.
+                    if open.pop().is_some_and(|opened| opened < at && at <= token.range.start) {
+                        let next = usize::from(self.text[token.range.end..].starts_with('{'));
+                        return Some(self.range.start + token.range.end + next);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// The rectangles under a stretch of the source, one per row it touches.
     fn spans(&self, range: &Range<usize>) -> Vec<Rect> {
         let height = Self::line_height();
@@ -352,31 +402,69 @@ impl<L: Lines> Lines for SheetLines<L> {
     }
 }
 
-/// The symbols that match what is typed after a backslash, best first: the command of that name, those
-/// that begin with it, then those whose plain name, or another word for them, has a word that does.
-pub(crate) fn matching(typed: &str) -> Vec<&'static Symbol> {
+/// The symbols of a table that match what is typed after a backslash, or the environments that match
+/// what is typed after `\begin{`. The one of that very name is first, then those in `recent`, which were
+/// taken last and come latest first, then those that begin with what is typed, then those whose plain
+/// name, or another word for them, has a word that does.
+pub(crate) fn matching(table: &'static [Symbol], typed: &str, recent: &[&str]) -> Vec<&'static Symbol> {
     let lower = typed.to_ascii_lowercase();
     let begins = |text: &str| text.to_ascii_lowercase().starts_with(&lower);
     let worded = |text: &str| !typed.is_empty() && text.split(' ').any(begins);
     let rank = |symbol: &Symbol| {
-        let command = symbol.command.strip_prefix('\\')?;
-        match () {
-            () if command == typed => Some(0),
-            () if command.starts_with(typed) => Some(1),
-            () if begins(command) => Some(2),
-            () if worded(symbol.name) || symbol.aliases.iter().any(|alias| worded(alias)) => Some(3),
-            () => None,
-        }
+        // An environment has no backslash, and the line break keeps its second.
+        let command = symbol.command.strip_prefix('\\').unwrap_or(symbol.command);
+        let fit = match () {
+            () if command == typed => 0,
+            () if command.starts_with(typed) => 1,
+            () if begins(command) => 2,
+            () if worded(symbol.name) || symbol.aliases.iter().any(|alias| worded(alias)) => 3,
+            () => return None,
+        };
+        let used = recent.iter().position(|used| *used == symbol.command);
+        Some(match (fit, used) {
+            // What was typed whole is what is meant, whatever was used last.
+            (0, _) => (0, 0),
+            (_, Some(used)) => (1, used),
+            (fit, None) => (2, fit),
+        })
     };
-    let mut found: Vec<(u8, &Symbol)> = commands().iter().filter_map(|symbol| Some((rank(symbol)?, symbol))).collect();
+    let mut found: Vec<((u8, usize), &Symbol)> =
+        table.iter().filter_map(|symbol| Some((rank(symbol)?, symbol))).collect();
     // Within a rank the table's order stands, which puts the everyday ones first.
     found.sort_by_key(|(rank, _)| *rank);
     found.into_iter().map(|(_, symbol)| symbol).take(LISTED).collect()
 }
 
-/// What a symbol puts into the source: its command, and a pair of braces for each argument it takes.
-pub(crate) fn written(symbol: &Symbol) -> String {
-    format!("{}{}", symbol.command, "{}".repeat(symbol.arguments.into()))
+/// What a symbol puts into the source, and how far into it the caret then waits: its command and a pair
+/// of braces for each argument it takes, with the caret in the first pair.
+pub(crate) fn written(symbol: &Symbol) -> (String, usize) {
+    let written = format!("{}{}", symbol.command, "{}".repeat(symbol.arguments.into()));
+    let caret = if symbol.arguments > 0 { symbol.command.len() + 1 } else { written.len() };
+    (written, caret)
+}
+
+/// What an environment puts into the source in place of its `\begin{`, and how far into it the caret then
+/// waits: its `\begin`, with braces for the arguments that follow it, and the `\end` that matches unless
+/// one is there already. The caret waits in the first argument, or between the two where there is none.
+pub(crate) fn begun(environment: &Symbol, ended: bool) -> (String, usize) {
+    let name = environment.command;
+    let begin = format!(r"\begin{{{name}}}");
+    let arguments = "{}".repeat(environment.arguments.into());
+    let end = if ended { String::new() } else { format!(r"  \end{{{name}}}") };
+    // Past the brace that opens the first argument, or the first of the two spaces before the end.
+    let caret = if environment.arguments == 0 && ended { begin.len() } else { begin.len() + 1 };
+    (format!("{begin}{arguments}{end}"), caret)
+}
+
+/// What the list under a source offers at the caret.
+pub(crate) struct Offered {
+    /// The stretch of the block that one of them would replace.
+    pub range: Range<usize>,
+    pub symbols: Vec<&'static Symbol>,
+    /// Whether they are environments, named after `\begin{`.
+    pub environments: bool,
+    /// Whether an `\end` waits for the environment already.
+    pub ended: bool,
 }
 
 /// A formula that was just closed, while the source it was typed as still blends into its glyphs.
@@ -408,6 +496,8 @@ pub(crate) struct Maths {
     typing: bool,
     /// The symbol picked in the list, counted from the first.
     picked: usize,
+    /// The symbols and environments taken from the list in this window, the last first.
+    recent: Vec<&'static str>,
     blend: Option<Blend>,
 }
 
@@ -437,12 +527,34 @@ impl Maths {
         self.picked.min(listed.saturating_sub(1))
     }
 
-    /// The symbols on offer at the caret, and the stretch of the block one of them would replace: none
-    /// unless a command is being typed there, and the sheet is out.
-    pub fn symbols(&self, source: &Source, selection: &Selection) -> Option<(Range<usize>, Vec<&'static Symbol>)> {
-        let typing = self.typing && self.slid >= 1.0 && selection.is_caret();
-        let (range, typed) = source.typed(selection.head.offset).filter(|_| typing)?;
-        Some((range, matching(typed))).filter(|(_, found)| !found.is_empty())
+    /// Notes that a symbol or an environment was taken from the list, which lists it first from then on,
+    /// and puts the list away.
+    pub fn took(&mut self, symbol: &'static Symbol) {
+        self.recent.retain(|used| *used != symbol.command);
+        self.recent.insert(0, symbol.command);
+        self.recent.truncate(RECENT);
+        self.typed(false);
+    }
+
+    /// What is on offer at the caret: none unless a command or the name of an environment is being typed
+    /// there, and the sheet is out.
+    pub fn symbols(&self, source: &Source, selection: &Selection) -> Option<Offered> {
+        if !self.typing || self.slid < 1.0 || !selection.is_caret() {
+            return None;
+        }
+        let at = selection.head.offset;
+        let offered = match source.typed(at) {
+            Some((range, typed)) => {
+                let symbols = matching(commands(), typed, &self.recent);
+                Offered { range, symbols, environments: false, ended: false }
+            }
+            None => {
+                let (range, typed) = source.beginning(at)?;
+                let (symbols, ended) = (matching(environments(), typed, &self.recent), source.awaited(&range));
+                Offered { range, symbols, environments: true, ended }
+            }
+        };
+        (!offered.symbols.is_empty()).then_some(offered)
     }
 
     /// Slides the sheet further out, and blends a closed formula further in. Returns when the next frame is
@@ -556,13 +668,13 @@ impl Maths {
         wide: f32,
         scheme: Scheme,
     ) -> Popover<Message> {
-        let symbols = self.symbols(&source, selection);
+        let offered = self.symbols(&source, selection);
         // What is still being written is not called wrong: a fault the caret is at, and a bracket left open
         // while the caret is at the end of the source.
         let at = selection.head.offset.saturating_sub(source.range.start);
         let fault = source.fault().filter(|fault| !fault.written_at(at));
         let writing = source.text.get(at..).is_none_or(|rest| rest.trim().is_empty());
-        let least = match (&symbols, &fault) {
+        let least = match (&offered, &fault) {
             (Some(_), _) => LIST_WIDTH,
             (None, Some(_)) => FAULT_WIDTH,
             (None, None) => 0.0,
@@ -577,7 +689,7 @@ impl Maths {
         let source = Rc::new(source);
         let (mut inks, mut lined) = source.marks(fault.as_ref().and_then(|fault| fault.range.as_ref()), writing);
         // The command being typed is in the accent and underlined, whatever it would be otherwise.
-        let typed = symbols.iter().flat_map(|(range, _)| source.spans(range)).map(|span| (span, accent().text));
+        let typed = offered.iter().flat_map(|offered| source.spans(&offered.range)).map(|span| (span, accent().text));
         inks.extend(typed.clone());
         lined.extend(typed);
         let composing = source.composing.iter().flat_map(|range| source.spans(range)).collect();
@@ -617,9 +729,11 @@ impl Maths {
             let said = Element::paragraph(fault.message, quiet).fg(tokens::DANGER).max_width(width);
             sheet = sheet.child(said.role(Role::Status));
         }
-        if let Some((_, symbols)) = &symbols {
-            let hint = options::hint("Matches commands and plain names", &["Tab", "Esc"]);
-            sheet = sheet.child(self.list(symbols, scheme)).child(hint);
+        if let Some(offered) = &offered {
+            let matches =
+                if offered.environments { "Matches names and plain words" } else { "Matches commands and plain names" };
+            let hint = options::hint(matches, &["Tab", "Esc"]);
+            sheet = sheet.child(self.list(offered, scheme)).child(hint);
         }
         Popover::new(sheet)
             .flush()
@@ -633,8 +747,9 @@ impl Maths {
             .on_close(Message::Maths(Sheet::Leave))
     }
 
-    /// The symbols on offer, each typeset beside its command and its plain name.
-    fn list(&self, symbols: &[&'static Symbol], scheme: Scheme) -> Element<Message> {
+    /// The symbols or environments on offer, each typeset beside its command and its plain name.
+    fn list(&self, offered: &Offered, scheme: Scheme) -> Element<Message> {
+        let symbols = &offered.symbols;
         let style = letters_math::Style {
             size: tokens::TEXT_MD * TEXT_RATIO,
             color: resolve(tokens::FG, scheme, 1.0),
@@ -655,7 +770,8 @@ impl Maths {
         let across = pictures.iter().flatten().map(|picture| picture.size.width).fold(PICTURE.width, f32::max);
         let command = TextStyle::control().family(Family::Mono).size(tokens::TEXT_SM);
         let name = TextStyle::control().size(tokens::TEXT_XS);
-        let mut options = Options::new("Symbols").picked(self.picked(symbols.len()));
+        let called = if offered.environments { "Environments" } else { "Symbols" };
+        let mut options = Options::new(called).picked(self.picked(symbols.len()));
         for (index, (symbol, picture)) in symbols.iter().zip(pictures).enumerate() {
             let picture = Element::canvas(Rc::new(Picture(picture))).width(across).height(PICTURE.height);
             let choice = Choice::new(symbol.command)
@@ -895,7 +1011,7 @@ mod tests {
 
     #[test]
     fn symbols_match_by_command_and_by_plain_name() {
-        let first = |typed: &str| matching(typed).first().map(|symbol| symbol.command);
+        let first = |typed: &str| matching(commands(), typed, &[]).first().map(|symbol| symbol.command);
         // What is typed after the backslash, and the symbol offered first.
         let cases = [
             ("ap", Some(r"\approx")),
@@ -909,16 +1025,106 @@ mod tests {
         for (typed, expected) in cases {
             assert_eq!(first(typed), expected, "{typed:?}");
         }
-        let divide: Vec<&str> = matching("divide").iter().map(|symbol| symbol.command).collect();
+        let divide: Vec<&str> = matching(commands(), "divide", &[]).iter().map(|symbol| symbol.command).collect();
         assert!(divide.contains(&r"\frac"), "another word for a symbol finds it: {divide:?}");
-        assert!(matching("a").len() <= LISTED, "the list stays short");
+        assert!(matching(commands(), "a", &[]).len() <= LISTED, "the list stays short");
+    }
+
+    #[test]
+    fn what_was_taken_last_is_listed_first_but_for_the_command_typed_whole() {
+        let listed = |typed: &str, recent: &[&str]| -> Vec<&str> {
+            matching(commands(), typed, recent).iter().map(|symbol| symbol.command).collect()
+        };
+        // What is typed, what was taken (the last first), and how the list then starts.
+        let cases: [(&str, &[&str], &[&str]); 5] = [
+            ("in", &[], &[r"\in"]),
+            ("in", &[r"\infty"], &[r"\in", r"\infty"]),
+            ("inf", &[r"\infty", r"\inf"], &[r"\inf", r"\infty"]),
+            ("", &[r"\infty", r"\approx"], &[r"\infty", r"\approx"]),
+            // What does not match is not listed for having been taken.
+            ("ap", &[r"\infty"], &[r"\approx"]),
+        ];
+        for (typed, recent, starts) in cases {
+            let listed = listed(typed, recent);
+            assert!(listed.starts_with(starts), "{typed:?} after {recent:?}: {listed:?}");
+        }
     }
 
     #[test]
     fn a_symbol_is_written_with_braces_for_its_arguments() {
-        let written = |command: &str| matching(&command[1..]).first().map(|symbol| written(symbol));
-        for (command, expected) in [(r"\approx", r"\approx"), (r"\sqrt", r"\sqrt{}"), (r"\frac", r"\frac{}{}")] {
-            assert_eq!(written(command).as_deref(), Some(expected));
+        let written = |command: &str| matching(commands(), &command[1..], &[]).first().map(|symbol| written(symbol));
+        // A command, what it writes, and how far into that the caret waits.
+        let cases = [(r"\approx", r"\approx", 7), (r"\sqrt", r"\sqrt{}", 6), (r"\frac", r"\frac{}{}", 6)];
+        for (command, expected, caret) in cases {
+            assert_eq!(written(command), Some((expected.to_owned(), caret)));
+        }
+    }
+
+    #[test]
+    fn an_environment_is_named_after_begin_and_written_with_its_end() {
+        // The source, where the caret is in it, and the environment found there with what was typed of it.
+        let cases = [
+            (r"a \begin{pm", 11, Some((2..11, "pm"))),
+            (r"a \begin{", 9, Some((2..9, ""))),
+            // The name is replaced whole, with the brace that closes it.
+            (r"\begin{pmat} x", 9, Some((0..12, "pm"))),
+            (r"\begin{align*", 13, Some((0..13, "align*"))),
+            (r"a \\begin{pm", 12, None),
+            (r"\end{pm", 7, None),
+            (r"\frac{pm", 8, None),
+        ];
+        for (text, caret, expected) in cases {
+            let source = rows(text, f32::INFINITY);
+            let expected =
+                expected.map(|(range, typed): (Range<usize>, &str)| (range.start + 10..range.end + 10, typed));
+            assert_eq!(source.beginning(10 + caret), expected, "{text:?} at {caret}");
+        }
+
+        let named = |name: &str| environments().iter().find(|environment| environment.command == name).unwrap();
+        // An environment, whether its end is there already, what is written and where the caret waits.
+        let cases = [
+            ("pmatrix", false, r"\begin{pmatrix}  \end{pmatrix}", 16),
+            ("pmatrix", true, r"\begin{pmatrix}", 15),
+            ("array", false, r"\begin{array}{}  \end{array}", 14),
+        ];
+        for (name, ended, expected, caret) in cases {
+            assert_eq!(begun(named(name), ended), (expected.to_owned(), caret), "{name}, {ended}");
+        }
+
+        // An end waits for a begin when the rest of the source ends more than it begins.
+        let cases = [
+            (r"\begin{pm} a \end{matrix}", 0..10, true),
+            (r"\begin{pm} a", 0..10, false),
+            (r"\begin{pm} \begin{cases} a \end{cases}", 0..10, false),
+            (r"\begin{cases} \begin{pm} a \end{cases}", 14..24, false),
+            (r"\begin{cases} \begin{pm} a \end{matrix} \end{cases}", 14..24, true),
+        ];
+        for (text, begin, waits) in cases {
+            assert_eq!(rows(text, f32::INFINITY).awaited(&(begin.start + 10..begin.end + 10)), waits, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn tab_leaves_the_braces_the_caret_is_in_for_the_next_argument_or_past_them() {
+        // A source with a bar where the caret is, and with one where Tab takes it.
+        let cases = [
+            (r"\frac{|}{}", Some(r"\frac{}{|}")),
+            (r"\frac{a|}{b}", Some(r"\frac{a}{|b}")),
+            (r"\frac{a}{b|}+c", Some(r"\frac{a}{b}|+c")),
+            (r"\sqrt{\frac{a|}{b}}", Some(r"\sqrt{\frac{a}{|b}}")),
+            (r"\sqrt{\frac{a}{b|}}", Some(r"\sqrt{\frac{a}{b}|}")),
+            // Braces a space apart are not the arguments of one command.
+            (r"x^{2|} {y}", Some(r"x^{2}| {y}")),
+            (r"a + |b", None),
+            (r"|{a}", None),
+            (r"\{a|\}", None),
+            (r"{a|", None),
+        ];
+        for (from, to) in cases {
+            let caret = from.find('|').unwrap();
+            let source = rows(&from.replace('|', ""), f32::INFINITY);
+            let expected = to.map(|to| 10 + to.find('|').unwrap());
+            assert_eq!(source.onward(10 + caret), expected, "{from}");
         }
     }
 

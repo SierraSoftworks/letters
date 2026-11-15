@@ -652,10 +652,40 @@ fn a_table_of_contents_leads_to_the_headings_it_lists() {
     assert!(after.contains("<h3>Too deep to list") && article.starts_with("<h1>Rates"), "{article}");
     assert!(nests(&article), "{article}");
 
-    // With no heading to list it is left out, and a copy has no page to lead into.
+    // With no heading to list it is left out, and a copy has no page to lead into. The window says so
+    // to whoever edits it, and so does the page that stands in for the window.
     let alone = vec![heading("title", 1, "Rates"), Block::new("toc", BlockKind::TableOfContents { levels: 2 })];
-    assert!(!export(&Document { blocks: alone.clone(), ..Document::default() }).contains("<nav"));
+    let alone_doc = Document { blocks: alone.clone(), ..Document::default() };
+    assert!(!export(&alone_doc).contains("<nav"));
     assert!(!to_html_fragment(&alone).contains("nav"));
+    let window = HtmlPage { window: Some(Column { gutter: 24.0, top: 48.0 }), ..HtmlPage::default() };
+    let shown = to_html_with(&alone_doc, &Style::default(), "Report", &mut |_| None, &window);
+    assert!(shown.contains("No headings yet"), "{shown}");
+}
+
+#[test]
+fn a_line_of_a_table_of_contents_reads_as_its_heading_does() {
+    let mut marked = Block::new("m", BlockKind::Heading { level: 2 });
+    marked.body = Body::Text(vec![
+        Run::plain("The "),
+        Run::marked("rate", [Mark::Code]),
+        Run { link: Some("https://example.com/".into()), ..Run::plain(" table") },
+    ]);
+    let blocks = vec![
+        Block::new("toc", BlockKind::TableOfContents { levels: 3 }),
+        marked,
+        Block::text("r", BlockKind::Heading { level: 3 }, "שלום"),
+    ];
+    let written = article(&export(&Document { blocks, ..Document::default() }));
+    let (_, rest) = written.split_once("<nav").expect("the table is written");
+    let (table, _) = rest.split_once("</nav>").expect("the table ends");
+    let lines: Vec<&str> = table.split("<p").skip(1).collect();
+    // Its marks stay, and the whole line leads to the heading, whatever the heading's own text leads to.
+    assert!(lines[0].contains("<code>rate</code>") && !lines[0].contains("example.com"), "{table}");
+    assert_eq!(lines[0].matches("<a ").count(), 1, "{table}");
+    // A deeper heading is set in, from the side it reads from.
+    assert!(lines[1].contains("level-2") && lines[1].contains("dir=\"rtl\""), "{table}");
+    assert!(!lines[0].contains("dir="), "{table}");
 }
 
 #[test]
@@ -690,12 +720,13 @@ fn a_link_preview_is_a_card_that_leads_to_its_page() {
     assert!(nests(&whole), "{whole}");
 
     // One that was never fetched shows where it leads, and a picture the file lacks leaves no hole.
-    let bare = page(&card("https://example.com/rates", None, None, Some("assets/gone.png")));
+    let bare = page(&card("https://example.com/rates", None, None, None));
     assert!(
         bare.contains("href=\"https://example.com/rates\"") && bare.contains(">https://example.com/rates<"),
         "{bare}"
     );
-    assert!(!bare.contains("<img"), "{bare}");
+    let lacking = page(&card("https://example.com/rates", Some("Rates"), None, Some("assets/gone.png")));
+    assert!(!lacking.contains("<img") && lacking.contains("Rates"), "{lacking}");
 
     // An address that would run script leads nowhere.
     let trap = page(&card("javascript:alert(1)", Some("Rates"), None, None));
@@ -749,4 +780,22 @@ fn a_list_item_and_a_quote_that_read_from_the_right_stand_at_the_right() {
 
     // A copy says the side too, for whatever it is pasted into.
     assert!(to_html_fragment(&document("- שלום\n").blocks).contains("<li dir=\"rtl\">"));
+}
+
+#[test]
+fn a_link_says_the_title_of_the_page_it_leads_to() {
+    let link = |text: &str, url: &str| Run { link: Some(url.into()), ..Run::plain(text) };
+    let mut text = Block::new("p", BlockKind::Paragraph);
+    text.body = Body::Text(vec![link("rates", "https://example.com/rates"), link("fees", "https://example.com/fees")]);
+    let fetched = letters_model::Preview { title: Some("Rates \"2027\"".into()), ..Default::default() };
+    let previews = [("https://example.com/rates".to_owned(), fetched)];
+    let doc = Document { blocks: vec![text], previews: previews.into(), ..Document::default() };
+
+    let article = article(&export(&doc));
+    assert!(
+        article.contains("<a href=\"https://example.com/rates\" title=\"Rates &quot;2027&quot;\">rates</a>"),
+        "{article}"
+    );
+    assert!(article.contains("<a href=\"https://example.com/fees\">fees</a>"), "nothing was fetched of it: {article}");
+    assert!(!to_html_fragment(&doc.blocks).contains("title="), "a copy has the link alone");
 }

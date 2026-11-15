@@ -1,0 +1,411 @@
+//! Link previews on the page: how one is put in, fetched, changed and followed, and what a link in text
+//! shows of its page.
+
+use accesskit::{Action, ActionRequest, TreeId};
+use letters_editor::Picture;
+use letters_model::{Block, BlockKind, Body, Document, Pos, Preview, Run, Selection};
+use letters_render::Point;
+use letters_test::{Found, Harness, Role};
+use letters_ui::{LinkPreviewFound, Request, SaveState};
+
+const QUOTE: &str = "https://roofers.example.org/quotes/spring";
+const GUIDE: &str = "https://slate.example.org/guides/welsh";
+const EDIT: &str = "Edit link preview";
+const FETCH: &str = "Fetch preview";
+const CARD: &str = "Link preview";
+
+fn preview(url: &str, title: Option<&str>, image: Option<&str>) -> BlockKind {
+    let (title, image) = (title.map(str::to_owned), image.map(str::to_owned));
+    BlockKind::LinkPreview { url: url.to_owned(), title, description: None, image }
+}
+
+/// A note with a link preview, `card`, between two lines, and the caret in the first line.
+fn note(kind: BlockKind) -> Harness {
+    notes(vec![Block::new("card", kind)])
+}
+
+/// A note with these blocks between two lines, and the caret in the first line.
+fn notes(cards: Vec<Block>) -> Harness {
+    let mut blocks = vec![Block::text("before", BlockKind::Paragraph, "The roofer sent a quote.")];
+    blocks.extend(cards);
+    blocks.push(Block::text("after", BlockKind::Paragraph, "Reply by Friday."));
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.paint();
+    window
+}
+
+/// A note whose preview shows its address alone.
+fn bare() -> Harness {
+    note(preview(QUOTE, None, None))
+}
+
+/// A preview as the document has it: its address, its title, its description and its picture.
+type Shown = (String, Option<String>, Option<String>, Option<String>);
+
+/// The previews of the note as the document has them, from the top.
+fn all_shown(window: &Harness) -> Vec<Shown> {
+    let preview = |block: &Block| match &block.kind {
+        BlockKind::LinkPreview { url, title, description, image } => {
+            Some((url.clone(), title.clone(), description.clone(), image.clone()))
+        }
+        _ => None,
+    };
+    window.editor().doc().walk().filter_map(preview).collect()
+}
+
+/// The first preview of the note.
+fn shown(window: &Harness) -> Shown {
+    all_shown(window).into_iter().next().expect("the note has a preview")
+}
+
+/// The addresses the shell is asked to fetch, since this was last called.
+fn fetches(window: &mut Harness) -> Vec<String> {
+    let fetch = |request| match request {
+        Request::FetchPreview { url } => Some(url),
+        _ => None,
+    };
+    window.ui().take_requests().into_iter().filter_map(fetch).collect()
+}
+
+/// What a shell found of the page at an address.
+fn found(url: &str, title: Option<&str>, description: Option<&str>) -> LinkPreviewFound {
+    let (title, description) = (title.map(str::to_owned), description.map(str::to_owned));
+    LinkPreviewFound { url: url.to_owned(), title, description, picture: None }
+}
+
+/// What the card of the preview says of the last fetch.
+fn status(window: &mut Harness) -> Option<String> {
+    let said = window.controls().into_iter().find(|found| found.role == Role::Status)?;
+    said.value.or(Some(said.name))
+}
+
+/// The field of the card with a name, as it reads.
+fn field(window: &mut Harness, name: &str) -> Option<String> {
+    window.find(Role::TextInput, name).map(|field| field.value.unwrap_or_default())
+}
+
+/// A line that links to the guide, in a document that keeps this of the guide's page.
+fn linked(kept: Option<Preview>) -> Harness {
+    let link = Run { link: Some(GUIDE.to_owned()), ..Run::plain("the quarries of Gwynedd") };
+    let runs = vec![Run::plain("Slate from "), link, Run::plain(" lasts a century.")];
+    let line = Block { body: Body::Text(runs), ..Block::new("line", BlockKind::Paragraph) };
+    let previews = kept.into_iter().map(|kept| (GUIDE.to_owned(), kept)).collect();
+    let mut window = Harness::open(Document { blocks: vec![line], previews, ..Document::default() });
+    window.paint();
+    window
+}
+
+/// What the guide's page says of itself.
+fn guide() -> Preview {
+    let (title, description) =
+        (Some("Choosing Welsh slate".to_owned()), Some("How to tell the quarries apart.".to_owned()));
+    Preview { title, description, image: Some("assets/quarry.png".to_owned()), ..Preview::default() }
+}
+
+/// A point on the link of [`linked`].
+fn link(window: &mut Harness) -> Point {
+    window.ui().select(Selection::caret(Pos::new("line", "Slate from ".len())));
+    window.paint();
+    let start = window.ui().caret_rect().expect("the page shows a caret");
+    Point { x: start.x + 12.0, y: start.y + start.height / 2.0 }
+}
+
+/// The card that shows over the page once the pointer has rested where it is.
+fn rested(window: &mut Harness) -> Option<Found> {
+    window.advance(0).advance(1_000);
+    window.controls().into_iter().find(|found| found.role == Role::Tooltip)
+}
+
+#[test]
+fn a_preview_put_in_shows_its_address_and_asks_the_shell_for_its_page() {
+    // How it is asked for on an empty line.
+    type Ask = fn(&mut Harness);
+    let ways: [(&str, Ask); 2] = [
+        ("the insert menu", |window| _ = window.type_text("/link").key("Enter")),
+        ("the commands", |window| _ = window.key("Mod+Shift+P").type_text("Link preview").key("Enter")),
+    ];
+    for (way, ask) in ways {
+        let blocks = vec![Block::text("p", BlockKind::Paragraph, "")];
+        let mut window = Harness::open(Document { blocks, ..Document::default() });
+        window.ui().set_save_state(SaveState::Unsaved);
+        ask(&mut window);
+        window.assert_open(Role::Dialog, CARD);
+        assert_eq!(window.editor().doc().blocks.len(), 1, "{way}: nothing is put in before there is an address");
+
+        window.type_text(&format!(" {QUOTE} ")).key("Enter").assert_closed(Role::Dialog, CARD);
+        assert_eq!(shown(&window), (QUOTE.to_owned(), None, None, None), "{way}");
+        assert_eq!(fetches(&mut window), [QUOTE], "{way}: its page is asked for once");
+        window.assert_open(Role::Button, "Fetching");
+        window.type_text("Roof");
+        assert_eq!(window.markdown().matches("Roof").count(), 1, "{way}: writing goes on in the line below");
+    }
+
+    // Enter with no address, or Escape, puts nothing in.
+    for leave in ["Enter", "Escape"] {
+        let blocks = vec![Block::text("p", BlockKind::Paragraph, "")];
+        let mut window = Harness::open(Document { blocks, ..Document::default() });
+        window.ui().set_save_state(SaveState::Unsaved);
+        window.type_text("/link").key("Enter").key(leave).assert_closed(Role::Dialog, CARD);
+        assert_eq!(window.editor().doc().blocks.len(), 1, "{leave}");
+        assert_eq!(fetches(&mut window), [""; 0], "{leave}");
+    }
+}
+
+#[test]
+fn what_the_shell_finds_fills_the_preview_in_one_step() {
+    let mut window = bare();
+    window.click(Role::Button, FETCH);
+    assert_eq!(fetches(&mut window), [QUOTE]);
+    // A second press while the page is fetched asks for nothing more.
+    window.click(Role::Button, "Fetching");
+    assert_eq!(fetches(&mut window), [""; 0], "one fetch at a time");
+    assert_eq!(window.editor().selection().map(|caret| caret.head.block.as_str()), Some("before"), "the caret stays");
+
+    let picture = Picture {
+        bytes: vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        mime: "image/png".into(),
+        width: 400,
+        height: 200,
+    };
+    let page = LinkPreviewFound {
+        picture: Some(picture),
+        ..found(QUOTE, Some("Spring quotes"), Some("  Slate and\n lead.  "))
+    };
+    window.fill_preview(page);
+    let (url, title, description, image) = shown(&window);
+    assert_eq!(
+        (url.as_str(), title.as_deref(), description.as_deref()),
+        (QUOTE, Some("Spring quotes"), Some("Slate and lead."))
+    );
+    assert!(image.is_some(), "the page's picture is kept in the document");
+    window.assert_closed(Role::Button, FETCH).assert_closed(Role::Button, "Fetching");
+
+    window.key("Mod+Z");
+    assert_eq!(shown(&window), (QUOTE.to_owned(), None, None, None), "undo takes all of it back at once");
+}
+
+#[test]
+fn what_is_found_leaves_the_page_where_it_is_read() {
+    // A note far taller than its window, with the caret at its top and its preview at its end.
+    let long = |id: &str| Block::text(id, BlockKind::Paragraph, "Estimates so far. ".repeat(80));
+    let mut window = notes(vec![long("p1"), long("p2"), long("p3"), Block::new("card", preview(QUOTE, None, None))]);
+    window.resize(900.0, 600.0);
+    window.scroll_at(Point { x: 450.0, y: 300.0 }, 1e6).paint();
+    window.click(Role::Button, FETCH).fill_preview(found(QUOTE, Some("Spring quotes"), None));
+    window.paint();
+    assert_eq!(shown(&window).1.as_deref(), Some("Spring quotes"));
+    window.assert_open(Role::Button, EDIT);
+}
+
+#[test]
+fn a_fetch_that_finds_nothing_says_why_and_offers_another_try() {
+    // What the shell answers, and what is then said of the preview.
+    type Answer = fn(&mut Harness);
+    let cases: [(&str, Answer, &str); 2] = [
+        (
+            "the fetch failed",
+            |window| window.ui().fail_preview(QUOTE, "the server answered 404"),
+            "Not fetched: the server answered 404",
+        ),
+        (
+            "the page says nothing of itself",
+            |window| _ = window.fill_preview(found(QUOTE, None, Some("  "))),
+            "Not fetched: the page has no title, description or picture",
+        ),
+    ];
+    for (case, answer, said) in cases {
+        let mut window = bare();
+        window.click(Role::Button, FETCH);
+        fetches(&mut window);
+        answer(&mut window);
+        assert_eq!(shown(&window), (QUOTE.to_owned(), None, None, None), "{case}: the preview is as it was");
+        let again = window.find(Role::Button, "Try again").unwrap_or_else(|| panic!("{case}: another try is offered"));
+        assert_eq!(again.description.as_deref(), Some(said), "{case}");
+        // The card of the preview says it too.
+        window.click(Role::Button, EDIT);
+        assert_eq!(status(&mut window).as_deref(), Some(said), "{case}");
+        window.key("Escape");
+
+        window.click(Role::Button, "Try again");
+        assert_eq!(fetches(&mut window), [QUOTE], "{case}");
+        window.assert_open(Role::Button, "Fetching");
+    }
+}
+
+#[test]
+fn what_is_found_goes_to_every_preview_that_waits_for_the_address_and_to_no_other() {
+    let bare = |id: &str, url: &str| Block::new(id, preview(url, None, None));
+    let mut window = notes(vec![bare("card", QUOTE), bare("twin", QUOTE), bare("other", GUIDE)]);
+    let controls = window.controls().into_iter().filter(|found| found.name == FETCH);
+    for at in controls.map(|control| control.center()).collect::<Vec<_>>() {
+        window.click_at(at);
+    }
+    assert_eq!(fetches(&mut window), [QUOTE, GUIDE], "an address is asked for once, however many wait for it");
+
+    // The third preview is given another address while its page is fetched: it waits for that page no
+    // more, and offers a fetch of where it leads now.
+    let third = window.controls().into_iter().filter(|found| found.name == EDIT).nth(2).expect("three previews");
+    let elsewhere = "https://slate.example.org/guides/cornish";
+    window.click_at(third.center()).click(Role::TextInput, "Address").key("Mod+A").type_text(elsewhere);
+    window.key("Enter").key("Escape").click(Role::Button, FETCH);
+    assert_eq!(fetches(&mut window), [elsewhere]);
+
+    window.fill_preview(found(QUOTE, Some("Spring quotes"), None));
+    window.fill_preview(found(GUIDE, Some("Welsh slate"), None));
+    let titles: Vec<_> = all_shown(&window).into_iter().map(|(url, title, ..)| (url, title)).collect();
+    let quote = (QUOTE.to_owned(), Some("Spring quotes".to_owned()));
+    assert_eq!(titles, [quote.clone(), quote, (elsewhere.to_owned(), None)]);
+}
+
+#[test]
+fn a_shell_that_cannot_fetch_is_asked_for_nothing_and_offers_no_fetch() {
+    let blocks = vec![Block::text("p", BlockKind::Paragraph, "")];
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.ui().set_save_state(SaveState::Unsaved);
+    window.ui().set_preview_fetching(false);
+    window.type_text("/link").key("Enter").type_text(QUOTE).key("Enter");
+    assert_eq!(shown(&window), (QUOTE.to_owned(), None, None, None), "a preview is put in all the same");
+    assert_eq!(fetches(&mut window), [""; 0]);
+
+    // Nothing on the preview or in its card offers a fetch, and the rest of the card is there.
+    let offers = |window: &mut Harness| {
+        let fetch =
+            |found: &Found| found.role == Role::Button && (found.name.contains("etch") || found.name == "Try again");
+        window.controls().into_iter().filter(fetch).map(|found| found.name).collect::<Vec<_>>()
+    };
+    assert_eq!(offers(&mut window), [""; 0]);
+    window.click(Role::Button, EDIT).assert_open(Role::Dialog, CARD);
+    assert_eq!(offers(&mut window), [""; 0]);
+    window.click(Role::TextInput, "Title").type_text("Spring quotes");
+    assert_eq!(shown(&window).1.as_deref(), Some("Spring quotes"));
+}
+
+#[test]
+fn a_press_on_a_preview_opens_a_card_that_changes_it() {
+    let mut window = note(preview(GUIDE, Some("Welsh slate"), Some("assets/slate.png")));
+    window.click(Role::Button, EDIT).assert_open(Role::Dialog, CARD);
+    assert_eq!(field(&mut window, "Address").as_deref(), Some(GUIDE));
+    assert_eq!(field(&mut window, "Title").as_deref(), Some("Welsh slate"));
+    assert_eq!(fetches(&mut window), [""; 0], "opening the card fetches nothing");
+
+    // What is typed for the title and the description shows on the page at once.
+    window.click(Role::TextInput, "Title").key("Mod+A").type_text("Choosing slate");
+    window.click(Role::TextInput, "Description").type_text("How to tell the quarries apart.");
+    let (_, title, description, image) = shown(&window);
+    assert_eq!(title.as_deref(), Some("Choosing slate"));
+    assert_eq!(description.as_deref(), Some("How to tell the quarries apart."));
+    assert_eq!(image.as_deref(), Some("assets/slate.png"));
+
+    // The address is taken when it is done, with Enter or by going on to another field, and one with
+    // nothing in it is not.
+    window.click(Role::TextInput, "Address").key("Mod+A").type_text(QUOTE);
+    assert_eq!(shown(&window).0, GUIDE, "not while it is typed");
+    window.key("Enter");
+    assert_eq!(shown(&window).0, QUOTE);
+    window.click(Role::TextInput, "Address").key("Mod+A").type_text(GUIDE).click(Role::TextInput, "Title");
+    assert_eq!(shown(&window).0, GUIDE, "going on to another field takes it too");
+    window.click(Role::TextInput, "Address").key("Mod+A").key("Backspace").key("Enter");
+    assert_eq!(shown(&window).0, GUIDE, "a preview always leads somewhere");
+
+    window.click(Role::Button, "Remove picture");
+    assert_eq!(shown(&window).3, None);
+    window.assert_closed(Role::Button, "Remove picture").assert_open(Role::Dialog, CARD);
+
+    // Another fetch is asked for by name, and is the shell's to do.
+    window.click(Role::Button, "Fetch again");
+    assert_eq!(fetches(&mut window), [GUIDE]);
+    window.key("Escape").assert_closed(Role::Dialog, CARD);
+}
+
+#[test]
+fn a_preview_is_followed_as_a_link_with_ctrl_or_cmd_held() {
+    let mut window = bare();
+    let card = window.find(Role::Button, EDIT).expect("the preview").center();
+    window.mod_click_at(card);
+    let asked = window.ui().take_requests();
+    assert_eq!(asked, [Request::OpenLink { href: QUOTE.to_owned(), confirmed: false }]);
+    window.assert_closed(Role::Dialog, CARD);
+}
+
+#[test]
+fn the_card_goes_with_its_preview() {
+    let mut window = bare();
+    window.click(Role::Button, FETCH).click(Role::Button, EDIT).assert_open(Role::Dialog, CARD);
+    window.key("Escape").key("Mod+A").key("Backspace");
+    assert!(window.editor().doc().block(&"card".into()).is_none(), "the preview is gone with the rest");
+    // What was found for a preview that is gone goes nowhere.
+    window.fill_preview(found(QUOTE, Some("Spring quotes"), None));
+    window.assert_closed(Role::Button, EDIT).assert_closed(Role::Dialog, CARD);
+    assert!(!window.markdown().contains("Spring quotes"));
+}
+
+#[test]
+fn assistive_technology_presses_a_preview_and_its_control() {
+    // What is pressed, by name, and whether the page is then asked for.
+    for (name, fetched) in [(EDIT, false), (FETCH, true)] {
+        let mut window = bare();
+        let tree = window.ui().access();
+        let named = |node: &accesskit::Node| node.role() == Role::Button && node.label() == Some(name);
+        let (target_node, node) = tree.nodes.iter().find(|(_, node)| named(node)).expect("it is told");
+        assert!(node.supports_action(Action::Click), "{name} says that it can be pressed");
+        let target_node = *target_node;
+        window.ask(ActionRequest { action: Action::Click, target_tree: TreeId::ROOT, target_node, data: None });
+        assert_eq!(fetches(&mut window).len(), usize::from(fetched), "{name}");
+        assert_eq!(window.find(Role::Dialog, CARD).is_some(), !fetched, "{name}: the card is out");
+    }
+}
+
+#[test]
+fn a_link_in_text_shows_what_is_kept_of_its_page_while_the_pointer_rests_on_it() {
+    let mut window = linked(Some(guide()));
+    let at = link(&mut window);
+    window.ui().take_requests();
+    window.hover_at(at).advance(0);
+    assert!(
+        window.find(Role::Tooltip, "").is_none() && window.controls().iter().all(|found| found.role != Role::Tooltip)
+    );
+
+    let card = rested(&mut window).expect("a card, once the pointer has rested");
+    for said in ["Choosing Welsh slate", "How to tell the quarries apart.", "slate.example.org"] {
+        assert!(card.name.contains(said), "{said}: {:?}", card.name);
+    }
+    let beside = (card.bounds.y - at.y).abs().min((card.bounds.y + card.bounds.height - at.y).abs());
+    assert!(beside < 24.0 && !card.bounds.contains(at), "beside the link, not over it: {:?}", card.bounds);
+    // Showing it reads no page: its picture is the document's own, asked for as any picture of the page.
+    let asked = window.ui().take_requests();
+    assert!(asked.contains(&Request::Asset("assets/quarry.png".to_owned())), "{asked:?}");
+    assert_eq!(asked.len(), 1, "and nothing else is asked for: {asked:?}");
+
+    // The card goes with the pointer, and when the person writes.
+    window.hover_at(Point { x: at.x, y: at.y + 200.0 });
+    assert_eq!(rested(&mut window), None, "off the link");
+    window.hover_at(at);
+    assert!(rested(&mut window).is_some());
+    window.type_text("x");
+    assert_eq!(rested(&mut window), None, "while writing");
+}
+
+#[test]
+fn a_link_shows_no_card_when_nothing_is_kept_of_its_page() {
+    for kept in [None, Some(Preview::default())] {
+        let mut window = linked(kept.clone());
+        let at = link(&mut window);
+        window.hover_at(at);
+        assert_eq!(rested(&mut window), None, "{kept:?}");
+        assert_eq!(fetches(&mut window), [""; 0], "{kept:?}: resting on a link fetches nothing");
+    }
+}
+
+#[test]
+fn the_card_of_a_link_reads_what_is_kept_of_its_page() {
+    let mut window = linked(Some(guide()));
+    let at = link(&mut window);
+    window.key("Mod+K").assert_open(Role::Dialog, "Link");
+    assert_eq!(field(&mut window, "Link").as_deref(), Some(GUIDE));
+    window.assert_open(Role::Label, "Choosing Welsh slate").assert_open(Role::Label, "How to tell the quarries apart.");
+    // The pointer raises no second card while this one hangs from the page.
+    window.hover_at(at);
+    assert_eq!(rested(&mut window), None);
+    // What is kept is of the address in the field: another address has nothing to show yet.
+    window.type_text("x").assert_closed(Role::Label, "Choosing Welsh slate");
+}

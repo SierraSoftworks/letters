@@ -7,16 +7,16 @@
 //! A gallery, a table and a row hold only their own parts, and a file that nests them otherwise is
 //! refused. A row may hold any number of cells, since two people changing one table can leave it so.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde_json::{Map, Value};
 
-use crate::doc::ASSETS;
+use crate::doc::{ASSETS, line};
 use crate::style::{ALIGNS, write_number};
 use crate::{
-    Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Properties, PropertiesFormat,
-    Run, Tone,
+    Block, BlockId, BlockKind, Body, BodyShape, Document, Extra, FORMAT, ListKind, Mark, Preview, Properties,
+    PropertiesFormat, Run, Tone,
 };
 
 mod stream;
@@ -65,6 +65,10 @@ impl Document {
         }
         if let Some(properties) = &self.properties {
             map.insert("properties".into(), properties.to_value());
+        }
+        if !self.previews.is_empty() {
+            let previews = self.previews.iter().map(|(url, preview)| (url.clone(), preview.to_value()));
+            map.insert("previews".into(), Value::Object(previews.collect()));
         }
         map.insert("blocks".into(), self.blocks.iter().map(write_block).collect());
         write_extra(&mut map, &self.extra);
@@ -115,6 +119,23 @@ impl Block {
     }
 }
 
+impl Preview {
+    /// Reads a preview as `document.json` stores it. `path` names it in errors.
+    pub(crate) fn from_value(value: Value, path: &str) -> Result<Self> {
+        let mut map = object(value, path)?;
+        let (title, description, image) = told(&mut map, path)?;
+        Ok(Self { title, description, image, extra: map.into_iter().collect() })
+    }
+
+    /// The preview as `document.json` stores it.
+    pub(crate) fn to_value(&self) -> Value {
+        let mut map = Map::new();
+        write_told(&mut map, &self.title, &self.description, &self.image);
+        write_extra(&mut map, &self.extra);
+        Value::Object(map)
+    }
+}
+
 impl Run {
     /// Reads a list of runs as a block's `content` stores it. `path` names the list in errors.
     pub fn list_from_value(value: Value, path: &str) -> Result<Vec<Self>> {
@@ -145,12 +166,13 @@ fn document(mut map: Map<String, Value>, read: Option<Vec<Block>>) -> Result<Doc
     let dictionary =
         strings(map.remove("dictionary"), "dictionary")?.unwrap_or_default().into_iter().collect::<BTreeSet<_>>();
     let properties = map.remove("properties").map(|value| Properties::from_value(value, "properties")).transpose()?;
+    let previews = previews(map.remove("previews"))?;
     let blocks = match read {
         Some(blocks) => blocks,
         None => blocks(map.remove("blocks").unwrap_or(Value::Array(Vec::new())), "blocks")?,
     };
 
-    let doc = Document { language, dictionary, properties, blocks, extra: map.into_iter().collect() };
+    let doc = Document { language, dictionary, properties, previews, blocks, extra: map.into_iter().collect() };
     let mut seen = BTreeSet::new();
     for block in doc.walk() {
         if !seen.insert(&block.id) {
@@ -158,6 +180,52 @@ fn document(mut map: Map<String, Value>, read: Option<Vec<Block>>) -> Result<Doc
         }
     }
     Ok(doc)
+}
+
+/// Reads what the document keeps of the pages its links lead to. One that tells nothing is not kept.
+fn previews(value: Option<Value>) -> Result<BTreeMap<String, Preview>> {
+    let Some(value) = value else { return Ok(BTreeMap::new()) };
+    let mut previews = BTreeMap::new();
+    for (url, value) in object(value, "previews")? {
+        let path = format!("previews[{url}]");
+        if !line(&url) {
+            return err(&path, "expected an address on one line");
+        }
+        let preview = Preview::from_value(value, &path)?;
+        if !preview.is_empty() {
+            previews.insert(url, preview);
+        }
+    }
+    Ok(previews)
+}
+
+/// Takes what a preview tells of its page out of its fields: its title, description and picture.
+fn told(map: &mut Map<String, Value>, path: &str) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    // A field that is empty says what one left out does.
+    let mut given = |name: &str| Ok(string(map, name, path)?.filter(|text| !text.is_empty()));
+    let (title, description, image) = (given("title")?, given("description")?, given("image")?);
+    for (name, text) in [("title", &title), ("image", &image)] {
+        if text.as_deref().is_some_and(|text| text.contains(['\n', '\r'])) {
+            return err(&format!("{path}.{name}"), "expected one line");
+        }
+    }
+    if image.as_deref().is_some_and(|image| !image.starts_with(ASSETS)) {
+        return err(&format!("{path}.image"), "expected the name of an asset, such as assets/<sha256>.jpg");
+    }
+    Ok((title, description, image))
+}
+
+fn write_told(
+    map: &mut Map<String, Value>,
+    title: &Option<String>,
+    description: &Option<String>,
+    image: &Option<String>,
+) {
+    for (name, value) in [("title", title), ("description", description), ("image", image)] {
+        if let Some(value) = value {
+            map.insert(name.into(), value.as_str().into());
+        }
+    }
 }
 
 pub(crate) fn object(value: Value, path: &str) -> Result<Map<String, Value>> {
@@ -318,20 +386,13 @@ fn block_from(mut map: Map<String, Value>, read: Option<Body>, path: &str) -> Re
             _ => return err(&format!("{path}.levels"), "expected a number of levels from 1 to 4"),
         },
         "link_preview" => {
-            // A field that is empty says what one left out does.
-            let mut given = |name: &str| Ok(string(&mut map, name, path)?.filter(|text| !text.is_empty()));
-            let Some(url) = given("url")? else {
+            let Some(url) = string(&mut map, "url", path)?.filter(|url| !url.is_empty()) else {
                 return err(&format!("{path}.url"), "a link preview needs an address");
             };
-            let (title, description, image) = (given("title")?, given("description")?, given("image")?);
-            for (name, text) in [("url", Some(&url)), ("title", title.as_ref()), ("image", image.as_ref())] {
-                if text.is_some_and(|text| text.contains(['\n', '\r'])) {
-                    return err(&format!("{path}.{name}"), "expected one line");
-                }
+            if !line(&url) {
+                return err(&format!("{path}.url"), "expected one line");
             }
-            if image.as_deref().is_some_and(|image| !image.starts_with(ASSETS)) {
-                return err(&format!("{path}.image"), "expected the name of an asset, such as assets/<sha256>.jpg");
-            }
+            let (title, description, image) = told(&mut map, path)?;
             BlockKind::LinkPreview { url, title, description, image }
         }
         _ => BlockKind::Unknown { type_name },
@@ -484,11 +545,7 @@ fn write_block(block: &Block) -> Value {
         }
         BlockKind::LinkPreview { url, title, description, image } => {
             map.insert("url".into(), url.as_str().into());
-            for (name, value) in [("title", title), ("description", description), ("image", image)] {
-                if let Some(value) = value {
-                    map.insert(name.into(), value.as_str().into());
-                }
-            }
+            write_told(&mut map, title, description, image);
             "link_preview"
         }
         BlockKind::Unknown { type_name } => type_name,

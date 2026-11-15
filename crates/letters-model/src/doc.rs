@@ -50,6 +50,10 @@ pub struct Document {
     pub dictionary: BTreeSet<String>,
     /// The front matter of the file the document came from, if it had any.
     pub properties: Option<Properties>,
+    /// What is kept of the pages the text links to, by address as a link writes it, so that a link shows
+    /// its page without the network. One whose address no link names is shown nowhere. It stays while the
+    /// history does, so that a link brought back has its preview: see [`Document::prune_previews`].
+    pub previews: BTreeMap<String, Preview>,
     pub blocks: Vec<Block>,
     pub extra: Extra,
 }
@@ -60,6 +64,7 @@ impl Default for Document {
             language: "en".into(),
             dictionary: BTreeSet::new(),
             properties: None,
+            previews: BTreeMap::new(),
             blocks: Vec::new(),
             extra: Extra::new(),
         }
@@ -80,6 +85,43 @@ pub struct Properties {
 pub enum PropertiesFormat {
     Yaml,
     Toml,
+}
+
+/// What a fetch found of the page a link leads to. It is fetched when a writer asks, never to show it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Preview {
+    /// The page's title, on one line.
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// The page's picture, by its name among the file's assets, such as `assets/<sha256>.jpg`. It is
+    /// never an address, so showing a preview loads nothing.
+    pub image: Option<String>,
+    pub extra: Extra,
+}
+
+impl Preview {
+    /// Whether it holds nothing, which is not kept.
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none() && self.description.is_none() && self.image.is_none() && self.extra.is_empty()
+    }
+
+    /// Whether the fields hold what `document.json` accepts for them.
+    pub fn sound(&self) -> bool {
+        told(&self.title, &self.description, &self.image)
+    }
+}
+
+/// Whether an address or a title is one line that says something.
+pub(crate) fn line(text: &str) -> bool {
+    !text.is_empty() && !text.contains(['\n', '\r'])
+}
+
+/// Whether what a preview tells of its page is what `document.json` accepts, for a card and for a link's.
+fn told(title: &Option<String>, description: &Option<String>, image: &Option<String>) -> bool {
+    // What a preview lacks is left out, so that it has one spelling.
+    let given = description.as_deref().is_none_or(|text| !text.is_empty());
+    let stored = image.as_deref().is_none_or(|image| image.starts_with(ASSETS) && line(image));
+    title.as_deref().is_none_or(line) && given && stored
 }
 
 impl Document {
@@ -112,6 +154,37 @@ impl Document {
         let listed = |block: &&Block| level(block).is_some_and(|level| level <= levels);
         let title = title.map(|title| &title.id);
         from.iter().copied().filter(listed).filter(|block| Some(&block.id) != title).collect()
+    }
+
+    /// The names of the assets the document shows: the pictures of its figures, of its link previews, and
+    /// of the previews a link in the text names.
+    ///
+    /// Whatever writes a file without its history asks here for what to carry, so that none leaves one out.
+    pub fn assets(&self) -> BTreeSet<&str> {
+        fn shown(block: &Block) -> Option<&str> {
+            match &block.kind {
+                BlockKind::Figure { asset, .. } => asset.as_deref(),
+                BlockKind::LinkPreview { image, .. } => image.as_deref(),
+                _ => None,
+            }
+        }
+        let linked = self.linked();
+        let named = self.previews.iter().filter(|(url, _)| linked.contains(url.as_str()));
+        let hovered = named.filter_map(|(_, preview)| preview.image.as_deref());
+        self.walk().filter_map(shown).chain(hovered).collect()
+    }
+
+    /// Takes out the previews whose address no link in the text names. For a copy without a history:
+    /// one that keeps its history keeps them, since an undo or an older version may bring the link back.
+    pub fn prune_previews(&mut self) {
+        let linked: BTreeSet<String> = self.linked().into_iter().map(str::to_owned).collect();
+        self.previews.retain(|url, _| linked.contains(url));
+    }
+
+    /// The addresses the links in the text lead to.
+    fn linked(&self) -> BTreeSet<&str> {
+        let runs = self.walk().flat_map(|block| block.body.runs());
+        runs.filter_map(|run| run.link.as_deref()).collect()
     }
 
     /// Every block in document order, parents before their children.
@@ -297,13 +370,7 @@ impl BlockKind {
                 line(title) && line(icon) && color.as_deref().is_none_or(crate::style::is_color)
             }
             Self::TableOfContents { levels } => (1..=4).contains(levels),
-            Self::LinkPreview { url, title, description, image } => {
-                let line = |text: &str| !text.is_empty() && !text.contains(['\n', '\r']);
-                // What a preview lacks is left out, so that it has one spelling.
-                let given = [title, description, image].into_iter().flatten().all(|text| !text.is_empty());
-                let stored = image.as_deref().is_none_or(|image| image.starts_with(ASSETS) && line(image));
-                line(url) && title.as_deref().is_none_or(line) && given && stored
-            }
+            Self::LinkPreview { url, title, description, image } => line(url) && told(title, description, image),
             _ => true,
         }
     }

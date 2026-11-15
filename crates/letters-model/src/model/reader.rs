@@ -126,6 +126,7 @@ impl Reader {
                 mem::swap(&mut doc.language, &mut fields.language);
                 mem::swap(&mut doc.dictionary, &mut fields.dictionary);
                 mem::swap(&mut doc.properties, &mut fields.properties);
+                mem::swap(&mut doc.previews, &mut fields.previews);
                 mem::swap(&mut doc.extra, &mut fields.extra);
                 mem::swap(&mut self.model.style, style);
             }

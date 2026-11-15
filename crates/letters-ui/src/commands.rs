@@ -63,6 +63,8 @@ pub(crate) enum Act {
     Comment,
     /// Lets the person choose pictures to put in.
     Pictures,
+    /// Asks for the address of a link preview to put in.
+    Preview,
     /// Turns the line under a picture to its alt text.
     AltText,
     /// Opens the card of the callout the caret is in.
@@ -162,7 +164,7 @@ const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> E
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 97] = [
+pub(crate) static ENTRIES: [Entry; 99] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -225,6 +227,8 @@ pub(crate) static ENTRIES: [Entry; 97] = [
     run("Insert", "Callout", "box note", Command::SetBlock(BlockKind::callout(Tone::Info))),
     run("Insert", "Formula", "maths equation tex", Command::SetBlock(BlockKind::Formula)),
     run("Insert", "Divider", "rule line separator", Command::SetBlock(BlockKind::Divider)),
+    run("Insert", "Table of contents", "toc headings outline", Command::InsertContents),
+    entry("Insert", "Link preview", "card bookmark website page", Act::Preview),
     run("Edit", "Undo", "", Command::Undo),
     run("Edit", "Redo", "", Command::Redo),
     run("Edit", "Cut", "", Command::Cut),
@@ -519,6 +523,8 @@ mod tests {
                 Put::Kind(kind) => Act::Run(Command::SetBlock(kind.clone())),
                 Put::Table => Act::Run(Command::InsertTable { rows: 3, columns: 3 }),
                 Put::Pictures => Act::Pictures,
+                Put::Contents => Act::Run(Command::InsertContents),
+                Put::Preview => Act::Preview,
             };
             assert!(ENTRIES.iter().any(|entry| entry.act == act), "{:?} is a command", offer.name);
         }

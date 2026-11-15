@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use letters_model::{
     Align, Block, BlockId, BlockKind, Body, BodyShape, Change, Conflict, Document, ListKind, Mark, Model, Op, OpError,
-    Page, Pos, Properties, PropertiesFormat, ReplicaId, Run, Style, Tone,
+    Page, Pos, Preview, Properties, PropertiesFormat, ReplicaId, Run, Style, Tone,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -44,6 +44,7 @@ enum Edit {
     Language { language: usize },
     Word { word: usize, add: bool },
     Properties { properties: usize },
+    Preview { url: usize, preview: usize },
 }
 
 /// No language, or one of two.
@@ -116,6 +117,7 @@ fn edit() -> impl Strategy<Value = Edit> {
         1 => (n(), n(), 0..6usize, n()).prop_map(|(block, at, len, lang)| Edit::Lang { block, at, len, lang }),
         1 => (n(), any::<bool>(), n()).prop_map(|(block, page_break, lang)| Edit::Props { block, page_break, lang }),
         1 => n().prop_map(|properties| Edit::Properties { properties }),
+        1 => (n(), n()).prop_map(|(url, preview)| Edit::Preview { url, preview }),
         3 => (n(), n(), id()).prop_map(|(block, at, id)| Edit::Split { block, at, id }),
         3 => n().prop_map(|block| Edit::Join { block }),
         1 => (n(), n()).prop_map(|(block, kind)| Edit::Kind { block, kind }),
@@ -322,6 +324,14 @@ fn op((doc, style): &Shown, edit: &Edit) -> Option<Op> {
             let source = ["title: a\n", "title: b\n"][n % 2].to_owned();
             let properties = Properties { format: PropertiesFormat::Toml, source, extra: Default::default() };
             Op::SetProperties { properties: (n % 3 > 0).then_some(properties) }
+        }
+        // The last address and the last title are ones no document keeps.
+        Edit::Preview { url, preview: n } => {
+            let url = ["https://example.com/a", "https://example.com/b", "two\nlines"][url % 3].to_owned();
+            let title = ["A page", "Another", "two\nlines"][n % 3].to_owned();
+            let image = (n % 2 > 0).then(|| "assets/a.png".to_owned());
+            let preview = Preview { title: (n % 4 > 0).then_some(title), image, ..Preview::default() };
+            Op::SetPreview { url, preview: (n % 5 > 0).then_some(preview) }
         }
         Edit::Word { word, add } => {
             let word = ["mot", "word", "字\u{1e}x"][word % 3].to_owned();
