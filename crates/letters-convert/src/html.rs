@@ -52,6 +52,8 @@ pub type Assets<'a> = &'a mut dyn FnMut(&str) -> Option<Vec<u8>>;
 /// - Maths is set and written in as a drawing, in the colour of the text around it. Its TeX source is kept on
 ///   the element, of the class `math`, where [`from_html`] reads it back. Maths that cannot be set is
 ///   written as its source.
+/// - A block or a passage in another language than the document's says so with `lang`, and a block that
+///   starts a page with `data-page-break`, which the stylesheet turns into a break when the page is printed.
 /// - An unknown block is written as its fallback text. Unknown marks and fields are left out.
 pub fn to_html(doc: &Document, style: &Style, title: &str, assets: Assets) -> String {
     to_html_with(doc, style, title, assets, &HtmlPage::default())
@@ -222,56 +224,91 @@ fn blocks(blocks: &[Block], page: &mut Writing, out: &mut String) {
     let mut lists: Vec<&str> = Vec::new();
     for block in blocks {
         if let BlockKind::ListItem { list, depth } = block.kind {
+            let start = out.len();
             item(&mut lists, list, depth, block.body.runs(), page.text(0), out);
+            // The item is the last one opened: text never holds a tag.
+            told(block, out[start..].rfind("<li").map(|at| start + at), out);
             continue;
         }
         close(&mut lists, 0, out);
-        match &block.kind {
-            BlockKind::Paragraph => element("p", block.body.runs(), page.text(0), out),
-            BlockKind::Heading { level } => {
-                let level = (*level).clamp(1, 4);
-                element(&format!("h{level}"), block.body.runs(), page.text(level), out);
-            }
-            BlockKind::Code { language } => code(language.as_deref(), &block.plain_text(), out),
-            BlockKind::Formula => {
-                maths(&block.plain_text(), true, page.text(0).maths, out);
-                out.push('\n');
-            }
-            BlockKind::Quote => container("<blockquote>", "</blockquote>", block.body.blocks(), page, out),
-            BlockKind::Callout { tone, .. } => {
-                let open = callout(&block.kind, tone_name(*tone));
-                container(&open, "</div>", block.body.blocks(), page, out);
-            }
-            BlockKind::Divider => out.push_str("<hr>\n"),
-            BlockKind::Figure { asset, src, alt, width, height, .. } => {
-                let image =
-                    Figure { asset: asset.as_deref(), src: src.as_deref(), alt, width: *width, height: *height };
-                figure(&image, block.body.runs(), Some(&block.id), page, out);
-            }
-            BlockKind::Table { columns, header } => table(columns, *header, block.body.blocks(), page, out),
-            // A merge can leave a row outside a table and a cell outside a row.
-            BlockKind::TableRow => table(&[], false, std::slice::from_ref(block), page, out),
-            // A merge can leave a caption outside a gallery too.
-            BlockKind::Caption | BlockKind::TableCell => element("p", block.body.runs(), page.text(0), out),
-            BlockKind::Gallery { .. } => gallery(block, page, out),
-            BlockKind::Unknown { type_name } if page.window => {
-                out.push_str("<p class=\"unknown\">Unsupported block: ");
-                escape(type_name, out);
-                out.push_str("</p>\n");
-            }
-            BlockKind::Unknown { .. } => {
-                let fallback = block.extra.get("fallback").and_then(|fallback| fallback.as_str()).unwrap_or_default();
-                if !fallback.is_empty() {
-                    out.push_str("<p class=\"fallback\">");
-                    text(fallback, out);
-                    out.push_str("</p>\n");
-                }
-            }
-            // Written by `item`, which knows the list around it.
-            BlockKind::ListItem { .. } => {}
-        }
+        let start = out.len();
+        written(block, page, out);
+        told(block, Some(start), out);
     }
     close(&mut lists, 0, out);
+}
+
+/// What a block says of itself that HTML has a word for and its element does not show: its language, where
+/// that is not the document's, as ` lang="fr"`. Empty for a block that says none.
+fn language(lang: Option<&str>) -> String {
+    let mut said = String::new();
+    if let Some(lang) = lang.filter(|lang| !lang.is_empty()) {
+        said.push_str(" lang=\"");
+        escape(lang, &mut said);
+        said.push('"');
+    }
+    said
+}
+
+/// Says on the element written at `from` the block's language, and that a page starts with it, which a
+/// browser heeds when it prints.
+fn told(block: &Block, from: Option<usize>, out: &mut String) {
+    let mut said = language(block.lang.as_deref());
+    if block.page_break {
+        said.push_str(" data-page-break");
+    }
+    // An attribute's value never holds this, so the first one ends the element's opening tag.
+    let end = from.filter(|from| out[*from..].starts_with('<')).and_then(|from| Some(from + out[from..].find('>')?));
+    if let (Some(end), false) = (end, said.is_empty()) {
+        out.insert_str(end, &said);
+    }
+}
+
+/// Writes one block that is not a list item.
+fn written(block: &Block, page: &mut Writing, out: &mut String) {
+    match &block.kind {
+        BlockKind::Paragraph => element("p", block.body.runs(), page.text(0), out),
+        BlockKind::Heading { level } => {
+            let level = (*level).clamp(1, 4);
+            element(&format!("h{level}"), block.body.runs(), page.text(level), out);
+        }
+        BlockKind::Code { language } => code(language.as_deref(), &block.plain_text(), out),
+        BlockKind::Formula => {
+            maths(&block.plain_text(), true, page.text(0).maths, out);
+            out.push('\n');
+        }
+        BlockKind::Quote => container("<blockquote>", "</blockquote>", block.body.blocks(), page, out),
+        BlockKind::Callout { tone, .. } => {
+            let open = callout(&block.kind, tone_name(*tone));
+            container(&open, "</div>", block.body.blocks(), page, out);
+        }
+        BlockKind::Divider => out.push_str("<hr>\n"),
+        BlockKind::Figure { asset, src, alt, width, height, .. } => {
+            let image = Figure { asset: asset.as_deref(), src: src.as_deref(), alt, width: *width, height: *height };
+            figure(&image, block.body.runs(), Some(&block.id), page, out);
+        }
+        BlockKind::Table { columns, header } => table(columns, *header, block.body.blocks(), page, out),
+        // A merge can leave a row outside a table and a cell outside a row.
+        BlockKind::TableRow => table(&[], false, std::slice::from_ref(block), page, out),
+        // A merge can leave a caption outside a gallery too.
+        BlockKind::Caption | BlockKind::TableCell => element("p", block.body.runs(), page.text(0), out),
+        BlockKind::Gallery { .. } => gallery(block, page, out),
+        BlockKind::Unknown { type_name } if page.window => {
+            out.push_str("<p class=\"unknown\">Unsupported block: ");
+            escape(type_name, out);
+            out.push_str("</p>\n");
+        }
+        BlockKind::Unknown { .. } => {
+            let fallback = block.extra.get("fallback").and_then(|fallback| fallback.as_str()).unwrap_or_default();
+            if !fallback.is_empty() {
+                out.push_str("<p class=\"fallback\">");
+                text(fallback, out);
+                out.push_str("</p>\n");
+            }
+        }
+        // Written by `item`, which knows the list around it.
+        BlockKind::ListItem { .. } => {}
+    }
 }
 
 /// The opening of a callout and the line that heads it. What was chosen over its tone is said in `data-`
@@ -364,7 +401,7 @@ fn table(columns: &[Align], header: bool, children: &[Block], page: &mut Writing
                         Some(Align::Justify) => " style=\"text-align: justify\"",
                         Some(Align::Start) | None => "",
                     };
-                    let _ = write!(out, "<{cell}{align}>");
+                    let _ = write!(out, "<{cell}{align}{}>", language(block.lang.as_deref()));
                     inline(block.body.runs(), page.text(0), out);
                     let _ = write!(out, "</{cell}>");
                 }
@@ -622,6 +659,11 @@ fn inline(runs: &[Run], line: Line, out: &mut String) {
         }
         for run in linked.iter().filter(|run| !run.text.is_empty()) {
             let tags = || MARKS.iter().filter(|(mark, _)| run.marks.contains(mark)).map(|(_, tag)| *tag);
+            // Words in another language than the text around them say so, for whatever reads the page aloud.
+            let spoken = language(run.lang.as_deref());
+            if !spoken.is_empty() {
+                let _ = write!(out, "<span{spoken}>");
+            }
             tags().for_each(|tag| _ = write!(out, "<{tag}>"));
             let target = run.marks.iter().find_map(|mark| match mark {
                 Mark::Ref(target) => Some(target),
@@ -636,6 +678,9 @@ fn inline(runs: &[Run], line: Line, out: &mut String) {
                 (None, _) => text(&run.text, out),
             }
             tags().rev().for_each(|tag| _ = write!(out, "</{tag}>"));
+            if !spoken.is_empty() {
+                out.push_str("</span>");
+            }
         }
         if address.is_some() {
             out.push_str("</a>");
@@ -966,7 +1011,8 @@ fn css(style: &Style, with: &HtmlPage, css: &mut String) {
          .callout > .callout-title {{ display: flex; align-items: center; gap: 8px; margin: 0 0 4px; \
          font-weight: 600; }}\n\
          .callout > .callout-title.alone {{ float: left; margin: 0 8px 0 0; }}\n\
-         .callout > .callout-title > svg {{ flex: none; }}\n",
+         .callout > .callout-title > svg {{ flex: none; }}\n\
+         [data-page-break] {{ break-before: page; }}\n",
         mono = quoted(&code.family),
         before = px(body.space_before * PIXELS),
         after = px(unit),

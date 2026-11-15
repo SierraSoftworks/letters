@@ -84,17 +84,7 @@ fn each_format_lists_what_it_cannot_carry() {
                 (Languages, 2),
             ],
         ),
-        (
-            Target::Html,
-            vec![
-                (UnknownBlocks, 1),
-                (UnknownMarks, 1),
-                (Comments, 2),
-                (LinkedPictures, 1),
-                (PageBreaks, 1),
-                (Languages, 2),
-            ],
-        ),
+        (Target::Html, vec![(UnknownBlocks, 1), (UnknownMarks, 1), (Comments, 2), (LinkedPictures, 1)]),
         (
             Target::Docx,
             vec![

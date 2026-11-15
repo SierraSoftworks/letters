@@ -33,9 +33,9 @@ pub enum LossKind {
     CalloutLooks,
     /// Galleries, where the format has pictures but no way to set them side by side.
     Galleries,
-    /// Page breaks, where the format has no pages.
+    /// Page breaks, which Markdown has no word for.
     PageBreaks,
-    /// Passages said to be in a language other than the document's, where the format cannot say so.
+    /// Passages said to be in a language other than the document's, which Markdown cannot say.
     Languages,
     /// Code blocks whose language the format does not keep.
     CodeLanguages,
@@ -96,10 +96,10 @@ pub fn losses_with(doc: &Document, notes: &Notes, to: Target, loaded: &dyn Fn(&s
         (NestedBlocks, to == Docx, nested()),
         (CalloutLooks, matches!(to, Markdown | Docx), blocks(&looks)),
         (Galleries, to == Markdown, blocks(&|block| matches!(block.kind, BlockKind::Gallery { .. }))),
-        (PageBreaks, matches!(to, Markdown | Html), blocks(&|block| block.page_break)),
+        (PageBreaks, to == Markdown, blocks(&|block| block.page_break)),
         (
             Languages,
-            matches!(to, Markdown | Html),
+            to == Markdown,
             blocks(&|block| block.lang.is_some()) + runs().filter(|run| run.lang.is_some()).count(),
         ),
         (CodeLanguages, to == Docx, blocks(&coded)),

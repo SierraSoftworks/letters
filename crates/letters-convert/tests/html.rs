@@ -594,3 +594,39 @@ fn a_callout_is_headed_by_its_title_and_keeps_what_was_chosen_for_it() {
         assert_eq!(callout.body.blocks()[0].plain_text(), "Inside", "{kind:?}");
     }
 }
+
+#[test]
+fn a_page_says_the_language_of_a_passage_and_where_a_page_starts() {
+    let mut doc = document(
+        "# Rates\n\nBonjour à tous.\n\n- Guten Tag\n- Second\n\n> Quoted\n\n| A | B |\n| - | - |\n| uno | two |\n\n## Later\n",
+    );
+    let said = |block: &mut Block, lang: &str| block.lang = Some(lang.into());
+    said(&mut doc.blocks[1], "fr");
+    said(&mut doc.blocks[2], "de");
+    said(&mut doc.blocks[4], "la");
+    let Body::Blocks(rows) = &mut doc.blocks[5].body else { panic!("a table holds rows") };
+    let Body::Blocks(cells) = &mut rows[1].body else { panic!("a row holds cells") };
+    said(&mut cells[0], "es");
+    let last = doc.blocks.len() - 1;
+    doc.blocks[last].page_break = true;
+    doc.blocks[last].body =
+        Body::Text(vec![Run::plain("Later, "), Run { lang: Some("it".into()), ..Run::plain("ciao") }]);
+
+    let html = export(&doc);
+    let article = article(&html);
+    for element in [
+        "<p lang=\"fr\">Bonjour",
+        "<li lang=\"de\">Guten Tag",
+        "<li>Second",
+        "<blockquote lang=\"la\">",
+        "<td lang=\"es\">uno",
+        "<td>two",
+        "<span lang=\"it\">ciao</span>",
+        "<h2 data-page-break>Later",
+    ] {
+        assert!(article.contains(element), "{element} in {article}");
+    }
+    assert!(article.starts_with("<h1>Rates</h1>"), "a block that says neither is written as ever: {article}");
+    assert!(rule(stylesheet(&html), "[data-page-break]").contains("break-before: page"), "a printed page breaks there");
+    assert!(nests(&article), "{article}");
+}
