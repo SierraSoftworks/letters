@@ -80,6 +80,7 @@ use crate::widgets::{
     side_panel, top_bar,
 };
 use crate::words::WordLists;
+use crate::written::{self, Writing};
 
 /// Space kept beside the text column.
 pub(crate) const GUTTER: f32 = 24.0;
@@ -283,6 +284,8 @@ pub enum Message {
     Refer(Picking),
     /// What the settings dialog asks for.
     Settings(Setting),
+    /// What the dialog about the document's language and a passage's asks.
+    Written(Writing),
     /// What the menu on a linked picture's cloud asks for.
     Linked(Linking),
     /// Puts the menu of the caret's column or row away.
@@ -341,6 +344,7 @@ impl Message {
             Message::Rename(_) | Message::EditLink | Message::LinkDraft(_) | Message::LinkApply => true,
             Message::Maths(_) | Message::Insert(_) | Message::Fence(_) | Message::Refer(_) => true,
             Message::Language(_) | Message::Callout(_) | Message::Contents(_) | Message::Preview(_) => true,
+            Message::Written(_) => true,
             Message::Alt(_) | Message::Styles(_) | Message::Restyle(_) | Message::Draft(..) => true,
             Message::Apply(_) | Message::Merge(_) | Message::History(_) | Message::Sharing(_) => true,
             Message::Panel(panel) => *panel == Panel::Styles,
@@ -1328,6 +1332,8 @@ pub struct EditorApp {
     edits: u64,
     panel: Option<Panel>,
     share: Share,
+    /// Whether the dialog about the language of the document and of a passage is out.
+    written: bool,
     servers: Servers,
     browser: Browser,
     /// The address in the link editor while it is open.
@@ -1447,6 +1453,7 @@ impl EditorApp {
             edits: 0,
             panel: None,
             share: Share::default(),
+            written: false,
             servers: Servers::default(),
             browser: Browser::default(),
             link: None,
@@ -2247,7 +2254,7 @@ impl EditorApp {
             Act::MoveRow { .. } | Act::MoveColumn { .. } | Act::Link | Act::Pictures | Act::Preview => false,
             Act::CardAsLink => false,
             Act::AltText | Act::Callout | Act::CodeLanguage | Act::Embed | Act::EmbedAll => false,
-            Act::Panel(Panel::Styles) | Act::Rename | Act::Save | Act::PageSetup => false,
+            Act::Panel(Panel::Styles) | Act::Rename | Act::Save | Act::PageSetup | Act::Language => false,
             Act::MergeConflicts | Act::MergeFrom | Act::MergeInto | Act::Share => false,
             Act::History | Act::SelectionHistory | Act::Misspelling { .. } | Act::Replace => false,
         };
@@ -2330,6 +2337,7 @@ impl EditorApp {
             Act::Servers => self.servers.offered().then_some(Message::Servers(Signing::Show))?,
             Act::Settings => Message::Settings(Setting::Show),
             Act::PageSetup => Message::Styles(Styling::PageSetup),
+            Act::Language => Message::Written(Writing::Show),
             Act::TrustDocument => self.safe.on().then_some(Message::Safe(Safely::TrustDocument))?,
             Act::TrustFolder => self.safe.folder().then_some(Message::Safe(Safely::TrustFolder))?,
             Act::MergeConflicts => self.merges.waiting().then_some(Message::Merge(Merging::Conflicts))?,
@@ -2813,6 +2821,7 @@ impl EditorApp {
     /// while another is out, and the one asked for takes its place.
     fn undialog(&mut self) {
         self.dialog.update(Setting::Close, &mut self.settings);
+        self.written = false;
         self.share.close();
         self.servers.close();
         self.browser.close();
@@ -4793,7 +4802,8 @@ impl EditorApp {
         );
         // The page is set up by someone who writes on it.
         let setup = MenuItem::new("Page setup").icon(icon::FILE_TEXT).on_select(Message::Styles(Styling::PageSetup));
-        let more = if self.writes() { more.item(setup) } else { more };
+        let language = MenuItem::new("Language").icon(icon::LANGUAGES).on_select(Message::Written(Writing::Show));
+        let more = if self.writes() { more.item(setup).item(language) } else { more };
         let more = more.separator();
         let servers = MenuItem::new("Servers").icon(icon::CLOUD).on_select(Message::Servers(Signing::Show));
         let more = if self.servers.offered() { more.item(servers) } else { more };
@@ -5529,6 +5539,22 @@ impl EditorApp {
                 }
                 self.servers.update(asked, platform, &mut self.requests);
             }
+            Message::Written(asked) => match asked {
+                Writing::Show => {
+                    // The language is said of the page, so not while another view or a card has its place.
+                    if !self.away() && !self.carded() {
+                        self.undialog();
+                        self.written = true;
+                    }
+                }
+                Writing::Close => self.written = false,
+                Writing::Document(tag) => {
+                    self.edit(platform, |editor, platform| editor.run(Command::SetLanguage(tag), platform));
+                }
+                Writing::Passage(tag) => {
+                    self.edit(platform, |editor, platform| editor.run(Command::SetLang(tag), platform));
+                }
+            },
             Message::Visit(session) => self.visit(session),
             Message::Correct(text) => {
                 self.context = None;
@@ -5772,6 +5798,17 @@ impl App for EditorApp {
         let over = over.chain(self.merges.card());
         let over = over.chain(self.share.view(&self.name().0, self.connection.is_some(), window.height));
         let over = over.chain(self.servers.view());
+        let written = self.written.then(|| {
+            let editor = &self.editor;
+            let told = written::Told {
+                document: &editor.doc().language,
+                passage: editor.applies(&Command::SetLang(None)).then(|| editor.lang()),
+                selected: editor.selection().is_some_and(|selection| !selection.is_caret()),
+                shell: &self.dialog.languages,
+            };
+            written::view(&told)
+        });
+        let over = over.chain(written);
         let over = over.chain(self.browser.view(self.servers.signed_in()));
         let commands = self.commands.open().then(|| {
             let (offers, keymap) = (self.offers(), self.editor.keymap());

@@ -20,7 +20,7 @@ use crate::window::Message;
 
 /// The width of the dialog, and of the names down its left side.
 const WIDTH: f32 = 560.0;
-const NAMES: f32 = 116.0;
+pub(crate) const NAMES: f32 = 116.0;
 /// What the dialog takes of the window's height besides what it sets, with the room it keeps clear of the
 /// window's edges, and the least the settings are given before they scroll.
 const AROUND: f32 = 160.0;
@@ -105,7 +105,7 @@ const ACCENTS: [(&str, Option<[u8; 3]>); 8] = [
 ];
 
 /// The kinds of English that are built in, which every shell can offer.
-const ENGLISH: [&str; 4] = ["en-US", "en-GB", "en-AU", "en-CA"];
+pub(crate) const ENGLISH: [&str; 4] = ["en-US", "en-GB", "en-AU", "en-CA"];
 
 /// What the dialog keeps between frames.
 #[derive(Default)]
@@ -260,40 +260,50 @@ impl Dialog {
     /// The language of new documents: the kinds of English built in, then the system's dictionaries.
     fn language(&self, settings: &Settings) -> Element<Message> {
         let chosen = settings.language.as_deref().unwrap_or(ENGLISH[0]);
-        let mut offered: Vec<&str> = ENGLISH.to_vec();
-        let others = self.languages.iter().map(String::as_str).chain([chosen]);
-        offered.extend(others.filter(|tag| !ENGLISH.iter().any(|english| english.eq_ignore_ascii_case(tag))));
-        offered[ENGLISH.len()..].sort_by_key(|tag| language_name(tag));
-        offered.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-
-        let mut menu = Menu::new().label("Language");
-        for tag in offered {
+        let mut menu = Menu::new();
+        for tag in offered(&self.languages, &[chosen]) {
             let pick = Message::Settings(Setting::Language(tag.to_owned()));
             let item = MenuItem::new(language_name(tag)).checked(tag.eq_ignore_ascii_case(chosen));
             menu = menu.item(item.on_select(pick));
         }
-        // The list is as wide as the control it drops from, as a select's is.
-        let list = Element::from(menu).min_width(WIDTH - 2.0 * tokens::SPACE_XL - NAMES - tokens::SPACE_LG);
-        let list = Popover::new(list.max_height(LANGUAGES).scroll()).max_width(WIDTH).list(HasPopup::Menu).gap(4.0);
-        let name = language_name(chosen);
-        let select = Element::row()
-            .align(Align::Center)
-            .gap(tokens::SPACE_SM)
-            .height(tokens::CONTROL_HEIGHT)
-            .padding(Edges::xy(tokens::CONTROL_PADDING - 4.0, 0.0))
-            .border(Edges::all(1.0), tokens::LINE_STRONG)
-            .radius(tokens::RADIUS_CONTROL)
-            .bg(tokens::SURFACE)
-            .hover(Look::bg(tokens::TONE_1))
-            .ring(Ring::Outline(2.0))
-            .role(Role::Button)
-            .label("Language")
-            .description(name.clone())
-            .child(Element::text(name, TextStyle::control()).grow(1.0))
-            .child(Element::icon(icon::CHEVRON_DOWN, 14.0).fg(tokens::FG_MUTED))
-            .popover(list);
+        let width = WIDTH - 2.0 * tokens::SPACE_XL - NAMES - tokens::SPACE_LG;
+        let select = select("Language", language_name(chosen), menu, width);
         row("Language", select, Some("New documents are written and spell-checked in it."))
     }
+}
+
+/// The languages a list offers: the kinds of English that are built in, then by name those the shell has
+/// dictionaries for and those in `used`.
+pub(crate) fn offered<'a>(shell: &'a [String], used: &[&'a str]) -> Vec<&'a str> {
+    let mut offered: Vec<&str> = ENGLISH.to_vec();
+    let others = shell.iter().map(String::as_str).chain(used.iter().copied());
+    offered.extend(others.filter(|tag| !ENGLISH.iter().any(|english| english.eq_ignore_ascii_case(tag))));
+    offered[ENGLISH.len()..].sort_by_key(|tag| language_name(tag));
+    offered.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    offered
+}
+
+/// A select: a control that says what is chosen, and drops the list it is chosen from.
+pub(crate) fn select(label: &str, chosen: String, menu: Menu<Message>, width: f32) -> Element<Message> {
+    // The list is as wide as the control it drops from, as a select's is.
+    let list = Element::from(menu.label(label)).min_width(width);
+    let list = Popover::new(list.max_height(LANGUAGES).scroll()).max_width(WIDTH).list(HasPopup::Menu).gap(4.0);
+    Element::row()
+        .align(Align::Center)
+        .gap(tokens::SPACE_SM)
+        .height(tokens::CONTROL_HEIGHT)
+        .padding(Edges::xy(tokens::CONTROL_PADDING - 4.0, 0.0))
+        .border(Edges::all(1.0), tokens::LINE_STRONG)
+        .radius(tokens::RADIUS_CONTROL)
+        .bg(tokens::SURFACE)
+        .hover(Look::bg(tokens::TONE_1))
+        .ring(Ring::Outline(2.0))
+        .role(Role::Button)
+        .label(label)
+        .description(chosen.clone())
+        .child(Element::text(chosen, TextStyle::control()).grow(1.0))
+        .child(Element::icon(icon::CHEVRON_DOWN, 14.0).fg(tokens::FG_MUTED))
+        .popover(list)
 }
 
 /// Light, dark, or as the system is: three buttons of which one is down.

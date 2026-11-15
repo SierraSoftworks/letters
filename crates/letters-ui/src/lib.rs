@@ -67,6 +67,7 @@ mod ui;
 pub mod widgets;
 mod window;
 mod words;
+mod written;
 
 pub use accesskit::Role;
 pub use browsing::{Browsed, Place};

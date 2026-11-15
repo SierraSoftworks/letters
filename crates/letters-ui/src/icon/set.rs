@@ -91,6 +91,8 @@ pub const INFO: Icon = Icon::new("M2 12a10 10 0 1 0 20 0a10 10 0 1 0 -20 0M12 16
 pub const ITALIC: Icon = Icon::new("M19 4L10 4M14 20L5 20M15 4L9 20");
 /// `key-round`
 pub const KEY_ROUND: Icon = Icon::new("M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4zM16 7.5a0.5 0.5 0 1 0 1 0a0.5 0.5 0 1 0 -1 0");
+/// `languages`
+pub const LANGUAGES: Icon = Icon::new("M5 8l6 6M4 14l6-6 2-3M2 5h12M7 2h1M22 22l-5-10-5 10M14 18h6");
 /// `line-height`
 pub const LINE_HEIGHT: Icon = Icon::new("M15 14H9M21 21H3M21 3H3M8 16l3.453-7.648a.6.6 0 011.094.001L16 16");
 /// `link`

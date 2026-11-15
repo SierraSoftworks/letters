@@ -1167,6 +1167,27 @@ fn a_word_taken_out_of_the_persons_own_is_marked_again() {
 }
 
 #[test]
+fn text_said_to_be_in_a_language_without_a_dictionary_is_left_alone() {
+    // What is said to be French, which the harness has no dictionary for, and the words still marked.
+    for (said, left) in [("Language of selected text", 1), ("Language of the document", 0)] {
+        let mut window = Harness::doc("The quik brown fox.\n\nBonjour tout le monde.");
+        window.ui().set_languages(["fr-FR"]);
+        rest(&mut window);
+        let marked = waves(&mut window).len();
+        assert!(marked > 1, "{said}: French reads as misspelled English");
+
+        window.select("Bonjour tout le monde.").click(Role::Button, "More").click(Role::MenuItem, "Language");
+        window.click(Role::Button, said).click(Role::MenuItemCheckBox, "French (France)").key("Escape");
+        rest(&mut window);
+        assert_eq!(waves(&mut window).len(), left, "{said}");
+
+        window.key("Mod+z");
+        rest(&mut window);
+        assert_eq!(waves(&mut window).len(), marked, "{said}: undo has it checked as it was");
+    }
+}
+
+#[test]
 fn a_word_is_accepted_from_the_menu_or_from_the_persons_own_list() {
     // How the word comes to be accepted, and whether the shell is handed it to keep.
     for (route, kept) in [("Add to my dictionary", true), ("Add to this document", false), ("the shell's list", false)]
