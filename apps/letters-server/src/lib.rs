@@ -2,7 +2,8 @@
 //! keeps only the state that files cannot hold.
 //!
 //! - [`config`] is the settings file, and [`store`] the state directory.
-//! - [`session`] says who is asking.
+//! - [`session`] says who is asking, [`oidc`] asks the identity provider who signs in, and [`auth`] is
+//!   the way from one to the other.
 //! - [`spaces`] is the only way to a file, and cannot leave a space's folder.
 //! - [`library`] lists a space and finds a document by its id, wherever its file was moved to.
 //! - [`api`] answers the interface `letters_api` lays down.
@@ -11,10 +12,13 @@
 //! with a sync tool, is another writer like the server, and the save in `letters_format` merges with it.
 
 pub mod api;
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod ids;
 pub mod library;
+pub mod oidc;
+pub mod pages;
 pub mod session;
 pub mod spaces;
 pub mod store;
@@ -27,6 +31,7 @@ use letters_api::{Role, Space};
 use crate::config::Config;
 use crate::error::{Answer, Refusal};
 use crate::library::Library;
+use crate::oidc::Provider;
 use crate::session::Signed;
 use crate::spaces::Root;
 use crate::store::Store;
@@ -39,6 +44,7 @@ pub struct App {
     pub config: Config,
     pub store: Store,
     pub library: Library,
+    pub provider: Provider,
     clock: Clock,
 }
 
@@ -47,7 +53,8 @@ pub type Shared = Arc<App>;
 impl App {
     pub fn new(config: Config, store: Store) -> Self {
         let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
-        Self { config, store, library: Library::new(), clock: Box::new(clock) }
+        let provider = Provider::new(&config);
+        Self { config, store, library: Library::new(), provider, clock: Box::new(clock) }
     }
 
     /// The same server telling another time, for tests of what runs out.

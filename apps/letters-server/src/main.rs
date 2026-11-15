@@ -6,7 +6,7 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use letters_server::config::Config;
+use letters_server::config::{Config, ConfigError};
 use letters_server::store::Store;
 use letters_server::{App, api, log};
 
@@ -30,7 +30,12 @@ fn main() -> ExitCode {
         }
     }
     let config = std::fs::read_to_string(&path).map_err(|error| error.to_string());
-    let config = match config.and_then(|text| Config::parse(&text).map_err(|error| error.to_string())) {
+    let read = |text: String| {
+        let mut config = Config::parse(&text)?;
+        config.read_secrets()?;
+        Ok(config)
+    };
+    let config = match config.and_then(|text| read(text).map_err(|error: ConfigError| error.to_string())) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("letters-server: {path}: {error}");

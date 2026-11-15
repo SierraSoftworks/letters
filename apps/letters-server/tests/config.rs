@@ -6,7 +6,7 @@ use letters_api::Role;
 use letters_server::config::Config;
 
 fn with(change: impl Fn(String) -> String) -> Result<Config, String> {
-    let sound = common::settings(std::path::Path::new("/srv/letters"));
+    let sound = common::settings(std::path::Path::new("/srv/letters"), "https://id.example.test", "");
     Config::parse(&change(sound)).map_err(|error| error.to_string())
 }
 
@@ -20,6 +20,33 @@ fn sound_settings_are_read_with_their_defaults() {
     let ids: Vec<String> = config.spaces.iter().map(|space| space.id()).collect();
     assert_eq!(ids, ["home", "family"]);
     assert!(config.spaces[0].personal() && !config.spaces[1].personal());
+}
+
+#[test]
+fn the_clients_secret_is_read_from_the_settings_or_from_a_file() {
+    let scratch = common::Scratch::new("secret");
+    let file = scratch.0.join("secret");
+    std::fs::write(&file, "from a file\n").unwrap();
+    let cases = [
+        (String::new(), Ok(None)),
+        ("client_secret = \"inline\"".to_owned(), Ok(Some("inline"))),
+        (format!("client_secret_file = \"{}\"", file.display()), Ok(Some("from a file"))),
+        ("client_secret_file = \"/nowhere/secret\"".to_owned(), Err("client_secret_file")),
+        ("client_secret = \"\"".to_owned(), Err("nothing in it")),
+        (format!("client_secret = \"a\"\nclient_secret_file = \"{}\"", file.display()), Err("both")),
+    ];
+    for (setting, expected) in cases {
+        let line = "client_id = \"letters\"";
+        let read = with(|sound| sound.replace(line, &format!("{line}\n{setting}"))).and_then(|mut config| {
+            config.read_secrets().map_err(|error| error.to_string())?;
+            Ok(config.auth.oidc.client_secret)
+        });
+        match (read, expected) {
+            (Ok(secret), Ok(expected)) => assert_eq!(secret.as_deref(), expected, "{setting}"),
+            (Err(refusal), Err(word)) => assert!(refusal.contains(word), "{setting}: {refusal}"),
+            (read, _) => panic!("{setting}: {read:?}"),
+        }
+    }
 }
 
 #[test]

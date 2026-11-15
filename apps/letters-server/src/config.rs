@@ -227,6 +227,27 @@ impl Config {
         Ok(config)
     }
 
+    /// Reads the client's secret from its file, when the settings name one. The file may end in a line
+    /// break, as files do.
+    pub fn read_secrets(&mut self) -> Result<(), ConfigError> {
+        let oidc = &mut self.auth.oidc;
+        if let Some(file) = oidc.client_secret_file.take() {
+            let secret = std::fs::read_to_string(&file).map_err(|error| {
+                ConfigError(format!(
+                    "auth.oidc.client_secret_file is \"{}\", which cannot be read: {error}",
+                    file.display()
+                ))
+            })?;
+            oidc.client_secret = Some(secret.trim().to_owned());
+        }
+        if oidc.client_secret.as_deref().is_some_and(str::is_empty) {
+            return Err(ConfigError(
+                "auth.oidc has a client secret with nothing in it: leave it out, or fill it in".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The sources the server itself fetches from.
     pub fn sources(&self) -> Result<Vec<Source>, ConfigError> {
         let read = |text: &String| {
@@ -237,22 +258,35 @@ impl Config {
     }
 }
 
+/// Whether `url` is reached over TLS, or on this machine, which alone may go without. `None` when it is
+/// no `http` address at all.
+fn secure(url: &str) -> Option<bool> {
+    let (secure, rest) = match (url.strip_prefix("https://"), url.strip_prefix("http://")) {
+        (Some(rest), _) => (true, rest),
+        (_, Some(rest)) => (false, rest),
+        _ => return None,
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = host.rsplit_once(':').filter(|(_, port)| port.parse::<u16>().is_ok()).map_or(host, |(host, _)| host);
+    Some(secure || matches!(host, "localhost" | "127.0.0.1" | "[::1]"))
+}
+
+/// Whether `url` is an address the server may send a secret to: over TLS, or on this machine.
+pub fn local_or_secure(url: &str) -> bool {
+    secure(url) == Some(true)
+}
+
 /// Holds `url` to `scheme://host[:port]` and hands it back without a slash at its end. Only a server on
 /// this machine may go without TLS.
 fn origin(url: &str, setting: &str) -> Result<String, ConfigError> {
     let url = url.trim().trim_end_matches('/');
     let bad = |why: &str| ConfigError(format!("{setting} is \"{url}\", {why}"));
-    let (secure, rest) = match (url.strip_prefix("https://"), url.strip_prefix("http://")) {
-        (Some(rest), _) => (true, rest),
-        (_, Some(rest)) => (false, rest),
-        _ => return Err(bad("which is not an address that starts with https://")),
-    };
+    let secure = secure(url).ok_or_else(|| bad("which is not an address that starts with https://"))?;
+    let rest = url.split_once("://").map_or("", |(_, rest)| rest);
     if rest.is_empty() || rest.contains(['/', '?', '#', '@', ' ']) {
         return Err(bad("which must be a host and no more, such as https://letters.example.com"));
     }
-    let host = rest.rsplit_once(':').filter(|(_, port)| port.parse::<u16>().is_ok()).map_or(rest, |(host, _)| host);
-    let local = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
-    if !secure && !local {
+    if !secure {
         return Err(bad("which is without TLS: only a server on this machine may be reached over http://"));
     }
     Ok(url.to_owned())

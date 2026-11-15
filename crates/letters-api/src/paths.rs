@@ -34,6 +34,10 @@ pub const SOURCES: &str = "/api/v1/trust/sources";
 
 /// A page: where a browser starts signing in. `?then=` names the page to come back to.
 pub const SIGN_IN_PAGE: &str = "/auth/sign-in";
+/// A page: `POST` from one of the server's own pages ends the browser's session.
+pub const SIGN_OUT_PAGE: &str = "/auth/sign-out";
+/// A page: where the desktop app sends the system's browser to sign in. See [`desktop_sign_in`].
+pub const DESKTOP_PAGE: &str = "/auth/desktop";
 /// A page: where the identity provider sends the browser back. The one redirect address to register.
 pub const CALLBACK_PAGE: &str = "/auth/callback";
 /// A page: the documents the person reaches.
@@ -83,6 +87,12 @@ pub fn trash(id: &str) -> String {
     format!("{}/trash", document(id))
 }
 
+/// `GET`: the names of the document's assets, as [`asset`] takes them. A device that wrote offline asks
+/// this to learn which of its pictures the server lacks, and hands those over before its edits.
+pub fn assets(id: &str) -> String {
+    format!("{}/assets", document(id))
+}
+
 /// `GET`: one asset of the document, by the name its entry has without `assets/`, such as
 /// `<sha256>.png`. `PUT`: adds it, before the edit that names it. The name must be the hash of the bytes.
 pub fn asset(id: &str, name: &str) -> String {
@@ -130,13 +140,18 @@ pub fn access(id: &str) -> String {
     format!("{}/access", document(id))
 }
 
-/// A page: where the desktop app sends the system's browser to sign in.
+/// A page: where the desktop app sends the system's browser to sign in, at [`DESKTOP_PAGE`].
 ///
 /// `challenge` is the SHA-256 of a secret the app keeps, in base64 for addresses without padding. Once the
 /// person has signed in and agreed, the browser is sent to `http://127.0.0.1:<port>/?code=…&state=…`,
 /// where the app listens, and the app trades the code and its secret at [`EXCHANGE`].
 pub fn desktop_sign_in(challenge: &str, port: u16, state: &str) -> String {
-    format!("/auth/desktop?challenge={}&port={port}&state={}", segment(challenge), segment(state))
+    format!("{DESKTOP_PAGE}?challenge={}&port={port}&state={}", segment(challenge), segment(state))
+}
+
+/// A page: [`SIGN_IN_PAGE`], coming back to the page `then` of this server once signed in.
+pub fn sign_in_page(then: &str) -> String {
+    format!("{SIGN_IN_PAGE}?then={}", segment(then))
 }
 
 /// A page: the document in the browser's editor.

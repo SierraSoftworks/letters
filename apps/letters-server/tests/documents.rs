@@ -308,6 +308,8 @@ async fn a_documents_picture_is_served_as_what_it_is() {
     std::fs::write(server.scratch.0.join("home/ben/Pictured.let"), bytes.into_inner()).unwrap();
     names(&listed(&ben, "home", "").await);
 
+    let held: Vec<String> = ben.get(&paths::assets("with-picture")).await.unwrap();
+    assert_eq!(held, ["ab12.png", "cd34.bin"], "a device learns which pictures the server has");
     let picture = ben.send(Method::GET, &paths::asset("with-picture", "ab12.png"), "", Vec::new()).await;
     assert_eq!(
         (picture.status, picture.header("content-type"), picture.body.as_slice()),

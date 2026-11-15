@@ -29,12 +29,23 @@ pub fn hashed(secret: &str) -> String {
 
 /// Base64 in the alphabet for addresses, without padding: what PKCE and JWTs write.
 pub fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    encoded(bytes, b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", false)
+}
+
+/// Base64 as a header writes it, padded.
+pub fn base64(bytes: &[u8]) -> String {
+    encoded(bytes, b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", true)
+}
+
+fn encoded(bytes: &[u8], alphabet: &[u8; 64], padded: bool) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let bits = chunk.iter().fold(0u32, |bits, byte| bits << 8 | u32::from(*byte)) << (8 * (3 - chunk.len()));
         for i in 0..=chunk.len() {
-            out.push(char::from(ALPHABET[(bits >> (18 - 6 * i) & 63) as usize]));
+            out.push(char::from(alphabet[(bits >> (18 - 6 * i) & 63) as usize]));
+        }
+        if padded {
+            out.extend(std::iter::repeat_n('=', 3 - chunk.len()));
         }
     }
     out

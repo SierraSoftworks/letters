@@ -169,21 +169,22 @@ impl Batch {
         Ok(())
     }
 
-    /// Removes every row whose key starts with `prefix` and that `keep` does not ask to keep.
-    pub fn prune<V>(
+    /// Removes every row whose key starts with `prefix` and that `keep` does not ask to keep. A row that
+    /// cannot be read goes too.
+    pub fn prune<V: DeserializeOwned>(
         &mut self,
         table: &Table<V>,
         prefix: &str,
-        mut keep: impl FnMut(&str) -> bool,
+        mut keep: impl FnMut(&str, &V) -> bool,
     ) -> Result<(), StoreError> {
         let mut rows = self.write.open_table(table.definition())?;
         let mut gone = Vec::new();
         for row in rows.range(prefix..)? {
-            let (key, _) = row?;
+            let (key, bytes) = row?;
             if !key.value().starts_with(prefix) {
                 break;
             }
-            if !keep(key.value()) {
+            if !table.row(key.value(), bytes.value()).is_ok_and(|row| keep(key.value(), &row)) {
                 gone.push(key.value().to_owned());
             }
         }

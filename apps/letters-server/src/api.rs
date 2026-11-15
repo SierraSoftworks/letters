@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, SET_COOKIE};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::error::{Answer, Refusal};
 use crate::library::Row;
-use crate::session::Signed;
+use crate::session::{Carrier, Signed};
 use crate::spaces::{EXTENSION, Place, Root, seconds, shown};
 use crate::store::Table;
 use crate::{App, Shared};
@@ -42,6 +42,7 @@ pub fn routes() -> Router<Shared> {
         .route(paths::SETTINGS, get(settings).put(set_settings))
         .route(paths::SPACES, get(spaces))
         .route(paths::RECENT, get(recent))
+        .route(paths::SHARED, get(shared))
         .route(paths::SOURCES, get(sources))
         .route("/api/v1/spaces/{space}/entries", get(entries))
         .route("/api/v1/spaces/{space}/documents", post(new_document))
@@ -51,6 +52,7 @@ pub fn routes() -> Router<Shared> {
         .route("/api/v1/documents/{id}/rename", post(rename))
         .route("/api/v1/documents/{id}/move", post(relocate))
         .route("/api/v1/documents/{id}/trash", post(trash))
+        .route("/api/v1/documents/{id}/assets", get(assets))
         .route("/api/v1/documents/{id}/assets/{name}", get(asset))
 }
 
@@ -79,8 +81,14 @@ async fn renew(State(app): State<Shared>, Json(renewal): Json<Renewal>) -> Answe
     blocking(move || app.renew(&renewal.renew).map(Json)).await
 }
 
-async fn sign_out(State(app): State<Shared>, who: Signed) -> Answer<()> {
-    blocking(move || app.sign_out(&who.token)).await
+async fn sign_out(State(app): State<Shared>, who: Signed) -> Answer<Response> {
+    let ended = app.clone();
+    blocking(move || ended.sign_out(&who.token)).await?;
+    // A browser is told to forget what no longer signs it in.
+    Ok(match who.carrier {
+        Carrier::Cookie => [(SET_COOKIE, crate::auth::no_session_cookie(&app))].into_response(),
+        Carrier::Bearer => ().into_response(),
+    })
 }
 
 async fn settings(State(app): State<Shared>, who: Signed) -> Answer<Json<Settings>> {
@@ -161,6 +169,15 @@ async fn file(State(app): State<Shared>, who: Signed, Path(id): Path<String>) ->
     Ok(([(CONTENT_TYPE, MIMETYPE.to_owned()), (CONTENT_DISPOSITION, disposition)], bytes).into_response())
 }
 
+async fn assets(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -> Answer<Json<Vec<String>>> {
+    blocking(move || {
+        let found = app.locate(&who, &id)?;
+        let archive = app.library.open(&found.root, &found.place)?;
+        Ok(Json(archive.names().filter_map(|name| name.strip_prefix(ASSETS)).map(str::to_owned).collect()))
+    })
+    .await
+}
+
 async fn asset(State(app): State<Shared>, who: Signed, Path((id, name)): Path<(String, String)>) -> Answer<Response> {
     let bytes = blocking(move || {
         let found = app.locate(&who, &id)?;
@@ -209,6 +226,11 @@ async fn trash(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -
 
 async fn recent(State(app): State<Shared>, who: Signed) -> Answer<Json<Vec<Entry>>> {
     blocking(move || app.recent(&who).map(Json)).await
+}
+
+/// Nothing is shared from beyond a person's spaces until documents can be shared with people.
+async fn shared(_: Signed) -> Json<Vec<Entry>> {
+    Json(Vec::new())
 }
 
 /// A document as a session reaches it.
@@ -391,5 +413,5 @@ fn entry(space: &Space, row: &Row) -> Entry {
 
 /// The routes with their state, for the server and for tests.
 pub fn router(app: Arc<App>) -> Router {
-    routes().with_state(app)
+    routes().merge(crate::auth::routes()).with_state(app)
 }

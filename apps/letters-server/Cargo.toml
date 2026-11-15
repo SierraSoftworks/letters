@@ -23,6 +23,8 @@ tokio.workspace = true
 redb.workspace = true
 cap-std.workspace = true
 toml.workspace = true
+jsonwebtoken.workspace = true
+ureq.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
@@ -33,3 +35,4 @@ jiff.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
 zip.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

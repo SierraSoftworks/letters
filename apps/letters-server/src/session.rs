@@ -140,9 +140,14 @@ pub fn carried(headers: &HeaderMap) -> Option<(Carrier, &str)> {
     if let Some(token) = text(AUTHORIZATION).and_then(|value| value.strip_prefix("Bearer ")) {
         return Some((Carrier::Bearer, token.trim()));
     }
+    cookie(headers, COOKIE_NAME).map(|token| (Carrier::Cookie, token))
+}
+
+/// The value of the cookie `name` among the ones a request carries.
+pub fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     let cookies = headers.get_all(COOKIE).into_iter().filter_map(|value| value.to_str().ok());
     let mut pairs = cookies.flat_map(|line| line.split(';')).filter_map(|pair| pair.trim().split_once('='));
-    pairs.find(|(name, _)| *name == COOKIE_NAME).map(|(_, token)| (Carrier::Cookie, token))
+    pairs.find(|(found, _)| *found == name).map(|(_, value)| value)
 }
 
 /// Whoever a request comes from, signed in. A request without a session is refused as signed out.

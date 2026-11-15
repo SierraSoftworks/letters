@@ -1,13 +1,16 @@
 //! A server over scratch folders, and people to ask it things.
 #![allow(dead_code)]
 
+pub mod idp;
+
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, ORIGIN};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, ORIGIN, SET_COOKIE};
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use letters_api::{Entry, Error, NewDocument, Person, paths};
@@ -51,8 +54,8 @@ impl Drop for Scratch {
 }
 
 /// The settings every test starts from: each person's own space, and one the `family` group edits, the
-/// `friends` group reads and the `reviewers` group comments in.
-pub fn settings(scratch: &Path) -> String {
+/// `friends` group reads and the `reviewers` group comments in. `oidc` is what else to say of the provider.
+pub fn settings(scratch: &Path, issuer: &str, oidc: &str) -> String {
     let at = scratch.display();
     format!(
         r#"
@@ -62,8 +65,9 @@ url = "{URL}"
 state = "{at}/state"
 
 [auth.oidc]
-issuer = "https://id.example.test"
+issuer = "{issuer}"
 client_id = "letters"
+{oidc}
 
 [[space]]
 name = "Home"
@@ -87,11 +91,16 @@ pub struct Server {
 }
 
 impl Server {
-    /// A server over scratch folders named for the test.
+    /// A server over scratch folders named for the test. Its provider is not there to be asked.
     pub fn new(name: &str) -> Self {
+        Self::with_provider(name, "https://id.example.test", "")
+    }
+
+    /// A server that signs people in at `issuer`, with `oidc` as its other settings for the provider.
+    pub fn with_provider(name: &str, issuer: &str, oidc: &str) -> Self {
         let scratch = Scratch::new(name);
         std::fs::create_dir_all(scratch.0.join("family")).unwrap();
-        let config = Config::parse(&settings(&scratch.0)).expect("the settings are sound");
+        let config = Config::parse(&settings(&scratch.0, issuer, oidc)).expect("the settings are sound");
         let clock = Arc::new(AtomicU64::new(START));
         let told = clock.clone();
         let app = App::new(config, Store::in_memory()).with_clock(Box::new(move || told.load(Ordering::Relaxed)));
@@ -132,6 +141,11 @@ impl Server {
         }
     }
 
+    /// A browser that has not been here before.
+    pub fn visitor(&self) -> Browser {
+        Browser { router: self.router.clone(), cookies: BTreeMap::new() }
+    }
+
     /// Someone with no session.
     pub fn stranger(&self) -> Client {
         Client {
@@ -165,6 +179,16 @@ pub struct Raw {
 impl Raw {
     pub fn header(&self, name: &str) -> &str {
         self.headers.get(name).and_then(|value| value.to_str().ok()).unwrap_or_default()
+    }
+
+    /// Where the answer sends a browser on to. Empty when it does not.
+    pub fn location(&self) -> &str {
+        if self.status.is_redirection() { self.header(LOCATION.as_str()) } else { "" }
+    }
+
+    /// The cookies the answer sets, each as it was written.
+    pub fn cookies(&self) -> Vec<&str> {
+        self.headers.get_all(SET_COOKIE).into_iter().filter_map(|value| value.to_str().ok()).collect()
     }
 
     pub fn text(&self) -> String {
@@ -227,6 +251,82 @@ impl Client {
         let new = NewDocument { folder: folder.into(), name: Some(name.into()) };
         self.post(&paths::documents(space), &new).await.expect("the document is made")
     }
+}
+
+/// A browser: it keeps the cookies it is handed, and follows nothing by itself.
+pub struct Browser {
+    router: Router,
+    pub cookies: BTreeMap<String, String>,
+}
+
+impl Browser {
+    pub async fn get(&mut self, path: &str) -> Raw {
+        self.send(Method::GET, path, "", Vec::new(), None).await
+    }
+
+    /// Sends a form, as a page that came from `origin` would.
+    pub async fn submit(&mut self, path: &str, fields: &[(&str, &str)], origin: Option<&str>) -> Raw {
+        let body = letters_server::oidc::form(fields).into_bytes();
+        self.send(Method::POST, path, "application/x-www-form-urlencoded", body, origin).await
+    }
+
+    async fn send(&mut self, method: Method, path: &str, kind: &str, body: Vec<u8>, origin: Option<&str>) -> Raw {
+        let mut request = Request::builder().method(method).uri(path);
+        if !self.cookies.is_empty() {
+            let cookies: Vec<String> = self.cookies.iter().map(|(name, value)| format!("{name}={value}")).collect();
+            request = request.header(COOKIE, cookies.join("; "));
+        }
+        if let Some(origin) = origin {
+            request = request.header(ORIGIN, origin);
+        }
+        if !kind.is_empty() {
+            request = request.header(CONTENT_TYPE, kind);
+        }
+        let response = self.router.clone().oneshot(request.body(Body::from(body)).unwrap()).await.unwrap();
+        let (parts, body) = response.into_parts();
+        let raw =
+            Raw { status: parts.status, headers: parts.headers, body: body.collect().await.unwrap().to_bytes().into() };
+        for cookie in raw.cookies() {
+            let (pair, rules) = cookie.split_once(';').unwrap_or((cookie, ""));
+            let (name, value) = pair.split_once('=').expect("a cookie has a name");
+            match rules.contains("Max-Age=0") {
+                true => self.cookies.remove(name),
+                false => self.cookies.insert(name.to_owned(), value.to_owned()),
+            };
+        }
+        raw
+    }
+
+    /// The browser's pages asking the interface, with the session the browser holds.
+    pub fn pages(&self) -> Client {
+        Client {
+            router: self.router.clone(),
+            token: self.cookies.get(COOKIE_NAME).cloned(),
+            renew: String::new(),
+            carrier: Carrier::Cookie,
+            origin: Some(URL.into()),
+        }
+    }
+}
+
+/// The fields of a query or a form, as they were before they were written into it.
+pub fn query(text: &str) -> HashMap<String, String> {
+    let unescaped = |text: &str| {
+        let (mut out, mut bytes) = (Vec::new(), text.bytes());
+        while let Some(byte) = bytes.next() {
+            match byte {
+                b'%' => {
+                    let hex: Vec<u8> = bytes.by_ref().take(2).collect();
+                    out.push(u8::from_str_radix(std::str::from_utf8(&hex).unwrap(), 16).unwrap());
+                }
+                b'+' => out.push(b' '),
+                byte => out.push(byte),
+            }
+        }
+        String::from_utf8(out).unwrap()
+    };
+    let pairs = text.split('&').filter_map(|pair| pair.split_once('='));
+    pairs.map(|(name, value)| (unescaped(name), unescaped(value))).collect()
 }
 
 /// The names of some rows, in their order.
