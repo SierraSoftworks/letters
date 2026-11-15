@@ -10,7 +10,7 @@
 
 # The launch here is of a window, on a display in memory with the CPU renderer. The others launch headless.
 [ubuntu-latest]
-launch_ms = 80
+launch_ms = 50
 keystroke_median_ms = 2.3
 keystroke_p99_ms = 6
 
