@@ -25,6 +25,7 @@ server that adds identity, sharing and sync without owning any content.
 
 ```sh
 ./scripts/check.sh   # format, lint, test and the wasm build
+./scripts/budgets.sh # the launch and keystroke budgets, on a release build
 ./scripts/fuzz       # names the fuzz targets, and runs one under AFL++ when given its name
 ```
 

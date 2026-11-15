@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Each night: the platforms a push does not wait for, on caches this run also keeps from lapsing.
+  schedule:
+    - cron: "43 3 * * *"
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: Also build, test and measure on macOS and Windows
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Pushes to main come minutes apart. One run at a time, and of those waiting only the newest: every run
+# checks main as it stands, and none is cut off half way.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing here reads debug info: a failed test names its line without it.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  # The gate of scripts/check.sh, its steps side by side.
+  gate:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Lint
+            steps: fmt lint
+          - name: Test
+            steps: test
+          - name: Wasm
+            steps: wasm
+    steps:
+      - uses: actions/checkout@v7
+
+      # The version rust-toolchain.toml pins, with its components and targets.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: ${{ matrix.name }}
+        run: ./scripts/check.sh ${{ matrix.steps }}
+
+  # The launch and keystroke budgets, on a release build.
+  budgets:
+    name: Budgets
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: budgets
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check budgets
+        shell: bash
+        run: |
+          ./scripts/budgets.sh ubuntu-latest | tee budgets.txt
+          { echo '```text'; cat budgets.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+
+  # macOS and Windows cost several times what Linux does, so they run each night and when asked for, not on
+  # every push.
+  platforms:
+    name: ${{ matrix.name }}
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.platforms)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+          - name: Windows
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test
+        shell: bash
+        run: ./scripts/check.sh test
+
+      - name: Check budgets
+        shell: bash
+        run: |
+          ./scripts/budgets.sh ${{ matrix.os }} | tee budgets.txt
+          { echo '```text'; cat budgets.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
