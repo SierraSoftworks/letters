@@ -19,6 +19,7 @@ server that adds identity, sharing and sync without owning any content.
 - `crates/letters-test`: the headless interaction-test harness.
 - `apps/letters`: the desktop app.
 - `apps/letters-web`: the browser shell, which paints the same engine on a canvas.
+- `apps/letters-server`: the server, which shares folders of documents with the people an identity provider names.
 - `fuzz`: the fuzz targets, which a nightly workflow runs and files issues from.
 
 ## Working on it

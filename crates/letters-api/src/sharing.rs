@@ -8,8 +8,7 @@ pub enum Role {
     /// Reads, and writes comments.
     Commenter,
     Editor,
-    /// Edits, and says who else may. A document in a person's own space is theirs, and one in a shared
-    /// space belongs to the space's editors.
+    /// Edits, and says who else may. A document in a person's own space is theirs.
     Owner,
 }
 

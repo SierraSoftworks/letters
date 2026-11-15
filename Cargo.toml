@@ -133,6 +133,20 @@ objc2 = "0.5"
 objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSData", "NSGeometry", "NSString", "NSThread"] }
 objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSButton", "NSControl", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSToolbar", "NSView", "NSWindow"] }
 
+# The server. None of these may reach the core crates.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query", "json", "form"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
+# The state directory: one file, in Rust alone, with no server of its own.
+redb = "4"
+# Opens files beneath a folder and nowhere else, whatever a path or a symlink says.
+cap-std = "4"
+# Checks the identity provider's signature on an ID token, in Rust alone.
+jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"] }
+toml = "1"
+# Drives the server's routes in its tests with no socket between.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+http-body-util = "0.1"
+
 # The browser shell. The command-line `wasm-bindgen` must be the version the lock file names.
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
