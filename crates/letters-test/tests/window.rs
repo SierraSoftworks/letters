@@ -1,8 +1,8 @@
 //! The editor's window, as a shell shows it: the page, the top bar and the side panel.
 
-use accesskit::{Action, ActionData, ActionRequest, TextPosition, TextSelection, TreeId};
+use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, Toggled, TreeId, TreeUpdate};
 use letters_editor::InputEvent;
-use letters_model::{Align, Block, BlockKind, Document, Pos, Selection, Style, TextStyle};
+use letters_model::{Align, Block, BlockKind, Document, ListKind, Pos, Selection, Style, TextStyle};
 use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
 use letters_ui::{Chrome, Cursor, Edge, Folder, Frame, Landing, Location, Recent, Request, SaveState, WindowButton};
@@ -873,6 +873,101 @@ fn a_screen_reader_reads_the_document_and_edits_it() {
     assert_eq!(selected(&window), "Harland");
     window.ask(ask(Action::ReplaceSelectedText, ActionData::Value("Hartley".into())));
     assert_eq!(block_text(&window, "p1"), "Hartley Roofing sent a quote.");
+}
+
+/// The document as a screen reader walks it under the page: each node's role and what it says, set in by
+/// how deep it is.
+fn read(update: &TreeUpdate) -> Vec<String> {
+    fn walk(update: &TreeUpdate, id: NodeId, depth: usize, out: &mut Vec<String>) {
+        let node = &update.nodes.iter().find(|(node, _)| *node == id).expect("a node the tree lists").1;
+        let ticked = node.toggled().map(|toggled| if toggled == Toggled::True { "ticked" } else { "unticked" });
+        let says = [node.label(), node.value().map(str::trim_end), ticked].into_iter().flatten();
+        let line = [format!("{:?}", node.role())].into_iter().chain(says.map(str::to_owned)).collect::<Vec<_>>();
+        out.push(format!("{}{}", "  ".repeat(depth), line.join(" ")));
+        node.children().iter().for_each(|child| walk(update, *child, depth + 1, out));
+    }
+    let page = update.nodes.iter().find(|(_, node)| node.role() == Role::Document).expect("the page");
+    let mut out = Vec::new();
+    page.1.children().iter().for_each(|child| walk(update, *child, 0, &mut out));
+    out
+}
+
+/// Two bullets with one more inside the first, a numbered step, two tasks and a figure.
+fn shopping() -> Harness {
+    let item = |id: &str, list, depth, words: &str| text(id, BlockKind::ListItem { list, depth }, words);
+    let figure = BlockKind::Figure {
+        asset: None,
+        src: Some("https://example.com/roof.png".into()),
+        alt: "A slate roof".into(),
+        width: 300.0,
+        height: 200.0,
+        numbered: false,
+    };
+    let blocks = vec![
+        item("a", ListKind::Bullet, 0, "Slates"),
+        item("b", ListKind::Bullet, 1, "Welsh"),
+        item("c", ListKind::Bullet, 0, "Nails"),
+        item("d", ListKind::Ordered, 0, "Strip"),
+        item("e", ListKind::Task { checked: false }, 0, "Order"),
+        item("f", ListKind::Task { checked: true }, 0, "Measure"),
+        text("g", figure, "The roof today"),
+    ];
+    Harness::open(Document { blocks, ..Document::default() })
+}
+
+#[test]
+fn a_screen_reader_finds_lists_ticks_and_pictures_as_what_they_are() {
+    let mut window = shopping();
+    window.ui().select(Selection::caret(Pos::new("a", 2)));
+    let tree = window.ui().access();
+    let expected = [
+        "List",
+        "  ListItem",
+        "    TextRun Slates",
+        "    List",
+        "      ListItem",
+        "        TextRun Welsh",
+        "  ListItem",
+        "    TextRun Nails",
+        "List",
+        "  ListItem",
+        "    TextRun Strip",
+        "List",
+        "  ListItem",
+        "    CheckBox unticked",
+        "    TextRun Order",
+        "  ListItem",
+        "    CheckBox ticked",
+        "    TextRun Measure",
+        "Figure",
+        "  Image A slate roof",
+        "  TextRun The roof today",
+    ];
+    assert_eq!(read(&tree), expected);
+
+    // A click on a tick ticks its task, and leaves the caret where the writer has it.
+    let tick = tree.nodes.iter().find(|(_, node)| node.role() == Role::CheckBox).expect("a tick").0;
+    window.ask(ActionRequest { action: Action::Click, target_tree: TreeId::ROOT, target_node: tick, data: None });
+    let ticked = |window: &Harness, id: &str| window.editor().doc().block(&id.into()).map(|block| block.kind.clone());
+    assert!(matches!(ticked(&window, "e"), Some(BlockKind::ListItem { list: ListKind::Task { checked: true }, .. })));
+    assert_eq!(head(&window), Pos::new("a", 2));
+}
+
+#[test]
+fn a_key_typed_in_a_long_document_tells_a_screen_reader_of_its_block_alone() {
+    // What the tree says of the letter's lines.
+    let lines = |update: &TreeUpdate| {
+        let said = update.nodes.iter().filter_map(|(_, node)| node.value().map(str::to_owned));
+        said.filter(|said| said.contains("line of the letter")).collect::<Vec<_>>()
+    };
+    let mut window = long();
+    window.ui().select(Selection::caret(Pos::new("p3", 0)));
+    assert_eq!(lines(&window.ui().access()).len(), 200, "one that starts to listen is told all of it");
+    window.type_text("x");
+    assert_eq!(lines(&window.ui().access_changes()), ["xOne more line of the letter.\n"]);
+    window.key("Right");
+    assert_eq!(lines(&window.ui().access_changes()), [""; 0], "the caret moves with nothing told again");
+    assert_eq!(lines(&window.ui().access()).len(), 200, "and one that starts later is told all of it too");
 }
 
 #[test]

@@ -3,6 +3,7 @@
 //! [`Window`] is what a shell shows and the test harness drives. The page is a canvas holding what the
 //! document's layout painted for the part in view. Everything around it is made of the toolkit's widgets.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
@@ -416,6 +417,8 @@ pub struct EditorApp {
     spelling: Spelling,
     dragging: bool,
     maths: Maths,
+    /// How the document read when assistive technology was last told of it.
+    told: RefCell<describe::Told>,
 }
 
 impl EditorApp {
@@ -458,6 +461,7 @@ impl EditorApp {
             spelling: Spelling::default(),
             dragging: false,
             maths: Maths::default(),
+            told: RefCell::default(),
         }
     }
 
@@ -1692,8 +1696,9 @@ impl App for EditorApp {
         used || link
     }
 
-    fn describe(&self, page: &mut AccessNode, nodes: &mut Vec<(NodeId, AccessNode)>) {
-        describe::page(self.editor.doc(), self.editor.selection(), page, nodes);
+    fn describe(&self, page: &mut AccessNode, nodes: &mut Vec<(NodeId, AccessNode)>, whole: bool) {
+        let told = &mut self.told.borrow_mut();
+        describe::page(self.editor.doc(), self.editor.selection(), told, whole, page, nodes);
     }
 
     fn access_action(&mut self, request: &ActionRequest, platform: &mut dyn Platform) {
@@ -1705,6 +1710,16 @@ impl App for EditorApp {
             }
             Some(describe::Request::Replace(text)) => {
                 self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(text), platform));
+            }
+            Some(describe::Request::Tick(block)) => {
+                // The editor ticks the task the caret is in, and the caret is not the reader's to lose.
+                let held = self.editor.selection().cloned();
+                self.editor.select(Selection::caret(Pos::new(block, 0)));
+                self.edit(platform, |editor, platform| editor.run(Command::ToggleChecked, platform));
+                if let Some(held) = held {
+                    self.editor.select(held);
+                    self.mark();
+                }
             }
             None => {}
         }

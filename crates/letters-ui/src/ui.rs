@@ -69,7 +69,10 @@ pub trait App {
 
     /// Fills in the accessibility node of a canvas and adds the nodes under it: what the app draws there
     /// itself, such as a document's blocks.
-    fn describe(&self, _canvas: &mut AccessNode, _nodes: &mut Vec<(NodeId, AccessNode)>) {}
+    ///
+    /// With `whole` unset, only what differs from the last time it was described has to be added: the nodes
+    /// left out stay as assistive technology knows them.
+    fn describe(&self, _canvas: &mut AccessNode, _nodes: &mut Vec<(NodeId, AccessNode)>, _whole: bool) {}
 
     /// A request from assistive technology for a canvas or a node described under one.
     fn access_action(&mut self, _request: &ActionRequest, _platform: &mut dyn Platform) {}
@@ -383,6 +386,17 @@ impl<A: App> Ui<A> {
 
     /// The whole accessibility tree.
     pub fn access(&mut self) -> TreeUpdate {
+        self.described(true)
+    }
+
+    /// The accessibility tree as an update for whoever was last given it, whole or as changes: of what the
+    /// app describes under a canvas, such as a document's blocks, only what differs since then. On a long
+    /// document this is far less to make, and to read, than the whole tree.
+    pub fn access_changes(&mut self) -> TreeUpdate {
+        self.described(false)
+    }
+
+    fn described(&mut self, whole: bool) -> TreeUpdate {
         self.refresh();
         self.update_tip();
         let title = self.app.title();
@@ -393,7 +407,7 @@ impl<A: App> Ui<A> {
             focus: self.focus,
             inputs: &self.inputs,
             tip: self.tip.as_ref().map(|tip| (tip.text.as_str(), tip.rect)),
-            describe: &|node, nodes| self.app.describe(node, nodes),
+            describe: &|node, nodes| self.app.describe(node, nodes, whole),
         };
         access::build(&self.tree, &window)
     }

@@ -8,7 +8,7 @@
 use std::rc::Rc;
 
 use accesskit::{ActionRequest, Toggled};
-use accesskit_consumer::{NodeRef, Tree};
+use accesskit_consumer::{NodeRef, Tree, TreeChangeHandler};
 use letters_editor::{Clip, Editor, InputEvent, Key, KeyEvent, Modifiers, Platform};
 use letters_model::{Document, Pos, ReplicaId, Selection};
 use letters_render::{DisplayList, Point, Rect, Size};
@@ -99,6 +99,19 @@ impl Found {
 pub struct Harness<A: App = EditorApp> {
     ui: Ui<A>,
     pub platform: TestPlatform,
+    /// The accessibility tree as a screen reader holds it: given whole once, and kept up by changes for as
+    /// long as the harness alone has asked the window for them.
+    heard: Option<Tree>,
+}
+
+/// Takes the changes to the tree without a word, as the harness only reads how it stands.
+struct Unheard;
+
+impl TreeChangeHandler for Unheard {
+    fn node_added(&mut self, _node: &NodeRef) {}
+    fn node_updated(&mut self, _old_node: &NodeRef, _new_node: &NodeRef) {}
+    fn focus_moved(&mut self, _old_node: Option<&NodeRef>, _new_node: Option<&NodeRef>) {}
+    fn node_removed(&mut self, _node: &NodeRef) {}
 }
 
 impl<A: App> Harness<A> {
@@ -111,7 +124,7 @@ impl<A: App> Harness<A> {
     pub fn with(mut ui: Ui<A>) -> Self {
         ui.resize(WINDOW, 1.0);
         ui.set_keys(Keys::Standard);
-        Self { ui, platform: TestPlatform::default() }
+        Self { ui, platform: TestPlatform::default(), heard: None }
     }
 
     /// The same window under macOS key conventions.
@@ -126,6 +139,8 @@ impl<A: App> Harness<A> {
 
     /// The window itself, for calls the harness has no shorthand for.
     pub fn ui(&mut self) -> &mut Ui<A> {
+        // The caller may ask for the tree too, and the changes after that would not add up to it here.
+        self.heard = None;
         &mut self.ui
     }
 
@@ -149,9 +164,17 @@ impl<A: App> Harness<A> {
             out.push(Found::of(&node));
             node.children().for_each(|child| walk(child, out));
         }
-        let tree = Tree::new(self.ui.access(), true);
+        // A screen reader is given the tree whole once and the changes from then on, and so is this one.
+        let tree = match self.heard.take() {
+            Some(mut tree) => {
+                tree.update_and_process_changes(self.ui.access_changes(), &mut Unheard);
+                tree
+            }
+            None => Tree::new(self.ui.access(), true),
+        };
         let mut out = Vec::new();
         walk(tree.state().root(), &mut out);
+        self.heard = Some(tree);
         out
     }
 

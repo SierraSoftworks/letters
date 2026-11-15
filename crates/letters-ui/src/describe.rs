@@ -1,29 +1,75 @@
 //! The document as accessibility nodes under the page, and assistive technology's requests as edits.
 //!
 //! Each block is a node of its role, and a text block holds one text run whose characters are Unicode scalar
-//! values. The page's own node carries the selection.
+//! values. List items that follow one another stand under a list, a task's tick is a checkbox and a figure's
+//! picture an image named by its alt text. The page's own node carries the selection.
+//!
+//! A long document is not told again for every key: [`Told`] remembers how each block read, and a block that
+//! still reads the same is left out when only the changes are asked for.
+
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::mem;
 
 use accesskit::{Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection, Toggled};
 use letters_model::{Block, BlockId, BlockKind, Body, Document, ListKind, Pos, Selection};
 
+/// The parts of a block that have nodes of their own, beside its text.
+const LIST: u8 = 1;
+const TICK: u8 = 2;
+const PICTURE: u8 = 3;
+
+/// FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
+fn hashed(bytes: impl Iterator<Item = u8>) -> u64 {
+    bytes.fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+}
+
 /// A block's node. Its text run, if it has one, is the next id up.
 fn block_node(id: &BlockId) -> NodeId {
-    // FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
-    let hash = id
-        .as_str()
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3));
-    NodeId(hash & !1)
+    NodeId(hashed(id.as_str().bytes()) & !1)
 }
 
 fn run_node(id: &BlockId) -> NodeId {
     NodeId(block_node(id).0 | 1)
 }
 
-/// Fills in the page's node and adds the blocks under it.
-pub(crate) fn page(doc: &Document, selection: Option<&Selection>, page: &mut Node, nodes: &mut Vec<(NodeId, Node)>) {
+/// The node of a part of a block: the list it begins, its tick or its picture.
+fn part_node(id: &BlockId, part: u8) -> NodeId {
+    // No id holds a byte of 0xff, so no block's own node is this one.
+    NodeId(hashed(id.as_str().bytes().chain([0xff, part])) & !1)
+}
+
+/// How each block read when assistive technology was last told of it.
+#[derive(Default)]
+pub(crate) struct Told(HashMap<NodeId, u64>);
+
+/// One telling of the document: what is told, and what it is told against.
+struct Telling<'a> {
+    /// How the blocks read before, when only those that read differently are wanted.
+    before: Option<&'a HashMap<NodeId, u64>>,
+    now: HashMap<NodeId, u64>,
+    nodes: &'a mut Vec<(NodeId, Node)>,
+}
+
+impl Telling<'_> {
+    /// Notes how a node reads now. Returns whether it has to be told: it is new, or read otherwise before.
+    fn differs(&mut self, id: NodeId, reads: u64) -> bool {
+        self.now.insert(id, reads);
+        self.before.is_none_or(|before| before.get(&id) != Some(&reads))
+    }
+}
+
+/// Fills in the page's node and adds the blocks under it: all of them when `whole` is set, and otherwise
+/// those that read differently than `told` has them.
+pub(crate) fn page(
+    doc: &Document,
+    selection: Option<&Selection>,
+    told: &mut Told,
+    whole: bool,
+    page: &mut Node,
+    nodes: &mut Vec<(NodeId, Node)>,
+) {
     page.set_language(doc.language.as_str());
-    page.set_children(doc.blocks.iter().map(|block| block_node(&block.id)).collect::<Vec<_>>());
     for action in [Action::SetTextSelection, Action::ReplaceSelectedText] {
         page.add_action(action);
     }
@@ -36,12 +82,82 @@ pub(crate) fn page(doc: &Document, selection: Option<&Selection>, page: &mut Nod
     {
         page.set_text_selection(TextSelection { anchor, focus });
     }
-    for block in &doc.blocks {
-        push_block(block, nodes);
+    let before = mem::take(&mut told.0);
+    let mut telling = Telling { before: (!whole).then_some(&before), now: HashMap::with_capacity(before.len()), nodes };
+    page.set_children(push_blocks(&doc.blocks, &mut telling));
+    told.0 = telling.now;
+}
+
+/// A list item's depth and which kind of list it is in. A task belongs with its list ticked or not.
+fn item(block: &Block) -> Option<(u8, mem::Discriminant<ListKind>)> {
+    match &block.kind {
+        BlockKind::ListItem { list, depth } => Some((*depth, mem::discriminant(list))),
+        _ => None,
     }
 }
 
-fn push_block(block: &Block, nodes: &mut Vec<(NodeId, Node)>) {
+/// Adds blocks that stand side by side, and returns the nodes that stand for them under their parent: each
+/// block's own, but for list items, which stand under a list.
+fn push_blocks(blocks: &[Block], telling: &mut Telling) -> Vec<NodeId> {
+    let mut children = Vec::new();
+    let mut at = 0;
+    while let Some(block) = blocks.get(at) {
+        if item(block).is_some() {
+            children.push(push_list(blocks, &mut at, telling));
+        } else {
+            children.push(push_block(block, Vec::new(), telling));
+            at += 1;
+        }
+    }
+    children
+}
+
+/// Adds the list that the item at `at` begins, and moves `at` past it. The list holds the items of the
+/// first one's depth and kind that follow it, and each item holds the deeper lists that follow it.
+fn push_list(blocks: &[Block], at: &mut usize, telling: &mut Telling) -> NodeId {
+    let first = &blocks[*at];
+    let (kind, depth) = (item(first), item(first).map_or(0, |item| item.0));
+    let mut items = Vec::new();
+    while let Some(block) = blocks.get(*at).filter(|block| item(block) == kind) {
+        *at += 1;
+        let mut inner = Vec::new();
+        while blocks.get(*at).and_then(item).is_some_and(|item| item.0 > depth) {
+            inner.push(push_list(blocks, at, telling));
+        }
+        items.push(push_block(block, inner, telling));
+    }
+    let id = part_node(&first.id, LIST);
+    let mut reads = DefaultHasher::new();
+    items.hash(&mut reads);
+    if telling.differs(id, reads.finish()) {
+        let mut list = Node::new(Role::List);
+        list.set_children(items);
+        telling.nodes.push((id, list));
+    }
+    id
+}
+
+/// Adds a block and what is under it, with the lists `inner` inside it, and returns its node.
+fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeId {
+    let id = block_node(&block.id);
+    // What is under the block is gone through whether or not the block itself reads as before.
+    let under = push_blocks(block.body.blocks(), telling);
+    let mut reads = DefaultHasher::new();
+    mem::discriminant(&block.kind).hash(&mut reads);
+    match &block.kind {
+        BlockKind::Heading { level } => level.hash(&mut reads),
+        BlockKind::ListItem { list, depth } => {
+            (depth, matches!(list, ListKind::Task { checked: true })).hash(&mut reads)
+        }
+        BlockKind::Figure { alt, .. } => alt.hash(&mut reads),
+        _ => {}
+    }
+    block.body.runs().iter().for_each(|run| run.text.hash(&mut reads));
+    (&under, &inner).hash(&mut reads);
+    if !telling.differs(id, reads.finish()) {
+        return id;
+    }
+
     let mut node = Node::new(match &block.kind {
         BlockKind::Paragraph => Role::Paragraph,
         BlockKind::Heading { .. } => Role::Heading,
@@ -59,37 +175,47 @@ fn push_block(block: &Block, nodes: &mut Vec<(NodeId, Node)>) {
         BlockKind::TableCell => Role::Cell,
         BlockKind::Unknown { .. } => Role::Unknown,
     });
+    let mut children = Vec::new();
+    let mut part = |part: u8, node: Node, children: &mut Vec<NodeId>| {
+        telling.nodes.push((part_node(&block.id, part), node));
+        children.push(part_node(&block.id, part));
+    };
     match &block.kind {
         BlockKind::Heading { level } => node.set_level(usize::from(*level)),
         BlockKind::ListItem { list, depth } => {
             node.set_level(usize::from(*depth) + 1);
             if let ListKind::Task { checked } = list {
-                node.set_toggled(if *checked { Toggled::True } else { Toggled::False });
+                // The tick is a checkbox of its own, which a click ticks.
+                let mut tick = Node::new(Role::CheckBox);
+                tick.set_toggled(if *checked { Toggled::True } else { Toggled::False });
+                tick.add_action(Action::Click);
+                part(TICK, tick, &mut children);
             }
+        }
+        BlockKind::Figure { alt, .. } => {
+            // The picture comes before its caption, named by what it shows.
+            let mut picture = Node::new(Role::Image);
+            picture.set_label(alt.as_str());
+            part(PICTURE, picture, &mut children);
         }
         _ => {}
     }
-    match &block.body {
-        Body::Text(_) => {
-            // The line break that ends the block counts as its last character.
-            let mut text = block.plain_text();
-            text.push('\n');
-            let mut run = Node::new(Role::TextRun);
-            run.set_character_lengths(text.chars().map(|c| c.len_utf8() as u8).collect::<Vec<_>>());
-            run.set_word_starts(word_starts(&text));
-            run.set_value(text);
-            node.set_children([run_node(&block.id)]);
-            nodes.push((run_node(&block.id), run));
-        }
-        Body::Blocks(children) => {
-            node.set_children(children.iter().map(|child| block_node(&child.id)).collect::<Vec<_>>());
-            for child in children {
-                push_block(child, nodes);
-            }
-        }
-        Body::None => {}
+    if let Body::Text(_) = &block.body {
+        // The line break that ends the block counts as its last character.
+        let mut text = block.plain_text();
+        text.push('\n');
+        let mut run = Node::new(Role::TextRun);
+        run.set_character_lengths(text.chars().map(|c| c.len_utf8() as u8).collect::<Vec<_>>());
+        run.set_word_starts(word_starts(&text));
+        run.set_value(text);
+        children.push(run_node(&block.id));
+        telling.nodes.push((run_node(&block.id), run));
     }
-    nodes.push((block_node(&block.id), node));
+    children.extend(under);
+    children.extend(inner);
+    node.set_children(children);
+    telling.nodes.push((id, node));
+    id
 }
 
 /// The character index at which each word starts. Whitespace belongs to the word before it.
@@ -112,6 +238,8 @@ pub(crate) enum Request {
     Select(Selection),
     /// Replaces the selection with text.
     Replace(String),
+    /// Ticks or unticks a task.
+    Tick(BlockId),
 }
 
 pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request> {
@@ -126,6 +254,10 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
             Some(Request::Select(Selection { anchor: pos(&selection.anchor)?, head: pos(&selection.focus)? }))
         }
         (Action::ReplaceSelectedText, Some(ActionData::Value(text))) => Some(Request::Replace(text.to_string())),
+        (Action::Click, _) => {
+            let ticked = doc.walk().find(|block| part_node(&block.id, TICK) == request.target_node)?;
+            Some(Request::Tick(ticked.id.clone()))
+        }
         _ => None,
     }
 }
