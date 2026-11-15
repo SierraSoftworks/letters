@@ -150,6 +150,9 @@ struct Seated {
     signed: String,
     /// The name the person signs in with, for the log.
     person: String,
+    /// Whether a share had a say in what the session may do. Such a session joins again when the
+    /// document's shares change.
+    lent: bool,
 }
 
 /// One device's place in a room. Dropping it leaves the room.
@@ -337,6 +340,16 @@ impl Rooms {
             let theirs = |(session, seated): (&SessionId, &Seated)| (seated.signed == signed).then_some(*session);
             let theirs: Vec<SessionId> = hosted.seats.iter().filter_map(theirs).collect();
             theirs.into_iter().for_each(|session| hosted.room.dismiss(session, Ended::SignedOut));
+        });
+    }
+
+    /// Ends every session in the room of a file that a share had a say in, as the file's shares change.
+    /// Each joins again at once, and is seated as its share lets it now, or not at all.
+    pub fn reseat(&self, root: &Root, place: &Place) {
+        self.if_open(&key(root, place), |hosted, _| {
+            let lent = |(session, seated): (&SessionId, &Seated)| seated.lent.then_some(*session);
+            let lent: Vec<SessionId> = hosted.seats.iter().filter_map(lent).collect();
+            lent.into_iter().for_each(|session| hosted.room.dismiss(session, Ended::AccessChanged));
         });
     }
 
@@ -776,7 +789,8 @@ impl App {
 
     /// Seats `who` in the room of a document they were found to reach.
     fn seat(self: &Arc<Self>, who: &Signed, found: &Found) -> Answer<(Seat, mpsc::Receiver<Out>)> {
-        let access = Access { role: may(found.space.role), name: self.signs_as(who)? };
+        let access = Access { role: may(found.role), name: self.signs_as(who)? };
+        let lent = found.space.as_ref().is_none_or(|space| space.role < found.role);
         let (to, from) = mpsc::channel(BACKLOG);
         let (signed, person) = (who.session.clone(), who.person.username.clone());
         let (open, session) = self.rooms.within(self, &found.root, &found.place, |hosted, now| {
@@ -784,7 +798,7 @@ impl App {
                 return Err(Refusal::not_found());
             }
             let session = hosted.room.join(access, now);
-            hosted.seats.insert(session, Seated { to, signed, person });
+            hosted.seats.insert(session, Seated { to, signed, person, lent });
             Ok(session)
         })?;
         Ok((Seat { app: self.clone(), open, session, left: false }, from))

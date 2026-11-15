@@ -7,6 +7,7 @@
 //! - [`spaces`] is the only way to a file, and cannot leave a space's folder.
 //! - [`library`] lists a space and finds a document by its id, wherever its file was moved to.
 //! - [`api`] answers the interface `letters_api` lays down.
+//! - [`shares`] is who reaches a document besides those its space lets in.
 //! - [`fetch`] is what the server fetches for a document from elsewhere: a linked picture, a link's page.
 //! - [`rooms`] are the documents that are open now, and [`socket`] is each device's line to one.
 //! - [`pages`] are the server's own pages for a browser: the documents a person reaches, one to read, and
@@ -26,6 +27,7 @@ pub mod oidc;
 pub mod pages;
 pub mod rooms;
 pub mod session;
+pub mod shares;
 pub mod socket;
 pub mod spaces;
 pub mod store;
@@ -34,7 +36,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::serve::ListenerExt;
-use letters_api::{Role, Space};
+use letters_api::{Person, Role, Space};
 
 use crate::config::Config;
 use crate::error::{Answer, Refusal};
@@ -118,21 +120,32 @@ impl App {
     }
 }
 
+/// A folder the server knows of, open.
+pub(crate) struct Rooted<'a> {
+    pub space: &'a config::Space,
+    /// Whose it is, when it is one person's own.
+    pub whose: Option<Person>,
+    pub root: Root,
+}
+
 impl App {
-    /// Every folder the server knows of, each with its space's name: the shared spaces, and the own space
-    /// of everyone who has signed in. One that cannot be opened is said and passed over.
-    fn folders(&self) -> Vec<(&str, Root)> {
+    /// Every folder the server knows of: the shared spaces, and the own space of everyone who has signed
+    /// in. One that cannot be opened is said and passed over, and so is the own space of someone who
+    /// has not come to it yet, which is no fault.
+    pub(crate) fn folders(&self) -> Vec<Rooted<'_>> {
         let people = self.store.under(&session::PEOPLE, "").unwrap_or_default();
-        let names: Vec<String> = people.into_iter().map(|(_, seen)| seen.person.username).collect();
+        let people: Vec<Person> = people.into_iter().map(|(_, seen)| seen.person).collect();
         let mut roots = Vec::new();
         for space in &self.config.spaces {
-            let folders: Vec<String> = match space.personal() {
-                true => names.iter().filter(|name| spaces::username_ok(name)).map(|name| space.folder(name)).collect(),
-                false => vec![space.folder("")],
+            let own = people.iter().filter(|person| spaces::username_ok(&person.username));
+            let folders: Vec<(String, Option<Person>)> = match space.personal() {
+                true => own.map(|person| (space.folder(&person.username), Some(person.clone()))).collect(),
+                false => vec![(space.folder(""), None)],
             };
-            for folder in folders {
+            for (folder, whose) in folders {
                 match Root::open(&folder, false) {
-                    Ok(root) => roots.push((space.name.as_str(), root)),
+                    Ok(root) => roots.push(Rooted { space, whose, root }),
+                    Err(error) if whose.is_some() && error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => log(&format!("the space \"{}\" could not be opened: {error}", space.name)),
                 }
             }
@@ -142,15 +155,15 @@ impl App {
 
     /// Every folder the server knows of that can be opened now.
     pub fn roots(&self) -> Vec<Root> {
-        self.folders().into_iter().map(|(_, root)| root).collect()
+        self.folders().into_iter().map(|rooted| rooted.root).collect()
     }
 
     /// Reads every folder the server knows of into the index. One that cannot be read is said and passed
     /// over.
     pub fn scan(&self) {
-        for (space, root) in self.folders() {
+        for Rooted { space, root, .. } in self.folders() {
             if let Err(refusal) = self.library.scan(&self.store, &root) {
-                log(&format!("the space \"{space}\" could not be scanned: {}", refusal.0));
+                log(&format!("the space \"{}\" could not be scanned: {}", space.name, refusal.0));
             }
         }
     }

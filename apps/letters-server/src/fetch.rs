@@ -25,6 +25,7 @@ use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use ureq::{Agent, Error};
 
 use crate::App;
+use crate::api::Found;
 use crate::error::{Answer, Refusal};
 use crate::session::Signed;
 use crate::store::Table;
@@ -146,14 +147,26 @@ impl App {
         })?)
     }
 
+    /// Whether `who` trusts the document `id`, which they were found to reach. One in a space of theirs is
+    /// vouched for by whoever let them into the space. One that only a share leads to is in safe mode
+    /// until they say they trust it.
+    pub fn trusts(&self, who: &Signed, found: &Found, id: &str) -> Answer<bool> {
+        if found.space.is_some() {
+            return Ok(true);
+        }
+        let trusted = self.store.get(&TRUSTED, &who.person.id)?.unwrap_or_default();
+        Ok(trusted.documents.iter().any(|document| document == id))
+    }
+
     /// Starts a fetch for the document `id` as `who` may: `start` asks the document's gate for it.
     fn guarded<T>(&self, who: &Signed, id: &str, start: impl FnOnce(&Gate) -> Result<T, FetchError>) -> Answer<T> {
-        self.locate(who, id)?;
+        let found = self.locate(who, id)?;
         let sources = self.config.sources().unwrap_or_default();
-        // A document in a space the person reaches is vouched for by whoever let them in. What a person
-        // trusts by themselves adds no source: only the owner's sources reach into the owner's network.
+        // What a person trusts by themselves adds no source: only the owner's sources reach into the
+        // owner's network.
+        let origin = if self.trusts(who, &found, id)? { Origin::Created } else { Origin::Outside };
         let trust = Trust::default();
-        let gate = trust.gate(id, Origin::Created).on_server(&sources);
+        let gate = trust.gate(id, origin).on_server(&sources);
         Ok(start(&gate).map_err(Failed::Refused)?)
     }
 

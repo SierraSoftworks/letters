@@ -29,6 +29,9 @@ pub const SPACES: &str = "/api/v1/spaces";
 pub const RECENT: &str = "/api/v1/recent";
 /// `GET`: the documents shared with the person from beyond their spaces, as [`Entry`](crate::Entry)s.
 pub const SHARED: &str = "/api/v1/shared";
+/// `GET`: who a document can be shared with, as [`Grantee`](crate::Grantee)s: everyone else who has signed
+/// in to the server, and then the groups it has heard of.
+pub const PEOPLE: &str = "/api/v1/people";
 /// `GET`: the sources the server itself fetches pictures and previews from, as a list of addresses.
 pub const SOURCES: &str = "/api/v1/trust/sources";
 
@@ -128,17 +131,22 @@ pub fn trust(id: &str) -> String {
     format!("{}/trust", document(id))
 }
 
-/// `GET`: the document's [`Shares`](crate::Shares). `PUT` them: replaces its people.
+/// `GET`: the document's [`Shares`](crate::Shares), for whoever says who it is shared with. Anyone else is
+/// refused as [`Code::Forbidden`](crate::Code::Forbidden).
+///
+/// `PUT` a [`Shares`](crate::Shares): its people are all the document's people from here on, and its links
+/// are not read. Answers the shares as they then are, people and links.
 pub fn shares(id: &str) -> String {
     format!("{}/shares", document(id))
 }
 
-/// `POST` a [`NewLink`](crate::NewLink): a [`CreatedLink`](crate::CreatedLink).
+/// `POST` a [`NewLink`](crate::NewLink): a [`CreatedLink`](crate::CreatedLink), the one time the link's
+/// address is told. A server makes links only when its [`Server::links`](crate::Server::links) says so.
 pub fn links(id: &str) -> String {
     format!("{}/links", document(id))
 }
 
-/// `DELETE`: revokes the link with this [`Link::id`](crate::Link::id).
+/// `DELETE`: revokes the link with this [`Link::id`](crate::Link::id). Answers with no body.
 pub fn link(id: &str, link: &str) -> String {
     format!("{}/links/{}", document(id), segment(link))
 }

@@ -35,6 +35,7 @@ use crate::api::blocking;
 use crate::auth::{Desktop, browser};
 use crate::error::{Answer, Refusal};
 use crate::session::Signed;
+use crate::shares::may_share;
 use crate::spaces::{Place, seconds, shown};
 use crate::{App, Shared};
 
@@ -56,6 +57,8 @@ pub const ACT_MOVE: &str = "/act/move";
 pub const ACT_TRASH: &str = "/act/trash";
 pub const ACT_MERGE: &str = "/act/merge-conflicts";
 pub const ACT_PUT_BACK: &str = "/act/put-back";
+pub const ACT_SHARE: &str = "/act/share";
+pub const ACT_UNSHARE: &str = "/act/unshare";
 
 /// How many folders a document is offered to be moved to. A space with more is tidied in the editor's own
 /// file dialogs or on the disk.
@@ -226,7 +229,7 @@ async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
 /// What a folder's address asks for beside the folder.
 #[derive(Default, Deserialize)]
 struct Asked {
-    /// The question to open the page with: `rename`, `move` or `trash`, about the document `id`.
+    /// The question to open the page with: `rename`, `move`, `trash` or `share`, about the document `id`.
     #[serde(default)]
     ask: Option<String>,
     #[serde(default)]
@@ -295,7 +298,13 @@ async fn folder(
             let now = app.now();
             let edits = listing.space.role.edits();
             let about = |id: &String| listing.entries.iter().find(|entry| entry.id.as_ref() == Some(id)).cloned();
+            let shares = may_share(listing.space.role);
             let ask = match (asked.ask.as_deref(), asked.id.as_ref().and_then(about)) {
+                // Whoever may not share is asked nothing, as with a document that is gone.
+                (Some("share"), Some(entry)) => {
+                    let people = entry.id.as_ref().and_then(|id| app.shares(&who, id).ok());
+                    people.map(|shares| Ask::Share(entry, shares.people, app.directory(&who).unwrap_or_default()))
+                }
                 (Some("rename"), Some(entry)) if edits => Some(Ask::Rename(entry)),
                 (Some("trash"), Some(entry)) if edits => Some(Ask::Trash(entry)),
                 (Some("move"), Some(entry)) if edits => {
@@ -307,7 +316,7 @@ async fn folder(
             let title = listing.path.rsplit('/').next().filter(|name| !name.is_empty());
             let title = title.unwrap_or(&listing.space.name).to_owned();
             let rows = listing.entries.into_iter().map(|entry| row(entry, None, now)).collect();
-            let body = Body::Folder(Box::new(Folder { space: listing.space, path: listing.path, rows, ask }));
+            let body = Body::Folder(Box::new(Folder { space: listing.space, path: listing.path, rows, shares, ask }));
             let mut page = page(&app, Some(&who), at, body);
             page.refused = asked.error.as_deref().map(refusal);
             Ok((title, page))
@@ -351,9 +360,10 @@ async fn recent(State(app): State<Shared>, Visitor(who): Visitor, Query(asked): 
         move || {
             let (entries, now) = (app.recent(&who)?, app.now());
             let spaces = app.spaces(&who);
+            // What a share led to is in no space of theirs.
             let named = |entry: &Entry| {
                 let space = spaces.iter().find(|(space, _)| Some(space.id()) == entry.space);
-                space.map(|(space, _)| space.name.clone())
+                Some(space.map_or_else(|| "Shared with me".to_owned(), |(space, _)| space.name.clone()))
             };
             let rows = entries.into_iter().map(|entry| row(entry.clone(), named(&entry), now)).collect();
             Ok(page(&app, Some(&who), At::Recent, Body::Recent(rows)))
@@ -362,8 +372,16 @@ async fn recent(State(app): State<Shared>, Visitor(who): Visitor, Query(asked): 
     listed(&app, &who, "Recent", shown.await, asked).await
 }
 
-async fn shared(State(app): State<Shared>, Visitor(who): Visitor) -> Response {
-    send(StatusCode::OK, "Shared with me", page(&app, Some(&who), At::Shared, Body::Shared), None).await
+async fn shared(State(app): State<Shared>, Visitor(who): Visitor, Query(asked): Query<Asked>) -> Response {
+    let shown = blocking({
+        let (app, who) = (app.clone(), who.clone());
+        move || {
+            let (lent, now) = (app.shared(&who)?, app.now());
+            let rows = lent.into_iter().map(|(entry, whose)| row(entry, Some(whose), now)).collect();
+            Ok(page(&app, Some(&who), At::Shared, Body::Shared(rows)))
+        }
+    });
+    listed(&app, &who, "Shared with me", shown.await, asked).await
 }
 
 async fn trash(State(app): State<Shared>, Visitor(who): Visitor, Query(asked): Query<Asked>) -> Response {

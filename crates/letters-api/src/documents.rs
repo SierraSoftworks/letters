@@ -42,7 +42,7 @@ pub enum Tag {
     ImportNotes { count: u32 },
     /// Who has it open to edit now, by the names they sign with.
     Editing { people: Vec<String> },
-    /// Shared with this many people or groups beyond its space.
+    /// Shared with this many people or groups beyond its space. Told to whoever says who it is shared with.
     Shared { with: u32 },
     /// This many links lead to it.
     Links { count: u32 },

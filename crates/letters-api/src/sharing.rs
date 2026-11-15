@@ -8,7 +8,8 @@ pub enum Role {
     /// Reads, and writes comments.
     Commenter,
     Editor,
-    /// Edits, and says who else may. A document in a person's own space is theirs.
+    /// A document in a person's own space is theirs. Who a document is shared with is said by whoever
+    /// edits the space it is kept in: its owner, or in a space of several everyone who edits there.
     Owner,
 }
 
@@ -21,6 +22,7 @@ impl Role {
         self >= Self::Editor
     }
 
+    /// Whether the document is theirs. Nobody is given this, and a row of it is not taken away.
     pub fn shares(self) -> bool {
         self == Self::Owner
     }
@@ -103,6 +105,8 @@ pub struct CreatedLink {
 /// Who reaches a document besides those its space lets in.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shares {
+    /// A document in a person's own space has its owner first. One in a space of several has no owner's
+    /// row.
     #[serde(default)]
     pub people: Vec<Grant>,
     #[serde(default)]

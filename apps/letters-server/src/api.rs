@@ -49,7 +49,6 @@ pub fn routes() -> Router<Shared> {
         .route(paths::SETTINGS, get(settings).put(set_settings))
         .route(paths::SPACES, get(spaces))
         .route(paths::RECENT, get(recent))
-        .route(paths::SHARED, get(shared))
         .route(paths::SOURCES, get(sources))
         .route("/api/v1/spaces/{space}/entries", get(entries))
         .route("/api/v1/spaces/{space}/documents", post(new_document))
@@ -230,7 +229,6 @@ async fn asset(State(app): State<Shared>, who: Signed, Path((id, name)): Path<(S
     Ok((headers, bytes).into_response())
 }
 
-/// Why a body was not read, as a refusal. `large` is what is said of one over its limit.
 /// `POST`: a picture the document links to, fetched here so that its site learns nothing of the reader.
 async fn fetch_picture(
     State(app): State<Shared>,
@@ -273,6 +271,7 @@ async fn trust(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Why a body was not read, as a refusal. `large` is what is said of one over its limit.
 fn unread(rejection: BytesRejection, large: &str) -> Refusal {
     match rejection {
         BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_)) => {
@@ -351,14 +350,12 @@ async fn recent(State(app): State<Shared>, who: Signed) -> Answer<Json<Vec<Entry
     blocking(move || app.recent(&who).map(Json)).await
 }
 
-/// Nothing is shared from beyond a person's spaces until documents can be shared with people.
-async fn shared(_: Signed) -> Json<Vec<Entry>> {
-    Json(Vec::new())
-}
-
 /// A document as a session reaches it.
 pub struct Found {
-    pub space: Space,
+    /// The space it is in, for a session that reaches the space. `None` when only a share leads to it.
+    pub space: Option<Space>,
+    /// What the session may do with it: what its space lets it, or a share when that is more.
+    pub role: Role,
     pub root: Root,
     pub place: Place,
 }
@@ -366,21 +363,34 @@ pub struct Found {
 impl Found {
     /// Refuses unless the session may do what `role` may.
     pub fn must(&self, role: Role) -> Answer<()> {
-        match self.space.role >= role {
+        match self.role >= role {
             true => Ok(()),
             false => Err(Refusal::forbidden("You can read this document, but not change it.")),
         }
     }
+
+    /// The space the session reaches the document in, for what is done to its place and not to it. A
+    /// share is of the document alone.
+    pub fn placed(&self) -> Answer<&Space> {
+        let lent = || Refusal::forbidden("This document is shared with you: where it is kept is its owner's to say.");
+        self.space.as_ref().ok_or_else(lent)
+    }
 }
 
 impl App {
-    /// Where the document `id` is, for `who`. One in no space they reach is not there for them.
+    /// Where the document `id` is, for `who`: in a space they reach, or wherever a share leads them. One
+    /// that neither leads to is not there for them.
     pub fn locate(&self, who: &Signed, id: &str) -> Answer<Found> {
         let reach = self.reach(who);
         let roots: Vec<&Root> = reach.iter().map(|(_, root)| root).collect();
-        let (at, place) = self.library.find(&self.store, &roots, id, self.now())?.ok_or_else(Refusal::not_found)?;
-        let (space, root) = reach.into_iter().nth(at).expect("the library answers with one of the roots it was given");
-        Ok(Found { space, root, place })
+        if let Some((at, place)) = self.library.find(&self.store, &roots, id, self.now())? {
+            let (space, root) = reach.into_iter().nth(at).expect("the library answers with a root it was given");
+            // A share may let someone do more with one document than its space lets them do with all.
+            let (role, _) = self.in_space(who, id, &root, space.role);
+            return Ok(Found { space: Some(space), role, root, place });
+        }
+        let (role, root, place) = self.lent(who, id)?.ok_or_else(Refusal::not_found)?;
+        Ok(Found { space: None, role, root, place })
     }
 
     pub fn listing(&self, who: &Signed, space: &str, folder: &str) -> Answer<Listing> {
@@ -388,24 +398,51 @@ impl App {
         let (root, place) = (self.root(who, space)?, Place::parse(folder)?);
         let told = space.told(role);
         let rows = self.library.list(&self.store, &root, &place)?;
-        let entries = rows.iter().map(|row| self.told(&told, &root, row)).collect();
+        let entries = rows.iter().map(|row| self.told(who, placed(&told, row), &root, row)).collect();
         Ok(Listing { space: told, path: place.as_str().to_owned(), entries })
     }
 
-    /// The row of the file at `place`, as a file table shows it.
-    fn entry(&self, space: &Space, root: &Root, place: &Place) -> Answer<Entry> {
+    /// The row of the file at `place` in a folder.
+    fn row(&self, root: &Root, place: &Place) -> Answer<Row> {
         let (folder, name) = place.split();
         let rows = self.library.list(&self.store, root, &folder)?;
-        let row = rows.iter().find(|row| row.listed.name == name).ok_or_else(Refusal::not_found)?;
-        Ok(self.told(space, root, row))
+        rows.into_iter().find(|row| row.listed.name == name).ok_or_else(Refusal::not_found)
     }
 
-    /// A row as a file table shows it, with who has it open now.
-    fn told(&self, space: &Space, root: &Root, row: &Row) -> Entry {
-        let mut entry = entry(space, row);
+    /// The row of the file at `place`, as a file table of its space shows it.
+    fn entry(&self, who: &Signed, space: &Space, root: &Root, place: &Place) -> Answer<Entry> {
+        let row = self.row(root, place)?;
+        Ok(self.told(who, placed(space, &row), root, &row))
+    }
+
+    /// The row of a document for whoever a share leads to it: where it is kept is not told.
+    pub(crate) fn lent_entry(&self, who: &Signed, role: Role, root: &Root, place: &Place) -> Answer<Entry> {
+        let row = self.row(root, place)?;
+        Ok(self.told(who, entry(&row, role), root, &row))
+    }
+
+    /// The row of the document that was found, when its file is at `place`.
+    fn found_entry(&self, who: &Signed, found: &Found, place: &Place) -> Answer<Entry> {
+        match &found.space {
+            Some(space) => self.entry(who, space, &found.root, place),
+            None => self.lent_entry(who, found.role, &found.root, place),
+        }
+    }
+
+    /// A row as a file table shows it to `who`, with who has it open now. In its space, a share of it may
+    /// let them do more than the space does, and whoever shares it is told with how many.
+    fn told(&self, who: &Signed, mut entry: Entry, root: &Root, row: &Row) -> Entry {
         let people = if row.listed.folder { Vec::new() } else { self.rooms.people(root, &row.place) };
         if !people.is_empty() {
             entry.tags.push(Tag::Editing { people });
+        }
+        // A conflict copy has its original's id, and is shared with nobody.
+        if let (Some(id), Some(_), None) = (&entry.id, &entry.space, &row.copy_of) {
+            let (role, with) = self.in_space(who, id, root, entry.role);
+            entry.role = role;
+            if with > 0 {
+                entry.tags.push(Tag::Shared { with });
+            }
         }
         entry
     }
@@ -427,7 +464,7 @@ impl App {
         let author = settings.name.as_deref().unwrap_or(&who.person.name);
         let name = new.name.as_deref();
         let place = self.library.create(&root, &folder, name, style.unwrap_or_default(), author, self.now())?;
-        self.entry(&space.told(role), &root, &place)
+        self.entry(who, &space.told(role), &root, &place)
     }
 
     pub fn new_folder(&self, who: &Signed, space: &str, new: &NewFolder) -> Answer<Entry> {
@@ -439,7 +476,7 @@ impl App {
         let name = file_name(&new.name).ok_or_else(|| Refusal::invalid("That name cannot be used for a folder."))?;
         let place = parent.child(&name)?;
         root.folder(&parent)?.make_folder(&name)?;
-        self.entry(&space.told(role), &root, &place)
+        self.entry(who, &space.told(role), &root, &place)
     }
 
     pub fn rename(&self, who: &Signed, id: &str, name: &str) -> Answer<Entry> {
@@ -451,12 +488,13 @@ impl App {
             let (from, at) = ((&found.root, &found.place), (found.root.again()?, to.clone()));
             self.rooms.moving(from, Some(at), || self.library.relocate(&self.store, from, (&found.root, &to)))?;
         }
-        self.entry(&found.space, &found.root, &to)
+        self.found_entry(who, &found, &to)
     }
 
     pub fn relocate(&self, who: &Signed, id: &str, to: &Move) -> Answer<Entry> {
         let found = self.locate(who, id)?;
         found.must(Role::Editor)?;
+        found.placed()?;
         let (space, role) = self.space(who, &to.space)?;
         if !role.edits() {
             return Err(Refusal::forbidden("You can read that space, but not add to it."));
@@ -467,13 +505,14 @@ impl App {
             let (from, at) = ((&found.root, &found.place), (root.again()?, place.clone()));
             self.rooms.moving(from, Some(at), || self.library.relocate(&self.store, from, (&root, &place)))?;
         }
-        self.entry(&space.told(role), &root, &place)
+        self.entry(who, &space.told(role), &root, &place)
     }
 
     /// Moves the document `id` to the trash of its space.
     pub fn trash(&self, who: &Signed, id: &str) -> Answer<()> {
         let found = self.locate(who, id)?;
         found.must(Role::Editor)?;
+        found.placed()?;
         let thrown = || self.library.trash(&self.store, &found.root, &found.place, self.now());
         self.rooms.moving((&found.root, &found.place), None, thrown)
     }
@@ -519,7 +558,7 @@ impl App {
         }
         let root = self.root(who, space)?;
         let place = self.library.put_back(&self.store, &root, file)?;
-        self.entry(&space.told(role), &root, &place)
+        self.entry(who, &space.told(role), &root, &place)
     }
 
     /// The document `id`, ready to edit. A `page` carries its style and its notes along.
@@ -554,13 +593,13 @@ impl App {
             created: manifest.created,
             name: shown(found.place.name()).to_owned(),
             named: !untitled(shown(found.place.name())),
-            space: Some(found.space.id.clone()),
-            path: found.place.as_str().to_owned(),
-            role: found.space.role,
+            space: found.space.as_ref().map(|space| space.id.clone()),
+            // Where a shared document is kept is its owner's business.
+            path: found.space.as_ref().map(|_| found.place.as_str().to_owned()).unwrap_or_default(),
+            role: found.role,
             author: self.signs_as(who)?,
             socket: paths::socket(&manifest.id),
-            // A document in a space the person reaches is vouched for by whoever let them in.
-            trust: Trust::Trusted,
+            trust: if self.trusts(who, &found, &manifest.id)? { Trust::Trusted } else { Trust::Safe },
             allows: letters_api::Allows { download: true, copy: true, print: true },
             style,
             notes,
@@ -582,13 +621,15 @@ impl App {
     /// The documents the person opened lately that they still reach, newest first.
     pub fn recent(&self, who: &Signed) -> Answer<Vec<Entry>> {
         let ids = self.store.get(&RECENT, &who.person.id)?.unwrap_or_default();
-        let reach = self.reach(who);
-        let roots: Vec<&Root> = reach.iter().map(|(_, root)| root).collect();
         let mut entries = Vec::new();
         for id in ids {
-            // One that is gone, or out of reach now, is left out and not an error.
-            let Some((at, place)) = self.library.find(&self.store, &roots, &id, self.now())? else { continue };
-            if let Ok(entry) = self.entry(&reach[at].0, &reach[at].1, &place) {
+            let found = match self.locate(who, &id) {
+                Ok(found) => found,
+                // One that is gone, or out of reach now, is left out and not an error.
+                Err(refusal) if refusal.code() == Code::NotFound => continue,
+                Err(refusal) => return Err(refusal),
+            };
+            if let Ok(entry) = self.found_entry(who, &found, &found.place) {
                 entries.push(entry);
             }
         }
@@ -596,8 +637,13 @@ impl App {
     }
 }
 
-/// A row of a folder as a file table shows it.
-fn entry(space: &Space, row: &Row) -> Entry {
+/// A row as a file table of its space shows it.
+fn placed(space: &Space, row: &Row) -> Entry {
+    Entry { space: Some(space.id.clone()), path: row.place.as_str().to_owned(), ..entry(row, space.role) }
+}
+
+/// A row as a file table shows it to whoever may do what `role` may. Where it is, is not said.
+fn entry(row: &Row, role: Role) -> Entry {
     let known = row.known.as_ref();
     let mut tags = Vec::new();
     if let Some(original) = &row.copy_of {
@@ -611,12 +657,12 @@ fn entry(space: &Space, row: &Row) -> Entry {
     Entry {
         kind: if row.listed.folder { EntryKind::Folder } else { EntryKind::Document },
         name: shown(&row.listed.name).to_owned(),
-        space: Some(space.id.clone()),
-        path: row.place.as_str().to_owned(),
+        space: None,
+        path: String::new(),
         id: known.and_then(|known| known.id.clone()),
         created: known.and_then(|known| known.created.clone()),
         modified: seconds(row.listed.stamp),
-        role: space.role,
+        role,
         contributors: known.map(|known| known.contributors.clone()).unwrap_or_default(),
         tags,
     }
@@ -624,6 +670,6 @@ fn entry(space: &Space, row: &Row) -> Entry {
 
 /// The routes with their state, for the server and for tests.
 pub fn router(app: Arc<App>) -> Router {
-    let routes = routes().merge(crate::socket::routes()).merge(crate::auth::routes()).merge(crate::pages::routes());
-    routes.with_state(app)
+    let routes = routes().merge(crate::shares::routes()).merge(crate::socket::routes());
+    routes.merge(crate::auth::routes()).merge(crate::pages::routes()).with_state(app)
 }

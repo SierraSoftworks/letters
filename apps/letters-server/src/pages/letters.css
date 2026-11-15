@@ -12,6 +12,22 @@ a.lt-file__name:hover { text-decoration: underline; }
 .lt-file__more form { display: none; }
 .lt-dim { color: var(--yi-fg-muted); font-size: var(--yi-text-sm); white-space: nowrap; }
 
+/* The Share dialog: who a document is shared with, each face, name, role and way out in a column of its
+   own, and the form that shares it with one more. */
+.lt-shares {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: var(--yi-space-xs) var(--yi-space-sm);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.lt-shares__row { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; align-items: center; min-block-size: 2rem; }
+.lt-shares__row > .yi-icon { justify-self: center; color: var(--yi-fg-subtle); }
+.lt-shares__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lt-shares__add { display: flex; flex-wrap: wrap; align-items: end; gap: var(--yi-space-sm); }
+.lt-shares__to { flex: 1; min-inline-size: 12rem; }
+
 /* A page with no frame: one thing said in the middle of it. */
 .lt-card {
   display: grid;
