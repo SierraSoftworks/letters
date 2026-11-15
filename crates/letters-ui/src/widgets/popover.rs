@@ -46,6 +46,7 @@ pub struct Popover<M> {
     pub(crate) shows_focus: bool,
     pub(crate) beside: bool,
     pub(crate) stays: bool,
+    pub(crate) nested: bool,
     pub(crate) popup: HasPopup,
 }
 
@@ -71,6 +72,7 @@ impl<M> Popover<M> {
             shows_focus: false,
             beside: false,
             stays: false,
+            nested: false,
             popup: HasPopup::Dialog,
         }
     }
@@ -151,6 +153,14 @@ impl<M> Popover<M> {
     /// reason of its own holds. Escape still asks it to close.
     pub fn stays(mut self) -> Self {
         self.stays = true;
+        self
+    }
+
+    /// Makes the popover a part of the one its anchor is in, as a menu's sub-menu is: it opens when the
+    /// pointer rests on its anchor or the arrow key that points at it is pressed, and a choice in it closes
+    /// both.
+    pub fn nested(mut self) -> Self {
+        self.nested = true;
         self
     }
 

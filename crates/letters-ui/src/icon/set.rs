@@ -171,3 +171,43 @@ pub const UPLOAD: Icon = Icon::new("M12 3v12M17 8l-5-5-5 5M21 15v4a2 2 0 0 1-2 2
 pub const USERS: Icon = Icon::new("M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M16 3.128a4 4 0 0 1 0 7.744M22 21v-2a4 4 0 0 0-3-3.87M5 7a4 4 0 1 0 8 0a4 4 0 1 0 -8 0");
 /// `x`
 pub const X: Icon = Icon::new("M18 6 6 18M6 6l12 12");
+/// `arrow-right`
+pub const ARROW_RIGHT: Icon = Icon::new("M5 12h14M12 5l7 7-7 7");
+/// indent: lines that a chevron pushes in
+pub const INDENT: Icon = Icon::new("M21 5H11M21 12H11M21 19H11M3 8l4 4-4 4");
+/// outdent: lines that a chevron pulls out
+pub const OUTDENT: Icon = Icon::new("M21 5H11M21 12H11M21 19H11M7 8l-4 4 4 4");
+/// `scan-text`
+pub const SCAN_TEXT: Icon = Icon::new("M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2M7 8h8M7 12h10M7 16h6");
+/// A table's row with room above it, for what is added there. Drawn for Letters, as are those after it.
+pub const ROW_LOW: Icon = Icon::new("M4.5 14H19.5a1.5 1.5 0 0 1 1.5 1.5V18.5a1.5 1.5 0 0 1 -1.5 1.5H4.5a1.5 1.5 0 0 1 -1.5 -1.5V15.5a1.5 1.5 0 0 1 1.5 -1.5z");
+/// A row with room below it.
+pub const ROW_HIGH: Icon = Icon::new("M4.5 4H19.5a1.5 1.5 0 0 1 1.5 1.5V8.5a1.5 1.5 0 0 1 -1.5 1.5H4.5a1.5 1.5 0 0 1 -1.5 -1.5V5.5a1.5 1.5 0 0 1 1.5 -1.5z");
+/// A row that moves up.
+pub const ROW_UP: Icon = Icon::new("M4.5 14H19.5a1.5 1.5 0 0 1 1.5 1.5V18.5a1.5 1.5 0 0 1 -1.5 1.5H4.5a1.5 1.5 0 0 1 -1.5 -1.5V15.5a1.5 1.5 0 0 1 1.5 -1.5zM12 10.5V3M8.5 6.5 12 3l3.5 3.5");
+/// A row that moves down.
+pub const ROW_DOWN: Icon = Icon::new("M4.5 4H19.5a1.5 1.5 0 0 1 1.5 1.5V8.5a1.5 1.5 0 0 1 -1.5 1.5H4.5a1.5 1.5 0 0 1 -1.5 -1.5V5.5a1.5 1.5 0 0 1 1.5 -1.5zM12 13.5V21M8.5 17.5 12 21l3.5-3.5");
+/// A row with room after it, for the cross that takes it away.
+pub const ROW_SHORT: Icon = Icon::new("M3.5 8.5H12.5a1.5 1.5 0 0 1 1.5 1.5V14.0a1.5 1.5 0 0 1 -1.5 1.5H3.5a1.5 1.5 0 0 1 -1.5 -1.5V10.0a1.5 1.5 0 0 1 1.5 -1.5z");
+/// A column with room to its left.
+pub const COLUMN_RIGHT: Icon = Icon::new("M15.5 3H18.5a1.5 1.5 0 0 1 1.5 1.5V19.5a1.5 1.5 0 0 1 -1.5 1.5H15.5a1.5 1.5 0 0 1 -1.5 -1.5V4.5a1.5 1.5 0 0 1 1.5 -1.5z");
+/// A column with room to its right.
+pub const COLUMN_LEFT: Icon = Icon::new("M5.5 3H8.5a1.5 1.5 0 0 1 1.5 1.5V19.5a1.5 1.5 0 0 1 -1.5 1.5H5.5a1.5 1.5 0 0 1 -1.5 -1.5V4.5a1.5 1.5 0 0 1 1.5 -1.5z");
+/// A column that moves left.
+pub const COLUMN_TO_LEFT: Icon = Icon::new("M15.5 3H18.5a1.5 1.5 0 0 1 1.5 1.5V19.5a1.5 1.5 0 0 1 -1.5 1.5H15.5a1.5 1.5 0 0 1 -1.5 -1.5V4.5a1.5 1.5 0 0 1 1.5 -1.5zM10.5 12H3M6.5 8.5 3 12l3.5 3.5");
+/// A column that moves right.
+pub const COLUMN_TO_RIGHT: Icon = Icon::new("M5.5 3H8.5a1.5 1.5 0 0 1 1.5 1.5V19.5a1.5 1.5 0 0 1 -1.5 1.5H5.5a1.5 1.5 0 0 1 -1.5 -1.5V4.5a1.5 1.5 0 0 1 1.5 -1.5zM13.5 12H21M17.5 8.5 21 12l-3.5 3.5");
+/// A column with room under it.
+pub const COLUMN_SHORT: Icon = Icon::new("M10.0 2H14.0a1.5 1.5 0 0 1 1.5 1.5V12.5a1.5 1.5 0 0 1 -1.5 1.5H10.0a1.5 1.5 0 0 1 -1.5 -1.5V3.5a1.5 1.5 0 0 1 1.5 -1.5z");
+/// A plus in the room above a row.
+pub const MARK_PLUS_TOP: Icon = Icon::new("M12 2.5v8M8 6.5h8");
+/// A plus in the room below a row.
+pub const MARK_PLUS_BOTTOM: Icon = Icon::new("M12 13.5v8M8 17.5h8");
+/// A plus in the room left of a column.
+pub const MARK_PLUS_LEFT: Icon = Icon::new("M2.5 12h8M6.5 8v8");
+/// A plus in the room right of a column.
+pub const MARK_PLUS_RIGHT: Icon = Icon::new("M13.5 12h8M17.5 8v8");
+/// A cross in the room after a row.
+pub const MARK_CROSS_RIGHT: Icon = Icon::new("M16.5 9l6 6M22.5 9l-6 6");
+/// A cross in the room under a column.
+pub const MARK_CROSS_BOTTOM: Icon = Icon::new("M9 16.5l6 6M15 16.5l-6 6");

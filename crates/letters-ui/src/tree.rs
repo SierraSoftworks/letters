@@ -57,6 +57,8 @@ pub(crate) struct Trigger {
     /// Whether the app decides when the popover is open.
     pub controlled: bool,
     pub open: bool,
+    /// Whether the popover is a part of the one its anchor is in.
+    pub nested: bool,
     pub popup: accesskit::HasPopup,
 }
 
@@ -73,6 +75,8 @@ pub(crate) struct Layer<M> {
     pub beside: bool,
     /// Whether a press outside leaves the layer open.
     pub stays: bool,
+    /// Whether the layer is a part of the one its anchor is in, and closes that with a choice made in it.
+    pub nested: bool,
     pub controlled: bool,
     pub on_close: Option<M>,
 }
@@ -115,6 +119,7 @@ impl<M> Tree<M> {
             layer.shows_focus = popover.shows_focus;
             layer.beside = popover.beside;
             layer.stays = popover.stays;
+            layer.nested = popover.nested;
             layer.controlled = popover.open.is_some();
             layer.on_close = popover.on_close;
         }
@@ -141,6 +146,7 @@ impl<M> Tree<M> {
             shows_focus: false,
             beside: false,
             stays: false,
+            nested: false,
             controlled: false,
             on_close: None,
         });
@@ -174,7 +180,8 @@ impl<M> Tree<M> {
         }
         let trigger = el.popover.take().map(|popover| {
             let open = popover.open.unwrap_or_else(|| kept.open.contains(&id));
-            let trigger = Trigger { controlled: popover.open.is_some(), open, popup: popover.popup };
+            let trigger =
+                Trigger { controlled: popover.open.is_some(), open, nested: popover.nested, popup: popover.popup };
             if open {
                 pending.push_back((at, popover));
             }
