@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::rc::{Rc, Weak};
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
-use js_sys::{Function, Object, Reflect};
+use js_sys::{Array, Function, Map, Object, Reflect, Uint8Array};
 use letters_editor::{Clip, KeyEvent, Modifiers, Picture, Platform as _};
 use letters_model::{BlockKind, Document, HistoryError, Mark, Pos, ReplicaId, Selection};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
@@ -40,6 +40,21 @@ const HIDDEN: &str = "position:fixed;width:1px;padding:0;border:0;margin:0;outli
 
 /// The hidden input when a keyboard is to leave what is typed as it is.
 const HELP: [(&str, &str); 2] = [("autocapitalize", "off"), ("autocorrect", "off")];
+
+/// The frame a PDF is printed from. It has no size, and still has to count as shown for the browser to
+/// load a PDF into it.
+const PRINTED: &str = "position:fixed;width:0;height:0;border:0;visibility:hidden;";
+
+#[wasm_bindgen(inline_js = "export async function load(url) {
+    const module = await import(url);
+    await module.default();
+    return module;
+}")]
+extern "C" {
+    /// Fetches and starts a module that `wasm-bindgen` made, which the page did not load with the editor.
+    #[wasm_bindgen(catch)]
+    async fn load(url: &str) -> Result<JsValue, JsValue>;
+}
 
 /// A handle at one end of a selection a finger made: a dot under the line, in a square large enough for a
 /// finger to take hold of. It scrolls nothing, so that a finger on it moves the selection's end.
@@ -101,6 +116,14 @@ pub struct Shell {
     /// The shell itself, for what finishes after the call that began it.
     me: Weak<RefCell<Self>>,
     later: Option<Later>,
+    /// Where the files beside the wasm are found: a URL that is empty or ends in a slash.
+    base: String,
+    /// The PDF export, once the person has printed: a module of its own, fetched then.
+    printer: Option<JsValue>,
+    /// Whether a PDF is being made for the person to print.
+    printing: bool,
+    /// The frame the last PDF was printed from, and the address the PDF has in this page.
+    printed: Option<(HtmlIFrameElement, String)>,
     window: Window,
     canvas: HtmlCanvasElement,
     context: CanvasRenderingContext2d,
@@ -142,7 +165,8 @@ pub struct Shell {
     scale: f32,
 
     pointer: Point,
-    cursor: Cursor,
+    /// The pointer's shape on the canvas, by its name in CSS.
+    cursor: &'static str,
     /// Where the hidden input was last put.
     caret: Option<Rect>,
     /// Whether a frame has been asked for and not yet painted.
@@ -213,6 +237,10 @@ impl Shell {
         let shell = Rc::new_cyclic(|shell| {
             RefCell::new(Self {
                 me: shell.clone(),
+                base: later.base.clone(),
+                printer: None,
+                printing: false,
+                printed: None,
                 later: Some(later),
                 on_frame: callback(shell, Self::paint),
                 on_wake: callback(shell, Self::wake),
@@ -243,7 +271,7 @@ impl Shell {
                 strip: Vec::new(),
                 scale: 1.0,
                 pointer: Point::default(),
-                cursor: Cursor::Default,
+                cursor: "default",
                 caret: None,
                 frame_due: false,
                 timer: None,
@@ -462,15 +490,97 @@ impl Shell {
     /// Offers `text` to the person as a file to keep, named after the document.
     fn download(&self, text: &str, extension: &str) -> Result<(), JsValue> {
         let page = self.window.document().ok_or("there is no document")?;
-        let parts = js_sys::Array::of1(&text.into());
         let options = BlobPropertyBag::new();
         options.set_type("application/json");
-        let url = Url::create_object_url_with_blob(&Blob::new_with_str_sequence_and_options(&parts, &options)?)?;
-        let link: HtmlAnchorElement = page.create_element("a")?.dyn_into()?;
-        link.set_href(&url);
-        link.set_download(&format!("{}.{extension}", page.title()));
-        link.click();
+        let file = Blob::new_with_str_sequence_and_options(&Array::of1(&text.into()), &options)?;
+        let url = Url::create_object_url_with_blob(&file)?;
+        keep(&page, &url, extension)?;
         Url::revoke_object_url(&url)
+    }
+
+    // Printing
+
+    /// Makes the PDF of the document, which is what Print view shows, and hands it to the browser's print
+    /// dialog. The export is fetched the first time, so that no other visit waits for it.
+    fn print(&mut self) {
+        if std::mem::replace(&mut self.printing, true) {
+            return;
+        }
+        let editor = self.view.editor();
+        let (document, style) = (editor.doc().to_json(), self.view.style().to_json());
+        let title = self.window.document().map(|page| page.title()).unwrap_or_default();
+        let authors: Array = editor.model().authors().iter().map(|author| JsValue::from(author.as_str())).collect();
+        let created = self.platform.wall_time().map(|seconds| seconds as f64);
+        let assets = Map::new();
+        for (name, file) in self.platform.assets.iter().filter(|(name, _)| document.contains(name.as_str())) {
+            assets.set(&name.into(), &Uint8Array::from(&file[..]));
+        }
+        let (shell, window, base, printer) =
+            (self.me.clone(), self.window.clone(), self.base.clone(), self.printer.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let made = async {
+                let printer = match printer {
+                    Some(printer) => printer,
+                    None => {
+                        let module = Url::new_with_base(&format!("{base}print.js"), &window.location().href()?)?;
+                        let printer = load(&module.href()).await?;
+                        // The editor has fetched these already, so the browser has them at hand.
+                        let fonts = browser::files(&window, &urls(&base, "fonts", &letters_fonts::FILES)).await?;
+                        let maths = browser::files(&window, &urls(&base, "maths", &letters_math::FONT_FILES)).await?;
+                        let files = |files: Vec<Vec<u8>>| -> Array {
+                            files.iter().map(|file| Uint8Array::from(&file[..])).collect()
+                        };
+                        call(&printer, "fonts", &Array::of2(&files(fonts), &files(maths)))?;
+                        printer
+                    }
+                };
+                let asked: [JsValue; 6] =
+                    [document.into(), style.into(), title.into(), authors.into(), created.into(), assets.into()];
+                let pdf = call(&printer, "pdf", &asked.into_iter().collect())?;
+                Ok::<_, JsValue>((printer, pdf))
+            };
+            let made = made.await;
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            shell.printing = false;
+            report(made.and_then(|(printer, pdf)| {
+                shell.printer = Some(printer);
+                shell.hand_to_print(&pdf)
+            }));
+            shell.sync();
+        });
+    }
+
+    /// Hands a PDF to the browser's print dialog, from a frame nobody sees. A browser that shows no PDFs
+    /// in a page keeps the file instead, which is the next best thing to do with it.
+    fn hand_to_print(&mut self, pdf: &JsValue) -> Result<(), JsValue> {
+        let page = self.window.document().ok_or("there is no document")?;
+        let options = BlobPropertyBag::new();
+        options.set_type("application/pdf");
+        let file = Blob::new_with_u8_array_sequence_and_options(&Array::of1(pdf), &options)?;
+        let url = Url::create_object_url_with_blob(&file)?;
+        if let Some((frame, last)) = self.printed.take() {
+            frame.remove();
+            Url::revoke_object_url(&last)?;
+        }
+        let frame: HtmlIFrameElement = page.create_element("iframe")?.dyn_into()?;
+        for (name, value) in
+            [("data-letters", "print"), ("aria-hidden", "true"), ("tabindex", "-1"), ("style", PRINTED)]
+        {
+            frame.set_attribute(name, value)?;
+        }
+        let (shown, kept) = (frame.clone(), url.clone());
+        let print = Closure::once_into_js(move || {
+            let printed =
+                shown.content_window().ok_or_else(|| "the frame has no window".into()).and_then(|pdf| pdf.print());
+            // A frame the page may not print from still holds a file the person can keep.
+            report(printed.or_else(|_: JsValue| keep(&page, &kept, "pdf")));
+        });
+        frame.set_onload(Some(print.unchecked_ref()));
+        frame.set_src(&url);
+        self.picker.insert_adjacent_element("afterend", &frame)?;
+        self.printed = Some((frame, url));
+        Ok(())
     }
 
     /// Brings a new view to the canvas.
@@ -536,6 +646,7 @@ impl Shell {
                 Request::ImportStyle => self.chooser.click(),
                 Request::ExportStyle(json) => report(self.download(&json, "letstyle")),
                 Request::Pictures => self.picker.click(),
+                Request::Print => self.print(),
                 Request::Asset(name) => self.load(name),
                 Request::OpenLink { href, confirmed } => self.open_link(&href, confirmed),
                 // The window has taken the settings already. The rest is the shell's: keeping them, the
@@ -565,25 +676,26 @@ impl Shell {
         }
         self.caret = caret;
         self.place_handles();
-        let cursor = self.view.cursor();
+        let cursor = match self.view.cursor() {
+            // Making a PDF takes a moment, and the first one the time to fetch what makes it.
+            _ if self.printing => "progress",
+            Cursor::Default => "default",
+            Cursor::Pointer => "pointer",
+            Cursor::Text => "text",
+            Cursor::Resize(edge) => match edge {
+                Edge::North => "n-resize",
+                Edge::NorthEast => "ne-resize",
+                Edge::East => "e-resize",
+                Edge::SouthEast => "se-resize",
+                Edge::South => "s-resize",
+                Edge::SouthWest => "sw-resize",
+                Edge::West => "w-resize",
+                Edge::NorthWest => "nw-resize",
+            },
+        };
         if cursor != self.cursor {
             self.cursor = cursor;
-            let name = match cursor {
-                Cursor::Default => "default",
-                Cursor::Pointer => "pointer",
-                Cursor::Text => "text",
-                Cursor::Resize(edge) => match edge {
-                    Edge::North => "n-resize",
-                    Edge::NorthEast => "ne-resize",
-                    Edge::East => "e-resize",
-                    Edge::SouthEast => "se-resize",
-                    Edge::South => "s-resize",
-                    Edge::SouthWest => "sw-resize",
-                    Edge::West => "w-resize",
-                    Edge::NorthWest => "nw-resize",
-                },
-            };
-            report(self.canvas.style().set_property("cursor", name));
+            report(self.canvas.style().set_property("cursor", cursor));
         }
     }
 
@@ -1067,6 +1179,20 @@ impl Shell {
         let delta = Point { x: event.delta_x() as f32 * unit, y: event.delta_y() as f32 * unit };
         self.view.scroll(self.pointer, delta, &mut self.platform);
     }
+}
+
+/// Offers what is at `url` to the person as a file to keep, named after the document.
+fn keep(page: &web_sys::Document, url: &str, extension: &str) -> Result<(), JsValue> {
+    let link: HtmlAnchorElement = page.create_element("a")?.dyn_into()?;
+    link.set_href(url);
+    link.set_download(&format!("{}.{extension}", page.title()));
+    link.click();
+    Ok(())
+}
+
+/// Calls a function that a module exports.
+fn call(module: &JsValue, name: &str, arguments: &Array) -> Result<JsValue, JsValue> {
+    Reflect::get(module, &name.into())?.dyn_into::<Function>()?.apply(&JsValue::NULL, arguments)
 }
 
 /// The files a paste, a drop or a chooser carries.

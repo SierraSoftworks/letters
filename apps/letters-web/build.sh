@@ -17,6 +17,10 @@ cargo build -p letters-web --lib --profile web --target wasm32-unknown-unknown
 rm -rf dist
 "$bindgen" "$wasm" --target web --no-typescript --out-name letters --out-dir dist \
   --remove-name-section --remove-producers-section
+# The PDF export is a module of its own, which the editor fetches when the person first prints.
+cargo build -p letters-web --example print --profile web --target wasm32-unknown-unknown
+"$bindgen" "${wasm%/*}/examples/print.wasm" --target web --no-typescript --out-name print --out-dir dist \
+  --remove-name-section --remove-producers-section
 cargo run --quiet -p letters-web --example page -- www/index.html > dist/index.html
 # What the editor fetches beside the wasm, each with its licence.
 for files in fonts:letters-fonts/fonts maths:letters-math/fonts dictionaries:letters-spell/dictionaries; do

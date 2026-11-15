@@ -52,3 +52,14 @@ test("two pages on one document take in each other's edits", async ({ page, cont
   expect(merged.at(-1)).toContain("from the second");
   expect(await texts(other)).toEqual(merged);
 });
+
+test("Ctrl or Cmd with P is the editor's, and never reaches the browser's own print dialog", async ({ page }) => {
+  // The page hears the key after the hidden input has: by then the editor has taken it.
+  await page.evaluate(() => {
+    window.addEventListener("keydown", (event) => event.key === "p" && (window.taken = event.defaultPrevented));
+  });
+  await page.keyboard.press("ControlOrMeta+p");
+  expect(await page.evaluate(() => window.taken)).toBe(true);
+  // Print view shows the document on its sheets, and says so to a reader.
+  await expect(page.getByRole("button", { name: "Print", exact: true })).toBeAttached();
+});

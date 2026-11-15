@@ -76,6 +76,17 @@ web-sys = { workspace = true, features = [
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 letters-convert.workspace = true
 
+# The PDF export is a module of its own, which the page fetches when the person first prints.
+[[example]]
+name = "print"
+crate-type = ["cdylib"]
+
+[dev-dependencies]
+letters-layout.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+letters-convert.workspace = true
+
 # The browser fetches the fonts, the maths faces and the dictionaries beside the wasm, so they are cached
 # apart from it and only the fonts hold up the first frame. Only the wasm build leaves them out: a feature
 # named here for every target would take them from the native tests too.

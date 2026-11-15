@@ -136,15 +136,20 @@ const download = (files) => [(bytes) => bytes.length, (bytes) => gzipSync(bytes,
 /** The files of a folder that the editor fetches. Their licences travel with them and are never asked for. */
 const folder = (name) => readdirSync(join(dist, name)).filter((file) => !file.endsWith(".txt")).map((file) => read(name, file));
 const [fonts, maths, dictionaries] = ["fonts", "maths", "dictionaries"].map(folder);
+/** The scripts `letters.js` imports, which `wasm-bindgen` writes beside it. */
+const snippets = readdirSync(join(dist, "snippets"), { recursive: true })
+  .filter((file) => file.endsWith(".js"))
+  .map((file) => read("snippets", file));
 const downloads = [
   ["letters_bg.wasm", [served]],
-  ["letters.js", [read("letters.js")]],
+  ["letters.js", [read("letters.js"), ...snippets]],
   [`fonts (${fonts.length} files)`, fonts],
 ];
 // A document with maths has the maths faces before its first frame, too.
 const later = [
   [`maths (${maths.length} files)`, maths],
   [`dictionaries (${dictionaries.length})`, dictionaries],
+  ["print, when printing", [read("print_bg.wasm"), read("print.js")]],
 ];
 console.log(`${"What the browser downloads".padEnd(24)}${["as served", "gzip", "brotli"].map((head) => head.padStart(11)).join("")}`);
 downloads.forEach(([label, files]) => row(label, ...download(files)));
