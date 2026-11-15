@@ -110,3 +110,29 @@ jobs:
         run: |
           xvfb-run -a -s "-screen 0 1400x1000x24" ./scripts/budgets.sh --window ubuntu-latest | tee budgets.txt
           { echo '```text'; cat budgets.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+
+  # What layout costs a frame. The bench holds its own budgets and fails when a measurement is over one.
+  bench:
+    name: Layout bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build
+        run: cargo bench -p letters-layout --no-run
+
+      - name: Bench
+        shell: bash
+        run: |
+          cargo bench -p letters-layout | tee bench.txt
+          { echo '```text'; cat bench.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
