@@ -328,3 +328,53 @@ for (const [name, allowed] of links) {
     await expect(page.locator("canvas")).toBeVisible({ visible: allowed });
   });
 }
+
+const grace = { to: { kind: "person", id: "sub-grace", name: "Grace Hopper" }, role: "reader" };
+const friends = { to: { kind: "group", name: "friends" }, role: "reader" };
+const link = { id: "l1", label: "Accountant", role: "reader", created: 1794000000, allows: {} };
+const REFUSAL = { status: 403, body: { code: "forbidden", message: "Only the owner says who a document is shared with." } };
+/** A server that shares the document with Grace and answers what the Share dialog asks, or `refuses` to change anything. */
+const sharing = (refuses) => (method, path, body) => {
+  if (path === "/api/v1/server") return { body: { product: "letters", name: "Letters", version: "0.1.0", protocols: [1], links: true } };
+  if (method !== "GET" && refuses) return REFUSAL;
+  if (path === `${DOCUMENT}/shares`) return { body: { people: method === "PUT" ? JSON.parse(body).people : [grace], links: [] } };
+  if (path === `${DOCUMENT}/links`) return { status: 201, body: { link, url: "https://letters.example/l/abc" } };
+  return path === `${DOCUMENT}/links/l1` ? { status: 204 } : undefined;
+};
+const shared = (page, name) => page.getByRole("list", { name: "Shared with" }).getByRole("listitem", { name });
+/** Adds the group `friends` as readers in the Share dialog. */
+const add = async (page) => {
+  await click(page, "Share");
+  await expect(shared(page, /Grace Hopper/)).toBeAttached();
+  const field = await page.getByRole("textbox", { name: "Add a group" }).boundingBox();
+  await page.mouse.click(field.x + field.width / 2, field.y + field.height / 2);
+  await page.keyboard.type("friends");
+  await click(page, "Add reader");
+};
+
+test("the owner shares the document through its server: with a group, and by a link that is then revoked", async ({ page }) => {
+  const asked = await serve(page, opened({ role: "owner" }), sharing(false));
+  await add(page);
+  await expect(shared(page, /friends/)).toBeAttached();
+  await click(page, "New link");
+  await page.keyboard.type("Accountant");
+  await click(page, "Make link");
+  await expect(page.getByRole("button", { name: "Copy link" })).toBeAttached();
+  await click(page, "Revoke");
+  await expect.poll(() => told(asked).at(-1)).toBe("DELETE /links/l1");
+
+  const [about, shares, put, post] = told(asked);
+  expect([about, shares]).toEqual(["GET /api/v1/server", "GET /shares"]);
+  expect(JSON.parse(put.replace("PUT /shares ", "")).people).toEqual([grace, friends]);
+  expect(JSON.parse(post.replace("POST /links ", ""))).toMatchObject({ label: "Accountant", role: "reader" });
+  expect(await page.evaluate(() => window.blocked)).toEqual([]);
+});
+
+test("a change to the shares that the server refuses is told in its words, and the list is the server's again", async ({ page }) => {
+  const asked = await serve(page, opened({ role: "owner" }), sharing(true));
+  await add(page);
+  await expect(page.getByRole("dialog", { name: "Share" }).getByRole("alert", { name: REFUSAL.body.message })).toBeAttached();
+  await expect(shared(page, /friends/)).toHaveCount(0);
+  await expect(shared(page, /Grace Hopper/)).toBeAttached();
+  expect(told(asked).filter((line) => line === "GET /shares")).toHaveLength(2);
+});

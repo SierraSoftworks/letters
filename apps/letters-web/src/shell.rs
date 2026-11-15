@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Array, Function, Map, Object, Promise, Reflect, Uint8Array};
-use letters_api::{Code, Fetch, Opened, Preview, paths};
+use letters_api::{Code, Fetch, Opened, Preview, Shares, paths};
 use letters_editor::{Clip, Editor, Key, KeyEvent, Modifiers, Picture, Platform as _};
 use letters_model::{
     BlockId, BlockKind, Change, Document, HistoryError, Mark, Model, Notes, Pos, ReplicaId, Revision, Selection, Style,
@@ -26,7 +26,7 @@ use letters_sync::{Client, Link, Local, Progress, Role};
 use letters_trust::{LinkDecision, Origin, Trust};
 use letters_ui::{
     Access, Appearance, Connection, CopyFormat, Cursor, Edge, Keys, LinkPreviewFound, Peer, PictureState, Request,
-    SaveState, Scheme, Settings, Uncovered, Window as View, WordList, tokens,
+    SaveState, Scheme, Settings, Shared, Uncovered, Window as View, WordList, tokens,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
@@ -195,6 +195,8 @@ pub struct Shell {
     hosts: Vec<String>,
     /// The page of the server the person asked for, which waits until the server has what they wrote.
     leaving: Option<String>,
+    /// Whether the server makes links to its documents, once it has said.
+    links: Option<bool>,
     /// What the person set for themselves as their server keeps it, once it has said. What this browser
     /// keeps of it is a copy, which the page starts with.
     account: Option<letters_api::Settings>,
@@ -389,6 +391,7 @@ impl Shell {
                 linked: HashMap::new(),
                 hosts: Vec::new(),
                 leaving: None,
+                links: None,
                 account: None,
                 client: None,
                 socket: None,
@@ -1318,6 +1321,9 @@ impl Shell {
                 Request::SaveCopy { name, format, .. } => self.copy(name, format, None),
                 // A version that shows in the history is copied as it read then.
                 Request::SaveVersion { revision, name, format, .. } => self.copy(name, format, Some(&revision)),
+                asked @ (Request::Shares | Request::SharePeople(_) | Request::MakeLink(_) | Request::RevokeLink(_)) => {
+                    self.share(asked);
+                }
                 // Moves and folders wait for the server's listings.
                 _ => {}
             }
@@ -1805,6 +1811,62 @@ impl Shell {
                 }
                 Ok(Err(_)) => shell.view.set_notice(Some("The server's answer could not be read.")),
                 Err(refusal) => shell.view.set_notice(Some(&refusal.message)),
+            }
+            shell.arrived();
+        });
+    }
+
+    /// Asks the document's server what the Share dialog asked, and tells the window the answer: the shares
+    /// as they then are, the link that was made, or the server's sentence for what it would not do.
+    fn share(&mut self, asked: Request) {
+        const UNREAD: &str = "The server's answer could not be read.";
+        let Some(server) = &self.server else { return };
+        let (id, owner) = (server.id.clone(), server.role.shares());
+        let (method, path, body) = match &asked {
+            Request::Shares => ("GET", paths::shares(&id), None),
+            // The people are put as the shares are read. The links are not a put's to change.
+            Request::SharePeople(people) => {
+                let shares = Shares { people: people.clone(), links: Vec::new() };
+                ("PUT", paths::shares(&id), serde_json::to_vec(&shares).ok())
+            }
+            Request::MakeLink(link) => ("POST", paths::links(&id), serde_json::to_vec(link).ok()),
+            Request::RevokeLink(link) => ("DELETE", paths::link(&id, link), None),
+            _ => return,
+        };
+        // Whether the server makes links is asked once, with the first of these.
+        let about = self.links.is_none().then(|| browser::ask(&self.window, "GET", paths::SERVER, None));
+        let body = body.as_deref().map(|body| (letters_api::JSON, body));
+        let sent = browser::ask(&self.window, method, &path, body);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let about = match about {
+                Some(about) => {
+                    about.await.ok().and_then(|about| serde_json::from_slice::<letters_api::Server>(&about).ok())
+                }
+                None => None,
+            };
+            let answer = sent.await;
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            // The page may show another document by now.
+            if shell.server.as_ref().is_none_or(|server| server.id != id) {
+                return;
+            }
+            shell.links = shell.links.or(about.map(|server| server.links));
+            // A server that does not say makes none.
+            let links = shell.links.unwrap_or(false);
+            match (asked, answer) {
+                (_, Err(refusal)) => shell.view.refuse_share(&refusal.message),
+                (Request::Shares | Request::SharePeople(_), Ok(answer)) => match serde_json::from_slice(&answer) {
+                    Ok(shares) => shell.view.set_shares(Shared { shares, owner, links }),
+                    Err(_) => shell.view.refuse_share(UNREAD),
+                },
+                (Request::MakeLink(_), Ok(answer)) => match serde_json::from_slice(&answer) {
+                    Ok(made) => shell.view.link_made(made),
+                    Err(_) => shell.view.refuse_share(UNREAD),
+                },
+                // The dialog dropped a revoked link already.
+                _ => {}
             }
             shell.arrived();
         });
