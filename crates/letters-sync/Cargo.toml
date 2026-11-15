@@ -1,0 +1,16 @@
+[package]
+name = "letters-sync"
+description = "Realtime sync: the wire messages, a device's side and the server's room"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+letters-model.workspace = true
+letters-format.workspace = true

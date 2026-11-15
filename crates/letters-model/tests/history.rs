@@ -6,8 +6,8 @@ use std::cmp::Ordering;
 
 use common::{doc, id, pair, saved, split, sync, texts, typed};
 use letters_model::{
-    Block, BlockKind, Body, Change, Document, HistoryError, Hold, Mark, Model, Op, OpError, Page, Pos, ReplicaId,
-    Revision, Run, StablePos, Style,
+    Block, BlockKind, Body, Change, Document, Extent, HistoryError, Hold, Mark, Model, Op, OpError, Page, Pos,
+    ReplicaId, Revision, Run, StablePos, Style,
 };
 
 /// A name, what each of two replicas does unseen by the other, and the text of every block once merged.
@@ -117,6 +117,60 @@ fn updates_bring_a_replica_up_to_date() {
     let change = b.merge(&a.updates_since(&b.revision())).unwrap();
     assert_eq!(b.doc(), a.doc());
     assert!(change.structure && change.blocks.contains(&id("p")));
+}
+
+#[test]
+fn replicas_that_trade_extents_send_only_what_the_other_lacks() {
+    let cases = [(false, false), (true, false), (false, true), (true, true)];
+    for (ours, theirs) in cases {
+        let (mut a, mut b) = pair();
+        if ours {
+            a.apply([typed("p", 0, "A")]).unwrap();
+        }
+        if theirs {
+            b.apply([typed("p", 11, "B")]).unwrap();
+        }
+        let (held_a, held_b) = (a.extent(), b.extent());
+        let expected = match (ours, theirs) {
+            (false, false) => Some(Ordering::Equal),
+            (true, false) => Some(Ordering::Greater),
+            (false, true) => Some(Ordering::Less),
+            (true, true) => None,
+        };
+        assert_eq!(held_a.partial_cmp(&held_b), expected, "ours edited: {ours}, theirs edited: {theirs}");
+        assert!(held_a.shares(&held_b) && !held_a.is_empty());
+
+        // Each is told the other's extent as bytes, and answers with the rest.
+        let (to_b, to_a) = (a.updates_for(&round_trip(&held_b)), b.updates_for(&round_trip(&held_a)));
+        // An update reaches as far as its edits, so what was traded is known without reading the models.
+        let mut known = held_b.clone();
+        known.merge(&Extent::of(&to_b).unwrap());
+        assert!(known >= held_a, "ours edited: {ours}, theirs edited: {theirs}");
+        assert_eq!(a.merge(&to_a).unwrap() == Change::default(), !theirs);
+        assert_eq!(b.merge(&to_b).unwrap() == Change::default(), !ours);
+        assert_eq!(a.doc(), b.doc());
+        assert_eq!(a.extent(), b.extent());
+    }
+}
+
+fn round_trip(extent: &Extent) -> Extent {
+    Extent::from_bytes(&extent.to_bytes()).unwrap()
+}
+
+#[test]
+fn an_extent_tells_copies_of_other_documents_apart() {
+    let (a, _) = pair();
+    let stranger =
+        Model::new(Document { blocks: vec![Block::text("p", BlockKind::Paragraph, "Other")], ..doc() }, 3.into());
+    assert!(!a.extent().shares(&stranger.extent()));
+    assert!(Extent::default().is_empty() && !a.extent().shares(&Extent::default()));
+    // A copy with nothing is sent everything, which is a history that loads.
+    let whole = a.updates_for(&Extent::default());
+    assert_eq!(Model::load(&whole, ReplicaId::from(4)).unwrap().doc(), a.doc());
+    for bytes in [&b"\xff\xff\xff\xff\xff"[..], b"not an extent at all, and far too long to be one"] {
+        assert!(matches!(Extent::from_bytes(bytes), Err(HistoryError::Unreadable(_))), "{bytes:?}");
+    }
+    assert!(matches!(Extent::of(b"not a history"), Err(HistoryError::Unreadable(_))));
 }
 
 #[test]

@@ -23,6 +23,7 @@ letters-spell = { path = "crates/letters-spell" }
 letters-math = { path = "crates/letters-math" }
 letters-trust = { path = "crates/letters-trust" }
 letters-api = { path = "crates/letters-api" }
+letters-sync = { path = "crates/letters-sync" }
 letters-test = { path = "crates/letters-test" }
 # The one crate with unsafe code. Only the desktop shell may name it.
 letters-frame = { path = "platform/letters-frame" }

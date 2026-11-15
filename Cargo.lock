@@ -3091,6 +3091,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "letters-sync"
+version = "0.1.0"
+dependencies = [
+ "letters-format",
+ "letters-model",
+]
+
+[[package]]
 name = "letters-test"
 version = "0.1.0"
 dependencies = [

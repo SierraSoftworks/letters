@@ -20,7 +20,7 @@ wasm() {
   cargo build --target wasm32-unknown-unknown \
     -p letters-model -p letters-format -p letters-fonts -p letters-render -p letters-layout \
     -p letters-editor -p letters-ui -p letters-convert -p letters-spell -p letters-math -p letters-trust \
-    -p letters-api -p letters-web
+    -p letters-api -p letters-sync -p letters-web
 }
 
 [ $# -gt 0 ] || set -- fmt lint test wasm
