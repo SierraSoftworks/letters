@@ -98,8 +98,15 @@ jobs:
       - name: Build
         run: cargo build --release -p letters
 
+      # The launch budget is about a window, so it is measured in one, on a display in memory. The CPU
+      # renderer, since the runner has no GPU to speak of.
+      - name: Install a display
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends xvfb libxkbcommon-x11-0
+
       - name: Check budgets
         shell: bash
+        env:
+          LETTERS_RENDERER: cpu
         run: |
-          ./scripts/budgets.sh ubuntu-latest | tee budgets.txt
+          xvfb-run -a -s "-screen 0 1400x1000x24" ./scripts/budgets.sh --window ubuntu-latest | tee budgets.txt
           { echo '```text'; cat budgets.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"

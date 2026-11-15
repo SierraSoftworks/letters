@@ -3,10 +3,17 @@
 #
 #   ./scripts/budgets.sh            the budgets of the reference machine, which the app holds itself
 #   ./scripts/budgets.sh RUNNER     also that RUNNER's own limits in perf-budget.toml, as CI does
+#   ./scripts/budgets.sh --window   the launch in a window, as the budget is worded, where there is a display
 #
+# Keystrokes are always measured without a window.
 # Every measurement is made and printed before the script fails for any of them.
 set -eu
 cd "$(dirname "$0")/.."
+headless=--headless
+if [ "${1:-}" = --window ]; then
+  headless=
+  shift
+fi
 runner=${1:-}
 target=${CARGO_TARGET_DIR:-target}
 
@@ -31,7 +38,7 @@ awk 'BEGIN {
 "$letters" import "$work/Rates.md" >/dev/null
 
 failed=0
-"$letters" --bench-launch --headless "$work/Rates.let" >"$work/launch" || failed=1
+"$letters" --bench-launch $headless "$work/Rates.let" >"$work/launch" || failed=1
 cat "$work/launch"
 "$letters" --typing-report=1000 --headless "$work/Rates.let" >"$work/typing" || failed=1
 cat "$work/typing"

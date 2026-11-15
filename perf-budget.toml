@@ -8,6 +8,7 @@
 # the spread between its runs. A run over a limit has made Letters slower there. Find out why, and raise a
 # limit only for a cost that was chosen.
 
+# The launch here is of a window, on a display in memory with the CPU renderer. The others launch headless.
 [ubuntu-latest]
 launch_ms = 80
 keystroke_median_ms = 2.3
