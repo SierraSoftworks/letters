@@ -10,15 +10,19 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use letters_api::{Code, Opened, paths};
 use letters_model::{Model, Notes, Selection, Style};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
 use ureq::http::Uri;
 
+use crate::keychain::Keychain;
 use crate::remote::Roots;
 use crate::server::{Client, Refused};
 use crate::session::Session;
+use crate::signin::{SignIn, Unsigned};
 use crate::socket::{Closed, Heard, Socket};
 
 /// The server and the document that the address of a document's page names, as a browser shows it:
@@ -78,6 +82,10 @@ pub enum Unreached {
     Refused(Refused),
     /// The copy could not be kept on this device.
     Unkept(io::Error),
+    /// Nobody signed in to the server.
+    Unsigned(Unsigned),
+    /// The system opened no browser to sign in at.
+    NoBrowser(io::Error),
 }
 
 impl fmt::Display for Unreached {
@@ -85,6 +93,8 @@ impl fmt::Display for Unreached {
         match self {
             Self::Refused(refused) => refused.fmt(f),
             Self::Unkept(error) => write!(f, "its copy could not be kept on this device ({error})"),
+            Self::Unsigned(unsigned) => unsigned.fmt(f),
+            Self::NoBrowser(_) => write!(f, "no browser could be opened to sign in at"),
         }
     }
 }
@@ -138,6 +148,40 @@ pub fn reach(session: &Session, id: &str, home: &Path) -> Result<Reached, Unreac
     // Kept for the day the document is opened with no server in reach.
     let _ = serde_json::to_vec(&opened).map(|json| keep(&said, &json));
     Ok(Reached { opened, path, online: true })
+}
+
+/// How long a person has at the browser to sign in.
+const SIGN_IN_WITHIN: Duration = Duration::from_secs(300);
+
+/// Opens the way to a server's document: a session at its server, and the document's copy on this device.
+///
+/// The session is `held` if the app has one there, else the one the keychain kept from an earlier run,
+/// else a new one from a sign-in at the system's browser, which `browse` is handed the page of. The wait
+/// for the browser ends when `given_up` is set. All of this waits on the network, and on the person.
+pub fn enter(
+    server: &Client,
+    id: &str,
+    held: Option<Arc<Session>>,
+    keychain: Option<Keychain>,
+    home: &Path,
+    browse: &dyn Fn(&str) -> io::Result<()>,
+    given_up: &AtomicBool,
+) -> Result<(Arc<Session>, Reached), Unreached> {
+    let kept = || Session::kept(server.clone(), keychain?).ok().flatten().map(Arc::new);
+    if let Some(session) = held.or_else(kept).filter(|session| !session.ended()) {
+        match reach(&session, id, home) {
+            // A session the server has ended is followed by a new sign-in.
+            Err(Unreached::Refused(refused)) if refused.code() == Some(Code::SignedOut) => {}
+            reached => return reached.map(|reached| (session, reached)),
+        }
+    }
+    // Nobody is sent to sign in at what is no Letters server.
+    server.discover().map_err(Unreached::Refused)?;
+    let sign_in = SignIn::begin().map_err(Unreached::Unsigned)?;
+    browse(&sign_in.page(server).map_err(Unreached::Unsigned)?).map_err(Unreached::NoBrowser)?;
+    let token = sign_in.finish(server, SIGN_IN_WITHIN, given_up).map_err(Unreached::Unsigned)?;
+    let session = Arc::new(Session::begin(server.clone(), keychain, token));
+    reach(&session, id, home).map(|reached| (session, reached))
 }
 
 /// What is known of a document whose server never said anything this device kept: no more than its id.

@@ -259,6 +259,9 @@ pub struct Place {
     chosen: Option<PathBuf>,
     /// Whether the name is still the first Heading 1's to give. It gives one once.
     naming: bool,
+    /// What the document is called where it lives, when its file here is not named for it: the copy of
+    /// a server's document is kept under its id.
+    called: Option<String>,
 }
 
 impl Default for Place {
@@ -270,12 +273,17 @@ impl Default for Place {
 impl Place {
     /// The place of a new document: nowhere yet.
     pub fn new() -> Self {
-        Self { home: None, typed: None, chosen: None, naming: true }
+        Self { home: None, typed: None, chosen: None, naming: true, called: None }
     }
 
     /// The place of a document that was opened from its file.
     pub fn at(home: Home) -> Self {
-        Self { home: Some(home), typed: None, chosen: None, naming: false }
+        Self { home: Some(home), typed: None, chosen: None, naming: false, called: None }
+    }
+
+    /// Has the document go by `name`, as it does where it lives, whatever its file here is called.
+    pub fn call(&mut self, name: &str) {
+        self.called = Some(name.to_owned());
     }
 
     pub fn home(&self) -> Option<&Home> {
@@ -289,6 +297,7 @@ impl Place {
     /// The document's name: its file's, or the one typed for the file to come.
     pub fn name(&self) -> String {
         match (&self.home, &self.typed) {
+            _ if self.called.is_some() => self.called.clone().unwrap_or_default(),
             (Some(home), _) => home.title(),
             (None, Some(typed)) => typed.clone(),
             (None, None) => UNTITLED.into(),

@@ -568,3 +568,60 @@ fn a_document_the_person_may_no_longer_read_is_not_kept_for_them() {
     assert!(matches!(refused, Err(Unreached::Refused(refused)) if refused.code() == Some(Code::Forbidden)));
     assert!(!copy.exists());
 }
+
+/// What the system's browser does with the page it is sent to, when the person signs in there: the
+/// server notes the challenge and sends the browser back to the app with a code.
+fn sign_in_at(server: &Server) -> impl Fn(&str) -> std::io::Result<()> + '_ {
+    |page| {
+        let (port, state) = (query(page, "port").parse::<u16>().unwrap(), query(page, "state"));
+        server.letters.lock().unwrap().codes.insert("c0de".to_owned(), query(page, "challenge"));
+        thread::spawn(move || browse(port, &format!("/?code=c0de&state={state}")));
+        Ok(())
+    }
+}
+
+#[test]
+fn a_document_is_entered_with_the_session_at_hand_or_a_new_sign_in() {
+    let (home, server) = (Scratch::new("connected-enter"), Server::start());
+    let client = server.client();
+    let (waiting, exchange) = (AtomicBool::new(false), "POST /api/v1/session/exchange".to_owned());
+    let exchanges = |server: &Server| server.asked().iter().filter(|(line, _)| *line == exchange).count();
+    let no_browser = |_: &str| -> std::io::Result<()> { panic!("nobody is sent to sign in") };
+
+    // Nobody is signed in: the browser is, and the session is kept.
+    let (first, reached) =
+        connected::enter(&client, "d1", None, Some(*KEYCHAIN), &home.0, &sign_in_at(&server), &waiting).unwrap();
+    assert_eq!((first.person(), reached.opened, reached.online), (ada(), opened(), true));
+    assert_eq!(exchanges(&server), 1);
+
+    // The session the app holds opens the next document, and the one that was kept opens it after a restart.
+    for held in [Some(first.clone()), None] {
+        let (session, _) =
+            connected::enter(&client, "d1", held, Some(*KEYCHAIN), &home.0, &no_browser, &waiting).unwrap();
+        assert_eq!(session.person(), ada());
+    }
+    assert_eq!(exchanges(&server), 0);
+
+    // A session the server ended is followed by a new sign-in.
+    server.letters.lock().unwrap().signed_out = true;
+    let again = |page: &str| {
+        server.letters.lock().unwrap().signed_out = false;
+        sign_in_at(&server)(page)
+    };
+    let (session, reached) =
+        connected::enter(&client, "d1", Some(first), Some(*KEYCHAIN), &home.0, &again, &waiting).unwrap();
+    assert!(reached.online && !session.ended());
+    assert_eq!(exchanges(&server), 1);
+}
+
+#[test]
+fn nobody_is_sent_to_sign_in_at_what_is_no_letters_server() {
+    let (home, server) = (Scratch::new("connected-stranger"), Server::start());
+    // What answers there is believed by nobody.
+    let stranger = Client::new(server.client().origin(), &Roots::These(Vec::new())).unwrap();
+    let no_browser = |_: &str| -> std::io::Result<()> { panic!("nobody is sent to sign in") };
+
+    let entered = connected::enter(&stranger, "d1", None, None, &home.0, &no_browser, &AtomicBool::new(false));
+
+    assert!(matches!(entered, Err(Unreached::Refused(Refused::Unreachable(_)))));
+}
