@@ -1,8 +1,8 @@
 mod common;
 
 use common::Do::{self, K, T};
-use common::{Harness, canon};
-use letters_editor::InputEvent;
+use common::{Harness, canon, clip};
+use letters_editor::{Command, InputEvent};
 use letters_model::{BlockKind, Mark};
 
 fn play(before: &str, script: &[Do]) -> String {
@@ -217,6 +217,13 @@ fn a_stretch_of_text_on_its_own_stays_the_block_it_is() {
     let mut editor = inline("p one|");
     editor.play(&[K("Enter"), T("two")]);
     assert_eq!(editor.editor.doc().blocks.len(), 1, "Enter breaks the line inside the block");
+
+    // Lines pasted as plain text stay in the block too, whatever came with them.
+    let mut editor = inline("p one|");
+    editor.platform.clip = Some(clip(" two\n\nthree\r\nfour", Some("<h1>two</h1><p>three</p><p>four</p>")));
+    editor.run(Command::PastePlain);
+    let blocks = &editor.editor.doc().blocks;
+    assert_eq!((blocks.len(), blocks[0].plain_text().as_str()), (1, "one two\n\nthree\nfour"));
 }
 
 #[test]
