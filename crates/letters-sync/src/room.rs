@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::mem;
 
 use letters_format::{ASSETS, Error, Files, Journal, Save, Saved, Stamp, WorkingCopy, hash};
-use letters_model::{Extent, Model, Notes, Revision, Style};
+use letters_model::{Extent, Notes, Revision, Style};
 
 use crate::access::{Access, Refusal, Role, comments};
 use crate::presence::{Passage, Peer};
@@ -483,14 +483,15 @@ impl Room {
         state: &mut impl Files,
         now: u64,
     ) -> Result<bool, Error> {
-        // A device's bytes are read apart from the document first: a panic of the history library as it
-        // reads them would leave the document unusable for everyone.
-        if Model::check(updates).is_err() {
+        // A device's update is tried on a copy of the history first. One that the history library panics
+        // on, or cannot save and read again, would cost everyone the document, and one that builds on
+        // edits the room never saw would wait in it unseen.
+        if self.copy.model().admit(updates).is_err() {
             return Ok(self.refuse(session, seq, Refusal::Unreadable));
         }
         let before = (self.copy.model().extent(), self.copy.model().revision());
         let read = self.copy.edit(updates).is_ok();
-        // Edits that build on others the room never saw wait outside the document, and are not held.
+        // Held is a promise, so the room sees for itself that the document now reaches all of the update.
         let reaches = |reach: Extent| self.copy.model().extent().partial_cmp(&reach);
         let whole = read && matches!(Extent::of(updates).map(reaches), Ok(Some(Ordering::Greater | Ordering::Equal)));
         let apart = self.sessions.get_mut(&session).and_then(|session| session.apart.take()).filter(|_| whole);
