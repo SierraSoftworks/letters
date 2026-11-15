@@ -20,6 +20,7 @@ mod maths;
 pub mod motion;
 mod opening;
 mod paint;
+mod references;
 mod renaming;
 mod restyle;
 mod spelling;

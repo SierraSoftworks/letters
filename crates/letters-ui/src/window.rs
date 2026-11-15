@@ -26,6 +26,7 @@ use crate::maths::{self, Maths, Sheet, SheetLines, Source};
 use crate::motion::{self, FRAME_MS};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
+use crate::references::{self, Preview, Reference, References};
 use crate::renaming::{Outcome, Rename, Renaming};
 use crate::restyle::{self, Field, StyleEdit};
 use crate::spelling::{Fix, Spelling};
@@ -33,7 +34,7 @@ use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::styles::{self, Styles, Styling};
 use crate::text::{Family, FontShaper, TextShaper, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::ui::{App, Idle, Keys, Ui};
+use crate::ui::{App, DRAG_SLOP, Idle, Keys, Ui};
 use crate::widgets::{
     Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, Title, TopBar, side_panel, top_bar,
 };
@@ -451,6 +452,9 @@ pub struct EditorApp {
     dragging: bool,
     maths: Maths,
     insert: Insert,
+    references: References,
+    /// The preview of a figure that shows over the page: its caption, and where it is in the page area.
+    previewed: Option<(String, Rect)>,
     /// How the document read when assistive technology was last told of it.
     told: RefCell<describe::Told>,
 }
@@ -496,6 +500,8 @@ impl EditorApp {
             dragging: false,
             maths: Maths::default(),
             insert: Insert::default(),
+            references: References::default(),
+            previewed: None,
             told: RefCell::default(),
         }
     }
@@ -687,6 +693,8 @@ impl EditorApp {
             self.estimated = true;
         }
         if edited {
+            // What the pointer rested on may be gone, or somewhere else.
+            self.unpoint();
             self.highlight((!change.structure).then_some(&change.blocks));
             let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
             self.spelling.edited(change, self.editor.doc(), caret, &mut self.layout);
@@ -753,11 +761,77 @@ impl EditorApp {
         self.layout.hit(Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP })
     }
 
+    /// The reference to a figure at a point of the page area, while nothing hangs over the page.
+    fn reference(&self, at: Point) -> Option<Reference> {
+        let hung = self.landing.is_some() || self.spelling.fix.is_some() || self.link.is_some();
+        if hung || self.insert.offers(&self.editor).is_some() {
+            return None;
+        }
+        let at = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+        Reference::at(self.editor.doc(), &self.layout, at)
+    }
+
+    /// Whether enough of a figure's picture is in view to tell it by: half of it, or of the page area.
+    fn in_view(&self, figure: &BlockId) -> bool {
+        let Some(picture) = self.layout.figure(figure).map(|figure| figure.image) else { return false };
+        let view = self.viewport();
+        let shown = (picture.y + picture.height).min(view.y + view.height) - picture.y.max(view.y);
+        shown >= picture.height.min(view.height) / 2.0
+    }
+
+    /// Where a figure's picture is in the layout, and each picture of a gallery by itself.
+    fn pictures(&self, figure: &BlockId) -> Option<(Rect, Vec<Rect>)> {
+        let whole = self.layout.figure(figure)?.image;
+        let parts = self.editor.doc().block(figure).map_or(&[][..], |block| block.body.blocks());
+        let parts = parts.iter().filter(|part| matches!(part.kind, BlockKind::Figure { .. }));
+        let each: Vec<Rect> = parts.filter_map(|part| Some(self.layout.figure(&part.id)?.image)).collect();
+        Some((whole, if each.is_empty() { vec![whole] } else { each }))
+    }
+
+    /// Works out again which reference the pointer rests on, after it or the page under it has moved.
+    /// Returns whether what shows changed with it.
+    fn repoint(&mut self) -> bool {
+        let found = self.references.rest().and_then(|at| self.reference(at));
+        let found = found.map(|reference| {
+            let in_view = self.in_view(&reference.target);
+            (reference, in_view)
+        });
+        self.references.point(found)
+    }
+
+    /// Forgets where the pointer rests until it next moves, as when the person goes on writing.
+    fn unpoint(&mut self) {
+        self.references.set_rest(None);
+        self.repoint();
+    }
+
+    /// Brings a figure into view, as a press on a reference to it asks: to the middle of the page area
+    /// with its caption, or under the top when it is too tall for that. One that shows whole stays where it
+    /// is. The caret stays at the reference, so the next key goes on from there.
+    fn show_figure(&mut self, figure: &BlockId) {
+        // Twice, since laying out what comes into view can move the figure.
+        for _ in 0..2 {
+            let Some(at) = self.layout.figure(figure) else { return };
+            let (top, bottom) = (at.image.y, at.caption.y + at.caption.height);
+            let view = self.viewport();
+            if top >= view.y && bottom <= view.y + view.height {
+                break;
+            }
+            let above = ((self.height - (bottom - top)) / 2.0).max(GUTTER.min(self.height / 4.0));
+            self.scroll = (top + TOP - above).clamp(0.0, self.max_scroll());
+            self.layout.settle(self.viewport(), 0);
+        }
+        self.references.flash(figure);
+    }
+
     fn pointer(&mut self, event: Pointer, platform: &mut dyn Platform) {
         match event {
             Pointer::Down { at, mods, clicks } => {
                 self.picked = None;
                 self.maths.typed(false);
+                // A press that stays on a reference follows it. Any other press is the caret's alone.
+                let pressed = self.reference(at).filter(|_| clicks == 1 && !mods.shift);
+                self.references.press(pressed.map(|reference| (reference, at)));
                 // Under the last block there is always a line to write on, also when the document ends in
                 // something that holds the caret in, as a code block does.
                 if at.y + self.scrolled() - TOP > self.layout.height() && !mods.shift {
@@ -787,19 +861,31 @@ impl EditorApp {
             }
             Pointer::Drag { at } if self.dragging => {
                 let (Some(head), Some(selection)) = (self.hit(at), self.editor.selection()) else { return };
+                // A drag that selects is no longer pointing at anything.
+                if head != selection.anchor {
+                    self.references.point(None);
+                }
                 self.editor.select(Selection { anchor: selection.anchor.clone(), head });
                 // Dragging past an edge scrolls the page after the selection.
                 self.reveal();
             }
             Pointer::Drag { .. } => {}
-            Pointer::Up { .. } => {
+            Pointer::Up { at } => {
                 self.dragging = false;
                 // The markers at the caret show once the button is up: text that made room for them
                 // under a pointer still held would be selected by its next move.
                 self.mark();
+                let reference = self.reference(at);
+                if let Some(figure) = self.references.followed(at, DRAG_SLOP, reference.as_ref()) {
+                    self.show_figure(&figure);
+                }
             }
             Pointer::Menu { at } => self.menu(at),
-            Pointer::Scroll { delta } => self.scroll_by(delta.y),
+            Pointer::Scroll { delta } => {
+                self.scroll_by(delta.y);
+                // Another part of the page is under the pointer now.
+                self.repoint();
+            }
         }
     }
 
@@ -971,12 +1057,25 @@ impl EditorApp {
             let rect = Rect::new(image.x - RING, image.y - RING, image.width + 2.0 * RING, image.height + 2.0 * RING);
             Item::Stroke { rect, color: ring, width: 2.0, radius: 2.0 }
         }));
+        // The figure a reference under the pointer means, or the one the page was just brought to.
+        let lit = self.references.light().and_then(|(figure, way)| Some((self.pictures(figure)?, way)));
+        match lit {
+            Some(((figure, pictures), Some(way))) => {
+                references::light(figure, &pictures, way, self.scheme, self.scale, &mut list);
+            }
+            Some(((figure, _), None)) => references::mark(figure, self.scheme, &mut list),
+            None => {}
+        }
+        let mut over = DisplayList::default();
+        self.previewed = self.preview(origin, room, &mut over);
+
         let written = sheet.is_none() && self.editor.picture().is_none();
         let caret = selection.filter(|_| written).and_then(|selection| self.layout.caret(&selection.head));
         let caret =
             caret.map(|caret| Rect { x: origin.x + caret.x, y: origin.y + caret.y, width: CARET_WIDTH, ..caret });
         let paint = PagePaint {
             list,
+            over,
             origin,
             page: self.palette.page,
             content: self.layout.height() + 2.0 * TOP,
@@ -990,7 +1089,8 @@ impl EditorApp {
             .default_focus()
             .caret(caret)
             .on_text(Message::Text)
-            .on_pointer(|event| Some(Message::Pointer(event)));
+            .on_pointer(|event| Some(Message::Pointer(event)))
+            .pointed();
         if let Some(landing) = &self.landing {
             element = element.popover(Self::card(landing, room));
         } else if let Some(fix) = &self.spelling.fix {
@@ -1018,7 +1118,26 @@ impl EditorApp {
             element =
                 element.popover(self.maths.sheet(source, selection, rect.width, self.wide(), self.scheme).at(spot));
         }
-        element
+        // A press on a reference follows it, which the pointer's shape says.
+        if self.references.pointed().is_some() { element.cursor(Cursor::Pointer) } else { element }
+    }
+
+    /// Draws the figure of the reference under the pointer small beside it, when it is out of view. `origin`
+    /// is where the layout's origin is in the page area, and `room` the size of that area. Returns what the
+    /// preview says and where it is.
+    fn preview(&self, origin: Point, room: Size, out: &mut DisplayList) -> Option<(String, Rect)> {
+        let reference = self.references.previewed()?;
+        let rest = self.references.rest()?;
+        let picture = self.layout.figure(&reference.target)?.image;
+        let caption = references::caption(self.editor.doc(), self.editor.model().style(), &reference.target)?;
+        // The preview hangs from the line of the label that the pointer is on.
+        let lines = reference.lines(&self.layout);
+        let on_page = |line: &Rect| Rect { x: line.x + origin.x, y: line.y + origin.y, ..*line };
+        let anchor = lines.iter().map(on_page).find(|line| line.contains(rest)).or(lines.first().map(on_page))?;
+        let page = self.palette.page;
+        let preview = Preview { layout: &self.layout, picture, page, caption: &caption, anchor, room };
+        let rect = preview.paint(self.shaper.as_ref(), self.scheme, out);
+        Some((caption, rect))
     }
 
     /// The heading the top of the view is under.
@@ -1690,6 +1809,7 @@ impl App for EditorApp {
                 let before = self.editor.selection().filter(|_| dollar && !self.reduced_motion);
                 let before = before.map(|selection| selection.head.clone());
                 let before = before.map(|head| (self.layout.caret(&Pos::new(head.block.clone(), 0)), head));
+                self.unpoint();
                 self.edit(platform, |editor, platform| editor.input(event, platform));
                 self.maths.typed(true);
                 self.insert.typed(&self.editor);
@@ -1781,6 +1901,8 @@ impl App for EditorApp {
         // A key that deletes is typing too. One that moves the caret is not, and puts the symbols away.
         if used {
             self.maths.typed(edited);
+            // The page may have moved under a pointer that rests where it was.
+            self.unpoint();
         }
         // The editor leaves this one to the window, which edits the link in place.
         let link = event.key == Key::Char('k') && event.mods == Modifiers { primary: true, ..Modifiers::default() };
@@ -1793,6 +1915,9 @@ impl App for EditorApp {
     fn describe(&self, page: &mut AccessNode, nodes: &mut Vec<(NodeId, AccessNode)>, whole: bool) {
         let told = &mut self.told.borrow_mut();
         describe::page(self.editor.doc(), self.editor.selection(), told, whole, page, nodes);
+        if let Some((caption, rect)) = &self.previewed {
+            describe::preview(caption, *rect, page, nodes);
+        }
     }
 
     fn access_action(&mut self, request: &ActionRequest, platform: &mut dyn Platform) {
@@ -1847,6 +1972,12 @@ impl App for EditorApp {
 
     fn reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
+        self.references.set_reduced_motion(reduced);
+    }
+
+    fn point(&mut self, at: Option<Point>) -> bool {
+        self.references.set_rest(at);
+        self.repoint()
     }
 
     fn active(&mut self, active: bool) {
@@ -1875,7 +2006,8 @@ impl App for EditorApp {
             }
             (progress < 1.0).then_some(now_ms + FRAME_MS)
         });
-        [note, slide, fade].into_iter().flatten().min()
+        let light = self.references.animate(now_ms);
+        [note, slide, fade, light].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {
@@ -1907,6 +2039,8 @@ impl App for EditorApp {
 /// What the layout painted for the part of the page in view, placed where the page area is.
 struct PagePaint {
     list: DisplayList,
+    /// What hangs over the page, placed in the page area: the preview of a figure.
+    over: DisplayList,
     /// Where the layout's origin is inside the page area.
     origin: Point,
     page: Color,
@@ -1922,6 +2056,9 @@ impl Paint for PagePaint {
         out.items.extend(self.list.items.iter().cloned());
         out.translate(first, Point { x: rect.x + self.origin.x, y: rect.y + self.origin.y });
         out.items.extend(scrollbar(rect, self.content, self.scroll, scheme, 1.0));
+        let first = out.items.len();
+        out.items.extend(self.over.items.iter().cloned());
+        out.translate(first, Point { x: rect.x, y: rect.y });
     }
 }
 

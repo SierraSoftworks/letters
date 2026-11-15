@@ -242,6 +242,12 @@ impl<A: App> Harness<A> {
         self
     }
 
+    /// Moves the pointer to a point with no button held.
+    pub fn hover_at(&mut self, at: Point) -> &mut Self {
+        self.ui.pointer_move(at, &mut self.platform);
+        self
+    }
+
     pub fn press_at(&mut self, at: Point) -> &mut Self {
         self.ui.pointer_move(at, &mut self.platform);
         self.ui.pointer_down(at, Modifiers::default(), &mut self.platform);

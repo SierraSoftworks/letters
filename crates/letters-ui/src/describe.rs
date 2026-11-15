@@ -13,6 +13,7 @@ use std::mem;
 
 use accesskit::{Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection, Toggled};
 use letters_model::{Block, BlockId, BlockKind, Body, Document, ListKind, Pos, Selection};
+use letters_render::Rect;
 
 /// The parts of a block that have nodes of their own, beside its text.
 const LIST: u8 = 1;
@@ -86,6 +87,20 @@ pub(crate) fn page(
     let mut telling = Telling { before: (!whole).then_some(&before), now: HashMap::with_capacity(before.len()), nodes };
     page.set_children(push_blocks(&doc.blocks, &mut telling));
     told.0 = telling.now;
+}
+
+/// Adds the preview of a figure under the page: a tooltip that reads the figure's caption. `rect` is where
+/// it shows in the page area.
+pub(crate) fn preview(caption: &str, rect: Rect, page: &mut Node, nodes: &mut Vec<(NodeId, Node)>) {
+    let (x, y) = page.bounds().map_or((0.0, 0.0), |page| (page.x0, page.y0));
+    let (x, y) = (x + f64::from(rect.x), y + f64::from(rect.y));
+    let mut tip = Node::new(Role::Tooltip);
+    tip.set_label(caption);
+    tip.set_bounds(accesskit::Rect { x0: x, y0: y, x1: x + f64::from(rect.width), y1: y + f64::from(rect.height) });
+    // No block's id holds a byte of 0xff, so no node of the document is this one.
+    let id = NodeId(hashed([0xff, 0xff].into_iter()) & !1);
+    page.push_child(id);
+    nodes.push((id, tip));
 }
 
 /// A list item's depth and which kind of list it is in. A task belongs with its list ticked or not.
