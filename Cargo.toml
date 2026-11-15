@@ -99,6 +99,11 @@ todo = "allow"
 
 [profile.dev]
 debug = "line-tables-only"
+# Each test binary links the whole tree, and incremental state and dependency debug info filled 30 GB disks.
+incremental = false
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 lto = "thin"
