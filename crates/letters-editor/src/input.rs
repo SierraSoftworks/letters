@@ -88,9 +88,11 @@ impl Editor {
             // A caption and a cell hold one stretch of text, so lines pasted into one run on.
             return self.insert(&text.replace('\n', " "));
         }
+        // A line break alone is Enter. Among other text it only parts the lines.
+        let pressed = text == "\n";
         for (index, line) in text.split('\n').enumerate() {
             if index > 0 {
-                self.split(platform);
+                self.split(pressed, platform);
             }
             self.insert(line);
         }

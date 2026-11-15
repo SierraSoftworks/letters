@@ -254,7 +254,7 @@ impl Editor {
     }
 
     /// Deletes the selection, or from the caret to where `motion` leads.
-    pub(crate) fn delete(&mut self, motion: Motion, platform: &dyn Platform) {
+    pub(crate) fn delete(&mut self, motion: Motion, platform: &mut dyn Platform) {
         if self.delete_selection() {
             return;
         }
@@ -278,7 +278,7 @@ impl Editor {
             }
             let Some(block) = self.block(&pos.block) else { return };
             if !right && pos.offset == 0 {
-                return self.delete_at_start(caret);
+                return self.delete_at_start(caret, platform);
             }
             if right && pos.offset == text::len(block) {
                 return self.delete_at_end(caret);
@@ -314,8 +314,8 @@ impl Editor {
     }
 
     /// Backspace at the start of a block takes away what makes the block more than a paragraph, one step
-    /// at a time, and then joins it to the block before.
-    fn delete_at_start(&mut self, caret: Caret) {
+    /// at a time, and then joins it to the block before. A card before it goes back to the link it shows.
+    fn delete_at_start(&mut self, caret: Caret, platform: &mut dyn Platform) {
         let id = caret.selection.head.block.clone();
         let doc = self.doc();
         let (Some(block), Some(place)) = (doc.block(&id), self.seat(&id)) else { return };
@@ -380,6 +380,10 @@ impl Editor {
         } else if tree::is_text(before) {
             let pos = self.join(&before.id.clone(), &id);
             self.place_with(pos, caret.marks);
+        } else if matches!(before.kind, BlockKind::LinkPreview { .. }) {
+            // A card is a link on a line of its own, and is text to keep or to delete once it is that.
+            let card = before.id.clone();
+            self.card_as_link(&card, platform);
         } else {
             // A divider, or anything else with no text to join, is removed whole.
             self.apply(vec![Op::RemoveBlock { block: tree::removal(doc, &before.id) }]);
@@ -515,8 +519,9 @@ impl Editor {
         }
     }
 
-    /// Breaks the block at the caret, as Enter does.
-    pub(crate) fn split(&mut self, platform: &mut dyn Platform) -> Kind {
+    /// Breaks the block at the caret, as Enter does. `pressed` says that Enter was pressed, and the break
+    /// is not one among the lines of other text.
+    pub(crate) fn split(&mut self, pressed: bool, platform: &mut dyn Platform) -> Kind {
         self.delete_selection();
         let Some(caret) = self.caret.clone() else { return Kind::Other };
         if caret.picture {
@@ -535,6 +540,12 @@ impl Editor {
         let at = caret.selection.head.clone();
         if self.split_part(&at, platform) {
             return Kind::Other;
+        }
+        // An address that Enter is pressed after is a link, as one a space is typed after. An address
+        // alone on its line is a card instead, below.
+        let card = pressed && self.typed_card(&at.block);
+        if pressed && !card {
+            self.link_typed(&at.block, at.offset);
         }
         let doc = self.doc();
         let (Some(block), Some(place)) = (doc.block(&at.block), self.seat(&at.block)) else {
@@ -569,6 +580,11 @@ impl Editor {
                 self.table_rule(&id, platform);
                 self.rule = true;
                 return Kind::Rule;
+            }
+            BlockKind::Paragraph if card && at_end => {
+                // An address typed on a line of its own is shown as a card, above the line to write on.
+                self.address_as_card(&id, &text, platform);
+                return Kind::Other;
             }
             BlockKind::Paragraph if at_end => {
                 // A fence opens code, and `$$` a formula.
@@ -719,7 +735,9 @@ impl Editor {
             self.pieces(&caret.selection)
         };
         let ops = pieces.into_iter().map(|(block, range)| Op::SetLink { block, range, link: link.clone() });
-        self.apply(ops.collect());
+        if let (true, Some(link)) = (self.apply(ops.collect()), link) {
+            self.put_in(&link);
+        }
     }
 
     pub(crate) fn toggle_checked(&mut self) {

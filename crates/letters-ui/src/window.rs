@@ -1115,6 +1115,16 @@ impl EditorApp {
             self.palette.selection = resolve(fade(self.accent.base, 0.3), self.scheme, 1.0);
         }
         self.layout.set_palette(self.palette);
+        self.light();
+    }
+
+    /// Lights the term the caret is at in the formula it is written in, in the accent as text: what the
+    /// sheet's caret stands at in the source is seen in the formula over it.
+    fn light(&mut self) {
+        let written = self.editor.formula().is_some();
+        let caret = self.editor.selection().filter(|selection| written && selection.is_caret());
+        let lit = resolve(self.accent.text, self.scheme, 1.0);
+        self.layout.tint_term(caret.map(|caret| (&caret.head, lit)));
     }
 
     /// The first Heading 1, which names a document that has no name of its own.
@@ -2177,6 +2187,11 @@ impl EditorApp {
             self.highlight(None);
             self.tell_links(None);
         }
+        // A sheet says nothing of a fetch. What the page wrote on a preview goes, so that the sheets break
+        // where the printed ones do, and is written again when the page shows.
+        for preview in self.previews.unnoted() {
+            self.layout.set_preview_note(&preview, None);
+        }
         // Paging lays out whatever was still estimated.
         let pages = self.layout.paginate(&self.editor.model().style().page);
         self.estimated = false;
@@ -2377,6 +2392,7 @@ impl EditorApp {
         self.layout.set_composition(self.editor.composition());
         let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
         self.spelling.moved(caret, &mut self.layout);
+        self.light();
         // A document without a name takes its first Heading 1, once the caret has left it.
         let heading = self.heading().filter(|_| self.location.name.is_none());
         let naming = heading.zip(head.as_ref()).is_some_and(|(heading, head)| heading.id == head.block);
@@ -3467,6 +3483,16 @@ impl EditorApp {
                 self.held(|page| page.layout.set_caption_open(named.as_ref()));
                 self.captions.named = named;
             }
+        }
+        // A preview says under its address why its page was not fetched, for as long as that holds. A line
+        // that comes or goes above the view leaves what is read where it is.
+        let notes = self.previews.notes();
+        if !notes.is_empty() {
+            self.held(|page| {
+                for (preview, note) in &notes {
+                    page.layout.set_preview_note(preview, note.as_deref());
+                }
+            });
         }
         // A heading's markers hang in the margin, beside the outline when it shows.
         let taken = if self.outlined() { chapters_width() } else { tokens::SPACE_SM };
@@ -4990,7 +5016,7 @@ impl App for EditorApp {
             let at = self.onto(card.rect);
             describe::whole(&card.block, Whole::Preview, (previews::LABEL, None), at, page, nodes);
             if let Some(room) = card.control.filter(|_| self.previews.offered()) {
-                let failed = self.previews.failed(&card.block).map(|why| format!("Not fetched: {why}"));
+                let failed = self.previews.failed(&card.block);
                 let told = (self.previews.says(&card.block), failed.as_deref());
                 describe::whole(&card.block, Whole::Fetch, told, self.onto(previews::control(room)), page, nodes);
             }

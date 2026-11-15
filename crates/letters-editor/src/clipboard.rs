@@ -7,10 +7,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use letters_convert::{from_html, from_markdown, to_html_fragment, to_markdown};
-use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Op, Pos, PropertiesFormat, Run};
+use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Op, Pos, Preview, PropertiesFormat, Run};
 use serde_json::Value;
 
-use crate::{Clip, Editor, Platform, parts, refs, text, tree};
+use crate::{Clip, Editor, Platform, links, parts, refs, text, tree};
 
 /// The HTML attribute that holds the copied blocks.
 const CARRIER: &str = "data-letters-blocks";
@@ -50,10 +50,14 @@ fn carried(html: &str) -> Option<Vec<Block>> {
     blocks.into_iter().map(|block| Block::from_value(block, "clipboard").ok()).collect()
 }
 
-/// The clipboard's plain text for `blocks`: their Markdown.
-fn to_text(blocks: &[Block]) -> String {
+/// What a document keeps of the pages its links lead to, by address.
+type Previews = BTreeMap<String, Preview>;
+
+/// The clipboard's plain text for `blocks`: their Markdown, where a link says the title that `previews`
+/// keeps of its page.
+fn to_text(blocks: &[Block], previews: &Previews) -> String {
     let markdown = |blocks: &[Block]| {
-        let doc = Document { blocks: blocks.to_vec(), ..Document::default() };
+        let doc = Document { blocks: blocks.to_vec(), previews: previews.clone(), ..Document::default() };
         to_markdown(&doc).trim_end_matches('\n').to_owned()
     };
     // A phrase keeps the spaces at its edges as they are, which Markdown would have to escape.
@@ -70,10 +74,13 @@ fn to_text(blocks: &[Block]) -> String {
     markdown(blocks)
 }
 
-/// The blocks that text from another application stands for, read as Markdown.
-fn from_text(text: &str, platform: &mut dyn Platform) -> Vec<Block> {
+/// The blocks that text from another application stands for, read as Markdown, and what its links say
+/// of the pages they lead to.
+fn from_text(text: &str, platform: &mut dyn Platform) -> (Vec<Block>, Previews) {
+    let mut told = Previews::new();
     let mut read = |markdown: &str| {
         let mut doc = from_markdown(markdown, &mut || platform.new_id()).0;
+        told.append(&mut doc.previews);
         // Front matter is read as the properties of a document, and a paste is not one. Its lines stay.
         if let Some(properties) = doc.properties {
             let language = if properties.format == PropertiesFormat::Toml { "toml" } else { "yaml" };
@@ -85,7 +92,8 @@ fn from_text(text: &str, platform: &mut dyn Platform) -> Vec<Block> {
     };
     let line = text.trim_matches('\n');
     if line.contains('\n') {
-        return read(text);
+        let blocks = read(text);
+        return (blocks, told);
     }
     // A phrase keeps the spaces at its edges, which Markdown would drop or read as an indent.
     let phrase = line.trim();
@@ -95,13 +103,7 @@ fn from_text(text: &str, platform: &mut dyn Platform) -> Vec<Block> {
         runs.insert(0, Run::plain(&line[..start]));
         runs.push(Run::plain(&line[start + phrase.len()..]));
     }
-    blocks
-}
-
-fn is_address(text: &str) -> bool {
-    let schemes = ["http://", "https://", "mailto:"];
-    schemes.iter().any(|scheme| text.len() > scheme.len() && text.starts_with(scheme))
-        && !text.contains(char::is_whitespace)
+    (blocks, told)
 }
 
 /// The last text block in `blocks`, at any depth.
@@ -229,7 +231,8 @@ impl Editor {
     pub(crate) fn copy(&mut self, platform: &mut dyn Platform) {
         let blocks = self.fragment();
         if !blocks.is_empty() {
-            let clip = Clip { text: to_text(&blocks), html: Some(to_html(&blocks)), ..Clip::default() };
+            let text = to_text(&blocks, &self.doc().previews);
+            let clip = Clip { text, html: Some(to_html(&blocks)), ..Clip::default() };
             platform.clipboard_write(clip);
         }
     }
@@ -265,7 +268,7 @@ impl Editor {
         let code = self.block(&selection.head.block).is_some_and(text::is_source) || self.formula().is_some();
         let ranged = !selection.is_caret();
         let address = clip.text.trim();
-        if !plain && !code && ranged && is_address(address) {
+        if !plain && !code && ranged && links::is_address(address) {
             // A web address pasted over a selection links it.
             return self.set_link(Some(address.to_owned()));
         }
@@ -278,14 +281,35 @@ impl Editor {
             let text = own.map_or(text, |blocks| lines(&blocks).join("\n"));
             return self.insert_lines(&text, platform);
         }
+        // An address is a link by itself, except where it goes into code.
+        if own.is_none() && !marks.contains(&Mark::Code) && links::is_address(address) {
+            return self.paste_address(address, &marks, platform);
+        }
         // Formatted text keeps its own formatting. Bare text takes what is in force at the caret.
         let none = BTreeSet::new();
         let read = |html: &str, platform: &mut dyn Platform| from_html(html, &mut || platform.new_id()).0.blocks;
         let formatted = own.or_else(|| html.map(|html| read(html, platform)).filter(|blocks| !blocks.is_empty()));
-        match formatted.map_or_else(|| (from_text(&text, platform), &marks), |blocks| (blocks, &none)) {
-            (blocks, _) if blocks.is_empty() => self.insert_lines(&text, platform),
-            (blocks, marks) => self.insert_blocks(blocks, marks, platform),
+        let ((blocks, told), marks) = match formatted {
+            Some(blocks) => ((blocks, Previews::new()), &none),
+            None => (from_text(&text, platform), &marks),
+        };
+        if blocks.is_empty() {
+            return self.insert_lines(&text, platform);
         }
+        self.insert_blocks(blocks, marks, platform);
+        self.keep_told(told);
+    }
+
+    /// Pastes an address at the caret: the address of a web page as a card where the line holds nothing
+    /// else, and any address as a link in the text of a line that does.
+    fn paste_address(&mut self, address: &str, marks: &BTreeSet<Mark>, platform: &mut dyn Platform) {
+        let Some(at) = self.selection().map(|selection| selection.head.clone()) else { return };
+        if self.pasted_card(address, &at.block) {
+            return self.address_as_card(&at.block, address, platform);
+        }
+        self.replace(&at.block, at.offset..at.offset, address, marks, &Some(address.to_owned()));
+        self.place_with(Pos::new(at.block, at.offset + address.len()), marks.clone());
+        self.put_in(address);
     }
 
     /// Replaces the selection with `blocks`. Text poured into the block at the caret also takes `marks`.

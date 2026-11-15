@@ -202,8 +202,8 @@ fn an_address_pasted_over_a_selection_links_it() {
     };
     let address = "https://example.com/page";
     assert_eq!(paste("p see ^this| page", address), canon("p see ^[this](https://example.com/page)| page"));
-    // With nothing selected, or with text that is no address, it is pasted as text.
-    assert_eq!(paste("p see |", address), canon("p see https://example.com/page|"));
+    // With nothing selected it is a link itself, and text that is no address is pasted as text.
+    assert_eq!(paste("p see |", address), canon(&format!("p see [{address}]({address})|")));
     assert_eq!(paste("p see ^this| page", "that"), canon("p see that| page"));
 }
 

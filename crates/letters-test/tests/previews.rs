@@ -213,12 +213,16 @@ fn a_fetch_that_finds_nothing_says_why_and_offers_another_try() {
             "Not fetched: the page has no title, description or picture",
         ),
     ];
+    // How tall the preview stands on the page.
+    let tall = |window: &mut Harness| window.find(Role::Button, EDIT).expect("the preview").bounds.height;
     for (case, answer, said) in cases {
         let mut window = bare();
+        let alone = tall(&mut window);
         window.click(Role::Button, FETCH);
         fetches(&mut window);
         answer(&mut window);
         assert_eq!(shown(&window), (QUOTE.to_owned(), None, None, None), "{case}: the preview is as it was");
+        assert!(tall(&mut window) > alone, "{case}: a line under its address says why");
         let again = window.find(Role::Button, "Try again").unwrap_or_else(|| panic!("{case}: another try is offered"));
         assert_eq!(again.description.as_deref(), Some(said), "{case}");
         // The card of the preview says it too.
@@ -229,7 +233,30 @@ fn a_fetch_that_finds_nothing_says_why_and_offers_another_try() {
         window.click(Role::Button, "Try again");
         assert_eq!(fetches(&mut window), [QUOTE], "{case}");
         window.assert_open(Role::Button, "Fetching");
+        assert_eq!(tall(&mut window), alone, "{case}: the line goes for another try");
     }
+}
+
+#[test]
+fn print_view_shows_a_preview_as_it_prints_whatever_is_said_of_its_fetch() {
+    // A note in Print view after its preview was asked for, and what the shell answered if it did.
+    let printing = |failed: Option<&str>| {
+        let mut window = bare();
+        window.click(Role::Button, FETCH);
+        if let Some(why) = failed {
+            window.ui().fail_preview(QUOTE, why);
+        }
+        let tall = window.find(Role::Button, EDIT).expect("the preview").bounds.height;
+        window.key("Mod+P");
+        (window, tall)
+    };
+    let ((mut waiting, alone), (mut failed, said)) = (printing(None), printing(Some("the server answered 404")));
+    assert!(said > alone, "the page says why");
+    assert!(failed.paint() == waiting.paint(), "a sheet says nothing of a fetch and keeps no room for it");
+
+    failed.key("Escape");
+    let back = failed.find(Role::Button, EDIT).expect("the preview").bounds.height;
+    assert_eq!(back, said, "the page says it again");
 }
 
 #[test]

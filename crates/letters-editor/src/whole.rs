@@ -1,5 +1,6 @@
 //! Blocks that hold no text: a divider, a table of contents and a link preview. No caret stands in one, so
-//! the caret steps over it, Backspace beside it removes it whole, and a change to one names it.
+//! the caret steps over it, what deletes beside it takes it whole, and a change to one names it. Backspace
+//! after a link preview turns it back into its link: see [`crate::links`].
 
 use letters_model::{Block, BlockId, BlockKind, Op, Pos};
 
@@ -46,14 +47,19 @@ pub(crate) fn address(url: &str) -> Option<String> {
     (!url.is_empty()).then_some(url)
 }
 
+/// What a page says of itself, as a preview keeps it: a page's own words come with the white space of
+/// its markup, and what says nothing is none.
+pub(crate) fn folded(text: &Option<String>) -> Option<String> {
+    let text = text.as_deref()?.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
 /// A link preview after an edit. `None` for an edit that cannot be taken, or a block that is no preview.
 fn edited(kind: &BlockKind, edit: &PreviewEdit) -> Option<BlockKind> {
     let BlockKind::LinkPreview { url, title, description, image } = kind else { return None };
     let (mut url, mut title, mut description, mut image) =
         (url.clone(), title.clone(), description.clone(), image.clone());
     let said = |text: String| (!text.is_empty()).then_some(text);
-    // A page's own words come with the white space of its markup.
-    let found = |text: &Option<String>| said(text.as_deref()?.split_whitespace().collect::<Vec<_>>().join(" "));
     match edit {
         PreviewEdit::Url(to) => url = address(to)?,
         // Text is typed a key at a time, so the spaces at its ends are left as typed.
@@ -65,7 +71,7 @@ fn edited(kind: &BlockKind, edit: &PreviewEdit) -> Option<BlockKind> {
             if address(of).as_ref() != Some(&url) {
                 return None;
             }
-            (title, description) = (found(named), found(about));
+            (title, description) = (folded(named), folded(about));
             image = picture.as_ref().and_then(|picture| figures::asset_name(&picture.bytes));
         }
     }
@@ -78,11 +84,12 @@ impl Editor {
         self.insert_whole(BlockKind::TableOfContents { levels: LEVELS }, platform);
     }
 
-    /// Puts in a card that leads to an address, and shows that alone until it is filled.
+    /// Puts in a card that leads to an address. It shows what the document keeps of the page, and the
+    /// address alone until it is filled when that is nothing.
     pub(crate) fn insert_preview(&mut self, url: &str, platform: &mut dyn Platform) {
-        if let Some(url) = address(url) {
-            let kind = BlockKind::LinkPreview { url, title: None, description: None, image: None };
+        if let (Some(kind), Some(url)) = (self.card(url), address(url)) {
             self.insert_whole(kind, platform);
+            self.put_in(&url);
         }
     }
 
