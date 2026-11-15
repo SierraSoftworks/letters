@@ -1,11 +1,13 @@
 //! Saving a copy of a document, or writing it in another format: one card over the page asks for the
 //! copy's name, its format and its folder. Opened while the history shows an earlier version, the card
-//! asks for a copy of that version.
+//! asks for a copy of that version. Under the formats it lists what the picked one will simplify, before
+//! anything is written.
 //!
 //! The window only asks: the shell writes the copy, and answers with where it went or with why it could not.
 
 use accesskit::Role;
-use letters_model::Revision;
+use letters_convert::{Loss, Target, losses_with};
+use letters_model::{Document, Notes, Revision};
 use letters_render::{Rect, Size};
 
 use crate::element::Element;
@@ -20,6 +22,10 @@ use crate::window::Message;
 const CARD_WIDTH: f32 = 544.0;
 /// The most rows the tree shows before it scrolls.
 const ROWS: f32 = 6.5;
+/// What the list of a format's losses is called.
+const LOSSES: &str = "Simplified in this copy";
+/// The height of a line of the losses, for placing the card.
+const LOSS_HEIGHT: f32 = 18.0;
 
 /// What a copy of a document can be written as.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -27,6 +33,9 @@ pub enum CopyFormat {
     /// Another document, with this one's history.
     #[default]
     Letters,
+    /// Another document with this one's text and pictures and nothing of how it came to be: no history
+    /// and no notes. A file that ends as a Letters document does.
+    Clean,
     Word,
     Pdf,
     /// One HTML file.
@@ -35,12 +44,13 @@ pub enum CopyFormat {
 }
 
 impl CopyFormat {
-    pub const ALL: [Self; 5] = [Self::Letters, Self::Word, Self::Pdf, Self::WebPage, Self::Markdown];
+    pub const ALL: [Self; 6] = [Self::Letters, Self::Clean, Self::Word, Self::Pdf, Self::WebPage, Self::Markdown];
 
     /// The format's name, as the card offers it.
     pub fn name(self) -> &'static str {
         match self {
             Self::Letters => "Letters",
+            Self::Clean => "Clean copy",
             Self::Word => "Word",
             Self::Pdf => "PDF",
             Self::WebPage => "Web page",
@@ -53,10 +63,24 @@ impl CopyFormat {
         match self {
             Self::Letters if earlier => "A document of its own that starts with this version\u{2019}s text.",
             Self::Letters => "A document of its own that starts with this one\u{2019}s text and history.",
+            Self::Clean => "A document of its own that holds this one\u{2019}s text and nothing of how it came to be.",
             Self::Word => "A .docx file for Word and other editors.",
             Self::Pdf => "A .pdf file, set in pages as it would print.",
             Self::WebPage => "One .html file that holds its own pictures.",
             Self::Markdown => "A .md file. Its pictures are written beside it.",
+        }
+    }
+
+    /// What the format is to the converters, which say what it will simplify. A copy with the history
+    /// simplifies nothing.
+    fn target(self) -> Option<Target> {
+        match self {
+            Self::Letters => None,
+            Self::Clean => Some(Target::Clean),
+            Self::Word => Some(Target::Docx),
+            Self::Pdf => Some(Target::Pdf),
+            Self::WebPage => Some(Target::Html),
+            Self::Markdown => Some(Target::Markdown),
         }
     }
 }
@@ -108,6 +132,8 @@ pub(crate) struct Copy {
     replaceable: bool,
     /// The version the copy is of, where that is not the document as it reads now.
     version: Option<Earlier>,
+    /// What the format will simplify, a line for each kind of loss.
+    simplified: Vec<String>,
 }
 
 impl Copy {
@@ -117,12 +143,30 @@ impl Copy {
         let mut tree = Tree::open(location);
         tree.picked = Some(location.folder.clone()).filter(|folder| !folder.is_empty());
         let name = suggested(format, title, version.as_ref());
-        Self { name, typed: false, format, tree, notice: None, replaceable: false, version }
+        Self { name, typed: false, format, tree, notice: None, replaceable: false, version, simplified: Vec::new() }
+    }
+
+    /// The revision the copy is of, where that is not the document as it reads now.
+    pub fn version(&self) -> Option<&Revision> {
+        self.version.as_ref().map(|version| &version.revision)
+    }
+
+    /// Takes in what the copy is made of, to list what its format will simplify: the document, and the
+    /// notes that are copied with it. `shown` says whether the window shows the picture linked from an
+    /// address: a shell hands a PDF the linked pictures that show, so they are no loss there.
+    pub fn weigh(&mut self, document: &Document, notes: &Notes, shown: &dyn Fn(&str) -> bool) {
+        let lost = self.format.target().map(|to| losses_with(document, notes, to, shown)).unwrap_or_default();
+        self.simplified = lost.iter().map(worded).collect();
     }
 
     /// Whether the copy is of an earlier version, which only the history has to show.
     pub fn earlier(&self) -> bool {
         self.version.is_some()
+    }
+
+    /// Whether the card offers a format. A copy of an earlier version is a clean one as it is.
+    fn offers(&self, format: CopyFormat) -> bool {
+        !self.earlier() || format != CopyFormat::Clean
     }
 
     /// What the card is called, and says over its name field.
@@ -219,12 +263,13 @@ impl Copy {
             .label("Format")
             .arrows(Dir::Row)
             .one_stop()
-            .children(CopyFormat::ALL.map(format));
+            .children(CopyFormat::ALL.into_iter().filter(|&offered| self.offers(offered)).map(format));
         let formats = Element::column()
             .gap(tokens::SPACE_SM)
             .padding(Edges { top: 0.0, ..Edges::all(tokens::SPACE_MD) })
             .child(formats)
-            .child(Element::paragraph(self.format.about(self.earlier()), quiet).fg(tokens::FG_MUTED));
+            .child(Element::paragraph(self.format.about(self.earlier()), quiet).fg(tokens::FG_MUTED))
+            .children(self.losses());
 
         let mut card = Element::column().width(CARD_WIDTH).child(head).child(formats);
         let mut rows = 0.0;
@@ -242,7 +287,11 @@ impl Copy {
         card = card.child(line()).child(self.foot(location));
 
         // The card sits a little above the middle of the page area, as the landing card does.
-        let height = 230.0 + rows * folders::ROW_HEIGHT;
+        let lost = match self.simplified.len() {
+            0 => 0.0,
+            lines => (lines + 1) as f32 * LOSS_HEIGHT + tokens::SPACE_SM,
+        };
+        let height = 230.0 + lost + rows * folders::ROW_HEIGHT;
         let spot = Rect::new(room.width / 2.0, ((room.height - height) * 0.4).max(0.0), 0.0, 0.0);
         Popover::new(card)
             .label(self.title())
@@ -253,6 +302,23 @@ impl Copy {
             .gap(0.0)
             .open(true)
             .on_close(send(Copying::Close))
+    }
+
+    /// What the format will simplify, a line for each kind of loss. Nothing for a format that carries all
+    /// the document holds.
+    fn losses(&self) -> Option<Element<Message>> {
+        let quiet = TextStyle::control().size(tokens::TEXT_SM);
+        let lines = self.simplified.iter().map(|line| {
+            Element::row()
+                .gap(tokens::SPACE_SM)
+                .role(Role::ListItem)
+                .label(line.as_str())
+                .child(Element::text("\u{2022}", quiet).fg(tokens::FG_MUTED))
+                .child(Element::paragraph(line.as_str(), quiet).grow(1.0))
+        });
+        let list = Element::column().role(Role::List).label(LOSSES).children(lines);
+        let title = Element::text(LOSSES, quiet.weight(600)).fg(tokens::FG_MUTED);
+        (!self.simplified.is_empty()).then(|| Element::column().child(title).child(list))
     }
 
     /// The card's last row: a new folder, and the copy itself.
@@ -287,7 +353,18 @@ fn suggested(format: CopyFormat, title: &str, version: Option<&Earlier>) -> Stri
     match version {
         Some(version) => format!("{title}, {}", version.called),
         None if format == CopyFormat::Letters => format!("{title} copy"),
+        None if format == CopyFormat::Clean => format!("{title} clean"),
         None => title.to_owned(),
+    }
+}
+
+/// A loss as a line of the card, which starts with a capital as the card's other lines do.
+fn worded(loss: &Loss) -> String {
+    let said = loss.to_string();
+    let mut letters = said.chars();
+    match letters.next() {
+        Some(first) => first.to_uppercase().chain(letters).collect(),
+        None => said,
     }
 }
 

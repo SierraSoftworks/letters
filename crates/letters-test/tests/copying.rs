@@ -1,11 +1,14 @@
 //! The card that saves a copy of a document, or writes it in another format.
 
-use letters_model::{Block, BlockKind, Document};
+use letters_model::{Anchor, Block, BlockKind, Document, Note, NoteKind, Notes, Run};
+use letters_render::image::Image;
 use letters_test::{Harness, Role};
 use letters_ui::{CopyFormat, Folder, Landing, Location, Request};
 
 const HOUSE: &str = "/Family/House";
 const QUOTES: &str = "/Family/House/Quotes";
+/// What the card calls the list of what a format will simplify.
+const LOSSES: &str = "Simplified in this copy";
 
 /// Where the cottage's plan is kept: in House, in the space called Family.
 fn family() -> Location {
@@ -27,6 +30,45 @@ fn letter(location: Location) -> Harness {
     let mut window = Harness::open(Document { blocks, ..Document::default() });
     window.ui().set_location(location);
     window
+}
+
+/// The letter with a code block in Rust and a comment on its first paragraph, kept in House.
+fn annotated() -> Harness {
+    let blocks = vec![
+        Block::text("h1", BlockKind::Heading { level: 1 }, "Roof repairs"),
+        Block::text("p1", BlockKind::Paragraph, "Harland Roofing sent a quote."),
+        Block::text("c1", BlockKind::Code { language: Some("rust".into()) }, "let quote = 4_200;"),
+    ];
+    let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.ui().set_location(family());
+    let note = Note {
+        id: "n1".into(),
+        kind: NoteKind::Comment,
+        anchor: Anchor::range("p1", 0..7),
+        author: "Alice Moreau".into(),
+        created: "2026-11-10T08:00:00Z".into(),
+        resolved: false,
+        content: vec![Run::plain("Is this the final quote?")],
+        replies: Vec::new(),
+        extra: Default::default(),
+    };
+    window.ui().set_notes(Notes { notes: vec![note], ..Notes::default() });
+    window
+}
+
+/// The lines of what the card says the picked format will simplify.
+fn simplified(window: &mut Harness) -> Vec<String> {
+    let Some(list) = window.find(Role::List, LOSSES) else { return Vec::new() };
+    let (top, bottom) = (list.bounds.y, list.bounds.y + list.bounds.height);
+    let within = |found: &letters_test::Found| {
+        found.role == Role::ListItem && found.bounds.y >= top && found.bounds.y + found.bounds.height <= bottom
+    };
+    window.controls().into_iter().filter(within).map(|found| found.name).collect()
+}
+
+/// Runs a command from the palette.
+fn run(window: &mut Harness, command: &str) {
+    window.key("Mod+Shift+P").type_text(command).key("Enter");
 }
 
 /// The letter with the card open, as the key opens it.
@@ -61,8 +103,10 @@ fn copy(name: &str, format: CopyFormat, folder: Option<&str>, replace: bool) -> 
 #[test]
 fn the_card_opens_from_the_key_and_the_menu_set_to_a_format() {
     type Open = fn(&mut Harness);
-    let cases: [(&str, Open, &str, &str); 3] = [
+    let cases: [(&str, Open, &str, &str); 4] = [
         ("the key", |window| _ = window.key("Mod+Shift+S"), "Letters", "Cottage renovation copy"),
+        // A clean copy is a document too, so it cannot share the name either.
+        ("the palette", |window| run(window, "Export clean copy"), "Clean copy", "Cottage renovation clean"),
         // The menu names the key beside the command.
         ("the menu", |window| menu(window, "Save a copy Ctrl+Shift+S"), "Letters", "Cottage renovation copy"),
         ("Export", |window| menu(window, "Export"), "PDF", "Cottage renovation"),
@@ -99,9 +143,24 @@ fn the_name_follows_the_format_until_one_is_typed() {
 }
 
 #[test]
+fn a_name_the_card_suggests_is_typed_over_whole() {
+    // The name a format suggests may be longer or shorter than the one before it.
+    for format in ["Clean copy", "Word"] {
+        let mut window = copying();
+        window.click(Role::Button, format).type_text("Plan B");
+        assert_eq!(name(&mut window), "Plan B", "{format}");
+    }
+}
+
+#[test]
 fn the_shell_is_asked_for_the_copy_and_the_card_goes() {
     type Ask = fn(&mut Harness);
-    let cases: [(&str, Ask, Request); 4] = [
+    let cases: [(&str, Ask, Request); 5] = [
+        (
+            "a copy without the history",
+            |window| _ = window.click(Role::Button, "Clean copy").click(Role::Button, "Export to House"),
+            copy("Cottage renovation clean", CopyFormat::Clean, Some(HOUSE), false),
+        ),
         (
             "Enter in the name",
             |window| _ = window.key("Enter"),
@@ -133,6 +192,78 @@ fn the_shell_is_asked_for_the_copy_and_the_card_goes() {
         ask(&mut window);
         assert_eq!(window.ui().take_requests(), [request], "{case}");
         window.assert_closed(Role::Dialog, "Save a copy");
+    }
+}
+
+#[test]
+fn the_card_lists_what_the_picked_format_will_simplify() {
+    // A format, what its list names of a letter with a comment and a code block in Rust, and what it
+    // must not: Word carries comments, and the others the code's language.
+    let cases: [(&str, &[&str], &[&str]); 5] = [
+        ("Clean copy", &["history", "comment"], &["code block"]),
+        ("Word", &["code block"], &["comment", "history"]),
+        ("PDF", &["comment"], &["code block", "history"]),
+        ("Web page", &["comment"], &["code block", "history"]),
+        ("Markdown", &["comment"], &["code block", "history"]),
+    ];
+    let mut window = annotated();
+    window.key("Mod+Shift+S");
+    assert!(window.find(Role::List, LOSSES).is_none(), "a copy with the history holds all the document does");
+    for (format, lost, kept) in cases {
+        let listed = simplified(window.click(Role::Button, format)).join("\n").to_lowercase();
+        for word in lost {
+            assert!(listed.contains(word), "{format}: {word} in {listed:?}");
+        }
+        for word in kept {
+            assert!(!listed.contains(word), "{format}: no {word} in {listed:?}");
+        }
+    }
+    window.click(Role::Button, "Letters");
+    assert!(window.find(Role::List, LOSSES).is_none(), "the list goes with the format it was of");
+
+    // A card that opens on a format says at once what that format leaves out.
+    window.key("Escape");
+    run(&mut window, "Export clean copy");
+    let listed = simplified(&mut window).join("\n").to_lowercase();
+    assert!(listed.contains("history") && listed.contains("comment"), "{listed:?}");
+}
+
+#[test]
+fn a_linked_picture_that_shows_is_no_loss_in_a_pdf() {
+    const LINK: &str = "https://example.com/roof.png";
+    let figure = BlockKind::Figure {
+        asset: None,
+        src: Some(LINK.into()),
+        alt: "A slate roof".into(),
+        width: 300.0,
+        height: 150.0,
+        numbered: false,
+    };
+    let blocks = vec![Block::text("p1", BlockKind::Paragraph, "The roof today:"), Block::new("g", figure)];
+    // Whether the window shows the picture, and whether a PDF and a web page then lose it: a shell hands
+    // a PDF the pictures that show, and a web page is written with the link either way.
+    for (shown, pdf, page) in [(false, true, true), (true, false, true)] {
+        let mut window = Harness::open(Document { blocks: blocks.clone(), ..Document::default() });
+        window.ui().set_location(family());
+        if shown {
+            let image = Image::from_rgba8(2, 1, vec![255; 8]).expect("two pixels");
+            window.ui().set_image(LINK, Some(image));
+        }
+        window.key("Mod+Shift+S");
+        for (format, lost) in [("PDF", pdf), ("Web page", page)] {
+            let listed = simplified(window.click(Role::Button, format)).join("\n");
+            assert_eq!(listed.contains("linked picture"), lost, "{format}, shown: {shown}: {listed:?}");
+        }
+    }
+}
+
+#[test]
+fn a_format_that_carries_everything_lists_nothing() {
+    let mut window = copying();
+    for format in CopyFormat::ALL.map(CopyFormat::name) {
+        let listed = simplified(window.click(Role::Button, format));
+        // A plain letter loses nothing but its history, and that only in a clean copy.
+        assert_eq!(listed.len(), usize::from(format == "Clean copy"), "{format}: {listed:?}");
     }
 }
 

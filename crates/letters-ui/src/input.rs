@@ -62,8 +62,10 @@ impl InputState {
         floor(value, self.head) + self.composing.as_ref().map_or(0, String::len)
     }
 
-    pub fn select_all(&mut self, value: &str) {
-        (self.anchor, self.head) = (0, value.len());
+    /// Selects the whole value, and the whole of what the app makes of it while the selection stands: a
+    /// name that a card suggests anew is typed over whole, as the first was.
+    pub fn select_all(&mut self) {
+        (self.anchor, self.head) = (0, usize::MAX);
     }
 
     /// Puts the caret at `offset`, extending the selection instead when `extend` is set.

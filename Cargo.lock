@@ -2983,6 +2983,7 @@ version = "0.1.0"
 dependencies = [
  "accesskit",
  "image",
+ "letters-convert",
  "letters-editor",
  "letters-fonts",
  "letters-layout",

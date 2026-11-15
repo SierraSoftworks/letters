@@ -50,6 +50,7 @@ pub enum Request {
     /// has. `folder` is the path of the folder to write it to, or `None` to let the person choose where.
     /// A file of that name is in the way unless `replace` is set, which it is once the person has said so.
     /// Answer with `Window::set_copied`, or with `Window::refuse_copy` when it cannot be done.
+    /// [`CopyFormat::Clean`] asks for a document of its own without the history and the notes.
     SaveCopy {
         name: String,
         format: CopyFormat,

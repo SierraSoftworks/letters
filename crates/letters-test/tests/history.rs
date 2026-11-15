@@ -977,6 +977,8 @@ fn a_copy_of_the_version_that_shows_is_asked_of_the_shell() {
         window.click(Role::ListBoxOption, "11:30");
         ask(&mut window);
         window.assert_open(Role::Dialog, "Save a copy of this version");
+        // A copy of a version starts with its text alone, so no cleaner copy is offered.
+        assert!(window.find(Role::Button, "Clean copy").is_none(), "by {way}");
         // The copy's name says which version it is of: the one written on Tuesday 10 November.
         assert_eq!(copy_name(&mut window).as_deref(), Some("Cottage renovation, 10 Nov"), "by {way}");
         window.key("Enter").assert_closed(Role::Dialog, "Save a copy of this version");

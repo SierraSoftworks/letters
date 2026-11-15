@@ -491,8 +491,8 @@ impl<A: App> Ui<A> {
             }
             (Action::Focus, _) if self.tree.focusable(i) => self.set_focus(Some(id), true),
             (Action::SetValue, Some(ActionData::Value(text))) => {
-                if let Content::Input(input) = &self.tree.nodes[i].el.content {
-                    self.inputs.entry(id).or_default().select_all(&input.value);
+                if matches!(self.tree.nodes[i].el.content, Content::Input(_)) {
+                    self.inputs.entry(id).or_default().select_all();
                 }
                 self.input_text(i, InputEvent::Insert(text.into()));
             }
@@ -594,7 +594,7 @@ impl<A: App> Ui<A> {
                 match clicks {
                     1 => state.place(&input.value, offset, mods.shift),
                     2 => state.select_word(&input.value, offset),
-                    _ => state.select_all(&input.value),
+                    _ => state.select_all(),
                 }
                 self.restart_blink();
             }
@@ -942,7 +942,7 @@ impl<A: App> Ui<A> {
                 None
             }
             (Key::Char('a'), _) if mods.primary => {
-                state.select_all(value);
+                state.select_all();
                 None
             }
             (Key::Char('c' | 'x'), _) if mods.primary => {
@@ -1243,8 +1243,8 @@ impl<A: App> Ui<A> {
         self.restart_blink();
         let Some(i) = id.and_then(|id| self.tree.find(id)) else { return };
         let node = &self.tree.nodes[i];
-        if let (Content::Input(input), true) = (&node.el.content, keyboard) {
-            self.inputs.entry(node.id).or_default().select_all(&input.value);
+        if keyboard && matches!(node.el.content, Content::Input(_)) {
+            self.inputs.entry(node.id).or_default().select_all();
         }
         self.reveal(i, node.rect, 0.0);
     }
@@ -1483,8 +1483,8 @@ impl<A: App> Ui<A> {
         if let Some(&took) = took.last() {
             let node = &tree.nodes[took];
             // A field reached this way is ready to be typed over, as one reached by Tab is.
-            if let Content::Input(input) = &node.el.content {
-                self.inputs.entry(node.id).or_default().select_all(&input.value);
+            if matches!(node.el.content, Content::Input(_)) {
+                self.inputs.entry(node.id).or_default().select_all();
             }
             focus = Some(node.id);
         }

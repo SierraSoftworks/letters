@@ -855,19 +855,24 @@ impl Shell {
     /// that asked for it.
     fn copy(&mut self, name: String, format: CopyFormat, version: Option<&Revision>) {
         let source = match version.map(|version| self.view.document_at(version)) {
+            // A clean copy starts a document of its own from what is written now, as a copy of a version
+            // does from what was written then: neither the history nor the notes go with it.
+            None if format == CopyFormat::Clean => {
+                Source::Version(Box::new((self.view.editor().doc().clone(), self.view.style().clone())))
+            }
             None => Source::Copy,
             Some(Some(version)) => Source::Version(Box::new(version)),
             Some(None) => return self.view.refuse_copy("That version could not be read.", false),
         };
+        // Only a copy of the document as it is holds everything written up to when it was asked for.
+        let whole = (format == CopyFormat::Letters && version.is_none()).then(|| self.view.edits());
         let format = match format {
-            CopyFormat::Letters => "let",
+            CopyFormat::Letters | CopyFormat::Clean => "let",
             CopyFormat::Word => "docx",
             CopyFormat::Pdf => "pdf",
             CopyFormat::WebPage => "html",
             CopyFormat::Markdown => "md",
         };
-        // Only a copy of the document as it is holds everything written up to when it was asked for.
-        let whole = (format == "let" && version.is_none()).then(|| self.view.edits());
         self.export(format, source, name, move |shell, made| {
             let failed = |why: String| format!("The copy could not be written: {why}.");
             let refused = match made {

@@ -85,6 +85,8 @@ pub(crate) enum Act {
     Save,
     SaveCopy,
     Export,
+    /// Opens the card that saves a copy, set to a copy without the history and the notes.
+    CleanCopy,
     Share,
     Settings,
     /// Shows where the paper and the margins are set.
@@ -160,7 +162,7 @@ const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> E
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 96] = [
+pub(crate) static ENTRIES: [Entry; 97] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -249,6 +251,7 @@ pub(crate) static ENTRIES: [Entry; 96] = [
     entry("Document", "Save", "keep write file download", Act::Save),
     entry("Document", "Save a copy", "duplicate", Act::SaveCopy),
     entry("Document", "Export", "pdf word markdown html web", Act::Export),
+    entry("Document", "Export clean copy", "history comments notes strip private", Act::CleanCopy),
     entry("Document", "Share", "", Act::Share),
     entry("Document", "Page setup", "paper margins orientation size landscape portrait", Act::PageSetup),
     entry("Document", "Settings", "preferences appearance accent", Act::Settings),

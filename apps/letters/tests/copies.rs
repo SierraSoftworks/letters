@@ -50,6 +50,21 @@ fn a_copy_is_a_document_of_its_own_with_the_same_text() {
 }
 
 #[test]
+fn a_clean_copy_is_a_document_of_its_own_without_the_history() {
+    let (scratch, source) = saved("copies-clean");
+    let output = copies::path(&scratch.0, "Roof repairs clean", CopyFormat::Clean).unwrap();
+    let made = copies::write(&source, &output, CopyFormat::Clean, false, &Linked::new()).unwrap();
+
+    assert_eq!(output, scratch.0.join("Roof repairs clean.let"));
+    assert_eq!(files::open(&output, Style::default).unwrap().document, letter());
+    assert!(made.is_some_and(|made| made == id(&output) && made != id(&source)), "a document of its own");
+    let archive = Archive::open(fs::File::open(&output).unwrap()).unwrap();
+    assert!(!archive.names().any(|name| name.starts_with(letters_format::HISTORY)), "the history stays behind");
+    let kept = Archive::open(fs::File::open(&source).unwrap()).unwrap();
+    assert!(kept.names().any(|name| name.starts_with(letters_format::HISTORY)), "the original keeps its own");
+}
+
+#[test]
 fn an_export_is_a_file_in_its_format_that_holds_the_text() {
     // What each format's file starts with, and whether the text can be read from it as it is.
     let cases = [
@@ -140,7 +155,7 @@ fn a_file_in_the_way_is_replaced_only_when_asked_and_a_document_never() {
 
         let refused = copies::write(&source, &output, format, false, &Linked::new()).unwrap_err();
         assert!(matches!(refused, Refused::Taken { .. }), "{format:?}: {refused}");
-        assert_eq!(refused.replaceable(), format != CopyFormat::Letters, "{format:?}");
+        assert_eq!(refused.replaceable(), EXPORTS.contains(&format), "{format:?}");
         assert_eq!(fs::read(&output).unwrap(), b"kept", "{format:?}: nothing was written");
 
         let again = copies::write(&source, &output, format, true, &Linked::new());
