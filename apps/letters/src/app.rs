@@ -51,7 +51,7 @@ use crate::dictionaries;
 use crate::fallback::Finder;
 use crate::files::{self, EXTENSION, Exchange, Home, Merged, Opened, Rest, STYLESHEET, Working};
 use crate::gpu::Gpu;
-use crate::import::{self, Choices, Plan};
+use crate::import::{self, Choices, Plan, Unplanned};
 use crate::input::{self, Composer, Press};
 use crate::journal::{self, Journal, Journals};
 use crate::keychain::Keychain;
@@ -127,7 +127,7 @@ pub enum Event {
     Picture(WindowId, String, Option<Image>, u32),
     /// The file at a path, which a window was asked to bring in, has been read: what it would bring is
     /// known, or why it cannot be brought in.
-    Planned(WindowId, PathBuf, Result<Box<Plan>, String>),
+    Planned(WindowId, PathBuf, Result<Box<Plan>, Unplanned>),
     /// A file of this name was brought in for a window and kept as a new document at this path, or could
     /// not be.
     Imported(WindowId, String, Result<PathBuf, (Box<Plan>, std::io::Error)>),
@@ -680,7 +680,7 @@ struct DocWindow {
 
     /// What the first paint did not need from the file, until reading it starts.
     rest: Option<Rest>,
-    reading: Option<JoinHandle<Result<Working, String>>>,
+    reading: Option<JoinHandle<Result<Working, &'static str>>>,
     /// What saves are written from. `None` while it is being read, and while a save has it.
     copy: Option<WorkingCopy>,
     /// The editor's revision that the copy has seen all of.
@@ -1583,7 +1583,7 @@ impl DocWindow {
         let (vouched, trust, path) = (self.vouched(), trust.clone(), self.place.path().map(Path::to_owned));
         let wary = move |id: &str| !vouched && trust::mode(&trust, id, path.as_deref()) != letters_trust::Mode::Trusted;
         self.reading = Some(thread::spawn(move || {
-            let working = rest.read(replica, journals.as_deref(), wary).map_err(|error| error.to_string());
+            let working = rest.read(replica, journals.as_deref(), wary).map_err(|error| error.unopened());
             let _ = proxy.send_event(Event::Read(id));
             working
         }));
@@ -1593,12 +1593,13 @@ impl DocWindow {
     /// started and waiting if it had not finished. Fails once, when the file could not be read for saving.
     fn finish_read(&mut self, journals: &mut Journals) -> Result<(), String> {
         let working = match (self.reading.take(), self.rest.take()) {
-            (Some(reading), _) => reading.join().unwrap_or_else(|_| Err("reading it stopped unexpectedly".into())),
+            // A read that stopped unexpectedly has said so itself, and there is no plain reason to give.
+            (Some(reading), _) => reading.join().unwrap_or(Err("")),
             (None, Some(rest)) => {
                 let replica = self.view.editor().model().replica();
                 // With nothing at hand that says who is trusted, only what is vouched for here is.
                 let (journals, vouched) = (self.keeps.then(|| journals.folder()), self.vouched());
-                rest.read(replica, journals, |_| !vouched).map_err(|error| error.to_string())
+                rest.read(replica, journals, |_| !vouched).map_err(|error| error.unopened())
             }
             (None, None) => return Ok(()),
         };
@@ -1653,10 +1654,10 @@ impl DocWindow {
                 self.recomment();
                 Ok(())
             }
-            Err(error) => {
+            Err(why) => {
                 self.save_failed = self.keeps;
                 self.retitle();
-                Err(format!("{} is open, but changes to it cannot be saved.\n\n{error}", self.name()))
+                Err(format!("{} is open, but changes to it cannot be saved{why}.", self.name()))
             }
         }
     }
@@ -1888,8 +1889,8 @@ impl DocWindow {
             return None;
         }
         if let Err(error) = conflicts::discard(copy) {
-            let said = format!("{} was merged, but could not be moved to the trash: {error}", named(copy));
-            self.view.refuse_merge(&said);
+            eprintln!("letters: could not move {} to the trash: {error}", copy.display());
+            self.view.refuse_merge(&format!("{} was merged, but could not be moved to the trash.", named(copy)));
         }
         Some(named(copy))
     }
@@ -1919,15 +1920,15 @@ impl DocWindow {
                 Ok(()) => {
                     names.push(named(&path));
                     if copy && let Err(error) = conflicts::discard(&path) {
-                        refused
-                            .push(format!("{} was merged, but could not be moved to the trash: {error}", named(&path)));
+                        eprintln!("letters: could not move {} to the trash: {error}", path.display());
+                        refused.push(format!("{} was merged, but could not be moved to the trash.", named(&path)));
                     }
                 }
                 Err(files::Error::Format(letters_format::Error::Unmerged)) => refused.push(format!(
                     "{} could not be merged: it is not a copy of this document, or a newer Letters wrote it.",
                     named(&path)
                 )),
-                Err(error) => refused.push(format!("{} could not be read: {error}", named(&path))),
+                Err(error) => refused.push(format!("{} could not be read{}.", named(&path), error.unopened())),
             }
         }
         if !refused.is_empty() {
@@ -2100,6 +2101,13 @@ fn alert(parent: Option<&Arc<Window>>, message: &str) {
         Some(window) => dialog.set_parent(&**window).show(),
         None => dialog.show(),
     };
+}
+
+/// Why no window was made, to end a sentence a person reads. The desktop's own words are for the log, and
+/// there is no plain reason to give in their place.
+fn no_window(error: &dyn Error) -> &'static str {
+    eprintln!("letters: a window could not be made: {error}");
+    ""
 }
 
 impl App {
@@ -2374,7 +2382,7 @@ impl App {
                     // The window says so itself when the text is no stylesheet.
                     match fs::read(&path) {
                         Ok(text) => window.view.offer_stylesheet(&name, &String::from_utf8_lossy(&text)),
-                        Err(error) => window.alert(&format!("{name} could not be read.\n\n{error}")),
+                        Err(error) => window.alert(&format!("{name} could not be read{}.", files::unread(&error))),
                     }
                 }
                 Request::ExportStyle(json) => {
@@ -2531,7 +2539,8 @@ impl App {
         self.windows.values_mut().for_each(|window| window.follow(&self.settings, writer));
         if let (Err(error), Some(window)) = (kept, self.windows.get(&id)) {
             window.alert(&format!(
-                "Your settings could not be kept, and will last only until Letters closes.\n\n{error}"
+                "Your settings could not be kept in ~/.letters{}. They will last only until Letters closes.",
+                files::because(&error)
             ));
         }
     }
@@ -2558,7 +2567,7 @@ impl App {
             }
         }
         if let (Err(error), Some(window)) = (kept, self.windows.get(&id)) {
-            window.alert(&format!("Your default style could not be kept.\n\n{error}"));
+            window.alert(&format!("Your default style could not be kept in ~/.letters{}.", files::because(&error)));
         }
     }
 
@@ -2666,9 +2675,16 @@ impl App {
         let (proxy, title, linked) = (self.proxy.clone(), window.name(), window.linked.clone());
         self.copies.retain(|copy| !copy.is_finished());
         self.copies.push(thread::spawn(move || {
-            let file = fs::read(&source).map_err(|error| error.to_string());
+            // Said as the person is to read it. What went wrong in the file is for the log.
+            let file =
+                fs::read(&source).map_err(|error| format!("Its file could not be read{}.", files::unread(&error)));
             let mut linked = |address: &str| linked.get(address).cloned();
-            let pdf = file.and_then(|file| convert::exported_with(file, &title, Format::Pdf, &mut linked));
+            let pdf = file.and_then(|file| {
+                convert::exported_with(file, &title, Format::Pdf, &mut linked).map_err(|error| {
+                    eprintln!("letters: could not make a PDF of {}: {error}", source.display());
+                    "Its file could not be read.".to_owned()
+                })
+            });
             let pdf = pdf.map(|pdf| pdf.bytes);
             let _ = proxy.send_event(Event::Pdf(id, pdf));
         }));
@@ -3004,8 +3020,11 @@ impl App {
                 window.sync(now);
                 return Ok(());
             }
-            let opened = files::open(&reached.path, new_style).map_err(|error| Some(error.to_string()))?;
-            let id = self.open_window(event_loop, Some(opened), false).map_err(|error| Some(error.to_string()))?;
+            let opened = files::open(&reached.path, new_style)
+                .map_err(|error| Some(format!("Its copy on this device could not be opened{}.", error.unopened())))?;
+            let id = self
+                .open_window(event_loop, Some(opened), false)
+                .map_err(|error| Some(format!("A window could not be opened for it{}.", no_window(&*error))))?;
             self.sessions.insert(session.server().origin().to_owned(), session.clone());
             if let Some(window) = self.windows.get_mut(&id) {
                 window.connect(session, reached, &self.proxy, &self.library, now);
@@ -3035,12 +3054,12 @@ impl App {
 
     fn open_path(&mut self, event_loop: &ActiveEventLoop, path: &Path, parent: Option<WindowId>) -> bool {
         let parent = parent.and_then(|id| self.windows.get(&id)).map(|window| window.window.clone());
-        let opened = files::open(path, new_style).map_err(|error| error.to_string());
+        let opened = files::open(path, new_style).map_err(|error| error.unopened());
         let shown = opened
-            .and_then(|opened| self.open_window(event_loop, Some(opened), false).map_err(|e| e.to_string()))
+            .and_then(|opened| self.open_window(event_loop, Some(opened), false).map_err(|error| no_window(&*error)))
             .map(drop);
-        if let Err(error) = &shown {
-            alert(parent.as_ref(), &format!("{} could not be opened.\n\n{error}", path.display()));
+        if let Err(why) = &shown {
+            alert(parent.as_ref(), &format!("{} could not be opened{why}.", path.display()));
         }
         shown.is_ok()
     }
@@ -3052,7 +3071,7 @@ impl App {
             asked.filter(|id| self.windows.get(id).is_some_and(|window| window.pristine() && window.plan.is_none()));
         let id = match empty.map(Ok).unwrap_or_else(|| self.open_window(event_loop, None, true)) {
             Ok(id) => id,
-            Err(error) => return alert(None, &format!("A new window could not be opened.\n\n{error}")),
+            Err(error) => return alert(None, &format!("A new window could not be opened{}.", no_window(&*error))),
         };
         let proxy = self.proxy.clone();
         thread::spawn(move || {
@@ -3162,7 +3181,9 @@ impl App {
             _ => None,
         };
         match kept {
-            Some(Err(error)) => window.alert(&format!("Your choice to trust it could not be kept.\n\n{error}")),
+            Some(Err(error)) => {
+                window.alert(&format!("Your choice to trust it could not be kept{}.", trust::unkept(&error)));
+            }
             Some(Ok(())) => {
                 // Trusted again, a document made in this window is vouched for as it was.
                 if let Some(window) = self.windows.get_mut(&id) {
@@ -3179,7 +3200,7 @@ impl App {
     /// that window that the change could not be kept.
     fn retrust(&mut self, id: WindowId, kept: Result<(), TrustError>) {
         if let (Err(error), Some(window)) = (&kept, self.windows.get(&id)) {
-            window.alert(&format!("Your choice could not be kept.\n\n{error}"));
+            window.alert(&format!("Your choice could not be kept{}.", trust::unkept(error)));
         }
         // Said again either way: a window shows a row until it is told the list without it.
         let (trust, library) = (self.trust.trust(), &self.library);
@@ -3259,12 +3280,14 @@ impl App {
 
     /// Keeps the host of a linked picture as one whose pictures load from now on.
     fn trust_host(&mut self, id: WindowId, src: &str) {
-        let kept = HttpsUrl::parse(src).map_err(|error| error.to_string()).and_then(|url| {
-            self.trust.trust_source(&letters_trust::Source::host_of(&url)).map_err(|error| error.to_string())
+        // Only a picture with an address pictures load from offers this, so an address that is none has no
+        // plain reason to give.
+        let kept = HttpsUrl::parse(src).map_err(|_| "").and_then(|url| {
+            self.trust.trust_source(&letters_trust::Source::host_of(&url)).map_err(|error| trust::unkept(&error))
         });
         match (kept, self.windows.get(&id)) {
-            (Err(error), Some(window)) => {
-                window.alert(&format!("The host could not be kept as one you trust.\n\n{error}"));
+            (Err(why), Some(window)) => {
+                window.alert(&format!("The host could not be kept as one you trust{why}."));
             }
             (Err(_), None) => {}
             // The Settings dialog of every window lists it from now on.
@@ -3276,12 +3299,12 @@ impl App {
     }
 
     /// Shows the card that asks what to bring in with a file, now that the file has been read.
-    fn offer(&mut self, id: WindowId, path: &Path, plan: Result<Box<Plan>, String>) {
+    fn offer(&mut self, id: WindowId, path: &Path, plan: Result<Box<Plan>, Unplanned>) {
         let Some(window) = self.windows.get_mut(&id) else { return };
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let plan = match plan {
             Ok(plan) => plan,
-            Err(error) => return window.alert(&format!("{name} could not be brought in.\n\n{error}")),
+            Err(unplanned) => return window.alert(&format!("{name} could not be brought in{}.", unplanned.why())),
         };
         let home = std::env::home_dir();
         let folders = plan.folders.iter().map(|folder| ImportFolder {
@@ -3400,7 +3423,7 @@ impl App {
         match action {
             Action::New => {
                 if let Err(error) = self.open_window(event_loop, None, false) {
-                    alert(None, &format!("A new window could not be opened.\n\n{error}"));
+                    alert(None, &format!("A new window could not be opened{}.", no_window(&*error)));
                 }
             }
             Action::Open(path) => {
@@ -3508,9 +3531,11 @@ impl ApplicationHandler<Event> for App {
         }
         let opened = match self.reading.take().map(|reading| reading.join().expect("reading does not panic")) {
             Some(Ok(opened)) => Ok(Some(opened)),
+            // The person reads the plain reason, and the command line the error as it was.
             Some(Err(error)) => {
-                let path = self.path.as_deref().unwrap_or(Path::new(""));
-                Err(format!("{} could not be opened.\n\n{error}", path.display()))
+                let path = self.path.as_deref().unwrap_or(Path::new("")).display();
+                let failure = format!("{path} could not be opened.\n\n{error}");
+                Err((format!("{path} could not be opened{}.", error.unopened()), failure))
             }
             None => Ok(None),
         };
@@ -3526,9 +3551,9 @@ impl ApplicationHandler<Event> for App {
             }
             documents.into_iter().try_for_each(|opened| {
                 let landing = opened.is_none();
-                self.open_window(event_loop, opened, landing)
-                    .map(drop)
-                    .map_err(|error| format!("No window could be opened.\n\n{error}"))
+                self.open_window(event_loop, opened, landing).map(drop).map_err(|error| {
+                    ("No window could be opened.".to_owned(), format!("No window could be opened.\n\n{error}"))
+                })
             })
         });
         // A Markdown or Word file that was asked for is offered in a window that has nothing of its own.
@@ -3541,9 +3566,9 @@ impl ApplicationHandler<Event> for App {
             let empty = self.windows.iter().find(|(_, window)| window.pristine()).map(|(id, _)| *id);
             self.reach(empty, &origin, id);
         }
-        if let Err(failure) = shown {
+        if let Err((said, failure)) = shown {
             if !self.report_launch {
-                alert(None, &failure);
+                alert(None, &said);
             }
             self.fail(event_loop, failure);
         }

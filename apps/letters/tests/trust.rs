@@ -132,3 +132,21 @@ fn a_source_that_is_none_is_refused_in_a_sentence() {
         assert!(why.ends_with('.') && why.starts_with("A source"), "{typed:?}: {why}");
     }
 }
+
+#[test]
+fn a_choice_that_could_not_be_kept_says_why_in_plain_words() {
+    let home = Home::new("unkept");
+    let folder = home.file("Documents/Rates.let").parent().unwrap().to_owned();
+    let mut store = trust::store(&home.0);
+    let whole_disk = store.trust_folder("/").expect_err("a whole disk is no folder to trust");
+    fs::create_dir_all(home.settings().parent().unwrap()).unwrap();
+    fs::write(home.settings(), "trust = [ this is not TOML").unwrap();
+    let unreadable = store.trust_folder(folder.to_str().unwrap()).expect_err("the file cannot be read");
+
+    for (error, why) in [(whole_disk, "a whole disk"), (unreadable, "settings.toml")] {
+        let said = trust::unkept(&error);
+        // A reason that ends a sentence, with nothing of the parser's or the system's own words.
+        assert!(said.starts_with(" because ") && said.contains(why), "{error}: {said}");
+        assert!(!said.contains(&error.to_string()), "{said}");
+    }
+}

@@ -22,6 +22,7 @@ use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progr
 use sha2::{Digest, Sha256};
 use ureq::http::Uri;
 
+use crate::files;
 use crate::keychain::Keychain;
 use crate::remote::Roots;
 use crate::server::{Client, Refused};
@@ -108,7 +109,7 @@ impl fmt::Display for Unreached {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused(refused) => refused.fmt(f),
-            Self::Unkept(error) => write!(f, "its copy could not be kept on this device ({error})"),
+            Self::Unkept(error) => write!(f, "its copy could not be kept on this device{}", files::because(error)),
             Self::Unsigned(unsigned) => unsigned.fmt(f),
         }
     }

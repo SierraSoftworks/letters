@@ -131,10 +131,13 @@ fn what_cannot_be_brought_in_is_refused_before_anything_is_asked() {
         ("Photo.md", &[0xff, 0xfe, 0x00, 0xd8]),
         ("Old.doc", &[0xd0, 0xcf, 0x11, 0xe0, 1]),
     ];
+    // Each says why, as it ends the sentence the person reads.
     for (name, bytes) in cases {
-        assert!(Plan::of(&folder.write(name, bytes), &Style::default()).is_err(), "{name}");
+        let why = Plan::of(&folder.write(name, bytes), &Style::default()).expect_err(name).why();
+        assert!(why.starts_with(" because ") && !why.ends_with('.'), "{name}: {why}");
     }
-    assert!(Plan::of(&folder.0.join("Missing.md"), &Style::default()).is_err());
+    let missing = Plan::of(&folder.0.join("Missing.md"), &Style::default()).expect_err("there is no such file");
+    assert_eq!(missing.why(), " because it is not there");
 }
 
 #[test]

@@ -117,3 +117,17 @@ pub fn source(typed: &str) -> Result<Source, String> {
         .to_owned()
     })
 }
+
+/// Why a change to what the person trusts was not kept, to end a sentence they read, or nothing where
+/// there is no plain reason to give. The store's own words are for the log.
+pub fn unkept(error: &TrustError) -> &'static str {
+    eprintln!("letters: what is trusted could not be changed: {error}");
+    match error {
+        TrustError::Store(_) => " because ~/.letters/settings.toml could not be read or written",
+        TrustError::Toml(_) | TrustError::Shape(_) => {
+            " because ~/.letters/settings.toml holds something Letters cannot read"
+        }
+        TrustError::Folder(_) => " because a whole disk cannot be trusted, only a folder on it",
+        TrustError::NoDocument => "",
+    }
+}

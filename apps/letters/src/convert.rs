@@ -355,7 +355,7 @@ fn import_file(
     let choices = Choices { pictures: roots.to_vec(), comments: true };
     let plan = match Plan::of(source, style) {
         Ok(plan) => plan,
-        Err(error) => return failed(&error),
+        Err(error) => return failed(&error.to_string()),
     };
     if let Some(Err(error)) = trust.map(|trust| trust::import(trust, &plan.id, source)) {
         return failed(&format!("the import could not be recorded, so nothing was written: {error}"));

@@ -42,7 +42,50 @@ impl Error {
     pub fn unsaved(&self, what: &str) -> String {
         match self {
             Self::Io(error) => unwritten(what, error),
-            Self::Format(error) => format!("{what} could not be saved.\n\n{error}"),
+            Self::Format(error) => format!("{what} could not be saved{}.", unfit(error)),
+        }
+    }
+
+    /// Why a file was not opened or read, to end a sentence a person reads: " because it is damaged", or
+    /// nothing where there is no plain reason to give.
+    pub fn unopened(&self) -> &'static str {
+        match self {
+            Self::Io(error) => unread(error),
+            Self::Format(error) => unfit(error),
+        }
+    }
+}
+
+/// What is wrong with a file that was read, to end a sentence. The detail is for the log.
+fn unfit(error: &letters_format::Error) -> &'static str {
+    use letters_format::Error::{
+        Document, HashMismatch, History, Manifest, Missing, NewerFormat, NotLetters, Notes, OtherDocument, Style,
+        Unmerged, Zip,
+    };
+    eprintln!("letters: {error}");
+    match error {
+        Zip(_) | NotLetters | Missing(_) | Manifest(_) => " because it is damaged or is not a Letters document",
+        NewerFormat(_) => " because a newer Letters wrote it",
+        HashMismatch(_) | Document(_) | Style(_) | Notes(_) => " because it is damaged",
+        History(_) => " because its history cannot be read",
+        OtherDocument(_) => " because the file holds a different document",
+        Unmerged => " because the file holds changes that Letters could not take in",
+        // What a folder refused is said by the one who knows what it was asked.
+        _ => "",
+    }
+}
+
+/// Why the system would not read a file, to end a sentence a person reads: " because it is no longer
+/// there", or nothing where there is no plain reason to give. As [`because`], for a file that is read.
+pub fn unread(error: &io::Error) -> &'static str {
+    use io::ErrorKind::{IsADirectory, NotADirectory, NotFound, PermissionDenied};
+    match error.kind() {
+        NotFound | NotADirectory => " because it is not there",
+        PermissionDenied => " because Letters may not read it",
+        IsADirectory => " because it is a folder",
+        _ => {
+            eprintln!("letters: a file could not be read: {error}");
+            ""
         }
     }
 }

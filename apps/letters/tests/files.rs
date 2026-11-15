@@ -333,9 +333,29 @@ fn files_that_are_not_documents_are_refused_with_a_reason() {
     let bytes = fs::read(&truncated).unwrap();
     fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
 
-    for path in [folder.path("no such folder/missing.let"), text, truncated] {
+    let cases =
+        [(folder.path("no such folder/missing.let"), "it is not there"), (text, "damaged"), (truncated, "damaged")];
+    for (path, why) in cases {
         let error = open(&path).expect_err("not a document");
         assert!(!error.to_string().is_empty(), "{path:?}");
+        // The person reads a plain reason that ends a sentence, and nothing of the system's own.
+        let said = error.unopened();
+        assert!(said.starts_with(" because ") && said.contains(why), "{path:?}: {said}");
+    }
+}
+
+#[test]
+fn what_the_system_would_not_read_is_said_in_plain_words() {
+    use std::io::{Error, ErrorKind};
+    let cases = [
+        (ErrorKind::NotFound, " because it is not there"),
+        (ErrorKind::PermissionDenied, " because Letters may not read it"),
+        (ErrorKind::IsADirectory, " because it is a folder"),
+        // Where the system has no reason a person can act on, its own words are for the log.
+        (ErrorKind::Other, ""),
+    ];
+    for (kind, why) in cases {
+        assert_eq!(files::unread(&Error::new(kind, "Whatever (os error 5)")), why, "{kind:?}");
     }
 }
 

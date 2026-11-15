@@ -10,11 +10,12 @@
 //! elsewhere could otherwise name a picture anywhere on this machine and carry it off in the document.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use letters_convert::{DocxImport, ImportNote, from_docx, import_markdown};
+use letters_convert::{DocxError, DocxImport, ImportNote, from_docx, import_markdown};
 use letters_format::Package;
 use letters_model::{Anchor, Document, Note, NoteKind, Notes, Run, Style};
 
@@ -146,19 +147,60 @@ enum Content {
     Word(Box<DocxImport>),
 }
 
+/// Why a file is not brought in. As text it is for the command line. A window says [`Unplanned::why`].
+#[derive(Debug)]
+pub enum Unplanned {
+    /// The system would not read the file.
+    Unread(io::Error),
+    /// It starts as a Word file does, and is none that can be read.
+    Word(DocxError),
+    /// It is neither Markdown in UTF-8 nor a Word document.
+    Neither,
+}
+
+impl Unplanned {
+    /// Why, to end a sentence a person reads: " because it is not there", or nothing where there is no
+    /// plain reason to give. The detail is for the log.
+    pub fn why(&self) -> &'static str {
+        match self {
+            Self::Unread(error) => files::unread(error),
+            Self::Word(DocxError::Legacy) => {
+                " because it is an older .doc or is locked with a password. Save it from Word as an unlocked .docx"
+            }
+            Self::Word(DocxError::TooLarge(_)) => " because it is too large to bring in",
+            Self::Word(error) => {
+                eprintln!("letters: a Word file could not be read: {error}");
+                " because it is damaged or is not a Word document"
+            }
+            Self::Neither => " because it is neither Markdown nor a Word document",
+        }
+    }
+}
+
+impl fmt::Display for Unplanned {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unread(error) => error.fmt(f),
+            Self::Word(error) => error.fmt(f),
+            Self::Neither => f.write_str("the file is neither Markdown in UTF-8 nor a Word document"),
+        }
+    }
+}
+
+impl std::error::Error for Unplanned {}
+
 impl Plan {
-    /// Reads `source`. Fails, in words for the person, on a file that is neither Markdown nor a Word document.
+    /// Reads `source`. Fails on a file that cannot be read or is neither Markdown nor a Word document.
     ///
     /// `style` is the person's own, which the document starts with. A Word file's styles are laid over it,
     /// so that the document looks as it did.
-    pub fn of(source: &Path, style: &Style) -> Result<Self, String> {
-        let bytes = fs::read(source).map_err(|error| error.to_string())?;
+    pub fn of(source: &Path, style: &Style) -> Result<Self, Unplanned> {
+        let bytes = fs::read(source).map_err(Unplanned::Unread)?;
         let name = source.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let folder = normal(source.parent().unwrap_or(Path::new("")));
         let (id, created) = (platform::document_id(), platform::now_rfc3339());
         if WORD_STARTS.iter().any(|start| bytes.starts_with(start)) {
-            let word =
-                from_docx(&bytes, style, &created, &mut platform::block_id).map_err(|error| error.to_string())?;
+            let word = from_docx(&bytes, style, &created, &mut platform::block_id).map_err(Unplanned::Word)?;
             let (comments, content) = (word.comments.len(), Content::Word(Box::new(word)));
             return Ok(Self {
                 id,
@@ -174,7 +216,7 @@ impl Plan {
             });
         }
         let Ok(markdown) = String::from_utf8(bytes) else {
-            return Err("the file is neither Markdown in UTF-8 nor a Word document".into());
+            return Err(Unplanned::Neither);
         };
         // A read that is handed no picture finds out which ones the file names.
         let mut named = Vec::new();

@@ -76,14 +76,20 @@ mod system {
             File::open(&path)
         })();
         let _ = fs::remove_file(&path);
-        written.map_err(|error| format!("The document could not be made ready to print: {error}."))
+        written.map_err(|error| {
+            eprintln!("letters: could not write what is printed: {error}");
+            "The document could not be made ready to print.".to_owned()
+        })
     }
 
     /// Asks the portal to show the print dialog, then to print the file as the person chose there.
     fn through_portal(pdf: &File, title: &str, parent: &str) -> Result<(), String> {
         let failed = |error: zbus::Error| match error {
             zbus::Error::MethodError(..) | zbus::Error::InterfaceNotFound => NO_PORTAL.to_owned(),
-            other => format!("The print dialog could not be reached: {other}."),
+            other => {
+                eprintln!("letters: the print dialog could not be reached: {other}");
+                "The print dialog could not be reached.".to_owned()
+            }
         };
         let connection = Connection::session().map_err(|_| NO_PORTAL.to_owned())?;
         let print = Proxy::new(&connection, PORTAL, "/org/freedesktop/portal/desktop", "org.freedesktop.portal.Print")
