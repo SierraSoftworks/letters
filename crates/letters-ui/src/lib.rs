@@ -11,6 +11,7 @@ mod chrome;
 pub mod color;
 mod describe;
 mod element;
+mod folders;
 mod highlight;
 pub mod icon;
 mod importing;
