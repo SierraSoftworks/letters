@@ -9,6 +9,7 @@
 mod access;
 mod chrome;
 pub mod color;
+mod copying;
 mod describe;
 mod element;
 mod folders;
@@ -41,6 +42,7 @@ mod window;
 
 pub use accesskit::Role;
 pub use chrome::{Chrome, Edge, Frame, WindowButton};
+pub use copying::CopyFormat;
 pub use element::{Cursor, Element, Fitted, Paint, Pointer};
 pub use icon::Icon;
 pub use importing::{ImportFolder, ImportKind, ImportOffer};

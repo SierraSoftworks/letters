@@ -23,8 +23,8 @@ use letters_spell::Dictionary;
 use letters_trust::Trust;
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
-    Appearance, Chrome, Cursor, Edge, Frame, Landing, Location, Request, SaveState, Scheme, Settings, Window as View,
-    tokens,
+    Appearance, Chrome, CopyFormat, Cursor, Edge, Frame, Landing, Location, Request, SaveState, Scheme, Settings,
+    Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -39,6 +39,7 @@ use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowAttributes
 
 use crate::chrome::{self, Buttons, Host};
 use crate::cli::{Mode, Options};
+use crate::copies;
 use crate::dictionaries;
 use crate::files::{self, EXTENSION, Exchange, Home, Opened, Rest, STYLESHEET, Working};
 use crate::gpu::Gpu;
@@ -75,6 +76,8 @@ pub enum Event {
     Access(accesskit_winit::Event),
     /// A window's save has finished, and its result is ready to collect.
     Saved(WindowId),
+    /// The copy a window asked for was written at this path, or was not.
+    Copied(WindowId, PathBuf, Result<Option<String>, copies::Refused>),
     /// What a window's first paint did not need has been read.
     Read(WindowId),
     /// The search for a GPU has ended, with one or without.
@@ -139,6 +142,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
             _ => GpuState::Wanted { software: false },
         },
         windows: HashMap::new(),
+        copies: Vec::new(),
         mods: ModifiersState::empty(),
         failure: None,
     };
@@ -273,6 +277,8 @@ struct App {
     languages: Vec<String>,
     gpu: GpuState,
     windows: HashMap<WindowId, DocWindow>,
+    /// The copies being written, which the app waits for before it ends.
+    copies: Vec<JoinHandle<()>>,
     mods: ModifiersState,
     /// Why the app is exiting, when it is not by choice.
     failure: Option<String>,
@@ -1139,6 +1145,14 @@ impl App {
                     let make = |library: &Library| library.new_folder(Path::new(&parent), &name).map(drop);
                     refused = !self.replace(id, now, |_, library| make(library));
                 }
+                Request::SaveCopy { name, format, folder, replace } => {
+                    let folder = folder.as_deref().map(Path::new);
+                    if let Err(refused) = self.copy(id, &name, format, folder, replace)
+                        && let Some(window) = self.windows.get_mut(&id)
+                    {
+                        window.view.refuse_copy(&refused.to_string(), refused.replaceable());
+                    }
+                }
                 Request::Close => self.act(event_loop, id, Action::Close),
                 Request::DragWindow
                 | Request::ResizeWindow(_)
@@ -1218,6 +1232,47 @@ impl App {
         if let (Err(error), Some(window)) = (kept, self.windows.get(&id)) {
             window.alert(&format!("Your default style could not be kept.\n\n{error}"));
         }
+    }
+
+    /// Starts writing a copy of a window's document called `name`, in `folder` or where the person then
+    /// chooses. The copy is made from the document's file on another thread, and arrives as an event.
+    fn copy(
+        &mut self,
+        id: WindowId,
+        name: &str,
+        format: CopyFormat,
+        folder: Option<&Path>,
+        replace: bool,
+    ) -> Result<(), copies::Refused> {
+        let Some(window) = self.windows.get_mut(&id) else { return Ok(()) };
+        // The file is brought up to date first. A title still being typed names it only if nothing
+        // else would give the document a file.
+        for caret in [true, false] {
+            if window.file().is_none() || window.unsaved() {
+                window.save_now(caret, &self.library, &mut self.journals).map_err(copies::Refused::Failed)?;
+            }
+        }
+        let source = window.file().ok_or(copies::Refused::Nothing)?.to_owned();
+        let (output, replace) = match folder {
+            Some(folder) => (copies::path(folder, name, format)?, replace),
+            None => {
+                let suggested = copies::path(&window.place.folder(&self.library), name, format)?;
+                let dialog = FileDialog::new()
+                    .add_filter(copies::kind(format), &[copies::extension(format)])
+                    .set_directory(suggested.parent().unwrap_or(Path::new("")))
+                    .set_file_name(suggested.file_name().unwrap_or_default().to_string_lossy());
+                let Some(chosen) = dialog.set_parent(&*window.window).save_file() else { return Ok(()) };
+                // The system has asked about a file that is in the way.
+                (copies::ending(chosen, format), true)
+            }
+        };
+        let proxy = self.proxy.clone();
+        self.copies.retain(|copy| !copy.is_finished());
+        self.copies.push(thread::spawn(move || {
+            let written = copies::write(&source, &output, format, replace);
+            let _ = proxy.send_event(Event::Copied(id, output, written));
+        }));
+        Ok(())
     }
 
     /// Has a window rename or move its document. Returns whether it was done.
@@ -1565,6 +1620,23 @@ impl ApplicationHandler<Event> for App {
                     window.sync(now);
                 }
             }
+            Event::Copied(id, output, written) => {
+                let Some(window) = self.windows.get_mut(&id) else { return };
+                match written {
+                    Ok(made) => {
+                        window.view.set_copied(&self.library.shown(output.parent().unwrap_or(Path::new(""))));
+                        // A copy of a document the person trusts is theirs as much as the document is.
+                        if let Some(made) = made.filter(|_| window.maths_links)
+                            && let Err(error) = self.trust.trust_document(&made)
+                        {
+                            eprintln!("letters: could not record a copy as trusted: {error}");
+                        }
+                    }
+                    Err(refused) => window.view.refuse_copy(&refused.to_string(), refused.replaceable()),
+                }
+                window.access_stale = true;
+                window.sync(now);
+            }
             Event::Read(id) => {
                 let Some(window) = self.windows.get_mut(&id) else { return };
                 if let Err(error) = window.finish_read(&mut self.journals) {
@@ -1659,6 +1731,10 @@ impl ApplicationHandler<Event> for App {
         }
         self.vouch();
         self.journals.finish();
+        // Half a copy is worse than a moment's wait.
+        for copy in self.copies.drain(..) {
+            let _ = copy.join();
+        }
     }
 
     /// Runs after each batch of events: starts due saves and sleeps until the next thing is due.

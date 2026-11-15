@@ -7,7 +7,8 @@
 //! - [`words`] keeps the person's own dictionary, [`trust`] what they trust, and [`settings`] what they set.
 //! - [`dictionaries`] finds the system's dictionaries for languages other than English.
 //! - [`measure`] checks the performance budgets, and [`baseline`] is the empty window it compares with.
-//! - [`convert`] runs the `export` and `import` subcommands, which need no window.
+//! - [`convert`] runs the `export` and `import` subcommands, which need no window, and [`copies`] writes the
+//!   copies and exports a window asks for.
 //! - [`import`] makes a document of a Markdown or Word file, for that subcommand and for a window.
 
 pub mod app;
@@ -15,6 +16,7 @@ pub mod baseline;
 pub mod chrome;
 pub mod cli;
 pub mod convert;
+pub mod copies;
 pub mod dictionaries;
 pub mod files;
 pub mod gpu;

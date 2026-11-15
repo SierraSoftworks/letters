@@ -472,6 +472,10 @@ impl Shell {
                     follow(&mut self.view, settings);
                     self.view.set_dark(self.dark());
                 }
+                // A copy needs somewhere to go as well, and the card that asked waits for its answer.
+                Request::SaveCopy { .. } => {
+                    self.view.refuse_copy("Copies cannot be saved from the browser yet.", false)
+                }
                 // Opening, starting and moving need files, which wait for a server behind the page.
                 _ => {}
             }

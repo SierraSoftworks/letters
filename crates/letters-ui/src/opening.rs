@@ -5,6 +5,7 @@
 use letters_render::Point;
 
 use crate::chrome::Edge;
+use crate::copying::CopyFormat;
 use crate::settings::Settings;
 
 /// What the window asks its shell to do. Collect them with `Window::take_requests` after each event.
@@ -33,6 +34,16 @@ pub enum Request {
     NewFolder {
         parent: String,
         name: String,
+    },
+    /// Write a copy of the document called `name` in `format`, and leave this window on the document it
+    /// has. `folder` is the path of the folder to write it to, or `None` to let the person choose where.
+    /// A file of that name is in the way unless `replace` is set, which it is once the person has said so.
+    /// Answer with `Window::set_copied`, or with `Window::refuse_copy` when it cannot be done.
+    SaveCopy {
+        name: String,
+        format: CopyFormat,
+        folder: Option<String>,
+        replace: bool,
     },
     /// Keep this as the person's default style, which their new documents start with: the text of a
     /// `style.json`. Answer with `Window::set_default_style` if it could not be kept.

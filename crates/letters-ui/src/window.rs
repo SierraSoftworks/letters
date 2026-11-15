@@ -22,6 +22,7 @@ use letters_spell::Dictionary;
 
 use crate::chrome::Chrome;
 use crate::color::{blend, fade, resolve, same};
+use crate::copying::{self, Copy, CopyFormat, Copying};
 use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::highlight;
@@ -171,6 +172,8 @@ pub enum Message {
     Rename(Rename),
     /// Chooses what an imported file brings, on the import card.
     Import(Import),
+    /// What is done on the card that saves a copy of the document, or writes it in another format.
+    Copy(Copying),
     /// What the Styles panel asks for: the person's default, page setup and stylesheets.
     Styles(Styling),
     /// Asks the shell for something only it can do, such as moving the window.
@@ -248,6 +251,26 @@ impl Ui<EditorApp> {
         app.asked = None;
     }
 
+    /// Says that the copy a [`Request::SaveCopy`] asked for is written, and names its folder as the bar is
+    /// to say it for a few seconds.
+    pub fn set_copied(&mut self, folder: &str) {
+        let app = self.app_mut();
+        let Some(asked) = app.copy_asked.take() else { return };
+        let said = if asked.format() == CopyFormat::Letters { "Copy saved in" } else { "Exported to" };
+        app.note = Some((format!("{said} {folder}"), None));
+    }
+
+    /// Says why a copy could not be written, as the person is to read it. The card comes back as it was
+    /// and says so until something on it changes. `replaceable` is for a file of the copy's name that is in
+    /// the way: the card then offers to replace it, and asks again with `replace` set.
+    pub fn refuse_copy(&mut self, notice: &str, replaceable: bool) {
+        let app = self.app_mut();
+        if let Some(mut copy) = app.copy_asked.take() {
+            copy.refused(notice, replaceable);
+            app.copying = Some(copy);
+        }
+    }
+
     /// Shows the landing card over a document nobody has written in, or takes it away. The card goes by
     /// itself when the person starts to write.
     pub fn set_landing(&mut self, landing: Option<Landing>) {
@@ -272,7 +295,7 @@ impl Ui<EditorApp> {
 
     /// Has the bar say for a few seconds which folder the document was written to, after its first write.
     pub fn set_saved_in(&mut self, folder: &str) {
-        self.app_mut().saved_in = Some((folder.to_owned(), None));
+        self.app_mut().note = Some((format!("Saved in {folder}"), None));
     }
 
     /// Says what the person's default style is, which their new documents start with. The Styles panel
@@ -553,14 +576,21 @@ pub struct EditorApp {
     wanted: HashSet<String>,
     /// The bar that says where pictures held over the page would land, in the layout's coordinates.
     drop: Option<Rect>,
-    /// The folder the bar says the document was saved in, and since when, once a frame has said so.
-    saved_in: Option<(String, Option<u64>)>,
+    /// What the bar says of a write that was just done, as where the document was first saved, and since
+    /// when, once a frame has said so.
+    note: Option<(String, Option<u64>)>,
     /// Whether the caret is in the heading that will name the document.
     naming: bool,
     /// The name field in the bar, while the document is being renamed or moved.
     renaming: Option<Renaming>,
     /// What the field held when the shell was last asked for it, to bring back if the shell refuses.
     asked: Option<Renaming>,
+    /// The card that saves a copy, while it shows.
+    copying: Option<Copy>,
+    /// The card as it was when the shell was asked for the copy, to bring back if the shell refuses.
+    copy_asked: Option<Copy>,
+    /// Whether keys follow macOS conventions, which is how the menus then write them.
+    mac: bool,
     save: SaveState,
     edits: u64,
     panel: Option<Panel>,
@@ -621,10 +651,13 @@ impl EditorApp {
             images: Images::default(),
             wanted: HashSet::new(),
             drop: None,
-            saved_in: None,
+            note: None,
             naming: false,
             renaming: None,
             asked: None,
+            copying: None,
+            copy_asked: None,
+            mac: cfg!(target_os = "macos"),
             save: SaveState::default(),
             edits: 0,
             panel: None,
@@ -682,6 +715,29 @@ impl EditorApp {
         self.asked = None;
         if let Some(renaming) = &mut self.renaming {
             renaming.placed(&self.location);
+        }
+        if let Some(copy) = &mut self.copying {
+            copy.placed(&self.location);
+        }
+    }
+
+    /// What the card that saves a copy asks for.
+    fn copy(&mut self, message: Copying) {
+        let title = self.name().0;
+        let Some(mut copy) = self.copying.take() else {
+            // The landing card stands over a document there is nothing of yet, and so does the import card.
+            if let Copying::Open(format) = message
+                && self.landing.is_none()
+                && self.importing.is_none()
+            {
+                self.copying = Some(Copy::open(format, &self.location, &title));
+            }
+            return;
+        };
+        match copy.update(message, &self.location, &title, &mut self.requests) {
+            copying::Outcome::Open => self.copying = Some(copy),
+            copying::Outcome::Asked => self.copy_asked = Some(copy),
+            copying::Outcome::Closed => {}
         }
     }
 
@@ -918,8 +974,11 @@ impl EditorApp {
 
     /// The reference to a figure at a point of the page area, while nothing hangs over the page.
     fn reference(&self, at: Point) -> Option<Reference> {
-        let hung =
-            self.landing.is_some() || self.importing.is_some() || self.spelling.fix.is_some() || self.link.is_some();
+        let hung = self.landing.is_some()
+            || self.importing.is_some()
+            || self.copying.is_some()
+            || self.spelling.fix.is_some()
+            || self.link.is_some();
         if hung || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some() {
             return None;
         }
@@ -1182,8 +1241,11 @@ impl EditorApp {
         let selection = self.editor.selection();
         // A formula with the caret in it has its source out on a sheet, while the place under it is in view
         // and nothing else hangs from the page.
-        let alone =
-            self.landing.is_none() && self.importing.is_none() && self.spelling.fix.is_none() && self.link.is_none();
+        let alone = self.landing.is_none()
+            && self.importing.is_none()
+            && self.copying.is_none()
+            && self.spelling.fix.is_none()
+            && self.link.is_none();
         let formula = selection.filter(|_| alone).and_then(|selection| self.layout.formula_rect(&selection.head));
         let formula = formula.filter(|rect| (0.0..=room.height).contains(&(origin.y + rect.y + rect.height)));
         let sheet = formula.and_then(|rect| Some((Source::of(&self.editor, self.shaper.as_ref(), self.wide())?, rect)));
@@ -1261,6 +1323,8 @@ impl EditorApp {
             element = element.popover(importing.card(room));
         } else if let Some(landing) = &self.landing {
             element = element.popover(Self::card(landing, room));
+        } else if let Some(copy) = &self.copying {
+            element = element.popover(copy.card(&self.location, room));
         } else if let Some(fix) = &self.spelling.fix {
             // The menu hangs from the start of its word.
             let start = self.layout.caret(&Pos::new(fix.block.clone(), fix.range.start)).unwrap_or_default();
@@ -1442,7 +1506,13 @@ impl EditorApp {
             .item(MenuItem::new("New document").icon(icon::PLUS).on_select(Message::NewDocument))
             .item(MenuItem::new("Open").icon(icon::FOLDER_OPEN).on_select(Message::OpenDialog))
             .separator()
-            .item(MenuItem::new("Export").icon(icon::DOWNLOAD).disabled(true))
+            .item(
+                MenuItem::new("Save a copy")
+                    .icon(icon::COPY)
+                    .aside(if self.mac { "\u{21e7}\u{2318}S" } else { "Ctrl+Shift+S" })
+                    .on_select(Message::Copy(Copying::Open(CopyFormat::Letters))),
+            )
+            .item(MenuItem::new("Export").icon(icon::DOWNLOAD).on_select(Message::Copy(Copying::Open(CopyFormat::Pdf))))
             .item(MenuItem::new("Print view").icon(icon::PRINTER).disabled(true))
             .item(MenuItem::new("Page setup").icon(icon::FILE_TEXT).disabled(true))
             .separator()
@@ -1539,8 +1609,8 @@ impl EditorApp {
             }
         };
         // For a moment after its first write, the icon tells where the document went.
-        let note = self.saved_in.as_ref().filter(|_| self.save == SaveState::Saved);
-        let said = note.map_or_else(|| said.to_owned(), |(folder, _)| format!("Saved in {folder}"));
+        let note = self.note.as_ref().filter(|_| self.save == SaveState::Saved);
+        let said = note.map_or_else(|| said.to_owned(), |(note, _)| note.clone());
         let tip = more.map_or_else(|| said.clone(), |more| format!("{said}. {more}"));
         let mut saved = Element::icon(state, SAVE_ICON)
             .fg(ink)
@@ -2090,6 +2160,7 @@ impl App for EditorApp {
                 let stays = self.importing.as_mut().is_some_and(|card| card.update(message, &mut self.requests));
                 self.importing = self.importing.take().filter(|_| stays);
             }
+            Message::Copy(message) => self.copy(message),
             Message::Styles(message) => self.styling(message, platform),
             Message::Ask(request) => self.requests.push(request),
             Message::Maths(message) => self.sheet(message, platform),
@@ -2158,7 +2229,8 @@ impl App for EditorApp {
             // The page may have moved under a pointer that rests where it was.
             self.unpoint();
         }
-        // The editor leaves this one to the window, which edits the link in place.
+        // The editor leaves these to the window: the link is edited in place, and a copy is asked for on
+        // its card.
         let primary = Modifiers { primary: true, ..Modifiers::default() };
         let link = event.key == Key::Char('k') && event.mods == primary;
         if !used && link {
@@ -2169,7 +2241,11 @@ impl App for EditorApp {
         if settings {
             self.dialog.open = true;
         }
-        used || link || settings
+        let copy = event.key == Key::Char('s') && event.mods == Modifiers { shift: true, ..primary };
+        if !used && copy {
+            self.copy(Copying::Open(CopyFormat::Letters));
+        }
+        used || link || settings || copy
     }
 
     fn describe(&self, page: &mut AccessNode, nodes: &mut Vec<(NodeId, AccessNode)>, whole: bool) {
@@ -2214,6 +2290,7 @@ impl App for EditorApp {
     }
 
     fn keys(&mut self, keys: Keys) {
+        self.mac = keys == Keys::Mac;
         self.editor.set_keymap(match keys {
             Keys::Standard => Keymap::standard(),
             Keys::Mac => Keymap::mac(),
@@ -2254,10 +2331,10 @@ impl App for EditorApp {
 
     fn animate(&mut self, now_ms: u64) -> Option<u64> {
         // The note about where the document was saved goes after its few seconds.
-        let until = self.saved_in.as_mut().map(|(_, from)| *from.get_or_insert(now_ms) + SAVED_NOTE_MS);
+        let until = self.note.as_mut().map(|(_, from)| *from.get_or_insert(now_ms) + SAVED_NOTE_MS);
         let note = until.filter(|until| now_ms < *until);
         if note.is_none() {
-            self.saved_in = None;
+            self.note = None;
         }
         let slide = self.maths.animate(now_ms);
         let fade = self.fading.as_mut().map(|from| *from.get_or_insert(now_ms)).and_then(|from| {
