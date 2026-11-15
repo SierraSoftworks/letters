@@ -277,6 +277,41 @@ impl Margin {
         all.get(next).map(|id| (*id).to_owned())
     }
 
+    /// The note the keyboard steps to, of those that have a marker, in the order of the document: the one
+    /// after the note that is open, or with `back` the one before it, round and round. With none open,
+    /// the first beside the block the caret is in or below it, or with `back` the last beside that block
+    /// or above it. `None` where there is no other note to go to, and while a reply is being typed, which
+    /// keeps its note open.
+    pub fn next(&self, back: bool, doc: &Document, caret: Option<&BlockId>) -> Option<String> {
+        fn holds(block: &Block, id: &BlockId) -> bool {
+            block.id == *id || block.body.blocks().iter().any(|part| holds(part, id))
+        }
+        if self.thread.as_ref().is_some_and(|(_, reply)| !reply.is_blank()) {
+            return None;
+        }
+        // Each note with where the block of its marker stands in the document.
+        let mut all: Vec<(Option<usize>, &String)> = Vec::new();
+        for marker in &self.marks {
+            let at = doc.blocks.iter().position(|top| top.id == marker.block);
+            all.extend(marker.notes.iter().map(|note| (at, note)));
+        }
+        let open = self.thread.as_ref().and_then(|(open, _)| all.iter().position(|(_, note)| *note == open));
+        let next = match open {
+            _ if all.is_empty() => return None,
+            Some(_) if all.len() == 1 => return None,
+            Some(at) if back => (at + all.len() - 1) % all.len(),
+            Some(at) => (at + 1) % all.len(),
+            None => {
+                // The notes beside the blocks above the caret's, and with `back` those beside its own too.
+                let own = caret.and_then(|caret| doc.blocks.iter().position(|top| holds(top, caret)));
+                let before = |at: usize| own.is_some_and(|own| at < own || (back && at == own));
+                let passed = all.iter().filter(|(at, _)| at.is_some_and(before)).count();
+                if back { (passed + all.len() - 1) % all.len() } else { passed % all.len() }
+            }
+        };
+        Some(all[next].1.clone())
+    }
+
     /// Settles the conflict that is open, once one of its versions was chosen, and puts it away. Returns
     /// whether it did.
     pub fn settle(&mut self) -> bool {

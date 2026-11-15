@@ -6,7 +6,7 @@ use letters_editor::Picture;
 use letters_model::{Block, BlockKind, Body, Document, Pos, Preview, Run, Selection};
 use letters_render::Point;
 use letters_test::{Found, Harness, Role};
-use letters_ui::{LinkPreviewFound, Request, SaveState};
+use letters_ui::{Access, LinkPreviewFound, Request, SaveState};
 
 const QUOTE: &str = "https://roofers.example.org/quotes/spring";
 const GUIDE: &str = "https://slate.example.org/guides/welsh";
@@ -577,4 +577,106 @@ fn the_card_of_a_link_reads_what_is_kept_of_its_page() {
     assert_eq!(rested(&mut window), None);
     // What is kept is of the address in the field: another address has nothing to show yet.
     window.type_text("x").assert_closed(Role::Label, "Choosing Welsh slate");
+}
+
+const AS_CARD: &str = "Show link as card";
+const AS_LINK: &str = "Show card as link";
+
+/// A note whose middle line, `line`, is a link to the guide and nothing else.
+fn lone() -> Harness {
+    let link = Run { link: Some(GUIDE.to_owned()), ..Run::plain("the guide to Welsh slate") };
+    notes(vec![Block { body: Body::Text(vec![link]), ..Block::new("line", BlockKind::Paragraph) }])
+}
+
+/// Puts the caret in a block of the note.
+fn caret(window: &mut Harness, block: &str, offset: usize) {
+    window.ui().select(Selection::caret(Pos::new(block, offset)));
+    window.paint();
+}
+
+/// Which of the two commands that show a link as a card, or a card as a link, the palette lists.
+fn offered(window: &mut Harness) -> Vec<String> {
+    window.key("Mod+Shift+P").type_text("show as");
+    let listed = window.controls().into_iter().filter(|found| found.role == Role::ListBoxOption);
+    let names = listed.map(|found| found.name).collect();
+    window.key("Escape");
+    names
+}
+
+/// Takes a command from the palette by its name.
+fn command(window: &mut Harness, name: &str) {
+    window.key("Mod+Shift+P").type_text(name).key("Enter");
+}
+
+/// The addresses the links in the note's text lead to.
+fn links(window: &Harness) -> Vec<String> {
+    let runs = window.editor().doc().walk().flat_map(|block| block.body.runs());
+    runs.filter_map(|run| run.link.clone()).collect()
+}
+
+#[test]
+fn a_link_alone_on_its_line_is_shown_as_a_card_and_as_a_link_again_from_the_palette() {
+    let mut window = lone();
+    caret(&mut window, "line", 4);
+    command(&mut window, AS_CARD);
+    assert_eq!(all_shown(&window), [(GUIDE.to_owned(), None, None, None)], "the line is a card that leads there");
+    assert_eq!(links(&window), [""; 0], "and no line of text any more");
+    assert_eq!(fetches(&mut window), [GUIDE], "its page is asked for, as for a card that is put in");
+
+    // The caret is left under the card, and the card above it is the one meant.
+    command(&mut window, AS_LINK);
+    assert_eq!(all_shown(&window), [], "the card is a line of text again");
+    assert_eq!(links(&window), [GUIDE]);
+    window.key("Mod+Z");
+    assert_eq!(all_shown(&window).len(), 1, "one step back brings the card");
+}
+
+#[test]
+fn the_preview_whose_card_is_out_is_the_one_shown_as_a_link() {
+    // Two previews, and the caret right under the second of them.
+    let cards = vec![
+        Block::new("card", preview(QUOTE, Some("Spring quotes"), None)),
+        Block::new("twin", preview(GUIDE, None, None)),
+    ];
+    let mut window = notes(cards);
+    caret(&mut window, "after", 0);
+    window.click(Role::Button, EDIT).assert_open(Role::Dialog, CARD);
+    assert_eq!(field(&mut window, "Address").as_deref(), Some(QUOTE), "the card of the first is out");
+
+    command(&mut window, AS_LINK);
+    assert_eq!(links(&window), [QUOTE]);
+    assert_eq!(all_shown(&window), [(GUIDE.to_owned(), None, None, None)], "the other preview stays a card");
+    window.assert_closed(Role::Dialog, CARD);
+    let kept = window.editor().doc().previews.get(QUOTE).and_then(|kept| kept.title.clone());
+    assert_eq!(kept.as_deref(), Some("Spring quotes"), "what the card showed of its page is kept for the link");
+}
+
+#[test]
+fn a_link_and_a_card_are_offered_their_other_shape_only_where_one_is_meant() {
+    type Open = fn() -> Harness;
+    // A note with the block its caret is in and how far along, and which of the two commands the palette
+    // lists there.
+    type Case = (&'static str, Open, (&'static str, usize), &'static [&'static str]);
+    let carded: Open = || note(preview(GUIDE, None, None));
+    let cases: [Case; 6] = [
+        ("in a line that is one link", lone, ("line", 4), &[AS_CARD]),
+        ("in a line with words round its link", || linked(None), ("line", 14), &[]),
+        ("in a line with no link", lone, ("before", 4), &[]),
+        ("at the start of the line under a card", carded, ("after", 0), &[AS_LINK]),
+        ("further along the line under a card", carded, ("after", 5), &[]),
+        ("at the start of the line over a card", carded, ("before", 0), &[]),
+    ];
+    for (what, open, (block, offset), lists) in cases {
+        let mut window = open();
+        caret(&mut window, block, offset);
+        assert_eq!(offered(&mut window), lists, "{what}");
+    }
+
+    // Someone who does not write the document changes the shape of nothing.
+    for (open, (block, offset)) in [(lone as Open, ("line", 4)), (carded, ("after", 0))] {
+        let mut window = open();
+        window.ui().set_access(Access::Reads);
+        caret(&mut window, block, offset);
+        assert_eq!(offered(&mut window), [""; 0]);
+    }
 }

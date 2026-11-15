@@ -2130,6 +2130,19 @@ impl EditorApp {
         }
     }
 
+    /// The link preview a command is for, since no caret stands in one: the one whose card is out, or
+    /// the one right above the line the caret is at the start of, where Backspace does the same.
+    fn card_chosen(&self) -> Option<BlockId> {
+        if let Some(open) = &self.previews.open {
+            return Some(open.clone());
+        }
+        let caret = &self.editor.selection().filter(|selection| selection.is_caret())?.head;
+        let place = self.editor.model().place(&caret.block).filter(|_| caret.offset == 0)?;
+        let beside = place.parent.map_or(&self.editor.doc().blocks[..], |parent| parent.body.blocks());
+        let above = beside.get(place.index.checked_sub(1)?)?;
+        matches!(above.kind, BlockKind::LinkPreview { .. }).then(|| above.id.clone())
+    }
+
     /// What a command asks for where the caret is now, or `None` while it has nothing to act on.
     fn asked(&self, act: &Act) -> Option<Message> {
         let editor = &self.editor;
@@ -2148,9 +2161,10 @@ impl EditorApp {
             Act::Run(_) | Act::Load | Act::AlwaysLoad | Act::Panel(Panel::Notes) | Act::Review(_) => true,
             Act::NewDocument | Act::Open | Act::SaveCopy | Act::Export | Act::CleanCopy => true,
             Act::Settings | Act::Servers | Act::TrustDocument | Act::TrustFolder | Act::Print => true,
-            Act::Find | Act::FindStep { .. } | Act::Palette => true,
+            Act::Find | Act::FindStep { .. } | Act::Palette | Act::Note { .. } => true,
             Act::Comment => !self.margin.reads,
             Act::MoveRow { .. } | Act::MoveColumn { .. } | Act::Link | Act::Pictures | Act::Preview => false,
+            Act::CardAsLink => false,
             Act::AltText | Act::Callout | Act::CodeLanguage | Act::Embed | Act::EmbedAll => false,
             Act::Panel(Panel::Styles) | Act::Rename | Act::Save | Act::PageSetup => false,
             Act::MergeConflicts | Act::MergeFrom | Act::MergeInto | Act::Share => false,
@@ -2195,8 +2209,18 @@ impl EditorApp {
                 let selection = editor.selection().filter(|selection| !selection.is_caret())?;
                 notes::passage(editor.doc(), selection).map(|_| Message::Note(Noting::Write))?
             }
+            // A note opens under its passage on the page, so only while the page shows.
+            Act::Note { back } => {
+                let caret = editor.selection().map(|selection| &selection.head.block);
+                let next = self.margin.next(*back, editor.doc(), caret).filter(|_| !self.carded() && !self.away())?;
+                Message::Note(Noting::Open(next))
+            }
             Act::Pictures => Message::Ask(Request::Pictures),
             Act::Preview => Message::Preview(Previewing::New),
+            Act::CardAsLink => {
+                let command = Command::CardAsLink(self.card_chosen()?);
+                editor.applies(&command).then_some(Message::Run(command))?
+            }
             Act::AltText => self.captioned().map(|_| Message::Alt(Altering::Open))?,
             Act::Callout => editor.callout().map(|_| Message::Callout(Calling::Open))?,
             Act::CodeLanguage => self.code().map(|_| Message::Language(Languaging::Open))?,
@@ -5510,10 +5534,10 @@ impl EditorApp {
         if self.history.is_some() {
             return self.history_key(event, platform);
         }
-        // Print view opens at what is being read. A key the editor is offered brings the caret into view,
-        // so this one is not offered: it is none of the editor's.
-        if commands::bound(event) == Some(&Act::Print) {
-            let asked = self.asked(&Act::Print);
+        // Print view opens at what is being read, and a note where it is. A key the editor is offered
+        // brings the caret into view, so these are not offered: they are none of the editor's.
+        if let Some(act @ (Act::Print | Act::Note { .. })) = commands::bound(event) {
+            let asked = self.asked(act);
             return asked.map(|message| self.update(message, platform)).is_some();
         }
         // Escape lets go of a picture held by a corner or carried, which stays as it was.
