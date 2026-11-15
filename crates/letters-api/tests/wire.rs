@@ -231,6 +231,10 @@ fn an_address_keeps_each_part_in_its_place() {
         (paths::desktop_sign_in("abc-_", 4711, "x&y"), "/auth/desktop?challenge=abc-_&port=4711&state=x%26y"),
         (paths::editor_page("é"), "/d/%C3%A9"),
         (paths::word("naïve/2"), "/api/v1/settings/dictionary/na%C3%AFve%2F2"),
+        (
+            paths::import("family", "House/2026", "Roof & co.md"),
+            "/api/v1/spaces/family/import?path=House%2F2026&name=Roof%20%26%20co.md",
+        ),
         (paths::own_source("img.example.org/a b"), "/api/v1/settings/sources/img.example.org%2Fa%20b"),
     ];
     for (address, expected) in cases {

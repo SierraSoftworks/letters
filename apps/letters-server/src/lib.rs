@@ -8,6 +8,7 @@
 //! - [`library`] lists a space and finds a document by its id, wherever its file was moved to.
 //! - [`api`] answers the interface `letters_api` lays down.
 //! - [`home`] is what a person set for themselves, kept as files in their own space.
+//! - [`import`] makes a document of a Markdown or a Word file.
 //! - [`shares`] is who reaches a document besides those its space lets in, and [`links`] are the
 //!   addresses that let in whoever holds one.
 //! - [`fetch`] is what the server fetches for a document from elsewhere: a linked picture, a link's page.
@@ -26,6 +27,7 @@ pub mod error;
 pub mod fetch;
 pub mod home;
 pub mod ids;
+pub mod import;
 pub mod library;
 pub mod links;
 pub mod oidc;

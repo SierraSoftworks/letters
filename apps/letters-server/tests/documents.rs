@@ -11,8 +11,8 @@ use letters_api::{
     Code, Entry, EntryKind, Error, Listing, Move, NewDocument, NewFolder, Opened, Rename, Role, Settings, Space,
     SpaceKind, Tag, Trust, paths,
 };
-use letters_format::{Archive, MIMETYPE, WorkingCopy};
-use letters_model::{Document, ReplicaId, Style};
+use letters_format::{Archive, MIMETYPE, OPLOG, WorkingCopy};
+use letters_model::{Block, BlockId, BlockKind, Document, Model, Notes, ReplicaId, Style, TagKind};
 use letters_server::store::Table;
 
 /// What the folder at `path` of a space lists for `who`.
@@ -414,6 +414,68 @@ async fn a_dictionary_changes(server: &Server) {
     }
     assert_eq!(ben.get::<Vec<String>>(paths::DICTIONARY).await.unwrap(), kept);
     assert!(server.person("alice", &[]).get::<Vec<String>>(paths::DICTIONARY).await.unwrap().is_empty());
+}
+
+/// A Word file that says `text`.
+fn docx(text: &str) -> Vec<u8> {
+    let line = Block::text(BlockId::new("line"), BlockKind::Paragraph, text);
+    let document = Document { blocks: vec![line], ..Document::default() };
+    letters_convert::to_docx(&document, &Style::default(), &Notes::default(), "Quote", &mut |_| None)
+}
+
+#[tokio::test]
+async fn a_markdown_or_word_file_is_brought_in_as_a_document_that_replaces_nothing() {
+    let server = Server::new("import");
+    let ben = server.person("ben", &[]);
+    // What the file is called and holds, then what the document is called, a line of it, and whether the
+    // import had to simplify something.
+    let markdown = "# Roof\n\nThe quote is *due*.\n\n<video src=\"roof.mp4\"></video>\n";
+    let cases: [(&str, Vec<u8>, &str, &str, bool); 4] = [
+        ("Roof.md", markdown.into(), "Roof", "The quote is due.", true),
+        ("C:\\notes\\Roof.md", "Plain words.".into(), "Roof 2", "Plain words.", false),
+        ("Quote.docx", docx("From the builder."), "Quote", "From the builder.", false),
+        // What a file is, is told from what it holds.
+        ("Quote.md", docx("Named as Markdown."), "Quote 2", "Named as Markdown.", false),
+    ];
+    for (name, file, called, line, simplified) in cases {
+        let made = ben.send(Method::POST, &paths::import("home", "", name), "", file).await;
+        assert_eq!(made.status, StatusCode::OK, "{name}: {}", made.text());
+        let entry: Entry = made.json();
+        let noted = entry.tags.iter().any(|tag| matches!(tag, Tag::ImportNotes { .. }));
+        assert_eq!((entry.name.as_str(), noted), (called, simplified), "{name}");
+
+        let file = ben.send(Method::GET, &paths::file(&entry.id.unwrap()), "", Vec::new()).await.body;
+        let mut archive = Archive::open(Cursor::new(file)).unwrap();
+        let text: Vec<String> = archive.document().unwrap().walk().map(Block::plain_text).collect();
+        assert!(text.iter().any(|block| block == line), "{name}: {text:?}");
+        // Its history says where it came from.
+        let history = archive.read(OPLOG).unwrap().expect("a history");
+        let marks = Model::load(&history, ReplicaId::new("reader")).unwrap().tags();
+        let from = name.rsplit('\\').next();
+        assert!(marks.iter().any(|mark| mark.kind == TagKind::Import && mark.name.as_deref() == from), "{name}");
+    }
+    assert_eq!(names(&listed(&ben, "home", "").await), ["Quote", "Quote 2", "Roof", "Roof 2"]);
+}
+
+#[tokio::test]
+async fn a_file_that_makes_no_document_is_refused_and_nothing_is_kept() {
+    let server = Server::new("import-refused");
+    let (ben, guest) = (server.person("ben", &["family"]), server.person("guest", &["friends"]));
+    // Who hands it over, where, what it holds, and what comes of it.
+    let cases: [(&common::Client, &str, &str, &[u8], Code); 5] = [
+        (&ben, "home", "", b"\xff\xfe neither words nor Word", Code::Invalid),
+        (&ben, "home", "", b"\xd0\xcf\x11\xe0 an older .doc", Code::Invalid),
+        (&ben, "home", "", b"PK\x03\x04 and no more of a zip", Code::Invalid),
+        (&guest, "family", "", b"A reader's words.", Code::Forbidden),
+        (&ben, "home", "Nowhere", b"Words for no folder.", Code::NotFound),
+    ];
+    for (who, space, folder, file, code) in cases {
+        let refused = who.send(Method::POST, &paths::import(space, folder, "File.md"), "", file.to_vec()).await;
+        assert_eq!(refused.json::<Error>().code, code, "{}", String::from_utf8_lossy(file));
+    }
+    for space in ["home", "family"] {
+        assert!(listed(&ben, space, "").await.is_empty(), "{space}");
+    }
 }
 
 /// A style that is not the built-in one, and as a person's settings carry it.

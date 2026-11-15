@@ -266,7 +266,6 @@ impl Library {
         author: &str,
         now: u64,
     ) -> Answer<Place> {
-        let mut folder = root.folder(place)?;
         let stem = match name {
             Some(name) => {
                 file_name(name).ok_or_else(|| Refusal::invalid("That name cannot be used for a document."))?
@@ -280,14 +279,28 @@ impl Library {
         let line = Block::text(BlockId::new(ids::block_id()), BlockKind::Paragraph, "");
         copy.apply([Op::InsertBlock { parent: None, index: 0, block: line }])
             .map_err(|error| Refusal::new(Code::Internal, format!("A document could not be started: {error}.")))?;
+        self.keep(root, place, &stem, &packed(&copy)?, name.is_none())
+    }
+
+    /// Keeps a document that an import made, in the folder at `place`: as `name`, or as the first of
+    /// "name 2" and so on that is free. A file that is brought in replaces nothing.
+    pub fn bring(&self, root: &Root, place: &Place, name: &str, copy: &WorkingCopy) -> Answer<Place> {
+        let stem = file_name(name).unwrap_or_else(|| UNTITLED.into());
+        self.keep(root, place, &stem, &packed(copy)?, true)
+    }
+
+    /// Writes a new document's file into the folder at `place` as `stem`, or where `numbered` says so as
+    /// the first of "stem 2" and so on that is free, and says where it is.
+    fn keep(&self, root: &Root, place: &Place, stem: &str, file: &[u8], numbered: bool) -> Answer<Place> {
+        let mut folder = root.folder(place)?;
         // Written under a hidden name first, so that the document appears whole or not at all.
         let hidden = format!(".{stem}.{}.new", ids::block_id());
-        Files::write(&mut folder, &hidden, &packed(&copy)?)?;
+        Files::write(&mut folder, &hidden, file)?;
         for n in 1.. {
             let file = if n == 1 { format!("{stem}{EXTENSION}") } else { format!("{stem} {n}{EXTENSION}") };
             match folder.move_to(&hidden, &folder, &file) {
                 Ok(()) => return place.child(&file),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && name.is_none() => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && numbered => {}
                 Err(error) => {
                     let _ = Files::remove(&mut folder, &hidden);
                     return Err(error.into());

@@ -3,14 +3,14 @@
 //! something was.
 
 use axum::Router;
-use axum::extract::{Form, State};
+use axum::extract::{DefaultBodyLimit, Form, Multipart, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::post;
 use letters_api::{Code, Grant, Grantee, Move, NewDocument, NewFolder, Role, paths};
 use serde::Deserialize;
 
+use super::{ACT_IMPORT, ACT_REVOKE, ACT_SHARE, ACT_UNSHARE, Visitor, asking, refusing, unmerged};
 use super::{ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH, TRASH_PAGE};
-use super::{ACT_REVOKE, ACT_SHARE, ACT_UNSHARE, Visitor, asking, refusing, unmerged};
 use crate::api::blocking;
 use crate::auth::local;
 use crate::error::{Answer, Refusal};
@@ -22,6 +22,10 @@ pub fn routes() -> Router<Shared> {
     Router::new()
         .route(ACT_NEW_DOCUMENT, post(new_document))
         .route(ACT_NEW_FOLDER, post(new_folder))
+        .route(
+            ACT_IMPORT,
+            post(import).layer(DefaultBodyLimit::max(FORM + letters_api::Limits::default().document as usize)),
+        )
         .route(ACT_RENAME, post(rename))
         .route(ACT_MOVE, post(relocate))
         .route(ACT_TRASH, post(trash))
@@ -31,6 +35,9 @@ pub fn routes() -> Router<Shared> {
         .route(ACT_UNSHARE, post(unshare))
         .route(ACT_REVOKE, post(revoke))
 }
+
+/// What a form that carries a file may weigh beyond the file: its other fields and what parts them.
+const FORM: usize = 64 << 10;
 
 /// Does `work`, which says the page to show next, and shows `back` with the refusal when it is refused.
 async fn done(app: Shared, back: String, work: impl FnOnce(&App) -> Answer<String> + Send + 'static) -> Response {
@@ -63,6 +70,46 @@ async fn new_document(State(app): State<Shared>, Visitor(who): Visitor, Form(wit
     done(app, within.page(), move |app| {
         let new = NewDocument { folder: within.folder, name: None };
         let entry = app.new_document(&who, &within.space, &new)?;
+        Ok(paths::editor_page(&entry.id.unwrap_or_default()))
+    })
+    .await
+}
+
+/// Makes a document of the Markdown or Word file a form carries, and opens it.
+async fn import(State(app): State<Shared>, Visitor(who): Visitor, mut form: Multipart) -> Response {
+    let (mut space, mut folder, mut file) = (String::new(), String::new(), None);
+    // A form that stops short was cut off at what a form may weigh.
+    let mut whole = true;
+    loop {
+        let field = match form.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => {
+                whole = false;
+                break;
+            }
+        };
+        let named = field.name().unwrap_or_default().to_owned();
+        match named.as_str() {
+            "space" => space = field.text().await.unwrap_or_default(),
+            "folder" => folder = field.text().await.unwrap_or_default(),
+            "file" => {
+                let name = field.file_name().unwrap_or_default().to_owned();
+                match field.bytes().await {
+                    Ok(bytes) => file = Some((name, bytes)).filter(|(name, _)| !name.is_empty()),
+                    Err(_) => whole = false,
+                }
+            }
+            _ => {}
+        }
+    }
+    let back = paths::folder_page(&space, &folder);
+    done(app, back, move |app| {
+        if !whole {
+            return Err(Refusal::new(Code::TooLarge, "The file is larger than the server takes."));
+        }
+        let (name, file) = file.ok_or_else(|| Refusal::invalid("Choose a Markdown or Word file to import."))?;
+        let entry = app.import(&who, &space, &folder, &name, &file)?;
         Ok(paths::editor_page(&entry.id.unwrap_or_default()))
     })
     .await

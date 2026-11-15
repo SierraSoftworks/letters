@@ -108,6 +108,15 @@ fn folder_act(space: &str, path: &str, act: &str) -> String {
     format!("{SPACES}/{}/folders/{act}?path={}", segment(space), segment(path))
 }
 
+/// `POST`: a Markdown or Word file, as it is, to make a document of in the folder at `folder`. `name` is
+/// the file's own, which names the document without its ending, or by the next name after it that is free:
+/// nothing is replaced. Which of the two the file is, is told from what it holds. It may be as large as
+/// [`Limits::document`](crate::Limits::document). Answers the document's [`Entry`](crate::Entry), with a
+/// tag for what the import simplified. A file that is neither is [`Code::Invalid`](crate::Code::Invalid).
+pub fn import(space: &str, folder: &str, name: &str) -> String {
+    format!("{SPACES}/{}/import?path={}&name={}", segment(space), segment(folder), segment(name))
+}
+
 /// `GET`: the document as [`Opened`](crate::Opened).
 pub fn document(id: &str) -> String {
     format!("{API}/documents/{}", segment(id))

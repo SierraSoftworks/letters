@@ -6,8 +6,8 @@ use axum::http::StatusCode;
 use common::{Browser, START, Server, URL, follow, link, names};
 use letters_api::{CreatedLink, Entry, Listing, NewLink, Opened, Role, paths};
 use letters_server::pages::{
-    ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_REVOKE, ACT_SHARE, ACT_TRASH,
-    ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder,
+    ACT_IMPORT, ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_REVOKE, ACT_SHARE,
+    ACT_TRASH, ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder,
 };
 
 /// What the folder at `path` of a space holds, as the interface tells the browser's own session.
@@ -251,6 +251,32 @@ async fn a_conflict_copy_offers_its_merge_to_whoever_may_edit_and_nothing_else()
     assert_eq!(merged.location(), here);
     assert_eq!(names(&listed(&ben, "family", "").await), ["Plan"]);
     assert!(page(&mut ben, TRASH_PAGE).await.contains(copy), "the copy waits in the trash");
+}
+
+#[tokio::test]
+async fn a_folders_page_takes_a_file_to_make_a_document_of_and_opens_it() {
+    let server = Server::new("import-form");
+    let mut ben = server.reader("ben", &["family"]);
+    let (here, within) = (paths::folder_page("family", ""), [("space", "family"), ("folder", "")]);
+    assert!(page(&mut ben, &here).await.contains(&format!("action=\"{ACT_IMPORT}\"")), "the page offers it");
+
+    let made = ben.hand(ACT_IMPORT, &within, ("Roof.md", b"# Roof\n\nThe quote is due."), URL).await;
+    let rows = listed(&ben, "family", "").await;
+    assert_eq!(names(&rows), ["Roof"]);
+    assert_eq!(made.location(), paths::editor_page(rows[0].id.as_deref().unwrap()), "the document is opened");
+
+    // What is no file to import says so on the folder's page, and so does a form with no file.
+    for (name, file) in [("Roof.pdf", &b"%PDF-1.7 \xff\xfe"[..]), ("", &b""[..])] {
+        let refused = ben.hand(ACT_IMPORT, &within, (name, file), URL).await;
+        assert!(refused.location().starts_with(&format!("{here}?error=")), "{name}: {}", refused.location());
+    }
+    // And a reader, or another site's page, brings nothing in.
+    let mut guest = server.reader("guest", &["friends"]);
+    assert!(!page(&mut guest, &here).await.contains(ACT_IMPORT), "a reader is not offered it");
+    assert!(guest.hand(ACT_IMPORT, &within, ("Mine.md", b"Mine."), URL).await.location().contains("error=forbidden"));
+    let forged = ben.hand(ACT_IMPORT, &within, ("Theirs.md", b"Theirs."), "https://elsewhere.example").await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    assert_eq!(names(&listed(&ben, "family", "").await), ["Roof"]);
 }
 
 #[tokio::test]

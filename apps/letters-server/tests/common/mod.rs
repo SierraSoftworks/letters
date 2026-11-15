@@ -380,6 +380,24 @@ impl Browser {
         self.send(Method::POST, path, "application/x-www-form-urlencoded", body, &origin).await
     }
 
+    /// Sends a form that carries a file, from one of the server's own pages or as `origin` would. `file` is
+    /// what the file is called and what it holds.
+    pub async fn hand(&mut self, path: &str, fields: &[(&str, &str)], file: (&str, &[u8]), origin: &str) -> Raw {
+        let part = "letters-form-part";
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            let field = format!("--{part}\r\ncontent-disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n");
+            body.extend_from_slice(field.as_bytes());
+        }
+        let named =
+            format!("--{part}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"{}\"\r\n\r\n", file.0);
+        body.extend_from_slice(named.as_bytes());
+        body.extend_from_slice(file.1);
+        body.extend_from_slice(format!("\r\n--{part}--\r\n").as_bytes());
+        let kind = format!("multipart/form-data; boundary={part}");
+        self.send(Method::POST, path, &kind, body, &[(ORIGIN.as_str(), origin)]).await
+    }
+
     /// Asks the interface to change something, as a script of one of the server's own pages would.
     pub async fn post(&mut self, path: &str, body: &impl Serialize) -> Raw {
         let body = serde_json::to_vec(body).unwrap();

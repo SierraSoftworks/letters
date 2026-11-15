@@ -11,6 +11,7 @@ use std::mem;
 
 use letters_model::{
     Block, BlockId, Change, Document, HistoryError, Model, Note, Notes, Op, OpError, ReplicaId, Revision, Stood, Style,
+    TagKind,
 };
 
 use crate::journal::Unsaved;
@@ -186,6 +187,13 @@ impl WorkingCopy {
     pub fn add_note(&mut self, mut note: Note) {
         note.anchor.pin(&self.model);
         self.notes.notes.push(note);
+    }
+
+    /// Marks the document as it stands as a version, for a writer with no editor of its own: see
+    /// [`Model::tag`]. The mark carries the name and the time this copy was last [signed](Self::sign) with.
+    pub fn mark(&mut self, kind: TagKind, name: Option<&str>) -> Result<(), Error> {
+        let revision = self.model.revision();
+        self.model.tag(&revision, kind, name).map_err(Error::History)
     }
 
     /// Takes in edits made on another replica of this session, such as the editor's, as [`Model::save`] or

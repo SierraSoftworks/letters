@@ -7,7 +7,7 @@ use letters_api::{self as api, EntryKind, Person, SpaceKind, paths};
 use yew::prelude::*;
 use yewi::prelude::*;
 
-use super::{ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH};
+use super::{ACT_IMPORT, ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH};
 use super::{ACT_REVOKE, ACT_SHARE, ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder};
 
 /// Everything one page shows. It is made where the request is answered and drawn on another thread, so it
@@ -371,6 +371,7 @@ fn folder(folder: &Folder) -> Html {
     let actions = if edits {
         html! {
             <>
+                <Button icon={icons::FILE_INPUT} command={Command::show_modal("import")}>{ "Import" }</Button>
                 <Button icon={icons::FOLDER_PLUS} command={Command::show_modal("new-folder")}>{ "New folder" }</Button>
                 <Button variant={ButtonVariant::Primary} icon={icons::PLUS} kind={ButtonKind::Submit} attrs={attrs! { "form" => "new-document" }}>
                     { "New document" }
@@ -403,6 +404,26 @@ fn folder(folder: &Folder) -> Html {
                     { hidden("space", &space.id) }
                     { hidden("folder", &folder.path) }
                 </form>
+                <Dialog id="import" title="Import a file" size={Size::Small} footer={html! {
+                    <>
+                        <Button command={Command::close("import")}>{ "Cancel" }</Button>
+                        <Button variant={ButtonVariant::Primary} kind={ButtonKind::Submit} attrs={attrs! { "form" => "import-form" }}>
+                            { "Import" }
+                        </Button>
+                    </>
+                }}>
+                    <form id="import-form" method="post" action={ACT_IMPORT} enctype="multipart/form-data">
+                        { hidden("space", &space.id) }
+                        { hidden("folder", &folder.path) }
+                        <FileDrop
+                            name="file"
+                            accept=".md,.markdown,.docx"
+                            required=true
+                            label={html! { "Drop a Markdown or Word file here, or choose one" }}
+                            hint={html! { "It becomes a document in this folder, and opens." }}
+                        />
+                    </form>
+                </Dialog>
                 <Dialog id="new-folder" title="New folder" size={Size::Small} footer={html! {
                     <>
                         <Button command={Command::close("new-folder")}>{ "Cancel" }</Button>

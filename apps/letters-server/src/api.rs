@@ -57,6 +57,7 @@ pub fn routes() -> Router<Shared> {
         .route(paths::SOURCES, get(sources))
         .route("/api/v1/spaces/{space}/entries", get(entries))
         .route("/api/v1/spaces/{space}/documents", post(new_document))
+        .route("/api/v1/spaces/{space}/import", post(import).layer(DefaultBodyLimit::max(limits.document as usize)))
         .route("/api/v1/spaces/{space}/folders", post(new_folder))
         .route("/api/v1/spaces/{space}/folders/rename", post(rename_folder))
         .route("/api/v1/spaces/{space}/folders/move", post(move_folder))
@@ -187,6 +188,27 @@ async fn new_document(
 ) -> Answer<Json<Entry>> {
     app.telemetry.record(Event::DocumentMade);
     blocking(move || app.new_document(&who, &space, &new).map(Json)).await
+}
+
+/// A file to make a document of: the folder to make it in, and what the file was called.
+#[derive(Deserialize)]
+struct Brought {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// `POST`: a Markdown or Word file, to make a document of.
+async fn import(
+    State(app): State<Shared>,
+    who: Signed,
+    Path(space): Path<String>,
+    Query(brought): Query<Brought>,
+    body: Result<Bytes, BytesRejection>,
+) -> Answer<Json<Entry>> {
+    let file = body.map_err(|rejection| unread(rejection, "The file is larger than the server takes."))?;
+    blocking(move || app.import(&who, &space, &brought.path, &brought.name, &file).map(Json)).await
 }
 
 async fn new_folder(
@@ -513,7 +535,7 @@ impl App {
     }
 
     /// The row of the file at `place`, as a file table of its space shows it.
-    fn entry(&self, who: &Signed, space: &Space, root: &Root, place: &Place) -> Answer<Entry> {
+    pub(crate) fn entry(&self, who: &Signed, space: &Space, root: &Root, place: &Place) -> Answer<Entry> {
         let row = self.row(root, place)?;
         Ok(self.told(who, placed(space, &row), root, &row))
     }
