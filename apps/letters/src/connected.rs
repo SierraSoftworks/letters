@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use letters_api::{Code, EntryKind, Opened, paths};
+use letters_api::{Code, CreatedLink, EntryKind, Grant, NewLink, Opened, Shares, paths};
 use letters_format::{Archive, WorkingCopy};
 use letters_model::{Model, Notes, ReplicaId, Selection};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
@@ -225,16 +225,65 @@ pub fn place(session: &Session, id: &str, copy: &Path, asks: &[Placing]) -> Plac
         Placing::Move { space, folder } => session.relocate(id, space, folder).map(drop),
         Placing::NewFolder { space, parent, name } => session.new_folder(space, parent, name).map(drop),
     };
-    let refused = asks.iter().try_for_each(ask).err().map(|refused| match refused {
-        Refused::Said(said) => said.to_string(),
-        other => format!("That could not be done: {other}."),
-    });
+    let refused = asks.iter().try_for_each(ask).err().map(|refused| sentence(&refused));
     let opened = session.open(id).ok();
     if let Some(opened) = &opened {
         remember(copy, opened);
     }
     let space = opened.as_ref().and_then(|opened| opened.space.as_deref());
     Placed { shelves: space.and_then(|space| shelves(session, space).ok()), opened, refused }
+}
+
+/// Why a server did not do what the person asked, as they are to read it: the server's own sentence where
+/// it gave one.
+fn sentence(refused: &Refused) -> String {
+    match refused {
+        Refused::Said(said) => said.to_string(),
+        other => format!("That could not be done: {other}."),
+    }
+}
+
+/// What the Share dialog asks of a document's server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Sharing {
+    /// Who the document is shared with.
+    Look,
+    /// All its people from here on.
+    People(Vec<Grant>),
+    /// A link to make.
+    Link(NewLink),
+    /// A link to revoke, by its id.
+    Revoke(String),
+}
+
+/// What a document's server answered the Share dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Shared {
+    /// Who the document is shared with now, and whether the server makes links.
+    Shares(Shares, bool),
+    /// The link that was asked for, with its address.
+    Made(CreatedLink),
+    Revoked,
+    /// Why it was not done, as the person is to read it.
+    Refused(String),
+}
+
+/// Asks a document's server what the Share dialog asked. This waits on the network.
+pub fn share(session: &Session, id: &str, ask: &Sharing) -> Shared {
+    let told = |shares| Shared::Shares(shares, session.links().unwrap_or(false));
+    let answered = match ask {
+        Sharing::Look => session.shares(id).map(told),
+        Sharing::People(people) => session.share(id, people).map(told),
+        Sharing::Link(new) => session.make_link(id, new).map(Shared::Made),
+        Sharing::Revoke(link) => session.revoke_link(id, link).map(|()| Shared::Revoked),
+    };
+    answered.unwrap_or_else(|refused| {
+        Shared::Refused(match refused {
+            // No word of why: the server is one from before documents were shared.
+            Refused::Status(404 | 405) => "This server does not share documents yet.".to_owned(),
+            refused => sentence(&refused),
+        })
+    })
 }
 
 /// Gives a document the name of its first heading, unless it has a name of its own by now: another

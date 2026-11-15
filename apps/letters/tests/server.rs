@@ -11,13 +11,16 @@ use std::thread;
 use std::time::Duration;
 
 use common::Scratch;
-use letters::connected::{self, Reached, Unreached};
+use letters::connected::{self, Reached, Shared, Sharing, Unreached};
 use letters::keychain::Keychain;
 use letters::remote::Roots;
 use letters::server::{Client, Refused};
 use letters::session::Session;
 use letters::signin::{SignIn, Unsigned};
-use letters_api::{Allows, Code, Exchange, Opened, Person, Renewal, Role, Space, SpaceKind, Token, Trust, paths};
+use letters_api::{
+    Allows, Code, CreatedLink, Exchange, Grant, Grantee, Link, NewLink, Opened, Person, Renewal, Role, Shares, Space,
+    SpaceKind, Token, Trust, paths,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -125,6 +128,8 @@ struct Letters {
     signed_out: bool,
     /// The person may no longer read the document.
     barred: bool,
+    /// Who the document is shared with.
+    shares: Shares,
 }
 
 impl Letters {
@@ -169,6 +174,27 @@ impl Letters {
                 Answer("200 OK", "content-type: image/png\r\n", png())
             }
             "GET /api/v1/documents/d1/assets/0000.png" => Answer("200 OK", "content-type: image/png\r\n", png()),
+            "GET /api/v1/documents/d1/shares" => json(&self.shares),
+            "PUT /api/v1/documents/d1/shares" => {
+                let Shares { people, .. } = serde_json::from_slice(&asked.body).unwrap();
+                self.shares.people = people;
+                json(&self.shares)
+            }
+            "POST /api/v1/documents/d1/links" => {
+                let NewLink { label, role, expires, allows, .. } = serde_json::from_slice(&asked.body).unwrap();
+                let id = format!("link-{}", self.shares.links.len() + 1);
+                let link = Link { id, label, role, expires, passphrase: false, allows, created: 1, revoked: None };
+                self.shares.links.push(link.clone());
+                json(&CreatedLink { url: format!("https://localhost/l/secret-of-{}", link.id), link })
+            }
+            line if line.starts_with("DELETE /api/v1/documents/d1/links/") => {
+                let id = line.rsplit('/').next().unwrap_or_default();
+                match self.shares.links.iter_mut().find(|link| link.id == id) {
+                    Some(link) => link.revoked = Some(2),
+                    None => return said(Code::Forbidden, "That link is not this document's."),
+                }
+                Answer("204 No Content", "", Vec::new())
+            }
             "GET /api/v1/forbidden" => said(Code::Forbidden, "That is not yours to read."),
             "GET /api/v1/elsewhere" => Answer("302 Found", "location: https://elsewhere.example/\r\n", Vec::new()),
             "GET /api/v1/page" => {
@@ -657,4 +683,38 @@ fn a_picture_the_copy_lacks_is_had_from_the_server_only_as_what_its_name_says() 
     for (name, expected) in cases {
         assert_eq!(connected::picture(&session, "d1", &name), expected, "{name}");
     }
+}
+
+#[test]
+fn the_share_dialog_is_answered_by_the_documents_server() {
+    let server = Server::start();
+    let session = server.session();
+    let share = |ask: Sharing| connected::share(&session, "d1", &ask);
+    let family = Grant { to: Grantee::Group { name: "family".into() }, role: Role::Commenter };
+    let new = NewLink {
+        label: "Accountant".into(),
+        role: Role::Reader,
+        expires: None,
+        passphrase: None,
+        allows: Allows::default(),
+    };
+
+    assert_eq!(share(Sharing::Look), Shared::Shares(Shares::default(), false));
+    // Its people are replaced whole, and the answer says who they are now.
+    let Shared::Shares(now, _) = share(Sharing::People(vec![family.clone()])) else { panic!("the people are told") };
+    assert_eq!(now.people, [family]);
+    // A link's address is told once, when it is made. Afterwards it is listed, and can be revoked.
+    let Shared::Made(made) = share(Sharing::Link(new)) else { panic!("the link is made") };
+    assert!(made.url.contains(&made.link.id) && made.link.label == "Accountant", "{made:?}");
+    assert_eq!(share(Sharing::Revoke(made.link.id.clone())), Shared::Revoked);
+    let Shared::Shares(now, _) = share(Sharing::Look) else { panic!("the shares are told") };
+    assert!(now.links.iter().any(|link| link.id == made.link.id && link.revoked.is_some()), "{now:?}");
+
+    // A refusal is the server's own sentence, and a server that shares nothing yet is named as one.
+    assert_eq!(
+        share(Sharing::Revoke("no-such-link".into())),
+        Shared::Refused("That link is not this document's.".into())
+    );
+    let elsewhere = connected::share(&session, "d2", &Sharing::Look);
+    assert_eq!(elsewhere, Shared::Refused("This server does not share documents yet.".into()));
 }

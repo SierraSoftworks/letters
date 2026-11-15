@@ -44,7 +44,7 @@ use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowAttributes
 use crate::chrome::{self, Buttons, Host};
 use crate::cli::{Format, Mode, Options};
 use crate::conflicts;
-use crate::connected::{self, Line, Placed, Placing, Reached, Said, Shelf, Told};
+use crate::connected::{self, Line, Placed, Placing, Reached, Said, Sharing, Shelf, Told};
 use crate::convert;
 use crate::copies;
 use crate::dictionaries;
@@ -147,9 +147,11 @@ pub enum Event {
     /// A picture of this name, which the copy of a window's document lacked, was asked of the document's
     /// server: its file, if the server had it.
     Brought(WindowId, String, Option<Vec<u8>>),
-    /// The server of a window's document was asked about the document's name and place, in this turn of
-    /// the window's asking: how the document stands there now. The flag says that the window's bar asked.
-    Placed(WindowId, u64, bool, Box<Placed>),
+    /// The server of a window's document was asked about the document's name and place: how the
+    /// document stands there now. The flag says that the window's bar asked.
+    Placed(WindowId, bool, Box<Placed>),
+    /// The server of a window's document answered what the window's Share dialog asked, in that order.
+    Shared(WindowId, Vec<connected::Shared>),
 }
 
 impl From<accesskit_winit::Event> for Event {
@@ -449,8 +451,12 @@ struct Remote {
     lacking: Vec<String>,
     /// What is to be asked of the server about the document's name and place, in this order.
     asks: Vec<Placing>,
-    /// How often that was asked. Only the last answer says how the document stands.
-    turn: u64,
+    /// Whether the server is being asked. One thing is asked at a time, so that the server does them
+    /// in the order the person did.
+    placing: bool,
+    /// What the Share dialog asks of the server, in this order, and whether the server is being asked.
+    shares: Vec<Sharing>,
+    sharing: bool,
     /// Whether the line was live when it last said how it stood, and when the server was last asked how
     /// the document stands.
     live: bool,
@@ -1302,7 +1308,9 @@ impl DocWindow {
             asked: BTreeSet::new(),
             lacking: Vec::new(),
             asks: Vec::new(),
-            turn: 0,
+            placing: false,
+            shares: Vec::new(),
+            sharing: false,
             live: false,
             looked: None,
             shelves: Vec::new(),
@@ -1448,15 +1456,17 @@ impl DocWindow {
 
     /// Takes how the document stands at its server, which was asked about its name and place. `answers`
     /// says that the bar asked and waits to be told.
-    fn placed(&mut self, turn: u64, answers: bool, placed: Placed, library: &Library) {
+    fn placed(&mut self, answers: bool, placed: Placed, library: &Library) {
         let Some(remote) = &mut self.remote else { return };
-        // An answer that others were asked after says how the document stood, not how it stands.
-        if let Some(now) = placed.opened.filter(|_| turn == remote.turn) {
+        remote.placing = false;
+        if let Some(now) = placed.opened {
             let opened = &mut remote.opened;
             (opened.name, opened.named, opened.space, opened.path) = (now.name, now.named, now.space, now.path);
+            // What the person may do holds while there is no line, and says whether they share it.
+            (opened.role, opened.allows) = (now.role, now.allows);
             self.place.call(&remote.opened.name);
         }
-        if let Some(shelves) = placed.shelves.filter(|shelves| turn == remote.turn && *shelves != remote.shelves) {
+        if let Some(shelves) = placed.shelves.filter(|shelves| *shelves != remote.shelves) {
             remote.shelves = shelves;
             // The bar lists them, whether or not the document is where it was.
             self.located = None;
@@ -2285,6 +2295,17 @@ impl App {
                 Request::MergeFrom { path, confirmed } => self.merge_from(id, path.map(PathBuf::from), confirmed, now),
                 Request::MergeIntoOriginal { confirmed } => self.merge_into_original(id, confirmed, now),
                 Request::Connect => self.reconnect(id, now),
+                // The Share dialog asks of a document's server. With no server it asks nothing.
+                Request::Shares | Request::SharePeople(_) | Request::MakeLink(_) | Request::RevokeLink(_) => {
+                    let window = self.windows.get_mut(&id);
+                    let Some(remote) = window.and_then(|window| window.remote.as_mut()) else { continue };
+                    remote.shares.push(match request {
+                        Request::SharePeople(people) => Sharing::People(people),
+                        Request::MakeLink(new) => Sharing::Link(new),
+                        Request::RevokeLink(link) => Sharing::Revoke(link),
+                        _ => Sharing::Look,
+                    });
+                }
                 // A request this shell does not know yet.
                 _ => {}
             }
@@ -2296,6 +2317,7 @@ impl App {
         }
         // What was asked of the document's server goes there now.
         self.place(id);
+        self.share(id);
     }
 
     /// The name the person's edits carry: the one they set, or else their account's.
@@ -2502,17 +2524,54 @@ impl App {
     fn place(&mut self, id: WindowId) {
         let Some(window) = self.windows.get_mut(&id) else { return };
         let Some(copy) = window.place.path().map(Path::to_owned) else { return };
-        let Some(remote) = window.remote.as_mut().filter(|remote| !remote.asks.is_empty()) else { return };
+        let waits = |remote: &&mut Remote| !remote.placing && !remote.asks.is_empty();
+        let Some(remote) = window.remote.as_mut().filter(waits) else { return };
         let asks = std::mem::take(&mut remote.asks);
-        (remote.turn, remote.looked) = (remote.turn + 1, Some(Instant::now()));
+        (remote.placing, remote.looked) = (true, Some(Instant::now()));
         // What its first heading asks for is nothing the bar waits to hear of.
         let answers = asks.iter().any(|ask| !matches!(ask, Placing::Look | Placing::Name(_)));
-        let (session, document, turn) = (remote.line.session().clone(), remote.opened.id.clone(), remote.turn);
-        let proxy = self.proxy.clone();
+        let (session, document, proxy) = (remote.line.session().clone(), remote.opened.id.clone(), self.proxy.clone());
         thread::spawn(move || {
             let placed = Box::new(connected::place(&session, &document, &copy, &asks));
-            let _ = proxy.send_event(Event::Placed(id, turn, answers, placed));
+            let _ = proxy.send_event(Event::Placed(id, answers, placed));
         });
+    }
+
+    /// Asks the server of a window's document what the window's Share dialog asked, on another thread.
+    /// The answers arrive as an event.
+    fn share(&mut self, id: WindowId) {
+        let Some(remote) = self.windows.get_mut(&id).and_then(|window| window.remote.as_mut()) else { return };
+        if remote.sharing || remote.shares.is_empty() {
+            return;
+        }
+        let asks = std::mem::take(&mut remote.shares);
+        remote.sharing = true;
+        let (session, document, proxy) = (remote.line.session().clone(), remote.opened.id.clone(), self.proxy.clone());
+        thread::spawn(move || {
+            let answers = asks.iter().map(|ask| connected::share(&session, &document, ask)).collect();
+            let _ = proxy.send_event(Event::Shared(id, answers));
+        });
+    }
+
+    /// Tells a window's Share dialog what the document's server answered it.
+    fn shared(&mut self, id: WindowId, answers: Vec<connected::Shared>, now: Instant) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        let Some(remote) = &mut window.remote else { return };
+        remote.sharing = false;
+        let owner = remote.opened.role.shares();
+        for answer in answers {
+            match answer {
+                connected::Shared::Shares(shares, links) => {
+                    window.view.set_shares(letters_ui::Shared { shares, owner, links });
+                }
+                connected::Shared::Made(link) => window.view.link_made(link),
+                // The dialog dropped the link when it asked.
+                connected::Shared::Revoked => {}
+                connected::Shared::Refused(why) => window.view.refuse_share(&why),
+            }
+        }
+        window.access_stale = true;
+        window.sync(now);
     }
 
     /// Tries a document's server again, as the person asked of a window whose line the server ended. A
@@ -3317,11 +3376,18 @@ impl ApplicationHandler<Event> for App {
                 }
                 self.place(id);
             }
-            Event::Placed(id, turn, answers, placed) => {
+            Event::Placed(id, answers, placed) => {
                 if let Some(window) = self.windows.get_mut(&id) {
-                    window.placed(turn, answers, *placed, &self.library);
+                    window.placed(answers, *placed, &self.library);
                     window.sync(now);
                 }
+                // What was asked meanwhile goes to the server now.
+                self.place(id);
+            }
+            Event::Shared(id, answers) => {
+                self.shared(id, answers, now);
+                // A dialog that was refused may ask how things stand, and more may have been asked.
+                self.serve(event_loop, id, now);
             }
             Event::Dictionary(id, name, dictionary) => {
                 if let Some(window) = self.windows.get_mut(&id) {
