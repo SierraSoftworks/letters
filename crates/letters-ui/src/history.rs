@@ -1728,8 +1728,9 @@ impl History {
     /// Fills the bar while the history shows: the way back, what the version is of and when it was
     /// written, what it is compared with, the button that restores it, and a menu that saves a copy of
     /// it. A narrow window has the bar folded. `told` is what there is to say of a copy that was just
-    /// written, which the menu's button says, and `keys` the keys that ask for a copy.
-    pub fn bar(&self, bar: TopBar<Message>, name: &str, told: Option<&str>, keys: &str) -> TopBar<Message> {
+    /// written, which the menu's button says, and `keys` the keys that ask for a copy: `None` where no
+    /// copy is to be had, and the bar is without the menu.
+    pub fn bar(&self, bar: TopBar<Message>, name: &str, told: Option<&str>, keys: Option<&str>) -> TopBar<Message> {
         if let Some(passage) = &self.passage {
             return self.passage_bar(passage, bar, name);
         }
@@ -1773,7 +1774,15 @@ impl History {
             .middle(compare)
             .middle(TopBar::rule())
             .middle(naming(Button::new("Name").icon(icon::TAG)))
-            .middle(restore(Button::new("Restore this version").icon(icon::ROTATE_CCW)));
+            .middle(restore(Button::new("Restore this version").icon(icon::ROTATE_CCW)))
+            .form(FORMS.1)
+            .start(Button::icon_only(icon::ARROW_LEFT, "Back to editing").small().on_press(back))
+            .start(name())
+            .middle(Element::from(Button::new(with).small().menu(compares)).description("Compare with"))
+            .middle(TopBar::rule())
+            .middle(naming(Button::icon_only(icon::TAG, "Name")))
+            .middle(restore(Button::icon_only(icon::ROTATE_CCW, "Restore this version")));
+        let Some(keys) = keys else { return bar };
         // A copy of the version is asked for where the bar has its other commands while the page is edited.
         let copy = |format: CopyFormat| Message::Copy(Copying::Open(format));
         let menu = Menu::new()
@@ -1791,14 +1800,7 @@ impl History {
             Some(told) => more.tooltip(told, widgets::Side::Bottom).telling(true),
             None => more,
         };
-        bar.form(FORMS.1)
-            .start(Button::icon_only(icon::ARROW_LEFT, "Back to editing").small().on_press(back))
-            .start(name())
-            .middle(Element::from(Button::new(with).small().menu(compares)).description("Compare with"))
-            .middle(TopBar::rule())
-            .middle(naming(Button::icon_only(icon::TAG, "Name")))
-            .middle(restore(Button::icon_only(icon::ROTATE_CCW, "Restore this version")))
-            .end(more)
+        bar.end(more)
     }
 
     /// Fills the bar while the history is of a passage: the way back, what shows, the way to every

@@ -283,6 +283,25 @@ pub enum Message {
     Review(Reviewing),
 }
 
+/// What the person may take away of the document, as the link that brought them to it allows. A document
+/// is theirs to take until a shell says otherwise. What is withheld is not offered, which only deters:
+/// what shows on a screen can be captured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Allows {
+    /// The clipboard takes what they select, a code block, a picture or a link's address.
+    pub copy: bool,
+    /// They save a copy of the document and export it.
+    pub download: bool,
+    /// They print it.
+    pub print: bool,
+}
+
+impl Default for Allows {
+    fn default() -> Self {
+        Self { copy: true, download: true, print: true }
+    }
+}
+
 impl Message {
     /// Whether this asks for something that is for writing the document: what changes it, and what opens
     /// a card, a list or a view that does. Of the editor's commands the editor says which apply.
@@ -502,6 +521,16 @@ impl Ui<EditorApp> {
     pub fn set_access(&mut self, access: Access) {
         if self.app().access != access {
             self.app_mut().grant(access);
+        }
+    }
+
+    /// Says what the person may take away of the document: see [`Allows`]. A shell says it of a document
+    /// that a share link opened, from what the link allows. What is withheld is not offered and not done:
+    /// nothing of the page goes to the clipboard, no copy is saved or exported, nothing is printed. Print
+    /// view still shows the sheets.
+    pub fn set_allows(&mut self, allows: Allows) {
+        if self.app().allows != allows {
+            self.app_mut().allow(allows);
         }
     }
 
@@ -1061,6 +1090,8 @@ pub struct EditorApp {
     connection: Option<Connection>,
     /// What the person may do with the document.
     access: Access,
+    /// What the person may take away of the document.
+    allows: Allows,
     /// Whether the shell fetches what a page says of itself. Only someone who writes is offered a fetch.
     fetching: bool,
     /// Who else has the document open.
@@ -1176,6 +1207,7 @@ impl EditorApp {
             save: SaveState::default(),
             connection: None,
             access: Access::default(),
+            allows: Allows::default(),
             fetching: true,
             presence: Presence::default(),
             edits: 0,
@@ -1964,6 +1996,15 @@ impl EditorApp {
         if !(reads || self.writes()) {
             return None;
         }
+        // What a link withholds is not offered. A cut would lose what it could not take.
+        let withheld = match act {
+            Act::Run(Command::Copy | Command::Cut) => !self.allows.copy,
+            Act::SaveCopy | Act::Export | Act::CleanCopy => !self.allows.download,
+            _ => false,
+        };
+        if withheld {
+            return None;
+        }
         let message = match act {
             Act::Run(command) => {
                 // The editor says where a command applies. One that turns something on or off is listed
@@ -2115,6 +2156,27 @@ impl EditorApp {
         }
     }
 
+    /// Takes what the person may take away of the document from here on. What was out to take it goes.
+    fn allow(&mut self, allows: Allows) {
+        self.allows = allows;
+        self.printing.iter_mut().for_each(|print| print.allow(allows.download, allows.print));
+        self.context = None;
+        if !allows.download {
+            self.copying = None;
+        }
+        // The pointer may rest where a code block's button stood, or stands again.
+        self.repoint();
+    }
+
+    /// Puts something of the document on the clipboard, unless a copy is withheld. Returns whether it is
+    /// there.
+    fn clip(&self, clip: Clip, platform: &mut dyn Platform) -> bool {
+        if self.allows.copy {
+            platform.clipboard_write(clip);
+        }
+        self.allows.copy
+    }
+
     /// Offers the fetch of what a page says of itself where the shell fetches and the person writes: what
     /// is fetched is kept in the document.
     fn offer_fetches(&mut self) {
@@ -2203,6 +2265,7 @@ impl EditorApp {
             Historying::Drag(at) => self.history.iter_mut().for_each(|history| history.drag(at)),
             Historying::Up => self.history.iter_mut().for_each(History::release),
             Historying::All => self.history.iter_mut().for_each(|history| history.select_all(platform)),
+            Historying::Copy if !self.allows.copy => {}
             Historying::Copy => self.history.iter_mut().for_each(|history| history.copy(platform)),
             Historying::Unselect => self.history.iter_mut().for_each(History::unselect),
             Historying::Compare(with) => {
@@ -2295,7 +2358,7 @@ impl EditorApp {
             }
         }
         // The tool that copies a passage waits behind the card that copies the version.
-        match (&self.copying, history.tools()) {
+        match (&self.copying, history.tools().filter(|_| self.allows.copy)) {
             (Some(copy), _) => version.popover(copy.card(&self.location, room)),
             (None, Some(tools)) => version.popover(tools),
             (None, None) => version,
@@ -2349,6 +2412,7 @@ impl EditorApp {
                 let reading = self.layout.hit(Point { x: 0.0, y: self.viewport().y.max(0.0) });
                 let mut print = Print::new(reading);
                 print.fix(!self.writes());
+                print.allow(self.allows.download, self.allows.print);
                 self.printing = Some(print);
                 // The nodes that stand for the blocks go with the page, and are told whole when it is back.
                 self.told.get_mut().forget();
@@ -2356,6 +2420,7 @@ impl EditorApp {
             Printing::Back => self.printing = None,
             Printing::Zoom(zoom) => self.printing.iter_mut().for_each(|print| print.zoom(zoom)),
             Printing::Scroll(delta) => self.printing.iter_mut().for_each(|print| print.scroll(delta)),
+            Printing::Print if !self.allows.print => {}
             Printing::Print => self.requests.push(Request::Print),
             Printing::Down(at) => self.printing.iter_mut().for_each(|print| print.press(at)),
             Printing::Up(at) => {
@@ -3108,14 +3173,15 @@ impl EditorApp {
 
     /// The code block whose copy button is at a point of the page area.
     fn copy_button(&self, at: Point) -> Option<BlockId> {
-        self.code_at(at).filter(|(_, on)| *on).map(|(block, _)| block)
+        self.code_at(at).filter(|(_, on)| *on && self.allows.copy).map(|(block, _)| block)
     }
 
     /// Puts a code block's text on the clipboard as it is written, and has its button say so.
     fn copy_code(&mut self, block: BlockId, platform: &mut dyn Platform) {
         let Some(code) = self.editor.doc().block(&block) else { return };
-        platform.clipboard_write(Clip { text: code.plain_text(), ..Clip::default() });
-        self.code_copy.copied(block, platform.now_ms());
+        if self.clip(Clip { text: code.plain_text(), ..Clip::default() }, platform) {
+            self.code_copy.copied(block, platform.now_ms());
+        }
     }
 
     /// The cell the caret is in, when it is in one.
@@ -3234,7 +3300,8 @@ impl EditorApp {
     /// Works out again which reference or linked picture the pointer rests on, after it or the page under
     /// it has moved. Returns whether what shows changed with it.
     fn repoint(&mut self) -> bool {
-        let code = self.references.rest().and_then(|at| self.code_at(at));
+        // A code block has its button where a copy is to be had.
+        let code = self.references.rest().filter(|_| self.allows.copy).and_then(|at| self.code_at(at));
         let copy = self.code_copy.point(code);
         // The button covers what is under it, a reference too.
         let found = self.references.rest().filter(|_| !self.code_copy.pointed()).and_then(|at| self.reference(at));
@@ -3604,7 +3671,7 @@ impl EditorApp {
             }
             Contexting::CopyText(block) => match self.editor.doc().block(&block) {
                 Some(code) if matches!(code.kind, BlockKind::Code { .. }) => self.copy_code(block, platform),
-                Some(written) => platform.clipboard_write(Clip { text: written.plain_text(), ..Clip::default() }),
+                Some(written) => _ = self.clip(Clip { text: written.plain_text(), ..Clip::default() }, platform),
                 None => {}
             },
             Contexting::CopyPicture(block) => {
@@ -3621,12 +3688,14 @@ impl EditorApp {
                     starts.filter_map(|at| self.layout.caret(&Pos::new(block.clone(), at))).collect();
                 let (ink, page) = (self.palette.text, self.palette.page);
                 let shaper = self.shaper.as_ref();
-                if let Some(picture) = context::picture(&self.layout, &self.images, shaper, code, &lines, ink, page) {
-                    platform.clipboard_write(Clip { pictures: vec![picture], ..Clip::default() });
+                let picture = context::picture(&self.layout, &self.images, shaper, code, &lines, ink, page);
+                let put = picture
+                    .is_some_and(|picture| self.clip(Clip { pictures: vec![picture], ..Clip::default() }, platform));
+                if put {
                     self.code_copy.copied(block, platform.now_ms());
                 }
             }
-            Contexting::CopyLink(address) => platform.clipboard_write(Clip { text: address, ..Clip::default() }),
+            Contexting::CopyLink(address) => _ = self.clip(Clip { text: address, ..Clip::default() }, platform),
             Contexting::ShowFigure(figure) => self.show_figure(&figure),
         }
     }
@@ -3876,7 +3945,9 @@ impl EditorApp {
             // The first line is kept clear of whichever of the two stands further left.
             let reach = language.as_ref().map_or(button, |(_, at, _)| *at);
             let behind = self.reaches(&block, reach).then_some([self.palette.page, self.palette.code]);
-            self.code_copy.paint(&block, button, behind, self.scheme, &mut list);
+            if self.allows.copy {
+                self.code_copy.paint(&block, button, behind, self.scheme, &mut list);
+            }
             if let Some((said, at, _)) = language.filter(|_| behind.is_none() || near) {
                 self.languages.paint(&block, (at, &said), behind, self.scheme, &mut list);
             }
@@ -4072,7 +4143,8 @@ impl EditorApp {
             let asked = |act: &Act| self.asked(act);
             let fix = self.spelling.fix.as_ref();
             let (mac, writes) = (self.mac, self.writes());
-            let about = About { editor: &self.editor, asked: &asked, mac, writes, fix, room: room.height };
+            let copies = self.allows.copy;
+            let about = About { editor: &self.editor, asked: &asked, mac, writes, copies, fix, room: room.height };
             element = element.popover(context.menu(&about));
         } else if let Some(address) = &self.link {
             let field = TextField::new("Link", address)
@@ -4345,7 +4417,7 @@ impl EditorApp {
             (None, Some(history)) => {
                 let told = self.note.as_ref().map(|(note, _)| note.as_str());
                 let keys = commands::shortcut(&Act::SaveCopy, self.editor.keymap(), self.mac).unwrap_or_default();
-                history.bar(bar, &self.name().0, told, &keys)
+                history.bar(bar, &self.name().0, told, self.allows.download.then_some(keys.as_str()))
             }
             (None, None) => self.editing(bar),
         };
@@ -4376,20 +4448,21 @@ impl EditorApp {
             .separator()
             .item(MenuItem::new("New document").icon(icon::PLUS).on_select(Message::NewDocument))
             .item(MenuItem::new("Open").icon(icon::FOLDER_OPEN).on_select(Message::OpenDialog))
-            .separator()
-            .item(
-                MenuItem::new("Save a copy")
-                    .icon(icon::COPY)
-                    .aside(keys(Act::SaveCopy))
-                    .on_select(Message::Copy(Copying::Open(CopyFormat::Letters))),
-            )
-            .item(MenuItem::new("Export").icon(icon::DOWNLOAD).on_select(Message::Copy(Copying::Open(CopyFormat::Pdf))))
-            .item(
-                MenuItem::new("Print view")
-                    .icon(icon::PRINTER)
-                    .aside(keys(Act::Print))
-                    .on_select(Message::Print(Printing::Show)),
-            );
+            .separator();
+        // A copy as a file is offered where the link allows one.
+        let save = MenuItem::new("Save a copy")
+            .icon(icon::COPY)
+            .aside(keys(Act::SaveCopy))
+            .on_select(Message::Copy(Copying::Open(CopyFormat::Letters)));
+        let export =
+            MenuItem::new("Export").icon(icon::DOWNLOAD).on_select(Message::Copy(Copying::Open(CopyFormat::Pdf)));
+        let more = if self.allows.download { more.item(save).item(export) } else { more };
+        let more = more.item(
+            MenuItem::new("Print view")
+                .icon(icon::PRINTER)
+                .aside(keys(Act::Print))
+                .on_select(Message::Print(Printing::Show)),
+        );
         // The page is set up by someone who writes on it.
         let setup = MenuItem::new("Page setup").icon(icon::FILE_TEXT).on_select(Message::Styles(Styling::PageSetup));
         let more = if self.writes() { more.item(setup) } else { more };
@@ -5092,6 +5165,7 @@ impl EditorApp {
             // The page behind the import card is not written on.
             Message::Pointer(_) if self.importing.is_some() => {}
             Message::Pointer(event) => self.pointer(event, platform),
+            Message::Run(Command::Copy | Command::Cut) if !self.allows.copy => {}
             Message::Run(command) => {
                 // A shell that has the clipboard only later is asked to paste once it has.
                 let plain = match command {
@@ -5141,6 +5215,7 @@ impl EditorApp {
                 let stays = self.importing.as_mut().is_some_and(|card| card.update(message, &mut self.requests));
                 self.importing = self.importing.take().filter(|_| stays);
             }
+            Message::Copy(_) if !self.allows.download => {}
             Message::Copy(message) => self.copy(message),
             Message::Styles(message) => self.styling(message, platform),
             Message::Ask(request) => self.requests.push(request),
@@ -5221,6 +5296,12 @@ impl EditorApp {
         }
         let listed = self.insert_key(event, platform) || self.fence_key(event, platform);
         if listed || self.refer_key(event, platform) || self.list_key(event, platform) {
+            return true;
+        }
+        // Where a copy is withheld the key for one does nothing, and neither does a cut, which would lose
+        // what it could not take.
+        let takes = matches!(self.editor.keymap().command(event), Some(Command::Copy | Command::Cut));
+        if takes && !self.allows.copy {
             return true;
         }
         let (mut used, mut edited) = (false, false);
@@ -5359,7 +5440,8 @@ impl App for EditorApp {
             said.extend(self.editor.doc().walk().filter_map(state));
         }
         let writes = self.writes();
-        describe::page(self.editor.doc(), self.editor.selection(), (&said, writes), told, whole, page, nodes);
+        let may = describe::May { edits: writes, copies: self.allows.copy };
+        describe::page(self.editor.doc(), self.editor.selection(), (&said, may), told, whole, page, nodes);
         if let Some((caption, rect)) = &self.previewed {
             describe::preview(caption, *rect, page, nodes);
         }

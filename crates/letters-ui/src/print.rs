@@ -203,6 +203,8 @@ pub(crate) struct Print {
     /// Whether the sheets are only looked at: where pages start and how the page is set up are for
     /// someone who writes the document.
     fixed: bool,
+    /// Whether a copy of the sheets is offered as a file, and on paper: a link may withhold either.
+    takes: (bool, bool),
 }
 
 impl Print {
@@ -222,7 +224,13 @@ impl Print {
             hot: Vec::new(),
             pressed: None,
             fixed: false,
+            takes: (true, true),
         }
+    }
+
+    /// Says whether the sheets are offered to be exported and to be printed.
+    pub fn allow(&mut self, export: bool, print: bool) {
+        self.takes = (export, print);
     }
 
     /// Says whether the sheets are only looked at, as by someone who does not write the document.
@@ -485,11 +493,13 @@ impl Print {
                     .description("Page setup"),
             ),
         };
-        let bar = bar
-            .middle(zoom)
-            .middle(TopBar::rule())
-            .middle(export(Button::new("Export PDF").icon(icon::FILE_DOWN)))
-            .middle(print());
+        // What takes the sheets away, after a rule, where the link that opened the document allows it.
+        let takes = |export: Element<Message>| {
+            let takes = [self.takes.0.then_some(export), self.takes.1.then(|| print().into())];
+            let rule = takes.iter().any(Option::is_some).then(TopBar::rule);
+            rule.into_iter().chain(takes.into_iter().flatten())
+        };
+        let bar = takes(export(Button::new("Export PDF").icon(icon::FILE_DOWN))).fold(bar.middle(zoom), TopBar::middle);
         let bar =
             bar.form(FORMS.1).start(Button::icon_only(icon::ARROW_LEFT, leave).small().on_press(back)).start(name());
         let bar = match self.fixed {
@@ -499,10 +509,8 @@ impl Print {
                     .description(paper),
             ),
         };
-        bar.middle(Element::from(Button::new(shown).small().menu(zooms)).description("Zoom"))
-            .middle(TopBar::rule())
-            .middle(export(Button::icon_only(icon::FILE_DOWN, "Export PDF")))
-            .middle(print())
+        let bar = bar.middle(Element::from(Button::new(shown).small().menu(zooms)).description("Zoom"));
+        takes(export(Button::icon_only(icon::FILE_DOWN, "Export PDF"))).fold(bar, TopBar::middle)
     }
 
     /// Tells assistive technology of the sheets in view, under the canvas that shows them.

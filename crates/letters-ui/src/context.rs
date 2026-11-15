@@ -76,6 +76,8 @@ pub(crate) struct About<'a> {
     /// Whether the document is the person's to change. Someone who only reads it has what copies and
     /// what leads somewhere, and a comment where they may write one.
     pub writes: bool,
+    /// Whether the clipboard takes what is on the page.
+    pub copies: bool,
     /// The misspelled word there, with its corrections.
     pub fix: Option<&'a Fix>,
     /// How high the page area is.
@@ -241,9 +243,12 @@ impl Context {
         let marks = editor.marks();
         let mark =
             |icon, mark: Mark| about.tool(icon, run(Command::ToggleMark(mark.clone())), marks.contains(&mark), false);
+        // Where the clipboard takes nothing of the page, nothing is cut either.
+        let takes = [(icon::SCISSORS, Command::Cut), (icon::COPY, Command::Copy)];
+        let takes =
+            takes.into_iter().filter(|_| about.copies).map(|(icon, takes)| about.tool(icon, run(takes), false, true));
         let first = bar("Clipboard and format")
-            .child(about.tool(icon::SCISSORS, run(Command::Cut), false, true))
-            .child(about.tool(icon::COPY, run(Command::Copy), false, true))
+            .children(takes)
             .child(about.tool(icon::CLIPBOARD_PASTE, run(Command::Paste), false, true))
             .child(divider())
             .child(mark(icon::BOLD, Mark::Bold))
@@ -256,14 +261,18 @@ impl Context {
             .child(about.tool(icon::LINK, Act::Link, editor.link().is_some(), true))
             .child(about.tool(icon::MESSAGE_SQUARE_PLUS, Act::Comment, false, true));
         let first = match about.writes {
-            true => first,
+            true => Some(first),
             false => {
+                let copy = about.copies.then(|| about.tool(icon::COPY, run(Command::Copy), false, true));
                 let comment = (about.asked)(&Act::Comment).is_some();
                 let comment = comment.then(|| about.tool(icon::MESSAGE_SQUARE_PLUS, Act::Comment, false, true));
-                bar("Clipboard").child(about.tool(icon::COPY, run(Command::Copy), false, true)).children(comment)
+                // With neither there is no strip.
+                let tools: Vec<_> = copy.into_iter().chain(comment).collect();
+                (!tools.is_empty()).then(|| bar("Clipboard").children(tools))
             }
         };
-        let mut strip = Element::column().gap(tokens::SPACE_2XS).padding(Edges::all(tokens::SPACE_XS)).child(first);
+        let headed = first.is_some();
+        let mut strip = Element::column().gap(tokens::SPACE_2XS).padding(Edges::all(tokens::SPACE_XS)).children(first);
 
         let cell = editor.cell();
         let fixed = matches!(kind, Some(BlockKind::Figure { .. } | BlockKind::Caption | BlockKind::Gallery { .. }));
@@ -360,8 +369,10 @@ impl Context {
                     None => item,
                 });
             }
-            let copy = MenuItem::new("Copy link address").icon(icon::COPY);
-            items.push(copy.on_select(send(Contexting::CopyLink(address.to_owned()))));
+            if about.copies {
+                let copy = MenuItem::new("Copy link address").icon(icon::COPY);
+                items.push(copy.on_select(send(Contexting::CopyLink(address.to_owned()))));
+            }
             if about.writes {
                 let remove = MenuItem::new("Remove link").icon(icon::X);
                 items.push(remove.on_select(Message::Run(Command::SetLink(None))));
@@ -388,10 +399,11 @@ impl Context {
                     MenuItem::new("Copy code").icon(icon::COPY).on_select(send(Contexting::CopyText(block.clone()))),
                     MenuItem::new("Copy as picture").icon(icon::IMAGE).on_select(send(Contexting::CopyPicture(block))),
                 ];
+                items.retain(|_| about.copies);
                 items.extend(about.items(&[Act::CodeLanguage, run(Command::Indent), run(Command::Outdent)]));
                 menu = section(menu, "Code", items);
             }
-            (Some(BlockKind::Formula), Some(block)) => {
+            (Some(BlockKind::Formula), Some(block)) if about.copies => {
                 let copy =
                     MenuItem::new("Copy TeX source").icon(icon::COPY).on_select(send(Contexting::CopyText(block)));
                 menu = section(menu, "Formula", vec![copy]);
@@ -462,7 +474,8 @@ impl Context {
 
         let rule = Element::row().height(1.0).bg(tokens::LINE).decorative();
         let list = Element::from(menu).max_height((about.room - AROUND).max(LEAST)).scroll();
-        let content = Element::column().key(("context menu", self.serial)).child(strip).child(rule).child(list);
+        let head = headed.then_some([strip, rule]).into_iter().flatten();
+        let content = Element::column().key(("context menu", self.serial)).children(head).child(list);
         let spot = Rect::new(self.at.x, self.at.y, 0.0, 0.0);
         let menu = Popover::new(content.on_key(keys)).list(HasPopup::Menu).max_width(f32::MAX).gap(2.0).at(spot);
         menu.open(true).on_close(send(Contexting::Close(self.serial)))

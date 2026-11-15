@@ -1,5 +1,6 @@
 //! What the person may do with a document: someone who only reads it, or reads and comments, changes
-//! nothing in it and is offered nothing that would.
+//! nothing in it and is offered nothing that would. And what they may take away of it: a link that opens
+//! it can withhold the clipboard, a copy as a file, and paper.
 
 use accesskit::{Action, ActionRequest, NodeId, TreeId};
 use letters_editor::{Clip, InputEvent, Picture};
@@ -7,7 +8,7 @@ use letters_model::{Anchor, Block, BlockKind, Document, Note, NoteKind, Notes, R
 use letters_render::image::Image;
 use letters_render::{Item, PathEl, Point, Rect};
 use letters_test::{Found, Harness, Role};
-use letters_ui::{Access, Request};
+use letters_ui::{Access, Allows, Cursor, Request};
 
 const ADDRESS: &str = "https://example.org/manual";
 const PICTURE: &str = "https://example.org/roof.png";
@@ -727,4 +728,198 @@ fn saying_the_same_again_asks_for_no_frame() {
     assert!(!window.ui().needs_paint(), "the same again changes nothing");
     window.ui().set_access(Access::Reads);
     assert!(window.ui().needs_paint(), "another role does");
+}
+
+/// What a link allows with one thing withheld: the clipboard (0), a copy as a file (1) or paper (2).
+/// A point on the copy button the page draws on its code block, when it draws one.
+fn code_button(window: &mut Harness) -> Option<Point> {
+    let page = page(window);
+    let icon = |item: &Item| match item {
+        Item::Path { origin, stroke: Some(_), .. } if page.contains(*origin) => Some(*origin),
+        _ => None,
+    };
+    let at = window.paint().items.iter().find_map(icon)?;
+    Some(Point { x: at.x + 4.0, y: at.y + 4.0 })
+}
+
+fn without(withheld: Option<usize>) -> Allows {
+    Allows { copy: withheld != Some(0), download: withheld != Some(1), print: withheld != Some(2) }
+}
+
+#[test]
+fn what_a_link_withholds_is_not_offered_and_not_done() {
+    type Opens = fn() -> Harness;
+    type Takes = fn(&mut Harness) -> bool;
+    // A way to take the document away: which of the three allows it, the document it is tried on, and
+    // the try, which says whether the way was there or the thing was taken.
+    let ways: [(&str, usize, Opens, Takes); 21] = [
+        ("the key that copies", 0, plan, |window| {
+            window.select("brown").key("Mod+C");
+            window.platform.clipboard.is_some()
+        }),
+        ("the key that cuts", 0, plan, |window| {
+            window.select("brown").key("Mod+X");
+            window.platform.clipboard.is_some()
+        }),
+        ("Copy among the commands", 0, plan, |window| {
+            window.select("brown");
+            offered(window, "copy").iter().any(|name| name == "Copy")
+        }),
+        ("Copy in the menu", 0, plan, |window| menu_on(window, "manual").iter().any(|name| name == "Copy")),
+        ("Copy in the menu of someone who reads", 0, plan, |window| {
+            window.ui().set_access(Access::Reads);
+            menu_on(window, "brown").iter().any(|name| name == "Copy")
+        }),
+        ("a link's address in the menu", 0, plan, |window| {
+            menu_on(window, "manual").iter().any(|name| name == "Copy link address")
+        }),
+        ("code in the menu", 0, plan, |window| menu_on(window, "main").iter().any(|name| name == "Copy code")),
+        ("a picture of code in the menu", 0, plan, |window| {
+            menu_on(window, "main").iter().any(|name| name == "Copy as picture")
+        }),
+        (
+            "the source of a formula in the menu",
+            0,
+            || {
+                let line = |id: &str, kind, text: &str| Block::text(id, kind, text);
+                let blocks = vec![
+                    line("above", BlockKind::Paragraph, "Above."),
+                    line("sum", BlockKind::Formula, "a^2 + b^2"),
+                    line("end", BlockKind::Paragraph, "Last line."),
+                ];
+                Harness::open(Document { blocks, ..Document::default() })
+            },
+            |window| {
+                // The formula stands between the two lines, in the middle of the page.
+                let (over, under, page) = (on(window, "Above"), on(window, "Last"), page(window));
+                let at = Point { x: page.x + page.width / 2.0, y: (over.y + under.y) / 2.0 };
+                menu_at(window, at).iter().any(|name| name == "Copy TeX source")
+            },
+        ),
+        ("the button told of a code block", 0, plan, |window| pressable(window, Role::Button, "Copy code")),
+        ("a press on that button that comes all the same", 0, plan, |window| {
+            // The same document tells the same node to whoever may copy.
+            let tree = plan().ui().access();
+            let copy = |node: &accesskit::Node| node.label() == Some("Copy code");
+            let node = tree.nodes.iter().find(|(_, node)| copy(node)).expect("a button").0;
+            window.ask(press(node));
+            window.platform.clipboard.is_some()
+        }),
+        (
+            "the button drawn on a code block",
+            0,
+            || Harness::doc("```rust\nfn main() {}\n```"),
+            |window| {
+                let Some(at) = code_button(window) else { return false };
+                window.click_at(at);
+                window.platform.clipboard.is_some()
+            },
+        ),
+        ("a passage of an earlier version", 0, plan, |window| {
+            window.platform.wall = Some(1_794_700_800);
+            window.select("brown").type_text("red");
+            window.click(Role::Button, "History").key("Mod+A").key("Mod+C");
+            window.platform.clipboard.is_some()
+        }),
+        ("the tool over a passage of an earlier version", 0, plan, |window| {
+            window.platform.wall = Some(1_794_700_800);
+            window.select("brown").type_text("red");
+            window.click(Role::Button, "History").key("Mod+A");
+            has(window, Role::Button, "Copy")
+        }),
+        ("Save a copy among the commands", 1, plan, |window| {
+            offered(window, "save a copy").iter().any(|name| name == "Save a copy")
+        }),
+        ("Export in More", 1, plan, |window| {
+            window.click(Role::Button, "More");
+            has(window, Role::MenuItem, "Export")
+        }),
+        ("a copy of an earlier version in History", 1, plan, |window| {
+            window.platform.wall = Some(1_794_700_800);
+            window.select("brown").type_text("red");
+            window.click(Role::Button, "History");
+            has(window, Role::Button, "More")
+        }),
+        ("the key that saves a copy", 1, plan, |window| {
+            let before = window.controls().len();
+            window.key("Mod+Shift+S");
+            window.controls().len() > before
+        }),
+        ("Export PDF in Print view", 1, plan, |window| {
+            window.key("Mod+P");
+            has(window, Role::Button, "Export PDF")
+        }),
+        ("Print in Print view", 2, plan, |window| {
+            window.key("Mod+P");
+            has(window, Role::Button, "Print")
+        }),
+        ("the key that prints from Print view", 2, plan, |window| {
+            window.key("Mod+P").key("Mod+P");
+            window.ui().take_requests().contains(&Request::Print)
+        }),
+    ];
+    for withheld in [None, Some(0), Some(1), Some(2)] {
+        for (way, by, opens, takes) in ways {
+            let mut window = opens();
+            window.ui().set_allows(without(withheld));
+            window.paint();
+            window.ui().take_requests();
+            assert_eq!(takes(&mut window), withheld != Some(by), "{way}, withheld: {withheld:?}");
+        }
+    }
+}
+
+#[test]
+fn a_code_block_has_no_copy_button_where_a_copy_is_withheld() {
+    let mut window = Harness::doc("Above.\n\n```rust\nfn main() {}\n```");
+    let at = code_button(&mut window).expect("a button, for someone who may copy");
+    // The pointer rests on the button while the shell says what the link allows.
+    window.hover_at(at);
+    for copy in [false, true] {
+        window.ui().set_allows(Allows { copy, ..Allows::default() });
+        assert_eq!(code_button(&mut window).is_some(), copy, "copy: {copy}: the button is drawn");
+        let pressable = window.ui().cursor() == Cursor::Pointer;
+        assert_eq!(pressable, copy, "copy: {copy}: the pointer says its place can be pressed");
+        // A press there is the button's, or else the text's under it.
+        window.select("Above");
+        let before = window.editor().selection().cloned();
+        window.click_at(at);
+        assert_eq!(window.editor().selection().cloned() == before, copy, "copy: {copy}: the caret stays");
+    }
+}
+
+#[test]
+fn a_cut_that_could_not_take_what_it_cuts_leaves_it() {
+    for copy in [true, false] {
+        let mut window = plan();
+        window.ui().set_allows(Allows { copy, ..Allows::default() });
+        window.select("brown").key("Mod+X");
+        assert_eq!(window.markdown().contains("brown"), !copy, "copy: {copy}");
+    }
+}
+
+#[test]
+fn what_was_out_to_take_the_document_away_goes_when_a_link_withholds_it() {
+    let mut window = plan();
+    let rest = window.controls().len();
+    window.key("Mod+Shift+S");
+    assert!(window.controls().len() > rest, "the card that saves a copy is out");
+    window.ui().set_allows(without(Some(1)));
+    assert_eq!(window.controls().len(), rest, "and goes");
+
+    window.key("Mod+P").assert_open(Role::Button, "Print");
+    window.ui().set_allows(without(Some(2)));
+    window.assert_closed(Role::Button, "Print").assert_open(Role::Button, "Export PDF");
+    assert!(has(&mut window, Role::Document, "Print view"), "the sheets are still looked at");
+
+    // The same again asks for no frame.
+    window.paint();
+    window.ui().set_allows(without(Some(2)));
+    assert!(!window.ui().needs_paint());
+
+    let mut window = plan();
+    let at = on(&mut window, "manual");
+    window.secondary_click_at(at).assert_open(Role::MenuItem, "Copy link address");
+    window.ui().set_allows(without(Some(0)));
+    window.assert_closed(Role::Menu, "Context menu");
 }

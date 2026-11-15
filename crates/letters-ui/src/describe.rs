@@ -84,11 +84,20 @@ struct Telling<'a> {
     nodes: &'a mut Vec<(NodeId, Node)>,
     /// Whether this is the document on its page. A version of it that is only read has nothing to press.
     written: bool,
-    /// Whether the person may change the document, and so has what changes it to press.
-    edits: bool,
+    /// What the person may do with the document, and so has to press.
+    may: May,
     /// What is said of a block beside what it reads: that a version of the document added it, or why the
     /// page does not show what it links to.
     said: &'a HashMap<BlockId, String>,
+}
+
+/// What the person may do with the document on its page.
+#[derive(Clone, Copy, Default, Hash)]
+pub(crate) struct May {
+    /// They change it.
+    pub edits: bool,
+    /// The clipboard takes what is on it.
+    pub copies: bool,
 }
 
 impl Telling<'_> {
@@ -101,12 +110,12 @@ impl Telling<'_> {
 
 /// Fills in the page's node and adds the blocks under it: all of them when `whole` is set, and otherwise
 /// those that read differently than `told` has them. `said` holds what the page shows of a block beside
-/// what it reads, such as why what it links to was not fetched, and `edits` is whether the person may
-/// change the document: someone who only reads it is told of nothing that changes it.
+/// what it reads, such as why what it links to was not fetched, and `may` is what the person may do with
+/// the document: nobody is told of what they may not do.
 pub(crate) fn page(
     doc: &Document,
     selection: Option<&Selection>,
-    (said, edits): (&HashMap<BlockId, String>, bool),
+    (said, may): (&HashMap<BlockId, String>, May),
     told: &mut Told,
     whole: bool,
     page: &mut Node,
@@ -125,7 +134,7 @@ pub(crate) fn page(
     {
         page.set_text_selection(TextSelection { anchor, focus });
     }
-    tell(doc, (said, true, edits), told, whole, page, nodes);
+    tell(doc, (said, true, may), told, whole, page, nodes);
 }
 
 /// Adds the blocks of a version of the document under the canvas that shows it, as [`page`] does for
@@ -140,14 +149,14 @@ pub(crate) fn version(
     nodes: &mut Vec<(NodeId, Node)>,
 ) {
     canvas.set_language(doc.language.as_str());
-    tell(doc, (said, false, false), told, whole, canvas, nodes);
+    tell(doc, (said, false, May::default()), told, whole, canvas, nodes);
 }
 
 /// Adds the blocks of `doc` under `page`, with what is `said` of them, for the document on its page
-/// (`written`), which the person may change or not (`edits`), or for a version that is only read.
+/// (`written`) and what the person may do with it, or for a version that is only read.
 fn tell(
     doc: &Document,
-    (said, written, edits): (&HashMap<BlockId, String>, bool, bool),
+    (said, written, may): (&HashMap<BlockId, String>, bool, May),
     told: &mut Told,
     whole: bool,
     page: &mut Node,
@@ -155,7 +164,7 @@ fn tell(
 ) {
     let before = mem::take(&mut told.0);
     let now = HashMap::with_capacity(before.len());
-    let mut telling = Telling { before: (!whole).then_some(&before), now, nodes, written, edits, said };
+    let mut telling = Telling { before: (!whole).then_some(&before), now, nodes, written, may, said };
     page.set_children(push_blocks(&doc.blocks, &mut telling));
     told.0 = telling.now;
 }
@@ -418,7 +427,7 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
     block.body.runs().iter().for_each(|run| run.text.hash(&mut reads));
     (&under, &inner).hash(&mut reads);
     let said = telling.said.get(&block.id);
-    (said, telling.edits).hash(&mut reads);
+    (said, telling.may).hash(&mut reads);
     if !telling.differs(id, reads.finish()) {
         return id;
     }
@@ -446,7 +455,7 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
         node.set_description(said.as_str());
     }
     let mut children = Vec::new();
-    let (written, edits) = (telling.written, telling.edits);
+    let (written, May { edits, copies }) = (telling.written, telling.may);
     let mut part = |part: u8, node: Node, children: &mut Vec<NodeId>| {
         telling.nodes.push((part_node(&block.id, part), node));
         children.push(part_node(&block.id, part));
@@ -487,10 +496,12 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
                 named.add_action(Action::Click);
                 part(LANGUAGE, named, &mut children);
             }
-            let mut copy = Node::new(Role::Button);
-            copy.set_label(crate::code_copy::LABEL);
-            copy.add_action(Action::Click);
-            part(COPY, copy, &mut children);
+            if copies {
+                let mut copy = Node::new(Role::Button);
+                copy.set_label(crate::code_copy::LABEL);
+                copy.add_action(Action::Click);
+                part(COPY, copy, &mut children);
+            }
         }
         BlockKind::TableOfContents { .. } => node.set_label("Table of contents"),
         BlockKind::LinkPreview { url, title, .. } => {
