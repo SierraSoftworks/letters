@@ -15,15 +15,15 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::{Scratch, Writer};
-use letters::connected::{self, Line, Told};
-use letters::files;
+use letters::connected::{self, Line, Said, Told};
+use letters::files::{self, Home};
 use letters::keychain::Keychain;
+use letters::pictures;
 use letters::platform;
 use letters::remote::Roots;
 use letters::server::Client;
 use letters::session::Session;
 use letters::signin::SignIn;
-use letters::socket::Heard;
 use letters_api::{Entry, EntryKind, NewDocument, Opened, Person, Role, SpaceKind, Trust, paths};
 use letters_format::{Archive, Files, Stamp, WorkingCopy};
 use letters_model::{Block, BlockKind, Notes, ReplicaId, Style};
@@ -31,7 +31,8 @@ use letters_server::config::Config;
 use letters_server::session::{COOKIE_NAME, Carrier};
 use letters_server::store::Store;
 use letters_server::{App, api};
-use letters_sync::{Access, Link, Local, Outbound, Progress, Refusal, Room, SessionId};
+use letters_sync::{Access, ClientMessage, Link, Local, Outbound, Progress, Refusal, Room, SessionId};
+use sha2::{Digest, Sha256};
 
 /// Sign-ins are kept in memory here, never in the keychain of whoever runs the tests.
 static KEYCHAIN: LazyLock<Keychain> = LazyLock::new(|| Keychain::in_memory().unwrap());
@@ -47,9 +48,7 @@ struct Server {
     /// The certificate it shows.
     certificate: Vec<u8>,
     clock: Arc<AtomicU64>,
-    /// The rooms of the documents that have a socket, and whether the network to the server is down.
-    rooms: Arc<Mutex<HashMap<String, Hosted>>>,
-    down: Arc<AtomicBool>,
+    front: Arc<Front>,
     _scratch: Scratch,
     _runtime: tokio::runtime::Runtime,
 }
@@ -58,8 +57,8 @@ impl Server {
     fn start(name: &str) -> Self {
         let scratch = Scratch::new(name);
         let (tls, certificate) = common::tls();
-        let front = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = front.local_addr().unwrap().port();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
         let at = scratch.0.display();
         let settings = format!(
             r#"
@@ -90,25 +89,26 @@ path = "{at}/home/{{username}}"
             tokio::spawn(async move { axum::serve(listener, router).await });
             behind
         });
-        let (rooms, down) = (Arc::new(Mutex::new(HashMap::new())), Arc::new(AtomicBool::new(false)));
-        let (hosted, gone) = (rooms.clone(), down.clone());
+        let front =
+            Arc::new(Front { behind, rooms: Mutex::default(), down: AtomicBool::new(false), log: Mutex::default() });
+        let serving = front.clone();
         // The server speaks plain HTTP and expects TLS in front of it, as it has wherever it runs.
         thread::spawn(move || {
-            for socket in front.incoming().flatten() {
-                if gone.load(Ordering::Relaxed) {
+            for socket in listener.incoming().flatten() {
+                if serving.down.load(Ordering::Relaxed) {
                     continue;
                 }
                 let Ok(connection) = rustls::ServerConnection::new(tls.clone()) else { continue };
                 let mut stream = rustls::StreamOwned::new(connection, socket);
-                let (hosted, gone) = (hosted.clone(), gone.clone());
+                let serving = serving.clone();
                 thread::spawn(move || {
-                    let _ = serve(&mut stream, behind, &hosted, &gone);
+                    let _ = serving.serve(&mut stream);
                     stream.conn.send_close_notify();
                     let _ = stream.flush();
                 });
             }
         });
-        Self { app, port, certificate, clock, rooms, down, _scratch: scratch, _runtime: runtime }
+        Self { app, port, certificate, clock, front, _scratch: scratch, _runtime: runtime }
     }
 
     fn origin(&self) -> String {
@@ -140,9 +140,9 @@ path = "{at}/home/{{username}}"
 
     /// The network to the server goes: every socket ends without a word, and nothing is answered.
     fn cut(&self) {
-        self.down.store(true, Ordering::Relaxed);
+        self.front.down.store(true, Ordering::Relaxed);
         let ended = Instant::now() + Duration::from_secs(10);
-        while self.rooms.lock().unwrap().values().any(|hosted| !hosted.to.is_empty()) {
+        while self.front.rooms.lock().unwrap().values().any(|hosted| !hosted.to.is_empty()) {
             assert!(Instant::now() < ended, "the sockets end");
             thread::sleep(Duration::from_millis(5));
         }
@@ -150,7 +150,12 @@ path = "{at}/home/{{username}}"
 
     /// The network is back.
     fn mend(&self) {
-        self.down.store(false, Ordering::Relaxed);
+        self.front.down.store(false, Ordering::Relaxed);
+    }
+
+    /// What came in since this was last asked: `picture NAME` and `edits`, in their order.
+    fn came(&self) -> Vec<String> {
+        std::mem::take(&mut self.front.log.lock().unwrap())
     }
 
     /// The system's browser, signed in to the server as `person`: sent to the page the app made, it
@@ -199,39 +204,16 @@ path = "{at}/home/{{username}}"
 
 type Tls = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
 
-/// Answers one connection: a document's socket here, and anything else by the server behind.
-fn serve(
-    stream: &mut Tls,
+/// What stands in front of the server: it passes on what the server answers itself, and does what the
+/// server does not do yet for a document's socket and for the pictures that come in beside it.
+struct Front {
     behind: SocketAddr,
-    rooms: &Mutex<HashMap<String, Hosted>>,
-    down: &AtomicBool,
-) -> io::Result<()> {
-    let (mut head, mut byte) = (Vec::new(), [0]);
-    while !head.ends_with(b"\r\n\r\n") {
-        stream.read_exact(&mut byte)?;
-        head.push(byte[0]);
-    }
-    let said = String::from_utf8_lossy(&head).into_owned();
-    let path = said.split(' ').nth(1).unwrap_or_default();
-    if let Some(id) = path.strip_prefix("/api/v1/documents/").and_then(|rest| rest.strip_suffix("/sync")) {
-        return sync(stream, &head, id, behind, rooms, down);
-    }
-    let length =
-        said.to_ascii_lowercase().lines().find_map(|line| line.strip_prefix("content-length:")?.trim().parse().ok());
-    let mut body = vec![0; length.unwrap_or(0)];
-    stream.read_exact(&mut body)?;
-    stream.write_all(&ask(behind, &head, &body)?)
-}
-
-/// Asks the server behind one thing, and gives its whole answer.
-fn ask(behind: SocketAddr, head: &[u8], body: &[u8]) -> io::Result<Vec<u8>> {
-    // One request to a connection, so that the answer ends where the server hangs up.
-    let line = head.iter().position(|byte| *byte == b'\n').unwrap_or(0) + 1;
-    let mut server = TcpStream::connect(behind)?;
-    server.write_all(&[&head[..line], b"connection: close\r\n", &head[line..], body].concat())?;
-    let mut answer = Vec::new();
-    server.read_to_end(&mut answer)?;
-    Ok(answer)
+    /// The rooms of the documents that have a socket.
+    rooms: Mutex<HashMap<String, Hosted>>,
+    /// Whether the network to the server is down.
+    down: AtomicBool,
+    /// What came in that a test asks the order of: `picture NAME` and `edits`.
+    log: Mutex<Vec<String>>,
 }
 
 /// One document's room, its journal, and the way to each socket in it.
@@ -239,6 +221,8 @@ struct Hosted {
     room: Room,
     state: Memory,
     to: HashMap<SessionId, mpsc::Sender<Outbound>>,
+    /// The pictures the room was handed, by their names without `assets/`.
+    handed: Vec<String>,
 }
 
 impl Hosted {
@@ -311,129 +295,240 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
-/// A document's socket: the server says whether this session may have it, and the room does the rest.
-fn sync(
-    stream: &mut Tls,
-    head: &[u8],
-    id: &str,
-    behind: SocketAddr,
-    rooms: &Mutex<HashMap<String, Hosted>>,
-    down: &AtomicBool,
-) -> io::Result<()> {
-    let said = String::from_utf8_lossy(head);
-    let named = |line: &str| {
-        line.split_once(':')
-            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-            .map(|(_, value)| value.trim().to_owned())
-    };
-    let bearer = said.lines().find_map(named).unwrap_or_default();
-    let get = |path: &str| -> io::Result<(u16, Vec<u8>)> {
+/// An answer with a body, or with none.
+fn answer(stream: &mut Tls, status: u16, body: &[u8]) -> io::Result<()> {
+    write!(stream, "HTTP/1.1 {status} Said\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len())?;
+    stream.write_all(body)
+}
+
+impl Front {
+    /// Answers one connection.
+    fn serve(&self, stream: &mut Tls) -> io::Result<()> {
+        let (mut head, mut byte) = (Vec::new(), [0]);
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte)?;
+            head.push(byte[0]);
+        }
+        let said = String::from_utf8_lossy(&head).into_owned();
+        let mut line = said.split(' ');
+        let (verb, path) = (line.next().unwrap_or_default(), line.next().unwrap_or_default());
+        let named = |line: &str| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization").then(|| value.trim().to_owned())
+        };
+        let bearer = said.lines().find_map(named).unwrap_or_default();
+        let of_document = path.strip_prefix("/api/v1/documents/").and_then(|rest| rest.split_once('/'));
+        if let Some((id, "sync")) = of_document {
+            return self.sync(stream, &head, id, &bearer);
+        }
+        let length = said
+            .to_ascii_lowercase()
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:")?.trim().parse().ok());
+        let mut body = vec![0; length.unwrap_or(0)];
+        stream.read_exact(&mut body)?;
+        match (verb, of_document.and_then(|(id, rest)| Some((id, rest.strip_prefix("assets")?)))) {
+            // The server lists what the file holds, and the room what it was handed since.
+            ("GET", Some((id, ""))) => {
+                let (status, listed) = self.get(&paths::assets(id), &bearer)?;
+                let mut names: Vec<String> = serde_json::from_slice(&listed).unwrap_or_default();
+                names.extend(self.rooms.lock().unwrap().get(id).into_iter().flat_map(|hosted| hosted.handed.clone()));
+                answer(stream, status, &if status == 200 { serde_json::to_vec(&names).unwrap() } else { listed })
+            }
+            ("GET", Some((id, name))) if self.picture(id, name).is_some() => {
+                answer(stream, 200, &self.picture(id, name).unwrap())
+            }
+            ("PUT", Some((id, name))) => {
+                let status = self.keep(id, name.trim_start_matches('/'), body, &bearer)?;
+                answer(stream, status, &[])
+            }
+            _ => stream.write_all(&self.ask(&head, &body)?),
+        }
+    }
+
+    /// Asks the server behind one thing, and gives its whole answer.
+    fn ask(&self, head: &[u8], body: &[u8]) -> io::Result<Vec<u8>> {
+        // One request to a connection, so that the answer ends where the server hangs up.
+        let line = head.iter().position(|byte| *byte == b'\n').unwrap_or(0) + 1;
+        let mut server = TcpStream::connect(self.behind)?;
+        server.write_all(&[&head[..line], b"connection: close\r\n", &head[line..], body].concat())?;
+        let mut answer = Vec::new();
+        server.read_to_end(&mut answer)?;
+        Ok(answer)
+    }
+
+    /// Asks the server for `path` as whoever holds `bearer`: how it answered, and with what.
+    fn get(&self, path: &str, bearer: &str) -> io::Result<(u16, Vec<u8>)> {
         let head = format!("GET {path} HTTP/1.1\r\nhost: localhost\r\nauthorization: {bearer}\r\n\r\n");
-        let answer = ask(behind, head.as_bytes(), &[])?;
+        let answer = self.ask(head.as_bytes(), &[])?;
         let body = answer.windows(4).position(|window| window == b"\r\n\r\n").map_or(answer.len(), |at| at + 4);
         let status = String::from_utf8_lossy(&answer[..body]).split(' ').nth(1).and_then(|status| status.parse().ok());
         Ok((status.unwrap_or(502), answer[body..].to_vec()))
-    };
-    let (status, opened) = get(&paths::document(id))?;
-    if status != 200 {
-        return write!(stream, "HTTP/1.1 {status} Refused\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
     }
-    let opened: Opened = serde_json::from_slice(&opened).expect("the server says how the document is opened");
-    let role = match opened.role {
-        Role::Reader => letters_sync::Role::Reader,
-        Role::Commenter => letters_sync::Role::Commenter,
-        Role::Editor | Role::Owner => letters_sync::Role::Editor,
-    };
-    let (tell, told) = mpsc::channel();
-    let session = {
-        let mut rooms = rooms.lock().unwrap();
+
+    /// What the server says of a document to whoever holds `bearer`, or how it refused.
+    fn opened(&self, id: &str, bearer: &str) -> io::Result<Result<Opened, u16>> {
+        let (status, opened) = self.get(&paths::document(id), bearer)?;
+        Ok(match status {
+            200 => Ok(serde_json::from_slice(&opened).expect("the server says how the document is opened")),
+            status => Err(status),
+        })
+    }
+
+    /// Does `with` to a document's room, which opens over the file as the server holds it.
+    fn room<T>(&self, id: &str, bearer: &str, with: impl FnOnce(&mut Hosted) -> T) -> io::Result<T> {
+        let mut rooms = self.rooms.lock().unwrap();
         if !rooms.contains_key(id) {
-            // The room opens over the file as the server holds it.
-            let file = get(&paths::file(id))?.1;
+            let file = self.get(&paths::file(id), bearer)?.1;
             let mut file = Archive::open(Cursor::new(file)).expect("the server holds a document");
             let copy = WorkingCopy::open(&mut file, ReplicaId::new(&platform::block_id())).unwrap();
             let mut state = Memory::default();
             let room = Room::open(copy, id, &mut state, now()).expect("a room opens over the file");
-            rooms.insert(id.to_owned(), Hosted { room, state, to: HashMap::new() });
+            rooms.insert(id.to_owned(), Hosted { room, state, to: HashMap::new(), handed: Vec::new() });
         }
-        let hosted = rooms.get_mut(id).unwrap();
-        let session = hosted.room.join(Access { role, name: opened.author }, now());
-        hosted.to.insert(session, tell);
-        session
-    };
-    let leave = || {
-        let mut rooms = rooms.lock().unwrap();
-        let hosted = rooms.get_mut(id).unwrap();
-        hosted.to.remove(&session);
-        hosted.room.leave(session);
-        hosted.tell();
-    };
-    let Ok(mut socket) = tungstenite::accept(Replayed { head: Cursor::new(head), stream }) else {
-        leave();
-        return Ok(());
-    };
-    // The socket is looked at often, so that what the room has for it is not kept waiting.
-    socket.get_ref().stream.sock.set_read_timeout(Some(Duration::from_millis(5)))?;
-    while !down.load(Ordering::Relaxed) {
-        let frame = match socket.read() {
-            Ok(tungstenite::Message::Binary(frame)) => Some(frame),
-            Ok(_) => None,
-            Err(tungstenite::Error::Io(error))
-                if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
-            {
-                None
-            }
-            Err(_) => break,
-        };
-        {
-            let mut rooms = rooms.lock().unwrap();
-            let Hosted { room, state, .. } = rooms.get_mut(id).unwrap();
-            if let Some(frame) = frame {
-                let _ = room.received(session, &frame, state, now());
-            }
-            room.tick(now());
-            rooms.get_mut(id).unwrap().tell();
-        }
-        for out in told.try_iter() {
-            let sent = match out {
-                Outbound::Send(_, frame) => socket.send(tungstenite::Message::Binary(frame.into())),
-                // Reading on is what ends it, once the other side has said so too.
-                Outbound::Close(_) => socket.close(None),
-            };
-            if sent.is_err() {
-                break;
-            }
-        }
+        Ok(with(rooms.get_mut(id).unwrap()))
     }
-    leave();
-    Ok(())
+
+    /// A picture a document's room was handed, which the server's file does not hold.
+    fn picture(&self, id: &str, name: &str) -> Option<Vec<u8>> {
+        let name = format!("assets{name}");
+        self.rooms.lock().unwrap().get(id)?.room.asset(&name).map(<[u8]>::to_vec)
+    }
+
+    /// Takes a picture for a document from someone who may edit it. How that is answered.
+    fn keep(&self, id: &str, name: &str, bytes: Vec<u8>, bearer: &str) -> io::Result<u16> {
+        match self.opened(id, bearer)? {
+            Ok(opened) if opened.role >= Role::Editor => {}
+            Ok(_) => return Ok(403),
+            Err(status) => return Ok(status),
+        }
+        let kept = self.room(id, bearer, |Hosted { room, state, handed, .. }| {
+            let kept = room.add_asset(&format!("assets/{name}"), bytes, state, now()).is_ok();
+            if kept {
+                handed.push(name.to_owned());
+            }
+            kept
+        })?;
+        if kept {
+            self.log.lock().unwrap().push(format!("picture {name}"));
+        }
+        Ok(if kept { 200 } else { 400 })
+    }
+
+    /// A document's socket: the server says whether this session may have it, and the room does the rest.
+    fn sync(&self, stream: &mut Tls, head: &[u8], id: &str, bearer: &str) -> io::Result<()> {
+        let opened = match self.opened(id, bearer)? {
+            Ok(opened) => opened,
+            Err(status) => return answer(stream, status, &[]),
+        };
+        let role = match opened.role {
+            Role::Reader => letters_sync::Role::Reader,
+            Role::Commenter => letters_sync::Role::Commenter,
+            Role::Editor | Role::Owner => letters_sync::Role::Editor,
+        };
+        let (tell, told) = mpsc::channel();
+        let session = self.room(id, bearer, |hosted| {
+            let session = hosted.room.join(Access { role, name: opened.author }, now());
+            hosted.to.insert(session, tell);
+            session
+        })?;
+        let leave = || {
+            let _ = self.room(id, bearer, |hosted| {
+                hosted.to.remove(&session);
+                hosted.room.leave(session);
+                hosted.tell();
+            });
+        };
+        let Ok(mut socket) = tungstenite::accept(Replayed { head: Cursor::new(head), stream }) else {
+            leave();
+            return Ok(());
+        };
+        // The socket is looked at often, so that what the room has for it is not kept waiting.
+        socket.get_ref().stream.sock.set_read_timeout(Some(Duration::from_millis(5)))?;
+        'open: while !self.down.load(Ordering::Relaxed) {
+            let frame = match socket.read() {
+                Ok(tungstenite::Message::Binary(frame)) => Some(frame),
+                Ok(_) => None,
+                Err(tungstenite::Error::Io(error))
+                    if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+                {
+                    None
+                }
+                Err(_) => break,
+            };
+            if matches!(frame.as_deref().map(ClientMessage::decode), Some(Ok(Some(ClientMessage::Edits { .. })))) {
+                self.log.lock().unwrap().push("edits".to_owned());
+            }
+            self.room(id, bearer, |hosted| {
+                if let Some(frame) = frame {
+                    let _ = hosted.room.received(session, &frame, &mut hosted.state, now());
+                }
+                hosted.room.tick(now());
+                hosted.tell();
+            })?;
+            for out in told.try_iter() {
+                let sent = match out {
+                    Outbound::Send(_, frame) => socket.send(tungstenite::Message::Binary(frame.into())),
+                    // Reading on is what ends it, once the other side has said so too.
+                    Outbound::Close(_) => socket.close(None),
+                };
+                if sent.is_err() {
+                    break 'open;
+                }
+            }
+        }
+        leave();
+        Ok(())
+    }
 }
 
 /// A document of the server's open on one device, with what a window holds beside its line.
 struct Desk {
+    id: String,
     writer: Writer,
+    /// Where the copy on this device is saved.
+    copy: Home,
     notes: Notes,
+    /// Pictures no save has put in the copy's file yet.
+    pictures: Vec<(String, Vec<u8>)>,
     line: Line,
-    heard: mpsc::Receiver<(u64, Heard)>,
+    heard: mpsc::Receiver<Said>,
     born: Instant,
     /// How far this device's clock was put on, so that no test waits for a line to try again.
     ahead: u64,
-    /// What the server would not take.
+    /// What the server would not take: work, and pictures by their names.
     refused: Vec<Refusal>,
-    _home: Scratch,
+    unkept: Vec<String>,
+    home: Scratch,
 }
 
 impl Desk {
     /// Brings the document here and opens it, as a window does. The line is not started.
     fn open(server: &Server, session: Arc<Session>, id: &str, home: &str) -> Self {
-        let home = Scratch::new(home);
+        Self::open_in(server, session, id, Scratch::new(home))
+    }
+
+    fn open_in(server: &Server, session: Arc<Session>, id: &str, home: Scratch) -> Self {
         let reached = connected::reach(&session, id, &home.0).expect("the document is reached");
-        let (writer, _) = Writer::of(files::open(&reached.path, Style::default).expect("the copy is a document"));
+        let (writer, copy) = Writer::of(files::open(&reached.path, Style::default).expect("the copy is a document"));
         let (tell, heard) = mpsc::channel();
-        let tell: connected::Tell = Arc::new(move |socket, heard| drop(tell.send((socket, heard))));
-        let line = Line::new(session, &reached.opened, server.roots(), tell);
-        let notes = writer.copy.notes.clone();
-        Self { writer, notes, line, heard, born: Instant::now(), ahead: 0, refused: Vec::new(), _home: home }
+        let tell: connected::Tell = Arc::new(move |said| drop(tell.send(said)));
+        let line = Line::new(session, &reached.opened, &reached.path, server.roots(), tell);
+        let (notes, born) = (writer.copy.notes.clone(), Instant::now());
+        let (id, pictures, refused, unkept) = (id.to_owned(), Vec::new(), Vec::new(), Vec::new());
+        Self { id, writer, copy, notes, pictures, line, heard, born, ahead: 0, refused, unkept, home }
+    }
+
+    /// The app is closed and opened again: the document is opened from its copy, on a new line.
+    fn again(self, server: &Server) -> Self {
+        Self::open_in(server, self.line.session().clone(), &self.id, self.home)
+    }
+
+    /// Saves the copy on this device, as an autosave does.
+    fn save(&mut self) {
+        self.writer.copy.entries.extend(self.pictures.drain(..));
+        let document = self.writer.model.doc().clone();
+        self.copy = self.writer.save(&self.copy, &document).0;
     }
 
     fn now(&self) -> u64 {
@@ -462,6 +557,7 @@ impl Desk {
                     told.extend(self.tell());
                 }
                 Told::Refused(refusal) => self.refused.push(refusal),
+                Told::Unkept(name) => self.unkept.push(name),
                 Told::Link | Told::Progress | Told::Peers => {}
             }
         }
@@ -481,6 +577,29 @@ impl Desk {
         self.does(told);
     }
 
+    /// The person puts a picture in the document. Its name there.
+    fn picture(&mut self, block: &str, bytes: Vec<u8>) -> String {
+        let hash: String = Sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+        let name = format!("assets/{hash}.png");
+        self.line.keep(&name, bytes.clone());
+        self.pictures.push((name.clone(), bytes));
+        let (asset, alt) = (Some(name.clone()), String::new());
+        let figure = BlockKind::Figure { asset, src: None, alt, width: 40.0, height: 20.0, numbered: false };
+        let mut document = self.writer.model.doc().clone();
+        document.blocks.push(Block::text(block, figure, ""));
+        self.writer.write(&document);
+        let told = self.tell();
+        self.does(told);
+        name
+    }
+
+    /// Whether the document here has a figure of the picture of this name.
+    fn shows(&self, name: &str) -> bool {
+        let shown =
+            |block: &Block| matches!(&block.kind, BlockKind::Figure { asset, .. } if asset.as_deref() == Some(name));
+        self.writer.model.doc().walk().any(shown)
+    }
+
     /// The person comments on a paragraph.
     fn comment(&mut self, id: &str, block: &str, words: &str) {
         self.notes.notes.push(common::comment(id, block, words));
@@ -496,10 +615,9 @@ impl Desk {
 
     /// Hears what its sockets said since, and does what is due.
     fn turn(&mut self) {
-        while let Ok((socket, heard)) = self.heard.try_recv() {
+        while let Ok(said) = self.heard.try_recv() {
             let now = self.now();
-            let told =
-                self.line.heard(socket, heard, Local { model: Some(&self.writer.model), notes: &self.notes }, now);
+            let told = self.line.heard(said, Local { model: Some(&self.writer.model), notes: &self.notes }, now);
             self.does(told);
         }
         // A line that waits to try again does not have to.
@@ -683,12 +801,12 @@ fn a_document_the_server_will_not_open_has_no_line() {
 
     for (name, session, opened) in cases {
         let (tell, heard) = mpsc::channel();
-        let tell: connected::Tell = Arc::new(move |socket, heard| drop(tell.send((socket, heard))));
-        let mut line = Line::new(session, &opened, server.roots(), tell);
+        let tell: connected::Tell = Arc::new(move |said| drop(tell.send(said)));
+        let mut line = Line::new(session, &opened, std::path::Path::new("no-copy.let"), server.roots(), tell);
         let nothing = Notes::default();
         line.start(false, 0);
-        while let Ok((socket, said)) = heard.recv_timeout(Duration::from_secs(10)) {
-            line.heard(socket, said, Local { model: None, notes: &nothing }, 0);
+        while let Ok(said) = heard.recv_timeout(Duration::from_secs(10)) {
+            line.heard(said, Local { model: None, notes: &nothing }, 0);
             if !matches!(line.link(), Link::Connecting) {
                 break;
             }
@@ -697,4 +815,50 @@ fn a_document_the_server_will_not_open_has_no_line() {
         assert!(matches!(line.link(), Link::Refused(Refusal::NoAccess | Refusal::Gone)), "{name}: {:?}", line.link());
         assert_eq!(line.wake_at(), None, "{name}");
     }
+}
+
+#[test]
+fn a_picture_is_with_the_server_before_the_edit_that_names_it() {
+    let server = Server::start("line-pictures");
+    let (ours, theirs) = (server.session(ada()), server.session(ada()));
+    let id = server.document(&ours, "Roof repairs");
+    let mut here = Desk::open(&server, ours, &id, "line-pictures-here");
+    let mut there = Desk::open(&server, theirs.clone(), &id, "line-pictures-there");
+    here.start();
+    there.start();
+    assert!(settle(&mut [&mut here, &mut there], |desks| desks.iter().all(|desk| live(desk))));
+
+    // A picture comes into the document while the line is live, while the server is away, and in a run of
+    // the app that ends before the server is back.
+    for (case, shade) in ["live", "away", "closed"].into_iter().zip(1u8..) {
+        if case != "live" {
+            server.cut();
+            assert!(settle(&mut [&mut here, &mut there], |desks| desks.iter().all(|desk| !live(desk))), "{case}");
+        }
+        server.came();
+        let picture = pictures::from_rgba(4, 2, &[shade; 32]).unwrap().bytes;
+        let name = here.picture(case, picture.clone());
+        if case == "closed" {
+            here.save();
+            here = here.again(&server);
+            here.start();
+        }
+        server.mend();
+
+        let shown = |desks: &[&mut Desk]| desks[1].shows(&name) && desks[0].line.progress() == Progress::Saved;
+        assert!(settle(&mut [&mut here, &mut there], shown), "{case}: {:?}", here.line.link());
+        let came = server.came();
+        assert_eq!(came.first(), Some(&format!("picture {}", &name["assets/".len()..])), "{case}: {came:?}");
+        assert!(came.contains(&"edits".to_owned()), "{case}: {came:?}");
+        // Whoever reads the edit has the picture for the asking.
+        assert_eq!(connected::picture(&theirs, &id, &name), Some(picture), "{case}");
+    }
+    assert_eq!(here.unkept, [""; 0]);
+
+    // A picture the server will not take is told, and the writing goes on.
+    here.line.keep("assets/not-its-hash.png", vec![1, 2, 3]);
+    here.write("gutters", "Then the gutters.");
+    let read = |desks: &[&mut Desk]| desks[1].reads().contains(&"Then the gutters.".to_owned());
+    assert!(settle(&mut [&mut here, &mut there], read), "{:?}", there.reads());
+    assert_eq!(here.unkept, ["assets/not-its-hash.png"]);
 }

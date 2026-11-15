@@ -149,6 +149,11 @@ impl Session {
         self.ask(|server, token| server.asset(token, id, name, most))
     }
 
+    /// The names of the pictures the server holds for a document, each without `assets/`.
+    pub fn assets(&self, id: &str) -> Result<Vec<String>, Refused> {
+        self.ask(|server, token| server.get(token, &paths::assets(id)))
+    }
+
     /// Hands the server a picture of a document, before the edit that names it is sent.
     pub fn keep_asset(&self, id: &str, name: &str, bytes: &[u8]) -> Result<(), Refused> {
         self.ask(|server, token| server.keep_asset(token, id, name, bytes))

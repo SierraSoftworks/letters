@@ -5,15 +5,18 @@
 //! can be written in with no server in reach. The line trades what each side lacks while there is one:
 //! `letters-sync` says what to send and what to merge, and this carries it.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread;
 use std::time::Duration;
 
 use letters_api::{Code, Opened, paths};
+use letters_format::Archive;
 use letters_model::{Model, Notes, Selection};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
 use sha2::{Digest, Sha256};
@@ -224,6 +227,8 @@ pub enum Told {
     Notes(Notes),
     /// The server did not take work that was sent, and why. The work stays in the copy here.
     Refused(Refusal),
+    /// The server did not take the picture of this name, so the others will not see it.
+    Unkept(String),
     /// [`Line::link`] changed.
     Link,
     /// [`Line::progress`] changed.
@@ -232,9 +237,107 @@ pub enum Told {
     Peers,
 }
 
-/// What tells a line's window that its socket has something to say. It is called on another thread, with
-/// the socket's number.
-pub type Tell = Arc<dyn Fn(u64, Heard) + Send + Sync>;
+/// What a line's window hands back to [`Line::heard`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Said {
+    /// The socket of this number had something to say.
+    Socket(u64, Heard),
+    /// The pictures the server was owed were handed over, or could not be for now.
+    Handed,
+}
+
+/// What tells a line's window that there is something for [`Line::heard`]. It is called on another thread.
+pub type Tell = Arc<dyn Fn(Said) + Send + Sync>;
+
+/// How long the line waits before it tries again to hand over pictures the server could not be given, in
+/// milliseconds.
+const HAND_AGAIN: u64 = 5_000;
+
+/// The pictures the server is to hold before it is sent the edits that name them.
+#[derive(Default)]
+struct Owed {
+    /// Pictures that came into the document here, by their names in it.
+    pictures: BTreeMap<String, Vec<u8>>,
+    /// Whether the pictures in the copy's file were held against what the server has: the copy may hold
+    /// some from a run that ended before they were handed over.
+    compared: bool,
+    /// The pictures the server would not take, until the window is told.
+    unkept: Vec<String>,
+}
+
+/// What a line and the threads that hand over its pictures share.
+struct Handing {
+    session: Arc<Session>,
+    /// The document's id, and where its copy is on this device.
+    id: String,
+    copy: PathBuf,
+    owed: Mutex<Owed>,
+    /// Held by whoever is handing pictures over, so that no picture goes twice at once.
+    turn: Mutex<()>,
+}
+
+impl Handing {
+    fn owed(&self) -> MutexGuard<'_, Owed> {
+        self.owed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Hands the server every picture it is owed. Fails when the server cannot be asked now, with the rest
+    /// still owed. A picture the server will not take is given up, and told. This waits on the network.
+    fn hand(&self) -> Result<(), Refused> {
+        let _turn = self.turn.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.owed().compared {
+            match self.session.assets(&self.id) {
+                Ok(there) => self.compare(&there.into_iter().collect()),
+                Err(refused) if passes(&refused) => return Err(refused),
+                // A server that lists nothing for this session takes nothing from it either.
+                Err(_) => {}
+            }
+            self.owed().compared = true;
+        }
+        loop {
+            let next = self.owed().pictures.iter().next().map(|(name, bytes)| (name.clone(), bytes.clone()));
+            let Some((name, bytes)) = next else { return Ok(()) };
+            let short = name.strip_prefix(ASSETS).unwrap_or(&name);
+            let kept = self.session.keep_asset(&self.id, short, &bytes);
+            match kept {
+                Err(refused) if passes(&refused) => return Err(refused),
+                kept => {
+                    let mut owed = self.owed();
+                    owed.pictures.remove(&name);
+                    if kept.is_err() {
+                        owed.unkept.push(name);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Owes the server the pictures in the copy's file that it does not list.
+    fn compare(&self, there: &BTreeSet<String>) {
+        let Ok(file) = fs::File::open(&self.copy) else { return };
+        let Ok(mut file) = Archive::open(io::BufReader::new(file)) else { return };
+        let lacks = |name: &&str| name.strip_prefix(ASSETS).is_some_and(|short| !there.contains(short));
+        let lacking: Vec<String> = file.names().filter(lacks).map(str::to_owned).collect();
+        for name in lacking {
+            if let Ok(Some(bytes)) = file.read(&name) {
+                self.owed().pictures.entry(name).or_insert(bytes);
+            }
+        }
+    }
+}
+
+/// Where a document keeps its pictures, as its blocks name them.
+const ASSETS: &str = "assets/";
+
+/// Whether a refusal may not last: the network is down, the server is busy, or the sign-in is over, which
+/// the socket's own refusal then says.
+fn passes(refused: &Refused) -> bool {
+    match refused {
+        Refused::Unreachable(_) | Refused::Slow => true,
+        Refused::Status(status) => *status >= 500,
+        refused => refused.code() == Some(Code::SignedOut),
+    }
+}
 
 /// One open document's line to its server. The window feeds it whatever happens, each time with the time
 /// in milliseconds on its own clock, and does what comes back.
@@ -253,15 +356,40 @@ pub struct Line {
     denied: bool,
     /// Why the server will open no socket for this document, however often it is asked.
     ended: Option<Refusal>,
+    handing: Arc<Handing>,
+    /// Whether a thread is handing pictures over while the line is live.
+    hands: bool,
+    /// When to try that again, after the server could not be given them.
+    hand_at: Option<u64>,
 }
 
 impl Line {
-    /// The line of the document `opened`, which does nothing until [`Line::start`]. `tell` is called
-    /// when a socket has something to say, which is then handed to [`Line::heard`].
-    pub fn new(session: Arc<Session>, opened: &Opened, roots: Roots, tell: Tell) -> Self {
+    /// The line of the document `opened`, whose copy on this device is the file at `copy`. It does nothing
+    /// until [`Line::start`]. `tell` is called when there is something for [`Line::heard`].
+    pub fn new(session: Arc<Session>, opened: &Opened, copy: &Path, roots: Roots, tell: Tell) -> Self {
         let address = session.server().socket(&opened.socket);
         let sync = Syncing::new(opened.id.clone());
-        Self { session, address, roots, sync, socket: None, sockets: 0, tell, denied: false, ended: None }
+        let handing = Arc::new(Handing {
+            session: session.clone(),
+            id: opened.id.clone(),
+            copy: copy.to_owned(),
+            owed: Mutex::default(),
+            turn: Mutex::default(),
+        });
+        Self {
+            session,
+            address,
+            roots,
+            sync,
+            socket: None,
+            sockets: 0,
+            tell,
+            denied: false,
+            ended: None,
+            handing,
+            hands: false,
+            hand_at: None,
+        }
     }
 
     /// The session the line asks its server with.
@@ -286,8 +414,23 @@ impl Line {
         self.socket = None;
     }
 
-    /// The socket of this number had something to say.
-    pub fn heard(&mut self, socket: u64, heard: Heard, local: Local<'_>, now: u64) -> Vec<Told> {
+    /// A picture came into the document here, under this name. Say so before [`Line::changed`] hears of
+    /// the edit that names it: the server is handed the picture first.
+    pub fn keep(&mut self, name: &str, bytes: Vec<u8>) {
+        self.handing.owed().pictures.insert(name.to_owned(), bytes);
+    }
+
+    /// What `tell` was called with.
+    pub fn heard(&mut self, said: Said, local: Local<'_>, now: u64) -> Vec<Told> {
+        let (socket, heard) = match said {
+            Said::Socket(socket, heard) => (socket, heard),
+            Said::Handed => {
+                self.hands = false;
+                // What is still owed could not be handed over now.
+                self.hand_at = self.owes().then_some(now + HAND_AGAIN);
+                return self.changed(local, now);
+            }
+        };
         if socket != self.sockets {
             return Vec::new();
         }
@@ -295,6 +438,13 @@ impl Line {
             Heard::Open => {
                 self.denied = false;
                 self.sync.opened(local, now);
+            }
+            // A picture that came in since the socket was asked for is not with the server, and the
+            // handshake would send the edit that names it: the next socket hands it over first.
+            Heard::Frame(_) if self.sync.link() == Link::Connecting && self.owes() => {
+                self.socket = None;
+                self.sockets += 1;
+                self.sync.closed(now);
             }
             Heard::Frame(frame) => self.sync.received(&frame, local, now),
             Heard::Closed(closed) => {
@@ -319,8 +469,37 @@ impl Line {
 
     /// The document or its notes may have changed here, by the person or by a merge.
     pub fn changed(&mut self, local: Local<'_>, now: u64) -> Vec<Told> {
-        self.sync.changed(local, now);
+        // Edits wait for the pictures they may name.
+        if !self.hand(now) {
+            self.sync.changed(local, now);
+        }
         self.drain()
+    }
+
+    /// Whether the server is owed pictures.
+    fn owes(&self) -> bool {
+        !self.handing.owed().pictures.is_empty()
+    }
+
+    /// Whether pictures are still to be handed over, which a live line starts on here. One with no socket
+    /// hands them over before it opens the next.
+    fn hand(&mut self, now: u64) -> bool {
+        if self.hands {
+            return true;
+        }
+        if !self.owes() {
+            self.hand_at = None;
+            return false;
+        }
+        if matches!(self.sync.link(), Link::Live(_)) && self.hand_at.is_none_or(|at| at <= now) {
+            (self.hands, self.hand_at) = (true, None);
+            let (handing, tell) = (self.handing.clone(), self.tell.clone());
+            thread::spawn(move || {
+                let _ = handing.hand();
+                tell(Said::Handed);
+            });
+        }
+        true
     }
 
     /// The person's caret or selection moved.
@@ -332,12 +511,14 @@ impl Line {
     /// The time [`Line::wake_at`] named has come.
     pub fn tick(&mut self, now: u64) -> Vec<Told> {
         self.sync.tick(now);
+        self.hand(now);
         self.drain()
     }
 
     /// When to call [`Line::tick`] next. `None` when nothing is due.
     pub fn wake_at(&self) -> Option<u64> {
-        self.sync.wake_at()
+        let (sync, hand) = (self.sync.wake_at(), self.hand_at);
+        sync.zip(hand).map(|(sync, hand)| sync.min(hand)).or(sync).or(hand)
     }
 
     /// How the document stands to its server.
@@ -345,8 +526,12 @@ impl Line {
         self.ended.map_or_else(|| self.sync.link(), Link::Refused)
     }
 
+    /// Where the work written here is. Edits that wait for their pictures are on their way.
     pub fn progress(&self) -> Progress {
-        self.sync.progress()
+        match self.sync.progress() {
+            Progress::Saved if self.hands || self.owes() => Progress::Saving,
+            progress => progress,
+        }
     }
 
     /// Everyone else who has the document open.
@@ -356,7 +541,8 @@ impl Line {
 
     /// Does what the sync asks that is the line's own to do, and gives the rest.
     fn drain(&mut self) -> Vec<Told> {
-        let mut told = Vec::new();
+        let mut told: Vec<Told> =
+            std::mem::take(&mut self.handing.owed().unkept).into_iter().map(Told::Unkept).collect();
         while let Some(event) = self.sync.poll() {
             match event {
                 Event::Open => self.open(),
@@ -386,14 +572,16 @@ impl Line {
     fn open(&mut self) {
         self.sockets += 1;
         let (session, denied, number, tell) = (self.session.clone(), self.denied, self.sockets, self.tell.clone());
+        let handing = self.handing.clone();
         let token = move || {
-            let token = if denied { session.renewed() } else { session.token() };
+            // The pictures first: the handshake sends the edits that name them.
+            let token = handing.hand().and_then(|()| if denied { session.renewed() } else { session.token() });
             token.map_err(|refused| match refused.code() {
                 Some(Code::SignedOut) => Closed::Refused(401),
                 _ => Closed::Lost(refused.to_string()),
             })
         };
-        let heard = move |heard| tell(number, heard);
+        let heard = move |heard| tell(Said::Socket(number, heard));
         self.socket = Some(Socket::open(&self.address, token, &self.roots, MAX_FRAME, heard));
     }
 }

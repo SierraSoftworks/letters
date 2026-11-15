@@ -44,7 +44,7 @@ use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowAttributes
 use crate::chrome::{self, Buttons, Host};
 use crate::cli::{Format, Mode, Options};
 use crate::conflicts;
-use crate::connected::{self, Line, Reached, Told};
+use crate::connected::{self, Line, Reached, Said, Told};
 use crate::convert;
 use crate::copies;
 use crate::dictionaries;
@@ -66,7 +66,6 @@ use crate::remote::{self, Roots};
 use crate::server::Client;
 use crate::session::Session;
 use crate::settings;
-use crate::socket::Heard;
 use crate::trust::{self, Trusted};
 use crate::versions::Rests;
 use crate::words::{self, Words};
@@ -144,7 +143,7 @@ pub enum Event {
     /// and the document's copy on this device, or why there is neither.
     Reached(Option<WindowId>, Result<Box<(Arc<Session>, Reached)>, String>),
     /// The socket of this number, to the server of a window's document, has something to say.
-    Heard(WindowId, u64, Heard),
+    Heard(WindowId, Said),
     /// A picture of this name, which the copy of a window's document lacked, was asked of the document's
     /// server: its file, if the server had it.
     Brought(WindowId, String, Option<Vec<u8>>),
@@ -665,6 +664,9 @@ fn lies_at(folder: &Path, other: &Path) -> bool {
     real(folder) == real(other)
 }
 
+/// What the person is told of a picture the document's server would not take.
+const UNKEPT: &str = "The server did not take a picture, so the others who open this document will not see it.";
+
 /// What the bar says when asked to rename or move a server's document.
 const AT_ITS_SERVER: &str = "This document lives on a server, and is renamed and moved there.";
 /// What the Comment tool says of a server's document the person may only read.
@@ -790,6 +792,10 @@ impl DocWindow {
         for (name, bytes) in assets {
             if let Some(journal) = &mut self.journal {
                 journal.asset(&name, &bytes);
+            }
+            // The document's server is handed it before the edit that names it.
+            if let Some(remote) = &mut self.remote {
+                remote.line.keep(&name, bytes.clone());
             }
             self.assets.insert(name, bytes);
         }
@@ -1189,10 +1195,11 @@ impl DocWindow {
         now: Instant,
     ) {
         let (id, proxy) = (self.window.id(), proxy.clone());
-        let tell: connected::Tell =
-            Arc::new(move |socket, heard| drop(proxy.send_event(Event::Heard(id, socket, heard))));
+        let tell: connected::Tell = Arc::new(move |said| drop(proxy.send_event(Event::Heard(id, said))));
         let host = session.server().origin().trim_start_matches("https://").to_owned();
-        let line = Line::new(session, &reached.opened, Roots::System, tell);
+        let mut line = Line::new(session, &reached.opened, &reached.path, Roots::System, tell);
+        // What no save has put in the copy's file yet, the server may lack too.
+        self.assets.iter().for_each(|(name, bytes)| line.keep(name, bytes.clone()));
         // The copy is kept under the document's id, and is no file the person copied by hand or would
         // look for among their own, whatever else has its id.
         self.place.call(&reached.opened.name);
@@ -1273,12 +1280,12 @@ impl DocWindow {
         told
     }
 
-    /// A socket to the document's server had something to say.
-    fn heard(&mut self, socket: u64, heard: Heard, now: Instant) {
+    /// The line to the document's server was told something on another thread.
+    fn heard(&mut self, said: Said, now: Instant) {
         let Some(remote) = self.remote.as_mut() else { return };
         let (editor, ms) = (self.view.editor(), remote.ms(now));
         let local = Local { model: Some(editor.model()), notes: self.view.notes() };
-        let told = remote.line.heard(socket, heard, local, ms);
+        let told = remote.line.heard(said, local, ms);
         self.told(told, now);
     }
 
@@ -1324,6 +1331,7 @@ impl DocWindow {
                 }
                 // The work stays in the copy here. The person is told why it went no further.
                 Told::Refused(refusal) => self.view.set_notice(Some(&refusal.to_string())),
+                Told::Unkept(_) => self.view.set_notice(Some(UNKEPT)),
                 Told::Link | Told::Progress => stands = true,
                 // Said below, with where each of them is now.
                 Told::Peers => {}
@@ -3108,9 +3116,9 @@ impl ApplicationHandler<Event> for App {
             }
             Event::Gpu(None) => self.gpu = GpuState::Off,
             Event::Reached(asker, entered) => self.reached(event_loop, asker, entered, now),
-            Event::Heard(id, socket, heard) => {
+            Event::Heard(id, said) => {
                 if let Some(window) = self.windows.get_mut(&id) {
-                    window.heard(socket, heard, now);
+                    window.heard(said, now);
                     window.sync(now);
                 }
             }
