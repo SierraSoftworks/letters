@@ -1,0 +1,26 @@
+# What Letters may cost in time. `./scripts/budgets.sh` checks it on a release build, with 500 pages open.
+#
+# The budgets are those of the reference machine, a MacBook Pro with the M1 Pro: opening a document adds at
+# most 150 ms to the launch of an empty window, and a keystroke reaches its frame in 8 ms, 16 ms at p99. The
+# app holds them itself and fails a measurement that breaks one, on any machine.
+#
+# A CI runner is not that machine, so each kind has limits of its own here, set above what it measures by
+# the spread between its runs. A run over a limit has made Letters slower there. Find out why, and raise a
+# limit only for a cost that was chosen.
+
+# The launch here is of a window, on a display in memory with the CPU renderer. The others launch headless.
+[ubuntu-latest]
+launch_ms = 80
+keystroke_median_ms = 2.3
+keystroke_p99_ms = 6
+
+[macos-latest]
+launch_ms = 50
+keystroke_median_ms = 1.7
+keystroke_p99_ms = 5
+
+# Not measured yet: the tests do not pass on Windows.
+[windows-latest]
+launch_ms = 150
+keystroke_median_ms = 8
+keystroke_p99_ms = 16

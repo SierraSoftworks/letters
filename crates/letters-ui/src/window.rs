@@ -30,6 +30,7 @@ use crate::chrome::Chrome;
 use crate::code_copy::{self, CodeCopy};
 use crate::color::{fade, resolve, same};
 use crate::commands::{self, Act, Commanding, Commands, Entry};
+use crate::comment;
 use crate::contents::{self, Contents, Listing};
 use crate::context::{self, About, Context, Contexting};
 use crate::copying::{self, Copy, CopyFormat, Copying};
@@ -51,6 +52,7 @@ use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
 use crate::peek::{self, Peek, Peeks};
 use crate::pictures::{self, Linked, Linking, PictureState};
+use crate::presence::{Peer, Presence};
 use crate::previews::{self, LinkPreviewFound, Previewing, Previews};
 use crate::print::{Breaking, Paged, Print, Printing};
 use crate::refer::{Picking, Refer};
@@ -70,8 +72,8 @@ use crate::threads::{self, Said};
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::ui::{App, DRAG_SLOP, Idle, Keys, Ui};
 use crate::widgets::{
-    Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, Title, TopBar, banner, side_panel,
-    top_bar,
+    Banner, Button, ControlSize, Menu, MenuItem, Popover, Side, SidePanel, TextField, Title, Tone, TopBar, banner,
+    side_panel, top_bar,
 };
 use crate::words::WordLists;
 
@@ -139,6 +141,21 @@ pub enum SaveState {
     Edited,
 }
 
+/// How the window stands to the server that keeps its document, for a shell that syncs with one. The bar
+/// says the document is offline for all but [`Connection::Live`], whatever was last told of saving.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Connection {
+    /// The server is not reached. Changes are kept on this device.
+    Offline,
+    /// The server was asked and has not answered.
+    Connecting,
+    /// In session: [`SaveState`] says where the person's work is.
+    Live,
+    /// The server ended the session for a reason that waiting does not mend, told in a sentence that stands
+    /// by itself. A bar under the top bar says it, and offers another try with [`Request::Connect`].
+    Refused(String),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Panel {
     Styles,
@@ -165,6 +182,8 @@ pub enum Message {
     Panel(Panel),
     ClosePanel,
     Share(bool),
+    /// Brings the page to where someone else who has the document open is, by their session.
+    Visit(u64),
     /// Puts the caret at the start of a block and brings the block to the top of the page.
     Jump(BlockId),
     /// Opens the link editor at the caret.
@@ -433,6 +452,30 @@ impl Ui<EditorApp> {
 
     pub fn set_save_state(&mut self, state: SaveState) {
         self.app_mut().save = state;
+    }
+
+    /// Says how the window stands to the server that keeps the document: see [`Connection`]. `None` is
+    /// for a document that no server keeps, which is what a window takes its document for until told.
+    pub fn set_connection(&mut self, connection: Option<Connection>) {
+        if self.app().connection != connection {
+            self.app_mut().connection = connection;
+        }
+    }
+
+    /// Says who else has the document open: see [`Peer`]. Their faces stand on the bar, and the page shows
+    /// their carets and what they have selected, each in their colour. Each call replaces the list, so say
+    /// it again when someone comes, goes or moves, and once a merge has moved the text under them.
+    pub fn set_peers(&mut self, peers: Vec<Peer>) {
+        if !self.app().presence.is(&peers) {
+            self.app_mut().presence.set(peers);
+        }
+    }
+
+    /// The person's caret or selection, for a shell that tells it to the others who have the document
+    /// open. `None` while the page is not what shows, as in Print view and in the history.
+    pub fn selection(&self) -> Option<&Selection> {
+        let app = self.app();
+        app.editor.selection().filter(|_| !app.away())
     }
 
     /// The person's own words, which are right in every document: the lines of their dictionary file. A
@@ -711,30 +754,36 @@ impl Ui<EditorApp> {
     }
 
     /// Takes what the shell found of the page at `found.url`, in answer to a [`Request::FetchPreview`]:
-    /// its title, its description and its picture stand in place of what each link preview that waits
-    /// for the address had, as one step to undo. Nothing is taken by a preview that is gone or leads to
-    /// another address by now. A page that says nothing a card can show is told as a fetch that found
-    /// nothing.
+    /// its title, its description and its picture stand in place of what each link preview that leads
+    /// to the address had, and the document keeps them for the links in its text that lead there, as one
+    /// step to undo. Nothing is taken for an address that was not asked for, or that nothing leads to by
+    /// now. A page that says nothing a card can show is told as a fetch that found nothing.
     pub fn fill_preview(&mut self, found: LinkPreviewFound, platform: &mut dyn Platform) {
         if !found.says() {
             return self.fail_preview(&found.url, Previews::nothing());
         }
         let app = self.app_mut();
-        for block in app.previews.answered(&found.url, None) {
-            let LinkPreviewFound { url, title, description, picture } = found.clone();
-            let command = Command::Preview { block, edit: PreviewEdit::Fetched { url, title, description, picture } };
-            // The answer comes when it comes: the page stays where the person has it.
-            let change = app.run(platform, |editor, platform| editor.run(command, platform));
-            app.follow(&change);
+        if !app.previews.answered(&found.url, None) {
+            return;
         }
+        let LinkPreviewFound { url, title, description, picture } = found;
+        let command = Command::Fetched { url, title, description, picture };
+        // The answer comes when it comes: the page stays where the person has it.
+        let change = app.run(platform, |editor, platform| editor.run(command, platform));
+        app.follow(&change);
     }
 
     /// Says whether this shell can fetch what a page says of itself, which it can until told otherwise.
     /// Where it cannot, no [`Request::FetchPreview`] is raised and nothing offers one: a link preview that
-    /// shows its address alone has no "Fetch preview", and its card no button for it. What the document
-    /// keeps of a page shows as it does anywhere.
+    /// shows its address alone has no "Fetch preview" and keeps no room for it, its card has no button for
+    /// it, and an address put on a line of its own stays a link in the text. What the document keeps of a
+    /// page shows as it does anywhere.
     pub fn set_preview_fetching(&mut self, offered: bool) {
-        self.app_mut().previews.offer(offered);
+        let app = self.app_mut();
+        app.previews.offer(offered);
+        app.editor.set_preview_fetching(offered);
+        // A card that gives up the room of its control, or takes it again, leaves what is read where it is.
+        app.held(|app| app.layout.set_preview_control(offered));
     }
 
     /// Says that the page at an address was not fetched and why, in a few words that read on from
@@ -854,6 +903,17 @@ impl Lines for DocLines<'_> {
     }
 }
 
+/// The card of a link in the text as it was drawn.
+struct Peeked {
+    /// What it says, for someone who cannot see it.
+    said: String,
+    rect: Rect,
+    /// Its button, when it has one to press.
+    button: Option<Rect>,
+    /// The pictures it shows that are not here yet.
+    awaited: Vec<String>,
+}
+
 /// Lends the editor the shell's platform together with the laid-out lines.
 struct Lent<'a> {
     platform: &'a mut dyn Platform,
@@ -954,6 +1014,10 @@ pub struct EditorApp {
     /// Whether keys follow macOS conventions, which is how the menus then write them.
     mac: bool,
     save: SaveState,
+    /// How the window stands to the server that keeps the document, when one does.
+    connection: Option<Connection>,
+    /// Who else has the document open.
+    presence: Presence,
     edits: u64,
     panel: Option<Panel>,
     sharing: bool,
@@ -1063,6 +1127,8 @@ impl EditorApp {
             copy_asked: None,
             mac: cfg!(target_os = "macos"),
             save: SaveState::default(),
+            connection: None,
+            presence: Presence::default(),
             edits: 0,
             panel: None,
             sharing: false,
@@ -1243,7 +1309,7 @@ impl EditorApp {
         let mut hasher = DefaultHasher::new();
         let differs = self.styles.differs(self.editor.model().style());
         let chrome = (self.chrome.buttons.len(), self.chrome.inset_start.to_bits());
-        (width.to_bits(), self.name(), style, differs, chrome).hash(&mut hasher);
+        (width.to_bits(), self.name(), style, differs, chrome, self.presence.shown()).hash(&mut hasher);
         let key = hasher.finish();
         if key != self.folded.key {
             self.folded = Folded { key, form: None, seen: Fitted::default() };
@@ -1522,9 +1588,13 @@ impl EditorApp {
         self.margin.now = platform.wall_time().map(notes::stamp).unwrap_or_default();
         let opens = matches!(asked, Noting::Open(_) | Noting::Press(_));
         match asked {
-            // What is typed changes nothing but itself.
-            Noting::Draft(text) => return self.margin.typed(text),
-            Noting::Reply(text) => return self.margin.reply(text),
+            // What is written in the field changes nothing but itself.
+            Noting::Wrote(asked) => {
+                let Some((written, row)) = self.margin.written() else { return };
+                let layout = self.said.layout(self.palette);
+                let desk = comment::Desk { keys: self.editor.keymap(), layout, width: comment::width(row) };
+                return written.does(asked, desk, platform);
+            }
             Noting::Away => self.margin.put_away(self.editor.selection()),
             Noting::Write => {
                 self.margin.write(self.editor.model(), self.editor.selection());
@@ -2439,7 +2509,12 @@ impl EditorApp {
             left: left.unwrap_or_default(),
         };
         let mut lent = Lent { platform, lines };
-        act(&mut self.editor, &mut lent)
+        let change = act(&mut self.editor, &mut lent);
+        // The page of an address the writer just put in is asked for at once, as a link or as a card.
+        for url in self.editor.take_unfetched() {
+            self.fetch(url);
+        }
+        change
     }
 
     /// Brings the layout and the viewport up to date after the editor did something.
@@ -2458,6 +2533,7 @@ impl EditorApp {
             self.estimated = true;
         }
         if edited {
+            self.previews.edited();
             // What the pointer rested on may be gone, or somewhere else.
             self.unpoint();
             self.highlight((!change.structure).then_some(&change.blocks));
@@ -2658,38 +2734,60 @@ impl EditorApp {
         let at = self.in_layout(at);
         let cards = self.layout.previews(Rect::new(at.x, at.y, 0.0, 1.0));
         let card = cards.into_iter().find(|card| card.rect.contains(at))?;
-        let room = card.control.filter(|_| self.previews.offered());
-        let on_control = room.is_some_and(|room| previews::control(room).contains(at));
+        let on_control = card.control.is_some_and(|room| previews::control(room).contains(at));
         Some((card.block, on_control))
     }
 
-    /// The link in text at a point of the page area whose page the document keeps something of, while
-    /// nothing hangs over the page.
+    /// What the document keeps of the page at an address, when it keeps anything.
+    fn kept(&self, url: &str) -> Option<&letters_model::Preview> {
+        self.editor.doc().previews.get(url).filter(|kept| !kept.is_empty())
+    }
+
+    /// Whether a fetch of the page at an address is offered: the shell fetches, and it is a web page's.
+    fn fetchable(&self, url: &str) -> bool {
+        self.previews.offered() && previews::web(url)
+    }
+
+    /// The link in text at a point of the page area that has a card to show, while nothing hangs over the
+    /// page: one whose page the document keeps something of, or whose page can be fetched.
     fn peek_at(&self, at: Point) -> Option<Peek> {
         if self.hung() || self.away() || self.dragging {
             return None;
         }
-        let doc = self.editor.doc();
-        let (url, line) = safe::link_line_at(doc, &self.layout, self.in_layout(at))?;
-        doc.previews.get(&url).is_some_and(|kept| !kept.is_empty()).then_some(Peek { url, line })
+        // A card with a button stays while the pointer is on it, or on its way there from the link.
+        if let Some(held) = self.peeks.held(at) {
+            return Some(held.clone());
+        }
+        let (block, url, line) = safe::link_line_at(self.editor.doc(), &self.layout, self.in_layout(at))?;
+        (self.kept(&url).is_some() || self.fetchable(&url)).then_some(Peek { block, url, line })
     }
 
-    /// Draws what the document keeps of the page of the link under the pointer, in a card beside the
-    /// link. `room` is the size of the page area. Returns what the card says, where it is, and the
-    /// pictures it waits for.
-    fn peek(&self, room: Size, out: &mut DisplayList) -> Option<(String, Rect, Vec<String>)> {
-        let Peek { url, line } = self.peeks.shown()?.clone();
+    /// Draws the card of the link under the pointer beside the link: what the document keeps of its page,
+    /// or the fetch of a page it keeps nothing of. `room` is the size of the page area. Returns what the
+    /// card says, where it and its button are, and the pictures it waits for.
+    fn peek(&self, room: Size, out: &mut DisplayList) -> Option<Peeked> {
+        let Peek { url, line, .. } = self.peeks.shown()?.clone();
         let anchor = self.onto(line);
-        let kept = self.editor.doc().previews.get(&url)?;
+        let kept = self.kept(&url);
+        let offer = (kept.is_none() && self.fetchable(&url)).then(|| peek::Offer {
+            says: self.previews.says(&url),
+            waits: self.previews.waits(&url),
+            failed: self.previews.failed(&url),
+            aimed: self.peeks.aimed(),
+        });
+        if kept.is_none() && offer.is_none() {
+            return None;
+        }
         let size = |image: &Image| (image.width(), image.height());
-        let picture = kept.image.as_deref().and_then(|asset| self.images.get(asset)).map(size);
-        let card = peek::Card { url: &url, kept, picture, anchor, room };
+        let image = kept.and_then(|kept| kept.image.as_deref());
+        let picture = image.and_then(|asset| self.images.get(asset)).map(size);
+        let card = peek::Card { url: &url, kept, picture, offer, anchor, room };
         let mut drawn = DisplayList::default();
-        let rect = card.paint(self.shaper.as_ref(), self.scheme, &mut drawn);
+        let (rect, button) = card.paint(self.shaper.as_ref(), self.scheme, &mut drawn);
         // A picture that is not here yet has its place kept.
         let awaited = pictures::awaited(&self.images, self.scheme, &mut drawn);
         out.items.extend(drawn.items);
-        Some((card.said(), rect, awaited))
+        Some(Peeked { said: card.said(), rect, button, awaited })
     }
 
     /// The address a link preview leads to.
@@ -2697,12 +2795,18 @@ impl EditorApp {
         self.editor.doc().block(preview).and_then(|block| previews::address(&block.kind))
     }
 
-    /// Asks the shell for what the page of a link preview says of itself, unless its address is being
-    /// fetched already.
-    fn fetch_preview(&mut self, preview: &BlockId) {
-        let Some(url) = self.address_of(preview).map(str::to_owned) else { return };
-        if self.previews.fetch(preview, &url) {
+    /// Asks the shell for what the page at an address says of itself, unless it is being fetched already.
+    fn fetch(&mut self, url: String) {
+        if self.previews.fetch(&url) {
             self.requests.push(Request::FetchPreview { url });
+        }
+    }
+
+    /// Asks for the page of a link preview, or of the link in the text whose card shows in that block.
+    fn fetch_preview(&mut self, block: &BlockId) {
+        let shown = self.peeks.shown().filter(|peek| peek.block == *block).map(|peek| peek.url.clone());
+        if let Some(url) = self.address_of(block).map(str::to_owned).or(shown) {
+            self.fetch(url);
         }
     }
 
@@ -2723,15 +2827,10 @@ impl EditorApp {
                     let command = Command::Preview { block, edit: PreviewEdit::Url(url) };
                     self.edit(platform, |editor, platform| editor.run(command, platform));
                 }
+                // The card that is put in shows what the document keeps of its page. When that is nothing
+                // it shows its address alone, and its page is asked for at once, as for every address put in.
                 Some((None, url)) => {
-                    let change =
-                        self.run(platform, |editor, platform| editor.run(Command::InsertPreview(url), platform));
-                    self.changed(&change);
-                    // The card that was put in shows its address alone, and its page is asked for at once.
-                    let new = change.blocks.iter().find(|block| self.address_of(block).is_some()).cloned();
-                    if let Some(new) = new {
-                        self.fetch_preview(&new);
-                    }
+                    self.edit(platform, |editor, platform| editor.run(Command::InsertPreview(url), platform));
                 }
                 None => {}
             },
@@ -2745,6 +2844,7 @@ impl EditorApp {
                     self.fetch_preview(&preview);
                 }
             }
+            Previewing::FetchLink(url) => self.fetch(url),
             Previewing::Close => self.previews.close(),
         }
     }
@@ -2754,6 +2854,26 @@ impl EditorApp {
         (self.link, self.spelling.fix, self.linked.open, self.captions.alt) = (None, None, None, None);
         self.contents.open = None;
         self.previews.close();
+    }
+
+    /// Brings the page to where someone else is, with their caret in the middle of it. The person's own
+    /// caret stays where it stands.
+    fn visit(&mut self, session: u64) {
+        let Some(head) = self.presence.visit(session) else { return };
+        // Twice, since laying out what comes into view can move the line.
+        for _ in 0..2 {
+            let Some(line) = self.layout.caret(&head) else { break };
+            let middle = self.down(line.y) + TOP + (line.height - self.height) / 2.0;
+            self.scroll = middle.clamp(0.0, self.max_scroll());
+            self.layout.settle(self.viewport(), 0);
+        }
+    }
+
+    /// The bar that says why a server ended the session, with the button that asks it again.
+    fn refused(&self) -> Option<Element<Message>> {
+        let Some(Connection::Refused(why)) = &self.connection else { return None };
+        let again = Button::new("Try again").small().on_press(Message::Ask(Request::Connect));
+        Some(Banner::new(why.as_str()).tone(Tone::Warn).icon(icon::CLOUD_OFF).action(again).into())
     }
 
     /// Puts the caret at the start of a block and brings the block to the top of the page.
@@ -3000,6 +3120,7 @@ impl EditorApp {
         let called = (std::mem::replace(&mut self.previews.over, carded.clone()) != carded) || called;
         let peeked = self.references.rest().and_then(|at| self.peek_at(at));
         let called = self.peeks.point(peeked) || called;
+        let called = self.peeks.aim(self.references.rest()) || called;
         let linked = self.references.rest().and_then(|at| self.linked_at(at));
         // Each is taken, whichever changed.
         let clouded = self.linked.point(linked);
@@ -3018,6 +3139,8 @@ impl EditorApp {
         self.margin.over = marker;
         let part = rest.and_then(|at| self.table_part(at)).map(|(_, part)| part);
         let tabled = self.tables.point(part);
+        let peer = rest.and_then(|at| self.presence.at(&self.layout, self.in_layout(at), self.viewport()));
+        let called = self.presence.point(peer) || called;
         self.references.point(found) || copy || clouded || gripped || switched || marked || tabled || called
     }
 
@@ -3095,6 +3218,16 @@ impl EditorApp {
                             self.unpoint();
                         }
                     };
+                }
+                // A press on the card of a link in the text is the card's: on its button it fetches the
+                // link's page, and elsewhere it does nothing.
+                if let Some(held) = self.peeks.held(at).cloned() {
+                    self.dragging = false;
+                    self.references.press(None);
+                    if self.peeks.aimed() {
+                        self.fetch(held.url);
+                    }
+                    return;
                 }
                 // A press on a link preview opens its card, and one on its control fetches its page. With
                 // Ctrl or Cmd held the preview is a link like any other.
@@ -3486,7 +3619,7 @@ impl EditorApp {
         }
         // A preview says under its address why its page was not fetched, for as long as that holds. A line
         // that comes or goes above the view leaves what is read where it is.
-        let notes = self.previews.notes();
+        let notes = self.previews.notes(self.editor.doc());
         if !notes.is_empty() {
             self.held(|page| {
                 for (preview, note) in &notes {
@@ -3553,6 +3686,7 @@ impl EditorApp {
                 list.items.extend(spans.into_iter().map(|rect| fill(rect, color)));
             }
         }
+        self.presence.wash(&self.layout, viewport, self.scheme, &mut list);
         self.layout.paint(viewport, &mut list);
         // A picture the shell has not handed over is asked for once, and its place is kept until it comes.
         for asset in pictures::awaited(&self.images, self.scheme, &mut list) {
@@ -3590,9 +3724,9 @@ impl EditorApp {
             }
         }
         for card in self.layout.previews(viewport) {
-            if let Some(room) = card.control.filter(|_| self.previews.offered()) {
+            if let Some((room, url)) = card.control.zip(self.address_of(&card.block)) {
                 let at = previews::control(room);
-                self.previews.paint(&card.block, at, self.shaper.as_ref(), self.scheme, &mut list);
+                self.previews.paint((&card.block, url), at, self.shaper.as_ref(), self.scheme, &mut list);
             }
             if self.previews.open.as_ref() == Some(&card.block) {
                 list.items.push(ring(card.rect, (RING, RING)));
@@ -3672,6 +3806,9 @@ impl EditorApp {
             Some(((figure, _), None)) => references::mark(figure, self.scheme, &mut list),
             None => {}
         }
+        // The others' carets lie over all that is the page's own. A name keeps inside the page area.
+        let reach = (viewport, room.width - left - tokens::SPACE_XS);
+        self.presence.carets(&self.layout, reach, self.shaper.as_ref(), self.scheme, &mut list);
         // What stands round the two versions of the conflict that is open, and the one held back.
         let (mut under, mut over) = (DisplayList::default(), DisplayList::default());
         let (cut, shift) = (self.cut(), self.shift());
@@ -3689,9 +3826,9 @@ impl EditorApp {
             review::cuts(cut, shift, room)
         });
         self.previewed = self.preview(room, &mut over);
-        if self.previewed.is_none()
-            && let Some((said, rect, awaited)) = self.peek(room, &mut over)
-        {
+        let peeked = if self.previewed.is_none() { self.peek(room, &mut over) } else { None };
+        self.peeks.drew(peeked.as_ref().map(|peeked| (peeked.rect, peeked.button)));
+        if let Some(Peeked { said, rect, awaited, .. }) = peeked {
             // The card's picture is the document's own, asked for once like any other the page shows.
             for asset in awaited {
                 if self.wanted.insert(asset.clone()) {
@@ -3792,7 +3929,7 @@ impl EditorApp {
             let cards = self.layout.previews(viewport);
             let shown = cards.into_iter().find(|card| card.block == *preview).map(|card| self.onto(card.rect));
             let spot = shown.or(caret).unwrap_or_default();
-            if let Some(card) = self.previews.card(preview, kind, spot) {
+            if let Some(card) = self.previews.card(kind, spot) {
                 element = element.popover(card);
             }
         } else if let Some(context) = &self.context {
@@ -3814,8 +3951,9 @@ impl EditorApp {
             let row = row.child(Element::from(field).grow(1.0)).child(open);
             // What the document keeps of the page there is read here too, by someone with no pointer.
             let mut card = Element::column().gap(tokens::SPACE_SM).width(LINK_WIDTH).child(row);
-            if let Some(kept) = self.editor.doc().previews.get(address.trim()) {
-                let quiet = TextStyle::control().size(tokens::TEXT_SM);
+            let (url, quiet) = (address.trim(), TextStyle::control().size(tokens::TEXT_SM));
+            let kept = self.kept(url);
+            if let Some(kept) = kept {
                 let lines =
                     [(&kept.title, tokens::FG, quiet.weight(600)), (&kept.description, tokens::FG_MUTED, quiet)];
                 let said = lines.into_iter().filter_map(|(line, ink, style)| {
@@ -3823,6 +3961,17 @@ impl EditorApp {
                     Some(Element::paragraph(said, style).fg(ink).max_width(LINK_WIDTH))
                 });
                 card = card.child(Element::column().gap(tokens::SPACE_XS).children(said));
+            }
+            // The page of the link as it is written can be fetched from here, for the first time or again.
+            if self.editor.link() == Some(url) && self.fetchable(url) {
+                if let Some(failed) = self.previews.failed(url) {
+                    let said = Element::paragraph(failed, quiet).fg(tokens::DANGER).max_width(LINK_WIDTH);
+                    card = card.child(said.role(Role::Status));
+                }
+                let fetch = Button::new(self.previews.asks(url, kept.is_some())).small();
+                let fetch = fetch.disabled(self.previews.waits(url));
+                let fetch = fetch.on_press(Message::Preview(Previewing::FetchLink(url.to_owned())));
+                card = card.child(Element::row().child(fetch));
             }
             let editor = Popover::new(card)
                 .label("Link")
@@ -3836,14 +3985,23 @@ impl EditorApp {
             // top of the margin its marker stood in.
             let under = self.note_lines(note).map(|(_, last)| self.onto(last));
             let ways = (self.margin.follows(), self.put_back().is_some());
+            let layout = self.said.layout(self.palette);
+            let desk = comment::Desk { keys: self.editor.keymap(), layout, width: comment::width(threads::WIDTH) };
+            let look = (self.palette.selection, self.shaper.as_ref() as &dyn TextShaper);
+            let field = reply.field(desk, look, ("Reply", "Reply"), Noting::Answer);
             let said = self.said.of(note, threads::SAID, self.palette);
             let (now, refused) = (self.margin.now.as_str(), self.margin.refused.as_deref());
-            let thread = threads::thread(note, reply, said, now, refused, ways);
+            let thread = threads::thread(note, (field, reply.is_blank()), said, now, refused, ways);
             element = element.popover(match under {
                 Some(under) => thread.at(under),
                 None => thread.at(Rect::new(room.width - GUTTER, GUTTER, 0.0, 0.0)).align(Align::End),
             });
-        } else if let Some((field, passage)) = self.margin.field().zip(self.margin.writing()) {
+        } else if let Some((draft, passage)) = self.margin.drafted().zip(self.margin.writing()) {
+            let layout = self.said.layout(self.palette);
+            let desk = comment::Desk { keys: self.editor.keymap(), layout, width: comment::width(notes::WIDTH) };
+            let look = (self.palette.selection, self.shaper.as_ref() as &dyn TextShaper);
+            let field = draft.field(desk, look, ("Comment", "Comment on this"), Noting::Send);
+            let field = self.margin.field(field.takes_focus()).expect("a comment is being written");
             // The field hangs under the last line of the passage the comment is about.
             let lines = notes::stretch(passage).map(|passage| self.layout.selection(&passage)).unwrap_or_default();
             let under = lines.last().copied().unwrap_or_default();
@@ -3876,7 +4034,7 @@ impl EditorApp {
         let pressable = pressable || self.captions.over || self.margin.over.is_some() || self.review.pressable();
         let pressable = pressable || self.tables.pointed();
         let pressable = pressable || self.callouts.over.is_some() || self.languages.over.is_some();
-        let pressable = pressable || self.contents.pointed() || self.previews.over.is_some();
+        let pressable = pressable || self.contents.pointed() || self.previews.over.is_some() || self.peeks.aimed();
         match self.grip.corner() {
             Some(corner) => element.cursor(Cursor::Resize(figures::edge(corner))),
             None if pressable => element.cursor(Cursor::Pointer),
@@ -4118,6 +4276,9 @@ impl EditorApp {
         if let Some(badge) = self.safe.badge() {
             bar = bar.end(badge);
         }
+        if let Some(faces) = self.presence.faces() {
+            bar = bar.end(faces);
+        }
         bar = bar.end(Button::new("Share").icon(icon::USERS).small().on_press(Message::Share(true)).popover(share));
         bar = bar.end(TopBar::rule());
         let mut panels = cluster();
@@ -4156,13 +4317,23 @@ impl EditorApp {
         let name = if own { name } else { name.fg(tokens::FG_MUTED) };
         let mut lead = vec![page, name];
 
+        // Nothing reaches a server the window is not in session with, whatever was last said of saving.
+        let apart = self.connection.as_ref().filter(|connection| **connection != Connection::Live);
+        let save = match self.save {
+            SaveState::Saved | SaveState::Saving if apart.is_some() => SaveState::Offline,
+            save => save,
+        };
         // How saving stands is an icon of one size whatever it says, so that nothing after it moves when
         // saving starts. A document not yet written keeps the room.
-        let (state, said, more, ink) = match self.save {
+        let (state, said, more, ink) = match save {
             SaveState::Saved => (icon::CLOUD_CHECK, "Saved", None, tokens::FG_MUTED),
             SaveState::Saving => (icon::REFRESH_CW, "Saving", None, tokens::FG_MUTED),
             SaveState::Offline => {
-                (icon::CLOUD_OFF, "Offline", Some("Changes are kept on this device"), tokens::FG_MUTED)
+                let kept = Some("Changes are kept on this device");
+                match apart {
+                    Some(Connection::Connecting) => (icon::CLOUD, "Connecting", kept, tokens::FG_MUTED),
+                    _ => (icon::CLOUD_OFF, "Offline", kept, tokens::FG_MUTED),
+                }
             }
             SaveState::Failed => {
                 (icon::CLOUD_ALERT, "Not saved", Some("The last changes could not be written"), tokens::DANGER)
@@ -4184,7 +4355,7 @@ impl EditorApp {
             }
         };
         // For a moment after its first write, the icon tells where the document went.
-        let note = self.note.as_ref().filter(|_| self.save == SaveState::Saved);
+        let note = self.note.as_ref().filter(|_| save == SaveState::Saved);
         let said = note.map_or_else(|| said.to_owned(), |(note, _)| note.clone());
         let tip = more.map_or_else(|| said.clone(), |more| format!("{said}. {more}"));
         let mut saved = Element::icon(state, SAVE_ICON)
@@ -4762,6 +4933,7 @@ impl EditorApp {
             }
             Message::ClosePanel => self.show(None),
             Message::Share(open) => self.sharing = open,
+            Message::Visit(session) => self.visit(session),
             Message::Correct(text) => {
                 self.context = None;
                 let Some(fix) = self.spelling.fix.take() else { return };
@@ -4921,6 +5093,7 @@ impl App for EditorApp {
         // A floating window that Letters frames has a border, which everything else stands inside.
         let border = self.chrome.border();
         let window = Size { width: window.width - 2.0 * border, height: window.height - 2.0 * border };
+        self.presence.fit(window.width);
         self.refold(window.width);
         // Print view has the window to itself: the panels and the outline are for editing. The history
         // has its versions listed where a panel would be.
@@ -4940,6 +5113,9 @@ impl App for EditorApp {
         // the page.
         let bar = self.chrome.bar_height.unwrap_or(top_bar::HEIGHT) + self.safe.height() + told;
         let bar = bar + self.merges.height();
+        // So does what a server said when it ended the session.
+        let refused = self.refused();
+        let bar = bar + if refused.is_some() { banner::HEIGHT } else { 0.0 };
         // The history has a strip of its versions under the page and the panel.
         let strip = self.history.as_ref().map(History::strip);
         let foot = if strip.is_some() { history::STRIP } else { 0.0 };
@@ -4967,7 +5143,7 @@ impl App for EditorApp {
         let over = over.chain(commands);
         // It comes first, so that whatever else opens lies over it and is the first that Escape puts away.
         let all = Element::column().bg(tokens::BG).fg(tokens::FG).children(find);
-        let all = all.child(self.bar()).children(self.safe.bar()).children(self.merges.bar());
+        let all = all.child(self.bar()).children(refused).children(self.safe.bar()).children(self.merges.bar());
         let all = all.children(conflicts).child(body).children(strip).children(over);
         if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
     }
@@ -4995,7 +5171,17 @@ impl App for EditorApp {
         if let Some(history) = &self.history {
             return history.describe(told, whole, page, nodes);
         }
-        describe::page(self.editor.doc(), self.editor.selection(), told, whole, page, nodes);
+        // What the page shows of a block that is not its text is told with the block: why the page of a
+        // link preview was not fetched, and how a linked picture that does not show is doing.
+        let mut said: HashMap<BlockId, String> = self.previews.noted().clone().into_iter().collect();
+        if self.linked.says() {
+            let state = |block: &Block| {
+                let src = pictures::link(block)?;
+                Some((block.id.clone(), pictures::says(src, Some(self.linked.said(src)?))))
+            };
+            said.extend(self.editor.doc().walk().filter_map(state));
+        }
+        describe::page(self.editor.doc(), self.editor.selection(), &said, told, whole, page, nodes);
         if let Some((caption, rect)) = &self.previewed {
             describe::preview(caption, *rect, page, nodes);
         }
@@ -5015,11 +5201,18 @@ impl App for EditorApp {
         for card in self.layout.previews(view) {
             let at = self.onto(card.rect);
             describe::whole(&card.block, Whole::Preview, (previews::LABEL, None), at, page, nodes);
-            if let Some(room) = card.control.filter(|_| self.previews.offered()) {
-                let failed = self.previews.failed(&card.block);
-                let told = (self.previews.says(&card.block), failed.as_deref());
+            if let Some((room, url)) = card.control.zip(self.address_of(&card.block)) {
+                let failed = self.previews.failed(url);
+                let told = (self.previews.says(url), failed.as_deref());
                 describe::whole(&card.block, Whole::Fetch, told, self.onto(previews::control(room)), page, nodes);
             }
+        }
+        // The button on the card of a link in the text, which fetches the link's page.
+        let offered = self.peeks.shown().filter(|peek| !self.previews.waits(&peek.url));
+        if let Some((peek, button)) = offered.zip(self.peeks.button()) {
+            let failed = self.previews.failed(&peek.url);
+            let told = (self.previews.says(&peek.url), failed.as_deref());
+            describe::whole(&peek.block, Whole::Fetch, told, button, page, nodes);
         }
         if let Some(shown) = self.table() {
             for (part, at) in shown.parts() {
@@ -5204,7 +5397,8 @@ impl App for EditorApp {
         let copied = self.code_copy.animate(now_ms);
         let slid = self.review.animate(now_ms);
         let rested = self.peeks.animate(now_ms);
-        [note, slide, fade, light, copied, slid, rested].into_iter().flatten().min()
+        let named = self.presence.animate(now_ms);
+        [note, slide, fade, light, copied, slid, rested, named].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {

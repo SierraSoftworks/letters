@@ -19,7 +19,7 @@ use crate::conflict::{self, Conflict};
 use crate::crdt::{self, Assign, Event, attrs};
 use crate::doc::line;
 use crate::flat::{self, BLOCK, DEPTH, Entry, Flat, children, head, insert, marker, nth, nth_mut, spell};
-use crate::history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
+use crate::history::{Extent, HistoryError, Hold, ReplicaId, Revision, StablePos};
 use crate::undo::{Delta, Edit, Script, Step, Steps, is_skip};
 use crate::versions::{self, Point, Tag, TagKind};
 use crate::{
@@ -803,8 +803,24 @@ impl Model {
         self.loro().export(ExportMode::updates(&from)).expect("a history can always be written out")
     }
 
+    /// How far this history has read each of its writers. A replica that is told answers with
+    /// [`Model::updates_for`], so that two replicas trade only what each lacks.
+    pub fn extent(&self) -> Extent {
+        Extent(self.loro().oplog_vv())
+    }
+
+    /// What this replica holds beyond `extent`, for the replica that told it. Unlike
+    /// [`Model::updates_since`], the other replica may hold edits that this one lacks.
+    pub fn updates_for(&self, extent: &Extent) -> Vec<u8> {
+        self.loro().export(ExportMode::updates(&extent.0)).expect("a history can always be written out")
+    }
+
     /// Takes in what another replica wrote. Merging is commutative and idempotent: replicas that have seen
     /// the same edits show the same document, and a merge that adds nothing changes nothing.
+    ///
+    /// An update that builds on edits this history lacks changes nothing yet. It waits, in memory only, and
+    /// lands when those edits arrive. Until then [`Model::extent`] does not cover it and [`Model::save`]
+    /// does not hold it, so a replica that must not lose it asks for what is missing by its extent.
     pub fn merge(&mut self, history: &[u8]) -> Result<Change, HistoryError> {
         self.loro().import(history).map_err(unreadable)?;
         Ok(self.drain())

@@ -26,6 +26,11 @@ letters-fonts.workspace = true
 letters-math.workspace = true
 letters-spell.workspace = true
 letters-trust.workspace = true
+# What the server behind a page says, and where it is asked.
+letters-api.workspace = true
+serde_json.workspace = true
+# The document's line to its server: what to send over the page's socket, and what to merge.
+letters-sync.workspace = true
 
 accesskit.workspace = true
 wasm-bindgen.workspace = true
@@ -33,6 +38,7 @@ wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 web-sys = { workspace = true, features = [
   "Blob",
+  "BinaryType",
   "BlobPropertyBag",
   "CanvasRenderingContext2d",
   "ClipboardEvent",
@@ -62,14 +68,17 @@ web-sys = { workspace = true, features = [
   "KeyboardEvent",
   "Location",
   "MediaQueryList",
+  "MessageEvent",
   "MouseEvent",
   "Navigator",
   "Node",
   "Performance",
   "PointerEvent",
+  "RequestInit",
   "Response",
   "Storage",
   "Url",
+  "WebSocket",
   "WheelEvent",
   "Window",
   "console",
@@ -88,6 +97,7 @@ crate-type = ["cdylib"]
 [dev-dependencies]
 letters-format.workspace = true
 letters-layout.workspace = true
+letters-test.workspace = true
 zip.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

@@ -1,0 +1,168 @@
+//! The Letters server: it maps the people an identity provider signs in onto folders of documents, and
+//! keeps only the state that files cannot hold.
+//!
+//! - [`config`] is the settings file, and [`store`] the state directory.
+//! - [`session`] says who is asking, [`oidc`] asks the identity provider who signs in, and [`auth`] is
+//!   the way from one to the other.
+//! - [`spaces`] is the only way to a file, and cannot leave a space's folder.
+//! - [`library`] lists a space and finds a document by its id, wherever its file was moved to.
+//! - [`api`] answers the interface `letters_api` lays down.
+//! - [`rooms`] are the documents that are open now, and [`socket`] is each device's line to one.
+//! - [`pages`] are the server's own pages for a browser: the documents a person reaches, and one to read.
+//!
+//! A document's content lives in its `.let` file alone. Whatever else writes that file, over a share or
+//! with a sync tool, is another writer like the server, and the save in `letters_format` merges with it.
+
+pub mod api;
+pub mod auth;
+pub mod config;
+pub mod error;
+pub mod ids;
+pub mod library;
+pub mod oidc;
+pub mod pages;
+pub mod rooms;
+pub mod session;
+pub mod socket;
+pub mod spaces;
+pub mod store;
+
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::serve::ListenerExt;
+use letters_api::{Role, Space};
+
+use crate::config::Config;
+use crate::error::{Answer, Refusal};
+use crate::library::Library;
+use crate::oidc::Provider;
+use crate::rooms::Rooms;
+use crate::session::Signed;
+use crate::spaces::Root;
+use crate::store::Store;
+
+/// Tells the time, in seconds since 1970.
+pub type Clock = Box<dyn Fn() -> u64 + Send + Sync>;
+
+/// Everything a request is answered from.
+pub struct App {
+    pub config: Config,
+    pub store: Store,
+    pub library: Library,
+    pub provider: Provider,
+    pub rooms: Rooms,
+    clock: Clock,
+}
+
+pub type Shared = Arc<App>;
+
+impl App {
+    pub fn new(config: Config, store: Store) -> Self {
+        let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
+        let (provider, rooms) = (Provider::new(&config), Rooms::new(&config.server.state));
+        Self { config, store, library: Library::new(), provider, rooms, clock: Box::new(clock) }
+    }
+
+    /// The same server telling another time, for tests of what runs out.
+    pub fn with_clock(self, clock: Clock) -> Self {
+        Self { clock, ..self }
+    }
+
+    pub fn now(&self) -> u64 {
+        (self.clock)()
+    }
+
+    /// The spaces `who` reaches, in the order the settings list them.
+    pub fn spaces(&self, who: &Signed) -> Vec<(&config::Space, Role)> {
+        let reached = |space| Some((space, config::Space::role(space, &who.groups)?));
+        self.config.spaces.iter().filter_map(reached).collect()
+    }
+
+    /// The space `id` as `who` reaches it. One they do not reach is not there for them.
+    pub fn space(&self, who: &Signed, id: &str) -> Answer<(&config::Space, Role)> {
+        self.spaces(who).into_iter().find(|(space, _)| space.id() == id).ok_or_else(Refusal::not_found)
+    }
+
+    /// Opens a space's folder for `who`. Their own is made when they first come to it.
+    pub fn root(&self, who: &Signed, space: &config::Space) -> Answer<Root> {
+        if space.personal() && !spaces::username_ok(&who.person.username) {
+            return Err(Refusal::forbidden("The name you sign in with cannot name a folder."));
+        }
+        Ok(Root::open(&space.folder(&who.person.username), space.personal())?)
+    }
+
+    /// Every space `who` reaches whose folder can be opened now, as the interface tells it.
+    pub fn reach(&self, who: &Signed) -> Vec<(Space, Root)> {
+        let open = |(space, role): (&config::Space, Role)| Some((space.told(role), self.root(who, space).ok()?));
+        self.spaces(who).into_iter().filter_map(open).collect()
+    }
+}
+
+impl App {
+    /// Every folder the server knows of, each with its space's name: the shared spaces, and the own space
+    /// of everyone who has signed in. One that cannot be opened is said and passed over.
+    fn folders(&self) -> Vec<(&str, Root)> {
+        let people = self.store.under(&session::PEOPLE, "").unwrap_or_default();
+        let names: Vec<String> = people.into_iter().map(|(_, seen)| seen.person.username).collect();
+        let mut roots = Vec::new();
+        for space in &self.config.spaces {
+            let folders: Vec<String> = match space.personal() {
+                true => names.iter().filter(|name| spaces::username_ok(name)).map(|name| space.folder(name)).collect(),
+                false => vec![space.folder("")],
+            };
+            for folder in folders {
+                match Root::open(&folder, false) {
+                    Ok(root) => roots.push((space.name.as_str(), root)),
+                    Err(error) => log(&format!("the space \"{}\" could not be opened: {error}", space.name)),
+                }
+            }
+        }
+        roots
+    }
+
+    /// Every folder the server knows of that can be opened now.
+    pub fn roots(&self) -> Vec<Root> {
+        self.folders().into_iter().map(|(_, root)| root).collect()
+    }
+
+    /// Reads every folder the server knows of into the index. One that cannot be read is said and passed
+    /// over.
+    pub fn scan(&self) {
+        for (space, root) in self.folders() {
+            if let Err(refusal) = self.library.scan(&self.store, &root) {
+                log(&format!("the space \"{space}\" could not be scanned: {}", refusal.0));
+            }
+        }
+    }
+}
+
+/// Serves on `listener` until `stop` resolves. What an earlier run left in its journals goes to its files
+/// before anyone is let in. When the server is told to stop, every session ends and every open document
+/// is saved first, and then the requests that are being answered are answered.
+pub async fn serve(
+    app: Shared,
+    listener: tokio::net::TcpListener,
+    stop: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let recovering = app.clone();
+    tokio::task::spawn_blocking(move || recovering.rooms.recover(&recovering)).await?;
+    // The index is brought up to the folders while the first requests are already answered.
+    let scanning = app.clone();
+    tokio::task::spawn_blocking(move || scanning.scan());
+    let closing = app.clone();
+    let stopped = async move {
+        stop.await;
+        if tokio::task::spawn_blocking(move || closing.rooms.close()).await.is_err() {
+            log("the open documents could not all be saved as the server stopped: their journals keep the rest");
+        }
+    };
+    // A frame that relays what someone typed is small, and is not held back to be sent with the next.
+    let listener = listener.tap_io(|socket| drop(socket.set_nodelay(true)));
+    axum::serve(listener, api::router(app)).with_graceful_shutdown(stopped).await
+}
+
+/// Writes a line to the server's log, which is its standard error.
+pub fn log(line: &str) {
+    eprintln!("letters-server: {line}");
+}

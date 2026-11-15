@@ -97,6 +97,8 @@ pub(crate) struct Canvas<M> {
     pub pointed: bool,
     /// Whether positions on it are told as parts of its width and height.
     pub spread: bool,
+    /// What is written in it, when it is a field of the window and not the app's own area.
+    pub field: Option<String>,
 }
 
 /// Whether and how an element takes keyboard focus.
@@ -250,6 +252,7 @@ impl<M> Element<M> {
             caret: None,
             pointed: false,
             spread: false,
+            field: None,
         }));
         element.focus = Focus::Click;
         element.style.clip = true;
@@ -608,6 +611,18 @@ impl<M> Element<M> {
     pub fn spread(mut self) -> Self {
         if let Content::Canvas(canvas) = &mut self.content {
             canvas.spread = true;
+        }
+        self
+    }
+
+    /// Makes a canvas a field of the window that the app draws itself, as a text input is one the toolkit
+    /// draws, and not the app's own area as the page is. Its keys come to its [`Element::on_key`] before the
+    /// app is offered any, and the app then hears only the shortcuts it left, as from a text input. Its
+    /// caret is its own: it shows while the canvas itself has focus. Assistive technology is told `value`
+    /// as what is written in it, and the app is not asked to describe it.
+    pub fn field(mut self, value: impl Into<String>) -> Self {
+        if let Content::Canvas(canvas) = &mut self.content {
+            canvas.field = Some(value.into());
         }
         self
     }

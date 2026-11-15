@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 
+use letters_editor::Clip;
 use letters_model::{Anchor, Block, BlockKind, Document, Mark, Note, NoteKind, Notes, Pos, Reply, Run, Selection};
 use letters_render::{Item, Point, Rect};
 use letters_test::{Found, Harness, Role};
@@ -219,6 +220,7 @@ fn a_comment_is_written_under_its_passage_and_kept_as_a_note() {
     let cases = [
         ("Has anyone **chased** it?", "Enter", Some("Has anyone chased it?")),
         ("Thanks \u{1f64f}", "Send", Some("Thanks \u{1f64f}")),
+        ("  Thanks  ", "Enter", Some("Thanks")),
         ("   ", "Enter", None),
         ("Never mind", "Escape", None),
     ];
@@ -280,6 +282,147 @@ fn a_comment_is_signed_and_reads_the_marks_markdown_writes() {
     assert_eq!((bold, links), (vec!["Friday"], vec![("their email", "https://a.example/m")]));
     // What is kept is what the file takes.
     assert_eq!(Notes::from_json(&notes.to_json()).map(|read| read.notes.len()).ok(), Some(2));
+}
+
+/// The runs of the one comment the window keeps: what each says, whether it is bold and where it links.
+fn written(window: &mut Harness) -> Vec<(String, bool, Option<String>)> {
+    let notes = window.ui().notes().clone();
+    let [note] = &notes.notes[..] else { panic!("one note: {notes:?}") };
+    note.content.iter().map(|run| (run.text.clone(), run.marks.contains(&Mark::Bold), run.link.clone())).collect()
+}
+
+/// How many glyphs a frame draws in a part of the window.
+fn glyphs_in(window: &mut Harness, area: Rect) -> usize {
+    let drawn = |item: &Item| match item {
+        Item::Glyphs { origin, glyphs, .. } if area.contains(*origin) => glyphs.len(),
+        _ => 0,
+    };
+    window.paint().items.iter().map(drawn).sum()
+}
+
+#[test]
+fn a_comment_is_typed_with_the_shorthand_of_the_page_and_shows_its_marks_at_the_caret() {
+    let mut window = letter();
+    window.select("written quote").click(Role::Button, "Comment").type_text("Has anyone **chased** it");
+    // The marks are read as they are typed: the stars are gone, and the word is bold.
+    let field = window.find(Role::TextInput, "Comment").expect("the field");
+    assert_eq!(field.value.as_deref(), Some("Has anyone chased it"));
+    let caret = window.ui().caret_rect().expect("the caret of the field");
+    assert!(field.bounds.contains(Point { x: caret.x, y: caret.y }), "{caret:?} in {:?}", field.bounds);
+    // They show again while the caret is in the word they mark, as on the page.
+    let away = glyphs_in(&mut window, field.bounds);
+    for _ in 0..5 {
+        window.key("Left");
+    }
+    assert!(glyphs_in(&mut window, field.bounds) > away, "the stars show around the word the caret is in");
+    window.key("Enter");
+    let said = [("Has anyone ", false), ("chased", true), (" it", false)];
+    assert_eq!(written(&mut window), said.map(|(text, bold)| (text.to_owned(), bold, None)));
+}
+
+#[test]
+fn the_shorthand_that_makes_a_block_of_the_page_means_nothing_in_a_comment() {
+    // What is typed is what is kept: a comment is one stretch of text.
+    for typed in ["- slates first", "# 1", "> said who?", "costs $40 or $50"] {
+        let mut window = letter();
+        comment(&mut window, "written quote", typed);
+        assert_eq!(kept(&mut window), [("written quote".to_owned(), typed.to_owned())]);
+    }
+}
+
+#[test]
+fn an_address_in_a_comment_is_a_link_wherever_it_is_written() {
+    const MAIL: &str = "https://a.example/m";
+    // What is typed, and the runs that link somewhere.
+    let cases = [
+        (format!("see {MAIL}"), vec![(MAIL, MAIL)]),
+        (format!("{MAIL} has it, and so has {MAIL}."), vec![(MAIL, MAIL), (MAIL, MAIL)]),
+        (format!("see [their email]({MAIL}) again"), vec![("their email", MAIL)]),
+        ("no address here".to_owned(), vec![]),
+    ];
+    for (typed, links) in cases {
+        let mut window = letter();
+        comment(&mut window, "written quote", &typed);
+        let linked: Vec<(String, String)> =
+            written(&mut window).into_iter().filter_map(|(text, _, link)| Some((text, link?))).collect();
+        let links: Vec<(String, String)> =
+            links.iter().map(|(text, to)| ((*text).to_owned(), (*to).to_owned())).collect();
+        assert_eq!(linked, links, "{typed:?}");
+    }
+}
+
+#[test]
+fn the_keys_and_the_pointer_edit_a_comment_as_they_edit_the_page() {
+    let mut window = letter();
+    let (page, edits) = (window.markdown(), window.ui().edits());
+    window.select("written quote").click(Role::Button, "Comment");
+    let value = |window: &mut Harness| window.find(Role::TextInput, "Comment").and_then(|field| field.value);
+
+    // The key that makes text bold on the page makes it bold here.
+    window.type_text("due ").key("Mod+B").type_text("Friday").key("Mod+B").type_text(" noon");
+    // A press puts the caret where it lands, and what is typed goes in there.
+    let field = window.find(Role::TextInput, "Comment").expect("the field");
+    window.click_at(Point { x: field.bounds.x + 3.0, y: field.center().y }).type_text("Now ");
+    assert_eq!(value(&mut window).as_deref(), Some("Now due Friday noon"));
+    // What is pasted comes as plain text, and stays in the comment.
+    window.platform.clipboard =
+        Some(Clip { text: "really ".into(), html: Some("<h1>really </h1>".into()), pictures: Vec::new() });
+    window.key("Mod+V");
+    assert_eq!(value(&mut window).as_deref(), Some("Now really due Friday noon"));
+    // Undo takes back what was done in the field, and nothing on the page.
+    window.key("Mod+Z");
+    assert_eq!(value(&mut window).as_deref(), Some("Now due Friday noon"));
+    assert_eq!((window.markdown(), window.ui().edits()), (page, edits), "the page is as it was");
+
+    window.key("Enter");
+    let said = [("Now due ", false), ("Friday", true), (" noon", false)];
+    assert_eq!(written(&mut window), said.map(|(text, bold)| (text.to_owned(), bold, None)));
+}
+
+#[test]
+fn a_drag_in_a_comment_selects_what_it_passes_and_typing_replaces_it() {
+    let mut window = letter();
+    window.select("written quote").click(Role::Button, "Comment").type_text("Chased it?");
+    let field = window.find(Role::TextInput, "Comment").expect("the field");
+    let fills = |window: &mut Harness| {
+        let within = |item: &Item| matches!(item, Item::Fill { rect, .. } if field.bounds.contains(Point { x: rect.x, y: rect.y }) && rect.height < field.bounds.height - 4.0);
+        window.paint().items.iter().filter(|item| within(item)).count()
+    };
+    let plain = fills(&mut window);
+    let (y, right) = (field.center().y, field.bounds.x + field.bounds.width - 3.0);
+    window.press_at(Point { x: field.bounds.x + 3.0, y }).hover_at(Point { x: right, y });
+    assert!(fills(&mut window) > plain, "what is selected shows as selected");
+    window.release_at(Point { x: right, y }).type_text("Paid?");
+    assert_eq!(window.find(Role::TextInput, "Comment").and_then(|field| field.value).as_deref(), Some("Paid?"));
+}
+
+#[test]
+fn a_shortcut_a_comment_has_no_use_for_is_the_windows() {
+    let mut window = letter();
+    window.select("written quote").click(Role::Button, "Comment").type_text("Chased?");
+    // Tab moves on to the button that sends it, where on the page it would indent.
+    window.key("Tab");
+    assert!(window.focused().is_some_and(|found| found.name == "Send"), "{:?}", window.focused());
+    window.key("Mod+Shift+P").assert_open(Role::Dialog, "Commands");
+}
+
+#[test]
+fn a_reply_is_written_as_a_comment_is() {
+    let mut window = noted(vec![chased()]);
+    let on = spot(&mut window, "a", QUOTE.start + 4);
+    window.click_at(on).click(Role::TextInput, "Reply").type_text("on it, **today** see https://a.example/m");
+    let field = window.find(Role::TextInput, "Reply").expect("the field");
+    assert_eq!(field.value.as_deref(), Some("on it, today see https://a.example/m"));
+    window.key("Enter");
+    let replies = &window.ui().notes().notes[0].replies;
+    let said: Vec<_> = replies.last().into_iter().flat_map(|reply| &reply.content).collect();
+    let bold: Vec<&str> =
+        said.iter().filter(|run| run.marks.contains(&Mark::Bold)).map(|run| run.text.as_str()).collect();
+    let links: Vec<Option<&str>> =
+        said.iter().filter_map(|run| run.link.as_ref().map(|link| Some(link.as_str()))).collect();
+    assert_eq!((bold, links), (vec!["today"], vec![Some("https://a.example/m")]), "{said:?}");
+    // The field is empty again for the next reply.
+    assert_eq!(window.find(Role::TextInput, "Reply").and_then(|field| field.value).as_deref(), Some(""));
 }
 
 #[test]

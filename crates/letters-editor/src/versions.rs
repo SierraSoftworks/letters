@@ -28,6 +28,10 @@ impl Editor {
     /// gave is lost, and on the step that ends it, since a mark with nothing written after the last one
     /// would list an empty version. A revision nothing was written in needs none either.
     pub fn mark_version(&mut self, revision: &Revision, kind: TagKind, name: Option<&str>) -> Result<(), HistoryError> {
+        if self.read_only {
+            // A mark is written into the history, which one who only reads leaves as it is.
+            return Ok(());
+        }
         let steps = self.model.timeline();
         // How many steps the revision holds, where that can be told: all of them when it is the newest,
         // and else those before the step that was written on it.
@@ -46,6 +50,9 @@ impl Editor {
     /// of the history and so something to save, but no edit and no undo step. See
     /// [`letters_model::Model::tag`].
     pub fn name_version(&mut self, revision: &Revision, name: Option<&str>) -> Result<(), HistoryError> {
+        if self.read_only {
+            return Ok(());
+        }
         match name {
             Some(name) => self.model.tag(revision, TagKind::Named, Some(name)),
             None => {

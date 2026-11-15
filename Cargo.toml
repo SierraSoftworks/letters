@@ -22,6 +22,8 @@ letters-convert = { path = "crates/letters-convert" }
 letters-spell = { path = "crates/letters-spell" }
 letters-math = { path = "crates/letters-math" }
 letters-trust = { path = "crates/letters-trust" }
+letters-api = { path = "crates/letters-api" }
+letters-sync = { path = "crates/letters-sync" }
 letters-test = { path = "crates/letters-test" }
 # The one crate with unsafe code. Only the desktop shell may name it.
 letters-frame = { path = "platform/letters-frame" }
@@ -103,6 +105,15 @@ ureq = { version = "3", default-features = false, features = ["rustls", "platfor
 # A server for the fetch's tests.
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# The system's own word on a server's certificate, for the socket to a Letters server. ureq brings it too.
+rustls-platform-verifier = "0.7"
+# Keeps a server's sign-in in the system's keychain: Keychain on macOS, Credential Manager on Windows, the
+# Secret Service elsewhere.
+keyring = "4"
+# What keyring is built on, named so that tests can keep sign-ins in memory and not in a real keychain.
+keyring-core = "1"
+# The socket a document syncs over in connected mode. It speaks over the TLS the shell sets up itself.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # Already in the tree through accesskit. Linux only: it asks the desktop for its settings.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 getrandom = "0.4"
@@ -121,6 +132,23 @@ rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSData", "NSGeometry", "NSString", "NSThread"] }
 objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSButton", "NSControl", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSToolbar", "NSView", "NSWindow"] }
+
+# The server. None of these may reach the core crates.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query", "json", "form"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
+# The state directory: one file, in Rust alone, with no server of its own.
+redb = "4"
+# Opens files beneath a folder and nowhere else, whatever a path or a symlink says.
+cap-std = "4"
+# Checks the identity provider's signature on an ID token, in Rust alone.
+jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"] }
+toml = "1"
+# The server's own pages: yewi components drawn where they are served, so that no wasm goes to the browser.
+yew = { version = "0.23", default-features = false, features = ["ssr"] }
+yewi = { version = "0.3", features = ["ssr", "fonts"] }
+# Drives the server's routes in its tests with no socket between.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+http-body-util = "0.1"
 
 # The browser shell. The command-line `wasm-bindgen` must be the version the lock file names.
 wasm-bindgen = "0.2"

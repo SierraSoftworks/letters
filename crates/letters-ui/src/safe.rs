@@ -6,7 +6,7 @@
 
 use accesskit::Role;
 use letters_layout::DocLayout;
-use letters_model::{Document, Pos, Selection};
+use letters_model::{BlockId, Document, Pos, Selection};
 use letters_render::{Point, Rect};
 
 use crate::element::Element;
@@ -229,11 +229,12 @@ fn lines(address: &str, fits: usize, most: usize) -> Vec<String> {
 
 /// The address of the link whose text is drawn at a point of the layout.
 pub(crate) fn link_at(doc: &Document, layout: &DocLayout, at: Point) -> Option<String> {
-    link_line_at(doc, layout, at).map(|(href, _)| href)
+    link_line_at(doc, layout, at).map(|(_, href, _)| href)
 }
 
-/// The address of the link whose text is drawn at a point of the layout, and the line of it that is there.
-pub(crate) fn link_line_at(doc: &Document, layout: &DocLayout, at: Point) -> Option<(String, Rect)> {
+/// The link whose text is drawn at a point of the layout: the block it is written in, its address, and the
+/// line of it that is there.
+pub(crate) fn link_line_at(doc: &Document, layout: &DocLayout, at: Point) -> Option<(BlockId, String, Rect)> {
     let pos = layout.hit(at)?;
     let block = doc.block(&pos.block)?;
     let mut start = 0;
@@ -246,7 +247,7 @@ pub(crate) fn link_line_at(doc: &Document, layout: &DocLayout, at: Point) -> Opt
         let end = |offset| Pos::new(block.id.clone(), offset);
         let drawn = layout.selection(&Selection { anchor: end(range.start), head: end(range.end) });
         if let Some(line) = drawn.into_iter().find(|line| line.contains(at)) {
-            return Some((href.to_owned(), line));
+            return Some((block.id.clone(), href.to_owned(), line));
         }
     }
     None

@@ -23,7 +23,7 @@ pub use doc::{
     Block, BlockId, BlockKind, Body, BodyShape, CalloutLook, Document, Extra, FORMAT, ListKind, Mark, Preview,
     Properties, PropertiesFormat, Run, Tone,
 };
-pub use history::{HistoryError, Hold, ReplicaId, Revision, StablePos};
+pub use history::{Extent, HistoryError, Hold, ReplicaId, Revision, StablePos};
 pub use json::JsonError;
 pub use markers::{Marker, Markers};
 pub use model::{Change, Model, Op, OpError, Place, Prepared};

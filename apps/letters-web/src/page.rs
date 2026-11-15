@@ -5,26 +5,36 @@
 //! [`Skeleton`] of how the window's bar starts, the document's name and how saving stands, so that nothing
 //! moves when the editor's first frame takes their place. The bar's other controls come with the editor. The export sits in a frame of its own, so that its styles and
 //! the page's cannot reach each other and nothing a document carries can run.
+//!
+//! A server calls [`served`] and sends what it answers. Beside the document such a page carries the
+//! server's [`Opened`]: which document it is, who writes in it and what they may do.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::ops::RangeInclusive;
 
 use accesskit::{Node, NodeId, Role};
+use letters_api::{Opened, Trust};
 use letters_editor::Editor;
-use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Pos, ReplicaId, Selection};
+use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Model, Notes, Pos, ReplicaId, Selection, Style};
 use letters_render::Size;
-use letters_ui::{Ink, Scheme, Window, tokens};
+use letters_ui::{Ink, SafeMode, Scheme, Window, tokens};
 
 /// The `id` of what stands in for the window until the editor has painted it.
 pub const FIRST_PAINT: &str = "letters-first-paint";
 /// The `id` of the script element that holds the document as `document.json` stores it.
 pub const DOCUMENT: &str = "letters-document";
+/// The `id` of the script element that holds what a server says of the document: its [`Opened`].
+pub const OPENED: &str = "letters-opened";
 
 /// Where each goes in a page's template.
 const FIRST_PAINT_SLOT: &str = "<!--letters:first-paint-->";
 const DOCUMENT_SLOT: &str = "<!--letters:document-->";
 const PRELOAD_SLOT: &str = "<!--letters:preload-->";
+
+/// What the Comment tool says of a document whose notes this build cannot read.
+pub const NO_COMMENTS: &str = "Comments cannot be added here: this document's notes are in a form this version of \
+                               Letters cannot read.";
 
 /// The widths of window a [`Skeleton`] is laid out for. A narrower or wider one carries on from the nearest.
 const WIDTHS: RangeInclusive<u16> = 240..=1600;
@@ -196,15 +206,45 @@ fn hex(ink: Ink, scheme: Scheme) -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use server::export;
+pub use server::{export, served};
 
 /// What a server needs to make a page and the editor's own code does without.
 #[cfg(not(target_arch = "wasm32"))]
 mod server {
+    use letters_api::Opened;
     use letters_convert::{Column, HtmlPage, WebFont};
     use letters_fonts::{DISPLAY, MONO, SANS};
-    use letters_model::{Document, Style};
+    use letters_model::{Document, ReplicaId, Style};
     use letters_ui::{Scheme, palette};
+
+    use super::{OPENED, Skeleton, compose, first_paint, preloads, script, served_window};
+
+    /// The page every document is sent in.
+    const TEMPLATE: &str = include_str!("../www/index.html");
+    /// Where a page says where its files are, what it is called, and what the server says of its document.
+    const BASE_SLOT: &str = "<!--letters:base-->";
+    const TITLE: &str = "<title>Letters</title>";
+    const OPENED_SLOT: &str = "<!--letters:opened-->";
+
+    /// The whole page a server sends for `document`: it reads at once, and the editor opens it as `opened`
+    /// says, with no request of its own. `base` is where the server keeps what the browser build made, a
+    /// URL that ends in a slash.
+    ///
+    /// The page runs one script, a file under `base`, so a policy that lets no inline script run suits it.
+    pub fn served(document: &Document, opened: &Opened, base: &str) -> String {
+        // The window as the editor will open it.
+        let mut window = served_window(document.clone(), opened, ReplicaId::new("page"));
+        let style = window.style().clone();
+        let html = export(document, &style, &opened.name, &format!("{base}fonts/"));
+        let first = first_paint(&Skeleton::of(&mut window), &html);
+        let said = serde_json::to_string(opened).expect("what a server says of a document is JSON");
+        let text = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('"', "&quot;");
+        let template = TEMPLATE
+            .replacen(BASE_SLOT, &format!("<base href=\"{}\" />", text(base)), 1)
+            .replacen(TITLE, &format!("<title>{}</title>", text(&opened.name)), 1)
+            .replacen(OPENED_SLOT, &script(OPENED, &said), 1);
+        compose(&template, &preloads(document, base), &first, &document.to_json())
+    }
 
     /// The window's own measures for the column a document is set in: the least room it keeps beside the
     /// column, and the room above and below it. The browser tests hold the two to each other.
@@ -312,20 +352,54 @@ pub fn preloads(document: &Document, base: &str) -> String {
 /// [`first_paint`] made of it, and `json` its `document.json`, which cannot end its element early
 /// whatever the document holds.
 pub fn compose(template: &str, preloads: &str, first_paint: &str, json: &str) -> String {
-    // Inside a script, `<` could begin the tag that ends it. JSON reads the escape as the same character.
-    let json = json.replace('<', "\\u003c");
-    let script = format!("<script type=\"application/json\" id=\"{DOCUMENT}\">{json}</script>");
     // The script goes in first: it holds no `<`, so it cannot be mistaken for another's place, while the
     // first paint may hold anything.
-    let page = template.replacen(DOCUMENT_SLOT, &script, 1).replacen(PRELOAD_SLOT, preloads, 1);
+    let page = template.replacen(DOCUMENT_SLOT, &script(DOCUMENT, json), 1).replacen(PRELOAD_SLOT, preloads, 1);
     page.replacen(FIRST_PAINT_SLOT, first_paint, 1)
+}
+
+/// JSON for the editor to read from the page, in an element that nothing it holds can end early.
+fn script(id: &str, json: &str) -> String {
+    // Inside a script, `<` could begin the tag that ends it. JSON reads the escape as the same character.
+    format!("<script type=\"application/json\" id=\"{id}\">{}</script>", json.replace('<', "\\u003c"))
 }
 
 /// The window the editor opens on `document`: the caret waits at its end. A page's [`Skeleton`] is taken
 /// from the same window, so that it is the one the editor's first frame shows.
 pub fn window(document: Document, replica: ReplicaId) -> Window {
-    let end = document.blocks.last().map(|block| Pos::new(block.id.clone(), usize::MAX));
-    let mut window = Window::new(Editor::new(document, replica));
+    at_end(Window::new(Editor::new(document, replica)))
+}
+
+/// The window the editor opens on a document a server sent, as `opened` says of it: in the document's
+/// style and under its name, with its notes, signing edits as the session does, and held in safe mode
+/// until the person trusts it. [`served`] takes the page's [`Skeleton`] from the same window.
+pub fn served_window(document: Document, opened: &Opened, replica: ReplicaId) -> Window {
+    // The built-in style stands in for one this build cannot read, as it does on the desktop.
+    let style = opened.style.as_ref().and_then(|style| Style::from_json(&style.to_string()).ok());
+    served_on(Model::new(document, replica).with_style(style.unwrap_or_default()), opened)
+}
+
+/// The window on a served document as `model` holds it: the page's own, or the server's history once
+/// it has arrived.
+pub fn served_on(model: Model, opened: &Opened) -> Window {
+    let mut window = at_end(Window::new(Editor::with_model(model)));
+    window.set_document_name(&opened.name);
+    window.set_author(&opened.author);
+    match opened.notes.as_ref().map(|notes| Notes::from_json(&notes.to_string())) {
+        Some(Ok(notes)) => window.set_notes(notes),
+        // A comment added to notes that cannot be read could not be kept.
+        Some(Err(_)) => window.refuse_comments(Some(NO_COMMENTS)),
+        None => {}
+    }
+    if opened.trust == Trust::Safe {
+        window.set_safe_mode(Some(SafeMode { folder: None }));
+    }
+    window
+}
+
+/// Puts the caret at the document's end, where the person writes on.
+fn at_end(mut window: Window) -> Window {
+    let end = window.editor().doc().blocks.last().map(|block| Pos::new(block.id.clone(), usize::MAX));
     if let Some(end) = end {
         window.select(Selection::caret(end));
     }

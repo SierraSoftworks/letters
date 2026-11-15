@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek};
 use std::mem;
 
-use letters_model::{Block, BlockId, Change, Document, Model, Note, Notes, Op, OpError, ReplicaId, Stood, Style};
+use letters_model::{
+    Block, BlockId, Change, Document, Model, Note, Notes, Op, OpError, ReplicaId, Revision, Stood, Style,
+};
 
 use crate::journal::Unsaved;
 use crate::save::{DiskCopy, Replica};
@@ -151,6 +153,32 @@ impl WorkingCopy {
     pub fn edit(&mut self, history: &[u8]) -> Result<Change, Error> {
         self.notes.pin(&self.model);
         let change = self.model.merge(history).map_err(Error::History)?;
+        self.notes.follow(&self.model);
+        Ok(change)
+    }
+
+    /// Settles what this copy and another wrote apart, once this one holds the edits of both: `ours` is
+    /// the revision it stood at before it took the other's edits in, and `theirs` the one the other stood
+    /// at. For edits that arrive without their file, as a device's do that wrote while it was away.
+    ///
+    /// As where two files merge, each block the two changed in the same words comes to read as the later
+    /// side left it, and a conflict note keeps both versions. Returns what that did to the document.
+    pub fn settle(&mut self, ours: &Revision, theirs: &Revision) -> Result<Change, Error> {
+        self.notes.pin(&self.model);
+        let (change, conflicts) = self.model.settle(ours, theirs).map_err(Error::History)?;
+        let mut raised = Vec::new();
+        for conflict in conflicts {
+            let [earlier, later] = [1 - conflict.later, conflict.later].map(|side| conflict.sides[side].version());
+            let mut note = Note::conflict(conflict.block, [earlier, later]);
+            if self.model.block(&note.anchor.block).is_none() {
+                // The side that kept the block knows where it stood, and the note has no other place.
+                let kept = [ours, theirs][1 - conflict.later];
+                let (held, _) = self.model.document_at(kept).map_err(Error::History)?;
+                note.anchor.stood = stood(&held, &self.model, &note.anchor.block);
+            }
+            raised.push(note);
+        }
+        self.notes.raise(raised);
         self.notes.follow(&self.model);
         Ok(change)
     }

@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Each night as well: a cache nobody reads for a week is dropped, and the next push would build everything.
+  schedule:
+    - cron: "43 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Pushes to main come minutes apart. One run at a time, and of those waiting only the newest: every run
+# checks main as it stands, and none is cut off half way.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing here reads debug info: a failed test names its line without it.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  # The gate of scripts/check.sh, its steps side by side.
+  gate:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Lint
+            key: Lint
+            check: fmt lint
+          - name: Wasm
+            key: Wasm
+            check: wasm
+          # The gate's `cargo test --workspace` as three jobs of about one length, since building and running
+          # the tests is most of a push. The last takes every crate the others do not name, new ones too.
+          - name: Test (model, layout, render)
+            key: test-model
+            test: -p letters-model -p letters-layout -p letters-render
+          - name: Test (editor, window)
+            key: test-window
+            test: -p letters-editor -p letters-test
+          - name: Test (the rest)
+            key: test-rest
+            test: >-
+              --workspace --exclude letters-model --exclude letters-layout --exclude letters-render
+              --exclude letters-editor --exclude letters-test
+    steps:
+      - uses: actions/checkout@v7
+
+      # The version rust-toolchain.toml pins, with its components and targets.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.key }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check
+        if: matrix.check
+        run: ./scripts/check.sh ${{ matrix.check }}
+
+      # A step of its own, so that the run shows what building costs and what testing does.
+      - name: Build tests
+        if: matrix.test
+        run: cargo test ${{ matrix.test }} --no-run
+
+      - name: Test
+        if: matrix.test
+        run: cargo test ${{ matrix.test }}
+
+  # The launch and keystroke budgets, on a release build.
+  budgets:
+    name: Budgets
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: budgets
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build
+        run: cargo build --release -p letters
+
+      # The launch budget is about a window, so it is measured in one, on a display in memory. The CPU
+      # renderer, since the runner has no GPU to speak of.
+      - name: Install a display
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends xvfb libxkbcommon-x11-0
+
+      - name: Check budgets
+        shell: bash
+        env:
+          LETTERS_RENDERER: cpu
+        run: |
+          xvfb-run -a -s "-screen 0 1400x1000x24" ./scripts/budgets.sh --window ubuntu-latest | tee budgets.txt
+          { echo '```text'; cat budgets.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"

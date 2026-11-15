@@ -1,0 +1,38 @@
+/* The rules of the server's own pages, on top of yewi's. */
+html, body { margin: 0; block-size: 100%; }
+
+/* A row of a file table: its icon, its name, and what it is marked with. */
+.lt-file { display: inline-flex; align-items: center; gap: var(--yi-space-sm); font-weight: 500; }
+.lt-file > .yi-icon { flex: none; color: var(--yi-fg-subtle); }
+.lt-file .yi-tag { font-weight: 400; }
+.lt-file__name { margin-inline-end: var(--yi-space-xs); color: inherit; text-decoration: none; }
+a.lt-file__name:hover { text-decoration: underline; }
+.lt-file__more { inline-size: 1%; text-align: end; white-space: nowrap; }
+.lt-file__more form { display: none; }
+.lt-dim { color: var(--yi-fg-muted); font-size: var(--yi-text-sm); white-space: nowrap; }
+
+/* A page with no frame: one thing said in the middle of it. */
+.lt-card {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: var(--yi-space-md);
+  min-block-size: 100%;
+  box-sizing: border-box;
+  padding: var(--yi-space-xl);
+  background: var(--yi-bg);
+  color: var(--yi-fg);
+}
+.lt-card > .yi-empty-state { max-inline-size: 30rem; }
+.lt-card__other {
+  display: flex;
+  align-items: center;
+  gap: var(--yi-space-xs);
+  color: var(--yi-fg-muted);
+  font-size: var(--yi-text-sm);
+}
+
+/* A narrow page keeps a row's name, when it was written, and its menu. */
+@media (max-width: 40rem) {
+  .lt-wide { display: none; }
+}

@@ -99,3 +99,19 @@ impl Drop for Scratch {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// What a server on this machine needs to answer over TLS as `localhost`, and the certificate it shows,
+/// which nobody but a test trusts.
+pub fn tls() -> (std::sync::Arc<rustls::ServerConfig>, Vec<u8>) {
+    let made = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let certificate = made.cert.der().to_vec();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(made.signing_key.serialize_der()).unwrap();
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![rustls::pki_types::CertificateDer::from(certificate.clone())], key)
+        .unwrap();
+    (std::sync::Arc::new(config), certificate)
+}

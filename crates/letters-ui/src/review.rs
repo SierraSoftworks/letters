@@ -250,6 +250,8 @@ impl Review {
         if !open.laid.as_ref().is_some_and(|laid| (laid.0, &laid.1, laid.2) == (width, style, palette)) {
             // A formula is typeset in both versions: only the page's has a caret to show its source for.
             open.first.set_formula_source(false);
+            // Nor is anything fetched for the version that is only read: its preview has no control.
+            open.first.set_preview_control(false);
             open.first.set_palette(palette);
             open.first.update(&open.doc, style, width, None);
             open.laid = Some((width, style.clone(), palette));

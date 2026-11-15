@@ -17,6 +17,7 @@ mod model;
 mod page;
 mod save;
 mod spell;
+mod sync;
 mod trust;
 #[cfg(feature = "shell")]
 mod windows;
@@ -125,6 +126,12 @@ pub const TARGETS: &[Target] = &[
         about: "what is marked as misspelled lies on whole characters of its text",
         run: spell::run,
         seeds: spell::seeds,
+    },
+    Target {
+        name: "sync",
+        about: "a room reads any frame or refuses it, holds each role to what it may do, and keeps what it holds through a stop",
+        run: sync::run,
+        seeds: sync::seeds,
     },
     Target {
         name: "trust",

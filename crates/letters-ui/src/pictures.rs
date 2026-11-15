@@ -92,6 +92,11 @@ impl Linked {
         (open || pointed.is_some() || selected == Some(figure)).then_some(open || pointed == Some(true))
     }
 
+    /// Whether the shell has said anything of a picture that does not show.
+    pub fn says(&self) -> bool {
+        !self.states.is_empty()
+    }
+
     /// What the shell says of the picture linked from `src`.
     pub fn said(&self, src: &str) -> Option<&PictureState> {
         self.states.get(src)
@@ -151,9 +156,8 @@ pub(crate) fn menu(src: &str, loaded: bool, state: Option<&PictureState>, vouche
     };
     let mut menu = Menu::new().label("Linked picture");
     menu = match state {
-        Some(PictureState::Loading) => menu.note(format!("Loading from {host}"), Tone::Default).separator(),
-        Some(PictureState::Failed(reason)) => menu.note(format!("Not loaded: {reason}"), Tone::Danger).separator(),
-        Some(PictureState::Held) => menu.note(HELD, Tone::Default).separator(),
+        Some(PictureState::Failed(_)) => menu.note(says(src, state), Tone::Danger).separator(),
+        Some(_) => menu.note(says(src, state), Tone::Default).separator(),
         None => menu,
     };
     let load = match state {
@@ -179,6 +183,20 @@ pub(crate) fn menu(src: &str, loaded: bool, state: Option<&PictureState>, vouche
         menu = menu.separator();
     }
     menu.item(item("Embed in the document".to_owned(), Linking::Embed))
+}
+
+/// What is said of a linked picture that does not show, in its menu and to assistive technology.
+pub(crate) fn says(src: &str, state: Option<&PictureState>) -> String {
+    let host = match host(src) {
+        "" => "this host",
+        host => host,
+    };
+    match state {
+        Some(PictureState::Loading) => format!("Loading from {host}"),
+        Some(PictureState::Failed(reason)) => format!("Not loaded: {reason}"),
+        Some(PictureState::Held) => HELD.to_owned(),
+        None => String::new(),
+    }
 }
 
 fn grown(rect: Rect, by: f32) -> Rect {

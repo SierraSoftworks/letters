@@ -1960,6 +1960,8 @@ impl History {
             let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
             layout.add_fallback_fonts(backup);
             lists.hand(&mut layout);
+            // What is quoted is only read: a link preview keeps no room for a control.
+            layout.set_preview_control(false);
             layout
         });
         layout.set_palette(palette);
@@ -2216,6 +2218,8 @@ impl Leaf {
                 late.1.hand(&mut layout);
                 // Nothing has a caret here, so a formula is typeset and never shows its source.
                 layout.set_formula_source(false);
+                // A version is only read, so a link preview keeps no room for a control either.
+                layout.set_preview_control(false);
                 (layout, None)
             }
         };

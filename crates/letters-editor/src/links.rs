@@ -75,10 +75,15 @@ impl Editor {
         self.lone_link().is_some()
     }
 
+    /// Whether the page of an address is fetched and shown: where the shell can fetch, on a page.
+    fn previewing(&self) -> bool {
+        self.fetching && !self.inline_only
+    }
+
     /// Notes that the writer has just put in a link or a card that leads to `address`, for
     /// [`Editor::take_unfetched`]: the address of a web page that the document keeps nothing of yet.
     pub(crate) fn put_in(&mut self, address: &str) {
-        let wanted = self.fetching && is_page(address) && !self.doc().previews.contains_key(address);
+        let wanted = self.previewing() && is_page(address) && !self.doc().previews.contains_key(address);
         if wanted && !self.unfetched.iter().any(|noted| noted == address) {
             self.unfetched.push(address.to_owned());
         }
@@ -169,14 +174,14 @@ impl Editor {
     /// Whether a line is an address that Enter after it makes a card of: one typed alone on its line,
     /// where a card has a page to show.
     pub(crate) fn typed_card(&self, line: &BlockId) -> bool {
-        self.fetching && self.block(line).is_some_and(typed)
+        self.previewing() && self.block(line).is_some_and(typed)
     }
 
     /// Whether the address of a web page pasted at the caret becomes a card: on an empty line of body
     /// text, where a card has a page to show.
     pub(crate) fn pasted_card(&self, address: &str, line: &BlockId) -> bool {
         let empty = |line: &Block| line.kind == BlockKind::Paragraph && text::len(line) == 0;
-        self.fetching && is_page(address) && self.block(line).is_some_and(empty)
+        self.previewing() && is_page(address) && self.block(line).is_some_and(empty)
     }
 
     /// Shows the address of a web page as a card above the line it was put on alone, which is left empty

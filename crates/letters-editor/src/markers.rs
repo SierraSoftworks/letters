@@ -74,8 +74,10 @@ impl Editor {
     ///
     /// Stepping over a marker changes what this returns and leaves the selection where it was, so read it
     /// again after every call that may move the caret.
+    ///
+    /// None are drawn where nothing may be written: a page that is only read shows no Markdown.
     pub fn markers(&self) -> Markers {
-        let Some(caret) = &self.caret else { return Markers::default() };
+        let Some(caret) = self.caret.as_ref().filter(|_| !self.read_only) else { return Markers::default() };
         let head = &caret.selection.head;
         let Some(block) = self.block(&head.block) else { return Markers::default() };
         let mut markers = Markers { block: self.block_marker(block), ..Markers::default() };

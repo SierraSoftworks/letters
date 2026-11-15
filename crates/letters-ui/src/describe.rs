@@ -84,8 +84,9 @@ struct Telling<'a> {
     nodes: &'a mut Vec<(NodeId, Node)>,
     /// Whether the document is written on. One that is only read has nothing to press.
     written: bool,
-    /// What is said of a block beside what it reads, as of one that a version of the document added.
-    said: Option<&'a HashMap<BlockId, String>>,
+    /// What is said of a block beside what it reads: that a version of the document added it, or why the
+    /// page does not show what it links to.
+    said: &'a HashMap<BlockId, String>,
 }
 
 impl Telling<'_> {
@@ -97,10 +98,12 @@ impl Telling<'_> {
 }
 
 /// Fills in the page's node and adds the blocks under it: all of them when `whole` is set, and otherwise
-/// those that read differently than `told` has them.
+/// those that read differently than `told` has them. `said` holds what the page shows of a block beside
+/// what it reads, such as why what it links to was not fetched.
 pub(crate) fn page(
     doc: &Document,
     selection: Option<&Selection>,
+    said: &HashMap<BlockId, String>,
     told: &mut Told,
     whole: bool,
     page: &mut Node,
@@ -119,7 +122,7 @@ pub(crate) fn page(
     {
         page.set_text_selection(TextSelection { anchor, focus });
     }
-    tell(doc, None, told, whole, page, nodes);
+    tell(doc, (said, true), told, whole, page, nodes);
 }
 
 /// Adds the blocks of a version of the document under the canvas that shows it, as [`page`] does for
@@ -134,14 +137,14 @@ pub(crate) fn version(
     nodes: &mut Vec<(NodeId, Node)>,
 ) {
     canvas.set_language(doc.language.as_str());
-    tell(doc, Some(said), told, whole, canvas, nodes);
+    tell(doc, (said, false), told, whole, canvas, nodes);
 }
 
-/// Adds the blocks of `doc` under `page`. With something `said` of its blocks the document is a version
-/// that is only read, and otherwise the one that is written on.
+/// Adds the blocks of `doc` under `page`, with what is `said` of them, for the document that is `written`
+/// on or for a version that is only read.
 fn tell(
     doc: &Document,
-    said: Option<&HashMap<BlockId, String>>,
+    (said, written): (&HashMap<BlockId, String>, bool),
     told: &mut Told,
     whole: bool,
     page: &mut Node,
@@ -149,7 +152,7 @@ fn tell(
 ) {
     let before = mem::take(&mut told.0);
     let now = HashMap::with_capacity(before.len());
-    let mut telling = Telling { before: (!whole).then_some(&before), now, nodes, written: said.is_none(), said };
+    let mut telling = Telling { before: (!whole).then_some(&before), now, nodes, written, said };
     page.set_children(push_blocks(&doc.blocks, &mut telling));
     told.0 = telling.now;
 }
@@ -411,7 +414,7 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
     }
     block.body.runs().iter().for_each(|run| run.text.hash(&mut reads));
     (&under, &inner).hash(&mut reads);
-    let said = telling.said.and_then(|said| said.get(&block.id));
+    let said = telling.said.get(&block.id);
     said.hash(&mut reads);
     if !telling.differs(id, reads.finish()) {
         return id;

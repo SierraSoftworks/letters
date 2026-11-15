@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use letters_editor::{InputEvent, Platform};
+use letters_editor::{InputEvent, Key, KeyEvent, Modifiers, Platform};
 use letters_render::{DisplayList, Item, Point, Rect, Size};
 use letters_test::{Harness, Role, WINDOW};
 use letters_ui::widgets::{Button, Menu, MenuItem, Popover, SidePanel, TextField, TopBar};
@@ -574,4 +574,107 @@ fn the_caret_blinks_while_a_field_has_focus() {
     desk.ui().focus(false);
     desk.paint();
     assert_eq!(desk.ui().animate(next + 1), None, "a window without the keyboard shows no caret");
+}
+
+// A field the app draws
+
+/// What a slip was sent: a key its field used, or text typed into the page or into the field.
+#[derive(Clone, Debug, PartialEq)]
+enum Wrote {
+    Key(KeyEvent),
+    Page(InputEvent),
+    Field(InputEvent),
+}
+
+/// A page with a field that the app draws itself, in a popover that hangs beside the page. It keeps what
+/// it was sent, and every key the app was offered.
+#[derive(Default)]
+struct Slip {
+    sent: Vec<Wrote>,
+    offered: Vec<KeyEvent>,
+}
+
+const PAGE_CARET: Rect = Rect { x: 10.0, y: 10.0, width: 1.0, height: 20.0 };
+
+impl App for Slip {
+    type Msg = Wrote;
+
+    fn title(&self) -> String {
+        "Slip".into()
+    }
+
+    fn view(&mut self, _window: Size) -> Element<Wrote> {
+        // The field uses the keys that edit what is written in it, and leaves the rest.
+        let edits = |event: &KeyEvent| matches!(event.key, Key::Left | Key::Char('b'));
+        let field = Element::canvas(Rc::new(Blank))
+            .width(200.0)
+            .height(24.0)
+            .role(Role::TextInput)
+            .label("Comment")
+            .field("Well said")
+            .caret(Some(Rect::new(4.0, 2.0, 1.0, 16.0)))
+            .on_text(Wrote::Field)
+            .on_key(move |event| edits(event).then(|| Wrote::Key(event.clone())));
+        let note = Popover::new(field).label("Note").beside().stays().open(true);
+        let page = Element::canvas(Rc::new(Blank)).grow(1.0).role(Role::Document).label("Page").default_focus();
+        page.caret(Some(PAGE_CARET)).on_text(Wrote::Page).popover(note)
+    }
+
+    fn update(&mut self, message: Wrote, _platform: &mut dyn Platform) {
+        self.sent.push(message);
+    }
+
+    fn key(&mut self, event: &KeyEvent, _platform: &mut dyn Platform) -> bool {
+        self.offered.push(event.clone());
+        true
+    }
+
+    fn describe(&self, canvas: &mut accesskit::Node, _nodes: &mut Vec<(accesskit::NodeId, accesskit::Node)>, _: bool) {
+        canvas.set_description("The app's own");
+    }
+}
+
+fn chord(key: Key, primary: bool) -> KeyEvent {
+    KeyEvent { key, mods: Modifiers { primary, ..Modifiers::default() } }
+}
+
+#[test]
+fn a_field_the_app_draws_has_its_keys_and_text_before_the_app() {
+    let mut slip = Harness::new(Slip::default());
+    // On the page, every key is the app's and what is typed is the page's.
+    slip.key("Left").key("Mod+B").type_text("a");
+    assert_eq!(slip.app().offered, [chord(Key::Left, false), chord(Key::Char('b'), true)]);
+    assert_eq!(slip.app().sent, [Wrote::Page(InputEvent::Insert("a".into()))]);
+    assert!(slip.ui().types_in_canvas());
+
+    // In the field, the keys it uses are its own, and of the rest the app hears the shortcuts.
+    slip.click(Role::TextInput, "Comment");
+    assert_eq!(focus_of(&mut slip), "Comment");
+    slip.key("Left").key("Mod+B").key("Down").key("Mod+S").type_text("b");
+    let field = [Wrote::Key(chord(Key::Left, false)), Wrote::Key(chord(Key::Char('b'), true))];
+    assert_eq!(slip.app().sent[1..], [&field[..], &[Wrote::Field(InputEvent::Insert("b".into()))]].concat());
+    assert_eq!(slip.app().offered[2..], [chord(Key::Char('s'), true)]);
+    assert!(!slip.ui().types_in_canvas(), "a shell asks the page nothing about text typed in the field");
+}
+
+#[test]
+fn a_field_the_app_draws_keeps_its_caret_to_itself_and_says_what_is_written_in_it() {
+    let mut slip = Harness::new(Slip::default());
+    // While the page has focus the caret that shows is the page's, though the field hangs beside it.
+    let page = slip.find(Role::Document, "Page").expect("the page");
+    let caret = slip.ui().caret_rect().expect("the page's caret");
+    assert_eq!((caret.x - page.bounds.x, caret.height), (PAGE_CARET.x, PAGE_CARET.height));
+
+    let field = slip.find(Role::TextInput, "Comment").expect("the field");
+    assert_eq!(field.value.as_deref(), Some("Well said"));
+    assert_eq!(field.description, None, "the app is asked to describe its own canvas only");
+    assert_eq!(page.description.as_deref(), Some("The app's own"));
+
+    slip.click(Role::TextInput, "Comment");
+    let caret = slip.ui().caret_rect().expect("the field's caret");
+    assert!(field.bounds.contains(Point { x: caret.x, y: caret.y }), "{caret:?} in {:?}", field.bounds);
+}
+
+fn focus_of<A: App>(window: &mut Harness<A>) -> String {
+    window.focused().map(|found| found.name).unwrap_or_default()
 }

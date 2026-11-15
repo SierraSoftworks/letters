@@ -22,6 +22,7 @@ letters-layout.workspace = true
 letters-fonts.workspace = true
 letters-math.workspace = true
 letters-spell.workspace = true
+letters-sync.workspace = true
 letters-trust.workspace = true
 letters = { path = "../apps/letters", optional = true }
 letters-render.workspace = true

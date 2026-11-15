@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use accesskit::Role;
 use letters_editor::{Editor, Picture, PreviewEdit};
-use letters_model::{BlockId, BlockKind};
+use letters_model::{Block, BlockId, BlockKind, Document};
 use letters_render::{DisplayList, Item, Point, Rect};
 
 use crate::color::resolve;
@@ -35,7 +35,7 @@ const NOTHING: &str = "the page has no title, description or picture";
 /// How wide the card is.
 const WIDTH: f32 = 320.0;
 /// The most room the control takes across, and how tall it is: yewi's small button.
-const CONTROL: (f32, f32) = (112.0, 24.0);
+pub(crate) const CONTROL: (f32, f32) = (112.0, 24.0);
 
 /// What a shell found of the page a link preview leads to, in answer to a `Request::FetchPreview`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -73,6 +73,8 @@ pub enum Previewing {
     Edit(PreviewEdit),
     /// Asks the shell for what the page of the preview whose card is out says of itself.
     Fetch,
+    /// Asks the shell for what the page at the address of a link in the text says of itself.
+    FetchLink(String),
     /// Escape or a press elsewhere.
     Close,
 }
@@ -88,13 +90,17 @@ pub(crate) struct Previews {
     address: Option<String>,
     /// The preview under the pointer, and whether the pointer is on its control.
     pub over: Option<(BlockId, bool)>,
-    /// The previews whose page was asked for: the address that was asked for, and why its fetch found
-    /// nothing, in the shell's words, which is `None` while the shell fetches.
-    fetches: BTreeMap<BlockId, (String, Option<String>)>,
+    /// The pages that were asked for, by their address: why the fetch found nothing, in the shell's words,
+    /// which is `None` while the shell fetches. A card and a link in the text that lead to one address
+    /// wait for one page.
+    fetches: BTreeMap<String, Option<String>>,
     /// Whether the shell cannot fetch what a page says of itself, so that nothing offers a fetch.
     unfetched: bool,
     /// What the page was last told to write on a preview: why its page was not fetched.
     noted: BTreeMap<BlockId, String>,
+    /// Whether what the page writes on its previews may hold no more: a fetch began or ended, or the
+    /// document changed.
+    stale: bool,
 }
 
 /// The address of a link preview.
@@ -110,6 +116,38 @@ pub(crate) fn control(room: Rect) -> Rect {
     let wide = CONTROL.0.min(room.width - 2.0 * tokens::SPACE_SM).max(0.0);
     let (x, y) = (room.x + (room.width - wide) / 2.0, room.y + (room.height - CONTROL.1) / 2.0);
     Rect::new(x.round(), y.round(), wide, CONTROL.1)
+}
+
+/// Whether an address is a web page's, which a shell can fetch.
+pub(crate) fn web(url: &str) -> bool {
+    let scheme = url.split_once("://").map(|(scheme, _)| scheme.to_ascii_lowercase());
+    matches!(scheme.as_deref(), Some("http" | "https"))
+}
+
+/// Draws a button that fetches a page, at `at`, as yewi's small button: what it `says`, lit while the
+/// pointer is `over` it. One whose page is being fetched (`waits`) is its words alone.
+pub(crate) fn button(
+    says: &str,
+    (waits, over): (bool, bool),
+    at: Rect,
+    shaper: &dyn TextShaper,
+    scheme: Scheme,
+    out: &mut DisplayList,
+) {
+    let radius = tokens::RADIUS_CONTROL;
+    let word = TextStyle::control().size(tokens::TEXT_SM).weight(500);
+    let shaped = shaper.shape(says, &word, None);
+    let origin = Point {
+        x: at.x + ((at.width - shaped.size.width) / 2.0).round(),
+        y: at.y + (at.height - shaped.size.height) / 2.0,
+    };
+    if waits {
+        return shaped.paint(origin, resolve(tokens::FG_MUTED, scheme, 1.0), out);
+    }
+    let ground = if over { tokens::TONE_1 } else { tokens::SURFACE };
+    out.push(Item::Fill { rect: at, color: resolve(ground, scheme, 1.0), radius });
+    out.push(Item::Stroke { rect: at, color: resolve(tokens::LINE_STRONG, scheme, 1.0), width: 1.0, radius });
+    shaped.paint(origin, resolve(tokens::FG, scheme, 1.0), out);
 }
 
 impl Previews {
@@ -161,7 +199,7 @@ impl Previews {
     /// Takes whether the shell can fetch what a page says of itself. Where it cannot, nothing waits for
     /// a page.
     pub fn offer(&mut self, offered: bool) {
-        self.unfetched = !offered;
+        (self.unfetched, self.stale) = (!offered, true);
         if self.unfetched {
             self.fetches.clear();
         }
@@ -172,29 +210,34 @@ impl Previews {
         !self.unfetched
     }
 
-    /// Notes that a preview waits for the page at its address. Returns whether the shell has to be asked:
-    /// it can fetch, and no fetch of that address runs already, for this preview or for another.
-    pub fn fetch(&mut self, block: &BlockId, url: &str) -> bool {
-        if self.unfetched {
+    /// Notes that the page at an address is waited for. Returns whether the shell has to be asked: it can
+    /// fetch, and no fetch of that address runs already.
+    pub fn fetch(&mut self, url: &str) -> bool {
+        if self.unfetched || self.waits(url) {
             return false;
         }
-        let asked = self.fetches.values().any(|(at, failed)| at == url && failed.is_none());
-        self.fetches.insert(block.clone(), (url.to_owned(), None));
-        !asked
+        self.fetches.insert(url.to_owned(), None);
+        self.stale = true;
+        true
     }
 
     /// Takes the shell's answer for an address: why it found nothing, or `None` when it found the page.
-    /// Returns the previews that waited for it.
-    pub fn answered(&mut self, url: &str, failed: Option<&str>) -> Vec<BlockId> {
-        let waits = |(_, (at, failed)): &(&BlockId, &(String, Option<String>))| at == url && failed.is_none();
-        let waited: Vec<BlockId> = self.fetches.iter().filter(waits).map(|(block, _)| block.clone()).collect();
-        for block in &waited {
-            match failed {
-                Some(why) => _ = self.fetches.insert(block.clone(), (url.to_owned(), Some(why.trim().to_owned()))),
-                None => _ = self.fetches.remove(block),
-            }
+    /// Returns whether the page was waited for.
+    pub fn answered(&mut self, url: &str, failed: Option<&str>) -> bool {
+        if !self.waits(url) {
+            return false;
         }
-        waited
+        match failed {
+            Some(why) => _ = self.fetches.insert(url.to_owned(), Some(why.trim().to_owned())),
+            None => _ = self.fetches.remove(url),
+        }
+        self.stale = true;
+        true
+    }
+
+    /// Notes that the document changed: a preview may have come, gone or been given another address.
+    pub fn edited(&mut self) {
+        self.stale = true;
     }
 
     /// What is said of a page that was read and says nothing a card can show.
@@ -202,36 +245,44 @@ impl Previews {
         NOTHING
     }
 
-    /// Puts the card away once its preview is gone, and forgets the fetch of an address that a preview
-    /// leads to no more.
+    /// Puts the card away once its preview is gone.
     pub fn follow(&mut self, editor: &Editor) {
         let leads = |block: &BlockId| editor.doc().block(block).and_then(|block| address(&block.kind));
         if self.open.as_ref().is_some_and(|open| leads(open).is_none()) {
             self.close();
         }
-        self.fetches.retain(|block, (at, _)| leads(block) == Some(at.as_str()));
     }
 
-    /// What the control of a preview says now.
-    pub fn says(&self, block: &BlockId) -> &'static str {
-        match self.fetches.get(block) {
-            Some((_, None)) => FETCHING,
-            Some((_, Some(_))) => AGAIN,
+    /// What the page writes on its previews now: why the page of each was not fetched.
+    pub fn noted(&self) -> &BTreeMap<BlockId, String> {
+        &self.noted
+    }
+
+    /// What a control that fetches the page at an address says now.
+    pub fn says(&self, url: &str) -> &'static str {
+        match self.fetches.get(url) {
+            Some(None) => FETCHING,
+            Some(Some(_)) => AGAIN,
             None => FETCH,
         }
     }
 
-    /// What is said of a preview whose last fetch found nothing: that, and why.
-    pub fn failed(&self, block: &BlockId) -> Option<String> {
-        let (_, failed) = self.fetches.get(block)?;
-        Some(format!("Not fetched: {}", failed.as_deref()?))
+    /// What is said of an address whose last fetch found nothing: that, and why.
+    pub fn failed(&self, url: &str) -> Option<String> {
+        Some(format!("Not fetched: {}", self.fetches.get(url)?.as_deref()?))
     }
 
-    /// What the page is to write on its previews from now on. For each one whose line changes: what is
-    /// said of its failed fetch, or `None` where that holds no more.
-    pub fn notes(&mut self) -> Vec<(BlockId, Option<String>)> {
-        let said = |block: &BlockId| Some((block.clone(), self.failed(block)?));
-        let now: BTreeMap<BlockId, String> = self.fetches.keys().filter_map(said).collect();
+    /// What the page is to write on the previews of a document from now on. For each one whose line
+    /// changes: what is said of the failed fetch of its address, or `None` where that holds no more.
+    pub fn notes(&mut self, doc: &Document) -> Vec<(BlockId, Option<String>)> {
+        if !std::mem::take(&mut self.stale) {
+            return Vec::new();
+        }
+        let failing = self.fetches.values().any(Option::is_some);
+        let said = |block: &Block| Some((block.id.clone(), self.failed(address(&block.kind)?)?));
+        // The document is gone through only while there is something to say of one of its addresses.
+        let now: BTreeMap<BlockId, String> =
+            if failing { doc.walk().filter_map(said).collect() } else { BTreeMap::new() };
         let gone = self.noted.keys().filter(|block| !now.contains_key(*block)).map(|block| (block.clone(), None));
         let new = now.iter().filter(|(block, note)| self.noted.get(*block) != Some(*note));
         let changed = gone.chain(new.map(|(block, note)| (block.clone(), Some(note.clone())))).collect();
@@ -242,32 +293,37 @@ impl Previews {
     /// Forgets what the page was told to write, and returns the previews it was written on. A sheet says
     /// nothing of a fetch, and the page is told again once it shows.
     pub fn unnoted(&mut self) -> Vec<BlockId> {
+        self.stale = true;
         std::mem::take(&mut self.noted).into_keys().collect()
     }
 
-    /// Whether a press on a preview's control asks for anything: not while its page is being fetched.
-    pub fn waits(&self, block: &BlockId) -> bool {
-        matches!(self.fetches.get(block), Some((_, None)))
+    /// Whether the page at an address is being fetched, so that a press on a control for it asks for
+    /// nothing.
+    pub fn waits(&self, url: &str) -> bool {
+        matches!(self.fetches.get(url), Some(None))
     }
 
-    /// Draws the control of a preview that shows its address alone, at `at`, as yewi's small button. One
-    /// whose page is being fetched says so and takes no press.
-    pub fn paint(&self, block: &BlockId, at: Rect, shaper: &dyn TextShaper, scheme: Scheme, out: &mut DisplayList) {
-        let (waits, radius) = (self.waits(block), tokens::RADIUS_CONTROL);
-        let over = !waits && self.over.as_ref() == Some(&(block.clone(), true));
-        let word = TextStyle::control().size(tokens::TEXT_SM).weight(500);
-        let shaped = shaper.shape(self.says(block), &word, None);
-        let origin = Point {
-            x: at.x + ((at.width - shaped.size.width) / 2.0).round(),
-            y: at.y + (at.height - shaped.size.height) / 2.0,
-        };
-        if waits {
-            return shaped.paint(origin, resolve(tokens::FG_MUTED, scheme, 1.0), out);
+    /// Draws the control of a preview that shows its address alone, at `at`. One whose page is being
+    /// fetched says so and takes no press.
+    pub fn paint(
+        &self,
+        (block, url): (&BlockId, &str),
+        at: Rect,
+        shaper: &dyn TextShaper,
+        scheme: Scheme,
+        out: &mut DisplayList,
+    ) {
+        let (waits, over) = (self.waits(url), self.over.as_ref() == Some(&(block.clone(), true)));
+        button(self.says(url), (waits, over), at, shaper, scheme, out);
+    }
+
+    /// What a button that fetches the page at an address says in a card: as a control does, and that
+    /// the page is fetched again where something of it shows already.
+    pub fn asks(&self, url: &str, shown: bool) -> &'static str {
+        match self.says(url) {
+            FETCH if shown => "Fetch again",
+            says => says,
         }
-        let ground = if over { tokens::TONE_1 } else { tokens::SURFACE };
-        out.push(Item::Fill { rect: at, color: resolve(ground, scheme, 1.0), radius });
-        out.push(Item::Stroke { rect: at, color: resolve(tokens::LINE_STRONG, scheme, 1.0), width: 1.0, radius });
-        shaped.paint(origin, resolve(tokens::FG, scheme, 1.0), out);
     }
 
     /// The card that asks for the address of a preview to put in, which hangs from the caret at `spot`.
@@ -287,7 +343,7 @@ impl Previews {
     }
 
     /// The card of a preview, which hangs under it at `spot`. `None` for a block that is no preview.
-    pub fn card(&self, block: &BlockId, kind: &BlockKind, spot: Rect) -> Option<Popover<Message>> {
+    pub fn card(&self, kind: &BlockKind, spot: Rect) -> Option<Popover<Message>> {
         let BlockKind::LinkPreview { url, title, description, image } = kind else { return None };
         let send = Message::Preview;
         let edit = move |edit: PreviewEdit| send(Previewing::Edit(edit));
@@ -320,11 +376,8 @@ impl Previews {
         // The button says what the control on the card says. A fetch of a preview that shows something
         // already brings what stands over that, so it is asked for as another.
         let fetched = title.is_some() || description.is_some() || image.is_some();
-        let fetch = match self.says(block) {
-            FETCH if fetched => "Fetch again",
-            says => says,
-        };
-        let fetch = Button::new(fetch).small().disabled(self.waits(block)).on_press(send(Previewing::Fetch));
+        let fetch = Button::new(self.asks(url, fetched)).small().disabled(self.waits(url));
+        let fetch = fetch.on_press(send(Previewing::Fetch));
         let mut buttons = Element::row().align(Align::Center).justify(Justify::Between);
         buttons = buttons.children(self.offered().then_some(fetch));
         if image.is_some() {
@@ -333,7 +386,7 @@ impl Previews {
         }
 
         let mut card = Element::column().width(WIDTH).gap(tokens::SPACE_SM).child(address).child(heading).child(about);
-        if let Some(failed) = self.failed(block) {
+        if let Some(failed) = self.failed(url) {
             let quiet = TextStyle::control().size(tokens::TEXT_SM);
             let said = Element::paragraph(failed, quiet).fg(tokens::DANGER).max_width(WIDTH);
             card = card.child(said.role(Role::Status));
@@ -355,59 +408,75 @@ mod tests {
 
     const ROOF: &str = "https://example.org/roof";
 
-    #[test]
-    fn the_control_says_how_the_fetch_of_its_preview_stands() {
-        let (mut previews, block, twin) = (Previews::default(), BlockId::new("card"), BlockId::new("twin"));
-        assert_eq!(previews.says(&block), FETCH);
-        assert!(previews.fetch(&block, ROOF), "the shell is asked");
-        assert!(!previews.fetch(&block, ROOF), "and not twice for one fetch");
-        assert!(!previews.fetch(&twin, ROOF), "nor for another preview of the address");
-        assert_eq!((previews.says(&block), previews.waits(&block)), (FETCHING, true));
+    const WALL: &str = "https://example.org/wall";
 
-        assert_eq!(previews.answered("https://example.org/wall", None), [], "an answer for another address");
-        assert_eq!(previews.answered(ROOF, Some(" the server answered 404 ")), [block.clone(), twin.clone()]);
-        for block in [&block, &twin] {
-            assert_eq!((previews.says(block), previews.waits(block)), (AGAIN, false));
-            assert_eq!(previews.failed(block).as_deref(), Some("Not fetched: the server answered 404"));
-        }
+    /// A document of two link previews that lead to the roof's page and one that leads to the wall's.
+    fn cards() -> Document {
+        let card = |id: &str, url: &str| {
+            Block::new(id, BlockKind::LinkPreview { url: url.to_owned(), title: None, description: None, image: None })
+        };
+        Document { blocks: vec![card("card", ROOF), card("twin", ROOF), card("other", WALL)], ..Document::default() }
+    }
+
+    #[test]
+    fn a_control_says_how_the_fetch_of_its_address_stands() {
+        let mut previews = Previews::default();
+        assert_eq!(previews.says(ROOF), FETCH);
+        assert!(previews.fetch(ROOF), "the shell is asked");
+        assert!(!previews.fetch(ROOF), "and not twice for one fetch");
+        assert_eq!((previews.says(ROOF), previews.waits(ROOF)), (FETCHING, true));
+        assert_eq!((previews.says(WALL), previews.waits(WALL)), (FETCH, false), "another address is not waited for");
+
+        assert!(!previews.answered(WALL, None), "an answer nothing waits for");
+        assert!(previews.answered(ROOF, Some(" the server answered 404 ")));
+        assert_eq!((previews.says(ROOF), previews.waits(ROOF)), (AGAIN, false));
+        assert_eq!(previews.failed(ROOF).as_deref(), Some("Not fetched: the server answered 404"));
 
         // Another try forgets why the last one failed, and a page that was found leaves nothing to say.
-        assert!(previews.fetch(&block, ROOF));
-        assert_eq!(previews.failed(&block), None);
-        assert_eq!(
-            previews.answered(ROOF, None),
-            std::slice::from_ref(&block),
-            "one that does not wait is not answered"
-        );
-        assert_eq!((previews.says(&block), previews.waits(&block)), (FETCH, false));
-        assert_eq!(previews.says(&twin), AGAIN);
+        assert!(previews.fetch(ROOF));
+        assert_eq!(previews.failed(ROOF), None);
+        assert!(previews.answered(ROOF, None));
+        assert!(!previews.answered(ROOF, None), "an answer is taken once");
+        assert_eq!((previews.says(ROOF), previews.waits(ROOF)), (FETCH, false));
+
+        // A shell that cannot fetch is asked for nothing.
+        previews.offer(false);
+        assert!(!previews.fetch(ROOF));
+        assert_eq!(previews.says(ROOF), FETCH);
     }
 
     #[test]
     fn the_page_is_told_once_what_to_write_on_a_preview_and_once_to_take_it_away() {
-        let (mut previews, block, twin) = (Previews::default(), BlockId::new("card"), BlockId::new("twin"));
+        let (mut previews, doc) = (Previews::default(), cards());
+        let (block, twin) = (BlockId::new("card"), BlockId::new("twin"));
         let said = |code: u16| Some(format!("Not fetched: the server answered {code}"));
-        previews.fetch(&block, ROOF);
-        previews.fetch(&twin, ROOF);
-        assert_eq!(previews.notes(), [], "nothing is said of a fetch that runs");
+        previews.fetch(ROOF);
+        assert_eq!(previews.notes(&doc), [], "nothing is said of a fetch that runs");
         previews.answered(ROOF, Some("the server answered 404"));
-        assert_eq!(previews.notes(), [(block.clone(), said(404)), (twin.clone(), said(404))]);
-        assert_eq!(previews.notes(), [], "what stands is not told again");
+        let both = |code: u16| [(block.clone(), said(code)), (twin.clone(), said(code))];
+        assert_eq!(previews.notes(&doc), both(404), "on every preview that leads to the address, and no other");
+        assert_eq!(previews.notes(&doc), [], "what stands is not told again");
 
-        // Another try takes the line away, and one that fails for another reason writes that.
-        previews.fetch(&block, ROOF);
-        assert_eq!(previews.notes(), [(block.clone(), None)]);
+        // Another try takes the lines away, and one that fails for another reason writes that.
+        previews.fetch(ROOF);
+        assert_eq!(previews.notes(&doc), [(block.clone(), None), (twin.clone(), None)]);
         previews.answered(ROOF, Some("the server answered 500"));
-        assert_eq!(previews.notes(), [(block.clone(), said(500))]);
-        previews.fetch(&block, ROOF);
+        assert_eq!(previews.notes(&doc), both(500));
+        previews.fetch(ROOF);
         previews.answered(ROOF, Some("the server answered 503"));
-        assert_eq!(previews.notes(), [(block.clone(), said(503))], "though the page was not told of the try");
+        assert_eq!(previews.notes(&doc), both(503), "though the page was not told of the try");
+
+        // A preview that is gone, or leads elsewhere by now, has nothing written on it.
+        let left = Document { blocks: doc.blocks[1..].to_vec(), ..Document::default() };
+        assert_eq!(previews.notes(&left), [], "until the page hears that the document changed");
+        previews.edited();
+        assert_eq!(previews.notes(&left), [(block.clone(), None)]);
         // What a sheet has taken away is written again on the page.
-        assert_eq!(previews.unnoted(), [block.clone(), twin.clone()]);
-        assert_eq!(previews.notes(), [(block.clone(), said(503)), (twin.clone(), said(404))]);
+        assert_eq!(previews.unnoted(), std::slice::from_ref(&twin));
+        assert_eq!(previews.notes(&left), [(twin.clone(), said(503))]);
         // A shell that cannot fetch after all leaves nothing to say.
         previews.offer(false);
-        assert_eq!(previews.notes(), [(block, None), (twin, None)]);
+        assert_eq!(previews.notes(&left), [(twin, None)]);
     }
 
     #[test]

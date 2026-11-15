@@ -3,7 +3,9 @@
 use std::fmt;
 use std::str::FromStr;
 
-use loro::{Frontiers, ID};
+use std::cmp::Ordering;
+
+use loro::{Frontiers, ID, LoroDoc, VersionVector};
 use sha2::{Digest, Sha256};
 
 /// One writer of a document.
@@ -57,6 +59,59 @@ pub(crate) fn read_id(text: &str) -> Option<ID> {
     let (counter, peer) = text.split_once('@')?;
     let counter: i32 = counter.parse().ok()?;
     (counter >= 0).then_some(ID::new(peer.parse().ok()?, counter))
+}
+
+/// How far a history has read each of its writers. Two replicas trade these, and each then sends the other
+/// only what it lacks: see [`Model::extent`](crate::Model::extent).
+///
+/// Extents order as the histories they tell of do: `Greater` holds everything the other does and more,
+/// and two that each hold what the other lacks do not order. As bytes one grows with the number of
+/// sessions that ever wrote, since each session writes under an id of its own.
+#[derive(Clone, Debug, Default)]
+pub struct Extent(pub(crate) VersionVector);
+
+impl Extent {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.encode()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, HistoryError> {
+        let read = VersionVector::decode(bytes).map_err(|_| HistoryError::Unreadable("not an extent".into()))?;
+        Ok(Self(read))
+    }
+
+    /// How far the edits in a saved history or an update reach, for each writer with edits in it.
+    pub fn of(history: &[u8]) -> Result<Self, HistoryError> {
+        let read = LoroDoc::decode_import_blob_meta(history, true);
+        read.map(|meta| Self(meta.partial_end_vv)).map_err(|error| HistoryError::Unreadable(error.to_string()))
+    }
+
+    /// Takes in what `other` tells of, as a history does that merges the other.
+    pub fn merge(&mut self, other: &Extent) {
+        self.0.merge(&other.0);
+    }
+
+    /// Whether the two tell of an edit in common, as copies that began as one document do.
+    pub fn shares(&self, other: &Extent) -> bool {
+        self.0.iter().any(|(writer, end)| *end > 0 && other.0.get(writer).is_some_and(|held| *held > 0))
+    }
+
+    /// Whether it tells of no edit at all, as a copy does that is yet to be filled.
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|(_, end)| *end <= 0)
+    }
+}
+
+impl PartialEq for Extent {
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other) == Some(Ordering::Equal)
+    }
+}
+
+impl PartialOrd for Extent {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
 }
 
 /// Why a history was refused. The model is left as it was.
