@@ -1387,6 +1387,7 @@ fn family() -> Location {
         name: Some("Cottage renovation".into()),
         folder: "/Family/House".into(),
         folders: folders.map(folder).into(),
+        ..Location::default()
     }
 }
 

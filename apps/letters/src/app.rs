@@ -946,6 +946,7 @@ impl DocWindow {
             name: name.clone(),
             folder: folder.to_string_lossy().into_owned(),
             folders: if remote { Vec::new() } else { library.folders(&folder).into_iter().filter_map(shown).collect() },
+            ..Location::default()
         });
         self.located = Some((name, folder));
     }

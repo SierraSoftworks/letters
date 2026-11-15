@@ -18,7 +18,23 @@ fn family() -> Location {
         depth: path.matches('/').count() as u8 - 1,
     };
     let folders = ["/Family", HOUSE, QUOTES, "/Family/School"];
-    Location { name: Some("Cottage renovation".into()), folder: HOUSE.into(), folders: folders.map(folder).into() }
+    Location {
+        name: Some("Cottage renovation".into()),
+        folder: HOUSE.into(),
+        folders: folders.map(folder).into(),
+        ..Location::default()
+    }
+}
+
+/// Where a server keeps the plan: folders of the server's, and nowhere else for the plan to go.
+fn served() -> Location {
+    let folder = |path: &str, name: &str, depth| Folder { path: path.into(), name: name.into(), depth };
+    Location {
+        name: Some("Cottage renovation".into()),
+        folder: "shared/plans".into(),
+        folders: vec![folder("shared", "Shared", 0), folder("shared/plans", "Plans", 1)],
+        closed: true,
+    }
 }
 
 /// A short letter, kept where `location` says.
@@ -359,6 +375,41 @@ fn a_new_folder_is_made_from_the_card_and_picked() {
     window.assert_open(Role::Dialog, "Save a copy").click(Role::Button, "Save copy in Drafts");
     let asked = copy("Cottage renovation copy", CopyFormat::Letters, Some("/Family/House/Quotes/Drafts"), false);
     assert_eq!(window.ui().take_requests(), [asked]);
+}
+
+#[test]
+fn a_copy_of_a_document_kept_elsewhere_goes_among_the_folders_the_shell_names_for_copies() {
+    let mut window = letter(served());
+    window.ui().set_copy_location(Some(family()));
+    window.key("Mod+Shift+S").assert_open(Role::TreeItem, "Quotes").assert_closed(Role::TreeItem, "Plans");
+    window.click(Role::TreeItem, "Quotes").click(Role::Button, "New folder");
+    window.type_text("Drafts").key("Enter");
+    assert_eq!(window.ui().take_requests(), [Request::NewFolder { parent: QUOTES.into(), name: "Drafts".into() }]);
+
+    // What the shell says of the document's own place meanwhile is not the card's.
+    window.ui().set_location(served());
+    let mut copies = family();
+    copies.folders.insert(3, Folder { path: "/Family/House/Quotes/Drafts".into(), name: "Drafts".into(), depth: 3 });
+    window.ui().set_copy_location(Some(copies));
+    window.click(Role::Button, "Save copy in Drafts");
+    let asked = copy("Cottage renovation copy", CopyFormat::Letters, Some("/Family/House/Quotes/Drafts"), false);
+    assert_eq!(window.ui().take_requests(), [asked]);
+
+    // With no place of their own, copies go where the document is.
+    window.ui().set_copy_location(None);
+    window.key("Mod+Shift+S").assert_open(Role::TreeItem, "Plans").assert_closed(Role::TreeItem, "Quotes");
+}
+
+#[test]
+fn a_place_with_nowhere_else_to_go_offers_no_other_location() {
+    let other = "Other location\u{2026}";
+    for closed in [false, true] {
+        let mut window = letter(Location { closed, ..family() });
+        window.key("Mod+Shift+S").assert_open(Role::Tree, "Folder");
+        assert_eq!(window.find(Role::Button, other).is_some(), !closed, "closed: {closed}: on the card");
+        window.key("Escape").click(Role::Button, "Cottage renovation").assert_open(Role::Tree, "Move to");
+        assert_eq!(window.find(Role::Button, other).is_some(), !closed, "closed: {closed}: under the name");
+    }
 }
 
 #[test]

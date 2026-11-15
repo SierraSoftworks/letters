@@ -210,6 +210,9 @@ pub struct Location {
     pub folder: String,
     /// The folders it can move to, in tree order.
     pub folders: Vec<Folder>,
+    /// Whether `folders` are all the places there are for it, as for a document a server keeps. Nothing
+    /// then offers "Other location", which asks for a folder of the device.
+    pub closed: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

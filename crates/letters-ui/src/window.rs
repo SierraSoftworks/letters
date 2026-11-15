@@ -375,6 +375,20 @@ impl Ui<EditorApp> {
         self.app_mut().place(location);
     }
 
+    /// Says where copies of the document go, when that is not where the document is: a copy of a document
+    /// a server keeps is a file on this device. The card that saves a copy then lists these folders, and its
+    /// [`Request::SaveCopy`] and [`Request::NewFolder`] carry their paths. The name is not read. `None`,
+    /// as at the start, is the document's own [`Location`]. It is also the answer to a
+    /// [`Request::NewFolder`] the card asked for.
+    pub fn set_copy_location(&mut self, location: Option<Location>) {
+        let app = self.app_mut();
+        app.copy_location = location;
+        let place = app.copy_location.as_ref().unwrap_or(&app.location);
+        if let Some(copy) = &mut app.copying {
+            copy.placed(place);
+        }
+    }
+
     /// Says why a rename, a move or a new folder could not be done, as the person is to read it. The name
     /// field comes back with what was typed, marked as wrong, and says so until something in it changes.
     /// `None` takes the notice away.
@@ -1049,6 +1063,8 @@ pub struct EditorApp {
     /// Whether the layout still holds estimated heights, to be replaced in idle time.
     estimated: bool,
     location: Location,
+    /// Where copies go, when that is not where the document is.
+    copy_location: Option<Location>,
     /// What the landing card offers, while it shows.
     landing: Option<Landing>,
     /// The file the import card offers, while it shows.
@@ -1183,6 +1199,7 @@ impl EditorApp {
             scale: 1.0,
             estimated: true,
             location: Location::default(),
+            copy_location: None,
             landing: None,
             importing: None,
             requests: Vec::new(),
@@ -1296,9 +1313,15 @@ impl EditorApp {
         if let Some(renaming) = &mut self.renaming {
             renaming.placed(&self.location);
         }
-        if let Some(copy) = &mut self.copying {
+        // Copies that go elsewhere are placed by what the shell says of that place.
+        if let Some(copy) = self.copying.as_mut().filter(|_| self.copy_location.is_none()) {
             copy.placed(&self.location);
         }
+    }
+
+    /// Where copies of the document go: where the shell says, or else where the document is.
+    fn copies_to(&self) -> &Location {
+        self.copy_location.as_ref().unwrap_or(&self.location)
     }
 
     /// What the card that saves a copy asks for.
@@ -1312,14 +1335,16 @@ impl EditorApp {
             {
                 // While the history shows an earlier version, the copy is of that.
                 let version = self.history.as_ref().and_then(History::copied);
-                let mut copy = Copy::open(format, &self.location, &title, version);
+                let place = self.copy_location.as_ref().unwrap_or(&self.location);
+                let mut copy = Copy::open(format, place, &title, version);
                 self.weigh(&mut copy);
                 self.copying = Some(copy);
             }
             return;
         };
         let format = copy.format();
-        match copy.update(message, &self.location, &title, &mut self.requests) {
+        let place = self.copy_location.as_ref().unwrap_or(&self.location);
+        match copy.update(message, place, &title, &mut self.requests) {
             copying::Outcome::Open => {
                 if copy.format() != format {
                     self.weigh(&mut copy);
@@ -2359,7 +2384,7 @@ impl EditorApp {
         }
         // The tool that copies a passage waits behind the card that copies the version.
         match (&self.copying, history.tools().filter(|_| self.allows.copy)) {
-            (Some(copy), _) => version.popover(copy.card(&self.location, room)),
+            (Some(copy), _) => version.popover(copy.card(self.copies_to(), room)),
             (None, Some(tools)) => version.popover(tools),
             (None, None) => version,
         }
@@ -2469,7 +2494,7 @@ impl EditorApp {
             }
         }
         if let Some(copy) = &self.copying {
-            sheets = sheets.popover(copy.card(&self.location, room));
+            sheets = sheets.popover(copy.card(self.copies_to(), room));
         }
         sheets
     }
@@ -4082,7 +4107,7 @@ impl EditorApp {
         } else if let Some(landing) = &self.landing {
             element = element.popover(Self::card(landing, room));
         } else if let Some(copy) = &self.copying {
-            element = element.popover(copy.card(&self.location, room));
+            element = element.popover(copy.card(self.copies_to(), room));
         } else if let Some((figure, src)) =
             self.linked.open.as_ref().and_then(|figure| Some((figure, self.link_of(figure)?)))
         {

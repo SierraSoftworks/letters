@@ -276,13 +276,16 @@ impl Copy {
         if !location.folders.is_empty() {
             let title = Element::text(folders::title(location), quiet.weight(600)).fg(tokens::FG_MUTED);
             let tree = self.tree.list(location, "Folder", ROWS, browse);
-            rows = (location.folders.len() as f32).min(ROWS) + 2.0;
+            rows = (location.folders.len() as f32).min(ROWS) + 1.0;
             card = card
                 .child(line())
                 .child(Element::column().padding(section).child(title))
-                .child(Element::column().padding(inset).child(tree))
-                .child(line())
-                .child(Element::column().padding(inset).child(folders::elsewhere(send(Copying::Elsewhere))));
+                .child(Element::column().padding(inset).child(tree));
+            if !location.closed {
+                let other = folders::elsewhere(send(Copying::Elsewhere));
+                card = card.child(line()).child(Element::column().padding(inset).child(other));
+                rows += 1.0;
+            }
         }
         card = card.child(line()).child(self.foot(location));
 
