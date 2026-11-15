@@ -19,7 +19,8 @@ use letters::{fallback, trust};
 use letters_format::{Archive, OPLOG, Package};
 use letters_layout::Uncovered;
 use letters_model::{
-    Anchor, Block, BlockKind, Document, Mark, Model, Note, NoteKind, Notes, Op, Pos, ReplicaId, Run, Style,
+    Anchor, Block, BlockKind, Body, Document, Mark, Model, Note, NoteKind, Notes, Op, Pos, Preview, ReplicaId, Run,
+    Style,
 };
 use letters_trust::Mode;
 
@@ -598,8 +599,19 @@ fn a_clean_copy_is_the_document_without_its_history_and_notes() {
         description: None,
         image: Some("assets/card.png".into()),
     };
-    let blocks = vec![Block::text("p", BlockKind::Paragraph, "Rates"), Block::new("f", shown), Block::new("c", card)];
-    let mut model = Model::new(Document { blocks, ..Document::default() }, ReplicaId::new("a device"));
+    let mut linked = Block::new("l", BlockKind::Paragraph);
+    linked.body =
+        Body::Text(vec![Run { link: Some("https://example.com/kept".into()), ..Run::plain("See the rates") }]);
+    let blocks =
+        vec![Block::text("p", BlockKind::Paragraph, "Rates"), Block::new("f", shown), Block::new("c", card), linked];
+    // What was fetched of a page a link leads to, and of one whose link the text no longer has.
+    let fetched = |picture: &str| Preview { image: Some(picture.into()), ..Preview::default() };
+    let previews = [
+        ("https://example.com/kept".to_owned(), fetched("assets/hover.png")),
+        ("https://example.com/gone".to_owned(), fetched("assets/stale.png")),
+    ];
+    let document = Document { blocks, previews: previews.into(), ..Document::default() };
+    let mut model = Model::new(document, ReplicaId::new("a device"));
     model.set_author("Ada Lovelace");
     model.apply([Op::InsertText { at: Pos::new("p", 5), text: " change in January.".into() }]).unwrap();
     let mut package = Package {
@@ -611,7 +623,9 @@ fn a_clean_copy_is_the_document_without_its_history_and_notes() {
     package.entries.insert(OPLOG.into(), model.save());
     // A picture the page shows in a figure, one a link preview shows, and one only an earlier version did.
     package.entries.insert("assets/shown.png".into(), PICTURE.to_vec());
-    package.entries.insert("assets/card.png".into(), PICTURE.to_vec());
+    for name in ["assets/card.png", "assets/hover.png", "assets/stale.png"] {
+        package.entries.insert(name.into(), PICTURE.to_vec());
+    }
     package.entries.insert("assets/removed.png".into(), PICTURE.to_vec());
     package.set_style(&Style::default());
     let mut out = Cursor::new(Vec::new());
@@ -631,12 +645,15 @@ fn a_clean_copy_is_the_document_without_its_history_and_notes() {
 
     let mut copy = open(&folder.path("Rates clean.let"));
     let clean = copy.package().unwrap();
-    assert_eq!(clean.document, package.document, "the document is the same");
+    assert_eq!(clean.document.blocks, package.document.blocks, "the document reads the same");
+    let previews: Vec<&str> = clean.document.previews.keys().map(String::as_str).collect();
+    assert_eq!(previews, ["https://example.com/kept"], "with the previews its links still name");
     assert_ne!(clean.id, package.id, "under an id of its own");
     let names: Vec<&str> = clean.entries.keys().map(String::as_str).collect();
     assert!(!names.iter().any(|name| name.starts_with(letters_format::HISTORY)), "no history: {names:?}");
     assert!(clean.notes().unwrap().notes.is_empty(), "no notes");
-    assert_eq!(pictures_held(&names), ["assets/card.png", "assets/shown.png"], "only the pictures the page shows");
+    let pictures = ["assets/card.png", "assets/hover.png", "assets/shown.png"];
+    assert_eq!(pictures_held(&names), pictures, "only the pictures the page shows");
     assert!(names.contains(&letters_format::STYLE), "and its style");
 
     // The copy opens and exports like any document.

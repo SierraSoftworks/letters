@@ -165,10 +165,12 @@ pub fn exported_with(file: Vec<u8>, title: &str, to: Format, linked: Linked) -> 
 /// - The history goes, and with it every earlier version and who wrote what.
 /// - The notes go: comments, import notes and conflicts. The document stands as the page shows it.
 /// - A picture stays only where the document shows it, in a figure or a link preview. The file may hold
-///   others that the history still named.
+///   others that the history still named. The preview of a link the text no longer has goes too.
 /// - The style and the writer's own words for the spelling check stay, since they are the document's.
 fn clean(package: &mut Package) {
     (package.id, package.created) = (platform::document_id(), platform::now_rfc3339());
+    // A preview no link names is kept for the history's sake, which goes.
+    package.document.prune_previews();
     // The document says which pictures it shows, so that none is left behind here.
     let shown = package.document.assets();
     let kept = |name: &str| match name {
