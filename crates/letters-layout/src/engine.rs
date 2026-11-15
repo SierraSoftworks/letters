@@ -4,12 +4,13 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
+use icu_properties::props::BidiClass;
 use letters_render::{Color, Font, FontBytes, Glyph, Item, Point};
 use parley::fontique::{Blob, CharmapIndex, Collection, CollectionOptions, FamilyId, SourceCache};
 use parley::setting::Tag;
 use parley::{
-    FontContext, FontFamily, FontFamilyName, FontStyle, FontVariation, FontVariations, FontWeight, GenericFamily,
-    GlyphRun, InlineBox, Language, Layout, LayoutContext, LineHeight, OverflowWrap, Run, TextStyle,
+    BaseDirection, FontContext, FontFamily, FontFamilyName, FontStyle, FontVariation, FontVariations, FontWeight,
+    GenericFamily, GlyphRun, InlineBox, Language, Layout, LayoutContext, LineHeight, OverflowWrap, Run, TextStyle,
 };
 use parley_data::Properties;
 
@@ -272,11 +273,12 @@ impl Engine {
         locale: Option<Language>,
         layout: &mut Layout<Brush>,
     ) {
-        self.build_with(text, specs, runs, &[], false, locale, layout);
+        self.build_with(text, specs, runs, &[], false, locale, BaseDirection::Auto, layout);
     }
 
     /// As [`Engine::build`], with `boxes` set in the line, each at a U+FFFC of the text. `by_words` keeps a
     /// word whole when the layout is asked how narrow it can go, which is what sizes a table's columns.
+    /// `reads` is the side the text reads from, where the caller has decided it.
     #[allow(clippy::too_many_arguments)]
     pub fn build_with(
         &mut self,
@@ -286,6 +288,7 @@ impl Engine {
         boxes: &[InlineBox],
         by_words: bool,
         locale: Option<Language>,
+        reads: BaseDirection,
         layout: &mut Layout<Brush>,
     ) {
         let has = |spec: &Spec| {
@@ -297,6 +300,7 @@ impl Engine {
             self.note(text.get(range.clone()).unwrap_or_default(), locale);
         }
         let mut builder = self.lcx.style_run_builder(&mut self.fcx, text, 1.0, true);
+        builder.set_base_direction(reads);
         for spec in specs {
             let generic = if spec.mono { GenericFamily::Monospace } else { GenericFamily::SansSerif };
             let stack = [FontFamilyName::named(spec.family), FontFamilyName::Generic(generic)];
@@ -389,6 +393,18 @@ impl Engine {
         }
         self.instances.push((id, font.clone()));
         Some(font)
+    }
+}
+
+/// The side a letter reads from, `true` for the right. Digits, spaces and signs have none of their own.
+pub(crate) fn reads(ch: char) -> Option<bool> {
+    if ch.is_ascii() {
+        return ch.is_ascii_alphabetic().then_some(false);
+    }
+    match Properties::get(ch).bidi_class() {
+        BidiClass::LeftToRight => Some(false),
+        BidiClass::RightToLeft | BidiClass::ArabicLetter => Some(true),
+        _ => None,
     }
 }
 

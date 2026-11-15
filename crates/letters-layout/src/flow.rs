@@ -5,12 +5,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use letters_model::{Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Style, TextStyle, Tone};
+use letters_model::{Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Run, Style, TextStyle, Tone};
 use letters_render::{Color, Point, Rect};
 use parley::{Alignment, Language, Layout, LineHeight};
 
 use crate::callout::Head;
-use crate::engine::{Engine, Spec};
+use crate::engine::{self, Engine, Spec};
 use crate::ink::Brush;
 use crate::leaf::Laid;
 use crate::theme;
@@ -268,11 +268,35 @@ pub(crate) struct Words {
     pub lang: Option<Language>,
     /// The languages that stretches of the text name, each once.
     pub langs: Vec<Language>,
+    /// Whether the text reads from the right, which is then the side it starts at.
+    pub rtl: bool,
 }
 
 /// The language a tag names, if it is one.
 pub(crate) fn language(tag: Option<&str>) -> Option<Language> {
     Language::parse(tag?).ok()
+}
+
+/// Whether a block's text reads from the right: its first letter does. The source of a formula is passed
+/// over, since the formula stands in its place, and code reads from the left whatever is written in it.
+pub(crate) fn rtl(block: &Block) -> bool {
+    if matches!(block.kind, BlockKind::Code { .. } | BlockKind::Formula) {
+        return false;
+    }
+    let shown =
+        |run: &&Run| !run.marks.contains(&Mark::Math) || run.marks.iter().any(|mark| matches!(mark, Mark::Ref(_)));
+    let mut letters = block.body.runs().iter().filter(shown).flat_map(|run| run.text.chars());
+    letters.find_map(engine::reads).unwrap_or(false)
+}
+
+/// Whether what a quote holds reads from the right: its first block says, a text by its letters and a quote
+/// or callout by what it holds in turn.
+fn leads(blocks: &[Block]) -> bool {
+    blocks.first().is_some_and(|first| match &first.body {
+        Body::Blocks(inside) if matches!(first.kind, BlockKind::Quote | BlockKind::Callout { .. }) => leads(inside),
+        Body::Text(_) => rtl(first),
+        _ => false,
+    })
 }
 
 impl Words {
@@ -282,7 +306,7 @@ impl Words {
 
     /// Reads a text block's runs.
     pub fn of(block: &Block) -> Self {
-        let mut words = Self { lang: language(block.lang.as_deref()), ..Self::default() };
+        let mut words = Self { lang: language(block.lang.as_deref()), rtl: rtl(block), ..Self::default() };
         for run in block.body.runs() {
             let start = words.text.len();
             words.text.push_str(&run.text);
@@ -781,6 +805,8 @@ pub(crate) struct Frame {
     pub lead: f32,
     /// How far the frame reaches below its last leaf's text.
     pub reach: f32,
+    /// Whether a quote reads from the right, which is then the side its bar stands at.
+    pub rtl: bool,
 }
 
 impl Frame {
@@ -1107,6 +1133,9 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                         }
                         _ => (Look::Quote, theme::QUOTE_INSET, 0.0, 0.0),
                     };
+                    // A quote's bar stands at the side its lines start at.
+                    let rtl = look == Look::Quote && leads(block.body.blocks());
+                    let (left, right) = if rtl { (right, left) } else { (left, right) };
                     let shrink = (left + right).min(width - theme::MIN_WIDTH).max(0.0);
                     let left = left.min(shrink);
                     let this = self.out.frames.len();
@@ -1114,8 +1143,8 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                     let lead = self.pad + gap;
                     let id = block.id.clone();
                     let above = head.room().0;
-                    let framed =
-                        Frame { id, look, head, parent: frame, first, last: first, x, width, lead, reach: 0.0 };
+                    let (last, reach) = (first, 0.0);
+                    let framed = Frame { id, look, head, parent: frame, first, last, x, width, lead, reach, rtl };
                     self.out.frames.push(framed);
                     self.pad = lead + pad + above;
                     let quoted = quoted || look == Look::Quote;
@@ -1208,7 +1237,9 @@ impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
                     }
                     leaf.pictures = Picture::of(block).into_iter().collect();
                     (leaf.role, leaf.marker, leaf.number) = (role, marker, number);
-                    self.push(leaf, x + inset, width - inset, gap, frame);
+                    // A list item is set in from the side it starts at, where its marker stands.
+                    let x = if leaf.words.rtl { x } else { x + inset };
+                    self.push(leaf, x, width - inset, gap, frame);
                 }
             }
         }

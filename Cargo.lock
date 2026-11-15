@@ -2851,6 +2851,7 @@ dependencies = [
 name = "letters-layout"
 version = "0.1.0"
 dependencies = [
+ "icu_properties",
  "letters-editor",
  "letters-fonts",
  "letters-math",

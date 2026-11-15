@@ -58,6 +58,8 @@ hayro = "0.9"
 parley = { version = "0.13", default-features = false, features = ["std"] }
 # The Unicode properties parley itself reads, for telling which characters no font covers: same version as its.
 parley_data = "0.13"
+# The classes parley_data answers in, for telling which side a text reads from: the version parley_data has.
+icu_properties = { version = "2.3", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false }
 # Tokenizes clipboard HTML. No dependencies of its own.
 html5gum = "0.9"

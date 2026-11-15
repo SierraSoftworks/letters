@@ -655,6 +655,11 @@ impl State {
             if !kept || !matches!(block.body, Body::Text(_)) {
                 return false;
             }
+            // A text that turns to read from the other side takes what stands beside it along: its marker
+            // and indent, the bar of its quote.
+            if part == Part::Text && flow::rtl(block) != leaf.words.rtl {
+                return false;
+            }
             let before = leaf.reword(part, block);
             let after = leaf.text(part).map_or("", |words| words.text.as_str());
             if let Some(tokens) = self.tokens.get_mut(id) {
@@ -926,7 +931,10 @@ impl State {
             return Shifts::default();
         }
         // Inside a quote or callout a marker hangs clear of the bar down its side, never across it.
-        let room = leaf.frame.map_or(*margin + leaf.x, |frame| leaf.x - frames[frame].x - theme::BAR - 2.0);
+        let room = leaf.frame.map_or(*margin + leaf.x, |frame| {
+            let bar = if frames[frame].rtl { 0.0 } else { theme::BAR + 2.0 };
+            leaf.x - frames[frame].x - bar
+        });
         reveal.over(id, text.set, room, |text| shapes.get(engine, types, leaf.role, false, text))
     }
 
@@ -1115,7 +1123,9 @@ impl State {
             let frame = &frames[frame];
             let (top, bottom) = frame.span(leaves);
             let rect = Rect::new(frame.x, top, frame.width, bottom - top);
-            let bar = Rect { width: theme::BAR, ..rect };
+            // The bar stands at the side the lines start at.
+            let aside = if frame.rtl { rect.width - theme::BAR } else { 0.0 };
+            let bar = Rect { x: rect.x + aside, width: theme::BAR, ..rect };
             match frame.look {
                 Look::Quote => out.push(Item::Fill { rect: bar, color: palette.line_strong, radius: theme::BAR / 2.0 }),
                 Look::Callout(tone) => {

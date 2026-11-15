@@ -9,8 +9,8 @@ use letters_math::{Formula, Style as Maths, TEXT_RATIO};
 use letters_model::{BlockId, BlockKind, ListKind};
 use letters_render::{Color, DisplayList, Glyph, Item, PathEl, Point, Rect, Role as Tag, RunText};
 use parley::{
-    Affinity, Alignment, AlignmentOptions, BreakReason, Cluster, Cursor, GlyphRun, InlineBox, InlineBoxKind, Language,
-    Layout, Line, PositionedLayoutItem, Selection as Span, VerticalAlign,
+    Affinity, Alignment, AlignmentOptions, BaseDirection, BreakReason, Cluster, Cursor, GlyphRun, InlineBox,
+    InlineBoxKind, Language, Layout, Line, PositionedLayoutItem, Selection as Span, VerticalAlign,
 };
 
 use crate::engine::{Engine, Spec};
@@ -194,6 +194,11 @@ impl<'a> Source<'a> {
     }
 }
 
+/// The side a text is set from.
+fn side(rtl: bool) -> BaseDirection {
+    if rtl { BaseDirection::Rtl } else { BaseDirection::Ltr }
+}
+
 /// Typesets a formula for a place `room` wide, and says at what em. One too wide is set smaller to fit.
 fn typeset(engine: &mut Engine, source: &str, like: Maths, room: f32) -> Option<(Arc<Formula>, f32)> {
     let set = engine.maths.typeset(source, &like).ok()?;
@@ -221,6 +226,9 @@ fn build(
     let mut runs = Vec::with_capacity(spans.len().max(1));
     // A stretch is in its own language, or else its block's, or else the document's.
     let locale = source.lang.or(locale);
+    // The side a text reads from is told from its own letters, whatever stands in it for a formula or
+    // before it as a label.
+    let reads = side(source.words.rtl);
     // One spec per distinct set of marks and language, however many spans share it.
     let mut slots: Vec<(u8, u8)> = Vec::new();
     let mut slot = |bits: u8, lang: u8| {
@@ -251,7 +259,7 @@ fn build(
             runs.extend((!text.is_empty()).then_some((plain, 0..text.len())));
         }
         set.shown = None;
-        engine.build_with(text, &specs, &runs, &[], by_words, locale, &mut set.layout);
+        engine.build_with(text, &specs, &runs, &[], by_words, locale, reads, &mut set.layout);
         return;
     }
 
@@ -321,7 +329,7 @@ fn build(
     if runs.is_empty() {
         slot(0, 0);
     }
-    engine.build_with(&shown, &specs, &runs, &boxes, by_words, locale, &mut set.layout);
+    engine.build_with(&shown, &specs, &runs, &boxes, by_words, locale, reads, &mut set.layout);
     set.shown = Some(shown);
 }
 
@@ -480,27 +488,29 @@ pub(crate) fn opened<'a>(leaf: &Leaf, laid: &'a Laid) -> Option<(Part, &'a Swap)
 /// pictures that are still links.
 pub(crate) fn adorn(engine: &mut Engine, types: &Types, leaf: &Leaf, laid: &mut Laid) {
     let of = types.get(leaf.role);
-    let mut small = |text: &str, ink: Ink, size: f32, width: Option<f32>| {
+    let mut small = |text: &str, ink: Ink, size: f32, width: Option<f32>, reads: BaseDirection| {
         let mut spec = of.spec(false, Brush { ink, back: None });
         (spec.size, spec.italic) = (size, false);
         let mut layout = Layout::new();
-        engine.build(text, &[spec], &[(0, 0..text.len())], None, &mut layout);
+        engine.build_with(text, &[spec], &[(0, 0..text.len())], &[], false, None, reads, &mut layout);
         if width.is_some() {
             layout.set_alignment(Alignment::Center, AlignmentOptions::default());
         }
         layout.break_all_lines(width);
         layout
     };
+    let auto = BaseDirection::Auto;
     laid.sign = match leaf.marker {
-        Marker::Number(number) => Some(small(&numbered(number), Ink::Marker, of.size, None)),
-        Marker::Task(true) => Some(small(TICK, Ink::OnAccent, theme::CHECKBOX * 0.8, None)),
+        // A number reads the way its item does, so that its stop is on the side of the text.
+        Marker::Number(number) => Some(small(&numbered(number), Ink::Marker, of.size, None, side(leaf.words.rtl))),
+        Marker::Task(true) => Some(small(TICK, Ink::OnAccent, theme::CHECKBOX * 0.8, None, auto)),
         _ => None,
     };
     laid.names.clear();
     for (index, picture) in leaf.pictures.iter().enumerate() {
         let room = picture.rect.width - 2.0 * theme::BADGE_INSET;
         if picture.asset.is_none() && !picture.host.is_empty() && room > 0.0 {
-            laid.names.push((index, small(&picture.host, Ink::Marker, of.size, Some(room))));
+            laid.names.push((index, small(&picture.host, Ink::Marker, of.size, Some(room), auto)));
         }
     }
 }
@@ -1147,14 +1157,18 @@ impl Painter<'_> {
 
     fn mark(&mut self, leaf: &Leaf, laid: &Laid, baseline: f32) {
         let (of, palette) = (self.types.get(leaf.role), &self.inks.palette);
-        let right = leaf.x - theme::MARKER_GAP;
+        // The left edge of a marker of a given width: it stands before the text, at the side the text starts at.
+        let before = |width: f32| match leaf.words.rtl {
+            true => leaf.x + leaf.width + theme::MARKER_GAP,
+            false => leaf.x - theme::MARKER_GAP - width,
+        };
         // The middle of a lower-case letter, which is where a bullet or checkbox looks centred.
         let middle = leaf.y + baseline - of.size * 0.34;
         match leaf.marker {
             Marker::None => {}
             Marker::Bullet(depth) => {
                 let side = (of.size * 0.36).round().max(3.0);
-                let rect = Rect::new(right - side, (middle - side / 2.0).round(), side, side);
+                let rect = Rect::new(before(side), (middle - side / 2.0).round(), side, side);
                 self.out.push(match depth % 3 {
                     0 => Item::Fill { rect, color: palette.marker, radius: side / 2.0 },
                     1 => Item::Stroke { rect, color: palette.marker, width: 1.0, radius: side / 2.0 },
@@ -1163,11 +1177,11 @@ impl Painter<'_> {
             }
             Marker::Number(number) => {
                 let Some(sign) = &laid.sign else { return };
-                self.glyphs(sign, &numbered(number), Point { x: right - sign.full_width(), y: leaf.y });
+                self.glyphs(sign, &numbered(number), Point { x: before(sign.full_width()), y: leaf.y });
             }
             Marker::Task(checked) => {
                 let side = theme::CHECKBOX;
-                let rect = Rect::new(right - side, (middle - side / 2.0).round(), side, side);
+                let rect = Rect::new(before(side), (middle - side / 2.0).round(), side, side);
                 if !checked {
                     self.out.push(Item::Stroke { rect, color: palette.line_strong, width: 1.5, radius: 3.0 });
                     return;

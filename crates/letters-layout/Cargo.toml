@@ -12,6 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+icu_properties.workspace = true
 letters-math.workspace = true
 letters-model.workspace = true
 letters-render.workspace = true
