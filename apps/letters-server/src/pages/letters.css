@@ -5,6 +5,7 @@ html, body { margin: 0; block-size: 100%; }
 .lt-file { display: inline-flex; align-items: center; gap: var(--yi-space-sm); font-weight: 500; }
 .lt-file > .yi-icon { flex: none; color: var(--yi-fg-subtle); }
 .lt-file .yi-tag { font-weight: 400; }
+.lt-file form { display: contents; }
 .lt-file__name { margin-inline-end: var(--yi-space-xs); color: inherit; text-decoration: none; }
 a.lt-file__name:hover { text-decoration: underline; }
 .lt-file__more { inline-size: 1%; text-align: end; white-space: nowrap; }

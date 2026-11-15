@@ -62,6 +62,7 @@ pub fn routes() -> Router<Shared> {
         .route("/api/v1/documents/{id}/rename", post(rename))
         .route("/api/v1/documents/{id}/move", post(relocate))
         .route("/api/v1/documents/{id}/trash", post(trash))
+        .route("/api/v1/documents/{id}/merge-conflicts", post(merge_conflicts))
         .route("/api/v1/documents/{id}/assets", get(assets))
         .route(
             "/api/v1/documents/{id}/assets/{name}",
@@ -342,6 +343,10 @@ async fn trash(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -
     blocking(move || app.trash(&who, &id)).await
 }
 
+async fn merge_conflicts(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -> Answer<Json<Vec<String>>> {
+    blocking(move || app.merge_conflicts(&who, &id).map(Json)).await
+}
+
 async fn recent(State(app): State<Shared>, who: Signed) -> Answer<Json<Vec<Entry>>> {
     blocking(move || app.recent(&who).map(Json)).await
 }
@@ -485,6 +490,25 @@ impl App {
         }
         let merged = || self.library.merge(&found.root, &found.place, &mut theirs, self.now());
         self.rooms.around(&found.root, &found.place, merged)
+    }
+
+    /// Merges into the document `id` every conflict copy beside it, through its room when it is open, and
+    /// moves each copy to the trash once the document holds what the copy held. Says the copies' names.
+    pub fn merge_conflicts(&self, who: &Signed, id: &str) -> Answer<Vec<String>> {
+        let found = self.locate(who, id)?;
+        found.must(Role::Editor)?;
+        let rows = self.library.list(&self.store, &found.root, &found.place.split().0)?;
+        let mut merged = Vec::new();
+        for copy in rows.iter().filter(|row| row.copy_of.as_ref() == Some(&found.place)) {
+            let mut theirs = self.library.open(&found.root, &copy.place)?;
+            let merge = || self.library.merge(&found.root, &found.place, &mut theirs, self.now());
+            self.rooms.around(&found.root, &found.place, merge)?;
+            // Closed before it is moved, which a folder on Windows asks for.
+            drop(theirs);
+            self.library.trash(&self.store, &found.root, &copy.place, self.now())?;
+            merged.push(shown(&copy.listed.name).to_owned());
+        }
+        Ok(merged)
     }
 
     /// Puts `file` back from the trash of `space`, and says where it is now.

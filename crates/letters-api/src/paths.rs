@@ -89,6 +89,12 @@ pub fn trash(id: &str) -> String {
     format!("{}/trash", document(id))
 }
 
+/// `POST`: merges into the document every conflict copy a sync tool left beside it, and moves each to
+/// its space's trash: the names of the copies it took, as a list. No copy is merged unless this is asked.
+pub fn merge_conflicts(id: &str) -> String {
+    format!("{}/merge-conflicts", document(id))
+}
+
 /// `GET`: the names of the document's assets, as [`asset`] takes them. A device that wrote offline asks
 /// this to learn which of its pictures the server lacks, and hands those over before its edits.
 pub fn assets(id: &str) -> String {

@@ -9,7 +9,7 @@ use std::time::Duration;
 use axum::http::{Method, StatusCode};
 use common::desk::{Desk, settle};
 use common::{Client, Server, texts};
-use letters_api::{Entry, Listing, Move, NewFolder, Rename, Tag, paths};
+use letters_api::{Code, Entry, Listing, Move, NewFolder, Rename, Tag, paths};
 use letters_format::{Archive, MIMETYPE, WorkingCopy, hash};
 use letters_model::{Block, BlockKind, Op, Pos, ReplicaId};
 use letters_sync::{Link, Refusal, Role};
@@ -227,6 +227,36 @@ async fn a_device_hands_its_whole_file_over_and_nothing_is_replaced() {
     let text = desk.texts().join("\n");
     assert!(text.contains("Written away.") && text.contains("Written here."), "whoever has it open is told: {text}");
     assert_eq!(on_file(&ada, &id).await, text);
+}
+
+#[tokio::test]
+async fn a_conflict_copy_is_merged_when_an_editor_asks_and_then_thrown_away() {
+    let (server, ada, id) = shared("merge-conflicts").await;
+    let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
+    settle([&mut desk]).await;
+    // A sync tool leaves what another machine wrote beside the document, and someone writes here.
+    let was = ada.send(Method::GET, &paths::file(&id), "", Vec::new()).await.body;
+    let mut away = WorkingCopy::open(&mut Archive::open(Cursor::new(was)).unwrap(), ReplicaId::from(9)).unwrap();
+    let first = away.model().doc().blocks[0].id.clone();
+    away.apply([Op::InsertText { at: Pos::new(first, 0), text: "Written away. ".into() }]).unwrap();
+    let copy = "Plan (conflicted copy 2026-11-15)";
+    let beside = server.scratch.0.join("family").join(format!("{copy}.let"));
+    std::fs::write(beside, letters_server::library::packed(&away).unwrap()).unwrap();
+    desk.write("Written here. ");
+    settle([&mut desk]).await;
+
+    let merge = async |who: &Client| who.post::<Vec<String>>(&paths::merge_conflicts(&id), &()).await;
+    let guest = server.person("guest", &["friends"]);
+    assert_eq!(merge(&guest).await.expect_err("a reader merges nothing").code, Code::Forbidden);
+    assert!(!on_file(&ada, &id).await.contains("Written away."), "nothing is merged before an editor asks");
+
+    assert_eq!(merge(&ada).await.unwrap(), [copy]);
+    settle([&mut desk]).await;
+    let text = desk.texts().join("\n");
+    assert!(text.contains("Written away.") && text.contains("Written here."), "whoever has it open is told: {text}");
+    assert_eq!(on_file(&ada, &id).await, text);
+    assert_eq!(server.scratch.names("family/.letters-trash"), [format!("{copy}.let")], "the copy can be put back");
+    assert_eq!(merge(&ada).await.unwrap(), [""; 0], "with no copy left there is nothing to merge");
 }
 
 #[tokio::test(start_paused = true)]

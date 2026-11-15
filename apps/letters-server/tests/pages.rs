@@ -6,7 +6,8 @@ use axum::http::StatusCode;
 use common::{Browser, Server, URL, names};
 use letters_api::{Entry, Listing, paths};
 use letters_server::pages::{
-    ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH, RECENT_PAGE, TRASH_PAGE, asking,
+    ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH, RECENT_PAGE,
+    TRASH_PAGE, asking,
 };
 
 /// What the folder at `path` of a space holds, as the interface tells the browser's own session.
@@ -119,6 +120,30 @@ async fn the_forms_make_rename_move_and_throw_away() {
     ben.fill(ACT_TRASH, &[("id", &id), ("back", &top)]).await;
     assert_eq!(names(&listed(&ben, "family", "").await), ["House"]);
     assert!(page(&mut ben, TRASH_PAGE).await.contains("Roof"), "the trash lists it");
+}
+
+#[tokio::test]
+async fn a_conflict_copy_offers_its_merge_to_whoever_may_edit_and_nothing_else() {
+    let server = Server::new("merge-form");
+    let mut ben = server.reader("ben", &["family"]);
+    let id = ben.pages().start("family", "", "Plan").await.id.unwrap();
+    let (family, copy) = (server.scratch.0.join("family"), "Plan (conflicted copy 2026-11-15)");
+    std::fs::copy(family.join("Plan.let"), family.join(format!("{copy}.let"))).unwrap();
+    let here = paths::folder_page("family", "");
+
+    let editors = page(&mut ben, &here).await;
+    assert!(editors.contains(ACT_MERGE) && editors.contains("Merge conflicts"), "the copy's row offers the merge");
+    // The copy has the id of its original, so a link or a menu on its row would act on the original.
+    let opens = format!("href=\"{}\"", paths::editor_page(&id));
+    assert_eq!(editors.matches(&opens).count(), 1, "only the original's row opens the document");
+    let mut guest = server.reader("guest", &["friends"]);
+    let readers = page(&mut guest, &here).await;
+    assert!(readers.contains(copy) && !readers.contains(ACT_MERGE), "a reader sees the copy and is offered nothing");
+
+    let merged = ben.fill(ACT_MERGE, &[("id", &id), ("back", &here)]).await;
+    assert_eq!(merged.location(), here);
+    assert_eq!(names(&listed(&ben, "family", "").await), ["Plan"]);
+    assert!(page(&mut ben, TRASH_PAGE).await.contains(copy), "the copy waits in the trash");
 }
 
 #[tokio::test]

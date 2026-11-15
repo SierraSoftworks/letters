@@ -54,6 +54,7 @@ pub const ACT_NEW_FOLDER: &str = "/act/new-folder";
 pub const ACT_RENAME: &str = "/act/rename";
 pub const ACT_MOVE: &str = "/act/move";
 pub const ACT_TRASH: &str = "/act/trash";
+pub const ACT_MERGE: &str = "/act/merge-conflicts";
 pub const ACT_PUT_BACK: &str = "/act/put-back";
 
 /// How many folders a document is offered to be moved to. A space with more is tidied in the editor's own
@@ -240,16 +241,31 @@ pub fn asking(here: &str, what: &str, id: &str) -> String {
     format!("{here}?ask={what}&id={}", paths::segment(id))
 }
 
+/// What an address says in place of a code when a conflict copy could not be merged.
+const UNMERGED: &str = "unmerged";
+
+/// The address of `back` saying `word` of what was asked there.
+fn saying(back: &str, word: &str) -> String {
+    format!("{}?error={word}", back.split(['?', '#']).next().unwrap_or_default())
+}
+
 /// The address of `back` saying that what was asked there was refused.
 pub fn refusing(back: &str, refusal: &Refusal) -> String {
     let code = serde_json::to_value(refusal.code()).ok();
-    let code = code.as_ref().and_then(|code| code.as_str()).unwrap_or_default().to_owned();
-    format!("{}?error={code}", back.split(['?', '#']).next().unwrap_or_default())
+    saying(back, code.as_ref().and_then(|code| code.as_str()).unwrap_or_default())
+}
+
+/// The address of `back` saying that a conflict copy could not be merged.
+pub fn unmerged(back: &str) -> String {
+    saying(back, UNMERGED)
 }
 
 /// What a page says of a refusal an address names. Only words of the server's own: whoever writes the
 /// address chooses among them.
 fn refusal(code: &str) -> String {
+    if code == UNMERGED {
+        return "That copy could not be merged, and is still where it was.".to_owned();
+    }
     let code = serde_json::from_value(serde_json::Value::String(code.to_owned())).unwrap_or(Code::Unknown);
     let said = match code {
         Code::NameTaken => "Something of that name is already there.",

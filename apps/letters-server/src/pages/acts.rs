@@ -6,11 +6,11 @@ use axum::Router;
 use axum::extract::{Form, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::post;
-use letters_api::{Move, NewDocument, NewFolder, paths};
+use letters_api::{Code, Move, NewDocument, NewFolder, paths};
 use serde::Deserialize;
 
-use super::{ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH, TRASH_PAGE};
-use super::{Visitor, refusing};
+use super::{ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH, TRASH_PAGE};
+use super::{Visitor, refusing, unmerged};
 use crate::api::blocking;
 use crate::auth::local;
 use crate::error::{Answer, Refusal};
@@ -23,6 +23,7 @@ pub fn routes() -> Router<Shared> {
         .route(ACT_RENAME, post(rename))
         .route(ACT_MOVE, post(relocate))
         .route(ACT_TRASH, post(trash))
+        .route(ACT_MERGE, post(merge_conflicts))
         .route(ACT_PUT_BACK, post(put_back))
 }
 
@@ -111,6 +112,18 @@ async fn relocate(State(app): State<Shared>, Visitor(who): Visitor, Form(about):
 
 async fn trash(State(app): State<Shared>, Visitor(who): Visitor, Form(about): Form<About>) -> Response {
     done(app, about.back(), move |app| app.trash(&who, &about.id).map(|()| about.back())).await
+}
+
+/// Merges the conflict copies beside a document into it. Nothing else a form asks is refused for what a
+/// file holds, so this refusal has words of its own.
+async fn merge_conflicts(State(app): State<Shared>, Visitor(who): Visitor, Form(about): Form<About>) -> Response {
+    let back = about.back();
+    let next = match blocking(move || app.merge_conflicts(&who, &about.id)).await {
+        Ok(_) => back,
+        Err(refusal) if refusal.code() == Code::Invalid => unmerged(&back),
+        Err(refusal) => refusing(&back, &refusal),
+    };
+    Redirect::to(&next).into_response()
 }
 
 /// A file in a space's trash.

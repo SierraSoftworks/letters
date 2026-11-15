@@ -7,7 +7,7 @@ use letters_api::{self as api, EntryKind, Person, SpaceKind, paths};
 use yew::prelude::*;
 use yewi::prelude::*;
 
-use super::{ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH};
+use super::{ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH};
 use super::{RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking};
 
 /// Everything one page shows. It is made where the request is answered and drawn on another thread, so it
@@ -219,9 +219,7 @@ fn headings(places: bool) -> Html {
 fn tag(tag: &api::Tag) -> Html {
     let count = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
     match tag {
-        api::Tag::ConflictCopy { .. } => {
-            html! { <Tag icon={icons::GIT_MERGE} tone={Tone::Warn}>{ "Conflicted copy" }</Tag> }
-        }
+        api::Tag::ConflictCopy { .. } => html! { <Tag icon={icons::GIT_MERGE}>{ "Conflicted copy" }</Tag> },
         api::Tag::ImportNotes { count: notes } => html! {
             <Tag icon={icons::FILE_INPUT} tone={Tone::Warn}>{ count(*notes as usize, "import note", "import notes") }</Tag>
         },
@@ -244,11 +242,28 @@ fn tag(tag: &api::Tag) -> Html {
 fn file(row: &Row, here: Option<&str>, places: bool) -> Html {
     let entry = &row.entry;
     let space = entry.space.as_deref().unwrap_or_default();
+    // A conflict copy has the id of its original, so whatever is asked by id is asked of the original.
+    // The copy itself is only merged.
+    let copy = entry.tags.iter().any(|tag| matches!(tag, api::Tag::ConflictCopy { .. }));
     let (icon, href) = match (&entry.kind, &entry.id) {
         (EntryKind::Folder, _) => (icons::FOLDER, Some(paths::folder_page(space, &entry.path))),
-        (EntryKind::Document, Some(id)) => (icons::FILE_TEXT, Some(paths::editor_page(id))),
-        (EntryKind::Document, None) => (icons::FILE_TEXT, None),
+        (EntryKind::Document, Some(id)) if !copy => (icons::FILE_TEXT, Some(paths::editor_page(id))),
+        (EntryKind::Document, _) => (icons::FILE_TEXT, None),
     };
+    let merge = entry.id.as_ref().zip(here).filter(|_| copy && entry.role.edits());
+    // The button says what the tag would.
+    let tags = entry.tags.iter().filter(|tag| merge.is_none() || !matches!(tag, api::Tag::ConflictCopy { .. }));
+    let merge = merge.map(|(id, here)| {
+        html! {
+            <form method="post" action={ACT_MERGE}>
+                { hidden("id", id) }
+                { hidden("back", here) }
+                <Button size={Size::Small} variant={ButtonVariant::Primary} icon={icons::GIT_MERGE} kind={ButtonKind::Submit}>
+                    { "Merge conflicts" }
+                </Button>
+            </form>
+        }
+    });
     let name = match href {
         Some(href) => html! { <a class="lt-file__name" {href}>{ entry.name.clone() }</a> },
         None => html! { <span class="lt-file__name">{ entry.name.clone() }</span> },
@@ -263,7 +278,7 @@ fn file(row: &Row, here: Option<&str>, places: bool) -> Html {
         }
     };
     let more = match &entry.id {
-        Some(id) => {
+        Some(id) if !copy => {
             let ask = |what: &str| here.filter(|_| entry.role.edits()).map(|here| asking(here, what, id));
             html! {
                 <MenuButton label={format!("More for {}", entry.name)} icon_only=true variant={ButtonVariant::Subtle} size={Size::Small} placement={Placement::BottomEnd}>
@@ -278,12 +293,12 @@ fn file(row: &Row, here: Option<&str>, places: bool) -> Html {
                 </MenuButton>
             }
         }
-        None => Html::default(),
+        _ => Html::default(),
     };
     html! {
         <tr class="yi-table__row">
             <th scope="row">
-                <span class="lt-file"><Icon {icon} />{ name }{ for entry.tags.iter().map(tag) }</span>
+                <span class="lt-file"><Icon {icon} />{ name }{ for tags.map(tag) }{ for merge }</span>
             </th>
             if places {
                 <td class="lt-dim">{ row.space.clone().unwrap_or_default() }</td>
