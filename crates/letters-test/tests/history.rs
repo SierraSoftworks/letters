@@ -1,7 +1,7 @@
 //! The history: the document's versions listed by day beside the one that is picked, which is read where
 //! the page was, shows how it differs from the version before it or from the document, and can be restored
 //! or given a name, and a copy of it saved as a document of its own. A strip under the page has a cell for
-//! each version.
+//! each version. A passage of a version is selected with the pointer and copied out of it.
 
 use letters_editor::Editor;
 use letters_model::{Block, Change, ReplicaId, TagKind};
@@ -281,6 +281,37 @@ fn more(window: &mut Harness, command: &str) {
 /// What the name field of the card that saves a copy holds, while the card shows.
 fn copy_name(window: &mut Harness) -> Option<String> {
     window.find(Role::TextInput, "Name of the copy").and_then(|field| field.value)
+}
+
+/// How far down the window each line of text stands that shows in `within`, from the top one.
+fn lines(window: &mut Harness, within: Rect) -> Vec<f32> {
+    let mut down: Vec<f32> = Vec::new();
+    for item in window.paint().items {
+        let Item::Glyphs { origin, .. } = item else { continue };
+        // A point on the line's letters, which stand on where the line is drawn from.
+        let on = origin.y - 4.0;
+        if within.contains(origin) && !down.contains(&on) {
+            down.push(on);
+        }
+    }
+    down.sort_by(f32::total_cmp);
+    down
+}
+
+/// The left end and the right end of the part of the window that is `within`, at a height.
+fn ends(within: Rect, y: f32) -> [Point; 2] {
+    [1.0, within.width - 1.0].map(|across| Point { x: within.x + across, y })
+}
+
+/// What was last copied, as another application reads it.
+fn copied(window: &Harness) -> Option<&str> {
+    window.platform.clipboard.as_ref().map(|clip| clip.text.as_str())
+}
+
+/// Whether the tool shows that copies a passage, and whether it says that it has.
+fn tool(window: &mut Harness) -> Option<bool> {
+    let copied = window.find(Role::Button, "Copied").map(|_| true);
+    copied.or_else(|| window.find(Role::Button, "Copy").map(|_| false))
 }
 
 /// A document with its history showing.
@@ -937,4 +968,190 @@ fn a_card_for_a_copy_of_a_version_goes_when_the_history_does() {
     window.ui().set_landing(Some(Landing::default()));
     window.ui().set_landing(None);
     assert_eq!((showing(&mut window), copy_name(&mut window)), (false, None));
+}
+
+#[test]
+fn a_passage_of_a_version_is_selected_with_the_pointer_and_copied_out_of_it() {
+    // How the passage is selected, given where the lines of the version's two paragraphs start and end,
+    // and what it reads.
+    type Select = fn(&mut Harness, [Point; 2], [Point; 2]);
+    let ways: [(&str, Select, &str); 5] = [
+        ("a drag along a line", |window, _, [from, to]| _ = window.press_at(from).release_at(to), VERSIONS[2].1[1]),
+        ("a drag back along it", |window, _, [from, to]| _ = window.press_at(to).release_at(from), VERSIONS[2].1[1]),
+        (
+            "a drag down the page",
+            |window, [from, _], [_, to]| _ = window.press_at(from).release_at(to),
+            "The roof comes first. Costs are rising.\n\nThe kitchen floor follows.",
+        ),
+        (
+            "a press, and another with Shift",
+            |window, [from, _], [_, to]| _ = window.click_at(from).shift_click_at(to),
+            "The roof comes first. Costs are rising.\n\nThe kitchen floor follows.",
+        ),
+        ("a second press", |window, _, [from, _]| _ = window.click_at(from).click_at(from), "The"),
+    ];
+    let copies: [(&str, Act); 2] =
+        [("the tool", |window| _ = window.click(Role::Button, "Copy")), ("the key", |window| _ = window.key("Mod+C"))];
+    for (way, select, reads) in ways {
+        for (by, copy) in copies {
+            let mut window = history();
+            window.click(Role::ListBoxOption, "11:30");
+            let area = area(&mut window);
+            let down = lines(&mut window, area);
+            assert_eq!(down.len(), 3, "the heading and two paragraphs show");
+            // With nothing selected there is nothing to copy.
+            window.click_at(ends(area, down[0])[0]).key("Mod+C");
+            assert_eq!((tool(&mut window), copied(&window)), (None, None), "{way}: a press alone");
+
+            // The marks that lie along the second paragraph's line: over the word it gained, and over
+            // what is selected of it.
+            let line = down[2];
+            let marks = |window: &mut Harness| {
+                let along = |item: &&Item| matches!(item, Item::Fill { rect, .. } if rect.height < 40.0 && rect.y <= line && line <= rect.y + rect.height);
+                drawn(window).iter().filter(along).count()
+            };
+            let unmarked = marks(&mut window);
+            select(&mut window, ends(area, down[1]), ends(area, down[2]));
+            assert_eq!(tool(&mut window), Some(false), "{way}: a tool offers to copy what is selected");
+            assert!(marks(&mut window) > unmarked, "{way}: what is selected is marked");
+            copy(&mut window);
+            assert_eq!(copied(&window), Some(reads), "{way}, {by}");
+            assert_eq!(tool(&mut window), Some(true), "{way}, {by}: the tool says so");
+            assert_eq!(written(&window), VERSIONS[4].1, "{way}: the document is as it was");
+
+            // Another passage, selected a while later, has not been copied.
+            window.advance(2_000);
+            window.press_at(ends(area, down[0])[0]).release_at(ends(area, down[0])[1]);
+            assert_eq!(tool(&mut window), Some(false), "{way}, {by}");
+        }
+    }
+}
+
+#[test]
+fn a_third_press_selects_the_paragraph_and_a_key_the_whole_version() {
+    let mut window = history();
+    window.click(Role::ListBoxOption, "11:30");
+    let area = area(&mut window);
+    let at = ends(area, lines(&mut window, area)[2])[0];
+    window.click_at(at).click_at(at).click_at(at).key("Mod+C");
+    assert_eq!(copied(&window), Some(VERSIONS[2].1[1]));
+
+    window.key("Mod+A");
+    assert_eq!(tool(&mut window), Some(false), "another passage has not been copied");
+    window.key("Mod+C");
+    let whole = format!("# Cottage renovation\n\n{}\n\n{}", VERSIONS[2].1[0], VERSIONS[2].1[1]);
+    assert_eq!(copied(&window), Some(whole.as_str()));
+}
+
+#[test]
+fn each_version_of_a_rewritten_block_is_copied_as_that_version_reads() {
+    // Whether the drag ends in the block it began in, or far down the page.
+    for beyond in [false, true] {
+        let mut window = plan();
+        window.resize(1720.0, 800.0);
+        let (area, before) = (area(&mut window), before(&mut window).expect("the earlier version").bounds);
+        // The line at the head of the earlier version says whose it is, over its text.
+        let down = lines(&mut window, before);
+        let (first, last) = (down[1], if beyond { area.y + area.height - 2.0 } else { down[down.len() - 1] });
+        window.press_at(ends(before, first)[0]).release_at(ends(before, last)[1]);
+        let tool = window.find(Role::Button, "Copy").expect("the tool that copies").bounds;
+        assert!(tool.y > first, "the line that says whose version it is stays to be read: {tool:?}");
+        window.key("Mod+C");
+        assert_eq!(copied(&window), Some(PLAN[1]), "the earlier version, and no more than its block shows of it");
+
+        // The later version stands beside it, where the page goes on above and below.
+        let beside = Rect { x: before.x + before.width + 24.0, ..before };
+        window.press_at(ends(beside, first)[0]).release_at(ends(beside, down[down.len() - 1])[1]).key("Mod+C");
+        assert_eq!(copied(&window), Some(HERS[0]), "the later version");
+        // A while later, so that the press is not the second of two.
+        window.advance(2_000);
+        window.press_at(ends(beside, first)[0]).release_at(ends(area, area.y + area.height - 2.0)[1]).key("Mod+C");
+        let all = copied(&window).expect("a passage down to the end of the page");
+        assert!(all.starts_with(HERS[0]) && all.ends_with(HERS[5]), "the page, from the later version on: {all}");
+    }
+
+    // Of two blocks rewritten at one sitting, a drag from the earlier version of the first stays in it.
+    let mut window = Harness::doc("# Plan\n\nThe roof comes first.\n\nThe floor follows.");
+    write(&mut window, SUNDAY + HOUR, "roof comes", "slates come");
+    write(&mut window, SUNDAY + HOUR, "floor follows", "kitchen is last");
+    window.platform.wall = Some(SUNDAY + 2 * HOUR);
+    window.resize(1720.0, 800.0);
+    window.click(Role::Button, "History");
+    let (area, before) = (area(&mut window), before(&mut window).expect("the earlier version").bounds);
+    let first = lines(&mut window, before)[1];
+    window.press_at(ends(before, first)[0]).release_at(ends(area, area.y + area.height - 2.0)[1]).key("Mod+C");
+    assert_eq!(copied(&window), Some("The roof comes first."));
+}
+
+#[test]
+fn a_press_that_brings_a_version_across_selects_nothing() {
+    let mut window = plan();
+    window.resize(1440.0, 800.0);
+    let (area, before) = (area(&mut window), before(&mut window).expect("the earlier version").bounds);
+    let showing = Rect { x: area.x, width: before.x + before.width - area.x, ..before };
+    let line = lines(&mut window, before)[1];
+    window.press_at(ends(showing, line)[0]).release_at(ends(showing, line)[1]);
+    window.advance(16).advance(400);
+    assert_eq!(tool(&mut window), None, "the press brought the earlier version across");
+
+    // Once it shows whole, a drag over it selects in it.
+    let before = self::before(&mut window).expect("the earlier version").bounds;
+    let down = lines(&mut window, before);
+    window.press_at(ends(before, down[1])[0]).release_at(ends(before, down[down.len() - 1])[1]).key("Mod+C");
+    assert_eq!(copied(&window), Some(PLAN[1]));
+}
+
+#[test]
+fn a_passage_goes_with_its_version_and_escape_drops_it_before_it_leaves_the_history() {
+    let mut window = history();
+    window.click(Role::ListBoxOption, "11:30");
+    let area = area(&mut window);
+    let down = lines(&mut window, area);
+    let select = |window: &mut Harness| _ = window.press_at(ends(area, down[2])[0]).release_at(ends(area, down[2])[1]);
+    // The tool waits for the passage: it shows once the button is let go.
+    window.press_at(ends(area, down[1])[0]).hover_at(ends(area, down[1])[1]);
+    assert_eq!(tool(&mut window), None, "the passage is still being selected");
+    window.release_at(ends(area, down[1])[1]);
+    assert_eq!(tool(&mut window), Some(false));
+    window.key("Right");
+    assert_eq!(tool(&mut window), None, "another version shows");
+    window.key("Mod+C");
+    assert_eq!(copied(&window), None, "and nothing of it is selected");
+
+    // A while later, so that the press is not the second of two.
+    window.advance(2_000);
+    select(&mut window);
+    window.key("Escape");
+    assert_eq!((tool(&mut window), showing(&mut window)), (None, true), "the passage goes first");
+    window.key("Escape");
+    assert!(!showing(&mut window), "then the history");
+}
+
+#[test]
+fn a_passage_copied_from_a_version_is_pasted_as_it_was_written() {
+    let mut window = Harness::doc("# Roof\n\nThe **north** roof comes first.\n\nThe floor follows.");
+    write(&mut window, SUNDAY + HOUR, "The north roof comes first.", "Nothing is decided.");
+    window.platform.wall = Some(SUNDAY + 2 * HOUR);
+    window.click(Role::Button, "History").key("Left");
+    let area = area(&mut window);
+    let at = ends(area, lines(&mut window, area)[1])[0];
+    window.click_at(at).click_at(at).click_at(at).key("Mod+C").key("Escape").key("Escape");
+
+    window.select("follows.").key("Right").key("Enter").key("Mod+V");
+    let pasted = "The floor follows.\n\nThe **north** roof comes first.";
+    assert!(window.markdown().contains(pasted), "the passage came with its marks: {}", window.markdown());
+}
+
+#[test]
+fn a_drag_past_the_edge_of_the_page_area_scrolls_the_version_after_it() {
+    let mut window = survey();
+    let area = area(&mut window);
+    let top = lines(&mut window, area)[1];
+    let under = Point { x: area.x + area.width / 2.0, y: area.y + area.height + 200.0 };
+    window.press_at(ends(area, top)[0]);
+    for _ in 0..4 {
+        window.hover_at(under);
+    }
+    window.release_at(under);
+    assert!(lines(&mut window, area)[0] < top - 100.0, "the survey moved up under the drag");
 }

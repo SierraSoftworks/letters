@@ -4,7 +4,6 @@
 //! trait and [`forward_canvas`] implements most of it for either.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use skrifa::bitmap::{BitmapFormat, Origin};
 use skrifa::instance::{LocationRef, Size};
@@ -15,7 +14,7 @@ use vello_cpu::kurbo::{Affine, BezPath, Cap, Diagonal2, Join, Rect as KRect, Rou
 use vello_cpu::peniko::{Blob, Fill, FontData, ImageSampler};
 use vello_cpu::{Glyph as RunGlyph, ImageSource, PaintType, color};
 
-use crate::{Color, DisplayList, Font, Item, PathEl, Point, Rect};
+use crate::{Color, DisplayList, Font, FontBytes, Item, PathEl, Point, Rect};
 
 /// How far a curve may stray from its true shape, in physical pixels.
 const TOLERANCE: f64 = 0.05;
@@ -115,7 +114,7 @@ pub(crate) struct FontCache {
 
 pub(crate) struct Face {
     /// Keeps the address the face is keyed by from being reused.
-    data: Arc<[u8]>,
+    data: FontBytes,
     /// `None` if the data is not a font: Vello panics on one.
     handle: Option<FontData>,
     /// Unique to this face for the life of the process, unlike its address.
@@ -126,9 +125,9 @@ pub(crate) struct Face {
 
 impl FontCache {
     pub fn face(&mut self, font: &Font) -> &Face {
-        let key = (Arc::as_ptr(&font.data).cast::<u8>() as usize, font.index);
+        let key = (font.data.as_ptr() as usize, font.index);
         self.faces.entry(key).or_insert_with(|| {
-            let blob = Blob::new(Arc::new(font.data.clone()));
+            let blob = Blob::new(font.data.shared());
             let id = blob.id();
             let face = skrifa::FontRef::from_index(&font.data, font.index);
             let head = face.as_ref().map(|face| face.head());
@@ -150,7 +149,7 @@ impl FontCache {
 
     /// Forgets fonts nothing else uses any more. A handle holds a second reference.
     pub fn trim(&mut self) {
-        self.faces.retain(|_, face| Arc::strong_count(&face.data) > 1 + usize::from(face.handle.is_some()));
+        self.faces.retain(|_, face| face.data.holders() > 1 + usize::from(face.handle.is_some()));
     }
 }
 

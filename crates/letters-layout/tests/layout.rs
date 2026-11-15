@@ -2,7 +2,7 @@
 
 use letters_layout::{Callout, DocLayout, FontSpec, Fonts, Palette, Shaper, Token, TokenKind};
 use letters_model::{
-    Align, Block, BlockKind, Body, Document, ListKind, Mark, Model, Op, Pos, ReplicaId, Run, Selection, Style,
+    Align, Block, BlockKind, Body, Document, ListKind, Mark, Markers, Model, Op, Pos, ReplicaId, Run, Selection, Style,
     TextStyle, Tone,
 };
 use letters_render::{Color, DisplayList, Item, Point, Rect};
@@ -20,8 +20,8 @@ fn every_kind_of_block_paints_inside_the_column() {
         ("task", Block::text("a", BlockKind::ListItem { list: ListKind::Task { checked: true }, depth: 0 }, PROSE)),
         ("code", Block::text("a", BlockKind::Code { language: Some("rust".into()) }, "fn main() {\n    run();\n}")),
         ("quote", container("q", BlockKind::Quote, vec![paragraph("a", PROSE)])),
-        ("callout", container("c", BlockKind::Callout { tone: Tone::Warn }, vec![paragraph("a", PROSE)])),
-        ("empty callout", container("c", BlockKind::Callout { tone: Tone::Info }, vec![])),
+        ("callout", container("c", BlockKind::callout(Tone::Warn), vec![paragraph("a", PROSE)])),
+        ("empty callout", container("c", BlockKind::callout(Tone::Info), vec![])),
         ("divider", Block::new("d", BlockKind::Divider)),
         ("unknown", Block::new("u", BlockKind::Unknown { type_name: "chart".into() })),
         ("empty paragraph", paragraph("a", "")),
@@ -110,7 +110,7 @@ fn fonts_fall_back_and_may_be_missing() {
         .map(|item| if let Item::Glyphs { font, .. } = item { &font.data } else { unreachable!() })
         .collect();
     assert_eq!(fonts.len(), 2, "both blocks are drawn with a bundled face");
-    assert!(!std::sync::Arc::ptr_eq(fonts[0], fonts[1]), "code falls back to a monospace face, prose does not");
+    assert!(!fonts[0].same(fonts[1]), "code falls back to a monospace face, prose does not");
 
     let mut bare = DocLayout::new(Fonts::default());
     bare.update(&doc, &Style::default(), WIDTH, None);
@@ -312,7 +312,8 @@ fn an_edit_gives_the_same_layout_as_starting_over() {
             paragraph("a", PROSE),
             Block::text("i", BlockKind::ListItem { list: ListKind::Ordered, depth: 0 }, "One"),
             Block::text("j", BlockKind::ListItem { list: ListKind::Ordered, depth: 0 }, "Two"),
-            container("c", BlockKind::Callout { tone: Tone::Tip }, vec![paragraph("b", PROSE)]),
+            container("c", BlockKind::callout(Tone::Tip), vec![paragraph("b", PROSE)]),
+            container("q", BlockKind::Quote, vec![paragraph("d", "Quoted"), paragraph("e", PROSE)]),
             paragraph("z", "End"),
         ])
     };
@@ -329,6 +330,8 @@ fn an_edit_gives_the_same_layout_as_starting_over() {
         ("retoning", vec![Op::SetKind { block: "c".into(), kind: BlockKind::Quote }]),
         ("removing a container", vec![Op::RemoveBlock { block: "c".into() }]),
         ("inserting", vec![Op::InsertBlock { parent: Some("c".into()), index: 0, block: paragraph("n", "New") }]),
+        ("turning an item to read from the right", vec![Op::InsertText { at: Pos::new("i", 0), text: HEBREW.into() }]),
+        ("turning a quote to read from the right", vec![Op::InsertText { at: Pos::new("d", 0), text: HEBREW.into() }]),
         (
             "several at once",
             vec![
@@ -393,6 +396,136 @@ fn lists_number_and_indent() {
     assert!(left_of_text(x("a"), x("b") - 1.0) && left_of_text(x("b"), x("c") - 1.0));
 }
 
+const HEBREW: &str = "שלום עולם";
+const ARABIC: &str = "مرحبا بالعالم";
+
+/// How far across the page an item reaches, loosely: glyphs from the first of them to the last.
+fn across(item: &Item) -> Option<(f32, f32)> {
+    match item {
+        Item::Fill { rect, .. } | Item::Stroke { rect, .. } => Some((rect.x, rect.x + rect.width)),
+        Item::Glyphs { origin, glyphs, .. } => {
+            let at = glyphs.iter().map(|glyph| origin.x + glyph.x);
+            Some((at.clone().fold(f32::MAX, f32::min), at.fold(f32::MIN, f32::max)))
+        }
+        _ => None,
+    }
+}
+
+#[test]
+fn a_text_reads_from_the_side_its_first_letter_does() {
+    let item = |block: Block| Block { kind: BlockKind::ListItem { list: ListKind::Bullet, depth: 0 }, ..block };
+    let cases: Vec<(&str, Block, bool)> = vec![
+        ("Latin", paragraph("a", "Hello"), false),
+        ("Hebrew", paragraph("a", HEBREW), true),
+        ("Arabic", paragraph("a", ARABIC), true),
+        ("a heading", Block::text("a", BlockKind::Heading { level: 2 }, HEBREW), true),
+        ("Hebrew after a number", paragraph("a", "12. שלום"), true),
+        ("Hebrew after Latin", paragraph("a", "A שלום"), false),
+        ("Hebrew after a formula", item(rich("a", &[("x", &[Mark::Math]), (" שלום", &[])])), true),
+        ("code", Block::text("a", BlockKind::Code { language: None }, HEBREW), false),
+    ];
+    for (name, block, right) in cases {
+        let mut layout = laid(&doc(vec![block]));
+        let leftmost = |layout: &DocLayout| {
+            let glyphs = placed(&painted(layout, everything()));
+            glyphs.iter().map(|glyph| glyph.1).fold(f32::MAX, f32::min)
+        };
+        assert_eq!(leftmost(&layout) > WIDTH / 2.0, right, "{name}");
+        // A formula shows its source while the caret is in it, which is no letter of the text either.
+        layout.reveal(Some((&Pos::new("a", 1), &Markers::default())));
+        assert_eq!(leftmost(&layout) > WIDTH / 2.0, right, "{name}, with the caret in it");
+    }
+}
+
+#[test]
+fn a_list_item_is_marked_and_set_in_at_the_side_it_starts_at() {
+    const LOUD: Color = Color::rgb(1, 200, 3);
+    let palette = Palette { marker: LOUD, accent: LOUD, on_accent: LOUD, line_strong: LOUD, ..Palette::LIGHT };
+    let lists = [
+        ("a bullet", ListKind::Bullet),
+        ("a number", ListKind::Ordered),
+        ("a ticked box", ListKind::Task { checked: true }),
+        ("an unticked box", ListKind::Task { checked: false }),
+    ];
+    for (list, kind) in lists {
+        for (script, text, right) in [("Latin", "Hello", false), ("Hebrew", HEBREW, true), ("Arabic", ARABIC, true)] {
+            let item = Block::text("a", BlockKind::ListItem { list: kind, depth: 1 }, text);
+            let mut layout = laid(&doc(vec![paragraph("p", text), item]));
+            layout.set_palette(palette);
+            let start = |id: &str| layout.caret(&Pos::new(id, 0)).unwrap().x;
+            let (edge, inner) = (start("p"), start("a"));
+            assert_eq!(inner < edge, right, "{list} in {script}: it is set in from where a paragraph starts");
+
+            let items = painted(&layout, everything());
+            let marks: Vec<(f32, f32)> =
+                items.iter().filter(|item| color_of(item) == Some(LOUD)).filter_map(across).collect();
+            assert!(!marks.is_empty(), "{list} in {script}: it has a marker");
+            let (low, high) = (edge.min(inner), edge.max(inner));
+            assert!(
+                marks.iter().all(|(from, to)| low <= *from && *to <= high),
+                "{list} in {script}: the marker stands in that indent, {marks:?} in {low}..{high}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_number_reads_the_way_its_item_does() {
+    const LOUD: Color = Color::rgb(1, 200, 3);
+    let number = |text: &str| {
+        let item = Block::text("a", BlockKind::ListItem { list: ListKind::Ordered, depth: 0 }, text);
+        let mut layout = laid(&doc(vec![item]));
+        layout.set_palette(Palette { marker: LOUD, ..Palette::LIGHT });
+        let mut marker: Vec<Item> = painted(&layout, everything());
+        marker.retain(|item| color_of(item) == Some(LOUD));
+        let mut glyphs = placed(&marker);
+        glyphs.sort_by(|a, b| a.1.total_cmp(&b.1));
+        glyphs.into_iter().map(|glyph| glyph.0).collect::<Vec<u32>>()
+    };
+    let (left, mut right) = (number("Hello"), number(HEBREW));
+    assert!(left.len() > 1, "a number has its stop");
+    right.reverse();
+    assert_eq!(left, right, "the stop is between the number and the text on either side");
+}
+
+#[test]
+fn a_quotes_bar_stands_where_its_first_text_starts() {
+    const LOUD: Color = Color::rgb(1, 200, 3);
+    let quote = |id: &str, inside: Vec<Block>| container(id, BlockKind::Quote, inside);
+    let cases: Vec<(&str, Vec<Block>, bool)> = vec![
+        ("Latin", vec![paragraph("a", "Hello")], false),
+        ("Hebrew", vec![paragraph("a", HEBREW)], true),
+        ("Arabic", vec![paragraph("a", ARABIC)], true),
+        ("Hebrew after Latin", vec![paragraph("a", "Hello"), paragraph("b", HEBREW)], false),
+        ("Latin after Hebrew", vec![paragraph("a", HEBREW), paragraph("b", "Hello")], true),
+        ("a quote in Hebrew", vec![quote("r", vec![paragraph("a", HEBREW)])], true),
+        ("code in Hebrew", vec![Block::text("a", BlockKind::Code { language: None }, HEBREW)], false),
+    ];
+    for (name, inside, right) in cases {
+        let mut layout = laid(&doc(vec![quote("q", inside)]));
+        layout.set_palette(Palette { line_strong: LOUD, ..Palette::LIGHT });
+        let items = painted(&layout, everything());
+        let (bars, rest): (Vec<&Item>, Vec<&Item>) = items.iter().partition(|item| color_of(item) == Some(LOUD));
+        let reach = |items: &[&Item]| {
+            let spans = items.iter().filter_map(|item| across(item));
+            spans.fold((f32::MAX, f32::MIN), |all, span| (all.0.min(span.0), all.1.max(span.1)))
+        };
+        let (bar, text) = (reach(&bars), reach(&rest));
+        let start = layout.caret(&Pos::new("a", 0)).unwrap();
+        assert!(bar.0 >= 0.0 && bar.1 <= WIDTH, "{name}: the bar is in the column");
+        match right {
+            true => {
+                assert!(text.1 <= bar.0, "{name}: the bar is right of all it holds, {text:?} and {bar:?}");
+                assert!(start.x + start.width <= bar.0, "{name}: and its text starts clear of the bar");
+            }
+            false => {
+                assert!(bar.1 <= text.0, "{name}: the bar is left of all it holds, {bar:?} and {text:?}");
+                assert!(bar.1 <= start.x, "{name}: and its text starts clear of the bar");
+            }
+        }
+    }
+}
+
 #[test]
 fn plain_strings_are_shaped_for_widgets() {
     let shaper = Shaper::new(fonts());
@@ -427,7 +560,7 @@ fn the_palette_colours_what_the_style_does_not() {
     let light = Palette::LIGHT;
     let item = |list| Block::text("a", BlockKind::ListItem { list, depth: 0 }, "Item");
     let run = |run: Run| Block { body: Body::Text(vec![run]), ..paragraph("a", "") };
-    let warning = || container("c", BlockKind::Callout { tone: Tone::Warn }, vec![paragraph("a", "Rates")]);
+    let warning = || container("c", BlockKind::callout(Tone::Warn), vec![paragraph("a", "Rates")]);
     let cases: Vec<(&str, Palette, Block)> = vec![
         (
             "a link",
@@ -679,4 +812,54 @@ fn text_is_read_in_the_language_named_nearest_to_it() {
         assert!(glyphs(&layout) == wanted.0, "{name}: the text is set again for the language");
         assert!(read(model.doc()) == wanted, "{name}: as on a page that starts with it, Han told with it");
     }
+}
+
+#[test]
+fn a_callout_is_headed_by_its_icon_and_title_in_its_colour() {
+    const OWN: Color = Color::rgb(0xaa, 0x33, 0x66);
+    let chosen = |title: Option<&str>, icon: Option<&str>, color: Option<&str>| {
+        let own = |text: Option<&str>| text.map(str::to_owned);
+        let kind = BlockKind::Callout { tone: Tone::Warn, title: own(title), icon: own(icon), color: own(color) };
+        laid(&doc(vec![container("c", kind, vec![paragraph("a", "Rates")])]))
+    };
+    let icons = |layout: &DocLayout| {
+        let items = painted(layout, everything());
+        items.iter().filter(|item| matches!(item, Item::Path { .. })).count()
+    };
+    let caret = |layout: &DocLayout| layout.caret(&Pos::new("a", 0)).expect("the text has a caret");
+
+    let plain = chosen(None, None, None);
+    let (titled, untitled) = (chosen(Some("Before the roofers arrive"), None, None), chosen(Some(""), None, None));
+    let bare = chosen(Some(""), Some("none"), None);
+    // The tone gives a title and an icon. A title has a line of its own, and an icon alone stands beside the text.
+    assert_eq!(spelt(&plain).matches("Warning").count(), 1, "the tone's title shows: {}", spelt(&plain));
+    assert!(spelt(&titled).contains("Before the roofers arrive") && !spelt(&titled).contains("Warning"));
+    assert_eq!((icons(&plain), icons(&untitled), icons(&bare)), (1, 1, 0));
+    assert_eq!(titled.height(), plain.height(), "a title takes one line, whatever it says");
+    assert!(untitled.height() < plain.height() && bare.height() == untitled.height());
+    assert!(caret(&untitled).x > caret(&bare).x, "the text makes room for an icon beside it");
+    assert!((caret(&plain).x - caret(&bare).x).abs() < 0.01, "and for none above it");
+
+    // What a press on the callout's head is on: its icon and title, inside its box and above its text.
+    for (name, layout) in [("the tone's", &plain), ("a title", &titled), ("an icon alone", &untitled)] {
+        let heads = layout.callouts(everything());
+        let [(block, head)] = heads.as_slice() else { panic!("{name}: one callout has one head, not {heads:?}") };
+        assert_eq!(block.as_str(), "c");
+        assert!(head.width > 0.0 && head.x >= 0.0 && head.x + head.width <= WIDTH, "{name}: {head:?}");
+        assert!(head.y < caret(layout).y + caret(layout).height, "{name}: {head:?}");
+    }
+    assert!(bare.callouts(everything()).is_empty(), "nothing to press where nothing shows");
+
+    // A colour of its own colours the bar and the title, and a dark page turns it over to be read.
+    let mut own = chosen(None, None, Some("#aa3366"));
+    let light = painted(&own, everything());
+    let in_own = light.iter().filter(|item| color_of(item) == Some(OWN)).count();
+    assert!(in_own >= 2, "the bar and the title take the colour: {in_own}");
+    assert!(!light.iter().any(|item| color_of(item) == Some(Palette::LIGHT.warn.accent)));
+    own.set_palette(dark());
+    let dim = painted(&own, everything());
+    assert!(
+        !dim.iter().any(|item| color_of(item) == Some(OWN)),
+        "a colour for paper is not drawn as it is on a dark page"
+    );
 }

@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use letters_layout::{FontSpec, Fonts, Shaper};
+use letters_layout::{FontSpec, Fonts, Shaper, Uncovered};
 use letters_render::{Color, DisplayList, Font, Glyph, Item, Point, Size};
 
 /// Glyphs in one font, positioned from the text's top left.
@@ -157,6 +157,17 @@ impl FontShaper {
     /// before may have been set without it.
     pub fn add_fonts(&self, fonts: &Fonts) -> bool {
         self.0.add_fonts(fonts)
+    }
+
+    /// Adds faces that only back the fonts up, for the characters they lack. Returns whether a label
+    /// shaped before was shown without a glyph that it has now.
+    pub fn add_fallback_fonts(&self, fonts: &Fonts) -> bool {
+        self.0.add_fallback_fonts(fonts)
+    }
+
+    /// The characters of the labels shaped since this was last asked that no face has a glyph for.
+    pub fn take_uncovered(&self) -> Vec<Uncovered> {
+        self.0.take_uncovered()
     }
 }
 

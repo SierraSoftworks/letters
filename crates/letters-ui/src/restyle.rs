@@ -157,7 +157,7 @@ mod tests {
                 holding("quote", BlockKind::Quote, vec![text("said", BlockKind::Paragraph)]),
                 holding(
                     "note",
-                    BlockKind::Callout { tone: Tone::Info },
+                    BlockKind::callout(Tone::Info),
                     vec![
                         text("noted", BlockKind::Paragraph),
                         holding("within", BlockKind::Quote, vec![text("deep", BlockKind::Paragraph)]),

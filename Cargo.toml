@@ -58,6 +58,8 @@ hayro = "0.9"
 parley = { version = "0.13", default-features = false, features = ["std"] }
 # The Unicode properties parley itself reads, for telling which characters no font covers: same version as its.
 parley_data = "0.13"
+# The classes parley_data answers in, for telling which side a text reads from: the version parley_data has.
+icu_properties = { version = "2.3", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false }
 # Tokenizes clipboard HTML. No dependencies of its own.
 html5gum = "0.9"
@@ -85,6 +87,8 @@ softbuffer = "0.4"
 accesskit_winit = "0.34"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
 rfd = "0.17"
+# Lists the system's font files and their families, in Rust alone. For what the bundled fonts cannot draw.
+fontdb = "0.24"
 # The desktop shell fetches linked pictures with it: no cookies, no proxies, the system's own roots.
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
 # A server for the fetch's tests.
@@ -128,6 +132,12 @@ incremental = false
 
 [profile.dev.package."*"]
 debug = false
+
+# ICU writes a line to stderr for every stretch of Thai or CJK text it segments without a dictionary, but
+# only where debug assertions are on. A release build says nothing, and so a debug build does not either.
+[profile.dev.package.icu_provider]
+debug = false
+debug-assertions = false
 
 [profile.release]
 lto = "thin"

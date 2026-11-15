@@ -281,12 +281,12 @@ fn rgb_of(ink: Ink) -> [u8; 3] {
     [ink.light.r, ink.light.g, ink.light.b]
 }
 
-fn hex([r, g, b]: [u8; 3]) -> String {
+pub(crate) fn hex([r, g, b]: [u8; 3]) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
 /// Reads a colour as people type it: six hex digits, with or without the `#`.
-fn read_hex(typed: &str) -> Option<[u8; 3]> {
+pub(crate) fn read_hex(typed: &str) -> Option<[u8; 3]> {
     let digits = typed.trim();
     let digits = digits.strip_prefix('#').unwrap_or(digits);
     // A sign would parse as a number, and is no part of a colour.

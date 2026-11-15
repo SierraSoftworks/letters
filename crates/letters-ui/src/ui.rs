@@ -185,8 +185,7 @@ pub struct Ui<A: App> {
     last_press: Option<Press>,
     focus: Option<Id>,
     focus_visible: bool,
-    /// The open popovers, as of the last build: the anchor of each, and whether it is beside it. One that
-    /// takes the place of another on the same anchor is another popover when only one of them is beside.
+    /// The open popovers, as of the last build: the surface of each, and whether it is beside its anchor.
     layers: Vec<(Id, bool)>,
     /// For each open popover, where focus was before it opened.
     returns: Vec<((Id, bool), Option<Id>)>,
@@ -267,6 +266,11 @@ impl<A: App> Ui<A> {
     /// The app, to change its state from outside. The window is described again afterwards.
     pub fn app_mut(&mut self) -> &mut A {
         self.stale.view = true;
+        &mut self.app
+    }
+
+    /// The app, for what changes nothing the window shows: no frame is asked for.
+    pub(crate) fn app_unseen(&mut self) -> &mut A {
         &mut self.app
     }
 
@@ -1394,7 +1398,12 @@ impl<A: App> Ui<A> {
     /// Carries focus, popovers and per-element state over to a newly built tree.
     fn settle(&mut self) {
         let tree = &self.tree;
-        let open = tree.layers.iter().filter_map(|layer| Some((tree.nodes[layer.anchor?].id, layer.beside)));
+        // A popover is known by its surface, which is named after its anchor and its own key or label: one
+        // that takes the place of another on the same anchor is another popover.
+        let open = tree
+            .layers
+            .iter()
+            .filter_map(|layer| Some((tree.nodes[layer.anchor.map(|_| layer.root)?].id, layer.beside)));
         let anchors: Vec<(Id, bool)> = open.collect();
         let mut focus = self.focus;
 

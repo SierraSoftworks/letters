@@ -162,7 +162,7 @@ impl Writer {
             5 => BlockKind::Code { language: script.one(&[None, Some("rust")]).map(str::to_owned) },
             6 => BlockKind::Formula,
             7 => BlockKind::Quote,
-            8 => BlockKind::Callout { tone: script.one(&TONES) },
+            8 => BlockKind::callout(script.one(&TONES)),
             _ => BlockKind::Divider,
         }
     }

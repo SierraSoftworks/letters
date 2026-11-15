@@ -345,7 +345,7 @@ pub fn read(state: &str) -> (Document, Option<Selection>, Option<BlockId>) {
             Some(("g#", rest)) => (Some(Outer::Holder(BlockKind::Gallery { numbered: true })), rest),
             Some((tone, rest)) if TONES.iter().any(|(name, _)| *name == tone) => {
                 let tone = TONES.iter().find(|(name, _)| *name == tone).expect("checked above").1;
-                (Some(Outer::Holder(BlockKind::Callout { tone })), rest)
+                (Some(Outer::Holder(BlockKind::callout(tone))), rest)
             }
             Some((name, rest)) if numbered(name).is_some() => (numbered(name).map(Outer::Row), rest),
             _ => (None, line),
@@ -496,7 +496,7 @@ pub fn render(doc: &Document, selection: Option<&Selection>, picture: Option<&Bl
             (BlockKind::Quote, Body::Blocks(children)) => {
                 lines.extend(children.iter().map(|child| format!("> {}", line(child))));
             }
-            (BlockKind::Callout { tone }, Body::Blocks(children)) => {
+            (BlockKind::Callout { tone, .. }, Body::Blocks(children)) => {
                 let name = TONES.iter().find(|(_, other)| other == tone).expect("every tone has a name").0;
                 lines.extend(children.iter().map(|child| format!("{name}> {}", line(child))));
             }
@@ -706,7 +706,7 @@ pub fn action() -> impl Strategy<Value = Action> {
         BlockKind::ListItem { list: ListKind::Task { checked: true }, depth: 0 },
         BlockKind::Code { language: None },
         BlockKind::Quote,
-        BlockKind::Callout { tone: Tone::Tip },
+        BlockKind::callout(Tone::Tip),
         BlockKind::Divider,
     ]);
     let commands = prop_oneof![

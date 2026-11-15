@@ -1,5 +1,6 @@
 // Save a copy: the document again, or in another format, as a file the browser keeps for the person.
 
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 
 import { expect, test } from "@playwright/test";
@@ -102,4 +103,30 @@ test("a copy that cannot be written leaves its card to ask again", async ({ page
   const [name] = await saved(page);
   expect(name).toBe("Later.html");
   await expect(card(page)).not.toBeAttached();
+});
+
+test.describe("a PDF of emoji and of scripts the fonts lack", () => {
+  // The faces that back up the fonts are fetched as the page is built, and a build without a network has none.
+  const built = existsSync(new URL("../dist/fallback/NotoColorEmoji.ttf", import.meta.url));
+  test.skip(!built, "this build has no faces to back up the fonts");
+
+  /** A PDF of a line with an emoji and Japanese in it. */
+  const pdf = async (page) => {
+    await page.keyboard.insertText("A smile 🙂 and 日本語のテキスト");
+    await ask(page, "Faces", "PDF");
+    return (await saved(page))[1];
+  };
+
+  test("carries the faces that have them", async ({ page }) => {
+    const file = await pdf(page);
+    for (const face of ["NotoColorEmoji", "NotoSansJP"]) expect(file).toContain(face);
+  });
+
+  test("is made without a face that cannot be fetched", async ({ page }) => {
+    await page.route("**/fallback/NotoColorEmoji.ttf", (route) => route.abort());
+    const file = await pdf(page);
+    expect(file.startsWith("%PDF-")).toBe(true);
+    expect(file).toContain("NotoSansJP");
+    expect(file).not.toContain("NotoColorEmoji");
+  });
 });

@@ -41,7 +41,7 @@ test("a menu that opens is in the mirror, and its items can be chosen there", as
   await page.keyboard.press("ArrowLeft");
   await page.keyboard.press("ArrowLeft");
   await page.locator("textarea").dispatchEvent("contextmenu");
-  await expect(page.getByRole("menu", { name: "Spelling" })).toBeAttached();
+  await expect(page.getByRole("menu", { name: "Context menu" })).toBeAttached();
   await press(page.getByRole("menuitem", { name: "quick" }));
   await expect.poll(async () => (await texts(page)).at(-1)).toBe("The quick ");
   await expect(page.getByRole("menu")).toHaveCount(0);

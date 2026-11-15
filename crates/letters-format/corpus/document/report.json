@@ -163,6 +163,9 @@
           "id": "b14",
           "type": "callout",
           "tone": "danger",
+          "title": "Before you start",
+          "icon": "flame",
+          "color": "#7a3fb5",
           "blocks": []
         }
       ]

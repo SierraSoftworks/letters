@@ -29,7 +29,7 @@ fn a_document_is_named_after_its_first_heading_1() {
 
 #[test]
 fn a_heading_inside_a_callout_counts() {
-    let mut callout = Block::new("c", BlockKind::Callout { tone: Tone::Info });
+    let mut callout = Block::new("c", BlockKind::callout(Tone::Info));
     callout.body = letters_model::Body::Blocks(vec![heading(1, "Inside")]);
     assert_eq!(suggested_name(&document([callout])).as_deref(), Some("Inside"));
 }

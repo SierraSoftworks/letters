@@ -238,7 +238,7 @@ fn read_text_style(value: Value, mut style: TextStyle, path: &str) -> Result<Tex
     Ok(style)
 }
 
-fn is_color(color: &str) -> bool {
+pub(crate) fn is_color(color: &str) -> bool {
     color.len() == 7 && color.starts_with('#') && color[1..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 

@@ -30,6 +30,7 @@ const USE: u8 = 9;
 const HELD: u8 = 10;
 /// The handle of a cell's column and of its row, and the bars that add a column and a row after it.
 const TABLE: [u8; 4] = [11, 12, 13, 14];
+const CALLOUT: u8 = 15;
 
 /// FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
 fn hashed(bytes: impl Iterator<Item = u8>) -> u64 {
@@ -326,6 +327,7 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
             (depth, matches!(list, ListKind::Task { checked: true })).hash(&mut reads)
         }
         BlockKind::Figure { alt, .. } => alt.hash(&mut reads),
+        BlockKind::Callout { .. } => block.kind.callout_look().map(|look| look.title.to_owned()).hash(&mut reads),
         _ => {}
     }
     block.body.runs().iter().for_each(|run| run.text.hash(&mut reads));
@@ -374,6 +376,19 @@ fn push_block(block: &Block, inner: Vec<NodeId>, telling: &mut Telling) -> NodeI
                     tick.add_action(Action::Click);
                 }
                 part(TICK, tick, &mut children);
+            }
+        }
+        BlockKind::Callout { .. } => {
+            // A callout is named by its title, and its icon and title are a button that opens its card.
+            let title = block.kind.callout_look().map(|look| look.title).unwrap_or_default();
+            if !title.is_empty() {
+                node.set_label(title);
+            }
+            if written {
+                let mut edit = Node::new(Role::Button);
+                edit.set_label(crate::callouts::LABEL);
+                edit.add_action(Action::Click);
+                part(CALLOUT, edit, &mut children);
             }
         }
         BlockKind::Code { .. } if written => {
@@ -440,6 +455,8 @@ pub(crate) enum Request {
     Tick(BlockId),
     /// Copies a code block.
     Copy(BlockId),
+    /// Presses a callout's icon and title, which opens its card.
+    Callout(BlockId),
     /// Turns the line under a figure's picture to its alt text.
     Alt(BlockId),
     /// Presses the marker of the notes beside a block.
@@ -476,6 +493,7 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
             let ticked = part(TICK).map(|block| Request::Tick(block.id.clone()));
             let copied = || part(COPY).map(|block| Request::Copy(block.id.clone()));
             let switched = || part(ALT).map(|block| Request::Alt(block.id.clone()));
+            let called = || part(CALLOUT).map(|block| Request::Callout(block.id.clone()));
             let noted = || part(NOTE).map(|block| Request::Note(block.id.clone()));
             let broken = || part(BREAK).map(|block| Request::Break(block.id.clone()));
             let chosen = |keep| part(if keep { KEEP } else { USE }).map(|block| (block.id.clone(), keep));
@@ -488,7 +506,8 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
                     add: at >= 2,
                 })
             };
-            ticked.or_else(copied).or_else(switched).or_else(noted).or_else(broken).or_else(chosen).or_else(tabled)
+            let found = ticked.or_else(copied).or_else(switched).or_else(called).or_else(noted).or_else(broken);
+            found.or_else(chosen).or_else(tabled)
         }
         _ => None,
     }

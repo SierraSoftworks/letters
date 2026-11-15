@@ -86,7 +86,13 @@
           "then": {
             "$ref": "#/$defs/container",
             "required": ["tone"],
-            "properties": { "tone": { "enum": ["tip", "info", "warn", "danger"] } }
+            "description": "A boxed note. Its tone gives it a title, an icon and a colour, and each can be chosen over the tone's.",
+            "properties": {
+              "tone": { "enum": ["tip", "info", "warn", "danger"] },
+              "title": { "type": "string", "pattern": "^[^\\n\\r]*$", "description": "The line that heads it. Defaults to the tone's: Tip, Info, Warning or Danger. Empty shows no title." },
+              "icon": { "type": "string", "pattern": "^[^\\n\\r]*$", "description": "info, lightbulb, triangle-alert, octagon-alert, circle-check, circle-help, star, flame, bookmark, pencil, quote, bug, or none for no icon. Defaults to the tone's. Any other name is kept and shown as the tone's." },
+              "color": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$", "description": "As #rrggbb, as it shows on a light page. Defaults to the tone's." }
+            }
           }
         },
         {

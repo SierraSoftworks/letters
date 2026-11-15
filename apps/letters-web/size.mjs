@@ -136,6 +136,8 @@ const download = (files) => [(bytes) => bytes.length, (bytes) => gzipSync(bytes,
 /** The files of a folder that the editor fetches. Their licences travel with them and are never asked for. */
 const folder = (name) => readdirSync(join(dist, name)).filter((file) => !file.endsWith(".txt")).map((file) => read(name, file));
 const [fonts, maths, dictionaries] = ["fonts", "maths", "dictionaries"].map(folder);
+/** The faces that back up the fonts. A document fetches one when it first shows a character of its script. */
+const fallback = readdirSync(join(dist, "fallback")).filter((file) => !file.endsWith(".txt"));
 /** The scripts `letters.js` imports, which `wasm-bindgen` writes beside it. */
 const snippets = readdirSync(join(dist, "snippets"), { recursive: true })
   .filter((file) => file.endsWith(".js"))
@@ -155,6 +157,7 @@ console.log(`${"What the browser downloads".padEnd(24)}${["as served", "gzip", "
 downloads.forEach(([label, files]) => row(label, ...download(files)));
 row("for the first frame", ...download(downloads.flatMap(([, files]) => files)));
 later.forEach(([label, files]) => row(label, ...download(files)));
+fallback.forEach((file) => row(`fallback/${file}`.slice(0, 22), ...download([read("fallback", file)])));
 console.log("What the wasm holds");
 row("code", size(10));
 row("data", size(11));

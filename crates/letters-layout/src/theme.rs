@@ -55,6 +55,9 @@ pub(crate) const FORMULA_SHRINK: f32 = 0.4;
 /// A callout's revealed tag is set small enough to sit in the padding above its text.
 pub(crate) const TAG_SCALE: f32 = 0.7;
 
+/// A callout's title is at least this heavy.
+pub(crate) const TITLE_WEIGHT: f32 = 600.0;
+
 /// Reads `#rrggbb`.
 pub(crate) fn color(hex: &str) -> Option<Color> {
     let digits = hex.strip_prefix('#').unwrap_or(hex);

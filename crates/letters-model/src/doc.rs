@@ -159,8 +159,16 @@ pub enum BlockKind {
     /// Display maths. Its text is the TeX source, and marks on it mean nothing.
     Formula,
     Quote,
+    /// A boxed note. `tone` is its preset, and the rest are a writer's own choices over it.
     Callout {
         tone: Tone,
+        /// The line that heads it. `None` is the tone's own, and an empty one shows no title.
+        title: Option<String>,
+        /// The name of its icon, one of [`Tone::ICONS`] or `none`. `None` is the tone's own, and a
+        /// name this build does not know is kept and drawn as the tone's.
+        icon: Option<String>,
+        /// Its colour as `#rrggbb`, written for a light page. `None` is the tone's own.
+        color: Option<String>,
     },
     Divider,
     /// A line in the caption style, as under a gallery.
@@ -201,6 +209,11 @@ pub enum BlockKind {
 }
 
 impl BlockKind {
+    /// A callout as its tone alone makes it.
+    pub const fn callout(tone: Tone) -> Self {
+        Self::Callout { tone, title: None, icon: None, color: None }
+    }
+
     pub fn shape(&self) -> BodyShape {
         match self {
             Self::Paragraph | Self::Heading { .. } | Self::ListItem { .. } => BodyShape::Text,
@@ -227,11 +240,15 @@ impl BlockKind {
     }
 
     /// Whether the kind's fields hold what `document.json` accepts for them.
-    pub(crate) fn sound(&self) -> bool {
+    pub fn sound(&self) -> bool {
         match self {
             Self::Heading { level } => (1..=4).contains(level),
             Self::Figure { asset, src, width, height, .. } => {
                 asset.is_some() != src.is_some() && [width, height].iter().all(|size| size.is_finite() && **size > 0.0)
+            }
+            Self::Callout { title, icon, color, .. } => {
+                let line = |text: &Option<String>| text.as_deref().is_none_or(|text| !text.contains(['\n', '\r']));
+                line(title) && line(icon) && color.as_deref().is_none_or(crate::style::is_color)
             }
             _ => true,
         }
@@ -251,6 +268,86 @@ pub enum Tone {
     Info,
     Warn,
     Danger,
+}
+
+impl Tone {
+    pub const ALL: [Self; 4] = [Self::Info, Self::Tip, Self::Warn, Self::Danger];
+
+    /// The icons a callout can name, besides `none`. The first four are the tones' own.
+    pub const ICONS: [&'static str; 12] = [
+        "info",
+        "lightbulb",
+        "triangle-alert",
+        "octagon-alert",
+        "circle-check",
+        "circle-help",
+        "star",
+        "flame",
+        "bookmark",
+        "pencil",
+        "quote",
+        "bug",
+    ];
+
+    /// The name `document.json` stores.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tip => "tip",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Danger => "danger",
+        }
+    }
+
+    /// The title of a callout that has none of its own.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Tip => "Tip",
+            Self::Info => "Info",
+            Self::Warn => "Warning",
+            Self::Danger => "Danger",
+        }
+    }
+
+    /// The icon of a callout that names none.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Tip => "lightbulb",
+            Self::Info => "info",
+            Self::Warn => "triangle-alert",
+            Self::Danger => "octagon-alert",
+        }
+    }
+}
+
+/// How a callout shows, with its tone's defaults filled in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CalloutLook<'a> {
+    pub tone: Tone,
+    /// Empty when it shows no title.
+    pub title: &'a str,
+    /// One of [`Tone::ICONS`], or `None` when it shows no icon.
+    pub icon: Option<&'static str>,
+    /// `#rrggbb` when it has a colour of its own.
+    pub color: Option<&'a str>,
+}
+
+impl BlockKind {
+    /// How a callout shows. `None` for any other kind.
+    pub fn callout_look(&self) -> Option<CalloutLook<'_>> {
+        let Self::Callout { tone, title, icon, color } = self else { return None };
+        let icon = match icon.as_deref() {
+            Some("none") => None,
+            Some(name) => Some(Tone::ICONS.iter().find(|known| **known == name).copied().unwrap_or(tone.icon())),
+            None => Some(tone.icon()),
+        };
+        Some(CalloutLook {
+            tone: *tone,
+            title: title.as_deref().unwrap_or(tone.title()),
+            icon,
+            color: color.as_deref(),
+        })
+    }
 }
 
 /// What a block holds. The block's kind fixes which variant it takes.

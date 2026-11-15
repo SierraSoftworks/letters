@@ -7,11 +7,13 @@
 //! - [`Window`] is the editor's window, which the shells and the test harness drive through the same calls.
 
 mod access;
+mod callouts;
 mod captions;
 mod chrome;
 mod code_copy;
 pub mod color;
 mod commands;
+mod context;
 mod copying;
 mod describe;
 mod element;
@@ -53,11 +55,14 @@ pub mod widgets;
 mod window;
 
 pub use accesskit::Role;
+pub use callouts::Calling;
 pub use chrome::{Chrome, Edge, Frame, WindowButton};
+pub use context::Contexting;
 pub use copying::CopyFormat;
 pub use element::{Cursor, Element, Fitted, Paint, Pointer};
 pub use icon::Icon;
 pub use importing::{ImportFolder, ImportKind, ImportOffer};
+pub use letters_layout::Uncovered;
 pub use opening::{Folder, Landing, Location, Recent, Request};
 pub use pictures::PictureState;
 pub use restyle::StyleEdit;

@@ -16,15 +16,19 @@
 //! Under the page a strip has a cell for each version, to press on or drag along, and the bar names the
 //! version that is picked: a name is a mark in the history, which is saved and is no edit. The bar's menu
 //! asks for a copy of the picked version, through the card that saves a copy of the document.
+//!
+//! A passage is copied out of a version as it is out of the page: the pointer selects it, and a tool over
+//! what is selected copies it, as the key for a copy does. There is no caret, since nothing is written.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use accesskit::{Node, NodeId, Role};
-use letters_editor::{Key, KeyEvent};
-use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split};
+use letters_editor::{Command, Editor, Key, KeyEvent, Platform};
+use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split, Uncovered};
 use letters_model::{
-    Block, BlockId, BlockKind, Body, Change, Document, Point as Step, Pos, Revision, Selection, Style, Tag, TagKind,
+    Block, BlockId, BlockKind, Body, Change, Document, Point as Step, Pos, ReplicaId, Revision, Selection, Style, Tag,
+    TagKind,
 };
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Item, PathEl, Point, Rect, Size};
@@ -46,7 +50,7 @@ use crate::text::{Family, TextShaper, TextStyle};
 use crate::theme::accent;
 use crate::threads;
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::widgets::{self, Button, ControlSize, Menu, MenuItem, Segmented, SidePanel, TextField, TopBar};
+use crate::widgets::{self, Button, ControlSize, Menu, MenuItem, Popover, Segmented, SidePanel, TextField, TopBar};
 use crate::window::{GUTTER, Message, PT, TOP};
 
 /// How long writing rests before what comes after it is another version, in seconds.
@@ -107,9 +111,20 @@ pub enum Historying {
     },
     /// The wheel turned over the version.
     Scroll(Point),
-    /// A press began at a point of the version, or ended there.
-    Down(Point),
+    /// A press began at a point of the version: the first, second or third in quick succession, and
+    /// with Shift to select as far as there. Then the pointer moved with the button held, and the press
+    /// ended.
+    Down {
+        at: Point,
+        clicks: u8,
+        extend: bool,
+    },
+    Drag(Point),
     Up(Point),
+    /// Selects all of the version that shows, copies what is selected of it, or selects nothing.
+    All,
+    Copy,
+    Unselect,
     /// Shows the picked version against another, or as it read.
     Compare(Compare),
     /// The pointer went down on the strip of versions, or moved along it while held: this far across it,
@@ -669,11 +684,24 @@ pub(crate) struct History {
     /// Where the pointer rests in the page area, and the button a press began on.
     pointer: Option<Point>,
     pressed: Option<Side>,
+    /// The passage selected in the version that shows, to be copied out of it: from where a press began
+    /// to where it got to, in the earlier version of a rewritten block or in the page. It goes when
+    /// another version shows.
+    selected: Option<(Side, Selection)>,
+    /// Whether the press that selects is still held, and whether what is selected was copied.
+    selecting: bool,
+    copied: bool,
     /// What was last drawn: how the pairs shared the window, where the versions of the rewritten blocks
-    /// in view stand in the page area, and the buttons that bring a version across.
+    /// in view stand in the page area, and the buttons that bring a version across. Then how the page was
+    /// split and where the page area showed the split's top left, and the first line and the last of what
+    /// is selected that showed, with whether the line at the head of a version stands over the first.
     arrangement: Option<Arrangement>,
     frames: Vec<(BlockId, Side, Rect)>,
     hot: Vec<(Rect, Side)>,
+    split: Option<(Split, Point)>,
+    lines: Option<(Rect, Rect, bool)>,
+    /// The faces of the system that back the fonts up, for the layout of a version shown after they came.
+    backup: Fonts,
 }
 
 impl History {
@@ -698,9 +726,15 @@ impl History {
             still: false,
             pointer: None,
             pressed: None,
+            selected: None,
+            selecting: false,
+            copied: false,
             arrangement: None,
             frames: Vec::new(),
             hot: Vec::new(),
+            split: None,
+            lines: None,
+            backup: Fonts::default(),
         };
         history.follow(steps, current);
         history
@@ -792,11 +826,15 @@ impl History {
             (_, None) => ["Removed", "Added"].map(str::to_owned),
         };
         let last = self.leaf.take();
-        self.leaf = later.map(|later| Leaf::new(between, earlier.as_deref(), &later, heads, captions, last));
+        let backup = &self.backup;
+        self.leaf = later.map(|later| Leaf::new(between, earlier.as_deref(), &later, heads, captions, last, backup));
         // The versions just shown are the ones a step is most likely to want again.
         let spare = self.read.len().saturating_sub(KEPT);
         self.read.drain(..spare);
         (self.frames, self.hot, self.pressed) = (Vec::new(), Vec::new(), None);
+        // A passage is of the version it was selected in.
+        (self.split, self.lines) = (None, None);
+        self.unselect();
     }
 
     /// Who wrote a version and when, for the line at the head of its side of a rewritten block.
@@ -853,6 +891,28 @@ impl History {
     /// Picks the version before the one picked, or the one after it, when there is one.
     pub fn step(&mut self, back: bool) {
         self.pick(if back { self.at.saturating_sub(1) } else { self.at + 1 });
+    }
+
+    /// Takes faces of the system that back the fonts up, for the versions shown from now on. Returns
+    /// whether a character that was shown without a glyph has one now.
+    pub fn add_fallback_fonts(&mut self, fonts: &Fonts) -> bool {
+        self.backup.faces.extend(fonts.faces.iter().cloned());
+        let Some(leaf) = &mut self.leaf else { return false };
+        let earlier = leaf.earlier.as_mut().is_some_and(|(_, layout)| layout.add_fallback_fonts(fonts));
+        let shown = leaf.layout.add_fallback_fonts(fonts) || earlier;
+        leaf.estimated |= shown;
+        if let Some((_, spare, _)) = &mut leaf.spare {
+            spare.add_fallback_fonts(fonts);
+        }
+        shown
+    }
+
+    /// The characters the versions showed without a glyph since this was last asked.
+    pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
+        let Some(leaf) = &mut self.leaf else { return Vec::new() };
+        let mut found = leaf.layout.take_uncovered();
+        found.extend(leaf.earlier.iter_mut().flat_map(|(_, layout)| layout.take_uncovered()));
+        found
     }
 
     /// Takes faces that arrived late.
@@ -962,21 +1022,140 @@ impl History {
         changed
     }
 
-    /// Takes a press at a point of the page area. One on a version of a rewritten block brings that
-    /// version across, and one on a button waits to end there.
-    pub fn press(&mut self, at: Point) {
-        self.pressed = self.button(at);
-        let on = self.frames.iter().find(|(_, _, frame)| frame.contains(at)).map(|(_, side, _)| *side);
-        if let Some(side) = on.filter(|_| self.pressed.is_none()) {
-            self.bring(side);
+    /// The position in the version nearest to a point of the page area, and the side it is on. With a
+    /// passage `held`, the nearest that the passage can reach to: on its side, and for the earlier version
+    /// of a rewritten block in that block, which is all that shows of that version.
+    fn spot(&self, at: Point, held: Option<&(Side, Selection)>) -> Option<(Side, Pos)> {
+        let (leaf, (split, shift)) = (self.leaf.as_ref()?, self.split.as_ref()?);
+        let mut at = Point { x: at.x - shift.x, y: at.y - shift.y };
+        let earlier = leaf.earlier.as_ref().map_or(&leaf.layout, |(_, layout)| layout);
+        if let Some((side, selection)) = held {
+            let layout = if *side == Side::First { earlier } else { &leaf.layout };
+            let block = layout.band(&selection.anchor.block).filter(|_| *side == Side::First);
+            let reached = |piece: &&Piece| {
+                piece.side == *side && block.is_none_or(|block| piece.band.0 < block.1 && block.0 < piece.band.1)
+            };
+            let off = |piece: &&Piece| (piece.rect.y - at.y).max(at.y - piece.rect.y - piece.rect.height).max(0.0);
+            let piece = split.pieces.iter().filter(reached).min_by(|a, b| off(a).total_cmp(&off(b)))?.rect;
+            // Kept inside that part of the split, the point is in its version whatever stands beside it.
+            let (right, bottom) =
+                ((piece.x + piece.width - 0.5).max(piece.x), (piece.y + piece.height - 0.5).max(piece.y));
+            at = Point { x: at.x.clamp(piece.x, right), y: at.y.clamp(piece.y, bottom) };
         }
+        split.hit(earlier, &leaf.layout, at).filter(|(side, _)| held.is_none_or(|(held, _)| held == side))
+    }
+
+    /// Takes a press at a point of the page area. One on a version of a rewritten block that the window
+    /// cuts off brings that version across, and one on a button waits to end there. Any other starts a
+    /// passage where it is, or with `extend` takes the one there is as far as there.
+    pub fn press(&mut self, at: Point, extend: bool) {
+        self.pressed = self.button(at);
+        if self.pressed.is_some() {
+            return;
+        }
+        let on = self.frames.iter().find(|(_, _, frame)| frame.contains(at)).map(|(_, side, _)| *side);
+        let across = self.arrangement == Some(Arrangement::Pinned) && on.is_some_and(|side| side != self.active);
+        on.into_iter().for_each(|side| self.bring(side));
+        // The text of a version that comes across moves from under the pointer.
+        if across {
+            return;
+        }
+        let held = self.selected.clone().filter(|_| extend);
+        let Some((side, head)) = self.spot(at, held.as_ref()) else { return };
+        let anchor = held.map_or_else(|| head.clone(), |(_, selection)| selection.anchor);
+        self.selected = Some((side, Selection { anchor, head }));
+        (self.selecting, self.copied) = (true, false);
+    }
+
+    /// Takes the passage as far as the pointer went with the button held. Past the top or the bottom of
+    /// the page area the version scrolls after it.
+    pub fn drag(&mut self, at: Point) {
+        let Some(held) = self.selected.clone().filter(|_| self.selecting) else { return };
+        if let Some((_, head)) = self.spot(at, Some(&held)) {
+            self.selected = Some((held.0, Selection { anchor: held.1.anchor, head }));
+        }
+        let past = at.y.min(0.0) + (at.y - self.room.height).max(0.0);
+        self.scroll += past.clamp(-STEP, STEP);
+        self.keep();
     }
 
     /// Lets go at a point of the page area. A button does what it is for when the press ends on it.
     pub fn release(&mut self, at: Point) {
+        self.selecting = false;
         if let Some(side) = self.pressed.take().filter(|side| self.button(at) == Some(*side)) {
             self.bring(side);
         }
+    }
+
+    /// An editor that holds one side of the version as its document. It selects and copies as the page's
+    /// own does, and nothing is written with it.
+    fn reader(&self, side: Side) -> Option<Editor> {
+        let leaf = self.leaf.as_ref()?;
+        let doc = match (side, &leaf.earlier) {
+            (Side::First, Some((earlier, _))) => earlier,
+            _ => &leaf.doc,
+        };
+        Some(Editor::new(doc.clone(), ReplicaId::from(1)))
+    }
+
+    /// Has an editor of the side the passage is on select from where the passage ends, as `command` does,
+    /// and takes what it selected.
+    fn reselect(&mut self, side: Side, command: Command, platform: &mut dyn Platform) {
+        let Some(mut reader) = self.reader(side) else { return };
+        if let Some((_, selection)) = &self.selected {
+            reader.select(Selection::caret(selection.head.clone()));
+        }
+        reader.run(command, platform);
+        self.selected = reader.selection().cloned().map(|selection| (side, selection));
+        (self.selecting, self.copied) = (false, false);
+    }
+
+    /// Takes the second press of a double click, which selects the word the first was on, or a later one,
+    /// which selects its whole block.
+    pub fn widen(&mut self, clicks: u8, platform: &mut dyn Platform) {
+        let Some(side) = self.selected.as_ref().map(|(side, _)| *side) else { return };
+        let command = if clicks == 2 { Command::SelectWord } else { Command::SelectBlock };
+        self.reselect(side, command, platform);
+    }
+
+    /// Selects all of the version that shows: the page, with what stands in it of the later version.
+    pub fn select_all(&mut self, platform: &mut dyn Platform) {
+        self.selected = None;
+        self.reselect(Side::Second, Command::SelectAll, platform);
+    }
+
+    pub fn unselect(&mut self) {
+        (self.selected, self.selecting, self.copied) = (None, false, false);
+    }
+
+    /// The passage that is selected, when it holds anything.
+    fn passage(&self) -> Option<&(Side, Selection)> {
+        self.selected.as_ref().filter(|(_, selection)| !selection.is_caret())
+    }
+
+    /// Copies the passage to the clipboard as the page's editor copies: with its marks and its blocks, for
+    /// Letters and for other applications.
+    pub fn copy(&mut self, platform: &mut dyn Platform) {
+        let Some((side, selection)) = self.passage().cloned() else { return };
+        let Some(mut reader) = self.reader(side) else { return };
+        reader.select(selection);
+        reader.run(Command::Copy, platform);
+        self.copied = true;
+    }
+
+    /// The tool over a passage once it is selected, which copies it and then says so: over the first line
+    /// of the passage, or under its last where there is no room above or the room is the line that says
+    /// whose version it is.
+    pub fn tools(&self) -> Option<Popover<Message>> {
+        let (first, last, headed) = self.lines.filter(|_| !self.selecting)?;
+        let above = !headed && first.y >= notes::TOOLS_ROOM;
+        let (sign, label) = if self.copied { (icon::CHECK, "Copied") } else { (icon::COPY, "Copy") };
+        let copy = Button::new(label).icon(sign).subtle().small().on_press(Message::History(Historying::Copy));
+        let tools =
+            Element::row().padding(Edges::all(tokens::SPACE_XS)).role(Role::Toolbar).label("Selection").child(copy);
+        let side = if above { widgets::Side::Top } else { widgets::Side::Bottom };
+        let tools = Popover::new(tools).flush().side(side).gap(notes::TOOLS_GAP).beside().stays().open(true);
+        Some(tools.on_close(Message::History(Historying::Unselect)).at(if above { first } else { last }))
     }
 
     /// The picked version, for the area where the page was. Also returns the pictures in it that the
@@ -991,7 +1170,7 @@ impl History {
         scale: f32,
     ) -> (Element<Message>, Vec<String>) {
         (self.room, self.scale) = (room, scale);
-        (self.frames, self.hot) = (Vec::new(), Vec::new());
+        (self.frames, self.hot, self.lines) = (Vec::new(), Vec::new(), None);
         let mut list = DisplayList::default();
         if let Some(mut leaf) = self.leaf.take() {
             self.draw(&mut leaf, images, shaper, palette, scheme, &mut list);
@@ -999,7 +1178,7 @@ impl History {
         }
         let awaited = pictures::awaited(images, scheme, &mut list);
         let paint = Page { list, page: palette.page, content: self.tall, scrolled: self.scrolled() };
-        let mut canvas = Element::canvas(Rc::new(paint))
+        let canvas = Element::canvas(Rc::new(paint))
             .grow(1.0)
             .fg(tokens::FG)
             .role(Role::Document)
@@ -1007,15 +1186,17 @@ impl History {
             .default_focus()
             .on_pointer(|event| match event {
                 Pointer::Scroll { delta } => Some(Message::History(Historying::Scroll(delta))),
-                Pointer::Down { at, .. } => Some(Message::History(Historying::Down(at))),
+                Pointer::Down { at, mods, clicks } => {
+                    Some(Message::History(Historying::Down { at, clicks, extend: mods.shift }))
+                }
+                Pointer::Drag { at } => Some(Message::History(Historying::Drag(at))),
                 Pointer::Up { at } => Some(Message::History(Historying::Up(at))),
                 _ => None,
             })
             .pointed();
-        if self.pointer.is_some_and(|at| self.button(at).is_some()) {
-            canvas = canvas.cursor(Cursor::Pointer);
-        }
-        (canvas, awaited)
+        // The version is text to select, as the page is, but for the buttons over it.
+        let on_button = self.pointer.is_some_and(|at| self.button(at).is_some()) && !self.selecting;
+        (canvas.cursor(if on_button { Cursor::Pointer } else { Cursor::Text }), awaited)
     }
 
     /// Lays out what shows of a version and draws it into `list`, in the page area's coordinates.
@@ -1056,6 +1237,7 @@ impl History {
         // A split stands the page's column in the very middle, and the page area on a whole pixel beside it.
         let middle = ((room.width - width) / 2.0).max(0.0);
         let shift = Point { x: middle.round() - middle, y: -view.y };
+        let passage = self.passage().cloned();
         let ink = |ink: Ink| resolve(ink, scheme, 1.0);
         for piece in &split.pieces {
             let (top, bottom) = (piece.rect.y + shift.y, piece.rect.y + piece.rect.height + shift.y);
@@ -1117,6 +1299,15 @@ impl History {
                     }
                 }
             }
+            // What is selected of this version, under its text as on the page.
+            let selected = passage.as_ref().filter(|(side, _)| *side == piece.side);
+            for line in selected.into_iter().flat_map(|(_, selection)| layout.selection_in(selection, cut)) {
+                list.push(Item::Fill { rect: line, color: palette.selection, radius: 0.0 });
+                let shown = Rect { x: line.x + origin.x, y: line.y + origin.y, ..line };
+                let headed = piece.head > 0.0 && line.y - piece.band.0 < notes::TOOLS_ROOM;
+                let (first, headed) = self.lines.map_or((shown, headed), |(first, _, headed)| (first, headed));
+                self.lines = Some((first, shown, headed));
+            }
             layout.paint(cut, list);
             list.translate(from, origin);
             list.push(Item::PopClip);
@@ -1134,6 +1325,7 @@ impl History {
                 self.hot.extend(button.map(|button| (button, aside)));
             }
         }
+        self.split = Some((split, shift));
     }
 
     /// The picked version as a copy of it is asked for: what the copy's name says it is of is the
@@ -1417,7 +1609,8 @@ impl History {
 impl Leaf {
     /// A version to show: `later`, as it read or as it differs from `earlier`. `heads` say who wrote the
     /// two and when, and `captions` what stands over a stretch that was taken out and over one that was
-    /// added. `last` is the version that showed until now.
+    /// added. `last` is the version that showed until now, and `backup` the faces of the system for a
+    /// layout that is made new.
     fn new(
         between: (Option<Revision>, Revision),
         earlier: Option<&(Document, Style)>,
@@ -1425,6 +1618,7 @@ impl Leaf {
         heads: [Head; 2],
         captions: [String; 2],
         last: Option<Self>,
+        backup: &Fonts,
     ) -> Self {
         let (doc, found) = match earlier {
             Some((earlier, _)) => compare(earlier, &later.0),
@@ -1445,6 +1639,7 @@ impl Leaf {
             }
             None => {
                 let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
+                layout.add_fallback_fonts(backup);
                 // Nothing has a caret here, so a formula is typeset and never shows its source.
                 layout.set_formula_source(false);
                 (layout, None)

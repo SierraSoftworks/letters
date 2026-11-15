@@ -424,7 +424,7 @@ impl<'d> Writer<'d, '_> {
                     None => self.paragraph("Code", None, block.body.runs(), spans),
                 },
                 BlockKind::Quote => self.container(block, "Quote"),
-                BlockKind::Callout { tone } => {
+                BlockKind::Callout { tone, .. } => {
                     let style = CALLOUTS.iter().find(|(known, ..)| known == tone).map_or("Quote", |(_, id, _)| *id);
                     self.container(block, style);
                 }
@@ -481,7 +481,17 @@ impl<'d> Writer<'d, '_> {
     /// takes the container's style, and Word draws neighbours of one style as one box.
     fn container(&mut self, block: &'d Block, style: &'static str) {
         let inner = block.body.blocks();
-        if inner.is_empty() {
+        // A title of the writer's own heads the box in bold. Word has no place for an icon or a colour
+        // beside the tone's style, and a tone's own title is said by that style's name.
+        let titled = match &block.kind {
+            BlockKind::Callout { title: Some(title), .. } if !title.is_empty() => {
+                let run = Run { marks: [Mark::Bold].into(), ..Run::plain(title.as_str()) };
+                self.paragraph(style, None, &[run], Vec::new());
+                true
+            }
+            _ => false,
+        };
+        if inner.is_empty() && !titled {
             self.paragraph(style, None, &[], Vec::new());
         }
         self.blocks(inner, Some(style));

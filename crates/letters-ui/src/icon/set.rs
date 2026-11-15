@@ -21,6 +21,8 @@ pub const CHEVRON_LEFT: Icon = Icon::new("M15 18l-6-6 6-6");
 pub const CHEVRON_RIGHT: Icon = Icon::new("M9 18l6-6-6-6");
 /// `chevron-up`
 pub const CHEVRON_UP: Icon = Icon::new("M18 15l-6-6-6 6");
+/// `clipboard-paste`
+pub const CLIPBOARD_PASTE: Icon = Icon::new("M11 14h10M16 4h2a2 2 0 0 1 2 2v1.344M17 18l4-4-4-4M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 1.793-1.113M9 2h6a1 1 0 0 1 1 1v2a1 1 0 0 1 -1 1h-6a1 1 0 0 1 -1 -1v-2a1 1 0 0 1 1 -1z");
 /// `cloud`
 pub const CLOUD: Icon = Icon::new("M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z");
 /// `cloud-alert`
@@ -105,6 +107,8 @@ pub const MOUSE_POINTER_CLICK: Icon = Icon::new("M14 4.1 12 6M5.1 8l-2.9-.8M6 12
 pub const PALETTE: Icon = Icon::new("M12 22a1 1 0 0 1 0-20 10 9 0 0 1 10 9 5 5 0 0 1-5 5h-2.25a1.75 1.75 0 0 0-1.4 2.8l.3.4a1.75 1.75 0 0 1-1.4 2.8zM13 6.5a0.5 0.5 0 1 0 1 0a0.5 0.5 0 1 0 -1 0M17 10.5a0.5 0.5 0 1 0 1 0a0.5 0.5 0 1 0 -1 0M6 12.5a0.5 0.5 0 1 0 1 0a0.5 0.5 0 1 0 -1 0M8 7.5a0.5 0.5 0 1 0 1 0a0.5 0.5 0 1 0 -1 0");
 /// `pencil`
 pub const PENCIL: Icon = Icon::new("M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497zM15 5l4 4");
+/// `pilcrow`
+pub const PILCROW: Icon = Icon::new("M13 4v16M17 4v16M19 4H9.5a4.5 4.5 0 0 0 0 9H13");
 /// `plus`
 pub const PLUS: Icon = Icon::new("M5 12h14M12 5v14");
 /// `printer`
@@ -119,6 +123,8 @@ pub const ROTATE_CCW: Icon = Icon::new("M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74
 pub const SAVE: Icon = Icon::new(
     "M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7M7 3v4a1 1 0 0 0 1 1h7",
 );
+/// `scissors`
+pub const SCISSORS: Icon = Icon::new("M3 6a3 3 0 1 0 6 0a3 3 0 1 0 -6 0M8.12 8.12 12 12M20 4 8.12 15.88M3 18a3 3 0 1 0 6 0a3 3 0 1 0 -6 0M14.8 14.8 20 20");
 /// `search`
 pub const SEARCH: Icon = Icon::new("M21 21l-4.34-4.34M3 11a8 8 0 1 0 16 0a8 8 0 1 0 -16 0");
 /// `send`

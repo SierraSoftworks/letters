@@ -23,6 +23,7 @@
 //! reference to a figure reads as the figure's label, whatever its own text is. A picture of a gallery has
 //! no text on the page, and a position in it is on the picture.
 
+mod callout;
 mod engine;
 mod flow;
 mod ink;
@@ -43,7 +44,7 @@ use std::sync::Arc;
 
 use letters_model::{BlockId, BlockKind, Body, Change, Document, Markers, Page, Pos, Selection, Style};
 use letters_render::{DisplayList, Font, Item, Point, Rect, Role as Tag};
-use parley::{Alignment, Language};
+use parley::{Alignment, Language, PositionedLayoutItem};
 
 use crate::engine::Engine;
 use crate::flow::{Frame, Leaf, Look, Part, Picture, Role, Table, Types, What, Words};
@@ -51,6 +52,7 @@ use crate::ink::{Brush, Ink, Inks};
 use crate::leaf::{Extent, Laid, Lay, Open, Over, Painter, Source, Swap, Text};
 use crate::reveal::{Reveal, Shapes, Shifts};
 
+pub use crate::callout::icon_path;
 pub use crate::engine::Uncovered;
 pub use crate::paginate::{Heading, PageBlock, PageLink, Pages, Sheet};
 pub use crate::palette::{Callout, Palette, Scheme, Syntax};
@@ -484,6 +486,12 @@ impl DocLayout {
         self.state.borrow_mut().linked(viewport)
     }
 
+    /// The callouts whose tops `viewport` shows, in order, each with the box around its icon and title. One
+    /// that shows neither is left out.
+    pub fn callouts(&self, viewport: Rect) -> Vec<(BlockId, Rect)> {
+        self.state.borrow_mut().callouts(viewport)
+    }
+
     /// The code blocks that `viewport` shows, in order, each with the box drawn behind its text.
     pub fn code_boxes(&self, viewport: Rect) -> Vec<(BlockId, Rect)> {
         self.state.borrow_mut().code_boxes(viewport)
@@ -645,6 +653,11 @@ impl State {
                 Part::Whole | Part::Picture(_) => false,
             };
             if !kept || !matches!(block.body, Body::Text(_)) {
+                return false;
+            }
+            // A text that turns to read from the other side takes what stands beside it along: its marker
+            // and indent, the bar of its quote.
+            if part == Part::Text && flow::rtl(block) != leaf.words.rtl {
                 return false;
             }
             let before = leaf.reword(part, block);
@@ -918,7 +931,10 @@ impl State {
             return Shifts::default();
         }
         // Inside a quote or callout a marker hangs clear of the bar down its side, never across it.
-        let room = leaf.frame.map_or(*margin + leaf.x, |frame| leaf.x - frames[frame].x - theme::BAR - 2.0);
+        let room = leaf.frame.map_or(*margin + leaf.x, |frame| {
+            let bar = if frames[frame].rtl { 0.0 } else { theme::BAR + 2.0 };
+            leaf.x - frames[frame].x - bar
+        });
         reveal.over(id, text.set, room, |text| shapes.get(engine, types, leaf.role, false, text))
     }
 
@@ -1107,11 +1123,13 @@ impl State {
             let frame = &frames[frame];
             let (top, bottom) = frame.span(leaves);
             let rect = Rect::new(frame.x, top, frame.width, bottom - top);
-            let bar = Rect { width: theme::BAR, ..rect };
+            // The bar stands at the side the lines start at.
+            let aside = if frame.rtl { rect.width - theme::BAR } else { 0.0 };
+            let bar = Rect { x: rect.x + aside, width: theme::BAR, ..rect };
             match frame.look {
                 Look::Quote => out.push(Item::Fill { rect: bar, color: palette.line_strong, radius: theme::BAR / 2.0 }),
                 Look::Callout(tone) => {
-                    let Callout { accent, fill } = palette.callout(tone);
+                    let Callout { accent, fill } = frame.head.colors(palette, tone);
                     out.push(Item::Fill { rect, color: fill, radius: theme::BOX_RADIUS });
                     // The accent follows the rounded corners.
                     out.push(Item::PushClip { rect, radius: theme::BOX_RADIUS });
@@ -1161,6 +1179,49 @@ impl State {
             for (id, role) in inside.drain(shared..) {
                 out.push(Item::Open { role, id });
                 around.push(id);
+            }
+            // A callout's icon and title stand above its first leaf, as part of the callout.
+            let mut next = leaf.frame;
+            while let Some(frame) = next {
+                let (engine, types, leaves, shapes) = (&mut self.engine, &self.types, &self.leaves, &mut self.shapes);
+                let frame = &self.frames[frame];
+                next = frame.parent;
+                let Look::Callout(tone) = frame.look else { continue };
+                if frame.first != at {
+                    continue;
+                }
+                let color = frame.head.colors(palette, tone).accent;
+                let (x, width) = (frame.x + theme::BOX_PAD_X, (frame.width - theme::BOX_PAD_X * 2.0).max(0.0));
+                let head = Rect::new(x, frame.span(leaves).0 + theme::BOX_PAD_Y, width, 0.0);
+                let line = if frame.head.line > 0.0 { frame.head.line } else { types.get(leaves[at].role).line };
+                // The leaf's later lines can be all that shows of it, as on the sheet after its first.
+                if head.y >= band.1 || head.y + line <= band.0 {
+                    continue;
+                }
+                let mut x = head.x;
+                if let Some((path, scale, stroke)) = frame.head.icon.and_then(callout::outline) {
+                    let origin = Point { x, y: head.y + ((line - callout::ICON) / 2.0).round() };
+                    out.push(Item::Path { origin, scale, path, color, stroke: Some(stroke) });
+                    x += callout::ICON + callout::ICON_GAP;
+                }
+                if frame.head.title.is_empty() {
+                    continue;
+                }
+                let (shape, _) = shapes.title(engine, types, &frame.head.title);
+                let Some(line) = shapes.layout(shape).and_then(|shape| shape.get(0)) else { continue };
+                // A title longer than the callout is wide is cut at its edge.
+                out.push(Item::PushClip { rect: Rect { height: frame.head.line, ..head }, radius: 0.0 });
+                let mut clusters = line.runs().flat_map(|run| run.visual_clusters()).peekable();
+                for item in line.items() {
+                    let PositionedLayoutItem::GlyphRun(run) = item else { continue };
+                    let mut glyphs = engine.glyphs(&run, Point { x, y: head.y }, color);
+                    // A sheet says what the title spells, as it does of the text under it.
+                    if let (Some(item), true) = (&mut glyphs, print) {
+                        leaf::spell(item, &mut clusters, &frame.head.title);
+                    }
+                    out.items.extend(glyphs);
+                }
+                out.push(Item::PopClip);
             }
             // A row holds its cells.
             let name = print.then_some((at as u64 + 1) << PARTS);
@@ -1431,6 +1492,35 @@ impl State {
                 let image = Rect { x: leaf.x + picture.rect.x, y: leaf.y + picture.rect.y, ..picture.rect };
                 Some((picture.id.clone(), leaf::badge(image)?))
             }));
+        }
+        found
+    }
+
+    fn callouts(&mut self, viewport: Rect) -> Vec<(BlockId, Rect)> {
+        let (first, end) = self.show(viewport.y, viewport.y + viewport.height);
+        let mut found = Vec::new();
+        for at in 0..self.frames.len() {
+            let Self { engine, types, leaves, frames, shapes, .. } = self;
+            let frame = &frames[at];
+            if !(first..end).contains(&frame.first) || !matches!(frame.look, Look::Callout(_)) {
+                continue;
+            }
+            let icon = frame.head.icon.map_or(0.0, |_| callout::ICON);
+            let title = match frame.head.title.as_str() {
+                "" => 0.0,
+                title => shapes.title(engine, types, title).1 + if icon > 0.0 { callout::ICON_GAP } else { 0.0 },
+            };
+            let line = if frame.head.line > 0.0 { frame.head.line } else { types.get(leaves[frame.first].role).line };
+            let room = (frame.width - theme::BOX_PAD_X * 2.0).max(0.0);
+            let rect = Rect::new(
+                frame.x + theme::BOX_PAD_X,
+                frame.span(leaves).0 + theme::BOX_PAD_Y,
+                (icon + title).min(room),
+                line,
+            );
+            if rect.width > 0.0 {
+                found.push((frame.id.clone(), rect));
+            }
         }
         found
     }

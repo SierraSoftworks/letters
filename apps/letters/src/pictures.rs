@@ -75,6 +75,13 @@ pub fn from_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<Picture> {
     Some(Picture { bytes, mime: "image/png".into(), width, height })
 }
 
+/// A picture as the bare pixels a clipboard takes, four bytes each: red, green, blue and alpha.
+pub fn to_rgba(picture: &Picture) -> Option<arboard::ImageData<'static>> {
+    let pixels = image::load_from_memory(&picture.bytes).ok()?.into_rgba8();
+    let (width, height) = (pixels.width() as usize, pixels.height() as usize);
+    Some(arboard::ImageData { width, height, bytes: pixels.into_raw().into() })
+}
+
 /// The pictures among copied files, if every one of them is a picture. Files of other kinds are no
 /// pictures to paste, and neither is a list with one of them in it.
 pub fn from_files(files: &[PathBuf]) -> Vec<Picture> {

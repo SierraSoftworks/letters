@@ -118,7 +118,7 @@ impl Editor {
         }
         let mut id = block.id.clone();
         while let Some(parent) = self.seat(&id).and_then(|place| place.parent) {
-            if let BlockKind::Callout { tone } = parent.kind {
+            if let BlockKind::Callout { tone, .. } = parent.kind {
                 return Some((parent.id.clone(), tag(tone).to_owned()));
             }
             id = parent.id.clone();

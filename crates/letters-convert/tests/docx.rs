@@ -1944,7 +1944,7 @@ fn any_blocks() -> impl Strategy<Value = Vec<Block>> {
         1 => any_text().prop_map(move |code| with(BlockKind::Code { language: None }, vec![Run::plain(code.trim_end_matches('\n'))])),
         1 => Just(Block::new("", BlockKind::Divider)),
         1 => inside.clone().prop_map(move |blocks| holding(BlockKind::Quote, blocks)),
-        1 => (tone, inside).prop_map(move |(tone, blocks)| holding(BlockKind::Callout { tone }, blocks)),
+        1 => (tone, inside).prop_map(move |(tone, blocks)| holding(BlockKind::callout(tone), blocks)),
     ];
     proptest::collection::vec(block, 0..8).prop_map(nested)
 }

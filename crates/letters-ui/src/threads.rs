@@ -9,7 +9,7 @@ use std::iter;
 use std::rc::Rc;
 
 use accesskit::Role;
-use letters_layout::{DocLayout, Fonts, Palette};
+use letters_layout::{DocLayout, Fonts, Palette, Uncovered};
 use letters_model::{
     Block, BlockId, BlockKind, Body, Document, Note, NoteKind, Pos, Run, Selection, Style, TextStyle as Type, Version,
 };
@@ -242,6 +242,8 @@ impl Paint for Spoken {
 pub(crate) struct Said {
     /// Made when the first note is opened.
     layout: Option<DocLayout>,
+    /// The faces of the system that back the fonts up, for a layout made after they came.
+    backup: Fonts,
     /// What was last set: the note, how many replies it had, how wide and in which colours.
     of: Option<(String, usize, f32, Palette)>,
     spoken: Vec<Rc<Spoken>>,
@@ -253,12 +255,29 @@ impl Said {
         self.of = None;
     }
 
+    /// Takes faces of the system that back the fonts up. Returns whether a character that was shown
+    /// without a glyph has one now.
+    pub fn add_fallback_fonts(&mut self, fonts: &Fonts) -> bool {
+        self.backup.faces.extend(fonts.faces.iter().cloned());
+        self.again();
+        self.layout.as_mut().is_some_and(|layout| layout.add_fallback_fonts(fonts))
+    }
+
+    /// The characters that notes showed without a glyph since this was last asked.
+    pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
+        self.layout.as_mut().map(DocLayout::take_uncovered).unwrap_or_default()
+    }
+
     /// What a note says and each reply to it, set `width` wide. They are set again only when they change.
     pub fn of(&mut self, note: &Note, width: f32, palette: Palette) -> &[Rc<Spoken>] {
         let of = (note.id.clone(), note.replies.len(), width, palette);
         if self.of.as_ref() != Some(&of) {
             let fonts = Fonts { faces: letters_fonts::bundled() };
-            let layout = self.layout.get_or_insert_with(|| DocLayout::new(fonts.clone()));
+            let layout = self.layout.get_or_insert_with(|| {
+                let mut layout = DocLayout::new(fonts.clone());
+                layout.add_fallback_fonts(&self.backup);
+                layout
+            });
             // A shell whose fonts come one after another may hold more by now.
             layout.add_fonts(&fonts);
             layout.set_palette(palette);
@@ -399,13 +418,15 @@ fn voice(index: usize, (who, when): (&str, &str), said: &Rc<Spoken>, import: boo
 
 /// A note that is open, to hang under its passage: what was said, by whom and when, with Resolve at its
 /// top right and a reply under it. `said` is what the note and each reply say, as [`Said::of`] set them,
-/// and `refused` why nothing can be added to the notes of this document.
+/// and `refused` why nothing can be added to the notes of this document. `follows` is for a note the caret
+/// opened by coming into its passage.
 pub(crate) fn thread(
     note: &Note,
     reply: &str,
     said: &[Rc<Spoken>],
     now: &str,
     refused: Option<&str>,
+    follows: bool,
 ) -> Popover<Message> {
     let small = TextStyle::control().size(tokens::TEXT_SM);
     let kind = Kind::of(note).unwrap_or(Kind::Comment);
@@ -456,7 +477,9 @@ pub(crate) fn thread(
                     .small()
                     .disabled(reply.trim().is_empty())
                     .on_press(send(Noting::Answer));
-                under.child(Element::from(field).key("reply").grow(1.0).takes_focus()).child(post)
+                // A note the caret opened leaves the keyboard with the page, until its reply is pressed.
+                let field = Element::from(field).key("reply").grow(1.0);
+                under.child(if follows { field } else { field.takes_focus() }).child(post)
             }
         };
         all = all.child(top).child(voices).child(under);
@@ -466,6 +489,10 @@ pub(crate) fn thread(
         .max_width(WIDTH + 2.0 * tokens::SPACE_MD + 2.0)
         .open(true)
         .on_close(send(Noting::Close));
+    // A note the caret opened is beside the page, and stays for as long as the caret is in its passage.
+    if follows {
+        return thread.beside().stays();
+    }
     // A stray press on the page does not cost what was typed: Escape drops it.
     if reply.trim().is_empty() { thread } else { thread.stays() }
 }

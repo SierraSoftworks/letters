@@ -15,8 +15,9 @@ use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::object::{Array, Dict, String as Bytes};
 use hayro::hayro_syntax::page::Page;
 use hayro::kurbo::{Affine, BezPath};
-use letters::trust;
+use letters::{fallback, trust};
 use letters_format::{Archive, OPLOG, Package};
+use letters_layout::Uncovered;
 use letters_model::{
     Anchor, Block, BlockKind, Document, Mark, Model, Note, NoteKind, Notes, Op, Pos, ReplicaId, Run, Style,
 };
@@ -533,6 +534,26 @@ fn export_writes_a_pdf_a_reader_can_search_and_find_its_way_in() {
     let title = pdf.metadata().title.as_deref().map(|title| String::from_utf8_lossy(title).into_owned());
     assert_eq!(title.as_deref(), Some("Rates"));
     assert!(pdf.metadata().creation_date.is_some(), "the PDF says when it was written");
+}
+
+#[test]
+fn a_pdf_sets_what_the_bundled_fonts_lack_in_a_face_of_the_system() {
+    let folder = Folder::new("pdf-fallback");
+    folder.write("Trip.md", "# Trip\n\nBy air to 東京, and back.\n");
+    assert!(folder.letters(&["import", "Trip.md"]).ok);
+    let run = folder.letters(&["export", "Trip.let", "--to", "pdf"]);
+    assert!(run.ok, "{}", run.stderr);
+    let pdf = Pdf::new(fs::read(folder.path("Trip.pdf")).unwrap()).expect("a reader can open the PDF");
+    let text = text_on(&pdf.pages()[0]);
+    assert!(text.contains("Byairto") && text.contains(",andback."), "what the fonts cover is set as ever: {text}");
+
+    // Which faces a machine holds varies. Where it has one for these characters, they are text in the PDF.
+    let lacking = ['東', '京'].map(|ch| Uncovered { ch, emoji: false, lang: None });
+    if fallback::system_fonts(&lacking).faces.is_empty() {
+        eprintln!("no face of this system draws Han, so only the export itself was checked");
+    } else {
+        assert!(text.contains("東京"), "{text}");
+    }
 }
 
 #[test]

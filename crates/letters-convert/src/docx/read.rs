@@ -853,7 +853,7 @@ impl Reader<'_, '_> {
                 }
                 _ => {
                     let kind = match wrapper {
-                        Open::Callout(tone) => BlockKind::Callout { tone },
+                        Open::Callout(tone) => BlockKind::callout(tone),
                         _ => BlockKind::Quote,
                     };
                     let mut outer = Block::new(self.id(), kind);

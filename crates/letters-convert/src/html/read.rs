@@ -546,7 +546,8 @@ impl Reader<'_> {
     fn element(&mut self, element: &Element, outer: &Style, out: &mut Vec<Block>) {
         let name = element.name.as_str();
         // KaTeX writes maths twice: as MathML, which carries its source, and as the boxes it draws.
-        if element.is_hidden() || element.classes().any(|class| matches!(class, "markdown-alert-title" | "katex-html"))
+        if element.is_hidden()
+            || element.classes().any(|class| matches!(class, "markdown-alert-title" | "callout-title" | "katex-html"))
         {
             return;
         }
@@ -611,7 +612,15 @@ impl Reader<'_> {
                 self.kind = outer;
             }
             _ => match element.tone() {
-                Some(tone) => self.container(BlockKind::Callout { tone }, element, &style, out),
+                Some(tone) => {
+                    // What was chosen over the tone is in the attributes `to_html` writes.
+                    let chosen = |name: &str| element.attributes.get(name).cloned();
+                    let color = chosen("data-color").map(|color| color.to_ascii_lowercase());
+                    let kind =
+                        BlockKind::Callout { tone, title: chosen("data-title"), icon: chosen("data-icon"), color };
+                    let kind = if kind.sound() { kind } else { BlockKind::callout(tone) };
+                    self.container(kind, element, &style, out)
+                }
                 None => self.nodes(&element.children, &style, out),
             },
         }

@@ -238,8 +238,8 @@ fn blocks(blocks: &[Block], page: &mut Writing, out: &mut String) {
                 out.push('\n');
             }
             BlockKind::Quote => container("<blockquote>", "</blockquote>", block.body.blocks(), page, out),
-            BlockKind::Callout { tone } => {
-                let open = format!("<div class=\"callout {}\" role=\"note\">", tone_name(*tone));
+            BlockKind::Callout { tone, .. } => {
+                let open = callout(&block.kind, tone_name(*tone));
                 container(&open, "</div>", block.body.blocks(), page, out);
             }
             BlockKind::Divider => out.push_str("<hr>\n"),
@@ -272,6 +272,44 @@ fn blocks(blocks: &[Block], page: &mut Writing, out: &mut String) {
         }
     }
     close(&mut lists, 0, out);
+}
+
+/// The opening of a callout and the line that heads it. What was chosen over its tone is said in `data-`
+/// attributes, which is what a paste reads, and the title line is there to be seen.
+fn callout(kind: &BlockKind, tone: &str) -> String {
+    let BlockKind::Callout { title, icon, color, .. } = kind else { return String::new() };
+    let Some(look) = kind.callout_look() else { return String::new() };
+    let mut open = format!("<div class=\"callout {tone}\" role=\"note\"");
+    for (name, value) in [("data-title", title), ("data-icon", icon), ("data-color", color)] {
+        if let Some(value) = value {
+            let _ = write!(open, " {name}=\"");
+            escape(value, &mut open);
+            open.push('"');
+        }
+    }
+    let mut ink = String::new();
+    if let Some(color) = look.color {
+        // The fill is the colour at the strength a tone's fill has.
+        let _ = write!(open, " style=\"border-color: {color}; background: {color}1f;\"");
+        ink = format!(" style=\"color: {color};\"");
+    }
+    open.push('>');
+    if look.icon.is_none() && look.title.is_empty() {
+        return open;
+    }
+    let alone = if look.title.is_empty() { " alone" } else { "" };
+    let _ = write!(open, "\n<p class=\"callout-title{alone}\"{ink}>");
+    if let Some(path) = look.icon.and_then(letters_layout::icon_path) {
+        let _ = write!(
+            open,
+            "<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" \
+             stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">\
+             <path d=\"{path}\"/></svg>"
+        );
+    }
+    escape(look.title, &mut open);
+    open.push_str("</p>");
+    open
 }
 
 fn tone_name(tone: Tone) -> &'static str {
@@ -800,6 +838,7 @@ fn colours(style: &Style, on: &Palette, css: &mut String) {
     for (tone, look) in [(Tone::Tip, on.tip), (Tone::Info, on.info), (Tone::Warn, on.warn), (Tone::Danger, on.danger)] {
         let (name, accent, fill) = (tone_name(tone), color(look.accent), color(look.fill));
         let _ = writeln!(css, ".callout.{name} {{ border-color: {accent}; background: {fill}; }}");
+        let _ = writeln!(css, ".callout.{name} > .callout-title {{ color: {accent}; }}");
     }
     for kind in TokenKind::ALL {
         let _ = writeln!(css, ".tok-{} {{ color: {}; }}", kind.as_str(), color(on.syntax.color(ink(kind))));
@@ -923,7 +962,11 @@ fn css(style: &Style, with: &HtmlPage, css: &mut String) {
          :is(ul, ol) + :is(ul, ol) {{ margin-top: {beside}; }}\n\
          blockquote {{ margin: {after} 0; padding: 0 0 0 16px; border-left: 3px solid; }}\n\
          .callout {{ margin: {callout_gap} 0; padding: 12px 16px 12px 13px; border-left: 3px solid; \
-         border-radius: 6px; }}\n",
+         border-radius: 6px; }}\n\
+         .callout > .callout-title {{ display: flex; align-items: center; gap: 8px; margin: 0 0 4px; \
+         font-weight: 600; }}\n\
+         .callout > .callout-title.alone {{ float: left; margin: 0 8px 0 0; }}\n\
+         .callout > .callout-title > svg {{ flex: none; }}\n",
         mono = quoted(&code.family),
         before = px(body.space_before * PIXELS),
         after = px(unit),
@@ -948,7 +991,8 @@ fn css(style: &Style, with: &HtmlPage, css: &mut String) {
          .gallery > .row > * {{ flex: 1; min-width: 0; margin: 0; }}\n\
          a.ref {{ text-decoration: none; }}\n\
          .math.display > svg {{ display: block; margin: 0 auto; max-width: 100%; height: auto; }}\n\
-         article > :first-child, blockquote > :first-child, .callout > :first-child {{ margin-top: 0; }}\n\
+         article > :first-child, blockquote > :first-child, .callout > :first-child, \
+         .callout > .callout-title + * {{ margin-top: 0; }}\n\
          article > :last-child, blockquote > :last-child, .callout > :last-child {{ margin-bottom: 0; }}\n\
          hr {{ margin: {rule_gap} 0; border: 0; border-top: 1px solid; }}\n\
          mark {{ color: inherit; }}\n\

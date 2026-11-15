@@ -14,13 +14,14 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf};
+use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with};
 use letters_format::{Archive, OPLOG};
 use letters_layout::Fonts;
 use letters_model::{Block, BlockKind, Body, Document, Mark, Model, ReplicaId, Run, Style};
 use serde_json::json;
 
 use crate::cli::{Export, Format, Import, Output};
+use crate::fallback;
 use crate::files;
 use crate::import::{Choices, Plan, normal};
 use crate::trust::{self, Trusted};
@@ -102,7 +103,10 @@ pub fn exported(file: Vec<u8>, title: &str, to: Format) -> Result<Exported, Stri
             let model = history.and_then(|history| Model::load(&history, ReplicaId::new("export")).ok());
             let authors = model.map(|model| model.authors().into_iter().collect()).unwrap_or_default();
             let info = PdfInfo { title: title.to_owned(), authors, created };
-            to_pdf(&document, &style, fonts, &mut |name| archive.read(name).ok().flatten(), &info)
+            // What the bundled fonts cannot draw is set in the system's faces, as the window sets it. The
+            // system's fonts are read only when a page has such a character.
+            let mut assets = |name: &str| archive.read(name).ok().flatten();
+            to_pdf_with(&document, &style, fonts, &mut assets, &info, &mut |lacking| fallback::system_fonts(lacking))
                 .map_err(|error| error.to_string())?
         }
     };

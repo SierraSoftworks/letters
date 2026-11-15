@@ -158,7 +158,7 @@ fn document() -> (Document, usize) {
                 blocks.push(Block::text(id(), BlockKind::Code { language: None }, lines.join("\n")));
             }
             2 => {
-                let kind = if dice.roll(2) == 0 { BlockKind::Quote } else { BlockKind::Callout { tone: Tone::Info } };
+                let kind = if dice.roll(2) == 0 { BlockKind::Quote } else { BlockKind::callout(Tone::Info) };
                 let inside = Block::text(id(), BlockKind::Paragraph, dice.words(200, 300));
                 blocks.push(Block { body: Body::Blocks(vec![inside]), ..Block::new(id(), kind) });
             }

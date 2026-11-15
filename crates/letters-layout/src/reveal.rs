@@ -271,25 +271,46 @@ pub(crate) struct Shapes(Vec<Shape>);
 
 struct Shape {
     role: Role,
-    small: bool,
+    cut: Cut,
     text: String,
     layout: Layout<Brush>,
+}
+
+/// How a shape is set in its role's type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    Marker,
+    /// Small, for a tag that sits in a corner.
+    Tag,
+    /// Heavy, for a callout's title.
+    Title,
 }
 
 impl Shapes {
     /// The shape of a marker set in a role's type, and its width. `small` is for a tag that sits in a corner.
     pub fn get(&mut self, engine: &mut Engine, types: &Types, role: Role, small: bool, text: &str) -> (usize, f32) {
-        let known = |shape: &Shape| (shape.role, shape.small, shape.text.as_str()) == (role, small, text);
+        self.cut(engine, types, role, if small { Cut::Tag } else { Cut::Marker }, text)
+    }
+
+    /// The shape of a callout's title, on one line.
+    pub fn title(&mut self, engine: &mut Engine, types: &Types, text: &str) -> (usize, f32) {
+        self.cut(engine, types, Role::Body, Cut::Title, text)
+    }
+
+    fn cut(&mut self, engine: &mut Engine, types: &Types, role: Role, cut: Cut, text: &str) -> (usize, f32) {
+        let known = |shape: &Shape| (shape.role, shape.cut, shape.text.as_str()) == (role, cut, text);
         let at = self.0.iter().position(known).unwrap_or_else(|| {
             let mut spec = types.get(role).spec(role == Role::Code, Brush { ink: Ink::Marker, back: None });
             spec.italic = false;
-            if small {
-                spec.size = (spec.size * theme::TAG_SCALE).round();
+            match cut {
+                Cut::Marker => {}
+                Cut::Tag => spec.size = (spec.size * theme::TAG_SCALE).round(),
+                Cut::Title => spec.weight = spec.weight.max(theme::TITLE_WEIGHT),
             }
             let mut layout = Layout::new();
             engine.build(text, &[spec], &[(0, 0..text.len())], None, &mut layout);
             layout.break_all_lines(None);
-            self.0.push(Shape { role, small, text: text.to_owned(), layout });
+            self.0.push(Shape { role, cut, text: text.to_owned(), layout });
             self.0.len() - 1
         });
         (at, self.0[at].layout.full_width())

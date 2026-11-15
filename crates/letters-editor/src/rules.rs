@@ -206,7 +206,11 @@ impl Editor {
             // The tag belongs at the top of a quote, and retyping it in a callout changes the tone.
             Some(BlockRule::Callout(tone)) if place.index == 0 && place.parent.is_some_and(quoted) => {
                 let parent = place.parent_id().expect("the block has a parent");
-                self.apply(vec![clear, Op::SetKind { block: parent, kind: BlockKind::Callout { tone } }]);
+                let kind = self
+                    .doc()
+                    .block(&parent)
+                    .map_or(BlockKind::callout(tone), |held| crate::callout::toned(&held.kind, tone));
+                self.apply(vec![clear, Op::SetKind { block: parent, kind }]);
             }
             _ => return self.apply_inline_rule(&id, typed, &caret.marks, platform),
         }

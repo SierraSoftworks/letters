@@ -5,7 +5,8 @@
 //! - [`files`] opens and saves `.let` files, and [`library`] decides where they live.
 //! - [`journal`] keeps unsaved work through a crash.
 //! - [`words`] keeps the person's own dictionary, [`trust`] what they trust, and [`settings`] what they set.
-//! - [`dictionaries`] finds the system's dictionaries for languages other than English.
+//! - [`dictionaries`] finds the system's dictionaries for languages other than English, and [`fallback`]
+//!   its fonts for what the bundled ones cannot draw.
 //! - [`measure`] checks the performance budgets, and [`baseline`] is the empty window it compares with.
 //! - [`convert`] runs the `export` and `import` subcommands, which need no window, and [`copies`] writes the
 //!   copies and exports a window asks for.
@@ -18,6 +19,7 @@ pub mod cli;
 pub mod convert;
 pub mod copies;
 pub mod dictionaries;
+pub mod fallback;
 pub mod files;
 pub mod gpu;
 pub mod import;

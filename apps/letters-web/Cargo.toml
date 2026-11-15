@@ -18,6 +18,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 letters-model.workspace = true
 letters-render.workspace = true
+# Reads which characters a fetched face has. The renderer links it already.
+skrifa.workspace = true
 letters-editor.workspace = true
 letters-ui.workspace = true
 letters-fonts.workspace = true

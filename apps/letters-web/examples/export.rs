@@ -5,14 +5,17 @@
 //! document's own file format: more than two megabytes that the editor's first frame would otherwise wait
 //! for, and that most visits never use.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 
 use js_sys::{Array, Date, Map, Uint8Array};
-use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf};
+use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with};
 use letters_format::{ASSETS, Archive, Error, MIMETYPE, OPLOG, Package};
-use letters_layout::Fonts;
+use letters_layout::{Fonts, Uncovered};
 use letters_model::{Document, Notes, Style};
+use letters_render::Font;
+
 use wasm_bindgen::prelude::*;
 use zip::result::ZipResult;
 use zip::write::SimpleFileOptions;
@@ -30,6 +33,23 @@ pub fn fonts(fonts: &Array, maths: &Array) {
     letters_math::provide_fonts(files(maths));
 }
 
+// The editor's own module, taken by its file: naming the editor's crate here would link the editor in.
+#[path = "../src/faces.rs"]
+mod faces;
+use faces::{Face, chosen, has, lacking as wanted};
+
+thread_local! {
+    /// The faces that back up the fonts, as far as the page has fetched them.
+    static BACKUPS: RefCell<Vec<(Face, Font)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Takes a face that backs up the fonts, which the page fetched, by the name of its file.
+#[wasm_bindgen]
+pub fn backup(name: &str, file: Vec<u8>) {
+    let face = Face::ALL.into_iter().find(|face| face.file() == name);
+    BACKUPS.with_borrow_mut(|backups| backups.extend(face.map(|face| (face, Font::new(file.into(), 0)))));
+}
+
 /// Writes a document in another format, from its `document.json`, `style.json` and `notes.json`. `format`
 /// is what such a file's name ends in: `pdf`, `docx`, `html` or `md`. `assets` holds the pictures the
 /// document shows, by their names in it. `created` is in seconds since 1970 began.
@@ -39,7 +59,8 @@ pub fn fonts(fonts: &Array, maths: &Array) {
 /// identity of its own, so that the two never pass for one document written in two places.
 ///
 /// Returns the file's name, its media type and its bytes. The name is `title` as a file can be called,
-/// and `undefined` when nothing of the title can name a file.
+/// and `undefined` when nothing of the title can name a file. A PDF also tells the files of the faces it
+/// would have set characters in that are shown as boxes, had [`backup`] handed them over.
 #[wasm_bindgen]
 #[allow(clippy::too_many_arguments, reason = "the arguments cross from the page one by one")]
 pub fn exported(
@@ -58,11 +79,23 @@ pub fn exported(
     let mut asset =
         |name: &str| Some(Uint8Array::new(&assets.get(&name.into())).to_vec()).filter(|file| !file.is_empty());
     let name = letters_format::file_name(title);
+    let lacking = Array::new();
     let (file, ending, kind) = match format {
         "pdf" => {
             let info = PdfInfo { title: title.to_owned(), authors, created: created.map(|seconds| seconds as u64) };
             let fonts = Fonts { faces: letters_fonts::bundled() };
-            (to_pdf(&document, &style, fonts, &mut asset, &info)?, "pdf", "application/pdf")
+            let mut backups = |uncovered: &[Uncovered]| {
+                let (had, faces): (Vec<Face>, Vec<Font>) =
+                    BACKUPS.with_borrow(|backups| backups.iter().cloned().unzip());
+                let told = uncovered.iter().map(|one| (one.ch, one.emoji, one.lang.as_deref()));
+                let lacks = |face: Face, ch: char| {
+                    had.iter().zip(&faces).any(|(had, font)| *had == face && !has(&font.data, ch))
+                };
+                // A face the page has not handed over may have what these lack.
+                wanted(&chosen(told, &had, lacks), &had).iter().for_each(|face| _ = lacking.push(&face.file().into()));
+                Fonts { faces }
+            };
+            (to_pdf_with(&document, &style, fonts, &mut asset, &info, &mut backups)?, "pdf", "application/pdf")
         }
         "docx" => (
             to_docx(&document, &style, &Notes::from_json(notes)?, title, &mut asset),
@@ -106,7 +139,7 @@ pub fn exported(
         _ => return Err(JsError::new("there is no such format")),
     };
     let name = name.map(|name| format!("{name}.{ending}"));
-    Ok(Array::of3(&name.into(), &kind.into(), &Uint8Array::from(&file[..])))
+    Ok(Array::of4(&name.into(), &kind.into(), &Uint8Array::from(&file[..]), &lacking))
 }
 
 /// Files in one archive, each under its name and dated now.
