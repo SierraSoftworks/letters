@@ -389,10 +389,26 @@ fn put<S: BuildHasher>(body: &LoroText, at: usize, text: &str, attrs: Option<&At
 }
 
 /// Makes in the history a change the document already shows. `None` when Loro refused a part of it.
+///
+/// Text that takes the place of text is put in behind the first character it replaces, which then goes
+/// with the rest. Put in before that character, it would share its place with whatever another writer
+/// typed there meanwhile, and the two would merge in an order that only their replica ids decide: a word
+/// typed before a word that was replaced could come to stand behind the new one, or inside it.
 pub(crate) fn write(loro: &LoroDoc, body: &LoroText, delta: &[TextDelta]) -> Option<()> {
+    apply(loro, body, delta, true)
+}
+
+/// As [`write`], with all text put in exactly where the change says, for a change whose places were
+/// worked out one by one.
+pub(crate) fn write_as_told(loro: &LoroDoc, body: &LoroText, delta: &[TextDelta]) -> Option<()> {
+    apply(loro, body, delta, false)
+}
+
+fn apply(loro: &LoroDoc, body: &LoroText, delta: &[TextDelta], replacing: bool) -> Option<()> {
     let markers = Markers::of(loro);
     let mut at = 0;
-    for item in delta {
+    let mut delta = delta.iter().peekable();
+    while let Some(item) = delta.next() {
         match item {
             TextDelta::Retain { retain, attributes } => {
                 match attributes.as_ref().filter(|attrs| !attrs.is_empty()) {
@@ -430,7 +446,24 @@ pub(crate) fn write(loro: &LoroDoc, body: &LoroText, delta: &[TextDelta]) -> Opt
                     Markers::forget(&markers.blocks, &key)?;
                     Markers::forget(&markers.depths, &key)?;
                 }
-                body.delete(at, *delete).ok()?;
+                let mut put_in = 0;
+                while replacing
+                    && let Some(TextDelta::Insert { insert: text, attributes }) = delta.peek()
+                    && !attributes.as_ref().is_some_and(|attrs| attrs.contains_key(BLOCK))
+                {
+                    put(body, at + 1 + put_in, text, attributes.as_ref())?;
+                    put_in += text.chars().count();
+                    delta.next();
+                }
+                if put_in == 0 {
+                    body.delete(at, *delete).ok()?;
+                } else {
+                    body.delete(at, 1).ok()?;
+                    at += put_in;
+                    if *delete > 1 {
+                        body.delete(at, delete - 1).ok()?;
+                    }
+                }
             }
         }
     }

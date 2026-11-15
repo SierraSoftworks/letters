@@ -30,6 +30,25 @@ fn concurrent_edits_all_survive_a_merge() {
             vec![Op::DeleteText { block: id("p"), range: 3..8 }],
             vec!["Hel", "rld", ""],
         ),
+        // Text that replaces a word stands where the word stood, behind what was typed before it.
+        (
+            "typing before a word that is replaced",
+            vec![typed("p", 6, "big ")],
+            vec![Op::DeleteText { block: id("p"), range: 6..11 }, typed("p", 6, "moon")],
+            vec!["Hello big moon", ""],
+        ),
+        (
+            "replacing a word that is typed before",
+            vec![Op::DeleteText { block: id("p"), range: 6..11 }, typed("p", 6, "moon")],
+            vec![typed("p", 6, "big ")],
+            vec!["Hello big moon", ""],
+        ),
+        (
+            "typing after a word that is replaced",
+            vec![typed("p", 11, ", again")],
+            vec![Op::DeleteText { block: id("p"), range: 6..11 }, typed("p", 6, "moon")],
+            vec!["Hello moon, again", ""],
+        ),
         (
             "typing into a removed block",
             vec![Op::RemoveBlock { block: id("p") }],

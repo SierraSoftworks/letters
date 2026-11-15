@@ -866,7 +866,7 @@ pub(crate) fn settle(loro: &LoroDoc, body: &LoroText, sides: [&Frontiers; 2], cl
         return false;
     }
     // A part Loro refused leaves the rest written, here as on every device.
-    let _ = crdt::write(loro, body, &delta);
+    let _ = crdt::write_as_told(loro, body, &delta);
     clashes.iter().for_each(|clash| crdt::settled(loro, &clash.conflict.block));
     loro.commit();
     true

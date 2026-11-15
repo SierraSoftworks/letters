@@ -405,7 +405,8 @@ fn beside() -> impl Strategy<Value = Touch> {
 }
 
 /// The edit to the sentence in the paragraph `s` that a touch of its `word` is. With it, where the edit
-/// starts in the sentence, and where it types.
+/// starts in the sentence, and where it types text that shares its place with whatever else is typed
+/// there. Text that replaces text stands behind anything typed at its start, so it shares no place.
 fn touched(word: usize, touch: &Touch) -> (Vec<Op>, usize, Option<usize>) {
     let start: usize = SENTENCE.split(' ').take(word).map(|word| word.len() + 1).sum();
     let word = SENTENCE.split(' ').nth(word).unwrap_or_default();
@@ -421,7 +422,7 @@ fn touched(word: usize, touch: &Touch) -> (Vec<Op>, usize, Option<usize>) {
         Touch::Cut { at, len } => (vec![cut(*at, *len).0], cut(*at, *len).1, None),
         Touch::Swap { at, len, text } => {
             let (cut, from) = cut(*at, *len);
-            (vec![cut, typed(from, text)], from, Some(from))
+            (vec![cut, typed(from, text)], from, None)
         }
         Touch::Beside { end, text } => {
             let at = if *end { start + word.len() } else { start };

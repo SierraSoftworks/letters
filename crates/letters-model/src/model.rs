@@ -738,7 +738,15 @@ impl Model {
 
     /// Sends changes the document already shows to the history, as one change there.
     fn write(&mut self, edits: &[Delta], change: &mut Change) -> bool {
-        let written = edits.iter().all(|delta| crdt::write(self.loro(), self.body(), delta).is_some());
+        let (mut written, mut edits) = (true, edits.iter().peekable());
+        while let Some(delta) = edits.next().filter(|_| written) {
+            // Text put in where text was just taken out replaces it, and is written as that.
+            let both = edits.peek().and_then(|put| replacement(delta, put));
+            if both.is_some() {
+                edits.next();
+            }
+            written = crdt::write(self.loro(), self.body(), both.as_ref().unwrap_or(delta)).is_some();
+        }
         self.commit();
         if written {
             // The history reports the edit back, and the document already shows it.
@@ -1583,6 +1591,18 @@ fn set(op: &Op, fields: &mut Document, style: &mut Style) -> Result<(), OpError>
 /// The document's own fields that a [`Change`] speaks of.
 fn fields(doc: &Document) -> (&String, &BTreeSet<String>, &Option<Properties>) {
     (&doc.language, &doc.dictionary, &doc.properties)
+}
+
+/// The one change that two make together, when the first takes text out and the second puts text in at
+/// the same place.
+fn replacement(cut: &[TextDelta], put: &[TextDelta]) -> Option<Delta> {
+    let (TextDelta::Delete { .. }, lead) = cut.split_last()? else { return None };
+    let text = put.strip_prefix(lead).filter(|text| !text.is_empty() && lead.iter().all(is_skip))?;
+    let plain = |item: &TextDelta| match item {
+        TextDelta::Insert { attributes, .. } => attributes.as_ref().is_none_or(|attrs| !attrs.contains_key(BLOCK)),
+        _ => false,
+    };
+    text.iter().all(plain).then(|| cut.iter().chain(text).cloned().collect())
 }
 
 fn unreadable(error: impl fmt::Display) -> HistoryError {

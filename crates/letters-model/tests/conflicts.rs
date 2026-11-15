@@ -363,27 +363,34 @@ fn a_settled_block_reads_as_the_writer_who_edited_last_left_it() {
     }
 }
 
-/// A name, what each writer does to one block unseen by the other, and what each typed.
-type Beside = (&'static str, (&'static str, Edit), (&'static str, Edit), [&'static str; 2]);
+/// A name, what each writer does to one block unseen by the other, and what the block then reads in part.
+type Beside = (&'static str, (&'static str, Edit), (&'static str, Edit), &'static [&'static str]);
 
 #[test]
 fn text_beside_a_word_another_writer_changed_stays_on_the_page() {
     use Edit::*;
     let cases: Vec<Beside> = vec![
-        ("before the word", ("p1", Before("quick", "very ")), ("p1", Swap("quick", "fast")), ["very ", "fast"]),
-        ("after the word", ("p1", Swap("quick", "fast")), ("p1", After("quick", ", sly")), ["fast", ", sly"]),
-        ("either side of one word", ("h", Before("Boats", "Oh. ")), ("h", Add("!")), ["Oh. ", "!"]),
-        ("at the start of a block", ("p2", Before("It", "So. ")), ("p2", Swap("It", "This")), ["So. ", "This"]),
-        ("at the end of a block", ("h", Swap("Boats", "Ships")), ("h", Add("!")), ["Ships", "!"]),
-        ("at one place", ("p1", Add(" It ran.")), ("p1", Add(" It hid.")), [" It ran.", " It hid."]),
+        ("before the word", ("p1", Before("quick", "very ")), ("p1", Swap("quick", "fast")), &["The very fast brown"]),
+        (
+            "the word, and before it",
+            ("p1", Swap("quick", "fast")),
+            ("p1", Before("quick", "very ")),
+            &["The very fast brown"],
+        ),
+        ("after the word", ("p1", Swap("quick", "fast")), ("p1", After("quick", ", sly")), &["The fast, sly brown"]),
+        ("either side of one word", ("h", Before("Boats", "Oh. ")), ("h", Add("!")), &["Oh. Boats!"]),
+        ("at the start of a block", ("p2", Before("It", "So. ")), ("p2", Swap("It", "This")), &["So. This was"]),
+        ("at the end of a block", ("h", Swap("Boats", "Ships")), ("h", Add("!")), &["Ships!"]),
+        // Two sentences put in at one place stand there in either order.
+        ("at one place", ("p1", Add(" It ran.")), ("p1", Add(" It hid.")), &[" It ran.", " It hid."]),
     ];
-    for (name, hers, his, typed) in cases {
+    for (name, hers, his, reads) in cases {
         let block = hers.0;
         let (mut ana, mut ben) = writers();
         let found = settle(&mut ana, &mut ben, vec![hers], vec![his]);
         assert_eq!(found, [vec![], vec![]], "{name}: neither changed the other's words");
         let text = text(&ana, block).unwrap_or_default();
-        assert!(typed.iter().all(|typed| text.contains(typed)), "{name}: {text:?} lacks what one of them typed");
+        assert!(reads.iter().all(|part| text.contains(part)), "{name}: {text:?} does not read {reads:?}");
         assert_eq!(ana.doc(), ben.doc(), "{name}");
     }
 }
