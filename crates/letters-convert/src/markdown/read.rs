@@ -1,6 +1,7 @@
 //! Markdown to document.
 
 use std::collections::BTreeSet;
+use std::mem;
 use std::ops::Range;
 
 use letters_model::{Block, BlockKind, Body, Document, ListKind, Mark, Run, Tone};
@@ -12,7 +13,7 @@ use crate::ImportNote;
 /// Quotes and lists nested deeper than this are kept as source, which bounds the reader's recursion.
 const MAX_DEPTH: usize = 32;
 
-const MATHS: &str = "Maths kept as TeX source";
+const MOVED: &str = "Moved out of a list item";
 const FOOTNOTE: &str = "Footnote kept as text";
 
 /// Reads CommonMark and GFM. `new_id` supplies an id for each block.
@@ -93,6 +94,14 @@ impl<'a> Reader<'a, '_> {
         block
     }
 
+    fn formula(&mut self, tex: &str) -> Block {
+        let mut block = self.block(BlockKind::Formula);
+        if !tex.is_empty() {
+            block.body = Body::Text(vec![Run::plain(tex)]);
+        }
+        block
+    }
+
     /// Keeps source the document cannot hold as a code block, with a note that says so.
     fn placeholder(&mut self, language: &str, text: &str, message: &str, out: &mut Vec<Block>) {
         let block = self.code(Some(language), text);
@@ -127,18 +136,14 @@ impl<'a> Reader<'a, '_> {
     fn read(&mut self, tag: Tag<'a>, range: Range<usize>, list_depth: u8, out: &mut Vec<Block>) {
         match tag {
             Tag::Paragraph => {
-                if let (Some(Event::DisplayMath(tex)), Some(Event::End(_))) = (self.peek(0), self.peek(1)) {
-                    let tex = unix_lines(tex.trim());
-                    self.at += 2;
-                    return self.placeholder("math", &tex, MATHS, out);
-                }
                 let mut block = self.block(BlockKind::Paragraph);
-                let runs = self.inline(&block);
+                let (runs, formulas) = self.flow(&block);
                 self.at += 1;
                 if !runs.is_empty() {
                     block.body = Body::Text(runs);
                     out.push(block);
                 }
+                out.extend(formulas);
             }
             Tag::Heading { level, .. } => {
                 let level = level as u8;
@@ -146,7 +151,7 @@ impl<'a> Reader<'a, '_> {
                 if level > 4 {
                     self.note(&block, format!("Heading level {level} became level 4"));
                 }
-                block.body = Body::Text(self.inline(&block));
+                block.body = Body::Text(self.line(&block));
                 self.at += 1;
                 out.push(block);
             }
@@ -184,8 +189,12 @@ impl<'a> Reader<'a, '_> {
                 };
                 let (language, options) = info.trim().split_once(char::is_whitespace).unwrap_or((info.trim(), ""));
                 let text = self.raw();
-                let block =
-                    self.code(Some(language).filter(|name| !name.is_empty()), text.strip_suffix('\n').unwrap_or(&text));
+                let text = text.strip_suffix('\n').unwrap_or(&text);
+                // GitHub shows a code block in this language as maths.
+                if language == "math" && options.is_empty() {
+                    return out.push(self.formula(text));
+                }
+                let block = self.code(Some(language).filter(|name| !name.is_empty()), text);
                 if !options.is_empty() {
                     self.note(&block, format!("Code block options dropped: {}", options.trim()));
                 }
@@ -283,15 +292,15 @@ impl<'a> Reader<'a, '_> {
             }
 
             self.task = None;
-            let mut runs = self.inline(&block);
+            let (mut runs, mut after) = self.flow(&block);
             let mut task = self.task.take();
-            let mut after = Vec::new();
+            after.iter().for_each(|moved| self.note(moved, MOVED));
             while let Some((event, range)) = self.next() {
                 match event {
                     Event::End(_) => break,
                     // The paragraphs an item opens with are its text. Anything else follows the item.
                     Event::Start(Tag::Paragraph) if after.is_empty() => {
-                        let more = self.inline(&block);
+                        let (more, formulas) = self.flow(&block);
                         self.at += 1;
                         task = task.or(self.task.take());
                         if !runs.is_empty() && !more.is_empty() {
@@ -299,18 +308,20 @@ impl<'a> Reader<'a, '_> {
                             self.note(&block, "Paragraphs of this list item were joined");
                         }
                         runs.extend(more);
+                        formulas.iter().for_each(|moved| self.note(moved, MOVED));
+                        after.extend(formulas);
                     }
                     Event::Start(tag) => {
                         let nested = matches!(tag, Tag::List(_));
                         let from = after.len();
                         self.read(tag, range, depth.saturating_add(1), &mut after);
                         for moved in after[from..].iter().filter(|_| !nested) {
-                            self.note(moved, "Moved out of a list item");
+                            self.note(moved, MOVED);
                         }
                     }
                     Event::Rule => {
                         let rule = self.block(BlockKind::Divider);
-                        self.note(&rule, "Moved out of a list item");
+                        self.note(&rule, MOVED);
                         after.push(rule);
                     }
                     _ => {}
@@ -336,7 +347,7 @@ impl<'a> Reader<'a, '_> {
             match event {
                 Event::Start(Tag::TableHead | Tag::TableRow) => rows.push(Vec::new()),
                 Event::Start(Tag::TableCell) => {
-                    let cell = write::cell(&self.inline(block));
+                    let cell = write::cell(&self.line(block));
                     self.at += 1;
                     rows.last_mut().expect("a cell sits in a row").push(cell);
                 }
@@ -353,9 +364,42 @@ impl<'a> Reader<'a, '_> {
         table(rows, alignments.iter().map(|alignment| rule(alignment).to_owned()).collect())
     }
 
-    /// Reads inline content up to the next block boundary, which is left for the caller.
-    fn inline(&mut self, block: &Block) -> Vec<Run> {
+    /// Reads text up to the next block boundary, which is left for the caller. Display maths in it is a formula
+    /// of its own: the text before the first is returned for `block`, then each formula and the text after it
+    /// as the blocks that follow.
+    fn flow(&mut self, block: &Block) -> (Vec<Run>, Vec<Block>) {
         let mut text = Text::default();
+        self.inline(block, &mut text, true);
+        let mut first = mem::take(&mut text.runs);
+        let mut rest = Vec::new();
+        while let Some(Event::DisplayMath(tex)) = self.peek(0).cloned() {
+            self.at += 1;
+            rest.push(self.formula(&unix_lines(tex.trim())));
+            let mut after = self.block(BlockKind::Paragraph);
+            self.inline(&after, &mut text, true);
+            let mut runs = mem::take(&mut text.runs);
+            trim(&mut runs);
+            if !runs.is_empty() {
+                after.body = Body::Text(runs);
+                rest.push(after);
+            }
+        }
+        if !rest.is_empty() {
+            trim(&mut first);
+        }
+        (first, rest)
+    }
+
+    /// Reads the text of a block that is one line, where display maths can only sit in the line.
+    fn line(&mut self, block: &Block) -> Vec<Run> {
+        let mut text = Text::default();
+        self.inline(block, &mut text, false);
+        text.runs
+    }
+
+    /// Reads inline content into `text`, up to the next block boundary, which is left for the caller. With
+    /// `formulas`, display maths is such a boundary.
+    fn inline(&mut self, block: &Block, text: &mut Text, formulas: bool) {
         while let Some(event) = self.peek(0).cloned() {
             match event {
                 Event::Text(part) => text.push(&part, None),
@@ -369,12 +413,24 @@ impl<'a> Reader<'a, '_> {
                     }
                 }
                 Event::InlineMath(tex) => {
-                    text.push(&format!("${}$", unix_lines(&tex)), Some(Mark::Code));
-                    self.note(block, MATHS);
+                    // A price is not maths. As Pandoc reads them, the dollar that ends maths has no digit after it.
+                    let end = self.events[self.at].1.end;
+                    if self.source.as_bytes().get(end).is_some_and(u8::is_ascii_digit) {
+                        text.push(&format!("${}$", one_line(&tex)), None);
+                    } else {
+                        text.push(&one_line(&tex), Some(Mark::Math));
+                    }
                 }
+                Event::DisplayMath(_) if formulas => break,
                 Event::DisplayMath(tex) => {
-                    text.push(&format!("$${}$$", unix_lines(tex.trim())), Some(Mark::Code));
-                    self.note(block, MATHS);
+                    // Not all that two dollar signs hold can sit between single ones, and so be written back.
+                    let tex = one_line(tex.trim());
+                    let inline = format!("${tex}$");
+                    let mut events = Parser::new_ext(&inline, Options::ENABLE_MATH).skip(1);
+                    let fits = matches!(events.next(), Some(Event::InlineMath(read)) if *read == *tex)
+                        && matches!(events.next(), Some(Event::End(_)));
+                    text.push(&tex, Some(if fits { Mark::Math } else { Mark::Code }));
+                    self.note(block, "Display maths set in its line");
                 }
                 Event::FootnoteReference(label) => {
                     text.push(&format!("[^{label}]"), None);
@@ -409,7 +465,6 @@ impl<'a> Reader<'a, '_> {
             }
             self.at += 1;
         }
-        text.runs
     }
 }
 
@@ -466,6 +521,11 @@ fn unix_lines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+/// Maths that sits in a line of text, where a line break in its source is only a space.
+fn one_line(tex: &str) -> String {
+    unix_lines(tex).replace('\n', " ")
+}
+
 /// A link's address. A wiki link can wrap, and an address cannot hold the line break.
 fn address(url: &str) -> String {
     url.replace(['\n', '\r'], " ")
@@ -490,6 +550,20 @@ pub(crate) fn nest(blocks: &mut [Block]) {
 pub(crate) fn table(mut rows: Vec<Vec<String>>, rules: Vec<String>) -> String {
     rows.insert(rows.len().min(1), rules);
     rows.iter().map(|row| format!("| {} |", row.join(" | "))).collect::<Vec<_>>().join("\n")
+}
+
+/// Drops the spaces and line breaks at the edges of a block's text.
+pub(crate) fn trim(runs: &mut Vec<Run>) {
+    const EDGE: [char; 3] = [' ', '\t', '\n'];
+    let blank = |run: &Run| run.text.trim_matches(EDGE).is_empty();
+    runs.truncate(runs.len() - runs.iter().rev().take_while(|run| blank(run)).count());
+    runs.drain(..runs.iter().take_while(|run| blank(run)).count());
+    if let Some(last) = runs.last_mut() {
+        last.text.truncate(last.text.trim_end_matches(EDGE).len());
+    }
+    if let Some(first) = runs.first_mut() {
+        first.text.drain(..first.text.len() - first.text.trim_start_matches(EDGE).len());
+    }
 }
 
 /// Joins neighbouring runs that share their formatting.

@@ -10,8 +10,11 @@ use super::{TAGS, TONES, from_markdown};
 /// Writes Markdown. Reading the result back gives an equal document, apart from block ids and what Markdown
 /// cannot say:
 ///
-/// - Emphasis never starts or ends on a space, so spaces at the edge of a bold, italic or struck span leave it.
-///   Inline code cannot hold a line break, so the break leaves it too.
+/// - Emphasis and maths never start or end on a space, so spaces at the edge of a bold, italic or struck span
+///   or of maths leave it. Inline code and maths cannot hold a line break, so the break leaves them too.
+/// - Maths that dollar signs cannot hold, such as a brace with no partner, is written as code. A formula they
+///   cannot hold is written as a code block in the language `math`, which reads back as a formula, as any
+///   code block in that language does.
 /// - An empty paragraph is left out, and a list item sits at most one level below the item before it.
 /// - An unknown block is written as its fallback text. Unknown marks and fields are left out.
 pub fn to_markdown(doc: &Document) -> String {
@@ -121,8 +124,7 @@ fn other(block: &Block) -> Vec<String> {
             vec![format!("{marker} {}", text(runs, Context::Heading)).trim_end_matches(' ').to_owned()]
         }
         BlockKind::Code { language } => code(language.as_deref().unwrap_or_default(), &block.plain_text()),
-        // A formula goes out as a `math` fence until `$$` is written.
-        BlockKind::Formula => code("math", &block.plain_text()),
+        BlockKind::Formula => formula(&block.plain_text()),
         BlockKind::Quote => quote(None, block.body.blocks()),
         BlockKind::Callout { tone } => quote(Some(*tone), block.body.blocks()),
         BlockKind::Divider => vec!["---".to_owned()],
@@ -149,6 +151,17 @@ fn code(language: &str, text: &str) -> Vec<String> {
     }
     out.push(fence);
     out
+}
+
+/// Writes display maths between dollar signs where it reads back from them. They sit in a paragraph, which a
+/// blank line or a line that starts another block would end. A tab is as wide as where it sits, so inside a
+/// quote it could start a block that it does not start here.
+fn formula(tex: &str) -> Vec<String> {
+    let dollars = if tex.is_empty() { "$$\n$$".to_owned() } else { format!("$$\n{tex}\n$$") };
+    let (doc, _) = from_markdown(&dollars, &mut String::new);
+    let reads_back =
+        matches!(doc.blocks.as_slice(), [block] if block.kind == BlockKind::Formula && block.plain_text() == tex);
+    if reads_back && !tex.contains('\t') { lines(&dollars) } else { code("math", tex) }
 }
 
 fn quote(tone: Option<Tone>, children: &[Block]) -> Vec<String> {
@@ -186,11 +199,25 @@ enum Context {
 }
 
 /// Writes a block's text. Emphasis is written with Markdown's delimiters where they read back as written, and
-/// as HTML tags where Markdown's rules about the characters beside a delimiter would lose it.
+/// as HTML tags where Markdown's rules about the characters beside a delimiter would lose it. Maths is written
+/// between dollar signs where it reads back from them, and as code where it does not.
 fn text(runs: &[Run], context: Context) -> String {
-    let inline = Inline::new(runs);
-    let written = inline.write(context, false);
-    if inline.has(EMPHASIS) && !inline.reads_back(&written, context) { inline.write(context, true) } else { written }
+    let mut inline = Inline::new(runs);
+    loop {
+        let written = inline.write(context, false);
+        if !inline.has(EMPHASIS | MATH) || inline.reads_back(&written, context) {
+            return written;
+        }
+        let tagged = inline.write(context, true);
+        if !inline.has(MATH) || inline.reads_back(&tagged, context) {
+            return tagged;
+        }
+        inline
+            .formats
+            .iter_mut()
+            .filter(|format| format.marks & MATH != 0)
+            .for_each(|format| format.marks ^= MATH | CODE);
+    }
 }
 
 const BOLD: u8 = 1;
@@ -199,10 +226,12 @@ const STRIKE: u8 = 4;
 const UNDERLINE: u8 = 8;
 const HIGHLIGHT: u8 = 16;
 const CODE: u8 = 32;
+const MATH: u8 = 64;
 /// The marks written with delimiters, which Markdown only accepts next to the right characters.
 const EMPHASIS: u8 = BOLD | ITALIC | STRIKE;
 
-const MARKS: [(u8, Mark); 6] = [
+const MARKS: [(u8, Mark); 7] = [
+    (MATH, Mark::Math),
     (BOLD, Mark::Bold),
     (ITALIC, Mark::Italic),
     (STRIKE, Mark::Strike),
@@ -237,7 +266,7 @@ impl Format<'_> {
 struct Inline<'a> {
     chars: Vec<char>,
     formats: Vec<Format<'a>>,
-    /// One dollar is a price. Two could hold maths between them, so they are escaped.
+    /// Whether a dollar in the text could be read as the edge of maths. One dollar alone is a price.
     maths: bool,
 }
 
@@ -248,17 +277,23 @@ impl<'a> Inline<'a> {
         for run in runs {
             let bit = |mark| MARKS.iter().find(|(_, known)| known == mark).map_or(0, |(bit, _)| *bit);
             let marks = run.marks.iter().fold(0, |marks, mark| marks | bit(mark));
+            // Maths is written as its source, which is not also code.
+            let marks = if marks & MATH != 0 { marks & !CODE } else { marks };
             for c in run.text.chars() {
-                // A code span cannot hold a line break.
-                let marks = if matches!(c, '\n' | '\r') { marks & !CODE } else { marks };
+                // Neither a code span nor maths can hold a line break.
+                let marks = if matches!(c, '\n' | '\r') { marks & !(CODE | MATH) } else { marks };
                 chars.push(c);
                 formats.push(Format { marks, link: run.link.as_deref() });
             }
         }
 
-        // Markdown cannot open emphasis before a space or close it after one, so those spaces leave the span.
-        let space = |i: usize, formats: &[Format]| chars[i].is_whitespace() && formats[i].marks & CODE == 0;
-        for bit in [BOLD, ITALIC, STRIKE] {
+        // Markdown cannot open emphasis or maths before a space or close it after one, so those spaces leave the
+        // span. Maths goes first: the spaces that leave it are then spaces of the emphasis around it.
+        for bit in [MATH, BOLD, ITALIC, STRIKE] {
+            let space = |i: usize, formats: &[Format]| match bit {
+                MATH => chars[i].is_ascii_whitespace(),
+                _ => chars[i].is_whitespace() && formats[i].marks & (CODE | MATH) == 0,
+            };
             let mut start = 0;
             while start < chars.len() {
                 let end = start + formats[start..].iter().take_while(|format| format.marks & bit != 0).count();
@@ -270,7 +305,8 @@ impl<'a> Inline<'a> {
                 start = end.max(start + 1);
             }
         }
-        let maths = chars.iter().filter(|c| **c == '$').count() > 1;
+        let maths =
+            chars.iter().filter(|c| **c == '$').count() > 1 || formats.iter().any(|format| format.marks & MATH != 0);
         Self { chars, formats, maths }
     }
 
@@ -317,7 +353,10 @@ impl<'a> Inline<'a> {
             let autolink = self.is_autolink(&segments, i);
             let mut spans: Vec<Span> = format.link.filter(|_| !autolink).map(Span::Link).into_iter().collect();
             spans.extend(
-                MARKS.iter().filter(|(bit, _)| *bit != CODE && format.marks & bit != 0).map(|m| Span::Mark(m.0)),
+                MARKS
+                    .iter()
+                    .filter(|(bit, _)| bit & (CODE | MATH) == 0 && format.marks & bit != 0)
+                    .map(|m| Span::Mark(m.0)),
             );
 
             // Close what ends here, along with everything opened inside it.
@@ -348,6 +387,9 @@ impl<'a> Inline<'a> {
                 let spaced = text.starts_with(' ') && text.ends_with(' ') && !text.trim_matches(' ').is_empty();
                 let pad = if spaced || text.starts_with('`') || text.ends_with('`') { " " } else { "" };
                 out.push_str(&format!("{fence}{pad}{text}{pad}{fence}"));
+            } else if format.marks & MATH != 0 {
+                let text = if context == Context::Cell { text.replace('|', "\\|") } else { text };
+                out.push_str(&format!("${text}$"));
             } else {
                 self.escape(range.clone(), context, &mut out);
             }
@@ -366,7 +408,7 @@ impl<'a> Inline<'a> {
         let alone = (i == 0 || segments[i - 1].1.link != format.link)
             && segments.get(i + 1).is_none_or(|(_, next)| next.link != format.link);
         alone
-            && format.marks & CODE == 0
+            && format.marks & (CODE | MATH) == 0
             && !url.contains('$')
             && self.chars[range.clone()].iter().copied().eq(url.chars())
             && (2..=32).contains(&scheme.len())
@@ -402,6 +444,11 @@ impl<'a> Inline<'a> {
             }
 
             let escaped = match c {
+                // A digit straight after maths would make its dollar signs read as prices.
+                '0'..='9' if i == range.start && i > 0 && self.formats[i - 1].marks & MATH != 0 => {
+                    out.push_str(&format!("&#{};", u32::from(c)));
+                    continue;
+                }
                 // Markdown trims a line, so the spaces at its ends are written as references.
                 ' ' | '\t' | '\r' if c == '\r' || before.is_none() || after.is_none() => {
                     out.push_str(&format!("&#{};", u32::from(c)));

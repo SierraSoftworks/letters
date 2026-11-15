@@ -244,6 +244,52 @@ fn reads_what_applications_copy() {
 }
 
 #[test]
+fn reads_maths_where_a_page_carries_its_source() {
+    let katex = |display: &str| {
+        format!(
+            concat!(
+                r#"<span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"{}>"#,
+                r#"<semantics><mrow><msup><mi>x</mi><mn>2</mn></msup></mrow>"#,
+                r#"<annotation encoding="application/x-tex">x^2</annotation></semantics></math></span>"#,
+                r#"<span class="katex-html" aria-hidden="true"><span class="base"><span class="mord mathnormal">x</span>"#,
+                r#"<span class="mord mtight">2</span></span></span></span>"#,
+            ),
+            display
+        )
+    };
+    let wikipedia = concat!(
+        r#"<span class="mwe-math-element"><span class="mwe-math-mathml-inline" style="display: none;">"#,
+        r#"<math alttext="{\displaystyle x^{2}}"><semantics><mi>x</mi></semantics></math></span>"#,
+        r#"<img src="https://example.org/x.svg" class="mwe-math-fallback-image-inline" alt="{\displaystyle x^{2}}"></span>"#,
+    );
+    let cases: &[(String, &[&str])] = &[
+        (format!("<p>so {} holds</p>", katex("")), &[r#"p "so <math|x^2> holds""#]),
+        (
+            format!("<p>so</p><span class=\"katex-display\">{}</span>", katex(r#" display="block""#)),
+            &[r#"p "so""#, r#"formula "x^2""#],
+        ),
+        (format!("<p>so {wikipedia} holds</p>"), &[r#"p "so <math|{\\displaystyle x^{2}}> holds""#]),
+        (r#"<p>so <script type="math/tex">x < 2</script> holds</p>"#.into(), &[r#"p "so <math|x < 2> holds""#]),
+        (r#"<script type="math/tex; mode=display">x^2</script>"#.into(), &[r#"formula "x^2""#]),
+        (r#"<p>so <span class="math inline">\(x^2\)</span> holds</p>"#.into(), &[r#"p "so <math|x^2> holds""#]),
+        (
+            r#"<p>so <span class="math display">\[x^2\]</span> holds</p>"#.into(),
+            &[r#"p "so""#, r#"formula "x^2""#, r#"p "holds""#],
+        ),
+        (
+            r#"<ul><li>step <math display="block" alttext="x^2"><mi>x</mi></math></li></ul>"#.into(),
+            &[r#"bullet/0 "step""#, r#"formula "x^2""#],
+        ),
+        // Maths with no source is a drawing, and a `math` class alone does not make text maths.
+        ("<p>so <math><mi>x</mi></math> holds</p>".into(), &[r#"p "so holds""#]),
+        (r#"<p>so <span class="math">x</span> holds</p>"#.into(), &[r#"p "so x holds""#]),
+    ];
+    for (html, expected) in cases {
+        assert_eq!(outline(&read(html).0), *expected, "reading {html:?}");
+    }
+}
+
+#[test]
 fn keeps_a_table_as_markdown() {
     let html = concat!(
         "<table><caption>Sizes</caption><thead><tr><th>Name</th><th>Size</th></tr></thead>",
@@ -346,7 +392,8 @@ fn writes_a_fragment_with_no_page_around_it() {
 fn reads_back_the_fragment_a_copy_writes() {
     let markdown = concat!(
         "# Title\n\n#### Small\n\nText with **bold**, *italic*, ~~struck~~, <u>under</u>, <mark>lit</mark>, `code`\n",
-        "and [a **link**](https://example.com).\n\nTwo\\\nlines.\n\n- a\n  1. b\n     - [x] c\n- [ ] d\n\n",
+        "and [a **link**](https://example.com), with $x < 2$ in it.\n\nTwo\\\nlines.\n\n$$\na &= b \\\\\n  &< c\n$$\n\n",
+        "- a\n  1. b\n     - [x] c\n- [ ] d\n\n",
         "```rust\nfn main() {\n    let a = 1 < 2;\n}\n```\n\n```\n```\n\n> quoted\n>\n> - item\n\n> [!WARNING]\n> Hot.\n\n---\n\nEnd.\n",
     );
     let (doc, notes) = from_markdown(markdown, &mut || String::new());

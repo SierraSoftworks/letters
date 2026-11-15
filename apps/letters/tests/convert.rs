@@ -173,7 +173,7 @@ fn export_fails_on_what_is_not_a_document() {
 fn notes(folder: &Folder) {
     folder.write(
         "notes/index.md",
-        "# Index\n\n[Plan](sub/plan.md#goals), [[My note]] and [web](https://example.com/a.md).\n\n$$x^2$$\n",
+        "# Index\n\n[Plan](sub/plan.md#goals), [[My note]] and [web](https://example.com/a.md).\n\n<div>raw</div>\n",
     );
     folder.write("notes/My note.md", "Back to [the index](index.md) or [a file](todo.txt).\n");
     folder.write("notes/sub/plan.markdown", "# Plan\n\nUp to [the index](../index.md).\n");

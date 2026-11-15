@@ -40,7 +40,9 @@ fn linked(text: &str, url: &str) -> Run {
 fn settled(doc: &Document) -> Document {
     fn settle_block(block: &Block) -> Block {
         let body = match &block.body {
-            Body::Text(runs) if !matches!(block.kind, BlockKind::Code { .. }) => Body::Text(settle(runs)),
+            Body::Text(runs) if !matches!(block.kind, BlockKind::Code { .. } | BlockKind::Formula) => {
+                Body::Text(settle(runs))
+            }
             Body::Blocks(blocks) => Body::Blocks(blocks.iter().map(settle_block).collect()),
             other => other.clone(),
         };
@@ -117,6 +119,126 @@ fn reads_every_mark() {
 }
 
 #[test]
+fn reads_maths() {
+    let cases: &[(&str, &[&str])] = &[
+        (r"Euler: $e^{i\pi} + 1 = 0$.", &[r#"p "Euler: <math|e^{i\\pi} + 1 = 0>.""#]),
+        ("**$x$** and [$y$](/z)", &[r#"p "<bold,math|x> and <math,@/z|y>""#]),
+        ("$a\nb$", &[r#"p "<math|a b>""#]),
+        ("$$x^2$$", &[r#"formula "x^2""#]),
+        ("$$\na &= b \\\\\n  &= c\n$$", &[r#"formula "a &= b \\\\\n  &= c""#]),
+        ("```math\nx^2\n```", &[r#"formula "x^2""#]),
+        ("where\n$$\nx^2\n$$\nholds", &[r#"p "where""#, r#"formula "x^2""#, r#"p "holds""#]),
+        ("- step\n  $$\n  x^2\n  $$\n- next", &[r#"bullet/0 "step""#, r#"formula "x^2""#, r#"bullet/0 "next""#]),
+        ("> $$x^2$$", &["quote", r#"  formula "x^2""#]),
+        ("# On $$x^2$$", &[r#"h1 "On <math|x^2>""#]),
+    ];
+    for (markdown, expected) in cases {
+        assert_eq!(outline(&read(markdown).0), *expected, "reading {markdown:?}");
+    }
+}
+
+#[test]
+fn reads_a_price_as_text() {
+    let cases =
+        ["costs $5", "between $5 and $10", "$5-$10 each", "US$5/kg and US$6", "$1.50, $2 or $3.25", "5$ and 10$"];
+    for markdown in cases {
+        assert_eq!(outline(&read(markdown).0), [format!("p {markdown:?}")], "reading {markdown:?}");
+        let (back, _) = read(&to_markdown(&read(markdown).0));
+        assert_eq!(outline(&back), [format!("p {markdown:?}")], "writing {markdown:?}");
+    }
+}
+
+#[test]
+fn writes_maths_between_dollar_signs() {
+    let maths = |tex: &str| Run::marked(tex, [Mark::Math]);
+    let formula = |tex: &str| with_text(BlockKind::Formula, vec![Run::plain(tex)]);
+    let cases = [
+        (
+            with_text(BlockKind::Paragraph, vec![Run::plain("so "), maths("x^2"), Run::plain(" holds")]),
+            "so $x^2$ holds\n",
+        ),
+        (with_text(BlockKind::Paragraph, vec![Run::marked("x", [Mark::Math, Mark::Bold])]), "**$x$**\n"),
+        (with_text(BlockKind::Heading { level: 2 }, vec![Run::plain("On "), maths("a_1*b_2")]), "## On $a_1*b_2$\n"),
+        (with_text(BlockKind::Paragraph, vec![maths("x"), Run::plain(" costs $5")]), "$x$ costs \\$5\n"),
+        (formula("x^2"), "$$\nx^2\n$$\n"),
+        (formula("a &= b \\\\\n&= c"), "$$\na &= b \\\\\n&= c\n$$\n"),
+        (Block::new("", BlockKind::Formula), "$$\n$$\n"),
+        (holding(BlockKind::Quote, vec![formula("x^2")]), "> $$\n> x^2\n> $$\n"),
+    ];
+    for (block, expected) in cases {
+        assert_eq!(to_markdown(&doc(vec![block.clone()])), expected, "writing {block:?}");
+    }
+}
+
+#[test]
+fn maths_survives_a_round_trip() {
+    let inline = [
+        r"\frac{a}{b}",
+        "a_1 + b_2^{n}",
+        r"\text{cost: } \$5",
+        "x < y & z > 0",
+        "a|b",
+        r"\{x\}",
+        "a*b*c",
+        "[x](y)",
+        "f`x`",
+        r"a \\ b",
+        "#1 ~ !x",
+        r"\text{$y$}",
+        "2",
+    ];
+    let display =
+        ["x^2", "a &= b \\\\\n  &= c", "a\n- b", "a\n\nb", "", " x ", "> a", "# a", "a\n===", "x $$ y", "a {", "```"];
+    let around = |tex: &str| {
+        let maths = Run::marked(tex, [Mark::Math]);
+        vec![
+            with_text(BlockKind::Paragraph, vec![maths.clone()]),
+            with_text(BlockKind::Paragraph, vec![Run::plain("so "), maths.clone(), Run::plain(" and "), maths.clone()]),
+            with_text(BlockKind::Paragraph, vec![Run::plain("a"), maths.clone(), Run::plain("2 $")]),
+            with_text(BlockKind::Heading { level: 1 }, vec![Run::marked("On ", [Mark::Italic]), maths.clone()]),
+            item(ListKind::Bullet, 0, "item"),
+            with_text(
+                BlockKind::ListItem { list: ListKind::Bullet, depth: 1 },
+                vec![Run { link: Some("/a".into()), ..maths }],
+            ),
+        ]
+    };
+    let formula = |tex: &str| {
+        let formula = with_text(
+            BlockKind::Formula,
+            Some(tex).filter(|tex| !tex.is_empty()).map(Run::plain).into_iter().collect(),
+        );
+        vec![
+            with_text(BlockKind::Paragraph, vec![Run::plain("before")]),
+            formula.clone(),
+            item(ListKind::Ordered, 0, "item"),
+            formula.clone(),
+            holding(BlockKind::Callout { tone: Tone::Tip }, vec![formula]),
+        ]
+    };
+    let cases = inline.iter().map(|tex| around(tex)).chain(display.iter().map(|tex| formula(tex)));
+    for blocks in cases {
+        let before = doc(blocks);
+        let markdown = to_markdown(&before);
+        let (after, notes) = read(&markdown);
+        assert_eq!(settled(&after), settled(&before), "through {markdown:?}");
+        assert_eq!(notes, [], "through {markdown:?}");
+    }
+}
+
+#[test]
+fn writes_maths_that_dollar_signs_cannot_hold_as_code() {
+    let cases = [("a } b", "`a } b`"), ("x $ y", "`x $ y`"), (" x ", " $x$ "), ("a\nb", "$a$\\\n$b$")];
+    for (tex, expected) in cases {
+        let block = with_text(
+            BlockKind::Paragraph,
+            vec![Run::plain("so"), Run::marked(tex, [Mark::Math]), Run::plain("holds")],
+        );
+        assert_eq!(to_markdown(&doc(vec![block])), format!("so{expected}holds\n"), "writing {tex:?}");
+    }
+}
+
+#[test]
 fn reads_callout_tags_and_their_aliases() {
     let cases = [
         ("INFO", Tone::Info),
@@ -171,8 +293,8 @@ fn notes_what_an_import_simplified() {
         ("text <span>inline</span>", "HTML", "<span>inline</span>"),
         ("---\ntitle: Notes\n---\n\nBody", "Front matter", "title: Notes"),
         ("+++\r\ntitle = \"Notes\"\r\nlang = \"en\"\r\n+++\r\nBody", "Front matter", "title = \"Notes\"\nlang"),
-        ("Euler: $e^{i\\pi} + 1 = 0$", "Maths", "$e^{i\\pi} + 1 = 0$"),
-        ("$$\nx^2\n$$", "Maths", "x^2"),
+        ("# Title $$x^2$$", "Display maths", "x^2"),
+        ("- item $$x^2$$", "Moved out of a list item", "x^2"),
         ("Claim[^1]\n\n[^1]: Source", "Footnote", "[^1]: Source"),
         ("![A cat](cat.png)", "Image", "A cat"),
         ("[a](/b \"Hover\")", "Hover", "a"),
@@ -391,6 +513,43 @@ fn any_text() -> impl Strategy<Value = String> {
     proptest::collection::vec(piece, 1..8).prop_map(|pieces| pieces.concat())
 }
 
+/// TeX that sits between dollar signs: its braces pair up, its dollars are escaped, and no space is at its edge.
+fn any_tex() -> impl Strategy<Value = String> {
+    let piece = proptest::sample::select(vec![
+        "x",
+        "2",
+        "a_1",
+        "^2",
+        " + ",
+        " ",
+        "=",
+        r"\frac{a}{b}",
+        r"\alpha",
+        r"\$",
+        "{y}",
+        "|",
+        "*",
+        "_",
+        "<",
+        ">",
+        "&",
+        "[",
+        "]",
+        "(",
+        ")",
+        "`",
+        r"\\",
+        "-",
+        "!",
+        "#",
+        "~",
+        "é",
+    ]);
+    proptest::collection::vec(piece, 1..6)
+        .prop_map(|pieces| pieces.concat().trim().to_owned())
+        .prop_filter("maths has a source", |tex| !tex.is_empty())
+}
+
 fn any_runs() -> impl Strategy<Value = Vec<Run>> {
     let marks = [Mark::Bold, Mark::Italic, Mark::Underline, Mark::Strike, Mark::Highlight, Mark::Code];
     let marks = prop_oneof![
@@ -408,8 +567,11 @@ fn any_runs() -> impl Strategy<Value = Vec<Run>> {
         "https://a.b/$c",
     ];
     let link = proptest::option::weighted(0.2, proptest::sample::select(urls));
-    let run = (any_text(), marks, link)
-        .prop_map(|(text, marks, link)| Run { link: link.map(str::to_owned), ..Run::marked(text, marks) });
+    let text = (any_text(), marks);
+    let maths = (any_tex(), proptest::sample::subsequence(vec![Mark::Math, Mark::Bold, Mark::Underline], 1..=3))
+        .prop_map(|(tex, marks)| (tex, [vec![Mark::Math], marks].concat()));
+    let run = (prop_oneof![5 => text, 1 => maths], link)
+        .prop_map(|((text, marks), link)| Run { link: link.map(str::to_owned), ..Run::marked(text, marks) });
     proptest::collection::vec(run, 1..4)
 }
 
@@ -429,6 +591,8 @@ fn any_blocks() -> impl Strategy<Value = Vec<Block>> {
             with_text(BlockKind::Code { language }, code.into_iter().map(Run::plain).collect())
         }),
         1 => Just(Block::new("", BlockKind::Divider)),
+        1 => proptest::option::of(prop_oneof![any_tex(), any_text()])
+            .prop_map(|tex| with_text(BlockKind::Formula, tex.into_iter().map(Run::plain).collect())),
     ];
     let block = leaf.prop_recursive(3, 16, 4, move |inner| {
         let children = proptest::collection::vec(inner, 0..4);

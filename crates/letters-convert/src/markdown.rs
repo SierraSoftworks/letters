@@ -1,8 +1,8 @@
 //! Markdown in both directions.
 //!
 //! Reading follows CommonMark and GFM, with front matter, footnotes, dollar maths and wiki links. What the
-//! document cannot hold yet (tables, images, maths, footnotes, front matter and raw HTML) is kept as text or as
-//! a code block, with an import note that says so.
+//! document cannot hold yet (tables, images, footnotes, front matter and raw HTML) is kept as text or as a code
+//! block, with an import note that says so.
 
 mod read;
 mod write;
@@ -10,7 +10,7 @@ mod write;
 use letters_model::{Mark, Tone};
 
 pub use read::from_markdown;
-pub(crate) use read::{merge, nest, table};
+pub(crate) use read::{merge, nest, table, trim};
 pub(crate) use write::cell;
 pub use write::to_markdown;
 

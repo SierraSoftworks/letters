@@ -8,7 +8,7 @@ use letters_model::{Block, BlockKind, Body, Document, ListKind, Mark, Run, Tone}
 
 use super::href;
 use crate::ImportNote;
-use crate::markdown::{TAGS, TONES, cell, merge, nest, table};
+use crate::markdown::{TAGS, TONES, cell, merge, nest, table, trim};
 
 /// Elements nested deeper than this are read as their text, which bounds the reader's recursion.
 const MAX_DEPTH: usize = 128;
@@ -88,6 +88,7 @@ const PROPERTIES: [&str; 7] =
 ///   dropped, and an unknown element is read through to its text.
 /// - White space collapses as a browser shows it. A fragment with no block in it is one paragraph that keeps
 ///   the spaces at its edges, so that a phrase can be poured into a line.
+/// - Maths is read where a page carries its TeX source, and left out where it carries only a drawing of it.
 /// - Blocks with no text, scripts, style sheets and images are left out.
 /// - A table is kept as Markdown in a code block, as a Markdown import keeps one.
 pub fn from_html(html: &str, new_id: &mut dyn FnMut() -> String) -> (Document, Vec<ImportNote>) {
@@ -155,6 +156,52 @@ impl Element {
         self.classes().find_map(|class| {
             let name = class.strip_prefix("markdown-alert-").unwrap_or(class);
             TONES.iter().find(|(tag, _)| tag.eq_ignore_ascii_case(name)).map(|(_, tone)| *tone)
+        })
+    }
+
+    /// The TeX source of the maths this element stands for, and whether it is set on a line of its own. The
+    /// source is found where pages carry it: annotated on MathML, as KaTeX and Wikipedia write it, in the
+    /// script MathJax leaves, or between delimiters in an element of the class `math`, as Pandoc and
+    /// `to_html` write it.
+    fn maths(&self) -> Option<(String, bool)> {
+        let text = |element: &Element| {
+            let mut text = String::new();
+            raw(&element.children, &mut text);
+            text
+        };
+        let class = self.attribute("class");
+        match self.name.as_str() {
+            "math" => {
+                let is_source = |element: &Element| {
+                    element.name == "annotation" && element.attribute("encoding").to_ascii_lowercase().contains("tex")
+                };
+                let source = self.find(&is_source).map_or_else(|| self.attribute("alttext").to_owned(), text);
+                Some((source, self.attribute("display") == "block"))
+            }
+            "script" => {
+                let kind = self.attribute("type").strip_prefix("math/tex")?;
+                Some((text(self), kind.contains("display")))
+            }
+            // Wikipedia shows a picture of the maths, described by its source.
+            "img" if class.starts_with("mwe-math-fallback-image") => {
+                Some((self.attribute("alt").to_owned(), class.ends_with("display")))
+            }
+            _ if self.classes().any(|class| class == "math") => {
+                let source = text(self);
+                [(r"\(", r"\)", false), (r"\[", r"\]", true)].into_iter().find_map(|(open, close, display)| {
+                    Some((source.trim().strip_prefix(open)?.strip_suffix(close)?.to_owned(), display))
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The first element inside this one that `is` what is looked for.
+    fn find(&self, is: &dyn Fn(&Element) -> bool) -> Option<&Element> {
+        self.children.iter().find_map(|node| match node {
+            Node::Element(child) if is(child) => Some(child),
+            Node::Element(child) => child.find(is),
+            Node::Text(_) => None,
         })
     }
 
@@ -265,20 +312,6 @@ fn flatten(blocks: Vec<Block>, runs: &mut Vec<Run>) {
             Body::Blocks(children) => flatten(children, runs),
             _ => {}
         }
-    }
-}
-
-/// Drops the spaces and line breaks at the edges of a block's text, which a browser does not show.
-fn trim(runs: &mut Vec<Run>) {
-    const EDGE: [char; 3] = [' ', '\t', '\n'];
-    let blank = |run: &Run| run.text.trim_matches(EDGE).is_empty();
-    runs.truncate(runs.len() - runs.iter().rev().take_while(|run| blank(run)).count());
-    runs.drain(..runs.iter().take_while(|run| blank(run)).count());
-    if let Some(last) = runs.last_mut() {
-        last.text.truncate(last.text.trim_end_matches(EDGE).len());
-    }
-    if let Some(first) = runs.first_mut() {
-        first.text.drain(..first.text.len() - first.text.trim_start_matches(EDGE).len());
     }
 }
 
@@ -409,6 +442,27 @@ impl Reader<'_> {
         self.gap = true;
     }
 
+    /// Reads maths from its source: a formula between the blocks around it, or a run in the text.
+    fn maths(&mut self, tex: &str, display: bool, style: &Style, out: &mut Vec<Block>) {
+        let tex = tex.replace('\r', "");
+        let tex = tex.trim();
+        if tex.is_empty() {
+            return;
+        }
+        if display {
+            self.blocks = true;
+            self.flush(out);
+            let mut block = self.block(BlockKind::Formula);
+            block.body = Body::Text(vec![Run::plain(tex)]);
+            out.push(block);
+        } else {
+            let mut style = style.clone();
+            style.marks.insert(Mark::Math);
+            self.push(&tex.replace('\n', " "), &style);
+            self.gap = false;
+        }
+    }
+
     /// Ends the block being read. One with nothing to show is left out.
     fn flush(&mut self, out: &mut Vec<Block>) {
         let mut runs = mem::take(&mut self.runs);
@@ -443,10 +497,15 @@ impl Reader<'_> {
 
     fn element(&mut self, element: &Element, outer: &Style, out: &mut Vec<Block>) {
         let name = element.name.as_str();
-        if UNREAD.contains(&name)
-            || element.is_hidden()
-            || element.classes().any(|class| class == "markdown-alert-title")
+        // KaTeX writes maths twice: as MathML, which carries its source, and as the boxes it draws.
+        if element.is_hidden() || element.classes().any(|class| matches!(class, "markdown-alert-title" | "katex-html"))
         {
+            return;
+        }
+        if let Some((tex, display)) = element.maths() {
+            return self.maths(&tex, display, outer, out);
+        }
+        if UNREAD.contains(&name) {
             return;
         }
         let mut style = outer.inside(element);

@@ -38,6 +38,8 @@ pub type Assets<'a> = &'a mut dyn FnMut(&str) -> Option<Vec<u8>>;
 /// - An image held by the file is written in as a `data:` address. One that is still remote becomes a link
 ///   to it, so that opening the page fetches nothing.
 /// - A link that would run script is written as its text alone.
+/// - Maths is written as its TeX source between `\(` and `\)`, or `\[` and `\]` for a formula, in an element
+///   of the class `math`. Nothing in the file sets it, since nothing in the file runs.
 /// - An unknown block is written as its fallback text. Unknown marks and fields are left out.
 pub fn to_html(doc: &Document, style: &Style, title: &str, assets: Assets) -> String {
     let mut out = String::from("<!doctype html>\n<html lang=\"");
@@ -95,8 +97,13 @@ fn blocks(blocks: &[Block], assets: Assets, out: &mut String) {
             BlockKind::Paragraph => element("p", block.body.runs(), out),
             BlockKind::Heading { level } => element(&format!("h{}", (*level).clamp(1, 4)), block.body.runs(), out),
             BlockKind::Code { language } => code(language.as_deref(), &block.plain_text(), out),
-            // A formula goes out as its source until maths is written.
-            BlockKind::Formula => code(Some("math"), &block.plain_text(), out),
+            // Maths goes out as its source between the delimiters MathJax and Pandoc use, for a page or a paste
+            // that can set it.
+            BlockKind::Formula => {
+                out.push_str("<p class=\"math display\">\\[");
+                escape(&block.plain_text(), out);
+                out.push_str("\\]</p>\n");
+            }
             BlockKind::Quote => container("<blockquote>", "</blockquote>", block.body.blocks(), assets, out),
             BlockKind::Callout { tone } => {
                 let open = format!("<div class=\"callout {}\" role=\"note\">", tone_name(*tone));
@@ -308,7 +315,13 @@ fn inline(runs: &[Run], out: &mut String) {
         for run in linked.iter().filter(|run| !run.text.is_empty()) {
             let tags = || MARKS.iter().filter(|(mark, _)| run.marks.contains(mark)).map(|(_, tag)| *tag);
             tags().for_each(|tag| _ = write!(out, "<{tag}>"));
-            text(&run.text, out);
+            if run.marks.contains(&Mark::Math) {
+                out.push_str("<span class=\"math inline\">\\(");
+                escape(&run.text, out);
+                out.push_str("\\)</span>");
+            } else {
+                text(&run.text, out);
+            }
             tags().rev().for_each(|tag| _ = write!(out, "</{tag}>"));
         }
         if address.is_some() {
