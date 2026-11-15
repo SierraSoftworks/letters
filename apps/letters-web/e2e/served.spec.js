@@ -7,7 +7,7 @@ import { expect, test } from "@playwright/test";
 import { createHash } from "node:crypto";
 
 import { INK, blocks, carry, entry, file, inked, png, rested, texts } from "./page.js";
-import { album, opened, picture, serve } from "./server.js";
+import { album, opened, picture, room, serve } from "./server.js";
 
 const DOCUMENT = `/api/v1/documents/${opened().id}`;
 const TRUST = `${DOCUMENT}/trust`;
@@ -257,4 +257,47 @@ test("what the person set elsewhere is how the page is, and what they set here i
   await click(page, "Light");
   await expect.poll(() => asked.map(({ method, path }) => `${method} ${path}`)).toEqual(["PUT /api/v1/settings"]);
   expect(JSON.parse(asked[0].body)).toEqual({ ...theirs, appearance: "light" });
+});
+
+/** The served document in a folder of a space, and what the server says of a document there. */
+const HOUSE = { space: "family", path: "House/Minutes.let" };
+const listed = (name, id = opened().id) => ({ kind: "document", name, space: "family", path: `House/${name}.let`, id, modified: 0, role: "editor" });
+
+const renames = [
+  { name: "takes", answer: { body: listed("Agenda") }, title: "Agenda" },
+  { name: "refuses", answer: { status: 409, body: { code: "name_taken", message: "Another document here is called Agenda." } }, title: "Minutes" },
+];
+for (const { name, answer, title } of renames) {
+  test(`the document is renamed by its server, which ${name} the name`, async ({ page }) => {
+    const asked = await serve(page, opened(HOUSE), (method, path) => (path === `${DOCUMENT}/rename` ? answer : undefined));
+    await run(page, "Rename or move");
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.type("Agenda");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => told(asked)).toEqual(['POST /rename {"name":"Agenda"}']);
+    await expect(page).toHaveTitle(title);
+    // The name field stays with what was typed and says why, or the bar has the new name.
+    const said = answer.status ? page.getByRole("alert", { name: "Another document here is called Agenda." }) : page.getByRole("button", { name: "Agenda", exact: true });
+    await expect(said).toBeAttached();
+  });
+}
+
+test("a new document is started beside this one, and the page goes to it once what was written is kept", async ({ page }) => {
+  const [host, made] = [room(), listed("Untitled", "0190f3a2-7c1e-7b4a-9c55-000000000002")];
+  const documents = "/api/v1/spaces/family/documents";
+  const asked = await serve(page, opened(HOUSE), (method, path) => (path === documents ? { status: 201, body: made } : undefined), undefined, host);
+  await page.route(`**/d/${made.id}`, (route) => route.fulfill({ contentType: "text/html", body: "<title>The new one</title>" }));
+  await page.keyboard.type("Kept first.");
+  await run(page, "New document");
+  await expect(page).toHaveTitle("The new one");
+  expect(told(asked)).toEqual([`POST ${documents} {"folder":"House"}`]);
+  expect((await host.texts()).join()).toContain("Kept first.");
+  host.close();
+});
+
+test("the person's other documents are on the server's page for the folder", async ({ page }) => {
+  await serve(page, opened(HOUSE));
+  await page.route("**/s/family/House", (route) => route.fulfill({ contentType: "text/html", body: "<title>House</title>" }));
+  await run(page, "Open");
+  await expect(page).toHaveTitle("House");
 });

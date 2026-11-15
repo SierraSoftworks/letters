@@ -193,6 +193,8 @@ pub struct Shell {
     /// The hosts whose pictures the person said they trust, for as long as the page is open. The server
     /// has nowhere to keep them.
     hosts: Vec<String>,
+    /// The page of the server the person asked for, which waits until the server has what they wrote.
+    leaving: Option<String>,
     /// What the person set for themselves as their server keeps it, once it has said. What this browser
     /// keeps of it is a copy, which the page starts with.
     account: Option<letters_api::Settings>,
@@ -376,6 +378,7 @@ impl Shell {
                 server,
                 linked: HashMap::new(),
                 hosts: Vec::new(),
+                leaving: None,
                 account: None,
                 client: None,
                 socket: None,
@@ -514,6 +517,12 @@ impl Shell {
         hear(&shell, &input, "focus", |shell, _: Event| shell.view.focus(true))?;
         hear(&shell, &input, "blur", |shell, _: Event| shell.view.focus(false))?;
         hear(&shell, &window, "resize", |shell, _: Event| shell.fit())?;
+        // The browser asks before it leaves a page whose work the server lacks.
+        hear(&shell, &window, "beforeunload", |shell, event: Event| {
+            if shell.unsent() {
+                event.prevent_default();
+            }
+        })?;
         // Another tab of the editor may have added to the person's words, kept another default style, or
         // changed their settings.
         hear(&shell, &window, "storage", |shell, _: Event| {
@@ -1249,13 +1258,7 @@ impl Shell {
         }
         for request in self.view.take_requests() {
             match request {
-                // There are no folders to move between, so a name is the person's to give.
-                Request::Named(name) | Request::Rename(name) => {
-                    self.view.set_document_name(&name);
-                    if let Some(page) = self.window.document() {
-                        page.set_title(&name);
-                    }
-                }
+                Request::Named(name) | Request::Rename(name) => self.rename(name),
                 Request::SaveDefaultStyle(json) => {
                     if !self.platform.keep_default_style(&json) {
                         self.view.set_default_style(self.platform.default_style());
@@ -1269,7 +1272,14 @@ impl Shell {
                     report(self.download(&json.into(), "application/json", &format!("{name}.letstyle")));
                 }
                 Request::Pictures => self.picker.click(),
-                Request::OpenDialog => self.opener.click(),
+                // A server's documents are listed on its own pages. Without one, the browser asks the person
+                // for a file, and the chooser's `change` hands it over.
+                Request::OpenDialog => match self.folder() {
+                    Some((space, folder)) => self
+                        .leave(space.map_or(paths::HOME_PAGE.to_owned(), |space| paths::folder_page(&space, &folder))),
+                    None => self.opener.click(),
+                },
+                Request::New => self.start_document(),
                 Request::Save => self.save(),
                 Request::Paste { plain } => self.paste_later(plain),
                 Request::Print => self.print(),
@@ -1295,7 +1305,7 @@ impl Shell {
                 Request::SaveCopy { name, format, .. } => self.copy(name, format, None),
                 // A version that shows in the history is copied as it read then.
                 Request::SaveVersion { revision, name, format, .. } => self.copy(name, format, Some(&revision)),
-                // Recent documents, new ones and moves need files, which wait for a server behind the page.
+                // Moves and folders wait for the server's listings.
                 _ => {}
             }
         }
@@ -1325,6 +1335,7 @@ impl Shell {
             self.keep_settings();
         }
         self.keep_up();
+        self.go();
         self.cover();
         if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
             self.frame_due = self.window.request_animation_frame(&self.on_frame).is_ok();
@@ -1742,6 +1753,110 @@ impl Shell {
                 // The edit that names it may go now.
                 shell.sync();
             });
+        }
+    }
+
+    // The server's documents
+
+    /// The space and the folder the served document is in. `None` on a page of no server, and no space
+    /// for a document that reaches the person only through a share.
+    fn folder(&self) -> Option<(Option<String>, String)> {
+        let server = self.server.as_ref()?;
+        let folder = server.path.rsplit_once('/').map_or("", |(folder, _)| folder);
+        Some((server.space.clone(), folder.to_owned()))
+    }
+
+    /// Calls the document `name`. A server's document is renamed by its server, which may refuse.
+    fn rename(&mut self, name: String) {
+        let Some(id) = self.server.as_ref().map(|server| server.id.clone()) else {
+            // There are no folders to move between, so a name is the person's to give.
+            return self.called(&name);
+        };
+        let body = serde_json::to_vec(&letters_api::Rename { name }).unwrap_or_default();
+        let asked = browser::ask(&self.window, "POST", &paths::rename(&id), Some((letters_api::JSON, &body)));
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let answer = asked.await;
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            // The page may show another document by now.
+            if shell.server.as_ref().is_none_or(|server| server.id != id) {
+                return;
+            }
+            match answer.map(|entry| serde_json::from_slice::<letters_api::Entry>(&entry)) {
+                Ok(Ok(entry)) => {
+                    shell.called(&entry.name);
+                    if let Some(server) = &mut shell.server {
+                        (server.name, server.path) = (entry.name, entry.path);
+                    }
+                }
+                Ok(Err(_)) => shell.view.set_notice(Some("The server's answer could not be read.")),
+                Err(refusal) => shell.view.set_notice(Some(&refusal.message)),
+            }
+            shell.arrived();
+        });
+    }
+
+    /// Shows the document under `name`, in the window and on the browser's tab.
+    fn called(&mut self, name: &str) {
+        self.view.set_document_name(name);
+        if let Some(page) = self.window.document() {
+            page.set_title(name);
+        }
+    }
+
+    /// Starts another document beside the served one and goes to it. A page of no server has nowhere to
+    /// keep a second one.
+    fn start_document(&mut self) {
+        let Some((space, folder)) = self.folder() else { return };
+        // A document shared from elsewhere has no folder of the person's: they choose one on the server's pages.
+        let Some(space) = space else { return self.leave(paths::HOME_PAGE.to_owned()) };
+        let body = serde_json::to_vec(&letters_api::NewDocument { folder, name: None }).unwrap_or_default();
+        let asked = browser::ask(&self.window, "POST", &paths::documents(&space), Some((letters_api::JSON, &body)));
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let answer = asked.await;
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            let made = answer
+                .map(|entry| serde_json::from_slice::<letters_api::Entry>(&entry).ok().and_then(|entry| entry.id));
+            match made {
+                Ok(Some(id)) => shell.leave(paths::editor_page(&id)),
+                Ok(None) => shell.say("The server's answer could not be read.".to_owned()),
+                Err(refusal) => shell.say(refusal.message),
+            }
+            shell.sync();
+        });
+    }
+
+    /// Goes to another of the server's pages, once the server has what the person wrote on this one.
+    fn leave(&mut self, to: String) {
+        self.leaving = Some(to);
+    }
+
+    /// Whether the page holds work its server lacks.
+    fn unsent(&self) -> bool {
+        let saved = self.client.as_ref().is_none_or(|client| !self.attached || client.progress() == Progress::Saved);
+        self.uploading > 0 || !saved
+    }
+
+    /// Leaves for the page the person asked for, if nothing written here would be lost with this one.
+    fn go(&mut self) {
+        if self.leaving.is_none() || self.uploading > 0 {
+            return;
+        }
+        match self.client.as_ref().filter(|_| self.attached).map(Client::progress) {
+            // It is on its way, and the page goes once it is there.
+            Some(Progress::Saving) => {}
+            Some(Progress::Edited) => {
+                self.leaving = None;
+                self.say("What you wrote is not with the server yet. Try again once the bar says Saved.".to_owned());
+            }
+            _ => {
+                if let Some(to) = self.leaving.take() {
+                    report(self.window.location().assign(&to));
+                }
+            }
         }
     }
 
