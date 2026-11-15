@@ -64,7 +64,7 @@ fn backup(index: u32) -> Fonts {
 
 /// Whether anything painted is set in a face of [`system`].
 fn backed(items: &[Item]) -> bool {
-    items.iter().any(|item| matches!(item, Item::Glyphs { font, .. } if Arc::ptr_eq(&font.data, &system())))
+    items.iter().any(|item| matches!(item, Item::Glyphs { font, .. } if font.data.same(&system())))
 }
 
 /// A copy of a face that calls itself bold, as a system may keep a family of the fonts in files of its own.

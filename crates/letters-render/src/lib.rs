@@ -75,10 +75,81 @@ impl Color {
     }
 }
 
+/// A font file's bytes, shared between every [`Font`] made of them. They are on the heap, or wherever
+/// something else keeps them, such as a file a shell has mapped into memory. Fonts are told apart by where
+/// their bytes are, not by what they hold.
+#[derive(Clone)]
+pub struct FontBytes(Held);
+
+#[derive(Clone)]
+enum Held {
+    Heap(Arc<[u8]>),
+    Lent(Arc<dyn AsRef<[u8]> + Send + Sync>),
+}
+
+impl FontBytes {
+    /// Bytes that something else keeps for as long as the `Arc` lives. They must not change or move. Hand in
+    /// clones of one `Arc` for one file, so that a renderer can tell when nothing uses its fonts any more.
+    pub fn lent(bytes: Arc<dyn AsRef<[u8]> + Send + Sync>) -> Self {
+        Self(Held::Lent(bytes))
+    }
+
+    /// Whether these are the very bytes `other` is, in the same place, and not merely equal ones.
+    pub fn same(&self, other: &[u8]) -> bool {
+        std::ptr::eq(self.as_ptr(), other.as_ptr()) && self.len() == other.len()
+    }
+
+    /// The bytes as the font crates take them, without a copy.
+    pub fn shared(&self) -> Arc<dyn AsRef<[u8]> + Send + Sync> {
+        match &self.0 {
+            Held::Heap(bytes) => Arc::new(bytes.clone()),
+            Held::Lent(bytes) => bytes.clone(),
+        }
+    }
+
+    /// How many hold the bytes, this one among them.
+    pub(crate) fn holders(&self) -> usize {
+        match &self.0 {
+            Held::Heap(bytes) => Arc::strong_count(bytes),
+            Held::Lent(bytes) => Arc::strong_count(bytes),
+        }
+    }
+}
+
+impl std::ops::Deref for FontBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match &self.0 {
+            Held::Heap(bytes) => bytes,
+            Held::Lent(bytes) => (**bytes).as_ref(),
+        }
+    }
+}
+
+impl AsRef<[u8]> for FontBytes {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl From<Arc<[u8]>> for FontBytes {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        Self(Held::Heap(bytes))
+    }
+}
+
+impl std::fmt::Debug for FontBytes {
+    // A font is megabytes, so say which it is and not what is in it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FontBytes({} bytes at {:p})", self.len(), self.as_ptr())
+    }
+}
+
 /// One instance of a face in a font file. Cheap to clone, and compared by identity of its bytes.
 #[derive(Clone, Debug)]
 pub struct Font {
-    pub data: Arc<[u8]>,
+    pub data: FontBytes,
     /// The face's index in a collection, or 0.
     pub index: u32,
     /// A variable font's normalised design coordinates (F2Dot14, in axis order), or empty for the default
@@ -89,6 +160,11 @@ pub struct Font {
 impl Font {
     /// The default instance of a face.
     pub fn new(data: Arc<[u8]>, index: u32) -> Self {
+        Self { data: data.into(), index, coords: Arc::default() }
+    }
+
+    /// The default instance of a face in bytes held any way, such as [`FontBytes::lent`] ones.
+    pub fn of(data: FontBytes, index: u32) -> Self {
         Self { data, index, coords: Arc::default() }
     }
 
@@ -100,7 +176,7 @@ impl Font {
 
 impl PartialEq for Font {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.data, &other.data) && self.index == other.index && self.coords == other.coords
+        self.data.same(&other.data) && self.index == other.index && self.coords == other.coords
     }
 }
 

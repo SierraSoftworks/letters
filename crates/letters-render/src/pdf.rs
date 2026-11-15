@@ -40,7 +40,7 @@ use vello_cpu::kurbo::{self, Shape};
 use crate::cpu::{CpuRenderer, Frame};
 use crate::image::Images;
 use crate::paint::{EMBOLDEN, bez_path, rounded};
-use crate::{Color, DisplayList, Font, Glyph, Item, Point, Rect, Role, RunText, Size};
+use crate::{Color, DisplayList, Font, FontBytes, Glyph, Item, Point, Rect, Role, RunText, Size};
 
 /// PDF points in a logical pixel: 72 to the inch against 96.
 const POINTS: f32 = 0.75;
@@ -142,7 +142,7 @@ struct Kept {
 
 struct Face {
     /// Keeps the address the face is keyed by from being reused.
-    _data: Arc<[u8]>,
+    _data: FontBytes,
     /// `None` if the data is not a font.
     font: Option<krilla::text::Font>,
     glyphs: u32,
@@ -652,7 +652,7 @@ impl Painter<'_, '_> {
 
     /// A run as the PDF takes it, or `None` if nothing of it can be drawn.
     fn shaped(&mut self, font: &Font, run: &Run<'_>) -> Option<Shaped> {
-        let address = Arc::as_ptr(&font.data).cast::<u8>() as usize;
+        let address = font.data.as_ptr() as usize;
         let face = self.kept.faces.entry((address, font.index, font.coords.clone())).or_insert_with(|| face(font));
         let embedded = face.font.clone()?;
         let count = face.glyphs;
@@ -731,7 +731,7 @@ fn face(font: &Font) -> Face {
     let read = FontRef::from_index(&font.data, font.index).ok();
     let glyphs = read.as_ref().and_then(|face| face.maxp().ok()).map_or(0, |maxp| u32::from(maxp.num_glyphs()));
     let embedded = read.and_then(|face| {
-        let data: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(font.data.clone());
+        let data = font.data.shared();
         krilla::text::Font::new_variable(data.into(), font.index, &design(&face, &font.coords))
     });
     Face { _data: font.data.clone(), font: embedded, glyphs }

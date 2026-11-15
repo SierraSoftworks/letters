@@ -9,7 +9,7 @@ use image::{ImageFormat, Rgb, RgbImage};
 use letters_render::cpu::{CpuRenderer, Frame};
 use letters_render::image::{Image, Images};
 use letters_render::snapshot::Shot;
-use letters_render::{Color, DisplayList, Font, Glyph, Item, PathEl, Point, Rect, Role};
+use letters_render::{Color, DisplayList, Font, FontBytes, Glyph, Item, PathEl, Point, Rect, Role};
 use skrifa::instance::{LocationRef, Size};
 use skrifa::raw::types::F2Dot14;
 use skrifa::{FontRef, MetadataProvider};
@@ -106,6 +106,18 @@ fn instance(font: &Font, weight: f32) -> Font {
     let face = FontRef::from_index(&font.data, font.index).expect("a bundled font parses");
     let location = face.axes().location([("wght", weight)]);
     font.clone().with_coords(location.coords().iter().map(|coord| coord.to_bits()).collect::<Vec<_>>())
+}
+
+/// The same face in a copy of its bytes that the font does not own, as a shell lends a mapped file.
+pub fn lent(font: &Font) -> Font {
+    struct Mapped(Vec<u8>);
+    impl AsRef<[u8]> for Mapped {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+    let bytes = FontBytes::lent(Arc::new(Mapped(font.data.to_vec())));
+    Font::of(bytes, font.index).with_coords(font.coords.clone())
 }
 
 /// A line of text set left to right from `origin` on its baseline, with no shaping beyond advances.

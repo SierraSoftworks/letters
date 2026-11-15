@@ -59,7 +59,7 @@ fn lacking(window: &mut Harness) -> Vec<char> {
 /// Whether a frame sets anything in the face of the system.
 fn backed(window: &mut Harness) -> bool {
     let face = system();
-    let in_face = |item: &Item| matches!(item, Item::Glyphs { font, .. } if Arc::ptr_eq(&font.data, &face.data));
+    let in_face = |item: &Item| matches!(item, Item::Glyphs { font, .. } if font.data.same(&face.data));
     window.paint().items.iter().any(in_face)
 }
 

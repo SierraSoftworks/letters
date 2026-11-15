@@ -429,3 +429,16 @@ fn a_colour_glyph_is_drawn_in_its_own_colours() {
         assert!(coloured(&styled) > 40, "{format} keeps its colours in bold and slanted text");
     }
 }
+
+#[test]
+fn a_font_draws_from_bytes_that_something_else_keeps() {
+    let owned = sans(400.0);
+    let lent = lent(&owned);
+    let line = |font: &Font| list([text(font, 16.0, BLACK, Point { x: 10.0, y: 30.0 }, "Mapped")]);
+
+    let (from_owned, from_lent) = (render(&line(&owned), 100, 40, 1.0), render(&line(&lent), 100, 40, 1.0));
+
+    assert!(ink(&from_lent, 0, 0, 100, 40) > 0, "the text is drawn");
+    assert_eq!(furthest_apart(&from_owned, &from_lent), 0, "as it is from bytes the font owns");
+    assert!(lent == lent.clone() && lent != owned, "fonts are told apart by where their bytes are");
+}

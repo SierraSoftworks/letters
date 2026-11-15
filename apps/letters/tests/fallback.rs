@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use common::Scratch;
@@ -68,7 +68,7 @@ fn a_face_taken_twice_is_the_same_bytes() {
     let mut shelf = Shelf::of(&[&fonts.0], &[]);
     let first = shelf.find(&uncovered("a", None), Han::default());
     let again = shelf.find(&uncovered("ab", None), Han::default());
-    assert!(Arc::ptr_eq(&first[0].data, &again[0].data), "a file is read once, and the layout knows the face");
+    assert!(first[0].data.same(&again[0].data), "a file is read once, and the layout knows the face");
 }
 
 #[test]

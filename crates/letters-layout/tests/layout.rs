@@ -110,7 +110,7 @@ fn fonts_fall_back_and_may_be_missing() {
         .map(|item| if let Item::Glyphs { font, .. } = item { &font.data } else { unreachable!() })
         .collect();
     assert_eq!(fonts.len(), 2, "both blocks are drawn with a bundled face");
-    assert!(!std::sync::Arc::ptr_eq(fonts[0], fonts[1]), "code falls back to a monospace face, prose does not");
+    assert!(!fonts[0].same(fonts[1]), "code falls back to a monospace face, prose does not");
 
     let mut bare = DocLayout::new(Fonts::default());
     bare.update(&doc, &Style::default(), WIDTH, None);

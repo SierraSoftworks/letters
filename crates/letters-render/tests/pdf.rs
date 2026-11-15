@@ -309,13 +309,15 @@ fn text_can_be_searched_and_copied_as_it_was_written() {
 
 #[test]
 fn a_font_is_embedded_as_the_part_of_it_that_is_used() {
-    let lines = [(sans(400.0), 30.0), (sans(700.0), 60.0), (mono(), 90.0)];
+    // The last is in bytes the font does not own, as a shell lends a mapped file.
+    let lines = [(sans(400.0), 30.0), (sans(700.0), 60.0), (mono(), 90.0), (lent(&display(400.0)), 120.0)];
     let fonts: usize = lines.iter().map(|(font, _)| font.data.len()).sum();
     let items = lines.iter().map(|(font, y)| text(font, 14.0, BLACK, Point { x: 10.0, y: *y }, "The quick brown fox"));
 
     let bytes = written(&[(on_white(items), vec![])], &Images::default(), &Info::default()).expect("it can be written");
 
     assert!(bytes.len() < fonts / 20, "{} bytes of PDF from {fonts} bytes of fonts", bytes.len());
+    assert_eq!(text_of(&read(bytes).pages()[0]), "The quick brown fox".repeat(4), "every font's line is there");
 }
 
 #[test]

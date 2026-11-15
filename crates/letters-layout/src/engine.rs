@@ -3,9 +3,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
 
-use letters_render::{Color, Font, Glyph, Item, Point};
+use letters_render::{Color, Font, FontBytes, Glyph, Item, Point};
 use parley::fontique::{Blob, CharmapIndex, Collection, CollectionOptions, FamilyId, SourceCache};
 use parley::setting::Tag;
 use parley::{
@@ -54,7 +53,7 @@ pub(crate) struct Engine {
     fcx: FontContext,
     lcx: LayoutContext<Brush>,
     /// The bytes behind each registered blob, by blob id.
-    sources: Vec<(u64, Arc<[u8]>)>,
+    sources: Vec<(u64, FontBytes)>,
     /// Font instances already handed out, so that painting clones one and allocates nothing.
     instances: Vec<(u64, Font)>,
     /// The families of the document's fonts, in the order they came.
@@ -111,7 +110,7 @@ impl Engine {
             if self.source(&font.data).is_some() {
                 continue;
             }
-            let blob = Blob::new(Arc::new(font.data.clone()));
+            let blob = Blob::new(font.data.shared());
             self.sources.push((blob.id(), font.data.clone()));
             for (family, faces) in self.fcx.collection.register_fonts(blob.clone(), None) {
                 if !self.families.contains(&family) {
@@ -147,7 +146,7 @@ impl Engine {
         let mut new = Vec::new();
         for font in &fonts.faces {
             let source = self.source(&font.data).or_else(|| {
-                let blob = Blob::new(Arc::new(font.data.clone()));
+                let blob = Blob::new(font.data.shared());
                 // A file that holds a family of the document's is left out. The two would be one family,
                 // and the document's own text could come out in the other's faces.
                 if self.clashes(&blob) {
@@ -182,8 +181,8 @@ impl Engine {
     }
 
     /// The blob registered with these bytes.
-    fn source(&self, data: &Arc<[u8]>) -> Option<u64> {
-        self.sources.iter().find(|(_, known)| Arc::ptr_eq(known, data) || known == data).map(|(id, _)| *id)
+    fn source(&self, data: &FontBytes) -> Option<u64> {
+        self.sources.iter().find(|(_, known)| known.same(data) || **known == **data).map(|(id, _)| *id)
     }
 
     /// Whether a font file holds a family the document's fonts have.
@@ -383,7 +382,7 @@ impl Engine {
             return Some(font.clone());
         }
         let data = self.sources.iter().find(|(source, _)| *source == id)?.1.clone();
-        let font = Font::new(data, face.index).with_coords(coords.iter().map(|c| c.to_bits()).collect::<Vec<_>>());
+        let font = Font::of(data, face.index).with_coords(coords.iter().map(|c| c.to_bits()).collect::<Vec<_>>());
         // Sizes are few, so this stays small. The cap only guards against a caller that animates them.
         if self.instances.len() >= 256 {
             self.instances.clear();
