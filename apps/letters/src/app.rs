@@ -22,7 +22,7 @@ use letters_render::{Color, DisplayList, Point, Size};
 use letters_spell::Dictionary;
 use letters_trust::Trust;
 // The editor's window is the view here, where `Window` is the system's.
-use letters_ui::{Cursor, Edge, Landing, Location, Request, SaveState, Scheme, Window as View, tokens};
+use letters_ui::{Chrome, Cursor, Edge, Landing, Location, Request, SaveState, Scheme, Window as View, tokens};
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -31,9 +31,9 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{self, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowAttributes, WindowId};
 
-use crate::chrome;
+use crate::chrome::{self, Buttons, Host};
 use crate::cli::{Mode, Options};
 use crate::dictionaries;
 use crate::files::{self, EXTENSION, Exchange, Home, Opened, Rest, STYLESHEET, Working};
@@ -75,6 +75,8 @@ pub enum Event {
     Gpu(Option<Box<Gpu>>),
     /// The desktop has said whether it wants less motion.
     Motion(bool),
+    /// The desktop has said which buttons its windows carry.
+    Buttons(Buttons),
     /// A system dictionary a window's document asked for has been read, under the name it has on disk.
     Dictionary(WindowId, String, Box<Dictionary>),
 }
@@ -111,6 +113,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         journals: Journals::of(&home),
         dictionaries: dictionaries::system_folders(&home).into(),
         reduced_motion: false,
+        buttons: Buttons::guess(),
         gpu: match std::env::var("LETTERS_RENDERER").as_deref() {
             Ok("cpu") => GpuState::Off,
             Ok("gpu") => GpuState::Wanted { software: true },
@@ -138,12 +141,19 @@ pub(crate) fn event_loop<T: 'static>(background: bool) -> Result<EventLoop<T>, E
     builder.build()
 }
 
-/// What every window starts as, document or not.
+/// What every window starts as, document or not. Its bar is its title bar where the desktop leaves that
+/// to the app: under the system's lights on macOS, and in a frame Letters draws on Linux.
 pub(crate) fn window_attributes() -> WindowAttributes {
-    Window::default_attributes()
+    let attributes = Window::default_attributes()
         .with_title(UNTITLED)
         .with_inner_size(WINDOW_SIZE)
-        .with_min_inner_size(LogicalSize::new(360.0, 240.0))
+        .with_min_inner_size(LogicalSize::new(360.0, 240.0));
+    #[cfg(target_os = "macos")]
+    let attributes = {
+        use winit::platform::macos::WindowAttributesExtMacOS;
+        attributes.with_titlebar_transparent(true).with_title_hidden(true).with_fullsize_content_view(true)
+    };
+    attributes.with_decorations(Host::HERE != Host::Linux)
 }
 
 /// Opens the document and paints into memory, as [`run`] would into a window, then prints the report the
@@ -228,6 +238,8 @@ struct App {
     dictionaries: Arc<[PathBuf]>,
     /// Whether the desktop asked for less motion. Asked once, after the first frame.
     reduced_motion: bool,
+    /// The buttons the desktop's windows carry: a guess until it has been asked, after the first frame.
+    buttons: Buttons,
     gpu: GpuState,
     windows: HashMap<WindowId, DocWindow>,
     mods: ModifiersState,
@@ -270,6 +282,8 @@ struct DocWindow {
     gpu_offered: bool,
     /// Whether the accessibility tree is behind the view.
     access_stale: bool,
+    /// The frame the view was last told to draw.
+    chrome: Chrome,
     /// When the view next wants a frame without being asked, on the editor's clock.
     wake_ms: Option<u64>,
 
@@ -538,6 +552,40 @@ impl DocWindow {
         // Taking its name may have moved the file.
         self.rehome();
         home.ok().flatten()
+    }
+
+    /// Does what the bar asks of the window itself, as the title bar it stands in for would.
+    fn frame(&self, request: &Request) {
+        let window = &self.window;
+        match request {
+            // A desktop that will not move or resize a window this way leaves it where it is.
+            Request::DragWindow => drop(window.drag_window()),
+            Request::ResizeWindow(edge) => drop(window.drag_resize_window(match edge {
+                Edge::North => ResizeDirection::North,
+                Edge::NorthEast => ResizeDirection::NorthEast,
+                Edge::East => ResizeDirection::East,
+                Edge::SouthEast => ResizeDirection::SouthEast,
+                Edge::South => ResizeDirection::South,
+                Edge::SouthWest => ResizeDirection::SouthWest,
+                Edge::West => ResizeDirection::West,
+                Edge::NorthWest => ResizeDirection::NorthWest,
+            })),
+            Request::WindowMenu(at) => window.show_window_menu(LogicalPosition::new(at.x, at.y)),
+            Request::Minimise => window.set_minimized(true),
+            Request::ToggleMaximise => window.set_maximized(!window.is_maximized()),
+            _ => {}
+        }
+    }
+
+    /// Tells the view what frame the desktop expects around it, when that has changed: the window's
+    /// buttons, and whether it floats or fills its place.
+    fn reframe(&mut self, buttons: &Buttons) {
+        let (maximized, full_screen) = (self.window.is_maximized(), self.window.fullscreen().is_some());
+        let chrome = Host::HERE.chrome(buttons, maximized, full_screen);
+        if self.chrome != chrome {
+            self.chrome = chrome.clone();
+            self.view.set_chrome(chrome);
+        }
     }
 
     /// Fits the view to the window, which may have changed size, display or theme.
@@ -886,6 +934,7 @@ impl App {
             cursor: Cursor::Default,
             gpu_offered: false,
             access_stale: false,
+            chrome: Chrome::default(),
             wake_ms: None,
             place,
             keeps: self.typing.is_none() && !self.report_launch,
@@ -921,6 +970,7 @@ impl App {
         }
         window.retrust(self.trust.trust());
         window.retitle();
+        window.reframe(&self.buttons);
         window.fit();
         self.mark("laid out");
         window.window.set_visible(true);
@@ -980,6 +1030,17 @@ impl App {
                 Request::NewFolder { parent, name } => {
                     let make = |library: &Library| library.new_folder(Path::new(&parent), &name).map(drop);
                     refused = !self.replace(id, now, |_, library| make(library));
+                }
+                Request::Close => self.act(event_loop, id, Action::Close),
+                Request::DragWindow
+                | Request::ResizeWindow(_)
+                | Request::WindowMenu(_)
+                | Request::Minimise
+                | Request::ToggleMaximise => {
+                    if let Some(window) = self.windows.get_mut(&id) {
+                        window.frame(&request);
+                        window.reframe(&self.buttons);
+                    }
                 }
                 Request::SaveDefaultStyle(json) => self.keep_style(id, &json),
                 Request::ImportStyle => {
@@ -1208,7 +1269,12 @@ impl ApplicationHandler<Event> for App {
                     // The desktop is asked over D-Bus, which is not worth holding a frame for.
                     let proxy = self.proxy.clone();
                     thread::spawn(move || {
-                        chrome::reduced_motion().map(|reduced| proxy.send_event(Event::Motion(reduced)))
+                        if let Some(reduced) = chrome::reduced_motion() {
+                            let _ = proxy.send_event(Event::Motion(reduced));
+                        }
+                        if let Some(buttons) = Buttons::ask().filter(|_| Host::HERE == Host::Linux) {
+                            let _ = proxy.send_event(Event::Buttons(buttons));
+                        }
                     });
                 }
                 if let Some(run) = &mut self.typing
@@ -1251,6 +1317,8 @@ impl ApplicationHandler<Event> for App {
                 return;
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } | WindowEvent::ThemeChanged(_) => {
+                // A window that was maximised or let go again changed its size on the way.
+                window.reframe(&self.buttons);
                 window.fit()
             }
             WindowEvent::Focused(focused) => {
@@ -1385,6 +1453,14 @@ impl ApplicationHandler<Event> for App {
                 self.reduced_motion = reduced;
                 for window in self.windows.values_mut() {
                     window.view.set_reduced_motion(reduced);
+                }
+            }
+            Event::Buttons(buttons) => {
+                self.buttons = buttons;
+                for window in self.windows.values_mut() {
+                    window.reframe(&self.buttons);
+                    window.access_stale = true;
+                    window.sync(now);
                 }
             }
             Event::Gpu(Some(mut gpu)) => {
