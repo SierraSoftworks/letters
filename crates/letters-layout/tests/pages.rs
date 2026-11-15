@@ -410,10 +410,11 @@ fn a_sheet_typesets_the_formula_the_caret_is_in() {
         let caret = Pos::new(block, offset);
         assert!(layout.reveal(Some((&caret, &none))), "the formula in {block} opens");
         let screen = painted(&layout, everything());
-        assert!(layout.paginate(&paper(240.0)) == pages, "the pages are the same with the caret in {block}");
-        for index in 0..pages.sheets.len() {
+        // The pages made before the caret came are painted as they were, whichever is asked for first.
+        for index in (0..pages.sheets.len()).rev() {
             assert!(page(&layout, &pages, index).text == page(&plain, &pages, index).text, "page {index}, {block}");
         }
+        assert!(layout.paginate(&paper(240.0)) == pages, "the pages are the same with the caret in {block}");
         assert_eq!(layout.page_of(&pages, &caret), plain.page_of(&pages, &caret), "{block} is on the same page");
         assert!(painted(&layout, everything()) == screen, "and the screen still shows the source in {block}");
     }

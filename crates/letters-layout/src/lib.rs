@@ -796,14 +796,19 @@ impl State {
     /// set for being written. The pages of one pagination are then the same wherever the caret goes
     /// meanwhile.
     fn printed<T>(&mut self, work: impl FnOnce(&mut Self) -> T) -> T {
-        let shows = self.shows_open();
-        if shows {
+        // The leaf of the formula the caret is in, where the caret changes how that shows.
+        let shown = self.open_slot().map(|slot| slot.leaf).filter(|_| self.shows_open());
+        if shown.is_some() {
             self.unlay_open();
         }
         let (open, captioned) = (self.open.take(), self.open_caption(false));
+        // Every sheet below it is placed by the height it prints at, whichever sheet is asked for first.
+        if let Some(leaf) = shown {
+            self.measure(leaf);
+        }
         let done = work(self);
         self.open = open;
-        if shows {
+        if shown.is_some() {
             self.unlay_open();
         }
         if captioned {
