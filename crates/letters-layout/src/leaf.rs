@@ -14,7 +14,7 @@ use parley::{
 };
 
 use crate::engine::{Engine, Spec};
-use crate::flow::{self, Cell, Leaf, Marker, Part, Picture, Role, Type, Types, What, Words, marks};
+use crate::flow::{self, Cell, Entry, Leaf, Marker, Part, Picture, Role, Type, Types, What, Words, marks};
 use crate::ink::{Back, Brush, Ink, Inks};
 use crate::palette::Palette;
 use crate::reveal::{Shapes, Shifts};
@@ -104,6 +104,11 @@ pub(crate) struct Laid {
     pub sign: Option<Layout<Brush>>,
     /// The host name on each picture that is still a link, with the picture's place among the leaf's.
     pub names: Vec<(usize, Layout<Brush>)>,
+    /// The lines of a table of contents, or what a link preview says.
+    pub entries: Vec<Set>,
+    /// What each of those was set from. A layout that is brought up to date sets only those that say
+    /// something else now, so that an edit to one heading of many sets one line.
+    pub set_from: Vec<Entry>,
 }
 
 /// What a text is set from, and how.
@@ -190,6 +195,23 @@ impl<'a> Source<'a> {
             open,
             page,
             lang: cell.words.lang.or(leaf.lang),
+        }
+    }
+
+    /// One of the texts a table of contents or a link preview sets one under the other.
+    pub fn entry(leaf: &'a Leaf, entry: &'a Entry, types: &Types, page: Page<'a>) -> Self {
+        Self {
+            words: &entry.words,
+            role: entry.role,
+            ink: entry.ink,
+            align: Alignment::Start,
+            width: leaf.room(entry, types).1,
+            label: None,
+            bold: entry.bold,
+            formula: false,
+            open: None,
+            page,
+            lang: entry.words.lang.or(leaf.lang),
         }
     }
 }
@@ -342,6 +364,74 @@ pub(crate) fn shape(engine: &mut Engine, types: &Types, source: &Source<'_>, loc
     set.layout.break_all_lines(Some(source.width));
 }
 
+/// What a text that is cut short ends in.
+const ELLIPSIS: char = '\u{2026}';
+
+/// Shapes a text of which no more than `lines` lines show. A plain one that runs longer is cut short to end
+/// in an ellipsis on the last of them, after a word where one ends near there.
+fn shape_within(
+    engine: &mut Engine,
+    types: &Types,
+    source: &Source<'_>,
+    locale: Option<Language>,
+    lines: usize,
+    set: &mut Set,
+) {
+    shape(engine, types, source, locale, set);
+    let Words { text, spans, refs, lang, rtl, .. } = source.words;
+    let last = set.layout.get(lines.wrapping_sub(1)).filter(|_| set.layout.len() > lines);
+    let Some(mut end) = last.filter(|_| spans.is_empty() && refs.is_empty()).map(|last| last.text_range().end) else {
+        return;
+    };
+    // Each try leaves out a little more, until the ellipsis has room on the last line.
+    for _ in 0..4 {
+        let kept = text[..end].trim_end();
+        let letters = || kept.char_indices().rev();
+        let word = letters().take(24).find(|(_, letter)| letter.is_whitespace());
+        end = word.or_else(|| letters().next()).map_or(0, |(at, _)| at);
+        let mut cut = text[..end].trim_end().to_owned();
+        cut.push(ELLIPSIS);
+        let words = Words { text: cut, lang: *lang, rtl: *rtl, ..Words::default() };
+        shape(engine, types, &Source { words: &words, label: None, ..*source }, locale, set);
+        set.shown = Some(words.text);
+        if set.layout.len() <= lines || end == 0 {
+            break;
+        }
+    }
+}
+
+/// How tall a text shows when no more than `lines` of its lines do.
+fn showing(set: &Set, lines: usize) -> f32 {
+    let last = set.layout.get(lines.wrapping_sub(1)).filter(|_| set.layout.len() > lines);
+    last.map_or_else(|| tall(&set.layout), |last| last.metrics().block_max_coord.round().max(1.0))
+}
+
+/// The texts a leaf sets one under the other, as laid: each with its top left from the leaf's and how tall
+/// it shows. Texts shorter than the picture beside them stand at its middle.
+pub(crate) fn stack<'a>(
+    leaf: &'a Leaf,
+    laid: &'a Laid,
+    types: &'a Types,
+) -> impl Iterator<Item = (&'a Entry, &'a Set, Point, f32)> {
+    let entries = || leaf.entries.iter().zip(&laid.entries);
+    let gaps = theme::ENTRY_GAP * leaf.entries.len().saturating_sub(1) as f32;
+    let texts = entries().map(|(entry, set)| showing(set, entry.clamp)).sum::<f32>() + gaps;
+    let mut y = ((leaf.height - texts) / 2.0).round().max(0.0);
+    entries().map(move |(entry, set)| {
+        let (height, at) = (showing(set, entry.clamp), Point { x: leaf.room(entry, types).0, y });
+        y += height + theme::ENTRY_GAP;
+        (entry, set, at, height)
+    })
+}
+
+/// Where a picture of a given size is drawn to fill a slot at its own shape: over all of the slot, with
+/// what does not fit cut off alike at both sides.
+fn cover(slot: Rect, (width, height): (f32, f32)) -> Rect {
+    let scale = (slot.width / width).max(slot.height / height);
+    let (width, height) = (width * scale, height * scale);
+    Rect::new(slot.x + (slot.width - width) / 2.0, slot.y + (slot.height - height) / 2.0, width, height)
+}
+
 /// The narrowest a text can be set without breaking a word, and the widest it runs when nothing breaks.
 pub(crate) fn fit(
     engine: &mut Engine,
@@ -427,6 +517,23 @@ pub(crate) fn extent(leaf: &Leaf, laid: &Laid) -> Extent {
         }
         // A picture never parts from its caption.
         What::Figure => (leaf.tall(text), 1),
+        What::Contents | What::Preview => {
+            // A line of a table of contents goes to the next page with the gap under it.
+            let mut bottom = 0.0;
+            for (entry, set) in leaf.entries.iter().zip(&laid.entries) {
+                bottom += showing(set, entry.clamp) + theme::ENTRY_GAP;
+                ends.push(bottom);
+            }
+            let texts = (bottom - theme::ENTRY_GAP).max(1.0);
+            match leaf.what {
+                What::Contents => (texts, ends.len()),
+                // A card is one piece, as tall as its picture where its texts are shorter.
+                _ => {
+                    ends.clear();
+                    (texts.max(leaf.slot().map_or(0.0, |slot| slot.height)), 1)
+                }
+            }
+        }
         _ => {
             if laid.text.boxed() {
                 ends.extend(bottoms(&laid.text, 0.0));
@@ -466,9 +573,21 @@ pub(crate) struct Lay<'a> {
 /// Lays out the texts of a leaf: its own, and those of its cells.
 pub(crate) fn lay(engine: &mut Engine, types: &Types, leaf: &Leaf, how: &Lay<'_>, laid: &mut Laid) {
     let open = |part: Part| how.open.and_then(|open| open.of(leaf, part));
-    if leaf.what != What::Row {
+    if leaf.what != What::Row && !leaf.stacks() {
         let source = Source::own(leaf, types, open(Part::Text), how.page);
         shape(engine, types, &source, how.locale, &mut laid.text);
+    }
+    laid.entries.resize_with(leaf.entries.len(), Set::default);
+    laid.set_from.truncate(leaf.entries.len());
+    for (index, (entry, set)) in leaf.entries.iter().zip(&mut laid.entries).enumerate() {
+        if laid.set_from.get(index) == Some(entry) {
+            continue;
+        }
+        shape_within(engine, types, &Source::entry(leaf, entry, types, how.page), how.locale, entry.clamp, set);
+        match laid.set_from.get_mut(index) {
+            Some(from) => from.clone_from(entry),
+            None => laid.set_from.push(entry.clone()),
+        }
     }
     laid.cells.resize_with(leaf.cells.len(), Set::default);
     for (index, (cell, set)) in leaf.cells.iter().zip(&mut laid.cells).enumerate() {
@@ -665,6 +784,9 @@ pub(crate) struct Over<'a> {
     pub composing: Option<Range<usize>>,
     /// The misspelled words, in order.
     pub spelling: &'a [Range<usize>],
+    /// The sheet a block starts on, counted from 0, where sheets are what is painted: the number a line
+    /// of a table of contents ends in.
+    pub sheet_of: &'a dyn Fn(&BlockId) -> Option<usize>,
 }
 
 /// One laid text of a leaf, and where it is.
@@ -746,6 +868,7 @@ pub(crate) fn backing(leaf: &Leaf, palette: &Palette) -> Option<Item> {
         What::Label | What::Empty => {
             Some(Item::Stroke { rect: boxed, color: palette.line_strong, width: 1.0, radius: theme::BOX_RADIUS })
         }
+        What::Preview => Some(Item::Stroke { rect: boxed, color: palette.line, width: 1.0, radius: theme::BOX_RADIUS }),
         _ if leaf.boxed() => Some(Item::Fill { rect: boxed, color: palette.code, radius: theme::BOX_RADIUS }),
         _ => None,
     }
@@ -798,6 +921,9 @@ impl Painter<'_> {
     /// Emits what a leaf shows apart from the text of its cells: its marker and pictures, and the lines of
     /// its own text that fall inside the band. `tokens` colour the text of a code block.
     pub fn leaf(&mut self, leaf: &Leaf, laid: &Laid, tokens: Option<&[Token]>, over: &Over<'_>) {
+        if leaf.stacks() {
+            return self.entries(leaf, laid, over);
+        }
         // A figure holds its caption. The pictures of a gallery are figures side by side, and its caption
         // comes after them.
         let shown = leaf.what == What::Figure && !self.outside(leaf.y, leaf.y + leaf.height);
@@ -834,6 +960,87 @@ impl Painter<'_> {
         }
         self.text(&text, tokens, over);
         self.close();
+    }
+
+    /// Emits the texts of a table of contents or a link preview that fall inside the band.
+    ///
+    /// A sheet says that each line of a table of contents leads to its heading, and sets the number of the
+    /// heading's sheet at the line's end. All that a card says is one text, which leads where the card does.
+    fn entries(&mut self, leaf: &Leaf, laid: &Laid, over: &Over<'_>) {
+        let (name, band, card) = (self.part, self.band, leaf.what == What::Preview);
+        if card {
+            self.picture(leaf);
+        }
+        let (mut number, mut opened) = (Layout::new(), false);
+        for (index, (entry, set, at, height)) in stack(leaf, laid, self.types).enumerate() {
+            let at = Point { x: leaf.x + at.x, y: leaf.y + at.y };
+            // A table with nothing to list says so only to whoever edits it.
+            let unsaid = name.is_some() && !card && entry.target.is_none();
+            if unsaid || self.outside(at.y, at.y + height) {
+                continue;
+            }
+            if !card {
+                // A line is named as a cell is, from its table.
+                self.part = name.map(|table| table | (index as u64 + 1) << CELLS);
+            }
+            if !std::mem::replace(&mut opened, card) {
+                self.open(0, || Tag::Paragraph);
+                self.open(LINKS, || Tag::Link);
+            }
+            // No more of the text than is to show: the line after its last is out of the band.
+            self.band.1 = band.1.min(at.y + height - 0.5);
+            self.text(&Text { set, source: &entry.words, at, role: entry.role }, None, over);
+            self.band = band;
+            if let Some(sheet) = entry.target.as_ref().and_then(|target| (over.sheet_of)(target)) {
+                self.sheet_number(leaf, entry, set, at.y, sheet, &mut number);
+            }
+            if !card {
+                self.close();
+                self.close();
+            }
+        }
+        if opened {
+            self.close();
+            self.close();
+        }
+        self.part = name;
+    }
+
+    /// Sets the number of a sheet at the end of a line of a table of contents, on the last of the line's
+    /// baselines. `top` is where the line's text starts on the page.
+    fn sheet_number(
+        &mut self,
+        leaf: &Leaf,
+        entry: &Entry,
+        set: &Set,
+        top: f32,
+        sheet: usize,
+        number: &mut Layout<Brush>,
+    ) {
+        let label = (sheet + 1).to_string();
+        let spec = self.types.get(entry.role).spec(false, Brush { ink: entry.ink, back: None });
+        self.engine.build(&label, &[spec], &[(0, 0..label.len())], None, number);
+        number.break_all_lines(None);
+        let (Some(last), Some(line)) = (set.layout.lines().next_back(), number.get(0)) else { return };
+        // A line that reads from the right ends at the left.
+        let x = if entry.words.rtl { leaf.x } else { leaf.x + leaf.width - number.full_width() };
+        let y = top + last.metrics().baseline - line.metrics().baseline;
+        self.glyphs(number, &label, Point { x: x.round(), y });
+    }
+
+    /// Draws the picture of a link preview in its slot: as much of it as fills the slot at its own shape,
+    /// once its size is known, and until then all of it at the slot's shape.
+    fn picture(&mut self, leaf: &Leaf) {
+        let (Some(asset), Some(slot)) = (&leaf.image, leaf.slot()) else { return };
+        let rect = Rect { x: leaf.x + slot.x, y: leaf.y + slot.y, ..slot };
+        if self.outside(rect.y, rect.y + rect.height) {
+            return;
+        }
+        let drawn = self.loaded.get(asset).map_or(rect, |size| cover(rect, *size));
+        self.out.push(Item::Fill { rect, color: self.inks.palette.code, radius: theme::INLINE_RADIUS });
+        self.out.push(Item::PushClip { rect, radius: theme::INLINE_RADIUS });
+        self.out.push(Item::Image { rect: drawn, asset: asset.clone() });
+        self.out.push(Item::PopClip);
     }
 
     /// Emits the lines of one cell of a table row that fall inside the band.
