@@ -815,12 +815,7 @@ impl DocWindow {
     /// held in safe mode. One made in this window is trusted. One that was opened is unknown until its id
     /// is read.
     fn retrust(&mut self, trust: &Trust, library: &Library) {
-        let mode = match (&self.id, self.place.path()) {
-            _ if self.made_here => letters_trust::Mode::Trusted,
-            (Some(id), path) => trust::mode(trust, id, path),
-            (None, _) => letters_trust::Mode::Safe,
-        };
-        let links = mode == letters_trust::Mode::Trusted;
+        let links = self.trusted(trust);
         if std::mem::replace(&mut self.maths_links, links) != links {
             self.view.set_maths_links(links);
         }
@@ -830,6 +825,17 @@ impl DocWindow {
             let named = folder.and_then(|folder| Some(folder.file_name()?.to_string_lossy().into_owned()));
             self.view.set_safe_mode((!links).then_some(SafeMode { folder: named }));
         }
+    }
+
+    /// Whether the document is trusted, and not in safe mode. One that has not said which document it is
+    /// is not.
+    fn trusted(&self, trust: &Trust) -> bool {
+        let mode = match (&self.id, self.place.path()) {
+            _ if self.made_here => letters_trust::Mode::Trusted,
+            (Some(id), path) => trust::mode(trust, id, path),
+            (None, _) => letters_trust::Mode::Safe,
+        };
+        mode == letters_trust::Mode::Trusted
     }
 
     /// The folder the document's file is in, as the system spells it, which is how trusted folders are
@@ -1250,8 +1256,9 @@ impl DocWindow {
         self.copies = Some(copies);
     }
 
-    /// Whether the person's trust lets `file` be merged into the document without a question. Only a
-    /// trusted folder vouches for a file, and links are followed first, since folders are matched by name.
+    /// Whether the person's trust lets a file they picked be merged into the document without a question.
+    /// Only a trusted folder vouches for such a file, and links are followed first, since folders are
+    /// matched by name.
     fn may_merge(&self, trust: &Trust, file: &Path) -> bool {
         let real = fs::canonicalize(file).ok();
         let decision = real.as_deref().and_then(Path::to_str).map(|file| self.gate(trust).merge(file));
@@ -1980,13 +1987,17 @@ impl App {
         }
     }
 
-    /// Merges the conflict copies a window was told of with its next save, once the person's trust or
-    /// their yes allows it. Every asking is answered: with a question, or with the copies still offered.
+    /// Merges the conflict copies a window was told of with its next save. Every asking is answered: with
+    /// a question, or with the copies still offered.
+    ///
+    /// The press on "Merge conflicts" is enough in a trusted document, as the design has it: the copies
+    /// lie beside the document under a sync tool's name for it and say they are that document, and what
+    /// they bring is held to the document's own trust. Safe mode holds merges back, so there the person
+    /// is asked first.
     fn merge_conflicts(&mut self, id: WindowId, confirmed: bool, now: Instant) {
         let Some(window) = self.windows.get_mut(&id) else { return };
         let copies = window.copies.clone().unwrap_or_default();
-        let trust = self.trust.trust();
-        if !confirmed && copies.iter().any(|copy| !window.may_merge(trust, copy)) {
+        if !confirmed && !window.trusted(self.trust.trust()) {
             let files = copies.iter().map(|copy| merge_file(copy, &self.library)).collect();
             return window.view.ask_merge(MergeAsk { files, conflicts: true });
         }
