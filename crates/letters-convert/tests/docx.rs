@@ -8,8 +8,8 @@ use std::io::{Cursor, Read, Write};
 
 use letters_convert::{DocxError, DocxImport, from_docx, from_markdown, to_docx};
 use letters_model::{
-    Align, Anchor, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Note, NoteKind, Notes, Reply, Run, Style,
-    Tone,
+    Align, Anchor, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Note, NoteKind, Notes, Preview, Reply,
+    Run, Style, Tone,
 };
 use proptest::prelude::*;
 use zip::write::SimpleFileOptions;
@@ -1599,6 +1599,53 @@ fn a_link_preview_is_written_as_what_it_shows() {
         );
         assert_eq!(back.notes, [], "{lines:?}");
     }
+}
+
+#[test]
+fn a_link_in_text_says_where_it_leads_when_pointed_at() {
+    let titled = |title: &str| Preview { title: Some(title.into()), ..Preview::default() };
+    let long = "A long title. ".repeat(40);
+    // The text of a link, what the document keeps of its page, and whether Word is given the title to show.
+    let cases = [
+        ("kept", Some(Preview { description: Some("What it is about.".into()), ..titled("A \"post\" & more") }), true),
+        ("long", Some(titled(&long)), true),
+        ("untitled", Some(Preview { description: Some("No title.".into()), ..Preview::default() }), false),
+        ("unknown", None, false),
+    ];
+    let address = |text: &str| format!("https://example.com/{text}");
+    let runs = cases.iter().map(|(text, ..)| Run { link: Some(address(text)), ..Run::plain(*text) }).collect();
+    let previews = cases.iter().filter_map(|(text, preview, _)| Some((address(text), preview.clone()?))).collect();
+    let doc = Document { previews, blocks: vec![paragraph("p", runs)], ..Document::default() };
+
+    let body = part(&export(&doc), "word/document.xml");
+    let xml = roxmltree::Document::parse(&body).expect("the body is XML");
+    let links = xml.descendants().filter(|node| node.tag_name().name() == "hyperlink");
+    let tips: BTreeMap<String, Option<&str>> = links
+        .map(|link| {
+            let text = link.descendants().filter(|node| node.tag_name().name() == "t").filter_map(|node| node.text());
+            (text.collect(), link.attributes().find(|held| held.name() == "tooltip").map(|held| held.value()))
+        })
+        .collect();
+    for (text, preview, shown) in &cases {
+        let tip = tips[*text];
+        assert_eq!(tip.is_some(), *shown, "{text}");
+        let Some((tip, title)) = tip.zip(preview.as_ref().and_then(|preview| preview.title.as_deref())) else {
+            continue;
+        };
+        // Word limits how long a ScreenTip may be, so a long title is cut short.
+        let units = |text: &str| text.encode_utf16().count();
+        assert!(units(tip) <= 255, "{text}: {tip:?}");
+        let cut = title.starts_with(tip.trim_end_matches('\u{2026}'));
+        assert!(if units(title) <= 255 { tip == title } else { cut }, "{text}: {tip:?}");
+    }
+    // The link itself is as it was.
+    let back = returned(&doc);
+    let runs = back.document.blocks[0].body.runs();
+    let linked: Vec<(String, Option<String>)> = runs.iter().map(|run| (run.text.clone(), run.link.clone())).collect();
+    let expected: Vec<(String, Option<String>)> =
+        cases.iter().map(|(text, ..)| (text.to_string(), Some(address(text)))).collect();
+    assert_eq!(linked, expected);
+    assert_eq!(back.notes, []);
 }
 
 #[test]
