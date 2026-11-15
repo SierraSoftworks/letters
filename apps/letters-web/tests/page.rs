@@ -318,10 +318,15 @@ fn only_a_document_with_maths_has_its_first_frame_wait_for_the_maths_faces() {
             if maths { letters_math::FONT_FILES.len() } else { 0 },
             "{name}"
         );
+        // The engine that sets them is asked for with them, as a module and its wasm.
+        let engine = ["<link rel=\"modulepreload\" href=\"/static/maths.js\"", "href=\"/static/maths_bg.wasm\""];
+        for file in engine {
+            assert_eq!(preloads.contains(file), maths, "{name}: {file}");
+        }
         // Besides them it waits for one font, and for nothing else.
         assert_eq!(preloads.matches("href=\"/static/fonts/").count(), 1, "{name}");
-        assert_eq!(preloads.matches("<link rel=\"preload\"").count(), preloads.matches("href=").count(), "{name}");
-        assert_eq!(preloads.matches("href=").count(), 1 + preloads.matches("/maths/").count(), "{name}");
+        let asked = 1 + if maths { engine.len() + letters_math::FONT_FILES.len() } else { 0 };
+        assert_eq!(preloads.matches("href=").count(), asked, "{name}");
         let page = page::compose("<head><!--letters:preload--></head>", &preloads, "", "{}");
         assert_eq!(page, format!("<head>{preloads}</head>"), "{name}");
     }

@@ -1,5 +1,5 @@
-// What the first frame does without: every font but the first, the dictionaries, and the maths faces of a
-// document that has no maths.
+// What the first frame does without: every font but the first, the dictionaries, and the maths engine and
+// faces of a document that has no maths.
 
 import { expect, test } from "@playwright/test";
 
@@ -87,18 +87,90 @@ test("the first frame does not wait for dictionaries, and misspellings are marke
   await expect.poll(async () => (await texts(page)).at(-1)).toMatch(/^The (?!quik)qu\w+ $/);
 });
 
-test("a document with maths is not shown before its maths faces are here", async ({ page }) => {
-  // The page as a server would send it for a document that holds a formula.
-  const formula = { format: 1, language: "en", blocks: [{ id: "f1", type: "formula", content: [{ text: "x^2" }] }] };
-  await carrying(page, formula);
-  const arrive = await held(page, /\/maths\//);
-  const asked = page.waitForRequest(/\/maths\/KaTeX_Main-Regular\.ttf$/);
+/** A document that holds a formula in a line of text. */
+const MATHS = { format: 1, language: "en", blocks: [{ id: "p1", type: "paragraph", content: [{ text: "Mass, " }, { text: "\\frac{a}{b}", marks: ["math"] }] }] };
+/** The canvas as it is once it rests, with no caret on it. */
+const shown = async (page) => {
+  await page.locator("textarea").blur();
+  await rested(page);
+  return page.evaluate(() => document.querySelector("canvas").toDataURL());
+};
+/** The addresses the page asks for from here on, without what follows a `?`. */
+const requests = (page) => {
+  const asked = [];
+  page.on("request", (request) => asked.push(new URL(request.url()).pathname));
+  return asked;
+};
+
+for (const [what, files] of [["maths faces are", /\/maths\//], ["maths engine is", /\/maths(\.js|_bg\.wasm)/]]) {
+  test(`a document with maths is not shown before its ${what} here`, async ({ page }) => {
+    // The page as a server would send it for a document that holds a formula.
+    const formula = { format: 1, language: "en", blocks: [{ id: "f1", type: "formula", content: [{ text: "x^2" }] }] };
+    await carrying(page, formula);
+    const arrive = await held(page, files);
+    const asked = page.waitForRequest(files);
+    await page.goto("/");
+    await asked;
+    await page.waitForTimeout(300);
+    expect(await page.evaluate(() => window.letters.frames)).toBeUndefined();
+
+    arrive();
+    await painted(page);
+    expect(await page.evaluate(() => window.letters.maths)).toBe(true);
+    expect(await page.evaluate(() => JSON.parse(window.letters.json()).blocks.map((block) => block.type))).toEqual(["formula"]);
+  });
+}
+
+test("a document with no maths fetches no engine, and its first formula shows as written until the engine has come", async ({ page }) => {
+  const asked = requests(page);
+  const arrive = await held(page, /\/maths\.js/);
   await page.goto("/");
-  await asked;
-  await page.waitForTimeout(300);
-  expect(await page.evaluate(() => window.letters.frames)).toBeUndefined();
+  await page.waitForFunction(() => window.letters?.frames > 0 && window.letters.fonts && window.letters.spelling);
+  await rested(page);
+  expect(asked.filter((path) => /\/maths(\.js|_bg\.wasm)$/.test(path))).toEqual([]);
+  expect(await page.evaluate(() => window.letters.maths)).toBe(false);
+
+  await page.evaluate((json) => window.letters.open(json), JSON.stringify(MATHS));
+  await expect.poll(() => asked.filter((path) => path.endsWith("/maths.js")).length).toBe(1);
+  const written = await shown(page);
 
   arrive();
+  await page.waitForFunction(() => window.letters.maths);
+  const set = await shown(page);
+  expect(set).not.toBe(written);
+  expect(asked.filter((path) => path.endsWith("/maths.js")).length).toBe(1);
+
+  // It is the formula a page shows that had the engine from the start.
+  const other = await page.context().newPage();
+  await carrying(other, MATHS);
+  await other.goto("/");
+  await other.waitForFunction(() => window.letters?.frames > 0 && window.letters.fonts && window.letters.spelling);
+  expect(await other.evaluate(() => window.letters.maths)).toBe(true);
+  expect(await shown(other)).toBe(set);
+});
+
+test("an engine that cannot be fetched leaves the formula as written, and is asked for again after a while", async ({ page }) => {
+  const asked = requests(page);
+  await page.route("**/maths.js", (route) => route.abort());
+  await page.goto("/");
   await painted(page);
-  expect(await page.evaluate(() => JSON.parse(window.letters.json()).blocks.map((block) => block.type))).toEqual(["formula"]);
+  await page.evaluate((json) => window.letters.open(json), JSON.stringify(MATHS));
+  await expect.poll(() => asked.filter((path) => path.endsWith("/maths.js")).length).toBe(1);
+  const written = await shown(page);
+  expect(await page.evaluate(() => window.letters.maths)).toBe(false);
+
+  // The page is written on as before. Not every key asks again: the next try waits some seconds, and
+  // then for the formula's text to be set again.
+  await page.mouse.click(400, 300);
+  await page.keyboard.press("ControlOrMeta+Home");
+  await page.keyboard.type("Of ");
+  await expect.poll(async () => (await texts(page))[0]).toMatch(/^Of Mass, /);
+  await rested(page);
+  expect(asked.filter((path) => path.endsWith("/maths.js")).length).toBe(1);
+  await page.unroute("**/maths.js");
+  await page.waitForTimeout(5200);
+  await page.keyboard.type("all ");
+  await page.waitForFunction(() => window.letters.maths);
+  expect(await shown(page)).not.toBe(written);
+  expect((await texts(page))[0]).toMatch(/^Of all Mass, /);
 });

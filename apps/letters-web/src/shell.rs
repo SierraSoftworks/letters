@@ -41,6 +41,7 @@ use web_sys::{
 use crate::browser::{self, Browser};
 use crate::faces::{self, Face};
 use crate::input::{Around, Clipboard, Dom, Finger, Gesture, Held, Reply, TextInput, Touch, modifiers};
+use crate::maths;
 use crate::mirror::{Act, Mirror, Page};
 use crate::page;
 
@@ -142,6 +143,11 @@ pub struct Shell {
     base: String,
     /// The exports, once the person has printed or saved a copy: a module of its own, fetched then.
     exporter: Option<Promise>,
+    /// Whether the maths engine has been asked for and is on its way.
+    engine_coming: bool,
+    /// How often it could not be fetched, and when it last could not: it is asked for again only after a
+    /// while, however often a formula asks for it.
+    engine_lost: (u32, u64),
     /// How often the exports could not be fetched.
     refetches: u32,
     /// The files asked for because a document needed them, and how far each has come.
@@ -373,6 +379,8 @@ impl Shell {
                 me: shell.clone(),
                 base: later.base.clone(),
                 exporter: None,
+                engine_coming: false,
+                engine_lost: (0, 0),
                 refetches: 0,
                 extras: Vec::new(),
                 handed: Vec::new(),
@@ -623,6 +631,8 @@ impl Shell {
                 Ok(files) => letters_fonts::provide(files),
                 Err(error) => return web_sys::console::error_1(&error),
             }
+            // The engine draws the letters the maths faces lack in the first font, which may be whole only now.
+            maths::rebody();
             let Some(shell) = shell.upgrade() else { return };
             let mut shell = shell.borrow_mut();
             shell.view.add_fonts(letters_fonts::bundled());
@@ -924,6 +934,34 @@ impl Shell {
         self.uncovered.retain(|_| waits.next() == Some(true));
         let lacking: Vec<Extra> = faces::lacking(&chosen, &asked).into_iter().map(Extra::Face).collect();
         self.fetch_extras(&lacking);
+    }
+
+    /// Fetches the maths engine once the window asked for a formula and there was none to set it. Until it
+    /// comes a formula shows as its source, and all of them are set together when it does.
+    fn want_engine(&mut self) {
+        if !letters_math::take_pending() || self.engine_coming || maths::here() {
+            return;
+        }
+        let (tries, lost) = self.engine_lost;
+        if tries > 0 && self.platform.now_ms() < lost + ENGINE_AGAIN_MS {
+            return;
+        }
+        self.engine_coming = true;
+        let (shell, window, base) = (self.me.clone(), self.window.clone(), self.base.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let fetched = engine(&window, &base, tries, None).await;
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            shell.engine_coming = false;
+            match fetched {
+                Ok(()) => drop(shell.view.maths_arrived()),
+                Err(error) => {
+                    web_sys::console::error_1(&error);
+                    shell.engine_lost = (tries + 1, shell.platform.now_ms());
+                }
+            }
+            shell.arrived();
+        });
     }
 
     /// Fetches the files among `extras` that were never asked for. One that arrives is the window's from
@@ -1367,6 +1405,7 @@ impl Shell {
         self.keep_up();
         self.go();
         self.cover();
+        self.want_engine();
         if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
             self.frame_due = self.window.request_animation_frame(&self.on_frame).is_ok();
         }
@@ -2758,6 +2797,25 @@ fn keep(page: &web_sys::Document, url: &str, name: &str) -> Result<(), JsValue> 
 fn said(error: &JsValue) -> String {
     let message = error.dyn_ref::<js_sys::Error>().map(|error| String::from(error.message()));
     message.or_else(|| error.as_string()).unwrap_or_else(|| "it failed without saying why".to_owned())
+}
+
+/// How long the maths engine is not asked for again after it could not be fetched, in milliseconds.
+const ENGINE_AGAIN_MS: u64 = 5_000;
+
+/// Fetches the maths engine, a module of its own, and its faces, and has it set the editor's formulas. A
+/// page whose document holds maths preloads both, so its first frame waits for little more than the
+/// faces alone. `tries` is how often it could not be fetched before, and `faces` are the maths faces where
+/// the caller has them already.
+pub async fn engine(window: &Window, base: &str, tries: u32, faces: Option<Vec<Vec<u8>>>) -> Result<(), JsValue> {
+    // A browser remembers a module it could not fetch, so another try asks under another address.
+    let again = Some(tries).filter(|tries| *tries > 0).map(|tries| format!("?again={tries}"));
+    let module = format!("{base}maths.js{}", again.unwrap_or_default());
+    let module = Url::new_with_base(&module, &window.location().href()?)?;
+    let faces = match faces {
+        Some(faces) => faces,
+        None => browser::files(window, &urls(base, "maths", &letters_math::FONT_FILES)).await?,
+    };
+    maths::provide(load(&module.href()).await?, faces)
 }
 
 /// Calls a function that a module exports.
