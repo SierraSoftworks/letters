@@ -2142,3 +2142,49 @@ fn the_insert_menu_stays_away_where_a_slash_is_only_a_slash() {
     window.type_text("/").key("Left").key("Right");
     window.assert_closed(Role::ListBox, "Insert");
 }
+
+/// A paragraph `p1`, a figure `g` with a caption, and a paragraph `p2`.
+fn pictured() -> Harness {
+    let figure = BlockKind::Figure {
+        asset: None,
+        src: Some("https://example.com/roof.png".into()),
+        alt: "A slate roof".into(),
+        width: 300.0,
+        height: 150.0,
+        numbered: false,
+    };
+    let blocks = vec![
+        text("p1", BlockKind::Paragraph, "The roof today:"),
+        text("g", figure, "Seen from the garden"),
+        text("p2", BlockKind::Paragraph, "Reply by Friday."),
+    ];
+    Harness::open(Document { blocks, ..Document::default() })
+}
+
+/// The outlines the page draws round a point.
+fn rings(window: &mut Harness, at: Point) -> usize {
+    let round = |item: &Item| matches!(item, Item::Stroke { rect, .. } if rect.contains(at));
+    window.paint().items.iter().filter(|item| round(item)).count()
+}
+
+#[test]
+fn a_press_on_a_picture_selects_its_figure_and_one_on_its_caption_writes_there() {
+    let mut window = pictured();
+    let caption = spot(&mut window, "g", 4);
+    // The picture is above its caption, across the middle of the page.
+    let page = page(&mut window);
+    let picture = Point { x: page.x + page.width / 2.0, y: caption.y - 40.0 };
+    let before = rings(&mut window, picture);
+
+    window.click_at(picture);
+    assert_eq!(window.editor().picture().map(|figure| figure.as_str()), Some("g"));
+    assert_eq!(rings(&mut window, picture), before + 1, "the picture has a ring round it");
+    assert_eq!(window.ui().caret_rect(), None, "and no caret blinks in the text");
+    window.type_text("x");
+    assert_eq!(block_text(&window, "g"), "Seen from the garden", "what is typed on a picture goes nowhere");
+
+    window.click_at(Point { x: caption.x, y: caption.y + caption.height / 2.0 });
+    assert_eq!(window.editor().picture(), None);
+    assert_eq!(head(&window), Pos::new("g", 4));
+    assert_eq!(rings(&mut window, picture), before, "the ring goes with the selection");
+}

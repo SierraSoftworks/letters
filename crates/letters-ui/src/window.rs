@@ -45,6 +45,8 @@ const TOP: f32 = 48.0;
 /// Points to logical pixels.
 pub(crate) const PT: f32 = 96.0 / 72.0;
 pub(crate) const CARET_WIDTH: f32 = 1.5;
+/// How far outside a selected picture its ring is drawn.
+const RING: f32 = 3.0;
 /// How much text one idle step lays out, in bytes. Small enough to fit between two frames.
 const SETTLE_BYTES: usize = 4096;
 
@@ -742,6 +744,14 @@ impl EditorApp {
                     return self.edit(platform, |editor, platform| editor.run(Command::LineBelow, platform));
                 }
                 let Some(head) = self.hit(at) else { return };
+                // A press on a picture selects its figure. The caption under it is text like any other.
+                let on_page = Point { x: at.x - self.column.0, y: at.y + self.scrolled() - TOP };
+                let pictured = self.layout.figure(&head.block).is_some_and(|figure| figure.image.contains(on_page));
+                if pictured && !mods.shift {
+                    self.editor.select_picture(&head.block);
+                    self.dragging = false;
+                    return self.reveal();
+                }
                 let anchor = match self.editor.selection() {
                     Some(selection) if mods.shift => selection.anchor.clone(),
                     _ => head.clone(),
@@ -932,7 +942,16 @@ impl EditorApp {
             None => {}
         }
 
-        let caret = selection.filter(|_| sheet.is_none()).and_then(|selection| self.layout.caret(&selection.head));
+        // A figure that is selected has a ring round its picture, and a selected picture is where the caret is.
+        let ring = resolve(tokens::ACCENT, self.scheme, 1.0);
+        let pictures = self.editor.figures().into_iter().filter_map(|figure| self.layout.figure(&figure));
+        list.items.extend(pictures.map(|figure| {
+            let image = figure.image;
+            let rect = Rect::new(image.x - RING, image.y - RING, image.width + 2.0 * RING, image.height + 2.0 * RING);
+            Item::Stroke { rect, color: ring, width: 2.0, radius: 2.0 }
+        }));
+        let written = sheet.is_none() && self.editor.picture().is_none();
+        let caret = selection.filter(|_| written).and_then(|selection| self.layout.caret(&selection.head));
         let caret =
             caret.map(|caret| Rect { x: origin.x + caret.x, y: origin.y + caret.y, width: CARET_WIDTH, ..caret });
         let paint = PagePaint {
