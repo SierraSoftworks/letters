@@ -208,6 +208,26 @@ fn devices_that_find_the_same_clash_apart_settle_it_alike() {
 }
 
 #[test]
+fn edits_that_arrive_without_their_file_settle_as_two_files_do() {
+    // The same clash twice: met through a file, and through the edits alone.
+    let (_, mut by_file, mut laptop) = clashing();
+    let mut his = Folder::default();
+    save_from(&mut his, &mut laptop, "laptop");
+    by_file.merge_from(&mut open(&his.files[NAME])).unwrap();
+
+    let (_, mut by_edits, laptop) = clashing();
+    let (ours, theirs) = (by_edits.model().revision(), laptop.model().revision());
+    by_edits.edit(&laptop.model().save()).unwrap();
+    assert!(clashes(&by_edits).is_empty(), "edits alone merge without a word");
+    by_edits.settle(&ours, &theirs).unwrap();
+
+    assert_eq!(clashes(&by_edits), [[wrote("Ana", "Hello worlds"), wrote("Ben", "Hello underworld")]]);
+    assert_eq!(text(by_edits.model().doc()), "Hello underworld");
+    assert_eq!(by_edits.notes, by_file.notes);
+    assert!(level(&by_edits, &by_file), "each wrote the same change to settle it");
+}
+
+#[test]
 fn a_block_that_clashes_again_keeps_only_the_newer_note_open() {
     let (mut folder, mut desk, mut laptop) = clashing();
     in_turn(&mut folder, &mut desk, &mut laptop, 3);

@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::mem;
 
 use letters_format::{ASSETS, Error, Files, Journal, Save, Saved, Stamp, WorkingCopy, hash};
-use letters_model::{Extent, Notes, Style};
+use letters_model::{Extent, Notes, Revision, Style};
 
 use crate::access::{Access, Refusal, Role, comments};
 use crate::presence::{Passage, Peer};
@@ -50,6 +50,9 @@ struct Session {
     greeted: bool,
     heard: u64,
     selection: Option<Passage>,
+    /// Where the device's copy stood at its hello, while that copy and the room each hold edits the
+    /// other lacks: the device wrote while it was away. Its first edits settle against it.
+    apart: Option<Revision>,
 }
 
 /// One open document on the server.
@@ -125,7 +128,7 @@ impl Room {
         let taken = |colour: &u8| self.sessions.values().any(|session| session.colour == *colour);
         // The first colour nobody here has, so that few people look as different as the window can make them.
         let colour = (0..=u8::MAX).find(|colour| !taken(colour)).unwrap_or(self.last as u8);
-        let session = Session { access, colour, greeted: false, heard: now, selection: None };
+        let session = Session { access, colour, greeted: false, heard: now, selection: None, apart: None };
         self.sessions.insert(SessionId(self.last), session);
         SessionId(self.last)
     }
@@ -391,6 +394,7 @@ impl Room {
             return self.end(session, why);
         }
         let holds = matches!(hello.extent.partial_cmp(&held), Some(Ordering::Greater | Ordering::Equal));
+        let welcomed = held.clone();
         let peer = |(id, session): (&SessionId, &Session)| {
             let Session { access, colour, selection, .. } = session;
             Peer { session: *id, name: access.name.clone(), colour: *colour, selection: selection.clone() }
@@ -414,7 +418,9 @@ impl Room {
             return self.end(session, Refusal::TooLarge);
         }
         self.pass_on(None, &joined);
-        self.sessions.get_mut(&session).expect("it was just read").greeted = true;
+        let greeted = self.sessions.get_mut(&session).expect("it was just read");
+        greeted.greeted = true;
+        greeted.apart = hello.revision.filter(|_| hello.extent.partial_cmp(&welcomed).is_none());
         self.out.push_back(Outbound::Send(session, frame));
         false
     }
@@ -427,13 +433,29 @@ impl Room {
         state: &mut impl Files,
         now: u64,
     ) -> Result<bool, Error> {
-        let before = self.copy.model().extent();
+        let before = (self.copy.model().extent(), self.copy.model().revision());
         let read = self.copy.edit(updates).is_ok();
         // Edits that build on others the room never saw wait outside the document, and are not held.
         let reaches = |reach: Extent| self.copy.model().extent().partial_cmp(&reach);
         let whole = read && matches!(Extent::of(updates).map(reaches), Ok(Some(Ordering::Greater | Ordering::Equal)));
+        let apart = self.sessions.get_mut(&session).and_then(|session| session.apart.take()).filter(|_| whole);
+        let met = (self.copy.model().extent(), apart.is_some().then(|| self.copy.notes.clone()));
+        if let Some(theirs) = &apart {
+            // What the device wrote while it was away meets what was written here as two files meet. A
+            // revision the edits did not bring is one the device made up, and settles nothing.
+            let _ = self.copy.settle(&before.1, theirs);
+        }
         // What the document gained is what is kept and passed on, whatever was sent.
-        let kept = self.keep_edits(Some(session), &before, state, now);
+        let mut kept = self.keep_edits(Some(session), &before.0, state, now);
+        if self.copy.model().extent() != met.0 {
+            // The room wrote the settling, so the device that sent the edits lacks it too.
+            let settled = self.copy.model().updates_for(&met.0);
+            self.to(session, &ServerMessage::Edits { updates: settled });
+        }
+        if let Some(notes) = &met.1 {
+            let raised = self.keep_notes(None, notes, state, now);
+            kept = kept.and_then(|edits| Ok(edits | raised?));
+        }
         if whole && kept.is_ok() {
             self.to(session, &ServerMessage::Held { seq });
         } else if whole {

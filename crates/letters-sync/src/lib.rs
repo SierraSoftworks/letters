@@ -26,10 +26,12 @@
 //!
 //! # What meets
 //!
-//! Edits from sessions meet in the room as the history merges them, character by character, and no one
-//! is asked anything. What another writer put into the file meets them in the room's save, as two files
-//! meet: a word that both changed reads as the later change left it, and a conflict note keeps both for
-//! someone to pick from. The note and the settled text go to every session.
+//! Edits from sessions that are live meet in the room as the history merges them, character by
+//! character, and no one is asked anything. Edits that were written apart meet as two files do: a word
+//! that both sides changed reads as the later change left it, and a conflict note keeps both for someone
+//! to pick from. That is so for what a device wrote while it was away, which the room settles when the
+//! device is back, and for what another writer put into the file, which the room's save settles. The
+//! note and the settled text go to every session.
 //!
 //! Nothing in this crate opens a socket, reads a file or asks the time. The shell and the server's host
 //! bring all three.

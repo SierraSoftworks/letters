@@ -56,8 +56,9 @@ pub enum Event {
     /// Close the socket, and tell the client nothing more of it: what [`Client::closed`] says is about
     /// the socket that is open or asked for now, and the client may ask for the next one at once.
     Close,
-    /// Edits made elsewhere. Merge them into the document as a file's are merged, and then call
-    /// [`Client::changed`].
+    /// Edits made elsewhere. Merge them into the document as they are, with
+    /// [`Model::merge`](letters_model::Model::merge), and then call [`Client::changed`]. Where they met
+    /// what this device wrote while it was away, the server has settled the two and sends that too.
     Merge(Vec<u8>),
     /// Notes that were added or changed elsewhere. Join them into the notes with
     /// [`Notes::merge`](letters_model::Notes::merge), move them to where their text is now with

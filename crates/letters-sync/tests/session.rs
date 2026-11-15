@@ -72,6 +72,8 @@ fn editors_who_type_at_the_same_place_at_the_same_time_agree() {
     assert!(held[0].contains(" there") && held[0].contains(", dear"), "both edits are kept: {held:?}");
     assert_eq!(texts(world.devices[ada].document()), held);
     assert_eq!(texts(world.devices[ben].document()), held);
+    // People who see each other type are asked nothing.
+    assert!(world.room.as_ref().unwrap().copy().notes.notes.is_empty());
 }
 
 #[test]
@@ -111,6 +113,52 @@ fn edits_written_offline_arrive_once_the_device_is_back() {
     assert_eq!(texts(world.devices[ben].document()), expected);
     assert!(world.devices[ada].holds(offline));
     assert_eq!(world.devices[ada].client.progress(), Progress::Saved);
+    assert!(world.room.as_ref().unwrap().copy().notes.notes.is_empty(), "edits to other words merge without a word");
+}
+
+/// The two versions of each conflict the notes hold, as plain text, in order.
+fn conflicts(notes: &Notes) -> Vec<Vec<String>> {
+    let sides = |note: &letters_model::Note| match &note.kind {
+        NoteKind::Conflict { versions } => {
+            let text = |side: &letters_model::Version| side.block.as_ref().map(|block| block.plain_text());
+            let mut sides: Vec<String> = versions.iter().filter_map(text).collect();
+            sides.sort();
+            Some(sides)
+        }
+        _ => None,
+    };
+    notes.notes.iter().filter_map(sides).collect()
+}
+
+#[test]
+fn a_word_changed_offline_and_in_the_room_is_settled_the_same_for_everyone() {
+    let (mut world, ada, ben) = editors();
+    world.cut(ada);
+    world.edit(ada, [typed("q", 2, "yy"), typed("p", 0, "Oh. ")]);
+    world.edit(ben, [typed("q", 3, "XX")]);
+    world.settle();
+    world.mend(ada);
+    world.advance(5_000);
+
+    // One of the two shows whole, a note keeps both, and what touched no word of the other's merged.
+    let held = world.room.as_ref().unwrap().copy();
+    let shown = texts(held.model().doc());
+    assert_eq!(conflicts(&held.notes), [["SecXXond", "Seyycond"]]);
+    assert!(["SecXXond", "Seyycond"].contains(&shown[1].as_str()), "{shown:?}");
+    assert_eq!(shown[0], "Oh. Hello world");
+    for device in [ada, ben] {
+        let device = &world.devices[device];
+        assert_eq!(texts(device.document()), shown, "{}", device.name);
+        assert_eq!(device.notes, held.notes, "{}", device.name);
+        assert_eq!(device.client.progress(), Progress::Saved, "{}", device.name);
+    }
+
+    // Nothing raises it again: not the next socket, and not the file.
+    world.cut(ada);
+    world.mend(ada);
+    world.advance(SAVE_WITHIN);
+    assert_eq!(conflicts(&world.room.as_ref().unwrap().copy().notes).len(), 1);
+    assert_eq!(conflicts(&world.folder.read_document(NAME).1).len(), 1);
 }
 
 #[test]
