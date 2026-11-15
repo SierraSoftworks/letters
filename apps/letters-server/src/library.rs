@@ -292,9 +292,11 @@ impl Library {
         let (folder, name) = place.split();
         let mut folder = root.folder(&folder)?;
         let mut ours = Archive::open(BufReader::new(folder.open(name)?))?;
-        let mut copy = WorkingCopy::open(&mut ours, ReplicaId::new(&ids::block_id()))?;
+        // Neither file is the server's own writing: a wary copy checks both histories before it loads them.
+        let mut copy = WorkingCopy::open_wary(&mut ours, ReplicaId::new(&ids::block_id()))?;
         copy.merge_from(theirs).map_err(|error| match error {
             letters_format::Error::Unmerged => Refusal::invalid("That file shares nothing with the document."),
+            letters_format::Error::History(_) => Refusal::invalid("That file's history cannot be merged."),
             error => error.into(),
         })?;
         let (token, day) = (ids::block_id(), ids::rfc3339(now));
@@ -426,8 +428,9 @@ fn read(folder: &Folder, listed: &Listed) -> Known {
     let Ok(mut archive) = Archive::open(BufReader::new(file)) else { return damaged };
     let manifest = archive.manifest();
     let (id, created) = (Some(manifest.id.clone()), Some(manifest.created.clone()));
-    // Who wrote it is in the history. The replica only reads, so any id will do for it.
-    let history = archive.read(OPLOG).ok().flatten();
+    // Who wrote it is in the history, which is checked first: a folder holds whatever was put there. The
+    // replica only reads, so any id will do for it.
+    let history = archive.read(OPLOG).ok().flatten().filter(|history| Model::check(history).is_ok());
     let model = history.and_then(|history| Model::load(&history, ReplicaId::from(0)).ok());
     let contributors = model.map(|model| model.authors().into_iter().filter(|name| !name.is_empty()).collect());
     let open = |notes: letters_model::Notes| {

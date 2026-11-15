@@ -569,8 +569,9 @@ impl Hosted {
         // How the file looks before it is read: the room reads it again only once a writer has changed it.
         let stamp = Files::stamp(&mut folder, name).ok().flatten();
         let mut archive = Archive::open(BufReader::new(folder.open(name)?))?;
-        // A replica of this room's own: what it settles between two devices is written under it.
-        let copy = WorkingCopy::open(&mut archive, ReplicaId::new(&ids::block_id()))?;
+        // A replica of this room's own: what it settles between two devices is written under it. Any
+        // writer of the folder may have left the file, so its history is checked before it is loaded.
+        let copy = WorkingCopy::open_wary(&mut archive, ReplicaId::new(&ids::block_id()))?;
         let journal = journal.or_else(|| rooms.adopt(&copy.id)).unwrap_or_else(ids::block_id);
         let unavailable = || Refusal::new(Code::Unavailable, "The server cannot keep what is written just now.");
         let mut state = rooms.journals(&journal).ok_or_else(unavailable)?;

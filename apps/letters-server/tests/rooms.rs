@@ -10,12 +10,15 @@ use axum::http::{Method, StatusCode};
 use common::desk::{Desk, settle};
 use common::{Client, Server, texts};
 use letters_api::{Code, Entry, Listing, Move, NewFolder, Rename, Tag, paths};
-use letters_format::{Archive, MIMETYPE, WorkingCopy, hash};
+use letters_format::{Archive, MIMETYPE, OPLOG, WorkingCopy, hash};
 use letters_model::{Block, BlockKind, Op, Pos, ReplicaId};
 use letters_sync::{Link, Refusal, Role};
 
 /// A smallest PNG, by its first bytes.
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n and the rest";
+
+/// A history with a sound checksum that Loro panics on, from the fuzzer's findings.
+const HARMFUL: &[u8] = include_bytes!("../../../fuzz/corpus/history/a-history-loro-panics-on.bin");
 
 /// A server with the document "Plan" in the family's space, the person who made it, and its id.
 async fn shared(name: &str) -> (Server, Client, String) {
@@ -227,6 +230,42 @@ async fn a_device_hands_its_whole_file_over_and_nothing_is_replaced() {
     let text = desk.texts().join("\n");
     assert!(text.contains("Written away.") && text.contains("Written here."), "whoever has it open is told: {text}");
     assert_eq!(on_file(&ada, &id).await, text);
+}
+
+#[tokio::test]
+async fn a_file_whose_history_would_harm_is_never_merged_and_opens_without_it() {
+    let (server, ada, id) = shared("harmful").await;
+    let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
+    desk.write("Kept. ");
+    settle([&mut desk]).await;
+    // A file as a stranger writes it: every hash sound, and a history that Loro panics on.
+    let harmful = |file: Vec<u8>| {
+        let mut package = Archive::open(Cursor::new(file)).unwrap().package().unwrap();
+        package.entries.insert(OPLOG.into(), HARMFUL.to_vec());
+        let mut bytes = Cursor::new(Vec::new());
+        letters_format::write(&mut bytes, &package).unwrap();
+        bytes.into_inner()
+    };
+
+    // Handed over to be merged into the document, it is refused, and the document is as it was.
+    let was = ada.send(Method::GET, &paths::file(&id), "", Vec::new()).await.body;
+    let handed = ada.send(Method::PUT, &paths::file(&id), MIMETYPE, harmful(was)).await;
+    assert_eq!(handed.status, StatusCode::BAD_REQUEST);
+    settle([&mut desk]).await;
+    assert!(on_file(&ada, &id).await.contains("Kept."));
+    assert_eq!(desk.line.link(), Link::Live(Role::Editor), "its room goes on");
+
+    // Left in the folder by another writer, it is listed like any file, and opens with its text.
+    let other = ada.start("family", "", "Other").await.id.unwrap();
+    let file = ada.send(Method::GET, &paths::file(&other), "", Vec::new()).await.body;
+    std::fs::write(server.scratch.0.join("family/Other.let"), harmful(file)).unwrap();
+    let listing: Listing = ada.get(&paths::entries("family", "")).await.expect("the folder lists");
+    assert_eq!(listing.entries.len(), 2);
+    let mut opened = Desk::open(&server, &ada, &other).await.unwrap();
+    settle([&mut opened]).await;
+    opened.write("Written after. ");
+    settle([&mut opened]).await;
+    assert!(on_file(&ada, &other).await.contains("Written after."), "its history starts over");
 }
 
 #[tokio::test]
