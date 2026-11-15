@@ -158,20 +158,27 @@ fn text_set_short_of_its_face_is_set_again_when_the_face_arrives() {
 #[test]
 fn the_whole_of_a_face_takes_the_place_of_the_part_a_page_started_with() {
     const GREEK: &str = "Τιμές";
-    let (part, whole) = (latin(&fonts().faces[0]), first());
+    let whole = first();
+    // A part cut here, and the one letters-fonts keeps for a shell that fetches its fonts.
+    let kept = format!("{}/../letters-fonts/fonts/{}", env!("CARGO_MANIFEST_DIR"), letters_fonts::FIRST);
+    let kept = Font::new(std::fs::read(kept).expect("the part letters-fonts names").into(), 0);
+    let parts =
+        [("a part cut here", latin(&fonts().faces[0])), ("the part letters-fonts keeps", Fonts { faces: vec![kept] })];
     let set_in = |items: &[Item], fonts: &Fonts| {
         let mut runs = glyph_runs(items).peekable();
         runs.peek().is_some()
             && runs.all(|item| matches!(item, Item::Glyphs { font, .. } if font.data.same(&fonts.faces[0].data)))
     };
     // What a paragraph says before the whole face arrives, and whether that is set short of a character.
-    for (name, early, short) in [("Latin first", "Rates", false), ("Greek first", GREEK, true)] {
+    let cases = [("Latin first", "Rates", false), ("Greek first", GREEK, true)];
+    for ((of, part), (first, early, short)) in parts.iter().flat_map(|part| cases.map(|case| (part, case))) {
+        let name = format!("{of}, {first}");
         let mut model = Model::new(doc(vec![paragraph("p", PROSE), paragraph("x", early)]), ReplicaId::from(1));
         let mut layout = DocLayout::new(part.clone());
         layout.update(model.doc(), &Style::default(), WIDTH, None);
         settled(&mut layout);
         let before = painted(&layout, everything());
-        assert!(set_in(&before, &part), "{name}: the page starts in the part");
+        assert!(set_in(&before, part), "{name}: the page starts in the part");
         assert_eq!(!layout.take_uncovered().is_empty(), short, "{name}: which lacks only what is not Latin");
 
         assert_eq!(layout.add_fonts(&whole), short, "{name}: only text that was short of a character is set again");
@@ -192,10 +199,10 @@ fn the_whole_of_a_face_takes_the_place_of_the_part_a_page_started_with() {
         assert!(layout.take_uncovered().is_empty(), "{name}: and nothing is told as lacking");
         let line = layout.band(&"x".into()).map(|(top, height)| Rect::new(0.0, top, WIDTH, height)).unwrap();
         assert!(set_in(&painted(&layout, line), &whole), "{name}: the new words are in the whole face");
-        assert!(!layout.add_fonts(&part), "{name}: the part given again changes nothing");
+        assert!(!layout.add_fonts(part), "{name}: the part given again changes nothing");
     }
 
-    let (late, wanted) = (Shaper::new(part), Shaper::new(whole.clone()));
+    let (late, wanted) = (Shaper::new(parts[0].1.clone()), Shaper::new(whole.clone()));
     let font = FontSpec::new(SANS, 14.0);
     assert!(late.shape(GREEK, &font, None) != wanted.shape(GREEK, &font, None), "a shaper lacks them too");
     late.add_fonts(&whole);
