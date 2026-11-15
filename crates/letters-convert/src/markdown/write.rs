@@ -3,7 +3,9 @@
 use std::cmp::Reverse;
 use std::ops::Range;
 
-use letters_model::{Block, BlockKind, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone};
+use letters_model::{
+    Align, Block, BlockKind, BodyShape, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone,
+};
 
 use super::read::{FENCES, front_matter};
 use super::{TAGS, TONES, from_markdown};
@@ -17,6 +19,9 @@ use super::{TAGS, TONES, from_markdown};
 ///   cannot hold is written as a code block in the language `math`, which reads back as a formula, as any
 ///   code block in that language does.
 /// - An empty paragraph is left out, and a list item sits at most one level below the item before it.
+/// - A table's first row always heads it, so a table with no header gets an empty first row, which reads back
+///   as none. A header row with no text in it therefore reads back as no header. Short rows are filled with
+///   empty cells, and a justified column reads back as aligned to the start.
 /// - An unknown block is written as its fallback text. Unknown marks and fields are left out, and so are the
 ///   languages of blocks and runs and the page breaks before blocks, which Markdown has no way to say.
 pub fn to_markdown(doc: &Document) -> String {
@@ -49,11 +54,6 @@ fn properties(properties: &Properties) -> Vec<String> {
     }
 }
 
-/// A table cell, for the reader to keep a table as source.
-pub(crate) fn cell(runs: &[Run]) -> String {
-    text(runs, Context::Cell)
-}
-
 /// One nesting level of the list being written.
 struct Level {
     /// The column of this level's markers.
@@ -65,12 +65,12 @@ struct Level {
 }
 
 /// Writes sibling blocks as lines, with a blank line between blocks and none between the items of a list.
-fn blocks(blocks: &[Block]) -> Vec<String> {
+fn blocks<'a>(blocks: impl IntoIterator<Item = &'a Block>) -> Vec<String> {
     let mut out = Vec::new();
     let mut levels: Vec<Level> = Vec::new();
     // The item before this one, while a list is being written.
     let mut last: Option<&Block> = None;
-    for block in blocks.iter().filter(|block| is_written(block)) {
+    for block in blocks.into_iter().filter(|block| is_written(block)) {
         if let BlockKind::ListItem { list, depth } = block.kind {
             let after_text = last.is_some_and(|last| !last.plain_text().is_empty());
             let (lines, gap) = item(&mut levels, list, depth, block.body.runs(), after_text);
@@ -92,14 +92,17 @@ fn blocks(blocks: &[Block]) -> Vec<String> {
 }
 
 /// Whether a block has a Markdown form. An empty paragraph has none, nor has an unknown block with no fallback.
+/// A table has one as soon as it has a row, since its cells are there to be filled.
 fn is_written(block: &Block) -> bool {
     match block.kind {
         BlockKind::Paragraph | BlockKind::Caption | BlockKind::Figure { .. } | BlockKind::TableCell => {
             !block.plain_text().is_empty()
         }
-        BlockKind::Gallery { .. } | BlockKind::Table { .. } | BlockKind::TableRow => {
-            block.body.blocks().iter().any(is_written)
+        BlockKind::Gallery { .. } => block.body.blocks().iter().any(is_written),
+        BlockKind::Table { .. } => {
+            block.body.blocks().iter().any(|row| row.kind == BlockKind::TableRow || is_written(row))
         }
+        BlockKind::TableRow => true,
         BlockKind::Unknown { .. } => !fallback(block).is_empty(),
         _ => true,
     }
@@ -157,10 +160,13 @@ fn other(block: &Block) -> Vec<String> {
         BlockKind::Quote => quote(None, block.body.blocks()),
         BlockKind::Callout { tone } => quote(Some(*tone), block.body.blocks()),
         BlockKind::Divider => vec!["---".to_owned()],
-        // Until Markdown writes pictures and tables, a figure goes out as its caption, a caption and a cell as
-        // paragraphs, and what a gallery or a table holds in order.
+        BlockKind::Table { columns, header } => table(columns, *header, block.body.blocks()),
+        // A merge can leave a row outside a table and a cell outside a row.
+        BlockKind::TableRow => table(&[], false, std::slice::from_ref(block)),
+        // Until Markdown writes pictures, a figure goes out as its caption, a caption as a paragraph, and what a
+        // gallery holds in order.
         BlockKind::Caption | BlockKind::Figure { .. } | BlockKind::TableCell => lines(&text(runs, Context::Lines)),
-        BlockKind::Gallery { .. } | BlockKind::Table { .. } | BlockKind::TableRow => blocks(block.body.blocks()),
+        BlockKind::Gallery { .. } => blocks(block.body.blocks()),
         BlockKind::Unknown { .. } => lines(&text(&[Run::plain(fallback(block))], Context::Lines)),
         // A list item is written by `item`, which knows the list around it.
         BlockKind::ListItem { .. } => Vec::new(),
@@ -214,6 +220,42 @@ fn quote(tone: Option<Tone>, children: &[Block]) -> Vec<String> {
         out.push(String::new());
     }
     out.into_iter().map(|line| if line.is_empty() { ">".to_owned() } else { format!("> {line}") }).collect()
+}
+
+/// Writes a table as GFM has them: a line to a row, with a rule under the first that aligns the columns. The
+/// first row heads the table there, so a table with no header is given a row of empty cells for one. A row
+/// that is short of cells is filled up. What a table holds that is not a row is written after it.
+fn table(columns: &[Align], header: bool, children: &[Block]) -> Vec<String> {
+    let is_row = |child: &&Block| child.kind == BlockKind::TableRow;
+    let cell = |cell: &Block| match cell.kind {
+        BlockKind::Unknown { .. } => text(&[Run::plain(fallback(cell))], Context::Cell),
+        _ => text(cell.body.runs(), Context::Cell),
+    };
+    let mut rows: Vec<Vec<String>> =
+        children.iter().filter(is_row).map(|row| row.body.blocks().iter().map(cell).collect()).collect();
+    let mut out = Vec::new();
+    if !rows.is_empty() {
+        let width = rows.iter().map(Vec::len).chain([columns.len()]).max().unwrap_or(0).max(1);
+        let rule = |column: usize| match columns.get(column) {
+            Some(Align::Center) => ":-:",
+            Some(Align::End) => "--:",
+            _ => "---",
+        };
+        if !header {
+            rows.insert(0, Vec::new());
+        }
+        rows.insert(1, (0..width).map(|column| rule(column).to_owned()).collect());
+        for mut row in rows {
+            row.resize(width, String::new());
+            out.push(format!("| {} |", row.join(" | ")));
+        }
+    }
+    let rest = blocks(children.iter().filter(|child| !is_row(child)));
+    if !out.is_empty() && !rest.is_empty() {
+        out.push(String::new());
+    }
+    out.extend(rest);
+    out
 }
 
 fn longest_run(text: &str, of: char) -> usize {
@@ -371,10 +413,18 @@ impl<'a> Inline<'a> {
                 ..Run::default()
             })
             .collect();
-        // A heading stands in for a cell: both are one line of text.
-        let source = if context == Context::Lines { written.to_owned() } else { format!("# {written}") };
+        let source = match context {
+            Context::Lines => written.to_owned(),
+            Context::Heading => format!("# {written}"),
+            Context::Cell => format!("| {written} |\n| --- |"),
+        };
         let (doc, _) = from_markdown(&source, &mut String::new);
-        matches!(doc.blocks.as_slice(), [block] if block.body.runs() == runs)
+        let read = match (context, doc.blocks.as_slice()) {
+            (Context::Cell, [table]) => table.body.blocks().first().and_then(|row| row.body.blocks().first()),
+            (_, [block]) => Some(block),
+            _ => None,
+        };
+        read.is_some_and(|block| block.kind.shape() == BodyShape::Text && block.body.runs() == runs)
     }
 
     /// Writes the text. With `tags`, emphasis is written as HTML, which reads back whatever sits beside it.

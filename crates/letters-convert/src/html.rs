@@ -129,11 +129,12 @@ fn blocks(blocks: &[Block], assets: Assets, out: &mut String) {
                     Figure { asset: asset.as_deref(), src: src.as_deref(), alt, width: *width, height: *height };
                 figure(&image, block.body.runs(), assets, out);
             }
-            // Until galleries and tables are written as such, what they hold is written in order.
+            BlockKind::Table { columns, header } => table(columns, *header, block.body.blocks(), assets, out),
+            // A merge can leave a row outside a table and a cell outside a row.
+            BlockKind::TableRow => table(&[], false, std::slice::from_ref(block), assets, out),
+            // Until galleries are written as such, what they hold is written in order.
             BlockKind::Caption | BlockKind::TableCell => element("p", block.body.runs(), out),
-            BlockKind::Gallery { .. } | BlockKind::Table { .. } | BlockKind::TableRow => {
-                self::blocks(block.body.blocks(), assets, out);
-            }
+            BlockKind::Gallery { .. } => self::blocks(block.body.blocks(), assets, out),
             // A reader that does not build figures yet hands one over as an unknown block, its fields beside it.
             BlockKind::Unknown { type_name } if type_name == "figure" => {
                 let field = |name: &str| block.extra.get(name);
@@ -192,6 +193,43 @@ fn container(open: &str, end: &str, children: &[Block], assets: Assets, out: &mu
         out.push_str("<p><br></p>\n");
     }
     let _ = writeln!(out, "{end}");
+}
+
+/// Writes a table, its first row in a head where that row heads it. A cell says how its column is aligned
+/// where that is not to the start. What the table holds that is not a row is written after it.
+fn table(columns: &[Align], header: bool, children: &[Block], assets: Assets, out: &mut String) {
+    let is_row = |child: &&Block| child.kind == BlockKind::TableRow;
+    let rows: Vec<&Block> = children.iter().filter(is_row).collect();
+    if !rows.is_empty() {
+        out.push_str("<table>\n");
+        let (head, body) = rows.split_at(usize::from(header));
+        for (section, cell, rows) in [("thead", "th", head), ("tbody", "td", body)] {
+            if rows.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "<{section}>");
+            for row in rows {
+                out.push_str("<tr>");
+                for (column, block) in row.body.blocks().iter().enumerate() {
+                    let align = match columns.get(column) {
+                        Some(Align::Center) => " style=\"text-align: center\"",
+                        Some(Align::End) => " style=\"text-align: end\"",
+                        Some(Align::Justify) => " style=\"text-align: justify\"",
+                        Some(Align::Start) | None => "",
+                    };
+                    let _ = write!(out, "<{cell}{align}>");
+                    inline(block.body.runs(), out);
+                    let _ = write!(out, "</{cell}>");
+                }
+                out.push_str("</tr>\n");
+            }
+            let _ = writeln!(out, "</{section}>");
+        }
+        out.push_str("</table>\n");
+    }
+    for other in children.iter().filter(|child| !is_row(child)) {
+        blocks(std::slice::from_ref(other), assets, out);
+    }
 }
 
 /// Closes the innermost lists until `keep` are open.
@@ -451,8 +489,9 @@ fn space_rule(selector: &str, before: f32, after: f32, css: &mut String) {
 }
 
 /// The element types that set text, each with the elements written in it.
-const TYPES: [(&str, &str); 9] = [
+const TYPES: [(&str, &str); 10] = [
     ("body", "p, li"),
+    ("body", "th, td"),
     ("heading1", "h1"),
     ("heading2", "h2"),
     ("heading3", "h3"),
@@ -484,7 +523,7 @@ fn colours(style: &Style, on: &Palette, css: &mut String) {
          li::marker {{ color: {marker}; }}\n\
          li.task > input {{ accent-color: {accent}; }}\n\
          blockquote {{ border-color: {line_strong}; }}\n\
-         hr {{ border-color: {line}; }}\n\
+         hr, th, td {{ border-color: {line}; }}\n\
          a {{ color: {link}; }}\n\
          mark {{ background: {highlight}; }}\n",
         inline_code = color(on.inline_code),
@@ -527,6 +566,7 @@ fn css(style: &Style, dark: Option<&Palette>, css: &mut String) {
     );
 
     type_rule("p, li", &body, false, css);
+    type_rule("th, td", &body, false, css);
     space_rule("p", body.space_before, body.space_after, css);
     for level in 1..=4 {
         let (heading, selector) = (of(&format!("heading{level}")), format!("h{level}"));
@@ -564,7 +604,10 @@ fn css(style: &Style, dark: Option<&Palette>, css: &mut String) {
     );
     let _ = write!(
         css,
-        "figure {{ margin: {after} 0; }}\n\
+        "table {{ margin: {after} 0; border-collapse: collapse; }}\n\
+         th, td {{ padding: 4px 8px; border: 1px solid; vertical-align: top; }}\n\
+         th {{ font-weight: 600; }}\n\
+         figure {{ margin: {after} 0; }}\n\
          figure > * {{ margin: 0; }}\n\
          figure > figcaption {{ margin-top: {between}; }}\n\
          img {{ display: block; max-width: 100%; height: auto; }}\n\

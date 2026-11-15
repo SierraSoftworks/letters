@@ -4,7 +4,7 @@ mod common;
 
 use letters_convert::{ImportNote, from_markdown, to_markdown};
 use letters_model::{
-    Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone,
+    Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone,
 };
 use proptest::prelude::*;
 
@@ -34,21 +34,39 @@ fn item(list: ListKind, depth: u8, text: &str) -> Block {
     with_text(BlockKind::ListItem { list, depth }, vec![Run::plain(text)])
 }
 
+/// A table of rows of cells, each cell holding its text.
+fn table(columns: &[Align], header: bool, rows: &[&[&str]]) -> Block {
+    let cell = |text: &&str| with_text(BlockKind::TableCell, vec![Run::plain(*text)]);
+    let row = |cells: &&[&str]| holding(BlockKind::TableRow, cells.iter().map(cell).collect());
+    holding(BlockKind::Table { columns: columns.to_vec(), header }, rows.iter().map(row).collect())
+}
+
 fn linked(text: &str, url: &str) -> Run {
     Run { link: Some(url.into()), ..Run::plain(text) }
 }
 
-/// A document with what a round trip may change set aside: block ids, emphasis on spaces and code on line breaks.
+/// A document with what a round trip may change set aside: block ids, emphasis on spaces, code on line breaks,
+/// and the cells a table's short rows lack.
 fn settled(doc: &Document) -> Document {
     fn settle_block(block: &Block) -> Block {
-        let body = match &block.body {
+        let mut body = match &block.body {
             Body::Text(runs) if !matches!(block.kind, BlockKind::Code { .. } | BlockKind::Formula) => {
                 Body::Text(settle(runs))
             }
             Body::Blocks(blocks) => Body::Blocks(blocks.iter().map(settle_block).collect()),
             other => other.clone(),
         };
-        Block { id: BlockId::new(""), body, ..block.clone() }
+        let mut kind = block.kind.clone();
+        if let (BlockKind::Table { columns, .. }, Body::Blocks(rows)) = (&mut kind, &mut body) {
+            let width = rows.iter().map(|row| row.body.blocks().len()).chain([columns.len(), 1]).max().unwrap_or(1);
+            columns.resize(width, Align::Start);
+            for row in rows {
+                if let Body::Blocks(cells) = &mut row.body {
+                    cells.resize(width, with_text(BlockKind::TableCell, Vec::new()));
+                }
+            }
+        }
+        Block { id: BlockId::new(""), kind, body, ..block.clone() }
     }
     fn settle(runs: &[Run]) -> Vec<Run> {
         let mut out: Vec<Run> = Vec::new();
@@ -136,6 +154,74 @@ fn reads_maths() {
     ];
     for (markdown, expected) in cases {
         assert_eq!(outline(&read(markdown).0), *expected, "reading {markdown:?}");
+    }
+}
+
+#[test]
+fn reads_a_table() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "| Year | Rate |\n|:-----|-----:|\n| 2026 | **4 %** |\n| 2027 |",
+            &[
+                "table:start,end headed",
+                "  row",
+                r#"    cell "Year""#,
+                r#"    cell "Rate""#,
+                "  row",
+                r#"    cell "2026""#,
+                r#"    cell "<bold|4 %>""#,
+                "  row",
+                r#"    cell "2027""#,
+                r#"    cell """#,
+            ],
+        ),
+        ("a|b\n:-:|-\n", &["table:center,start headed", "  row", r#"    cell "a""#, r#"    cell "b""#]),
+        // A first row with nothing in it is how Markdown writes a table that has no header.
+        (
+            "|   |   |\n|---|---|\n| 1 | a<br>b \\| c |",
+            &["table:start,start", "  row", r#"    cell "1""#, r#"    cell "a\nb | c""#],
+        ),
+        (
+            "> | a |\n> |---|\n\n- item\n\n  | b |\n  |---|",
+            &[
+                "quote",
+                "  table:start headed",
+                "    row",
+                r#"      cell "a""#,
+                r#"bullet/0 "item""#,
+                "table:start headed",
+                "  row",
+                r#"    cell "b""#,
+            ],
+        ),
+    ];
+    for (markdown, expected) in cases {
+        assert_eq!(outline(&read(markdown).0), *expected, "reading {markdown:?}");
+    }
+}
+
+#[test]
+fn writes_a_table() {
+    let (start, end) = (Align::Start, Align::End);
+    let cases = [
+        (
+            table(&[start, end], true, &[&["Year", "Rate"], &["2026", "4 %"]]),
+            "| Year | Rate |\n| --- | --: |\n| 2026 | 4 % |\n",
+        ),
+        (table(&[Align::Center, Align::Justify], true, &[&["a", "b"]]), "| a | b |\n| :-: | --- |\n"),
+        // Markdown has no table without a header, so an empty one stands in.
+        (table(&[start, start], false, &[&["1", "2"]]), "|  |  |\n| --- | --- |\n| 1 | 2 |\n"),
+        // A row that a merge left short is filled, and one left long widens the table.
+        (table(&[start], true, &[&["a", "b"], &[], &["c"]]), "| a | b |\n| --- | --- |\n|  |  |\n| c |  |\n"),
+        (table(&[start], true, &[&["a|b\nc", " "]]), "| a\\|b<br>c | &#32; |\n| --- | --- |\n"),
+        // A row that a merge left outside its table.
+        (
+            holding(BlockKind::TableRow, vec![with_text(BlockKind::TableCell, vec![Run::plain("a")])]),
+            "|  |\n| --- |\n| a |\n",
+        ),
+    ];
+    for (block, expected) in cases {
+        assert_eq!(to_markdown(&doc(vec![block.clone()])), expected, "writing {block:?}");
     }
 }
 
@@ -290,7 +376,6 @@ fn notes_what_an_import_simplified() {
         ("3. three\n4. four", "started at 3", "three"),
         ("- one\n\n  two", "joined", "one\ntwo"),
         ("- item\n\n  ```\n  code\n  ```", "Moved out of a list item", "code"),
-        ("| a | b |\n|---|--:|\n| 1 | 2 |", "Table", "| 1 | 2 |"),
         ("<div class=\"x\">\nraw\n</div>", "HTML", "<div class=\"x\">"),
         ("text <span>inline</span>", "HTML", "<span>inline</span>"),
         ("# Title $$x^2$$", "Display maths", "x^2"),
@@ -529,6 +614,8 @@ fn round_trips_canonical_markdown_unchanged() {
         "-\n  -\n",
         "- bullets\n\n1. then numbers\n",
         "- not a | table\n  - \\|\n",
+        "Before\n\n| Name | Size |\n| --- | --: |\n| `a\\|b` | $x^2$ |\n| *c* |  |\n\nAfter\n",
+        "> |  |  |\n> | :-: | --- |\n> | no | header |\n",
         "---\ntitle: Notes\n---\n\n# Notes\n\nSo $x^2$ holds:\n\n$$\nx^2 \\ge 0\n$$\n",
         "+++\ntitle = \"Notes\"\n+++\n",
     ];
@@ -656,6 +743,7 @@ fn any_blocks() -> impl Strategy<Value = Vec<Block>> {
         1 => Just(Block::new("", BlockKind::Divider)),
         1 => proptest::option::of(prop_oneof![any_tex(), any_text()])
             .prop_map(|tex| with_text(BlockKind::Formula, tex.into_iter().map(Run::plain).collect())),
+        1 => any_table(),
     ];
     let block = leaf.prop_recursive(3, 16, 4, move |inner| {
         let children = proptest::collection::vec(inner, 0..4);
@@ -665,6 +753,21 @@ fn any_blocks() -> impl Strategy<Value = Vec<Block>> {
         ]
     });
     proptest::collection::vec(block, 0..6).prop_map(nest_items)
+}
+
+/// A table as a merge may leave one: rows of any length under any number of columns. Its first row heads it
+/// only where that row has text, since Markdown writes a table with no header as one with an empty first row.
+fn any_table() -> impl Strategy<Value = Block> {
+    let cell =
+        prop_oneof![3 => any_runs(), 1 => Just(Vec::new())].prop_map(|runs| with_text(BlockKind::TableCell, runs));
+    let row = proptest::collection::vec(cell, 0..4).prop_map(|cells| holding(BlockKind::TableRow, cells));
+    let align = proptest::sample::select(vec![Align::Start, Align::Center, Align::End]);
+    (proptest::collection::vec(align, 0..4), any::<bool>(), proptest::collection::vec(row, 1..4)).prop_map(
+        |(columns, header, rows)| {
+            let headed = rows[0].body.blocks().iter().any(|cell| !cell.plain_text().is_empty());
+            holding(BlockKind::Table { columns, header: header && headed || rows.len() == 1 }, rows)
+        },
+    )
 }
 
 /// Markdown nests a list item under the one before it, so an item goes at most one level deeper than that.

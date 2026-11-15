@@ -4,10 +4,10 @@ use std::collections::BTreeSet;
 use std::mem;
 use std::ops::Range;
 
-use letters_model::{Block, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone};
+use letters_model::{Align, Block, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
-use super::{TAGS, TONES, write};
+use super::{TAGS, TONES};
 use crate::ImportNote;
 
 /// Quotes and lists nested deeper than this are kept as source, which bounds the reader's recursion.
@@ -205,12 +205,7 @@ impl<'a> Reader<'a, '_> {
                 let html = self.raw();
                 self.placeholder("html", html.trim_end_matches('\n'), "HTML kept as a code block", out);
             }
-            Tag::Table(alignments) => {
-                let mut block = self.block(BlockKind::Code { language: Some("markdown".into()) });
-                block.body = Body::Text(vec![Run::plain(self.table(&block, &alignments))]);
-                self.note(&block, "Table kept as Markdown in a code block");
-                out.push(block);
-            }
+            Tag::Table(alignments) => out.push(self.table(&alignments)),
             Tag::FootnoteDefinition(label) => {
                 self.depth += 1;
                 let mut inner = self.blocks();
@@ -341,14 +336,21 @@ impl<'a> Reader<'a, '_> {
         }
     }
 
-    /// Reads a table back into Markdown, since the document has no tables yet.
-    fn table(&mut self, block: &Block, alignments: &[Alignment]) -> String {
-        let mut rows: Vec<Vec<String>> = Vec::new();
+    /// Reads a table. Markdown always gives one a first row that heads it, so a first row with no text in it,
+    /// above other rows, is how a table with no header is written.
+    fn table(&mut self, alignments: &[Alignment]) -> Block {
+        let align = |alignment: &Alignment| match alignment {
+            Alignment::None | Alignment::Left => Align::Start,
+            Alignment::Center => Align::Center,
+            Alignment::Right => Align::End,
+        };
+        let mut rows: Vec<Vec<Block>> = Vec::new();
         while let Some((event, _)) = self.next() {
             match event {
                 Event::Start(Tag::TableHead | Tag::TableRow) => rows.push(Vec::new()),
                 Event::Start(Tag::TableCell) => {
-                    let cell = write::cell(&self.line(block));
+                    let mut cell = self.block(BlockKind::TableCell);
+                    cell.body = Body::Text(self.line(&cell));
                     self.at += 1;
                     rows.last_mut().expect("a cell sits in a row").push(cell);
                 }
@@ -356,13 +358,19 @@ impl<'a> Reader<'a, '_> {
                 _ => {}
             }
         }
-        let rule = |alignment: &Alignment| match alignment {
-            Alignment::None => "---",
-            Alignment::Left => ":--",
-            Alignment::Center => ":-:",
-            Alignment::Right => "--:",
-        };
-        table(rows, alignments.iter().map(|alignment| rule(alignment).to_owned()).collect())
+        let header = rows.len() < 2 || rows[0].iter().any(|cell| !cell.plain_text().is_empty());
+        if !header {
+            let unheaded = rows.remove(0);
+            self.notes.retain(|note| unheaded.iter().all(|cell| cell.id.as_str() != note.block));
+        }
+        let mut table = self.block(BlockKind::Table { columns: alignments.iter().map(align).collect(), header });
+        let rows = rows.into_iter().map(|cells| {
+            let mut row = self.block(BlockKind::TableRow);
+            row.body = Body::Blocks(cells);
+            row
+        });
+        table.body = Body::Blocks(rows.collect());
+        table
     }
 
     /// Reads text up to the next block boundary, which is left for the caller. Display maths in it is a formula
@@ -545,12 +553,6 @@ pub(crate) fn nest(blocks: &mut [Block]) {
             _ => 0,
         };
     }
-}
-
-/// Lays rows of cells out as a Markdown table, with `rules` under its first row.
-pub(crate) fn table(mut rows: Vec<Vec<String>>, rules: Vec<String>) -> String {
-    rows.insert(rows.len().min(1), rules);
-    rows.iter().map(|row| format!("| {} |", row.join(" | "))).collect::<Vec<_>>().join("\n")
 }
 
 /// Drops the spaces and line breaks at the edges of a block's text.

@@ -4,11 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 
 use html5gum::{DefaultEmitter, HtmlString, Token, Tokenizer};
-use letters_model::{Block, BlockKind, Body, Document, ListKind, Mark, Run, Tone};
+use letters_model::{Align, Block, BlockKind, Body, Document, ListKind, Mark, Run, Tone};
 
 use super::href;
 use crate::ImportNote;
-use crate::markdown::{TAGS, TONES, cell, merge, nest, table, trim};
+use crate::markdown::{TAGS, TONES, merge, nest, trim};
 
 /// Elements nested deeper than this are read as their text, which bounds the reader's recursion.
 const MAX_DEPTH: usize = 128;
@@ -78,8 +78,20 @@ const SIBLINGS: [(&[&str], &[&str]); 3] =
     [(&["li"], &["ul", "ol"]), (&["td", "th"], &["tr", "table"]), (&["tr"], &["table"])];
 
 /// The style properties the reader acts on.
-const PROPERTIES: [&str; 7] =
-    ["display", "font-style", "font-weight", "mso-list", "text-decoration", "text-decoration-line", "white-space"];
+const PROPERTIES: [&str; 8] = [
+    "display",
+    "font-style",
+    "font-weight",
+    "mso-list",
+    "text-align",
+    "text-decoration",
+    "text-decoration-line",
+    "white-space",
+];
+
+/// The empty cells one read adds where cells span rows or columns. Past it, spans are not filled in, so that
+/// a page cannot make a small paste a huge table.
+const MAX_SPANNED: usize = 10_000;
 
 /// Reads the HTML another application put on the clipboard: a fragment or a whole page, with or without the
 /// comments that mark what was copied. `new_id` supplies an id for each block.
@@ -90,9 +102,15 @@ const PROPERTIES: [&str; 7] =
 ///   the spaces at its edges, so that a phrase can be poured into a line.
 /// - Maths is read where a page carries its TeX source, and left out where it carries only a drawing of it.
 /// - Blocks with no text, scripts, style sheets and images are left out.
-/// - A table is kept as Markdown in a code block, as a Markdown import keeps one.
+/// - A table keeps its rows and the text of its cells. A cell that spans several leaves empty cells where it
+///   reaches. A table that only lays a page out, with one column or in that role, is read as what its cells
+///   hold.
 pub fn from_html(html: &str, new_id: &mut dyn FnMut() -> String) -> (Document, Vec<ImportNote>) {
-    let nodes = parse(copied(html));
+    let mut nodes = parse(copied(html));
+    // Excel marks the rows it copied, which leaves out the table around them.
+    if nodes.iter().any(|node| matches!(node, Node::Element(element) if element.name == "tr")) {
+        nodes = vec![Node::Element(Element { name: "table".into(), children: nodes, ..Element::default() })];
+    }
     let mut reader = Reader {
         new_id,
         notes: Vec::new(),
@@ -103,6 +121,7 @@ pub fn from_html(html: &str, new_id: &mut dyn FnMut() -> String) -> (Document, V
         task: None,
         marker: None,
         cell: false,
+        spare: MAX_SPANNED,
     };
     let mut blocks = Vec::new();
     reader.nodes(&nodes, &Style::default(), &mut blocks);
@@ -205,6 +224,23 @@ impl Element {
         })
     }
 
+    /// How the element says its text is aligned, as a table's cell does.
+    fn align(&self) -> Option<Align> {
+        let stated = self.css("text-align").map_or_else(|| self.attribute("align").to_ascii_lowercase(), str::to_owned);
+        match stated.as_str() {
+            "left" | "start" => Some(Align::Start),
+            "center" => Some(Align::Center),
+            "right" | "end" => Some(Align::End),
+            "justify" => Some(Align::Justify),
+            _ => None,
+        }
+    }
+
+    /// How many rows or columns a cell reaches over, as the attribute `name` says.
+    fn span(&self, name: &str) -> usize {
+        self.attribute(name).trim().parse().unwrap_or(1).clamp(1, 1000)
+    }
+
     /// How deep in its list a paragraph of Word's sits. Word writes list items as paragraphs.
     fn word_depth(&self) -> Option<u8> {
         let level = self.css("mso-list")?.split_whitespace().find_map(|word| word.strip_prefix("level"))?;
@@ -299,13 +335,13 @@ fn raw(nodes: &[Node], out: &mut String) {
     }
 }
 
-/// The text of `blocks` as the runs of one line.
+/// The text of `blocks` as the runs of one block, a line to each.
 fn flatten(blocks: Vec<Block>, runs: &mut Vec<Run>) {
     for block in blocks {
         match block.body {
             Body::Text(text) if !text.is_empty() => {
                 if !runs.is_empty() {
-                    runs.push(Run::plain(" "));
+                    runs.push(Run::plain("\n"));
                 }
                 runs.extend(text);
             }
@@ -392,15 +428,13 @@ struct Reader<'f> {
     marker: Option<String>,
     /// Whether a table's cell is being read, where a table reads as its text.
     cell: bool,
+    /// How many more empty cells may be added where cells span.
+    spare: usize,
 }
 
 impl Reader<'_> {
     fn block(&mut self, kind: BlockKind) -> Block {
         Block::new((self.new_id)().as_str(), kind)
-    }
-
-    fn note(&mut self, block: &Block, message: impl Into<String>) {
-        self.notes.push(ImportNote { block: block.id.to_string(), message: message.into() });
     }
 
     fn push(&mut self, text: &str, style: &Style) {
@@ -633,56 +667,96 @@ impl Reader<'_> {
         }
     }
 
-    /// Reads a table back into Markdown, since the document has no tables yet. A table that only lays a page
-    /// out, with one column or in that role, is read as the blocks in its cells, and so is one inside a cell.
+    /// Reads a table. One that only lays a page out, with one column or in that role, is read as the blocks in
+    /// its cells, and so is one inside a cell, which holds text alone.
     fn table(&mut self, element: &Element, style: &Style, out: &mut Vec<Block>) {
-        fn collect<'a>(element: &'a Element, rows: &mut Vec<Vec<&'a Element>>, rest: &mut Vec<&'a Element>) {
+        /// A row's cells, and whether it sits in the table's head.
+        type Row<'a> = (bool, Vec<&'a Element>);
+        fn collect<'a>(element: &'a Element, head: bool, rows: &mut Vec<Row<'a>>, rest: &mut Vec<&'a Node>) {
             for node in &element.children {
-                let Node::Element(child) = node else { continue };
-                match child.name.as_str() {
-                    "td" | "th" => match rows.last_mut() {
-                        Some(row) => row.push(child),
-                        None => rows.push(vec![child]),
+                match node {
+                    Node::Element(child) => match child.name.as_str() {
+                        "td" | "th" => match rows.last_mut() {
+                            Some((_, row)) => row.push(child),
+                            None => rows.push((head, vec![child])),
+                        },
+                        "tr" => {
+                            rows.push((head, Vec::new()));
+                            collect(child, head, rows, rest);
+                        }
+                        "thead" | "tbody" | "tfoot" => collect(child, child.name == "thead", rows, rest),
+                        _ => rest.push(node),
                     },
-                    "tr" => {
-                        rows.push(Vec::new());
-                        collect(child, rows, rest);
-                    }
-                    "thead" | "tbody" | "tfoot" => collect(child, rows, rest),
-                    _ => rest.push(child),
+                    Node::Text(_) => rest.push(node),
                 }
             }
         }
-        let (mut cells, mut rest) = (Vec::new(), Vec::new());
-        collect(element, &mut cells, &mut rest);
-        if self.cell || element.attribute("role") == "presentation" || cells.iter().all(|row| row.len() < 2) {
+        let (mut rows, mut rest) = (Vec::new(), Vec::new());
+        collect(element, false, &mut rows, &mut rest);
+        if self.cell || element.attribute("role") == "presentation" || rows.iter().all(|(_, row)| row.len() < 2) {
             return self.nodes(&element.children, style, out);
         }
         // A caption reads as the paragraph above its table.
-        rest.into_iter().for_each(|other| self.element(other, style, out));
+        for node in rest {
+            match node {
+                Node::Text(text) => self.text(text, style),
+                Node::Element(other) => self.element(other, style, out),
+            }
+        }
+        self.flush(out);
 
-        let rules = vec!["---".to_owned(); cells.first().map_or(0, Vec::len)];
+        let header = rows
+            .first()
+            .is_some_and(|(head, row)| *head || !row.is_empty() && row.iter().all(|cell| cell.name == "th"));
         let (notes, kind) = (self.notes.len(), mem::replace(&mut self.kind, BlockKind::Paragraph));
         self.cell = true;
+        let mut columns: Vec<Option<Align>> = Vec::new();
+        // How many more rows each column is covered for by a cell above.
+        let mut covered: Vec<usize> = Vec::new();
         let mut lines = Vec::new();
-        for row in cells {
-            let mut line = Vec::new();
-            for element in row {
+        for (_, row) in rows {
+            let mut cells = Vec::new();
+            let mut row = row.into_iter();
+            loop {
+                let column = cells.len();
+                if covered.get(column).is_some_and(|rows| *rows > 0) && self.spare > 0 {
+                    (covered[column], self.spare) = (covered[column] - 1, self.spare - 1);
+                    cells.push(self.block(BlockKind::TableCell));
+                    continue;
+                }
+                let Some(element) = row.next() else { break };
                 let (mut blocks, mut runs) = (Vec::new(), Vec::new());
                 let inside = Style { list: None, ..style.inside(element) };
                 self.within(BlockKind::Paragraph, element, &inside, &mut blocks);
                 flatten(blocks, &mut runs);
-                line.push(cell(&merge(runs)));
+                let mut cell = self.block(BlockKind::TableCell);
+                cell.body = Body::Text(merge(runs));
+                cells.push(cell);
+
+                let across = element.span("colspan").min(self.spare + 1);
+                self.spare -= across - 1;
+                covered.resize(covered.len().max(column + across), 0);
+                columns.resize(columns.len().max(column + across), None);
+                // Word says how a cell is aligned on the paragraph in it.
+                let align = || element.align().or_else(|| element.find(&|inner| inner.name == "p")?.align());
+                columns[column] = columns[column].or_else(align);
+                covered[column..column + across].fill(element.span("rowspan") - 1);
+                cells.extend((1..across).map(|_| self.block(BlockKind::TableCell)));
             }
+            covered.iter_mut().skip(cells.len()).for_each(|rows| *rows = rows.saturating_sub(1));
+            let mut line = self.block(BlockKind::TableRow);
+            line.body = Body::Blocks(cells);
             lines.push(line);
         }
         // The blocks read inside the cells are gone, and so is what was noted on them.
         self.notes.truncate(notes);
         (self.kind, self.cell) = (kind, false);
-        let mut block = self.block(BlockKind::Code { language: Some("markdown".into()) });
-        block.body = Body::Text(vec![Run::plain(table(lines, rules))]);
-        self.note(&block, "Table kept as Markdown in a code block");
-        out.push(block);
+        if lines.iter().any(|line| line.body.blocks().iter().any(|cell| !cell.plain_text().trim().is_empty())) {
+            let columns = columns.into_iter().map(|align| align.unwrap_or(Align::Start)).collect();
+            let mut block = self.block(BlockKind::Table { columns, header });
+            block.body = Body::Blocks(lines);
+            out.push(block);
+        }
     }
 }
 

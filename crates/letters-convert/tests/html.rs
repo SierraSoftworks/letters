@@ -93,6 +93,12 @@ fn blocks_and_marks_become_their_elements() {
         ("> [!CAUTION]\n> Hot", "<div class=\"callout danger\" role=\"note\"> <p>Hot</p> </div>"),
         ("a\n\n---\n\nb", "<p>a</p> <hr> <p>b</p>"),
         ("```\nx < 1 && y\n```", "<pre><code>x &lt; 1 &amp;&amp; y</code></pre>"),
+        (
+            "| a | b |\n|---|--:|\n| 1 | **2** |",
+            "<table> <thead> <tr><th>a</th><th style=\"text-align: end\">b</th></tr> </thead> <tbody> \
+             <tr><td>1</td><td style=\"text-align: end\"><strong>2</strong></td></tr> </tbody> </table>",
+        ),
+        ("|   |   |\n|---|---|\n| 1 | 2 |", "<table> <tbody> <tr><td>1</td><td>2</td></tr> </tbody> </table>"),
     ];
     for (markdown, expected) in cases {
         let html = export(&document(markdown));

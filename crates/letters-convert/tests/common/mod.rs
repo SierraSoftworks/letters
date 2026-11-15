@@ -3,7 +3,7 @@
 use letters_model::{Block, BlockKind, Document, ListKind, Run};
 
 /// A document as indented lines such as `h1 "Title"`, with marked runs as `<bold,italic|text>` and linked ones
-/// as `<@url|text>`, so that a case can state the document it expects.
+/// as `<@url|text>`, so that a case can state the document it expects. A table names how its columns align.
 pub fn outline(doc: &Document) -> Vec<String> {
     fn runs(block: &Block) -> String {
         let run = |run: &Run| {
@@ -34,7 +34,10 @@ pub fn outline(doc: &Document) -> Vec<String> {
                 BlockKind::Caption => format!("caption {}", runs(block)),
                 BlockKind::Figure { .. } => format!("figure {}", runs(block)),
                 BlockKind::Gallery { .. } => "gallery".to_owned(),
-                BlockKind::Table { .. } => "table".to_owned(),
+                BlockKind::Table { columns, header } => {
+                    let aligns: Vec<String> = columns.iter().map(|align| format!("{align:?}").to_lowercase()).collect();
+                    format!("table:{}{}", aligns.join(","), if *header { " headed" } else { "" })
+                }
                 BlockKind::TableRow => "row".to_owned(),
                 BlockKind::TableCell => format!("cell {}", runs(block)),
                 BlockKind::Unknown { type_name } => format!("unknown:{type_name}"),

@@ -290,16 +290,88 @@ fn reads_maths_where_a_page_carries_its_source() {
 }
 
 #[test]
-fn keeps_a_table_as_markdown() {
-    let html = concat!(
-        "<table><caption>Sizes</caption><thead><tr><th>Name</th><th>Size</th></tr></thead>",
-        "<tbody><tr><td><b>a</b></td><td><p>1</p><p>2</p></td></tr><tr><td>b|c</td><td></td></tr></tbody></table>",
-    );
-    let (doc, notes) = read(html);
-    let expected = r#"code:markdown "| Name | Size |\n| --- | --- |\n| **a** | 1 2 |\n| b\\|c |  |""#;
-    assert_eq!(outline(&doc), [r#"p "Sizes""#, expected]);
-    assert_eq!(notes.len(), 1, "{notes:?}");
-    assert_eq!(notes[0].block, doc.blocks[1].id.as_str());
+fn reads_a_table() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            concat!(
+                "<table><caption>Sizes</caption><thead><tr><th>Name</th><th align=\"right\">Size</th></tr></thead>",
+                "<tbody><tr><td><b>a</b></td><td align=\"right\"><p>1</p><p>2</p></td></tr>",
+                "<tr><td>b|c</td><td></td></tr></tbody></table>",
+            ),
+            &[
+                r#"p "Sizes""#,
+                "table:start,end headed",
+                "  row",
+                r#"    cell "Name""#,
+                r#"    cell "Size""#,
+                "  row",
+                r#"    cell "<bold|a>""#,
+                r#"    cell "1\n2""#,
+                "  row",
+                r#"    cell "b|c""#,
+                r#"    cell """#,
+            ],
+        ),
+        // Word wraps what a cell holds in a paragraph, and says there how it is aligned.
+        (
+            concat!(
+                "<table class=MsoTableGrid border=1 cellspacing=0><tr><td width=100 valign=top>",
+                "<p class=MsoNormal>Item<o:p></o:p></p></td><td width=100 valign=top>",
+                "<p class=MsoNormal align=center style='text-align:center'><i>Cost</i><o:p></o:p></p></td></tr></table>",
+            ),
+            &["table:start,center", "  row", r#"    cell "Item""#, r#"    cell "<italic|Cost>""#],
+        ),
+        // Excel marks the rows it copied, inside their table.
+        (
+            concat!(
+                "<html><body><table border=0><col width=64 span=2><!--StartFragment--><tr height=20>",
+                "<td height=20 align=right>1</td><td>a</td></tr><tr><td align=right>2</td><td>b</td></tr>",
+                "<!--EndFragment--></table></body></html>",
+            ),
+            &[
+                "table:end,start",
+                "  row",
+                r#"    cell "1""#,
+                r#"    cell "a""#,
+                "  row",
+                r#"    cell "2""#,
+                r#"    cell "b""#,
+            ],
+        ),
+        // A cell that spans rows or columns leaves empty cells where it reaches, so that columns stay in line.
+        (
+            "<table><tr><td rowspan=2>a</td><td colspan=2>b</td></tr><tr><td>c</td><td>d</td></tr></table>",
+            &[
+                "table:start,start,start",
+                "  row",
+                r#"    cell "a""#,
+                r#"    cell "b""#,
+                r#"    cell """#,
+                "  row",
+                r#"    cell """#,
+                r#"    cell "c""#,
+                r#"    cell "d""#,
+            ],
+        ),
+        // A cell holds text alone, so a table inside one is read as its text.
+        (
+            "<table><tr><td>a</td><td><table><tr><td>b</td><td>c</td></tr></table></td></tr></table>",
+            &["table:start,start", "  row", r#"    cell "a""#, r#"    cell "b\nc""#],
+        ),
+    ];
+    for (html, expected) in cases {
+        let (doc, notes) = read(html);
+        assert_eq!(outline(&doc), *expected, "reading {html:?}");
+        assert_eq!(notes, [], "reading {html:?}");
+    }
+}
+
+#[test]
+fn bounds_the_cells_that_spans_add() {
+    let row = "<tr><td colspan=1000 rowspan=1000>a</td><td>b</td></tr>";
+    let (doc, _) = read(&format!("<table>{}</table>", row.repeat(2_000)));
+    let cells = doc.walk().filter(|block| block.kind == BlockKind::TableCell).count();
+    assert!((4_000..20_000).contains(&cells), "{cells} cells from 4,000 written");
 }
 
 #[test]
@@ -326,7 +398,6 @@ fn notes_what_a_read_simplified() {
             &[r#"bullet/0 "a""#, r#"code:- "code""#, r#"bullet/0 "b""#, "quote", r#"  p "q""#],
             &[1, 3],
         ),
-        ("<table><tr><td>a</td><td>b</td></tr></table>", &[r#"code:markdown "| a | b |\n| --- | --- |""#], &[0]),
         (
             "<h1>Plain</h1><p>text</p><ul><li>item</li></ul>",
             &[r#"h1 "Plain""#, r#"p "text""#, r#"bullet/0 "item""#],
@@ -394,6 +465,7 @@ fn reads_back_the_fragment_a_copy_writes() {
         "# Title\n\n#### Small\n\nText with **bold**, *italic*, ~~struck~~, <u>under</u>, <mark>lit</mark>, `code`\n",
         "and [a **link**](https://example.com), with $x < 2$ in it.\n\nTwo\\\nlines.\n\n$$\na &= b \\\\\n  &< c\n$$\n\n",
         "- a\n  1. b\n     - [x] c\n- [ ] d\n\n",
+        "| Name | Size |\n| --- | :-: |\n| **a** | 1<br>2 |\n|  | `x` |\n\n|  |  |\n| --- | --: |\n| no | header |\n\n",
         "```rust\nfn main() {\n    let a = 1 < 2;\n}\n```\n\n```\n```\n\n> quoted\n>\n> - item\n\n> [!WARNING]\n> Hot.\n\n---\n\nEnd.\n",
     );
     let (doc, notes) = from_markdown(markdown, &mut || String::new());
@@ -468,6 +540,8 @@ proptest! {
                     }
                     _ => 0,
                 };
+                let children = block.body.blocks();
+                prop_assert!(children.iter().all(|child| block.kind.admits(&child.kind)), "a block holds what it may");
                 match &block.kind {
                     BlockKind::Paragraph | BlockKind::Heading { .. } => {
                         prop_assert!(!text.trim().is_empty(), "a block of text has text");

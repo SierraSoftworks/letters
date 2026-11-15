@@ -13,17 +13,10 @@ $$
 
 The table and Figure 1 show the change.
 
-Year
-
-Rate
-
-2026
-
-4.0 %
-
-2027
-
-**4.5 %**
+| Year | Rate |
+| --- | --: |
+| 2026 | 4.0 % |
+| 2027 | **4.5 %** |
 
 Rates since 2020
 
