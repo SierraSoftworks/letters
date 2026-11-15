@@ -22,11 +22,11 @@ use letters_model::{BlockId, Change, Model, Notes, ReplicaId, Revision, Selectio
 use letters_render::image::Image;
 use letters_render::{Color, DisplayList, Font, Point, Size};
 use letters_spell::Dictionary;
-use letters_sync::Local;
+use letters_sync::{Local, Progress, Refusal};
 use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDecision, Origin, Trust};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
-    Appearance, Chrome, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer, Landing,
+    Appearance, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer, Landing,
     LinkPreviewFound, Location, MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState, Scheme, Settings,
     Window as View, tokens,
 };
@@ -432,11 +432,10 @@ struct Remote {
     born: Instant,
     /// Whether the line was started, which waits for the file's history.
     started: bool,
-    /// The style and the selection the line was last told of.
-    style: Style,
+    /// Whether an earlier line of this window may have left work the server lacks.
+    owes: bool,
+    /// The selection the line was last told of.
     selection: Option<Selection>,
-    /// Whether the person was told why the server ended the line.
-    said: bool,
     /// The pictures the server was asked for, each once.
     asked: BTreeSet<String>,
     /// Pictures the copy lacks, until the server is asked for them.
@@ -467,6 +466,23 @@ impl Remote {
     /// with them.
     fn vouched(&self) -> bool {
         self.opened.trust == letters_api::Trust::Trusted
+    }
+
+    /// How the window stands to the server, for its bar.
+    fn connection(&self) -> Connection {
+        match self.line.link() {
+            // The line waits for the file's history.
+            _ if !self.started => Connection::Connecting,
+            letters_sync::Link::Offline => Connection::Offline,
+            letters_sync::Link::Connecting => Connection::Connecting,
+            letters_sync::Link::Live(_) => Connection::Live,
+            letters_sync::Link::Refused(refusal) => Connection::Refused(refusal.to_string()),
+        }
+    }
+
+    /// Whether only a new sign-in opens the document again.
+    fn signed_out(&self) -> bool {
+        self.line.session().ended() || self.line.link() == letters_sync::Link::Refused(Refusal::SignedOut)
     }
 }
 
@@ -881,17 +897,20 @@ impl DocWindow {
     /// The top bar says whether the document is saved. The title adds what the bar has no word for: a
     /// save that failed.
     fn retitle(&mut self) {
-        let offline = self.remote.as_ref().is_some_and(|remote| {
-            remote.started && matches!(remote.line.link(), letters_sync::Link::Offline | letters_sync::Link::Refused(_))
-        });
+        let remote = self.remote.as_ref();
+        // A server's document that is all in its copy here is saved once the server keeps it.
+        let progress = remote.filter(|remote| remote.started).map(|remote| remote.line.progress());
+        self.view.set_connection(remote.map(Remote::connection));
         self.view.set_save_state(match (self.save_failed, self.place.home().is_some(), self.unsaved()) {
             (true, _, _) => SaveState::Failed,
             // A document with no file yet has nothing to say about saving.
             (false, false, _) => SaveState::Unsaved,
             (false, true, true) => SaveState::Saving,
-            // A server's document that is all in its copy here waits for the server.
-            (false, true, false) if offline => SaveState::Offline,
-            (false, true, false) => SaveState::Saved,
+            (false, true, false) => match progress {
+                Some(Progress::Saving) => SaveState::Saving,
+                Some(Progress::Edited) => SaveState::Offline,
+                Some(Progress::Saved) | None => SaveState::Saved,
+            },
         });
         let state = if self.save_failed { " · Not saved" } else { "" };
         self.window.set_title(&format!("{}{state}", self.name()));
@@ -1182,16 +1201,19 @@ impl DocWindow {
         if !reached.opened.author.is_empty() {
             self.view.set_author(&reached.opened.author);
         }
-        let style = self.view.style().clone();
+        // A window that is tied again, as after a new sign-in, lets go of the line it had.
+        let owes = self.remote.take().is_some_and(|mut before| {
+            before.line.stop();
+            before.started
+        });
         self.remote = Some(Remote {
             line,
             opened: reached.opened,
             host,
             born: now,
             started: false,
-            style,
+            owes,
             selection: None,
-            said: false,
             asked: BTreeSet::new(),
             lacking: Vec::new(),
         });
@@ -1209,22 +1231,43 @@ impl DocWindow {
         }
         let Some(remote) = self.remote.as_mut().filter(|remote| !remote.started) else { return };
         remote.started = true;
-        let told = remote.line.start(remote.ms(now));
+        let owes = remote.owes || self.journal.as_ref().is_some_and(Journal::owes);
+        let told = remote.line.start(owes, remote.ms(now));
         self.told(told, now);
+    }
+
+    /// Asks the server again, after it ended the line for a reason the person may have mended since.
+    fn try_again(&mut self, now: Instant) {
+        if let Some(remote) = &mut self.remote {
+            (remote.started, remote.owes) = (false, true);
+        }
+        self.go_online(now);
+        self.retitle();
+    }
+
+    /// Says who else has the document open, each where their caret is in the text as it reads now.
+    fn show_peers(&mut self) {
+        let Some(remote) = &self.remote else { return };
+        let model = self.view.editor().model();
+        let shown = |peer: &letters_sync::Peer| letters_ui::Peer {
+            session: peer.session.0.into(),
+            name: peer.name.clone(),
+            colour: peer.colour,
+            selection: peer.selection.as_ref().and_then(|passage| passage.selection(model)),
+        };
+        let peers = remote.line.peers().iter().map(shown).collect();
+        self.view.set_peers(peers);
     }
 
     /// Tells the line to the server how the document stands now, and gives what the line leaves to do.
     fn tell_line(&mut self, now: Instant) -> Vec<Told> {
         let Some(remote) = self.remote.as_mut().filter(|remote| remote.started) else { return Vec::new() };
         let (editor, ms) = (self.view.editor(), remote.ms(now));
-        let mut told = Vec::new();
-        if editor.model().style() != &remote.style {
-            remote.style = editor.model().style().clone();
-            told.extend(remote.line.restyled(&remote.style, ms));
-        }
-        told.extend(remote.line.changed(Local { model: Some(editor.model()), notes: self.view.notes() }, ms));
-        if editor.selection() != remote.selection.as_ref() {
-            remote.selection = editor.selection().cloned();
+        // A style set here is in the history, and travels with the edits.
+        let mut told = remote.line.changed(Local { model: Some(editor.model()), notes: self.view.notes() }, ms);
+        // The others see no caret while the page is not what shows here.
+        if self.view.selection() != remote.selection.as_ref() {
+            remote.selection = self.view.selection().cloned();
             told.extend(remote.line.selected(editor.model(), remote.selection.as_ref(), ms));
         }
         told
@@ -1262,10 +1305,6 @@ impl DocWindow {
                     if self.noticed_edits == before {
                         self.noticed_edits = self.view.edits();
                     }
-                    if let Some(remote) = &mut self.remote {
-                        // A style that came with it was set elsewhere.
-                        remote.style = self.view.style().clone();
-                    }
                     self.save_at.get_or_insert(now + SAVE_AFTER);
                     stands = true;
                     told.extend(self.tell_line(now));
@@ -1273,6 +1312,8 @@ impl DocWindow {
                 Told::Notes(notes) => {
                     let mut joined = self.view.notes().clone();
                     if joined.merge(&notes) {
+                        // A note says where its text was on the device that wrote it.
+                        joined.follow(self.view.editor().model());
                         self.view.set_notes(joined);
                         // A note is no edit of the text, but the copy is to hold it.
                         self.marks = true;
@@ -1281,23 +1322,19 @@ impl DocWindow {
                     stands = true;
                     told.extend(self.tell_line(now));
                 }
+                // The work stays in the copy here. The person is told why it went no further.
+                Told::Refused(refusal) => self.view.set_notice(Some(&refusal.to_string())),
                 Told::Link | Told::Progress => stands = true,
-                // The window has nowhere to show who else is here yet.
+                // Said below, with where each of them is now.
                 Told::Peers => {}
             }
         }
-        if !stands {
-            return;
+        // Whatever was written here or there since may have moved the text under the others' carets.
+        self.show_peers();
+        if stands {
+            self.recomment();
+            self.retitle();
         }
-        // A line the server ended says why, once.
-        if let Some(remote) = &mut self.remote
-            && let letters_sync::Link::Refused(refusal) = remote.line.link()
-            && !std::mem::replace(&mut remote.said, true)
-        {
-            self.view.set_notice(Some(&refusal.to_string()));
-        }
-        self.recomment();
-        self.retitle();
     }
 
     /// Starts reading what the first paint did not need, on another thread.
@@ -2080,6 +2117,7 @@ impl App {
                 Request::MergeConflicts { confirmed } => self.merge_conflicts(id, confirmed, now),
                 Request::MergeFrom { path, confirmed } => self.merge_from(id, path.map(PathBuf::from), confirmed, now),
                 Request::MergeIntoOriginal { confirmed } => self.merge_into_original(id, confirmed, now),
+                Request::Connect => self.reconnect(id, now),
                 // A request this shell does not know yet.
                 _ => {}
             }
@@ -2279,8 +2317,21 @@ impl App {
         });
     }
 
+    /// Tries a document's server again, as the person asked of a window whose line the server ended. A
+    /// sign-in that is over starts with a new one.
+    fn reconnect(&mut self, id: WindowId, now: Instant) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        let Some(remote) = &window.remote else { return };
+        if !remote.signed_out() {
+            return window.try_again(now);
+        }
+        let (origin, document) = (remote.line.session().server().origin().to_owned(), remote.opened.id.clone());
+        self.reach(Some(id), &origin, document);
+    }
+
     /// Opens the copy of a server's document in a window of its own and ties the window to the server,
-    /// or says why there is nothing to open. The window that asked gives way if it holds nothing.
+    /// or says why there is nothing to open. The window that asked gives way if it holds nothing. A window
+    /// that has the document open already is tied to the server again instead.
     fn reached(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -2294,6 +2345,19 @@ impl App {
         }
         let shown = entered.and_then(|entered| {
             let (session, reached) = *entered;
+            let has = |window: &DocWindow| {
+                window.remote.as_ref().is_some_and(|remote| {
+                    remote.opened.id == reached.opened.id
+                        && remote.line.session().server().origin() == session.server().origin()
+                })
+            };
+            if let Some(window) = self.windows.values_mut().find(|window| has(window)) {
+                self.sessions.insert(session.server().origin().to_owned(), session.clone());
+                window.connect(session, reached, &self.proxy, &self.library, now);
+                window.window.focus_window();
+                window.sync(now);
+                return Ok(());
+            }
             let opened = files::open(&reached.path, new_style).map_err(|error| error.to_string())?;
             let id = self.open_window(event_loop, Some(opened), false).map_err(|error| error.to_string())?;
             self.sessions.insert(session.server().origin().to_owned(), session.clone());

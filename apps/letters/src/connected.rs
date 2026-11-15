@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use letters_api::{Code, Opened, paths};
-use letters_model::{Model, Notes, Selection, Style};
+use letters_model::{Model, Notes, Selection};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
 use sha2::{Digest, Sha256};
 use ureq::http::Uri;
@@ -219,8 +219,11 @@ fn unsaid(id: &str) -> Opened {
 pub enum Told {
     /// Edits made elsewhere. Merge them into the document, and then call [`Line::changed`].
     Merge(Vec<u8>),
-    /// Notes added or changed elsewhere. Join them into the notes, and then call [`Line::changed`].
+    /// Notes added or changed elsewhere. Join them into the notes, move them to where their text is now,
+    /// and then call [`Line::changed`].
     Notes(Notes),
+    /// The server did not take work that was sent, and why. The work stays in the copy here.
+    Refused(Refusal),
     /// [`Line::link`] changed.
     Link,
     /// [`Line::progress`] changed.
@@ -266,9 +269,13 @@ impl Line {
         &self.session
     }
 
-    /// Goes online. Only once the file's history is attached to the editor's model.
-    pub fn start(&mut self, now: u64) -> Vec<Told> {
+    /// Goes online. Only once the file's history is attached to the editor's model. `owes` says that the
+    /// journal holds work of an earlier run, which the server may lack until the first handshake has told.
+    pub fn start(&mut self, owes: bool, now: u64) -> Vec<Told> {
         self.ended = None;
+        if owes {
+            self.sync.owes();
+        }
         self.sync.start(now);
         self.drain()
     }
@@ -316,12 +323,6 @@ impl Line {
         self.drain()
     }
 
-    /// The person set the document's style.
-    pub fn restyled(&mut self, style: &Style, now: u64) -> Vec<Told> {
-        self.sync.restyled(style, now);
-        self.drain()
-    }
-
     /// The person's caret or selection moved.
     pub fn selected(&mut self, model: &Model, selection: Option<&Selection>, now: u64) -> Vec<Told> {
         self.sync.selected(model, selection, now);
@@ -364,13 +365,16 @@ impl Line {
                         socket.send(frame);
                     }
                 }
-                Event::Close => self.socket = None,
+                Event::Close => {
+                    // What the socket still says of its end is for nobody: the next one has another number.
+                    self.socket = None;
+                    self.sockets += 1;
+                }
                 Event::Merge(edits) => told.push(Told::Merge(edits)),
                 Event::Notes(notes) => told.push(Told::Notes(notes)),
                 // The copy on this device and its journal keep the work whether or not the server has it.
                 Event::Held(_) => {}
-                // The work stays in the copy here, and the progress that follows says it is here alone.
-                Event::Refused(_) => {}
+                Event::Refused(refusal) => told.push(Told::Refused(refusal)),
                 Event::Link => told.push(Told::Link),
                 Event::Progress => told.push(Told::Progress),
                 Event::Peers => told.push(Told::Peers),
