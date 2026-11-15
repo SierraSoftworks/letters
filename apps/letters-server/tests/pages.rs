@@ -202,7 +202,7 @@ async fn a_document_reads_as_a_page_that_runs_nothing() {
     let policy = raw.header("content-security-policy");
     assert!(policy.contains("default-src 'none'") && !policy.contains("script-src"), "{policy}");
     assert_eq!(raw.header("cache-control"), "no-store");
-    // Until the editor is part of the server, a document opens to read.
+    // A server that was built with no editor opens a document to read.
     assert_eq!(ben.get(&paths::editor_page(&id)).await.location(), paths::read_page(&id));
     assert!(page(&mut ben, RECENT_PAGE).await.contains("Plan"), "what was read is among the recent");
 

@@ -18,7 +18,7 @@ use letters_api::{
     Server, Settings, Space, Tag, Token, Trust, paths,
 };
 use letters_format::{ASSETS, MIMETYPE, NOTES, STYLE, file_name};
-use letters_model::Style;
+use letters_model::{Document, Style};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -28,6 +28,9 @@ use crate::session::{Carrier, Signed};
 use crate::spaces::{EXTENSION, Place, Root, seconds, shown};
 use crate::store::Table;
 use crate::{App, Shared};
+
+/// A document's file, open to be read.
+type File = letters_format::Archive<std::io::BufReader<std::fs::File>>;
 
 /// By [`Person::id`].
 const SETTINGS: Table<Settings> = Table::new("settings");
@@ -452,6 +455,18 @@ impl App {
 
     /// The document `id`, ready to edit. A `page` carries its style and its notes along.
     pub fn opened(&self, who: &Signed, id: &str, page: bool) -> Answer<Opened> {
+        Ok(self.opening(who, id, page)?.0)
+    }
+
+    /// The document `id` as a page for a browser's editor is made of it: what it holds now, and how it
+    /// is opened.
+    pub fn page(&self, who: &Signed, id: &str) -> Answer<(Document, Opened)> {
+        let (opened, mut file) = self.opening(who, id, true)?;
+        Ok((file.document()?, opened))
+    }
+
+    /// How the document `id` is opened, and its file as that was read from.
+    fn opening(&self, who: &Signed, id: &str, page: bool) -> Answer<(Opened, File)> {
         let found = self.locate(who, id)?;
         if page {
             // The style and the notes are read from the file, which its room may be ahead of.
@@ -465,7 +480,7 @@ impl App {
         };
         let (style, notes) = (json(&mut archive, STYLE)?, json(&mut archive, NOTES)?);
         self.note_opened(who, &manifest.id)?;
-        Ok(Opened {
+        let opened = Opened {
             id: manifest.id.clone(),
             created: manifest.created,
             name: shown(found.place.name()).to_owned(),
@@ -479,7 +494,8 @@ impl App {
             allows: letters_api::Allows { download: true, copy: true, print: true },
             style,
             notes,
-        })
+        };
+        Ok((opened, archive))
     }
 
     /// Puts the document first among the person's recents.

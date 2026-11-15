@@ -148,6 +148,10 @@ yew = { version = "0.23", default-features = false, features = ["ssr"] }
 yewi = { version = "0.3", features = ["ssr", "fonts"] }
 # Drives the server's routes in its tests with no socket between.
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# The browser's editor is compiled into the server in brotli, made when the server is built. In Rust alone.
+brotli = "8"
+# For the browser that asks for a file of the editor and does not read brotli.
+brotli-decompressor = "5"
 http-body-util = "0.1"
 
 # The browser shell. The command-line `wasm-bindgen` must be the version the lock file names.
@@ -176,10 +180,18 @@ debug = false
 debug = false
 debug-assertions = false
 
+# The server's build compresses the browser's editor once, as small as it goes. Unoptimised, that takes
+# minutes, and a build script is not optimised unless it is said here.
+[profile.dev.package.brotli]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+[profile.release.package.brotli]
+opt-level = 3
 
 # What scripts/fuzz builds: quick to link, and a panic names its line.
 [profile.fuzz]

@@ -6,8 +6,10 @@
 //! - [`view`] is what a page shows, and [`acts`] what its forms do.
 //! - [`statics`] is what a page loads.
 //! - [`read`] is a document as plain HTML, to read with no editor.
+//! - [`editor`] is a document in the browser's editor, and the files of that editor.
 
 mod acts;
+pub mod editor;
 mod read;
 mod statics;
 pub mod view;
@@ -66,9 +68,10 @@ pub fn routes() -> Router<Shared> {
         .route(RECENT_PAGE, get(recent))
         .route(SHARED_PAGE, get(shared))
         .route(TRASH_PAGE, get(trash))
-        .route("/d/{id}", get(editor))
+        .route("/d/{id}", get(editor::page))
         .route("/d/{id}/read", get(read::page))
         .route("/static/{version}/{*file}", get(statics::file))
+        .route("/assets/{version}/{*file}", get(editor::file))
         .merge(acts::routes())
 }
 
@@ -387,11 +390,6 @@ async fn listed(app: &App, who: &Signed, title: &str, shown: Answer<Page>, asked
         }
         Err(refusal) => refused(app, Some(who), &refusal).await,
     }
-}
-
-/// The document in the browser's editor. Until the editor is part of the server, it is shown to read.
-async fn editor(Visitor(_): Visitor, Path(id): Path<String>) -> Response {
-    Redirect::to(&paths::read_page(&id)).into_response()
 }
 
 /// A row of a file table, with its times as the table says them.

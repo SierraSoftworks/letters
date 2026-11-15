@@ -3824,6 +3824,8 @@ name = "letters-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "brotli",
+ "brotli-decompressor",
  "cap-std",
  "getrandom 0.4.3",
  "http-body-util",
@@ -3838,6 +3840,7 @@ dependencies = [
  "letters-sync",
  "letters-trust",
  "letters-ui",
+ "letters-web",
  "redb",
  "serde",
  "serde_json",

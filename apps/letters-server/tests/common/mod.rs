@@ -13,11 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, ORIGIN, SET_COOKIE};
+use axum::http::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, ORIGIN, SET_COOKIE};
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use letters_api::{Entry, Error, NewDocument, Person, paths};
 use letters_server::config::Config;
+use letters_server::pages::editor::Editor;
 use letters_server::session::{COOKIE_NAME, Carrier};
 use letters_server::store::Store;
 use letters_server::{App, Shared, api};
@@ -89,6 +90,11 @@ readers = ["friends"]
     )
 }
 
+/// The settings of a server whose provider is not there to be asked.
+fn sound(scratch: &Path) -> String {
+    settings(scratch, "https://id.example.test", "")
+}
+
 pub struct Server {
     pub scratch: Scratch,
     pub app: Shared,
@@ -104,25 +110,28 @@ impl Server {
 
     /// A server that signs people in at `issuer`, with `oidc` as its other settings for the provider.
     pub fn with_provider(name: &str, issuer: &str, oidc: &str) -> Self {
-        let scratch = Scratch::new(name);
-        std::fs::create_dir_all(scratch.0.join("family")).unwrap();
-        let config = Config::parse(&settings(&scratch.0, issuer, oidc)).expect("the settings are sound");
-        let clock = Arc::new(AtomicU64::new(START));
-        let told = clock.clone();
-        let app = App::new(config, Store::in_memory()).with_clock(Box::new(move || told.load(Ordering::Relaxed)));
-        let app = Arc::new(app);
-        Self { scratch, router: api::router(app.clone()), app, clock }
+        Self::over(Scratch::new(name), &|at| settings(at, issuer, oidc), |app| app)
+    }
+
+    /// A server whose browsers are sent `editor`.
+    pub fn editing(name: &str, editor: Editor) -> Self {
+        Self::over(Scratch::new(name), &sound, |app| app.with_editor(Some(editor)))
     }
 
     /// The server after it stopped and started again: the same folders, and nothing that was in memory.
     pub fn restarted(self) -> Self {
-        let Self { scratch, .. } = self;
-        let config =
-            Config::parse(&settings(&scratch.0, "https://id.example.test", "")).expect("the settings are sound");
+        Self::over(self.scratch, &sound, |app| app)
+    }
+
+    /// A server over the folders of `scratch`, with the settings `written` for them. It has no editor
+    /// unless `more` gives it one, whatever it was built with.
+    fn over(scratch: Scratch, written: &dyn Fn(&Path) -> String, more: impl FnOnce(App) -> App) -> Self {
+        std::fs::create_dir_all(scratch.0.join("family")).unwrap();
+        let config = Config::parse(&written(&scratch.0)).expect("the settings are sound");
         let clock = Arc::new(AtomicU64::new(START));
         let told = clock.clone();
         let app = App::new(config, Store::in_memory()).with_clock(Box::new(move || told.load(Ordering::Relaxed)));
-        let app = Arc::new(app);
+        let app = Arc::new(more(app.with_editor(None)));
         Self { scratch, router: api::router(app.clone()), app, clock }
     }
 
@@ -305,7 +314,12 @@ pub struct Browser {
 
 impl Browser {
     pub async fn get(&mut self, path: &str) -> Raw {
-        self.send(Method::GET, path, "", Vec::new(), None).await
+        self.send(Method::GET, path, "", Vec::new(), &[]).await
+    }
+
+    /// Fetches a file as a browser that reads the encodings `accepts` names.
+    pub async fn fetch(&mut self, path: &str, accepts: &str) -> Raw {
+        self.send(Method::GET, path, "", Vec::new(), &[(ACCEPT_ENCODING.as_str(), accepts)]).await
     }
 
     /// Sends a form from one of the server's own pages.
@@ -316,17 +330,18 @@ impl Browser {
     /// Sends a form, as a page that came from `origin` would.
     pub async fn submit(&mut self, path: &str, fields: &[(&str, &str)], origin: Option<&str>) -> Raw {
         let body = letters_server::oidc::form(fields).into_bytes();
-        self.send(Method::POST, path, "application/x-www-form-urlencoded", body, origin).await
+        let origin: Vec<(&str, &str)> = origin.map(|origin| (ORIGIN.as_str(), origin)).into_iter().collect();
+        self.send(Method::POST, path, "application/x-www-form-urlencoded", body, &origin).await
     }
 
-    async fn send(&mut self, method: Method, path: &str, kind: &str, body: Vec<u8>, origin: Option<&str>) -> Raw {
+    async fn send(&mut self, method: Method, path: &str, kind: &str, body: Vec<u8>, said: &[(&str, &str)]) -> Raw {
         let mut request = Request::builder().method(method).uri(path);
         if !self.cookies.is_empty() {
             let cookies: Vec<String> = self.cookies.iter().map(|(name, value)| format!("{name}={value}")).collect();
             request = request.header(COOKIE, cookies.join("; "));
         }
-        if let Some(origin) = origin {
-            request = request.header(ORIGIN, origin);
+        for (name, value) in said {
+            request = request.header(*name, *value);
         }
         if !kind.is_empty() {
             request = request.header(CONTENT_TYPE, kind);

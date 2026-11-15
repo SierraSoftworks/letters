@@ -8,7 +8,8 @@
 //! - [`library`] lists a space and finds a document by its id, wherever its file was moved to.
 //! - [`api`] answers the interface `letters_api` lays down.
 //! - [`rooms`] are the documents that are open now, and [`socket`] is each device's line to one.
-//! - [`pages`] are the server's own pages for a browser: the documents a person reaches, and one to read.
+//! - [`pages`] are the server's own pages for a browser: the documents a person reaches, one to read, and
+//!   one in the editor, which is compiled in when the server is built with it.
 //!
 //! A document's content lives in its `.let` file alone. Whatever else writes that file, over a share or
 //! with a sync tool, is another writer like the server, and the save in `letters_format` merges with it.
@@ -37,6 +38,7 @@ use crate::config::Config;
 use crate::error::{Answer, Refusal};
 use crate::library::Library;
 use crate::oidc::Provider;
+use crate::pages::editor::Editor;
 use crate::rooms::Rooms;
 use crate::session::Signed;
 use crate::spaces::Root;
@@ -52,6 +54,8 @@ pub struct App {
     pub library: Library,
     pub provider: Provider,
     pub rooms: Rooms,
+    /// The browser's editor, when the server was built with one. Without it a browser reads.
+    pub editor: Option<Editor>,
     clock: Clock,
 }
 
@@ -61,7 +65,13 @@ impl App {
     pub fn new(config: Config, store: Store) -> Self {
         let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
         let (provider, rooms) = (Provider::new(&config), Rooms::new(&config.server.state));
-        Self { config, store, library: Library::new(), provider, rooms, clock: Box::new(clock) }
+        let editor = Editor::compiled();
+        Self { config, store, library: Library::new(), provider, rooms, editor, clock: Box::new(clock) }
+    }
+
+    /// The same server with another editor for its browsers, or with none.
+    pub fn with_editor(self, editor: Option<Editor>) -> Self {
+        Self { editor, ..self }
     }
 
     /// The same server telling another time, for tests of what runs out.
