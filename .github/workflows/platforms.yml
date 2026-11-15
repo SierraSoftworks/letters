@@ -6,6 +6,12 @@ on:
   schedule:
     - cron: "13 4 * * *"
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Which runner to use
+        type: choice
+        options: [both, macos-latest, windows-latest]
+        default: both
 
 permissions:
   contents: read
@@ -20,17 +26,15 @@ env:
 
 jobs:
   platforms:
-    name: ${{ matrix.name }}
+    name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: macOS
-            os: macos-latest
-          - name: Windows
-            os: windows-latest
+        os: >-
+          ${{ fromJSON(inputs.runner && inputs.runner != 'both' && format('["{0}"]', inputs.runner)
+          || '["macos-latest", "windows-latest"]') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -38,14 +42,22 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install
 
+      # Kept though a test fails: the dependencies are built all the same, and are most of a night's cost.
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}
+          cache-on-failure: true
 
       # Every failure in one night: a test that fails does not hide those after it.
       - name: Test
-        run: cargo test --workspace --no-fail-fast
+        shell: bash
+        run: cargo test --workspace --no-fail-fast 2>&1 | tee test.log
+
+      # The log of the tests is long, and what failed is spread over it.
+      - name: List failures
+        if: failure()
+        shell: bash
+        run: grep -E -A 12 '^---- .+ ----$|targets? failed' test.log || true
 
       - name: Build
         run: cargo build --release -p letters
