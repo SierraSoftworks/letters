@@ -5,9 +5,13 @@
 //! which is written on as ever. A line at the head of each says whose it is, where it stands, and what
 //! choosing it does. Only the words in which the two differ are marked.
 //!
+//! The two trade places when the version held back is used, so that either is written on in the page
+//! before one is kept, which settles the conflict.
+//!
 //! The layout cuts the page ([`Split`]). This module keeps the held-back version laid out, draws what
 //! stands round the two, and tells the window where each part of the page shows.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use accesskit::{Node, NodeId};
@@ -62,7 +66,8 @@ pub enum Reviewing {
     Step { back: bool },
     /// Keeps the version on the page, which settles the conflict.
     Keep,
-    /// Puts the version that was held back on the page, which settles the conflict too.
+    /// Puts the version that was held back on the page and holds back what the page read: the two trade
+    /// places, and the conflict stays open. A version that took the block out takes it out, which settles.
     Use,
     /// Puts the open conflict away undecided.
     Close,
@@ -82,6 +87,11 @@ struct Open {
     note: String,
     block: BlockId,
     versions: [Version; 2],
+    /// Which of the note's two versions the page stands for. The other is held back.
+    page: usize,
+    /// The block as the version held back has it: as the note does, or as the page read when the two
+    /// last traded places. `None` for a version that took the block out.
+    held: Option<Block>,
     /// The document with the held-back version in the block's place, and its layout.
     doc: Document,
     first: DocLayout,
@@ -111,31 +121,59 @@ pub(crate) struct Review {
     arrangement: Option<Arrangement>,
     pointer: Option<Point>,
     pressed: Option<Press>,
+    /// What the page read of a conflict's block when its versions last traded places, by the note: which
+    /// of the note's versions that was, and the block. A conflict that is opened again holds it back so.
+    traded: HashMap<String, (usize, Block)>,
     /// Whether what moves may be shown moving.
     pub still: bool,
 }
 
 impl Open {
-    fn new(note: &Note, versions: &[Version; 2], doc: &Document, selection: Option<&Selection>) -> Self {
+    /// `page` is the block as the page has it, and `traded` what the page last read of another version.
+    fn new(
+        note: &Note,
+        versions: &[Version; 2],
+        doc: &Document,
+        page: &Block,
+        traded: Option<&(usize, Block)>,
+    ) -> Self {
         let block = note.anchor.block.clone();
-        // A version that took the block away stands as an empty line, so that the page has a place for it.
-        let held = versions[0].block.clone().unwrap_or_else(|| Block::new(block.clone(), BlockKind::Paragraph));
-        let mut copy = doc.clone();
-        put(&mut copy.blocks, Block { id: block.clone(), ..held });
-        Self {
+        // The page stands for the version it reads more like: the later one, until the two trade places.
+        let far = |version: &Version| version.block.as_ref().map_or(usize::MAX, |block| apart(block, page));
+        let on_page = usize::from(far(&versions[0]) >= far(&versions[1]));
+        let traded = traded.filter(|(side, _)| *side != on_page);
+        let held = traded.map(|(_, block)| block.clone()).or_else(|| versions[1 - on_page].block.clone());
+        let mut open = Self {
             note: note.id.clone(),
             block,
             versions: versions.clone(),
-            doc: copy,
+            page: on_page,
+            held: None,
+            doc: doc.clone(),
             first: DocLayout::new(Fonts { faces: letters_fonts::bundled() }),
             laid: None,
             active: Side::Second,
             slide: 1.0,
             since: None,
-            seen: selection.cloned(),
+            seen: None,
             compared: None,
             words: Default::default(),
-        }
+        };
+        open.hold(held);
+        open
+    }
+
+    /// Whose the version held back is and when it was written, or with `on_page` the page's.
+    fn of(&self, on_page: bool) -> &Version {
+        &self.versions[if on_page { self.page } else { 1 - self.page }]
+    }
+
+    /// Holds a version back: `None` for one that took the block out.
+    fn hold(&mut self, held: Option<Block>) {
+        // A version that took the block away stands as an empty line, so that the page has a place for it.
+        let shown = held.clone().unwrap_or_else(|| Block::new(self.block.clone(), BlockKind::Paragraph));
+        put(&mut self.doc.blocks, Block { id: self.block.clone(), ..shown });
+        (self.held, self.laid) = (held, None);
     }
 
     /// Makes `side` the version the window is pinned to, sliding there where the pair is pinned.
@@ -184,20 +222,31 @@ impl Review {
         };
         let same = |open: &Open| open.note == note.id && open.block == note.anchor.block && open.versions == *versions;
         if !self.open.as_ref().is_some_and(same) {
-            self.open = Some(Open::new(note, versions, doc, selection));
+            let mut open = Open::new(note, versions, doc, page, self.traded.get(&note.id));
+            open.seen = selection.cloned();
+            self.open = Some(open);
         }
         let Some(open) = self.open.as_mut() else { return };
+        if open.compared.as_ref() != Some(page) {
+            // A page that comes to read as the version held back has traded places with it: that version
+            // was used, here or by a writer elsewhere, or a use was taken back. What the page read until
+            // then is the version held back now.
+            let was = open.compared.replace(page.clone());
+            let traded = open.held.as_ref().is_some_and(|held| apart(held, page) == 0);
+            if let Some(was) = was.filter(|_| traded) {
+                self.traded.insert(open.note.clone(), (open.page, was.clone()));
+                open.page = 1 - open.page;
+                open.hold(Some(was));
+            }
+            let held = open.doc.block(&open.block);
+            open.words = held.map(|held| differing(held, page)).unwrap_or_default();
+        }
         if !open.laid.as_ref().is_some_and(|laid| (laid.0, &laid.1, laid.2) == (width, style, palette)) {
             // A formula is typeset in both versions: only the page's has a caret to show its source for.
             open.first.set_formula_source(false);
             open.first.set_palette(palette);
             open.first.update(&open.doc, style, width, None);
             open.laid = Some((width, style.clone(), palette));
-        }
-        if open.compared.as_ref() != Some(page) {
-            let held = open.doc.block(&open.block);
-            open.words = held.map(|held| differing(held, page)).unwrap_or_default();
-            open.compared = Some(page.clone());
         }
         // The version that holds the caret is the active one, and the caret is only ever in the page's.
         if open.seen.as_ref() != selection {
@@ -241,17 +290,11 @@ impl Review {
         self.open.as_ref().map(|open| open.note.as_str())
     }
 
-    /// The version a conflict held back, to put in its block's place: `None` inside for one that took
+    /// The version a conflict holds back, to put in its block's place: `None` inside for one that took
     /// the block away.
     pub fn held_back(&self) -> Option<(BlockId, Option<Box<Block>>)> {
         let open = self.open.as_ref()?;
-        Some((open.block.clone(), open.versions[0].block.clone().map(Box::new)))
-    }
-
-    /// Whether the block reads as the version that was held back, so that using it changes nothing.
-    pub fn same(&self) -> bool {
-        let same = |open: &Open| open.doc.block(&open.block) == open.compared.as_ref();
-        self.open.as_ref().is_some_and(|open| open.versions[0].block.is_some() && same(open))
+        Some((open.block.clone(), open.held.clone().map(Box::new)))
     }
 
     /// Steps the slide of a pinned pair. Returns when it wants to be drawn next.
@@ -350,8 +393,13 @@ impl Review {
             };
             out.push(Item::Stroke { rect: frame, color: ink(tokens::LINE), width: 1.0, radius: 0.0 });
             out.push(fill(Rect { height: RULE, ..frame }, ink(tone)));
-            let version = &open.versions[usize::from(!first)];
-            let head = Head { version, first, can: shown.choosing, now: shown.now };
+            let head = Head {
+                version: open.of(!first),
+                first,
+                gone: open.held.is_none(),
+                can: shown.choosing,
+                now: shown.now,
+            };
             self.hot.extend(head.paint(frame, shaper, scheme, &lit, out));
             if !first {
                 continue;
@@ -362,7 +410,7 @@ impl Review {
             let origin = Point { x: piece.origin.x + shift.x, y: piece.origin.y + shift.y };
             out.push(Item::PushClip { rect: text, radius: 0.0 });
             let from = out.items.len();
-            if open.versions[0].block.is_none() {
+            if open.held.is_none() {
                 // Said on the line the block would start on, level with the first line of the other version.
                 let gone = shaper.shape("Not in this version", &TextStyle::control().size(tokens::TEXT_SM), None);
                 let line = open.first.caret(&Pos::new(open.block.clone(), 0));
@@ -395,8 +443,8 @@ impl Review {
     pub fn describe(&self, page: &mut Node, nodes: &mut Vec<(NodeId, Node)>) {
         let Some(open) = &self.open else { return };
         if let Some(held) = self.held {
-            let by = threads::named(&open.versions[0].author);
-            let text = open.versions[0].block.as_ref().map(Block::plain_text);
+            let by = threads::named(&open.of(false).author);
+            let text = open.held.as_ref().map(Block::plain_text);
             let text = text.unwrap_or_else(|| "Not in this version".into());
             describe::held_back(&open.block, &format!("Version held back, by {by}"), &text, held, page, nodes);
         }
@@ -406,7 +454,7 @@ impl Review {
                 Press::Use => (false, "Use this version"),
                 Press::Bring(_) => continue,
             };
-            let by = threads::named(&open.versions[usize::from(keep)].author);
+            let by = threads::named(&open.of(keep).author);
             let place = if keep { format!("By {by}, on the page now") } else { format!("By {by}, held back") };
             describe::choice(&open.block, keep, label, &place, *rect, page, nodes);
         }
@@ -507,8 +555,9 @@ pub(crate) fn pair(split: &Split) -> Option<(f32, f32)> {
 /// The line at the head of a version.
 struct Head<'a> {
     version: &'a Version,
-    /// Whether it is the version held back.
+    /// Whether it is the version held back, and whether that took the block out.
     first: bool,
+    gone: bool,
     /// Whether it can be chosen.
     can: bool,
     now: &'a str,
@@ -528,8 +577,7 @@ impl Head<'_> {
         let ink = |ink: Ink| resolve(ink, scheme, 1.0);
         let small = TextStyle::control().size(tokens::TEXT_SM);
         let name = threads::named(&self.version.author);
-        let gone = self.first && self.version.block.is_none();
-        let (stands, label, sign_of, press) = match (self.first, gone) {
+        let (stands, label, sign_of, press) = match (self.first, self.gone) {
             (true, true) => ("Took this out", "Use this version", icon::ARROW_LEFT_RIGHT, Press::Use),
             (true, false) => ("Held back", "Use this version", icon::ARROW_LEFT_RIGHT, Press::Use),
             (false, _) => ("On the page now", "Keep this version", icon::CHECK, Press::Keep),
@@ -707,6 +755,13 @@ pub(crate) fn bar(count: usize, open: Option<usize>) -> Element<Message> {
         Some(_) => bar.on_dismiss("Close conflict", send(Reviewing::Close)).into(),
         None => bar.into(),
     }
+}
+
+/// How far apart two versions of a block read: how much text only one of them has, in bytes. Nothing
+/// where they read alike.
+fn apart(a: &Block, b: &Block) -> usize {
+    let long = |words: &Selection| words.head.offset.abs_diff(words.anchor.offset);
+    differing(a, b).iter().flatten().map(long).sum()
 }
 
 /// The words in which two versions of a block differ, as selections in each: the held-back version's

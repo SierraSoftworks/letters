@@ -134,7 +134,7 @@ const fn table(name: &'static str, also: &'static str, edit: TableEdit) -> Entry
 /// first. Names are told apart by the list, so no two are the same.
 pub(crate) static ENTRIES: [Entry; 78] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
-    entry("Conflict", "Use the other version", "choose held back earlier settle resolve", Act::Review(Reviewing::Use)),
+    entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
     run("Image", "Edit caption", "picture", Command::EditCaption),
     entry("Image", "Edit alt text", "picture describe description", Act::AltText),

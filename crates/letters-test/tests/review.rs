@@ -1,5 +1,5 @@
 //! Conflict review: the banner that counts the blocks two writers changed apart and steps through them, the
-//! page split at the one that is open, and the choice of one of its versions.
+//! page split at the one that is open, the two versions trading places, and the choice of the one on the page.
 
 use accesskit::{Action, ActionRequest, TreeId};
 use letters_model::{Block, BlockKind, Document, Note, Notes, Pos, Selection, Version};
@@ -46,10 +46,15 @@ fn both() -> Vec<Note> {
 
 /// The letter that Sam has open on that Sunday, with `notes` on it.
 fn letter(notes: Vec<Note>) -> Harness {
+    written(ROOF[0], notes)
+}
+
+/// The letter with `notes` on it, where the page reads `roof` of the roof.
+fn written(roof: &str, notes: Vec<Note>) -> Harness {
     let blocks = vec![
         Block::text("title", BlockKind::Heading { level: 1 }, "Cottage renovation"),
         para("plan", PLAN[0]),
-        para("roof", ROOF[0]),
+        para("roof", roof),
         para("dates", DATES),
     ];
     let mut window = Harness::open(Document { blocks, ..Document::default() });
@@ -80,6 +85,22 @@ fn held_back(window: &mut Harness) -> Option<Found> {
 /// The buttons that choose a version: the one on the page, then the one held back.
 fn choices(window: &mut Harness) -> [Option<Found>; 2] {
     ["Keep this version", "Use this version"].map(|name| window.find(Role::Button, name))
+}
+
+/// Whose the version on the page is said to be and whose the one held back, then what each reads.
+fn versions(window: &mut Harness, block: &str) -> [(String, String); 2] {
+    let whose = |told: Option<String>| {
+        let told = told.unwrap_or_default();
+        ["Sam Okafor", "Alice Moreau"].into_iter().find(|name| told.contains(name)).unwrap_or_default().to_owned()
+    };
+    let [keep, used] = choices(window).map(|choice| whose(choice.and_then(|choice| choice.description)));
+    let held = held_back(window).and_then(|held| held.value).unwrap_or_default();
+    [(keep, reads(window, block).unwrap_or_default()), (used, held)]
+}
+
+/// The two versions of the roof as the conflict has them when it opens: Sam's on the page, Alice's held back.
+fn roofs() -> [(String, String); 2] {
+    [("Sam Okafor".to_owned(), ROOF[0].to_owned()), ("Alice Moreau".to_owned(), ROOF[1].to_owned())]
 }
 
 /// What a block of the page reads, or `None` once the page does not have it.
@@ -258,19 +279,85 @@ fn keeping_the_version_on_the_page_settles_the_conflict_and_changes_no_text() {
 }
 
 #[test]
-fn using_the_version_held_back_puts_it_on_the_page_in_one_step_that_can_be_undone() {
+fn using_the_version_held_back_trades_the_two_and_leaves_the_conflict_open() {
     for (name, ask) in WAYS {
         let mut window = reviewing();
-        let edits = window.ui().edits();
+        let (edits, [sams, alices]) = (window.ui().edits(), roofs());
+        assert_eq!(versions(&mut window, "roof"), [sams.clone(), alices.clone()], "by {name}: as it opens");
         ask(&mut window, "Use this version");
-        assert_eq!(reads(&window, "roof").as_deref(), Some(ROOF[1]), "by {name}");
+        assert_eq!(versions(&mut window, "roof"), [alices.clone(), sams.clone()], "by {name}: the two traded places");
         assert_eq!(reads(&window, "plan").as_deref(), Some(PLAN[0]), "by {name}: the rest reads as it did");
-        assert_eq!(waiting(&mut window), 1, "by {name}: the conflict is settled");
-        assert!(window.ui().edits() > edits, "by {name}");
-        assert_eq!(held_back(&mut window), None, "by {name}: the page is whole again");
+        assert_eq!(waiting(&mut window), 2, "by {name}: the conflict is still to be settled");
+        assert!(window.ui().edits() > edits, "by {name}: the page changed, which is something to save");
 
+        // One step back takes the trade back, and using the other again trades them again.
         window.key("Mod+Z");
-        assert_eq!(reads(&window, "roof").as_deref(), Some(ROOF[0]), "by {name}: one step back");
+        assert_eq!(versions(&mut window, "roof"), [sams.clone(), alices.clone()], "by {name}: one step back");
+        ask(&mut window, "Use this version");
+        ask(&mut window, "Use this version");
+        assert_eq!(versions(&mut window, "roof"), [sams, alices], "by {name}: twice is as it was");
+    }
+}
+
+#[test]
+fn either_version_is_written_on_in_the_page_before_one_is_kept() {
+    let mut window = reviewing();
+    // Sam mends his own version, then has Alice's on the page and writes on that.
+    window.select("three weeks").type_text("four weeks");
+    let sams = ROOF[0].replace("three weeks", "four weeks");
+    window.click(Role::Button, "Use this version");
+    window.select("chimney").type_text("north chimney");
+    let alices = ROOF[1].replace("chimney", "north chimney");
+    let now = versions(&mut window, "roof");
+    assert_eq!(now, [("Alice Moreau".into(), alices.clone()), ("Sam Okafor".into(), sams.clone())]);
+
+    // What was written on a version stays with it while the other is on the page.
+    window.click(Role::Button, "Use this version");
+    assert_eq!(versions(&mut window, "roof"), [("Sam Okafor".into(), sams), ("Alice Moreau".into(), alices.clone())]);
+    window.click(Role::Button, "Use this version").click(Role::Button, "Keep this version");
+    assert_eq!(reads(&window, "roof"), Some(alices), "the version on the page is the one kept");
+    assert_eq!((waiting(&mut window), held_back(&mut window)), (1, None), "which settles the conflict");
+}
+
+#[test]
+fn a_conflict_that_is_opened_again_shows_its_versions_where_they_were_left() {
+    let mut window = reviewing();
+    window.select("three weeks").type_text("four weeks");
+    let sams = ("Sam Okafor".to_owned(), ROOF[0].replace("three weeks", "four weeks"));
+    window.click(Role::Button, "Use this version");
+    let left = [("Alice Moreau".to_owned(), ROOF[1].to_owned()), sams];
+    assert_eq!(versions(&mut window, "roof"), left);
+
+    let ways: [(&str, Open); 2] = [
+        ("another conflict", |window| _ = window.click(Role::Button, "Next conflict")),
+        ("closing", |window| _ = window.click(Role::Button, "Close conflict")),
+    ];
+    for (name, leave) in ways {
+        leave(&mut window);
+        assert_ne!(versions(&mut window, "roof"), left, "by {name}: the roof's versions are put away");
+        window.click(Role::Button, "Previous conflict");
+        assert_eq!(versions(&mut window, "roof"), left, "by {name}");
+    }
+    // A trade that is taken back while the conflict is put away is taken back where it shows again.
+    window.click(Role::Button, "Close conflict").key("Mod+Z").click(Role::Button, "Previous conflict");
+    assert_eq!(versions(&mut window, "roof"), [left[1].clone(), roofs()[1].clone()]);
+}
+
+#[test]
+fn a_page_that_reads_as_the_earlier_version_has_the_later_one_held_back() {
+    // What the page reads of the roof when the conflict is opened, as after a trade made elsewhere or
+    // before the letter was last closed, and which of the two versions the page then stands for.
+    let cases = [
+        (ROOF[0].to_owned(), 0),
+        (ROOF[0].replace("three weeks", "four weeks"), 0),
+        (ROOF[1].to_owned(), 1),
+        (ROOF[1].replace("chimney", "north chimney"), 1),
+    ];
+    for (page, stands) in cases {
+        let mut window = written(&page, both());
+        window.click(Role::Button, "Previous conflict");
+        let (on_page, held) = (roofs()[stands].0.clone(), roofs()[1 - stands].clone());
+        assert_eq!(versions(&mut window, "roof"), [(on_page, page.clone()), held], "{page}");
     }
 }
 

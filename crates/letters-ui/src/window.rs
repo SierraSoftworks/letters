@@ -1089,8 +1089,9 @@ impl EditorApp {
         self.review.follow(open, self.editor.doc(), self.editor.selection(), made);
     }
 
-    /// Does what is asked about the conflicts: steps through them, puts the open one away, or settles it
-    /// with one of its versions. The page keeps its place while the block's other version comes or goes.
+    /// Does what is asked about the conflicts: steps through them, puts the open one away, has its two
+    /// versions trade places, or settles it with the one on the page. The page keeps its place while the
+    /// block's other version comes or goes.
     fn reviewing(&mut self, asked: Reviewing, platform: &mut dyn Platform) {
         match asked {
             Reviewing::Step { back } => {
@@ -1109,18 +1110,20 @@ impl EditorApp {
             Reviewing::Use => {
                 let held = self.review.held_back().filter(|_| self.margin.refused.is_none());
                 let Some((block, version)) = held else { return };
+                // A version that took the block out leaves nothing to write on: using it settles.
+                let settles = version.is_none();
                 let command = Command::UseVersion { block, version };
-                // A version that reads as the page does is chosen by leaving the page as it is.
-                let reads = self.review.same();
-                if !reads && !self.editor.applies(&command) {
+                if !self.editor.applies(&command) {
                     return;
                 }
                 self.held(|app| {
-                    app.edits += u64::from(app.margin.settle());
-                    if !reads {
-                        let change = app.run(platform, |editor, platform| editor.run(command, platform));
-                        app.follow(&change);
+                    if settles {
+                        app.edits += u64::from(app.margin.settle());
                     }
+                    // The review takes what the page read as the version held back, once the page reads
+                    // as the one that was.
+                    let change = app.run(platform, |editor, platform| editor.run(command, platform));
+                    app.follow(&change);
                     app.sync();
                 });
             }
