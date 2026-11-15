@@ -261,6 +261,13 @@ impl<A: App> Harness<A> {
         self.release_at(at)
     }
 
+    /// Clicks at a point with Shift held.
+    pub fn shift_click_at(&mut self, at: Point) -> &mut Self {
+        self.ui.pointer_move(at, &mut self.platform);
+        self.ui.pointer_down(at, Modifiers { shift: true, ..Modifiers::default() }, &mut self.platform);
+        self.release_at(at)
+    }
+
     pub fn press_at(&mut self, at: Point) -> &mut Self {
         self.ui.pointer_move(at, &mut self.platform);
         self.ui.pointer_down(at, Modifiers::default(), &mut self.platform);

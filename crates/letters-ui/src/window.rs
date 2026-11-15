@@ -1719,8 +1719,17 @@ impl EditorApp {
             Historying::Name(Naming::Apply) => self.take_name(),
             Historying::Name(asked) => self.history.iter_mut().for_each(|history| history.name(asked.clone())),
             Historying::Scroll(delta) => self.history.iter_mut().for_each(|history| history.scroll(delta)),
-            Historying::Down(at) => self.history.iter_mut().for_each(|history| history.press(at)),
+            Historying::Down { at, clicks: 1, extend } => {
+                self.history.iter_mut().for_each(|history| history.press(at, extend));
+            }
+            Historying::Down { clicks, .. } => {
+                self.history.iter_mut().for_each(|history| history.widen(clicks, platform));
+            }
+            Historying::Drag(at) => self.history.iter_mut().for_each(|history| history.drag(at)),
             Historying::Up(at) => self.history.iter_mut().for_each(|history| history.release(at)),
+            Historying::All => self.history.iter_mut().for_each(|history| history.select_all(platform)),
+            Historying::Copy => self.history.iter_mut().for_each(|history| history.copy(platform)),
+            Historying::Unselect => self.history.iter_mut().for_each(History::unselect),
             Historying::Compare(with) => {
                 self.take_name();
                 self.history.iter_mut().for_each(|history| history.compare(with));
@@ -1780,9 +1789,11 @@ impl EditorApp {
                 self.requests.push(Request::Asset(asset));
             }
         }
-        match &self.copying {
-            Some(copy) => version.popover(copy.card(&self.location, room)),
-            None => version,
+        // The tool that copies a passage waits behind the card that copies the version.
+        match (&self.copying, history.tools()) {
+            (Some(copy), _) => version.popover(copy.card(&self.location, room)),
+            (None, Some(tools)) => version.popover(tools),
+            (None, None) => version,
         }
     }
 
@@ -1797,6 +1808,16 @@ impl EditorApp {
             return true;
         }
         let plain = !event.mods.primary && !event.mods.alt;
+        // A passage of the version is selected and copied with the keys that do so on the page.
+        let asked = match self.editor.keymap().command(event) {
+            Some(Command::Copy) => Some(Historying::Copy),
+            Some(Command::SelectAll) => Some(Historying::All),
+            _ => None,
+        };
+        if let Some(asked) = asked {
+            self.historying(asked, platform);
+            return true;
+        }
         let asked = match event.key {
             Key::Escape => Historying::Back,
             Key::Left if plain => Historying::Step { back: true },

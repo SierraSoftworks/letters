@@ -24,7 +24,7 @@ use crate::window::Message;
 /// How wide the field a comment is written in hangs under its passage.
 const WIDTH: f32 = 320.0;
 /// The room between a selection and the tools over it.
-const TOOLS_GAP: f32 = 8.0;
+pub(crate) const TOOLS_GAP: f32 = 8.0;
 /// The room the tools take above a selection, which they hang under when it is not there.
 pub(crate) const TOOLS_ROOM: f32 = tokens::CONTROL_HEIGHT_SM + 2.0 * tokens::SPACE_XS + 2.0 + TOOLS_GAP;
 /// How strong the tint of a passage is while its comment is being written or read.
