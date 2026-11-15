@@ -505,6 +505,8 @@ struct Remote {
     looked: Option<Instant>,
     /// The folders of the document's space as the server last listed them, which it can move among.
     shelves: Vec<Shelf>,
+    /// The name and the place the list of recent documents has for it, once it is on that list.
+    listed: Option<(String, String)>,
 }
 
 impl Remote {
@@ -565,6 +567,27 @@ impl Remote {
     /// The folder the server keeps the document in, as the bar is told it.
     fn folder(&self) -> String {
         self.key(self.opened.path.rsplit_once('/').map_or("", |(folder, _)| folder))
+    }
+
+    /// Where the server keeps the document, as a list of recent documents says it: the server, the space
+    /// by its name if the server told it, and the folders down to the document's.
+    fn shown(&self) -> String {
+        let space = self.shelves.first().map(|shelf| shelf.name.as_str());
+        let folder = self.opened.path.rsplit_once('/').map_or("", |(folder, _)| folder);
+        let parts = [Some(self.host.as_str()), space].into_iter().flatten().chain(folder.split('/'));
+        parts.filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" / ")
+    }
+
+    /// The document as the list of recent ones is to hold it, if the list does not hold it so yet.
+    fn lately(&mut self) -> Option<servers::Lately> {
+        let now = (self.opened.name.clone(), self.shown());
+        if self.listed.as_ref() == Some(&now) {
+            return None;
+        }
+        self.listed = Some(now.clone());
+        let address =
+            format!("{}{}", self.line.session().server().origin(), letters_api::paths::editor_page(&self.opened.id));
+        Some(servers::Lately { address, name: now.0, folder: now.1, opened: platform::now_rfc3339() })
     }
 
     /// The space and the folder of it that the bar knows by `key`, if it is one the server listed.
@@ -1356,6 +1379,7 @@ impl DocWindow {
             live: false,
             looked: None,
             shelves: Vec::new(),
+            listed: None,
         });
         self.recopy(library);
         self.recomment();
@@ -1497,10 +1521,12 @@ impl DocWindow {
     }
 
     /// Takes how the document stands at its server, which was asked about its name and place. `answers`
-    /// says that the bar asked and waits to be told.
-    fn placed(&mut self, answers: bool, placed: Placed, library: &Library) {
-        let Some(remote) = &mut self.remote else { return };
+    /// says that the bar asked and waits to be told. Gives the document for the list of recent ones, if
+    /// the server said how it stands and the list has it otherwise.
+    fn placed(&mut self, answers: bool, placed: Placed, library: &Library) -> Option<servers::Lately> {
+        let remote = self.remote.as_mut()?;
         remote.placing = false;
+        let said = placed.opened.is_some();
         if let Some(now) = placed.opened {
             let opened = &mut remote.opened;
             (opened.name, opened.named, opened.space, opened.path) = (now.name, now.named, now.space, now.path);
@@ -1527,6 +1553,7 @@ impl DocWindow {
             }
         }
         self.retitle();
+        self.remote.as_mut().filter(|_| said && self.keeps).and_then(Remote::lately)
     }
 
     /// Starts reading what the first paint did not need, on another thread.
@@ -2194,9 +2221,18 @@ impl App {
                 path: recent.path.to_str()?.to_owned(),
             })
         };
+        // A server's document is listed by the address of its page, which `Request::Open` asks its server for.
+        let served = |lately: servers::Lately| {
+            let (opened, at) = (platform::local(&lately.opened), lately.opened);
+            (at, letters_ui::Recent { name: lately.name, folder: lately.folder, opened, path: lately.address })
+        };
+        let here = self.library.recents().into_iter().filter_map(|kept| Some((kept.opened.clone(), recent(kept)?)));
+        let mut recents: Vec<_> = here.chain(servers::lately(&self.home).into_iter().map(served)).collect();
+        // Both lists are newest first, and a sort that is stable keeps each in its order.
+        recents.sort_by(|a, b| b.0.cmp(&a.0));
         Landing {
             now: platform::local(&platform::now_rfc3339()),
-            recents: self.library.recents().into_iter().filter_map(recent).take(LISTED).collect(),
+            recents: recents.into_iter().map(|(_, recent)| recent).take(LISTED).collect(),
         }
     }
 
@@ -3688,8 +3724,10 @@ impl ApplicationHandler<Event> for App {
             }
             Event::Placed(id, answers, placed) => {
                 if let Some(window) = self.windows.get_mut(&id) {
-                    window.placed(answers, *placed, &self.library);
+                    let lately = window.placed(answers, *placed, &self.library);
                     window.sync(now);
+                    // A list that cannot be written costs a row on a card.
+                    let _ = lately.map(|lately| servers::opened(&self.home, lately));
                 }
                 // What was asked meanwhile goes to the server now.
                 self.place(id);

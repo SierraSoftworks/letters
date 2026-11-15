@@ -712,6 +712,32 @@ fn a_server_signed_in_to_is_listed_until_the_person_signs_out() {
 }
 
 #[test]
+fn a_servers_documents_are_recent_until_the_person_signs_out_of_it() {
+    let home = Scratch::new("connected-lately");
+    let lately = |host: &str, name: &str| servers::Lately {
+        address: format!("https://{host}/d/d1"),
+        name: name.into(),
+        folder: format!("{host} / Home"),
+        opened: "2026-11-15T20:00:00Z".into(),
+    };
+    let names = || servers::lately(&home.0).into_iter().map(|lately| lately.name).collect::<Vec<_>>();
+    assert!(names().is_empty());
+
+    // The newest is first, and a document that is opened again, renamed since, has one row.
+    for (host, name) in
+        [("a.example", "Roof"), ("b.example", "Garden"), ("a.example.org", "Rates"), ("a.example", "Roof repairs")]
+    {
+        servers::opened(&home.0, lately(host, name)).unwrap();
+    }
+    assert_eq!(names(), ["Roof repairs", "Rates", "Garden"]);
+    assert_eq!(servers::lately(&home.0)[0], lately("a.example", "Roof repairs"));
+
+    // Signing out of a server takes its documents off the list, and no other server's.
+    servers::forget(&home.0, "https://a.example").unwrap();
+    assert_eq!(names(), ["Rates", "Garden"]);
+}
+
+#[test]
 fn a_sign_in_that_did_not_work_says_why_in_a_sentence() {
     let (home, server) = (Scratch::new("connected-unsigned"), Server::start());
     let stranger = Client::new(server.client().origin(), &Roots::These(Vec::new())).unwrap();
