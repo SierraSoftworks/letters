@@ -164,6 +164,9 @@ fn leaves_out_what_is_not_text() {
         "<p>text</p><p> </p><p>&nbsp;</p><div><br></div><blockquote></blockquote>",
         "<p>text<img src='https://example.com/cat.png' alt='A cat'><svg><text>no</text></svg></p>",
         "<p>text<button>Copy</button></p>",
+        // A picture the clipboard gives no lasting address for, and the speck a page counts its readers with.
+        "<p>text</p><p><img src='data:image/png;base64,iVBORw0KGgo='><img src='file:///C:/Temp/clip_image001.png'></p>",
+        "<p>text</p><img src='http://example.com/plain.png'><img src='https://example.com/count.gif' width=1 height=1>",
     ];
     for html in cases {
         assert_eq!(outline(&read(html).0), [r#"p "text""#], "reading {html:?}");
@@ -286,6 +289,67 @@ fn reads_maths_where_a_page_carries_its_source() {
     ];
     for (html, expected) in cases {
         assert_eq!(outline(&read(html).0), *expected, "reading {html:?}");
+    }
+}
+
+#[test]
+fn reads_pictures() {
+    let (a, b) = ("https://example.com/a.png", "https://example.com/b.png");
+    let cases: &[(String, &[&str])] = &[
+        (
+            format!("<p><a href='/full'><img src='{a}' alt='A cat'></a></p>"),
+            &[r#"figure https://example.com/a.png [A cat] """#],
+        ),
+        (
+            format!(
+                "<figure><img src='{a}' alt='A cat'><figcaption>It <b>sat</b> down.</figcaption></figure><p>Next</p>"
+            ),
+            &[r#"figure https://example.com/a.png [A cat] "It <bold|sat> down.""#, r#"p "Next""#],
+        ),
+        // Several pictures in one figure are a gallery, as Ghost writes one.
+        (
+            format!(
+                "<figure class='kg-gallery-card'><div class='kg-gallery-row'><div><img src='{a}' alt='a'></div>\
+                 <div><img src='{b}'></div></div><figcaption>Both</figcaption></figure>"
+            ),
+            &[
+                "gallery",
+                r#"  figure https://example.com/a.png [a] """#,
+                r#"  figure https://example.com/b.png [] """#,
+                r#"  caption "Both""#,
+            ],
+        ),
+        (
+            format!("<p><img src='{a}'> beside it</p>"),
+            &[r#"figure https://example.com/a.png [] """#, r#"p "beside it""#],
+        ),
+        // A figure need not hold a picture.
+        (
+            "<figure><blockquote>Said</blockquote><figcaption>Someone</figcaption></figure>".to_owned(),
+            &["quote", r#"  p "Said""#, r#"p "Someone""#],
+        ),
+    ];
+    for (html, expected) in cases {
+        let (doc, notes) = read(html);
+        assert_eq!(outline(&doc), *expected, "reading {html:?}");
+        assert_eq!(notes, [], "reading {html:?}");
+    }
+}
+
+#[test]
+fn shows_a_picture_at_the_size_its_page_did() {
+    // Each case: what the element says of its size in pixels, and the size in points.
+    let cases = [
+        ("width='400' height='200'", (300.0, 150.0)),
+        ("width='1280' height='320'", (480.0, 120.0)),
+        ("", (320.0, 240.0)),
+    ];
+    for (stated, expected) in cases {
+        let (doc, _) = read(&format!("<img src='https://example.com/a.png' {stated}>"));
+        let [Block { kind: BlockKind::Figure { width, height, .. }, .. }] = doc.blocks.as_slice() else {
+            panic!("one figure from {stated:?}: {:?}", doc.blocks);
+        };
+        assert_eq!((*width, *height), expected, "from {stated:?}");
     }
 }
 
@@ -512,6 +576,10 @@ fn any_html() -> impl Strategy<Value = String> {
         "span style='mso-list:Ignore'",
         "div class='callout tip'",
         "div style='white-space:pre'",
+        "figure",
+        "figcaption",
+        "img src='https://e.com/a.png'",
+        "img src='https://e.com/b.png' width=9 height=0",
     ]);
     let piece = prop_oneof![
         tag.clone().prop_map(|tag| format!("<{tag}>")),
@@ -549,6 +617,14 @@ proptest! {
                     }
                     BlockKind::Quote | BlockKind::Callout { .. } => {
                         prop_assert!(!block.body.blocks().is_empty(), "a quote holds blocks");
+                    }
+                    BlockKind::Figure { asset, src, width, height, .. } => {
+                        prop_assert!(asset.is_some() != src.is_some(), "a figure has one picture");
+                        prop_assert!(*width > 0.0 && *height > 0.0, "and a size");
+                    }
+                    BlockKind::Gallery { .. } => {
+                        prop_assert!(children.iter().filter(|part| part.kind != BlockKind::Caption).count() > 1);
+                        prop_assert!(children.iter().filter(|part| part.kind == BlockKind::Caption).count() <= 1);
                     }
                     _ => {}
                 }

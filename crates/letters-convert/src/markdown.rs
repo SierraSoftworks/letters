@@ -1,17 +1,17 @@
 //! Markdown in both directions.
 //!
 //! Reading follows CommonMark and GFM, with front matter, footnotes, dollar maths and wiki links. What the
-//! document cannot hold yet (images, footnotes and raw HTML) is kept as text or as a code block, with an import
-//! note that says so.
+//! document cannot hold (footnotes, raw HTML and a picture amid text) is kept as text or as a code block, with
+//! an import note that says so.
 
 mod read;
 mod write;
 
 use letters_model::{Mark, Tone};
 
-pub use read::from_markdown;
+pub use read::{MarkdownImport, from_markdown, import_markdown};
 pub(crate) use read::{merge, nest, trim};
-pub use write::to_markdown;
+pub use write::{markdown_assets, to_markdown};
 
 /// The tags a callout opens with. The first name of each tone is GitHub's and is the one written, so that the
 /// file renders as alerts there.

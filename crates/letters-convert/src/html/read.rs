@@ -7,8 +7,8 @@ use html5gum::{DefaultEmitter, HtmlString, Token, Tokenizer};
 use letters_model::{Align, Block, BlockKind, Body, Document, ListKind, Mark, Run, Tone};
 
 use super::href;
-use crate::ImportNote;
 use crate::markdown::{TAGS, TONES, merge, nest, trim};
+use crate::{ImportNote, figures};
 
 /// Elements nested deeper than this are read as their text, which bounds the reader's recursion.
 const MAX_DEPTH: usize = 128;
@@ -101,7 +101,10 @@ const MAX_SPANNED: usize = 10_000;
 /// - White space collapses as a browser shows it. A fragment with no block in it is one paragraph that keeps
 ///   the spaces at its edges, so that a phrase can be poured into a line.
 /// - Maths is read where a page carries its TeX source, and left out where it carries only a drawing of it.
-/// - Blocks with no text, scripts, style sheets and images are left out.
+/// - A picture that stands alone in its block is a figure whose picture is still at its `https` address, and
+///   several in one `figure` element are a gallery, with the element's caption as theirs. A picture amid text
+///   is left out, as is one at any other address.
+/// - Blocks with no text, scripts and style sheets are left out.
 /// - A table keeps its rows and the text of its cells. A cell that spans several leaves empty cells where it
 ///   reaches. A table that only lays a page out, with one column or in that role, is read as what its cells
 ///   hold.
@@ -121,6 +124,7 @@ pub fn from_html(html: &str, new_id: &mut dyn FnMut() -> String) -> (Document, V
         task: None,
         marker: None,
         cell: false,
+        captioned: false,
         spare: MAX_SPANNED,
     };
     let mut blocks = Vec::new();
@@ -432,6 +436,8 @@ struct Reader<'f> {
     marker: Option<String>,
     /// Whether a table's cell is being read, where a table reads as its text.
     cell: bool,
+    /// Whether a figure is being read, whose caption is the caption of the pictures in it.
+    captioned: bool,
     /// How many more empty cells may be added where cells span.
     spare: usize,
 }
@@ -550,6 +556,7 @@ impl Reader<'_> {
         if !BLOCKS.contains(&name) {
             match name {
                 "br" => self.line_break(&style),
+                "img" => self.picture(element, out),
                 "input" if element.attribute("type").eq_ignore_ascii_case("checkbox") => {
                     self.task = Some(element.attributes.contains_key("checked"));
                 }
@@ -572,7 +579,9 @@ impl Reader<'_> {
                 let level = name[1..].parse::<u8>().unwrap_or(1);
                 let from = out.len();
                 self.within(BlockKind::Heading { level: level.min(4) }, element, &style, out);
-                if let Some(heading) = out.get(from).filter(|_| level > 4) {
+                // What the heading holds can come out as other blocks, which the note is not about.
+                let lowered = |block: &&Block| level > 4 && matches!(block.kind, BlockKind::Heading { .. });
+                if let Some(heading) = out[from..].iter().find(lowered) {
                     let message = format!("Heading level {level} became level 4");
                     self.notes.push(ImportNote { block: heading.id.to_string(), message });
                 }
@@ -584,6 +593,8 @@ impl Reader<'_> {
             }
             "li" => self.item(element, &style, out),
             "blockquote" => self.container(BlockKind::Quote, element, &style, out),
+            "figure" => self.figure(element, &style, out),
+            "figcaption" if self.captioned => self.within(BlockKind::Caption, element, &style, out),
             "table" => self.table(element, &style, out),
             "p" if element.word_depth().is_some() => {
                 self.marker = None;
@@ -621,6 +632,74 @@ impl Reader<'_> {
             block.body = Body::Text(vec![Run::plain(text)]);
         }
         out.push(block);
+    }
+
+    /// Reads a picture that stands alone in its block as a figure. One amid text has no place in a line, and
+    /// one the clipboard only names by a file or by its bytes cannot be found again: both are left out, as
+    /// is the speck a page uses to count its readers.
+    fn picture(&mut self, element: &Element, out: &mut Vec<Block>) {
+        let src = element.attribute("src").trim();
+        let side = |name: &str| element.attribute(name).trim().trim_end_matches("px").parse::<f32>().ok();
+        let size = (side("width"), side("height"));
+        let speck = [size.0, size.1].into_iter().flatten().any(|side| side.is_nan() || side <= 2.0);
+        let amid = self.cell || self.runs.iter().any(|run| !run.text.trim().is_empty());
+        if amid || speck || !src.starts_with("https://") || src.len() > MAX_ADDRESS {
+            return;
+        }
+        self.blocks = true;
+        self.flush(out);
+        let (width, height) = match size {
+            (Some(width), Some(height)) => figures::fitted(width, height),
+            _ => figures::UNSIZED,
+        };
+        let alt = element.attribute("alt").to_owned();
+        out.push(self.block(BlockKind::Figure {
+            asset: None,
+            src: Some(src.to_owned()),
+            alt,
+            width,
+            height,
+            numbered: false,
+        }));
+    }
+
+    /// Reads a `figure` element: one picture in it is a figure and several are a gallery, with the element's
+    /// caption as theirs. With no picture in it, it is read as what it holds.
+    fn figure(&mut self, element: &Element, style: &Style, out: &mut Vec<Block>) {
+        let mut parts = Vec::new();
+        let captioned = mem::replace(&mut self.captioned, true);
+        self.within(BlockKind::Paragraph, element, style, &mut parts);
+        self.captioned = captioned;
+
+        let is_picture = |part: &Block| matches!(part.kind, BlockKind::Figure { .. });
+        let pictured = parts.iter().any(is_picture);
+        let (mut pictures, mut caption, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+        for mut part in parts {
+            match (&part.kind, &mut part.body) {
+                (BlockKind::Figure { .. }, _) => pictures.push(part),
+                (BlockKind::Caption, Body::Text(runs)) if pictured => {
+                    caption.extend((!caption.is_empty()).then(|| Run::plain("\n")));
+                    caption.append(runs);
+                }
+                (BlockKind::Caption, _) => rest.push(Block { kind: BlockKind::Paragraph, ..part }),
+                _ => rest.push(part),
+            }
+        }
+        let caption = merge(caption);
+        if pictures.len() > 1 {
+            let mut gallery = self.block(BlockKind::Gallery { numbered: false });
+            if !caption.is_empty() {
+                let mut line = self.block(BlockKind::Caption);
+                line.body = Body::Text(caption);
+                pictures.push(line);
+            }
+            gallery.body = Body::Blocks(pictures);
+            out.push(gallery);
+        } else if let Some(mut picture) = pictures.pop() {
+            picture.body = Body::Text(caption);
+            out.push(picture);
+        }
+        out.extend(rest);
     }
 
     /// Reads a list item. The text it opens with is the item, and anything else follows it.
@@ -662,7 +741,9 @@ impl Reader<'_> {
     /// Reads a quote or a callout, whose content is blocks of its own.
     fn container(&mut self, kind: BlockKind, element: &Element, style: &Style, out: &mut Vec<Block>) {
         let mut children = Vec::new();
+        let captioned = mem::take(&mut self.captioned);
         self.within(BlockKind::Paragraph, element, &Style { list: None, ..style.clone() }, &mut children);
+        self.captioned = captioned;
         nest(&mut children);
         if !children.is_empty() {
             let mut block = self.block(kind);

@@ -1,6 +1,6 @@
 //! Markdown to document.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 use std::ops::Range;
 
@@ -8,18 +8,45 @@ use letters_model::{Align, Block, BlockKind, Body, Document, ListKind, Mark, Pro
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use super::{TAGS, TONES};
-use crate::ImportNote;
+use crate::html::Assets;
+use crate::{ImportNote, figures};
 
 /// Quotes and lists nested deeper than this are kept as source, which bounds the reader's recursion.
 const MAX_DEPTH: usize = 32;
 
 const MOVED: &str = "Moved out of a list item";
 const FOOTNOTE: &str = "Footnote kept as text";
+const LINKED: &str = "Image kept as a link";
 
-/// Reads CommonMark and GFM. `new_id` supplies an id for each block.
+/// What [`import_markdown`] read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkdownImport {
+    pub document: Document,
+    /// What the import simplified, each on the block it happened to.
+    pub notes: Vec<ImportNote>,
+    /// The pictures the document shows, by the entry name its blocks use.
+    pub assets: BTreeMap<String, Vec<u8>>,
+}
+
+/// Reads CommonMark and GFM as text alone, as a paste holds it. `new_id` supplies an id for each block.
 ///
 /// Nothing is dropped: what the document cannot hold is kept as text or as a code block and named in a note.
+/// A picture at an `https` address becomes a figure that is still remote. One named by a path has no file to
+/// come from, and is kept as a link.
 pub fn from_markdown(markdown: &str, new_id: &mut dyn FnMut() -> String) -> (Document, Vec<ImportNote>) {
+    let import = import_markdown(markdown, new_id, &mut |_| None);
+    (import.document, import.notes)
+}
+
+/// Reads a Markdown file. `files` reads a file by the path the Markdown names it by, which is relative to the
+/// Markdown file's folder, and so brings in its pictures.
+///
+/// - A paragraph that holds only a picture is a figure, and one that holds several is a gallery. Its caption
+///   is the emphasised line or paragraph under it, or else a lone picture's title.
+/// - A caption that opens with "Figure 2:" makes its figure numbered, and "Figure 2" in the text becomes a
+///   reference to it.
+/// - A picture that `files` lacks or that Letters cannot show is kept as a link, as is one amid text.
+pub fn import_markdown(markdown: &str, new_id: &mut dyn FnMut() -> String, files: Assets) -> MarkdownImport {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
@@ -28,9 +55,21 @@ pub fn from_markdown(markdown: &str, new_id: &mut dyn FnMut() -> String) -> (Doc
         | Options::ENABLE_WIKILINKS;
     let (properties, source) = front_matter(markdown);
     let events = Parser::new_ext(source, options).into_offset_iter().collect();
-    let mut reader = Reader { source, events, at: 0, depth: 0, new_id, notes: Vec::new(), task: None };
+    let mut reader = Reader {
+        source,
+        events,
+        at: 0,
+        depth: 0,
+        new_id,
+        notes: Vec::new(),
+        task: None,
+        files,
+        assets: BTreeMap::new(),
+    };
     let blocks = reader.blocks();
-    (Document { properties, blocks, ..Document::default() }, reader.notes)
+    let mut document = Document { properties, blocks, ..Document::default() };
+    figures::relabel(&mut document);
+    MarkdownImport { document, notes: reader.notes, assets: reader.assets }
 }
 
 /// The fence that opens and closes front matter in each format.
@@ -70,6 +109,9 @@ struct Reader<'a, 'f> {
     notes: Vec<ImportNote>,
     /// The checkbox of the list item being read, once its marker has been seen.
     task: Option<bool>,
+    files: Assets<'f>,
+    /// The pictures read through `files`, by the names their figures use.
+    assets: BTreeMap<String, Vec<u8>>,
 }
 
 impl<'a> Reader<'a, '_> {
@@ -136,6 +178,7 @@ impl<'a> Reader<'a, '_> {
     /// Reads the block that `tag` opens. A list read here starts at `list_depth`.
     fn read(&mut self, tag: Tag<'a>, range: Range<usize>, list_depth: u8, out: &mut Vec<Block>) {
         match tag {
+            Tag::Paragraph if self.pictures(out) => {}
             Tag::Paragraph => {
                 let mut block = self.block(BlockKind::Paragraph);
                 let (runs, formulas) = self.flow(&block);
@@ -276,6 +319,146 @@ impl<'a> Reader<'a, '_> {
             }
         }
         Some(*tone)
+    }
+
+    /// Reads a paragraph that holds only pictures: one is a figure, several are a gallery. An emphasised line
+    /// under them, or the paragraph after them where it is all emphasised, is their caption. Returns false,
+    /// with nothing read, for any other paragraph and where no picture can be shown.
+    fn pictures(&mut self, out: &mut Vec<Block>) -> bool {
+        let (start, noted) = (self.at, self.notes.len());
+        let mut shown = Vec::new();
+        loop {
+            match self.peek(0).cloned() {
+                Some(Event::Start(Tag::Image { dest_url, title, .. })) => {
+                    self.at += 1;
+                    shown.push((dest_url.to_string(), title.to_string(), self.alt()));
+                }
+                Some(Event::SoftBreak | Event::HardBreak) => self.at += 1,
+                Some(Event::Text(text)) if text.trim().is_empty() => self.at += 1,
+                _ => break,
+            }
+        }
+        // Notes on a caption wait under no name for the block that takes it.
+        let holder = Block::new("", BlockKind::Caption);
+        let mut caption = self.caption(&holder);
+        let ends = matches!(self.peek(0), Some(Event::End(TagEnd::Paragraph)));
+        if shown.is_empty() || !ends || caption.as_ref().is_some_and(Option::is_none) {
+            (self.at, _) = (start, self.notes.truncate(noted));
+            return false;
+        }
+        self.at += 1;
+        if caption.is_none() && matches!(self.peek(0), Some(Event::Start(Tag::Paragraph))) {
+            let (from, noted) = (self.at, self.notes.len());
+            self.at += 1;
+            caption = self.caption(&holder).filter(|_| matches!(self.peek(0), Some(Event::End(TagEnd::Paragraph))));
+            match caption {
+                Some(Some(_)) => self.at += 1,
+                _ => (self.at, caption, _) = (from, None, self.notes.truncate(noted)),
+            }
+        }
+        let mut caption = caption.flatten().unwrap_or_default();
+
+        let (mut figures, mut links, mut titles) = (Vec::new(), Vec::new(), Vec::new());
+        for (address, title, alt) in shown {
+            match self.figure(&address, &alt) {
+                Some(figure) => figures.push(figure),
+                None => links.push(Run {
+                    link: Some(address.clone()),
+                    ..Run::plain(if alt.is_empty() { address } else { alt })
+                }),
+            }
+            titles.extend(Some(title).filter(|title| !title.is_empty()));
+        }
+        if figures.is_empty() {
+            (self.at, _) = (start, self.notes.truncate(noted));
+            return false;
+        }
+        // A lone picture's title is its caption where it has no other.
+        if let ([figure], [title], true) = (figures.as_mut_slice(), titles.as_slice(), caption.is_empty()) {
+            figure.body = Body::Text(vec![Run::plain(title)]);
+            titles.clear();
+        }
+        let mut block = match figures.len() {
+            1 => figures.remove(0),
+            _ => self.block(BlockKind::Gallery { numbered: false }),
+        };
+        match &mut block.body {
+            Body::Blocks(children) => {
+                children.extend(figures);
+                if !caption.is_empty() {
+                    let mut line = self.block(BlockKind::Caption);
+                    line.body = Body::Text(mem::take(&mut caption));
+                    children.push(line);
+                }
+            }
+            body if !caption.is_empty() => *body = Body::Text(mem::take(&mut caption)),
+            _ => {}
+        }
+        for note in &mut self.notes[noted..] {
+            note.block = block.id.to_string();
+        }
+        for title in titles {
+            self.note(&block, format!("Image title dropped: {title}"));
+        }
+        out.push(block);
+        if !links.is_empty() {
+            let mut kept = self.block(BlockKind::Paragraph);
+            kept.body = Body::Text(links.into_iter().flat_map(|link| [Run::plain(" "), link]).skip(1).collect());
+            self.note(&kept, LINKED);
+            out.push(kept);
+        }
+        true
+    }
+
+    /// The description of the picture that has just opened, as plain text, read up to its end.
+    fn alt(&mut self) -> String {
+        let (mut alt, mut open) = (String::new(), 1);
+        while open > 0
+            && let Some((event, _)) = self.next()
+        {
+            match event {
+                Event::Start(_) => open += 1,
+                Event::End(_) => open -= 1,
+                Event::Text(text) | Event::Code(text) | Event::InlineMath(text) | Event::DisplayMath(text) => {
+                    alt.push_str(&text);
+                }
+                Event::SoftBreak | Event::HardBreak => alt.push(' '),
+                _ => {}
+            }
+        }
+        alt
+    }
+
+    /// Reads the text up to the next block boundary as a caption. `None` where there is no text, and
+    /// `Some(None)` where there is text that is not a caption: one is emphasised from end to end, and not by
+    /// the tag for text that is only set in italics, which is how a paragraph that is no caption is told apart.
+    fn caption(&mut self, block: &Block) -> Option<Option<Vec<Run>>> {
+        let mut text = Text::default();
+        self.inline(block, &mut text, false);
+        let mut runs = text.runs;
+        if runs.is_empty() {
+            return None;
+        }
+        let mut shown = runs.iter().filter(|run| !run.text.trim().is_empty()).peekable();
+        if text.set_italic || shown.peek().is_none() || !shown.all(|run| run.marks.contains(&Mark::Italic)) {
+            return Some(None);
+        }
+        runs.iter_mut().for_each(|run| _ = run.marks.remove(&Mark::Italic));
+        Some(Some(merge(runs)))
+    }
+
+    /// Makes the figure for a picture at `address`: one that is still remote, or one whose file `files` has.
+    fn figure(&mut self, address: &str, alt: &str) -> Option<Block> {
+        let (asset, src, (width, height)) = if address.starts_with("https://") {
+            (None, Some(address.to_owned()), figures::UNSIZED)
+        } else if address.contains(':') || address.starts_with(['/', '#']) {
+            return None;
+        } else {
+            let path = address.split(['?', '#']).next().unwrap_or_default();
+            let (name, width, height) = figures::asset((self.files)(&unescaped(path))?, &mut self.assets)?;
+            (Some(name), None, (width, height))
+        };
+        Some(self.block(BlockKind::Figure { asset, src, alt: alt.to_owned(), width, height, numbered: false }))
     }
 
     /// Reads a list as flat items. `depth` is how far the list is nested in other lists.
@@ -457,7 +640,7 @@ impl<'a> Reader<'a, '_> {
                     text.links.push((address(&dest_url), text.len));
                 }
                 Event::Start(Tag::Image { dest_url, .. }) => {
-                    self.note(block, "Image kept as a link");
+                    self.note(block, LINKED);
                     text.links.push((address(&dest_url), text.len));
                 }
                 Event::End(TagEnd::Link) => drop(text.links.pop()),
@@ -489,6 +672,8 @@ struct Text {
     tags: Vec<Mark>,
     /// Open links, each with the `len` at which it opened.
     links: Vec<(String, usize)>,
+    /// Whether any of the text was set in italics by the tag that does not emphasise it.
+    set_italic: bool,
 }
 
 impl Text {
@@ -515,6 +700,7 @@ impl Text {
         let (name, closes) = inner.strip_prefix('/').map_or((inner, false), |name| (name, true));
         let Some((_, mark)) = TAGS.iter().find(|(tag, _)| tag.eq_ignore_ascii_case(name)) else { return false };
         if !closes {
+            self.set_italic |= name.eq_ignore_ascii_case("i");
             self.tags.push(mark.clone());
         } else if let Some(open) = self.tags.iter().rposition(|open| open == mark) {
             self.tags.remove(open);
@@ -533,6 +719,19 @@ fn unix_lines(text: &str) -> String {
 /// Maths that sits in a line of text, where a line break in its source is only a space.
 fn one_line(tex: &str) -> String {
     unix_lines(tex).replace('\n', " ")
+}
+
+/// A path as an address writes it, with each `%20` and its like as the character it stands for.
+fn unescaped(path: &str) -> String {
+    let (mut out, mut rest) = (Vec::new(), path.as_bytes());
+    while let [byte, after @ ..] = rest {
+        let hex = after.get(..2).filter(|_| *byte == b'%').and_then(|hex| str::from_utf8(hex).ok());
+        match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+            Some(decoded) => (out.push(decoded), rest = &after[2..]).1,
+            None => (out.push(*byte), rest = after).1,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A link's address. A wiki link can wrap, and an address cannot hold the line break.

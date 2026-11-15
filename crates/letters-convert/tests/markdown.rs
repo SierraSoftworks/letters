@@ -2,7 +2,7 @@
 
 mod common;
 
-use letters_convert::{ImportNote, from_markdown, to_markdown};
+use letters_convert::{ImportNote, from_markdown, import_markdown, markdown_assets, to_markdown};
 use letters_model::{
     Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone,
 };
@@ -41,6 +41,23 @@ fn table(columns: &[Align], header: bool, rows: &[&[&str]]) -> Block {
     holding(BlockKind::Table { columns: columns.to_vec(), header }, rows.iter().map(row).collect())
 }
 
+/// A figure whose picture is still at `src`, at the size one has until its own is known.
+fn figure(src: &str, alt: &str, numbered: bool, caption: Vec<Run>) -> Block {
+    let kind = BlockKind::Figure {
+        asset: None,
+        src: Some(src.into()),
+        alt: alt.into(),
+        width: 320.0,
+        height: 240.0,
+        numbered,
+    };
+    with_text(kind, caption)
+}
+
+/// A picture of 40 by 20 pixels, and one of 1200 by 600.
+const SMALL: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x28\x00\x00\x00\x14\x01\x00\x00\x00\x00\xd7\x3d\x42\x16\x00\x00\x00\x0c\x49\x44\x41\x54\x78\xda\x63\x60\x18\x18\x00\x00\x00\x78\x00\x01\x35\x33\x6e\xa4\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+const WIDE: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x04\xb0\x00\x00\x02\x58\x01\x00\x00\x00\x00\x5a\x9d\x22\xb7\x00\x00\x00\x6f\x49\x44\x41\x54\x78\xda\xed\xc1\x81\x00\x00\x00\x00\xc3\xa0\xf9\x53\x5f\xe1\x00\x55\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xaf\x01\x61\xf7\x00\x01\x76\x1d\xb3\x81\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
 fn linked(text: &str, url: &str) -> Run {
     Run { link: Some(url.into()), ..Run::plain(text) }
 }
@@ -57,6 +74,23 @@ fn settled(doc: &Document) -> Document {
             other => other.clone(),
         };
         let mut kind = block.kind.clone();
+        // A caption is written in italics from end to end, and one with nothing to show is not written.
+        let numbered = match &mut kind {
+            BlockKind::Figure { alt, numbered, .. } => {
+                *alt = alt.replace(['\n', '\r'], " ");
+                Some(*numbered)
+            }
+            BlockKind::Caption => Some(true),
+            _ => None,
+        };
+        if let (Some(numbered), Body::Text(runs)) = (numbered, &mut body) {
+            let upright = |run: &Run| Run {
+                marks: run.marks.iter().filter(|mark| **mark != Mark::Italic).cloned().collect(),
+                ..run.clone()
+            };
+            let shown = numbered || block.body.runs().iter().any(|run| !run.text.trim().is_empty());
+            *runs = settle(&block.body.runs().iter().filter(|_| shown).map(upright).collect::<Vec<_>>());
+        }
         if let (BlockKind::Table { columns, .. }, Body::Blocks(rows)) = (&mut kind, &mut body) {
             let width = rows.iter().map(|row| row.body.blocks().len()).chain([columns.len(), 1]).max().unwrap_or(1);
             columns.resize(width, Align::Start);
@@ -222,6 +256,169 @@ fn writes_a_table() {
     ];
     for (block, expected) in cases {
         assert_eq!(to_markdown(&doc(vec![block.clone()])), expected, "writing {block:?}");
+    }
+}
+
+#[test]
+fn reads_pictures() {
+    let (a, b) = ("https://example.com/a.png", "https://example.com/b.png");
+    let cases: &[(String, &[&str])] = &[
+        (format!("![A cat]({a})"), &[r#"figure https://example.com/a.png [A cat] """#]),
+        // The caption is the emphasised paragraph under the picture, or the emphasised line.
+        (
+            format!("![A *fine* cat]({a})\n\n*It **sat** down.*\n\nNext"),
+            &[r#"figure https://example.com/a.png [A fine cat] "It <bold|sat> down.""#, r#"p "Next""#],
+        ),
+        (format!("![a]({a})\n_Under it_"), &[r#"figure https://example.com/a.png [a] "Under it""#]),
+        (format!("![a]({a} \"Its title\")"), &[r#"figure https://example.com/a.png [a] "Its title""#]),
+        (
+            format!("![a]({a})\n![b]({b})\n\n*Both*"),
+            &[
+                "gallery",
+                r#"  figure https://example.com/a.png [a] """#,
+                r#"  figure https://example.com/b.png [b] """#,
+                r#"  caption "Both""#,
+            ],
+        ),
+        // Only a paragraph that is emphasised from end to end is a caption.
+        (
+            format!("![a]({a})\n\n*Not* a caption"),
+            &[r#"figure https://example.com/a.png [a] """#, r#"p "<italic|Not> a caption""#],
+        ),
+        (
+            format!("![a]({a})\n\n<i>Aside</i>"),
+            &[r#"figure https://example.com/a.png [a] """#, r#"p "<italic|Aside>""#],
+        ),
+        // A caption that opens with a number makes its figure numbered, and the text can refer to it.
+        (
+            format!("See Figure 2, not Figure 9.\n\n![a]({a})\n\n*Figure 2: Rates*"),
+            &[r#"p "See <ref:b2|Figure 2>, not Figure 9.""#, r#"figure# https://example.com/a.png [a] "Rates""#],
+        ),
+        (
+            format!("![a]({a})\n![b]({b})\n\n*Figure 1*\n\nAs Figure 1 shows."),
+            &[
+                "gallery#",
+                r#"  figure https://example.com/a.png [a] """#,
+                r#"  figure https://example.com/b.png [b] """#,
+                r#"p "As <ref:b3|Figure 1> shows.""#,
+            ],
+        ),
+    ];
+    for (markdown, expected) in cases {
+        let (doc, notes) = read(markdown);
+        assert_eq!(outline(&doc), *expected, "reading {markdown:?}");
+        assert_eq!(notes, [], "reading {markdown:?}");
+    }
+}
+
+#[test]
+fn brings_in_the_pictures_a_file_names() {
+    let files = |path: &str| match path {
+        "img/small one.png" => Some(SMALL.to_vec()),
+        "wide.png" => Some(WIDE.to_vec()),
+        "notes.txt" => Some(b"not a picture".to_vec()),
+        _ => None,
+    };
+    let markdown = concat!(
+        "![Small](img/small%20one.png)\n\n![Wide](wide.png)\n\n![Again](<img/small one.png>)\n\n",
+        "![Text](notes.txt)\n\n![Gone](gone.png)\n\n![Plain](http://example.com/plain.png)\n",
+    );
+    let mut next = 0;
+    let mut new_id = || {
+        next += 1;
+        format!("b{next}")
+    };
+    let import = import_markdown(markdown, &mut new_id, &mut { files });
+
+    let sizes: Vec<(Option<String>, f32, f32)> = import
+        .document
+        .blocks
+        .iter()
+        .filter_map(|block| match &block.kind {
+            BlockKind::Figure { asset, width, height, .. } => Some((asset.clone(), *width, *height)),
+            _ => None,
+        })
+        .collect();
+    let [(Some(small), 30.0, 15.0), (Some(wide), 480.0, 240.0), (Some(again), 30.0, 15.0)] = sizes.as_slice() else {
+        panic!("three figures at the sizes of their pictures, the wide one fitted to a page: {sizes:?}");
+    };
+    assert_eq!(small, again, "one picture is kept once");
+    assert!(small.starts_with("assets/") && small.ends_with(".png"), "{small}");
+    assert_eq!(import.assets.get(small).map(Vec::as_slice), Some(SMALL));
+    assert_eq!(import.assets.get(wide).map(Vec::as_slice), Some(WIDE));
+    assert_eq!(import.assets.len(), 2);
+
+    // What cannot be shown stays, as a link to where it was.
+    let kept: Vec<&Block> = import.document.blocks.iter().filter(|block| block.kind == BlockKind::Paragraph).collect();
+    let links: Vec<_> = kept.iter().map(|block| block.body.runs()[0].link.as_deref()).collect();
+    assert_eq!(links, [Some("notes.txt"), Some("gone.png"), Some("http://example.com/plain.png")]);
+    assert_eq!(import.notes.len(), 3, "{:?}", import.notes);
+
+    // An export names each picture by its entry, and reads back with those entries beside it.
+    let exported = to_markdown(&import.document);
+    assert!(exported.contains(&format!("![Small]({small})")), "{exported}");
+    assert_eq!(
+        markdown_assets(&import.document).into_iter().collect::<Vec<_>>(),
+        import.assets.keys().cloned().collect::<Vec<_>>()
+    );
+    let again = import_markdown(&exported, &mut String::new, &mut |path| import.assets.get(path).cloned());
+    assert_eq!(settled(&again.document), settled(&import.document));
+}
+
+#[test]
+fn writes_pictures() {
+    let (a, b) = ("https://example.com/a.png", "https://example.com/b.png");
+    let plain = |text: &str| with_text(BlockKind::Paragraph, vec![Run::plain(text)]);
+    let held = BlockKind::Figure {
+        asset: Some("assets/0a1b.png".into()),
+        src: None,
+        alt: "Held".into(),
+        width: 30.0,
+        height: 15.0,
+        numbered: false,
+    };
+    let both = |numbered, caption: Option<&str>| {
+        let caption = caption.map(|text| with_text(BlockKind::Caption, vec![Run::plain(text)]));
+        let parts = [figure(a, "a", false, vec![]), figure(b, "b", false, vec![])].into_iter().chain(caption);
+        holding(BlockKind::Gallery { numbered }, parts.collect())
+    };
+    let cases = [
+        (vec![figure(a, "A cat", false, vec![])], "![A cat](https://example.com/a.png)\n".to_owned()),
+        (vec![with_text(held, vec![])], "![Held](assets/0a1b.png)\n".to_owned()),
+        (
+            vec![figure(
+                a,
+                "A [fine]\ncat",
+                false,
+                vec![Run::plain("It "), Run::marked("sat", [Mark::Bold]), Run::plain(" down.")],
+            )],
+            format!("![A \\[fine\\] cat]({a})\n\n*It **sat** down.*\n"),
+        ),
+        (vec![both(false, Some("Both"))], format!("![a]({a})\n![b]({b})\n\n*Both*\n")),
+        // A numbered caption opens with its number, and a reference reads as it whatever text it holds.
+        (
+            vec![
+                with_text(
+                    BlockKind::Paragraph,
+                    vec![Run::plain("See "), Run::marked("the chart", [Mark::Ref("f".into())]), Run::plain(".")],
+                ),
+                figure(a, "a", true, vec![Run::plain("Rates")]),
+                Block { id: "f".into(), ..both(true, None) },
+            ],
+            format!("See Figure 2.\n\n![a]({a})\n\n*Figure 1: Rates*\n\n![a]({a})\n![b]({b})\n\n*Figure 2*\n"),
+        ),
+        // A paragraph in italics under a picture with no caption is not its caption.
+        (
+            vec![
+                figure(a, "a", false, vec![]),
+                with_text(BlockKind::Paragraph, vec![Run::marked("Aside", [Mark::Italic])]),
+                plain("b"),
+            ],
+            format!("![a]({a})\n\n<i>Aside</i>\n\nb\n"),
+        ),
+    ];
+    for (blocks, expected) in cases {
+        assert_eq!(to_markdown(&doc(blocks)), expected);
     }
 }
 
@@ -616,6 +813,9 @@ fn round_trips_canonical_markdown_unchanged() {
         "- not a | table\n  - \\|\n",
         "Before\n\n| Name | Size |\n| --- | --: |\n| `a\\|b` | $x^2$ |\n| *c* |  |\n\nAfter\n",
         "> |  |  |\n> | :-: | --- |\n> | no | header |\n",
+        "See Figure 1.\n\n![A cat](https://example.com/cat.png)\n\n*Figure 1: A **fine** cat.*\n",
+        "![a](https://example.com/a.png)\n![b](<https://example.com/b c.png>)\n\n*Both.*\n\n*Not a caption.*\n",
+        "> ![a](https://example.com/a.png)\n>\n> <i>An aside.</i>\n",
         "---\ntitle: Notes\n---\n\n# Notes\n\nSo $x^2$ holds:\n\n$$\nx^2 \\ge 0\n$$\n",
         "+++\ntitle = \"Notes\"\n+++\n",
     ];
@@ -744,6 +944,8 @@ fn any_blocks() -> impl Strategy<Value = Vec<Block>> {
         1 => proptest::option::of(prop_oneof![any_tex(), any_text()])
             .prop_map(|tex| with_text(BlockKind::Formula, tex.into_iter().map(Run::plain).collect())),
         1 => any_table(),
+        1 => any_figure(prop_oneof![2 => any_runs(), 1 => Just(Vec::new())]),
+        1 => any_gallery(),
     ];
     let block = leaf.prop_recursive(3, 16, 4, move |inner| {
         let children = proptest::collection::vec(inner, 0..4);
@@ -768,6 +970,30 @@ fn any_table() -> impl Strategy<Value = Block> {
             holding(BlockKind::Table { columns, header: header && headed || rows.len() == 1 }, rows)
         },
     )
+}
+
+/// A figure whose picture is still remote, which is what Markdown alone can name.
+fn any_figure(caption: impl Strategy<Value = Vec<Run>>) -> impl Strategy<Value = Block> {
+    let src = proptest::sample::select(vec!["https://example.com/a.png", "https://example.com/b (c).png?d=1&amp;e"]);
+    (src, any_text(), any::<bool>(), caption)
+        .prop_map(|(src, alt, numbered, caption)| figure(src, &alt, numbered, caption))
+}
+
+/// A gallery as Markdown can say one: several pictures with no captions of their own, then at most one caption.
+fn any_gallery() -> impl Strategy<Value = Block> {
+    let caption = any_runs()
+        .prop_filter("a caption shows", |runs| runs.iter().any(|run| !run.text.trim().is_empty()))
+        .prop_map(|runs| with_text(BlockKind::Caption, runs));
+    let figures = proptest::collection::vec(any_figure(Just(Vec::new())), 2..4);
+    (figures, proptest::option::of(caption), any::<bool>()).prop_map(|(mut parts, caption, numbered)| {
+        for part in &mut parts {
+            if let BlockKind::Figure { numbered, .. } = &mut part.kind {
+                *numbered = false;
+            }
+        }
+        parts.extend(caption);
+        holding(BlockKind::Gallery { numbered }, parts)
+    })
 }
 
 /// Markdown nests a list item under the one before it, so an item goes at most one level deeper than that.
@@ -818,7 +1044,7 @@ fn any_markdown() -> impl Strategy<Value = String> {
             "\n", "\n\n", "# ", "## ", "###### ", "- ", "* ", "1. ", "7) ", "- [ ] ", "- [x] ", "> ", "> > ", "  ", "    ",
             "```\n", "~~~rust\n", "---\n", "===\n", "> [!NOTE]\n", "> [!warn] ", "[!TIP]", "| a | b |\n|---|---|\n", "<div>\n",
             "<!-- c -->", "<u>", "</u>", "<mark>", "<br>", "<span>", "$", "$$\n", "[^1]", "[^1]: ", "[a]: /b\n", "[a]",
-            "[[w]]", "![i](s)", "[l](u \"t\")", "<https://e.com>", "&#32;", "&amp;", "\\\n", "  \n", "+++\n", "\r\n",
+            "[[w]]", "![i](s)", "![i](https://e.com/s.png)\n", "*Figure 1: c*\n", "Figure 1", "[l](u \"t\")", "<https://e.com>", "&#32;", "&amp;", "\\\n", "  \n", "+++\n", "\r\n",
         ])
         .prop_map(str::to_owned),
     ];
