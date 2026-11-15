@@ -9,8 +9,8 @@ use std::rc::{Rc, Weak};
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Function, Object, Reflect};
-use letters_editor::{Clip, Editor, Modifiers, Platform as _};
-use letters_model::{Document, HistoryError, Pos, ReplicaId, Selection};
+use letters_editor::{Clip, Modifiers, Platform as _};
+use letters_model::{Document, HistoryError, ReplicaId};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Point, Rect, Size};
@@ -19,7 +19,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use web_sys::{
     CanvasRenderingContext2d, ClipboardEvent, CompositionEvent, Element, Event, EventTarget, HtmlCanvasElement,
-    HtmlTextAreaElement, ImageData, KeyboardEvent, MediaQueryList, MouseEvent, PointerEvent, WheelEvent, Window,
+    HtmlIFrameElement, HtmlTextAreaElement, ImageData, KeyboardEvent, MediaQueryList, MouseEvent, PointerEvent,
+    WheelEvent, Window,
 };
 
 use crate::browser::Browser;
@@ -364,6 +365,15 @@ impl Shell {
     fn paint(&mut self) {
         self.frame_due = false;
         let start = self.platform.now();
+        // What stood in for the window until now. The person may have read on in it while the editor was
+        // on its way, and the editor opens where they are.
+        let page = self.window.document().filter(|_| self.stats.first_frame_ms.is_none());
+        let first = page.and_then(|page| page.get_element_by_id(page::FIRST_PAINT));
+        if let Some(read) = first.as_ref().map(read_to).filter(|read| *read > 0.0) {
+            let middle =
+                Point { x: self.canvas.client_width() as f32 / 2.0, y: self.canvas.client_height() as f32 / 2.0 };
+            self.view.scroll(middle, Point { x: 0.0, y: read as f32 }, &mut self.platform);
+        }
         if let Some((at, by)) = self.touch.glide(start) {
             self.view.scroll(at, by, &mut self.platform);
             // Nothing moved, so the page is at its end.
@@ -384,11 +394,10 @@ impl Shell {
         self.stats.frames += 1;
         if self.stats.first_frame_ms.is_none() {
             self.stats.first_frame_ms = Some(end);
-            // The canvas shows the document now, so the HTML that stood in for it goes.
-            let page = self.window.document();
-            if let Some(first) = page.and_then(|page| page.get_element_by_id(page::FIRST_PAINT)) {
-                first.remove();
-            }
+        }
+        // The canvas shows the window now, so what stood in for it goes.
+        if let Some(first) = first {
+            first.remove();
         }
         self.stats.frame_ms = end - start;
         self.wake_at(wake);
@@ -627,15 +636,18 @@ fn place(event: &PointerEvent) -> Point {
     Point { x: event.offset_x() as f32, y: event.offset_y() as f32 }
 }
 
+/// How far down the document the person has scrolled the HTML that stands in for it.
+fn read_to(first: &Element) -> f64 {
+    let frame =
+        first.query_selector("iframe").ok().flatten().and_then(|frame| frame.dyn_into::<HtmlIFrameElement>().ok());
+    frame.and_then(|frame| frame.content_window()).and_then(|inner| inner.scroll_y().ok()).unwrap_or(0.0)
+}
+
 /// A window on `document`, set up for this browser.
 fn view(document: Document, platform: &mut Browser, mac: bool) -> View {
-    let end = document.blocks.last().map(|block| Pos::new(block.id.clone(), usize::MAX));
-    let mut view = View::new(Editor::new(document, ReplicaId::new(&platform.new_id())));
+    let mut view = page::window(document, ReplicaId::new(&platform.new_id()));
     view.set_keys(if mac { Keys::Mac } else { Keys::Standard });
     view.set_user_words(platform.user_words());
-    if let Some(end) = end {
-        view.select(Selection::caret(end));
-    }
     view
 }
 
