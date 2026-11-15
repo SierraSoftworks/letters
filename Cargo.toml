@@ -85,6 +85,8 @@ softbuffer = "0.4"
 accesskit_winit = "0.34"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
 rfd = "0.17"
+# Lists the system's font files and their families, in Rust alone. For what the bundled fonts cannot draw.
+fontdb = "0.24"
 # The desktop shell fetches linked pictures with it: no cookies, no proxies, the system's own roots.
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
 # A server for the fetch's tests.
