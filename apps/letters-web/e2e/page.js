@@ -23,6 +23,16 @@ export const frames = (page) => page.evaluate(() => window.letters.frames);
 /** Waits for the frame that follows an edit, and for the spelling check that runs once it is painted. */
 export const rested = (page) => page.evaluate(() => new Promise((done) => requestAnimationFrame(() => setTimeout(done, 100))));
 
+/** Types a word no dictionary has, and adds it to the person's own from the menu the Menu key opens on it. */
+export const learn = async (page, word) => {
+  await page.keyboard.type(`${word} `);
+  await rested(page);
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.press("ArrowLeft");
+  await page.locator("textarea").dispatchEvent("contextmenu");
+  await page.getByRole("menuitem", { name: "Add to my dictionary" }).dispatchEvent("click");
+};
+
 /** Opens the document's history. Its versions are the options of its list. */
 export const history = async (page) => {
   await page.keyboard.press("ControlOrMeta+Shift+p");

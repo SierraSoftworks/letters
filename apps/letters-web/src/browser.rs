@@ -152,6 +152,10 @@ pub async fn decode(window: &Window, bytes: &[u8]) -> Option<Image> {
 /// Where this browser keeps the person's own words, a line each, as their dictionary file does elsewhere.
 const WORDS: &str = "letters.words";
 
+/// Where this browser keeps those of the person's words their account is yet to be told, a line each. A
+/// browser that has none has asked no account, and no word of it was told.
+const UNSENT: &str = "letters.words.unsent";
+
 /// Where this browser keeps the person's default style, as a `style.json`, until an account keeps it.
 const STYLE: &str = "letters.style";
 
@@ -176,8 +180,8 @@ pub struct Browser {
     pub assets: HashMap<String, Vec<u8>>,
     /// The names of those the editor put in since the shell last looked, for a server to be handed.
     pub stored: Vec<String>,
-    /// Whether the person added a word to their own since the shell last looked, for a server to be told.
-    pub learned: bool,
+    /// The words the person added to their own since the shell last looked, for a server to be told.
+    pub learned: Vec<String>,
 }
 
 /// The page's async clipboard. Read by name: the binding to it is not in every release of `web-sys`.
@@ -293,7 +297,7 @@ impl Browser {
             copied: None,
             assets: HashMap::new(),
             stored: Vec::new(),
-            learned: false,
+            learned: Vec::new(),
         })
     }
 
@@ -319,6 +323,33 @@ impl Browser {
         if let Some(storage) = &self.storage {
             let _ = storage.set_item(WORDS, &words.join("\n"));
         }
+    }
+
+    /// The words of this browser that the person's account is yet to be told.
+    pub fn unsent_words(&self) -> Vec<String> {
+        let kept = self.storage.as_ref().and_then(|storage| storage.get_item(UNSENT).ok().flatten());
+        kept.map_or_else(|| self.user_words(), |kept| kept.lines().map(str::to_owned).collect())
+    }
+
+    /// Keeps `words` as those the person's account is yet to be told.
+    pub fn keep_unsent_words(&self, words: &[String]) {
+        if let Some(storage) = &self.storage {
+            let _ = storage.set_item(UNSENT, &words.join("\n"));
+        }
+    }
+
+    /// Takes a word out of the person's own, as they asked.
+    pub fn forget_word(&self, word: &str) {
+        let without = |words: Vec<String>| words.into_iter().filter(|known| known != word).collect::<Vec<_>>();
+        self.keep_user_words(&without(self.user_words()));
+        if self.told_an_account() {
+            self.keep_unsent_words(&without(self.unsent_words()));
+        }
+    }
+
+    /// Whether an account was ever told this browser's words.
+    fn told_an_account(&self) -> bool {
+        self.storage.as_ref().is_some_and(|storage| matches!(storage.get_item(UNSENT), Ok(Some(_))))
     }
 
     /// The `style.json` the person kept as their default in this browser, if they kept one.
@@ -435,6 +466,12 @@ impl Platform for Browser {
         words.push(word.to_owned());
         // Storage that is full or turned off keeps nothing, and the word still holds until the page closes.
         self.keep_user_words(&words);
-        self.learned = true;
+        // Until an account takes it: the page may close first, or show to someone with no account.
+        if self.told_an_account() {
+            let mut unsent = self.unsent_words();
+            unsent.push(word.to_owned());
+            self.keep_unsent_words(&unsent);
+        }
+        self.learned.push(word.to_owned());
     }
 }

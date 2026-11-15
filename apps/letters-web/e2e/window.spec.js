@@ -2,7 +2,7 @@
 
 import { expect, test } from "@playwright/test";
 
-import { ready, rested, texts } from "./page.js";
+import { learn, ready, rested, texts } from "./page.js";
 
 /** Where the caret is on the page, which is where the hidden input is kept. */
 const caret = (page) => page.locator("textarea").boundingBox();
@@ -20,12 +20,7 @@ test("the secondary button on a misspelled word offers words to mend it with", a
 });
 
 test("a word added from the Menu key's menu is kept in this browser", async ({ page }) => {
-  await page.keyboard.type("Zorvex ");
-  await rested(page);
-  await page.keyboard.press("ArrowLeft");
-  await page.keyboard.press("ArrowLeft");
-  await page.locator("textarea").dispatchEvent("contextmenu");
-  await page.getByRole("menuitem", { name: "Add to my dictionary" }).dispatchEvent("click");
+  await learn(page, "Zorvex");
   await expect.poll(() => page.evaluate(() => localStorage.getItem("letters.words"))).toBe("Zorvex");
   expect((await texts(page)).at(-1)).toBe("Zorvex ");
 });

@@ -23,10 +23,10 @@ use letters_model::{
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::{Color, DisplayList, Font, Point, Rect, Size};
 use letters_sync::{Client, Link, Local, Progress, Role};
-use letters_trust::{LinkDecision, Origin, Trust};
+use letters_trust::{HttpsUrl, LinkDecision, Origin, Trust};
 use letters_ui::{
     Access, Appearance, Connection, CopyFormat, Cursor, Edge, Keys, LinkPreviewFound, Peer, PictureState, Request,
-    SaveState, Scheme, Settings, Shared, Uncovered, Window as View, WordList, tokens,
+    SaveState, Scheme, Settings, Shared, TrustedSource, Uncovered, Window as View, WordList, tokens,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
@@ -202,9 +202,9 @@ pub struct Shell {
     on_slow: Function,
     /// The timer for the next of them. `None` with pictures waiting while one is being asked for.
     slow_timer: Option<i32>,
-    /// The hosts whose pictures the person said they trust, for as long as the page is open. The server
-    /// has nowhere to keep them.
-    hosts: Vec<String>,
+    /// The sources of linked pictures the person trusts: those their account keeps, which the server
+    /// fetches from unasked, or without an account those they said on this page, for as long as it is open.
+    sources: Vec<letters_trust::Source>,
     /// The page of the server the person asked for, which waits until the server has what they wrote.
     leaving: Option<String>,
     /// Whether the server makes links to its documents, once it has said.
@@ -406,7 +406,7 @@ impl Shell {
                 slow: VecDeque::new(),
                 on_slow: callback(shell, Self::link_again),
                 slow_timer: None,
-                hosts: Vec::new(),
+                sources: Vec::new(),
                 leaving: None,
                 links: None,
                 account: None,
@@ -1353,7 +1353,15 @@ impl Shell {
                 Request::LoadPicture(src) => self.link(src, Linking::Once),
                 Request::EmbedPicture { figure, src } => self.link(src, Linking::Embed(figure)),
                 // The window asks for that host's pictures again by itself.
-                Request::TrustPictures(src) => self.hosts.extend(host(&src)),
+                Request::TrustPictures(src) => {
+                    if let Ok(url) = HttpsUrl::parse(&src) {
+                        let host = letters_trust::Source::host_of(&url);
+                        self.tell_source(host.to_string(), true, false);
+                        self.sources.push(host);
+                    }
+                }
+                Request::TrustSource(source) => self.tell_source(source, true, true),
+                Request::ForgetSource(source) => self.tell_source(source, false, false),
                 Request::FetchPreview { url } => self.preview(url),
                 Request::Connect => self.tell(|client, _, now| client.start(now)),
                 // The window has taken the settings already. The rest is the shell's: keeping them, the
@@ -1363,6 +1371,12 @@ impl Shell {
                     follow(&mut self.view, settings);
                     self.view.set_dark(self.dark());
                     self.keep_settings();
+                }
+                // The window has dropped the word already, and the person's other tabs hear of it from the
+                // browser's storage.
+                Request::ForgetWord(word) => {
+                    self.platform.forget_word(&word);
+                    self.tell_word(word, false);
                 }
                 // A page has no folders to write in: a copy is a file the browser keeps for the person.
                 Request::SaveCopy { name, format, .. } => self.copy(name, format, None),
@@ -1399,8 +1413,8 @@ impl Shell {
             self.changed();
         }
         self.keep_pictures();
-        if mem::take(&mut self.platform.learned) {
-            self.keep_settings();
+        for word in mem::take(&mut self.platform.learned) {
+            self.tell_word(word, true);
         }
         self.keep_up();
         self.go();
@@ -2030,10 +2044,50 @@ impl Shell {
             shell.take_settings(settings);
             shell.arrived();
         });
+        // A visitor has no sources of their own, and their settings then list none.
+        let asked = browser::ask(&self.window, "GET", paths::OWN_SOURCES, None);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Ok(Ok(sources)) = asked.await.map(|answer| serde_json::from_slice(&answer)) else { return };
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            shell.take_sources(sources);
+            shell.arrived();
+        });
     }
 
-    /// Takes what the server keeps for the person, in place of what this browser kept. The words and the
-    /// default style this browser has and the server lacks are theirs too, and the server is told.
+    /// Takes the sources of linked pictures the person's account keeps, as the server writes them.
+    fn take_sources(&mut self, sources: Vec<String>) {
+        self.sources = sources.iter().filter_map(|source| letters_trust::Source::parse(source).ok()).collect();
+        let listed = sources.into_iter().map(|source| TrustedSource { source, fixed: false }).collect();
+        self.view.set_trusted_sources(listed);
+    }
+
+    /// Has the person's account keep a source of linked pictures, or let one go. The server answers all
+    /// of them, and says in a sentence why something is no source: `typed` is whether the person wrote it
+    /// in their settings, where the sentence shows under the field. Without an account nothing is kept.
+    fn tell_source(&mut self, source: String, add: bool, typed: bool) {
+        if self.account.is_none() {
+            return;
+        }
+        let sent = browser::ask(&self.window, if add { "PUT" } else { "DELETE" }, &paths::own_source(&source), None);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let answer = sent.await.map(|sources| serde_json::from_slice(&sources));
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            match answer {
+                Ok(Ok(sources)) => shell.take_sources(sources),
+                Ok(Err(_)) => {}
+                Err(refusal) if typed => shell.view.refuse_source(&refusal.message),
+                Err(refusal) => shell.say(refusal.message),
+            }
+            shell.arrived();
+        });
+    }
+
+    /// Takes what the server keeps for the person, in place of what this browser kept. A default style
+    /// this browser has and the server lacks is theirs too, and the server is told.
     fn take_settings(&mut self, theirs: letters_api::Settings) {
         let settings = Settings {
             appearance: match theirs.appearance {
@@ -2046,9 +2100,13 @@ impl Shell {
             language: theirs.language.clone(),
         };
         self.platform.keep_settings(&settings);
+        // The account's words are all there are, so that one taken out elsewhere is not brought back here.
+        // It is still to be told those this browser took when it could tell no account.
+        let mut alone = self.platform.unsent_words();
+        alone.retain(|word| !theirs.dictionary.contains(word));
+        self.platform.keep_unsent_words(&alone);
         let mut words = theirs.dictionary.clone();
-        let ours = self.platform.user_words();
-        words.extend(ours.into_iter().filter(|word| !theirs.dictionary.contains(word)));
+        words.extend(alone.iter().cloned());
         self.platform.keep_user_words(&words);
         if let Some(style) = &theirs.default_style {
             self.platform.keep_default_style(&style.to_string());
@@ -2063,6 +2121,48 @@ impl Shell {
         self.fit();
         self.account = Some(theirs);
         self.keep_settings();
+        alone.into_iter().for_each(|word| self.tell_word(word, true));
+    }
+
+    /// Has the person's account keep a word they added to their own, or take out one they removed. The
+    /// server takes a word at a time and answers all of them, which are then the words this browser has:
+    /// two devices that change them at once both have their way. Without an account the browser keeps
+    /// the word, for the account that next answers.
+    fn tell_word(&mut self, word: String, add: bool) {
+        if self.account.is_none() {
+            return;
+        }
+        let sent = browser::ask(&self.window, if add { "PUT" } else { "DELETE" }, &paths::word(&word), None);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let answer = sent.await.map(|words| serde_json::from_slice::<Vec<String>>(&words));
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            let mut unsent = shell.platform.unsent_words();
+            match answer {
+                Ok(Ok(mut words)) => {
+                    unsent.retain(|unsent| *unsent != word && !words.contains(unsent));
+                    if let Some(account) = &mut shell.account {
+                        account.dictionary.clone_from(&words);
+                    }
+                    // An answer may overtake that for a word sent after it.
+                    words.extend(unsent.iter().cloned());
+                    shell.platform.keep_user_words(&words);
+                    shell.view.set_user_words(words);
+                }
+                Ok(Err(_)) => {}
+                Err(refusal) => {
+                    // A word the server will not have is not offered to it again. One it could not be
+                    // asked for is, when the page next opens.
+                    if refusal.code == Code::Invalid {
+                        unsent.retain(|unsent| *unsent != word);
+                    }
+                    shell.say(refusal.message);
+                }
+            }
+            shell.platform.keep_unsent_words(&unsent);
+            shell.arrived();
+        });
     }
 
     /// Has the server keep what the person set, where it differs from what the server has. The server
@@ -2079,7 +2179,8 @@ impl Shell {
                 Appearance::System => None,
             },
             accent: set.accent,
-            dictionary: self.platform.user_words(),
+            // The words go a word at a time (`tell_word`): the server takes none from here.
+            dictionary: kept.dictionary.clone(),
             default_style: self.platform.kept_default_style().or_else(|| kept.default_style.clone()),
         };
         if ours == *kept {
@@ -2372,7 +2473,7 @@ impl Shell {
             // The window asks again by itself once the document is trusted.
             return self.view.set_picture_state(&src, Some(PictureState::Held));
         }
-        let trusted = host(&src).is_some_and(|host| self.hosts.contains(&host));
+        let trusted = HttpsUrl::parse(&src).is_ok_and(|url| self.sources.iter().any(|source| source.allows(&url)));
         self.view.set_picture_trusted(&src, trusted);
         let asked = trusted || !matches!(link, Linking::Open);
         // A picture nobody asked for waits as it is: the server may well not fetch it.
@@ -2944,11 +3045,6 @@ fn fetching(
 ) -> impl Future<Output = Result<Vec<u8>, letters_api::Error>> + 'static + use<> {
     let fetch = serde_json::to_vec(fetch).expect("an address to fetch is JSON");
     browser::ask(window, "POST", path, Some((letters_api::JSON, &fetch)))
-}
-
-/// The host of an address, which is what a person trusts pictures from.
-fn host(src: &str) -> Option<String> {
-    Url::new(src).ok().map(|url| url.host()).filter(|host| !host.is_empty())
 }
 
 /// Why the server did not fetch, in words that read on from "Not loaded:": its own sentence, as part of one.

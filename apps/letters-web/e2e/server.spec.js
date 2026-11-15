@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 
 import { expect, test } from "@playwright/test";
 
-import { rested, texts } from "./page.js";
+import { learn, rested, texts } from "./page.js";
 
 test.skip(!process.env.LETTERS_WEB_DIST, "letters-server is built with the editor when LETTERS_WEB_DIST names dist/");
 // The first run builds the server.
@@ -155,6 +155,36 @@ test("a link's reader, signed in nowhere, reads the document and is offered only
     await reader.emulateMedia({ media: "print" });
     await expect(reader.locator("canvas")).toBeHidden();
     expect(await reader.evaluate(() => window.blocked)).toEqual([]);
+  } finally {
+    server.stop();
+  }
+});
+
+test("a word and a source of pictures a person adds in one browser are theirs in the next", async ({ browser }) => {
+  const server = await served();
+  try {
+    const ada = await server.browser(browser, "ada");
+    const made = await ada.request.post("/api/v1/spaces/family/documents", { data: { name: "Minutes" }, headers: { origin: server.url } });
+    const { id } = await made.json();
+    const settings = async (page) => {
+      await page.keyboard.press("ControlOrMeta+,");
+      return page.getByRole("dialog", { name: "Settings" });
+    };
+    const first = await open(ada, id);
+    await learn(first, "Zorvex");
+    const field = await (await settings(first)).getByRole("textbox", { name: "Trust a source" }).boundingBox();
+    await first.mouse.click(field.x + field.width / 2, field.y + field.height / 2);
+    await first.keyboard.type("img.example.org");
+    await first.keyboard.press("Enter");
+    await expect(first.getByRole("listitem", { name: "https://img.example.org/" })).toBeAttached();
+
+    // Another browser of theirs has kept nothing: what it lists is the account's.
+    const next = await open(await server.browser(browser, "ada"), id);
+    const dialog = await settings(next);
+    for (const name of ["Zorvex", "https://img.example.org/"]) {
+      await expect(dialog.getByRole("listitem", { name })).toBeAttached();
+    }
+    expect(await next.evaluate(() => window.blocked)).toEqual([]);
   } finally {
     server.stop();
   }

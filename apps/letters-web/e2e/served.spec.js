@@ -6,7 +6,7 @@ import { expect, test } from "@playwright/test";
 
 import { createHash } from "node:crypto";
 
-import { INK, blocks, carry, entry, file, inked, png, rested, texts } from "./page.js";
+import { INK, blocks, carry, entry, file, inked, learn, png, rested, texts } from "./page.js";
 import { album, opened, picture, room, serve } from "./server.js";
 
 const DOCUMENT = `/api/v1/documents/${opened().id}`;
@@ -272,6 +272,124 @@ test("what the person set elsewhere is how the page is, and what they set here i
   await expect.poll(() => asked.map(({ method, path }) => `${method} ${path}`)).toEqual(["PUT /api/v1/settings"]);
   expect(JSON.parse(asked[0].body)).toEqual({ ...theirs, appearance: "light" });
 });
+
+/**
+ * An account that holds `words` and `sources` of pictures, and takes one or lets one go as the server does.
+ * `refusal` is its answer to either instead.
+ */
+const WORD = "/api/v1/settings/dictionary/";
+const SOURCE = "/api/v1/settings/sources/";
+const account = ({ words = [], sources = [], refusal } = {}) => (method, path) => {
+  if (path === "/api/v1/settings") return method === "GET" ? { body: { dictionary: words } } : { status: 204 };
+  if (path === SOURCE.slice(0, -1)) return { body: sources };
+  const [kept, under] = path.startsWith(WORD) ? [words, WORD] : [sources, SOURCE];
+  if (!path.startsWith(under)) return undefined;
+  if (refusal) return refusal;
+  const named = decodeURIComponent(path.slice(under.length));
+  // The server writes a source as a whole address.
+  const one = kept === words || named.includes("://") ? named : `https://${named}/`;
+  const at = kept.indexOf(one);
+  if (method === "PUT" && at < 0) kept.push(one);
+  if (method === "DELETE" && at >= 0) kept.splice(at, 1);
+  return { body: kept };
+};
+/** What the page asked of the account, a line each, with what it named as it is written. */
+const named = (asked) => told(asked).filter((line) => line.includes("/api/v1/settings/")).map(decodeURIComponent);
+const words = (page) => page.evaluate(() => localStorage.getItem("letters.words"));
+const opens = async (page) => {
+  await page.reload();
+  await page.waitForFunction(() => window.letters?.frames > 0 && window.letters.spelling);
+};
+
+test("the account's words are the person's, once it has those this browser took before it had an account", async ({ page }) => {
+  const theirs = ["quik"];
+  // Words from before any account answered, on the first page only.
+  await page.addInitScript(() => localStorage.getItem("letters.words") ?? localStorage.setItem("letters.words", "Zorvex\nquik"));
+  const asked = await serve(page, opened(), account({ words: theirs }));
+  await expect.poll(() => named(asked)).toEqual([`PUT ${WORD}Zorvex`]);
+
+  await learn(page, "Blorptix");
+  await expect.poll(() => named(asked)).toEqual([`PUT ${WORD}Zorvex`, `PUT ${WORD}Blorptix`]);
+  await expect.poll(() => words(page)).toBe("quik\nZorvex\nBlorptix");
+  expect(theirs).toEqual(["quik", "Zorvex", "Blorptix"]);
+
+  // A word taken out on another device is not brought back by this one.
+  theirs.splice(1, 1);
+  await opens(page);
+  await expect.poll(() => words(page)).toBe("quik\nBlorptix");
+  await rested(page);
+  expect(named(asked)).toHaveLength(2);
+});
+
+test("a word removed in the settings is taken out of the account", async ({ page }) => {
+  const theirs = ["quik", "Zorvex"];
+  const asked = await serve(page, opened(), account({ words: theirs }));
+  await page.keyboard.press("ControlOrMeta+,");
+  await click(page, "Remove quik");
+  await expect.poll(() => named(asked)).toEqual([`DELETE ${WORD}quik`]);
+  await expect.poll(() => words(page)).toBe("Zorvex");
+  expect(theirs).toEqual(["Zorvex"]);
+});
+
+const unkept = [
+  { name: "will not have is told in the server's words, and not offered again", refusal: { status: 400, body: { code: "invalid", message: "Your dictionary already holds 10000 words." } }, again: 0 },
+  { name: "could not be asked for is offered when the page next opens", refusal: { status: 503, body: { code: "unavailable", message: "The server is busy." } }, again: 1 },
+];
+for (const { name, refusal, again } of unkept) {
+  test(`a word the account ${name}`, async ({ page }) => {
+    const asked = await serve(page, opened(), account({ refusal }));
+    const said = page.waitForEvent("dialog");
+    await learn(page, "Zorvex");
+    const alert = await said;
+    expect(alert.message()).toBe(refusal.body.message);
+    await alert.accept();
+    // The word holds on this page all the same.
+    expect(await words(page)).toBe("Zorvex");
+
+    page.on("dialog", (alert) => alert.accept());
+    await opens(page);
+    await expect.poll(() => words(page)).toBe(again ? "Zorvex" : "");
+    await rested(page);
+    await expect.poll(() => named(asked)).toHaveLength(1 + again);
+  });
+}
+
+test("a host the person always loads pictures from is kept by their account, until they stop trusting it", async ({ page }) => {
+  const theirs = [];
+  const answer = fetches({ fetch: (_, asked) => asked && picture(INK).bytes });
+  const asked = await serve(page, opened(), (method, path, body) => account({ sources: theirs })(method, path) ?? answer(method, path, body), linked);
+  await page.mouse.click(600, 300);
+  await run(page, "Always load images from this host");
+  await expect.poll(() => inked(page)).toBeGreaterThan(1000);
+  expect(named(asked)).toEqual([`PUT ${SOURCE}https://pictures.example/`]);
+
+  // The settings list it, as the account wrote it.
+  await page.keyboard.press("ControlOrMeta+,");
+  const sources = page.getByRole("list", { name: "Trusted sources" });
+  await expect(sources.getByRole("listitem", { name: "https://pictures.example/" })).toBeAttached();
+  await click(page, "Stop trusting https://pictures.example/");
+  await expect.poll(() => named(asked).at(-1)).toBe(`DELETE ${SOURCE}https://pictures.example/`);
+  await expect(sources.getByRole("listitem")).toHaveCount(0);
+  expect(theirs).toEqual([]);
+});
+
+const typed = [
+  { name: "is trusted as the account writes it", refusal: undefined, listed: 1 },
+  { name: "that is none is refused in the server's words", refusal: { status: 400, body: { code: "invalid", message: "That is not a source of pictures." } }, listed: 0 },
+];
+for (const { name, refusal, listed } of typed) {
+  test(`a source typed in the settings ${name}`, async ({ page }) => {
+    const asked = await serve(page, opened(), account({ refusal }));
+    await page.keyboard.press("ControlOrMeta+,");
+    await click(page, "Trust a source", "textbox");
+    await page.keyboard.type("img.example.org");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => named(asked)).toEqual([`PUT ${SOURCE}img.example.org`]);
+    const dialog = page.getByRole("dialog", { name: "Settings" });
+    await expect(dialog.getByRole("listitem", { name: "https://img.example.org/" })).toHaveCount(listed);
+    await expect(dialog.getByRole("alert", { name: "That is not a source of pictures." })).toHaveCount(1 - listed);
+  });
+}
 
 /** The served document in a folder of a space, and what the server says of a document there. */
 const HOUSE = { space: "family", path: "House/Minutes.let" };
