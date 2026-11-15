@@ -40,7 +40,7 @@ use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::figures::{self, Grip, Moving, Resizing};
 use crate::finding::{self, Find, Finding};
 use crate::highlight;
-use crate::history::{self, History, Historying, Naming};
+use crate::history::{self, Compare, History, Historying, Naming};
 use crate::icon::{self, Icon};
 use crate::importing::{self, Import, ImportOffer, Imported, Importing};
 use crate::insert::{Insert, Inserting, Put};
@@ -63,6 +63,7 @@ use crate::renaming::{Outcome, Rename, Renaming};
 use crate::restyle::{self, Field, StyleEdit};
 use crate::review::{self, Review, Reviewing, Shown};
 use crate::safe::{self, Safe, SafeMode, Safely};
+use crate::seen::{Seeing, Seen};
 use crate::servers::{Server, Servers, SignIn, Signing};
 use crate::settings::{Dialog, Setting, Settings};
 use crate::sharing::{Share, Shared, Sharing};
@@ -286,6 +287,8 @@ pub enum Message {
     Settings(Setting),
     /// What the dialog about the document's language and a passage's asks.
     Written(Writing),
+    /// What is asked about what others wrote since the person's last visit.
+    Seen(Seeing),
     /// What the menu on a linked picture's cloud asks for.
     Linked(Linking),
     /// Puts the menu of the caret's column or row away.
@@ -344,7 +347,7 @@ impl Message {
             Message::Rename(_) | Message::EditLink | Message::LinkDraft(_) | Message::LinkApply => true,
             Message::Maths(_) | Message::Insert(_) | Message::Fence(_) | Message::Refer(_) => true,
             Message::Language(_) | Message::Callout(_) | Message::Contents(_) | Message::Preview(_) => true,
-            Message::Written(_) => true,
+            Message::Written(_) | Message::Seen(_) => true,
             Message::Alt(_) | Message::Styles(_) | Message::Restyle(_) | Message::Draft(..) => true,
             Message::Apply(_) | Message::Merge(_) | Message::History(_) | Message::Sharing(_) => true,
             Message::Panel(panel) => *panel == Panel::Styles,
@@ -363,6 +366,20 @@ impl Ui<EditorApp> {
 
     pub fn editor(&self) -> &Editor {
         &self.app().editor
+    }
+
+    /// Says what the person last saw of this document: the revision it read at when they last had it
+    /// open, which a shell keeps outside the file, for each person their own. Where others have written
+    /// since, a toast names them and offers to show what changed, and the history can compare the
+    /// document with what was last seen once it reads otherwise. `None` takes both away, and so does a
+    /// revision that the document's history lacks.
+    ///
+    /// Say it once the document is as new as the shell can make it: after its file is read, or after a
+    /// server was caught up with. What comes in later is seen as it comes. What to keep is
+    /// `editor().model().revision()` as text, when the document is closed and whenever it is saved.
+    pub fn set_last_seen(&mut self, seen: Option<Revision>) {
+        let app = self.app_mut();
+        app.seen = seen.and_then(|seen| app.since(seen));
     }
 
     /// Says how far the person's clock is ahead of UTC, in minutes: the history tells its days and times
@@ -1311,6 +1328,8 @@ pub struct EditorApp {
     edits: u64,
     panel: Option<Panel>,
     share: Share,
+    /// What the person last saw of the document before this visit, where the shell said.
+    seen: Option<Seen>,
     /// Whether the dialog about the language of the document and of a passage is out.
     written: bool,
     servers: Servers,
@@ -1432,6 +1451,7 @@ impl EditorApp {
             edits: 0,
             panel: None,
             share: Share::default(),
+            seen: None,
             written: false,
             servers: Servers::default(),
             browser: Browser::default(),
@@ -2236,6 +2256,7 @@ impl EditorApp {
             Act::Panel(Panel::Styles) | Act::Rename | Act::Save | Act::PageSetup | Act::Language => false,
             Act::MergeConflicts | Act::MergeFrom | Act::MergeInto | Act::Share => false,
             Act::History | Act::SelectionHistory | Act::Misspelling { .. } | Act::Replace => false,
+            Act::SinceVisit => false,
         };
         if !(reads || self.writes()) {
             return None;
@@ -2325,6 +2346,11 @@ impl EditorApp {
             // A card over the window is answered first: there is no document to act on behind it.
             Act::Print => (!self.carded()).then_some(Message::Print(Printing::Show))?,
             Act::History => (!self.carded()).then_some(Message::History(Historying::Show))?,
+            Act::SinceVisit => {
+                // Offered once the document reads otherwise than it was last seen, whoever wrote.
+                let changed = self.seen.as_ref().is_some_and(|seen| seen.revision != editor.model().revision());
+                (changed && !self.carded()).then_some(Message::Seen(Seeing::Show))?
+            }
             Act::SelectionHistory => {
                 let touched = editor.selection().and_then(|selection| history::touched(editor.doc(), selection));
                 (touched.is_some() && !self.carded()).then_some(Message::History(Historying::Passage))?
@@ -2465,7 +2491,10 @@ impl EditorApp {
                 self.dragging = false;
                 self.unpoint();
                 let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
+                let seen = self.seen.as_ref().map(|seen| &seen.revision).filter(|seen| **seen != current).cloned();
                 let mut history = History::new(&steps, current, platform.wall_time(), self.zone);
+                // The document can be compared with what the person last saw, where it reads otherwise now.
+                seen.into_iter().for_each(|seen| history.since(seen));
                 history.add_fallback_fonts(&self.backup);
                 for (list, data) in self.lists.iter() {
                     history.add_word_list(list, data);
@@ -2551,6 +2580,14 @@ impl EditorApp {
                 self.edit(platform, |editor, platform| editor.run(Command::Restore(revision), platform));
             }
         }
+    }
+
+    /// What the person last saw at `revision`, with who else wrote since. `None` for a revision the
+    /// document's history lacks.
+    fn since(&mut self, revision: Revision) -> Option<Seen> {
+        // It costs a reading of the whole history, so it is asked once, when the shell says.
+        let steps = self.editor.since(&revision).ok()?;
+        Some(Seen::new(revision, &steps, &self.margin.author))
     }
 
     /// Gives the picked version the name that was typed for it, when one was. A name is a mark in the
@@ -2990,6 +3027,10 @@ impl EditorApp {
     /// Runs something on the editor, which may ask the layout about lines while it works.
     fn edit(&mut self, platform: &mut dyn Platform, act: impl FnOnce(&mut Editor, &mut dyn Platform) -> Change) {
         let change = self.run(platform, act);
+        // Who writes has taken the document as it is: the toast about what others wrote goes.
+        if !change.blocks.is_empty() || change.structure {
+            self.seen.iter_mut().for_each(Seen::noted);
+        }
         self.changed(&change);
     }
 
@@ -5534,6 +5575,13 @@ impl EditorApp {
                     self.edit(platform, |editor, platform| editor.run(Command::SetLang(tag), platform));
                 }
             },
+            Message::Seen(asked) => {
+                self.seen.iter_mut().for_each(Seen::noted);
+                if asked == Seeing::Show {
+                    self.historying(Historying::Show, platform);
+                    self.historying(Historying::Compare(Compare::Seen), platform);
+                }
+            }
             Message::Visit(session) => self.visit(session),
             Message::Correct(text) => {
                 self.context = None;
@@ -5765,10 +5813,13 @@ impl App for EditorApp {
             self.find.view(self.find.current(self.editor.selection()), bar, end, room.width)
         });
         // The toast about an import lies over the foot of the page, and is the first stop after it.
-        let toast = self.imported.filter(|_| !printing && !away && !self.carded()).map(|_| {
+        let toast = self.imported.filter(|_| !away && !self.carded()).map(|_| {
             let keys = commands::shortcut(&Act::Note { back: false }, self.editor.keymap(), self.mac);
             importing::toast(self.margin.imports().0, keys.as_deref(), room)
         });
+        // So does the toast about what others wrote since the last visit, for one who can look it up.
+        let news = self.seen.as_ref().filter(|_| self.writes() && !away && !self.carded());
+        let toast = toast.or_else(|| news.and_then(|seen| seen.toast(room)));
         let page = Element::row().grow(1.0).child(page).children(toast).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.

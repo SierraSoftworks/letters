@@ -1384,3 +1384,209 @@ fn edits_that_come_in_under_the_history_of_a_selection_are_listed_when_they_chan
         assert_eq!(shown(&mut window), VERSIONS[2].1, "{old}: the version that was being read still shows");
     }
 }
+
+// Since the last visit
+
+/// When each of the others wrote on the letter that Sam comes back to.
+const TUESDAY: u64 = SUNDAY - 5 * DAY + 16 * HOUR;
+
+/// What they wrote over, one after the other, and with what: a sentence of each paragraph, then words.
+const SINCE: [(&str, &str); 4] = [
+    ("The floor follows.", "A slate floor is laid in the kitchen next spring."),
+    ("The roof comes first.", "Scaffolding goes up on the north side in April."),
+    ("Costs", "Prices"),
+    ("rising", "rising fast"),
+];
+
+/// The letter Sam last saw on Monday, after Dana had written on it, as it is opened on Sunday morning: since
+/// then each of `others` has written on it in turn, on a device of their own.
+fn revisited(others: &[&str]) -> Harness {
+    let mut sam = Harness::doc(&format!("# Cottage renovation\n\n{}\n\n{}", VERSIONS[0].1[0], VERSIONS[0].1[1]));
+    sam.ui().set_author("Sam Okafor");
+    write(&mut sam, SUNDAY - 6 * DAY + 11 * HOUR, "unknown", "rising");
+    // A history knows one name for each device, so each writer has one.
+    let wrote = |sam: &mut Harness, device: u64, writer: &str, at: u64, (old, new): (&str, &str)| {
+        let copy = sam.editor().model().fork(ReplicaId::from(device));
+        let mut theirs = Harness::with(Window::new(Editor::with_model(copy)));
+        theirs.ui().set_author(writer);
+        write(&mut theirs, at, old, new);
+        let history = theirs.editor().model().save();
+        sam.ui().change(|editor| editor.merge(&history)).expect("a history of the same document");
+    };
+    // What another wrote before Sam last looked is no news.
+    wrote(&mut sam, 9, "Dana Reyes", SUNDAY - 6 * DAY + 12 * HOUR, ("renovation", "repairs"));
+    let seen = sam.editor().model().revision();
+    for (at, writer) in others.iter().enumerate() {
+        let device = others.iter().position(|other| other == writer).unwrap_or(at) as u64;
+        wrote(&mut sam, 2 + device, writer, TUESDAY + at as u64 * HOUR, SINCE[at]);
+    }
+    sam.platform.wall = Some(SUNDAY + 9 * HOUR + 20 * MINUTE);
+    sam.ui().set_last_seen(Some(seen));
+    sam
+}
+
+/// What the toast about the last visit says, while it shows.
+fn news(window: &mut Harness) -> Option<String> {
+    let toast = window.controls().into_iter().find(|found| found.role == Role::Status);
+    toast.map(|toast| toast.name).filter(|said| said.starts_with("Edited by"))
+}
+
+/// What the picked version is compared with, as the bar says.
+fn compared(window: &mut Harness) -> Option<String> {
+    let segments = window.controls().into_iter().filter(|found| found.role == Role::RadioButton);
+    segments.filter(|segment| segment.toggled == Some(true)).map(|segment| segment.name).next()
+}
+
+#[test]
+fn opening_a_document_that_others_wrote_on_since_the_last_visit_says_who() {
+    // Who wrote since, and what the toast says.
+    let cases: [(&[&str], Option<&str>); 5] = [
+        (&[], None),
+        (&["Sam Okafor"], None),
+        (&["Alice Moreau"], Some("Edited by Alice Moreau")),
+        (&["Alice Moreau", "Sam Okafor", "Ben Adler"], Some("Edited by 2 people")),
+        (&["Alice Moreau", "Ben Adler", "Chidi Eze", "Alice Moreau"], Some("Edited by 3 people")),
+    ];
+    for (others, said) in cases {
+        let mut window = revisited(others);
+        assert_eq!(news(&mut window).as_deref(), said, "{others:?}");
+    }
+}
+
+#[test]
+fn the_toast_shows_the_document_against_what_was_last_seen() {
+    let mut window = revisited(&["Alice Moreau", "Ben Adler"]);
+    window.click(Role::Button, "See changes");
+    assert!(showing(&mut window) && news(&mut window).is_none());
+    assert_eq!(picked(&mut window).as_deref(), Some("Current version"));
+    assert_eq!(compared(&mut window).as_deref(), Some("Last visit"));
+    // Both paragraphs were rewritten since, each by another writer: neither is told as one writer's.
+    let found = differing(&mut window);
+    let says = |holds: &str| {
+        found.iter().any(|(told, reads)| told == "Changed since your last visit" && reads.contains(holds))
+    };
+    assert!(says("slate floor") && says("Scaffolding"), "{found:?}");
+    // A paragraph shows as Sam last saw it too, with what Sam had written by then.
+    let before = before(&mut window).and_then(|before| before.value).expect("a paragraph as it was last seen");
+    assert_eq!(before, "The roof comes first. Costs are rising.");
+
+    // What comes in while it shows is part of the document, which stays the version that is compared.
+    merge(&mut window, "Chidi Eze", SUNDAY + 9 * HOUR + 40 * MINUTE, "Costs", "Prices");
+    assert_eq!(picked(&mut window).as_deref(), Some("Current version"));
+    assert_eq!(compared(&mut window).as_deref(), Some("Last visit"));
+    assert!(differing(&mut window).iter().any(|(_, reads)| reads.contains("Prices")));
+
+    // Back on the page the toast has had its answer.
+    window.key("Escape");
+    assert!(!showing(&mut window) && news(&mut window).is_none());
+}
+
+#[test]
+fn the_toast_goes_when_it_is_put_away_or_the_person_writes() {
+    let ways: [(&str, Act); 3] = [
+        ("put away", |window| _ = window.click(Role::Button, "Dismiss")),
+        ("written", |window| _ = window.select("Costs").type_text("Prices")),
+        ("another writer's edit", |window| merge(window, "Ben Adler", SUNDAY + 10 * HOUR, "comes", "goes")),
+    ];
+    for (way, act) in ways {
+        let mut window = revisited(&["Alice Moreau"]);
+        act(&mut window);
+        assert_eq!(news(&mut window).is_some(), way == "another writer's edit", "{way}");
+        assert!(!showing(&mut window), "{way}");
+    }
+}
+
+#[test]
+fn the_toast_waits_while_another_view_has_the_page() {
+    for view in ["the history", "Print view"] {
+        let mut window = revisited(&["Alice Moreau"]);
+        match view {
+            "Print view" => window.key("Mod+P"),
+            _ => window.click(Role::Button, "History"),
+        };
+        assert_eq!(news(&mut window), None, "{view}");
+        window.key("Escape");
+        assert!(news(&mut window).is_some(), "{view}: it has had no answer yet");
+    }
+}
+
+#[test]
+fn what_was_written_apart_before_the_visit_ended_is_news_once_it_comes_in() {
+    let mut sam = revisited(&[]);
+    // Alice takes a copy and writes on it offline. Sam writes on meanwhile, and last sees that.
+    let copy = sam.editor().model().fork(ReplicaId::from(2));
+    let mut alice = Harness::with(Window::new(Editor::with_model(copy)));
+    alice.ui().set_author("Alice Moreau");
+    write(&mut alice, TUESDAY, SINCE[0].0, SINCE[0].1);
+    write(&mut sam, TUESDAY + HOUR, "roof", "north roof");
+    write(&mut sam, TUESDAY + 2 * HOUR, "first", "first of all");
+    let seen = sam.editor().model().revision();
+    let hers = alice.editor().model().save();
+    sam.ui().change(|editor| editor.merge(&hers)).expect("a history of the same document");
+    sam.platform.wall = Some(SUNDAY + 9 * HOUR + 20 * MINUTE);
+    sam.ui().set_last_seen(Some(seen));
+    assert_eq!(news(&mut sam).as_deref(), Some("Edited by Alice Moreau"));
+
+    // Only what Sam had not seen is told as changed, though Sam wrote after Alice did.
+    sam.click(Role::Button, "See changes");
+    let found = differing(&mut sam);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].0 == "Changed since your last visit" && found[0].1.contains("slate floor"), "{found:?}");
+}
+
+#[test]
+fn what_the_person_writes_in_a_visit_is_compared_with_the_last_visit_too() {
+    let mut window = revisited(&[]);
+    write(&mut window, SUNDAY + 10 * HOUR, SINCE[0].0, SINCE[0].1);
+    assert_eq!(news(&mut window), None, "it is no news to who wrote it");
+    window.key("Mod+Shift+P").type_text("Changes since last visit").key("Enter");
+    assert_eq!(compared(&mut window).as_deref(), Some("Last visit"));
+    let found = differing(&mut window);
+    let news =
+        |(told, reads): &(String, String)| told == "Changed since your last visit" && reads.contains("slate floor");
+    assert!(found.iter().any(news), "{found:?}");
+}
+
+#[test]
+fn the_history_compares_with_the_last_visit_only_the_document_as_it_reads_now() {
+    let mut window = revisited(&["Alice Moreau"]);
+    // Offered from the palette too, and beside the other comparisons whenever the history shows.
+    window.key("Mod+Shift+P").type_text("Changes since last visit").key("Enter");
+    assert_eq!(compared(&mut window).as_deref(), Some("Last visit"));
+    window.key("Escape").click(Role::Button, "History");
+    assert_eq!(compared(&mut window).as_deref(), Some("Previous"));
+
+    // An earlier version shows what it changed itself, and the last visit brings the newest back.
+    window.key("Left").click(Role::RadioButton, "Last visit");
+    assert_eq!(picked(&mut window).as_deref(), Some("Current version"));
+    assert!(differing(&mut window).iter().any(|(told, _)| told == "Changed since your last visit"));
+    window.key("Left");
+    assert_eq!(compared(&mut window).as_deref(), Some("Previous"));
+    assert!(differing(&mut window).iter().all(|(told, _)| told != "Changed since your last visit"));
+}
+
+#[test]
+fn a_last_visit_the_shell_did_not_say_or_the_history_lacks_is_offered_nowhere() {
+    // What the shell says it last saw.
+    let stranger = Harness::doc("Another document").editor().model().revision();
+    for (told, seen) in [("nothing", None), ("another document's", Some(stranger)), ("the document as it reads", None)]
+    {
+        let mut window = revisited(&["Alice Moreau"]);
+        let now = window.editor().model().revision();
+        window.ui().set_last_seen(if told == "the document as it reads" { Some(now) } else { seen });
+        assert_eq!(news(&mut window), None, "{told}");
+        window.key("Mod+Shift+P").type_text("Changes since last visit").key("Enter");
+        assert!(!showing(&mut window), "{told}: the palette");
+        window.key("Escape").click(Role::Button, "History");
+        assert!(window.find(Role::RadioButton, "Last visit").is_none(), "{told}: the history");
+    }
+}
+
+#[test]
+fn only_one_who_writes_is_told_of_the_last_visit() {
+    for access in [letters_ui::Access::Comments, letters_ui::Access::Reads] {
+        let mut window = revisited(&["Alice Moreau"]);
+        window.ui().set_access(access);
+        assert_eq!(news(&mut window), None, "{access:?}");
+    }
+}

@@ -119,6 +119,8 @@ pub(crate) enum Act {
     History,
     /// Shows the versions that changed what is selected.
     SelectionHistory,
+    /// Shows what changed since the person last had the document open.
+    SinceVisit,
     /// Steps through the conflicts that wait for a choice, or settles the one that is open.
     Review(Reviewing),
     /// Goes to the next misspelled word and offers its corrections, or to the one before.
@@ -176,7 +178,7 @@ const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> E
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 105] = [
+pub(crate) static ENTRIES: [Entry; 106] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -260,6 +262,7 @@ pub(crate) static ENTRIES: [Entry; 105] = [
     entry("View", "Notes panel", "show hide comments", Act::Panel(Panel::Notes)),
     entry("View", "History", "versions earlier before rewind restore", Act::History),
     entry("View", "History of selection", "passage versions changed who restore", Act::SelectionHistory),
+    entry("View", "Changes since last visit", "history others wrote edited new seen", Act::SinceVisit),
     entry("View", "Print view", "pages paper sheets preview", Act::Print),
     entry("View", "Next note", "comment margin marker import", Act::Note { back: false }),
     entry("View", "Previous note", "comment margin marker import", Act::Note { back: true }),

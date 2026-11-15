@@ -197,11 +197,15 @@ pub enum Compare {
     Current,
     /// Nothing: the version shows as it read.
     Off,
+    /// The version the person last saw, which shows what changed since their last visit. It is told of
+    /// the document as it reads now, and offered where the shell said what was last seen.
+    Seen,
 }
 
 impl Compare {
     const ALL: [(Self, &'static str); 3] =
         [(Self::Previous, "Previous"), (Self::Current, "Current"), (Self::Off, "Off")];
+    const SEEN: (Self, &'static str) = (Self::Seen, "Last visit");
 }
 
 /// A version the history lists.
@@ -895,6 +899,9 @@ impl Line {
 struct Leaf {
     /// The revision the page is of and, where that is compared with an earlier one, the earlier one.
     between: (Option<Revision>, Revision),
+    /// What it was shown as compared with, which says what the lines in its bands read: the version
+    /// last seen can be the one before, and is told otherwise.
+    compared: Compare,
     /// The page: the later version, with what only the earlier one has put back in.
     doc: Document,
     style: Style,
@@ -938,6 +945,9 @@ pub(crate) struct History {
     at: usize,
     /// What it is compared with.
     compare: Compare,
+    /// The revision the person last saw before this visit, where the shell said one and the document
+    /// reads otherwise now.
+    seen: Option<Revision>,
     /// What the field holds that its name is typed in, while that is open.
     naming: Option<String>,
     /// The versions the window read last.
@@ -988,6 +998,7 @@ impl History {
             versions: Rc::default(),
             at: 0,
             compare: Compare::default(),
+            seen: None,
             naming: None,
             read: Vec::new(),
             leaf: None,
@@ -1032,7 +1043,21 @@ impl History {
             let listed = self.versions.iter().position(|version| version.at == picked);
             listed.or_else(|| holding(steps, &self.versions, &picked))
         });
+        // What changed since the last visit is told of the document as it reads now, whatever came in.
+        let kept = kept.filter(|_| self.compare != Compare::Seen);
         self.at = kept.unwrap_or(self.versions.len() - 1);
+    }
+
+    /// Takes the revision the person last saw before this visit. The document as it reads now can then
+    /// be compared with it.
+    pub fn since(&mut self, seen: Revision) {
+        self.seen = Some(seen);
+    }
+
+    /// What the picked version can be compared with, as the bar offers it.
+    fn compares(&self) -> Vec<(Compare, &'static str)> {
+        let [previous, current, off] = Compare::ALL;
+        [previous, current].into_iter().chain(self.seen.as_ref().map(|_| Compare::SEEN)).chain([off]).collect()
     }
 
     pub fn picked(&self) -> &Version {
@@ -1056,12 +1081,16 @@ impl History {
         match self.compare {
             Compare::Previous => self.at.checked_sub(1).map(|before| (before, self.at)),
             Compare::Current => (self.at < newest).then_some((self.at, newest)),
-            Compare::Off => None,
+            Compare::Off | Compare::Seen => None,
         }
     }
 
     /// The revision the page is to be of and, where it is compared with an earlier one, the earlier one.
     fn between(&self) -> (Option<Revision>, Revision) {
+        // The version last seen is none of those listed. The newest is picked whenever it is compared.
+        if let (Compare::Seen, Some(seen), None) = (self.compare, &self.seen, &self.passage) {
+            return (Some(seen.clone()), self.picked().at.clone());
+        }
         match self.sides() {
             Some((earlier, later)) => (Some(self.versions[earlier].at.clone()), self.versions[later].at.clone()),
             None => (None, self.picked().at.clone()),
@@ -1071,7 +1100,8 @@ impl History {
     /// Whether what shows is what is picked, of every version or of a passage as the history is.
     fn showing(&self) -> bool {
         let (between, narrowed) = (self.between(), self.passage.is_some());
-        self.leaf.as_ref().is_some_and(|leaf| leaf.between == between && leaf.lit.is_some() == narrowed)
+        let shown = |leaf: &Leaf| leaf.between == between && leaf.compared == self.compare;
+        self.leaf.as_ref().is_some_and(|leaf| shown(leaf) && leaf.lit.is_some() == narrowed)
     }
 
     /// The revisions to read before what is picked can show.
@@ -1103,13 +1133,16 @@ impl History {
         // What changed from the version before is its writer's. What changed since is many people's.
         let by = match (self.compare, sides.and_then(|(_, later)| self.versions[later].who())) {
             (Compare::Current, _) => " later".to_owned(),
+            (Compare::Seen, _) => " since your last visit".to_owned(),
             (_, Some(by)) => format!(" by {by}"),
             (_, None) => String::new(),
         };
         let captions = [[format!("Removed{by}"), format!("Added{by}")], ["Before".to_owned(), format!("Changed{by}")]];
         let last = self.leaf.take();
         let late = (&self.backup, &self.lists);
-        self.leaf = later.map(|later| Leaf::new(between, earlier.as_deref(), &later, captions, last, late));
+        let compared = self.compare;
+        let leaf = later.map(|later| Leaf::new(between, earlier.as_deref(), &later, captions, last, late));
+        self.leaf = leaf.map(|leaf| Leaf { compared, ..leaf });
         if let (Some(leaf), Some(passage)) = (&mut self.leaf, &self.passage) {
             passage.light(leaf, self.at);
         }
@@ -1128,10 +1161,19 @@ impl History {
         // version asked for has it. The passage stays where it is looked at.
         self.at = self.passage.as_ref().map_or(at, |passage| passage.left(at));
         self.seeking = self.passage.is_some();
+        // What changed since the last visit is told of the document as it reads now. Another version
+        // shows what it changed itself.
+        if self.compare == Compare::Seen && !self.newest() {
+            self.compare = Compare::default();
+        }
     }
 
-    /// Compares the picked version with another, or with none.
+    /// Compares the picked version with another, or with none. The version last seen is compared with
+    /// the document as it reads now, which is then picked.
     pub fn compare(&mut self, with: Compare) {
+        if with == Compare::Seen {
+            self.pick(self.versions.len() - 1);
+        }
         self.compare = with;
     }
 
@@ -1713,12 +1755,13 @@ impl History {
         let back = Message::History(Historying::Back);
         let mut compare = Segmented::new("Compare with").small();
         let mut compares = Menu::new().label("Compare with");
-        for (with, label) in Compare::ALL {
+        let offered = self.compares();
+        for &(with, label) in &offered {
             let pick = Message::History(Historying::Compare(with));
             compare = compare.segment(label, self.compare == with, pick.clone());
             compares = compares.item(MenuItem::new(label).checked(self.compare == with).on_select(pick));
         }
-        let with = Compare::ALL.iter().find(|(with, _)| *with == self.compare).map_or("Off", |(_, label)| label);
+        let with = offered.iter().find(|(with, _)| *with == self.compare).map_or("Off", |(_, label)| label);
         let name = || Element::text(name, TextStyle::control().weight(600)).min_width(tokens::SPACE_3XL).shrink();
         let when = Element::text(self.said(), TextStyle::control().size(tokens::TEXT_SM));
         // The picked version's name is typed where the button stood that asks for it.
@@ -2228,6 +2271,7 @@ impl Leaf {
         });
         Self {
             between,
+            compared: Compare::default(),
             said: said.collect(),
             pairs: pairs.collect(),
             doc,

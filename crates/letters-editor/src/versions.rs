@@ -14,6 +14,12 @@ impl Editor {
         self.model.timeline()
     }
 
+    /// The steps of the timeline that `revision` does not hold, oldest first: what was written since a
+    /// person last saw the document there. See [`letters_model::Model::since`].
+    pub fn since(&mut self, revision: &Revision) -> Result<Vec<Point>, HistoryError> {
+        self.model.since(revision)
+    }
+
     /// The document and its style as they were at `revision`, read without leaving the one that shows.
     /// See [`letters_model::Model::document_at`].
     pub fn document_at(&mut self, revision: &Revision) -> Result<(Document, Style), HistoryError> {

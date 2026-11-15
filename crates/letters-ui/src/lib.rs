@@ -50,6 +50,7 @@ mod renaming;
 mod restyle;
 mod review;
 mod safe;
+mod seen;
 mod servers;
 mod settings;
 mod sharing;
