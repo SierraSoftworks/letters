@@ -7,6 +7,7 @@
 //! - [`spaces`] is the only way to a file, and cannot leave a space's folder.
 //! - [`library`] lists a space and finds a document by its id, wherever its file was moved to.
 //! - [`api`] answers the interface `letters_api` lays down.
+//! - [`fetch`] is what the server fetches for a document from elsewhere: a linked picture, a link's page.
 //! - [`rooms`] are the documents that are open now, and [`socket`] is each device's line to one.
 //! - [`pages`] are the server's own pages for a browser: the documents a person reaches, one to read, and
 //!   one in the editor, which is compiled in when the server is built with it.
@@ -18,6 +19,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod fetch;
 pub mod ids;
 pub mod library;
 pub mod oidc;
@@ -36,6 +38,7 @@ use letters_api::{Role, Space};
 
 use crate::config::Config;
 use crate::error::{Answer, Refusal};
+use crate::fetch::{Fetches, Roots};
 use crate::library::Library;
 use crate::oidc::Provider;
 use crate::pages::editor::Editor;
@@ -56,6 +59,7 @@ pub struct App {
     pub rooms: Rooms,
     /// The browser's editor, when the server was built with one. Without it a browser reads.
     pub editor: Option<Editor>,
+    pub fetches: Fetches,
     clock: Clock,
 }
 
@@ -65,8 +69,13 @@ impl App {
     pub fn new(config: Config, store: Store) -> Self {
         let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
         let (provider, rooms) = (Provider::new(&config), Rooms::new(&config.server.state));
-        let editor = Editor::compiled();
-        Self { config, store, library: Library::new(), provider, rooms, editor, clock: Box::new(clock) }
+        let (editor, fetches) = (Editor::compiled(), Fetches::new(Roots::System));
+        Self { config, store, library: Library::new(), provider, rooms, editor, fetches, clock: Box::new(clock) }
+    }
+
+    /// The same server taking another word on who a site is, for tests against a site of their own.
+    pub fn with_roots(self, roots: Roots) -> Self {
+        Self { fetches: Fetches::new(roots), ..self }
     }
 
     /// The same server with another editor for its browsers, or with none.

@@ -18,6 +18,7 @@ use axum::http::{HeaderMap, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use letters_api::{Entry, Error, NewDocument, Person, paths};
 use letters_server::config::Config;
+use letters_server::fetch::Roots;
 use letters_server::pages::editor::Editor;
 use letters_server::session::{COOKIE_NAME, Carrier};
 use letters_server::store::Store;
@@ -116,6 +117,12 @@ impl Server {
     /// A server whose browsers are sent `editor`.
     pub fn editing(name: &str, editor: Editor) -> Self {
         Self::over(Scratch::new(name), &sound, |app| app.with_editor(Some(editor)))
+    }
+
+    /// A server whose owner trusts `sources`, and which believes a site that shows one of `roots`.
+    pub fn fetching(name: &str, sources: &[String], roots: Roots) -> Self {
+        let trusting = |at: &Path| format!("{}\n[trust]\nsources = {sources:?}\n", sound(at));
+        Self::over(Scratch::new(name), &trusting, |app| app.with_roots(roots))
     }
 
     /// The server after it stopped and started again: the same folders, and nothing that was in memory.

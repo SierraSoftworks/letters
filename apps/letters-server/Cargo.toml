@@ -52,3 +52,6 @@ http-body-util.workspace = true
 zip.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tungstenite.workspace = true
+# A site for the server's fetches to be tried against.
+rcgen.workspace = true
+rustls.workspace = true

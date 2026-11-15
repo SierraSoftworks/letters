@@ -9,13 +9,13 @@ use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, FailedToBufferBody};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
-use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, SET_COOKIE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, SET_COOKIE, X_CONTENT_TYPE_OPTIONS};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use letters_api::{
-    Code, Entry, EntryKind, Listing, Move, NewDocument, NewFolder, Opened, PROTOCOL, Person, Rename, Renewal, Role,
-    Server, Settings, Space, Tag, Token, Trust, paths,
+    Code, Entry, EntryKind, Fetch, Listing, Move, NewDocument, NewFolder, Opened, PROTOCOL, Person, Preview, Rename,
+    Renewal, Role, Server, Settings, Space, Tag, Token, Trust, paths,
 };
 use letters_format::{ASSETS, MIMETYPE, NOTES, STYLE, file_name};
 use letters_model::{Document, Style};
@@ -67,6 +67,9 @@ pub fn routes() -> Router<Shared> {
             "/api/v1/documents/{id}/assets/{name}",
             get(asset).put(add_asset).layer(DefaultBodyLimit::max(limits.asset as usize)),
         )
+        .route("/api/v1/documents/{id}/fetch/picture", post(fetch_picture))
+        .route("/api/v1/documents/{id}/fetch/preview", post(fetch_preview))
+        .route("/api/v1/documents/{id}/trust", post(trust))
 }
 
 /// Runs `work` where it may wait on a folder or the store.
@@ -227,6 +230,48 @@ async fn asset(State(app): State<Shared>, who: Signed, Path((id, name)): Path<(S
 }
 
 /// Why a body was not read, as a refusal. `large` is what is said of one over its limit.
+/// `POST`: a picture the document links to, fetched here so that its site learns nothing of the reader.
+async fn fetch_picture(
+    State(app): State<Shared>,
+    who: Signed,
+    Path(id): Path<String>,
+    Json(fetch): Json<Fetch>,
+) -> Answer<Response> {
+    let turn = app.fetches.turn().await?;
+    let fetched = blocking(move || {
+        let _turn = turn;
+        app.fetch_picture(&who, &id, &fetch)
+    })
+    .await?;
+    let headers = [
+        (CONTENT_TYPE, fetched.kind.media_type()),
+        // The site may send another picture tomorrow, and what one person asked for is not another's.
+        (CACHE_CONTROL, "no-store"),
+        (X_CONTENT_TYPE_OPTIONS, "nosniff"),
+    ];
+    Ok((headers, fetched.bytes).into_response())
+}
+
+/// `POST`: what the page behind a link says of itself.
+async fn fetch_preview(
+    State(app): State<Shared>,
+    who: Signed,
+    Path(id): Path<String>,
+    Json(fetch): Json<Fetch>,
+) -> Answer<Json<Preview>> {
+    let turn = app.fetches.turn().await?;
+    blocking(move || {
+        let _turn = turn;
+        app.fetch_preview(&who, &id, &fetch).map(Json)
+    })
+    .await
+}
+
+async fn trust(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -> Answer<StatusCode> {
+    blocking(move || app.trust(&who, &id)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn unread(rejection: BytesRejection, large: &str) -> Refusal {
     match rejection {
         BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_)) => {
