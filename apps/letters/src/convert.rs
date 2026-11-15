@@ -14,10 +14,10 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use letters_convert::{PdfInfo, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with};
+use letters_convert::{Loss, PdfInfo, Target, losses, markdown_assets, to_docx, to_html, to_markdown, to_pdf_with};
 use letters_format::{Archive, OPLOG};
 use letters_layout::Fonts;
-use letters_model::{Block, BlockKind, Body, Document, Mark, Model, ReplicaId, Run, Style};
+use letters_model::{Block, Body, Model, ReplicaId, Style};
 use serde_json::json;
 
 use crate::cli::{Export, Format, Import, Output};
@@ -85,15 +85,20 @@ pub fn exported(file: Vec<u8>, title: &str, to: Format) -> Result<Exported, Stri
     let document = archive.document().map_err(failed)?;
     // A style this build cannot read gives way to the built-in one, as it does on screen.
     let style = archive.style().unwrap_or_default();
+    // Notes that cannot be read are left behind: the text matters more than its comments.
+    let notes = archive.notes().unwrap_or_default();
+    let target = match to {
+        Format::Markdown => Target::Markdown,
+        Format::Html => Target::Html,
+        Format::Docx => Target::Docx,
+        Format::Pdf => Target::Pdf,
+    };
+    let simplified = losses(&document, &notes, target).iter().map(Loss::to_string).collect();
     let bytes = match to {
         Format::Markdown => to_markdown(&document).into_bytes(),
         // An image that cannot be read is treated as missing, and its description stands in for it.
         Format::Html => to_html(&document, &style, title, &mut |name| archive.read(name).ok().flatten()).into_bytes(),
-        Format::Docx => {
-            // Notes that cannot be read are left behind: the text matters more than its comments.
-            let notes = archive.notes().unwrap_or_default();
-            to_docx(&document, &style, &notes, title, &mut |name| archive.read(name).ok().flatten())
-        }
+        Format::Docx => to_docx(&document, &style, &notes, title, &mut |name| archive.read(name).ok().flatten()),
         Format::Pdf => {
             let fonts = Fonts { faces: letters_fonts::bundled() };
             let created = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|since| since.as_secs());
@@ -116,7 +121,7 @@ pub fn exported(file: Vec<u8>, title: &str, to: Format) -> Result<Exported, Stri
     let entries = markdown_assets(&document).into_iter().filter(|_| to == Format::Markdown).filter(inside);
     let pictures = entries.filter_map(|entry| Some((archive.read(&entry).ok().flatten()?, entry)));
     let pictures = pictures.map(|(bytes, entry)| (entry, bytes)).collect();
-    Ok(Exported { bytes, pictures, simplified: simplified(&document, to) })
+    Ok(Exported { bytes, pictures, simplified })
 }
 
 impl Exported {
@@ -137,40 +142,6 @@ impl Exported {
         }
         Ok(())
     }
-}
-
-/// What the format cannot carry over, a line for each kind of loss.
-fn simplified(document: &Document, to: Format) -> Vec<String> {
-    let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    let unknown = document.walk().filter(|block| matches!(block.kind, BlockKind::Unknown { .. })).count();
-    let other = |run: &&Run| run.marks.iter().any(|mark| matches!(mark, Mark::Other(_)));
-    let marks = document.walk().flat_map(|block| block.body.runs()).filter(other).count();
-    let mut lines = Vec::new();
-    if unknown > 0 {
-        let blocks = count(unknown, "block is", "blocks are");
-        // A page shows what the screen shows, which for these is a placeholder that names the kind.
-        let shown = if to == Format::Pdf { "shown as a placeholder" } else { "written as fallback text" };
-        lines.push(format!("{blocks} of a kind this version does not know, and {shown}"));
-    }
-    if marks > 0 {
-        lines.push(format!(
-            "formatting this version does not know is left out of {}",
-            count(marks, "passage", "passages")
-        ));
-    }
-    if to == Format::Docx {
-        // Word has no block that holds others, so only what is one paragraph there can take a quote's style.
-        let boxes = document.walk().filter(|block| matches!(block.kind, BlockKind::Quote | BlockKind::Callout { .. }));
-        let kept =
-            |kind: &BlockKind| matches!(kind, BlockKind::Paragraph | BlockKind::ListItem { .. } | BlockKind::Formula);
-        let plain = |block: &&Block| !kept(&block.kind);
-        let outside = boxes.flat_map(|outer| outer.body.blocks()).filter(plain).count();
-        if outside > 0 {
-            let blocks = count(outside, "block inside a quote or callout is", "blocks inside quotes or callouts are");
-            lines.push(format!("{blocks} written outside it, since Word cannot nest them"));
-        }
-    }
-    lines
 }
 
 /// Writes a file. Unless `replace` is set, one that is already there is left alone and reported.
