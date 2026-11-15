@@ -10,12 +10,14 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use common::Scratch;
+use letters::connected::{self, Reached, Unreached};
 use letters::keychain::Keychain;
 use letters::remote::Roots;
 use letters::server::{Client, Refused};
 use letters::session::Session;
 use letters::signin::{SignIn, Unsigned};
-use letters_api::{Code, Exchange, Person, Renewal, Role, Space, SpaceKind, Token, paths};
+use letters_api::{Allows, Code, Exchange, Opened, Person, Renewal, Role, Space, SpaceKind, Token, Trust, paths};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -81,6 +83,24 @@ fn spaces() -> Vec<Space> {
     vec![Space { id: "ada".into(), name: "Ada".into(), kind: SpaceKind::Personal, role: Role::Owner }]
 }
 
+/// What the server says of its one document.
+fn opened() -> Opened {
+    Opened {
+        id: "d1".into(),
+        created: "2026-11-15T04:00:00Z".into(),
+        name: "Roof repairs".into(),
+        space: Some("ada".into()),
+        path: "House".into(),
+        role: Role::Editor,
+        author: "Ada Lovelace".into(),
+        socket: paths::socket("d1"),
+        trust: Trust::Trusted,
+        allows: Allows::default(),
+        style: None,
+        notes: None,
+    }
+}
+
 /// What the Letters server of these tests knows.
 #[derive(Default)]
 struct Letters {
@@ -91,6 +111,8 @@ struct Letters {
     /// Takes the next token shown for run out, whatever its time says.
     strict: bool,
     signed_out: bool,
+    /// The person may no longer read the document.
+    barred: bool,
 }
 
 impl Letters {
@@ -126,6 +148,8 @@ impl Letters {
                 Answer("204 No Content", "", Vec::new())
             }
             "GET /api/v1/spaces" => json(&spaces()),
+            "GET /api/v1/documents/d1" if self.barred => said(Code::Forbidden, "That is not yours to read."),
+            "GET /api/v1/documents/d1" => json(&opened()),
             "GET /api/v1/documents/d1/file" => Answer("200 OK", "content-type: application/zip\r\n", FILE.to_vec()),
             "PUT /api/v1/documents/d1/assets/sky.png" => Answer("204 No Content", "", Vec::new()),
             "GET /api/v1/forbidden" => said(Code::Forbidden, "That is not yours to read."),
@@ -462,4 +486,85 @@ fn signing_out_ends_the_session_here_and_there() {
     assert!(server.letters.lock().unwrap().signed_out);
     assert_eq!(session.spaces().unwrap_err().code(), Some(Code::SignedOut));
     assert!(Session::kept(server.client(), *KEYCHAIN).unwrap().is_none());
+}
+
+#[test]
+fn the_address_of_a_documents_page_names_its_server_and_the_document() {
+    let at = |server: &str, id: &str| Some((server.to_owned(), id.to_owned()));
+    let cases = [
+        ("https://letters.example/d/abc", at("https://letters.example", "abc")),
+        ("  https://letters.example:8443/d/a%2Fb/read ", at("https://letters.example:8443", "a/b")),
+        ("https://letters.example/d/abc/", at("https://letters.example", "abc")),
+        ("https://letters.example/d/", None),
+        ("https://letters.example/d/abc/shares", None),
+        ("https://letters.example/s/ada", None),
+        ("http://letters.example/d/abc", None),
+        ("/home/ada/d/abc", None),
+        ("Roof repairs.let", None),
+    ];
+    for (typed, expected) in cases {
+        assert_eq!(connected::address(typed), expected, "{typed:?}");
+    }
+}
+
+#[test]
+fn no_id_leads_a_copy_out_of_its_servers_folder() {
+    let home = Scratch::new("connected-cache");
+    let client = Client::new("letters.example:8443", &Roots::System).unwrap();
+    let ids = ["abc", "ABC", "../../etc/passwd", "..", ".", ".hidden", "a/b", "a\\b", "a%2Fb", ""];
+
+    let copies: Vec<_> = ids.iter().map(|id| connected::cached(&home.0, &client, id)).collect();
+
+    let folder = copies[0].parent().unwrap();
+    assert!(folder.starts_with(home.0.join(".letters").join("servers")), "{folder:?}");
+    for (id, copy) in ids.iter().zip(&copies) {
+        assert_eq!(copy.parent(), Some(folder), "{id:?}");
+        assert_eq!(copy.extension().and_then(|ending| ending.to_str()), Some("let"), "{id:?}");
+        assert_eq!(copies.iter().filter(|other| *other == copy).count(), 1, "{id:?} has a copy of its own");
+    }
+    let elsewhere = Client::new("letters.example", &Roots::System).unwrap();
+    assert_ne!(connected::cached(&home.0, &elsewhere, "abc").parent(), Some(folder));
+}
+
+#[test]
+fn a_servers_document_is_brought_here_once_and_opens_with_no_server_in_reach() {
+    let (home, server) = (Scratch::new("connected-reach"), Server::start());
+    let session = server.session();
+    let file = ("GET /api/v1/documents/d1/file".to_owned(), "Bearer token-1".to_owned());
+    // The same sign-in, asked of a server whose certificate is not believed just now.
+    let nowhere = Client::new(server.client().origin(), &Roots::These(Vec::new())).unwrap();
+    let offline = Session::begin(nowhere, Some(*KEYCHAIN), token(1));
+
+    // With no copy here, a server out of reach has nothing to open.
+    assert!(matches!(connected::reach(&offline, "d1", &home.0), Err(Unreached::Refused(Refused::Unreachable(_)))));
+
+    let first = connected::reach(&session, "d1", &home.0).unwrap();
+    assert_eq!(
+        first,
+        Reached { opened: opened(), path: connected::cached(&home.0, session.server(), "d1"), online: true }
+    );
+    assert_eq!(std::fs::read(&first.path).unwrap(), FILE);
+    assert!(server.asked().contains(&file));
+
+    // The copy is the document from here on: the line brings what changed, not the file again.
+    std::fs::write(&first.path, b"written in since").unwrap();
+    assert_eq!(connected::reach(&session, "d1", &home.0).unwrap(), first);
+    assert!(!server.asked().contains(&file));
+
+    let later = connected::reach(&offline, "d1", &home.0).unwrap();
+    assert_eq!(later, Reached { online: false, ..first.clone() });
+    assert_eq!(std::fs::read(&first.path).unwrap(), b"written in since");
+}
+
+#[test]
+fn a_document_the_person_may_no_longer_read_is_not_kept_for_them() {
+    let (home, server) = (Scratch::new("connected-barred"), Server::start());
+    let session = server.session();
+    let copy = connected::reach(&session, "d1", &home.0).unwrap().path;
+    server.letters.lock().unwrap().barred = true;
+
+    let refused = connected::reach(&session, "d1", &home.0);
+
+    assert!(matches!(refused, Err(Unreached::Refused(refused)) if refused.code() == Some(Code::Forbidden)));
+    assert!(!copy.exists());
 }

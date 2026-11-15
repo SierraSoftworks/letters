@@ -24,6 +24,7 @@ letters-trust.workspace = true
 letters-spell.workspace = true
 letters-frame.workspace = true
 letters-api.workspace = true
+letters-sync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

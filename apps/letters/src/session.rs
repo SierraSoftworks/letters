@@ -72,6 +72,21 @@ impl Session {
         self.fresh(None)
     }
 
+    /// The next token, for when the server would not take the one it was last shown.
+    pub fn renewed(&self) -> Result<String, Refused> {
+        let mut held = self.held();
+        if held.token.ends <= now() {
+            return Err(over());
+        }
+        self.renew(&mut held)?;
+        Ok(held.token.token.clone())
+    }
+
+    /// Whether the session is over, so that only a new sign-in opens anything. Asks nothing.
+    pub fn ended(&self) -> bool {
+        self.held().token.ends <= now()
+    }
+
     /// Asks the server something as this session, with a token that is renewed first if it has run out.
     /// A refusal with [`Code::SignedOut`] means the person signs in through the browser again.
     pub fn ask<T>(&self, ask: impl Fn(&Client, &str) -> Result<T, Refused>) -> Result<T, Refused> {

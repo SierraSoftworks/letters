@@ -68,7 +68,7 @@ impl Server {
     fn open(&self, path: &str, most: usize) -> (Socket, mpsc::Receiver<Heard>) {
         let (tell, told) = mpsc::channel();
         let heard = move |heard| drop(tell.send(heard));
-        (Socket::open(&self.address(path), "a-sign-in", &self.roots(), most, heard), told)
+        (Socket::open(&self.address(path), || Ok("a-sign-in".to_owned()), &self.roots(), most, heard), told)
     }
 }
 
@@ -185,7 +185,8 @@ fn a_socket_is_opened_only_to_a_server_that_is_believed_over_tls() {
     ];
     for (address, roots, expected) in cases {
         let (tell, told) = mpsc::channel();
-        let _socket = Socket::open(&address, "a-sign-in", &roots, MOST, move |heard| drop(tell.send(heard)));
+        let _socket =
+            Socket::open(&address, || Ok("a-sign-in".to_owned()), &roots, MOST, move |heard| drop(tell.send(heard)));
 
         let ended = next(&told).map(|heard| match heard {
             Heard::Closed(Closed::Lost(_)) => Heard::Closed(Closed::Lost(String::new())),

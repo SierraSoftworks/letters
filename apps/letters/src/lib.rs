@@ -17,6 +17,7 @@ pub mod baseline;
 pub mod chrome;
 pub mod cli;
 pub mod conflicts;
+pub mod connected;
 pub mod convert;
 pub mod copies;
 pub mod dictionaries;

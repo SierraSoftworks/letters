@@ -265,7 +265,6 @@ fn config(roots: &Roots, within: Duration) -> Config {
         .max_redirects_will_error(false)
         .http_status_as_error(false)
         .user_agent(CLIENT)
-        .accept(letters_api::JSON)
         .accept_encoding(AutoHeaderValue::None)
         .max_idle_connections(0)
         .timeout_global(Some(within))

@@ -3110,6 +3110,7 @@ dependencies = [
  "letters-model",
  "letters-render",
  "letters-spell",
+ "letters-sync",
  "letters-trust",
  "letters-ui",
  "pollster 1.0.1",

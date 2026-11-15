@@ -85,22 +85,23 @@ enum Turn {
 }
 
 impl Socket {
-    /// Opens a socket at `address`, a `wss` address, for whoever holds `token`. Nothing waits here: all
-    /// that happens is told to `heard` on another thread, and ends with one [`Heard::Closed`]. A frame of
-    /// more than `most` bytes is taken from no server.
+    /// Opens a socket at `address`, a `wss` address, for whoever holds the token that `token` gives.
+    /// Nothing waits here: `token` is asked on another thread, since a session may have to renew it
+    /// first, and all that happens is told to `heard` there, ending with one [`Heard::Closed`]. A frame
+    /// of more than `most` bytes is taken from no server.
     ///
     /// The token goes to the server in a header and nowhere else.
     pub fn open(
         address: &str,
-        token: &str,
+        token: impl FnOnce() -> Result<String, Closed> + Send + 'static,
         roots: &Roots,
         most: usize,
         mut heard: impl FnMut(Heard) + Send + 'static,
     ) -> Self {
         let (to, turns) = mpsc::channel();
-        let (address, token, roots, arrived) = (address.to_owned(), token.to_owned(), roots.clone(), to.clone());
+        let (address, roots, arrived) = (address.to_owned(), roots.clone(), to.clone());
         thread::spawn(move || {
-            let closed = match connect(&address, &token, &roots, most) {
+            let closed = match token().and_then(|token| connect(&address, &token, &roots, most)) {
                 Ok(socket) => serve(socket, &turns, arrived, &mut heard),
                 Err(closed) => closed,
             };
