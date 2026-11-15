@@ -159,6 +159,22 @@ pub enum Connection {
     Refused(String),
 }
 
+/// What the window shows, as a shell that reports usage counts the time in it. It says nothing of the
+/// document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Mode {
+    /// A card over a page nobody has written on: the landing card, or the one that imports a file.
+    Landing,
+    /// The page, to write on or to read.
+    Editor,
+    /// The document's versions.
+    History,
+    /// A conflict is open to be settled.
+    Review,
+    /// Print view.
+    Print,
+}
+
 /// What the person may do with the document, as its server granted it. A document is theirs to change
 /// until a shell says otherwise.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -455,6 +471,35 @@ impl Ui<EditorApp> {
     /// Whether the landing card is showing.
     pub fn landing(&self) -> bool {
         self.app().landing.is_some()
+    }
+
+    /// Says that this shell sends anonymous usage reports, and whether the person has them on: at the
+    /// start, and whenever that changes. The Settings dialog then has a switch for them, which asks
+    /// [`Request::UsageReports`]. A shell that sends none never says, and its window has no switch.
+    pub fn set_usage_reports(&mut self, on: bool) {
+        self.app_mut().dialog.usage = Some(on);
+    }
+
+    /// Has the landing card say that usage reports are sent and where they are turned off, or not any
+    /// more. A shell shows it once, and remembers that it did.
+    pub fn set_usage_notice(&mut self, shown: bool) {
+        self.app_mut().usage_notice = shown;
+    }
+
+    /// What the window shows now: see [`Mode`]. A shell that reports usage counts the time in each.
+    pub fn mode(&self) -> Mode {
+        let app = self.app();
+        if app.carded() {
+            Mode::Landing
+        } else if app.printing.is_some() {
+            Mode::Print
+        } else if app.history.is_some() {
+            Mode::History
+        } else if app.review.note().is_some() {
+            Mode::Review
+        } else {
+            Mode::Editor
+        }
     }
 
     /// Shows the import card for a file that has to be imported, in place of the landing card, or takes it
@@ -1153,6 +1198,8 @@ pub struct EditorApp {
     copy_location: Option<Location>,
     /// What the landing card offers, while it shows.
     landing: Option<Landing>,
+    /// Whether the landing card says that usage reports are sent.
+    usage_notice: bool,
     /// The file the import card offers, while it shows.
     importing: Option<Importing>,
     requests: Vec<Request>,
@@ -1289,6 +1336,7 @@ impl EditorApp {
             location: Location::default(),
             copy_location: None,
             landing: None,
+            usage_notice: false,
             importing: None,
             requests: Vec::new(),
             images: Images::default(),
@@ -3842,7 +3890,7 @@ impl EditorApp {
 
     /// The landing card, over the middle of a page nobody has written on: the documents opened lately, and
     /// the ways to open another or to start this one. A press on the page behind it starts this one.
-    fn card(landing: &Landing, room: Size) -> Popover<Message> {
+    fn card(landing: &Landing, room: Size, notice: bool) -> Popover<Message> {
         let quiet = |text: &str| Element::text(text, TextStyle::control().size(tokens::TEXT_SM)).fg(tokens::FG_MUTED);
         let recent = |recent: &Recent| {
             let when = opening::ago(&landing.now, &recent.opened);
@@ -3898,10 +3946,26 @@ impl EditorApp {
                 .child(list)
                 .child(line);
         }
+        // Said once by a shell that sends usage reports, with the way to where they are turned off.
+        let notice = notice.then(|| {
+            let said = "Letters shares anonymous usage reports. You can turn this off in Settings.";
+            let said = Element::paragraph(said, TextStyle::control().size(tokens::TEXT_SM)).fg(tokens::FG_MUTED);
+            let settings = Button::new("Settings").small().on_press(Message::Settings(Setting::Show));
+            let line = Element::row().height(1.0).bg(tokens::LINE).decorative();
+            let row = Element::row()
+                .align(Align::Center)
+                .gap(tokens::SPACE_SM)
+                .padding(Edges::left(tokens::SPACE_SM))
+                .child(Element::column().grow(1.0).child(said))
+                .child(settings);
+            Element::column().gap(tokens::SPACE_SM).child(line).child(row)
+        });
         // The card sits a little above the middle of the page area.
-        let height = listed * RECENT_HEIGHT + if listed > 0.0 { 120.0 } else { 64.0 };
+        let height = listed * RECENT_HEIGHT
+            + if listed > 0.0 { 120.0 } else { 64.0 }
+            + if notice.is_some() { 48.0 } else { 0.0 };
         let spot = Rect::new(room.width / 2.0, ((room.height - height) * 0.4).max(0.0), 0.0, 0.0);
-        Popover::new(card.child(foot))
+        Popover::new(card.child(foot).children(notice))
             .label("Open a document")
             .max_width(CARD_WIDTH + 2.0 * tokens::SPACE_MD)
             .at(spot)
@@ -4221,7 +4285,7 @@ impl EditorApp {
             element = element.popover(importing.card(room));
         } else if let Some(landing) = self.landing.as_ref().filter(|_| !self.browser.open()) {
             // The card of a server's documents takes the landing card's place while it is out.
-            element = element.popover(Self::card(landing, room));
+            element = element.popover(Self::card(landing, room, self.usage_notice));
         } else if let Some(copy) = &self.copying {
             element = element.popover(copy.card(self.copies_to(), room));
         } else if let Some((figure, src)) =
@@ -5400,6 +5464,12 @@ impl EditorApp {
             Message::Settings(message) => {
                 if matches!(message, Setting::Show) {
                     self.undialog();
+                }
+                // Whether usage is reported is the shell's to keep.
+                if let Setting::Usage(on) = message
+                    && self.dialog.usage.is_some_and(|was| was != on)
+                {
+                    self.requests.push(Request::UsageReports(on));
                 }
                 if self.dialog.update(message, &mut self.settings) {
                     self.tint();

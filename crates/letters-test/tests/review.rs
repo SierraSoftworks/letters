@@ -5,6 +5,7 @@ use accesskit::{Action, ActionRequest, TreeId};
 use letters_model::{Block, BlockKind, Document, Note, NoteKind, Notes, Pos, Selection, Stood, Version};
 use letters_render::{Point, Rect};
 use letters_test::{Found, Harness, Role};
+use letters_ui::Mode;
 
 /// A Sunday, 15 November 2026, at twenty past two in the morning, in seconds since 1970.
 const NOW: u64 = 1_794_709_230;
@@ -177,6 +178,12 @@ fn a_banner_counts_the_conflicts_that_wait_and_steps_through_them_down_the_page(
         assert!(window.find(Role::Label, stands).is_some(), "{step}: the banner says {stands}");
         window.assert_closed(Role::Dialog, "Conflict");
     }
+}
+
+#[test]
+fn a_shell_is_told_while_a_conflict_is_open() {
+    assert_eq!(letter(both()).ui().mode(), Mode::Editor);
+    assert_eq!(reviewing().ui().mode(), Mode::Review);
 }
 
 #[test]

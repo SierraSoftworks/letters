@@ -92,6 +92,10 @@ pub enum Request {
     /// `Window::set_settings`. The window that asks already follows the accent. The rest is the shell's to
     /// follow: light or dark, the name edits are signed with, and the language of new documents.
     Settings(Settings),
+    /// The person turned this shell's anonymous usage reports on or off in the Settings dialog, which has
+    /// the switch once the shell has said `Window::set_usage_reports`. Keep it, follow it, and tell every
+    /// other window.
+    UsageReports(bool),
     /// Move the window with the pointer, which is held down on the bar: a bar that is the title bar asks
     /// (see `Window::set_chrome`).
     DragWindow,

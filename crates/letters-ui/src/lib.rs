@@ -94,4 +94,4 @@ pub use text::{Family, FixedShaper, FontShaper, GlyphRun, Shaped, Stop, TextShap
 pub use theme::Accent;
 pub use tokens::{Color as Ink, Scheme};
 pub use ui::{App, Idle, Keys, Ui};
-pub use window::{Access, Allows, Connection, DocLines, EditorApp, SaveState, Window, palette};
+pub use window::{Access, Allows, Connection, DocLines, EditorApp, Mode, SaveState, Window, palette};
