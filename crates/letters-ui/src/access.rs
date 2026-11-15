@@ -195,9 +195,14 @@ fn collect<M>(tree: &Tree<M>, window: &Window<'_>, i: usize, named: bool, siblin
         children.extend(runs);
     }
     node.set_children(children);
-    // The app describes the canvas that takes its input. A passive one has only its own name.
-    if matches!(n.el.content, Content::Canvas(_)) && n.el.focus != Focus::No {
-        (window.describe)(&mut node, out);
+    if let Content::Canvas(canvas) = &n.el.content {
+        match &canvas.field {
+            // A field says what is written in it.
+            Some(value) => node.set_value(value.as_str()),
+            // The app describes the canvas that takes its input. A passive one has only its own name.
+            None if n.el.focus != Focus::No => (window.describe)(&mut node, out),
+            None => {}
+        }
     }
 
     let id = node_id(n.id);

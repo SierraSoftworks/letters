@@ -390,7 +390,13 @@ impl<A: App> Ui<A> {
     /// Whether what is typed goes to the app's own canvas, such as the page, and not to a field of the
     /// window, as last laid out. A shell that shows a keyboard the text around the caret asks this first.
     pub fn types_in_canvas(&self) -> bool {
-        self.caret_holder().is_some_and(|i| matches!(self.tree.nodes[i].el.content, Content::Canvas(_)))
+        self.caret_holder().is_some_and(|i| self.own(i))
+    }
+
+    /// Whether an element is a canvas that is the app's own area, such as the page, and not a field that
+    /// the app happens to draw.
+    fn own(&self, i: usize) -> bool {
+        matches!(&self.tree.nodes[i].el.content, Content::Canvas(canvas) if canvas.field.is_none())
     }
 
     /// Where the app's own canvas is in the window as last laid out: the one focus rests on, such as the
@@ -474,9 +480,9 @@ impl<A: App> Ui<A> {
     pub fn access_action(&mut self, request: ActionRequest, platform: &mut dyn Platform) {
         self.refresh();
         let id = Id(request.target_node.0);
-        // What a canvas holds is the app's, and so is anything asked of it beyond a click or focus.
+        // What the app's own canvas holds is the app's, and so is anything asked of it beyond a click or focus.
         let found = self.tree.find(id);
-        let canvas = found.is_some_and(|i| matches!(self.tree.nodes[i].el.content, Content::Canvas(_)));
+        let canvas = found.is_some_and(|i| self.own(i));
         let (Some(i), true) = (found, !canvas || matches!(request.action, Action::Click | Action::Focus)) else {
             self.app.access_action(&request, platform);
             self.stale.view = true;
@@ -766,7 +772,8 @@ impl<A: App> Ui<A> {
                 return true;
             }
         }
-        let on_page = focused.is_none_or(|i| matches!(self.tree.nodes[i].el.content, Content::Canvas(_)));
+        // A field the app draws has its keys first, as a text input has.
+        let on_page = focused.is_none_or(|i| self.own(i));
         if on_page && self.offer(event, platform) {
             self.restart_blink();
             return true;
@@ -1391,11 +1398,13 @@ impl<A: App> Ui<A> {
     }
 
     /// The element whose caret shows: the one with focus, or a canvas that holds a caret for it in a popover
-    /// beside it.
+    /// beside it. A field's caret is its own, and it holds none for anything else.
     fn caret_holder(&self) -> Option<usize> {
         let focused = self.focused()?;
-        let holds =
-            |i: &usize| matches!(&self.tree.nodes[*i].el.content, Content::Canvas(canvas) if canvas.caret.is_some());
+        let holds = |i: &usize| {
+            let content = &self.tree.nodes[*i].el.content;
+            matches!(content, Content::Canvas(canvas) if canvas.caret.is_some() && canvas.field.is_none())
+        };
         let beside = self.tree.layers.iter().filter(|layer| layer.beside && layer.anchor == Some(focused));
         beside.flat_map(|layer| layer.root..layer.end).find(holds).or(Some(focused))
     }
