@@ -93,6 +93,8 @@ pub(crate) struct Previews {
     fetches: BTreeMap<BlockId, (String, Option<String>)>,
     /// Whether the shell cannot fetch what a page says of itself, so that nothing offers a fetch.
     unfetched: bool,
+    /// What the page was last told to write on a preview: why its page was not fetched.
+    noted: BTreeMap<BlockId, String>,
 }
 
 /// The address of a link preview.
@@ -219,9 +221,28 @@ impl Previews {
         }
     }
 
-    /// Why the last fetch of a preview found nothing.
-    pub fn failed(&self, block: &BlockId) -> Option<&str> {
-        self.fetches.get(block).and_then(|(_, failed)| failed.as_deref())
+    /// What is said of a preview whose last fetch found nothing: that, and why.
+    pub fn failed(&self, block: &BlockId) -> Option<String> {
+        let (_, failed) = self.fetches.get(block)?;
+        Some(format!("Not fetched: {}", failed.as_deref()?))
+    }
+
+    /// What the page is to write on its previews from now on. For each one whose line changes: what is
+    /// said of its failed fetch, or `None` where that holds no more.
+    pub fn notes(&mut self) -> Vec<(BlockId, Option<String>)> {
+        let said = |block: &BlockId| Some((block.clone(), self.failed(block)?));
+        let now: BTreeMap<BlockId, String> = self.fetches.keys().filter_map(said).collect();
+        let gone = self.noted.keys().filter(|block| !now.contains_key(*block)).map(|block| (block.clone(), None));
+        let new = now.iter().filter(|(block, note)| self.noted.get(*block) != Some(*note));
+        let changed = gone.chain(new.map(|(block, note)| (block.clone(), Some(note.clone())))).collect();
+        self.noted = now;
+        changed
+    }
+
+    /// Forgets what the page was told to write, and returns the previews it was written on. A sheet says
+    /// nothing of a fetch, and the page is told again once it shows.
+    pub fn unnoted(&mut self) -> Vec<BlockId> {
+        std::mem::take(&mut self.noted).into_keys().collect()
     }
 
     /// Whether a press on a preview's control asks for anything: not while its page is being fetched.
@@ -312,9 +333,9 @@ impl Previews {
         }
 
         let mut card = Element::column().width(WIDTH).gap(tokens::SPACE_SM).child(address).child(heading).child(about);
-        if let Some(why) = self.failed(block) {
+        if let Some(failed) = self.failed(block) {
             let quiet = TextStyle::control().size(tokens::TEXT_SM);
-            let said = Element::paragraph(format!("Not fetched: {why}"), quiet).fg(tokens::DANGER).max_width(WIDTH);
+            let said = Element::paragraph(failed, quiet).fg(tokens::DANGER).max_width(WIDTH);
             card = card.child(said.role(Role::Status));
         }
         let card = card.children((self.offered() || image.is_some()).then_some(buttons));
@@ -347,7 +368,7 @@ mod tests {
         assert_eq!(previews.answered(ROOF, Some(" the server answered 404 ")), [block.clone(), twin.clone()]);
         for block in [&block, &twin] {
             assert_eq!((previews.says(block), previews.waits(block)), (AGAIN, false));
-            assert_eq!(previews.failed(block), Some("the server answered 404"));
+            assert_eq!(previews.failed(block).as_deref(), Some("Not fetched: the server answered 404"));
         }
 
         // Another try forgets why the last one failed, and a page that was found leaves nothing to say.
@@ -360,6 +381,33 @@ mod tests {
         );
         assert_eq!((previews.says(&block), previews.waits(&block)), (FETCH, false));
         assert_eq!(previews.says(&twin), AGAIN);
+    }
+
+    #[test]
+    fn the_page_is_told_once_what_to_write_on_a_preview_and_once_to_take_it_away() {
+        let (mut previews, block, twin) = (Previews::default(), BlockId::new("card"), BlockId::new("twin"));
+        let said = |code: u16| Some(format!("Not fetched: the server answered {code}"));
+        previews.fetch(&block, ROOF);
+        previews.fetch(&twin, ROOF);
+        assert_eq!(previews.notes(), [], "nothing is said of a fetch that runs");
+        previews.answered(ROOF, Some("the server answered 404"));
+        assert_eq!(previews.notes(), [(block.clone(), said(404)), (twin.clone(), said(404))]);
+        assert_eq!(previews.notes(), [], "what stands is not told again");
+
+        // Another try takes the line away, and one that fails for another reason writes that.
+        previews.fetch(&block, ROOF);
+        assert_eq!(previews.notes(), [(block.clone(), None)]);
+        previews.answered(ROOF, Some("the server answered 500"));
+        assert_eq!(previews.notes(), [(block.clone(), said(500))]);
+        previews.fetch(&block, ROOF);
+        previews.answered(ROOF, Some("the server answered 503"));
+        assert_eq!(previews.notes(), [(block.clone(), said(503))], "though the page was not told of the try");
+        // What a sheet has taken away is written again on the page.
+        assert_eq!(previews.unnoted(), [block.clone(), twin.clone()]);
+        assert_eq!(previews.notes(), [(block.clone(), said(503)), (twin.clone(), said(404))]);
+        // A shell that cannot fetch after all leaves nothing to say.
+        previews.offer(false);
+        assert_eq!(previews.notes(), [(block, None), (twin, None)]);
     }
 
     #[test]

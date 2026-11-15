@@ -2187,6 +2187,11 @@ impl EditorApp {
             self.highlight(None);
             self.tell_links(None);
         }
+        // A sheet says nothing of a fetch. What the page wrote on a preview goes, so that the sheets break
+        // where the printed ones do, and is written again when the page shows.
+        for preview in self.previews.unnoted() {
+            self.layout.set_preview_note(&preview, None);
+        }
         // Paging lays out whatever was still estimated.
         let pages = self.layout.paginate(&self.editor.model().style().page);
         self.estimated = false;
@@ -3478,6 +3483,16 @@ impl EditorApp {
                 self.held(|page| page.layout.set_caption_open(named.as_ref()));
                 self.captions.named = named;
             }
+        }
+        // A preview says under its address why its page was not fetched, for as long as that holds. A line
+        // that comes or goes above the view leaves what is read where it is.
+        let notes = self.previews.notes();
+        if !notes.is_empty() {
+            self.held(|page| {
+                for (preview, note) in &notes {
+                    page.layout.set_preview_note(preview, note.as_deref());
+                }
+            });
         }
         // A heading's markers hang in the margin, beside the outline when it shows.
         let taken = if self.outlined() { chapters_width() } else { tokens::SPACE_SM };
@@ -5001,7 +5016,7 @@ impl App for EditorApp {
             let at = self.onto(card.rect);
             describe::whole(&card.block, Whole::Preview, (previews::LABEL, None), at, page, nodes);
             if let Some(room) = card.control.filter(|_| self.previews.offered()) {
-                let failed = self.previews.failed(&card.block).map(|why| format!("Not fetched: {why}"));
+                let failed = self.previews.failed(&card.block);
                 let told = (self.previews.says(&card.block), failed.as_deref());
                 describe::whole(&card.block, Whole::Fetch, told, self.onto(previews::control(room)), page, nodes);
             }
