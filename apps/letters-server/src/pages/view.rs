@@ -8,7 +8,7 @@ use yew::prelude::*;
 use yewi::prelude::*;
 
 use super::{ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH};
-use super::{ACT_SHARE, ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder};
+use super::{ACT_REVOKE, ACT_SHARE, ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder};
 
 /// Everything one page shows. It is made where the request is answered and drawn on another thread, so it
 /// holds plain text.
@@ -79,8 +79,20 @@ pub enum Ask {
     /// Where to, among the folders the person may put it in.
     Move(api::Entry, Vec<Target>),
     Trash(api::Entry),
-    /// Who it is shared with, and who it can be shared with besides.
-    Share(api::Entry, Vec<api::Grant>, Vec<api::Grantee>),
+    /// Who it is shared with, who it can be shared with besides, and the links that open it.
+    Share(api::Entry, Vec<api::Grant>, Vec<api::Grantee>, Vec<Linked>),
+}
+
+/// A link that still opens a document, as the Share dialog lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Linked {
+    pub id: String,
+    pub label: String,
+    pub role: api::Role,
+    /// Whether it asks a passphrase.
+    pub passphrase: bool,
+    /// The day it stops opening the document, as a person reads it.
+    pub ends: Option<String>,
 }
 
 /// A folder a document can be moved to.
@@ -421,7 +433,7 @@ fn asked(ask: &Ask, here: &str) -> Html {
         Ask::Rename(entry) => (entry, format!("Rename {}", entry.name), "Rename", ACT_RENAME),
         Ask::Move(entry, _) => (entry, format!("Move {}", entry.name), "Move", ACT_MOVE),
         Ask::Trash(entry) => (entry, format!("Move {} to the trash?", entry.name), "Move to trash", ACT_TRASH),
-        Ask::Share(entry, people, offered) => return sharing(entry, people, offered, here),
+        Ask::Share(entry, people, offered, links) => return sharing(entry, people, offered, links, here),
     };
     let fields = match ask {
         Ask::Rename(entry) => html! {
@@ -523,9 +535,30 @@ fn grantee(to: &api::Grantee) -> (String, String) {
 }
 
 /// The Share dialog, open over the folder at `here`: who the document is shared with, each with the way to
-/// take them out, and a form that shares it with one more or gives one of them another role.
-fn sharing(entry: &api::Entry, people: &[api::Grant], offered: &[api::Grantee], here: &str) -> Html {
+/// take them out, a form that shares it with one more or gives one of them another role, and the links
+/// that open it, each with the way to revoke it. A link is made in the editor, which shows its address.
+fn sharing(entry: &api::Entry, people: &[api::Grant], offered: &[api::Grantee], links: &[Linked], here: &str) -> Html {
     let id = entry.id.as_deref().unwrap_or_default();
+    let link = |link: &Linked| {
+        let asks = link.passphrase.then(|| "with a passphrase".to_owned());
+        let ends = link.ends.as_ref().map(|day| format!("until {day}"));
+        let terms: Vec<String> = [Some(role(link.role).to_owned()), asks, ends].into_iter().flatten().collect();
+        html! {
+            <li class="lt-shares__row">
+                <Icon icon={if link.passphrase { icons::KEY_ROUND } else { icons::LINK }} />
+                <span class="lt-shares__name">{ link.label.clone() }</span>
+                <span class="lt-dim">{ terms.join(", ") }</span>
+                <form method="post" action={ACT_REVOKE}>
+                    { hidden("id", id) }
+                    { hidden("back", here) }
+                    { hidden("link", &link.id) }
+                    <Button size={Size::Small} variant={ButtonVariant::Subtle} kind={ButtonKind::Submit} attrs={attrs! { "aria-label" => format!("Revoke the link {}", link.label) }}>
+                        { "Revoke" }
+                    </Button>
+                </form>
+            </li>
+        }
+    };
     let row = |grant: &api::Grant| {
         let (value, label) = grantee(&grant.to);
         let face = match &grant.to {
@@ -576,6 +609,12 @@ fn sharing(entry: &api::Entry, people: &[api::Grant], offered: &[api::Grantee], 
                     </Field>
                     <Button variant={ButtonVariant::Primary} kind={ButtonKind::Submit}>{ "Share" }</Button>
                 </form>
+                if !links.is_empty() {
+                    <section>
+                        <h3 class="lt-shares__title">{ "Links" }</h3>
+                        <ul class="lt-shares" aria-label="Links">{ for links.iter().map(link) }</ul>
+                    </section>
+                }
             </Stack>
         </Dialog>
     }

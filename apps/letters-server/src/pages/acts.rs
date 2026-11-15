@@ -10,7 +10,7 @@ use letters_api::{Code, Grant, Grantee, Move, NewDocument, NewFolder, Role, path
 use serde::Deserialize;
 
 use super::{ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH, TRASH_PAGE};
-use super::{ACT_SHARE, ACT_UNSHARE, Visitor, asking, refusing, unmerged};
+use super::{ACT_REVOKE, ACT_SHARE, ACT_UNSHARE, Visitor, asking, refusing, unmerged};
 use crate::api::blocking;
 use crate::auth::local;
 use crate::error::{Answer, Refusal};
@@ -29,6 +29,7 @@ pub fn routes() -> Router<Shared> {
         .route(ACT_PUT_BACK, post(put_back))
         .route(ACT_SHARE, post(share))
         .route(ACT_UNSHARE, post(unshare))
+        .route(ACT_REVOKE, post(revoke))
 }
 
 /// Does `work`, which says the page to show next, and shows `back` with the refusal when it is refused.
@@ -98,6 +99,9 @@ struct About {
     /// What to share it to do: a role, as it is on the wire.
     #[serde(default)]
     role: String,
+    /// The link of it to revoke, by its id.
+    #[serde(default)]
+    link: String,
 }
 
 impl About {
@@ -179,6 +183,15 @@ async fn share(State(app): State<Shared>, Visitor(who): Visitor, Form(about): Fo
 
 async fn unshare(State(app): State<Shared>, Visitor(who): Visitor, Form(about): Form<About>) -> Response {
     done(app, about.back(), move |app| about.sharing(&who, app, |_| Ok(None))).await
+}
+
+/// Revokes a link of a document. The Share dialog is shown again, without it.
+async fn revoke(State(app): State<Shared>, Visitor(who): Visitor, Form(about): Form<About>) -> Response {
+    done(app, about.back(), move |app| {
+        app.revoke_link(&who, &about.id, &about.link)?;
+        Ok(asking(&about.back(), "share", &about.id))
+    })
+    .await
 }
 
 /// Merges the conflict copies beside a document into it. Nothing else a form asks is refused for what a

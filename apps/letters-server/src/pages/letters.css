@@ -13,10 +13,10 @@ a.lt-file__name:hover { text-decoration: underline; }
 .lt-dim { color: var(--yi-fg-muted); font-size: var(--yi-text-sm); white-space: nowrap; }
 
 /* The Share dialog: who a document is shared with, each face, name, role and way out in a column of its
-   own, and the form that shares it with one more. */
+   own, the form that shares it with one more, and its links in the same columns. */
 .lt-shares {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(1.5rem, auto) minmax(0, 1fr) auto auto;
   gap: var(--yi-space-xs) var(--yi-space-sm);
   margin: 0;
   padding: 0;
@@ -27,6 +27,7 @@ a.lt-file__name:hover { text-decoration: underline; }
 .lt-shares__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lt-shares__add { display: flex; flex-wrap: wrap; align-items: end; gap: var(--yi-space-sm); }
 .lt-shares__to { flex: 1; min-inline-size: 12rem; }
+.lt-shares__title { margin: 0 0 var(--yi-space-xs); font-size: var(--yi-text-sm); font-weight: 600; color: var(--yi-fg-muted); }
 
 /* A page with no frame: one thing said in the middle of it. */
 .lt-card {

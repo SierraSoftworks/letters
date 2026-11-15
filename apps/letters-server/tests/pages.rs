@@ -3,11 +3,11 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{Browser, Server, URL, names};
-use letters_api::{Entry, Listing, Opened, paths};
+use common::{Browser, START, Server, URL, follow, link, names};
+use letters_api::{CreatedLink, Entry, Listing, NewLink, Opened, Role, paths};
 use letters_server::pages::{
-    ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_SHARE, ACT_TRASH, ACT_UNSHARE,
-    RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder,
+    ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_REVOKE, ACT_SHARE, ACT_TRASH,
+    ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder,
 };
 
 /// What the folder at `path` of a space holds, as the interface tells the browser's own session.
@@ -197,6 +197,36 @@ async fn the_share_dialog_shares_a_document_and_whoever_it_names_finds_it() {
     let taken = ada.fill(ACT_UNSHARE, &[about[0], about[1], ("to", "p:sub-ben")]).await;
     assert_eq!(taken.location(), ask);
     assert!(!page(&mut ben, SHARED_PAGE).await.contains("Plan"), "what is no longer shared is not listed");
+}
+
+#[tokio::test]
+async fn the_share_dialog_lists_the_links_that_open_a_document_and_revokes_them() {
+    let server = Server::linking("link-form");
+    let (mut ada, mut ben) = (server.reader("ada", &[]), server.reader("ben", &[]));
+    let id = ada.pages().start("home", "", "Plan").await.id.unwrap();
+    let here = paths::folder_page("home", "");
+    let ask = asking(&here, "share", &id);
+    assert!(!page(&mut ada, &ask).await.contains(ACT_REVOKE), "a document with no link offers none to revoke");
+
+    // One that is over is the access log's to remember: the dialog lists what still opens the document.
+    let over = NewLink { expires: Some(START + 60), ..link("Builder", Role::Reader) };
+    let news = [link("Accountant", Role::Commenter), over];
+    let mut made = Vec::new();
+    for new in &news {
+        made.push(ada.pages().post::<CreatedLink>(&paths::links(&id), new).await.expect("her own document"));
+    }
+    server.wait(120);
+    let dialog = page(&mut ada, &ask).await;
+    assert!(dialog.contains("Accountant") && dialog.contains("Commenter"), "the link and what it lets its reader do");
+    assert!(!dialog.contains("Builder"), "a link that is over is not listed");
+
+    // Only whoever may share revokes, and then the link opens nothing and the dialog no longer has it.
+    let about = [("id", id.as_str()), ("back", here.as_str()), ("link", made[0].link.id.as_str())];
+    assert!(ben.fill(ACT_REVOKE, &about).await.location().contains("error="), "it is not Ben's to revoke");
+    assert_eq!(follow(&mut server.visitor(), &made[0]).await.location(), paths::editor_page(&id));
+    assert_eq!(ada.fill(ACT_REVOKE, &about).await.location(), ask);
+    assert!(!page(&mut ada, &ask).await.contains("Accountant"), "a revoked link is not listed");
+    assert_eq!(follow(&mut server.visitor(), &made[0]).await.status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

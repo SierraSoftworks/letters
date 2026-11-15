@@ -29,7 +29,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use letters_api::{Code, Entry, EntryKind, Person, paths};
+use letters_api::{Code, Entry, EntryKind, Link, Person, paths};
 use serde::Deserialize;
 use yew::ServerRenderer;
 
@@ -43,7 +43,7 @@ use crate::spaces::{Place, seconds, shown};
 use crate::{App, Shared};
 
 use self::statics::statics;
-use self::view::{Ask, At, Body, Card, Folder, Page, Root, RootProps, Row, Target, Trashed};
+use self::view::{Ask, At, Body, Card, Folder, Linked, Page, Root, RootProps, Row, Target, Trashed};
 
 /// A page: the documents the person opened lately.
 pub const RECENT_PAGE: &str = "/recent";
@@ -62,6 +62,7 @@ pub const ACT_MERGE: &str = "/act/merge-conflicts";
 pub const ACT_PUT_BACK: &str = "/act/put-back";
 pub const ACT_SHARE: &str = "/act/share";
 pub const ACT_UNSHARE: &str = "/act/unshare";
+pub const ACT_REVOKE: &str = "/act/revoke-link";
 
 /// How many folders a document is offered to be moved to. A space with more is tidied in the editor's own
 /// file dialogs or on the disk.
@@ -350,8 +351,20 @@ async fn folder(
             let ask = match (asked.ask.as_deref(), about) {
                 // Whoever may not share is asked nothing, as with a document that is gone.
                 (Some("share"), Some(entry)) => {
-                    let people = entry.id.as_ref().and_then(|id| app.shares(&who, id).ok());
-                    people.map(|shares| Ask::Share(entry, shares.people, app.directory(&who).unwrap_or_default()))
+                    let shares = entry.id.as_ref().and_then(|id| app.shares(&who, id).ok());
+                    shares.map(|shares| {
+                        // A link that opens nothing any more is the access log's to remember.
+                        let live = |link: &&Link| link.revoked.is_none() && link.expires.is_none_or(|ends| now < ends);
+                        let linked = |link: &Link| Linked {
+                            id: link.id.clone(),
+                            label: link.label.clone(),
+                            role: link.role,
+                            passphrase: link.passphrase,
+                            ends: link.expires.map(|ends| day(ends, now)),
+                        };
+                        let links = shares.links.iter().filter(live).map(linked).collect();
+                        Ask::Share(entry, shares.people, app.directory(&who).unwrap_or_default(), links)
+                    })
                 }
                 (Some("rename"), Some(entry)) if edits => Some(Ask::Rename(entry)),
                 (Some("trash"), Some(entry)) if edits => Some(Ask::Trash(entry)),
@@ -507,6 +520,11 @@ pub fn when(at: u64, now: u64) -> String {
     } else if ago < 7 * DAY {
         return count(ago / DAY, "day");
     }
+    day(at, now)
+}
+
+/// The day of `at` in the server's time zone, with its year when that is not this one.
+pub fn day(at: u64, now: u64) -> String {
     let zone = TimeZone::system();
     let day = |seconds: u64| Timestamp::from_second(seconds as i64).ok().map(|time| time.to_zoned(zone.clone()));
     match (day(at), day(now)) {
