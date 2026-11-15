@@ -73,7 +73,7 @@ pub fn to_pdf(
         }
         let links = layout.page_links(&pages, index).into_iter().filter_map(|link| {
             let address = href(&link.target)?;
-            Some(Link { rect: link.rect, target: Target::Url(address) })
+            Some(Link { rect: link.rect, target: Target::Url(address), part: None })
         });
         pdf.page(sheet, &list, &images, &links.collect::<Vec<_>>());
     }

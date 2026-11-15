@@ -60,6 +60,8 @@ pub struct Link {
     /// Where on the page it is, in logical pixels from the page's top left.
     pub rect: Rect,
     pub target: Target,
+    /// The id of the [`Role::Link`] part that holds the link's text, if the page's list has one.
+    pub part: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -169,24 +171,6 @@ impl Pdf {
         let sheet = PageSettings::from_wh(size.width * POINTS, size.height * POINTS)
             .unwrap_or_else(|| PageSettings::from_wh(1.0, 1.0).expect("a point square is a valid page"));
         let mut page = self.document.start_page_with(sheet);
-        for link in links {
-            let Rect { x, y, width, height } = link.rect;
-            if !(width > 0.0 && height > 0.0) {
-                continue;
-            }
-            let Some(rect) = geom::Rect::from_xywh(x * POINTS, y * POINTS, width * POINTS, height * POINTS) else {
-                continue;
-            };
-            let opens = match &link.target {
-                Target::Url(url) => Opens::Action(Action::Link(LinkAction::new(url.clone()))),
-                Target::Place { page, at } => {
-                    self.furthest = self.furthest.max(Some(*page));
-                    Opens::Destination(place(*page, *at).into())
-                }
-            };
-            page.add_annotation(Annotation::new_link(LinkAnnotation::new(rect, opens), None));
-        }
-
         let mut surface = page.surface();
         surface.push_transform(&Transform::from_scale(POINTS, POINTS));
         let mut painter = Painter {
@@ -201,6 +185,31 @@ impl Pdf {
         painter.paint(list);
         surface.pop();
         surface.finish();
+        for Link { rect, target, part } in links {
+            let Rect { x, y, width, height } = *rect;
+            if !(width > 0.0 && height > 0.0) {
+                continue;
+            }
+            let Some(rect) = geom::Rect::from_xywh(x * POINTS, y * POINTS, width * POINTS, height * POINTS) else {
+                continue;
+            };
+            let opens = match target {
+                Target::Url(url) => Opens::Action(Action::Link(LinkAction::new(url.clone()))),
+                Target::Place { page, at } => {
+                    self.furthest = self.furthest.max(Some(*page));
+                    Opens::Destination(place(*page, *at).into())
+                }
+            };
+            let link = Annotation::new_link(LinkAnnotation::new(rect, opens), None);
+            // A link that names its text is read where the text is. The others can only be clicked.
+            let linked = part
+                .and_then(|part| self.structure.known.get(&part))
+                .map(|element| &mut self.structure.elements[*element]);
+            match linked.filter(|element| element.role == Role::Link) {
+                Some(element) => element.parts.push(Part::Content(page.add_tagged_annotation(link))),
+                None => page.add_annotation(link),
+            }
+        }
         page.finish();
         self.pages += 1;
     }
@@ -304,7 +313,7 @@ struct Element {
 #[derive(Clone, Copy)]
 enum Part {
     Element(usize),
-    /// A stretch of one page's content.
+    /// A stretch of one page's content, or a link on it.
     Content(Identifier),
 }
 
@@ -409,6 +418,7 @@ fn tag(role: &Role) -> TagKind {
         Role::Figure { alt } => Kind::Figure(said(alt)).into(),
         Role::Caption => Kind::Caption.into(),
         Role::Formula { alt } => Kind::Formula(said(alt)).into(),
+        Role::Link => Kind::Link.into(),
         Role::Table => Kind::Table.into(),
         Role::Row => Kind::TR.into(),
         Role::Cell { header: true } => Kind::TH(TableHeaderScope::Column).into(),

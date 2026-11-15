@@ -160,6 +160,9 @@ pub enum Role {
     Formula {
         alt: Arc<str>,
     },
+    /// Text that takes the reader somewhere, inside the text around it. A backend with links of its own,
+    /// such as [`pdf::Link`], is told which part a link belongs to by the part's id.
+    Link,
     Table,
     Row,
     Cell {

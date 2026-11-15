@@ -139,7 +139,8 @@ fn document_of(read: &Read) -> Option<Dict<'_>> {
 
 /// The document as a reader that cannot see the pages gets it: each element as its PDF type, then what
 /// kind of list it is, then `[the words that stand for it]`, around `{what it holds}` in reading order. A
-/// stretch of a page is the text it draws, or `*` if it draws none. Empty if the PDF says nothing.
+/// stretch of a page is the text it draws, or `*` if it draws none, and a link is `@` and its address. Empty
+/// if the PDF says nothing.
 fn structure_of(read: &Read) -> String {
     fn element(read: &Read, pages: &[Reader], dict: &Dict<'_>) -> String {
         let kind = dict.get::<Name<'_>>("S").map(|kind| kind.as_str().to_owned()).unwrap_or_default();
@@ -171,6 +172,11 @@ fn structure_of(read: &Read) -> String {
             .map(|held| match held {
                 Object::Number(number) => stretch(page, Some(number.as_i64() as i32)),
                 Object::Dict(inner) if inner.contains_key("S") => element(read, pages, inner),
+                Object::Dict(link) if link.contains_key("Obj") => {
+                    let address =
+                        link.get::<Dict<'_>>("Obj").and_then(|link| string(&link.get::<Dict<'_>>("A")?, "URI"));
+                    format!("@{}", address.unwrap_or_default())
+                }
                 Object::Dict(marked) => stretch(page_at(read, marked, "Pg").or(page), marked.get::<i32>("MCID")),
                 _ => "something else".to_owned(),
             })
@@ -369,13 +375,17 @@ fn a_photo_goes_in_as_the_file_it_came_from() {
 
 #[test]
 fn links_and_the_outline_lead_where_they_say() {
-    let link = |target| Link { rect: Rect::new(10.0, 20.0, 100.0, 12.0), target };
+    let link = |target| Link { rect: Rect::new(10.0, 20.0, 100.0, 12.0), target, part: None };
     let heading =
         |title: &str, level, page| Heading { title: title.into(), level, page, at: Point { x: 0.0, y: 40.0 } };
     let links = vec![
         link(Target::Url("https://example.com/rates?year=2027".into())),
         link(Target::Place { page: 2, at: Point { x: 0.0, y: 40.0 } }),
-        Link { rect: Rect::new(10.0, 20.0, 0.0, 0.0), target: Target::Url("https://example.com/nowhere".into()) },
+        Link {
+            rect: Rect::new(10.0, 20.0, 0.0, 0.0),
+            target: Target::Url("https://example.com/nowhere".into()),
+            part: None,
+        },
     ];
     let info = Info {
         title: "Household rates".into(),
@@ -447,7 +457,11 @@ fn the_file_says_when_it_was_written_if_the_shell_says() {
 
 #[test]
 fn a_link_to_a_page_that_is_never_added_fails() {
-    let link = Link { rect: Rect::new(0.0, 0.0, 10.0, 10.0), target: Target::Place { page: 7, at: Point::default() } };
+    let link = Link {
+        rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+        target: Target::Place { page: 7, at: Point::default() },
+        part: None,
+    };
 
     let outcome = written(&[(on_white([]), vec![link])], &Images::default(), &Info::default());
 
@@ -645,4 +659,27 @@ fn parts_that_do_not_pair_up_change_nothing_on_the_page() {
         assert!(shown(&read.pages()[0]) == shown(&expected.pages()[0]), "{name} shows what the plain page shows");
         assert_eq!(text_of(&read.pages()[0]), "OneTwoThree", "{name} keeps the text");
     }
+}
+
+#[test]
+fn a_link_is_read_with_the_text_it_covers() {
+    let link = |address: &str, part| Link {
+        rect: Rect::new(10.0, 20.0, 60.0, 14.0),
+        target: Target::Url(address.into()),
+        part,
+    };
+    let text = [line("See", 0)].into_iter().chain(part(Role::Link, 2, [line("the rates", 0)])).chain([line("now", 0)]);
+    let list = on_white(part(Role::Paragraph, 1, text));
+    let links = vec![
+        link("https://example.com/rates", Some(2)),
+        link("https://example.com/paragraph", Some(1)),
+        link("https://example.com/nothing", Some(9)),
+        link("https://example.com/plain", None),
+    ];
+
+    let read = read(written(&[(list, links)], &Images::default(), &Info::default()).expect("it can be written"));
+
+    assert_eq!(structure_of(&read), "P{See Link{the rates @https://example.com/rates} now}");
+    let links = read.pages()[0].raw().get::<Array<'_>>("Annots").map(|links| links.iter::<Dict<'_>>().count());
+    assert_eq!(links, Some(4), "a link that names no link's text can still be clicked");
 }
