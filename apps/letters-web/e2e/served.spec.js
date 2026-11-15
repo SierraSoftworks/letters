@@ -14,8 +14,8 @@ const TRUST = `${DOCUMENT}/trust`;
 const bar = (page) => page.getByText(/^Safe mode:/);
 
 /** Clicks the control with this name where the canvas draws it. */
-const click = async (page, name) => {
-  const box = await page.getByRole("button", { name, exact: true }).boundingBox();
+const click = async (page, name, role = "button") => {
+  const box = await page.getByRole(role, { name, exact: true }).boundingBox();
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
 };
 
@@ -339,6 +339,7 @@ const sharing = (refuses) => (method, path, body) => {
   if (method !== "GET" && refuses) return REFUSAL;
   if (path === `${DOCUMENT}/shares`) return { body: { people: method === "PUT" ? JSON.parse(body).people : [grace], links: [] } };
   if (path === `${DOCUMENT}/links`) return { status: 201, body: { link, url: "https://letters.example/l/abc" } };
+  if (path === `${DOCUMENT}/access`) return { body: [{ time: 1794000000, who: grace.to, action: "open", role: "reader", address: "192.0.2.7", browser: "Firefox" }] };
   return path === `${DOCUMENT}/links/l1` ? { status: 204 } : undefined;
 };
 const shared = (page, name) => page.getByRole("list", { name: "Shared with" }).getByRole("listitem", { name });
@@ -346,8 +347,7 @@ const shared = (page, name) => page.getByRole("list", { name: "Shared with" }).g
 const add = async (page) => {
   await click(page, "Share");
   await expect(shared(page, /Grace Hopper/)).toBeAttached();
-  const field = await page.getByRole("textbox", { name: "Add a group" }).boundingBox();
-  await page.mouse.click(field.x + field.width / 2, field.y + field.height / 2);
+  await click(page, "Add a group", "textbox");
   await page.keyboard.type("friends");
   await click(page, "Add reader");
 };
@@ -377,4 +377,13 @@ test("a change to the shares that the server refuses is told in its words, and t
   await expect(shared(page, /friends/)).toHaveCount(0);
   await expect(shared(page, /Grace Hopper/)).toBeAttached();
   expect(told(asked).filter((line) => line === "GET /shares")).toHaveLength(2);
+});
+
+test("who reached the document through a share is asked of its server when the owner turns to Activity", async ({ page }) => {
+  const asked = await serve(page, opened({ role: "owner" }), sharing(false));
+  await click(page, "Share");
+  await expect(shared(page, /Grace Hopper/)).toBeAttached();
+  await click(page, "Activity", "tab");
+  await expect(page.getByRole("dialog", { name: "Share" }).getByRole("listitem", { name: /Grace Hopper/ })).toBeAttached();
+  expect(told(asked).at(-1)).toBe("GET /access");
 });

@@ -1321,9 +1321,11 @@ impl Shell {
                 Request::SaveCopy { name, format, .. } => self.copy(name, format, None),
                 // A version that shows in the history is copied as it read then.
                 Request::SaveVersion { revision, name, format, .. } => self.copy(name, format, Some(&revision)),
-                asked @ (Request::Shares | Request::SharePeople(_) | Request::MakeLink(_) | Request::RevokeLink(_)) => {
-                    self.share(asked);
-                }
+                asked @ (Request::Shares
+                | Request::SharePeople(_)
+                | Request::MakeLink(_)
+                | Request::RevokeLink(_)
+                | Request::AccessLog) => self.share(asked),
                 // Moves and folders wait for the server's listings.
                 _ => {}
             }
@@ -1817,7 +1819,8 @@ impl Shell {
     }
 
     /// Asks the document's server what the Share dialog asked, and tells the window the answer: the shares
-    /// as they then are, the link that was made, or the server's sentence for what it would not do.
+    /// as they then are, the link that was made, who reached the document, or the server's sentence for
+    /// what it would not do.
     fn share(&mut self, asked: Request) {
         const UNREAD: &str = "The server's answer could not be read.";
         let Some(server) = &self.server else { return };
@@ -1831,6 +1834,7 @@ impl Shell {
             }
             Request::MakeLink(link) => ("POST", paths::links(&id), serde_json::to_vec(link).ok()),
             Request::RevokeLink(link) => ("DELETE", paths::link(&id, link), None),
+            Request::AccessLog => ("GET", paths::access(&id), None),
             _ => return,
         };
         // Whether the server makes links is asked once, with the first of these.
@@ -1863,6 +1867,10 @@ impl Shell {
                 },
                 (Request::MakeLink(_), Ok(answer)) => match serde_json::from_slice(&answer) {
                     Ok(made) => shell.view.link_made(made),
+                    Err(_) => shell.view.refuse_share(UNREAD),
+                },
+                (Request::AccessLog, Ok(answer)) => match serde_json::from_slice(&answer) {
+                    Ok(log) => shell.view.set_access_log(log),
                     Err(_) => shell.view.refuse_share(UNREAD),
                 },
                 // The dialog dropped a revoked link already.
