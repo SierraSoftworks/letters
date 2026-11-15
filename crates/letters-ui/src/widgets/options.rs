@@ -1,7 +1,7 @@
 //! Options: a short list to pick from while the keyboard stays where the person is typing.
 //!
 //! Focus never enters the list. Its owner hears the keys and says which choice is picked, and the list shows
-//! that one and tells assistive technology of it. A press on a choice takes it outright.
+//! that one, keeps it in view where the list scrolls, and tells assistive technology of it. A press on a choice takes it outright.
 
 use accesskit::Role;
 
@@ -128,6 +128,7 @@ fn row<M>(choice: Choice<M>, picked: bool) -> Element<M> {
         .role(Role::ListBoxOption)
         .label(choice.label.as_str())
         .selected(picked)
+        .in_view(picked)
         .children(choice.lead.map(|lead| *lead))
         .child(Element::text(choice.label, choice.style));
     if let Some((aside, style)) = choice.aside {
@@ -136,8 +137,9 @@ fn row<M>(choice: Choice<M>, picked: bool) -> Element<M> {
             .child(Element::row().grow(1.0).min_width(tokens::SPACE_SM))
             .child(Element::text(aside, style).fg(tokens::FG_MUTED));
     }
+    // A press takes a choice. The keyboard's focus stays with whoever owns the list.
     if let Some(message) = choice.on_take {
-        row = row.on_press(message);
+        row = row.on_click(message);
     }
     if picked { row.bg(accent().soft) } else { row }
 }

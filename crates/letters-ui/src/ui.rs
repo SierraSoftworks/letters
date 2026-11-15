@@ -198,6 +198,8 @@ pub struct Ui<A: App> {
     scroll: HashMap<Id, f32>,
     /// The focused canvas's caret at the last layout, to scroll after it when it moves.
     canvas_caret: Option<Rect>,
+    /// The element that was last brought into view because it asked: see `Element::in_view`.
+    shown: Option<Id>,
     /// Whether the app may have work for idle time, and whether it did any since the window was described.
     idle: (bool, bool),
     blink_from: Option<u64>,
@@ -239,6 +241,7 @@ impl<A: App> Ui<A> {
             inputs: HashMap::new(),
             scroll: HashMap::new(),
             canvas_caret: None,
+            shown: None,
             idle: (true, false),
             blink_from: None,
             moving: false,
@@ -1261,7 +1264,8 @@ impl<A: App> Ui<A> {
             self.stale.paint = true;
             self.layout();
             // A caret that moved is scrolled into view, once the layout says where it is.
-            if self.follow_caret() {
+            // The two are asked in turn, since each scrolls: a caret that moved and a pick that did.
+            if self.follow_caret() | self.follow_pick() {
                 self.stale.layout = false;
                 self.layout();
             }
@@ -1331,6 +1335,22 @@ impl<A: App> Ui<A> {
             }
             _ => false,
         }
+    }
+
+    /// Brings the element that asks to be in view there, once for each element that asks. Returns whether
+    /// anything scrolled.
+    fn follow_pick(&mut self) -> bool {
+        let picked = self.tree.nodes.iter().position(|node| node.el.in_view);
+        let id = picked.map(|i| self.tree.nodes[i].id);
+        let (Some(i), true) = (picked, id != self.shown) else {
+            self.shown = id;
+            return false;
+        };
+        self.shown = id;
+        // A row is shown with room for the one beside it, or the heading over it.
+        let rect = self.tree.nodes[i].rect;
+        self.reveal(i, rect, rect.height);
+        self.stale.layout
     }
 
     /// Carries focus, popovers and per-element state over to a newly built tree.

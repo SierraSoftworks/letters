@@ -11,6 +11,7 @@ mod captions;
 mod chrome;
 mod code_copy;
 pub mod color;
+mod commands;
 mod copying;
 mod describe;
 mod element;

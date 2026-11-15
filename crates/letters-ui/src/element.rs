@@ -148,6 +148,7 @@ pub struct Element<M> {
     pub(crate) popover: Option<Box<Popover<M>>>,
     pub(crate) tooltip: Option<(String, Side)>,
     pub(crate) telling: bool,
+    pub(crate) in_view: bool,
     pub(crate) fitted: Option<Fitted>,
 }
 
@@ -182,6 +183,7 @@ impl<M> Element<M> {
             popover: None,
             tooltip: None,
             telling: false,
+            in_view: false,
             fitted: None,
         }
     }
@@ -531,6 +533,14 @@ impl<M> Element<M> {
     /// or the keyboard's focus still comes first.
     pub fn telling(mut self, telling: bool) -> Self {
         self.telling = telling;
+        self
+    }
+
+    /// Brings the element into view of whatever scrolls it, when it first shows and each time it takes this
+    /// over from another: for the row a list has picked while focus stays in a field. One element of a
+    /// window at a time.
+    pub fn in_view(mut self, in_view: bool) -> Self {
+        self.in_view = in_view;
         self
     }
 

@@ -38,6 +38,8 @@ pub enum Linking {
     Trust,
     /// Keeps the picture in the document.
     Embed,
+    /// Keeps every linked picture in the document, as the command of that name asks.
+    EmbedAll,
     /// Escape or a press elsewhere.
     Close,
 }

@@ -37,6 +37,8 @@ const SHEET: (f32, f32) = (tokens::SPACE_SM, tokens::SPACE_XS);
 /// What the field of a picture's alt text asks for.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Altering {
+    /// Turns the line under the caret's picture to its alt text, as a press on the switch does.
+    Open,
     /// What is typed into the field, before it is taken.
     Draft(String),
     /// Takes what was typed as the picture's alt text, and gives the line back to the caption.

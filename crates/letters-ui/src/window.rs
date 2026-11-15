@@ -11,6 +11,7 @@ use std::rc::Rc;
 use accesskit::{ActionRequest, Node as AccessNode, NodeId, Role};
 use letters_editor::{
     Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Modifiers, Motion, Picture, Platform, Spot,
+    TableEdit,
 };
 use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Syntax};
 use letters_model::{
@@ -25,6 +26,7 @@ use crate::captions::{self, Altering, Captions};
 use crate::chrome::Chrome;
 use crate::code_copy::{self, CodeCopy};
 use crate::color::{fade, resolve, same};
+use crate::commands::{self, Act, Commanding, Commands, Entry};
 use crate::copying::{self, Copy, CopyFormat, Copying};
 use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
@@ -200,6 +202,8 @@ pub enum Message {
     Note(Noting),
     /// What the safe mode bar, a link and the card about a link ask for.
     Safe(Safely),
+    /// What is asked of the command palette.
+    Commands(Commanding),
 }
 
 impl Ui<EditorApp> {
@@ -719,6 +723,7 @@ pub struct EditorApp {
     dragging: bool,
     maths: Maths,
     insert: Insert,
+    commands: Commands,
     refer: Refer,
     references: References,
     code_copy: CodeCopy,
@@ -785,6 +790,7 @@ impl EditorApp {
             dragging: false,
             maths: Maths::default(),
             insert: Insert::default(),
+            commands: Commands::default(),
             refer: Refer::default(),
             references: References::default(),
             code_copy: CodeCopy::default(),
@@ -1183,7 +1189,7 @@ impl EditorApp {
     /// last when there is no room above. `origin` is where the layout's origin is in the page area.
     fn selection_tools(&self, origin: Point, viewport: Rect) -> Option<Popover<Message>> {
         let selection = self.editor.selection().filter(|selection| !selection.is_caret())?;
-        if self.dragging || !self.margin.offers() {
+        if self.dragging || !self.margin.offers() || self.commands.open() {
             return None;
         }
         notes::passage(self.editor.doc(), selection)?;
@@ -1198,6 +1204,12 @@ impl EditorApp {
     /// Does what the field of a picture's alt text asked.
     fn altering(&mut self, asked: Altering, platform: &mut dyn Platform) {
         match asked {
+            Altering::Open => {
+                if let Some(figure) = self.captioned().cloned() {
+                    self.reveal();
+                    self.alter(figure);
+                }
+            }
             Altering::Draft(text) => {
                 if let Some((_, typed)) = &mut self.captions.alt {
                     *typed = text;
@@ -1263,7 +1275,11 @@ impl EditorApp {
 
     /// Does what the menu on a linked picture's cloud asked, which is the shell's to do.
     fn linking(&mut self, asked: Linking) {
-        let Some(figure) = self.linked.open.take() else { return };
+        if asked == Linking::EmbedAll {
+            return self.embed_all();
+        }
+        // The picture whose menu is out, or the selected one when a command asks.
+        let Some(figure) = self.linked.open.take().or_else(|| self.editor.picture().cloned()) else { return };
         let Some(src) = self.link_of(&figure).map(str::to_owned) else { return };
         match asked {
             Linking::Load => self.requests.push(Request::LoadPicture(src)),
@@ -1273,7 +1289,128 @@ impl EditorApp {
                 self.ask_again(false);
             }
             Linking::Embed => self.requests.push(Request::EmbedPicture { figure, src }),
-            Linking::Close => {}
+            Linking::Close | Linking::EmbedAll => {}
+        }
+    }
+
+    /// Asks the shell to keep every linked picture in the document. Those that safe mode holds back stay
+    /// links, since nothing is fetched for a document that is not trusted.
+    fn embed_all(&mut self) {
+        let free = |src: &&str| self.linked.said(src) != Some(&PictureState::Held);
+        let link = |block: &Block| Some((block.id.clone(), pictures::link(block).filter(free)?.to_owned()));
+        let links: Vec<(BlockId, String)> = self.editor.doc().walk().filter_map(link).collect();
+        for (figure, src) in links {
+            self.requests.push(Request::EmbedPicture { figure, src });
+        }
+    }
+
+    /// Whether the figure the caret is on or in carries a number, or the gallery it is one of does.
+    fn numbered(&self) -> Option<bool> {
+        let figure = self.captioned()?;
+        match self.gallery_of(figure).or_else(|| self.editor.doc().block(figure))?.kind {
+            BlockKind::Figure { numbered, .. } | BlockKind::Gallery { numbered } => Some(numbered),
+            _ => None,
+        }
+    }
+
+    /// Whether the first row of the caret's table is its header.
+    fn header(&self) -> Option<bool> {
+        match self.editor.doc().block(&self.editor.cell()?.table)?.kind {
+            BlockKind::Table { header, .. } => Some(header),
+            _ => None,
+        }
+    }
+
+    /// What a command asks for where the caret is now, or `None` while it has nothing to act on.
+    fn asked(&self, act: &Act) -> Option<Message> {
+        let editor = &self.editor;
+        let picture = editor.picture();
+        let in_text = editor.selection().is_some() && picture.is_none();
+        // The selected picture's address while it is a link that safe mode does not hold back.
+        let held = |src: &str| self.linked.said(src) == Some(&PictureState::Held);
+        let link = picture.and_then(|figure| self.link_of(figure)).filter(|src| !held(src));
+        // One place along a row or column of `count`, if there is one that way.
+        let beside = |at: usize, count: usize, on: bool| {
+            if on { Some(at + 1).filter(|to| *to < count) } else { at.checked_sub(1) }
+        };
+        let message = match act {
+            Act::Run(command) => {
+                // The editor says where a command applies. One that turns something on or off is listed
+                // for the way it would turn it, and a picture is no text to make a heading of.
+                let fits = match command {
+                    Command::Table(TableEdit::Header(on)) => self.header() == Some(!on),
+                    Command::SetNumbered(on) => self.numbered() == Some(!on),
+                    Command::SetBlock(_) => in_text,
+                    _ => true,
+                };
+                (fits && editor.applies(command)).then(|| Message::Run(command.clone()))?
+            }
+            Act::MoveRow { down } => {
+                let cell = editor.cell()?;
+                Message::Run(Command::Table(TableEdit::MoveRow { to: beside(cell.row, cell.rows, *down)? }))
+            }
+            Act::MoveColumn { right } => {
+                let cell = editor.cell()?;
+                Message::Run(Command::Table(TableEdit::MoveColumn { to: beside(cell.column, cell.columns, *right)? }))
+            }
+            Act::Link => in_text.then_some(Message::EditLink)?,
+            Act::Comment => {
+                let selection = editor.selection().filter(|selection| !selection.is_caret())?;
+                notes::passage(editor.doc(), selection).map(|_| Message::Note(Noting::Write))?
+            }
+            Act::Pictures => Message::Ask(Request::Pictures),
+            Act::AltText => self.captioned().map(|_| Message::Alt(Altering::Open))?,
+            Act::Load => {
+                let waits = |src: &&str| self.linked.said(src).is_none_or(|state| *state != PictureState::Loading);
+                let src = link.filter(waits).filter(|src| self.images.get(src).is_none());
+                src.map(|_| Message::Linked(Linking::Load))?
+            }
+            Act::AlwaysLoad => link.filter(|src| !self.linked.vouched(src)).map(|_| Message::Linked(Linking::Trust))?,
+            Act::Embed => link.map(|_| Message::Linked(Linking::Embed))?,
+            Act::EmbedAll => {
+                let any = editor.doc().walk().filter_map(pictures::link).any(|src| !held(src));
+                any.then_some(Message::Linked(Linking::EmbedAll))?
+            }
+            Act::Panel(panel) => Message::Panel(*panel),
+            Act::NewDocument => Message::NewDocument,
+            Act::Open => Message::OpenDialog,
+            Act::Rename => Message::Rename(Rename::Open),
+            Act::SaveCopy => Message::Copy(Copying::Open(CopyFormat::Letters)),
+            Act::Export => Message::Copy(Copying::Open(CopyFormat::Pdf)),
+            Act::Share => Message::Share(true),
+            Act::Settings => Message::Settings(Setting::Show),
+            Act::TrustDocument => self.safe.on().then_some(Message::Safe(Safely::TrustDocument))?,
+            Act::TrustFolder => self.safe.folder().then_some(Message::Safe(Safely::TrustFolder))?,
+            // A card over the window is answered first: there is no document to act on behind it.
+            Act::Palette => {
+                let card = self.landing.is_some() || self.importing.is_some();
+                (!card).then_some(Message::Commands(Commanding::Toggle))?
+            }
+        };
+        Some(message)
+    }
+
+    /// The commands the palette lists: those that what is typed finds and that have something to act on,
+    /// each with what it asks.
+    fn offers(&self) -> Vec<(&'static Entry, Message)> {
+        self.commands.matching().filter_map(|entry| Some((entry, self.asked(&entry.act)?))).collect()
+    }
+
+    /// Does what the command palette asked. A command that is taken is done as if its key were pressed.
+    fn commanding(&mut self, asked: Commanding, platform: &mut dyn Platform) {
+        let taken = match asked {
+            Commanding::Toggle => return self.commands.toggle(),
+            Commanding::Close => return self.commands.close(),
+            Commanding::Type(typed) => return self.commands.typed(typed),
+            Commanding::Step { down } => return self.commands.step(down, self.offers().len()),
+            Commanding::Take(index) => Some(index),
+            Commanding::Enter => None,
+        };
+        let mut offers = self.offers();
+        let taken = taken.unwrap_or_else(|| self.commands.picked(offers.len()));
+        self.commands.close();
+        if taken < offers.len() {
+            self.update(offers.swap_remove(taken).1, platform);
         }
     }
 
@@ -1477,6 +1614,7 @@ impl EditorApp {
         let asked = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
         let asked = asked || self.captions.alt.is_some() || self.margin.writing().is_some();
         let asked = asked || self.margin.reading().is_some();
+        let asked = asked || self.commands.open();
         card || asked || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
     }
 
@@ -2279,15 +2417,23 @@ impl EditorApp {
             .child(Element::from(Button::new("Done").on_press(Message::Share(false))).align_self(Align::End));
         let share = Popover::new(share).label("Share").modal().open(self.sharing).on_close(Message::Share(false));
 
+        let keys = |act: Act| commands::shortcut(&act, self.editor.keymap(), self.mac).unwrap_or_default();
         let more = Menu::new()
             .label("More")
+            .item(
+                MenuItem::new("Commands")
+                    .icon(icon::SEARCH)
+                    .aside(keys(Act::Palette))
+                    .on_select(Message::Commands(Commanding::Toggle)),
+            )
+            .separator()
             .item(MenuItem::new("New document").icon(icon::PLUS).on_select(Message::NewDocument))
             .item(MenuItem::new("Open").icon(icon::FOLDER_OPEN).on_select(Message::OpenDialog))
             .separator()
             .item(
                 MenuItem::new("Save a copy")
                     .icon(icon::COPY)
-                    .aside(if self.mac { "\u{21e7}\u{2318}S" } else { "Ctrl+Shift+S" })
+                    .aside(keys(Act::SaveCopy))
                     .on_select(Message::Copy(Copying::Open(CopyFormat::Letters))),
             )
             .item(MenuItem::new("Export").icon(icon::DOWNLOAD).on_select(Message::Copy(Copying::Open(CopyFormat::Pdf))))
@@ -2886,6 +3032,11 @@ impl App for EditorApp {
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
         let over = self.dialog.view(&self.settings).into_iter().chain(self.safe.card());
+        let commands = self.commands.open().then(|| {
+            let (offers, keymap) = (self.offers(), self.editor.keymap());
+            self.commands.view(&offers, keymap, self.mac, bar, window)
+        });
+        let over = over.chain(commands);
         let all = Element::column().bg(tokens::BG).fg(tokens::FG).child(self.bar()).children(self.safe.bar());
         let all = all.child(body).children(over);
         if border > 0.0 { all.border(Edges::all(border), tokens::LINE_STRONG) } else { all }
@@ -2961,6 +3112,7 @@ impl App for EditorApp {
             Message::Safe(asked) => self.safely(asked),
             Message::Alt(asked) => self.altering(asked, platform),
             Message::Note(asked) => self.noting(asked, platform),
+            Message::Commands(asked) => self.commanding(asked, platform),
             Message::Refer(Picking::Close) => {
                 self.edit(platform, |editor, platform| editor.run(Command::DismissReference, platform));
             }
@@ -3028,23 +3180,17 @@ impl App for EditorApp {
             // The page may have moved under a pointer that rests where it was.
             self.unpoint();
         }
-        // The editor leaves these to the window: the link is edited in place, and a copy is asked for on
-        // its card.
-        let primary = Modifiers { primary: true, ..Modifiers::default() };
-        let link = event.key == Key::Char('k') && event.mods == primary;
-        if !used && link {
-            self.link = Some(self.editor.link().unwrap_or_default().to_owned());
+        if used {
+            return true;
         }
-        // The settings open as they do in most apps, where the system keeps no menu for them.
-        let settings = !used && event.key == Key::Char(',') && event.mods == primary;
-        if settings {
-            self.dialog.open = true;
+        // The editor leaves some keys to the window: the palette, the link that is edited in place, the
+        // settings and the card that saves a copy.
+        let asked = commands::bound(event).and_then(|act| self.asked(act));
+        let bound = asked.is_some();
+        if let Some(message) = asked {
+            self.update(message, platform);
         }
-        let copy = event.key == Key::Char('s') && event.mods == Modifiers { shift: true, ..primary };
-        if !used && copy {
-            self.copy(Copying::Open(CopyFormat::Letters));
-        }
-        used || link || settings || copy
+        bound
     }
 
     fn describe(&self, page: &mut AccessNode, nodes: &mut Vec<(NodeId, AccessNode)>, whole: bool) {

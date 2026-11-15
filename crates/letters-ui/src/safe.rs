@@ -81,6 +81,11 @@ impl Safe {
         self.mode.is_some()
     }
 
+    /// Whether the shell named a folder that can be trusted with the document.
+    pub fn folder(&self) -> bool {
+        self.mode.as_ref().is_some_and(|mode| mode.folder.is_some())
+    }
+
     pub fn hide(&mut self, hidden: bool) {
         self.hidden = hidden;
     }
