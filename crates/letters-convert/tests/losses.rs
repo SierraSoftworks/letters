@@ -118,8 +118,6 @@ fn each_format_lists_what_it_cannot_carry() {
                 // Word shows no icon, so the callout that keeps its tone's loses it too.
                 (CalloutLooks, 2),
                 (CodeLanguages, 1),
-                (Contents, 1),
-                (LinkPreviews, 1),
             ],
         ),
         (Target::Pdf, vec![(UnknownBlocks, 1), (UnknownMarks, 1), (Comments, 2), (LinkedPictures, 1)]),

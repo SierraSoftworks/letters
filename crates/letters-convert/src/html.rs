@@ -446,7 +446,7 @@ fn preview(card: &Preview, page: &mut Writing, out: &mut String) {
 }
 
 /// The part of an address that names where it leads: its host, or all of it where it names none.
-fn host(url: &str) -> &str {
+pub(crate) fn host(url: &str) -> &str {
     let Some((_, rest)) = url.split_once("://") else { return url };
     let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
     // What stands before an `@` is a name to sign in with, and the host follows it.

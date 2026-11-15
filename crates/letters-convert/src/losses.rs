@@ -42,10 +42,11 @@ pub enum LossKind {
     Languages,
     /// Code blocks in a language, which Word neither names nor colours. A reader misses the colours.
     CodeLanguages,
-    /// Tables of contents, which a Word file does not write yet. Markdown writes one as the list it shows.
+    /// Tables of contents, where a format writes none. Every format writes one now: Markdown as the list
+    /// it shows, a Word file as the field Word makes one from.
     Contents,
     /// Link previews, where the format has no card: the link is written under its title, without the
-    /// picture, and in a Word file without the description.
+    /// picture. A Word file frames what the card shows.
     LinkPreviews,
     /// The history: every earlier version, and who wrote what. A clean copy is the document as it stands.
     /// Counted once.
@@ -125,12 +126,7 @@ pub fn losses_with(doc: &Document, notes: &Notes, to: Target, loaded: &dyn Fn(&s
             blocks(&|block| block.lang.is_some()) + runs().filter(|run| run.lang.is_some()).count(),
         ),
         (CodeLanguages, to == Docx, blocks(&coded)),
-        (Contents, to == Docx, blocks(&|block| matches!(block.kind, BlockKind::TableOfContents { .. }))),
-        (
-            LinkPreviews,
-            matches!(to, Markdown | Docx),
-            blocks(&|block| matches!(block.kind, BlockKind::LinkPreview { .. })),
-        ),
+        (LinkPreviews, to == Markdown, blocks(&|block| matches!(block.kind, BlockKind::LinkPreview { .. }))),
         (History, to == Clean, 1),
         (Conflicts, to == Clean, notes.notes.iter().filter(|note| open_conflict(note)).count()),
     ];

@@ -23,6 +23,9 @@ const NOW: &str = "2026-01-02T03:04:05Z";
 /// The start of a PNG, which is all that tells a picture's format.
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n-pixels-";
 
+/// A picture of four pixels by two, for where a picture's size is asked.
+const PIXELS: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x04\x00\x00\x00\x02\x08\x02\x00\x00\x00\xf0\xca\xea\x34\x00\x00\x00\x12\x49\x44\x41\x54\x78\xda\x63\x3c\x61\xa3\xc1\x00\x03\x4c\x0c\x48\x00\x00\x1d\x0e\x01\x30\x58\x04\x05\xe9\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
 /// Every namespace the cases write elements in.
 const NAMESPACES: &str = concat!(
     r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
@@ -847,29 +850,43 @@ fn keeps_the_text_of_what_it_simplifies_and_says_so() {
 }
 
 #[test]
-fn leaves_out_a_table_of_contents_and_says_where() {
+fn reads_a_table_of_contents_as_one_block() {
     let entry = |text: &str| styled("Toc1", text);
-    let built = format!(
-        r#"<w:sdt><w:sdtPr><w:docPartObj><w:docPartGallery w:val="Table of Contents"/></w:docPartObj></w:sdtPr>
-        <w:sdtContent>{}{}</w:sdtContent></w:sdt>"#,
-        entry("Introduction 1"),
-        entry("Method 2")
-    );
-    let field = format!(
-        r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> TOC \o "1-3" </w:instrText></w:r>
-        <w:r><w:fldChar w:fldCharType="separate"/></w:r>{}</w:p><w:p>{}<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#,
-        t("Introduction 1"),
-        t("Method 2")
-    );
-    for contents in [built, field, entry("Introduction 1")] {
+    let field = |code: &str| {
+        format!(
+            r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>{code}</w:instrText></w:r>
+            <w:r><w:fldChar w:fldCharType="separate"/></w:r>{}</w:p><w:p>{}<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#,
+            t("Introduction 1"),
+            t("Method 2")
+        )
+    };
+    let built = |inside: &str| {
+        format!(
+            r#"<w:sdt><w:sdtPr><w:docPartObj><w:docPartGallery w:val="Table of Contents"/></w:docPartObj></w:sdtPr>
+            <w:sdtContent>{inside}</w:sdtContent></w:sdt>"#
+        )
+    };
+    let unmade = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> TOC \o "1-1" </w:instrText></w:r>
+        <w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#;
+    // A field makes the table, whether Word's own frame holds it or not, and says how deep it lists.
+    let cases = [
+        (field(r#" TOC \o "1-3" \h \z \u "#), "contents:3"),
+        (field(r#" TOC \o "2-2" "#), "contents:2"),
+        (field(r#" TOC \h "#), "contents:4"),
+        (built(&field(r#" TOC \o "1-2" "#)), "contents:2"),
+        (built(&(entry("Introduction 1") + &entry("Method 2"))), "contents:4"),
+        (unmade.to_owned(), "contents:1"),
+    ];
+    for (contents, expected) in cases {
         let import = read(&word(&(p("Before") + &contents + &p("After"))));
-        assert_eq!(outline(&import.document), [r#"p "Before""#, r#"p "After""#], "reading {contents}");
-        assert!(
-            noted(&import, "After").iter().any(|note| note.contains("contents")),
-            "reading {contents}: {:?}",
-            import.notes
-        );
+        assert_eq!(outline(&import.document), [r#"p "Before""#, expected, r#"p "After""#], "reading {contents}");
+        assert_eq!(import.notes, [], "reading {contents}");
     }
+
+    // Lines that are only set as a table say nothing of what they list, so they are left out, with a note.
+    let import = read(&word(&(p("Before") + &entry("Introduction 1") + &p("After"))));
+    assert_eq!(outline(&import.document), [r#"p "Before""#, r#"p "After""#]);
+    assert!(noted(&import, "After").iter().any(|note| note.contains("contents")), "{:?}", import.notes);
 }
 
 #[test]
@@ -1494,6 +1511,97 @@ fn a_formula_is_written_as_an_equation_and_one_with_a_mistake_as_its_source() {
 }
 
 #[test]
+fn a_table_of_contents_is_a_field_that_holds_the_lines_the_page_lists() {
+    let heading = |id: &str, level: u8, text: &str| Block::text(id, BlockKind::Heading { level }, text);
+    let blocks = vec![
+        heading("title", 1, "Report"),
+        Block::new("toc", BlockKind::TableOfContents { levels: 2 }),
+        heading("a", 1, "Introduction"),
+        heading("b", 2, "Scope & limits"),
+        heading("c", 3, "A detail"),
+        Block::text("p", BlockKind::Paragraph, "Text."),
+        heading("d", 1, "Method"),
+    ];
+    let doc = Document { blocks, ..Document::default() };
+    let body = part(&export(&doc), "word/document.xml");
+    let xml = roxmltree::Document::parse(&body).expect("the body is XML");
+    let named = |node: &roxmltree::Node, name: &str| node.tag_name().name() == name;
+    let attribute = |node: &roxmltree::Node, name: &str| {
+        node.attributes().find(|held| held.name() == name).map(|held| held.value().to_owned())
+    };
+    let said = |node: roxmltree::Node| -> String {
+        node.descendants().filter(|held| named(held, "t")).filter_map(|held| held.text()).collect()
+    };
+    let styled = |para: &roxmltree::Node| {
+        para.descendants().find(|held| named(held, "pStyle")).and_then(|style| attribute(&style, "val"))
+    };
+    let lines =
+        xml.descendants().filter(|para| named(para, "p") && styled(para).is_some_and(|id| id.starts_with("TOC")));
+    let lines: Vec<(String, String)> = lines.map(|para| (styled(&para).unwrap_or_default(), said(para))).collect();
+    let marks: BTreeSet<String> = xml
+        .descendants()
+        .filter(|held| named(held, "bookmarkStart"))
+        .filter_map(|mark| attribute(&mark, "name"))
+        .collect();
+    let leads: Vec<String> = xml
+        .descendants()
+        .filter(|held| named(held, "hyperlink"))
+        .filter_map(|link| attribute(&link, "anchor"))
+        .collect();
+    let back = returned(&doc);
+
+    // Word is asked for the same levels, and shows the page's lines until it renews them.
+    assert!(body.contains(r#"TOC \o "1-2""#), "the field asks for two levels");
+    let expected = [("TOC1", "Introduction"), ("TOC2", "Scope & limits"), ("TOC1", "Method")];
+    assert_eq!(lines, expected.map(|(style, text)| (style.to_owned(), text.to_owned())));
+    assert_eq!(leads.len(), 3, "each line leads somewhere");
+    assert!(leads.iter().all(|lead| marks.contains(lead)), "{leads:?} lead to {marks:?}");
+    assert_eq!(outline(&back.document), outline(&doc));
+    assert_eq!(back.notes, []);
+}
+
+#[test]
+fn a_link_preview_is_written_as_what_it_shows() {
+    let preview = |title: Option<&str>, description: Option<&str>, image: Option<&str>| {
+        let kind = BlockKind::LinkPreview {
+            url: "https://example.com/post?id=1".into(),
+            title: title.map(String::from),
+            description: description.map(String::from),
+            image: image.map(String::from),
+        };
+        Block::new("card", kind)
+    };
+    // What a preview holds, the lines it is written as, and whether its picture is.
+    let cases = [
+        (
+            preview(Some("A post"), Some("What it is about."), Some("assets/card.png")),
+            vec!["A post", "What it is about.", "example.com"],
+            true,
+        ),
+        (preview(Some("A post"), None, None), vec!["A post", "example.com"], false),
+        // One that was never fetched is its address.
+        (preview(None, None, None), vec!["https://example.com/post?id=1"], false),
+    ];
+    for (card, lines, pictured) in cases {
+        let doc = Document { blocks: vec![card], ..Document::default() };
+        let file = to_docx(&doc, &Style::default(), &Notes::default(), "Report", &mut |_| Some(PIXELS.to_vec()));
+        let back = import(&file, &Style::default()).expect("the export reads");
+        let texts: Vec<String> = back.document.walk().map(Block::plain_text).filter(|text| !text.is_empty()).collect();
+        let linked: Vec<&Run> =
+            back.document.walk().flat_map(|block| block.body.runs()).filter(|run| run.link.is_some()).collect();
+
+        assert_eq!(texts, lines);
+        assert_eq!(pictures(&back.document).len(), usize::from(pictured), "{lines:?}");
+        assert_eq!(linked.len(), 1, "{lines:?}");
+        assert_eq!(
+            (linked[0].text.as_str(), linked[0].link.as_deref()),
+            (lines[0], Some("https://example.com/post?id=1"))
+        );
+        assert_eq!(back.notes, [], "{lines:?}");
+    }
+}
+
+#[test]
 fn text_that_reads_from_the_right_is_set_from_the_right() {
     // What a paragraph holds, whether Word sets it from the right, and the stretches Word is told read
     // from the right.
@@ -1531,8 +1639,8 @@ fn a_callout_is_headed_as_on_the_page() {
     let cases = [
         (Tone::Warn, None, vec!["Warning", "Warning"]),
         (Tone::Tip, Some("Before you start"), vec!["Before you start", "Before you start"]),
-        // With no line between them, Word draws two callouts of one tone as one.
-        (Tone::Info, Some(""), vec![""]),
+        // Two of one tone with no line to head them are still two.
+        (Tone::Info, Some(""), vec!["", ""]),
     ];
     for (tone, title, heads) in cases {
         let blocks = vec![callout("a", tone, title), callout("b", tone, title)];
@@ -2023,6 +2131,7 @@ fn any_blocks() -> impl Strategy<Value = Vec<Block>> {
         1 => (1..=4u8, any_runs()).prop_map(move |(level, runs)| with(BlockKind::Heading { level }, runs)),
         1 => any_text().prop_map(move |code| with(BlockKind::Code { language: None }, vec![Run::plain(code.trim_end_matches('\n'))])),
         1 => Just(Block::new("", BlockKind::Divider)),
+        1 => (1..=4u8).prop_map(|levels| Block::new("", BlockKind::TableOfContents { levels })),
         1 => inside.clone().prop_map(move |blocks| holding(BlockKind::Quote, blocks)),
         1 => (tone, title, inside).prop_map(move |(tone, title, blocks)| holding(boxed(tone, title), blocks)),
     ];
@@ -2061,29 +2170,7 @@ fn settled(blocks: Vec<Block>) -> Vec<Block> {
                 }
             }
         }
-        // Neighbouring paragraphs of one style are one quote, one callout or one block of code in Word. The
-        // line that heads a callout parts it from the one before.
-        let joins = |last: &BlockKind| match (last, &block.kind) {
-            (BlockKind::Quote, BlockKind::Quote) => true,
-            (BlockKind::Callout { tone, .. }, BlockKind::Callout { tone: next, title: Some(title), .. }) => {
-                tone == next && title.is_empty()
-            }
-            _ => false,
-        };
-        match (out.last_mut(), &block) {
-            (Some(Block { kind, body: Body::Blocks(held), .. }), Block { body: Body::Blocks(more), .. })
-                if joins(kind) =>
-            {
-                held.extend(more.iter().cloned());
-            }
-            (
-                Some(Block { kind: BlockKind::Code { .. }, body: Body::Text(held), .. }),
-                Block { kind: BlockKind::Code { .. }, .. },
-            ) => {
-                held[0].text = format!("{}\n{}", held[0].text, block.plain_text());
-            }
-            _ => out.push(block),
-        }
+        out.push(block);
     }
     for block in &mut out {
         if let Body::Blocks(inner) = &mut block.body {

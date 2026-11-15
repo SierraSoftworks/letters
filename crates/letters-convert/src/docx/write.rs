@@ -17,15 +17,17 @@ use letters_model::{
     Align, Block, BlockId, BlockKind, Document, ListKind, Mark, NoteKind, Notes, Run, Style, TextStyle, Tone,
 };
 use letters_render::Color;
+use letters_render::image::Image;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use super::math::equation;
 use super::{
-    BOOKMARK, CALLOUT_TITLE, CALLOUTS, CELL, DIVIDER, HEAD_CELL, INLINE_CODE, LINK, LIST, SEQUENCE, SINGLE, TABLE,
-    TABLE_SPACE, TASK_DONE, TASK_OPEN, TWIPS, TYPES,
+    BOOKMARK, BOX_SPACE, CALLOUT_TITLE, CALLOUTS, CELL, CONTENTS, DIVIDER, HEAD_CELL, HEADING_MARK, INLINE_CODE, LINK,
+    LIST, PREVIEW, SEQUENCE, SINGLE, TABLE, TABLE_SPACE, TASK_DONE, TASK_OPEN, TWIPS, TYPES,
 };
-use crate::html::{Assets, href};
+use crate::figures::fitted;
+use crate::html::{Assets, host, href};
 
 /// Exports are drawn on the light page, whatever theme the editor is in.
 const PAGE: Palette = Palette::LIGHT;
@@ -58,6 +60,10 @@ const BIDI: &str = "<w:bidi/>";
 const TILE_GAP: f32 = 8.0;
 const TILE_SPACE: &str = "<w:r><w:rPr><w:spacing w:val=\"150\"/><w:sz w:val=\"2\"/><w:szCs w:val=\"2\"/></w:rPr>\
                           <w:t xml:space=\"preserve\"> </w:t></w:r>";
+/// The widest a link's preview shows its picture, in points.
+const PREVIEW_WIDE: f32 = 240.0;
+/// The ids of the bookmarks at headings start here, clear of those at figures, which are their numbers.
+const HEADING_IDS: usize = 1_000_000;
 /// The padding inside a table cell, across and down, in twentieths of a point. The page's own.
 const CELL_PAD: (u32, u32) = (200, 120);
 
@@ -75,6 +81,9 @@ const CELL_PAD: (u32, u32) = (200, 120);
 ///   and so is a colour of its own.
 /// - A block that reads from the right on the page is set from the right, and so is each stretch of text
 ///   in a line that does.
+/// - A table of contents is the field Word makes one from, holding the lines the page lists until Word is
+///   asked to renew them. A link's preview is what it shows: its picture, its title as the link, and its
+///   description.
 /// - A link that would run script is written as its text alone, and an unknown block as its fallback text.
 pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets: Assets) -> Vec<u8> {
     let page = &style.page;
@@ -89,6 +98,15 @@ pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets
         Some(align @ (Align::Center | Align::End)) => align,
         _ => Align::Start,
     };
+    // The lines of each table of contents, and a number for every heading that one of them lists.
+    let tables = doc.walk().filter(|block| matches!(block.kind, BlockKind::TableOfContents { .. }));
+    let tables: BTreeMap<&str, Vec<&Block>> =
+        tables.map(|table| (table.id.as_str(), doc.contents(&table.id))).collect();
+    let mut listed = BTreeMap::new();
+    for heading in tables.values().flatten() {
+        let next = listed.len() + 1;
+        listed.entry(heading.id.as_str()).or_insert(next);
+    }
     let mut writer = Writer {
         out: String::new(),
         links: Links::default(),
@@ -106,11 +124,14 @@ pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets
         rtl: false,
         turn: false,
         labels: labels.collect(),
+        tables,
+        listed,
         pictured,
         drawn: 0,
         keep: false,
         align: None,
         lead: String::new(),
+        last: String::new(),
     };
     let comments = writer.plan(doc, notes);
     writer.blocks(&doc.blocks, None);
@@ -377,6 +398,10 @@ struct Writer<'d, 'a> {
     turn: bool,
     /// The label of each numbered figure and gallery.
     labels: BTreeMap<BlockId, Label>,
+    /// The headings each table of contents lists, by the table's id.
+    tables: BTreeMap<&'d str, Vec<&'d Block>>,
+    /// The number of the bookmark at each heading that a table of contents lists.
+    listed: BTreeMap<&'d str, usize>,
     /// Where a picture stands on its line, which is where the caption's style sets text.
     pictured: Align,
     /// How many pictures have been drawn. Word wants a number on each.
@@ -387,6 +412,8 @@ struct Writer<'d, 'a> {
     align: Option<Align>,
     /// What the next paragraph opens with before its text, as a caption does with its label.
     lead: String,
+    /// The style of the last paragraph written.
+    last: String,
 }
 
 impl<'d> Writer<'d, '_> {
@@ -425,6 +452,14 @@ impl<'d> Writer<'d, '_> {
                 BlockKind::Paragraph => self.paragraph(within.unwrap_or(""), None, block.body.runs(), spans),
                 BlockKind::Heading { level } => {
                     let style = TYPES[usize::from((*level).clamp(1, 4))].1;
+                    if let Some(number) = self.listed.get(block.id.as_str()) {
+                        // Where the line of a table of contents leads.
+                        let id = HEADING_IDS + number;
+                        let _ = write!(
+                            self.lead,
+                            "<w:bookmarkStart w:id=\"{id}\" w:name=\"{HEADING_MARK}{number}\"/><w:bookmarkEnd w:id=\"{id}\"/>"
+                        );
+                    }
                     self.paragraph(style, None, block.body.runs(), spans);
                 }
                 BlockKind::ListItem { list, depth } => {
@@ -432,7 +467,10 @@ impl<'d> Writer<'d, '_> {
                     let list = self.list(*list, usize::from(depth));
                     self.paragraph(within.unwrap_or(LIST.0), Some((list, depth)), block.body.runs(), spans);
                 }
-                BlockKind::Code { .. } => self.paragraph("Code", None, block.body.runs(), spans),
+                BlockKind::Code { .. } => {
+                    self.part("Code");
+                    self.paragraph("Code", None, block.body.runs(), spans);
+                }
                 BlockKind::Formula => match equation(&block.plain_text(), true) {
                     Some(equation) => {
                         self.open(within.unwrap_or(""), None);
@@ -440,12 +478,15 @@ impl<'d> Writer<'d, '_> {
                         self.out.push_str("</w:p>");
                     }
                     // A source with a mistake in it goes out as it is, so that it is not lost.
-                    None => self.paragraph("Code", None, block.body.runs(), spans),
+                    None => {
+                        self.part("Code");
+                        self.paragraph("Code", None, block.body.runs(), spans);
+                    }
                 },
-                BlockKind::Quote => self.container(block, "Quote"),
+                BlockKind::Quote => self.container(block, "Quote", within),
                 BlockKind::Callout { tone, .. } => {
                     let style = CALLOUTS.iter().find(|(known, ..)| known == tone).map_or("Quote", |(_, id, _)| *id);
-                    self.container(block, style);
+                    self.container(block, style, within);
                 }
                 BlockKind::Divider => self.paragraph(DIVIDER.0, None, &[], Vec::new()),
                 BlockKind::Figure { .. } => self.figure(block, spans),
@@ -471,13 +512,8 @@ impl<'d> Writer<'d, '_> {
                         self.paragraph("Caption", None, &[Run::plain(fallback)], Vec::new());
                     }
                 }
-                // Until it has a mapping of its own, a preview is the link it holds, under its title.
-                BlockKind::LinkPreview { url, title, .. } => {
-                    let link = Run { link: Some(url.clone()), ..Run::plain(title.as_deref().unwrap_or(url)) };
-                    self.paragraph(within.unwrap_or(""), None, &[link], spans);
-                }
-                // Not written yet: its lines are for Word to make from a field.
-                BlockKind::TableOfContents { .. } => {}
+                BlockKind::LinkPreview { .. } => self.preview(block, within),
+                BlockKind::TableOfContents { levels } => self.contents(block, *levels),
             }
         }
         (self.lang, self.rtl) = (around, turned);
@@ -505,8 +541,12 @@ impl<'d> Writer<'d, '_> {
 
     /// Writes what a quote or a callout holds. Word has no block that holds others, so each paragraph inside
     /// takes the container's style, and Word draws neighbours of one style as one box.
-    fn container(&mut self, block: &'d Block, style: &'static str) {
+    fn container(&mut self, block: &'d Block, style: &'static str, within: Option<&'static str>) {
         let inner = block.body.blocks();
+        // One inside another of its kind is more of that one, which is all Word can show of it.
+        if within != Some(style) {
+            self.part(style);
+        }
         // The line that heads a callout on the page heads it here, in a style of its own that shares the
         // box. Word has no place for an icon, or for a colour beside the tone's.
         let title = block.kind.callout_look().map_or("", |look| look.title);
@@ -550,6 +590,8 @@ impl<'d> Writer<'d, '_> {
     /// for the next paragraph alone.
     fn open(&mut self, style: &str, list: Option<(usize, u8)>) {
         self.out.push_str("<w:p>");
+        self.last.clear();
+        self.last.push_str(style);
         let (breaks, keep, align) =
             (std::mem::take(&mut self.breaks), std::mem::take(&mut self.keep), self.align.take());
         let turn = std::mem::take(&mut self.turn);
@@ -591,6 +633,15 @@ impl<'d> Writer<'d, '_> {
                 let _ = write!(self.out, "<w:jc w:val=\"{}\"/>", justification(align));
             }
             self.out.push_str("</w:pPr>");
+        }
+    }
+
+    /// Parts a box from one of its kind right above it, which Word would draw as one with it. `style` is
+    /// what the paragraphs of the box are set in.
+    fn part(&mut self, style: &str) {
+        let above = self.last.strip_suffix(CALLOUT_TITLE.0).filter(|callout| *callout == style);
+        if self.last == style || above.is_some() {
+            self.empty(BOX_SPACE.0);
         }
     }
 
@@ -723,13 +774,91 @@ impl<'d> Writer<'d, '_> {
     /// The relationship of a figure's picture, for one the file can hold.
     fn held(&mut self, figure: &'d Block) -> Option<String> {
         let BlockKind::Figure { asset: Some(name), .. } = &figure.kind else { return None };
-        match self.pictures.get(name.as_str()) {
+        self.stored(name)
+    }
+
+    /// The relationship of an asset, for one the file can hold. Each is stored once.
+    fn stored(&mut self, name: &'d str) -> Option<String> {
+        match self.pictures.get(name) {
             Some(known) => known.clone(),
             None => {
                 let id = self.embed(name);
                 self.pictures.insert(name, id.clone());
                 id
             }
+        }
+    }
+
+    /// Writes a table of contents as the field Word makes one from. What the field last came to is the
+    /// lines the page lists, each leading to its heading, which Word shows until it is asked to renew
+    /// them. It then sets its own, with the numbers of its pages.
+    fn contents(&mut self, block: &'d Block, levels: u8) {
+        let lines = self.tables.remove(block.id.as_str()).unwrap_or_default();
+        let code = format!("TOC \\o \"1-{}\" \\h", levels.clamp(1, 4));
+        let mut opening = field_start(&code);
+        if lines.is_empty() {
+            self.open(CONTENTS[0].0, None);
+            self.whole(&(opening + &field_mark("end")));
+            self.out.push_str("</w:p>");
+            return;
+        }
+        for (index, heading) in lines.iter().enumerate() {
+            let BlockKind::Heading { level } = heading.kind else { continue };
+            let (rtl, lang) = (letters_layout::rtl(heading), heading.lang.as_deref().or(self.lang));
+            // A field starts in its first line and ends in its last.
+            let mut line = std::mem::take(&mut opening);
+            if let Some(number) = self.listed.get(heading.id.as_str()) {
+                let _ = write!(line, "<w:hyperlink w:anchor=\"{HEADING_MARK}{number}\">");
+            }
+            let text = Run::plain(heading.plain_text().replace('\n', " "));
+            inline(&[text], &[], lang, rtl, &self.labels, &mut self.links, &mut line);
+            if self.listed.contains_key(heading.id.as_str()) {
+                line.push_str("</w:hyperlink>");
+            }
+            if index + 1 == lines.len() {
+                line.push_str(&field_mark("end"));
+            }
+            self.turn = rtl;
+            self.open(CONTENTS[usize::from(level.clamp(1, 4)) - 1].0, None);
+            self.whole(&line);
+            self.out.push_str("</w:p>");
+        }
+    }
+
+    /// Writes a link's preview as what it shows, in a frame that holds it together: its picture, its title
+    /// as the link, its description and where it leads. Word has no card that would fetch these again.
+    fn preview(&mut self, block: &'d Block, within: Option<&'static str>) {
+        let BlockKind::LinkPreview { url, title, description, image } = &block.kind else { return };
+        let style = within.unwrap_or(PREVIEW.0);
+        if within.is_none() {
+            self.part(style);
+        }
+        let turned = |text: &str| text.chars().find_map(letters_layout::reads).unwrap_or(false);
+        let given = |text: &'d Option<String>| text.as_deref().filter(|text| !text.trim().is_empty());
+        let (title, description) = (given(title), given(description));
+        let shot = image.as_deref().and_then(|name| {
+            let image = Image::decode(&(self.assets)(name)?).ok()?;
+            let (width, height) = fitted(image.width() as f32, image.height() as f32);
+            let wide = width.min(PREVIEW_WIDE).min(self.measure);
+            Some((self.stored(name)?, wide, (height * wide / width).max(1.0)))
+        });
+        if let Some((id, width, height)) = shot {
+            // The title under it says what the picture is of.
+            let picture = self.drawing(&id, "", width, height);
+            self.keep = true;
+            self.open(style, None);
+            self.whole(&picture);
+            self.out.push_str("</w:p>");
+        }
+        // One that was never fetched shows its address alone, and a title says where it leads under it.
+        let link = Run { link: Some(url.clone()), ..Run::marked(title.unwrap_or(url), [Mark::Bold]) };
+        let under = description.into_iter().chain(title.map(|_| host(url)));
+        let lines: Vec<Vec<Run>> =
+            std::iter::once(vec![link]).chain(under.map(|text| vec![Run::plain(text)])).collect();
+        for (index, line) in lines.iter().enumerate() {
+            let said: String = line.iter().map(|run| run.text.as_str()).collect();
+            (self.keep, self.rtl) = (index + 1 < lines.len(), turned(&said));
+            self.paragraph(style, None, line, Vec::new());
         }
     }
 
@@ -892,9 +1021,18 @@ impl<'d> Writer<'d, '_> {
 /// A field: the instructions Word follows, between marks, and then what they last came to, which is what
 /// a reader that follows none shows.
 fn field(code: &str, shown: &str) -> String {
-    let mark = |kind: &str| format!("<w:r><w:fldChar w:fldCharType=\"{kind}\"/></w:r>");
+    [field_start(code), shown.to_owned(), field_mark("end")].concat()
+}
+
+/// One of the marks a field's parts stand between.
+fn field_mark(kind: &str) -> String {
+    format!("<w:r><w:fldChar w:fldCharType=\"{kind}\"/></w:r>")
+}
+
+/// A field up to where what it last came to starts.
+fn field_start(code: &str) -> String {
     let code = format!("<w:r><w:instrText xml:space=\"preserve\"> {code} </w:instrText></w:r>");
-    [mark("begin"), code, mark("separate"), shown.to_owned(), mark("end")].concat()
+    [field_mark("begin"), code, field_mark("separate")].concat()
 }
 
 /// Ends a comment's passage and leaves its mark, which is where Word hangs the comment.
@@ -1201,6 +1339,18 @@ fn styles(style: &Style, language: &str) -> String {
         let kept = format!("<w:keepNext/>{frame}");
         paragraph(&id, &name, true, &paragraph_look(&title, &kept, inset, ""), &run_look(&title, ""));
     }
+    // The lines of a table of contents sit closer than paragraphs do, each level further in than the last.
+    let line = TextStyle { space_after: body.space_after / 2.0, align: Align::Start, ..body.clone() };
+    for (level, (id, name)) in CONTENTS.iter().enumerate() {
+        let inset = format!("<w:ind w:left=\"{}\"/>", 240 * level);
+        paragraph(id, name, true, &paragraph_look(&line, "", &inset, ""), &run_look(&line, ""));
+    }
+    // What a link's preview shows is held in a thin frame, as a card is.
+    let frame = ["top", "left", "bottom", "right"]
+        .map(|side| border(side, 4, if side == "top" || side == "bottom" { 9 } else { 12 }, &hex(PAGE.line)));
+    let card = format!("<w:pBdr>{}</w:pBdr>", frame.concat());
+    let look = paragraph_look(body, &card, "<w:ind w:left=\"250\" w:right=\"250\"/>", "");
+    paragraph(PREVIEW.0, PREVIEW.1, true, &look, &run_look(body, ""));
     // Items of one list sit closer than paragraphs do.
     paragraph(LIST.0, LIST.1, true, &paragraph_look(body, "", "<w:contextualSpacing/>", ""), &run_look(body, ""));
     // The text of a cell is body text with no space around it, and bold in a row that heads the table.
@@ -1218,6 +1368,14 @@ fn styles(style: &Style, language: &str) -> String {
         DIVIDER.0, DIVIDER.1
     );
 
+    // A paragraph too small to see, which parts two boxes that are framed alike.
+    let _ = write!(
+        out,
+        "<w:style w:type=\"paragraph\" w:styleId=\"{}\"><w:name w:val=\"{}\"/><w:basedOn w:val=\"Normal\"/>\
+         <w:next w:val=\"Normal\"/><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"20\" \
+         w:lineRule=\"exact\"/></w:pPr><w:rPr><w:sz w:val=\"2\"/><w:szCs w:val=\"2\"/></w:rPr></w:style>",
+        BOX_SPACE.0, BOX_SPACE.1,
+    );
     // A paragraph too small to see, which leaves under a table the space a paragraph leaves under itself.
     let _ = write!(
         out,
