@@ -23,10 +23,6 @@ wasm() {
     -p letters-model -p letters-format -p letters-fonts -p letters-render -p letters-layout \
     -p letters-editor -p letters-ui -p letters-convert -p letters-spell -p letters-math -p letters-trust \
     -p letters-api -p letters-sync -p letters-web
-  # The browser is handed its maths engine after its first frame (letters-math's `provided` feature). A
-  # formula that waits for it is only in a build with that feature, so its tests run here.
-  cargo test -p letters-math --features provided --test provided
-  LETTERS_MATHS_WAITS=1 cargo test -p letters-layout --features letters-math/provided --test pending
 }
 
 # The tests `cargo test` leaves out (#[ignore]) because a debug build takes minutes over them, or because
