@@ -1,0 +1,57 @@
+name: Platforms
+
+# macOS and Windows cost several times what Linux does, so they are tested and measured each night and when
+# asked for, not on every push.
+on:
+  schedule:
+    - cron: "13 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platforms
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing here reads debug info: a failed test names its line without it.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  platforms:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+          - name: Windows
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The version rust-toolchain.toml pins, with its components and targets.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      # Every failure in one night: a test that fails does not hide those after it.
+      - name: Test
+        run: cargo test --workspace --no-fail-fast
+
+      - name: Build
+        run: cargo build --release -p letters
+
+      - name: Check budgets
+        shell: bash
+        run: |
+          ./scripts/budgets.sh ${{ matrix.os }} | tee budgets.txt
+          { echo '```text'; cat budgets.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"

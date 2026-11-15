@@ -4,15 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Each night: the platforms a push does not wait for, on caches this run also keeps from lapsing.
+  # Each night as well: a cache nobody reads for a week is dropped, and the next push would build everything.
   schedule:
     - cron: "43 3 * * *"
   workflow_dispatch:
-    inputs:
-      platforms:
-        description: Also build, test and measure on macOS and Windows
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -57,6 +52,11 @@ jobs:
           key: ${{ matrix.name }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # A step of its own, so that the run shows what building costs and what testing does.
+      - name: Build tests
+        if: matrix.steps == 'test'
+        run: cargo test --workspace --no-run
+
       - name: ${{ matrix.name }}
         run: ./scripts/check.sh ${{ matrix.steps }}
 
@@ -77,45 +77,11 @@ jobs:
           key: budgets
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Build
+        run: cargo build --release -p letters
+
       - name: Check budgets
         shell: bash
         run: |
           ./scripts/budgets.sh ubuntu-latest | tee budgets.txt
-          { echo '```text'; cat budgets.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
-
-  # macOS and Windows cost several times what Linux does, so they run each night and when asked for, not on
-  # every push.
-  platforms:
-    name: ${{ matrix.name }}
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.platforms)
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS
-            os: macos-latest
-          - name: Windows
-            os: windows-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        run: rustup toolchain install
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.name }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Test
-        shell: bash
-        run: ./scripts/check.sh test
-
-      - name: Check budgets
-        shell: bash
-        run: |
-          ./scripts/budgets.sh ${{ matrix.os }} | tee budgets.txt
           { echo '```text'; cat budgets.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"

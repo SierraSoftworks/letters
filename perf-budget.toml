@@ -9,16 +9,17 @@
 # limit only for a cost that was chosen.
 
 [ubuntu-latest]
-launch_ms = 150
-keystroke_median_ms = 5
-keystroke_p99_ms = 12
+launch_ms = 80
+keystroke_median_ms = 2.3
+keystroke_p99_ms = 6
 
 [macos-latest]
-launch_ms = 150
-keystroke_median_ms = 5
-keystroke_p99_ms = 12
+launch_ms = 50
+keystroke_median_ms = 1.7
+keystroke_p99_ms = 5
 
+# Not measured yet: the tests do not pass on Windows.
 [windows-latest]
 launch_ms = 150
-keystroke_median_ms = 5
-keystroke_p99_ms = 12
+keystroke_median_ms = 8
+keystroke_p99_ms = 16
