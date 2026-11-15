@@ -2599,6 +2599,7 @@ dependencies = [
 name = "letters-convert"
 version = "0.1.0"
 dependencies = [
+ "hayro",
  "html5gum",
  "letters-fonts",
  "letters-layout",

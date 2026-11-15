@@ -25,4 +25,5 @@ yewi-highlight.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+hayro.workspace = true
 proptest.workspace = true

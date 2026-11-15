@@ -12,7 +12,7 @@ mod pdf;
 pub use docx::{DocxError, DocxImport, from_docx, to_docx};
 pub use html::{Assets, from_html, to_html, to_html_fragment, to_html_themed};
 pub use markdown::{from_markdown, to_markdown};
-pub use pdf::to_pdf;
+pub use pdf::{PdfInfo, to_pdf};
 
 /// Something an import had to simplify, to be shown as an import note on the affected block.
 #[derive(Clone, Debug, PartialEq, Eq)]

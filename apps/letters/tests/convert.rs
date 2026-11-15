@@ -473,4 +473,5 @@ fn export_writes_a_pdf_a_reader_can_search_and_find_its_way_in() {
     assert_eq!(outline_of(&pdf), [("Rates".to_owned(), 0), (" Appeals".to_owned(), appeals)]);
     let title = pdf.metadata().title.as_deref().map(|title| String::from_utf8_lossy(title).into_owned());
     assert_eq!(title.as_deref(), Some("Rates"));
+    assert!(pdf.metadata().creation_date.is_some(), "the PDF says when it was written");
 }

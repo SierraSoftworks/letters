@@ -10,8 +10,9 @@ use std::fs;
 use std::io::{self, Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use letters_convert::{ImportNote, from_docx, from_markdown, to_docx, to_html, to_markdown, to_pdf};
+use letters_convert::{ImportNote, PdfInfo, from_docx, from_markdown, to_docx, to_html, to_markdown, to_pdf};
 use letters_format::{Archive, Package};
 use letters_layout::Fonts;
 use letters_model::{Anchor, Block, BlockKind, Body, Document, Mark, Note, NoteKind, Notes, Run, Style};
@@ -64,7 +65,11 @@ fn try_export(export: &Export) -> Result<(), String> {
         }
         Format::Pdf => {
             let fonts = Fonts { faces: letters_fonts::bundled() };
-            to_pdf(&document, &style, fonts, &title).map_err(|error| failed(&error))?
+            // Who wrote a document is in its history, which a file does not hold yet.
+            let created = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|since| since.as_secs());
+            let info = PdfInfo { title: title.to_string(), authors: Vec::new(), created };
+            to_pdf(&document, &style, fonts, &mut |name| archive.read(name).ok().flatten(), &info)
+                .map_err(|error| failed(&error))?
         }
     };
 
