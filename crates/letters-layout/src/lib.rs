@@ -1445,16 +1445,19 @@ impl State {
                 if head.y >= band.1 || head.y + line <= band.0 {
                     continue;
                 }
-                let mut x = head.x;
+                // The icon leads and the title follows it, from the side the callout's lines start at.
+                let mut after = 0.0;
                 if let Some((path, scale, stroke)) = frame.head.icon.and_then(callout::outline) {
+                    let x = frame.headed(after, callout::ICON);
                     let origin = Point { x, y: head.y + ((line - callout::ICON) / 2.0).round() };
                     out.push(Item::Path { origin, scale, path, color, stroke: Some(stroke) });
-                    x += callout::ICON + callout::ICON_GAP;
+                    after += callout::ICON + callout::ICON_GAP;
                 }
                 if frame.head.title.is_empty() {
                     continue;
                 }
-                let (shape, _) = shapes.title(engine, types, &frame.head.title);
+                let (shape, wide) = shapes.title(engine, types, &frame.head.title);
+                let x = frame.headed(after, wide);
                 let Some(line) = shapes.layout(shape).and_then(|shape| shape.get(0)) else { continue };
                 // A title longer than the callout is wide is cut at its edge.
                 out.push(Item::PushClip { rect: Rect { height: frame.head.line, ..head }, radius: 0.0 });
@@ -1818,13 +1821,8 @@ impl State {
                 title => shapes.title(engine, types, title).1 + if icon > 0.0 { callout::ICON_GAP } else { 0.0 },
             };
             let line = if frame.head.line > 0.0 { frame.head.line } else { types.get(leaves[frame.first].role).line };
-            let room = (frame.width - theme::BOX_PAD_X * 2.0).max(0.0);
-            let rect = Rect::new(
-                frame.x + theme::BOX_PAD_X,
-                frame.span(leaves).0 + theme::BOX_PAD_Y,
-                (icon + title).min(room),
-                line,
-            );
+            let width = (icon + title).min((frame.width - theme::BOX_PAD_X * 2.0).max(0.0));
+            let rect = Rect::new(frame.headed(0.0, width), frame.span(leaves).0 + theme::BOX_PAD_Y, width, line);
             if rect.width > 0.0 {
                 found.push((frame.id.clone(), rect));
             }
