@@ -9,16 +9,16 @@ use std::ops::Range;
 use std::rc::{Rc, Weak};
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
-use js_sys::{Array, Function, Map, Object, Reflect, Uint8Array};
+use js_sys::{Array, Function, Map, Object, Promise, Reflect, Uint8Array};
 use letters_editor::{Clip, KeyEvent, Modifiers, Picture, Platform as _};
 use letters_model::{BlockKind, Document, HistoryError, Mark, Pos, ReplicaId, Selection};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::{Color, DisplayList, Point, Rect, Size};
 use letters_trust::{LinkDecision, Origin, Trust};
-use letters_ui::{Appearance, Cursor, Edge, Keys, Request, Scheme, Settings, Window as View, tokens};
+use letters_ui::{Appearance, CopyFormat, Cursor, Edge, Keys, Request, Scheme, Settings, Window as View, tokens};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_futures::{JsFuture, future_to_promise};
 use web_sys::{
     Blob, BlobPropertyBag, CanvasRenderingContext2d, ClipboardEvent, CompositionEvent, DragEvent, Element, Event,
     EventTarget, File, FileList, HtmlAnchorElement, HtmlCanvasElement, HtmlElement, HtmlIFrameElement,
@@ -118,8 +118,12 @@ pub struct Shell {
     later: Option<Later>,
     /// Where the files beside the wasm are found: a URL that is empty or ends in a slash.
     base: String,
-    /// The PDF export, once the person has printed: a module of its own, fetched then.
-    printer: Option<JsValue>,
+    /// The exports, once the person has printed or saved a copy: a module of its own, fetched then.
+    exporter: Option<Promise>,
+    /// How often the exports could not be fetched.
+    refetches: u32,
+    /// How many files the exports are writing.
+    exporting: u32,
     /// Whether a PDF is being made for the person to print.
     printing: bool,
     /// The frame the last PDF was printed from, and the address the PDF has in this page.
@@ -238,7 +242,9 @@ impl Shell {
             RefCell::new(Self {
                 me: shell.clone(),
                 base: later.base.clone(),
-                printer: None,
+                exporter: None,
+                refetches: 0,
+                exporting: 0,
                 printing: false,
                 printed: None,
                 later: Some(later),
@@ -487,68 +493,156 @@ impl Shell {
         }
     }
 
-    /// Offers `text` to the person as a file to keep, named after the document.
-    fn download(&self, text: &str, extension: &str) -> Result<(), JsValue> {
+    /// Offers `file` to the person as a file to keep, called `name`: text, or bytes.
+    fn download(&self, file: &JsValue, kind: &str, name: &str) -> Result<(), JsValue> {
         let page = self.window.document().ok_or("there is no document")?;
         let options = BlobPropertyBag::new();
-        options.set_type("application/json");
-        let file = Blob::new_with_str_sequence_and_options(&Array::of1(&text.into()), &options)?;
+        options.set_type(kind);
+        let file = Blob::new_with_u8_array_sequence_and_options(&Array::of1(file), &options)?;
         let url = Url::create_object_url_with_blob(&file)?;
-        keep(&page, &url, extension)?;
+        keep(&page, &url, name)?;
         Url::revoke_object_url(&url)
     }
 
-    // Printing
+    // Printing and copies
 
-    /// Makes the PDF of the document, which is what Print view shows, and hands it to the browser's print
-    /// dialog. The export is fetched the first time, so that no other visit waits for it.
-    fn print(&mut self) {
-        if std::mem::replace(&mut self.printing, true) {
-            return;
+    /// The exports with their fonts, fetched when they are first asked for so that no other visit waits
+    /// for them.
+    fn exporter(&mut self) -> Promise {
+        if let Some(exporter) = &self.exporter {
+            return exporter.clone();
         }
+        let (window, base) = (self.window.clone(), self.base.clone());
+        // A browser remembers a module it could not fetch, so another try asks under another address.
+        let again = Some(self.refetches).filter(|tries| *tries > 0).map(|tries| format!("?again={tries}"));
+        let exporter = future_to_promise(async move {
+            let module = format!("{base}export.js{}", again.unwrap_or_default());
+            let module = Url::new_with_base(&module, &window.location().href()?)?;
+            let exporter = load(&module.href()).await?;
+            // The editor has fetched these already, so the browser has them at hand.
+            let fonts = browser::files(&window, &urls(&base, "fonts", &letters_fonts::FILES)).await?;
+            let maths = browser::files(&window, &urls(&base, "maths", &letters_math::FONT_FILES)).await?;
+            let files =
+                |files: Vec<Vec<u8>>| -> Array { files.iter().map(|file| Uint8Array::from(&file[..])).collect() };
+            call(&exporter, "fonts", &Array::of2(&files(fonts), &files(maths)))?;
+            Ok(exporter)
+        });
+        self.exporter.insert(exporter).clone()
+    }
+
+    /// Has the exports write the document as it now is, in the format whose files end in `format`, and
+    /// hands `then` the file, or why there is none in words that end a sentence.
+    fn export(
+        &mut self,
+        format: &'static str,
+        title: String,
+        then: impl FnOnce(&mut Self, Result<Exported, String>) + 'static,
+    ) {
         let editor = self.view.editor();
-        let (document, style) = (editor.doc().to_json(), self.view.style().to_json());
-        let title = self.window.document().map(|page| page.title()).unwrap_or_default();
+        let (document, style, notes) =
+            (editor.doc().to_json(), self.view.style().to_json(), self.view.notes().to_json());
         let authors: Array = editor.model().authors().iter().map(|author| JsValue::from(author.as_str())).collect();
         let created = self.platform.wall_time().map(|seconds| seconds as f64);
         let assets = Map::new();
         for (name, file) in self.platform.assets.iter().filter(|(name, _)| document.contains(name.as_str())) {
             assets.set(&name.into(), &Uint8Array::from(&file[..]));
         }
-        let (shell, window, base, printer) =
-            (self.me.clone(), self.window.clone(), self.base.clone(), self.printer.clone());
+        let asked: [JsValue; 8] = [
+            format.into(),
+            title.into(),
+            document.into(),
+            style.into(),
+            notes.into(),
+            authors.into(),
+            created.into(),
+            assets.into(),
+        ];
+        self.exporting += 1;
+        let (shell, exporter) = (self.me.clone(), self.exporter());
         wasm_bindgen_futures::spawn_local(async move {
-            let made = async {
-                let printer = match printer {
-                    Some(printer) => printer,
-                    None => {
-                        let module = Url::new_with_base(&format!("{base}print.js"), &window.location().href()?)?;
-                        let printer = load(&module.href()).await?;
-                        // The editor has fetched these already, so the browser has them at hand.
-                        let fonts = browser::files(&window, &urls(&base, "fonts", &letters_fonts::FILES)).await?;
-                        let maths = browser::files(&window, &urls(&base, "maths", &letters_math::FONT_FILES)).await?;
-                        let files = |files: Vec<Vec<u8>>| -> Array {
-                            files.iter().map(|file| Uint8Array::from(&file[..])).collect()
-                        };
-                        call(&printer, "fonts", &Array::of2(&files(fonts), &files(maths)))?;
-                        printer
-                    }
-                };
-                let asked: [JsValue; 6] =
-                    [document.into(), style.into(), title.into(), authors.into(), created.into(), assets.into()];
-                let pdf = call(&printer, "pdf", &asked.into_iter().collect())?;
-                Ok::<_, JsValue>((printer, pdf))
+            let asked_of = exporter.clone();
+            let exporter = JsFuture::from(exporter).await;
+            let made = match &exporter {
+                Ok(exporter) => call(exporter, "exported", &asked.into_iter().collect()).map_err(|error| said(&error)),
+                Err(error) => {
+                    web_sys::console::error_1(error);
+                    Err("what writes it could not be fetched".to_owned())
+                }
             };
-            let made = made.await;
+            let made = made.map(|made| {
+                let made: Array = made.unchecked_into();
+                Exported {
+                    name: made.get(0).as_string(),
+                    kind: made.get(1).as_string().unwrap_or_default(),
+                    file: made.get(2),
+                }
+            });
             let Some(shell) = shell.upgrade() else { return };
             let mut shell = shell.borrow_mut();
-            shell.printing = false;
-            report(made.and_then(|(printer, pdf)| {
-                shell.printer = Some(printer);
-                shell.hand_to_print(&pdf)
-            }));
+            shell.exporting -= 1;
+            // What could not be fetched is asked for again the next time.
+            if exporter.is_err() && shell.exporter.as_ref().is_some_and(|kept| Object::is(kept, &asked_of)) {
+                (shell.exporter, shell.refetches) = (None, shell.refetches + 1);
+            }
+            then(&mut shell, made);
             shell.sync();
         });
+    }
+
+    /// Writes a copy of the document in another format, as a file the browser keeps for the person, and
+    /// answers the card that asked for it.
+    fn copy(&mut self, name: String, format: CopyFormat) {
+        let format = match format {
+            // A document of its own has its history and a place among the person's documents, which wait
+            // for a server behind the page.
+            CopyFormat::Letters => {
+                let notice = "A Letters document cannot be saved from the browser yet. The other formats can.";
+                return self.view.refuse_copy(notice, false);
+            }
+            CopyFormat::Word => "docx",
+            CopyFormat::Pdf => "pdf",
+            CopyFormat::WebPage => "html",
+            CopyFormat::Markdown => "md",
+        };
+        self.export(format, name, |shell, made| {
+            let failed = |why: String| format!("The copy could not be written: {why}.");
+            let refused = match made {
+                Ok(Exported { name: None, .. }) => Some("A copy needs a name.".to_owned()),
+                Ok(Exported { name: Some(name), kind, file }) => {
+                    shell.download(&file, &kind, &name).err().map(|error| failed(said(&error)))
+                }
+                Err(why) => Some(failed(why)),
+            };
+            match refused {
+                Some(notice) => shell.view.refuse_copy(&notice, false),
+                None => shell.view.set_copied("your downloads"),
+            }
+        });
+    }
+
+    /// Makes the PDF of the document, which is what Print view shows, and hands it to the browser's print
+    /// dialog.
+    fn print(&mut self) {
+        // One dialog at a time: a second Print while the first is on its way is the same wish.
+        if std::mem::replace(&mut self.printing, true) {
+            return;
+        }
+        let title = self.window.document().map(|page| page.title()).unwrap_or_default();
+        self.export("pdf", title, |shell, made| {
+            shell.printing = false;
+            let printed = made.and_then(|pdf| shell.hand_to_print(&pdf.file).map_err(|error| said(&error)));
+            if let Err(why) = printed {
+                shell.say(format!("The document could not be printed: {why}."));
+            }
+        });
+    }
+
+    /// Tells the person what went wrong where the window has no place to say it, as the browser tells
+    /// them things. It does so once this event is over, since nothing else happens while they read.
+    fn say(&self, message: String) {
+        let window = self.window.clone();
+        let say = Closure::once_into_js(move || report(window.alert_with_message(&message)));
+        report(self.window.set_timeout_with_callback(say.unchecked_ref()).map(drop));
     }
 
     /// Hands a PDF to the browser's print dialog, from a frame nobody sees. A browser that shows no PDFs
@@ -574,7 +668,7 @@ impl Shell {
             let printed =
                 shown.content_window().ok_or_else(|| "the frame has no window".into()).and_then(|pdf| pdf.print());
             // A frame the page may not print from still holds a file the person can keep.
-            report(printed.or_else(|_: JsValue| keep(&page, &kept, "pdf")));
+            report(printed.or_else(|_: JsValue| keep(&page, &kept, &format!("{}.pdf", page.title()))));
         });
         frame.set_onload(Some(print.unchecked_ref()));
         frame.set_src(&url);
@@ -644,7 +738,10 @@ impl Shell {
                 }
                 // The browser asks the person for the file, and the chooser's `change` hands it over.
                 Request::ImportStyle => self.chooser.click(),
-                Request::ExportStyle(json) => report(self.download(&json, "letstyle")),
+                Request::ExportStyle(json) => {
+                    let name = self.window.document().map(|page| page.title()).unwrap_or_default();
+                    report(self.download(&json.into(), "application/json", &format!("{name}.letstyle")));
+                }
                 Request::Pictures => self.picker.click(),
                 Request::Print => self.print(),
                 Request::Asset(name) => self.load(name),
@@ -656,10 +753,8 @@ impl Shell {
                     follow(&mut self.view, settings);
                     self.view.set_dark(self.dark());
                 }
-                // A copy needs somewhere to go as well, and the card that asked waits for its answer.
-                Request::SaveCopy { .. } => {
-                    self.view.refuse_copy("Copies cannot be saved from the browser yet.", false)
-                }
+                // A page has no folders to write in: a copy is a file the browser keeps for the person.
+                Request::SaveCopy { name, format, .. } => self.copy(name, format),
                 // Opening, starting and moving need files, which wait for a server behind the page.
                 _ => {}
             }
@@ -677,8 +772,8 @@ impl Shell {
         self.caret = caret;
         self.place_handles();
         let cursor = match self.view.cursor() {
-            // Making a PDF takes a moment, and the first one the time to fetch what makes it.
-            _ if self.printing => "progress",
+            // Writing a file takes a moment, and the first one the time to fetch what writes it.
+            _ if self.exporting > 0 => "progress",
             Cursor::Default => "default",
             Cursor::Pointer => "pointer",
             Cursor::Text => "text",
@@ -1181,13 +1276,28 @@ impl Shell {
     }
 }
 
-/// Offers what is at `url` to the person as a file to keep, named after the document.
-fn keep(page: &web_sys::Document, url: &str, extension: &str) -> Result<(), JsValue> {
+/// A file the exports wrote.
+struct Exported {
+    /// What to call it, unless nothing of what it was to be called can name a file.
+    name: Option<String>,
+    /// Its media type.
+    kind: String,
+    file: JsValue,
+}
+
+/// Offers what is at `url` to the person as a file to keep, called `name`.
+fn keep(page: &web_sys::Document, url: &str, name: &str) -> Result<(), JsValue> {
     let link: HtmlAnchorElement = page.create_element("a")?.dyn_into()?;
     link.set_href(url);
-    link.set_download(&format!("{}.{extension}", page.title()));
+    link.set_download(name);
     link.click();
     Ok(())
+}
+
+/// What an error says, for a sentence the person reads.
+fn said(error: &JsValue) -> String {
+    let message = error.dyn_ref::<js_sys::Error>().map(|error| String::from(error.message()));
+    message.or_else(|| error.as_string()).unwrap_or_else(|| "it failed without saying why".to_owned())
 }
 
 /// Calls a function that a module exports.

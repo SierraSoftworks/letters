@@ -149,7 +149,7 @@ const downloads = [
 const later = [
   [`maths (${maths.length} files)`, maths],
   [`dictionaries (${dictionaries.length})`, dictionaries],
-  ["print, when printing", [read("print_bg.wasm"), read("print.js")]],
+  ["exports, when asked for", [read("export_bg.wasm"), read("export.js")]],
 ];
 console.log(`${"What the browser downloads".padEnd(24)}${["as served", "gzip", "brotli"].map((head) => head.padStart(11)).join("")}`);
 downloads.forEach(([label, files]) => row(label, ...download(files)));

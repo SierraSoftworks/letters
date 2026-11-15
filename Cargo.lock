@@ -2925,6 +2925,7 @@ dependencies = [
  "letters-convert",
  "letters-editor",
  "letters-fonts",
+ "letters-format",
  "letters-layout",
  "letters-math",
  "letters-model",
@@ -2935,6 +2936,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "zip",
 ]
 
 [[package]]

@@ -76,13 +76,15 @@ web-sys = { workspace = true, features = [
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 letters-convert.workspace = true
 
-# The PDF export is a module of its own, which the page fetches when the person first prints.
+# The exports are a module of their own, which the page fetches when the person first prints or saves a copy.
 [[example]]
-name = "print"
+name = "export"
 crate-type = ["cdylib"]
 
 [dev-dependencies]
+letters-format.workspace = true
 letters-layout.workspace = true
+zip.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 letters-convert.workspace = true
