@@ -698,9 +698,10 @@ impl Ui<EditorApp> {
     pub fn select_word_at(&mut self, at: Point, platform: &mut dyn Platform) -> bool {
         // The version a conflict holds back is read, not selected.
         let on_page = self.on_canvas(at).filter(|at| !self.app().review.covers(*at));
-        let Some(head) = on_page.and_then(|at| self.app().hit(at)) else { return false };
+        let Some((head, before_wrap)) = on_page.and_then(|at| self.app().hit_sided(at)) else { return false };
         let app = self.app_mut();
-        app.editor.select(Selection::caret(head));
+        // Past the end of a line that wraps with no space, the word is one of that line.
+        app.editor.select_at(Selection::caret(head), before_wrap);
         app.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform));
         true
     }
@@ -2745,14 +2746,6 @@ impl EditorApp {
                     self.editor.select_at(Selection { anchor, head }, before_wrap);
                 }
                 self.dragging = clicks == 1;
-                // The end of a line that wraps with no space is where the next line's first word starts.
-                // The word that is meant is the one on the line that was pressed, so it is picked from the
-                // last place inside that line.
-                let inside = self.head().filter(|_| clicks == 2 && self.editor.before_wrap());
-                let inside = inside.and_then(|end| self.layout.hit(Point { x: end.x, y: end.y + end.height / 2.0 }));
-                if let Some(inside) = inside {
-                    self.editor.select(Selection::caret(inside));
-                }
                 match clicks {
                     1 => self.reveal(),
                     2 => self.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform)),
@@ -3892,17 +3885,13 @@ impl EditorApp {
         let at = |offset: usize| Pos::new(block.clone(), offset.clamp(source.start, source.end));
         match message {
             Sheet::Press { offset, before_wrap, extend, clicks } => {
-                // A second press picks a word of the row that was pressed: the end of a row that goes on with
-                // no space is where the next row's first word starts, so the word is picked a character in.
-                let text = self.editor.doc().block(&block).map(Block::plain_text).unwrap_or_default();
-                let inside = text.get(..offset).and_then(|before| before.char_indices().next_back());
-                let inside = inside.filter(|_| before_wrap && clicks == 2).map(|(inside, _)| inside);
-                let head = at(inside.unwrap_or(offset));
+                let head = at(offset);
                 let anchor = match self.editor.selection() {
                     Some(selection) if extend => selection.anchor.clone(),
                     _ => head.clone(),
                 };
-                self.editor.select_at(Selection { anchor, head }, before_wrap && inside.is_none());
+                // A second press picks a word of the row that was pressed, which the side tells the editor.
+                self.editor.select_at(Selection { anchor, head }, before_wrap);
                 match clicks {
                     1 => self.stay(offset == source.start, platform),
                     2 => self.edit(platform, |editor, platform| editor.run(Command::SelectWord, platform)),

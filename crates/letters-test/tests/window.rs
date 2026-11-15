@@ -297,6 +297,10 @@ fn a_press_past_the_end_of_a_line_that_wraps_with_no_space_puts_the_caret_at_its
         window.advance(1000).click_at(past).click_at(past);
         let [from, to] = window.ui().selection_ends();
         assert!(!selected(&window).is_empty() && from.map(|from| from.y) == Some(end.y), "{name}: {from:?} {to:?}");
+        // So does a finger held there.
+        let picked = selected(&window);
+        window.advance(1000).click_at(Point { x: next.x - 2.0, y: next.y + next.height / 2.0 });
+        assert!(window.long_press_at(past) && selected(&window) == picked, "{name}: held, {:?}", selected(&window));
         // A drag along the line to past its end selects the line, and ends where the line does.
         window.advance(1000).press_at(Point { x: start.x, y: start.y + start.height / 2.0 }).release_at(past);
         assert_eq!(selected(&window), part.repeat(40)[..wrap.offset], "{name}: the line is selected");
