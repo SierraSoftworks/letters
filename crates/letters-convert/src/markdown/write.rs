@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use letters_model::{
-    Align, Block, BlockId, BlockKind, Body, BodyShape, Document, ListKind, Mark, Properties, PropertiesFormat, Run,
-    Tone,
+    Align, Block, BlockId, BlockKind, Body, BodyShape, Document, ListKind, Mark, Preview, Properties, PropertiesFormat,
+    Run, Tone,
 };
 
 use super::read::{FENCES, front_matter};
@@ -34,11 +34,14 @@ use crate::figures;
 ///   one, which most renderers follow. It reads back as that list. `[TOC]` reads as a table.
 /// - A link preview is its title as a link to the page, then on the next line what the page says of itself.
 ///   Its picture is left out. It reads back as that paragraph.
+/// - A link to a page the document keeps a preview of carries the page's title as its own, which a reader
+///   sees when the pointer rests on the link. The preview's description and picture are left out.
 /// - An unknown block is written as its fallback text. Unknown marks and fields are left out, and so are the
 ///   languages of blocks and runs and the page breaks before blocks, which Markdown has no way to say.
 pub fn to_markdown(doc: &Document) -> String {
     let mut doc = figures::labelled(doc);
     list_contents(&mut doc);
+    title_links(&mut doc);
     let doc = &doc;
     let mut lines = doc.properties.as_ref().map(properties).unwrap_or_default();
     let body = blocks(&doc.blocks);
@@ -109,6 +112,36 @@ fn list_contents(doc: &mut Document) {
     };
     let mut lists: BTreeMap<BlockId, Vec<Block>> = tables.into_iter().map(list).collect();
     swap(&mut doc.blocks, &mut lists);
+}
+
+/// Says after each link's address the title the document keeps of the page there, set apart by a line break,
+/// which no address is written with. A link is then written with that title: see [`titled`].
+fn title_links(doc: &mut Document) {
+    fn title(blocks: &mut [Block], previews: &BTreeMap<String, Preview>) {
+        for block in blocks {
+            match &mut block.body {
+                Body::Text(runs) => {
+                    for link in runs.iter_mut().filter_map(|run| run.link.as_mut()) {
+                        let kept = previews.get(link.as_str()).and_then(|preview| preview.title.as_deref());
+                        *link = link.replace(['\n', '\r'], " ");
+                        if let Some(kept) = kept.filter(|kept| !kept.is_empty() && !link.is_empty()) {
+                            link.push('\n');
+                            link.push_str(&kept.replace(['\n', '\r'], " "));
+                        }
+                    }
+                }
+                Body::Blocks(children) => title(children, previews),
+                Body::None => {}
+            }
+        }
+    }
+    let previews = std::mem::take(&mut doc.previews);
+    title(&mut doc.blocks, &previews);
+}
+
+/// A link's address, and the title [`title_links`] put after it.
+fn titled(link: &str) -> (&str, Option<&str>) {
+    link.split_once('\n').map_or((link, None), |(address, title)| (address, Some(title)))
 }
 
 /// The anchor of each heading as GitHub makes it: the heading's text in lower case, with a hyphen for each
@@ -581,7 +614,7 @@ impl<'a> Inline<'a> {
             .map(|(range, format)| Run {
                 text: self.chars[range].iter().collect(),
                 marks: MARKS.iter().filter(|(bit, _)| format.marks & bit != 0).map(|(_, mark)| mark.clone()).collect(),
-                link: format.link.map(str::to_owned),
+                link: format.link.map(|link| titled(link).0.to_owned()),
                 ..Run::default()
             })
             .collect();
@@ -745,7 +778,10 @@ fn start(span: Span, tags: Option<&str>) -> String {
 
 fn close(span: Span, tags: Option<&str>) -> String {
     match span {
-        Span::Link(url) => format!("]({})", destination(url)),
+        Span::Link(link) => match titled(link) {
+            (address, Some(title)) => format!("]({} \"{}\")", destination(address), quoted(title)),
+            (address, None) => format!("]({})", destination(address)),
+        },
         Span::Mark(bit) if tags.is_some() || bit & EMPHASIS == 0 => format!("</{}>", tag(bit, tags)),
         Span::Mark(_) => start(span, tags),
     }
@@ -777,6 +813,25 @@ fn destination(url: &str) -> String {
         out.push(*c);
     }
     if pointed { format!("<{out}>") } else { out }
+}
+
+/// Writes a link's title as its quotes hold it. What would end it is escaped, and so is what Markdown looks
+/// for before it looks for links, which could pair with the same in the text.
+fn quoted(title: &str) -> String {
+    let chars: Vec<char> = title.chars().collect();
+    let mut out = String::new();
+    for (i, c) in chars.iter().enumerate() {
+        let escaped = match c {
+            '"' | '\\' | '`' | '<' | '$' | '|' => true,
+            '&' => is_reference(&chars[i + 1..]),
+            _ => false,
+        };
+        if escaped {
+            out.push('\\');
+        }
+        out.push(*c);
+    }
+    out
 }
 
 /// Whether the text after an ampersand makes it a character reference such as `&amp;`.

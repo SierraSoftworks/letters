@@ -3,8 +3,10 @@
 mod common;
 
 use letters_convert::{ImportNote, from_markdown, import_markdown, markdown_assets, to_markdown};
+use std::collections::BTreeMap;
+
 use letters_model::{
-    Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone,
+    Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Preview, Properties, PropertiesFormat, Run, Tone,
 };
 use proptest::prelude::*;
 
@@ -76,7 +78,7 @@ fn linked(text: &str, url: &str) -> Run {
 }
 
 /// A document with what a round trip may change set aside: block ids, emphasis on spaces, code on line breaks,
-/// and the cells a table's short rows lack.
+/// the cells a table's short rows lack, and the previews of pages no link leads to.
 fn settled(doc: &Document) -> Document {
     fn settle_block(block: &Block) -> Block {
         let mut body = match &block.body {
@@ -134,7 +136,16 @@ fn settled(doc: &Document) -> Document {
         }
         out
     }
-    Document { blocks: doc.blocks.iter().map(settle_block).collect(), ..doc.clone() }
+    let mut settled = Document { blocks: doc.blocks.iter().map(settle_block).collect(), ..doc.clone() };
+    // A preview of a page shows on a link to it, so one that no link names is not written.
+    settled.prune_previews();
+    settled
+}
+
+/// What a document keeps of the pages at `titles`' addresses: for each, its title.
+fn previews(titles: &[(&str, &str)]) -> BTreeMap<String, Preview> {
+    let preview = |title: &str| Preview { title: Some(title.into()), ..Preview::default() };
+    titles.iter().map(|(address, title)| ((*address).to_owned(), preview(title))).collect()
 }
 
 #[test]
@@ -521,6 +532,54 @@ fn writes_a_link_preview_as_its_linked_title_and_description() {
 }
 
 #[test]
+fn a_links_title_is_the_title_of_its_pages_preview() {
+    let (fees, tides) = ("https://example.com/fees", "https://example.com/tides");
+    let link =
+        |text: &str, address: &str| with_text(BlockKind::Paragraph, vec![Run::plain("See "), linked(text, address)]);
+    let cases = [
+        (
+            vec![link("the fees", fees)],
+            previews(&[(fees, "Harbour fees")]),
+            "See [the fees](https://example.com/fees \"Harbour fees\")\n",
+        ),
+        // The title is written as its quotes hold it, and a link that is its own address has a place for one too.
+        (
+            vec![link(fees, fees)],
+            previews(&[(fees, "A \"night\" | $4 `each`")]),
+            "See [https://example.com/fees](https://example.com/fees \"A \\\"night\\\" \\| \\$4 \\`each\\`\")\n",
+        ),
+        // Each link to a page says its title, and a link to another page says none.
+        (
+            vec![link("fees", fees), link("tides", tides), link("fees again", fees)],
+            previews(&[(fees, "Harbour fees")]),
+            "See [fees](https://example.com/fees \"Harbour fees\")\n\nSee [tides](https://example.com/tides)\n\n\
+             See [fees again](https://example.com/fees \"Harbour fees\")\n",
+        ),
+    ];
+    for (blocks, previews, markdown) in cases {
+        let before = Document { previews, ..doc(blocks) };
+        assert_eq!(to_markdown(&before), markdown);
+        let (after, notes) = read(markdown);
+        assert_eq!(after.previews, before.previews, "reading {markdown}");
+        assert_eq!(notes, [], "reading {markdown}");
+    }
+
+    // What else a preview holds has no place in Markdown, and one with no title leaves its link as it is.
+    let told = Preview {
+        description: Some("What a night costs.".into()),
+        image: Some("assets/5e2f.jpg".into()),
+        ..Preview::default()
+    };
+    let before = Document { previews: [(fees.to_owned(), told)].into(), ..doc(vec![link("fees", fees)]) };
+    assert_eq!(to_markdown(&before), "See [fees](https://example.com/fees)\n");
+
+    // An address has one preview, so a second title for it is noted and dropped.
+    let (twice, notes) = read("[a](/fees \"One\") and [b](/fees \"Two\") and [c](/fees 'One')");
+    assert_eq!(twice.previews, previews(&[("/fees", "One")]));
+    assert_eq!(notes.iter().map(|note| note.message.as_str()).collect::<Vec<_>>(), ["Link title dropped: Two"]);
+}
+
+#[test]
 fn reads_a_price_as_text() {
     let cases =
         ["costs $5", "between $5 and $10", "$5-$10 each", "US$5/kg and US$6", "$1.50, $2 or $3.25", "5$ and 10$"];
@@ -693,7 +752,7 @@ fn notes_what_an_import_simplified() {
         ("- item $$x^2$$", "Moved out of a list item", "x^2"),
         ("Claim[^1]\n\n[^1]: Source", "Footnote", "[^1]: Source"),
         ("![A cat](cat.png)", "Image", "A cat"),
-        ("[a](/b \"Hover\")", "Hover", "a"),
+        ("[a](/b \"Fees\") or [a](/b \"Hover\")", "Hover", "a"),
         ("```rust ignore\nfn f() {}\n```", "ignore", "fn f() {}"),
     ];
     for (markdown, phrase, kept) in cases {
@@ -1129,6 +1188,23 @@ fn nest_items(mut blocks: Vec<Block>) -> Vec<Block> {
     blocks
 }
 
+/// Previews of the pages that links lead to, as Markdown can say them: by their titles.
+fn any_previews() -> impl Strategy<Value = BTreeMap<String, Preview>> {
+    let addresses =
+        vec!["https://example.com/a?b=1&c=2", "/relative path", "x(y)&amp;z\\", "<q>", "/pay?in=$", "/none"];
+    let title = any_text()
+        .prop_map(|title| title.replace('\n', " "))
+        .prop_filter("a title says something", |title| !title.is_empty());
+    proptest::collection::btree_map(proptest::sample::select(addresses).prop_map(str::to_owned), title, 0..3).prop_map(
+        |titles| {
+            titles
+                .into_iter()
+                .map(|(address, title)| (address, Preview { title: Some(title), ..Preview::default() }))
+                .collect()
+        },
+    )
+}
+
 /// Front matter as a file holds it: lines of anything but a blank first line or the fence that would end it.
 fn any_properties() -> impl Strategy<Value = Option<Properties>> {
     let line = proptest::sample::select(vec![
@@ -1168,8 +1244,12 @@ fn any_markdown() -> impl Strategy<Value = String> {
 
 proptest! {
     #[test]
-    fn a_document_survives_a_round_trip(blocks in any_blocks(), properties in any_properties()) {
-        let before = Document { properties, ..doc(blocks) };
+    fn a_document_survives_a_round_trip(
+        blocks in any_blocks(),
+        properties in any_properties(),
+        previews in any_previews(),
+    ) {
+        let before = Document { properties, previews, ..doc(blocks) };
         let markdown = to_markdown(&before);
         let (after, notes) = read(&markdown);
         prop_assert_eq!(settled(&after), settled(&before), "through {:?}", markdown);

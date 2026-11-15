@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 use std::ops::Range;
 
-use letters_model::{Align, Block, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run};
+use letters_model::{
+    Align, Block, BlockKind, Body, Document, ListKind, Mark, Preview, Properties, PropertiesFormat, Run,
+};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use super::{TAGS, TONES};
@@ -46,6 +48,8 @@ pub fn from_markdown(markdown: &str, new_id: &mut dyn FnMut() -> String) -> (Doc
 /// - A caption that opens with "Figure 2:" makes its figure numbered, and "Figure 2" in the text becomes a
 ///   reference to it.
 /// - A picture that `files` lacks or that Letters cannot show is kept as a link, as is one amid text.
+/// - A link's title is kept as the title of the document's preview of the page at its address, which shows
+///   where a title does: when the pointer rests on the link.
 pub fn import_markdown(markdown: &str, new_id: &mut dyn FnMut() -> String, files: Assets) -> MarkdownImport {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
@@ -65,9 +69,11 @@ pub fn import_markdown(markdown: &str, new_id: &mut dyn FnMut() -> String, files
         task: None,
         files,
         assets: BTreeMap::new(),
+        previews: BTreeMap::new(),
     };
     let blocks = reader.blocks();
-    let mut document = Document { properties, blocks, ..Document::default() };
+    let previews = std::mem::take(&mut reader.previews);
+    let mut document = Document { properties, previews, blocks, ..Document::default() };
     figures::relabel(&mut document);
     MarkdownImport { document, notes: reader.notes, assets: reader.assets }
 }
@@ -115,6 +121,8 @@ struct Reader<'a, 'f> {
     files: Assets<'f>,
     /// The pictures read through `files`, by the names their figures use.
     assets: BTreeMap<String, Vec<u8>>,
+    /// The titles of links, kept as what the document tells of the pages they lead to.
+    previews: BTreeMap<String, Preview>,
 }
 
 impl<'a> Reader<'a, '_> {
@@ -670,10 +678,17 @@ impl<'a> Reader<'a, '_> {
                 Event::Start(Tag::Strikethrough) => text.marks.push(Mark::Strike),
                 Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => drop(text.marks.pop()),
                 Event::Start(Tag::Link { dest_url, title, .. }) => {
-                    if !title.is_empty() {
+                    let address = address(&dest_url);
+                    // A link's title is what shows when the pointer rests on it, as its page's preview does.
+                    // An address has one preview, so another title for it has no place.
+                    let title = one_line(&title);
+                    let kept = self.previews.get(&address).and_then(|preview| preview.title.clone());
+                    if kept.is_none() && !title.is_empty() && !address.is_empty() {
+                        self.previews.insert(address.clone(), Preview { title: Some(title), ..Preview::default() });
+                    } else if !title.is_empty() && kept != Some(title.clone()) {
                         self.note(block, format!("Link title dropped: {title}"));
                     }
-                    text.links.push((address(&dest_url), text.len));
+                    text.links.push((address, text.len));
                 }
                 Event::Start(Tag::Image { dest_url, .. }) => {
                     self.note(block, LINKED);
