@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use letters_convert::{DocxImport, ImportNote, from_docx, import_markdown};
@@ -99,20 +100,19 @@ pub fn shown(folder: &Path, beside: &Path, home: Option<&Path>) -> String {
 impl Imported {
     /// Keeps the document as a new file in `folder`, called `name` or by the next name after it that is
     /// free, and returns where. No file is replaced.
-    pub fn keep(&self, folder: &Path, name: &str) -> Result<PathBuf, String> {
-        let mut bytes = std::io::Cursor::new(Vec::new());
-        letters_format::write(&mut bytes, &self.package).map_err(|error| error.to_string())?;
-        fs::create_dir_all(folder).map_err(|error| error.to_string())?;
+    pub fn keep(&self, folder: &Path, name: &str) -> io::Result<PathBuf> {
+        let mut bytes = io::Cursor::new(Vec::new());
+        letters_format::write(&mut bytes, &self.package).map_err(io::Error::other)?;
+        fs::create_dir_all(folder)?;
         // A name that was free may be taken by the time it is written: the next one is tried then.
         for _ in 0..8 {
             let path = free_path(folder, name);
             match convert::write(&path, bytes.get_ref(), false) {
-                Ok(()) => return Ok(path),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.to_string()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                written => return written.map(|()| path),
             }
         }
-        Err(format!("no name like {name} is free in {}", folder.display()))
+        Err(io::Error::other(format!("no name like {name} is free in {}", folder.display())))
     }
 }
 

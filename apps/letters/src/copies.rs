@@ -26,11 +26,11 @@ pub enum Refused {
     /// The version asked for is not in the document's history.
     NoVersion,
     /// A file of that name is in the folder already. A document is never replaced.
-    Taken {
-        name: String,
-        format: CopyFormat,
-    },
-    Failed(String),
+    Taken { name: String, format: CopyFormat },
+    /// The document could not be saved first, for this reason, which is a sentence of its own.
+    Unsaved(String),
+    /// The system would not write it, or the document could not be read to make it.
+    Failed(io::Error),
 }
 
 impl Refused {
@@ -50,12 +50,19 @@ impl fmt::Display for Refused {
                 write!(f, "There is already a document called \u{201c}{name}\u{201d} in that folder.")
             }
             Self::Taken { name, .. } => write!(f, "\u{201c}{name}\u{201d} is already in that folder."),
-            Self::Failed(error) => write!(f, "The copy could not be written: {error}."),
+            Self::Unsaved(why) => f.write_str(why),
+            Self::Failed(error) => f.write_str(&files::unwritten("The copy", error)),
         }
     }
 }
 
 impl std::error::Error for Refused {}
+
+/// A copy that could not be made from the document, whatever the folder it was for would have said: the
+/// system's reason is none to give the writer, whose folder is not at fault.
+fn unmade(error: &dyn fmt::Display) -> Refused {
+    Refused::Failed(io::Error::other(error.to_string()))
+}
 
 /// Whether a copy in a format is a Letters document, which never takes the place of another.
 fn document(format: CopyFormat) -> bool {
@@ -123,7 +130,7 @@ pub fn write(
     replace: bool,
     linked: &Linked,
 ) -> Result<Option<String>, Refused> {
-    let file = fs::read(source).map_err(|error| Refused::Failed(error.to_string()))?;
+    let file = fs::read(source).map_err(|error| unmade(&error))?;
     put(file, output, format, replace, linked)
 }
 
@@ -138,7 +145,7 @@ pub fn write_version(
     replace: bool,
     linked: &Linked,
 ) -> Result<Option<String>, Refused> {
-    let failed = |error: &dyn fmt::Display| Refused::Failed(error.to_string());
+    let failed = unmade;
     let file = fs::read(source).map_err(|error| failed(&error))?;
     let mut package =
         Archive::open(Cursor::new(file)).and_then(|mut file| file.package()).map_err(|error| failed(&error))?;
@@ -163,7 +170,7 @@ fn put(
     replace: bool,
     linked: &Linked,
 ) -> Result<Option<String>, Refused> {
-    let failed = |error: &dyn fmt::Display| Refused::Failed(error.to_string());
+    let failed = unmade;
     let name = |path: &Path| path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let title = output.file_stem().unwrap_or_default().to_string_lossy();
     let taken = |path: &Path| match document(format) {
@@ -172,7 +179,7 @@ fn put(
     };
     let refused = |path: &Path, error: io::Error| match error.kind() {
         io::ErrorKind::AlreadyExists => taken(path),
-        _ => failed(&error),
+        _ => Refused::Failed(error),
     };
     let Some(to) = exported(format) else {
         // A document of its own has its own id: with this one's, the two would pass for one document

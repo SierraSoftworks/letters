@@ -130,7 +130,7 @@ pub enum Event {
     Planned(WindowId, PathBuf, Result<Box<Plan>, String>),
     /// A file of this name was brought in for a window and kept as a new document at this path, or could
     /// not be.
-    Imported(WindowId, String, Result<PathBuf, (Box<Plan>, String)>),
+    Imported(WindowId, String, Result<PathBuf, (Box<Plan>, std::io::Error)>),
     /// How far the person's clock is ahead of UTC, in minutes.
     Offset(i32),
     /// A picture a window's document links to, at this address, was fetched for this: its file, or why
@@ -2011,7 +2011,7 @@ impl DocWindow {
     }
 
     /// Saves to `home` on this thread, with the copy the window keeps for it.
-    fn exchange(&mut self, home: &Home, copy: &mut WorkingCopy, library: &Library) -> Result<(), String> {
+    fn exchange(&mut self, home: &Home, copy: &mut WorkingCopy, library: &Library) -> Result<(), files::Error> {
         if let Some(journal) = &mut self.journal {
             journal.saving();
         }
@@ -2022,7 +2022,7 @@ impl DocWindow {
             Err(error) => {
                 self.unheld();
                 self.catch_up(copy, &revision);
-                return Err(error.to_string());
+                return Err(error);
             }
         }
         Ok(())
@@ -2061,7 +2061,8 @@ impl DocWindow {
             Some(Err(error)) => {
                 self.save_failed = true;
                 self.retitle();
-                return Err(format!("{} could not be saved.\n\n{error}", self.name()));
+                eprintln!("letters: could not save {}: {error}", self.name());
+                return Err(error.unsaved(&self.name()));
             }
             // Nothing to write, though a name may have been due. A place that could not be made is retried.
             None if self.save_failed => return Err(format!("{} could not be saved.", self.name())),
@@ -2377,7 +2378,8 @@ impl App {
                     if let Some(path) = dialog.set_parent(&*window.window).save_file()
                         && let Err(error) = files::write_stylesheet(&path, &json)
                     {
-                        window.alert(&format!("The stylesheet could not be written.\n\n{error}"));
+                        eprintln!("letters: could not write {}: {error}", path.display());
+                        window.alert(&files::unwritten("The stylesheet", &error));
                     }
                 }
                 Request::Asset(name) => {
@@ -2539,7 +2541,7 @@ impl App {
         // else would give the document a file.
         for caret in [true, false] {
             if window.file().is_none() || window.unsaved() {
-                window.save_now(caret, &self.library, &mut self.journals).map_err(copies::Refused::Failed)?;
+                window.save_now(caret, &self.library, &mut self.journals).map_err(copies::Refused::Unsaved)?;
             }
         }
         let source = window.file().ok_or(copies::Refused::Nothing)?.to_owned();
@@ -3231,9 +3233,8 @@ impl App {
         if let Err(error) = trust::import(&mut self.trust, &plan.id, plan.source()) {
             // The card stays and says why, with the file's plan for another try.
             window.plan = Some(plan);
-            window.view.refuse_import(&format!(
-                "The file was not imported because the import could not be recorded: {error}."
-            ));
+            eprintln!("letters: the import could not be recorded: {error}");
+            window.view.refuse_import("The file was not imported because Letters could not record where it came from.");
             return window.sync(Instant::now());
         }
         // The card names the folders as it was given them.
@@ -3256,13 +3257,13 @@ impl App {
         event_loop: &ActiveEventLoop,
         id: WindowId,
         source: String,
-        kept: Result<PathBuf, (Box<Plan>, String)>,
+        kept: Result<PathBuf, (Box<Plan>, std::io::Error)>,
     ) {
         let path = match kept {
             Ok(path) => path,
             Err((plan, error)) => {
-                let folder = self.library.shown(&self.library.default_folder());
-                let why = format!("The document could not be saved in {folder}: {error}.");
+                eprintln!("letters: could not save what was imported from {source}: {error}");
+                let why = files::unwritten("The document", &error);
                 match self.windows.get_mut(&id) {
                     Some(window) if window.view.importing() => {
                         window.plan = Some(plan);

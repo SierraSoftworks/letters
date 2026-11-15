@@ -233,10 +233,10 @@ impl fmt::Display for Refused {
         match self {
             Self::NoName => f.write_str("A document needs a name."),
             Self::Taken(name) => write!(f, "There is already a document called \u{201c}{name}\u{201d} in that folder."),
-            Self::Io(error) => write!(f, "The document could not be moved: {error}."),
+            Self::Io(error) => write!(f, "The document could not be moved{}.", crate::files::because(error)),
             Self::NoFolderName => f.write_str("A folder needs a name."),
             Self::FolderTaken(name) => write!(f, "There is already a folder called \u{201c}{name}\u{201d} there."),
-            Self::NoFolder(error) => write!(f, "The folder could not be made: {error}."),
+            Self::NoFolder(error) => write!(f, "The folder could not be made{}.", crate::files::because(error)),
         }
     }
 }

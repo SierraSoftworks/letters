@@ -190,8 +190,10 @@ fn a_plan_whose_document_could_not_be_kept_makes_it_again() {
     // A file lies where the documents' folder should be.
     let taken = folder.write("Taken", "a file");
 
-    let refused = plan.clone().import(&choices).keep(&taken, "Animals");
-    assert!(refused.is_err_and(|why| !why.is_empty()), "nothing can be kept in a file");
+    let refused =
+        plan.clone().import(&choices).keep(&taken.join("Letters"), "Animals").expect_err("no folder is there");
+    let said = letters::files::unwritten("The document", &refused);
+    assert_eq!(said, "The document could not be saved because that folder does not exist.");
     let kept = plan.import(&choices).keep(&folder.0.join("Letters"), "Animals").expect("the plan is whole still");
 
     let opened = letters::files::open(&kept, Style::default).expect("what was kept opens as a document");

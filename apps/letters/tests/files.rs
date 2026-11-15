@@ -288,6 +288,42 @@ fn a_file_deleted_by_someone_else_is_written_back() {
 }
 
 #[test]
+fn what_the_system_refused_is_said_in_plain_words() {
+    use std::io::{Error, ErrorKind};
+    let cases = [
+        (ErrorKind::NotFound, "because that folder does not exist"),
+        (ErrorKind::NotADirectory, "because that folder does not exist"),
+        (ErrorKind::PermissionDenied, "because Letters may not write to that folder"),
+        (ErrorKind::ReadOnlyFilesystem, "because Letters may not write to that folder"),
+        (ErrorKind::StorageFull, "because the disk is full"),
+        (ErrorKind::AlreadyExists, "because a file with that name already exists"),
+    ];
+    for (kind, why) in cases {
+        let said = files::unwritten("The document", &Error::new(kind, "Whatever (os error 20)"));
+        assert_eq!(said, format!("The document could not be saved {why}."), "{kind:?}");
+    }
+    // Where the system has no reason a person can act on, its own words are for the log.
+    let unknown = Error::other("Input/output error (os error 5)");
+    assert_eq!(files::unwritten("The copy", &unknown), "The copy could not be saved.");
+}
+
+#[test]
+fn a_save_into_a_folder_that_is_gone_says_so() {
+    let folder = Folder::new("gone");
+    let path = folder.path("Away/Rates.let");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    write_full(&path, "Shared");
+    let (mut writer, home) = Writer::of(open(&path).unwrap());
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+    writer.write(&document("Mine"));
+    writer.copy.edit(&writer.model.save()).unwrap();
+    let refused = home.save(&mut writer.copy).expect_err("there is nowhere to write");
+
+    assert_eq!(refused.unsaved("Rates"), "Rates could not be saved because that folder does not exist.");
+}
+
+#[test]
 fn files_that_are_not_documents_are_refused_with_a_reason() {
     let folder = Folder::new("bad");
     let text = folder.path("plain.let");

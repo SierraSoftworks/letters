@@ -37,6 +37,43 @@ impl fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// Why `what` was not saved, as its writer is to read it.
+    pub fn unsaved(&self, what: &str) -> String {
+        match self {
+            Self::Io(error) => unwritten(what, error),
+            Self::Format(error) => format!("{what} could not be saved.\n\n{error}"),
+        }
+    }
+}
+
+/// Why the system would not write a file, make a folder or move one, to end a sentence a person reads:
+/// " because the disk is full", or nothing where there is no plain reason to give. The system's own
+/// words are never shown: where they are all there is, they go to the log.
+pub fn because(error: &io::Error) -> &'static str {
+    use io::ErrorKind::{
+        AlreadyExists, InvalidFilename, NotADirectory, NotFound, PermissionDenied, QuotaExceeded, ReadOnlyFilesystem,
+        StorageFull,
+    };
+    match error.kind() {
+        NotFound | NotADirectory => " because that folder does not exist",
+        PermissionDenied | ReadOnlyFilesystem => " because Letters may not write to that folder",
+        StorageFull | QuotaExceeded => " because the disk is full",
+        AlreadyExists => " because a file with that name already exists",
+        InvalidFilename => " because that name cannot be used for a file",
+        _ => {
+            eprintln!("letters: a file could not be written: {error}");
+            ""
+        }
+    }
+}
+
+/// Why `what` could not be saved, as a person is to read it: "The document could not be saved because the
+/// disk is full." One wording for a save, a copy, an export and an import.
+pub fn unwritten(what: &str, error: &io::Error) -> String {
+    format!("{what} could not be saved{}.", because(error))
+}
+
 impl std::error::Error for Error {}
 
 impl From<io::Error> for Error {
@@ -135,10 +172,15 @@ impl Home {
     /// cannot be merged is left alone: the document goes to a conflict copy beside it, which becomes its home.
     pub fn save(&self, copy: &mut WorkingCopy) -> Result<(Home, Saved), Error> {
         let name = self.path.file_name().unwrap_or_default().to_string_lossy();
-        let mut folder = Folder(folder_of(&self.path).to_owned());
+        let mut folder = Folder::new(folder_of(&self.path));
         let today = &platform::now_rfc3339()[..10];
         let save = Save { name: &name, token: &platform::block_id(), label: today, attempts: 3 };
-        let saved = letters_format::save(&mut folder, copy, &save)?;
+        let saved =
+            letters_format::save(&mut folder, copy, &save).map_err(|error| match (error, folder.failed.take()) {
+                // The save keeps only the words of what the folder refused. The folder knows what it was.
+                (letters_format::Error::Files(_), Some(failed)) => Error::Io(failed),
+                (error, _) => Error::Format(error),
+            })?;
         let path = match &saved {
             Saved::ConflictCopy { name, .. } => self.path.with_file_name(name),
             _ => self.path.clone(),
@@ -255,11 +297,23 @@ fn folder_of(path: &Path) -> &Path {
 }
 
 /// A real folder, for `letters_format::save` and for journals.
-pub(crate) struct Folder(PathBuf);
+pub(crate) struct Folder {
+    path: PathBuf,
+    /// What the system last refused here, for whoever asks why a save failed.
+    failed: Option<io::Error>,
+}
 
 impl Folder {
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
-        Self(path.into())
+        Self { path: path.into(), failed: None }
+    }
+
+    /// Notes a refusal on its way out.
+    fn noted<T>(&mut self, done: io::Result<T>) -> io::Result<T> {
+        if let Err(error) = &done {
+            self.failed = Some(io::Error::new(error.kind(), error.to_string()));
+        }
+        done
     }
 }
 
@@ -274,38 +328,56 @@ fn found<T>(result: io::Result<T>) -> io::Result<Option<T>> {
 
 impl Files for Folder {
     fn stamp(&mut self, name: &str) -> io::Result<Option<Stamp>> {
-        let Some(metadata) = found(fs::metadata(self.0.join(name)))? else { return Ok(None) };
-        let modified = metadata.modified()?.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_nanos() as u64);
-        Ok(Some(Stamp { len: metadata.len(), modified }))
+        let stamp = |path: &Path| {
+            let Some(metadata) = found(fs::metadata(path))? else { return Ok(None) };
+            let modified = metadata.modified()?.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_nanos() as u64);
+            Ok(Some(Stamp { len: metadata.len(), modified }))
+        };
+        let stamp = stamp(&self.path.join(name));
+        self.noted(stamp)
     }
 
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
-        found(fs::read(self.0.join(name)))
+        let read = found(fs::read(self.path.join(name)));
+        self.noted(read)
     }
 
     fn write(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
-        let mut file = fs::File::create(self.0.join(name))?;
-        file.write_all(bytes)?;
-        file.sync_all()
+        let write = |path: &Path| {
+            let mut file = fs::File::create(path)?;
+            file.write_all(bytes)?;
+            file.sync_all()
+        };
+        let written = write(&self.path.join(name));
+        self.noted(written)
     }
 
     fn append(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
-        let mut file = fs::OpenOptions::new().append(true).create(true).open(self.0.join(name))?;
-        file.write_all(bytes)?;
-        file.sync_data()
+        let append = |path: &Path| {
+            let mut file = fs::OpenOptions::new().append(true).create(true).open(path)?;
+            file.write_all(bytes)?;
+            file.sync_data()
+        };
+        let appended = append(&self.path.join(name));
+        self.noted(appended)
     }
 
     fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
-        let (from, to) = (self.0.join(from), self.0.join(to));
-        // The new file takes over the permissions of the one it replaces.
-        if let Ok(replaced) = fs::metadata(&to) {
-            fs::set_permissions(&from, replaced.permissions())?;
-        }
-        fs::rename(from, to)
+        let (from, to) = (self.path.join(from), self.path.join(to));
+        let rename = || {
+            // The new file takes over the permissions of the one it replaces.
+            if let Ok(replaced) = fs::metadata(&to) {
+                fs::set_permissions(&from, replaced.permissions())?;
+            }
+            fs::rename(&from, &to)
+        };
+        let renamed = rename();
+        self.noted(renamed)
     }
 
     fn remove(&mut self, name: &str) -> io::Result<()> {
-        fs::remove_file(self.0.join(name))
+        let removed = fs::remove_file(self.path.join(name));
+        self.noted(removed)
     }
 
     fn wait(&mut self, retry: u32) {
