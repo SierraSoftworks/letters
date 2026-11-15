@@ -243,6 +243,7 @@ async fn fetch_picture(
     Path(id): Path<String>,
     Json(fetch): Json<Fetch>,
 ) -> Answer<Response> {
+    app.fetching(&who)?;
     let turn = app.fetches.turn().await?;
     let fetched = blocking(move || {
         let _turn = turn;
@@ -265,6 +266,7 @@ async fn fetch_preview(
     Path(id): Path<String>,
     Json(fetch): Json<Fetch>,
 ) -> Answer<Json<Preview>> {
+    app.fetching(&who)?;
     let turn = app.fetches.turn().await?;
     blocking(move || {
         let _turn = turn;

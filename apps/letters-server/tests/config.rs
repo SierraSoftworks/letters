@@ -17,6 +17,7 @@ fn sound_settings_are_read_with_their_defaults() {
     assert_eq!(config.auth.oidc.groups_claim, "groups");
     assert!(config.auth.oidc.scopes.iter().any(|scope| scope == "openid"));
     assert!(!config.links.enabled, "links are off until the owner turns them on");
+    assert!(config.server.proxies.iter().all(|proxy| proxy.is_loopback()), "only this machine speaks for others");
     let ids: Vec<String> = config.spaces.iter().map(|space| space.id()).collect();
     assert_eq!(ids, ["home", "family"]);
     assert!(config.spaces[0].personal() && !config.spaces[1].personal());
@@ -52,13 +53,14 @@ fn the_clients_secret_is_read_from_the_settings_or_from_a_file() {
 #[test]
 fn settings_that_cannot_be_run_with_say_why() {
     // What is changed in sound settings, and a word the refusal must hold.
-    let cases: [(&str, &str, &str); 11] = [
+    let cases: [(&str, &str, &str); 12] = [
         ("editors = [\"family\"]", "editor = [\"family\"]", "editor"),
         ("url = \"https://letters.example.test\"", "url = \"http://letters.example.test\"", "TLS"),
         ("url = \"https://letters.example.test\"", "url = \"https://letters.example.test/app\"", "host"),
         ("issuer = \"https://id.example.test\"", "issuer = \"ftp://id.example.test\"", "https://"),
         ("client_id = \"letters\"", "client_id = \"\"", "client_id"),
         ("client_id = \"letters\"", "client_id = \"letters\"\nscopes = [\"profile\"]", "openid"),
+        ("name = \"Test\"", "name = \"Test\"\nproxies = [\"the proxy\"]", "proxies"),
         ("name = \"Family\"", "name = \"home\"", "two spaces"),
         ("name = \"Family\"", "name = \"!!\"", "letter"),
         ("path = '/srv/letters/family'", "path = \"family\"", "root"),

@@ -101,3 +101,24 @@ readers = ["friends"]
 - **Reach.** Everyone who signs in reaches both machines on port 443, and the server's machine reaches the
   provider. A tailnet's first policy allows all of it, and a stricter one grants it.
 - **Check.** `letters-server --check` reads the settings and says what is wrong with them.
+
+## Share links
+
+Links are off until the settings turn them on. A link opens one document for whoever holds its address,
+with no sign-in.
+
+```toml
+[links]
+enabled = true
+```
+
+- **Inside.** With nothing more, a link works for devices on the tailnet: `tailscale serve` reaches nobody
+  else.
+- **Outside.** `tailscale funnel --bg 8080` in place of `tailscale serve` puts the same address on the
+  internet, once the tailnet policy gives the machine the `funnel` attribute under `nodeAttrs`. The whole
+  server is then asked from outside. Signing in still needs the provider, which only the tailnet reaches,
+  but a browser or an app that is signed in already stays so wherever it is.
+- **Addresses.** A link's page counts tries by the visitor's address. `tailscale serve` and `funnel` name
+  it in `X-Forwarded-For`, and the server takes that word only from the proxies its settings name:
+  `proxies` under `[server]`, which is this machine (`127.0.0.1` and `::1`) unless set. A proxy on another
+  machine is named there by its address, or every visitor counts as one.

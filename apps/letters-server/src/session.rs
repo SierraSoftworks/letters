@@ -200,6 +200,8 @@ pub struct Linked {
     pub alone: bool,
     /// When the visit that let the browser in is over: the link's own end, or sooner.
     pub ends: u64,
+    /// Whether the document was taken out of safe mode in this visit.
+    pub trusted: bool,
 }
 
 /// Whoever a request about one document comes from: someone signed in, or someone a link let in to that

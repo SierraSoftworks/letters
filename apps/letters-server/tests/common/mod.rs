@@ -127,7 +127,17 @@ impl Server {
 
     /// A server whose owner lets links be made.
     pub fn linking(name: &str) -> Self {
-        let linking = |at: &Path| format!("{}\n[links]\nenabled = true\n", sound(at));
+        Self::behind(name, None)
+    }
+
+    /// A server that makes links, and takes the word of `proxies` for where a request came from. `None`
+    /// leaves that as the settings have it unasked.
+    pub fn behind(name: &str, proxies: Option<&[&str]>) -> Self {
+        let named = proxies.map(|proxies| format!("[server]\nproxies = {proxies:?}"));
+        let linking = |at: &Path| {
+            let settings = format!("{}\n[links]\nenabled = true\n", sound(at));
+            named.as_ref().map_or(settings.clone(), |named| settings.replacen("[server]", named, 1))
+        };
         Self::over(Scratch::new(name), &linking, |app| app)
     }
 

@@ -72,6 +72,10 @@ struct Visit {
     leads: Leads,
     /// When the link is to be followed again.
     ends: u64,
+    /// Whether whoever sits at the browser took the document out of safe mode. A link is passed on, so
+    /// one holder of it does not decide for the next.
+    #[serde(default)]
+    trusted: bool,
 }
 
 /// By the hash of the secret in the browser's cookie.
@@ -90,7 +94,8 @@ const MOST_COOKIES: usize = 8;
 /// How often the visits that are over are cleared away.
 const SWEEP: u64 = 60 * 60;
 /// What one address may spend on following links each minute: a look at a link costs 1 and a try at a
-/// passphrase [`TRY`], which makes five tries a minute.
+/// passphrase [`TRY`], which makes five tries a minute. A visit may ask the server for as many pictures
+/// and previews a minute, so that one link does not take up the fetches everyone shares.
 const PER_MINUTE: u32 = 30;
 const TRY: u32 = 6;
 /// How many addresses are counted before the ones of minutes past are forgotten.
@@ -143,21 +148,30 @@ pub struct Caller {
     pub address: String,
 }
 
-impl<S: Sync> FromRequestParts<S> for Caller {
-    type Rejection = Infallible;
-
-    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Infallible> {
-        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|connected| connected.0.ip());
-        // What stands in front of the server on its own machine, as `tailscale serve` does, says last who
-        // it asks for. Anything else that says so is not believed.
+impl Caller {
+    /// Where the request in `parts` came from.
+    pub fn of(parts: &Parts, app: &App) -> Self {
+        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|connected| connected.0.ip().to_canonical());
+        // A proxy the settings name, as `tailscale serve` on this machine is unless they say otherwise,
+        // says last who it asks for. Anything else that says so is not believed.
         let said = parts.headers.get("x-forwarded-for").and_then(|value| value.to_str().ok());
         let forwarded = said.and_then(|said| said.rsplit(',').next()).map(str::trim).filter(|said| !said.is_empty());
         let address = match (peer, forwarded) {
-            (Some(peer), Some(forwarded)) if peer.is_loopback() => forwarded.chars().take(64).collect(),
+            (Some(peer), Some(forwarded)) if app.config.server.proxies.contains(&peer) => {
+                forwarded.chars().take(64).collect()
+            }
             (Some(peer), _) => peer.to_string(),
             (None, _) => String::new(),
         };
-        Ok(Self { address })
+        Self { address }
+    }
+}
+
+impl FromRequestParts<Shared> for Caller {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Infallible> {
+        Ok(Self::of(parts, app))
     }
 }
 
@@ -328,7 +342,7 @@ impl App {
         }
         let secret = secret();
         let ends = kept.link.expires.map_or(now + STAYS, |expires| expires.min(now + STAYS));
-        self.store.put(&VISITS, &hashed(&secret), &Visit { leads: leads.clone(), ends })?;
+        self.store.put(&VISITS, &hashed(&secret), &Visit { leads: leads.clone(), ends, trusted: false })?;
         self.sweep(now);
         let cookie = format!("{COOKIE}{}", leads.link);
         Ok(Door::Open { document: leads.document, cookie, secret, life: ends - now })
@@ -355,7 +369,7 @@ impl App {
         let named = cookies(headers).filter(|(name, _)| name.starts_with(COOKIE)).take(MOST_COOKIES);
         for (name, secret) in named.filter(|_| self.config.links.enabled) {
             let visit = hashed(secret);
-            let Ok(Some(Visit { leads, ends })) = self.store.get(&VISITS, &visit) else { continue };
+            let Ok(Some(Visit { leads, ends, trusted })) = self.store.get(&VISITS, &visit) else { continue };
             if leads.document != id || ends <= now || name.strip_prefix(COOKIE) != Some(leads.link.as_str()) {
                 continue;
             }
@@ -363,11 +377,28 @@ impl App {
             let Ok(Some(kept)) = self.store.get(&LINKS, &key) else { continue };
             if kept.live(now) {
                 let (document, root) = (leads.document, leads.root);
-                let linked = Linked { link: kept.link, document, root, alone: false, ends };
+                let linked = Linked { link: kept.link, document, root, alone: false, ends, trusted };
                 return Some(Guest { linked, secret: secret.to_owned(), visit });
             }
         }
         None
+    }
+
+    /// Whoever sits at the browser of the visit `visit` trusts its document, until the visit is over.
+    pub(crate) fn trust_visit(&self, visit: &str) -> Answer<()> {
+        Ok(self.store.write(|batch| match batch.get(&VISITS, visit)? {
+            Some(seen) => batch.put(&VISITS, visit, &Visit { trusted: true, ..seen }),
+            None => Ok(()),
+        })?)
+    }
+
+    /// Counts a picture or a preview the server is asked to fetch. Whoever only a link let in may ask for
+    /// so many a minute in one visit.
+    pub(crate) fn fetching(&self, who: &Signed) -> Answer<()> {
+        if who.alone() && !self.doors.spend(&format!("visit {}", who.session), 1, self.now()) {
+            return Err(Refusal::new(Code::Slow, "Too many pictures and previews at once. Wait a minute."));
+        }
+        Ok(())
     }
 
     /// Where the file of a link's document is, while it is in the folder the link was made in.
