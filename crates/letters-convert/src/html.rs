@@ -59,6 +59,8 @@ pub type Assets<'a> = &'a mut dyn FnMut(&str) -> Option<Vec<u8>>;
 ///   the class `rtl`, whose first block does.
 /// - A table of contents is a line for each heading it lists, which leads to the heading. A link preview
 ///   is a card that is one link, with its picture written in. Both are set as layout draws them.
+/// - A link in the text whose page was fetched says the page's title to whoever points at it. What else
+///   was fetched of the page is left out.
 /// - An unknown block is written as its fallback text. Unknown marks and fields are left out.
 pub fn to_html(doc: &Document, style: &Style, title: &str, assets: Assets) -> String {
     to_html_with(doc, style, title, assets, &HtmlPage::default())
@@ -142,7 +144,13 @@ pub fn to_html_with(doc: &Document, style: &Style, title: &str, assets: Assets, 
     let sizes = [size("body"), size("heading1"), size("heading2"), size("heading3"), size("heading4")];
     let figures = Some(Figures::of(doc, style));
     let contents = Some(Contents::of(doc));
-    let mut writing = Writing { assets, maths: Some(sizes), window: page.window.is_some(), figures, contents };
+    let said = |(url, preview): (&String, &letters_model::Preview)| {
+        let title = preview.title.as_deref().map(str::trim).filter(|title| !title.is_empty())?;
+        Some((url.clone(), title.to_owned()))
+    };
+    let titles = doc.previews.iter().filter_map(said).collect();
+    let window = page.window.is_some();
+    let mut writing = Writing { assets, maths: Some(sizes), window, figures, contents, titles };
     blocks(&doc.blocks, &mut writing, &mut out);
     out.push_str("</article>\n</body>\n</html>\n");
     out
@@ -153,7 +161,14 @@ pub fn to_html_with(doc: &Document, style: &Style, title: &str, assets: Assets, 
 /// between `\(` and `\)`, or `\[` and `\]` for a formula, for whatever takes the paste to set.
 pub fn to_html_fragment(blocks: &[Block]) -> String {
     let mut out = String::new();
-    let mut writing = Writing { assets: &mut |_| None, maths: None, window: false, figures: None, contents: None };
+    let mut writing = Writing {
+        assets: &mut |_| None,
+        maths: None,
+        window: false,
+        figures: None,
+        contents: None,
+        titles: BTreeMap::new(),
+    };
     self::blocks(blocks, &mut writing, &mut out);
     out
 }
@@ -173,13 +188,16 @@ struct Writing<'a> {
     /// The document's tables of contents, on a page whose lines can lead to their headings. `None` leaves a
     /// table out and writes a link preview as its link.
     contents: Option<Contents>,
+    /// The title of the page each link leads to, by the link's address, where one was fetched. A link
+    /// shows it to whoever points at it, which is all of a preview that a page has a place for.
+    titles: BTreeMap<String, String>,
 }
 
 impl Writing<'_> {
     /// What the text of a heading of `level` is written with, or other text for level 0.
     fn text(&self, level: u8) -> Line<'_> {
         let maths = self.maths.map(|sizes| sizes[usize::from(level.min(4))]);
-        Line { maths, figures: self.figures.as_ref() }
+        Line { maths, figures: self.figures.as_ref(), titles: &self.titles }
     }
 }
 
@@ -189,6 +207,7 @@ struct Line<'a> {
     /// The size maths in the line is typeset at. `None` writes it as its source.
     maths: Option<f32>,
     figures: Option<&'a Figures>,
+    titles: &'a BTreeMap<String, String>,
 }
 
 /// What the numbers of a document's figures read as. A document does not store them: they follow from the
@@ -825,6 +844,10 @@ fn inline(runs: &[Run], line: Line, out: &mut String) {
         if let Some(address) = &address {
             out.push_str("<a href=\"");
             escape(address, out);
+            if let Some(title) = first.link.as_ref().and_then(|link| line.titles.get(link)) {
+                out.push_str("\" title=\"");
+                escape(title, out);
+            }
             out.push_str("\">");
         }
         for run in linked.iter().filter(|run| !run.text.is_empty()) {

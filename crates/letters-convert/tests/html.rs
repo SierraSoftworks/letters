@@ -781,3 +781,21 @@ fn a_list_item_and_a_quote_that_read_from_the_right_stand_at_the_right() {
     // A copy says the side too, for whatever it is pasted into.
     assert!(to_html_fragment(&document("- שלום\n").blocks).contains("<li dir=\"rtl\">"));
 }
+
+#[test]
+fn a_link_says_the_title_of_the_page_it_leads_to() {
+    let link = |text: &str, url: &str| Run { link: Some(url.into()), ..Run::plain(text) };
+    let mut text = Block::new("p", BlockKind::Paragraph);
+    text.body = Body::Text(vec![link("rates", "https://example.com/rates"), link("fees", "https://example.com/fees")]);
+    let fetched = letters_model::Preview { title: Some("Rates \"2027\"".into()), ..Default::default() };
+    let previews = [("https://example.com/rates".to_owned(), fetched)];
+    let doc = Document { blocks: vec![text], previews: previews.into(), ..Document::default() };
+
+    let article = article(&export(&doc));
+    assert!(
+        article.contains("<a href=\"https://example.com/rates\" title=\"Rates &quot;2027&quot;\">rates</a>"),
+        "{article}"
+    );
+    assert!(article.contains("<a href=\"https://example.com/fees\">fees</a>"), "nothing was fetched of it: {article}");
+    assert!(!to_html_fragment(&doc.blocks).contains("title="), "a copy has the link alone");
+}
