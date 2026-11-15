@@ -200,7 +200,7 @@ impl Editor {
         }
         // The caret lands on the near side of any marker at its new place: it keeps the paired marks of
         // the character it crossed, or none when it came from another block.
-        let Some(block) = self.block(&target.block).filter(|block| !text::is_code(block)) else {
+        let Some(block) = self.block(&target.block).filter(|block| !text::is_source(block)) else {
             return self.place_with(target, BTreeSet::new());
         };
         let paired = |mark: &&Mark| PAIRED.contains(mark);

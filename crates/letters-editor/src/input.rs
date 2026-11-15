@@ -71,7 +71,8 @@ impl Editor {
 
     /// Inserts text that may hold line breaks. Outside code each one starts a new block, as Enter does.
     pub(crate) fn insert_lines(&mut self, text: &str, platform: &mut dyn Platform) {
-        let code = self.selection().and_then(|selection| self.block(&selection.head.block)).is_some_and(text::is_code);
+        let code =
+            self.selection().and_then(|selection| self.block(&selection.head.block)).is_some_and(text::is_source);
         if code || !text.contains('\n') {
             return self.insert(text);
         }

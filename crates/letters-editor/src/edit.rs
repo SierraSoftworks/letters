@@ -27,7 +27,7 @@ impl Editor {
             (at, offset)
         };
         let Some(block) = self.block(&start.block) else { return };
-        let marks = if text::is_code(block) { BTreeSet::new() } else { caret.marks.clone() };
+        let marks = if text::is_source(block) { BTreeSet::new() } else { caret.marks.clone() };
         // Typed text joins a link only from inside it, so a link does not grow from its edges.
         let runs = block.body.runs();
         let before = start.offset.checked_sub(1).and_then(|at| text::run_at(runs, at)).and_then(|run| run.link.clone());
@@ -280,7 +280,7 @@ impl Editor {
         let (Some(block), Some(place)) = (doc.block(&head.block), tree::place(doc, &head.block)) else {
             return false;
         };
-        let code = text::is_code(block);
+        let code = text::is_source(block);
         let outermost = |place: &tree::Place| match down {
             true => place.index + 1 == place.siblings(doc).len(),
             false => place.index == 0,
@@ -322,7 +322,7 @@ impl Editor {
     /// Puts the caret below everything: at the end of the text the document ends in, or on a line made
     /// after a last block that would hold the caret in or cannot hold one.
     pub(crate) fn line_below(&mut self, platform: &mut dyn Platform) {
-        if let Some(last) = self.doc().blocks.last().filter(|last| tree::is_text(last) && !text::is_code(last)) {
+        if let Some(last) = self.doc().blocks.last().filter(|last| tree::is_text(last) && !text::is_source(last)) {
             return self.place(Pos::new(last.id.clone(), text::len(last)));
         }
         let new = BlockId::new(platform.new_id());
@@ -332,10 +332,31 @@ impl Editor {
         }
     }
 
+    /// Steps out of the formula the caret is in: past inline maths, or to the line below a formula block.
+    pub(crate) fn leave_formula(&mut self, platform: &mut dyn Platform) {
+        let Some((id, source)) = self.formula().map(|(id, source)| (id.clone(), source)) else { return };
+        let Some(mut marks) = self.caret.as_ref().map(|caret| caret.marks.clone()) else { return };
+        let end = Pos::new(id, source.end);
+        if !self.block(&end.block).is_some_and(text::is_source) {
+            marks.remove(&Mark::Math);
+            return self.place_with(end, marks);
+        }
+        self.place(end.clone());
+        match self.target(&end, Motion::Right, &mut None, platform) {
+            next if next == end => _ = self.open(true, platform),
+            next => self.place(next),
+        }
+    }
+
     /// Breaks the block at the caret, as Enter does.
     pub(crate) fn split(&mut self, platform: &mut dyn Platform) -> Kind {
         self.delete_selection();
         let Some(caret) = self.caret.clone() else { return Kind::Other };
+        if caret.marks.contains(&Mark::Math) && self.formula().is_some() {
+            // A formula is not broken in two. Enter says it is done.
+            self.leave_formula(platform);
+            return Kind::Other;
+        }
         let at = caret.selection.head.clone();
         let doc = self.doc();
         let (Some(block), Some(place)) = (doc.block(&at.block), tree::place(doc, &at.block)) else {
@@ -346,9 +367,9 @@ impl Editor {
         let paragraph = BlockKind::Paragraph;
 
         match &block.kind {
-            BlockKind::Code { .. } if at_end && rules::closes(&text) => {
-                // A closing fence ends the code block as it does in Markdown. An empty line does not,
-                // because code has empty lines of its own.
+            BlockKind::Code { .. } | BlockKind::Formula if at_end && rules::closes(&block.kind, &text) => {
+                // A closing fence ends code or a formula as it does in Markdown. An empty line does not,
+                // because source has empty lines of its own.
                 let new = BlockId::new(platform.new_id());
                 let fence = text.rfind('\n').unwrap_or(0)..text.len();
                 let after = Op::InsertBlock {
@@ -361,13 +382,14 @@ impl Editor {
                 self.rule = true;
                 return Kind::Rule;
             }
-            BlockKind::Code { .. } => {
+            BlockKind::Code { .. } | BlockKind::Formula => {
                 self.insert("\n");
                 return Kind::Other;
             }
             BlockKind::Paragraph if at_end => {
-                if let Some(language) = rules::fence(&text) {
-                    let kind = BlockKind::Code { language };
+                // A fence opens code, and `$$` a formula.
+                let code = rules::fence(&text).map(|language| BlockKind::Code { language });
+                if let Some(kind) = code.or_else(|| (text == "$$").then_some(BlockKind::Formula)) {
                     let clear = Op::DeleteText { block: id.clone(), range: 0..text.len() };
                     self.apply(vec![clear, Op::SetKind { block: id.clone(), kind }]);
                     self.place(Pos::new(id, 0));
@@ -421,7 +443,7 @@ impl Editor {
         let head = caret.selection.head.clone();
         let doc = self.doc();
         let Some(block) = doc.block(&head.block) else { return };
-        if text::is_code(block) {
+        if text::is_source(block) {
             if deeper {
                 return self.insert(CODE_INDENT);
             }
@@ -483,7 +505,7 @@ impl Editor {
             return;
         }
         let doc = self.doc();
-        let prose = |id: &BlockId| doc.block(id).filter(|block| !text::is_code(block));
+        let prose = |id: &BlockId| doc.block(id).filter(|block| !text::is_source(block));
         let pieces: Vec<_> = self.pieces(&caret.selection).into_iter().filter(|(id, _)| prose(id).is_some()).collect();
         let marked = |(id, range): &(BlockId, Range<usize>)| {
             let runs = prose(id).map_or(&[][..], |block| block.body.runs());

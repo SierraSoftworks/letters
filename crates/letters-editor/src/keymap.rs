@@ -86,6 +86,7 @@ impl Keymap {
             (Key::Enter, NONE, Command::Split),
             (Key::Enter, SHIFT, Command::LineBreak),
             (Key::Enter, PRIMARY, Command::ToggleChecked),
+            (Key::Escape, NONE, Command::LeaveFormula),
             (Key::Tab, NONE, Command::Indent),
             (Key::Tab, SHIFT, Command::Outdent),
             (Key::Char('b'), PRIMARY, Command::ToggleMark(Mark::Bold)),

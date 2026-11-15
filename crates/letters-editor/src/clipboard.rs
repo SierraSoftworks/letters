@@ -191,7 +191,8 @@ impl Editor {
             return;
         }
         let Some(selection) = self.selection() else { return };
-        let code = self.block(&selection.head.block).is_some_and(text::is_code);
+        // Source takes text as it is written: code, and a formula's TeX.
+        let code = self.block(&selection.head.block).is_some_and(text::is_source) || self.formula().is_some();
         let ranged = !selection.is_caret();
         let address = clip.text.trim();
         if !plain && !code && ranged && is_address(address) {

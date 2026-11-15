@@ -21,8 +21,8 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 
 use letters_model::{
-    Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, OpError, Page, Pos, ReplicaId, Selection,
-    Style, TextStyle,
+    Block, BlockId, BlockKind, Change, Document, ListKind, Mark, Model, Op, OpError, Page, Pos, ReplicaId, Run,
+    Selection, Style, TextStyle,
 };
 
 pub use keymap::Keymap;
@@ -117,8 +117,11 @@ pub enum Command {
     /// Puts the caret below everything, as a click under the last block asks. It goes to the end of the
     /// body text, heading or list item the document ends in. After anything else an empty line is made for it.
     LineBelow,
-    /// Breaks the block at the caret, as Enter does.
+    /// Breaks the block at the caret, as Enter does. Inside inline maths it leaves the formula instead.
     Split,
+    /// Steps out of the formula the caret is in, as Esc does: to just after inline maths, or to the line
+    /// below a formula block, which is made when there is none.
+    LeaveFormula,
     /// A line break that stays inside the block.
     LineBreak,
     /// Nests list items one level deeper, or steps a line of code in.
@@ -358,6 +361,29 @@ impl Editor {
         if caret.selection.is_caret() { before.or(after) } else { after }
     }
 
+    /// The formula the caret or the selection is in: its block and where in it the TeX source sits. A formula
+    /// block is all source. A caret at either end of inline maths is in it only when text typed there
+    /// would be, which [`Editor::marks`] also says.
+    pub fn formula(&self) -> Option<(&BlockId, Range<usize>)> {
+        let caret = self.caret.as_ref()?;
+        let (start, end) = self.ordered(&caret.selection);
+        let block = self.doc().block(&start.block).filter(|_| start.block == end.block)?;
+        if block.kind == BlockKind::Formula {
+            return Some((&block.id, 0..text::len(block)));
+        }
+        let runs = block.body.runs();
+        let maths = |run: &Run| run.marks.contains(&Mark::Math);
+        let inside = match caret.selection.is_caret() {
+            true => caret.marks.contains(&Mark::Math),
+            false => text::runs_in(runs, start.offset..end.offset).all(maths),
+        };
+        let before = text::marks_before(runs, start.offset).contains(&Mark::Math);
+        let after = text::marks_after(runs, end.offset).contains(&Mark::Math);
+        let from = if before { text::stretch_start(runs, start.offset, maths) } else { start.offset };
+        let to = if after { text::stretch_end(runs, end.offset, maths) } else { end.offset };
+        inside.then_some((&block.id, from..to))
+    }
+
     /// The text an input method is composing: its block and where in it the text sits.
     pub fn composition(&self) -> Option<(&BlockId, Range<usize>)> {
         let composing = self.composing.as_ref()?;
@@ -411,9 +437,10 @@ impl Editor {
             Command::ToggleChecked => {
                 matches!(kind, Some(BlockKind::ListItem { list: ListKind::Task { .. }, .. }))
             }
-            Command::ToggleMark(_) => ranged || !matches!(kind, Some(BlockKind::Code { .. })),
+            Command::ToggleMark(_) => ranged || !matches!(kind, Some(BlockKind::Code { .. } | BlockKind::Formula)),
             Command::SetLink(_) => ranged || self.link().is_some(),
             Command::Copy | Command::Cut => ranged,
+            Command::LeaveFormula => self.formula().is_some(),
             Command::Undo => self.can_undo(),
             Command::Redo => self.can_redo(),
             _ => true,
@@ -440,6 +467,7 @@ impl Editor {
             }
             Command::LineBelow => self.line_below(platform),
             Command::Split => kind = self.split(platform),
+            Command::LeaveFormula => self.leave_formula(platform),
             Command::LineBreak => self.insert("\n"),
             Command::Indent => self.indent(true),
             Command::Outdent => self.indent(false),
@@ -636,7 +664,7 @@ impl Editor {
     /// block the caret sits before any opening marker, so only marks that show no marker carry over from the
     /// first character. Code blocks carry none.
     fn natural(&self, pos: &Pos) -> BTreeSet<Mark> {
-        let Some(block) = self.block(&pos.block).filter(|block| !text::is_code(block)) else {
+        let Some(block) = self.block(&pos.block).filter(|block| !text::is_source(block)) else {
             return BTreeSet::new();
         };
         let runs = block.body.runs();
@@ -652,7 +680,7 @@ impl Editor {
             self.natural(&selection.head)
         } else {
             let (start, _) = self.ordered(&selection);
-            let block = self.block(&start.block).filter(|block| !text::is_code(block));
+            let block = self.block(&start.block).filter(|block| !text::is_source(block));
             block.map(|block| text::marks_after(block.body.runs(), start.offset)).unwrap_or_default()
         };
         self.caret = Some(Caret { selection, marks });

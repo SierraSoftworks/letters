@@ -10,7 +10,7 @@ use letters_model::{Block, BlockId, BlockKind, Mark, Marker, Markers, Tone};
 use crate::{Editor, text, tree};
 
 /// The marks that show a pair of markers, outermost first.
-pub(crate) const PAIRED: [Mark; 4] = [Mark::Bold, Mark::Italic, Mark::Strike, Mark::Code];
+pub(crate) const PAIRED: [Mark; 5] = [Mark::Bold, Mark::Italic, Mark::Strike, Mark::Code, Mark::Math];
 
 fn delimiter(mark: &Mark) -> &'static str {
     match mark {
@@ -18,6 +18,7 @@ fn delimiter(mark: &Mark) -> &'static str {
         Mark::Italic => "*",
         Mark::Strike => "~~",
         Mark::Code => "`",
+        Mark::Math => "$",
         _ => "",
     }
 }
@@ -32,9 +33,9 @@ pub(crate) struct Sides {
 }
 
 impl Sides {
-    /// Code blocks show their text as written, so nothing in one is a marker.
+    /// Code and formula blocks show their text as written, so nothing in one is a marker.
     pub fn at(block: &Block, offset: usize) -> Self {
-        if text::is_code(block) {
+        if text::is_source(block) {
             return Self { left: BTreeSet::new(), right: BTreeSet::new() };
         }
         let runs = block.body.runs();
@@ -78,7 +79,7 @@ impl Editor {
         let head = &caret.selection.head;
         let Some(block) = self.block(&head.block) else { return Markers::default() };
         let mut markers = Markers { block: self.block_marker(block), ..Markers::default() };
-        if !caret.selection.is_caret() || text::is_code(block) {
+        if !caret.selection.is_caret() || text::is_source(block) {
             return markers;
         }
 

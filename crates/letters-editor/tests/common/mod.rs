@@ -1,10 +1,10 @@
 //! Shared fixtures: a scripted editor, and a one-line-per-block notation for documents with a selection.
 //!
-//! Each line is a block: a kind (`p`, `h1` to `h4`, `ul`, `ol`, `todo`, `done`, `code`, `code:rust`, `hr`) and
-//! its text. Two spaces before the kind nest a list item one level. `> ` puts the block in a quote, and
-//! `tip> `, `info> `, `warn> ` or `danger> ` in a callout. In the text, `**`, `*`, `~~`, `` ` ``, `__` and `==`
-//! switch bold, italic, strike, code, underline and highlight, `[text](address)` is a link, `⏎` is a line
-//! break, `|` is the caret and `^` the other end of a selection. A backslash makes the next character text.
+//! Each line is a block: a kind (`p`, `h1` to `h4`, `ul`, `ol`, `todo`, `done`, `code`, `code:rust`, `formula`,
+//! `hr`) and its text. Two spaces before the kind nest a list item one level. `> ` puts the block in a quote, and
+//! `tip> `, `info> `, `warn> ` or `danger> ` in a callout. In the text, `**`, `*`, `~~`, `` ` ``, `__`, `==` and
+//! `$` switch bold, italic, strike, code, underline, highlight and maths, `[text](address)` is a link, `⏎` is a
+//! line break, `|` is the caret and `^` the other end of a selection. A backslash makes the next character text.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
@@ -16,15 +16,16 @@ use letters_model::{
 use proptest::prelude::*;
 
 /// The marks the notation can write, with their switches. Longer switches come first so they are read first.
-const SWITCHES: [(&str, Mark); 6] = [
+const SWITCHES: [(&str, Mark); 7] = [
     ("**", Mark::Bold),
     ("~~", Mark::Strike),
     ("__", Mark::Underline),
     ("==", Mark::Highlight),
     ("*", Mark::Italic),
     ("`", Mark::Code),
+    ("$", Mark::Math),
 ];
-const SPECIAL: &str = "\\*~`_=[]|^⏎";
+const SPECIAL: &str = "\\*~`_=$[]|^⏎";
 const TONES: [(&str, Tone); 4] =
     [("tip", Tone::Tip), ("info", Tone::Info), ("warn", Tone::Warn), ("danger", Tone::Danger)];
 
@@ -297,6 +298,7 @@ pub fn parse(state: &str) -> (Document, Option<Selection>) {
             "todo" => list(ListKind::Task { checked: false }),
             "done" => list(ListKind::Task { checked: true }),
             "hr" => BlockKind::Divider,
+            "formula" => BlockKind::Formula,
             "code" => BlockKind::Code { language: None },
             other => match other.strip_prefix("code:") {
                 Some(language) => BlockKind::Code { language: Some(language.to_owned()) },
@@ -413,6 +415,7 @@ fn line(block: &Block, selection: Option<&Selection>) -> String {
         BlockKind::Code { language: None } => (0, "code".to_owned()),
         BlockKind::Code { language: Some(language) } => (0, format!("code:{language}")),
         BlockKind::Divider => (0, "hr".to_owned()),
+        BlockKind::Formula => (0, "formula".to_owned()),
         other => (0, format!("{other:?}")),
     };
     let at = |pos: &Pos| (pos.block == block.id).then_some(pos.offset);
@@ -481,6 +484,8 @@ pub fn action() -> impl Strategy<Value = Action> {
         "*",
         "`",
         "~",
+        "$",
+        "$",
         "#",
         "-",
         ">",
@@ -522,6 +527,7 @@ pub fn action() -> impl Strategy<Value = Action> {
         "Mod+Delete",
         "Enter",
         "Enter",
+        "Escape",
         "Shift+Enter",
         "Mod+Enter",
         "Tab",
