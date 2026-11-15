@@ -3,7 +3,9 @@
 mod common;
 
 use letters_convert::{ImportNote, from_markdown, to_markdown};
-use letters_model::{Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Run, Tone};
+use letters_model::{
+    Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone,
+};
 use proptest::prelude::*;
 
 use common::outline;
@@ -291,8 +293,6 @@ fn notes_what_an_import_simplified() {
         ("| a | b |\n|---|--:|\n| 1 | 2 |", "Table", "| 1 | 2 |"),
         ("<div class=\"x\">\nraw\n</div>", "HTML", "<div class=\"x\">"),
         ("text <span>inline</span>", "HTML", "<span>inline</span>"),
-        ("---\ntitle: Notes\n---\n\nBody", "Front matter", "title: Notes"),
-        ("+++\r\ntitle = \"Notes\"\r\nlang = \"en\"\r\n+++\r\nBody", "Front matter", "title = \"Notes\"\nlang"),
         ("# Title $$x^2$$", "Display maths", "x^2"),
         ("- item $$x^2$$", "Moved out of a list item", "x^2"),
         ("Claim[^1]\n\n[^1]: Source", "Footnote", "[^1]: Source"),
@@ -306,6 +306,62 @@ fn notes_what_an_import_simplified() {
         assert!(!noted.is_empty(), "notes for {markdown:?}: {notes:?}");
         assert!(noted.iter().all(|note| doc.block(&BlockId::new(&note.block)).is_some()), "{notes:?} sit on blocks");
         assert!(doc.walk().any(|block| block.plain_text().contains(kept)), "{kept:?} kept from {markdown:?}");
+    }
+}
+
+#[test]
+fn keeps_front_matter_as_the_documents_properties() {
+    let cases = [
+        (
+            "---\ntitle: Notes\ntags: [a, b]\n---\n\n# Title\n",
+            PropertiesFormat::Yaml,
+            "title: Notes\ntags: [a, b]\n",
+            1,
+        ),
+        ("+++\r\ntitle = \"Notes\"\r\n+++\r\nBody", PropertiesFormat::Toml, "title = \"Notes\"\n", 1),
+        ("---\n# a comment\n\nkey: |\n  - text\n---\n", PropertiesFormat::Yaml, "# a comment\n\nkey: |\n  - text\n", 0),
+        ("---\n---\nBody", PropertiesFormat::Yaml, "", 1),
+    ];
+    for (markdown, format, source, blocks) in cases {
+        let (doc, notes) = read(markdown);
+        let properties = doc.properties.as_ref().unwrap_or_else(|| panic!("{markdown:?} has front matter"));
+        assert_eq!((properties.format, properties.source.as_str()), (format, source), "reading {markdown:?}");
+        assert_eq!((doc.blocks.len(), notes.as_slice()), (blocks, [].as_slice()), "reading {markdown:?}");
+        let (back, _) = read(&to_markdown(&doc));
+        assert_eq!(settled(&back), settled(&doc), "through {:?}", to_markdown(&doc));
+    }
+}
+
+#[test]
+fn reads_front_matter_only_where_a_file_starts_with_it() {
+    let cases = [
+        "---\n\ntitle: a divider and text\n\n---\n",
+        "Text\n\n---\ntitle: Notes\n---\n",
+        "---\nnever closed\n",
+        " ---\na: b\n---\n",
+    ];
+    for markdown in cases {
+        let (doc, _) = read(markdown);
+        assert_eq!(doc.properties, None, "reading {markdown:?}");
+        assert!(!doc.blocks.is_empty(), "reading {markdown:?}");
+    }
+}
+
+#[test]
+fn writes_properties_that_front_matter_cannot_hold_as_code() {
+    let properties =
+        |source: &str| Properties { format: PropertiesFormat::Yaml, source: source.into(), extra: Default::default() };
+    let cases = [
+        ("title: Notes\n", "---\ntitle: Notes\n---\n\nBody\n"),
+        ("title: Notes", "---\ntitle: Notes\n---\n\nBody\n"),
+        ("", "---\n---\n\nBody\n"),
+        ("a: 1\n---\nb: 2\n", "```yaml\na: 1\n---\nb: 2\n```\n\nBody\n"),
+        ("\na: 1\n", "```yaml\n\na: 1\n```\n\nBody\n"),
+    ];
+    for (source, expected) in cases {
+        let body = with_text(BlockKind::Paragraph, vec![Run::plain("Body")]);
+        let doc = Document { properties: Some(properties(source)), ..doc(vec![body]) };
+        assert_eq!(to_markdown(&doc), expected, "writing {source:?}");
     }
 }
 
@@ -473,6 +529,8 @@ fn round_trips_canonical_markdown_unchanged() {
         "-\n  -\n",
         "- bullets\n\n1. then numbers\n",
         "- not a | table\n  - \\|\n",
+        "---\ntitle: Notes\n---\n\n# Notes\n\nSo $x^2$ holds:\n\n$$\nx^2 \\ge 0\n$$\n",
+        "+++\ntitle = \"Notes\"\n+++\n",
     ];
     for markdown in cases {
         assert_eq!(to_markdown(&read(markdown).0), markdown);
@@ -481,10 +539,15 @@ fn round_trips_canonical_markdown_unchanged() {
 
 /// The conformance corpus ships each sample with the export a reader should expect.
 #[test]
-fn exports_the_conformance_report() {
-    let report = include_str!("../../letters-format/corpus/document/report.json");
-    let report = Document::from_json(report).expect("the corpus holds a valid document");
-    assert_eq!(to_markdown(&report), include_str!("corpus/report.md"));
+fn exports_the_conformance_samples() {
+    let cases = [
+        (include_str!("../../letters-format/corpus/document/report.json"), include_str!("corpus/report.md")),
+        (include_str!("../../letters-format/corpus/document/notice.json"), include_str!("corpus/notice.md")),
+    ];
+    for (sample, expected) in cases {
+        let sample = Document::from_json(sample).expect("the corpus holds a valid document");
+        assert_eq!(to_markdown(&sample), expected);
+    }
 }
 
 #[test]
@@ -622,6 +685,28 @@ fn nest_items(mut blocks: Vec<Block>) -> Vec<Block> {
     blocks
 }
 
+/// Front matter as a file holds it: lines of anything but a blank first line or the fence that would end it.
+fn any_properties() -> impl Strategy<Value = Option<Properties>> {
+    let line = proptest::sample::select(vec![
+        "title: Notes",
+        "tags: [a, b]",
+        "# - *x* $",
+        "  - nested",
+        "",
+        "+++",
+        "---",
+        "\t",
+    ]);
+    let format = proptest::sample::select(vec![(PropertiesFormat::Yaml, "---"), (PropertiesFormat::Toml, "+++")]);
+    let properties = (format, proptest::collection::vec(line, 0..4)).prop_map(|((format, fence), lines)| {
+        let lines: Vec<&str> = lines.into_iter().filter(|line| *line != fence).collect();
+        let source: String =
+            lines.iter().skip_while(|line| line.trim().is_empty()).map(|line| format!("{line}\n")).collect();
+        Properties { format, source, extra: Default::default() }
+    });
+    proptest::option::of(properties)
+}
+
 /// Anything a Markdown file might hold, well formed or not.
 fn any_markdown() -> impl Strategy<Value = String> {
     let piece = prop_oneof![
@@ -639,8 +724,8 @@ fn any_markdown() -> impl Strategy<Value = String> {
 
 proptest! {
     #[test]
-    fn a_document_survives_a_round_trip(blocks in any_blocks()) {
-        let before = doc(blocks);
+    fn a_document_survives_a_round_trip(blocks in any_blocks(), properties in any_properties()) {
+        let before = Document { properties, ..doc(blocks) };
         let markdown = to_markdown(&before);
         let (after, notes) = read(&markdown);
         prop_assert_eq!(settled(&after), settled(&before), "through {:?}", markdown);

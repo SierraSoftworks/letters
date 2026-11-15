@@ -1,8 +1,8 @@
 //! Markdown in both directions.
 //!
 //! Reading follows CommonMark and GFM, with front matter, footnotes, dollar maths and wiki links. What the
-//! document cannot hold yet (tables, images, footnotes, front matter and raw HTML) is kept as text or as a code
-//! block, with an import note that says so.
+//! document cannot hold yet (tables, images, footnotes and raw HTML) is kept as text or as a code block, with an
+//! import note that says so.
 
 mod read;
 mod write;

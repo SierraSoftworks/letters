@@ -3,8 +3,9 @@
 use std::cmp::Reverse;
 use std::ops::Range;
 
-use letters_model::{Block, BlockKind, Document, ListKind, Mark, Run, Tone};
+use letters_model::{Block, BlockKind, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone};
 
+use super::read::{FENCES, front_matter};
 use super::{TAGS, TONES, from_markdown};
 
 /// Writes Markdown. Reading the result back gives an equal document, apart from block ids and what Markdown
@@ -16,13 +17,36 @@ use super::{TAGS, TONES, from_markdown};
 ///   cannot hold is written as a code block in the language `math`, which reads back as a formula, as any
 ///   code block in that language does.
 /// - An empty paragraph is left out, and a list item sits at most one level below the item before it.
-/// - An unknown block is written as its fallback text. Unknown marks and fields are left out.
+/// - An unknown block is written as its fallback text. Unknown marks and fields are left out, and so are the
+///   languages of blocks and runs and the page breaks before blocks, which Markdown has no way to say.
 pub fn to_markdown(doc: &Document) -> String {
-    let mut out = blocks(&doc.blocks).join("\n");
+    let mut lines = doc.properties.as_ref().map(properties).unwrap_or_default();
+    let body = blocks(&doc.blocks);
+    if !lines.is_empty() && !body.is_empty() {
+        lines.push(String::new());
+    }
+    lines.extend(body);
+    let mut out = lines.join("\n");
     if !out.is_empty() {
         out.push('\n');
     }
     out
+}
+
+/// Writes a document's properties as front matter, where they read back as it. Those that would not, such as
+/// ones that hold a line like their own fence, are written as a code block, so that nothing is lost.
+fn properties(properties: &Properties) -> Vec<String> {
+    let (fence, format) =
+        FENCES.iter().find(|(_, format)| *format == properties.format).expect("each format has a fence");
+    let source = properties.source.strip_suffix('\n').unwrap_or(&properties.source);
+    let mut written = vec![(*fence).to_owned()];
+    written.extend(lines(source).into_iter().filter(|_| !properties.source.is_empty()));
+    written.push((*fence).to_owned());
+    let front = format!("{}\n", written.join("\n"));
+    match front_matter(&front) {
+        (Some(read), "") if read.source.strip_suffix('\n').unwrap_or(&read.source) == source => written,
+        _ => code(if *format == PropertiesFormat::Yaml { "yaml" } else { "toml" }, source),
+    }
 }
 
 /// A table cell, for the reader to keep a table as source.

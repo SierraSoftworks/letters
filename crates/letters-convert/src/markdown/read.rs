@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::mem;
 use std::ops::Range;
 
-use letters_model::{Block, BlockKind, Body, Document, ListKind, Mark, Run, Tone};
+use letters_model::{Block, BlockKind, Body, Document, ListKind, Mark, Properties, PropertiesFormat, Run, Tone};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use super::{TAGS, TONES, write};
@@ -26,21 +26,21 @@ pub fn from_markdown(markdown: &str, new_id: &mut dyn FnMut() -> String) -> (Doc
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_MATH
         | Options::ENABLE_WIKILINKS;
-    let (front, source) = front_matter(markdown);
+    let (properties, source) = front_matter(markdown);
     let events = Parser::new_ext(source, options).into_offset_iter().collect();
     let mut reader = Reader { source, events, at: 0, depth: 0, new_id, notes: Vec::new(), task: None };
-    let mut blocks = Vec::new();
-    if let Some((language, text)) = front {
-        reader.placeholder(language, &unix_lines(text), "Front matter kept as a code block", &mut blocks);
-    }
-    blocks.extend(reader.blocks());
-    (Document { blocks, ..Document::default() }, reader.notes)
+    let blocks = reader.blocks();
+    (Document { properties, blocks, ..Document::default() }, reader.notes)
 }
 
-/// Splits front matter off the start of a file: the lines between a first line of `---` or `+++` and the next
-/// such line. Returns its language and text, then the rest of the file.
-fn front_matter(markdown: &str) -> (Option<(&str, &str)>, &str) {
-    for (fence, language) in [("---", "yaml"), ("+++", "toml")] {
+/// The fence that opens and closes front matter in each format.
+pub(super) const FENCES: [(&str, PropertiesFormat); 2] =
+    [("---", PropertiesFormat::Yaml), ("+++", PropertiesFormat::Toml)];
+
+/// Splits front matter off the start of a file: the lines between a first line that is a fence and the next
+/// such line. Returns it as the document's properties, then the rest of the file.
+pub(super) fn front_matter(markdown: &str) -> (Option<Properties>, &str) {
+    for (fence, format) in FENCES {
         let Some(rest) = markdown.strip_prefix(fence) else { continue };
         let Some(body) = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix('\n')) else { continue };
         // A blank line straight after the fence makes it a divider.
@@ -50,7 +50,8 @@ fn front_matter(markdown: &str) -> (Option<(&str, &str)>, &str) {
         let mut end = 0;
         for line in body.split_inclusive('\n') {
             if line.trim_end() == fence {
-                return (Some((language, body[..end].trim())), &body[end + line.len()..]);
+                let properties = Properties { format, source: unix_lines(&body[..end]), extra: Default::default() };
+                return (Some(properties), &body[end + line.len()..]);
             }
             end += line.len();
         }
