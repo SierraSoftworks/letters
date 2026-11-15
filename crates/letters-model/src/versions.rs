@@ -92,21 +92,34 @@ pub struct Tag {
 /// Steps written apart have no order of their own. They are listed by Loro's logical clock and then by
 /// replica, which every device does alike, and which never lists a step before one it was written on.
 pub(crate) fn timeline(loro: &LoroDoc) -> Vec<Point> {
+    steps(loro).0
+}
+
+/// The steps of [`timeline`] that a revision lacks the end of, where `held` is all the revision holds.
+/// A step written apart from the revision is among them wherever it is listed.
+pub(crate) fn since(loro: &LoroDoc, held: &VersionVector) -> Vec<Point> {
+    let (points, ends) = steps(loro);
+    points.into_iter().zip(ends).filter(|(_, end)| !held.includes_id(*end)).map(|(point, _)| point).collect()
+}
+
+/// The steps as [`timeline`] lists them, and the last edit of each.
+fn steps(loro: &LoroDoc) -> (Vec<Point>, Vec<ID>) {
     let names = crdt::names(loro);
     let mut heads = Frontiers::default();
-    let mut points: Vec<Point> = Vec::new();
+    let (mut points, mut ends): (Vec<Point>, Vec<ID>) = (Vec::new(), Vec::new());
     // Where each replica's changes start, with the step that is the first to hold each.
-    let mut steps: HashMap<u64, Vec<(i32, usize)>> = HashMap::new();
+    let mut firsts: HashMap<u64, Vec<(i32, usize)>> = HashMap::new();
     for change in changes(loro) {
         let before = heads.clone();
         heads.update_frontiers_on_new_change(last(&change), &change.deps);
         let marking = change.message.as_deref() == Some(MARKING);
         // A change that only marks a version is no step, and goes with the step before it.
         let step = if marking { points.len().saturating_sub(1) } else { points.len() };
-        steps.entry(change.id.peer).or_default().push((change.id.counter, step));
+        firsts.entry(change.id.peer).or_default().push((change.id.counter, step));
         if marking {
             continue;
         }
+        ends.push(last(&change));
         points.push(Point {
             before: Revision(before),
             after: Revision(heads.clone()),
@@ -120,7 +133,7 @@ pub(crate) fn timeline(loro: &LoroDoc) -> Vec<Point> {
         });
     }
     let step = |id: ID| {
-        let starts = steps.get(&id.peer)?;
+        let starts = firsts.get(&id.peer)?;
         let held = starts.partition_point(|(counter, _)| *counter <= id.counter).checked_sub(1)?;
         Some(starts[held].1)
     };
@@ -133,7 +146,7 @@ pub(crate) fn timeline(loro: &LoroDoc) -> Vec<Point> {
             point.tags.push(tag);
         }
     }
-    points
+    (points, ends)
 }
 
 /// The revisions either side of each step, as [`timeline`] lists them: all a reader of old revisions

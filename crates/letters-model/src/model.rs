@@ -1088,6 +1088,18 @@ impl Model {
         self.look(None, |history| versions::timeline(&history.loro)).unwrap_or_default()
     }
 
+    /// The steps of the [timeline](Model::timeline) that `revision` does not hold, oldest first and as
+    /// the timeline gives them: what was written since a reader last saw the document there. None for
+    /// the newest revision. Fails with [`HistoryError::UnknownRevision`] for a revision the history lacks.
+    ///
+    /// A step written apart from the revision is among them wherever the timeline lists it: an offline
+    /// writer's step that came in later can be listed before steps the revision holds. So is a step
+    /// that the revision holds only the start of, as when its writer went on within the minute.
+    pub fn since(&mut self, revision: &Revision) -> Result<Vec<Point>, HistoryError> {
+        let held = self.loro().frontiers_to_vv(&revision.0).ok_or(HistoryError::UnknownRevision)?;
+        Ok(self.look(None, |history| versions::since(&history.loro, &held)).unwrap_or_default())
+    }
+
     /// The document and its style as they were at `revision`, read without leaving the revision shown,
     /// and with the undo steps kept. Fails with [`HistoryError::UnknownRevision`] for a revision the
     /// history lacks.

@@ -81,6 +81,53 @@ fn every_device_lists_one_history_alike() {
     }
 }
 
+/// A name, a revision, and the steps it lacks: the writer of each and when it was begun.
+type Lacking<'a> = (&'static str, &'a Revision, &'a [(&'static str, u64)]);
+
+#[test]
+fn since_tells_the_steps_a_revision_lacks_wherever_they_are_listed() {
+    let (mut ana, mut ben) = writers();
+    let start = ana.revision();
+    // Ben writes a step offline while Ana writes two, and his comes in after she last looked.
+    ben.apply([typed("p", 0, "Oh. ")]).unwrap();
+    ana.apply([typed("p", 11, "!")]).unwrap();
+    let first = ana.revision();
+    ana.set_time(MORNING + 7200);
+    ana.apply([typed("p", 12, " Again.")]).unwrap();
+    let (seen, his) = (ana.revision(), ben.revision());
+    ana.merge(&ben.save()).unwrap();
+
+    let steps = ana.timeline();
+    let (hers, later, bens) = (("Ana", MORNING), ("Ana", MORNING + 7200), ("Ben", MORNING + 3600));
+    let cases: [Lacking; 5] = [
+        ("the newest revision", &ana.revision(), &[]),
+        ("her own last edit, which his step is listed before", &seen, &[bens]),
+        ("her first edit", &first, &[bens, later]),
+        ("his edit", &his, &[hers, later]),
+        ("the start", &start, &[hers, bens, later]),
+    ];
+    for (name, revision, expected) in cases {
+        let since = ana.since(revision).unwrap();
+        assert_eq!(signed(&since), expected, "{name}");
+        assert!(since.iter().all(|step| steps.contains(step)), "{name}: the steps are the timeline's own");
+    }
+    assert_eq!(ana.since(&unknown()), Err(HistoryError::UnknownRevision));
+}
+
+#[test]
+fn a_revision_inside_a_step_is_read_and_counts_the_step_as_since() {
+    let (mut ana, _) = writers();
+    ana.apply([typed("p", 11, "!")]).unwrap();
+    let (inside, steps) = (ana.revision(), ana.timeline().len());
+    // Within the minute, she writes on in the same step.
+    ana.apply([typed("p", 12, " Again.")]).unwrap();
+    assert_eq!(ana.timeline().len(), steps, "one step holds both edits");
+
+    assert_eq!(signed(&ana.since(&inside).unwrap()), [("Ana", MORNING)]);
+    let read = ana.document_at(&inside).unwrap().0;
+    assert_eq!(read.block(&id("p")).map(|block| block.plain_text()).as_deref(), Some("Hello world!"));
+}
+
 #[test]
 fn a_version_is_read_without_leaving_the_one_shown() {
     let mut model = Model::new(common::doc(), ReplicaId::from(1));
