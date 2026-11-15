@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use letters_api::{Code, Role};
-use letters_format::{ASSETS, Archive, Error, Save, Saved, Unsaved, WorkingCopy, is_journal};
+use letters_format::{ASSETS, Archive, Error, Files, Save, Saved, Unsaved, WorkingCopy, is_journal};
 use letters_model::ReplicaId;
 use letters_sync::{Access, LOOK_EVERY, Outbound, Refusal as Ended, Room, SessionId};
 use tokio::sync::{Notify, mpsc};
@@ -361,8 +361,9 @@ impl Rooms {
     }
 
     /// Brings every file up to its room and ends every session, as the server stops. Each file is
-    /// written and read back, which is when its journal lets go, so that nothing is left for the next
-    /// start to recover. No room is opened afterwards.
+    /// written once. Its journal is kept for the next start to read the file back with, which is when a
+    /// journal lets go: by then another writer of the file, who would have dropped what the room wrote,
+    /// has shown itself. No room is opened afterwards.
     ///
     /// The devices are given no reason: each takes its socket for lost, and comes back when the server
     /// does, with whatever it was not told the server holds.
@@ -376,9 +377,10 @@ impl Rooms {
             let mut state = lock(&open.state);
             if let State::Open(hosted) = &mut *state {
                 let now = self.now();
-                hosted.save_through(now);
+                hosted.stop(now);
                 // Each device hears what the save let the server say it holds, and then its socket closes.
                 hosted.settle(&open, now);
+                // A room whose folder was out of reach has closed nobody.
                 for (session, seated) in hosted.seats.drain() {
                     let _ = seated.to.try_send(Out::Close);
                     hosted.room.leave(session);
@@ -518,14 +520,19 @@ impl Hosted {
     /// for the document, or a new one.
     fn open(rooms: &Rooms, root: &Root, place: &Place, journal: Option<String>, now: u64) -> Answer<Self> {
         let (folder, name) = place.split();
-        let file = root.folder(&folder)?.open(name)?;
-        let mut archive = Archive::open(BufReader::new(file))?;
+        let mut folder = root.folder(&folder)?;
+        // How the file looks before it is read: the room reads it again only once a writer has changed it.
+        let stamp = Files::stamp(&mut folder, name).ok().flatten();
+        let mut archive = Archive::open(BufReader::new(folder.open(name)?))?;
         // A replica of this room's own: what it settles between two devices is written under it.
         let copy = WorkingCopy::open(&mut archive, ReplicaId::new(&ids::block_id()))?;
         let journal = journal.or_else(|| rooms.adopt(&copy.id)).unwrap_or_else(ids::block_id);
         let unavailable = || Refusal::new(Code::Unavailable, "The server cannot keep what is written just now.");
         let mut state = rooms.journals(&journal).ok_or_else(unavailable)?;
-        let room = Room::open(copy, &home(root, place), &mut state, now).map_err(failed)?;
+        let mut room = Room::open(copy, &home(root, place), &mut state, now).map_err(failed)?;
+        if let Some(stamp) = stamp {
+            room.read_as(stamp);
+        }
         Ok(Self {
             room,
             root: root.again()?,
@@ -587,31 +594,56 @@ impl Hosted {
     /// so. A save that fails is tried again by the room, and its edits stay in the journal. Says whether
     /// the file was written.
     fn save(&mut self, now: u64, whatever: bool) -> bool {
-        if self.parked || self.lost {
+        if self.parked {
             return false;
         }
-        let place = self.place.clone();
-        let (folder, name) = place.split();
-        let mut folder = match self.root.folder(&folder) {
-            Ok(folder) if folder.has(name) => folder,
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                log(&format!("\"{name}\" cannot be saved while its folder cannot be reached: {error}"));
-                self.hold = now + LOOK_EVERY;
-                return false;
-            }
-            _ => {
-                self.not_there(name, now);
-                return false;
-            }
-        };
-        (self.missing, self.hold) = (false, 0);
-        let (token, day) = (ids::block_id(), ids::rfc3339(now / 1000));
-        let label = format!("{} server", day.get(..10).unwrap_or(&day));
-        let save = Save { name, token: &token, label: &label, attempts: ATTEMPTS };
+        let Some(mut folder) = self.folder(now) else { return false };
+        let (place, (token, label)) = (self.place.clone(), marks(now));
+        let save = Save { name: place.name(), token: &token, label: &label, attempts: ATTEMPTS };
         let saved = match whatever {
             true => self.room.flush(&mut folder, &mut self.state, &save, now).map(Some),
             false => self.room.exchange(&mut folder, &mut self.state, &save, now),
         };
+        self.saved(saved)
+    }
+
+    /// Writes what the file lacks, as the server stops, and closes every session. What cannot be written
+    /// stays in the journal, and so does what was: the next start reads the file back.
+    fn stop(&mut self, now: u64) {
+        let Some(mut folder) = self.folder(now) else { return };
+        let (place, (token, label)) = (self.place.clone(), marks(now));
+        let save = Save { name: place.name(), token: &token, label: &label, attempts: ATTEMPTS };
+        let saved = self.room.stop(&mut folder, &mut self.state, &save, now);
+        self.saved(saved);
+    }
+
+    /// The folder of the room's file, when the file is there to be saved.
+    fn folder(&mut self, now: u64) -> Option<Folder> {
+        if self.lost {
+            return None;
+        }
+        let place = self.place.clone();
+        let (folder, name) = place.split();
+        match self.root.folder(&folder) {
+            Ok(folder) if folder.has(name) => {
+                (self.missing, self.hold) = (false, 0);
+                Some(folder)
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                log(&format!("\"{name}\" cannot be saved while its folder cannot be reached: {error}"));
+                self.hold = now + LOOK_EVERY;
+                None
+            }
+            _ => {
+                self.not_there(name, now);
+                None
+            }
+        }
+    }
+
+    /// Takes in how a save ended. Says whether the file was written.
+    fn saved(&mut self, saved: Result<Option<Saved>, Error>) -> bool {
+        let name = self.place.name().to_owned();
         match saved {
             Ok(Some(Saved::ConflictCopy { name: copy, cause })) => {
                 log(&format!("\"{name}\" could not be saved ({cause}), and what its room held went to \"{copy}\""));
@@ -659,6 +691,12 @@ impl Hosted {
             None => drop(std::fs::remove_dir_all(path)),
         }
     }
+}
+
+/// A save's token, and the label of the version it may leave.
+fn marks(now: u64) -> (String, String) {
+    let day = ids::rfc3339(now / 1000);
+    (ids::block_id(), format!("{} server", day.get(..10).unwrap_or(&day)))
 }
 
 /// Wakes a room when it is due, until it is dropped.

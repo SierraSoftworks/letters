@@ -113,6 +113,5 @@ async fn a_server_that_is_told_to_stop_saves_what_is_open_first() {
     // The file itself is read, as whatever starts next will find it.
     let file = std::fs::read(server.scratch.0.join("family/Plan.let")).unwrap();
     assert!(texts(file).join("\n").contains("Written just before the stop."));
-    assert!(server.scratch.names("state/rooms").is_empty(), "nothing is left for the next start to recover");
     assert_eq!(heard(&mut socket), None, "the socket is closed, with nothing said that would keep the device away");
 }
