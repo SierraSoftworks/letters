@@ -2,12 +2,13 @@
 //!
 //! Over a stretch of selected text float the two things that are done to a passage: linking it and
 //! commenting on it. A comment is written in a field that hangs under its passage, in Markdown's bold,
-//! italic and links, and is kept as a note that stays with its text.
+//! italic, struck text, code and links, and is kept as a note that stays with its text. How notes show
+//! once they are kept is in [`crate::threads`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use accesskit::Role;
-use letters_model::{Anchor, Document, Mark, Model, Note, NoteKind, Notes, Pos, Run, Selection};
+use letters_model::{Anchor, Block, BlockId, Document, Mark, Model, Note, NoteKind, Notes, Pos, Reply, Run, Selection};
 use letters_render::{DisplayList, Item, Rect};
 
 use crate::color::{fade, resolve};
@@ -15,6 +16,7 @@ use crate::element::Element;
 use crate::icon;
 use crate::style::{Align, Edges};
 use crate::text::TextStyle;
+use crate::threads::{Kind, Marker};
 use crate::tokens::{self, Scheme};
 use crate::widgets::{Button, ControlSize, Popover, Side, TextField};
 use crate::window::Message;
@@ -41,6 +43,23 @@ pub enum Noting {
     Send,
     /// Drops it.
     Drop,
+    /// Opens a note in place, under the passage it is about.
+    Open(String),
+    /// A press on the marker beside a block: opens the first of its notes, or the one after the note
+    /// that is open, and puts the last one away.
+    Press(BlockId),
+    /// What is typed into the reply to the note that is open.
+    Reply(String),
+    /// Keeps that reply.
+    Answer,
+    /// Resolves the note that is open.
+    Resolve,
+    /// Puts the note that is open away.
+    Close,
+    /// The kind of note the panel lists: all of them when `None`.
+    Show(Option<Kind>),
+    /// Resolves every open import note.
+    ResolveImports,
 }
 
 /// The document's notes, and what the window is doing about them.
@@ -55,6 +74,18 @@ pub(crate) struct Margin {
     draft: Option<(Anchor, String)>,
     /// Why no comment can be written on this document, as the shell says.
     pub refused: Option<String>,
+    /// The note that is open under its passage, and the reply typed into it so far.
+    thread: Option<(String, String)>,
+    /// The note a press outside it just put away. A press on its own marker goes on from it.
+    left: Option<String>,
+    /// The markers beside the blocks that have open notes, in the order of the document.
+    marks: Vec<Marker>,
+    /// The block whose marker the pointer rests on.
+    pub over: Option<BlockId>,
+    /// The time that notes are told against, as RFC 3339. Empty when the shell has no clock.
+    pub now: String,
+    /// The one kind of note the panel lists, when it does not list them all.
+    pub filter: Option<Kind>,
 }
 
 impl Margin {
@@ -67,7 +98,7 @@ impl Margin {
 
     /// Whether the tools may show over the selection: not once they were put away over it.
     pub fn offers(&self) -> bool {
-        self.away.is_none() && self.draft.is_none()
+        self.away.is_none() && self.draft.is_none() && self.thread.is_none()
     }
 
     pub fn put_away(&mut self, selection: Option<&Selection>) {
@@ -79,6 +110,7 @@ impl Margin {
         notes.pin(model);
         notes.follow(model);
         self.notes = notes;
+        self.remark(model.doc());
     }
 
     /// Moves every note to where its text is now, after the document changed.
@@ -87,11 +119,13 @@ impl Margin {
         if let Some((anchor, _)) = &mut self.draft {
             anchor.follow(model);
         }
+        self.remark(model.doc());
     }
 
     /// Starts a comment on what is selected. A selection with no text in it has nothing to comment on.
     pub fn write(&mut self, model: &Model, selection: Option<&Selection>) {
         let passage = selection.and_then(|selection| passage(model.doc(), selection));
+        self.thread = None;
         self.draft = passage.map(|mut anchor| {
             // The passage stays with its text while the comment is written.
             anchor.pin(model);
@@ -137,12 +171,128 @@ impl Margin {
         true
     }
 
-    /// The passages to mark on the page: those that open comments are about, and the one a comment is
-    /// being written on, which comes with `true`.
+    /// The passages to mark on the page: those that open comments are about, the one of the note that is
+    /// open and the one a comment is being written on. The last two come with `true`.
     pub fn commented(&self) -> impl Iterator<Item = (Selection, bool)> + '_ {
-        let open = self.notes.notes.iter().filter(|note| note.kind == NoteKind::Comment && !note.resolved);
-        let kept = open.filter_map(|note| Some((stretch(&note.anchor)?, false)));
+        let read = self.reading().map(|(note, _)| note.id.as_str());
+        let shown = self.open().filter(move |(note, kind)| *kind == Kind::Comment || read == Some(note.id.as_str()));
+        let kept = shown.filter_map(move |(note, _)| Some((stretch(&note.anchor)?, read == Some(note.id.as_str()))));
         kept.chain(self.writing().and_then(stretch).map(|passage| (passage, true)))
+    }
+
+    /// The notes that wait for attention, of the kinds this build knows, in the order they were added.
+    pub fn open(&self) -> impl Iterator<Item = (&Note, Kind)> + '_ {
+        let open = self.notes.notes.iter().filter(|note| !note.resolved);
+        open.filter_map(|note| Some((note, Kind::of(note)?)))
+    }
+
+    /// The markers beside the blocks that have open notes.
+    pub fn marks(&self) -> &[Marker] {
+        &self.marks
+    }
+
+    /// Works the markers out again, after the notes changed or the blocks they are about did. A note
+    /// inside a table or a gallery is marked beside the whole of it.
+    pub fn remark(&mut self, doc: &Document) {
+        fn within<'a>(block: &'a Block, visit: &mut impl FnMut(&'a Block)) {
+            visit(block);
+            block.body.blocks().iter().for_each(|part| within(part, visit));
+        }
+        let mut about: HashMap<&BlockId, Vec<(&Note, Kind)>> = HashMap::new();
+        for (note, kind) in self.open() {
+            about.entry(&note.anchor.block).or_default().push((note, kind));
+        }
+        let mut marks = Vec::new();
+        for top in doc.blocks.iter().filter(|_| !about.is_empty()) {
+            let mut marker: Option<Marker> = None;
+            within(top, &mut |block| {
+                for (note, kind) in about.get(&block.id).into_iter().flatten() {
+                    marker.get_or_insert_with(|| Marker::beside(top, *kind)).add(note, *kind);
+                }
+            });
+            marks.extend(marker);
+        }
+        self.marks = marks;
+    }
+
+    /// The note that is open under its passage, and the reply typed into it so far.
+    pub fn reading(&self) -> Option<(&Note, &str)> {
+        let (id, reply) = self.thread.as_ref()?;
+        let note = self.notes.notes.iter().find(|note| &note.id == id && !note.resolved)?;
+        Some((note, reply))
+    }
+
+    /// Opens a note under its passage. What was being written elsewhere is dropped.
+    pub fn read(&mut self, id: &str) {
+        (self.thread, self.draft, self.left) = (Some((id.to_owned(), String::new())), None, None);
+    }
+
+    /// Puts the open note away, as a press outside it or Escape does, and remembers which it was.
+    pub fn close(&mut self) {
+        self.left = self.thread.take().map(|(id, _)| id);
+    }
+
+    /// Puts the open note away because something else came to hang from the page.
+    pub fn shut(&mut self) {
+        (self.thread, self.left) = (None, None);
+    }
+
+    /// Forgets which note was last put away: the press that did it is over.
+    pub fn forget(&mut self) {
+        self.left = None;
+    }
+
+    /// Does what a press on the marker beside `block` asks: opens the first note of the block, or the one
+    /// after the note that is open or was just put away by this press. After the last, none is open. A
+    /// reply that is being typed keeps its note open.
+    pub fn press(&mut self, block: &BlockId) {
+        let Some(marker) = self.marks.iter().find(|marker| &marker.block == block) else { return };
+        let at = self.thread.as_ref().map(|(id, _)| id).or(self.left.as_ref());
+        let at = at.and_then(|id| marker.notes.iter().position(|note| note == id));
+        if at.is_some() && self.thread.as_ref().is_some_and(|(_, reply)| !reply.trim().is_empty()) {
+            return;
+        }
+        let next = at.map_or(Some(0), |at| Some(at + 1)).and_then(|next| marker.notes.get(next)).cloned();
+        match next {
+            Some(id) => self.read(&id),
+            None => self.shut(),
+        }
+    }
+
+    pub fn reply(&mut self, text: String) {
+        if let Some((_, reply)) = &mut self.thread {
+            *reply = text;
+        }
+    }
+
+    /// Keeps the reply typed into the open note, signed and dated. Returns whether there was anything to
+    /// keep.
+    pub fn answer(&mut self, created: String) -> bool {
+        let Some((id, reply)) = &mut self.thread else { return false };
+        let content = inline(reply.trim());
+        let note = self.notes.notes.iter_mut().find(|note| &note.id == id);
+        let Some(note) = note.filter(|_| !content.is_empty() && self.refused.is_none()) else { return false };
+        note.replies.push(Reply { author: self.author.clone(), created, content, extra: Default::default() });
+        reply.clear();
+        true
+    }
+
+    /// Resolves the open note and puts it away. Returns whether it did: a conflict is resolved by
+    /// choosing one of its versions, which is not done here.
+    pub fn resolve(&mut self) -> bool {
+        let Some((id, _)) = self.thread.take().filter(|_| self.refused.is_none()) else { return false };
+        let note = self.notes.notes.iter_mut().find(|note| note.id == id && !note.resolved);
+        let note = note.filter(|note| matches!(note.kind, NoteKind::Comment | NoteKind::Import));
+        note.map(|note| note.resolved = true).is_some()
+    }
+
+    /// Resolves every open import note. Returns whether there were any.
+    pub fn resolve_imports(&mut self) -> bool {
+        let open = self.notes.notes.iter_mut().filter(|note| note.kind == NoteKind::Import && !note.resolved);
+        let open: Vec<&mut Note> = open.filter(|_| self.refused.is_none()).collect();
+        let any = !open.is_empty();
+        open.into_iter().for_each(|note| note.resolved = true);
+        any
     }
 
     /// The tools over a selection: a link and a comment, and nothing else. They hang over the first line of
@@ -259,8 +409,8 @@ pub(crate) fn passage(doc: &Document, selection: &Selection) -> Option<Anchor> {
     })
 }
 
-/// Reads a comment as it was typed: Markdown's bold, italic and links, a bare address as a link to itself,
-/// and everything else as it stands.
+/// Reads a comment as it was typed: Markdown's bold, italic, struck text, code and links, a bare address
+/// as a link to itself, and everything else as it stands.
 pub(crate) fn inline(text: &str) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::new();
     read(text, &BTreeSet::new(), None, &mut runs);
@@ -288,8 +438,13 @@ fn read(text: &str, marks: &BTreeSet<Mark>, link: Option<&str>, out: &mut Vec<Ru
         let starts = before.is_none_or(|before| !before.is_alphanumeric());
         if let Some((mark, inner, after)) = fenced(rest, starts) {
             let mut marked = marks.clone();
+            let code = mark == Mark::Code;
             marked.insert(mark);
-            read(inner, &marked, link, out);
+            // Code is kept as typed: nothing in it is a mark.
+            match code {
+                true => push(inner, (&marked, link), out),
+                false => read(inner, &marked, link, out),
+            }
             (before, rest) = (inner.chars().last(), after);
         } else if let Some((label, address, after)) = linked(rest).filter(|_| link.is_none()) {
             read(label, marks, Some(address), out);
@@ -305,10 +460,11 @@ fn read(text: &str, marks: &BTreeSet<Mark>, link: Option<&str>, out: &mut Vec<Ru
     }
 }
 
-/// What `text` opens with when that is bold or italic text between its marks: the mark, the text inside
-/// and what follows. An underscore marks only whole words, so that a `name_like_this` stays as typed.
+/// What `text` opens with when that is text between a pair of marks: the mark, the text inside and what
+/// follows. An underscore marks only whole words, so that a `name_like_this` stays as typed.
 fn fenced(text: &str, starts: bool) -> Option<(Mark, &str, &str)> {
-    let fences = [("**", Mark::Bold), ("*", Mark::Italic), ("_", Mark::Italic)];
+    let fences =
+        [("**", Mark::Bold), ("~~", Mark::Strike), ("*", Mark::Italic), ("_", Mark::Italic), ("`", Mark::Code)];
     fences.into_iter().find_map(|(fence, mark)| {
         let body = text.strip_prefix(fence).filter(|_| fence != "_" || starts)?;
         let closes = |at: &usize| {
@@ -342,7 +498,7 @@ fn bare(text: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use letters_model::Block;
-    use letters_model::BlockKind::Paragraph;
+    use letters_model::BlockKind::{Paragraph, Quote};
 
     use super::*;
 
@@ -350,9 +506,11 @@ mod tests {
     fn a_comment_is_read_with_markdowns_bold_italic_and_links() {
         const B: u8 = 1;
         const I: u8 = 2;
+        const S: u8 = 4;
+        const C: u8 = 8;
         // What is typed, and its runs: the text, its marks and its link.
         type Runs<'a> = &'a [(&'a str, u8, &'a str)];
-        let cases: [(&str, Runs); 12] = [
+        let cases: [(&str, Runs); 14] = [
             ("Has anyone chased it? \u{26a1}", &[("Has anyone chased it? \u{26a1}", 0, "")]),
             ("due **this Friday**, see", &[("due ", 0, ""), ("this Friday", B, ""), (", see", 0, "")]),
             ("tell *Harland* and _Sam_", &[("tell ", 0, ""), ("Harland", I, ""), (" and ", 0, ""), ("Sam", I, "")]),
@@ -362,6 +520,9 @@ mod tests {
                 &[("see ", 0, ""), ("their email", 0, "https://a.example/m"), ("!", 0, "")],
             ),
             ("[a **b**](x:y)", &[("a ", 0, "x:y"), ("b", B, "x:y")]),
+            ("~~Monday~~ **Tuesday**", &[("Monday", S, ""), (" ", 0, ""), ("Tuesday", B, "")]),
+            // Code is kept as typed.
+            ("run `a *b* c` twice", &[("run ", 0, ""), ("a *b* c", C, ""), (" twice", 0, "")]),
             (
                 "at https://a.example/q?x=1. Thanks",
                 &[("at ", 0, ""), ("https://a.example/q?x=1", 0, "https://a.example/q?x=1"), (". Thanks", 0, "")],
@@ -377,8 +538,8 @@ mod tests {
             let read: Vec<(String, u8, String)> = inline(typed)
                 .into_iter()
                 .map(|run| {
-                    let marks =
-                        u8::from(run.marks.contains(&Mark::Bold)) * B + u8::from(run.marks.contains(&Mark::Italic)) * I;
+                    let has = |mark: Mark, bit: u8| u8::from(run.marks.contains(&mark)) * bit;
+                    let marks = has(Mark::Bold, B) + has(Mark::Italic, I) + has(Mark::Strike, S) + has(Mark::Code, C);
                     (run.text, marks, run.link.unwrap_or_default())
                 })
                 .collect();
@@ -386,6 +547,42 @@ mod tests {
                 runs.iter().map(|(text, marks, link)| ((*text).to_owned(), *marks, (*link).to_owned())).collect();
             assert_eq!(read, runs, "{typed:?}");
         }
+    }
+
+    #[test]
+    fn notes_inside_a_block_are_marked_beside_the_whole_of_it_in_the_order_of_the_page() {
+        let part = |id: &str| Block::text(id, Paragraph, "One two");
+        let quote = Block { body: letters_model::Body::Blocks(vec![part("q1"), part("q2")]), ..Block::new("q", Quote) };
+        let doc = Document { blocks: vec![part("a"), quote, part("b")], ..Document::default() };
+        let note = |id: &str, block: &str| Note {
+            id: id.into(),
+            kind: NoteKind::Comment,
+            anchor: Anchor::range(block, 0..3),
+            author: String::new(),
+            created: String::new(),
+            resolved: false,
+            content: vec![Run::plain("Why?")],
+            replies: Vec::new(),
+            extra: Default::default(),
+        };
+        let notes = vec![note("1", "b"), note("2", "q2"), note("3", "q1"), note("4", "gone")];
+        let mut margin = Margin { notes: Notes { notes, ..Notes::default() }, ..Margin::default() };
+        margin.remark(&doc);
+        let marks: Vec<(&str, Vec<&str>)> = margin
+            .marks()
+            .iter()
+            .map(|marker| (marker.block.as_str(), marker.notes.iter().map(String::as_str).collect()))
+            .collect();
+        assert_eq!(marks, [("q", vec!["3", "2"]), ("b", vec!["1"])]);
+
+        // A press on a marker goes through its notes, and then none is open.
+        let q = BlockId::new("q");
+        let mut read = Vec::new();
+        for _ in 0..3 {
+            margin.press(&q);
+            read.push(margin.reading().map(|(note, _)| note.id.clone()));
+        }
+        assert_eq!(read, [Some("3".to_owned()), Some("2".to_owned()), None]);
     }
 
     #[test]

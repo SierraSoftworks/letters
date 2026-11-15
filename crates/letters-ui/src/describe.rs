@@ -3,7 +3,8 @@
 //! Each block is a node of its role, and a text block holds one text run whose characters are Unicode scalar
 //! values. List items that follow one another stand under a list, a task's tick is a checkbox, a figure's
 //! picture an image named by its alt text with a button that turns to that text, and a code block's copy
-//! button a button. The page's own node carries the selection.
+//! button a button. The page's own node carries the selection, and the markers of the notes in its margin
+//! are buttons under it.
 //!
 //! A long document is not told again for every key: [`Told`] remembers how each block read, and a block that
 //! still reads the same is left out when only the changes are asked for.
@@ -22,6 +23,7 @@ const TICK: u8 = 2;
 const PICTURE: u8 = 3;
 const COPY: u8 = 4;
 const ALT: u8 = 5;
+const NOTE: u8 = 6;
 
 /// FNV-1a: stable between runs, so a screen reader keeps its place across a restart.
 fn hashed(bytes: impl Iterator<Item = u8>) -> u64 {
@@ -95,15 +97,32 @@ pub(crate) fn page(
 /// Adds the preview of a figure under the page: a tooltip that reads the figure's caption. `rect` is where
 /// it shows in the page area.
 pub(crate) fn preview(caption: &str, rect: Rect, page: &mut Node, nodes: &mut Vec<(NodeId, Node)>) {
-    let (x, y) = page.bounds().map_or((0.0, 0.0), |page| (page.x0, page.y0));
-    let (x, y) = (x + f64::from(rect.x), y + f64::from(rect.y));
     let mut tip = Node::new(Role::Tooltip);
     tip.set_label(caption);
-    tip.set_bounds(accesskit::Rect { x0: x, y0: y, x1: x + f64::from(rect.width), y1: y + f64::from(rect.height) });
+    tip.set_bounds(placed(page, rect));
     // No block's id holds a byte of 0xff, so no node of the document is this one.
     let id = NodeId(hashed([0xff, 0xff].into_iter()) & !1);
     page.push_child(id);
     nodes.push((id, tip));
+}
+
+/// Adds the marker beside a block under the page: a button named by the notes it opens, which a click
+/// presses. `rect` is where it stands in the page area.
+pub(crate) fn marker(block: &BlockId, label: &str, rect: Rect, page: &mut Node, nodes: &mut Vec<(NodeId, Node)>) {
+    let mut marker = Node::new(Role::Button);
+    marker.set_label(label);
+    marker.add_action(Action::Click);
+    marker.set_bounds(placed(page, rect));
+    let id = part_node(block, NOTE);
+    page.push_child(id);
+    nodes.push((id, marker));
+}
+
+/// Where something at `rect` in the page area is in the window.
+fn placed(page: &Node, rect: Rect) -> accesskit::Rect {
+    let (x, y) = page.bounds().map_or((0.0, 0.0), |page| (page.x0, page.y0));
+    let (x, y) = (x + f64::from(rect.x), y + f64::from(rect.y));
+    accesskit::Rect { x0: x, y0: y, x1: x + f64::from(rect.width), y1: y + f64::from(rect.height) }
 }
 
 /// A list item's depth and which kind of list it is in. A task belongs with its list ticked or not.
@@ -274,6 +293,8 @@ pub(crate) enum Request {
     Copy(BlockId),
     /// Turns the line under a figure's picture to its alt text.
     Alt(BlockId),
+    /// Presses the marker of the notes beside a block.
+    Note(BlockId),
 }
 
 pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request> {
@@ -292,7 +313,9 @@ pub(crate) fn request(doc: &Document, request: &ActionRequest) -> Option<Request
             let part = |part| doc.walk().find(|block| part_node(&block.id, part) == request.target_node);
             let ticked = part(TICK).map(|block| Request::Tick(block.id.clone()));
             let copied = || part(COPY).map(|block| Request::Copy(block.id.clone()));
-            ticked.or_else(copied).or_else(|| part(ALT).map(|block| Request::Alt(block.id.clone())))
+            let switched = || part(ALT).map(|block| Request::Alt(block.id.clone()));
+            let noted = || part(NOTE).map(|block| Request::Note(block.id.clone()));
+            ticked.or_else(copied).or_else(switched).or_else(noted)
         }
         _ => None,
     }

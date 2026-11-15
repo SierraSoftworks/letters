@@ -14,7 +14,8 @@ use letters_editor::{
 };
 use letters_layout::{CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Syntax};
 use letters_model::{
-    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Notes, Pos, Selection, Style,
+    Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, Notes, Pos, Selection,
+    Style,
 };
 use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
@@ -49,6 +50,7 @@ use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::styles::{self, Styles, Styling};
 use crate::text::{Family, FontShaper, TextShaper, TextStyle};
 use crate::theme::{Accent, accent};
+use crate::threads::{self, Said};
 use crate::tokens::{self, Color as Ink, Scheme};
 use crate::ui::{App, DRAG_SLOP, Idle, Keys, Ui};
 use crate::widgets::{
@@ -392,6 +394,7 @@ impl Ui<EditorApp> {
         let fonts = Fonts { faces };
         let app = self.app_mut();
         let labels = app.shaper.add_fonts(&fonts);
+        app.said.again();
         if app.held(|app| app.layout.add_fonts(&fonts)) {
             // Blocks set again keep their heights as estimates until idle time settles them.
             app.estimated = true;
@@ -673,6 +676,8 @@ pub struct EditorApp {
     grip: Grip,
     captions: Captions,
     margin: Margin,
+    /// What the note that is open says, set to be drawn.
+    said: Said,
     /// What the bar says of a write that was just done, as where the document was first saved, and since
     /// when, once a frame has said so.
     note: Option<(String, Option<u64>)>,
@@ -754,6 +759,7 @@ impl EditorApp {
             grip: Grip::default(),
             captions: Captions::default(),
             margin: Margin::default(),
+            said: Said::default(),
             note: None,
             naming: false,
             renaming: None,
@@ -1051,15 +1057,21 @@ impl EditorApp {
         (self.link, self.spelling.fix, self.linked.open) = (None, None, None);
     }
 
-    /// Does what the tools over a selection or the field of a comment asked.
+    /// Does what the tools over a selection, the field of a comment, a marker in the margin, a note that
+    /// is open or the panel of them all asked.
     fn noting(&mut self, asked: Noting, platform: &mut dyn Platform) {
+        // Notes say when they were written against the time one of them was last asked about.
+        self.margin.now = platform.wall_time().map(notes::stamp).unwrap_or_default();
+        let opens = matches!(asked, Noting::Open(_) | Noting::Press(_));
         match asked {
+            // What is typed changes nothing but itself.
+            Noting::Draft(text) => return self.margin.typed(text),
+            Noting::Reply(text) => return self.margin.reply(text),
             Noting::Away => self.margin.put_away(self.editor.selection()),
             Noting::Write => {
                 self.margin.write(self.editor.model(), self.editor.selection());
                 (self.link, self.spelling.fix, self.linked.open, self.captions.alt) = (None, None, None, None);
             }
-            Noting::Draft(text) => self.margin.typed(text),
             Noting::Drop => self.margin.drop_draft(),
             Noting::Send => {
                 let created = notes::stamp(platform.wall_time().unwrap_or(0));
@@ -1068,11 +1080,103 @@ impl EditorApp {
                     self.edits += 1;
                 }
             }
+            Noting::Open(id) => {
+                self.margin.read(&id);
+                self.show_note();
+            }
+            Noting::Press(block) => self.margin.press(&block),
+            Noting::Close => self.margin.close(),
+            Noting::Show(kind) => self.margin.filter = kind,
+            // A reply, and a note that is resolved, are kept with the document as a comment is.
+            Noting::Answer => {
+                let created = notes::stamp(platform.wall_time().unwrap_or(0));
+                self.edits += u64::from(self.margin.answer(created));
+            }
+            Noting::Resolve => self.edits += u64::from(self.margin.resolve()),
+            Noting::ResolveImports => self.edits += u64::from(self.margin.resolve_imports()),
+        }
+        if opens && self.margin.reading().is_some() {
+            (self.link, self.spelling.fix, self.linked.open, self.captions.alt) = (None, None, None, None);
         }
         // Once a comment is kept or dropped, the tools wait for another selection.
         if self.margin.writing().is_none() {
             self.margin.put_away(self.editor.selection());
         }
+        self.margin.remark(self.editor.doc());
+    }
+
+    /// The first and the last line of the passage a note is about, in the layout's coordinates: of its
+    /// stretch of text, or the first line of the block it is on as a whole. `None` once its block is gone.
+    fn note_lines(&self, note: &Note) -> Option<(Rect, Rect)> {
+        if let Some(passage) = notes::stretch(&note.anchor) {
+            let lines = self.layout.selection(&passage);
+            return Some((*lines.first()?, *lines.last()?));
+        }
+        let block = self.editor.doc().block(&note.anchor.block)?;
+        if let Some(figure) = self.layout.figure(&block.id) {
+            return Some((figure.image, figure.image));
+        }
+        let mut texts = Vec::new();
+        written(block, &mut texts);
+        let start = Pos::new(texts.first()?.id.clone(), 0);
+        let from = self.layout.caret(&start)?;
+        let to = self.layout.line_edge(&start, true).and_then(|end| self.layout.caret(&end));
+        let line = Rect { width: to.map_or(0.0, |to| (to.x - from.x).max(0.0)), ..from };
+        Some((line, line))
+    }
+
+    /// Brings the passage of the note that is open into view, as opening it from the panel asks. One that
+    /// shows whole stays where it is.
+    fn show_note(&mut self) {
+        // Twice, since laying out what comes into view can move the passage.
+        for _ in 0..2 {
+            let lines = self.margin.reading().and_then(|(note, _)| self.note_lines(note));
+            let Some((first, last)) = lines else { return };
+            let (top, bottom, view) = (first.y, last.y + last.height, self.viewport());
+            if top >= view.y && bottom <= view.y + view.height {
+                break;
+            }
+            // A quarter of the way down, the note has the rest of the page to hang in.
+            self.scroll = (top + TOP - self.height / 4.0).clamp(0.0, self.max_scroll());
+            self.layout.settle(self.viewport(), 0);
+        }
+    }
+
+    /// The first line of a block that has a marker, in the layout's coordinates, while the block's start
+    /// is in view.
+    fn marked_line(&self, marker: &threads::Marker, view: Rect) -> Option<Rect> {
+        let line = match (self.layout.figure(&marker.block), &marker.first) {
+            (Some(figure), _) => Rect { height: 0.0, ..figure.image },
+            (None, Some((text, long))) => {
+                // Only text that shows is asked where it is: asking lays it out, and text laid out above
+                // the view moves the page.
+                let (start, end) = (Pos::new(text.clone(), 0), Pos::new(text.clone(), *long));
+                let all = Selection { anchor: start.clone(), head: end };
+                if *long > 0 && self.layout.selection_in(&all, view).is_empty() {
+                    return None;
+                }
+                self.layout.caret(&start)?
+            }
+            (None, None) => return None,
+        };
+        (line.y + line.height >= view.y && line.y <= view.y + view.height).then_some(line)
+    }
+
+    /// The markers in view, each with where it stands in the layout's coordinates.
+    fn markers(&self) -> Vec<(&threads::Marker, Rect)> {
+        let view = self.viewport();
+        let (column, room) = (self.column.1, self.column.0);
+        let placed = |marker| {
+            let line = self.marked_line(marker, view)?;
+            Some((marker, threads::place(marker, line, column, room, self.shaper.as_ref())))
+        };
+        self.margin.marks().iter().filter_map(placed).collect()
+    }
+
+    /// The block whose marker is at a point of the layout.
+    fn marker_at(&self, spot: Point) -> Option<BlockId> {
+        let on = self.markers().into_iter().find(|(_, at)| threads::pressed(*at, spot));
+        on.map(|(marker, _)| marker.block.clone())
     }
 
     /// The tools over a selected stretch of text, once it is selected: over its first line, or under its
@@ -1372,6 +1476,7 @@ impl EditorApp {
         let card = self.landing.is_some() || self.importing.is_some() || self.copying.is_some();
         let asked = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
         let asked = asked || self.captions.alt.is_some() || self.margin.writing().is_some();
+        let asked = asked || self.margin.reading().is_some();
         card || asked || self.insert.offers(&self.editor).is_some() || Refer::offers(&self.editor).is_some()
     }
 
@@ -1455,7 +1560,11 @@ impl EditorApp {
             self.alt_switch().is_some_and(|(_, _, switch)| captions::pressed(switch, self.in_layout(at)))
         });
         let switched = std::mem::replace(&mut self.captions.over, over) != over;
-        self.references.point(found) || copy || clouded || gripped || switched
+        let rest = self.references.rest().filter(|_| !self.hung());
+        let marker = rest.and_then(|at| self.marker_at(self.in_layout(at)));
+        let marked = self.margin.over != marker;
+        self.margin.over = marker;
+        self.references.point(found) || copy || clouded || gripped || switched || marked
     }
 
     /// Forgets where the pointer rests until it next moves, as when the person goes on writing.
@@ -1488,6 +1597,14 @@ impl EditorApp {
             Pointer::Down { at, mods, clicks } => {
                 self.picked = None;
                 self.maths.typed(false);
+                // A press on a marker in the margin is about the notes of its block, and leaves the caret
+                // where it is.
+                if let Some(block) = self.marker_at(self.in_layout(at)) {
+                    self.dragging = false;
+                    self.references.press(None);
+                    return self.noting(Noting::Press(block), platform);
+                }
+                self.margin.forget();
                 // A press on a copy button is the button's, and leaves the caret where it is.
                 let button = self.copy_button(at);
                 self.code_copy.press(button);
@@ -1766,6 +1883,11 @@ impl EditorApp {
         if self.captions.alt.as_ref().is_some_and(|(figure, _)| self.captioned() != Some(figure)) {
             self.captions.alt = None;
         }
+        // A note that was open goes when something else comes to hang from the page.
+        let other = self.spelling.fix.is_some() || self.link.is_some() || self.linked.open.is_some();
+        if other || self.captions.alt.is_some() {
+            self.margin.shut();
+        }
         (self.column, self.height) = ((left, width), room.height);
         // The line under the picture the selection is at is made ready for its caption, once the button is
         // up: a caption that made room for its switch under a pointer still held would be selected by its
@@ -1840,6 +1962,14 @@ impl EditorApp {
             let button = code_copy::button(code);
             let behind = self.reaches(&block, button).then_some([self.palette.page, self.palette.code]);
             self.code_copy.paint(&block, button, behind, self.scheme, &mut list);
+        }
+
+        // Beside each block with open notes is their marker, in the margin.
+        let read = self.margin.reading().map(|(note, _)| note.id.as_str());
+        for (marker, at) in self.markers() {
+            let open = read.is_some_and(|read| marker.notes.iter().any(|note| note == read));
+            let over = self.margin.over.as_ref() == Some(&marker.block);
+            threads::mark(marker, at, (open, over), self.shaper.as_ref(), self.scheme, &mut list);
         }
 
         // A figure that is selected has a ring round its picture, and a selected picture is where the caret is.
@@ -1963,6 +2093,17 @@ impl EditorApp {
                 .on_close(Message::LinkClose);
             // The editor hangs from the caret, in place.
             element = element.popover(editor.at(caret.unwrap_or_default())).cursor(Cursor::Text);
+        } else if let Some((note, reply)) = self.margin.reading() {
+            // The note hangs under the last line of its passage. One whose text is gone hangs from the
+            // top of the margin its marker stood in.
+            let under =
+                self.note_lines(note).map(|(_, last)| Rect { x: origin.x + last.x, y: origin.y + last.y, ..last });
+            let said = self.said.of(note, threads::SAID, self.palette);
+            let thread = threads::thread(note, reply, said, &self.margin.now, self.margin.refused.as_deref());
+            element = element.popover(match under {
+                Some(under) => thread.at(under),
+                None => thread.at(Rect::new(room.width - GUTTER, GUTTER, 0.0, 0.0)).align(Align::End),
+            });
         } else if let Some((field, passage)) = self.margin.field().zip(self.margin.writing()) {
             // The field hangs under the last line of the passage the comment is about.
             let lines = notes::stretch(passage).map(|passage| self.layout.selection(&passage)).unwrap_or_default();
@@ -1988,7 +2129,7 @@ impl EditorApp {
         // A press on a reference follows it, one on a copy button copies and one on a cloud opens its menu,
         // which the pointer's shape says.
         let pressable = self.references.pointed().is_some() || self.code_copy.pointed() || self.linked.on_cloud();
-        let pressable = pressable || self.captions.over;
+        let pressable = pressable || self.captions.over || self.margin.over.is_some();
         match self.grip.corner() {
             Some(corner) => element.cursor(Cursor::Resize(figures::edge(corner))),
             None if pressable => element.cursor(Cursor::Pointer),
@@ -2480,7 +2621,7 @@ impl EditorApp {
         };
         let body = match panel {
             Panel::Styles => self.styles.view(self.editor.model().style(), self.element(), &self.palette),
-            Panel::Notes => empty("No open notes."),
+            Panel::Notes => threads::listed(&self.margin, self.editor.doc()).unwrap_or_else(|| empty("No open notes.")),
             Panel::History => empty("No earlier versions yet."),
         };
         SidePanel::new(panel.title()).on_close(Message::ClosePanel).child(body).into()
@@ -2751,6 +2892,10 @@ impl App for EditorApp {
     }
 
     fn update(&mut self, message: Message, platform: &mut dyn Platform) {
+        // A note that a press outside it put away is remembered for that press alone.
+        if !matches!(message, Message::Note(Noting::Close) | Message::Pointer(Pointer::Down { .. })) {
+            self.margin.forget();
+        }
         match message {
             Message::Text(event) => {
                 let dollar =
@@ -2771,7 +2916,10 @@ impl App for EditorApp {
             Message::Pointer(_) if self.importing.is_some() => {}
             Message::Pointer(event) => self.pointer(event, platform),
             Message::Run(command) => self.edit(platform, |editor, platform| editor.run(command, platform)),
-            Message::Panel(panel) => self.show((self.panel != Some(panel)).then_some(panel)),
+            Message::Panel(panel) => {
+                self.margin.now = platform.wall_time().map(notes::stamp).unwrap_or_default();
+                self.show((self.panel != Some(panel)).then_some(panel));
+            }
             Message::ClosePanel => self.show(None),
             Message::Share(open) => self.sharing = open,
             Message::Correct(text) => {
@@ -2905,6 +3053,10 @@ impl App for EditorApp {
         if let Some((caption, rect)) = &self.previewed {
             describe::preview(caption, *rect, page, nodes);
         }
+        for (marker, at) in self.markers() {
+            let at = Rect { x: at.x + self.column.0, y: at.y + TOP - self.scrolled(), ..at };
+            describe::marker(&marker.block, &marker.label(), at, page, nodes);
+        }
     }
 
     fn access_action(&mut self, request: &ActionRequest, platform: &mut dyn Platform) {
@@ -2918,6 +3070,7 @@ impl App for EditorApp {
                 self.edit(platform, |editor, platform| editor.input(InputEvent::Insert(text), platform));
             }
             Some(describe::Request::Copy(block)) => self.copy_code(block, platform),
+            Some(describe::Request::Note(block)) => self.noting(Noting::Press(block), platform),
             Some(describe::Request::Alt(figure)) => {
                 self.editor.select_picture(&figure);
                 self.mark();

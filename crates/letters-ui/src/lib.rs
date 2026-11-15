@@ -40,6 +40,7 @@ mod styles;
 mod tex;
 mod text;
 mod theme;
+mod threads;
 pub use yewi_tokens as tokens;
 mod tree;
 mod ui;

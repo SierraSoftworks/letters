@@ -23,6 +23,8 @@ pub const WINDOW: Size = Size { width: 1280.0, height: 800.0 };
 #[derive(Clone, Debug, Default)]
 pub struct TestPlatform {
     pub now_ms: u64,
+    /// The time of day, in seconds since 1970. `None` is a shell without a clock.
+    pub wall: Option<u64>,
     pub clipboard: Option<Clip>,
     /// The words the person added to their own dictionary.
     pub learned: Vec<String>,
@@ -32,6 +34,10 @@ pub struct TestPlatform {
 impl Platform for TestPlatform {
     fn now_ms(&self) -> u64 {
         self.now_ms
+    }
+
+    fn wall_time(&self) -> Option<u64> {
+        self.wall
     }
 
     fn clipboard_read(&mut self) -> Option<Clip> {
