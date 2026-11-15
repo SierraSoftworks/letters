@@ -9,8 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use axum::http::{Method, StatusCode};
+use common::desk::{Desk, settle};
 use common::{Client, Server};
-use letters_api::{Code, Error, Fetch, JSON, Preview, paths};
+use letters_api::{Code, Error, Fetch, Grant, Grantee, JSON, Preview, Role, Shares, paths};
+use letters_model::{Block, BlockKind, Op};
 use letters_server::fetch::Roots;
 
 /// A smallest PNG, by its first bytes.
@@ -141,6 +143,49 @@ async fn a_linked_picture_is_fetched_only_as_the_owners_rules_allow() {
     for request in asked.iter() {
         for telling in ["cookie", "referer", "authorization", "from:", "accept-language", "ada", "guest"] {
             assert!(!request.contains(telling), "the site is told nothing of who asks: {telling} in {request}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_to_read_shows_the_linked_pictures_the_server_may_fetch_unasked() {
+    let site = Site::start();
+    let (server, ada, id) = trusting("fetch-read", &site).await;
+    // Three figures whose pictures are still links: under the owner's source, under it but not there,
+    // and somewhere the owner does not trust.
+    let (trusted, missing) = (site.address("/sky.png"), site.address("/nothing.png"));
+    let foreign = "https://pictures.example/sky.png".to_owned();
+    let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
+    settle([&mut desk]).await;
+    let figure = |src: &String| {
+        let (asset, src, alt) = (None, Some(src.clone()), "The sky".to_owned());
+        let kind = BlockKind::Figure { asset, src, alt, width: 300.0, height: 200.0, numbered: false };
+        Op::InsertBlock { parent: None, index: 0, block: Block::new(letters_server::ids::block_id().as_str(), kind) }
+    };
+    desk.edit([&trusted, &missing, &foreign].map(figure));
+    settle([&mut desk]).await;
+    desk.leave().await;
+    // Carol has signed in before, and is handed the document.
+    let mut carol = server.reader("carol", &[]);
+    let to = Grantee::Person { id: "sub-carol".into(), name: String::new() };
+    let shares = Shares { people: vec![Grant { to, role: Role::Reader }], links: Vec::new() };
+    ada.put::<Shares>(&paths::shares(&id), &shares).await.unwrap();
+
+    // Whether the page carries the picture within itself, and which addresses are left as links.
+    let picture = format!("src=\"data:image/png;base64,{}\"", letters_server::ids::base64(PNG));
+    let told = |page: String| (page.contains(&picture), [&trusted, &missing, &foreign].map(|url| page.contains(url)));
+    let read = paths::read_page(&id);
+    assert_eq!(told(server.reader("ada", &["family"]).get(&read).await.text()), (true, [false, true, true]));
+    // A document someone was only handed is held back, and fetches nothing until they trust it.
+    let before = site.asked.lock().unwrap().len();
+    assert_eq!(told(carol.get(&read).await.text()), (false, [true, true, true]));
+    assert_eq!(site.asked.lock().unwrap().len(), before, "nothing is fetched for a document held back");
+    assert_eq!(carol.post(&paths::trust(&id), &()).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(told(carol.get(&read).await.text()), (true, [false, true, true]));
+
+    for request in site.asked.lock().unwrap().iter() {
+        for telling in ["cookie", "referer", "authorization", "ada", "carol"] {
+            assert!(!request.contains(telling), "the site is told nothing of who reads: {telling} in {request}");
         }
     }
 }

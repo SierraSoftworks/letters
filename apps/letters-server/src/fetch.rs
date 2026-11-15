@@ -7,6 +7,7 @@
 //! and nothing of the session, and gives up after [`LIMIT`]. The server sits inside its owner's network,
 //! so only the sources its owner listed may be on a private address.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
@@ -17,6 +18,7 @@ use letters_convert::{PageSummary, page_summary};
 use letters_trust::{Fetch, FetchError, Gate, HttpsUrl, ImageType, Kind, Limits, Origin, Source, Trust};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use ureq::config::{AutoHeaderValue, Config};
 use ureq::http::{HeaderMap, header};
 use ureq::tls::{Certificate, RootCerts, TlsConfig};
@@ -34,6 +36,10 @@ use crate::store::Table;
 pub const LIMIT: Duration = Duration::from_secs(10);
 /// How many fetches run at once, for everyone together. The rest wait their turn.
 pub const AT_ONCE: usize = 16;
+/// How many of its linked pictures a page the server writes shows, and how many bytes of them. A page
+/// carries its pictures within itself, and is not to grow without end.
+pub const SHOWN: usize = 24;
+pub const SHOWN_BYTES: usize = 32 << 20;
 /// All a site is told about who asks.
 const CLIENT: &str = "Letters";
 /// The kinds of picture a document shows.
@@ -219,6 +225,53 @@ impl App {
         })?;
         let (_, kind, bytes) = get(guard, &self.fetches.roots, PICTURES)?;
         Ok(Fetched { kind, bytes })
+    }
+
+    /// The pictures the document `id` links to at `urls` that `who` is shown unasked, each by its
+    /// address: those under a trusted source, the owner's or their own, as when the document opens in
+    /// the editor. For a page the server writes whole, where no editor is there to ask for them.
+    ///
+    /// One that is not fetched, whatever the reason, is left out: its link stands in for it. So are
+    /// those beyond [`SHOWN`] and [`SHOWN_BYTES`], and for whoever only a link let in those beyond what
+    /// their visit may ask for.
+    pub async fn linked_pictures(
+        self: &Arc<Self>,
+        who: &Signed,
+        id: &str,
+        urls: Vec<String>,
+    ) -> HashMap<String, Fetched> {
+        let (app, asks, document) = (self.clone(), who.clone(), id.to_owned());
+        let allowed = crate::api::blocking(move || {
+            app.guarded(&asks, &document, |gate| {
+                let guarded = |url: String| Some((gate.fetch_on_open(&url, Limits::default()).ok()?, url));
+                Ok(urls.into_iter().filter_map(guarded).take(SHOWN).collect::<Vec<_>>())
+            })
+        });
+        let mut fetches = JoinSet::new();
+        for (guard, url) in allowed.await.unwrap_or_default() {
+            if self.fetching(who).is_err() {
+                break;
+            }
+            let app = self.clone();
+            fetches.spawn(async move {
+                let turn = app.fetches.turn().await.ok()?;
+                let got = tokio::task::spawn_blocking(move || {
+                    let _turn = turn;
+                    get(guard, &app.fetches.roots, PICTURES)
+                });
+                let (_, kind, bytes) = got.await.ok()?.ok()?;
+                Some((url, Fetched { kind, bytes }))
+            });
+        }
+        let (mut shown, mut weight) = (HashMap::new(), 0);
+        while let Some(fetched) = fetches.join_next().await {
+            let Ok(Some((url, fetched))) = fetched else { continue };
+            weight += fetched.bytes.len();
+            if weight <= SHOWN_BYTES {
+                shown.insert(url, fetched);
+            }
+        }
+        shown
     }
 
     /// Reads what the page behind a link says of itself. The page's picture is named by its whole
