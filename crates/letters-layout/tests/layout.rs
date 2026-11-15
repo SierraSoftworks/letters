@@ -307,6 +307,85 @@ fn line_step_reaches_short_lines() {
 }
 
 #[test]
+fn home_and_end_follow_the_way_a_line_reads() {
+    let cases = [("English", PROSE.to_owned(), false), ("Hebrew", [HEBREW; 16].join(" "), true)];
+    for (name, text, rtl) in cases {
+        let layout = laid(&doc(vec![paragraph("a", &text)]));
+        let at = |offset: usize| Pos::new("a", offset);
+        let caret = |pos: &Pos| layout.caret(pos).unwrap();
+        let middle = text.char_indices().nth(8).unwrap().0;
+        let (home, end) = (layout.line_edge(&at(middle), false).unwrap(), layout.line_edge(&at(middle), true).unwrap());
+        assert!(home.offset < middle && middle < end.offset, "{name}: Home goes back in the text and End on");
+        assert!(end.offset < text.len(), "{name}: the text wraps");
+        assert_eq!((caret(&home).y, caret(&end).y), (caret(&at(middle)).y, caret(&at(middle)).y), "{name}");
+        assert_eq!(caret(&end).x < caret(&home).x, rtl, "{name}: the line ends at the side it is read toward");
+    }
+}
+
+/// Texts whose lines wrap with no space to wrap at, each with an `x` far past the end of its lines.
+fn unspaced() -> Vec<(&'static str, String, f32)> {
+    vec![
+        ("a long word", "abcdefghij".repeat(20), WIDTH * 2.0),
+        ("hyphens", "well-known-".repeat(20), WIDTH * 2.0),
+        ("Japanese", "今日は天気がいいので散歩に行きます".repeat(6), WIDTH * 2.0),
+        ("a long Hebrew word", "שלום".repeat(50), -WIDTH),
+    ]
+}
+
+#[test]
+fn a_line_that_wraps_with_no_space_ends_after_its_last_character() {
+    for (name, text, past) in unspaced() {
+        let layout = laid(&doc(vec![paragraph("a", &text)]));
+        let at = |offset: usize| Pos::new("a", offset);
+        let first = layout.caret(&at(0)).unwrap();
+        let (end, before_wrap) = layout.line_edge_sided(&at(0), false, true).unwrap();
+        let last = text[..end.offset].char_indices().next_back().unwrap().0;
+        let second = layout.caret(&end).unwrap();
+        assert!(before_wrap, "{name}: the line ends where the next begins");
+        assert_eq!(layout.caret(&at(last)).unwrap().y, first.y, "{name}: after its last character");
+        assert!(second.y > first.y, "{name}: which a caret from the other side starts the next line at");
+        let beside = Point { x: past, y: first.y + first.height / 2.0 };
+        assert_eq!(layout.hit_sided(beside), Some((end.clone(), true)), "{name}: a point past the end is there");
+
+        let ended = layout.caret_sided(&end, true).unwrap();
+        assert_eq!(ended.y, first.y, "{name}: the caret stays on the line it ends");
+        assert!((ended.x - first.x).abs() > (second.x - first.x).abs(), "{name}: at its far side");
+        let edge = |before_wrap: bool, end_of: bool| layout.line_edge_sided(&end, before_wrap, end_of).unwrap();
+        assert_eq!(edge(true, true), (end.clone(), true), "{name}: End pressed twice stays put");
+        assert_eq!(edge(true, false), (at(0), false), "{name}: and Home goes back along the line");
+        assert_eq!(edge(false, false), (end.clone(), false), "{name}: from the other side it is the line's start");
+        let (below, sided) = layout.line_step_sided(&end, true, ended.x, true).unwrap();
+        assert_eq!(layout.caret_sided(&below, sided).unwrap().y, second.y, "{name}: a step down is one line");
+        assert_eq!(
+            layout.line_step_sided(&below, sided, ended.x, false),
+            Some((end.clone(), true)),
+            "{name}: and back"
+        );
+
+        // A position alone says nothing of its side, so it is kept off an end that needs one.
+        let plain = [layout.line_edge(&at(0), true), layout.hit(beside)];
+        assert_eq!(plain, [Some(at(last)), Some(at(last))], "{name}: without a side");
+    }
+}
+
+#[test]
+fn a_caret_has_a_side_only_where_a_line_wraps_with_no_space() {
+    let layout = laid(&prose(1));
+    let at = |offset: usize| Pos::new("p0", offset);
+    let (end, before_wrap) = layout.line_edge_sided(&at(0), false, true).unwrap();
+    assert_eq!((&PROSE[end.offset..=end.offset], before_wrap), (" ", false), "a wrap at a space ends before it");
+    let top = layout.caret(&at(0)).unwrap().y;
+    let beside = layout.hit_sided(Point { x: WIDTH * 2.0, y: top + 5.0 });
+    assert_eq!(beside, Some((end.clone(), false)), "also for a point past the line's end");
+    for offset in [0, 3, end.offset, end.offset + 1, PROSE.len()] {
+        let pos = at(offset);
+        assert_eq!(layout.caret_sided(&pos, true), layout.caret(&pos), "a side left over moves no caret at {offset}");
+        let edges = [false, true].map(|end| layout.line_edge_sided(&pos, true, end).map(|(pos, _)| pos));
+        assert_eq!(edges, [false, true].map(|end| layout.line_edge(&pos, end)), "nor a line's edges at {offset}");
+    }
+}
+
+#[test]
 fn an_edit_gives_the_same_layout_as_starting_over() {
     let start = || {
         doc(vec![
