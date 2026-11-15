@@ -17,6 +17,7 @@ mod motion;
 mod parts;
 mod refs;
 mod rules;
+mod shared;
 mod table;
 mod text;
 mod tree;
@@ -337,6 +338,8 @@ pub struct Editor {
     origin: Kept,
     /// Where the words typed for a reference start that Esc has said are only words.
     dismissed: Option<(BlockId, usize)>,
+    /// The blocks that the command at hand put back under another id, see [`shared`].
+    renames: shared::Renames,
 }
 
 impl Editor {
@@ -362,6 +365,7 @@ impl Editor {
             merges: 0,
             origin: Kept::default(),
             dismissed: None,
+            renames: Vec::new(),
         };
         if let Some(pos) = first {
             editor.place(pos);
@@ -563,6 +567,7 @@ impl Editor {
         }
         let now = platform.now_ms();
         self.end_composition();
+        self.renames.clear();
         let rule = std::mem::take(&mut self.rule);
         let goal = self.goal.take();
         self.mark();
@@ -629,6 +634,7 @@ impl Editor {
         if ops.is_empty() {
             return false;
         }
+        let (ops, renames) = shared::unshared(self.doc(), ops);
         // The model records an undo step only for an edit that changed something, so the count kept here
         // must do the same. An edit that adds or removes blocks always does, and one to the style or the
         // document's own fields says so in its change. Any other is checked against the blocks it names.
@@ -661,6 +667,11 @@ impl Editor {
                 return false;
             }
         };
+        // The selection stays with a block that came back under another id.
+        for pos in self.caret.iter_mut().flat_map(|caret| [&mut caret.selection.anchor, &mut caret.selection.head]) {
+            pos.block = shared::renamed(&renames, &pos.block);
+        }
+        self.renames.extend(renames);
         let differs = |blocks: Vec<Block>| blocks.iter().any(|block| self.doc().block(&block.id) != Some(block));
         let changed = change.style || change.document || before.is_none_or(differs);
         if changed {
@@ -758,6 +769,12 @@ impl Editor {
 
     fn block(&self, id: &BlockId) -> Option<&Block> {
         self.model.block(id)
+    }
+
+    /// The id that a block goes by now which the command at hand took out and put back. Any id held from
+    /// before such an edit is asked for here, since a block that shares it may have taken it.
+    fn renamed(&self, id: &BlockId) -> BlockId {
+        shared::renamed(&self.renames, id)
     }
 
     /// The position on a character boundary of a text block that is nearest to `pos`.

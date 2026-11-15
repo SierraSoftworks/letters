@@ -9,6 +9,7 @@ use crate::{Caret, Composing, Editor, InputEvent, Kind, Platform, text};
 impl Editor {
     pub(crate) fn handle(&mut self, event: InputEvent, platform: &mut dyn Platform) {
         let now = platform.now_ms();
+        self.renames.clear();
         let rule = std::mem::take(&mut self.rule);
         self.goal = None;
         match event {

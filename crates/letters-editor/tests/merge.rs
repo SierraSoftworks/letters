@@ -1,9 +1,9 @@
 mod common;
 
 use common::Do::{K, T};
-use common::{Do, Harness, SAMPLE, action, canon, clip, parse, perform, sound};
-use letters_editor::InputEvent;
-use letters_model::{Model, ReplicaId};
+use common::{Action, Do, Harness, SAMPLE, action, canon, check, clip, parse, perform, sound};
+use letters_editor::{Command, InputEvent, Spot, TableEdit};
+use letters_model::{BlockId, BlockKind, Model, ReplicaId};
 use proptest::prelude::*;
 
 /// Two writers on `state`: this one with its selection, and another who plays `script` from `theirs`.
@@ -148,6 +148,72 @@ fn a_history_that_cannot_be_read_changes_nothing() {
     let mut editor = Harness::new("p one|");
     assert!(editor.editor.merge(b"not a history").is_err());
     assert_eq!(editor.state(), canon("p one|"));
+}
+
+/// The lines of a state in an order of their own, for where two blocks that are alike may stand either way.
+fn lines(state: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = state.lines().collect();
+    lines.sort_unstable();
+    lines
+}
+
+#[test]
+fn a_block_that_two_writers_moved_at_once_is_two_blocks_that_still_move() {
+    let line = |block: &str, below| Spot::Line { block: BlockId::new(block), below };
+    // (before, what both writers do at once, what one of them does next, after)
+    let cases = [
+        // Both put a line in a quote, and one takes its copy out again.
+        (
+            "p one\np |two",
+            vec![Action::Run(Command::SetBlock(BlockKind::Quote))],
+            vec![Action::Key("Backspace")],
+            "p one\np |two\n> p two",
+        ),
+        // Both take a line out of a quote, and one quotes its copy again by shorthand.
+        (
+            "> p |two\n> p three",
+            vec![Action::Key("Backspace")],
+            vec![Action::Type("> ".into())],
+            "p two\n> p |two\n> p three",
+        ),
+        // Both move a figure to the top, and one moves its copy to the end, where it is left selected.
+        (
+            "p one\nfig* Boats\np two",
+            vec![Action::Run(Command::MoveFigure(line("b1", false)))],
+            vec![Action::Run(Command::MoveFigure(line("b3", true)))],
+            "fig Boats\np one\np two\nfig* Boats",
+        ),
+        // Both move a row down, and one moves its copy back up with the caret in it.
+        (
+            "r1> td A|\nr1> td B\nr2> td C\nr2> td D",
+            vec![Action::Run(Command::Table(TableEdit::MoveRow { to: 1 }))],
+            vec![Action::Run(Command::Table(TableEdit::MoveRow { to: 0 }))],
+            "r1> td A|\nr1> td B\nr2> td C\nr2> td D\nr3> td A\nr3> td B",
+        ),
+    ];
+    for (before, both, next, after) in cases {
+        let mut first = Harness::new(before);
+        let mut second = first.fork(2);
+        // The other writer stands where this one does.
+        second.editor.select(first.editor.selection().cloned().expect("the writers have a caret"));
+        if let Some(picture) = first.editor.picture().cloned() {
+            second.editor.select_picture(&picture);
+        }
+        for writer in [&mut first, &mut second] {
+            both.iter().for_each(|action| perform(writer, action));
+        }
+        assert!(first.merge(&second) && second.merge(&first));
+        let twice = first.text();
+        assert_eq!(twice.lines().count(), canon(after).lines().count(), "each writer's block is there: {twice:?}");
+
+        next.iter().for_each(|action| perform(&mut first, action));
+        assert_eq!(lines(&first.state()), lines(&canon(after)), "{next:?} after both did {both:?} to {before:?}");
+        assert!(check(&first).is_ok(), "{next:?} after both did {both:?} to {before:?}");
+        assert!(second.merge(&first));
+        assert_eq!(second.text(), first.text(), "the other writer after {next:?}");
+        while first.text() != twice && first.key("Mod+z") {}
+        assert_eq!(first.text(), twice, "{next:?} undone");
+    }
 }
 
 proptest! {

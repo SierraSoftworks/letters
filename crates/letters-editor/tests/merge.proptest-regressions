@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dee971eb0f290190ae89d4548a8e1c09b41e39166e8eafd51c85320709c5ae6b # shrinks to turns = [(true, Select(38, 0, 1, 0), false), (false, Select(26, 0, 38, 0), false), (true, Type("a"), false), (false, Type("a"), true), (true, MoveFigure(2, false, false), false)]

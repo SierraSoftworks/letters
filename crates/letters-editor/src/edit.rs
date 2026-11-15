@@ -470,7 +470,7 @@ impl Editor {
             let index = if down { len - gone } else { 0 };
             ops.push(Op::InsertBlock { parent: into, index, block: block.clone() });
             self.apply(ops);
-            self.place(head);
+            self.place(Pos::new(self.renamed(&head.block), head.offset));
             return true;
         }
         let new = BlockId::new(platform.new_id());

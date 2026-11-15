@@ -210,7 +210,7 @@ impl Editor {
             }
             _ => return self.apply_inline_rule(&id, typed, &caret.marks, platform),
         }
-        self.place(Pos::new(id, 0));
+        self.place(Pos::new(self.renamed(&id), 0));
         true
     }
 

@@ -236,6 +236,7 @@ impl Editor {
             return moved;
         }
         self.apply(ops);
+        let moved: Vec<_> = moved.into_iter().map(|(caption, figure)| (caption, self.renamed(&figure))).collect();
         // A caret in a caption that moved stays in its text.
         let follow = |pos: &Pos| match moved.iter().find(|(caption, _)| *caption == pos.block) {
             Some((_, figure)) => Pos::new(figure.clone(), pos.offset),

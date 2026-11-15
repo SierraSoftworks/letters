@@ -318,7 +318,7 @@ impl Editor {
         let Some(home) = self.home(spot, Some(&id)) else { return };
         if self.put(vec![figure], home, Some(&id), None, platform) {
             self.settle();
-            self.place_picture(&id);
+            self.place_picture(&self.renamed(&id));
         }
     }
 
