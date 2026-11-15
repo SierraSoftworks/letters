@@ -111,6 +111,8 @@ pub const SIGMA: Icon = Icon::new("M18 7V5a1 1 0 0 0-1-1H6.5a.5.5 0 0 0-.4.8l4.5
 pub const SQUARE: Icon = Icon::new("M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z");
 /// `strikethrough`
 pub const STRIKETHROUGH: Icon = Icon::new("M16 4H9a3 3 0 0 0-2.83 4M14 12a4 4 0 0 1 0 8H6M4 12L20 12");
+/// `table`
+pub const TABLE: Icon = Icon::new("M12 3v18M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2zM3 9h18M3 15h18");
 /// `text-align-center`
 pub const TEXT_ALIGN_CENTER: Icon = Icon::new("M21 5H3M17 12H7M19 19H5");
 /// `text-align-end`

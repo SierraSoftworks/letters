@@ -26,6 +26,15 @@ pub enum Inserting {
     Close,
 }
 
+/// What taking an offer does to its line.
+#[derive(Clone)]
+pub(crate) enum Put {
+    /// Makes the line a block of this kind.
+    Kind(BlockKind),
+    /// Puts a table in the line's place.
+    Table,
+}
+
 /// Something the menu puts on the line.
 pub(crate) struct Offer {
     pub name: &'static str,
@@ -33,29 +42,34 @@ pub(crate) struct Offer {
     icon: Icon,
     /// What typed at the start of a line makes the same thing.
     shorthand: &'static str,
-    pub kind: BlockKind,
+    pub put: Put,
 }
 
-const fn offer(group: &'static str, name: &'static str, icon: Icon, shorthand: &'static str, kind: BlockKind) -> Offer {
-    Offer { name, group, icon, shorthand, kind }
+const fn offer(group: &'static str, name: &'static str, icon: Icon, shorthand: &'static str, put: Put) -> Offer {
+    Offer { name, group, icon, shorthand, put }
 }
 
-const fn list(list: ListKind) -> BlockKind {
-    BlockKind::ListItem { list, depth: 0 }
+const fn kind(kind: BlockKind) -> Put {
+    Put::Kind(kind)
 }
 
-pub(crate) static OFFERS: [Offer; 11] = [
-    offer("Text", "Heading 1", icon::HEADING_1, "#", BlockKind::Heading { level: 1 }),
-    offer("Text", "Heading 2", icon::HEADING_2, "##", BlockKind::Heading { level: 2 }),
-    offer("Text", "Heading 3", icon::HEADING_3, "###", BlockKind::Heading { level: 3 }),
+const fn list(list: ListKind) -> Put {
+    Put::Kind(BlockKind::ListItem { list, depth: 0 })
+}
+
+pub(crate) static OFFERS: [Offer; 12] = [
+    offer("Text", "Heading 1", icon::HEADING_1, "#", kind(BlockKind::Heading { level: 1 })),
+    offer("Text", "Heading 2", icon::HEADING_2, "##", kind(BlockKind::Heading { level: 2 })),
+    offer("Text", "Heading 3", icon::HEADING_3, "###", kind(BlockKind::Heading { level: 3 })),
     offer("Text", "Bulleted list", icon::LIST, "-", list(ListKind::Bullet)),
     offer("Text", "Numbered list", icon::LIST_ORDERED, "1.", list(ListKind::Ordered)),
     offer("Text", "Task list", icon::LIST_CHECKS, "[ ]", list(ListKind::Task { checked: false })),
-    offer("Text", "Quote", icon::TEXT_QUOTE, ">", BlockKind::Quote),
-    offer("Text", "Code block", icon::CODE_XML, "```", BlockKind::Code { language: None }),
-    offer("Elements", "Callout", icon::INFO, "> [!INFO]", BlockKind::Callout { tone: Tone::Info }),
-    offer("Elements", "Formula", icon::SIGMA, "$$", BlockKind::Formula),
-    offer("Elements", "Divider", icon::SEPARATOR_HORIZONTAL, "---", BlockKind::Divider),
+    offer("Text", "Quote", icon::TEXT_QUOTE, ">", kind(BlockKind::Quote)),
+    offer("Text", "Code block", icon::CODE_XML, "```", kind(BlockKind::Code { language: None })),
+    offer("Elements", "Table", icon::TABLE, "| a | b |", Put::Table),
+    offer("Elements", "Callout", icon::INFO, "> [!INFO]", kind(BlockKind::Callout { tone: Tone::Info })),
+    offer("Elements", "Formula", icon::SIGMA, "$$", kind(BlockKind::Formula)),
+    offer("Elements", "Divider", icon::SEPARATOR_HORIZONTAL, "---", kind(BlockKind::Divider)),
 ];
 
 /// The offers that match what is typed after the slash: those with a word that begins with it, in the

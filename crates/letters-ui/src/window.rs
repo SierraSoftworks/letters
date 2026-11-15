@@ -21,7 +21,7 @@ use crate::describe;
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
 use crate::highlight;
 use crate::icon::{self, Icon};
-use crate::insert::{Insert, Inserting};
+use crate::insert::{Insert, Inserting, Put};
 use crate::maths::{self, Maths, Sheet, SheetLines, Source};
 use crate::motion::{self, FRAME_MS};
 use crate::opening::{self, Landing, Location, Recent, Request};
@@ -1518,11 +1518,16 @@ impl EditorApp {
     /// typed after it.
     fn put(&mut self, index: usize, platform: &mut dyn Platform) {
         let Some((line, typed, offers)) = self.insert.offers(&self.editor) else { return };
-        let Some(kind) = offers.get(index).map(|offer| offer.kind.clone()) else { return };
+        let Some(put) = offers.get(index).map(|offer| offer.put.clone()) else { return };
         self.insert.close();
         self.editor.select(Selection { anchor: Pos::new(line.clone(), 0), head: Pos::new(line, typed) });
         self.edit(platform, |editor, platform| editor.run(Command::Delete(Motion::Left), platform));
-        self.edit(platform, |editor, platform| editor.run(Command::SetBlock(kind), platform));
+        let command = match put {
+            Put::Kind(kind) => Command::SetBlock(kind),
+            // A header row over two more, three cells across: enough to start with.
+            Put::Table => Command::InsertTable { rows: 3, columns: 3 },
+        };
+        self.edit(platform, |editor, platform| editor.run(command, platform));
     }
 
     /// Lets the insert menu have the keys that walk it and take from it, while it shows.

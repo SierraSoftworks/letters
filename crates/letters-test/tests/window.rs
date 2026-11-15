@@ -2298,6 +2298,19 @@ fn the_insert_menu_puts_what_is_taken_on_its_line() {
 }
 
 #[test]
+fn the_insert_menu_puts_a_table_where_the_slash_was() {
+    let mut window = blank();
+    window.type_text("/tab").key("Enter");
+    window.assert_closed(Role::ListBox, "Insert");
+    let cell = window.editor().cell().expect("the caret is in a table");
+    assert_eq!((cell.row, cell.column), (0, 0), "in its first cell");
+    assert!(cell.rows >= 2 && cell.columns >= 2, "a table has more cells than one: {cell:?}");
+    window.type_text("Roof");
+    let written = window.markdown();
+    assert!(written.contains("Roof") && !written.contains('/'), "the slash is gone: {written}");
+}
+
+#[test]
 fn the_insert_menu_stays_away_where_a_slash_is_only_a_slash() {
     // A slash inside a line opens nothing.
     let mut window = blank();
