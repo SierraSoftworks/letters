@@ -264,6 +264,24 @@ fn ops_of_one_batch_name_blocks_that_share_an_id_as_they_stood_before_it() {
 }
 
 #[test]
+fn a_block_named_like_a_copy_is_told_from_the_copies() {
+    // "n~2" is a block of its own. Each replica adds a block under the id "n" after it, and merged, the
+    // second of those goes by the next free number.
+    let own = Document { blocks: vec![Block::text("n~2", BlockKind::Paragraph, "own")], ..Document::default() };
+    let (mut a, mut b) = (Model::new(own.clone(), ReplicaId::from(1)), Model::new(own, ReplicaId::from(2)));
+    let added =
+        |text: &str| Op::InsertBlock { parent: None, index: 1, block: Block::text("n", BlockKind::Paragraph, text) };
+    a.apply([added("one")]).unwrap();
+    b.apply([added("two")]).unwrap();
+    sync(&mut a, &mut b);
+    let second = a.block(&id("n~3")).expect("the second of the two").plain_text();
+
+    // With the first of the two gone, an op that names the second still means it.
+    a.apply([Op::RemoveBlock { block: id("n") }, typed("n~3", 0, "> ")]).unwrap();
+    assert_eq!(texts(&a), ["own".to_string(), format!("> {second}")]);
+}
+
+#[test]
 fn an_older_revision_is_shown_read_only() {
     let (mut a, mut b) = pair();
     let first = a.revision();

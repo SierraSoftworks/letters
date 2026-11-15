@@ -578,7 +578,7 @@ impl Model {
         let mut step = Step::new();
         let mut refused = None;
         for (nth, op) in ops.iter_mut().enumerate() {
-            if let Some((named, now)) = target(op).zip(copies.now(nth)) {
+            if let Some((named, now)) = target(op).zip(copies.now(self, nth)) {
                 *named = now;
             }
             let op = &*op;
@@ -1533,25 +1533,25 @@ impl Copies {
             return Self::default();
         }
         let copy = |id: &mut BlockId| {
-            let stored = &model.index[model.find(id)?].stored;
-            let number = match id.as_str().strip_prefix(stored.as_str())? {
-                "" => 1,
-                rest => rest.strip_prefix('~')?.parse().ok()?,
-            };
+            let at = model.find(id)?;
+            let stored = &model.index[at].stored;
+            // Counted by where it stands. The number in its name can be higher, where a block of another
+            // id is stored under a name of the same form.
+            let number = model.index[..=at].iter().filter(|entry| entry.stored == *stored).count();
             Some((stored.clone(), number))
         };
         Self { named: ops.iter_mut().map(|op| target(op).and_then(copy)).collect(), gone: Vec::new() }
     }
 
-    /// What the block of the `nth` op goes by now, if no longer by what the op calls it.
-    fn now(&self, nth: usize) -> Option<BlockId> {
-        let (stored, number) = self.named.get(nth)?.as_ref()?;
+    /// What the block of the `op`th op goes by now, once the batch has taken a block away. Any block gone
+    /// can have freed the name of another, so it is looked up by where it stands.
+    fn now(&self, model: &Model, op: usize) -> Option<BlockId> {
+        let (stored, number) = self.named.get(op)?.as_ref().filter(|_| !self.gone.is_empty())?;
         let earlier = self.gone.iter().filter(|(id, gone)| id == stored && gone < number).count();
         let there = !self.gone.iter().any(|(id, gone)| id == stored && gone == number);
-        (earlier > 0 && there).then(|| match number - earlier {
-            1 => stored.clone(),
-            now => BlockId::new(format!("{stored}~{now}")),
-        })
+        let mut stored = model.index.iter().enumerate().filter(|(_, entry)| entry.stored == *stored);
+        let (at, _) = stored.nth(number - earlier - 1).filter(|_| there)?;
+        nth(&model.doc.blocks, &model.index, at).map(|block| block.id.clone())
     }
 
     /// Notes that the `nth` op took its block away.
