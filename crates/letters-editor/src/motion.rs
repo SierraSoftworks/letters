@@ -408,11 +408,18 @@ impl Editor {
     }
 
     pub(crate) fn select_word(&mut self) {
-        let Some(head) = self.selection().map(|selection| selection.head.clone()) else { return };
+        let Some(caret) = &self.caret else { return };
+        let (head, before_wrap) = (caret.selection.head.clone(), caret.before_wrap);
         let Some(block) = self.block(&head.block) else { return };
-        let word = text::word_around(&block.plain_text(), head.offset);
+        let text = block.plain_text();
+        // At the end of a line that wraps with no space, the word is the one that line ends with, and not
+        // the one the next line starts with.
+        let inside = if before_wrap { text::prev(&text, head.offset) } else { head.offset };
+        let word = text::word_around(&text, inside);
         let at = |offset: usize| Pos::new(head.block.clone(), offset);
         self.set_selection(Selection { anchor: at(word.start), head: at(word.end) });
+        // A word that ends with the line ends on it.
+        self.side(&LinePos { pos: at(word.end), before_wrap: before_wrap && word.end == head.offset });
     }
 
     pub(crate) fn select_block(&mut self) {

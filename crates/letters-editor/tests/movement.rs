@@ -310,3 +310,23 @@ fn a_press_at_a_wrap_is_on_the_line_that_layout_says() {
     editor.editor.select(Selection::caret(Pos::new("b1", 5)));
     assert!(!editor.editor.before_wrap(), "a press at the start of the next line");
 }
+
+#[test]
+fn a_word_is_picked_on_the_line_the_caret_is_shown_on() {
+    // Lines of five characters: `well-`, `known`, `-word`, and `abcde`, `fghij`. The caret is put where the
+    // first line wraps, on one side of it. The last flag says whether the word picked ends on that line.
+    let cases = [
+        ("p |well-known-word", true, "p well^-|known-word", true),
+        ("p |well-known-word", false, "p well-^known|-word", false),
+        // A word that the wrap runs through is picked whole from either side.
+        ("p |abcdefghij", true, "p ^abcdefghij|", false),
+        ("p |abcdefghij", false, "p ^abcdefghij|", false),
+    ];
+    for (before, before_wrap, after, ends_before_wrap) in cases {
+        let mut editor = narrow(before, &[]);
+        editor.editor.select_at(Selection::caret(Pos::new("b1", 5)), before_wrap);
+        editor.run(Command::SelectWord);
+        assert_eq!(editor.state(), canon(after), "{before:?}, before the wrap: {before_wrap}");
+        assert_eq!(editor.editor.before_wrap(), ends_before_wrap, "{before:?}, before the wrap: {before_wrap}");
+    }
+}
