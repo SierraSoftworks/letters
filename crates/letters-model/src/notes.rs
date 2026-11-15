@@ -4,6 +4,7 @@
 //! as for `document.json`, and unknown fields and note types are kept and written back.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::mem;
 use std::ops::Range;
 
 use serde_json::{Map, Value};
@@ -193,15 +194,21 @@ impl Notes {
         self.notes.iter_mut().for_each(|note| note.anchor.follow(model));
     }
 
-    /// Adds a conflict that a merge found. Older conflicts on its block are resolved by it: its versions
-    /// are the ones left to choose from. Raising a note that is held already changes nothing.
-    pub fn raise(&mut self, conflict: Note) {
-        let on_block =
-            |note: &Note| matches!(note.kind, NoteKind::Conflict { .. }) && note.anchor.block == conflict.anchor.block;
+    /// Adds the conflicts that a merge found. Raising one that is held already changes nothing.
+    ///
+    /// A conflict is resolved by a newer one on its block, whichever copy raised that: the newer versions
+    /// are the ones left to choose from. So this is also called with none, after notes came in.
+    pub fn raise(&mut self, conflicts: impl IntoIterator<Item = Note>) {
+        self.merge(&Notes { notes: conflicts.into_iter().collect(), extra: Extra::new() });
+        let is_conflict = |note: &Note| matches!(note.kind, NoteKind::Conflict { .. });
+        let mut newest: BTreeMap<BlockId, String> = BTreeMap::new();
+        for note in self.notes.iter().filter(|note| is_conflict(note)) {
+            let held = newest.entry(note.anchor.block.clone()).or_default();
+            *held = note.created.clone().max(mem::take(held));
+        }
         // Times that tie leave both open: there is no telling which of the two came after the other.
-        let older = |note: &&mut Note| on_block(note) && note.created < conflict.created;
+        let older = |note: &&mut Note| is_conflict(note) && note.created < newest[&note.anchor.block];
         self.notes.iter_mut().filter(older).for_each(|note| note.resolved = true);
-        self.merge(&Notes { notes: vec![conflict], extra: Extra::new() });
     }
 
     /// Takes in the notes of another copy of the document. Returns whether anything here changed.
@@ -212,7 +219,7 @@ impl Notes {
     pub fn merge(&mut self, other: &Notes) -> bool {
         let before = self.clone();
         let mut notes: BTreeMap<String, Note> = BTreeMap::new();
-        for note in std::mem::take(&mut self.notes).into_iter().chain(other.notes.iter().cloned()) {
+        for note in mem::take(&mut self.notes).into_iter().chain(other.notes.iter().cloned()) {
             let joined = match notes.remove(&note.id) {
                 Some(held) => join(held, note),
                 None => note,

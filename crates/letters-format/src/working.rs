@@ -174,15 +174,18 @@ impl WorkingCopy {
         self.notes.pin(&self.model);
         let mut change = self.model.merge(&merged).map_err(Error::History)?;
         self.notes.merge(&notes);
+        let mut raised = Vec::new();
         if let Some((ours, theirs)) = apart {
             // Each block the two changed in the same words reads as the later side left it from here on.
             let (settled, conflicts) = self.model.settle(&ours, &theirs).map_err(Error::History)?;
             change.absorb(settled);
             for conflict in conflicts {
                 let [earlier, later] = [1 - conflict.later, conflict.later].map(|side| conflict.sides[side].version());
-                self.notes.raise(Note::conflict(conflict.block, [earlier, later]));
+                raised.push(Note::conflict(conflict.block, [earlier, later]));
             }
         }
+        // With none raised too: a note that came in can be newer than one held for the same block.
+        self.notes.raise(raised);
         self.notes.follow(&self.model);
         if home {
             // What the merge made of the style came from other writers, and is no change made here.

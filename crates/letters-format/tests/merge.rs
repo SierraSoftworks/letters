@@ -5,7 +5,7 @@ mod common;
 use std::cmp::Ordering;
 
 use common::{Folder, ID, bytes, open, package, paragraph};
-use letters_format::{Error, NOTES, OPLOG, Package, STYLE, Save, Saved, WorkingCopy, conflict_copy_of, save};
+use letters_format::{Error, NOTES, OPLOG, STYLE, Save, Saved, WorkingCopy, conflict_copy_of, save};
 use letters_model::{Anchor, BlockId, Document, Note, NoteKind, Op, Pos, ReplicaId, Run, Style, Version};
 
 const NAME: &str = "report.let";
@@ -222,6 +222,27 @@ fn a_block_that_clashes_again_keeps_only_the_newer_note_open() {
 }
 
 #[test]
+fn devices_that_merged_at_different_points_keep_one_note_open() {
+    let (_, mut desk, mut laptop) = clashing();
+    let (mut hers, mut his) = (Folder::default(), Folder::default());
+    save_from(&mut hers, &mut desk, "desk");
+    save_from(&mut his, &mut laptop, "laptop");
+    // The desk meets what the laptop saved. The laptop writes on in the word before it meets the desk.
+    desk.merge_from(&mut open(&his.files[NAME])).unwrap();
+    laptop.sign("Ben", at(20));
+    typed(&mut laptop, 16, "ly");
+    laptop.merge_from(&mut open(&hers.files[NAME])).unwrap();
+
+    let (mut folder, _, _) = shared();
+    let saves = in_turn(&mut folder, &mut desk, &mut laptop, 6);
+    assert!(matches!(saves[..], [.., Saved::Unchanged, Saved::Unchanged]), "{saves:?}");
+    for (who, copy) in [("the desk", &desk), ("the laptop", &laptop)] {
+        assert_eq!(text(copy.model().doc()), "Hello underworldly", "{who}");
+        assert_eq!(clashes(copy), [[wrote("Ana", "Hello worlds"), wrote("Ben", "Hello underworldly")]], "{who}");
+    }
+}
+
+#[test]
 fn a_block_one_writer_removed_and_the_other_changed_goes_the_later_way_with_a_note() {
     // When Ana removes the paragraph, against Ben changing its text ten minutes in.
     for (removed, stands) in [(0, true), (20, false)] {
@@ -322,17 +343,16 @@ fn opened_bytes() -> Vec<u8> {
 #[test]
 fn a_file_without_a_usable_history_still_merges() {
     // `package` holds a history no build can read.
-    let unreadable = Package { document: document(), ..package() };
-    let mut bare = unreadable.clone();
+    let mut bare = package();
     bare.entries.remove(OPLOG);
-    let cases = [("no history", bytes(&bare)), ("an unreadable history", bytes(&unreadable))];
+    let cases = [("no history", bytes(&bare)), ("an unreadable history", bytes(&package()))];
     for (why, file) in cases {
         let (mut folder, mut desk, mut laptop) = opened(file);
         typed(&mut desk, 0, "Oh. ");
-        typed(&mut laptop, 11, "!");
+        typed(&mut laptop, 5, "!");
         let saves = in_turn(&mut folder, &mut desk, &mut laptop, 3);
         assert!(saves.iter().all(|saved| matches!(saved, Saved::Written | Saved::Unchanged)), "{why}: {saves:?}");
-        assert_eq!(text(open_at(&folder, NAME, 4).model().doc()), "Oh. Hello world!", "{why}");
+        assert_eq!(text(open_at(&folder, NAME, 4).model().doc()), "Oh. Hello!", "{why}");
         assert!(level(&desk, &laptop), "{why}");
         assert_eq!(folder.names(), [NAME], "{why}");
     }
@@ -391,16 +411,15 @@ fn a_change_by_another_tool_is_merged_once_on_every_device() {
     package.set_style(&style);
     folder.put(NAME, bytes(&package));
 
-    // The desk writes in another word than the tool did, and the laptop writes no text at all.
     typed(&mut desk, 0, "Oh. ");
-    comment(&mut laptop, "laptop", 0..5);
+    typed(&mut laptop, 11, "!");
     let saves = in_turn(&mut folder, &mut desk, &mut laptop, 3);
     assert!(saves.iter().all(|saved| matches!(saved, Saved::Written | Saved::Unchanged)), "{saves:?}");
 
     let file = open_at(&folder, NAME, 4);
     let blocks: Vec<String> = file.model().doc().walk().map(|block| block.plain_text()).collect();
-    assert_eq!(blocks, ["Oh. Hello there world", "Added"], "both devices took the change in, and it is there once");
-    assert_eq!(note_ids(&file), ["laptop"], "nothing clashed");
+    assert_eq!(blocks, ["Oh. Hello there world!", "Added"], "both devices took the change in, and it is there once");
+    assert!(note_ids(&file).is_empty(), "nothing clashed");
     assert_eq!(file.style(), &style);
     assert!(level(&desk, &laptop));
     assert_eq!(folder.names(), [NAME]);
