@@ -59,13 +59,14 @@ impl Server {
         let (tls, certificate) = common::tls();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        // In literal strings below: a path on Windows has backslashes, which a basic string reads as escapes.
         let at = scratch.0.display();
         let settings = format!(
             r#"
 [server]
 name = "Home"
 url = "https://localhost:{port}"
-state = "{at}/state"
+state = '{at}/state'
 
 [auth.oidc]
 issuer = "https://id.example.test"
@@ -73,7 +74,7 @@ client_id = "letters"
 
 [[space]]
 name = "Home"
-path = "{at}/home/{{username}}"
+path = '{at}/home/{{username}}'
 "#
         );
         let clock = Arc::new(AtomicU64::new(START));
