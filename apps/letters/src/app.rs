@@ -11,7 +11,7 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -28,7 +28,7 @@ use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDeci
 use letters_ui::{
     Access, Allows, Appearance, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind,
     ImportOffer, Landing, LinkPreviewFound, Location, MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState,
-    Scheme, Settings, Window as View, tokens,
+    Scheme, Settings, SignIn, Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -64,6 +64,7 @@ use crate::present::{Painter, Presenter};
 use crate::printing;
 use crate::remote::{self, Roots};
 use crate::server::Client;
+use crate::servers;
 use crate::session::Session;
 use crate::settings;
 use crate::trust::{self, Trusted};
@@ -141,7 +142,16 @@ pub enum Event {
     Dictionary(WindowId, String, Box<Dictionary>),
     /// The way to a server's document was opened for the window that asked: the session at its server
     /// and the document's copy on this device, or why there is neither.
-    Reached(Option<WindowId>, Result<Box<(Arc<Session>, Reached)>, String>),
+    /// There is nothing to say of a sign-in the person gave up.
+    Reached(Option<WindowId>, Result<Box<(Arc<Session>, Reached)>, Option<String>>),
+    /// The sessions kept from when the app last ran have been read.
+    Kept(Vec<Arc<Session>>),
+    /// The sign-in a window waits for, which ends when this is set, has sent the browser to the page at
+    /// this address of the server of this name.
+    SigningIn(WindowId, Arc<AtomicBool>, String, String),
+    /// The sign-in a window asked for, which ended when this was set, has ended: in a session, or in a
+    /// sentence on why not, or in neither if the person gave it up.
+    SignedIn(WindowId, Arc<AtomicBool>, Result<Arc<Session>, Option<String>>),
     /// The socket of this number, to the server of a window's document, has something to say.
     Heard(WindowId, Said),
     /// A picture of this name, which the copy of a window's document lacked, was asked of the document's
@@ -189,6 +199,8 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         path: file,
         from_server,
         sessions: HashMap::new(),
+        servers_told: false,
+        signing: HashMap::new(),
         proxy: event_loop.create_proxy(),
         platform: Desktop::new().with_words(Words::of(&home)),
         library: Library::of(&home),
@@ -350,6 +362,25 @@ fn new_style() -> Style {
     files::new_style(std::env::home_dir().as_deref())
 }
 
+/// A sign-in at the browser that a window waits for.
+struct Signing {
+    /// Set to give the sign-in up.
+    given_up: Arc<AtomicBool>,
+    /// Whether the window shows it. One that opening a document began is not shown until there is a page
+    /// to wait at.
+    shown: bool,
+}
+
+/// Reads the sessions the keychain keeps for the servers that are listed in `home`, on another thread.
+/// They arrive as an event.
+fn read_kept(proxy: &EventLoopProxy<Event>, home: &Path) {
+    let (proxy, home) = (proxy.clone(), home.to_owned());
+    thread::spawn(move || {
+        let kept = servers::kept(&home, || Keychain::system().ok(), &Roots::System);
+        let _ = proxy.send_event(Event::Kept(kept));
+    });
+}
+
 struct App {
     /// Whether the first window is still to open.
     starting: bool,
@@ -365,6 +396,11 @@ struct App {
     from_server: Option<(String, String)>,
     /// The sessions at the servers the person is signed in to, by each server's address.
     sessions: HashMap<String, Arc<Session>>,
+    /// Whether the kept sessions have been read, after the first frame. The windows hear where the
+    /// person is signed in from then on.
+    servers_told: bool,
+    /// The sign-ins under way, by the window that waits for each.
+    signing: HashMap<WindowId, Signing>,
     /// The person's home folder, where the copies of servers' documents are kept.
     home: PathBuf,
     proxy: EventLoopProxy<Event>,
@@ -2122,6 +2158,9 @@ impl App {
         window.retitle();
         window.reframe(&self.buttons);
         window.follow(&self.settings, self.writer());
+        if self.servers_told {
+            window.view.set_servers(self.servers());
+        }
         self.mark("laid out");
         window.window.set_visible(true);
         // macOS places a window's lights for good as it shows it, which is before the first frame.
@@ -2312,6 +2351,13 @@ impl App {
                         _ => Sharing::Look,
                     });
                 }
+                Request::SignIn { server } => self.sign_in(id, &server, now),
+                Request::CancelSignIn => {
+                    if let Some(signing) = self.signing.remove(&id) {
+                        signing.given_up.store(true, Ordering::Relaxed);
+                    }
+                }
+                Request::SignOut { server } => self.sign_out(&server, now),
                 // A request this shell does not know yet.
                 _ => {}
             }
@@ -2508,21 +2554,137 @@ impl App {
     fn reach(&mut self, asker: Option<WindowId>, origin: &str, id: String) {
         let server = match Client::new(origin, &Roots::System) {
             Ok(server) => server,
-            Err(refused) => return drop(self.proxy.send_event(Event::Reached(asker, Err(refused.to_string())))),
+            Err(refused) => {
+                return drop(self.proxy.send_event(Event::Reached(asker, Err(Some(refused.to_string())))));
+            }
         };
-        if let Some(window) = asker.and_then(|id| self.windows.get_mut(&id)) {
-            let host = server.origin().trim_start_matches("https://");
-            window
-                .view
-                .set_notice(Some(&format!("Opening a document from {host}. Your browser may ask you to sign in.")));
-            window.sync(Instant::now());
+        // The window that asked says so if the person is sent to sign in, and can give it up.
+        let given_up = Arc::new(AtomicBool::new(false));
+        if let Some(asker) = asker {
+            self.wait(asker, &given_up, false);
         }
         let (held, proxy, home) = (self.sessions.get(server.origin()).cloned(), self.proxy.clone(), self.home.clone());
         thread::spawn(move || {
-            let (keychain, waiting) = (Keychain::system().ok(), AtomicBool::new(false));
-            let entered = connected::enter(&server, &id, held, keychain, &home, &|page| links::open(page), &waiting);
-            let _ = proxy.send_event(Event::Reached(asker, entered.map(Box::new).map_err(|error| error.to_string())));
+            let waiting = |name: &str, page: &str| {
+                if let Some(asker) = asker {
+                    let waits = Event::SigningIn(asker, given_up.clone(), name.to_owned(), page.to_owned());
+                    let _ = proxy.send_event(waits);
+                }
+            };
+            let keychain = Keychain::system().ok();
+            let browse = |page: &str| links::open(page);
+            let entered = connected::enter(&server, &id, held, keychain, &home, &browse, &waiting, &given_up);
+            // Nothing is said of a sign-in the person gave up.
+            let entered = entered.map(Box::new).map_err(|error| error.sign_in().map(|_| error.to_string()));
+            let _ = proxy.send_event(Event::Reached(asker, entered));
         });
+    }
+
+    /// Notes that a window waits for a sign-in from here on, which ends when `given_up` is set. One it
+    /// waited for before is given up.
+    fn wait(&mut self, id: WindowId, given_up: &Arc<AtomicBool>, shown: bool) {
+        let waiting = Signing { given_up: given_up.clone(), shown };
+        if let Some(before) = self.signing.insert(id, waiting) {
+            before.given_up.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Ends a window's wait for the sign-in that `given_up` ends, if that is the one it waits for, and
+    /// says whether the window showed it.
+    fn waited(&mut self, id: WindowId, given_up: &Arc<AtomicBool>) -> bool {
+        let waits = self.signing.get(&id).is_some_and(|signing| Arc::ptr_eq(&signing.given_up, given_up));
+        waits && self.signing.remove(&id).is_some_and(|signing| signing.shown)
+    }
+
+    /// Signs the person in to the server at `address`, as they typed it, for the window whose Servers
+    /// dialog asked. The browser is waited for on another thread, and what came of it arrives as an event.
+    fn sign_in(&mut self, id: WindowId, address: &str, now: Instant) {
+        let server = match Client::new(address, &Roots::System) {
+            Ok(server) => server,
+            Err(refused) => {
+                let Some(window) = self.windows.get_mut(&id) else { return };
+                window.view.set_sign_in(Some(SignIn::Failed(format!("Signing in did not work: {refused}."))));
+                return window.sync(now);
+            }
+        };
+        let given_up = Arc::new(AtomicBool::new(false));
+        self.wait(id, &given_up, true);
+        let (proxy, home) = (self.proxy.clone(), self.home.clone());
+        thread::spawn(move || {
+            let waiting = |name: &str, page: &str| {
+                let waits = Event::SigningIn(id, given_up.clone(), name.to_owned(), page.to_owned());
+                let _ = proxy.send_event(waits);
+            };
+            let keychain = Keychain::system().ok();
+            let browse = |page: &str| links::open(page);
+            let signed = connected::sign_in(&server, keychain, &home, &browse, &waiting, &given_up);
+            let signed = signed.map_err(|error| error.sign_in());
+            let _ = proxy.send_event(Event::SignedIn(id, given_up.clone(), signed));
+        });
+    }
+
+    /// Takes in what came of the sign-in a window's Servers dialog asked for.
+    fn signed_in(
+        &mut self,
+        id: WindowId,
+        given_up: &Arc<AtomicBool>,
+        signed: Result<Arc<Session>, Option<String>>,
+        now: Instant,
+    ) {
+        let shown = self.waited(id, given_up);
+        let failed = match signed {
+            Ok(session) => {
+                self.sessions.insert(session.server().origin().to_owned(), session);
+                self.tell_servers(now);
+                None
+            }
+            Err(failed) => failed,
+        };
+        // A sign-in the window no longer waits for has nothing to say there.
+        if shown && let Some(window) = self.windows.get_mut(&id) {
+            window.view.set_sign_in(failed.map(SignIn::Failed));
+            window.access_stale = true;
+            window.sync(now);
+        }
+    }
+
+    /// Signs the person out of the server at `origin`. The server is told on another thread, and the
+    /// sign-in is forgotten whether or not it hears.
+    fn sign_out(&mut self, origin: &str, now: Instant) {
+        if let Some(session) = self.sessions.remove(origin) {
+            let home = self.home.clone();
+            thread::spawn(move || {
+                let _ = session.sign_out();
+                let _ = servers::forget(&home, session.server().origin());
+            });
+        }
+        self.tell_servers(now);
+    }
+
+    /// Where the person is signed in, as the Servers dialog lists it.
+    fn servers(&self) -> Vec<letters_ui::Server> {
+        let signed_in = self.sessions.values().filter(|session| !session.ended());
+        let mut servers: Vec<_> = signed_in
+            .map(|session| letters_ui::Server {
+                address: session.server().origin().to_owned(),
+                account: session.person().name,
+            })
+            .collect();
+        servers.sort_by(|a, b| a.address.cmp(&b.address));
+        servers
+    }
+
+    /// Says to every window where the person is signed in.
+    fn tell_servers(&mut self, now: Instant) {
+        if !self.servers_told {
+            return;
+        }
+        let servers = self.servers();
+        for window in self.windows.values_mut() {
+            window.view.set_servers(servers.clone());
+            window.access_stale = true;
+            window.sync(now);
+        }
     }
 
     /// Asks the server of a window's document what the window has to ask about the document's name and
@@ -2600,11 +2762,16 @@ impl App {
         &mut self,
         event_loop: &ActiveEventLoop,
         asker: Option<WindowId>,
-        entered: Result<Box<(Arc<Session>, Reached)>, String>,
+        entered: Result<Box<(Arc<Session>, Reached)>, Option<String>>,
         now: Instant,
     ) {
-        if let Some(window) = asker.and_then(|id| self.windows.get_mut(&id)) {
-            window.view.set_notice(None);
+        // The sign-in the window that asked may have waited for is over, however it ended.
+        if let Some(id) = asker
+            && self.signing.remove(&id).is_some_and(|signing| signing.shown)
+            && let Some(window) = self.windows.get_mut(&id)
+        {
+            window.view.set_sign_in(None);
+            window.access_stale = true;
             window.sync(now);
         }
         let shown = entered.and_then(|entered| {
@@ -2622,8 +2789,8 @@ impl App {
                 window.sync(now);
                 return Ok(());
             }
-            let opened = files::open(&reached.path, new_style).map_err(|error| error.to_string())?;
-            let id = self.open_window(event_loop, Some(opened), false).map_err(|error| error.to_string())?;
+            let opened = files::open(&reached.path, new_style).map_err(|error| Some(error.to_string()))?;
+            let id = self.open_window(event_loop, Some(opened), false).map_err(|error| Some(error.to_string()))?;
             self.sessions.insert(session.server().origin().to_owned(), session.clone());
             if let Some(window) = self.windows.get_mut(&id) {
                 window.connect(session, reached, &self.proxy, &self.library, now);
@@ -2640,11 +2807,15 @@ impl App {
                     window.leave();
                 }
             }
-            Err(error) => {
+            Err(Some(error)) => {
                 let parent = asker.and_then(|id| self.windows.get(&id)).map(|window| window.window.clone());
                 alert(parent.as_ref(), &format!("The document could not be opened from its server.\n\n{error}"));
+                // A sign-in that ended in no document is kept all the same, and listed once it is read.
+                read_kept(&self.proxy, &self.home);
             }
+            Err(None) => {}
         }
+        self.tell_servers(now);
     }
 
     fn open_path(&mut self, event_loop: &ActiveEventLoop, path: &Path, parent: Option<WindowId>) -> bool {
@@ -3048,6 +3219,10 @@ impl App {
         let saved = self.windows.get_mut(&id).is_some_and(|window| window.save_or_say(false, library, journals));
         self.vouch();
         if saved && let Some(mut window) = self.windows.remove(&id) {
+            // Nobody waits for the sign-in a closed window asked for.
+            if let Some(signing) = self.signing.remove(&id) {
+                signing.given_up.store(true, Ordering::Relaxed);
+            }
             window.leave();
         }
         if self.windows.is_empty() {
@@ -3136,6 +3311,8 @@ impl ApplicationHandler<Event> for App {
                     if let Err(error) = self.trust.load() {
                         eprintln!("letters: nothing is trusted, since {error}");
                     }
+                    // Nor where the person is signed in, which the keychain is asked for.
+                    read_kept(&self.proxy, &self.home);
                     // The desktop is asked over D-Bus, which is not worth holding a frame for.
                     let (proxy, folders) = (self.proxy.clone(), self.dictionaries.clone());
                     thread::spawn(move || {
@@ -3376,6 +3553,26 @@ impl ApplicationHandler<Event> for App {
             }
             Event::Gpu(None) => self.gpu = GpuState::Off,
             Event::Reached(asker, entered) => self.reached(event_loop, asker, entered, now),
+            Event::Kept(kept) => {
+                // A session the app holds is the newer one.
+                for session in kept {
+                    self.sessions.entry(session.server().origin().to_owned()).or_insert(session);
+                }
+                self.servers_told = true;
+                self.tell_servers(now);
+            }
+            Event::SigningIn(id, given_up, name, page) => {
+                let waits = |signing: &&mut Signing| Arc::ptr_eq(&signing.given_up, &given_up);
+                if let Some(signing) = self.signing.get_mut(&id).filter(waits)
+                    && let Some(window) = self.windows.get_mut(&id)
+                {
+                    signing.shown = true;
+                    window.view.set_sign_in(Some(SignIn::Waiting { name, page }));
+                    window.access_stale = true;
+                    window.sync(now);
+                }
+            }
+            Event::SignedIn(id, given_up, signed) => self.signed_in(id, &given_up, signed, now),
             Event::Heard(id, said) => {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.heard(said, now);

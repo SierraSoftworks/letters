@@ -301,7 +301,7 @@ fn refusal(code: &str) -> String {
     }
     let code = serde_json::from_value(serde_json::Value::String(code.to_owned())).unwrap_or(Code::Unknown);
     let said = match code {
-        Code::NameTaken => "Something of that name is already there.",
+        Code::NameTaken => "A document or folder with that name already exists.",
         Code::Invalid => "That name cannot be used.",
         Code::Forbidden => "You can read this, but not change it.",
         Code::NotFound => "It is no longer there.",

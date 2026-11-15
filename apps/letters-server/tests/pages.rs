@@ -187,7 +187,7 @@ async fn a_form_that_is_refused_says_so_on_its_page() {
 
     let refused = ben.fill(ACT_RENAME, &[("id", &id), ("back", &here), ("name", &taken.name)]).await;
     assert!(refused.location().starts_with(&format!("{here}?error=")), "{}", refused.location());
-    assert!(page(&mut ben, refused.location()).await.contains("already there"), "the page says why");
+    assert!(page(&mut ben, refused.location()).await.contains("already exists"), "the page says why");
     assert_eq!(names(&listed(&ben, "family", "").await), ["Plan", "Taken"]);
 
     // The page to show next is one of the server's own, whatever the form says.

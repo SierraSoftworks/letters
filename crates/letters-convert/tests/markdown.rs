@@ -336,6 +336,54 @@ fn reads_pictures() {
 }
 
 #[test]
+fn reads_the_size_of_each_kind_of_picture_from_how_its_file_starts() {
+    // Each file is no more than its opening: the size is read there, and nothing is decoded.
+    let png = |width: u32, height: u32| {
+        let mut file = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        file.extend([width.to_be_bytes(), height.to_be_bytes()].concat());
+        file
+    };
+    let webp = |part: &[u8]| [b"RIFF\0\0\0\0WEBP".as_slice(), part].concat();
+    // A JPEG of 64 by 48 that says, or not, that the camera was held on its side.
+    let jpeg = |turned: bool| {
+        let exif = b"\xff\xe1\0\x1eExif\0\0MM\0*\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0\x06\0\0";
+        let frame = b"\xff\xc0\0\x0b\x08\0\x30\0\x40\x01\x01\x11\0";
+        [b"\xff\xd8".as_slice(), if turned { exif } else { b"" }, frame].concat()
+    };
+    // A file's name, how it starts, and its size in pixels where it is a picture.
+    type Case = (&'static str, Vec<u8>, Option<(f32, f32)>);
+    let cases: Vec<Case> = vec![
+        ("a.png", png(40, 20), Some((40.0, 20.0))),
+        ("a.gif", b"GIF89a\x1e\0\x32\0\0\0\0".to_vec(), Some((30.0, 50.0))),
+        ("a.jpg", jpeg(false), Some((64.0, 48.0))),
+        ("turned.jpg", jpeg(true), Some((48.0, 64.0))),
+        ("lossy.webp", webp(b"VP8 \0\0\0\0\0\0\0\x9d\x01\x2a\x46\0\x21\0"), Some((70.0, 33.0))),
+        ("lossless.webp", webp(b"VP8L\0\0\0\0\x2f\x14\x80\x18\0"), Some((21.0, 99.0))),
+        ("extended.webp", webp(b"VP8X\x0a\0\0\0\0\0\0\0\x36\0\0\x2b\0\0"), Some((55.0, 44.0))),
+        // What does not say its size, or is too large to draw, is no picture.
+        ("cut.png", b"\x89PNG\r\n\x1a\n".to_vec(), None),
+        ("cut.jpg", b"\xff\xd8\xff\xe0\0\x10JFIF".to_vec(), None),
+        ("huge.png", png(70_000, 10), None),
+        ("empty.png", png(0, 10), None),
+    ];
+    for (name, file, expected) in cases {
+        let mut next = 0;
+        let mut new_id = || {
+            next += 1;
+            format!("b{next}")
+        };
+        let import = import_markdown(&format!("![A picture]({name})"), &mut new_id, &mut |_| Some(file.clone()));
+        let shown = import.document.blocks.iter().find_map(|block| match block.kind {
+            BlockKind::Figure { width, height, .. } => Some((width, height)),
+            _ => None,
+        });
+        // A pixel is three quarters of a point.
+        assert_eq!(shown, expected.map(|(width, height)| (width * 0.75, height * 0.75)), "{name}");
+        assert_eq!(import.assets.len(), usize::from(expected.is_some()), "{name}");
+    }
+}
+
+#[test]
 fn brings_in_the_pictures_a_file_names() {
     let files = |path: &str| match path {
         "img/small one.png" => Some(SMALL.to_vec()),

@@ -6,7 +6,7 @@ use std::mem;
 
 use letters_layout::figure_numbers;
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Run};
-use letters_render::image::Image;
+use letters_render::image::{MAX_PIXELS, MAX_SIDE};
 use sha2::{Digest, Sha256};
 
 /// The word a numbered figure's caption opens with, and a reference to one reads as.
@@ -22,7 +22,8 @@ const WIDEST: f32 = 480.0;
 const LARGEST: usize = 64 << 20;
 
 /// Keeps a picture as an asset named after its content. Returns the name and the size to show the picture at,
-/// or `None` for bytes that are not a picture Letters can show.
+/// or `None` for bytes that are not a picture Letters can show. The picture is not decoded: one whose file
+/// starts well and is damaged further on is kept, and shows as an empty place.
 pub(crate) fn asset(bytes: Vec<u8>, assets: &mut BTreeMap<String, Vec<u8>>) -> Option<(String, f32, f32)> {
     let extension = match bytes.as_slice() {
         _ if bytes.len() > LARGEST => return None,
@@ -32,12 +33,129 @@ pub(crate) fn asset(bytes: Vec<u8>, assets: &mut BTreeMap<String, Vec<u8>>) -> O
         [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "webp",
         _ => return None,
     };
-    let image = Image::decode(&bytes).ok()?;
-    let (width, height) = fitted(image.width() as f32, image.height() as f32);
+    let (width, height) = size(&bytes)?;
+    let (width, height) = fitted(width as f32, height as f32);
     let hash: String = Sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
     let name = format!("assets/{hash}.{extension}");
     assets.insert(name.clone(), bytes);
     Some((name, width, height))
+}
+
+/// A whole number of `len` bytes at `at`, with its first byte the most significant where `big`.
+fn uint(bytes: &[u8], at: usize, len: usize, big: bool) -> Option<u32> {
+    let digits = bytes.get(at..)?.get(..len)?.iter();
+    let join = |value: u32, digit: &u8| value << 8 | u32::from(*digit);
+    Some(if big { digits.fold(0, join) } else { digits.rev().fold(0, join) })
+}
+
+/// A picture's size in pixels as it is shown, read from how its file starts, or `None` for a file that
+/// does not say or a picture too large to draw. Nothing is decoded, so that a shell which draws its
+/// pictures by other means, as a browser does, has no decoder to carry for the sake of two numbers.
+fn size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let (width, height) = match bytes {
+        [0x89, b'P', b'N', b'G', ..] if bytes.get(12..16) == Some(b"IHDR") => {
+            let (width, height) = (uint(bytes, 16, 4, true)?, uint(bytes, 20, 4, true)?);
+            if on_its_side(exif_part(bytes, true)) { (height, width) } else { (width, height) }
+        }
+        [b'G', b'I', b'F', b'8', ..] => (uint(bytes, 6, 2, false)?, uint(bytes, 8, 2, false)?),
+        // A WebP says its size where its first part does, by which of three kinds that part is.
+        [b'R', b'I', b'F', b'F', ..] => match bytes.get(12..16)? {
+            b"VP8 " if bytes.get(23..26) == Some(&[0x9d, 0x01, 0x2a]) => {
+                (uint(bytes, 26, 2, false)? & 0x3fff, uint(bytes, 28, 2, false)? & 0x3fff)
+            }
+            b"VP8L" if bytes.get(20) == Some(&0x2f) => {
+                let packed = uint(bytes, 21, 4, false)?;
+                ((packed & 0x3fff) + 1, (packed >> 14 & 0x3fff) + 1)
+            }
+            b"VP8X" => {
+                let (width, height) = (uint(bytes, 24, 3, false)? + 1, uint(bytes, 27, 3, false)? + 1);
+                if on_its_side(exif_part(bytes, false)) { (height, width) } else { (width, height) }
+            }
+            _ => return None,
+        },
+        [0xff, 0xd8, ..] => jpeg_size(bytes)?,
+        _ => return None,
+    };
+    let drawn = width > 0 && height > 0 && width <= MAX_SIDE && height <= MAX_SIDE;
+    (drawn && u64::from(width) * u64::from(height) <= MAX_PIXELS).then_some((width, height))
+}
+
+/// A JPEG's size: that of its frame, with the two changed over where the camera says it was held on its
+/// side, since the picture is shown upright.
+fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let (mut at, mut on_its_side) = (2, false);
+    loop {
+        let [0xff, marker] = *bytes.get(at..)?.get(..2)? else { return None };
+        match marker {
+            // Padding before a marker.
+            0xff => at += 1,
+            // Markers that stand alone.
+            0x01 | 0xd0..=0xd8 => at += 2,
+            // The picture itself starts, or the file ends, and no frame was met.
+            0xd9 | 0xda => return None,
+            _ => {
+                let length = uint(bytes, at + 2, 2, true)? as usize;
+                let segment = bytes.get(at + 4..at + 2 + length)?;
+                match marker {
+                    // A frame header, which all of these are but the three that define tables.
+                    0xc0..=0xcf if !matches!(marker, 0xc4 | 0xc8 | 0xcc) => {
+                        let (height, width) = (uint(segment, 1, 2, true)?, uint(segment, 3, 2, true)?);
+                        return Some(if on_its_side { (height, width) } else { (width, height) });
+                    }
+                    0xe1 if segment.starts_with(EXIF) => on_its_side = self::on_its_side(Some(segment)),
+                    _ => {}
+                }
+                at += 2 + length;
+            }
+        }
+    }
+}
+
+/// What EXIF opens with where it is not the whole of a part.
+const EXIF: &[u8] = b"Exif\0\0";
+
+/// The EXIF a PNG or a WebP holds in a part of its own, where the decoder looks for it. Both files are a
+/// run of named parts, each with its length.
+fn exif_part(bytes: &[u8], png: bool) -> Option<&[u8]> {
+    let mut at: usize = if png { 8 } else { 12 };
+    loop {
+        let rest = bytes.get(at..)?;
+        // A PNG writes the length first and its high byte first, and a WebP the name and the low byte.
+        let (length, name) = if png { (0, 4) } else { (4, 0) };
+        let length = uint(rest, length, 4, png)? as usize;
+        let part = rest.get(8..)?.get(..length)?;
+        match rest.get(name..name + 4)? {
+            b"eXIf" | b"EXIF" => return Some(part),
+            // A PNG's is heeded only where it comes before the pixels.
+            b"IDAT" if png => return None,
+            _ => {}
+        }
+        // A PNG's part ends in a checksum, and a WebP's of odd length in a byte of padding.
+        at = at.checked_add(8 + if png { 4 } else { length & 1 })?.checked_add(length)?;
+    }
+}
+
+/// Whether EXIF says the camera was held on its side, so that the picture is shown a quarter turned.
+fn on_its_side(exif: Option<&[u8]>) -> bool {
+    let turn = exif.and_then(|exif| orientation(exif.strip_prefix(EXIF).unwrap_or(exif)));
+    turn.is_some_and(|turn| (5..=8).contains(&turn))
+}
+
+/// How EXIF says a picture is turned, from 1 for upright to 8.
+fn orientation(exif: &[u8]) -> Option<u32> {
+    let big = match exif.get(..4)? {
+        b"MM\0*" => true,
+        b"II*\0" => false,
+        _ => return None,
+    };
+    let entries = uint(exif, 4, 4, big)? as usize;
+    let count = uint(exif, entries, 2, big)? as usize;
+    // An entry is 12 bytes: what it is, how it is written, how many, and the value.
+    let turn = |entry: usize| {
+        let at = entries.checked_add(2 + entry * 12)?;
+        (uint(exif, at, 2, big)? == 0x0112).then(|| uint(exif, at.checked_add(8)?, 2, big)).flatten()
+    };
+    (0..count).find_map(turn)
 }
 
 /// The size in points to show a picture of so many pixels at.

@@ -37,6 +37,7 @@ pub mod present;
 pub mod printing;
 pub mod remote;
 pub mod server;
+pub mod servers;
 pub mod session;
 pub mod settings;
 pub mod shadow;
