@@ -13,7 +13,6 @@ use std::sync::Arc;
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Array, Function, Map, Object, Promise, Reflect, Uint8Array};
 use letters_editor::{Clip, Editor, Key, KeyEvent, Modifiers, Picture, Platform as _};
-use letters_layout::WordList;
 use letters_model::{
     BlockKind, Change, Document, HistoryError, Mark, Model, Notes, Pos, ReplicaId, Revision, Selection, Style, TagKind,
 };
@@ -21,7 +20,8 @@ use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::{Color, DisplayList, Font, Point, Rect, Size};
 use letters_trust::{LinkDecision, Origin, Trust};
 use letters_ui::{
-    Appearance, CopyFormat, Cursor, Edge, Keys, Request, SaveState, Scheme, Settings, Uncovered, Window as View, tokens,
+    Appearance, CopyFormat, Cursor, Edge, Keys, Request, SaveState, Scheme, Settings, Uncovered, Window as View,
+    WordList, tokens,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
@@ -732,19 +732,28 @@ impl Shell {
         })
     }
 
-    /// Hands a window that was just made the faces that back up the fonts, as far as they were fetched.
-    /// What the window before it lacked is no longer asked about.
+    /// Hands a window that was just made the faces that back up the fonts and the word lists, as far as
+    /// they were fetched. What the window before it lacked is no longer asked about.
     fn backed(&mut self) {
         self.uncovered.clear();
         let fetched: Vec<Font> = self.faces().map(|(_, file)| Font::new(file.clone(), 0)).collect();
         if !fetched.is_empty() {
             self.view.add_fallback_fonts(fetched);
         }
+        let fetched: Vec<_> = self.fetched().map(|(extra, file)| (extra, file.clone())).collect();
+        for (extra, file) in fetched {
+            if let Extra::Words(list) = extra {
+                self.view.add_word_list(list, &file);
+            }
+        }
     }
 
-    /// Asks what characters the window showed that no face has, and fetches the faces that have them. A
-    /// font that is still on its way may have them too, so nothing is asked before the last has come.
+    /// Asks what the window showed that it lacks something for, and fetches that: the word list of a
+    /// script written without spaces, and the faces that have the characters no face has. A font that is
+    /// still on its way may have them too, so no face is asked for before the last has come.
     fn cover(&mut self) {
+        let unlisted: Vec<Extra> = self.view.take_unlisted().into_iter().map(Extra::Words).collect();
+        self.fetch_extras(&unlisted);
         if self.stats.fonts {
             self.uncovered.extend(self.view.take_uncovered());
         }
@@ -768,9 +777,13 @@ impl Shell {
         self.fetch_extras(&lacking);
     }
 
-    /// Fetches files that were never asked for. A face that arrives is the window's from then on.
+    /// Fetches the files among `extras` that were never asked for. One that arrives is the window's from
+    /// then on.
     fn fetch_extras(&mut self, extras: &[Extra]) {
         for extra in extras.iter().copied() {
+            if self.extras.iter().any(|(asked, _)| *asked == extra) {
+                continue;
+            }
             self.extras.push((extra, Arrival::Coming));
             let (shell, window) = (self.me.clone(), self.window.clone());
             let (folder, file) = extra.file();
@@ -782,8 +795,9 @@ impl Shell {
                 let arrival = match fetched {
                     Ok(Some(file)) => {
                         let file: Arc<[u8]> = file.into();
-                        if let Extra::Face(_) = extra {
-                            shell.view.add_fallback_fonts(vec![Font::new(file.clone(), 0)]);
+                        match extra {
+                            Extra::Face(_) => _ = shell.view.add_fallback_fonts(vec![Font::new(file.clone(), 0)]),
+                            Extra::Words(list) => _ = shell.view.add_word_list(list, &file),
                         }
                         Arrival::Here(file)
                     }
@@ -805,9 +819,7 @@ impl Shell {
     /// Fetches the files among `extras` that were never asked for, and tells `then` whether any of `extras`
     /// is here once none is on its way. One that cannot be fetched is done without.
     fn back_up(&mut self, extras: Vec<Extra>, then: impl FnOnce(&mut Self, bool) + 'static) {
-        let asked = |extra: &Extra| self.extras.iter().any(|(asked, _)| asked == extra);
-        let new: Vec<Extra> = extras.iter().copied().filter(|extra| !asked(extra)).collect();
-        self.fetch_extras(&new);
+        self.fetch_extras(&extras);
         self.awaited.push((extras, Box::new(then)));
         self.settle();
     }
