@@ -1272,24 +1272,6 @@ impl History {
         shown || quoted
     }
 
-    /// The maths engine is here. Returns whether the version that shows has a formula it could not set
-    /// before.
-    pub fn maths_arrived(&mut self) -> bool {
-        // What the panel shows of a passage is set again, as for a word list.
-        let quoted = self.setter.as_mut().is_some_and(|setter| {
-            setter.maths_arrived();
-            self.passage.as_mut().is_some_and(|passage| passage.shown.take().is_some())
-        });
-        let Some(leaf) = &mut self.leaf else { return quoted };
-        let earlier = leaf.earlier.as_mut().is_some_and(|(_, layout)| layout.maths_arrived());
-        let shown = leaf.layout.maths_arrived() || earlier;
-        leaf.estimated |= shown;
-        if let Some((_, spare, _)) = &mut leaf.spare {
-            spare.maths_arrived();
-        }
-        shown || quoted
-    }
-
     /// The scripts the versions were set in without their word list since this was last asked.
     pub fn take_unlisted(&mut self) -> Vec<WordList> {
         let mut found: Vec<WordList> = self.setter.iter_mut().flat_map(DocLayout::take_unlisted).collect();

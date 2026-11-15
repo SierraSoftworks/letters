@@ -851,27 +851,6 @@ impl Ui<EditorApp> {
         found
     }
 
-    /// Says that the maths engine is here, for a shell that hands it over only once a formula is asked for
-    /// ([`letters_math::provide_engine`], which [`letters_math::take_pending`] is the cue for). Until then
-    /// a formula shows as its source wherever the window sets the document's text, and the sheet a
-    /// formula is written on offers its symbols without their pictures. All of them are set now, at once:
-    /// the next frame shows them. Returns whether a formula that showed as its source is among them. A
-    /// shell whose engine is built in has no use for this.
-    pub fn maths_arrived(&mut self) -> bool {
-        // The sheet draws from the engine at every frame, so there is one whatever was laid out.
-        let app = self.app_mut();
-        let mut shown = app.said.maths_arrived();
-        shown |= app.review.maths_arrived();
-        if let Some(history) = &mut app.history {
-            shown |= history.maths_arrived();
-        }
-        if app.held(|app| app.layout.maths_arrived()) {
-            // Blocks set again keep their heights as estimates until idle time settles them.
-            (app.estimated, shown) = (true, true);
-        }
-        shown
-    }
-
     /// Lets formulas link, as `\\href` asks. The shell turns it on for a document the person trusts, and it
     /// is off until then.
     pub fn set_maths_links(&mut self, links: bool) {

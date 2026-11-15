@@ -285,15 +285,6 @@ impl Said {
         self.of.take().is_some()
     }
 
-    /// The maths engine is here. Returns whether what a note says may now be set otherwise, as for a
-    /// word list.
-    pub fn maths_arrived(&mut self) -> bool {
-        self.layout.as_mut().is_some_and(|layout| {
-            layout.maths_arrived();
-            self.of.take().is_some()
-        })
-    }
-
     /// The scripts that notes set without their word list since this was last asked.
     pub fn take_unlisted(&mut self) -> Vec<WordList> {
         self.layout.as_mut().map(DocLayout::take_unlisted).unwrap_or_default()
