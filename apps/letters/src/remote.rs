@@ -9,6 +9,7 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use letters_convert::{PageSummary, page_summary};
 use letters_trust::{Fetch, FetchError, HttpsUrl, ImageFetch, ImageType, Kind, PageFetch};
 use ureq::config::{AutoHeaderValue, Config};
 use ureq::http::{HeaderMap, header};
@@ -52,6 +53,15 @@ pub struct FetchedPage {
     pub bytes: Vec<u8>,
 }
 
+/// What a page says of itself, for a link preview to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preview {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// The file of the picture the page shows itself by, as its server sent it.
+    pub picture: Option<Vec<u8>>,
+}
+
 /// Why a fetch brought nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Failed {
@@ -63,6 +73,8 @@ pub enum Failed {
     Slow,
     /// The server could not be reached or did not speak as expected.
     Unreachable(String),
+    /// The page came, and has no title, description or picture for a preview to show.
+    Nothing,
 }
 
 impl fmt::Display for Failed {
@@ -73,6 +85,7 @@ impl fmt::Display for Failed {
             Self::Slow => write!(f, "the server took longer than {} seconds", LIMIT.as_secs()),
             // The reason is the network's own wording, which is kept for whoever debugs and not shown.
             Self::Unreachable(_) => write!(f, "the server could not be reached"),
+            Self::Nothing => write!(f, "the page says nothing about itself"),
         }
     }
 }
@@ -124,6 +137,27 @@ pub fn fetch(guard: ImageFetch, roots: &Roots) -> Result<Fetched, Failed> {
 pub fn fetch_page(guard: PageFetch, roots: &Roots) -> Result<FetchedPage, Failed> {
     let (url, (), bytes) = get(guard, roots, PAGES)?;
     Ok(FetchedPage { url, bytes })
+}
+
+/// Fetches the page `guard` was made for and reads what it says of itself, for a link preview.
+///
+/// The page names its picture by an address, which is read against the page's own and fetched only if
+/// `picture` gives a guard for it. A picture that is not to be had leaves the preview without one. Each
+/// of the two fetches has its own [`LIMIT`].
+pub fn preview(
+    guard: PageFetch,
+    picture: &dyn Fn(&str) -> Result<ImageFetch, FetchError>,
+    roots: &Roots,
+) -> Result<Preview, Failed> {
+    let page = fetch_page(guard, roots)?;
+    let PageSummary { title, description, image } = page_summary(&page.bytes);
+    let address = image.and_then(|written| page.url.join(&written).ok());
+    let guard = address.and_then(|address| picture(&address.to_string()).ok());
+    let picture = guard.and_then(|guard| fetch(guard, roots).ok()).map(|fetched| fetched.bytes);
+    if title.is_none() && description.is_none() && picture.is_none() {
+        return Err(Failed::Nothing);
+    }
+    Ok(Preview { title, description, picture })
 }
 
 /// Fetches what `guard` was made for, asked for as `accept`, and says where it was found at last.

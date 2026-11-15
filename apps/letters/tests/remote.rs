@@ -19,6 +19,13 @@ const MOST: u64 = 2048;
 /// A page with no picture in it.
 const PAGE: &[u8] = b"<p>No picture</p>";
 
+/// A page that says what it is and names its picture by `address`.
+fn article(address: &str) -> Vec<u8> {
+    let head =
+        r#"<meta property="og:title" content="Roof repairs"><meta property="og:description" content="A quote.">"#;
+    format!(r#"<html><head>{head}<meta property="og:image" content="{address}"></head></html>"#).into_bytes()
+}
+
 /// A small picture's file.
 fn png() -> Vec<u8> {
     letters::pictures::from_rgba(4, 2, &[0x80; 32]).unwrap().bytes
@@ -37,6 +44,10 @@ fn answer(path: &str) -> Vec<u8> {
         "/away" => with("302 Found", "location: https://elsewhere.example/sky.png\r\n", b""),
         "/page" => with("200 OK", "content-type: text/html; charset=utf-8\r\n", PAGE),
         "/moved/page" => with("302 Found", "location: /page\r\n", b""),
+        "/article" => with("200 OK", "content-type: text/html\r\n", &article("pictures/sky.png")),
+        "/pictures/sky.png" => with("200 OK", "content-type: image/png\r\n", &png()),
+        "/article/lost" => with("200 OK", "content-type: text/html\r\n", &article("/nothing")),
+        "/article/plain" => with("200 OK", "content-type: text/html\r\n", &article("http://localhost/sky.png")),
         "/long" => with("200 OK", "content-type: text/html\r\n", &[PAGE, &vec![b' '; MOST as usize]].concat()),
         "/unlabelled" => with("200 OK", "", b"words, with no word on what they are"),
         "/huge" => with("200 OK", "content-type: image/png\r\n", &[png(), vec![0; MOST as usize]].concat()),
@@ -167,6 +178,36 @@ fn a_page_is_fetched_as_a_picture_is_and_says_where_it_was_found() {
     }
     let asked = server.asked.lock().unwrap();
     assert!(asked.iter().all(|request| request.contains("accept: text/html")), "a page is asked for as one");
+}
+
+#[test]
+fn a_preview_is_what_a_page_says_of_itself_with_its_picture_if_that_may_be_had() {
+    let (home, server) = (Scratch::new("remote-preview"), Server::start());
+    let store = trusting(&home, &server);
+    let gate = store.trust().gate("document", Origin::Created);
+    let allowed = |address: &str| gate.fetch_on_request(address, Limits { max_bytes: MOST, ..Limits::default() });
+    let held = |_: &str| Err(FetchError::Held);
+    let preview = |path: &str, picture: &dyn Fn(&str) -> Result<ImageFetch, FetchError>| {
+        let guard = gate.fetch_page(&server.address(path), Limits { max_bytes: MOST, ..Limits::page() });
+        remote::preview(guard.expect("a page may be asked for"), picture, &server.roots())
+    };
+    // (the page, whether its picture may be fetched, the picture the preview has)
+    let cases: [(&str, bool, Option<Vec<u8>>); 4] = [
+        ("/article", true, Some(png())),
+        ("/article", false, None),
+        ("/article/lost", true, None),
+        ("/article/plain", true, None),
+    ];
+    for (path, may, picture) in cases {
+        let found =
+            preview(path, if may { &allowed } else { &held }).unwrap_or_else(|failed| panic!("{path}: {failed}"));
+
+        assert_eq!(found.title.as_deref(), Some("Roof repairs"), "{path}");
+        assert_eq!(found.description.as_deref(), Some("A quote."), "{path}");
+        assert_eq!(found.picture, picture, "{path}, picture allowed: {may}");
+    }
+    assert_eq!(preview("/page", &allowed), Err(Failed::Nothing), "a page with nothing to show is no preview");
+    assert_eq!(preview("/nothing", &allowed), Err(Failed::Status(404)));
 }
 
 #[test]
