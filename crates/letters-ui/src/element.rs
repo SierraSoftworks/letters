@@ -92,6 +92,8 @@ pub(crate) struct Canvas<M> {
     pub on_pointer: Option<Rc<dyn Fn(Pointer) -> Option<M>>>,
     /// Where the canvas's own caret is, relative to its top left, for the input method's window.
     pub caret: Option<Rect>,
+    /// Whether the app hears where the pointer rests on it.
+    pub pointed: bool,
 }
 
 /// Whether and how an element takes keyboard focus.
@@ -221,7 +223,8 @@ impl<M> Element<M> {
     /// An area the app draws itself. It takes focus on a click, and text and pointer input once the handlers
     /// are set.
     pub fn canvas(paint: Rc<dyn Paint>) -> Self {
-        let mut element = Self::new(Content::Canvas(Canvas { paint, on_text: None, on_pointer: None, caret: None }));
+        let mut element =
+            Self::new(Content::Canvas(Canvas { paint, on_text: None, on_pointer: None, caret: None, pointed: false }));
         element.focus = Focus::Click;
         element.style.clip = true;
         element
@@ -552,6 +555,15 @@ impl<M> Element<M> {
     pub fn on_pointer(mut self, handler: impl Fn(Pointer) -> Option<M> + 'static) -> Self {
         if let Content::Canvas(canvas) = &mut self.content {
             canvas.on_pointer = Some(Rc::new(handler));
+        }
+        self
+    }
+
+    /// Has the app told where the pointer rests on the canvas, through [`App::point`](crate::App::point). A
+    /// window has one such canvas at most, since the app is not told which.
+    pub fn pointed(mut self) -> Self {
+        if let Content::Canvas(canvas) = &mut self.content {
+            canvas.pointed = true;
         }
         self
     }

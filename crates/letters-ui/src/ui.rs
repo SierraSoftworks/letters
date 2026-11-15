@@ -29,7 +29,7 @@ const DOUBLE_CLICK_MS: u64 = 400;
 /// How far the pointer may wander between them.
 const DOUBLE_CLICK_SLOP: f32 = 4.0;
 /// How far a press moves before it is a drag.
-const DRAG_SLOP: f32 = 4.0;
+pub(crate) const DRAG_SLOP: f32 = 4.0;
 /// Room kept between a canvas's caret and the edge of what scrolls it.
 const CARET_MARGIN: f32 = 24.0;
 /// Which system's key conventions a window follows.
@@ -102,6 +102,13 @@ pub trait App {
 
     /// Told whether the window is the one in front, which has the keyboard.
     fn active(&mut self, _active: bool) {}
+
+    /// Told where the pointer rests on the canvas that asked to hear of it ([`Element::pointed`]), relative
+    /// to its top left, and `None` when it rests there no longer. It is told on every move with no button
+    /// held, so this has to be cheap. `true` says that what the app shows changed with it.
+    fn point(&mut self, _at: Option<Point>) -> bool {
+        false
+    }
 
     /// What the window's own frame does at a point: the pointer's shape there, and what a press sends. For
     /// a window that draws its frame, whose edge comes before whatever lies under it.
@@ -189,6 +196,8 @@ pub struct Ui<A: App> {
     caret_on: bool,
     /// The tooltip that is showing.
     tip: Option<Tip>,
+    /// Whether the app was last told that the pointer rests on its canvas.
+    pointed: bool,
 }
 
 impl<A: App> Ui<A> {
@@ -224,6 +233,7 @@ impl<A: App> Ui<A> {
             moving: false,
             caret_on: true,
             tip: None,
+            pointed: false,
         }
     }
 
@@ -492,6 +502,7 @@ impl<A: App> Ui<A> {
         }
         self.update_hover();
         self.flush(platform);
+        self.update_pointed();
     }
 
     pub fn pointer_down(&mut self, at: Point, mods: Modifiers, platform: &mut dyn Platform) {
@@ -610,11 +621,13 @@ impl<A: App> Ui<A> {
             }
         }
         self.flush(platform);
+        self.update_pointed();
     }
 
     pub fn pointer_leave(&mut self) {
         self.pointer = None;
         self.update_hover();
+        self.update_pointed();
     }
 
     /// `delta` is in logical pixels. A positive `y` moves the content up.
@@ -1028,6 +1041,25 @@ impl<A: App> Ui<A> {
             self.hover = hover;
             self.stale.paint = true;
         }
+    }
+
+    /// Tells the app where the pointer rests on the canvas that asked to hear of it, or that it has left.
+    /// A held button keeps the app's last word: a drag is the canvas's own to follow.
+    fn update_pointed(&mut self) {
+        if self.pressed.is_some() {
+            return;
+        }
+        // What the app does with a message may have moved what is under the pointer.
+        self.refresh();
+        let rests = |i: &usize| matches!(&self.tree.nodes[*i].el.content, Content::Canvas(canvas) if canvas.pointed);
+        let over = self.pointer.and_then(|at| Some((self.hit(at).filter(rests)?, at)));
+        let at = over.map(|(i, at)| self.within(i, at));
+        if (at.is_some() || self.pointed) && self.app.point(at) {
+            // The pointer's shape is read before the next frame, and may be part of what changed.
+            self.stale.view = true;
+            self.refresh();
+        }
+        self.pointed = at.is_some();
     }
 
     /// Presses an element: sends its message, toggles its popover, and closes the popover it is in if it
