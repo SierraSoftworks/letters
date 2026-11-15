@@ -771,6 +771,44 @@ fn the_outline_lists_headings_with_their_sheets() {
 }
 
 #[test]
+fn a_sheet_says_where_its_top_level_blocks_stand() {
+    // The room of a page, and whether some block has to run on from one sheet to the next.
+    for (room, runs_on) in [(240.0, true), (500.0, true), (4000.0, false)] {
+        let mut blocks = mixed().blocks;
+        blocks.insert(4, breaking(paragraph("m", PROSE)));
+        let doc = doc(blocks);
+        let (layout, pages) = paged(&doc, room);
+        let area = pages.area;
+        let (mut started, mut ran_on) = (Vec::new(), false);
+        for index in 0..pages.sheets.len() {
+            let shown = layout.page_blocks(&pages, index);
+            let first = shown.first().unwrap_or_else(|| panic!("sheet {index} shows a block, at {room}"));
+            assert!((first.top - area.y).abs() < 0.01 && first.above == first.top, "{first:?} leads sheet {index}");
+            let mut end = area.y;
+            for (nth, block) in shown.iter().enumerate() {
+                let said = format!("{block:?} on sheet {index} at {room}");
+                assert!(block.above >= end - 0.01 && block.above <= block.top && block.top < block.bottom, "{said}");
+                assert!(block.bottom <= area.y + area.height + 0.01, "{said}");
+                assert!(block.starts || nth == 0, "only the first can be the rest of a block: {said}");
+                assert_eq!(block.starts, started.last() != Some(&block.index), "{said}");
+                if block.starts {
+                    started.push(block.index);
+                }
+                ran_on |= !block.starts;
+                end = block.bottom;
+            }
+        }
+        // A quote or a callout is one block whatever it holds, and a marked block leads its sheet.
+        assert_eq!(started, (0..doc.blocks.len()).collect::<Vec<_>>(), "at {room}");
+        assert_eq!(ran_on, runs_on, "at {room}");
+        let leads = |index: usize| layout.page_blocks(&pages, index)[0].clone();
+        assert!((1..pages.sheets.len()).any(|index| leads(index).starts && leads(index).index == 4), "at {room}");
+    }
+    let (layout, pages) = paged(&mixed(), 240.0);
+    assert_eq!(layout.page_blocks(&pages, pages.sheets.len()), [], "no sheet, no blocks");
+}
+
+#[test]
 fn pages_follow_edits() {
     let edits: Vec<(&str, Vec<Op>)> = vec![
         ("typing a page's worth", vec![Op::InsertText { at: Pos::new("a", 5), text: PROSE.repeat(4) }]),

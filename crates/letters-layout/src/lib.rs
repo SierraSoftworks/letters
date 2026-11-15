@@ -51,7 +51,7 @@ use crate::ink::{Brush, Ink, Inks};
 use crate::leaf::{Extent, Laid, Lay, Open, Over, Painter, Source, Swap, Text};
 use crate::reveal::{Reveal, Shapes, Shifts};
 
-pub use crate::paginate::{Heading, PageLink, Pages, Sheet};
+pub use crate::paginate::{Heading, PageBlock, PageLink, Pages, Sheet};
 pub use crate::palette::{Callout, Palette, Scheme, Syntax};
 pub use crate::shape::{FontSpec, ShapedRun, ShapedText, Shaper};
 pub use crate::split::{Arrangement, Piece, Side, Split, Window};
@@ -387,6 +387,13 @@ impl DocLayout {
     /// The page of `pages` that shows the line `pos` is on.
     pub fn page_of(&self, pages: &Pages, pos: &Pos) -> Option<usize> {
         self.state.borrow_mut().printed(|state| state.page_of(pages, pos))
+    }
+
+    /// The top-level blocks one sheet of `pages` shows, in order, each with where it stands on the sheet.
+    /// Print view marks where a page was made to start, and offers to start one, between them. A block
+    /// that runs on to the next sheet is on both.
+    pub fn page_blocks(&self, pages: &Pages, index: usize) -> Vec<PageBlock> {
+        self.state.borrow_mut().printed(|state| state.page_blocks(pages, index))
     }
 
     /// The links on one sheet of `pages`, in reading order: those that lead out of the document, and each
@@ -1192,6 +1199,11 @@ impl State {
         let line = Text::of(leaf, part).map_or(0, |text| leaf::line_of(text.set, pos.offset));
         let line = leaf.line_of(part, line);
         pages.sheets.partition_point(|sheet| sheet.first <= (at, line)).checked_sub(1)
+    }
+
+    fn page_blocks(&mut self, pages: &Pages, index: usize) -> Vec<PageBlock> {
+        self.place_all();
+        paginate::blocks(&self.leaves, &self.frames, pages, index)
     }
 
     fn page_links(&mut self, pages: &Pages, index: usize) -> Vec<PageLink> {

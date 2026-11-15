@@ -63,6 +63,22 @@ pub struct Heading {
     pub at: Point,
 }
 
+/// A top-level block on a sheet, for what Print view shows between blocks. See
+/// [`crate::DocLayout::page_blocks`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageBlock {
+    /// Which of the document's blocks it is, counted from 0.
+    pub index: usize,
+    /// Whether the sheet shows the block from its start, and not the rest of one the sheet before began.
+    pub starts: bool,
+    /// Where what stands above the block ends, from the sheet's top. For the first block of a sheet that
+    /// is the top of the text area.
+    pub above: f32,
+    /// Where the block starts on the sheet, with its own box, and where it ends there.
+    pub top: f32,
+    pub bottom: f32,
+}
+
 /// One page of a paginated document.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sheet {
@@ -77,6 +93,50 @@ pub struct Sheet {
 
 /// Room for the rounding of positions that are whole pixels in sum.
 const SLACK: f32 = 0.01;
+
+/// What each leaf shows above its text and takes with it to a new page: its own box, and the top of each
+/// quote or callout that it opens.
+fn heads(leaves: &[Leaf], frames: &[Frame]) -> Vec<f32> {
+    let mut heads: Vec<f32> = leaves.iter().map(|leaf| if leaf.boxed() { theme::BOX_PAD_Y } else { 0.0 }).collect();
+    for frame in frames {
+        heads[frame.first] = heads[frame.first].max(leaves[frame.first].top - frame.lead);
+    }
+    heads
+}
+
+/// The top-level blocks one sheet shows, in order, each with where it stands on the sheet.
+pub(crate) fn blocks(leaves: &[Leaf], frames: &[Frame], pages: &Pages, index: usize) -> Vec<PageBlock> {
+    let (Some(sheet), Some(origin)) = (pages.sheets.get(index), pages.origin(index)) else { return Vec::new() };
+    let heads = heads(leaves, frames);
+    // The sheet shows its leaves up to the one the next sheet starts with, and of that one the lines before.
+    let (first, _) = sheet.first;
+    let (next, upto) = pages.sheets.get(index + 1).map_or((leaves.len(), 0), |next| next.first);
+    let end = (next + usize::from(upto > 0)).min(leaves.len());
+    let mut blocks: Vec<PageBlock> = Vec::new();
+    for at in first..end {
+        let leaf = &leaves[at];
+        let bottom = origin.y + (leaf.y + leaf.height + leaf.bottom).min(sheet.band.1);
+        match blocks.last_mut().filter(|block| block.index == leaf.root) {
+            Some(block) => block.bottom = bottom,
+            None => {
+                let starts = (at > first || sheet.first.1 == 0) && (at == 0 || leaves[at - 1].root != leaf.root);
+                // The sheet starts where its first leaf is cut, which is all that is above it there.
+                let (above, top) = match at.checked_sub(1).filter(|_| at > first) {
+                    Some(before) => (leaves[before].span().1, leaf.y - heads[at]),
+                    None => (sheet.band.0, sheet.band.0),
+                };
+                blocks.push(PageBlock {
+                    index: leaf.root,
+                    starts,
+                    above: origin.y + above,
+                    top: origin.y + top,
+                    bottom,
+                });
+            }
+        }
+    }
+    blocks
+}
 
 /// Where a page starts: before a line of a leaf, at a height in the column.
 #[derive(Clone, Copy)]
@@ -97,12 +157,7 @@ pub(crate) fn sheets(leaves: &[Leaf], frames: &[Frame], room: f32) -> Vec<Sheet>
     if leaves.is_empty() {
         return vec![Sheet { blocks: Vec::new(), band: (0.0, 0.0), first: (0, 0) }];
     }
-    // What a leaf shows above its text and takes with it to a new page: its own box, and the top of each
-    // quote or callout that it opens.
-    let mut heads: Vec<f32> = leaves.iter().map(|leaf| if leaf.boxed() { theme::BOX_PAD_Y } else { 0.0 }).collect();
-    for frame in frames {
-        heads[frame.first] = heads[frame.first].max(leaves[frame.first].top - frame.lead);
-    }
+    let heads = heads(leaves, frames);
     let top = |at: usize| leaves[at].y - heads[at];
 
     let mut cuts = vec![Cut { leaf: 0, line: 0, y: top(0) }];
