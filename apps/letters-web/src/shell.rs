@@ -288,6 +288,13 @@ impl Shell {
     ) -> Result<Rc<RefCell<Self>>, JsValue> {
         let window = web_sys::window().ok_or("there is no window")?;
         let document = window.document().ok_or("there is no document")?;
+        // The window offers no printing that is withheld. The browser's own would print the canvas: the
+        // page's styles leave it out of what a page so marked prints.
+        if let Some(root) =
+            document.document_element().filter(|_| server.as_ref().is_some_and(|server| !server.allows.print))
+        {
+            root.set_attribute("data-print", "withheld")?;
+        }
         // The view paints every pixel, so the canvas needs no alpha.
         let options = Object::new();
         Reflect::set(&options, &"alpha".into(), &false.into())?;

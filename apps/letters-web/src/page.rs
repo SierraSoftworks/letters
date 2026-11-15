@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use std::ops::RangeInclusive;
 
 use accesskit::{Node, NodeId, Role};
-use letters_api::{Opened, Trust};
+use letters_api::{Allows, Opened, Trust};
 use letters_editor::Editor;
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Model, Notes, Pos, ReplicaId, Selection, Style};
 use letters_render::Size;
@@ -439,7 +439,8 @@ pub fn window(document: Document, replica: ReplicaId) -> Window {
 
 /// The window the editor opens on a document a server sent, as `opened` says of it: in the document's
 /// style and under its name, with its notes, signing edits as the session does, and held in safe mode
-/// until the person trusts it. [`served`] takes the page's [`Skeleton`] from the same window.
+/// until the person trusts it, and offering what the person may take away of it. [`served`] takes the
+/// page's [`Skeleton`] from the same window.
 pub fn served_window(document: Document, opened: &Opened, replica: ReplicaId) -> Window {
     // The built-in style stands in for one this build cannot read, as it does on the desktop.
     let style = opened.style.as_ref().and_then(|style| Style::from_json(&style.to_string()).ok());
@@ -464,6 +465,9 @@ pub fn served_on(model: Model, opened: &Opened) -> Window {
     if opened.trust == Trust::Safe {
         window.set_safe_mode(Some(SafeMode { folder: None }));
     }
+    // What a share link withholds is not offered.
+    let Allows { download, copy, print } = opened.allows;
+    window.set_allows(letters_ui::Allows { copy, download, print });
     window
 }
 

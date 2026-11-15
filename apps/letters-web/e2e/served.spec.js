@@ -311,3 +311,20 @@ test("a document started without a name takes its first heading's, on the server
   await expect.poll(() => told(asked)).toEqual(['POST /rename {"name":"Letters in the browser"}']);
   await expect(page).toHaveTitle("Letters in the browser");
 });
+
+const links = [
+  ["allows", true],
+  ["withholds", false],
+];
+for (const [name, allowed] of links) {
+  test(`what a share link ${name} of the document is ${allowed ? "" : "not "}offered, by the browser's own print too`, async ({ page }) => {
+    await serve(page, opened({ allows: { download: allowed, copy: allowed, print: allowed } }));
+    await click(page, "More");
+    await expect(page.getByRole("menuitem", { name: "Settings" })).toBeAttached();
+    for (const item of ["Save a copy", "Export"]) {
+      await expect(page.getByRole("menuitem", { name: item })).toHaveCount(allowed ? 1 : 0);
+    }
+    await page.emulateMedia({ media: "print" });
+    await expect(page.locator("canvas")).toBeVisible({ visible: allowed });
+  });
+}

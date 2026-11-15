@@ -30,6 +30,12 @@
         width: 100vw;
         height: 100vh;
       }
+      /* The editor marks a page whose document is not to be printed. */
+      @media print {
+        html[data-print="withheld"] body {
+          display: none;
+        }
+      }
     </style>
   </head>
   <body>
