@@ -8,6 +8,8 @@
 # Keystrokes are always measured without a window.
 # Every measurement is made and printed before the script fails for any of them.
 set -eu
+# No check reports its use as a person's (see apps/letters/src/telemetry.rs).
+export LETTERS_TELEMETRY=0
 cd "$(dirname "$0")/.."
 headless=--headless
 if [ "${1:-}" = --window ]; then

@@ -49,13 +49,15 @@ tungstenite.workspace = true
 keyring.workspace = true
 keyring-core.workspace = true
 pollster.workspace = true
+# The runtime the reports are sent on, kept to the telemetry thread.
+tracing-batteries.workspace = true
+tokio.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus.workspace = true
 
 [dev-dependencies]
 letters-server = { path = "../letters-server" }
-tokio.workspace = true
 axum.workspace = true
 hayro.workspace = true
 rcgen.workspace = true

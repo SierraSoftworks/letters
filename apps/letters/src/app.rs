@@ -67,6 +67,7 @@ use crate::server::Client;
 use crate::servers;
 use crate::session::Session;
 use crate::settings;
+use crate::telemetry::{self, Page, Telemetry};
 use crate::trust::{self, Trusted};
 use crate::versions::Rests;
 use crate::words::{self, Words};
@@ -190,6 +191,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
     let mut app = App {
         starting: true,
         report_launch,
+        telemetry: Telemetry::off(),
         typing: match options.mode {
             Mode::TypingReport { keys } => Some(TypingRun { keys, stats: Typing::default(), typed: None, next: None }),
             _ => None,
@@ -385,6 +387,8 @@ struct App {
     /// Whether the first window is still to open.
     starting: bool,
     report_launch: bool,
+    /// Off until the first frame is drawn, and for good in a run that measures.
+    telemetry: Telemetry,
     /// The typing report in progress, in that mode.
     typing: Option<TypingRun>,
     /// The stopwatch, until the first frame is on screen.
@@ -2201,6 +2205,7 @@ impl App {
         let requests = window.view.take_requests();
         let served = !requests.is_empty();
         for request in requests {
+            telemetry::Event::asked(&request).into_iter().for_each(|event| self.telemetry.record(event));
             match request {
                 Request::Open(path) => self.act(event_loop, id, Action::Open(Some(path.into()))),
                 Request::OpenDialog => self.act(event_loop, id, Action::Open(None)),
@@ -3139,6 +3144,12 @@ impl App {
     }
 
     fn act(&mut self, event_loop: &ActiveEventLoop, id: WindowId, action: Action) {
+        match &action {
+            Action::New => self.telemetry.record(telemetry::Event::DocumentOpened(telemetry::Source::New)),
+            Action::Open(Some(_)) => self.telemetry.record(telemetry::Event::DocumentOpened(telemetry::Source::Listed)),
+            Action::Open(None) => self.telemetry.record(telemetry::Event::DocumentOpened(telemetry::Source::Chosen)),
+            _ => {}
+        }
         match action {
             Action::New => {
                 if let Err(error) = self.open_window(event_loop, None, false) {
@@ -3319,6 +3330,15 @@ impl ApplicationHandler<Event> for App {
                     }
                     // Nor where the person is signed in, which the keychain is asked for.
                     read_kept(&self.proxy, &self.home);
+                    // Nor what Letters reports of its use, which a run that measures never does.
+                    if self.typing.is_none() && telemetry::here() {
+                        let said = letters_trust::Store::read(&mut trust::Settings::of(&self.home))
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        self.telemetry = Telemetry::start(telemetry::SERVER, telemetry::allowed(&said));
+                        self.telemetry.page(if window.view.landing() { Page::Landing } else { Page::Editor });
+                    }
                     // The desktop is asked over D-Bus, which is not worth holding a frame for.
                     let (proxy, folders) = (self.proxy.clone(), self.dictionaries.clone());
                     thread::spawn(move || {
@@ -3754,6 +3774,8 @@ impl ApplicationHandler<Event> for App {
         for copy in self.copies.drain(..) {
             let _ = copy.join();
         }
+        // Last, and briefly: the person's work is safe by now, and a report is not worth their wait.
+        std::mem::replace(&mut self.telemetry, Telemetry::off()).stop(Duration::from_millis(300));
     }
 
     /// Runs after each batch of events: starts due saves and sleeps until the next thing is due.

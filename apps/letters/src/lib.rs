@@ -43,6 +43,7 @@ pub mod settings;
 pub mod shadow;
 pub mod signin;
 pub mod socket;
+pub mod telemetry;
 pub mod trust;
 pub mod versions;
 pub mod words;
