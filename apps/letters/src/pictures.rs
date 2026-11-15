@@ -4,9 +4,6 @@ use std::fs;
 
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread;
 
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::metadata::Orientation;
@@ -16,6 +13,7 @@ use letters_model::Style;
 use letters_render::image::{Image, MAX_PIXELS, MAX_SIDE};
 
 use crate::files;
+use crate::workers::Workers;
 
 /// How many pixels across the widest picture on a page of `style` is drawn, in a window that shows
 /// `scale` pixels to a point of the screen: the page's text is that wide, and no picture is wider. A
@@ -93,30 +91,19 @@ pub enum Source {
     Document(PathBuf),
 }
 
-/// What is done with a picture once it is decoded: its name, and the picture unless it could not be had.
-type Done = Box<dyn FnOnce(String, Option<Image>) + Send>;
-
-struct Job {
-    name: String,
-    source: Source,
-    within: u32,
-    done: Done,
-}
-
-/// Decodes pictures off the thread that asks, a few at a time and in the order asked. A photo is tens of
+/// Decodes pictures off the thread that asks, two at a time and in the order asked. A photo is tens of
 /// megabytes while it is being decoded, so a page of them is not decoded all at once.
-#[derive(Default)]
-pub struct Decoder {
-    /// The way to the threads that decode, which start with the first picture.
-    jobs: Option<Sender<Job>>,
+pub struct Decoder(Workers);
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self(Workers::new(2))
+    }
 }
 
 impl Decoder {
-    /// The most pictures decoded at a time.
-    const AT_ONCE: usize = 2;
-
     /// Decodes the picture `name` from `source`, held no wider than `within` pixels, and calls `done` with
-    /// it on another thread.
+    /// it on another thread: with no picture when it could not be had.
     pub fn decode(
         &mut self,
         name: String,
@@ -124,33 +111,13 @@ impl Decoder {
         within: u32,
         done: impl FnOnce(String, Option<Image>) + Send + 'static,
     ) {
-        let jobs = self.jobs.get_or_insert_with(Self::start);
-        // The threads live as long as this does, so the job is taken.
-        let _ = jobs.send(Job { name, source, within, done: Box::new(done) });
+        self.0.run(move || {
+            let bytes = match source {
+                Source::Bytes(bytes) => Some(bytes),
+                Source::Document(path) => files::entry(&path, &name),
+            };
+            let image = bytes.and_then(|bytes| Image::decode_within(&bytes, within).ok());
+            done(name, image);
+        });
     }
-
-    fn start() -> Sender<Job> {
-        let (jobs, waiting) = mpsc::channel::<Job>();
-        let waiting = Arc::new(Mutex::new(waiting));
-        let threads = thread::available_parallelism().map_or(1, usize::from).min(Self::AT_ONCE);
-        for _ in 0..threads {
-            let waiting = waiting.clone();
-            thread::spawn(move || {
-                while let Some(job) = next(&waiting) {
-                    let bytes = match &job.source {
-                        Source::Bytes(bytes) => Some(std::borrow::Cow::Borrowed(bytes.as_slice())),
-                        Source::Document(path) => files::entry(path, &job.name).map(std::borrow::Cow::Owned),
-                    };
-                    let image = bytes.and_then(|bytes| Image::decode_within(&bytes, job.within).ok());
-                    (job.done)(job.name, image);
-                }
-            });
-        }
-        jobs
-    }
-}
-
-/// The next job, once there is one. `None` when the decoder is gone and no more will come.
-fn next(waiting: &Mutex<Receiver<Job>>) -> Option<Job> {
-    waiting.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).recv().ok()
 }

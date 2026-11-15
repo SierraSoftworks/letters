@@ -35,6 +35,7 @@ jiff.workspace = true
 encoding_rs.workspace = true
 toml_edit.workspace = true
 image.workspace = true
+ureq.workspace = true
 pollster.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
@@ -42,3 +43,5 @@ zbus.workspace = true
 
 [dev-dependencies]
 hayro.workspace = true
+rcgen.workspace = true
+rustls.workspace = true

@@ -16,11 +16,11 @@ use std::time::{Duration, Instant};
 
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Picture, Platform as _};
 use letters_format::WorkingCopy;
-use letters_model::{Model, ReplicaId, Revision, Style};
+use letters_model::{BlockId, Model, ReplicaId, Revision, Style};
 use letters_render::image::Image;
 use letters_render::{Color, DisplayList, Point, Size};
 use letters_spell::Dictionary;
-use letters_trust::Trust;
+use letters_trust::{Gate, HttpsUrl, Limits, Origin, Trust};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
     Appearance, Chrome, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer, Landing, Location,
@@ -51,9 +51,11 @@ use crate::measure::{FIRST_FRAME, Launch, Typing};
 use crate::pictures::{self, Decoder, Source};
 use crate::platform::{self, Desktop};
 use crate::present::{Painter, Presenter};
+use crate::remote::{self, Roots};
 use crate::settings;
 use crate::trust::{self, Trusted};
 use crate::words::{self, Words};
+use crate::workers::Workers;
 use crate::writer;
 
 const MAC: bool = cfg!(target_os = "macos");
@@ -100,6 +102,10 @@ pub enum Event {
     Planned(WindowId, PathBuf, Result<Box<Plan>, String>),
     /// A file was brought in for a window and kept as a new document at this path, or could not be.
     Imported(WindowId, Result<PathBuf, String>),
+    /// A picture a window's document links to was fetched and decoded, to draw under its address.
+    Linked(WindowId, String, Image),
+    /// A picture a window's document links to was fetched, to be kept in the document by this figure.
+    Embed(WindowId, BlockId, Picture),
     /// A system dictionary a window's document asked for has been read, under the name it has on disk.
     Dictionary(WindowId, String, Box<Dictionary>),
 }
@@ -141,6 +147,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         trust: trust::store(&home),
         journals: Journals::of(&home),
         decoder: Decoder::default(),
+        fetching: Workers::new(4),
         dictionaries: dictionaries::system_folders(&home).into(),
         reduced_motion: false,
         buttons: Buttons::guess(),
@@ -286,6 +293,8 @@ struct App {
     journals: Journals,
     /// Decodes the pictures the windows' pages ask for.
     decoder: Decoder,
+    /// Fetches the pictures the windows' documents link to.
+    fetching: Workers,
     /// Where the system keeps dictionaries for languages other than English.
     dictionaries: Arc<[PathBuf]>,
     /// Whether the desktop asked for less motion. Asked once, after the first frame.
@@ -411,6 +420,9 @@ struct DocWindow {
     dropped: Vec<PathBuf>,
     /// Pictures the page asked for whose files were not to be had while a read or a save was under way.
     awaited: Vec<String>,
+    /// Linked pictures that were asked for before the file said which document this is, which decides
+    /// what it may fetch.
+    links: Vec<(String, Link)>,
     /// The pictures the view was handed, and how wide each could be held at most.
     held: BTreeMap<String, u32>,
 }
@@ -423,6 +435,16 @@ struct Saving {
 
 /// Something a key asks of the app, not of the document.
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// What a linked picture is fetched for.
+enum Link {
+    /// To show, if the person's trust lets it load as its document opens.
+    Open,
+    /// To show this once, because the person asked.
+    Once,
+    /// To keep in the document, in this figure.
+    Embed(BlockId),
+}
+
 enum Action {
     New,
     /// Opens the document at a path, or one the person picks.
@@ -673,6 +695,17 @@ impl DocWindow {
         let links = mode == letters_trust::Mode::Trusted;
         if std::mem::replace(&mut self.maths_links, links) != links {
             self.view.set_maths_links(links);
+        }
+    }
+
+    /// What the document may fetch. One made in this window is trusted, and one that was opened is held
+    /// to what the person trusts of its id and its folder.
+    fn gate<'a>(&self, trust: &'a Trust) -> Gate<'a> {
+        match self.id.as_deref() {
+            _ if self.made_here => trust.gate(self.id.as_deref().unwrap_or_default(), Origin::Created),
+            Some(id) => trust::gate(trust, id, self.place.path()),
+            // Nothing vouches for a document that has not said which one it is.
+            None => trust.gate("", Origin::Outside),
         }
     }
 
@@ -1166,6 +1199,7 @@ impl App {
             plan: None,
             dropped: Vec::new(),
             awaited: Vec::new(),
+            links: Vec::new(),
             held: BTreeMap::new(),
         };
         window.view.set_reduced_motion(self.reduced_motion);
@@ -1298,6 +1332,11 @@ impl App {
                     let read = chosen.iter().filter_map(|file| pictures::read(fs::read(file).ok()?));
                     window.insert(read.collect(), &mut self.platform);
                 }
+                Request::LinkedPicture(src) => self.link(id, src, Link::Open),
+                Request::LoadPicture(src) => self.link(id, src, Link::Once),
+                Request::EmbedPicture { figure, src } => self.link(id, src, Link::Embed(figure)),
+                // The window asks for the pictures of that host again by itself.
+                Request::TrustPictures(src) => self.trust_host(id, &src),
                 Request::Import { folders, comments } => self.bring_in(id, &folders, comments),
                 Request::CancelImport => {
                     if let Some(window) = self.windows.get_mut(&id) {
@@ -1446,6 +1485,45 @@ impl App {
             let plan = Plan::of(&path, &new_style()).map(Box::new);
             let _ = proxy.send_event(Event::Planned(id, path, plan));
         });
+    }
+
+    /// Fetches a picture a window's document links to, off this thread, if the document may: one that
+    /// may not keeps its frame. Linked pictures are fetched a few at a time.
+    fn link(&mut self, id: WindowId, src: String, link: Link) {
+        let Some(window) = self.windows.get_mut(&id) else { return };
+        if !window.made_here && window.id.is_none() {
+            return window.links.push((src, link));
+        }
+        let (gate, limits) = (window.gate(self.trust.trust()), Limits::default());
+        let guard = match link {
+            Link::Open => gate.fetch_on_open(&src, limits),
+            Link::Once | Link::Embed(_) => gate.fetch_on_request(&src, limits),
+        };
+        let Ok(guard) = guard else { return };
+        let (proxy, within) = (self.proxy.clone(), window.widest());
+        self.fetching.run(move || {
+            let Ok(fetched) = remote::fetch(guard, &Roots::System) else { return };
+            let event = match link {
+                Link::Embed(figure) => pictures::read(fetched.bytes).map(|picture| Event::Embed(id, figure, picture)),
+                Link::Open | Link::Once => {
+                    let image = Image::decode_within(&fetched.bytes, within).ok();
+                    image.map(|image| Event::Linked(id, src, image))
+                }
+            };
+            if let Some(event) = event {
+                let _ = proxy.send_event(event);
+            }
+        });
+    }
+
+    /// Keeps the host of a linked picture as one whose pictures load from now on.
+    fn trust_host(&mut self, id: WindowId, src: &str) {
+        let kept = HttpsUrl::parse(src).map_err(|error| error.to_string()).and_then(|url| {
+            self.trust.trust_source(&letters_trust::Source::host_of(&url)).map_err(|error| error.to_string())
+        });
+        if let (Err(error), Some(window)) = (kept, self.windows.get(&id)) {
+            window.alert(&format!("The host could not be kept as one you trust.\n\n{error}"));
+        }
     }
 
     /// Shows the card that asks what to bring in with a file, now that the file has been read.
@@ -1886,8 +1964,11 @@ impl ApplicationHandler<Event> for App {
                 window.ask_again(&mut self.decoder, &self.proxy);
                 // The file has said which document it is, so what the person trusts can be asked about it.
                 window.retrust(self.trust.trust());
+                let links = std::mem::take(&mut window.links);
                 window.access_stale = true;
                 window.sync(now);
+                // And the pictures it links to can be fetched, if it may.
+                links.into_iter().for_each(|(src, link)| self.link(id, src, link));
             }
             Event::Gpu(None) => self.gpu = GpuState::Off,
             Event::Dictionary(id, name, dictionary) => {
@@ -1906,6 +1987,17 @@ impl ApplicationHandler<Event> for App {
             Event::Picture(id, asset, image, within) => {
                 let Some(window) = self.windows.get_mut(&id) else { return };
                 window.picture(asset, image, within);
+            }
+            Event::Linked(id, src, image) => {
+                let Some(window) = self.windows.get_mut(&id) else { return };
+                window.view.set_image(&src, Some(image));
+                window.sync(now);
+            }
+            Event::Embed(id, figure, picture) => {
+                let Some(window) = self.windows.get_mut(&id) else { return };
+                window.view.embed_picture(&figure, picture, &mut self.platform);
+                window.keep(self.platform.take_assets());
+                window.sync(now);
             }
             Event::Planned(id, path, plan) => self.offer(id, &path, plan),
             Event::Imported(id, kept) => self.imported(event_loop, id, kept),

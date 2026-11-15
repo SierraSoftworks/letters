@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use letters_trust::{Mode, Origin, Store, Trust, TrustStore};
+use letters_trust::{Gate, Mode, Origin, Store, Trust, TrustStore};
 
 /// The settings file. Whatever else it holds is left as its writer had it.
 #[derive(Clone, Debug)]
@@ -63,5 +63,15 @@ pub fn mode(trust: &Trust, id: &str, path: Option<&Path>) -> Mode {
         Some(path) => trust.mode(id, Origin::File(path)),
         // No folder can vouch for a path that cannot be resolved or written as text.
         None => trust.mode(id, Origin::Outside),
+    }
+}
+
+/// What a document may fetch, link to and merge, by the same rules as [`mode`].
+pub fn gate<'a>(trust: &'a Trust, id: &str, path: Option<&Path>) -> Gate<'a> {
+    let Some(path) = path else { return trust.gate(id, Origin::Created) };
+    let real = fs::canonicalize(path).ok();
+    match real.as_deref().and_then(Path::to_str) {
+        Some(path) => trust.gate(id, Origin::File(path)),
+        None => trust.gate(id, Origin::Outside),
     }
 }
