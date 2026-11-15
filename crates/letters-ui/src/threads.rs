@@ -25,7 +25,7 @@ use crate::safe::Safely;
 use crate::style::{Align, Dir, Edges, Justify, Look};
 use crate::text::{TextShaper, TextStyle};
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::widgets::{Button, ControlSize, Popover, TextField};
+use crate::widgets::{Button, Popover};
 use crate::window::{Message, PT};
 use crate::words::WordLists;
 
@@ -42,7 +42,7 @@ const PADDING: f32 = 6.0;
 const REACH: f32 = 3.0;
 
 /// How wide a note that is open is, and the round face of who speaks in it.
-const WIDTH: f32 = 344.0;
+pub(crate) const WIDTH: f32 = 344.0;
 pub(crate) const FACE: f32 = 24.0;
 /// How wide what is said runs, beside the face of who says it.
 pub(crate) const SAID: f32 = WIDTH - FACE - tokens::SPACE_SM;
@@ -290,23 +290,30 @@ impl Said {
         self.layout.as_mut().map(DocLayout::take_unlisted).unwrap_or_default()
     }
 
+    /// The layout that sets what notes say, in these colours. The field a note is written in is set in
+    /// it too ([`crate::comment`]), so that what is written looks as it will once it is kept.
+    pub fn layout(&mut self, palette: Palette) -> &mut DocLayout {
+        let fonts = Fonts { faces: letters_fonts::bundled() };
+        let layout = self.layout.get_or_insert_with(|| {
+            let mut layout = DocLayout::new(fonts.clone());
+            layout.add_fallback_fonts(&self.backup);
+            self.lists.hand(&mut layout);
+            layout
+        });
+        // A shell whose fonts come one after another may hold more by now.
+        layout.add_fonts(&fonts);
+        layout.set_palette(palette);
+        layout
+    }
+
     /// What a note says and each reply to it, set `width` wide. They are set again only when they change.
     pub fn of(&mut self, note: &Note, width: f32, palette: Palette) -> &[Rc<Spoken>] {
         let of = (note.id.clone(), note.replies.len(), width, palette);
         if self.of.as_ref() != Some(&of) {
-            let fonts = Fonts { faces: letters_fonts::bundled() };
-            let layout = self.layout.get_or_insert_with(|| {
-                let mut layout = DocLayout::new(fonts.clone());
-                layout.add_fallback_fonts(&self.backup);
-                self.lists.hand(&mut layout);
-                layout
-            });
-            // A shell whose fonts come one after another may hold more by now.
-            layout.add_fonts(&fonts);
-            layout.set_palette(palette);
+            let layout = self.layout(palette);
             let said = iter::once(&note.content).chain(note.replies.iter().map(|reply| &reply.content));
-            self.spoken = said.map(|runs| Rc::new(spoken(layout, runs, width))).collect();
-            self.of = Some(of);
+            let spoken = said.map(|runs| Rc::new(spoken(layout, runs, width))).collect();
+            (self.spoken, self.of) = (spoken, Some(of));
         }
         &self.spoken
     }
@@ -442,12 +449,13 @@ fn voice(index: usize, (who, when): (&str, &str), said: &Rc<Spoken>, import: boo
 }
 
 /// A note that is open, to hang under its passage: what was said, by whom and when, with Resolve at its
-/// top right and a reply under it. `said` is what the note and each reply say, as [`Said::of`] set them,
+/// top right and a reply under it. `reply` is the field the reply is written in, and whether nothing is
+/// written in it. `said` is what the note and each reply say, as [`Said::of`] set them,
 /// and `refused` why nothing can be added to the notes of this document. `follows` is for a note the caret
 /// opened by coming into its passage, and `back` for a conflict whose block can be put back on the page.
 pub(crate) fn thread(
     note: &Note,
-    reply: &str,
+    (field, blank): (Element<Message>, bool),
     said: &[Rc<Spoken>],
     now: &str,
     refused: Option<&str>,
@@ -487,27 +495,22 @@ pub(crate) fn thread(
         if tall > TALL {
             voices = voices.height(TALL).scroll();
         }
+        // A reply of several lines has the button beside its last.
         let under = Element::row()
-            .align(Align::Center)
+            .align(Align::End)
             .gap(tokens::SPACE_SM)
             .padding(Edges::top(tokens::SPACE_MD))
             .border(Edges::top(1.0), tokens::LINE);
         let under = match refused {
             Some(why) => under.child(Element::paragraph(why, small).fg(tokens::FG_MUTED).grow(1.0).role(Role::Status)),
             None => {
-                let field = TextField::new("Reply", reply)
-                    .placeholder("Reply")
-                    .size(ControlSize::Small)
-                    .on_input(|text| send(Noting::Reply(text)))
-                    .on_submit(send(Noting::Answer))
-                    .on_cancel(send(Noting::Close));
                 let post = Button::icon_only(icon::SEND, "Send")
                     .primary()
                     .small()
-                    .disabled(reply.trim().is_empty())
+                    .disabled(blank)
                     .on_press(send(Noting::Answer));
                 // A note the caret opened leaves the keyboard with the page, until its reply is pressed.
-                let field = Element::from(field).key("reply").grow(1.0);
+                let field = field.key("reply");
                 under.child(if follows { field } else { field.takes_focus() }).child(post)
             }
         };
@@ -523,7 +526,7 @@ pub(crate) fn thread(
         return thread.beside().stays();
     }
     // A stray press on the page does not cost what was typed: Escape drops it.
-    if reply.trim().is_empty() { thread } else { thread.stays() }
+    if blank { thread } else { thread.stays() }
 }
 
 /// The version of a conflict that still has the block the page lost: who wrote it and when, how it reads,

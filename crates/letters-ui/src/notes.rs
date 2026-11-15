@@ -1,28 +1,29 @@
 //! Notes on a passage: what people say about it, kept beside the page.
 //!
 //! Over a stretch of selected text float the two things that are done to a passage: linking it and
-//! commenting on it. A comment is written in a field that hangs under its passage, in Markdown's bold,
-//! italic, struck text, code and links, and is kept as a note that stays with its text. How notes show
-//! once they are kept is in [`crate::threads`].
+//! commenting on it. A comment is written in a field that hangs under its passage ([`crate::comment`]),
+//! and is kept as a note that stays with its text. How notes show once they are kept is in
+//! [`crate::threads`].
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use accesskit::Role;
 use letters_model::{Anchor, Block, BlockId, Document, Mark, Model, Note, NoteKind, Notes, Pos, Reply, Run, Selection};
 use letters_render::{DisplayList, Item, Rect};
 
 use crate::color::{fade, resolve};
+use crate::comment::{Writing, Written};
 use crate::element::Element;
 use crate::icon;
 use crate::style::{Align, Edges};
 use crate::text::TextStyle;
 use crate::threads::{Kind, Marker};
 use crate::tokens::{self, Scheme};
-use crate::widgets::{Button, ControlSize, Popover, Side, TextField};
+use crate::widgets::{Button, Popover, Side};
 use crate::window::Message;
 
-/// How wide the field a comment is written in hangs under its passage.
-const WIDTH: f32 = 320.0;
+/// How wide the field a comment is written in hangs under its passage, with the button that sends it.
+pub(crate) const WIDTH: f32 = 320.0;
 /// The room between a selection and the tools over it.
 pub(crate) const TOOLS_GAP: f32 = 8.0;
 /// The room the tools take above a selection, which they hang under when it is not there.
@@ -37,8 +38,8 @@ pub enum Noting {
     Away,
     /// Starts a comment on the selected passage.
     Write,
-    /// What is typed into the comment being written.
-    Draft(String),
+    /// What the keyboard or the pointer does in the field of the comment or the reply being written.
+    Wrote(Writing),
     /// Keeps the comment being written.
     Send,
     /// Drops it.
@@ -48,8 +49,6 @@ pub enum Noting {
     /// A press on the marker beside a block: opens the first of its notes, or the one after the note
     /// that is open, and puts the last one away.
     Press(BlockId),
-    /// What is typed into the reply to the note that is open.
-    Reply(String),
     /// Keeps that reply.
     Answer,
     /// Resolves the note that is open.
@@ -72,12 +71,12 @@ pub(crate) struct Margin {
     pub author: String,
     /// The selection the tools were put away over. They stay away until it changes.
     away: Option<Selection>,
-    /// The comment being written: the passage it is about, and what is typed so far.
-    draft: Option<(Anchor, String)>,
+    /// The comment being written: the passage it is about, and what is written so far.
+    draft: Option<(Anchor, Written)>,
     /// Why no comment can be written on this document, as the shell says.
     pub refused: Option<String>,
-    /// The note that is open under its passage, and the reply typed into it so far.
-    thread: Option<(String, String)>,
+    /// The note that is open under its passage, and the reply written to it so far.
+    thread: Option<(String, Written)>,
     /// Whether the caret opened the note that is open, by coming into its passage. Such a note leaves the
     /// keyboard with the page, and goes when the caret does.
     followed: bool,
@@ -134,14 +133,20 @@ impl Margin {
         self.draft = passage.map(|mut anchor| {
             // The passage stays with its text while the comment is written.
             anchor.pin(model);
-            (anchor, String::new())
+            (anchor, Written::default())
         });
     }
 
-    pub fn typed(&mut self, text: String) {
-        if let Some((_, draft)) = &mut self.draft {
-            *draft = text;
-        }
+    /// The field that is open, to write in: the comment's, or the reply's to the note that is read. With
+    /// it comes how wide the row is that it shares with the button that sends it.
+    pub fn written(&mut self) -> Option<(&mut Written, f32)> {
+        let draft = self.draft.as_mut().map(|(_, draft)| (draft, WIDTH));
+        draft.or(self.thread.as_mut().map(|(_, reply)| (reply, crate::threads::WIDTH)))
+    }
+
+    /// The comment being written, as far as it is.
+    pub fn drafted(&self) -> Option<&Written> {
+        self.draft.as_ref().map(|(_, draft)| draft)
     }
 
     pub fn drop_draft(&mut self) {
@@ -156,8 +161,8 @@ impl Margin {
     /// Keeps the comment being written as a note, tied to the text it is about. Returns whether there was
     /// anything to keep: a comment that says nothing is dropped.
     pub fn send(&mut self, model: &Model, id: String, created: String) -> bool {
-        let Some((mut anchor, text)) = self.draft.take() else { return false };
-        let content = inline(text.trim());
+        let Some((mut anchor, written)) = self.draft.take() else { return false };
+        let content = written.content();
         if content.is_empty() || self.refused.is_some() {
             return false;
         }
@@ -220,9 +225,9 @@ impl Margin {
         self.marks = marks;
     }
 
-    /// The note that is open under its passage, and the reply typed into it so far. A conflict whose
+    /// The note that is open under its passage, and the reply written to it so far. A conflict whose
     /// versions show in the page is not read there: see [`Margin::reviewing`].
-    pub fn reading(&self) -> Option<(&Note, &str)> {
+    pub fn reading(&self) -> Option<(&Note, &Written)> {
         let (id, reply) = self.thread.as_ref()?;
         let note = self.notes.notes.iter().find(|note| &note.id == id && !note.resolved)?;
         (!self.reviewed(note)).then_some((note, reply))
@@ -273,7 +278,7 @@ impl Margin {
 
     /// Opens a note under its passage. What was being written elsewhere is dropped.
     pub fn read(&mut self, id: &str) {
-        (self.thread, self.draft, self.left) = (Some((id.to_owned(), String::new())), None, None);
+        (self.thread, self.draft, self.left) = (Some((id.to_owned(), Written::default())), None, None);
         self.followed = false;
     }
 
@@ -302,7 +307,7 @@ impl Margin {
     /// note was opened.
     pub fn attend(&mut self, was: Option<&str>, caret: Option<&Pos>, free: bool) -> bool {
         let at = caret.and_then(|caret| self.about(caret)).map(str::to_owned);
-        let left = |(open, reply): &(String, String)| reply.trim().is_empty() && Some(open) != at.as_ref();
+        let left = |(open, reply): &(String, Written)| reply.is_blank() && Some(open) != at.as_ref();
         if self.followed && self.thread.as_ref().is_some_and(left) {
             self.thread = None;
         }
@@ -311,7 +316,7 @@ impl Margin {
         if !free || held {
             return false;
         }
-        (self.thread, self.followed, self.left) = (Some((at, String::new())), true, None);
+        (self.thread, self.followed, self.left) = (Some((at, Written::default())), true, None);
         true
     }
 
@@ -337,7 +342,7 @@ impl Margin {
         let Some(marker) = self.marks.iter().find(|marker| &marker.block == block) else { return };
         let at = self.thread.as_ref().map(|(id, _)| id).or(self.left.as_ref());
         let at = at.and_then(|id| marker.notes.iter().position(|note| note == id));
-        if at.is_some() && self.thread.as_ref().is_some_and(|(_, reply)| !reply.trim().is_empty()) {
+        if at.is_some() && self.thread.as_ref().is_some_and(|(_, reply)| !reply.is_blank()) {
             return;
         }
         let next = at.map_or(Some(0), |at| Some(at + 1)).and_then(|next| marker.notes.get(next)).cloned();
@@ -347,21 +352,15 @@ impl Margin {
         }
     }
 
-    pub fn reply(&mut self, text: String) {
-        if let Some((_, reply)) = &mut self.thread {
-            *reply = text;
-        }
-    }
-
     /// Keeps the reply typed into the open note, signed and dated. Returns whether there was anything to
     /// keep.
     pub fn answer(&mut self, created: String) -> bool {
         let Some((id, reply)) = &mut self.thread else { return false };
-        let content = inline(reply.trim());
+        let content = reply.content();
         let note = self.notes.notes.iter_mut().find(|note| &note.id == id);
         let Some(note) = note.filter(|_| !content.is_empty() && self.refused.is_none()) else { return false };
         note.replies.push(Reply { author: self.author.clone(), created, content, extra: Default::default() });
-        reply.clear();
+        *reply = Written::default();
         true
     }
 
@@ -408,40 +407,30 @@ impl Margin {
             .on_close(Message::Note(Noting::Away))
     }
 
-    /// The field the comment is written in, to hang under its passage. Where no comment can be written,
-    /// the reason hangs there in its place.
-    pub fn field(&self) -> Option<Popover<Message>> {
-        let (_, text) = self.draft.as_ref()?;
+    /// The field the comment is written in, with the button that sends it, to hang under its passage.
+    /// Where no comment can be written, the reason hangs there in place of `field`.
+    pub fn field(&self, field: Element<Message>) -> Option<Popover<Message>> {
+        let blank = self.drafted()?.is_blank();
         if let Some(why) = &self.refused {
             let quiet = TextStyle::control().size(tokens::TEXT_SM);
             let said = Element::paragraph(why.as_str(), quiet).fg(tokens::FG_MUTED).width(WIDTH).role(Role::Status);
             let said = Popover::new(said).label("New comment").max_width(WIDTH + 2.0 * tokens::SPACE_MD + 2.0);
             return Some(said.open(true).on_close(Message::Note(Noting::Drop)));
         }
-        let field = TextField::new("Comment", text)
-            .placeholder("Comment on this")
-            .size(ControlSize::Small)
-            .on_input(|text| Message::Note(Noting::Draft(text)))
-            .on_submit(Message::Note(Noting::Send))
-            .on_cancel(Message::Note(Noting::Drop));
         let send = Button::icon_only(icon::SEND, "Send")
             .primary()
             .small()
-            .disabled(text.trim().is_empty())
+            .disabled(blank)
             .on_press(Message::Note(Noting::Send));
-        let row = Element::row()
-            .align(Align::Center)
-            .gap(tokens::SPACE_SM)
-            .width(WIDTH)
-            .child(Element::from(field).grow(1.0))
-            .child(send);
+        // A comment of several lines has the button beside its last.
+        let row = Element::row().align(Align::End).gap(tokens::SPACE_SM).width(WIDTH).child(field).child(send);
         let field = Popover::new(row)
             .label("New comment")
             .max_width(WIDTH + 2.0 * tokens::SPACE_MD + 2.0)
             .open(true)
             .on_close(Message::Note(Noting::Drop));
         // A stray press on the page does not cost what was typed: Escape drops it.
-        Some(if text.trim().is_empty() { field } else { field.stays() })
+        Some(if blank { field } else { field.stays() })
     }
 }
 
@@ -503,82 +492,43 @@ pub(crate) fn passage(doc: &Document, selection: &Selection) -> Option<Anchor> {
     })
 }
 
-/// Reads a comment as it was typed: Markdown's bold, italic, struck text, code and links, a bare address
-/// as a link to itself, and everything else as it stands.
-pub(crate) fn inline(text: &str) -> Vec<Run> {
-    let mut runs: Vec<Run> = Vec::new();
-    read(text, &BTreeSet::new(), None, &mut runs);
-    runs
-}
-
-/// What a stretch of a comment is set in.
-type Format<'a> = (&'a BTreeSet<Mark>, Option<&'a str>);
-
-fn push(text: &str, (marks, link): Format, out: &mut Vec<Run>) {
-    if text.is_empty() {
-        return;
-    }
-    match out.last_mut() {
-        Some(last) if &last.marks == marks && last.link.as_deref() == link => last.text.push_str(text),
-        _ => out.push(Run { link: link.map(str::to_owned), ..Run::marked(text, marks.iter().cloned()) }),
-    }
-}
-
-fn read(text: &str, marks: &BTreeSet<Mark>, link: Option<&str>, out: &mut Vec<Run>) {
-    let mut rest = text;
-    // The character before `rest`, which says whether a word starts there.
+/// Makes each web address that is written out in plain text a link to itself, as a note keeps it: one that
+/// ends a comment is never followed by the space that makes it a link while it is typed. What is code, or
+/// a link already, stays as it is.
+pub(crate) fn addressed(runs: Vec<Run>) -> Vec<Run> {
+    let mut out: Vec<Run> = Vec::new();
+    // The character before, which says whether a word starts.
     let mut before: Option<char> = None;
-    while let Some(next) = rest.chars().next() {
-        let starts = before.is_none_or(|before| !before.is_alphanumeric());
-        if let Some((mark, inner, after)) = fenced(rest, starts) {
-            let mut marked = marks.clone();
-            let code = mark == Mark::Code;
-            marked.insert(mark);
-            // Code is kept as typed: nothing in it is a mark.
-            match code {
-                true => push(inner, (&marked, link), out),
-                false => read(inner, &marked, link, out),
+    for run in runs {
+        if run.link.is_some() || run.marks.contains(&Mark::Code) {
+            before = run.text.chars().last().or(before);
+            out.push(run);
+            continue;
+        }
+        let piece = |text: &str, link: Option<&str>| Run {
+            text: text.to_owned(),
+            link: link.map(str::to_owned),
+            ..run.clone()
+        };
+        let (mut rest, mut plain) = (run.text.as_str(), String::new());
+        while let Some(next) = rest.chars().next() {
+            let starts = before.is_none_or(|before| !before.is_alphanumeric());
+            if let Some((address, after)) = bare(rest).filter(|_| starts) {
+                if !plain.is_empty() {
+                    out.push(piece(&std::mem::take(&mut plain), None));
+                }
+                out.push(piece(address, Some(address)));
+                (before, rest) = (address.chars().last(), after);
+            } else {
+                plain.push(next);
+                (before, rest) = (Some(next), &rest[next.len_utf8()..]);
             }
-            (before, rest) = (inner.chars().last(), after);
-        } else if let Some((label, address, after)) = linked(rest).filter(|_| link.is_none()) {
-            read(label, marks, Some(address), out);
-            (before, rest) = (Some(')'), after);
-        } else if let Some((address, after)) = bare(rest).filter(|_| starts && link.is_none()) {
-            push(address, (marks, Some(address)), out);
-            (before, rest) = (address.chars().last(), after);
-        } else {
-            let (one, after) = rest.split_at(next.len_utf8());
-            push(one, (marks, link), out);
-            (before, rest) = (Some(next), after);
+        }
+        if !plain.is_empty() {
+            out.push(piece(&plain, None));
         }
     }
-}
-
-/// What `text` opens with when that is text between a pair of marks: the mark, the text inside and what
-/// follows. An underscore marks only whole words, so that a `name_like_this` stays as typed.
-fn fenced(text: &str, starts: bool) -> Option<(Mark, &str, &str)> {
-    let fences =
-        [("**", Mark::Bold), ("~~", Mark::Strike), ("*", Mark::Italic), ("_", Mark::Italic), ("`", Mark::Code)];
-    fences.into_iter().find_map(|(fence, mark)| {
-        let body = text.strip_prefix(fence).filter(|_| fence != "_" || starts)?;
-        let closes = |at: &usize| {
-            let (inner, after) = (&body[..*at], &body[at + fence.len()..]);
-            // A single star is not one of a pair of them.
-            let lone = fence != "*" || !(inner.ends_with('*') || after.starts_with('*'));
-            let worded = fence != "_" || !after.starts_with(char::is_alphanumeric);
-            lone && worded && !inner.is_empty() && !inner.starts_with(char::is_whitespace) && !inner.ends_with(' ')
-        };
-        let close = body.match_indices(fence).map(|(at, _)| at).find(closes)?;
-        Some((mark, &body[..close], &body[close + fence.len()..]))
-    })
-}
-
-/// What `text` opens with when that is a link as Markdown writes it: its words, its address and what follows.
-fn linked(text: &str) -> Option<(&str, &str, &str)> {
-    let (label, rest) = text.strip_prefix('[')?.split_once("](")?;
-    let (address, after) = rest.split_once(')')?;
-    let whole = !label.is_empty() && !label.contains(['[', '\n']) && !address.is_empty();
-    (whole && !address.contains(char::is_whitespace)).then_some((label, address, after))
+    out
 }
 
 /// What `text` opens with when that is a web address written out, without the stop that ends its sentence.
@@ -597,49 +547,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_comment_is_read_with_markdowns_bold_italic_and_links() {
-        const B: u8 = 1;
-        const I: u8 = 2;
-        const S: u8 = 4;
-        const C: u8 = 8;
-        // What is typed, and its runs: the text, its marks and its link.
-        type Runs<'a> = &'a [(&'a str, u8, &'a str)];
-        let cases: [(&str, Runs); 14] = [
-            ("Has anyone chased it? \u{26a1}", &[("Has anyone chased it? \u{26a1}", 0, "")]),
-            ("due **this Friday**, see", &[("due ", 0, ""), ("this Friday", B, ""), (", see", 0, "")]),
-            ("tell *Harland* and _Sam_", &[("tell ", 0, ""), ("Harland", I, ""), (" and ", 0, ""), ("Sam", I, "")]),
-            ("*a **b** c*", &[("a ", I, ""), ("b", B | I, ""), (" c", I, "")]),
+    fn an_address_written_out_in_a_comment_is_a_link_when_the_comment_is_kept() {
+        const A: &str = "https://a.example/q?x=1";
+        let bold = |text: &str| Run::marked(text, [Mark::Bold]);
+        let code = |text: &str| Run::marked(text, [Mark::Code]);
+        let link = |run: Run, to: &str| Run { link: Some(to.to_owned()), ..run };
+        // What was written, and what is kept.
+        let cases = [
+            (vec![Run::plain("Has anyone chased it?")], vec![Run::plain("Has anyone chased it?")]),
             (
-                "see [their email](https://a.example/m)!",
-                &[("see ", 0, ""), ("their email", 0, "https://a.example/m"), ("!", 0, "")],
+                vec![Run::plain(format!("at {A}. Thanks"))],
+                vec![Run::plain("at "), link(Run::plain(A), A), Run::plain(". Thanks")],
             ),
-            ("[a **b**](x:y)", &[("a ", 0, "x:y"), ("b", B, "x:y")]),
-            ("~~Monday~~ **Tuesday**", &[("Monday", S, ""), (" ", 0, ""), ("Tuesday", B, "")]),
-            // Code is kept as typed.
-            ("run `a *b* c` twice", &[("run ", 0, ""), ("a *b* c", C, ""), (" twice", 0, "")]),
-            (
-                "at https://a.example/q?x=1. Thanks",
-                &[("at ", 0, ""), ("https://a.example/q?x=1", 0, "https://a.example/q?x=1"), (". Thanks", 0, "")],
-            ),
-            // What only looks like a mark stays as typed.
-            ("2 * 3 * 4", &[("2 * 3 * 4", 0, "")]),
-            ("the roof_plan_v2 file", &[("the roof_plan_v2 file", 0, "")]),
-            ("**open", &[("**open", 0, "")]),
-            ("[not a link] (here)", &[("[not a link] (here)", 0, "")]),
-            ("", &[]),
+            (vec![Run::plain(format!("see {A}"))], vec![Run::plain("see "), link(Run::plain(A), A)]),
+            // The marks of the text are the address's too.
+            (vec![Run::plain("see "), bold(A)], vec![Run::plain("see "), link(bold(A), A)]),
+            // What is a link already, what is code and what only holds an address stay as written.
+            (vec![link(Run::plain(A), "https://b.example")], vec![link(Run::plain(A), "https://b.example")]),
+            (vec![code(A)], vec![code(A)]),
+            (vec![Run::plain(format!("x{A}"))], vec![Run::plain(format!("x{A}"))]),
+            (vec![Run::plain("ab"), bold(A)], vec![Run::plain("ab"), bold(A)]),
         ];
-        for (typed, runs) in cases {
-            let read: Vec<(String, u8, String)> = inline(typed)
-                .into_iter()
-                .map(|run| {
-                    let has = |mark: Mark, bit: u8| u8::from(run.marks.contains(&mark)) * bit;
-                    let marks = has(Mark::Bold, B) + has(Mark::Italic, I) + has(Mark::Strike, S) + has(Mark::Code, C);
-                    (run.text, marks, run.link.unwrap_or_default())
-                })
-                .collect();
-            let runs: Vec<(String, u8, String)> =
-                runs.iter().map(|(text, marks, link)| ((*text).to_owned(), *marks, (*link).to_owned())).collect();
-            assert_eq!(read, runs, "{typed:?}");
+        for (written, kept) in cases {
+            assert_eq!(addressed(written.clone()), kept, "{written:?}");
         }
     }
 

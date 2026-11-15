@@ -30,6 +30,7 @@ use crate::chrome::Chrome;
 use crate::code_copy::{self, CodeCopy};
 use crate::color::{fade, resolve, same};
 use crate::commands::{self, Act, Commanding, Commands, Entry};
+use crate::comment;
 use crate::contents::{self, Contents, Listing};
 use crate::context::{self, About, Context, Contexting};
 use crate::copying::{self, Copy, CopyFormat, Copying};
@@ -1539,9 +1540,13 @@ impl EditorApp {
         self.margin.now = platform.wall_time().map(notes::stamp).unwrap_or_default();
         let opens = matches!(asked, Noting::Open(_) | Noting::Press(_));
         match asked {
-            // What is typed changes nothing but itself.
-            Noting::Draft(text) => return self.margin.typed(text),
-            Noting::Reply(text) => return self.margin.reply(text),
+            // What is written in the field changes nothing but itself.
+            Noting::Wrote(asked) => {
+                let Some((written, row)) = self.margin.written() else { return };
+                let layout = self.said.layout(self.palette);
+                let desk = comment::Desk { keys: self.editor.keymap(), layout, width: comment::width(row) };
+                return written.does(asked, desk, platform);
+            }
             Noting::Away => self.margin.put_away(self.editor.selection()),
             Noting::Write => {
                 self.margin.write(self.editor.model(), self.editor.selection());
@@ -3906,14 +3911,23 @@ impl EditorApp {
             // top of the margin its marker stood in.
             let under = self.note_lines(note).map(|(_, last)| self.onto(last));
             let ways = (self.margin.follows(), self.put_back().is_some());
+            let layout = self.said.layout(self.palette);
+            let desk = comment::Desk { keys: self.editor.keymap(), layout, width: comment::width(threads::WIDTH) };
+            let look = (self.palette.selection, self.shaper.as_ref() as &dyn TextShaper);
+            let field = reply.field(desk, look, ("Reply", "Reply"), Noting::Answer);
             let said = self.said.of(note, threads::SAID, self.palette);
             let (now, refused) = (self.margin.now.as_str(), self.margin.refused.as_deref());
-            let thread = threads::thread(note, reply, said, now, refused, ways);
+            let thread = threads::thread(note, (field, reply.is_blank()), said, now, refused, ways);
             element = element.popover(match under {
                 Some(under) => thread.at(under),
                 None => thread.at(Rect::new(room.width - GUTTER, GUTTER, 0.0, 0.0)).align(Align::End),
             });
-        } else if let Some((field, passage)) = self.margin.field().zip(self.margin.writing()) {
+        } else if let Some((draft, passage)) = self.margin.drafted().zip(self.margin.writing()) {
+            let layout = self.said.layout(self.palette);
+            let desk = comment::Desk { keys: self.editor.keymap(), layout, width: comment::width(notes::WIDTH) };
+            let look = (self.palette.selection, self.shaper.as_ref() as &dyn TextShaper);
+            let field = draft.field(desk, look, ("Comment", "Comment on this"), Noting::Send);
+            let field = self.margin.field(field.takes_focus()).expect("a comment is being written");
             // The field hangs under the last line of the passage the comment is about.
             let lines = notes::stretch(passage).map(|passage| self.layout.selection(&passage)).unwrap_or_default();
             let under = lines.last().copied().unwrap_or_default();

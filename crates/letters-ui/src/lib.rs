@@ -13,6 +13,7 @@ mod chrome;
 mod code_copy;
 pub mod color;
 mod commands;
+mod comment;
 mod contents;
 mod context;
 mod copying;
