@@ -27,5 +27,8 @@
       { "id": "r1", "type": "table_row" }, { "id": "r2", "type": "table_row", "blocks": [{ "id": "a", "type": "table_cell" }, { "id": "b", "type": "table_cell", "content": [{ "text": "x" }] }] }] },
       { "id": "u", "type": "table" }] } },
   { "why": "text may refer to a block that is not there",
-    "json": { "format": 1, "blocks": [{ "id": "a", "type": "paragraph", "content": [{ "text": "Figure 2", "ref": "gone" }] }] } }
+    "json": { "format": 1, "blocks": [{ "id": "a", "type": "paragraph", "content": [{ "text": "Figure 2", "ref": "gone" }] }] } },
+  { "why": "a row may stand outside a table, a cell outside a row, and a caption or figure anywhere",
+    "json": { "format": 1, "blocks": [{ "id": "r", "type": "table_row", "blocks": [{ "id": "a", "type": "table_cell" }] }, { "id": "b", "type": "table_cell" },
+      { "id": "q", "type": "quote", "blocks": [{ "id": "c", "type": "caption" }, { "id": "d", "type": "table_row" }, { "id": "e", "type": "figure", "src": "https://example.com/a.png", "width": 2, "height": 2 }] }] } }
 ]

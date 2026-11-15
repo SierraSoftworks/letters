@@ -113,14 +113,14 @@
         {
           "if": { "properties": { "type": { "const": "gallery" } } },
           "then": {
-            "description": "Pictures shown together. Holds figures and captions: one caption, last, unless two people's changes left more.",
+            "description": "Pictures shown together. Holds figures and captions, and types a reader does not know: one caption, last, unless two people's changes left more.",
             "properties": {
               "numbered": { "type": "boolean", "description": "Whether the caption opens with a generated number. Defaults to false." },
               "blocks": {
                 "type": "array",
                 "items": {
                   "$ref": "#/$defs/block",
-                  "properties": { "type": { "not": { "enum": ["paragraph", "heading", "list_item", "code", "formula", "quote", "callout", "divider", "gallery", "table", "table_row", "table_cell"] } } }
+                  "properties": { "type": { "anyOf": [{ "enum": ["figure", "caption"] }, { "not": { "$ref": "#/$defs/known" } }] } }
                 }
               }
             }
@@ -137,7 +137,7 @@
                 "type": "array",
                 "items": {
                   "$ref": "#/$defs/block",
-                  "properties": { "type": { "not": { "enum": ["paragraph", "heading", "list_item", "code", "formula", "quote", "callout", "divider", "caption", "figure", "gallery", "table", "table_cell"] } } }
+                  "properties": { "type": { "anyOf": [{ "enum": ["table_row"] }, { "not": { "$ref": "#/$defs/known" } }] } }
                 }
               }
             }
@@ -146,13 +146,13 @@
         {
           "if": { "properties": { "type": { "const": "table_row" } } },
           "then": {
-            "description": "Holds cells.",
+            "description": "Holds cells. A row outside a table reads as a table of that one row.",
             "properties": {
               "blocks": {
                 "type": "array",
                 "items": {
                   "$ref": "#/$defs/block",
-                  "properties": { "type": { "not": { "enum": ["paragraph", "heading", "list_item", "code", "formula", "quote", "callout", "divider", "caption", "figure", "gallery", "table", "table_row"] } } }
+                  "properties": { "type": { "anyOf": [{ "enum": ["table_cell"] }, { "not": { "$ref": "#/$defs/known" } }] } }
                 }
               }
             }
@@ -160,9 +160,13 @@
         },
         {
           "if": { "properties": { "type": { "const": "table_cell" } } },
-          "then": { "$ref": "#/$defs/text", "description": "One cell of a row." }
+          "then": { "$ref": "#/$defs/text", "description": "One cell of a row. A cell outside a row reads as a paragraph." }
         }
       ]
+    },
+    "known": {
+      "enum": ["paragraph", "heading", "list_item", "code", "formula", "quote", "callout", "divider", "caption", "figure", "gallery", "table", "table_row", "table_cell"],
+      "description": "The types this format version defines. A gallery, a table and a row hold only their own parts and types outside this list."
     },
     "text": {
       "description": "A block that holds text. A line feed in the text of a paragraph, heading or list item is a hard line break.",

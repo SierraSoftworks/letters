@@ -45,6 +45,156 @@
     },
     {
       "id": "n4",
+      "type": "paragraph",
+      "content": [
+        {
+          "text": "The table and "
+        },
+        {
+          "text": "Figure 1",
+          "ref": "n6"
+        },
+        {
+          "text": " show the change."
+        }
+      ]
+    },
+    {
+      "id": "n5",
+      "type": "table",
+      "columns": [
+        "start",
+        "end"
+      ],
+      "header": true,
+      "blocks": [
+        {
+          "id": "r1",
+          "type": "table_row",
+          "blocks": [
+            {
+              "id": "c1",
+              "type": "table_cell",
+              "content": [
+                {
+                  "text": "Year"
+                }
+              ]
+            },
+            {
+              "id": "c2",
+              "type": "table_cell",
+              "content": [
+                {
+                  "text": "Rate"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "r2",
+          "type": "table_row",
+          "blocks": [
+            {
+              "id": "c3",
+              "type": "table_cell",
+              "content": [
+                {
+                  "text": "2026"
+                }
+              ]
+            },
+            {
+              "id": "c4",
+              "type": "table_cell",
+              "content": [
+                {
+                  "text": "4.0 %"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "r3",
+          "type": "table_row",
+          "blocks": [
+            {
+              "id": "c5",
+              "type": "table_cell",
+              "content": [
+                {
+                  "text": "2027"
+                }
+              ]
+            },
+            {
+              "id": "c6",
+              "type": "table_cell",
+              "content": [
+                {
+                  "text": "4.5 %",
+                  "marks": [
+                    "bold"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "n6",
+      "type": "figure",
+      "asset": "assets/76f8124708a505934c81e82d0b3fd1ff4e13334fe05397e6ce477133b4e957d7.png",
+      "alt": "A line rising from 4.0 to 4.5",
+      "width": 320,
+      "height": 213.5,
+      "numbered": true,
+      "content": [
+        {
+          "text": "Rates since 2020"
+        }
+      ]
+    },
+    {
+      "id": "n7",
+      "type": "gallery",
+      "numbered": true,
+      "blocks": [
+        {
+          "id": "g1",
+          "type": "figure",
+          "src": "https://example.com/branch.jpg",
+          "alt": "",
+          "width": 240,
+          "height": 160,
+          "content": []
+        },
+        {
+          "id": "g2",
+          "type": "figure",
+          "asset": "assets/76f8124708a505934c81e82d0b3fd1ff4e13334fe05397e6ce477133b4e957d7.png",
+          "alt": "The counter",
+          "width": 240,
+          "height": 180,
+          "content": []
+        },
+        {
+          "id": "g3",
+          "type": "caption",
+          "content": [
+            {
+              "text": "Where to ask"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "n8",
       "type": "heading",
       "level": 1,
       "content": [
@@ -56,7 +206,7 @@
       "lang": "fr"
     },
     {
-      "id": "n5",
+      "id": "n9",
       "type": "paragraph",
       "content": [
         {
