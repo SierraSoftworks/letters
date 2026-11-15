@@ -5,8 +5,11 @@ Build what it specifies, and prefer simple and polished over complex.
 
 ## Rules for every change
 
-- **Main stays green.** Commit straight to `main` in small commits. Before each push, rebase on `origin/main`
-  and run `./scripts/check.sh`.
+- **Main stays green.** Commit straight to `main` in small commits. Run `./scripts/check.sh` on your change,
+  then rebase on `origin/main`. If main moved during the run, `cargo check --workspace --all-targets`, the wasm
+  build of `letters-web` and your own crates' tests on the rebased tree are enough to push.
+- **Callers come along.** A change to a public signature or a public enum fixes every caller in the same
+  commit and names them in the message.
 - **Stay in your crate.** Each crate has one owner at a time. To change another crate's public interface, make
   the smallest additive change that unblocks you and say so in the commit message.
 - **The core is wasm-clean.** Every crate under `crates/` builds for `wasm32-unknown-unknown`. No threads,
