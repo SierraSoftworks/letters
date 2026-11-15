@@ -34,11 +34,24 @@ jobs:
       matrix:
         include:
           - name: Lint
-            steps: fmt lint
-          - name: Test
-            steps: test
+            key: Lint
+            check: fmt lint
           - name: Wasm
-            steps: wasm
+            key: Wasm
+            check: wasm
+          # The gate's `cargo test --workspace` as three jobs of about one length, since building and running
+          # the tests is most of a push. The last takes every crate the others do not name, new ones too.
+          - name: Test (model, layout, render)
+            key: test-model
+            test: -p letters-model -p letters-layout -p letters-render
+          - name: Test (editor, window)
+            key: test-window
+            test: -p letters-editor -p letters-test
+          - name: Test (the rest)
+            key: test-rest
+            test: >-
+              --workspace --exclude letters-model --exclude letters-layout --exclude letters-render
+              --exclude letters-editor --exclude letters-test
     steps:
       - uses: actions/checkout@v7
 
@@ -49,16 +62,21 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}
+          key: ${{ matrix.key }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check
+        if: matrix.check
+        run: ./scripts/check.sh ${{ matrix.check }}
 
       # A step of its own, so that the run shows what building costs and what testing does.
       - name: Build tests
-        if: matrix.steps == 'test'
-        run: cargo test --workspace --no-run
+        if: matrix.test
+        run: cargo test ${{ matrix.test }} --no-run
 
-      - name: ${{ matrix.name }}
-        run: ./scripts/check.sh ${{ matrix.steps }}
+      - name: Test
+        if: matrix.test
+        run: cargo test ${{ matrix.test }}
 
   # The launch and keystroke budgets, on a release build.
   budgets:
