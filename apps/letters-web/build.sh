@@ -28,6 +28,25 @@ for files in fonts:letters-fonts/fonts maths:letters-math/fonts dictionaries:let
   cp ../../crates/"${files#*:}"/* "dist/${files%%:*}/"
 done
 
+# The faces that back up the fonts are too large to keep in the repository. Each is fetched once, as it was
+# published, and checked. A build that cannot reach one goes on without it, and the page without its glyphs.
+faces=$target/letters-web-faces
+sum() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; }
+mkdir -p "$faces" dist/fallback
+grep -v '^#' fallback.txt | while read -r wanted name url; do
+  if [ ! -f "$faces/$name" ] || [ "$(sum "$faces/$name")" != "$wanted" ]; then
+    rm -f "$faces/$name"
+    if curl -fsSL --retry 2 -o "$faces/$name.part" "$url" && [ "$(sum "$faces/$name.part")" = "$wanted" ]; then
+      mv "$faces/$name.part" "$faces/$name"
+    else
+      rm -f "$faces/$name.part"
+      echo "warning: $name could not be fetched as it was published, and is left out" >&2
+      continue
+    fi
+  fi
+  cp "$faces/$name" dist/fallback/
+done
+
 # The same module with its function names left in, which the report reads to say whose the code is.
 "$bindgen" "$wasm" --target web --no-typescript --out-name letters --out-dir "$target/letters-web-named" --no-demangle
 node size.mjs dist "$target/letters-web-named/letters_bg.wasm"

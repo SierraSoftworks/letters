@@ -3,6 +3,7 @@
 //! - [`shell`] owns the canvas, the hidden input beside it and the frame loop.
 //! - [`input`] turns the hidden input's events into the editor's input, and [`browser`] lends the editor
 //!   the browser's clock, identifiers and clipboard.
+//! - [`faces`] says which face backs up the fonts for a character they lack.
 //! - [`mirror`] keeps the window readable as HTML beside the canvas, for assistive technology.
 //! - [`page`] is the page a server sends: the document as HTML to read at once, and for the editor to open.
 //! - [`Letters`] is what a page holds: `await Letters.start(canvas, "")` starts the editor.
@@ -12,6 +13,7 @@
 //! the maths faces of a document without maths, are fetched after the first frame, which has no use for them.
 
 pub mod browser;
+pub mod faces;
 pub mod input;
 pub mod mirror;
 pub mod page;
