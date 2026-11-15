@@ -253,6 +253,36 @@ fn picture(source: &str, alt: &str) -> String {
     )
 }
 
+/// A run of an equation.
+fn m(text: &str) -> String {
+    format!("<m:r><m:t>{text}</m:t></m:r>")
+}
+
+/// A structure of an equation: its properties, then each part by name.
+fn structure(name: &str, props: &str, parts: &[(&str, String)]) -> String {
+    let parts: String = parts.iter().map(|(part, inner)| format!("<m:{part}>{inner}</m:{part}>")).collect();
+    format!("<m:{name}><m:{name}Pr>{props}</m:{name}Pr>{parts}</m:{name}>")
+}
+
+/// The formulas of a document in order: whether each is a block of its own, and its source.
+fn formulas(doc: &Document) -> Vec<(bool, String)> {
+    let within = |block: &Block| {
+        let maths = block.body.runs().iter().filter(|run| run.marks.contains(&Mark::Math));
+        maths.map(|run| (false, run.text.clone())).collect::<Vec<_>>()
+    };
+    doc.walk()
+        .flat_map(|block| match block.kind {
+            BlockKind::Formula => vec![(true, block.plain_text())],
+            _ => within(block),
+        })
+        .collect()
+}
+
+/// What a source is typeset as, which every way of typing one formula shares.
+fn typeset(source: &str) -> String {
+    letters_math::mathml(source, true).unwrap_or_else(|error| panic!("{source:?} is no formula: {error:?}"))
+}
+
 /// The text of the one block a file reads as, as `outline` writes runs.
 fn line(file: &Word) -> String {
     let lines = outline(&read(file).document);
@@ -593,6 +623,97 @@ fn reads_links() {
 }
 
 #[test]
+fn reads_equations_as_the_source_a_person_would_type() {
+    let val = |name: &str, value: &str| format!(r#"<m:{name} m:val="{value}"/>"#);
+    let upright = |text: &str| format!("<m:r><m:rPr>{}</m:rPr><m:t>{text}</m:t></m:r>", val("sty", "p"));
+    let e = |inner: String| ("e", inner);
+    let matrix = structure(
+        "m",
+        "",
+        &[
+            ("mr", format!("<m:e>{}</m:e><m:e>{}</m:e>", m("a"), m("b"))),
+            ("mr", format!("<m:e>{}</m:e><m:e>{}</m:e>", m("c"), m("d"))),
+        ],
+    );
+    let rows = structure("eqArr", "", &[e(m("a&amp;=b")), e(m("c&amp;=d"))]);
+    // Tools other than Word line equations up as a matrix whose columns meet.
+    let column = |side: &str| format!("<m:mc><m:mcPr>{}</m:mcPr></m:mc>", val("mcJc", side));
+    let met = structure(
+        "m",
+        &format!("<m:mcs>{}{}</m:mcs>", column("right"), column("left")),
+        &[("mr", format!("<m:e>{}</m:e><m:e>{}</m:e>", m("a"), m("=b")))],
+    );
+    let cases: &[(String, &str)] = &[
+        (m("x=1"), "x=1"),
+        (m("α≤β×2"), r"\alpha\le\beta\times 2"),
+        (structure("f", "", &[("num", m("a")), ("den", m("b"))]), r"\frac{a}{b}"),
+        (structure("sSup", "", &[e(m("x")), ("sup", m("2"))]), "x^2"),
+        (structure("sSubSup", "", &[e(m("x")), ("sub", m("ij")), ("sup", m("2"))]), "x_{ij}^2"),
+        (structure("rad", &val("degHide", "1"), &[("deg", String::new()), e(m("x+1"))]), r"\sqrt{x+1}"),
+        (structure("rad", "", &[("deg", m("3")), e(m("x"))]), r"\sqrt[3]{x}"),
+        (structure("nary", &val("chr", "∑"), &[("sub", m("i=1")), ("sup", m("n")), e(m("i"))]), r"\sum_{i=1}^n i"),
+        (structure("nary", &val("limLoc", "subSup"), &[("sub", m("0")), ("sup", m("1")), e(m("x"))]), r"\int_0^1 x"),
+        (structure("d", "", &[e(m("a+b"))]), r"\left(a+b\right)"),
+        (
+            structure("d", &(val("begChr", "[") + &val("endChr", "]")), &[e(matrix)]),
+            r"\begin{bmatrix} a & b \\ c & d \end{bmatrix}",
+        ),
+        (
+            structure("d", &(val("begChr", "{") + &val("endChr", "")), &[e(rows.clone())]),
+            r"\begin{cases} a&=b \\ c&=d \end{cases}",
+        ),
+        (rows, r"\begin{aligned} a&=b \\ c&=d \end{aligned}"),
+        (met, r"\begin{aligned} a & =b \end{aligned}"),
+        (structure("func", "", &[("fName", upright("sin")), e(m("x"))]), r"\sin x"),
+        (structure("limLow", "", &[e(m("⋃")), ("lim", m("i"))]) + &m("A"), r"\bigcup_i A"),
+        (structure("limLow", "", &[e(m("c+d")), ("lim", m("⏟"))]), r"\underbrace{c+d}"),
+        (structure("limUpp", "", &[e(m("→")), ("lim", m("f"))]), r"\xrightarrow{f}"),
+        (structure("limLow", "", &[e(upright("lim")), ("lim", m("n→∞"))]) + &m("a"), r"\lim_{n\to\infty} a"),
+        (structure("acc", &val("chr", "\u{20d7}"), &[e(m("v"))]), r"\vec{v}"),
+        (structure("bar", &val("pos", "top"), &[e(m("x"))]), r"\overline{x}"),
+        (format!("<m:r><m:rPr>{}</m:rPr><m:t>R</m:t></m:r>", val("scr", "double-struck")), r"\mathbb{R}"),
+        (format!("<m:r><m:rPr><m:nor/></m:rPr><m:t>if </m:t></m:r>{}", m("x")), r"\text{if }x"),
+    ];
+    for (equation, source) in cases {
+        let import = read(&word(&format!("<w:p>{}<m:oMath>{equation}</m:oMath></w:p>", t("So "))));
+        let read = formulas(&import.document);
+        let [(false, read)] = read.as_slice() else { panic!("{equation} is one formula in its line, got {read:?}") };
+        assert_eq!(typeset(read), typeset(source), "reading {equation} as {read:?}");
+        assert_eq!(import.notes, [], "nothing of {equation} is simplified");
+    }
+}
+
+#[test]
+fn an_equation_alone_in_its_paragraph_is_a_block() {
+    let (x, y) = (format!("<m:oMath>{}</m:oMath>", m("x")), format!("<m:oMath>{}</m:oMath>", m("y")));
+    let list = r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>"#;
+    // The body, the block it reads as, whether the formula is that block, and the formula.
+    let cases: &[(String, &str, bool, &str)] = &[
+        (format!("<w:p>{x}</w:p>"), "formula", true, "x"),
+        (format!("<w:p><m:oMathPara>{x}</m:oMathPara></w:p>"), "formula", true, "x"),
+        (
+            format!("<w:p><m:oMathPara>{x}{y}</m:oMathPara></w:p>"),
+            "formula",
+            true,
+            r"\begin{gathered} x \\ y \end{gathered}",
+        ),
+        (para(r#"<w:pStyle w:val="Q"/>"#, &x), "quote", true, "x"),
+        (format!("<w:p>{}{x}</w:p>", t("So ")), "p", false, "x"),
+        (format!("<w:p>{x}{}{y}</w:p>", t(" and ")), "p", false, "x"),
+        (para(list, &x), "bullet/0", false, "x"),
+        (para(r#"<w:pStyle w:val="H1"/>"#, &x), "h1", false, "x"),
+        (format!(r#"<w:p><w:hyperlink r:id="site">{x}</w:hyperlink></w:p>"#), "p", false, "x"),
+    ];
+    for (body, kind, alone, source) in cases {
+        let doc = read(&word(body).link("site", "https://example.com/")).document;
+        let lines = outline(&doc);
+        assert!(lines[0].split(' ').next() == Some(*kind), "{body} reads as a {kind}, got {lines:?}");
+        let (block, read) = formulas(&doc).into_iter().next().unwrap_or_else(|| panic!("{body} holds a formula"));
+        assert_eq!((block, typeset(&read)), (*alone, typeset(source)), "reading {body} as {read:?}");
+    }
+}
+
+#[test]
 fn keeps_the_text_of_what_it_simplifies_and_says_so() {
     let boxed = format!(
         r#"<w:p>{}<w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:anchor><a:graphic><a:graphicData>
@@ -611,6 +732,9 @@ fn keeps_the_text_of_what_it_simplifies_and_says_so() {
         p("Lovelace"),
     );
     let chart = r#"<w:p><w:r><w:t>Chart: </w:t></w:r><w:r><w:drawing><wp:inline><a:graphic/></wp:inline></w:drawing></w:r></w:p>"#;
+    // Roots inside roots, further down than a formula is typeset.
+    let deep = (0..40).fold(m("x"), |inner, _| structure("rad", "", &[("deg", String::new()), ("e", inner)]));
+    let deep_source = format!("So {}x{}", r"\sqrt{".repeat(40), "}".repeat(40));
     // The body, the text each block must come to, and a word of the note on that block.
     let cases: &[(String, &[&str], &str)] = &[
         (
@@ -627,7 +751,12 @@ fn keeps_the_text_of_what_it_simplifies_and_says_so() {
             &["E = mc2"],
             "Superscript",
         ),
-        (format!("<w:p>{}<m:oMath><m:r><m:t>x=1</m:t></m:r></m:oMath></w:p>", t("So ")), &["So x=1"], "Equation"),
+        (format!("<w:p>{}<m:oMath>{deep}</m:oMath></w:p>", t("So ")), &[deep_source.as_str()], "equation"),
+        (
+            format!("<w:p>{}<m:oMath><w:del>{}</w:del><w:ins>{}</w:ins></m:oMath></w:p>", t("So "), m("y"), m("x")),
+            &["So x"],
+            "Tracked changes",
+        ),
         (
             r#"<w:p><w:r><w:t>Go </w:t><w:sym w:font="Wingdings" w:char="F0E0"/></w:r></w:p>"#.to_owned(),
             &["Go \u{fffd}"],
@@ -1011,6 +1140,100 @@ fn page_breaks_and_languages_survive_a_round_trip() {
     assert_eq!(turned(&back), turned(&doc));
     assert_eq!(tongues(&back), tongues(&doc));
     assert_eq!(back.language, "en-AU");
+}
+
+/// Formulas of every structure Word has one for.
+const FORMULAS: &[&str] = &[
+    "x=1",
+    r"E = mc^2",
+    r"x_{i_j}^{2^k} + {}_a^b C",
+    r"\frac{-b \pm \sqrt{b^2 - 4ac}}{2a}",
+    r"\sqrt[3]{x} + \binom{n}{k}",
+    r"\sum_{i=1}^n i = \frac{n(n+1)}{2}",
+    r"\int_0^\infty e^{-x^2}\,dx = \frac{\sqrt{\pi}}{2}",
+    r"\prod_{k=1}^n k \ne \bigcup_i A_i",
+    r"\lim_{x \to 0} \frac{\sin x}{x} = 1",
+    r"\sin^2\theta + \cos^2\theta",
+    r"\left( \frac{a}{b} \right) + \left[ c \middle| d \right] + \left\langle e \right\rangle",
+    r"\begin{pmatrix} a & b \\ c & d \end{pmatrix} \begin{vmatrix} 1 & 0 \\ 0 & 1 \end{vmatrix}",
+    r"f(x) = \begin{cases} x & \text{if } x \ge 0 \\ -x & \text{otherwise} \end{cases}",
+    r"\begin{aligned} a &= b + c \\ &= d \end{aligned}",
+    r"\hat{x} + \vec{v} + \bar{z} + \dot{q} + \tilde{n} + \overline{AB} + \underline{c}",
+    r"\overbrace{a+b}^{n} + \underbrace{c+d}_{m}",
+    r"\mathbb{R} \subset \mathcal{C}, \mathbf{v} \in \mathfrak{g}, \mathrm{d}x",
+    r"\alpha\beta\Gamma \le \infty \to \partial \nabla \cdot \times",
+    r"a \quad b \; c",
+    r"f'(x) + g''(x)",
+    r"\boxed{x} + \cancel{y}",
+    r"A \xrightarrow{f} B \xleftarrow[g]{h} C",
+    r"\begin{array}{lr} a & b \\ c & d \end{array}",
+    r"\left. \frac{df}{dx} \right|_{x=0} + \lfloor x \rfloor + \|v\|",
+    r"\underbrace{1 + \cdots + 1}_{n \text{ times}} \textbf{ in all}",
+    r"x \in \{1, 2\} \% \#",
+];
+
+#[test]
+fn formulas_survive_a_round_trip() {
+    for source in FORMULAS {
+        let within = vec![Run::plain("Since "), Run::marked(*source, [Mark::Math]), Run::plain(", done.")];
+        let blocks = vec![Block::text("", BlockKind::Formula, *source), paragraph("", within)];
+        let back = returned(&Document { blocks, ..Document::default() });
+
+        let read = formulas(&back.document);
+        let [(true, alone), (false, within)] = read.as_slice() else {
+            panic!("{source:?} returns as a block and in a line, got {read:?}")
+        };
+        assert_eq!(typeset(alone), typeset(source), "returning {source:?} as {alone:?}");
+        assert_eq!(typeset(within), typeset(source), "returning {source:?} in a line as {within:?}");
+        assert_eq!(back.document.blocks[1].plain_text(), format!("Since {within}, done."));
+        assert_eq!(back.notes, [], "nothing of {source:?} is simplified");
+    }
+}
+
+#[test]
+fn formulas_keep_their_place_through_word() {
+    let text = |kind: BlockKind, text: &str| Block::text("", kind, text);
+    let maths = |source: &str| Run::marked(source, [Mark::Math]);
+    let item = BlockKind::ListItem { list: ListKind::Bullet, depth: 0 };
+    let linked = Run { link: Some("https://example.com/".into()), ..maths("c") };
+    let quote = Block {
+        body: Body::Blocks(vec![text(BlockKind::Paragraph, "Then"), text(BlockKind::Formula, "x^2")]),
+        ..Block::new("", BlockKind::Quote)
+    };
+    let blocks = vec![
+        text(BlockKind::Paragraph, "First"),
+        Block { page_break: true, ..text(BlockKind::Formula, r"\frac{a}{b}") },
+        Block { body: Body::Text(vec![maths("a")]), ..Block::new("", item) },
+        quote,
+        paragraph("", vec![linked]),
+        paragraph("", vec![Run::marked("bold ", [Mark::Bold]), maths("b"), Run::plain(" plain")]),
+    ];
+    let doc = Document { blocks, ..Document::default() };
+    let back = returned(&doc);
+
+    assert_eq!(outline(&back.document), outline(&doc));
+    assert_eq!(turned(&back.document), turned(&doc));
+    assert_eq!(back.notes, []);
+}
+
+#[test]
+fn a_formula_is_written_as_an_equation_and_one_with_a_mistake_as_its_source() {
+    let within = |source: &str| paragraph("", vec![Run::plain("See "), Run::marked(source, [Mark::Math])]);
+    let alone = |source: &str| Block::text("", BlockKind::Formula, source);
+    let equations = |doc: &Document| {
+        let xml = part(&export(doc), "word/document.xml");
+        let tree = roxmltree::Document::parse(&xml).expect("the part is XML");
+        let named = |name: &str| tree.descendants().filter(|node| node.tag_name().name() == name).count();
+        (named("oMath"), named("oMathPara"), named("f"), xml.contains(r"\frac"))
+    };
+
+    let sound = Document { blocks: vec![within(r"\frac{a}{b}"), alone(r"\frac{a}{b}")], ..Document::default() };
+    assert_eq!(equations(&sound), (2, 1, 2, false), "Word is given the fraction, not how it is typed");
+
+    let mistaken = Document { blocks: vec![within(r"\frac{a"), alone(r"\frac{a")], ..Document::default() };
+    assert_eq!(equations(&mistaken), (0, 0, 0, true));
+    let texts: Vec<String> = returned(&mistaken).document.walk().map(Block::plain_text).collect();
+    assert_eq!(texts, [r"See \frac{a", r"\frac{a"], "the source is not lost");
 }
 
 #[test]
@@ -1452,6 +1675,15 @@ fn any_body() -> impl Strategy<Value = String> {
         r#"<w:r><w:footnoteReference w:id="9"/></w:r>"#.to_owned(),
         picture(r#"r:embed="png""#, "alt"),
         "<m:oMath><m:r><m:t>x</m:t></m:r></m:oMath>".to_owned(),
+        format!("<m:oMathPara><m:oMath>{}</m:oMath><m:oMath/></m:oMathPara>", m("a&amp;{b}^_")),
+        format!(
+            "<m:oMath>{}<w:r><w:t>w</w:t></w:r><m:box><m:e><m:oMath>{}</m:oMath></m:e></m:box></m:oMath>",
+            structure("f", "", &[("num", structure("eqArr", "", &[("e", m("a&amp;b"))])), ("den", String::new())]),
+            structure("d", r#"<m:begChr m:val="⟦"/><m:endChr/>"#, &[("e", structure("rad", "", &[("deg", m("]"))]))]),
+        ),
+        format!("<m:oMath>{}</m:oMath>", (0..70).fold(m("z"), |inner, _| structure("sSup", "", &[("e", inner)]))),
+        "<m:oMath><m:nary/><m:acc/><m:func/><m:m><m:mr/></m:m><m:groupChr/><m:sPre/><m:limUpp/><m:unknown/></m:oMath>"
+            .to_owned(),
         r#"<w:sdt><w:sdtPr><w14:checkbox><w14:checked w14:val="1"/></w14:checkbox></w:sdtPr></w:sdt>"#.to_owned(),
     ];
     let style = |id: &str| format!(r#"<w:pPr><w:pStyle w:val="{id}"/></w:pPr>"#);

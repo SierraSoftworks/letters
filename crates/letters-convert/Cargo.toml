@@ -16,6 +16,7 @@ html5gum.workspace = true
 letters-fonts.workspace = true
 letters-model.workspace = true
 letters-layout.workspace = true
+letters-math.workspace = true
 letters-render.workspace = true
 pulldown-cmark.workspace = true
 roxmltree.workspace = true

@@ -115,9 +115,11 @@ fn simplified(document: &Document, to: Format) -> Vec<String> {
         ));
     }
     if to == Format::Docx {
-        // Word has no block that holds others, so only paragraphs and list items can take a quote's style.
+        // Word has no block that holds others, so only what is one paragraph there can take a quote's style.
         let boxes = document.walk().filter(|block| matches!(block.kind, BlockKind::Quote | BlockKind::Callout { .. }));
-        let plain = |block: &&Block| !matches!(block.kind, BlockKind::Paragraph | BlockKind::ListItem { .. });
+        let kept =
+            |kind: &BlockKind| matches!(kind, BlockKind::Paragraph | BlockKind::ListItem { .. } | BlockKind::Formula);
+        let plain = |block: &&Block| !kept(&block.kind);
         let outside = boxes.flat_map(|outer| outer.body.blocks()).filter(plain).count();
         if outside > 0 {
             let blocks = count(outside, "block inside a quote or callout is", "blocks inside quotes or callouts are");

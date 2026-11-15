@@ -6,7 +6,10 @@
 //!
 //! Writing generates real Word styles from the document's style and points each paragraph at one, so the file
 //! restyles in Word as the document does here. Only marks are written as formatting on runs.
+//!
+//! Maths is TeX here and an equation in Word, and each is made from the other.
 
+mod math;
 mod numbering;
 mod package;
 mod read;

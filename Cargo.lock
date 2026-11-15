@@ -2603,6 +2603,7 @@ dependencies = [
  "html5gum",
  "letters-fonts",
  "letters-layout",
+ "letters-math",
  "letters-model",
  "letters-render",
  "proptest",

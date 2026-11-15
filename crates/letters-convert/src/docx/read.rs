@@ -2,6 +2,7 @@
 
 mod comments;
 mod inline;
+mod math;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -217,7 +218,7 @@ fn turns(body: Node) -> BTreeSet<usize> {
 /// where the whole block agrees, and on its runs otherwise.
 fn languages(blocks: &mut [Block], declared: Option<&str>) -> Option<String> {
     fn count(blocks: &[Block], declared: Option<&str>, sizes: &mut BTreeMap<Option<String>, usize>) {
-        for block in blocks {
+        for block in blocks.iter().filter(|block| worded(block)) {
             for run in block.body.runs().iter().filter(|run| spoken(run)) {
                 let language = run.lang.as_deref().or(declared).map(str::to_owned);
                 *sizes.entry(language).or_default() += run.text.len();
@@ -228,7 +229,7 @@ fn languages(blocks: &mut [Block], declared: Option<&str>) -> Option<String> {
     /// Tags what differs from `main`, and says whether the blocks hold any words.
     fn tag(blocks: &mut [Block], declared: Option<&str>, main: Option<&str>) -> bool {
         let mut any = false;
-        for block in blocks {
+        for block in blocks.iter_mut().filter(|block| worded(block)) {
             let worded = match &mut block.body {
                 Body::Text(runs) => {
                     for run in runs.iter_mut() {
@@ -262,7 +263,7 @@ fn languages(blocks: &mut [Block], declared: Option<&str>) -> Option<String> {
         any
     }
     fn words(block: &Block) -> bool {
-        block.body.runs().iter().any(spoken) || block.body.blocks().iter().any(words)
+        worded(block) && (block.body.runs().iter().any(spoken) || block.body.blocks().iter().any(words))
     }
 
     let mut sizes = BTreeMap::new();
@@ -273,6 +274,11 @@ fn languages(blocks: &mut [Block], declared: Option<&str>) -> Option<String> {
     let main = most.and_then(|(language, _)| language.clone()).or(declared_key);
     tag(blocks, declared, main.as_deref());
     main
+}
+
+/// Whether a block can hold words in some language: code and maths are in none.
+fn worded(block: &Block) -> bool {
+    !matches!(block.kind, BlockKind::Code { .. } | BlockKind::Formula)
 }
 
 /// Whether a run holds words in some language: code and maths are in none.
@@ -412,7 +418,14 @@ impl Para {
         self.len += text.len();
         let lang = self.lang.clone();
         match self.runs.last_mut() {
-            Some(last) if last.marks == *marks && last.link == link && last.lang == lang => last.text.push_str(text),
+            Some(last) if last.marks == *marks && last.link == link && last.lang == lang => {
+                // Two formulas side by side stay two terms of one source.
+                if marks.contains(&Mark::Math) {
+                    last.text.push(' ');
+                    self.len += 1;
+                }
+                last.text.push_str(text);
+            }
             _ => self.runs.push(Run { text: text.into(), marks: marks.clone(), link, lang, ..Run::default() }),
         }
     }
@@ -724,6 +737,9 @@ impl Reader<'_, '_> {
                 (None, None) => None,
             };
             let item = list.map(|(list, depth)| BlockKind::ListItem { list, depth });
+            // An equation with a paragraph to itself is set as a display.
+            let alone = matches!(runs.as_slice(), [Run { marks, link: None, .. }] if marks.contains(&Mark::Math));
+            let text = item.unwrap_or(if alone { BlockKind::Formula } else { BlockKind::Paragraph });
             let (kind, wrapper) = match para.role {
                 Role::Heading(level) => {
                     if level > 4 {
@@ -735,10 +751,14 @@ impl Reader<'_, '_> {
                     notes.push(TITLE.into());
                     (BlockKind::Heading { level: 1 }, Open::Nothing)
                 }
-                Role::Quote => (item.unwrap_or(BlockKind::Paragraph), Open::Quote),
-                Role::Callout(tone) => (item.unwrap_or(BlockKind::Paragraph), Open::Callout(tone)),
-                _ => (item.unwrap_or(BlockKind::Paragraph), Open::Nothing),
+                Role::Quote => (text, Open::Quote),
+                Role::Callout(tone) => (text, Open::Callout(tone)),
+                _ => (text, Open::Nothing),
             };
+            if kind == BlockKind::Formula {
+                // A formula's text is its source, and no run of it is marked as one.
+                runs.iter_mut().for_each(|run| run.marks.clear());
+            }
             let numbered = level.is_some_and(|(level, ..)| level.kind == Some(ListKind::Ordered));
             if matches!(kind, BlockKind::Heading { .. }) && numbered {
                 self.whole(HEADING_NUMBERS);
@@ -886,7 +906,11 @@ fn captions(last: Option<&Block>) -> bool {
 fn flatten(blocks: Vec<Block>, runs: &mut Vec<Run>, moved: &mut BTreeMap<BlockId, usize>, aside: &mut Vec<Block>) {
     for block in blocks {
         match block.body {
-            Body::Text(text) => {
+            Body::Text(mut text) => {
+                // A formula keeps being one inside the line.
+                if block.kind == BlockKind::Formula {
+                    text.iter_mut().for_each(|run| _ = run.marks.insert(Mark::Math));
+                }
                 let len: usize = runs.iter().map(|run| run.text.len()).sum();
                 let fresh = runs.last().is_none_or(|last| last.text.ends_with(['\t', '\n']));
                 if !fresh {

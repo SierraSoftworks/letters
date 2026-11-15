@@ -7,7 +7,7 @@ use roxmltree::Node;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{DIRECT, Field, Inline, MAX_DEPTH, Para, Reader, Spot, text_of};
+use super::{DIRECT, Field, Inline, MAX_DEPTH, Para, Reader, Spot, math, text_of};
 use crate::docx::monospace;
 use crate::docx::package::Element;
 use crate::docx::styles::{Role, RunProps, code_family};
@@ -19,7 +19,7 @@ const PICTURE_LIMIT: usize = 64 << 20;
 
 const TRACKED: &str = "Tracked changes were accepted";
 const FOOTNOTE: &str = "Footnote kept as text";
-const EQUATION: &str = "Equation kept as plain text";
+const EQUATION: &str = "An equation holds something Letters cannot typeset. Its source is kept as Word had it";
 const SHIFTED: &str = "Superscript and subscript became plain text";
 const SYMBOL: &str = "A symbol from a symbol font could not be converted";
 const INTERNAL_LINK: &str = "A link to a place in the document was kept as text";
@@ -77,10 +77,27 @@ impl Reader<'_, '_> {
                 Some("commentRangeStart") => self.span(node).0 = Some(Spot { para: para.index, at: para.len }),
                 Some("commentRangeEnd") => self.span(node).1 = Some(Spot { para: para.index, at: para.len }),
                 _ if matches!(node.tag_name().name(), "oMath" | "oMathPara") && node.word().is_none() => {
-                    let letters = node.descendants().filter(|part| part.tag_name().name() == "t" && !part.is("t"));
-                    let text: String = letters.map(text_of).collect();
-                    self.text(&text, &BTreeSet::new(), around, para);
-                    para.note(EQUATION);
+                    // A group of equations is one formula with a line for each.
+                    let lines = node.children().filter(|line| line.tag_name().name() == "oMath");
+                    let lines = if node.tag_name().name() == "oMath" { vec![node] } else { lines.collect() };
+                    let (mut read, mut whole) = (Vec::new(), true);
+                    for (tex, followed) in lines.into_iter().map(math::tex) {
+                        whole &= followed;
+                        read.extend(Some(tex).filter(|tex| !tex.is_empty()));
+                    }
+                    let tex = match read.as_slice() {
+                        [] => continue,
+                        [line] => line.clone(),
+                        lines => format!(r"\begin{{gathered}} {} \end{{gathered}}", lines.join(r" \\ ")),
+                    };
+                    if node.descendants().any(|part| matches!(part.word(), Some("ins" | "del" | "moveFrom" | "moveTo")))
+                    {
+                        para.note(TRACKED);
+                    }
+                    if !whole || letters_math::mathml(&tex, false).is_err() {
+                        para.note(EQUATION);
+                    }
+                    self.text(&tex, &BTreeSet::from([Mark::Math]), around, para);
                 }
                 _ => {}
             }

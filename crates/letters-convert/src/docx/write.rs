@@ -14,6 +14,7 @@ use letters_render::Color;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+use super::math::equation;
 use super::{CALLOUTS, DIVIDER, INLINE_CODE, LINK, LIST, SINGLE, TASK_DONE, TASK_OPEN, TWIPS, TYPES};
 use crate::html::{Assets, href};
 
@@ -22,6 +23,7 @@ const PAGE: Palette = Palette::LIGHT;
 
 const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const M: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
 const RELATIONSHIP: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const DOCUMENT_TYPE: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml";
 const HEAD: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
@@ -44,6 +46,7 @@ const BREAK: &str = "<w:pageBreakBefore/>";
 /// - Comments are written as Word comments on the same passages, with their replies. Import notes and
 ///   conflicts stay behind.
 /// - `title` goes into the file's properties, and `assets` supplies the pictures.
+/// - A formula is written as a Word equation, and as its source where it has a mistake in it.
 /// - A link that would run script is written as its text alone, and an unknown block as its fallback text.
 pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets: Assets) -> Vec<u8> {
     let page = &style.page;
@@ -70,7 +73,7 @@ pub fn to_docx(doc: &Document, style: &Style, notes: &Notes, title: &str, assets
     }
     let twips = |points: f32| (points * TWIPS).round().max(0.0) as u32;
     let mut document = format!(
-        "{HEAD}<w:document xmlns:w=\"{W}\" xmlns:r=\"{R}\"><w:body>{}<w:sectPr><w:pgSz w:w=\"{}\" w:h=\"{}\"/>\
+        "{HEAD}<w:document xmlns:w=\"{W}\" xmlns:r=\"{R}\" xmlns:m=\"{M}\"><w:body>{}<w:sectPr><w:pgSz w:w=\"{}\" w:h=\"{}\"/>\
          <w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"708\" w:footer=\"708\" \
          w:gutter=\"0\"/></w:sectPr></w:body></w:document>",
         writer.out,
@@ -337,7 +340,8 @@ impl<'d> Writer<'d, '_> {
             self.lang = block.lang.as_deref().or(around);
             let mut spans = Vec::new();
             for (range, comments) in self.anchors.remove(block.id.as_str()).unwrap_or_default() {
-                match range.filter(|_| !block.body.runs().is_empty()) {
+                // A passage of a formula's source is no passage of the equation it is written as.
+                match range.filter(|_| !block.body.runs().is_empty() && block.kind != BlockKind::Formula) {
                     Some(range) => spans.push((range, comments)),
                     None => self.pending.push(comments),
                 }
@@ -356,8 +360,16 @@ impl<'d> Writer<'d, '_> {
                     let list = self.list(*list, usize::from(depth));
                     self.paragraph(within.unwrap_or(LIST.0), Some((list, depth)), block.body.runs(), spans);
                 }
-                // A formula goes out as its source until Word maths is written.
-                BlockKind::Code { .. } | BlockKind::Formula => self.paragraph("Code", None, block.body.runs(), spans),
+                BlockKind::Code { .. } => self.paragraph("Code", None, block.body.runs(), spans),
+                BlockKind::Formula => match equation(&block.plain_text(), true) {
+                    Some(equation) => {
+                        self.open(within.unwrap_or(""), None);
+                        self.whole(&format!("<m:oMathPara>{equation}</m:oMathPara>"));
+                        self.out.push_str("</w:p>");
+                    }
+                    // A source with a mistake in it goes out as it is, so that it is not lost.
+                    None => self.paragraph("Code", None, block.body.runs(), spans),
+                },
                 BlockKind::Quote => self.container(block, "Quote"),
                 BlockKind::Callout { tone } => {
                     let style = CALLOUTS.iter().find(|(known, ..)| known == tone).map_or("Quote", |(_, id, _)| *id);
@@ -420,14 +432,8 @@ impl<'d> Writer<'d, '_> {
         }
     }
 
-    /// Writes one paragraph of a style, with the comments that sit on it.
-    fn paragraph(
-        &mut self,
-        style: &str,
-        list: Option<(usize, u8)>,
-        runs: &[Run],
-        mut spans: Vec<(Range<usize>, Range<usize>)>,
-    ) {
+    /// Starts a paragraph of a style, which takes the page break that waits for one.
+    fn open(&mut self, style: &str, list: Option<(usize, u8)>) {
         self.out.push_str("<w:p>");
         let breaks = std::mem::take(&mut self.breaks);
         if !style.is_empty() || list.is_some() || breaks {
@@ -443,6 +449,17 @@ impl<'d> Writer<'d, '_> {
             }
             self.out.push_str("</w:pPr>");
         }
+    }
+
+    /// Writes one paragraph of a style, with the comments that sit on it.
+    fn paragraph(
+        &mut self,
+        style: &str,
+        list: Option<(usize, u8)>,
+        runs: &[Run],
+        mut spans: Vec<(Range<usize>, Range<usize>)>,
+    ) {
+        self.open(style, list);
         let len: usize = runs.iter().map(|run| run.text.len()).sum();
         spans.extend(self.pending.drain(..).map(|comments| (0..len, comments)));
         let mut out = std::mem::take(&mut self.out);
@@ -550,7 +567,7 @@ impl<'d> Writer<'d, '_> {
     /// Writes the comments part and the part that threads replies under them.
     fn comments(&mut self, comments: &[Comment]) -> (String, String) {
         let mut out = format!(
-            "{HEAD}<w:comments xmlns:w=\"{W}\" xmlns:r=\"{R}\" \
+            "{HEAD}<w:comments xmlns:w=\"{W}\" xmlns:r=\"{R}\" xmlns:m=\"{M}\" \
              xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" \
              xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" mc:Ignorable=\"w14\">"
         );
@@ -625,11 +642,12 @@ fn inline(
     let mut at = 0;
     let mut open: Option<&str> = None;
     for run in runs {
+        let maths = run.marks.contains(&Mark::Math).then(|| equation(&run.text, false)).flatten();
         let mut rest = run.text.as_str();
         while !rest.is_empty() {
-            // The run is cut where a passage starts or ends inside it, never inside a character.
+            // The run is cut where a passage starts or ends inside it, never inside a character or a formula.
             let cut = cuts.iter().map(|cut| cut.saturating_sub(at)).filter(|cut| *cut > 0 && *cut < rest.len());
-            let mut cut = cut.min().unwrap_or(rest.len());
+            let mut cut = cut.min().filter(|_| maths.is_none()).unwrap_or(rest.len());
             while !rest.is_char_boundary(cut) {
                 cut += 1;
             }
@@ -645,7 +663,10 @@ fn inline(
                 let _ = write!(out, "<w:hyperlink r:id=\"{}\">", links.id(&target, "hyperlink"));
                 open = link;
             }
-            text(piece, run, open.is_some(), run.lang.as_deref().or(lang), out);
+            match &maths {
+                Some(equation) => out.push_str(equation),
+                None => text(piece, run, open.is_some(), run.lang.as_deref().or(lang), out),
+            }
             at += piece.len();
             rest = after;
         }
@@ -661,7 +682,9 @@ fn inline(
 fn text(text: &str, run: &Run, linked: bool, lang: Option<&str>, out: &mut String) {
     out.push_str("<w:r>");
     let has = |mark: Mark| run.marks.contains(&mark);
-    let style = if has(Mark::Code) { Some(INLINE_CODE.0) } else { linked.then_some(LINK.0) };
+    // A formula comes here only as its source, when it has a mistake in it, and source reads as code.
+    let code = has(Mark::Code) || has(Mark::Math);
+    let style = if code { Some(INLINE_CODE.0) } else { linked.then_some(LINK.0) };
     if style.is_some() || !run.marks.is_empty() || lang.is_some() {
         out.push_str("<w:rPr>");
         if let Some(style) = style {
