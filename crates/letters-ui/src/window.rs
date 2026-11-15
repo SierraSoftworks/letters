@@ -711,7 +711,12 @@ impl EditorApp {
                 self.reveal();
             }
             Pointer::Drag { .. } => {}
-            Pointer::Up { .. } => self.dragging = false,
+            Pointer::Up { .. } => {
+                self.dragging = false;
+                // The markers at the caret show once the button is up: text that made room for them
+                // under a pointer still held would be selected by its next move.
+                self.mark();
+            }
             Pointer::Menu { at } => self.menu(at),
             Pointer::Scroll { delta } => self.scroll_by(delta.y),
         }

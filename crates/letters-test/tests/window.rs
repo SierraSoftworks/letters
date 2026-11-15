@@ -1724,3 +1724,15 @@ fn a_bar_under_the_systems_buttons_takes_their_height_and_leaves_them_room() {
     let first = bar_controls(&mut window).into_iter().next().expect("the bar holds controls");
     assert!(first.1.x >= 78.0, "{} starts at {}", first.0, first.1.x);
 }
+
+#[test]
+fn a_click_on_the_page_shows_the_markers_where_it_lands() {
+    let inside = spot(&mut marked(true), "b1", INSIDE);
+    let mut window = marked(true);
+    // The word has yet to make room for its markers, so it is still a little to the left.
+    window.click_at(Point { x: inside.x - 12.0, y: inside.y + inside.height / 2.0 });
+    let landed = head(&window);
+    assert!((9..=14).contains(&landed.offset), "in the bold word: {landed:?}");
+    let shown = spot(&mut marked(true), "b1", landed.offset);
+    assert_eq!(caret(&mut window).x, shown.x, "the markers show as they do when the caret is put there");
+}
