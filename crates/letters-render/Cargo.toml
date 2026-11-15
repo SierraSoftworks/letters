@@ -33,6 +33,8 @@ wgpu = { workspace = true, optional = true }
 [dev-dependencies]
 font-test-data.workspace = true
 hayro.workspace = true
+# A decoder the crate leaves out, as a shell's dependencies can add one, for the test that it is refused.
+image = { workspace = true, features = ["bmp"] }
 letters-fonts.workspace = true
 # Turns the snapshot feature on for this crate's own tests.
 letters-render = { workspace = true, features = ["pdf", "snapshot"] }
