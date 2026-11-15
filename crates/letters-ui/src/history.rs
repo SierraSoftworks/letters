@@ -11,7 +11,9 @@
 //! A version shows with what it changed, or with what has changed since: compared with the version before
 //! it or with the document as it reads now. A block that was rewritten shows as it read before and after,
 //! the page split there as it is at a conflict. A block that only gained words, or only lost some, shows
-//! once with those words marked, and a line over blocks that only one version has says so.
+//! once with those words marked. Blocks that only one version has lie in a band of that version's colour
+//! right across the page, as if the paper were cut there and pulled apart over them, under a line that says
+//! whose they are.
 //!
 //! Under the page a strip has a cell for each version, to press on or drag along, and the bar names the
 //! version that is picked: a name is a mark in the history, which is saved and is no edit. The bar's menu
@@ -71,11 +73,14 @@ const CLEAR: f32 = 3.0;
 const HEAD: f32 = 20.0;
 /// The sign of a version that was given a name.
 const SIGN: f32 = 12.0;
-/// The room over a stretch of blocks that only one version has, for the line that says so. The bar beside
-/// the stretch stands this far to the left of its text, and is dashed this long where the stretch was
-/// taken out.
+/// The band that a stretch of blocks lies in that only one version has: the room it keeps clear of what
+/// stands over it, the room in it over the stretch for the line that says whose the stretch is, and the
+/// room in it under the stretch. Its edges are this thick, and broken into dashes this long where the
+/// stretch was taken out.
+const ABOVE: f32 = tokens::SPACE_MD;
 const CAPTION: f32 = 22.0;
-const BAR_OUT: f32 = 16.0;
+const UNDER: f32 = tokens::SPACE_MD;
+const EDGE: f32 = 1.0;
 const DASH: f32 = 4.0;
 /// How many times a version is split again before it is drawn, while laying out what shows changes heights.
 const SETTLES: usize = 3;
@@ -522,34 +527,36 @@ fn read(block: &Block, words: &[Selection]) -> String {
     }
 }
 
-/// Makes room in a split page over the stretch of the page's column that `band` is, for the line that says
-/// which version has it. The stretch becomes a piece of its own, under the first of its blocks.
+/// Makes room in a split page round the stretch of the page's column that `band` is, for the band it lies
+/// in: over it for the line that says which version has it, and a little under it. The stretch becomes a
+/// piece of its own, under the first of its blocks.
 fn part(split: &mut Split, first: &BlockId, band: (f32, f32)) {
     let holds = |piece: &Piece| piece.block.is_none() && piece.band.0 <= band.0 && band.0 < piece.band.1;
     let Some(at) = split.pieces.iter().position(holds) else { return };
     let whole = split.pieces.remove(at);
     let end = band.1.min(whole.band.1);
     let cuts = [
-        ((whole.band.0, band.0), None, 0.0),
-        ((band.0, end), Some(first.clone()), CAPTION),
-        ((end, whole.band.1), None, 0.0),
+        ((whole.band.0, band.0), None, 0.0, 0.0),
+        ((band.0, end), Some(first.clone()), ABOVE + CAPTION, UNDER),
+        ((end, whole.band.1), None, 0.0, 0.0),
     ];
     let mut y = whole.rect.y;
     let mut pieces = Vec::with_capacity(cuts.len());
-    for (band, block, head) in cuts {
+    for (band, block, head, foot) in cuts {
         if band.1 > band.0 {
-            let rect = Rect::new(whole.rect.x, y, whole.rect.width, head + band.1 - band.0);
+            let rect = Rect::new(whole.rect.x, y, whole.rect.width, head + band.1 - band.0 + foot);
             let origin = Point { x: whole.origin.x, y: y + head - band.0 };
             pieces.push(Piece { side: Side::Second, block, rect, head, origin, band });
             y += rect.height;
         }
     }
+    let room = ABOVE + CAPTION + UNDER;
     for piece in &mut split.pieces[at..] {
-        piece.rect.y += CAPTION;
-        piece.origin.y += CAPTION;
+        piece.rect.y += room;
+        piece.origin.y += room;
     }
     split.pieces.splice(at..at, pieces);
-    split.height += CAPTION;
+    split.height += room;
 }
 
 /// The part of its version's column that a piece of a split page shows in `view`, a part of what the
@@ -1258,11 +1265,27 @@ impl History {
                 head.paint(piece.side, frame, shaper, scheme, list);
                 self.frames.push((block.clone(), piece.side, frame));
             } else if let Some(run) = block.and_then(|block| leaf.found.runs.iter().find(|run| run.first == *block)) {
-                // A stretch that only one version has: a bar beside it, and a line over its first line.
-                let (tone, caption) = match run.added {
-                    true => (tokens::INFO, &leaf.captions[1]),
-                    false => (tokens::WARN, &leaf.captions[0]),
+                // A stretch that only one version has lies in a band of that version's colour, from one edge
+                // of the page area to the other: the paper cut there and pulled apart over what was put in
+                // or taken out. What was taken out has broken edges, so that the two are told apart without
+                // their colours.
+                let (tone, soft, caption) = match run.added {
+                    true => (tokens::INFO, tokens::INFO_SOFT, &leaf.captions[1]),
+                    false => (tokens::WARN, tokens::WARN_SOFT, &leaf.captions[0]),
                 };
+                let over = (top + ABOVE).round();
+                let band = Rect::new(0.0, over, room.width, bottom.round() - over);
+                list.push(Item::Fill { rect: band, color: ink(soft), radius: 0.0 });
+                let (dash, gap) = if run.added { (band.width, 0.0) } else { (DASH, DASH) };
+                for y in [band.y, band.y + band.height - EDGE] {
+                    let mut x = 0.0;
+                    while x < band.width {
+                        let rect = Rect::new(x, y, dash.min(band.width - x), EDGE);
+                        list.push(Item::Fill { rect, color: ink(tone), radius: 0.0 });
+                        x += dash + gap;
+                    }
+                }
+                // A line over its first line says whose it is.
                 let first = run.text.as_ref().and_then(|text| leaf.layout.caret(&Pos::new(text.clone(), 0)));
                 let over = origin.y + first.map_or(piece.band.0, |line| line.y) - CAPTION;
                 let said = shaper.shape(caption, &TextStyle::control().size(tokens::TEXT_SM).weight(600), None);
@@ -1271,14 +1294,6 @@ impl History {
                     ink(tone),
                     list,
                 );
-                // What was taken out has a broken bar, so that the two are told apart without their colours.
-                let (dash, gap) = if run.added { (bottom - over, 0.0) } else { (DASH, DASH) };
-                let mut y = over;
-                while y < bottom {
-                    let rect = Rect::new(origin.x - BAR_OUT, y, review::RULE, dash.min(bottom - y));
-                    list.push(Item::Fill { rect, color: ink(tone), radius: 0.0 });
-                    y += dash + gap;
-                }
             }
             let Some(cut) = cut(piece, view) else { continue };
             let layout = match (piece.side, &leaf.earlier) {
