@@ -2,8 +2,8 @@
 //! the editor has arrived, and the document as the editor reads it.
 //!
 //! What stands in for the window is the document's export where the canvas will draw the document, and a
-//! [`Skeleton`] of the window's controls where the canvas will draw those, so that nothing moves when the
-//! editor's first frame takes their place. The export sits in a frame of its own, so that its styles and
+//! [`Skeleton`] of how the window's bar starts, the document's name and how saving stands, so that nothing
+//! moves when the editor's first frame takes their place. The bar's other controls come with the editor. The export sits in a frame of its own, so that its styles and
 //! the page's cannot reach each other and nothing a document carries can run.
 
 use std::collections::{HashMap, HashSet};
@@ -84,7 +84,8 @@ pub fn spans(shown: &[(f32, Vec<Place>)]) -> Vec<Span> {
     spans
 }
 
-/// The window's controls as shapes with nothing in them, for every width of window.
+/// The start of the window's bar as shapes with nothing in them, for every width of window: the document's
+/// name and how saving stands. The controls after them are left out, so that less changes when they come.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Skeleton {
     /// How much of the window's top its bar takes. The document has the rest.
@@ -93,10 +94,11 @@ pub struct Skeleton {
 }
 
 impl Skeleton {
-    /// Lays the window out at every width a browser is likely to give it, and notes where its controls are.
+    /// Lays the window out at every width a browser is likely to give it, and notes where its bar starts.
     pub fn of(window: &mut Window) -> Self {
         let mut bar = 0.0;
         let mut shown: Vec<(f32, Vec<(NodeId, Place)>)> = Vec::new();
+        let mut lead: HashSet<NodeId> = HashSet::new();
         for width in WIDTHS {
             let width = f32::from(width);
             window.resize(Size { width, height: 2.0 * width }, 1.0);
@@ -108,6 +110,9 @@ impl Skeleton {
             }
             let document = nodes.values().find(|node| node.role() == Role::Document);
             bar = document.and_then(|document| document.bounds()).map_or(bar, |bounds| bounds.y0 as f32);
+            // The bar starts with the document's name and then how saving stands, the one label it has.
+            let ends = controls.iter().position(|(id, _)| nodes[id].role() == Role::Label).map_or(0, |at| at + 1);
+            lead.extend(controls[..ends].iter().map(|(id, _)| *id));
             shown.push((width, controls));
         }
         // The controls at the bar's end follow the window's far edge, which the two widest windows tell
@@ -130,7 +135,8 @@ impl Skeleton {
                     // A sliver of a control would read as a mark of its own.
                     false => Some([left, top, wide.min(edge - left), high]).filter(|cut| cut[2] >= high / 2.0),
                 };
-                let mut places: Vec<Place> = controls.into_iter().filter_map(cut).collect();
+                let mut places: Vec<Place> =
+                    controls.into_iter().filter(|(id, _)| lead.contains(id)).filter_map(cut).collect();
                 places.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
                 (width, places)
             })

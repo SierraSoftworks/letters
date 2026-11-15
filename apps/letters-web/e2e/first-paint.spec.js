@@ -1,5 +1,5 @@
-// The page as a server sends it: the document as HTML to read at once under the shapes of the window's
-// controls, which the editor then takes over without anything moving.
+// The page as a server sends it: the document as HTML to read at once under the shape of how the window's
+// bar starts, which the editor then takes over without anything moving.
 
 import { expect, test } from "@playwright/test";
 
@@ -46,14 +46,16 @@ test("the document can be read before the editor arrives, and the editor opens t
 });
 
 for (const [name, width] of [["a wide window", 1280], ["a narrow window", 820], ["a phone", 390]]) {
-  test(`in ${name}, each control arrives where its shape was`, async ({ page }) => {
+  test(`in ${name}, the document's name and save mark arrive where their shapes were`, async ({ page }) => {
     await page.setViewportSize({ width, height: 700 });
     const arrive = await held(page);
     const shapes = await page.locator("#letters-first-paint i").evaluateAll(
       (shapes, box) => shapes.map(eval(box)).filter((shape) => shape.width > 0),
       String(box),
     );
-    expect(shapes.length).toBeGreaterThan(4);
+    // Only how the bar starts is drawn. Its tools come with the editor.
+    expect(shapes.length).toBeGreaterThan(0);
+    expect(shapes.length).toBeLessThanOrEqual(2);
     // No shape lies over another, as no control does.
     const across = [...shapes].sort((a, b) => a.x - b.x);
     for (const [i, shape] of across.slice(1).entries()) {
@@ -68,6 +70,8 @@ for (const [name, width] of [["a wide window", 1280], ["a narrow window", 820], 
       const control = (node) => placed(node) && ![...node.querySelectorAll("*")].some(placed) && !node.closest('[role="document"]');
       return nodes.filter(control).map(eval(box));
     }, String(box));
+    const name = await page.getByRole("button", { name: "Letters in the browser" }).evaluate(box);
+    expect(Math.abs(name.x - shapes[0].x)).toBeLessThanOrEqual(1);
     for (const shape of shapes) {
       // The mirror rounds to whole pixels. A control the bar cuts short has a shape as wide as what shows.
       const near = (a, b) => Math.abs(a - b) <= 1;

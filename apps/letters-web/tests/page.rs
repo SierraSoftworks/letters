@@ -1,5 +1,4 @@
-//! The page a server sends: a template with the document in it twice, under the shapes of the window's
-//! controls.
+//! The page a server sends: a template with the document in it twice, under the shape of the window's bar.
 
 use letters_model::{Block, BlockId, BlockKind, Document, ReplicaId, Style};
 use letters_ui::{Scheme, palette};
@@ -111,14 +110,16 @@ fn spans_put_every_control_where_the_window_showed_it() {
 }
 
 #[test]
-fn the_skeleton_keeps_the_windows_controls_in_its_bar_and_apart() {
+fn the_skeleton_is_the_start_of_the_windows_bar_and_none_of_its_tools() {
     let mut window = page::window(page::welcome(&mut || "b".into()), ReplicaId::new("test"));
     let skeleton = Skeleton::of(&mut window);
     assert!(skeleton.bar > 0.0, "the window has a bar");
     assert!(skeleton.spans.len() < 64, "the bar has a few forms, not one for every width");
     for width in [320.0, 390.0, 768.0, 1024.0, 1400.0, 2560.0] {
         let places = placed(&skeleton.spans, width);
-        assert!(places.len() >= 4, "at {width}: the bar's controls show");
+        assert!(matches!(places.len(), 1 | 2), "at {width}: the name, and how saving stands: {places:?}");
+        let name = places[0];
+        assert!(name[0] < 64.0 && name[2] >= 24.0, "at {width}: the name starts the bar: {name:?}");
         for [left, top, wide, high] in &places {
             assert!(*left >= 0.0 && left + wide <= width, "at {width}: inside the window");
             assert!(*top >= 0.0 && top + high <= skeleton.bar, "at {width}: inside the bar");
