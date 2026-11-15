@@ -3,7 +3,7 @@
 mod common;
 
 use common::{id, sync};
-use letters_model::{Block, BlockKind, Document, Model, Op, OpError, ReplicaId};
+use letters_model::{Block, BlockKind, Body, Document, Model, Op, OpError, ReplicaId};
 
 const URL: &str = "https://example.com/post";
 
@@ -126,6 +126,28 @@ fn fields_no_file_would_hold_are_refused() {
         assert!(matches!(model.apply([set(block, kind)]), Err(OpError::BadKind(_))), "{name}");
         assert_eq!(kinds(&model), before, "{name}");
     }
+}
+
+#[test]
+fn a_document_names_the_assets_it_shows() {
+    let figure = |name: &str, asset: Option<&str>, src: Option<&str>| {
+        let (asset, src) = (asset.map(str::to_owned), src.map(str::to_owned));
+        let kind = BlockKind::Figure { asset, src, alt: String::new(), width: 240.0, height: 160.0, numbered: false };
+        Block::text(name, kind, "")
+    };
+    let inside = Body::Blocks(vec![figure("inside", Some("assets/inside.png"), None)]);
+    let gallery = Block { body: inside, ..Block::new("gallery", BlockKind::Gallery { numbered: false }) };
+    let blocks = vec![
+        figure("held", Some("assets/held.png"), None),
+        figure("linked", None, Some("https://example.com/a.png")),
+        gallery,
+        Block::new("card", preview(URL, Some("A post"), Some("assets/card.jpg"))),
+        Block::new("bare", preview(URL, None, None)),
+    ];
+    let doc = Document { blocks, ..Document::default() };
+
+    let shown: Vec<&str> = doc.assets().into_iter().collect();
+    assert_eq!(shown, ["assets/card.jpg", "assets/held.png", "assets/inside.png"]);
 }
 
 #[test]

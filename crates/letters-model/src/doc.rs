@@ -114,6 +114,20 @@ impl Document {
         from.iter().copied().filter(listed).filter(|block| Some(&block.id) != title).collect()
     }
 
+    /// The names of the assets the document shows: the pictures of its figures and of its link previews.
+    ///
+    /// Whatever writes a file without its history asks here for what to carry, so that none leaves one out.
+    pub fn assets(&self) -> BTreeSet<&str> {
+        fn shown(block: &Block) -> Option<&str> {
+            match &block.kind {
+                BlockKind::Figure { asset, .. } => asset.as_deref(),
+                BlockKind::LinkPreview { image, .. } => image.as_deref(),
+                _ => None,
+            }
+        }
+        self.walk().filter_map(shown).collect()
+    }
+
     /// Every block in document order, parents before their children.
     pub fn walk(&self) -> impl Iterator<Item = &Block> {
         fn push<'a>(blocks: &'a [Block], out: &mut Vec<&'a Block>) {
