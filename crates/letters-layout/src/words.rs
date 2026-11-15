@@ -39,6 +39,12 @@ impl WordList {
         found.map(|list| list.payload.get().trie_data.as_bytes().to_vec()).unwrap_or_default()
     }
 
+    /// What to call the list's file where lists are fetched. The name changes when the list does, so a
+    /// copy kept from another build is never the one asked for.
+    pub fn file(self) -> String {
+        format!("{self:?}-{:016x}.bin", self.seal().1).to_lowercase()
+    }
+
     /// The list that says where the words of a character's script end, for the scripts that have one.
     pub(crate) fn of(ch: char) -> Option<Self> {
         match u32::from(ch) {

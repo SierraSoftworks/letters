@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use letters_layout::{DocLayout, Fonts, Palette, Token, Uncovered};
+use letters_layout::{DocLayout, Fonts, Palette, Token, Uncovered, WordList};
 use letters_model::{BlockKind, Document, Style};
 use letters_render::image::{Image, Images};
 use letters_render::pdf::{Heading, Info, Link, Pdf, PdfError, Target};
@@ -53,6 +53,11 @@ pub fn to_pdf(
     to_pdf_with(doc, style, fonts, assets, info, &mut |_| Fonts::default())
 }
 
+/// Finds the word list of a script that is written without spaces, as [`WordList::data`] gives it, so that
+/// its lines end between words. It is asked once at most for each such script of the document, and only
+/// where the lists are not built in, as [`DocLayout::add_word_list`] says.
+pub type Words<'a> = &'a mut dyn FnMut(WordList) -> Option<Vec<u8>>;
+
 /// Writes a PDF as [`to_pdf`] does, with the faces `backups` finds for what the fonts lack, so that a page
 /// shows the emoji and scripts the window shows. A PDF carries its fonts, so these are embedded too.
 pub fn to_pdf_with(
@@ -62,6 +67,20 @@ pub fn to_pdf_with(
     assets: Assets,
     info: &PdfInfo,
     backups: Backups,
+) -> Result<Vec<u8>, PdfError> {
+    to_pdf_with_words(doc, style, fonts, assets, info, backups, &mut |_| None)
+}
+
+/// Writes a PDF as [`to_pdf_with`] does, with the lists `words` finds, so that a line ends where the
+/// window ends it. A browser fetches these, and every other build has them.
+pub fn to_pdf_with_words(
+    doc: &Document,
+    style: &Style,
+    fonts: Fonts,
+    assets: Assets,
+    info: &PdfInfo,
+    backups: Backups,
+    words: Words,
 ) -> Result<Vec<u8>, PdfError> {
     let page = &style.page;
     let mut layout = DocLayout::new(fonts);
@@ -74,7 +93,11 @@ pub fn to_pdf_with(
     let mut pages = layout.paginate(page);
     // Paging lays out every block, so each character that no face has is known by now.
     let lacking = layout.take_uncovered();
-    if !lacking.is_empty() && layout.add_fallback_fonts(&backups(&lacking)) {
+    let mut again = !lacking.is_empty() && layout.add_fallback_fonts(&backups(&lacking));
+    for list in layout.take_unlisted() {
+        again |= words(list).is_some_and(|data| layout.add_word_list(list, &data));
+    }
+    if again {
         pages = layout.paginate(page);
     }
     let sheet = Size { width: pages.width, height: pages.height };

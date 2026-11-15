@@ -3,8 +3,8 @@
 
 use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::object::{Array, Dict};
-use letters_convert::{PdfInfo, to_pdf, to_pdf_with};
-use letters_layout::Fonts;
+use letters_convert::{PdfInfo, to_pdf, to_pdf_with, to_pdf_with_words};
+use letters_layout::{Fonts, WordList};
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, Run, Style};
 
 fn written(doc: &Document, info: &PdfInfo) -> Pdf {
@@ -91,5 +91,27 @@ fn a_shell_backs_the_fonts_up_for_what_they_lack() {
         let expected: Vec<Vec<char>> = if lacking.is_empty() { vec![] } else { vec![lacking.clone()] };
         assert_eq!(asked, expected, "{name}: asked once, for what is lacking alone");
         assert_eq!(faces(backed) - faces(plain), lacking.len(), "{name}: the face that draws it is embedded");
+    }
+}
+
+#[test]
+fn a_shell_finds_the_word_list_of_a_script_written_without_spaces() {
+    let fonts = || Fonts { faces: letters_fonts::bundled() };
+    let (style, info) = (Style::default(), PdfInfo::default());
+    let thai = "ภาษาไทยเขียนติดกันโดยไม่เว้นวรรคระหว่างคำ".repeat(8);
+    for (name, text, lists) in [("Latin", "Rates change in January.", vec![]), ("Thai", &*thai, vec![WordList::Thai])] {
+        let doc = Document { blocks: vec![Block::text("a", BlockKind::Paragraph, text)], ..Document::default() };
+        let plain = to_pdf(&doc, &style, fonts(), &mut |_| None, &info).unwrap();
+
+        let mut asked = Vec::new();
+        let mut words = |list: WordList| {
+            asked.push(list);
+            Some(list.data())
+        };
+        let listed = to_pdf_with_words(&doc, &style, fonts(), &mut |_| None, &info, &mut |_| fonts(), &mut words);
+        // A build that has the lists asks for none, and its lines end between words anyway.
+        let lacking = if WordList::BUILT_IN { vec![] } else { lists };
+        assert_eq!(asked, lacking, "{name}: asked once, for the list of a script it shows");
+        assert_eq!(listed.unwrap() != plain, !lacking.is_empty(), "{name}: the lines end where the list says");
     }
 }

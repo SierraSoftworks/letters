@@ -21,6 +21,7 @@ letters-render.workspace = true
 # Reads which characters a fetched face has. The renderer links it already.
 skrifa.workspace = true
 letters-editor.workspace = true
+letters-layout.workspace = true
 letters-ui.workspace = true
 letters-fonts.workspace = true
 letters-math.workspace = true
@@ -87,7 +88,6 @@ crate-type = ["cdylib"]
 
 [dev-dependencies]
 letters-format.workspace = true
-letters-layout.workspace = true
 zip.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

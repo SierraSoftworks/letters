@@ -130,3 +130,24 @@ test.describe("a PDF of emoji and of scripts the fonts lack", () => {
     expect(file).not.toContain("NotoColorEmoji");
   });
 });
+
+test("a PDF of a script written without spaces ends its lines by the script's word list", async ({ page }) => {
+  // Two PDFs written in the same second of the same document are the same file.
+  await page.clock.setFixedTime(new Date("2026-11-15T12:00:00Z"));
+  const asked = [];
+  page.on("request", (request) => request.url().includes("/words/") && asked.push(request.url()));
+  const pdf = async () => {
+    await ready(page);
+    await page.keyboard.insertText("ภาษาไทยเขียนติดกันโดยไม่เว้นวรรคระหว่างคำ".repeat(8));
+    await ask(page, "Thai", "PDF");
+    return (await saved(page))[1];
+  };
+  const listed = await pdf();
+  expect(asked.map((url) => url.replace(/.*\/words\/|-.*/g, ""))).toEqual(["thai"]);
+
+  // Without the list a line ends wherever it fills, and the PDF is made all the same.
+  await page.route("**/words/*", (route) => route.abort());
+  const plain = await pdf();
+  expect(plain.startsWith("%PDF-")).toBe(true);
+  expect(plain).not.toBe(listed);
+});
