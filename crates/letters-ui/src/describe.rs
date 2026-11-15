@@ -28,8 +28,8 @@ const BREAK: u8 = 7;
 const KEEP: u8 = 8;
 const USE: u8 = 9;
 const HELD: u8 = 10;
-/// The handle of a cell's column and of its row, the bars that add a column and a row after it, and the
-/// pluses that add one before it.
+/// The handle of a cell's column and of its row, and the pluses that add a column and a row after it and
+/// before it.
 const TABLE: [u8; 6] = [11, 12, 13, 14, 16, 17];
 const CALLOUT: u8 = 15;
 
@@ -463,7 +463,7 @@ pub(crate) enum Request {
     Alt(BlockId),
     /// Presses the marker of the notes beside a block.
     Note(BlockId),
-    /// Presses the handle of a cell's column or of its row, the bar that adds one at the end or the plus
+    /// Presses the handle of a cell's column or of its row, the plus that adds one at the end or the plus
     /// that adds one before it: `does` is 0, 1 or 2 in that order.
     Table {
         cell: BlockId,

@@ -45,15 +45,16 @@ fn text(window: &mut Harness, text: &str) -> Point {
 #[test]
 fn a_table_shows_its_handles_under_the_pointer_and_round_the_caret() {
     let mut window = note();
-    let all = ["Column 1", "Column 2", "Column 3", "Row 1", "Row 2", "Row 3", "Add column", "Add row"];
+    let all = ["Column 1", "Column 2", "Column 3", "Row 1", "Row 2", "Row 3"];
     let shown =
         |window: &mut Harness| all.iter().filter(|name| button(window, name).is_some()).copied().collect::<Vec<_>>();
     assert!(shown(&mut window).is_empty(), "nothing round a table that is left alone");
 
     let over = text(&mut window, "80");
     window.hover_at(over);
-    assert_eq!(shown(&mut window), ["Column 2", "Row 3", "Add column", "Add row"], "those of the cell pointed at");
-    let pluses = ["Add column before column 2", "Add column before column 3", "Add row before row 3"];
+    assert_eq!(shown(&mut window), ["Column 2", "Row 3"], "those of the cell pointed at");
+    let pluses =
+        ["Add column before column 2", "Add column before column 3", "Add row before row 3", "Add row at the end"];
     assert!(pluses.iter().all(|name| button(&mut window, name).is_some()), "with a plus on each border beside them");
 
     let away = text(&mut window, "After");
@@ -63,20 +64,20 @@ fn a_table_shows_its_handles_under_the_pointer_and_round_the_caret() {
     window.select("4");
     let caret = window.editor().selection().map(|selection| selection.head.clone()).expect("a selection");
     window.ui().select(letters_model::Selection::caret(caret));
-    assert_eq!(shown(&mut window), ["Column 3", "Row 2", "Add column", "Add row"], "those of the caret's cell");
+    assert_eq!(shown(&mut window), ["Column 3", "Row 2"], "those of the caret's cell");
 }
 
 #[test]
-fn the_bars_add_a_column_and_a_row_at_the_end() {
+fn a_plus_past_the_last_adds_a_column_or_a_row_at_the_end() {
     let cases = [
-        ("Add column", ["Band|Homes|Rate", "A|120|4", "B|80|6"].as_slice(), 4),
-        ("Add row", ["Band|Homes|Rate", "A|120|4", "B|80|6", ""].as_slice(), 3),
+        ("Add column at the end", ["Band|Homes|Rate", "A|120|4", "B|80|6"].as_slice(), 4),
+        ("Add row at the end", ["Band|Homes|Rate", "A|120|4", "B|80|6", ""].as_slice(), 3),
     ];
     for (bar, expected, columns) in cases {
         let mut window = note();
-        let over = text(&mut window, "120");
+        let over = text(&mut window, "6");
         window.hover_at(over);
-        let at = button(&mut window, bar).expect("the bar shows");
+        let at = button(&mut window, bar).expect("the plus shows");
         window.click_at(at);
         assert_eq!(rows(&window), expected, "{bar}: what was written stays where it was");
         let cell = window.editor().cell().expect("the caret is in the table");

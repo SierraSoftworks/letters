@@ -2355,7 +2355,6 @@ impl EditorApp {
     fn tabled(&mut self, shown: &tables::Shown, asked: tables::Asked, platform: &mut dyn Platform) {
         let (axis, index) = match asked {
             tables::Asked::Menu(axis, index) | tables::Asked::Move { axis, from: index, .. } => (axis, Some(index)),
-            tables::Asked::Add(axis) => (axis, None),
             tables::Asked::Insert { axis, before } => {
                 let count = match axis {
                     tables::Axis::Column => shown.table.columns.len(),
@@ -2377,8 +2376,6 @@ impl EditorApp {
                 self.tables.open = Some(axis);
                 return self.reveal();
             }
-            (tables::Asked::Add(_), tables::Axis::Column) => TableEdit::AddColumn { after: true },
-            (tables::Asked::Add(_), tables::Axis::Row) => TableEdit::AddRow { below: true },
             // Past the last there is none to go before.
             (tables::Asked::Insert { .. }, tables::Axis::Column) => TableEdit::AddColumn { after: index.is_none() },
             (tables::Asked::Insert { .. }, tables::Axis::Row) => TableEdit::AddRow { below: index.is_none() },
@@ -4258,14 +4255,17 @@ impl App for EditorApp {
         if let Some(shown) = self.table() {
             for (part, at) in shown.parts() {
                 let (axis, index, does) = match part {
-                    tables::Part::Handle(axis, index) => (axis, Some(index), 0),
-                    tables::Part::Add(axis) => (axis, None, 1),
-                    tables::Part::Insert(axis, before) => (axis, Some(before), 2),
+                    tables::Part::Handle(axis, index) => (axis, index, 0),
+                    tables::Part::Insert(axis, before) => (axis, before, 2),
                 };
-                // The plus past the last column or row does what the bar there does, which is told.
-                let Some(cell) = shown.cell(axis, index, self.caret_cell()) else { continue };
-                let told = (axis == tables::Axis::Row, does);
-                describe::table_part(&cell, told, &tables::label(part), self.onto(at), page, nodes);
+                // The plus past the last column or row is told by a cell of the last, as adding at the end.
+                let caret = self.caret_cell();
+                let within = shown.cell(axis, Some(index), caret).map(|cell| (cell, does));
+                let Some((cell, does)) = within.or_else(|| Some((shown.cell(axis, None, caret)?, 1))) else {
+                    continue;
+                };
+                let (told, label) = ((axis == tables::Axis::Row, does), tables::label(part, does == 1));
+                describe::table_part(&cell, told, &label, self.onto(at), page, nodes);
             }
         }
         self.review.describe(page, nodes);
@@ -4309,7 +4309,7 @@ impl App for EditorApp {
                 let index = if row { at.row } else { at.column };
                 let asked = match does {
                     0 => tables::Asked::Menu(axis, index),
-                    1 => tables::Asked::Add(axis),
+                    1 => tables::Asked::Insert { axis, before: index + 1 },
                     _ => tables::Asked::Insert { axis, before: index },
                 };
                 self.tabled(&shown, asked, platform);
