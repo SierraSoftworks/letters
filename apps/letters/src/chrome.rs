@@ -8,6 +8,8 @@ use letters_ui::{Chrome, Frame, WindowButton};
 
 /// Room the bar leaves for the three lights macOS draws over its start.
 const LIGHTS: f32 = 78.0;
+/// The same in a unified title bar, whose lights stand 13 pt further from the window's edge.
+const LIGHTS_UNIFIED: f32 = 91.0;
 
 /// Whose rules a window's frame follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,14 +33,19 @@ impl Host {
     };
 
     /// What the desktop expects of a window's frame and bar. A window that is maximised or full screen
-    /// has no edge of its own to show or to be resized by.
-    pub fn chrome(self, buttons: &Buttons, maximized: bool, full_screen: bool) -> Chrome {
+    /// has no edge of its own to show or to be resized by. `bar` is the height of the title bar where the
+    /// system made it a unified one, which the bar then fills so that its contents line up with the lights.
+    pub fn chrome(self, buttons: &Buttons, maximized: bool, full_screen: bool, bar: Option<f32>) -> Chrome {
         match self {
             Self::Other => Chrome::default(),
-            // A full screen window has no lights to leave room for.
             Self::Mac => {
-                let inset_start = if full_screen { 0.0 } else { LIGHTS };
-                Chrome { frame: Frame::Unified, inset_start, maximized, ..Chrome::default() }
+                let inset_start = match bar {
+                    // A full screen window has no lights to leave room for.
+                    _ if full_screen => 0.0,
+                    Some(_) => LIGHTS_UNIFIED,
+                    None => LIGHTS,
+                };
+                Chrome { frame: Frame::Unified, inset_start, bar_height: bar, maximized, ..Chrome::default() }
             }
             Self::Linux => Chrome {
                 buttons: buttons.order.iter().map(|button| button.shown()).collect(),

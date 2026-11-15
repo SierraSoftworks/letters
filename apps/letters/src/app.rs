@@ -22,7 +22,7 @@ use letters_render::{Color, DisplayList, Point, Size};
 use letters_spell::Dictionary;
 use letters_trust::Trust;
 // The editor's window is the view here, where `Window` is the system's.
-use letters_ui::{Chrome, Cursor, Edge, Landing, Location, Request, SaveState, Scheme, Window as View, tokens};
+use letters_ui::{Chrome, Cursor, Edge, Frame, Landing, Location, Request, SaveState, Scheme, Window as View, tokens};
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -31,6 +31,7 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{self, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowAttributes, WindowId};
 
 use crate::chrome::{self, Buttons, Host};
@@ -143,11 +144,16 @@ pub(crate) fn event_loop<T: 'static>(background: bool) -> Result<EventLoop<T>, E
 
 /// What every window starts as, document or not. Its bar is its title bar where the desktop leaves that
 /// to the app: under the system's lights on macOS, and in a frame Letters draws on Linux.
-pub(crate) fn window_attributes() -> WindowAttributes {
+pub(crate) fn window_attributes(event_loop: &ActiveEventLoop) -> WindowAttributes {
+    // A Wayland window draws its own corners, which are round: what its frames leave clear must show
+    // what is behind it. Elsewhere a window is all its own.
+    let wayland =
+        event_loop.display_handle().is_ok_and(|display| matches!(display.as_raw(), RawDisplayHandle::Wayland(_)));
     let attributes = Window::default_attributes()
         .with_title(UNTITLED)
         .with_inner_size(WINDOW_SIZE)
-        .with_min_inner_size(LogicalSize::new(360.0, 240.0));
+        .with_min_inner_size(LogicalSize::new(360.0, 240.0))
+        .with_transparent(wayland);
     #[cfg(target_os = "macos")]
     let attributes = {
         use winit::platform::macos::WindowAttributesExtMacOS;
@@ -179,7 +185,7 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
     launch.mark("display list");
     let mut pixels = vec![0; (width * height) as usize];
     let mut painter = Painter::new();
-    painter.paint(&list, &Images::default(), scale as f32, background(false), width, 0, &mut pixels);
+    painter.paint(&list, &Images::default(), scale as f32, background(false), false, width, 0, &mut pixels);
     launch.mark(FIRST_FRAME);
     let Mode::TypingReport { keys } = options.mode else {
         println!("{FIRST_FRAME}\n{}", launch.report());
@@ -194,7 +200,7 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
         list.items.clear();
         view.paint(&mut list);
         // The pixels still hold the frame before, as a window's buffer does.
-        painter.paint(&list, &Images::default(), scale as f32, background(false), width, 1, &mut pixels);
+        painter.paint(&list, &Images::default(), scale as f32, background(false), false, width, 1, &mut pixels);
         typing.record(typed.elapsed());
     }
     print!("{}", typing.report("CPU"));
@@ -284,6 +290,8 @@ struct DocWindow {
     access_stale: bool,
     /// The frame the view was last told to draw.
     chrome: Chrome,
+    /// The height of the unified title bar the system gave the window, which the bar then fills.
+    bar: Option<f32>,
     /// When the view next wants a frame without being asked, on the editor's clock.
     wake_ms: Option<u64>,
 
@@ -581,7 +589,7 @@ impl DocWindow {
     /// buttons, and whether it floats or fills its place.
     fn reframe(&mut self, buttons: &Buttons) {
         let (maximized, full_screen) = (self.window.is_maximized(), self.window.fullscreen().is_some());
-        let chrome = Host::HERE.chrome(buttons, maximized, full_screen);
+        let chrome = Host::HERE.chrome(buttons, maximized, full_screen, self.bar);
         if self.chrome != chrome {
             self.chrome = chrome.clone();
             self.view.set_chrome(chrome);
@@ -594,6 +602,7 @@ impl DocWindow {
         let scale = self.window.scale_factor();
         let size = self.window.inner_size().to_logical::<f32>(scale);
         self.view.resize(Size { width: size.width, height: size.height }, scale as f32);
+        self.presenter.shade(self.chrome.frame == Frame::Floating, self.dark());
     }
 
     /// Paints one frame and puts it on screen.
@@ -602,7 +611,11 @@ impl DocWindow {
         self.wake_ms = self.view.animate(now_ms);
         self.list.items.clear();
         self.view.paint(&mut self.list);
-        self.presenter.present(&self.list, background(self.dark()))
+        // A window that floats in a frame of Letters' own has round corners wherever it can.
+        let dark = self.dark();
+        let line = tokens::LINE_STRONG.resolve(if dark { Scheme::Dark } else { Scheme::Light });
+        let line = (self.chrome.frame == Frame::Floating).then(|| Color::rgba(line.r, line.g, line.b, line.a));
+        self.presenter.present(&mut self.list, background(dark), line)
     }
 
     /// Brings everything outside the canvas up to date with the view, after any event.
@@ -914,7 +927,10 @@ impl App {
             }
         };
         // AccessKit must attach before the window is first shown.
-        let window = Arc::new(event_loop.create_window(window_attributes().with_visible(false))?);
+        let window = Arc::new(event_loop.create_window(window_attributes(event_loop).with_visible(false))?);
+        // Only macOS has this to give: a taller title bar with the lights centred in it, where the bar's
+        // own contents are centred too. Without it the lights sit higher than the name beside them.
+        let bar = letters_frame::unify_title_bar(&window);
         let access = accesskit_winit::Adapter::with_event_loop_proxy(event_loop, &window, self.proxy.clone());
         let presenter = Presenter::new(window.clone())?;
         window.set_ime_allowed(true);
@@ -935,6 +951,7 @@ impl App {
             gpu_offered: false,
             access_stale: false,
             chrome: Chrome::default(),
+            bar,
             wake_ms: None,
             place,
             keeps: self.typing.is_none() && !self.report_launch,

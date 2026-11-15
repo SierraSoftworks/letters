@@ -53,7 +53,7 @@ impl Baseline {
     }
 
     fn open(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
-        let window = Arc::new(event_loop.create_window(window_attributes())?);
+        let window = Arc::new(event_loop.create_window(window_attributes(event_loop))?);
         self.surface = Some(softbuffer::Surface::new(&softbuffer::Context::new(window.clone())?, window)?);
         self.mark("window shown");
         Ok(())

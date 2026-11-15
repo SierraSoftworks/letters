@@ -109,7 +109,7 @@ fn a_window_is_framed_as_its_desktop_expects() {
         (Host::Other, false, false, Frame::System, 0),
     ];
     for (host, maximized, full_screen, frame, count) in cases {
-        let chrome = host.chrome(&buttons, maximized, full_screen);
+        let chrome = host.chrome(&buttons, maximized, full_screen, None);
         let case = format!("{host:?}, maximised {maximized}, full screen {full_screen}");
         assert_eq!(chrome.frame, frame, "{case}");
         assert_eq!(chrome.buttons, shown[..count], "{case}");
@@ -121,8 +121,20 @@ fn a_window_is_framed_as_its_desktop_expects() {
 #[test]
 fn the_bar_leaves_room_for_the_lights_macos_draws() {
     let none = Buttons::parse("");
-    assert!(Host::Mac.chrome(&none, false, false).inset_start > 0.0);
-    assert_eq!(Host::Mac.chrome(&none, false, true).inset_start, 0.0, "a full screen window has no lights");
-    assert_eq!(Host::Linux.chrome(&none, false, false).inset_start, 0.0);
-    assert_eq!(Host::Other.chrome(&none, true, true), Chrome::default());
+    let usual = Host::Mac.chrome(&none, false, false, None);
+    assert!(usual.inset_start > 0.0 && usual.bar_height.is_none());
+    assert_eq!(Host::Mac.chrome(&none, false, true, None).inset_start, 0.0, "a full screen window has no lights");
+    assert_eq!(Host::Linux.chrome(&none, false, false, None).inset_start, 0.0);
+    assert_eq!(Host::Other.chrome(&none, true, true, None), Chrome::default());
+}
+
+#[test]
+fn the_bar_fills_a_unified_title_bar_so_its_contents_meet_the_lights() {
+    let none = Buttons::parse("");
+    let (usual, unified) =
+        (Host::Mac.chrome(&none, false, false, None), Host::Mac.chrome(&none, false, false, Some(52.0)));
+    assert_eq!(unified.bar_height, Some(52.0), "the bar is as tall as the title bar, whose lights are centred");
+    assert!(unified.inset_start > usual.inset_start, "the lights of a unified title bar stand further in");
+    let full_screen = Host::Mac.chrome(&none, false, true, Some(52.0));
+    assert_eq!((full_screen.inset_start, full_screen.bar_height), (0.0, Some(52.0)));
 }

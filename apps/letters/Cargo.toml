@@ -22,6 +22,7 @@ letters-fonts.workspace = true
 letters-layout.workspace = true
 letters-trust.workspace = true
 letters-spell.workspace = true
+letters-frame.workspace = true
 serde_json.workspace = true
 
 winit.workspace = true

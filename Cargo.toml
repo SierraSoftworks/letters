@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/*"]
+members = ["crates/*", "apps/*", "platform/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,6 +23,8 @@ letters-spell = { path = "crates/letters-spell" }
 letters-math = { path = "crates/letters-math" }
 letters-trust = { path = "crates/letters-trust" }
 letters-test = { path = "crates/letters-test" }
+# The one crate with unsafe code. Only the desktop shell may name it.
+letters-frame = { path = "platform/letters-frame" }
 
 serde = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -84,6 +86,17 @@ getrandom = "0.4"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 # Older system dictionaries are not in UTF-8. The app reads them: nothing in the core needs this.
 encoding_rs = "0.8"
+
+# What letters-frame calls the desktop with, in the versions winit and softbuffer already bring.
+raw-window-handle = "0.6"
+wayland-client = "0.31"
+# Loaded when a window turns out to be a Wayland one, as winit does: nothing links against it.
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+memmap2 = "0.9"
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSGeometry", "NSThread"] }
+objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSResponder", "NSToolbar", "NSView", "NSWindow"] }
 
 # The browser shell. The command-line `wasm-bindgen` must be the version the lock file names.
 wasm-bindgen = "0.2"

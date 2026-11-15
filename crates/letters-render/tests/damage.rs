@@ -362,6 +362,25 @@ fn a_window_frame_holds_the_same_picture_in_the_windows_layout() {
 }
 
 #[test]
+fn a_window_frame_with_alpha_is_clear_where_nothing_is_drawn() {
+    let swatch = |x| fill(x, 100.0, 40.0, 30.0, Color::rgb(0x12, 0x34, 0x56));
+    let scenes = [150.0, 160.0].map(|x| list([swatch(x)]));
+    let (none, clear) = (Images::default(), Color::rgba(0, 0, 0, 0));
+    let mut renderer = CpuRenderer::new();
+    let mut frame = Frame::argb(WIDTH, HEIGHT);
+
+    for scene in &scenes {
+        renderer.render(scene, &none, 1.0, clear, &mut frame);
+        let mut fresh = Frame::argb(WIDTH, HEIGHT);
+        CpuRenderer::new().render(scene, &none, 1.0, clear, &mut fresh);
+        assert!(frame == fresh, "a kept frame shows the new list");
+    }
+    assert_eq!(frame.pixels()[(120 * WIDTH + 170) as usize], 0xff12_3456);
+    assert_eq!(frame.pixel(170, 120), Some(Color::rgb(0x12, 0x34, 0x56)));
+    assert_eq!(frame.pixels()[(120 * WIDTH + 155) as usize], 0, "where the swatch was is clear again");
+}
+
+#[test]
 fn damage_from_two_renders_can_be_joined() {
     let mut kept = Kept::new(1.0);
     let none = Images::default();

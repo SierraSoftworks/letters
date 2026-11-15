@@ -24,6 +24,9 @@ pub enum PixelFormat {
     /// One `0x00RRGGBB` word, the layout a window's software surface takes. It has no alpha, so draw over
     /// an opaque background.
     Xrgb,
+    /// One `0xAARRGGBB` word with the colours multiplied by alpha, the layout of a window that is clear
+    /// where nothing is drawn.
+    Argb,
 }
 
 /// The pixels of one frame, row by row from the top left.
@@ -56,6 +59,11 @@ impl Frame {
         Self::with_format(width, height, PixelFormat::Xrgb)
     }
 
+    /// A transparent frame in the pixel layout of a window with alpha.
+    pub fn argb(width: u32, height: u32) -> Self {
+        Self::with_format(width, height, PixelFormat::Argb)
+    }
+
     fn with_format(width: u32, height: u32, format: PixelFormat) -> Self {
         let (width, height) = (width.min(u16::MAX.into()) as u16, height.min(u16::MAX.into()) as u16);
         Self { width, height, format, pixels: vec![0; usize::from(width) * usize::from(height)], drawn: 0 }
@@ -78,12 +86,14 @@ impl Frame {
         bytemuck::cast_slice(&self.pixels)
     }
 
-    /// The frame as one word per pixel. For an [`PixelFormat::Xrgb`] frame these are a window's pixels.
+    /// The frame as one word per pixel. For an [`PixelFormat::Xrgb`] or [`PixelFormat::Argb`] frame these
+    /// are a window's pixels.
     pub fn pixels(&self) -> &[u32] {
         &self.pixels
     }
 
-    /// The colour of a pixel as stored (premultiplied in an RGBA8 frame), or `None` outside the frame.
+    /// The colour of a pixel as stored (premultiplied where the format has alpha), or `None` outside the
+    /// frame.
     pub fn pixel(&self, x: u32, y: u32) -> Option<Color> {
         if x >= self.width() || y >= self.height() {
             return None;
@@ -98,6 +108,10 @@ impl Frame {
                 let [_, r, g, b] = pixel.to_be_bytes();
                 Color { r, g, b, a: 255 }
             }
+            PixelFormat::Argb => {
+                let [a, r, g, b] = pixel.to_be_bytes();
+                Color { r, g, b, a }
+            }
         })
     }
 
@@ -107,8 +121,8 @@ impl Frame {
         self.copy_rect_to(out, whole);
     }
 
-    /// Copies one rectangle of the frame as `0x00RRGGBB` pixels into `out`, a buffer of the frame's size
-    /// that already holds the rest. With [`Damage::rects`] this brings a window's buffer up to date.
+    /// Copies one rectangle of the frame into `out`, a buffer of the frame's size that already holds the
+    /// rest: as `0xAARRGGBB` pixels from an [`PixelFormat::Argb`] frame, and as `0x00RRGGBB` from any other. With [`Damage::rects`] this brings a window's buffer up to date.
     pub fn copy_rect_to(&self, out: &mut [u32], rect: PixelRect) {
         let stride = usize::from(self.width);
         let (left, right) = (rect.x as usize, ((rect.x + rect.width) as usize).min(stride));
@@ -120,7 +134,7 @@ impl Frame {
                 return;
             };
             match self.format {
-                PixelFormat::Xrgb => to.copy_from_slice(from),
+                PixelFormat::Xrgb | PixelFormat::Argb => to.copy_from_slice(from),
                 PixelFormat::Rgba8 => to.iter_mut().zip(from).for_each(|(to, from)| *to = xrgb(*from)),
             }
         }
@@ -150,6 +164,22 @@ impl Frame {
 /// An RGBA8 pixel as `0x00RRGGBB`.
 fn xrgb(rgba: u32) -> u32 {
     u32::from_be_bytes(rgba.to_ne_bytes()) >> 8
+}
+
+/// An RGBA8 pixel as `0xAARRGGBB`.
+fn argb(rgba: u32) -> u32 {
+    u32::from_be_bytes(rgba.to_ne_bytes()).rotate_right(8)
+}
+
+impl PixelFormat {
+    /// A pixel the rasteriser made, as this format stores it.
+    fn stored(self, rgba: u32) -> u32 {
+        match self {
+            Self::Rgba8 => rgba,
+            Self::Xrgb => xrgb(rgba),
+            Self::Argb => argb(rgba),
+        }
+    }
 }
 
 /// Draws display lists on the CPU. Keep one for the life of a window: it holds the glyph and font caches,
@@ -265,8 +295,9 @@ impl CpuRenderer {
         paint::paint(&mut CpuCanvas { context, resources: &mut self.resources, images }, &mut self.fonts, list, &view);
         context.flush();
         context.render_with(target, &mut self.resources, clear(background));
-        if frame.format == PixelFormat::Xrgb {
-            frame.pixels.iter_mut().for_each(|pixel| *pixel = xrgb(*pixel));
+        if frame.format != PixelFormat::Rgba8 {
+            let format = frame.format;
+            frame.pixels.iter_mut().for_each(|pixel| *pixel = format.stored(*pixel));
         }
     }
 
@@ -308,8 +339,7 @@ impl CpuRenderer {
                 let start = y * width;
                 let kept = &mut frame.pixels[start + columns.start..start + columns.end];
                 for (to, from) in kept.iter_mut().zip(&row[columns.clone()]) {
-                    let rgba = u32::from_ne_bytes(*from);
-                    *to = if frame.format == PixelFormat::Xrgb { xrgb(rgba) } else { rgba };
+                    *to = frame.format.stored(u32::from_ne_bytes(*from));
                 }
             }
         }

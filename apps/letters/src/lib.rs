@@ -23,5 +23,6 @@ pub mod library;
 pub mod measure;
 pub mod platform;
 pub mod present;
+pub mod shadow;
 pub mod trust;
 pub mod words;

@@ -2581,6 +2581,7 @@ dependencies = [
  "letters-editor",
  "letters-fonts",
  "letters-format",
+ "letters-frame",
  "letters-layout",
  "letters-model",
  "letters-render",
@@ -2642,6 +2643,21 @@ dependencies = [
  "serde_json",
  "sha2",
  "zip",
+]
+
+[[package]]
+name = "letters-frame"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "memmap2",
+ "objc2 0.5.3",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
+ "raw-window-handle",
+ "rustix 1.1.6",
+ "wayland-backend",
+ "wayland-client",
 ]
 
 [[package]]
