@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Picture, Platform as _};
 use letters_format::WorkingCopy;
+use letters_frame::Lights;
 use letters_model::{BlockId, Change, Model, Notes, ReplicaId, Revision, Style, TagKind};
 use letters_render::image::Image;
 use letters_render::{Color, DisplayList, Point, Size};
@@ -370,8 +371,11 @@ struct DocWindow {
     chrome: Chrome,
     /// Whether the person set the window light or dark, or left it to the system.
     appearance: Appearance,
-    /// The height of the unified title bar the system gave the window, which the bar then fills.
+    /// The height of the unified title bar the system gave the window, which the bar fills until the
+    /// lights are seen.
     bar: Option<f32>,
+    /// Where the system last stood the window's lights, which the bar is then centred on.
+    lights: Option<Lights>,
     /// When the view next wants a frame without being asked, on the editor's clock.
     wake_ms: Option<u64>,
 
@@ -878,7 +882,11 @@ impl DocWindow {
     /// buttons, and whether it floats or fills its place.
     fn reframe(&mut self, buttons: &Buttons) {
         let (maximized, full_screen) = (self.window.is_maximized(), self.window.fullscreen().is_some());
-        let chrome = Host::HERE.chrome(buttons, maximized, full_screen, self.bar);
+        // The lights are read while they stand in the window, and remembered while they do not.
+        if let Some(lights) = letters_frame::lights(&self.window) {
+            self.lights = Some(lights);
+        }
+        let chrome = Host::HERE.chrome(buttons, maximized, full_screen, self.bar, self.lights);
         if self.chrome != chrome {
             self.chrome = chrome.clone();
             self.view.set_chrome(chrome);
@@ -1304,6 +1312,7 @@ impl App {
             chrome: Chrome::default(),
             appearance: Appearance::System,
             bar,
+            lights: None,
             wake_ms: None,
             place,
             keeps: self.typing.is_none() && !self.report_launch,
@@ -1361,6 +1370,8 @@ impl App {
         window.follow(&self.settings, self.writer());
         self.mark("laid out");
         window.window.set_visible(true);
+        // macOS places a window's lights for good as it shows it, which is before the first frame.
+        window.reframe(&self.buttons);
         self.mark("window shown");
         window.window.request_redraw();
         let id = window.window.id();
@@ -2080,6 +2091,8 @@ impl ApplicationHandler<Event> for App {
             }
             WindowEvent::Focused(focused) => {
                 window.view.focus(focused);
+                // The lights may have been moved since they were last looked for.
+                window.reframe(&self.buttons);
                 // Another window, or another copy of the app, may have taught the dictionary a word.
                 if focused && window.rest.is_none() {
                     window.reword(&self.words);
