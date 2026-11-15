@@ -150,6 +150,38 @@ fn check_pages(doc: &Document, layout: &DocLayout, pages: &Pages) -> Result<(), 
     Ok(())
 }
 
+/// Prose with formulas in its lines, some taller than a line of text, and formulas as blocks.
+fn sums() -> Document {
+    let tall = r"\frac{\frac{a}{b}}{\frac{c}{d}}";
+    let runs: Vec<(&str, &[Mark])> =
+        vec![(PROSE, &[]), (tall, &[Mark::Math]), (PROSE, &[]), ("x^2", &[Mark::Math]), (PROSE, &[])];
+    doc(vec![
+        paragraph("a", PROSE),
+        rich("m", &runs),
+        formula("f", r"\sum_{i=0}^{n} \frac{1}{i^2}"),
+        rich("n", &runs),
+        formula("g", "E = mc^2"),
+        paragraph("z", PROSE),
+    ])
+}
+
+#[test]
+fn lines_with_formulas_go_to_one_page_each() {
+    let sums = sums();
+    for room in [160.0, 240.0, 500.0, 5000.0] {
+        let (layout, pages) = paged(&sums, room);
+        assert_eq!(check_pages(&sums, &layout, &pages), Ok(()), "with {room} px of room");
+        // A formula is never cut by the edge of a page.
+        for (block, offset) in [("m", PROSE.len()), ("f", 0), ("n", PROSE.len()), ("g", 0)] {
+            let at = Pos::new(block, offset);
+            let (place, sheet) = (layout.formula_rect(&at).unwrap(), layout.page_of(&pages, &at).unwrap());
+            let top = place.y + pages.origin(sheet).unwrap().y;
+            let Painted { clip, .. } = page(&layout, &pages, sheet);
+            assert!(clip.y <= top + 0.01 && top + place.height <= clip.y + clip.height + 0.01, "{block} at {room} px");
+        }
+    }
+}
+
 #[test]
 fn every_line_is_on_one_page_in_order() {
     let mixed = mixed();
@@ -449,7 +481,7 @@ const WORDS: [&str; 8] = ["rates", "change", "on", "the", "first", "of", "Januar
 fn documents() -> impl Strategy<Value = Document> {
     let words = |most: usize| prop::collection::vec(prop::sample::select(WORDS.to_vec()), 1..most);
     let lines = prop::collection::vec(words(14).prop_map(|words| words.join(".")), 1..12);
-    let block = (0..9u8, words(90), lines, prop::bool::weighted(0.1));
+    let block = (0..11u8, words(90), lines, prop::bool::weighted(0.1));
     prop::collection::vec(block, 1..14).prop_map(|blocks| {
         let blocks = blocks.into_iter().enumerate().map(|(index, (kind, words, lines, breaks))| {
             let (id, text) = (format!("b{index}"), words.join(" "));
@@ -475,6 +507,8 @@ fn documents() -> impl Strategy<Value = Document> {
                 3 => inside(BlockKind::Callout { tone: Tone::Info }),
                 4 => inside(BlockKind::Quote),
                 5 => Block::new(id.as_str(), BlockKind::Divider),
+                6 => rich(&id, &[(&text, &[]), (r"\frac{a}{\frac{b}{c}}", &[Mark::Math]), (&text, &[])]),
+                7 => formula(&id, r"\sum_{i=0}^{n} i"),
                 _ => paragraph(&id, &text),
             };
             if breaks { breaking(block) } else { block }

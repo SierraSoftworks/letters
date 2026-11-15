@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use letters_layout::{DocLayout, Fonts, Palette, Scheme};
-use letters_model::{Block, BlockKind, Body, Document, Style};
+use letters_model::{Block, BlockKind, Body, Document, Mark, Run, Style};
 use letters_render::{Color, DisplayList, Item, Rect};
 
 pub const WIDTH: f32 = 600.0;
@@ -19,6 +19,17 @@ pub fn doc(blocks: Vec<Block>) -> Document {
 
 pub fn paragraph(id: &str, text: &str) -> Block {
     Block::text(id, BlockKind::Paragraph, text)
+}
+
+/// A paragraph of runs, each plain or marked.
+pub fn rich(id: &str, runs: &[(&str, &[Mark])]) -> Block {
+    let runs = runs.iter().map(|(text, marks)| Run::marked(*text, marks.iter().cloned())).collect();
+    Block { body: Body::Text(runs), ..paragraph(id, "") }
+}
+
+/// A formula set as a block, from its TeX.
+pub fn formula(id: &str, tex: &str) -> Block {
+    Block::text(id, BlockKind::Formula, tex)
 }
 
 pub fn container(id: &str, kind: BlockKind, children: Vec<Block>) -> Block {

@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use letters_layout::{DocLayout, Fonts};
 use letters_model::{
-    Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Model, Op, Page, Pos, ReplicaId, Run, Style, Tone,
+    Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Markers, Model, Op, Page, Pos, ReplicaId, Run, Style,
+    Tone,
 };
 use letters_render::{DisplayList, Rect};
 
@@ -73,6 +74,17 @@ const WORDS: &[&str] = &[
     "résumé",
 ];
 
+/// Formulas as writing has them, in a line or as a block.
+const FORMULAS: &[&str] = &[
+    "x^2",
+    r"\alpha + \beta",
+    r"\frac{a}{b}",
+    r"e^{i\pi} + 1 = 0",
+    r"\sqrt{x^2 + y^2}",
+    r"\sum_{i=0}^{n} \frac{1}{i^2}",
+    r"\int_0^\infty e^{-x^2} \, dx = \frac{\sqrt{\pi}}{2}",
+];
+
 /// A small repeatable generator, so every run lays out the same document.
 struct Dice {
     state: u64,
@@ -110,6 +122,10 @@ impl Dice {
             runs.push(Run::plain(self.words(40, 200) + " "));
             let mark = [Mark::Bold, Mark::Italic, Mark::Code, Mark::Highlight][self.roll(4)].clone();
             runs.push(Run::marked(self.words(4, 20) + " ", [mark]));
+            if self.roll(8) == 0 {
+                runs.push(Run::marked(FORMULAS[self.roll(FORMULAS.len())], [Mark::Math]));
+                runs.push(Run::plain(" "));
+            }
         }
         Body::Text(runs)
     }
@@ -147,7 +163,7 @@ fn document() -> (Document, usize) {
                 blocks.push(Block { body: Body::Blocks(vec![inside]), ..Block::new(id(), kind) });
             }
             3 => blocks.push(Block::new(id(), BlockKind::Divider)),
-            _ => {}
+            _ => blocks.push(Block::text(id(), BlockKind::Formula, FORMULAS[dice.roll(FORMULAS.len())])),
         }
     }
     (Document { blocks, ..Document::default() }, dice.made)
@@ -218,7 +234,7 @@ fn main() {
             }
             format!("  budget {:.1} ms", ms(budget))
         });
-        println!("{name:<14} median {:>8.3} ms  worst {:>8.3} ms{budget}", ms(times.median()), ms(times.worst()));
+        println!("{name:<15} median {:>8.3} ms  worst {:>8.3} ms{budget}", ms(times.median()), ms(times.worst()));
     };
     let megabytes = bytes as f64 / 1e6;
     println!("{PAGES} pages: {megabytes:.2} MB of text in {} blocks, {WIDTH} px wide", doc.walk().count());
@@ -286,6 +302,42 @@ fn main() {
         })
     });
     report("enter", &split, split.worst(), Some(KEYSTROKE));
+
+    // Typing in the source of a formula in a line, which shows in its place while the caret is in it.
+    let formula = |block: &&Block| block.body.runs().iter().any(|run| run.marks.contains(&Mark::Math));
+    let target = doc.blocks.iter().find(formula).expect("a paragraph with a formula");
+    let before = target.body.runs().iter().take_while(|run| !run.marks.contains(&Mark::Math));
+    let (id, start) = (target.id.clone(), before.map(|run| run.text.len()).sum::<usize>());
+    let y = opened(&doc, &style).caret(&Pos::new(id.clone(), start)).expect("a caret").y;
+    let mut model = Model::new(doc.clone(), ReplicaId::from(1));
+    let mut layout = opened(model.doc(), &style);
+    layout.reveal(Some((&Pos::new(id.clone(), start + 1), &Markers::default())));
+    frame(&mut layout, y, &mut list);
+    let source = Times::of(200, |at| {
+        let caret = Pos::new(id.clone(), start + 1 + at);
+        let change = model.apply([Op::InsertText { at: caret.clone(), text: "x".into() }]).expect("typed");
+        timed(|| {
+            layout.update(model.doc(), &style, WIDTH, Some(&change));
+            layout.reveal(Some((&Pos::new(id.clone(), caret.offset + 1), &Markers::default())));
+            frame(&mut layout, y, &mut list);
+        })
+    });
+    report("formula source", &source, source.worst(), Some(KEYSTROKE));
+
+    // Typing in a formula that stays typeset, so each key sets a formula never seen before.
+    let target = doc.blocks.iter().find(|block| block.kind == BlockKind::Formula).expect("a formula block");
+    let (id, y) = (target.id.clone(), opened(&doc, &style).caret(&Pos::new(target.id.clone(), 0)).expect("a caret").y);
+    let mut layout = opened(model.doc(), &style);
+    frame(&mut layout, y, &mut list);
+    let typeset = Times::of(200, |at| {
+        let text = if at % 2 == 0 { "+" } else { "y" };
+        let change = model.apply([Op::InsertText { at: Pos::new(id.clone(), at), text: text.into() }]).expect("typed");
+        timed(|| {
+            layout.update(model.doc(), &style, WIDTH, Some(&change));
+            frame(&mut layout, y, &mut list);
+        })
+    });
+    report("formula typeset", &typeset, typeset.worst(), Some(KEYSTROKE));
 
     // Replacing every estimate, in the slices the shell runs while idle.
     let mut layout = opened(&doc, &style);

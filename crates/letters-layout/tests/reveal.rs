@@ -28,12 +28,6 @@ impl Platform for Desk {
     }
 }
 
-/// A paragraph of runs, each plain or marked.
-fn rich(id: &str, runs: &[(&str, &[Mark])]) -> Block {
-    let runs = runs.iter().map(|(text, marks)| Run::marked(*text, marks.iter().cloned())).collect();
-    Block { body: Body::Text(runs), ..paragraph(id, "") }
-}
-
 /// A sentence that wraps, with `word` marked on its second line.
 fn sentence(marks: &[Mark]) -> Document {
     let before = "Rates change on the first of January, and every ";

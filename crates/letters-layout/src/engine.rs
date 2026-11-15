@@ -9,7 +9,7 @@ use parley::fontique::{Blob, Collection, CollectionOptions, FamilyId, SourceCach
 use parley::setting::Tag;
 use parley::{
     FontContext, FontFamily, FontFamilyName, FontStyle, FontVariation, FontVariations, FontWeight, GenericFamily,
-    GlyphRun, Language, Layout, LayoutContext, LineHeight, OverflowWrap, Run, TextStyle,
+    GlyphRun, InlineBox, Language, Layout, LayoutContext, LineHeight, OverflowWrap, Run, TextStyle,
 };
 
 use crate::Fonts;
@@ -31,6 +31,10 @@ pub(crate) struct Spec<'a> {
 }
 
 pub(crate) struct Engine {
+    /// The formulas typeset so far. They are set far more often than they change.
+    pub maths: letters_math::Cache,
+    /// Whether a formula may link. Only a document that is trusted may.
+    pub links: bool,
     fcx: FontContext,
     lcx: LayoutContext<Brush>,
     /// The bytes behind each registered blob, by blob id.
@@ -49,6 +53,8 @@ impl Engine {
     pub fn new(fonts: &Fonts) -> Self {
         let collection = Collection::new(CollectionOptions { shared: false, system_fonts: false });
         let mut engine = Self {
+            maths: letters_math::Cache::default(),
+            links: false,
             fcx: FontContext { collection, source_cache: SourceCache::default() },
             lcx: LayoutContext::new(),
             sources: Vec::new(),
@@ -107,6 +113,19 @@ impl Engine {
         locale: Option<Language>,
         layout: &mut Layout<Brush>,
     ) {
+        self.build_with(text, specs, runs, &[], locale, layout);
+    }
+
+    /// As [`Engine::build`], with `boxes` set in the line, each at a U+FFFC of the text.
+    pub fn build_with(
+        &mut self,
+        text: &str,
+        specs: &[Spec],
+        runs: &[(u16, Range<usize>)],
+        boxes: &[InlineBox],
+        locale: Option<Language>,
+        layout: &mut Layout<Brush>,
+    ) {
         let mut builder = self.lcx.style_run_builder(&mut self.fcx, text, 1.0, true);
         for spec in specs {
             let generic = if spec.mono { GenericFamily::Monospace } else { GenericFamily::SansSerif };
@@ -130,6 +149,9 @@ impl Engine {
         }
         for (spec, range) in runs {
             builder.push_style_run(*spec, range.clone());
+        }
+        for inline in boxes {
+            builder.push_inline_box(inline.clone());
         }
         builder.build_into(layout, text);
     }

@@ -1,6 +1,7 @@
 //! Turns the block tree into a flat column of leaves: where each block sits across the page, the space around
 //! it and what frames it. No text is shaped here, so this stays cheap for a whole document.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 
 use letters_model::{Align, Block, BlockId, BlockKind, Body, Document, ListKind, Mark, Style, TextStyle, Tone};
@@ -152,6 +153,8 @@ pub(crate) enum What {
     Label,
     /// An empty line that keeps an empty quote or callout visible.
     Blank,
+    /// A formula set as a block. The leaf's text is its source.
+    Formula,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -173,6 +176,8 @@ pub(crate) mod marks {
     pub const HIGHLIGHT: u8 = 1 << 4;
     pub const CODE: u8 = 1 << 5;
     pub const LINK: u8 = 1 << 6;
+    /// The stretch is the source of a formula, which is set in its place.
+    pub const MATH: u8 = 1 << 7;
 }
 
 /// A stretch of a leaf's text set one way. Spans run in order, each ending at `end`.
@@ -180,6 +185,78 @@ pub(crate) mod marks {
 pub(crate) struct Span {
     pub end: usize,
     pub marks: u8,
+}
+
+/// A text as the document holds it: the text, how each stretch of it is set, and where its links lead.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Words {
+    pub text: String,
+    /// Empty when the whole text is unmarked.
+    pub spans: Vec<Span>,
+    /// In order: the bytes each link covers and where it leads.
+    pub links: Vec<(Range<usize>, String)>,
+}
+
+impl Words {
+    pub fn plain(text: String) -> Self {
+        Self { text, ..Self::default() }
+    }
+
+    /// Reads a text block's runs.
+    pub fn of(block: &Block) -> Self {
+        let mut words = Self::default();
+        for run in block.body.runs() {
+            let start = words.text.len();
+            words.text.push_str(&run.text);
+            if let Some(link) = run.link.as_ref().filter(|_| !run.text.is_empty()) {
+                match words.links.last_mut() {
+                    // One link whose words differ in marks is still one link.
+                    Some((range, last)) if range.end == start && last == link => range.end = words.text.len(),
+                    _ => words.links.push((start..words.text.len(), link.clone())),
+                }
+            }
+            let mut bits = if run.link.is_some() { marks::LINK } else { 0 };
+            for mark in &run.marks {
+                bits |= match mark {
+                    Mark::Bold => marks::BOLD,
+                    Mark::Italic => marks::ITALIC,
+                    Mark::Underline => marks::UNDERLINE,
+                    Mark::Strike => marks::STRIKE,
+                    Mark::Highlight => marks::HIGHLIGHT,
+                    Mark::Code => marks::CODE,
+                    Mark::Math => marks::MATH,
+                    Mark::Other(_) => 0,
+                };
+            }
+            match words.spans.last_mut() {
+                // Two formulas side by side stay two, though they are marked alike.
+                Some(last) if last.marks == bits && bits & marks::MATH == 0 => last.end = words.text.len(),
+                _ if run.text.is_empty() => {}
+                _ => words.spans.push(Span { end: words.text.len(), marks: bits }),
+            }
+        }
+        if matches!(words.spans[..], [Span { marks: 0, .. }]) {
+            words.spans.clear();
+        }
+        words
+    }
+
+    /// The formula that holds `offset`, or starts or ends there: which of the text's formulas it is, and the
+    /// bytes of its source.
+    pub fn formula(&self, offset: usize) -> Option<(usize, Range<usize>)> {
+        let mut start = 0;
+        let mut formulas = 0..;
+        for span in &self.spans {
+            if span.marks & marks::MATH != 0 {
+                let which = formulas.next()?;
+                if (start..=span.end).contains(&offset) {
+                    return Some((which, start..span.end));
+                }
+            }
+            start = span.end;
+        }
+        None
+    }
 }
 
 /// One row of the column: a text block, or something that stands where a block is.
@@ -194,11 +271,7 @@ pub(crate) struct Leaf {
     pub role: Role,
     pub marker: Marker,
     /// The leaf keeps its own copy of the text, so it can be laid out whenever it scrolls into view.
-    pub text: String,
-    /// Empty when the whole text is unmarked.
-    pub spans: Vec<Span>,
-    /// The links in the text, in order: the bytes each covers and where it leads.
-    pub links: Vec<(Range<usize>, String)>,
+    pub words: Words,
     pub newlines: usize,
 
     /// The left edge and width of the text.
@@ -220,8 +293,10 @@ pub(crate) struct Leaf {
     pub height: f32,
     /// Whether `height` comes from a real layout and not an estimate.
     pub exact: bool,
-    /// How many lines the leaf has, each as tall as the next. Known once `exact`.
+    /// How many lines the leaf has. Known once `exact`.
     pub lines: u32,
+    /// Where each line ends, from the leaf's top, when they are not all as tall as each other.
+    pub ends: Vec<f32>,
     /// The lines that carry on a line of code from the line before, in order. No page starts with one.
     pub joined: Vec<u32>,
     pub laid: Option<Box<Laid>>,
@@ -247,57 +322,52 @@ impl Leaf {
             What::Rule => theme::RULE,
             What::Blank => of.line,
             What::Text | What::Label => {
-                let wrapped = (self.text.len() as f32 * of.advance / self.width.max(1.0)).ceil().max(1.0);
+                let wrapped = (self.words.text.len() as f32 * of.advance / self.width.max(1.0)).ceil().max(1.0);
                 (self.newlines as f32 + wrapped) * of.line
             }
+            // A fraction or a sum is about this tall.
+            What::Formula => (of.line * 2.5).round(),
         }
     }
 
-    /// The leaf of a text block, not yet placed.
-    pub fn of(block: &Block) -> Self {
-        let mut leaf = Self { id: Some(block.id.clone()), kind: Some(block.kind.clone()), ..Self::default() };
-        leaf.set_content(block);
-        leaf
+    /// Whether a position can be in the leaf.
+    pub fn holds(&self) -> bool {
+        matches!(self.what, What::Text | What::Formula)
     }
 
-    /// Copies a text block's runs.
-    pub fn set_content(&mut self, block: &Block) {
-        self.text.clear();
-        self.spans.clear();
-        self.links.clear();
-        for run in block.body.runs() {
-            let start = self.text.len();
-            self.text.push_str(&run.text);
-            if let Some(link) = run.link.as_ref().filter(|_| !run.text.is_empty()) {
-                match self.links.last_mut() {
-                    // One link whose words differ in marks is still one link.
-                    Some((range, last)) if range.end == start && last == link => range.end = self.text.len(),
-                    _ => self.links.push((start..self.text.len(), link.clone())),
-                }
-            }
-            let mut bits = if run.link.is_some() { marks::LINK } else { 0 };
-            for mark in &run.marks {
-                bits |= match mark {
-                    Mark::Bold => marks::BOLD,
-                    Mark::Italic => marks::ITALIC,
-                    Mark::Underline => marks::UNDERLINE,
-                    Mark::Strike => marks::STRIKE,
-                    Mark::Highlight => marks::HIGHLIGHT,
-                    // Until maths is typeset in a line, its source shows as code does.
-                    Mark::Code | Mark::Math => marks::CODE,
-                    Mark::Other(_) => 0,
-                };
-            }
-            match self.spans.last_mut() {
-                Some(last) if last.marks == bits => last.end = self.text.len(),
-                _ if run.text.is_empty() => {}
-                _ => self.spans.push(Span { end: self.text.len(), marks: bits }),
-            }
+    /// The formula at `offset` of the leaf's text: which of the leaf's formulas it is, and the bytes of its
+    /// source. A formula block is all one, and code has none.
+    pub fn formula(&self, offset: usize) -> Option<(usize, Range<usize>)> {
+        match self.what {
+            What::Formula => Some((0, 0..self.words.text.len())),
+            _ if self.role == Role::Code => None,
+            _ => self.words.formula(offset),
         }
-        if matches!(self.spans[..], [Span { marks: 0, .. }]) {
-            self.spans.clear();
+    }
+
+    /// Where a line starts, from the leaf's top.
+    pub fn line_top(&self, line: usize) -> f32 {
+        match (line, self.ends.get(line.wrapping_sub(1))) {
+            (0, _) => 0.0,
+            (_, Some(end)) => *end,
+            _ => line as f32 * self.height / self.lines.max(1) as f32,
         }
-        self.newlines = self.text.bytes().filter(|byte| *byte == b'\n').count();
+    }
+
+    /// How many lines end within `room` of the leaf's top.
+    pub fn lines_in(&self, room: f32) -> usize {
+        let count = self.lines.max(1) as usize;
+        match self.ends.is_empty() {
+            true => (((room * count as f32) / self.height.max(1.0)).floor().max(0.0) as usize).min(count),
+            false => self.ends.partition_point(|end| *end <= room).min(count),
+        }
+    }
+
+    /// Copies a text block's runs, and hands back the text there was.
+    pub fn set_content(&mut self, block: &Block) -> String {
+        let before = std::mem::replace(&mut self.words, Words::of(block));
+        self.newlines = self.words.text.bytes().filter(|byte| *byte == b'\n').count();
+        before.text
     }
 }
 
@@ -341,19 +411,31 @@ pub(crate) fn breaks(block: &Block) -> bool {
 pub(crate) struct Flow {
     pub leaves: Vec<Leaf>,
     pub frames: Vec<Frame>,
+    /// The blocks whose text was read anew into a leaf that was kept, each with the text it had.
+    pub retexted: Vec<(BlockId, String)>,
 }
 
-/// Lays the document out as a column `width` wide. `reuse` hands back the old leaf of a block whose content
-/// has not changed, so its text and layout carry over.
-pub(crate) fn flow(doc: &Document, types: &Types, width: f32, reuse: impl FnMut(&Block) -> Option<Leaf>) -> Flow {
-    let mut walk = Walk { types, reuse, out: Flow::default(), pad: 0.0, breaks: false, root: 0 };
+/// Lays the document out as a column `width` wide.
+///
+/// With `carry`, the leaves of the last column are kept: `old` hands over the leaf a block had, and `carry`
+/// names the blocks whose text has changed since, which are read again. A kept leaf brings its height and,
+/// when nothing in it changed, its layout.
+pub(crate) fn flow(
+    doc: &Document,
+    types: &Types,
+    width: f32,
+    carry: Option<&BTreeSet<BlockId>>,
+    old: impl FnMut(&BlockId) -> Option<Leaf>,
+) -> Flow {
+    let mut walk = Walk { types, carry, old, out: Flow::default(), pad: 0.0, breaks: false, root: 0 };
     walk.place(&doc.blocks, 0.0, width, None, false);
     walk.out
 }
 
 struct Walk<'a, F> {
     types: &'a Types,
-    reuse: F,
+    carry: Option<&'a BTreeSet<BlockId>>,
+    old: F,
     out: Flow,
     /// Padding of frames opened since the last leaf, which the next leaf carries above it.
     pad: f32,
@@ -362,7 +444,25 @@ struct Walk<'a, F> {
     root: usize,
 }
 
-impl<F: FnMut(&Block) -> Option<Leaf>> Walk<'_, F> {
+impl<F: FnMut(&BlockId) -> Option<Leaf>> Walk<'_, F> {
+    /// The leaf `block` had, when it is still the kind of block it was, and otherwise a new one that shows
+    /// `what`. Also says whether the leaf is the old one.
+    fn leaf(&mut self, block: &Block, what: What) -> (Leaf, bool) {
+        let old = self.carry.and_then(|_| (self.old)(&block.id));
+        match old.filter(|old| old.kind.as_ref() == Some(&block.kind) && old.what == what) {
+            Some(old) => (old, true),
+            None => {
+                let (id, kind) = (Some(block.id.clone()), Some(block.kind.clone()));
+                (Leaf { id, kind, what, ..Leaf::default() }, false)
+            }
+        }
+    }
+
+    /// Whether a text read from `block` when the column was last built may no longer be its text.
+    fn changed(&self, block: &BlockId) -> bool {
+        self.carry.is_none_or(|changed| changed.contains(block))
+    }
+
     fn place(&mut self, blocks: &[Block], x: f32, width: f32, frame: Option<usize>, quoted: bool) {
         let unit = self.types.get(Role::Body).after;
         let prose = if quoted { Role::Quote } else { Role::Body };
@@ -385,7 +485,7 @@ impl<F: FnMut(&Block) -> Option<Leaf>> Walk<'_, F> {
             };
             let of = self.types.get(role);
             let (before, after) = match &block.kind {
-                BlockKind::Quote => (unit, unit),
+                BlockKind::Quote | BlockKind::Formula => (unit, unit),
                 BlockKind::Callout { .. } => ((unit * 1.5).round(), (unit * 1.5).round()),
                 BlockKind::Divider => (unit * 2.0, unit * 2.0),
                 BlockKind::Code { .. } | BlockKind::Unknown { .. } => (of.before.max(of.after), of.after),
@@ -453,14 +553,20 @@ impl<F: FnMut(&Block) -> Option<Leaf>> Walk<'_, F> {
                     self.push(Leaf { id, what: What::Rule, ..Leaf::default() }, x, width, gap, frame);
                 }
                 BlockKind::Unknown { type_name } => {
-                    let (id, text) = (Some(block.id.clone()), format!("Unsupported block: {type_name}"));
-                    self.push(Leaf { id, what: What::Label, role, text, ..Leaf::default() }, x, width, gap, frame);
+                    let words = Words::plain(format!("Unsupported block: {type_name}"));
+                    let leaf = Leaf { id: Some(block.id.clone()), what: What::Label, role, words, ..Leaf::default() };
+                    self.push(leaf, x, width, gap, frame);
                 }
                 _ => {
-                    let mut leaf = match (self.reuse)(block) {
-                        Some(old) if old.kind.as_ref() == Some(&block.kind) => old,
-                        _ => Leaf::of(block),
-                    };
+                    let what = if block.kind == BlockKind::Formula { What::Formula } else { What::Text };
+                    let (mut leaf, kept) = self.leaf(block, what);
+                    if !kept || self.changed(&block.id) {
+                        let before = leaf.set_content(block);
+                        if kept {
+                            self.out.retexted.push((block.id.clone(), before));
+                        }
+                        (leaf.exact, leaf.laid) = (false, None);
+                    }
                     if leaf.role != role {
                         leaf.exact = false;
                     }

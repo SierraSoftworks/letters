@@ -16,6 +16,10 @@
 //!
 //! Pages exist only on request: [`DocLayout::paginate`] splits the same column into sheets for Print view
 //! and export, and typing never pays for it.
+//!
+//! A position is a block and a byte offset in its text, as the model has it. Some text is not drawn as it is
+//! written: a formula is typeset in place of its TeX, so every offset inside the source is at the formula's
+//! right edge. While the caret is in a formula, its source shows instead. See [`DocLayout::reveal`].
 
 mod engine;
 mod flow;
@@ -35,12 +39,12 @@ use std::ops::Range;
 
 use letters_model::{BlockId, Body, Change, Document, Markers, Page, Pos, Selection, Style};
 use letters_render::{DisplayList, Font, Item, Point, Rect};
-use parley::{Language, Layout};
+use parley::Language;
 
 use crate::engine::Engine;
 use crate::flow::{Frame, Leaf, Look, Role, Types, What};
 use crate::ink::{Brush, Ink, Inks};
-use crate::leaf::{Over, Painter};
+use crate::leaf::{Extent, Laid, Over, Painter, Set, Source, Text};
 use crate::reveal::{Reveal, Shapes, Shifts};
 
 pub use crate::paginate::{Heading, PageLink, Pages, Sheet};
@@ -112,7 +116,8 @@ impl DocLayout {
             pending: 0,
             held: 0,
             clock: 0,
-            scratch: Layout::new(),
+            open: None,
+            scratch: Set::default(),
         };
         Self { state: RefCell::new(state) }
     }
@@ -140,7 +145,7 @@ impl DocLayout {
 
     /// Shows the Markdown markers around the caret: `at` is the caret and what the editor's `markers()`
     /// gives for it, or `None` to show none. Call it after every call to the editor, since markers change
-    /// while the caret stays put. Returns whether a marker appears or goes.
+    /// while the caret stays put. Returns whether a marker appears or goes, or a formula opens or closes.
     ///
     /// Markers never change the layout. One inside a line pushes the rest of that line aside, past the text
     /// edge when the line is full, and no other line moves. A heading's hangs left of the text edge, or as
@@ -148,6 +153,10 @@ impl DocLayout {
     /// callout's sits in the corner of its box. [`DocLayout::caret`], [`DocLayout::hit`] and the other
     /// queries answer for the page as drawn, so a caret among markers at its offset sits after the first
     /// `before_caret` of them.
+    ///
+    /// A formula is the one thing that is laid out again. While the caret is in it or at either end of it,
+    /// its TeX shows in its place, written as code, with the editor's markers around it like any others.
+    /// It is typeset again when the caret leaves, or with `None`.
     ///
     /// A change is shown at once. To animate it, see [`DocLayout::set_reveal_progress`].
     pub fn reveal(&mut self, at: Option<(&Pos, &Markers)>) -> bool {
@@ -168,6 +177,12 @@ impl DocLayout {
     /// is laid out again.
     pub fn set_margin(&mut self, margin: f32) {
         self.state.get_mut().margin = margin.max(0.0);
+    }
+
+    /// Lets formulas link, as `\\href` asks. Off until set, and only a document that is trusted may have it on.
+    /// Formulas are set again, since one that links may be drawn another way.
+    pub fn set_maths_links(&mut self, links: bool) {
+        self.state.get_mut().set_maths_links(links);
     }
 
     /// Underlines the text an input method is composing: a block and a byte range in it, as the editor's
@@ -214,6 +229,9 @@ impl DocLayout {
     /// after it. A block splits between pages only where two of its lines stay and two go, and a line of
     /// code never splits. Only something taller than a page breaks these rules.
     ///
+    /// A formula that shows its source for the caret is paged, and painted, as that source. For an export,
+    /// show no caret first: [`DocLayout::reveal`] with `None`.
+    ///
     /// This is a pass over the heights of lines and shapes nothing, so it is cheap to run again after an
     /// edit. It first lays out whatever is still estimated, which on a long document that was never
     /// settled takes as long as settling it.
@@ -256,6 +274,13 @@ impl DocLayout {
     /// Where a caret at `pos` is drawn. An offset where a line wraps belongs to the start of the next line.
     pub fn caret(&self, pos: &Pos) -> Option<Rect> {
         self.state.borrow_mut().caret(pos)
+    }
+
+    /// Where the formula at `pos` is drawn: the one `pos` is in or beside, in a line of text or as a block of
+    /// its own. `None` when `pos` is at no formula. One that shows as its source, because the caret is in it
+    /// or it cannot be typeset, has the place of that text.
+    pub fn formula_rect(&self, pos: &Pos) -> Option<Rect> {
+        self.state.borrow_mut().formula_rect(pos)
     }
 
     /// The rectangles that highlight a selection, one per line it touches.
@@ -304,7 +329,7 @@ struct State {
     width: f32,
     leaves: Vec<Leaf>,
     frames: Vec<Frame>,
-    /// Text leaves by block.
+    /// The leaves that hold a block's text, by block.
     index: HashMap<BlockId, usize>,
     /// The tokens of code blocks.
     tokens: HashMap<BlockId, Vec<Token>>,
@@ -326,7 +351,10 @@ struct State {
     held: usize,
     /// Counts queries, to tell which layouts were used last.
     clock: u64,
-    scratch: Layout<Brush>,
+    /// The formula whose source shows in its place: its block, and which of the block's formulas it is.
+    open: Option<(BlockId, usize)>,
+    /// A layout to measure with, so that measuring allocates nothing.
+    scratch: Set,
 }
 
 impl State {
@@ -367,22 +395,18 @@ impl State {
             let Some(&at) = self.index.get(id) else { return false };
             let leaf = &mut self.leaves[at];
             let Some(block) = doc.blocks.get(leaf.root).and_then(|root| flow::find(root, id)) else { return false };
-            if leaf.kind.as_ref() != Some(&block.kind) || !matches!(block.body, Body::Text(_)) {
+            // A block of another kind changes the column's shape. Whether a page starts at a block is decided
+            // where the column is built.
+            let kept = leaf.kind.as_ref() == Some(&block.kind) && flow::breaks(block) == leaf.breaks;
+            if !kept || !matches!(block.body, Body::Text(_)) {
                 return false;
             }
-            // Whether a page starts here is decided where the column is built.
-            if flow::breaks(block) != leaf.breaks {
-                return false;
+            let before = leaf.set_content(block);
+            if let Some(tokens) = self.tokens.get_mut(id) {
+                tokens::follow(tokens, &before, &leaf.words.text);
             }
-            let (tokens, spelling) = (self.tokens.get_mut(id), self.spelling.get_mut(id));
-            // Only what follows the text needs to know what the text was.
-            let before = if tokens.is_some() || spelling.is_some() { leaf.text.clone() } else { String::new() };
-            leaf.set_content(block);
-            if let Some(tokens) = tokens {
-                tokens::follow(tokens, &before, &leaf.text);
-            }
-            if let Some(spelling) = spelling {
-                tokens::follow_ranges(spelling, &before, &leaf.text);
+            if let Some(spelling) = self.spelling.get_mut(id) {
+                tokens::follow_ranges(spelling, &before, &leaf.words.text);
             }
             if leaf.laid.take().is_some() {
                 self.held -= 1;
@@ -399,34 +423,37 @@ impl State {
     fn reflow(&mut self, doc: &Document, carry: Option<&Change>) {
         let mut old = std::mem::take(&mut self.leaves);
         let mut index = std::mem::take(&mut self.index);
-        let (tokens, spelling) = (&mut self.tokens, &mut self.spelling);
-        let flow = flow::flow(doc, &self.types, self.width, |block| {
-            let (change, at) = (carry?, *index.get(&block.id)?);
-            if change.blocks.contains(&block.id) {
-                if let Some(tokens) = tokens.get_mut(&block.id) {
-                    tokens::follow(tokens, &old[at].text, &block.plain_text());
-                }
-                if let Some(spelling) = spelling.get_mut(&block.id) {
-                    tokens::follow_ranges(spelling, &old[at].text, &block.plain_text());
-                }
-                return None;
-            }
-            Some(std::mem::take(&mut old[at]))
+        let flow = flow::flow(doc, &self.types, self.width, carry.map(|change| &change.blocks), |block| {
+            index.get(block).map(|at| std::mem::take(&mut old[*at]))
         });
         (self.leaves, self.frames) = (flow.leaves, flow.frames);
         index.clear();
         for (at, leaf) in self.leaves.iter().enumerate() {
-            if let (What::Text, Some(id)) = (leaf.what, &leaf.id) {
+            if let (true, Some(id)) = (leaf.holds(), &leaf.id) {
                 index.insert(id.clone(), at);
             }
         }
         self.index = index;
+        for (id, before) in &flow.retexted {
+            let Some(after) = self.index.get(id).map(|at| &self.leaves[*at].words.text) else { continue };
+            if let Some(tokens) = self.tokens.get_mut(id) {
+                tokens::follow(tokens, before, after);
+            }
+            if let Some(spelling) = self.spelling.get_mut(id) {
+                tokens::follow_ranges(spelling, before, after);
+            }
+        }
         let coded = |id: &BlockId| self.index.get(id).is_some_and(|at| self.leaves[*at].role == Role::Code);
         self.tokens.retain(|id, tokens| coded(id) && !tokens.is_empty());
         self.spelling.retain(|id, ranges| self.index.contains_key(id) && !ranges.is_empty());
+        self.recount();
+        self.stale = 0;
+    }
+
+    /// Counts the leaves whose height is a guess and those that hold a layout.
+    fn recount(&mut self) {
         self.pending = self.leaves.iter().filter(|leaf| !leaf.exact).count();
         self.held = self.leaves.iter().filter(|leaf| leaf.laid.is_some()).count();
-        self.stale = 0;
     }
 
     fn set_spelling(&mut self, block: &BlockId, mut ranges: Vec<Range<usize>>) {
@@ -439,26 +466,62 @@ impl State {
         }
     }
 
+    fn set_maths_links(&mut self, links: bool) {
+        if std::mem::replace(&mut self.engine.links, links) != links {
+            // A formula may be another size now. Formulas are few, so everything is set again.
+            for leaf in &mut self.leaves {
+                (leaf.exact, leaf.laid) = (false, None);
+            }
+            self.recount();
+        }
+    }
+
     fn reveal(&mut self, at: Option<(&Pos, &Markers)>) -> bool {
         // Markers are few, so this only guards against a caller that makes up new ones without end.
         if self.shapes.len() > 64 {
             self.shapes.clear();
         }
-        self.reveal.set(at)
+        // The formula the caret is in or beside shows its source, and the one it has left is typeset again.
+        let formula = |caret: &Pos| {
+            Some((caret.block.clone(), self.leaves[*self.index.get(&caret.block)?].formula(caret.offset)?.0))
+        };
+        let open = at.and_then(|(caret, _)| formula(caret));
+        let reset = open != self.open;
+        if reset {
+            for (block, _) in [self.open.take(), open.clone()].into_iter().flatten() {
+                if let Some(&at) = self.index.get(&block) {
+                    self.unlay(at);
+                }
+            }
+            self.open = open;
+        }
+        self.reveal.set(at) | reset
+    }
+
+    /// Drops a leaf's layout, so that it is laid out again when next needed. Its height stays as the
+    /// estimate until then, so nothing jumps.
+    fn unlay(&mut self, at: usize) {
+        let leaf = &mut self.leaves[at];
+        if leaf.laid.take().is_some() {
+            self.held -= 1;
+        }
+        if std::mem::take(&mut leaf.exact) {
+            self.pending += 1;
+        }
     }
 
     /// The markers revealed in a leaf that holds its layout.
     fn shifts(&mut self, at: usize) -> Shifts {
         let Self { reveal, shapes, engine, types, leaves, frames, margin, .. } = self;
         let leaf = &leaves[at];
-        let (Some(id), Some(laid)) = (&leaf.id, &leaf.laid) else { return Shifts::default() };
+        let (Some(id), Some(text)) = (&leaf.id, Text::of(leaf)) else { return Shifts::default() };
         // Code shows its text as written.
-        if leaf.what != What::Text || leaf.role == Role::Code {
+        if !leaf.holds() || leaf.role == Role::Code {
             return Shifts::default();
         }
         // Inside a quote or callout a marker hangs clear of the bar down its side, never across it.
         let room = leaf.frame.map_or(*margin + leaf.x, |frame| leaf.x - frames[frame].x - theme::BAR - 2.0);
-        reveal.over(id, &laid.text, room, |text| shapes.get(engine, types, leaf.role, false, text))
+        reveal.over(id, text.set, room, |text| shapes.get(engine, types, leaf.role, false, text))
     }
 
     fn set_tokens(&mut self, block: &BlockId, mut tokens: Vec<Token>) {
@@ -495,9 +558,10 @@ impl State {
         if self.held >= KEPT {
             self.evict();
         }
-        let laid = leaf::lay(&mut self.engine, &self.types, &self.leaves[at], self.locale);
-        self.set_extent(at, leaf::height(&laid.text), leaf::lines(&laid.text, self.leaves[at].role == Role::Code));
-        self.leaves[at].laid = Some(Box::new(laid));
+        let mut laid = Box::<Laid>::default();
+        self.shape(at, &mut laid.text);
+        laid.sign = leaf::sign(&mut self.engine, &self.types, &self.leaves[at]);
+        self.leaves[at].laid = Some(laid);
         self.held += 1;
     }
 
@@ -506,15 +570,22 @@ impl State {
         if self.leaves[at].exact {
             return;
         }
-        leaf::shape(&mut self.engine, &self.types, &self.leaves[at], self.locale, &mut self.scratch);
-        let lines = leaf::lines(&self.scratch, self.leaves[at].role == Role::Code);
-        self.set_extent(at, leaf::height(&self.scratch), lines);
+        let mut scratch = std::mem::take(&mut self.scratch);
+        self.shape(at, &mut scratch);
+        self.scratch = scratch;
     }
 
-    /// Records what a layout says of a leaf: its height, and the lines pagination may split it at.
-    fn set_extent(&mut self, at: usize, height: f32, (lines, joined): (u32, Vec<u32>)) {
+    /// Shapes a leaf's text into `set`, and records what it says of the leaf: its height, and the lines
+    /// pagination may split it at.
+    fn shape(&mut self, at: usize, set: &mut Set) {
+        let Self { engine, types, leaves, palette, locale, open, .. } = self;
+        let leaf = &leaves[at];
+        let open = open.as_ref().filter(|(block, _)| leaf.id.as_ref() == Some(block)).map(|(_, which)| *which);
+        let source = Source::of(leaf, types, open, ink::of(types, palette, leaf.role));
+        leaf::shape(engine, types, &source, *locale, set);
+        let Extent { height, lines, ends, joined } = leaf::extent(leaf, set);
         let leaf = &mut self.leaves[at];
-        (leaf.lines, leaf.joined) = (lines, joined);
+        (leaf.lines, leaf.ends, leaf.joined) = (lines, ends, joined);
         if !std::mem::replace(&mut leaf.exact, true) {
             self.pending -= 1;
         }
@@ -605,26 +676,29 @@ impl State {
         for at in first..end {
             // A viewport taller than the cache holds has dropped its first layouts by now.
             self.lay(at);
-            let shifts = if print { Shifts::default() } else { self.shifts(at) };
-            let Self { engine, types, leaves, tokens, spelling, shapes, composition, .. } = self;
-            let leaf = &leaves[at];
+            let leaf = &self.leaves[at];
             if leaf.what == What::Rule {
                 let rect = Rect::new(leaf.x, leaf.y, leaf.width, leaf.height);
                 out.push(Item::Fill { rect, color: palette.line, radius: 0.0 });
-            } else if let Some(laid) = &leaf.laid {
-                let tokens = leaf.id.as_ref().and_then(|id| tokens.get(id));
-                let own = |id: &&BlockId| !print && leaf.id.as_ref() == Some(*id);
-                let composing = composition.as_ref().filter(|(block, _)| own(&block)).map(|(_, range)| range.clone());
-                let spelling = leaf.id.as_ref().filter(own).and_then(|id| spelling.get(id));
-                let spelling = spelling.map_or(&[][..], Vec::as_slice);
-                let over = Over { shifts: &shifts, shapes, composing, spelling };
-                Painter { engine, types, inks: &inks, band, spelt: print, out }.leaf(
-                    leaf,
-                    laid,
-                    tokens.map(Vec::as_slice),
-                    &over,
-                );
+                continue;
             }
+            let shifts = if print { Shifts::default() } else { self.shifts(at) };
+            let Self { engine, types, leaves, tokens, spelling, shapes, composition, .. } = self;
+            let leaf = &leaves[at];
+            let Some(laid) = &leaf.laid else { continue };
+            // What belongs to editing is found by the block the text is of.
+            let block = leaf.id.as_ref().filter(|_| !print);
+            let own = |id: &BlockId| block == Some(id);
+            let composing = composition.as_ref().filter(|(block, _)| own(block)).map(|(_, range)| range.clone());
+            let spelling = block.and_then(|id| spelling.get(id)).map_or(&[][..], Vec::as_slice);
+            let over = Over { shifts: &shifts, shapes, composing, spelling };
+            let tokens = leaf.id.as_ref().and_then(|id| tokens.get(id));
+            Painter { engine, types, inks: &inks, band, spelt: print, out }.leaf(
+                leaf,
+                laid,
+                tokens.map(Vec::as_slice),
+                &over,
+            );
         }
     }
 
@@ -665,17 +739,17 @@ impl State {
         }
         // The page number sits in the middle of the margin beneath the text, if the margin has room for it.
         let Self { engine, types, scratch, palette, .. } = self;
-        let label = (index + 1).to_string();
+        let (label, number) = ((index + 1).to_string(), &mut scratch.layout);
         let spec = types.get(Role::Caption).spec(false, Brush { ink: Ink::Style(Role::Caption), back: None });
-        engine.build(&label, &[spec], &[(0, 0..label.len())], None, scratch);
-        scratch.break_all_lines(None);
+        engine.build(&label, &[spec], &[(0, 0..label.len())], None, number);
+        number.break_all_lines(None);
         let (below, foot) = (area.y + area.height, pages.height - area.y - area.height);
-        if foot >= scratch.height() {
-            let x = area.x + (area.width - scratch.full_width()) / 2.0;
-            let at = Point { x: x.round(), y: below + ((foot - scratch.height()) / 2.0).round() };
+        if foot >= number.height() {
+            let x = area.x + (area.width - number.full_width()) / 2.0;
+            let at = Point { x: x.round(), y: below + ((foot - number.height()) / 2.0).round() };
             let inks = Inks::new(types, *palette);
             Painter { engine, types, inks: &inks, band: (f32::MIN, f32::MAX), spelt: true, out }
-                .glyphs(scratch, &label, at);
+                .glyphs(number, &label, at);
         }
     }
 
@@ -683,7 +757,7 @@ impl State {
         let at = *self.index.get(&pos.block)?;
         self.clock += 1;
         self.lay(at);
-        let line = leaf::line_of(self.leaves[at].laid.as_ref()?, pos.offset);
+        let line = leaf::line_of(Text::of(&self.leaves[at])?.set, pos.offset);
         pages.sheets.partition_point(|sheet| sheet.first <= (at, line)).checked_sub(1)
     }
 
@@ -693,16 +767,16 @@ impl State {
         self.clock += 1;
         self.place_all();
         for (block, lines) in &sheet.blocks {
-            let Some(&at) = self.index.get(block).filter(|at| !self.leaves[**at].links.is_empty()) else { continue };
+            let linked = |at: &&usize| !self.leaves[**at].words.links.is_empty();
+            let Some(&at) = self.index.get(block).filter(linked) else { continue };
             self.lay(at);
-            let leaf = &self.leaves[at];
-            let Some(laid) = &leaf.laid else { continue };
-            for (range, target) in &leaf.links {
-                leaf::stretches(laid, range, &Shifts::default(), |line, x, width| {
-                    let Some(shown) = laid.text.get(line).filter(|_| lines.contains(&line)) else { return };
-                    let (top, bottom) = (shown.metrics().block_min_coord, shown.metrics().block_max_coord);
-                    let rect = Rect::new(origin.x + leaf.x + x, origin.y + leaf.y + top, width, bottom - top);
-                    links.push(PageLink { rect, target: target.clone() });
+            let Some(text) = Text::of(&self.leaves[at]) else { continue };
+            for (range, target) in &text.source.links {
+                leaf::stretches(text.set, range, &Shifts::default(), |line, part| {
+                    if lines.contains(&line) {
+                        let (x, y) = (origin.x + text.at.x + part.x, origin.y + text.at.y + part.y);
+                        links.push(PageLink { rect: Rect { x, y, ..part }, target: target.clone() });
+                    }
                 });
             }
         }
@@ -717,9 +791,10 @@ impl State {
             // A heading is listed where it starts.
             for (block, _) in sheet.blocks.iter().filter(|(_, lines)| lines.start == 0) {
                 let Some(leaf) = self.index.get(block).map(|at| &self.leaves[*at]) else { continue };
-                let Some(level) = leaf.role.level().filter(|_| !leaf.text.trim().is_empty()) else { continue };
+                let title = &leaf.words.text;
+                let Some(level) = leaf.role.level().filter(|_| !title.trim().is_empty()) else { continue };
                 let at = Point { x: origin.x + leaf.x, y: origin.y + leaf.y };
-                headings.push(Heading { block: block.clone(), title: leaf.text.clone(), level, page, at });
+                headings.push(Heading { block: block.clone(), title: title.clone(), level, page, at });
             }
         }
         headings
@@ -729,10 +804,9 @@ impl State {
         self.clock += 1;
         self.place_all();
         let at = self.leaves.partition_point(|leaf| leaf.y + leaf.height < point.y);
-        // The nearest leaf that holds text, above or below.
-        let text = |leaf: &Leaf| leaf.what == What::Text;
-        let below = self.leaves.get(at..).and_then(|rest| rest.iter().position(text)).map(|skip| at + skip);
-        let above = self.leaves[..at.min(self.leaves.len())].iter().rposition(text);
+        // The nearest leaf that a position can be in, above or below.
+        let below = self.leaves.get(at..).and_then(|rest| rest.iter().position(Leaf::holds)).map(|skip| at + skip);
+        let above = self.leaves[..at.min(self.leaves.len())].iter().rposition(Leaf::holds);
         let at = match (above, below) {
             (Some(above), Some(below)) => {
                 let gap_above = point.y - (self.leaves[above].y + self.leaves[above].height);
@@ -741,9 +815,14 @@ impl State {
             (above, below) => above.or(below)?,
         };
         self.lay(at);
+        self.find(at, |text, shifts| leaf::hit(text, shifts, point))
+    }
+
+    /// A position in a laid leaf, at the offset `offset` gives.
+    fn find(&mut self, at: usize, offset: impl FnOnce(&Text<'_>, &Shifts) -> usize) -> Option<Pos> {
         let shifts = self.shifts(at);
         let leaf = &self.leaves[at];
-        let offset = leaf::hit(leaf.laid.as_ref()?, &shifts, point.x - leaf.x, point.y - leaf.y);
+        let offset = offset(&Text::of(leaf)?, &shifts);
         Some(Pos { block: leaf.id.clone()?, offset })
     }
 
@@ -753,14 +832,26 @@ impl State {
         self.lay(at);
         self.place(at);
         let shifts = self.shifts(at);
+        Some(leaf::caret(&Text::of(&self.leaves[at])?, &shifts, pos.offset))
+    }
+
+    fn formula_rect(&mut self, pos: &Pos) -> Option<Rect> {
+        let at = *self.index.get(&pos.block)?;
+        let (_, source) = self.leaves[at].formula(pos.offset)?;
+        self.clock += 1;
+        self.lay(at);
+        self.place(at);
+        let shifts = self.shifts(at);
         let leaf = &self.leaves[at];
-        Some(leaf::caret(leaf, leaf.laid.as_ref()?, &shifts, pos.offset))
+        // A formula block with nothing written in it still has its place.
+        let whole = || Rect::new(leaf.x, leaf.y, leaf.width, leaf.height);
+        leaf::formula_at(&Text::of(leaf)?, &shifts, &source).or_else(|| (leaf.what == What::Formula).then(whole))
     }
 
     fn selection(&mut self, selection: &Selection, viewport: Option<Rect>) -> Vec<Rect> {
         let mut rects = Vec::new();
-        let ends = [&selection.anchor, &selection.head].map(|pos| Some((*self.index.get(&pos.block)?, pos.offset)));
-        let [Some(anchor), Some(head)] = ends else { return rects };
+        let end = |pos: &Pos| self.index.get(&pos.block).map(|at| (*at, pos.offset));
+        let (Some(anchor), Some(head)) = (end(&selection.anchor), end(&selection.head)) else { return rects };
         let (from, to) = (anchor.min(head), anchor.max(head));
         if from == to {
             return rects;
@@ -774,17 +865,16 @@ impl State {
             if self.leaves[at].span().0 >= band.1 {
                 break;
             }
-            if self.leaves[at].what != What::Text {
+            if !self.leaves[at].holds() {
                 continue;
             }
             self.lay(at);
             let shifts = self.shifts(at);
-            let leaf = &self.leaves[at];
-            let Some(laid) = &leaf.laid else { continue };
-            let len = leaf.text.len();
+            let Some(text) = Text::of(&self.leaves[at]) else { continue };
+            let len = text.source.text.len();
             let start = if at == from.0 { from.1.min(len) } else { 0 };
             let end = if at == to.0 { to.1.min(len) } else { len };
-            leaf::selection(leaf, laid, &shifts, start..end, at != to.0, &mut rects);
+            leaf::selection(&text, &shifts, start..end, at != to.0, &mut rects);
         }
         rects
     }
@@ -793,36 +883,33 @@ impl State {
         let at = *self.index.get(&pos.block)?;
         self.clock += 1;
         self.lay(at);
-        let shifts = self.shifts(at);
-        let leaf = &self.leaves[at];
-        let laid = leaf.laid.as_ref()?;
-        let line = leaf::line_of(laid, pos.offset);
-        let within = if down { Some(line + 1).filter(|next| *next < laid.text.len()) } else { line.checked_sub(1) };
-        if let Some(line) = within {
-            return Some(Pos { block: pos.block.clone(), offset: leaf::on_line(laid, &shifts, line, x - leaf.x) });
+        let text = Text::of(&self.leaves[at])?;
+        let (line, lines) = (leaf::line_of(text.set, pos.offset), text.set.layout.len());
+        match if down { Some(line + 1).filter(|next| *next < lines) } else { line.checked_sub(1) } {
+            Some(line) => self.find(at, |text, shifts| leaf::on_line(text, shifts, line, x)),
+            None => {
+                // Off this leaf's edge: the nearest line of the next leaf that a position can be in.
+                let at = match down {
+                    true => at + 1 + self.leaves[at + 1..].iter().position(Leaf::holds)?,
+                    false => self.leaves[..at].iter().rposition(Leaf::holds)?,
+                };
+                self.lay(at);
+                self.find(at, |text, shifts| {
+                    let line = if down { 0 } else { text.set.layout.len().saturating_sub(1) };
+                    leaf::on_line(text, shifts, line, x)
+                })
+            }
         }
-        // Off this block's edge: the nearest line of the next block that holds text.
-        let text = |leaf: &Leaf| leaf.what == What::Text;
-        let at = match down {
-            true => at + 1 + self.leaves[at + 1..].iter().position(text)?,
-            false => self.leaves[..at].iter().rposition(text)?,
-        };
-        self.lay(at);
-        let shifts = self.shifts(at);
-        let leaf = &self.leaves[at];
-        let laid = leaf.laid.as_ref()?;
-        let line = if down { 0 } else { laid.text.len().saturating_sub(1) };
-        Some(Pos { block: leaf.id.clone()?, offset: leaf::on_line(laid, &shifts, line, x - leaf.x) })
     }
 
     fn line_edge(&mut self, pos: &Pos, end: bool) -> Option<Pos> {
         let at = *self.index.get(&pos.block)?;
         self.clock += 1;
         self.lay(at);
-        let laid = self.leaves[at].laid.as_ref()?;
+        let text = Text::of(&self.leaves[at])?;
         // Far off either side, which no marker reaches.
         let x = if end { f32::MAX } else { f32::MIN };
-        let offset = leaf::on_line(laid, &Shifts::default(), leaf::line_of(laid, pos.offset), x);
+        let offset = leaf::on_line(&text, &Shifts::default(), leaf::line_of(text.set, pos.offset), x);
         Some(Pos { block: pos.block.clone(), offset })
     }
 
@@ -838,7 +925,7 @@ impl State {
             }
             for at in [next_below, next_above].into_iter().flatten() {
                 // A short block still costs something to set up.
-                left = left.saturating_sub(self.leaves[at].text.len() + 64);
+                left = left.saturating_sub(self.leaves[at].words.text.len() + 64);
                 self.measure(at);
             }
             below = next_below.map_or(self.leaves.len(), |at| at + 1);

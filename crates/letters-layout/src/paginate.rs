@@ -1,8 +1,8 @@
 //! Splits the column into the pages of Print view and export.
 //!
-//! Pagination is a pass over leaves that are already laid out. Every line of a leaf is as tall as the next, so
-//! the pass shapes no text: it only decides before which lines a page starts. A page then shows a band of
-//! the column, cut between lines.
+//! Pagination is a pass over leaves that are already laid out. Each knows how many lines it has and where
+//! they end, so the pass shapes no text: it only decides before which lines a page starts. A page then shows
+//! a band of the column, cut between lines.
 
 use std::ops::Range;
 
@@ -117,10 +117,9 @@ pub(crate) fn sheets(leaves: &[Leaf], frames: &[Frame], room: f32) -> Vec<Sheet>
         }
 
         let count = leaf.lines.max(1) as usize;
-        let line = leaf.height / count as f32;
-        let fits = (((limit - leaf.y) / line).floor().max(0.0) as usize).min(count);
+        let fits = leaf.lines_in(limit - leaf.y);
         let free = |before: &usize| leaf.joined.binary_search(&(*before as u32)).is_err();
-        let cut = |before: usize| Cut { leaf: at, line: before, y: leaf.y + before as f32 * line };
+        let cut = |before: usize| Cut { leaf: at, line: before, y: leaf.y + leaf.line_top(before) };
         let stay = from + if from == 0 { TOGETHER } else { 1 };
         if let Some(before) = (stay..=fits.min(count.saturating_sub(TOGETHER))).rev().find(free) {
             cuts.push(cut(before));
