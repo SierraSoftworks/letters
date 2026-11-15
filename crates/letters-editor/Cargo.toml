@@ -13,8 +13,10 @@ workspace = true
 
 [dependencies]
 letters-convert.workspace = true
+letters-layout.workspace = true
 letters-model.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 unicode-segmentation.workspace = true
 
 [dev-dependencies]

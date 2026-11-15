@@ -8,6 +8,7 @@
 
 mod clipboard;
 mod edit;
+mod figures;
 mod input;
 mod keymap;
 mod markers;
@@ -27,6 +28,7 @@ use letters_model::{
     Selection, Style, TextStyle,
 };
 
+pub use figures::Spot;
 pub use keymap::Keymap;
 /// The markers [`Editor::markers`] returns. They live in the model so that layout can draw them.
 pub use letters_model::{Marker, Markers};
@@ -147,6 +149,36 @@ pub enum Command {
     },
     /// Changes the table the caret is in. [`Editor::cell`] says where in it the caret is.
     Table(TableEdit),
+    /// Puts pictures in: one as a figure, several as a gallery, and the last is left selected. With no
+    /// spot they go below the block the selection ends in, in place of an empty line, or beside the
+    /// selected picture of a gallery. The bytes go to [`Platform::store_asset`], and what is no picture
+    /// Letters can show is left out.
+    InsertFigures {
+        pictures: Vec<Picture>,
+        at: Option<Spot>,
+    },
+    /// Moves the caret's figure, as dragging it does: the one whose picture is selected, or in whose
+    /// caption the caret is. A gallery it leaves with one picture becomes a figure.
+    MoveFigure(Spot),
+    /// Moves the selected picture one place along its gallery.
+    ShiftFigure {
+        right: bool,
+    },
+    /// Sets the size the caret's figure is shown at, in points.
+    ResizeFigure {
+        width: f32,
+        height: f32,
+    },
+    /// Says what the caret's figure shows, for a reader who cannot see it.
+    SetAlt(String),
+    /// Turns the generated label before a caption, such as "Figure 2:", on or off: for the caret's
+    /// figure, or for the gallery it is in.
+    SetNumbered(bool),
+    /// Puts the caret in the caption of the selected picture, as Enter does there. A gallery has one
+    /// caption for all its pictures, which is made when there is none.
+    EditCaption,
+    /// Steps out of a caption, as Esc does: back to the picture it stands under.
+    LeaveCaption,
     Undo,
     Redo,
     SelectAll,
@@ -429,11 +461,16 @@ impl Editor {
         std::mem::take(&mut self.change)
     }
 
-    /// Feeds a key press. Returns `None` when the key means nothing here, so the shell may use it.
+    /// Feeds a key press. Returns `None` when the key means nothing here, so the shell may use it. Of the
+    /// commands a key is bound to, the first that has something to act on runs.
     pub fn key(&mut self, event: KeyEvent, platform: &mut dyn Platform) -> Option<Change> {
-        let command = self.keymap.command(&event)?.clone();
+        let commands: Vec<Command> = self.keymap.commands(&event).cloned().collect();
+        if commands.is_empty() {
+            return None;
+        }
         self.date(platform);
-        self.exec(command, platform).then(|| std::mem::take(&mut self.change))
+        let ran = commands.into_iter().any(|command| self.exec(command, platform));
+        ran.then(|| std::mem::take(&mut self.change))
     }
 
     pub fn run(&mut self, command: Command, platform: &mut dyn Platform) -> Change {
@@ -455,7 +492,8 @@ impl Editor {
             return match command {
                 Command::Undo => self.can_undo(),
                 Command::Redo => self.can_redo(),
-                Command::Paste | Command::PastePlain | Command::LineBelow | Command::InsertTable { .. } => true,
+                Command::Paste | Command::PastePlain | Command::LineBelow => true,
+                Command::InsertTable { .. } | Command::InsertFigures { .. } => true,
                 // The style and the document's own fields are there whether or not there is text.
                 Command::SetStyle { .. } | Command::SetPage(_) | Command::ReplaceStyle(_) => true,
                 Command::SetLanguage(_) | Command::AddWord(_) | Command::RemoveWord(_) => true,
@@ -479,6 +517,11 @@ impl Editor {
             Command::Copy | Command::Cut => ranged || caret.picture,
             Command::LeaveFormula => self.formula().is_some(),
             Command::Table(_) => self.cell().is_some(),
+            Command::MoveFigure(_) | Command::ResizeFigure { .. } | Command::SetAlt(_) => self.subject().is_some(),
+            Command::ShiftFigure { .. } => caret.picture && self.member(&caret.selection.head.block),
+            Command::SetNumbered(_) => self.numbered_by(&caret.selection.head.block).is_some(),
+            Command::EditCaption => caret.picture,
+            Command::LeaveCaption => self.captioned().is_some(),
             Command::Undo => self.can_undo(),
             Command::Redo => self.can_redo(),
             _ => true,
@@ -515,6 +558,19 @@ impl Editor {
             Command::ToggleChecked => self.toggle_checked(),
             Command::InsertTable { rows, columns } => self.insert_table(rows, columns, platform),
             Command::Table(edit) => self.table_edit(edit, platform),
+            Command::InsertFigures { pictures, at } => self.insert_figures(&pictures, at.as_ref(), platform),
+            Command::MoveFigure(spot) => self.move_figure(&spot, platform),
+            Command::ShiftFigure { right } => self.shift_figure(right, platform),
+            Command::ResizeFigure { width, height } => self.resize_figure(width, height),
+            Command::SetAlt(alt) => self.set_alt(alt),
+            Command::SetNumbered(on) => {
+                let holder = self.selection().and_then(|selection| self.numbered_by(&selection.head.block));
+                if let Some(holder) = holder.map(|holder| holder.id.clone()) {
+                    self.set_numbered(&holder, on);
+                }
+            }
+            Command::EditCaption => self.edit_caption(platform),
+            Command::LeaveCaption => self.leave_caption(),
             Command::Undo => _ = self.undo_step(),
             Command::Redo => self.redo_step(),
             Command::SelectAll => self.select_all(),

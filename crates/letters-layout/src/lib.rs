@@ -93,6 +93,11 @@ pub fn figure_numbers(doc: &Document) -> Vec<(BlockId, u32)> {
     numbers
 }
 
+/// The word a style gives its figure labels, such as "Figure", for whoever reads a label typed by hand.
+pub fn figure_word(style: &Style) -> &str {
+    flow::figure_word(style)
+}
+
 /// The label layout draws before the caption of the `number`th numbered figure, such as "Figure 2:". The
 /// word is the Caption style's.
 pub fn figure_label(style: &Style, number: u32) -> String {

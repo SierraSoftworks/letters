@@ -244,6 +244,11 @@ impl Editor {
         if !self.ensure_caret(platform) {
             return;
         }
+        if !plain && clip.text.is_empty() && clip.html.is_none() && !clip.pictures.is_empty() {
+            // Pictures alone come in as figures. Beside words they are a rendering of the words.
+            self.delete_selection();
+            return self.insert_figures(&clip.pictures, None, platform);
+        }
         if self.picture().is_some() {
             // A picture is not typed over. What is pasted with one selected goes on a line after it.
             if clip.text.is_empty() && clip.html.is_none() {

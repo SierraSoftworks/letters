@@ -170,6 +170,9 @@ impl Editor {
         let at = |caret: &Caret| caret.selection.is_caret() && !caret.picture;
         let Some(caret) = self.caret.clone().filter(at) else { return false };
         let pos = caret.selection.head;
+        if self.label_rule(&pos) {
+            return true;
+        }
         let doc = self.doc();
         let (Some(block), Some(place)) = (doc.block(&pos.block), self.seat(&pos.block)) else {
             return false;

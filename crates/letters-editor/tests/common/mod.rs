@@ -12,10 +12,11 @@
 //! row that heads its table, after the row it is in: `r1> `, `r2> ` and so on. Consecutive rows are one table.
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use letters_editor::{
-    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Marker, Modifiers, Platform, TableEdit,
+    Clip, Command, Editor, InputEvent, Key, KeyEvent, Keymap, Lines, Marker, Modifiers, Picture, Platform, Spot,
+    TableEdit,
 };
 use letters_model::{
     Align, Block, BlockId, BlockKind, Body, Change, Document, ListKind, Mark, Model, Pos, ReplicaId, Run, Selection,
@@ -47,6 +48,8 @@ pub struct Fake {
     pub wrap: Option<Wrapped>,
     /// What this writer's new ids start with, so that two writers never make the same one.
     pub writer: String,
+    /// The pictures handed over to be kept, by name.
+    pub assets: BTreeMap<String, Vec<u8>>,
     ids: u32,
 }
 
@@ -70,6 +73,14 @@ impl Platform for Fake {
     fn lines(&self) -> Option<&dyn Lines> {
         self.wrap.as_ref().map(|wrap| wrap as &dyn Lines)
     }
+    fn store_asset(&mut self, name: &str, bytes: &[u8]) {
+        self.assets.insert(name.to_owned(), bytes.to_vec());
+    }
+}
+
+/// A picture of so many pixels, as a shell hands one over. `seed` tells one picture's bytes from another's.
+pub fn png(seed: u8, width: u32, height: u32) -> Picture {
+    Picture { bytes: vec![0x89, b'P', b'N', b'G', seed], mime: "image/png".into(), width, height }
 }
 
 /// A layout that wraps every block after `width` bytes, for text of one byte per character.
@@ -568,6 +579,10 @@ pub enum Action {
     Select(usize, usize, usize, usize),
     Input(InputEvent),
     Wait(u64),
+    /// Puts so many pictures in, at the selection or at a spot by a block: beside it, or on a line by it.
+    Figures(usize, Option<(usize, bool, bool)>),
+    /// Moves the caret's figure to a spot by a block.
+    MoveFigure(usize, bool, bool),
 }
 
 pub fn action() -> impl Strategy<Value = Action> {
@@ -646,6 +661,8 @@ pub fn action() -> impl Strategy<Value = Action> {
         "Mod+v",
         "Mod+v",
         "Mod+Shift+v",
+        "Alt+Left",
+        "Alt+Right",
     ]);
     let kinds = prop::sample::select(vec![
         BlockKind::Paragraph,
@@ -668,6 +685,11 @@ pub fn action() -> impl Strategy<Value = Action> {
         Just(Command::RemoveWord("mot".into())),
         Just(Command::SetLanguage("fr".into())),
         Just(Command::InsertTable { rows: 2, columns: 2 }),
+        Just(Command::ShiftFigure { right: true }),
+        Just(Command::ResizeFigure { width: 120.0, height: 90.0 }),
+        Just(Command::SetAlt("boats".into())),
+        any::<bool>().prop_map(Command::SetNumbered),
+        Just(Command::EditCaption),
         prop::sample::select(vec![
             TableEdit::AddRow { below: true },
             TableEdit::AddRow { below: false },
@@ -700,6 +722,9 @@ pub fn action() -> impl Strategy<Value = Action> {
         2 => (0..40usize, 0..24usize, 0..40usize, 0..24usize).prop_map(|(a, b, c, d)| Action::Select(a, b, c, d)),
         1 => inputs.prop_map(Action::Input),
         1 => prop::sample::select(vec![10u64, 2_000]).prop_map(Action::Wait),
+        1 => (1..4usize, prop::option::of((0..40usize, any::<bool>(), any::<bool>())))
+            .prop_map(|(count, spot)| Action::Figures(count, spot)),
+        1 => (0..40usize, any::<bool>(), any::<bool>()).prop_map(|(at, beside, after)| Action::MoveFigure(at, beside, after)),
     ]
 }
 
@@ -710,6 +735,17 @@ pub fn perform(editor: &mut Harness, action: &Action) {
         Action::Run(command) => _ = editor.run(command.clone()),
         Action::Input(event) => _ = editor.input(event.clone()),
         Action::Wait(ms) => editor.platform.now += ms,
+        Action::Figures(count, spot) => {
+            let seed = editor.platform.assets.len() as u8;
+            let pictures = (0..*count as u8).map(|n| png(seed.wrapping_add(n), 400, 300)).collect();
+            let at = spot.and_then(|(at, beside, after)| spot_by(editor, at, beside, after));
+            editor.run(Command::InsertFigures { pictures, at });
+        }
+        Action::MoveFigure(at, beside, after) => {
+            if let Some(spot) = spot_by(editor, *at, *beside, *after) {
+                editor.run(Command::MoveFigure(spot));
+            }
+        }
         Action::Select(a, b, c, d) => {
             let ids: Vec<_> = editor.editor.doc().walk().map(|block| block.id.clone()).collect();
             if !ids.is_empty() {
@@ -718,6 +754,14 @@ pub fn perform(editor: &mut Harness, action: &Action) {
             }
         }
     }
+}
+
+/// A spot by one of the document's blocks, counted in document order and wrapped into range. Any block
+/// will do, since a spot that names nothing a picture can go by is ignored.
+fn spot_by(editor: &Harness, at: usize, beside: bool, after: bool) -> Option<Spot> {
+    let ids: Vec<_> = editor.editor.doc().walk().map(|block| block.id.clone()).collect();
+    let id = ids.get(at % ids.len().max(1))?.clone();
+    Some(if beside { Spot::Beside { figure: id, after } } else { Spot::Line { block: id, below: after } })
 }
 
 /// What must hold after anything one writer does: [`sound`], and the blocks made of parts are whole. Two

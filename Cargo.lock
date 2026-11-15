@@ -2622,9 +2622,11 @@ name = "letters-editor"
 version = "0.1.0"
 dependencies = [
  "letters-convert",
+ "letters-layout",
  "letters-model",
  "proptest",
  "serde_json",
+ "sha2",
  "unicode-segmentation",
 ]
 

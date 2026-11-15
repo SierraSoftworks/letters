@@ -314,6 +314,13 @@ impl Editor {
         let id = caret.selection.head.block.clone();
         let doc = self.doc();
         let (Some(block), Some(place)) = (doc.block(&id), self.seat(&id)) else { return };
+        let label = |holder: &&Block| {
+            matches!(holder.kind, BlockKind::Figure { numbered: true, .. } | BlockKind::Gallery { numbered: true })
+        };
+        if let Some(holder) = self.numbered_by(&id).filter(label).map(|holder| holder.id.clone()) {
+            // The generated label before a caption goes first, as the marker of a list item does.
+            return self.set_numbered(&holder, false);
+        }
         if tree::is_part(block, place.parent) {
             // A part stays what it is. From the start of a caption the caret steps back onto the picture,
             // and a gallery's caption with nothing in it goes.
