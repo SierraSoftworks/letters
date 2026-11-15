@@ -787,6 +787,17 @@ pub(crate) struct Over<'a> {
     /// The sheet a block starts on, counted from 0, where sheets are what is painted: the number a line
     /// of a table of contents ends in.
     pub sheet_of: &'a dyn Fn(&BlockId) -> Option<usize>,
+    /// The term to light in one of the text's formulas.
+    pub lit: Option<Lit>,
+}
+
+/// The term of a formula that is lit while the formula is written.
+pub(crate) struct Lit {
+    /// The formula, as the bytes of its text.
+    pub source: Range<usize>,
+    /// Where the caret is in the formula's own source. Its term is the one lit.
+    pub caret: usize,
+    pub color: Color,
 }
 
 /// One laid text of a leaf, and where it is.
@@ -1136,7 +1147,7 @@ impl Painter<'_> {
                     PositionedLayoutItem::InlineBox(inline) => {
                         let push = over.shifts.push(index, inline.x);
                         let origin = Point { x: at.x + inline.x + push, y: at.y + inline.y };
-                        self.formula(text, inline.id as usize, origin);
+                        self.formula(text, inline.id as usize, origin, over.lit.as_ref());
                         continue;
                     }
                 };
@@ -1218,9 +1229,11 @@ impl Painter<'_> {
 
     /// Draws the formula of one of a text's swaps with the top left of its box at `origin`. The cache holds
     /// it from when the text was shaped, unless the colours have changed since.
-    fn formula(&mut self, text: &Text<'_>, swap: usize, origin: Point) {
-        let Some(Swap { source, maths: Some((size, display)), kept, .. }) = text.set.swaps.get(swap) else { return };
-        let Some(source) = kept.as_deref().or_else(|| text.source.text.get(source.clone())) else { return };
+    fn formula(&mut self, text: &Text<'_>, swap: usize, origin: Point, lit: Option<&Lit>) {
+        let Some(Swap { source: range, maths: Some((size, display)), kept, .. }) = text.set.swaps.get(swap) else {
+            return;
+        };
+        let Some(source) = kept.as_deref().or_else(|| text.source.text.get(range.clone())) else { return };
         let color = self.inks.ink(Ink::Style(text.role));
         let style = Maths { size: *size, color, display: *display, links: self.engine.links };
         if let Ok(formula) = self.engine.maths.typeset(source, &style) {
@@ -1230,7 +1243,11 @@ impl Painter<'_> {
             if inline {
                 self.open(FORMULAS + swap as u64, || Tag::Formula { alt: source.into() });
             }
-            formula.paint(origin, self.out);
+            // The term at the caret is lit in the formula itself, which is drawn so in place of the plain one:
+            // drawn over it, its edges would double. One that stands as it was is not what the caret is in.
+            let lit = lit.filter(|lit| lit.source == *range && kept.is_none());
+            let lit = lit.and_then(|lit| self.engine.lit(source, &style, lit.caret, lit.color));
+            lit.as_ref().unwrap_or(&formula).paint(origin, self.out);
             if inline {
                 self.close();
             }
