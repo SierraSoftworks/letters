@@ -2969,6 +2969,7 @@ dependencies = [
  "letters-spell",
  "letters-trust",
  "letters-ui",
+ "skrifa 0.49.0",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

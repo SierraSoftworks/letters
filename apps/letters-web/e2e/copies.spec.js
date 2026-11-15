@@ -110,26 +110,21 @@ test.describe("a PDF of emoji and of scripts the fonts lack", () => {
   const built = existsSync(new URL("../dist/fallback/NotoColorEmoji.ttf", import.meta.url));
   test.skip(!built, "this build has no faces to back up the fonts");
 
-  /** Asks for a PDF of a line with an emoji and Japanese in it, and tells which faces the page fetched for it. */
+  /** A PDF of a line with an emoji and Japanese in it. */
   const pdf = async (page) => {
-    const fetched = [];
-    page.on("request", (request) => fetched.push(new URL(request.url()).pathname));
     await page.keyboard.insertText("A smile 🙂 and 日本語のテキスト");
     await ask(page, "Faces", "PDF");
-    expect(fetched.filter((path) => path.startsWith("/fallback/"))).toEqual([]);
-    const [, file] = await saved(page);
-    return { file, fetched: fetched.filter((path) => path.startsWith("/fallback/")) };
+    return (await saved(page))[1];
   };
 
-  test("carries the faces that have them, which are fetched when it is asked for", async ({ page }) => {
-    const { file, fetched } = await pdf(page);
-    expect(fetched.sort()).toEqual(["/fallback/NotoColorEmoji.ttf", "/fallback/NotoSansJP.otf"]);
+  test("carries the faces that have them", async ({ page }) => {
+    const file = await pdf(page);
     for (const face of ["NotoColorEmoji", "NotoSansJP"]) expect(file).toContain(face);
   });
 
   test("is made without a face that cannot be fetched", async ({ page }) => {
     await page.route("**/fallback/NotoColorEmoji.ttf", (route) => route.abort());
-    const { file } = await pdf(page);
+    const file = await pdf(page);
     expect(file.startsWith("%PDF-")).toBe(true);
     expect(file).toContain("NotoSansJP");
     expect(file).not.toContain("NotoColorEmoji");

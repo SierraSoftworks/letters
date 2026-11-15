@@ -4,6 +4,8 @@
 
 use std::ops::RangeInclusive;
 
+use skrifa::{FontRef, MetadataProvider};
+
 /// A face that backs up the fonts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Face {
@@ -12,8 +14,8 @@ pub enum Face {
     Korean,
     /// Chinese as Taiwan and Hong Kong write it.
     Traditional,
-    /// Chinese as the mainland writes it. It has the most Han characters, so it is the face for Han that
-    /// nothing says more about.
+    /// Chinese as the mainland writes it. It has the most Han characters, so it is the first face for Han
+    /// that nothing says more about.
     Simplified,
 }
 
@@ -37,7 +39,7 @@ const HANGUL: [RangeInclusive<u32>; 5] =
 const KANA: [RangeInclusive<u32>; 4] = [0x3040..=0x30FF, 0x31F0..=0x31FF, 0xFF66..=0xFF9F, 0x1B000..=0x1B16F];
 const BOPOMOFO: [RangeInclusive<u32>; 2] = [0x3100..=0x312F, 0x31A0..=0x31BF];
 /// Han, and the signs and full-width forms the three languages share.
-const SHARED: [RangeInclusive<u32>; 8] = [
+const SHARED: [RangeInclusive<u32>; 10] = [
     0x2E80..=0x2FDF,
     0x3000..=0x303F,
     0x3190..=0x33FF,
@@ -45,9 +47,12 @@ const SHARED: [RangeInclusive<u32>; 8] = [
     0x4E00..=0x9FFF,
     0xF900..=0xFAFF,
     0xFE30..=0xFE4F,
+    0xFF00..=0xFF65,
+    0xFFE0..=0xFFEF,
     0x20000..=0x323AF,
 ];
-const FULL_WIDTH: [RangeInclusive<u32>; 2] = [0xFF00..=0xFF65, 0xFFE0..=0xFFEF];
+/// The faces that have Han, the one with the most first.
+const HAN: [Face; 4] = [Face::Simplified, Face::Traditional, Face::Japanese, Face::Korean];
 
 /// The face a language's Han is drawn in, when the language is one that writes Han.
 fn written(lang: &str) -> Option<Face> {
@@ -63,33 +68,75 @@ fn written(lang: &str) -> Option<Face> {
     }
 }
 
-/// The faces to fetch for characters no font has: each as layout tells it, with whether it shows as an
-/// emoji and the language of its text. `had` are the faces fetched before.
+/// What a character says of the face to set it in.
+enum Told {
+    Face(Face),
+    /// Han, and the face its language says, if it names one.
+    Han(Option<Face>),
+    Nothing,
+}
+
+/// Whether a face's file has a glyph for a character.
+pub fn has(file: &[u8], ch: char) -> bool {
+    FontRef::new(file).is_ok_and(|face| face.charmap().map(ch).is_some())
+}
+
+/// The face to set each character in that no font has, in the order they are given: each as layout tells
+/// it, with whether it shows as an emoji and the language of its text. `None` is for a character that no
+/// face kept here has.
 ///
-/// Han in text that names no language that writes it is drawn as its neighbours are: in the face that
-/// kana or hangul beside it asked for, now or before. A character of a script no face is kept for asks
-/// for nothing.
-pub fn wanted<'a>(uncovered: impl IntoIterator<Item = (char, bool, Option<&'a str>)>, had: &[Face]) -> Vec<Face> {
+/// `asked` are the faces asked for before. `lacks` says of a face that it is known to be of no use for a
+/// character: it was fetched and has no glyph for it, or it could not be fetched.
+///
+/// Han is drawn as its language writes it. In text that names no such language it is drawn as its
+/// neighbours are: in the face that kana or hangul beside it took, now or before. Where that face lacks
+/// the character it takes the next that has it, since a box is worse than a stroke drawn another way.
+pub fn chosen<'a>(
+    uncovered: impl IntoIterator<Item = (char, bool, Option<&'a str>)>,
+    asked: &[Face],
+    lacks: impl Fn(Face, char) -> bool,
+) -> Vec<Option<Face>> {
     let within = |ranges: &[RangeInclusive<u32>], ch: char| ranges.iter().any(|range| range.contains(&(ch as u32)));
-    let (mut wanted, mut unsaid) = (Vec::new(), false);
-    for (ch, emoji, lang) in uncovered {
-        let face = match ch {
-            _ if emoji => Some(Face::Emoji),
-            _ if within(&HANGUL, ch) => Some(Face::Korean),
-            _ if within(&KANA, ch) => Some(Face::Japanese),
-            _ if within(&BOPOMOFO, ch) => Some(Face::Traditional),
-            _ if within(&SHARED, ch) || within(&FULL_WIDTH, ch) => {
-                let said = lang.and_then(written);
-                unsaid |= said.is_none();
-                said
-            }
-            _ => None,
-        };
-        wanted.extend(face.filter(|face| !wanted.contains(face) && !had.contains(face)));
+    let told: Vec<(char, Told)> = uncovered
+        .into_iter()
+        .map(|(ch, emoji, lang)| {
+            let told = match ch {
+                _ if emoji => Told::Face(Face::Emoji),
+                _ if within(&HANGUL, ch) => Told::Face(Face::Korean),
+                _ if within(&KANA, ch) => Told::Face(Face::Japanese),
+                _ if within(&BOPOMOFO, ch) => Told::Face(Face::Traditional),
+                _ if within(&SHARED, ch) => Told::Han(lang.and_then(written)),
+                _ => Told::Nothing,
+            };
+            (ch, told)
+        })
+        .collect();
+    // The faces Han's neighbours took: those asked for before, then those these characters say.
+    let said = told.iter().filter_map(|(_, told)| match told {
+        Told::Face(face) => Some(*face),
+        Told::Han(face) => *face,
+        Told::Nothing => None,
+    });
+    let beside: Vec<Face> = asked.iter().copied().chain(said).filter(|face| HAN.contains(face)).collect();
+    let choose = |(ch, told): &(char, Told)| {
+        let of_use = |face: &Face| !lacks(*face, *ch);
+        match told {
+            Told::Face(face) => Some(*face).filter(of_use),
+            Told::Han(Some(said)) => [*said].into_iter().chain(HAN).find(of_use),
+            Told::Han(None) => beside.iter().copied().chain(HAN).find(of_use),
+            Told::Nothing => None,
+        }
+    };
+    told.iter().map(choose).collect()
+}
+
+/// The faces among those [`chosen`] that are not `had`, each once, in the order they are first needed.
+pub fn lacking(chosen: &[Option<Face>], had: &[Face]) -> Vec<Face> {
+    let mut lacking = Vec::new();
+    for face in chosen.iter().flatten().filter(|face| !had.contains(face)) {
+        if !lacking.contains(face) {
+            lacking.push(*face);
+        }
     }
-    let beside = |faces: &[Face]| faces.iter().any(|face| *face != Face::Emoji);
-    if unsaid && !beside(&wanted) && !beside(had) {
-        wanted.push(Face::Simplified);
-    }
-    wanted
+    lacking
 }

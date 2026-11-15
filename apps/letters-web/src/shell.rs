@@ -19,7 +19,7 @@ use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::{Color, DisplayList, Font, Point, Rect, Size};
 use letters_trust::{LinkDecision, Origin, Trust};
 use letters_ui::{
-    Appearance, CopyFormat, Cursor, Edge, Keys, Request, SaveState, Scheme, Settings, Window as View, tokens,
+    Appearance, CopyFormat, Cursor, Edge, Keys, Request, SaveState, Scheme, Settings, Uncovered, Window as View, tokens,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
@@ -32,7 +32,7 @@ use web_sys::{
 };
 
 use crate::browser::{self, Browser};
-use crate::faces::Face;
+use crate::faces::{self, Face};
 use crate::input::{Around, Clipboard, Dom, Finger, Gesture, Held, Reply, TextInput, Touch, modifiers};
 use crate::mirror::{Act, Mirror, Page};
 use crate::page;
@@ -137,11 +137,14 @@ pub struct Shell {
     exporter: Option<Promise>,
     /// How often the exports could not be fetched.
     refetches: u32,
-    /// The faces asked for to back up the fonts: each as it was fetched, once it was. One that could not
-    /// be fetched is not asked for again.
-    backups: Vec<(Face, Option<Font>)>,
+    /// The faces asked for to back up the fonts, and how far each has come.
+    backups: Vec<(Face, Backup)>,
     /// The faces among them that the exports were handed.
     handed: Vec<Face>,
+    /// The characters the window showed without a glyph, until a face that is here has them or none can.
+    uncovered: Vec<Uncovered>,
+    /// What waits for faces that are on their way, to be told whether any came.
+    awaited: Vec<(Vec<Face>, Arrived)>,
     /// How many files the exports are writing.
     exporting: u32,
     /// Whether a PDF is being made for the person to print.
@@ -291,6 +294,8 @@ impl Shell {
                 refetches: 0,
                 backups: Vec::new(),
                 handed: Vec::new(),
+                uncovered: Vec::new(),
+                awaited: Vec::new(),
                 exporting: 0,
                 printing: false,
                 printed: None,
@@ -463,6 +468,7 @@ impl Shell {
     /// Shows `document` in place of the one on screen.
     pub fn open(&mut self, document: Document) {
         self.view = view(document, &mut self.platform, self.mac);
+        self.backed();
         (self.kept, self.identity) = (self.view.edits(), None);
         (self.session, self.written, self.rested) = (None, self.kept, None);
         self.save_state = SaveState::default();
@@ -599,12 +605,13 @@ impl Shell {
         title: String,
         then: impl FnOnce(&mut Self, Result<Exported, String>) + 'static,
     ) {
-        self.export_with(format, source, title, true, Box::new(then));
+        self.export_with(format, source, title, 2, Box::new(then));
     }
 
     /// Writes the file [`Self::export`] asks for. A PDF that shows characters as boxes for want of a face
-    /// that backs up the fonts is made again once the face is fetched, when `again` allows.
-    fn export_with(&mut self, format: &'static str, source: Source, title: String, again: bool, then: Made) {
+    /// that backs up the fonts is made again once the face is fetched, as often as `again` allows: the
+    /// face a character is first set in may lack it, and the next be asked for.
+    fn export_with(&mut self, format: &'static str, source: Source, title: String, again: u8, then: Made) {
         let editor = self.view.editor();
         // A document's file takes the history with it, which nothing else has a use for.
         let kept = format == "let";
@@ -647,7 +654,7 @@ impl Shell {
             history.into(),
             identity.into(),
         ];
-        let retry = again.then(|| (source, title.clone()));
+        let retry = again.checked_sub(1).map(|again| (source, title.clone(), again));
         self.ask("exported", asked.into_iter().collect(), move |shell, made| {
             let lacking: Vec<Face> = made.iter().flat_map(|made| Array::from(&made.get(3))).filter_map(face).collect();
             let made = made.map(|made| Exported {
@@ -655,13 +662,15 @@ impl Shell {
                 kind: made.get(1).as_string().unwrap_or_default(),
                 file: made.get(2),
             });
-            let Some((source, title)) = retry.filter(|_| !lacking.is_empty()) else { return then(shell, made) };
+            let Some((source, title, again)) = retry.filter(|_| !lacking.is_empty()) else {
+                return then(shell, made);
+            };
             // The file as it is will do if the faces cannot be had.
             shell.exporting += 1;
             shell.back_up(lacking, move |shell, arrived| {
                 shell.exporting -= 1;
                 match arrived {
-                    true => shell.export_with(format, source, title, false, then),
+                    true => shell.export_with(format, source, title, again, then),
                     false => then(shell, made),
                 }
             });
@@ -704,46 +713,116 @@ impl Shell {
         });
     }
 
-    /// Hands the exports the faces that back up the fonts, as far as they were fetched since it was last
-    /// handed any.
-    fn hand_backups(&mut self, exporter: &JsValue) {
-        for (face, font) in &self.backups {
-            let Some(font) = font.as_ref().filter(|_| !self.handed.contains(face)) else { continue };
-            let asked = Array::of2(&face.file().into(), &Uint8Array::from(&font.data[..]));
-            match call(exporter, "backup", &asked) {
-                Ok(_) => self.handed.push(*face),
-                Err(error) => web_sys::console::error_1(&error),
-            }
+    /// The faces that back up the fonts, as far as they have come.
+    fn fetched(&self) -> impl Iterator<Item = (Face, &Font)> {
+        self.backups.iter().filter_map(|(face, backup)| match backup {
+            Backup::Here(font) => Some((*face, font)),
+            Backup::Coming | Backup::Lost => None,
+        })
+    }
+
+    /// Hands a window that was just made the faces that back up the fonts, as far as they were fetched.
+    /// What the window before it lacked is no longer asked about.
+    fn backed(&mut self) {
+        self.uncovered.clear();
+        let fetched: Vec<Font> = self.fetched().map(|(_, font)| font.clone()).collect();
+        if !fetched.is_empty() {
+            self.view.add_fallback_fonts(fetched);
         }
     }
 
-    /// Fetches the faces among `faces` that were never asked for, to back up the fonts where they lack a
-    /// character, and tells `then` whether any arrived. A face that cannot be fetched is done without.
-    fn back_up(&mut self, faces: Vec<Face>, then: impl FnOnce(&mut Self, bool) + 'static) {
-        let new: Vec<Face> = faces.into_iter().filter(|face| self.backups.iter().all(|(had, _)| had != face)).collect();
-        self.backups.extend(new.iter().map(|face| (*face, None)));
-        let (shell, window, base) = (self.me.clone(), self.window.clone(), self.base.clone());
-        wasm_bindgen_futures::spawn_local(async move {
-            let mut fetched = Vec::new();
-            for face in new {
-                match browser::files(&window, &urls(&base, "fallback", &[face.file()])).await {
-                    Ok(files) => fetched.extend(files.into_iter().map(|file| (face, Font::new(file.into(), 0)))),
-                    Err(error) => web_sys::console::error_1(&error),
+    /// Asks what characters the window showed that no face has, and fetches the faces that have them. A
+    /// font that is still on its way may have them too, so nothing is asked before the last has come.
+    fn cover(&mut self) {
+        if self.stats.fonts {
+            self.uncovered.extend(self.view.take_uncovered());
+        }
+        if self.uncovered.is_empty() {
+            return;
+        }
+        let asked: Vec<Face> = self.backups.iter().map(|(face, _)| *face).collect();
+        let lacks = |face: Face, ch: char| match self.backups.iter().find(|(asked, _)| *asked == face) {
+            Some((_, Backup::Here(font))) => !faces::has(&font.data, ch),
+            Some((_, Backup::Lost)) => true,
+            Some((_, Backup::Coming)) | None => false,
+        };
+        let told = self.uncovered.iter().map(|one| (one.ch, one.emoji, one.lang.as_deref()));
+        let chosen = faces::chosen(told, &asked, lacks);
+        // A character waits only for a face that is still to come.
+        let here: Vec<Face> = self.fetched().map(|(face, _)| face).collect();
+        let mut waits = chosen.iter().map(|face| face.is_some_and(|face| !here.contains(&face)));
+        self.uncovered.retain(|_| waits.next() == Some(true));
+        self.fetch_faces(&faces::lacking(&chosen, &asked));
+    }
+
+    /// Fetches faces that were never asked for. One that arrives is the window's from then on.
+    fn fetch_faces(&mut self, faces: &[Face]) {
+        for face in faces.iter().copied() {
+            self.backups.push((face, Backup::Coming));
+            let (shell, window) = (self.me.clone(), self.window.clone());
+            let url = urls(&self.base, "fallback", &[face.file()]);
+            wasm_bindgen_futures::spawn_local(async move {
+                let fetched = browser::files(&window, &url).await.map(|files| files.into_iter().next());
+                let Some(shell) = shell.upgrade() else { return };
+                let mut shell = shell.borrow_mut();
+                let backup = match fetched {
+                    Ok(Some(file)) => {
+                        let font = Font::new(file.into(), 0);
+                        shell.view.add_fallback_fonts(vec![font.clone()]);
+                        Backup::Here(font)
+                    }
+                    Ok(None) => Backup::Lost,
+                    Err(error) => {
+                        web_sys::console::error_1(&error);
+                        Backup::Lost
+                    }
+                };
+                if let Some((_, kept)) = shell.backups.iter_mut().find(|(asked, _)| *asked == face) {
+                    *kept = backup;
                 }
+                shell.settle();
+                shell.sync();
+            });
+        }
+    }
+
+    /// Fetches the faces among `faces` that were never asked for, and tells `then` whether any of `faces`
+    /// is here once none is on its way. A face that cannot be fetched is done without.
+    fn back_up(&mut self, faces: Vec<Face>, then: impl FnOnce(&mut Self, bool) + 'static) {
+        let asked = |face: &Face| self.backups.iter().any(|(asked, _)| asked == face);
+        let new: Vec<Face> = faces.iter().copied().filter(|face| !asked(face)).collect();
+        self.fetch_faces(&new);
+        self.awaited.push((faces, Box::new(then)));
+        self.settle();
+    }
+
+    /// Tells whoever waited for faces of which none is on its way any more.
+    fn settle(&mut self) {
+        let coming =
+            |face: &Face| self.backups.iter().any(|(asked, backup)| asked == face && matches!(backup, Backup::Coming));
+        let (waiting, ready): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.awaited).into_iter().partition(|(faces, _)| faces.iter().any(&coming));
+        self.awaited = waiting;
+        for (faces, then) in ready {
+            let arrived = self.fetched().any(|(face, _)| faces.contains(&face));
+            then(self, arrived);
+        }
+    }
+
+    /// Hands the exports the faces that back up the fonts, as far as they were fetched since it was last
+    /// handed any.
+    fn hand_backups(&mut self, exporter: &JsValue) {
+        let new: Vec<(Face, Array)> = self
+            .fetched()
+            .filter(|(face, _)| !self.handed.contains(face))
+            .map(|(face, font)| (face, Array::of2(&face.file().into(), &Uint8Array::from(&font.data[..]))))
+            .collect();
+        for (face, asked) in new {
+            match call(exporter, "backup", &asked) {
+                Ok(_) => self.handed.push(face),
+                Err(error) => web_sys::console::error_1(&error),
             }
-            let Some(shell) = shell.upgrade() else { return };
-            let mut shell = shell.borrow_mut();
-            let arrived = !fetched.is_empty();
-            for (face, font) in fetched {
-                shell
-                    .backups
-                    .iter_mut()
-                    .filter(|(had, _)| *had == face)
-                    .for_each(|(_, kept)| *kept = Some(font.clone()));
-            }
-            then(&mut shell, arrived);
-            shell.sync();
-        });
+        }
     }
 
     /// Writes a copy of the document, as a file the browser keeps for the person, and answers the card
@@ -898,6 +977,7 @@ impl Shell {
         (self.session, self.written, self.rested) = (session, self.kept, None);
         self.save_state = SaveState::default();
         self.view = view;
+        self.backed();
         self.text = TextInput::new(self.mac);
         self.touch = Touch::default();
         self.rest();
@@ -1070,6 +1150,7 @@ impl Shell {
             self.save_state = state;
             self.view.set_save_state(state);
         }
+        self.cover();
         if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
             self.frame_due = self.window.request_animation_frame(&self.on_frame).is_ok();
         }
@@ -1642,6 +1723,18 @@ impl Shell {
 }
 
 /// A file the exports wrote.
+/// How far a face that backs up the fonts has come.
+#[derive(Clone)]
+enum Backup {
+    Coming,
+    Here(Font),
+    /// It could not be fetched, and is not asked for again.
+    Lost,
+}
+
+/// What is told whether faces it waited for are here.
+type Arrived = Box<dyn FnOnce(&mut Shell, bool)>;
+
 /// What is done with a file the exports made, or with why there is none.
 type Made = Box<dyn FnOnce(&mut Shell, Result<Exported, String>)>;
 

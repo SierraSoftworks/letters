@@ -36,7 +36,7 @@ pub fn fonts(fonts: &Array, maths: &Array) {
 // The editor's own module, taken by its file: naming the editor's crate here would link the editor in.
 #[path = "../src/faces.rs"]
 mod faces;
-use faces::{Face, wanted};
+use faces::{Face, chosen, has, lacking as wanted};
 
 thread_local! {
     /// The faces that back up the fonts, as far as the page has fetched them.
@@ -88,7 +88,11 @@ pub fn exported(
                 let (had, faces): (Vec<Face>, Vec<Font>) =
                     BACKUPS.with_borrow(|backups| backups.iter().cloned().unzip());
                 let told = uncovered.iter().map(|one| (one.ch, one.emoji, one.lang.as_deref()));
-                wanted(told, &had).into_iter().for_each(|face| _ = lacking.push(&face.file().into()));
+                let lacks = |face: Face, ch: char| {
+                    had.iter().zip(&faces).any(|(had, font)| *had == face && !has(&font.data, ch))
+                };
+                // A face the page has not handed over may have what these lack.
+                wanted(&chosen(told, &had, lacks), &had).iter().for_each(|face| _ = lacking.push(&face.file().into()));
                 Fonts { faces }
             };
             (to_pdf_with(&document, &style, fonts, &mut asset, &info, &mut backups)?, "pdf", "application/pdf")
