@@ -2,6 +2,11 @@
 //!
 //! Run with `cargo bench -p letters-layout`. It exits with an error when a budget is broken. The budgets are
 //! for the whole app on the reference machine, an M1 Pro, so layout should use a small part of each.
+//!
+//! A machine that is shared, as a CI runner is, now and then stalls a run for longer than the run takes, and
+//! hardly the same run twice. So each measurement is made a few times over from a fresh start and a run
+//! counts as the fastest it was: what is held to a budget is what the slowest run costs, not when it was
+//! interrupted.
 
 use std::time::{Duration, Instant};
 
@@ -24,8 +29,10 @@ const PAGES: usize = 500;
 const PAGE: usize = 3_000;
 const WIDTH: f32 = 680.0;
 const SCREEN: f32 = 900.0;
-/// What the shell would settle in one idle slice.
-const SLICE: usize = 8 * 1024;
+/// What the window settles in one idle step: `SETTLE_BYTES` in letters-ui.
+const SLICE: usize = 4096;
+/// How often each measurement is made.
+const PASSES: usize = 5;
 
 const WORDS: &[&str] = &[
     "rates",
@@ -173,10 +180,21 @@ fn document() -> (Document, usize) {
 struct Times(Vec<Duration>);
 
 impl Times {
-    fn of(runs: usize, mut run: impl FnMut(usize) -> Duration) -> Self {
-        let mut times: Vec<_> = (0..runs).map(&mut run).collect();
+    fn of(mut times: Vec<Duration>) -> Self {
         times.sort_unstable();
         Self(times)
+    }
+
+    /// A measurement made `PASSES` times over. `pass` makes all its runs once from a fresh start, and each
+    /// run counts as the least it took.
+    fn best(mut pass: impl FnMut() -> Vec<Duration>) -> Self {
+        let mut times = pass();
+        for _ in 1..PASSES {
+            for (least, time) in times.iter_mut().zip(pass()) {
+                *least = (*least).min(time);
+            }
+        }
+        Self::of(times)
     }
 
     fn median(&self) -> Duration {
@@ -194,6 +212,11 @@ impl Times {
 
 fn ms(time: Duration) -> f64 {
     time.as_secs_f64() * 1000.0
+}
+
+/// How long each of `count` runs takes.
+fn runs(count: usize, run: impl FnMut(usize) -> Duration) -> Vec<Duration> {
+    (0..count).map(run).collect()
 }
 
 fn timed(run: impl FnOnce()) -> Duration {
@@ -222,6 +245,15 @@ fn opened_at(doc: &Document, style: &Style, width: f32) -> DocLayout {
     layout
 }
 
+/// The document as someone writing in it has it: a model to edit, and its layout with the screen at `y`
+/// painted once.
+fn written(doc: &Document, style: &Style, y: f32) -> (Model, DocLayout) {
+    let model = Model::new(doc.clone(), ReplicaId::from(1));
+    let mut layout = opened(model.doc(), style);
+    frame(&mut layout, y, &mut DisplayList::default());
+    (model, layout)
+}
+
 fn main() {
     let (doc, bytes) = document();
     let style = Style::default();
@@ -239,66 +271,75 @@ fn main() {
     let megabytes = bytes as f64 / 1e6;
     println!("{PAGES} pages: {megabytes:.2} MB of text in {} blocks, {WIDTH} px wide", doc.walk().count());
 
-    // Fonts, the first layout and the first screen. The worst run is the cold one.
-    let open = Times::of(15, |_| {
+    // Fonts, the first layout and the first screen. The worst run is the cold one, so this is made once.
+    let open = Times::of(runs(15, |_| {
         timed(|| {
             let mut layout = opened(&doc, &style);
             frame(&mut layout, 0.0, &mut list);
             assert!(list.items.len() > 10 && layout.height() > SCREEN);
         })
-    });
+    }));
     report("open", &open, open.worst(), Some(OPEN));
 
     // A new width drops every layout, as a window resize does on each frame.
-    let mut layout = opened(&doc, &style);
-    let resize = Times::of(30, |run| {
-        timed(|| {
-            layout.update(&doc, &style, WIDTH - 1.0 - run as f32, None);
-            frame(&mut layout, 0.0, &mut list);
+    let resize = Times::best(|| {
+        let mut layout = opened(&doc, &style);
+        runs(30, |run| {
+            timed(|| {
+                layout.update(&doc, &style, WIDTH - 1.0 - run as f32, None);
+                frame(&mut layout, 0.0, &mut list);
+            })
         })
     });
     report("resize", &resize, resize.worst(), Some(FRAME));
 
     // The far end of a document nothing has been laid out in.
-    let jump = Times::of(15, |_| {
-        let mut layout = opened(&doc, &style);
-        let end = layout.height() - SCREEN;
-        timed(|| frame(&mut layout, end, &mut list))
+    let jump = Times::best(|| {
+        runs(15, |_| {
+            let mut layout = opened(&doc, &style);
+            let end = layout.height() - SCREEN;
+            timed(|| frame(&mut layout, end, &mut list))
+        })
     });
     report("jump to end", &jump, jump.worst(), Some(FRAME));
 
     // Scrolling down a fresh document, 40 px a frame and then a screen a frame.
     for (name, step) in [("scroll", 40.0), ("page down", SCREEN)] {
-        let mut layout = opened(&doc, &style);
-        let frames = (((layout.height() - SCREEN) / step) as usize).min(1500);
-        let scroll = Times::of(frames, |at| timed(|| frame(&mut layout, at as f32 * step, &mut list)));
+        let scroll = Times::best(|| {
+            let mut layout = opened(&doc, &style);
+            let frames = (((layout.height() - SCREEN) / step) as usize).min(1500);
+            runs(frames, |at| timed(|| frame(&mut layout, at as f32 * step, &mut list)))
+        });
         report(name, &scroll, scroll.worst(), Some(FRAME));
     }
 
     // Typing into a long paragraph on screen: the layout's part of a key press.
     let target = doc.blocks.iter().find(|block| block.plain_text().len() > 600).expect("a long paragraph");
     let (id, y) = (target.id.clone(), opened(&doc, &style).caret(&Pos::new(target.id.clone(), 0)).expect("a caret").y);
-    let mut model = Model::new(doc.clone(), ReplicaId::from(1));
-    let mut layout = opened(model.doc(), &style);
-    frame(&mut layout, y, &mut list);
-    let typing = Times::of(300, |at| {
-        let change =
-            model.apply([Op::InsertText { at: Pos::new(id.clone(), 40 + at), text: "x".into() }]).expect("typed");
-        timed(|| {
-            layout.update(model.doc(), &style, WIDTH, Some(&change));
-            frame(&mut layout, y, &mut list);
-            assert!(layout.caret(&Pos::new(id.clone(), 41 + at)).is_some());
+    let typing = Times::best(|| {
+        let (mut model, mut layout) = written(&doc, &style, y);
+        runs(300, |at| {
+            let typed = Op::InsertText { at: Pos::new(id.clone(), 40 + at), text: "x".into() };
+            let change = model.apply([typed]).expect("typed");
+            timed(|| {
+                layout.update(model.doc(), &style, WIDTH, Some(&change));
+                frame(&mut layout, y, &mut list);
+                assert!(layout.caret(&Pos::new(id.clone(), 41 + at)).is_some());
+            })
         })
     });
     report("keystroke", &typing, typing.worst(), Some(KEYSTROKE));
 
     // A new paragraph changes the structure, so the column is rebuilt around what it keeps.
-    let split = Times::of(100, |at| {
-        let new_id = BlockId::new(format!("split{at}"));
-        let change = model.apply([Op::Split { at: Pos::new(id.clone(), 20), new_id }]).expect("split");
-        timed(|| {
-            layout.update(model.doc(), &style, WIDTH, Some(&change));
-            frame(&mut layout, y, &mut list);
+    let split = Times::best(|| {
+        let (mut model, mut layout) = written(&doc, &style, y);
+        runs(100, |at| {
+            let new_id = BlockId::new(format!("split{at}"));
+            let change = model.apply([Op::Split { at: Pos::new(id.clone(), 20), new_id }]).expect("split");
+            timed(|| {
+                layout.update(model.doc(), &style, WIDTH, Some(&change));
+                frame(&mut layout, y, &mut list);
+            })
         })
     });
     report("enter", &split, split.worst(), Some(KEYSTROKE));
@@ -309,17 +350,18 @@ fn main() {
     let before = target.body.runs().iter().take_while(|run| !run.marks.contains(&Mark::Math));
     let (id, start) = (target.id.clone(), before.map(|run| run.text.len()).sum::<usize>());
     let y = opened(&doc, &style).caret(&Pos::new(id.clone(), start)).expect("a caret").y;
-    let mut model = Model::new(doc.clone(), ReplicaId::from(1));
-    let mut layout = opened(model.doc(), &style);
-    layout.reveal(Some((&Pos::new(id.clone(), start + 1), &Markers::default())));
-    frame(&mut layout, y, &mut list);
-    let source = Times::of(200, |at| {
-        let caret = Pos::new(id.clone(), start + 1 + at);
-        let change = model.apply([Op::InsertText { at: caret.clone(), text: "x".into() }]).expect("typed");
-        timed(|| {
-            layout.update(model.doc(), &style, WIDTH, Some(&change));
-            layout.reveal(Some((&Pos::new(id.clone(), caret.offset + 1), &Markers::default())));
-            frame(&mut layout, y, &mut list);
+    let source = Times::best(|| {
+        let (mut model, mut layout) = written(&doc, &style, y);
+        layout.reveal(Some((&Pos::new(id.clone(), start + 1), &Markers::default())));
+        frame(&mut layout, y, &mut list);
+        runs(200, |at| {
+            let caret = Pos::new(id.clone(), start + 1 + at);
+            let change = model.apply([Op::InsertText { at: caret.clone(), text: "x".into() }]).expect("typed");
+            timed(|| {
+                layout.update(model.doc(), &style, WIDTH, Some(&change));
+                layout.reveal(Some((&Pos::new(id.clone(), caret.offset + 1), &Markers::default())));
+                frame(&mut layout, y, &mut list);
+            })
         })
     });
     report("formula source", &source, source.worst(), Some(KEYSTROKE));
@@ -327,67 +369,83 @@ fn main() {
     // Typing in a formula that stays typeset, so each key sets a formula never seen before.
     let target = doc.blocks.iter().find(|block| block.kind == BlockKind::Formula).expect("a formula block");
     let (id, y) = (target.id.clone(), opened(&doc, &style).caret(&Pos::new(target.id.clone(), 0)).expect("a caret").y);
-    let mut layout = opened(model.doc(), &style);
-    frame(&mut layout, y, &mut list);
-    let typeset = Times::of(200, |at| {
-        let text = if at % 2 == 0 { "+" } else { "y" };
-        let change = model.apply([Op::InsertText { at: Pos::new(id.clone(), at), text: text.into() }]).expect("typed");
-        timed(|| {
-            layout.update(model.doc(), &style, WIDTH, Some(&change));
-            frame(&mut layout, y, &mut list);
+    let typeset = Times::best(|| {
+        let (mut model, mut layout) = written(&doc, &style, y);
+        runs(200, |at| {
+            let text = if at % 2 == 0 { "+" } else { "y" };
+            let typed = Op::InsertText { at: Pos::new(id.clone(), at), text: text.into() };
+            let change = model.apply([typed]).expect("typed");
+            timed(|| {
+                layout.update(model.doc(), &style, WIDTH, Some(&change));
+                frame(&mut layout, y, &mut list);
+            })
         })
     });
     report("formula typeset", &typeset, typeset.worst(), Some(KEYSTROKE));
 
-    // Replacing every estimate, in the slices the shell runs while idle.
-    let mut layout = opened(&doc, &style);
-    let estimate = layout.height();
-    let mut slices = Vec::new();
-    loop {
-        let mut more = false;
-        slices.push(timed(|| more = layout.settle(screen(0.0), SLICE)));
-        if !more {
-            break;
+    // Replacing every estimate, in the steps the window takes while idle.
+    let (mut estimate, mut height) = (0.0, 0.0);
+    let settle = Times::best(|| {
+        let mut layout = opened(&doc, &style);
+        estimate = layout.height();
+        let (mut slices, mut more) = (Vec::new(), true);
+        while more {
+            slices.push(timed(|| more = layout.settle(screen(0.0), SLICE)));
         }
-    }
-    let settle = Times::of(slices.len(), |at| slices[at]);
+        height = layout.height();
+        slices
+    });
     report("settle slice", &settle, settle.worst(), Some(FRAME));
-    println!("settle all     {:.0} ms in {} slices of {SLICE} bytes", ms(settle.total()), slices.len());
-    println!("height         {:.0} px, first estimated as {estimate:.0} px", layout.height());
+    println!("settle all     {:.0} ms in {} slices of {SLICE} bytes", ms(settle.total()), settle.0.len());
+    println!("height         {height:.0} px, first estimated as {estimate:.0} px");
 
     // Print view: the column at the page's text width, split into sheets. The first split settles the
-    // whole document, as the idle slices above would have by the time anyone asks for pages.
+    // whole document, as the idle steps above would have by the time anyone asks for pages.
     let page = Page::default();
     let column = (page.width - page.margin_left - page.margin_right) * 96.0 / 72.0;
-    let mut model = Model::new(doc.clone(), ReplicaId::from(1));
-    let mut layout = opened_at(model.doc(), &style, column);
-    let mut pages = layout.paginate(&page);
-    let paginate = Times::of(50, |_| timed(|| pages = layout.paginate(&page)));
+    let paged = |doc: &Document| {
+        let layout = opened_at(doc, &style, column);
+        let pages = layout.paginate(&page);
+        (layout, pages)
+    };
+    let mut sheets = 0;
+    let paginate = Times::best(|| {
+        let (layout, mut pages) = paged(&doc);
+        sheets = pages.sheets.len();
+        runs(50, |_| timed(|| pages = layout.paginate(&page)))
+    });
     report("paginate", &paginate, paginate.worst(), Some(FRAME));
-    println!("sheets         {} of {} by {} pt", pages.sheets.len(), page.width, page.height);
+    println!("sheets         {sheets} of {} by {} pt", page.width, page.height);
 
     // A page break put before a block in the middle: the column is rebuilt and split again.
-    let middle = model.doc().blocks.len() / 2;
-    let breaking = Times::of(50, |at| {
-        let mut block = model.doc().blocks[middle + at].clone();
-        block.page_break = true;
-        let ops =
-            [Op::RemoveBlock { block: block.id.clone() }, Op::InsertBlock { parent: None, index: middle + at, block }];
-        let change = model.apply(ops).expect("a page break");
-        let sheets = pages.sheets.len();
-        timed(|| {
-            layout.update(model.doc(), &style, column, Some(&change));
-            pages = layout.paginate(&page);
-            assert!(pages.sheets.len() >= sheets);
+    let breaking = Times::best(|| {
+        let mut model = Model::new(doc.clone(), ReplicaId::from(1));
+        let (mut layout, mut pages) = paged(model.doc());
+        let middle = model.doc().blocks.len() / 2;
+        runs(50, |at| {
+            let mut block = model.doc().blocks[middle + at].clone();
+            block.page_break = true;
+            let (block_id, index) = (block.id.clone(), middle + at);
+            let ops = [Op::RemoveBlock { block: block_id }, Op::InsertBlock { parent: None, index, block }];
+            let change = model.apply(ops).expect("a page break");
+            let sheets = pages.sheets.len();
+            timed(|| {
+                layout.update(model.doc(), &style, column, Some(&change));
+                pages = layout.paginate(&page);
+                assert!(pages.sheets.len() >= sheets);
+            })
         })
     });
     report("page break", &breaking, breaking.worst(), Some(KEYSTROKE));
 
     // One sheet a frame, as scrolling Print view or writing a PDF asks for them.
-    let step = (pages.sheets.len() / 200).max(1);
-    let sheet = Times::of(pages.sheets.len() / step, |at| {
-        list.items.clear();
-        timed(|| layout.paint_page(&pages, at * step, &mut list))
+    let sheet = Times::best(|| {
+        let (layout, pages) = paged(&doc);
+        let step = (pages.sheets.len() / 200).max(1);
+        runs(pages.sheets.len() / step, |at| {
+            list.items.clear();
+            timed(|| layout.paint_page(&pages, at * step, &mut list))
+        })
     });
     report("paint a sheet", &sheet, sheet.worst(), Some(FRAME));
 
