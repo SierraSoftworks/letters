@@ -9,7 +9,7 @@ use std::rc::{Rc, Weak};
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Function, Object, Reflect};
-use letters_editor::{Clip, Editor, Platform as _};
+use letters_editor::{Clip, Editor, Modifiers, Platform as _};
 use letters_model::{Block, BlockId, BlockKind, Document, HistoryError, Pos, ReplicaId, Selection, Style};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::image::Images;
@@ -23,7 +23,7 @@ use web_sys::{
 };
 
 use crate::browser::Browser;
-use crate::input::{Clipboard, Dom, Held, Reply, TextInput, modifiers};
+use crate::input::{Clipboard, Dom, Finger, Gesture, Held, Reply, TextInput, Touch, modifiers};
 use crate::mirror::{Act, Mirror, Page};
 
 /// The distance one line of a mouse wheel scrolls, in logical pixels.
@@ -84,6 +84,7 @@ pub struct Shell {
     view: View,
     platform: Browser,
     text: TextInput,
+    touch: Touch,
     mac: bool,
 
     renderer: CpuRenderer,
@@ -121,6 +122,8 @@ impl Shell {
             ("aria-label", "Document"),
             ("autocomplete", "off"),
             ("autocorrect", "off"),
+            // The input holds none of the sentence, so a keyboard asked to capitalise would do it to every word.
+            ("autocapitalize", "off"),
             ("spellcheck", "false"),
         ] {
             input.set_attribute(name, value)?;
@@ -154,6 +157,7 @@ impl Shell {
                 view,
                 platform,
                 text: TextInput::new(mac),
+                touch: Touch::default(),
                 mac,
                 renderer: CpuRenderer::new(),
                 frame: Frame::default(),
@@ -171,9 +175,19 @@ impl Shell {
 
         // A press on the canvas must leave the keyboard with the hidden input, or give it back. The input
         // is focused here, outside the shell, because the browser reports the focus before `focus` returns.
+        // A finger asks for the keyboard with a tap, which the browser reports as a click. One that goes
+        // down may be about to scroll, and must not bring the soft keyboard up.
         let focus = input.clone();
-        listen(&canvas, "pointerdown", move |_| report(focus.focus()))?;
+        listen(&canvas, "pointerdown", move |event| {
+            if event.unchecked_ref::<PointerEvent>().pointer_type() != "touch" {
+                report(focus.focus());
+            }
+        })?;
+        let focus = input.clone();
+        listen(&canvas, "click", move |_| report(focus.focus()))?;
         listen(&canvas, "mousedown", |event| event.prevent_default())?;
+        // One finger scrolls the document, which is this shell's to do. Two still zoom the page.
+        canvas.style().set_property("touch-action", "pinch-zoom")?;
 
         // Assistive technology presses what it finds in the mirror. The keyboard goes back to the hidden
         // input afterwards, as it does after a press on the canvas.
@@ -197,7 +211,7 @@ impl Shell {
         hear(&shell, &canvas, "pointerdown", Self::pointer_down)?;
         hear(&shell, &canvas, "pointermove", Self::pointer_move)?;
         hear(&shell, &canvas, "pointerup", Self::pointer_up)?;
-        hear(&shell, &canvas, "pointercancel", Self::pointer_up)?;
+        hear(&shell, &canvas, "pointercancel", Self::pointer_cancel)?;
         hear(&shell, &canvas, "pointerleave", |shell, _: Event| shell.view.pointer_leave())?;
         hear(&shell, &canvas, "wheel", Self::wheel)?;
         // The secondary button, Ctrl with a press on a Mac and a long press on a touch screen all ask for
@@ -222,6 +236,7 @@ impl Shell {
         }
 
         input.focus()?;
+        shell.borrow().rest();
         shell.borrow_mut().show();
         Ok(shell)
     }
@@ -238,7 +253,8 @@ impl Shell {
     pub fn open(&mut self, document: Document) {
         self.view = view(document, &mut self.platform, self.mac);
         self.text = TextInput::new(self.mac);
-        self.input.set_value("");
+        self.touch = Touch::default();
+        self.rest();
         self.show();
     }
 
@@ -301,7 +317,7 @@ impl Shell {
                 }
             }
         }
-        if self.view.needs_paint() && !self.frame_due {
+        if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
             self.frame_due = self.window.request_animation_frame(&self.on_frame).is_ok();
         }
         let caret = self.view.caret_rect();
@@ -327,6 +343,13 @@ impl Shell {
     fn paint(&mut self) {
         self.frame_due = false;
         let start = self.platform.now();
+        if let Some((at, by)) = self.touch.glide(start) {
+            self.view.scroll(at, by, &mut self.platform);
+            // Nothing moved, so the page is at its end.
+            if !self.view.needs_paint() {
+                self.touch.stop();
+            }
+        }
         let wake = self.view.animate(start as u64);
         self.list.items.clear();
         self.view.paint(&mut self.list);
@@ -426,10 +449,19 @@ impl Shell {
                 event.prevent_default();
             }
         }
-        // Outside a composition the hidden input holds nothing.
         if !self.text.composing() && matches!(event.type_().as_str(), "input" | "compositionend") {
-            self.input.set_value("");
+            self.rest();
         }
+    }
+
+    /// Puts the hidden input back to what it holds between edits, with the caret after it.
+    fn rest(&self) {
+        // Writing to the input restarts a soft keyboard's session, so it is left alone when it can be.
+        if self.input.value() != TextInput::REST {
+            self.input.set_value(TextInput::REST);
+        }
+        let end = TextInput::REST.encode_utf16().count() as u32;
+        report(self.input.set_selection_range(end, end));
     }
 
     fn key_down(&mut self, event: KeyboardEvent) {
@@ -438,7 +470,8 @@ impl Shell {
     }
 
     fn before_input(&mut self, event: web_sys::InputEvent) {
-        self.text(Dom::BeforeInput { kind: &event.input_type(), data: event.data().as_deref() }, &event);
+        let (kind, data) = (event.input_type(), event.data());
+        self.text(Dom::BeforeInput { kind: &kind, data: data.as_deref(), cancelable: event.cancelable() }, &event);
     }
 
     fn input(&mut self, event: Event) {
@@ -485,19 +518,47 @@ impl Shell {
         }
         // A drag keeps reporting to the canvas after it leaves it.
         report(self.canvas.set_pointer_capture(event.pointer_id()));
-        // A touch presses without having moved there first.
-        self.pointer_move(event.clone().into());
+        if let Some(touch) = touch(&event) {
+            return self.finger(Finger::Down { id: touch, at: place(&event), ms: event.time_stamp() });
+        }
+        self.pointer_move(event.clone());
         self.view.pointer_down(self.pointer, modifiers(held!(event), self.mac), &mut self.platform);
     }
 
-    fn pointer_move(&mut self, event: MouseEvent) {
-        self.pointer = Point { x: event.offset_x() as f32, y: event.offset_y() as f32 };
+    fn pointer_move(&mut self, event: PointerEvent) {
+        if let Some(touch) = touch(&event) {
+            return self.finger(Finger::Move { id: touch, at: place(&event), ms: event.time_stamp() });
+        }
+        self.pointer = place(&event);
         self.view.pointer_move(self.pointer, &mut self.platform);
     }
 
     fn pointer_up(&mut self, event: PointerEvent) {
-        if event.button() == 0 {
+        if let Some(touch) = touch(&event) {
+            self.finger(Finger::Up { id: touch, ms: event.time_stamp() });
+        } else if event.button() == 0 {
             self.view.pointer_up(self.pointer, &mut self.platform);
+        }
+    }
+
+    fn pointer_cancel(&mut self, event: PointerEvent) {
+        match touch(&event) {
+            Some(touch) => self.finger(Finger::Cancel { id: touch }),
+            None => self.view.pointer_up(self.pointer, &mut self.platform),
+        }
+    }
+
+    /// Does what a finger's movement comes to: a scroll, or the press and release of a tap.
+    fn finger(&mut self, finger: Finger) {
+        match self.touch.event(finger) {
+            Gesture::None => {}
+            Gesture::Scroll { at, by } => self.view.scroll(at, by, &mut self.platform),
+            Gesture::Tap(at) => {
+                self.pointer = at;
+                self.view.pointer_move(at, &mut self.platform);
+                self.view.pointer_down(at, Modifiers::default(), &mut self.platform);
+                self.view.pointer_up(at, &mut self.platform);
+            }
         }
     }
 
@@ -526,6 +587,16 @@ impl Shell {
         let delta = Point { x: event.delta_x() as f32 * unit, y: event.delta_y() as f32 * unit };
         self.view.scroll(self.pointer, delta, &mut self.platform);
     }
+}
+
+/// The pointer's id if it is a finger, whose movements are gestures.
+fn touch(event: &PointerEvent) -> Option<i32> {
+    (event.pointer_type() == "touch").then(|| event.pointer_id())
+}
+
+/// Where on the canvas a pointer event happened.
+fn place(event: &PointerEvent) -> Point {
+    Point { x: event.offset_x() as f32, y: event.offset_y() as f32 }
 }
 
 /// A window on `document`, set up for this browser.

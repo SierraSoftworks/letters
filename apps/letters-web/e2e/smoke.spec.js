@@ -16,7 +16,7 @@ const colours = (page) =>
 const compose = (page, type, text) =>
   page.locator("textarea").evaluate(
     (input, [type, text]) => {
-      if (type === "input") input.value = text;
+      if (type === "input") input.value = ` ${text}`;
       const event = type === "input" ? new InputEvent(type, { data: text, isComposing: true }) : new CompositionEvent(type, { data: text });
       input.dispatchEvent(event);
     },
@@ -41,8 +41,8 @@ test("typing reaches the document and the canvas", async ({ page }) => {
   await page.keyboard.type("Typed in a browser");
   await expect.poll(() => texts(page)).toEqual([...before.slice(0, -1), "Typed in a browser"]);
   await expect.poll(() => frames(page)).toBeGreaterThan(painted);
-  // The hidden input passes text on and keeps none of it.
-  await expect(page.locator("textarea")).toHaveValue("");
+  // The hidden input passes text on and keeps none of it: only the space it rests on.
+  await expect(page.locator("textarea")).toHaveValue(" ");
 });
 
 test("editing keys and Markdown shorthand work as they do on the desktop", async ({ page }) => {
@@ -80,7 +80,7 @@ test("a composition shows as it is composed and commits its text", async ({ page
   await compose(page, "input", "にほん");
   await compose(page, "compositionend", "日本");
   await expect.poll(() => texts(page)).toContain("日本");
-  await expect(page.locator("textarea")).toHaveValue("");
+  await expect(page.locator("textarea")).toHaveValue(" ");
 });
 
 test("a press on the canvas gives the keyboard back to the document", async ({ page }) => {
