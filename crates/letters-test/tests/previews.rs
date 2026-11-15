@@ -1,10 +1,11 @@
-//! Link previews on the page: how one is put in, fetched, changed and followed.
+//! Link previews on the page: how one is put in, fetched, changed and followed, and what a link in text
+//! shows of its page.
 
 use accesskit::{Action, ActionRequest, TreeId};
 use letters_editor::Picture;
-use letters_model::{Block, BlockKind, Document};
+use letters_model::{Block, BlockKind, Body, Document, Pos, Preview, Run, Selection};
 use letters_render::Point;
-use letters_test::{Harness, Role};
+use letters_test::{Found, Harness, Role};
 use letters_ui::{LinkPreviewFound, Request, SaveState};
 
 const QUOTE: &str = "https://roofers.example.org/quotes/spring";
@@ -81,6 +82,38 @@ fn status(window: &mut Harness) -> Option<String> {
 /// The field of the card with a name, as it reads.
 fn field(window: &mut Harness, name: &str) -> Option<String> {
     window.find(Role::TextInput, name).map(|field| field.value.unwrap_or_default())
+}
+
+/// A line that links to the guide, in a document that keeps this of the guide's page.
+fn linked(kept: Option<Preview>) -> Harness {
+    let link = Run { link: Some(GUIDE.to_owned()), ..Run::plain("the quarries of Gwynedd") };
+    let runs = vec![Run::plain("Slate from "), link, Run::plain(" lasts a century.")];
+    let line = Block { body: Body::Text(runs), ..Block::new("line", BlockKind::Paragraph) };
+    let previews = kept.into_iter().map(|kept| (GUIDE.to_owned(), kept)).collect();
+    let mut window = Harness::open(Document { blocks: vec![line], previews, ..Document::default() });
+    window.paint();
+    window
+}
+
+/// What the guide's page says of itself.
+fn guide() -> Preview {
+    let (title, description) =
+        (Some("Choosing Welsh slate".to_owned()), Some("How to tell the quarries apart.".to_owned()));
+    Preview { title, description, image: Some("assets/quarry.png".to_owned()), ..Preview::default() }
+}
+
+/// A point on the link of [`linked`].
+fn link(window: &mut Harness) -> Point {
+    window.ui().select(Selection::caret(Pos::new("line", "Slate from ".len())));
+    window.paint();
+    let start = window.ui().caret_rect().expect("the page shows a caret");
+    Point { x: start.x + 12.0, y: start.y + start.height / 2.0 }
+}
+
+/// The card that shows over the page once the pointer has rested where it is.
+fn rested(window: &mut Harness) -> Option<Found> {
+    window.advance(0).advance(1_000);
+    window.controls().into_iter().find(|found| found.role == Role::Tooltip)
 }
 
 #[test]
@@ -297,4 +330,59 @@ fn assistive_technology_presses_a_preview_and_its_control() {
         assert_eq!(fetches(&mut window).len(), usize::from(fetched), "{name}");
         assert_eq!(window.find(Role::Dialog, CARD).is_some(), !fetched, "{name}: the card is out");
     }
+}
+
+#[test]
+fn a_link_in_text_shows_what_is_kept_of_its_page_while_the_pointer_rests_on_it() {
+    let mut window = linked(Some(guide()));
+    let at = link(&mut window);
+    window.ui().take_requests();
+    window.hover_at(at).advance(0);
+    assert!(
+        window.find(Role::Tooltip, "").is_none() && window.controls().iter().all(|found| found.role != Role::Tooltip)
+    );
+
+    let card = rested(&mut window).expect("a card, once the pointer has rested");
+    for said in ["Choosing Welsh slate", "How to tell the quarries apart.", "slate.example.org"] {
+        assert!(card.name.contains(said), "{said}: {:?}", card.name);
+    }
+    let beside = (card.bounds.y - at.y).abs().min((card.bounds.y + card.bounds.height - at.y).abs());
+    assert!(beside < 24.0 && !card.bounds.contains(at), "beside the link, not over it: {:?}", card.bounds);
+    // Showing it reads no page: its picture is the document's own, asked for as any picture of the page.
+    let asked = window.ui().take_requests();
+    assert!(asked.contains(&Request::Asset("assets/quarry.png".to_owned())), "{asked:?}");
+    assert_eq!(asked.len(), 1, "and nothing else is asked for: {asked:?}");
+
+    // The card goes with the pointer, and when the person writes.
+    window.hover_at(Point { x: at.x, y: at.y + 200.0 });
+    assert_eq!(rested(&mut window), None, "off the link");
+    window.hover_at(at);
+    assert!(rested(&mut window).is_some());
+    window.type_text("x");
+    assert_eq!(rested(&mut window), None, "while writing");
+}
+
+#[test]
+fn a_link_shows_no_card_when_nothing_is_kept_of_its_page() {
+    for kept in [None, Some(Preview::default())] {
+        let mut window = linked(kept.clone());
+        let at = link(&mut window);
+        window.hover_at(at);
+        assert_eq!(rested(&mut window), None, "{kept:?}");
+        assert_eq!(fetches(&mut window), [""; 0], "{kept:?}: resting on a link fetches nothing");
+    }
+}
+
+#[test]
+fn the_card_of_a_link_reads_what_is_kept_of_its_page() {
+    let mut window = linked(Some(guide()));
+    let at = link(&mut window);
+    window.key("Mod+K").assert_open(Role::Dialog, "Link");
+    assert_eq!(field(&mut window, "Link").as_deref(), Some(GUIDE));
+    window.assert_open(Role::Label, "Choosing Welsh slate").assert_open(Role::Label, "How to tell the quarries apart.");
+    // The pointer raises no second card while this one hangs from the page.
+    window.hover_at(at);
+    assert_eq!(rested(&mut window), None);
+    // What is kept is of the address in the field: another address has nothing to show yet.
+    window.type_text("x").assert_closed(Role::Label, "Choosing Welsh slate");
 }

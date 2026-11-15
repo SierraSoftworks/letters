@@ -49,6 +49,7 @@ use crate::motion::{self, FRAME_MS};
 use crate::notes::{self, Margin, Noting};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
+use crate::peek::{self, Peek, Peeks};
 use crate::pictures::{self, Linked, Linking, PictureState};
 use crate::previews::{self, LinkPreviewFound, Previewing, Previews};
 use crate::print::{Breaking, Paged, Print, Printing};
@@ -990,11 +991,14 @@ pub struct EditorApp {
     contents: Contents,
     /// The link previews under the pointer, the card of one, and what the shell says of fetching them.
     previews: Previews,
+    /// The link in text under the pointer, whose page the document keeps something of.
+    peeks: Peeks,
     /// The menu about what is under the pointer, while it is open.
     context: Option<Context>,
     /// How many of those menus were opened.
     menus: u32,
-    /// The preview of a figure that shows over the page: its caption, and where it is in the page area.
+    /// The preview that shows over the page, of a figure or of the page a link leads to: what it says, and
+    /// where it is in the page area.
     previewed: Option<(String, Rect)>,
     /// How the document read when assistive technology was last told of it.
     told: RefCell<describe::Told>,
@@ -1082,6 +1086,7 @@ impl EditorApp {
             callouts: Callouts::default(),
             contents: Contents::default(),
             previews: Previews::default(),
+            peeks: Peeks::default(),
             context: None,
             menus: 0,
             previewed: None,
@@ -2633,6 +2638,35 @@ impl EditorApp {
         Some((card.block, on_control))
     }
 
+    /// The link in text at a point of the page area whose page the document keeps something of, while
+    /// nothing hangs over the page.
+    fn peek_at(&self, at: Point) -> Option<Peek> {
+        if self.hung() || self.away() || self.dragging {
+            return None;
+        }
+        let doc = self.editor.doc();
+        let (url, line) = safe::link_line_at(doc, &self.layout, self.in_layout(at))?;
+        doc.previews.get(&url).is_some_and(|kept| !kept.is_empty()).then_some(Peek { url, line })
+    }
+
+    /// Draws what the document keeps of the page of the link under the pointer, in a card beside the
+    /// link. `room` is the size of the page area. Returns what the card says, where it is, and the
+    /// pictures it waits for.
+    fn peek(&self, room: Size, out: &mut DisplayList) -> Option<(String, Rect, Vec<String>)> {
+        let Peek { url, line } = self.peeks.shown()?.clone();
+        let anchor = self.onto(line);
+        let kept = self.editor.doc().previews.get(&url)?;
+        let size = |image: &Image| (image.width(), image.height());
+        let picture = kept.image.as_deref().and_then(|asset| self.images.get(asset)).map(size);
+        let card = peek::Card { url: &url, kept, picture, anchor, room };
+        let mut drawn = DisplayList::default();
+        let rect = card.paint(self.shaper.as_ref(), self.scheme, &mut drawn);
+        // A picture that is not here yet has its place kept.
+        let awaited = pictures::awaited(&self.images, self.scheme, &mut drawn);
+        out.items.extend(drawn.items);
+        Some((card.said(), rect, awaited))
+    }
+
     /// The address a link preview leads to.
     fn address_of(&self, preview: &BlockId) -> Option<&str> {
         self.editor.doc().block(preview).and_then(|block| previews::address(&block.kind))
@@ -2939,6 +2973,8 @@ impl EditorApp {
         let called = self.contents.point(listed) || called;
         let carded = self.references.rest().and_then(|at| self.preview_at(at));
         let called = (std::mem::replace(&mut self.previews.over, carded.clone()) != carded) || called;
+        let peeked = self.references.rest().and_then(|at| self.peek_at(at));
+        let called = self.peeks.point(peeked) || called;
         let linked = self.references.rest().and_then(|at| self.linked_at(at));
         // Each is taken, whichever changed.
         let clouded = self.linked.point(linked);
@@ -3618,6 +3654,17 @@ impl EditorApp {
             review::cuts(cut, shift, room)
         });
         self.previewed = self.preview(room, &mut over);
+        if self.previewed.is_none()
+            && let Some((said, rect, awaited)) = self.peek(room, &mut over)
+        {
+            // The card's picture is the document's own, asked for once like any other the page shows.
+            for asset in awaited {
+                if self.wanted.insert(asset.clone()) {
+                    self.requests.push(Request::Asset(asset));
+                }
+            }
+            self.previewed = Some((said, rect));
+        }
         if let Some((at, image)) = carried {
             self.carry(image, at, &mut over);
         }
@@ -3730,7 +3777,19 @@ impl EditorApp {
                 .on_press(Message::Safe(Safely::Follow(address.clone())));
             let row = Element::row().align(Align::Center).gap(tokens::SPACE_XS).width(LINK_WIDTH);
             let row = row.child(Element::from(field).grow(1.0)).child(open);
-            let editor = Popover::new(row)
+            // What the document keeps of the page there is read here too, by someone with no pointer.
+            let mut card = Element::column().gap(tokens::SPACE_SM).width(LINK_WIDTH).child(row);
+            if let Some(kept) = self.editor.doc().previews.get(address.trim()) {
+                let quiet = TextStyle::control().size(tokens::TEXT_SM);
+                let lines =
+                    [(&kept.title, tokens::FG, quiet.weight(600)), (&kept.description, tokens::FG_MUTED, quiet)];
+                let said = lines.into_iter().filter_map(|(line, ink, style)| {
+                    let said = line.as_deref().map(str::trim).filter(|said| !said.is_empty())?;
+                    Some(Element::paragraph(said, style).fg(ink).max_width(LINK_WIDTH))
+                });
+                card = card.child(Element::column().gap(tokens::SPACE_XS).children(said));
+            }
+            let editor = Popover::new(card)
                 .label("Link")
                 .max_width(LINK_WIDTH + 2.0 * tokens::SPACE_MD + 2.0)
                 .open(true)
@@ -5109,7 +5168,8 @@ impl App for EditorApp {
         let light = self.references.animate(now_ms);
         let copied = self.code_copy.animate(now_ms);
         let slid = self.review.animate(now_ms);
-        [note, slide, fade, light, copied, slid].into_iter().flatten().min()
+        let rested = self.peeks.animate(now_ms);
+        [note, slide, fade, light, copied, slid, rested].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {

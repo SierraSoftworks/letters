@@ -134,7 +134,7 @@ pub(crate) fn link(block: &Block) -> Option<&str> {
 }
 
 /// The host a link names, as the page writes it on a picture that is not loaded.
-fn host(src: &str) -> &str {
+pub(crate) fn host(src: &str) -> &str {
     let rest = src.split_once("://").map_or(src, |(_, rest)| rest);
     let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     host.rsplit_once('@').map_or(host, |(_, host)| host)

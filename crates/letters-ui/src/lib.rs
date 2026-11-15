@@ -35,6 +35,7 @@ pub mod motion;
 mod notes;
 mod opening;
 mod paint;
+mod peek;
 mod pictures;
 mod previews;
 mod print;
