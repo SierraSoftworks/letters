@@ -217,6 +217,12 @@ pub enum Command {
     },
     /// Sets the paper size and margins.
     SetPage(Page),
+    /// Makes a page of print start with a block, or no longer start there. Nothing of it shows while
+    /// writing: Print view places these breaks and takes them away.
+    SetPageBreak {
+        block: BlockId,
+        on: bool,
+    },
     /// Replaces the whole style, as applying a stylesheet does.
     ReplaceStyle(Style),
     /// Sets the language the document is written in.
@@ -519,6 +525,9 @@ impl Editor {
             // The figure is named, so the caret has no say.
             return self.embeddable(figure, picture);
         }
+        if let Command::SetPageBreak { block, on } = command {
+            return self.doc().block(block).is_some_and(|block| block.page_break != *on);
+        }
         let Some(caret) = &self.caret else {
             return match command {
                 Command::Undo => self.can_undo(),
@@ -619,6 +628,11 @@ impl Editor {
             Command::PastePlain => self.paste(true, platform),
             Command::SetStyle { element, style } => _ = self.apply(vec![Op::SetStyle { element, style }]),
             Command::SetPage(page) => _ = self.apply(vec![Op::SetPage { page }]),
+            Command::SetPageBreak { block, on } => {
+                // The op sets all a block may carry, so the language goes back as it is.
+                let lang = self.doc().block(&block).and_then(|block| block.lang.clone());
+                _ = self.apply(vec![Op::SetBlockProps { block, page_break: on, lang }]);
+            }
             Command::ReplaceStyle(style) => _ = self.apply(vec![Op::ReplaceStyle { style }]),
             Command::SetLanguage(language) => _ = self.apply(vec![Op::SetLanguage { language }]),
             Command::AddWord(word) => _ = self.apply(vec![Op::AddWord { word }]),
@@ -646,7 +660,8 @@ impl Editor {
             Op::DeleteText { block, .. }
             | Op::SetMark { block, .. }
             | Op::SetLink { block, .. }
-            | Op::SetKind { block, .. } => Some(block.clone()),
+            | Op::SetKind { block, .. }
+            | Op::SetBlockProps { block, .. } => Some(block.clone()),
             _ => None,
         };
         let before: Option<Vec<Block>> = (!ops.iter().any(structural)).then(|| {

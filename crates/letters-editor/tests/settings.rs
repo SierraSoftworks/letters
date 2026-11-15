@@ -4,9 +4,9 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use common::{Harness, canon};
+use common::{Harness, canon, parse};
 use letters_editor::{Command, InputEvent};
-use letters_model::{Change, Page, Style, TextStyle};
+use letters_model::{BlockId, Change, Model, Page, ReplicaId, Style, TextStyle};
 
 /// Sets the style of first headings to the built-in one at another size.
 fn heading(size: f32) -> Command {
@@ -124,4 +124,42 @@ fn a_style_changed_outside_is_shown_and_is_no_undo_step() {
     assert_eq!(editor.editor.model().style(), &narrow());
     assert_eq!(editor.state(), canon("p on^e|"));
     assert!(!editor.editor.can_undo());
+}
+
+#[test]
+fn a_page_is_made_to_start_with_a_named_block_wherever_the_caret_is() {
+    let breaks = |editor: &Harness| -> Vec<bool> { editor.editor.doc().walk().map(|block| block.page_break).collect() };
+    // With the caret in another block, and with a selection in the block itself.
+    for state in ["p one|\np two\np three", "p one\np tw^o|\np three"] {
+        let mut editor = Harness::new(state);
+        let second = BlockId::new("b2");
+        let start = Command::SetPageBreak { block: second.clone(), on: true };
+
+        let change = editor.run(start.clone());
+        assert_eq!(breaks(&editor), [false, true, false], "in {state:?}");
+        assert!(change.blocks.contains(&second), "the layout hears of it, in {state:?}");
+        assert_eq!(editor.state(), canon(state), "the text and the selection stay, in {state:?}");
+        assert_eq!(editor.run(start), Change::default(), "set again, it changes nothing");
+
+        editor.run(Command::Undo);
+        assert_eq!(breaks(&editor), [false; 3], "undone in {state:?}");
+        editor.run(Command::Redo);
+        editor.run(Command::SetPageBreak { block: second, on: false });
+        assert_eq!(breaks(&editor), [false; 3], "taken away in {state:?}");
+    }
+}
+
+#[test]
+fn a_page_break_leaves_the_language_of_its_block_and_needs_a_block() {
+    let (mut doc, _) = parse("p un\np deux");
+    doc.blocks[1].lang = Some("fr".into());
+    let mut editor = Harness::on(Model::new(doc, ReplicaId::from(1)), 1);
+    let second = BlockId::new("b2");
+    editor.run(Command::SetPageBreak { block: second.clone(), on: true });
+    let block = editor.editor.doc().block(&second).expect("the second block");
+    assert_eq!((block.page_break, block.lang.as_deref()), (true, Some("fr")));
+
+    let missing = Command::SetPageBreak { block: BlockId::new("nowhere"), on: true };
+    assert!(!editor.editor.applies(&missing));
+    assert_eq!(editor.run(missing), Change::default());
 }
