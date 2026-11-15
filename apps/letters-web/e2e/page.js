@@ -23,6 +23,15 @@ export const frames = (page) => page.evaluate(() => window.letters.frames);
 /** Waits for the frame that follows an edit, and for the spelling check that runs once it is painted. */
 export const rested = (page) => page.evaluate(() => new Promise((done) => requestAnimationFrame(() => setTimeout(done, 100))));
 
+/** Opens the document's history. Its versions are the options of its list. */
+export const history = async (page) => {
+  await page.keyboard.press("ControlOrMeta+Shift+p");
+  await page.keyboard.type("History");
+  await rested(page);
+  await page.keyboard.press("Enter");
+  await page.getByRole("button", { name: "Back to editing" }).waitFor({ state: "attached" });
+};
+
 /** An entry of a zip that Letters wrote, as text. `zip` is a `Buffer`. */
 export const entry = (zip, name) => {
   for (let at = 0; zip.readUInt32LE(at) === 0x04034b50; ) {

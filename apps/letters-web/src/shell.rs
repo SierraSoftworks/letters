@@ -12,7 +12,9 @@ use std::rc::{Rc, Weak};
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Array, Function, Map, Object, Promise, Reflect, Uint8Array};
 use letters_editor::{Clip, Editor, KeyEvent, Modifiers, Picture, Platform as _};
-use letters_model::{BlockKind, Document, HistoryError, Mark, Model, Notes, Pos, ReplicaId, Selection, Style};
+use letters_model::{
+    BlockKind, Change, Document, HistoryError, Mark, Model, Notes, Pos, ReplicaId, Revision, Selection, Style, TagKind,
+};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::{Color, DisplayList, Point, Rect, Size};
 use letters_trust::{LinkDecision, Origin, Trust};
@@ -70,6 +72,10 @@ const DOCUMENTS: &str = ".let";
 /// What the Comment tool says of a document whose notes this build could not read, as the desktop does.
 const NO_COMMENTS: &str = "Comments cannot be added here: this document's notes are in a form this version of \
                            Letters cannot read.";
+
+/// How long writing rests before where it stopped is marked as a version, in seconds. The desktop marks
+/// after the same rest, and the history ends a version at it.
+const REST: u64 = 600;
 
 /// The mirror: over the canvas, so that what it says about where things are is true, and out of sight and
 /// out of the pointer's way. Its text is not for the eye, so the page lays out as little of it as it can.
@@ -160,6 +166,14 @@ pub struct Shell {
     /// The document's id and when it was created, which its file says. One that never had a file is
     /// given them when it is first saved.
     identity: Option<[String; 2]>,
+    /// The revision a file was opened at, until the person writes on from it.
+    session: Option<Revision>,
+    /// What `View::edits` last said.
+    written: u64,
+    /// The revision the last edit led to, and when it was made by the wall clock, in seconds.
+    rested: Option<(Revision, u64)>,
+    /// How far the browser's clock is ahead of UTC in minutes, as the window was last told.
+    zone: i32,
     /// The handles at the ends of the selection, the anchor's first, and how each was last styled.
     handles: [(HtmlElement, String); 2],
     /// Whether the page was last pressed by a finger, which is who the handles are for.
@@ -278,6 +292,10 @@ impl Shell {
                 opener: opener.clone(),
                 kept: view.edits(),
                 identity: None,
+                session: None,
+                written: view.edits(),
+                rested: None,
+                zone: zone(),
                 handles: handles.clone(),
                 fingers: false,
                 editing: false,
@@ -430,6 +448,7 @@ impl Shell {
     pub fn open(&mut self, document: Document) {
         self.view = view(document, &mut self.platform, self.mac);
         (self.kept, self.identity) = (self.view.edits(), None);
+        (self.session, self.written, self.rested) = (None, self.kept, None);
         self.text = TextInput::new(self.mac);
         self.touch = Touch::default();
         self.rest();
@@ -758,9 +777,13 @@ impl Shell {
         let replica = ReplicaId::new(&self.platform.new_id());
         let shown = || Model::new(document.clone(), replica).with_style(style.clone());
         let mut view = set_up(View::new(Editor::with_model(shown())), &mut self.platform, self.mac);
+        let mut session = None;
         if let Some(history) = history {
             match shown().prepare(Some(&Uint8Array::new(&history).to_vec())) {
-                Ok(history) => _ = view.change(|editor| Ok::<_, Infallible>(editor.attach(history))),
+                Ok(history) => {
+                    _ = view.change(|editor| Ok::<_, Infallible>(editor.attach(history)));
+                    session = Some(view.editor().model().revision());
+                }
                 // A history that cannot be read starts over from the document.
                 Err(error) => web_sys::console::error_1(&format!("{name}: {error}").into()),
             }
@@ -779,6 +802,7 @@ impl Shell {
             self.platform.assets.extend(name.as_string().map(|name| (name, picture)));
         });
         (self.kept, self.identity) = (view.edits(), Some(identity));
+        (self.session, self.written, self.rested) = (session, self.kept, None);
         self.view = view;
         self.text = TextInput::new(self.mac);
         self.touch = Touch::default();
@@ -888,6 +912,17 @@ impl Shell {
         // During an edit the hidden input's selection is what the edit is aimed at, and no move of the caret.
         if !std::mem::take(&mut self.editing) {
             self.keyboard_moved();
+        }
+        // The browser's clock changes with the season and the place.
+        let zone = zone();
+        if zone != self.zone {
+            self.zone = zone;
+            self.view.set_utc_offset(zone);
+        }
+        let edits = self.view.edits();
+        if edits != self.written {
+            self.written = edits;
+            self.wrote();
         }
         for request in self.view.take_requests() {
             match request {
@@ -1056,6 +1091,25 @@ impl Shell {
         };
         self.view.access_action(request, &mut self.platform);
         self.hand_over();
+    }
+
+    /// The document was written in. What it held when its file was opened, and where writing rested for
+    /// long, is a version of its own. It is marked only now, as the desktop does: a mark is part of the
+    /// history, and a file that was only read is not to change.
+    fn wrote(&mut self) {
+        let now = self.platform.wall_time().unwrap_or_default();
+        let opened = self.session.take().map(|opened| (opened, TagKind::Session));
+        let paused = self.rested.take_if(|(_, since)| now.saturating_sub(*since) >= REST);
+        if let Some((before, kind)) = opened.or(paused.map(|(before, _)| (before, TagKind::Pause))) {
+            self.mark(&before, kind);
+        }
+        self.rested = Some((self.view.editor().model().revision(), now));
+    }
+
+    /// Marks `revision` as a version. A mark is part of the history, and no edit.
+    fn mark(&mut self, revision: &Revision, kind: TagKind) {
+        let marked = self.view.change(|editor| editor.mark_version(revision, kind, None).map(|()| Change::default()));
+        report(marked.map_err(|error| error.to_string().into()));
     }
 
     /// Lets the view move what moves on its own, when the time it asked for has come.
@@ -1548,10 +1602,16 @@ fn view(document: Document, platform: &mut Browser, mac: bool) -> View {
 /// Sets a window up for this browser and the person in it.
 fn set_up(mut view: View, platform: &mut Browser, mac: bool) -> View {
     view.set_keys(if mac { Keys::Mac } else { Keys::Standard });
+    view.set_utc_offset(zone());
     view.set_user_words(platform.user_words());
     view.set_default_style(platform.default_style());
     follow(&mut view, platform.settings());
     view
+}
+
+/// How far the browser's clock is ahead of UTC, in minutes.
+fn zone() -> i32 {
+    -js_sys::Date::new_0().get_timezone_offset() as i32
 }
 
 /// Has `view` take `settings`, and sign the person's edits with the name they set. There is no account to

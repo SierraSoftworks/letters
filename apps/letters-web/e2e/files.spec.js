@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 
 import { expect, test } from "@playwright/test";
 
-import { blocks, entry, ready, rested, texts } from "./page.js";
+import { blocks, entry, history, ready, rested, texts } from "./page.js";
 
 /** Pastes a small picture, which becomes a figure. */
 const picture = async (page) => {
@@ -98,6 +98,24 @@ test("a file that was opened is saved as the same document, and copied as anothe
   await expect(page.getByRole("dialog", { name: "Save a copy" })).toBeAttached();
   const copy = await saved(page, "Enter");
   expect(identity(copy).id).not.toBe(identity(file).id);
+});
+
+test("what a file held when it was opened is a version of its own once it is written on", async ({ page }) => {
+  await page.keyboard.type("From one sitting");
+  const file = await saved(page);
+  await ready(page);
+  await drop(page, [file]);
+  await expect.poll(() => texts(page)).toContain("From one sitting");
+
+  // A version between the first and the current one is listed by the time it was written at.
+  const earlier = page.getByRole("option", { name: /^\d\d:\d\d$/ });
+  await history(page);
+  await expect(earlier).toHaveCount(0);
+  await page.keyboard.press("Escape");
+
+  await page.keyboard.type("And from the next. ");
+  await history(page);
+  await expect(earlier).toHaveCount(1);
 });
 
 test("Open asks for a document's file, and shows it with its name, its pictures and its history", async ({ page }) => {
