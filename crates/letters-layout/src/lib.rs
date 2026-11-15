@@ -334,7 +334,7 @@ impl DocLayout {
 
     /// The stretch of the column that a block takes up with the space above it, from the column's top. A
     /// block inside another, as a cell is in a table, answers for the whole top-level block around it.
-    pub(crate) fn band(&self, block: &BlockId) -> Option<(f32, f32)> {
+    pub fn band(&self, block: &BlockId) -> Option<(f32, f32)> {
         self.state.borrow_mut().band(block)
     }
 

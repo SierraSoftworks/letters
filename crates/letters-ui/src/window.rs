@@ -1594,7 +1594,9 @@ impl EditorApp {
                 self.dragging = false;
                 self.unpoint();
                 let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
-                self.history = Some(History::new(&steps, current, platform.wall_time(), self.zone));
+                let mut history = History::new(&steps, current, platform.wall_time(), self.zone);
+                history.still = self.reduced_motion;
+                self.history = Some(history);
                 // The nodes that stand for the blocks go with the page, and are told whole when it is back.
                 self.told.get_mut().forget();
                 self.turn();
@@ -1609,6 +1611,12 @@ impl EditorApp {
                 self.turn();
             }
             Historying::Scroll(delta) => self.history.iter_mut().for_each(|history| history.scroll(delta)),
+            Historying::Down(at) => self.history.iter_mut().for_each(|history| history.press(at)),
+            Historying::Up(at) => self.history.iter_mut().for_each(|history| history.release(at)),
+            Historying::Compare(with) => {
+                self.history.iter_mut().for_each(|history| history.compare(with));
+                self.turn();
+            }
             Historying::Restore => {
                 let Some(revision) = self.history.as_ref().map(|history| history.picked().at.clone()) else { return };
                 // The document reads as the version again, and is there to be written on.
@@ -1618,13 +1626,16 @@ impl EditorApp {
         }
     }
 
-    /// Reads the version the history has picked, when it is not the one that shows.
+    /// Reads what the history is to show and has not read: the version it has picked, and the one that
+    /// is compared with.
     fn turn(&mut self) {
-        let Some(revision) = self.history.as_ref().and_then(|history| history.wanted().cloned()) else { return };
-        let read = self.editor.document_at(&revision).ok();
-        if let Some(history) = &mut self.history {
-            history.show(read);
+        let Some(history) = &mut self.history else { return };
+        for revision in history.wanted() {
+            if let Ok(read) = self.editor.document_at(&revision) {
+                history.take(revision, read);
+            }
         }
+        history.show();
     }
 
     /// Gives the page its place back from the history.
@@ -1638,7 +1649,8 @@ impl EditorApp {
     /// The version the history has picked, for the area the page has while it is edited.
     fn version(&mut self, room: Size) -> Element<Message> {
         let Some(history) = self.history.as_mut() else { return Element::row() };
-        let (version, awaited) = history.view(room, &self.images, self.palette, self.scheme, self.scale);
+        let shaper = self.shaper.as_ref();
+        let (version, awaited) = history.view(room, &self.images, shaper, self.palette, self.scheme, self.scale);
         for asset in awaited {
             if self.wanted.insert(asset.clone()) {
                 self.requests.push(Request::Asset(asset));
@@ -3791,6 +3803,7 @@ impl App for EditorApp {
     fn reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
         self.review.still = reduced;
+        self.history.iter_mut().for_each(|history| history.still = reduced);
         self.references.set_reduced_motion(reduced);
     }
 
@@ -3798,8 +3811,8 @@ impl App for EditorApp {
         if let Some(print) = self.printing.as_mut() {
             return print.point(at);
         }
-        if self.history.is_some() {
-            return false;
+        if let Some(history) = self.history.as_mut() {
+            return history.point(at);
         }
         // The page has nothing of its own under the version held back, nor under the buttons.
         let moved = self.review.point(at);
@@ -3836,7 +3849,8 @@ impl App for EditorApp {
         let light = self.references.animate(now_ms);
         let copied = self.code_copy.animate(now_ms);
         let slid = self.review.animate(now_ms);
-        [note, slide, fade, light, copied, slid].into_iter().flatten().min()
+        let brought = self.history.as_mut().and_then(|history| history.animate(now_ms));
+        [note, slide, fade, light, copied, slid, brought].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {

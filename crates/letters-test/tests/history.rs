@@ -1,11 +1,11 @@
 //! The history: the document's versions listed by day beside the one that is picked, which is read where
-//! the page was and can be restored.
+//! the page was, shows how it differs from the version before it or from the document, and can be restored.
 
 use letters_editor::Editor;
 use letters_model::{Block, ReplicaId};
-use letters_render::{Item, Rect};
+use letters_render::{Color, Item, Point, Rect};
 use letters_test::{Found, Harness, Role};
-use letters_ui::Window;
+use letters_ui::{Window, tokens};
 
 /// Midnight before Sunday 15 November 2026 in UTC, in seconds since 1970.
 const SUNDAY: u64 = 1_794_700_800;
@@ -30,14 +30,18 @@ fn write(window: &mut Harness, at: u64, old: &str, new: &str) {
     window.select(old).type_text(new);
 }
 
-/// Has another writer change the document on a device of their own, and brings the change in.
-fn merge(window: &mut Harness, writer: &str, at: u64, old: &str, new: &str) {
+/// Has another writer change the document on a device of their own, and brings the changes in.
+fn merged(window: &mut Harness, writer: &str, change: impl FnOnce(&mut Harness)) {
     let copy = window.editor().model().fork(ReplicaId::from(2));
     let mut theirs = Harness::with(Window::new(Editor::with_model(copy)));
     theirs.ui().set_author(writer);
-    write(&mut theirs, at, old, new);
+    change(&mut theirs);
     let history = theirs.editor().model().save();
     window.ui().change(|editor| editor.merge(&history)).expect("a history of the same document");
+}
+
+fn merge(window: &mut Harness, writer: &str, at: u64, old: &str, new: &str) {
+    merged(window, writer, |theirs| write(theirs, at, old, new));
 }
 
 /// The letter Sam has open at twenty past nine on that Sunday. It was begun without a date, Sam wrote on
@@ -60,7 +64,7 @@ fn history() -> Harness {
     window
 }
 
-/// A survey long enough to scroll, written on twice.
+/// A survey long enough to scroll, written on twice. The second time a line was added at its end.
 fn survey() -> Harness {
     // Each line is longer than the page is wide.
     let found = "says what was found on that part of the roof, and what the roofer made of it when he came down";
@@ -68,9 +72,98 @@ fn survey() -> Harness {
     let mut window = Harness::doc(&format!("# Survey\n\n{}", lines.join("\n\n")));
     write(&mut window, SUNDAY + HOUR, "Line 1 ", "The first line ");
     write(&mut window, SUNDAY + 3 * HOUR, "Line 60 ", "The last line ");
+    window.key("Mod+End").key("Enter").type_text("The roofer signed the survey.");
     window.platform.wall = Some(SUNDAY + 4 * HOUR);
     window.click(Role::Button, "History");
     window
+}
+
+/// What the plan read when it was begun, block by block.
+const PLAN: [&str; 6] = [
+    "# Cottage renovation",
+    "The cottage needs three jobs done. Costs are still unknown.",
+    "## Roof first",
+    "The quote covers slates and battens.",
+    "The scaffold is hired by the week.",
+    "The old boards come up. The joists are sound, so the new floor goes straight on.",
+];
+/// What its blocks under the heading read once Alice had written on it.
+const HERS: [&str; 6] = [
+    "The cottage needs three jobs done. This plan keeps them in order.",
+    "Roof first",
+    "The quote covers slates and battens and the lead flashing.",
+    "The old pine boards come up. The new floor goes straight on.",
+    "Budget",
+    "Roof and gutters come to 8,400.",
+];
+
+/// A plan with its history showing, and what Alice wrote on Tuesday afternoon picked. Sam wrote on it
+/// that morning. Then Alice rewrote the end of its first paragraph, added to the quote, took the scaffold
+/// out and some words about the floor, and added a budget. Sam wrote on it again this morning.
+fn plan() -> Harness {
+    let mut sam = Harness::doc(&PLAN.join("\n\n"));
+    sam.ui().set_author("Sam Okafor");
+    write(&mut sam, SUNDAY - 5 * DAY + 11 * HOUR + 30 * MINUTE, "old boards", "old pine boards");
+    merged(&mut sam, "Alice Moreau", |alice| {
+        write(
+            alice,
+            SUNDAY - 5 * DAY + 16 * HOUR + 42 * MINUTE,
+            "Costs are still unknown.",
+            "This plan keeps them in order.",
+        );
+        alice.select("battens").type_text("battens and the lead flashing");
+        alice.select(PLAN[4]).key("Backspace").key("Backspace");
+        alice.select("The joists are sound, so the").type_text("The");
+        alice.select("straight on.").key("Right").key("Enter").type_text("## Budget");
+        alice.key("Enter").type_text("Roof and gutters come to 8,400.");
+    });
+    write(&mut sam, SUNDAY + 9 * HOUR + 12 * MINUTE, "pine boards", "wide pine boards");
+    sam.platform.wall = Some(SUNDAY + 9 * HOUR + 20 * MINUTE);
+    sam.click(Role::Button, "History").click(Role::ListBoxOption, "16:42");
+    sam
+}
+
+/// What the version that shows says of each block that differs, with what the block reads, down the page.
+fn differing(window: &mut Harness) -> Vec<(String, String)> {
+    let controls = window.controls();
+    let blocks = controls.iter().enumerate().filter(|(_, found)| matches!(found.role, Role::Paragraph | Role::Heading));
+    let said = blocks.filter_map(|(at, block)| {
+        let reads = controls[at..].iter().find(|found| found.role == Role::TextRun)?.value.clone()?;
+        Some((block.description.clone()?, reads.trim_end().to_owned()))
+    });
+    said.collect()
+}
+
+/// A rewritten block as it read before, which shows beside the block or over it.
+fn before(window: &mut Harness) -> Option<Found> {
+    window.controls().into_iter().find(|found| found.role == Role::Note && found.name.starts_with("Before"))
+}
+
+/// How many stretches of words are marked as only the earlier version's, and as only the later one's.
+fn marked(window: &mut Harness) -> [usize; 2] {
+    let fills: Vec<Color> = window
+        .paint()
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            Item::Fill { color, .. } => Some(color),
+            _ => None,
+        })
+        .collect();
+    [tokens::WARN_SOFT, tokens::INFO_SOFT].map(|ink| {
+        let tint = Color::rgba(ink.light.r, ink.light.g, ink.light.b, ink.light.a);
+        fills.iter().filter(|color| **color == tint).count()
+    })
+}
+
+/// The part of the window the version shows in.
+fn area(window: &mut Harness) -> Rect {
+    window.controls().into_iter().find(|found| found.role == Role::Document).expect("a page").bounds
+}
+
+/// Whether `inner` shows whole between the left and right edges of `outer`.
+fn across(inner: Rect, outer: Rect) -> bool {
+    inner.x >= outer.x && inner.x + inner.width <= outer.x + outer.width
 }
 
 /// The versions the panel lists, newest first.
@@ -130,6 +223,8 @@ fn kept(window: &mut Harness) -> Kept {
 type Act = fn(&mut Harness);
 /// A way of picking the version that is so many back from the newest.
 type Pick = fn(&mut Harness, usize);
+/// How far into the page area a press is, given how much of the earlier version shows at its left.
+type Reach = fn(f32) -> f32;
 
 const PICKS: [(&str, Pick); 2] = [
     ("a press", |window, back| {
@@ -327,4 +422,132 @@ fn a_version_is_set_again_for_a_window_of_another_width() {
         // Its longest line ends about as far from the right as its lines start from the left.
         assert!(right < left + 80.0, "{width}: the text takes the width there is, {left} and {right} from the edges");
     }
+}
+
+#[test]
+fn a_version_shows_what_it_changed_from_the_version_before_it() {
+    let mut window = plan();
+    let document = window.markdown();
+    // What is said of each block that differs, and some of what the block reads.
+    let expected = [
+        ("After, by Alice Moreau, Tuesday 16:42", "This plan keeps them in order."),
+        ("Added: and the lead flashing", "battens and the lead flashing."),
+        ("Removed by Alice Moreau", PLAN[4]),
+        ("Removed: joists are sound, so the", "The joists are sound, so the new floor"),
+        ("Added by Alice Moreau", "Budget"),
+        ("Added by Alice Moreau", "Roof and gutters"),
+    ];
+    let found = differing(&mut window);
+    assert_eq!(found.len(), expected.len(), "{found:?}");
+    for ((said, reads), (says, holds)) in found.iter().zip(expected) {
+        assert!(said == says && reads.contains(holds), "{said:?} of {reads:?}, for {says:?} of {holds:?}");
+    }
+    // The paragraph that was rewritten shows as it read before as well, under the name of who wrote that.
+    let before = before(&mut window).expect("the paragraph as it read before");
+    assert_eq!(before.name, "Before, by Sam Okafor, Tuesday 11:30");
+    assert_eq!(before.value.as_deref(), Some(PLAN[1]));
+    let [gone, came] = marked(&mut window);
+    assert!(gone >= 2 && came >= 2, "words of both versions are marked: {gone} and {came}");
+    assert_eq!(window.markdown(), document, "the document itself is as it was");
+}
+
+#[test]
+fn a_version_compared_with_the_document_shows_what_has_changed_since() {
+    let mut window = plan();
+    window.click(Role::ListBoxOption, "11:30").click(Role::RadioButton, "Current");
+    let found = differing(&mut window);
+    let says = |said: &str, holds: &str| found.iter().any(|(told, reads)| told == said && reads.contains(holds));
+    assert!(says("After, by Sam Okafor, Today 09:12", "This plan keeps them in order."), "{found:?}");
+    assert!(says("Removed later", PLAN[4]), "{found:?}");
+    assert!(says("Added later", "Budget"), "{found:?}");
+    // The version that is picked is the earlier of the two.
+    let before = before(&mut window).expect("the paragraph as the picked version has it");
+    assert_eq!(before.name, "Before, by Sam Okafor, Tuesday 11:30");
+
+    // What comes in while it shows is part of the document it is compared with.
+    merge(&mut window, "Alice Moreau", SUNDAY + 9 * HOUR + 40 * MINUTE, "8,400", "9,100");
+    assert!(differing(&mut window).iter().any(|(said, reads)| said == "Added later" && reads.contains("9,100")));
+    assert_eq!(picked(&mut window).as_deref(), Some("11:30"));
+}
+
+#[test]
+fn a_version_with_nothing_to_compare_it_with_shows_as_it_read() {
+    // What is picked and pressed, and what the version then reads under its heading.
+    let cases: [(&str, Act, &[&str]); 3] = [
+        ("compared with nothing", |window| _ = window.click(Role::RadioButton, "Off"), &HERS),
+        ("the first version", |window| _ = window.click(Role::ListBoxOption, "First version"), &PLAN[1..]),
+        (
+            "the document against itself",
+            |window| {
+                window.click(Role::ListBoxOption, "Current version").click(Role::RadioButton, "Current");
+            },
+            &[],
+        ),
+    ];
+    for (name, pick, reads) in cases {
+        let mut window = plan();
+        pick(&mut window);
+        assert_eq!(differing(&mut window), [], "{name}: nothing is said to differ");
+        assert!(before(&mut window).is_none(), "{name}: no block shows twice");
+        assert_eq!(marked(&mut window), [0, 0], "{name}: no words are marked");
+        // A heading is written here with the signs that Markdown makes one from.
+        let expected: Vec<&str> = reads.iter().map(|text| text.trim_start_matches(['#', ' '])).collect();
+        if !expected.is_empty() {
+            assert_eq!(shown(&mut window), expected, "{name}: only what the version itself has shows");
+        }
+    }
+}
+
+#[test]
+fn both_versions_of_a_rewritten_block_stand_side_by_side_while_the_window_has_room_for_them() {
+    // How wide the window is, whether the earlier version shows whole, and whether it takes the page's
+    // whole width, as the upper one of a stack does.
+    let cases = [(1720.0, true, false), (1440.0, false, false), (900.0, true, true)];
+    for (width, whole, stacked) in cases {
+        let mut window = plan();
+        window.resize(width, 800.0);
+        let (area, before) = (area(&mut window), before(&mut window).expect("the earlier version").bounds);
+        assert_eq!(across(before, area), whole, "{width}: {before:?} in {area:?}");
+        assert_eq!(before.width > 0.9 * area.width, stacked, "{width}: {before:?} in {area:?}");
+        assert!(before.y > area.y, "{width}: under the heading, which both versions have");
+    }
+}
+
+#[test]
+fn a_version_the_window_cuts_off_comes_across_when_it_is_pressed() {
+    // Where the press is: how far into the page area from its left edge, given how much of the earlier
+    // version shows there.
+    let ways: [(&str, Reach); 2] = [
+        ("what shows of the version", |showing| showing / 2.0),
+        ("the round button at the window's edge", |_| tokens::SPACE_LG + 16.0),
+    ];
+    for (way, across_to) in ways {
+        let mut window = plan();
+        window.resize(1440.0, 800.0);
+        let whole = |window: &mut Harness| across(before(window).expect("the earlier version").bounds, area(window));
+        assert!(!whole(&mut window), "{way}: the later version is the one that shows whole at first");
+
+        let (area, before) = (area(&mut window), before(&mut window).expect("the earlier version").bounds);
+        let x = area.x + across_to(before.x + before.width - area.x);
+        window.click_at(Point { x, y: before.y + before.height / 2.0 });
+        window.advance(16).advance(400);
+        assert!(whole(&mut window), "{way}: the pair slid across");
+        // Another version starts with its later side whole again.
+        window.key("Right").key("Left");
+        assert!(!whole(&mut window), "{way}");
+    }
+}
+
+#[test]
+fn a_version_is_listed_with_how_much_it_put_in_and_took_out() {
+    let mut window = plan();
+    let listed = versions(&mut window);
+    let told = |name: &str| {
+        let version = listed.iter().find(|version| version.name == name).expect("a version of that name");
+        version.description.clone().unwrap_or_default()
+    };
+    // Sam wrote fifteen characters over ten, and Alice both wrote and took out.
+    assert!(told("11:30").ends_with("15 characters added, 10 removed"), "{}", told("11:30"));
+    assert!(told("16:42").contains(" added, ") && told("16:42").ends_with(" removed"), "{}", told("16:42"));
+    assert!(!told("First version").contains("removed"), "{}", told("First version"));
 }

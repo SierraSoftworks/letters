@@ -7,31 +7,41 @@
 //! The model's history has a step for each minute of a writer's typing. A version is a run of steps with
 //! no long rest in it and no night between: what was written at one sitting. A step that was marked ends
 //! its version, so that a named version, an import, a merge or a restore is listed on its own.
+//!
+//! A version shows with what it changed, or with what has changed since: compared with the version before
+//! it or with the document as it reads now. A block that was rewritten shows as it read before and after,
+//! the page split there as it is at a conflict. A block that only gained words, or only lost some, shows
+//! once with those words marked, and a line over blocks that only one version has says so.
 
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use accesskit::{Node, NodeId, Role};
 use letters_editor::{Key, KeyEvent};
-use letters_layout::{DocLayout, Fonts, Palette};
-use letters_model::{BlockKind, Document, Point as Step, Revision, Style, Tag, TagKind};
+use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split};
+use letters_model::{
+    Block, BlockId, BlockKind, Body, Document, Point as Step, Pos, Revision, Selection, Style, Tag, TagKind,
+};
 use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Item, PathEl, Point, Rect, Size};
 
 use crate::color::resolve;
 use crate::describe::{self, Told};
-use crate::element::{Element, Paint, Pointer};
+use crate::element::{Cursor, Element, Paint, Pointer};
 use crate::highlight;
 use crate::icon;
+use crate::motion::{self, FRAME_MS};
 use crate::notes;
 use crate::opening::{MONTHS, WEEKDAYS};
 use crate::paint::scrollbar;
 use crate::pictures;
+use crate::review;
 use crate::style::{Align, Edges, Look};
-use crate::text::TextStyle;
+use crate::text::{Family, TextShaper, TextStyle};
 use crate::theme::accent;
 use crate::threads;
 use crate::tokens::{self, Color as Ink, Scheme};
-use crate::widgets::{Button, SidePanel, TopBar};
+use crate::widgets::{Button, Menu, MenuItem, Segmented, SidePanel, TopBar};
 use crate::window::{GUTTER, Message, PT, TOP};
 
 /// How long writing rests before what comes after it is another version, in seconds.
@@ -52,6 +62,18 @@ const CLEAR: f32 = 3.0;
 const HEAD: f32 = 20.0;
 /// The sign of a version that was given a name.
 const SIGN: f32 = 12.0;
+/// The room over a stretch of blocks that only one version has, for the line that says so. The bar beside
+/// the stretch stands this far to the left of its text, and is dashed this long where the stretch was
+/// taken out.
+const CAPTION: f32 = 22.0;
+const BAR_OUT: f32 = 16.0;
+const DASH: f32 = 4.0;
+/// How many times a version is split again before it is drawn, while laying out what shows changes heights.
+const SETTLES: usize = 3;
+/// How many versions that were read are kept, so that a step to the next version reads one and not two.
+const KEPT: usize = 3;
+/// The most characters of the words a block gained or lost that assistive technology is told.
+const TOLD: usize = 160;
 
 /// What is asked of the history.
 #[derive(Clone, Debug, PartialEq)]
@@ -63,11 +85,35 @@ pub enum Historying {
     /// Picks a version, counted from the oldest.
     Pick(usize),
     /// Picks the version before the one picked, or the one after it.
-    Step { back: bool },
+    Step {
+        back: bool,
+    },
     /// The wheel turned over the version.
     Scroll(Point),
+    /// A press began at a point of the version, or ended there.
+    Down(Point),
+    Up(Point),
+    /// Shows the picked version against another, or as it read.
+    Compare(Compare),
     /// Makes the document read as the picked version again.
     Restore,
+}
+
+/// What the picked version is compared with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Compare {
+    /// The version before it, which shows what the picked one changed.
+    #[default]
+    Previous,
+    /// The document as it reads now, which shows what has changed since.
+    Current,
+    /// Nothing: the version shows as it read.
+    Off,
+}
+
+impl Compare {
+    const ALL: [(Self, &'static str); 3] =
+        [(Self::Previous, "Previous"), (Self::Current, "Current"), (Self::Off, "Off")];
 }
 
 /// A version the history lists.
@@ -79,8 +125,9 @@ pub(crate) struct Version {
     time: u64,
     /// Who wrote it, each with how many of its steps are theirs. Whoever wrote most comes first.
     authors: Vec<(String, usize)>,
-    /// About how many characters it put in and took out.
-    size: usize,
+    /// How many characters of text it put in, and how many it took out.
+    added: usize,
+    removed: usize,
     /// Why it was marked, when it was.
     tag: Option<Tag>,
 }
@@ -164,12 +211,22 @@ fn day(seconds: u64, zone: i32) -> i64 {
     local(seconds, zone).div_euclid(86_400)
 }
 
-/// How much a version changed, in words.
-fn characters(size: usize) -> String {
-    match size {
-        1 => "1 character".to_owned(),
-        ..10_000 => format!("{size} characters"),
-        _ => format!("{}k characters", size / 1_000),
+/// A count of characters as the panel has room for it: in thousands from ten thousand on.
+fn count(characters: usize) -> String {
+    match characters {
+        ..10_000 => characters.to_string(),
+        _ => format!("{}k", characters / 1_000),
+    }
+}
+
+/// How much a version put in and took out, in words. `None` for one that changed no text.
+fn changed(added: usize, removed: usize) -> Option<String> {
+    let characters = |count: usize| if count == 1 { "1 character".to_owned() } else { format!("{count} characters") };
+    match (added, removed) {
+        (0, 0) => None,
+        (added, 0) => Some(format!("{} added", characters(added))),
+        (0, removed) => Some(format!("{} removed", characters(removed))),
+        (added, removed) => Some(format!("{} added, {removed} removed", characters(added))),
     }
 }
 
@@ -189,11 +246,13 @@ fn versions(steps: &[Step], zone: i32) -> Vec<Version> {
             at: step.after.clone(),
             time: step.time,
             authors: Vec::new(),
-            size: 0,
+            added: 0,
+            removed: 0,
             tag: None,
         });
         (version.at, version.time) = (step.after.clone(), step.time);
-        version.size += step.size;
+        version.added += step.added;
+        version.removed += step.removed;
         for (name, edits) in &step.authors {
             match version.authors.iter_mut().find(|(known, _)| known == name) {
                 Some((_, count)) => *count += edits,
@@ -204,8 +263,16 @@ fn versions(steps: &[Step], zone: i32) -> Vec<Version> {
         // and the first of them stands for what the run wrote.
         if let Some(run) = open.take_if(|_| !step.tags.is_empty()) {
             for (index, tag) in step.tags.iter().enumerate() {
-                let size = if index == 0 { run.size } else { 0 };
-                versions.push(Version { at: tag.at.clone(), size, tag: Some(tag.clone()), ..run.clone() });
+                let (added, removed) = if index == 0 { (run.added, run.removed) } else { (0, 0) };
+                let mut version = Version { at: tag.at.clone(), added, removed, tag: Some(tag.clone()), ..run.clone() };
+                // What nobody dated or signed, as the steps of an import, is told by its mark.
+                if version.time == 0 {
+                    version.time = tag.time;
+                }
+                if version.authors.is_empty() {
+                    version.authors.extend(tag.author.clone().map(|author| (author, 0)));
+                }
+                versions.push(version);
             }
         }
     }
@@ -216,12 +283,268 @@ fn versions(steps: &[Step], zone: i32) -> Vec<Version> {
     versions
 }
 
-/// The version that is picked, read and laid out.
+/// A stretch of blocks that only one of two versions has.
+#[derive(Clone, Debug, PartialEq)]
+struct Run {
+    first: BlockId,
+    last: BlockId,
+    /// Whether the later version is the one that has them.
+    added: bool,
+    /// The first of its blocks that holds text, which the line over the stretch stands right above.
+    text: Option<BlockId>,
+}
+
+/// How a block of the page differs between two versions.
+#[derive(Clone, Debug, PartialEq)]
+enum Sort {
+    /// Only the later version has it, or only the earlier.
+    Added,
+    Removed,
+    /// It has words that the earlier version does not, and all of that one's. The words are kept to be told.
+    Gained(String),
+    /// It lost words and gained none, so it reads as the earlier version has it.
+    Lost(String),
+    /// It reads otherwise in each, and both show.
+    Rewritten,
+}
+
+/// How a later version of a document differs from an earlier one, as the page shows it.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Differences {
+    /// The blocks of the page that differ, from its top down.
+    sorts: Vec<(BlockId, Sort)>,
+    /// The blocks that were rewritten, as the earlier version has them.
+    pairs: Vec<Block>,
+    /// The words of those that the later version does not have.
+    gone: Vec<Selection>,
+    /// The words on the page that one version does not have: the later version's own, and under
+    /// [`Side::First`] those of a block that only lost words.
+    words: Vec<(Selection, Side)>,
+    runs: Vec<Run>,
+}
+
+/// The page that shows how `later` differs from `earlier`, and what differs on it. The page is the later
+/// version with what only the earlier one has put back in: the blocks that were taken out, each behind the
+/// block it followed, and a block that only lost words as it read with them. Blocks are compared where
+/// they stand at the top of the document, and what lies inside one is part of it.
+fn compare(earlier: &Document, later: &Document) -> (Document, Differences) {
+    let was: HashMap<&BlockId, &Block> = earlier.blocks.iter().map(|block| (&block.id, block)).collect();
+    let stays: HashSet<&BlockId> = later.walk().map(|block| &block.id).collect();
+    // What was taken out, under the block it came after: `None` for what the document began with.
+    let mut taken: HashMap<Option<BlockId>, Vec<&Block>> = HashMap::new();
+    let mut after = None;
+    for block in &earlier.blocks {
+        match stays.contains(&block.id) {
+            true => after = Some(block.id.clone()),
+            false => taken.entry(after.clone()).or_default().push(block),
+        }
+    }
+
+    let mut found = Differences::default();
+    let mut page = Vec::with_capacity(earlier.blocks.len().max(later.blocks.len()));
+    let mut put_back = |after: Option<&BlockId>, page: &mut Vec<Block>, found: &mut Differences| {
+        for block in taken.remove(&after.cloned()).unwrap_or_default() {
+            found.sorts.push((block.id.clone(), Sort::Removed));
+            page.push(block.clone());
+        }
+    };
+    put_back(None, &mut page, &mut found);
+    for block in &later.blocks {
+        let mut shows = block;
+        match was.get(&block.id) {
+            None => found.sorts.push((block.id.clone(), Sort::Added)),
+            Some(old) if *old == block => {}
+            Some(old) => {
+                let [gone, came] = review::differing(old, block);
+                let sort = match (gone.is_empty(), came.is_empty()) {
+                    (true, false) => Sort::Gained(read(block, &came)),
+                    (false, true) => {
+                        shows = old;
+                        let lost = read(old, &gone);
+                        found.words.extend(gone.into_iter().map(|words| (words, Side::First)));
+                        Sort::Lost(lost)
+                    }
+                    // A block that reads the same and looks otherwise has two versions as well.
+                    _ => {
+                        found.pairs.push((*old).clone());
+                        found.gone.extend(gone);
+                        Sort::Rewritten
+                    }
+                };
+                found.words.extend(came.into_iter().map(|words| (words, Side::Second)));
+                found.sorts.push((block.id.clone(), sort));
+            }
+        }
+        page.push(shows.clone());
+        put_back(Some(&block.id), &mut page, &mut found);
+    }
+
+    // Blocks that follow one another and were all added, or all taken out, are one stretch.
+    let mut sorts = found.sorts.iter().peekable();
+    let mut open: Option<Run> = None;
+    for block in &page {
+        let sort = sorts.next_if(|(id, _)| *id == block.id).map(|(_, sort)| sort);
+        let added = match sort {
+            Some(Sort::Added) => Some(true),
+            Some(Sort::Removed) => Some(false),
+            _ => None,
+        };
+        if open.as_ref().map(|run| run.added) != added {
+            found.runs.extend(open.take());
+        }
+        if let Some(added) = added {
+            let run =
+                open.get_or_insert_with(|| Run { first: block.id.clone(), last: block.id.clone(), added, text: None });
+            run.last = block.id.clone();
+            run.text = run.text.take().or_else(|| written(block).map(|text| text.id.clone()));
+        }
+    }
+    found.runs.extend(open);
+    (Document { blocks: page, ..later.clone() }, found)
+}
+
+/// The first block that holds text in a block or under it.
+fn written(block: &Block) -> Option<&Block> {
+    match &block.body {
+        Body::Text(_) => Some(block),
+        _ => block.body.blocks().iter().find_map(written),
+    }
+}
+
+/// The block of an id in a block or under it.
+fn under<'a>(block: &'a Block, id: &BlockId) -> Option<&'a Block> {
+    if block.id == *id {
+        return Some(block);
+    }
+    block.body.blocks().iter().find_map(|part| under(part, id))
+}
+
+/// What stretches of a block's text read, one after another, for assistive technology: no more than
+/// [`TOLD`] characters of them.
+fn read(block: &Block, words: &[Selection]) -> String {
+    let texts = words.iter().filter_map(|words| {
+        let text = under(block, &words.anchor.block)?.plain_text();
+        let (from, to) = (words.anchor.offset.min(words.head.offset), words.anchor.offset.max(words.head.offset));
+        text.get(from..to).map(str::to_owned)
+    });
+    let all = texts.collect::<Vec<_>>().join(", ");
+    match all.char_indices().nth(TOLD) {
+        Some((end, _)) => format!("{}\u{2026}", all[..end].trim_end()),
+        None => all,
+    }
+}
+
+/// Makes room in a split page over the stretch of the page's column that `band` is, for the line that says
+/// which version has it. The stretch becomes a piece of its own, under the first of its blocks.
+fn part(split: &mut Split, first: &BlockId, band: (f32, f32)) {
+    let holds = |piece: &Piece| piece.block.is_none() && piece.band.0 <= band.0 && band.0 < piece.band.1;
+    let Some(at) = split.pieces.iter().position(holds) else { return };
+    let whole = split.pieces.remove(at);
+    let end = band.1.min(whole.band.1);
+    let cuts = [
+        ((whole.band.0, band.0), None, 0.0),
+        ((band.0, end), Some(first.clone()), CAPTION),
+        ((end, whole.band.1), None, 0.0),
+    ];
+    let mut y = whole.rect.y;
+    let mut pieces = Vec::with_capacity(cuts.len());
+    for (band, block, head) in cuts {
+        if band.1 > band.0 {
+            let rect = Rect::new(whole.rect.x, y, whole.rect.width, head + band.1 - band.0);
+            let origin = Point { x: whole.origin.x, y: y + head - band.0 };
+            pieces.push(Piece { side: Side::Second, block, rect, head, origin, band });
+            y += rect.height;
+        }
+    }
+    for piece in &mut split.pieces[at..] {
+        piece.rect.y += CAPTION;
+        piece.origin.y += CAPTION;
+    }
+    split.pieces.splice(at..at, pieces);
+    split.height += CAPTION;
+}
+
+/// The part of its version's column that a piece of a split page shows in `view`, a part of what the
+/// split counts from.
+fn cut(piece: &Piece, view: Rect) -> Option<Rect> {
+    let top = (view.y - piece.origin.y).max(piece.band.0);
+    let bottom = (view.y + view.height - piece.origin.y).min(piece.band.1);
+    (top < bottom).then(|| Rect::new(view.x - piece.origin.x, top, view.width, bottom - top))
+}
+
+/// Who wrote one of the two versions that are compared, and when.
+#[derive(Clone, Debug, Default)]
+struct Head {
+    /// The writer whose face shows, and everyone who wrote it in a few words.
+    face: Option<String>,
+    who: Option<String>,
+    when: String,
+}
+
+impl Head {
+    /// What assistive technology is told of the version, after which of the two it is.
+    fn told(&self, label: &str) -> String {
+        match &self.who {
+            Some(who) => format!("{label}, by {who}, {}", self.when),
+            None => format!("{label}, {}", self.when),
+        }
+    }
+
+    /// Draws the line at the head of one version of a rewritten block, inside the top of its frame: which
+    /// of the two it is, who wrote it and when. The time goes first where the frame is narrow.
+    fn paint(&self, side: Side, frame: Rect, shaper: &dyn TextShaper, scheme: Scheme, out: &mut DisplayList) {
+        let ink = |ink: Ink| resolve(ink, scheme, 1.0);
+        let small = TextStyle::control().size(tokens::TEXT_SM);
+        let (label, tone) = match side {
+            Side::First => ("Before", tokens::WARN),
+            Side::Second => ("After", tokens::INFO),
+        };
+        let (left, right) =
+            (frame.x + review::MARGIN - review::INSET, frame.x + frame.width - review::MARGIN + review::INSET);
+        let middle = frame.y + review::RULE + ((review::HEAD - review::RULE) / 2.0).round();
+        let gap = tokens::SPACE_SM;
+        out.push(Item::PushClip { rect: Rect::new(left, frame.y, (right - left).max(0.0), review::HEAD), radius: 0.0 });
+        // Says a word at `x`, when it has to be said or there is room for it, and returns where the next goes.
+        let say = |text: &str, style: &TextStyle, color: Ink, x: f32, must: bool, out: &mut DisplayList| {
+            let word = shaper.shape(text, style, None);
+            if must || x + word.size.width <= right {
+                word.paint(Point { x, y: middle - (word.size.height / 2.0).round() }, ink(color), out);
+            }
+            x + word.size.width + gap
+        };
+        let mut x = say(label, &small.weight(600), tone, left, true, out);
+        if let Some(name) = &self.face {
+            review::face(name, Point { x, y: middle }, shaper, scheme, out);
+            x += review::FACE + gap;
+        }
+        if let Some(who) = &self.who {
+            x = say(who, &small, tokens::FG, x, true, out);
+        }
+        say(&self.when, &small, tokens::FG_MUTED, x, false, out);
+        out.push(Item::PopClip);
+    }
+}
+
+/// The version that is picked, read and laid out: as it read, or as it differs from another.
 struct Leaf {
-    at: Revision,
+    /// The revision the page is of and, where that is compared with an earlier one, the earlier one.
+    between: (Option<Revision>, Revision),
+    /// The page: the later version, with what only the earlier one has put back in.
     doc: Document,
     style: Style,
     layout: DocLayout,
+    /// The page with each rewritten block as the earlier version has it, laid out for that side of the
+    /// pairs. `None` when no block has two versions.
+    earlier: Option<(Document, DocLayout)>,
+    found: Differences,
+    /// The rewritten blocks, which the page is split at.
+    pairs: Vec<BlockId>,
+    /// Who wrote the earlier version and the later, and when.
+    heads: [Head; 2],
+    /// What the line over a stretch says that was taken out, and over one that was added.
+    captions: [String; 2],
+    /// What assistive technology is told of the blocks that differ.
+    said: HashMap<BlockId, String>,
     /// The width it is laid out at, once it is.
     laid: Option<f32>,
     /// Whether some of its heights are still estimates.
@@ -234,6 +557,10 @@ pub(crate) struct History {
     versions: Vec<Version>,
     /// The version picked.
     at: usize,
+    /// What it is compared with.
+    compare: Compare,
+    /// The versions the window read last.
+    read: Vec<(Revision, Rc<(Document, Style)>)>,
     /// What the page area shows of it, once the window has read it.
     leaf: Option<Leaf>,
     /// How far down the version is scrolled, which stays as it is from one version to the next: the same
@@ -247,6 +574,21 @@ pub(crate) struct History {
     /// ahead of UTC in minutes.
     now: Option<u64>,
     zone: i32,
+    /// The version the window is pinned to where it has no room for both of a rewritten block: After,
+    /// until the other is brought across. Then how far the pairs have slid there, and when they set off.
+    active: Side,
+    slide: f32,
+    since: Option<u64>,
+    /// Whether what moves may be shown moving.
+    pub still: bool,
+    /// Where the pointer rests in the page area, and the button a press began on.
+    pointer: Option<Point>,
+    pressed: Option<Side>,
+    /// What was last drawn: how the pairs shared the window, where the versions of the rewritten blocks
+    /// in view stand in the page area, and the buttons that bring a version across.
+    arrangement: Option<Arrangement>,
+    frames: Vec<(BlockId, Side, Rect)>,
+    hot: Vec<(Rect, Side)>,
 }
 
 impl History {
@@ -255,6 +597,8 @@ impl History {
         let mut history = Self {
             versions: Vec::new(),
             at: 0,
+            compare: Compare::default(),
+            read: Vec::new(),
             leaf: None,
             scroll: 0.0,
             room: Size::default(),
@@ -262,6 +606,15 @@ impl History {
             scale: 1.0,
             now,
             zone,
+            active: Side::Second,
+            slide: 1.0,
+            since: None,
+            still: false,
+            pointer: None,
+            pressed: None,
+            arrangement: None,
+            frames: Vec::new(),
+            hot: Vec::new(),
         };
         history.follow(steps, current);
         history
@@ -276,7 +629,8 @@ impl History {
         let newest = steps.last().map_or(&current, |step| &step.after);
         if self.versions.last().is_none_or(|last| last.at != *newest) {
             let time = steps.last().map_or(0, |step| step.time);
-            self.versions.push(Version { at: newest.clone(), time, authors: Vec::new(), size: 0, tag: None });
+            let (authors, tag) = (Vec::new(), None);
+            self.versions.push(Version { at: newest.clone(), time, authors, added: 0, removed: 0, tag });
         }
         let kept = picked.and_then(|picked| self.versions.iter().position(|version| version.at == picked));
         self.at = kept.unwrap_or(self.versions.len() - 1);
@@ -291,25 +645,87 @@ impl History {
         self.at + 1 == self.versions.len()
     }
 
-    /// The revision to read, when the version picked is not the one that shows.
-    pub fn wanted(&self) -> Option<&Revision> {
-        let picked = &self.picked().at;
-        self.leaf.as_ref().is_none_or(|leaf| leaf.at != *picked).then_some(picked)
+    /// The two versions that are compared, the earlier first: the picked one and the one it is compared
+    /// with. `None` where the picked version shows as it read, which it also does with nothing before it
+    /// and when it is the document as it reads now.
+    fn sides(&self) -> Option<(usize, usize)> {
+        let newest = self.versions.len() - 1;
+        match self.compare {
+            Compare::Previous => self.at.checked_sub(1).map(|before| (before, self.at)),
+            Compare::Current => (self.at < newest).then_some((self.at, newest)),
+            Compare::Off => None,
+        }
     }
 
-    /// Shows the picked version, as the window read it. With `None` the history has no such revision,
-    /// and the page area stays empty.
-    pub fn show(&mut self, read: Option<(Document, Style)>) {
-        self.leaf = read.map(|(doc, style)| {
-            let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
-            // Nothing has a caret here, so a formula is typeset and never shows its source.
-            layout.set_formula_source(false);
-            Leaf { at: self.picked().at.clone(), doc, style, layout, laid: None, estimated: true }
-        });
+    /// The revision the page is to be of and, where it is compared with an earlier one, the earlier one.
+    fn between(&self) -> (Option<Revision>, Revision) {
+        match self.sides() {
+            Some((earlier, later)) => (Some(self.versions[earlier].at.clone()), self.versions[later].at.clone()),
+            None => (None, self.picked().at.clone()),
+        }
+    }
+
+    /// The revisions to read before what is picked can show.
+    pub fn wanted(&self) -> Vec<Revision> {
+        let between = self.between();
+        if self.leaf.as_ref().is_some_and(|leaf| leaf.between == between) {
+            return Vec::new();
+        }
+        let known = |revision: &Revision| self.read.iter().any(|(read, _)| read == revision);
+        between.0.into_iter().chain([between.1]).filter(|revision| !known(revision)).collect()
+    }
+
+    /// Takes a revision as the window read it.
+    pub fn take(&mut self, revision: Revision, read: (Document, Style)) {
+        self.read.push((revision, Rc::new(read)));
+    }
+
+    /// Shows what is picked, from the revisions the window read. Without the revision that the page is of
+    /// the page area stays empty, and without the one to compare it with the version shows as it read.
+    pub fn show(&mut self) {
+        let between = self.between();
+        if self.leaf.as_ref().is_some_and(|leaf| leaf.between == between) {
+            return;
+        }
+        let read =
+            |revision: &Revision| self.read.iter().find(|(read, _)| read == revision).map(|(_, read)| read.clone());
+        let (earlier, later) = (between.0.as_ref().and_then(read), read(&between.1));
+        let sides = self.sides().filter(|_| earlier.is_some());
+        let heads = sides.map(|(earlier, later)| [earlier, later].map(|at| self.head(at))).unwrap_or_default();
+        // What changed from the version before is its writer's. What changed since is many people's.
+        let by = sides.and_then(|(_, later)| self.versions[later].who());
+        let captions = match (self.compare, by) {
+            (Compare::Current, _) => ["Removed later", "Added later"].map(str::to_owned),
+            (_, Some(by)) => [format!("Removed by {by}"), format!("Added by {by}")],
+            (_, None) => ["Removed", "Added"].map(str::to_owned),
+        };
+        self.leaf = later.map(|later| Leaf::new(between, earlier.as_deref(), &later, heads, captions));
+        // The versions just shown are the ones a step is most likely to want again.
+        let spare = self.read.len().saturating_sub(KEPT);
+        self.read.drain(..spare);
+        (self.frames, self.hot, self.pressed) = (Vec::new(), Vec::new(), None);
+    }
+
+    /// Who wrote a version and when, for the line at the head of its side of a rewritten block.
+    fn head(&self, at: usize) -> Head {
+        let version = &self.versions[at];
+        Head {
+            face: version.authors.first().map(|(name, _)| name.clone()),
+            who: version.who(),
+            when: self.when(version),
+        }
     }
 
     pub fn pick(&mut self, at: usize) {
         self.at = at.min(self.versions.len() - 1);
+        // After is the version the window shows whole, until the other is asked for.
+        (self.active, self.slide, self.since) = (Side::Second, 1.0, None);
+    }
+
+    /// Compares the picked version with another, or with none.
+    pub fn compare(&mut self, with: Compare) {
+        self.compare = with;
+        (self.active, self.slide, self.since) = (Side::Second, 1.0, None);
     }
 
     /// Picks the version before the one picked, or the one after it, when there is one.
@@ -319,10 +735,11 @@ impl History {
 
     /// Takes faces that arrived late.
     pub fn add_fonts(&mut self, fonts: &Fonts) {
-        if let Some(leaf) = &mut self.leaf
-            && leaf.layout.add_fonts(fonts)
-        {
-            leaf.estimated = true;
+        if let Some(leaf) = &mut self.leaf {
+            let earlier = leaf.earlier.as_mut().is_some_and(|(_, layout)| layout.add_fonts(fonts));
+            if leaf.layout.add_fonts(fonts) || earlier {
+                leaf.estimated = true;
+            }
         }
     }
 
@@ -361,27 +778,80 @@ impl History {
         (self.scroll * self.scale).round() / self.scale
     }
 
-    /// The part of the version in view, in its layout's coordinates.
-    fn viewport(&self, width: f32) -> Rect {
-        Rect::new(0.0, self.scrolled() - TOP, width, self.room.height)
+    /// The part of the version in view: of what scrolls, counted from under the room at its top.
+    fn viewport(&self) -> Rect {
+        Rect::new(0.0, self.scrolled() - TOP, self.room.width, self.room.height)
     }
 
     /// Lays out some of what is out of view, in idle time. The line at the top of the view stays where it
     /// is while what is above it changes height. Returns whether there was something to lay out.
     pub fn settle(&mut self) -> bool {
-        let Some(width) = self.leaf.as_ref().filter(|leaf| leaf.estimated).and_then(|leaf| leaf.laid) else {
+        let (view, room, pinned) = (self.viewport(), self.room.width, (self.active, self.slide));
+        let Some(leaf) = self.leaf.as_mut().filter(|leaf| leaf.estimated && leaf.laid.is_some()) else {
             return false;
         };
-        let viewport = self.viewport(width);
-        let Some(leaf) = &mut self.leaf else { return false };
-        let pin = leaf.layout.hit(Point { x: 0.0, y: viewport.y.max(0.0) });
-        let top = |layout: &DocLayout| pin.as_ref().and_then(|pos| layout.caret(pos)).map(|caret| caret.y);
-        let before = top(&leaf.layout);
-        leaf.estimated = leaf.layout.settle(viewport, SETTLE_BYTES);
-        if let (Some(before), Some(after)) = (before, top(&leaf.layout)) {
+        let split = leaf.split(room, pinned);
+        let pin = leaf.layout.hit(Point { x: 0.0, y: review::shown(&split, view).0.max(0.0) });
+        let top = |leaf: &Leaf, split: &Split| {
+            let line = pin.as_ref().and_then(|pos| leaf.layout.caret(pos))?.y;
+            Some(line + review::origin(split, line).y)
+        };
+        let before = top(leaf, &split);
+        leaf.settle(&split, view, SETTLE_BYTES);
+        if let (Some(before), Some(after)) = (before, top(leaf, &leaf.split(room, pinned))) {
             self.scroll += after - before;
         }
         true
+    }
+
+    /// Steps the slide of the pairs to the version that was brought across. Returns when it wants to be
+    /// drawn next.
+    pub fn animate(&mut self, now_ms: u64) -> Option<u64> {
+        if self.slide >= 1.0 {
+            return None;
+        }
+        let since = *self.since.get_or_insert(now_ms);
+        let progress = now_ms.saturating_sub(since) as f32 / review::SLIDE_MS;
+        self.slide = if progress < 1.0 && !self.still { motion::ease(progress) } else { 1.0 };
+        (self.slide < 1.0).then_some(now_ms + FRAME_MS)
+    }
+
+    /// Makes `side` the version the window shows whole where it has no room for two, sliding there.
+    fn bring(&mut self, side: Side) {
+        if self.active != side {
+            let slides = self.arrangement == Some(Arrangement::Pinned) && !self.still;
+            (self.active, self.since) = (side, None);
+            self.slide = if slides { 0.0 } else { 1.0 };
+        }
+    }
+
+    /// The button at a point of the page area, by the version it brings across.
+    fn button(&self, at: Point) -> Option<Side> {
+        self.hot.iter().find(|(rect, _)| rect.contains(at)).map(|(_, side)| *side)
+    }
+
+    /// Takes where the pointer rests in the page area. Returns whether what shows changed with it.
+    pub fn point(&mut self, at: Option<Point>) -> bool {
+        let changed = at.and_then(|at| self.button(at)) != self.pointer.and_then(|at| self.button(at));
+        self.pointer = at;
+        changed
+    }
+
+    /// Takes a press at a point of the page area. One on a version of a rewritten block brings that
+    /// version across, and one on a button waits to end there.
+    pub fn press(&mut self, at: Point) {
+        self.pressed = self.button(at);
+        let on = self.frames.iter().find(|(_, _, frame)| frame.contains(at)).map(|(_, side, _)| *side);
+        if let Some(side) = on.filter(|_| self.pressed.is_none()) {
+            self.bring(side);
+        }
+    }
+
+    /// Lets go at a point of the page area. A button does what it is for when the press ends on it.
+    pub fn release(&mut self, at: Point) {
+        if let Some(side) = self.pressed.take().filter(|side| self.button(at) == Some(*side)) {
+            self.bring(side);
+        }
     }
 
     /// The picked version, for the area where the page was. Also returns the pictures in it that the
@@ -390,53 +860,21 @@ impl History {
         &mut self,
         room: Size,
         images: &Images,
+        shaper: &dyn TextShaper,
         palette: Palette,
         scheme: Scheme,
         scale: f32,
     ) -> (Element<Message>, Vec<String>) {
         (self.room, self.scale) = (room, scale);
-        let (mut list, mut awaited, mut left) = (DisplayList::default(), Vec::new(), 0.0);
-        // The version is set as the page is: as wide as its paper leaves between the margins, or as the
-        // window has room for.
-        let column = self.leaf.as_ref().map(|leaf| {
-            let page = &leaf.style.page;
-            let text = (page.width - page.margin_left - page.margin_right) * PT;
-            text.min(room.width - 2.0 * GUTTER).max(1.0)
-        });
-        if let Some((leaf, width)) = self.leaf.as_mut().zip(column) {
-            left = ((room.width - width) / 2.0).max(0.0).round();
-            if leaf.laid != Some(width) {
-                leaf.layout.update(&leaf.doc, &leaf.style, width, None);
-                if leaf.laid.is_none() {
-                    leaf.dress(images);
-                }
-                (leaf.laid, leaf.estimated) = (Some(width), true);
-            }
-            leaf.layout.set_palette(palette);
+        (self.frames, self.hot) = (Vec::new(), Vec::new());
+        let mut list = DisplayList::default();
+        if let Some(mut leaf) = self.leaf.take() {
+            self.draw(&mut leaf, images, shaper, palette, scheme, &mut list);
+            self.leaf = Some(leaf);
         }
-        if let Some(width) = column {
-            // What is about to show is laid out for real. The rest waits for idle time.
-            let viewport = self.viewport(width);
-            if let Some(leaf) = &mut self.leaf {
-                leaf.estimated = leaf.layout.settle(viewport, 0);
-                self.tall = leaf.layout.height() + 2.0 * TOP;
-            }
-            self.keep();
-            let viewport = self.viewport(width);
-            if let Some(leaf) = &self.leaf {
-                leaf.layout.paint(viewport, &mut list);
-            }
-            awaited = pictures::awaited(images, scheme, &mut list);
-        }
-        let scrolled = self.scrolled();
-        let paint = Page {
-            list,
-            origin: Point { x: left, y: TOP - scrolled },
-            page: palette.page,
-            content: self.tall,
-            scrolled,
-        };
-        let canvas = Element::canvas(Rc::new(paint))
+        let awaited = pictures::awaited(images, scheme, &mut list);
+        let paint = Page { list, page: palette.page, content: self.tall, scrolled: self.scrolled() };
+        let mut canvas = Element::canvas(Rc::new(paint))
             .grow(1.0)
             .fg(tokens::FG)
             .role(Role::Document)
@@ -444,15 +882,148 @@ impl History {
             .default_focus()
             .on_pointer(|event| match event {
                 Pointer::Scroll { delta } => Some(Message::History(Historying::Scroll(delta))),
+                Pointer::Down { at, .. } => Some(Message::History(Historying::Down(at))),
+                Pointer::Up { at } => Some(Message::History(Historying::Up(at))),
                 _ => None,
-            });
+            })
+            .pointed();
+        if self.pointer.is_some_and(|at| self.button(at).is_some()) {
+            canvas = canvas.cursor(Cursor::Pointer);
+        }
         (canvas, awaited)
     }
 
+    /// Lays out what shows of a version and draws it into `list`, in the page area's coordinates.
+    fn draw(
+        &mut self,
+        leaf: &mut Leaf,
+        images: &Images,
+        shaper: &dyn TextShaper,
+        palette: Palette,
+        scheme: Scheme,
+        list: &mut DisplayList,
+    ) {
+        let room = self.room;
+        // The version is set as the page is: as wide as its paper leaves between the margins, or as the
+        // window has room for.
+        let paper = &leaf.style.page;
+        let text = (paper.width - paper.margin_left - paper.margin_right) * PT;
+        let width = text.min(room.width - 2.0 * GUTTER).max(1.0);
+        leaf.lay(width, images, palette);
+
+        // What is about to show is laid out for real, and the page split again while that changes
+        // heights. The rest waits for idle time.
+        let pinned = (self.active, self.slide);
+        let mut split = leaf.split(room.width, pinned);
+        for _ in 0..SETTLES {
+            self.tall = split.height + 2.0 * TOP;
+            self.keep();
+            if !leaf.settle(&split, self.viewport(), 0) {
+                break;
+            }
+            split = leaf.split(room.width, pinned);
+        }
+        self.tall = split.height + 2.0 * TOP;
+        self.keep();
+        self.arrangement = Some(split.arrangement);
+
+        let view = self.viewport();
+        // A split stands the page's column in the very middle, and the page area on a whole pixel beside it.
+        let middle = ((room.width - width) / 2.0).max(0.0);
+        let shift = Point { x: middle.round() - middle, y: -view.y };
+        let ink = |ink: Ink| resolve(ink, scheme, 1.0);
+        for piece in &split.pieces {
+            let (top, bottom) = (piece.rect.y + shift.y, piece.rect.y + piece.rect.height + shift.y);
+            if bottom <= 0.0 || top >= room.height {
+                continue;
+            }
+            let origin = Point { x: piece.origin.x + shift.x, y: piece.origin.y + shift.y };
+            let block = piece.block.as_ref();
+            if let Some(block) = block.filter(|block| leaf.pairs.contains(block)) {
+                // One version of a rewritten block: a frame round it, and a line at its head.
+                let frame = review::frame(piece, width, shift, room.width);
+                let (tone, head) = match piece.side {
+                    Side::First => (tokens::WARN, &leaf.heads[0]),
+                    Side::Second => (tokens::INFO, &leaf.heads[1]),
+                };
+                list.push(Item::Stroke { rect: frame, color: ink(tokens::LINE), width: 1.0, radius: 0.0 });
+                list.push(Item::Fill { rect: Rect { height: review::RULE, ..frame }, color: ink(tone), radius: 0.0 });
+                head.paint(piece.side, frame, shaper, scheme, list);
+                self.frames.push((block.clone(), piece.side, frame));
+            } else if let Some(run) = block.and_then(|block| leaf.found.runs.iter().find(|run| run.first == *block)) {
+                // A stretch that only one version has: a bar beside it, and a line over its first line.
+                let (tone, caption) = match run.added {
+                    true => (tokens::INFO, &leaf.captions[1]),
+                    false => (tokens::WARN, &leaf.captions[0]),
+                };
+                let first = run.text.as_ref().and_then(|text| leaf.layout.caret(&Pos::new(text.clone(), 0)));
+                let over = origin.y + first.map_or(piece.band.0, |line| line.y) - CAPTION;
+                let said = shaper.shape(caption, &TextStyle::control().size(tokens::TEXT_SM).weight(600), None);
+                said.paint(
+                    Point { x: origin.x, y: over + ((CAPTION - said.size.height) / 2.0).round() },
+                    ink(tone),
+                    list,
+                );
+                // What was taken out has a broken bar, so that the two are told apart without their colours.
+                let (dash, gap) = if run.added { (bottom - over, 0.0) } else { (DASH, DASH) };
+                let mut y = over;
+                while y < bottom {
+                    let rect = Rect::new(origin.x - BAR_OUT, y, review::RULE, dash.min(bottom - y));
+                    list.push(Item::Fill { rect, color: ink(tone), radius: 0.0 });
+                    y += dash + gap;
+                }
+            }
+            let Some(cut) = cut(piece, view) else { continue };
+            let layout = match (piece.side, &leaf.earlier) {
+                (Side::First, Some((_, earlier))) => earlier,
+                _ => &leaf.layout,
+            };
+            list.push(Item::PushClip { rect: review::text(piece, shift), radius: 0.0 });
+            let from = list.items.len();
+            match piece.side {
+                Side::First => {
+                    for words in &leaf.found.gone {
+                        review::mark(&layout.selection_in(words, cut), Side::First, scheme, list);
+                    }
+                }
+                Side::Second => {
+                    for (words, side) in &leaf.found.words {
+                        review::mark(&layout.selection_in(words, cut), *side, scheme, list);
+                    }
+                }
+            }
+            layout.paint(cut, list);
+            list.translate(from, origin);
+            list.push(Item::PopClip);
+        }
+
+        // Of pinned pairs the window shows one version whole. The other lies under a veil, with a button
+        // at the window's edge that brings it across.
+        if split.arrangement == Arrangement::Pinned && self.slide >= 1.0 {
+            let aside = if self.active == Side::First { Side::Second } else { Side::First };
+            let (pointer, down) = (self.pointer, self.pressed);
+            let lit =
+                |button: Rect| pointer.is_some_and(|at| button.contains(at)) && down.is_none_or(|down| down == aside);
+            for (_, _, frame) in self.frames.iter().filter(|(_, side, _)| *side == aside) {
+                let button = review::veil(*frame, aside, room, palette.page, &lit, scheme, list);
+                self.hot.extend(button.map(|button| (button, aside)));
+            }
+        }
+    }
+
     /// Fills the bar while the history shows: the way back, what the version is of and when it was
-    /// written, and the button that restores it. A narrow window has the bar folded.
+    /// written, what it is compared with, and the button that restores it. A narrow window has the bar
+    /// folded.
     pub fn bar(&self, bar: TopBar<Message>, name: &str) -> TopBar<Message> {
         let back = Message::History(Historying::Back);
+        let mut compare = Segmented::new("Compare with").small();
+        let mut compares = Menu::new().label("Compare with");
+        for (with, label) in Compare::ALL {
+            let pick = Message::History(Historying::Compare(with));
+            compare = compare.segment(label, self.compare == with, pick.clone());
+            compares = compares.item(MenuItem::new(label).checked(self.compare == with).on_select(pick));
+        }
+        let with = Compare::ALL.iter().find(|(with, _)| *with == self.compare).map_or("Off", |(_, label)| label);
         let name = || Element::text(name, TextStyle::control().weight(600)).min_width(tokens::SPACE_3XL).shrink();
         let when = Element::text(self.said(), TextStyle::control().size(tokens::TEXT_SM));
         // The document as it reads now is what a restore would leave: there is nothing to do.
@@ -467,10 +1038,14 @@ impl History {
             .start(Button::new("Back to editing").icon(icon::ARROW_LEFT).small().on_press(back.clone()))
             .start(name())
             .start(when.fg(tokens::FG_MUTED).shrink())
+            .middle(compare)
+            .middle(TopBar::rule())
             .middle(restore(Button::new("Restore this version").icon(icon::ROTATE_CCW)));
         bar.form(FORMS.1)
             .start(Button::icon_only(icon::ARROW_LEFT, "Back to editing").small().on_press(back))
             .start(name())
+            .middle(Element::from(Button::new(with).small().menu(compares)).description("Compare with"))
+            .middle(TopBar::rule())
             .middle(restore(Button::icon_only(icon::ROTATE_CCW, "Restore this version")))
     }
 
@@ -478,12 +1053,17 @@ impl History {
     /// Moreau".
     fn said(&self) -> String {
         let version = self.picked();
-        let day = version.day(self.today(), self.zone);
-        let when = version.clock(self.zone).map_or_else(|| day.clone(), |clock| format!("{day} {clock}"));
+        let when = self.when(version);
         match version.who() {
             Some(who) => format!("{when}, by {who}"),
             None => when,
         }
+    }
+
+    /// The day and the time a version was last written at, on the person's clock.
+    fn when(&self, version: &Version) -> String {
+        let day = version.day(self.today(), self.zone);
+        version.clock(self.zone).map_or_else(|| day.clone(), |clock| format!("{day} {clock}"))
     }
 
     fn today(&self) -> Option<i64> {
@@ -534,7 +1114,7 @@ impl History {
         let who = version.who();
         // The time is said once: by the title, or else after who wrote the version.
         let when = version.clock(self.zone).filter(|clock| *clock != title);
-        let size = (version.size > 0).then(|| characters(version.size));
+        let size = changed(version.added, version.removed);
 
         let mut head = Element::row()
             .align(Align::Center)
@@ -552,8 +1132,12 @@ impl History {
                 .child(Element::icon(icon::TAG, SIGN))
                 .child(Element::text("Named", quiet));
             head = head.child(named.fg(tokens::FG_MUTED));
-        } else if let Some(size) = &size {
-            head = head.child(Element::text(size.as_str(), quiet).fg(tokens::FG_MUTED));
+        } else if size.is_some() {
+            // What it put in and what it took out, in the colours those have on the page.
+            let figures = quiet.family(Family::Mono);
+            let put_in = Element::text(format!("+{}", count(version.added)), figures).fg(tokens::INFO);
+            let taken_out = Element::text(format!("\u{2212}{}", count(version.removed)), figures).fg(tokens::WARN);
+            head = head.child(Element::row().gap(tokens::SPACE_XS).child(put_in).child(taken_out).decorative());
         }
         let mut body =
             Element::column().grow(1.0).gap(tokens::SPACE_2XS).padding(Edges::xy(0.0, tokens::SPACE_SM)).child(head);
@@ -593,36 +1177,142 @@ impl History {
         if picked { row.bg(accent().soft) } else { row }
     }
 
-    /// Tells assistive technology of the version that shows, under the canvas that shows it.
+    /// Tells assistive technology of the version that shows, under the canvas that shows it: its blocks,
+    /// how each differs from the version it is compared with, and what the rewritten ones in view read
+    /// before.
     pub fn describe(&self, told: &mut Told, whole: bool, canvas: &mut Node, nodes: &mut Vec<(NodeId, Node)>) {
         canvas.set_description(self.said());
-        if let Some(leaf) = &self.leaf {
-            describe::version(&leaf.doc, told, whole, canvas, nodes);
+        let Some(leaf) = &self.leaf else { return };
+        describe::version(&leaf.doc, &leaf.said, told, whole, canvas, nodes);
+        for (block, _, frame) in self.frames.iter().filter(|(_, side, _)| *side == Side::First) {
+            // What is told is what is drawn there: the block of the document that the earlier side shows.
+            let Some(before) = leaf.earlier.as_ref().and_then(|(earlier, _)| earlier.block(block)) else { continue };
+            let label = leaf.heads[0].told("Before");
+            describe::held_back(block, &label, &before.plain_text(), *frame, canvas, nodes);
         }
     }
 }
 
 impl Leaf {
-    /// Gives the layout what the page's has beside the document: the colours of its code, and the
-    /// pictures it links to that are there to draw.
-    fn dress(&mut self, images: &Images) {
-        for block in self.doc.walk() {
-            if let BlockKind::Code { language } = &block.kind {
-                let tokens = highlight::tokens(&block.plain_text(), language.as_deref().unwrap_or_default());
-                self.layout.set_tokens(&block.id, tokens);
+    /// A version to show: `later`, as it read or as it differs from `earlier`. `heads` say who wrote the
+    /// two and when, and `captions` what stands over a stretch that was taken out and over one that was
+    /// added.
+    fn new(
+        between: (Option<Revision>, Revision),
+        earlier: Option<&(Document, Style)>,
+        later: &(Document, Style),
+        heads: [Head; 2],
+        captions: [String; 2],
+    ) -> Self {
+        let (doc, found) = match earlier {
+            Some((earlier, _)) => compare(earlier, &later.0),
+            None => (later.0.clone(), Differences::default()),
+        };
+        let fresh = || {
+            let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
+            // Nothing has a caret here, so a formula is typeset and never shows its source.
+            layout.set_formula_source(false);
+            layout
+        };
+        let earlier = (!found.pairs.is_empty()).then(|| {
+            let mut first = doc.clone();
+            for before in &found.pairs {
+                review::put(&mut first.blocks, before.clone());
             }
-            if let Some((src, image)) = pictures::link(block).and_then(|src| Some((src, images.get(src)?))) {
-                self.layout.set_loaded(src, Some((image.width(), image.height())));
+            (first, fresh())
+        });
+        let said = found.sorts.iter().map(|(block, sort)| {
+            let said = match sort {
+                Sort::Added => captions[1].clone(),
+                Sort::Removed => captions[0].clone(),
+                Sort::Gained(words) => format!("Added: {words}"),
+                Sort::Lost(words) => format!("Removed: {words}"),
+                Sort::Rewritten => heads[1].told("After"),
+            };
+            (block.clone(), said)
+        });
+        Self {
+            between,
+            said: said.collect(),
+            pairs: found.pairs.iter().map(|before| before.id.clone()).collect(),
+            doc,
+            style: later.1.clone(),
+            layout: fresh(),
+            earlier,
+            found,
+            heads,
+            captions,
+            laid: None,
+            estimated: true,
+        }
+    }
+
+    /// Sets the version for a column `width` wide, when it is not.
+    fn lay(&mut self, width: f32, images: &Images, palette: Palette) {
+        let mut layouts =
+            [Some((&self.doc, &mut self.layout)), self.earlier.as_mut().map(|(doc, layout)| (&*doc, layout))];
+        for (doc, layout) in layouts.iter_mut().flatten() {
+            if self.laid != Some(width) {
+                layout.update(doc, &self.style, width, None);
             }
+            if self.laid.is_none() {
+                dress(doc, layout, images);
+            }
+            layout.set_palette(palette);
+        }
+        if self.laid != Some(width) {
+            (self.laid, self.estimated) = (Some(width), true);
+        }
+    }
+
+    /// The page as what differs splits it, in a page area `room` wide: at each block that has two
+    /// versions, with room over each stretch that only one version has. `pinned` is as for
+    /// [`review::split`].
+    fn split(&self, room: f32, pinned: (Side, f32)) -> Split {
+        let first = self.earlier.as_ref().map_or(&self.layout, |(_, layout)| layout);
+        let mut split = review::split(first, &self.layout, &self.pairs, room, pinned);
+        for run in &self.found.runs {
+            if let Some((first, last)) = self.layout.band(&run.first).zip(self.layout.band(&run.last)) {
+                part(&mut split, &run.first, (first.0, last.1));
+            }
+        }
+        split
+    }
+
+    /// Lays out what `view` shows of the two versions, a part of what `split` counts from, and about
+    /// `budget` bytes of text round that. Returns whether a height changed, so that the page is to be
+    /// split again.
+    fn settle(&mut self, split: &Split, view: Rect, budget: usize) -> bool {
+        let tall = |leaf: &Self| (leaf.layout.height(), leaf.earlier.as_ref().map(|(_, layout)| layout.height()));
+        let before = tall(self);
+        let (top, shown) = review::shown(split, view);
+        let page = Rect::new(0.0, top, view.width, shown);
+        self.estimated = self.layout.settle(page, budget);
+        if let Some((_, earlier)) = &mut self.earlier {
+            // Where none of the earlier version is in view, it is laid out round what the page shows.
+            self.estimated |= earlier.settle(split.shown(Side::First, view).unwrap_or(page), budget);
+        }
+        tall(self) != before
+    }
+}
+
+/// Gives a layout what the page's has beside the document: the colours of its code, and the pictures it
+/// links to that are there to draw.
+fn dress(doc: &Document, layout: &mut DocLayout, images: &Images) {
+    for block in doc.walk() {
+        if let BlockKind::Code { language } = &block.kind {
+            let tokens = highlight::tokens(&block.plain_text(), language.as_deref().unwrap_or_default());
+            layout.set_tokens(&block.id, tokens);
+        }
+        if let Some((src, image)) = pictures::link(block).and_then(|src| Some((src, images.get(src)?))) {
+            layout.set_loaded(src, Some((image.width(), image.height())));
         }
     }
 }
 
-/// What the layout painted of the version in view, placed where the page was.
+/// What was drawn of the version in view, in the coordinates of the area where the page was.
 struct Page {
     list: DisplayList,
-    /// Where the layout's origin is inside the page area.
-    origin: Point,
     page: Color,
     /// The height of everything that scrolls, and how far it is scrolled.
     content: f32,
@@ -634,7 +1324,7 @@ impl Paint for Page {
         out.push(Item::Fill { rect, color: self.page, radius: 0.0 });
         let first = out.items.len();
         out.items.extend(self.list.items.iter().cloned());
-        out.translate(first, Point { x: rect.x + self.origin.x, y: rect.y + self.origin.y });
+        out.translate(first, Point { x: rect.x, y: rect.y });
         out.items.extend(scrollbar(rect, self.content, self.scrolled, scheme, 1.0));
     }
 }
@@ -743,7 +1433,7 @@ mod tests {
         let listed = versions(&steps, 0);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].who().as_deref(), Some("Alice and Sam"));
-        assert_eq!(listed[0].size, 30);
+        assert_eq!((listed[0].added, listed[0].removed), (30, 0));
     }
 
     #[test]
@@ -759,7 +1449,7 @@ mod tests {
         let expected = [(2, "Sent to builder"), (1, "Merged edits"), (3, "Current version")];
         assert_eq!(read, expected.map(|(at, title)| (revision(at), title.to_owned())));
         // What the run wrote is counted once.
-        assert_eq!(listed.iter().map(|version| version.size).collect::<Vec<_>>(), [20, 0, 10]);
+        assert_eq!(listed.iter().map(|version| version.added).collect::<Vec<_>>(), [20, 0, 10]);
     }
 
     #[test]
@@ -785,6 +1475,22 @@ mod tests {
             assert_eq!(version.day(today, zone), name, "{time} at {zone}");
             assert_eq!(version.clock(zone).as_deref(), clock, "{time} at {zone}");
         }
+    }
+
+    #[test]
+    fn a_version_that_nobody_dated_is_told_by_when_and_by_whom_it_was_marked() {
+        let mut steps = vec![step(0, 0, ""), step(1, NOON + HOUR, "Alice")];
+        let import = Tag { author: Some("Sam".to_owned()), time: NOON, ..tag(1, TagKind::Import, Some("Plan.docx")) };
+        steps[0].tags = vec![import];
+        let listed = versions(&steps, 0);
+        assert_eq!(listed[0].title((true, false), 0), "Imported from Plan.docx");
+        assert_eq!(listed[0].day(Some(day(NOON, 0)), 0), "Today");
+        assert_eq!((listed[0].clock(0).as_deref(), listed[0].who().as_deref()), (Some("12:00"), Some("Sam")));
+        // A step that says when it was written and by whom is told by that, marked or not.
+        steps[1].tags =
+            vec![Tag { author: Some("Sam".to_owned()), time: NOON, ..tag(2, TagKind::Named, Some("Draft")) }];
+        let listed = versions(&steps, 0);
+        assert_eq!((listed[1].clock(0).as_deref(), listed[1].who().as_deref()), (Some("13:00"), Some("Alice")));
     }
 
     #[test]

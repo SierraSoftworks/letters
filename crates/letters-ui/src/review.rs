@@ -29,17 +29,17 @@ use crate::window::Message;
 
 /// The room at the head of a version for the line that says whose it is, the room under its text, and
 /// the room between its frame and what the page has above it.
-const HEAD: f32 = 44.0;
+pub(crate) const HEAD: f32 = 44.0;
 const FOOT: f32 = tokens::SPACE_MD;
 const ABOVE: f32 = tokens::SPACE_MD;
 /// The margin on either side of a version's text, and how far inside its segment its frame stands, so
 /// that two frames side by side have a gap between them.
-const MARGIN: f32 = tokens::SPACE_XL;
-const INSET: f32 = tokens::SPACE_XS;
+pub(crate) const MARGIN: f32 = tokens::SPACE_XL;
+pub(crate) const INSET: f32 = tokens::SPACE_XS;
 /// How thick the rule at the top of a version is, which tells the two apart with the marks on its words.
-const RULE: f32 = 3.0;
+pub(crate) const RULE: f32 = 3.0;
 /// The face of who wrote a version, the icon on a button, and the room inside a button beside them.
-const FACE: f32 = 20.0;
+pub(crate) const FACE: f32 = 20.0;
 const SIGN: f32 = 14.0;
 const PAD: f32 = 10.0;
 /// How thick the line under a word that differs is, and how long its dots and gaps are where it is dotted.
@@ -48,7 +48,7 @@ const DOT: f32 = 2.0;
 /// The round button that brings a version cut off by the window's edge across.
 const BRING: f32 = 32.0;
 /// How long a pair takes to slide to its other end, in milliseconds.
-const SLIDE_MS: f32 = 150.0;
+pub(crate) const SLIDE_MS: f32 = 150.0;
 /// How much of the page's colour lies over the version that is not the active one of a pinned pair.
 const ASIDE: f32 = 0.5;
 /// The most pairs of words that are compared one by one. Longer texts are compared by their ends alone.
@@ -148,7 +148,7 @@ impl Open {
 }
 
 /// Puts `with` where the block of its id is among `blocks`, however deep.
-fn put(blocks: &mut [Block], with: Block) -> Option<Block> {
+pub(crate) fn put(blocks: &mut [Block], with: Block) -> Option<Block> {
     let mut with = Some(with);
     for block in blocks {
         let held = with.take()?;
@@ -217,16 +217,7 @@ impl Review {
     /// scrolls. `None` while no conflict is open.
     pub fn split(&self, page: &DocLayout, room: f32) -> Option<Split> {
         let open = self.open.as_ref()?;
-        let head = ABOVE + HEAD + FOOT;
-        let window = Window { width: room, margin: MARGIN, head, active: open.active, slide: open.slide };
-        let mut split = Split::new(&open.first, page, std::slice::from_ref(&open.block), &window);
-        // The layout knows of room over a version and of none under it, so some of what was asked for
-        // over each goes under it here.
-        for piece in split.pieces.iter_mut().filter(|piece| piece.block.is_some()) {
-            piece.head -= FOOT;
-            piece.origin.y -= FOOT;
-        }
-        Some(split)
+        Some(split(&open.first, page, std::slice::from_ref(&open.block), room, (open.active, open.slide)))
     }
 
     /// Lays out what `view`, a part of what scrolls, shows of the held-back version. Returns whether
@@ -393,28 +384,9 @@ impl Review {
             let aside = if open.active == Side::First { Side::Second } else { Side::First };
             let piece = split.pieces.iter().find(|piece| piece.block.is_some() && piece.side == aside);
             let frame = piece.map(|piece| frame(piece, measure, shift, room.width));
-            if let Some(frame) = frame.filter(|frame| frame.y + frame.height > 0.0 && frame.y < room.height) {
-                let seen = Rect::new(frame.x.max(0.0), frame.y, frame.width, frame.height);
-                let seen = Rect { width: (frame.x + frame.width).min(room.width) - seen.x, ..seen };
-                over.push(fill(seen, Color { a: (255.0 * ASIDE) as u8, ..shown.page }));
-                let (top, bottom) = (frame.y.max(0.0), (frame.y + frame.height).min(room.height));
-                let x = if aside == Side::First { tokens::SPACE_LG } else { room.width - tokens::SPACE_LG - BRING };
-                let button = Rect::new(x, ((top + bottom - BRING) / 2.0).round(), BRING, BRING);
-                over.push(Item::Fill { rect: button, color: ink(tokens::SURFACE_RAISED), radius: BRING / 2.0 });
-                if lit(button, Press::Bring(aside)) {
-                    over.push(Item::Fill { rect: button, color: ink(tokens::NEUTRAL_SOFT), radius: BRING / 2.0 });
-                }
-                over.push(Item::Stroke {
-                    rect: button,
-                    color: ink(tokens::LINE_STRONG),
-                    width: 1.0,
-                    radius: BRING / 2.0,
-                });
-                let arrow = if aside == Side::First { icon::CHEVRON_LEFT } else { icon::CHEVRON_RIGHT };
-                let at = Point { x: button.x + (BRING - SIGN) / 2.0, y: button.y + BRING / 2.0 };
-                sign(arrow, at, ink(tokens::FG), over);
-                self.hot.push((button, Press::Bring(aside)));
-            }
+            let lit = |button: Rect| lit(button, Press::Bring(aside));
+            let button = frame.and_then(|frame| veil(frame, aside, room, shown.page, &lit, scheme, over));
+            self.hot.extend(button.map(|button| (button, Press::Bring(aside))));
         }
     }
 
@@ -465,7 +437,7 @@ pub(crate) struct Shown<'a> {
 
 /// Where the frame round a version stands in the page area: round its text and the margins beside it,
 /// kept inside the window where one version stands alone at the page's width.
-fn frame(piece: &Piece, measure: f32, shift: Point, room: f32) -> Rect {
+pub(crate) fn frame(piece: &Piece, measure: f32, shift: Point, room: f32) -> Rect {
     let left = piece.origin.x - MARGIN + INSET;
     let right = piece.origin.x + measure + MARGIN - INSET;
     let (left, right) = match piece.rect.width >= room {
@@ -478,7 +450,7 @@ fn frame(piece: &Piece, measure: f32, shift: Point, room: f32) -> Rect {
 
 /// Where a part's text shows in the page area: no more of the part than its stretch of the page fills,
 /// since one of two versions side by side can be the shorter.
-fn text(piece: &Piece, shift: Point) -> Rect {
+pub(crate) fn text(piece: &Piece, shift: Point) -> Rect {
     let tall = (piece.band.1 - piece.band.0).min(piece.rect.height - piece.head);
     Rect::new(piece.rect.x + shift.x, piece.rect.y + piece.head + shift.y, piece.rect.width, tall.max(0.0))
 }
@@ -583,10 +555,7 @@ impl Head<'_> {
         };
 
         out.push(Item::PushClip { rect: Rect::new(left, frame.y, (right - left).max(0.0), HEAD), radius: 0.0 });
-        let face = Rect::new(left, middle - FACE / 2.0, FACE, FACE);
-        out.push(Item::Fill { rect: face, color: ink(tokens::NEUTRAL_SOFT), radius: FACE / 2.0 });
-        let letters = shape(&threads::initials(name), &TextStyle::control().size(9.0).weight(600));
-        text(&letters, face.x + ((FACE - letters.size.width) / 2.0).round(), tokens::FG_MUTED, out);
+        face(name, Point { x: left, y: middle }, shaper, scheme, out);
         let mut x = left + FACE + gap;
         text(&by, x, tokens::FG, out);
         x += by.size.width + gap;
@@ -611,6 +580,73 @@ impl Head<'_> {
         text(&label, button.x + PAD + SIGN + tokens::SPACE_XS, tokens::FG, out);
         Some((button, press))
     }
+}
+
+/// Two layouts of a document as one page in a page area `room` wide, cut at each of `blocks` that both
+/// hold: with room over each version of a block for the line at its head, and room under its text. `pinned`
+/// is the version the window is pinned to where it cannot show both whole, and how far the pair has slid
+/// to that version's end.
+pub(crate) fn split(
+    first: &DocLayout,
+    second: &DocLayout,
+    blocks: &[BlockId],
+    room: f32,
+    (active, slide): (Side, f32),
+) -> Split {
+    let head = ABOVE + HEAD + FOOT;
+    let window = Window { width: room, margin: MARGIN, head, active, slide };
+    let mut split = Split::new(first, second, blocks, &window);
+    // The layout knows of room over a version and of none under it, so some of what was asked for over
+    // each goes under it here.
+    for piece in split.pieces.iter_mut().filter(|piece| piece.block.is_some()) {
+        piece.head -= FOOT;
+        piece.origin.y -= FOOT;
+    }
+    split
+}
+
+/// Draws what lies over the version of a pinned pair that the window does not show whole: a veil, and at
+/// the window's edge the round button that brings the version across. `frame` is where the version stands
+/// in the page area, which is `room` large, and `lit` says whether the button is to show as under the
+/// pointer. Returns where the button is. Nothing is drawn for a version out of view.
+pub(crate) fn veil(
+    frame: Rect,
+    aside: Side,
+    room: Size,
+    page: Color,
+    lit: &dyn Fn(Rect) -> bool,
+    scheme: Scheme,
+    over: &mut DisplayList,
+) -> Option<Rect> {
+    if frame.y + frame.height <= 0.0 || frame.y >= room.height {
+        return None;
+    }
+    let ink = |ink: Ink| resolve(ink, scheme, 1.0);
+    let seen = Rect::new(frame.x.max(0.0), frame.y, frame.width, frame.height);
+    let seen = Rect { width: (frame.x + frame.width).min(room.width) - seen.x, ..seen };
+    over.push(fill(seen, Color { a: (255.0 * ASIDE) as u8, ..page }));
+    let (top, bottom) = (frame.y.max(0.0), (frame.y + frame.height).min(room.height));
+    let x = if aside == Side::First { tokens::SPACE_LG } else { room.width - tokens::SPACE_LG - BRING };
+    let button = Rect::new(x, ((top + bottom - BRING) / 2.0).round(), BRING, BRING);
+    over.push(Item::Fill { rect: button, color: ink(tokens::SURFACE_RAISED), radius: BRING / 2.0 });
+    if lit(button) {
+        over.push(Item::Fill { rect: button, color: ink(tokens::NEUTRAL_SOFT), radius: BRING / 2.0 });
+    }
+    over.push(Item::Stroke { rect: button, color: ink(tokens::LINE_STRONG), width: 1.0, radius: BRING / 2.0 });
+    let arrow = if aside == Side::First { icon::CHEVRON_LEFT } else { icon::CHEVRON_RIGHT };
+    sign(arrow, Point { x: button.x + (BRING - SIGN) / 2.0, y: button.y + BRING / 2.0 }, ink(tokens::FG), over);
+    Some(button)
+}
+
+/// Draws the face of who wrote a version: a round with the first letters of the name, its left edge at
+/// `at` and its middle at that height.
+pub(crate) fn face(name: &str, at: Point, shaper: &dyn TextShaper, scheme: Scheme, out: &mut DisplayList) {
+    let ink = |ink: Ink| resolve(ink, scheme, 1.0);
+    let round = Rect::new(at.x, at.y - FACE / 2.0, FACE, FACE);
+    out.push(Item::Fill { rect: round, color: ink(tokens::NEUTRAL_SOFT), radius: FACE / 2.0 });
+    let letters = shaper.shape(&threads::initials(name), &TextStyle::control().size(9.0).weight(600), None);
+    let x = round.x + ((FACE - letters.size.width) / 2.0).round();
+    letters.paint(Point { x, y: at.y - (letters.size.height / 2.0).round() }, ink(tokens::FG_MUTED), out);
 }
 
 /// Draws an icon [`SIGN`] large, with its left edge at `at` and its middle at that height.
@@ -675,7 +711,7 @@ pub(crate) fn bar(count: usize, open: Option<usize>) -> Element<Message> {
 
 /// The words in which two versions of a block differ, as selections in each: the held-back version's
 /// first. Text that only one of them has differs whole.
-fn differing(held: &Block, page: &Block) -> [Vec<Selection>; 2] {
+pub(crate) fn differing(held: &Block, page: &Block) -> [Vec<Selection>; 2] {
     fn texts<'a>(block: &'a Block, out: &mut Vec<(&'a BlockId, String)>) {
         if matches!(block.body, Body::Text(_)) {
             out.push((&block.id, block.plain_text()));
