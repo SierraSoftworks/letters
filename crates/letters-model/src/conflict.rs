@@ -535,7 +535,9 @@ pub(crate) struct Clash {
     lost: HashSet<ID>,
     /// The character that stands before the block on the later side.
     prior: Option<ID>,
-    /// The characters the earlier side put into what it holds of the block.
+    /// All the earlier side holds of the block.
+    held: Vec<ID>,
+    /// Those of them that it put in.
     drop: Vec<ID>,
     /// What else the earlier side put in where the block stood or right before it: text that runs on from
     /// the block before, then blocks of its own. This block goes between the two.
@@ -658,9 +660,10 @@ pub(crate) fn find(
         let lost = keep.ids.iter().filter(|id| struck[1 - later].contains_key(*id)).copied().collect();
         let prior = keep.prior;
         let beside = drop.ahead.into_iter().chain(drop.beside).collect();
-        let drop = drop.ids.into_iter().filter(|id| !is_old(id)).collect();
+        let held = drop.ids;
+        let drop = held.iter().copied().filter(|id| !is_old(id)).collect();
         let keep = (keep.pieces, keep.ids);
-        found.push(Clash { conflict, settled, old, keep, lost, prior, drop, beside, near });
+        found.push(Clash { conflict, settled, old, keep, lost, prior, held, drop, beside, near });
     }
     Ok(found)
 }
@@ -706,9 +709,9 @@ pub(crate) fn told(clashes: Vec<Clash>) -> Vec<Conflict> {
 struct Fixes {
     cut: BTreeSet<usize>,
     put: BTreeMap<(usize, usize), Vec<TextDelta>>,
-    /// The conflict that mends each character: the first to hold it. Two conflicts can hold one, when a
-    /// side cut one of their blocks from the other. Mended by both, it would be put back twice, or moved
-    /// by one from where the other counts on it.
+    /// The conflict that mends each character: the first to hold it, on either side. Two conflicts can
+    /// hold one, when a side cut one of their blocks from the other. Mended by both, it would be put back
+    /// twice, moved by one from where the other counts on it, or kept by one and taken out by the other.
     mender: HashMap<ID, usize>,
 }
 
@@ -727,23 +730,44 @@ impl Clash {
         let (pieces, ids) = &self.keep;
         let kept: Vec<ID> = ids.iter().copied().filter(|id| !self.lost.contains(id)).collect();
         let mut stand = places(loro, body, &kept);
-        fixes.cut.extend(places(loro, body, &self.drop).into_values());
+        let mine = |id: &ID| fixes.mender.get(id) == Some(&nth);
+        let theirs = places(loro, body, &self.held);
+        let dropped = self.drop.iter().filter(|id| mine(id)).filter_map(|id| theirs.get(id));
+        fixes.cut.extend(dropped);
         // The merge can leave some of the block on the wrong side of what the earlier side put in beside
         // it: behind a marker, in a block of that side's own, or ahead of text that ends the block before.
         // Those characters are moved: taken out there, and put back in with what was lost.
         let beside = places(loro, body, &self.beside);
         let marks = |at: &&usize| body.char_at(**at).is_ok_and(|c| MARKER.starts_with(c));
-        // A block the later side joined to this one can hold a marker of the earlier side's as well.
+        // What stands between the block's characters and is not the block's is the earlier side's too. A
+        // block the later side joined to this one can hold a marker of that side's.
         let reach = stand.values().min().copied().zip(stand.values().max().copied());
-        let within = reach.and_then(|(first, last)| {
-            let (stretch, held) = (body.slice(first, last + 1).ok()?, stand.values().collect::<HashSet<_>>());
-            let markers =
-                stretch.chars().enumerate().filter(|(_, c)| MARKER.starts_with(*c)).map(|(nth, _)| first + nth);
-            markers.filter(|at| !held.contains(at) && !fixes.cut.contains(at)).min()
-        });
+        let (mut within, mut among) = (None, Vec::new());
+        if let Some((first, last)) = reach {
+            let own: HashSet<usize> = stand.values().chain(theirs.values()).copied().collect();
+            let mut at = first;
+            while let Ok(c) = body.char_at(at) {
+                let (marker, behind) = (MARKER.starts_with(c), at > last);
+                if fixes.cut.contains(&at) || (!behind && own.contains(&at)) {
+                    at += 1;
+                    continue;
+                }
+                match marker {
+                    true if !behind => within = within.or(Some(at)),
+                    // A block that was not there when the sides last agreed has no place to tell by what
+                    // the earlier side put in beside it. Its text among the block's own is that, and so is
+                    // text right behind the block, where the later side left none: it is the end of the
+                    // block before, as the earlier side has it.
+                    false if !self.old && !own.contains(&at) && !(behind && theirs.is_empty()) => among.push(at),
+                    _ if behind => break,
+                    _ => {}
+                }
+                at += 1;
+            }
+        }
         let gate = beside.values().filter(marks).copied().chain(within).min();
-        let lead = beside.values().filter(|at| gate.is_none_or(|gate| **at < gate)).max().map(|at| at + 1);
-        let mine = |id: &ID| fixes.mender.get(id) == Some(&nth);
+        let ahead = beside.values().chain(&among).filter(|at| gate.is_none_or(|gate| **at < gate));
+        let lead = ahead.max().map(|at| at + 1);
         let astray =
             |id: &ID, at: usize| mine(id) && (lead.is_some_and(|lead| at < lead) || gate.is_some_and(|gate| at > gate));
         fixes.cut.extend(stand.iter().filter(|(id, at)| astray(id, **at)).map(|(_, at)| *at));
@@ -809,7 +833,7 @@ pub(crate) fn settle(loro: &LoroDoc, body: &LoroText, sides: [&Frontiers; 2], cl
     // side by side.
     let (mut fixes, mut next) = (Fixes::default(), None);
     for (nth, clash) in clashes.iter().enumerate() {
-        for id in &clash.keep.1 {
+        for id in clash.keep.1.iter().chain(&clash.drop) {
             fixes.mender.entry(*id).or_insert(nth);
         }
     }
