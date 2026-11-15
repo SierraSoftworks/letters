@@ -1713,7 +1713,6 @@ impl EditorApp {
                 let (steps, current) = (self.editor.timeline(), self.editor.model().revision());
                 let mut history = History::new(&steps, current, platform.wall_time(), self.zone);
                 history.add_fallback_fonts(&self.backup);
-                history.still = self.reduced_motion;
                 self.history = Some(history);
                 // The nodes that stand for the blocks go with the page, and are told whole when it is back.
                 self.told.get_mut().forget();
@@ -1752,7 +1751,7 @@ impl EditorApp {
                 self.history.iter_mut().for_each(|history| history.widen(clicks, platform));
             }
             Historying::Drag(at) => self.history.iter_mut().for_each(|history| history.drag(at)),
-            Historying::Up(at) => self.history.iter_mut().for_each(|history| history.release(at)),
+            Historying::Up => self.history.iter_mut().for_each(History::release),
             Historying::All => self.history.iter_mut().for_each(|history| history.select_all(platform)),
             Historying::Copy => self.history.iter_mut().for_each(|history| history.copy(platform)),
             Historying::Unselect => self.history.iter_mut().for_each(History::unselect),
@@ -4381,7 +4380,6 @@ impl App for EditorApp {
     fn reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
         self.review.still = reduced;
-        self.history.iter_mut().for_each(|history| history.still = reduced);
         self.references.set_reduced_motion(reduced);
     }
 
@@ -4389,8 +4387,9 @@ impl App for EditorApp {
         if let Some(print) = self.printing.as_mut() {
             return print.point(at);
         }
-        if let Some(history) = self.history.as_mut() {
-            return history.point(at);
+        // A version has nothing that shows otherwise under the pointer.
+        if self.history.is_some() {
+            return false;
         }
         // The page has nothing of its own under the version held back, nor under the buttons.
         let moved = self.review.point(at);
@@ -4427,8 +4426,7 @@ impl App for EditorApp {
         let light = self.references.animate(now_ms);
         let copied = self.code_copy.animate(now_ms);
         let slid = self.review.animate(now_ms);
-        let brought = self.history.as_mut().and_then(|history| history.animate(now_ms));
-        [note, slide, fade, light, copied, slid, brought].into_iter().flatten().min()
+        [note, slide, fade, light, copied, slid].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {
