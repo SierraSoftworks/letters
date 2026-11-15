@@ -212,6 +212,8 @@ panic = "unwind"
 inherits = "release"
 lto = false
 debug = "line-tables-only"
+# A target may catch a panic of code it cannot make refuse, as `Model::check` does with Loro's.
+panic = "unwind"
 
 # The browser's wasm is downloaded before it runs, so it is built small, except where a frame is made:
 # shaping, layout and painting keep their speed. Measured at 17% less to download for the same frame times.
