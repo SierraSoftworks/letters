@@ -449,6 +449,8 @@ proptest! {
             }
             prop_assert_eq!(shown(model), reread(model), "the document drifted from its history");
             prop_assert!(unique_ids(model.doc()), "two blocks share an id");
+            let found = |block: &Block| model.block(&block.id).is_some_and(|found| std::ptr::eq(found, block));
+            prop_assert!(model.doc().walk().all(found), "a block is not found by its id");
         }
 
         for to in 0..REPLICAS {

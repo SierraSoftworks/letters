@@ -3,6 +3,7 @@
 //! Run with `cargo bench -p letters-model`. It exits with an error when a budget is broken. A key press
 //! has 8 ms to reach the screen on the reference machine, an M1 Pro, and the model should use little of it.
 
+use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Hold, Mark, Model, Op, Pos, ReplicaId, Run};
@@ -102,6 +103,10 @@ fn main() {
         drop(model.apply([Op::Join { block: new_id(99 - run) }]).expect("joined"))
     });
     kept &= report("undo a join", 100, Some(STRUCTURE), |_| drop(model.undo().expect("a step to undo")));
+    // The first search after blocks came or went reads where every block is. Later ones do not.
+    let found = |block: usize| black_box(model.place(&id(block))).is_some();
+    report("find a block, the first time", 1, None, |_| assert!(found(BLOCKS - 1)));
+    kept &= report("find a block by its id", 2_000, Some(EDIT), |run| assert!(found(run * 5)));
 
     // What another replica typed arrives while this one has moved on.
     report("merge a remote key press", 100, None, |run| {

@@ -2,8 +2,8 @@
 
 mod common;
 
-use common::{id, sync, typed};
-use letters_model::{Align, Block, BlockId, BlockKind, Body, Document, Mark, Model, Op, OpError, ReplicaId};
+use common::{id, split, sync, typed};
+use letters_model::{Align, Block, BlockId, BlockKind, Body, Document, Mark, Model, Op, OpError, Place, ReplicaId};
 
 fn picture(asset: &str, width: f32, height: f32) -> BlockKind {
     BlockKind::Figure { asset: Some(asset.into()), src: None, alt: String::new(), width, height, numbered: false }
@@ -73,6 +73,29 @@ fn outline(doc: &Document) -> String {
 /// Whether the document can go into a file and come back, as only one that nests its parts rightly can.
 fn stored(doc: &Document) -> bool {
     Document::from_json(&doc.to_json()).as_ref() == Ok(doc)
+}
+
+/// A block's id, the id of the block that holds it, and its place there.
+type Seat = (BlockId, Option<BlockId>, usize);
+
+/// Where each block sits, read from the document itself.
+fn seats(blocks: &[Block], parent: Option<&BlockId>) -> Vec<Seat> {
+    let seat = |(index, block): (usize, &Block)| {
+        let mut all = vec![(block.id.clone(), parent.cloned(), index)];
+        all.extend(seats(block.body.blocks(), Some(&block.id)));
+        all
+    };
+    blocks.iter().enumerate().flat_map(seat).collect()
+}
+
+/// Where each block sits, as the model finds it by its id. A block it does not find is left out.
+fn found(model: &Model) -> Vec<Seat> {
+    let seat = |block: &Block| {
+        let place = model.place(&block.id)?;
+        let same = model.block(&block.id).is_some_and(|found| std::ptr::eq(found, block));
+        same.then(|| (block.id.clone(), place.parent.map(|parent| parent.id.clone()), place.index))
+    };
+    model.doc().walk().filter_map(seat).collect()
 }
 
 #[test]
@@ -312,4 +335,39 @@ fn a_block_merged_into_a_container_that_cannot_hold_it_sits_after_it() {
     // Each can still be edited where it now sits.
     a.apply([typed("x", 5, "!"), insert(Some("q"), 1, figure("f5", ""))]).unwrap();
     assert_eq!(outline(a.doc()), "q(f3 f5) x f4");
+}
+
+#[test]
+fn a_block_is_found_by_its_id_wherever_it_comes_to_sit() {
+    let (mut m, mut other) = (model(), Model::new(doc(), ReplicaId::from(2)));
+    let first = m.revision();
+    let place = m.place(&id("c4")).unwrap();
+    assert_eq!((place.parent.map(|row| row.id.as_str()), place.index), (Some("r2"), 1));
+    assert_eq!(m.place(&id("t")), Some(Place { parent: None, index: 2 }));
+    assert_eq!(m.block(&id("cap")).map(Block::plain_text).as_deref(), Some("At sea"));
+
+    let moved = m.doc().block(&id("f2")).unwrap().clone();
+    let edits = [
+        ("typing", vec![typed("c4", 0, "about ")]),
+        ("a new row", vec![insert(Some("t"), 1, row("r3", vec![cell("c5", "Punt")]))]),
+        ("a split", vec![split("p", 3, "p2")]),
+        ("a move", vec![remove("f2"), insert(None, 0, moved)]),
+        ("a removal", vec![remove("g")]),
+    ];
+    for (edit, ops) in edits {
+        m.apply(ops).unwrap();
+        assert_eq!(found(&m), seats(&m.doc().blocks, None), "after {edit}");
+    }
+    assert_eq!((m.block(&id("f1")), m.place(&id("f1"))), (None, None), "a block that went is not found");
+
+    m.undo().unwrap();
+    assert_eq!(found(&m), seats(&m.doc().blocks, None), "after an undo");
+    other.apply([insert(Some("r2"), 0, cell("c0", ""))]).unwrap();
+    m.merge(&other.save()).unwrap();
+    assert_eq!(found(&m), seats(&m.doc().blocks, None), "after a merge");
+    assert_eq!(m.place(&id("c3")).map(|place| place.index), Some(1));
+
+    m.checkout(&first).unwrap();
+    assert_eq!(found(&m), seats(&m.doc().blocks, None), "at an old revision");
+    assert_eq!((outline(m.doc()), m.block(&id("r3"))), (OUTLINE.to_string(), None));
 }

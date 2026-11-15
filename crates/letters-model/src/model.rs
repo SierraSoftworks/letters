@@ -5,8 +5,9 @@
 //! [`Model::doc`] is a view of that history, brought up to date by each change and never rebuilt.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -178,7 +179,35 @@ impl Change {
 }
 
 /// The entry of a block, and where the block starts in the sequence, in characters.
-type Place = (usize, usize);
+type Seat = (usize, usize);
+
+/// Where a block sits: the block that holds it, and its place among that block's children or, at the top
+/// level, among the document's blocks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Place<'a> {
+    pub parent: Option<&'a Block>,
+    pub index: usize,
+}
+
+/// Each block's entry by the hash of its id, which is spread well enough to be the map's own hash.
+type Lookup = HashMap<u64, u32, BuildHasherDefault<Ready>>;
+
+#[derive(Default)]
+struct Ready(u64);
+
+impl Hasher for Ready {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = bytes.iter().fold(self.0, |hash, byte| hash.rotate_left(8) ^ u64::from(*byte));
+    }
+
+    fn write_u64(&mut self, hash: u64) {
+        self.0 = hash;
+    }
+}
 
 /// The history behind a document, and what it has reported since the model last caught up with it.
 struct History {
@@ -214,6 +243,8 @@ pub struct Model {
     /// Started from the document when something first needs it, unless one is attached before.
     history: OnceLock<History>,
     steps: Steps,
+    /// Made when a block is first looked up by id, and again after blocks come, go, move or are renamed.
+    lookup: OnceLock<Lookup>,
 }
 
 impl fmt::Debug for Model {
@@ -250,8 +281,8 @@ impl Model {
         let built = flat::normal(mem::take(&mut doc.blocks));
         doc.blocks = built.blocks;
         crdt::normal_meta(&mut doc);
-        let (index, style) = (built.index, Style::default());
-        Self { doc, index, style, styled: false, replica, history: OnceLock::new(), steps: Steps::default() }
+        let (index, style, lookup) = (built.index, Style::default(), OnceLock::new());
+        Self { doc, index, style, styled: false, replica, history: OnceLock::new(), steps: Steps::default(), lookup }
     }
 
     /// The model with the style its file holds, for one that was just made.
@@ -274,8 +305,8 @@ impl Model {
         let history = History::open(loro, replica);
         let (doc, index) = crdt::read(&history.loro, &history.body);
         let style = crdt::read_style(&history.loro);
-        let (history, steps) = (OnceLock::from(history), Steps::default());
-        Ok(Self { doc, index, style, styled: true, replica, history, steps })
+        let (history, steps, lookup) = (OnceLock::from(history), Steps::default(), OnceLock::new());
+        Ok(Self { doc, index, style, styled: true, replica, history, steps, lookup })
     }
 
     /// A second replica at the newest revision, for another writer. It starts with no undo steps.
@@ -285,8 +316,8 @@ impl Model {
             // Both then start the same history from the same document.
             None => {
                 let (doc, index, style) = (self.doc.clone(), self.index.clone(), self.style.clone());
-                let (history, steps) = (OnceLock::new(), Steps::default());
-                Self { doc, index, style, styled: self.styled, replica, history, steps }
+                let (history, steps, lookup) = (OnceLock::new(), Steps::default(), self.lookup.clone());
+                Self { doc, index, style, styled: self.styled, replica, history, steps, lookup }
             }
         }
     }
@@ -337,6 +368,7 @@ impl Model {
         self.history = OnceLock::from(history);
         let shown = mem::replace(&mut self.doc, theirs.doc);
         let layout = mem::replace(&mut self.index, theirs.index);
+        self.lookup = theirs.lookup;
         let style = mem::replace(&mut self.style, theirs.style);
         let steps = mem::take(&mut self.steps);
         // What this model shows that the history does not is its own writer's work.
@@ -444,6 +476,33 @@ impl Model {
 
     pub fn style(&self) -> &Style {
         &self.style
+    }
+
+    /// Finds a block by its id, as [`Document::block`] does, without searching the document for it.
+    pub fn block(&self, id: &BlockId) -> Option<&Block> {
+        nth(&self.doc.blocks, &self.index, self.find(id)?)
+    }
+
+    /// Where a block sits. `None` when the document has no such block.
+    pub fn place(&self, id: &BlockId) -> Option<Place<'_>> {
+        let entry = &self.index[self.find(id)?];
+        let parent = (entry.level > 0).then(|| nth(&self.doc.blocks, &self.index, entry.parent)).flatten();
+        Some(Place { parent, index: entry.nth })
+    }
+
+    /// The entry of the block with this id.
+    fn find(&self, id: &BlockId) -> Option<usize> {
+        let lookup = self.lookup.get_or_init(|| {
+            let mut lookup = Lookup::with_capacity_and_hasher(self.index.len(), BuildHasherDefault::default());
+            for (i, entry) in self.index.iter().enumerate() {
+                lookup.entry(entry.hash).or_insert(i as u32);
+            }
+            lookup
+        });
+        let i = *lookup.get(&flat::hash(id))? as usize;
+        let found = nth(&self.doc.blocks, &self.index, i).is_some_and(|block| block.id == *id);
+        // Two ids that share a hash are told apart the slow way.
+        if found { Some(i) } else { self.spot(id).ok().map(|spot| spot.i) }
     }
 
     pub fn replica(&self) -> ReplicaId {
@@ -788,7 +847,7 @@ impl Model {
         let (doc, index) = crdt::read(self.loro(), self.body());
         let style = crdt::read_style(self.loro());
         let old = mem::replace(&mut self.doc, doc);
-        self.index = index;
+        (self.index, self.lookup) = (index, OnceLock::new());
         self.queue().clear();
         let mut change = diff(&old, &self.doc);
         change.document = fields(&old) != fields(&self.doc);
@@ -800,7 +859,7 @@ impl Model {
     /// that takes it back: `None` when it did not fit and the document was read again from the history.
     ///
     /// `place` is the entry of the block the change is known to be made in, and where that block starts.
-    fn shift(&mut self, delta: &[TextDelta], place: Option<Place>) -> (Change, Option<Delta>) {
+    fn shift(&mut self, delta: &[TextDelta], place: Option<Seat>) -> (Change, Option<Delta>) {
         if let Some(done) = self.shift_text(delta, place) {
             return done;
         }
@@ -814,7 +873,7 @@ impl Model {
             return (change, None);
         };
         let built = flat::build(moved.blocks);
-        (self.doc.blocks, self.index) = (built.blocks, built.index);
+        (self.doc.blocks, self.index, self.lookup) = (built.blocks, built.index, OnceLock::new());
         // Blocks came, went or moved exactly when the ids or their nesting read differently in order.
         let structure = !before.iter().copied().eq(self.index.iter().map(|entry| (entry.hash, entry.level)));
         let blocks = built.dirty.into_iter().chain(moved.gone).collect();
@@ -822,7 +881,7 @@ impl Model {
     }
 
     /// The common case of [`Model::shift`]: a change inside one block's text edits that block in place.
-    fn shift_text(&mut self, delta: &[TextDelta], place: Option<Place>) -> Option<(Change, Option<Delta>)> {
+    fn shift_text(&mut self, delta: &[TextDelta], place: Option<Seat>) -> Option<(Change, Option<Delta>)> {
         let (first, last) = span(delta)?;
         let holds = |entry: &Entry, start: usize| {
             entry.marker && entry.shape == BodyShape::Text && start < first && last <= start + entry.len()
@@ -905,7 +964,7 @@ impl Model {
     /// Turns an operation into the change it makes to the sequence, or says why it cannot be made.
     ///
     /// An operation on one block's text also names that block's place, which saves looking for it again.
-    fn compile(&self, op: &Op) -> Result<(Delta, Option<Place>), OpError> {
+    fn compile(&self, op: &Op) -> Result<(Delta, Option<Seat>), OpError> {
         let mut delta = Vec::new();
         let mut place = None;
         match op {
@@ -1073,7 +1132,7 @@ impl Model {
         value: LoroValue,
         set: impl Fn(&Run) -> bool,
         delta: &mut Vec<TextDelta>,
-    ) -> Result<Place, OpError> {
+    ) -> Result<Seat, OpError> {
         let (spot, runs) = self.text(block)?;
         let chars = char_range(runs, block, range)?;
         // Where the change has got to in the block's text. `None` until it has somewhere to start.
