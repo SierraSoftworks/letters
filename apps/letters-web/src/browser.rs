@@ -12,8 +12,8 @@ use letters_ui::{Appearance, Settings};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    Blob, BlobPropertyBag, CanvasRenderingContext2d, Crypto, HtmlCanvasElement, ImageBitmap, Performance, Response,
-    Storage, Url, Window,
+    Blob, BlobPropertyBag, CanvasRenderingContext2d, Crypto, HtmlCanvasElement, ImageBitmap, Performance, RequestInit,
+    Response, Storage, Url, Window,
 };
 
 /// Fetches the files at `urls`, all at once. A page that preloads them has them here by the time the wasm
@@ -30,6 +30,39 @@ pub async fn files(window: &Window, urls: &[String]) -> Result<Vec<Vec<u8>>, JsV
         files.push(Uint8Array::new(&bytes).to_vec());
     }
     Ok(files)
+}
+
+/// Asks the server behind the page for what is at `path`, an address of `letters_api::paths`, with a
+/// `body` of JSON if it takes one. The browser sends the session along by itself. `Err` is the server's
+/// refusal, or one made up here for an answer that never came, with a sentence the person can be shown.
+pub async fn ask(
+    window: &Window,
+    method: &str,
+    path: &str,
+    body: Option<String>,
+) -> Result<Vec<u8>, letters_api::Error> {
+    let lost = |_| letters_api::Error::new(letters_api::Code::Unavailable, "The server could not be reached.");
+    let request = RequestInit::new();
+    request.set_method(method);
+    if let Some(body) = &body {
+        let headers = Object::new();
+        Reflect::set(&headers, &"content-type".into(), &letters_api::JSON.into()).map_err(lost)?;
+        request.set_headers(&headers);
+        request.set_body(&body.into());
+    }
+    let response = JsFuture::from(window.fetch_with_str_and_init(path, &request)).await.map_err(lost)?;
+    let response: Response = response.dyn_into().map_err(lost)?;
+    let bytes = JsFuture::from(response.array_buffer().map_err(lost)?).await.map_err(lost)?;
+    let bytes = Uint8Array::new(&bytes).to_vec();
+    if response.ok() {
+        return Ok(bytes);
+    }
+    // What stands between the page and the server may refuse in words of its own.
+    let unread = || {
+        let message = format!("The server answered {} and did not say why.", response.status());
+        letters_api::Error::new(letters_api::Code::Unknown, message)
+    };
+    Err(serde_json::from_slice(&bytes).unwrap_or_else(|_| unread()))
 }
 
 /// The longest side a picture is drawn from, in pixels. A photo straight from a camera is several times

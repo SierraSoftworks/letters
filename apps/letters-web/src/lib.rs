@@ -6,7 +6,7 @@
 //! - [`faces`] says which face backs up the fonts for a character they lack.
 //! - [`mirror`] keeps the window readable as HTML beside the canvas, for assistive technology.
 //! - [`page`] is the page a server sends: the document as HTML to read at once, and for the editor to open.
-//! - [`Letters`] is what a page holds: `await Letters.start(canvas, "")` starts the editor.
+//! - [`Letters`] is what a page holds: `await Letters.start(canvas, base)` starts the editor.
 //!
 //! Frames are rasterised on the CPU, so the page needs no WebGPU. The fonts are fetched beside the wasm and
 //! are no part of it, so a new build of the code leaves them in the browser's cache. The dictionaries, and
@@ -49,6 +49,7 @@ impl Letters {
         let window = web_sys::window().ok_or("there is no window")?;
         let mut platform = Browser::new(&window)?;
         let opened = shell::carried(&window, &mut platform);
+        let server = shell::served(&window);
         let maths = page::has_maths(&opened);
         let fonts = shell::urls(&base, "fonts", &letters_fonts::FILES);
         let first = if platform.kept(&window, &fonts[0]) { fonts.len() } else { 1 };
@@ -63,7 +64,7 @@ impl Letters {
             letters_math::provide_fonts(faces);
         }
         let later = Later { base, fonts: fonts[first..].to_vec(), maths: !maths };
-        Ok(Self { shell: Shell::start(canvas, platform, opened, later)? })
+        Ok(Self { shell: Shell::start(canvas, platform, opened, server, later)? })
     }
 
     /// The document, as `document.json` stores it.

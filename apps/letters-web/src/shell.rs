@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Array, Function, Map, Object, Promise, Reflect, Uint8Array};
+use letters_api::{Opened, paths};
 use letters_editor::{Clip, Editor, Key, KeyEvent, Modifiers, Picture, Platform as _};
 use letters_model::{
     BlockKind, Change, Document, HistoryError, Mark, Model, Notes, Pos, ReplicaId, Revision, Selection, Style, TagKind,
@@ -74,10 +75,6 @@ const DOT: f32 = 7.0;
 const PICTURES: &str = "image/png,image/jpeg,image/gif,image/webp";
 /// What a document's file is called, which is what the person is offered to open.
 const DOCUMENTS: &str = ".let";
-/// What the Comment tool says of a document whose notes this build could not read, as the desktop does.
-const NO_COMMENTS: &str = "Comments cannot be added here: this document's notes are in a form this version of \
-                           Letters cannot read.";
-
 /// How long writing rests before where it stopped is marked as a version, in seconds. The desktop marks
 /// after the same rest, and the history ends a version at it.
 const REST: u64 = 600;
@@ -176,9 +173,12 @@ pub struct Shell {
     /// What `View::edits` said when the document was opened or last kept as a file of its own. What was
     /// written since is nowhere but on the page.
     kept: u64,
-    /// The document's id and when it was created, which its file says. One that never had a file is
-    /// given them when it is first saved.
+    /// The document's id and when it was created, which its file or its server says. One that never had
+    /// a file is given them when it is first saved.
     identity: Option<[String; 2]>,
+    /// What the server behind the page says of the document on it. `None` for a page with no server, and
+    /// once the person has opened a file of their own in the server's document's place.
+    server: Option<Opened>,
     /// Whether the document's file is being written.
     saving: bool,
     /// What the window was last told of saving.
@@ -231,6 +231,7 @@ impl Shell {
         canvas: HtmlCanvasElement,
         mut platform: Browser,
         opened: Document,
+        server: Option<Opened>,
         later: Later,
     ) -> Result<Rc<RefCell<Self>>, JsValue> {
         let window = web_sys::window().ok_or("there is no window")?;
@@ -286,7 +287,17 @@ impl Shell {
         let mac = window.navigator().platform().is_ok_and(|name| name.starts_with("Mac") || name.starts_with("iP"));
         let dark_mode = window.match_media("(prefers-color-scheme: dark)")?;
         let less_motion = window.match_media("(prefers-reduced-motion: reduce)")?;
-        let view = view(opened, &mut platform, mac);
+        let view = match &server {
+            Some(server) => {
+                let replica = ReplicaId::new(&platform.new_id());
+                let mut view = set_up(page::served_window(opened, server, replica), &mut platform, mac);
+                // The session's name signs the edits, whatever name this browser kept from another time.
+                view.set_author(&server.author);
+                view
+            }
+            None => view(opened, &mut platform, mac),
+        };
+        let identity = server.as_ref().map(|server| [server.id.clone(), server.created.clone()]);
 
         let shell = Rc::new_cyclic(|shell| {
             RefCell::new(Self {
@@ -312,7 +323,8 @@ impl Shell {
                 picker: picker.clone(),
                 opener: opener.clone(),
                 kept: view.edits(),
-                identity: None,
+                identity,
+                server,
                 saving: false,
                 save_state: SaveState::default(),
                 session: None,
@@ -470,7 +482,7 @@ impl Shell {
     pub fn open(&mut self, document: Document) {
         self.view = view(document, &mut self.platform, self.mac);
         self.backed();
-        (self.kept, self.identity) = (self.view.edits(), None);
+        (self.kept, self.identity, self.server) = (self.view.edits(), None, None);
         (self.session, self.written, self.rested) = (None, self.kept, None);
         self.save_state = SaveState::default();
         self.text = TextInput::new(self.mac);
@@ -547,10 +559,13 @@ impl Shell {
         });
     }
 
-    /// Opens a link the person followed, in another tab. The browser keeps no word yet of what they trust,
-    /// so every address is shown whole first, and what would run something here is never opened.
+    /// Opens a link the person followed, in another tab. Only a server keeps word of what they trust, so
+    /// without its word every address is shown whole first, and what would run something here is never
+    /// opened.
     fn open_link(&mut self, href: &str, confirmed: bool) {
-        match Trust::default().gate("", Origin::Outside).link(href) {
+        let trusted = self.server.as_ref().is_some_and(|server| server.trust == letters_api::Trust::Trusted);
+        let origin = if trusted { Origin::Created } else { Origin::Outside };
+        match Trust::default().gate("", origin).link(href) {
             LinkDecision::Refuse => self.view.refuse_link(href, "Letters does not open addresses of this kind."),
             LinkDecision::Ask if !confirmed => self.view.ask_link(href),
             // The page it opens learns nothing of this one, and cannot reach back into it.
@@ -558,6 +573,28 @@ impl Shell {
                 self.window.open_with_url_and_target_and_features(href, "_blank", "noopener,noreferrer").map(drop),
             ),
         }
+    }
+
+    /// Has the server keep that the person trusts this document, which ends its safe mode for them here
+    /// and wherever they open it next.
+    fn trust(&mut self) {
+        let Some(id) = self.server.as_ref().map(|server| server.id.clone()) else { return };
+        let (shell, window) = (self.me.clone(), self.window.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let answer = browser::ask(&window, "POST", &paths::trust(&id), None).await;
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            // The page may show another document by now.
+            let Some(server) = shell.server.as_mut().filter(|server| server.id == id) else { return };
+            match answer {
+                Ok(_) => {
+                    server.trust = letters_api::Trust::Trusted;
+                    shell.view.set_safe_mode(None);
+                }
+                Err(refusal) => shell.say(refusal.message),
+            }
+            shell.arrived();
+        });
     }
 
     /// Offers `file` to the person as a file to keep, called `name`: text, or bytes.
@@ -993,7 +1030,7 @@ impl Shell {
         }
         match notes {
             Some(notes) => view.set_notes(notes),
-            None => view.refuse_comments(Some(NO_COMMENTS)),
+            None => view.refuse_comments(Some(page::NO_COMMENTS)),
         }
         view.set_document_name(name);
         if let Some(page) = self.window.document() {
@@ -1004,7 +1041,7 @@ impl Shell {
             let picture = Uint8Array::new(&picture).to_vec();
             self.platform.assets.extend(name.as_string().map(|name| (name, picture)));
         });
-        (self.kept, self.identity) = (view.edits(), Some(identity));
+        (self.kept, self.identity, self.server) = (view.edits(), Some(identity), None);
         (self.session, self.written, self.rested) = (session, self.kept, None);
         self.save_state = SaveState::default();
         self.view = view;
@@ -1156,6 +1193,7 @@ impl Shell {
                 Request::Print => self.print(),
                 Request::Asset(name) => self.load(name),
                 Request::OpenLink { href, confirmed } => self.open_link(&href, confirmed),
+                Request::TrustDocument => self.trust(),
                 // The window has taken the settings already. The rest is the shell's: keeping them, the
                 // name edits carry, and light or dark.
                 Request::Settings(settings) => {
@@ -1877,6 +1915,18 @@ pub fn carried(window: &Window, platform: &mut Browser) -> Document {
                 welcome.language = language;
             }
             welcome
+        }
+    }
+}
+
+/// What the server behind the page says of the document it carries. `None` for a page with no server.
+pub fn served(window: &Window) -> Option<Opened> {
+    let said = window.document()?.get_element_by_id(page::OPENED)?.text_content()?;
+    match serde_json::from_str(&said) {
+        Ok(opened) => Some(opened),
+        Err(error) => {
+            web_sys::console::error_1(&format!("what the server says of the document cannot be read: {error}").into());
+            None
         }
     }
 }

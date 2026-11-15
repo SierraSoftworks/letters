@@ -4,9 +4,12 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
+    <!-- A server says here where the files below are, and names the page after its document. -->
+    <!--letters:base-->
     <title>Letters</title>
     <link rel="icon" href="favicon.ico" sizes="any" />
     <!-- What the editor's first frame needs is asked for at once, not each when the one before has arrived. -->
+    <link rel="modulepreload" href="start.js" />
     <link rel="modulepreload" href="letters.js" />
     <link rel="preload" as="fetch" crossorigin href="letters_bg.wasm" />
     <!-- The text of the first paint and the editor's first frame are waiting for this one. The other fonts
@@ -35,12 +38,9 @@
          the window's controls, and to open. -->
     <!--letters:first-paint-->
     <!--letters:document-->
-    <script type="module">
-      import init, { Letters } from "./letters.js";
-
-      await init();
-      // The console and the tests reach the editor here.
-      window.letters = await Letters.start(document.getElementById("letters"), "");
-    </script>
+    <!-- A server writes in here what it says of the document: who writes in it, and what they may do. -->
+    <!--letters:opened-->
+    <!-- The page's one script is a file, so that a server's policy need let no inline script run. -->
+    <script type="module" src="start.js"></script>
   </body>
 </html>

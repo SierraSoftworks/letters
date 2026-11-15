@@ -1,7 +1,13 @@
 //! The page a server sends: a template with the document in it twice, under the shape of the window's bar.
 
-use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, ReplicaId};
-use letters_web::page::{self, DOCUMENT, FIRST_PAINT, Place, Skeleton, Span};
+use std::convert::Infallible;
+
+use letters_api::{Allows, Opened, Role, Trust};
+use letters_editor::InputEvent;
+use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, ReplicaId, Style};
+use letters_test::TestPlatform;
+use letters_web::page::{self, DOCUMENT, FIRST_PAINT, OPENED, Place, Skeleton, Span};
+use serde_json::json;
 
 const TEMPLATE: &str =
     "<body><canvas></canvas><!--letters:first-paint--><!--letters:document--><script>start()</script></body>";
@@ -18,6 +24,24 @@ fn first_paint_of(document: &Document) -> String {
     let style = window.style().clone();
     let html = page::export(document, &style, "Title", "fonts/");
     page::first_paint(&Skeleton::of(&mut window), &html)
+}
+
+/// What a server says of a document called `name` that `author` may edit.
+fn opened(name: &str, author: &str, trust: Trust) -> Opened {
+    Opened {
+        id: "0190f3a2-7c1e-7b4a-9c55-3f2a1b0c9d8e".into(),
+        created: "2026-11-15T10:00:00Z".into(),
+        name: name.into(),
+        space: None,
+        path: String::new(),
+        role: Role::Editor,
+        author: author.into(),
+        socket: "/api/v1/documents/0190f3a2-7c1e-7b4a-9c55-3f2a1b0c9d8e/socket".into(),
+        trust,
+        allows: Allows { download: true, copy: true, print: true },
+        style: None,
+        notes: None,
+    }
 }
 
 /// Where the spans put each control in a window of `width`.
@@ -59,6 +83,79 @@ fn a_page_carries_its_document_to_read_and_to_open_whatever_it_holds() {
         assert!(around.contains(&format!("<div id=\"{FIRST_PAINT}\">")), "{text}");
         assert!(around.contains("sandbox=\"allow-same-origin\""), "{text}");
     }
+}
+
+#[test]
+fn a_served_page_carries_what_the_server_says_whatever_it_holds() {
+    let names = ["Minutes", "A \"quoted\" & <b>bold</b> name", "</title></script><script>alert(1)</script>"];
+    for name in names {
+        let block = Block::text(BlockId::new("b1"), BlockKind::Paragraph, name);
+        let document = Document { blocks: vec![block], ..Document::default() };
+        let said = opened(name, name, Trust::Trusted);
+        let page = page::served(&document, &said, "/assets/abc123/");
+
+        let carried = between(&page, &format!("id=\"{OPENED}\">"), "</script>");
+        assert_eq!(serde_json::from_str::<Opened>(carried).expect("what the server says reads"), said, "{name}");
+        let carried = between(&page, &format!("id=\"{DOCUMENT}\">"), "</script>");
+        assert_eq!(Document::from_json(carried).expect("the page's document reads"), document, "{name}");
+        let title = between(&page, "<title>", "</title>");
+        assert_eq!(title.replace("&lt;", "<").replace("&quot;", "\"").replace("&amp;", "&"), name, "{name}");
+
+        // The page's files are the server's, and the one script that runs is among them: a policy that
+        // lets no inline script run still starts the editor.
+        assert!(page.contains("<base href=\"/assets/abc123/\" />"), "{name}");
+        let shown = between(&page, "srcdoc=\"", "\"");
+        assert!(shown.contains("/assets/abc123/fonts/Inter.ttf"), "{name}: the first paint has its fonts");
+        let around = page.replace(shown, "");
+        let kind = |(at, _): (usize, &str)| match &around[at..] {
+            tag if tag.starts_with("<script type=\"application/json\"") => "data",
+            tag if tag.starts_with("<script type=\"module\" src=\"") => "file",
+            _ => "inline",
+        };
+        let scripts: Vec<&str> = around.match_indices("<script").map(kind).collect();
+        assert_eq!(scripts, ["data", "data", "file"], "{name}");
+    }
+}
+
+#[test]
+fn the_window_on_a_served_document_is_in_its_style_and_signs_as_the_session_does() {
+    let mut said = opened("Minutes", "Ada Lovelace", Trust::Trusted);
+    said.style = Some(json!({ "format": 1, "page": { "margin_top": 99 } }));
+    let mut window = page::served_window(page::welcome(&mut || "b".into()), &said, ReplicaId::new("test"));
+    assert_eq!(window.style().page.margin_top, 99.0);
+
+    let mut platform = TestPlatform::default();
+    let written =
+        window.change(|editor| Ok::<_, Infallible>(editor.input(InputEvent::Insert("x".into()), &mut platform)));
+    assert!(written.is_ok());
+    let authors = window.editor().model().authors();
+    assert_eq!(authors.iter().map(String::as_str).collect::<Vec<_>>(), ["Ada Lovelace"]);
+}
+
+#[test]
+fn a_served_document_opens_whatever_this_build_cannot_read_of_its_style_and_notes() {
+    let cases = [(json!("nonsense"), json!([1])), (json!({ "format": 99 }), json!({ "format": 99 }))];
+    for (style, notes) in cases {
+        let mut said = opened("Minutes", "Ada Lovelace", Trust::Trusted);
+        (said.style, said.notes) = (Some(style.clone()), Some(notes));
+        let block = Block::text(BlockId::new("b1"), BlockKind::Paragraph, "Kept as it is.");
+        let document = Document { blocks: vec![block], ..Document::default() };
+        let window = page::served_window(document.clone(), &said, ReplicaId::new("test"));
+        assert_eq!(window.editor().doc(), &document, "{style}");
+        assert_eq!(window.style(), &Style::default(), "{style}: the built-in style stands in");
+        assert!(page::served(&document, &said, "/").contains("srcdoc"), "{style}: and its page is still made");
+    }
+}
+
+#[test]
+fn a_served_page_in_safe_mode_leaves_room_for_the_bar_that_says_so() {
+    let document = page::welcome(&mut || "b".into());
+    let top = |trust| {
+        let page = page::served(&document, &opened("Minutes", "Ada", trust), "/");
+        let rule = between(&page, &format!("#{FIRST_PAINT} iframe {{"), "}").to_owned();
+        between(&rule, "top: ", "px").parse::<f32>().expect("the frame's top is a measure")
+    };
+    assert!(top(Trust::Safe) > top(Trust::Trusted), "the document starts under the bar");
 }
 
 #[test]
