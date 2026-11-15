@@ -207,7 +207,8 @@ impl Source {
     fn fault(&self) -> Option<Fault> {
         let style =
             letters_math::Style { size: TEXT.size, color: Color::rgb(0, 0, 0), display: self.display, links: false };
-        let error = typeset(&self.text, &style).err()?;
+        // An engine that is not here yet has found nothing wrong.
+        let error = typeset(&self.text, &style).err().filter(|error| !error.is_pending())?;
         Some(Fault { range: error.span, message: error.message })
     }
 
