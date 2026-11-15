@@ -2929,6 +2929,7 @@ dependencies = [
  "letters-model",
  "letters-render",
  "letters-spell",
+ "letters-trust",
  "letters-ui",
  "wasm-bindgen",
  "wasm-bindgen-futures",

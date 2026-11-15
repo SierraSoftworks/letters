@@ -23,6 +23,7 @@ letters-ui.workspace = true
 letters-fonts.workspace = true
 letters-math.workspace = true
 letters-spell.workspace = true
+letters-trust.workspace = true
 
 accesskit.workspace = true
 wasm-bindgen.workspace = true

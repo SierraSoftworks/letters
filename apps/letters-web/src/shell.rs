@@ -14,6 +14,7 @@ use letters_editor::{Clip, KeyEvent, Modifiers, Picture, Platform as _};
 use letters_model::{BlockKind, Document, HistoryError, Mark, Pos, ReplicaId, Selection};
 use letters_render::cpu::{CpuRenderer, Frame, PixelRect};
 use letters_render::{Color, DisplayList, Point, Rect, Size};
+use letters_trust::{LinkDecision, Origin, Trust};
 use letters_ui::{Appearance, Cursor, Edge, Keys, Request, Scheme, Settings, Window as View, tokens};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
@@ -445,6 +446,19 @@ impl Shell {
         });
     }
 
+    /// Opens a link the person followed, in another tab. The browser keeps no word yet of what they trust,
+    /// so every address is shown whole first, and what would run something here is never opened.
+    fn open_link(&mut self, href: &str, confirmed: bool) {
+        match Trust::default().gate("", Origin::Outside).link(href) {
+            LinkDecision::Refuse => self.view.refuse_link(href, "Letters does not open addresses of this kind."),
+            LinkDecision::Ask if !confirmed => self.view.ask_link(href),
+            // The page it opens learns nothing of this one, and cannot reach back into it.
+            _ => report(
+                self.window.open_with_url_and_target_and_features(href, "_blank", "noopener,noreferrer").map(drop),
+            ),
+        }
+    }
+
     /// Offers `text` to the person as a file to keep, named after the document.
     fn download(&self, text: &str, extension: &str) -> Result<(), JsValue> {
         let page = self.window.document().ok_or("there is no document")?;
@@ -523,6 +537,7 @@ impl Shell {
                 Request::ExportStyle(json) => report(self.download(&json, "letstyle")),
                 Request::Pictures => self.picker.click(),
                 Request::Asset(name) => self.load(name),
+                Request::OpenLink { href, confirmed } => self.open_link(&href, confirmed),
                 // The window has taken the settings already. The rest is the shell's: keeping them, the
                 // name edits carry, and light or dark.
                 Request::Settings(settings) => {
