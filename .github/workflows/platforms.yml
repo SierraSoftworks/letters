@@ -59,10 +59,13 @@ jobs:
         shell: bash
         run: grep -E -A 12 '^---- .+ ----$|targets? failed' test.log || true
 
+      # Measured though a test fails: what Letters costs here does not wait for the tests.
       - name: Build
+        if: ${{ !cancelled() }}
         run: cargo build --release -p letters
 
       - name: Check budgets
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           ./scripts/budgets.sh ${{ matrix.os }} | tee budgets.txt
