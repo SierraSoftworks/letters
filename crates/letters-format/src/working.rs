@@ -94,6 +94,12 @@ impl WorkingCopy {
         self.model.style()
     }
 
+    /// Whether the file's notes are ones this build cannot read. They are carried over as they are, and a
+    /// save that would add a note to them is refused.
+    pub fn notes_unread(&self) -> bool {
+        self.unread_notes
+    }
+
     /// Names who writes here and tells the time, in seconds since 1970, for a writer with no editor of its
     /// own. Edits made from here on carry both, and a conflict shows them beside each version.
     pub fn sign(&mut self, author: &str, time: u64) {

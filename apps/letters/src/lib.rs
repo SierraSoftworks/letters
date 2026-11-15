@@ -24,6 +24,7 @@ pub mod import;
 pub mod input;
 pub mod journal;
 pub mod library;
+pub mod links;
 pub mod measure;
 pub mod pictures;
 pub mod platform;

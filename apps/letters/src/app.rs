@@ -20,11 +20,11 @@ use letters_model::{BlockId, Model, Notes, ReplicaId, Revision, Style};
 use letters_render::image::Image;
 use letters_render::{Color, DisplayList, Point, Size};
 use letters_spell::Dictionary;
-use letters_trust::{FetchError, Gate, HttpsUrl, Limits, Origin, Trust};
+use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, Origin, Trust};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
     Appearance, Chrome, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind, ImportOffer, Landing, Location,
-    PictureState, Request, SaveState, Scheme, Settings, Window as View, tokens,
+    PictureState, Request, SafeMode, SaveState, Scheme, Settings, Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -47,6 +47,7 @@ use crate::import::{self, Choices, Plan};
 use crate::input::{self, Composer, Press};
 use crate::journal::{Journal, Journals};
 use crate::library::{Library, Place, Recent, Refused, UNTITLED, has_content};
+use crate::links::{self, Step};
 use crate::measure::{FIRST_FRAME, Launch, Typing};
 use crate::pictures::{self, Decoder, Source};
 use crate::platform::{self, Desktop};
@@ -427,8 +428,6 @@ struct DocWindow {
     /// The files of linked pictures that are held narrower than they are, by their addresses, so that a
     /// sharper screen does not ask their servers again.
     linked: BTreeMap<String, Vec<u8>>,
-    /// The addresses of linked pictures that safe mode holds back.
-    withheld: BTreeSet<String>,
     /// The pictures the view was handed, and how wide each could be held at most.
     held: BTreeMap<String, u32>,
 }
@@ -449,6 +448,16 @@ pub enum Link {
     /// To keep in the document, in this figure.
     Embed(BlockId),
 }
+
+/// Whether two folders are one, however each is spelled. One that cannot be resolved is taken as written.
+fn lies_at(folder: &Path, other: &Path) -> bool {
+    let real = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    real(folder) == real(other)
+}
+
+/// What the Comment tool says of a document whose notes this build could not read.
+const NO_COMMENTS: &str = "Comments cannot be added here: this document's notes are in a form this version of \
+                           Letters cannot read.";
 
 /// Why a file that is no picture after all is not shown, as it reads on from "Not loaded:".
 const NO_PICTURE: &str = "it is not a picture Letters can show";
@@ -707,9 +716,10 @@ impl DocWindow {
         done.is_ok()
     }
 
-    /// Tells the view how far the document is trusted, which for now decides whether its formulas may
-    /// link. One made in this window is trusted. One that was opened is unknown until its id is read.
-    fn retrust(&mut self, trust: &Trust) {
+    /// Tells the view how far the document is trusted: whether its formulas may link, and whether it is
+    /// held in safe mode. One made in this window is trusted. One that was opened is unknown until its id
+    /// is read.
+    fn retrust(&mut self, trust: &Trust, library: &Library) {
         let mode = match (&self.id, self.place.path()) {
             _ if self.made_here => letters_trust::Mode::Trusted,
             (Some(id), path) => trust::mode(trust, id, path),
@@ -719,6 +729,18 @@ impl DocWindow {
         if std::mem::replace(&mut self.maths_links, links) != links {
             self.view.set_maths_links(links);
         }
+        // Nothing is said of a document that has not said which one it is: the bar would come and go.
+        if self.made_here || self.id.is_some() {
+            let folder = self.folder().filter(|folder| !lies_at(folder, &library.default_folder()));
+            let named = folder.and_then(|folder| Some(folder.file_name()?.to_string_lossy().into_owned()));
+            self.view.set_safe_mode((!links).then_some(SafeMode { folder: named }));
+        }
+    }
+
+    /// The folder the document's file is in, as the system spells it, which is how trusted folders are
+    /// matched.
+    fn folder(&self) -> Option<PathBuf> {
+        Some(fs::canonicalize(self.place.path()?).ok()?.parent()?.to_owned())
     }
 
     /// What the document may fetch. One made in this window is trusted, and one that was opened is held
@@ -942,6 +964,7 @@ impl DocWindow {
                     self.record();
                 }
                 self.copy = Some(copy);
+                self.recomment();
                 Ok(())
             }
             Err(error) => {
@@ -1007,6 +1030,7 @@ impl DocWindow {
         let result = match save.join() {
             Ok(Saving { copy, result }) => {
                 self.copy = Some(copy);
+                self.recomment();
                 result
             }
             Err(_) => Err("the save stopped unexpectedly".into()),
@@ -1029,6 +1053,14 @@ impl DocWindow {
             }
         }
         self.retitle();
+    }
+
+    /// Says whether comments can be written, now that the copy is back from a read or a save: not on
+    /// notes this build could not read, where a save that added one would be refused.
+    fn recomment(&mut self) {
+        if let Some(copy) = &self.copy {
+            self.view.refuse_comments(copy.notes_unread().then_some(NO_COMMENTS));
+        }
     }
 
     /// Tells the journal of a save that failed, which leaves it the only place the edits are.
@@ -1117,6 +1149,7 @@ impl DocWindow {
             let _ = self.exchange(&home, &mut copy, library);
         }
         self.copy = Some(copy);
+        self.recomment();
         match saved {
             Some(Ok(())) => self.save_at = None,
             Some(Err(error)) => {
@@ -1240,7 +1273,6 @@ impl App {
             awaited: Vec::new(),
             links: Vec::new(),
             linked: BTreeMap::new(),
-            withheld: BTreeSet::new(),
             held: BTreeMap::new(),
         };
         window.view.set_reduced_motion(self.reduced_motion);
@@ -1252,7 +1284,7 @@ impl App {
         if landing && made_here && window.keeps {
             window.view.set_landing(Some(self.landing()));
         }
-        window.retrust(self.trust.trust());
+        window.retrust(self.trust.trust(), &self.library);
         window.retitle();
         window.reframe(&self.buttons);
         window.follow(&self.settings, self.writer());
@@ -1378,6 +1410,9 @@ impl App {
                 Request::EmbedPicture { figure, src } => self.link(id, src, Link::Embed(figure)),
                 // The window asks for the pictures of that host again by itself.
                 Request::TrustPictures(src) => self.trust_host(id, &src),
+                Request::TrustDocument => self.vouch_for(id, false),
+                Request::TrustFolder => self.vouch_for(id, true),
+                Request::OpenLink { href, confirmed } => self.open_link(id, &href, confirmed),
                 Request::Import { folders, comments } => self.bring_in(id, &folders, comments),
                 Request::CancelImport => {
                     if let Some(window) = self.windows.get_mut(&id) {
@@ -1480,8 +1515,7 @@ impl App {
         let Some(window) = self.windows.get_mut(&id) else { return false };
         let done = window.replace(&self.library, now, change);
         // A trusted folder vouches for what is in it, so a move can change how the document is treated.
-        window.retrust(self.trust.trust());
-        self.release(id);
+        window.retrust(self.trust.trust(), &self.library);
         done
     }
 
@@ -1541,13 +1575,12 @@ impl App {
             Link::Open => gate.fetch_on_open(&src, limits),
             Link::Once | Link::Embed(_) => gate.fetch_on_request(&src, limits),
         };
-        window.withheld.remove(&src);
+        // A host the person trusts already is not offered for trusting again.
+        window.view.set_picture_trusted(&src, gate.image(&src) == ImageDecision::Load);
         let state = match &guard {
             Ok(_) => Some(PictureState::Loading),
-            Err(FetchError::Held) => {
-                window.withheld.insert(src.clone());
-                Some(PictureState::Held)
-            }
+            // The window asks again by itself once the document is trusted.
+            Err(FetchError::Held) => Some(PictureState::Held),
             // It waits to be asked for, as any picture from a host the person has not said they trust.
             Err(FetchError::UntrustedSource) => None,
             Err(error) => Some(PictureState::Failed(error.to_string())),
@@ -1585,12 +1618,37 @@ impl App {
         }
     }
 
-    /// Asks again about the linked pictures safe mode held back in a window, whose document may be
-    /// trusted now.
-    fn release(&mut self, id: WindowId) {
+    /// Keeps a window's document, or the folder it is in, as one the person trusts. Every window is
+    /// looked at again, since a folder vouches for all that is in it.
+    fn vouch_for(&mut self, id: WindowId, folder: bool) {
+        let Some(window) = self.windows.get(&id) else { return };
+        let kept = match (folder, window.folder(), &window.id) {
+            (true, Some(folder), _) => folder.to_str().map(|folder| self.trust.trust_folder(folder)),
+            (false, _, Some(id)) => Some(self.trust.trust_document(id)),
+            _ => None,
+        };
+        match kept {
+            Some(Err(error)) => window.alert(&format!("Your choice to trust it could not be kept.\n\n{error}")),
+            Some(Ok(())) => {
+                let (trust, library) = (self.trust.trust(), &self.library);
+                self.windows.values_mut().for_each(|window| window.retrust(trust, library));
+            }
+            None => {}
+        }
+    }
+
+    /// Opens a link that was clicked in a window, if the person's trust lets it: a link from a document
+    /// in safe mode shows where it goes first, and one that would run something is never opened.
+    fn open_link(&mut self, id: WindowId, href: &str, confirmed: bool) {
         let Some(window) = self.windows.get_mut(&id) else { return };
-        for src in std::mem::take(&mut window.withheld) {
-            self.link(id, src, Link::Open);
+        match links::step(&window.gate(self.trust.trust()), href, confirmed) {
+            Step::Ask => window.view.ask_link(href),
+            Step::Refuse(why) => window.view.refuse_link(href, why),
+            Step::Open => {
+                if links::open(href).is_err() {
+                    window.view.refuse_link(href, "Nothing on this device could be found to open it.");
+                }
+            }
         }
     }
 
@@ -2034,7 +2092,7 @@ impl ApplicationHandler<Event> for App {
                 }
                 window.ask_again(&mut self.decoder, &self.proxy);
                 // The file has said which document it is, so what the person trusts can be asked about it.
-                window.retrust(self.trust.trust());
+                window.retrust(self.trust.trust(), &self.library);
                 let links = std::mem::take(&mut window.links);
                 window.access_stale = true;
                 window.sync(now);
