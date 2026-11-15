@@ -24,6 +24,13 @@
 //! Pictures do not travel here. A history names its assets by hash, and a device fetches the ones it
 //! lacks from the server, and hands over new ones, apart from the socket.
 //!
+//! # What meets
+//!
+//! Edits from sessions meet in the room as the history merges them, character by character, and no one
+//! is asked anything. What another writer put into the file meets them in the room's save, as two files
+//! meet: a word that both changed reads as the later change left it, and a conflict note keeps both for
+//! someone to pick from. The note and the settled text go to every session.
+//!
 //! Nothing in this crate opens a socket, reads a file or asks the time. The shell and the server's host
 //! bring all three.
 

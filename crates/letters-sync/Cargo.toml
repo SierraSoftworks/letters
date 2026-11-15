@@ -14,3 +14,6 @@ workspace = true
 [dependencies]
 letters-model.workspace = true
 letters-format.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

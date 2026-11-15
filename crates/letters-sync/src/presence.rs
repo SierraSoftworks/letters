@@ -1,6 +1,6 @@
 //! Presence: who else has the document open, and where their caret is. Passed on, never kept.
 
-use letters_model::{Model, Selection, StablePos};
+use letters_model::{Hold, Model, Selection, StablePos};
 
 use crate::wire::SessionId;
 
@@ -16,14 +16,15 @@ pub struct Passage {
 impl Passage {
     /// The selection as it can be told to others. `None` when it is not in the document `model` shows.
     pub fn of(model: &Model, selection: &Selection) -> Option<Self> {
-        let _ = (model, selection);
-        todo!()
+        // Each end holds on to the character before it, so text that others type right there lands after
+        // the caret, as it does for the person whose caret it is.
+        let stable = |pos| model.stable(pos, Hold::Prev);
+        Some(Self { anchor: stable(&selection.anchor)?, head: stable(&selection.head)? })
     }
 
     /// Where the selection is in `model` now. `None` when its text is gone.
     pub fn selection(&self, model: &Model) -> Option<Selection> {
-        let _ = model;
-        todo!()
+        Some(Selection { anchor: model.resolve(&self.anchor)?, head: model.resolve(&self.head)? })
     }
 }
 

@@ -353,6 +353,8 @@ impl Line {
                 Event::Notes(notes) => told.push(Told::Notes(notes)),
                 // The copy on this device and its journal keep the work whether or not the server has it.
                 Event::Held(_) => {}
+                // The work stays in the copy here, and the progress that follows says it is here alone.
+                Event::Refused(_) => {}
                 Event::Link => told.push(Told::Link),
                 Event::Progress => told.push(Told::Progress),
                 Event::Peers => told.push(Told::Peers),
