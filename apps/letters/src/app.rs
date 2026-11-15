@@ -218,7 +218,27 @@ pub(crate) fn window_attributes(event_loop: &ActiveEventLoop) -> WindowAttribute
         use winit::platform::macos::WindowAttributesExtMacOS;
         attributes.with_titlebar_transparent(true).with_title_hidden(true).with_fullsize_content_view(true)
     };
+    // A Wayland desktop finds the icon through the desktop entry of this name. X11 is handed it.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let attributes = if wayland {
+        winit::platform::wayland::WindowAttributesExtWayland::with_name(attributes, APP_ID, "letters")
+    } else {
+        winit::platform::x11::WindowAttributesExtX11::with_name(attributes, APP_ID, "letters")
+            .with_window_icon(window_icon())
+    };
     attributes.with_decorations(Host::HERE != Host::Linux)
+}
+
+/// The name a desktop knows Letters by: its desktop entry on Linux and its bundle on macOS carry the same.
+pub const APP_ID: &str = "com.sierrasoftworks.Letters";
+
+/// The app's icon, for a desktop that takes it from the window.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn window_icon() -> Option<winit::window::Icon> {
+    let png = include_bytes!("../../../assets/icons/png/app-128.png");
+    let icon = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.into_rgba8();
+    let (width, height) = icon.dimensions();
+    winit::window::Icon::from_rgba(icon.into_raw(), width, height).ok()
 }
 
 /// Opens the document and paints into memory, as [`run`] would into a window, then prints the report the
