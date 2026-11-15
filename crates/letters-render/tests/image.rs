@@ -59,6 +59,40 @@ fn transparency_survives_decoding() {
 }
 
 #[test]
+fn a_picture_decoded_within_a_width_is_held_no_wider_and_keeps_its_shape() {
+    // (the width asked for, the size held)
+    let cases = [(16, (16, 8)), (32, (32, 16)), (400, (32, 16))];
+    for (within, held) in cases {
+        let image = Image::decode_within(&encoded(32, 16, ImageFormat::Png), within).expect("the PNG decodes");
+
+        assert_eq!((image.width(), image.height()), held, "within {within}");
+        let (left, right) = halves(image);
+        assert!(close(left, RED, 40) && close(right, BLUE, 40), "within {within}: {left:?} and {right:?}");
+    }
+
+    let least = Image::decode_within(&encoded(32, 16, ImageFormat::Png), 0).expect("no width is still a picture");
+    assert_eq!((least.width(), least.height()), (1, 1));
+}
+
+#[test]
+fn a_clear_edge_stays_clean_when_a_picture_is_narrowed() {
+    // Opaque red beside clear pixels whose hidden colour is blue.
+    let picture = RgbaImage::from_fn(64, 8, |x, _| if x < 32 { Rgba([255, 0, 0, 255]) } else { Rgba([0, 0, 255, 0]) });
+    let mut bytes = Cursor::new(Vec::new());
+    picture.write_to(&mut bytes, ImageFormat::Png).expect("PNG encodes");
+    let image = Image::decode_within(&bytes.into_inner(), 16).expect("the PNG decodes");
+
+    let mut images = Images::default();
+    images.insert("picture", image);
+    let item = Item::Image { rect: Rect::new(0.0, 0.0, 16.0, 2.0), asset: "picture".into() };
+    let frame = render_with(&list([item]), &images, 16, 2, 1.0);
+    for x in 0..16 {
+        let Color { r, g, b, .. } = frame.pixel(x, 1).expect("inside the frame");
+        assert!(b <= g.saturating_add(2) || (r, g) == (255, 255), "pixel {x} took the hidden blue: {r} {g} {b}");
+    }
+}
+
+#[test]
 fn images_that_cannot_be_drawn_are_refused() {
     let png = encoded(32, 16, ImageFormat::Png);
     // A GIF whose header claims a canvas far past the pixel limit.

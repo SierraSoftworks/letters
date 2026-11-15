@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use letters_frame::Strip;
 use letters_render::cpu::{CpuRenderer, Damage, Frame, PixelFormat};
-use letters_render::image::{Image, Images};
+use letters_render::image::Images;
 use letters_render::{Color, DisplayList, Item, Rect};
 use winit::window::Window;
 
@@ -121,8 +121,6 @@ pub struct Presenter {
     window: Arc<Window>,
     surface: Surface,
     painter: Painter,
-    /// Decoded assets by entry name. Empty until images are loaded after the first paint.
-    images: Images,
     /// The window's surface where it is a Wayland one, whatever paints it.
     layer: Option<Layer>,
     /// The shadow the window's is cut from, and what the one round it now was cut for.
@@ -137,8 +135,7 @@ impl Presenter {
             Some(_) => Surface::Layered,
             None => Surface::Software(Box::new(software(&window)?)),
         };
-        let (painter, images) = (Painter::new(), Images::default());
-        Ok(Self { window, surface, painter, images, layer, shadow: None, shaded: None })
+        Ok(Self { window, surface, painter: Painter::new(), layer, shadow: None, shaded: None })
     }
 
     /// Casts the window's shadow, or takes it away, where the desktop leaves the shadow to the window.
@@ -172,11 +169,6 @@ impl Presenter {
         matches!(self.surface, Surface::Gpu(_))
     }
 
-    /// Gives the window a picture to draw wherever the display list names `asset`.
-    pub fn show(&mut self, asset: String, image: Image) {
-        self.images.insert(asset, image);
-    }
-
     /// Moves the window to the GPU if it will take a surface there. Otherwise nothing changes.
     pub fn use_gpu(&mut self, gpu: &mut Gpu) {
         // A window that could leave its corners clear until now goes on doing so if the GPU lets it.
@@ -192,9 +184,11 @@ impl Presenter {
     ///
     /// `round` asks for round corners, and is the colour of the line that follows them. They are round
     /// where the surface can leave them clear, and square anywhere else. The list gets that line.
+    /// `images` are the pictures the list names.
     pub fn present(
         &mut self,
         list: &mut DisplayList,
+        images: &Images,
         background: Color,
         round: Option<Color>,
     ) -> Result<(), softbuffer::SoftBufferError> {
@@ -214,7 +208,7 @@ impl Presenter {
                 background = Color::rgba(0, 0, 0, 0);
             }
             self.window.pre_present_notify();
-            match gpu.present(list, &self.images, scale, background, (size.width, size.height)) {
+            match gpu.present(list, images, scale, background, (size.width, size.height)) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     eprintln!("letters: {error}. Painting on the CPU from here on.");
@@ -236,7 +230,7 @@ impl Presenter {
                 let age = frame.age();
                 // The view's own border is square: the line joins up what rounding leaves of it.
                 list.items.extend(round.map(line));
-                self.painter.paint(list, &self.images, scale, background, true, size.width, age, frame.pixels());
+                self.painter.paint(list, images, scale, background, true, size.width, age, frame.pixels());
                 if round.is_some() {
                     self.painter.round((CORNER as f32 * scale).round() as u32, frame.pixels());
                 }
@@ -251,7 +245,7 @@ impl Presenter {
         surface.resize(width, height)?;
         let mut buffer = surface.buffer_mut()?;
         let age = buffer.age();
-        self.painter.paint(list, &self.images, scale, background, false, size.width, age, &mut buffer);
+        self.painter.paint(list, images, scale, background, false, size.width, age, &mut buffer);
         self.window.pre_present_notify();
         // The whole buffer is presented even when little of it changed: a redraw may be the system's way
         // of asking for all of the window again.

@@ -27,8 +27,6 @@ struct Desk {
     journal: Option<Journal>,
     /// The revision the journal has seen all of.
     seen: Option<Revision>,
-    /// The names and sizes of the pictures the window was given to show.
-    pictures: Vec<(String, u32, u32)>,
 }
 
 impl Desk {
@@ -37,8 +35,7 @@ impl Desk {
         let replica = ReplicaId::new(&platform::block_id());
         let mut model = Model::new(opened.document, replica).with_style(opened.style);
         let rest = opened.rest.read(replica, Some(journals.folder())).unwrap();
-        let Working { copy, history, news, claim, journalled, pictures } = rest;
-        let pictures = pictures.into_iter().map(|(name, image)| (name, image.width(), image.height())).collect();
+        let Working { copy, history, news, claim, journalled } = rest;
         if let Some(history) = history {
             model.attach(history);
         }
@@ -47,7 +44,7 @@ impl Desk {
         }
         let file = opened.home.as_ref().filter(|home| home.written()).map(Home::path);
         let journal = claim.map(|claim| journals.open(claim, &copy.id, &copy.created, file));
-        Self { writer: Writer { model, copy }, home: opened.home, journal, seen: journalled, pictures }
+        Self { writer: Writer { model, copy }, home: opened.home, journal, seen: journalled }
     }
 
     fn journal(&mut self) -> &mut Journal {
@@ -206,20 +203,18 @@ fn a_picture_put_in_before_a_crash_comes_back_and_reaches_the_file() {
 
     // The asset is journalled ahead of the edit that names it, as a window does.
     let picture = letters::pictures::from_rgba(3, 2, &[0x80; 24]).unwrap();
-    let shown = vec![("assets/pasted.png".to_owned(), 3, 2)];
-    desk.journal().asset(&shown[0].0, &picture.bytes);
+    let name = "assets/pasted.png";
+    desk.journal().asset(name, &picture.bytes);
     desk.write(&document("With the picture"));
 
     let mut journals = crash(desk, journals);
     let mut back = brought_back(&journals);
     assert_eq!(back.len(), 1);
     let mut desk = Desk::at(&mut journals, back.remove(0));
-    assert_eq!(desk.pictures, shown, "the window is given the picture again");
+    assert_eq!(desk.writer.copy.entries.get(name), Some(&picture.bytes), "the window has the picture again");
+    assert_eq!(files::entry(&path, name), None, "which the file does not hold yet");
 
     // The save it is owed puts the picture in the file, where the next opening finds it.
     desk.save();
-    drop((desk, journals));
-    let mut journals = Journals::at(scratch.0.join("elsewhere"));
-    let desk = Desk::at(&mut journals, files::open(&path, Style::default).unwrap());
-    assert_eq!(desk.pictures, shown, "the file holds the picture");
+    assert_eq!(files::entry(&path, name), Some(picture.bytes), "the file holds the picture");
 }

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use letters_editor::{Editor, InputEvent, Key, KeyEvent, Platform as _};
 use letters_format::WorkingCopy;
 use letters_model::{Model, ReplicaId, Revision, Style};
-use letters_render::image::{Image, Images};
+use letters_render::image::Image;
 use letters_render::{Color, DisplayList, Point, Size};
 use letters_spell::Dictionary;
 use letters_trust::Trust;
@@ -47,6 +47,7 @@ use crate::input::{self, Composer, Press};
 use crate::journal::{Journal, Journals};
 use crate::library::{Library, Place, Recent, Refused, UNTITLED, has_content};
 use crate::measure::{FIRST_FRAME, Launch, Typing};
+use crate::pictures::{self, Decoder, Source};
 use crate::platform::{self, Desktop};
 use crate::present::{Painter, Presenter};
 use crate::settings;
@@ -90,8 +91,9 @@ pub enum Event {
     Account(String),
     /// The languages the system has dictionaries for have been listed.
     Languages(Vec<String>),
-    /// A picture that was put into a window's document is ready to draw, under its asset's name.
-    Picture(WindowId, String, Image),
+    /// A picture a window's page asked for was decoded, to be held no wider than the last, or could not
+    /// be had.
+    Picture(WindowId, String, Option<Image>, u32),
     /// A system dictionary a window's document asked for has been read, under the name it has on disk.
     Dictionary(WindowId, String, Box<Dictionary>),
 }
@@ -130,6 +132,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         words: Words::of(&home),
         trust: trust::store(&home),
         journals: Journals::of(&home),
+        decoder: Decoder::default(),
         dictionaries: dictionaries::system_folders(&home).into(),
         reduced_motion: false,
         buttons: Buttons::guess(),
@@ -207,13 +210,24 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
     launch.mark("display list");
     let mut pixels = vec![0; (width * height) as usize];
     let mut painter = Painter::new();
-    painter.paint(&list, &Images::default(), scale as f32, background(false), false, width, 0, &mut pixels);
+    painter.paint(&list, view.images(), scale as f32, background(false), false, width, 0, &mut pixels);
     launch.mark(FIRST_FRAME);
     let Mode::TypingReport { keys } = options.mode else {
         println!("{FIRST_FRAME}\n{}", launch.report());
         return Ok(true);
     };
 
+    // Typing is timed with the pictures the page shows in place, as a window has them soon after its
+    // first frame.
+    let within = pictures::widest(view.editor().model().style(), scale);
+    for request in view.take_requests() {
+        let (Request::Asset(asset), Some(path)) = (request, &options.file) else { continue };
+        let image = files::entry(path, &asset).and_then(|bytes| Image::decode_within(&bytes, within).ok());
+        view.set_image(&asset, image);
+    }
+    list.items.clear();
+    view.paint(&mut list);
+    painter.paint(&list, view.images(), scale as f32, background(false), false, width, 0, &mut pixels);
     let mut platform = Desktop::new();
     let mut typing = Typing::default();
     for _ in 0..keys {
@@ -222,7 +236,7 @@ pub fn run_headless(options: &Options, mut launch: Launch) -> Result<bool, Box<d
         list.items.clear();
         view.paint(&mut list);
         // The pixels still hold the frame before, as a window's buffer does.
-        painter.paint(&list, &Images::default(), scale as f32, background(false), false, width, 1, &mut pixels);
+        painter.paint(&list, view.images(), scale as f32, background(false), false, width, 1, &mut pixels);
         typing.record(typed.elapsed());
     }
     print!("{}", typing.report("CPU"));
@@ -262,6 +276,8 @@ struct App {
     words: Words,
     trust: Trusted,
     journals: Journals,
+    /// Decodes the pictures the windows' pages ask for.
+    decoder: Decoder,
     /// Where the system keeps dictionaries for languages other than English.
     dictionaries: Arc<[PathBuf]>,
     /// Whether the desktop asked for less motion. Asked once, after the first frame.
@@ -381,6 +397,10 @@ struct DocWindow {
     journal_at: Option<Instant>,
     /// Assets the document names that no save has been handed yet.
     assets: BTreeMap<String, Vec<u8>>,
+    /// Pictures the page asked for whose files were not to be had while a read or a save was under way.
+    awaited: Vec<String>,
+    /// The pictures the view was handed, and how wide each could be held at most.
+    held: BTreeMap<String, u32>,
 }
 
 /// A save on its way back from its thread: the copy, and how the save ended.
@@ -473,21 +493,72 @@ impl DocWindow {
         (self.journalled, self.journalled_edits) = (Some(model.revision()), self.view.edits());
     }
 
-    /// Keeps the assets the editor stored for this window's document: in the journal at once, in the file
-    /// with the next save, and on screen as soon as each is decoded, which is not done on this thread.
-    fn keep(&mut self, assets: Vec<(String, Vec<u8>)>, proxy: &EventLoopProxy<Event>) {
+    /// How wide a picture is held for this window, in pixels.
+    fn widest(&self) -> u32 {
+        pictures::widest(self.view.editor().model().style(), self.window.scale_factor())
+    }
+
+    /// Keeps the assets the editor stored for this window's document: in the journal at once, and in the
+    /// file with the next save. The page asks for each when it comes to show it.
+    fn keep(&mut self, assets: Vec<(String, Vec<u8>)>) {
         for (name, bytes) in assets {
             if let Some(journal) = &mut self.journal {
                 journal.asset(&name, &bytes);
             }
-            let (id, proxy, asset, encoded) = (self.window.id(), proxy.clone(), name.clone(), bytes.clone());
-            thread::spawn(move || {
-                if let Ok(image) = Image::decode(&encoded) {
-                    let _ = proxy.send_event(Event::Picture(id, asset, image));
-                }
-            });
             self.assets.insert(name, bytes);
         }
+    }
+
+    /// Whether the document's file or the copy kept for it is away on another thread.
+    fn busy(&self) -> bool {
+        self.rest.is_some() || self.reading.is_some() || self.saving.is_some()
+    }
+
+    /// Has a picture the page asked for decoded, from wherever its file is now: with this window if no
+    /// save has had it, else in the document's file.
+    fn want(&mut self, name: String, decoder: &mut Decoder, proxy: &EventLoopProxy<Event>) {
+        let unsaved = self.assets.get(&name).or_else(|| self.copy.as_ref()?.entries.get(&name));
+        let source = match unsaved {
+            Some(bytes) => Some(Source::Bytes(bytes.clone())),
+            None => self.file().map(|file| Source::Document(file.to_owned())),
+        };
+        let (id, proxy, within) = (self.window.id(), proxy.clone(), self.widest());
+        match source {
+            Some(source) => {
+                let done = move |name, image| drop(proxy.send_event(Event::Picture(id, name, image, within)));
+                decoder.decode(name, source, within, done);
+            }
+            // It may be in what is being read, or on its way into the file.
+            None if self.busy() => self.awaited.push(name),
+            None => self.view.set_image(&name, None),
+        }
+    }
+
+    /// Takes a picture that was decoded for the page, or the word that it could not be had.
+    fn picture(&mut self, name: String, image: Option<Image>, within: u32) {
+        match image {
+            // A file that does not hold it yet may once the read or the save under way is done.
+            None if self.busy() => self.awaited.push(name),
+            None => self.view.set_image(&name, None),
+            Some(image) => {
+                self.view.set_image(&name, Some(image));
+                self.held.insert(name, within);
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    /// Asks again for the pictures that waited on a read or a save, and for those held narrower than the
+    /// page now draws them, as after a move to a sharper screen.
+    fn ask_again(&mut self, decoder: &mut Decoder, proxy: &EventLoopProxy<Event>) {
+        let within = self.widest();
+        let narrow = self.held.iter().filter(|(_, held)| **held < within).map(|(name, _)| name.clone());
+        let mut again: Vec<String> = narrow.collect();
+        again.iter().for_each(|name| _ = self.held.insert(name.clone(), within));
+        if !self.busy() {
+            again.append(&mut self.awaited);
+        }
+        again.into_iter().for_each(|name| self.want(name, decoder, proxy));
     }
 
     /// Tells the journal where the document's file is, which may have changed.
@@ -692,7 +763,7 @@ impl DocWindow {
         let dark = self.dark();
         let line = tokens::LINE_STRONG.resolve(if dark { Scheme::Dark } else { Scheme::Light });
         let line = (self.chrome.frame == Frame::Floating).then(|| Color::rgba(line.r, line.g, line.b, line.a));
-        self.presenter.present(&mut self.list, background(dark), line)
+        self.presenter.present(&mut self.list, self.view.images(), background(dark), line)
     }
 
     /// Brings everything outside the canvas up to date with the view, after any event.
@@ -760,11 +831,7 @@ impl DocWindow {
             (None, None) => return Ok(()),
         };
         match working {
-            Ok(Working { copy, history, news, claim, journalled, pictures }) => {
-                for (asset, image) in pictures {
-                    self.presenter.show(asset, image);
-                }
-                self.window.request_redraw();
+            Ok(Working { copy, history, news, claim, journalled }) => {
                 if let Some(history) = history {
                     let _ = self.view.change(|editor| Ok::<_, Infallible>(editor.attach(history)));
                 }
@@ -1072,6 +1139,8 @@ impl App {
             journalled_edits: 0,
             journal_at: None,
             assets: BTreeMap::new(),
+            awaited: Vec::new(),
+            held: BTreeMap::new(),
         };
         window.view.set_reduced_motion(self.reduced_motion);
         window.view.set_account_name(self.account.as_deref());
@@ -1187,6 +1256,11 @@ impl App {
                         && let Err(error) = files::write_stylesheet(&path, &json)
                     {
                         window.alert(&format!("The stylesheet could not be written.\n\n{error}"));
+                    }
+                }
+                Request::Asset(name) => {
+                    if let Some(window) = self.windows.get_mut(&id) {
+                        window.want(name, &mut self.decoder, &self.proxy);
                     }
                 }
                 // A request this shell does not know yet.
@@ -1430,7 +1504,7 @@ impl ApplicationHandler<Event> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let Self { windows, platform, mods, library, proxy, .. } = self;
+        let Self { windows, platform, mods, library, .. } = self;
         let Some(window) = windows.get_mut(&id) else { return };
         window.access.process_event(&window.window, &event);
         let mut action = None;
@@ -1504,12 +1578,15 @@ impl ApplicationHandler<Event> for App {
                     window.relocate(library);
                 }
                 window.relist(library);
-                return;
+                // The page asks for the pictures it came to show while it was painted.
+                return self.serve(event_loop, id, Instant::now());
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } | WindowEvent::ThemeChanged(_) => {
                 // A window that was maximised or let go again changed its size on the way.
                 window.reframe(&self.buttons);
-                window.fit()
+                window.fit();
+                // A sharper screen draws pictures from more pixels than were held for the last.
+                window.ask_again(&mut self.decoder, &self.proxy)
             }
             WindowEvent::Focused(focused) => {
                 window.view.focus(focused);
@@ -1598,7 +1675,7 @@ impl ApplicationHandler<Event> for App {
             _ => {}
         }
         // A paste or a drop may have put pictures in.
-        window.keep(platform.take_assets(), proxy);
+        window.keep(platform.take_assets());
         let now = Instant::now();
         window.sync(now);
         self.serve(event_loop, id, now);
@@ -1613,6 +1690,7 @@ impl ApplicationHandler<Event> for App {
             Event::Saved(id) => {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.finish_save(&self.library, now);
+                    window.ask_again(&mut self.decoder, &self.proxy);
                     // Another writer's edits may have come in with it, in a language of their own.
                     window.ask_dictionaries(&self.proxy, &self.dictionaries);
                     // Another writer's edits may have come in with it.
@@ -1645,6 +1723,7 @@ impl ApplicationHandler<Event> for App {
                         false => eprintln!("letters: {error}"),
                     }
                 }
+                window.ask_again(&mut self.decoder, &self.proxy);
                 // The file has said which document it is, so what the person trusts can be asked about it.
                 window.retrust(self.trust.trust());
                 window.access_stale = true;
@@ -1664,10 +1743,9 @@ impl ApplicationHandler<Event> for App {
                     window.view.set_reduced_motion(reduced);
                 }
             }
-            Event::Picture(id, asset, image) => {
+            Event::Picture(id, asset, image, within) => {
                 let Some(window) = self.windows.get_mut(&id) else { return };
-                window.presenter.show(asset, image);
-                window.window.request_redraw();
+                window.picture(asset, image, within);
             }
             Event::Account(name) => {
                 self.account = Some(name);
@@ -1707,7 +1785,7 @@ impl ApplicationHandler<Event> for App {
                     }
                     accesskit_winit::WindowEvent::ActionRequested(request) => {
                         window.view.access_action(request, &mut self.platform);
-                        window.keep(self.platform.take_assets(), &self.proxy);
+                        window.keep(self.platform.take_assets());
                         window.access_stale = true;
                     }
                     accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
