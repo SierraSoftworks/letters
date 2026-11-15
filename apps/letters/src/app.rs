@@ -2,11 +2,13 @@
 //!
 //! Each window holds one document. Everything a window shows comes from its view as a display list, which
 //! is rasterised into a software surface. Saving happens on a thread per save, a moment after typing stops,
-//! and nobody is asked where: a new document gets a file of its own once it has content.
+//! and nobody is asked where: a new document gets a file of its own once it has content. What is typed
+//! goes into a journal sooner than that, so that it outlives a crash.
 
 use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::error::Error;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -34,9 +36,10 @@ use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 use crate::chrome;
 use crate::cli::{Mode, Options};
 use crate::dictionaries;
-use crate::files::{self, EXTENSION, Home, Opened, Rest, Working};
+use crate::files::{self, EXTENSION, Exchange, Home, Opened, Rest, Working};
 use crate::gpu::Gpu;
 use crate::input::{self, Composer, Press};
+use crate::journal::{Journal, Journals};
 use crate::library::{Library, Place, Recent, Refused, UNTITLED, has_content};
 use crate::measure::{FIRST_FRAME, Launch, Typing};
 use crate::platform::{self, Desktop};
@@ -47,6 +50,8 @@ use crate::words::{self, Words};
 const MAC: bool = cfg!(target_os = "macos");
 /// How long typing must pause before a save starts.
 const SAVE_AFTER: Duration = Duration::from_millis(800);
+/// How long after an edit the journal has it, however long the typing goes on.
+const JOURNAL_AFTER: Duration = Duration::from_millis(300);
 /// How long to wait before trying a failed save again.
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 /// The gap between the keystrokes of a typing report, long enough that no frame waits on the one before.
@@ -101,6 +106,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         library: Library::of(&home),
         words: Words::of(&home),
         trust: trust::store(&home),
+        journals: Journals::of(&home),
         dictionaries: dictionaries::system_folders(&home).into(),
         reduced_motion: false,
         gpu: match std::env::var("LETTERS_RENDERER").as_deref() {
@@ -189,6 +195,12 @@ fn background(dark: bool) -> Color {
     Color::rgba(ink.r, ink.g, ink.b, ink.a)
 }
 
+/// Whether two opened documents are one file.
+fn same_file(a: &Opened, b: &Opened) -> bool {
+    let file = |opened: &Opened| opened.home.as_ref().and_then(|home| fs::canonicalize(home.path()).ok());
+    file(a).is_some_and(|a| Some(a) == file(b))
+}
+
 /// The style of a new document.
 fn new_style() -> Style {
     files::new_style(std::env::home_dir().as_deref())
@@ -209,6 +221,7 @@ struct App {
     library: Library,
     words: Words,
     trust: Trusted,
+    journals: Journals,
     /// Where the system keeps dictionaries for languages other than English.
     dictionaries: Arc<[PathBuf]>,
     /// Whether the desktop asked for less motion. Asked once, after the first frame.
@@ -299,12 +312,21 @@ struct DocWindow {
     sent: Option<Revision>,
     /// The style the copy was last given, which tells a change made here from one a save merged in.
     sent_style: Style,
+
+    /// The document's journal, once its history is read. `None` too when another window has it.
+    journal: Option<Journal>,
+    /// The editor's revision the journal has seen all of. `None` while it has seen nothing of a new
+    /// document, whose whole history it is given first.
+    journalled: Option<Revision>,
+    /// The view's edit count the journal was last given.
+    journalled_edits: u64,
+    journal_at: Option<Instant>,
 }
 
-/// A save on its way back from its thread: the copy, and the home with what the file held from others.
+/// A save on its way back from its thread: the copy, and how the save ended.
 struct Saving {
     copy: WorkingCopy,
-    result: Result<(Home, Option<Vec<u8>>), String>,
+    result: Result<Exchange, String>,
 }
 
 /// Something a key asks of the app, not of the document.
@@ -343,6 +365,47 @@ impl DocWindow {
 
     fn dark(&self) -> bool {
         self.window.theme() == Some(Theme::Dark)
+    }
+
+    /// Where the document's file is, once it has been written. A journal builds on the file it is told of.
+    fn file(&self) -> Option<&Path> {
+        self.place.home().filter(|home| home.written()).map(Home::path)
+    }
+
+    /// Whether the journal holds what no save has found in the file, which one more save settles.
+    fn owes(&self) -> bool {
+        self.journal.as_ref().is_some_and(Journal::owes)
+    }
+
+    /// Gives the journal what was edited since it was last given anything.
+    fn record(&mut self) {
+        self.journal_at = None;
+        let Some(journal) = &mut self.journal else { return };
+        if self.view.edits() == self.journalled_edits {
+            return;
+        }
+        let model = self.view.editor().model();
+        journal.edits(self.journalled.as_ref().map_or_else(|| model.save(), |seen| model.updates_since(seen)));
+        (self.journalled, self.journalled_edits) = (Some(model.revision()), self.view.edits());
+    }
+
+    /// Tells the journal where the document's file is, which may have changed.
+    fn rehome(&mut self) {
+        let Some(mut journal) = self.journal.take() else { return };
+        if let Some(file) = self.file() {
+            journal.moved(file);
+        }
+        self.journal = Some(journal);
+    }
+
+    /// Lets the journal go as the window closes with everything saved. A document that was never worth
+    /// a file is not worth bringing back either.
+    fn leave(&mut self) {
+        if let Some(mut journal) = self.journal.take()
+            && self.file().is_none()
+        {
+            journal.forget();
+        }
     }
 
     /// The top bar says whether the document is saved. The title adds what the bar has no word for: a
@@ -391,6 +454,7 @@ impl DocWindow {
         let done = change(&mut self.place, library);
         match &done {
             Ok(()) => {
+                self.rehome();
                 self.relist(library);
                 // Told even when nothing changed, since the bar waits for its answer.
                 self.located = None;
@@ -469,6 +533,8 @@ impl DocWindow {
         }
         self.retitle();
         self.relocate(library);
+        // Taking its name may have moved the file.
+        self.rehome();
         home.ok().flatten()
     }
 
@@ -515,16 +581,18 @@ impl DocWindow {
         if self.view.edits() != self.noticed_edits {
             self.noticed_edits = self.view.edits();
             self.save_at = Some(now + SAVE_AFTER);
+            self.journal_at.get_or_insert(now + JOURNAL_AFTER);
             self.retitle();
         }
     }
 
     /// Starts reading what the first paint did not need, on another thread.
-    fn start_read(&mut self, proxy: &EventLoopProxy<Event>) {
+    fn start_read(&mut self, proxy: &EventLoopProxy<Event>, journals: &Journals) {
         let Some(rest) = self.rest.take() else { return };
         let (id, proxy, replica) = (self.window.id(), proxy.clone(), self.view.editor().model().replica());
+        let journals = self.keeps.then(|| journals.folder().to_owned());
         self.reading = Some(thread::spawn(move || {
-            let working = rest.read(replica).map_err(|error| error.to_string());
+            let working = rest.read(replica, journals.as_deref()).map_err(|error| error.to_string());
             let _ = proxy.send_event(Event::Read(id));
             working
         }));
@@ -532,18 +600,36 @@ impl DocWindow {
 
     /// Collects the working copy and gives the editor the file's history, reading here if that had not
     /// started and waiting if it had not finished. Fails once, when the file could not be read for saving.
-    fn finish_read(&mut self) -> Result<(), String> {
+    fn finish_read(&mut self, journals: &mut Journals) -> Result<(), String> {
         let working = match (self.reading.take(), self.rest.take()) {
             (Some(reading), _) => reading.join().unwrap_or_else(|_| Err("reading it stopped unexpectedly".into())),
-            (None, Some(rest)) => rest.read(self.view.editor().model().replica()).map_err(|error| error.to_string()),
+            (None, Some(rest)) => {
+                let replica = self.view.editor().model().replica();
+                rest.read(replica, self.keeps.then(|| journals.folder())).map_err(|error| error.to_string())
+            }
             (None, None) => return Ok(()),
         };
         match working {
-            Ok(Working { copy, history }) => {
+            Ok(Working { copy, history, news, claim, journalled }) => {
                 if let Some(history) = history {
                     let _ = self.view.change(|editor| Ok::<_, Infallible>(editor.attach(history)));
                 }
+                if let Some(news) = news
+                    && let Err(error) = self.view.change(|editor| editor.merge(&news))
+                {
+                    eprintln!("letters: could not bring back unsaved work in {}: {error}", self.name());
+                }
                 self.id = Some(copy.id.clone());
+                if let Some(claim) = claim {
+                    let journal = journals.open(claim, &copy.id, &copy.created, self.file());
+                    // What an earlier session left unsaved is saved now.
+                    if journal.owes() {
+                        self.save_at = Some(Instant::now());
+                    }
+                    (self.journal, self.journalled) = (Some(journal), journalled);
+                    // What was typed before the history arrived is typed all the same.
+                    self.record();
+                }
                 self.copy = Some(copy);
                 Ok(())
             }
@@ -578,12 +664,17 @@ impl DocWindow {
         if !self.keeps {
             return;
         }
+        // The journal has everything a save is handed, and a new document's before it is given a file.
+        self.record();
         let Some(home) = self.settle(true, library, now) else { return };
-        if !self.unsaved() {
+        if !self.unsaved() && !self.owes() {
             // Only the name was due.
             return self.relist(library);
         }
         let Some(mut copy) = self.copy.take() else { return };
+        if let Some(journal) = &mut self.journal {
+            journal.saving();
+        }
         let (edits, revision) = self.edits_for(&mut copy);
         let (id, proxy, since) = (self.window.id(), proxy.clone(), revision.clone());
         let save = thread::spawn(move || {
@@ -597,6 +688,8 @@ impl DocWindow {
     /// Collects a running save, waiting for it if it has not finished.
     fn finish_save(&mut self, library: &Library, now: Instant) {
         let Some((edits, revision, save)) = self.saving.take() else { return };
+        // A save with nothing to carry was there to read the file back for the journal.
+        let carried = edits != self.saved_edits || self.sent.is_none();
         let result = match save.join() {
             Ok(Saving { copy, result }) => {
                 self.copy = Some(copy);
@@ -605,14 +698,18 @@ impl DocWindow {
             Err(_) => Err("the save stopped unexpectedly".into()),
         };
         match result {
-            Ok((home, news)) => {
-                self.saved(home, news, edits, revision, library);
-                if self.unsaved() && self.save_at.is_none() {
+            Ok(exchange) => {
+                self.saved(exchange, edits, revision, library);
+                // A file that was written is read back once things are quiet, which lets the journal go.
+                // That is tried once: a file that keeps changing is read again with the next edit.
+                let again = self.unsaved() || (carried && self.owes());
+                if again && self.save_at.is_none() {
                     self.save_at = Some(now + SAVE_AFTER);
                 }
             }
             Err(error) => {
                 eprintln!("letters: could not save {}: {error}", self.name());
+                self.unheld();
                 self.save_failed = true;
                 self.save_at = Some(now + RETRY_AFTER);
             }
@@ -620,10 +717,22 @@ impl DocWindow {
         self.retitle();
     }
 
-    /// Notes a save that worked: the document as it was at `edits` and `revision` is in its file at `home`,
-    /// and `news` is what the file held from other writers.
-    fn saved(&mut self, home: Home, news: Option<Vec<u8>>, edits: u64, revision: Revision, library: &Library) {
+    /// Tells the journal of a save that failed, which leaves it the only place the edits are.
+    fn unheld(&mut self) {
+        if let Some(journal) = &mut self.journal {
+            journal.saved(false);
+        }
+    }
+
+    /// Notes a save that worked: the document as it was at `edits` and `revision` is in its file, and
+    /// `exchange` says where that is and what the file held from other writers.
+    fn saved(&mut self, exchange: Exchange, edits: u64, revision: Revision, library: &Library) {
+        let Exchange { home, news, held } = exchange;
         self.place.saved(home);
+        self.rehome();
+        if let Some(journal) = &mut self.journal {
+            journal.saved(held);
+        }
         // The first write is to a folder nobody chose, so the bar names it for a moment.
         let first = self.keeps && self.listed.is_none();
         self.relist(library);
@@ -647,29 +756,48 @@ impl DocWindow {
         }
     }
 
+    /// Saves to `home` on this thread, with the copy the window keeps for it.
+    fn exchange(&mut self, home: &Home, copy: &mut WorkingCopy, library: &Library) -> Result<(), String> {
+        if let Some(journal) = &mut self.journal {
+            journal.saving();
+        }
+        let (edits, revision) = self.edits_for(copy);
+        match home.exchange(copy, &edits, &revision) {
+            Ok(exchange) => self.saved(exchange, self.view.edits(), revision, library),
+            Err(error) => {
+                self.unheld();
+                return Err(error.to_string());
+            }
+        }
+        Ok(())
+    }
+
     /// Saves now, on this thread, if anything is unsaved. Fails with what to tell the writer.
     ///
     /// With the `caret` counted, a first Heading 1 it is still in does not name the file yet.
-    fn save_now(&mut self, caret: bool, library: &Library) -> Result<(), String> {
+    fn save_now(&mut self, caret: bool, library: &Library, journals: &mut Journals) -> Result<(), String> {
         if !self.keeps {
             return Ok(());
         }
         let now = Instant::now();
-        self.finish_read()?;
+        self.finish_read(journals)?;
         self.finish_save(library, now);
         // A copy that could not be read was reported when that failed, and holds nothing back now.
         let Some(mut copy) = self.copy.take() else { return Ok(()) };
-        let home = self.settle(caret, library, now).filter(|_| self.unsaved());
-        let saved = home.map(|home| {
-            let (edits, revision) = self.edits_for(&mut copy);
-            home.exchange(&mut copy, &edits, &revision).map(|(home, news)| (home, news, revision))
-        });
+        self.record();
+        let home = self.settle(caret, library, now).filter(|_| self.unsaved() || self.owes());
+        let saved = home.map(|home| self.exchange(&home, &mut copy, library));
+        // A file that was just written is read back, which lets the journal go. A journal that stays is
+        // looked at when the app next starts.
+        if matches!(saved, Some(Ok(())))
+            && self.owes()
+            && let Some(home) = self.place.home().cloned()
+        {
+            let _ = self.exchange(&home, &mut copy, library);
+        }
         self.copy = Some(copy);
         match saved {
-            Some(Ok((home, news, revision))) => {
-                self.saved(home, news, self.view.edits(), revision, library);
-                self.save_at = None;
-            }
+            Some(Ok(())) => self.save_at = None,
             Some(Err(error)) => {
                 self.save_failed = true;
                 self.retitle();
@@ -688,8 +816,8 @@ impl DocWindow {
     }
 
     /// Saves and says so if that fails. Returns whether everything is on disk.
-    fn save_or_say(&mut self, caret: bool, library: &Library) -> bool {
-        let saved = self.save_now(caret, library);
+    fn save_or_say(&mut self, caret: bool, library: &Library, journals: &mut Journals) -> bool {
+        let saved = self.save_now(caret, library, journals);
         if let Err(error) = &saved {
             self.alert(error);
         }
@@ -715,9 +843,12 @@ impl App {
         opened: Option<Opened>,
         landing: bool,
     ) -> Result<(), Box<dyn Error>> {
-        let made_here = opened.is_none();
+        // A document with no file was made in this app, though perhaps in a session that ended early.
+        let made_here = opened.as_ref().is_none_or(|opened| opened.home.is_none());
         let (document, style, place, rest) = match opened {
-            Some(Opened { document, style, home, rest }) => (document, style, Place::at(home), rest),
+            Some(Opened { document, style, home, rest }) => {
+                (document, style, home.map_or_else(Place::new, Place::at), rest)
+            }
             None => {
                 let (document, style) = (files::blank(), new_style());
                 let rest = Rest::new(&document, &style);
@@ -766,6 +897,10 @@ impl App {
             reading: None,
             copy: None,
             sent: None,
+            journal: None,
+            journalled: None,
+            journalled_edits: 0,
+            journal_at: None,
         };
         window.view.set_reduced_motion(self.reduced_motion);
         if !window.place.naming() {
@@ -854,6 +989,15 @@ impl App {
         done
     }
 
+    /// The documents that sessions which ended early left unsaved. A run that only measures looks for
+    /// none, and leaves every journal as it found it.
+    fn left_unsaved(&self) -> Vec<Opened> {
+        if self.typing.is_some() || self.report_launch {
+            return Vec::new();
+        }
+        self.journals.orphans().into_iter().filter_map(files::reopen).collect()
+    }
+
     fn mark(&mut self, stage: &'static str) {
         if let Some(launch) = &mut self.launch {
             launch.mark(stage);
@@ -889,7 +1033,11 @@ impl App {
                 // A window with no file and nothing to put in one gives way to the document that was asked for.
                 let pristine = window.place.home().is_none() && !has_content(window.view.editor().doc());
                 match self.open_path(event_loop, &path, Some(id)) {
-                    true if pristine => drop(self.windows.remove(&id)),
+                    true if pristine => {
+                        if let Some(mut window) = self.windows.remove(&id) {
+                            window.leave();
+                        }
+                    }
                     true => {}
                     // A recent document that has gone is no longer offered.
                     false => {
@@ -902,7 +1050,7 @@ impl App {
             }
             Action::Save => {
                 if let Some(window) = self.windows.get_mut(&id) {
-                    window.save_or_say(true, &self.library);
+                    window.save_or_say(true, &self.library, &mut self.journals);
                 }
             }
             Action::Close => self.close(event_loop, id),
@@ -926,10 +1074,11 @@ impl App {
 
     fn close(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
         // Nothing is asked at closing: the document is saved, and stays open only if that fails.
-        let saved = self.windows.get_mut(&id).is_some_and(|window| window.save_or_say(false, &self.library));
+        let (library, journals) = (&self.library, &mut self.journals);
+        let saved = self.windows.get_mut(&id).is_some_and(|window| window.save_or_say(false, library, journals));
         self.vouch();
-        if saved {
-            self.windows.remove(&id);
+        if saved && let Some(mut window) = self.windows.remove(&id) {
+            window.leave();
         }
         if self.windows.is_empty() {
             event_loop.exit();
@@ -959,7 +1108,18 @@ impl ApplicationHandler<Event> for App {
         // The document was read long before the desktop finished starting the app.
         self.mark("app launched");
         let shown = opened.and_then(|opened| {
-            self.open_window(event_loop, opened, true).map_err(|error| format!("No window could be opened.\n\n{error}"))
+            // What sessions that ended early left unsaved comes back first, and the document that was
+            // asked for may be among it.
+            let mut documents: Vec<_> = self.left_unsaved().into_iter().map(Some).collect();
+            let asked = opened.filter(|opened| !documents.iter().flatten().any(|kept| same_file(kept, opened)));
+            if asked.is_some() || documents.is_empty() {
+                documents.push(asked);
+            }
+            documents.into_iter().try_for_each(|opened| {
+                let landing = opened.is_none();
+                self.open_window(event_loop, opened, landing)
+                    .map_err(|error| format!("No window could be opened.\n\n{error}"))
+            })
         });
         if let Err(failure) = shown {
             if !self.report_launch {
@@ -1026,7 +1186,7 @@ impl ApplicationHandler<Event> for App {
                 // and the recents list learns of an opened document.
                 if window.rest.is_some() {
                     window.reword(&self.words);
-                    window.start_read(&self.proxy);
+                    window.start_read(&self.proxy, &self.journals);
                     window.ask_dictionaries(&self.proxy, &self.dictionaries);
                     window.relocate(library);
                 }
@@ -1145,7 +1305,7 @@ impl ApplicationHandler<Event> for App {
             }
             Event::Read(id) => {
                 let Some(window) = self.windows.get_mut(&id) else { return };
-                if let Err(error) = window.finish_read() {
+                if let Err(error) = window.finish_read(&mut self.journals) {
                     match window.keeps {
                         true => window.alert(&error),
                         false => eprintln!("letters: {error}"),
@@ -1198,11 +1358,15 @@ impl ApplicationHandler<Event> for App {
     /// menu does. Nothing may ask a question here.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         for window in self.windows.values_mut() {
-            if let Err(error) = window.save_now(false, &self.library) {
-                eprintln!("letters: {error}");
+            match window.save_now(false, &self.library, &mut self.journals) {
+                Ok(()) => window.leave(),
+                Err(error) => eprintln!("letters: {error}"),
             }
+            // What could not be saved stays in its journal, which closes here.
+            window.journal = None;
         }
         self.vouch();
+        self.journals.finish();
     }
 
     /// Runs after each batch of events: starts due saves and sleeps until the next thing is due.
@@ -1215,6 +1379,9 @@ impl ApplicationHandler<Event> for App {
             if window.wake_ms.is_some_and(|wake| wake <= now_ms) {
                 window.wake_ms = window.view.animate(now_ms);
                 window.sync(now);
+            }
+            if window.journal_at.is_some_and(|at| at <= now) {
+                window.record();
             }
             if window.save_at.is_some_and(|at| at <= now) {
                 // What was written since the last save may be in a language not seen before.
@@ -1237,7 +1404,7 @@ impl ApplicationHandler<Event> for App {
             // A save that is due but waiting on another needs no timer: that save's end wakes the loop.
             let save = window.save_at.filter(|_| window.saving.is_none() && window.copy.is_some());
             let type_next = self.typing.as_ref().and_then(|run| run.next);
-            for due in [wake, save, type_next].into_iter().flatten() {
+            for due in [wake, save, window.journal_at, type_next].into_iter().flatten() {
                 next = Some(next.map_or(due, |next| next.min(due)));
             }
         }

@@ -31,11 +31,11 @@ impl Writer {
         let replica = replica();
         // The editor's history starts from the style on screen, as a window's does.
         let mut model = Model::new(opened.document, replica).with_style(opened.style);
-        let Working { copy, history } = opened.rest.read(replica).unwrap();
+        let Working { copy, history, .. } = opened.rest.read(replica, None).unwrap();
         if let Some(history) = history {
             model.attach(history);
         }
-        (Self { model, copy }, opened.home)
+        (Self { model, copy }, opened.home.expect("an opened file is its home"))
     }
 
     /// Makes the document read as `document`, as typing would.
@@ -51,5 +51,31 @@ impl Writer {
         let saved = home.save(&mut self.copy).unwrap();
         self.model.merge(&self.copy.model().save()).unwrap();
         saved
+    }
+}
+
+/// A scratch folder that is removed when the test ends.
+pub struct Scratch(pub std::path::PathBuf);
+
+impl Scratch {
+    pub fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("letters-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    /// The names of what a folder in it holds, which is nothing when the folder is not there.
+    pub fn names(&self, folder: &str) -> Vec<String> {
+        let entries = std::fs::read_dir(self.0.join(folder)).into_iter().flatten();
+        let mut names: Vec<String> = entries.map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        names
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }

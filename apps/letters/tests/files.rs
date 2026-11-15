@@ -5,7 +5,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use common::Writer;
-use letters::files::{self, Home, Opened};
+use letters::files::{self, Exchange, Home, Opened};
 use letters_format::{Archive, Package, Saved, conflict_copy_of};
 use letters_model::{Block, BlockKind, Document, Page, Style};
 
@@ -136,18 +136,19 @@ fn two_writers_of_one_file_both_keep_their_edits() {
     // Ben's save meets hers in the file, and hands him what he has not seen.
     ben.write(&paragraphs(&["One", "Two, says Ben"]));
     let seen = ben.model.revision();
-    let (home, news) = bens.exchange(&mut ben.copy, &ben.model.save(), &seen).unwrap();
+    let Exchange { home, news, held } = bens.exchange(&mut ben.copy, &ben.model.save(), &seen).unwrap();
     ben.model.merge(&news.expect("the file held her edit")).unwrap();
+    assert!(!held, "the file had to be written");
 
     let both = paragraphs(&["One, says Ada", "Two, says Ben"]);
     assert_eq!(ben.model.doc(), &both);
     assert_eq!(open(&path).unwrap().document, both);
     assert_eq!((home.path(), folder.names().len()), (path.as_path(), 1), "no conflict copy was needed");
 
-    // A save with nothing new on either side has nothing to hand back.
+    // A save with nothing new on either side has nothing to hand back, and finds it all in the file.
     let seen = ben.model.revision();
-    let (_, news) = home.exchange(&mut ben.copy, &ben.model.updates_since(&seen), &seen).unwrap();
-    assert!(news.is_none());
+    let again = home.exchange(&mut ben.copy, &ben.model.updates_since(&seen), &seen).unwrap();
+    assert!(again.news.is_none() && again.held);
 }
 
 #[test]

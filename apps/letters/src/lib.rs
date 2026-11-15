@@ -3,6 +3,7 @@
 //! - [`app`] runs the winit event loop and owns the windows.
 //! - [`input`] and [`platform`] adapt the desktop to the engine's interfaces.
 //! - [`files`] opens and saves `.let` files, and [`library`] decides where they live.
+//! - [`journal`] keeps unsaved work through a crash.
 //! - [`words`] keeps the person's own dictionary, and [`trust`] what they trust.
 //! - [`dictionaries`] finds the system's dictionaries for languages other than English.
 //! - [`measure`] checks the performance budgets, and [`baseline`] is the empty window it compares with.
@@ -17,6 +18,7 @@ pub mod dictionaries;
 pub mod files;
 pub mod gpu;
 pub mod input;
+pub mod journal;
 pub mod library;
 pub mod measure;
 pub mod platform;
