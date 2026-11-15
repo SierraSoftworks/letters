@@ -5,10 +5,10 @@
 //! where the index says is found again by a scan. Nothing here is the truth but the files.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufReader, Cursor};
+use std::io::{BufReader, Cursor, Read, Seek};
 use std::sync::Mutex;
 
-use letters_format::{Archive, Files, OPLOG, Replica, WorkingCopy, conflict_copy_of, file_name};
+use letters_format::{Archive, Files, OPLOG, Replica, Save, Saved, WorkingCopy, conflict_copy_of, file_name};
 use letters_model::{Block, BlockId, BlockKind, Document, Model, NoteKind, Op, ReplicaId, Style};
 use serde::{Deserialize, Serialize};
 
@@ -271,6 +271,28 @@ impl Library {
         let (folder, name) = place.split();
         let bytes = Files::read(&mut root.folder(&folder)?, name)?;
         bytes.ok_or_else(Refusal::not_found)
+    }
+
+    /// Merges `theirs`, another copy of the document at `place`, into its file. Nothing in the file is
+    /// replaced: the two meet as two writers of one folder do, and merging the same copy again changes
+    /// nothing.
+    pub fn merge<R: Read + Seek>(&self, root: &Root, place: &Place, theirs: &mut Archive<R>, now: u64) -> Answer<()> {
+        let (folder, name) = place.split();
+        let mut folder = root.folder(&folder)?;
+        let mut ours = Archive::open(BufReader::new(folder.open(name)?))?;
+        let mut copy = WorkingCopy::open(&mut ours, ReplicaId::new(&ids::block_id()))?;
+        copy.merge_from(theirs).map_err(|error| match error {
+            letters_format::Error::Unmerged => Refusal::invalid("That file shares nothing with the document."),
+            error => error.into(),
+        })?;
+        let (token, day) = (ids::block_id(), ids::rfc3339(now));
+        let label = format!("{} server", day.get(..10).unwrap_or(&day));
+        let save = Save { name, token: &token, label: &label, attempts: 3 };
+        // A copy beside the file holds the document as safely as the file would.
+        if let Saved::ConflictCopy { name: beside, cause } = letters_format::save(&mut folder, &mut copy, &save)? {
+            crate::log(&format!("\"{name}\" could not be written ({cause}), and what was merged went to \"{beside}\""));
+        }
+        Ok(())
     }
 
     /// Moves the file or folder at `from` to `to`, in the same root or another. Nothing at `to` is replaced.

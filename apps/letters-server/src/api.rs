@@ -37,6 +37,7 @@ const RECENT: Table<Vec<String>> = Table::new("recent");
 const RECENTS: usize = 30;
 
 pub fn routes() -> Router<Shared> {
+    let limits = letters_api::Limits::default();
     Router::new()
         .route(paths::SERVER, get(server))
         .route(paths::SESSION, get(session))
@@ -51,14 +52,17 @@ pub fn routes() -> Router<Shared> {
         .route("/api/v1/spaces/{space}/documents", post(new_document))
         .route("/api/v1/spaces/{space}/folders", post(new_folder))
         .route("/api/v1/documents/{id}", get(document))
-        .route("/api/v1/documents/{id}/file", get(file))
+        .route(
+            "/api/v1/documents/{id}/file",
+            get(file).put(merge_file).layer(DefaultBodyLimit::max(limits.document as usize)),
+        )
         .route("/api/v1/documents/{id}/rename", post(rename))
         .route("/api/v1/documents/{id}/move", post(relocate))
         .route("/api/v1/documents/{id}/trash", post(trash))
         .route("/api/v1/documents/{id}/assets", get(assets))
         .route(
             "/api/v1/documents/{id}/assets/{name}",
-            get(asset).put(add_asset).layer(DefaultBodyLimit::max(letters_api::Limits::default().asset as usize)),
+            get(asset).put(add_asset).layer(DefaultBodyLimit::max(limits.asset as usize)),
         )
 }
 
@@ -219,6 +223,29 @@ async fn asset(State(app): State<Shared>, who: Signed, Path((id, name)): Path<(S
     Ok((headers, bytes).into_response())
 }
 
+/// Why a body was not read, as a refusal. `large` is what is said of one over its limit.
+fn unread(rejection: BytesRejection, large: &str) -> Refusal {
+    match rejection {
+        BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_)) => {
+            Refusal::new(Code::TooLarge, large)
+        }
+        _ => Refusal::invalid("The request did not arrive whole."),
+    }
+}
+
+/// `PUT`: a device's own copy of the document, whole, for work that is too much for the socket. It is
+/// merged into the document and replaces nothing.
+async fn merge_file(
+    State(app): State<Shared>,
+    who: Signed,
+    Path(id): Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> Answer<StatusCode> {
+    let file = body.map_err(|rejection| unread(rejection, "The file is larger than the server takes."))?;
+    blocking(move || app.merge(&who, &id, &file)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `PUT`: a picture for the document, ahead of the edit that names it.
 async fn add_asset(
     State(app): State<Shared>,
@@ -226,12 +253,7 @@ async fn add_asset(
     Path((id, name)): Path<(String, String)>,
     body: Result<Bytes, BytesRejection>,
 ) -> Answer<StatusCode> {
-    let bytes = body.map_err(|rejection| match rejection {
-        BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_)) => {
-            Refusal::new(Code::TooLarge, "The picture is larger than the server takes.")
-        }
-        _ => Refusal::invalid("The picture did not arrive whole."),
-    })?;
+    let bytes = body.map_err(|rejection| unread(rejection, "The picture is larger than the server takes."))?;
     blocking(move || {
         let found = app.locate(&who, &id)?;
         found.must(Role::Editor)?;
@@ -401,6 +423,20 @@ impl App {
         found.must(Role::Editor)?;
         let thrown = || self.library.trash(&self.store, &found.root, &found.place, self.now());
         self.rooms.moving((&found.root, &found.place), None, thrown)
+    }
+
+    /// Merges a device's own copy of the document `id` into it. Whoever has the document open is told
+    /// what the copy brought.
+    pub fn merge(&self, who: &Signed, id: &str, file: &[u8]) -> Answer<()> {
+        let found = self.locate(who, id)?;
+        found.must(Role::Editor)?;
+        let mut theirs = letters_format::Archive::open(std::io::Cursor::new(file))?;
+        // A copy made by hand that became a document of its own is not this one any more.
+        if theirs.manifest().id != id {
+            return Err(Refusal::invalid("That file is of another document."));
+        }
+        let merged = || self.library.merge(&found.root, &found.place, &mut theirs, self.now());
+        self.rooms.around(&found.root, &found.place, merged)
     }
 
     /// Puts `file` back from the trash of `space`, and says where it is now.

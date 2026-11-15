@@ -5,9 +5,9 @@ mod common;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use common::{Server, URL};
+use common::{Server, URL, texts};
 use letters_api::paths;
-use letters_model::Extent;
+use letters_model::{Extent, Model, Op, Pos, ReplicaId};
 use letters_server::session::COOKIE_NAME;
 use letters_sync::{ClientMessage, Hello, PROTOCOL, Refusal, ServerMessage};
 use tungstenite::client::IntoClientRequest;
@@ -86,4 +86,33 @@ async fn frames_travel_both_ways_and_the_server_says_why_it_closes() {
     ada.post::<()>(&paths::trash(&id), &()).await.unwrap();
     assert_eq!(heard(&mut socket), Some(ServerMessage::Goodbye { why: Refusal::Gone }));
     assert_eq!(heard(&mut socket), None, "and then the socket is closed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_is_told_to_stop_saves_what_is_open_first() {
+    let server = Server::new("socket-stop");
+    let ada = server.person("ada", &["family"]);
+    let id = ada.start("family", "", "Plan").await.id.unwrap();
+    let (at, stop, served) = server.serving().await;
+    let mut socket = dial(at, &id, &[(AUTHORIZATION, format!("Bearer {}", ada.token.as_deref().unwrap()))]).unwrap();
+    let hello = Hello { protocol: PROTOCOL, document: String::new(), extent: Extent::default(), revision: None };
+    socket.send(Message::Binary(ClientMessage::Hello(hello).encode().into())).unwrap();
+    let Some(ServerMessage::Welcome(welcome)) = heard(&mut socket) else { panic!("the server answers a hello") };
+
+    let mut model = Model::load(&welcome.updates, ReplicaId::from(7)).unwrap();
+    let (before, first) = (model.extent(), model.doc().blocks[0].id.clone());
+    model.apply([Op::InsertText { at: Pos::new(first, 0), text: "Written just before the stop. ".into() }]).unwrap();
+    let edits = ClientMessage::Edits { seq: 1, updates: model.updates_for(&before) };
+    socket.send(Message::Binary(edits.encode().into())).unwrap();
+    assert_eq!(heard(&mut socket), Some(ServerMessage::Held { seq: 1 }));
+
+    stop.send(()).unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(20), served).await;
+    assert!(matches!(ended, Ok(Ok(Ok(())))), "the server stops though a socket is open: {ended:?}");
+
+    // The file itself is read, as whatever starts next will find it.
+    let file = std::fs::read(server.scratch.0.join("family/Plan.let")).unwrap();
+    assert!(texts(file).join("\n").contains("Written just before the stop."));
+    assert!(server.scratch.names("state/rooms").is_empty(), "nothing is left for the next start to recover");
+    assert_eq!(heard(&mut socket), None, "the socket is closed, with nothing said that would keep the device away");
 }

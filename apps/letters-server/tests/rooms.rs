@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use axum::http::{Method, StatusCode};
 use common::desk::{Desk, settle};
-use common::{Client, Server};
+use common::{Client, Server, texts};
 use letters_api::{Entry, Listing, Move, NewFolder, Rename, Tag, paths};
-use letters_format::{Archive, hash};
-use letters_model::{Block, BlockKind, Op};
+use letters_format::{Archive, MIMETYPE, WorkingCopy, hash};
+use letters_model::{Block, BlockKind, Op, Pos, ReplicaId};
 use letters_sync::{Link, Refusal, Role};
 
 /// A smallest PNG, by its first bytes.
@@ -23,12 +23,6 @@ async fn shared(name: &str) -> (Server, Client, String) {
     let ada = server.person("ada", &["family"]);
     let id = ada.start("family", "", "Plan").await.id.expect("a document has an id");
     (server, ada, id)
-}
-
-/// The text of a `.let` file, block by block.
-fn texts(file: Vec<u8>) -> Vec<String> {
-    let document = Archive::open(Cursor::new(file)).expect("a document").document().expect("it reads");
-    document.walk().map(Block::plain_text).collect()
 }
 
 /// The text of the document `id` as the server sends its file.
@@ -195,6 +189,44 @@ async fn a_picture_is_handed_over_ahead_of_the_edit_that_names_it() {
     let kept = Archive::open(Cursor::new(file)).unwrap().read(&format!("assets/{name}")).unwrap();
     assert_eq!(kept.as_deref(), Some(PNG), "the file holds it once the document names it");
     assert_eq!(put(&ada, &name, PNG).await, StatusCode::NO_CONTENT, "handing it over again is no fault");
+}
+
+#[tokio::test]
+async fn a_device_hands_its_whole_file_over_and_nothing_is_replaced() {
+    let (server, ada, id) = shared("handed-over").await;
+    let mut desk = Desk::open(&server, &ada, &id).await.unwrap();
+    settle([&mut desk]).await;
+    // A device wrote on its own copy of the file while it was away, and someone else wrote here.
+    let was = ada.send(Method::GET, &paths::file(&id), "", Vec::new()).await.body;
+    let mut away = WorkingCopy::open(&mut Archive::open(Cursor::new(was)).unwrap(), ReplicaId::from(9)).unwrap();
+    let first = away.model().doc().blocks[0].id.clone();
+    away.apply([Op::InsertText { at: Pos::new(first, 0), text: "Written away. ".into() }]).unwrap();
+    let theirs = letters_server::library::packed(&away).expect("the copy is a file");
+    desk.write("Written here. ");
+    settle([&mut desk]).await;
+
+    let put = async |who: &Client, file: &[u8]| {
+        who.send(Method::PUT, &paths::file(&id), MIMETYPE, file.to_vec()).await.status
+    };
+    let guest = server.person("guest", &["friends"]);
+    let other = ada.start("family", "", "Other").await.id.unwrap();
+    let other = ada.send(Method::GET, &paths::file(&other), "", Vec::new()).await.body;
+    let cases: [(&Client, &[u8], StatusCode, &str); 3] = [
+        (&guest, &theirs, StatusCode::FORBIDDEN, "a reader"),
+        (&ada, &other, StatusCode::BAD_REQUEST, "another document"),
+        (&ada, b"no document at all", StatusCode::BAD_REQUEST, "no document"),
+    ];
+    for (who, file, expected, what) in cases {
+        assert_eq!(put(who, file).await, expected, "{what}");
+    }
+    for _ in 0..2 {
+        assert_eq!(put(&ada, &theirs).await, StatusCode::NO_CONTENT, "handing it over twice is no fault");
+    }
+    settle([&mut desk]).await;
+
+    let text = desk.texts().join("\n");
+    assert!(text.contains("Written away.") && text.contains("Written here."), "whoever has it open is told: {text}");
+    assert_eq!(on_file(&ada, &id).await, text);
 }
 
 #[tokio::test(start_paused = true)]

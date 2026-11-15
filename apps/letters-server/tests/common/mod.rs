@@ -5,6 +5,8 @@ pub mod desk;
 pub mod idp;
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Cursor;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +23,8 @@ use letters_server::store::Store;
 use letters_server::{App, Shared, api};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tower::ServiceExt;
 
 /// The address the scratch server is told it is reached at.
@@ -122,12 +126,21 @@ impl Server {
     }
 
     /// Serves on a port of this machine, for what a router alone cannot be asked: a socket.
-    pub async fn listen(&self) -> std::net::SocketAddr {
+    pub async fn listen(&self) -> SocketAddr {
+        let (address, stop, _) = self.serving().await;
+        // Never told to stop.
+        std::mem::forget(stop);
+        address
+    }
+
+    /// Serves on a port of this machine until the sender is used: the address, the way to stop the
+    /// server, and how its serving ends.
+    pub async fn serving(&self) -> (SocketAddr, oneshot::Sender<()>, JoinHandle<std::io::Result<()>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("a port is free");
         let address = listener.local_addr().unwrap();
-        let router = self.router.clone();
-        tokio::spawn(async move { axum::serve(listener, router).await });
-        address
+        let (stop, stopped) = oneshot::channel();
+        let served = letters_server::serve(self.app.clone(), listener, async move { drop(stopped.await) });
+        (address, stop, tokio::spawn(served))
     }
 
     /// Lets `seconds` pass.
@@ -362,6 +375,12 @@ pub fn query(text: &str) -> HashMap<String, String> {
     };
     let pairs = text.split('&').filter_map(|pair| pair.split_once('='));
     pairs.map(|(name, value)| (unescaped(name), unescaped(value))).collect()
+}
+
+/// The text of a `.let` file, block by block.
+pub fn texts(file: Vec<u8>) -> Vec<String> {
+    let document = letters_format::Archive::open(Cursor::new(file)).expect("a document").document().expect("it reads");
+    document.walk().map(letters_model::Block::plain_text).collect()
 }
 
 /// The names of some rows, in their order.

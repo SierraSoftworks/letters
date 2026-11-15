@@ -30,6 +30,7 @@ pub mod store;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::serve::ListenerExt;
 use letters_api::{Role, Space};
 
 use crate::config::Config;
@@ -134,6 +135,31 @@ impl App {
             }
         }
     }
+}
+
+/// Serves on `listener` until `stop` resolves. What an earlier run left in its journals goes to its files
+/// before anyone is let in. When the server is told to stop, every session ends and every open document
+/// is saved first, and then the requests that are being answered are answered.
+pub async fn serve(
+    app: Shared,
+    listener: tokio::net::TcpListener,
+    stop: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let recovering = app.clone();
+    tokio::task::spawn_blocking(move || recovering.rooms.recover(&recovering)).await?;
+    // The index is brought up to the folders while the first requests are already answered.
+    let scanning = app.clone();
+    tokio::task::spawn_blocking(move || scanning.scan());
+    let closing = app.clone();
+    let stopped = async move {
+        stop.await;
+        if tokio::task::spawn_blocking(move || closing.rooms.close()).await.is_err() {
+            log("the open documents could not all be saved as the server stopped: their journals keep the rest");
+        }
+    };
+    // A frame that relays what someone typed is small, and is not held back to be sent with the next.
+    let listener = listener.tap_io(|socket| drop(socket.set_nodelay(true)));
+    axum::serve(listener, api::router(app)).with_graceful_shutdown(stopped).await
 }
 
 /// Writes a line to the server's log, which is its standard error.

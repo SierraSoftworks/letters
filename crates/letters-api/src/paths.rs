@@ -67,7 +67,9 @@ pub fn document(id: &str) -> String {
     format!("{API}/documents/{}", segment(id))
 }
 
-/// `GET`: the whole `.let` file, pictures and history included, as the server would save it now.
+/// `GET`: the whole `.let` file, pictures and history included, as the server would save it now. `PUT`: a
+/// device's own copy of the document, for work that is too much for the socket. It is merged into the
+/// document and replaces nothing, and may be as large as [`Limits::document`](crate::Limits::document).
 pub fn file(id: &str) -> String {
     format!("{}/file", document(id))
 }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use letters_server::config::{Config, ConfigError};
 use letters_server::store::Store;
-use letters_server::{App, api, log};
+use letters_server::{App, log};
 
 const DEFAULT_CONFIG: &str = "/etc/letters/server.toml";
 
@@ -63,16 +63,8 @@ fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(listen).await?;
         log(&format!("listening on {listen} as {}", app.config.server.url));
-        // What the last run was told to keep and did not get to its file goes there before anyone is
-        // let in, so that nobody opens a document that lacks it.
-        let recovering = app.clone();
-        tokio::task::spawn_blocking(move || recovering.rooms.recover(&recovering)).await?;
-        // The index is brought up to the folders while the first requests are already answered.
-        let scanning = app.clone();
-        tokio::task::spawn_blocking(move || scanning.scan());
-        axum::serve(listener, api::router(app.clone())).with_graceful_shutdown(stopped()).await?;
-        // The files are brought up to their rooms. The sockets end with the program.
-        tokio::task::spawn_blocking(move || app.rooms.close()).await?;
+        letters_server::serve(app, listener, stopped()).await?;
+        log("stopped, with what was open saved");
         Ok(())
     })
 }

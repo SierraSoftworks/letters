@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -90,6 +90,8 @@ pub struct Rooms {
     /// The journals no room has: the id of the document each is of, and its folder's name. The room
     /// that is opened next for the document takes one over, wherever the document's file is by then.
     left: Mutex<Vec<(String, String)>>,
+    /// The server is stopping, and no room is opened any more. Set and read under the lock on `open`.
+    closed: AtomicBool,
     /// The time when the clock was first read, and that moment on the runtime's clock.
     started: OnceLock<(u64, Instant)>,
 }
@@ -154,6 +156,7 @@ impl Rooms {
             folder: state.join("rooms"),
             open: Mutex::new(HashMap::new()),
             left: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
             started: OnceLock::new(),
         }
     }
@@ -183,7 +186,13 @@ impl Rooms {
     ) -> Answer<(Arc<Open>, T)> {
         let key = key(root, place);
         loop {
-            let open = lock(&self.open).entry(key.clone()).or_insert_with(|| Arc::new(Open::new())).clone();
+            let open = {
+                let mut rooms = lock(&self.open);
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(Refusal::new(Code::Unavailable, "The server is stopping."));
+                }
+                rooms.entry(key.clone()).or_insert_with(|| Arc::new(Open::new())).clone()
+            };
             let mut state = lock(&open.state);
             let now = self.now();
             if matches!(*state, State::Opening) {
@@ -296,7 +305,7 @@ impl Rooms {
         let State::Open(hosted) = &mut *state else { return work() };
         let now = self.now();
         // What cannot be saved now stays in the journal, and goes to the file where it is next.
-        hosted.save(now, true);
+        hosted.save_through(now);
         let done = match work() {
             Ok(done) => done,
             Err(refusal) => {
@@ -335,10 +344,50 @@ impl Rooms {
         });
     }
 
-    /// Saves every room, as the server stops. The devices are told nothing: each takes its socket for
-    /// lost, and comes back when the server does.
+    /// Does `work`, which writes to the file at `place` as any other writer of its folder would. A room
+    /// that is open for the file saves first and reads the file again at once, so that its sessions are
+    /// told what was written.
+    pub fn around<T>(&self, root: &Root, place: &Place, work: impl FnOnce() -> Answer<T>) -> Answer<T> {
+        let open = lock(&self.open).get(&key(root, place)).cloned();
+        let Some(open) = open else { return work() };
+        let mut state = lock(&open.state);
+        let State::Open(hosted) = &mut *state else { return work() };
+        let now = self.now();
+        hosted.save(now, true);
+        let done = work();
+        hosted.save(now, true);
+        hosted.settle(&open, now);
+        done
+    }
+
+    /// Brings every file up to its room and ends every session, as the server stops. Each file is
+    /// written and read back, which is when its journal lets go, so that nothing is left for the next
+    /// start to recover. No room is opened afterwards.
+    ///
+    /// The devices are given no reason: each takes its socket for lost, and comes back when the server
+    /// does, with whatever it was not told the server holds.
     pub fn close(&self) {
-        self.each(|hosted, now| hosted.save(now, true));
+        let rooms: Vec<Arc<Open>> = {
+            let mut rooms = lock(&self.open);
+            self.closed.store(true, Ordering::Release);
+            rooms.drain().map(|(_, open)| open).collect()
+        };
+        for open in rooms {
+            let mut state = lock(&open.state);
+            if let State::Open(hosted) = &mut *state {
+                let now = self.now();
+                hosted.save_through(now);
+                // Each device hears what the save let the server say it holds, and then its socket closes.
+                hosted.settle(&open, now);
+                for (session, seated) in hosted.seats.drain() {
+                    let _ = seated.to.try_send(Out::Close);
+                    hosted.room.leave(session);
+                }
+                hosted.discard(self);
+            }
+            *state = State::Gone;
+            open.gone();
+        }
     }
 
     /// One turn of a room's keeper: what is due is done. Says whether the room is gone.
@@ -526,22 +575,33 @@ impl Hosted {
         open.wake.notify_one();
     }
 
+    /// Saves everything the room has, and reads a file that was written back at once. That is when the
+    /// journal lets go, which otherwise waits for a quiet moment.
+    fn save_through(&mut self, now: u64) {
+        if self.save(now, true) {
+            self.save(now, true);
+        }
+    }
+
     /// Saves what is due between the room and its file, or everything the room has when `whatever` says
-    /// so. A save that fails is tried again by the room, and its edits stay in the journal.
-    fn save(&mut self, now: u64, whatever: bool) {
+    /// so. A save that fails is tried again by the room, and its edits stay in the journal. Says whether
+    /// the file was written.
+    fn save(&mut self, now: u64, whatever: bool) -> bool {
         if self.parked || self.lost {
-            return;
+            return false;
         }
         let place = self.place.clone();
         let (folder, name) = place.split();
         let mut folder = match self.root.folder(&folder) {
             Ok(folder) if folder.has(name) => folder,
-            Ok(_) => return self.not_there(name, now),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return self.not_there(name, now),
-            Err(error) => {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                 log(&format!("\"{name}\" cannot be saved while its folder cannot be reached: {error}"));
                 self.hold = now + LOOK_EVERY;
-                return;
+                return false;
+            }
+            _ => {
+                self.not_there(name, now);
+                return false;
             }
         };
         (self.missing, self.hold) = (false, 0);
@@ -560,9 +620,13 @@ impl Hosted {
                 if matches!(cause, Error::OtherDocument(_) | Error::NewerFormat(_) | Error::Unmerged) {
                     self.end(Ended::Gone);
                 }
+                false
             }
-            Ok(_) => {}
-            Err(error) => log(&format!("\"{name}\" could not be saved, and is tried again: {error}")),
+            Ok(saved) => matches!(saved, Some(Saved::Written | Saved::Restored { .. })),
+            Err(error) => {
+                log(&format!("\"{name}\" could not be saved, and is tried again: {error}"));
+                false
+            }
         }
     }
 
