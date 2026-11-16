@@ -393,13 +393,14 @@ impl Browser {
                 choice.into()
             }
         };
-        let device = Button::new("This device").icon(icon::FOLDER_OPEN).on_press(send(Browsing::Device));
+        // Named, they would leave several servers too little of a card that is not roomy.
+        let brief = room == Room::Tight || (room < Room::Roomy && servers.len() > 1);
         let sources = Element::row()
             .align(Align::Center)
             .justify(Justify::Between)
             .gap(tokens::SPACE_MD)
             .child(from)
-            .child(device);
+            .children(self.made(brief));
         let line = || Element::row().width(1.0).bg(tokens::LINE).decorative();
         let body = Element::row()
             .height(HEIGHT)
@@ -426,7 +427,8 @@ impl Browser {
     }
 
     /// The places of the server down the card's side: the person's spaces, then what reaches them from
-    /// other people's, what they had open lately, and what was thrown away.
+    /// other people's, what they had open lately, and what was thrown away. Under them, the way to a file
+    /// of this device.
     fn places(&self, room: Room) -> Element<Message> {
         let spaces = self.spaces.as_deref().unwrap_or_default().iter().map(|space| {
             let mark = if space.kind == SpaceKind::Personal { icon::FOLDER } else { icon::USERS };
@@ -443,8 +445,9 @@ impl Browser {
             option(mark, name, here).selected(here).on_press(send(Browsing::Go(place)))
         });
         let trash = option(icon::TRASH_2, "Trash", self.binned).selected(self.binned).on_press(send(Browsing::Trash));
-        Element::column()
-            .width(if room == Room::Tight { NARROW } else { PLACES })
+        let places = Element::column()
+            .grow(1.0)
+            .shrink()
             .padding(Edges::all(tokens::SPACE_XS))
             .role(Role::ListBox)
             .label("Places")
@@ -452,7 +455,31 @@ impl Browser {
             .one_stop()
             .scroll()
             .children(rows)
-            .child(trash)
+            .child(trash);
+        // Not a place of the server: it leaves the card for the system's own dialog, so it stands under
+        // the places and stays there while they scroll.
+        let device = option(icon::MONITOR, "This device", false)
+            .role(Role::Button)
+            .description("Open a file from this device")
+            .on_press(send(Browsing::Device));
+        Element::column()
+            .width(if room == Room::Tight { NARROW } else { PLACES })
+            .child(places)
+            .child(Element::row().height(1.0).bg(tokens::LINE).decorative())
+            .child(Element::column().padding(Edges::all(tokens::SPACE_XS)).child(device))
+    }
+
+    /// What is made in the folder that is looked at, where the person may write: a document started there,
+    /// or one made out of a file of this device.
+    fn made(&self, brief: bool) -> Option<Element<Message>> {
+        let (space, path) = self.written().filter(|_| !self.binned)?;
+        let named = self.spaces.as_deref()?.iter().find(|known| known.id == space)?.name.as_str();
+        let here = path.rsplit('/').next().filter(|folder| !folder.is_empty()).unwrap_or(named);
+        let made = Element::row()
+            .gap(tokens::SPACE_XS)
+            .child(act("Import", icon::FILE_UP, Some(Browsing::Import), format!("Into {here}"), brief))
+            .child(act("New document", icon::PLUS, Some(Browsing::New), format!("In {here}"), brief));
+        Some(made)
     }
 
     /// What the place that is looked at holds, under the way that leads to it.
@@ -621,8 +648,7 @@ impl Browser {
             .children(rows)
     }
 
-    /// The way to the folder that is looked at, from its space down. Each step but the last leads back. At
-    /// its end a document is started in the folder or made there out of a file, where the person may write.
+    /// The way to the folder that is looked at, from its space down. Each step but the last leads back.
     /// A tight card has room for the folder's own name alone, with one step that leads up from it.
     fn way(&self, room: Room) -> Option<Element<Message>> {
         let Some(Place::Folder { space, path }) = self.place.as_ref().filter(|_| !self.binned) else { return None };
@@ -655,16 +681,6 @@ impl Browser {
                 };
                 way = way.child(up.on_press(send(Browsing::Go(back))));
             }
-        }
-        if self.written().is_some() {
-            let here = folders.last().copied().or(name).unwrap_or_default();
-            // Named, they would leave the steps too little of a card that is not roomy.
-            let brief = room < Room::Roomy;
-            let made = Element::row()
-                .gap(tokens::SPACE_XS)
-                .child(act("Import", icon::FILE_UP, Some(Browsing::Import), format!("Into {here}"), brief))
-                .child(act("New document", icon::PLUS, Some(Browsing::New), format!("In {here}"), brief));
-            way = way.child(Element::row().grow(1.0)).child(made);
         }
         Some(way.shrink().height(tokens::CONTROL_HEIGHT_SM))
     }

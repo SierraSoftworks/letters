@@ -354,14 +354,14 @@ fn a_narrow_window_holds_the_card_and_leaves_out_what_it_has_no_room_for() {
             assert_eq!(has(&mut window, Role::Label, heading), roomy, "{width}: {heading}");
         }
         assert_eq!(has(&mut window, Role::Button, "Modified"), dated, "{width}");
-        // What is offered is inside the card at any width, and the name is written whole. The buttons over
-        // the list say their names where that leaves the way to a folder its room.
+        // What is offered is inside the card at any width, and the name is written whole. The buttons of the
+        // bar say their names in all but a tight card.
         let offered = ["Import", "New document"].into_iter().chain(dated.then_some("Modified"));
         for button in offered {
             let found = window.find(Role::Button, button).expect("offered");
             let ends = found.bounds.x + found.bounds.width;
             assert!(ends < card.x + card.width, "{width}: {button} at {:?} in {card:?}", found.bounds);
-            assert!(button == "Modified" || named(&found) == roomy, "{width}: {button}");
+            assert!(button == "Modified" || named(&found) == dated, "{width}: {button}");
         }
         assert!(letters(&mut window, "Roof plan").into_iter().max() >= Some(8), "{width}");
         window.click(Role::ListBoxOption, "Roof plan");
@@ -516,7 +516,7 @@ fn what_is_too_long_for_a_row_is_cut_short_inside_the_card() {
     let card = window.find(Role::Dialog, "Open").expect("the card").bounds;
     assert!(list.x + list.width < card.x + card.width, "the list is inside the card: {list:?} in {card:?}");
 
-    // So is the way to a folder with such a name, which ends in the button that starts a document there.
+    // So is the way to a folder with such a name, and the button that starts a document there.
     window.ui().set_listing(listing(HOME, within("sam", ""), vec![folder("sam", LONG)]));
     window.click(Role::ListBoxOption, LONG);
     window.ui().set_listing(listing(HOME, within("sam", LONG), Vec::new()));
@@ -531,9 +531,18 @@ fn servers_with_long_addresses_are_chosen_between_inside_the_card() {
     let mut window = signed_in(&[home, work]);
     window.click(Role::Button, "More").click(Role::MenuItem, "Open");
     let card = window.find(Role::Dialog, "Open").expect("the card").bounds;
-    // Each is cut short where it is chosen, and the way to this device's files keeps its place beside them.
-    let device = window.find(Role::Button, "This device").expect("the way to a file on this device").bounds;
-    assert!(device.x + device.width < card.x + card.width, "{device:?} in {card:?}");
+    // Each is cut short where it is chosen, and what is made in a folder keeps its place beside them.
+    window.ui().set_listing(Browsed {
+        server: home.into(),
+        place: Place::Spaces,
+        spaces: spaces(),
+        entries: Vec::new(),
+    });
+    window.ui().set_listing(listing(home, within("sam", ""), own()));
+    for button in ["Import", "New document"] {
+        let found = window.find(Role::Button, button).expect("offered").bounds;
+        assert!(found.x + found.width < card.x + card.width, "{button}: {found:?} in {card:?}");
+    }
 }
 
 #[test]
@@ -787,8 +796,10 @@ fn the_places_are_one_stop_of_the_tab_key_at_the_place_that_is_looked_at() {
     }
     assert_eq!(at(&mut window), "Sam Okafor");
     window.key("Shift+Tab");
-    assert_eq!(at(&mut window), "This device", "the places cost one press to pass");
-    window.key("Tab").key("Up").key("Enter");
+    assert_eq!(at(&mut window), "New document", "the places cost one press to pass");
+    window.key("Tab").key("Tab");
+    assert_eq!(at(&mut window), "This device", "and one to leave");
+    window.key("Shift+Tab").key("Up").key("Enter");
     assert_eq!(window.ui().take_requests(), [browse(HOME, within("family", ""))]);
 
     // While the server is asked, what is typed does not reach the page under the card.
@@ -816,6 +827,8 @@ fn a_document_is_started_or_imported_in_the_folder_that_is_looked_at() {
                 window.ui().take_requests();
             }
             let offered = window.find(Role::Button, button).expect("offered");
+            let lists = window.find(Role::ListBox, "Places").expect("the places").bounds;
+            assert!(offered.bounds.y + offered.bounds.height <= lists.y, "{button} stands in the bar over the lists");
             let said = format!("{word} {}", folder.unwrap_or("Sam Okafor"));
             assert_eq!(offered.description.as_deref(), Some(said.as_str()), "{button}");
             window.click(Role::Button, button);
@@ -1020,6 +1033,11 @@ fn the_trash_is_looked_at_before_the_spaces_are_told_and_left_with_its_server() 
 fn a_file_of_this_device_is_still_one_press_away() {
     let mut window = signed_in(&[HOME]);
     open(&mut window, own());
+    // It stands under the places, down the card's side.
+    let places = window.find(Role::ListBox, "Places").expect("the places").bounds;
+    let device = window.find(Role::Button, "This device").expect("the way to a file of this device").bounds;
+    assert!(device.y >= places.y + places.height, "{device:?} under {places:?}");
+    assert!(device.x >= places.x && device.x + device.width <= places.x + places.width, "{device:?} beside {places:?}");
     window.click(Role::Button, "This device");
     assert_eq!(window.ui().take_requests(), [Request::OpenDialog]);
     window.assert_closed(Role::Dialog, "Open");
