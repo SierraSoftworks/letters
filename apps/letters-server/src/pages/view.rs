@@ -91,6 +91,8 @@ pub struct Activity {
     pub days: Vec<(String, Vec<Reached>)>,
     /// How many days the server keeps a row.
     pub kept: u32,
+    /// The time zone the days and the times are told in, as a reader in another one must know it.
+    pub zone: String,
     /// The address that lists the rows from before these, where there may be some.
     pub earlier: Option<String>,
     /// These are not the newest: the dialog opens on them, and offers the way back.
@@ -638,7 +640,10 @@ fn activity(log: &Activity, newest: &str) -> Html {
             } else if log.days.is_empty() {
                 <p class="lt-note">{ "Nobody has reached this document through a share yet." }</p>
             } else {
-                <p class="lt-note">{ format!("Everything that reached this document through a share{within}, newest first.") }</p>
+                <p class="lt-note">
+                    { format!("Everything that reached this document through a share{within}, newest first. ") }
+                    { format!("Times are in {}.", log.zone) }
+                </p>
                 { for log.days.iter().map(day) }
             }
             if log.older || log.earlier.is_some() {

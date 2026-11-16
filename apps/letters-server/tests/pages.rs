@@ -253,6 +253,7 @@ async fn the_share_dialog_tells_what_was_done_through_a_share_or_a_link() {
     assert!(at.is_sorted(), "the newest comes first: {at:?}");
     assert!(dialog[at[0]..at[2]].contains("Accountant"), "a guest's row names their link");
     assert!(dialog.contains("Today"), "the rows are under their day");
+    assert!(dialog.contains("Times are in "), "and a reader in another time zone is told whose times they are");
     assert!(!dialog.contains("before="), "a log this short is shown whole");
 }
 

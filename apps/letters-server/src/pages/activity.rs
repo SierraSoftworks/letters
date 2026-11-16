@@ -1,5 +1,5 @@
 //! A document's access log, made ready for the Share dialog's Activity tab: its rows by day in the
-//! server's time zone, each worded as the app's own Activity tab words it.
+//! server's time zone, which the tab names, each worded as the app's own Activity tab words it.
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -56,6 +56,16 @@ fn reached(row: &Access, at: String) -> Reached {
     Reached { said, action: row.action, role: row.role, refused: row.refused, link, from, at }
 }
 
+/// What a zone is called for a reader who may be in another: its name, or how far from UTC it is where it
+/// has none. A server that cannot tell its zone tells its times in UTC.
+fn called(zone: &TimeZone, now: Timestamp) -> String {
+    match zone.iana_name() {
+        Some("UTC" | "Etc/UTC" | "Etc/Unknown") => "UTC".to_owned(),
+        Some(name) => format!("{} time", name.replace('_', " ")),
+        None => format!("UTC{}", zone.to_offset(now)),
+    }
+}
+
 /// The tab for `rows`, which come newest first, at the time `now`. `older` says that they are not the
 /// newest, and `before` makes the address that lists the rows from before a time.
 pub fn listed(rows: &[Access], now: u64, older: bool, before: impl Fn(u64) -> String) -> Activity {
@@ -75,5 +85,6 @@ pub fn listed(rows: &[Access], now: u64, older: bool, before: impl Fn(u64) -> St
     }
     // A full page may not be all of it.
     let earlier = rows.last().filter(|_| rows.len() >= LISTED).map(|last| before(last.time));
-    Activity { days, kept: KEPT_DAYS, earlier, older }
+    let zone = called(&zone, Timestamp::from_second(now as i64).unwrap_or(Timestamp::UNIX_EPOCH));
+    Activity { days, kept: KEPT_DAYS, zone, earlier, older }
 }
