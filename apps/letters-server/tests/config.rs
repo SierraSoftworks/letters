@@ -56,7 +56,7 @@ fn the_clients_secret_is_read_from_the_settings_or_from_a_file() {
 #[test]
 fn settings_that_cannot_be_run_with_say_why() {
     // What is changed in sound settings, and a word the refusal must hold.
-    let cases: [(&str, &str, &str); 13] = [
+    let cases: [(&str, &str, &str); 14] = [
         ("name = \"Test\"", "name = \"Test\"\n[telemetry]\nserver = \"https://elsewhere.example\"", "server"),
         ("editors = [\"family\"]", "editor = [\"family\"]", "editor"),
         ("url = \"https://letters.example.test\"", "url = \"http://letters.example.test\"", "TLS"),
@@ -65,6 +65,7 @@ fn settings_that_cannot_be_run_with_say_why() {
         ("client_id = \"letters\"", "client_id = \"\"", "client_id"),
         ("client_id = \"letters\"", "client_id = \"letters\"\nscopes = [\"profile\"]", "openid"),
         ("name = \"Test\"", "name = \"Test\"\nproxies = [\"the proxy\"]", "proxies"),
+        ("name = \"Test\"", "name = \"Test\"\nlog = \"everything\"", "debug"),
         ("name = \"Family\"", "name = \"home\"", "two spaces"),
         ("name = \"Family\"", "name = \"!!\"", "letter"),
         ("path = '/srv/letters/family'", "path = \"family\"", "root"),

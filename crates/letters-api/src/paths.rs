@@ -11,6 +11,9 @@ pub const API: &str = "/api/v1";
 
 /// `GET`: a [`Server`](crate::Server). Needs no session.
 pub const SERVER: &str = "/api/v1/server";
+/// `GET`: 200 while the server can answer and 503 while its state cannot be read, for whatever watches
+/// that it runs. Needs no session, and tells nothing of the server.
+pub const HEALTH: &str = "/health";
 
 /// `GET`: the [`Person`](crate::Person) signed in.
 pub const SESSION: &str = "/api/v1/session";

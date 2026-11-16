@@ -20,11 +20,12 @@ use sha2::{Digest, Sha256};
 use crate::api::blocking;
 use crate::error::{Answer, Refusal};
 use crate::ids::{base64url, hashed, secret};
+use crate::logs::warn;
 use crate::oidc::{Sent, form};
 use crate::session::{self, Carrier, Signed};
 use crate::store::Table;
 use crate::telemetry::{Event, Through};
-use crate::{App, Shared, log, pages};
+use crate::{App, Shared, pages};
 
 /// How long a person has at the provider before the sign-in must be started again.
 const SIGN_IN_TIME: u64 = 10 * 60;
@@ -297,7 +298,7 @@ impl App {
         let pending = pending.filter(|pending| now < pending.expires).ok_or_else(stale)?;
         if let Some(error) = back.error {
             let said = back.error_description.unwrap_or_default();
-            log(&format!("the identity provider ended a sign-in with \"{error}\": {said}"));
+            warn(&format!("the identity provider ended a sign-in with \"{error}\": {said}"));
             return Err(Refusal::forbidden(match error.as_str() {
                 "access_denied" => "You were not signed in at the identity provider.",
                 _ => "The identity provider could not sign you in. Try again, or ask whoever runs this server.",

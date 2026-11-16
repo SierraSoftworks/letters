@@ -21,7 +21,7 @@ use ureq::tls::{RootCerts, TlsConfig};
 use crate::config::{Config, Oidc, local_or_secure};
 use crate::error::{Answer, Refusal};
 use crate::ids::{base64, base64url, secret};
-use crate::log;
+use crate::logs::warn;
 
 /// How long the provider's description of itself is taken as read.
 const DISCOVERY_LIFE: u64 = 60 * 60;
@@ -159,7 +159,7 @@ impl Provider {
                         }
                     }
                     Ok(_) => {
-                        log("the provider's userinfo was about another subject than its token, and was left unread")
+                        warn("the provider's userinfo was about another subject than its token, and was left unread")
                     }
                     Err(_) => {}
                 }
@@ -190,13 +190,13 @@ impl Provider {
         let discovery: Discovery = self.ask("discovery", self.agent.get(&address).call()).and_then(shaped)?;
         // A description of another issuer is no description of this one.
         if discovery.issuer.trim_end_matches('/') != issuer {
-            log(&format!("{address} describes the issuer \"{}\", not \"{issuer}\"", discovery.issuer));
+            warn(&format!("{address} describes the issuer \"{}\", not \"{issuer}\"", discovery.issuer));
             return Err(unreachable());
         }
         let mut endpoints = vec![&discovery.authorization_endpoint, &discovery.token_endpoint, &discovery.jwks_uri];
         endpoints.extend(&discovery.userinfo_endpoint);
         if let Some(open) = endpoints.into_iter().find(|endpoint| !local_or_secure(endpoint)) {
-            log(&format!("the provider names \"{open}\", which is without TLS"));
+            warn(&format!("the provider names \"{open}\", which is without TLS"));
             return Err(unreachable());
         }
         let keys = self.keys(&discovery)?;
@@ -248,7 +248,7 @@ impl Provider {
     /// Reads an ID token: signed by the provider, made for this client and this sign-in, and not run out.
     fn read(&self, mut known: Arc<Known>, token: &str, nonce: &str, now: u64) -> Answer<Map<String, Value>> {
         let refused = |why: &str| {
-            log(&format!("the provider's ID token was refused: {why}"));
+            warn(&format!("the provider's ID token was refused: {why}"));
             Refusal::new(Code::Upstream, "The identity provider's answer could not be trusted. Try to sign in again.")
         };
         let header = decode_header(token).map_err(|error| refused(&error.to_string()))?;
@@ -296,7 +296,7 @@ impl Provider {
     /// that the provider failed.
     fn ask(&self, what: &str, answer: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Answer<Value> {
         let failed = |why: String| {
-            log(&format!("the identity provider's {what} failed: {why}"));
+            warn(&format!("the identity provider's {what} failed: {why}"));
             unreachable()
         };
         let mut answer = answer.map_err(|error| failed(error.to_string()))?;
@@ -318,7 +318,7 @@ fn unreachable() -> Refusal {
 
 fn shaped<T: serde::de::DeserializeOwned>(value: Value) -> Answer<T> {
     serde_json::from_value(value).map_err(|error| {
-        log(&format!("the identity provider's answer is not what OpenID Connect lays down: {error}"));
+        warn(&format!("the identity provider's answer is not what OpenID Connect lays down: {error}"));
         unreachable()
     })
 }
@@ -331,7 +331,7 @@ fn object(value: Value) -> Answer<Map<String, Value>> {
 fn person(oidc: &Oidc, claims: &Map<String, Value>) -> Answer<(Person, Vec<String>)> {
     let text = |claim: &str| claims.get(claim).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty());
     let lacking = |claim: &str| {
-        log(&format!("the provider told no \"{claim}\" for someone who signed in"));
+        warn(&format!("the provider told no \"{claim}\" for someone who signed in"));
         Refusal::forbidden(format!(
             "The identity provider did not say your \"{claim}\", which this server knows people by. Ask whoever runs \
              this server."

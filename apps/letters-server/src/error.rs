@@ -82,7 +82,7 @@ impl From<io::Error> for Refusal {
                 Self::invalid("A folder cannot be moved to a space on another disk. Move its documents instead.")
             }
             _ => {
-                crate::log(&format!("a folder refused: {error}"));
+                crate::logs::warn(&format!("a folder refused: {error}"));
                 Self::new(Code::Unavailable, "The folder behind this space cannot be used just now.")
             }
         }
@@ -91,7 +91,7 @@ impl From<io::Error> for Refusal {
 
 impl From<StoreError> for Refusal {
     fn from(error: StoreError) -> Self {
-        crate::log(&error.to_string());
+        crate::logs::warn(&error.to_string());
         Self::new(Code::Internal, "The server could not read its own records.")
     }
 }
@@ -100,7 +100,7 @@ impl From<letters_format::Error> for Refusal {
     fn from(error: letters_format::Error) -> Self {
         match error {
             letters_format::Error::Files(why) => {
-                crate::log(&format!("a folder refused: {why}"));
+                crate::logs::warn(&format!("a folder refused: {why}"));
                 Self::new(Code::Unavailable, "The folder behind this space cannot be used just now.")
             }
             error => Self::new(Code::Invalid, format!("The file cannot be read as a document: {error}.")),

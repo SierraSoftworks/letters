@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use letters_server::config::{Config, ConfigError};
 use letters_server::store::Store;
-use letters_server::{App, log};
+use letters_server::{App, logs};
 
 const DEFAULT_CONFIG: &str = "/etc/letters/server.toml";
 
@@ -62,11 +62,15 @@ fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(listen).await?;
-        log(&format!("listening on {listen} as {}", app.config.server.url));
+        // Where it listens in fact, which the settings may leave to the system.
+        let listen = listener.local_addr()?;
+        logs::info(&format!("listening on {listen} as {}", app.config.server.url));
         #[cfg(not(panic = "unwind"))]
-        log("built so that a fault in one document stops the server: `--profile server` builds one that goes on");
+        logs::warn(
+            "built so that a fault in one document stops the server: `--profile server` builds one that goes on",
+        );
         letters_server::serve(app, listener, stopped()).await?;
-        log("stopped, with what was open saved");
+        logs::info("stopped, with what was open saved");
         Ok(())
     })
 }

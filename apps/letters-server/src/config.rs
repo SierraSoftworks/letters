@@ -46,6 +46,21 @@ pub struct Server {
     /// machine unless set, which is where `tailscale serve` stands. Nobody else is believed.
     #[serde(default = "default_proxies")]
     pub proxies: Vec<IpAddr>,
+    /// How much the log says: `"info"` unless set.
+    #[serde(default)]
+    pub log: Log,
+}
+
+/// How much the server's log says. See `logs.rs`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Log {
+    /// That the server started and stopped, and what went wrong.
+    #[default]
+    Info,
+    /// And a line for every request: its route, the answer's status and the time it took. Nothing of
+    /// who asked, and no id, link or name out of the address.
+    Debug,
 }
 
 #[derive(Clone, Debug, Deserialize)]

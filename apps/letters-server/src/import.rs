@@ -44,7 +44,7 @@ fn unread(error: &DocxError) -> &'static str {
         }
         DocxError::TooLarge(_) => " because it is too large to bring in",
         error => {
-            crate::log(&format!("a Word file could not be read: {error}"));
+            crate::logs::warn(&format!("a Word file could not be read: {error}"));
             " because it is damaged or is not a Word document"
         }
     }

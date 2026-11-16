@@ -31,10 +31,11 @@ use crate::access::Reach;
 use crate::api::{Found, blocking};
 use crate::error::{Answer, Refusal};
 use crate::ids;
+use crate::logs::warn;
 use crate::session::Signed;
 use crate::spaces::{Folder, Place, Root};
 use crate::store::Store;
-use crate::{App, Shared, log};
+use crate::{App, Shared};
 
 /// How many frames may wait for one socket. A device that falls this far behind is let go, and joins
 /// again for what it lacks.
@@ -87,7 +88,7 @@ fn home(root: &Root, place: &Place) -> String {
 /// A failure of the room's own, as a refusal. The journal and the folders are the server's to keep
 /// working, so none of it is the device's fault.
 fn failed(error: Error) -> Refusal {
-    log(&format!("a room failed: {error}"));
+    warn(&format!("a room failed: {error}"));
     Refusal::new(Code::Unavailable, "The server cannot keep what is written just now.")
 }
 
@@ -369,7 +370,7 @@ impl Rooms {
                     let to = key(&root, &place);
                     let moved = open.act(self, &mut state, |hosted, _| {
                         if let Err(error) = hosted.room.moved(&home(&root, &place), &mut hosted.state) {
-                            log(&format!("a room's journal could not be told of a move: {error}"));
+                            warn(&format!("a room's journal could not be told of a move: {error}"));
                         }
                         (hosted.root, hosted.place) = (root, place);
                         (hosted.parked, hosted.missing, hosted.hold) = (false, false, 0);
@@ -518,7 +519,7 @@ impl Rooms {
             // One journal's fault keeps no other from its file, nor the server from starting.
             let taken = catch_unwind(AssertUnwindSafe(|| self.take(app, &all, &folder.path(), &name)));
             if taken.is_err() {
-                log(&format!("the journal {name} failed as it was read, and is kept for the next start"));
+                warn(&format!("the journal {name} failed as it was read, and is kept for the next start"));
             }
         }
     }
@@ -540,7 +541,7 @@ impl Rooms {
         });
         let taken = found.is_some_and(|(root, place)| self.resume(app, root, &place, name));
         if !taken {
-            log(&format!("the journal {name} waits for its document, which was not found"));
+            warn(&format!("the journal {name} waits for its document, which was not found"));
             lock(&self.left).push((left.id, name.to_owned()));
         }
     }
@@ -554,7 +555,7 @@ impl Rooms {
         let mut hosted = match Hosted::open(self, root, place, Some(journal.to_owned()), now) {
             Ok(hosted) => hosted,
             Err(refusal) => {
-                log(&format!("the journal {journal} could not be taken to its file: {}", refusal.0.message));
+                warn(&format!("the journal {journal} could not be taken to its file: {}", refusal.0.message));
                 return false;
             }
         };
@@ -787,7 +788,7 @@ impl Hosted {
                 Some(folder)
             }
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                log(&format!("\"{name}\" cannot be saved while its folder cannot be reached: {error}"));
+                warn(&format!("\"{name}\" cannot be saved while its folder cannot be reached: {error}"));
                 self.hold = now + LOOK_EVERY;
                 None
             }
@@ -803,7 +804,7 @@ impl Hosted {
         let name = self.place.name().to_owned();
         match saved {
             Ok(Some(Saved::ConflictCopy { name: copy, cause })) => {
-                log(&format!("\"{name}\" could not be saved ({cause}), and what its room held went to \"{copy}\""));
+                warn(&format!("\"{name}\" could not be saved ({cause}), and what its room held went to \"{copy}\""));
                 self.parked = true;
                 // A file that is another document now, or one this build cannot write, is not the room's.
                 if matches!(cause, Error::OtherDocument(_) | Error::NewerFormat(_) | Error::Unmerged) {
@@ -817,7 +818,7 @@ impl Hosted {
                 wrote
             }
             Err(error) => {
-                log(&format!("\"{name}\" could not be saved, and is tried again: {error}"));
+                warn(&format!("\"{name}\" could not be saved, and is tried again: {error}"));
                 false
             }
         }
@@ -832,7 +833,7 @@ impl Hosted {
             self.hold = now + LOOK_EVERY;
             return;
         }
-        log(&format!("\"{name}\" is gone from its folder, and its room ends"));
+        warn(&format!("\"{name}\" is gone from its folder, and its room ends"));
         self.lost = true;
         self.end(Ended::Gone);
     }
@@ -849,7 +850,7 @@ impl Hosted {
     /// them hold whatever a device was told the server keeps.
     fn fail(self: Box<Self>, rooms: &Rooms) {
         let Self { room, journal, place, .. } = *self;
-        log(&format!("the room of \"{}\" failed and was closed: whoever had it open joins it anew", place.name()));
+        warn(&format!("the room of \"{}\" failed and was closed: whoever had it open joins it anew", place.name()));
         lock(&rooms.left).push((room.copy().id.clone(), journal));
         // Never dropped: a document that panicked inside Loro panics again as it is dropped.
         std::mem::forget(room);
@@ -947,13 +948,13 @@ impl Seat {
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    log(&format!("a room could not journal an edit, which waits for the next save: {error}"));
+                    warn(&format!("a room could not journal an edit, which waits for the next save: {error}"));
                 }
             }
             if hosted.room.unreadable(session) >= UNREADABLE {
                 let person = hosted.seats.get(&session).map_or("someone", |seated| seated.person.as_str());
                 let name = hosted.place.name();
-                log(&format!("{person} kept sending \"{name}\" what cannot be read, and their session was ended"));
+                warn(&format!("{person} kept sending \"{name}\" what cannot be read, and their session was ended"));
                 hosted.room.dismiss(session, Ended::Unreadable);
             }
         });

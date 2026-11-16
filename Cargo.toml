@@ -139,7 +139,7 @@ objc2-foundation = { version = "0.2", default-features = false, features = ["std
 objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSButton", "NSControl", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSToolbar", "NSView", "NSWindow"] }
 
 # The server. None of these may reach the core crates.
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query", "json", "form", "multipart"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query", "json", "form", "multipart", "matched-path"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
 # The state directory: one file, in Rust alone, with no server of its own.
 redb = "4"

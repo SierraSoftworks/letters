@@ -383,7 +383,7 @@ impl Library {
         let save = Save { name, token: &token, label: &label, attempts: 3 };
         // A copy beside the file holds the document as safely as the file would.
         match letters_format::save(&mut folder, &mut copy, &save)? {
-            Saved::ConflictCopy { name: beside, cause } => crate::log(&format!(
+            Saved::ConflictCopy { name: beside, cause } => crate::logs::warn(&format!(
                 "\"{name}\" could not be written ({cause}), and what was merged went to \"{beside}\""
             )),
             Saved::Written | Saved::Restored { .. } => wrote(store, root, place, &copy),

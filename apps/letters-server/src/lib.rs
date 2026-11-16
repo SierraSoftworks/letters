@@ -13,6 +13,7 @@
 //!   addresses that let in whoever holds one.
 //! - [`fetch`] is what the server fetches for a document from elsewhere: a linked picture, a link's page.
 //! - [`rooms`] are the documents that are open now, and [`socket`] is each device's line to one.
+//! - [`logs`] is what the server says of itself, on its standard error.
 //! - [`pages`] are the server's own pages for a browser: the documents a person reaches, one to read, and
 //!   one in the editor, which is compiled in when the server is built with it.
 //!
@@ -30,6 +31,7 @@ pub mod ids;
 pub mod import;
 pub mod library;
 pub mod links;
+pub mod logs;
 pub mod oidc;
 pub mod pages;
 pub mod rooms;
@@ -173,7 +175,7 @@ impl App {
                 match Root::open(&folder, false) {
                     Ok(root) => roots.push(Rooted { space, whose, root }),
                     Err(error) if whose.is_some() && error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => log(&format!("the space \"{}\" could not be opened: {error}", space.name)),
+                    Err(error) => logs::warn(&format!("the space \"{}\" could not be opened: {error}", space.name)),
                 }
             }
         }
@@ -190,7 +192,7 @@ impl App {
     pub fn scan(&self) {
         for Rooted { space, root, .. } in self.folders() {
             if let Err(refusal) = self.library.scan(&self.store, &root) {
-                log(&format!("the space \"{}\" could not be scanned: {}", space.name, refusal.0));
+                logs::warn(&format!("the space \"{}\" could not be scanned: {}", space.name, refusal.0));
             }
         }
     }
@@ -216,7 +218,7 @@ pub async fn serve(
     let stopped = async move {
         stop.await;
         if tokio::task::spawn_blocking(move || closing.rooms.close()).await.is_err() {
-            log("the open documents could not all be saved as the server stopped: their journals keep the rest");
+            logs::warn("the open documents could not all be saved as the server stopped: their journals keep the rest");
         }
     };
     // A frame that relays what someone typed is small, and is not held back to be sent with the next.
@@ -227,9 +229,4 @@ pub async fn serve(
     // Last, and briefly: everything is saved by now.
     reporting.telemetry.stop(std::time::Duration::from_secs(1)).await;
     served
-}
-
-/// Writes a line to the server's log, which is its standard error.
-pub fn log(line: &str) {
-    eprintln!("letters-server: {line}");
 }

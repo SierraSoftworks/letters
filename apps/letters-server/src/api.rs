@@ -23,6 +23,7 @@ use letters_model::{Document, ReplicaId};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::config::Log;
 use crate::error::{Answer, Refusal};
 use crate::ids;
 use crate::library::{Row, untitled};
@@ -44,6 +45,7 @@ pub fn routes() -> Router<Shared> {
     let limits = letters_api::Limits::default();
     Router::new()
         .route(paths::SERVER, get(server))
+        .route(paths::HEALTH, get(health))
         .route(paths::SESSION, get(session))
         .route(paths::RENEW, post(renew))
         .route(paths::SIGN_OUT, post(sign_out))
@@ -85,6 +87,14 @@ pub fn routes() -> Router<Shared> {
 pub async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Answer<T> + Send + 'static) -> Answer<T> {
     let failed = |_| Refusal::new(Code::Internal, "The server failed while answering.");
     tokio::task::spawn_blocking(work).await.map_err(failed)?
+}
+
+/// Whether the server runs, for a watcher: it does while its store answers.
+async fn health(State(app): State<Shared>) -> (StatusCode, &'static str) {
+    match tokio::task::spawn_blocking(move || app.store.answers()).await {
+        Ok(true) => (StatusCode::OK, "ok\n"),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "the state store does not answer\n"),
+    }
 }
 
 async fn server(State(app): State<Shared>) -> Json<Server> {
@@ -863,5 +873,11 @@ fn entry(row: &Row, role: Role) -> Entry {
 pub fn router(app: Arc<App>) -> Router {
     let routes = routes().merge(crate::shares::routes()).merge(crate::links::routes());
     let routes = routes.merge(crate::access::routes()).merge(crate::socket::routes());
-    routes.merge(crate::auth::routes()).merge(crate::pages::routes()).with_state(app)
+    let routes = routes.merge(crate::auth::routes()).merge(crate::pages::routes());
+    // Around every route, and around the answer where there is none.
+    let routes = match app.config.server.log {
+        Log::Debug => routes.layer(axum::middleware::from_fn(crate::logs::request)),
+        Log::Info => routes,
+    };
+    routes.with_state(app)
 }

@@ -19,12 +19,21 @@ use serde::de::DeserializeOwned;
 /// The store's file in the state directory.
 pub const FILE: &str = "letters.redb";
 
+/// How this build lays out what it keeps in the store. It goes up when a build writes what an earlier
+/// one would misread, and the store is marked with it.
+pub const FORMAT: u32 = 1;
+/// What the store says of itself: its [`FORMAT`], under [`MARK`].
+const ITSELF: Table<u32> = Table::new("store");
+const MARK: &str = "format";
+
 #[derive(Debug)]
 pub enum StoreError {
     /// The store could not be opened, read or written.
     Storage(String),
     /// A row is not what this build writes there.
     Row { table: &'static str, key: String, why: String },
+    /// A later build wrote the store, in a layout this one does not know.
+    Newer { format: u32 },
 }
 
 impl fmt::Display for StoreError {
@@ -32,6 +41,11 @@ impl fmt::Display for StoreError {
         match self {
             Self::Storage(why) => write!(f, "the state store failed: {why}"),
             Self::Row { table, key, why } => write!(f, "the row {key:?} of {table} cannot be read: {why}"),
+            Self::Newer { format } => write!(
+                f,
+                "the state store was written by a newer letters-server (its format is {format}, and this build \
+                 reads up to {FORMAT}): run that build, or this one with another state folder"
+            ),
         }
     }
 }
@@ -88,10 +102,23 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens the store in `folder`, which is made if it is not there.
+    /// Opens the store in `folder`, which is made if it is not there. One that a later build wrote is
+    /// refused, and left as it is: an older build would misread it, and write over what it misread.
     pub fn open(folder: &Path) -> Result<Self, StoreError> {
         std::fs::create_dir_all(folder)?;
-        Ok(Self { db: Arc::new(Database::create(folder.join(FILE))?) })
+        let store = Self { db: Arc::new(Database::create(folder.join(FILE))?) };
+        store.write(|batch| match batch.get(&ITSELF, MARK)? {
+            Some(format) if format > FORMAT => Err(StoreError::Newer { format }),
+            // An earlier layout is brought up to this one here, once there is one. A store from before
+            // the mark is laid out as the first.
+            _ => batch.put(&ITSELF, MARK, &FORMAT),
+        })?;
+        Ok(store)
+    }
+
+    /// Whether the store answers: its file can still be read.
+    pub fn answers(&self) -> bool {
+        self.get(&ITSELF, MARK).is_ok()
     }
 
     /// A store that is gone when it is dropped, for tests.

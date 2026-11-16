@@ -371,7 +371,7 @@ fn failed(error: Error) -> Failed {
         Error::Timeout(_) => Failed::Slow,
         Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => Failed::Slow,
         other => {
-            crate::log(&format!("a fetch failed: {other}"));
+            crate::logs::warn(&format!("a fetch failed: {other}"));
             Failed::Unreachable(other.to_string())
         }
     }

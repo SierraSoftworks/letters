@@ -182,7 +182,7 @@ impl App {
         };
         drop(noted);
         if let Err(error) = written {
-            crate::log(&format!("the access log could not be written: {error}"));
+            crate::logs::warn(&format!("the access log could not be written: {error}"));
         }
         self.sweep_log(now);
     }
