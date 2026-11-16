@@ -17,6 +17,9 @@ const CSS: &str = "text/css; charset=utf-8";
 const PNG: &str = "image/png";
 /// The rules of the server's own pages, on top of yewi's.
 const OWN: &str = include_str!("letters.css");
+/// The one script of the server's own, beside yewi's: a right click on a row of a file table opens the
+/// row's menu where the pointer is.
+const OWN_SCRIPT: &str = include_str!("letters.js");
 /// The icon in the tab and in a browser's own lists, drawn at 16, 32 and 48 pixels.
 pub const TAB_ICON: &str = "favicon.ico";
 /// The icon a home screen shows, which the system cuts to its own tile.
@@ -57,6 +60,7 @@ pub fn statics() -> &'static Statics {
             file("yewi.css", CSS, yewi::STYLESHEET.as_bytes()),
             file("yewi.js", "text/javascript; charset=utf-8", yewi::BEHAVIOURS.as_bytes()),
             file("letters.css", CSS, OWN.as_bytes()),
+            file("letters.js", "text/javascript; charset=utf-8", OWN_SCRIPT.as_bytes()),
             // The fonts of the pages themselves. The rules name each file beside them.
             file("fonts/fonts.css", CSS, yewi::fonts::RELATIVE_CSS.as_bytes()),
             file(TAB_ICON, "image/x-icon", include_bytes!("../../../../assets/icons/favicon.ico")),

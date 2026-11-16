@@ -15,6 +15,18 @@ a.lt-file__name:hover { text-decoration: underline; }
 .lt-file__more { inline-size: 1%; text-align: end; white-space: nowrap; }
 .lt-file__more form { display: none; }
 .lt-dim { color: var(--yi-fg-muted); font-size: var(--yi-text-sm); white-space: nowrap; }
+/* A row's menu opened by a right click: where the pointer is, which the script says, and no longer beside
+   its button. */
+.lt-context {
+  position-area: none;
+  position-try-fallbacks: none;
+  margin: 0;
+  max-block-size: calc(100vh - 8px);
+  overflow-y: auto;
+}
+/* The files that keep a folder out of the trash, each on a line of its own however long its path. */
+.lt-strays { margin: 0; padding-inline-start: var(--yi-space-lg); overflow-wrap: anywhere; }
+
 /* A sentence said in a dialog, which wraps where a table's cell does not. */
 .lt-note { margin: 0; color: var(--yi-fg-muted); font-size: var(--yi-text-sm); }
 

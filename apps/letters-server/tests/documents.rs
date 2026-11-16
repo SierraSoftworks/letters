@@ -780,3 +780,45 @@ async fn a_documents_picture_is_served_as_what_it_is() {
         assert_eq!(missing.status, StatusCode::NOT_FOUND, "{name}");
     }
 }
+
+/// A folder goes to the trash with documents and with what they were written out as beside them. Any
+/// other file keeps it where it is, and the refusal names the file.
+#[tokio::test]
+async fn a_folder_that_holds_files_that_are_no_documents_stays_out_of_the_trash() {
+    let server = Server::new("strays");
+    let ben = server.person("ben", &[]);
+    // Each folder with the files put in it besides the document "Plan", and the files that keep it.
+    let cases: [(&str, &[&str], &[&str]); 6] = [
+        ("Exports", &["Plan.pdf", "Plan.html", "Plan.DOCX", "Plan.md", ".DS_Store"], &[]),
+        ("Text", &["notes.txt"], &["notes.txt"]),
+        ("Other", &["Budget.pdf"], &["Budget.pdf"]),
+        ("Kinds", &["Plan.png"], &["Plan.png"]),
+        ("Deep", &["Old/Plan.pdf", "Old/scan.jpg"], &["Old/Plan.pdf", "Old/scan.jpg"]),
+        ("Many", &["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"], &["a.txt", "b.txt", "c.txt", "2 more"]),
+    ];
+    for (folder, files, keep) in cases {
+        let new = NewFolder { parent: String::new(), name: folder.into() };
+        ben.post::<Entry>(&paths::folders("home"), &new).await.expect("the folder is made");
+        ben.start("home", folder, "Plan").await;
+        let at = server.scratch.0.join("home/ben").join(folder);
+        for file in files {
+            std::fs::create_dir_all(at.join(file).parent().unwrap()).unwrap();
+            std::fs::write(at.join(file), b"kept").unwrap();
+        }
+        let thrown = ben.post::<()>(&paths::trash_folder("home", folder), &()).await;
+        let here = names(&listed(&ben, "home", "").await).contains(&folder);
+        match thrown {
+            Ok(()) => {
+                assert!(keep.is_empty() && !here, "{folder} went to the trash");
+                let trashed = server.scratch.names(&format!("home/ben/.letters-trash/{folder}"));
+                assert!(files.iter().all(|file| trashed.contains(&(*file).to_owned())), "{folder}: all of it went");
+            }
+            Err(refused) => {
+                assert!(here, "{folder} stays");
+                assert_eq!(refused.code, Code::Invalid, "{folder}");
+                assert!(keep.iter().all(|file| refused.message.contains(file)), "{folder}: {}", refused.message);
+                assert!(!keep.is_empty(), "{folder} was refused: {}", refused.message);
+            }
+        }
+    }
+}

@@ -567,6 +567,16 @@ impl Found {
     }
 }
 
+/// The first few of `names` as a sentence lists them, and how many more there are.
+pub fn some(names: &[String]) -> String {
+    const MOST: usize = 3;
+    let shown = names.iter().take(MOST).map(String::as_str).collect::<Vec<_>>().join(", ");
+    match names.len().saturating_sub(MOST) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
+}
+
 impl App {
     /// Where the document `id` is, for `who`: in a space they reach, or wherever a share leads them, or
     /// a link their browser was let in by. One that none of these leads to is not there for them.
@@ -799,13 +809,32 @@ impl App {
         self.entry(who, &space.told(role), &there, &at)
     }
 
+    /// The files in the folder at `path` in `space`, and in the folders below it, that keep it out of the
+    /// trash: each by its path from the folder. See [`trash_folder`](Self::trash_folder).
+    pub fn strays(&self, who: &Signed, space: &str, path: &str) -> Answer<Vec<String>> {
+        let (_, root, place) = self.folder_in(who, space, path)?;
+        Ok(root.folder(&place)?.strays()?)
+    }
+
     /// Moves the folder at `path` in `space` to the space's trash, with everything in it. Whoever has a
     /// document in it open is told that it is gone. A folder holds the work of everyone in its space, so
     /// only an owner of the space throws one away: whoever edits there renames and moves it.
+    ///
+    /// The trash is for documents. A folder that holds any other file stays, since Letters did not write
+    /// that file and shows it nowhere: but for a document written out in another format, which goes with
+    /// the document of its name beside it.
     pub fn trash_folder(&self, who: &Signed, space: &str, path: &str) -> Answer<()> {
         let (space, root, place) = self.folder_in(who, space, path)?;
         if space.role != Role::Owner {
             return Err(Refusal::forbidden("Only an owner of this space can move a folder to the trash."));
+        }
+        let strays = root.folder(&place)?.strays()?;
+        if !strays.is_empty() {
+            return Err(Refusal::invalid(format!(
+                "This folder cannot be moved to the trash because it holds files that are not Letters documents: \
+                 {}. Move them out of the folder first.",
+                some(&strays)
+            )));
         }
         let thrown = || self.library.trash(&self.store, &root, &place, self.now());
         self.rooms.moving((&root, &place), None, thrown)

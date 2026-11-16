@@ -9,7 +9,9 @@ use axum::routing::post;
 use letters_api::{Code, Grant, Grantee, Move, NewDocument, NewFolder, Role, paths};
 use serde::Deserialize;
 
-use super::{ACT_IMPORT, ACT_IMPORT_FILE, ACT_REVOKE, ACT_SHARE, ACT_UNSHARE, Visitor, asking, refusing, unmerged};
+use super::{
+    ACT_IMPORT, ACT_IMPORT_FILE, ACT_REVOKE, ACT_SHARE, ACT_UNSHARE, Visitor, asking, asking_folder, refusing, unmerged,
+};
 use super::{ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH, TRASH_PAGE};
 use crate::api::blocking;
 use crate::auth::local;
@@ -208,6 +210,10 @@ async fn relocate(State(app): State<Shared>, Visitor(who): Visitor, Form(about):
 async fn trash(State(app): State<Shared>, Visitor(who): Visitor, Form(about): Form<About>) -> Response {
     done(app, about.back(), move |app| {
         match about.id.is_empty() {
+            // A file put in the folder since the question was asked: the page says which, as it would have.
+            true if !app.strays(&who, &about.space, &about.folder)?.is_empty() => {
+                return Ok(asking_folder(&about.back(), "trash", &about.folder));
+            }
             true => app.trash_folder(&who, &about.space, &about.folder)?,
             false => app.trash(&who, &about.id)?,
         };
