@@ -111,6 +111,8 @@ pub const MESSAGE_SQUARE: Icon = Icon::new("M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0
 pub const MESSAGE_SQUARE_PLUS: Icon = Icon::new("M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2zM12 8v6M9 11h6");
 /// `minus`
 pub const MINUS: Icon = Icon::new("M5 12h14");
+/// `monitor`
+pub const MONITOR: Icon = Icon::new("M4 3h16a2 2 0 0 1 2 2v10a2 2 0 0 1 -2 2h-16a2 2 0 0 1 -2 -2v-10a2 2 0 0 1 2 -2zM8 21L16 21M12 17L12 21");
 /// `mouse-pointer-click`
 pub const MOUSE_POINTER_CLICK: Icon = Icon::new("M14 4.1 12 6M5.1 8l-2.9-.8M6 12l-1.9 2M7.2 2.2 8 5.1M9.037 9.69a.498.498 0 0 1 .653-.653l11 4.5a.5.5 0 0 1-.074.949l-4.349 1.041a1 1 0 0 0-.74.739l-1.04 4.35a.5.5 0 0 1-.95.074z");
 /// `palette`
