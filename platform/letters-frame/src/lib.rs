@@ -2,7 +2,8 @@
 //! holds nothing else.
 //!
 //! Besides the window calls it maps font files into memory ([`map_font`]), which is unsafe for any crate,
-//! and asks macOS to download files a sync app keeps in the cloud ([`fetch_cloud_files`]).
+//! asks macOS to download files a sync app keeps in the cloud ([`fetch_cloud_files`]), and gives the bare
+//! program its icon in the Dock ([`set_dock_icon`]).
 //!
 //! Every call is optional and is there on every system. Each says whether it worked, and where one did
 //! not the app runs as it would without this crate: square corners and no shadow of its own on Wayland, a
@@ -21,7 +22,7 @@ pub mod wayland;
 #[cfg(target_os = "macos")]
 pub use cloud::fetch_cloud_files;
 #[cfg(target_os = "macos")]
-pub use macos::{lights, name_process, unify_title_bar};
+pub use macos::{lights, name_process, set_dock_icon, unify_title_bar};
 pub use map::{Mapped, map_font};
 #[cfg(target_os = "macos")]
 pub use print::print_pdf;
@@ -30,6 +31,12 @@ pub use print::print_pdf;
 #[cfg(not(target_os = "macos"))]
 pub fn fetch_cloud_files() -> bool {
     true
+}
+
+/// Only macOS has a Dock whose icon a running app sets. Nothing is shown, and `false` says so.
+#[cfg(not(target_os = "macos"))]
+pub fn set_dock_icon(_png: &[u8]) -> bool {
+    false
 }
 
 /// Only macOS has the print sheet this asks for. Nothing is shown, and `false` says so.

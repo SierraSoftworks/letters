@@ -52,6 +52,8 @@ pollster.workspace = true
 # The runtime the reports are sent on, kept to the telemetry thread.
 tracing-batteries.workspace = true
 tokio.workspace = true
+update-rs.workspace = true
+semver.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda.workspace = true

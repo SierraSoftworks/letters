@@ -71,6 +71,7 @@ use crate::session::Session;
 use crate::settings;
 use crate::telemetry::{self, Page, Telemetry};
 use crate::trust::{self, Trusted};
+use crate::update;
 use crate::versions::Rests;
 use crate::words::{self, Words};
 use crate::workers::Workers;
@@ -116,6 +117,8 @@ pub enum Event {
     Faces(WindowId, Vec<Font>),
     /// What a window's first paint did not need has been read.
     Read(WindowId),
+    /// A newer release of Letters was found, and fetched where it can take this one's place.
+    Update(Box<update::Found>),
     /// The file at this path, which a window asked to be shown where it is kept, could not be shown.
     Unshown(WindowId, PathBuf),
     /// The folder of a window's document, whose file is at this path, was looked through for conflict
@@ -219,6 +222,8 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         reports: None,
         notice: false,
         page: None,
+        update: None,
+        updating: None,
         typing: match options.mode {
             Mode::TypingReport { keys } => Some(TypingRun { keys, stats: Typing::default(), typed: None, next: None }),
             _ => None,
@@ -432,6 +437,10 @@ struct App {
     notice: bool,
     /// The page last reported.
     page: Option<Page>,
+    /// A newer release that was found, which the windows have a notice of.
+    update: Option<update::Found>,
+    /// What the new version is started with once everything is saved, when the person asked for it.
+    updating: Option<Option<PathBuf>>,
     /// The typing report in progress, in that mode.
     typing: Option<TypingRun>,
     /// The stopwatch, until the first frame is on screen.
@@ -2729,6 +2738,7 @@ impl App {
                 Request::MergeConflictsOf { server, id: document, place } => {
                     self.browse(id, server, place, Some(document), now);
                 }
+                Request::NoticePressed(key) if key == update::KEY => self.take_update(event_loop, id),
                 Request::NoticePressed(key) => self.show_kept(id, &key),
                 Request::BrowseTrash { server } => self.browse_trash(id, server, None, now),
                 Request::PutBack { server, space, file } => self.browse_trash(id, server, Some((space, file)), now),
@@ -2927,6 +2937,24 @@ impl App {
         // A trusted folder vouches for what is in it, so a move can change how the document is treated.
         window.retrust(self.trust.trust(), &self.library);
         done
+    }
+
+    /// Does what the notice of a newer release offers: closes Letters to come back as the new version with
+    /// this window's document, or shows the release's page where Letters cannot replace itself.
+    fn take_update(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
+        match &self.update {
+            Some(found) if found.way == update::Way::Itself => {
+                let reopen = self.windows.get(&id).and_then(|window| window.place.path());
+                self.updating = Some(reopen.map(Path::to_path_buf));
+                // Everything is saved on the way out, and the new version is started after that.
+                event_loop.exit();
+            }
+            _ => {
+                if let Err(error) = links::open(update::PAGE) {
+                    eprintln!("letters: {} could not be opened: {error}", update::PAGE);
+                }
+            }
+        }
     }
 
     /// Shows the journal a notice of the window told of, where it is kept. The file manager is asked on
@@ -3930,6 +3958,11 @@ impl ApplicationHandler<Event> for App {
         if !std::mem::take(&mut self.starting) {
             return;
         }
+        // The Dock has the bundle's icon for an app started from it. The bare program hands over its own.
+        #[cfg(target_os = "macos")]
+        if !std::env::current_exe().is_ok_and(|program| update::bundled(&program)) {
+            letters_frame::set_dock_icon(include_bytes!("../../../assets/icons/png/app-512.png"));
+        }
         let opened = match self.reading.take().map(|reading| reading.join().expect("reading does not panic")) {
             Some(Ok(opened)) => Ok(Some(opened)),
             // The person reads the plain reason, and the command line the error as it was.
@@ -4040,6 +4073,16 @@ impl ApplicationHandler<Event> for App {
                         }
                         window.view.set_usage_reports(allowed);
                         window.view.set_usage_notice(self.notice);
+                    }
+                    // Nor whether there is a newer Letters, which GitHub is asked.
+                    if self.typing.is_none() && update::here() {
+                        let said = letters_trust::Store::read(&mut trust::Settings::of(&self.home));
+                        if update::allowed(&said.ok().flatten().unwrap_or_default()) {
+                            let proxy = self.proxy.clone();
+                            update::look(&self.home, move |found| {
+                                let _ = proxy.send_event(Event::Update(Box::new(found)));
+                            });
+                        }
                     }
                     // The desktop is asked over D-Bus, which is not worth holding a frame for.
                     let (proxy, folders) = (self.proxy.clone(), self.dictionaries.clone());
@@ -4311,6 +4354,13 @@ impl ApplicationHandler<Event> for App {
                 // The card asks for the next place once it has the spaces.
                 self.serve(event_loop, id, now);
             }
+            Event::Update(found) => {
+                for window in self.windows.values_mut() {
+                    window.view.notify(found.notice());
+                    window.sync(now);
+                }
+                self.update = Some(*found);
+            }
             Event::Unshown(id, kept) => {
                 if let Some(window) = self.windows.get(&id) {
                     window.alert(&format!("The file could not be shown. It is kept at {}.", journal::shown(&kept)));
@@ -4530,6 +4580,12 @@ impl ApplicationHandler<Event> for App {
         }
         // Last, and briefly: the person's work is safe by now, and a report is not worth their wait.
         std::mem::replace(&mut self.telemetry, Telemetry::off()).stop(Duration::from_millis(300));
+        // The new version takes this one's place as it ends, and opens what the person was in.
+        if let (Some(found), Some(reopen)) = (&self.update, self.updating.take())
+            && let Err(error) = found.install(reopen.as_deref())
+        {
+            eprintln!("letters: the new version could not be started: {error}");
+        }
     }
 
     /// Runs after each batch of events: starts due saves and sleeps until the next thing is due.

@@ -119,6 +119,10 @@ keyring-core = "1"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # Already in the tree through accesskit. Linux only: it asks the desktop for its settings.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+# Replaces the running program with a newer release from GitHub, by Sierra Softworks. It brings reqwest.
+update-rs = "0.4"
+# The versions update-rs compares releases by: the version it has.
+semver = "1"
 # The menu bar on macOS, by Tauri's authors: winit has none beyond its default. macOS only, so no GTK.
 muda = { version = "0.21", default-features = false }
 getrandom = "0.4"
@@ -138,7 +142,7 @@ memmap2 = "0.9"
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSData", "NSGeometry", "NSProcessInfo", "NSString", "NSThread"] }
-objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSButton", "NSControl", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSToolbar", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSApplication", "NSButton", "NSControl", "NSImage", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSToolbar", "NSView", "NSWindow"] }
 
 # The server. None of these may reach the core crates.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query", "json", "form", "multipart", "matched-path"] }
