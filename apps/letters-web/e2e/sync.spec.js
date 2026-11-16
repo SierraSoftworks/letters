@@ -62,6 +62,30 @@ test("two people with the document open read what the other writes, and see who 
   await expect(page.getByLabel("Grace Hopper")).not.toBeAttached();
 });
 
+test("who else wrote since the person's last visit is told when they come back, and what they wrote themselves is not", async ({ page, browser }) => {
+  const host = hosted();
+  const note = page.getByText(/^Edited by/);
+  await serve(page, opened(), undefined, undefined, host);
+  await page.keyboard.type("From Ada.");
+  await expect.poll(() => held(host)).toContain("From Ada.");
+  await page.goto("about:blank");
+  await serve(page, opened(), undefined, undefined, host);
+  await rested(page);
+  await expect(note).not.toBeAttached();
+  await page.goto("about:blank");
+
+  // Someone else writes meanwhile, in a browser of their own.
+  const theirs = await browser.newContext();
+  const other = await theirs.newPage();
+  await serve(other, opened({ author: "Grace Hopper" }), undefined, undefined, host);
+  await other.keyboard.type("From Grace.");
+  await expect.poll(() => held(host)).toContain("From Grace.");
+  await theirs.close();
+
+  await serve(page, opened(), undefined, undefined, host);
+  await expect(note).toHaveText("Edited by Grace Hopper");
+});
+
 const roles = [
   { role: "reader", does: "reads", said: "Reading" },
   { role: "commenter", does: "comments on", said: "Commenting" },

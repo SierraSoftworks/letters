@@ -156,6 +156,10 @@ const WORDS: &str = "letters.words";
 /// browser that has none has asked no account, and no word of it was told.
 const UNSENT: &str = "letters.words.unsent";
 
+/// Where this browser keeps what the person last saw of a server's document, under the document's id after
+/// this: the revision it read at, for the note of what others wrote since.
+const SEEN: &str = "letters.seen.";
+
 /// Where this browser keeps the person's default style, as a `style.json`, until an account keeps it.
 const STYLE: &str = "letters.style";
 
@@ -350,6 +354,18 @@ impl Browser {
     /// Whether an account was ever told this browser's words.
     fn told_an_account(&self) -> bool {
         self.storage.as_ref().is_some_and(|storage| matches!(storage.get_item(UNSENT), Ok(Some(_))))
+    }
+
+    /// The revision the document of this id read at when the person last had it open in this browser.
+    pub fn last_seen(&self, id: &str) -> Option<String> {
+        self.storage.as_ref()?.get_item(&format!("{SEEN}{id}")).ok().flatten()
+    }
+
+    /// Keeps `revision` as what the person last saw of the document of this id.
+    pub fn keep_last_seen(&self, id: &str, revision: &str) {
+        if let Some(storage) = &self.storage {
+            let _ = storage.set_item(&format!("{SEEN}{id}"), revision);
+        }
     }
 
     /// The `style.json` the person kept as their default in this browser, if they kept one.

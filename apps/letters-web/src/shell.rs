@@ -217,6 +217,10 @@ pub struct Shell {
     /// Whether the document's history is the server's, which comes with the first session. Until then
     /// the page shows the document it was sent, and the client is told nothing of it.
     attached: bool,
+    /// Whether the person's name is as they set it, or their server did not say what they set: the window
+    /// tells who else wrote by it. And whether the window was told what they last saw of the document.
+    named: bool,
+    seen: bool,
     /// How many pictures are on their way to the server. The edits that name them wait for them.
     uploading: u32,
     /// What the server lets this person do with the document. It says so with the page, and again with
@@ -407,6 +411,8 @@ impl Shell {
                 hung: None,
                 sockets: 0,
                 attached: false,
+                named: false,
+                seen: false,
                 uploading: 0,
                 role: Role::Editor,
                 access: Access::Edits,
@@ -548,6 +554,7 @@ impl Shell {
                 event.prevent_default();
             }
         })?;
+        hear(&shell, &window, "pagehide", |shell, _: Event| shell.keep_seen())?;
         // Another tab of the editor may have added to the person's words, kept another default style, or
         // changed their settings.
         hear(&shell, &window, "storage", |shell, _: Event| {
@@ -1367,6 +1374,9 @@ impl Shell {
         let connection = self.connection();
         self.stats.live = self.attached && connection == Some(Connection::Live);
         if state != self.save_state || connection != self.connection {
+            if state == SaveState::Saved && self.save_state != state {
+                self.keep_seen();
+            }
             self.save_state = state;
             self.view.set_save_state(state);
             self.connection.clone_from(&connection);
@@ -1998,11 +2008,15 @@ impl Shell {
         let asked = browser::ask(&self.window, "GET", paths::SETTINGS, None);
         let shell = self.me.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            // A server that does not say leaves the person with what this browser kept.
-            let Ok(settings) = asked.await.map(|answer| serde_json::from_slice(&answer)) else { return };
-            let (Ok(settings), Some(shell)) = (settings, shell.upgrade()) else { return };
+            let settings = asked.await.map(|answer| serde_json::from_slice(&answer));
+            let Some(shell) = shell.upgrade() else { return };
             let mut shell = shell.borrow_mut();
-            shell.take_settings(settings);
+            // A server that does not say leaves the person with what this browser kept.
+            if let Ok(Ok(settings)) = settings {
+                shell.take_settings(settings);
+            }
+            shell.named = true;
+            shell.say_seen();
             shell.arrived();
         });
         // A visitor has no sources of their own, and their settings then list none.
@@ -2288,7 +2302,27 @@ impl Shell {
             self.show_held(held);
         }
         self.attached = true;
+        self.say_seen();
         Ok(())
+    }
+
+    /// Tells the window what the person last saw of the document, once: when the server's history is the
+    /// document's and the person has their name, by which the window knows what others wrote since.
+    fn say_seen(&mut self) {
+        let ready = self.attached && self.named && !self.seen;
+        let Some(server) = self.server.as_ref().filter(|_| ready) else { return };
+        self.seen = true;
+        let seen = self.platform.last_seen(&server.id).and_then(|seen| seen.parse().ok());
+        self.view.set_last_seen(seen);
+    }
+
+    /// Keeps how the document reads now as what the person last saw of it: when the page goes, and when
+    /// what they wrote is the server's, so that a page that dies has lost little. Not before the window
+    /// was told what was kept the last time.
+    fn keep_seen(&self) {
+        if let Some(server) = self.server.as_ref().filter(|_| self.attached && self.seen) {
+            self.platform.keep_last_seen(&server.id, &self.view.editor().model().revision().to_string());
+        }
     }
 
     /// Tells the window what the person may do with the document: what their role allows, and nothing
