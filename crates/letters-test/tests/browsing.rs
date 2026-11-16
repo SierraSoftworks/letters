@@ -209,6 +209,31 @@ fn the_places_of_a_server_are_its_spaces_what_is_shared_and_what_was_open_lately
 }
 
 #[test]
+fn what_is_too_long_for_a_row_is_cut_short_inside_the_card() {
+    const LONG: &str = "Roof plan and every quote the roofers sent for the north slope and the gutters in March";
+    let mut window = signed_in(&[HOME]);
+    let people = vec!["Alice Moreau".into(), "Priya Nair".into(), "Chidi Obi".into()];
+    let tags = vec![Tag::Editing { people }, Tag::Shared { with: 2 }, Tag::Links { count: 2 }];
+    let busy = Entry { tags, ..document("sam", "Minutes of the residents' meeting.let", "d2", 0) };
+    open(&mut window, vec![document("sam", &format!("{LONG}.let"), "d1", 0), busy]);
+
+    let list = window.find(Role::ListBox, "Documents").expect("the list").bounds;
+    for name in [LONG, "Minutes of the residents' meeting"] {
+        let row = window.find(Role::ListBoxOption, name).expect("listed").bounds;
+        assert!(row.x + row.width <= list.x + list.width + 0.5, "{name}: {row:?} in {list:?}");
+    }
+    let card = window.find(Role::Dialog, "Open").expect("the card").bounds;
+    assert!(list.x + list.width < card.x + card.width, "the list is inside the card: {list:?} in {card:?}");
+
+    // So is the way to a folder with such a name, which ends in the button that starts a document there.
+    window.ui().set_listing(listing(HOME, within("sam", ""), vec![folder("sam", LONG)]));
+    window.click(Role::ListBoxOption, LONG);
+    window.ui().set_listing(listing(HOME, within("sam", LONG), Vec::new()));
+    let new = window.find(Role::Button, "New document").expect("a document can be started here").bounds;
+    assert!(new.x + new.width < card.x + card.width, "{new:?} in {card:?}");
+}
+
+#[test]
 fn a_document_that_is_pressed_is_opened_and_the_card_goes() {
     let mut window = signed_in(&[HOME]);
     let editing = Tag::Editing { people: vec!["Alice Moreau".into()] };
@@ -217,17 +242,27 @@ fn a_document_that_is_pressed_is_opened_and_the_card_goes() {
     let damaged = Entry { id: None, tags: vec![Tag::Damaged], ..document("sam", "Old notes.let", "", 0) };
     let copy = Tag::ConflictCopy { of: "Minutes.let".into() };
     let copy = Entry { tags: vec![copy], ..document("sam", "Minutes (conflict).let", "d4", 0) };
-    open(&mut window, vec![busy, copy, damaged]);
+    // Who else reaches a document, and what an import left to settle in it.
+    let reached = vec![Tag::ImportNotes { count: 3 }, Tag::Shared { with: 2 }, Tag::Links { count: 1 }];
+    let reached = Entry { tags: reached, ..document("sam", "Roof survey.let", "d5", 0) };
+    let unshared = Entry { tags: vec![Tag::Links { count: 0 }], ..document("sam", "Kitchen.let", "d6", 0) };
+    open(&mut window, vec![busy, copy, damaged, reached, unshared]);
     let about = |window: &mut Harness, name: &str| window.find(Role::ListBoxOption, name).expect("listed");
     // What a row says of its file, beside its name.
     let notes = [
         ("Minutes", "Alice Moreau editing"),
         ("Minutes (conflict)", "Conflict copy"),
         ("Old notes", "Could not be read"),
+        ("Roof survey", "3 import notes"),
+        ("Roof survey", "Shared with 2 others"),
+        ("Roof survey", "1 link"),
     ];
     for (name, note) in notes {
-        assert!(about(&mut window, name).description.unwrap_or_default().contains(note), "{name}");
+        let said = about(&mut window, name).description.unwrap_or_default();
+        assert!(said.split(", ").any(|part| part == note), "{name}: {said}");
     }
+    let said = about(&mut window, "Kitchen").description.unwrap_or_default();
+    assert!(!said.contains("link"), "no links are nothing to say: {said}");
     assert!(about(&mut window, "Old notes").disabled);
     window.click(Role::ListBoxOption, "Old notes");
     assert_eq!(window.ui().take_requests(), []);

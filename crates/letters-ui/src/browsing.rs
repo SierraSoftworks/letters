@@ -280,8 +280,10 @@ impl Browser {
 
     /// What the place that is looked at holds, under the way that leads to it.
     fn held(&self) -> Element<Message> {
+        // What is too long for a row is cut short there: the pane is as wide as the card leaves it.
         let pane = Element::column()
             .grow(1.0)
+            .shrink()
             .padding(Edges::all(tokens::SPACE_XS))
             .gap(tokens::SPACE_XS)
             .children(self.way());
@@ -315,6 +317,7 @@ impl Browser {
         });
         let list = Element::column()
             .grow(1.0)
+            .shrink()
             .role(Role::ListBox)
             .label("Documents")
             .arrows(Dir::Column)
@@ -356,7 +359,7 @@ impl Browser {
             let new = Button::new("New document").icon(icon::PLUS).small().on_press(send(Browsing::New));
             way = way.child(Element::row().grow(1.0)).child(Element::from(new).description(format!("In {here}")));
         }
-        Some(way.height(tokens::CONTROL_HEIGHT_SM))
+        Some(way.shrink().height(tokens::CONTROL_HEIGHT_SM))
     }
 
     /// One folder or document of the place. A folder is gone into, a document is opened, and a file that
@@ -377,11 +380,13 @@ impl Browser {
         let about: Vec<&str> = [Some(kind), noted.as_deref(), when.as_deref()].into_iter().flatten().collect();
         let mark = if folder { icon::FOLDER } else { icon::FILE_TEXT };
         let key = format!("{}/{}/{}", entry.space.as_deref().unwrap_or_default(), entry.path, entry.name);
+        // The note has the room the name and the day leave, and is cut short in it: the name is what a
+        // document is found by.
+        let noted = noted.as_deref().map(|noted| Element::text(noted, quiet()).fg(tokens::FG_MUTED).shrink());
         let row = option(mark, &entry.name, false)
             .key(key.as_str())
             .description(about.join(", "))
-            .children(noted.as_deref().map(|noted| Element::text(noted, quiet()).fg(tokens::FG_MUTED).shrink()))
-            .child(Element::row().grow(1.0))
+            .child(Element::row().width(0.0).grow(1.0).clip().children(noted))
             .children(when.as_deref().map(|when| Element::text(when, quiet()).fg(tokens::FG_MUTED)));
         match does {
             Some(does) => row.on_press(send(does)),
@@ -411,14 +416,23 @@ fn option(mark: Icon, name: &str, chosen: bool) -> Element<Message> {
         .child(Element::text(name, TextStyle::control().weight(weight)).shrink())
 }
 
-/// What a file table marks an entry with, in a few words: who writes in it now, and what is wrong with it.
+/// What a file table marks an entry with, in a few words: who writes in it now, who else reaches it, and
+/// what is wrong with it.
 fn notes(tags: &[Tag]) -> Option<String> {
+    let counted = |count: u32, one: &str, many: &str| match count {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        _ => Some(format!("{count} {many}")),
+    };
     let said: Vec<String> = tags
         .iter()
         .filter_map(|tag| match tag {
             Tag::Editing { people } if !people.is_empty() => Some(format!("{} editing", people.join(", "))),
             Tag::ConflictCopy { .. } => Some("Conflict copy".to_owned()),
             Tag::Damaged => Some("Could not be read".to_owned()),
+            Tag::ImportNotes { count } => counted(*count, "import note", "import notes"),
+            Tag::Shared { with } => counted(*with, "other", "others").map(|others| format!("Shared with {others}")),
+            Tag::Links { count } => counted(*count, "link", "links"),
             _ => None,
         })
         .collect();
