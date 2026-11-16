@@ -1190,6 +1190,31 @@ impl Ui<EditorApp> {
         self.app_mut().editor.document_at(revision).ok()
     }
 
+    /// The key that does the command the palette lists under `name` (see [`crate::command_names`]), for a
+    /// shell whose own menus write it beside the command. `None` for a command without one.
+    pub fn command_key(&self, name: &str) -> Option<KeyEvent> {
+        let app = self.app();
+        commands::key(&commands::named(name)?.act, app.editor.keymap(), app.mac).cloned()
+    }
+
+    /// Whether the command the palette lists under `name` has something to act on now: the palette lists
+    /// it then, and a shell's own menu offers it.
+    pub fn offers(&self, name: &str) -> bool {
+        commands::named(name).is_some_and(|entry| self.app().asked(&entry.act).is_some())
+    }
+
+    /// Does the command the palette lists under `name`, as taking it from the palette does, for a shell
+    /// with menus of its own. Returns whether it had something to act on.
+    pub fn run_command(&mut self, name: &str, platform: &mut dyn Platform) -> bool {
+        let Some(message) = commands::named(name).and_then(|entry| self.app().asked(&entry.act)) else {
+            return false;
+        };
+        let app = self.app_mut();
+        app.commands.close();
+        app.update(message, platform);
+        true
+    }
+
     /// Runs something on the editor from outside, such as taking in another writer's edits, and brings the
     /// page up to date with what it changed. The page stays where it is scrolled to.
     pub fn change<E>(&mut self, act: impl FnOnce(&mut Editor) -> Result<Change, E>) -> Result<(), E> {
