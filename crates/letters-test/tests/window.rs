@@ -8,7 +8,7 @@ use letters_render::{Color, Item, PathEl, Point, Rect};
 use letters_test::{Harness, Role, WINDOW};
 use letters_ui::{
     Chrome, Cursor, Edge, Folder, Frame, Landing, Location, Mode, PictureState, Recent, Request, SafeMode, SaveState,
-    Settings, WindowButton,
+    Settings, TrustedSource, WindowButton,
 };
 
 fn text(id: &str, kind: BlockKind, text: &str) -> Block {
@@ -2951,6 +2951,37 @@ fn a_linked_picture_is_told_to_the_shell_once_and_drawn_when_the_shell_hands_it_
     window.ui().set_image(LINK, None);
     assert_eq!(drawn(&mut window), [""; 0], "and is a link again when it is taken away");
     assert_eq!(window.ui().take_requests(), []);
+}
+
+#[test]
+fn a_source_the_shell_comes_to_trust_has_the_pictures_that_do_not_show_asked_for_again() {
+    let source = |source: &str| TrustedSource { source: source.into(), fixed: false };
+    let (mine, new) = (source("https://img.example.org/"), source("https://example.com/"));
+    // Whether the picture shows, the list a shell says after its first, and whether the picture is asked for.
+    let cases = [
+        (false, vec![mine.clone(), new.clone()], true),
+        (true, vec![mine.clone(), new.clone()], false),
+        (false, vec![mine.clone()], false),
+        (false, vec![], false),
+    ];
+    for (loaded, sources, asked) in cases {
+        let (mut window, ..) = linked(loaded);
+        // The first list is no news: the picture was asked for when the document opened.
+        window.ui().set_trusted_sources(vec![mine.clone()]);
+        assert_eq!(window.ui().take_requests(), [], "shows: {loaded}, the first list");
+        window.ui().set_trusted_sources(sources.clone());
+        let again = if asked { vec![Request::LinkedPicture(LINK.into())] } else { vec![] };
+        assert_eq!(window.ui().take_requests(), again, "shows: {loaded}, {sources:?}");
+    }
+
+    // The source may not be the picture's: what the shell held back is held until it says otherwise.
+    let (mut window, _, cloud) = linked(false);
+    window.ui().set_picture_state(LINK, Some(PictureState::Held));
+    window.ui().set_trusted_sources(vec![mine.clone()]);
+    window.ui().set_trusted_sources(vec![mine, new]);
+    let far = spot(&mut window, "p1", 2);
+    window.hover_at(Point { x: far.x, y: far.y + 2.0 });
+    assert!(chip(&mut window, cloud), "the list does not free a picture");
 }
 
 #[test]

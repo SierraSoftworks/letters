@@ -63,12 +63,14 @@ pub(crate) struct Kept {
 
 impl Kept {
     /// Takes the sources the shell trusts now. That answers a source the person asked for, whose field
-    /// empties.
-    pub fn set_sources(&mut self, sources: Vec<TrustedSource>) {
+    /// empties. Returns whether one of them is new to a list that was said before.
+    pub fn set_sources(&mut self, sources: Vec<TrustedSource>) -> bool {
         if std::mem::take(&mut self.asked) {
             self.typed.clear();
         }
-        self.sources = Some(sources);
+        let before = self.sources.replace(sources);
+        let now = self.sources.iter().flatten();
+        before.is_some_and(|before| now.into_iter().any(|source| !before.contains(source)))
     }
 
     /// The shell does not trust the source that was asked for. What was typed stays, to be mended.

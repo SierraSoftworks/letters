@@ -898,9 +898,13 @@ impl Ui<EditorApp> {
     /// Says which sources linked pictures load from when a trusted document opens, the person's and an
     /// administrator's, at the start and whenever that changes. The Settings dialog then lists them, asks
     /// [`Request::ForgetSource`] for one of the person's to go and [`Request::TrustSource`] for another,
-    /// which this call also answers.
+    /// which this call also answers. A source that is new to the list may be where a picture of the page
+    /// is linked from, so the window then asks for every linked picture not yet showing with
+    /// [`Request::LinkedPicture`] again.
     pub fn set_trusted_sources(&mut self, sources: Vec<TrustedSource>) {
-        self.app_mut().dialog.kept.set_sources(sources);
+        if self.app_mut().dialog.kept.set_sources(sources) {
+            self.app_mut().ask_again(false);
+        }
     }
 
     /// Says why the source a [`Request::TrustSource`] asked for is not trusted, in a sentence. The dialog
