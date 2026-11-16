@@ -144,7 +144,8 @@ pub enum Command {
     LeaveFormula,
     /// A line break that stays inside the block.
     LineBreak,
-    /// Nests list items one level deeper, or steps a line of code in.
+    /// Nests list items one level deeper, or steps code in: at a caret, or every line a selection takes in.
+    /// Other text has no level and is left as it is.
     Indent,
     Outdent,
     /// Flips a mark on the selection, or on the text typed next at a caret.
@@ -776,8 +777,13 @@ impl Editor {
         let kind = self.doc().block(&caret.selection.head.block).map(|block| &block.kind);
         match command {
             Command::Indent | Command::Outdent => {
-                matches!(kind, Some(BlockKind::ListItem { .. } | BlockKind::Code { .. }))
-                    || self.grid(&caret.selection.head.block).is_some()
+                // Lists nest and code steps in. No other text has a level, as Markdown gives it none.
+                let steps = |kind: Option<&BlockKind>| {
+                    matches!(kind, Some(BlockKind::ListItem { .. } | BlockKind::Code { .. }))
+                };
+                let doc = self.doc();
+                let among = || self.touched(&caret.selection).iter().any(|id| steps(doc.block(id).map(|b| &b.kind)));
+                steps(kind) || self.grid(&caret.selection.head.block).is_some() || (ranged && among())
             }
             Command::ToggleChecked => {
                 matches!(kind, Some(BlockKind::ListItem { list: ListKind::Task { .. }, .. }))

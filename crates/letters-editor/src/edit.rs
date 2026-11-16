@@ -13,6 +13,26 @@ const MAX_DEPTH: u8 = 8;
 /// What Tab steps a line of code in by.
 const CODE_INDENT: &str = "    ";
 
+/// The lines of code that `range` selects and that a step in or out changes: where each starts, and how
+/// many spaces it gains or loses. A line the range only reaches the start of is not selected, and an empty
+/// line gains nothing.
+fn code_lines(text: &str, range: Range<usize>, deeper: bool) -> Vec<(usize, usize)> {
+    let mut lines = Vec::new();
+    let mut line = text::line_start(text, range.start);
+    while line <= range.end && !(line == range.end && line > range.start) {
+        let end = text::line_end(text, line);
+        let spaces = match deeper {
+            true => CODE_INDENT.len() * usize::from(end > line),
+            false => text[line..].bytes().take(CODE_INDENT.len()).take_while(|byte| *byte == b' ').count(),
+        };
+        if spaces > 0 {
+            lines.push((line, spaces));
+        }
+        line = end + 1;
+    }
+    lines
+}
+
 impl Editor {
     /// Replaces the selection with `text` in the caret's marks, and leaves the caret after it.
     pub(crate) fn insert(&mut self, text: &str) {
@@ -655,7 +675,10 @@ impl Editor {
         }
         let doc = self.doc();
         let Some(block) = doc.block(&head.block) else { return };
-        if text::is_source(block) {
+        let (start, end) = self.ordered(&caret.selection);
+        // A selection over several lines steps each of them. One within a line is typed over.
+        let lines = start.block != end.block || block.plain_text()[start.offset..end.offset].contains('\n');
+        if text::is_source(block) && !lines {
             if deeper {
                 return self.insert(CODE_INDENT);
             }
@@ -672,7 +695,28 @@ impl Editor {
         let selected: BTreeSet<BlockId> = self.touched(&caret.selection);
         let mut depths: BTreeMap<BlockId, u8> = BTreeMap::new();
         let mut ops = Vec::new();
+        let mut selection = caret.selection.clone();
         for block in tree::texts(doc).into_iter().filter(|block| selected.contains(&block.id)) {
+            if matches!(block.kind, BlockKind::Code { .. }) {
+                let text = block.plain_text();
+                let from = if block.id == start.block { start.offset } else { 0 };
+                let to = if block.id == end.block { end.offset } else { text.len() };
+                // Last line first, so that the offsets of the lines before it hold.
+                for (line, spaces) in code_lines(&text, from..to, deeper).into_iter().rev() {
+                    for pos in [&mut selection.anchor, &mut selection.head] {
+                        if pos.block == block.id && pos.offset > line {
+                            pos.offset =
+                                if deeper { pos.offset + spaces } else { pos.offset - spaces.min(pos.offset - line) };
+                        }
+                    }
+                    ops.push(if deeper {
+                        Op::InsertText { at: Pos::new(block.id.clone(), line), text: CODE_INDENT.into() }
+                    } else {
+                        Op::DeleteText { block: block.id.clone(), range: line..line + spaces }
+                    });
+                }
+                continue;
+            }
             let BlockKind::ListItem { list, depth } = &block.kind else { continue };
             let to = if deeper {
                 // An item nests at most one level below the item before it.
@@ -695,11 +739,13 @@ impl Editor {
                 ops.push(Op::SetKind { block: block.id.clone(), kind });
             }
         }
-        self.apply(ops);
+        if self.apply(ops) {
+            self.set_selection(selection);
+        }
     }
 
     /// The text blocks a selection touches, including one that only holds a caret.
-    fn touched(&self, selection: &Selection) -> BTreeSet<BlockId> {
+    pub(crate) fn touched(&self, selection: &Selection) -> BTreeSet<BlockId> {
         let (start, end) = self.ordered(selection);
         let texts = tree::texts(self.doc());
         let index = |pos: &Pos| texts.iter().position(|block| block.id == pos.block);
