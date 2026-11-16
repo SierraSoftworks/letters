@@ -25,7 +25,8 @@ cargo run --quiet -p letters-web --example page -- www/index.html > dist/index.h
 cp www/start.js dist/
 # The word lists of Thai, Lao, Khmer and Burmese, which a document in one of them fetches.
 cargo run --quiet -p letters-web --example words -- dist/words
-cp ../../assets/icons/favicon.ico dist/
+# The icons of the tab, of a home screen, and the list that names them.
+cp ../../assets/icons/favicon.ico ../../assets/icons/web/* dist/
 # What the editor fetches beside the wasm, each with its licence.
 for files in fonts:letters-fonts/fonts maths:letters-math/fonts dictionaries:letters-spell/dictionaries; do
   mkdir "dist/${files%%:*}"

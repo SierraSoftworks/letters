@@ -468,6 +468,26 @@ async fn a_page_loads_only_the_servers_own_files() {
     let text = raw.text();
     let named: Vec<&str> = text.split('"').filter(|part| part.starts_with("/static/")).collect();
     assert!(named.iter().any(|file| file.ends_with(".css")) && named.iter().any(|file| file.ends_with(".js")));
+    assert!(named.iter().any(|file| file.ends_with(".svg")), "the bar shows the icon");
+    // The page has the icon of its tab and of a home screen, and the list of the icons a browser may show.
+    assert!(policy.contains("manifest-src 'self'"), "{policy}");
+    let linked = |rel: &str| {
+        let link = text.split('<').find(|tag| tag.starts_with(&format!("link rel=\"{rel}\"")));
+        link.and_then(|link| link.split('"').find(|part| part.starts_with("/static/")))
+            .unwrap_or_else(|| panic!("{rel}"))
+    };
+    for (rel, kind) in [("icon", "image/x-icon"), ("apple-touch-icon", "image/png")] {
+        assert_eq!(server.visitor().get(linked(rel)).await.header("content-type"), kind, "{rel}");
+    }
+    let manifest = linked("manifest");
+    let list: serde_json::Value = serde_json::from_slice(&server.visitor().get(manifest).await.body).unwrap();
+    let icons = list["icons"].as_array().expect("the list names icons");
+    assert!(!icons.is_empty());
+    for icon in icons {
+        let file =
+            manifest.rsplit_once('/').map(|(folder, _)| format!("{folder}/{}", icon["src"].as_str().unwrap())).unwrap();
+        assert_eq!(server.visitor().get(&file).await.header("content-type"), "image/png", "{file}");
+    }
     for file in named {
         let raw = server.visitor().get(file).await;
         assert_eq!(raw.status, StatusCode::OK, "{file}");

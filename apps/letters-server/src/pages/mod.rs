@@ -43,7 +43,7 @@ use crate::shares::may_share;
 use crate::spaces::Place;
 use crate::{App, Shared};
 
-use self::statics::statics;
+use self::statics::{MANIFEST, TAB_ICON, TOUCH_ICON, statics};
 use self::view::{Ask, At, Body, Card, Folder, Linked, Page, Root, RootProps, Row, Target, Trashed};
 
 /// A page: the documents the person opened lately.
@@ -145,12 +145,15 @@ async fn send(status: StatusCode, title: &str, page: Page, beyond: Option<&str>)
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light dark\"><title>{} · {server}</title>\
          <link rel=\"stylesheet\" href=\"{base}/fonts/fonts.css\"><link rel=\"stylesheet\" href=\"{base}/yewi.css\">\
-         <link rel=\"stylesheet\" href=\"{base}/letters.css\"></head><body>{body}</body></html>",
+         <link rel=\"stylesheet\" href=\"{base}/letters.css\">\
+         <link rel=\"icon\" href=\"{base}/{TAB_ICON}\" sizes=\"any\">\
+         <link rel=\"apple-touch-icon\" href=\"{base}/{TOUCH_ICON}\">\
+         <link rel=\"manifest\" href=\"{base}/{MANIFEST}\"></head><body>{body}</body></html>",
         escape(title)
     );
     let policy = format!(
         "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'; \
-         img-src 'self' data:; form-action 'self'{}{}; base-uri 'none'; frame-ancestors 'none'",
+         img-src 'self' data:; manifest-src 'self'; form-action 'self'{}{}; base-uri 'none'; frame-ancestors 'none'",
         if beyond.is_some() { " " } else { "" },
         beyond.unwrap_or_default()
     );

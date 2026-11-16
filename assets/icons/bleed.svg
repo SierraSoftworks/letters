@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- The app icon with no tile of its own, for a system that cuts the tile itself: a phone's home screen. -->
+  <rect width="512" height="512" fill="#fff"/>
+  <rect y="200" width="512" height="112" fill="#cfe5ff"/>
+  <rect x="128" y="118" width="256" height="40" rx="20" fill="#c5cfdc"/>
+  <rect x="128" y="236" width="208" height="40" rx="20" fill="#1b66d1"/>
+  <rect x="348" y="212" width="16" height="88" rx="8" fill="#15171a"/>
+  <rect x="128" y="354" width="256" height="40" rx="20" fill="#c5cfdc"/>
+</svg>

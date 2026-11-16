@@ -7,6 +7,7 @@ use letters_api::{self as api, EntryKind, Person, SpaceKind, paths};
 use yew::prelude::*;
 use yewi::prelude::*;
 
+use super::statics::LOGO;
 use super::{
     ACT_IMPORT, ACT_IMPORT_FILE, ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME,
     ACT_TRASH,
@@ -187,8 +188,9 @@ pub fn Root(props: &RootProps) -> Html {
 }
 
 fn brand(page: &Page) -> Html {
+    let logo = html! { <img src={format!("{}/{LOGO}", page.statics)} alt="" /> };
     html! {
-        <AppBarBrand href={paths::HOME_PAGE} logo={html! { <Icon icon={icons::PEN_LINE} /> }}>
+        <AppBarBrand href={paths::HOME_PAGE} {logo}>
             { page.server.clone() }
         </AppBarBrand>
     }
