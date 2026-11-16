@@ -63,7 +63,7 @@ use crate::platform::{self, Desktop};
 use crate::present::{Painter, Presenter};
 use crate::printing;
 use crate::remote::{self, Roots};
-use crate::seen::Seen;
+use crate::seen::{Seen, Telling};
 use crate::server::Client;
 use crate::servers;
 use crate::session::Session;
@@ -458,7 +458,7 @@ struct App {
     /// The copies being written, which the app waits for before it ends.
     copies: Vec<JoinHandle<()>>,
     /// The tellings of what was seen that closed windows left on their way to their servers.
-    parting: Vec<JoinHandle<()>>,
+    parting: Vec<JoinHandle<bool>>,
     /// Looks among the system's fonts for what the bundled ones cannot draw, once a window shows any.
     fonts: Finder<WindowId>,
     mods: ModifiersState,
@@ -695,10 +695,8 @@ struct DocWindow {
     /// Where what the person saw of each document is kept, and what was last kept there of this one.
     seen: Seen,
     marked: Option<Revision>,
-    /// What the account of a server's document was last told the person saw, and the telling that is on
-    /// its way. One at a time: a later save tells what an earlier one could not.
-    told_seen: Option<Revision>,
-    telling: Option<JoinHandle<()>>,
+    /// What the account of a server's document is told the person saw.
+    telling: Telling,
     /// What the person last saw of the document, until the window is told.
     last_seen: Option<Revision>,
     /// Whether the window was told by the copy on this device, the document's server being out of reach.
@@ -1083,32 +1081,31 @@ impl DocWindow {
 
     /// Keeps what the person has seen of the document, which is all the window shows of it, for the note
     /// of what others wrote when it is next opened. Kept at each save, so that a crash loses little.
-    fn saw(&mut self) {
+    fn saw(&mut self, closing: bool) {
         let Some(id) = self.id.as_deref().filter(|_| self.keeps && self.file().is_some()) else { return };
         let revision = self.view.editor().model().revision();
         if self.marked.as_ref() != Some(&revision) {
             self.seen.saw(id, &revision);
             self.marked = Some(revision.clone());
         }
-        // The account of a server's document is told too, for the person's other devices, off this thread.
-        let waits = self.telling.as_ref().is_some_and(|telling| !telling.is_finished());
-        if let Some(remote) = self.remote.as_ref().filter(|_| !waits && self.told_seen.as_ref() != Some(&revision)) {
-            let (session, id, seen) = (remote.line.session().clone(), remote.opened.id.clone(), revision.to_string());
-            self.telling = Some(thread::spawn(move || {
-                // A server that cannot be told now is told at a later save, or by another visit.
-                if let Err(refused) = session.saw(&id, &seen) {
+        // The account of a server's document is told too, for the person's other devices.
+        if let Some(remote) = &self.remote {
+            let (session, id) = (remote.line.session().clone(), remote.opened.id.clone());
+            self.telling.tell(&revision, closing, move |seen| {
+                let told = session.saw(&id, &seen);
+                if let Err(refused) = &told {
                     eprintln!("letters: the server was not told what was seen of a document: {refused}");
                 }
-            }));
-            self.told_seen = Some(revision);
+                told.is_ok()
+            });
         }
     }
 
     /// Lets the journal go as the window closes with everything saved. A document that was never worth
     /// a file is not worth bringing back either. Returns the telling of what was seen that is still on
     /// its way to a server, which the app gives a moment before it ends.
-    fn leave(&mut self) -> Option<JoinHandle<()>> {
-        self.saw();
+    fn leave(&mut self) -> Option<JoinHandle<bool>> {
+        self.saw(true);
         if let Some(remote) = &mut self.remote {
             remote.line.stop();
         }
@@ -1117,7 +1114,7 @@ impl DocWindow {
         {
             journal.forget();
         }
-        self.telling.take()
+        self.telling.leave()
     }
 
     /// The top bar says whether the document is saved. The title adds what the bar has no word for: a
@@ -1713,8 +1710,9 @@ impl DocWindow {
                     // The account of a server's document knows what its person saw on any device. This
                     // device's own word serves a file, and a server that said nothing.
                     let said = self.remote.as_ref().and_then(|remote| remote.opened.last_seen.as_deref());
-                    self.told_seen = said.and_then(|said| said.parse().ok());
-                    self.last_seen = self.told_seen.clone().or_else(|| self.seen.last(&copy.id));
+                    let said: Option<Revision> = said.and_then(|said| said.parse().ok());
+                    self.last_seen = said.clone().or_else(|| self.seen.last(&copy.id));
+                    self.telling = Telling::after(said);
                     self.say_seen(false);
                 }
                 // What the file held is where the last session ended, should this one write anything.
@@ -2119,7 +2117,7 @@ impl DocWindow {
             self.retitle();
             self.view.set_merged(names);
         }
-        self.saw();
+        self.saw(false);
     }
 
     /// Saves to `home` on this thread, with the copy the window keeps for it.
@@ -2303,8 +2301,7 @@ impl App {
             save_failed: false,
             seen: self.seen.clone(),
             marked: None,
-            told_seen: None,
-            telling: None,
+            telling: Telling::default(),
             last_seen: None,
             seen_offline: false,
             named: self.named,

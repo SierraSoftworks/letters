@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread::{self, JoinHandle};
 
 use letters_model::Revision;
 use serde_json::{Value, json};
@@ -62,5 +63,66 @@ impl Seen {
         if let Err(error) = written {
             eprintln!("letters: could not remember what was seen of a document: {error}");
         }
+    }
+}
+
+/// Tells a server what its person last saw of a document, off the caller's thread and one telling at a
+/// time, so that their account has it for the next device they open the document on.
+#[derive(Debug, Default)]
+pub struct Telling {
+    /// What was last sent, whether it arrived or not.
+    sent: Option<Revision>,
+    /// The telling that is on its way, which ends with whether the server took it.
+    last: Option<JoinHandle<bool>>,
+    /// Whether the server did not take what was last sent, and whether that was told once more.
+    refused: bool,
+    again: bool,
+}
+
+impl Telling {
+    /// Starts from what the server itself `said` the person saw, which it need not be told again.
+    pub fn after(said: Option<Revision>) -> Self {
+        Self { sent: said, ..Self::default() }
+    }
+
+    /// Tells that the document was seen as it reads at `revision`, with `tell`, which is handed the
+    /// revision as text and says whether the server took it.
+    ///
+    /// A save's telling is left out while another is on its way, since the next one carries more, and
+    /// what the server did not take waits for a new revision. `closing` is the last chance: the telling
+    /// then follows the one on its way, and what the server did not take is told once more.
+    pub fn tell(&mut self, revision: &Revision, closing: bool, tell: impl FnOnce(String) -> bool + Send + 'static) {
+        let before = match self.last.take() {
+            Some(last) if last.is_finished() => {
+                self.refused = !last.join().unwrap_or(false);
+                None
+            }
+            Some(last) if !closing => return self.last = Some(last),
+            before => before,
+        };
+        if closing && self.refused && !std::mem::replace(&mut self.again, true) {
+            self.sent = None;
+        }
+        if self.sent.as_ref() == Some(revision) {
+            return self.last = before;
+        }
+        self.refused = false;
+        let seen = revision.to_string();
+        self.last = Some(thread::spawn(move || {
+            // In the order they were seen, so that the later one stands.
+            let _ = before.map(JoinHandle::join);
+            tell(seen)
+        }));
+        self.sent = Some(revision.clone());
+    }
+
+    /// Whether a telling is on its way.
+    pub fn on_its_way(&self) -> bool {
+        self.last.as_ref().is_some_and(|last| !last.is_finished())
+    }
+
+    /// The telling that is on its way, for whoever gives it a moment before the app ends.
+    pub fn leave(&mut self) -> Option<JoinHandle<bool>> {
+        self.last.take()
     }
 }
