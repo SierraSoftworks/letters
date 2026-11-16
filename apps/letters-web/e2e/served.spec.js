@@ -91,6 +91,23 @@ for (const { name, answer, held, told } of answers) {
   });
 }
 
+test("someone a share link alone leads in keeps the document as it stands, without what it once read", async ({ page }) => {
+  const files = [];
+  for (const by_link of [false, true]) {
+    await serve(page, opened({ by_link }));
+    // A passage written and taken back is in the history alone.
+    await page.keyboard.type("A passage that is written and then taken back, which only the history remembers. ".repeat(4));
+    await page.keyboard.press("ControlOrMeta+z");
+    const kept = page.waitForEvent("download");
+    await page.keyboard.press("ControlOrMeta+s");
+    files.push(await readFile(await (await kept).path()));
+  }
+  const [whole, clean] = files;
+  expect(JSON.parse(entry(whole, "manifest.json")).id).toBe(opened().id);
+  expect(JSON.parse(entry(clean, "manifest.json")).id).not.toBe(opened().id);
+  expect(file(clean, "history/oplog").length).toBeLessThan(file(whole, "history/oplog").length);
+});
+
 test("the pictures of the server's document come from the server, those the page never showed too", async ({ page }) => {
   // The second lies far below what the window shows.
   const [shown, below] = [picture(INK), picture([0, 128, 255], 64, 4000)];

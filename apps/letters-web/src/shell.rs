@@ -1014,8 +1014,9 @@ impl Shell {
         let source = match version.map(|version| self.view.document_at(version)) {
             // A clean copy starts a document of its own from what is written now, as a copy of a version
             // does from what was written then: neither the history nor the notes go with it.
-            None if format == CopyFormat::Clean => {
-                Source::Version(Box::new((self.view.editor().doc().clone(), self.view.style().clone())))
+            // So is the Letters copy of one a share link alone leads in.
+            None if format == CopyFormat::Clean || (format == CopyFormat::Letters && self.by_link()) => {
+                self.as_it_stands()
             }
             None => Source::Copy,
             Some(Some(version)) => Source::Version(Box::new(version)),
@@ -1058,7 +1059,8 @@ impl Shell {
         let written = self.view.edits();
         let title = self.window.document().map(|page| page.title()).unwrap_or_default();
         self.saving = true;
-        self.export("let", Source::Own, title, move |shell, made| {
+        let source = if self.by_link() { self.as_it_stands() } else { Source::Own };
+        self.export("let", source, title, move |shell, made| {
             shell.saving = false;
             let saved = made.and_then(|file| {
                 // A document whose name no file can have is kept all the same.
@@ -1073,6 +1075,18 @@ impl Shell {
                 Err(why) => shell.say(format!("The document could not be saved: {why}.")),
             }
         });
+    }
+
+    /// Whether a share link alone leads the person to the document. What they take of it is then the
+    /// document as it stands, and its past is not shown to them. A courtesy: the history is on the page.
+    fn by_link(&self) -> bool {
+        self.server.as_ref().is_some_and(|server| server.by_link)
+    }
+
+    /// The document as it reads now, for a copy that starts a document of its own: neither the history
+    /// nor the notes go with it.
+    fn as_it_stands(&self) -> Source {
+        Source::Version(Box::new((self.view.editor().doc().clone(), self.view.style().clone())))
     }
 
     /// The document the person chose after "Open" takes the place of the one on the page.
@@ -2310,7 +2324,8 @@ impl Shell {
     /// document's and the person has their name, by which the window knows what others wrote since.
     fn say_seen(&mut self) {
         let ready = self.attached && self.named && !self.seen;
-        let Some(server) = self.server.as_ref().filter(|_| ready) else { return };
+        // The note leads to the history, which is not shown to one a link alone leads in.
+        let Some(server) = self.server.as_ref().filter(|server| ready && !server.by_link) else { return };
         self.seen = true;
         let seen = self.platform.last_seen(&server.id).and_then(|seen| seen.parse().ok());
         self.view.set_last_seen(seen);
