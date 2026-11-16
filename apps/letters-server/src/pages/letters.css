@@ -1,6 +1,10 @@
 /* The rules of the server's own pages, on top of yewi's. */
 html, body { margin: 0; block-size: 100%; }
 
+/* yewi 0.3.0 gives every second row its stripe with more weight than a row's hover has, so those rows
+   would not answer the pointer. */
+.yi-table__row:hover { background: var(--yi-table-row-hover); }
+
 /* A row of a file table: its icon, its name, and what it is marked with. */
 .lt-file { display: inline-flex; align-items: center; gap: var(--yi-space-sm); font-weight: 500; }
 .lt-file > .yi-icon { flex: none; color: var(--yi-fg-subtle); }

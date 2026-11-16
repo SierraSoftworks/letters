@@ -485,12 +485,22 @@ test("a new document is started beside this one, and the page goes to it once wh
   host.close();
 });
 
-test("the person's other documents are on the server's page for the folder", async ({ page }) => {
-  await serve(page, opened(HOUSE));
-  await page.route("**/s/family/House", (route) => route.fulfill({ contentType: "text/html", body: "<title>House</title>" }));
-  await run(page, "Open");
-  await expect(page).toHaveTitle("House");
-});
+const ways = {
+  // The canvas lies over the mirror, so the pointer goes to where the mirror says the button is.
+  "the bar's way back": async (page) => {
+    const { x, y, width, height } = await page.getByRole("button", { name: "Back to House", exact: true }).boundingBox();
+    await page.mouse.click(x + width / 2, y + height / 2);
+  },
+  "the Open command": (page) => run(page, "Open"),
+};
+for (const [way, take] of Object.entries(ways)) {
+  test(`the person's other documents are on the server's page for the folder, by ${way}`, async ({ page }) => {
+    await serve(page, opened(HOUSE));
+    await page.route("**/s/family/House", (route) => route.fulfill({ contentType: "text/html", body: "<title>House</title>" }));
+    await take(page);
+    await expect(page).toHaveTitle("House");
+  });
+}
 
 test("a document started without a name takes its first heading's, on the server too", async ({ page }) => {
   const named = (method, path) => (path === `${DOCUMENT}/rename` ? { body: listed("Letters in the browser") } : undefined);
