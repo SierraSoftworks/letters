@@ -1590,3 +1590,45 @@ fn only_one_who_writes_is_told_of_the_last_visit() {
         assert_eq!(news(&mut window), None, "{access:?}");
     }
 }
+
+#[test]
+fn someone_the_shell_keeps_the_history_from_is_offered_none_of_it() {
+    // Whether the palette, asked for a command by its name, lists it.
+    let listed = |window: &mut Harness, command: &str| {
+        window.key("Mod+Shift+P").type_text(command);
+        let listed = window.controls().iter().any(|found| found.role == Role::ListBoxOption && found.name == command);
+        window.key("Escape");
+        listed
+    };
+    let mut window = revisited(&["Alice Moreau"]);
+    window.select("Cottage");
+    for command in ["History", "History of selection", "Changes since last visit"] {
+        assert!(listed(&mut window, command), "{command}: offered until the shell says");
+    }
+
+    window.ui().set_history_shown(false);
+    assert_eq!(news(&mut window), None, "no word of the last visit");
+    assert!(window.find(Role::Button, "History").is_none(), "the bar");
+    for command in ["History", "History of selection", "Changes since last visit"] {
+        assert!(!listed(&mut window, command), "{command}");
+    }
+    // The document is still theirs to write.
+    let before = window.markdown();
+    window.type_text("x");
+    assert_ne!(window.markdown(), before);
+
+    window.ui().set_history_shown(true);
+    window.click(Role::Button, "History");
+    assert!(showing(&mut window), "it is back when the shell says so");
+}
+
+#[test]
+fn a_history_that_is_out_goes_when_the_shell_keeps_it_back() {
+    for (whole, what) in [(true, "the history"), (false, "a passage's")] {
+        let mut window = if whole { history() } else { passage("rising") };
+        assert!(showing(&mut window) || narrowed(&mut window), "{what}");
+        window.ui().set_history_shown(false);
+        assert!(!showing(&mut window) && !narrowed(&mut window), "{what}");
+        assert!(window.focused().is_some_and(|found| found.role == Role::Document), "{what}: the page is back");
+    }
+}

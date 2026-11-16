@@ -382,6 +382,18 @@ impl Ui<EditorApp> {
         app.seen = seen.and_then(|seen| app.since(seen));
     }
 
+    /// Says whether the person is shown what was written before: the history, the history of a passage,
+    /// and what others wrote since the last visit. A shell says no of someone whom a share link alone
+    /// leads to the document, whatever the link lets them do. None of it is then offered or done, and a
+    /// history that is out goes. Shown until a shell says otherwise.
+    pub fn set_history_shown(&mut self, shown: bool) {
+        let app = self.app_mut();
+        app.past = shown;
+        if !shown {
+            app.leave();
+        }
+    }
+
     /// Says how far the person's clock is ahead of UTC, in minutes: the history tells its days and times
     /// by it, and by UTC until a shell says. One figure serves every date, so a time from the other side
     /// of a change to summer time reads an hour off.
@@ -1334,6 +1346,9 @@ pub struct EditorApp {
     share: Share,
     /// What the person last saw of the document before this visit, where the shell said.
     seen: Option<Seen>,
+    /// Whether the person is shown what was written before. A shell keeps it from someone whom a share
+    /// link alone leads to the document.
+    past: bool,
     /// Whether the dialog about the language of the document and of a passage is out.
     written: bool,
     servers: Servers,
@@ -1456,6 +1471,7 @@ impl EditorApp {
             panel: None,
             share: Share::default(),
             seen: None,
+            past: true,
             written: false,
             servers: Servers::default(),
             browser: Browser::default(),
@@ -2265,6 +2281,9 @@ impl EditorApp {
         if !(reads || self.writes()) {
             return None;
         }
+        if matches!(act, Act::History | Act::SelectionHistory | Act::SinceVisit) && !self.past {
+            return None;
+        }
         // What a link withholds is not offered. A cut would lose what it could not take.
         let withheld = match act {
             Act::Run(Command::Copy | Command::Cut) => !self.allows.copy,
@@ -2399,6 +2418,12 @@ impl EditorApp {
     /// Whether the document is the person's to change.
     fn writes(&self) -> bool {
         self.access == Access::Edits
+    }
+
+    /// Whether the person is offered what was written before. The history has it to be had back, which is
+    /// for someone who writes, and a shell can keep it from them all the same.
+    fn rewinds(&self) -> bool {
+        self.writes() && self.past
     }
 
     /// Whether the person may choose between the versions of a conflict: the choice changes the text, and
@@ -4872,7 +4897,7 @@ impl EditorApp {
         }
         // The history is no panel: it takes the page's place, and lists the versions beside it.
         let history = tool(icon::HISTORY, "History").on_press(Message::History(Historying::Show));
-        panels = panels.children(writes.then_some(history));
+        panels = panels.children(self.rewinds().then_some(history));
         bar.end(panels.child(tool(icon::ELLIPSIS, "More").popover(more.popover().align(Align::End))))
     }
 
@@ -5823,7 +5848,7 @@ impl App for EditorApp {
             importing::toast(self.margin.imports().0, keys.as_deref(), room)
         });
         // So does the toast about what others wrote since the last visit, for one who can look it up.
-        let news = self.seen.as_ref().filter(|_| self.writes() && !away && !self.carded());
+        let news = self.seen.as_ref().filter(|_| self.rewinds() && !away && !self.carded());
         let toast = toast.or_else(|| news.and_then(|seen| seen.toast(room)));
         let page = Element::row().grow(1.0).child(page).children(toast).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
