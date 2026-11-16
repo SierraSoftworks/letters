@@ -174,6 +174,11 @@ impl Session {
         }
     }
 
+    /// Says that the person read a document up to `revision`, as its model writes one.
+    pub fn saw(&self, id: &str, revision: &str) -> Result<(), Refused> {
+        self.ask(|server, token| server.saw(token, id, revision))
+    }
+
     /// The names of the pictures the server holds for a document, each without `assets/`.
     pub fn assets(&self, id: &str) -> Result<Vec<String>, Refused> {
         self.ask(|server, token| server.get(token, &paths::assets(id)))

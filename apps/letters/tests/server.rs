@@ -132,6 +132,8 @@ struct Letters {
     /// Takes the next token shown for run out, whatever its time says.
     strict: bool,
     signed_out: bool,
+    /// Where the person's account has them reading the document up to.
+    seen: Option<String>,
     /// The person may no longer read the document.
     barred: bool,
     /// Who the document is shared with.
@@ -174,7 +176,12 @@ impl Letters {
             }
             "GET /api/v1/spaces" => json(&spaces()),
             "GET /api/v1/documents/d1" if self.barred => said(Code::Forbidden, "That is not yours to read."),
-            "GET /api/v1/documents/d1" => json(&opened()),
+            "GET /api/v1/documents/d1" => json(&Opened { last_seen: self.seen.clone(), ..opened() }),
+            "PUT /api/v1/documents/d1/seen" => {
+                let letters_api::Seen { revision } = serde_json::from_slice(&asked.body).unwrap();
+                self.seen = Some(revision);
+                Answer("204 No Content", "", Vec::new())
+            }
             "GET /api/v1/documents/d1/file" => Answer("200 OK", "content-type: application/zip\r\n", FILE.to_vec()),
             "PUT /api/v1/documents/d1/file" if self.moved > 0 => {
                 self.moved -= 1;
@@ -800,6 +807,22 @@ fn a_file_for_a_document_that_moved_meanwhile_is_handed_over_once_more() {
     assert_eq!(told(refused), [Told::Unsent("That document was moved just now.".into())]);
     let large = Refused::Said(letters_api::Error::new(Code::TooLarge, "That is too large."));
     assert_eq!(told(large), [Told::Refused(Refusal::TooLarge)]);
+}
+
+#[test]
+fn what_a_person_saw_of_a_document_is_kept_by_their_account() {
+    let server = Server::start();
+    let session = server.session();
+    assert_eq!(session.open("d1").unwrap().last_seen, None, "nothing was seen yet");
+
+    for revision in ["3@7", "9@4,5@7"] {
+        assert_eq!(session.saw("d1", revision), Ok(()));
+        // Any device that opens the document as this person is told the latest.
+        assert_eq!(session.open("d1").unwrap().last_seen.as_deref(), Some(revision));
+    }
+    let asked = server.asked();
+    let told = asked.iter().filter(|(line, _)| line == "PUT /api/v1/documents/d1/seen");
+    assert!(told.clone().count() == 2 && told.clone().all(|(_, as_who)| as_who == "Bearer token-1"), "{asked:?}");
 }
 
 /// A history as a stranger writes it: one that Loro panics on.

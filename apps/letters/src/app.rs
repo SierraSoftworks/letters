@@ -78,6 +78,8 @@ use crate::writer;
 const MAC: bool = cfg!(target_os = "macos");
 /// How long typing must pause before a save starts.
 const SAVE_AFTER: Duration = Duration::from_millis(800);
+/// How long the app waits, as it ends, for servers to hear what was last seen of their documents.
+const PARTING: Duration = Duration::from_secs(2);
 /// How long after an edit the journal has it, however long the typing goes on.
 const JOURNAL_AFTER: Duration = Duration::from_millis(300);
 /// How long to wait before trying a failed save again.
@@ -233,6 +235,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         },
         windows: HashMap::new(),
         copies: Vec::new(),
+        parting: Vec::new(),
         fonts: Finder::system({
             let proxy = event_loop.create_proxy();
             move |id, faces| drop(proxy.send_event(Event::Faces(id, faces)))
@@ -454,6 +457,8 @@ struct App {
     windows: HashMap<WindowId, DocWindow>,
     /// The copies being written, which the app waits for before it ends.
     copies: Vec<JoinHandle<()>>,
+    /// The tellings of what was seen that closed windows left on their way to their servers.
+    parting: Vec<JoinHandle<()>>,
     /// Looks among the system's fonts for what the bundled ones cannot draw, once a window shows any.
     fonts: Finder<WindowId>,
     mods: ModifiersState,
@@ -690,6 +695,10 @@ struct DocWindow {
     /// Where what the person saw of each document is kept, and what was last kept there of this one.
     seen: Seen,
     marked: Option<Revision>,
+    /// What the account of a server's document was last told the person saw, and the telling that is on
+    /// its way. One at a time: a later save tells what an earlier one could not.
+    told_seen: Option<Revision>,
+    telling: Option<JoinHandle<()>>,
     /// What the person last saw of the document, until the window is told.
     last_seen: Option<Revision>,
     /// Whether the window was told by the copy on this device, the document's server being out of reach.
@@ -1079,13 +1088,26 @@ impl DocWindow {
         let revision = self.view.editor().model().revision();
         if self.marked.as_ref() != Some(&revision) {
             self.seen.saw(id, &revision);
-            self.marked = Some(revision);
+            self.marked = Some(revision.clone());
+        }
+        // The account of a server's document is told too, for the person's other devices, off this thread.
+        let waits = self.telling.as_ref().is_some_and(|telling| !telling.is_finished());
+        if let Some(remote) = self.remote.as_ref().filter(|_| !waits && self.told_seen.as_ref() != Some(&revision)) {
+            let (session, id, seen) = (remote.line.session().clone(), remote.opened.id.clone(), revision.to_string());
+            self.telling = Some(thread::spawn(move || {
+                // A server that cannot be told now is told at a later save, or by another visit.
+                if let Err(refused) = session.saw(&id, &seen) {
+                    eprintln!("letters: the server was not told what was seen of a document: {refused}");
+                }
+            }));
+            self.told_seen = Some(revision);
         }
     }
 
     /// Lets the journal go as the window closes with everything saved. A document that was never worth
-    /// a file is not worth bringing back either.
-    fn leave(&mut self) {
+    /// a file is not worth bringing back either. Returns the telling of what was seen that is still on
+    /// its way to a server, which the app gives a moment before it ends.
+    fn leave(&mut self) -> Option<JoinHandle<()>> {
         self.saw();
         if let Some(remote) = &mut self.remote {
             remote.line.stop();
@@ -1095,6 +1117,7 @@ impl DocWindow {
         {
             journal.forget();
         }
+        self.telling.take()
     }
 
     /// The top bar says whether the document is saved. The title adds what the bar has no word for: a
@@ -1687,7 +1710,11 @@ impl DocWindow {
                 self.id = Some(copy.id.clone());
                 // Read once, before a save of this visit keeps what is seen now in its place.
                 if self.keeps {
-                    self.last_seen = self.seen.last(&copy.id);
+                    // The account of a server's document knows what its person saw on any device. This
+                    // device's own word serves a file, and a server that said nothing.
+                    let said = self.remote.as_ref().and_then(|remote| remote.opened.last_seen.as_deref());
+                    self.told_seen = said.and_then(|said| said.parse().ok());
+                    self.last_seen = self.told_seen.clone().or_else(|| self.seen.last(&copy.id));
                     self.say_seen(false);
                 }
                 // What the file held is where the last session ended, should this one write anything.
@@ -2276,6 +2303,8 @@ impl App {
             save_failed: false,
             seen: self.seen.clone(),
             marked: None,
+            told_seen: None,
+            telling: None,
             last_seen: None,
             seen_offline: false,
             named: self.named,
@@ -3136,7 +3165,7 @@ impl App {
                 if let Some(id) = asker.filter(|id| self.windows.get(id).is_some_and(DocWindow::pristine))
                     && let Some(mut window) = self.windows.remove(&id)
                 {
-                    window.leave();
+                    self.parting.extend(window.leave());
                 }
             }
             Err(Some(error)) => {
@@ -3544,7 +3573,7 @@ impl App {
                 match self.open_path(event_loop, &path, Some(id)) {
                     true if pristine => {
                         if let Some(mut window) = self.windows.remove(&id) {
-                            window.leave();
+                            self.parting.extend(window.leave());
                         }
                     }
                     true => {}
@@ -3608,7 +3637,8 @@ impl App {
             if let Some(signing) = self.signing.remove(&id) {
                 signing.given_up.store(true, Ordering::Relaxed);
             }
-            window.leave();
+            self.parting.retain(|telling| !telling.is_finished());
+            self.parting.extend(window.leave());
         }
         if self.windows.is_empty() {
             event_loop.exit();
@@ -4154,7 +4184,7 @@ impl ApplicationHandler<Event> for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         for window in self.windows.values_mut() {
             match window.save_now(false, &self.library, &mut self.journals) {
-                Ok(()) => window.leave(),
+                Ok(()) => self.parting.extend(window.leave()),
                 Err(error) => eprintln!("letters: {error}"),
             }
             // What could not be saved stays in its journal, which closes here.
@@ -4165,6 +4195,11 @@ impl ApplicationHandler<Event> for App {
         // Half a copy is worse than a moment's wait.
         for copy in self.copies.drain(..) {
             let _ = copy.join();
+        }
+        // A server hears what was last seen if it answers soon. If not, this device remembers.
+        let until = Instant::now() + PARTING;
+        while self.parting.iter().any(|telling| !telling.is_finished()) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
         }
         // Last, and briefly: the person's work is safe by now, and a report is not worth their wait.
         std::mem::replace(&mut self.telemetry, Telemetry::off()).stop(Duration::from_millis(300));

@@ -8,7 +8,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use letters_api::{Exchange, Renewal, Token, paths};
+use letters_api::{Exchange, Renewal, Seen, Token, paths};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use ureq::config::{AutoHeaderValue, Config};
@@ -179,6 +179,14 @@ impl Client {
     pub fn keep_asset(&self, token: &str, id: &str, name: &str, bytes: &[u8]) -> Result<(), Refused> {
         let kind = crate::pictures::mime(bytes).unwrap_or("application/octet-stream");
         self.call(Verb::Put, &paths::asset(id, name), Some(token), Some((kind, bytes)), CARRYING, ANSWER).map(drop)
+    }
+
+    /// Says that the person read a document up to `revision`, which their account keeps for the next
+    /// device they open it on. The server answers nothing.
+    pub fn saw(&self, token: &str, id: &str, revision: &str) -> Result<(), Refused> {
+        let seen = serde_json::to_vec(&Seen { revision: revision.to_owned() });
+        let seen = seen.map_err(|error| Refused::Unreachable(error.to_string()))?;
+        self.call(Verb::Put, &paths::seen(id), Some(token), Some((letters_api::JSON, &seen)), LIMIT, ANSWER).map(drop)
     }
 
     /// Hands the server a document's whole `.let` file, which it merges into the document it holds.
