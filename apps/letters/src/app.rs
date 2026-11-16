@@ -900,8 +900,11 @@ const NO_PICTURE: &str = "it is not a picture Letters can show";
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Action {
     New,
-    /// Opens the document at a path, or one the person picks.
+    /// Opens the document at a path, or one the person picks in the system's dialog.
     Open(Option<PathBuf>),
+    /// Opens a document as the window's own Open does: from its card of a server's documents while the
+    /// person is signed in to one, else from the system's dialog.
+    Choose,
     Save,
     Close,
     Quit,
@@ -913,7 +916,7 @@ fn shortcut(event: &KeyEvent) -> Option<Action> {
     }
     Some(match event.key {
         Key::Char('n') => Action::New,
-        Key::Char('o') => Action::Open(None),
+        Key::Char('o') => Action::Choose,
         Key::Char('s') => Action::Save,
         Key::Char('w') => Action::Close,
         Key::Char('q') => Action::Quit,
@@ -3836,6 +3839,14 @@ impl App {
                 if let Err(error) = self.open_window(event_loop, None, false) {
                     alert(None, &format!("A new window could not be opened{}.", no_window(&*error)));
                 }
+            }
+            Action::Choose => {
+                let Some(window) = self.windows.get_mut(&id) else { return };
+                window.view.run_command("Open", &mut self.platform);
+                window.access_stale = true;
+                let now = Instant::now();
+                window.sync(now);
+                self.serve(event_loop, id, now);
             }
             Action::Open(path) => {
                 let Some(window) = self.windows.get(&id) else { return };
