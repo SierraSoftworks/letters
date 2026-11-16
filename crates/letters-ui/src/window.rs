@@ -24,7 +24,7 @@ use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
 use letters_spell::Dictionary;
 
-use crate::browsing::{Browsed, Browser, Browsing};
+use crate::browsing::{Browsed, Browser, Browsing, Stored};
 use crate::callouts::{self, Calling, Callouts};
 use crate::captions::{self, Altering, Captions};
 use crate::chrome::Chrome;
@@ -662,6 +662,15 @@ impl Ui<EditorApp> {
     pub fn set_connection(&mut self, connection: Option<Connection>) {
         if self.app().connection != connection {
             self.app_mut().connection = connection;
+        }
+    }
+
+    /// Says where a server keeps the document: see [`Stored`]. The card that opens a server's documents
+    /// then starts in its folder, on its row. `None`, as until a shell says, is for a document no server
+    /// keeps, and the card starts on the person's own space.
+    pub fn set_stored(&mut self, stored: Option<Stored>) {
+        if self.app().stored != stored {
+            self.app_mut().stored = stored;
         }
     }
 
@@ -1390,6 +1399,8 @@ pub struct EditorApp {
     save: SaveState,
     /// How the window stands to the server that keeps the document, when one does.
     connection: Option<Connection>,
+    /// Where a server keeps the document, when one does.
+    stored: Option<Stored>,
     /// What the person may do with the document.
     access: Access,
     /// What the person may take away of the document.
@@ -1523,6 +1534,7 @@ impl EditorApp {
             mac: cfg!(target_os = "macos"),
             save: SaveState::default(),
             connection: None,
+            stored: None,
             access: Access::default(),
             allows: Allows::default(),
             fetching: true,
@@ -2937,6 +2949,7 @@ impl EditorApp {
     fn browse(&mut self, asked: Browsing, platform: &mut dyn Platform) {
         if asked == Browsing::Show {
             self.undialog();
+            self.browser.beside(self.stored.clone());
         }
         let clock = (platform.wall_time(), self.zone);
         self.browser.update(asked, self.servers.signed_in(), clock, &mut self.requests);

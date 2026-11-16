@@ -28,7 +28,7 @@ use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDeci
 use letters_ui::{
     Access, Allows, Appearance, Browsed, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind,
     ImportOffer, Landing, LinkPreviewFound, Location, MergeAsk, MergeFile, Notice, PictureState, Request, SafeMode,
-    SaveState, Scheme, Settings, SignIn, Window as View, tokens,
+    SaveState, Scheme, Settings, SignIn, Stored, Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -542,8 +542,9 @@ struct Remote {
     line: Line,
     /// What the server said of the document.
     opened: letters_api::Opened,
-    /// The server's name for the bar.
+    /// The server's name for the bar, and its address as the Servers dialog lists it.
     host: String,
+    origin: String,
     /// When the line's clock started. The line is told the time since.
     born: Instant,
     /// Whether the line was started, which waits for the file's history.
@@ -621,6 +622,12 @@ impl Remote {
             letters_sync::Link::Live(_) => Connection::Live,
             letters_sync::Link::Refused(refusal) => Connection::Refused(refusal.to_string()),
         }
+    }
+
+    /// Where the server keeps the document, for the card that opens its documents.
+    fn stored(&self) -> Stored {
+        let letters_api::Opened { id, space, path, .. } = &self.opened;
+        Stored { server: self.origin.clone(), space: space.clone(), path: path.clone(), id: id.clone() }
     }
 
     /// What the bar is told a folder of the document's space by: no path on this device.
@@ -1180,6 +1187,7 @@ impl DocWindow {
         // A server's document that is all in its copy here is saved once the server keeps it.
         let progress = remote.filter(|remote| remote.started).map(|remote| remote.line.progress());
         self.view.set_connection(remote.map(Remote::connection));
+        self.view.set_stored(remote.map(Remote::stored));
         self.view.set_access(remote.map_or(Access::Edits, Remote::access));
         self.view.set_allows(remote.map_or_else(Allows::default, Remote::allows));
         self.view.set_save_state(match (self.save_failed, self.place.home().is_some(), self.unsaved()) {
@@ -1538,7 +1546,8 @@ impl DocWindow {
     ) {
         let (id, proxy) = (self.window.id(), proxy.clone());
         let tell: connected::Tell = Arc::new(move |said| drop(proxy.send_event(Event::Heard(id, said))));
-        let host = session.server().origin().trim_start_matches("https://").to_owned();
+        let origin = session.server().origin().to_owned();
+        let host = origin.trim_start_matches("https://").to_owned();
         let mut line = Line::new(session, &reached.opened, &reached.path, Roots::System, tell);
         // What no save has put in the copy's file yet, the server may lack too.
         self.assets.iter().for_each(|(name, bytes)| line.keep(name, bytes.clone()));
@@ -1559,6 +1568,7 @@ impl DocWindow {
             line,
             opened: reached.opened,
             host,
+            origin,
             born: now,
             started: false,
             owes,
