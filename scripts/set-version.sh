@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Gives every crate the version VERSION, as a release's tag names it: `./scripts/set-version.sh 1.2.3`.
+# Gives every crate the version VERSION, as the release workflow names it: `./scripts/set-version.sh 1.2.3`.
 # The version in the repository is only what a build from source says of itself.
 set -eu
 cd "$(dirname "$0")/.."
