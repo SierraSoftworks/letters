@@ -2,9 +2,9 @@
 //! writer, and an address keeps each part in its place.
 
 use letters_api::{
-    Access, Action, Allows, Code, Entry, EntryKind, Error, Grant, Grantee, Limits, Link, Listing, NewLink, Opened,
-    PROTOCOL, Person, Role, Seen, Server, Settings, Shares, Space, SpaceKind, Tag, Token, Trashed, Trust, Via, Who,
-    paths,
+    Access, Action, Allows, Code, Entry, EntryKind, Error, Export, Grant, Grantee, Limits, Link, Listing, NewLink,
+    Opened, PROTOCOL, Person, Role, Seen, Server, Settings, Shares, Space, SpaceKind, Tag, Token, Trashed, Trust, Via,
+    Who, paths,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -253,9 +253,15 @@ fn an_address_keeps_each_part_in_its_place() {
             "/api/v1/spaces/family/import?path=House%2F2026&name=Roof%20%26%20co.md",
         ),
         (paths::own_source("img.example.org/a b"), "/api/v1/settings/sources/img.example.org%2Fa%20b"),
+        (paths::export("doc 1", Export::Markdown), "/api/v1/documents/doc%201/export/md"),
     ];
     for (address, expected) in cases {
         assert_eq!(address, expected);
     }
     assert!(paths::socket("d").starts_with(paths::API));
+    // A format is read back from what its address calls it, and nothing else is one.
+    for format in Export::ALL {
+        assert_eq!(Export::named(format.name()), Some(format));
+    }
+    assert_eq!(Export::named("let"), None);
 }

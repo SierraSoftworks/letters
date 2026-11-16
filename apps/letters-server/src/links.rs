@@ -101,6 +101,9 @@ const SWEEP: u64 = 60 * 60;
 /// and previews a minute, so that one link does not take up the fetches everyone shares.
 const PER_MINUTE: u32 = 30;
 const TRY: u32 = 6;
+/// What a document written in another format costs a visit: the server lays it out anew each time, so a
+/// visit may ask for five a minute.
+const EXPORT: u32 = 6;
 /// How many addresses are counted before the ones of minutes past are forgotten.
 const COUNTED: usize = 10_000;
 
@@ -425,6 +428,16 @@ impl App {
         let now = self.now();
         if who.alone() && !self.doors.spend(&format!("visit {}", who.session), 1, now) {
             return Err(Refusal::slow(Doors::anew(now), "Too many pictures and previews at once. Wait a minute."));
+        }
+        Ok(())
+    }
+
+    /// Counts a document the server is asked to write in another format, against what a visit may ask
+    /// for in a minute.
+    pub(crate) fn exporting(&self, who: &Signed) -> Answer<()> {
+        let now = self.now();
+        if who.alone() && !self.doors.spend(&format!("visit {}", who.session), EXPORT, now) {
+            return Err(Refusal::slow(Doors::anew(now), "Too many exports at once. Wait a minute."));
         }
         Ok(())
     }

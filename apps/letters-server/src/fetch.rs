@@ -274,6 +274,16 @@ impl App {
         shown
     }
 
+    /// Which of the pictures the document `id` links to at `urls` are fetched for `who` unasked, as
+    /// [`linked_pictures`](Self::linked_pictures) chooses them, without fetching any.
+    pub fn fetched_unasked(&self, who: &Signed, id: &str, urls: Vec<String>) -> Vec<String> {
+        let chosen = self.guarded(who, id, |gate| {
+            let trusted = |url: &String| gate.fetch_on_open(url, Limits::default()).is_ok();
+            Ok(urls.into_iter().filter(trusted).take(SHOWN).collect())
+        });
+        chosen.unwrap_or_default()
+    }
+
     /// Reads what the page behind a link says of itself. The page's picture is named by its whole
     /// address, to be fetched in turn.
     pub fn fetch_preview(&self, who: &Signed, id: &str, fetch: &letters_api::Fetch) -> Answer<Preview> {

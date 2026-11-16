@@ -14,6 +14,7 @@ fn events() -> Vec<Event> {
         vec![Event::DocumentMade, Event::ShareChanged, Event::LinkMade, Event::LinkRevoked, Event::ConflictsMerged];
     events.extend(through.map(Event::SignedIn));
     events.extend(through.map(Event::SyncJoined));
+    events.extend(letters_api::Export::ALL.map(Event::Exported));
     events
 }
 

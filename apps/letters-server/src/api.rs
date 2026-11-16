@@ -287,10 +287,14 @@ async fn file(State(app): State<Shared>, Reader(who): Reader, Path(id): Path<Str
         Ok((found.place.name().to_owned(), bytes))
     })
     .await?;
-    // The name is the file's own, less what a header cannot carry.
+    Ok(([(CONTENT_TYPE, MIMETYPE.to_owned()), (CONTENT_DISPOSITION, attached(&name))], bytes).into_response())
+}
+
+/// What tells a browser to keep an answer as a file called `name`: the name itself, and for a browser
+/// that reads no more, the name less what a header cannot carry.
+pub(crate) fn attached(name: &str) -> String {
     let plain: String = name.chars().filter(|c| c.is_ascii() && !c.is_control() && !matches!(c, '"' | '\\')).collect();
-    let disposition = format!("attachment; filename=\"{plain}\"; filename*=UTF-8''{}", paths::segment(&name));
-    Ok(([(CONTENT_TYPE, MIMETYPE.to_owned()), (CONTENT_DISPOSITION, disposition)], bytes).into_response())
+    format!("attachment; filename=\"{plain}\"; filename*=UTF-8''{}", paths::segment(name))
 }
 
 async fn assets(State(app): State<Shared>, Reader(who): Reader, Path(id): Path<String>) -> Answer<Json<Vec<String>>> {
@@ -567,7 +571,7 @@ impl App {
     }
 
     /// The row of the file at `place` in a folder.
-    fn row(&self, root: &Root, place: &Place) -> Answer<Row> {
+    pub(crate) fn row(&self, root: &Root, place: &Place) -> Answer<Row> {
         let (folder, name) = place.split();
         let rows = self.library.list(&self.store, root, &folder)?;
         rows.into_iter().find(|row| row.listed.name == name).ok_or_else(Refusal::not_found)
@@ -934,7 +938,7 @@ fn entry(row: &Row, role: Role) -> Entry {
 pub fn router(app: Arc<App>) -> Router {
     let routes = routes().merge(crate::shares::routes()).merge(crate::links::routes());
     let routes = routes.merge(crate::access::routes()).merge(crate::socket::routes()).merge(crate::seen::routes());
-    let routes = routes.merge(crate::dictionaries::routes());
+    let routes = routes.merge(crate::dictionaries::routes()).merge(crate::export::routes());
     let routes = routes.merge(crate::auth::routes()).merge(crate::pages::routes());
     // Around every route, and around the answer where there is none.
     let routes = match app.config.server.log {

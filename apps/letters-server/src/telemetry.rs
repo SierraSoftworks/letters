@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+use letters_api::Export;
 use tracing_batteries::{Analytics, Session};
 
 use crate::session::{Carrier, Signed};
@@ -60,6 +61,8 @@ pub enum Event {
     LinkMade,
     LinkRevoked,
     ConflictsMerged,
+    /// A document was written in another format.
+    Exported(Export),
 }
 
 impl Event {
@@ -72,6 +75,7 @@ impl Event {
             Self::LinkMade => "link_made",
             Self::LinkRevoked => "link_revoked",
             Self::ConflictsMerged => "conflicts_merged",
+            Self::Exported(_) => "exported",
         }
     }
 
@@ -84,6 +88,15 @@ impl Event {
                     Through::Browser => "browser",
                     Through::Desktop => "desktop",
                     Through::Link => "link",
+                },
+            )),
+            Self::Exported(to) => Some((
+                "to",
+                match to {
+                    Export::Pdf => "pdf",
+                    Export::Docx => "docx",
+                    Export::Markdown => "markdown",
+                    Export::Html => "html",
                 },
             )),
             _ => None,

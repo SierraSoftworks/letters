@@ -10,8 +10,8 @@ use axum::http::{Method, StatusCode};
 use common::desk::{Desk, settle};
 use common::{Browser, Client, Raw, START, Server, URL, follow, let_in, link, planned, texts};
 use letters_api::{
-    Allows, Code, CreatedLink, Entry, Error, Fetch, Listing, NewLink, Opened, Rename, Role, Seen, Shares, Tag, Trust,
-    paths,
+    Allows, Code, CreatedLink, Entry, Error, Export, Fetch, Listing, NewLink, Opened, Rename, Role, Seen, Shares, Tag,
+    Trust, paths,
 };
 use letters_format::{Archive, HISTORY};
 use letters_model::Op;
@@ -271,18 +271,21 @@ async fn a_link_withholds_what_it_does_not_let_its_reader_take_away() {
         assert_eq!(opened.allows, allows);
         let file = guest.get(&paths::file(&id)).await.status;
         assert_eq!(file == StatusCode::OK, allows.download, "the file, with {allows:?}: {file}");
-        // The page of its text is all that a reader's link shows. It offers the file, lets its text be
-        // selected and goes to paper where the link lets its reader take that much away.
+        let export = guest.get(&paths::export(&id, Export::Markdown)).await.status;
+        assert_eq!(export == StatusCode::OK, allows.download, "another format, with {allows:?}: {export}");
+        // The page of its text is all that a reader's link shows. It offers the file and the other
+        // formats, lets its text be selected and goes to paper where the link lets its reader take that
+        // much away.
         let page = guest.get(&paths::read_page(&id)).await;
         assert_eq!(page.status, StatusCode::OK, "the page to read, with {allows:?}");
         let page = page.text();
-        let offers = page.contains(&format!("href=\"{}\"", paths::file(&id)));
+        let offers = [paths::file(&id), paths::export(&id, Export::Pdf)].map(|href| page.contains(&href));
         let (selects, prints) = (!page.contains("user-select: none"), !page.contains("does not let its reader print"));
-        assert_eq!((offers, selects, prints), (allows.download, allows.copy, allows.print), "{allows:?}");
+        assert_eq!((offers, selects, prints), ([allows.download; 2], allows.copy, allows.print), "{allows:?}");
     }
-    // Someone signed in reads the page as it always was: what is theirs to take is on their own pages.
+    // Someone signed in takes all of it away: the page offers them the file, and withholds nothing.
     let ben = server.reader("ben", &[]).get(&paths::read_page(&id)).await.text();
-    assert!(!ben.contains(&paths::file(&id)) && !ben.contains("user-select: none"), "{ben}");
+    assert!(ben.contains(&paths::file(&id)) && !ben.contains("user-select: none"), "{ben}");
 }
 
 #[tokio::test]

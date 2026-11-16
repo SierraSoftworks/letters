@@ -137,6 +137,7 @@ enabled = true
 - **Take away.** What a link does not let its reader take, the page to read withholds as far as a page
   can: no download is offered, text that is not to be copied cannot be selected, and a page that is not
   to be printed prints a notice in its place. The last two are a courtesy: the page's source holds the text.
+  A link that allows no download is handed no file by the server, in any format.
 - **History.** A link that comments or edits opens the editor. Its visitor downloads the document as it
   stands, without its history or its comments, and the editor is told to show and save no more. That is a
   courtesy and not a wall: the history still reaches that editor over its socket, where a visitor with

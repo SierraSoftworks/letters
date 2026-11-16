@@ -9,6 +9,7 @@ use yewi::prelude::*;
 
 use super::{ACT_IMPORT, ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH};
 use super::{ACT_REVOKE, ACT_SHARE, ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder};
+use crate::export::Offer;
 
 /// Everything one page shows. It is made where the request is answered and drawn on another thread, so it
 /// holds plain text.
@@ -82,6 +83,8 @@ pub enum Ask {
     /// Who it is shared with, who it can be shared with besides, the links that open it, and what was
     /// done through all of them.
     Share(api::Entry, Vec<api::Grant>, Vec<api::Grantee>, Vec<Linked>, Activity),
+    /// The formats the server writes it in, each with what it will simplify.
+    Export(api::Entry, Vec<Offer>),
 }
 
 /// A document's access log, as the Share dialog's Activity tab lists it.
@@ -334,10 +337,14 @@ fn file(row: &Row, here: Option<&str>, places: bool, shares: bool) -> Html {
         Some(id) if !copy => {
             let ask = |what: &str| here.filter(|_| entry.role.edits()).map(|here| asking(here, what, id));
             let share = here.filter(|_| shares).map(|here| asking(here, "share", id));
+            let export = here.map(|here| asking(here, "export", id));
             html! {
                 <MenuButton label={format!("More for {}", entry.name)} icon_only=true variant={ButtonVariant::Subtle} size={Size::Small} placement={Placement::BottomEnd}>
                     <MenuItem icon={icons::BOOK_OPEN} href={paths::read_page(id)}>{ "Read" }</MenuItem>
                     <MenuItem icon={icons::DOWNLOAD} href={paths::file(id)}>{ "Download" }</MenuItem>
+                    if let Some(export) = export {
+                        <MenuItem icon={icons::FILE_OUTPUT} href={export}>{ "Export" }</MenuItem>
+                    }
                     if let Some(share) = share {
                         <MenuItem icon={icons::SHARE_2} href={share}>{ "Share" }</MenuItem>
                     }
@@ -490,6 +497,7 @@ fn asked(ask: &Ask, here: &str) -> Html {
         Ask::Move(entry, _) => (entry, format!("Move {}", entry.name), "Move", ACT_MOVE),
         Ask::Trash(entry) => (entry, format!("Move {} to the trash?", entry.name), "Move to trash", ACT_TRASH),
         Ask::Share(entry, people, offered, links, log) => return sharing(entry, people, offered, links, log, here),
+        Ask::Export(entry, offers) => return exporting(entry, offers, here),
     };
     let fields = match ask {
         Ask::Rename(entry) => html! {
@@ -510,7 +518,7 @@ fn asked(ask: &Ask, here: &str) -> Html {
             <p>{ "Everything in it goes with it, and all of it can be put back from the trash." }</p>
         },
         Ask::Trash(_) => html! { <p>{ "It can be put back from the trash." }</p> },
-        Ask::Share(..) => Html::default(),
+        Ask::Share(..) | Ask::Export(..) => Html::default(),
     };
     let variant = if matches!(ask, Ask::Trash(_)) { ButtonVariant::Danger } else { ButtonVariant::Primary };
     let footer = html! {
@@ -760,6 +768,34 @@ fn sharing(
                 { activity(log, &asking(here, "share", id)) }
             </Tab>
             </Tabs>
+        </Dialog>
+    }
+}
+
+/// The Export dialog, open over the folder at `here`: each format the server writes the document in, with
+/// what that format will simplify said before it is asked for, and the way to take it.
+fn exporting(entry: &api::Entry, offers: &[Offer], here: &str) -> Html {
+    let row = |offer: &Offer| {
+        html! {
+            <li class="lt-export__row">
+                <div class="lt-export__what">
+                    <span>{ offer.label }</span>
+                    if offer.simplified.is_empty() {
+                        <span class="lt-note">{ "Carries the document as it reads." }</span>
+                    }
+                    { for offer.simplified.iter().map(|said| html! { <span class="lt-note">{ said.clone() }</span> }) }
+                </div>
+                <Button size={Size::Small} icon={icons::DOWNLOAD} href={offer.href.clone()} attrs={attrs! { "download" => "", "aria-label" => format!("Download as {}", offer.label) }}>
+                    { "Download" }
+                </Button>
+            </li>
+        }
+    };
+    html! {
+        <Dialog id="asked" open=true title={format!("Export {}", entry.name)} size={Size::Small} footer={html! {
+            <Button href={here.to_owned()}>{ "Done" }</Button>
+        }}>
+            <ul class="lt-export" aria-label="Formats">{ for offers.iter().map(row) }</ul>
         </Dialog>
     }
 }

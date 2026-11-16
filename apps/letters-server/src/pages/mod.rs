@@ -266,8 +266,8 @@ async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
 /// What a folder's address asks for beside the folder.
 #[derive(Default, Deserialize)]
 struct Asked {
-    /// The question to open the page with: `rename`, `move`, `trash` or `share`, about the document `id`,
-    /// or one of the first three about the folder at `folder`.
+    /// The question to open the page with: `rename`, `move`, `trash`, `share` or `export`, about the
+    /// document `id`, or one of the first three about the folder at `folder`.
     #[serde(default)]
     ask: Option<String>,
     #[serde(default)]
@@ -376,6 +376,15 @@ async fn folder(
                         let log = activity::listed(&rows, now, asked.before.is_some(), before);
                         Ask::Share(entry, shares.people, app.directory(&who).unwrap_or_default(), links, log)
                     })
+                }
+                // Whoever reads a document takes it away in any format. One that cannot be read now is
+                // asked nothing of.
+                (Some("export"), Some(entry)) if entry.kind == EntryKind::Document => {
+                    let offers = entry.id.as_ref().and_then(|id| {
+                        let found = app.locate(&who, id).ok()?;
+                        app.offers(&who, &found, id).ok()
+                    });
+                    offers.map(|offers| Ask::Export(entry, offers))
                 }
                 (Some("rename"), Some(entry)) if edits => Some(Ask::Rename(entry)),
                 // A folder is thrown away by an owner of its space alone.

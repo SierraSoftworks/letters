@@ -23,6 +23,12 @@ letters-spell.workspace = true
 letters-convert.workspace = true
 letters-ui.workspace = true
 letters-fonts.workspace = true
+# A PDF is laid out here as the window lays it out, with the word lists that end a line of Thai or
+# Chinese between words.
+letters-layout = { workspace = true, features = ["dictionaries"] }
+letters-render.workspace = true
+# Markdown goes out with its pictures in one file.
+zip.workspace = true
 # The page a document is sent to a browser in. The editor that page runs is compiled in by the build
 # script, from what `apps/letters-web/build.sh` made.
 letters-web = { path = "../letters-web" }
@@ -55,9 +61,10 @@ brotli.workspace = true
 [dev-dependencies]
 tower.workspace = true
 http-body-util.workspace = true
-zip.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tungstenite.workspace = true
+# A small face of Hebrew, for a PDF that is set in a face from the state directory.
+font-test-data.workspace = true
 # A site for the server's fetches to be tried against.
 rcgen.workspace = true
 rustls.workspace = true

@@ -157,6 +157,20 @@ pub fn file(id: &str) -> String {
     format!("{}/file", document(id))
 }
 
+/// `GET`: the document in another format, written by the server as the document stands now, for a
+/// browser to keep under the document's name.
+///
+/// - Markdown is a zip when the document holds pictures: the text, and the pictures in the folder it names
+///   them in.
+/// - A picture that is still a link is fetched for a PDF where the reader is shown it unasked. Every other
+///   format writes the link.
+/// - Whoever has no more than a link gets no comments and no names of who wrote the document, as with
+///   [`file()`], and is refused as [`Code::Forbidden`](crate::Code::Forbidden) where the link allows no
+///   download.
+pub fn export(id: &str, to: crate::Export) -> String {
+    format!("{}/export/{}", document(id), to.name())
+}
+
 /// `POST` a [`Rename`](crate::Rename): the document's [`Entry`](crate::Entry) under its new name.
 pub fn rename(id: &str) -> String {
     format!("{}/rename", document(id))

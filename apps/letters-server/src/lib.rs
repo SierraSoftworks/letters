@@ -14,6 +14,7 @@
 //! - [`dictionaries`] are the word lists of other languages, for the spell checker of the editor in a
 //!   browser.
 //! - [`fetch`] is what the server fetches for a document from elsewhere: a linked picture, a link's page.
+//! - [`export`] writes a document as a PDF, a Word file, Markdown or a web page, for a browser to keep.
 //! - [`seen`] is where each person read a document up to.
 //! - [`rooms`] are the documents that are open now, and [`socket`] is each device's line to one.
 //! - [`logs`] is what the server says of itself, on its standard error.
@@ -29,6 +30,7 @@ pub mod auth;
 pub mod config;
 pub mod dictionaries;
 pub mod error;
+pub mod export;
 pub mod fetch;
 pub mod home;
 pub mod ids;

@@ -113,6 +113,8 @@ These are fixed in the program. Only `auth.session_days` is a setting.
 - **Links.** 50 live links a document. A visit lasts 12 hours or until the link ends. One address
   follows links 30 times a minute, and a passphrase try counts as 6.
 - **Access log.** A row is kept 365 days. The same thing by the same reader within 5 minutes is one row.
+- **Exports.** The server writes two at a time as PDF, Word, Markdown or a web page, and the rest wait
+  their turn. A link's visit is written 5 a minute.
 
 ### What the owner cleans
 
@@ -125,4 +127,5 @@ The server deletes nothing a person made for good.
   document. It holds whatever the damage cost. Delete it once nobody misses an edit.
 - **`dictionaries/` and `fallback/`.** Hunspell pairs such as `de_DE.aff` and `de_DE.dic` serve spelling
   in other languages to the browser. `fallback/` takes the faces of the web build's `dist/fallback/`, for
-  emoji and scripts the built-in fonts lack. Both are read as they are asked for, with no restart.
+  emoji and scripts the built-in fonts lack, in the browser's editor and in a PDF the server writes. Both
+  are read as they are asked for, with no restart.

@@ -31,6 +31,13 @@ a.lt-file__name:hover { text-decoration: underline; }
 .lt-shares__to { flex: 1; min-inline-size: 12rem; }
 .lt-shares__title { margin: 0 0 var(--yi-space-xs); font-size: var(--yi-text-sm); font-weight: 600; color: var(--yi-fg-muted); }
 
+/* The Export dialog: each format with what it will simplify, and the way to take it at the row's end. */
+.lt-export { display: grid; gap: var(--yi-space-md); margin: 0; padding: 0; list-style: none; }
+.lt-export__row { display: flex; align-items: center; justify-content: space-between; gap: var(--yi-space-md); }
+.lt-export__what { display: grid; gap: var(--yi-space-2xs); min-inline-size: 0; font-weight: 500; }
+.lt-export__what .lt-note { font-weight: 400; }
+.lt-export__row > .yi-button { flex: none; }
+
 /* The Activity tab: the link a row came by, where from on one line however long a browser names itself,
    and the ways to other rows. */
 .lt-activity__link { display: inline-flex; align-items: center; gap: var(--yi-space-2xs); font-weight: 600; }

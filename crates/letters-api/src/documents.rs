@@ -249,3 +249,34 @@ pub struct Preview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
 }
+
+/// A format the server writes a document in, at [`paths::export`](crate::paths::export).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Export {
+    Pdf,
+    /// A Word file.
+    Docx,
+    /// The text alone, or a zip of it with the pictures it names beside it.
+    Markdown,
+    /// One web page that holds its pictures.
+    Html,
+}
+
+impl Export {
+    pub const ALL: [Self; 4] = [Self::Pdf, Self::Docx, Self::Markdown, Self::Html];
+
+    /// What an address calls the format.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pdf => "pdf",
+            Self::Docx => "docx",
+            Self::Markdown => "md",
+            Self::Html => "html",
+        }
+    }
+
+    /// The format an address calls `name`.
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|format| format.name() == name)
+    }
+}
