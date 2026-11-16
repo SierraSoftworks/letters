@@ -144,6 +144,33 @@ async fn a_folder_lists_its_folders_first_and_only_what_is_a_document() {
 }
 
 #[tokio::test]
+async fn folders_the_system_keeps_for_itself_are_not_part_of_a_space() {
+    let server = Server::new("system");
+    let ben = server.person("ben", &[]);
+    let id = ben.start("home", "", "Diary").await.id.unwrap();
+    let home = server.scratch.0.join("home/ben");
+    // A NAS leaves these beside a person's files, with copies of the documents in some.
+    let system = ["@eaDir", "#recycle", "#snapshot", "@tmp", "$RECYCLE.BIN", "System Volume Information", "lost+found"];
+    for name in system.into_iter().chain([".Trashes", "#RECYCLE"]) {
+        std::fs::create_dir(home.join(name)).unwrap();
+        std::fs::copy(home.join("Diary.let"), home.join(name).join("Diary.let")).unwrap();
+    }
+    for name in ["@work", "#ideas"] {
+        std::fs::create_dir(home.join(name)).unwrap();
+    }
+
+    assert_eq!(names(&listed(&ben, "home", "").await), ["#ideas", "@work", "Diary"], "a person's own names stay");
+    let opened: Opened = ben.get(&paths::document(&id)).await.unwrap();
+    assert_eq!(opened.path, "Diary.let", "a copy the system keeps is not the document");
+    for name in system {
+        let inside = ben.get::<Listing>(&paths::entries("home", name)).await.expect_err(name);
+        assert_ne!(inside.code, Code::Internal, "{name}: {inside:?}");
+        let new = NewFolder { parent: String::new(), name: name.into() };
+        ben.post::<Entry>(&paths::folders("home"), &new).await.expect_err(name);
+    }
+}
+
+#[tokio::test]
 async fn a_document_is_found_by_its_id_wherever_its_file_goes() {
     let server = Server::new("moved");
     let ben = server.person("ben", &["family"]);
