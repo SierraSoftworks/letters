@@ -5,7 +5,7 @@ use std::path::Path;
 
 use common::{Scratch, Writer, comment, comments};
 use letters::files::{self, Exchange, Home, Opened, Rest, Working};
-use letters::journal::{self, Journal, Journals};
+use letters::journal::{self, Aside, Journal, Journals, Why};
 use letters::platform;
 use letters_model::{Block, BlockKind, Document, Model, Notes, ReplicaId, Revision, Style};
 
@@ -27,6 +27,8 @@ struct Desk {
     journal: Option<Journal>,
     /// The revision the journal has seen all of.
     seen: Option<Revision>,
+    /// The journal that was set aside for the one the window has.
+    aside: Option<Aside>,
 }
 
 impl Desk {
@@ -43,8 +45,9 @@ impl Desk {
             model.merge(&news).unwrap();
         }
         let file = opened.home.as_ref().filter(|home| home.written()).map(Home::path);
+        let aside = claim.as_ref().and_then(|claim| claim.aside().cloned());
         let journal = claim.map(|claim| journals.open(claim, &copy.id, &copy.created, file));
-        Self { writer: Writer { model, copy }, home: opened.home, journal, seen: journalled }
+        Self { writer: Writer { model, copy }, home: opened.home, journal, seen: journalled, aside }
     }
 
     fn journal(&mut self) -> &mut Journal {
@@ -339,5 +342,58 @@ fn a_journal_the_app_ended_at_is_set_aside_and_its_document_opens_as_saved() {
         let back: Vec<Opened> = claims.into_iter().filter_map(files::reopen).collect();
         assert_eq!(back.iter().map(|opened| &opened.document).collect::<Vec<_>>(), [&typed], "{case}");
         assert!(aside[0].kept.exists(), "{case}");
+    }
+}
+
+#[test]
+fn a_journal_with_an_edit_that_does_not_stand_comes_back_up_to_it_and_is_set_aside() {
+    // Whether the document has a file, what was typed since, and whether anything is to come back.
+    let cases = [
+        ("a document changed since its save", true, Some("First thoughts, and second ones"), true),
+        ("a document that never reached a file", false, Some("Thoughts with no file"), true),
+        ("a document with nothing else unsaved", true, None, false),
+    ];
+    for (nth, (case, saved, typed, back)) in cases.into_iter().enumerate() {
+        let scratch = Scratch::new(&format!("journal-part-{nth}"));
+        let path = scratch.0.join("Notes.let");
+        let mut journals = Journals::at(scratch.0.join("unsaved"));
+        let mut desk = Desk::at(&mut journals, new(saved.then_some(&path)));
+        let mut expected = document("First thoughts");
+        if saved {
+            desk.write(&expected);
+            assert!(!desk.save() && desk.save(), "{case}");
+        }
+        if let Some(typed) = typed {
+            expected = document(typed);
+            desk.write(&expected);
+        }
+        // Then the edit Loro panics on, and more that was typed after it.
+        desk.journal().edits(PANICS.to_vec());
+        desk.write(&document("Typed after the edit that does not stand"));
+        let mut journals = crash(desk, journals);
+        let [journal] = &scratch.names("unsaved")[..] else { panic!("{case}: one journal is left") };
+        let left = fs::read(scratch.0.join("unsaved").join(journal)).unwrap();
+
+        let mut opened = brought_back(&journals);
+        assert_eq!(opened.len(), 1, "{case}");
+        assert_eq!(opened[0].document, expected, "{case}");
+        let desk = Desk::at(&mut journals, opened.remove(0));
+        let aside = desk.aside.clone().expect(case);
+        assert_eq!(aside.why, Why::Refused { back }, "{case}");
+        assert_eq!(fs::read(&aside.kept).unwrap(), left, "{case}: what was set aside is kept whole");
+        let kept = aside.kept.file_name().unwrap().to_string_lossy();
+        assert!(aside.said(true).contains(&*kept), "{case}: the person is told where it is");
+
+        // What came back outlives another crash, and what was set aside is not read again.
+        let mut journals = crash(desk, journals);
+        let mut again = brought_back(&journals);
+        assert_eq!(
+            again.iter().map(|opened| &opened.document).collect::<Vec<_>>(),
+            [&expected; 1][..usize::from(back)]
+        );
+        if back {
+            assert_eq!(Desk::at(&mut journals, again.remove(0)).aside, None, "{case}");
+        }
+        assert!(aside.kept.exists(), "{case}");
     }
 }

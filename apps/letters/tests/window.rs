@@ -64,6 +64,11 @@ impl Desk {
 
     /// Starts the app as `who` on `file`, and waits for its window.
     fn open(&self, who: &str, file: &Path) -> Shown {
+        self.launch(who, file).expect("the app shows a window")
+    }
+
+    /// Starts the app as `who` on `file`, and waits for its window. `None` when it ends before it shows one.
+    fn launch(&self, who: &str, file: &Path) -> Option<Shown> {
         let says = self.folder.0.join(format!("{who}-says.txt"));
         let _ = fs::remove_file(&says);
         let app = Command::new(env!("CARGO_BIN_EXE_letters"))
@@ -80,9 +85,10 @@ impl Desk {
         let pid = shown.app.id().to_string();
         shown.window = waited("the app's window", || {
             let found = xdotool(&["search", "--onlyvisible", "--pid", &pid]);
-            found.lines().last().map(str::to_owned)
-        });
-        shown
+            let window = found.lines().last().map(|window| Some(window.to_owned()));
+            window.or_else(|| (!shown.running()).then_some(None))
+        })?;
+        Some(shown)
     }
 }
 
@@ -248,7 +254,7 @@ fn a_document_says_who_else_wrote_since_the_person_last_had_it_open() {
 
 #[test]
 #[ignore = "needs a display and xdotool: ./scripts/check.sh slow"]
-fn a_journal_the_app_ended_at_is_set_aside_and_its_document_opens_as_saved() {
+fn a_journal_that_would_end_the_app_is_set_aside_and_its_document_opens_as_saved() {
     let desk = Desk::new("journal-aside");
     let file = desk.document("Rates.let");
     let first = desk.open("Ada", &file);
@@ -256,8 +262,7 @@ fn a_journal_the_app_ended_at_is_set_aside_and_its_document_opens_as_saved() {
     saved(&file, "Rates change in January.");
     drop(first);
 
-    // A session left an edit that Loro panics on (found by fuzzing a journal, issue #4), and the one
-    // after it ended as it brought that back.
+    // A session left an edit that Loro panics on (found by fuzzing a journal, issue #4).
     let edit = include_bytes!("../../../fuzz/corpus/history/a-first-edit-that-builds-on-one-before-it.bin");
     let unsaved = desk.home("Ada").join(".letters/unsaved");
     let _ = fs::remove_dir_all(&unsaved);
@@ -273,12 +278,10 @@ fn a_journal_the_app_ended_at_is_set_aside_and_its_document_opens_as_saved() {
     let [left] = &desk.folder.names("Ada/.letters/unsaved").iter().filter_map(journal).collect::<Vec<_>>()[..] else {
         panic!("the session left one journal")
     };
-    let claims = Journals::at(&unsaved).orphans();
-    assert!(std::panic::catch_unwind(|| claims[0].replay(|_| panic!("the app ends here"))).is_err());
-    drop(claims);
 
-    // The next launch does not read it again. It keeps it, and shows the document as its file has it.
-    let mut shown = desk.open("Ada", &file);
+    // A build that aborts on a panic ends at the journal once, before it shows anything. No build ends at
+    // it twice: the launch after keeps it, does not read it, and shows the document as its file has it.
+    let mut shown = desk.launch("Ada", &file).unwrap_or_else(|| desk.open("Ada", &file));
     shown.wait_for("Rates change in January.");
     let kept = |name: &String| !is_journal(name) && fs::read(unsaved.join(name)).is_ok_and(|held| &held == left);
     let names = desk.folder.names("Ada/.letters/unsaved");

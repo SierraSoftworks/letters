@@ -528,17 +528,23 @@ impl Rest {
         let claim = kept.or_else(|| {
             // A journal may wait for this file though no window opened for it: its file was gone when the
             // app started, and has turned up since. The editor shows the file, so it merges what that adds.
-            claim(&copy).filter(|claim| {
-                let file = copy.model().revision();
-                let Some(replayed) = claim.replay(|unsaved| copy.replay(unsaved).and_then(Replayed::whole)) else {
-                    return true;
-                };
-                news = (copy.model().revision() != file).then(|| copy.model().updates_since(&file));
+            let mut claim = claim(&copy)?;
+            let file = copy.model().revision();
+            let Some(replayed) = claim.replay(|unsaved| copy.replay(unsaved)) else { return Some(claim) };
+            news = (copy.model().revision() != file).then(|| copy.model().updates_since(&file));
+            match replayed {
+                // What stood is in the document. The journal is kept, and not read again.
+                Ok(Replayed { refused: Some(_), added, .. }) => {
+                    claim.set_aside(added, news.clone()).inspect_err(unmoved).ok()?
+                }
+                Ok(_) => {}
                 // A journal that builds on another file stays as it is, and this window keeps none.
-                replayed
-                    .inspect_err(|error| eprintln!("letters: unsaved work could not be brought back: {error}"))
-                    .is_ok()
-            })
+                Err(error) => {
+                    eprintln!("letters: unsaved work could not be brought back: {error}");
+                    return None;
+                }
+            }
+            Some(claim)
         });
         let journalled = Some(copy.model().revision());
         Ok(Working { history: Some(history), news, claim, journalled, copy })
@@ -574,14 +580,20 @@ pub fn entry(path: &Path, name: &str) -> Option<Vec<u8>> {
     archive.read(name).ok()?
 }
 
+fn unmoved(error: &io::Error) {
+    eprintln!("letters: a journal that came back in part could not be set aside: {error}");
+}
+
 /// Opens the document of a journal that a session left behind when it ended early.
 ///
 /// `None` when the document's file turns out to hold everything, and the journal goes. `None` too when the
 /// journal builds on a file that is not where it was: it then waits for that file to be opened.
 ///
-/// A journal that was set aside, as the app ended when it was last read, opens its document as the file
-/// has it. `None` when no file does.
-pub fn reopen(claim: Claim) -> Option<Opened> {
+/// A journal that holds an edit which does not stand comes back up to that edit and is set aside, and
+/// its document opens whether or not anything came back, for its window to say so. One that was set
+/// aside because the app ended when it was last read opens its document as the file has it, and `None`
+/// when no file does.
+pub fn reopen(mut claim: Claim) -> Option<Opened> {
     if let Some(aside) = claim.aside() {
         let home = aside.home.clone().filter(|home| home.is_file())?;
         // The window that opens it claims the journal the document has from here on.
@@ -598,23 +610,27 @@ pub fn reopen(claim: Claim) -> Option<Opened> {
         if copy.id != unsaved.id {
             copy.fork(unsaved.id.clone());
         }
-        let added = copy.replay(unsaved).and_then(Replayed::whole).ok()?;
-        Some((Home { path: path.into(), written: true }, copy, added))
+        let file = copy.model().revision();
+        let replayed = copy.replay(unsaved).ok()?;
+        let edits = (copy.model().revision() != file).then(|| copy.model().updates_since(&file));
+        Some((Some(Home { path: path.into(), written: true }), copy, replayed, edits))
     };
-    let back = claim.replay(|unsaved| match on_file(unsaved) {
-        Some((_, _, false)) => Some(None),
-        Some((home, copy, true)) => Some(Some((Some(home), copy))),
-        // With no file to add to, the journal has to hold the whole document.
-        None => {
+    let back = claim.replay(|unsaved| {
+        on_file(unsaved).or_else(|| {
+            // With no file to add to, the journal has to hold the whole document.
             let (copy, replayed) = WorkingCopy::recover(unsaved, replica()).ok()??;
-            replayed.whole().ok().map(|_| Some((None, copy)))
-        }
+            let edits = Some(copy.model().save());
+            Some((None, copy, replayed, edits))
+        })
     })?;
-    let Some(back) = back? else {
+    let (home, copy, replayed, edits) = back?;
+    if replayed.refused.is_some() {
+        // A document with no file came back from the journal alone, as far as it stood.
+        claim.set_aside(replayed.added || home.is_none(), edits).inspect_err(unmoved).ok()?;
+    } else if home.is_some() && !replayed.added {
         claim.discard();
         return None;
-    };
-    let (home, copy) = back;
+    }
     let (document, style) = (copy.model().doc().clone(), copy.model().style().clone());
     Some(Opened { document, style, home, rest: Rest(Source::Kept(Box::new(copy), claim)) })
 }

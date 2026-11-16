@@ -1748,9 +1748,11 @@ impl DocWindow {
             }
             (None, None) => return Ok(()),
         };
+        let mut own = None;
         let read = match working {
             Ok(Working { copy, history, news, claim, journalled }) => {
-                self.aside.extend(claim.as_ref().and_then(|claim| claim.aside().cloned()));
+                // The journal of this window's own document, set aside as the file was read or before.
+                own = claim.as_ref().and_then(|claim| claim.aside().cloned());
                 if let Some(history) = history {
                     let _ = self.view.change(|editor| Ok::<_, Infallible>(editor.attach(history)));
                 }
@@ -1820,6 +1822,9 @@ impl DocWindow {
         for aside in std::mem::take(&mut self.aside) {
             let here = aside.home.as_deref().is_some_and(|home| self.place.path() == Some(home));
             self.alert(&aside.said(here));
+        }
+        if let Some(aside) = own {
+            self.alert(&aside.said(true));
         }
         read
     }
