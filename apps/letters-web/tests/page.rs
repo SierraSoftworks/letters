@@ -1,6 +1,5 @@
 //! The page a server sends: a template with the document in it twice, under the shape of the window's bar.
 
-use std::collections::BTreeSet;
 use std::convert::Infallible;
 
 use accesskit::Node;
@@ -8,7 +7,6 @@ use letters_api::{Allows, Opened, Role, Trust};
 use letters_editor::InputEvent;
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Mark, ReplicaId, Style};
 use letters_render::Size;
-use letters_spell::{Dictionary, Speller, best_dictionary};
 use letters_test::TestPlatform;
 use letters_ui::Window;
 use letters_web::page::{self, DOCUMENT, FIRST_PAINT, OPENED, Place, Skeleton, Span};
@@ -380,46 +378,5 @@ fn the_languages_a_document_names_are_those_a_dictionary_is_fetched_for_and_neve
         let document = json!({ "format": 1, "language": language, "blocks": [block] });
         let document = Document::from_json(&document.to_string()).expect("the document reads");
         assert_eq!(page::languages(&document).into_iter().collect::<Vec<_>>(), named, "{language}");
-    }
-}
-
-#[test]
-fn text_is_checked_against_the_dictionary_its_server_answers_for_its_language() {
-    // The dictionaries a server holds, and the languages written in: the document's first.
-    let cases: [(&[&str], &[&str]); 4] = [
-        (&["de-AT", "de-DE"], &["de-CH", "de-AT", "de"]),
-        (&["de-AT", "de-CH"], &["de-DE", "de-CH"]),
-        (&["de", "de-DE"], &["de-CH", "de-DE"]),
-        (&["de-DE", "fr"], &["fr-CA", "de", "nl"]),
-    ];
-    // Each dictionary knows one word, which says whose it is.
-    let word = |held: &str| held.replace('-', "").to_lowercase();
-    for (held, written) in cases {
-        let held: Vec<String> = held.iter().map(|tag| (*tag).to_owned()).collect();
-        let passages: Vec<_> = written[1..].iter().map(|lang| json!({ "text": "x", "lang": lang })).collect();
-        let block = json!({ "id": "b", "type": "paragraph", "content": passages });
-        let document = json!({ "format": 1, "language": written[0], "blocks": [block] });
-        let document = Document::from_json(&document.to_string()).expect("the document reads");
-        let wanted = page::dictionaries(&document, &held);
-        // They arrive in any order.
-        for backwards in [false, true] {
-            let mut arriving: Vec<_> = wanted.iter().collect();
-            if backwards {
-                arriving.reverse();
-            }
-            let mut speller = Speller::new();
-            for (held, under) in arriving {
-                let dictionary = Dictionary::parse("", &format!("1\n{}\n", word(held))).expect("it reads");
-                speller.add_dictionary(under, dictionary);
-            }
-            for tag in written {
-                let served = best_dictionary(held.iter().map(String::as_str), tag).map(|at| word(&held[at]));
-                let words = BTreeSet::new();
-                let accepted =
-                    served.as_ref().map(|word| speller.checker(tag, &words).is_some_and(|by| by.check(word)));
-                assert_ne!(accepted, Some(false), "{held:?}, {tag}, backwards: {backwards}");
-                assert_eq!(speller.supports(tag), served.is_some(), "{held:?}, {tag}");
-            }
-        }
     }
 }

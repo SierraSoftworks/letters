@@ -2082,7 +2082,9 @@ impl Shell {
         if self.languages.is_empty() || self.stats.first_frame_ms.is_none() {
             return;
         }
-        let mut wanted = page::dictionaries(self.view.editor().doc(), &self.languages);
+        // By the rule every shell picks a server's dictionaries with.
+        let named = page::languages(self.view.editor().doc());
+        let mut wanted = letters_spell::served_dictionaries(named.iter().map(String::as_str), &self.languages);
         wanted.retain(|held, _| !self.dictionaries.contains(held));
         for (held, tag) in wanted {
             self.dictionaries.push(held.clone());

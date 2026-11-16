@@ -433,22 +433,6 @@ pub fn languages(document: &Document) -> BTreeSet<String> {
     named
 }
 
-/// The dictionaries among `held`, a server's by their tags, that the text of `document` is checked
-/// against: each by the server's tag for it, with the tag a speller takes it under. The one a region the
-/// server has none for falls back to goes under the language alone, where a speller looks for such a
-/// region's, so that the speller and the server choose alike.
-pub fn dictionaries(document: &Document, held: &[String]) -> BTreeMap<String, String> {
-    let best = |tag: &str| letters_spell::best_dictionary(held.iter().map(String::as_str), tag);
-    let mut wanted = BTreeMap::new();
-    for tag in languages(document) {
-        let Some(at) = best(&tag) else { continue };
-        let language = tag.split('-').next().unwrap_or(&tag);
-        let under = if best(language) == Some(at) { language.to_owned() } else { held[at].clone() };
-        wanted.insert(held[at].clone(), under);
-    }
-    wanted
-}
-
 /// What a page asks its browser to fetch early for `document`, beyond what every page does: the font its
 /// first frame waits for, ahead of the rest, and the maths faces when that frame waits for them too. `base`
 /// is where the files are found, as the editor is given it.
