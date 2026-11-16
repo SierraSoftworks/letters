@@ -1,9 +1,11 @@
 //! Opening a link from a document.
 //!
 //! `letters_trust` says what a click on a link may do. This turns that into the next step for a window,
-//! and hands an address the person may visit to the system, which knows what opens it.
+//! and hands an address the person may visit to the system, which knows what opens it. The system is
+//! also what shows a file where it lies.
 
 use std::io;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use letters_trust::{Gate, LinkDecision};
@@ -56,9 +58,65 @@ pub fn open(href: &str) -> io::Result<()> {
         }
         () => Command::new("xdg-open"),
     };
-    command.arg(href.trim()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    command.arg(href.trim());
+    hand_over(command)
+}
+
+fn hand_over(mut command: Command) -> io::Result<()> {
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     // The opener hands over and ends. It is waited for elsewhere, so that it leaves nothing behind.
     let mut opener = command.spawn()?;
     std::thread::spawn(move || drop(opener.wait()));
     Ok(())
+}
+
+/// Shows `file` in the system's file manager, picked out among what lies beside it where the system can
+/// do that. `file` is a whole path of the app's own making. This may wait for the file manager to
+/// answer, so call it off the main thread.
+pub fn reveal(file: &Path) -> io::Result<()> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if file_manager::show(file).is_some() {
+        return Ok(());
+    }
+    let mut command = match () {
+        () if cfg!(target_os = "macos") => {
+            let mut command = Command::new("open");
+            command.arg("-R").arg(file);
+            command
+        }
+        () if cfg!(windows) => {
+            let mut command = Command::new("explorer");
+            command.arg("/select,").arg(file);
+            command
+        }
+        // No file manager says it can pick a file out: the folder is opened by whatever opens folders.
+        () => {
+            let mut command = Command::new("xdg-open");
+            command.arg(file.parent().unwrap_or(file));
+            command
+        }
+    };
+    hand_over(command)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+mod file_manager {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    use zbus::blocking::{Connection, Proxy};
+
+    /// Asks the desktop's file manager to show `file`. `None` when none answers to the name they share.
+    pub fn show(file: &Path) -> Option<()> {
+        let plain = |byte: &u8| byte.is_ascii_alphanumeric() || b"-._~/".contains(byte);
+        let escaped = file.as_os_str().as_bytes().iter().map(|byte| match plain(byte) {
+            true => char::from(*byte).to_string(),
+            false => format!("%{byte:02X}"),
+        });
+        let address = format!("file://{}", escaped.collect::<String>());
+        let connection = Connection::session().ok()?;
+        let name = "org.freedesktop.FileManager1";
+        let manager = Proxy::new(&connection, name, "/org/freedesktop/FileManager1", name).ok()?;
+        manager.call::<_, _, ()>("ShowItems", &(vec![address], "")).ok()
+    }
 }
