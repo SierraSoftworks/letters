@@ -376,6 +376,11 @@ fn moment(text: &str) -> Option<Moment> {
     Some(Moment { date, day, seconds: day * 86_400 + hour * 3600 + minute * 60 + second - offset })
 }
 
+/// The seconds since 1970 at which a moment that RFC 3339 writes falls.
+pub(crate) fn seconds(text: &str) -> Option<u64> {
+    moment(text).and_then(|moment| u64::try_from(moment.seconds).ok())
+}
+
 /// How long ago `then` was, as the landing card says it: "2 minutes ago", "Yesterday", "Tuesday", "3 Nov".
 /// Empty when either time cannot be read.
 pub(crate) fn ago(now: &str, then: &str) -> String {

@@ -570,7 +570,7 @@ fn the_owner_reads_who_reached_the_document_by_day() {
         "Ben Price started editing",
         "Guest was refused a download",
         "Carla Diaz wrote a comment",
-        "Guest opened the document",
+        "Guest viewed the document",
         "Guest printed the document",
         "Ben Price downloaded a copy",
     ];
@@ -698,7 +698,7 @@ fn a_row_says_how_long_an_edit_lasted_and_the_link_someone_came_by() {
     let mut window = plan();
     let link = Some(Via { id: "l1".into(), label: "Accountant".into() });
     activity(&mut window, vec![Reach { link, ..reach(HOUR, by("Carla Diaz"), Action::Open, Grade::Reader) }]);
-    let row = window.find(Role::ListItem, "Carla Diaz opened the document").expect("named");
+    let row = window.find(Role::ListItem, "Carla Diaz viewed the document").expect("named");
     assert!(row.description.unwrap_or_default().contains("by the link for Accountant"));
     assert!(has(&mut window, Role::Label, "Accountant"), "the link is on the row");
 }

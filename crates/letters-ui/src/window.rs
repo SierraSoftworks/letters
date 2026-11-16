@@ -5869,7 +5869,7 @@ impl App for EditorApp {
             written::view(&told)
         });
         let over = over.chain(written);
-        let over = over.chain(self.browser.view(self.servers.signed_in()));
+        let over = over.chain(self.browser.view(self.servers.signed_in(), window.width));
         let commands = self.commands.open().then(|| {
             let (offers, keymap) = (self.offers(), self.editor.keymap());
             self.commands.view(&offers, keymap, self.mac, bar, window)

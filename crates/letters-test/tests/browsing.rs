@@ -2,6 +2,7 @@
 //! the window asks of the shell.
 
 use letters_api::{Entry, EntryKind, Role as Grade, Space, SpaceKind, Tag};
+use letters_render::{Item, Point};
 use letters_test::{Harness, Role};
 use letters_ui::{Browsed, Landing, Place, Request, Server};
 
@@ -137,15 +138,200 @@ fn open_lists_what_a_server_keeps_for_someone_signed_in() {
     let about = |window: &mut Harness, name: &str| {
         window.find(Role::ListBoxOption, name).and_then(|found| found.description).unwrap_or_default()
     };
-    assert_eq!(about(&mut window, "Roof plan"), "Document, Today");
-    assert_eq!(about(&mut window, "Tax 2026"), "Document, 6 Nov");
+    assert_eq!(about(&mut window, "Roof plan"), "Document, Modified Today");
+    assert_eq!(about(&mut window, "Tax 2026"), "Document, Modified 6 Nov");
     assert_eq!(about(&mut window, "House"), "Folder");
 
     // Half past eleven last night by UTC was today an hour to the east.
     let mut window = signed_in(&[HOME]);
     window.ui().set_utc_offset(60);
     open(&mut window, vec![document("sam", "Late.let", "d7", 12 * 3_600 + 1_800)]);
-    assert_eq!(about(&mut window, "Late"), "Document, Today");
+    assert_eq!(about(&mut window, "Late"), "Document, Modified Today");
+}
+
+/// A document these people wrote, made at this moment as RFC 3339 writes it.
+fn written(path: &str, id: &str, by: &[&str], made: &str) -> Entry {
+    let contributors = by.iter().map(|name| (*name).to_owned()).collect();
+    Entry { contributors, created: Some(made.into()), ..document("sam", path, id, 0) }
+}
+
+/// Whose name the pointer is told over the face that stands `at` places along under "Contributors", in the
+/// row of the document with this name.
+fn face(window: &mut Harness, name: &str, at: usize) -> Option<String> {
+    let head = window.find(Role::Label, "Contributors").expect("the heading").bounds;
+    let row = window.find(Role::ListBoxOption, name).expect("listed").bounds;
+    window.hover_at(Point { x: head.x + 26.0 * at as f32 + 12.0, y: row.y + row.height / 2.0 });
+    window.controls().into_iter().find(|found| found.role == Role::Tooltip).map(|found| found.name)
+}
+
+/// Whether the row of the document with this name has anything written under a heading of the list.
+fn says(window: &mut Harness, name: &str, heading: (Role, &str)) -> bool {
+    let head = window.find(heading.0, heading.1).expect("the heading").bounds;
+    let row = window.find(Role::ListBoxOption, name).expect("listed").bounds;
+    let under =
+        |at: Point| at.x >= head.x - 1.0 && at.x < head.x + head.width && at.y > row.y && at.y < row.y + row.height;
+    window.paint().items.iter().any(|item| matches!(item, Item::Glyphs { origin, .. } if under(*origin)))
+}
+
+#[test]
+fn a_row_says_who_wrote_a_document_and_when_it_was_made() {
+    let mut window = signed_in(&[HOME]);
+    window.resize(1100.0, 820.0);
+    let crowd = ["Sam Okafor", "Alice Moreau", "Sota Ono", "Chidi Obi", "Priya Nair"];
+    let held = vec![
+        folder("sam", "House"),
+        written("Roof plan.let", "d1", &crowd[..2], "2026-11-06T09:00:00Z"),
+        written("Survey.let", "d2", &crowd[..3], "2025-10-28T09:00:00Z"),
+        written("Minutes.let", "d3", &crowd, "2026-11-14T09:00:00Z"),
+        document("sam", "Tax 2026.let", "d4", 0),
+    ];
+    open(&mut window, held);
+    let about = |window: &mut Harness, name: &str| {
+        window.find(Role::ListBoxOption, name).and_then(|found| found.description).unwrap_or_default()
+    };
+    // A screen reader is told the row across, as the columns stand.
+    assert_eq!(about(&mut window, "Roof plan"), "Document, By Sam Okafor, Alice Moreau, Created 6 Nov, Modified Today");
+    assert!(about(&mut window, "Survey").contains("Created 28 Oct 2025"), "a year back says its year");
+    assert_eq!(about(&mut window, "Tax 2026"), "Document, Modified Today", "what is not known is not said");
+    // The eye is told the same under each heading: the row, and whether it has a day there.
+    let (made, modified) = ((Role::Label, "Created"), (Role::Button, "Modified"));
+    for (name, days) in [("Roof plan", [true, true]), ("Tax 2026", [false, true]), ("House", [false, false])] {
+        let written = [made, modified].map(|heading| says(&mut window, name, heading));
+        assert_eq!(written, days, "{name}");
+    }
+
+    // Each writer has a face under the heading, which says whose it is under the pointer.
+    let faces = [
+        ("Roof plan", vec![Some("Sam Okafor"), Some("Alice Moreau"), None]),
+        ("Survey", vec![Some("Sam Okafor"), Some("Alice Moreau"), Some("Sota Ono")]),
+        // More than the column holds: the last place counts the rest and names them.
+        ("Minutes", vec![Some("Sam Okafor"), Some("Alice Moreau"), Some("Sota Ono, Chidi Obi, Priya Nair")]),
+        ("Tax 2026", vec![None]),
+        ("House", vec![None]),
+    ];
+    for (name, told) in faces {
+        for (at, whose) in told.into_iter().enumerate() {
+            assert_eq!(face(&mut window, name, at).as_deref(), whose, "{name}, face {at}");
+        }
+    }
+}
+
+#[test]
+fn the_day_a_document_was_made_is_told_by_the_persons_clock() {
+    // Half past eleven at night by UTC is the next day an hour to the east.
+    for (zone, said) in [(0, "Created Yesterday"), (60, "Created Today")] {
+        let mut window = signed_in(&[HOME]);
+        window.ui().set_utc_offset(zone);
+        open(&mut window, vec![written("Late.let", "d7", &[], "2026-11-14T23:30:00Z")]);
+        let about = window.find(Role::ListBoxOption, "Late").and_then(|found| found.description).unwrap_or_default();
+        assert!(about.split(", ").any(|part| part == said), "{zone}: {about}");
+    }
+}
+
+/// Two folders and three documents as a server lists them: folders first, each by name whatever its case.
+/// The folder that comes first by name was written longest ago.
+fn mixed() -> Vec<Entry> {
+    vec![
+        Entry { modified: NOON - 30 * DAY, ..folder("sam", "House") },
+        folder("sam", "Letters sent"),
+        document("sam", "attic notes.let", "d3", DAY),
+        document("sam", "Roof plan.let", "d1", 2 * 3_600),
+        document("sam", "Tax 2026.let", "d2", 9 * DAY),
+    ]
+}
+
+/// The headings that are pressed, how the place is then listed, and what "Name" and "Modified" say of it.
+type Sorted = (&'static [&'static str], [&'static str; 5], [Option<&'static str>; 2]);
+
+#[test]
+fn what_a_place_holds_is_listed_by_name_or_by_when_it_was_last_written() {
+    const BY_NAME: [&str; 5] = ["House", "Letters sent", "attic notes", "Roof plan", "Tax 2026"];
+    const NEWEST: [&str; 5] = ["House", "Letters sent", "Roof plan", "attic notes", "Tax 2026"];
+    // Folders stay first, and keep to their names when the documents go by their days.
+    let cases: [Sorted; 7] = [
+        (&[], BY_NAME, [Some("Sorted from A to Z"), None]),
+        (
+            &["Name"],
+            ["Letters sent", "House", "Tax 2026", "Roof plan", "attic notes"],
+            [Some("Sorted from Z to A"), None],
+        ),
+        (&["Name", "Name"], BY_NAME, [Some("Sorted from A to Z"), None]),
+        (&["Modified"], NEWEST, [None, Some("Sorted newest first")]),
+        (
+            &["Modified", "Modified"],
+            ["House", "Letters sent", "Tax 2026", "attic notes", "Roof plan"],
+            [None, Some("Sorted oldest first")],
+        ),
+        (&["Modified", "Modified", "Modified"], NEWEST, [None, Some("Sorted newest first")]),
+        // Another heading starts the way it runs first, whichever way the last one ran.
+        (&["Modified", "Name"], BY_NAME, [Some("Sorted from A to Z"), None]),
+    ];
+    for (pressed, order, said) in cases {
+        let mut window = signed_in(&[HOME]);
+        open(&mut window, mixed());
+        for heading in pressed {
+            window.click(Role::Button, heading);
+        }
+        assert_eq!(listed(&mut window, "Documents").0, order, "{pressed:?}");
+        let says = ["Name", "Modified"].map(|heading| window.find(Role::Button, heading).expect("pressed").description);
+        assert_eq!(says, said.map(|said| said.map(str::to_owned)), "{pressed:?}");
+        assert_eq!(window.ui().take_requests(), [], "{pressed:?}: the server is not asked again");
+    }
+}
+
+#[test]
+fn the_order_that_was_chosen_holds_from_place_to_place_but_for_what_was_open_lately() {
+    let mut window = signed_in(&[HOME]);
+    open(&mut window, mixed());
+    window.click(Role::Button, "Modified");
+    let lately = || vec![document("sam", "Tax 2026.let", "d2", 9 * DAY), document("sam", "Roof plan.let", "d1", 0)];
+    // What was open lately stays as the server tells it, the last opened first, and is not to be sorted.
+    window.click(Role::ListBoxOption, "Recent");
+    window.ui().set_listing(listing(HOME, Place::Recent, lately()));
+    assert_eq!(listed(&mut window, "Documents").0, ["Tax 2026", "Roof plan"]);
+    assert!(!has(&mut window, Role::Button, "Name") && !has(&mut window, Role::Button, "Modified"));
+    assert!(has(&mut window, Role::Label, "Modified"), "the columns still say what they hold");
+    // Every other place is listed as the last one was.
+    window.click(Role::ListBoxOption, "Shared with me");
+    window.ui().set_listing(listing(HOME, Place::Shared, lately()));
+    assert_eq!(listed(&mut window, "Documents").0, ["Roof plan", "Tax 2026"]);
+}
+
+#[test]
+fn a_heading_keeps_the_keyboard_while_the_order_is_turned_round() {
+    let mut window = signed_in(&[HOME]);
+    open(&mut window, mixed().split_off(2));
+    let at = |window: &mut Harness| window.focused().map(|found| found.name).unwrap_or_default();
+    assert_eq!(at(&mut window), "attic notes", "what a place holds takes the keyboard as it comes");
+    // Back from the documents to the heading over them. The row that comes first then does not take the
+    // keyboard from it.
+    window.key("Shift+Tab");
+    assert_eq!(at(&mut window), "Modified");
+    window.key("Enter");
+    assert_eq!(listed(&mut window, "Documents").0, ["Roof plan", "attic notes", "Tax 2026"]);
+    window.key("Enter");
+    assert_eq!(listed(&mut window, "Documents").0, ["Tax 2026", "attic notes", "Roof plan"]);
+    assert_eq!(at(&mut window), "Modified");
+}
+
+#[test]
+fn a_narrow_window_holds_the_card_and_leaves_out_what_it_has_no_room_for() {
+    // How wide the window is, and whether a row says who wrote a document and when it was made.
+    for (width, roomy) in [(1100.0, true), (700.0, false), (420.0, false)] {
+        let mut window = signed_in(&[HOME]);
+        window.resize(width, 820.0);
+        open(&mut window, vec![written("Roof plan.let", "d1", &["Sam Okafor"], "2026-11-06T09:00:00Z")]);
+        let card = window.find(Role::Dialog, "Open").expect("the card").bounds;
+        assert!(card.x >= 0.0 && card.x + card.width <= width, "{width}: {card:?}");
+        for heading in ["Contributors", "Created"] {
+            assert_eq!(has(&mut window, Role::Label, heading), roomy, "{width}: {heading}");
+        }
+        // When it was last written is said at any width, at the row's end and inside the card.
+        let modified = window.find(Role::Button, "Modified").expect("the heading").bounds;
+        assert!(modified.x + modified.width < card.x + card.width, "{width}: {modified:?} in {card:?}");
+        window.click(Role::ListBoxOption, "Roof plan");
+        assert_eq!(window.ui().take_requests(), [Request::OpenFrom { server: HOME.into(), id: "d1".into() }]);
+    }
 }
 
 #[test]
@@ -306,8 +492,8 @@ fn the_places_are_one_stop_of_the_tab_key_at_the_place_that_is_looked_at() {
     let mut window = signed_in(&[HOME]);
     open(&mut window, own());
     let at = |window: &mut Harness| window.focused().map(|found| found.name).unwrap_or_default();
-    // Back from the documents, past what stands over them, to the places.
-    for _ in 0..3 {
+    // Back from the documents, past the headings and what else stands over them, to the places.
+    for _ in 0..5 {
         if at(&mut window) != "Sam Okafor" {
             window.key("Shift+Tab");
         }

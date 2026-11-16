@@ -395,7 +395,19 @@ fn send(asked: Noting) -> Message {
 
 /// The face of who speaks: the first letters of their name, or the sign of an import for what it noted.
 pub(crate) fn face(name: &str, import: bool) -> Element<Message> {
-    let round = Element::row()
+    match import {
+        true => round(Element::icon(icon::FILE_INPUT, SIGN)),
+        false => lettered(&initials(name)),
+    }
+}
+
+/// A face that says a few letters: the first of someone's name, or how many more people there are.
+pub(crate) fn lettered(letters: &str) -> Element<Message> {
+    round(Element::text(letters, TextStyle::control().size(10.0).weight(600)))
+}
+
+fn round(inside: Element<Message>) -> Element<Message> {
+    Element::row()
         .width(FACE)
         .height(FACE)
         .radius(FACE / 2.0)
@@ -403,11 +415,8 @@ pub(crate) fn face(name: &str, import: bool) -> Element<Message> {
         .fg(tokens::FG_MUTED)
         .align(Align::Center)
         .justify(Justify::Center)
-        .decorative();
-    match import {
-        true => round.child(Element::icon(icon::FILE_INPUT, SIGN)),
-        false => round.child(Element::text(initials(name), TextStyle::control().size(10.0).weight(600))),
-    }
+        .decorative()
+        .child(inside)
 }
 
 /// One comment or reply in a note: who said it and when, over what was said. A press on a link in it asks

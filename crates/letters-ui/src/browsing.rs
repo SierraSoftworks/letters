@@ -10,19 +10,29 @@ use letters_api::{Entry, EntryKind, Role as Grade, Space, SpaceKind, Tag};
 use crate::color::fade;
 use crate::element::Element;
 use crate::icon::{self, Icon};
-use crate::opening::{Request, day, day_called};
+use crate::layout::MARGIN;
+use crate::opening::{Request, day, day_called, seconds};
 use crate::servers::{Server, host};
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::text::TextStyle;
+use crate::threads::{FACE, face, lettered};
 use crate::tokens::{self, Color as Ink};
-use crate::widgets::{Button, Popover, Segmented};
+use crate::widgets::{Button, Popover, Segmented, Side};
 use crate::window::Message;
 
-const WIDTH: f32 = 760.0;
+/// How wide the card is where the window has the room, and how wide it has to be for a row to say more
+/// of a document than its name and when it was last written.
+const WIDTH: f32 = 880.0;
+const ROOMY: f32 = 760.0;
 /// How wide the places are, and how tall they and what they hold stand, whatever is in them.
 const PLACES: f32 = 200.0;
 const HEIGHT: f32 = 340.0;
 const ROW: f32 = 36.0;
+/// How many of a document's writers a row shows the faces of, and how wide its columns after the name are:
+/// those faces, the day it was made and the day it was last written.
+const FACES: usize = 3;
+const WRITERS: f32 = FACES as f32 * (FACE + tokens::SPACE_2XS);
+const DAY: f32 = 88.0;
 
 /// A place among the documents a server keeps.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +75,17 @@ pub enum Browsing {
     Device,
     /// Start a document in the folder that is looked at.
     New,
+    /// List what the place holds by this, or the other way round if it is listed so already.
+    Sort(Order),
+}
+
+/// What the documents of a place are listed by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    /// From A to Z.
+    Name,
+    /// The last written first.
+    Modified,
 }
 
 #[derive(Default)]
@@ -79,6 +100,10 @@ pub(crate) struct Browser {
     entries: Option<Vec<Entry>>,
     /// Why the last place could not be read.
     notice: Option<String>,
+    /// What the person chose to list a place by, and whether that is turned round.
+    chosen: Option<(Order, bool)>,
+    /// What the place holds has just come, and its first row takes the keyboard.
+    fresh: bool,
     /// The time when the card opened, in seconds since 1970, and the person's zone in minutes.
     now: Option<u64>,
     zone: i32,
@@ -108,7 +133,7 @@ impl Browser {
             }
             self.spaces = Some(listing.spaces);
         } else if self.place.as_ref() == Some(&listing.place) {
-            (self.entries, self.notice) = (Some(listing.entries), None);
+            (self.entries, self.notice, self.fresh) = (Some(listing.entries), None, true);
         }
     }
 
@@ -166,7 +191,39 @@ impl Browser {
                     self.close();
                 }
             }
+            Browsing::Sort(by) => {
+                let turned = self.order().is_some_and(|(at, turned)| at == by && !turned);
+                // The keyboard stays on the heading, to turn the order round with.
+                (self.chosen, self.fresh) = (Some((by, turned)), false);
+            }
         }
+    }
+
+    /// What the place is listed by, and whether that is turned round: by name, as a server lists it, until
+    /// the person chooses. What was open lately stays in the order it was opened in.
+    fn order(&self) -> Option<(Order, bool)> {
+        match self.place {
+            Some(Place::Recent) | None => None,
+            Some(_) => Some(self.chosen.unwrap_or((Order::Name, false))),
+        }
+    }
+
+    /// What the place holds in the order it is listed in.
+    fn sorted<'a>(&self, entries: &'a [Entry]) -> Vec<&'a Entry> {
+        let mut rows: Vec<&Entry> = entries.iter().collect();
+        let Some((by, turned)) = self.order() else { return rows };
+        let folder = |entry: &Entry| entry.kind == EntryKind::Folder;
+        rows.sort_by(|a, b| {
+            let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+            let within = match by {
+                Order::Name => names,
+                Order::Modified if !folder(a) => b.modified.cmp(&a.modified),
+                // Folders keep to their names: when one was last written says little of what is in it.
+                Order::Modified => return folder(b).cmp(&folder(a)).then(names),
+            };
+            folder(b).cmp(&folder(a)).then(if turned { within.reverse() } else { within })
+        });
+        rows
     }
 
     /// The folder that is looked at, by its space and its path there, if the person may write in it: a
@@ -191,11 +248,12 @@ impl Browser {
         self.place = Some(place);
     }
 
-    /// The card over the middle of the window, while it is open: see `settings::Dialog::view`.
-    pub fn view(&self, servers: &[Server]) -> Option<Element<Message>> {
+    /// The card over the middle of a window this wide, while it is open: see `settings::Dialog::view`.
+    pub fn view(&self, servers: &[Server], window: f32) -> Option<Element<Message>> {
         if !self.open {
             return None;
         }
+        let width = WIDTH.min(window - 2.0 * MARGIN);
         let head = Element::row()
             .align(Align::Center)
             .justify(Justify::Between)
@@ -233,9 +291,9 @@ impl Browser {
             .radius(tokens::RADIUS_CONTROL)
             .child(self.places())
             .child(line())
-            .child(self.held());
+            .child(self.held(width >= ROOMY));
         let content = Element::column()
-            .width(WIDTH)
+            .width(width)
             .gap(tokens::SPACE_MD)
             .padding(Edges { top: tokens::SPACE_LG, ..Edges::all(tokens::SPACE_XL) })
             .child(head)
@@ -244,7 +302,7 @@ impl Browser {
         let dialog = Popover::new(content)
             .flush()
             .label("Open")
-            .max_width(WIDTH)
+            .max_width(width)
             .modal()
             .open(true)
             .on_close(send(Browsing::Close));
@@ -278,8 +336,9 @@ impl Browser {
             .children(rows)
     }
 
-    /// What the place that is looked at holds, under the way that leads to it.
-    fn held(&self) -> Element<Message> {
+    /// What the place that is looked at holds, under the way that leads to it. `roomy` is whether the card
+    /// has the room to say who wrote a document and when it was made.
+    fn held(&self, roomy: bool) -> Element<Message> {
         // What is too long for a row is cut short there: the pane is as wide as the card leaves it.
         let pane = Element::column()
             .grow(1.0)
@@ -311,9 +370,9 @@ impl Browser {
         let today = self.now.map(|now| day(now, self.zone));
         // The first of them takes the keyboard as they come, so that a folder gone into with Enter is
         // walked on with the arrow keys.
-        let rows = entries.iter().enumerate().map(|(at, entry)| {
-            let row = self.entry(entry, today);
-            if at == 0 { row.takes_focus() } else { row }
+        let rows = self.sorted(entries).into_iter().enumerate().map(|(at, entry)| {
+            let row = self.entry(entry, today, roomy);
+            if at == 0 && self.fresh { row.takes_focus() } else { row }
         });
         let list = Element::column()
             .grow(1.0)
@@ -324,7 +383,51 @@ impl Browser {
             .one_stop()
             .scroll()
             .children(rows);
-        pane.child(list)
+        pane.child(self.heads(roomy)).child(list)
+    }
+
+    /// What stands in each column of the list, over it. The two a place is listed by are pressed for it.
+    fn heads(&self, roomy: bool) -> Element<Message> {
+        let plain = |name: &str, width: f32| {
+            Element::row().width(width).child(Element::text(name, small()).fg(tokens::FG_MUTED))
+        };
+        let more = [plain("Contributors", WRITERS), plain("Created", DAY)];
+        Element::row()
+            .align(Align::Center)
+            .gap(tokens::SPACE_SM)
+            .padding(Edges::xy(tokens::SPACE_SM, 0.0))
+            .child(Element::row().grow(1.0).child(self.head("Name", Order::Name)))
+            .children(more.into_iter().filter(|_| roomy))
+            .child(Element::row().width(DAY).child(self.head("Modified", Order::Modified)))
+    }
+
+    /// The heading of a column the place is listed by, with which way it runs while it is.
+    fn head(&self, name: &str, by: Order) -> Element<Message> {
+        let said = Element::text(name, small());
+        let Some((at, turned)) = self.order() else { return said.fg(tokens::FG_MUTED) };
+        let head = Element::row()
+            .align(Align::Center)
+            .gap(tokens::SPACE_2XS)
+            .radius(tokens::RADIUS_CONTROL)
+            .fg(tokens::FG_MUTED)
+            .hover(Look::NONE.with_fg(tokens::FG))
+            .ring(Ring::Outline(2.0))
+            .role(Role::Button)
+            .label(name)
+            .focusable()
+            .on_press(send(Browsing::Sort(by)))
+            .child(said);
+        if at != by {
+            return head;
+        }
+        // Names run up from A and days run back from today, until the order is turned round.
+        let (mark, sorted) = match (by, turned) {
+            (Order::Name, false) => (icon::CHEVRON_UP, "Sorted from A to Z"),
+            (Order::Name, true) => (icon::CHEVRON_DOWN, "Sorted from Z to A"),
+            (Order::Modified, false) => (icon::CHEVRON_DOWN, "Sorted newest first"),
+            (Order::Modified, true) => (icon::CHEVRON_UP, "Sorted oldest first"),
+        };
+        head.description(sorted).child(Element::icon(mark, 12.0))
     }
 
     /// The way to the folder that is looked at, from its space down. Each step but the last leads back. At
@@ -364,7 +467,7 @@ impl Browser {
 
     /// One folder or document of the place. A folder is gone into, a document is opened, and a file that
     /// could not be read as a document is only listed.
-    fn entry(&self, entry: &Entry, today: Option<i64>) -> Element<Message> {
+    fn entry(&self, entry: &Entry, today: Option<i64>, roomy: bool) -> Element<Message> {
         let folder = entry.kind == EntryKind::Folder;
         let does = match (&entry.space, &entry.id) {
             (Some(space), _) if folder => {
@@ -374,20 +477,34 @@ impl Browser {
             _ => None,
         };
         let noted = notes(&entry.tags);
-        let when = (!folder).then(|| day_called(day(entry.modified, self.zone), today));
+        let called = |seconds: u64| day_called(day(seconds, self.zone), today);
+        let made = entry.created.as_deref().and_then(seconds).map(called);
+        let when = (!folder).then(|| called(entry.modified));
         // A screen reader is told the row whole, in the order it is read across.
         let kind = if folder { "Folder" } else { "Document" };
-        let about: Vec<&str> = [Some(kind), noted.as_deref(), when.as_deref()].into_iter().flatten().collect();
+        let by = (!entry.contributors.is_empty()).then(|| format!("By {}", entry.contributors.join(", ")));
+        let told = [
+            Some(kind.to_owned()),
+            noted.clone(),
+            by,
+            made.as_ref().map(|made| format!("Created {made}")),
+            when.as_ref().map(|when| format!("Modified {when}")),
+        ];
+        let about: Vec<String> = told.into_iter().flatten().collect();
         let mark = if folder { icon::FOLDER } else { icon::FILE_TEXT };
         let key = format!("{}/{}/{}", entry.space.as_deref().unwrap_or_default(), entry.path, entry.name);
         // The note has the room the name and the day leave, and is cut short in it: the name is what a
         // document is found by.
         let noted = noted.as_deref().map(|noted| Element::text(noted, quiet()).fg(tokens::FG_MUTED).shrink());
+        let on = |said: Option<String>| {
+            Element::row().width(DAY).children(said.map(|said| Element::text(said, quiet()).fg(tokens::FG_MUTED)))
+        };
         let row = option(mark, &entry.name, false)
             .key(key.as_str())
             .description(about.join(", "))
             .child(Element::row().width(0.0).grow(1.0).clip().children(noted))
-            .children(when.as_deref().map(|when| Element::text(when, quiet()).fg(tokens::FG_MUTED)));
+            .children([writers(&entry.contributors), on(made)].into_iter().filter(|_| roomy))
+            .child(on(when));
         match does {
             Some(does) => row.on_press(send(does)),
             None => row.disabled(true),
@@ -439,6 +556,17 @@ fn notes(tags: &[Tag]) -> Option<String> {
     (!said.is_empty()).then(|| said.join(", "))
 }
 
+/// Who wrote a document: the faces of the first of them, each named under the pointer, and how many more
+/// there are.
+fn writers(names: &[String]) -> Element<Message> {
+    // The count takes the last face's place.
+    let shown = if names.len() > FACES { FACES - 1 } else { names.len() };
+    let faces = names[..shown].iter().map(|name| face(name, false).tooltip(name.as_str(), Side::Top));
+    let rest = names[shown..].join(", ");
+    let more = (names.len() > shown).then(|| lettered(&format!("+{}", names.len() - shown)).tooltip(rest, Side::Top));
+    Element::row().width(WRITERS).gap(tokens::SPACE_2XS).children(faces).children(more)
+}
+
 /// A folder of a space, by its path there.
 fn within(space: &Space, path: &str) -> Place {
     Place::Folder { space: space.id.clone(), path: path.to_owned() }
@@ -446,6 +574,10 @@ fn within(space: &Space, path: &str) -> Place {
 
 fn quiet() -> TextStyle {
     TextStyle::control().size(tokens::TEXT_SM)
+}
+
+fn small() -> TextStyle {
+    TextStyle::control().size(tokens::TEXT_XS)
 }
 
 fn send(message: Browsing) -> Message {
