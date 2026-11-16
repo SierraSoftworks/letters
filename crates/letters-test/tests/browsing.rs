@@ -396,7 +396,7 @@ fn a_narrow_window_holds_the_card_and_leaves_out_what_it_has_no_room_for() {
 
 #[test]
 fn what_is_done_from_a_row_stays_in_reach_beside_its_name_in_a_narrow_window() {
-    for (width, _, dated) in WINDOWS {
+    for (width, roomy, dated) in WINDOWS {
         // A button says its name where a row has room for a day. Where it has not, it shows its icon and is
         // named under the pointer.
         let reached = |window: &mut Harness, button: Found, name: &str| {
@@ -431,6 +431,11 @@ fn what_is_done_from_a_row_stays_in_reach_beside_its_name_in_a_narrow_window() {
         window.click_at(back.center());
         let asked = Request::PutBack { server: HOME.into(), space: "sam".into(), file: "Roof plan.let~1".into() };
         assert_eq!(window.ui().take_requests(), [asked], "{width}");
+        // While it waits the button says so in its row, in words where the row is at its widest.
+        let waits = button(&mut window, "Putting back", "Roof plan").expect("the row says that it waits").bounds;
+        let row = window.find(Role::ListBoxOption, "Roof plan").expect("listed").bounds;
+        assert!(waits.x > row.x && waits.x + waits.width < row.x + row.width, "{width}: {waits:?} in {row:?}");
+        assert_eq!(waits.width > 2.0 * waits.height, roomy, "{width}: {waits:?}");
     }
 }
 
@@ -593,15 +598,24 @@ fn a_conflict_copy_is_merged_into_its_original_from_its_row() {
 
     window.click(Role::Button, "Merge conflicts");
     let asked = Request::MergeConflictsOf { server: HOME.into(), id: "d3".into(), place: within("sam", "") };
-    assert_eq!(window.ui().take_requests(), [asked]);
-    assert!(has(&mut window, Role::Status, ASKING), "what the place holds then is waited for");
+    assert_eq!(window.ui().take_requests(), std::slice::from_ref(&asked));
+    // The list stays while the server merges, and the row alone says that it waits.
+    assert_eq!(listed(&mut window, "Documents").0, ["Minutes", "Minutes (conflicted copy)"]);
+    assert!(!has(&mut window, Role::Status, ASKING));
+    let waits = button(&mut window, "Merging", "Into Minutes").expect("the row says what is being done");
+    assert!(waits.disabled, "which is not a thing to press");
     assert!(!has(&mut window, Role::Button, "Merge conflicts"), "and the merge is not asked for twice");
-    // The answer is the place without the copy, or why not.
+    // Why it could not be done is said over the list, and the merge can be asked for again.
     window.ui().refuse_browse(REFUSAL);
     window.assert_open(Role::Alert, REFUSAL);
-    window.ui().set_listing(listing(HOME, within("sam", ""), vec![original()]));
+    assert_eq!(listed(&mut window, "Documents").0.len(), 2, "the list is still there");
+    window.click(Role::Button, "Merge conflicts");
+    assert_eq!(window.ui().take_requests(), [asked]);
     window.assert_closed(Role::Alert, REFUSAL);
+    // The answer is the place without the copy.
+    window.ui().set_listing(listing(HOME, within("sam", ""), vec![original()]));
     assert_eq!(listed(&mut window, "Documents").0, ["Minutes"]);
+    assert!(!has(&mut window, Role::Button, "Merging"));
 
     // Whoever may not edit there is told what the file is, and can neither merge it nor open it.
     for role in [Grade::Commenter, Grade::Reader] {
@@ -614,6 +628,133 @@ fn a_conflict_copy_is_merged_into_its_original_from_its_row() {
         window.click(Role::ListBoxOption, "Minutes (conflicted copy)");
         assert_eq!(window.ui().take_requests(), [], "{role:?}");
     }
+}
+
+/// Two documents with a conflict copy each, and one without, less those of these names.
+fn copied(without: &[&str]) -> Vec<Entry> {
+    let copy = |name: &str, id: &str| {
+        let tags = vec![Tag::ConflictCopy { of: format!("{name}.let") }];
+        Entry { tags, ..document("sam", &format!("{name} (conflicted copy).let"), id, 0) }
+    };
+    let held = vec![
+        document("sam", "Minutes.let", "d3", 0),
+        copy("Minutes", "d3"),
+        document("sam", "Rota.let", "d5", 0),
+        copy("Rota", "d5"),
+        document("sam", "Tax 2026.let", "d2", 0),
+    ];
+    held.into_iter().filter(|entry| !without.contains(&entry.name.as_str())).collect()
+}
+
+/// What the rows that wait for a merge say they are merged into.
+fn merging(window: &mut Harness) -> Vec<String> {
+    let waits = window.controls().into_iter().filter(|found| found.role == Role::Button && found.name == "Merging");
+    waits.filter_map(|found| found.description).collect()
+}
+
+#[test]
+fn the_rows_beside_one_that_waits_for_its_answer_stay_usable() {
+    let merge = |window: &mut Harness, into: &str| {
+        let merge = button(window, "Merge conflicts", into).expect("offered");
+        window.click_at(merge.center());
+    };
+    let asked = |id: &str| Request::MergeConflictsOf { server: HOME.into(), id: id.into(), place: within("sam", "") };
+    let mut window = signed_in(&[HOME]);
+    open(&mut window, copied(&[]));
+    // Another copy is merged while the first waits.
+    merge(&mut window, "Into Minutes");
+    assert_eq!(merging(&mut window), ["Into Minutes"]);
+    merge(&mut window, "Into Rota");
+    assert_eq!(window.ui().take_requests(), [asked("d3"), asked("d5")]);
+    assert_eq!(merging(&mut window), ["Into Minutes", "Into Rota"]);
+    // Why one could not be done is said of the first that was asked, and the other waits on.
+    window.ui().refuse_browse(REFUSAL);
+    assert_eq!(merging(&mut window), ["Into Rota"]);
+    merge(&mut window, "Into Minutes");
+
+    // A place that is left takes its waits with it.
+    window.click(Role::ListBoxOption, "Family");
+    window.click(Role::ListBoxOption, "Sam Okafor");
+    window.ui().set_listing(listing(HOME, within("sam", ""), copied(&[])));
+    assert_eq!(merging(&mut window), Vec::<String>::new());
+    merge(&mut window, "Into Minutes");
+    merge(&mut window, "Into Rota");
+
+    // Each answer is what the place holds by then, in whatever order they come: the row it leaves out is
+    // done, and the other waits on.
+    let left = || listing(HOME, within("sam", ""), copied(&["Rota (conflicted copy)"]));
+    window.ui().set_listing(left());
+    assert_eq!(merging(&mut window), ["Into Minutes"]);
+    assert!(!has(&mut window, Role::ListBoxOption, "Rota (conflicted copy)"));
+    // An answer that still lists the copy ends its wait all the same, so that no row waits for ever.
+    window.ui().set_listing(left());
+    assert_eq!(merging(&mut window), Vec::<String>::new());
+    assert!(button(&mut window, "Merge conflicts", "Into Minutes").is_some(), "and it can be asked for again");
+
+    // A document beside a row that waits is opened as ever.
+    merge(&mut window, "Into Minutes");
+    window.ui().take_requests();
+    window.click(Role::ListBoxOption, "Tax 2026");
+    assert_eq!(window.ui().take_requests(), [Request::OpenFrom { server: HOME.into(), id: "d2".into() }]);
+    window.assert_closed(Role::Dialog, "Open");
+}
+
+#[test]
+fn a_row_that_waits_has_the_keyboard_and_the_list_is_walked_on_when_it_goes() {
+    let at = |window: &mut Harness| window.focused().map(|found| found.name).unwrap_or_default();
+    // Presses this key until the keyboard is on what has this name.
+    let reach = |window: &mut Harness, key: &str, name: &str| {
+        for _ in 0..8 {
+            if at(window) == name {
+                break;
+            }
+            window.key(key);
+        }
+        assert_eq!(at(window), name, "reached from the keyboard with {key}");
+    };
+    // The first copy is merged from the keyboard, in the order a place is first listed in or in one that
+    // was chosen, after which the top of the list no longer asks for the keyboard as it comes.
+    let merged = |chosen: bool| {
+        let mut window = signed_in(&[HOME]);
+        open(&mut window, copied(&[]));
+        if chosen {
+            window.click(Role::Button, "Name").click(Role::Button, "Name");
+        }
+        reach(&mut window, "Down", "Merge conflicts");
+        window.key("Enter");
+        assert_eq!(merging(&mut window), ["Into Minutes"]);
+        window
+    };
+    let done = || listing(HOME, within("sam", ""), copied(&["Minutes (conflicted copy)"]));
+    for chosen in [false, true] {
+        // The button is none while it waits, so its row has the keyboard, and the rows after it are walked to.
+        let mut window = merged(chosen);
+        assert_eq!(at(&mut window), "Minutes (conflicted copy)", "chosen: {chosen}");
+        window.key("Down");
+        assert_eq!(at(&mut window), "Rota", "chosen: {chosen}");
+        // The answer leaves the keyboard where the person has it by then.
+        window.ui().set_listing(done());
+        assert_eq!(at(&mut window), "Rota", "chosen: {chosen}");
+
+        // An answer that takes away the row the keyboard is on leaves it on the list, at its top.
+        let mut window = merged(chosen);
+        window.ui().set_listing(done());
+        assert_eq!(at(&mut window), "Minutes", "chosen: {chosen}");
+        window.key("Down");
+        assert_eq!(at(&mut window), "Rota", "chosen: {chosen}: and the list is walked on");
+    }
+
+    // So it is in the trash.
+    let mut window = signed_in(&[HOME]);
+    open_trash(&mut window, bin());
+    reach(&mut window, "Tab", "Roof plan");
+    reach(&mut window, "Down", "Old letters");
+    window.key("Down");
+    assert_eq!(at(&mut window), "Put back");
+    window.key("Enter");
+    assert_eq!(at(&mut window), "Old letters", "the row that waits has the keyboard");
+    window.ui().set_trash(HOME, bin().into_iter().filter(|gone| gone.name != "Old letters").collect());
+    assert_eq!(at(&mut window), "Roof plan", "and the top of what is left has it when the row has gone");
 }
 
 #[test]
@@ -779,16 +920,36 @@ fn whoever_edits_in_a_space_puts_back_what_was_thrown_away_there() {
     let card = window.find(Role::Dialog, "Open").expect("the card").bounds;
     assert!(back.bounds.x + back.bounds.width < card.x + card.width, "{:?} in {card:?}", back.bounds);
     window.click_at(back.center());
-    let asked = Request::PutBack { server: HOME.into(), space: "sam".into(), file: "Roof plan.let~1".into() };
-    assert_eq!(window.ui().take_requests(), [asked]);
-    assert!(has(&mut window, Role::Status, ASKING), "what the trash holds then is waited for");
-    assert!(button(&mut window, "Put back", "Old letters").is_none(), "and nothing more is asked meanwhile");
-    // The answer is the trash without it, or why not.
+    let asked =
+        |name: &str| Request::PutBack { server: HOME.into(), space: "sam".into(), file: format!("{name}.let~1") };
+    assert_eq!(window.ui().take_requests(), [asked("Roof plan")]);
+    // The trash stays while the server puts it back, and the row alone says that it waits.
+    assert_eq!(listed(&mut window, "Trash").0, ["Roof plan", "Old letters", "Rota"]);
+    assert!(!has(&mut window, Role::Status, ASKING));
+    let waits = button(&mut window, "Putting back", "Roof plan").expect("the row says what is being done");
+    assert!(waits.disabled, "which is not a thing to press");
+    assert!(waits.bounds.x + waits.bounds.width < card.x + card.width, "{:?} in {card:?}", waits.bounds);
+    assert!(button(&mut window, "Put back", "Roof plan").is_none(), "and it is not asked for twice");
+    // Why it could not be done is said over the trash, and it can be asked for again.
     window.ui().refuse_browse(REFUSAL);
     window.assert_open(Role::Alert, REFUSAL);
-    window.ui().set_trash(HOME, bin().split_off(1));
+    assert_eq!(listed(&mut window, "Trash").0.len(), 3, "the trash is still there");
+    let again = button(&mut window, "Put back", "Roof plan").expect("offered again");
+    window.click_at(again.center());
     window.assert_closed(Role::Alert, REFUSAL);
-    assert_eq!(listed(&mut window, "Trash").0, ["Old letters", "Rota"]);
+    // What is beside it is put back meanwhile.
+    let other = button(&mut window, "Put back", "Old letters").expect("still offered");
+    window.click_at(other.center());
+    assert_eq!(window.ui().take_requests(), [asked("Roof plan"), asked("Old letters")]);
+    // Each answer is the trash as it is by then, in whatever order they come: what it leaves out is back,
+    // and the other waits on.
+    let left = || bin().into_iter().filter(|gone| gone.name != "Old letters").collect::<Vec<_>>();
+    window.ui().set_trash(HOME, left());
+    assert_eq!(listed(&mut window, "Trash").0, ["Roof plan", "Rota"]);
+    assert!(button(&mut window, "Putting back", "Roof plan").is_some());
+    // An answer that still lists it ends its wait all the same, so that no row waits for ever.
+    window.ui().set_trash(HOME, left());
+    assert!(button(&mut window, "Put back", "Roof plan").is_some(), "and it can be asked for again");
 }
 
 #[test]

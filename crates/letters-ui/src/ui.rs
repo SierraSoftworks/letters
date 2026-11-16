@@ -1522,8 +1522,16 @@ impl<A: App> Ui<A> {
 
         if focus.and_then(|id| tree.find(id)).is_none_or(|i| !tree.focusable(i)) {
             // Under a dialog the page is out of reach, and what is typed must not go to it. Nothing has
-            // focus until Tab is pressed, so that Enter presses nothing the person did not choose.
-            focus = if tree.modal_layer().is_some() { None } else { self.rest() };
+            // focus until Tab is pressed, so that Enter presses nothing the person did not choose: but for
+            // an element of the dialog that asked to have it after one that went.
+            let heir = |layer| {
+                let mut heirs = (0..tree.nodes.len()).filter(|&i| tree.nodes[i].el.heir && tree.in_layer(i, layer));
+                heirs.find(|&i| tree.focusable(i)).map(|i| tree.nodes[i].id).filter(|_| focus.is_some())
+            };
+            focus = match tree.modal_layer() {
+                Some(layer) => heir(layer),
+                None => self.rest(),
+            };
         }
         if focus != self.focus {
             self.focus = focus;

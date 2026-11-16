@@ -35,8 +35,10 @@ const ROW: f32 = 36.0;
 const FACES: usize = 3;
 const WRITERS: f32 = FACES as f32 * (FACE + tokens::SPACE_2XS);
 const DAY: f32 = 88.0;
-/// How wide the end of a row of the trash is, where what was thrown away is put back.
+/// How wide the end of a row of the trash is, where what was thrown away is put back. A roomy row has it
+/// wider, for a button that says in words that it waits.
 const BACK: f32 = 104.0;
+const BACK_ROOMY: f32 = 120.0;
 
 /// How much a card has room for, by how wide it is.
 #[derive(Clone, Copy, PartialEq, PartialOrd)]
@@ -137,8 +139,11 @@ pub(crate) struct Browser {
     /// The trash is looked at in place of `place`, and what is in it once the server has said.
     binned: bool,
     thrown: Option<Vec<Trashed>>,
-    /// Why the last place could not be read.
+    /// Why the last place could not be read, or what was asked of a row could not be done.
     notice: Option<String>,
+    /// The rows whose answer is waited for, in the order they were asked: a document whose conflict copies
+    /// are merged by its id, and what is put back by its space and what names it in the trash.
+    busy: Vec<String>,
     /// What the person chose to list a place by, and whether that is turned round.
     chosen: Option<(Order, bool)>,
     /// What the place holds has just come, and its first row takes the keyboard.
@@ -172,7 +177,20 @@ impl Browser {
             }
             self.spaces = Some(listing.spaces);
         } else if !self.binned && self.place.as_ref() == Some(&listing.place) {
-            (self.entries, self.notice, self.fresh) = (Some(listing.entries), None, true);
+            // The answer to a merge leaves the keyboard where the person has it.
+            self.fresh |= self.busy.is_empty();
+            self.answered(|id| listing.entries.iter().any(|entry| copy(entry).is_some_and(|(_, shared)| shared == id)));
+            (self.entries, self.notice) = (Some(listing.entries), None);
+        }
+    }
+
+    /// Takes one answer to what was asked of a row: the rows that are no longer `listed` wait no more. An
+    /// answer that left them all there was for the first that was asked, so that none waits for ever.
+    fn answered(&mut self, listed: impl Fn(&str) -> bool) {
+        let waited = self.busy.len();
+        self.busy.retain(|row| listed(row));
+        if self.busy.len() == waited && waited > 0 {
+            self.busy.remove(0);
         }
     }
 
@@ -180,16 +198,19 @@ impl Browser {
     /// and is let go.
     pub fn trashed(&mut self, server: &str, thrown: Vec<Trashed>) {
         if self.open && self.binned && server == self.server {
+            self.answered(|row| thrown.iter().any(|gone| binned(gone) == row));
             (self.thrown, self.notice) = (Some(thrown), None);
         }
     }
 
-    /// Takes in why the place that was asked for could not be read. One that comes when nothing is asked
-    /// is about a place that was left.
+    /// Takes in why the place that was asked for could not be read, or why what was asked of a row was not
+    /// done: that row waits no more, and can be asked again. One that comes when nothing is asked is about
+    /// a place that was left.
     pub fn refused(&mut self, why: &str) {
         let asked = if self.binned { self.thrown.is_none() } else { self.entries.is_none() };
-        if self.open && asked {
+        if self.open && (asked || !self.busy.is_empty()) {
             self.notice = Some(why.to_owned());
+            self.answered(|_| true);
         }
     }
 
@@ -251,17 +272,18 @@ impl Browser {
                 (self.binned, self.thrown, self.notice) = (true, None, None);
                 requests.push(Request::BrowseTrash { server: self.server.clone() });
             }
+            // The answer to either is the list without the row. The list stays meanwhile, and only that row
+            // says that it waits.
             Browsing::PutBack { space, file } => {
+                self.busy.push(format!("{space}/{file}"));
+                self.notice = None;
                 requests.push(Request::PutBack { server: self.server.clone(), space, file });
-                // The answer is the trash without it, so it is waited for as the trash was.
-                self.thrown = None;
             }
             Browsing::Merge(id) => {
                 if let Some(place) = self.place.clone() {
-                    requests.push(Request::MergeConflictsOf { server: self.server.clone(), id, place });
-                    // The answer is what the place holds without the copies, so it is waited for as the
-                    // place was.
-                    self.entries = None;
+                    requests.push(Request::MergeConflictsOf { server: self.server.clone(), id: id.clone(), place });
+                    self.busy.push(id);
+                    self.notice = None;
                 }
             }
         }
@@ -312,6 +334,7 @@ impl Browser {
     /// Turns to a place of the server, and asks what it holds.
     fn go(&mut self, place: Place, requests: &mut Vec<Request>) {
         (self.entries, self.notice, self.binned) = (None, None, false);
+        self.busy.clear();
         requests.push(Request::Browse { server: self.server.clone(), place: place.clone() });
         self.place = Some(place);
     }
@@ -424,8 +447,12 @@ impl Browser {
         };
         let quietly = |sentence: &str| said(sentence, Role::Status, tokens::FG_MUTED);
         let loading = format!("Loading documents from {}.", host(&self.server));
-        if let Some(why) = &self.notice {
-            return pane.child(said(why, Role::Alert, tokens::DANGER));
+        // Why a place could not be read stands in place of what it holds, and why what was asked of a row
+        // was not done stands over the list it is in.
+        let pane = pane.children(self.notice.as_deref().map(|why| said(why, Role::Alert, tokens::DANGER)));
+        let known = if self.binned { self.thrown.is_some() } else { self.entries.is_some() };
+        if self.notice.is_some() && !known {
+            return pane;
         }
         let today = self.now.map(|now| day(now, self.zone));
         if self.binned {
@@ -451,7 +478,12 @@ impl Browser {
         // walked on with the arrow keys.
         let rows = self.sorted(entries).into_iter().enumerate().map(|(at, entry)| {
             let row = self.entry(entry, today, room);
-            if at == 0 && self.fresh { row.takes_focus() } else { row }
+            match at {
+                0 if self.fresh => row.takes_focus().heir(),
+                // The list is walked on from its top when the row that had the keyboard was merged away.
+                0 => row.heir(),
+                _ => row,
+            }
         });
         let list = Element::column()
             .grow(1.0)
@@ -513,7 +545,7 @@ impl Browser {
     /// What was thrown away on the server, the last first: each with where it was and the day it went. Whoever
     /// edits in its space puts it back from its row.
     fn gone(&self, thrown: &[Trashed], today: Option<i64>, room: Room) -> Element<Message> {
-        let rows = thrown.iter().map(|gone| {
+        let rows = thrown.iter().enumerate().map(|(at, gone)| {
             let folder = gone.kind == EntryKind::Folder;
             // Where it was: its space, and its folders there.
             let space = self.spaces.as_deref().unwrap_or_default().iter().find(|space| space.id == gone.space);
@@ -528,22 +560,31 @@ impl Browser {
                 Some(format!("Thrown away {when}")),
             ];
             let about: Vec<String> = told.into_iter().flatten().collect();
+            let waits = self.busy.contains(&binned(gone));
             let back = (gone.role >= Grade::Editor).then(|| {
                 let asked = Browsing::PutBack { space: gone.space.clone(), file: gone.file.clone() };
-                act("Put back", icon::UNDO_2, asked, gone.name.as_str(), room == Room::Tight)
+                let name = gone.name.as_str();
+                match waits {
+                    true => act("Putting back", icon::HOURGLASS, None, name, room < Room::Roomy),
+                    false => act("Put back", icon::UNDO_2, Some(asked), name, room == Room::Tight),
+                }
             });
             let muted = |said: String| Element::text(said, quiet()).fg(tokens::FG_MUTED);
             // A tight card has room for the name alone, and no column to keep the button under.
             let (was, when, end) = match room {
                 Room::Tight => (None, None, Element::row()),
-                _ => (was, Some(Element::row().width(DAY).child(muted(when))), Element::row().width(BACK)),
+                _ => (was, Some(Element::row().width(DAY).child(muted(when))), Element::row().width(end(room))),
             };
-            option(if folder { icon::FOLDER } else { icon::FILE_TEXT }, &gone.name, false)
-                .key(format!("{}/{}", gone.space, gone.file).as_str())
+            let row = option(if folder { icon::FOLDER } else { icon::FILE_TEXT }, &gone.name, false)
+                .key(binned(gone).as_str())
                 .description(about.join(", "))
                 .child(Element::row().width(0.0).grow(1.0).clip().children(was.map(|was| muted(was).shrink())))
                 .children(when)
-                .child(end.justify(Justify::End).children(back))
+                .child(end.justify(Justify::End).children(back));
+            // The button that was pressed is not one while it waits, and the row has the keyboard for it.
+            // When it has gone, the list is walked on from its top.
+            let row = if waits { row.takes_focus() } else { row };
+            if at == 0 { row.heir() } else { row }
         });
         Element::column()
             .grow(1.0)
@@ -597,8 +638,8 @@ impl Browser {
             let brief = room < Room::Roomy;
             let made = Element::row()
                 .gap(tokens::SPACE_XS)
-                .child(act("Import", icon::FILE_UP, Browsing::Import, format!("Into {here}"), brief))
-                .child(act("New document", icon::PLUS, Browsing::New, format!("In {here}"), brief));
+                .child(act("Import", icon::FILE_UP, Some(Browsing::Import), format!("Into {here}"), brief))
+                .child(act("New document", icon::PLUS, Some(Browsing::New), format!("In {here}"), brief));
             way = way.child(Element::row().grow(1.0)).child(made);
         }
         Some(way.shrink().height(tokens::CONTROL_HEIGHT_SM))
@@ -609,19 +650,21 @@ impl Browser {
     /// document it is a copy of: whoever edits there merges it into that document from its row.
     fn entry(&self, entry: &Entry, today: Option<i64>, room: Room) -> Element<Message> {
         let folder = entry.kind == EntryKind::Folder;
-        let copy = entry.tags.iter().find_map(|tag| match tag {
-            Tag::ConflictCopy { of } => Some(of.as_str()),
-            _ => None,
-        });
-        let merge = copy.zip(entry.id.as_ref()).filter(|_| entry.role >= Grade::Editor).map(|(of, id)| {
+        let copied = entry.tags.iter().any(|tag| matches!(tag, Tag::ConflictCopy { .. }));
+        let merges = copy(entry).filter(|_| entry.role >= Grade::Editor);
+        let waits = merges.is_some_and(|(_, id)| self.busy.iter().any(|row| row == id));
+        let merge = merges.map(|(of, id)| {
             let original = of.rsplit_once('/').map_or(of, |(_, name)| name);
             let original = original.strip_suffix(".let").unwrap_or(original);
-            let (does, into) = (Browsing::Merge(id.clone()), format!("Into {original}"));
-            act("Merge conflicts", icon::GIT_MERGE, does, into, room == Room::Tight)
+            let (into, brief) = (format!("Into {original}"), room == Room::Tight);
+            match waits {
+                true => act("Merging", icon::HOURGLASS, None, into, brief),
+                false => act("Merge conflicts", icon::GIT_MERGE, Some(Browsing::Merge(id.to_owned())), into, brief),
+            }
         });
         let merged = merge.is_some();
         let does = match (&entry.space, &entry.id) {
-            _ if copy.is_some() => None,
+            _ if copied => None,
             (Some(space), _) if folder => {
                 Some(Browsing::Go(Place::Folder { space: space.clone(), path: entry.path.clone() }))
             }
@@ -661,6 +704,8 @@ impl Browser {
             .children((room > Room::Tight).then(|| on(when)));
         match does {
             Some(does) => row.on_press(send(does)),
+            // The button that was pressed is not one while it waits, and the row has the keyboard for it.
+            None if waits => row.takes_focus(),
             // The row of a copy is there for its button.
             None if merged => row,
             None => row.disabled(true),
@@ -668,10 +713,29 @@ impl Browser {
     }
 }
 
+/// What a conflict copy is a copy of: the path of its original, and the id the two share.
+fn copy(entry: &Entry) -> Option<(&str, &str)> {
+    let of = entry.tags.iter().find_map(|tag| match tag {
+        Tag::ConflictCopy { of } => Some(of.as_str()),
+        _ => None,
+    });
+    of.zip(entry.id.as_deref())
+}
+
+/// How wide the end of a row of the trash is.
+fn end(room: Room) -> f32 {
+    if room == Room::Roomy { BACK_ROOMY } else { BACK }
+}
+
+/// What a thing in the trash is known by while it is put back.
+fn binned(gone: &Trashed) -> String {
+    format!("{}/{}", gone.space, gone.file)
+}
+
 /// What stands in each column of the trash, over it.
 fn gone_heads(room: Room) -> Element<Message> {
     let plain = |name: &str| Element::text(name, small()).fg(tokens::FG_MUTED);
-    let more = [Element::row().width(DAY).child(plain("Thrown away")), Element::row().width(BACK)];
+    let more = [Element::row().width(DAY).child(plain("Thrown away")), Element::row().width(end(room))];
     Element::row()
         .align(Align::Center)
         .gap(tokens::SPACE_SM)
@@ -681,13 +745,15 @@ fn gone_heads(room: Room) -> Element<Message> {
 }
 
 /// A small button of the card, with what it is done to said after its name. A `brief` one shows its icon
-/// alone, and is named under the pointer.
-fn act(name: &str, mark: Icon, does: Browsing, to: impl Into<String>, brief: bool) -> Element<Message> {
-    let button = match brief {
-        true => Element::from(Button::icon_only(mark, name).small()).tooltip(name, Side::Top),
-        false => Button::new(name).icon(mark).small().into(),
-    };
-    button.on_press(send(does)).description(to)
+/// alone, and is named under the pointer. One that does nothing says what is being done, and is not pressed.
+fn act(name: &str, mark: Icon, does: Option<Browsing>, to: impl Into<String>, brief: bool) -> Element<Message> {
+    let button = if brief { Button::icon_only(mark, name) } else { Button::new(name).icon(mark) };
+    let button = Element::from(button.small().disabled(does.is_none())).description(to);
+    let button = if brief { button.tooltip(name, Side::Top) } else { button };
+    match does {
+        Some(does) => button.on_press(send(does)),
+        None => button,
+    }
 }
 
 /// A row of any list: an icon and a name, lit under the pointer and ringed while it has the keyboard.

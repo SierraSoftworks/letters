@@ -146,6 +146,7 @@ pub struct Element<M> {
     pub(crate) disabled: bool,
     pub(crate) rest: bool,
     pub(crate) takes_focus: bool,
+    pub(crate) heir: bool,
     pub(crate) closes: bool,
     pub(crate) arrows: Option<Dir>,
     pub(crate) one_stop: bool,
@@ -186,6 +187,7 @@ impl<M> Element<M> {
             disabled: false,
             rest: false,
             takes_focus: false,
+            heir: false,
             closes: false,
             arrows: None,
             one_stop: false,
@@ -536,6 +538,14 @@ impl<M> Element<M> {
     /// it edits.
     pub fn takes_focus(mut self) -> Self {
         self.takes_focus = true;
+        self.focus = self.focus.max(Focus::Keys);
+        self
+    }
+
+    /// Gives this element the keyboard's focus when what had it goes from under the same dialog, where it
+    /// would otherwise be nowhere: the row a list is walked on from when the one that was pressed has gone.
+    pub fn heir(mut self) -> Self {
+        self.heir = true;
         self.focus = self.focus.max(Focus::Keys);
         self
     }

@@ -678,3 +678,60 @@ fn a_field_the_app_draws_keeps_its_caret_to_itself_and_says_what_is_written_in_i
 fn focus_of<A: App>(window: &mut Harness<A>) -> String {
     window.focused().map(|found| found.name).unwrap_or_default()
 }
+
+/// A dialog of buttons that go when they are pressed, over a button of the window. The first in the dialog
+/// is the heir of the keyboard once no more than `heir` of them are left, and the one under it always is.
+struct Roll {
+    left: Vec<&'static str>,
+    heir: usize,
+}
+
+impl App for Roll {
+    type Msg = &'static str;
+
+    fn title(&self) -> String {
+        "Roll".into()
+    }
+
+    fn view(&mut self, _window: Size) -> Element<&'static str> {
+        let rows = self.left.iter().enumerate().map(|(at, name)| {
+            let row = Element::from(Button::new(*name).on_press(*name)).key(name);
+            if at == 0 && self.left.len() <= self.heir { row.heir() } else { row }
+        });
+        let roll = Popover::new(Element::column().children(rows)).label("Roll").modal().open(true);
+        let under = Element::from(Button::new("Under").on_press("Under")).heir();
+        Element::column().child(under).child(Element::row().overlay().popover(roll))
+    }
+
+    fn update(&mut self, message: &'static str, _platform: &mut dyn Platform) {
+        self.left.retain(|name| *name != message);
+    }
+}
+
+#[test]
+fn the_keyboard_goes_to_an_heir_in_the_dialog_when_what_had_it_goes_and_nowhere_without_one() {
+    let roll = |heir| Harness::new(Roll { left: vec!["One", "Two", "Three"], heir });
+    // With the keyboard on none of its buttons, the dialog itself is said to have it.
+    let nowhere = "Roll";
+    for (heir, then) in [(3, "One"), (0, nowhere)] {
+        let mut roll = roll(heir);
+        roll.key("Tab");
+        assert_eq!(focus_of(&mut roll), "Two");
+        roll.key("Enter");
+        assert_eq!(roll.app().left, ["One", "Three"]);
+        assert_eq!(focus_of(&mut roll), then, "an heir from {heir} left: never the one under the dialog");
+    }
+
+    // An heir takes the keyboard from nothing that still has it.
+    let mut kept = roll(3);
+    kept.key("Tab").key("Tab");
+    kept.click(Role::Button, "Two");
+    assert_eq!(focus_of(&mut kept), "Three");
+
+    // And it is the heir of what went, not of a keyboard that was nowhere before it came.
+    let mut late = roll(1);
+    late.key("Tab").key("Enter");
+    late.click(Role::Button, "Three");
+    assert_eq!(late.app().left, ["One"]);
+    assert_eq!(focus_of(&mut late), nowhere, "nothing is pressed by an Enter the person did not aim");
+}
