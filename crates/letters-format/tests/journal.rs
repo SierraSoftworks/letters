@@ -334,3 +334,53 @@ fn a_document_with_no_file_comes_back_up_to_the_first_edit_that_does_not_stand()
         assert!(replayed.refused.is_some(), "{why}");
     }
 }
+
+#[test]
+fn a_journal_goes_on_with_what_came_back_once_the_rest_is_dropped() {
+    for (why, refused) in REFUSED {
+        let (folder, mut state) = (shared(), Folder::default());
+        let mut session = Session::open(&folder, &mut state, 2);
+        session.write(&mut state, "one ");
+        session.journal.edits(&mut state, refused).unwrap();
+        session.write(&mut state, "two ");
+        session.journal.notes(&mut state, &note("n")).unwrap();
+        session.journal.asset(&mut state, "assets/a.png", &[1; 8]).unwrap();
+        drop(session);
+
+        let mut copy = WorkingCopy::open(&mut open(&folder.files[NAME]), ReplicaId::from(3)).unwrap();
+        let (mut journal, left) = Journal::open(&mut state, ID, CREATED, Some(NAME)).unwrap();
+        let left = left.expect("the journal holds the session's work");
+        let replayed = copy.replay(&left).expect(why);
+        journal.keep(&mut state, &left, replayed.edits).expect(why);
+
+        // What is recorded from here on is read again, which behind the refused edit it would not be.
+        let mut editor = Model::load(&copy.model().save(), ReplicaId::from(103)).unwrap();
+        let before = editor.revision();
+        editor.apply([Op::InsertText { at: Pos::new("p", 0), text: "three ".into() }]).unwrap();
+        journal.edits(&mut state, &editor.updates_since(&before)).unwrap();
+
+        let unsaved = Unsaved::read(&mut state, &journal_name(ID)).unwrap().unwrap();
+        let mut again = WorkingCopy::open(&mut open(&folder.files[NAME]), ReplicaId::from(4)).unwrap();
+        let replayed = again.replay(&unsaved).expect(why);
+        assert_eq!((replayed.edits, replayed.of, &replayed.refused), (2, 2, &None), "{why}: all of it stands now");
+        assert_eq!(text(again.model().doc()), "three one Hello world", "{why}");
+        assert_eq!(again.notes.notes.len(), 1, "{why}: the notes are kept");
+        assert_eq!(again.entries.get("assets/a.png"), Some(&vec![1; 8]), "{why}: and the assets");
+    }
+}
+
+#[test]
+fn a_journal_of_which_nothing_came_back_is_empty_once_that_is_dropped() {
+    let (folder, mut state) = (shared(), Folder::default());
+    let (mut journal, _) = Journal::open(&mut state, ID, CREATED, Some(NAME)).unwrap();
+    journal.edits(&mut state, b"not a history").unwrap();
+
+    let mut copy = WorkingCopy::open(&mut open(&folder.files[NAME]), ReplicaId::from(3)).unwrap();
+    let (mut journal, left) = Journal::open(&mut state, ID, CREATED, Some(NAME)).unwrap();
+    let left = left.expect("the journal holds a record");
+    let replayed = copy.replay(&left).unwrap();
+    assert_eq!((replayed.edits, replayed.added), (0, false));
+    journal.keep(&mut state, &left, replayed.edits).unwrap();
+    assert!(journal.is_empty(), "no save is owed to it");
+    assert_eq!(Unsaved::read(&mut state, &journal_name(ID)).unwrap(), None);
+}

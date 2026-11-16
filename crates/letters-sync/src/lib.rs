@@ -45,7 +45,7 @@ mod wire;
 pub use access::{Access, Refusal, Role};
 pub use client::{Client, Event, Link, Local, Progress};
 pub use presence::{Passage, Peer};
-pub use room::{LOOK_EVERY, Outbound, Room, SAVE_AFTER, SAVE_WITHIN};
+pub use room::{LOOK_EVERY, Outbound, Room, SAVE_AFTER, SAVE_WITHIN, SetAside};
 pub use wire::{ClientMessage, Hello, MAX_FRAME, PROTOCOL, ServerMessage, SessionId, Welcome, WireError};
 
 /// A session that has sent nothing for this long sends a [`ClientMessage::Ping`], in milliseconds.

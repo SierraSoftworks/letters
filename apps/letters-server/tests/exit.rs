@@ -14,14 +14,14 @@ use std::io::{self, BufRead, BufReader, Cursor, ErrorKind, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::Scratch;
 use letters_api::{Entry, Listing, NewDocument, Person, Tag, paths};
-use letters_format::{Archive, Files, Save, Saved, Stamp, WorkingCopy};
+use letters_format::{Archive, Files, Journal, Save, Saved, Stamp, Unsaved, WorkingCopy, is_journal};
 use letters_model::{Block, BlockKind, Document, Model, NoteKind, Notes, Op, Pos, ReplicaId};
 use letters_server::config::Config;
 use letters_server::session::Carrier;
@@ -84,6 +84,8 @@ struct Served {
     input: Option<ChildStdin>,
     at: SocketAddr,
     tokens: BTreeMap<String, String>,
+    /// The lines of its log so far.
+    log: Arc<Mutex<Vec<String>>>,
 }
 
 impl Served {
@@ -101,12 +103,18 @@ impl Served {
             let lines = out.lines().map_while(Result::ok);
             lines.filter_map(|line| Some(line.split_once(SAYS)?.1.to_owned())).for_each(|line| drop(said.send(line)));
         });
-        // The server's log is shown with a test that fails.
-        let log = BufReader::new(child.stderr.take().expect("its log is piped"));
-        thread::spawn(move || log.lines().map_while(Result::ok).for_each(|line| eprintln!("{line}")));
+        // The server's log is shown with a test that fails, and kept for one that reads it.
+        let (log, lines) = (Arc::new(Mutex::new(Vec::new())), BufReader::new(child.stderr.take().expect("its log")));
+        let kept = log.clone();
+        thread::spawn(move || {
+            for line in lines.lines().map_while(Result::ok) {
+                eprintln!("{line}");
+                kept.lock().expect("the log is kept").push(line);
+            }
+        });
 
-        let mut served =
-            Self { input: child.stdin.take(), child, at: ([0, 0, 0, 0], 0).into(), tokens: BTreeMap::new() };
+        let (input, at) = (child.stdin.take(), ([0, 0, 0, 0], 0).into());
+        let mut served = Self { input, child, at, tokens: BTreeMap::new(), log };
         loop {
             let line: String = hears.recv_timeout(PATIENCE).expect("the server says when it is ready");
             let words: Vec<&str> = line.split(' ').collect();
@@ -652,6 +660,52 @@ fn a_server_that_is_killed_brings_what_it_held_to_the_file_when_it_is_back() {
     (ada.at, ben.at) = (served.at, served.at);
     until("both are back and agree", &mut [&mut ada, &mut ben], agree);
     assert!(ben.said().contains("Kept."));
+}
+
+/// A journal with an edit that does not stand must not keep its document shut until someone removes the
+/// journal by hand: what stands goes to the file, and the journal is kept where nothing reads it.
+#[test]
+fn a_journal_with_an_edit_that_does_not_stand_is_set_aside_and_its_document_opens() {
+    let (scratch, served, id) = planned("refused");
+    let file = scratch.0.join("family").join(FILE);
+    let (mut ada, mut ben) = desktops(&served, &id);
+    let number = ada.begin("Kept. ");
+    until("the server says it holds the edit", &mut [&mut ada, &mut ben], |desks| desks[0].held >= number);
+    served.kill();
+
+    // The run's journal gains an edit the history library panics on as it lands, one of fuzz issue 4.
+    let rooms = scratch.0.join("state").join("rooms");
+    let [room] = &scratch.names("state/rooms")[..] else { panic!("one room's folder holds the journal") };
+    let mut state = Share(rooms.join(room));
+    let name = scratch.names(&format!("state/rooms/{room}")).into_iter().find(|name| is_journal(name));
+    let name = name.expect("the run left a journal");
+    let left = Unsaved::read(&mut state, &name).unwrap().expect("the journal holds the edit");
+    let (mut journal, _) = Journal::open(&mut state, &left.id, &left.created, left.home.as_deref()).unwrap();
+    let refused = include_bytes!("../../../fuzz/corpus/history/a-first-edit-that-builds-on-one-before-it.bin");
+    journal.edits(&mut state, refused).unwrap();
+    let found = std::fs::read(rooms.join(room).join(&name)).unwrap();
+
+    // Nobody opens the document. The server that starts next takes what stands to the file by itself.
+    let served = Served::start(&scratch.0, "state");
+    until("the file holds what stands", &mut [], |_| file_says(&file).contains("Kept."));
+    let aside: Vec<String> =
+        scratch.names("state/rooms").into_iter().filter(|name| name.ends_with(".journal")).collect();
+    let [aside] = &aside[..] else { panic!("the journal lies in rooms/ as one file: {aside:?}") };
+    assert!(!is_journal(aside), "under a name that no journal is read by");
+    assert_eq!(std::fs::read(rooms.join(aside)).unwrap(), found, "as it was found");
+    let log = served.log.lock().unwrap().join("\n");
+    let told = log.lines().find(|line| line.contains(&id) && line.contains("warn"));
+    let told = told.unwrap_or_else(|| panic!("the log names the document:\n{log}"));
+    assert!(told.contains("1 of its 2 edits") && told.contains("1 left out") && told.contains(aside), "{told}");
+
+    // The document opens for whoever had it open, with the sign-in they had.
+    (ada.at, ben.at) = (served.at, served.at);
+    until("both are back and agree", &mut [&mut ada, &mut ben], agree);
+    assert!(ben.said().contains("Kept."));
+    // Once its file holds everything the room's folder goes, and what was set aside stays.
+    drop((ada, ben));
+    served.stop();
+    assert_eq!(scratch.names("state/rooms"), std::slice::from_ref(aside));
 }
 
 /// The design's row "Truncated or corrupt file": the damaged file is kept aside, and the writer's replica

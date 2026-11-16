@@ -6,8 +6,10 @@ mod common;
 use std::io::Cursor;
 
 use common::{CREATED, ID, NAME, World, doc, find, note, open_file, save_file, texts, typed};
-use letters_format::{Archive, Error, Files, OPLOG, Reading, Replica, Saved, WorkingCopy, hash};
-use letters_model::{Block, BlockKind, Document, Note, NoteKind, Op, ReplicaId, Style};
+use letters_format::{
+    Archive, Error, Files, Journal, OPLOG, Reading, Replica, Saved, WorkingCopy, hash, is_journal, journal_name,
+};
+use letters_model::{Block, BlockKind, Document, Model, Note, NoteKind, Op, ReplicaId, Style};
 use letters_sync::{Access, LOOK_EVERY, Link, Progress, Role, SAVE_AFTER, SAVE_WITHIN};
 
 const HOME: &str = "/srv/letters/report.let";
@@ -516,4 +518,59 @@ fn a_journal_that_is_another_documents_keeps_the_room_from_opening() {
     world.state.files.insert(letters_format::journal_name("0d9a1b7c-0000-4000-8000-000000000001"), bytes);
 
     assert!(matches!(world.open_room(), Err(Error::OtherDocument(_))));
+}
+
+/// Edits the model refuses, by what is wrong with them. The histories are the ones of fuzz issue 4.
+const REFUSED: [(&str, &[u8]); 3] = [
+    ("no history", b"not a history"),
+    (
+        "edits Loro panics on as they land",
+        include_bytes!("../../../fuzz/corpus/history/a-first-edit-that-builds-on-one-before-it.bin"),
+    ),
+    ("a history Loro overflows on", include_bytes!("../../../fuzz/corpus/history/a-history-whose-mark-overflows.bin")),
+];
+
+#[test]
+fn a_journal_with_an_edit_that_does_not_stand_opens_the_room_with_what_does() {
+    for (why, refused) in REFUSED {
+        let (mut world, ada, ben) = editors();
+        world.edit(ada, [typed("p", 0, "one ")]);
+        world.settle();
+        world.stop_server();
+        // Nobody comes back to send anything again.
+        world.cut(ada);
+        world.cut(ben);
+
+        // What the run left: an edit that stands, one that does not, and behind it one that would.
+        let (mut journal, _) = Journal::open(&mut world.state, ID, CREATED, Some(HOME)).unwrap();
+        journal.edits(&mut world.state, refused).unwrap();
+        let mut writer = Model::load(&open_file(&world.folder, 50).model().save(), ReplicaId::from(51)).unwrap();
+        let before = writer.revision();
+        writer.apply([typed("q", 0, "two ")]).unwrap();
+        journal.edits(&mut world.state, &writer.updates_since(&before)).unwrap();
+        let found = world.state.files[&journal_name(ID)].clone();
+
+        world.open_room().expect(why);
+        assert_eq!(texts(world.held()), ["one Hello world", "Second"], "{why}: what stands, nothing behind the rest");
+        let aside = world.room.as_ref().unwrap().set_aside().cloned().expect(why);
+        assert_eq!((aside.replayed.edits, aside.replayed.of), (1, 3), "{why}");
+        assert!(aside.replayed.refused.is_some(), "{why}: {aside:?}");
+        assert_eq!(world.state.files.get(&aside.name), Some(&found), "{why}: the journal is kept as it was found");
+        assert!(!is_journal(&aside.name), "{why}: under a name that no journal is read by");
+
+        // What is written from here on is journalled where the next run reads it.
+        let cy = world.join("Cy", Role::Editor, true);
+        world.settle();
+        world.edit(cy, [typed("q", 0, "three ")]);
+        world.settle();
+        world.stop_server();
+        world.cut(cy);
+        world.open_room().expect(why);
+        assert_eq!(texts(world.held()), ["one Hello world", "three Second"], "{why}");
+        assert_eq!(world.room.as_ref().unwrap().set_aside(), None, "{why}: the journal came back whole this time");
+
+        world.advance(SAVE_WITHIN);
+        assert_eq!(on_disk(&world), texts(world.held()), "{why}: and all of it reaches the file");
+        assert!(world.room.as_ref().unwrap().is_idle(), "{why}");
+    }
 }

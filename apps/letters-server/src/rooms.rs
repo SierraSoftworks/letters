@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use letters_api::{Action, Code, Role};
 use letters_format::{ASSETS, Archive, Error, Files, Reading, Save, Saved, Unsaved, is_journal};
-use letters_sync::{Access, ClientMessage, LOOK_EVERY, Outbound, Refusal as Ended, Room, SessionId};
+use letters_sync::{Access, ClientMessage, LOOK_EVERY, Outbound, Refusal as Ended, Room, SessionId, SetAside};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 
@@ -516,6 +516,10 @@ impl Rooms {
         let all: Vec<&Root> = roots.iter().collect();
         for folder in folders.flatten() {
             let Ok(name) = folder.file_name().into_string() else { continue };
+            // A journal that was set aside lies here as a file, and is read by nobody.
+            if !folder.path().is_dir() {
+                continue;
+            }
             // One journal's fault keeps no other from its file, nor the server from starting.
             let taken = catch_unwind(AssertUnwindSafe(|| self.take(app, &all, &folder.path(), &name)));
             if taken.is_err() {
@@ -529,6 +533,7 @@ impl Rooms {
         let Some(mut state) = self.journals(name) else { return };
         let Some(left) = left_in(path, &mut state) else {
             // Nothing is owed to any file.
+            self.keep_aside(name);
             let _ = std::fs::remove_dir_all(path);
             return;
         };
@@ -573,12 +578,48 @@ impl Rooms {
         Root::open(&path.to_string_lossy(), true).and_then(|root| root.folder(&Place::default())).ok()
     }
 
+    /// Moves the journals that were set aside in the journal folder `journal` out of it, to where no
+    /// room's end removes them and nothing reads them: `<state>/rooms` itself, each under its own name or
+    /// the next that is free. Says where each went, by the name it had.
+    fn keep_aside(&self, journal: &str) -> Vec<(String, PathBuf)> {
+        let from = self.folder.join(journal);
+        let names = std::fs::read_dir(&from).into_iter().flatten().flatten();
+        let names = names.filter_map(|entry| entry.file_name().into_string().ok());
+        let mut kept = Vec::new();
+        for name in names.filter(|name| set_aside(name)) {
+            let stem = name.strip_suffix(JOURNAL).unwrap_or(&name);
+            let named = |nth: u32| match nth {
+                1 => self.folder.join(&name),
+                nth => self.folder.join(format!("{stem}.{nth}{JOURNAL}")),
+            };
+            let free = (1..=999).map(named).find(|to| !to.exists());
+            let moved = free.ok_or_else(|| std::io::Error::other("no name is free")).and_then(|to| {
+                std::fs::rename(from.join(&name), &to)?;
+                Ok(to)
+            });
+            match moved {
+                Ok(to) => kept.push((name, to)),
+                Err(error) => warn(&format!("a journal that was set aside stays in rooms/{journal}: {error}")),
+            }
+        }
+        kept
+    }
+
     /// A journal that was left for the document `id`, for the room that is opened for it now.
     fn adopt(&self, id: &str) -> Option<String> {
         let mut left = lock(&self.left);
         let at = left.iter().position(|(document, _)| document == id)?;
         Some(left.swap_remove(at).1)
     }
+}
+
+/// How a journal's file name ends, one that was set aside too.
+const JOURNAL: &str = ".journal";
+
+/// Whether a file in a room's folder is a journal that was set aside: one by its ending that is none by its
+/// name, so that nothing reads it.
+fn set_aside(name: &str) -> bool {
+    name.ends_with(JOURNAL) && !name.starts_with('.') && !is_journal(name)
 }
 
 /// The place in `root` that a journal's `home` names, if it names one there.
@@ -669,7 +710,8 @@ impl Hosted {
         if let Some(stamp) = stamp {
             room.read_as(stamp);
         }
-        Ok(Self {
+        let aside = room.set_aside().cloned();
+        let mut hosted = Self {
             room,
             root: root.again()?,
             place: place.clone(),
@@ -683,7 +725,29 @@ impl Hosted {
             wrote: false,
             lost: false,
             waiting: HashMap::new(),
-        })
+        };
+        if let Some(aside) = aside {
+            hosted.set_aside(rooms, &aside, now);
+        }
+        Ok(hosted)
+    }
+
+    /// The journal held an edit that does not stand, and the room opened with what came back. That goes to
+    /// the file at once, the journal as it was found goes to where nothing reads it again, and the log
+    /// says so, for whoever can look into it. No session is told.
+    fn set_aside(&mut self, rooms: &Rooms, aside: &SetAside, now: u64) {
+        self.save_through(now);
+        let kept = rooms.keep_aside(&self.journal);
+        let at = kept.iter().find(|(name, _)| *name == aside.name).map(|(_, to)| to.display().to_string());
+        let at = at.unwrap_or_else(|| format!("rooms/{}/{}", self.journal, aside.name));
+        let (edits, of) = (aside.replayed.edits, aside.replayed.of);
+        let why = aside.replayed.refused.as_ref().map(ToString::to_string).unwrap_or_default();
+        warn(&format!(
+            "the journal of the document {} held an edit that does not stand ({why}): {edits} of its {of} edits \
+             were kept and {} left out, and the journal as it was found is kept as {at}",
+            self.room.copy().id,
+            of - edits,
+        ));
     }
 
     /// Does what the room asks: frames go to their sockets, and the keeper is told when the room is due.
@@ -862,7 +926,10 @@ impl Hosted {
         let path = rooms.folder.join(&self.journal);
         match left_in(&path, &mut self.state) {
             Some(left) => lock(&rooms.left).push((left.id, self.journal.clone())),
-            None => drop(std::fs::remove_dir_all(path)),
+            None => {
+                rooms.keep_aside(&self.journal);
+                drop(std::fs::remove_dir_all(path));
+            }
         }
     }
 }

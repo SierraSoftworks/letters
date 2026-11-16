@@ -21,7 +21,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Seek};
 use std::mem;
 
-use letters_format::{ASSETS, Error, Files, Journal, Reading, Save, Saved, Stamp, WorkingCopy, hash};
+use letters_format::{
+    ASSETS, Error, Files, Journal, Reading, Replayed, Save, Saved, Stamp, WorkingCopy, hash, journal_name,
+};
 use letters_model::{Extent, Notes, Revision, Style};
 
 use crate::access::{Access, Refusal, Role, comments};
@@ -43,6 +45,27 @@ pub enum Outbound {
     Send(SessionId, Vec<u8>),
     /// Close a session's socket, once what was to be sent to it is sent. [`Room::leave`] need not follow.
     Close(SessionId),
+}
+
+/// A journal that did not come back whole, as [`Room::set_aside`] tells of it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetAside {
+    /// The file in the room's state folder that holds the journal as it was found. Nothing reads it again,
+    /// and the host may move it to where it keeps such files.
+    pub name: String,
+    /// How far the journal came back, and why it stopped.
+    pub replayed: Replayed,
+}
+
+/// A name in `state` that is no journal's and that no file has, for the journal `name` as it was found.
+fn aside(state: &mut impl Files, name: &str) -> Result<String, Error> {
+    let stem = name.strip_suffix(".journal").unwrap_or(name);
+    let named = |nth: u32| match nth {
+        1 => format!("{stem}.set-aside.journal"),
+        nth => format!("{stem}.set-aside-{nth}.journal"),
+    };
+    let free = (1..=999).map(named).find(|name| matches!(state.stamp(name), Ok(None)));
+    free.ok_or_else(|| Error::Files("no name is free to set a journal aside under".into()))
 }
 
 struct Session {
@@ -82,6 +105,8 @@ pub struct Room {
     offered: BTreeMap<String, Vec<u8>>,
     /// Acknowledgements that wait for a save, since the journal could not take what they are for.
     owed: Vec<(SessionId, u64)>,
+    /// The journal an earlier run left, where it did not come back whole.
+    aside: Option<SetAside>,
 }
 
 /// A host keeps rooms behind a lock and calls them from any thread.
@@ -96,18 +121,33 @@ impl Room {
     ///
     /// `state` is a folder on the host's local disk for this document's journal, and `home` says where
     /// the document is saved, in the host's own words. What a run that stopped early left in the journal
-    /// is taken in, and is then owed to the file. Fails when the journal cannot be read or does not fit
-    /// the document.
+    /// is taken in, and is then owed to the file. Fails when the journal cannot be read or is another
+    /// document's.
+    ///
+    /// A journal with an edit that does not stand comes back up to that edit, and the room opens all the
+    /// same: a document must not stay shut until someone removes a file by hand. The journal goes on with
+    /// what came back, and the file as it was found is kept beside it, which [`Room::set_aside`] tells.
     ///
     /// The copy is [wary](WorkingCopy::wary) from here on: what devices send and what other writers leave
     /// in the file is tried apart from the document before it is merged. A host opens the file itself
     /// with [`WorkingCopy::open_wary`], so that the history it starts from is checked as well.
     pub fn open(mut copy: WorkingCopy, home: &str, state: &mut impl Files, now: u64) -> Result<Self, Error> {
         copy.wary = true;
-        let (journal, left) = Journal::open(state, &copy.id, &copy.created, Some(home))?;
+        let (mut journal, left) = Journal::open(state, &copy.id, &copy.created, Some(home))?;
+        let mut set_aside = None;
         if let Some(left) = &left {
-            // A journal with an edit that does not stand fails the room, as it did when replay failed whole.
-            copy.replay(left)?.whole()?;
+            let replayed = copy.replay(left)?;
+            if replayed.refused.is_some() {
+                // Whatever is journalled behind an edit that does not stand is never read again. The
+                // journal is copied as it was found before it goes on with what came back.
+                let name = journal_name(&copy.id);
+                let found = state.read(&name).map_err(|error| Error::Files(error.to_string()))?;
+                let kept = aside(state, &name)?;
+                let copied = state.write(&kept, &found.unwrap_or_default());
+                copied.map_err(|error| Error::Files(error.to_string()))?;
+                journal.keep(state, left, replayed.edits)?;
+                set_aside = Some(SetAside { name: kept, replayed });
+            }
         }
         Ok(Self {
             copy,
@@ -124,7 +164,15 @@ impl Room {
             parked: false,
             offered: BTreeMap::new(),
             owed: Vec::new(),
+            aside: set_aside,
         })
+    }
+
+    /// The journal an earlier run left, where it held an edit that does not stand: where the file is kept
+    /// as it was found, and how far it came back. What came back is in the document and owed to the file.
+    /// What did not is in that file alone, and no session is told.
+    pub fn set_aside(&self) -> Option<&SetAside> {
+        self.aside.as_ref()
     }
 
     /// How the document's file looked just before the host read the copy this room was opened over. The

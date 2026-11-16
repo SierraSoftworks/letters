@@ -119,9 +119,36 @@ impl Journal {
 
     /// Records an asset that no file holds yet.
     pub fn asset(&mut self, files: &mut impl Files, name: &str, bytes: &[u8]) -> Result<(), Error> {
-        let length = u16::try_from(name.len()).map_err(|_| Error::Files("an asset's name is too long".into()))?;
-        let payload = [&length.to_le_bytes(), name.as_bytes(), bytes].concat();
-        self.add(files, ASSET, &payload)
+        self.add(files, ASSET, &asset(name, bytes)?)
+    }
+
+    /// Leaves in the journal only what came back of `left`, which this journal handed over as it was
+    /// opened: the first `edits` of its records of edits, as [`Replayed::edits`](crate::Replayed::edits)
+    /// counts them, with its notes and assets. The edit that did not stand and every one after it are
+    /// dropped. Until they are, whatever is recorded behind them is never read again.
+    ///
+    /// The journal is replaced in one step: a crash leaves it as it was, or as it is to be. A caller that
+    /// wants the dropped records kept copies the file first, under a name that is no journal's.
+    pub fn keep(&mut self, files: &mut impl Files, left: &Unsaved, edits: usize) -> Result<(), Error> {
+        let mut kept: Vec<u8> = left.edits.iter().take(edits).flat_map(|edits| record(EDITS, edits)).collect();
+        if let Some(notes) = &left.notes {
+            kept.extend(record(NOTES, notes.to_json().as_bytes()));
+        }
+        for (name, bytes) in &left.assets {
+            kept.extend(record(ASSET, &asset(name, bytes)?));
+        }
+        if kept.is_empty() {
+            match files.remove(&self.name) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(folder(error)),
+                _ => {}
+            }
+            (self.head, self.gone, self.len) = (0, self.gone + self.len, 0);
+            return Ok(());
+        }
+        let head = self.start();
+        self.replace(files, &[&head[..], &kept].concat())?;
+        (self.head, self.gone, self.len) = (head.len() as u64, self.gone + self.len, kept.len() as u64);
+        Ok(())
     }
 
     /// Records where the document is saved from now on: when a home is chosen for it, after a move, or
@@ -238,6 +265,12 @@ fn folder(error: std::io::Error) -> Error {
 fn sum(kind: u8, length: [u8; 4], payload: &[u8]) -> [u8; SUM] {
     let digest = Sha256::new().chain_update([kind]).chain_update(length).chain_update(payload).finalize();
     digest[..SUM].try_into().expect("a SHA-256 digest has 32 bytes")
+}
+
+/// The payload of an asset's record.
+fn asset(name: &str, bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    let length = u16::try_from(name.len()).map_err(|_| Error::Files("an asset's name is too long".into()))?;
+    Ok([&length.to_le_bytes(), name.as_bytes(), bytes].concat())
 }
 
 fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
