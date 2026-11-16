@@ -19,7 +19,6 @@ fn a_mark_is_switched_on_unless_all_of_the_selection_has_it() {
         ("p ^one **two**| three", "Mod+b", "p ^**one two**| three"),
         ("p o^ne\nhr\n> h2 **two**\n> ul th|ree", "Mod+i", "p o^*ne*\nhr\n> h2 ***two***\n> ul *th*|ree"),
         ("p ^one| two", "Mod+u", "p ^__one__| two"),
-        ("p ^one| two", "Mod+e", "p ^`one`| two"),
         ("p ^one| two", "Mod+Shift+x", "p ^~~one~~| two"),
         ("p ^one| two", "Mod+Shift+h", "p ^==one==| two"),
         // Code takes no marks, so a selection that runs through some leaves it be.

@@ -1,6 +1,6 @@
 //! Which key runs which command.
 
-use letters_model::{BlockKind, ListKind, Mark};
+use letters_model::Mark;
 
 use crate::{Command, Key, KeyEvent, Modifiers, Motion};
 
@@ -22,7 +22,6 @@ const PRIMARY: Modifiers = Modifiers { primary: true, ..NONE };
 const SHIFT: Modifiers = Modifiers { shift: true, ..NONE };
 const ALT: Modifiers = Modifiers { alt: true, ..NONE };
 const PRIMARY_SHIFT: Modifiers = Modifiers { shift: true, ..PRIMARY };
-const PRIMARY_ALT: Modifiers = Modifiers { alt: true, ..PRIMARY };
 
 impl Keymap {
     /// Linux and Windows conventions: Ctrl moves by word, and Home and End by line.
@@ -79,8 +78,7 @@ impl Keymap {
             (Key::PageUp, NONE, Motion::PageUp),
             (Key::PageDown, NONE, Motion::PageDown),
         ]);
-        let heading = |level| Command::SetBlock(BlockKind::Heading { level });
-        let list = |list| Command::SetBlock(BlockKind::ListItem { list, depth: 0 });
+        // The type of a block has no key: it is typed as Markdown, or taken from the menus.
         let commands = [
             (Key::Backspace, NONE, Command::Delete(Motion::Left)),
             (Key::Backspace, SHIFT, Command::Delete(Motion::Left)),
@@ -94,20 +92,8 @@ impl Keymap {
             (Key::Char('b'), PRIMARY, Command::ToggleMark(Mark::Bold)),
             (Key::Char('i'), PRIMARY, Command::ToggleMark(Mark::Italic)),
             (Key::Char('u'), PRIMARY, Command::ToggleMark(Mark::Underline)),
-            (Key::Char('e'), PRIMARY, Command::ToggleMark(Mark::Code)),
             (Key::Char('x'), PRIMARY_SHIFT, Command::ToggleMark(Mark::Strike)),
             (Key::Char('h'), PRIMARY_SHIFT, Command::ToggleMark(Mark::Highlight)),
-            (Key::Char('0'), PRIMARY_ALT, Command::SetBlock(BlockKind::Paragraph)),
-            (Key::Char('1'), PRIMARY_ALT, heading(1)),
-            (Key::Char('2'), PRIMARY_ALT, heading(2)),
-            (Key::Char('3'), PRIMARY_ALT, heading(3)),
-            (Key::Char('4'), PRIMARY_ALT, heading(4)),
-            (Key::Char('7'), PRIMARY_SHIFT, list(ListKind::Ordered)),
-            (Key::Char('8'), PRIMARY_SHIFT, list(ListKind::Bullet)),
-            (Key::Char('9'), PRIMARY_SHIFT, list(ListKind::Task { checked: false })),
-            (Key::Char('.'), PRIMARY_SHIFT, Command::SetBlock(BlockKind::Quote)),
-            (Key::Char('c'), PRIMARY_ALT, Command::SetBlock(BlockKind::Code { language: None })),
-            (Key::Char('-'), PRIMARY_ALT, Command::SetBlock(BlockKind::Divider)),
             (Key::Char('z'), PRIMARY, Command::Undo),
             (Key::Char('z'), PRIMARY_SHIFT, Command::Redo),
             (Key::Char('a'), PRIMARY, Command::SelectAll),
