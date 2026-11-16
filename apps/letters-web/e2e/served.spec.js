@@ -422,6 +422,29 @@ for (const { name, refusal, listed } of typed) {
   });
 }
 
+test("text in a language the server has a dictionary for is checked against it, once the document names the language", async ({ page }) => {
+  const german = { aff: "SET UTF-8\nTRY esn\n", dic: "2\nStraße\nÜbung\n" };
+  const held = (method, path) => {
+    if (path === "/api/v1/dictionaries") return { body: ["de-DE", "fr"] };
+    const [, file] = path.match(/^\/api\/v1\/dictionaries\/de-DE\/(aff|dic)$/) ?? [];
+    return file && { body: german[file], type: "text/plain; charset=utf-8" };
+  };
+  const written = { format: 1, language: "de", blocks: [{ id: "p", type: "paragraph", content: [{ text: "" }] }] };
+  const asked = await serve(page, opened(), held, written);
+  // Only the language that is written in is fetched, by the name the server has it under.
+  await expect.poll(() => told(asked).sort()).toEqual(["GET /api/v1/dictionaries/de-DE/aff", "GET /api/v1/dictionaries/de-DE/dic"]);
+  await rested(page);
+  // A dictionary judges only words in its own letters, so the wrong word is spelled with them.
+  await page.keyboard.type("Strase ");
+  await rested(page);
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.press("ArrowLeft");
+  await page.locator("textarea").dispatchEvent("contextmenu");
+  // The word is marked, and the correction is the German dictionary's.
+  await expect(page.getByRole("menuitem", { name: "Add to my dictionary" })).toBeAttached();
+  await expect(page.getByRole("menuitem", { name: "Straße" })).toBeAttached();
+});
+
 /** The served document in a folder of a space, and what the server says of a document there. */
 const HOUSE = { space: "family", path: "House/Minutes.let" };
 const listed = (name, id = opened().id) => ({ kind: "document", name, space: "family", path: `House/${name}.let`, id, modified: 0, role: "editor" });

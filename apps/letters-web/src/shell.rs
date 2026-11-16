@@ -5,7 +5,7 @@
 //! moves the hidden input under the caret, where the input method's candidate window should open.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::mem;
 use std::ops::Range;
@@ -199,6 +199,10 @@ pub struct Shell {
     /// The sources of linked pictures the person trusts: those their account keeps, which the server
     /// fetches from unasked, or without an account those they said on this page, for as long as it is open.
     sources: Vec<letters_trust::Source>,
+    /// The languages the server has a spelling dictionary for, once it has said, and those among them a
+    /// dictionary was asked for.
+    languages: Vec<String>,
+    dictionaries: Vec<String>,
     /// The page of the server the person asked for, which waits until the server has what they wrote.
     leaving: Option<String>,
     /// Whether the server makes links to its documents, once it has said.
@@ -405,6 +409,8 @@ impl Shell {
                 on_slow: callback(shell, Self::link_again),
                 slow_timer: None,
                 sources: Vec::new(),
+                languages: Vec::new(),
+                dictionaries: Vec::new(),
                 leaving: None,
                 links: None,
                 account: None,
@@ -1510,6 +1516,8 @@ impl Shell {
     /// Brings the mirror up to date with the window.
     fn reflect(&mut self) {
         self.mirror_timer = None;
+        // What was written may name a language for the first time.
+        self.want_dictionaries();
         let start = self.platform.now();
         let mirror = Mirror::of(&self.view.access());
         // The hidden input keeps the keyboard, and says which control inside the window has it.
@@ -2037,6 +2045,21 @@ impl Shell {
             shell.say_seen();
             shell.arrived();
         });
+        // The dictionaries are anyone's to ask for. A server that has none leaves every language but
+        // English unchecked, as a page with no server does.
+        let asked = browser::ask(&self.window, "GET", paths::DICTIONARIES, None);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Ok(Ok(languages)) = asked.await.map(|answer| serde_json::from_slice::<Vec<String>>(&answer)) else {
+                return;
+            };
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            shell.view.set_languages(&languages);
+            shell.languages = languages;
+            shell.want_dictionaries();
+            shell.arrived();
+        });
         // A visitor has no sources of their own, and their settings then list none.
         let asked = browser::ask(&self.window, "GET", paths::OWN_SOURCES, None);
         let shell = self.me.clone();
@@ -2047,6 +2070,46 @@ impl Shell {
             shell.take_sources(sources);
             shell.arrived();
         });
+    }
+
+    /// Fetches the server's dictionary for each language the document names that it has one for, once.
+    /// A dictionary is large, so none is fetched for a language nothing is written in. The text is
+    /// checked when it has come, and left alone if it does not.
+    fn want_dictionaries(&mut self) {
+        if self.languages.is_empty() {
+            return;
+        }
+        // By the server's own name for it, since one dictionary may serve several of the tags written.
+        let held = |tag: String| letters_spell::best_dictionary(self.languages.iter().map(String::as_str), &tag);
+        let named: BTreeSet<usize> = page::languages(self.view.editor().doc()).into_iter().filter_map(held).collect();
+        let wanted = named.into_iter().map(|at| self.languages[at].clone());
+        let wanted: Vec<String> = wanted.filter(|tag| !self.dictionaries.contains(tag)).collect();
+        for tag in wanted {
+            self.dictionaries.push(tag.clone());
+            let urls = [paths::dictionary_aff(&tag), paths::dictionary_dic(&tag)];
+            let (shell, window) = (self.me.clone(), self.window.clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                let files = match browser::files(&window, &urls).await {
+                    Ok(files) => files,
+                    Err(error) => return web_sys::console::error_1(&error),
+                };
+                let [aff, dic] = [0, 1].map(|at| String::from_utf8_lossy(&files[at]));
+                let dictionary = match letters_spell::Dictionary::parse(&aff, &dic) {
+                    Ok(dictionary) => dictionary,
+                    Err(error) => {
+                        return web_sys::console::error_1(&format!("the dictionary for {tag}: {error}").into());
+                    }
+                };
+                let Some(shell) = shell.upgrade() else { return };
+                let mut shell = shell.borrow_mut();
+                shell.view.add_dictionary(&tag, dictionary);
+                // The check runs in the time a frame leaves over, so there must be a frame.
+                if !shell.frame_due {
+                    shell.frame_due = shell.window.request_animation_frame(&shell.on_frame).is_ok();
+                }
+                shell.arrived();
+            });
+        }
     }
 
     /// Takes the sources of linked pictures the person's account keeps, as the server writes them.

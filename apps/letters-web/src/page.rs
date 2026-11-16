@@ -9,7 +9,7 @@
 //! A server calls [`served`] and sends what it answers. Beside the document such a page carries the
 //! server's [`Opened`]: which document it is, who writes in it and what they may do.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::ops::RangeInclusive;
 
@@ -416,6 +416,21 @@ pub fn has_maths(document: &Document) -> bool {
 pub fn first_font(document: &Document) -> &'static str {
     let written = document.walk().all(|block| letters_fonts::first_writes(&block.plain_text()));
     if written { letters_fonts::FIRST } else { letters_fonts::FILES[0] }
+}
+
+/// The languages `document` names besides English, which is built in: its own, and those of its blocks and
+/// runs, as `de` or `de-CH`. A server's dictionary serves text in one of them.
+pub fn languages(document: &Document) -> BTreeSet<String> {
+    let other =
+        |tag: &str| letters_spell::dictionary_language(tag).filter(|tag| tag != "en" && !tag.starts_with("en-"));
+    let mut named = BTreeSet::new();
+    let mut note = |tag: &str| named.extend(other(tag));
+    note(&document.language);
+    for block in document.walk() {
+        block.lang.as_deref().map(&mut note);
+        block.body.runs().iter().filter_map(|run| run.lang.as_deref()).for_each(&mut note);
+    }
+    named
 }
 
 /// What a page asks its browser to fetch early for `document`, beyond what every page does: the font its

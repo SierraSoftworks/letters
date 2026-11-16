@@ -175,9 +175,11 @@ export const serve = async (page, said, answer = () => undefined, document = und
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
-    // A page looks up what the person set for themselves, the sources they trust and what the document is
-    // called by itself, and says where its person read up to: none of it is what a test asked of it.
-    const own = request.method() === "GET" ? ["/api/v1/settings", "/api/v1/settings/sources", `/api/v1/documents/${said.id}`] : [`/api/v1/documents/${said.id}/seen`];
+    // A page looks up what the person set for themselves, the sources they trust, the server's dictionaries
+    // and what the document is called by itself, and says where its person read up to: none of it is what a
+    // test asked of it.
+    const looked = ["/api/v1/settings", "/api/v1/settings/sources", "/api/v1/dictionaries", `/api/v1/documents/${said.id}`];
+    const own = request.method() === "GET" ? looked : [`/api/v1/documents/${said.id}/seen`];
     if (!own.includes(path)) {
       asked.push({ method: request.method(), path, body: request.postDataBuffer(), type: await request.headerValue("content-type") });
     }

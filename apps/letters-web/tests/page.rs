@@ -367,3 +367,16 @@ fn the_welcome_document_takes_its_ids_from_the_page() {
     assert_eq!(ids, ["id1", "id2", "id3"]);
     assert_eq!(Document::from_json(&document.to_json()).expect("it reads back"), document);
 }
+
+#[test]
+fn the_languages_a_document_names_are_those_a_dictionary_is_fetched_for_and_never_english() {
+    let passage = |lang: &str| json!({ "text": "x", "lang": lang });
+    let block =
+        json!({ "id": "b", "type": "paragraph", "lang": "fr", "content": [passage("pt_BR"), passage("en-GB")] });
+    let cases = [("de-CH", vec!["de-CH", "fr", "pt-BR"]), ("en", vec!["fr", "pt-BR"])];
+    for (language, named) in cases {
+        let document = json!({ "format": 1, "language": language, "blocks": [block] });
+        let document = Document::from_json(&document.to_string()).expect("the document reads");
+        assert_eq!(page::languages(&document).into_iter().collect::<Vec<_>>(), named, "{language}");
+    }
+}
