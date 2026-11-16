@@ -178,7 +178,10 @@ jobs:
           mkdir "$RUNNER_TEMP/image"
           cp -R target/Letters.app "$RUNNER_TEMP/image/"
           ln -s /Applications "$RUNNER_TEMP/image/Applications"
-          hdiutil create -volname Letters -srcfolder "$RUNNER_TEMP/image" -ov -format UDZO dist/Letters.dmg
+          # Left to itself hdiutil guesses the room the folder needs, and at times too little ("No space
+          # left on device"). It is told: the folder's size and a fifth more.
+          room=$(du -sm "$RUNNER_TEMP/image" | awk '{ print int($1 * 1.2) + 16 }')
+          hdiutil create -volname Letters -srcfolder "$RUNNER_TEMP/image" -size "${room}m" -ov -format UDZO dist/Letters.dmg
 
       - name: Check that it starts
         run: |
