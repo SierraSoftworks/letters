@@ -5,7 +5,7 @@
 //! can be written in with no server in reach. The line trades what each side lacks while there is one:
 //! `letters-sync` says what to send and what to merge, and this carries it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -327,8 +327,11 @@ pub fn place(session: &Session, id: &str, copy: &Path, asks: &[Placing]) -> Plac
     if let Some(opened) = &opened {
         remember(copy, opened);
     }
-    let space = opened.as_ref().and_then(|opened| opened.space.as_deref());
-    Placed { shelves: space.and_then(|space| shelves(session, space).ok()), opened, refused }
+    let shelves = opened.as_ref().and_then(|opened| {
+        let folder = opened.path.rsplit_once('/').map_or("", |(folder, _)| folder);
+        shelves(session, opened.space.as_deref()?, folder).ok()
+    });
+    Placed { shelves, opened, refused }
 }
 
 /// Why a server did not do what the person asked, as they are to read it: the server's own sentence where
@@ -410,21 +413,48 @@ fn name_once(session: &Session, id: &str, name: &str) -> Result<(), Refused> {
     tried.map(drop)
 }
 
-/// The folders of a space in tree order, the space itself first.
-fn shelves(session: &Session, space: &str) -> Result<Vec<Shelf>, Refused> {
-    let inside = |folder: &str, depth: u8| {
-        let listing = session.entries(space, folder)?;
-        let folders = listing.entries.into_iter().filter(|entry| entry.kind == EntryKind::Folder);
-        // Each is taken from the end, so the first of a folder is the next listed.
-        let mut folders: Vec<_> = folders.map(|entry| (entry, depth)).collect();
-        folders.reverse();
-        Ok((listing.space.name, folders))
+/// The folders of a space in tree order, the space itself first: those the folder `at` is in, then the
+/// nearest to the space, [`SHELVES`] at most. A space with a great many still shows every folder at its
+/// top. A folder the server will not list is shown with nothing in it, and so are the rest once the
+/// server stops answering: a tree with gaps still has places to move to.
+fn shelves(session: &Session, space: &str, at: &str) -> Result<Vec<Shelf>, Refused> {
+    let mut name = String::new();
+    // The folders in each folder that was listed, by its path.
+    let mut inside: HashMap<String, Vec<Entry>> = HashMap::new();
+    let within = at.match_indices('/').map(|(end, _)| &at[..end]).chain([at]);
+    let mut waiting: VecDeque<String> = [""].into_iter().chain(within).map(str::to_owned).collect();
+    let mut known = 1;
+    while let Some(path) = waiting.pop_front().filter(|_| known < SHELVES) {
+        // One the document is in was asked for before the folder it is in listed it.
+        if inside.contains_key(&path) {
+            continue;
+        }
+        let listing = match session.entries(space, &path) {
+            Ok(listing) => listing,
+            Err(refused) if path.is_empty() => return Err(refused),
+            Err(Refused::Said(_) | Refused::Status(_)) => continue,
+            Err(_) => break,
+        };
+        let mut folders: Vec<Entry> =
+            listing.entries.into_iter().filter(|entry| entry.kind == EntryKind::Folder).collect();
+        folders.truncate(SHELVES - known);
+        known += folders.len();
+        waiting.extend(folders.iter().map(|folder| folder.path.clone()));
+        if path.is_empty() {
+            name = listing.space.name;
+        }
+        inside.insert(path, folders);
+    }
+    // Each is taken from the end, so the first of a folder is the next listed.
+    let mut held = |path: &str, depth: u8| {
+        let folders = inside.remove(path).unwrap_or_default();
+        folders.into_iter().rev().map(move |folder| (folder, depth)).collect::<Vec<_>>()
     };
-    let (name, mut left) = inside("", 1)?;
+    let mut left = held("", 1);
     let mut out = vec![Shelf { path: String::new(), name, depth: 0 }];
-    while let Some((folder, depth)) = left.pop().filter(|_| out.len() < SHELVES) {
+    while let Some((folder, depth)) = left.pop() {
         if let Some(deeper) = depth.checked_add(1) {
-            left.extend(inside(&folder.path, deeper)?.1);
+            left.extend(held(&folder.path, deeper));
         }
         out.push(Shelf { path: folder.path, name: folder.name, depth });
     }
