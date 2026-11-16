@@ -270,11 +270,13 @@ pub enum Request {
         id: String,
         place: Place,
     },
-    /// Let the person choose a Markdown or a Word file of this device, have the server at this address
-    /// make a document of it in this folder of a space, as `letters_api::paths::import` does, and open
-    /// that document as [`Request::NewAt`] opens the one it starts. `path` is the folder's path in the
-    /// space, empty for the space itself. Nothing is done when no file is chosen. The card that opens a
-    /// server's documents asks it, only of a space the person edits, and is put away by then.
+    /// Let the person choose a Markdown or a Word file of this device, and bring it into this folder of a
+    /// space at the server at this address as a new document, open as the one [`Request::NewAt`] starts
+    /// is. `path` is the folder's path in the space, empty for the space itself. Nothing is done when no
+    /// file is chosen. The file is read on the device, so that its pictures and notes come along: offer
+    /// it with `Window::offer_import`, the folder as `ImportOffer::destination`, and make the document
+    /// when [`Request::Import`] is asked. The card that opens a server's documents asks it, only of a
+    /// space the person edits, and is put away by then.
     ImportAt {
         server: String,
         space: String,
