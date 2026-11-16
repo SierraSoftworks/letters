@@ -328,8 +328,7 @@ fn a_journal_the_app_ended_at_is_set_aside_and_its_document_opens_as_saved() {
         assert_eq!((aside.len(), back.len()), (1, 1), "{case}");
         assert_eq!(aside[0].home.as_deref(), Some(path.as_path()), "{case}");
         assert_eq!(fs::read(&aside[0].kept).unwrap(), left, "{case}: what was set aside is kept whole");
-        let kept = aside[0].kept.file_name().unwrap().to_string_lossy();
-        assert!(aside[0].said(true).contains(&*kept), "{case}: the person is told where it is");
+        assert_eq!(aside[0].why, Why::Ended, "{case}");
         assert_eq!(back[0].document, saved, "{case}");
 
         // The document is journalled as any other from here on, and what was set aside is not read again.
@@ -381,8 +380,6 @@ fn a_journal_with_an_edit_that_does_not_stand_comes_back_up_to_it_and_is_set_asi
         let aside = desk.aside.clone().expect(case);
         assert_eq!(aside.why, Why::Refused { back }, "{case}");
         assert_eq!(fs::read(&aside.kept).unwrap(), left, "{case}: what was set aside is kept whole");
-        let kept = aside.kept.file_name().unwrap().to_string_lossy();
-        assert!(aside.said(true).contains(&*kept), "{case}: the person is told where it is");
 
         // What came back outlives another crash, and what was set aside is not read again.
         let mut journals = crash(desk, journals);

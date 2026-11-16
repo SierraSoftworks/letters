@@ -27,8 +27,8 @@ use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDeci
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
     Access, Allows, Appearance, Browsed, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind,
-    ImportOffer, Landing, LinkPreviewFound, Location, MergeAsk, MergeFile, PictureState, Request, SafeMode, SaveState,
-    Scheme, Settings, SignIn, Window as View, tokens,
+    ImportOffer, Landing, LinkPreviewFound, Location, MergeAsk, MergeFile, Notice, PictureState, Request, SafeMode,
+    SaveState, Scheme, Settings, SignIn, Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -115,6 +115,8 @@ pub enum Event {
     Faces(WindowId, Vec<Font>),
     /// What a window's first paint did not need has been read.
     Read(WindowId),
+    /// The file at this path, which a window asked to be shown where it is kept, could not be shown.
+    Unshown(WindowId, PathBuf),
     /// The folder of a window's document, whose file is at this path, was looked through for conflict
     /// copies of it, and for the file it is itself a conflict copy of.
     Beside(WindowId, PathBuf, Box<conflicts::Beside>),
@@ -758,6 +760,8 @@ struct DocWindow {
     imported: Option<String>,
     /// Journals that were set aside, as the app ended when it last read them, until the window says so.
     aside: Vec<Aside>,
+    /// Where the journals are that the window has said were set aside, for the button that shows one.
+    kept: Vec<PathBuf>,
     /// Where the writing rested, for the versions the history lists.
     rests: Rests,
     /// Whether versions were marked that no save has been handed. A mark is no edit, but it is saved.
@@ -1819,12 +1823,14 @@ impl DocWindow {
             }
         };
         // Said once the document is whole on screen, and whether or not it can be saved.
-        for aside in std::mem::take(&mut self.aside) {
-            let here = aside.home.as_deref().is_some_and(|home| self.place.path() == Some(home));
-            self.alert(&aside.said(here));
-        }
-        if let Some(aside) = own {
-            self.alert(&aside.said(true));
+        let told: Vec<_> = std::mem::take(&mut self.aside).into_iter().map(|aside| (aside, None)).collect();
+        for (aside, here) in told.into_iter().chain(own.map(|aside| (aside, Some(true)))) {
+            let shows = || aside.home.as_deref().is_some_and(|home| self.place.path() == Some(home));
+            let sentence = aside.said(here.unwrap_or_else(shows));
+            // The notice is known by where its journal is kept, which its button shows.
+            let key = aside.kept.to_string_lossy().into_owned();
+            self.view.notify(Notice { sentence, button: SHOW_FILE.into(), key });
+            self.kept.push(aside.kept);
         }
         read
     }
@@ -2276,6 +2282,9 @@ fn say(file: &Path, said: &str) {
     }
 }
 
+/// What the button of a notice about a journal that was set aside is called.
+const SHOW_FILE: &str = "Show file";
+
 fn alert(parent: Option<&Arc<Window>>, message: &str) {
     eprintln!("letters: {message}");
     let dialog = MessageDialog::new().set_level(MessageLevel::Error).set_title("Letters").set_description(message);
@@ -2389,6 +2398,7 @@ impl App {
             import_to: None,
             imported: None,
             aside: Vec::new(),
+            kept: Vec::new(),
             rests: Rests::default(),
             marks: false,
             copies: None,
@@ -2705,6 +2715,7 @@ impl App {
                 Request::MergeConflictsOf { server, id: document, place } => {
                     self.browse(id, server, place, Some(document), now);
                 }
+                Request::NoticePressed(key) => self.show_kept(id, &key),
                 Request::BrowseTrash { server } => self.browse_trash(id, server, None, now),
                 Request::PutBack { server, space, file } => self.browse_trash(id, server, Some((space, file)), now),
                 Request::ImportAt { server, space, path } => self.import_at(event_loop, id, server, space, path),
@@ -2901,6 +2912,21 @@ impl App {
         // A trusted folder vouches for what is in it, so a move can change how the document is treated.
         window.retrust(self.trust.trust(), &self.library);
         done
+    }
+
+    /// Shows the journal a notice of the window told of, where it is kept. The file manager is asked on
+    /// another thread, and the window says where the file is if nothing shows it.
+    fn show_kept(&self, id: WindowId, key: &str) {
+        let kept =
+            self.windows.get(&id).and_then(|window| window.kept.iter().find(|kept| kept.to_string_lossy() == key));
+        let Some(kept) = kept.cloned() else { return };
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            if let Err(error) = links::reveal(&kept) {
+                eprintln!("letters: {} could not be shown: {error}", kept.display());
+                let _ = proxy.send_event(Event::Unshown(id, kept));
+            }
+        });
     }
 
     /// The documents that sessions which ended early left unsaved. A run that only measures looks for
@@ -4223,6 +4249,11 @@ impl ApplicationHandler<Event> for App {
                 }
                 // The card asks for the next place once it has the spaces.
                 self.serve(event_loop, id, now);
+            }
+            Event::Unshown(id, kept) => {
+                if let Some(window) = self.windows.get(&id) {
+                    window.alert(&format!("The file could not be shown. It is kept at {}.", journal::shown(&kept)));
+                }
             }
             Event::Trash(id, server, thrown) => {
                 if let Some(window) = self.windows.get_mut(&id) {

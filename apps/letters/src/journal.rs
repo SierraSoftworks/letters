@@ -73,31 +73,30 @@ pub struct Aside {
 }
 
 impl Aside {
-    /// What to tell the person. `here` is whether the window that says it shows the journal's document.
+    /// What to tell the person, beside a button that shows the journal. `here` is whether the window that
+    /// says it shows the journal's document.
     pub fn said(&self, here: bool) -> String {
-        let home = std::env::home_dir();
-        let inside = home.as_deref().and_then(|home| self.kept.strip_prefix(home).ok());
-        let kept = inside.map_or_else(|| self.kept.display().to_string(), |inside| format!("~/{}", inside.display()));
         let name = self.home.as_deref().and_then(Path::file_stem).map(OsStr::to_string_lossy);
-        let document = match name {
-            _ if here => "this document".into(),
-            Some(name) => name,
-            None => "a document that was never saved".into(),
+        // A window that shows another document names the one this is about.
+        let (of, shown) = match name {
+            _ if here && self.home.is_some() => (String::new(), ", so this document is shown as it was last saved"),
+            _ if here => (String::new(), ""),
+            Some(name) => (format!(" to {name}"), ""),
+            None => (" to a document that was never saved".to_owned(), ""),
         };
-        let shown = if here && self.home.is_some() { ", so it is shown as it was last saved" } else { "" };
         match self.why {
-            Why::Ended => format!(
-                "Letters closed unexpectedly while it was bringing back unsaved changes to {document}{shown}. What \
-                 could not be brought back is kept in {kept}."
-            ),
-            Why::Refused { back: true } => format!(
-                "Some unsaved changes to {document} were brought back. The rest could not be, and are kept in {kept}."
-            ),
-            Why::Refused { back: false } => {
-                format!("Unsaved changes to {document} could not be brought back{shown}. They are kept in {kept}.")
-            }
+            Why::Ended => format!("Letters closed unexpectedly while bringing back unsaved changes{of}{shown}."),
+            Why::Refused { back: true } => format!("Some unsaved changes{of} could not be brought back."),
+            Why::Refused { back: false } => format!("Unsaved changes{of} could not be brought back{shown}."),
         }
     }
+}
+
+/// A path as a person reads it, from their home folder on where it is in there.
+pub fn shown(path: &Path) -> String {
+    let home = std::env::home_dir();
+    let inside = home.as_deref().and_then(|home| path.strip_prefix(home).ok());
+    inside.map_or_else(|| path.display().to_string(), |inside| format!("~/{}", inside.display()))
 }
 
 /// The file that lies beside a journal for as long as it is read.

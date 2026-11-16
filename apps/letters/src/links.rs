@@ -78,7 +78,7 @@ pub fn reveal(file: &Path) -> io::Result<()> {
     if file_manager::show(file).is_some() {
         return Ok(());
     }
-    let mut command = match () {
+    let command = match () {
         () if cfg!(target_os = "macos") => {
             let mut command = Command::new("open");
             command.arg("-R").arg(file);

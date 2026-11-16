@@ -283,6 +283,9 @@ fn a_journal_that_would_end_the_app_is_set_aside_and_its_document_opens_as_saved
     // it twice: the launch after keeps it, does not read it, and shows the document as its file has it.
     let mut shown = desk.launch("Ada", &file).unwrap_or_else(|| desk.open("Ada", &file));
     shown.wait_for("Rates change in January.");
+    // The window says so, with a button that shows where the journal is kept.
+    shown.wait_for("shown as it was last saved");
+    shown.wait_for("Show file");
     let kept = |name: &String| !is_journal(name) && fs::read(unsaved.join(name)).is_ok_and(|held| &held == left);
     let names = desk.folder.names("Ada/.letters/unsaved");
     assert!(names.iter().any(kept), "the journal is kept under a name of its own: {names:?}");
