@@ -6,7 +6,8 @@ a person in as the owner of the device they are on, with no password. Nothing is
 
 The examples use the tailnet `example.ts.net`, a server machine named `letters`, and the tailnet groups
 `family` and `friends`. The guide was written against tsidp v0.0.15. tsidp is experimental, and the shape of
-its grants may change.
+its grants may change. Every setting, backups, upgrades and the log are in [Operating a Letters
+server](operating.md).
 
 ## Publish
 
