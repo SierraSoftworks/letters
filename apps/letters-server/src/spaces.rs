@@ -24,11 +24,31 @@ pub const TRASH: &str = ".letters-trash";
 /// Where a person's own space keeps what they set for themselves, as the desktop app does in a home folder.
 pub const KEPT: &str = ".letters";
 
+/// Folders a NAS, a disk or an operating system keeps for itself among a person's own: Synology's
+/// thumbnails, recycle bin and snapshots, QNAP's, Windows', a Linux disk's and a Mac archive's. Told by
+/// their whole name, whatever its case, so that a folder a person called `#ideas` or `@work` stays theirs.
+const SYSTEM: [&str; 12] = [
+    "@eaDir",
+    "@tmp",
+    "@SynoResource",
+    "@sharebin",
+    "#recycle",
+    "#snapshot",
+    "@Recycle",
+    "@Recently-Snapshot",
+    "$RECYCLE.BIN",
+    "System Volume Information",
+    "lost+found",
+    "__MACOSX",
+];
+
 /// Whether `name` can name a file or a folder in a space: one visible name that every file system takes.
-/// A leading dot is how sync tools, the trash and half-written files hide, so none is reachable by name.
+/// A leading dot is how sync tools, the trash and half-written files hide, so none is reachable by name,
+/// and neither is a folder the system keeps for itself.
 pub fn name_ok(name: &str) -> bool {
     let plain = !name.chars().any(|c| c.is_control() || matches!(c, '/' | '\\'));
-    !name.is_empty() && name.len() <= 255 && !name.starts_with('.') && plain
+    let system = SYSTEM.iter().any(|system| system.eq_ignore_ascii_case(name));
+    !name.is_empty() && name.len() <= 255 && !name.starts_with('.') && plain && !system
 }
 
 /// Where something is in a space: the names of its folders and its own, joined by `/`. Empty for the
@@ -180,8 +200,8 @@ pub struct Folder {
 }
 
 impl Folder {
-    /// The folders and the documents here, by name. Hidden names are left out, and so are symlinks, which
-    /// could show one folder inside itself, and whatever is not a document.
+    /// The folders and the documents here, by name. Hidden names and the system's own folders are left out,
+    /// and so are symlinks, which could show one folder inside itself, and whatever is not a document.
     pub fn list(&self) -> io::Result<Vec<Listed>> {
         let mut out = Vec::new();
         for entry in self.dir.entries()? {

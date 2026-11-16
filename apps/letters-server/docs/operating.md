@@ -47,6 +47,8 @@ Each `[[space]]` is a folder of documents. There must be at least one.
   at least one. The highest role a person's groups give them counts.
 - **Owners.** They edit, and they alone move a folder to the trash. Editors rename and move folders, and
   move documents to the trash.
+- **What is left out.** Names with a leading dot, and the folders a NAS or a disk keeps for itself
+  (`@eaDir`, `#recycle`, `#snapshot`, `$RECYCLE.BIN`, `lost+found` and their like), are no part of a space.
 
 ### Switches
 
