@@ -53,7 +53,7 @@ use crate::files::{self, EXTENSION, Exchange, Home, Merged, Opened, Rest, STYLES
 use crate::gpu::Gpu;
 use crate::import::{self, Choices, Plan, Unplanned};
 use crate::input::{self, Composer, Press};
-use crate::journal::{self, Journal, Journals};
+use crate::journal::{self, Aside, Journal, Journals};
 use crate::keychain::Keychain;
 use crate::library::{Library, Place, Recent, Refused, UNTITLED, has_content};
 use crate::links::{self, Step};
@@ -756,6 +756,8 @@ struct DocWindow {
     import_to: Option<(String, String, String)>,
     /// The name of the file this document was just brought in from, until its history says so.
     imported: Option<String>,
+    /// Journals that were set aside, as the app ended when it last read them, until the window says so.
+    aside: Vec<Aside>,
     /// Where the writing rested, for the versions the history lists.
     rests: Rests,
     /// Whether versions were marked that no save has been handed. A mark is no edit, but it is saved.
@@ -1746,8 +1748,9 @@ impl DocWindow {
             }
             (None, None) => return Ok(()),
         };
-        match working {
+        let read = match working {
             Ok(Working { copy, history, news, claim, journalled }) => {
+                self.aside.extend(claim.as_ref().and_then(|claim| claim.aside().cloned()));
                 if let Some(history) = history {
                     let _ = self.view.change(|editor| Ok::<_, Infallible>(editor.attach(history)));
                 }
@@ -1812,7 +1815,13 @@ impl DocWindow {
                 self.retitle();
                 Err(format!("{} is open, but changes to it cannot be saved{why}.", self.name()))
             }
+        };
+        // Said once the document is whole on screen, and whether or not it can be saved.
+        for aside in std::mem::take(&mut self.aside) {
+            let here = aside.home.as_deref().is_some_and(|home| self.place.path() == Some(home));
+            self.alert(&aside.said(here));
         }
+        read
     }
 
     /// What the copy needs to catch up with the editor: the edits it has not seen, and the revision they
@@ -2374,6 +2383,7 @@ impl App {
             importing: None,
             import_to: None,
             imported: None,
+            aside: Vec::new(),
             rests: Rests::default(),
             marks: false,
             copies: None,
@@ -2890,11 +2900,16 @@ impl App {
 
     /// The documents that sessions which ended early left unsaved. A run that only measures looks for
     /// none, and leaves every journal as it found it.
-    fn left_unsaved(&self) -> Vec<Opened> {
+    ///
+    /// With them, the journals that were set aside because the app ended as it last read them. Such a
+    /// document comes back as its file has it.
+    fn left_unsaved(&self) -> (Vec<Opened>, Vec<Aside>) {
         if self.typing.is_some() || self.report_launch {
-            return Vec::new();
+            return Default::default();
         }
-        self.journals.orphans().into_iter().filter_map(files::reopen).collect()
+        let claims = self.journals.orphans();
+        let aside = claims.iter().filter_map(|claim| claim.aside().cloned()).collect();
+        (claims.into_iter().filter_map(files::reopen).collect(), aside)
     }
 
     fn mark(&mut self, stage: &'static str) {
@@ -3849,17 +3864,29 @@ impl ApplicationHandler<Event> for App {
         let shown = opened.and_then(|opened| {
             // What sessions that ended early left unsaved comes back first, and the document that was
             // asked for may be among it.
-            let mut documents: Vec<_> = self.left_unsaved().into_iter().map(Some).collect();
+            let (left, aside) = self.left_unsaved();
+            let mut documents: Vec<_> = left.into_iter().map(Some).collect();
             let asked = opened.filter(|opened| !documents.iter().flatten().any(|kept| same_file(kept, opened)));
             if asked.is_some() || documents.is_empty() {
                 documents.push(asked);
             }
-            documents.into_iter().try_for_each(|opened| {
+            let shown = documents.into_iter().try_for_each(|opened| {
                 let landing = opened.is_none();
                 self.open_window(event_loop, opened, landing).map(drop).map_err(|error| {
                     ("No window could be opened.".to_owned(), format!("No window could be opened.\n\n{error}"))
                 })
-            })
+            });
+            // The window of its document says that a journal was set aside, and any window one whose
+            // document has no file to show.
+            for aside in aside {
+                let shows =
+                    |window: &DocWindow| aside.home.as_deref().is_some_and(|home| window.place.path() == Some(home));
+                let its = self.windows.iter().find(|(_, window)| shows(window)).or(self.windows.iter().next());
+                if let Some(window) = its.map(|(id, _)| *id).and_then(|id| self.windows.get_mut(&id)) {
+                    window.aside.push(aside);
+                }
+            }
+            shown
         });
         // A Markdown or Word file that was asked for is offered in a window that has nothing of its own.
         if let Some(path) = self.path.clone().filter(|path| shown.is_ok() && import::offered(path)) {

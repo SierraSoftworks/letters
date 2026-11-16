@@ -76,8 +76,14 @@ impl Desk {
 
 /// Ends a session with no chance to save, and starts the next one.
 fn crash(desk: Desk, journals: Journals) -> Journals {
+    drop(desk);
+    crash_of(journals)
+}
+
+/// Ends a session that has no window, and starts the next one.
+fn crash_of(journals: Journals) -> Journals {
     let folder = journals.folder().to_owned();
-    drop((desk, journals));
+    drop(journals);
     Journals::at(folder)
 }
 
@@ -280,4 +286,58 @@ fn a_copy_that_became_its_own_document_comes_back_as_that_after_a_crash() {
     assert_eq!((id(&copied), id(&path)), (own, original), "each file is one document, and they are two");
     assert_eq!(files::open(&copied, Style::default).unwrap().document, typed);
     assert_eq!(files::open(&path, Style::default).unwrap().document, document("First thoughts"));
+}
+
+/// Found by fuzzing a journal (issue #4): an edit Loro panics on in a document that lacks its writer.
+const PANICS: &[u8] = include_bytes!("../../../fuzz/corpus/history/a-first-edit-that-builds-on-one-before-it.bin");
+
+#[test]
+fn a_journal_the_app_ended_at_is_set_aside_and_its_document_opens_as_saved() {
+    let cases: [(&str, Option<&[u8]>); 2] =
+        [("what the session wrote", None), ("an edit Loro panics on", Some(PANICS))];
+    for (nth, (case, edit)) in cases.into_iter().enumerate() {
+        let scratch = Scratch::new(&format!("journal-aside-{nth}"));
+        let path = scratch.0.join("Notes.let");
+        let mut journals = Journals::at(scratch.0.join("unsaved"));
+        let mut desk = Desk::at(&mut journals, new(Some(&path)));
+        let saved = document("First thoughts");
+        desk.write(&saved);
+        assert!(!desk.save() && desk.save(), "{case}");
+        desk.write(&document("First thoughts, and second ones"));
+        if let Some(edit) = edit {
+            desk.journal().edits(edit.to_vec());
+        }
+        let journals = crash(desk, journals);
+        let [journal] = &scratch.names("unsaved")[..] else { panic!("{case}: one journal is left") };
+        let left = fs::read(scratch.0.join("unsaved").join(journal)).unwrap();
+
+        // The next session ends as it brings the journal back, which lets go of what it held.
+        let claims = journals.orphans();
+        let ended = std::panic::catch_unwind(|| claims[0].replay(|_| panic!("the app ends here")));
+        assert!(ended.is_err(), "{case}");
+        drop(claims);
+
+        // The one after it leaves the journal alone and shows the document as its file has it.
+        let mut journals = crash_of(journals);
+        let claims = journals.orphans();
+        let aside: Vec<_> = claims.iter().filter_map(|claim| claim.aside().cloned()).collect();
+        let mut back: Vec<Opened> = claims.into_iter().filter_map(files::reopen).collect();
+        assert_eq!((aside.len(), back.len()), (1, 1), "{case}");
+        assert_eq!(aside[0].home.as_deref(), Some(path.as_path()), "{case}");
+        assert_eq!(fs::read(&aside[0].kept).unwrap(), left, "{case}: what was set aside is kept whole");
+        let kept = aside[0].kept.file_name().unwrap().to_string_lossy();
+        assert!(aside[0].said(true).contains(&*kept), "{case}: the person is told where it is");
+        assert_eq!(back[0].document, saved, "{case}");
+
+        // The document is journalled as any other from here on, and what was set aside is not read again.
+        let mut desk = Desk::at(&mut journals, back.remove(0));
+        let typed = document("First thoughts, and third ones");
+        desk.write(&typed);
+        let journals = crash(desk, journals);
+        let claims = journals.orphans();
+        assert!(claims.iter().all(|claim| claim.aside().is_none()), "{case}");
+        let back: Vec<Opened> = claims.into_iter().filter_map(files::reopen).collect();
+        assert_eq!(back.iter().map(|opened| &opened.document).collect::<Vec<_>>(), [&typed], "{case}");
+        assert!(aside[0].kept.exists(), "{case}");
+    }
 }

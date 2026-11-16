@@ -6,9 +6,14 @@
 //!
 //! Every record waits for the disk, so all journals are written on one thread of their own. A lock file
 //! beside a journal says that a window has it, in this copy of the app or another.
+//!
+//! A journal is read after a crash, which its last record may have caused. A marker lies beside it while
+//! it is read, and a journal whose marker is found later is set aside and not read again.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -47,18 +52,102 @@ impl Drop for Lock {
     }
 }
 
+/// A journal that was being read when the app ended, moved out of the way so that no later launch ends at
+/// it too. It is kept, and nothing reads it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Aside {
+    /// Where the journal is now.
+    pub kept: PathBuf,
+    /// The file of its document, if that was ever saved.
+    pub home: Option<PathBuf>,
+}
+
+impl Aside {
+    /// What to tell the person. `here` is whether the window that says it shows the document as its file
+    /// has it.
+    pub fn said(&self, here: bool) -> String {
+        let home = std::env::home_dir();
+        let inside = home.as_deref().and_then(|home| self.kept.strip_prefix(home).ok());
+        let kept = inside.map_or_else(|| self.kept.display().to_string(), |inside| format!("~/{}", inside.display()));
+        let name = self.home.as_deref().and_then(Path::file_stem).map(OsStr::to_string_lossy);
+        let what = match (&name, here) {
+            (Some(_), true) => "unsaved changes to this document, so it is shown as it was last saved".to_owned(),
+            (Some(name), false) => format!("unsaved changes to {name}"),
+            (None, _) => "a document that was never saved".to_owned(),
+        };
+        format!(
+            "Letters closed unexpectedly while it was bringing back {what}. What could not be brought back is kept in {kept}."
+        )
+    }
+}
+
+/// The file that lies beside a journal for as long as it is read.
+fn marker(journal: &Path) -> PathBuf {
+    journal.with_extension("reading")
+}
+
+/// Sets the journal `name` aside if its marker is beside it: the app ended as it was read. Fails when it
+/// cannot be moved, and it is then neither read nor written to.
+fn ended(folder: &Path, name: &str) -> io::Result<Option<Aside>> {
+    let journal = folder.join(name);
+    let marker = marker(&journal);
+    if !marker.exists() {
+        return Ok(None);
+    }
+    // Its records are read, which ended nothing, and none of its edits are tried.
+    let unsaved = Unsaved::read(&mut Folder::new(folder), name).ok().flatten();
+    let home = unsaved.and_then(|unsaved| unsaved.home).map(PathBuf::from);
+    let stem = journal.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    // One set aside before it keeps its name.
+    let names = (1..100).map(|nth| match nth {
+        1 => format!("{stem}.set-aside.journal"),
+        nth => format!("{stem}.set-aside-{nth}.journal"),
+    });
+    let free = names.map(|name| folder.join(name)).find(|kept| !kept.exists());
+    let kept = free.ok_or_else(|| io::Error::other("no name is free to set a journal aside under"))?;
+    match fs::rename(&journal, &kept) {
+        Ok(()) => {}
+        // The marker outlived its journal, and there is nothing to set aside.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return fs::remove_file(&marker).map(|()| None),
+        Err(error) => return Err(error),
+    }
+    let _ = fs::remove_file(&marker);
+    eprintln!("letters: the app ended as it read a journal, which is set aside as {}", kept.display());
+    Ok(Some(Aside { kept, home }))
+}
+
 /// A document's journal, held for one window: what an earlier session left in it, and the right to add.
 #[derive(Debug)]
 pub struct Claim {
     _lock: Lock,
     journal: PathBuf,
     unsaved: Option<Box<Unsaved>>,
+    aside: Option<Aside>,
 }
 
 impl Claim {
     /// What a session that ended early left unsaved.
     pub fn unsaved(&self) -> Option<&Unsaved> {
         self.unsaved.as_deref()
+    }
+
+    /// The journal that was here and was set aside as this one was claimed, for the person to be told.
+    pub fn aside(&self) -> Option<&Aside> {
+        self.aside.as_ref()
+    }
+
+    /// Hands what an earlier session left unsaved to `replay`, which brings it back into a document.
+    /// `None` when it left nothing. A marker lies beside the journal meanwhile: a replay that ends the
+    /// app, or its thread, leaves it there, and whoever claims the journal next sets it aside.
+    pub fn replay<T>(&self, replay: impl FnOnce(&Unsaved) -> T) -> Option<T> {
+        let unsaved = self.unsaved.as_deref()?;
+        let marker = marker(&self.journal);
+        if let Err(error) = fs::write(&marker, []) {
+            eprintln!("letters: a journal could not be marked as being read: {error}");
+        }
+        let replayed = replay(unsaved);
+        let _ = fs::remove_file(&marker);
+        Some(replayed)
     }
 
     /// Deletes the journal, whose document needs nothing from it.
@@ -73,9 +162,14 @@ pub fn claim(folder: &Path, id: &str) -> Option<Claim> {
     fs::create_dir_all(folder).ok()?;
     let name = journal_name(id);
     let lock = Lock::take(folder, &name)?;
+    let aside = ended(folder, &name).inspect_err(unmoved).ok()?;
     // A journal that cannot be read is a newer build's, and is not written over.
     let unsaved = Unsaved::read(&mut Folder::new(folder), &name).ok()?.map(Box::new);
-    Some(Claim { _lock: lock, journal: folder.join(name), unsaved })
+    Some(Claim { _lock: lock, journal: folder.join(name), unsaved, aside })
+}
+
+fn unmoved(error: &io::Error) {
+    eprintln!("letters: a journal the app ended at could not be set aside: {error}");
 }
 
 fn orphans(folder: &Path) -> Vec<Claim> {
@@ -83,7 +177,12 @@ fn orphans(folder: &Path) -> Vec<Claim> {
     let names = entries.flatten().filter_map(|entry| entry.file_name().into_string().ok());
     let claim = |name: String| {
         let lock = Lock::take(folder, &name)?;
-        let claim = Claim { _lock: lock, journal: folder.join(&name), unsaved: None };
+        let aside = ended(folder, &name).inspect_err(unmoved).ok()?;
+        let claim = Claim { _lock: lock, journal: folder.join(&name), unsaved: None, aside };
+        // Its document is opened as its file has it, with the word of what was set aside.
+        if claim.aside.is_some() {
+            return Some(claim);
+        }
         match Unsaved::read(&mut Folder::new(folder), &name) {
             Ok(Some(unsaved)) => Some(Claim { unsaved: Some(Box::new(unsaved)), ..claim }),
             // Cut off as it was made, before it held anything.

@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 
 use common::Scratch;
 use letters::app::SAYS;
+use letters::journal::{self, Journals};
 use letters::{files, strangers};
-use letters_format::{OPLOG, Package};
+use letters_format::{Archive, OPLOG, Package, is_journal};
 use letters_model::{Block, BlockKind, Document};
 
 /// How long anything a window is waited for may take, on a runner that is slow and busy.
@@ -243,4 +244,53 @@ fn a_document_says_who_else_wrote_since_the_person_last_had_it_open() {
     ada.write(" Again.");
     saved(&file, "Again.");
     assert!(ada.running() && !ada.says().contains("Edited by"), "{}", ada.says());
+}
+
+#[test]
+#[ignore = "needs a display and xdotool: ./scripts/check.sh slow"]
+fn a_journal_the_app_ended_at_is_set_aside_and_its_document_opens_as_saved() {
+    let desk = Desk::new("journal-aside");
+    let file = desk.document("Rates.let");
+    let first = desk.open("Ada", &file);
+    first.write("Rates change in January.");
+    saved(&file, "Rates change in January.");
+    drop(first);
+
+    // A session left an edit that Loro panics on (found by fuzzing a journal, issue #4), and the one
+    // after it ended as it brought that back.
+    let edit = include_bytes!("../../../fuzz/corpus/history/a-first-edit-that-builds-on-one-before-it.bin");
+    let unsaved = desk.home("Ada").join(".letters/unsaved");
+    let _ = fs::remove_dir_all(&unsaved);
+    let (id, created) = {
+        let archive = Archive::open(Cursor::new(fs::read(&file).unwrap())).unwrap();
+        (archive.manifest().id.clone(), archive.manifest().created.clone())
+    };
+    let mut journals = Journals::at(&unsaved);
+    let claim = journal::claim(&unsaved, &id).expect("nobody has the document's journal");
+    journals.open(claim, &id, &created, Some(&file)).edits(edit.to_vec());
+    drop(journals);
+    let journal = |name: &String| is_journal(name).then(|| fs::read(unsaved.join(name)).unwrap());
+    let [left] = &desk.folder.names("Ada/.letters/unsaved").iter().filter_map(journal).collect::<Vec<_>>()[..] else {
+        panic!("the session left one journal")
+    };
+    let claims = Journals::at(&unsaved).orphans();
+    assert!(std::panic::catch_unwind(|| claims[0].replay(|_| panic!("the app ends here"))).is_err());
+    drop(claims);
+
+    // The next launch does not read it again. It keeps it, and shows the document as its file has it.
+    let mut shown = desk.open("Ada", &file);
+    shown.wait_for("Rates change in January.");
+    let kept = |name: &String| !is_journal(name) && fs::read(unsaved.join(name)).is_ok_and(|held| &held == left);
+    let names = desk.folder.names("Ada/.letters/unsaved");
+    assert!(names.iter().any(kept), "the journal is kept under a name of its own: {names:?}");
+    assert!(shown.running());
+    drop(shown);
+
+    // Nothing is left to stop at, and the document is written on as any other.
+    let mut again = desk.open("Ada", &file);
+    again.wait_for("Rates change in January.");
+    again.write(" Still here.");
+    saved(&file, "Still here.");
+    assert!(again.running());
+    assert!(desk.folder.names("Ada/.letters/unsaved").iter().any(kept), "it is still kept");
 }
