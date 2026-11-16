@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use common::{Scratch, Writer};
 use letters::connected::{self, Line, Placing, Said, Told};
 use letters::files::{self, Home};
+use letters::import::Plan;
 use letters::keychain::Keychain;
 use letters::pictures;
 use letters::remote::Roots;
@@ -671,7 +672,7 @@ fn a_document_is_named_renamed_and_moved_at_its_server() {
     let spaces = session.spaces().unwrap();
     let space = spaces.iter().find(|space| space.kind == SpaceKind::Personal).unwrap().id.clone();
     server.document(&session, "Roof repairs");
-    let id = session.new_document(&space, "").unwrap().id.unwrap();
+    let id = session.new_document(&space, "", None).unwrap().id.unwrap();
     let home = Scratch::new("placing-home");
     let copy = connected::reach(&session, &id, &home.0).expect("the document is brought here").path;
     let place = |asks: &[Placing]| connected::place(&session, &id, &copy, asks);
@@ -766,6 +767,58 @@ fn a_picture_is_with_the_server_before_the_edit_that_names_it() {
     let read = |desks: &[&mut Desk]| desks[1].reads().contains(&"Then the gutters.".to_owned());
     assert!(settle(&mut [&mut here, &mut there], read), "{:?}", there.reads());
     assert_eq!(here.unkept, ["assets/not-its-hash.png"]);
+}
+
+#[test]
+fn a_file_brought_in_on_this_device_is_made_a_document_at_the_server_with_its_pictures() {
+    let server = Server::start("bring");
+    let (ours, theirs) = (server.session(ada()), server.session(ada()));
+    let spaces = ours.spaces().expect("the spaces are listed");
+    let space = spaces.iter().find(|space| space.kind == SpaceKind::Personal).expect("a space of their own");
+    // Markdown that shows a picture beside it and one that is gone, which the import leaves a note on.
+    let (files, home) = (Scratch::new("bring-files"), Scratch::new("bring-home"));
+    let picture = pictures::from_rgba(4, 2, &[7; 32]).unwrap().bytes;
+    std::fs::write(files.0.join("roof.png"), &picture).unwrap();
+    let markdown = "# Rates\n\nRates change in January.\n\n![The roof](roof.png)\n\n![Gone](gone.png)\n";
+    std::fs::write(files.0.join("Rates.md"), markdown).unwrap();
+    let bring = |space: &str| {
+        let plan = Plan::of(&files.0.join("Rates.md"), &Style::default()).expect("Markdown can be brought in");
+        let imported = plan.clone().import(&plan.choices());
+        connected::bring(&ours, space, "", &plan.name, &imported.package, &home.0)
+    };
+
+    let brought = bring(&space.id).expect("the server takes it");
+    assert_eq!(brought.opened.name, "Rates", "named after the file");
+    // Whoever opens it on another device reads all of it, with nothing more said by this one.
+    let there = Desk::open(&server, theirs.clone(), &brought.opened.id, "bring-there");
+    assert!(there.reads().contains(&"Rates change in January.".to_owned()), "{:?}", there.reads());
+    let shown = there.writer.model.doc().walk().find_map(|block| match &block.kind {
+        BlockKind::Figure { asset, .. } => asset.clone(),
+        _ => None,
+    });
+    let shown = shown.expect("the picture beside the file came along");
+    assert_eq!(connected::picture(&theirs, &brought.opened.id, &shown), Some(picture));
+    assert_eq!(there.notes.notes.len(), 1, "the import's note on the picture that stayed a link");
+
+    // The copy on this device opens as the same document, and owes the server nothing.
+    let mut here = Desk::open_in(&server, ours.clone(), &brought.opened.id, home);
+    assert_eq!(here.reads(), there.reads());
+    here.start();
+    assert!(settle(&mut [&mut here], |desks| live(desks[0]) && desks[0].line.progress() == Progress::Saved));
+    assert!(server.came().iter().all(|came| came != "edits"), "nothing was left to send");
+
+    // A second file of that name replaces nothing, and a space that is not theirs gets no document.
+    let home = Scratch::new("bring-home-again");
+    let bring = |space: &str| {
+        let plan = Plan::of(&files.0.join("Rates.md"), &Style::default()).expect("Markdown can be brought in");
+        connected::bring(&ours, space, "", &plan.name, &plan.clone().import(&plan.choices()).package, &home.0)
+    };
+    let second = bring(&space.id).expect("the next name is free");
+    assert_eq!(second.opened.name, "Rates 2");
+    assert_ne!(second.opened.id, brought.opened.id);
+    assert!(matches!(bring("nobodys"), Err(connected::Unreached::Refused(_))));
+    let listed = ours.entries(&space.id, "").expect("the space is listed").entries;
+    assert_eq!(listed.iter().filter(|entry| entry.name.starts_with("Rates")).count(), 2);
 }
 
 // A debug build takes two minutes to merge this much, and three sides here do.

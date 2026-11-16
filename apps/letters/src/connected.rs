@@ -15,14 +15,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use letters_api::{Access, Code, CreatedLink, EntryKind, Grant, NewLink, Opened, Shares, paths};
-use letters_format::{Archive, OPLOG, WorkingCopy};
+use letters_api::{Access, Code, CreatedLink, Entry, EntryKind, Grant, NewLink, Opened, Shares, paths};
+use letters_format::{Archive, OPLOG, Package, WorkingCopy};
 use letters_model::{Model, Notes, ReplicaId, Selection};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
 use sha2::{Digest, Sha256};
 use ureq::http::Uri;
 
-use crate::files;
+use crate::files::{self, Working};
 use crate::keychain::Keychain;
 use crate::remote::Roots;
 use crate::server::{Client, Refused};
@@ -158,6 +158,91 @@ pub fn reach(session: &Session, id: &str, home: &Path) -> Result<Reached, Unreac
     }
     remember(&path, &opened);
     Ok(Reached { opened, path, online: true })
+}
+
+/// How many names are tried for a document that a file is brought in as, before the server names it.
+const NAMES: u32 = 50;
+
+/// Starts a document called `name` in `folder` of a space, or by the first of "name 2" and so on that is
+/// free there, as the server names what it imports itself. A name the server cannot give a file is left
+/// to the server.
+fn start(session: &Session, space: &str, folder: &str, name: &str) -> Result<Entry, Refused> {
+    for n in 1..=NAMES {
+        let numbered = if n == 1 { name.to_owned() } else { format!("{name} {n}") };
+        match session.new_document(space, folder, Some(&numbered)) {
+            Err(refused) if refused.code() == Some(Code::NameTaken) => {}
+            Err(refused) if n == 1 && refused.code() == Some(Code::Invalid) => break,
+            started => return started,
+        }
+    }
+    session.new_document(space, folder, None)
+}
+
+/// Makes a document at the server of what a file on this device was imported as, in `folder` of a space,
+/// and brings its copy here to open. The document is started as any new one of the server is, called
+/// `name` or by the next name after it that is free, and then written as the import reads: its text, its
+/// style, its pictures and its notes. This waits on the network.
+///
+/// The server is handed all of it before this returns, if it can be reached that long: what it could not
+/// be handed stays in the copy, and goes up when the document is opened. What the server will not take
+/// at all leaves no document behind.
+pub fn bring(
+    session: &Arc<Session>,
+    space: &str,
+    folder: &str,
+    name: &str,
+    imported: &Package,
+    home: &Path,
+) -> Result<Reached, Unreached> {
+    let started = start(session, space, folder, name).map_err(Unreached::Refused)?;
+    let unnamed = || letters_api::Error::new(Code::Internal, "The server did not say which document it started.");
+    let id = started.id.ok_or_else(|| Unreached::Refused(Refused::Said(unnamed())))?;
+    let reached = reach(session, &id, home)?;
+    let handing = Handing {
+        session: session.clone(),
+        id,
+        copy: reached.path.clone(),
+        owed: Mutex::default(),
+        turn: Mutex::default(),
+    };
+    let handed = write_onto(&reached, imported).map_err(Unreached::Unkept).and_then(|()| {
+        match handing.hand().and_then(|()| handing.send()) {
+            Err(refused) if !passes(&refused) => Err(Unreached::Refused(refused)),
+            _ => Ok(()),
+        }
+    });
+    if handed.is_err() {
+        let _ = session.ask(|server, token| server.act(token, &paths::trash(&handing.id)));
+        let _ = (fs::remove_file(&reached.path), fs::remove_file(reached.path.with_extension("json")));
+    }
+    handed.map(|()| reached)
+}
+
+/// Writes what was imported onto the copy of the document a server started for it, as one change to
+/// what the server wrote: the copy then owes the server that change, as it would work done offline.
+fn write_onto(reached: &Reached, imported: &Package) -> io::Result<()> {
+    let other = |error: &dyn fmt::Display| io::Error::other(error.to_string());
+    let opened = files::open(&reached.path, Default::default).map_err(|error| other(&error))?;
+    let home = opened.home.ok_or_else(|| other(&"the copy has no file"))?;
+    let replica = ReplicaId::new(&crate::platform::block_id());
+    let mut model = Model::new(opened.document, replica).with_style(opened.style);
+    // The server made the copy's file a moment ago, for this person: its history is no stranger's.
+    let Working { mut copy, history, .. } =
+        opened.rest.read(replica, None, |_| false).map_err(|error| other(&error))?;
+    if let Some(history) = history {
+        model.attach(history);
+    }
+    model.set_author(&reached.opened.author);
+    model.set_time(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |now| now.as_secs()));
+    model.rewrite(imported.document.clone()).map_err(|error| other(&error))?;
+    model.rewrite_style(imported.style().map_err(|error| other(&error))?).map_err(|error| other(&error))?;
+    copy.edit(&model.save()).map_err(|error| other(&error))?;
+    let pictures = imported.entries.iter().filter(|(name, _)| name.starts_with(ASSETS));
+    copy.entries.extend(pictures.map(|(name, bytes)| (name.clone(), bytes.clone())));
+    for note in imported.notes().map_err(|error| other(&error))?.notes {
+        copy.add_note(note);
+    }
+    home.save(&mut copy).map(drop).map_err(|error| other(&error))
 }
 
 /// Writes a file beside its place and renames it there, so that a crash leaves a whole file or none.

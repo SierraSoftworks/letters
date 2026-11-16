@@ -97,6 +97,9 @@ const WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1100.0, 800.0);
 /// What a file dialog calls the files it lists for the Styles panel.
 const STYLESHEETS: &str = "Letters stylesheet";
 
+/// A session and a document of its server that is ready to open from its copy on this device.
+type Entered = Box<(Arc<Session>, Reached)>;
+
 /// What reaches the event loop from outside winit.
 pub enum Event {
     Access(accesskit_winit::Event),
@@ -130,7 +133,8 @@ pub enum Event {
     Picture(WindowId, String, Option<Image>, u32),
     /// The file at a path, which a window was asked to bring in, has been read: what it would bring is
     /// known, or why it cannot be brought in.
-    Planned(WindowId, PathBuf, Result<Box<Plan>, Unplanned>),
+    /// With where it is to be made, as the card says it, when that is a folder of a server.
+    Planned(WindowId, PathBuf, Result<Box<Plan>, Unplanned>, Option<String>),
     /// A file of this name was brought in for a window and kept as a new document at this path, or could
     /// not be.
     Imported(WindowId, String, Result<PathBuf, (Box<Plan>, std::io::Error)>),
@@ -160,9 +164,9 @@ pub enum Event {
     Browsed(WindowId, Result<Box<Browsed>, String>),
     /// The server at this address said what is in its trash, for a window's Open card, or why not.
     Trash(WindowId, String, Result<Vec<letters_api::Trashed>, String>),
-    /// A file a window was to hand to a server for a document was not brought in, and why, in a sentence
-    /// for the person.
-    Unbrought(WindowId, String),
+    /// The file of this name that a window offered was made a document of at a server and its copy is
+    /// here to open, or it was not, with the file's plan for another try and a sentence on why.
+    MadeThere(WindowId, String, Result<Entered, (Box<Plan>, String)>),
     /// The socket of this number, to the server of a window's document, has something to say.
     Heard(WindowId, Said),
     /// A picture of this name, which the copy of a window's document lacked, was asked of the document's
@@ -740,6 +744,9 @@ struct DocWindow {
     printing: bool,
     /// The name of the file this window offers to bring in, for the card and for the history.
     importing: Option<String>,
+    /// Where the file this window offers is to be made a document, when that is at a server: the
+    /// server's address, the space, and the folder in it. `None` for the default folder on this device.
+    import_to: Option<(String, String, String)>,
     /// The name of the file this document was just brought in from, until its history says so.
     imported: Option<String>,
     /// Where the writing rested, for the versions the history lists.
@@ -2324,6 +2331,7 @@ impl App {
             dropped: Vec::new(),
             printing: false,
             importing: None,
+            import_to: None,
             imported: None,
             rests: Rests::default(),
             marks: false,
@@ -2604,7 +2612,7 @@ impl App {
                 Request::Import { folders, comments } => self.bring_in(id, &folders, comments),
                 Request::CancelImport => {
                     if let Some(window) = self.windows.get_mut(&id) {
-                        (window.plan, window.importing) = (None, None);
+                        (window.plan, window.importing, window.import_to) = (None, None, None);
                     }
                 }
                 Request::Print => self.print(id),
@@ -2643,7 +2651,7 @@ impl App {
                 }
                 Request::BrowseTrash { server } => self.browse_trash(id, server, None, now),
                 Request::PutBack { server, space, file } => self.browse_trash(id, server, Some((space, file)), now),
-                Request::ImportAt { server, space, path } => self.import_at(id, &server, space, path),
+                Request::ImportAt { server, space, path } => self.import_at(event_loop, id, server, space, path),
                 Request::OpenFrom { server, id: document } => self.reach(Some(id), &server, document),
                 Request::NewAt { server, space, path } => self.start_at(id, &server, space, path),
                 // A request this shell does not know yet.
@@ -3014,38 +3022,16 @@ impl App {
         });
     }
 
-    /// Has the person choose a Markdown or Word file, hands it to the server at `server` to make a
-    /// document of in `folder` of a space, and brings that document here, off this thread once the file
-    /// is chosen. It opens as a document of the server does: see [`Self::reached`].
-    fn import_at(&mut self, id: WindowId, server: &str, space: String, folder: String) {
+    /// Has the person choose a Markdown or Word file to make a document of in `folder` of a space of the
+    /// server at `server`. The file is offered on its card as any file that is brought in, and read on
+    /// this device, so that its pictures come along: see [`Self::bring_in`].
+    fn import_at(&mut self, event_loop: &ActiveEventLoop, id: WindowId, server: String, space: String, folder: String) {
         let Some(window) = self.windows.get(&id) else { return };
         let dialog = FileDialog::new().add_filter("Markdown and Word", &import::ENDINGS);
         let chosen = dialog.set_directory(self.library.default_folder()).set_parent(&*window.window).pick_file();
-        let Some(path) = chosen else { return };
-        let Some(session) = self.sessions.get(server).filter(|session| !session.ended()).cloned() else {
-            let nobody = Err(Some("Nobody is signed in to that server any more.".to_owned()));
-            return drop(self.proxy.send_event(Event::Reached(Some(id), nobody)));
-        };
-        let (proxy, home) = (self.proxy.clone(), self.home.clone());
-        thread::spawn(move || {
-            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            let unbrought = |why: String| drop(proxy.send_event(Event::Unbrought(id, why)));
-            let file = match fs::read(&path) {
-                Ok(file) => file,
-                Err(error) => return unbrought(format!("{name} could not be brought in{}.", files::unread(&error))),
-            };
-            let entry = match session.import(&space, &folder, &name, &file) {
-                Ok(entry) => entry,
-                Err(refused) => {
-                    return unbrought(format!("{name} could not be brought in.\n\n{}", connected::sentence(&refused)));
-                }
-            };
-            let document = entry.id.ok_or("The server did not say which document it made.".to_owned());
-            let reached = document
-                .and_then(|document| connected::reach(&session, &document, &home).map_err(|error| error.to_string()));
-            let entered = reached.map(|reached| Box::new((session, reached))).map_err(Some);
-            let _ = proxy.send_event(Event::Reached(Some(id), entered));
-        });
+        if let Some(path) = chosen {
+            self.import(event_loop, Some(id), path, Some((server, space, folder)));
+        }
     }
 
     /// Starts a document in `folder` of a space of the server at `server` and brings it here, on another
@@ -3057,7 +3043,7 @@ impl App {
         };
         let (proxy, home) = (self.proxy.clone(), self.home.clone());
         thread::spawn(move || {
-            let started = session.new_document(&space, &folder).map_err(|refused| connected::sentence(&refused));
+            let started = session.new_document(&space, &folder, None).map_err(|refused| connected::sentence(&refused));
             let reached = started.and_then(|entry| {
                 let document = entry.id.ok_or("The server did not say which document it started.")?;
                 connected::reach(&session, &document, &home).map_err(|error| error.to_string())
@@ -3256,17 +3242,36 @@ impl App {
 
     /// Starts bringing in a Markdown or Word file. It is read off this thread, and offered on a card once
     /// what it holds is known: in the window that asked if that has nothing of its own, else in a new one.
-    fn import(&mut self, event_loop: &ActiveEventLoop, asked: Option<WindowId>, path: PathBuf) {
+    /// `to` is where its document is to be made if that is at a server: the server's address, the space
+    /// and the folder in it. With none it is kept in the default folder on this device.
+    fn import(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        asked: Option<WindowId>,
+        path: PathBuf,
+        to: Option<(String, String, String)>,
+    ) {
         let empty =
             asked.filter(|id| self.windows.get(id).is_some_and(|window| window.pristine() && window.plan.is_none()));
         let id = match empty.map(Ok).unwrap_or_else(|| self.open_window(event_loop, None, true)) {
             Ok(id) => id,
             Err(error) => return alert(None, &format!("A new window could not be opened{}.", no_window(&*error))),
         };
+        let session = to.as_ref().and_then(|(server, ..)| self.sessions.get(server)).cloned();
+        if let Some(window) = self.windows.get_mut(&id) {
+            window.import_to = to.clone();
+        }
         let proxy = self.proxy.clone();
         thread::spawn(move || {
             let plan = Plan::of(&path, &new_style()).map(Box::new);
-            let _ = proxy.send_event(Event::Planned(id, path, plan));
+            // The card names the space as its server does, which only the server can say.
+            let shown = to.map(|(server, space, folder)| {
+                let spaces = session.and_then(|session| session.spaces().ok()).unwrap_or_default();
+                let named = spaces.iter().find(|held| held.id == space).map_or(&space, |held| &held.name);
+                let parts = [server.trim_start_matches("https://"), named].into_iter().chain(folder.split('/'));
+                parts.filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" / ")
+            });
+            let _ = proxy.send_event(Event::Planned(id, path, plan, shown));
         });
     }
 
@@ -3489,7 +3494,7 @@ impl App {
     }
 
     /// Shows the card that asks what to bring in with a file, now that the file has been read.
-    fn offer(&mut self, id: WindowId, path: &Path, plan: Result<Box<Plan>, Unplanned>) {
+    fn offer(&mut self, id: WindowId, path: &Path, plan: Result<Box<Plan>, Unplanned>, to: Option<String>) {
         let Some(window) = self.windows.get_mut(&id) else { return };
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let plan = match plan {
@@ -3513,7 +3518,7 @@ impl App {
             folders: folders.collect(),
             missing: plan.missing as u32,
             comments: plan.comments as u32,
-            destination: self.library.shown(&self.library.default_folder()),
+            destination: to.unwrap_or_else(|| self.library.shown(&self.library.default_folder())),
         }));
         window.plan = Some(plan);
         window.sync(Instant::now());
@@ -3521,9 +3526,35 @@ impl App {
 
     /// Brings in the file a window offered, with what the person chose on its card, off this thread. The
     /// document is kept as a new one in the default folder, and the file it came from is left as it is.
+    /// A file that was offered for a folder of a server is made a document of there instead.
     fn bring_in(&mut self, id: WindowId, folders: &[String], comments: bool) {
         let Some(window) = self.windows.get_mut(&id) else { return };
         let Some(plan) = window.plan.take() else { return window.view.offer_import(None) };
+        // The card names the folders as it was given them.
+        let chosen =
+            plan.folders.iter().filter(|folder| folders.iter().any(|path| *path == folder.path.to_string_lossy()));
+        let choices = Choices { pictures: chosen.map(|folder| folder.path.clone()).collect(), comments };
+        let source = window.importing.clone().unwrap_or_default();
+        if let Some((server, space, folder)) = window.import_to.clone() {
+            let Some(session) = self.sessions.get(&server).filter(|session| !session.ended()).cloned() else {
+                window.plan = Some(plan);
+                window.view.refuse_import("Sign in to the server again to bring the file in there.");
+                return window.sync(Instant::now());
+            };
+            // Nothing is recorded of where the file came from: the server vouches for its documents.
+            let (proxy, home) = (self.proxy.clone(), self.home.clone());
+            thread::spawn(move || {
+                let imported = (*plan).clone().import(&choices);
+                let brought = connected::bring(&session, &space, &folder, &plan.name, &imported.package, &home);
+                let brought = match brought {
+                    Ok(reached) => Ok(Box::new((session, reached))),
+                    Err(connected::Unreached::Refused(refused)) => Err((plan, connected::sentence(&refused))),
+                    Err(other) => Err((plan, format!("The document could not be made at the server: {other}."))),
+                };
+                let _ = proxy.send_event(Event::MadeThere(id, source, brought));
+            });
+            return;
+        }
         // Recorded before the document exists: unless the file lies in a trusted folder, the document opens
         // in safe mode from the first, wherever it is saved, until the person trusts it from its own bar.
         if let Err(error) = trust::import(&mut self.trust, &plan.id, plan.source()) {
@@ -3533,17 +3564,59 @@ impl App {
             window.view.refuse_import("The file was not imported because Letters could not record where it came from.");
             return window.sync(Instant::now());
         }
-        // The card names the folders as it was given them.
-        let chosen =
-            plan.folders.iter().filter(|folder| folders.iter().any(|path| *path == folder.path.to_string_lossy()));
-        let choices = Choices { pictures: chosen.map(|folder| folder.path.clone()).collect(), comments };
         let (proxy, folder) = (self.proxy.clone(), self.library.default_folder());
-        let source = window.importing.clone().unwrap_or_default();
         thread::spawn(move || {
             // The plan comes back with a document that could not be kept, for the card to try again.
             let kept = (*plan).clone().import(&choices).keep(&folder, &plan.name);
             let _ = proxy.send_event(Event::Imported(id, source, kept.map_err(|error| (plan, error))));
         });
+    }
+
+    /// Opens the document of a server that a file was brought in as, in place of the window that offered
+    /// it. If the document could not be made there, the card says why and can ask again.
+    fn made_there(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        id: WindowId,
+        source: String,
+        brought: Result<Entered, (Box<Plan>, String)>,
+        now: Instant,
+    ) {
+        let entered = match brought {
+            Ok(entered) => entered,
+            Err((plan, why)) => {
+                match self.windows.get_mut(&id) {
+                    Some(window) if window.view.importing() => {
+                        window.plan = Some(plan);
+                        window.view.refuse_import(&why);
+                        window.sync(now);
+                    }
+                    // The card was put away meanwhile, or its window closed.
+                    window => alert(
+                        window.map(|window| &window.window),
+                        &format!("{source} could not be brought in.\n\n{why}"),
+                    ),
+                }
+                return;
+            }
+        };
+        if let Some(window) = self.windows.get_mut(&id) {
+            (window.plan, window.importing, window.import_to) = (None, None, None);
+            window.view.offer_import(None);
+            window.sync(now);
+        }
+        let (origin, document) = (entered.0.server().origin().to_owned(), entered.1.opened.id.clone());
+        self.reached(event_loop, Some(id), Ok(entered), now);
+        // Its history says where it came from, once the window that shows it has read the history.
+        let shows = |window: &&mut DocWindow| {
+            window
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.opened.id == document && remote.line.session().server().origin() == origin)
+        };
+        if let Some(window) = self.windows.values_mut().find(shows) {
+            window.imported = Some(source);
+        }
     }
 
     /// Opens the document a file was brought in as, in place of the window that offered it. If the document
@@ -3573,7 +3646,7 @@ impl App {
             }
         };
         if let Some(window) = self.windows.get_mut(&id) {
-            (window.plan, window.importing) = (None, None);
+            (window.plan, window.importing, window.import_to) = (None, None, None);
             window.view.offer_import(None);
             window.sync(Instant::now());
         }
@@ -3629,7 +3702,7 @@ impl App {
                 };
                 let Some(path) = path.or_else(pick) else { return };
                 if import::offered(&path) {
-                    return self.import(event_loop, Some(id), path);
+                    return self.import(event_loop, Some(id), path, None);
                 }
                 // A window with no file and nothing to put in one gives way to the document that was asked for.
                 let pristine = window.pristine();
@@ -3750,7 +3823,7 @@ impl ApplicationHandler<Event> for App {
         // A Markdown or Word file that was asked for is offered in a window that has nothing of its own.
         if let Some(path) = self.path.clone().filter(|path| shown.is_ok() && import::offered(path)) {
             let empty = self.windows.iter().find(|(_, window)| window.pristine()).map(|(id, _)| *id);
-            self.import(event_loop, empty, path);
+            self.import(event_loop, empty, path, None);
         }
         // A document that was asked for by the address of its page is asked of its server.
         if let Some((origin, id)) = self.from_server.take().filter(|_| shown.is_ok()) {
@@ -4092,11 +4165,7 @@ impl ApplicationHandler<Event> for App {
                     self.tell_servers(now);
                 }
             }
-            Event::Unbrought(id, why) => {
-                if let Some(window) = self.windows.get(&id) {
-                    window.alert(&why);
-                }
-            }
+            Event::MadeThere(id, source, brought) => self.made_there(event_loop, id, source, brought, now),
             Event::Heard(id, said) => {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.heard(said, now);
@@ -4184,7 +4253,7 @@ impl ApplicationHandler<Event> for App {
                     window.sync(now);
                 }
             }
-            Event::Planned(id, path, plan) => self.offer(id, &path, plan),
+            Event::Planned(id, path, plan, to) => self.offer(id, &path, plan, to),
             Event::Pdf(id, pdf) => {
                 let Some(window) = self.windows.get(&id) else { return };
                 let proxy = self.proxy.clone();

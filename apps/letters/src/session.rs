@@ -201,9 +201,10 @@ impl Session {
         self.ask(|server, token| server.post(token, &paths::relocate(id), &to))
     }
 
-    /// Starts a document in `folder` of a space. It is "Untitled" there until its first heading names it.
-    pub fn new_document(&self, space: &str, folder: &str) -> Result<Entry, Refused> {
-        let new = NewDocument { folder: folder.to_owned(), name: None };
+    /// Starts a document in `folder` of a space. With no `name` it is "Untitled" there until its first
+    /// heading names it. A name that is taken there is refused as [`Code::NameTaken`].
+    pub fn new_document(&self, space: &str, folder: &str, name: Option<&str>) -> Result<Entry, Refused> {
+        let new = NewDocument { folder: folder.to_owned(), name: name.map(str::to_owned) };
         self.ask(|server, token| server.post(token, &paths::documents(space), &new))
     }
 
@@ -211,12 +212,6 @@ impl Session {
     pub fn new_folder(&self, space: &str, parent: &str, name: &str) -> Result<Entry, Refused> {
         let new = NewFolder { parent: parent.to_owned(), name: name.to_owned() };
         self.ask(|server, token| server.post(token, &paths::folders(space), &new))
-    }
-
-    /// Makes a document of a Markdown or Word file in `folder` of a space. `name` is the file's own, which
-    /// names the document without its ending. A file that is neither is refused as [`Code::Invalid`].
-    pub fn import(&self, space: &str, folder: &str, name: &str, file: &[u8]) -> Result<Entry, Refused> {
-        self.ask(|server, token| server.hand(token, &paths::import(space, folder, name), file))
     }
 
     /// Merges into a document every conflict copy a sync tool left beside it on the server, and gives

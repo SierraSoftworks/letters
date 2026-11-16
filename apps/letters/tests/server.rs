@@ -240,13 +240,6 @@ impl Letters {
                     None => said(Code::Invalid, "That is not in the trash."),
                 }
             }
-            // A file is told by what it holds, and these tests hand over Markdown only.
-            "POST /api/v1/spaces/ada/import?path=House&name=Rates.md" if std::str::from_utf8(&asked.body).is_ok() => {
-                json(&entry("Rates", "House", "d3"))
-            }
-            line if line.starts_with("POST /api/v1/spaces/ada/import?") => {
-                said(Code::Invalid, "That is neither Markdown nor a Word document.")
-            }
             "PUT /api/v1/documents/d1/assets/sky.png" => Answer("204 No Content", "", Vec::new()),
             // A picture is asked for by the hash of its bytes, and one name gets another's bytes.
             line if line.strip_prefix("GET /api/v1/documents/d1/assets/").is_some_and(|name| name == held()) => {
@@ -342,12 +335,6 @@ impl Server {
     /// A session that begins with the first token, which has run out.
     fn session(&self) -> Session {
         Session::begin(self.client(), Some(*KEYCHAIN), token(0))
-    }
-
-    /// The last request whose line holds `part`, whole. It stays for [`Self::asked`].
-    fn heard(&self, part: &str) -> Asked {
-        let asked = self.asked.lock().unwrap();
-        asked.iter().rev().find(|asked| asked.line.contains(part)).cloned().expect("it was asked")
     }
 
     /// What was asked since the last look, as each request's line and the token it showed.
@@ -911,22 +898,6 @@ fn what_was_thrown_away_is_listed_and_put_back_by_its_name_in_the_trash() {
     // What is no longer there is refused in the server's own sentence, which the card shows.
     let gone = session.put_back("ada", "Rates 2.let").expect_err("it was put back already");
     assert_eq!(connected::sentence(&gone), "That is not in the trash.");
-}
-
-#[test]
-fn a_file_is_handed_to_the_server_whole_and_becomes_a_document_there() {
-    let server = Server::start();
-    let session = server.session();
-    let markdown = "# Rates\n\nRates change in January.\n";
-
-    let made = session.import("ada", "House", "Rates.md", markdown.as_bytes()).expect("Markdown is taken");
-    assert_eq!((made.name.as_str(), made.id.as_deref()), ("Rates", Some("d3")), "its id opens it as any other");
-    let heard = server.heard("/import?");
-    assert_eq!(heard.body, markdown.as_bytes(), "the server tells what the file is from what it holds");
-
-    let refused = session.import("ada", "House", "Rates.md", &[0xff, 0xfe]).expect_err("neither of the two");
-    assert_eq!(refused.code(), Some(Code::Invalid));
-    assert_eq!(connected::sentence(&refused), "That is neither Markdown nor a Word document.");
 }
 
 #[test]
