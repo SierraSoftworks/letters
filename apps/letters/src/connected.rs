@@ -441,6 +441,7 @@ fn unsaid(id: &str) -> Opened {
         socket: paths::socket(id),
         trust: letters_api::Trust::Safe,
         allows: letters_api::Allows::default(),
+        by_link: false,
         style: None,
         notes: None,
     }

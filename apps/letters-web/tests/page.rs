@@ -43,6 +43,7 @@ fn opened(name: &str, author: &str, trust: Trust) -> Opened {
         socket: "/api/v1/documents/0190f3a2-7c1e-7b4a-9c55-3f2a1b0c9d8e/socket".into(),
         trust,
         allows: Allows { download: true, copy: true, print: true },
+        by_link: false,
         style: None,
         notes: None,
     }

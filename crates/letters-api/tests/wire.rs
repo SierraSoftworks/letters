@@ -82,6 +82,7 @@ fn every_body_reads_back_as_written() {
         socket: paths::socket("doc-1"),
         trust: Trust::Safe,
         allows: Allows::default(),
+        by_link: true,
         style: Some(json!({"format": 1})),
         notes: None,
     });

@@ -788,6 +788,7 @@ impl App {
             socket: paths::socket(&manifest.id),
             trust: if self.trusts(who, &found, &manifest.id)? { Trust::Trusted } else { Trust::Safe },
             allows: found.allows,
+            by_link: found.by_link(),
             style,
             notes,
         };

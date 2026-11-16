@@ -168,6 +168,11 @@ pub struct Opened {
     pub trust: Trust,
     /// What may be taken away. Everything, but for a link's reader.
     pub allows: Allows,
+    /// The session reaches the document by a share link alone, with no role of its own in it. A shell
+    /// then shows no history, and a copy it saves is the document as it stands. A courtesy and not a
+    /// wall: the history still crosses the socket.
+    #[serde(default, skip_serializing_if = "no")]
+    pub by_link: bool,
     /// The document's `style.json`. In a page only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub style: Option<Value>,
@@ -178,6 +183,10 @@ pub struct Opened {
 
 fn yes() -> bool {
     true
+}
+
+fn no(flag: &bool) -> bool {
+    !flag
 }
 
 /// An address for the server to fetch on a document's behalf: a page a browser may not read itself, sent

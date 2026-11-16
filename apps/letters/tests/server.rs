@@ -115,6 +115,7 @@ fn opened() -> Opened {
         socket: paths::socket("d1"),
         trust: Trust::Trusted,
         allows: Allows::default(),
+        by_link: false,
         style: None,
         notes: None,
     }

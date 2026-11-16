@@ -324,6 +324,9 @@ async fn a_link_hands_over_the_document_as_it_stands_and_nothing_of_its_past() {
         assert!(text.contains("We would like to make an offer."), "{username:?} by {by:?}: {text}");
         let (history, notes, named) = past(file.body);
         assert_eq!((history, notes > 0, named == id), (whole, whole, whole), "{username:?} by {by:?}");
+        // An editor is told as much, so that it shows and saves no more than the file holds.
+        let opened: Opened = browser.get(&paths::document(&id)).await.json();
+        assert_eq!(opened.by_link, !whole, "{username:?} by {by:?}");
     }
 }
 
