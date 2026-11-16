@@ -26,6 +26,7 @@ pub enum Tone {
 pub struct MenuItem<M> {
     label: String,
     icon: Option<Icon>,
+    ink: Option<tokens::Color>,
     aside: Option<String>,
     checked: Option<bool>,
     face: Family,
@@ -40,6 +41,7 @@ impl<M> MenuItem<M> {
         Self {
             label: label.into(),
             icon: None,
+            ink: None,
             aside: None,
             checked: None,
             face: Family::Sans,
@@ -52,6 +54,12 @@ impl<M> MenuItem<M> {
 
     pub fn icon(mut self, icon: Icon) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// Draws the icon in a colour of its own, where the colour says what the icon stands for.
+    pub fn ink(mut self, ink: tokens::Color) -> Self {
+        self.ink = Some(ink);
         self
     }
 
@@ -260,7 +268,7 @@ fn row<M>(item: MenuItem<M>, leads: bool, iconed: bool) -> Element<M> {
         row = row.opacity(tokens::DISABLED_OPACITY);
     }
     if let Some(icon) = item.icon {
-        row = row.child(Element::icon(icon, ICON).fg(fade(fg, 0.7)));
+        row = row.child(Element::icon(icon, ICON).fg(item.ink.unwrap_or(fade(fg, 0.7))));
     } else if iconed {
         row = row.child(Element::row().width(ICON).height(ICON));
     }

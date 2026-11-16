@@ -200,6 +200,17 @@ fn the_owner_gives_someone_another_role_or_takes_them_away() {
 }
 
 #[test]
+fn the_controls_of_the_roles_line_up_whatever_role_each_says() {
+    let mut window = plan();
+    open(&mut window, shared(true, vec![]));
+    let wide = |window: &mut Harness, name: &str| {
+        window.find(Role::Button, &format!("Role of {name}")).expect("a control for the role").bounds.width
+    };
+    let (editor, commenter) = (wide(&mut window, "Ben Price"), wide(&mut window, "Family"));
+    assert!((editor - commenter).abs() < 0.5, "an editor's is {editor} wide and a commenter's {commenter}");
+}
+
+#[test]
 fn a_group_is_added_by_its_name() {
     let added = |name: &str, role: Grade| {
         let mut people = people();

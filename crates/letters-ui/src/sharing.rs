@@ -31,6 +31,8 @@ const SHORTEST: f32 = 200.0;
 const FACE: f32 = 32.0;
 /// What the field for a group is called.
 pub(crate) const GROUP: &str = "Add a group";
+/// How wide the control of a role is at least: the longest role fits, so the rows' controls line up.
+const ROLE: f32 = 128.0;
 /// How long a link lasts, in days, as the form offers it.
 const LASTS: [(&str, Option<u64>); 4] =
     [("1 day", Some(1)), ("7 days", Some(7)), ("30 days", Some(30)), ("No expiry", None)];
@@ -454,8 +456,9 @@ impl Share {
             Button::new("Add reader").icon(icon::EYE).disabled(nothing).on_press(send(Sharing::Add(Grade::Reader)));
         let mut others = Menu::new().label("Add as");
         for role in GRADES {
-            let (mark, _, _) = marks(role);
-            let item = MenuItem::new(format!("Add {}", named(role).to_lowercase())).icon(mark).aside(does(role));
+            let (mark, ink, _) = marks(role);
+            let item =
+                MenuItem::new(format!("Add {}", named(role).to_lowercase())).icon(mark).ink(ink).aside(does(role));
             others = others.item(item.disabled(nothing).on_select(send(Sharing::Add(role))));
         }
         // Both menus hang from the dialog's right edge, and open inwards from it.
@@ -640,8 +643,8 @@ fn person(at: usize, grant: &Grant, owner: bool) -> Element<Message> {
 fn choose(at: usize, name: &str, role: Grade) -> Element<Message> {
     let mut menu = Menu::new().label("Role");
     for grade in GRADES {
-        let (mark, _, _) = marks(grade);
-        let item = MenuItem::new(named(grade)).icon(mark).aside(does(grade)).checked(grade == role);
+        let (mark, ink, _) = marks(grade);
+        let item = MenuItem::new(named(grade)).icon(mark).ink(ink).aside(does(grade)).checked(grade == role);
         menu = menu.item(item.on_select(send(Sharing::Grant(at, grade))));
     }
     menu = menu.separator().item(MenuItem::new("Remove").icon(icon::X).danger().on_select(send(Sharing::Remove(at))));
@@ -660,8 +663,9 @@ fn choose(at: usize, name: &str, role: Grade) -> Element<Message> {
         .role(Role::Button)
         .label(format!("Role of {name}"))
         .description(named(role))
+        .min_width(ROLE)
         .child(Element::icon(mark, 14.0))
-        .child(Element::text(named(role), TextStyle::control().size(tokens::TEXT_SM).weight(500)))
+        .child(Element::text(named(role), TextStyle::control().size(tokens::TEXT_SM).weight(500)).grow(1.0))
         .child(Element::icon(icon::CHEVRON_DOWN, 14.0))
         .popover(menu.popover().align(Align::End))
 }

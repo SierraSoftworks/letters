@@ -4858,7 +4858,8 @@ impl EditorApp {
         }
         // Who else reaches the document is for someone who writes it to see, and for its owner to say.
         if self.writes() {
-            bar = bar.end(Button::new("Share").icon(icon::USERS).small().on_press(Message::Sharing(Sharing::Open)));
+            let share = Button::new("Share").icon(icon::USERS).small().primary();
+            bar = bar.end(share.on_press(Message::Sharing(Sharing::Open)));
         }
         bar = bar.end(TopBar::rule());
         let mut panels = cluster();
