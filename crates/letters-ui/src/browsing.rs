@@ -1,7 +1,8 @@
 //! Opening a document a server keeps: one card lists the places of a server the person is signed in to and
 //! what each holds, and the document that is pressed is asked of the shell. So is what else the card offers
 //! to have done there: a document started or imported, conflict copies merged, and what was thrown away put
-//! back.
+//! back. A Markdown or Word file a folder keeps is listed too: under the document of its name, or with the
+//! offer to make a document of it.
 //!
 //! The window only asks: the shell talks to the server, and answers with what a place holds or with why it
 //! could not be read.
@@ -108,6 +109,8 @@ pub enum Browsing {
     Merge(String),
     /// Make a document in the folder that is looked at out of a file of this device.
     Import,
+    /// Make a document of the Markdown or Word file at this path in the space that is looked at.
+    Bring(String),
     /// Look at what was thrown away on the server.
     Trash,
     /// Put back what `file` names in the trash of this space.
@@ -263,6 +266,12 @@ impl Browser {
                     self.close();
                 }
             }
+            Browsing::Bring(path) => {
+                if let Some((space, _)) = self.written() {
+                    requests.push(Request::ImportFile { server: self.server.clone(), space: space.to_owned(), path });
+                    self.close();
+                }
+            }
             Browsing::Sort(by) => {
                 let turned = self.order().is_some_and(|(at, turned)| at == by && !turned);
                 // The keyboard stays on the heading, to turn the order round with.
@@ -298,10 +307,25 @@ impl Browser {
         }
     }
 
-    /// What the place holds in the order it is listed in.
+    /// What the place holds in the order it is listed in. A file in another format follows the document it
+    /// is listed under, however the rest are ordered.
     fn sorted<'a>(&self, entries: &'a [Entry]) -> Vec<&'a Entry> {
-        let mut rows: Vec<&Entry> = entries.iter().collect();
-        let Some((by, turned)) = self.order() else { return rows };
+        let under = |entry: &Entry| {
+            let beside = loose(entry).flatten()?;
+            entries.iter().find(|above| above.id.is_some() && above.path == beside && above.space == entry.space)
+        };
+        let (mut rows, mut nested): (Vec<&Entry>, Vec<&Entry>) =
+            entries.iter().partition(|entry| under(entry).is_none());
+        nested.sort_by_key(|entry| entry.name.to_lowercase());
+        let whole = |rows: Vec<&'a Entry>| {
+            let mut all = Vec::with_capacity(entries.len());
+            for row in rows {
+                all.push(row);
+                all.extend(nested.iter().copied().filter(|entry| under(entry).is_some_and(|at| std::ptr::eq(at, row))));
+            }
+            all
+        };
+        let Some((by, turned)) = self.order() else { return whole(rows) };
         let folder = |entry: &Entry| entry.kind == EntryKind::Folder;
         rows.sort_by(|a, b| {
             let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
@@ -313,7 +337,7 @@ impl Browser {
             };
             folder(b).cmp(&folder(a)).then(if turned { within.reverse() } else { within })
         });
-        rows
+        whole(rows)
     }
 
     /// The folder that is looked at, by its space and its path there, if the person may write in it: a
@@ -647,8 +671,13 @@ impl Browser {
 
     /// One folder or document of the place. A folder is gone into, a document is opened, and a file that
     /// could not be read as a document is only listed. So is a conflict copy, which goes by the id of the
-    /// document it is a copy of: whoever edits there merges it into that document from its row.
+    /// document it is a copy of: whoever edits there merges it into that document from its row. A Markdown
+    /// or Word file is only listed under the document of its name, and else whoever edits there makes a
+    /// document of it from its row.
     fn entry(&self, entry: &Entry, today: Option<i64>, room: Room) -> Element<Message> {
+        if let Some(beside) = loose(entry) {
+            return self.file(entry, beside.is_some(), today, room);
+        }
         let folder = entry.kind == EntryKind::Folder;
         let copied = entry.tags.iter().any(|tag| matches!(tag, Tag::ConflictCopy { .. }));
         let merges = copy(entry).filter(|_| entry.role >= Grade::Editor);
@@ -711,6 +740,51 @@ impl Browser {
             None => row.disabled(true),
         }
     }
+}
+
+impl Browser {
+    /// A Markdown or Word file the place keeps, which is no document yet. `nested` is whether it stands
+    /// under the document of its name.
+    fn file(&self, entry: &Entry, nested: bool, today: Option<i64>, room: Room) -> Element<Message> {
+        let word = entry.name.to_lowercase().ends_with(".docx");
+        let kind = if word { "Word file" } else { "Markdown file" };
+        let brings = !nested && entry.role >= Grade::Editor && self.written().is_some();
+        let bring = brings.then(|| {
+            let does = Some(Browsing::Bring(entry.path.clone()));
+            act("Import", icon::FILE_INPUT, does, "As a new document", room == Room::Tight)
+        });
+        // The button says what the note would, and under its document a file needs neither.
+        let noted = (!nested && !brings).then_some("Not imported");
+        let when = day_called(day(entry.modified, self.zone), today);
+        let told = [Some(kind.to_owned()), noted.map(str::to_owned), Some(format!("Modified {when}"))];
+        let about: Vec<String> = told.into_iter().flatten().collect();
+        let key = format!("{}/{}", entry.space.as_deref().unwrap_or_default(), entry.path);
+        let muted = |said: &str| Element::text(said, quiet()).fg(tokens::FG_MUTED);
+        let ends = [Element::row().width(WRITERS), Element::row().width(DAY)];
+        let row = option(icon::FILE, &entry.name, false)
+            .key(key.as_str())
+            .description(about.join(", "))
+            .children(bring)
+            .child(Element::row().width(0.0).grow(1.0).clip().children(noted.map(|noted| muted(noted).shrink())))
+            .children(ends.into_iter().filter(|_| room == Room::Roomy))
+            .children((room > Room::Tight).then(|| Element::row().width(DAY).child(muted(&when))));
+        match (nested, brings) {
+            // Set in as far as the name of the document over it.
+            (true, _) => row.padding(Edges { left: 2.0 * tokens::SPACE_SM + 16.0, ..Edges::xy(tokens::SPACE_SM, 0.0) }),
+            // The row is there for its button.
+            (false, true) => row,
+            (false, false) => row.disabled(true),
+        }
+    }
+}
+
+/// What a row says of a Markdown or Word file that is no document yet: the path of the document it is
+/// listed under, if any. `None` for every other row.
+fn loose(entry: &Entry) -> Option<Option<&str>> {
+    entry.tags.iter().find_map(|tag| match tag {
+        Tag::Unimported { beside } => Some(beside.as_deref()),
+        _ => None,
+    })
 }
 
 /// What a conflict copy is a copy of: the path of its original, and the id the two share.

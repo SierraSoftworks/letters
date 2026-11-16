@@ -48,6 +48,14 @@ pub enum Tag {
     Links { count: u32 },
     /// The file could not be read as a document.
     Damaged,
+    /// Not a document yet: a Markdown or a Word file kept among the documents, which
+    /// [`paths::import_file`](crate::paths::import_file) makes one of. Its [`Entry::name`] has its ending
+    /// and it has no id. `beside` is the path of the document in the same folder that has its name, which
+    /// a file table lists it under.
+    Unimported {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        beside: Option<String>,
+    },
     /// A tag this build does not know.
     #[serde(other)]
     Unknown,

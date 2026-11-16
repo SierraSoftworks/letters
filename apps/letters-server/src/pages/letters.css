@@ -3,6 +3,8 @@ html, body { margin: 0; block-size: 100%; }
 
 /* A row of a file table: its icon, its name, and what it is marked with. */
 .lt-file { display: inline-flex; align-items: center; gap: var(--yi-space-sm); font-weight: 500; }
+/* A file in another format, under the document of its name. */
+.lt-file--under { padding-inline-start: var(--yi-space-xl); font-weight: 400; }
 .lt-file > .yi-icon { flex: none; color: var(--yi-fg-subtle); }
 .lt-file .yi-tag { font-weight: 400; }
 .lt-file form { display: contents; }

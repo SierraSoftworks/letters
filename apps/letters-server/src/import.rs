@@ -4,16 +4,17 @@
 //! that is free. What the document cannot hold is flattened and marked with an import note on its passage,
 //! and the import is the first version of the document's history.
 //!
-//! A Markdown file names its pictures by path. No file comes with it here, so those stay links.
+//! A Markdown file names its pictures by path. No file comes with one that is handed over, so those stay
+//! links. One that a space keeps has its pictures read from its folder and the folders in it.
 
 use letters_api::Entry;
-use letters_convert::{DocxError, ImportNote, from_docx, import_markdown};
+use letters_convert::{Assets, DocxError, ImportNote, from_docx, import_markdown};
 use letters_format::WorkingCopy;
 use letters_model::{Anchor, Block, BlockId, BlockKind, Note, NoteKind, ReplicaId, Run, TagKind};
 
 use crate::error::{Answer, Refusal};
 use crate::session::Signed;
-use crate::spaces::Place;
+use crate::spaces::{Place, Root, name_ok};
 use crate::{App, ids};
 
 /// How a zip starts, and how the older kind of Word file does. Either is read as Word, whatever its name.
@@ -59,6 +60,49 @@ impl App {
             return Err(Refusal::forbidden("You can read this space, but not add to it."));
         }
         let (root, folder) = (self.root(who, space)?, Place::parse(folder)?);
+        self.made(who, &space.told(role), &root, &folder, name, file, &mut |_| None)
+    }
+
+    /// Makes a document of the Markdown or Word file a space keeps at `path`, beside it. The file is left as
+    /// it is. Pictures a Markdown file names are read from its folder and the folders in it, and from
+    /// nowhere else: whoever wrote the file may not be who brings it in.
+    pub fn import_file(&self, who: &Signed, space: &str, path: &str) -> Answer<Entry> {
+        let (space, role) = self.space(who, space)?;
+        if !role.edits() {
+            return Err(Refusal::forbidden("You can read this space, but not add to it."));
+        }
+        let (root, place) = (self.root(who, space)?, Place::parse(path)?);
+        let (folder, name) = place.split();
+        let limits = letters_api::Limits::default();
+        let kept = root.folder(&folder)?;
+        // Only what the folder lists is read: no symlink, and nothing hidden.
+        let listed = kept.loose()?.into_iter().any(|file| file.name == name);
+        let file = if listed { kept.start(name, limits.document + 1)? } else { None };
+        let file = file.ok_or_else(Refusal::not_found)?;
+        if file.len() as u64 > limits.document {
+            return Err(Refusal::new(letters_api::Code::TooLarge, "The file is larger than the server takes."));
+        }
+        let mut pictures = |path: &str| {
+            let path = path.strip_prefix("./").unwrap_or(path);
+            let inside = !path.is_empty() && path.split('/').all(name_ok);
+            let picture = inside.then(|| kept.start(path, limits.asset + 1).ok().flatten()).flatten();
+            picture.filter(|picture| picture.len() as u64 <= limits.asset)
+        };
+        self.made(who, &space.told(role), &root, &folder, name, &file, &mut pictures)
+    }
+
+    /// The document of `file`, which was called `name`, kept in `folder`.
+    #[allow(clippy::too_many_arguments)]
+    fn made(
+        &self,
+        who: &Signed,
+        space: &letters_api::Space,
+        root: &Root,
+        folder: &Place,
+        name: &str,
+        file: &[u8],
+        pictures: Assets,
+    ) -> Answer<Entry> {
         // The name as the file had it on its device: its last part, without its ending.
         let named = name.rsplit(['/', '\\']).next().unwrap_or_default();
         let stem = named.rsplit_once('.').map_or(named, |(stem, _)| stem);
@@ -74,7 +118,7 @@ impl App {
         } else {
             let markdown = std::str::from_utf8(file)
                 .map_err(|_| refused(" because it is neither Markdown nor a Word document"))?;
-            let read = import_markdown(markdown, &mut ids::block_id, &mut |_| None);
+            let read = import_markdown(markdown, &mut ids::block_id, pictures);
             (read.document, style, read.notes, Vec::new(), read.assets)
         };
 
@@ -93,7 +137,7 @@ impl App {
         }
         // The history then lists where the document came from.
         copy.mark(TagKind::Import, Some(named))?;
-        let place = self.library.bring(&root, &folder, stem, &copy)?;
-        self.entry(who, &space.told(role), &root, &place)
+        let place = self.library.bring(root, folder, stem, &copy)?;
+        self.entry(who, space, root, &place)
     }
 }

@@ -1139,3 +1139,60 @@ fn the_landing_card_makes_way_for_the_servers_documents() {
     assert!(window.ui().landing());
     assert!(has(&mut window, Role::Button, "New document"));
 }
+
+/// A Markdown or Word file a folder keeps, which is no document yet, and the document it is listed under.
+fn kept(path: &str, beside: Option<&str>, role: Grade) -> Entry {
+    let name = path.rsplit('/').next().unwrap_or(path).to_owned();
+    let tags = vec![Tag::Unimported { beside: beside.map(str::to_owned) }];
+    Entry { name, role, tags, ..entry(EntryKind::Document, "sam", path, None, DAY) }
+}
+
+#[test]
+fn a_file_that_is_no_document_yet_is_listed_under_its_document_or_offered_to_import() {
+    let held = |role| {
+        vec![
+            document("sam", "Minutes.let", "d3", 0),
+            kept("Minutes.md", Some("Minutes.let"), role),
+            kept("Agenda.docx", None, role),
+            kept("Minutes.docx", Some("Minutes.let"), role),
+            document("sam", "Zoning.let", "d4", 3 * DAY),
+        ]
+    };
+    let mut window = signed_in(&[HOME]);
+    open(&mut window, held(Grade::Editor));
+    // A file follows the document of its name, however the list is ordered.
+    let by_name = ["Agenda.docx", "Minutes", "Minutes.docx", "Minutes.md", "Zoning"];
+    assert_eq!(listed(&mut window, "Documents").0, by_name);
+    window.click(Role::Button, "Modified");
+    assert_eq!(listed(&mut window, "Documents").0, ["Minutes", "Minutes.docx", "Minutes.md", "Agenda.docx", "Zoning"]);
+
+    // Only the file with no document is offered, and pressing a row of either does nothing.
+    let said = window.find(Role::ListBoxOption, "Agenda.docx").expect("listed").description.unwrap_or_default();
+    assert!(said.starts_with("Word file"), "{said}");
+    for name in ["Agenda.docx", "Minutes.md"] {
+        let row = window.find(Role::ListBoxOption, name).expect("listed").bounds;
+        window.click_at(Point { x: row.x + 60.0, y: row.y + row.height / 2.0 });
+        assert_eq!(window.ui().take_requests(), [], "{name}");
+    }
+    let import = button(&mut window, "Import", "As a new document").expect("offered to whoever edits there");
+    window.click_at(import.center());
+    let asked = Request::ImportFile { server: HOME.into(), space: "sam".into(), path: "Agenda.docx".into() };
+    assert_eq!(window.ui().take_requests(), [asked]);
+    window.assert_closed(Role::Dialog, "Open");
+
+    // A reader sees the files, and is told of the one that is not imported.
+    let mut window = signed_in(&[HOME]);
+    window.click(Role::Button, "More").click(Role::MenuItem, "Open");
+    let reads = Space { role: Grade::Reader, ..space("sam", "Sam Okafor", SpaceKind::Personal) };
+    window.ui().set_listing(Browsed {
+        server: HOME.into(),
+        place: Place::Spaces,
+        spaces: vec![reads],
+        entries: vec![],
+    });
+    window.ui().set_listing(listing(HOME, within("sam", ""), held(Grade::Reader)));
+    assert_eq!(listed(&mut window, "Documents").0, by_name);
+    assert!(button(&mut window, "Import", "As a new document").is_none());
+    let said = window.find(Role::ListBoxOption, "Agenda.docx").expect("listed").description.unwrap_or_default();
+    assert!(said.contains("Not imported"), "{said}");
+}

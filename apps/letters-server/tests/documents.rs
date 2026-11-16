@@ -541,6 +541,76 @@ async fn a_markdown_or_word_file_is_brought_in_as_a_document_that_replaces_nothi
     assert_eq!(names(&listed(&ben, "home", "").await), ["Quote", "Quote 2", "Roof", "Roof 2"]);
 }
 
+/// A picture of one pixel, whole.
+const PIXEL: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0b\x49\x44\x41\x54\x78\x9c\x63\x60\x00\x02\x00\x00\x05\x00\x01\x7a\x5e\xab\x3f\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
+/// What a row says of a file that is no document yet: `None` for a document, and else the document it is
+/// listed under.
+fn unimported(entry: &Entry) -> Option<Option<&str>> {
+    entry.tags.iter().find_map(|tag| match tag {
+        Tag::Unimported { beside } => Some(beside.as_deref()),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn markdown_and_word_files_a_folder_keeps_are_listed_and_made_documents_of() {
+    let server = Server::new("kept-files");
+    let (ben, guest) = (server.person("ben", &["family"]), server.person("guest", &["friends"]));
+    ben.start("family", "", "Plan").await;
+    let family = server.scratch.0.join("family");
+    std::fs::create_dir_all(family.join("img")).unwrap();
+    let kept: [(&str, Vec<u8>); 8] = [
+        ("Plan.md", "The plan, as it was drafted.".into()),
+        ("Plan.DOCX", docx("The plan, from Word.")),
+        ("Roof.md", "# Roof\n\n![The roof](img/roof.png)\n\n![Not ours](../../home/ben/secret.png)\n".into()),
+        ("img/roof.png", PIXEL.to_vec()),
+        // What is no file to bring in is not listed.
+        ("Budget.pdf", b"%PDF-1.7".to_vec()),
+        ("~$Plan.docx", b"a lock Word keeps".to_vec()),
+        (".Hidden.md", b"hidden".to_vec()),
+        ("notes.txt", b"plain".to_vec()),
+    ];
+    for (name, file) in &kept {
+        std::fs::write(family.join(name), file).unwrap();
+    }
+
+    // A reader sees them too. A file with the name of a document is listed under it.
+    let rows = listed(&guest, "family", "").await;
+    let told: Vec<(&str, Option<Option<&str>>)> = rows.iter().map(|row| (row.name.as_str(), unimported(row))).collect();
+    let expected = [
+        ("img", None),
+        ("Plan", None),
+        ("Plan.DOCX", Some(Some("Plan.let"))),
+        ("Plan.md", Some(Some("Plan.let"))),
+        ("Roof.md", Some(None)),
+    ];
+    assert_eq!(told, expected);
+    assert!(rows.iter().filter(|row| unimported(row).is_some()).all(|row| row.id.is_none()));
+
+    // Whoever writes there makes a document of one, beside it. Its pictures come from its folder only.
+    let refused = guest.send(Method::POST, &paths::import_file("family", "Roof.md"), "", Vec::new()).await;
+    assert_eq!(refused.json::<Error>().code, Code::Forbidden);
+    for (path, code) in [("Budget.pdf", Code::NotFound), ("Gone.md", Code::NotFound), (".Hidden.md", Code::Invalid)] {
+        let refused = ben.send(Method::POST, &paths::import_file("family", path), "", Vec::new()).await;
+        assert_eq!(refused.json::<Error>().code, code, "{path}");
+    }
+    let made = ben.send(Method::POST, &paths::import_file("family", "Roof.md"), "", Vec::new()).await;
+    assert_eq!(made.status, StatusCode::OK, "{}", made.text());
+    let roof: Entry = made.json();
+    assert_eq!(roof.name, "Roof");
+    let file = ben.send(Method::GET, &paths::file(roof.id.as_deref().unwrap()), "", Vec::new()).await.body;
+    let document = Archive::open(Cursor::new(file)).unwrap().document().unwrap();
+    let pictures = document.walk().filter(|block| matches!(&block.kind, BlockKind::Figure { asset: Some(_), .. }));
+    assert_eq!(pictures.count(), 1, "the picture beside it came along, and no other");
+
+    // The file is left as it was, and is now listed under its document.
+    assert_eq!(std::fs::read(family.join("Roof.md")).unwrap(), kept[2].1);
+    let rows = listed(&ben, "family", "").await;
+    let roof = rows.iter().find(|row| row.name == "Roof.md").expect("still listed");
+    assert_eq!(unimported(roof), Some(Some("Roof.let")));
+}
+
 #[tokio::test]
 async fn a_file_that_makes_no_document_is_refused_and_nothing_is_kept() {
     let server = Server::new("import-refused");

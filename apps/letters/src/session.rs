@@ -208,6 +208,11 @@ impl Session {
         self.ask(|server, token| server.post(token, &paths::documents(space), &new))
     }
 
+    /// Makes a document of a Markdown or Word file a space keeps at `path`, beside the file.
+    pub fn import_file(&self, space: &str, path: &str) -> Result<Entry, Refused> {
+        self.ask(|server, token| server.done(token, &paths::import_file(space, path)))
+    }
+
     /// Makes the folder `name` in `parent` of a space.
     pub fn new_folder(&self, space: &str, parent: &str, name: &str) -> Result<Entry, Refused> {
         let new = NewFolder { parent: parent.to_owned(), name: name.to_owned() };

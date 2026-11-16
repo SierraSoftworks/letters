@@ -9,7 +9,7 @@ use axum::routing::post;
 use letters_api::{Code, Grant, Grantee, Move, NewDocument, NewFolder, Role, paths};
 use serde::Deserialize;
 
-use super::{ACT_IMPORT, ACT_REVOKE, ACT_SHARE, ACT_UNSHARE, Visitor, asking, refusing, unmerged};
+use super::{ACT_IMPORT, ACT_IMPORT_FILE, ACT_REVOKE, ACT_SHARE, ACT_UNSHARE, Visitor, asking, refusing, unmerged};
 use super::{ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH, TRASH_PAGE};
 use crate::api::blocking;
 use crate::auth::local;
@@ -29,6 +29,7 @@ pub fn routes() -> Router<Shared> {
         .route(ACT_RENAME, post(rename))
         .route(ACT_MOVE, post(relocate))
         .route(ACT_TRASH, post(trash))
+        .route(ACT_IMPORT_FILE, post(import_file))
         .route(ACT_MERGE, post(merge_conflicts))
         .route(ACT_PUT_BACK, post(put_back))
         .route(ACT_SHARE, post(share))
@@ -110,6 +111,25 @@ async fn import(State(app): State<Shared>, Visitor(who): Visitor, mut form: Mult
         }
         let (name, file) = file.ok_or_else(|| Refusal::invalid("Choose a Markdown or Word file to import."))?;
         let entry = app.import(&who, &space, &folder, &name, &file)?;
+        Ok(paths::editor_page(&entry.id.unwrap_or_default()))
+    })
+    .await
+}
+
+/// A Markdown or Word file a space keeps, and the page it is listed on.
+#[derive(Deserialize)]
+struct Kept {
+    #[serde(default)]
+    space: String,
+    #[serde(default)]
+    path: String,
+}
+
+/// Makes a document of a file the space keeps, beside it, and opens it.
+async fn import_file(State(app): State<Shared>, Visitor(who): Visitor, Form(kept): Form<Kept>) -> Response {
+    let folder = kept.path.rsplit_once('/').map_or("", |(folder, _)| folder);
+    done(app, paths::folder_page(&kept.space, folder), move |app| {
+        let entry = app.import_file(&who, &kept.space, &kept.path)?;
         Ok(paths::editor_page(&entry.id.unwrap_or_default()))
     })
     .await

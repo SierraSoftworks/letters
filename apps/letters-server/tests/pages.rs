@@ -6,8 +6,8 @@ use axum::http::StatusCode;
 use common::{Browser, START, Server, URL, follow, let_in, link, names, planned};
 use letters_api::{CreatedLink, Entry, Listing, NewLink, Opened, Role, paths};
 use letters_server::pages::{
-    ACT_IMPORT, ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_REVOKE, ACT_SHARE,
-    ACT_TRASH, ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder,
+    ACT_IMPORT, ACT_IMPORT_FILE, ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME,
+    ACT_REVOKE, ACT_SHARE, ACT_TRASH, ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder,
 };
 
 /// What the folder at `path` of a space holds, as the interface tells the browser's own session.
@@ -332,6 +332,31 @@ async fn a_folders_page_takes_a_file_to_make_a_document_of_and_opens_it() {
     let forged = ben.hand(ACT_IMPORT, &within, ("Theirs.md", b"Theirs."), "https://elsewhere.example").await;
     assert_eq!(forged.status, StatusCode::FORBIDDEN);
     assert_eq!(names(&listed(&ben, "family", "").await), ["Roof"]);
+}
+
+#[tokio::test]
+async fn a_folders_page_lists_a_file_that_is_no_document_yet_and_makes_one_of_it() {
+    let server = Server::new("import-kept");
+    let mut ben = server.reader("ben", &["family"]);
+    ben.pages().start("family", "", "Plan").await;
+    for name in ["Plan.md", "Roof.md"] {
+        std::fs::write(server.scratch.0.join("family").join(name), "Words.").unwrap();
+    }
+    let here = paths::folder_page("family", "");
+    let shown = page(&mut ben, &here).await;
+    assert!(shown.contains("Plan.md") && shown.contains("Roof.md"), "both are listed");
+    // Only the one with no document is offered, and only to whoever writes there.
+    assert_eq!(shown.matches(&format!("action=\"{ACT_IMPORT_FILE}\"")).count(), 1);
+    let mut guest = server.reader("guest", &["friends"]);
+    let read = page(&mut guest, &here).await;
+    assert!(read.contains("Roof.md") && !read.contains(ACT_IMPORT_FILE), "a reader sees it and is not offered it");
+
+    let made = ben.fill(ACT_IMPORT_FILE, &[("space", "family"), ("path", "Roof.md")]).await;
+    let rows = listed(&ben, "family", "").await;
+    let roof = rows.iter().find(|row| row.name == "Roof").expect("the document is made");
+    assert_eq!(made.location(), paths::editor_page(roof.id.as_deref().unwrap()), "and opened");
+    let refused = ben.fill(ACT_IMPORT_FILE, &[("space", "family"), ("path", "Gone.md")]).await;
+    assert!(refused.location().starts_with(&format!("{here}?error=")), "{}", refused.location());
 }
 
 #[tokio::test]

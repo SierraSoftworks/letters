@@ -282,6 +282,16 @@ pub enum Request {
         space: String,
         path: String,
     },
+    /// Make a document of the Markdown or Word file at `path` in this space of the server at this address,
+    /// a row tagged `letters_api::Tag::Unimported`, as `letters_api::paths::import_file` does: beside the
+    /// file, which is left as it is. Then open the document, as the one [`Request::NewAt`] starts is. The
+    /// card that opens a server's documents asks it from the file's row, only of a space the person edits,
+    /// and is put away by then.
+    ImportFile {
+        server: String,
+        space: String,
+        path: String,
+    },
     /// Do what the button of a notice is for: the one handed to `Window::notify` with this
     /// [`Notice::key`](crate::Notice::key). The notice has gone by then.
     NoticePressed(String),

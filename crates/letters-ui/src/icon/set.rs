@@ -51,6 +51,8 @@ pub const ELLIPSIS: Icon = Icon::new("M11 12a1 1 0 1 0 2 0a1 1 0 1 0 -2 0M18 12a
 pub const EXTERNAL_LINK: Icon = Icon::new("M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6");
 /// `eye`
 pub const EYE: Icon = Icon::new("M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0M9 12a3 3 0 1 0 6 0a3 3 0 1 0 -6 0");
+/// `file`
+pub const FILE: Icon = Icon::new("M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2zM14 2v5a1 1 0 0 0 1 1h5");
 /// `file-down`
 pub const FILE_DOWN: Icon = Icon::new("M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2zM14 2v5a1 1 0 0 0 1 1h5M12 18v-6M9 15l3 3 3-3");
 /// `file-input`

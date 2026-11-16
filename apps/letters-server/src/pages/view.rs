@@ -7,7 +7,10 @@ use letters_api::{self as api, EntryKind, Person, SpaceKind, paths};
 use yew::prelude::*;
 use yewi::prelude::*;
 
-use super::{ACT_IMPORT, ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_TRASH};
+use super::{
+    ACT_IMPORT, ACT_IMPORT_FILE, ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME,
+    ACT_TRASH,
+};
 use super::{ACT_REVOKE, ACT_SHARE, ACT_UNSHARE, RECENT_PAGE, SHARED_PAGE, TRASH_PAGE, asking, asking_folder};
 use crate::export::Offer;
 
@@ -289,7 +292,9 @@ fn tag(tag: &api::Tag) -> Html {
             <Tag icon={icons::LINK}>{ count(*links as usize, "link", "links") }</Tag>
         },
         api::Tag::Damaged => html! { <Tag icon={icons::TRIANGLE_ALERT} tone={Tone::Danger}>{ "Cannot be read" }</Tag> },
-        api::Tag::Unknown => Html::default(),
+        // Under its document a file's ending says what it is.
+        api::Tag::Unimported { beside: None } => html! { <Tag icon={icons::FILE_INPUT}>{ "Not imported" }</Tag> },
+        api::Tag::Unimported { .. } | api::Tag::Unknown => Html::default(),
     }
 }
 
@@ -301,7 +306,13 @@ fn file(row: &Row, here: Option<&str>, places: bool, shares: bool) -> Html {
     // A conflict copy has the id of its original, so whatever is asked by id is asked of the original.
     // The copy itself is only merged.
     let copy = entry.tags.iter().any(|tag| matches!(tag, api::Tag::ConflictCopy { .. }));
+    // A Markdown or Word file is no document yet. One with the name of a document stands under it.
+    let loose = entry.tags.iter().find_map(|tag| match tag {
+        api::Tag::Unimported { beside } => Some(beside.is_some()),
+        _ => None,
+    });
     let (icon, href) = match (&entry.kind, &entry.id) {
+        _ if loose.is_some() => (icons::FILE, None),
         (EntryKind::Folder, _) => (icons::FOLDER, Some(paths::folder_page(space, &entry.path))),
         (EntryKind::Document, Some(id)) if !copy => (icons::FILE_TEXT, Some(paths::editor_page(id))),
         (EntryKind::Document, _) => (icons::FILE_TEXT, None),
@@ -320,6 +331,17 @@ fn file(row: &Row, here: Option<&str>, places: bool, shares: bool) -> Html {
             </form>
         }
     });
+    // Whoever writes here makes a document of a file that has none.
+    let import = here.filter(|_| loose == Some(false) && entry.role.edits()).map(|_| {
+        html! {
+            <form method="post" action={ACT_IMPORT_FILE}>
+                { hidden("space", space) }
+                { hidden("path", &entry.path) }
+                <Button size={Size::Small} icon={icons::FILE_INPUT} kind={ButtonKind::Submit}>{ "Import" }</Button>
+            </form>
+        }
+    });
+    let class = if loose == Some(true) { "lt-file lt-file--under" } else { "lt-file" };
     let name = match href {
         Some(href) => html! { <a class="lt-file__name" {href}>{ entry.name.clone() }</a> },
         None => html! { <span class="lt-file__name">{ entry.name.clone() }</span> },
@@ -379,7 +401,7 @@ fn file(row: &Row, here: Option<&str>, places: bool, shares: bool) -> Html {
     html! {
         <tr class="yi-table__row">
             <th scope="row">
-                <span class="lt-file"><Icon {icon} />{ name }{ for tags.map(tag) }{ for merge }</span>
+                <span {class}><Icon {icon} />{ name }{ for tags.map(tag) }{ for merge }{ for import }</span>
             </th>
             if places {
                 <td class="lt-dim">{ row.space.clone().unwrap_or_default() }</td>

@@ -22,7 +22,7 @@ use letters::remote::Roots;
 use letters::server::Client;
 use letters::session::Session;
 use letters::signin::SignIn;
-use letters_api::{Entry, EntryKind, NewDocument, Opened, Person, Role, SpaceKind, Trust, paths};
+use letters_api::{Entry, EntryKind, NewDocument, Opened, Person, Role, SpaceKind, Tag, Trust, paths};
 use letters_model::{Block, BlockKind, Notes, Style};
 use letters_server::config::Config;
 use letters_server::session::{COOKIE_NAME, Carrier};
@@ -728,6 +728,26 @@ fn a_document_is_named_renamed_and_moved_at_its_server() {
     assert!(place(&[Placing::Rename("Later".into())]).refused.is_some());
     let offline = connected::reach(&session, &id, &home.0).expect("the copy opens");
     assert_eq!((offline.online, offline.opened.name.as_str()), (false, "Quote"));
+}
+
+#[test]
+fn a_file_the_server_keeps_is_listed_and_made_a_document_there() {
+    let server = Server::start("kept-file");
+    let session = server.session(ada());
+    let spaces = session.spaces().unwrap();
+    let space = spaces.iter().find(|space| space.kind == SpaceKind::Personal).unwrap().id.clone();
+    // A person's own folder is made when it is first listed.
+    assert!(session.entries(&space, "").unwrap().entries.is_empty());
+    let own = std::fs::read_dir(server._scratch.0.join("home")).unwrap().next().unwrap().unwrap().path();
+    std::fs::write(own.join("Roof.md"), "# Roof\n\nThe quote is due.").unwrap();
+
+    let loose = |entry: &Entry| entry.tags.iter().any(|tag| matches!(tag, Tag::Unimported { .. }));
+    let listed = session.entries(&space, "").unwrap().entries;
+    let file = listed.iter().find(|entry| loose(entry)).expect("the file is listed");
+    let made = session.import_file(&space, &file.path).expect("a document is made of it");
+    assert_eq!(made.name, "Roof");
+    let home = Scratch::new("kept-file-home");
+    connected::reach(&session, &made.id.unwrap(), &home.0).expect("which opens here as any other does");
 }
 
 #[test]
