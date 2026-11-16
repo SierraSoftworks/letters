@@ -4,7 +4,7 @@
 // `./build.sh && LETTERS_WEB_DIST=$PWD/dist npx playwright test e2e/server.spec.js --project chromium`.
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -208,6 +208,53 @@ test("who wrote since a person's last visit is told from what their account keep
 
     const next = await open(await server.browser(browser, "ada"), id);
     await expect(next.getByText("Edited by Ben", { exact: true })).toBeAttached();
+  } finally {
+    server.stop();
+  }
+});
+
+test("text in a language the server keeps a dictionary for is checked against it, in whatever encoding the files are", async ({ browser }) => {
+  const server = await served();
+  try {
+    // A dictionary as a system keeps it: named for its language and country, in an older encoding.
+    const kept = join(server.folder, "state", "dictionaries");
+    mkdirSync(kept, { recursive: true });
+    writeFileSync(join(kept, "de_DE.aff"), Buffer.from("SET ISO8859-1\nTRY esn\n", "latin1"));
+    writeFileSync(join(kept, "de_DE.dic"), Buffer.from("2\nStraße\nÜbung\n", "latin1"));
+    const ada = await server.browser(browser, "ada");
+    const made = await ada.request.post("/api/v1/spaces/family/documents", { data: { name: "Brief" }, headers: { origin: server.url } });
+    const { id } = await made.json();
+    const page = await open(ada, id);
+
+    // The dialog offers what the server has. Nothing was fetched for a language nothing is written in.
+    const fetched = [];
+    page.on("response", (response) => /\/dictionaries\/.+\/(aff|dic)$/.test(response.url()) && fetched.push(response));
+    await page.keyboard.press("ControlOrMeta+Shift+p");
+    await page.keyboard.type("Language");
+    await rested(page);
+    await page.keyboard.press("Enter");
+    const press = async (role, name) => {
+      const box = await page.getByRole(role, { name, exact: true }).boundingBox();
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    };
+    await press("button", "Language of the document");
+    await press("menuitemcheckbox", "German (Germany)");
+    await page.keyboard.press("Escape");
+    // The language is written in now, so its dictionary is fetched.
+    await expect.poll(() => fetched.length).toBe(2);
+    await Promise.all(fetched.map((response) => response.finished()));
+    await rested(page);
+
+    // A wrong word in the dictionary's own letters is marked, and its correction is the dictionary's.
+    await page.keyboard.type("Strase ");
+    await rested(page);
+    await page.keyboard.press("ArrowLeft");
+    await page.keyboard.press("ArrowLeft");
+    await page.locator("textarea").dispatchEvent("contextmenu");
+    await expect(page.getByRole("menuitem", { name: "Straße" })).toBeAttached();
+    expect(fetched.map((response) => new URL(response.url()).pathname).sort()).toEqual(["/api/v1/dictionaries/de-DE/aff", "/api/v1/dictionaries/de-DE/dic"]);
+    expect(fetched.map((response) => response.status())).toEqual([200, 200]);
+    expect(await page.evaluate(() => window.blocked)).toEqual([]);
   } finally {
     server.stop();
   }

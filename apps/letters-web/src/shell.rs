@@ -5,7 +5,7 @@
 //! moves the hidden input under the caret, where the input method's candidate window should open.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::mem;
 use std::ops::Range;
@@ -1490,6 +1490,8 @@ impl Shell {
         }
         if let Some(later) = self.later.take() {
             self.fetch(later);
+            // The server may have said which dictionaries it has while the frame was on its way.
+            self.want_dictionaries();
         }
         self.stats.frame_ms = end - start;
         self.wake_at(wake);
@@ -2073,20 +2075,18 @@ impl Shell {
     }
 
     /// Fetches the server's dictionary for each language the document names that it has one for, once.
-    /// A dictionary is large, so none is fetched for a language nothing is written in. The text is
-    /// checked when it has come, and left alone if it does not.
+    /// A dictionary is large, so none is fetched for a language nothing is written in, and none before
+    /// the first frame, which must not wait for one. The text is checked when it has come, and left alone
+    /// if it does not.
     fn want_dictionaries(&mut self) {
-        if self.languages.is_empty() {
+        if self.languages.is_empty() || self.stats.first_frame_ms.is_none() {
             return;
         }
-        // By the server's own name for it, since one dictionary may serve several of the tags written.
-        let held = |tag: String| letters_spell::best_dictionary(self.languages.iter().map(String::as_str), &tag);
-        let named: BTreeSet<usize> = page::languages(self.view.editor().doc()).into_iter().filter_map(held).collect();
-        let wanted = named.into_iter().map(|at| self.languages[at].clone());
-        let wanted: Vec<String> = wanted.filter(|tag| !self.dictionaries.contains(tag)).collect();
-        for tag in wanted {
-            self.dictionaries.push(tag.clone());
-            let urls = [paths::dictionary_aff(&tag), paths::dictionary_dic(&tag)];
+        let mut wanted = page::dictionaries(self.view.editor().doc(), &self.languages);
+        wanted.retain(|held, _| !self.dictionaries.contains(held));
+        for (held, tag) in wanted {
+            self.dictionaries.push(held.clone());
+            let urls = [paths::dictionary_aff(&held), paths::dictionary_dic(&held)];
             let (shell, window) = (self.me.clone(), self.window.clone());
             wasm_bindgen_futures::spawn_local(async move {
                 let files = match browser::files(&window, &urls).await {
