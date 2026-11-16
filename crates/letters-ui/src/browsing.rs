@@ -81,6 +81,19 @@ pub enum Place {
     Recent,
 }
 
+/// Where a server keeps the document a window has open: the card that opens from it starts there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stored {
+    /// The [`Server::address`] of the server that keeps it.
+    pub server: String,
+    /// The space the person reaches it through, and its path there, as `letters_api::Opened` says them.
+    /// One that is only shared with them has no space.
+    pub space: Option<String>,
+    pub path: String,
+    /// Its id, as [`Entry::id`](letters_api::Entry::id) lists it.
+    pub id: String,
+}
+
 /// What a place holds, as its server answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Browsed {
@@ -144,6 +157,9 @@ pub(crate) struct Browser {
     open: bool,
     /// The address of the server that is looked at.
     server: String,
+    /// The document the card was opened from, while the person is signed in to its server. The card starts
+    /// in its folder, and its row takes the keyboard.
+    from: Option<Stored>,
     /// Its spaces, once it has said.
     spaces: Option<Vec<Space>>,
     /// The place that is looked at, and what it holds once the server has said.
@@ -191,7 +207,17 @@ impl Browser {
             if self.place.is_none() && !self.binned {
                 let own = listing.spaces.iter().find(|space| space.kind == SpaceKind::Personal);
                 let first = own.or(listing.spaces.first()).map(|space| within(space, ""));
-                self.go(first.unwrap_or(Place::Shared), requests);
+                // Opened from a document of this server, it starts where that document is.
+                let beside = self.from.as_ref().filter(|from| from.server == self.server).and_then(|from| {
+                    let folder = from.path.rsplit_once('/').map_or("", |(folder, _)| folder);
+                    match &from.space {
+                        Some(space) => {
+                            listing.spaces.iter().find(|known| known.id == *space).map(|space| within(space, folder))
+                        }
+                        None => Some(Place::Shared),
+                    }
+                });
+                self.go(beside.or(first).unwrap_or(Place::Shared), requests);
             }
             self.spaces = Some(listing.spaces);
         } else if let Place::Whole { space } = &listing.place {
@@ -247,6 +273,11 @@ impl Browser {
         }
     }
 
+    /// Takes in the document the card is next opened from, if a server keeps it.
+    pub fn beside(&mut self, stored: Option<Stored>) {
+        self.from = stored;
+    }
+
     /// Takes in where the person is signed in. The card of a server they are signed out of goes.
     pub fn signed(&mut self, servers: &[Server]) {
         if !servers.iter().any(|server| server.address == self.server) {
@@ -265,8 +296,11 @@ impl Browser {
     ) {
         match message {
             Browsing::Show => {
-                // The server that was looked at last, while the person is still signed in to it.
-                let known = servers.iter().find(|server| server.address == self.server);
+                // The server of the document it is opened from, else the one that was looked at last, while
+                // the person is still signed in to it.
+                let at = |address: &str| servers.iter().find(|server| server.address == address);
+                self.from = self.from.take().filter(|from| at(&from.server).is_some());
+                let known = self.from.as_ref().and_then(|from| at(&from.server)).or_else(|| at(&self.server));
                 let Some(server) = known.or(servers.first()) else { return };
                 (self.open, (self.now, self.zone)) = (true, clock);
                 self.look(server.address.clone(), requests);
@@ -651,14 +685,19 @@ impl Browser {
             Some(entries) => entries,
         };
         // The first of them takes the keyboard as they come, so that a folder gone into with Enter is
-        // walked on with the arrow keys.
-        let rows = self.sorted(entries).into_iter().enumerate().map(|(at, entry)| {
+        // walked on with the arrow keys. The document the card was opened from takes it instead.
+        let sorted = self.sorted(entries);
+        let from = self.from.as_ref().filter(|_| self.fresh);
+        let from = from.and_then(|from| sorted.iter().position(|entry| entry.id.as_deref() == Some(&from.id)));
+        let first = from.unwrap_or(0);
+        let rows = sorted.into_iter().enumerate().map(|(at, entry)| {
             let row = self.entry(entry, today, room, false);
-            match at {
-                0 if self.fresh => row.takes_focus().heir(),
+            match at == first {
+                // However far down the list it is, that document is in sight.
+                true if self.fresh => row.takes_focus().heir().in_view(from.is_some()),
                 // The list is walked on from its top when the row that had the keyboard was merged away.
-                0 => row.heir(),
-                _ => row,
+                true => row.heir(),
+                false => row,
             }
         });
         let list = Element::column()
