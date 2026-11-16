@@ -57,6 +57,7 @@ pub const TRASH_PAGE: &str = "/trash";
 pub const ACT_NEW_DOCUMENT: &str = "/act/new-document";
 pub const ACT_NEW_FOLDER: &str = "/act/new-folder";
 pub const ACT_IMPORT: &str = "/act/import";
+pub const ACT_IMPORT_FILE: &str = "/act/import-file";
 pub const ACT_RENAME: &str = "/act/rename";
 pub const ACT_MOVE: &str = "/act/move";
 pub const ACT_TRASH: &str = "/act/trash";

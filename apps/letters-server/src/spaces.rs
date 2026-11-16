@@ -24,6 +24,21 @@ pub const TRASH: &str = ".letters-trash";
 /// Where a person's own space keeps what they set for themselves, as the desktop app does in a home folder.
 pub const KEPT: &str = ".letters";
 
+/// How the name of a file ends that is no document but can be made one: Markdown and Word.
+const UNIMPORTED: [&str; 3] = [".md", ".markdown", ".docx"];
+
+/// The name, without its ending, of a file that can be made a document. `None` for any other file.
+pub fn unimported(name: &str) -> Option<&str> {
+    // Word keeps a lock file beside a document it has open.
+    if name.starts_with("~$") {
+        return None;
+    }
+    UNIMPORTED.iter().find_map(|ending| {
+        let at = name.len().checked_sub(ending.len()).filter(|&at| at > 0 && name.is_char_boundary(at))?;
+        name[at..].eq_ignore_ascii_case(ending).then(|| &name[..at])
+    })
+}
+
 /// Folders a NAS, a disk or an operating system keeps for itself among a person's own: Synology's
 /// thumbnails, recycle bin and snapshots, QNAP's, Windows', a Linux disk's and a Mac archive's. Told by
 /// their whole name, whatever its case, so that a folder a person called `#ideas` or `@work` stays theirs.
@@ -218,6 +233,23 @@ impl Folder {
         }
         // By the name shown, so that "Plan" comes before "Plan (conflicted copy)".
         out.sort_by_cached_key(|listed| (!listed.folder, shown(&listed.name).to_lowercase()));
+        Ok(out)
+    }
+
+    /// The files here that are no documents but can be made ones, by name: see [`unimported`]. Hidden names
+    /// and symlinks are left out, as [`list`](Self::list) leaves them out.
+    pub fn loose(&self) -> io::Result<Vec<Listed>> {
+        let mut out = Vec::new();
+        for entry in self.dir.entries()? {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else { continue };
+            if !name_ok(&name) || unimported(&name).is_none() || !entry.file_type()?.is_file() {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else { continue };
+            out.push(Listed { name, folder: false, stamp: stamp(&metadata) });
+        }
+        out.sort_by_cached_key(|listed| listed.name.to_lowercase());
         Ok(out)
     }
 

@@ -1,7 +1,8 @@
 //! Opening a document a server keeps: one card lists the places of a server the person is signed in to and
 //! what each holds, and the document that is pressed is asked of the shell. So is what else the card offers
 //! to have done there: a document started or imported, conflict copies merged, and what was thrown away put
-//! back.
+//! back. A Markdown or Word file a folder keeps is listed too: under the document of its name, or with the
+//! offer to make a document of it.
 //!
 //! The window only asks: the shell talks to the server, and answers with what a place holds or with why it
 //! could not be read.
@@ -118,6 +119,8 @@ pub enum Browsing {
     Seek(String),
     /// Enter in the field, which takes the best of what was found.
     Take,
+    /// Make a document of the Markdown or Word file at this path in the space that is looked at.
+    Bring(String),
     /// Look at what was thrown away on the server.
     Trash,
     /// Put back what `file` names in the trash of this space.
@@ -293,6 +296,12 @@ impl Browser {
                     self.close();
                 }
             }
+            Browsing::Bring(path) => {
+                if let Some((space, _)) = self.written() {
+                    requests.push(Request::ImportFile { server: self.server.clone(), space: space.to_owned(), path });
+                    self.close();
+                }
+            }
             Browsing::Sort(by) => {
                 let turned = self.order().is_some_and(|(at, turned)| at == by && !turned);
                 // The keyboard stays on the heading, to turn the order round with.
@@ -341,10 +350,25 @@ impl Browser {
         }
     }
 
-    /// What the place holds in the order it is listed in.
+    /// What the place holds in the order it is listed in. A file in another format follows the document it
+    /// is listed under, however the rest are ordered.
     fn sorted<'a>(&self, entries: &'a [Entry]) -> Vec<&'a Entry> {
-        let mut rows: Vec<&Entry> = entries.iter().collect();
-        let Some((by, turned)) = self.order() else { return rows };
+        let under = |entry: &Entry| {
+            let beside = loose(entry).flatten()?;
+            entries.iter().find(|above| above.id.is_some() && above.path == beside && above.space == entry.space)
+        };
+        let (mut rows, mut nested): (Vec<&Entry>, Vec<&Entry>) =
+            entries.iter().partition(|entry| under(entry).is_none());
+        nested.sort_by_key(|entry| entry.name.to_lowercase());
+        let whole = |rows: Vec<&'a Entry>| {
+            let mut all = Vec::with_capacity(entries.len());
+            for row in rows {
+                all.push(row);
+                all.extend(nested.iter().copied().filter(|entry| under(entry).is_some_and(|at| std::ptr::eq(at, row))));
+            }
+            all
+        };
+        let Some((by, turned)) = self.order() else { return whole(rows) };
         let folder = |entry: &Entry| entry.kind == EntryKind::Folder;
         rows.sort_by(|a, b| {
             let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
@@ -356,7 +380,7 @@ impl Browser {
             };
             folder(b).cmp(&folder(a)).then(if turned { within.reverse() } else { within })
         });
-        rows
+        whole(rows)
     }
 
     /// The folder that is looked at, by its space and its path there, if the person may write in it: a
@@ -452,13 +476,14 @@ impl Browser {
                 choice.into()
             }
         };
-        let device = Button::new("This device").icon(icon::FOLDER_OPEN).on_press(send(Browsing::Device));
+        // Named, they would leave several servers too little of a card that is not roomy.
+        let brief = room == Room::Tight || (room < Room::Roomy && servers.len() > 1);
         let sources = Element::row()
             .align(Align::Center)
             .justify(Justify::Between)
             .gap(tokens::SPACE_MD)
             .child(from)
-            .child(device);
+            .children(self.made(brief));
         let line = || Element::row().width(1.0).bg(tokens::LINE).decorative();
         let body = Element::row()
             .height(HEIGHT)
@@ -512,7 +537,8 @@ impl Browser {
     }
 
     /// The places of the server down the card's side: the person's spaces, then what reaches them from
-    /// other people's, what they had open lately, and what was thrown away.
+    /// other people's, what they had open lately, and what was thrown away. Under them, the way to a file
+    /// of this device.
     fn places(&self, room: Room) -> Element<Message> {
         let spaces = self.spaces.as_deref().unwrap_or_default().iter().map(|space| {
             let mark = if space.kind == SpaceKind::Personal { icon::FOLDER } else { icon::USERS };
@@ -529,8 +555,9 @@ impl Browser {
             option(mark, name, here).selected(here).on_press(send(Browsing::Go(place)))
         });
         let trash = option(icon::TRASH_2, "Trash", self.binned).selected(self.binned).on_press(send(Browsing::Trash));
-        Element::column()
-            .width(if room == Room::Tight { NARROW } else { PLACES })
+        let places = Element::column()
+            .grow(1.0)
+            .shrink()
             .padding(Edges::all(tokens::SPACE_XS))
             .role(Role::ListBox)
             .label("Places")
@@ -538,7 +565,31 @@ impl Browser {
             .one_stop()
             .scroll()
             .children(rows)
-            .child(trash)
+            .child(trash);
+        // Not a place of the server: it leaves the card for the system's own dialog, so it stands under
+        // the places and stays there while they scroll.
+        let device = option(icon::MONITOR, "This device", false)
+            .role(Role::Button)
+            .description("Open a file from this device")
+            .on_press(send(Browsing::Device));
+        Element::column()
+            .width(if room == Room::Tight { NARROW } else { PLACES })
+            .child(places)
+            .child(Element::row().height(1.0).bg(tokens::LINE).decorative())
+            .child(Element::column().padding(Edges::all(tokens::SPACE_XS)).child(device))
+    }
+
+    /// What is made in the folder that is looked at, where the person may write: a document started there,
+    /// or one made out of a file of this device.
+    fn made(&self, brief: bool) -> Option<Element<Message>> {
+        let (space, path) = self.written().filter(|_| !self.binned)?;
+        let named = self.spaces.as_deref()?.iter().find(|known| known.id == space)?.name.as_str();
+        let here = path.rsplit('/').next().filter(|folder| !folder.is_empty()).unwrap_or(named);
+        let made = Element::row()
+            .gap(tokens::SPACE_XS)
+            .child(act("Import", icon::FILE_UP, Some(Browsing::Import), format!("Into {here}"), brief))
+            .child(act("New document", icon::PLUS, Some(Browsing::New), format!("In {here}"), brief));
+        Some(made)
     }
 
     /// What the place that is looked at holds, under the way that leads to it.
@@ -732,8 +783,7 @@ impl Browser {
             .children(rows)
     }
 
-    /// The way to the folder that is looked at, from its space down. Each step but the last leads back. At
-    /// its end a document is started in the folder or made there out of a file, where the person may write.
+    /// The way to the folder that is looked at, from its space down. Each step but the last leads back.
     /// A tight card has room for the folder's own name alone, with one step that leads up from it.
     fn way(&self, room: Room) -> Option<Element<Message>> {
         let Some(Place::Folder { space, path }) = self.place.as_ref().filter(|_| !self.binned) else { return None };
@@ -767,24 +817,18 @@ impl Browser {
                 way = way.child(up.on_press(send(Browsing::Go(back))));
             }
         }
-        if self.written().is_some() {
-            let here = folders.last().copied().or(name).unwrap_or_default();
-            // Named, they would leave the steps too little of a card that is not roomy.
-            let brief = room < Room::Roomy;
-            let made = Element::row()
-                .gap(tokens::SPACE_XS)
-                .child(act("Import", icon::FILE_UP, Some(Browsing::Import), format!("Into {here}"), brief))
-                .child(act("New document", icon::PLUS, Some(Browsing::New), format!("In {here}"), brief));
-            way = way.child(Element::row().grow(1.0)).child(made);
-        }
         Some(way.shrink().height(tokens::CONTROL_HEIGHT_SM))
     }
 
     /// One folder or document of the place. A folder is gone into, a document is opened, and a file that
     /// could not be read as a document is only listed. So is a conflict copy, which goes by the id of the
-    /// document it is a copy of: whoever edits there merges it into that document from its row. One that a
-    /// search `found` says what folder it is in.
+    /// document it is a copy of: whoever edits there merges it into that document from its row. A Markdown
+    /// or Word file is only listed under the document of its name, and else whoever edits there makes a
+    /// document of it from its row. One that a search `found` says what folder it is in.
     fn entry(&self, entry: &Entry, today: Option<i64>, room: Room, found: bool) -> Element<Message> {
+        if let Some(beside) = loose(entry) {
+            return self.file(entry, beside.is_some(), today, room);
+        }
         let folder = entry.kind == EntryKind::Folder;
         let merges = copy(entry).filter(|_| entry.role >= Grade::Editor);
         let waits = merges.is_some_and(|(_, id)| self.busy.iter().any(|row| row == id));
@@ -860,6 +904,51 @@ fn does(entry: &Entry) -> Option<Browsing> {
 
 /// What stands in place of the list when a search found nothing.
 const NOTHING: &str = "Nothing here matches your search. Try fewer letters, or a filter such as author:sam, is:folder or before:2026-11-01.";
+
+impl Browser {
+    /// A Markdown or Word file the place keeps, which is no document yet. `nested` is whether it stands
+    /// under the document of its name.
+    fn file(&self, entry: &Entry, nested: bool, today: Option<i64>, room: Room) -> Element<Message> {
+        let word = entry.name.to_lowercase().ends_with(".docx");
+        let kind = if word { "Word file" } else { "Markdown file" };
+        let brings = !nested && entry.role >= Grade::Editor && self.written().is_some();
+        let bring = brings.then(|| {
+            let does = Some(Browsing::Bring(entry.path.clone()));
+            act("Import", icon::FILE_INPUT, does, "As a new document", room == Room::Tight)
+        });
+        // The button says what the note would, and under its document a file needs neither.
+        let noted = (!nested && !brings).then_some("Not imported");
+        let when = day_called(day(entry.modified, self.zone), today);
+        let told = [Some(kind.to_owned()), noted.map(str::to_owned), Some(format!("Modified {when}"))];
+        let about: Vec<String> = told.into_iter().flatten().collect();
+        let key = format!("{}/{}", entry.space.as_deref().unwrap_or_default(), entry.path);
+        let muted = |said: &str| Element::text(said, quiet()).fg(tokens::FG_MUTED);
+        let ends = [Element::row().width(WRITERS), Element::row().width(DAY)];
+        let row = option(icon::FILE, &entry.name, false)
+            .key(key.as_str())
+            .description(about.join(", "))
+            .children(bring)
+            .child(Element::row().width(0.0).grow(1.0).clip().children(noted.map(|noted| muted(noted).shrink())))
+            .children(ends.into_iter().filter(|_| room == Room::Roomy))
+            .children((room > Room::Tight).then(|| Element::row().width(DAY).child(muted(&when))));
+        match (nested, brings) {
+            // Set in as far as the name of the document over it.
+            (true, _) => row.padding(Edges { left: 2.0 * tokens::SPACE_SM + 16.0, ..Edges::xy(tokens::SPACE_SM, 0.0) }),
+            // The row is there for its button.
+            (false, true) => row,
+            (false, false) => row.disabled(true),
+        }
+    }
+}
+
+/// What a row says of a Markdown or Word file that is no document yet: the path of the document it is
+/// listed under, if any. `None` for every other row.
+fn loose(entry: &Entry) -> Option<Option<&str>> {
+    entry.tags.iter().find_map(|tag| match tag {
+        Tag::Unimported { beside } => Some(beside.as_deref()),
+        _ => None,
+    })
+}
 
 /// What a conflict copy is a copy of: the path of its original, and the id the two share.
 fn copy(entry: &Entry) -> Option<(&str, &str)> {

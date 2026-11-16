@@ -58,6 +58,7 @@ use crate::keychain::Keychain;
 use crate::library::{Library, Place, Recent, Refused, UNTITLED, has_content};
 use crate::links::{self, Step};
 use crate::measure::{FIRST_FRAME, Launch, Typing};
+use crate::menus::{self, Bar};
 use crate::pictures::{self, Decoder, Source};
 use crate::platform::{self, Desktop};
 use crate::present::{Painter, Presenter};
@@ -184,6 +185,8 @@ pub enum Event {
     Placed(WindowId, bool, Box<Placed>),
     /// The server of a window's document answered what the window's Share dialog asked, in that order.
     Shared(WindowId, Vec<connected::Shared>),
+    /// An item of the menu bar was taken: its place in [`menus::items`].
+    Menu(usize),
 }
 
 impl From<accesskit_winit::Event> for Event {
@@ -257,6 +260,8 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
             move |id, faces| drop(proxy.send_event(Event::Faces(id, faces)))
         }),
         mods: ModifiersState::empty(),
+        bar: None,
+        bar_stale: false,
         failure: None,
         home,
     };
@@ -478,6 +483,10 @@ struct App {
     /// Looks among the system's fonts for what the bundled ones cannot draw, once a window shows any.
     fonts: Finder<WindowId>,
     mods: ModifiersState,
+    /// The menus macOS shows at the top of the screen. `None` elsewhere, and until a window is up.
+    bar: Option<Bar>,
+    /// Whether something happened since the menus were last told what the window in front offers.
+    bar_stale: bool,
     /// Why the app is exiting, when it is not by choice.
     failure: Option<String>,
 }
@@ -2720,7 +2729,8 @@ impl App {
                 Request::PutBack { server, space, file } => self.browse_trash(id, server, Some((space, file)), now),
                 Request::ImportAt { server, space, path } => self.import_at(event_loop, id, server, space, path),
                 Request::OpenFrom { server, id: document } => self.reach(Some(id), &server, document),
-                Request::NewAt { server, space, path } => self.start_at(id, &server, space, path),
+                Request::NewAt { server, space, path } => self.start_at(id, &server, space, path, false),
+                Request::ImportFile { server, space, path } => self.start_at(id, &server, space, path, true),
                 // A request this shell does not know yet.
                 _ => {}
             }
@@ -3124,16 +3134,22 @@ impl App {
         }
     }
 
-    /// Starts a document in `folder` of a space of the server at `server` and brings it here, on another
-    /// thread, for the window that asked. It opens as a document of the server does: see [`Self::reached`].
-    fn start_at(&mut self, id: WindowId, server: &str, space: String, folder: String) {
+    /// Starts a document in the folder `at` of a space of the server at `server` and brings it here, on
+    /// another thread, for the window that asked. It opens as a document of the server does: see
+    /// [`Self::reached`]. With `import`, `at` is a Markdown or Word file the space keeps, and the document
+    /// is made of it, beside it.
+    fn start_at(&mut self, id: WindowId, server: &str, space: String, at: String, import: bool) {
         let Some(session) = self.sessions.get(server).filter(|session| !session.ended()).cloned() else {
             let nobody = Err(Some("Nobody is signed in to that server any more.".to_owned()));
             return drop(self.proxy.send_event(Event::Reached(Some(id), nobody)));
         };
         let (proxy, home) = (self.proxy.clone(), self.home.clone());
         thread::spawn(move || {
-            let started = session.new_document(&space, &folder, None).map_err(|refused| connected::sentence(&refused));
+            let started = match import {
+                true => session.import_file(&space, &at),
+                false => session.new_document(&space, &at, None),
+            };
+            let started = started.map_err(|refused| connected::sentence(&refused));
             let reached = started.and_then(|entry| {
                 let document = entry.id.ok_or("The server did not say which document it started.")?;
                 connected::reach(&session, &document, &home).map_err(|error| error.to_string())
@@ -3826,6 +3842,32 @@ impl App {
         }
     }
 
+    /// Does the item of the menu bar at a place in [`menus::items`], for the window in front.
+    fn menu(&mut self, event_loop: &ActiveEventLoop, place: usize) {
+        let Some(item) = menus::items().get(place).copied() else { return };
+        let front = self.windows.iter_mut().find(|(_, window)| window.window.has_focus());
+        let Some((id, window)) = front.map(|(id, window)| (*id, window)) else { return };
+        let mut action = None;
+        match (menus::key(item, &window.view), item) {
+            // As pressing the key does: the window is offered it, and the app what the window leaves.
+            (Some(key), _) => {
+                let used = window.view.key(key.clone(), &mut self.platform);
+                action = (!used).then_some(&key).and_then(shortcut);
+            }
+            (None, menus::Item::Command(_, name)) => drop(window.view.run_command(name, &mut self.platform)),
+            (None, _) => {}
+        }
+        window.access_stale = true;
+        // A paste may have put pictures in.
+        window.keep(self.platform.take_assets());
+        let now = Instant::now();
+        window.sync(now);
+        self.serve(event_loop, id, now);
+        if let Some(action) = action {
+            self.act(event_loop, id, action);
+        }
+    }
+
     /// Records the documents made here that have just been written, so that they stay trusted wherever
     /// their files go.
     fn vouch(&mut self) {
@@ -3938,9 +3980,18 @@ impl ApplicationHandler<Event> for App {
             }
             self.fail(event_loop, failure);
         }
+        // The menus write the keys of the window's commands, so they wait for a window to ask.
+        if let Some(window) = self.windows.values().next() {
+            let proxy = self.proxy.clone();
+            self.bar = Bar::install(&window.view, move |place| drop(proxy.send_event(Event::Menu(place))));
+            self.bar_stale = true;
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // What a window offers changes with what is done in it, not with where the pointer is or a frame.
+        let passing = matches!(event, WindowEvent::CursorMoved { .. } | WindowEvent::RedrawRequested);
+        self.bar_stale |= !passing;
         let Self { windows, platform, mods, library, fonts, .. } = self;
         let Some(window) = windows.get_mut(&id) else { return };
         window.access.process_event(&window.window, &event);
@@ -4164,7 +4215,9 @@ impl ApplicationHandler<Event> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         let now = Instant::now();
+        self.bar_stale = true;
         match event {
+            Event::Menu(place) => self.menu(event_loop, place),
             Event::Beside(id, home, found) => {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.found_beside(&home, *found, &self.library);
@@ -4529,6 +4582,10 @@ impl ApplicationHandler<Event> for App {
         // A document that just became its own is trusted as its original was, before anything asks.
         if self.windows.values().any(|window| window.forked.is_some()) {
             self.vouch();
+        }
+        if let Some(bar) = self.bar.as_mut().filter(|_| std::mem::take(&mut self.bar_stale)) {
+            let front = self.windows.values().find(|window| window.window.has_focus());
+            bar.offer(|name| front.is_some_and(|window| window.view.offers(name)));
         }
         event_loop.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }

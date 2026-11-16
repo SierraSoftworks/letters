@@ -333,16 +333,30 @@ pub(crate) fn bound(event: &KeyEvent) -> Option<&'static Act> {
     KEYS.iter().find(|(key, _)| key == event).map(|(_, act)| act)
 }
 
-/// The key that does what a command does, as a menu writes it beside the command.
-pub(crate) fn shortcut(act: &Act, keymap: &Keymap, mac: bool) -> Option<String> {
-    let key = match act {
+/// The command the palette lists under `name`.
+pub(crate) fn named(name: &str) -> Option<&'static Entry> {
+    ENTRIES.iter().find(|entry| entry.name == name)
+}
+
+/// The names the palette lists its commands under, in its order: what a shell's own menus ask for them by.
+pub fn names() -> impl Iterator<Item = &'static str> {
+    ENTRIES.iter().map(|entry| entry.name)
+}
+
+/// The key that does what a command does: the one a menu writes beside the command.
+pub(crate) fn key<'a>(act: &Act, keymap: &'a Keymap, mac: bool) -> Option<&'a KeyEvent> {
+    match act {
         Act::Run(command) => keymap.key(command),
         act => {
             let mut keys = KEYS.iter().filter(|(_, bound)| bound == act).map(|(key, _)| key);
             if mac { keys.next_back() } else { keys.next() }
         }
-    };
-    key.map(|key| chord(key, mac))
+    }
+}
+
+/// The key that does what a command does, as a menu writes it beside the command.
+pub(crate) fn shortcut(act: &Act, keymap: &Keymap, mac: bool) -> Option<String> {
+    key(act, keymap, mac).map(|key| chord(key, mac))
 }
 
 /// A key as menus write it: `Ctrl+Shift+P`, or the signs a Mac's menus use.

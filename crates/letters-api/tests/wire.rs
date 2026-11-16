@@ -252,6 +252,10 @@ fn an_address_keeps_each_part_in_its_place() {
             paths::import("family", "House/2026", "Roof & co.md"),
             "/api/v1/spaces/family/import?path=House%2F2026&name=Roof%20%26%20co.md",
         ),
+        (
+            paths::import_file("family", "House/Roof & co.md"),
+            "/api/v1/spaces/family/files/import?path=House%2FRoof%20%26%20co.md",
+        ),
         (paths::own_source("img.example.org/a b"), "/api/v1/settings/sources/img.example.org%2Fa%20b"),
         (paths::export("doc 1", Export::Markdown), "/api/v1/documents/doc%201/export/md"),
     ];

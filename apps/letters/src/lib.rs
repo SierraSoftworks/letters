@@ -7,6 +7,7 @@
 //! - [`words`] keeps the person's own dictionary, [`trust`] what they trust, and [`settings`] what they set.
 //! - [`dictionaries`] finds the system's dictionaries for languages other than English, and [`fallback`]
 //!   its fonts for what the bundled ones cannot draw.
+//! - [`menus`] lists what the macOS menu bar offers, all of it commands the window already has.
 //! - [`measure`] checks the performance budgets, and [`baseline`] is the empty window it compares with.
 //! - [`convert`] runs the `export` and `import` subcommands, which need no window, and [`copies`] writes the
 //!   copies and exports a window asks for.
@@ -32,6 +33,7 @@ pub mod keychain;
 pub mod library;
 pub mod links;
 pub mod measure;
+pub mod menus;
 pub mod pictures;
 pub mod platform;
 pub mod present;

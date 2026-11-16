@@ -1,5 +1,6 @@
 //! The command palette: every action by name, from the keyboard.
 
+use letters_editor::Key;
 use letters_model::{Block, BlockKind, Change, Document, Note, Notes, Version};
 use letters_test::{Found, Harness, Role};
 use letters_ui::{Landing, PictureState, Request, SafeMode};
@@ -390,4 +391,40 @@ fn the_palette_waits_while_a_card_asks_what_to_open() {
     window.ui().set_landing(Some(Landing::default()));
     window.key("Mod+Shift+P");
     assert!(palette(&mut window).is_none(), "there is no document to act on yet");
+}
+
+#[test]
+fn a_shell_runs_a_command_by_its_name_where_the_palette_offers_it() {
+    // The command, whether it is offered with a word selected, and how the document reads once it was asked.
+    let cases = [
+        ("Heading 2", true, "## Roof first"),
+        ("Bold", true, "**Roof** first"),
+        ("Remove row", false, "Roof first"),
+        ("No such command", false, "Roof first"),
+    ];
+    for (name, offered, reads) in cases {
+        let mut window = line();
+        assert_eq!(window.ui().offers(name), offered, "{name:?}");
+        let mut platform = letters_test::TestPlatform::default();
+        assert_eq!(window.ui().run_command(name, &mut platform), offered, "{name:?}");
+        window.assert_markdown(reads);
+    }
+}
+
+#[test]
+fn a_shell_is_told_the_key_of_a_command_as_its_system_writes_it() {
+    let chord = |window: &mut Harness, name: &str| {
+        let key = window.ui().command_key(name)?;
+        Some((key.key, key.mods.primary, key.mods.shift, key.mods.alt))
+    };
+    let (mut standard, mut mac) = (line(), line().mac());
+    for name in letters_ui::command_names() {
+        assert_eq!(chord(&mut standard, name).is_some(), chord(&mut mac, name).is_some(), "{name:?}");
+    }
+    assert_eq!(chord(&mut standard, "Bold"), Some((Key::Char('b'), true, false, false)));
+    assert_eq!(chord(&mut standard, "Find and replace"), Some((Key::Char('h'), true, false, false)));
+    // A Mac hides the application on Cmd with H.
+    assert_eq!(chord(&mut mac, "Find and replace"), Some((Key::Char('f'), true, false, true)));
+    assert_eq!(chord(&mut standard, "Share"), None);
+    assert_eq!(chord(&mut standard, "No such command"), None);
 }

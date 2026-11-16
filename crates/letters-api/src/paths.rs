@@ -148,6 +148,13 @@ pub fn import(space: &str, folder: &str, name: &str) -> String {
     format!("{SPACES}/{}/import?path={}&name={}", segment(space), segment(folder), segment(name))
 }
 
+/// `POST`: makes a document of the Markdown or Word file at `path` in the space, a row tagged
+/// [`Tag::Unimported`](crate::Tag::Unimported), in the folder the file is in. The file is left as it is, and
+/// a Markdown file's pictures are read from its folder and the folders in it. Answers as [`import`] does.
+pub fn import_file(space: &str, path: &str) -> String {
+    format!("{SPACES}/{}/files/import?path={}", segment(space), segment(path))
+}
+
 /// `GET`: the document as [`Opened`](crate::Opened).
 pub fn document(id: &str) -> String {
     format!("{API}/documents/{}", segment(id))

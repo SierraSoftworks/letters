@@ -28,7 +28,7 @@ use crate::error::{Answer, Refusal};
 use crate::ids;
 use crate::library::{Row, untitled};
 use crate::session::{Carrier, Reader, Signed};
-use crate::spaces::{EXTENSION, Place, Root, seconds, shown};
+use crate::spaces::{EXTENSION, Place, Root, seconds, shown, unimported};
 use crate::store::Table;
 use crate::telemetry::Event;
 use crate::{App, Shared};
@@ -60,6 +60,7 @@ pub fn routes() -> Router<Shared> {
         .route("/api/v1/spaces/{space}/entries", get(entries))
         .route("/api/v1/spaces/{space}/documents", post(new_document))
         .route("/api/v1/spaces/{space}/import", post(import).layer(DefaultBodyLimit::max(limits.document as usize)))
+        .route("/api/v1/spaces/{space}/files/import", post(import_file))
         .route("/api/v1/spaces/{space}/folders", post(new_folder))
         .route("/api/v1/spaces/{space}/folders/rename", post(rename_folder))
         .route("/api/v1/spaces/{space}/folders/move", post(move_folder))
@@ -230,6 +231,23 @@ async fn import(
 ) -> Answer<Json<Entry>> {
     let file = body.map_err(|rejection| unread(rejection, "The file is larger than the server takes."))?;
     blocking(move || app.import(&who, &space, &brought.path, &brought.name, &file).map(Json)).await
+}
+
+/// The file in a space to make a document of.
+#[derive(Deserialize)]
+struct Kept {
+    #[serde(default)]
+    path: String,
+}
+
+/// `POST`: makes a document of a Markdown or Word file the space keeps.
+async fn import_file(
+    State(app): State<Shared>,
+    who: Signed,
+    Path(space): Path<String>,
+    Query(kept): Query<Kept>,
+) -> Answer<Json<Entry>> {
+    blocking(move || app.import_file(&who, &space, &kept.path).map(Json)).await
 }
 
 async fn new_folder(
@@ -576,17 +594,57 @@ impl App {
         let (space, role) = self.space(who, space)?;
         let (root, place) = (self.root(who, space)?, Place::parse(folder)?);
         let told = space.told(role);
-        let mut rows = self.library.list(&self.store, &root, &place)?;
+        let mut entries = self.held(who, &told, &root, &place)?;
         let mut read = 0;
-        while deep && read < rows.len() {
-            let folders: Vec<Place> =
-                rows[read..].iter().filter(|row| row.listed.folder).map(|row| row.place.clone()).collect();
-            read = rows.len();
+        while deep && read < entries.len() {
+            let folders: Vec<String> = entries[read..]
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::Folder)
+                .map(|entry| entry.path.clone())
+                .collect();
+            read = entries.len();
             // A folder that cannot be read, or went away meanwhile, holds nothing to find.
-            rows.extend(folders.iter().filter_map(|at| self.library.list(&self.store, &root, at).ok()).flatten());
+            let held = |at: &String| self.held(who, &told, &root, &Place::parse(at).ok()?).ok();
+            entries.extend(folders.iter().filter_map(held).flatten());
         }
-        let entries = rows.iter().map(|row| self.told(who, placed(&told, row), &root, row)).collect();
         Ok(Listing { space: told, path: place.as_str().to_owned(), entries })
+    }
+
+    /// What one folder of a space holds, as a file table of the space shows it.
+    fn held(&self, who: &Signed, told: &Space, root: &Root, place: &Place) -> Answer<Vec<Entry>> {
+        let rows = self.library.list(&self.store, root, place)?;
+        let mut entries: Vec<Entry> = rows.iter().map(|row| self.told(who, placed(told, row), root, row)).collect();
+        // What could be a document and is none yet is listed among the documents, and under the document
+        // of its name where there is one: the same writing in another format.
+        let mut under = Vec::new();
+        for file in root.folder(place)?.loose()? {
+            let stem = unimported(&file.name).unwrap_or_default();
+            let read = |row: &Row| row.known.as_ref().is_some_and(|known| known.id.is_some());
+            let beside = rows.iter().find(|row| !row.listed.folder && read(row) && shown(&row.listed.name) == stem);
+            let entry = Entry {
+                kind: EntryKind::Document,
+                name: file.name.clone(),
+                space: Some(told.id.clone()),
+                path: place.child(&file.name)?.as_str().to_owned(),
+                id: None,
+                created: None,
+                modified: seconds(file.stamp),
+                role: told.role,
+                contributors: Vec::new(),
+                tags: vec![Tag::Unimported { beside: beside.map(|row| row.place.as_str().to_owned()) }],
+            };
+            match beside {
+                Some(row) => under.push((row.place.as_str().to_owned(), entry)),
+                None => entries.push(entry),
+            }
+        }
+        // Folders stay first, and the rest by the name shown, as the folder was listed.
+        entries.sort_by_cached_key(|entry| (entry.kind != EntryKind::Folder, shown(&entry.name).to_lowercase()));
+        for (beside, entry) in under.into_iter().rev() {
+            let at = entries.iter().position(|above| above.path == beside).map_or(entries.len(), |at| at + 1);
+            entries.insert(at, entry);
+        }
+        Ok(entries)
     }
 
     /// The row of the file at `place` in a folder.
