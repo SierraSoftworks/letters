@@ -22,7 +22,7 @@ pub mod wayland;
 #[cfg(target_os = "macos")]
 pub use cloud::fetch_cloud_files;
 #[cfg(target_os = "macos")]
-pub use macos::{lights, set_dock_icon, unify_title_bar};
+pub use macos::{lights, name_process, set_dock_icon, unify_title_bar};
 pub use map::{Mapped, map_font};
 #[cfg(target_os = "macos")]
 pub use print::print_pdf;
@@ -44,6 +44,10 @@ pub fn set_dock_icon(_png: &[u8]) -> bool {
 pub fn print_pdf(_window: &impl raw_window_handle::HasWindowHandle, _pdf: &[u8], _title: &str) -> bool {
     false
 }
+
+/// Only macOS names an app in its menu bar after the process. Nothing changes.
+#[cfg(not(target_os = "macos"))]
+pub fn name_process(_name: &str) {}
 
 /// Only macOS has the title bar this asks for. Nothing changes, and `None` says so.
 #[cfg(not(target_os = "macos"))]

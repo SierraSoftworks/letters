@@ -277,6 +277,8 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
 /// Builds the event loop. A `background` app does not come to the front, so a run that only measures takes
 /// no keystrokes from whatever the user is typing into.
 pub(crate) fn event_loop<T: 'static>(background: bool) -> Result<EventLoop<T>, EventLoopError> {
+    // Run from outside its bundle, the app would be called by its file's name in the menu bar.
+    letters_frame::name_process(NAME);
     let mut builder = EventLoop::<T>::with_user_event();
     #[cfg(target_os = "macos")]
     if background {
@@ -315,6 +317,9 @@ pub(crate) fn window_attributes(event_loop: &ActiveEventLoop) -> WindowAttribute
     };
     attributes.with_decorations(Host::HERE != Host::Linux)
 }
+
+/// What the app is called where a person reads its name.
+pub const NAME: &str = "Letters";
 
 /// The name a desktop knows Letters by: its desktop entry on Linux and its bundle on macOS carry the same.
 pub const APP_ID: &str = "com.sierrasoftworks.Letters";
