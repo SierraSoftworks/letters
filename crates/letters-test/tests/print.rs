@@ -265,7 +265,7 @@ fn keys_and_the_wheel_move_through_the_sheets() {
 #[test]
 fn nothing_is_written_in_print_view() {
     let before = "Part 1 of the plan\n\nPart 2 of the plan";
-    for key in ["x", "Backspace", "Delete", "Enter", "Mod+B", "Mod+V", "Mod+X", "Mod+K", "Mod+Shift+P"] {
+    for key in ["x", "Backspace", "Delete", "Enter", "Mod+B", "Mod+V", "Mod+X", "Mod+K"] {
         let mut window = paged(2);
         window.select("Part 2").key("Mod+P").key(key);
         assert!(printing(&mut window), "{key}");

@@ -100,11 +100,11 @@ pub static BAR: [Menu; 8] = [
     Menu {
         title: "File",
         items: &[
-            Pressed("New Document", held('n', false)),
-            Pressed("Open\u{2026}", held('o', false)),
+            Command("New Document", "New document"),
+            Command("Open\u{2026}", "Open"),
             Rule,
-            Pressed("Close Window", held('w', false)),
-            Pressed("Save", held('s', false)),
+            Command("Close Window", "Close window"),
+            Command("Save", "Save"),
             Command("Save a Copy\u{2026}", "Save a copy"),
             Command("Rename or Move\u{2026}", "Rename or move"),
             Rule,
@@ -221,7 +221,7 @@ pub static BAR: [Menu; 8] = [
         ],
     },
     // macOS puts the field that searches the menus here.
-    Menu { title: HELP, items: &[] },
+    Menu { title: HELP, items: &[Command("Keyboard Shortcuts", "Keyboard shortcuts")] },
 ];
 
 /// The menu macOS lists the open windows in.

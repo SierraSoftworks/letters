@@ -301,6 +301,9 @@ fn a_press_on_what_is_selected_keeps_it_and_one_elsewhere_moves_the_caret() {
     window.key("Escape");
 
     window.select("Last").menu_key().assert_open(Role::Menu, MENU);
+    // So does the key that is bound to it, for a keyboard without a Menu key.
+    window.key("Escape").assert_closed(Role::Menu, MENU);
+    window.key("Mod+.").assert_open(Role::Menu, MENU);
 }
 
 #[test]

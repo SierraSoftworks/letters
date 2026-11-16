@@ -110,6 +110,9 @@ pub enum Request {
     ToggleMaximise,
     /// Close the window.
     Close,
+    /// End the application, as its own key does. Asked only of a shell that said it is one with
+    /// `Window::set_application`.
+    Quit,
     /// The person asked to print the document, from Print view: hand what the PDF export writes to the
     /// system's print dialog, or to the browser's.
     Print,

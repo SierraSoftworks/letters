@@ -185,7 +185,9 @@ fn a_command_shows_the_key_that_does_the_same() {
     // A command, its key on Linux and Windows, and on a Mac.
     let cases = [
         ("Bold", Some("Ctrl+B"), Some("\u{2318}B")),
-        ("Heading 1", Some("Ctrl+Alt+1"), Some("\u{2325}\u{2318}1")),
+        ("Heading 1", None, None),
+        ("Open", Some("Ctrl+O"), Some("\u{2318}O")),
+        ("New document", None, None),
         ("Link", Some("Ctrl+K"), Some("\u{2318}K")),
         ("Save a copy", Some("Ctrl+Shift+S"), Some("\u{21e7}\u{2318}S")),
         ("Share", None, None),
@@ -427,4 +429,56 @@ fn a_shell_is_told_the_key_of_a_command_as_its_system_writes_it() {
     assert_eq!(chord(&mut mac, "Find and replace"), Some((Key::Char('f'), true, false, true)));
     assert_eq!(chord(&mut standard, "Share"), None);
     assert_eq!(chord(&mut standard, "No such command"), None);
+}
+
+#[test]
+fn the_keys_that_open_and_close_windows_are_an_applications() {
+    // Whether the shell is an application, the key, and what the window asks of the shell for it.
+    let cases = [
+        (false, "Mod+O", Some(Request::OpenDialog)),
+        (true, "Mod+O", Some(Request::OpenDialog)),
+        (true, "Mod+N", Some(Request::New)),
+        (true, "Mod+W", Some(Request::Close)),
+        (true, "Mod+Q", Some(Request::Quit)),
+        (false, "Mod+W", None),
+        (false, "Mod+Q", None),
+    ];
+    for (application, key, asks) in cases {
+        let mut window = line();
+        window.ui().set_application(application);
+        window.ui().take_requests();
+        window.key(key);
+        let asked = window.ui().take_requests();
+        assert_eq!(asked, Vec::from_iter(asks), "{key}, application: {application}");
+    }
+    // The palette offers to close and to quit, and writes the keys, only for an application.
+    for application in [false, true] {
+        let mut window = line();
+        window.ui().set_application(application);
+        window.key("Mod+Shift+P");
+        let listed = listed(&mut window);
+        let key = |name: &str| listed.iter().find(|found| found.name == name).map(|found| found.description.clone());
+        assert_eq!(key("Quit").is_some(), application);
+        assert_eq!(key("Close window").is_some(), application);
+        assert_eq!(key("New document").flatten().is_some(), application, "a browser keeps the key for a new window");
+    }
+}
+
+#[test]
+fn a_key_steps_through_the_conflicts() {
+    let mut window = conflicted(0);
+    assert!(window.find(Role::Button, "Keep this version").is_none());
+    window.key("F8");
+    assert!(window.find(Role::Button, "Keep this version").is_some(), "F8 opens the first conflict");
+    assert_eq!(window.ui().command_key("Previous conflict").map(|key| key.mods.shift), Some(true));
+}
+
+#[test]
+fn print_view_offers_the_commands_that_ask_nothing_of_the_page() {
+    let mut window = line();
+    window.key("Mod+P").key("Mod+Shift+P");
+    assert!(palette(&mut window).is_some(), "the palette opens over the sheets");
+    let names = names(&mut window);
+    assert!(names.iter().any(|name| name == "Settings"), "{names:?}");
+    assert!(!names.iter().any(|name| name == "Bold"), "nothing is written in Print view: {names:?}");
 }

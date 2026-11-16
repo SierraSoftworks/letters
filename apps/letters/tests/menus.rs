@@ -11,6 +11,7 @@ use letters_ui::{Keys, Window};
 fn window() -> Window {
     let mut window = Window::new(Editor::new(Document::default(), ReplicaId::from(1)));
     window.set_keys(Keys::Mac);
+    window.set_application(true);
     window
 }
 

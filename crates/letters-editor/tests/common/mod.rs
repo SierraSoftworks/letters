@@ -721,7 +721,6 @@ pub fn action() -> impl Strategy<Value = Action> {
         "Shift+Tab",
         "Mod+b",
         "Mod+i",
-        "Mod+e",
         "Mod+Shift+x",
         "Mod+u",
         "Mod+z",

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use letters_editor::{Editor, InputEvent, Key, KeyEvent, Picture, Platform as _};
+use letters_editor::{Editor, InputEvent, KeyEvent, Picture, Platform as _};
 use letters_format::WorkingCopy;
 use letters_frame::Lights;
 use letters_model::{BlockId, Change, Model, Notes, ReplicaId, Revision, Selection, Style, TagKind};
@@ -902,16 +902,15 @@ enum Action {
     Quit,
 }
 
+/// What a key asks of the app when the window had no use for it: the window binds these keys, and asks
+/// for them itself wherever it can.
 fn shortcut(event: &KeyEvent) -> Option<Action> {
-    if !event.mods.primary || event.mods.alt || event.mods.shift {
-        return None;
-    }
-    Some(match event.key {
-        Key::Char('n') => Action::New,
-        Key::Char('o') => Action::Open(None),
-        Key::Char('s') => Action::Save,
-        Key::Char('w') => Action::Close,
-        Key::Char('q') => Action::Quit,
+    Some(match letters_ui::command_of_key(event)? {
+        "New document" => Action::New,
+        "Open" => Action::Open(None),
+        "Save" => Action::Save,
+        "Close window" => Action::Close,
+        "Quit" => Action::Quit,
         _ => return None,
     })
 }
@@ -2439,6 +2438,7 @@ impl App {
             linked: BTreeMap::new(),
             held: BTreeMap::new(),
         };
+        window.view.set_application(true);
         window.view.set_reduced_motion(self.reduced_motion);
         if let Some(minutes) = self.offset {
             window.view.set_utc_offset(minutes);
@@ -2587,6 +2587,7 @@ impl App {
                     self.copy_or_say(id, Some(revision), &name, format, folder.as_deref(), replace);
                 }
                 Request::Close => self.act(event_loop, id, Action::Close),
+                Request::Quit => self.act(event_loop, id, Action::Quit),
                 Request::DragWindow
                 | Request::ResizeWindow(_)
                 | Request::WindowMenu(_)

@@ -90,6 +90,10 @@ pub(crate) enum Act {
     Panel(Panel),
     NewDocument,
     Open,
+    /// Closes the window, where the shell is an application with windows of its own.
+    CloseWindow,
+    /// Ends the application, where the shell is one.
+    Quit,
     Rename,
     /// Asks the shell to save the document, where it does so only when asked.
     Save,
@@ -137,6 +141,10 @@ pub(crate) enum Act {
     },
     /// Shows the palette itself. It is not one of its own commands.
     Palette,
+    /// Shows the sheet of the keys that do things, or puts it away.
+    Shortcuts,
+    /// Opens the menu about what is at the caret, as the secondary button does where it is pressed.
+    Menu,
 }
 
 /// A command of the palette.
@@ -178,7 +186,7 @@ const fn callout(name: &'static str, also: &'static str, edit: CalloutEdit) -> E
 
 /// Every command, in the order the palette lists them: what belongs to the thing the caret is on comes
 /// first. Names are told apart by the list, so no two are the same.
-pub(crate) static ENTRIES: [Entry; 106] = [
+pub(crate) static ENTRIES: [Entry; 110] = [
     entry("Conflict", "Keep this version", "choose page later settle resolve", Act::Review(Reviewing::Keep)),
     entry("Conflict", "Use the other version", "choose held back earlier trade swap", Act::Review(Reviewing::Use)),
     entry("Conflict", "Close conflict", "leave undecided later", Act::Review(Reviewing::Close)),
@@ -254,10 +262,12 @@ pub(crate) static ENTRIES: [Entry; 106] = [
     run("Edit", "Select all", "", Command::SelectAll),
     entry("Edit", "Next spelling mistake", "misspelled word typo check", Act::Misspelling { back: false }),
     entry("Edit", "Previous spelling mistake", "misspelled word typo check", Act::Misspelling { back: true }),
+    entry("Edit", "Menu at the caret", "context right click secondary", Act::Menu),
     entry("Edit", "Find", "search look for text", Act::Find),
     entry("Edit", "Find and replace", "search substitute change text", Act::Replace),
     entry("Edit", "Find next", "search result", Act::FindStep { back: false }),
     entry("Edit", "Find previous", "search result", Act::FindStep { back: true }),
+    entry("View", "Keyboard shortcuts", "keys hotkeys bindings cheat sheet help", Act::Shortcuts),
     entry("View", "Styles panel", "show hide fonts page", Act::Panel(Panel::Styles)),
     entry("View", "Notes panel", "show hide comments", Act::Panel(Panel::Notes)),
     entry("View", "History", "versions earlier before rewind restore", Act::History),
@@ -270,6 +280,8 @@ pub(crate) static ENTRIES: [Entry; 106] = [
     entry("View", "Previous conflict", "changed two places choice", Act::Review(Reviewing::Step { back: true })),
     entry("Document", "New document", "create", Act::NewDocument),
     entry("Document", "Open", "file", Act::Open),
+    entry("Document", "Close window", "", Act::CloseWindow),
+    entry("Document", "Quit", "exit leave end", Act::Quit),
     entry("Document", "Rename or move", "name folder", Act::Rename),
     entry("Document", "Save", "keep write file download", Act::Save),
     entry("Document", "Save a copy", "duplicate", Act::SaveCopy),
@@ -293,7 +305,7 @@ const PRIMARY_ALT: Modifiers = Modifiers { primary: true, shift: false, alt: tru
 
 /// The keys the window binds itself, for what is no command of the editor's. Where a command has two, the
 /// second is the one a Mac's menus write: there the system keeps Cmd with H to hide the application.
-static KEYS: [(KeyEvent, Act); 16] = [
+static KEYS: [(KeyEvent, Act); 24] = [
     (
         KeyEvent { key: Key::F(7), mods: Modifiers { primary: false, shift: false, alt: false } },
         Act::Misspelling { back: false },
@@ -302,8 +314,22 @@ static KEYS: [(KeyEvent, Act); 16] = [
         KeyEvent { key: Key::F(7), mods: Modifiers { primary: false, shift: true, alt: false } },
         Act::Misspelling { back: true },
     ),
+    (
+        KeyEvent { key: Key::F(8), mods: Modifiers { primary: false, shift: false, alt: false } },
+        Act::Review(Reviewing::Step { back: false }),
+    ),
+    (
+        KeyEvent { key: Key::F(8), mods: Modifiers { primary: false, shift: true, alt: false } },
+        Act::Review(Reviewing::Step { back: true }),
+    ),
+    (KeyEvent { key: Key::Char('n'), mods: PRIMARY }, Act::NewDocument),
+    (KeyEvent { key: Key::Char('o'), mods: PRIMARY }, Act::Open),
+    (KeyEvent { key: Key::Char('w'), mods: PRIMARY }, Act::CloseWindow),
+    (KeyEvent { key: Key::Char('q'), mods: PRIMARY }, Act::Quit),
     (KeyEvent { key: Key::Char('p'), mods: PRIMARY_SHIFT }, Act::Palette),
     (KeyEvent { key: Key::Char('p'), mods: PRIMARY }, Act::Print),
+    (KeyEvent { key: Key::Char('/'), mods: PRIMARY }, Act::Shortcuts),
+    (KeyEvent { key: Key::Char('.'), mods: PRIMARY }, Act::Menu),
     (KeyEvent { key: Key::Char('k'), mods: PRIMARY }, Act::Link),
     (KeyEvent { key: Key::Char('m'), mods: PRIMARY_ALT }, Act::Comment),
     (KeyEvent { key: Key::PageDown, mods: PRIMARY_ALT }, Act::Note { back: false }),
@@ -343,6 +369,30 @@ pub fn names() -> impl Iterator<Item = &'static str> {
     ENTRIES.iter().map(|entry| entry.name)
 }
 
+/// The name the palette lists the command under that a key of the window's does. A shell that answers
+/// some commands itself reads its keys here, so that they are bound in one place.
+pub fn of_key(event: &KeyEvent) -> Option<&'static str> {
+    bound(event).and_then(entry_of).map(|entry| entry.name)
+}
+
+/// Whether a command is an application's alone: a page in a browser has no windows to open or close, and
+/// the browser keeps the keys for them.
+pub(crate) fn of_application(act: &Act) -> bool {
+    matches!(act, Act::NewDocument | Act::CloseWindow | Act::Quit)
+}
+
+/// Whether a command is offered while an earlier version or Print view has the page's place: what asks
+/// nothing of the page.
+pub(crate) fn apart(act: &Act) -> bool {
+    let window = matches!(act, Act::Settings | Act::Shortcuts | Act::Save | Act::SaveCopy);
+    window || matches!(act, Act::NewDocument | Act::Open | Act::CloseWindow | Act::Quit)
+}
+
+/// Every command with its group and its name, in the palette's order.
+pub(crate) fn listed() -> impl Iterator<Item = (&'static str, &'static str, &'static Act)> {
+    ENTRIES.iter().map(|entry| (entry.group, entry.name, &entry.act))
+}
+
 /// The key that does what a command does: the one a menu writes beside the command.
 pub(crate) fn key<'a>(act: &Act, keymap: &'a Keymap, mac: bool) -> Option<&'a KeyEvent> {
     match act {
@@ -360,7 +410,7 @@ pub(crate) fn shortcut(act: &Act, keymap: &Keymap, mac: bool) -> Option<String> 
 }
 
 /// A key as menus write it: `Ctrl+Shift+P`, or the signs a Mac's menus use.
-fn chord(event: &KeyEvent, mac: bool) -> String {
+pub(crate) fn chord(event: &KeyEvent, mac: bool) -> String {
     let either = |standard: &str, sign: &str| (if mac { sign } else { standard }).to_owned();
     let key = match event.key {
         Key::Char(c) => c.to_uppercase().collect(),
@@ -446,7 +496,7 @@ impl Commands {
         &self,
         offers: &[(&'static Entry, Message)],
         keymap: &Keymap,
-        mac: bool,
+        (mac, application): (bool, bool),
         top: f32,
         window: Size,
     ) -> Element<Message> {
@@ -472,7 +522,9 @@ impl Commands {
                     options = options.heading(group);
                 }
                 let mut choice = Choice::new(entry.name).on_take(send(Commanding::Take(index)));
-                if let Some(keys) = shortcut(&entry.act, keymap, mac) {
+                // A browser keeps the keys that open and close its windows.
+                let keys = shortcut(&entry.act, keymap, mac).filter(|_| application || !of_application(&entry.act));
+                if let Some(keys) = keys {
                     choice = choice.aside(keys, quiet);
                 }
                 options = options.choice(choice);
@@ -575,7 +627,7 @@ mod tests {
         let cases = [
             (key(Key::Char('b'), true, false, false), "Ctrl+B", "\u{2318}B"),
             (key(Key::Char('p'), true, true, false), "Ctrl+Shift+P", "\u{21e7}\u{2318}P"),
-            (key(Key::Char('1'), true, false, true), "Ctrl+Alt+1", "\u{2325}\u{2318}1"),
+            (key(Key::Char('m'), true, false, true), "Ctrl+Alt+M", "\u{2325}\u{2318}M"),
             (key(Key::Tab, false, true, false), "Shift+Tab", "\u{21e7}\u{21e5}"),
             (key(Key::Left, false, false, true), "Alt+\u{2190}", "\u{2325}\u{2190}"),
             (key(Key::Enter, true, false, false), "Ctrl+Enter", "\u{2318}\u{21a9}"),
@@ -601,6 +653,9 @@ mod tests {
             (Act::FindStep { back: true }, Some("Ctrl+Shift+G")),
             (Act::Comment, Some("Ctrl+Alt+M")),
             (Act::Note { back: true }, Some("Ctrl+Alt+Page Up")),
+            (Act::Review(Reviewing::Step { back: true }), Some("Shift+F8")),
+            (Act::Open, Some("Ctrl+O")),
+            (Act::Menu, Some("Ctrl+.")),
             (Act::Share, None),
         ];
         for (act, key) in cases {

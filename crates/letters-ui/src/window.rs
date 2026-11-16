@@ -68,6 +68,7 @@ use crate::seen::{Seeing, Seen};
 use crate::servers::{Server, Servers, SignIn, Signing};
 use crate::settings::{Dialog, Setting, Settings};
 use crate::sharing::{Share, Shared, Sharing};
+use crate::shortcuts;
 use crate::spelling::Spelling;
 use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::styles::{self, Styles, Styling};
@@ -290,6 +291,8 @@ pub enum Message {
     Settings(Setting),
     /// What the dialog about the document's language and a passage's asks.
     Written(Writing),
+    /// Shows the sheet of the keys that do things, or puts it away.
+    Shortcuts(bool),
     /// What is asked about what others wrote since the person's last visit.
     Seen(Seeing),
     /// What the menu on a linked picture's cloud asks for.
@@ -1197,6 +1200,13 @@ impl Ui<EditorApp> {
         self.app_mut().editor.document_at(revision).ok()
     }
 
+    /// Says that the shell is an application with windows of its own: the palette then offers to close
+    /// the window and to quit, and writes the keys for them and for a new document, which a browser
+    /// keeps to itself. The window asks [`Request::Close`] and [`Request::Quit`] for them.
+    pub fn set_application(&mut self, application: bool) {
+        self.app_mut().application = application;
+    }
+
     /// The key that does the command the palette lists under `name` (see [`crate::command_names`]), for a
     /// shell whose own menus write it beside the command. `None` for a command without one.
     pub fn command_key(&self, name: &str) -> Option<KeyEvent> {
@@ -1410,6 +1420,10 @@ pub struct EditorApp {
     listed: Option<String>,
     /// Whether the dialog about the language of the document and of a passage is out.
     written: bool,
+    /// Whether the sheet of the keys that do things shows.
+    shortcuts: bool,
+    /// Whether the shell is an application with windows of its own to open, close and quit.
+    application: bool,
     servers: Servers,
     browser: Browser,
     /// The address in the link editor while it is open.
@@ -1534,6 +1548,8 @@ impl EditorApp {
             past: true,
             listed: None,
             written: false,
+            shortcuts: false,
+            application: false,
             servers: Servers::default(),
             browser: Browser::default(),
             link: None,
@@ -2328,8 +2344,10 @@ impl EditorApp {
         let reads = match act {
             Act::Run(_) | Act::Load | Act::AlwaysLoad | Act::Panel(Panel::Notes) | Act::Review(_) => true,
             Act::NewDocument | Act::Open | Act::SaveCopy | Act::Export | Act::CleanCopy => true,
+            Act::CloseWindow | Act::Quit => true,
             Act::Settings | Act::Servers | Act::TrustDocument | Act::TrustFolder | Act::Print => true,
-            Act::Find | Act::FindStep { .. } | Act::Palette | Act::Note { .. } => true,
+            Act::Find | Act::FindStep { .. } | Act::Palette | Act::Shortcuts | Act::Note { .. } => true,
+            Act::Menu => true,
             Act::Comment => !self.margin.reads,
             Act::MoveRow { .. } | Act::MoveColumn { .. } | Act::Link | Act::Pictures | Act::Preview => false,
             Act::CardAsLink => false,
@@ -2410,6 +2428,8 @@ impl EditorApp {
             Act::Panel(panel) => Message::Panel(*panel),
             Act::NewDocument => Message::NewDocument,
             Act::Open => Message::OpenDialog,
+            Act::CloseWindow => self.application.then_some(Message::Ask(Request::Close))?,
+            Act::Quit => self.application.then_some(Message::Ask(Request::Quit))?,
             Act::Rename => Message::Rename(Rename::Open),
             // Only where the shell keeps the document when asked, and has something to keep.
             Act::Save => (self.save == SaveState::Edited).then_some(Message::Ask(Request::Save))?,
@@ -2450,6 +2470,13 @@ impl EditorApp {
                 fits.then(|| Message::Review(asked.clone()))?
             }
             Act::Palette => (!self.carded()).then_some(Message::Commands(Commanding::Toggle))?,
+            Act::Shortcuts => Message::Shortcuts(!self.shortcuts),
+            // The menu hangs from the middle of the caret, where the Menu key opens it too.
+            Act::Menu => {
+                let caret = self.head().filter(|_| editor.picture().is_none() && !self.away() && !self.carded())?;
+                let caret = self.onto(caret);
+                Message::Pointer(Pointer::Menu { at: Point { x: caret.x, y: caret.y + caret.height / 2.0 } })
+            }
             // Text is found on the page, so only while the page shows.
             Act::Find | Act::Replace => {
                 let open = Finding::Open { replace: *act == Act::Replace };
@@ -2757,7 +2784,7 @@ impl EditorApp {
     fn history_key(&mut self, event: &KeyEvent, platform: &mut dyn Platform) -> bool {
         // Saving where it is asked for writes nothing on the document, and is asked from here as well. So
         // is a copy, which is of the version that shows.
-        let kept = commands::bound(event).filter(|act| matches!(act, Act::Save | Act::SaveCopy));
+        let kept = commands::bound(event).filter(|act| **act == Act::Palette || commands::apart(act));
         if let Some(asked) = kept.and_then(|act| self.asked(act)) {
             self.update(asked, platform);
             return true;
@@ -2885,7 +2912,7 @@ impl EditorApp {
         }
         let asked = match commands::bound(event) {
             Some(Act::Print) => Some(Message::Print(Printing::Print)),
-            Some(act @ (Act::Settings | Act::Save | Act::SaveCopy)) => self.asked(act),
+            Some(act) if *act == Act::Palette || commands::apart(act) => self.asked(act),
             _ => None,
         };
         let bound = asked.is_some();
@@ -2920,7 +2947,10 @@ impl EditorApp {
     /// The commands the palette lists: those that what is typed finds and that have something to act on,
     /// each with what it asks.
     fn offers(&self) -> Vec<(&'static Entry, Message)> {
-        self.commands.matching().filter_map(|entry| Some((entry, self.asked(&entry.act)?))).collect()
+        // While an earlier version or Print view shows, only what asks nothing of the page.
+        let apart = self.away();
+        let fits = |entry: &&Entry| !apart || commands::apart(&entry.act);
+        self.commands.matching().filter(fits).filter_map(|entry| Some((entry, self.asked(&entry.act)?))).collect()
     }
 
     /// Puts away the dialogs that lie over the middle of the window. A key or a command can ask for one
@@ -2928,6 +2958,7 @@ impl EditorApp {
     fn undialog(&mut self) {
         self.dialog.update(Setting::Close, &mut self.settings);
         self.written = false;
+        self.shortcuts = false;
         self.share.close();
         self.servers.close();
         self.browser.close();
@@ -4892,6 +4923,12 @@ impl EditorApp {
                     .aside(keys(Act::Palette))
                     .on_select(Message::Commands(Commanding::Toggle)),
             )
+            .item(
+                MenuItem::new("Keyboard shortcuts")
+                    .icon(icon::KEYBOARD)
+                    .aside(keys(Act::Shortcuts))
+                    .on_select(Message::Shortcuts(true)),
+            )
             .separator()
             .item(MenuItem::new("New document").icon(icon::PLUS).on_select(Message::NewDocument))
             .item(MenuItem::new("Open").icon(icon::FOLDER_OPEN).on_select(Message::OpenDialog))
@@ -5654,6 +5691,10 @@ impl EditorApp {
                 }
                 self.servers.update(asked, platform, &mut self.requests);
             }
+            Message::Shortcuts(show) => {
+                self.undialog();
+                self.shortcuts = show;
+            }
             Message::Written(asked) => match asked {
                 Writing::Show => {
                     // The language is said of the page, so not while another view or a card has its place.
@@ -5944,10 +5985,12 @@ impl App for EditorApp {
             written::view(&told)
         });
         let over = over.chain(written);
+        let keys = self.shortcuts.then(|| shortcuts::view(self.editor.keymap(), (self.mac, self.application), window));
+        let over = over.chain(keys);
         let over = over.chain(self.browser.view(self.servers.signed_in(), window.width));
         let commands = self.commands.open().then(|| {
             let (offers, keymap) = (self.offers(), self.editor.keymap());
-            self.commands.view(&offers, keymap, self.mac, bar, window)
+            self.commands.view(&offers, keymap, (self.mac, self.application), bar, window)
         });
         let over = over.chain(commands);
         // It comes first, so that whatever else opens lies over it and is the first that Escape puts away.
