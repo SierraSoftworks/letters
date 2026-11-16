@@ -462,6 +462,12 @@ fn notes_what_a_read_simplified() {
             &[r#"bullet/0 "a""#, r#"code:- "code""#, r#"bullet/0 "b""#, "quote", r#"  p "q""#],
             &[1, 3],
         ),
+        // A caption that leaves a list item for its picture is no block to note anything on.
+        (
+            "<figure><img src='https://e.com/a.png'><ul><li>one<figcaption>Two</figcaption></li></ul></figure>",
+            &[r#"figure https://e.com/a.png [] "Two""#, r#"bullet/0 "one""#],
+            &[],
+        ),
         (
             "<h1>Plain</h1><p>text</p><ul><li>item</li></ul>",
             &[r#"h1 "Plain""#, r#"p "text""#, r#"bullet/0 "item""#],

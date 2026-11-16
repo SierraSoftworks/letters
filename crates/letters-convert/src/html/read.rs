@@ -693,6 +693,8 @@ impl Reader<'_> {
                 (BlockKind::Caption, Body::Text(runs)) if pictured => {
                     caption.extend((!caption.is_empty()).then(|| Run::plain("\n")));
                     caption.append(runs);
+                    // Its text is the picture's now, and what was noted on the block goes with the block.
+                    self.notes.retain(|note| note.block != part.id.as_str());
                 }
                 (BlockKind::Caption, _) => rest.push(Block { kind: BlockKind::Paragraph, ..part }),
                 _ => rest.push(part),
