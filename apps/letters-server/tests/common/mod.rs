@@ -62,8 +62,9 @@ impl Drop for Scratch {
     }
 }
 
-/// The settings every test starts from: each person's own space, and one the `family` group edits, the
-/// `friends` group reads and the `reviewers` group comments in. `oidc` is what else to say of the provider.
+/// The settings every test starts from: each person's own space, and one the `parents` group owns, the
+/// `family` group edits, the `friends` group reads and the `reviewers` group comments in. `oidc` is what
+/// else to say of the provider.
 pub fn settings(scratch: &Path, issuer: &str, oidc: &str) -> String {
     // In literal strings below: a path on Windows has backslashes, which a basic string reads as escapes.
     let at = scratch.display();
@@ -86,6 +87,7 @@ path = '{at}/home/{{username}}'
 [[space]]
 name = "Family"
 path = '{at}/family'
+owners = ["parents"]
 editors = ["family"]
 commenters = ["reviewers"]
 readers = ["friends"]

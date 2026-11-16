@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use letters_api::{Entry, Grant, Grantee, Person, Role, Shares, paths};
+use letters_api::{Entry, Grant, Grantee, Person, Role, Shares, SpaceKind, paths};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{Found, blocking};
@@ -23,7 +23,7 @@ use crate::session::{PEOPLE, Reader, Signed};
 use crate::spaces::{Place, Root};
 use crate::store::Table;
 use crate::telemetry::Event;
-use crate::{App, Shared};
+use crate::{App, Shared, config};
 
 /// What is kept of a document's shares.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,8 +204,8 @@ impl App {
         let mut people: Vec<&Person> = seen.iter().map(|(_, seen)| &seen.person).collect();
         people.retain(|person| person.id != who.person.id);
         people.sort_by_cached_key(|person| (person.name.to_lowercase(), person.id.clone()));
-        let named = self.config.spaces.iter().flat_map(|space| [&space.editors, &space.commenters, &space.readers]);
-        let mut groups: Vec<&String> = named.chain(seen.iter().map(|(_, seen)| &seen.groups)).flatten().collect();
+        let named = self.config.spaces.iter().flat_map(config::Space::groups);
+        let mut groups: Vec<&String> = named.chain(seen.iter().flat_map(|(_, seen)| &seen.groups)).collect();
         groups.sort();
         groups.dedup();
         let people =
@@ -262,7 +262,7 @@ impl App {
     /// space of several keeps.
     fn told_shares(&self, who: &Signed, id: &str, found: &Found, kept: Kept) -> Answer<Shares> {
         let mut people = Vec::new();
-        if found.space.as_ref().is_some_and(|space| space.role == Role::Owner) {
+        if found.space.as_ref().is_some_and(|space| space.kind == SpaceKind::Personal) {
             let owner = Grantee::Person { id: who.person.id.clone(), name: who.person.name.clone() };
             people.push(Grant { to: owner, role: Role::Owner });
         }

@@ -246,13 +246,16 @@ async fn a_folder_is_renamed_moved_and_thrown_away_with_what_it_holds() {
 async fn what_is_thrown_away_is_listed_and_put_back_by_whoever_edits_its_space() {
     let server = Server::new("trash-listed");
     let (ben, guest) = (server.person("ben", &["family"]), server.person("guest", &["friends"]));
+    let ada = server.person("ada", &["parents"]);
     folders(&ben, &["House", "House/Roof"]).await;
     let quote = ben.start("family", "House", "Quote").await.id.unwrap();
     ben.start("family", "House/Roof", "Tiles").await;
     let diary = ben.start("home", "", "Diary").await.id.unwrap();
-    // A document goes, then the folder beside it with what that holds, then a document of Ben's own.
-    for thrown in [paths::trash(&quote), paths::trash_folder("family", "House/Roof"), paths::trash(&diary)] {
-        ben.post::<()>(&thrown, &()).await.expect("thrown away");
+    // A document goes, then the folder beside it with what that holds, then a document of Ben's own. A
+    // folder is thrown away by an owner of its space, which Ada is.
+    let roof = paths::trash_folder("family", "House/Roof");
+    for (who, thrown) in [(&ben, paths::trash(&quote)), (&ada, roof), (&ben, paths::trash(&diary))] {
+        who.post::<()>(&thrown, &()).await.expect("thrown away");
         server.wait(10);
     }
 
@@ -329,8 +332,11 @@ async fn a_folder_goes_nowhere_it_cannot() {
         let refused = who.post::<Entry>(&paths::rename_folder("family", path), &rename).await.expect_err(what);
         assert_eq!(refused.code, code, "{what}");
     }
-    let thrown = guest.post::<()>(&paths::trash_folder("family", "House"), &()).await.expect_err("by a reader");
-    assert_eq!(thrown.code, Code::Forbidden);
+    // Whoever edits the space renames and moves its folders, and throws none away: that is its owners'.
+    for (who, what) in [(&guest, "by a reader"), (&ben, "by an editor, who is no owner of the space")] {
+        let thrown = who.post::<()>(&paths::trash_folder("family", "House"), &()).await.expect_err(what);
+        assert_eq!(thrown.code, Code::Forbidden, "{what}");
+    }
 
     assert_eq!(server.scratch.names("family"), before, "nothing moved");
     assert_eq!(names(&listed(&ben, "family", "House").await), ["Roof"]);

@@ -103,6 +103,10 @@ pub struct Oidc {
 pub struct Space {
     pub name: String,
     pub path: String,
+    /// Whoever edits a shared space and may also throw its folders away. A space that names none keeps
+    /// every folder until someone removes it on the disk.
+    #[serde(default)]
+    pub owners: Vec<String>,
     #[serde(default)]
     pub editors: Vec<String>,
     #[serde(default)]
@@ -128,6 +132,11 @@ impl Space {
 
     pub fn personal(&self) -> bool {
         self.path.contains(USERNAME)
+    }
+
+    /// Every group the space names, whatever it lets them do.
+    pub fn groups(&self) -> impl Iterator<Item = &String> {
+        [&self.owners, &self.editors, &self.commenters, &self.readers].into_iter().flatten()
     }
 }
 
@@ -253,16 +262,16 @@ impl Config {
                     "the path of the space \"{name}\" may hold {USERNAME} and nothing else in braces"
                 )));
             }
-            let groups = space.editors.len() + space.commenters.len() + space.readers.len();
+            let groups = space.groups().count();
             match (space.personal(), groups) {
                 (true, 1..) => {
                     return Err(ConfigError(format!(
-                        "the space \"{name}\" is each person's own, so it takes no editors, commenters or readers"
+                        "the space \"{name}\" is each person's own, so it takes no owners, editors, commenters or readers"
                     )));
                 }
                 (false, 0) => {
                     return Err(ConfigError(format!(
-                        "the space \"{name}\" names no editors, commenters or readers, so nobody would reach it"
+                        "the space \"{name}\" names no owners, editors, commenters or readers, so nobody would reach it"
                     )));
                 }
                 _ => {}

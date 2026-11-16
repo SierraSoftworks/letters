@@ -166,7 +166,8 @@ async fn a_session_follows_its_document_when_it_is_renamed_and_moved() {
 #[tokio::test]
 async fn a_session_follows_its_document_when_a_folder_above_it_is_renamed_moved_or_thrown_away() {
     let server = Server::new("folder-follows");
-    let ada = server.person("ada", &["family"]);
+    // An owner of the space, who may throw its folders away.
+    let ada = server.person("ada", &["parents"]);
     for (parent, name) in [("", "Plans"), ("Plans", "Old"), ("", "Archive")] {
         let new = NewFolder { parent: parent.into(), name: name.into() };
         let _: Entry = ada.post(&paths::folders("family"), &new).await.unwrap();

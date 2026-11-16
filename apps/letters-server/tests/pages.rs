@@ -129,24 +129,31 @@ async fn the_forms_make_rename_move_and_throw_away() {
 #[tokio::test]
 async fn the_forms_rename_move_and_throw_away_a_folder_and_the_trash_puts_it_back() {
     let server = Server::new("folder-forms");
-    let mut ben = server.reader("ben", &["family"]);
+    // Ben is an owner of the space, and Carol edits in it.
+    let (mut ben, mut carol) = (server.reader("ben", &["parents"]), server.reader("carol", &["family"]));
     let top = paths::folder_page("family", "");
     for name in ["House", "Garden"] {
         ben.fill(ACT_NEW_FOLDER, &[("space", "family"), ("folder", ""), ("name", name)]).await;
     }
     let id = ben.pages().start("family", "House", "Plan").await.id.unwrap();
 
-    // A folder's row asks as a document's does, and a reader's asks nothing.
-    let editors = page(&mut ben, &top).await;
+    // A folder's row asks as a document's does. Whoever edits the space is offered all but to throw the
+    // folder away, which is its owners', and a reader's row asks nothing.
+    let (owners, editors) = (page(&mut ben, &top).await, page(&mut carol, &top).await);
     let readers = page(&mut server.reader("guest", &["friends"]), &top).await;
     for (what, act) in [("rename", ACT_RENAME), ("move", ACT_MOVE), ("trash", ACT_TRASH)] {
         let ask = asking_folder(&top, what, "House");
-        assert!(editors.contains(&ask.replace('&', "&amp;")), "the row asks to {what}");
+        assert!(owners.contains(&ask.replace('&', "&amp;")), "the row asks to {what}");
         assert!(page(&mut ben, &ask).await.contains(&format!("action=\"{act}\"")), "{what}");
+        assert_eq!(editors.contains(&ask.replace('&', "&amp;")), what != "trash", "an editor, to {what}");
         assert!(!readers.contains(&format!("ask={what}")), "a reader is not offered to {what}");
     }
 
     let about = |folder: &'static str| [("space", "family"), ("folder", folder), ("back", top.as_str())];
+    // Nor does the address of the question, or the form itself, throw a folder away for an editor.
+    assert!(!page(&mut carol, &asking_folder(&top, "trash", "House")).await.contains(ACT_TRASH));
+    carol.fill(ACT_TRASH, &about("House")).await;
+    assert_eq!(names(&listed(&ben, "family", "").await), ["Garden", "House"], "the folder stays");
     let renamed = ben.fill(ACT_RENAME, &[&about("House")[..], &[("name", "Home")]].concat()).await;
     assert_eq!(renamed.location(), top);
     assert_eq!(names(&listed(&ben, "family", "").await), ["Garden", "Home"]);

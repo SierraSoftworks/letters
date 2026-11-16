@@ -350,7 +350,8 @@ fn file(row: &Row, here: Option<&str>, places: bool, shares: bool) -> Html {
                 </MenuButton>
             }
         }
-        // A folder is asked about by where it is.
+        // A folder is asked about by where it is. Whoever edits its space renames and moves it, and only
+        // an owner of the space throws it away.
         None if entry.kind == EntryKind::Folder => match here.filter(|_| entry.role.edits()) {
             Some(here) => {
                 let ask = |what: &str| asking_folder(here, what, &entry.path);
@@ -358,7 +359,9 @@ fn file(row: &Row, here: Option<&str>, places: bool, shares: bool) -> Html {
                     <MenuButton label={format!("More for {}", entry.name)} icon_only=true variant={ButtonVariant::Subtle} size={Size::Small} placement={Placement::BottomEnd}>
                         <MenuItem icon={icons::PENCIL} href={ask("rename")}>{ "Rename" }</MenuItem>
                         <MenuItem icon={icons::FOLDER_INPUT} href={ask("move")}>{ "Move" }</MenuItem>
-                        <MenuItem icon={icons::TRASH_2} tone={Tone::Danger} href={ask("trash")}>{ "Move to trash" }</MenuItem>
+                        if entry.role == api::Role::Owner {
+                            <MenuItem icon={icons::TRASH_2} tone={Tone::Danger} href={ask("trash")}>{ "Move to trash" }</MenuItem>
+                        }
                     </MenuButton>
                 }
             }

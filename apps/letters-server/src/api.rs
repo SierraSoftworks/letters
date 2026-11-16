@@ -719,9 +719,13 @@ impl App {
     }
 
     /// Moves the folder at `path` in `space` to the space's trash, with everything in it. Whoever has a
-    /// document in it open is told that it is gone.
+    /// document in it open is told that it is gone. A folder holds the work of everyone in its space, so
+    /// only an owner of the space throws one away: whoever edits there renames and moves it.
     pub fn trash_folder(&self, who: &Signed, space: &str, path: &str) -> Answer<()> {
-        let (_, root, place) = self.folder_in(who, space, path)?;
+        let (space, root, place) = self.folder_in(who, space, path)?;
+        if space.role != Role::Owner {
+            return Err(Refusal::forbidden("Only an owner of this space can move a folder to the trash."));
+        }
         let thrown = || self.library.trash(&self.store, &root, &place, self.now());
         self.rooms.moving((&root, &place), None, thrown)
     }

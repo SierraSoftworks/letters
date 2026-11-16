@@ -66,8 +66,8 @@ its grants may change.
   },
   ```
 
-- **Spaces.** A space names those groups as its `editors`, `commenters` or `readers`. A space whose path
-  holds `{username}` is each person's own.
+- **Spaces.** A space names those groups as its `owners`, `editors`, `commenters` or `readers`. Owners
+  edit and may also move a folder to the trash. A space whose path holds `{username}` is each person's own.
 - **People.** A person signs in from a device of their own: tsidp turns a tagged device away. Their groups
   are read when they sign in, so a change in the policy reaches them at their next sign-in, `session_days`
   later at most.

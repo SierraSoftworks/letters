@@ -30,7 +30,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use letters_api::{Code, Entry, EntryKind, Link, Person, paths};
+use letters_api::{Code, Entry, EntryKind, Link, Person, Role, paths};
 use serde::Deserialize;
 use yew::ServerRenderer;
 
@@ -345,7 +345,7 @@ async fn folder(
         move || {
             let listing = app.listing(&who, &space, &path)?;
             let now = app.now();
-            let edits = listing.space.role.edits();
+            let (edits, owns) = (listing.space.role.edits(), listing.space.role == Role::Owner);
             let about = |id: &String| listing.entries.iter().find(|entry| entry.id.as_ref() == Some(id)).cloned();
             let within = |path: &String| {
                 let folders = listing.entries.iter().filter(|entry| entry.kind == EntryKind::Folder);
@@ -378,7 +378,10 @@ async fn folder(
                     })
                 }
                 (Some("rename"), Some(entry)) if edits => Some(Ask::Rename(entry)),
-                (Some("trash"), Some(entry)) if edits => Some(Ask::Trash(entry)),
+                // A folder is thrown away by an owner of its space alone.
+                (Some("trash"), Some(entry)) if edits && (entry.kind != EntryKind::Folder || owns) => {
+                    Some(Ask::Trash(entry))
+                }
                 (Some("move"), Some(entry)) if edits => {
                     let mut targets = targets(&app, &who, (&listing.space.id, &listing.path));
                     if entry.kind == EntryKind::Folder {

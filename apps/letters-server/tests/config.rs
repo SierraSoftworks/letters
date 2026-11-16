@@ -70,7 +70,11 @@ fn settings_that_cannot_be_run_with_say_why() {
         ("name = \"Family\"", "name = \"!!\"", "letter"),
         ("path = '/srv/letters/family'", "path = \"family\"", "root"),
         ("path = '/srv/letters/family'", "path = \"/srv/{group}/family\"", "braces"),
-        ("editors = [\"family\"]\ncommenters = [\"reviewers\"]\nreaders = [\"friends\"]", "", "nobody"),
+        (
+            "owners = [\"parents\"]\neditors = [\"family\"]\ncommenters = [\"reviewers\"]\nreaders = [\"friends\"]",
+            "",
+            "nobody",
+        ),
     ];
     for (from, to, word) in cases {
         let refusal = with(|sound| {
@@ -108,12 +112,13 @@ fn a_space_gives_each_group_its_role() {
     let config = with(|sound| sound).unwrap();
     let (home, family) = (&config.spaces[0], &config.spaces[1]);
     let groups = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
-    let cases: [(&[&str], Option<Role>); 5] = [
+    let cases: [(&[&str], Option<Role>); 6] = [
         (&[], None),
         (&["strangers"], None),
         (&["friends"], Some(Role::Reader)),
         (&["friends", "reviewers"], Some(Role::Commenter)),
         (&["reviewers", "family", "friends"], Some(Role::Editor)),
+        (&["family", "parents"], Some(Role::Owner)),
     ];
     for (names, role) in cases {
         assert_eq!(family.role(&groups(names)), role, "{names:?}");

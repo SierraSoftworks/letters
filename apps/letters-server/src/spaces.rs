@@ -86,7 +86,12 @@ impl config::Space {
             return Some(Role::Owner);
         }
         let holds = |listed: &[String]| listed.iter().any(|group| groups.contains(group));
-        let roles = [(Role::Editor, &self.editors), (Role::Commenter, &self.commenters), (Role::Reader, &self.readers)];
+        let roles = [
+            (Role::Owner, &self.owners),
+            (Role::Editor, &self.editors),
+            (Role::Commenter, &self.commenters),
+            (Role::Reader, &self.readers),
+        ];
         roles.into_iter().find(|(_, listed)| holds(listed)).map(|(role, _)| role)
     }
 
