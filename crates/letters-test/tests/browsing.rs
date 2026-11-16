@@ -1,9 +1,9 @@
 //! Opening a document a server keeps: the card that lists a server's places and what they hold, and what
 //! the window asks of the shell.
 
-use letters_api::{Entry, EntryKind, Role as Grade, Space, SpaceKind, Tag};
+use letters_api::{Entry, EntryKind, Role as Grade, Space, SpaceKind, Tag, Trashed};
 use letters_render::{Item, Point};
-use letters_test::{Harness, Role};
+use letters_test::{Found, Harness, Role};
 use letters_ui::{Browsed, Landing, Place, Request, Server};
 
 const HOME: &str = "https://letters.example.org";
@@ -127,7 +127,7 @@ fn open_lists_what_a_server_keeps_for_someone_signed_in() {
     let spaces = Browsed { server: HOME.into(), place: Place::Spaces, spaces: spaces(), entries: Vec::new() };
     window.ui().set_listing(spaces);
     assert_eq!(window.ui().take_requests(), [browse(HOME, within("sam", ""))]);
-    let places = ["Family", "Sam Okafor", "Shared with me", "Recent"].map(str::to_owned);
+    let places = ["Family", "Sam Okafor", "Shared with me", "Recent", "Trash"].map(str::to_owned);
     assert_eq!(listed(&mut window, "Places"), (places.to_vec(), vec!["Sam Okafor".to_owned()]));
 
     window.ui().set_listing(listing(HOME, within("sam", ""), own()));
@@ -217,14 +217,21 @@ fn a_row_says_who_wrote_a_document_and_when_it_was_made() {
 }
 
 #[test]
-fn the_day_a_document_was_made_is_told_by_the_persons_clock() {
+fn the_day_a_thing_was_made_or_thrown_away_is_told_by_the_persons_clock() {
     // Half past eleven at night by UTC is the next day an hour to the east.
-    for (zone, said) in [(0, "Created Yesterday"), (60, "Created Today")] {
+    for (zone, day) in [(0, "Yesterday"), (60, "Today")] {
         let mut window = signed_in(&[HOME]);
         window.ui().set_utc_offset(zone);
+        let about = |window: &mut Harness| {
+            let about =
+                window.find(Role::ListBoxOption, "Late").and_then(|found| found.description).unwrap_or_default();
+            about.split(", ").map(str::to_owned).collect::<Vec<String>>()
+        };
         open(&mut window, vec![written("Late.let", "d7", &[], "2026-11-14T23:30:00Z")]);
-        let about = window.find(Role::ListBoxOption, "Late").and_then(|found| found.description).unwrap_or_default();
-        assert!(about.split(", ").any(|part| part == said), "{zone}: {about}");
+        assert!(about(&mut window).contains(&format!("Created {day}")), "{zone}");
+        window.click(Role::ListBoxOption, "Trash");
+        window.ui().set_trash(HOME, vec![thrown(EntryKind::Document, "sam", "", "Late", 12 * 3_600 + 1_800)]);
+        assert!(about(&mut window).contains(&format!("Thrown away {day}")), "{zone}");
     }
 }
 
@@ -314,10 +321,30 @@ fn a_heading_keeps_the_keyboard_while_the_order_is_turned_round() {
     assert_eq!(at(&mut window), "Modified");
 }
 
+/// What the row of this name writes: how many letters each thing it says has. The longest is its name, where
+/// little else is said.
+fn letters(window: &mut Harness, name: &str) -> Vec<usize> {
+    let row = window.find(Role::ListBoxOption, name).expect("listed").bounds;
+    let runs = window.paint().items.into_iter().filter_map(|item| match item {
+        Item::Glyphs { origin, glyphs, .. } if row.contains(origin) => Some(glyphs.len()),
+        _ => None,
+    });
+    runs.collect()
+}
+
+/// Whether a button says its name, or shows its icon alone.
+fn named(button: &Found) -> bool {
+    button.bounds.width > 2.0 * button.bounds.height
+}
+
+/// The windows a card is looked at in, the narrowest the desktop lets a window be: how wide each is, whether
+/// a row has room to say who wrote a document and when it was made, and whether it has room for a day.
+const WINDOWS: [(f32, bool, bool); 4] =
+    [(1100.0, true, true), (700.0, false, true), (420.0, false, false), (360.0, false, false)];
+
 #[test]
 fn a_narrow_window_holds_the_card_and_leaves_out_what_it_has_no_room_for() {
-    // How wide the window is, and whether a row says who wrote a document and when it was made.
-    for (width, roomy) in [(1100.0, true), (700.0, false), (420.0, false)] {
+    for (width, roomy, dated) in WINDOWS {
         let mut window = signed_in(&[HOME]);
         window.resize(width, 820.0);
         open(&mut window, vec![written("Roof plan.let", "d1", &["Sam Okafor"], "2026-11-06T09:00:00Z")]);
@@ -326,11 +353,84 @@ fn a_narrow_window_holds_the_card_and_leaves_out_what_it_has_no_room_for() {
         for heading in ["Contributors", "Created"] {
             assert_eq!(has(&mut window, Role::Label, heading), roomy, "{width}: {heading}");
         }
-        // When it was last written is said at any width, at the row's end and inside the card.
-        let modified = window.find(Role::Button, "Modified").expect("the heading").bounds;
-        assert!(modified.x + modified.width < card.x + card.width, "{width}: {modified:?} in {card:?}");
+        assert_eq!(has(&mut window, Role::Button, "Modified"), dated, "{width}");
+        // What is offered is inside the card at any width, and the name is written whole. The buttons over
+        // the list say their names where that leaves the way to a folder its room.
+        let offered = ["Import", "New document"].into_iter().chain(dated.then_some("Modified"));
+        for button in offered {
+            let found = window.find(Role::Button, button).expect("offered");
+            let ends = found.bounds.x + found.bounds.width;
+            assert!(ends < card.x + card.width, "{width}: {button} at {:?} in {card:?}", found.bounds);
+            assert!(button == "Modified" || named(&found) == roomy, "{width}: {button}");
+        }
+        assert!(letters(&mut window, "Roof plan").into_iter().max() >= Some(8), "{width}");
         window.click(Role::ListBoxOption, "Roof plan");
         assert_eq!(window.ui().take_requests(), [Request::OpenFrom { server: HOME.into(), id: "d1".into() }]);
+
+        // A folder some way down keeps what is done in it inside the card: the steps to it are cut short, and
+        // a tight card keeps the one that leads up.
+        let mut window = signed_in(&[HOME]);
+        window.resize(width, 820.0);
+        let (house, quotes) = ("House and garden works", "House and garden works/Quotes for the roof");
+        open(&mut window, vec![folder("sam", house)]);
+        window.click(Role::ListBoxOption, house);
+        window.ui().set_listing(listing(HOME, within("sam", house), vec![folder("sam", quotes)]));
+        window.click(Role::ListBoxOption, "Quotes for the roof");
+        let deep = format!("{quotes}/Roofers and gutters");
+        window.ui().set_listing(listing(HOME, within("sam", quotes), vec![folder("sam", &deep)]));
+        window.click(Role::ListBoxOption, "Roofers and gutters");
+        window.ui().set_listing(listing(HOME, within("sam", &deep), Vec::new()));
+        let card = window.find(Role::Dialog, "Open").expect("the card").bounds;
+        for button in ["Import", "New document"] {
+            let found = window.find(Role::Button, button).expect("offered").bounds;
+            assert!(found.x + found.width < card.x + card.width, "{width}: {button} at {found:?} in {card:?}");
+        }
+        assert_eq!(has(&mut window, Role::Button, house), dated, "{width}: the steps further up");
+        let up = window.find(Role::Button, "Quotes for the roof").expect("the step up");
+        window.hover_at(up.center());
+        assert!(named(&up) || has(&mut window, Role::Tooltip, "Quotes for the roof"), "{width}");
+        window.click_at(up.center());
+        assert_eq!(window.ui().take_requests().last(), Some(&browse(HOME, within("sam", quotes))), "{width}");
+    }
+}
+
+#[test]
+fn what_is_done_from_a_row_stays_in_reach_beside_its_name_in_a_narrow_window() {
+    for (width, _, dated) in WINDOWS {
+        // A button says its name where a row has room for a day. Where it has not, it shows its icon and is
+        // named under the pointer.
+        let reached = |window: &mut Harness, button: Found, name: &str| {
+            let card = window.find(Role::Dialog, "Open").expect("the card").bounds;
+            let within = button.bounds.x + button.bounds.width < card.x + card.width;
+            window.hover_at(button.center());
+            within && named(&button) == dated && (dated || has(window, Role::Tooltip, name))
+        };
+        let mut window = signed_in(&[HOME]);
+        window.resize(width, 820.0);
+        let tags = vec![Tag::ConflictCopy { of: "Minutes.let".into() }];
+        let copy = Entry { tags, ..document("sam", "Minutes (conflicted copy).let", "d3", 0) };
+        open(&mut window, vec![document("sam", "Minutes.let", "d3", 0), copy]);
+        let merge = button(&mut window, "Merge conflicts", "Into Minutes").expect("offered");
+        assert!(reached(&mut window, merge.clone(), "Merge conflicts"), "{width}: {:?}", merge.bounds);
+        let written = letters(&mut window, "Minutes (conflicted copy)");
+        assert!(written.into_iter().max() >= Some(6), "{width}: the copy is told by its name");
+        window.click_at(merge.center());
+        let asked = Request::MergeConflictsOf { server: HOME.into(), id: "d3".into(), place: within("sam", "") };
+        assert_eq!(window.ui().take_requests(), [asked], "{width}");
+
+        let mut window = signed_in(&[HOME]);
+        window.resize(width, 820.0);
+        open_trash(&mut window, bin());
+        assert_eq!(has(&mut window, Role::Label, "Thrown away"), dated, "{width}");
+        let back = button(&mut window, "Put back", "Roof plan").expect("offered");
+        assert!(reached(&mut window, back.clone(), "Put back"), "{width}: {:?}", back.bounds);
+        // The name is written whole, and where the thing was and when it went only where there is the room.
+        let written = letters(&mut window, "Roof plan");
+        assert!(written.iter().max() >= Some(&8), "{width}: {written:?}");
+        assert_eq!(written.len() > 1, dated, "{width}: {written:?}");
+        window.click_at(back.center());
+        let asked = Request::PutBack { server: HOME.into(), space: "sam".into(), file: "Roof plan.let~1".into() };
+        assert_eq!(window.ui().take_requests(), [asked], "{width}");
     }
 }
 
@@ -439,7 +539,7 @@ fn a_document_that_is_pressed_is_opened_and_the_card_goes() {
     // A file that could not be read is listed, and is not to be opened.
     let damaged = Entry { id: None, tags: vec![Tag::Damaged], ..document("sam", "Old notes.let", "", 0) };
     let copy = Tag::ConflictCopy { of: "Minutes.let".into() };
-    let copy = Entry { tags: vec![copy], ..document("sam", "Minutes (conflict).let", "d4", 0) };
+    let copy = Entry { role: Grade::Reader, tags: vec![copy], ..document("sam", "Minutes (conflict).let", "d3", 0) };
     // Who else reaches a document, and what an import left to settle in it.
     let reached = vec![Tag::ImportNotes { count: 3 }, Tag::Shared { with: 2 }, Tag::Links { count: 1 }];
     let reached = Entry { tags: reached, ..document("sam", "Roof survey.let", "d5", 0) };
@@ -471,6 +571,52 @@ fn a_document_that_is_pressed_is_opened_and_the_card_goes() {
 }
 
 #[test]
+fn a_conflict_copy_is_merged_into_its_original_from_its_row() {
+    let original = || document("sam", "House/Minutes.let", "d3", 0);
+    // A copy goes by the id of the document it is a copy of.
+    let copy = |role| {
+        let tags = vec![Tag::ConflictCopy { of: "House/Minutes.let".into() }];
+        Entry { role, tags, ..document("sam", "House/Minutes (conflicted copy).let", "d3", 0) }
+    };
+    let about = |window: &mut Harness| window.find(Role::ListBoxOption, "Minutes (conflicted copy)").expect("listed");
+    let mut window = signed_in(&[HOME]);
+    open(&mut window, vec![original(), copy(Grade::Editor)]);
+    let merge = window.find(Role::Button, "Merge conflicts").expect("offered to whoever edits there");
+    assert_eq!(merge.description.as_deref(), Some("Into Minutes"));
+    let said = about(&mut window).description.unwrap_or_default();
+    assert!(!said.contains("Conflict copy"), "the button says what the note would: {said}");
+    // The row itself opens nothing: the id is the original's.
+    let row = about(&mut window).bounds;
+    window.click_at(Point { x: row.x + 12.0, y: row.y + row.height / 2.0 });
+    assert_eq!(window.ui().take_requests(), []);
+    window.assert_open(Role::Dialog, "Open");
+
+    window.click(Role::Button, "Merge conflicts");
+    let asked = Request::MergeConflictsOf { server: HOME.into(), id: "d3".into(), place: within("sam", "") };
+    assert_eq!(window.ui().take_requests(), [asked]);
+    assert!(has(&mut window, Role::Status, ASKING), "what the place holds then is waited for");
+    assert!(!has(&mut window, Role::Button, "Merge conflicts"), "and the merge is not asked for twice");
+    // The answer is the place without the copy, or why not.
+    window.ui().refuse_browse(REFUSAL);
+    window.assert_open(Role::Alert, REFUSAL);
+    window.ui().set_listing(listing(HOME, within("sam", ""), vec![original()]));
+    window.assert_closed(Role::Alert, REFUSAL);
+    assert_eq!(listed(&mut window, "Documents").0, ["Minutes"]);
+
+    // Whoever may not edit there is told what the file is, and can neither merge it nor open it.
+    for role in [Grade::Commenter, Grade::Reader] {
+        let mut window = signed_in(&[HOME]);
+        open(&mut window, vec![original(), copy(role)]);
+        assert!(!has(&mut window, Role::Button, "Merge conflicts"), "{role:?}");
+        let row = about(&mut window);
+        assert!(row.disabled, "{role:?}");
+        assert!(row.description.unwrap_or_default().contains("Conflict copy"), "{role:?}");
+        window.click(Role::ListBoxOption, "Minutes (conflicted copy)");
+        assert_eq!(window.ui().take_requests(), [], "{role:?}");
+    }
+}
+
+#[test]
 fn the_list_is_walked_and_a_document_opened_from_the_keyboard() {
     let mut window = signed_in(&[HOME]);
     open(&mut window, own());
@@ -493,7 +639,7 @@ fn the_places_are_one_stop_of_the_tab_key_at_the_place_that_is_looked_at() {
     open(&mut window, own());
     let at = |window: &mut Harness| window.focused().map(|found| found.name).unwrap_or_default();
     // Back from the documents, past the headings and what else stands over them, to the places.
-    for _ in 0..5 {
+    for _ in 0..6 {
         if at(&mut window) != "Sam Okafor" {
             window.key("Shift+Tab");
         }
@@ -509,22 +655,32 @@ fn the_places_are_one_stop_of_the_tab_key_at_the_place_that_is_looked_at() {
     window.assert_markdown("# Roof plan\n\nThe roofer needs the scaffold up by 3 March.");
 }
 
+/// What is asked of a folder, by its server, its space and its path there.
+type Asked = fn((String, String, String)) -> Request;
+
 #[test]
-fn a_document_is_started_in_the_folder_that_is_looked_at() {
-    // The folder that is gone into, and the path the document is started at.
-    for (folder, path) in [(None, ""), (Some("House"), "House")] {
-        let mut window = signed_in(&[HOME]);
-        open(&mut window, own());
-        if let Some(folder) = folder {
-            window.click(Role::ListBoxOption, folder);
-            window.ui().take_requests();
+fn a_document_is_started_or_imported_in_the_folder_that_is_looked_at() {
+    let at = |path: &str| (HOME.to_owned(), "sam".to_owned(), path.to_owned());
+    // The button, what it says of the folder, and what the shell is asked for there.
+    let new = |(server, space, path)| Request::NewAt { server, space, path };
+    let import = |(server, space, path)| Request::ImportAt { server, space, path };
+    let cases: [(&str, &str, Asked); 2] = [("New document", "In", new), ("Import", "Into", import)];
+    for (button, word, asked) in cases {
+        // The folder that is gone into, and its path in the space.
+        for (folder, path) in [(None, ""), (Some("House"), "House")] {
+            let mut window = signed_in(&[HOME]);
+            open(&mut window, own());
+            if let Some(folder) = folder {
+                window.click(Role::ListBoxOption, folder);
+                window.ui().take_requests();
+            }
+            let offered = window.find(Role::Button, button).expect("offered");
+            let said = format!("{word} {}", folder.unwrap_or("Sam Okafor"));
+            assert_eq!(offered.description.as_deref(), Some(said.as_str()), "{button}");
+            window.click(Role::Button, button);
+            assert_eq!(window.ui().take_requests(), [asked(at(path))], "{button} in {folder:?}");
+            window.assert_closed(Role::Dialog, "Open");
         }
-        let new = window.find(Role::Button, "New document").expect("offered");
-        assert_eq!(new.description.as_deref(), Some(format!("In {}", folder.unwrap_or("Sam Okafor")).as_str()));
-        window.click(Role::Button, "New document");
-        let asked = Request::NewAt { server: HOME.into(), space: "sam".into(), path: path.into() };
-        assert_eq!(window.ui().take_requests(), [asked], "{folder:?}");
-        window.assert_closed(Role::Dialog, "Open");
     }
 }
 
@@ -545,8 +701,158 @@ fn a_document_is_started_only_where_the_person_may_write() {
         let spaces = vec![Space { role, ..space("family", "Family", SpaceKind::Shared) }];
         window.ui().set_listing(Browsed { server: HOME.into(), place: Place::Spaces, spaces, entries: Vec::new() });
         window.click(Role::ListBoxOption, place);
-        assert_eq!(has(&mut window, Role::Button, "New document"), offered, "{role:?} in {place}");
+        for button in ["New document", "Import"] {
+            assert_eq!(has(&mut window, Role::Button, button), offered, "{button}: {role:?} in {place}");
+        }
     }
+}
+
+/// Something in the trash of a space, thrown away this long ago out of this folder.
+fn thrown(kind: EntryKind, space: &str, folder: &str, name: &str, ago: u64) -> Trashed {
+    let (name, space, folder) = (name.to_owned(), space.to_owned(), folder.to_owned());
+    Trashed { kind, file: format!("{name}.let~1"), name, space, folder, thrown: NOON - ago, role: Grade::Editor }
+}
+
+/// What is in the trash, the last thrown away first: a document and a folder of the person's own space, and
+/// a document of a space they may not edit in.
+fn bin() -> Vec<Trashed> {
+    vec![
+        thrown(EntryKind::Document, "sam", "House/Quotes", "Roof plan", 3_600),
+        thrown(EntryKind::Folder, "sam", "", "Old letters", DAY),
+        Trashed { role: Grade::Commenter, ..thrown(EntryKind::Document, "family", "", "Rota", 9 * DAY) },
+    ]
+}
+
+/// The button of this name that says this of itself: the one in the row of the thing it is about.
+fn button(window: &mut Harness, name: &str, about: &str) -> Option<Found> {
+    let fits = |found: &Found| found.role == Role::Button && found.name == name;
+    window.controls().into_iter().find(|found| fits(found) && found.description.as_deref() == Some(about))
+}
+
+/// Opens the card and looks at the trash, which holds this.
+fn open_trash(window: &mut Harness, held: Vec<Trashed>) {
+    open(window, own());
+    window.click(Role::ListBoxOption, "Trash");
+    assert_eq!(window.ui().take_requests(), [Request::BrowseTrash { server: HOME.into() }]);
+    window.ui().set_trash(HOME, held);
+}
+
+#[test]
+fn what_was_thrown_away_is_listed_with_where_it_was_and_when_it_went() {
+    let mut window = signed_in(&[HOME]);
+    open(&mut window, own());
+    window.click(Role::ListBoxOption, "Trash");
+    assert_eq!(window.ui().take_requests(), [Request::BrowseTrash { server: HOME.into() }]);
+    assert!(has(&mut window, Role::Status, ASKING), "the wait is said");
+    assert_eq!(listed(&mut window, "Places").1, ["Trash"]);
+    // Nothing is started in the trash, and no way leads into it.
+    assert!(!has(&mut window, Role::Button, "New document") && !has(&mut window, Role::Group, "Folder"));
+
+    // An answer from another server is not this trash's.
+    window.ui().set_trash(WORK, bin());
+    assert!(has(&mut window, Role::Status, ASKING));
+    window.ui().set_trash(HOME, bin());
+    assert_eq!(listed(&mut window, "Trash").0, ["Roof plan", "Old letters", "Rota"], "as the server tells it");
+    let about = |window: &mut Harness, name: &str| {
+        window.find(Role::ListBoxOption, name).and_then(|found| found.description).unwrap_or_default()
+    };
+    assert_eq!(about(&mut window, "Roof plan"), "Document, Was in Sam Okafor / House / Quotes, Thrown away Today");
+    assert_eq!(about(&mut window, "Old letters"), "Folder, Was in Sam Okafor, Thrown away Yesterday");
+    assert_eq!(about(&mut window, "Rota"), "Document, Was in Family, Thrown away 6 Nov");
+    // The eye is told the day under its heading.
+    assert!(says(&mut window, "Roof plan", (Role::Label, "Thrown away")));
+    // A row opens nothing.
+    window.click(Role::ListBoxOption, "Old letters");
+    assert_eq!(window.ui().take_requests(), []);
+    window.assert_open(Role::Dialog, "Open");
+
+    window.ui().set_trash(HOME, Vec::new());
+    assert!(has(&mut window, Role::Status, "The trash is empty."));
+}
+
+#[test]
+fn whoever_edits_in_a_space_puts_back_what_was_thrown_away_there() {
+    let mut window = signed_in(&[HOME]);
+    open_trash(&mut window, bin());
+    assert!(button(&mut window, "Put back", "Rota").is_none(), "whoever only comments there puts nothing back");
+    let back = button(&mut window, "Put back", "Roof plan").expect("offered");
+    let card = window.find(Role::Dialog, "Open").expect("the card").bounds;
+    assert!(back.bounds.x + back.bounds.width < card.x + card.width, "{:?} in {card:?}", back.bounds);
+    window.click_at(back.center());
+    let asked = Request::PutBack { server: HOME.into(), space: "sam".into(), file: "Roof plan.let~1".into() };
+    assert_eq!(window.ui().take_requests(), [asked]);
+    assert!(has(&mut window, Role::Status, ASKING), "what the trash holds then is waited for");
+    assert!(button(&mut window, "Put back", "Old letters").is_none(), "and nothing more is asked meanwhile");
+    // The answer is the trash without it, or why not.
+    window.ui().refuse_browse(REFUSAL);
+    window.assert_open(Role::Alert, REFUSAL);
+    window.ui().set_trash(HOME, bin().split_off(1));
+    window.assert_closed(Role::Alert, REFUSAL);
+    assert_eq!(listed(&mut window, "Trash").0, ["Old letters", "Rota"]);
+}
+
+#[test]
+fn the_trash_and_the_places_do_not_take_each_others_answers() {
+    // A place's late answer leaves the trash, and why it could not be read, as they are.
+    let mut window = signed_in(&[HOME]);
+    open(&mut window, own());
+    window.click(Role::ListBoxOption, "Trash");
+    window.ui().refuse_browse(REFUSAL);
+    window.ui().set_listing(listing(HOME, within("sam", ""), own()));
+    window.assert_open(Role::Alert, REFUSAL);
+    assert!(listed(&mut window, "Documents").0.is_empty());
+    // A refusal that comes after the trash was told is about a place that was left.
+    window.ui().set_trash(HOME, bin());
+    window.ui().refuse_browse(REFUSAL);
+    window.assert_closed(Role::Alert, REFUSAL);
+
+    // The trash's late answer leaves a place, and why it could not be read, as they are.
+    window.click(Role::ListBoxOption, "Sam Okafor");
+    assert_eq!(window.ui().take_requests().last(), Some(&browse(HOME, within("sam", ""))));
+    assert_eq!(listed(&mut window, "Places").1, ["Sam Okafor"]);
+    window.ui().refuse_browse(REFUSAL);
+    window.ui().set_trash(HOME, bin());
+    window.assert_open(Role::Alert, REFUSAL);
+    assert!(listed(&mut window, "Trash").0.is_empty());
+
+    // The trash is asked for afresh each time it is turned to: neither what it held before nor what a place
+    // said of itself stands there meanwhile.
+    window.click(Role::ListBoxOption, "Trash");
+    assert_eq!(window.ui().take_requests().last(), Some(&Request::BrowseTrash { server: HOME.into() }));
+    window.assert_closed(Role::Alert, REFUSAL);
+    assert!(has(&mut window, Role::Status, ASKING));
+    assert!(listed(&mut window, "Trash").0.is_empty());
+    // And a place that is turned back to is one a document is started in again.
+    window.click(Role::ListBoxOption, "Sam Okafor");
+    window.ui().set_listing(listing(HOME, within("sam", ""), own()));
+    assert!(has(&mut window, Role::Button, "New document"));
+}
+
+#[test]
+fn the_trash_is_looked_at_before_the_spaces_are_told_and_left_with_its_server() {
+    let mut window = signed_in(&[HOME, WORK]);
+    window.click(Role::Button, "More").click(Role::MenuItem, "Open");
+    window.click(Role::ListBoxOption, "Trash");
+    window.ui().take_requests();
+    // The spaces come late: the card stays where the person went.
+    window.ui().set_listing(Browsed {
+        server: HOME.into(),
+        place: Place::Spaces,
+        spaces: spaces(),
+        entries: Vec::new(),
+    });
+    assert_eq!(window.ui().take_requests(), []);
+    assert_eq!(listed(&mut window, "Places").1, ["Trash"]);
+    window.ui().set_trash(HOME, bin());
+    assert_eq!(listed(&mut window, "Trash").0.len(), 3);
+
+    // Another server is opened on its own space, as ever.
+    window.click(Role::RadioButton, "docs.example.net");
+    assert_eq!(window.ui().take_requests(), [browse(WORK, Place::Spaces)]);
+    let group = vec![space("office", "Office", SpaceKind::Shared)];
+    window.ui().set_listing(Browsed { server: WORK.into(), place: Place::Spaces, spaces: group, entries: Vec::new() });
+    assert_eq!(window.ui().take_requests(), [browse(WORK, within("office", ""))]);
+    assert_eq!(listed(&mut window, "Places").1, ["Office"]);
 }
 
 #[test]
@@ -571,7 +877,7 @@ fn each_server_the_person_is_signed_in_to_is_looked_at_in_turn() {
     assert_eq!(window.ui().take_requests(), [browse(WORK, Place::Spaces)]);
     assert_eq!(chosen(&mut window, "docs.example.net"), Some(true));
     assert!(listed(&mut window, "Documents").0.is_empty(), "nothing of the other server stays listed");
-    assert_eq!(listed(&mut window, "Places").0, ["Shared with me", "Recent"], "its spaces are not known yet");
+    assert_eq!(listed(&mut window, "Places").0, ["Shared with me", "Recent", "Trash"], "its spaces are not known yet");
 
     // An answer that comes late, from the server that was left, is let go.
     window.ui().set_listing(listing(HOME, within("sam", ""), own()));
@@ -582,7 +888,7 @@ fn each_server_the_person_is_signed_in_to_is_looked_at_in_turn() {
         spaces: spaces(),
         entries: Vec::new(),
     });
-    assert_eq!(listed(&mut window, "Places").0, ["Shared with me", "Recent"]);
+    assert_eq!(listed(&mut window, "Places").0, ["Shared with me", "Recent", "Trash"]);
     assert_eq!(window.ui().take_requests(), []);
 
     // A server where the person has no space of their own opens on its first space.
@@ -622,7 +928,7 @@ fn a_server_where_the_person_has_no_space_opens_on_what_is_shared_with_them() {
     assert_eq!(window.ui().take_requests(), [browse(WORK, Place::Shared)]);
     assert_eq!(
         listed(&mut window, "Places"),
-        (vec!["Shared with me".into(), "Recent".into()], vec!["Shared with me".into()])
+        (vec!["Shared with me".into(), "Recent".into(), "Trash".into()], vec!["Shared with me".into()])
     );
 }
 
@@ -654,7 +960,7 @@ fn a_place_the_server_does_not_tell_says_why() {
     window.ui().take_requests();
     window.ui().refuse_browse(REFUSAL);
     window.assert_open(Role::Alert, REFUSAL);
-    assert_eq!(listed(&mut window, "Places").0, ["Shared with me", "Recent"]);
+    assert_eq!(listed(&mut window, "Places").0, ["Shared with me", "Recent", "Trash"]);
     assert!(has(&mut window, Role::Button, "This device"));
 }
 

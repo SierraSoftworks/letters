@@ -259,6 +259,40 @@ pub enum Request {
         space: String,
         path: String,
     },
+    /// Merge into the document with this id, which the server at this address keeps, every conflict copy
+    /// beside it, as `letters_api::paths::merge_conflicts` does. Then answer as a [`Request::Browse`] of
+    /// `place` is answered: with what the place holds now that the copies are in the trash, or with why it
+    /// could not be done. The card that opens a server's documents asks it from a conflict copy's row,
+    /// only of a document the person edits, and waits as it does for a place.
+    /// [`Request::MergeConflicts`] is about the document in the window. This is about one in the card.
+    MergeConflictsOf {
+        server: String,
+        id: String,
+        place: Place,
+    },
+    /// Let the person choose a Markdown or a Word file of this device, have the server at this address
+    /// make a document of it in this folder of a space, as `letters_api::paths::import` does, and open
+    /// that document as [`Request::NewAt`] opens the one it starts. `path` is the folder's path in the
+    /// space, empty for the space itself. Nothing is done when no file is chosen. The card that opens a
+    /// server's documents asks it, only of a space the person edits, and is put away by then.
+    ImportAt {
+        server: String,
+        space: String,
+        path: String,
+    },
+    /// Say what is in the trash of the server at this address with `Window::set_trash`, or why it could not
+    /// be read with `Window::refuse_browse`. The card that opens a server's documents asks it.
+    BrowseTrash {
+        server: String,
+    },
+    /// Take what `file` names out of the trash of this space of the server and put it back where it was, as
+    /// `letters_api::paths::put_back` does. Then answer as a [`Request::BrowseTrash`] is answered: with
+    /// what the trash holds now, or with why it could not be done. Asked only of a space the person edits.
+    PutBack {
+        server: String,
+        space: String,
+        file: String,
+    },
 }
 
 /// A document opened lately, as the landing card lists it.

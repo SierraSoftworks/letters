@@ -717,8 +717,16 @@ impl Ui<EditorApp> {
         app.browser.told(listing, &mut app.requests);
     }
 
+    /// Says what is in the trash of the server at this address, the last thrown away first: what
+    /// `letters_api::paths::TRASH` answers. It answers [`Request::BrowseTrash`] and [`Request::PutBack`]. An
+    /// answer that comes when the card no longer shows that trash is let go.
+    pub fn set_trash(&mut self, server: &str, thrown: Vec<letters_api::Trashed>) {
+        self.app_mut().browser.trashed(server, thrown);
+    }
+
     /// Says that a place a [`Request::Browse`] asked for could not be read, in a sentence that stands by
-    /// itself. The card shows it where the place's documents would be.
+    /// itself. The card shows it where the place's documents would be. So for the trash, and for what the
+    /// card asked to have done to what it lists: [`Request::MergeConflictsOf`], [`Request::PutBack`].
     pub fn refuse_browse(&mut self, why: &str) {
         self.app_mut().browser.refused(why);
     }

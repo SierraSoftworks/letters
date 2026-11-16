@@ -54,6 +54,7 @@ pub struct Button<M> {
     size: ControlSize,
     pressed: Option<bool>,
     disabled: bool,
+    shrink: bool,
     on_press: Option<M>,
     popover: Option<Popover<M>>,
 }
@@ -69,6 +70,7 @@ impl<M> Button<M> {
             size: ControlSize::Medium,
             pressed: None,
             disabled: false,
+            shrink: false,
             on_press: None,
             popover: None,
         }
@@ -125,6 +127,12 @@ impl<M> Button<M> {
 
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Lets the button give up the end of its label, for an ellipsis, where its row has too little room.
+    pub fn shrink(mut self) -> Self {
+        self.shrink = true;
         self
     }
 
@@ -209,7 +217,11 @@ impl<M> From<Button<M>> for Element<M> {
             element = element.child(Element::row().child(Element::icon(icon, size)).children(mark));
         }
         if !button.icon_only {
-            element = element.child(Element::text(button.label, TextStyle::control().size(text).weight(500)));
+            let label = Element::text(button.label, TextStyle::control().size(text).weight(500));
+            element = element.child(if button.shrink { label.shrink() } else { label });
+        }
+        if button.shrink {
+            element = element.shrink();
         }
         if let Some(message) = button.on_press {
             element = element.on_press(message);
