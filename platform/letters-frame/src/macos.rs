@@ -2,7 +2,7 @@
 
 use objc2::rc::Retained;
 use objc2_app_kit::{NSToolbar, NSView, NSWindow, NSWindowButton, NSWindowToolbarStyle};
-use objc2_foundation::MainThreadMarker;
+use objc2_foundation::{MainThreadMarker, NSProcessInfo, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::Lights;
@@ -19,6 +19,15 @@ fn appkit(window: &impl HasWindowHandle) -> Option<(MainThreadMarker, Retained<N
     // borrowed, and views are only used on the main thread, which the marker says this is.
     let view: Retained<NSView> = unsafe { Retained::retain(handle.ns_view.as_ptr().cast()) }?;
     Some((main, view.window()?))
+}
+
+/// Names the process, which is what the menu bar calls an app that runs outside a bundle: without it the
+/// app's own menu carries the name of the program's file. It has to be called before the app is launched.
+/// An app in a bundle is called what the bundle says, whatever this is given.
+pub fn name_process(name: &str) {
+    // SAFETY: a property setter of the shared `NSProcessInfo`, which may be used from any thread, with a
+    // string that is alive for the call. The process info copies it.
+    unsafe { NSProcessInfo::processInfo().setProcessName(&NSString::from_str(name)) };
 }
 
 /// Gives a window the tall title bar of a window with a toolbar, and returns the bar's height in points

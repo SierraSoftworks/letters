@@ -137,7 +137,7 @@ wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 memmap2 = "0.9"
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 objc2 = "0.5"
-objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSData", "NSGeometry", "NSString", "NSThread"] }
+objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSData", "NSGeometry", "NSProcessInfo", "NSString", "NSThread"] }
 objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSButton", "NSControl", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSToolbar", "NSView", "NSWindow"] }
 
 # The server. None of these may reach the core crates.

@@ -81,7 +81,7 @@ static HEADER: [Item; 2] =
 /// The bar, from the left. The first menu is the one macOS names after the app.
 pub static BAR: [Menu; 8] = [
     Menu {
-        title: "Letters",
+        title: crate::app::NAME,
         items: &[
             Item::System(System::About),
             Rule,
@@ -284,6 +284,7 @@ mod bar {
     use muda::{AboutMetadata, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 
     use super::{BAR, HELP, Item, System, WINDOW};
+    use crate::app::NAME;
 
     /// What comes before an item's place in [`super::items`] in the name macOS knows it by. The system's
     /// own items are numbered too, and none of them is the app's to do.
@@ -371,18 +372,20 @@ mod bar {
         Ok(())
     }
 
+    /// The items that name the app say "Letters" outright: left to the system they carry the name of
+    /// the program's file when the app runs outside its bundle.
     fn system_item(system: System) -> PredefinedMenuItem {
         match system {
             System::About => {
                 let version = Some(env!("CARGO_PKG_VERSION").to_owned());
-                let about = AboutMetadata { name: Some("Letters".into()), version, ..AboutMetadata::default() };
-                PredefinedMenuItem::about(None, Some(about))
+                let about = AboutMetadata { name: Some(NAME.into()), version, ..AboutMetadata::default() };
+                PredefinedMenuItem::about(Some(&format!("About {NAME}")), Some(about))
             }
             System::Services => PredefinedMenuItem::services(None),
-            System::Hide => PredefinedMenuItem::hide(None),
+            System::Hide => PredefinedMenuItem::hide(Some(&format!("Hide {NAME}"))),
             System::HideOthers => PredefinedMenuItem::hide_others(None),
             System::ShowAll => PredefinedMenuItem::show_all(None),
-            System::Quit => PredefinedMenuItem::quit(None),
+            System::Quit => PredefinedMenuItem::quit(Some(&format!("Quit {NAME}"))),
             System::FullScreen => PredefinedMenuItem::fullscreen(None),
             System::Minimize => PredefinedMenuItem::minimize(None),
             System::Zoom => PredefinedMenuItem::zoom(None),
