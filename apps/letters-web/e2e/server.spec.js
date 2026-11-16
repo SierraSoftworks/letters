@@ -115,7 +115,17 @@ test("two browsers and a device write in one document that the server keeps", as
   }
 });
 
-test("a link's reader, signed in nowhere, reads the document and is offered only what the link allows", async ({ browser }) => {
+/** A browser the server has never seen. */
+const stranger = async (browser, server) => {
+  const guest = await browser.newContext({ baseURL: server.url });
+  await guest.addInitScript(() => {
+    window.blocked = [];
+    document.addEventListener("securitypolicyviolation", (event) => window.blocked.push(`${event.violatedDirective} ${event.blockedURI}`));
+  });
+  return guest.newPage();
+};
+
+test("a link's visitor, signed in nowhere, gets the page to read as a reader and the editor within the link's limits to comment", async ({ browser }) => {
   const server = await served();
   try {
     const ada = await server.browser(browser, "ada");
@@ -124,37 +134,42 @@ test("a link's reader, signed in nowhere, reads the document and is offered only
     const writer = await open(ada, id);
     await writer.keyboard.type("For the accountant.");
     await expect(tools(writer).getByText("Saved", { exact: true })).toBeAttached();
-    const made = await post(`/api/v1/documents/${id}/links`, { label: "Accountant", role: "reader", allows: { copy: true } });
-    expect(made.ok()).toBe(true);
-    const { url } = await made.json();
+    const link = async (label, role) => {
+      const made = await post(`/api/v1/documents/${id}/links`, { label, role, allows: { copy: true } });
+      expect(made.ok(), label).toBe(true);
+      return (await made.json()).url;
+    };
 
-    // A browser the server has never seen follows the link's address.
-    const guest = await browser.newContext({ baseURL: server.url });
-    await guest.addInitScript(() => {
-      window.blocked = [];
-      document.addEventListener("securitypolicyviolation", (event) => window.blocked.push(`${event.violatedDirective} ${event.blockedURI}`));
-    });
-    const reader = await guest.newPage();
-    await reader.goto(url);
-    await reader.waitForFunction(() => window.letters?.frames > 0 && window.letters.live, undefined, { timeout: 60_000 });
-    expect(new URL(reader.url()).pathname).toBe(`/d/${id}`);
-    await expect.poll(() => shown(reader)).toContain("For the accountant.");
-    await expect(tools(reader).getByText("Reading", { exact: true })).toBeAttached();
-    // The writer sees who reads, by the link's label, and what is written reaches the reader.
-    await expect(writer.getByLabel("Accountant")).toBeAttached();
+    // A reader's link shows the document on a plain page: no editor opens for it.
+    const reader = await stranger(browser, server);
+    await reader.goto(await link("Accountant", "reader"));
+    expect(new URL(reader.url()).pathname).toBe(`/d/${id}/read`);
+    await expect(reader.getByText("For the accountant.")).toBeVisible();
+    await expect(reader.locator("canvas")).toHaveCount(0);
+
+    // A commenter's link opens the editor, which says what they may do.
+    const guest = await stranger(browser, server);
+    await guest.goto(await link("Solicitor", "commenter"));
+    await guest.waitForFunction(() => window.letters?.frames > 0 && window.letters.live, undefined, { timeout: 60_000 });
+    expect(new URL(guest.url()).pathname).toBe(`/d/${id}`);
+    await expect.poll(() => shown(guest)).toContain("For the accountant.");
+    await expect(tools(guest).getByText("Commenting", { exact: true })).toBeAttached();
+    // The writer sees who is there, by the link's label, and what is written reaches them.
+    await expect(writer.getByLabel("Solicitor")).toBeAttached();
     await writer.bringToFront();
     await writer.keyboard.type(" And more.");
-    await expect.poll(() => shown(reader)).toContain("And more.");
+    await expect.poll(() => shown(guest)).toContain("And more.");
 
-    // The link lets its reader copy, and neither print nor take a file.
-    await reader.bringToFront();
-    const more = await reader.getByRole("button", { name: "More", exact: true }).boundingBox();
-    await reader.mouse.click(more.x + more.width / 2, more.y + more.height / 2);
-    await expect(reader.getByRole("menuitem", { name: "Settings" })).toBeAttached();
-    await expect(reader.getByRole("menuitem", { name: "Export" })).toHaveCount(0);
-    await reader.emulateMedia({ media: "print" });
-    await expect(reader.locator("canvas")).toBeHidden();
-    expect(await reader.evaluate(() => window.blocked)).toEqual([]);
+    // The link lets them copy, and neither print nor take a file, and they are shown no history.
+    await guest.bringToFront();
+    await expect(guest.getByRole("button", { name: "History", exact: true })).toHaveCount(0);
+    const more = await guest.getByRole("button", { name: "More", exact: true }).boundingBox();
+    await guest.mouse.click(more.x + more.width / 2, more.y + more.height / 2);
+    await expect(guest.getByRole("menuitem", { name: "Settings" })).toBeAttached();
+    await expect(guest.getByRole("menuitem", { name: "Export" })).toHaveCount(0);
+    await guest.emulateMedia({ media: "print" });
+    await expect(guest.locator("canvas")).toBeHidden();
+    expect(await guest.evaluate(() => window.blocked)).toEqual([]);
   } finally {
     server.stop();
   }
