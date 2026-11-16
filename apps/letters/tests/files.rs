@@ -366,10 +366,13 @@ fn a_path_with_no_file_opens_blank_and_is_created_by_the_first_save() {
     let opened = open(&path).unwrap();
     assert_eq!(opened.document.blocks.len(), 1);
     assert!(folder.names().is_empty(), "opening writes nothing");
+    // As `letters Fresh.let` does: nobody else wrote any of it, so it is the person's own to trust.
+    assert!(opened.made_here());
 
     let (mut writer, home) = Writer::of(opened);
     writer.save(&home, &document("Typed"));
     assert_eq!(read(&path).document, document("Typed"));
+    assert!(!open(&path).unwrap().made_here(), "once written it is read as any file is");
 }
 
 #[test]

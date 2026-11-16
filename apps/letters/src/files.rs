@@ -438,6 +438,14 @@ pub struct Opened {
     pub rest: Rest,
 }
 
+impl Opened {
+    /// Whether the document was made in this app and not read from a file: one found in a journal, or a
+    /// blank one for a path that has no file yet. Nobody else wrote any of it, so it is the person's own.
+    pub fn made_here(&self) -> bool {
+        self.home.as_ref().is_none_or(|home| !home.written())
+    }
+}
+
 /// What opening leaves for after the first paint: the file's history, and whatever else a save needs.
 pub struct Rest(Source);
 

@@ -690,6 +690,8 @@ struct DocWindow {
     marked: Option<Revision>,
     /// What the person last saw of the document, until the window is told.
     last_seen: Option<Revision>,
+    /// Whether the window was told by the copy on this device, the document's server being out of reach.
+    seen_offline: bool,
     /// Whether who writes here is as known as it will be. Until then the person's own writing from
     /// elsewhere could pass for another's.
     named: bool,
@@ -896,7 +898,7 @@ impl DocWindow {
         if let Some(writer) = theirs.or(writer) {
             self.view.set_author(writer);
             self.named = true;
-            self.say_seen();
+            self.say_seen(false);
         }
         self.appearance = settings.appearance;
         // What the system draws of the window goes light or dark with it: a title bar, or its buttons.
@@ -1042,12 +1044,29 @@ impl DocWindow {
         self.journal = Some(journal);
     }
 
-    /// Tells the window what the person last saw of the document, once: when who writes here is known,
-    /// and a server's document holds what its server does. What comes in after that is seen as it comes.
-    fn say_seen(&mut self) {
-        let live = |remote: &Remote| matches!(remote.line.link(), letters_sync::Link::Live(_));
-        if self.named && self.remote.as_ref().is_none_or(live) && self.last_seen.is_some() {
-            self.view.set_last_seen(self.last_seen.take());
+    /// Tells the window what the person last saw of the document, when who writes here is known and the
+    /// document is as new as it gets: once, but for a server's document that cannot be reached. That one
+    /// is told by its copy on this device, and again if the server is reached and has more to show.
+    /// `merged` says whether the server just sent what others wrote. What comes in after that is seen as
+    /// it comes.
+    fn say_seen(&mut self, merged: bool) {
+        use letters_sync::Link::{Connecting, Live, Offline, Refused};
+        if !self.named || self.last_seen.is_none() {
+            return;
+        }
+        match self.remote.as_ref().map(|remote| (remote.started, remote.line.link())) {
+            None | Some((_, Live(_))) => {
+                let seen = self.last_seen.take();
+                // A server that had nothing more leaves what was said by the copy as it was answered.
+                if !self.seen_offline || merged {
+                    self.view.set_last_seen(seen);
+                }
+            }
+            Some((true, Offline | Refused(_))) if !self.seen_offline => {
+                self.seen_offline = true;
+                self.view.set_last_seen(self.last_seen.clone());
+            }
+            Some((_, Connecting | Offline | Refused(_))) => {}
         }
     }
 
@@ -1513,10 +1532,11 @@ impl DocWindow {
     /// Does what the line to the document's server left to do, and tells it of what that changed.
     fn told(&mut self, told: Vec<Told>, now: Instant) {
         let mut told = VecDeque::from(told);
-        let mut stands = false;
+        let (mut stands, mut merged) = (false, false);
         while let Some(next) = told.pop_front() {
             match next {
                 Told::Merge(edits) => {
+                    merged = true;
                     let before = self.view.edits();
                     if let Err(error) = self.view.change(|editor| editor.merge(&edits)) {
                         eprintln!("letters: could not take in what the server sent of {}: {error}", self.name());
@@ -1570,7 +1590,7 @@ impl DocWindow {
             }
         }
         // With the server caught up with, what others wrote since the last visit is all here.
-        self.say_seen();
+        self.say_seen(merged);
         // Whatever was written here or there since may have moved the text under the others' carets.
         self.show_peers();
         if stands {
@@ -1659,7 +1679,7 @@ impl DocWindow {
                 // Read once, before a save of this visit keeps what is seen now in its place.
                 if self.keeps {
                     self.last_seen = self.seen.last(&copy.id);
-                    self.say_seen();
+                    self.say_seen(false);
                 }
                 // What the file held is where the last session ended, should this one write anything.
                 let found = copy.model().revision();
@@ -2167,8 +2187,9 @@ impl App {
         opened: Option<Opened>,
         landing: bool,
     ) -> Result<WindowId, Box<dyn Error>> {
-        // A document with no file was made in this app, though perhaps in a session that ended early.
-        let made_here = opened.as_ref().is_none_or(|opened| opened.home.is_none());
+        // A document with no file was made in this app, though perhaps in a session that ended early, or
+        // for a path that was named before anything was written there.
+        let made_here = opened.as_ref().is_none_or(Opened::made_here);
         let (document, style, place, rest) = match opened {
             Some(Opened { document, style, home, rest }) => {
                 (document, style, home.map_or_else(Place::new, Place::at), rest)
@@ -2232,6 +2253,7 @@ impl App {
             seen: self.seen.clone(),
             marked: None,
             last_seen: None,
+            seen_offline: false,
             named: self.named,
             rest: Some(rest),
             reading: None,
@@ -4060,7 +4082,7 @@ impl ApplicationHandler<Event> for App {
                     }
                     // Named or not, who writes here is as known as it will be.
                     window.named = true;
-                    window.say_seen();
+                    window.say_seen(false);
                     window.window.request_redraw();
                 }
             }
