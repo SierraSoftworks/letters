@@ -110,7 +110,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-${{ matrix.target }}
-          save-if: true # measuring: main only before this merges
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set the version
         if: env.VERSION != ''
@@ -233,7 +233,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: server
-          save-if: true # measuring: main only before this merges
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set the version
         if: env.VERSION != ''
