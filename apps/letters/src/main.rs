@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use letters::cli::{self, Command, Mode};
 use letters::measure::{self, Launch};
+use letters::update::{self, Resumed};
 
 fn main() -> ExitCode {
     let launch = Launch::start();
@@ -12,7 +13,12 @@ fn main() -> ExitCode {
     if !letters_frame::fetch_cloud_files() {
         eprintln!("letters: files kept in the cloud may not be read: the system would not set the policy");
     }
-    let options = match cli::parse(std::env::args_os().skip(1)) {
+    // A start that is a step of an update reads its own arguments first, and may be all this run is for.
+    let arguments = match update::resume(std::env::args_os().skip(1).collect()) {
+        Resumed::Run(arguments) => arguments,
+        Resumed::Leave => return ExitCode::SUCCESS,
+    };
+    let options = match cli::parse(arguments) {
         Ok(Command::Run(options)) => options,
         Ok(Command::Export(export)) => return letters::convert::export(&export),
         Ok(Command::Import(import)) => return letters::convert::import(&import),

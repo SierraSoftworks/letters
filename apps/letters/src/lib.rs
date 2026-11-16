@@ -8,6 +8,7 @@
 //! - [`dictionaries`] finds the system's dictionaries for languages other than English, and [`fallback`]
 //!   its fonts for what the bundled ones cannot draw.
 //! - [`menus`] lists what the macOS menu bar offers, all of it commands the window already has.
+//! - [`update`] looks for a newer release and puts it in this one's place.
 //! - [`measure`] checks the performance budgets, and [`baseline`] is the empty window it compares with.
 //! - [`convert`] runs the `export` and `import` subcommands, which need no window, and [`copies`] writes the
 //!   copies and exports a window asks for.
@@ -50,6 +51,7 @@ pub mod socket;
 pub mod strangers;
 pub mod telemetry;
 pub mod trust;
+pub mod update;
 pub mod versions;
 pub mod words;
 pub mod workers;

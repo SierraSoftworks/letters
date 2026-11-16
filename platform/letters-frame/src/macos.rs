@@ -1,8 +1,9 @@
-//! The unified title bar, which winit 0.30 has no attribute for, and where its lights stand.
+//! The unified title bar, which winit 0.30 has no attribute for, where its lights stand, and the Dock's icon.
 
+use objc2::ClassType;
 use objc2::rc::Retained;
-use objc2_app_kit::{NSToolbar, NSView, NSWindow, NSWindowButton, NSWindowToolbarStyle};
-use objc2_foundation::MainThreadMarker;
+use objc2_app_kit::{NSApplication, NSImage, NSToolbar, NSView, NSWindow, NSWindowButton, NSWindowToolbarStyle};
+use objc2_foundation::{MainThreadMarker, NSData};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::Lights;
@@ -70,4 +71,17 @@ pub fn lights(window: &impl HasWindowHandle) -> Option<Lights> {
     // Half the heights a unified title bar can have.
     let believed = (BELIEVED.start() / 2.0)..=(BELIEVED.end() / 2.0);
     believed.contains(&centre).then_some(Lights { centre: centre as f32, end: end as f32 })
+}
+
+/// Shows a PNG as the app's icon in the Dock and the app switcher while it runs. An app started from its
+/// bundle has the bundle's icon without this: it is for the bare program, which the Dock would give the
+/// icon of a command line tool. `false` off the main thread, or when the picture cannot be read.
+pub fn set_dock_icon(png: &[u8]) -> bool {
+    let Some(main) = MainThreadMarker::new() else { return false };
+    let data = NSData::with_bytes(png);
+    let Some(icon) = NSImage::initWithData(NSImage::alloc(), &data) else { return false };
+    // SAFETY: a property setter of the shared `NSApplication`, on the main thread, with a picture that
+    // is alive. The app retains it.
+    unsafe { NSApplication::sharedApplication(main).setApplicationIconImage(Some(&icon)) };
+    true
 }
