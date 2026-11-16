@@ -225,6 +225,8 @@ fn an_address_keeps_each_part_in_its_place() {
         (paths::file("../../etc"), "/api/v1/documents/..%2F..%2Fetc/file"),
         (paths::assets("doc 1"), "/api/v1/documents/doc%201/assets"),
         (paths::seen("doc 1"), "/api/v1/documents/doc%201/seen"),
+        (paths::dictionary_aff("de-CH"), "/api/v1/dictionaries/de-CH/aff"),
+        (paths::dictionary_dic("../x"), "/api/v1/dictionaries/..%2Fx/dic"),
         (paths::merge_conflicts("doc 1"), "/api/v1/documents/doc%201/merge-conflicts"),
         (paths::asset("doc 1", "ab12.png"), "/api/v1/documents/doc%201/assets/ab12.png"),
         (paths::sign_in_page("/d/a?b=c"), "/auth/sign-in?then=%2Fd%2Fa%3Fb%3Dc"),

@@ -3998,6 +3998,7 @@ dependencies = [
  "brotli 8.0.4",
  "brotli-decompressor 5.0.3",
  "cap-std",
+ "encoding_rs",
  "getrandom 0.4.3",
  "http-body-util",
  "jiff",

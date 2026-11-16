@@ -29,6 +29,24 @@ pub const SETTINGS: &str = "/api/v1/settings";
 /// time, at [`word`].
 pub const DICTIONARY: &str = "/api/v1/settings/dictionary";
 
+/// `GET`: the languages the server has a spelling dictionary for, as a list of tags such as `de-DE`.
+/// English is not among them: the editor has it built in. Needs no session.
+pub const DICTIONARIES: &str = "/api/v1/dictionaries";
+
+/// `GET`: the affix file of the Hunspell dictionary that best serves the language `tag`, as UTF-8 text.
+/// With [`dictionary_dic`] it is all a spell checker needs. The dictionary is the one for the tag's region,
+/// else for its language alone, else any of that language, so `de-CH` may be answered with German as
+/// Germany writes it. A language the server has none for is not found. Needs no session. A browser keeps
+/// the file and is told when it has not changed.
+pub fn dictionary_aff(tag: &str) -> String {
+    format!("{DICTIONARIES}/{}/aff", segment(tag))
+}
+
+/// `GET`: the word list of the dictionary [`dictionary_aff`] answers for `tag`, as UTF-8 text.
+pub fn dictionary_dic(tag: &str) -> String {
+    format!("{DICTIONARIES}/{}/dic", segment(tag))
+}
+
 /// `GET`: every [`Space`](crate::Space) the session reaches.
 pub const SPACES: &str = "/api/v1/spaces";
 /// `GET`: the documents the person opened lately, as [`Entry`](crate::Entry)s, newest first.

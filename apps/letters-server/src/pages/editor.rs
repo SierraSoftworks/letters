@@ -148,7 +148,7 @@ pub async fn file(
 }
 
 /// Whether the browser says it reads brotli. Most say so only to a server they reach over TLS.
-fn takes_brotli(headers: &HeaderMap) -> bool {
+pub(crate) fn takes_brotli(headers: &HeaderMap) -> bool {
     let said = headers.get_all(ACCEPT_ENCODING).iter().filter_map(|value| value.to_str().ok());
     said.flat_map(|value| value.split(',')).any(|coding| {
         let mut parts = coding.split(';').map(str::trim);

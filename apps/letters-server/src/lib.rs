@@ -11,6 +11,8 @@
 //! - [`import`] makes a document of a Markdown or a Word file.
 //! - [`shares`] is who reaches a document besides those its space lets in, and [`links`] are the
 //!   addresses that let in whoever holds one.
+//! - [`dictionaries`] are the word lists of other languages, for the spell checker of the editor in a
+//!   browser.
 //! - [`fetch`] is what the server fetches for a document from elsewhere: a linked picture, a link's page.
 //! - [`seen`] is where each person read a document up to.
 //! - [`rooms`] are the documents that are open now, and [`socket`] is each device's line to one.
@@ -25,6 +27,7 @@ pub mod access;
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod dictionaries;
 pub mod error;
 pub mod fetch;
 pub mod home;
@@ -52,6 +55,7 @@ use letters_api::{Person, Role, Space};
 
 use crate::access::Log;
 use crate::config::Config;
+use crate::dictionaries::Dictionaries;
 use crate::error::{Answer, Refusal};
 use crate::fetch::{Fetches, Roots};
 use crate::home::Homes;
@@ -83,6 +87,7 @@ pub struct App {
     /// What the access logs noted of late.
     pub log: Log,
     pub telemetry: Telemetry,
+    pub(crate) dictionaries: Dictionaries,
     homes: Homes,
     clock: Clock,
 }
@@ -96,7 +101,22 @@ impl App {
         let (editor, fetches) = (Editor::compiled(), Fetches::new(Roots::System));
         let (library, doors, log) = (Library::new(), Doors::default(), Log::default());
         let (telemetry, homes, clock) = (Telemetry::default(), Homes::default(), Box::new(clock));
-        Self { config, store, library, provider, rooms, editor, fetches, doors, log, telemetry, homes, clock }
+        let dictionaries = Dictionaries::default();
+        Self {
+            config,
+            store,
+            library,
+            provider,
+            rooms,
+            editor,
+            fetches,
+            doors,
+            log,
+            telemetry,
+            dictionaries,
+            homes,
+            clock,
+        }
     }
 
     /// The same server taking another word on who a site is, for tests against a site of their own.

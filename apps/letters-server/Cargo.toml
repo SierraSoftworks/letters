@@ -26,6 +26,9 @@ letters-fonts.workspace = true
 # script, from what `apps/letters-web/build.sh` made.
 letters-web = { path = "../letters-web" }
 brotli-decompressor.workspace = true
+# Presses the dictionaries of other languages, which the owner adds after the build.
+brotli.workspace = true
+encoding_rs.workspace = true
 
 axum.workspace = true
 tokio.workspace = true
@@ -49,7 +52,6 @@ tracing-batteries.workspace = true
 brotli.workspace = true
 
 [dev-dependencies]
-brotli.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
 zip.workspace = true

@@ -874,6 +874,7 @@ fn entry(row: &Row, role: Role) -> Entry {
 pub fn router(app: Arc<App>) -> Router {
     let routes = routes().merge(crate::shares::routes()).merge(crate::links::routes());
     let routes = routes.merge(crate::access::routes()).merge(crate::socket::routes()).merge(crate::seen::routes());
+    let routes = routes.merge(crate::dictionaries::routes());
     let routes = routes.merge(crate::auth::routes()).merge(crate::pages::routes());
     // Around every route, and around the answer where there is none.
     let routes = match app.config.server.log {
