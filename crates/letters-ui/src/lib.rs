@@ -73,7 +73,7 @@ mod words;
 mod written;
 
 pub use accesskit::Role;
-pub use browsing::{Browsed, Place};
+pub use browsing::{Browsed, Place, Stored};
 pub use callouts::Calling;
 pub use chrome::{Chrome, Edge, Frame, WindowButton};
 pub use commands::names as command_names;

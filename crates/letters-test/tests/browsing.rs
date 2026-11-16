@@ -4,7 +4,7 @@
 use letters_api::{Entry, EntryKind, Role as Grade, Space, SpaceKind, Tag, Trashed};
 use letters_render::{Item, Point};
 use letters_test::{Found, Harness, Role};
-use letters_ui::{Browsed, Landing, Place, Request, Server};
+use letters_ui::{Browsed, Landing, Place, Request, Server, Stored};
 
 const HOME: &str = "https://letters.example.org";
 const WORK: &str = "https://docs.example.net";
@@ -1344,4 +1344,71 @@ fn a_file_that_is_no_document_yet_is_listed_under_its_document_or_offered_to_imp
     assert!(button(&mut window, "Import", "As a new document").is_none());
     let said = window.find(Role::ListBoxOption, "Agenda.docx").expect("listed").description.unwrap_or_default();
     assert!(said.contains("Not imported"), "{said}");
+}
+
+#[test]
+fn the_card_opened_from_a_servers_document_starts_at_that_document() {
+    let stored = |server: &str, space: Option<&str>, path: &str| Stored {
+        server: server.into(),
+        space: space.map(str::to_owned),
+        path: path.into(),
+        id: "d7".into(),
+    };
+    let spaces =
+        |server: &str| Browsed { server: server.into(), place: Place::Spaces, spaces: spaces(), entries: Vec::new() };
+    let show = |window: &mut Harness| {
+        window.click(Role::Button, "More").click(Role::MenuItem, "Open").assert_open(Role::Dialog, "Open");
+    };
+    // Where the document is, and the place the card first asks for once it has the spaces.
+    let cases = [
+        (
+            "in a folder",
+            stored(WORK, Some("family"), "House/Plans/Roof plan.let"),
+            WORK,
+            within("family", "House/Plans"),
+        ),
+        ("at the top of a space", stored(WORK, Some("sam"), "Roof plan.let"), WORK, within("sam", "")),
+        ("only shared with the person", stored(WORK, None, "Roof plan.let"), WORK, Place::Shared),
+        ("in a space the person no longer has", stored(WORK, Some("gone"), "Roof plan.let"), WORK, within("sam", "")),
+        (
+            "on a server the person is signed out of",
+            stored("https://old.example.com", Some("sam"), "A/Roof plan.let"),
+            HOME,
+            within("sam", ""),
+        ),
+    ];
+    for (case, stored, server, place) in cases {
+        let mut window = signed_in(&[HOME, WORK]);
+        window.ui().set_stored(Some(stored));
+        show(&mut window);
+        assert_eq!(window.ui().take_requests(), [browse(server, Place::Spaces)], "{case}");
+        window.ui().set_listing(spaces(server));
+        assert_eq!(window.ui().take_requests(), [browse(server, place)], "{case}");
+    }
+
+    // Its row takes the keyboard, in sight however far down the list it is.
+    let mut window = signed_in(&[HOME]);
+    window.ui().set_stored(Some(stored(HOME, Some("sam"), "House/Roof plan.let")));
+    show(&mut window);
+    window.ui().set_listing(spaces(HOME));
+    let mut held: Vec<Entry> =
+        (0..60).map(|at| document("sam", &format!("House/Note {at:02}.let"), &format!("n{at}"), DAY)).collect();
+    held.push(document("sam", "House/Roof plan.let", "d7", 0));
+    window.ui().set_listing(listing(HOME, within("sam", "House"), held));
+    let focused = window.focused().expect("a row has the keyboard");
+    assert!(focused.name.contains("Roof plan"), "{}", focused.name);
+    let list = window.find(Role::ListBox, "Documents").expect("the documents are listed").bounds;
+    assert!(list.contains(focused.center()), "the row is in sight");
+
+    // In another folder the first row takes it, as for any card.
+    window.click(Role::ListBoxOption, "Family");
+    window.ui().set_listing(listing(HOME, within("family", ""), vec![document("family", "Rota.let", "f1", 0)]));
+    assert!(window.focused().is_some_and(|focused| focused.name.contains("Rota")));
+
+    // A document no server keeps leaves the card where it starts for anyone.
+    let mut window = signed_in(&[HOME]);
+    window.ui().set_stored(None);
+    show(&mut window);
+    window.ui().set_listing(spaces(HOME));
+    assert_eq!(window.ui().take_requests(), [browse(HOME, Place::Spaces), browse(HOME, within("sam", ""))]);
 }
