@@ -135,18 +135,28 @@ jobs:
       - name: Test
         run: ./scripts/check.sh slow
 
-  # The server as it ships: its own profile, with the browser's editor compiled in. Nothing else builds
-  # it, and thin LTO on one codegen unit takes minutes, so each night and when asked for.
+  # The server as it ships: its own profile, with the browser's editor compiled in, as one file that asks
+  # nothing of the system it is copied to. Nothing else builds it, and thin LTO on one codegen unit takes
+  # minutes, so each night and when asked for.
   server:
     name: Server build
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      SERVER_TARGET: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v7
 
+      # The target is this job's alone, so rust-toolchain.toml does not name it.
       - name: Install Rust
-        run: rustup toolchain install
+        run: |
+          rustup toolchain install
+          rustup target add "$SERVER_TARGET"
+
+      # The C in `ring` is built by the target's own compiler.
+      - name: Install the musl compiler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends musl-tools
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -160,7 +170,17 @@ jobs:
       - name: Build
         env:
           LETTERS_WEB_DIST: ${{ github.workspace }}/apps/letters-web/dist
-        run: cargo build --profile server -p letters-server
+        run: cargo build --profile server -p letters-server --target "$SERVER_TARGET"
+
+      # A file that names a loader or a library of the system's would not start where those are missing.
+      - name: Check that it is static
+        shell: bash
+        run: |
+          asks=$(readelf --program-headers --dynamic "target/$SERVER_TARGET/server/letters-server")
+          if grep -E 'INTERP|NEEDED' <<<"$asks"; then
+            echo "::error::the server is not a static file"
+            exit 1
+          fi
 
       # The least a server must do: read its settings and say they are sound.
       - name: Check that it starts
@@ -180,7 +200,7 @@ jobs:
           name = "Home"
           path = '$RUNNER_TEMP/home/{username}'
           EOF
-          target/server/letters-server --check --config "$RUNNER_TEMP/letters.toml"
+          "target/$SERVER_TARGET/server/letters-server" --check --config "$RUNNER_TEMP/letters.toml"
 
   # What layout costs a frame. The bench holds its own budgets and fails when a measurement is over one.
   bench:
