@@ -63,6 +63,7 @@ use crate::platform::{self, Desktop};
 use crate::present::{Painter, Presenter};
 use crate::printing;
 use crate::remote::{self, Roots};
+use crate::seen::Seen;
 use crate::server::Client;
 use crate::servers;
 use crate::session::Session;
@@ -119,7 +120,7 @@ pub enum Event {
     /// The desktop has said which buttons its windows carry.
     Buttons(Buttons),
     /// What the person's account calls them has been found.
-    Account(String),
+    Account(Option<String>),
     /// The languages the system has dictionaries for have been listed.
     Languages(Vec<String>),
     /// A picture a window's page asked for was decoded, to be held no wider than the last, or could not
@@ -211,6 +212,8 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         proxy: event_loop.create_proxy(),
         platform: Desktop::new().with_words(Words::of(&home)),
         library: Library::of(&home),
+        seen: Seen::of(&home),
+        named: false,
         words: Words::of(&home),
         trust: trust::store(&home),
         journals: Journals::of(&home),
@@ -421,6 +424,10 @@ struct App {
     proxy: EventLoopProxy<Event>,
     platform: Desktop,
     library: Library,
+    /// What the person last saw of each document.
+    seen: Seen,
+    /// Whether the account was asked for its name, so that who writes here is as known as it will be.
+    named: bool,
     words: Words,
     trust: Trusted,
     journals: Journals,
@@ -678,6 +685,15 @@ struct DocWindow {
     saving: Option<(u64, Revision, JoinHandle<Saving>)>,
     save_failed: bool,
 
+    /// Where what the person saw of each document is kept, and what was last kept there of this one.
+    seen: Seen,
+    marked: Option<Revision>,
+    /// What the person last saw of the document, until the window is told.
+    last_seen: Option<Revision>,
+    /// Whether who writes here is as known as it will be. Until then the person's own writing from
+    /// elsewhere could pass for another's.
+    named: bool,
+
     /// What the first paint did not need from the file, until reading it starts.
     rest: Option<Rest>,
     reading: Option<JoinHandle<Result<Working, &'static str>>>,
@@ -879,6 +895,8 @@ impl DocWindow {
         let theirs = self.remote.as_ref().map(|remote| remote.opened.author.as_str()).filter(|name| !name.is_empty());
         if let Some(writer) = theirs.or(writer) {
             self.view.set_author(writer);
+            self.named = true;
+            self.say_seen();
         }
         self.appearance = settings.appearance;
         // What the system draws of the window goes light or dark with it: a title bar, or its buttons.
@@ -1024,9 +1042,30 @@ impl DocWindow {
         self.journal = Some(journal);
     }
 
+    /// Tells the window what the person last saw of the document, once: when who writes here is known,
+    /// and a server's document holds what its server does. What comes in after that is seen as it comes.
+    fn say_seen(&mut self) {
+        let live = |remote: &Remote| matches!(remote.line.link(), letters_sync::Link::Live(_));
+        if self.named && self.remote.as_ref().is_none_or(live) && self.last_seen.is_some() {
+            self.view.set_last_seen(self.last_seen.take());
+        }
+    }
+
+    /// Keeps what the person has seen of the document, which is all the window shows of it, for the note
+    /// of what others wrote when it is next opened. Kept at each save, so that a crash loses little.
+    fn saw(&mut self) {
+        let Some(id) = self.id.as_deref().filter(|_| self.keeps && self.file().is_some()) else { return };
+        let revision = self.view.editor().model().revision();
+        if self.marked.as_ref() != Some(&revision) {
+            self.seen.saw(id, &revision);
+            self.marked = Some(revision);
+        }
+    }
+
     /// Lets the journal go as the window closes with everything saved. A document that was never worth
     /// a file is not worth bringing back either.
     fn leave(&mut self) {
+        self.saw();
         if let Some(remote) = &mut self.remote {
             remote.line.stop();
         }
@@ -1372,6 +1411,7 @@ impl DocWindow {
         (self.twinned, self.listed) = (true, self.place.path().map(Path::to_owned));
         if !reached.opened.author.is_empty() {
             self.view.set_author(&reached.opened.author);
+            self.named = true;
         }
         // A window that is tied again, as after a new sign-in, lets go of the line it had.
         let owes = self.remote.take().is_some_and(|mut before| {
@@ -1529,6 +1569,8 @@ impl DocWindow {
                 Told::Peers => {}
             }
         }
+        // With the server caught up with, what others wrote since the last visit is all here.
+        self.say_seen();
         // Whatever was written here or there since may have moved the text under the others' carets.
         self.show_peers();
         if stands {
@@ -1614,6 +1656,11 @@ impl DocWindow {
                     eprintln!("letters: could not bring back unsaved work in {}: {error}", self.name());
                 }
                 self.id = Some(copy.id.clone());
+                // Read once, before a save of this visit keeps what is seen now in its place.
+                if self.keeps {
+                    self.last_seen = self.seen.last(&copy.id);
+                    self.say_seen();
+                }
                 // What the file held is where the last session ended, should this one write anything.
                 let found = copy.model().revision();
                 let imported = self.imported.take();
@@ -2016,6 +2063,7 @@ impl DocWindow {
             self.retitle();
             self.view.set_merged(names);
         }
+        self.saw();
     }
 
     /// Saves to `home` on this thread, with the copy the window keeps for it.
@@ -2181,6 +2229,10 @@ impl App {
             save_at: None,
             saving: None,
             save_failed: false,
+            seen: self.seen.clone(),
+            marked: None,
+            last_seen: None,
+            named: self.named,
             rest: Some(rest),
             reading: None,
             copy: None,
@@ -3623,9 +3675,7 @@ impl ApplicationHandler<Event> for App {
                     let (proxy, folders) = (self.proxy.clone(), self.dictionaries.clone());
                     thread::spawn(move || {
                         // First, since it is wanted before the first edit.
-                        if let Some(account) = writer::account() {
-                            let _ = proxy.send_event(Event::Account(account));
-                        }
+                        let _ = proxy.send_event(Event::Account(writer::account()));
                         if let Some(reduced) = chrome::reduced_motion() {
                             let _ = proxy.send_event(Event::Motion(reduced));
                         }
@@ -4001,13 +4051,17 @@ impl ApplicationHandler<Event> for App {
                 }
             }
             Event::Account(name) => {
-                self.account = Some(name);
+                (self.account, self.named) = (name, true);
                 let writer = self.settings.name.as_deref().or(self.account.as_deref());
                 for window in self.windows.values_mut() {
                     window.view.set_account_name(self.account.as_deref());
                     if let Some(writer) = writer {
                         window.view.set_author(writer);
                     }
+                    // Named or not, who writes here is as known as it will be.
+                    window.named = true;
+                    window.say_seen();
+                    window.window.request_redraw();
                 }
             }
             Event::Languages(languages) => {

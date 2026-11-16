@@ -37,6 +37,7 @@ pub mod platform;
 pub mod present;
 pub mod printing;
 pub mod remote;
+pub mod seen;
 pub mod server;
 pub mod servers;
 pub mod session;
