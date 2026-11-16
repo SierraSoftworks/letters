@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Draws everything under `assets/icons/` that is not an SVG from the SVGs there, with Playwright's Chromium.
 // The 16 and 32 pixel drawings are their own, set on whole pixels: the rest is the full drawing.
+// `web/` is what a browser asks a site for. `bleed.svg` is the app icon for a system that cuts the tile itself.
 //
 //   node scripts/icons.cjs
 const { chromium } = require("playwright");
@@ -46,16 +47,25 @@ function ico(pngs, sizes) {
 (async () => {
   const browser = await chromium.launch();
   const page = await browser.newPage({ deviceScaleFactor: 1 });
+  const draw = async (svg, size) => {
+    await page.setViewportSize({ width: size, height: size });
+    await page.setContent(`<style>html,body{margin:0;background:transparent}svg{display:block;width:${size}px;height:${size}px}</style>${svg}`);
+    return page.screenshot({ omitBackground: true });
+  };
   mkdirSync(join(ICONS, "png"), { recursive: true });
   const sets = {};
   for (const name of ["app", "file"]) {
     sets[name] = {};
     for (const size of SIZES) {
-      await page.setViewportSize({ width: size, height: size });
-      await page.setContent(`<style>html,body{margin:0;background:transparent}svg{display:block;width:${size}px;height:${size}px}</style>${drawing(name, size)}`);
-      sets[name][size] = await page.screenshot({ omitBackground: true });
+      sets[name][size] = await draw(drawing(name, size), size);
       if (size <= 512) writeFileSync(join(ICONS, "png", `${name}-${size}.png`), sets[name][size]);
     }
+  }
+  // A page's icons: the tab's is `favicon.ico`, and the bar of the server's pages shows the 32 pixel drawing.
+  const web = { "apple-touch-icon": ["bleed", 180], "icon-192": ["app", 192], "icon-512": ["app", 512], "icon-maskable-512": ["bleed", 512] };
+  mkdirSync(join(ICONS, "web"), { recursive: true });
+  for (const [file, [name, size]] of Object.entries(web)) {
+    writeFileSync(join(ICONS, "web", `${file}.png`), await draw(readFileSync(join(ICONS, `${name}.svg`), "utf8"), size));
   }
   await browser.close();
   writeFileSync(join(ICONS, "letters.icns"), icns(sets.app));

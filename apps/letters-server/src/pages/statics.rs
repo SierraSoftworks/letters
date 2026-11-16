@@ -14,8 +14,23 @@ use sha2::{Digest, Sha256};
 use crate::ids::hex;
 
 const CSS: &str = "text/css; charset=utf-8";
+const PNG: &str = "image/png";
 /// The rules of the server's own pages, on top of yewi's.
 const OWN: &str = include_str!("letters.css");
+/// The icon in the tab and in a browser's own lists, drawn at 16, 32 and 48 pixels.
+pub const TAB_ICON: &str = "favicon.ico";
+/// The icon a home screen shows, which the system cuts to its own tile.
+pub const TOUCH_ICON: &str = "apple-touch-icon.png";
+/// The list of the icons a browser may show the server under.
+pub const MANIFEST: &str = "site.webmanifest";
+/// The icon beside the server's name in the bar: the drawing set on the pixels of a small size.
+pub const LOGO: &str = "logo.svg";
+/// The icons [`MANIFEST`] names, beside it.
+const LISTED: [(&str, &[u8]); 3] = [
+    ("icon-192.png", include_bytes!("../../../../assets/icons/web/icon-192.png")),
+    ("icon-512.png", include_bytes!("../../../../assets/icons/web/icon-512.png")),
+    ("icon-maskable-512.png", include_bytes!("../../../../assets/icons/web/icon-maskable-512.png")),
+];
 /// Where the fonts a document is set in are, under [`Statics::base`], by their names in
 /// [`letters_fonts::FILES`].
 pub const FACES: &str = "faces";
@@ -44,7 +59,16 @@ pub fn statics() -> &'static Statics {
             file("letters.css", CSS, OWN.as_bytes()),
             // The fonts of the pages themselves. The rules name each file beside them.
             file("fonts/fonts.css", CSS, yewi::fonts::RELATIVE_CSS.as_bytes()),
+            file(TAB_ICON, "image/x-icon", include_bytes!("../../../../assets/icons/favicon.ico")),
+            file(TOUCH_ICON, PNG, include_bytes!("../../../../assets/icons/web/apple-touch-icon.png")),
+            file(
+                MANIFEST,
+                "application/manifest+json",
+                include_bytes!("../../../../assets/icons/web/site.webmanifest"),
+            ),
+            file(LOGO, "image/svg+xml", include_bytes!("../../../../assets/icons/app-32.svg")),
         ];
+        files.extend(LISTED.iter().map(|(name, bytes)| file(name, PNG, bytes)));
         files.extend(
             yewi::fonts::FILES
                 .iter()

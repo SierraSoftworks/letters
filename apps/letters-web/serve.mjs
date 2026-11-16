@@ -13,9 +13,11 @@ const TYPES = {
   ".html": "text/html; charset=utf-8",
   ".ico": "image/x-icon",
   ".js": "text/javascript",
+  ".png": "image/png",
   ".ttf": "font/ttf",
   ".txt": "text/plain; charset=utf-8",
   ".wasm": "application/wasm",
+  ".webmanifest": "application/manifest+json",
 };
 const port = Number(process.argv[2] ?? 8080);
 

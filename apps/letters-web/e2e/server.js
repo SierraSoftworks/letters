@@ -13,7 +13,7 @@ const ID = "0190f3a2-7c1e-7b4a-9c55-3f2a1b0c9d8e";
 // What the server sends its pages under: nothing inline runs, and nothing is fetched from elsewhere.
 const POLICY =
   "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'unsafe-inline'; img-src 'self' blob: data:; " +
-  "font-src 'self'; connect-src 'self' ws://localhost:*; frame-src blob:; base-uri 'self'; form-action 'none'; frame-ancestors 'none'";
+  "font-src 'self'; connect-src 'self' ws://localhost:*; frame-src blob:; manifest-src 'self'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'";
 
 /** What a server says of a document its person may edit, as `letters_api::Opened`. */
 export const opened = (over = {}) => ({

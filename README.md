@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icons/png/app-256.png" width="128" height="128" alt="The Letters icon" /></p>
+
 # Letters
 
 A local-first document editor: one Rust editing engine, one self-contained `.let` file per document, and a

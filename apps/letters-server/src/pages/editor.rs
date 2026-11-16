@@ -90,7 +90,7 @@ pub async fn page(State(app): State<Shared>, Opener(who): Opener, Path(id): Path
     }
 }
 
-/// What the page may load: the editor's files, and the pictures and frames the editor makes itself. It
+/// What the page may load: the editor's files, its icons, and the pictures and frames the editor makes itself. It
 /// reaches this server alone, by request and by the document's socket.
 fn policy(app: &App) -> String {
     // A browser may read `'self'` as the page's own scheme alone, and the socket has another: `wss` for
@@ -99,7 +99,7 @@ fn policy(app: &App) -> String {
     format!(
         "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'unsafe-inline'; \
          img-src 'self' blob: data:; font-src 'self'; connect-src 'self' {socket}; frame-src blob:; \
-         base-uri 'self'; form-action 'none'; frame-ancestors 'none'"
+         manifest-src 'self'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'"
     )
 }
 
@@ -168,6 +168,8 @@ fn kind(name: &str) -> &'static str {
         "ttf" => "font/ttf",
         "otf" => "font/otf",
         "ico" => "image/x-icon",
+        "png" => "image/png",
+        "webmanifest" => "application/manifest+json",
         "txt" => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
