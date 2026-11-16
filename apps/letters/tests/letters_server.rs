@@ -92,6 +92,7 @@ path = '{at}/home/{{username}}'
             down: AtomicBool::new(false),
             sockets: AtomicUsize::new(0),
             log: Mutex::default(),
+            broken: Mutex::default(),
         });
         let serving = front.clone();
         // The server speaks plain HTTP and expects TLS in front of it, as it has wherever it runs.
@@ -215,6 +216,8 @@ struct Front {
     sockets: AtomicUsize,
     /// What came in for the server: `picture NAME` and `edits`.
     log: Mutex<Vec<String>>,
+    /// Part of an address that is answered with a 500 and never reaches the server.
+    broken: Mutex<Option<String>>,
 }
 
 /// Whether a read only ran out of time.
@@ -234,6 +237,9 @@ impl Front {
         let mut line = said.split(' ');
         let (verb, path) = (line.next().unwrap_or_default(), line.next().unwrap_or_default());
         let of_document = path.strip_prefix("/api/v1/documents/").and_then(|rest| rest.split_once('/'));
+        if self.broken.lock().unwrap().as_deref().is_some_and(|part| path.contains(part)) {
+            return stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n");
+        }
         if let Some((_, "sync")) = of_document {
             self.sockets.fetch_add(1, Ordering::Relaxed);
             let carried = self.carry(stream, &head);
@@ -892,4 +898,35 @@ fn work_that_fits_no_frame_travels_as_the_file() {
     // And the line carries what is written after as it did before.
     there.write("after", "Then the gutters.");
     assert!(settle(&mut [&mut here, &mut there], |desks| desks[0].reads().len() == paragraphs + 1));
+}
+
+#[test]
+fn the_folders_to_move_among_are_listed_whatever_some_of_them_do() {
+    let server = Server::start("shelves");
+    let session = server.session(ada());
+    let spaces = session.spaces().unwrap();
+    let space = spaces.iter().find(|space| space.kind == SpaceKind::Personal).unwrap().id.clone();
+    // A home as a person keeps one: a folder with more in it than a tree lists, one the server cannot
+    // read, and the document some way down another.
+    let folder = |parent: &str, name: &str| drop(session.new_folder(&space, parent, name).expect("a folder is made"));
+    for (parent, name) in [("", "Archive"), ("", "Locked"), ("Locked", "Inside"), ("", "Work"), ("Work", "Plans")] {
+        folder(parent, name);
+    }
+    (0..210).for_each(|year| folder("Archive", &format!("Year {year:03}")));
+    let id = session.new_document(&space, "Work/Plans", None).unwrap().id.unwrap();
+    let home = Scratch::new("shelves-home");
+    let copy = connected::reach(&session, &id, &home.0).expect("the document is brought here").path;
+    *server.front.broken.lock().unwrap() = Some("path=Locked".into());
+
+    let shelves = connected::place(&session, &id, &copy, &[Placing::Look]).shelves.expect("its space has folders");
+    let listed = |path: &str| shelves.iter().find(|shelf| shelf.path == path).map(|shelf| shelf.depth);
+    // Every folder at the top is there, and so is the one the document is in, under its own.
+    for (path, depth) in [("", 0), ("Archive", 1), ("Locked", 1), ("Work", 1), ("Work/Plans", 2)] {
+        assert_eq!(listed(path), Some(depth), "{path:?}");
+    }
+    let after = |path: &str| shelves.iter().position(|shelf| shelf.path == path);
+    assert!(after("Work") < after("Work/Plans"), "a folder comes before what is in it");
+    // What could not be listed is a folder with nothing in it, and a great many are not all asked for.
+    assert_eq!(listed("Locked/Inside"), None);
+    assert!(listed("Archive/Year 000").is_some() && shelves.len() < 210, "{} folders", shelves.len());
 }
