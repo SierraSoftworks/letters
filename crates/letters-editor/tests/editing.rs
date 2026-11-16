@@ -136,6 +136,28 @@ fn tab_nests_list_items_and_steps_code() {
 }
 
 #[test]
+fn tab_steps_every_line_and_block_a_selection_takes_in() {
+    let cases = [
+        // Several lines of code step together, and the selection stays on the same text.
+        ("code a^a⏎bb⏎c|c", "Tab", "code     a^a⏎    bb⏎    c|c"),
+        ("code a|a⏎b^b", "Tab", "code     a|a⏎    b^b"),
+        ("code     a^a⏎  bb⏎c|c", "Shift+Tab", "code a^a⏎bb⏎c|c"),
+        // An empty line gains nothing, and neither does a line the selection only reaches the start of.
+        ("code ^aa⏎⏎bb⏎|cc", "Tab", "code ^    aa⏎⏎    bb⏎|cc"),
+        // Within one line the selection is typed over, as before.
+        ("code a^a|a", "Tab", "code a    |a"),
+        // Lists and code step whichever block the selection ends in, and text with no level stays.
+        ("p o^ne\nul two\nul three\ncode x\np fo|ur", "Tab", "p o^ne\nul two\n  ul three\ncode     x\np fo|ur"),
+        ("p o|ne\nul two\n  ul th^ree", "Shift+Tab", "p o|ne\nul two\nul th^ree"),
+    ];
+    for (before, key, after) in cases {
+        assert_eq!(play(before, &[K(key)]), canon(after), "{key} from {before:?}");
+    }
+    // The whole step is one undo.
+    assert_eq!(play("code a^a⏎b|b", &[K("Tab"), K("Mod+z")]), canon("code a^a⏎b|b"));
+}
+
+#[test]
 fn blocks_change_kind_on_command() {
     let bullet = BlockKind::ListItem { list: ListKind::Bullet, depth: 0 };
     let task = BlockKind::ListItem { list: ListKind::Task { checked: false }, depth: 0 };

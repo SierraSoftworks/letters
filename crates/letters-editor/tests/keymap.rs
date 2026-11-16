@@ -91,6 +91,8 @@ fn a_key_with_nothing_to_do_is_left_to_the_shell() {
     let cases = [
         // (a place where the key means nothing, a place where it does, the key)
         ("p one|", "ul one|", "Tab"),
+        ("p o^ne\np tw|o", "p o^ne\nul tw|o", "Tab"),
+        ("p o^ne\np tw|o", "ul o^ne\np tw|o", "Shift+Tab"),
         ("p one|", "todo one|", "Mod+Enter"),
         ("p one|", "p ^one|", "Mod+c"),
         ("code one|", "p one|", "Mod+b"),
