@@ -257,21 +257,59 @@ async fn a_link_that_is_over_lets_nobody_in_and_whoever_it_let_in_goes() {
 async fn a_link_withholds_what_it_does_not_let_its_reader_take_away() {
     let (server, ada, _, id) = planned("links-allows").await;
     let (all, none) = (Allows { download: true, copy: true, print: true }, Allows::default());
-    let (kept, taken) = (StatusCode::FORBIDDEN, StatusCode::OK);
-    // What the link allows, then what becomes of asking for the file, and for the page of its text.
     let cases = [
-        (none, kept, kept),
-        (Allows { download: true, ..none }, taken, kept),
-        (Allows { download: false, ..all }, kept, taken),
-        (Allows { print: false, ..all }, taken, kept),
-        (all, taken, taken),
+        none,
+        Allows { download: true, ..none },
+        Allows { download: false, ..all },
+        Allows { print: false, ..all },
+        Allows { copy: false, ..all },
+        all,
     ];
-    for (allows, file, page) in cases {
+    for allows in cases {
         let (mut guest, _) = let_in(&server, &ada, &id, &NewLink { allows, ..link("Accountant", Role::Reader) }).await;
         let opened: Opened = guest.get(&paths::document(&id)).await.json();
         assert_eq!(opened.allows, allows);
-        assert_eq!(guest.get(&paths::file(&id)).await.status, file, "the file, with {allows:?}");
-        assert_eq!(guest.get(&paths::read_page(&id)).await.status, page, "the page to read, with {allows:?}");
+        let file = guest.get(&paths::file(&id)).await.status;
+        assert_eq!(file == StatusCode::OK, allows.download, "the file, with {allows:?}: {file}");
+        // The page of its text is all that a reader's link shows. It offers the file, lets its text be
+        // selected and goes to paper where the link lets its reader take that much away.
+        let page = guest.get(&paths::read_page(&id)).await;
+        assert_eq!(page.status, StatusCode::OK, "the page to read, with {allows:?}");
+        let page = page.text();
+        let offers = page.contains(&format!("href=\"{}\"", paths::file(&id)));
+        let (selects, prints) = (!page.contains("user-select: none"), !page.contains("does not let its reader print"));
+        assert_eq!((offers, selects, prints), (allows.download, allows.copy, allows.print), "{allows:?}");
+    }
+    // Someone signed in reads the page as it always was: what is theirs to take is on their own pages.
+    let ben = server.reader("ben", &[]).get(&paths::read_page(&id)).await.text();
+    assert!(!ben.contains(&paths::file(&id)) && !ben.contains("user-select: none"), "{ben}");
+}
+
+#[tokio::test]
+async fn a_link_for_a_reader_shows_the_document_to_read_and_opens_no_line_to_it() {
+    let (server, ada, _, id) = planned("links-read").await;
+    let made: CreatedLink = ada.post(&paths::links(&id), &link("Readers", Role::Reader)).await.unwrap();
+    let commenting: CreatedLink = ada.post(&paths::links(&id), &link("Reviewers", Role::Commenter)).await.unwrap();
+    // Who follows which link, and whether the document is then theirs to read alone: a link for a reader,
+    // where nothing else leads them to it. Ben's share lets him edit, whatever link he follows.
+    let cases = [
+        (None, &made, true),
+        (Some("carol"), &made, true),
+        (Some("ben"), &made, false),
+        (None, &commenting, false),
+        (Some("carol"), &commenting, false),
+    ];
+    for (username, by, reads) in cases {
+        let mut browser = username.map_or_else(|| server.visitor(), |username| server.reader(username, &[]));
+        follow(&mut browser, by).await;
+        let said = format!("{username:?} by {}", by.link.label);
+        // No line to the document's room is opened for a reader: its past would go down it.
+        let line = Desk::paged(&server, &browser, &id).await.map(|_| ()).map_err(|refused| refused.code);
+        assert_eq!(line, if reads { Err(Code::Forbidden) } else { Ok(()) }, "{said}");
+        // The page of its text is there for either, and holds the document as it stands.
+        let page = browser.get(&paths::read_page(&id)).await;
+        assert_eq!(page.status, StatusCode::OK, "{said}");
+        assert!(page.text().contains("<title>Plan</title>"), "{said}");
     }
 }
 
@@ -366,12 +404,12 @@ async fn where_a_person_read_up_to_is_kept_by_their_account_and_for_nobody_else(
 async fn a_link_that_edits_writes_to_the_document() {
     let (server, ada, _, id) = planned("links-edits").await;
     let (mut editor, _) = let_in(&server, &ada, &id, &link("Accountant", Role::Editor)).await;
-    let (mut reader, _) = let_in(&server, &ada, &id, &link("Builder", Role::Reader)).await;
+    let (mut reader, _) = let_in(&server, &ada, &id, &link("Builder", Role::Commenter)).await;
     let mut writes = Desk::paged(&server, &editor, &id).await.unwrap();
     let mut reads = Desk::paged(&server, &reader, &id).await.unwrap();
     settle([&mut writes, &mut reads]).await;
     let seated = (writes.line.link(), reads.line.link());
-    assert_eq!(seated, (Live(letters_sync::Role::Editor), Live(letters_sync::Role::Reader)));
+    assert_eq!(seated, (Live(letters_sync::Role::Editor), Live(letters_sync::Role::Commenter)));
 
     writes.write("From the accountant. ");
     settle([&mut writes, &mut reads]).await;

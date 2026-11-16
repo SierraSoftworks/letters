@@ -147,6 +147,12 @@ impl Server {
         Self::behind(name, None)
     }
 
+    /// A server that makes links, whose browsers are sent `editor`.
+    pub fn linking_to(name: &str, editor: Editor) -> Self {
+        let linking = |at: &Path| format!("{}\n[links]\nenabled = true\n", sound(at));
+        Self::over(Scratch::new(name), &linking, |app| app.with_editor(Some(editor)))
+    }
+
     /// A server that makes links, and takes the word of `proxies` for where a request came from. `None`
     /// leaves that as the settings have it unasked.
     pub fn behind(name: &str, proxies: Option<&[&str]>) -> Self {

@@ -71,20 +71,21 @@ impl Editor {
     }
 }
 
-/// `GET /d/{id}`: the document in the editor. A server built with no editor shows it to read.
+/// `GET /d/{id}`: the document in the editor. A server built with no editor shows it to read, and so
+/// does any server to whoever a link for a reader alone leads in.
 pub async fn page(State(app): State<Shared>, Opener(who): Opener, Path(id): Path<String>) -> Response {
-    let Some(base) = app.editor.as_ref().map(|editor| editor.base.clone()) else {
-        return Redirect::to(&paths::read_page(&id)).into_response();
-    };
+    let read = Redirect::to(&paths::read_page(&id)).into_response();
+    let Some(base) = app.editor.as_ref().map(|editor| editor.base.clone()) else { return read };
     let written = blocking({
         let (app, who) = (app.clone(), who.clone());
         move || {
-            let (document, opened) = app.page(&who, &id)?;
-            Ok(letters_web::page::served(&document, &opened, &base))
+            let page = app.page(&who, &id)?;
+            Ok(page.map(|(document, opened)| letters_web::page::served(&document, &opened, &base)))
         }
     });
     match written.await {
-        Ok(html) => (StatusCode::OK, guarded(&policy(&app)), html).into_response(),
+        Ok(Some(html)) => (StatusCode::OK, guarded(&policy(&app)), html).into_response(),
+        Ok(None) => read,
         Err(refusal) => refused(&app, Some(&who), &refusal).await,
     }
 }

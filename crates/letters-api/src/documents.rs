@@ -190,7 +190,8 @@ pub struct Opened {
     pub allows: Allows,
     /// The session reaches the document by a share link alone, with no role of its own in it. A shell
     /// then shows no history, and a copy it saves is the document as it stands. A courtesy and not a
-    /// wall: the history still crosses the socket.
+    /// wall: the history still crosses the socket. A link for a reader opens no shell at all: the server
+    /// shows its visitor the page to read, and refuses them the socket.
     #[serde(default, skip_serializing_if = "no")]
     pub by_link: bool,
     /// The revision the person last read the document up to, on whatever device, as a shell said it at

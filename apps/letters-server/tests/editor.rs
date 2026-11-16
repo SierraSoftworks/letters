@@ -5,8 +5,8 @@ mod common;
 use std::io::Write;
 
 use axum::http::StatusCode;
-use common::{Server, URL};
-use letters_api::{Opened, paths};
+use common::{Server, URL, let_in, link};
+use letters_api::{Access, Action, Opened, Role, paths};
 use letters_server::pages::editor::{Editor, FALLBACK, File};
 
 /// The script a page starts with, which brotli makes no smaller.
@@ -67,6 +67,32 @@ async fn a_document_opens_in_the_editor_with_what_the_editor_starts_from() {
     let hidden = stranger.get(&paths::editor_page(&id)).await;
     assert_eq!(hidden.status, StatusCode::NOT_FOUND);
     assert!(!hidden.text().contains("Plan"));
+}
+
+#[tokio::test]
+async fn whoever_a_link_for_a_reader_leads_in_is_sent_on_to_the_page_to_read() {
+    let server = Server::linking_to("editor-links", editor());
+    let ada = server.person("ada", &[]);
+    let id = ada.start("home", "", "Plan").await.id.unwrap();
+    // What a link lets its reader do, and whether the document is then shown to read and not in the editor.
+    for (role, reads) in [(Role::Reader, true), (Role::Commenter, false), (Role::Editor, false)] {
+        let (mut guest, _) = let_in(&server, &ada, &id, &link("Guests", role)).await;
+        let page = guest.get(&paths::editor_page(&id)).await;
+        let sent = (page.status, page.location().to_owned(), page.text().contains("letters-opened"));
+        let expected = match reads {
+            true => (StatusCode::SEE_OTHER, paths::read_page(&id), false),
+            false => (StatusCode::OK, String::new(), true),
+        };
+        assert_eq!(sent, expected, "a link for a {role:?}");
+        // Being sent on is no view of the document. The page to read is one, as the editor's is.
+        let views = async || {
+            let rows: Vec<Access> = ada.get(&paths::access(&id)).await.unwrap();
+            rows.iter().filter(|row| (row.role, row.action, row.refused) == (role, Action::Open, false)).count()
+        };
+        assert_eq!(views().await, usize::from(!reads), "a link for a {role:?}, sent its page");
+        assert_eq!(guest.get(&paths::read_page(&id)).await.status, StatusCode::OK);
+        assert_eq!(views().await, 1, "a link for a {role:?}, having read");
+    }
 }
 
 #[tokio::test]

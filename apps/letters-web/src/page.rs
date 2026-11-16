@@ -349,6 +349,7 @@ mod server {
             window: Some(Column { gutter: GUTTER, top: TOP }),
             // The frame scrolls as the canvas will, with no bar of its own, and is as busy as the page around it.
             css: "html { scrollbar-width: none; cursor: progress; }\n",
+            ..HtmlPage::default()
         };
         letters_convert::to_html_with(document, style, title, &mut |_| None, &page)
     }

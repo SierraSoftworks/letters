@@ -292,8 +292,8 @@ fn a_page_loads_the_fonts_it_is_given_and_takes_the_callers_rules() {
         WebFont { family: "Inter", url: "/fonts/Inter.ttf", italic: false },
         WebFont { family: "Inter", url: "/fonts/Inter-Italic.ttf?v=\"2\"</style>", italic: true },
     ];
-    let page =
-        HtmlPage { fonts: &fonts, css: "html { cursor: progress; }\n/* </style><script> */", ..HtmlPage::default() };
+    let (css, above) = ("html { cursor: progress; }\n/* </style><script> */", "<nav>Download</nav>\n");
+    let page = HtmlPage { fonts: &fonts, css, above, ..HtmlPage::default() };
     let html = to_html_with(&document("# Title"), &Style::default(), "Report", &mut |_| None, &page);
     let css = stylesheet(&html);
 
@@ -310,6 +310,9 @@ fn a_page_loads_the_fonts_it_is_given_and_takes_the_callers_rules() {
     // The caller's rules come last, where they win, and neither they nor an address can end the stylesheet.
     assert!(css.trim_end().ends_with("html { cursor: progress; }\n/* <\\/style><script> */"), "{css}");
     assert_eq!(html.matches("</style>").count(), 1);
+    // The caller's own elements stand in the body, above the document.
+    let at = |part: &str| html.find(part).unwrap_or_else(|| panic!("{part} is in the page"));
+    assert!(at("<body>") < at(above) && at(above) < at("<article>"), "{html}");
 }
 
 #[test]

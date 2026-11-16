@@ -130,10 +130,16 @@ enabled = true
   internet, once the tailnet policy gives the machine the `funnel` attribute under `nodeAttrs`. The whole
   server is then asked from outside. Signing in still needs the provider, which only the tailnet reaches,
   but a browser or an app that is signed in already stays so wherever it is.
-- **History.** A link's visitor downloads the document as it stands, without its history or its comments,
-  and an editor a link opens is told to show and save no more. That is a courtesy and not a wall: the
-  history still reaches that editor over its socket, where a visitor with tools can read it. Do not share
-  by link a document whose history must not be read.
+- **Readers.** A link for a reader shows the document as a page to read: its text as it stands, with no
+  history and no comments. No editor opens and no socket is served, so nothing of the document's past
+  leaves the server. The page does not update live: reload it to see changes.
+- **Take away.** What a link does not let its reader take, the page to read withholds as far as a page
+  can: no download is offered, text that is not to be copied cannot be selected, and a page that is not
+  to be printed prints a notice in its place. The last two are a courtesy: the page's source holds the text.
+- **History.** A link that comments or edits opens the editor. Its visitor downloads the document as it
+  stands, without its history or its comments, and the editor is told to show and save no more. That is a
+  courtesy and not a wall: the history still reaches that editor over its socket, where a visitor with
+  tools can read it. Share a document whose history must not be read by a reader's link alone.
 - **Addresses.** A link's page counts tries by the visitor's address. `tailscale serve` and `funnel` name
   it in `X-Forwarded-For`, and the server takes that word only from the proxies its settings name:
   `proxies` under `[server]`, which is this machine (`127.0.0.1` and `::1`) unless set. A proxy on another

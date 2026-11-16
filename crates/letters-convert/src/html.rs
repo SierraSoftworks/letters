@@ -87,6 +87,9 @@ pub struct HtmlPage<'a> {
     /// Rules written last in the stylesheet, where they win. For what only the caller knows of its page,
     /// such as a cursor. The caller vouches for them: they are written as they are.
     pub css: &'a str,
+    /// Elements written first in the body, above the document. For what the caller's page offers of its
+    /// own, such as a bar. The caller vouches for them: they are written as they are.
+    pub above: &'a str,
 }
 
 /// A font file for a page to load.
@@ -136,7 +139,9 @@ pub fn to_html_with(doc: &Document, style: &Style, title: &str, assets: Assets, 
     escape(title, &mut out);
     out.push_str("</title>\n<style>\n");
     css(style, page, &mut out);
-    out.push_str("</style>\n</head>\n<body>\n<article>\n");
+    out.push_str("</style>\n</head>\n<body>\n");
+    out.push_str(page.above);
+    out.push_str("<article>\n");
     let size = |key: &str| {
         let points = style.types.get(key).or_else(|| style.types.get("body")).map_or(0.0, |of| of.size);
         if points.is_finite() && points > 0.0 { points * PIXELS } else { TextStyle::default().size * PIXELS }

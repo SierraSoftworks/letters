@@ -968,6 +968,10 @@ impl App {
         let (app, who, id) = (self.clone(), who.clone(), id.to_owned());
         blocking(move || {
             let found = app.locate(&who, &id)?;
+            // A document that is only shown to read has no line: its history would go down it.
+            if found.reading() {
+                return Err(Refusal::forbidden("This link shows the document to read. It opens no editor."));
+            }
             app.seat(&who, &found, &id)
         })
         .await

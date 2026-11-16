@@ -521,6 +521,13 @@ impl Found {
         self.until.is_some()
     }
 
+    /// Whether the document is only shown to read: a link for a reader is all that leads the session to
+    /// it. Its history would go down an editor's socket, where a visitor with tools reads what was taken
+    /// out, so there is no editor and no socket for it: the page of its text, as it stands.
+    pub fn reading(&self) -> bool {
+        self.by_link() && self.role == Role::Reader
+    }
+
     /// The space the session reaches the document in, for what is done to its place and not to it. A
     /// share is of the document alone.
     pub fn placed(&self) -> Answer<&Space> {
@@ -805,19 +812,22 @@ impl App {
 
     /// The document `id`, ready to edit. A `page` carries its style and its notes along.
     pub fn opened(&self, who: &Signed, id: &str, page: bool) -> Answer<Opened> {
-        Ok(self.opening(who, id, page)?.0)
+        Ok(self.opening(who, &self.locate(who, id)?, page)?.0)
     }
 
     /// The document `id` as a page for a browser's editor is made of it: what it holds now, and how it
-    /// is opened.
-    pub fn page(&self, who: &Signed, id: &str) -> Answer<(Document, Opened)> {
-        let (opened, mut file) = self.opening(who, id, true)?;
-        Ok((file.document()?, opened))
+    /// is opened. `None` for whoever it is only [shown to read](Found::reading), who is noted nowhere.
+    pub fn page(&self, who: &Signed, id: &str) -> Answer<Option<(Document, Opened)>> {
+        let found = self.locate(who, id)?;
+        if found.reading() {
+            return Ok(None);
+        }
+        let (opened, mut file) = self.opening(who, &found, true)?;
+        Ok(Some((file.document()?, opened)))
     }
 
-    /// How the document `id` is opened, and its file as that was read from.
-    fn opening(&self, who: &Signed, id: &str, page: bool) -> Answer<(Opened, File)> {
-        let found = self.locate(who, id)?;
+    /// How the document that was found is opened, and its file as that was read from.
+    fn opening(&self, who: &Signed, found: &Found, page: bool) -> Answer<(Opened, File)> {
         if page {
             // The style and the notes are read from the file, which its room may be ahead of.
             self.rooms.save(&found.root, &found.place);
@@ -830,7 +840,7 @@ impl App {
         };
         let (style, notes) = (json(&mut archive, STYLE)?, json(&mut archive, NOTES)?);
         self.note_opened(who, &manifest.id)?;
-        self.note(who, &found, &manifest.id, Action::Open, false);
+        self.note(who, found, &manifest.id, Action::Open, false);
         let opened = Opened {
             id: manifest.id.clone(),
             created: manifest.created,
@@ -842,7 +852,7 @@ impl App {
             role: found.role,
             author: self.signs_as(who)?,
             socket: paths::socket(&manifest.id),
-            trust: if self.trusts(who, &found, &manifest.id)? { Trust::Trusted } else { Trust::Safe },
+            trust: if self.trusts(who, found, &manifest.id)? { Trust::Trusted } else { Trust::Safe },
             allows: found.allows,
             by_link: found.by_link(),
             last_seen: self.last_seen(who, &manifest.id)?,
