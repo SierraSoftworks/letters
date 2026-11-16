@@ -6,9 +6,10 @@
 use accesskit::{HasPopup, Role};
 use letters_render::Rect;
 
+use crate::color::fade;
 use crate::element::Element;
-use crate::style::{Align, Edges};
-use crate::tokens;
+use crate::style::{Align, Edges, Justify};
+use crate::tokens::{self, Color as Ink};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Side {
@@ -75,6 +76,19 @@ impl<M> Popover<M> {
             nested: false,
             popup: HasPopup::Dialog,
         }
+    }
+
+    /// A band across the foot of a flush surface, for what ends a dialog. Its tint sets it apart from what
+    /// is over it. In the dark the tint is all but the surface's own, so the surface's line is drawn there.
+    pub fn foot(ends: impl IntoIterator<Item = Element<M>>) -> Element<M> {
+        let line = Ink { light: fade(tokens::CARD_LINE, 0.0).light, dark: tokens::CARD_LINE.dark };
+        Element::row()
+            .justify(Justify::End)
+            .gap(tokens::SPACE_SM)
+            .padding(Edges::xy(tokens::SPACE_XL, tokens::SPACE_MD))
+            .bg(tokens::TONE_1)
+            .border(Edges::top(1.0), line)
+            .children(ends)
     }
 
     /// Names the surface, which makes it a dialog to assistive technology.

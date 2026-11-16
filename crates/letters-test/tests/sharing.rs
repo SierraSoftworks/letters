@@ -4,8 +4,9 @@
 use letters_api::{
     Access as Reach, Action, Allows, CreatedLink, Grant, Grantee, Link, NewLink, Role as Grade, Shares, Via, Who,
 };
-use letters_render::{Item, Rect};
-use letters_test::{Found, Harness, Role};
+use letters_render::cpu::{CpuRenderer, Frame};
+use letters_render::{Color, Item, Rect};
+use letters_test::{Found, Harness, Role, WINDOW};
 use letters_ui::{Access, Connection, Request, Shared};
 
 /// Noon on 15 November 2026, in seconds since 1970.
@@ -352,6 +353,47 @@ fn a_group_is_added_from_one_control_in_one_frame() {
         let inside = on.x >= button.x && on.x + on.width <= button.x + button.width && on.y >= button.y;
         assert!(inside && on.y + on.height <= button.y + button.height, "{on:?} in {button:?}");
         assert_eq!(round > 0.0, ends, "{button:?}");
+    }
+}
+
+/// The window as its pixels, one to a point.
+fn shot(window: &mut Harness) -> Frame {
+    let (list, images) = (window.paint(), window.ui().images().clone());
+    let mut frame = Frame::new(WINDOW.width as u32, WINDOW.height as u32);
+    CpuRenderer::new().render(&list, &images, 1.0, Color::rgb(255, 255, 255), &mut frame);
+    frame
+}
+
+#[test]
+fn the_band_is_set_apart_from_what_is_over_it_in_the_light_and_in_the_dark() {
+    // Whether the eye tells two colours apart.
+    let apart = |a: Color, b: Color| [(a.r, b.r), (a.g, b.g), (a.b, b.b)].into_iter().any(|(a, b)| a.abs_diff(b) >= 6);
+    for dark in [false, true] {
+        let mut window = plan();
+        window.ui().set_dark(dark);
+        open(&mut window, shared(true, Vec::new()));
+        let dialog = window.find(Role::Dialog, "Share").expect("the dialog").bounds;
+        let done = window.find(Role::Button, "Done").expect("the button").bounds;
+        // The colours met going up from beside the button to over the band, and how many pixels of each. It
+        // is looked at near the dialog's edge, where nothing else is drawn.
+        let seen = shot(&mut window);
+        let mut met: Vec<(Color, usize)> = Vec::new();
+        for y in (done.y as u32 - 24..done.y as u32).rev() {
+            let colour = seen.pixel(dialog.x as u32 + 8, y).expect("in the window");
+            match met.last_mut() {
+                Some((last, rows)) if *last == colour => *rows += 1,
+                _ => met.push((colour, 1)),
+            }
+        }
+        match (dark, &met[..]) {
+            // In the light the band's tint is told from the surface, and nothing is drawn between them.
+            (false, [(band, _), (surface, _)]) => assert!(apart(*band, *surface), "{met:?}"),
+            // In the dark the tint is all but the surface's own, and a line one pixel thick is drawn over it.
+            (true, [(band, _), (line, 1), (surface, _)]) => {
+                assert!(apart(*line, *band) && apart(*line, *surface), "{met:?}")
+            }
+            _ => panic!("dark: {dark}: {met:?}"),
+        }
     }
 }
 

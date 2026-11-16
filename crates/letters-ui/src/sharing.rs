@@ -363,12 +363,7 @@ impl Share {
         let owner = self.shared.as_ref().is_some_and(|shared| shared.owner);
         let tabs = (served && owner && self.form.is_none()).then(|| self.tabs());
         // What ends the dialog stands on a band across its foot.
-        let foot = Element::row()
-            .justify(Justify::End)
-            .gap(tokens::SPACE_SM)
-            .padding(Edges::xy(tokens::SPACE_XL, tokens::SPACE_MD))
-            .bg(tokens::TONE_1)
-            .children(ends);
+        let foot = Popover::foot(ends);
         // What scrolls runs to the dialog's edges, so that its thumb stands clear of what it scrolls.
         let side = Edges::xy(tokens::SPACE_XL, 0.0);
         let within = |part: Element<Message>| Element::column().padding(side).child(part);
