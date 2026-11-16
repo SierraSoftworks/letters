@@ -25,6 +25,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use letters_api::paths;
+use letters_spell::{best_dictionary, dictionary_language};
 use sha2::{Digest, Sha256};
 
 use crate::ids::hex;
@@ -38,70 +39,28 @@ const LARGEST: u64 = 64 << 20;
 /// How hard a file is pressed, once for as long as it stays the same.
 const QUALITY: u32 = 9;
 
-/// The parts of a language tag or of a dictionary's file name that choose a dictionary. The desktop app
-/// reads a system's dictionaries by the same rule (`apps/letters/src/dictionaries.rs`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Tag {
-    /// In lower case.
-    language: String,
-    /// In upper case.
-    region: Option<String>,
-    /// Whether the name says more than a language and a region, as `de_DE_frami` and `sr-Latn-RS` do.
-    more: bool,
-}
-
-impl Tag {
-    /// Reads a BCP 47 tag such as `pt-BR`, or a file name such as `pt_BR`.
-    fn parse(name: &str) -> Option<Self> {
-        let alphabetic = |part: &str| part.bytes().all(|b| b.is_ascii_alphabetic());
-        let mut parts = name.trim().split(['-', '_']);
-        let language = parts.next().filter(|part| matches!(part.len(), 2 | 3) && alphabetic(part))?;
-        let rest: Vec<&str> = parts.collect();
-        let region = rest.iter().find(|part| part.len() == 2 && alphabetic(part));
-        Some(Self {
-            language: language.to_ascii_lowercase(),
-            region: region.map(|region| region.to_ascii_uppercase()),
-            more: rest.len() > usize::from(region.is_some()),
-        })
-    }
-
-    fn written(&self) -> String {
-        match &self.region {
-            Some(region) => format!("{}-{region}", self.language),
-            None => self.language.clone(),
-        }
-    }
-}
-
-/// The dictionaries in `folder`: each one's tag, and the name its two files share. English is left out:
-/// the editor has it built in.
-fn held(folder: &FilePath) -> Vec<(Tag, String)> {
+/// The dictionaries in `folder`: each one's language as a tag such as `de-DE`, and the name its two files
+/// share, in the names' order. English is left out: the editor has it built in.
+fn held(folder: &FilePath) -> Vec<(String, String)> {
     let mut held = Vec::new();
     for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
         let aff = entry.path();
         let whole = aff.extension().is_some_and(|ending| ending == "aff") && aff.with_extension("dic").is_file();
         let name = aff.file_stem().and_then(|name| name.to_str()).filter(|_| whole);
-        let named = name.and_then(|name| Some((Tag::parse(name)?, name.to_owned())));
-        held.extend(named.filter(|(tag, _)| tag.language != "en"));
+        let named = name.and_then(|name| Some((dictionary_language(name)?, name.to_owned())));
+        held.extend(named.filter(|(tag, _)| tag != "en" && !tag.starts_with("en-")));
     }
     // A folder is read in no order.
     held.sort_by(|a, b| a.1.cmp(&b.1));
     held
 }
 
-/// The name of the dictionary in `folder` that best serves `language`, a tag such as `de` or `de-CH`: one
-/// for its region, else one for the language alone, else that of the country the language is named
-/// after, else any. A plain name is preferred to a variant such as `de_DE_frami`.
+/// The name of the dictionary in `folder` that best serves `language`, a tag such as `de` or `de-CH`. The
+/// desktop app chooses among a system's by the same rule (`letters_spell::best_dictionary`).
 fn best(folder: &FilePath, language: &str) -> Option<String> {
-    let wanted = Tag::parse(language)?;
-    let rank = |tag: &Tag| match &tag.region {
-        region if *region == wanted.region => 0,
-        None => 1,
-        Some(region) if region.eq_ignore_ascii_case(&wanted.language) => 2,
-        Some(_) => 3,
-    };
-    let serves = held(folder).into_iter().filter(|(tag, _)| tag.language == wanted.language);
-    serves.min_by_key(|(tag, name)| (rank(tag), tag.more, name.clone())).map(|(_, name)| name)
+    let mut held = held(folder);
+    let best = best_dictionary(held.iter().map(|(_, name)| name.as_str()), language)?;
+    Some(held.swap_remove(best).1)
 }
 
 /// The text of a dictionary's file. An older dictionary is in the encoding the `SET` line of its `.aff`
@@ -212,7 +171,7 @@ impl App {
     /// The languages the server has a dictionary for, as tags such as `de-DE`, each once.
     pub fn dictionaries(&self) -> Vec<String> {
         let tags: BTreeSet<String> =
-            held(&self.config.server.state.join(FOLDER)).into_iter().map(|(tag, _)| tag.written()).collect();
+            held(&self.config.server.state.join(FOLDER)).into_iter().map(|(tag, _)| tag).collect();
         tags.into_iter().collect()
     }
 }

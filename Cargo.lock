@@ -4009,6 +4009,7 @@ dependencies = [
  "letters-fonts",
  "letters-format",
  "letters-model",
+ "letters-spell",
  "letters-sync",
  "letters-trust",
  "letters-ui",

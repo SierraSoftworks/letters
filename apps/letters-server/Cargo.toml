@@ -18,6 +18,7 @@ letters-format.workspace = true
 letters-sync.workspace = true
 letters-editor.workspace = true
 letters-trust.workspace = true
+letters-spell.workspace = true
 # The read view: a document as HTML, in the window's dark colours where the reader asks for them.
 letters-convert.workspace = true
 letters-ui.workspace = true

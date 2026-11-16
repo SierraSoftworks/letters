@@ -9,54 +9,23 @@ use std::path::{Path, PathBuf};
 use std::{env, fs, io};
 
 use letters_model::Document;
-use letters_spell::Dictionary;
+use letters_spell::{Dictionary, best_dictionary, dictionary_language};
 
 /// A file larger than this is not read: no word list is worth that much memory.
 const LARGEST: u64 = 64 << 20;
 
-/// The parts of a language tag or of a dictionary's file name that choose a dictionary.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Tag {
-    /// In lower case.
-    language: String,
-    /// In upper case.
-    region: Option<String>,
-    /// Whether the name says more than a language and a region, as `de_DE_frami` and `sr-Latn-RS` do.
-    more: bool,
-}
-
-impl Tag {
-    /// Reads a BCP 47 tag such as `pt-BR`, or a file name such as `pt_BR`.
-    fn parse(name: &str) -> Option<Self> {
-        let alphabetic = |part: &str| part.bytes().all(|b| b.is_ascii_alphabetic());
-        let mut parts = name.trim().split(['-', '_']);
-        let language = parts.next().filter(|part| matches!(part.len(), 2 | 3) && alphabetic(part))?;
-        let rest: Vec<&str> = parts.collect();
-        let region = rest.iter().find(|part| part.len() == 2 && alphabetic(part));
-        Some(Self {
-            language: language.to_ascii_lowercase(),
-            region: region.map(|region| region.to_ascii_uppercase()),
-            more: rest.len() > usize::from(region.is_some()),
-        })
-    }
-
-    fn written(&self) -> String {
-        match &self.region {
-            Some(region) => format!("{}-{region}", self.language),
-            None => self.language.clone(),
-        }
-    }
+/// The tag a dictionary's name or a passage's language stands for, as `de` or `de-CH`, by the rule the
+/// server shares (`letters_spell::dictionary_language`). `None` for English: it is built in, and never
+/// read from the system.
+fn other(name: &str) -> Option<String> {
+    dictionary_language(name).filter(|tag| tag != "en" && !tag.starts_with("en-"))
 }
 
 /// The languages a document names that a system dictionary could serve: its own, and those of its blocks
 /// and runs, as `de` or `de-CH`.
 pub fn languages(document: &Document) -> BTreeSet<String> {
     let mut named = BTreeSet::new();
-    let mut note = |tag: &str| {
-        if let Some(tag) = Tag::parse(tag).filter(|tag| tag.language != "en") {
-            named.insert(tag.written());
-        }
-    };
+    let mut note = |tag: &str| named.extend(other(tag));
     note(&document.language);
     for block in document.walk() {
         block.lang.as_deref().map(&mut note);
@@ -90,10 +59,7 @@ pub fn installed(folders: &[PathBuf]) -> BTreeSet<String> {
     for entry in folders.iter().flat_map(|folder| fs::read_dir(folder).into_iter().flatten().flatten()) {
         let aff = entry.path();
         let named = aff.extension().is_some_and(|extension| extension == "aff") && aff.with_extension("dic").is_file();
-        let tag = aff.file_stem().and_then(|name| name.to_str()).filter(|_| named).and_then(Tag::parse);
-        if let Some(tag) = tag.filter(|tag| tag.language != "en") {
-            languages.insert(tag.written());
-        }
+        languages.extend(aff.file_stem().and_then(|name| name.to_str()).filter(|_| named).and_then(other));
     }
     languages
 }
@@ -107,33 +73,31 @@ pub struct Found {
     pub dic: PathBuf,
 }
 
-/// Finds the dictionary that best serves `language`, a tag such as `de` or `de-CH`: one for its region, else
-/// one for the language alone, else that of the country the language is named after, else any. A plain
-/// name is preferred to a variant such as `de_DE_frami`, and an earlier folder to a later one.
+/// Finds the dictionary that best serves `language`, a tag such as `de` or `de-CH`, by the rule the server
+/// shares (`letters_spell::best_dictionary`): one for its region, else one for the language alone, else
+/// that of the country the language is named after, else any. A plain name is preferred to a variant such
+/// as `de_DE_frami`, and an earlier folder to a later one.
 pub fn find(folders: &[PathBuf], language: &str) -> Option<Found> {
-    let wanted = Tag::parse(language)?;
-    let rank = |tag: &Tag| match &tag.region {
-        region if *region == wanted.region => 0,
-        None => 1,
-        Some(region) if region.eq_ignore_ascii_case(&wanted.language) => 2,
-        Some(_) => 3,
-    };
-    let mut found: Vec<_> = Vec::new();
-    for (place, folder) in folders.iter().enumerate() {
+    let mut found = Vec::new();
+    for folder in folders {
+        let mut here = Vec::new();
         for entry in fs::read_dir(folder).into_iter().flatten().flatten() {
             let aff = entry.path();
             let name = aff.file_stem().and_then(|name| name.to_str()).map(str::to_owned);
             let Some(name) = name.filter(|_| aff.extension().is_some_and(|extension| extension == "aff")) else {
                 continue;
             };
-            let Some(tag) = Tag::parse(&name).filter(|tag| tag.language == wanted.language) else { continue };
             let dic = aff.with_extension("dic");
             if dic.is_file() {
-                found.push(((rank(&tag), tag.more, place, name.clone()), Found { name, aff, dic }));
+                here.push(Found { name, aff, dic });
             }
         }
+        // A folder is read in no order, and of two that serve alike the earlier is taken.
+        here.sort_by(|a, b| a.name.cmp(&b.name));
+        found.append(&mut here);
     }
-    found.into_iter().min_by(|a, b| a.0.cmp(&b.0)).map(|(_, found)| found)
+    let best = best_dictionary(found.iter().map(|found| found.name.as_str()), language)?;
+    Some(found.swap_remove(best))
 }
 
 /// Reads the dictionary that best serves `language`, with the name it has on disk. `None` when there is

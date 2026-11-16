@@ -75,15 +75,15 @@ impl Speller {
 
 /// The parts of a BCP 47 tag that choose a dictionary.
 #[derive(Debug, PartialEq, Eq)]
-struct Tag {
+pub(crate) struct Tag {
     /// In lower case.
-    language: String,
+    pub(crate) language: String,
     /// In upper case.
-    region: Option<String>,
+    pub(crate) region: Option<String>,
 }
 
 impl Tag {
-    fn parse(tag: &str) -> Option<Self> {
+    pub(crate) fn parse(tag: &str) -> Option<Self> {
         let alphabetic = |part: &str| part.bytes().all(|b| b.is_ascii_alphabetic());
         let mut parts = tag.trim().split(['-', '_']);
         let language = parts.next().filter(|part| matches!(part.len(), 2 | 3) && alphabetic(part))?;
