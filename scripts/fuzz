@@ -73,7 +73,8 @@ cargo afl fuzz "${input[@]}" -o "$findings" -V "$seconds" -t 5000 "$@" -- "$bina
 # Every input that was kept is run again, and the report tells the places they fail at.
 report="${findings}/report.txt"
 rm -f "$report"
-if ! "$binary" --report "$target" "${findings}/default/crashes" "${findings}/default/hangs" >"$report"; then
+# AFL++ sets the findings of earlier runs aside under a dated name when it carries on.
+if ! "$binary" --report "$target" "${findings}"/default/crashes* "${findings}"/default/hangs* >"$report"; then
     echo >&2
     cat "$report" >&2
     echo "The inputs are kept in ${findings}/default/, and this report in ${report}." >&2
