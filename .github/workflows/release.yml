@@ -22,6 +22,7 @@ on:
       - .github/release-notes.md
       - scripts/bundle-macos.sh
       - scripts/set-version.sh
+      - apps/letters-web/build.sh
       - apps/letters/macos/**
 
 permissions:
@@ -102,6 +103,14 @@ jobs:
         run: |
           rustup toolchain install
           rustup target add ${{ matrix.target }}
+
+      # What the program depends on, as the last release built it: only Letters' own crates are compiled
+      # again. Before the version is set, so that the cache is named by the repository's own lock file.
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+          save-if: true # measuring: main only before this merges
 
       - name: Set the version
         if: env.VERSION != ''
@@ -206,6 +215,8 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.tag }}
       SERVER_TARGET: x86_64-unknown-linux-musl
+      # As ci.yml has it: the cache is named by these settings too, and the two jobs share one.
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@v7
 
@@ -217,12 +228,20 @@ jobs:
       - name: Install the musl compiler
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends musl-tools
 
+      # The cache of ci.yml's `server` job, which builds the same things each night.
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: server
+          save-if: true # measuring: main only before this merges
+
       - name: Set the version
         if: env.VERSION != ''
         run: ./scripts/set-version.sh "${VERSION#v}"
 
+      # Without the report of its size, which CI makes each night.
       - name: Build the browser's editor
-        run: ./apps/letters-web/build.sh
+        run: ./apps/letters-web/build.sh --no-report
 
       - name: Build
         env:
