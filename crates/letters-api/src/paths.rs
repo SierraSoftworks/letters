@@ -191,6 +191,13 @@ pub fn trust(id: &str) -> String {
     format!("{}/trust", document(id))
 }
 
+/// `PUT` a [`Seen`](crate::Seen): the person read the document up to there. Their account keeps it for
+/// [`Opened::last_seen`](crate::Opened::last_seen), on whatever device they open the document next. A
+/// shell says it as it closes the document and as it saves. Answers nothing.
+pub fn seen(id: &str) -> String {
+    format!("{}/seen", document(id))
+}
+
 /// `GET`: the document's [`Shares`](crate::Shares), for whoever says who it is shared with. Anyone else is
 /// refused as [`Code::Forbidden`](crate::Code::Forbidden).
 ///

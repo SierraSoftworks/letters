@@ -173,12 +173,24 @@ pub struct Opened {
     /// wall: the history still crosses the socket.
     #[serde(default, skip_serializing_if = "no")]
     pub by_link: bool,
+    /// The revision the person last read the document up to, on whatever device, as a shell said it at
+    /// [`paths::seen`](crate::paths::seen). None on a first visit, and for a link's own visitor, who has
+    /// no account to keep it by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
     /// The document's `style.json`. In a page only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub style: Option<Value>,
     /// The document's `notes.json`. In a page only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<Value>,
+}
+
+/// Where the person read a document up to, sent to [`paths::seen`](crate::paths::seen).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Seen {
+    /// The document's revision as its model writes it. The server keeps it and does not read it.
+    pub revision: String,
 }
 
 fn yes() -> bool {

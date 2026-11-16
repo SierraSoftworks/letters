@@ -3,7 +3,7 @@
 
 use letters_api::{
     Access, Action, Allows, Code, Entry, EntryKind, Error, Grant, Grantee, Limits, Link, Listing, NewLink, Opened,
-    PROTOCOL, Person, Role, Server, Settings, Shares, Space, SpaceKind, Tag, Token, Trust, Via, Who, paths,
+    PROTOCOL, Person, Role, Seen, Server, Settings, Shares, Space, SpaceKind, Tag, Token, Trust, Via, Who, paths,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -70,6 +70,7 @@ fn every_body_reads_back_as_written() {
     });
     let space = Space { id: "home".into(), name: "Home".into(), kind: SpaceKind::Personal, role: Role::Owner };
     round_trip(&Listing { space, path: "House".into(), entries: vec![entry()] });
+    round_trip(&Seen { revision: "r1".into() });
     round_trip(&Opened {
         id: "doc-1".into(),
         created: "2026-11-14T09:00:00Z".into(),
@@ -83,6 +84,7 @@ fn every_body_reads_back_as_written() {
         trust: Trust::Safe,
         allows: Allows::default(),
         by_link: true,
+        last_seen: Some("r1".into()),
         style: Some(json!({"format": 1})),
         notes: None,
     });
@@ -222,6 +224,7 @@ fn an_address_keeps_each_part_in_its_place() {
         (paths::document("a/b?c#d"), "/api/v1/documents/a%2Fb%3Fc%23d"),
         (paths::file("../../etc"), "/api/v1/documents/..%2F..%2Fetc/file"),
         (paths::assets("doc 1"), "/api/v1/documents/doc%201/assets"),
+        (paths::seen("doc 1"), "/api/v1/documents/doc%201/seen"),
         (paths::merge_conflicts("doc 1"), "/api/v1/documents/doc%201/merge-conflicts"),
         (paths::asset("doc 1", "ab12.png"), "/api/v1/documents/doc%201/assets/ab12.png"),
         (paths::sign_in_page("/d/a?b=c"), "/auth/sign-in?then=%2Fd%2Fa%3Fb%3Dc"),

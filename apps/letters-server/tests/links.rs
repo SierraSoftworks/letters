@@ -10,7 +10,8 @@ use axum::http::{Method, StatusCode};
 use common::desk::{Desk, settle};
 use common::{Browser, Client, Raw, START, Server, URL, follow, let_in, link, planned, texts};
 use letters_api::{
-    Allows, Code, CreatedLink, Entry, Error, Fetch, Listing, NewLink, Opened, Rename, Role, Shares, Tag, Trust, paths,
+    Allows, Code, CreatedLink, Entry, Error, Fetch, Listing, NewLink, Opened, Rename, Role, Seen, Shares, Tag, Trust,
+    paths,
 };
 use letters_format::{Archive, HISTORY};
 use letters_model::Op;
@@ -328,6 +329,37 @@ async fn a_link_hands_over_the_document_as_it_stands_and_nothing_of_its_past() {
         let opened: Opened = browser.get(&paths::document(&id)).await.json();
         assert_eq!(opened.by_link, !whole, "{username:?} by {by:?}");
     }
+}
+
+#[tokio::test]
+async fn where_a_person_read_up_to_is_kept_by_their_account_and_for_nobody_else() {
+    let (server, ada, ben, id) = planned("links-seen").await;
+    let (at, said) = (paths::document(&id), paths::seen(&id));
+    let seen = |revision: &str| Seen { revision: revision.into() };
+    // Nothing is known of a first visit. What Ada then says is hers on whatever device, and not Ben's.
+    assert_eq!(ada.get::<Opened>(&at).await.unwrap().last_seen, None);
+    for revision in ["r1", "r2"] {
+        ada.put::<()>(&said, &seen(revision)).await.unwrap();
+    }
+    let elsewhere = server.browser("ada", &[]);
+    assert_eq!(elsewhere.get::<Opened>(&at).await.unwrap().last_seen.as_deref(), Some("r2"));
+    assert_eq!(ben.get::<Opened>(&at).await.unwrap().last_seen, None);
+
+    // A link's own visitor has no account. What they say is taken, and kept for nobody.
+    let (mut guest, _) = let_in(&server, &ada, &id, &link("Accountant", Role::Reader)).await;
+    let body = serde_json::to_vec(&seen("r9")).unwrap();
+    let taken = guest.send(Method::PUT, &said, letters_api::JSON, body, &[("origin", URL)]).await;
+    assert_eq!(taken.status, StatusCode::NO_CONTENT);
+    assert_eq!(guest.get(&at).await.json::<Opened>().last_seen, None);
+    assert_eq!(ben.get::<Opened>(&at).await.unwrap().last_seen, None);
+
+    // Whoever does not reach the document says nothing of it, and what is no revision is not kept.
+    let carol = server.person("carol", &[]);
+    assert_eq!(carol.put::<()>(&said, &seen("r1")).await.unwrap_err().code, Code::NotFound);
+    for revision in [String::new(), "r".repeat(5000)] {
+        assert_eq!(ada.put::<()>(&said, &seen(&revision)).await.unwrap_err().code, Code::Invalid);
+    }
+    assert_eq!(ada.get::<Opened>(&at).await.unwrap().last_seen.as_deref(), Some("r2"));
 }
 
 #[tokio::test]

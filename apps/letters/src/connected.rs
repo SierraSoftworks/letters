@@ -442,6 +442,7 @@ fn unsaid(id: &str) -> Opened {
         trust: letters_api::Trust::Safe,
         allows: letters_api::Allows::default(),
         by_link: false,
+        last_seen: None,
         style: None,
         notes: None,
     }

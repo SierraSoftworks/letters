@@ -44,6 +44,7 @@ fn opened(name: &str, author: &str, trust: Trust) -> Opened {
         trust,
         allows: Allows { download: true, copy: true, print: true },
         by_link: false,
+        last_seen: None,
         style: None,
         notes: None,
     }

@@ -116,6 +116,7 @@ fn opened() -> Opened {
         trust: Trust::Trusted,
         allows: Allows::default(),
         by_link: false,
+        last_seen: None,
         style: None,
         notes: None,
     }

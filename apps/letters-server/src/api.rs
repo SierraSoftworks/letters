@@ -799,6 +799,7 @@ impl App {
             trust: if self.trusts(who, &found, &manifest.id)? { Trust::Trusted } else { Trust::Safe },
             allows: found.allows,
             by_link: found.by_link(),
+            last_seen: self.last_seen(who, &manifest.id)?,
             style,
             notes,
         };
@@ -872,7 +873,7 @@ fn entry(row: &Row, role: Role) -> Entry {
 /// The routes with their state, for the server and for tests.
 pub fn router(app: Arc<App>) -> Router {
     let routes = routes().merge(crate::shares::routes()).merge(crate::links::routes());
-    let routes = routes.merge(crate::access::routes()).merge(crate::socket::routes());
+    let routes = routes.merge(crate::access::routes()).merge(crate::socket::routes()).merge(crate::seen::routes());
     let routes = routes.merge(crate::auth::routes()).merge(crate::pages::routes());
     // Around every route, and around the answer where there is none.
     let routes = match app.config.server.log {
