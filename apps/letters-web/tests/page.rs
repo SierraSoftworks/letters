@@ -251,7 +251,7 @@ fn button(window: &mut Window, width: f32, name: &str) -> Place {
 }
 
 #[test]
-fn the_skeleton_has_the_name_where_the_window_has_it_at_widths_it_was_not_laid_out_at() {
+fn the_skeleton_has_the_way_back_and_the_name_where_the_window_has_them_at_widths_it_was_not_laid_out_at() {
     let cases =
         [("Minutes", Trust::Trusted), ("The minutes of a meeting that went on for a long time indeed", Trust::Safe)];
     for (name, trust) in cases {
@@ -259,16 +259,37 @@ fn the_skeleton_has_the_name_where_the_window_has_it_at_widths_it_was_not_laid_o
         let mut window = page::served_window(page::welcome(&mut || "b".into()), &said, ReplicaId::new("test"));
         let skeleton = Skeleton::of(&mut window);
         for width in (320..=1600).step_by(7).map(|width| width as f32) {
-            let [left, top, wide, high] = button(&mut window, width, name);
-            let shape = placed(&skeleton.spans, width)[0];
-            let near = |a: f32, b: f32| (a - b).abs() < 0.1;
-            assert!(
-                near(shape[0], left) && near(shape[1], top) && near(shape[3], high),
-                "{name} at {width}: {shape:?}"
-            );
-            // The bar cuts a name short where its tools begin.
-            assert!(shape[2] <= wide + 0.1, "{name} at {width}: {shape:?} is no wider than the {wide} of the name");
+            let shapes = placed(&skeleton.spans, width);
+            for (shape, control) in shapes.iter().zip(["Back to documents", name]) {
+                let [left, top, wide, high] = button(&mut window, width, control);
+                let near = |a: f32, b: f32| (a - b).abs() < 0.1;
+                assert!(
+                    near(shape[0], left) && near(shape[1], top) && near(shape[3], high),
+                    "{control} at {width}: {shape:?}"
+                );
+                // The bar cuts a name short where its tools begin.
+                assert!(shape[2] <= wide + 0.1, "{control} at {width}: {shape:?} is no wider than {wide}");
+            }
         }
+    }
+}
+
+#[test]
+fn a_served_window_names_the_way_back_to_where_its_document_is_listed() {
+    // Where the server says the document is, whether a share link alone leads to it, and the way back.
+    let cases = [
+        ("Reports/2026/Minutes.let", false, Some("Back to 2026")),
+        ("Minutes.let", false, Some("Back to documents")),
+        ("", false, Some("Back to documents")),
+        ("Reports/Minutes.let", true, None),
+    ];
+    for (path, by_link, back) in cases {
+        let said = Opened { path: path.into(), by_link, ..opened("Minutes", "Ada", Trust::Trusted) };
+        let mut window = page::served_window(page::welcome(&mut || "b".into()), &said, ReplicaId::new("test"));
+        window.resize(Size { width: 1024.0, height: 768.0 }, 1.0);
+        let update = window.access();
+        let found = update.nodes.iter().filter_map(|(_, node)| node.label()).find(|label| label.starts_with("Back to"));
+        assert_eq!(found, back, "{path:?}, by a link: {by_link}");
     }
 }
 

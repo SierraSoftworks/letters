@@ -1434,6 +1434,17 @@ fn the_more_menu_asks_the_shell_for_a_new_document_or_another_one() {
     }
 }
 
+#[test]
+fn the_bar_starts_with_the_way_back_to_where_a_shell_lists_the_document() {
+    let mut window = letter();
+    assert_eq!(window.find(Role::Button, "Back to House"), None, "no shell said where it is listed");
+    window.ui().set_listed(Some("House".into()));
+    window.click(Role::Button, "Back to House");
+    assert_eq!(window.ui().take_requests(), [Request::OpenDialog]);
+    window.ui().set_listed(None);
+    assert_eq!(window.find(Role::Button, "Back to House"), None);
+}
+
 /// Where the cottage's plan is kept: in House, in the space called Family. Holidays holds a folder too.
 fn family() -> Location {
     let folder = |path: &str| Folder {

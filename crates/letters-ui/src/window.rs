@@ -397,6 +397,13 @@ impl Ui<EditorApp> {
         }
     }
 
+    /// Says where the document is listed, by the name of the place: the folder it is in, on a shell whose
+    /// documents are listed outside the window, as a server's are on its pages. The bar then starts with a
+    /// way back to `listed`, which asks [`Request::OpenDialog`]. None until a shell says so.
+    pub fn set_listed(&mut self, listed: Option<String>) {
+        self.app_mut().listed = listed;
+    }
+
     /// Says how far the person's clock is ahead of UTC, in minutes: the history tells its days and times
     /// by it, and by UTC until a shell says. One figure serves every date, so a time from the other side
     /// of a change to summer time reads an hour off.
@@ -1399,6 +1406,8 @@ pub struct EditorApp {
     /// Whether the person is shown what was written before. A shell keeps it from someone whom a share
     /// link alone leads to the document.
     past: bool,
+    /// Where the document is listed, as the shell named it: the bar then starts with the way back there.
+    listed: Option<String>,
     /// Whether the dialog about the language of the document and of a passage is out.
     written: bool,
     servers: Servers,
@@ -1523,6 +1532,7 @@ impl EditorApp {
             share: Share::default(),
             seen: None,
             past: true,
+            listed: None,
             written: false,
             servers: Servers::default(),
             browser: Browser::default(),
@@ -4978,7 +4988,11 @@ impl EditorApp {
         // On a title bar a drag that starts on the name moves the window, and only a click renames.
         let name = if self.chrome.titled() { name.on_drag(Message::Ask(Request::DragWindow)) } else { name };
         let name = if own { name } else { name.fg(tokens::FG_MUTED) };
-        let mut lead = vec![page, name];
+        // Where the document is listed is a press away, before anything of the document's own.
+        let back = self.listed.as_ref().map(|listed| {
+            tool(icon::ARROW_LEFT, &format!("Back to {listed}")).on_press(Message::Ask(Request::OpenDialog))
+        });
+        let mut lead: Vec<Element<Message>> = back.map(Into::into).into_iter().chain([page, name]).collect();
 
         // Nothing reaches a server the window is not in session with, whatever was last said of saving.
         let apart = self.connection.as_ref().filter(|connection| **connection != Connection::Live);

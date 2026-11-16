@@ -502,7 +502,19 @@ pub fn served_on(model: Model, opened: &Opened) -> Window {
     window.set_allows(letters_ui::Allows { copy, download, print });
     // Nor is the document's past shown to one a share link alone leads in.
     window.set_history_shown(!opened.by_link);
+    // The server lists its documents on its own pages, which a link's visitor has none of.
+    window.set_listed((!opened.by_link).then(|| listed(opened)));
     window
+}
+
+/// The name of where a served document is listed: the folder it is in, or the server's documents for one
+/// at the top of its space or shared from another's.
+fn listed(opened: &Opened) -> String {
+    let folder = opened.path.rsplit_once('/').map_or("", |(folder, _)| folder);
+    match folder.rsplit('/').next().filter(|name| !name.is_empty()) {
+        Some(name) => name.to_owned(),
+        None => "documents".to_owned(),
+    }
 }
 
 /// What of `document` the start of the window's bar is drawn from: its first Heading 1, which names a
