@@ -23,6 +23,26 @@ server that adds identity, sharing and sync without owning any content.
   [Letters on a tailnet](apps/letters-server/docs/tailscale.md) sets one up with Tailscale as that provider.
 - `fuzz`: the fuzz targets, which a nightly workflow runs and files issues from.
 
+## Installing
+
+Each [release](https://github.com/SierraSoftworks/letters/releases/latest) carries the desktop app for every
+system. Letters is not signed with a paid developer certificate, so macOS and Windows ask before they open it
+the first time.
+
+- **macOS.** Open `Letters.dmg` and drag Letters to Applications. Then either:
+  - open Letters, press Done when macOS says it could not verify it, and press Open Anyway under
+    System Settings > Privacy & Security; or
+  - run `xattr -dr com.apple.quarantine /Applications/Letters.app` in Terminal, which also helps when macOS
+    calls the app damaged.
+- **Windows.** Run `letters-x86_64-pc-windows-msvc.exe`. When SmartScreen stops it, press More info, then
+  Run anyway.
+- **Linux.** `chmod +x letters-x86_64-unknown-linux-gnu`, put it on your `PATH` as `letters`, and run
+  `./scripts/install-desktop.sh` from this repository for the desktop entry and icons.
+
+Letters looks for a newer release when it starts and offers to restart into it. The Mac app is pointed at the
+release's page instead, and is allowed the same way after each download. Turn the look off with
+`[updates] check = false` in `~/.letters/settings.toml`, or with `LETTERS_UPDATES=0` in the environment.
+
 ## Usage reports
 
 Release builds of the desktop app tell `analytics.sierrasoftworks.com` which features are used and how long
