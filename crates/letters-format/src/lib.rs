@@ -133,7 +133,9 @@ impl Manifest {
         }
         let text = |key: &str| value[key].as_str().map(str::to_owned).ok_or_else(|| bad(&format!("expected {key}")));
         let hashes = value["hashes"].as_object().ok_or_else(|| bad("expected hashes"))?;
-        let hashes = hashes.iter().filter_map(|(name, hash)| Some((name.clone(), hash.as_str()?.to_owned()))).collect();
+        // The mimetype and the manifest are never listed, so a line for either names no entry.
+        let listed = hashes.iter().filter(|(name, _)| *name != "mimetype" && *name != MANIFEST);
+        let hashes = listed.filter_map(|(name, hash)| Some((name.clone(), hash.as_str()?.to_owned()))).collect();
         Ok(Self { id: text("id")?, created: text("created")?, hashes })
     }
 
@@ -179,6 +181,11 @@ impl<R: Read + Seek> Archive<R> {
     /// The names of every entry the manifest lists.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.manifest.hashes.keys().map(String::as_str)
+    }
+
+    /// Whether the file holds the entry called `name`, which is not to say that it reads.
+    fn holds(&self, name: &str) -> bool {
+        self.zip.index_for_name(name).is_some()
     }
 
     /// Reads one entry. `None` when the file does not have it.
@@ -275,21 +282,22 @@ impl Package {
 
 /// Writes a `.let` file. The same package always produces the same bytes.
 pub fn write<W: Write + Seek>(writer: W, package: &Package) -> Result<(), Error> {
-    Plan::new(package, None, |_| false).write(writer, None::<&mut Archive<std::io::Empty>>)
+    let base = None::<&mut Archive<std::io::Empty>>;
+    Plan::new(package, base.as_deref(), |_| false).write(writer, base)
 }
 
 /// Writes a `.let` file over an older copy of it, at disk speed where nothing changed.
 ///
 /// An entry the older copy already holds under the same name and hash is copied across still compressed. An
 /// entry of the older copy that the package does not hold is carried over the same way when `keep` says so,
-/// which lets a save leave large assets unread.
+/// which lets a save leave large assets unread. An entry its manifest lists and it lacks is left out.
 pub fn write_over<W: Write + Seek, R: Read + Seek>(
     writer: W,
     package: &Package,
     base: &mut Archive<R>,
     keep: impl Fn(&str) -> bool,
 ) -> Result<(), Error> {
-    Plan::new(package, Some(&base.manifest), keep).write(writer, Some(base))
+    Plan::new(package, Some(&*base), keep).write(writer, Some(base))
 }
 
 /// What a write will hold: the manifest, and the content of each entry that is not copied from the older file.
@@ -300,9 +308,15 @@ pub(crate) struct Plan<'a> {
 }
 
 impl<'a> Plan<'a> {
-    pub(crate) fn new(package: &'a Package, base: Option<&Manifest>, keep: impl Fn(&str) -> bool) -> Self {
+    pub(crate) fn new<R: Read + Seek>(
+        package: &'a Package,
+        base: Option<&Archive<R>>,
+        keep: impl Fn(&str) -> bool,
+    ) -> Self {
         let document = package.document.to_json().into_bytes();
-        let kept = base.into_iter().flat_map(|base| &base.hashes).filter(|(name, _)| keep(name));
+        // Only what the older file holds can be carried over. A manifest may list an entry the file lacks.
+        let listed = base.into_iter().flat_map(|base| base.manifest.hashes.iter().map(move |entry| (base, entry)));
+        let kept = listed.filter(|(base, (name, _))| base.holds(name) && keep(name)).map(|(_, entry)| entry);
         let mut hashes: BTreeMap<String, String> = kept.map(|(name, hash)| (name.clone(), hash.clone())).collect();
         hashes.extend(package.entries.iter().map(|(name, bytes)| (name.clone(), hash(bytes))));
         hashes.insert(DOCUMENT.into(), hash(&document));

@@ -157,7 +157,7 @@ pub fn save(files: &mut impl Files, replica: &mut impl Replica, save: &Save) -> 
         }
 
         let package = replica.package();
-        let plan = Plan::new(&package, base.as_ref().map(Archive::manifest), |name| replica.keeps(name));
+        let plan = Plan::new(&package, base.as_ref(), |name| replica.keeps(name));
         if base.as_ref().is_some_and(|base| base.manifest() == &plan.manifest) {
             return Ok(Saved::Unchanged);
         }
@@ -185,7 +185,7 @@ pub fn save(files: &mut impl Files, replica: &mut impl Replica, save: &Save) -> 
     }
 
     let package = replica.package();
-    let plan = Plan::new(&package, base.as_ref().map(Archive::manifest), |name| replica.keeps(name));
+    let plan = Plan::new(&package, base.as_ref(), |name| replica.keeps(name));
     let mut bytes = Cursor::new(Vec::new());
     plan.write(&mut bytes, base.as_mut())?;
     let copy = free_name(files, &sibling(name, &format!("conflicted copy {}", save.label)));

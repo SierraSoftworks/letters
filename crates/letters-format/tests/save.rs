@@ -1,7 +1,7 @@
 mod common;
 
 use common::{Folder, ID, bytes, open, package, paragraph, rezip};
-use letters_format::{DiskCopy, Error, Package, Replica, Save, Saved, conflict_copy_of, save};
+use letters_format::{DiskCopy, Error, Package, Replica, Save, Saved, conflict_copy_of, hash, save};
 
 const NAME: &str = "report.let";
 const SAVE: Save = Save { name: NAME, token: "t1", label: "2026-11-14 desk", attempts: 3 };
@@ -243,5 +243,40 @@ fn conflict_copies_are_recognised_by_name() {
     ];
     for (name, original) in cases {
         assert_eq!(conflict_copy_of(name).as_deref(), original, "{name}");
+    }
+}
+
+/// The manifest of `file` with `name` listed under a hash, whatever the file holds.
+fn listing(file: &[u8], name: &str) -> Vec<u8> {
+    rezip(file, |entry, content| {
+        if entry != "manifest.json" {
+            return Some(content);
+        }
+        let mut manifest: serde_json::Value = serde_json::from_slice(&content).unwrap();
+        manifest["hashes"][name] = hash(b"").into();
+        Some(manifest.to_string().into_bytes())
+    })
+}
+
+#[test]
+fn a_file_that_lists_what_it_cannot_hand_over_is_saved_without_it() {
+    let theirs = bytes(&theirs());
+    let cases = [
+        ("an asset the file lacks", rezip(&theirs, |name, content| (name != "assets/theirs.png").then_some(content))),
+        ("an entry that was never there", listing(&theirs, "assets/lost.png")),
+        ("its own mimetype", listing(&theirs, "mimetype")),
+        ("its own manifest", listing(&theirs, "manifest.json")),
+    ];
+    for (why, file) in cases {
+        let mut folder = Folder::default();
+        folder.put(NAME, file);
+        let mut memory = ours();
+        let saved = save(&mut folder, &mut memory, &SAVE);
+        assert!(matches!(saved, Ok(Saved::Written)), "{why}: {saved:?}");
+        let written = on_disk(&folder, NAME);
+        assert_eq!(block_ids(&written), ["p", "ours", "theirs"], "{why}");
+        assert!(written.entries.contains_key("assets/0a1b.png"), "{why}: what the file holds is carried over");
+        let again = save(&mut folder, &mut memory, &SAVE);
+        assert!(matches!(again, Ok(Saved::Unchanged)), "{why}: {again:?}");
     }
 }
