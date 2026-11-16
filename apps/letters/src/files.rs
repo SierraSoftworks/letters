@@ -78,11 +78,16 @@ fn unfit(error: &letters_format::Error) -> &'static str {
 /// Why the system would not read a file, to end a sentence a person reads: " because it is no longer
 /// there", or nothing where there is no plain reason to give. As [`because`], for a file that is read.
 pub fn unread(error: &io::Error) -> &'static str {
-    use io::ErrorKind::{IsADirectory, NotADirectory, NotFound, PermissionDenied};
+    use io::ErrorKind::{Deadlock, IsADirectory, NotADirectory, NotFound, PermissionDenied, TimedOut};
     match error.kind() {
         NotFound | NotADirectory => " because it is not there",
         PermissionDenied => " because Letters may not read it",
         IsADirectory => " because it is a folder",
+        // macOS on a file whose bytes a sync app holds: it may not fetch them, or they did not come.
+        Deadlock | TimedOut => {
+            eprintln!("letters: a file kept in the cloud could not be read: {error}");
+            " because it is kept in the cloud and could not be downloaded. Download it with the app that syncs it, then try again"
+        }
         _ => {
             eprintln!("letters: a file could not be read: {error}");
             ""

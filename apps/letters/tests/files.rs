@@ -357,6 +357,11 @@ fn what_the_system_would_not_read_is_said_in_plain_words() {
     for (kind, why) in cases {
         assert_eq!(files::unread(&Error::new(kind, "Whatever (os error 5)")), why, "{kind:?}");
     }
+    // What macOS says of a file a sync app has not downloaded (EDEADLK), or whose download did not come.
+    for kind in [ErrorKind::Deadlock, ErrorKind::TimedOut] {
+        let why = files::unread(&Error::from(kind));
+        assert!(why.starts_with(" because it is kept in the cloud") && !why.ends_with('.'), "{kind:?}: {why}");
+    }
 }
 
 #[test]

@@ -7,6 +7,11 @@ use letters::measure::{self, Launch};
 
 fn main() -> ExitCode {
     let launch = Launch::start();
+    // A file in a folder synced on demand is downloaded as it is read, also when Letters was not started
+    // from Finder. Without this macOS refuses the read (EDEADLK).
+    if !letters_frame::fetch_cloud_files() {
+        eprintln!("letters: files kept in the cloud may not be read: the system would not set the policy");
+    }
     let options = match cli::parse(std::env::args_os().skip(1)) {
         Ok(Command::Run(options)) => options,
         Ok(Command::Export(export)) => return letters::convert::export(&export),
